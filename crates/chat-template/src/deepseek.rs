@@ -168,14 +168,9 @@ tool-name ::= {alternatives}
     }
 }
 
-/// Reads fenced tool calls back out of generated text.
-///
-/// One clock. What stood here matched the begin and end markers against token
-/// IDS while accumulating the payload as TEXT, and the two ran at different
-/// speeds: `accumulated.clear()` at the begin marker discarded whatever text
-/// the same batch had already decoded past it, and `take()` at the end marker
-/// swallowed everything after. Both markers are found in the text now, so a
-/// batch carrying two calls yields two events and the tail survives.
+/// Reads fenced tool calls back out of generated text. Both begin/end
+/// markers are matched in decoded text (one clock), so a batch carrying two
+/// calls yields two events and the tail survives.
 struct DeepSeekToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,

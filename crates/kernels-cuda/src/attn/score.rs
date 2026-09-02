@@ -1,28 +1,9 @@
-//! `AttnScore`: per-key attention mass for an observation window — the alto
-//! observability door's capture (`.wiki/alto/attn-score.md` §4; §1 is the
-//! C++ lineage this reproduces).
-//!
-//! **A NEW FILE ON PURPOSE**, and the design says so in as many words: "the
-//! accumulating capture-arm kernel is agent-built in a NEW FILE outside
-//! `attn.rs`/`attn/kv.rs`" (§5). The ownership argument is the same one
-//! `attn::dense` made: this entry shares the PAGES with the fa2 family and
-//! nothing else — no schedule to walk, no split-kv partials, no merge, no
-//! log-sum-exp plane, no `o`. It borrows the plan for exactly one thing, the
-//! shape triple, and the plan's own `accepts` is the only question it asks
-//! of it.
-//!
-//! **Where the module hangs, and why it is not `attn::score`.** As with
-//! `attn::dense`: the FILE is `src/attn/score.rs`, where it belongs, but a
-//! child module can only be declared by its parent and `src/attn.rs` is
-//! closed to this wave. `lib.rs` re-homes the declaration with `#[path]`, so
-//! the module path is `kernels_cuda::attn_score` until that seam reopens and
-//! `pub mod score;` can move into `attn.rs`. Nothing about the op changes
-//! when it does.
-//!
-//! One entry, one instantiation ladder, no workspace: the kernel recomputes
-//! the softmax weights straight out of the pages rather than materialising
-//! the `heads x window x kv_len` F32 slab the C++ lineage allocated per fire
-//! (and refused above 1 GiB). See the unit's header for that argument.
+//! `AttnScore`: per-key attention mass for an observation window. Shares the
+//! pages with the fa2 family and nothing else — no schedule to walk, no
+//! split-kv partials, no merge, no log-sum-exp plane, no `o`; borrows the
+//! plan only for its shape triple. One entry, one instantiation ladder, no
+//! workspace: recomputes softmax weights straight out of the pages rather
+//! than materializing a `heads x window x kv_len` F32 slab per fire.
 
 use dtype::Dtype;
 
@@ -35,18 +16,14 @@ use crate::tensor::{KvPool, RaggedTensor, Tensor};
 const FILE: &str = "attn/score.cuh";
 
 /// Warps per block. Keys are split across them and folded once per window
-/// row, so this is the kernel's only parallelism knob above the head — and
-/// it is `attn/attention.cuh`'s post-processing width (256 threads), which
-/// is the shape this capture reproduces in one pass.
+/// row, so this is the kernel's only parallelism knob above the head.
 const WARPS: u32 = 8;
 
 const BLOCK: u32 = WARPS * 32;
 
-/// The dot-product stamps, tightest first — `attn/dense.cuh`'s ladder, for
-/// the same reason. A stamp is the unrolled per-lane length
-/// (`stamp / 32` elements) and not a shape: the live head width may be
-/// anything at or below it, which is what lets 64, 72 and 80 share the
-/// 128-wide stamp without any of them being padded.
+/// The dot-product stamps, tightest first. A stamp is the unrolled per-lane
+/// length (`stamp / 32` elements), so head widths at or below it share it
+/// unpadded.
 const STAMPS: [u32; 3] = [64, 128, 256];
 
 /// The head count a row's width spells at a stated head width.
@@ -66,15 +43,13 @@ fn stamp_for(head_dim: u32) -> Option<u32> {
     STAMPS.into_iter().find(|stamp| head_dim <= *stamp)
 }
 
-/// **PER-KEY ATTENTION MASS FOR AN OBSERVATION WINDOW, INTO A CALLER-OWNED
-/// F32 SLAB.**
+/// Per-key attention mass for an observation window, into a caller-owned F32
+/// slab.
 ///
 /// `q` is the capture window's query rows (`[rows, num_q_heads * head_dim]`,
-/// bf16) paired with the window-REBASED `qo_indptr` — `i32`,
-/// `[requests + 1]`, indexing `q.data` itself. `plan` is the very plan
-/// [`prefill_lse`](crate::attn::prefill_lse) runs on and is read for one
-/// thing only, the shape triple it was carved at; `pool` is the paged cache
-/// this layer read.
+/// bf16) paired with the window-rebased `qo_indptr` (`i32`, `[requests + 1]`).
+/// `plan` is read only for the shape triple it was carved at; `pool` is the
+/// paged cache this layer read.
 ///
 /// For request `r` and query head `h` the output row is
 /// `scores.ptr + ((lane_offset + r) * plane_stride + plane + h) * kv_max`
@@ -84,48 +59,37 @@ fn stamp_for(head_dim: u32) -> Option<u32> {
 ///   out[j] = (1 / rows) * sum over w of softmax_j( sm_scale * <q_w, k_j> )
 /// ```
 ///
-/// where `rows = min(observe, qo_len)`, `w` walks the request's LAST `rows`
+/// where `rows = min(observe, qo_len)`, `w` walks the request's last `rows`
 /// query rows, and each row's softmax is taken over its own causal limit
-/// `min(kv_len - rows + w + 1, kv_len)` — the arithmetic
-/// `attn/attention.cuh`'s `attn_prefill_score_normalize` spells, taken here
-/// in one pass. The result is a probability distribution over `[0, kv_len)`
-/// summing to one: TOVA's number at `observe = 1`, SnapKV's at
-/// `observe = 32`. The papers' extra fold over heads is deliberately not
-/// taken — §4 rules the contract per-head and lets the guest fold.
+/// `min(kv_len - rows + w + 1, kv_len)`. Result sums to one over `[0, kv_len)`:
+/// TOVA's number at `observe = 1`, SnapKV's at `observe = 32`.
 ///
-/// **THE WHOLE ROW IS WRITTEN, ALWAYS.** `[kv_len, kv_max)` lands exactly
-/// `0.0`, on every path including the degenerate ones (a request with no
-/// pages, an empty cache, an empty window). The slab is reused across fires
-/// and a stale tail is not "unset" — it is the previous fire's mass on keys
-/// that no longer exist, which an eviction policy would rank on and never
-/// fault.
+/// The whole row is written, always: `[kv_len, kv_max)` lands exactly `0.0`
+/// on every path, including degenerate ones, since the slab is reused across
+/// fires and a stale tail would otherwise be mistaken for zero mass.
 ///
 /// # Errors
 ///
 /// A refusal when:
 ///
 /// - the plan was not carved at this head width, kv head count or window
-///   ([`PrefillPlan::accepts`], asked first as `prefill_lse` asks it);
-/// - **a sliding window is stated at all** — a windowed row is not the
-///   softmax the eviction and interpretability papers define, and the
-///   registry has refused capture under it since before this kernel existed
-///   (`.wiki/alto/attn-score.md` §2.4 / §5). The refusal is semantic, not a
-///   missing instantiation;
-/// - the pool's key pages are not bf16 storage: this capture reads keys
-///   directly out of the pages and dequantizes nothing;
+///   ([`PrefillPlan::accepts`]);
+/// - a sliding window is stated at all — not the softmax eviction and
+///   interpretability papers define;
+/// - the pool's key pages are not bf16 storage (this capture dequantizes
+///   nothing);
 /// - the slab is not F32, or its row is not `kv_max` wide;
 /// - the query row width does not divide by the stated head width;
 /// - the query heads do not group over the kv heads;
 /// - the head is wider than the widest stamp;
-/// - `observe` is zero — an observation window that observes nothing;
+/// - `observe` is zero;
 /// - `kv_max` is zero, or any stated extent overflows the kernel's `int`.
 ///
 /// [`Error::DtypeUnsupported`] for a query in anything but bf16.
 ///
-/// `kv_len > kv_max` is a caller error the engine refuses upstream and it is
-/// NOT knowable here — `kv_len` is a device-side number read from the page
-/// tables. The kernel is safe under it on its own: the softmax is still
-/// taken over the true extent and only the store is clamped to `kv_max`.
+/// `kv_len > kv_max` is a caller error refused upstream, not knowable here
+/// (`kv_len` is device-side): the softmax is still taken over the true
+/// extent and only the store is clamped to `kv_max`.
 #[allow(clippy::too_many_arguments)]
 pub fn capture(
     ctx: &Ctx,
@@ -216,8 +180,6 @@ pub fn capture(
     let kv_ceiling = count(OP, "the slab's per-row kv ceiling", kv_max)?;
     let page_size = count(OP, "the pool's page size", pool.page_size.unsigned_abs())?;
 
-    // The named refusals above judge the geometry a caller can state; these
-    // are the landing contract, checked only once the fire is admissible.
     let requests = kv::lanes_of(OP, q.indptr)?.unsigned_abs();
     debug_assert_eq!(
         num_q_heads, plan.shape.num_q_heads,
@@ -234,10 +196,8 @@ pub fn capture(
         scores.rows
     );
 
-    // The q row, then the block's two fold words per warp — the whole
-    // workspace, and it is shared memory: the fire path allocates nothing
-    // (design Article 7), which is the entire difference from the C++
-    // lineage's per-fire `cudaMallocAsync`.
+    // The q row plus the block's two fold words per warp — the whole
+    // workspace, in shared memory (the fire path allocates nothing).
     let floats = head_width.saturating_add(2 * WARPS);
     let smem = floats
         .checked_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4))

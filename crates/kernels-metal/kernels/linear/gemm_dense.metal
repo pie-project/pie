@@ -146,6 +146,49 @@ instantiate_dense_gemm_t(bfloat16, bfloat, 8, 64, 32, 1, 2)
 // `VECTOR_MAX_ROWS`. Above it the tile wins because it reads the weight table
 // once for eight rows where this reads it once per ROW; below it the tile is
 // paying for eight rows to compute one.
+// Two bf16 in one 32-bit word, dotted in f32: the high half is a float
+// already (bf16 IS the top sixteen bits of an f32), the low half shifts up.
+// Only meaningful for `T = bfloat`, the one instantiation below.
+inline float bf16x2_dot(uint a, uint b) {
+  const float a_lo = as_type<float>(a << 16);
+  const float a_hi = as_type<float>(a & 0xffff0000u);
+  const float b_lo = as_type<float>(b << 16);
+  const float b_hi = as_type<float>(b & 0xffff0000u);
+  return a_lo * b_lo + a_hi * b_hi;
+}
+
+// The lane's share of one row-by-row dot: `[k0, K)` strided by `stride`
+// lanes. With `K` even the walk is over 32-bit words (two bf16 a load, four
+// independent accumulators so the loads overlap); an odd `K` falls back to
+// the scalar walk. The four accumulators fold in a fixed order, so a given
+// (K, stride) lands the same bits every launch.
+template <typename T>
+inline float gemv_lane_dot(const device T* act_row, const device T* w_row, int K, int k0, int stride) {
+  float acc = 0.0f;
+  if ((K & 1) == 0) {
+    const device uint* a2 = reinterpret_cast<const device uint*>(act_row);
+    const device uint* w2 = reinterpret_cast<const device uint*>(w_row);
+    const int pairs = K >> 1;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    int p = k0;
+    for (; p + 3 * stride < pairs; p += 4 * stride) {
+      acc0 += bf16x2_dot(a2[p], w2[p]);
+      acc1 += bf16x2_dot(a2[p + stride], w2[p + stride]);
+      acc2 += bf16x2_dot(a2[p + 2 * stride], w2[p + 2 * stride]);
+      acc3 += bf16x2_dot(a2[p + 3 * stride], w2[p + 3 * stride]);
+    }
+    for (; p < pairs; p += stride) {
+      acc0 += bf16x2_dot(a2[p], w2[p]);
+    }
+    acc = (acc0 + acc1) + (acc2 + acc3);
+  } else {
+    for (int k = k0; k < K; k += stride) {
+      acc += float(act_row[k]) * float(w_row[k]);
+    }
+  }
+  return acc;
+}
+
 template <typename T>
 [[kernel]] void dense_gemv_t(
     const device T* act      [[buffer(0)]],
@@ -163,10 +206,7 @@ template <typename T>
   }
   const device T* act_row = act + size_t(m) * size_t(K);
   const device T* w_row = w + size_t(n) * size_t(K);
-  float acc = 0.0f;
-  for (int k = int(lane); k < K; k += SIMD_SIZE) {
-    acc += float(act_row[k]) * float(w_row[k]);
-  }
+  float acc = gemv_lane_dot<T>(act_row, w_row, K, int(lane), SIMD_SIZE);
   acc = simd_sum(acc);
   if (lane == 0) {
     y[size_t(m) * size_t(N) + size_t(n)] = static_cast<T>(acc);
@@ -181,3 +221,59 @@ template <typename T>
       uint2, uint);
 
 instantiate_dense_gemv_t(bfloat16, bfloat)
+
+// ── the narrow-column vector point ──────────────────────────────────────────
+//
+// A projection landing fewer columns than a threadgroup has simdgroups — the
+// router's shared gate is `[1, K]`, one number a row — gives `dense_gemv_t`
+// one working simdgroup and three idle, and a walk of K/32 loads on one
+// lane set is the whole launch. Here the WHOLE threadgroup takes one column:
+// the contraction is split across all its lanes, folded per simdgroup with
+// `simd_sum` and across simdgroups through threadgroup memory. One
+// threadgroup per (row, column), so the grid is `[N * KSPLIT_GROUP, M]`.
+MLX_MTL_CONST int KSPLIT_GROUP = 128;
+MLX_MTL_CONST int KSPLIT_SIMDGROUPS = KSPLIT_GROUP / SIMD_SIZE;
+
+template <typename T>
+[[kernel]] void dense_gemv_t_ksplit(
+    const device T* act      [[buffer(0)]],
+    const device T* w        [[buffer(1)]],
+    device T* y              [[buffer(2)]],
+    const constant int& M    [[buffer(3)]],
+    const constant int& N    [[buffer(4)]],
+    const constant int& K    [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]],
+    uint sg    [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float part[KSPLIT_SIMDGROUPS];
+  const int n = int(tgid.x);
+  const int m = int(tgid.y);
+  if (n >= N || m >= M) {
+    return;
+  }
+  const device T* act_row = act + size_t(m) * size_t(K);
+  const device T* w_row = w + size_t(n) * size_t(K);
+  float acc = gemv_lane_dot<T>(act_row, w_row, K, int(tid), KSPLIT_GROUP);
+  acc = simd_sum(acc);
+  if (lane == 0) {
+    part[sg] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float total = 0.0f;
+    for (int i = 0; i < KSPLIT_SIMDGROUPS; ++i) {
+      total += part[i];
+    }
+    y[size_t(m) * size_t(N) + size_t(n)] = static_cast<T>(total);
+  }
+}
+
+#define instantiate_dense_gemv_t_ksplit(name, itype)                         \
+  template [[host_name("dense_gemv_t_ksplit_" #name)]]                       \
+  [[kernel]] void dense_gemv_t_ksplit<itype>(                                \
+      const device itype*, const device itype*, device itype*,               \
+      const constant int&, const constant int&, const constant int&,         \
+      uint2, uint, uint, uint);
+
+instantiate_dense_gemv_t_ksplit(bfloat16, bfloat)

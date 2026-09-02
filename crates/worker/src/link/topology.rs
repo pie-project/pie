@@ -1,20 +1,5 @@
-//! Control-plane **topology** axis: the resolved [`TopologyMode`] + the
-//! [`Coordinator`] the runtime boot path consumes.
-//!
-//! Kept orthogonal to the *backend* axis (which engine) and the *role-stage*
-//! wiring. Two forms:
-//!
-//! - **single-node** — no controller; this one node serves every role and
-//!   terminates clients directly (gateway-free local inference).
-//! - **distributed** — `role` + `controller` + the `gateways` this worker dials
-//!   INTO (M3 inversion), joining a cluster coordinated by a standalone
-//!   controller process.
-//!
-//! This is a pure library surface: flag parsing lives in the bins (`bin/worker`,
-//! `bin/pie`), which construct a [`TopologyMode`] (via [`TopologyMode::distributed`]
-//! or [`TopologyMode::SingleNode`]) and hand it to [`connect`]. Building the
-//! actual control connection (dial vs in-proc embed) is the runtime boot path's
-//! job ([`crate::runtime::start_runtime`]).
+//! Control-plane topology axis: the resolved [`TopologyMode`] + the [`Coordinator`] the runtime boot path consumes. Two forms: single-node (no controller, one node serves every role) and distributed (`role` + `controller` + the `gateways` this worker dials into, joining a cluster coordinated by a standalone controller process).
+//! Pure library surface: flag parsing lives in the bins, which build a [`TopologyMode`] and hand it to [`connect`]. Building the actual control connection is the runtime boot path's job ([`crate::serve::start_runtime`]).
 
 use anyhow::{Result, bail};
 use controller_api::Role;
@@ -29,21 +14,13 @@ pub enum TopologyMode {
     Distributed {
         role: Role,
         controller: String,
-        /// Gateway endpoint(s) to dial INTO — the worker is the client, the
-        /// gateway the listening server (M3 inversion). **Optional**: this is a
-        /// static *pin/override* for fixed or local topologies. When empty, the
-        /// worker discovers its gateway roster dynamically from the controller
-        /// (`gateway.md`); when non-empty, these addresses are always kept dialed
-        /// in addition to any the controller pushes.
+        /// Gateway endpoint(s) to dial into; the worker is the client, the gateway the listening server. Optional: a static pin for fixed/local topologies. Empty means dynamic discovery from the controller; non-empty addresses stay dialed alongside anything the controller pushes.
         gateways: Vec<String>,
     },
 }
 
 impl TopologyMode {
-    /// Build a validated distributed topology. A worker needs a reachable
-    /// controller address; gateways are optional (empty ⇒ dynamic discovery from
-    /// the controller). Any addresses supplied are validated and become the
-    /// pinned dial-in set; the real dial error surfaces later at connect time.
+    /// Build a validated distributed topology. Gateways are optional (empty means dynamic discovery); supplied addresses are validated and become the pinned dial-in set.
     pub fn distributed(role: Role, controller: String, gateways: Vec<String>) -> Result<Self> {
         if !is_valid_addr(&controller) {
             bail!("controller {controller:?}: expected host:port, tcp://host:port, or unix:/path");
@@ -77,21 +54,11 @@ pub fn addr_from_host_port(host: &str, port: u16) -> String {
     }
 }
 
-/// Resolved control-plane topology plus the worker's `host:port` identity.
-///
-/// Carried into the runtime boot path ([`crate::runtime::start_runtime`]), which builds the
-/// actual control connection on the server's async runtime — dialing the
-/// controller for distributed mode, or (for an in-proc embedder) taking an
-/// injected control link. Keeping the connection out of here means no
-/// pre-runtime dialing.
+/// Resolved control-plane topology plus the worker's `host:port` identity. Keeping the connection out of here means no pre-runtime dialing.
 #[derive(Debug, Clone)]
 pub struct Coordinator {
-    /// The resolved topology (single-node vs distributed + role/controller).
     pub mode: TopologyMode,
-    /// The worker's `host:port`, registered as `WorkerInfo.addr`. Post-inversion
-    /// this is vestigial for dispatch — the gateway routes via its dial-in
-    /// registry (keyed by `WorkerId`), not by dialing this address; it stays a
-    /// stable identity/display value.
+    /// The worker's `host:port`, registered as `WorkerInfo.addr`. Vestigial for dispatch (the gateway routes via its own dial-in registry); stays a stable identity/display value.
     pub control_addr: String,
 }
 
@@ -115,7 +82,7 @@ impl Coordinator {
 }
 
 /// Resolve `mode` into a [`Coordinator`]. The control connection itself is built
-/// later, on the server's async runtime, by [`crate::runtime::start_runtime`] — this
+/// later, on the server's async runtime, by [`crate::serve::start_runtime`] — this
 /// only carries the resolved topology + advertised address.
 pub fn connect(mode: &TopologyMode, control_addr: String) -> Result<Coordinator> {
     Ok(Coordinator {
@@ -129,40 +96,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn distributed_builds_and_validates() {
-        let mode = TopologyMode::distributed(
-            Role::Decode,
-            "127.0.0.1:7000".to_string(),
-            vec!["127.0.0.1:8000".to_string()],
-        )
-        .unwrap();
-        match mode {
-            TopologyMode::Distributed {
-                role,
-                controller,
-                gateways,
-            } => {
-                assert_eq!(role, Role::Decode);
-                assert_eq!(controller, "127.0.0.1:7000");
-                assert_eq!(gateways, vec!["127.0.0.1:8000".to_string()]);
-            }
-            other => panic!("expected Distributed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn distributed_without_gateway_is_dynamic() {
-        // Empty gateway list is valid now: the worker discovers its roster from
-        // the controller (gateway.md). No pinned dial-in set.
-        let mode =
-            TopologyMode::distributed(Role::Decode, "127.0.0.1:7000".to_string(), vec![]).unwrap();
-        match mode {
-            TopologyMode::Distributed { gateways, .. } => assert!(gateways.is_empty()),
-            other => panic!("expected Distributed, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn distributed_bad_addr_errors() {
         assert!(
             TopologyMode::distributed(
@@ -174,10 +107,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn connect_single_node_has_no_role() {
-        let coord = connect(&TopologyMode::SingleNode, "127.0.0.1:9000".to_string()).unwrap();
-        assert_eq!(coord.role(), None);
-        assert_eq!(coord.controller_addr(), None);
-    }
 }

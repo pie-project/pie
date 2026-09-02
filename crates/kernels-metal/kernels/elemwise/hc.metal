@@ -313,6 +313,58 @@ template <typename T, int BLOCK>
 
 instantiate_hc_gates(bfloat16, bfloat, 256)
 
+// ---- the trunk collapse ---------------------------------------------------
+
+// `y[n, h] = sum_i g_i * streams[n, i*H + h]`, `g_i = sigmoid(mixes[n, i] *
+// scale[0] + base[i]) + hc_eps` — the model's final fold of its `M` residual
+// streams into the one row the final norm reads (`hc_head`). `M` gates and no
+// post, no combiner, no Sinkhorn: the trunk's mix row is `M` wide, which is
+// what `hc_project` lands off the `[M, M*H]` `hc_head.fn` plane. One
+// threadgroup per token; `hc.cuh`'s `hc_head_postprocess`, transcribed.
+template <typename T, int BLOCK>
+[[kernel]] void hc_collapse(
+    const device float* mixes    [[buffer(0)]],
+    const device float* scale    [[buffer(1)]],
+    const device float* base     [[buffer(2)]],
+    const device T* residual     [[buffer(3)]],
+    device T* out                [[buffer(4)]],
+    const constant int& M        [[buffer(5)]],
+    const constant int& H        [[buffer(6)]],
+    const constant float& hc_eps [[buffer(7)]],
+    uint gid     [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]) {
+  const int n = int(gid);
+  const int tid = int(lid);
+
+  threadgroup float gates[HC_MAX_MULT];
+  if (tid < M) {
+    const float logit = mixes[size_t(n) * size_t(M) + size_t(tid)] * scale[0] + base[tid];
+    gates[tid] = 1.0f / (1.0f + precise::exp(-logit)) + hc_eps;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const device T* res_n = residual + size_t(n) * size_t(M) * size_t(H);
+  device T* out_n = out + size_t(n) * size_t(H);
+  for (uint h = lid; h < uint(H); h += tg_size) {
+    float acc = 0.0f;
+    for (int i = 0; i < M; ++i) {
+      acc += gates[i] * float(res_n[size_t(i) * size_t(H) + size_t(h)]);
+    }
+    out_n[h] = T(acc);
+  }
+}
+
+#define instantiate_hc_collapse(name, itype, block)               \
+  template [[host_name("hc_collapse_" #name)]]                    \
+  [[kernel]] void hc_collapse<itype, block>(                      \
+      const device float*, const device float*, const device float*, \
+      const device itype*, device itype*,                         \
+      const constant int&, const constant int&, const constant float&, \
+      uint, uint, uint);
+
+instantiate_hc_collapse(bfloat16, bfloat, 256)
+
 // ---- fold -----------------------------------------------------------------
 
 // Mixes the sublayer's output back into the `M` streams under the gate

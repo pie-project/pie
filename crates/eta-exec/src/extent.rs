@@ -3,16 +3,8 @@ use eta_compiler::plan::Dimension;
 use eta_ir::Dtype;
 use eta_ir::types::{MAX_RANK, from_wire, wire_dtype};
 
-/// Which runtime quantity a symbolic axis resolves against.
-///
-/// [`eta_compiler::plan::SymbolicExtent`], re-exported under the name this
-/// plane has always called it — a rename, not a copy. There were three of this
-/// seven-variant enum: one declared here, one the launch package declared as
-/// `ExtentRole`, and a `u8` tag space the contract carried, with nothing
-/// keeping the wire tags in step. The declaration here went first; `ExtentRole`
-/// went when the package stopped being declared in a crate that could not name
-/// the planner's. One is left, and this alias is a spelling of it rather than a
-/// fourth thing to keep right.
+/// Which runtime quantity a symbolic axis resolves against. A rename of
+/// [`eta_compiler::plan::SymbolicExtent`], not a copy.
 pub use eta_compiler::plan::SymbolicExtent as Role;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,11 +101,9 @@ impl ValueDesc {
         super::value::wire_cell_bytes(self.dtype(), self.len as usize) as u64
     }
 
-    /// The element type this descriptor's `dtype` word names.
-    ///
-    /// `dtype` is a `u32` because the struct is `#[repr(C)]` and read by a
-    /// device kernel; `F32` for a word no dtype claims, which is what the
-    /// `concrete_dtype` round trip this replaced also answered.
+    /// The element type this descriptor's `dtype` word names. `dtype` is a
+    /// `u32` because the struct is `#[repr(C)]` and read by a device kernel;
+    /// falls back to `F32` for a word no dtype claims.
     #[must_use]
     fn dtype(&self) -> Dtype {
         u8::try_from(self.dtype)
@@ -133,12 +123,6 @@ pub enum Unresolvable {
 }
 
 pub fn describe(value: &LaunchPlanValue, extents: &Extents) -> Result<ValueDesc, Unresolvable> {
-    // `Unresolvable::Mismatch` used to stand here, guarding two parallel
-    // vectors — `extents: Vec<u8>` and `dims: Vec<u32>` — against being
-    // different lengths. `LaunchPlanValue::axes` is one vector of
-    // `Dimension`, so there is nothing left to disagree with itself.
-    // `UnknownRole` went the same way: a role is an enum now, not a byte with
-    // a sentinel carved out of it.
     let rank = value.axes.len();
     if rank > MAX_RANK {
         return Err(Unresolvable::Rank {

@@ -1,9 +1,8 @@
-//! The fa2 decode work split: given the host copy of the kv page indptr it
+//! The fa2 decode work split: given the host copy of the kv page indptr,
 //! decides whether to split kv, partitions requests into `(request, kv
 //! tile)` work items, and stages the index vectors the decode kernel walks.
-//! A native reimplementation of FlashInfer's host planner — the schedule is
-//! valid and deterministic, not byte-identical to the C++ reference (see
-//! [`sched`](crate::attn::sched)).
+//! A native reimplementation of FlashInfer's host planner (schedule is
+//! valid and deterministic, not byte-identical to the C++ reference).
 
 use crate::error::Error;
 
@@ -15,22 +14,13 @@ use crate::jit::refuse;
 pub struct Request<'a> {
     /// Host copy of the kv page indptr — `[batch_size + 1]`.
     pub kv_indptr: &'a [i32],
-    /// The lane count this schedule is CARVED for: what the padding, the
-    /// allocations and the grid arithmetic below are sized at.
-    ///
-    /// **AND SINCE THE DECODE CEILING IT IS ROUTINELY LARGER THAN THE FIRE'S**
-    /// (`engine_cuda::run::Run::planning`): a bodied fire carves at the
-    /// bucket's lane ceiling so that the hashed image of the plan stops
-    /// following the batch. Nothing in this module moves with that except the
-    /// allocations and the padding — see [`schedule`] for the argument that
-    /// every work item past the live ones is masked off.
+    /// The lane count this schedule is carved for: what the padding, the
+    /// allocations, and the grid arithmetic below are sized at. Often larger
+    /// than the fire's live lane count (`engine_cuda::run::Run::planning`
+    /// carves at the bucket ceiling so the plan's hash stops following the
+    /// batch); work items past the live ones are masked off in [`schedule`].
     pub batch_size: u32,
-    /// **AND WHAT THIS FIRE ACTUALLY BROUGHT** — the origin-and-extent
-    /// channel ([`Live`]). Three readers here and no fourth: the staged
-    /// request ids, which are `live.lane_offset + r` (and see `schedule` for
-    /// why `o_indptr` does not move with them); the walk over `kv_indptr`'s
-    /// live contents; and the work-item count `block_valid_mask` retires the
-    /// padding against.
+    /// The origin-and-extent this fire actually brought.
     pub live: Live,
     pub num_qo_heads: u32,
     pub gqa_group_size: u32,
@@ -69,28 +59,11 @@ pub fn estimate(
     // A batch that already fills the grid takes one work item per request.
     if u64::from(req.batch_size) * u64::from(gdy) >= u64::from(max_grid_size) {
         return Ok(WorkEstimate {
-            // **AND IT STILL SPLITS UNDER CAPTURE**, which is the one word
-            // this arm used to answer without looking at the toggle. Two
-            // things hang off `split_kv` that a captured launch cannot do
-            // without: `layout` lays `block_valid_mask` only when it is set,
-            // and that mask is the ONLY thing that retires a work item the
-            // recorded grid over-launched; and `schedule` pads the batch to
-            // the grid only when it is set, so a `false` here bakes THIS
-            // fire's live lane count into a graph the next fire replays at
-            // another. Every other decode arm already splits under capture —
-            // the second return below does, and `can_use_static_nonsplit`
-            // refuses the fast path outright — so this was the one corner
-            // where over-launched work items would run unretired. The arm
-            // itself is unchanged: the chunk still spans the longest lane, so
-            // the split it now declares is one work item per request, exactly
-            // the schedule this arm has always produced.
+            // Splits under capture too: `block_valid_mask` (laid only when
+            // split_kv is set) is what retires an over-launched work item.
             split_kv: req.enable_cuda_graph,
             kv_chunk_size_in_pages: pages.iter().copied().max().unwrap_or(0).max(1),
-            // The count of work items this arm actually emits — one per LIVE
-            // lane, because the chunk spans the longest of them — and so the
-            // count `block_valid_mask` retires the padding against. The test
-            // above is the other half: which arm to take is grid arithmetic,
-            // and grid arithmetic reads the carved count.
+            // One work item per live lane (chunk spans the longest).
             new_batch_size: req.live.requests,
             gdy,
         });
@@ -143,18 +116,10 @@ pub fn schedule(
 
     let mut request_indices = Vec::new();
     let mut kv_tile_indices = Vec::new();
-    // **AND `o_indptr` STAYS WINDOW-LOCAL WHERE THE REQUEST IDS GO
-    // ABSOLUTE**, which is the opposite of `sched_prefill`'s and for the
-    // opposite reason: `decode.cuh` never reads it. The decode kernel writes
-    // its output at the WORK ITEM (`o + bx * ...`), and this vector's one
-    // consumer is the cascade fold, which walks it at `pos` in
-    // `[0, num_requests)` — the launch's own request number, from its own
-    // zero. Adding `lane_offset` here would send the fold's first lane to a
-    // dead entry.
+    // o_indptr stays window-local (unlike request_indices, which go
+    // absolute): the cascade fold walks it at the launch's own request
+    // number from zero, so adding lane_offset would misalign it.
     let mut o_indptr = vec![0i64];
-    // Every index pushed here is bounded by the work-item total, which the
-    // narrowed o_indptr tail below bounds at the device's i32 — the casts
-    // are plain.
     for (batch_idx, &p) in pages.iter().enumerate() {
         let chunks = p.max(1).div_ceil(est.kv_chunk_size_in_pages);
         for kv_tile in 0..chunks {
@@ -165,57 +130,13 @@ pub fn schedule(
     }
     let o_indptr = narrow_all(op, "batch_decode_o_indptr", &o_indptr)?;
 
-    // **THE PADDED BATCH IS THE GRID OR THE LANE COUNT, WHICHEVER IS LARGER.**
-    // `estimate` splits unconditionally under capture now, so the padding is
-    // the grid the occupancy probe granted — but the loop above floors every
-    // lane at ONE work item (`p.max(1)`), zero-page lanes included, where the
-    // search that sized the chunk counted a zero-page lane as zero. A fire
-    // with more lanes than `max_grid_size / gdy` therefore emits more work
-    // items than that grid holds and trips the refusal below, which is a fire
-    // the shell has to serve rather than refuse. The lane count is this
-    // window's `num_requests`, which the graph key holds fixed, so the larger
-    // of the two is still a function of the KEY and not of this fire's kv
-    // lengths — which is the whole property the graph arm exists to keep.
-    //
-    // What it does not cover is the SUM of the two: a fire whose zero-page
-    // lanes and whose split live lanes together outrun both numbers. That one
-    // still refuses, and the refusal is the honest answer — padding every
-    // capture's partial planes to `grid + lanes` would size the workspace for
-    // a case the key cannot promise, and a refusal here is a named fault
-    // rather than a wrong schedule.
-    //
-    // **AND EVERY WORK ITEM THIS PADDING BUYS IS PROVABLY DEAD** — which is
-    // the question a ceiling carve (`Run::planning`) asks of this loop,
-    // because `batch_size` is then the bucket's lane count and the walk above
-    // is over `live.requests` of them. The walk STAYS LIVE and the grid is
-    // covered by the padding, rather than the walk running out to the ceiling
-    // and emitting a one-page item per empty lane; the argument that this is
-    // the safe half of the choice is three lines long:
-    //
-    // * `request_indices.len()` IS `est.new_batch_size`. In the first arm the
-    //   chunk spans the longest lane, so every lane emits exactly one item and
-    //   the arm returns `live.requests`; in the second the arm returns the
-    //   same `sum p.max(1).div_ceil(chunk)` this loop pushes. One expression,
-    //   written twice, and the two are checked against each other by the
-    //   refusal just below.
-    // * `stage` writes `block_valid_mask[i] = i < new_batch_size` over the
-    //   WHOLE padded batch, so every index past the emitted items is `false`,
-    //   and `decode.cuh` retires those blocks before it reads anything else.
-    //   The mask is laid out and bound exactly when `split_kv` is, and
-    //   `estimate` sets `split_kv` unconditionally under capture — which a
-    //   bodied fire always is (`FireBindings::capture` is the load's
-    //   `Graphs::shaped()`), so a ceiling carve never reaches an arm without
-    //   one.
-    // * and what a masked block would have read is zeros anyway: `Staging`
-    //   zero-fills the whole grant before a single `put`, so the padded tail
-    //   of `request_indices` and `kv_tile_indices` names lane 0's tile 0
-    //   rather than the last fire's numbers.
-    //
-    // The other half — walking out to the ceiling and letting `p.max(1)` emit
-    // an item per EMPTY lane — would have to prove those items masked too, and
-    // they would not be: they would fall inside `new_batch_size` and run,
-    // reading the empty lane chunk 2 staged. Correct, but wasted grid and one
-    // more thing to argue; this way there is nothing to argue.
+    // Padded batch = max(grid, carved lane count) — a function of the graph
+    // key, not of this fire's kv lengths, which is what the graph arm needs.
+    // A fire whose zero-page and split live lanes together outrun both is
+    // refused rather than served with a wrong schedule. Every padding work
+    // item is masked off by `block_valid_mask` (laid whenever split_kv is
+    // set, which it always is under capture) and reads zeros regardless
+    // (`Staging` zero-fills the grant before any `put`).
     let padded_batch_size = if req.enable_cuda_graph {
         ((max_grid_size / est.gdy) as usize).max(req.batch_size as usize)
     } else {
@@ -393,12 +314,10 @@ pub fn static_nonsplit(
     enable_cuda_graph: bool,
     int_bytes: usize,
 ) -> Result<Built<DecodePlanInfo>, Error> {
-    // `n` is the carved count — what the padding and the allocations behind
-    // it are sized at; `live_n` is the count this fire actually stages.
+    // `n` is the carved count (padding/allocations); `live_n` is what this
+    // fire actually stages.
     let n = narrow(op, "batch_decode_request_indices", i64::from(num_requests))?;
     let live_n = narrow(op, "batch_decode_request_indices", i64::from(live.requests))?;
-    // The absolute ids of `schedule` above, at one work item per request; and
-    // `o_indptr` window-local for that arm's reason exactly.
     let first = narrow(op, "batch_decode_request_indices", i64::from(live.lane_offset))?;
     let sched = Schedule {
         split_kv: false,

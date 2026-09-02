@@ -4,11 +4,6 @@ use eta_ir::validate::Direction;
 
 use super::readiness::Effect;
 
-// `OpMeta` — one op's node index and result base — stood here with the
-// `op_metadata` that computed a stage's whole table. Its consumer was the
-// deleted device lane table's op side; `Malformed` below outlived it because
-// `channel_effects` answers with it (alto E).
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Malformed {
     ResultBaseOverflowed,

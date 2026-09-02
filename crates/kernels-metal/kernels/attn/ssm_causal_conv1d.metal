@@ -136,3 +136,100 @@ template <typename T>
 instantiate_causal_conv1d(bfloat16, bfloat)
 
 instantiate_causal_conv1d_chunked(bfloat16, bfloat)
+
+// ── the committed form ───────────────────────────────────────────────────────
+//
+// The buffered recurrence's arm (`engine_metal::rs`). Lane `r` of the window
+// runs over an EXTENDED row run: `replay[lane0 + r]` buffered tokens gathered
+// ahead of its own `indptr[r+1] - indptr[r]` rows, laid end to end in `x`
+// (lane `r`'s run begins at `indptr[r] + sum_{j<r} replay[lane0 + j]`). Every
+// row lands an output; the state persists as of row `commit[lane0 + r] - 1`
+// and not one row further, so a speculative window is computed from the
+// state it should see and folded only as far as it was accepted. `commit`
+// of zero leaves the bank untouched. The tables are the FIRE's, indexed at
+// `lane0 + r`; the CSR is the window's own.
+template <typename T>
+[[kernel]] void causal_conv1d_committed(
+    const device T* x              [[buffer(0)]],
+    const device int* indptr       [[buffer(1)]],
+    const device int* replay       [[buffer(2)]],
+    const device int* commit       [[buffer(3)]],
+    const device int* slots        [[buffer(4)]],
+    const constant int& lane0      [[buffer(5)]],
+    const device T* weight         [[buffer(6)]],
+    const device float* conv_state [[buffer(7)]],
+    device float* new_conv_state   [[buffer(8)]],
+    device T* y                    [[buffer(9)]],
+    const constant int& channels   [[buffer(10)]],
+    const constant int& conv_width [[buffer(11)]],
+    const constant int& dilation   [[buffer(12)]],
+    uint2 pos [[thread_position_in_grid]]) {
+  const int c = int(pos.x);
+  const int r = int(pos.y);
+  int begin = indptr[r];
+  for (int j = 0; j < r; ++j) {
+    begin += replay[lane0 + j];
+  }
+  const int span = (indptr[r + 1] - indptr[r]) + replay[lane0 + r];
+  if (span <= 0) {
+    return;
+  }
+  const int width = conv_width;
+  const int dil = dilation;
+  const int hist = (width - 1) * dil + 1;
+
+  const size_t chans = size_t(channels);
+  const size_t taps = size_t(conv_width);
+  const size_t col = size_t(c);
+
+  const int slot = slots[lane0 + r];
+  if (slot < 0) {
+    return;
+  }
+  const size_t slab = size_t(slot) * size_t(hist) * chans;
+  const size_t tap0 = size_t(c) * taps;
+
+  for (int t = 0; t < span; ++t) {
+    float acc = 0.0f;
+    for (int k = 0; k < width; ++k) {
+      const int src = t - (width - 1 - k) * dil;
+      const float tap = (src < 0)
+          ? conv_state[slab + size_t(hist + src) * chans + col]
+          : float(x[size_t(begin + src) * chans + col]);
+      acc += tap * float(weight[tap0 + size_t(k)]);
+    }
+    y[size_t(begin + t) * chans + col] = T(causal_conv1d_silu(acc));
+  }
+
+  int keep = commit[lane0 + r];
+  if (keep > span) {
+    keep = span;
+  }
+  if (keep <= 0) {
+    return;
+  }
+  // The new window: the last `hist` rows of (state ++ committed rows), staged
+  // before any of it is written because a short commit reads cells this loop
+  // also lands on.
+  float next[64];
+  for (int s = 0; s < hist && s < 64; ++s) {
+    const int src = keep - hist + s;
+    next[s] = (src < 0)
+        ? conv_state[slab + size_t(hist + src) * chans + col]
+        : float(x[size_t(begin + src) * chans + col]);
+  }
+  for (int s = 0; s < hist && s < 64; ++s) {
+    new_conv_state[slab + size_t(s) * chans + col] = next[s];
+  }
+}
+
+#define instantiate_causal_conv1d_committed(name, itype)                \
+  template [[host_name("causal_conv1d_committed_" #name)]]              \
+  [[kernel]] void causal_conv1d_committed<itype>(                       \
+      const device itype*, const device int*, const device int*,        \
+      const device int*, const device int*, const constant int&,        \
+      const device itype*, const device float*, device float*,          \
+      device itype*, const constant int&, const constant int&,          \
+      const constant int&, uint2);
+
+instantiate_causal_conv1d_committed(bfloat16, bfloat)

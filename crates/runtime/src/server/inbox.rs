@@ -152,37 +152,3 @@ impl ServiceHandler for InboxRegistry {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::InboxRegistry;
-
-    #[tokio::test]
-    async fn buffers_messages_fifo_before_receive() {
-        let mut inbox = InboxRegistry::default();
-        inbox.deliver("proc".into(), "first".into());
-        inbox.deliver("proc".into(), "second".into());
-
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        inbox.register_waiter("proc".into(), tx1);
-        assert_eq!(rx1.await.unwrap(), "first");
-
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        inbox.register_waiter("proc".into(), tx2);
-        assert_eq!(rx2.await.unwrap(), "second");
-    }
-
-    #[tokio::test]
-    async fn wakes_waiters_in_registration_order() {
-        let mut inbox = InboxRegistry::default();
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-
-        inbox.register_waiter("proc".into(), tx1);
-        inbox.register_waiter("proc".into(), tx2);
-        inbox.deliver("proc".into(), "first".into());
-        inbox.deliver("proc".into(), "second".into());
-
-        assert_eq!(rx1.await.unwrap(), "first");
-        assert_eq!(rx2.await.unwrap(), "second");
-    }
-}

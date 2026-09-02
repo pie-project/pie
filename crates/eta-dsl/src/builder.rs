@@ -1,17 +1,10 @@
 //! The neutral trace **builder** — the DSL crate's lowering core.
 //!
-//! [`Builder`] is the boundary-agnostic authoring core: it takes
-//! descriptor-port bindings ([`bind_port`](Builder::bind_port)) and
-//! stage closures ([`stage`](Builder::stage)), traces the closures once into
-//! the IR's canonical [`TraceContainer`], and runs the SDK span lints. It does
-//! **not** bind (the guest does not bind — `forward-pass.program` is the
-//! authoritative gate); the author-facing `ForwardPass`/`Pipeline`/`WorkingSet`
-//! lifetime objects live in `inferlet`, wrap the WIT resources, and drive this
-//! builder.
-//!
-//! Assembly invariants: gid re-key (interning order → declaration order),
-//! `HostRole` derivation, terminal-output inference, and the reader auto-drain
-//! drop.
+//! [`Builder`] takes descriptor-port bindings ([`bind_port`](Builder::bind_port))
+//! and stage closures ([`stage`](Builder::stage)), traces the closures once
+//! into the IR's canonical [`TraceContainer`], and runs the SDK span lints.
+//! It does not bind — `forward-pass.program` is the authoritative gate; the
+//! author-facing lifetime objects live in `inferlet` and drive this builder.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -63,11 +56,10 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Bind a descriptor [`Port`] to a channel. Records the port's
-    /// endpoint claim on the channel per its fixed consumption discipline
-    /// ([`Port::consumes`]): the token-indexed family (`embed`, `positions`,
-    /// `w_slot`/`w_off`) **takes**; geometry and masks **read**. The
-    /// claim drives host-role derivation and the span lints.
+    /// Bind a descriptor [`Port`] to a channel. Records the port's endpoint
+    /// claim per its fixed consumption discipline ([`Port::consumes`]):
+    /// token-indexed ports take, geometry/masks read. Drives host-role
+    /// derivation and the span lints.
     #[track_caller]
     pub fn bind_port(&mut self, port: Port, source: impl Into<PortInput>) {
         let source = source.into();
@@ -82,9 +74,9 @@ impl<'a> Builder<'a> {
         self.ports.push((port, source));
     }
 
-    /// Like [`bind_port`](Builder::bind_port), but WITHOUT recording the
+    /// Like [`bind_port`](Builder::bind_port), but without recording the
     /// endpoint claim — for callers that already claimed eagerly at pass
-    /// construction (`Channel::note_desc_claim`, F8).
+    /// construction.
     pub fn bind_port_recorded(&mut self, port: Port, source: impl Into<PortInput>) {
         self.ports.push((port, source.into()));
     }
@@ -100,13 +92,8 @@ impl<'a> Builder<'a> {
     }
 
     /// Read-out rows for `intrinsics::logits()`: an explicit `Readout`
-    /// channel, else the number of `EmbedIndptr` lanes.
-    ///
-    /// Saturating rather than truncating: a channel's cell shape is only
-    /// bounded to a `u64` element product, so a rank-2 read-out channel can
-    /// carry more elements than a `u32` row count holds. Wrapping there lands
-    /// on a small row count that plans and runs, and the pass then reads out
-    /// one row where the author asked for billions.
+    /// channel, else the number of `EmbedIndptr` lanes. Saturating rather
+    /// than truncating, since wrapping would silently under-read.
     fn rows(&self) -> u32 {
         if let Some(channel) = self.channel_port(Port::Readout) {
             return saturating_rows(channel.shape().numel()).max(1);
@@ -134,22 +121,17 @@ impl<'a> Builder<'a> {
             crate::model::with_constants(self.vocab, self.page_size, || {
                 context::with_session(|| self.record(rows))
             });
-        // Authoring mistakes come first and alone: everything below reads the
-        // recorded ops as if they typed, and a poisoned value makes the later
-        // diagnostics describe the recovery rather than the mistake.
+        // Authoring mistakes come first and alone, before anything below
+        // reads the recorded ops as if they typed.
         if !authoring.is_empty() {
             return Err(TraceErrors(authoring));
         }
         let (stage_results, ports) = result;
 
-        // The recorder interns channels in first-REFERENCE order (the order they
-        // appear in the traced body, e.g. `embed(toks,…)` interns `toks` first).
-        // But an inferlet DECLARES + indexes channels — seeds, host endpoints — in
-        // DECLARATION order. Re-key the container to gid (declaration) order so the
-        // two agree, remapping every channel reference (ChanTake / ChanRead /
-        // ChanPut ops + descriptor `PortSource::Channel`). Without this, a
-        // channel-0 [B,P] seed (e.g. beam `pages`) validates against whatever
-        // channel happened to be referenced first (a [B] channel) → numel mismatch.
+        // The recorder interns channels in first-reference order, but an
+        // inferlet declares/indexes channels in declaration order. Re-key
+        // the container to gid (declaration) order so the two agree,
+        // remapping every channel reference.
         let mut order: Vec<usize> = (0..channels.len()).collect();
         order.sort_by_key(|&i| channels[i].borrow().gid);
         let mut remap = vec![0u32; channels.len()];
@@ -178,11 +160,8 @@ impl<'a> Builder<'a> {
             })
             .collect();
 
-        // Same story for the NAME table. `intern_name` assigns indices in
-        // first-USE order, but the container requires the table to be strictly
-        // sorted and unique -- so a program naming `envelope_dot` before
-        // `attn_page_mask` emitted a table the loader rejects. This went
-        // unnoticed while every program used at most one second-party name.
+        // Same story for the name table: `intern_name` assigns first-use
+        // order, but the container requires it strictly sorted and unique.
         let mut name_order: Vec<usize> = (0..names.len()).collect();
         name_order.sort_by(|&a, &b| names[a].cmp(&names[b]));
         let mut name_remap = vec![0u16; names.len()];
@@ -218,20 +197,16 @@ impl<'a> Builder<'a> {
                 let has_desc_use = !st.desc_takes.is_empty() || !st.desc_reads.is_empty();
                 let has_host_put = !st.host_puts.is_empty();
                 let host_consumes = !st.host_takes.is_empty() || !st.host_reads.is_empty();
-                // A program-PRODUCED channel with NO program consumer (take/read),
-                // NO descriptor binding, and NO host writer is a terminal OUTPUT the
-                // host reads (e.g. beam `out`/`out_par`/`out_scr`): the guest's `take`
-                // at runtime isn't visible at trace time, so infer Reader here.
+                // Produced, with no program consumer, descriptor binding, or
+                // host writer: a terminal output the host reads.
                 let is_terminal_output = has_prog_put
                     && !has_prog_consume
                     && !has_desc_use
                     && !has_host_put
                     && !st.seeded
                     && st.seed.is_none();
-                // A seeded descriptor-only channel is replaceable through the
-                // host `set` operation after bind. It therefore needs the same
-                // device-visible Writer endpoint as an explicit host `put`,
-                // even when its initial value came from the seed table.
+                // A seeded descriptor-only channel is replaceable through
+                // host `set`, so it needs a Writer endpoint too.
                 let seeded_descriptor_writer = st.seeded && has_desc_use && !has_prog_put;
                 let host_role = if (has_host_put || seeded_descriptor_writer) && !has_prog_put {
                     HostRole::Writer
@@ -329,7 +304,7 @@ impl Traced {
     pub fn container(&self) -> &TraceContainer {
         &self.container
     }
-    /// Program-set identity hash (FNV-1a over the canonical container bytes, C3).
+    /// Program-set identity hash (FNV-1a over the canonical container bytes).
     pub fn identity_hash(&self) -> u64 {
         self.container.hash()
     }
@@ -338,7 +313,7 @@ impl Traced {
         self.container.encode()
     }
     /// Channel identities (gids) by dense index — the builder↔bridge contract:
-    /// the WIT channel-handle list must follow exactly this order (A.5).
+    /// the WIT channel-handle list must follow exactly this order.
     pub fn channel_order(&self) -> &[u64] {
         &self.channel_order
     }

@@ -1,57 +1,12 @@
-//! Per-engine batching: when accumulated fires launch.
-//!
-//! - [`worker`]: `BatchScheduler` — the per-engine run loop (accumulate,
-//!   decide, dispatch, retire). The only public submodule (external crates
-//!   construct `worker::BatchScheduler` directly for host-engine test
-//!   harnesses); `batch`/`dispatch`/`frame`/`probe`/`stats`/`wire` are
-//!   internal.
-//! - `batch`: capacity accounting + the dense-batch accumulator.
-//! - `dispatch`: the engine ABI's per-`engine_id` verbs (`register_program`,
-//!   `bind_instance`, the `copy_*` family, ...) — re-exported at this
-//!   module's root since they call [`scheduler_handle`], which is
-//!   scheduler-owned state.
-//! - `wire`: owned `LaunchPlan`s -> the batched wire request, page-trim.
-//! - `frame`: the wait-all-active-lanes frame fire rule (every k,
-//!   including the default single-slot k = 1).
-//! - `stats`: `SchedulerStats` (per-engine, lock-free) + [`AggregateStats`]
-//!   (cross-engine, this module's `get_stats`).
-//! - `probe`: per-fire lifecycle probes (`profile-fire` feature).
-//!
-//! This module also owns the engine-id -> `SchedulerHandle` registry: the
-//! `dispatch` trampolines and this module's own `submit_async`/
-//! `submit_prebuilt_async` look a handle up here to reach the scheduler
-//! that owns a given `engine_id`. `engine/` (L0) never imports this module.
+//! Per-engine batching: when accumulated fires launch. Also owns the
+//! engine-id -> `SchedulerHandle` registry.
 
 pub(crate) mod batch;
-// tart (V2): the fire planner — seriation (deepest-first bands, the
-// gray sentinel) and the per-site lowerings. Orphaned by the dev merge
-// (upstream's assembly does not call it yet); re-declared so the module
-// and its pinned tests stay live while the 0.3 regraft lands
-// (playbook: "0.3 re-port step 1").
 pub(crate) mod dispatch;
 pub(crate) mod fire_plan;
 pub(crate) mod frame;
 pub(crate) mod probe;
 pub(crate) mod stats;
-// `wire` STOOD HERE, and its whole reason was the CSR merge. It was 716
-// lines: `new_batched_forward_request_with_capacity` (a `LaunchPlan` with
-// thirty pre-seeded indptrs), `append_request_with_options` (eleven
-// simultaneous CSR merges per member), `append_multi_row_request`, and a
-// `TrimPlan` that dropped whole all-masked KV pages out of the merged page
-// list before it was written.
-//
-// A batch is a concatenation of lanes now (`crate::engine::fire`'s header),
-// so the merge is `extend` and lives in `batch.rs` in nine lines. The one
-// piece with a claim of its own is the page trim, and it is deliberately not
-// carried over: it was an optimisation ON THE MERGED FORM — it re-derived
-// each lane's `kv_len` from the EMITTED page count so the two agreed — and
-// the same optimisation on lanes is an edit to `Lane::kv.pages` and
-// `Lane::kv.held`, which is a different function and still unwritten
-// (`palo B-mask`: the axis reaches the shell now — `Lane::mask` stages and
-// binds — but dropping an all-masked PAGE out of a lane's table is a second
-// thing, and it has to agree with the mask's own `total`). `grammar::brle`'s
-// `droppable_page_bits` and `write_skipping` — the two primitives it was
-// built from, with their own tests — are untouched and waiting.
 pub mod worker;
 
 pub use frame::FrameStamp;
@@ -64,8 +19,8 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 
 // `copy_d2h`/`copy_h2d`/`copy_h2h`/`copy_rs_d2d` round out the engine ABI
-// verb surface (see `dispatch`'s module doc for which are wired into the
-// current mock-engine fire path vs. reserved/unit-test-only).
+// verb surface (see `dispatch`'s module doc for which are wired vs.
+// reserved).
 #[allow(unused_imports)]
 pub(crate) use dispatch::{
     bind_instance, bind_instance_classified, close_channels, close_instance, copy_d2d, copy_d2h,
@@ -147,7 +102,7 @@ pub(crate) fn ledger_monotonic_ns() -> u64 {
         .saturating_add(value.tv_nsec as u64)
 }
 
-// Scheduler handle registry (moved out of `engine/registry.rs`)
+// Scheduler handle registry
 // =============================================================================
 
 fn handle_registry() -> &'static RwLock<Vec<Option<SchedulerHandle>>> {
@@ -194,27 +149,16 @@ pub async fn debug_dump(engine_id: usize) -> Result<String> {
 }
 
 // =============================================================================
-// Frame size (`[model.scheduler] frame_size`) — the Vesuvius constant k
+// Frame size (`[model.scheduler] frame_size`)
 // =============================================================================
 
 /// How long a lane that is hard-blocking a frame's seal may go without
 /// submitting before the runtime stops waiting for it
-/// (`[model.scheduler] submit_deadline_us`, default 50ms). Guests read it as
-/// `model.submit-deadline-us()`.
-///
-/// Small enough to be a real bound on fleet exposure because it measures a
-/// much narrower interval than its size suggests: the clock runs only while
-/// the lane is an awaited member with nothing submitted, and is stopped by
-/// run-ahead, by an unretired dispatch (the runtime owes it a result), by a
-/// bind in flight, and by `forward.park()`. The host round trip has its own
-/// headroom in [`configured_submit_depth`].
-///
-/// This number can no longer kill: at the deadline the lane is dropped from
-/// the wait-set (an involuntary `forward.park()`), its queued frames still
-/// dispatch, and its next fire rejoins. It is a density bound — how long the
-/// fleet waits for a straggler — so a value that is too small costs a little
-/// epoch density and never a request. Termination is a separate, far longer
-/// verdict; see [`configured_silence_timeout`].
+/// (`[model.scheduler] submit_deadline_us`, default 50ms). A density bound,
+/// not a correctness one: at the deadline the lane is dropped from the
+/// wait-set, its queued frames still dispatch, and its next fire rejoins.
+/// Termination is a separate, longer verdict; see
+/// [`configured_silence_timeout`].
 pub fn configured_submit_deadline() -> Duration {
     *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(50_000))
 }
@@ -228,11 +172,9 @@ pub fn set_submit_deadline(deadline: Duration) {
 static SUBMIT_DEADLINE: OnceLock<Duration> = OnceLock::new();
 
 /// How long a lane may stay silent in total before its process is
-/// terminated. Unlike the leash above this IS a verdict, so it is generous:
-/// the leash already keeps a straggler from holding the fleet, which means
-/// nothing but an abandoned pipeline ever reaches this. A guest that means to
-/// go quiet calls `forward.park()`, which ends the silence and is never
-/// killed — that is exactly the contract this enforces.
+/// terminated. Unlike the deadline above, this is a verdict, so it is
+/// generous — a guest that means to go quiet calls `forward.park()`, which
+/// ends the silence and is never killed.
 ///
 /// Configured by `[model.scheduler] silence_timeout_secs` (default 30s).
 pub fn configured_silence_timeout() -> Duration {
@@ -246,20 +188,10 @@ pub fn set_silence_timeout(timeout: Duration) {
 
 static SILENCE_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
-/// Waves per frame (k): a static deployment constant, fixed at runtime start
-/// exactly like the KV page size — never renegotiated per frame and never
-/// adapted from runtime timing. Guests query it via `model.frame-size()` and
-/// size their frames/channels to it.
-///
-/// The default is 2. At k = 1 the wait-all quorum runs once per token, and
-/// above ~64 concurrent processes the fleet stops overlapping batches
-/// entirely — measured duty (forward batches in flight) collapses from 1.7
-/// to 1.0 and becomes bimodal, costing 29% throughput and 28% latency at
-/// concurrency 256. k = 2 halves the number of quorum boundaries and holds
-/// duty at 1.6 with no regression at any lower concurrency. k = 3 and k = 4
-/// measure the same as k = 2 while costing more engine staging depth, so 2
-/// is the setting (CONTENTION_FOLLOWUP §20.8). Set `[model.scheduler]
-/// frame_size = 1` to restore the per-wave path.
+/// Waves per frame (k): a static deployment constant, fixed at runtime
+/// start and never renegotiated per frame. Guests query it via
+/// `model.frame-size()` and size their frames/channels to it. Default is 2;
+/// `[model.scheduler] frame_size = 1` selects the per-wave path.
 pub fn configured_frame_size() -> usize {
     match FRAME_SIZE.load(Ordering::Relaxed) {
         0 => DEFAULT_FRAME_SIZE,
@@ -281,24 +213,10 @@ static FRAME_SIZE: AtomicUsize = AtomicUsize::new(0);
 // Guest run-ahead sizing
 // =============================================================================
 
-/// **Frames a lane keeps outstanding, DERIVED** (alto E; design §1 article 8).
-///
-/// One running per frame the runtime keeps posted to the engine, plus one the
-/// guest is building while they run — `engine::runahead::Runahead::
-/// submit_depth`, which is [`configured_dispatch_depth`] `+ 1`. The formula
-/// lives in the one module that owns every run-ahead depth, and this reads it
-/// rather than restating it.
-///
-/// It used to be `[runtime] frame_submit_depth`, a third independently
-/// configured number whose own documentation had to explain that it was not
-/// independent of the other two ("a frame is k waves of device time, so a
-/// deployment that moves k must re-measure this"). Three numbers with three
-/// owners, two of them guest-visible, checked jointly in a third crate: survey
-/// debt 8. The knob is gone; the default answer is unchanged, because the
-/// defaults were `frame_dispatch_depth = 2` and `frame_submit_depth = 3`.
-///
-/// Guests never read this. They get `model.channel-capacity()`, which is
-/// [`channel_capacity`].
+/// Frames a lane keeps outstanding, derived as
+/// `engine::runahead::Runahead::submit_depth`, which is
+/// [`configured_dispatch_depth`] `+ 1`. Guests never read this directly;
+/// they get `model.channel-capacity()`, which is [`channel_capacity`].
 pub fn configured_submit_depth() -> usize {
     ::engine::runahead::Runahead::of(
         u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
@@ -341,42 +259,11 @@ impl std::fmt::Display for ReconfigureRefused {
 impl std::error::Error for ReconfigureRefused {}
 
 /// Change the batching knobs on a running runtime, between rounds of a
-/// measurement sweep.
-///
-/// **TWO KNOBS, NOT THREE** (alto E; survey debt 8). `frame_submit_depth` was
-/// the third parameter and it was never independent: the guest's window is
-/// `frame_dispatch_depth + 1` (`engine::runahead::Runahead::submit_depth`),
-/// so a sweep that moved the two separately measured shapes the runtime can
-/// no longer be asked for. `channel_capacity` — the one of these numbers a
-/// guest actually reads — moves with the dispatch depth now.
-///
-/// **This is a quiesce gate, not a drain barrier, and the difference is the
-/// point.** A drain barrier would let in-flight frames retire and then swap.
-/// That is not sufficient here, because [`configured_frame_size`] is not
-/// runtime-internal state: it is handed to guests through `model.frame-size()`
-/// (`crate::inferlet::host::model`), and the SDK caches it for the life of the
-/// program (`eta.rs`, a per-thread `OnceLock`). A value already read cannot be
-/// recalled by anything the runtime does afterwards, so a guest that survives
-/// the swap keeps building frames to the old k while the runtime expects the
-/// new one. No barrier fixes that; only the absence of guests does.
-///
-/// Which costs nothing, because the sweep restarts the load between rounds
-/// anyway — restarting a guest is milliseconds and restarting the model is
-/// minutes, and that asymmetry is the whole reason these knobs became
-/// swappable rather than staying boot-fixed.
-///
-/// The bounds these two numbers have to clear are NOT checked here.
-/// `worker::config::RuntimeConfig::validate` owns them, is where both factors
-/// are visible at once, and reads them off `engine::runahead::Runahead` — the
-/// one module that owns the formula. Duplicating them would create a second
-/// spelling that can disagree. Callers pass values that came through that
-/// validation.
-///
-/// (It used to be one JOINT bound, `frame_dispatch_depth * frame_size <
-/// kUploadStagingDepth`, against a fixed pool of thirteen pinned slots. The
-/// engine CARVES its staging ring from these two numbers now — alto F2b — so
-/// there is no fixed pool for a product to overflow and the bound is per
-/// factor.)
+/// measurement sweep. A quiesce gate, not a drain barrier: SDKs cache
+/// [`configured_frame_size`] for the life of the guest program, so only the
+/// absence of guests makes the swap safe. Bound validation is not done
+/// here; callers pass values that already cleared
+/// `worker::config::RuntimeConfig::validate`.
 pub fn reconfigure(frame_size: usize, dispatch_depth: usize) -> Result<(), ReconfigureRefused> {
     let live = crate::inferlet::process::live_count();
     if live > 0 {
@@ -387,23 +274,10 @@ pub fn reconfigure(frame_size: usize, dispatch_depth: usize) -> Result<(), Recon
     Ok(())
 }
 
-/// **Host-reader channel capacity, in cells** — what a guest reads as
-/// `model.channel-capacity()`.
-///
-/// `engine::runahead::Runahead::channel_capacity` is the formula and this is
-/// the runtime's two live numbers put into it: the dispatch depth the
-/// deployment configured and the frame size it configured. Both the peak
-/// occupancy (`submit_depth × k`) and the visibility margin (`+ 1`) are
-/// argued there — a ring sized to exactly the peak re-imports the host round
-/// trip into the critical path, measured at 28.0k against 34.3k tok/s on the
-/// same guest (text-completion-bench).
-///
-/// At k = 1 an undersized ring is silent: `fire::submit_pass_stamped`
-/// short-circuits before `validate_frame`, so the static-admission capacity
-/// proof is k >= 2 only. A k = 1 guest that undersizes its rings serialises
-/// with no diagnostic — and since alto E deleted the sleep-retry loop, one
-/// that OVERFILLS a device ring gets the engine's loud non-commit fault
-/// instead of back-pressure. Sizing to this number is the contract.
+/// Host-reader channel capacity, in cells — what a guest reads as
+/// `model.channel-capacity()`: peak occupancy (`submit_depth * k`) plus a
+/// `+ 1` visibility margin, so a ring sized to the peak does not re-import
+/// the host round trip into the critical path.
 pub fn channel_capacity() -> usize {
     ::engine::runahead::Runahead::of(
         u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
@@ -474,9 +348,9 @@ impl SchedulerShutdownHandle {
 }
 
 /// Spawns one per-engine [`BatchScheduler`] for each of `engine_indices`.
-/// Replaces the former `InferenceService` actor: schedulers are plain
-/// worker threads registered directly in this module's handle registry, so
-/// there is no actor round-trip on the hot submit path.
+/// Schedulers are plain worker threads registered directly in this
+/// module's handle registry, so there is no actor round-trip on the hot
+/// submit path.
 pub async fn spawn(
     engine_indices: &[usize],
     page_size: u32,
@@ -536,28 +410,10 @@ pub fn submit_async(
     )
 }
 
-/// The memory an engine's KV pages live in, for a plan being addressed to it.
-///
-/// # Why this is a lookup and not a constant
-///
-/// It WAS a constant. Every `KvCopyPlan` this module built stamped
-/// `PIE_MEMORY_DOMAIN_CUDA_DEVICE` on both ends, at four sites here and five
-/// more in `dispatch`, whichever engine the plan was for. That is right on
-/// CUDA and names somebody else's memory everywhere else, and the copy in
-/// question is a page-to-page move inside one pool -- so an engine that
-/// checked the tag, which is the only thing standing between a prefix-cache
-/// hit and a copy across unrelated allocations, had to refuse every one.
-///
-/// The domain is the BACKEND's answer, recorded on its `EngineSpec` when it
-/// registered.
-///
-/// # An unknown engine
-///
-/// Answers `HOST_PINNED`, which no engine's device pages live in, so a plan
-/// built for an engine that is not registered is refused by the receiver
-/// rather than accepted as one of its own. The call sites cannot return an
-/// error from inside a struct literal, and the id they hold has already been
-/// used to reach a scheduler handle on the next line.
+/// The memory an engine's KV pages live in, for a plan being addressed to
+/// it. Not a constant: recorded on its `EngineSpec` at registration. An
+/// unregistered engine answers `HOST_PINNED`, so its plan is refused rather
+/// than accepted as memory it owns.
 pub(crate) fn device_domain(engine_idx: usize) -> ::engine::MemoryDomain {
     crate::engine::get_spec(engine_idx).map_or(::engine::MemoryDomain::HostPinned, |s| {
         s.device_domain
@@ -711,9 +567,8 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     lora_program: bool,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
-        // The HANDLE's, because this path is given a scheduler rather than an
-        // engine id -- and it is the same answer, recorded when that
-        // scheduler was built.
+        // The handle's domain: this path is given a scheduler, not an
+        // engine id, but it is the same answer recorded at build time.
         src: handle.device_domain(),
         dst: handle.device_domain(),
         src_page_ids: copy_src,
@@ -750,14 +605,9 @@ pub async fn get_stats() -> AggregateStats {
 #[cfg(test)]
 mod tests {
     /// A plan for an engine nobody registered names memory no device has.
-    ///
-    /// `device_domain` cannot return an error -- its callers use it inside a
-    /// struct literal -- so the question is what it answers when the lookup
-    /// misses. `HOST_PINNED` is chosen because no engine's DEVICE pages live
-    /// there: the plan is built, addressed, and refused by whatever receives
-    /// it. The alternative, defaulting to a device domain, hands an unknown
-    /// engine's plan the tag of a real pool and asks an engine to copy pages
-    /// into it.
+    /// `device_domain` cannot return an error from inside a struct literal,
+    /// so it answers `HOST_PINNED`: no engine's device pages live there, so
+    /// the plan is refused by whatever receives it.
     #[test]
     fn an_unregistered_engine_names_no_devices_memory() {
         let domain = super::device_domain(usize::MAX);

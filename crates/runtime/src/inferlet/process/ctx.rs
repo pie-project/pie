@@ -1,7 +1,4 @@
-//! Process context for WASM component execution.
-//!
-//! Per-process runtime state attached to every wasmtime `Store`: WASI
-//! context, filesystem/Python preopens, and dynamic-linking resource maps.
+//! Per-process runtime state attached to every wasmtime `Store`: WASI context, filesystem/Python preopens, and dynamic-linking resource maps.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,19 +41,15 @@ pub struct ProcessCtx {
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
-    /// wasi:http@0.3 host hooks. Enforces the instance's network policy at the
-    /// one host-side choke point (`is_supported_scheme`), the p3 analog of the
-    /// old `pie:core/http.fetch` `network_allowed()` gate.
+    /// wasi:http@0.3 host hooks. Enforces the instance's network policy at
+    /// the one host-side choke point (`is_supported_scheme`).
     http_hooks: PieHttpHooks,
 
-    /// Whether outbound network is permitted (gates `pie:core/http.fetch`,
-    /// parity with the wasi:http linker which is only wired when allowed).
+    /// Whether outbound network is permitted (gates `pie:core/http.fetch`).
     network_allowed: bool,
 
     /// Per-instance scratch directory, deleted on Drop. `None` when the
-    /// sandbox denies the filesystem: nothing was created, so there is
-    /// nothing to remove — and with `allow_fs` off `base_dir` is empty, so
-    /// the joined path would be a *relative* `./<pid>` under the server's CWD.
+    /// sandbox denies the filesystem.
     scratch_dir: Option<PathBuf>,
 
     // Dynamic linking support for proxy resources
@@ -67,30 +60,23 @@ pub struct ProcessCtx {
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
     residency: Arc<Mutex<ProcessResidency>>,
-    /// Held while this process is in the prewarm cohort: spawn through
-    /// instantiation, guest bring-up and bind admission. Released once the
-    /// bind permit is won, so the conveyor bounds how many processes have
-    /// instantiated without being able to make engine progress. The admit
-    /// paths clear it again as a safety net.
+    /// Held while this process is in the prewarm cohort (spawn through bind
+    /// admission); bounds how many processes instantiate without engine
+    /// progress. Released once the bind permit is won.
     prewarm_permit: Option<OwnedSemaphorePermit>,
-    /// The bind-ahead permit, acquired at the first operation that creates
-    /// per-instance engine state (channel registration / instance bind /
-    /// working-set declaration). Sized above execution admission so the
-    /// next cohort's engine bring-up overlaps the current cohort's
-    /// execution instead of the generation boundary. Transferred to
-    /// deferred teardown alongside the execution permit, bounding engine
-    /// registry overlap to the bind-ahead window.
+    /// The bind-ahead permit, acquired at the first operation creating
+    /// per-instance engine state. Transferred to deferred teardown alongside
+    /// the execution permit.
     bind_permit: Option<OwnedSemaphorePermit>,
     bind_admitted: bool,
-    /// The real concurrency permit, acquired lazily at fire submit (strict
-    /// admission). Process drop transfers it to deferred teardown so the
-    /// next cohort cannot overlap stale scheduler membership or pooled
-    /// resources.
+    /// The real concurrency permit, acquired lazily at fire submit. Process
+    /// drop transfers it to deferred teardown so the next cohort cannot
+    /// overlap stale scheduler membership or pooled resources.
     execution_permit: Option<OwnedSemaphorePermit>,
     execution_admitted: bool,
     admission_wait_us: u64,
     /// This process's lock-free planner residency flag, taken once on the
-    /// first residency-gate call. See [`crate::planner::Planner::residency_flag`].
+    /// first residency-gate call.
     residency_flag: Option<Arc<AtomicBool>>,
 }
 
@@ -100,21 +86,8 @@ impl Drop for ProcessCtx {
         let bind_permit = self.bind_permit.take();
         self.execution_admitted = false;
         self.bind_admitted = false;
-        // Free the execution seat HERE, on the guest's own thread, rather
-        // than carrying the permit into the spawned teardown below. The
-        // guest has stopped producing (this Drop runs 0.05 ms p50 after
-        // `guest_main_returned`), so the seat is genuinely free; deferring
-        // its release to the teardown task made every successor wait out
-        // that task's spawn latency too — 27.8 ms p50 per retiree at conc
-        // 512, and a whole cohort retires at once. Order is the contract:
-        // the Terminate leave is posted first on this same producer, so
-        // every engine observes leave-then-release and the policy never
-        // credits a slot whose departure it has not yet seen.
-        //
-        // Nothing may precede this. The scratch directory used to be removed
-        // first, which put a filesystem syscall — and, at a cohort boundary,
-        // 512 of them — between the last token and the successor's
-        // admission; it is torn down with the rest of the resources instead.
+        // Free the seat here, not in spawned teardown: Terminate leave is
+        // posted first on this producer, so every engine sees leave-then-release.
         let terminate_fences = execution_permit.as_ref().map(|_| {
             let fences = crate::scheduler::worker::post_process_terminate_fenced(self.id);
             crate::scheduler::worker::notify_execution_slot_released(self.id);
@@ -154,10 +127,7 @@ impl WasiHttpView for ProcessCtx {
 
 /// wasi:http@0.3 hooks carrying the instance's network policy. When the
 /// network is disabled every scheme is reported unsupported, so
-/// `wasi:http/handler#handle` fails each outgoing request with a protocol
-/// error and the guest's `client.send` returns `Err` — instantiation still
-/// succeeds (parity with the old host-side `network_allowed()` gate; the p2
-/// path drops the link entirely instead).
+/// `wasi:http/handler#handle` fails each request rather than refusing to instantiate.
 pub struct PieHttpHooks {
     network_allowed: bool,
 }
@@ -189,8 +159,7 @@ impl ProcessCtx {
     ) -> anyhow::Result<Self> {
         let mut builder = WasiCtx::builder();
 
-        // Network capability. `inherit_network` exposes the host network;
-        // `socket_addr_check` filters per-connect/per-bind. Skipping
+        // `socket_addr_check` filters per-connect/per-bind; skipping
         // `inherit_network` denies all socket operations entirely.
         if policy.network.allow {
             builder.inherit_network();
@@ -299,10 +268,8 @@ impl ProcessCtx {
     }
 
     /// The residency-gate fast path: one relaxed load, no lookup, no lock.
-    ///
-    /// The flag is taken once and cached; until the planner hands one out
-    /// (pre-registration, or no planner at all) the process holds no
-    /// pooled pages and is resident by definition.
+    /// Until the planner hands out a flag, the process holds no pooled
+    /// pages and is resident by definition.
     pub(crate) fn is_resident_fast(&mut self) -> bool {
         if self.residency_flag.is_none() {
             let Some(planner) = crate::planner::planner() else {
@@ -320,10 +287,7 @@ impl ProcessCtx {
         self.prewarm_permit = permit;
     }
 
-    /// Free the prewarm conveyor slot. Called once bind admission is won —
-    /// the slot spans spawn through bind, so a process that has not bound
-    /// still occupies one and instantiation stays bounded by the conveyor
-    /// rather than by the request count. Idempotent.
+    /// Free the prewarm conveyor slot. Called once bind admission is won. Idempotent.
     pub(crate) fn release_prewarm_permit(&mut self) {
         self.prewarm_permit = None;
     }

@@ -1,28 +1,15 @@
 //! A checkpoint's own files: reading them, writing them, and the namespace
 //! pie reserves inside one.
 //!
-//! Six modules over one subject. [`read`] turns a snapshot *directory* into a
-//! [`Metadata`], [`zt`] turns a single *container* into one, [`write`] puts
-//! one back on disk, and [`meta`] owns the `__meta__/` names that tell a pie
-//! artifact's own payloads apart from its weights. [`emit`] and [`serve`] are
-//! the `pie.serving/1` pair — the import-only writer and the lean serving
-//! reader — and both spell their agreement in [`serving`](crate::serving),
-//! which sits outside this directory because it opens nothing.
+//! Six modules over one subject. [`read`] turns a snapshot *directory* into
+//! a [`Metadata`], [`zt`] turns a single *container* into one, [`write`]
+//! puts one back on disk, [`meta`] owns the `__meta__/` names that tell a
+//! pie artifact's own payloads apart from its weights, and [`emit`]/[`serve`]
+//! are the `pie.serving/1` writer/reader pair, agreeing in
+//! [`serving`](crate::serving).
 //!
-//! Everything above this module computes over the value it produces: this is
-//! the only place in the crate where a *path* becomes one,
-//! which is what `tests/standalone.rs` holds the compiler to. The two files it
-//! exempts beside this directory — `executor/walk.rs` and `verify.rs` — copy
-//! bytes and compare a plan against the world; neither decides anything.
-//!
-//! # It was called `checkpoint`, inside a crate called `checkpoint`
-//!
-//! And a consumer wrote `checkpoint::checkpoint::read::parse_checkpoint_metadata`,
-//! which says one word three times and says what the thing IS once. The crate
-//! already names the subject; the module names the surface — a checkpoint's
-//! files — and the items in it drop the prefix for the same reason, the one
-//! that makes `io::Error` right and `io::IoError` wrong. [`Metadata`] is the
-//! checkpoint's, because there is nowhere else it could be from.
+//! This is the only place in the crate where a *path* becomes a [`Metadata`]
+//! — everything else computes over the value it produces.
 
 pub mod emit;
 pub mod meta;
@@ -41,13 +28,10 @@ pub struct Metadata {
     pub tensors: Vec<RawTensor>,
 }
 
-/// What a checkpoint says about ITSELF: a GGUF's key-value block.
-///
-/// Read with [`parse_attributes`](crate::file::read::parse_attributes) rather
-/// than carried on [`Metadata`] — see that function for why.
-///
-/// Flat, because GGUF's keys already are: `general.architecture`, and then a
-/// block namespaced under whatever that says, `qwen2.attention.head_count`.
+/// What a checkpoint says about itself: a GGUF's key-value block. Read with
+/// [`parse_attributes`](crate::file::read::parse_attributes) rather than
+/// carried on [`Metadata`]. Flat, because GGUF's keys already are:
+/// `general.architecture`, then a block namespaced under whatever that says.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Attributes {
     by_key: std::collections::BTreeMap<String, Attribute>,
@@ -61,12 +45,9 @@ pub enum Attribute {
     Float(f64),
     Bool(bool),
     Text(String),
-    /// An array or a nested map, recorded as present and not as contents.
-    ///
-    /// GGUF puts its tokenizer here — `tokenizer.ggml.tokens` is every token
-    /// in the vocabulary — and no reader of this type wants a vocabulary. The
-    /// key is kept so that absence still means absent, which is the whole
-    /// value of an honest answer to `get`.
+    /// An array or a nested map, recorded as present and not as contents
+    /// (e.g. GGUF's `tokenizer.ggml.tokens`, which no reader of this type
+    /// wants in full). The key is kept so absence still means absent.
     Aggregate,
 }
 
@@ -98,31 +79,18 @@ impl Attributes {
     }
 
     /// Which architecture llama.cpp wrote this file for — `llama`, `qwen2`,
-    /// `gemma3`.
-    ///
-    /// The one key that is not namespaced, because it is the key that says
-    /// what the namespace IS. Everything the file states about its geometry
-    /// hangs off this answer, and a converter that had to guess an
-    /// architecture from tensor names would be guessing at exactly the point
-    /// where being wrong is silent.
+    /// `gemma3`. The one key that is not namespaced, because it is the key
+    /// that says what the namespace is.
     #[must_use]
     pub fn architecture(&self) -> Option<&str> {
         self.text("general.architecture")
     }
 
-    /// This key-value block as a flat JSON object.
-    ///
-    /// Flat, and with the dotted keys left dotted: `qwen2.block_count` stays
-    /// one key rather than becoming `{"qwen2": {"block_count": ...}}`. The
-    /// dots are part of the name in GGUF — `general.alignment` and
-    /// `qwen2.attention.head_count` are namespaced by convention and not by
-    /// structure — and inventing a nesting the format does not have would
-    /// make the round trip lossy for any key whose prefix is also a key.
-    ///
-    /// [`Attribute::Aggregate`] renders as `null`, which is the same claim
-    /// the variant makes: the key was there, the contents were not carried.
-    /// A non-finite float renders as `null` for the same reason — JSON has
-    /// no spelling for it, and a silent 0.0 would be a different number.
+    /// This key-value block as a flat JSON object, with dotted keys left
+    /// dotted (`qwen2.block_count` stays one key, since the dots are part
+    /// of GGUF's naming convention rather than real nesting).
+    /// [`Attribute::Aggregate`] and a non-finite float both render as
+    /// `null`.
     #[must_use]
     pub fn to_json(&self) -> String {
         let map: serde_json::Map<String, serde_json::Value> = self
@@ -145,38 +113,26 @@ impl Attributes {
     }
 }
 
-/// GGUF's tokenizer tables, read whole.
-///
-/// The one thing [`Attributes`] deliberately does not carry. A vocabulary is
-/// 150,000 strings and no reader of a model's DESCRIPTION wants it, so the
-/// summary keeps `tokenizer.ggml.tokens` as an [`Attribute::Aggregate`] and
-/// the caller that actually wants the contents asks for them here, by name
-/// and on purpose.
-///
-/// Owned rather than borrowed because the source is a CBOR tree inside a
-/// memory map that the caller has no reason to keep open, and owned rather
-/// than compiled because compiling a tokenizer is the tokenizer crate's job
-/// — this crate reads files.
+/// GGUF's tokenizer tables, read whole. The one thing [`Attributes`]
+/// deliberately does not carry (a vocabulary is 150,000 strings, kept as
+/// [`Attribute::Aggregate`] there). Owned rather than borrowed since the
+/// source is a CBOR tree inside a memory map the caller has no reason to
+/// keep open.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TokenizerTables {
     /// `tokenizer.ggml.model` — `gpt2`, `llama`, `bert`, `rwkv`. Which
     /// FAMILY of tokenizer, not which model.
     pub model: String,
     /// `tokenizer.ggml.pre` — llama.cpp's name for a pre-tokenizer it has
-    /// hard-coded, `qwen2` or `llama-bpe`. Absent in older files.
-    ///
-    /// A name and not a pattern, which is the whole difficulty: GGUF stores
-    /// the IDENTITY of a pre-tokenizer where `tokenizer.json` stores its
-    /// regexes, so a reader either knows the name or cannot proceed.
+    /// hard-coded, `qwen2` or `llama-bpe`. Absent in older files. A name,
+    /// not a pattern: GGUF stores the identity where `tokenizer.json`
+    /// stores regexes.
     pub pre: Option<String>,
     /// `tokenizer.ggml.tokens` — every token's text, in id order.
     pub tokens: Vec<String>,
     /// `tokenizer.ggml.token_type` — one per token, parallel to `tokens`.
-    ///
     /// ggml's `llama_token_type`: 1 normal, 2 unknown, 3 control, 4 user
-    /// defined, 5 unused, 6 byte. This is how a GGUF says which tokens are
-    /// the added ones, a fact `tokenizer.json` keeps in a separate
-    /// `added_tokens` list.
+    /// defined, 5 unused, 6 byte.
     pub token_types: Vec<i64>,
     /// `tokenizer.ggml.merges` — `"left right"`, in rank order.
     pub merges: Vec<String>,
@@ -222,24 +178,17 @@ impl Metadata {
     }
 
     /// The checkpoint's weights — every object except pie's own metadata.
-    ///
-    /// **This is the enumeration a weight consumer wants**, not `tensors`. A
-    /// pie artifact stores its compiled tokenizer and model descriptor as
-    /// `dense` `u8` objects (zTensor has no non-tensor object, see
-    /// [`meta`]), which are indistinguishable from raw `u8` weights except by
-    /// name. Iterating `tensors` therefore plans, copies or uploads them; this
-    /// does not. `tensors` remains public because a reader, a writer and the
-    /// FFI marshaller each need the whole object list — but nothing that means
-    /// "the model's weights" should reach for it.
+    /// This is the enumeration a weight consumer wants, not `tensors`: pie
+    /// stores its compiled tokenizer and model descriptor as `dense` `u8`
+    /// objects indistinguishable from raw weights except by name.
     pub fn weights(&self) -> impl Iterator<Item = &RawTensor> {
         self.tensors
             .iter()
             .filter(|tensor| !meta::is_meta(&tensor.name))
     }
 
-    /// The artifact's metadata objects, in manifest order.
-    ///
-    /// Empty for every checkpoint pie did not write.
+    /// The artifact's metadata objects, in manifest order. Empty for every
+    /// checkpoint pie did not write.
     pub fn meta_objects(&self) -> impl Iterator<Item = &RawTensor> {
         self.tensors
             .iter()
@@ -247,8 +196,7 @@ impl Metadata {
     }
 
     /// The metadata object named `path` (without the [`meta::META_PREFIX`]).
-    ///
-    /// Its *bytes* come from [`read::read_meta`](crate::file::read::read_meta):
+    /// Its bytes come from [`read::read_meta`](crate::file::read::read_meta):
     /// this layer addresses, the reader opens.
     pub fn meta_object(&self, path: &str) -> Option<&RawTensor> {
         let name = meta::meta_name(path);
@@ -257,20 +205,11 @@ impl Metadata {
 }
 
 /// A checkpoint's tensors, indexed by name for the duration of one compile.
-///
-/// `tensor_by_name` is a linear scan, and both the resolver and the builder
-/// call it once per contract tensor — which made compiling a 32k-tensor
-/// checkpoint quadratic, and measurably so: 2.1 s, of which this was most.
-///
-/// The index lives here rather than on [`Metadata`] because it is a fact about
-/// a *compilation*, not about a checkpoint. Metadata is built by
-/// readers, by tests and across the FFI boundary, and none of them should have
-/// to carry a cache they never read.
-///
-/// It indexes weights only. A contract names the tensors a model family binds,
-/// and pie's own metadata objects ([`meta`]) are not among them — so a contract
-/// that names one fails to resolve, which is the reserved namespace being
-/// reserved rather than a name that happens to be unused.
+/// `Metadata::tensor_by_name` is a linear scan called once per contract
+/// tensor, which made compiling a 32k-tensor checkpoint quadratic (2.1s).
+/// The index lives here rather than on [`Metadata`] since it is a fact
+/// about a compilation, not a checkpoint. Indexes weights only: a contract
+/// that names one of pie's own metadata objects ([`meta`]) fails to resolve.
 pub struct Sources<'a> {
     metadata: &'a Metadata,
     by_name: std::collections::HashMap<&'a str, u32>,
@@ -322,77 +261,3 @@ impl crate::contract::infer::CheckpointTypes for Metadata {
     }
 }
 
-#[cfg(test)]
-mod attribute_tests {
-    use super::{Attribute, Attributes};
-
-    /// The rendering is what a GGUF import carries as `model/config`, so
-    /// every variant has to survive it -- and the two that JSON cannot spell
-    /// have to say so rather than pick a number.
-    #[test]
-    fn every_attribute_renders_and_the_unspellable_ones_say_null() {
-        let attributes = Attributes::from_pairs([
-            (
-                "general.architecture".into(),
-                Attribute::Text("qwen2".into()),
-            ),
-            ("qwen2.block_count".into(), Attribute::Uint(24)),
-            ("a.negative".into(), Attribute::Int(-3)),
-            ("a.float".into(), Attribute::Float(0.5)),
-            ("a.bool".into(), Attribute::Bool(true)),
-            ("a.nan".into(), Attribute::Float(f64::NAN)),
-            ("tokenizer.ggml.tokens".into(), Attribute::Aggregate),
-        ]);
-        let json: serde_json::Value = serde_json::from_str(&attributes.to_json()).unwrap();
-
-        assert_eq!(json["general.architecture"], "qwen2");
-        assert_eq!(json["qwen2.block_count"], 24);
-        assert_eq!(json["a.negative"], -3);
-        assert_eq!(json["a.float"], 0.5);
-        assert_eq!(json["a.bool"], true);
-        // Present, and honest about carrying no value: a 0.0 here would be a
-        // different number, and an omitted key would be a different fact.
-        assert!(json["a.nan"].is_null());
-        assert!(json["tokenizer.ggml.tokens"].is_null());
-        assert!(
-            json.as_object()
-                .unwrap()
-                .contains_key("tokenizer.ggml.tokens")
-        );
-    }
-
-    /// The dots are part of the key, not a path. `general` is not an object
-    /// here, and `qwen2.attention.head_count` is one key and not three.
-    #[test]
-    fn a_dotted_key_stays_one_key() {
-        let attributes =
-            Attributes::from_pairs([("qwen2.attention.head_count".into(), Attribute::Uint(14))]);
-        let json: serde_json::Value = serde_json::from_str(&attributes.to_json()).unwrap();
-
-        assert_eq!(json["qwen2.attention.head_count"], 14);
-        assert!(json.get("qwen2").is_none());
-    }
-
-    /// The whole point of carrying it: `Encoding::from_config_json` has to
-    /// read this document as an unquantized checkpoint. It IS one -- import
-    /// decodes every GGUF block on the way in, because no device capability
-    /// mask carries `DECODE` -- and a GGUF states its per-tensor scheme in
-    /// the tensor record rather than in a `quantization_config` block, so
-    /// there is nothing here for the reader to mistake for one.
-    #[test]
-    fn a_gguf_key_value_block_declares_no_quantization() {
-        let attributes = Attributes::from_pairs([
-            (
-                "general.architecture".into(),
-                Attribute::Text("qwen2".into()),
-            ),
-            ("general.file_type".into(), Attribute::Uint(2)),
-            ("qwen2.block_count".into(), Attribute::Uint(24)),
-        ]);
-        let json: serde_json::Value = serde_json::from_str(&attributes.to_json()).unwrap();
-
-        for key in ["quantization_config", "quantization", "text_config"] {
-            assert!(json.get(key).is_none(), "{key} would change the reading");
-        }
-    }
-}

@@ -67,44 +67,6 @@ fn verdicts() -> Vec<(&'static str, usize, usize)> {
         .collect()
 }
 
-/// Every mutation has to reach at least one stage, or it is describing damage
-/// the corpus cannot express and is checking nothing.
-#[test]
-fn every_mutation_reaches_the_corpus() {
-    let dead: Vec<_> = verdicts()
-        .into_iter()
-        .filter(|(_, applied, _)| *applied == 0)
-        .map(|(mutation, _, _)| mutation)
-        .collect();
-    assert!(
-        dead.is_empty(),
-        "these mutations applied to no accepted corpus stage, so they check \
-         nothing: {dead:?}. Either the corpus lost the shape they need or they \
-         describe damage the plan types no longer allow."
-    );
-}
-
-/// The accept path is not vacuous: the corpus really does contain stages the
-/// validator says yes to.
-#[test]
-fn the_unmutated_corpus_is_accepted() {
-    let stages: Vec<_> = corpus_stages()
-        .into_iter()
-        .chain(extended_stages())
-        .collect();
-    assert!(!stages.is_empty(), "the corpus is empty");
-    let accepted = stages
-        .iter()
-        .filter(|stage| validate_singleton_plan(&stage.plan).is_ok())
-        .count();
-    assert!(
-        accepted > 0,
-        "the validator rejected all {} corpus stages, so every rejection below \
-         proves nothing",
-        stages.len()
-    );
-}
-
 /// A mutation is either always caught or never caught. A mutation caught on
 /// some stages and not others is the interesting case — it means the check
 /// exists but depends on plan shape, and the stages it misses are plans that

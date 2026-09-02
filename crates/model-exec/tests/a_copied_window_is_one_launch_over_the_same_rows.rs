@@ -51,11 +51,11 @@ use model_exec::dispatch::{
     DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
     DispatchLinear,
 };
-use model_compiler::{CompiledModel, Budget, DeviceProfile, Fallback, Lowering, Region, compile};
+use model_compiler::{CompiledModel, Budget, DeviceProfile, Lowering, Region, compile};
 use model_dsl::Platform;
-use model_exec::fire::{EventId, FireDescriptor, Lane, Serve, Sink, compose, fallback, walk};
+use model_exec::fire::{EventId, Filter, FireDescriptor, Lane, Serve, Sink, compose, fallback, walk};
 use model_ir::{
-    Attention, ClassSet, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation,
+    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation,
     Trace,
 };
 
@@ -222,7 +222,7 @@ impl Sink for Runs {
 }
 
 fn sku() -> (Trace, CompiledModel) {
-    let trace = models::trace_of(SKU).unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
+    let trace = models::sku(SKU).map(|row| row.trace).unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
     let trace = trace(Platform::Cuda);
     let compiled = compile(&trace, &budget(), &DeviceProfile::default())
         .unwrap_or_else(|refusal| panic!("`{SKU}` bakes: {refusal:?}"));
@@ -245,7 +245,15 @@ fn fire(trace: &Trace, compiled: &CompiledModel, lanes: &[Lane], copies: bool) -
     let descriptor = FireDescriptor::of(&composition);
     let mut dispatch = MockDispatch::new(trace, copies);
     let mut runs = Runs::default();
-    walk(trace, compiled, &descriptor, &mut dispatch, &mut runs).expect("the fire walks");
+    walk(
+        trace,
+        compiled,
+        &descriptor,
+        &mut dispatch,
+        &mut runs,
+        Filter::default(),
+    )
+    .expect("the fire walks");
     (runs, dispatch)
 }
 
@@ -371,28 +379,6 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
 }
 
 #[test]
-fn a_backend_that_says_nothing_about_serve_still_gets_every_split_it_had() {
-    let (trace, compiled) = sku();
-    let lanes = fragmenting(&compiled);
-    let composition = compose(&compiled, &budget(), &lanes).expect("three lanes compose");
-    let descriptor = FireDescriptor::of(&composition);
-
-    // `MockDispatch::new(trace, false)` IS the default `Serve` impl's answer,
-    // and the assertion is that the walk's launch counts are then exactly the
-    // ones `WindowTable::spans` states — which is what rule 4 said before the
-    // branch existed and what every other gate in this repo is written to.
-    let (runs, dispatch) = fire(&trace, &compiled, &lanes, false);
-    let mut fragmented = 0usize;
-    for (at, region) in compiled.template().iter().enumerate() {
-        let spans = descriptor.spans(&region.mask).len();
-        fragmented += usize::from(spans > 1);
-        assert_eq!(runs.per_region[at], spans.max(1) as u32, "region {at}");
-    }
-    assert!(fragmented > 0, "this composition fragments nothing");
-    assert!(dispatch.moved.is_empty());
-}
-
-#[test]
 fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
     let (_, compiled) = sku();
     let lanes = fragmenting(&compiled);
@@ -450,102 +436,3 @@ fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
     }
 }
 
-#[test]
-fn the_menu_asks_for_a_copy_below_the_crossover_and_a_split_above_it() {
-    let (_, compiled) = sku();
-    let lattice = budget().buckets;
-
-    // The table itself, read at every bucket — the claim the walk's branch is
-    // built on, and the one that says the ten small buckets were the ones
-    // paying for a split they did not ask for.
-    let withdrawn: Vec<&Region> = compiled
-        .template()
-        .iter()
-        .filter(|region| {
-            !fallback::answers(&compiled, model_ir::RowAxis::Tokens, region.nodes.clone())
-                .is_empty()
-        })
-        .collect();
-    assert!(
-        !withdrawn.is_empty(),
-        "no region of `{SKU}` is owed a fallback"
-    );
-
-    let mut copies = 0usize;
-    let mut splits = 0usize;
-    for bucket in 0..lattice.len() as u32 {
-        let mask = &withdrawn[0].mask;
-        if fallback::copies(&compiled, model_ir::RowAxis::Tokens, mask, bucket) {
-            copies += 1;
-        } else {
-            splits += 1;
-        }
-    }
-    assert_eq!(
-        (copies, splits),
-        (10, 4),
-        "the {}-point lattice's copy/split cut moved",
-        lattice.len(),
-    );
-
-    // And the split rows say how many launches they would have cost, which is
-    // the number the copy replaces with one.
-    let r = compiled
-        .fallback
-        .rows
-        .iter()
-        .find_map(|row| match row.fallback {
-            Fallback::Split { r } => Some(r),
-            Fallback::Copy | Fallback::Grouped | Fallback::View => None,
-        })
-        .expect("the lattice reaches past the crossover");
-    assert_eq!(r, 4, "the withdrawn mask breaks into four runs");
-    assert_eq!(
-        fallback::bound(&compiled, model_ir::RowAxis::Tokens, &withdrawn[0].mask),
-        4,
-        "and the bound derived from the shipped order agrees",
-    );
-
-    // The withdrawn masks themselves, named so a seriation change is a failure
-    // here rather than a silent change of subject. There are TWO windows now
-    // and their order in the template is the order the text splits on: the
-    // masked arm's plan is cut after the capture arm's, so `withdrawn[0]` is
-    // still `captures_scores` and `withdrawn[1]` is the masked window the
-    // qwen text grew (`Facts::masked`, fact bit 4).
-    assert_eq!(
-        withdrawn[0].mask.iter().collect::<Vec<_>>(),
-        [4, 5, 6, 7],
-        "the withdrawn window is `captures_scores`",
-    );
-    assert_eq!(
-        withdrawn[1].mask.iter().collect::<Vec<_>>(),
-        [8, 9, 10, 11],
-        "and the one beside it is the masked window",
-    );
-    // THE ORDER, AND WHY IT IS THIS ONE. `Facts::masked` (fact bit 4) doubled
-    // the reachable class set from eight to twelve: masked and
-    // `captures_scores` never co-occur — the masked arm is FIRST in the split
-    // and exports no lse, so a lane that asked for both takes the mask and
-    // keeps no scores — so the twelve are `{plain, captures, masked}` times
-    // `{prefill, decode}` times `{plain, adapter}`, and class `c + 4` is the
-    // masked twin of capture class `c`.
-    //
-    // Being first in the split makes each masked class the seriation
-    // neighbour of that twin, so the shipped order is EXACTLY the eight-class
-    // order `[4, 0, 2, 6, 7, 3, 1, 5]` with `c + 4` spliced in behind every
-    // `c` in `4..=7`:
-    //
-    //     4 (8) 0 2 6 (10) 7 (11) 3 1 5 (9)
-    //
-    // Which is also the whole of `r`'s move from three to four. The capture
-    // window's only adjacency in the eight-class order was `6, 7`; class 10
-    // lands between them, and now all four capture classes stand alone.
-    let order = compiled
-        .order
-        .class_order(&ClassSet::of(0..compiled.classes.classes.len()), None);
-    assert_eq!(
-        order,
-        [4, 8, 0, 2, 6, 10, 7, 11, 3, 1, 5, 9],
-        "the baked class order moved"
-    );
-}

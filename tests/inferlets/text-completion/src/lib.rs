@@ -29,7 +29,9 @@
 //! Greedy (`reduce_argmax`) rather than sampled, because the point of the gate
 //! is that the same prompt produces the same continuation on every run.
 
-use inferlet::eta::attention::prelude::*;
+use std::ops::RangeBounds;
+
+use inferlet::eta::shared_prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -70,10 +72,89 @@ fn greedy(logits: Tensor) -> Tensor {
     reshape(reduce_argmax(&logits), [1])
 }
 
+/// What this program needs of a forward pass: bind the KV geometry, and —
+/// on a hybrid model — the recurrent working set beside it, folding every
+/// token straight into the recurrence. `text-completion-bench` states the same
+/// trait for the same reason: the two `pie:inferlet` pass interfaces have
+/// different `attention` signatures on purpose, and what they share for THIS
+/// program is the guest's to say.
+trait BindState {
+    fn bind_state<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> ::std::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>;
+}
+
+impl BindState for inferlet::eta::attention::ForwardPass {
+    fn bind_state<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> ::std::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        debug_assert!(rs.is_empty());
+        self.attention(ws, geom)
+    }
+}
+
+impl BindState for inferlet::eta::hybrid::ForwardPass {
+    fn bind_state<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> ::std::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        self.attention(
+            Some(KvBinding {
+                working_set: ws,
+                geometry: geom,
+            }),
+            rs,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
+            },
+        )
+    }
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
+    match model::pass_kind() {
+        model::ForwardKind::Attention => run_attention(input).await,
+        model::ForwardKind::Hybrid => run_hybrid(input).await,
+        model::ForwardKind::Recurrent => Err(
+            "this program has no recurrent-only path (no registered model reports that kind)".into(),
+        ),
+    }
+}
+
+macro_rules! define_run {
+    ($name:ident, $kind:ident) => {
+async fn $name(input: Input) -> Result<Output> {
+    use inferlet::eta::$kind::ForwardPass;
     let max_tokens = input.max_tokens;
     let ws = WorkingSet::new();
+    // One recurrent working set for the whole generation on a hybrid model
+    // (the engine requires one per request row); none on a pure-attention one.
+    let rs_ws: Vec<RsWorkingSet> = if model::pass_kind() != model::ForwardKind::Attention {
+        vec![RsWorkingSet::new()]
+    } else {
+        Vec::new()
+    };
     let page_size = kv_page_size();
 
     if max_tokens == 0 {
@@ -117,7 +198,7 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &embed_indptr)?;
-        fwd.attention(
+        fwd.bind_state(
             &ws,
             KvGeometry {
                 readable_pages: ..,
@@ -130,6 +211,7 @@ async fn main(input: Input) -> Result<Output> {
                 positions: &positions,
                 mask: None,
             },
+            &rs_ws,
         )?;
         fwd.epilogue(move || {
             tok_out.put(&greedy(intrinsics::logits()));
@@ -179,7 +261,7 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &embed_indptr)?;
-        fwd.attention(
+        fwd.bind_state(
             &ws,
             KvGeometry {
                 readable_pages: ..,
@@ -192,6 +274,7 @@ async fn main(input: Input) -> Result<Output> {
                 positions: &positions,
                 mask: None,
             },
+            &rs_ws,
         )?;
         fwd.epilogue(move || {
             // `length` is the readable extent this fire runs at, so it is
@@ -225,3 +308,8 @@ async fn main(input: Input) -> Result<Output> {
         tokens: generated,
     })
 }
+    };
+}
+
+define_run!(run_attention, attention);
+define_run!(run_hybrid, hybrid);

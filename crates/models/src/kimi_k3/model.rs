@@ -1,25 +1,16 @@
-use checkpoint::contract::ModelContract;
 use model_dsl::{Dtype, Weight};
 
-use checkpoint_dsl::Error;
 
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
     pub tp: u32,
 
-    /// The MLA reading, stated once for the whole text: every MLA layer reads
-    /// the same page-id space the same way, so one schedule per class is
-    /// carved for these numbers at the top of `forward` and every layer reads
-    /// it. The latent kernels size their output at `mla_heads × kv_lora_rank`,
-    /// which is what `MlaDecode`/`MlaPrefill` restate. `Kda` keeps its own
-    /// `heads`: a linear mixer carves no schedule.
+    /// Per-rank (already divided by tp). Output of the latent kernels is sized mla_heads × kv_lora_rank.
     pub mla_heads: u32,
     pub kv_lora_rank: u32,
 
-    /// The adapter banks this family seats (palo design §8). Per layer, and
-    /// the same two numbers at every one of them: the correction is a
-    /// per-lane axis, not a per-layer one.
+    /// Adapter bank dims, same at every layer.
     pub adapters: Adapters,
 
     pub kv: Dtype,
@@ -40,25 +31,9 @@ pub struct Layer {
     pub mlp_norm: Weight,
     pub mlp_norm_eps: f32,
     pub mlp: Mlp,
-    /// This layer's adapter bank, `[slots, rank, hidden]` and
-    /// `[slots, hidden, rank]` — the down and up planes of one correction site
-    /// (palo design §8, campaign A-6).
-    ///
-    /// **THE SITE IS THE MIXER SUBLAYER, AND IT IS THE SITE BECAUSE OF THE
-    /// COLLECTIVE.** Both ends are REPLICATED values: the input is this
-    /// layer's normed residual and the output is the mixer's result AFTER
-    /// `all_reduce`. A correction stated one statement earlier — on
-    /// `o_proj`'s own output, which is what a checkpoint's `o_proj` LoRA names
-    /// — reads a rows-cut partial product and lands before the reduce, so
-    /// every rank would contribute the whole `ΔW·x` and the sum would carry it
-    /// `tp` times.
-    ///
-    /// **ONE SITE FOR BOTH MIXERS, AND THAT IS THE HONEST READING.** This
-    /// family alternates MLA with a gated linear recurrence, and the two have
-    /// no bank in common for a per-projection correction to name; what they DO
-    /// share is this pair of replicated ends. So a bound adapter corrects the
-    /// mixer sublayer of every layer, whichever mixer it is, which is the same
-    /// sentence `Mixer` itself makes about the reading.
+    /// This layer's adapter bank: lora_a is `[slots, rank, hidden]`, lora_b is `[slots, hidden, rank]`.
+    /// Applied to the mixer sublayer's replicated output, after all_reduce (a rows-cut partial
+    /// product would sum the correction tp times if applied before).
     pub lora_a: Weight,
     pub lora_b: Weight,
 }
@@ -413,82 +388,8 @@ impl Model {
     }
 }
 
-/// What every SKU of this family seats.
-///
-/// Not a `Dims` field, because it is not a fact about the checkpoint the way
-/// `hidden` and `layers` are — no pretrained artifact states it. It is the
-/// DEPLOYMENT's ceiling written where a shape has to be written, and a
-/// deployment that wants a different one changes this line and re-traces,
-/// which is exactly the "load-time recompile, never a runtime extension"
-/// design §9 asks for.
-///
-/// Eight slots of rank sixteen costs the k3 row 1 MiB a layer — two planes of
-/// `8 x 16 x 2048` in the compute element — and 8 MiB over its eight, against
-/// a table this family measures in hundreds of gibibytes.
+/// Deployment ceiling for adapter slots/rank (not a checkpoint fact); change and re-trace to grow it.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
 impl Model {
-    pub fn load(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
-        let mut b = checkpoint_dsl::Builder::new(src, self.tp);
-        let mut state = |w: &Weight| b.read_own(w);
-        state(&self.embed)?;
-        state(&self.final_norm)?;
-        state(&self.head)?;
-        for layer in &self.layers {
-            state(&layer.mixer_norm)?;
-            state(&layer.mlp_norm)?;
-            if let Some(res) = &layer.res_blend {
-                state(&res.norm)?;
-                state(&res.proj)?;
-            }
-            match &layer.mixer {
-                Mixer::Mla(a) => {
-                    state(&a.q_a_proj)?;
-                    state(&a.q_a_norm)?;
-                    state(&a.q_b_proj)?;
-                    state(&a.kv_a_proj)?;
-                    state(&a.kv_a_norm)?;
-                    state(&a.kv_b_proj)?;
-                    if let Some(gate) = &a.gate {
-                        state(gate)?;
-                    }
-                    state(&a.o_proj)?;
-                }
-                Mixer::Kda(k) => {
-                    state(&k.qkv)?;
-                    state(&k.conv)?;
-                    state(&k.f_a)?;
-                    state(&k.f_b)?;
-                    state(&k.b)?;
-                    state(&k.dt_bias)?;
-                    state(&k.a_log)?;
-                    state(&k.gate)?;
-                    state(&k.o_norm)?;
-                    state(&k.o_proj)?;
-                }
-            }
-            match &layer.mlp {
-                Mlp::Dense { gate_up, down, .. } => {
-                    state(gate_up)?;
-                    state(down)?;
-                }
-                Mlp::Routed {
-                    router,
-                    gate_up,
-                    down,
-                    shared,
-                    ..
-                } => {
-                    state(router)?;
-                    state(gate_up)?;
-                    state(down)?;
-                    if let Some(s) = shared {
-                        state(&s.gate_up)?;
-                        state(&s.down)?;
-                    }
-                }
-            }
-        }
-        Ok(b.build())
-    }
-}
+ }

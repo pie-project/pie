@@ -28,11 +28,9 @@ const LANE_TABLE_ABI_VERSION: u32 = crate::plan::LANE_TABLE_ABI_VERSION;
 
 /// `emit_readiness_msl` — one lane, channel effects baked in.
 ///
-/// Rejects a channel count past [`METAL_M1_MAX_CHANNELS`] rather than emitting
-/// it. The constant states where buffer 30 falls; before anything compiled the
-/// emitter's output it stated only that, and a program one channel wider
-/// produced a `[[buffer(31)]]` Metal rejects — a raw shader diagnostic at PSO
-/// build time, from a count a guest container chooses.
+/// Rejects a channel count past [`METAL_M1_MAX_CHANNELS`] rather than
+/// emitting it: past that count a program would produce a `[[buffer(31)]]`
+/// Metal rejects, a raw shader diagnostic at PSO build time.
 pub fn emit_readiness(
     function_name: &str,
     channels: &[M1ChannelEffect],
@@ -272,17 +270,11 @@ pub fn emit_grouped_commit(function_name: &str) -> String {
     source
 }
 
-/// The per-program channel effect table the M1/M2 readiness and commit kernels
-/// are baked against.
-///
-/// Capacity and the take/put flags come from the container; the two readiness
-/// bits come from the bound trace's first-op direction table.
-///
-/// The table is emitted here rather than derived on the far side so that a
-/// engine never needs the decoded plan to build it. That keeps the effect
-/// kernels the M1 and M2 launch paths bind host-emitted like every other
-/// kernel, instead of leaving one kernel family that each engine assembles for
-/// itself and can get subtly different.
+/// The per-program channel effect table the M1/M2 readiness and commit
+/// kernels are baked against. Capacity and the take/put flags come from the
+/// container; the two readiness bits come from the bound trace's first-op
+/// direction table. Emitted here rather than derived on the far side so an
+/// engine never needs the decoded plan to build it.
 pub fn channel_effects(bound: &BoundTrace) -> Vec<M1ChannelEffect> {
     let channels = &bound.container.channels;
     let mut effects = Vec::with_capacity(channels.len());
@@ -303,14 +295,11 @@ pub fn channel_effects(bound: &BoundTrace) -> Vec<M1ChannelEffect> {
                 if used != chan {
                     continue;
                 }
-                // The engine advances the ring off these two flags, so a
-                // channel op that is not classified here leaves the ring
-                // un-advanced rather than raising anything.
+                // the engine advances the ring off these two flags only.
                 match use_ {
                     ChannelUse::Take => effect.take = true,
                     ChannelUse::Put => effect.put = true,
-                    // A peek neither drains nor fills; `requires_full` below
-                    // is what keeps it ordered.
+                    // a peek neither drains nor fills.
                     ChannelUse::Read => {}
                 }
             }

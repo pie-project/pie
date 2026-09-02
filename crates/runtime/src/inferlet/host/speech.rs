@@ -1,16 +1,13 @@
-//! pie:core/audio-out — native audio OUTPUT (CSM-1B + Mimi). The inverse of
-//! `media` (perception -> text): the runtime EMITS Mimi codec tokens and the
-//! Mimi decoder turns them back into a 24 kHz waveform. See AUDIO_OUTPUT.md.
+//! pie:core/audio-out — native audio output (CSM-1B + Mimi): the runtime
+//! emits Mimi codec tokens and the Mimi decoder turns them back into a
+//! 24 kHz waveform. The inverse of `media` (perception -> text).
 //!
-//! **Model-agnostic, mirroring `media`.** The inferlet supplies neutral intent
+//! Model-agnostic, mirroring `media`: the inferlet supplies neutral intent
 //! (text + [`Voice`] + an optional target duration) via a [`SpeechRequest`];
-//! everything model-specific — the "[speaker]text" prompt framing, the BOS/EOS
-//! the CSM processor adds, the 12.5 Hz frame rate, the 24 kHz sample rate — is
-//! applied here, dispatched off the bound model's arch. The engine runs the
-//! whole frame-stepped loop (backbone prefill -> per-frame depth loop -> Mimi
-//! decode) in one `generate_audio` cold-path request (AdapterOp::GenerateAudio).
-//! The returned [`Speech`] is self-describing, so the inferlet never hardcodes a
-//! model constant.
+//! everything model-specific is applied here, dispatched off the bound
+//! model's arch. The engine runs the whole frame-stepped loop in one
+//! `generate_audio` cold-path request. The returned [`Speech`] is
+//! self-describing, so the inferlet never hardcodes a model constant.
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
@@ -19,9 +16,7 @@ use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
-// ---- CSM (Llama-3 tokenizer) audio-output front-end constants --------------
-// CSM is the only audio-output arch today. These are the model-specific values
-// that used to leak into the inferlet; they live host-side now.
+// CSM (Llama-3 tokenizer) audio-output front-end constants.
 
 /// Llama-3 `<|begin_of_text|>` — the CSM processor prepends it (add_special_tokens).
 const CSM_BOS: u32 = 128000;
@@ -67,9 +62,7 @@ impl pie::inferlet::speech::HostSpeech for ProcessCtx {
         let prompt = {
             let m = crate::model::model();
             let arch = m.arch_name();
-            // CSM is the only audio-output arch. The engine also guards (negative
-            // status when the bound model isn't CSM), but reject early here with a
-            // clear message for every other arch.
+            // reject early with a clear message for every non-CSM arch.
             if arch != "csm" {
                 return Ok(Err(format!(
                     "model '{}' (arch '{arch}') has no audio-output front-end \

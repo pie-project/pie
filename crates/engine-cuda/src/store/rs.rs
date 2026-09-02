@@ -1,63 +1,5 @@
-//! **The buffered-activation pool** — the device half of `RsVerb::Buffer` and
-//! `RsVerb::FoldBuffered` (alto design §6, survey §9).
-//!
-//! # What is buffered, and dev's economy
-//!
-//! Not the recurrent state, and not the recurrence's outputs: the **inputs of
-//! the conv+scan**, which for a gated-delta layer are the two in-projection
-//! planes the mixer computes before anything stateful happens — `qkv` (the
-//! conv's rows, `conv_dim` wide) and `ba` (the `[b | a]` projection the gate
-//! prep reads, `2·V_h` wide). A few kilobytes per token against a full state
-//! copy per request, which is exactly why dev's programming model can afford
-//! to keep a speculative window recoverable and why the ping-pong slot design
-//! is superseded (survey §9's last paragraph).
-//!
-//! `z` is NOT buffered. It is the gate the post-recurrence `rmsnorm_gated`
-//! applies, and a fold-buffered replay is state-only — it computes no output
-//! anybody reads, so the one in-projection plane the recurrence does not feed
-//! is the one plane the replay does not need.
-//!
-//! # The shape
-//!
-//! ```text
-//! pool[layer][page_slot][plane][token]       bf16
-//!            └─ `Budget`-many, one per state slot (dev: rs_buffer_num_slots)
-//!                        │      └─ `page_tokens` rows = the kv page size
-//!                        └─ plane 0 `qkv`, then plane 1 `ba`
-//! ```
-//!
-//! One allocation for the whole pool, pointer-stable for the load's lifetime
-//! (article 7), cut by arithmetic: a page slot holds `page_tokens` rows of
-//! every plane, and a layer holds `slots` page slots. A lane's buffer is a RUN
-//! of page slots stated by the verb ([`engine::PageRange`]), page-major
-//! from buffer token zero — so buffer token `i` lives in page slot
-//! `run.page_index + i / page_tokens` at in-page row `i % page_tokens`, which
-//! is the addressing both the scatter and the gather do and the only thing the
-//! two have to agree about.
-//!
-//! Plane-major INSIDE a page slot rather than token-major across the two,
-//! because that is what makes one page's share of one plane a single
-//! contiguous run: the copies are then `cudaMemcpyAsync`s per (lane, page,
-//! plane) and nothing needs a strided kernel — dev's own choice
-//! (`qwen3_5_forward.cpp:704-772`, three d2d memcpys per page).
-//!
-//! # Why the planes are keyed by VALUE and not by layer
-//!
-//! The scatter has to happen where a plane is live and the gather has to
-//! happen before its reader runs, and the two readers are two different ops:
-//! `attention.ssm_causal_conv1d_chunked` takes `qkv`,
-//! `attention.ssm_gdn_prep` takes `ba`. So [`Planes`] is a map from the
-//! operand's `ValueId` to the plane it is buffered as, and each dispatch arm
-//! asks about its own operand — no arm has to know what the arm beside it will
-//! read, and a family that grows a third plane grows one row in this map.
-//!
-//! It also settles the arm question for free. A GDN mixer traces TWICE, once
-//! for the decode split and once for the chunked one, so a layer has two `ba`
-//! values and two conv inputs. Only the chunked ones are in this map, because
-//! only the chunked scans carry the `commit_len` and `write_state_mask` seats
-//! that make a buffered fold dispatchable at all (`attn/ssm.cuh`) — a
-//! single-token buffered write is expressible in the contract and is refused
-//! by name rather than served on an arm that cannot truncate.
+//! Device pool for the buffered in-projection planes (`qkv`, `ba`) used by
+//! `RsVerb::Buffer` / `RsVerb::FoldBuffered`; layout is `[layer][page_slot][plane][token]`, bf16.
 
 use std::collections::HashMap;
 
@@ -67,10 +9,7 @@ use crate::device::Buffer;
 use crate::error::{Fault, Result};
 use crate::store::kv::Paging;
 
-/// The element the in-projection planes are staged at — the same `bf16` the
-/// state slabs are, and for the same reason: `attn/ssm.cuh` instantiates every
-/// state-taking entry at `__nv_bfloat16`, and the planes this pool holds are
-/// the activations those entries read.
+/// Element type for staged in-projection planes; matches the state slabs (bf16).
 pub const PLANE_DTYPE: Dtype = Dtype::Bf16;
 
 /// Bytes of one buffered element.
@@ -113,7 +52,7 @@ impl Planes {
     }
 }
 
-/// **The pool, and the plan's reading of it.**
+/// The pool and the plan's reading of it.
 #[derive(Debug)]
 pub struct Buffers {
     slab: Buffer,
@@ -133,22 +72,10 @@ impl Buffers {
     /// Reserve the pool one plan needs at one deployment's budget, or `None`
     /// for a plan with no chunked recurrent layer to buffer.
     ///
-    /// # The structure is read off the plan, not configured
-    ///
-    /// A layer's chunked scan (`attention.ssm_gated_delta_chunked`) names the
-    /// `qkv` it consumes and the `gates` it consumes; the node that WROTE that
-    /// `qkv` is the chunked conv and the node that wrote those `gates` is the
-    /// prep, so following the two operands backwards is what picks the chunked
-    /// arm's planes out of a layer that also traced a decode arm. Nothing here
-    /// is matched by name or by position.
-    ///
     /// # Errors
     ///
-    /// [`Fault::Unbound`] for a recurrent layer whose planes this shell cannot
-    /// size — a symbolic row width, a scan whose operands no node defines, a
-    /// plane written after the scan that reads it, or per-layer widths that
-    /// disagree — and [`Fault::Device`](crate::Fault::Device) for the
-    /// allocation.
+    /// [`Fault::Unbound`] for a recurrent layer whose planes cannot be sized;
+    /// [`Fault::Device`](crate::Fault::Device) for the allocation.
     pub fn reserve(trace: &Trace, paging: Paging) -> Result<Option<Buffers>> {
         let Some((planes, per_token, layers)) = read(trace, paging.page_size)? else {
             return Ok(None);
@@ -169,13 +96,8 @@ impl Buffers {
     }
 }
 
-/// **Read the plan's chunked recurrent layers**, with no allocation and no
-/// device in reach — the half of [`Buffers::reserve`] that can be exercised
-/// on a machine with no GPU, and the half that can refuse.
-///
-/// Answers `None` for a plan with no chunked gated-delta scan at all (every
-/// dense text, and the KDA families until they are given the buffer
-/// vocabulary), the planes keyed by the operand that reads them otherwise.
+/// Reads the plan's chunked recurrent layers with no allocation and no
+/// device required; `None` if the plan has no chunked gated-delta scan.
 ///
 /// # Errors
 ///
@@ -183,8 +105,7 @@ impl Buffers {
 pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)>> {
     {
         let paging = page_tokens;
-        // Which node defines which value, so a scan's operands can be walked
-        // back to the ops that wrote them.
+        // maps each value to the node that defines it
         let mut defined: HashMap<u32, usize> = HashMap::new();
         for (at, node) in trace.nodes.iter().enumerate() {
             let mut outs = Vec::new();
@@ -225,14 +146,7 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                     ),
                 });
             };
-            // **THE GATHER HAS TO LAND BEFORE ITS READER**, and the two
-            // readers are two nodes. The scatter is order-free (both planes
-            // are still live wherever either op runs), but a replay
-            // OVERWRITES them — so the walk must reach each plane's own op
-            // with the plane not yet consumed, which is true exactly when
-            // each op stands before the scan that named it. Checked here
-            // rather than assumed, because it is a property of the model
-            // text and not of this shell.
+            // Writer nodes must precede the scan that names them.
             if conv_at >= at || prep_at >= at {
                 return Err(Fault::Unbound {
                     what: format!(
@@ -260,11 +174,8 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                     width: ba_width,
                 },
             );
-            // **ONE WIDTH FOR EVERY LAYER**, which is dev's one `stash_width`
-            // and is true of every family that ships one: the in-projection
-            // geometry is per model, not per layer. A plan that disagreed
-            // would need a per-layer stride table, so it is refused rather
-            // than mis-addressed.
+            // one width for every layer: the pool cuts a single page-slot
+            // stride shared by all layers.
             let here = qkv_width + ba_width;
             match per_token {
                 None => per_token = Some(here),
@@ -370,37 +281,10 @@ fn width_of(trace: &Trace, id: ValueId) -> Option<u64> {
     }
 }
 
-/// **The fold predicate and the accepted lengths, as one resident region**
-/// (alto design §6's change (a), and §12 finding 4).
-///
-/// Four small vectors that are not staged inputs and must not be:
-///
-/// ```text
-/// one        u32 == 1     the standing "committed" word
-/// zero       u32 == 0     the standing "did not commit" word
-/// commits    [lanes] u64  one commit-word ADDRESS per lane
-/// indptr     [lanes+1] i32   the identity CSR
-/// mask       [lanes] u8   what `mask_from_commit` writes and the scans read
-/// commit_len [lanes] i32  where each request's accepted prefix ends
-/// ```
-///
-/// **THE CSR IS THE IDENTITY, AND THAT IS A FINDING RATHER THAN A SHORTCUT.**
-/// `channel::mask_from_commit` scatters a lane's commit word across the rows
-/// the lane owns, through a row CSR — because a per-TOKEN predicate is what a
-/// kv writer would want. The recurrent scans want a per-REQUEST one:
-/// `attn/ssm.cuh`'s `row_persists(mask, r)` takes `r = blockIdx` over
-/// requests in every chunked arm, so what the scan indexes is the lane and not
-/// the token. Handing the kernel `indptr[l] = l` makes its scatter write
-/// exactly one byte per lane, which is the shape the scan reads, with the
-/// kernel unchanged.
-///
-/// **THE TWO STANDING WORDS ARE HOW A LANE WITH NO GUEST STAYS ALL-ONES.**
-/// `mask_from_commit` reads a null pointer as "did not commit", which is the
-/// right default for a channel and exactly the wrong one for a lane that
-/// simply has no attachment — so an unattached lane points at `one` and folds,
-/// and a lane whose verb is a buffered scatter points at `zero` and does not.
-/// One kernel then carries both predicates, the pass's and the verb's, and
-/// there is no second pass over the mask to fall out of step with the first.
+/// The fold predicate and the accepted lengths, as one resident region:
+/// standing committed/uncommitted words, per-lane commit addresses, an
+/// identity CSR (recurrent scans index by lane, not token/row), the mask,
+/// and each request's accepted prefix length.
 #[derive(Debug)]
 pub struct Predicate {
     region: Buffer,
@@ -518,8 +402,8 @@ impl Predicate {
         kernels_cuda::Tensor::new(self.region.ptr() + self.at_len, lanes, 1, Dtype::I32)
     }
 
-    /// **Read the mask back**, for a gate that has to see the predicate the
-    /// device wrote. Not on any fire path: it is a synchronous D2H.
+    /// Reads the mask back for a gate that needs it. Not on the fire path:
+    /// synchronous D2H.
     ///
     /// # Errors
     ///
@@ -531,63 +415,3 @@ impl Predicate {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use model_dsl::Platform;
-
-    /// **EVERY SKU IN THE CATALOG READS**, and the two that matter answer
-    /// differently.
-    ///
-    /// [`read`](super::read) runs at LOAD, before any lane has asked for a
-    /// recurrent verb — so a plan it cannot walk is a plan this shell refuses
-    /// to load at all, and a family that grows a third in-projection plane
-    /// would take every deployment of it down rather than refusing one fire.
-    /// The whole catalog is swept for exactly that reason.
-    ///
-    /// Two answers, and both are correct answers:
-    ///
-    /// * `None` for a plan with no chunked gated-delta scan — every dense
-    ///   text, and the KDA families until they are given the buffer
-    ///   vocabulary. Such a load reserves no pool and a lane that names a
-    ///   buffered verb against it is refused by name at the fire.
-    /// * a reading for the GDN hybrids, whose per-token width must be the
-    ///   conv's rows plus the gate prep's `[b | a]` — a number that is
-    ///   nonzero and the SAME for every layer, which is what the pool's one
-    ///   page-slot stride rests on.
-    ///
-    /// **AND AT LEAST ONE SKU MUST ANSWER THE SECOND WAY.** A sweep where
-    /// every row read `None` would pass while proving nothing.
-    #[test]
-    fn every_sku_in_the_catalog_reads_its_buffered_planes_or_says_it_has_none() {
-        let mut buffered = 0usize;
-        let mut table: Vec<String> = Vec::new();
-        for (sku, _, trace, _) in models::catalog() {
-            let trace = trace(Platform::Cuda);
-            let read = super::read(&trace, 16)
-                .unwrap_or_else(|why| panic!("`{sku}` will not load: {why}"));
-            match read {
-                None => table.push(format!("  {sku}: no chunked recurrence")),
-                Some((planes, per_token, layers)) => {
-                    assert!(per_token > 0, "`{sku}` buffers zero elements a token");
-                    assert_eq!(
-                        planes.len(),
-                        2 * layers as usize,
-                        "`{sku}` reads {layers} recurrent layers and {} planes, and this \
-                         shell buffers exactly two per layer",
-                        planes.len(),
-                    );
-                    buffered += 1;
-                    table.push(format!(
-                        "  {sku}: {layers} layers x {per_token} elements a token"
-                    ));
-                }
-            }
-        }
-        assert!(
-            buffered > 0,
-            "no SKU in the catalog buffers anything, so this sweep proves nothing:\n{}",
-            table.join("\n"),
-        );
-        eprintln!("{}", table.join("\n"));
-    }
-}

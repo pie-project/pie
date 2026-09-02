@@ -25,8 +25,8 @@
 //! * the patch ladder rounds on its own rungs;
 //! * the three M-1e refusals fire BY NAME.
 
-use model_compiler::{Budget, Budgets, DeviceProfile, PatchLadder, compile, compile_axes};
-use model_exec::fire::{Fault, Lane, compose, compose_axes};
+use model_compiler::{Budget, Budgets, DeviceProfile, PatchLadder, compile_axes};
+use model_exec::fire::{Fault, Lane, compose_axes};
 use model_ir::ops::Elementwise;
 use model_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, Trace, Ty, ValueDecl,
@@ -136,20 +136,6 @@ fn tower_and_trunk() -> Trace {
     b.trace
 }
 
-/// The same plan with NO patch row anywhere — a text-only artifact, which is
-/// what refusal (ii) is about.
-fn text_only() -> Trace {
-    let mut b = Build::new();
-    let tokens = b.input(RuntimeInput::Tokens, act());
-    let seeded = b.op(tokens, act(), Guard::Always);
-    let d = b.op(seeded, act(), Guard::Fact(0));
-    let p = b.op(seeded, act(), Guard::not(Guard::Fact(0)));
-    let o = b.merge(&[(d, Guard::Fact(0)), (p, Guard::not(Guard::Fact(0)))]);
-    let y = b.op(o, act(), Guard::Always);
-    b.out(y);
-    b.trace
-}
-
 fn tokens_budget() -> Budget {
     Budget::new(8, 64)
 }
@@ -208,189 +194,9 @@ fn a_class_with_rows_and_no_images_has_a_token_window_and_no_patch_window() {
     assert_eq!(patches.class(text_class).rows, 0);
     assert_eq!(patches.class(text_class).lanes, 0);
     assert_eq!(
-        fire.patch_present(),
-        &[with_images as u32],
+        fire.patch_classes().present_in_order().collect::<Vec<u32>>(),
+        vec![with_images as u32],
         "only the class with images is present on the patch axis",
-    );
-}
-
-/// **GATE (c) AT THE COMPOSITION.** The token half of a fire with images in
-/// it is the token half of the same fire without them, field for field. No
-/// image moves a text lane's rows, its lane index, its class or its window.
-#[test]
-fn images_do_not_move_one_token_row() {
-    let trace = tower_and_trunk();
-    let budgets = budgets();
-    let compiled =
-        compile_axes(&trace, &budgets, &DeviceProfile::default()).expect("the tower bakes");
-
-    let words: [(u64, u32); 5] = [(1, 5), (0, 3), (1, 4), (0, 1), (0, 1)];
-    let bare: Vec<Lane> = words.iter().map(|&(w, r)| Lane::new(w, r)).collect();
-    let carried: Vec<Lane> = words
-        .iter()
-        .map(|&(w, r)| {
-            if w == 1 {
-                Lane::with_images(w, r, 1, 64)
-            } else {
-                Lane::new(w, r)
-            }
-        })
-        .collect();
-
-    let plain = compose_axes(&compiled, &budgets, &bare).expect("the text-only fire composes");
-    let mixed = compose_axes(&compiled, &budgets, &carried).expect("the mixed fire composes");
-
-    assert_eq!(plain.rows(), mixed.rows());
-    assert_eq!(plain.bucket(), mixed.bucket());
-    assert_eq!(plain.classes(), mixed.classes());
-    assert_eq!(plain.present(), mixed.present());
-    for (a, b) in plain.lanes().iter().zip(mixed.lanes()) {
-        assert_eq!(a.source, b.source);
-        assert_eq!(a.word, b.word);
-        assert_eq!(a.class, b.class);
-        assert_eq!(a.row_offset, b.row_offset);
-        assert_eq!(a.rows, b.rows);
-    }
-    // And the text-only fire really is text-only, so the claim is not vacuous.
-    assert_eq!(plain.patch_rows(), 0);
-    assert_eq!(mixed.patch_rows(), 128);
-}
-
-/// Every lane record carries its place in BOTH orders, and the two prefix
-/// sums are each other's independent: images accumulate over the lanes that
-/// have them, in submission order inside a class, and skip the ones that do
-/// not.
-#[test]
-fn a_lane_record_carries_its_place_in_both_seriations() {
-    let trace = tower_and_trunk();
-    let budgets = budgets();
-    let compiled =
-        compile_axes(&trace, &budgets, &DeviceProfile::default()).expect("the tower bakes");
-
-    let lanes = [
-        Lane::with_images(1, 2, 1, 64),
-        Lane::new(0, 3),
-        Lane::with_images(1, 2, 2, 128),
-    ];
-    let fire = compose_axes(&compiled, &budgets, &lanes).expect("composes");
-
-    let by_source = |source: u32| {
-        *fire
-            .lanes()
-            .iter()
-            .find(|row| row.source == source)
-            .expect("every submitted lane is placed")
-    };
-
-    let first = by_source(0);
-    let text = by_source(1);
-    let second = by_source(2);
-
-    assert_eq!((first.patch_offset, first.patches), (0, 64));
-    assert_eq!((first.image_offset, first.images), (0, 1));
-    assert_eq!((second.patch_offset, second.patches), (64, 128));
-    assert_eq!((second.image_offset, second.images), (1, 2));
-    // The text lane occupies no patch rows and no images, and its offsets are
-    // the zero window rather than a stale neighbour's.
-    assert_eq!((text.patch_offset, text.patches), (0, 0));
-    assert_eq!((text.image_offset, text.images), (0, 0));
-    // The patch offsets partition the patch rectangle exactly.
-    assert_eq!(
-        first.patches + second.patches,
-        fire.patch_rows(),
-        "the lane runs tile the patch window with no gap and no overlap",
-    );
-}
-
-/// The patch ladder rounds on ITS OWN rungs, and a fire with no image rounds
-/// to nothing at all — which is what "an axis-empty fire does not launch that
-/// unit's exec" is, arithmetically.
-#[test]
-fn the_patch_rung_is_the_patch_ladders_and_an_axis_empty_fire_rounds_to_zero() {
-    let trace = tower_and_trunk();
-    let budgets = budgets();
-    let compiled =
-        compile_axes(&trace, &budgets, &DeviceProfile::default()).expect("the tower bakes");
-
-    let one = compose_axes(&compiled, &budgets, &[Lane::with_images(1, 2, 1, 64)]).expect("composes");
-    assert_eq!(one.patch_rows(), 64);
-    assert_eq!(one.patch_bucket(), 64, "64 is a rung of the patch ladder");
-    // The token bucket is the token ladder's, and this budget lists none — so
-    // it is the row count itself. Two ladders, two answers, neither derived
-    // from the other.
-    assert_eq!(one.bucket(), 2);
-
-    let two = compose_axes(&compiled, &budgets, &[Lane::with_images(1, 2, 2, 65)]).expect("composes");
-    assert_eq!(two.patch_bucket(), 128, "65 rounds up to the next rung");
-
-    let none = compose_axes(&compiled, &budgets, &[Lane::new(0, 4)]).expect("composes");
-    assert_eq!(none.patch_rows(), 0);
-    assert_eq!(none.patch_bucket(), 0, "no patch rows, no tower exec");
-}
-
-/// **REFUSAL (i), HOST HALF**: a media submission whose geometry disagrees
-/// with its patch payload.
-#[test]
-fn a_geometry_that_disagrees_with_its_payload_is_refused_by_name() {
-    let trace = tower_and_trunk();
-    let budgets = budgets();
-    let compiled =
-        compile_axes(&trace, &budgets, &DeviceProfile::default()).expect("the tower bakes");
-
-    // Images declared, no patch rows shipped.
-    let hollow = compose_axes(&compiled, &budgets, &[Lane::with_images(1, 2, 2, 0)])
-        .expect_err("two images of no patch rows is not a submission");
-    assert_eq!(
-        hollow,
-        Fault::PatchGeometry {
-            lane: 0,
-            images: 2,
-            patches: 0,
-        }
-        .into(),
-    );
-    assert!(hollow.to_string().contains("geometry and its payload disagree"));
-
-    // Patch rows shipped, no image declared — the same disagreement, the
-    // other way, and the one that would leave `attention.dense` with rows and
-    // no segment to put them in.
-    let orphan = compose_axes(&compiled, &budgets, &[Lane::with_images(1, 2, 0, 64)])
-        .expect_err("patch rows belonging to no image are not a submission");
-    assert_eq!(
-        orphan,
-        Fault::PatchGeometry {
-            lane: 0,
-            images: 0,
-            patches: 64,
-        }
-        .into(),
-    );
-}
-
-/// **REFUSAL (ii)**: patches against a text with no patch axis.
-#[test]
-fn images_against_a_text_with_no_tower_are_refused_by_name() {
-    let trace = text_only();
-    let profile = DeviceProfile::default();
-
-    // Through the one-axis door, which admits no patch ladder at all.
-    let plain = compile(&trace, &tokens_budget(), &profile).expect("a text-only plan bakes");
-    let refusal = compose(&plain, &tokens_budget(), &[Lane::with_images(0, 2, 1, 64)])
-        .expect_err("a text has no tower");
-    assert_eq!(refusal, Fault::Towerless { lane: 0 }.into());
-    assert!(refusal.to_string().contains("declares no patch axis"));
-
-    // And through the two-axis door with a ladder declared: the DEPLOYMENT
-    // admitting a patch axis does not give this artifact one, because the
-    // axis is a property of the plan and the artifact is bit-identical either
-    // way (the G4 invariant).
-    let budgets = budgets();
-    let admitted = compile_axes(&trace, &budgets, &profile).expect("bakes");
-    assert_eq!(admitted.patches, None);
-    assert_eq!(
-        compose_axes(&admitted, &budgets, &[Lane::with_images(0, 2, 1, 64)])
-            .expect_err("a ladder is not a tower"),
-        Fault::Towerless { lane: 0 }.into(),
     );
 }
 

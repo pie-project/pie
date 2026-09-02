@@ -1,71 +1,8 @@
-//! **What a captured graph says about itself** (`palo cuda-abi` wave).
-//!
-//! **THIS MODULE IS THE MEASUREMENT SURFACE, AND SINCE THE TIER-2 CAMPAIGN
-//! IT IS THAT AND NOTHING ELSE.** [`walk`] was written to answer one
-//! question — is a captured graph a host-side map from node to kernel
-//! argument? — and the answer was yes for 621 of 621 nodes, which
-//! `.wiki/palo/cuda-abi.md` §7 promoted into [`crate::device::map`]: a
-//! load-time table, and a diff between two of them. The consumer that table
-//! was built FOR was the fold's exec cache, which rebound against it on the
-//! fire path; the fold is deleted, and the answer the campaign took instead
-//! is that a body writes into no exec at all (`record.rs`'s header). So
-//! nothing here is called from a fire, and what the module is now is the
-//! place the driver facts poc1-24 measured are stated in code that still
-//! runs:
-//!
-//! ```text
-//! walk           what a captured graph says about itself — read by
-//!                `device::map`, and by the two probe gates
-//!                (`cuda_node_map`, `cuda_descriptor_abi_probe`)
-//! rebind         prices `cudaGraphExecKernelNodeSetParams` per node and
-//!                finds which fields the driver validates
-//! exec_footprint instantiates copies to weigh one exec
-//! free_bytes      what the device has left — the same reading taken one
-//!                 instantiation at a time, and the ONE thing here a load
-//!                 calls (`record::Graphs::fire_body` brackets an
-//!                 instantiation with it so `Shell::arm_bodies` can spend a
-//!                 byte budget instead of a constant)
-//! ```
-//!
-//! **SO "NOTHING HERE IS CALLED FROM A FIRE" IS STILL TRUE AND IS NOW WORTH
-//! SPELLING PRECISELY** (the capacity wave): [`free_bytes`] is called from a
-//! CAPTURE, which is a boot-time pass on a sealed load, and never from a
-//! replay. The distinction is the same one the module was written around —
-//! reading a graph is free of policy, and this reads the device rather than a
-//! graph — and it is why the byte a body costs is measured here rather than
-//! modelled in `record.rs`.
-//!
-//! The split between reading and writing is still worth keeping, and it is
-//! why the write half never grew a caller: what moved between two captures is
-//! derivable from the two graphs ALONE, and is therefore testable without an
-//! exec, a fire or a checkpoint, while a write needs a policy — which exec,
-//! which fire, whether the pass is worth its microseconds — that no pair of
-//! graphs contains and that this shell has decided not to have.
-//!
-//! Build log 10 ruled a per-fire `cudaGraphExecKernelNodeSetParams` rebind
-//! unreachable because "rebinding needs a host-side map from graph node to
-//! kernel argument, and the shell never sees one". This module is the test of
-//! that sentence against the driver API rather than against the seam: a
-//! captured `cudaGraph_t` *is* a host-side map from node to kernel argument,
-//! and the three calls that read it are
-//!
-//! ```text
-//! cuGraphGetNodes            → every node handle
-//! cuGraphKernelNodeGetParams → func, grid, block, smem, the argument cells
-//! cuFuncGetParamInfo         → the (offset, size) of each parameter, so the
-//!                              cells can be READ as typed bytes
-//! ```
-//!
-//! plus `cuFuncGetName` for the symbol. The last one is what makes the pack
-//! interpretable at all: `CUDA_KERNEL_NODE_PARAMS::kernelParams` is a
-//! `void**` with no length, so without `cuFuncGetParamInfo` a walker knows
-//! there are arguments and cannot say how many.
-//!
-//! The order the nodes come back in is unspecified, so [`walk`] canonicalises
-//! it: longest-path depth from a source, then symbol, then the enumeration
-//! index. On a chain that is exact; where two nodes of one depth share a
-//! symbol it is arbitrary, and [`Walked::ambiguous`] counts those so a diff
-//! can say whether it trusted its own alignment.
+//! Reads a captured graph's node/edge structure ([`walk`]), prices a per-node
+//! rebind ([`rebind`]), and measures per-exec device-memory cost
+//! ([`exec_footprint`], [`free_bytes`]). Only [`exec_footprint`] runs from a
+//! capture — once per load, to price a body's nodes
+//! (`record::Recorder::node_price`); nothing here runs on a fire/replay path.
 
 use crate::device::graph::Graph;
 use crate::error::{Fault, Result};
@@ -108,17 +45,10 @@ pub struct Node {
     pub symbol: String,
     /// The `CUfunction` address — identity of the entrypoint this node runs.
     pub func: u64,
-    /// **The live `CUgraphNode_t`.**
-    ///
-    /// [`func`](Node::func) is an identity to compare and to print; this is
-    /// the handle `cudaGraphExecKernelNodeSetParams` takes, and a table that
-    /// held only the number could describe a rebind without being able to
-    /// perform one. Null in a build with no runtime, where no node is ever
-    /// constructed at all.
+    /// The live handle `cudaGraphExecKernelNodeSetParams` takes ([`func`](Node::func)
+    /// is only an identity for comparing/printing). Null with no runtime.
     pub node: *mut core::ffi::c_void,
-    /// **The live `CUfunction`**, for the same reason and with the same
-    /// caveat: a patch that re-states a node's parameters has to re-state its
-    /// entrypoint, and the driver wants the pointer rather than its address.
+    /// The live `CUfunction`, for the same reason as [`node`](Node::node).
     pub entry: *mut core::ffi::c_void,
     /// The launch grid, in blocks.
     pub grid: [u32; 3],
@@ -150,17 +80,13 @@ pub struct Walked {
     pub ambiguous: usize,
     /// How many dependency edges the graph holds.
     pub edges: usize,
-    /// Every dependency edge, as `(from, to)` in the CANONICAL order — the
-    /// same numbering [`Node::at`] carries after the sort.
-    ///
-    /// The count above is what a census prints; this is what a topology
-    /// fingerprint hashes, and the two are kept apart because an edge whose
-    /// endpoints the enumeration did not name (the `index_of` miss below) is
-    /// counted by the driver and cannot be placed by us.
+    /// `(from, to)` pairs in canonical order (post-sort [`Node::at`] numbering).
+    /// Edges the enumeration couldn't place (an `index_of` miss) count in
+    /// [`edges`](Walked::edges) but are omitted here.
     pub links: Vec<(usize, usize)>,
 }
 
-#[cfg(not(feature = "_cuda"))]
+#[cfg(not(feature = "cuda"))]
 #[allow(clippy::needless_pass_by_value, unused_variables)]
 pub fn walk(graph: &Graph) -> Result<Walked> {
     Err(Fault::Runtimeless)
@@ -171,7 +97,7 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
 /// # Errors
 ///
 /// [`Fault::Device`] if the driver refuses an enumeration call.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_lines)]
 pub fn walk(graph: &Graph) -> Result<Walked> {
     use cudarc::driver::sys as dr;
@@ -310,9 +236,7 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
             ambiguous += 1;
         }
     }
-    // The sort moved every node; an edge named in the ENUMERATION's numbering
-    // now points at the wrong row, so it is re-based before anyone reads it.
-    // A fingerprint that hashed stale pairs would be stable and meaningless.
+    // re-base edges to post-sort numbering, or a fingerprint would hash stale pairs
     let mut place = vec![0usize; count];
     for (canonical, node) in nodes.iter().enumerate() {
         place[node.at] = canonical;
@@ -333,7 +257,7 @@ pub fn walk(graph: &Graph) -> Result<Walked> {
 }
 
 /// The mangled symbol behind a `CUfunction`, or an empty string.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 fn name_of(func: cudarc::driver::sys::CUfunction) -> String {
     use cudarc::driver::sys as dr;
     let mut name: *const core::ffi::c_char = core::ptr::null();
@@ -346,13 +270,10 @@ fn name_of(func: cudarc::driver::sys::CUfunction) -> String {
         .into_owned()
 }
 
-/// The parameter block of one captured launch.
-///
-/// **THE LENGTH COMES FROM THE FUNCTION, NOT FROM THE NODE.**
-/// `kernelParams` is a bare `void**`; `cuFuncGetParamInfo` is what says how
-/// many entries it has and how wide each one is, by refusing the first index
-/// past the end.
-#[cfg(feature = "_cuda")]
+/// The parameter block of one captured launch. Count/width come from
+/// `cuFuncGetParamInfo`, not the node: `kernelParams` is a bare `void**`
+/// with no length.
+#[cfg(feature = "cuda")]
 fn read_params(
     func: cudarc::driver::sys::CUfunction,
     kernel_params: *mut *mut core::ffi::c_void,
@@ -452,7 +373,7 @@ fn read_params(
     )
 }
 
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 fn said(call: &'static str, code: cudarc::driver::sys::CUresult) -> Result<()> {
     if code == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
         Ok(())
@@ -464,12 +385,8 @@ fn said(call: &'static str, code: cudarc::driver::sys::CUresult) -> Result<()> {
     }
 }
 
-/// **PROBE ONLY.** What `cudaGraphExecKernelNodeSetParams` will and will not
-/// accept against an instantiated graph, and what it costs per node.
-///
-/// This is the CUDA half of `.wiki/palo/icb.md` §8's first kill factor — "can
-/// a slot be rewritten, and what can it change?" — asked of the API rather
-/// than of a shader.
+/// Probe only: what `cudaGraphExecKernelNodeSetParams` accepts on an
+/// instantiated graph, and its per-node cost.
 #[derive(Clone, Debug)]
 pub struct Rebind {
     /// Nodes rewritten with their own parameters, unchanged.
@@ -482,15 +399,12 @@ pub struct Rebind {
     pub arg: core::result::Result<(), i32>,
     /// Did a changed SHARED MEMORY size take?
     pub smem: core::result::Result<(), i32>,
-    /// Did a changed FUNC take? **The one that decides the design.**
+    /// Did a changed FUNC take? Decides the rebind design.
     pub func: core::result::Result<(), i32>,
-    /// A NULL func — the control that says whether the driver validates the
-    /// field at all.
+    /// A NULL func — control for whether the driver validates the field at all.
     pub null_func: core::result::Result<(), i32>,
-    /// **A ZERO GRID.** The Metal plane turns an empty window's slot off with
-    /// `reset()`; the CUDA equivalent would be rewriting the node's grid to
-    /// zero blocks. Whether that is even expressible decides §4's
-    /// absent-vs-zero-grid ruling.
+    /// A zero grid — the CUDA equivalent of Metal's window-off `reset()`;
+    /// whether this is expressible decides absent-vs-zero-grid handling.
     pub zero_grid: core::result::Result<(), i32>,
     /// One block instead — the "max-grid + in-kernel early exit" fallback.
     pub one_block: core::result::Result<(), i32>,
@@ -506,7 +420,7 @@ pub struct Rebind {
     pub subset_nodes: usize,
 }
 
-#[cfg(not(feature = "_cuda"))]
+#[cfg(not(feature = "cuda"))]
 #[allow(unused_variables)]
 pub fn rebind(
     exec: &crate::device::GraphExec,
@@ -521,7 +435,7 @@ pub fn rebind(
 /// # Errors
 ///
 /// [`Fault::Device`] if the node enumeration itself refuses.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_lines)]
 pub fn rebind(
     exec: &crate::device::GraphExec,
@@ -658,21 +572,11 @@ pub fn rebind(
         cells.borrow_mut().push(boxed);
     });
 
-    // 5. **THE FUNC.** Point one node at another node's entrypoint — the
-    //    arm switch the Metal plane does from a shader.
-    // Prefer a func of a DIFFERENT ARITY, so a success says the driver did
-    // not check rather than that the swap happened to be shaped alike.
-    //
-    // And BECAUSE the driver does not check, the swap must bring its own
-    // param block: `SetParams` copies argument bytes per the NEW func's
-    // layout, so handing it the old node's array under a wider entrypoint is
-    // an out-of-bounds read — a SIGSEGV, not an error code. (The staged-seat
-    // wave is what surfaced this: seated kernels grew a trailing word, the
-    // arity spread widened, and the probe's own experiment started reading
-    // past the block it was handed.) The cells below are the target's shape,
-    // filled from the old block where the two layouts overlap and zeroed
-    // beyond — the finding this experiment records is unchanged: the driver
-    // accepted a func whose shape it never compared.
+    // 5. func: point one node at another's entrypoint. Prefer a different
+    //    arity, so a success shows the driver doesn't check.
+    // SetParams copies bytes per the NEW func's layout, so the swap must
+    // supply its own correctly-sized param block, or it's an OOB read
+    // (SIGSEGV, not an error code).
     let mine = held.first().map(|(_, p)| arity(p.func)).unwrap_or(0);
     let other = held
         .iter()
@@ -761,7 +665,7 @@ pub fn rebind(
 }
 
 /// How many parameters a `CUfunction` declares.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 fn arity(func: cudarc::driver::sys::CUfunction) -> usize {
     use cudarc::driver::sys as dr;
     let mut n = 0usize;
@@ -780,28 +684,21 @@ fn arity(func: cudarc::driver::sys::CUfunction) -> usize {
     }
 }
 
-/// **PROBE ONLY.** What one instantiated exec costs in device memory and in
-/// wall time, measured by instantiating `copies` of `graph` and watching
-/// `cudaMemGetInfo`.
+/// Per-exec device-memory and wall-time cost, measured by instantiating
+/// `copies` of `graph` and reading `cudaMemGetInfo` around the batch.
 ///
-/// The number a cache multiplies by its exec count, and the one the arming
-/// pass's BUDGET is denominated in: the retired keyed path would have
-/// multiplied it by the traffic's distinct `(rows, lanes)` tables, and the
-/// sealed lattice multiplies it by the present sets times the buckets, which
-/// is a list the load can walk.
-///
-/// **AND SINCE THE CAPACITY WAVE THE LOAD DOES NOT HAVE TO TRUST THIS
-/// MULTIPLICATION AT ALL.** `[engine] bodies_mem` states a byte budget and
-/// [`free_bytes`] weighs each body as it is instantiated, so what stops the
-/// enumeration is what was actually spent rather than a count somebody
-/// derived from this probe's figure. What the probe is FOR now is sizing the
-/// default: an operator reading `one exec of N nodes: X KiB` is reading the
-/// arithmetic behind [`crate::serve::DEFAULT_BODIES_MEGABYTES`].
+/// **A RATE, WHICH IS THE WHOLE REASON IT TAKES `copies`.** The driver
+/// sub-allocates an exec out of a reservation it already holds, so the delta
+/// around ONE instantiate is usually zero and occasionally the whole
+/// reservation; over enough of them the boundary cannot dominate. Divided by
+/// the graph's node count it becomes the per-node price
+/// `record::Recorder::node_price` charges every body of a load, and it also
+/// sizes [`crate::serve::DEFAULT_BODIES_MEGABYTES`].
 ///
 /// # Errors
 ///
 /// [`Fault::Device`] if an instantiation or the memory query refuses.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 pub fn exec_footprint(graph: &Graph, copies: usize) -> Result<(f64, f64)> {
     use cudarc::runtime::sys as rt;
 
@@ -823,39 +720,20 @@ pub fn exec_footprint(graph: &Graph, copies: usize) -> Result<(f64, f64)> {
     Ok((bytes, millis))
 }
 
-#[cfg(not(feature = "_cuda"))]
+#[cfg(not(feature = "cuda"))]
 #[allow(unused_variables)]
 pub fn exec_footprint(graph: &Graph, copies: usize) -> Result<(f64, f64)> {
     Err(Fault::Runtimeless)
 }
 
-/// **WHAT THE DEVICE HAS LEFT**, in bytes, or `None` where there is no
-/// runtime to ask.
+/// Free device bytes, or `None` with no runtime to ask.
 ///
-/// [`exec_footprint`] above is the PROBE that established what this number
-/// means for a graph: instantiate `copies` execs, watch `cudaMemGetInfo`, and
-/// divide. This is the same reading taken one instantiation at a time, and it
-/// exists so that a load can charge a BUDGET for the bodies it arms
-/// (`record::Graphs::fire_body` brackets `Graph::instantiate` with it,
-/// `Shell::arm_bodies` spends the total). The probe stays a probe: it costs
-/// `copies` execs nobody launches, and a boot cannot afford to double every
-/// instantiation to weigh it.
-///
-/// **A DELTA ACROSS ONE INSTANTIATION IS LUMPY AND THE SUM IS STILL EXACT**,
-/// which is the whole argument for pricing a body this way. The driver
-/// sub-allocates an exec out of a reservation it may already hold, so one
-/// instantiation can read zero and the next one can read a slab; what a
-/// budget is spending, though, IS device free memory, and free memory is the
-/// ground truth of that quantity rather than a model of it. A per-body figure
-/// is therefore an estimate and a running total is a measurement — which is
-/// the direction that matters, because the total is what the arming loop
-/// stops on.
-///
-/// `None` rather than a `Fault`: a caller weighing something is not a caller
-/// that fails when it cannot, and the one arithmetic that reads this
-/// (`Shell::arm_bodies`) treats an unmeasurable body as a body that spends
-/// nothing and leans on the count belt instead ([`crate::record::MAX_BODIES`]).
-#[cfg(feature = "_cuda")]
+/// **NOT WHAT PRICES A BODY.** It used to be — one reading either side of
+/// each `instantiate` — and per-instantiation deltas are lumpy, because the
+/// driver may sub-allocate from a reservation it already holds. What replaced
+/// it is a per-node rate taken once ([`exec_footprint`],
+/// `record::Recorder::node_price`).
+#[cfg(feature = "cuda")]
 #[must_use]
 pub fn free_bytes() -> Option<usize> {
     use cudarc::runtime::sys as rt;
@@ -865,7 +743,7 @@ pub fn free_bytes() -> Option<usize> {
     (said == rt::cudaError::cudaSuccess).then_some(free)
 }
 
-#[cfg(not(feature = "_cuda"))]
+#[cfg(not(feature = "cuda"))]
 #[must_use]
 pub fn free_bytes() -> Option<usize> {
     None

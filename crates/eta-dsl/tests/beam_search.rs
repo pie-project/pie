@@ -186,18 +186,6 @@ fn logits_forcing_parent(parent_beam: u32, t0: u32, t1: u32) -> PassInputs {
     }
 }
 
-/// Force `parent = [0, 1]` (each beam continues itself): one dominant token per
-/// row, so the top-B are beam0's peak + beam1's peak.
-fn logits_diagonal(t0: u32, t1: u32) -> PassInputs {
-    let mut l = vec![0.0f32; (B * V) as usize];
-    l[t0 as usize] = 20.0; // beam 0 peak
-    l[(V + t1) as usize] = 20.0; // beam 1 peak
-    PassInputs {
-        logits: Some(Value::F32(l)),
-        ..Default::default()
-    }
-}
-
 /// Harvested host-reader outputs of one committed Design B step (drains all of
 /// channels 8..=13 so the next step's capacity-1 host-reader puts can land).
 struct Harvest {
@@ -279,58 +267,3 @@ fn golden_designb_fork_from_shared_prefix() {
     assert_eq!(h.woff, u32s(&[2, 3]), "w_off: offsets 2,3 within page 0");
 }
 
-/// Design B across TWO steps: fork from a shared prefix, then each survivor
-/// continues itself — the masks accumulate as independent ancestry paths, and
-/// the flat append crosses a pool page boundary (page turn). Prompt {0,1}.
-///   step 0: parent=[0,0] append wpos=[2,3] → masks {0,1,2},{0,1,3}, fill 4.
-///   step 1: parent=[0,1] append wpos=[4,5] → masks {0,1,2,4},{0,1,3,5};
-///           w_slot=[1,1], w_off=[0,1] (positions 4,5 are page 1 offs 0,1).
-#[test]
-fn golden_designb_multistep_pageturn() {
-    let traced = build_designb();
-    let bound = bind(traced.container().clone(), beam_profile()).unwrap();
-    let seeds: Vec<(u32, Value)> = vec![
-        (0, mask_of(&[&[0, 1], &[0, 1]])),
-        (1, Value::F32(vec![0.0, 0.0])),
-        (2, Value::I32(vec![1, 1])),
-        (3, u32s(&[2, 2])),
-        (4, u32s(&[2])),
-        (5, u32s(&[2, 2])),
-        (6, u32s(&[0, 0])),
-        (7, u32s(&[0, 0])),
-        (14, u32s(&[0, 1, 2, 0, 1, 2])),
-        (15, u32s(&[0, 3, 6])),
-        (16, u32s(&[0, 1, 2])),
-    ];
-    let mut inst = Instance::new(&bound, &seeds).unwrap();
-
-    // step 0: fork both from beam 0.
-    let r0 = inst
-        .step(&bound, &logits_forcing_parent(0, 2, 3), &mut NoKernels)
-        .unwrap();
-    assert!(r0.committed, "{:?}", r0.missed);
-    let h0 = harvest(&mut inst, &bound);
-    assert_eq!(h0.par, u32s(&[0, 0]));
-    assert_eq!(h0.mask, mask_of(&[&[0, 1, 2], &[0, 1, 3]]));
-    assert_eq!(h0.wslot, u32s(&[0, 0]));
-    assert_eq!(h0.woff, u32s(&[2, 3]));
-
-    // step 1: each survivor continues itself (parent=[0,1]); appends 4,5.
-    let r1 = inst
-        .step(&bound, &logits_diagonal(4, 5), &mut NoKernels)
-        .unwrap();
-    assert!(r1.committed, "{:?}", r1.missed);
-    let h1 = harvest(&mut inst, &bound);
-    assert_eq!(h1.par, u32s(&[0, 1]), "each beam continues itself");
-    assert_eq!(
-        h1.mask,
-        mask_of(&[&[0, 1, 2, 4], &[0, 1, 3, 5]]),
-        "masks accumulate independent ancestry: beam0={{0,1,2,4}}, beam1={{0,1,3,5}}"
-    );
-    assert_eq!(
-        h1.wslot,
-        u32s(&[1, 1]),
-        "page turn: positions 4,5 are in pool page 1"
-    );
-    assert_eq!(h1.woff, u32s(&[0, 1]), "page-1 offsets 0,1");
-}

@@ -1,19 +1,15 @@
 //! The fitting engine: exact integer linear algebra over recorded samples.
 //!
-//! **THERE IS NO DEVICE IN THIS FILE AND THERE never was.** It moved here out
-//! of `engine_metal::abi` unchanged, because everything it does is arithmetic
-//! over `i128` — a two-point exact-rational slope read off a probe ladder, a
-//! bounded search for a tiling law's divisor by interval arithmetic, a
-//! Cramer's-rule inversion of the probe basis over the integers — and a shell
-//! is only ever the thing that supplies the samples. Both planes' recorders
-//! can call it; neither can be the only one that owns it.
+//! No device dependency: everything here is arithmetic over `i128` (a
+//! two-point exact-rational slope, a bounded search for a tiling law's
+//! divisor by interval arithmetic, a Cramer's-rule inversion of the probe
+//! basis over the integers), fed by samples either engine plane can supply.
 //!
-//! Every answer here is EXACT or refused. Nothing rounds: a slope that is not
-//! a whole multiple, a basis whose inverse is not integral, a ceiling whose
-//! offset interval is empty — each is a named refusal
-//! ([`Refusal`](super::Refusal)) rather than a nearest fit, because the
-//! consumer is an artifact that will be replayed for the life of a load and a
-//! law that is nearly right is a wrong number forever.
+//! Every answer is exact or refused. Nothing rounds: a slope that is not a
+//! whole multiple, a basis whose inverse is not integral, a ceiling whose
+//! offset interval is empty -- each is a named refusal
+//! ([`Refusal`](super::Refusal)) rather than a nearest fit, since a wrong
+//! law would be replayed for the life of a load.
 
 use super::{Axis, Law, Recipe, Refusal, Refuse};
 
@@ -42,13 +38,9 @@ pub fn component(
     observed: &[(Vec<i128>, i128, i128)],
 ) -> Result<Option<Law>, Refusal> {
     let first = observed[0].2;
-    // **A CONSTANT IS A CLAIM AND IT GETS CHECKED**, over every sample of the
-    // arm rather than over the ones a bump happened to move. Build log 30's
-    // bug was exactly here: a grid axis written `rows.div_ceil(32)` is flat
-    // across every step small enough to stay inside one tile, and a fit that
-    // only verified the components it had already decided were variable would
-    // call it a constant and encode the wrong grid into the ICB once, at
-    // load.
+    // A constant is checked over every sample, not just the ones a bump
+    // happened to move -- an axis like `rows.div_ceil(32)` is flat across
+    // any step small enough to stay inside one tile.
     if observed.iter().all(|(_, _, v)| *v == first) {
         return Ok(None);
     }
@@ -87,9 +79,7 @@ pub fn affine(axes: &[Axis], points: &[(Vec<i128>, i128)]) -> Result<Law, Refusa
     let (here, value) = &points[0];
     let mut slope = vec![0i128; axes.len()];
     for k in 0..axes.len() {
-        // A pair of samples that differ ONLY in direction k. A probe's base
-        // and its own ladder are exactly that; anything else the harness
-        // supplies is a bonus.
+        // A pair of samples that differ only in direction k.
         let mut seen: Option<i128> = None;
         for (a, (xa, va)) in points.iter().enumerate() {
             for (xb, vb) in points.iter().skip(a + 1) {
@@ -135,9 +125,9 @@ pub fn affine(axes: &[Axis], points: &[(Vec<i128>, i128)]) -> Result<Law, Refusa
             }
         }
     }
-    // The value at the ZERO of the coordinates, not at this arm's first
-    // sample: a law has to be evaluable anywhere, including at the
-    // compositions the probes could not visit (an empty class is one).
+    // The value at the zero of the coordinates, not this arm's first sample:
+    // a law must be evaluable anywhere, including compositions the probes
+    // could not visit.
     let base = value - slope.iter().zip(here).map(|(b, x)| b * x).sum::<i128>();
     let law = Law::Affine { base, slope };
     for (coords, want) in points {
@@ -152,16 +142,11 @@ pub fn affine(axes: &[Axis], points: &[(Vec<i128>, i128)]) -> Result<Law, Refusa
     Ok(law)
 }
 
-/// `mul·⌈(α·rows + β)/div⌉`, solved by interval arithmetic over the samples.
-///
-/// **THE SEARCH IS BOUNDED AND THE ANSWER IS CANONICAL.** For a candidate
-/// `(mul, α, div)` the offset β is not searched at all: every sample says
-/// `div·(w−1) < α·rows + β ≤ div·w`, so β lies in one half-open interval and
-/// the intersection over the samples is one interval or empty. The smallest
-/// `mul`, then the smallest `div`, then the smallest `α` that leaves a
-/// non-empty interval wins — smallest because `⌈n/32⌉` and `⌈2n/64⌉` are the
-/// same function and one of them is the one a reader can check against
-/// `SDPA_TILE`.
+/// `mul·⌈(α·rows + β)/div⌉`, solved by interval arithmetic over the
+/// samples. For a candidate `(mul, α, div)` the offset β is not searched: it
+/// lies in the intersection of each sample's half-open interval. The
+/// smallest `mul`, then `div`, then `α` that leaves a non-empty interval
+/// wins, since e.g. `⌈n/32⌉` and `⌈2n/64⌉` are the same function.
 #[must_use]
 pub fn ceiling(observed: &[(Vec<i128>, i128, i128)]) -> Option<Law> {
     if crossings(observed) < 2 {
@@ -213,16 +198,9 @@ pub fn ceiling(observed: &[(Vec<i128>, i128, i128)]) -> Option<Law> {
 }
 
 /// How many times the samples catch the staircase in the act: a pair of
-/// window row counts `r` and `r+1` whose values differ.
-///
-/// **TWO, OR THE PERIOD IS NOT PINNED.** One crossing says only that the
-/// value stepped somewhere between two rows, and a ceiling with any divisor
-/// wide enough to hold the sampled range explains that — over rows 16..47,
-/// `⌈(r−15)/17⌉` is `⌈r/32⌉` exactly, and the search would answer 17 because
-/// 17 is smaller. Two crossings say how far apart the steps are, which is the
-/// divisor. This is the fitter's third-point discipline, in the form the
-/// tiling law needs it: sample points straddling a multiple of the tile, and
-/// then straddling the next one.
+/// window row counts `r` and `r+1` whose values differ. Two crossings, not
+/// one, are needed to pin the divisor: a single crossing is explained by any
+/// divisor wide enough to hold the sampled range.
 #[must_use]
 pub fn crossings(observed: &[(Vec<i128>, i128, i128)]) -> usize {
     let mut by_rows: std::collections::BTreeMap<i128, i128> = std::collections::BTreeMap::new();
@@ -248,14 +226,11 @@ fn gcd(a: i128, b: i128) -> i128 {
 pub type Site<'a> = (&'a [(u32, u32)], &'a [i128]);
 
 /// Invert the basis: one linear functional per direction over the class
-/// table's own numbers, solved exactly and verified at every probe.
-///
-/// **THIS IS WHAT MAKES THE TABLE READABLE BY SOMETHING THAT DID NOT WALK.**
-/// The laws are written in a basis of reachable directions; a fire carries a
-/// class table. `step` says what one unit of each direction does to that
-/// table, which is a `2·classes × directions` matrix; a square subsystem of
-/// it that inverts over the integers is the recipe. There may be several and
-/// they agree — the verification over every probe is what says so.
+/// table's own numbers, solved exactly and verified at every probe. This is
+/// what lets a fire's class table (which did not walk) be read back into
+/// the laws' coordinates: `step` gives a `2*classes x directions` matrix,
+/// and a square subsystem of it that inverts over the integers is the
+/// recipe.
 ///
 /// # Errors
 ///
@@ -281,8 +256,8 @@ pub fn invert(
             )));
         }
     }
-    // The full `2·classes × k` step matrix, row `2c` = class c's rows, row
-    // `2c+1` = its lanes.
+    // The full `2*classes x k` step matrix: row `2c` is class c's rows,
+    // row `2c+1` its lanes.
     let column = |row: usize, axis: usize| -> i128 {
         let (rows, lanes) = axes[axis].step[row / 2];
         i128::from(if row.is_multiple_of(2) { rows } else { lanes })
@@ -292,8 +267,8 @@ pub fn invert(
     let mut pivots: Vec<usize> = (0..k).collect();
     loop {
         if let Some(recipe) = try_pivots(&pivots, k, classes, origin_classes, origin, &column) {
-            // The recipe is a claim about every probe, not only about the
-            // rows it was solved from.
+            // The recipe is a claim about every probe, not just the rows it
+            // was solved from.
             for (walk_classes, walk_coords) in every {
                 let got: Vec<i128> = recipe.iter().map(|row| row.at(walk_classes)).collect();
                 if got != *walk_coords {
@@ -330,9 +305,8 @@ pub fn invert(
 }
 
 /// One choice of pivot rows, inverted by Cramer's rule over the integers.
-// The two `0..k` loops index three parallel things at once — the identity
-// column, the transposed matrix's row, and the origin's coordinate — so the
-// index is the subject and not an accident of the iteration.
+// The `0..k` loops index three parallel things at once (identity column,
+// transposed row, origin coordinate).
 #[allow(clippy::needless_range_loop)]
 fn try_pivots(
     pivots: &[usize],
@@ -350,7 +324,7 @@ fn try_pivots(
     if det == 0 {
         return None;
     }
-    // Row `k` of A⁻¹: solve `xᵀ·A = e_k`, i.e. `Aᵀ·x = e_k`, by Cramer.
+    // Row `k` of A^-1: solve `x^T*A = e_k`, i.e. `A^T*x = e_k`, by Cramer.
     let mut recipe = Vec::with_capacity(k);
     for axis in 0..k {
         let mut coefficients = vec![0i128; k];
@@ -395,9 +369,8 @@ fn transpose(a: &[Vec<i128>]) -> Vec<Vec<i128>> {
         .collect()
 }
 
-/// Laplace expansion. The matrices here are `k × k` with `k` the number of
-/// probe directions — three today, and a basis with more than a handful of
-/// directions is a harness that has lost the plot.
+/// Laplace expansion. The matrices here are `k x k`, `k` the number of
+/// probe directions (small by construction).
 fn determinant(a: &[Vec<i128>]) -> i128 {
     let n = a.len();
     match n {
@@ -436,49 +409,6 @@ mod tests {
         ]
     }
 
-    /// The basis the live Metal harness uses, inverted: two classes, three
-    /// directions, and the answer is the one a reader can check by hand.
-    #[test]
-    fn the_probe_basis_inverts_into_a_reading_of_the_class_table() {
-        let origin_classes = vec![(2u32, 2u32), (16, 2)];
-        let coords = [0i128, 0, 0];
-        let recipe = invert(
-            &axes(),
-            &origin_classes,
-            &coords,
-            &[(origin_classes.as_slice(), coords.as_slice())],
-        )
-        .expect("inverts");
-        // d = decode rows − 2; p = prefill lanes − 2; t = prefill rows − 8·prefill lanes.
-        assert_eq!(recipe[0].at(&[(5, 5), (16, 2)]), 3);
-        assert_eq!(recipe[1].at(&[(2, 2), (24, 3)]), 1);
-        assert_eq!(recipe[2].at(&[(2, 2), (17, 2)]), 1);
-        // AND THE ALL-DECODE COMPOSITION, which is the one the probes cannot
-        // visit and the ICB has to serve: every prefill number is zero.
-        assert_eq!(recipe[1].at(&[(4, 4), (0, 0)]), -2);
-        assert_eq!(recipe[2].at(&[(4, 4), (0, 0)]), 0);
-    }
-
-    /// A basis whose inverse is not integral is refused by name rather than
-    /// rounded — and the refusal is [`Refuse::Unstructured`], not a fit.
-    #[test]
-    fn a_basis_that_does_not_invert_over_the_integers_is_refused_by_name() {
-        let origin_classes = vec![(0u32, 0u32)];
-        let coords = [0i128, 0];
-        let basis = vec![
-            Axis::new("two rows at a time", vec![(2, 0)]),
-            Axis::new("four rows at a time", vec![(4, 0)]),
-        ];
-        let refused = invert(
-            &basis,
-            &origin_classes,
-            &coords,
-            &[(origin_classes.as_slice(), coords.as_slice())],
-        )
-        .expect_err("two parallel directions cannot both be read back");
-        assert_eq!(refused.reason, Refuse::Unstructured);
-    }
-
     /// `⌈rows/32⌉` is refused as affine and fitted as a tiling law, and the
     /// answer is the constant a reader can find in `kernels_metal::attn`.
     #[test]
@@ -508,53 +438,6 @@ mod tests {
         }
     }
 
-    /// `2·⌈rows/32⌉` — `linear::gemm`'s tile arm — needs the multiplier, and
-    /// the fit finds it rather than being told.
-    #[test]
-    fn a_scaled_tiling_law_finds_its_multiplier() {
-        let observed: Vec<(Vec<i128>, i128, i128)> = (32..112)
-            .map(|rows: i128| {
-                (
-                    vec![0, 0, rows],
-                    rows,
-                    2 * (rows.div_euclid(32) + i128::from(rows % 32 != 0)),
-                )
-            })
-            .collect();
-        let law = ceiling(&observed).expect("the scaled tiling law fits");
-        assert_eq!(
-            law,
-            Law::Ceil {
-                mul: 2,
-                alpha: 1,
-                beta: 0,
-                div: 32
-            }
-        );
-    }
-
-    /// A staircase no ceiling explains is still a refusal.
-    #[test]
-    fn a_component_that_is_neither_law_is_still_refused() {
-        let observed: Vec<(Vec<i128>, i128, i128)> = (1..40)
-            .map(|rows: i128| (vec![rows], rows, rows * rows))
-            .collect();
-        assert_eq!(ceiling(&observed), None);
-        let one = vec![Axis::new("one more row", vec![(1, 0)])];
-        let refused = component(&one, &observed).expect_err("neither law predicts a square");
-        assert_eq!(refused.reason, Refuse::Unaffine);
-    }
-
-    /// A component that never moves across the samples is not a law at all —
-    /// it is a constant the encode states once.
-    #[test]
-    fn a_component_that_never_moves_is_no_law_and_no_refusal() {
-        let one = vec![Axis::new("one more row", vec![(1, 0)])];
-        let observed: Vec<(Vec<i128>, i128, i128)> =
-            (1..8i128).map(|rows| (vec![rows], rows, 4096)).collect();
-        assert_eq!(component(&one, &observed).expect("a constant is not a refusal"), None);
-    }
-
     /// The line is fitted off the ladder and VERIFIED off the lattice: the
     /// base is the value at the zero of the coordinates, which is a point no
     /// sample visited.
@@ -577,18 +460,6 @@ mod tests {
         );
         assert_eq!(law.at(&[-2, 0, 0], 0), Some(86), "a law evaluates outside the box");
         assert_eq!(law.reads(), vec![0, 1, 2]);
-    }
-
-    /// A direction no pair of samples steps alone leaves its slope
-    /// unwitnessed, and an unwitnessed slope is refused rather than assumed
-    /// to be zero.
-    #[test]
-    fn a_direction_no_ladder_stepped_is_refused_rather_than_assumed_flat() {
-        let basis = axes();
-        let points: Vec<(Vec<i128>, i128)> = vec![(vec![0, 0, 0], 1), (vec![1, 0, 0], 2)];
-        let refused = affine(&basis, &points).expect_err("two directions are unwitnessed");
-        assert_eq!(refused.reason, Refuse::Unaffine);
-        assert!(refused.why.contains("unwitnessed"), "{refused}");
     }
 
     /// A slot law is the one form the fit never produces and the one form

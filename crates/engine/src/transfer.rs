@@ -1,37 +1,12 @@
-//! Moving state that is already on a device: KV pages, recurrent slots, pool
-//! pages.
-//!
-//! Four nouns and three verbs' arguments. The nouns describe **where the bytes
-//! are** — [`KvHandle`] is what an engine exports so a peer can write into its
-//! pool without going through it — and the verbs
-//! ([`KvCopy`], [`StateCopy`]) describe a
-//! rearrangement inside one.
-//!
-//! # What changed here, and why
-//!
-//! * `KvDtype` is gone. It was five variants (`F32`/`F16`/`Bf16`/`F8E4M3`/`I8`)
-//!   of a dtype the model plane already spells [`model_ir::Dtype`], kept in a
-//!   second enum with a second `size()` and nothing to make the two agree
-//!   (decision 1 — this is the parallel spelling the rewrite names). A KV pool
-//!   holds the model's cache rows and their dtype is the model's.
-//! * `DeviceDomain = u32` and the seven `PIE_MEMORY_DOMAIN_*` constants beside
-//!   it are gone. [`MemoryDomain`] was already an enum in this very module,
-//!   used by [`KvRegion`]; the `u32` alias was the same axis spelled a second
-//!   time for the C boundary, complete with a `pie_memory_domain_is_valid`
-//!   predicate that exists only because an integer can hold a value no domain
-//!   claims. An enum cannot.
-//! * `PIE_ELASTIC_POOL_KV/STATE/WORKSPACE` — three `u64` tags in a `pool_id`
-//!   field — became [`Pool`].
+//! Moving state that is already on a device: KV pages, recurrent slots, pool pages.
 
 use serde::{Deserialize, Serialize};
 
 use model_ir::Dtype;
 
-/// Which memory a range of bytes lives in.
-///
-/// The device ordinal rides inside the variant that has one, because "which
-/// GPU" is meaningless for host-pinned memory and a separate `ordinal: u32`
-/// field would have to be ignored there by convention.
+/// Which memory a range of bytes lives in. The device ordinal rides inside
+/// the variant that has one, since "which GPU" is meaningless for
+/// host-pinned memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MemoryDomain {
     /// Page-locked host memory — reachable by every device on the node, and
@@ -97,12 +72,8 @@ impl KvLayoutKind {
 }
 
 /// The geometry of one KV pool, in enough detail that a peer can compute a
-/// page's address without asking.
-///
-/// Two loads may exchange pages iff their layouts are equal — that is what
-/// [`KvLayout::compatible_with`] means, and it is equality rather than a
-/// subtyping rule because a page is raw bytes and there is no field here whose
-/// mismatch is survivable.
+/// page's address without asking. Two loads may exchange pages iff their
+/// layouts are exactly equal — a page is raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvLayout {
     /// Layers with a cache row.
@@ -128,18 +99,10 @@ pub struct KvLayout {
     pub region_page_bytes: Vec<u64>,
 }
 
-// A `dtype_bits` TABLE STOOD HERE, the third of three: `model_ir::Dtype` and
-// `checkpoint::types::Dtype` each carried one of their own, over vocabularies
-// that only overlapped. It is [`Dtype::bits`] now, on the one enum, and its
-// note about bits rather than bytes went with it — the sub-byte formats are
-// real, and rounding them up over-reports a quantized pool by 2×.
-
 impl KvLayout {
-    /// How many bytes one page occupies.
-    ///
-    /// [`region_page_bytes`](KvLayout::region_page_bytes) wins when it is set;
-    /// otherwise the four geometry numbers multiply out, with the element size
-    /// taken in bits so a quantized pool is not rounded up.
+    /// How many bytes one page occupies. `region_page_bytes` wins when set;
+    /// otherwise the geometry multiplies out, element size in bits so a
+    /// quantized pool is not rounded up.
     #[must_use]
     pub fn page_bytes(&self) -> u64 {
         if !self.region_page_bytes.is_empty() {
@@ -173,12 +136,8 @@ pub struct KvRegion {
     pub domain: MemoryDomain,
 }
 
-/// A whole KV pool, addressable from outside the engine that owns it.
-///
-/// This is the RDMA half of disaggregated serving: a prefill worker exports
-/// one of these, a decode worker registers it with its transport, and pages
-/// move without either engine being on the path. `transport` consumes it and
-/// owns none of it.
+/// A whole KV pool, addressable from outside the engine that owns it — a
+/// prefill worker exports one, a decode worker registers it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvHandle {
     /// The pool's spans, in region order.
@@ -195,12 +154,8 @@ impl KvHandle {
     }
 
     /// How many pages the pool holds, or `None` if the regions disagree.
-    ///
-    /// Every region must hold the same page count, because a page id indexes
-    /// all of them at once — region 0 holds page `p`'s K plane where region 1
-    /// holds its scales. A region whose length is not a whole number of
-    /// strides, or that holds a different count, means the export is not a
-    /// pool this arithmetic describes, and `None` is the honest answer.
+    /// Every region must hold the same page count: a page id indexes all of
+    /// them at once (region 0 holds page `p`'s K plane, region 1 its scales).
     #[must_use]
     pub fn page_capacity(&self) -> Option<u64> {
         let mut capacity = None;
@@ -220,21 +175,17 @@ impl KvHandle {
     }
 }
 
-/// Something that can hand out its KV pool's address.
-///
-/// A trait rather than a method on [`Engine`](crate::Engine) because the
-/// transport engines take it on things that are not `Engine`s — a mock pool in a
-/// test, a registered peer's cached handle.
+/// Something that can hand out its KV pool's address. A trait rather than a
+/// method on [`Engine`](crate::Engine) because transport takes it on things
+/// that are not `Engine`s — a mock pool in a test, a peer's cached handle.
 pub trait KvExport {
     /// This pool's address, or `None` if it is not exportable.
     fn export_kv_handle(&self) -> Option<KvHandle>;
 }
 
-/// One page-to-page token move inside (or between) KV pools.
-///
-/// Token-granular rather than page-granular because that is what prefix
-/// sharing needs: a fork copies a partial page's live tokens into a fresh page
-/// and leaves the rest.
+/// One page-to-page token move inside (or between) KV pools. Token-granular
+/// rather than page-granular: a fork copies a partial page's live tokens
+/// into a fresh page and leaves the rest.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvMove {
     /// Page written.
@@ -278,11 +229,8 @@ impl Default for KvCopy {
 }
 
 impl KvCopy {
-    /// Is this a submission the contract describes?
-    ///
-    /// The `pie_memory_domain_is_valid` half of the old check is gone — a
-    /// [`MemoryDomain`] cannot name a domain that does not exist — so the one
-    /// thing left to say is that the two page lists are parallel.
+    /// Is this a submission the contract describes? Checks that the two
+    /// page lists are parallel.
     ///
     /// # Errors
     ///
@@ -320,21 +268,3 @@ pub struct StateCopy {
     /// The spans to move, in order.
     pub moves: Vec<StateMove>,
 }
-
-// **`Pool`, `PageRange` AND `PoolResize` ARE GONE** (alto design §8, wave C).
-//
-// They were the argument of `resize_pool`, whose only caller was the
-// runtime's 10-second elastic-trim poll — and that poll died with this wave.
-// Both halves of the verb had lost their reason:
-//
-// * its GROWTH half (`map_ranges`, a target above what is mapped) is
-//   admission's job now. A frame's union demand is committed atomically by
-//   the engine before any of it runs, and a second, non-atomic path to the
-//   same commit is exactly the double allocator article 8 forbids.
-// * its SHRINK half needs a residency truth — which pages still hold a
-//   cached prefix — and the scan that produced it went with the poll.
-//
-// `crate::frame::Supply::trim` is the successor and it lives inside the
-// engine, where supply lives. What has not been designed yet is the seam a
-// residency hint would cross on; when it is, it will be a hint and not a
-// mapping plan, so nothing here is worth keeping warm.

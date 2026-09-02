@@ -1,16 +1,6 @@
-//! The passes that only refuse.
-//!
-//! A validator is a `Pass` that returns `Ok(0)` — the honest answer, since it
-//! never rewrites — and whose whole job is to fail. They sit apart from the
-//! rewriters because they are the invariants the rewriters have to preserve,
-//! and a rewriter that breaks one should be able to read the rule rather than
-//! find it interleaved with the code that broke it.
-//!
-//! Each arrived by a different route. `validate-persistent-layout` is what
-//! makes the arena assignment safe to trust; `validate-target-support` keeps a
-//! backend from being handed a tile map it has no kernel for;
-//! `validate-fill-order` exists because a reordering pass silently broke it
-//! once, and the invariant was cheaper to state than to re-derive.
+//! The passes that only refuse: each is a `Pass` returning `Ok(0)`, stating
+//! an invariant the rewriters must preserve rather than leaving it implicit
+//! in the code that could break it.
 
 use std::collections::HashMap;
 
@@ -24,19 +14,13 @@ use crate::types::{
 
 /// Every `Fill` runs before every write to the buffer it zeroes.
 ///
-/// A fill is the one instruction whose *absence of order* is silent: run it
-/// late and the plan still validates, still has the right instruction count,
-/// and hands back a tensor whose padded region has eaten real data. Passes
-/// that reorder are free to move fills as long as this holds.
+/// A fill is the one instruction whose absence of order is silent: run it
+/// late and the plan still validates, but hands back a tensor whose padded
+/// region has eaten real data.
 ///
-/// Two kinds of write have to be matched to a fill, and only one of them names
-/// a buffer. `ExtentWrite` and `TileMap` carry [`BufferId`]s, so the match is a
-/// lookup. `BulkExtentWrite` addresses the persistent arena directly —
-/// coalescing is what turns a buffer-relative write into an arena-relative one,
-/// and it may fold several buffers into a single copy — so it is matched by
-/// *overlap* against the arena window each filled buffer owns. That is also the
-/// only formulation that stays right once a bulk write spans more than one
-/// buffer.
+/// `ExtentWrite`/`TileMap` carry a [`BufferId`] and match by lookup;
+/// `BulkExtentWrite` addresses the arena directly and is matched by overlap
+/// against each filled buffer's arena window instead.
 pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
     let mut filled: HashMap<BufferId, usize> = HashMap::new();
     for (at, id) in program.schedule.iter().enumerate() {
@@ -154,14 +138,9 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                             | QuantScheme::MlxAffineU4
                     )
                 ))
-                // Decode is implemented for the schemes whose scales live
-                // *inside* the payload — a GGUF block is self-contained, so
-                // decoding needs no factor operand. A separate-scale scheme
-                // spells its dequant as a per-block `Scale` instead, and a
-                // `Decode` of one has no meaning any executor could give it.
-                // Which schemes those are is asked, not restated: a block
-                // layout is exactly what the host executor needs to size and
-                // dispatch a decode.
+                // Decode is implemented for schemes whose scales live inside
+                // the payload; a separate-scale scheme dequants via `Scale`
+                // instead, and `Decode` of one has no meaning.
                 || (*kind == TileMapKind::Decode
                     && transform
                         .from
@@ -174,13 +153,9 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                             RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale
                         )
                     }))
-                // **THE TILED AFFINE PAIR NEEDS NO DEVICE CAPABILITY BIT**
-                // (§J4b), because it is not a device transform: the two
-                // rows are a pure gather the HOST executor runs, and the
-                // only target whose mask carries `Repack` at all is
-                // `CONVERT_TILE_MAP_MASK`. `advertised` above is therefore
-                // the whole gate, and a serving plan that states one is
-                // refused before this line is reached.
+                // The tiled affine pair needs no device capability bit: it
+                // is a pure gather the host executor runs, not a device
+                // transform.
                 || (*kind == TileMapKind::Repack
                     && transform.repack.is_some_and(|repack| {
                         matches!(
@@ -190,11 +165,8 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                         )
                     })));
         if !supported {
-            // **AN ENCODE IS NAMED FOR WHAT IT IS AND WHERE IT BELONGS**
-            // (§M-3). Every other refusal here says a backend lacks a
-            // kernel; this one says a SERVING plan may not convert, which is
-            // not a gap to be filled but the serve-as-stored rule, and an
-            // operator meeting it has one thing to do about it.
+            // Unlike the other refusals here, this one is not a missing
+            // kernel: a serving plan may not convert at all (serve-as-stored).
             if *kind == TileMapKind::Encode {
                 return Err(Error::Unsupported(format!(
                     "this load would quantize on the way in ({:?}->{:?}), and a serving \
@@ -204,12 +176,8 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                     transform.from, transform.to
                 )));
             }
-            // **AND A REPACK IS NAMED THE SAME WAY, FOR THE SAME REASON**
-            // (§J4b). It is not a conversion — a relabelling serves the row
-            // it stored — but it is paid once per weight, and a serving load
-            // that took one would rearrange a hundred gigabytes on the way
-            // in at every boot. The site is the import, and an operator
-            // meeting this has one thing to do about it.
+            // Same reasoning for a repack: paid once per weight, not once
+            // per boot, so a serving load must not take one.
             if *kind == TileMapKind::Repack {
                 return Err(Error::Unsupported(format!(
                     "this load would relayout a weight plane on the way in ({:?}), and a \
@@ -229,48 +197,17 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
     Ok(0)
 }
 
-/// A tensor the engine BINDS is stored in something the engine can read.
+/// A tensor the engine binds is stored in something the engine can read: no
+/// device may be handed a self-contained block it cannot read directly (see
+/// [`binds_block`] for which blocks a backend's kernels do read as stored).
 ///
-/// Narrowly: no device may be handed a self-contained block. A GGUF block
-/// carries its scales inside the payload, and `CONVERT_TILE_MAP_MASK`'s own
-/// doc states the consequence — *"the schemes it covers carry their scales
-/// inside the payload (GGUF blocks), which no device kernel reads"*. That
-/// sentence was true and unenforced.
-///
-/// **Why this pass exists although it cannot fire.** `validate_target_support`
-/// looks like the guard for this and is not: it refuses a `Decode` a backend
-/// has no bit for, so it only sees a plan that TRIES to decode. A plan that
-/// passes a blocked tensor straight through to the device emits no `TileMap`
-/// at all, so there is nothing for it to refuse. The only thing standing
-/// between a Q4_K checkpoint and a CUDA arena today is that
-/// `contract::materialize` decodes every blocked scheme on the way into a
-/// `.zt`, one crate away, for reasons that are about disk rather than about
-/// device kernels.
-///
-/// Measured, by flipping exactly that policy: `pie model import` of
-/// `qwen2.5-0.5b-instruct-q4_0.gguf` with blocked schemes preserved is
-/// **269 MiB in 153 ms** instead of 946 MiB in 1 s, and `pie model build
-/// --backend cuda` over the result **succeeded** (that command is since
-/// deleted; the hole it exposed is not), writing a runtime artifact
-/// holding 169 `GgufQ4_0` tensors for a device with no kernel that reads one.
-/// It compiled, it validated, and it was wrong. That is the hole, and the
-/// prize on the other side of it — 3.5x on disk — is large enough that the
-/// policy will be revisited, so the invariant is stated here where the plan
-/// can see it rather than left resting on a decision made for other reasons.
+/// `validate_target_support` is not the guard for this: it only refuses a
+/// `Decode` a backend has no bit for, so a plan that passes a blocked tensor
+/// straight through emits no `TileMap` and nothing to refuse there.
 ///
 /// Only `Visibility::Public` tensors are checked. An `Internal` tensor is an
-/// intermediate the plan itself consumes and the engine never sees, and a
-/// blocked one is exactly what a `Decode` reads from — refusing it would
-/// refuse the repair.
-///
-/// **THE POLICY WAS REVISITED, EXACTLY AS THE PARAGRAPH ABOVE SAID IT WOULD
-/// BE** (QNF wave, alto `next.md` §J5). "No device kernel reads one" was a
-/// statement about the kernels of the day, and it is no longer true of all of
-/// them: `kernels_cuda::linear::kquant` reads a ggml K-quant super-block row
-/// AS STORED, decoding each block inside the dot. So the invariant narrowed
-/// from "a device is never handed a block" to "a device is never handed a
-/// block IT CANNOT READ", and [`binds_block`] is the whole of the difference.
-/// The 3.5x on disk is what is on the other side of it.
+/// intermediate the plan itself consumes, and a blocked one is exactly what
+/// a `Decode` reads from — refusing it would refuse the repair.
 pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> {
     // A host target legitimately publishes blocked tensors: `pie model
     // import`'s passthrough is this, and the whole point of an offline
@@ -297,29 +234,15 @@ pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> 
     Ok(0)
 }
 
-/// **THE BLOCK SCHEMES A BACKEND'S KERNELS READ AS STORED**, and the whole of
+/// The block schemes a backend's kernels read as stored, and the whole of
 /// the exception [`validate_bound_encodings`] carries.
-///
-/// A capability table in this crate, which is where the tile-map masks
-/// already live and for their reason: a plan is compiled here, so the question
-/// "may this plan exist" has to be answerable here. Like those masks it is
-/// widened by a load that needed it and never by reasoning about what a shell
-/// could presumably do — `CUDA_TILE_MAP_MASK`'s own history is the precedent.
 fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
     match backend {
-        // **THE FIVE ggml K-QUANTS, ON CUDA** (QNF §J2 priority 3):
-        // `kernels_cuda::linear::kquant` names a point per scheme and reads
-        // the super-block row as one byte plane, decoding inside the dot. A
-        // model text reaches them by declaring the variant that names the term
-        // (`dtype::Fmt`), and `engine_cuda::dispatch::linear` routes there.
-        //
-        // NOT the 32-element blocks — `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`
-        // and gguf's interleaved mxfp4. Their arithmetic HAS a CUDA point
-        // (`linear::quant`'s symmetric and affine arms), but that point reads
-        // a leaf-per-plane operand, so serving one as stored wants a repack
-        // at import rather than a row here. And not the IQ lattices, whose
-        // points are compiled into llama.cpp: `QuantSpec::term` gives them no
-        // signature at all, which is the same refusal said one crate over.
+        // The five ggml K-quants: `kernels_cuda::linear::kquant` reads the
+        // super-block row as one byte plane, decoding inside the dot. Not
+        // the 32-element blocks (q4_0/q4_1/q5_0/q5_1/q8_0, gguf mxfp4),
+        // whose CUDA point reads a leaf-per-plane operand instead, and not
+        // the IQ lattices, which have no CUDA signature at all.
         BackendKind::Cuda => matches!(
             scheme,
             QuantScheme::GgufQ2K
@@ -328,22 +251,16 @@ fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
                 | QuantScheme::GgufQ5K
                 | QuantScheme::GgufQ6K
         ),
-        // Metal has no stored-block point — `kernels_metal::linear` carries
-        // the affine family and nothing braided — and the Vulkan shell is out
-        // of the workspace. `Unknown` never reaches here (the host arm above
-        // returns first), and answering `false` for it is the conservative
-        // reading of a backend that is not a device.
+        // Metal has no stored-block point, and Vulkan is out of the
+        // workspace. `Unknown` never reaches here (the host arm above
+        // returns first).
         BackendKind::Metal | BackendKind::Vulkan | BackendKind::Unknown => false,
     }
 }
 
 /// A per-group [`TileMapKind::Scale`] keeps the operand holding its factors.
-///
-/// The pairing is stated in the contract and checked by `infer`, but it only
-/// reaches the executor as an entry in `inputs`, and an optimizer pass that
-/// rewrites operands has no other reason to keep that entry. Losing it would
-/// not fail to compile — it would silently scale by whatever the executor found
-/// first — so the final plan says the invariant out loud.
+/// Losing it would not fail to compile — it would silently scale by
+/// whatever the executor found first — so the final plan says it out loud.
 pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
     for instr in &program.instrs {
         let StorageInstr::TileMap {
@@ -373,24 +290,10 @@ pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
     Ok(0)
 }
 
-/// A named kernel's operands are all in the arena.
-///
-/// **This was a policy the executor applied silently.**
-/// `HostExecutor::arena_tile_map_op` opened with `if source.is_some() { return
-/// Ok(None) }` — a transform reading the checkpoint was never offered to the
-/// backing, no matter what the plan said — so a plan could state
-/// `kernel = quant::quantize_bf16_to_fp8_e4m3_per_channel` and the load would
-/// run it on the host, correctly, and about a hundred times slower. Nothing
-/// reported the difference; the only way to see it was to instrument a load
-/// and count launches (`.wiki/fix/loader.md` §5.4).
-///
-/// That is the exact defect [`tile`](super::tile)'s header describes and was
-/// written to remove — a decision made while executing, invisible in the plan
-/// — reintroduced one layer up. `stage-device-transforms` makes the check
-/// unnecessary by construction: the compiler no longer emits a kernel-bearing
-/// `TileMap` whose operands are not device-addressable. So the rule moves here,
-/// where breaking it names the tensor and fails `compile` rather than
-/// producing a plan that loads correctly and slowly.
+/// A named kernel's operands are all in the arena. Without this check, a plan
+/// could name a device kernel over a checkpoint-backed operand and silently
+/// fall back to a correct but ~100x slower host execution instead of failing
+/// to compile.
 ///
 /// A view is resolved to its base: a window on a resident buffer IS in the
 /// arena, which is the same walk `executor::host::resolve` does.
@@ -457,22 +360,15 @@ fn in_arena(program: &LoadPlan, id: BufferId) -> Result<bool> {
 /// `passes::arena` and `passes::tile` use, for the same reason.
 const MAX_VIEW_HOPS: usize = 16;
 
-/// Operand-unit invariants the optimizer/ABI must preserve and the C++ executor
-/// relies on. Checked explicitly on the final plan so a future rewrite fails
-/// fast instead of silently regressing — these were previously only an implicit
-/// assumption in `assign_persistent_offsets`:
+/// Operand-unit invariants the optimizer/ABI must preserve and the executor
+/// relies on, checked explicitly on the final plan so a future rewrite fails
+/// fast instead of silently regressing:
 ///   1. every persistent operand buffer base is aligned to the device target
 ///      and its tensor contract.
 ///   2. persistent operand buffers occupy disjoint arena ranges.
 ///   3. every `CreateView` reads a single backing buffer that exists, and the
-///      view window lies within it — i.e. packed members stay *internal* to one
-///      backing buffer, which is what makes (1) safe for packed weights.
-///   4. a declared tensor is claimed by at most one buffer. `BufferDecl.tensor`
-///      says "this buffer *is* that tensor", so two claims are the plan saying
-///      one tensor lives in two places. Nothing checked this while the only way
-///      to provoke it was a rule stated in `plan::build`; the rule is now the
-///      `Role` a lowering is given, and this is what makes that safe rather
-///      than merely untested.
+///      view window lies within it.
+///   4. a declared tensor is claimed by at most one buffer.
 pub(super) fn validate_persistent_layout(program: &mut LoadPlan) -> Result<usize> {
     let mut claimed: HashMap<TensorId, BufferId> = HashMap::new();
     for buffer in &program.buffers {

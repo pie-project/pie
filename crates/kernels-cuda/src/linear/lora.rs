@@ -1,39 +1,21 @@
-//! `Lora`: the correction class (palo design §8, decision 17).
-//!
-//! One entry, [`correct`], for one IR variant — `linear.lora_correct` — and it
-//! is two launches because the correction is two matmuls with a rank-wide
-//! waist between them:
+//! `Lora`: the correction class. One entry, [`correct`], for
+//! `linear.lora_correct` — two launches, two matmuls with a rank-wide waist
+//! between them:
 //!
 //! ```text
-//! t[row, 0..r] = A[routes[row]] · x[row]      ← linear/moe.cuh, verbatim
-//! y[row, 0..n] += B[routes[row]] · t[row]     ← linear/lora.cuh, new
+//! t[row, 0..r] = A[routes[row]] . x[row]      <- linear/moe.cuh, verbatim
+//! y[row, 0..n] += B[routes[row]] . t[row]     <- linear/lora.cuh, new
 //! ```
 //!
-//! **THE FIRST HALF COMPOSES AND THE SECOND DOES NOT.** A routed projection at
-//! fan-out one IS `moe`'s dense select GEMV: same bank stride, same per-route
-//! index, same negative-route zero. It is fired through
-//! [`moe::select_gemv`](super::moe::select_gemv) under this op's own name, so
-//! no second copy of that ladder exists to drift. What has no counterpart is
-//! the ACCUMULATE — every routed op in this plane assigns its output row,
-//! because a routed expert owns the row it computes, and a correction by
-//! definition does not: it adds to a value the trunk already wrote. That is
-//! `lora_combine`, and it is the only device text this axis added.
+//! The first half is `moe`'s dense select GEMV at fan-out one, fired through
+//! [`moe::select_gemv`](super::moe::select_gemv). The second (`lora_combine`)
+//! is the accumulate a routed op never needs, since a correction adds to a
+//! value the trunk already wrote rather than assigning its own row.
 //!
-//! # The waist is a scratch slab, and it has to be
-//!
-//! `t` is `rows x rank` and lives for the two launches between which it is
-//! written and read. An entry may not allocate per fire (graph capture forbids
-//! it), so it comes from [`Ctx::scratch`] — named, process-global, grown but
-//! never shrunk, and warmed by the shell's eager pass before any capture, on
-//! the same contract every other scratch-consuming entry here answers to.
-//!
-//! It carries the ACTIVATION's dtype rather than f32, because that is what the
-//! composed projection writes. The arithmetic inside both halves is f32 (the
-//! GEMV accumulates in f32 and `lora_combine` reads back through
-//! `Elem<T>::to_f32`); what is bf16 is the rank-wide waist, which is `r`
-//! numbers per row against the `n` the trunk already rounded. Stated rather
-//! than hidden: a fused single-launch form would keep the waist in registers
-//! and is what a rank-diverse deployment should measure next.
+//! The waist `t` (`rows x rank`) lives in [`Ctx::scratch`] between the two
+//! launches (an entry may not allocate per fire under graph capture). It
+//! carries the activation's dtype (what the projection writes); the
+//! arithmetic inside both halves stays f32.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -45,32 +27,23 @@ const FILE: &str = "linear/lora.cuh";
 
 const BLOCK: u32 = 256;
 
-/// The rank-wide waist between the two halves, per fire.
-///
-/// One name for one slab: every correction site in a plan writes and consumes
-/// it inside its own dispatch, so the layers share it the way they share every
-/// other scratch here.
+/// The rank-wide waist between the two halves, per fire. One name for one
+/// slab: every correction site in a plan shares it.
 const WAIST: &str = "linear.lora.waist";
 
-/// **`Fallback::Grouped`, AS THE FEW NUMBERS A LAUNCH NEEDS FOR IT** (design
-/// §3, decision #15).
+/// `Fallback::Grouped`, as the few numbers a launch needs for it: a
+/// correction whose window covers several intervals rather than one, called
+/// once over their union, with segments saying where the intervals are so
+/// the combine can skip foreign rows between them.
 ///
-/// A correction whose window P4 could not seat covers several intervals of the
-/// rectangle it is handed rather than one. The shell may answer that with `r`
-/// calls to [`correct`] over `r` sub-rectangles — always legal, and the oracle
-/// — or with ONE call over their union plus this: where the intervals are, so
-/// the combine can skip the foreign rows standing between them.
-///
-/// WHY THE BOUND IS SEPARATE FROM THE COUNT. `count` is this fire's; `cap` is
-/// the artifact's (`engine::fire::max_runs`), and it is what the grid's `z`
-/// extent is sized at so that the grid does not move with the composition. The
-/// blocks between the two return immediately (decision #15: max-grid plus
-/// early exit, because the shell cannot rebind a captured launch's extent —
-/// palo build log 10).
+/// `count` is this fire's; `cap` is the artifact's (`engine::fire::max_runs`)
+/// and sizes the grid's `z` extent so the grid does not move with the
+/// composition — the shell cannot rebind a captured launch's extent, so the
+/// blocks between the two return immediately (max-grid plus early exit).
 #[derive(Debug, Clone, Copy)]
 pub struct Segments {
-    /// `[count, 2]` i32, on the device: `(first row of the rectangle `x` and
-    /// `y` were cut to, how many rows)`, ascending, non-overlapping.
+    /// `[count, 2]` i32, on the device: (first row, row count), ascending,
+    /// non-overlapping.
     pub list: Tensor,
     /// How many entries `list` holds this fire.
     pub count: u32,
@@ -80,32 +53,18 @@ pub struct Segments {
     pub max_rows: u32,
 }
 
-/// `y += B[a]·(A[a]·x)` over the rows `routes` gives an adapter.
+/// `y += B[a]*(A[a]*x)` over the rows `routes` gives an adapter.
 ///
 /// `x` is `[rows, in]`, `y` is `[rows, out]`, `bank_a` is `[adapters,
-/// rank·in]` and `bank_b` is `[adapters, out·rank]` — the weight table's
-/// `rows x width` reading of the `[adapters, rank, in]` and `[adapters, out,
-/// rank]` shapes the model text declared. The rank is not an argument: it is
-/// `bank_a.width / x.width`, and the two banks are checked against each other,
-/// because a rank stated twice is a rank free to disagree with itself.
+/// rank*in]`, `bank_b` is `[adapters, out*rank]`. The rank is not an
+/// argument: it is `bank_a.width / x.width`, checked against `bank_b`.
 ///
-/// `segments` is `None` for the window P4 seated — every row of the rectangle
-/// is a row of the correction — and `Some` for the one it withdrew: the
-/// rectangle is then the UNION of the correction's intervals, and the segments
-/// say which of its rows are actually corrected. See [`Segments`], and
-/// `linear/lora.cuh`'s own note for why the accumulate can take that treatment
-/// and a dense-writing kernel cannot.
-///
-/// **THE PROJECTION HALF IS NOT TOLD.** `select_gemv` runs over the whole
-/// rectangle either way, so a grouped call computes a waist row for the
-/// foreign rows in the gaps as well. That is correct rather than merely
-/// harmless: those rows belong to classes OUTSIDE the correction's window, the
-/// shell refuses a lane that carries an adapter against a word that does not
-/// route (`engine_cuda::Fault::AdapterWord`), so their route is `-1` and the
-/// select writes them a zero row — which the combine then never reads,
-/// because no segment names them. The cost is real and it is the price of not
-/// teaching an MoE kernel about layout: one gather-free GEMV over the gap
-/// rows, against the `r - 1` extra launches of both halves that a split pays.
+/// `segments` is `None` when every row of the rectangle is a row of the
+/// correction, `Some` when the rectangle is the union of several intervals
+/// and the segments say which rows are actually corrected (see
+/// [`Segments`]). The projection half is not told: `select_gemv` runs over
+/// the whole rectangle either way, computing a wasted waist row for the
+/// gap rows the combine then never reads.
 ///
 /// # Errors
 ///
@@ -166,26 +125,17 @@ pub fn correct(
     debug_assert_eq!(y.rows, x.rows, "a correction lands one row per input row");
     debug_assert_eq!(routes.rows, x.rows, "one adapter id per token row");
 
-    // ── the waist ──────────────────────────────────────────────────────
-    // Two bytes an element, and the `dtype_dispatch` above is what says so:
-    // the only activations this entry instantiates for are bf16 and f16.
+    // Two bytes an element: only bf16 and f16 are instantiated above.
     let bytes = (rows as usize)
         .saturating_mul(rank as usize)
         .saturating_mul(2);
     let waist = ctx.scratch(OP, WAIST, bytes)?;
     let mut projected = Tensor::new(waist as u64, rows, rank, x.dtype);
 
-    // ── half one: the routed projection, somebody else's launch ────────
-    //
-    // `routes` is `[rows, 1]`, so the select's fan-out is one and its route
-    // run is the row run: `t[row] = A[routes[row]] · x[row]`, with a zero row
-    // wherever the id is negative. That zero is what an adapterless row inside
-    // an adapter window computes, and the combine below returns on it before
-    // it reads the bank at all.
-    // **AN ADAPTER BANK IS RESIDENT BY CONSTRUCTION** (design §8): its slots
-    // are written by `register_adapter` between fires, at addresses reserved
-    // at load, and nothing about it streams. So the D2 seats are the
-    // degenerate pair and this call is byte-for-byte the launch it was.
+    // `routes` is `[rows, 1]`: fan-out one, `t[row] = A[routes[row]] * x[row]`,
+    // zero row where the id is negative (an adapterless row the combine
+    // never reads). The adapter bank is resident by construction, so this
+    // call is byte-for-byte the launch it was.
     super::moe::select_gemv(
         ctx,
         OP,
@@ -196,15 +146,11 @@ pub fn correct(
         super::moe::ExpertTable::RESIDENT,
     )?;
 
-    // ── half two: the accumulate ───────────────────────────────────────
     let rank_i = stated(OP, rank)?;
     let out_i = stated(OP, out_width)?;
     let stride = i64::from(out_i) * i64::from(rank_i);
-    // The grid, and the two shapes it has. Without segments it is the one it
-    // has always been — one block row per row of the rectangle, `z` of one —
-    // and the kernel's null arm reads `blockIdx.y` as the row. With them it is
-    // `(segment, row within segment)`, at the artifact's bound rather than at
-    // this fire's count, and both axes early-exit.
+    // Without segments: one block row per rectangle row, z of one. With
+    // them: (segment, row within segment), at the artifact's bound.
     let (grid, list, segs) = match segments {
         None => ([out_width.div_ceil(BLOCK), rows, 1], ArgValue::ABSENT, 0i32),
         Some(segments) => (

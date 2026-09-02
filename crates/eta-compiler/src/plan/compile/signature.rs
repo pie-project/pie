@@ -72,11 +72,8 @@ pub(crate) fn stage_signature(bound: &BoundTrace, stage: &NormalizedStage) -> St
         match &binding.source {
             PortSource::Channel(global) => {
                 bytes.push(0);
-                // Invariant: `localize_stage` ran before this and put every
-                // channel the stage's ports name into `channel_bindings` —
-                // that is what localization means. Skipping an unfound
-                // channel would drop a port from the signature, so two stages
-                // differing only in that port would share a plan.
+                // `localize_stage` already put every channel the stage's
+                // ports name into `channel_bindings`.
                 put_u32(
                     &mut bytes,
                     stage

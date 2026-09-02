@@ -1,10 +1,4 @@
-//! The fa2 plane: FlashInfer's decode/prefill kernels, fired one parameter
-//! block at a time. The instantiation a fire resolves is *derived*, not
-//! tabulated — [`decode_symbol`]/[`prefill_symbol`] spell the template
-//! arguments from the same [`DecodeGeometry`]/[`PrefillGeometry`] that size
-//! the launch, so the name NVRTC lowers and the smem/block geometry it is
-//! fired at cannot drift apart. Selection lives here, below the entries
-//! (decision #13) — a dispatch arm never sees a lattice point.
+//! The fa2 plane: FlashInfer's decode/prefill kernels, fired one parameter block at a time. The instantiation a fire resolves is derived, not tabulated: [`decode_symbol`]/[`prefill_symbol`] spell the template arguments from the same [`DecodeGeometry`]/[`PrefillGeometry`] that size the launch, so the NVRTC name and the launch geometry cannot drift apart.
 
 use crate::error::Error;
 
@@ -14,9 +8,7 @@ use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, symbol};
 
 pub const FILE: &str = "attn/attention.cuh";
 
-/// The decode variants an instantiation can be stamped with. The capture
-/// arms are unreached until a graph-capture consumer exists; they keep
-/// their spelling here so that consumer names an arm, not a string.
+/// The decode variants an instantiation can be stamped with. Capture arms are unreached until a graph-capture consumer exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeArm {
     Full,
@@ -41,9 +33,7 @@ pub enum PrefillArm {
     Custom,
 }
 
-/// One fa2 head width outside the stamped lattice, refused before NVRTC
-/// ever sees a name for it. The geometry derivations bound most shapes on
-/// their own; this is the belt over those braces.
+/// One fa2 head width outside the stamped lattice, refused before NVRTC ever sees a name for it.
 fn instantiated(op: &'static str, head_dim: u32) -> Result<(), Error> {
     if crate::attn::plan::head_dim_instantiated(head_dim) {
         return Ok(());
@@ -54,14 +44,7 @@ fn instantiated(op: &'static str, head_dim: u32) -> Result<(), Error> {
     ))
 }
 
-/// The decode instantiation, spelled from the derived geometry. The old
-/// plane carried these as a 20-root static table; every template argument
-/// below restates a field [`DecodeGeometry::derive`] computes, so the name
-/// NVRTC lowers and the launch shape are one derivation, not two.
-///
-/// `NUM_STAGES_SMEM` is stamped from `g.num_stages_smem` — the table
-/// stamped an unconditional 2 while the smem budget was sized at 1 stage on
-/// cc < 8, a latent drift this derivation closes.
+/// The decode instantiation, spelled from the derived geometry: every template argument below restates a field [`DecodeGeometry::derive`] computes, so the NVRTC name and the launch shape are one derivation, not two.
 fn decode_symbol(
     op: &'static str,
     g: &DecodeGeometry,
@@ -89,8 +72,7 @@ fn decode_symbol(
     )))
 }
 
-/// The prefill instantiation, spelled from the derived geometry — the old
-/// 36-root static table, restated as the derivation it always was.
+/// The prefill instantiation, spelled from the derived geometry.
 fn prefill_symbol(
     op: &'static str,
     g: &PrefillGeometry,
@@ -269,8 +251,7 @@ const fn merge_smem_bytes(head_dim: u32) -> Option<u32> {
     Some(NUM_SMEM_STAGES * bdy * head_dim * 2 + NUM_THREADS * 4)
 }
 
-/// The merge instantiation, spelled from [`merge_geometry`] — the same
-/// `<vec, bdx, bdy, stages>` tuple that shapes the launch.
+/// The merge instantiation, spelled from [`merge_geometry`]'s `<vec, bdx, bdy, stages>` tuple, the same one that shapes the launch.
 fn merge_varlen_inst(head_dim: u32) -> Option<&'static str> {
     let (vec_size, bdx, bdy) = merge_geometry(head_dim)?;
     Some(symbol(&format!(
@@ -296,7 +277,7 @@ fn grid_blocks(per_sm: u32, max_seq_len: u32, num_heads: u32, num_sms: u32) -> u
     per_sm.min(work_bound).saturating_mul(num_sms).max(num_sms)
 }
 
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 fn merge_blocks_per_sm(instantiation: &'static str, smem: u32) -> u32 {
     use cudarc::driver::sys as dr;
 
@@ -322,14 +303,12 @@ fn merge_blocks_per_sm(instantiation: &'static str, smem: u32) -> u32 {
     u32::try_from(blocks).unwrap_or(1).max(1)
 }
 
-#[cfg(not(feature = "_cuda"))]
+#[cfg(not(feature = "cuda"))]
 fn merge_blocks_per_sm(_instantiation: &'static str, _smem: u32) -> u32 {
     1
 }
 
-/// Folds a split schedule's partial planes into the final output. `Ok` on a
-/// non-split plan is a bug in the caller, not here — the entries call this
-/// only under `info.split_kv`.
+/// Folds a split schedule's partial planes into the final output. Called only under `info.split_kv`.
 pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), Error> {
     let head_dim = split.head_dim;
     let (_, bdx, bdy) = merge_geometry(head_dim).ok_or_else(|| no_merge_row(op))?;
@@ -367,14 +346,7 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
             split.max_seq_len.arg(),
             ArgValue::Ptr(split.seq_len),
             split.num_heads.arg(),
-            // **THE FOLD IS WHERE FA2 TOUCHES THE PLANE**, so it is the one
-            // launch of this family that takes the seat. Under a split
-            // schedule the attention itself writes only the partial planes
-            // in the plan's workspace; `v_merged`/`s_merged` are the fire's
-            // own output and log-sum-exp rectangles, and a region handed
-            // those UNSLICED needs `win[1]` to find its rows. A null seat is
-            // row zero and the whole extent, which is every fire that is not
-            // a body's.
+            // the fold is the one launch of this family that takes the seat: attention itself writes only the partial planes, and a region handed the unsliced output needs win[1] to find its rows.
             ctx.stage(),
         ],
     )
@@ -382,11 +354,8 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
 
 // ── occupancy probes the engine sizes plans with ────────────────────────────
 
-/// How many decode blocks one SM holds at this lattice point — the
-/// occupancy fact behind [`decode_max_grid_size`]. Resolves (and so may
-/// compile) the instantiation; host work for the prepare phase, never for
-/// an entry.
-#[cfg(feature = "_cuda")]
+/// How many decode blocks one SM holds at this lattice point. Resolves (and so may compile) the instantiation; host work for the prepare phase, never for an entry.
+#[cfg(feature = "cuda")]
 #[must_use]
 pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> Option<u32> {
     use cudarc::driver::sys as dr;
@@ -423,7 +392,7 @@ pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> 
     u32::try_from(blocks).ok().filter(|n| *n > 0)
 }
 
-#[cfg(not(feature = "_cuda"))]
+#[cfg(not(feature = "cuda"))]
 #[must_use]
 pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> Option<u32> {
     let _ = (head_dim, group_size, device);
@@ -454,14 +423,7 @@ pub fn decode_max_grid_size(
     }
 }
 
-// ─── the launch geometry, derived host-side (was fa2/geometry.rs) ──────────
-
-// The fa2 launch geometry, derived host-side exactly as the device text
-// derives it: block shapes, tile widths, and the shared-memory budget per
-// instantiation. Every constant here restates a formula in `attn/attention.cuh`
-// (line references kept from the transcription), so a disagreement is a
-// wrong launch, not a style choice.
-
+// The fa2 launch geometry, derived host-side exactly as the device text derives it: block shapes, tile widths, and the shared-memory budget per instantiation. Every constant restates a formula in `attn/attention.cuh`.
 
 /// The kv element width in bytes; the lattice is stamped at bf16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -510,7 +472,7 @@ impl DecodeGeometry {
                 format!("fa2 decode head_dim {head_dim} needs bdx > 32 (decode.cuh:765)"),
             ));
         }
-        // 12 joined the lattice with qwen4 (24 query heads over 2 kv).
+        // GQA group values the lattice is stamped for.
         if !matches!(group_size, 1 | 2 | 3 | 4 | 8 | 12) {
             return Err(refuse(
                 op,

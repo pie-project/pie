@@ -1,19 +1,16 @@
-//! **NVFP4 WEIGHT-ONLY**: `g16_e2m1_gt_e4m3_f32_n_n`, decoded inside the dot
-//! against a bf16/f16 activation. NVIDIA ships official checkpoints in this
-//! row and the hardware that decodes it natively is sm120 only, so the
-//! decode-in-dot skeleton is what serves it on every other card — the
-//! `linear::fp8` twin's bargain, at four bits (wiki alto/next.md §J2).
+//! NVFP4 weight-only: `g16_e2m1_gt_e4m3_f32_n_n`, decoded inside the dot
+//! against a bf16/f16 activation, since the hardware that decodes it
+//! natively is sm120 only.
 //!
-//! Three factors reach one weight and they are stored three different ways:
-//! the e2m1 CODE, an e4m3 scale per SIXTEEN codes, and one f32 for the whole
-//! tensor. The first two arrive as planes; the third arrives as an argument,
-//! because it is one number and a plane would cost a load per block to say it.
+//! Three factors reach one weight, stored three different ways: the e2m1
+//! code, an e4m3 scale per sixteen codes, and one f32 for the whole tensor.
+//! The first two arrive as planes; the third arrives as an argument, since
+//! it is one number and a plane would cost a load per block to say it.
 //!
-//! **THE PLANE WIDTHS ARE THE FORM'S OWN ALGEBRA.** `Dtype::Nvfp4`
-//! states `plane_widths(4096) == [2048, 256, 4]`, and the two widths this
-//! entry checks are that statement at any `k`: `k/2` code bytes a row, `k/16`
-//! scale bytes a row. A caller whose planes are a different rectangle is
-//! refused rather than served a plausible number off the wrong bytes.
+//! The plane widths are the form's own algebra: `Dtype::Nvfp4` states
+//! `plane_widths(4096) == [2048, 256, 4]`, and the two widths this entry
+//! checks are that statement at any `k`: `k/2` code bytes a row, `k/16`
+//! scale bytes a row.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -111,11 +108,9 @@ fn fire(
             format!("a {}-row scale plane is not {n} rows over a {n}x{k} weight", scales.rows),
         ));
     }
-    // **A NON-FINITE TENSOR SCALE IS REFUSED, NOT MULTIPLIED.** It is the one
-    // factor that reaches EVERY output of the projection, so a NaN here does
-    // not corrupt a row — it flattens the whole logit vector into a sampler
-    // that answers nothing, with no fire having failed. Loudly here is the
-    // only place it is still attributable.
+    // a non-finite tensor scale is refused, not multiplied: it reaches every
+    // output, so a NaN here would flatten the whole logit vector with no
+    // fire having failed.
     if !tensor_scale.is_finite() {
         return Err(refuse(
             op,
@@ -146,8 +141,7 @@ fn fire(
             tensor_scale.arg(),
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // staged-geometry seat: live-rows word, or the null seat (`ABSENT`).
             ctx.stage(),
         ],
     )

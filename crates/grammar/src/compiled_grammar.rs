@@ -23,10 +23,6 @@ use tokenizer::Tokenizer;
 const BITMASK_CACHE_BUDGET_BYTES: usize = 1024 * 1024;
 const BITMASK_CACHE_MAX_ENTRIES: usize = 256;
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 /// Packed state flags for fast branching during advance (1 byte).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StateFlags(pub(crate) u8);
@@ -124,10 +120,6 @@ impl CompiledGrammar {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Construction
-// ---------------------------------------------------------------------------
-
 impl CompiledGrammar {
     /// Build a compiled grammar from a grammar and tokenizer.
     ///
@@ -157,7 +149,6 @@ impl CompiledGrammar {
         let vocab_size = tokenizer_info.vocab_size();
         let normalized = Arc::new(normalize_grammar(grammar));
 
-        // Build per-rule NFAs and convert to DFAs
         let nfa_fsms = build_rule_fsms(&normalized);
         for nfa in &nfa_fsms {
             if nfa.fsm.num_states() > limits.max_nfa_states_per_rule {
@@ -209,11 +200,9 @@ impl CompiledGrammar {
         }
         check_deadline(deadline)?;
 
-        // Pre-compute state actions (replaces old dfa_state_info)
         let (state_actions, state_action_offsets, has_self_ref_chains) =
             compute_state_actions(&rule_dfas);
 
-        // Pre-compute token masks
         let token_masks = precompute_token_masks(
             &rule_dfas,
             tokenizer_info,
@@ -289,10 +278,6 @@ fn check_deadline(deadline: Option<Instant>) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// DFA state info pre-computation
-// ---------------------------------------------------------------------------
-
 /// Pre-compute state actions for all (rule_id, dfa_state) pairs.
 /// Returns (flat_actions, offsets_per_rule, has_self_ref_chains).
 fn compute_state_actions(rule_dfas: &[Automaton<DfaTable>]) -> (Vec<StateAction>, Vec<u32>, bool) {
@@ -360,10 +345,6 @@ fn compute_state_actions(rule_dfas: &[Automaton<DfaTable>]) -> (Vec<StateAction>
 
     (actions, offsets, has_self_ref_chains)
 }
-
-// ---------------------------------------------------------------------------
-// Adaptive token mask pre-computation
-// ---------------------------------------------------------------------------
 
 fn find_runtime_rules(grammar: &Grammar, rule_dfas: &[Automaton<DfaTable>]) -> Vec<bool> {
     let mut runtime_rules = vec![false; rule_dfas.len()];

@@ -1,11 +1,8 @@
-//! The tarpc `Control` server — the distributed RPC front door.
-//!
-//! Thin by design: every state-changing call funnels a command to the
-//! single-writer actor through the shared [`Handle`]; the two `watch_*` calls are
-//! the §7 long-poll read-path (bounded by `T_HANG` so a no-change watch returns
-//! as a keepalive before the client's RPC deadline). Eviction is signalled out
-//! of band via `heartbeat`'s [`Ack::ReRegister`], so the watch calls return their
-//! view directly.
+//! The tarpc `Control` server — the distributed RPC front door. Thin by
+//! design: every state-changing call funnels a command to the single-writer
+//! actor through the shared [`Handle`]; the two `watch_*` calls are a
+//! long-poll read-path bounded by `T_HANG` so a no-change watch returns as a
+//! keepalive before the client's RPC deadline.
 
 use std::io;
 

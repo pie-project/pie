@@ -1,21 +1,7 @@
-//! Shared real-hardware (`cuda_native`) test harness.
-//!
-//! Boots the worker's prod embedded path in-proc — `worker::run` in
-//! SingleNode mode loads the model onto the GPU via the embedded cuda engine and
-//! co-resides `::runtime::bootstrap::bootstrap` — then drives inferlets through the
-//! same in-proc `program::add` → `process::spawn` flow the mock canary uses,
-//! bypassing the gateway/client edge (no msgpack/JSON codec, no identity header,
-//! no `pie-server-py`).
-//!
-//! Reused by the cuda validation tests (`cuda_forward` = dense forward; the
-//! Lane-C CAS-dedup + Lane-D fold-parity tests compose on these helpers). Every
-//! cuda test is `#[ignore]`d (real GPU + `--features engine-cuda-13`) and boots
-//! ONCE per process (global engine state forbids a second boot).
-//!
-//! The model snapshot is overridable via `PIE_CUDA_TEST_SNAPSHOT` (a local HF
-//! snapshot dir — R3: the worker never downloads); the default is the Qwen3-0.6B
-//! dense model on the reference box. Use a GDN model (e.g. Qwen3.5-0.8B) for RS
-//! fold validation.
+//! Shared real-hardware (`cuda_native`) test harness: boots the worker's prod
+//! embedded path in-proc and drives inferlets directly (`program::add` →
+//! `process::spawn`), bypassing the gateway/client edge. Every cuda test is
+//! `#[ignore]`d and boots once per process.
 
 #![allow(dead_code)]
 
@@ -26,12 +12,12 @@ use std::time::Duration;
 use ::runtime::inferlet::program::{Manifest, ProgramName};
 use worker::WorkerHandle;
 
-/// Default local HF snapshot (Qwen3-0.6B dense) on the reference box. Override
-/// with `PIE_CUDA_TEST_SNAPSHOT=/path/to/snapshot` for another model/host.
+/// Default local HF snapshot (Qwen3-0.6B dense). Override with
+/// `PIE_CUDA_TEST_SNAPSHOT`.
 pub const DEFAULT_SNAPSHOT: &str = "/home/ingim/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca";
 
-/// Local HF snapshot for the Qwen3.5-0.8B GDN (hybrid linear-attention) model —
-/// the RS-fold validation model. Override with `PIE_CUDA_TEST_GDN_SNAPSHOT`.
+/// Local HF snapshot for the Qwen3.5-0.8B GDN model (RS-fold validation).
+/// Override with `PIE_CUDA_TEST_GDN_SNAPSHOT`.
 pub const DEFAULT_GDN_SNAPSHOT: &str = "/home/ingim/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
 /// The dense model snapshot path (env-overridable).
@@ -39,30 +25,18 @@ pub fn snapshot() -> String {
     std::env::var("PIE_CUDA_TEST_SNAPSHOT").unwrap_or_else(|_| DEFAULT_SNAPSHOT.to_string())
 }
 
-/// The GDN/hybrid-RS model snapshot path (env-overridable) — for fold validation.
+/// The GDN/hybrid-RS model snapshot path (env-overridable).
 pub fn gdn_snapshot() -> String {
     std::env::var("PIE_CUDA_TEST_GDN_SNAPSHOT").unwrap_or_else(|_| DEFAULT_GDN_SNAPSHOT.to_string())
 }
 
-/// Single-model worker config for `snapshot_path`: `cuda_native`, no cluster
-/// (→ SingleNode), client edge on an ephemeral loopback port (unused — tests
-/// drive `process::spawn` directly in-proc).
+/// Single-model worker config for `snapshot_path`: `cuda_native`, no cluster.
 pub fn cuda_toml_for(snapshot_path: &str) -> String {
-    // A writable scratch dir so snapshot-using canaries (demo-persistent-kv:
-    // Context::save/open over `/scratch`) work; harmless for fs-free inferlets.
     let scratch = std::env::temp_dir().join("pie-cuda-test-scratch");
     let _ = std::fs::create_dir_all(&scratch);
-    // The `stream_routed_experts` / `expert_cache` / `expert_host_cache`
-    // block STOOD HERE, keyed off `PIE_CUDA_TEST_STREAM_EXPERTS`. The three
-    // keys were retired with the boot document -- no engine read them, and a
-    // config stating one now refuses by name -- so the streamed arm's config
-    // is the resident arm's. `cuda_moe_streaming` still refuses a
-    // `PIE_CUDA_TEST_STREAM_EXPERTS=1` run before it boots; expert residency
-    // is `[model] device_weight_budget` / `host_weight_budget` now.
-    // The KV cache is otherwise sized from whatever VRAM is left, so changing
-    // the expert slab silently changes the page count -- and with it the
-    // attention plan and its reduction order. Two runs meant to differ only in
-    // residency would then differ in numerics too, which is not a comparison.
+    // Expert residency is `[model] device_weight_budget` / `host_weight_budget`;
+    // KV pages are sized from remaining VRAM, so changing the expert slab
+    // changes the attention plan's reduction order too.
     let kv = std::env::var("PIE_CUDA_TEST_KV_PAGES")
         .map(|v| format!("max_total_pages = {v}\n"))
         .unwrap_or_default();
@@ -84,7 +58,6 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
          type = \"cuda_native\"\n\
          device = [\"cuda:0\"]\n\
          gpu_mem_utilization = 0.90\n\
-         memory_profile = \"latency\"\n\
          {kv}",
         scratch = scratch.display(),
     )
@@ -96,26 +69,15 @@ pub fn cuda_toml() -> String {
 }
 
 /// Route `tracing` to stderr, once per process, at whatever `RUST_LOG` says
-/// (`error` if it says nothing).
-///
-/// The reason this exists rather than being left to whoever wants it: the
-/// interesting CUDA failures are not the ones this harness asserts on. A
-/// device instantiation that will not compile or load is reported by
-/// `kernels-cuda::jit::ctx::said` through `tracing::error!` and NOWHERE else
-/// -- the `KernelError::Device { call, code }` it returns holds a `&'static str` and so
-/// cannot carry the engine's sentence -- so the runtime's message stops at
-/// "the compile, the load or the launch refused; see the log". Without a
-/// subscriber there is no log, and a `CUDA_ERROR_ILLEGAL_ADDRESS` in one
-/// kernel reads as an unrelated module failing to load in the next, because
-/// that error is sticky.
+/// (`error` if it says nothing). Needed because device compile/load/launch
+/// failures are reported only through `tracing::error!`, not the returned error.
 fn wire_tracing() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error"));
-        // `try_init` and not `init`: a second harness in the same process, or
-        // an engine that wired its own, is not this function's failure.
+        // try_init: a second subscriber already wired is not a failure here.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
@@ -123,10 +85,8 @@ fn wire_tracing() {
     });
 }
 
-/// Boot the embedded cuda engine in-proc with an explicit model snapshot (loads
-/// it onto the GPU + bootstraps the runtime). Use a GDN snapshot for RS fold
-/// validation, the dense default otherwise. Caller holds the handle and
-/// `shutdown()`s it.
+/// Boot the embedded cuda engine in-proc with an explicit model snapshot.
+/// Caller holds the handle and `shutdown()`s it.
 pub async fn boot_cuda_model(snapshot_path: &str) -> WorkerHandle {
     wire_tracing();
     let cfg =
@@ -139,16 +99,9 @@ pub async fn boot_cuda() -> WorkerHandle {
     boot_cuda_model(&snapshot()).await
 }
 
-/// Build a curated inferlet fixture → wasm + manifest + program id.
-///
-/// The fixtures are at the REPOSITORY's `tests/inferlets`, which is two levels
-/// above this crate's manifest and not one: this crate lives at
-/// `crates/worker`. It read `../tests/inferlets` until every caller of this
-/// helper was `#[ignore]`d and nothing noticed, and the way it failed is worth
-/// the extra line below. `Command::current_dir` on a directory that is not
-/// there does not report the directory -- it reports `spawn cargo build for
-/// text-completion: No such file or directory`, which reads as a missing
-/// `cargo` and sent the first person to look at `PATH`.
+/// Build a curated inferlet fixture → wasm + manifest + program id. Fixtures
+/// live at the repository's `tests/inferlets`, two levels above this crate's
+/// manifest.
 pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/inferlets")
@@ -168,9 +121,7 @@ pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let wasm_path = dir
         .join("target/wasm32-wasip2/release")
         .join(format!("{}.wasm", name.replace('-', "_")));
-    // `tests/inferlets` is a cargo workspace, so a member's artifact lands in
-    // the shared target dir one level up, not beside its manifest. Non-members
-    // build in place. Accept either rather than caring which this one is.
+    // Workspace members' artifacts land one level up; non-members build in place.
     let wasm_path = if wasm_path.exists() {
         wasm_path
     } else {
@@ -185,8 +136,7 @@ pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     (wasm, manifest, program_name)
 }
 
-/// Build + add + install an inferlet once; returns its program id for repeated
-/// spawns (one install per process; spawn many).
+/// Build + add + install an inferlet once; returns its program id for repeated spawns.
 pub async fn install_inferlet(name: &str) -> ProgramName {
     let (wasm, manifest, program_name) = load_curated_inferlet(name);
     ::runtime::inferlet::program::add(wasm, manifest, true)
@@ -198,9 +148,8 @@ pub async fn install_inferlet(name: &str) -> ProgramName {
     program_name
 }
 
-/// Spawn one inferlet run and capture its result (`Ok(text)` / `Err(msg)`) — the
-/// result-captured pattern that surfaces host/forward errors (e.g. the lost-KV
-/// -commit bug) instead of a silent "completed". Panics only on timeout.
+/// Spawn one inferlet run and capture its result (`Ok(text)` / `Err(msg)`).
+/// Panics only on timeout.
 pub async fn spawn_text(
     program: &ProgramName,
     prompt: &str,
@@ -210,8 +159,7 @@ pub async fn spawn_text(
     spawn_input(program, &input).await
 }
 
-/// Spawn an already-installed inferlet with a raw JSON input string, capturing
-/// its result.
+/// Spawn an already-installed inferlet with a raw JSON input string.
 pub async fn spawn_input(program: &ProgramName, input_json: &str) -> Result<String, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     ::runtime::inferlet::process::spawn(
@@ -223,47 +171,24 @@ pub async fn spawn_input(program: &ProgramName, input_json: &str) -> Result<Stri
         Some(tx),
     )
     .expect("spawn process");
-    // A timeout is an `Err` rather than a panic, because "did not answer" is
-    // a RESULT about the inferlet -- four of the curated fixtures give exactly
-    // that on CUDA today (see `cuda_canaries`' census) -- and a caller that
-    // wants it fatal says `.expect()`, which is what every one of them does.
-    // A panic here instead reports the harness's deadline as though it were
-    // the assertion the caller wrote.
+    // A timeout is an `Err`, not a panic: "did not answer" is a result about
+    // the inferlet; callers that want it fatal use `.expect()`.
     match tokio::time::timeout(Duration::from_secs(180), rx).await {
         Err(_) => Err("no answer within 180s".to_string()),
         Ok(result) => result.expect("process result channel dropped"),
     }
 }
 
-/// Build + add + install + spawn an arbitrary curated inferlet fixture with a raw
-/// JSON input (for canaries — fork / spec / snapshot — that take
-/// inferlet-specific inputs). One-shot: installs then spawns.
+/// Build + add + install + spawn an arbitrary curated inferlet fixture with a
+/// raw JSON input. One-shot: installs then spawns.
 pub async fn spawn_inferlet(name: &str, input_json: &str) -> Result<String, String> {
     let program = install_inferlet(name).await;
     spawn_input(&program, input_json).await
 }
 
-/// Refuse a completion that is not made of WORDS.
-///
-/// "Non-empty" is the assertion these forward gates used to carry, and it is
-/// worth almost nothing: a model whose weights are being read correctly and a
-/// model whose every RMSNorm reduces over the wrong axis both emit sixteen
-/// tokens. The qwen3.5 hybrid answered `"The capital of France is"` with
-///
-///     "\n\n\nqu.c.\n\n. / } )\n0\n -"
-///
-/// for as long as nothing looked, and a non-empty check passed on it every
-/// time. What separates that from a real completion is not length and not
-/// perplexity — it is that a working model emits WORDS, and a broken one emits
-/// punctuation and fragments.
-///
-/// So: at least `min_words` runs of three-or-more letters, and at least two
-/// fifths of the non-space characters alphanumeric. Both thresholds are far
-/// below anything a coherent English completion produces and far above what
-/// degenerate sampling from a scrambled residual stream produces, which is the
-/// only band where a gate like this is worth having. It says nothing about
-/// WHICH words — that claim belongs to the A/B fixtures against transformers,
-/// which compare logits.
+/// Refuse a completion that is not made of words: a non-empty check alone
+/// passes garbage output from a broken reduction. Requires at least
+/// `min_words` runs of 3+ letters and >=2/5 of non-space chars alphanumeric.
 pub fn assert_coherent(text: &str, min_words: usize) {
     let words = text
         .split(|c: char| !c.is_alphabetic())

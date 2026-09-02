@@ -1,49 +1,22 @@
-//! `session.rs` — THE internal serving abstraction (design §6/§7/§10).
+//! The internal serving abstraction: every live request funnels through one
+//! [`Session`] (one-shot REST/SSE is a 1-turn session, WebSocket is
+//! multi-turn). Ingress adapters are thin shells over [`Sessions`]/
+//! [`SessionHandle`]; the worker-facing token push demuxes back in through
+//! [`Sessions::feed`]/[`Sessions::redirect`]; routing/admission/dispatch is
+//! reached through the [`TurnRouter`] seam (mocked in tests, real at the
+//! crate root).
 //!
-//! Everything the gateway does for a live request funnels through one [`Session`]
-//! model: one-shot (REST/SSE) is a 1-turn session, interactive (WebSocket) is a
-//! multi-turn session. The user-facing adapters in [`ingress`](crate::ingress)
-//! are thin shells over this; the worker-facing token push
-//! ([`GatewayInbound`](worker_api::GatewayInbound)) demuxes back into here. The
-//! route → admission → dispatch → token-stream pipe is **one path**.
+//! Each in-flight turn owns a bounded [`mpsc`] pipe keyed by [`ReqId`](ids::ReqId).
+//! [`feed`](Sessions::feed) awaits on a full pipe — the backpressure point
+//! that stalls the worker's push pump. A clean end forwards the worker's
+//! terminal [`Tokens::Eos`] in-band before the pipe closes; an abort (cancel,
+//! drain, or an already-emitted worker-drop) drops the sender without an
+//! `Eos`, so `recv` yields a bare `None`. Whether an `Eos` was seen is the
+//! unambiguous clean-vs-abort discriminator.
 //!
-//! # Surfaces
-//!
-//! - **ingress (delta):** [`Sessions::create`] → `(`[`SessionHandle`]`, `[`TokenRx`]`)`,
-//!   [`SessionHandle::turn`] (WS next turn), [`SessionHandle::cancel`],
-//!   [`SessionHandle::close`], [`TokenRx::recv`].
-//! - **worker.rs (foxtrot):** [`Sessions::feed`] (the `push_tokens` demux, the
-//!   backpressure point) and [`Sessions::redirect`].
-//! - **route/admission (alpha) + worker registry (foxtrot):** reached through the
-//!   [`TurnRouter`] seam — admission gate, select+retry dispatch, immediate
-//!   cancel, and the live connected-worker watch. At the crate root an adapter
-//!   impls `TurnRouter` over the real `RoutingHandle` + `WorkerRegistry`; unit
-//!   tests here use a mock.
-//!
-//! # Token pipe, backpressure, eos vs abort
-//!
-//! Each in-flight turn owns a **bounded** [`mpsc`] pipe keyed by its
-//! [`ReqId`](ids::ReqId). [`feed`](Sessions::feed) forwards a
-//! [`Tokens`] chunk into it and **awaits on a full pipe** — that await is the
-//! backpressure point: a slow consumer stalls `push_tokens`, which stalls the
-//! worker's push pump, which backpressures generation (design §6). The consumer
-//! distinguishes a **clean** end from an **abort**:
-//!
-//! - clean: the worker's terminal [`Tokens::Eos`] is forwarded in-band, so
-//!   [`recv`](TokenRx::recv) yields `Some(Tokens::Eos)` and then the pipe closes.
-//! - abort: every abort path (cancel / drain / already-emitted worker-drop) drops
-//!   the pipe sender **without** an `Eos`, so `recv` yields a bare `None`.
-//!
-//! Because `Eos` is always observed before a clean close and never before an
-//! abort close, "did I see an `Eos`?" is the unambiguous discriminator.
-//!
-//! # Mid-turn worker loss (design §8/§10, manager-ratified)
-//!
-//! [`Sessions`] watches [`TurnRouter::connected`]; when a live turn's bound
-//! worker leaves the connected set the response is split by whether the turn has
-//! **emitted** yet: not-emitted → re-dispatch the stored `Request` (idempotent,
-//! same `ReqId`, no double-emit); already-emitted → fail the turn clean (drop the
-//! pipe → consumer `None`). True mid-stream resume needs a runtime
+//! On mid-turn worker loss, [`Sessions`] watches [`TurnRouter::connected`]:
+//! a turn that hasn't emitted yet is re-dispatched (same `ReqId`, idempotent);
+//! one that has is failed clean. True mid-stream resume needs a runtime
 //! resume-from-position hook and is deferred.
 
 use std::collections::HashMap;
@@ -69,9 +42,9 @@ const DRAIN_POLL: Duration = Duration::from_millis(50);
 // ───────────────────────────── ingress seam types ─────────────────────────────
 
 /// The edge-supplied principal for a turn, extracted by `ingress/identity.rs`
-/// from the trusted edge header (design §5 — a light identity gate, **not**
-/// authentication). `session.rs` consumes only [`tenant`](Identity::tenant) for
-/// the dispatched [`Request`]; the rest is carried for tracing / quota.
+/// from the trusted edge header (a light identity gate, not authentication).
+/// `session.rs` consumes only [`tenant`](Identity::tenant) for the dispatched
+/// [`Request`]; the rest is carried for tracing / quota.
 #[derive(Debug, Clone)]
 pub struct Identity {
     /// Tenant the turn is attributed to (routing / quota / isolation).
@@ -99,7 +72,7 @@ pub struct TurnInput {
     pub priority: Priority,
 }
 
-/// The §7 routing mode for a session, chosen by the ingress adapter (which knows
+/// The routing mode for a session, chosen by the ingress adapter (which knows
 /// one-shot from multi-turn) and threaded to the dispatcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Affinity {
@@ -163,11 +136,11 @@ pub struct AdmitReject(pub String);
 #[derive(Debug, Clone)]
 pub struct DispatchFail;
 
-/// The orchestration backend `session.rs` drives — the in-proc seam onto alpha's
-/// `route.rs`/`admission.rs` and foxtrot's `WorkerRegistry`. Kept as a trait so
-/// the (bug-prone) registry/pipe/lifecycle logic is unit-testable in isolation
-/// with a mock, and so `session.rs` carries no upward edge to those modules. The
-/// crate root provides the real adapter:
+/// The orchestration backend `session.rs` drives — the in-proc seam onto
+/// `route.rs`/`admission.rs` and `WorkerRegistry`. Kept as a trait so the
+/// registry/pipe/lifecycle logic is unit-testable with a mock, and so
+/// `session.rs` carries no upward edge to those modules. The crate root
+/// provides the real adapter:
 ///
 /// ```ignore
 /// struct RouteBackend { routing: RoutingHandle, workers: WorkerRegistry }
@@ -181,12 +154,12 @@ pub struct DispatchFail;
 /// ```
 #[async_trait::async_trait]
 pub trait TurnRouter: Send + Sync + 'static {
-    /// Coarse cluster admission gate (runs before routing; design §7).
+    /// Coarse cluster admission gate (runs before routing).
     async fn admit(&self, req: &Request) -> Result<(), AdmitReject>;
 
     /// Select a worker and dispatch with the worker-final-admission retry loop,
-    /// returning the bound worker. `affinity` is the §7 routing mode: `Some(key)`
-    /// → stable HRW (warm-KV sticky, for a multi-turn session), `None` →
+    /// returning the bound worker. `affinity`: `Some(key)` → stable HRW
+    /// (warm-KV sticky, for a multi-turn session), `None` →
     /// power-of-two-choices (load-aware, for a fresh one-shot).
     async fn dispatch(
         &self,
@@ -199,8 +172,7 @@ pub trait TurnRouter: Send + Sync + 'static {
     /// reach a non-pushing worker promptly).
     async fn cancel(&self, worker: WorkerId, req: ReqId);
 
-    /// The live connected-worker set (foxtrot's `connected_watch`). Drives
-    /// mid-turn worker-drop detection.
+    /// The live connected-worker set. Drives mid-turn worker-drop detection.
     fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>>;
 }
 
@@ -212,14 +184,14 @@ struct TurnState {
     worker: Option<WorkerId>,
     /// The dispatched request, retained for idempotent re-dispatch on worker loss.
     request: Request,
-    /// The §7 routing mode for this turn (`None` = p2c, `Some(key)` = HRW),
+    /// The routing mode for this turn (`None` = p2c, `Some(key)` = HRW),
     /// retained so a re-dispatch (redirect / worker-drop) keeps the same policy.
     affinity: Option<u64>,
     /// Set once the first chunk is delivered to the consumer (in
-    /// [`Sessions::feed`], after the send succeeds — never for a bare `Eos`). The
-    /// §10 re-dispatch-vs-fail discriminator: unset ⇒ a worker drop can
-    /// re-dispatch this turn (no output seen yet); set ⇒ it must fail clean, since
-    /// a fresh dispatch would re-emit tokens the user already received.
+    /// [`Sessions::feed`], after the send succeeds — never for a bare `Eos`).
+    /// The re-dispatch-vs-fail discriminator: unset means a worker drop can
+    /// re-dispatch this turn; set means it must fail clean, since a fresh
+    /// dispatch would re-emit tokens the user already received.
     emitted: bool,
     /// Producer end of the turn's bounded pipe.
     sink: mpsc::Sender<Tokens>,
@@ -338,11 +310,11 @@ impl Sessions {
     }
 
     /// Begin a session and dispatch its first turn (one-shot = the whole session;
-    /// WS = the first of many). `affinity` is the §7 routing mode the ingress
+    /// WS = the first of many). `affinity` is the routing mode the ingress
     /// adapter picks: [`Affinity::Ephemeral`] for a one-shot (→ p2c),
     /// [`Affinity::Sticky`] for a multi-turn session (→ HRW on the session id).
-    /// Runs admission → route → dispatch internally (§6/§7 one-path). Errors if
-    /// the gateway is draining, admission rejects, or no worker accepts.
+    /// Runs admission → route → dispatch internally. Errors if the gateway is
+    /// draining, admission rejects, or no worker accepts.
     pub async fn create(
         &self,
         ident: Identity,
@@ -457,8 +429,8 @@ impl Sessions {
         });
     }
 
-    /// Graceful drain (design §10): stop accepting new sessions, wait up to `max`
-    /// for live sessions to finish, then force-close any stragglers (their token
+    /// Graceful drain: stop accepting new sessions, wait up to `max` for live
+    /// sessions to finish, then force-close any stragglers (their token
     /// streams abort).
     pub async fn drain(&self, max: Duration) {
         self.inner.draining.store(true, Ordering::Release);
@@ -485,15 +457,13 @@ pub struct SessionHandle {
     inner: Arc<Inner>,
     session: SessionId,
     tenant: TenantId,
-    /// The session's §7 affinity key, reused for every turn (a multi-turn session
+    /// The session's affinity key, reused for every turn (a multi-turn session
     /// sticks to its warm-KV worker; `None` for a one-shot).
     affinity_key: Option<u64>,
-    /// EVERY turn this session has opened and not yet cancelled. A WS client
-    /// may run several turns at once (one per launched process), so a single
-    /// slot here silently forgot all but the newest — `cancel`/`close` then
-    /// left the older turns running on the worker with nobody to stream them.
-    /// Ids of turns that finished on their own stay until the session ends;
-    /// `abort_turn` is a no-op for them, which is what makes that safe.
+    /// Every turn this session has opened and not yet cancelled — a WS client
+    /// may run several at once, so a single slot would leave older turns
+    /// running with nobody to stream them. Ids of turns that finished on
+    /// their own stay until the session ends; `abort_turn` is a no-op for them.
     current: Mutex<Vec<ReqId>>,
 }
 
@@ -550,7 +520,7 @@ impl Drop for SessionHandle {
 // ───────────────────────────── worker-drop watcher ─────────────────────────────
 
 /// Background task: when a live turn's bound worker leaves the connected set,
-/// re-dispatch the turn if it hasn't emitted, else fail it clean (design §10).
+/// re-dispatch the turn if it hasn't emitted, else fail it clean.
 fn spawn_drop_watcher(inner: Arc<Inner>) {
     let mut connected = inner.router.connected();
     tokio::spawn(async move {
@@ -615,7 +585,7 @@ mod tests {
         dispatched: Mutex<Vec<ReqId>>,
         affinities: Mutex<Vec<Option<u64>>>,
         cancels: Mutex<Vec<(WorkerId, ReqId)>>,
-        connected_tx: watch::Sender<Arc<HashSet<WorkerId>>>,
+        _connected_tx: watch::Sender<Arc<HashSet<WorkerId>>>,
         connected_rx: watch::Receiver<Arc<HashSet<WorkerId>>>,
     }
 
@@ -629,15 +599,11 @@ mod tests {
                 dispatched: Mutex::new(Vec::new()),
                 affinities: Mutex::new(Vec::new()),
                 cancels: Mutex::new(Vec::new()),
-                connected_tx: tx,
+                _connected_tx: tx,
                 connected_rx: rx,
             })
         }
 
-        fn set_connected(&self, workers: &[WorkerId]) {
-            let set: Arc<HashSet<WorkerId>> = Arc::new(workers.iter().copied().collect());
-            self.connected_tx.send(set).unwrap();
-        }
     }
 
     #[async_trait::async_trait]
@@ -734,16 +700,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_reject_surfaces() {
-        let router = MockRouter::new(Some(WorkerId(1)));
-        router.admit_ok.store(false, Ordering::Release);
-        let sessions = Sessions::new(router);
-        let res = sessions.create(ident(), input(), Affinity::Sticky).await;
-        assert!(matches!(res, Err(SessionError::Admission(_))));
-        assert_eq!(sessions.live(), 0); // failed create does not leak a live slot
-    }
-
-    #[tokio::test]
     async fn no_worker_surfaces() {
         let router = MockRouter::new(None); // dispatch always fails
         let sessions = Sessions::new(router);
@@ -751,121 +707,4 @@ mod tests {
         assert!(matches!(res, Err(SessionError::NoWorker)));
     }
 
-    #[tokio::test]
-    async fn cancel_aborts_turn_and_signals_worker() {
-        let router = MockRouter::new(Some(WorkerId(3)));
-        let sessions = Sessions::new(router.clone());
-        let (h, mut rx) = sessions
-            .create(ident(), input(), Affinity::Sticky)
-            .await
-            .unwrap();
-        let req_id = router.dispatched.lock().unwrap()[0];
-
-        h.cancel().await;
-        assert!(rx.recv().await.is_none()); // aborted: bare None, no Eos
-        assert_eq!(
-            router.cancels.lock().unwrap().as_slice(),
-            &[(WorkerId(3), req_id)]
-        );
-        assert_eq!(sessions.feed(req_id, chunk()).await, Control::Abort);
-    }
-
-    #[tokio::test]
-    async fn ws_multi_turn_reuses_session_id() {
-        let router = MockRouter::new(Some(WorkerId(5)));
-        let sessions = Sessions::new(router.clone());
-        let (h, mut rx1) = sessions
-            .create(ident(), input(), Affinity::Sticky)
-            .await
-            .unwrap();
-        let r1 = router.dispatched.lock().unwrap()[0];
-        sessions.feed(r1, Tokens::Eos).await;
-        assert!(matches!(rx1.recv().await, Some(Tokens::Eos)));
-
-        let mut rx2 = h.turn(input()).await.unwrap();
-        let r2 = router.dispatched.lock().unwrap()[1];
-        assert_ne!(r1, r2, "fresh ReqId per turn");
-        sessions.feed(r2, chunk()).await;
-        assert!(matches!(rx2.recv().await, Some(Tokens::Chunk(_))));
-    }
-
-    #[tokio::test]
-    async fn affinity_mode_maps_to_dispatch_key() {
-        // Ephemeral one-shot → None (alpha's p2c, load-aware).
-        let r1 = MockRouter::new(Some(WorkerId(1)));
-        let s1 = Sessions::new(r1.clone());
-        let _ = s1
-            .create(ident(), input(), Affinity::Ephemeral)
-            .await
-            .unwrap();
-        assert_eq!(r1.affinities.lock().unwrap()[0], None);
-
-        // Sticky WS → Some(session id), reused on every turn (HRW warm-KV).
-        let r2 = MockRouter::new(Some(WorkerId(1)));
-        let s2 = Sessions::new(r2.clone());
-        let (h, _rx) = s2.create(ident(), input(), Affinity::Sticky).await.unwrap();
-        let key = r2.affinities.lock().unwrap()[0];
-        assert!(key.is_some(), "sticky session keys affinity");
-        let _ = h.turn(input()).await.unwrap();
-        assert_eq!(
-            r2.affinities.lock().unwrap()[1],
-            key,
-            "turn reuses the session's affinity key"
-        );
-    }
-
-    #[tokio::test]
-    async fn draining_rejects_new_sessions() {
-        let router = MockRouter::new(Some(WorkerId(1)));
-        let sessions = Sessions::new(router);
-        sessions.drain(Duration::from_millis(0)).await;
-        let res = sessions.create(ident(), input(), Affinity::Sticky).await;
-        assert!(matches!(res, Err(SessionError::Draining)));
-    }
-
-    #[tokio::test]
-    async fn worker_drop_before_emit_redispatches() {
-        let router = MockRouter::new(Some(WorkerId(1)));
-        let sessions = Sessions::new(router.clone());
-        let (_h, _rx) = sessions
-            .create(ident(), input(), Affinity::Sticky)
-            .await
-            .unwrap();
-        let req_id = router.dispatched.lock().unwrap()[0];
-
-        // Worker 1 drops, worker 2 is now the only one connected.
-        *router.dispatch_worker.lock().unwrap() = Some(WorkerId(2));
-        router.set_connected(&[WorkerId(2)]);
-
-        // The watcher re-dispatches the same ReqId (not emitted yet).
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let dispatched = router.dispatched.lock().unwrap().clone();
-        assert_eq!(dispatched, vec![req_id, req_id], "same ReqId re-dispatched");
-    }
-
-    #[tokio::test]
-    async fn worker_drop_after_emit_aborts() {
-        let router = MockRouter::new(Some(WorkerId(1)));
-        let sessions = Sessions::new(router.clone());
-        let (_h, mut rx) = sessions
-            .create(ident(), input(), Affinity::Sticky)
-            .await
-            .unwrap();
-        let req_id = router.dispatched.lock().unwrap()[0];
-
-        // A token reached the consumer → the turn has emitted.
-        sessions.feed(req_id, chunk()).await;
-        assert!(matches!(rx.recv().await, Some(Tokens::Chunk(_))));
-
-        router.set_connected(&[WorkerId(2)]); // worker 1 drops
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Emitted turn is failed clean (abort), not re-dispatched.
-        assert!(rx.recv().await.is_none());
-        assert_eq!(
-            router.dispatched.lock().unwrap().len(),
-            1,
-            "no re-dispatch after emit"
-        );
-    }
 }

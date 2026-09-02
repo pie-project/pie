@@ -7,11 +7,9 @@ use tokenizer::{Tokenizer, TokenizerDecoder};
 
 use crate::{ChatDecoder, ChatEvent, ReasoningDecoder, ReasoningEvent, ToolDecoder, ToolEvent};
 
-/// Accumulates generated text and closes the turn on any stop token.
-///
-/// A batch may carry the stop token in the middle of itself. What follows it
-/// is the next turn's opening, and it used to be discarded; here the reader
-/// closes, resets, and keeps going through the same batch.
+/// Accumulates generated text and closes the turn on any stop token. A batch
+/// may carry the stop token mid-batch; what follows it is the next turn's
+/// opening, so the reader closes, resets, and keeps going through the batch.
 pub struct GenericChatDecoder {
     decoder: TokenizerDecoder,
     stop_ids: Vec<u32>,
@@ -59,14 +57,8 @@ impl ChatDecoder for GenericChatDecoder {
 }
 
 /// Watches for a thinking block: a marker sequence that opens it, one token
-/// that closes it.
-///
-/// The close is a single token by construction, and the constructor says so.
-/// A multi-token close needs a matcher that can roll back a partial match, and
-/// the one that stood here rolled back by re-feeding the marker's own ids into
-/// the content stream — which is only ever right when every prefix of the
-/// marker decodes to itself. No format in the catalog needs it: every one of
-/// them closes its thinking with one token from the vocabulary.
+/// that closes it. The close is a single token by construction; the
+/// constructor asserts it.
 pub struct ThinkingDecoder {
     decoder: TokenizerDecoder,
     open: Vec<u32>,

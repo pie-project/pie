@@ -1,6 +1,6 @@
 [package]
 name = "kernels-cuda"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Pure CUDA kernel definitions: jit unit names, argument marshalling, and launch geometry over a stream. Knows nothing about the IR; an engine Run resolves plan ids to handles and calls these entry functions."
@@ -8,12 +8,8 @@ license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 publish = false
 
-# The build script regenerates the carried-header table into OUT_DIR, for the
-# same reason the old crate's did: a checked-in list still COMPILES when it is
-# stale, and a stale list is a first-fire failure on a machine with a GPU —
-# exactly the run-time failure generation exists to convert into a build-time
-# one. It walks two directories, reads `#include` lines, and depends on
-# nothing, so a box with no CUDA toolkit still builds.
+# `build.rs` regenerates the carried-header table into OUT_DIR: a checked-in
+# list still compiles when stale, and a stale list is a first-fire failure.
 
 [lib]
 name = "kernels_cuda"
@@ -21,75 +17,40 @@ path = "src/lib.rs"
 
 [features]
 # Nothing by default: the handle vocabulary and every entry function compile
-# on a machine with no toolkit, and a fire without a runtime answers with a
-# typed refusal. This keeps a plain workspace build green everywhere.
+# with no toolkit present, and a fire without a runtime answers with a typed
+# refusal — which keeps a plain workspace build green everywhere.
 default = []
 
-# Exactly one of these turns the runtime on, and it must match the CUDA
-# runtime that will be LOADED. The split is the driver's and it is not a
-# style choice: `cudaGraphAddNode` has five parameters in `libcudart.so.12`
-# and six in `libcudart.so.13`, so a binary that picked the wrong one
-# segfaults inside the driver. Cargo unifies features across a graph, so a
-# crate that hard-coded either would silently decide for every other crate
-# in the build.
-cuda-12 = ["_cuda", "cudarc/cuda-12080"]
-cuda-13 = ["_cuda", "cudarc/cuda-13000"]
-
-# Private: "some CUDA version was chosen". The runtime layers gate on this
-# rather than on the two above, so that a build with no version selected
-# produces one actionable error instead of burying it under every use of
-# `cudarc`.
-_cuda = ["dep:cudarc"]
+# Turns the runtime on. The ABI pin below is the one place the CUDA version is
+# spelled; if a second ABI returns, this becomes `cuda-13` beside its sibling
+# rather than an alias for either.
+cuda = ["dep:cudarc", "cudarc/cuda-13000"]
 
 [dependencies]
-# `kernels` STOOD HERE for `KernelError`, the answer vocabulary every entry
-# function returns, and it was this crate's last edge to anything above it.
-# That crate is gone: its dispatch traits went to `model-exec`, beside the one
-# walk that calls them, and the error is `src/error.rs` here -- an `Error` of
-# this crate's own, named for the crate that owns it rather than for the
-# contract it used to be. `engine-cuda` translates it at eight points -- one
-# per `Dispatch*` impl and one per `Serve` half -- in a total match that
-# cannot go stale in silence.
-#
-# `Dtype`, and it is the whole edge now. `model-ir` STOOD HERE for exactly this
-# one name, which meant a kernel crate that knows nothing about the IR still
-# carried the IR's op enums, its validator and its `Trace` in reach. The enum
-# moved to a leaf of its own that deps serde and nothing else, so this is now
-# a name AND a dependency, and both are the right size.
+# `Dtype`, and that is the whole edge: a kernel crate must not carry the IR's
+# op enums and validator in reach.
 dtype = { path = "../dtype" }
 
-# The runtime, and the whole reason this crate can exist at all. Dynamically
-# loaded (`fallback-dynamic-loading`), so nothing links against a toolkit and
-# a build on a machine with no CUDA still produces a binary that RUNS on one
-# that has a driver.
-#
-# `nvrtc` is not an optimisation: a kernel in this crate exists only as text,
-# so a process that cannot open `libnvrtc.so` cannot fire one.
+# Dynamically loaded (`fallback-dynamic-loading`), so nothing links a toolkit
+# and a build on a CUDA-less box still produces a binary that runs on one with
+# a driver. `nvrtc` is required, not an optimisation: a kernel here exists only
+# as text, so a process that cannot open `libnvrtc.so` cannot fire one.
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
     "std",
     "driver",
     "runtime",
     "nvrtc",
-    # `linear::gemm`'s host programs. The dense autotuner and the plan cache
-    # are `cublasLtMatmul` and nothing else, and `linear::dense` issues
-    # them.
-    #
-    # Enabling these generates BINDINGS, not link flags:
-    # `fallback-dynamic-loading` still resolves every symbol with `dlopen` on
-    # first use, so **a box with no CUDA toolkit still builds** — the property
-    # that is easiest to break by reaching for a linked symbol instead.
+    # `linear::dense`'s `cublasLtMatmul` autotuner and plan cache. Bindings
+    # only — symbols still resolve by `dlopen` on first use.
     "cublas",
     "cublaslt",
-    # `collective`'s entries. Bindings only, same as the two above: the symbols
-    # resolve on first use, and the first use requires a communicator the
-    # driver could only have built with libnccl already open. A box with no
-    # NCCL still builds AND serves — single-rank contexts carry no
-    # communicator, and `collective::` answers them with a typed refusal.
+    # `collective`'s entries, bindings only as above: a box with no NCCL builds
+    # and serves, since single-rank contexts carry no communicator and
+    # `collective::` answers them with a typed refusal.
     "nccl",
     "fallback-dynamic-loading",
 ] }
 
-# A refusal on the launch path is reported, not returned twice: `fire` gives
-# the caller an error AND says once per symbol what went wrong, because the
-# same broken instantiation is fired once per layer per token.
+# A refusal on the launch path is reported once per symbol rather than once per
+# layer per token.
 tracing = "0.1"

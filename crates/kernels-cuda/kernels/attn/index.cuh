@@ -183,6 +183,8 @@ __global__ void index_topk_paged(
     // PLANES move by it — the qo boundaries below are the window's own,
     // rebased to its zero, and the score scratch starts at its own too.
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+    if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     const int tid = static_cast<int>(threadIdx.x);
     i32* srow = selection + static_cast<long long>(t_row) * topk;
 

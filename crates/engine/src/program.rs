@@ -1,36 +1,7 @@
 //! Guest-program registration — what a caller states, and what the engine
-//! answers.
-//!
-//! # What is here, and what moved
-//!
-//! The [`LaunchPackage`] and its whole lineage — the value table, the channels
-//! and ports, the per-stage op DAGs, the per-stage plans, the emitted kernels,
-//! the region analysis — used to be declared in this file. They are the
-//! **compiler's output artifact**, and they live with the compiler now
-//! ([`eta_compiler::codegen::launch`], plus [`eta_compiler::codegen::program`]
-//! and [`eta_compiler::codegen::cuda::region_analysis`] for the two halves
-//! that belong beside the walk and the analysis that fill them). The
-//! `LaunchPackage` header carries the reasoning that used to be this one's,
-//! including what "purify" meant and the `Direction::of` / `Direction::from_wire`
-//! bug that is the argument for it; if you came here for that, follow the link.
-//!
-//! That move deleted an inverted edge. `eta-compiler` depended on this crate
-//! solely to describe its own output, and five of the types it borrowed back —
-//! `LibraryOp`, `RegionKind`, `KernelKind`, `EmittedKernel`, `RegionAnalysis` —
-//! were second declarations of types it already had, joined by `match`es and
-//! struct copies whose only job was to cross the crate line. The edge runs the
-//! other way now, which is the direction a contract and a producer actually
-//! stand in.
-//!
-//! # What stayed
-//!
-//! The four nouns below are **trait method arguments**, not compiler output:
-//! [`ProgramRegistration`] and [`InstanceBinding`] are what a caller states to
-//! [`Engine::register_program`](crate::engine::Engine::register_program) and
-//! [`Engine::bind_instance`](crate::engine::Engine::bind_instance);
-//! [`BoundInstance`] is what the engine answers; [`BindExtents`] is the
-//! resolution a binding carries. Nothing produces them but the caller, so
-//! nothing else can own them.
+//! answers. `ProgramRegistration`/`InstanceBinding` are what a caller states,
+//! `BoundInstance` is what the engine answers, `BindExtents` is the
+//! resolution a binding carries.
 
 use serde::{Deserialize, Serialize};
 
@@ -69,20 +40,9 @@ pub struct ProgramRegistration {
 
 /// What a bound instance's symbolic value shapes resolve against.
 ///
-/// **A GUESS ZERO-FILLS SILENTLY, SO IT IS STATED** (Build log 15). A stage
-/// plan's value types are written in
-/// [`Dimension::Symbolic`](eta_compiler::plan::Dimension::Symbolic) over the
-/// seven [`SymbolicExtent`]s; an engine carves each stage's fire-path buffers at
-/// BIND time, from these numbers, and a buffer carved for one row when the fire
-/// hands it four leaves three rows of zeroes that no launch faults on. So the
-/// caller states them, and the one that matters at a model fire's boundary is
-/// [`BindExtents::sampled_rows`] — how many readout rows the epilogue reads,
-/// which is the fire's [`Readout`](crate::fire::Readout) and nothing the
-/// engine can infer from the package.
-///
-/// [`BindExtents::default`] is every extent ONE, which is what a program that
-/// resolves entirely from static dims reads (it never reads these at all) and
-/// what a `Readout::Last` lane hands an epilogue.
+/// Stated by the caller rather than inferred: a wrong guess zero-fills
+/// silently (e.g. a buffer carved for one row when the fire hands it four
+/// leaves three rows of undetected zeroes). Default is every extent one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BindExtents {
     /// The request's readable KV extent.
@@ -132,12 +92,6 @@ impl BindExtents {
 }
 
 /// Everything an instance binding states.
-///
-/// Was `InstanceBindingPlan`, which carried three more fields —
-/// `driver_id: usize`, `pacing_wait_id: u64` and `requested_instance_id` — that
-/// were the runtime's bookkeeping travelling through the engine so it could
-/// come back unchanged. The engine mints the id; the runtime keeps its own
-/// tables.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceBinding {
     /// Which program to instantiate.
@@ -155,10 +109,9 @@ pub struct InstanceBinding {
 }
 
 impl Default for InstanceBinding {
-    /// A binding of nothing, at every extent one — the shape a program with
-    /// no symbolic axis is bound in. Written out rather than derived because
-    /// a derived [`BindExtents`] would be every extent ZERO, and a zero
-    /// extent carves a zero-row buffer that no launch faults on.
+    /// Written out rather than derived: a derived `BindExtents` would be
+    /// every extent zero, and a zero extent carves a buffer no launch faults
+    /// on.
     fn default() -> InstanceBinding {
         InstanceBinding {
             program: 0,

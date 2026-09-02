@@ -1,14 +1,9 @@
-//! Gateway control-plane **client** (`controller_api::ControlClient`).
-//!
-//! The gateway registers as a gateway, heartbeats for liveness, and long-polls
-//! `watch_gateway` for the global [`RoutingTable`] — it never asks the controller
-//! per request. This is the control-plane half of the gateway, kept separate from
-//! the data plane ([`crate::worker`], where workers dial in).
-//!
-//! The [`GatewayControl`] seam abstracts the backend so the launcher can inject
-//! either the dialed [`ControlClient`] (distributed) or an in-proc
-//! `EmbeddedControl(Handle)` newtype (single-node, at the worker-bin composition
-//! root) — keeping `gateway` `controller`-free.
+//! Gateway control-plane client (`controller_api::ControlClient`). Registers
+//! as a gateway, heartbeats for liveness, and long-polls `watch_gateway` for
+//! the global [`RoutingTable`] — never asks the controller per request. The
+//! [`GatewayControl`] seam abstracts the backend so the launcher can inject
+//! either the dialed client (distributed) or an in-proc handle (single-node),
+//! keeping `gateway` `controller`-free.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -20,32 +15,18 @@ use tarpc::serde_transport::{tcp, unix};
 use tarpc::tokio_serde::formats::Bincode;
 use tokio::sync::watch;
 
-/// How often the gateway heartbeats the controller. Comfortably shorter than the
-/// controller's liveness-timeout window so a healthy gateway is never evicted
-/// between beats.
+/// Shorter than the controller's liveness-timeout window.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Client deadline for the `watch_gateway` long-poll. Generous so the
-/// server-side block (until the routing epoch advances) dominates; on expiry we
-/// re-poll with the same `since`. Transport errors surface immediately.
+/// Client deadline for the `watch_gateway` long-poll; on expiry we re-poll
+/// with the same `since`.
 const WATCH_DEADLINE: Duration = Duration::from_secs(300);
 
-/// Backoff before retrying `watch_gateway` after a transport error, so a wedged
-/// or restarting controller doesn't spin the loop.
+/// Backoff before retrying `watch_gateway` after a transport error.
 const WATCH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
-/// The control-plane backend the gateway drives. Two implementors:
-///
-/// - [`ControlClient`] (distributed, **in this crate**): tarpc RPCs;
-///   [`routing_watch`](GatewayControl::routing_watch) spawns the `watch_gateway`
-///   long-poll loop and returns its channel.
-/// - an `EmbeddedControl(Handle)` newtype at the single-node composition root
-///   (the worker binary — the only place that legitimately deps both
-///   `controller` and `gateway`): in-proc `Handle` calls, with
-///   `routing_watch` returning the controller's `gateway_watch()` directly.
-///
-/// Keeping the `Handle` adapter at the root (not here) is what lets `gateway`
-/// stay `controller`-free.
+/// The control-plane backend the gateway drives: [`ControlClient`] (tarpc
+/// RPCs, distributed) or an in-proc `EmbeddedControl(Handle)` (single-node).
 pub trait GatewayControl: Clone + Send + Sync + 'static {
     /// Register this gateway; returns its controller-minted [`GatewayId`].
     fn register_gateway(&self, info: GatewayInfo)
@@ -54,16 +35,13 @@ pub trait GatewayControl: Clone + Send + Sync + 'static {
     /// Liveness ping. [`Ack::ReRegister`] ⇒ the gateway must re-register.
     fn heartbeat(&self, id: NodeId) -> impl Future<Output = Result<Ack>> + Send;
 
-    /// A receiver of the latest [`RoutingTable`]. The distributed impl spawns the
-    /// long-poll loop internally and returns its channel; the in-proc impl returns
-    /// the controller's `gateway_watch()` directly (epoch-free).
+    /// A receiver of the latest [`RoutingTable`].
     fn routing_watch(&self) -> watch::Receiver<RoutingTable>;
 }
 
 impl GatewayControl for ControlClient {
     async fn register_gateway(&self, info: GatewayInfo) -> Result<GatewayId> {
-        // Inherent (tarpc) method shadows the trait method on `ControlClient` for
-        // method-call syntax, so this dispatches to the RPC, not back into us.
+        // Inherent tarpc method shadows this trait method, so this dispatches to the RPC.
         self.register_gateway(tarpc::context::current(), info)
             .await
             .context("register_gateway rpc")
@@ -85,9 +63,8 @@ impl GatewayControl for ControlClient {
     }
 }
 
-/// Heartbeat the controller on a fixed interval. On [`Ack::ReRegister`] the
-/// controller has lost our soft state (restart / timeout), so we re-register and
-/// adopt the new [`GatewayId`]. Transport errors are logged and retried next tick.
+/// Heartbeat the controller on a fixed interval. On [`Ack::ReRegister`] we
+/// re-register and adopt the new [`GatewayId`].
 pub(crate) async fn heartbeat_loop<C: GatewayControl>(
     control: C,
     mut id: GatewayId,
@@ -115,9 +92,8 @@ pub(crate) async fn heartbeat_loop<C: GatewayControl>(
     }
 }
 
-/// Long-poll `watch_gateway`, publishing each new [`RoutingTable`] to the shared
-/// channel. The controller blocks until the routing epoch advances past `since`;
-/// we re-poll with the returned epoch. On a transport error we back off and retry.
+/// Long-poll `watch_gateway`, publishing each new [`RoutingTable`] to the
+/// shared channel. Re-polls with the returned epoch; backs off on error.
 async fn watch_routing_loop(control: ControlClient, routing_tx: watch::Sender<RoutingTable>) {
     let mut since: u64 = 0;
     loop {

@@ -1,79 +1,54 @@
-//! Backend-agnostic transport core.
-//!
-//! Defines the uniform interface every backend implements and the
-//! register → transfer → complete lifecycle vocabulary. Backends (`local`,
-//! `nixl`) plug in behind the [`Backend`] trait; the [`crate::registry`] binds an
-//! engine-exported handle to one and dispatches.
-//!
-//! The KV handle the data plane consumes lives on the schema floor
-//! ([`engine::KvHandle`]) — transport never owns or interprets the
-//! bytes, it only moves pages between workers.
+//! Backend-agnostic transport core: register → transfer → complete lifecycle.
 
 use crate::error::Result;
 use engine::KvHandle;
 
-/// Worker identity on the data plane — re-exported from the interface leaf.
-///
-/// The controller assigns ids and decides pairings; transport only names a
-/// transfer's `src`/`dst` and reports completion. Single-source vocab: this is
-/// `ids::WorkerId`, shared with the controller and worker.
+/// Worker identity on the data plane (alias of `ids::WorkerId`).
 pub use ids::WorkerId;
 
-/// The KV pages to move within a handle, at whole-page granularity. Page
-/// indices address the paged KV arena described by the handle's layout.
+/// KV pages to move within a handle, at whole-page granularity.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PageSet {
-    /// Page indices to move.
     pub pages: Vec<u32>,
 }
 
 impl PageSet {
-    /// A page set from a list of indices.
     pub fn new(pages: Vec<u32>) -> Self {
         Self { pages }
     }
 
-    /// Number of pages.
     pub fn len(&self) -> usize {
         self.pages.len()
     }
 
-    /// Whether the set is empty.
     pub fn is_empty(&self) -> bool {
         self.pages.is_empty()
     }
 }
 
-/// Opaque token for an in-flight transfer. Poll it via the registry/backend for
-/// completion.
+/// Opaque token for an in-flight transfer; poll for completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransferId(pub u64);
 
-/// Async completion state of a transfer — the signal the runtime awaits.
-///
-/// Transport only *reports* state; *when* to await is the scheduler's call.
+/// Completion state of a transfer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Completion {
-    /// The transfer has not finished yet.
     Pending,
-    /// The transfer completed successfully.
     Done,
-    /// The transfer failed; the string is a human-readable reason.
+    /// Failed; string is a human-readable reason.
     Failed(String),
 }
 
 /// Which backend backs a registered handle or transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
-    /// Same-node device-to-device copy (co-located prefill+decode).
+    /// Same-node device-to-device copy.
     Local,
-    /// Cross-node RDMA/NIXL path (deferred behind `feature = "nixl"`).
+    /// Cross-node RDMA/NIXL path (behind `feature = "nixl"`).
     Nixl,
 }
 
-/// An engine-exported handle bound to a transfer backend — the output of
-/// [`Backend::register`]. Carries the backend tag and owning worker so the
-/// registry can route subsequent `send`/`recv`/`poll` calls.
+/// Handle bound to a transfer backend; carries backend tag and owner for routing.
 #[derive(Debug, Clone)]
 pub struct RegisteredHandle {
     pub(crate) backend: BackendKind,
@@ -82,59 +57,41 @@ pub struct RegisteredHandle {
 }
 
 impl RegisteredHandle {
-    /// The backend this handle is bound to.
     pub fn backend(&self) -> BackendKind {
         self.backend
     }
 
-    /// The worker that owns the underlying KV cache.
     pub fn owner(&self) -> WorkerId {
         self.owner
     }
 
-    /// The underlying engine-exported handle.
     pub fn handle(&self) -> &KvHandle {
         &self.handle
     }
 }
 
-/// A paired peer's connection info, handed over by the controller's pairing
-/// decision. Transport *executes* against this — it never computes it.
-///
-/// Bundles everything a cross-node backend needs to target the peer: the peer's
-/// id, its exported [`KvHandle`] (where its pages physically live, for building
-/// the remote descriptor list), and the opaque connect-metadata creds (for
-/// NIXL, the peer agent's `get_local_md` blob). serde because it crosses the
-/// control channel as pairing metadata.
+/// Peer connection info from the controller's pairing handoff. Crosses the
+/// control channel as pairing metadata (serde).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerConn {
-    /// The peer worker.
     pub worker: WorkerId,
-    /// The peer's exported KV handle (remote region addresses + layout).
+    /// Peer's exported KV handle (remote region addresses + layout).
     pub handle: KvHandle,
-    /// Opaque connect-metadata creds (mechanism-specific; empty for `local`).
+    /// Connect-metadata creds; mechanism-specific, empty for `local`.
     pub metadata: Vec<u8>,
 }
 
-/// The uniform, backend-agnostic data-plane interface.
+/// Backend-agnostic data-plane interface; `local` and `nixl` implement it.
 ///
-/// `local` and `nixl` implement it; the registry dispatches to the right one.
-/// Object-safe so the registry can hold backends behind a trait object.
-///
-/// Lifecycle: [`register`](Backend::register) →
-/// [`send`](Backend::send)/[`recv`](Backend::recv) → [`poll`](Backend::poll).
-/// Transfers are async — the start calls return a [`TransferId`] and completion
-/// is observed via `poll`.
+/// Lifecycle: register → send/recv → poll. Transfers are async — the start
+/// calls return a [`TransferId`] and completion is observed via `poll`.
 pub trait Backend {
-    /// The backend kind this implementation provides.
     fn kind(&self) -> BackendKind;
 
-    /// Register an engine-exported handle owned by `owner` so this transfer
-    /// backend can move its pages.
+    /// Register an engine-exported handle owned by `owner`.
     fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle>;
 
-    /// Start sending `pages` of `handle` to worker `dst`. Async — returns a
-    /// token to poll.
+    /// Start sending `pages` of `handle` to `dst`; async, returns a token to poll.
     fn send_mapped(
         &self,
         handle: &RegisteredHandle,
@@ -152,8 +109,8 @@ pub trait Backend {
         self.send_mapped(handle, pages, pages, dst)
     }
 
-    /// Start receiving `pages` into the local `slot` from worker `src`. Async —
-    /// returns a token to poll.
+    /// Start receiving `pages` into the local `slot` from `src`; async, returns
+    /// a token to poll.
     fn recv_mapped(
         &self,
         slot: &RegisteredHandle,
@@ -166,20 +123,12 @@ pub trait Backend {
         self.recv_mapped(slot, pages, pages, src)
     }
 
-    /// Poll an in-flight transfer's completion.
     fn poll(&self, id: TransferId) -> Result<Completion>;
 
-    /// Register a remote peer's connection info — the [`PeerConn`] the
-    /// controller's pairing handoff carries (peer id, its exported handle, and
-    /// for NIXL the peer agent's `get_local_md` blob). Subsequent
-    /// [`send`](Backend::send)/[`recv`](Backend::recv) to that peer target it.
-    ///
-    /// The local backend has no remote peers (co-located handles are known via
-    /// [`register`](Backend::register)), so its implementation is a no-op.
+    /// Register a remote peer's connection info. No-op for the local backend.
     fn connect(&self, peer: &PeerConn) -> Result<()>;
 
-    /// This backend's own connect metadata, to advertise to peers via the
-    /// controller. Empty for the local backend; for NIXL, the agent's local
-    /// metadata blob (valid once memory is registered).
+    /// This backend's connect metadata to advertise via the controller; empty
+    /// for the local backend.
     fn local_metadata(&self) -> Result<Vec<u8>>;
 }

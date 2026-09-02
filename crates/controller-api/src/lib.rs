@@ -1,39 +1,12 @@
-//! pie-controller-rpc — the controller's control-plane RPC contract.
-//!
-//! Unifies two things that used to live apart:
-//!   * the control-plane **data vocabulary** (registry / liveness / routing
-//!     types, formerly the schema crate's `control` module), and
-//!   * the `Control` **tarpc service** that carries them (formerly a separate
-//!     thin RPC crate).
-//!
-//! Workers and gateways dial the controller through the macro-generated
-//! [`ControlClient`]; the controller implements [`Control`]. The controller
-//! keeps a registry of workers + gateways, pushes each worker its [`Neighbors`]
-//! (TP siblings + prefill↔decode partners) and each gateway the [`RoutingTable`]
-//! (worker roster + coarse load) via long-poll watches, and tracks liveness from
-//! heartbeats.
-//!
-//! These are plain serde: the control plane is cross-node and low-rate.
-//! Cluster-unique id atoms
-//! ([`WorkerId`]/[`GatewayId`]/[`NodeId`]) come from the leaf `ids` crate and
-//! are re-exported here for ergonomics.
+//! The controller's control-plane RPC contract. Workers and gateways dial the
+//! controller through the macro-generated [`ControlClient`]; the controller
+//! implements [`Control`], pushing each worker its [`Neighbors`] and each
+//! gateway the [`RoutingTable`] via long-poll watches, and tracking liveness
+//! from heartbeats.
 
 use serde::{Deserialize, Serialize};
 
-// Cross-node id atoms live in the leaf `ids` crate; re-export them so
-// consumers can still reach them as `controller_api::{WorkerId, …}`.
 pub use ids::{GatewayId, NodeId, WorkerId};
-
-// `WorkerInfo` used to carry the engine's whole capability record
-// (`engine::caps::Capabilities`, itself the successor to the 30-field flat
-// `DriverCapabilities`). It was write-only: serialized by the worker, shipped,
-// and dropped again at `controller::actor::register_worker`. The engine keeps
-// that record behind `Engine::load`, which is where anything that needs it
-// reads it. If capability-aware placement is ever wanted, the controller takes
-// the specific low-cardinality numbers it needs as fields of its own — the rule
-// `WorkerStatus` already follows — instead of republishing the engine's
-// record whole, which is what cost this crate a dependency on the engine
-// contract.
 
 // ──────────────────────────── role / health ───────────────────────────
 
@@ -109,10 +82,8 @@ pub struct WorkerInfo {
 /// Static identity a gateway declares when it joins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayInfo {
-    /// The gateway's **worker-facing dial-in** endpoint (e.g. `"10.0.0.9:8001"`)
-    /// — the address workers dial INTO (M3 fan-in), NOT the client edge. The
-    /// controller republishes this in each worker's [`Neighbors`] gateway roster
-    /// so workers know where to dial.
+    /// The gateway's worker-facing dial-in endpoint (not the client edge).
+    /// Republished in each worker's [`Neighbors`] gateway roster.
     pub addr: String,
 }
 
@@ -151,22 +122,17 @@ pub struct NeighborPeer {
     pub role: Role,
 }
 
-/// One gateway a worker should dial INTO (M3 dial-in fan-in). The roster is
-/// **global** — every worker dials the same live gateway set — so each worker's
-/// [`Neighbors`] carries the identical list. Keyed by `addr` on the worker side
-/// (the dial target); `id` is for logging/observability.
+/// One gateway a worker should dial into. The roster is global (every worker
+/// dials the same live set); keyed by `addr`, `id` is for observability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayEndpoint {
     pub id: GatewayId,
     pub addr: String,
 }
 
-/// A worker's scoped view, pushed by `watch_worker`: who it should coordinate
-/// with (TP group + prefill↔decode partners) plus the global gateway roster it
-/// should dial INTO. `epoch` is the membership cursor the worker re-polls with
-/// (`since`); the controller replies only once `epoch` advances past the
-/// worker's last-seen value. Gateway join/leave bumps this same epoch, so a
-/// worker learns the live gateway set over the connection it already long-polls.
+/// A worker's scoped view, pushed by `watch_worker`: its neighbor peers plus
+/// the global gateway roster. `epoch` is the membership cursor re-polled via
+/// `since`; gateway join/leave bumps the same epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Neighbors {
     pub epoch: u64,
@@ -189,10 +155,8 @@ pub struct RoutableWorker {
     pub coarse_load: WorkerStatus,
 }
 
-/// The gateway's global view, pushed by `watch_gateway`: the full worker roster
-/// and its coarse load. `epoch` is the membership cursor the gateway re-polls
-/// with. (Every gateway gets the same global view, so `watch_gateway` takes no
-/// id.)
+/// The gateway's global view, pushed by `watch_gateway`: the full worker
+/// roster and its coarse load. Every gateway gets the same view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingTable {
     pub epoch: u64,
@@ -201,39 +165,28 @@ pub struct RoutingTable {
 
 // ──────────────────────────── Control service ─────────────────────────
 
-/// The controller's RPC surface. Registry of workers + gateways; pushes neighbor
-/// views / routing tables via long-poll watches; tracks liveness via heartbeats.
-///
-/// Workers and gateways dial the controller through the macro-generated
-/// `ControlClient`; the controller implements this trait.
+/// The controller's RPC surface. Registry of workers + gateways; pushes
+/// neighbor views / routing tables via long-poll watches; tracks liveness.
 #[tarpc::service]
 pub trait Control {
-    /// Register a worker; returns its controller-minted [`WorkerId`]. The worker
-    /// then calls `watch_worker(id, since = 0)` to get its initial neighbor view
-    /// (returns immediately, since `0 < current_epoch`).
+    /// Register a worker; returns its controller-minted [`WorkerId`].
     async fn register_worker(info: WorkerInfo) -> WorkerId;
 
     /// Register a gateway; returns its controller-minted [`GatewayId`].
     async fn register_gateway(info: GatewayInfo) -> GatewayId;
 
-    /// Liveness ping from either node kind (unified). [`Ack::ReRegister`] means
-    /// the controller has no record of this id (it restarted / the node timed
-    /// out) — the node must re-register. This is the sole eviction signal.
+    /// Liveness ping from either node kind. [`Ack::ReRegister`] means the
+    /// controller has no record of this id and it must re-register.
     async fn heartbeat(id: NodeId) -> Ack;
 
-    /// Push a worker's coarse load (write-only, returns nothing). Separate from
-    /// `heartbeat` so frequent load updates can be coalesced without disturbing
-    /// membership.
+    /// Push a worker's coarse load; separate from `heartbeat` so load updates
+    /// don't disturb membership.
     async fn report_worker(id: WorkerId, status: WorkerStatus);
 
-    /// Long-poll a worker's neighbor view. Blocks until the worker epoch advances
-    /// past `since`, then returns the scoped [`Neighbors`] (which carries the new
-    /// epoch to re-poll with).
+    /// Long-poll a worker's neighbor view; blocks until epoch advances past `since`.
     async fn watch_worker(id: WorkerId, since: u64) -> Neighbors;
 
-    /// Long-poll the global routing table. Blocks until the gateway epoch
-    /// advances past `since`, then returns the [`RoutingTable`] (which carries
-    /// the new epoch). Unscoped — every gateway gets the same global view.
+    /// Long-poll the global routing table; blocks until epoch advances past `since`.
     async fn watch_gateway(since: u64) -> RoutingTable;
 }
 

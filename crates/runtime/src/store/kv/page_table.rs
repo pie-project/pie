@@ -1,31 +1,8 @@
-//! `KvPageTable`: the hash-labeled, radix-compressed KV mapping trie
-//! (kv_refact.md, "Minimal WorkingSet Specification").
-//!
-//! The table owns the trie and the WorkingSet terminal registry. It does not
-//! allocate `PhysicalKvPageId`s or call engine APIs: `KvStore` passes freshly
-//! allocated ids in, and freed ids are returned to the caller for
-//! epoch-delayed recycling. There is no reverse hash index and no per-page
-//! refcount; lifetime is reachability from WorkingSet terminals, cache roots,
-//! and residency-transaction terminal pins.
-//!
-//! Index model: lookup anchors at the terminal. A WorkingSet's published
-//! mapping covers `[0, mapped_len)`; walking backward from the terminal, each
-//! node's contribution start may go negative, which is how front truncation
-//! (front discard, non-prefix slice) works without a structural node.
-//! `page_len >= mapped_len`; the difference is logically reserved,
-//! not-yet-published space (`reserve` is purely logical).
-//!
-//! Growth-boundary invariant: a `Pages::ParentSelection` is created only at
-//! the growth boundary of some WorkingSet mapping, and everything below a
-//! selection is created after it. Pre-existing shared nodes are never
-//! re-parented, so an interior discard on a shared path is rejected.
-//!
-//! Complete typed-store API (kv_refact.md): some methods here are not yet
-//! called by the live single-model fire path (only a subset of the typed
-//! store surface is currently wired) but are exercised by this module's
-//! own unit test suite and reserved for upcoming increments (contention/
-//! reclaim expansion, RS buffer-write paths, etc.) — kept rather than
-//! deleted, allowed rather than silently masked.
+//! `KvPageTable`: the hash-labeled, radix-compressed KV mapping trie and its WorkingSet terminal registry (no reverse hash index or per-page refcount; lifetime is reachability from terminals, cache roots, and residency pins).
+
+// Some methods here are not yet called by the live single-model fire path
+// but are exercised by this module's own tests and reserved for upcoming
+// increments.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
@@ -84,20 +61,12 @@ pub enum KvPageBacking {
     Swapped(HostKvSlotId),
 }
 
-/// What suspending one group of WorkingSets would ACTUALLY free, decided by
+/// What suspending one group of WorkingSets would actually free, decided by
 /// the same rule [`PageTable::private_resident_pages`] applies at suspend
-/// time. Victim selection consumes this, so selection and execution cannot
-/// disagree about what a candidate is worth.
-///
-/// **This is a transient policy signal, never a holdings measure.** It has
-/// no scalar accessor on purpose: the `pages()` that used to exist returned
-/// 0 for every `Nothing` variant, and `check_hog` read it as "pages this
-/// process holds" — so a head occupying the whole pool measured as holding
-/// nothing the moment one in-flight pin or one sharer appeared, and the hog
-/// endgame could not fire (`rainer_v3.md` §3.3). Liveness predicates call
-/// [`PageTable::held_pages`]; victim selection matches the variants
-/// directly, which forces each caller to say what a given [`NoReclaim`]
-/// means to it.
+/// time, so selection and execution can't disagree. A transient policy
+/// signal, not a holdings measure — has no scalar accessor on purpose, so a
+/// caller can't mistake "would free nothing now" for "holds nothing"
+/// (liveness predicates use [`PageTable::held_pages`] instead).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReclaimQuote {
     /// Suspending this group frees exactly this many resident pages.
@@ -113,7 +82,7 @@ pub enum ReclaimQuote {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoReclaim {
     /// Holds no pages at all. Cannot become reclaimable by waiting — only by
-    /// ALLOCATING. This is the case that livelocked the ladder.
+    /// allocating.
     HoldsNothing,
     /// Holds pages, but every one is reachable from another WorkingSet or a
     /// cache root. Cleared when the sharer releases.
@@ -180,35 +149,21 @@ struct WorkingSetEntry {
     /// Written only through [`WorkingSetEntry::set_page_len`], which keeps
     /// `page_len_mirror` in step.
     page_len: u64,
-    /// Lock-free copy of `page_len` for readers OUTSIDE the global KV mutex.
-    ///
-    /// Reading one integer was costing an exclusive acquisition of the mutex
-    /// every fire needs to compute its own page demand. Measured on D/512
-    /// after the census fix: the two `page_len` readers
-    /// (`inferlet/host/kv_working_set.rs` and `pipeline/fire.rs`) accounted
-    /// for 64744 of 117653 acquisitions (55%) and 4.2 s of the remaining
-    /// 6.8 s of aggregate wait, against 19 ms of combined HOLD — a pure
-    /// queue convoy in front of a load of a `u64`.
-    ///
+    /// Lock-free copy of `page_len` for readers outside the global KV mutex
+    /// (avoids an exclusive lock acquisition just to read one integer).
     /// Sound as a plain release/acquire pair because `page_len` moves only
-    /// under this process's OWN operations — `reserve`, adoption, and
-    /// `drop`/`discard` — never under the residency planner, which relocates
-    /// physical backings and leaves the logical extent alone. A reader
-    /// therefore never races its own writer, and every write it must observe
-    /// was released by the mutex it just left.
-    ///
-    /// [`Self::TORN_DOWN`] once the WorkingSet is gone, so a stale handle
-    /// still reports the error the locked path would have.
+    /// under this process's own operations (`reserve`, adoption,
+    /// `drop`/`discard`), never under the residency planner, so a reader
+    /// never races its own writer. Set to [`Self::TORN_DOWN`] once the
+    /// WorkingSet is gone, so a stale handle still reports the right error.
     page_len_mirror: Arc<AtomicU64>,
-    /// Exclusive end of the published mapping; the lookup anchor.
-    ///
-    /// kv_refact.md anchors lookup at `page_len`; with purely logical
-    /// `reserve` the anchor must exclude reserved-unpublished space, hence
-    /// this second length. (Doc to be updated.)
+    /// Exclusive end of the published mapping; the lookup anchor. Distinct
+    /// from `page_len` because `reserve` is purely logical, so the anchor
+    /// must exclude reserved-but-unpublished space.
     mapped_len: u64,
     /// The token-slot hash the NEXT appended slot chains from: the identity
     /// of the visible content so far. `None` = empty mapping (chain start).
-    /// Maintained by `KvStore` — the last committed slot hash after an
+    /// Maintained by `KvStore` — the most recently committed slot hash after an
     /// append, or a recomputed visible-content identity after surgery that
     /// edits the prefix (so post-surgery appends never impersonate the
     /// unedited continuation).
@@ -643,9 +598,8 @@ impl KvPageTable {
 
     /// `discard`: remove `ranges` (pre-discard indexes, applied atomically)
     /// from the mapping. Returns freed physical ids (caller recycles them
-    /// after the appropriate epoch). See kv_refact.md "Discard and Residency"
-    /// for the private / shared case analysis; an interior range on a shared
-    /// path is rejected before any mutation.
+    /// after the appropriate epoch); an interior range on a shared path is
+    /// rejected before any mutation.
     pub fn discard(
         &mut self,
         ws: WorkingSetId,
@@ -1629,11 +1583,10 @@ impl KvPageTable {
         marked
     }
 
-    /// Contention-ladder rung 1 (kv_refact.md, Scheduler): drop cache-root
-    /// leases on prefixes no WorkingSet terminal or in-flight pin reaches —
-    /// they are retained ONLY by the lease, so reclaiming them loses no work.
-    /// Returns the number of lease roots dropped; the caller runs
-    /// [`Self::collect`] to free their pages.
+    /// Drop cache-root leases on prefixes no WorkingSet terminal or
+    /// in-flight pin reaches — retained only by the lease, so reclaiming
+    /// them loses no work. Returns the number of lease roots dropped; the
+    /// caller runs [`Self::collect`] to free their pages.
     pub fn drop_unused_cache_leases(&mut self) -> (usize, Vec<KvPageBacking>) {
         if self.cache_roots.is_empty() {
             return (0, Vec::new());
@@ -1663,19 +1616,15 @@ impl KvPageTable {
     ///
     /// The shared exclusions — how many WorkingSets reach each location, which
     /// locations a cache root anchors, which an in-flight pin holds — are
-    /// computed ONCE for the whole batch. Calling `private_resident_pages` per
-    /// candidate would recompute the union of every other WorkingSet each
-    /// time, which is quadratic in the fleet.
+    /// computed once for the whole batch, since recomputing the union of
+    /// every other WorkingSet per candidate would be quadratic in the fleet.
     ///
     /// `budget` truncates the RESULT, never the census: the returned vector
     /// may be shorter than `groups`, and a caller that needs an opinion on
-    /// every group passes `u32::MAX`. Quoting is not free — each group costs
-    /// another walk of its own locations plus three lookups per location —
-    /// and the eviction picker consumes the list in order until the deficit
-    /// is covered, so quoting the whole fleet to use the first two entries
-    /// was pure lock hold. Measured at 512-way oversubscription: the quote
-    /// held the global KV mutex 3.8 ms per call, 558 calls, while every
-    /// fire's `host_kv_demand` waited behind it on the same mutex.
+    /// every group passes `u32::MAX`. Quoting is not free (each group costs
+    /// a walk of its own locations plus lookups per location), and the
+    /// eviction picker consumes the list in order until the deficit is
+    /// covered, so stopping at `budget` avoids quoting groups nobody will use.
     ///
     /// Advisory by design: a WorkingSet that has vanished contributes no
     /// locations rather than failing the batch. The authoritative decision is
@@ -1712,20 +1661,13 @@ impl KvPageTable {
 
     /// One group's quote.
     ///
-    /// Every question is asked AGAINST THE GROUP'S OWN LOCATIONS, never by
-    /// materializing a fleet-wide census first. The census form —
-    /// `owners[location]` over every WorkingSet, plus full `cache_held` and
-    /// `pinned` unions — is O(fleet × depth) and was paid in full even when
-    /// the budget stopped after the first group: measured on D/512, 876
-    /// quotes × 958 µs = 0.84 s of EXCLUSIVE hold on the global KV mutex,
-    /// which every fire needs to compute its own page demand. The bounded
-    /// form asks the same questions of the same walks but records only hits
-    /// inside `mine` and stops as soon as every one of them is accounted
-    /// for.
-    ///
-    /// `owners[l] > mine[l]` and "some WorkingSet outside the group reaches
-    /// `l`" are the same predicate — the count form just spelled it by
-    /// subtraction — so the answers are identical, not approximations.
+    /// Every question is asked against the group's own locations, never by
+    /// materializing a fleet-wide census first: a census form (`owners[location]`
+    /// over every WorkingSet, plus full `cache_held`/`pinned` unions) is
+    /// O(fleet × depth) and gets paid even when the budget stops after the
+    /// first group. This walks the same data but records only hits inside
+    /// `mine` and stops once every one of them is accounted for — the same
+    /// predicate as the census form, not an approximation of it.
     fn quote_group(
         &self,
         working_sets: &HashSet<WorkingSetId>,
@@ -1924,18 +1866,13 @@ impl KvPageTable {
     /// Every page this group holds — resident AND swapped, pinned or not,
     /// shared or not.
     ///
-    /// This is the DURABLE fact, and it is deliberately not a
-    /// [`ReclaimQuote`]: a quote answers "what would suspending free right
-    /// now", a transient property that collapses to zero the instant a pin
-    /// or a sharer appears. Liveness predicates need the other question —
-    /// "how much of the pool does this process occupy that evicting
-    /// everyone else cannot recover" — and reading `ReclaimQuote::pages()`
-    /// for it silently under-counted a 39-page holder to 0 whenever one
-    /// in-flight pin overlapped, disarming the hog endgame
-    /// (`rainer_v3.md` §3.3).
-    ///
-    /// Shared pages count: a sharer releasing does not hand the page back
-    /// to the pool while this group still references it.
+    /// This is the durable fact, deliberately not a [`ReclaimQuote`]: a quote
+    /// answers "what would suspending free right now", which collapses to
+    /// zero the instant a pin or a sharer appears. Liveness predicates need
+    /// the other question — how much of the pool this process occupies that
+    /// evicting everyone else cannot recover — so they must use this, not a
+    /// quote. Shared pages count: a sharer releasing doesn't free the page
+    /// while this group still references it.
     pub fn held_pages(&self, working_sets: &HashSet<WorkingSetId>) -> Result<usize, KvTableError> {
         let mut locations = HashSet::new();
         for &ws in working_sets {
@@ -2069,15 +2006,10 @@ impl KvPageTable {
         Ok(locations)
     }
 
-    /// Feed `visit` every published location of `ws`, WITHOUT materializing a
-    /// set for it.
-    ///
-    /// The fleet-wide censuses (`reclaim_quotes`, `private_resident_pages`)
-    /// call this once per WorkingSet while holding the global KV mutex — the
-    /// same mutex every fire needs to compute its page demand. A per-call
-    /// `HashSet` there is one allocation and one extra hash per location for
-    /// several hundred WorkingSets, paid inside the critical section that
-    /// convoys the whole fleet's fire path.
+    /// Feed `visit` every published location of `ws`, without materializing a
+    /// set for it — the fleet-wide censuses call this once per WorkingSet
+    /// while holding the global KV mutex, so a per-call allocation there
+    /// would be paid inside that critical section for every WorkingSet.
     ///
     /// Locations are NOT deduplicated: a chain that walks both a
     /// `ParentSelection` and the parent it selects from yields the parent's

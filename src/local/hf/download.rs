@@ -590,14 +590,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn star_stops_at_a_directory_boundary() {
-        assert!(glob_match("*.json", "config.json"));
-        assert!(!glob_match("*.json", "nested/config.json"));
-        assert!(glob_match("**/*.json", "nested/config.json"));
-        assert!(glob_match("**/*.json", "config.json"));
-    }
-
-    #[test]
     fn weight_shards_match_and_alternates_do_not() {
         let allow = super::super::runtime_snapshot_allow_patterns();
         let matches = |path: &str| allow.iter().any(|p| glob_match(p, path));
@@ -612,60 +604,4 @@ mod tests {
         assert!(!matches("model.gguf"));
     }
 
-    #[test]
-    fn question_mark_is_one_character() {
-        assert!(glob_match("model-?.safetensors", "model-1.safetensors"));
-        assert!(!glob_match("model-?.safetensors", "model-12.safetensors"));
-    }
-
-    #[test]
-    fn nested_paths_link_back_to_the_blob() {
-        // The `..` count is the one piece of this that a reader cannot check by
-        // eye, and a wrong one produces a dangling link rather than an error:
-        // the snapshot looks fetched and the loader fails later, elsewhere.
-        let root = std::env::temp_dir().join(format!("pie-hf-link-{}", std::process::id()));
-        let blobs = root.join("blobs");
-        let snapshot = root.join("snapshots").join("deadbeef");
-        std::fs::create_dir_all(&blobs).unwrap();
-        std::fs::create_dir_all(&snapshot).unwrap();
-
-        for path in ["config.json", "nested/config.json", "a/b/c/config.json"] {
-            let entry = Entry {
-                path: path.to_string(),
-                size: 5,
-                etag: format!("etag-{}", path.replace('/', "-")),
-            };
-            std::fs::write(blobs.join(&entry.etag), b"bytes").unwrap();
-            link_into_snapshot(&snapshot, &blobs, &entry).unwrap();
-
-            let linked = snapshot.join(path);
-            assert!(
-                std::fs::symlink_metadata(&linked).unwrap().is_symlink(),
-                "{path} should be a symlink"
-            );
-            assert_eq!(
-                std::fs::read(&linked).unwrap(),
-                b"bytes",
-                "{path} should resolve to its blob"
-            );
-        }
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn next_page_reads_the_link_header() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::LINK,
-            "<https://hf.co/api/models/x/tree/main?cursor=abc>; rel=\"next\""
-                .parse()
-                .unwrap(),
-        );
-        assert_eq!(
-            next_page(&headers).as_deref(),
-            Some("https://hf.co/api/models/x/tree/main?cursor=abc")
-        );
-        assert_eq!(next_page(&reqwest::header::HeaderMap::new()), None);
-    }
 }

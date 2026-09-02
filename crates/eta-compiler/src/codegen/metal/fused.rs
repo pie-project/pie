@@ -3,15 +3,12 @@
 //! per dispatch.
 //!
 //! The single-lane form binds each channel's committed/pending cells directly
-//! as buffers (hence the 12-channel cap — eleven for a region that also reads
-//! a second intrinsic rectangle, which binds down from the top of the same
-//! index space; see [`super::intrinsics`]); the grouped form reads them out of
-//! the lane table so one kernel serves every lane in the group, and it grows
-//! three inline expansions the single-lane form does not have — the MTP-draft
-//! argmax, the logits gather and the score gather. All three exist because the
-//! rectangle they walk arrives as an ADDRESS on the lane record rather than as
-//! a bound buffer, so there is no `setBuffer:offset:` for the row arithmetic
-//! to disappear into.
+//! as buffers (hence the 12-channel cap; see [`super::intrinsics`]); the
+//! grouped form reads them out of the lane table so one kernel serves every
+//! lane in the group, and it inlines three expansions the single-lane form
+//! does not need — MTP-draft argmax, logits gather, score gather — because
+//! those rectangles arrive as an address on the lane record, not a bound
+//! buffer.
 
 use crate::codegen::error::{EmitError, EmitterKind, RegionForm};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -37,11 +34,8 @@ fn value_ptr(value: u32) -> String {
     format!("scratch + offsets[{value}]")
 }
 
-/// The kernel argument holding intrinsic `intr`'s rectangle.
-///
-/// The trunk keeps the name it has always had — `logits` reads as itself in
-/// the emitted source and in every golden — and the others are named by id
-/// rather than by spelling, so a new intrinsic is a row in
+/// The kernel argument holding intrinsic `intr`'s rectangle. The trunk keeps
+/// its `logits` name; others are named by id, so a new intrinsic is a row in
 /// [`m2_intrinsic_buffer`] and not a name this file has to learn.
 fn intrinsic_slot_name(intr: u16) -> String {
     if m2_intrinsic_buffer(intr) == Some(M2_LOGITS_BUFFER) {
@@ -51,13 +45,9 @@ fn intrinsic_slot_name(intr: u16) -> String {
 }
 
 /// The intrinsic ids `region` reads that need a rectangle of their own, in
-/// ascending id order.
-///
-/// Scoped to the REGION rather than the stage, exactly as
-/// [`intrinsics_bindable`] is: a sibling region in the same stage may read a
-/// different set, and each region is its own kernel with its own signature.
-/// The trunk's `logits` is not in here — its index sits below the channels
-/// and is written unconditionally.
+/// ascending id order. Scoped to the region, not the stage, since a sibling
+/// region may read a different set. `logits` is never in here — it's written
+/// unconditionally.
 fn extra_intrinsics(ops: &[OpView], region: &Region) -> Vec<u16> {
     let mut used = BTreeSet::new();
     for &node in &region.nodes {
@@ -73,22 +63,13 @@ fn extra_intrinsics(ops: &[OpView], region: &Region) -> Vec<u16> {
     used.into_iter().collect()
 }
 
-/// Threads a grouped region's threadgroup gets per lane. The emitted kernel
-/// sizes its threadgroup reduction buffer to this; the engine launches the
-/// narrower of it and the pipeline's own maxTotalThreadsPerThreadgroup, and
-/// the kernel faults `0xB3` on a wider launch rather than reading past the
-/// buffer.
-///
-/// It must not be transcribed on the engine side: a hand-kept copy carrying a
-/// "must equal" comment has nothing comparing the two, and the failure mode is
-/// a threadgroup sized for one count reducing over a buffer built for another.
-/// This was published as `PTIR_METAL_M3_REGION_THREADS` in the generated
-/// `ptir_abi.h` while the driver was C++; the Rust `engine-metal` reads this
-/// constant itself, and `grouped.rs` asserts its mirror against it.
-///
-/// 512 measured against 256 with the model DAG truncated away, interleaved to
-/// cancel thermal drift: 0.951ms vs 1.557ms for the sampler region, reproduced
-/// twice. 1024 is not better (0.963ms) and costs twice the threadgroup memory.
+/// Threads a grouped region's threadgroup gets per lane. Sizes the emitted
+/// kernel's threadgroup reduction buffer; the engine launches the narrower of
+/// it and the pipeline's own maxTotalThreadsPerThreadgroup, and the kernel
+/// faults `0xB3` on a wider launch rather than reading past the buffer.
+/// `engine-metal` reads this constant directly (`grouped.rs` asserts the
+/// match) rather than keeping a hand-transcribed copy. 512 measured fastest
+/// against 256 and 1024.
 pub const METAL_M3_REGION_THREADS: u32 = 512;
 
 /// Device+threadgroup barrier between two ops of a region.
@@ -115,19 +96,15 @@ pub fn emit_fused_region(
     intrinsics_bindable(&ops, region)?;
     let bases = result_bases(&ops);
 
-    // ── **THE SLOT TABLE** (`super::intrinsics`). Every intrinsic this
-    //    region reads other than the trunk's `logits` gets a rectangle of its
-    //    own, at a buffer index fixed per intrinsic id and taken from the TOP
-    //    of Metal's argument space. Emitted only for the ids the region
-    //    actually reads, so a stage that reads nothing but `logits` — which is
-    //    every stage this emitter served before the table existed — emits the
-    //    bytes it always did.
+    // The slot table (`super::intrinsics`): every intrinsic this region reads
+    // besides `logits` gets a rectangle at a buffer index fixed per intrinsic
+    // id, taken from the top of Metal's argument space. Emitted only for the
+    // ids the region actually reads.
     let extra = extra_intrinsics(&ops, region);
     let ceiling = fused_channel_ceiling(&extra);
     if channel_bindings.len() > ceiling {
-        // The channels grow up from 7 and these grow down from 30; a region
-        // that let them meet would bind a rectangle at the index a channel
-        // cell already holds, and a take would answer with logits.
+        // Channels grow up from 7, these grow down from 30; letting them meet
+        // would bind a rectangle at an index a channel cell already holds.
         return Err(EmitError::ChannelLimitExceeded {
             emitter: EmitterKind::MetalFused,
             limit: ceiling,
@@ -187,13 +164,9 @@ pub fn emit_fused_region(
             }
             slots.o0 = format!("pending_{}", op.chan);
         } else if op.tag == tags::INTRINSIC_VAL {
-            // **THE RECTANGLE IS PICKED BY ID, AND IT USED TO BE PICKED BY
-            // NOTHING.** Every `INTRINSIC_VAL` op took `logits` here, so a
-            // stage reading `mtp_logits` beside `logits` read one rectangle
-            // twice — no fault, no bounds violation, the draft column's rows
-            // silently answered by the trunk's. That is the mis-binding
-            // `metal_intrinsic_supported` was written to keep out of the
-            // emitter; now there is somewhere for the second one to go.
+            // The rectangle is picked by intrinsic id; a stage reading
+            // `mtp_logits` beside `logits` needs its own slot rather than
+            // silently reusing the trunk's.
             slots.a0 = intrinsic_slot_name(op.intr);
         }
         let _ = writeln!(
@@ -220,13 +193,10 @@ pub fn emit_grouped_fused_region(
         return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedFused));
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
-    // **THE TWO LISTS ARE ONE LIST NOW**, and `attn_score` is the id that
-    // closed the gap. A grouped kernel still binds no per-intrinsic buffer —
-    // every rectangle it reads is an ADDRESS on the lane record — but the
-    // record carries a second one: `lane.attn_score_base` is the lane's block
-    // of the shell's observability slab, which no displacement off
-    // `lane.logits_base` was ever going to reach. See
-    // `grouped_intrinsics_bindable`.
+    // A grouped kernel binds no per-intrinsic buffer — every rectangle it
+    // reads is an address on the lane record — but the record carries two:
+    // `lane.attn_score_base` for the observability slab, unreachable from
+    // `lane.logits_base`. See `grouped_intrinsics_bindable`.
     grouped_intrinsics_bindable(&ops, region)?;
     let bases = result_bases(&ops);
     let channel_count = used_channel_slots(&ops);
@@ -250,12 +220,9 @@ pub fn emit_grouped_fused_region(
     source.push_str("    uint dispatch_lane [[threadgroup_position_in_grid]],\n");
     source.push_str("    uint m3_tid [[thread_position_in_threadgroup]],\n");
     source.push_str("    uint m3_threads [[threads_per_threadgroup]]) {\n");
-    // A lane owns a threadgroup rather than a thread. Everything the region does
-    // still happens once per lane -- ops that cannot be partitioned run on thread
-    // 0 -- but the ones that walk the whole vocabulary split across it. The
-    // engine picks the actual width from the pipeline's own limit and passes it
-    // in `m3_threads`; this array only has to be big enough for the largest it
-    // will ever ask for.
+    // A lane owns a threadgroup, not a thread: ops that can't be partitioned
+    // run on thread 0, the vocabulary-walking ones split across it. The
+    // engine passes the actual width in `m3_threads`.
     let _ = writeln!(
         source,
         "  threadgroup M1ArgmaxCandidate m3_tgbuf[{METAL_M3_REGION_THREADS}];"
@@ -282,9 +249,8 @@ pub fn emit_grouped_fused_region(
          reinterpret_cast<device M1Status*>(lane.commit_slot);\n",
     );
     source.push_str("  if (status->state != 1) return;\n");
-    // The threadgroup buffer above is sized for this width and the engine asks
-    // for no more than it, so a wider launch would read past the buffer. Say so
-    // rather than doing it.
+    // The threadgroup buffer is sized for this width; a wider launch would
+    // read past it, so fault rather than doing that.
     let _ = writeln!(
         source,
         "  if (m3_threads > {METAL_M3_REGION_THREADS}u) {{ \
@@ -331,13 +297,10 @@ pub fn emit_grouped_fused_region(
              channel_{channel}.pending_cell);"
         );
     }
-    // A reshape that does not change the element count or dtype is a view, but
-    // the runtime still executes it as a byte-for-byte copy of the whole value.
-    // In the sampler's graph that is a vocabulary-wide round trip through device
-    // memory for nothing. Elide it and point its consumers at the source
-    // instead, as long as the result stays inside this region -- a region output
-    // or sink is read through its own offset by someone else, so those keep the
-    // copy.
+    // A reshape that does not change element count or dtype is a view, but the
+    // runtime still executes it as a byte-for-byte copy. Elide it and point
+    // consumers at the source, as long as the result stays inside this region
+    // (a region output or sink is read elsewhere by offset, so keeps its copy).
     let escapes = crate::codegen::alias::escaping_values(region);
     let value_types = &stage.normalized.value_types;
     let covers =
@@ -538,13 +501,9 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
     source.push_str("  }\n");
 }
 
-/// `argmax(logits)` without materializing the logits.
-///
-/// The gather's only job in this shape is to widen bf16 to f32 so the generic
-/// reduction can read it, and bf16 -> f32 is exact, so the argmax over the
-/// stored halves has the same value and the same index. Fusing the two removes a
-/// vocabulary-wide f32 write and the read back of it, which was the sampler's
-/// whole remaining traffic for a graph that only wants one integer.
+/// `argmax(logits)` without materializing the logits. bf16 -> f32 is exact,
+/// so the argmax over the stored halves has the same value and index as over
+/// the widened row; fusing removes a vocabulary-wide f32 write and read-back.
 fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
     source.push_str("  {\n");
     let _ = writeln!(
@@ -556,14 +515,9 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
         "    const uint am_row_base = row_meta.offset + {};",
         if mtp { "row_meta.mtp_offset" } else { "0u" }
     );
-    // **THE ROW WIDTH IS THE READER'S AND THE PITCH IS THE RECTANGLE'S**,
-    // the same parting as in the gather below. This asked for equality —
-    // `am_in.last != am_vocab` — which was exactly right while `vocab` held
-    // the reader's own declared width, and becomes a refusal of every narrow
-    // read now that it holds the rectangle's. The relation that survives is
-    // the CUDA handler's: a declared row is a CEILING on the row it is
-    // pointed at, so more than the rectangle holds is the fault and less is
-    // an argmax over the first `am_width` columns.
+    // Row width is the reader's, pitch is the rectangle's (same parting as
+    // the gather below): a declared row is a ceiling on the row it points
+    // at, so a narrower declared width is an argmax over its first columns.
     source.push_str("    const uint am_vocab = layout->vocab;\n");
     source.push_str("    const uint am_width = am_in.last == 0u ? am_vocab : am_in.last;\n");
     let _ = writeln!(
@@ -580,28 +534,14 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
     source.push_str("      const uint am_src_row = row_indices[am_row_base + am_r];\n");
     source.push_str("      const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;\n");
     source.push_str("      M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};\n");
-    // Four independent accumulators. The combine is a strict total order, so
-    // splitting the fold changes nothing, and it breaks the dependency chain
-    // that otherwise serialises one device load per iteration in each thread.
+    // Four independent accumulators: the combine is a strict total order, so
+    // splitting the fold breaks the per-thread load dependency chain.
     source.push_str("      M1ArgmaxCandidate am_b1 = am_best, am_b2 = am_best, am_b3 = am_best;\n");
-    // **THE STRIDE IS THE LAUNCH'S WIDTH AND IT USED TO BE THE BUFFER'S.**
-    // This was `constexpr uint am_w = METAL_M3_REGION_THREADS`, on the
-    // reading that the engine always launches that many threads. It cannot:
-    // a threadgroup's width is capped by the PIPELINE's
-    // `maxTotalThreadsPerThreadgroup`, which falls with register pressure —
-    // `beam_epilogue`'s 67-op region measures 384 on an M1 Max — so a launch
-    // narrower than the constant is the normal case for a large region, and
-    // with a constant stride every column class the missing threads owned was
-    // never visited. The argmax answered confidently and wrongly.
-    //
-    // `m3_threads` is the number of threads that actually exist, so thread
-    // `t` covers `t, t + w, t + 2w, …` and the classes partition the row
-    // exactly. Nothing else moves: the four accumulators and the tree
-    // reduction below already fold over `m3_threads`, and `m1_argmax_combine`
-    // is a strict total order, so the answer does not depend on how the
-    // columns were split. The threadgroup BUFFER stays sized for
-    // `METAL_M3_REGION_THREADS` and the `0xB3` guard still refuses a launch
-    // wider than it — this loosens the narrow direction only.
+    // The stride must be the actual launch width (`m3_threads`), not the
+    // threadgroup buffer's constant capacity: a launch narrower than the
+    // constant is the normal case for a large region (register pressure caps
+    // the pipeline's threadgroup width), and a constant stride would leave
+    // columns unvisited.
     source.push_str("      const uint am_w = m3_threads;\n");
     source.push_str("      uint am_c = m3_tid;\n");
     source.push_str("      for (; am_c + 3u * am_w < am_width; am_c += 4u * am_w) {\n");
@@ -633,49 +573,26 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
     source.push_str("  }\n");
 }
 
-/// The `attn_score` intrinsic: a strided gather out of the lane's block of the
-/// observability slab.
-///
-/// **THE SECOND ADDRESS ON THE LANE RECORD, AND THE WHOLE REASON IT IS
-/// THERE.** Everything below is [`emit_logits_gather`] with three words
-/// changed, which is the point: the score plane is a rectangle like the
-/// readout is, so the walk is the same walk. What it cannot share is the
-/// BASE — the slab is the shell's own reservation and the readout is the
-/// arena's, so no row displacement off `lane.logits_base` reaches it — and
-/// that is exactly what `lane.attn_score_base` supplies.
-///
-/// Three differences, each forced:
-///
-/// * the elements are `float`. A per-key mass is a probability a policy
-///   divides by and ranks on, not a bf16 quantity, and the single-lane
-///   `0xA0` handler takes the same arm on `p.intr`
-///   (`.wiki/alto/attn-score.md` §4). So this is a copy rather than a widen.
-/// * there is no `row_indices` indirection. Those entries are FIRE rows of
-///   the readout rectangle; a score row is a `(layer, head)` PLANE of one
-///   lane's block, and the block begins at the base. Rows are `0..n` and the
-///   lane map is the offset that was already folded into the address.
-/// * a zero base is a FAULT rather than a read. A lane that did not capture
-///   has no block, and the engine refuses that ask on the host side
-///   (`program::session`'s third guard); this is the device's half of the
-///   same sentence, because reading the slab at zero is a null dereference
-///   that takes the queue with it.
+/// The `attn_score` intrinsic: a strided gather out of the lane's block of
+/// the observability slab, via `lane.attn_score_base` (the second address on
+/// the lane record — the score plane's own reservation, unreachable from
+/// `lane.logits_base`). Otherwise [`emit_logits_gather`] with three
+/// differences: elements are `float` (a copy, not a bf16 widen); no
+/// `row_indices` indirection (rows are `0..n` within the lane's own block);
+/// and a zero base faults rather than reading (a lane that did not capture
+/// has no block).
 fn emit_score_gather(source: &mut String, base: u32, o0: &str) {
     source.push_str("  {\n");
-    // A plane is `ATTN_SCORE_KV_MAX` wide, so this walks a row far longer than
-    // one thread wants. Split it exactly as the logits gather splits its own.
+    // A plane is ATTN_SCORE_KV_MAX wide; split across threads like the logits gather.
     source.push_str("    const uint score_begin = m3_tid;\n");
     source.push_str("    const uint score_step = m3_threads;\n");
     let _ = writeln!(
         source,
         "    const M1ValueDesc score_desc = descriptors[{base}];"
     );
-    // The pitch is the SLAB's and the width is the READER's, the same parting
-    // the logits gather makes — and here the two normally agree, because a
-    // guest declares `[planes, attn_score_kv_max()]` and the published width
-    // IS the pitch the capture arm wrote at. They are still two numbers: a
-    // declared row is a CEILING (`ptir_m1_runtime_body.cuh` faults on
-    // `stride < logical_width` and on nothing else), so a guest reading the
-    // first `k` keys of each plane is served rather than refused.
+    // Pitch is the slab's, width is the reader's (same parting as the logits
+    // gather); a declared row is a ceiling, so a guest reading fewer keys per
+    // plane is served rather than refused.
     source.push_str("    const uint score_stride = lane.attn_score_row_stride;\n");
     source.push_str(
         "    const uint score_width = \
@@ -696,10 +613,8 @@ fn emit_score_gather(source: &mut String, base: u32, o0: &str) {
         source,
         "    device float* score_out = reinterpret_cast<device float*>({o0});"
     );
-    // Row-major with the extent hoisted, for `emit_logits_gather`'s reason:
-    // `lane` is a register copy but `score_out` is a device store the compiler
-    // cannot prove disjoint from anything, and a flat walk pays a divide and a
-    // modulo per element on top.
+    // Row-major with the extent hoisted: a flat walk would pay a divide and
+    // modulo per element (see `emit_logits_gather`).
     source.push_str("    const uint score_rows = score_desc.len / score_width;\n");
     source.push_str("    for (uint sr = 0u; sr < score_rows; ++sr) {\n");
     source.push_str(
@@ -720,8 +635,8 @@ fn emit_score_gather(source: &mut String, base: u32, o0: &str) {
 /// logits buffer, rebased for MTP rows.
 fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
     source.push_str("  {\n");
-    // This walks the whole vocabulary. In the grouped region every thread of
-    // the lane's threadgroup reaches it, so it must be split, not repeated.
+    // Walks the whole vocabulary; every thread of the lane's threadgroup
+    // reaches this, so it must be split, not repeated.
     source.push_str("    const uint gather_begin = m3_tid;\n");
     source.push_str("    const uint gather_step = m3_threads;\n");
     let _ = writeln!(
@@ -733,24 +648,12 @@ fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
         "    const uint intrinsic_row_base = {};",
         if mtp { "row_meta.mtp_offset" } else { "0u" }
     );
-    // ── **THE STRIDE AND THE WIDTH ARE TWO NUMBERS, AND THIS USED TO SPEND
-    //    ONE ON BOTH JOBS.** `layout->vocab` is the row pitch of the
-    //    rectangle `lane.logits_base` points at; `intrinsic_desc.last` is
-    //    how many of each row THIS reader asked for. While the host wrote
-    //    the reader's own width into `vocab` the two were the same number
-    //    and the conflation was invisible — but it is what made a narrow
-    //    multi-row read inexpressible on this form too, because row `r`
-    //    started `last` elements in rather than a whole rectangle row.
-    //
-    //    So the relation checked here is the CUDA handler's and not a
-    //    stricter one: `ptir_m1_runtime_body.cuh`'s `0xA0` arm faults on
-    //    `stride < logical_width` and on nothing else about the two. A
-    //    reader declaring `[2, 8]` against a 248320-wide rectangle is
-    //    SERVED, with the first eight columns of each of two rows.
-    //
-    //    `last == 0` is a rank-zero descriptor, which has no row to be a
-    //    ceiling on; the CUDA twin falls back to `p.imm` there and this
-    //    form's equivalent fallback is the rectangle's own pitch.
+    // Stride and width are two separate numbers: `layout->vocab` is the row
+    // pitch of the rectangle `lane.logits_base` points at, `intrinsic_desc.last`
+    // is how many of each row this reader asked for. A reader declaring a
+    // narrower row than the rectangle's pitch is served, not refused (same
+    // relation the CUDA handler checks). `last == 0` has no row to be a
+    // ceiling on, so it falls back to the rectangle's own pitch.
     let _ = writeln!(source, "    const uint gather_stride = layout->vocab;");
     let _ = writeln!(
         source,
@@ -770,19 +673,15 @@ fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
         source,
         "    device float* intrinsic_out = reinterpret_cast<device float*>({o0});"
     );
-    // Row-major, not a flat walk with a divide. `layout` is device memory and
-    // `intrinsic_out` is a device store the compiler cannot prove disjoint from
-    // it, so a flat loop reloaded `layout->vocab` three times per element and
-    // paid a runtime div and mod on top -- a vocabulary-sized row cost ~85ms of
-    // an ~89ms decode step. Hoisting the extent turns it into a coalesced copy.
+    // Row-major, not a flat walk with a divide: the compiler can't prove
+    // `layout`/`intrinsic_out` disjoint, so a flat loop pays a reload and a
+    // runtime div/mod per element. Hoisting the extent makes it a coalesced copy.
     source.push_str("    const uint gather_rows = intrinsic_desc.len / gather_width;\n");
     source.push_str("    const uint gather_row_base = row_meta.offset + intrinsic_row_base;\n");
     source.push_str("    for (uint gr = 0u; gr < gather_rows; ++gr) {\n");
     source.push_str("      const uint source_row = row_indices[gather_row_base + gr];\n");
-    // The source steps a whole rectangle row and the destination steps only
-    // what the reader asked for. Where the two agree this is the coalesced
-    // copy it has always been; where they do not, this is the whole of the
-    // freedom `intrinsic_row_stride` buys the CUDA handler.
+    // Source steps a whole rectangle row; destination steps only what the
+    // reader asked for.
     source.push_str(
         "      const device bfloat* gather_src = logits + \
          ulong(source_row) * gather_stride;\n",

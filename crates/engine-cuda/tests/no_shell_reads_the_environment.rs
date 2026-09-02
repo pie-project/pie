@@ -1,47 +1,14 @@
-//! **ARTICLE 9'S GATE**: a shell reads no environment (alto design §1).
-//!
-//! > *Shells read no environment: every knob is typed in `Boot`/`Budget`/
-//! > `Profile` and portable across backends. Enforcement: a grep gate
-//! > (`env::var` count in shells = 0).*
-//!
-//! This is that grep, written down. It is a plain test and not a build script
-//! on purpose — a build script would run at compile time on a machine that may
-//! not have the sibling crate, and would report through a channel nobody reads
-//! on a green run. A test names the file and the line.
-//!
-//! # Why a grep and not a type
-//!
-//! Everything else in this constitution is enforced by a type or a submit-time
-//! gate, because the failure has a shape the compiler can see. This one does
-//! not: `std::env::var` is legal Rust everywhere, and the bug is not that the
-//! call is wrong — it is that the ANSWER did not come from the boot document.
-//! A knob a shell reads out of its own process environment is a knob that is
-//! not in the config, does not travel to the other shell, cannot be diffed
-//! against what a deployment asked for, and is invisible to every reader. That
-//! is a fact about provenance, and provenance is what a grep can see.
-//!
-//! # What died to make this pass
-//!
-//! Nine `PIE_CUDA_*` words in `serve.rs` — `GRAPHS`, `STREAMS`, `GROUPED`,
-//! `BUCKETS`, `PAD`, `FOLD`, `PIPELINE`, `FOLD_DISABLE`, `FALLBACK_COPY` —
-//! and, in `program/compile.rs`, the three-step `PIE_HOME`/`XDG_CACHE_HOME`/
-//! `HOME` walk that found the cubin cache. They are `Boot` fields and
-//! `[engine]`/`[cache]` keys now (alto wave P). The Metal shell never had any,
-//! and this gate is what keeps that true of both.
+//! Grep gate: no shell (`engine-cuda` or `engine-metal`) may call
+//! `env::var` — every knob must be typed in `Boot`/`Budget`/`Profile`.
 
 use std::path::{Path, PathBuf};
 
-/// The two shells, as directories relative to this crate's manifest.
-///
-/// `engine-metal` is a SIBLING and is read on purpose: the constitution's
-/// count is over shells, not over one shell, and "Metal has zero env vars"
-/// (survey §2 debt 6) is a property that has to keep being true. A gate that
-/// policed only the crate it lives in would let the next one land next door.
+/// Both shells: the constitution's count is over shells, not one, so this
+/// also polices `engine-metal`.
 const SHELLS: [&str; 2] = ["../engine-cuda/src", "../engine-metal/src"];
 
-/// What a shell may not do. `env::var` matches `var`, `var_os` and any
-/// `var_*` a future standard library grows, which is the whole family: the
-/// spelling is not the point, the ANSWER's provenance is.
+/// Matches `var`, `var_os`, and any future `var_*` — the spelling doesn't
+/// matter, the provenance does.
 const FORBIDDEN: &str = "env::var";
 
 #[test]

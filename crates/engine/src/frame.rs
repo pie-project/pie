@@ -1,4 +1,4 @@
-//! **The three-phase step, typed** (alto design §3 and §4; articles 2, 4, 7).
+//! The three-phase step, typed.
 //!
 //! ```text
 //!   StepView ──prepare──▶ Prepared ──enqueue──▶ Enqueued ──settle──▶ Settled
@@ -6,90 +6,41 @@
 //!             no stream              no alloc               pinned reads only
 //! ```
 //!
-//! # Why this is three functions and not one
+//! `prepare`: host only, never touches a stream. `enqueue`: stream only,
+//! allocates nothing (every device address was fixed at load or bake).
+//! `settle`: after the device answers — sync, readback, error attribution,
+//! staging release, and bookkeeping the next step's prepare reads.
 //!
-//! `fire_captured` is one function today, and the seam this module names is
-//! already drawn inside it — by a comment. The sync at the end of that
-//! function carries a list, written by the person who tried to move it, of the
-//! five things it guards: the readback, error attribution, staging lifetime,
-//! eviction/teardown, and bookkeeping order. Every one of those is
-//! **settle's** work; everything above the sync that touches a stream is
-//! **enqueue's**; everything above the first stream touch is **prepare's**.
-//! The comment was the design. This module is the same design, in types the
-//! compiler checks.
-//!
-//! # What each phase may do, and what it may not
-//!
-//! * **`prepare` — host only.** Composition, descriptor arithmetic, page
-//!   geometry, window resolution, mask expansion, plan building, validation.
-//!   Article 2 says no host read, decision, synchronize or memcpy may gate the
-//!   transition between consecutive waves; the enforcement is that
-//!   [`Prepared`] is a value that **cannot reach a stream** — a shell's
-//!   `Prepared` holds ring indices and plan objects, never a stream handle,
-//!   so hoisting all k steps' host work to frame entry is structurally
-//!   possible rather than a discipline someone maintains.
-//! * **`enqueue` — stream only, and it allocates nothing.** Article 7: every
-//!   device address captured work reads was fixed at load or bake, so the fire
-//!   path allocates nothing. What crosses here is bytes and table entries.
-//! * **`settle` — the device has answered.** The sync, the readback, error
-//!   attribution, staging release, and the bookkeeping the NEXT step's prepare
-//!   will read. In F1 it is synchronous and runs immediately; in F2 it is what
-//!   the completion broker drives.
-//!
-//! # F1 lands the seams, not the saturation
-//!
-//! `submit` runs `prepare → enqueue → settle` back to back, per step, exactly
-//! where `fire` ran them inline — the same launches in the same order at the
-//! same cost. What changed is that the three are now functions with types
-//! between them, so wave F2 can move `settle` off the critical path and F3 can
-//! interleave `prepare(W+1)` with `enqueue(W)` without inventing the seam
-//! first.
+//! `submit` runs the three back to back per step today, at the same cost as
+//! the old inline `fire`; the seam lets later work move `settle` off the
+//! critical path or interleave steps without reworking this contract.
 
-/// **What a shell's per-step host state must be able to answer** — its demand,
-/// so that article 4's union can be taken before anything runs.
+/// What a shell's per-step host state must be able to answer — its demand,
+/// so the union across steps can be taken before anything runs.
 ///
-/// The type itself is the shell's: a `Prepared` holds a composition, a
-/// descriptor, staged slot INDICES, a fold decision, an attention plan. What
-/// this trait fixes is the one question the neutral admission gate must ask of
-/// it.
-///
-/// **THE CONSTITUTIONAL PROPERTY IS A NEGATIVE ONE AND NO TRAIT CAN STATE IT:**
-/// a `Prepared` must hold no stream handle. It is enforced by the shell's own
-/// field list and by review, and it is why the phase exists at all.
+/// A `Prepared` must hold no stream handle (enforced by the shell's own
+/// field list and by review, not by this trait).
 pub trait Prepared {
     /// What this step will take from supply, if it is admitted.
     fn demand(&self) -> Demand;
 }
 
-/// **What a step that is on the stream can still be asked**, before the device
-/// has answered.
-///
-/// Deliberately almost nothing. An `Enqueued` is a receipt for launches that
-/// are already in flight: the shell may count them, and everything else is
-/// [`Shell::settle`]'s to read once the device is done.
+/// What a step that is on the stream can still be asked, before the device
+/// has answered — a receipt for launches already in flight; everything else
+/// is [`Shell::settle`]'s to read once the device is done.
 pub trait Enqueued {
-    /// How many launches this step put on the stream. Zero is legal — a fire
-    /// every window was empty for is still a fire (article 5's zero-row
-    /// always-launch is about a KERNEL launching, not about a step having to).
+    /// How many launches this step put on the stream. Zero is legal — a
+    /// fire every window was empty for is still a fire.
     fn launches(&self) -> u32;
 }
 
-/// **The device half of a load, cut at its three phases.**
+/// The device half of a load, cut at its three phases. One implementation
+/// per backend; the associated lifetimes let a `Prepared` borrow the
+/// submission rather than copy it.
 ///
-/// One implementation per backend. The associated lifetimes are what let a
-/// `Prepared` borrow the submission it was prepared from rather than copying
-/// it: a frame's steps outlive the frame's `submit`, so nothing here needs to
-/// own what the caller already owns.
-///
-/// # The phases are consumed in order and the types say so
-///
-/// `enqueue` takes a `Prepared` **by value** and `settle` takes an `Enqueued`
-/// by value, so a step cannot be enqueued twice, settled without being
-/// enqueued, or settled twice. Wave F2 wants `enqueue(&Prepared)` instead —
-/// its ping-pong needs step W-1's prepared state alive while W is being
-/// prepared — and that is a widening of this signature, not a rework of it:
-/// `prepare` already takes `prev` for exactly that reason and F1 always passes
-/// `None`.
+/// `enqueue` takes a `Prepared` by value and `settle` takes an `Enqueued` by
+/// value, so a step cannot be enqueued twice, settled unenqueued, or settled
+/// twice.
 pub trait Shell {
     /// The submission a step is prepared from, as the shell reads it.
     type Step<'a>
@@ -108,12 +59,9 @@ pub trait Shell {
     /// This shell's fault type.
     type Error;
 
-    /// **Every host decision this step needs, made now** (articles 2 and 5).
-    ///
-    /// `prev` is the step before this one in the same frame, still prepared —
-    /// wave-order effects read it (channel sequence tickets apply in wave
-    /// order; the fold's ping-pong rebinds W's idle exec while W-1 runs).
-    /// `None` for the first step of a frame, and for every step in F1.
+    /// Every host decision this step needs, made now. `prev` is the step
+    /// before this one in the same frame, still prepared (wave-order
+    /// effects read it); `None` for the first step of a frame.
     ///
     /// # Errors
     ///
@@ -127,10 +75,8 @@ pub trait Shell {
     where
         Self: 'a;
 
-    /// **Everything this step puts on the stream, and nothing else**
-    /// (articles 1 and 7).
-    ///
-    /// No allocation, no synchronize, no host read of device state.
+    /// Everything this step puts on the stream, and nothing else: no
+    /// allocation, no synchronize, no host read of device state.
     ///
     /// # Errors
     ///
@@ -142,15 +88,12 @@ pub trait Shell {
     where
         Self: 'a;
 
-    /// **The five obligations the sync guards**: the readback, error
-    /// attribution, staging lifetime, eviction/teardown, and the bookkeeping
-    /// order the next step's prepare depends on.
+    /// The obligations the sync guards: readback, error attribution, staging
+    /// lifetime, eviction/teardown, and bookkeeping order.
     ///
     /// # Errors
     ///
-    /// The shell's fault, carrying THIS step's name — which is the second of
-    /// the five obligations and the reason the sync is here rather than
-    /// wherever the next blocking call happens to be.
+    /// The shell's fault, carrying this step's name.
     fn settle<'a>(
         &mut self,
         enqueued: Self::Enqueued<'a>,
@@ -159,13 +102,10 @@ pub trait Shell {
         Self: 'a;
 }
 
-/// **What a frame will take from the engine's supply** (alto design §8;
-/// article 8: the runtime owns policy, the engine owns supply).
-///
-/// A frame's demand is the UNION of its steps' — not the sum — because the
-/// steps run one after another on one device and a page a step frees is a page
-/// the next may have. Article 4 commits it once, atomically across arenas,
-/// before any stream work.
+/// What a frame will take from the engine's supply. A frame's demand is the
+/// union of its steps', not the sum: steps run one after another on one
+/// device, so a page a step frees is a page the next may reuse. Committed
+/// once, atomically across arenas, before any stream work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Demand {
     /// KV pages this step addresses.
@@ -184,11 +124,9 @@ impl Demand {
         workspace: 0,
     };
 
-    /// **The union of two demands, arena by arena.**
-    ///
-    /// `max`, not `+`. Two steps of one frame do not hold their KV pages at
-    /// the same instant — a frame is sequential on one device — so summing
-    /// would refuse frames that fit.
+    /// The union of two demands, arena by arena. `max`, not `+`: two steps
+    /// of one frame never hold their KV pages at the same instant, so
+    /// summing would refuse frames that fit.
     #[must_use]
     pub const fn union(self, other: Demand) -> Demand {
         Demand {
@@ -211,29 +149,13 @@ impl Demand {
     }
 }
 
-/// **The engine's half of memory: physical commit and trim** (design §8).
-///
-/// The runtime owns page ids, CoW, the prefix cache and the eviction choice;
-/// this is the other side of that line, and the line is crossed once in one
-/// spelling (article 8). [`Supply::commit`] is the frame admission gate:
-/// atomic across arenas, `Exhausted` with **zero side effects**, and past it
-/// the stream work is success-only.
-///
-/// **WAVE C MADE THIS REAL ON THE CUDA PLANE.** `commit` is dev's elastic
-/// shape — a budgeted physical pool under VMM arenas whose virtual ranges are
-/// reserved at the load's ceiling and whose physical backing grows to demand
-/// — and the 10-second resize poll that used to stand in for it is gone,
-/// because elasticity is a side effect of admission rather than a thing
-/// somebody polls for. A shell that has not been converted still carves fixed
-/// pools at load, and for it `commit` is the ceiling check it already had and
-/// `trim` has nothing to give back; both readings satisfy this contract, and
-/// the difference is visible as `PoolFacts::elastic_page_bytes`.
+/// The engine's half of memory: physical commit and trim. The runtime owns
+/// page ids, CoW, the prefix cache and the eviction choice. [`Supply::commit`]
+/// is the frame admission gate: atomic across arenas, `Exhausted` with zero
+/// side effects, and past it the stream work is success-only.
 pub trait Supply {
-    /// What a refusal is spelled as. The shells speak their own fault type and
-    /// the contract layer above them turns it into `Exhausted`/`Impossible`;
-    /// putting this crate's `Error` here would push that translation down into
-    /// the arena code, which is the one place that genuinely knows only about
-    /// bytes.
+    /// What a refusal is spelled as; the contract layer above translates it
+    /// to `Exhausted`/`Impossible`, not the arena code itself.
     type Error;
 
     /// Commit a frame's union demand, atomically.
@@ -241,20 +163,13 @@ pub trait Supply {
     /// # Errors
     ///
     /// The shell's refusal when the budget will not cover it. Nothing is
-    /// committed in that case: article 4's zero side effects are this method's
-    /// promise, and it is why the caller may retry the identical frame.
+    /// committed in that case, so the caller may retry the identical frame.
     fn commit(&mut self, demand: Demand) -> std::result::Result<(), Self::Error>;
 
-    /// Give back what the load no longer needs. Background, best-effort, and
-    /// never on the fire path's critical section.
-    ///
-    /// **THE HINT IS A RESIDENCY STATEMENT, NOT A FRAME'S DEMAND.** A kv page
-    /// holds bytes for as long as somebody's prefix is cached in it, and
-    /// which pages those are is POLICY — the trie, the CoW, the eviction
-    /// choice, all of them the runtime's (article 8). An engine knows only
-    /// what the last frame addressed, which is a smaller set, so it must not
-    /// invent a watermark of its own: a shell unmaps exactly what it is told
-    /// to, above the committed line and only while it is idle.
+    /// Give back what the load no longer needs. Background, best-effort,
+    /// never on the fire path's critical section. The hint is a residency
+    /// statement, not a frame's demand: a shell unmaps exactly what it is
+    /// told, above the committed line, only while idle.
     fn trim(&mut self, hint: Demand) {
         let _ = hint;
     }

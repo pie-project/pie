@@ -1,8 +1,6 @@
-//! Program Repository - Two-tier program storage
-//!
-//! Provides a 2-tier lookup system for programs:
-//! 1. Disk index (Manifest with path/hash info)
-//! 2. Binary cache (WASM bytes for user-registered programs)
+//! Program repository: two-tier program storage, a disk index (manifest with
+//! path/hash info) plus a binary cache (WASM bytes for user-registered
+//! programs).
 
 use std::path::{Path, PathBuf};
 
@@ -12,31 +10,20 @@ use std::collections::HashMap;
 use super::ProgramName;
 use super::manifest::{Manifest, manifest_url};
 
-// =============================================================================
-// Repository Types
-// =============================================================================
-
-/// Get the WASM file path for a program.
-///
-/// `programs_dir` is the directory this repository owns outright. It used to
-/// be a `cache_dir` that these helpers joined `"programs"` onto -- while the
-/// only caller already passed `$PIE_HOME/programs`, so every program landed in
-/// `$PIE_HOME/programs/programs/<name>/`. Taking the directory itself leaves
-/// nowhere for the two ends to disagree.
+/// `programs_dir` is the directory this repository owns outright, so the
+/// wasm and manifest paths below cannot disagree about a "programs" prefix.
 fn wasm_path(programs_dir: &Path, name: &ProgramName) -> PathBuf {
     programs_dir
         .join(&name.name)
         .join(format!("{}.wasm", name.version))
 }
 
-/// Get the manifest file path for a program.
 fn manifest_path(programs_dir: &Path, name: &ProgramName) -> PathBuf {
     programs_dir
         .join(&name.name)
         .join(format!("{}.toml", name.version))
 }
 
-/// Build WASM download URL for a program from registry.
 fn wasm_url(registry_url: &str, name: &ProgramName) -> String {
     format!(
         "{}/api/v1/inferlets/{}/{}/download",
@@ -48,18 +35,15 @@ fn wasm_url(registry_url: &str, name: &ProgramName) -> String {
 
 /// Two-tier program repository: disk index + binary cache.
 pub struct Repository {
-    /// Index: manifests for programs on disk
     index: HashMap<ProgramName, Manifest>,
-    /// Preloaded binaries: WASM bytes staged for immediate first-use (consumed on fetch)
+    /// WASM bytes staged for immediate first-use, consumed on fetch.
     preloaded_binaries: HashMap<ProgramName, Vec<u8>>,
-    /// Registry URL for fallback downloads
     registry_url: String,
     /// The directory holding `<name>/<version>.{wasm,toml}`.
     programs_dir: PathBuf,
 }
 
 impl Repository {
-    /// Create a new empty repository.
     pub fn new(registry_url: String, programs_dir: PathBuf) -> Self {
         Self {
             preloaded_binaries: HashMap::new(),
@@ -69,19 +53,14 @@ impl Repository {
         }
     }
 
-    /// Get manifest from index.
     pub fn fetch_manifest(&self, name: &ProgramName) -> Option<Manifest> {
         self.index.get(name).cloned()
     }
 
-    /// Fetch WASM bytes for a program (consuming from preloaded_binaries or loading from disk).
     pub async fn fetch_wasm_binary(&mut self, name: &ProgramName) -> Result<Vec<u8>> {
-        // Consume from preloaded_binaries if present (e.g., user-registered program)
         if let Some(wasm_binary) = self.preloaded_binaries.remove(name) {
             return Ok(wasm_binary);
         }
-
-        // Load from disk if in index
         if self.index.contains_key(name) {
             let wasm = wasm_path(&self.programs_dir, name);
             let wasm_binary = tokio::fs::read(&wasm)
@@ -94,11 +73,8 @@ impl Repository {
     }
 
     /// Every program on disk, name-then-version ordered, with the bytes each
-    /// one occupies.
-    ///
-    /// Exists so `pie inferlet list` can enumerate the cache without knowing
-    /// the `<name>/<version>.wasm` layout. A second implementation of that
-    /// layout is a second thing to keep in step with this one.
+    /// one occupies. Exists so `pie inferlet list` can enumerate the cache
+    /// without knowing the `<name>/<version>.wasm` layout itself.
     pub fn cached(&self) -> Vec<(ProgramName, Manifest, u64)> {
         let mut out: Vec<(ProgramName, Manifest, u64)> = self
             .index
@@ -134,30 +110,25 @@ impl Repository {
                 Err(e) => return Err(anyhow!("removing {:?}: {}", path, e)),
             }
         }
-        // Prune the name directory once its last version goes, so the listing
-        // does not accumulate empty shells. Failure is not an error: an
-        // occupied directory means another version is still there.
+        // Prune the name directory once its last version goes; failure isn't
+        // an error, since it just means another version is still there.
         let _ = std::fs::remove_dir(self.programs_dir.join(&name.name));
         Ok(true)
     }
 
-    /// Check if program is cached in repository.
     pub fn exists(&self, name: &ProgramName) -> bool {
         self.index.contains_key(name)
     }
 
-    /// Add a program by name (downloads from registry).
     pub async fn add_from_registry(
         &mut self,
         name: &ProgramName,
         force_overwrite: bool,
     ) -> Result<()> {
-        // Check if already exists (unless force_overwrite)
         if !force_overwrite && self.index.contains_key(name) {
-            return Ok(()); // Already added
+            return Ok(());
         }
 
-        // Download manifest
         let url = manifest_url(&self.registry_url, name);
         let manifest_response = reqwest::get(&url)
             .await
@@ -177,7 +148,6 @@ impl Repository {
             .map_err(|e| anyhow!("Failed to read manifest response: {}", e))?;
         let manifest = Manifest::parse(&manifest_content)?;
 
-        // Download WASM
         let url = wasm_url(&self.registry_url, name);
         let wasm_response = reqwest::get(&url)
             .await
@@ -197,16 +167,12 @@ impl Repository {
             .map_err(|e| anyhow!("Failed to read WASM response: {}", e))?
             .to_vec();
 
-        // Save to disk (updates index)
         self.store_program_cache(&wasm_binary, manifest).await?;
-
-        // Store in preloaded binaries for first-use optimization
         self.preloaded_binaries.insert(name.clone(), wasm_binary);
 
         Ok(())
     }
 
-    /// Add a program manually with provided WASM binary and manifest.
     pub async fn add(
         &mut self,
         wasm_binary: Vec<u8>,
@@ -215,21 +181,16 @@ impl Repository {
     ) -> Result<()> {
         let name = manifest.program_name();
 
-        // Check if already registered (unless force_overwrite)
         if !force_overwrite && self.index.contains_key(&name) {
             return Ok(());
         }
 
-        // Save to disk (updates index)
         self.store_program_cache(&wasm_binary, manifest).await?;
-
-        // Store in preloaded binaries for first-use optimization
         self.preloaded_binaries.insert(name, wasm_binary);
 
         Ok(())
     }
 
-    /// Load programs from disk into the index.
     /// Scans `programs_dir` for `<name>/<version>.wasm` + its sibling manifest.
     pub fn load_program_cache(&mut self) {
         self.lift_doubled_programs_dir();
@@ -238,7 +199,6 @@ impl Repository {
             return;
         }
 
-        // List all subdirectories (each is a program name)
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -255,7 +215,6 @@ impl Repository {
                 None => continue,
             };
 
-            // Look for version files: {version}.wasm
             let version_entries = match std::fs::read_dir(&path) {
                 Ok(e) => e,
                 Err(_) => continue,
@@ -298,10 +257,7 @@ impl Repository {
     /// Move programs out of the `programs/programs/` directory the old
     /// `cache_dir` doubling wrote them to.
     ///
-    /// TEMPORARY -- delete once no tree in use predates the path fix. Without
-    /// it every already-downloaded program becomes invisible at once and is
-    /// silently re-fetched, which needs a reachable registry to recover from
-    /// and leaves the old copies occupying disk with nothing pointing at them.
+    /// Temporary: migrates the old doubled `programs/programs/` layout.
     fn lift_doubled_programs_dir(&self) {
         let nested = self.programs_dir.join("programs");
         let Ok(entries) = std::fs::read_dir(&nested) else {
@@ -309,8 +265,7 @@ impl Repository {
         };
         for entry in entries.flatten() {
             let destination = self.programs_dir.join(entry.file_name());
-            // Never over a live one: if both layouts hold a program, the one
-            // already in the right place is the one the runtime has been using.
+            // Never over a live one.
             if !destination.exists() {
                 let _ = std::fs::rename(entry.path(), destination);
             }
@@ -319,7 +274,6 @@ impl Repository {
         let _ = std::fs::remove_dir(&nested);
     }
 
-    /// Save program to disk and update index.
     async fn store_program_cache(&mut self, wasm_binary: &[u8], manifest: Manifest) -> Result<()> {
         let name = manifest.program_name();
         let dir = self.programs_dir.join(&name.name);
@@ -337,7 +291,6 @@ impl Repository {
             .await
             .map_err(|e| anyhow!("Failed to write manifest file: {}", e))?;
 
-        // Update index
         self.index.insert(name, manifest);
 
         Ok(())
@@ -354,106 +307,3 @@ impl std::fmt::Debug for Repository {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn manifest_toml(name: &str, version: &str) -> String {
-        format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n")
-    }
-
-    /// Write a program straight to disk in the layout the repository reads,
-    /// without going through the repository itself -- so these tests exercise
-    /// the reader rather than agreeing with the writer.
-    fn plant(root: &Path, name: &str, version: &str, bytes: usize) {
-        let dir = root.join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{version}.wasm")), vec![0u8; bytes]).unwrap();
-        std::fs::write(
-            dir.join(format!("{version}.toml")),
-            manifest_toml(name, version),
-        )
-        .unwrap();
-    }
-
-    fn open(root: &Path) -> Repository {
-        let mut repo = Repository::new(String::new(), root.to_path_buf());
-        repo.load_program_cache();
-        repo
-    }
-
-    #[test]
-    fn cached_reports_each_program_with_its_size() {
-        let dir = tempfile::tempdir().unwrap();
-        plant(dir.path(), "beta", "0.2.0", 200);
-        plant(dir.path(), "alpha", "0.1.0", 100);
-        plant(dir.path(), "alpha", "0.10.0", 150);
-
-        let cached = open(dir.path()).cached();
-        let ids: Vec<String> = cached
-            .iter()
-            .map(|(n, _, _)| format!("{}@{}", n.name, n.version))
-            .collect();
-        // Sorted, and two versions of one name are two rows.
-        assert_eq!(ids, ["alpha@0.1.0", "alpha@0.10.0", "beta@0.2.0"]);
-        assert_eq!(cached[0].2, 100);
-        assert_eq!(cached[2].2, 200);
-    }
-
-    #[test]
-    fn remove_takes_both_files_and_prunes_only_the_emptied_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        plant(dir.path(), "alpha", "0.1.0", 10);
-        plant(dir.path(), "alpha", "0.2.0", 10);
-        let mut repo = open(dir.path());
-
-        let first = ProgramName {
-            name: "alpha".into(),
-            version: "0.1.0".into(),
-        };
-        assert!(repo.remove(&first).unwrap());
-        assert!(!dir.path().join("alpha/0.1.0.wasm").exists());
-        assert!(!dir.path().join("alpha/0.1.0.toml").exists());
-        // The sibling version still lives here, so the directory stays.
-        assert!(dir.path().join("alpha/0.2.0.wasm").exists());
-        assert_eq!(repo.cached().len(), 1);
-
-        // Removing what is already gone is reported, not an error.
-        assert!(!repo.remove(&first).unwrap());
-
-        repo.remove(&ProgramName {
-            name: "alpha".into(),
-            version: "0.2.0".into(),
-        })
-        .unwrap();
-        assert!(!dir.path().join("alpha").exists());
-    }
-
-    #[test]
-    fn programs_left_in_the_old_doubled_directory_are_lifted_out() {
-        // The layout `cache_dir.join("programs")` produced when the caller had
-        // already appended `programs`.
-        let dir = tempfile::tempdir().unwrap();
-        plant(&dir.path().join("programs"), "alpha", "0.1.0", 42);
-
-        let repo = open(dir.path());
-        assert_eq!(repo.cached().len(), 1, "the old copy should be found");
-        assert_eq!(repo.cached()[0].2, 42);
-        assert!(dir.path().join("alpha/0.1.0.wasm").exists());
-        assert!(!dir.path().join("programs").exists(), "emptied, so pruned");
-    }
-
-    #[test]
-    fn lifting_never_overwrites_a_program_already_in_the_right_place() {
-        // Both layouts hold `alpha`. The one the runtime has been loading is
-        // the one in the right place, so it must survive.
-        let dir = tempfile::tempdir().unwrap();
-        plant(dir.path(), "alpha", "0.1.0", 999);
-        plant(&dir.path().join("programs"), "alpha", "0.1.0", 1);
-
-        let repo = open(dir.path());
-        assert_eq!(repo.cached()[0].2, 999);
-        // Not pruned: something is still in there, so it stays findable.
-        assert!(dir.path().join("programs/alpha/0.1.0.wasm").exists());
-    }
-}

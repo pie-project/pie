@@ -8,6 +8,16 @@ use dtype::Dtype;
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, head_group, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
+/// The YaRN ramp a partial rope states beside its theta (the IR's
+/// `elemwise::Yarn`, restated here because this crate names no IR).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Yarn {
+    pub factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    pub original_max_position: u32,
+}
+
 const FILE: &str = "elemwise/rope_neox.metal";
 
 const UNSCALED: f32 = 1.0;
@@ -103,33 +113,58 @@ fn rotate_proportional(
 }
 
 /// The tail arm: the rotation sits over the last `rotary` lanes of each head.
+///
+/// The tail rotation. `sign` is `-1` for the inverse (the angle negated) and
+/// `1` otherwise; `yarn` is the layer's ramp or `None`, and when it is `Some`
+/// the ramp bounds are derived here over the ROTATED width exactly as the
+/// reference's `precompute_freqs(dim = rotary, ...)` derives them.
 #[allow(clippy::too_many_arguments)]
 fn rotate_tail(
     ctx: &Ctx<'_>,
     op: &'static str,
     x: Tensor,
     positions: Tensor,
-    base: f32,
+    theta: f32,
     head_dim: u32,
     rotary: u32,
     interleaved: bool,
+    inverse: bool,
+    yarn: Option<Yarn>,
 ) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "neox_last_mb_bfloat16" });
     positions_stream(op, positions, x);
     let lanes = rope_grid(op, rotary, x.width, head_dim, x.rows)?;
+    let (factor, low, high) = match yarn {
+        Some(y) => {
+            let max_position = nonzero(
+                op,
+                "the position span this layer's YaRN ramp states",
+                y.original_max_position,
+            )?;
+            let rotated = stated(op, rotary)?;
+            let (low, high) =
+                ramp_bounds(rotated, theta, y.beta_fast, y.beta_slow, stated(op, max_position)?);
+            (y.factor, low, high)
+        }
+        None => (1.0, 0.0, 0.0),
+    };
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of(lanes, head_group(lanes))),
         &[
             x.arg_mut(),
             positions.arg(),
-            base.arg(),
+            theta.log2().arg(),
             stated(op, head_dim)?.arg(),
             i32::from(interleaved).arg(),
+            (if inverse { -1.0f32 } else { 1.0f32 }).arg(),
+            factor.arg(),
+            low.arg(),
+            high.arg(),
         ],
     )
 }
 
-/// The YaRN interpolation ramp, precomputed host-side as before.
+/// The YaRN interpolation ramp, precomputed host-side.
 #[derive(Clone, Copy)]
 struct Ramp {
     factor: f32,
@@ -252,6 +287,7 @@ pub fn partial_q(
 }
 
 /// Partial rope over the last `rotary_dim` lanes of each head.
+#[allow(clippy::too_many_arguments)]
 pub fn partial_last(
     ctx: &Ctx<'_>,
     q: Tensor,
@@ -260,6 +296,8 @@ pub fn partial_last(
     head_dim: u32,
     theta: f32,
     interleaved: bool,
+    inverse: bool,
+    yarn: Option<Yarn>,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial_last";
     if rotary_dim > head_dim {
@@ -276,10 +314,12 @@ pub fn partial_last(
         OP,
         q,
         positions,
-        theta.log2(),
+        theta,
         head_dim,
         rotary_dim,
         interleaved,
+        inverse,
+        yarn,
     )
 }
 

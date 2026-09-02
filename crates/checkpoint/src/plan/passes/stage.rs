@@ -1,30 +1,9 @@
-//! Device-side scratch: give a transform's operands somewhere on the device
-//! to BE.
-//!
-//! Every CUDA load-time transform kernel in this crate used to be unreachable.
-//! Not disabled, not slow — unreachable, in every plan the tree could compile
-//! (`.wiki/fix/loader.md`). The reason was one missing concept rather than a
-//! bug: the arena was defined as "the resident tensors, laid out", so anything
-//! that was not a resident tensor was host memory *by construction*. A
-//! transform reading a checkpoint extent therefore had its input on the host,
-//! and a transform reading an intermediate had its input in a host `Vec` —
-//! and [`ArenaBacking::run_tile_map`] is only ever offered a transform whose
-//! operands are already arena spans, because a backing is handed offsets and
-//! nothing else.
-//!
-//! Two gates whose intersection was empty. This pass closes both:
-//!
-//! * a transform reading the checkpoint gets an [`StorageInstr::ExtentWrite`]
-//!   into a staging buffer, and then reads THAT — the file bytes go to the
-//!   device first and the transform happens where the kernel is;
-//! * an intermediate that a device transform reads or writes is placed in the
-//!   arena's scratch region instead of being denied an offset.
-//!
-//! What it does not do is decide anything about kernels. Which operands a
-//! target has a row for is [`tile`](super::tile)'s table, and this pass asks
-//! it — [`kernel_for`] — about the instruction as it WOULD be once rewritten.
-//! A rewrite that would not reach a kernel is not made, so the plan does not
-//! grow a copy to feed a transform the host was going to run anyway.
+//! Device-side scratch: gives a transform's operands somewhere on the device
+//! to be. A transform reading the checkpoint gets an
+//! [`StorageInstr::ExtentWrite`] into a staging buffer and then reads that;
+//! an intermediate a device transform reads or writes is placed in the
+//! arena's scratch region. Whether a rewrite is worth making is decided by
+//! asking [`kernel_for`] about the instruction as it would be once rewritten.
 //!
 //! [`ArenaBacking::run_tile_map`]: crate::executor::arena::ArenaBacking::run_tile_map
 
@@ -36,10 +15,7 @@ use crate::plan::{BufferDecl, DestExtent, LoadPlan, SourceExtent, StorageInstr};
 use crate::types::{BufferId, Encoding, InstrId};
 
 pub(super) fn stage_device_transforms(program: &mut LoadPlan) -> Result<usize> {
-    // A target with no kernels has nothing to stage FOR, and paying a copy to
-    // put an operand somewhere no kernel will read it is strictly worse than
-    // the host path. `kernel_for` answers this per instruction too; the early
-    // return is so a host plan is not walked at all.
+    // A target with no kernels has nothing to stage for; skip walking a host plan.
     if program.target.tile_map_mask == 0 {
         return Ok(0);
     }
@@ -47,8 +23,7 @@ pub(super) fn stage_device_transforms(program: &mut LoadPlan) -> Result<usize> {
     let old = program.instrs.clone();
     let schedule = program.schedule.clone();
 
-    // Pass one: decide, reading only. Nothing is rewritten while the plan is
-    // still being asked questions about itself.
+    // Pass one: decide, reading only.
     let mut decisions = Vec::with_capacity(schedule.len());
     let mut wanted: Vec<BufferId> = Vec::new();
     for id in &schedule {
@@ -64,9 +39,7 @@ pub(super) fn stage_device_transforms(program: &mut LoadPlan) -> Result<usize> {
     }
 
     // Pass two: rewrite. Each staged transform gains a buffer to read and an
-    // `ExtentWrite` that fills it, immediately before the transform — the
-    // adjacency is what lets one scratch slot serve every staged transform in
-    // turn.
+    // `ExtentWrite` that fills it, immediately before the transform.
     let mut rewritten: Vec<StorageInstr> = Vec::with_capacity(old.len() + decisions.len() * 2);
     let mut staged = 0usize;
     for (id, decision) in schedule.iter().zip(decisions) {
@@ -146,8 +119,7 @@ fn decide(program: &LoadPlan, index: &PlanIndex, instr: &StorageInstr) -> Result
     };
 
     let Some(source) = source else {
-        // Already reads a buffer. The only thing between it and the device is
-        // whether that buffer is anywhere the device can address.
+        // Already reads a buffer; only question is whether it's device-addressable.
         let facts = TileMapFacts {
             operands_in_arena: true,
             ..facts
@@ -159,16 +131,12 @@ fn decide(program: &LoadPlan, index: &PlanIndex, instr: &StorageInstr) -> Result
     };
 
     // A block-scaled `Encode` reads its input's per-group factors out of the
-    // checkpoint while it works (`TransformSpec::metadata_source`), so its
-    // source is not merely bytes to be moved.
+    // checkpoint while it works, so its source is not merely bytes to move.
     if transform.metadata_source.is_some() {
         return Ok(None);
     }
-    // The bytes have to BE what the extent says they are. A quantized source
-    // reports its logical dtype — `SourceExtent::dtype` for an MXFP4 payload
-    // is BF16 — so staging one would declare a buffer of bf16 elements over
-    // four-bit codes, and the kernel table would pick a row for numbers that
-    // are not there.
+    // `SourceExtent::dtype` is the logical dtype (e.g. BF16 for an MXFP4
+    // payload), not the raw bytes, so only a raw-encoded source can stage.
     let Some(raw) = index.source(program, source.tensor_id) else {
         return Ok(None);
     };
@@ -179,34 +147,27 @@ fn decide(program: &LoadPlan, index: &PlanIndex, instr: &StorageInstr) -> Result
         return Ok(None);
     };
     let out = program.buffer(*primary)?;
-    // What the staged operand looks like from the far side: the destination's
-    // logical shape when the transform writes a whole buffer, and the extent's
-    // own counts when it writes a window of one.
+    // Destination's logical shape when writing a whole buffer, else the
+    // extent's own counts for a window write.
     let shape = match dest {
         Some(dest) => dest.stride.dims.iter().map(|dim| dim.count).collect(),
         None => out.ty.shape.clone(),
     };
     let elements = crate::types::tensor_elements(&shape).unwrap_or(0);
     if elements == 0 || elements.saturating_mul(source.dtype.bytes_ceil()) != source.span_bytes {
-        // The extent does not cover a whole operand of the declared shape, so
-        // a buffer of that shape is not what these bytes are.
+        // Extent doesn't cover a whole operand of the declared shape.
         return Ok(None);
     }
 
     // The instruction as it would be: reading a dense buffer of exactly these
-    // bytes rather than a file. Four facts change and the rest is what the
-    // plan already says, which is what keeps this from being a second copy of
-    // the lowering rule.
+    // bytes rather than a file.
     let staged_facts = TileMapFacts {
         has_source: false,
         compact_source: true,
         source_dtype: Some(source.dtype),
-        // A staging buffer is never the destination, so a transform whose
-        // kernel rewrites its input where it lies is not one this reaches.
+        // in_place: a staging buffer is never the destination.
+        // operands_in_arena: what this pass is making true.
         in_place: false,
-        // The question being asked: *if* the operands were on the device.
-        // Making that true is this pass's whole job, and `lower` re-derives it
-        // from the placement afterwards rather than taking this on trust.
         operands_in_arena: true,
         ..facts
     };
@@ -224,12 +185,8 @@ fn decide(program: &LoadPlan, index: &PlanIndex, instr: &StorageInstr) -> Result
     }))
 }
 
-/// Point a `TileMap` at a buffer instead of at the checkpoint.
-///
-/// The staged buffer goes FIRST in `inputs`, which is where every reader
-/// expects the payload: the factors of a per-group `Scale` follow it, exactly
-/// as they do for a transform whose payload was already a buffer
-/// (`validate-scale-factors`).
+/// Point a `TileMap` at a buffer instead of at the checkpoint. The staged
+/// buffer goes first in `inputs`, where every reader expects the payload.
 fn read_from_buffer(instr: StorageInstr, buffer: BufferId) -> Result<StorageInstr> {
     let StorageInstr::TileMap {
         id,
@@ -266,15 +223,12 @@ fn declare_staging_buffer(program: &mut LoadPlan, stage: &Staging) -> Result<Buf
     );
     program.buffers.push(BufferDecl {
         id,
-        // NOT a tensor. Nothing binds these bytes, nothing finalizes them, and
-        // nothing may publish them under a name — a staging buffer is the
-        // arena's, not the contract's.
+        // Not a tensor: a staging buffer is the arena's, not the contract's.
         tensor: None,
         ty: crate::contract::TensorType::new(stage.shape.clone(), stage.encoding.clone()),
         bytes: stage.source.span_bytes,
         alignment: stage.alignment.max(program.target.preferred_alignment),
-        // Temporary in the sense the streaming executor means: reusable, freed
-        // at its last use, and not part of what the load leaves behind.
+        // Reusable, freed at its last use, not part of what the load leaves behind.
         temporary: true,
         persistent_offset: None,
         scratch_offset: None,

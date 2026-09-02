@@ -1,17 +1,10 @@
-//! # `eta-compiler` — backend source emission for ETA
-//!
-//! Everything Pie generates *from* the IR tables rather than maintaining by
-//! hand. Each emitter is a pure function of the tables, so its output is
-//! byte-stable and CI can diff a checked-in artifact against it: host and
-//! device cannot disagree about the op vocabulary or the RNG formula if both
-//! are printed from one source.
-//!
-//! [`rng`], [`layout`] and [`slots`] project one declaration into several
-//! languages. [`cuda`] and [`metal`] turn a compiled stage into source and are
-//! pure `Plan -> String` with no device-architecture inputs, so a kernel can be
-//! emitted, diffed and reviewed without a device; [`op_view`], [`wellformed`],
-//! [`alias`], [`launch`] and [`program`] support them. Anything only one
-//! backend's engine reads lives under that backend — [`cuda::region_analysis`].
+//! Backend source emission for ETA: everything generated *from* the IR
+//! tables rather than maintained by hand. Each emitter is a pure function of
+//! the tables, so host and device cannot disagree if both are printed from
+//! one source. [`rng`], [`layout`] and [`slots`] project one declaration
+//! into several languages; [`cuda`] and [`metal`] turn a compiled stage into
+//! source as pure `Plan -> String`, with [`op_view`], [`wellformed`],
+//! [`alias`], [`launch`] and [`program`] supporting them.
 
 pub mod alias;
 pub mod cuda;

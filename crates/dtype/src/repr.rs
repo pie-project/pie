@@ -1,7 +1,4 @@
-//! The repr algebra behind [`Dtype::repr`](crate::Dtype::repr): one enum, [`Fmt`], recursive by `&'a`, covers element and composite alike.
-//! `term := elem | group '_' elem '_' term '_' offset ; offset := 'n' | 'z' '_' term | 'b' '_' term`
-//! Signed codes are excess-binary; offsets always add.
-//! The mangled spelling is the canonical name; [`spells`] ties constants to it at build time.
+//! Repr algebra behind [`Dtype::repr`](crate::Dtype::repr): [`Fmt`] recursively covers element and composite formats.
 
 use core::fmt;
 

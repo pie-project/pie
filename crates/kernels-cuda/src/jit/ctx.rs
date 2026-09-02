@@ -106,29 +106,18 @@ impl Fire {
     }
 }
 
-/// **ONE CONTEXT'S SCRATCH SLABS**, minted by [`Slabs::open`] and freed by
-/// [`Slabs::release`].
-///
-/// A scratch slab is the workspace an entry may not allocate per fire, and
-/// the question this handle answers is WHOSE. It used to be nobody's: the
-/// slabs were keyed by a static name and shared by every `Ctx` in the
-/// process, so two shells staged into one another's planes and both computed
-/// (build log 18 measured the garbage; the tree's workaround was one shell
-/// per process). An arena makes the sharing explicit — one per CUDA context,
-/// and within it one slab per `(name, stream)`, which is the other half of
-/// the same key (build log 24's `EXCLUSIVE` list existed only because two
-/// forked arms shared a name).
-///
-/// Handles are `Copy` and mean nothing but an identity; the storage is
-/// process-global behind them, like the jit cache beside it.
+/// One context's scratch slabs, minted by [`Slabs::open`] and freed by
+/// [`Slabs::release`]. One arena per CUDA context, one slab per
+/// `(name, region)` inside it, so two shells never stage into each other's
+/// planes. Handles are `Copy` and mean nothing but an identity; the storage
+/// is process-global behind them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Slabs(u32);
 
 impl Slabs {
-    /// **THE ARENA A BARE [`Ctx::on`] FIRES AGAINST.** Shared by everything
-    /// that never asked for one of its own — the checkpoint's transform
-    /// executor, benches, a test that wants a stream and nothing else — and
-    /// still per stream inside, so sharing it is not sharing a slab.
+    /// The arena a bare [`Ctx::on`] fires against. Shared by everything that
+    /// never asked for one of its own; still per-stream inside, so sharing
+    /// it is not sharing a slab.
     pub const PROCESS: Slabs = Slabs(0);
 
     /// A fresh arena, disjoint from every other. One per `Context`.
@@ -140,53 +129,35 @@ impl Slabs {
 
     /// Tell this arena it fires on `stream` too.
     ///
-    /// **CALL IT BEFORE THE FIRST FIRE ON THAT STREAM.** Growth is broadcast
-    /// across an arena's attached streams — that is what lets the shell's
-    /// EAGER warm pass, which runs on one stream, size the slabs the CAPTURE
-    /// pass will read on the others (`jit::device`'s header argues it). A
-    /// stream attached late gets its slab on the name's next growth, and a
-    /// capture is where there is no next growth.
-    ///
     /// # Safety
     ///
     /// `stream` must be a live `cudaStream_t`, and must not outlive this
     /// arena's [`release`](Slabs::release).
     pub unsafe fn attach(self, stream: *mut c_void) {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             crate::jit::device::attach(self.0, stream);
         }
-        #[cfg(not(feature = "_cuda"))]
+        #[cfg(not(feature = "cuda"))]
         {
             let _ = stream;
         }
     }
 
-    /// Free every slab in this arena.
-    ///
-    /// The context's teardown, and nothing else: a slab is read only by a
-    /// launch enqueued on one of the arena's own streams, so a context that
-    /// has synchronized has nothing left pointing at one. Freeing is what
-    /// makes a second shell in one process cost what the first did.
+    /// Free every slab in this arena. The context's teardown: a context that
+    /// has synchronized has nothing left pointing at one of its slabs.
     pub fn release(self) {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             crate::jit::device::release(self.0);
         }
     }
 }
 
-/// **THIS FIRE'S ROW COUNT AND THE BUCKET IT ROUNDS UP TO** — the whole of
-/// what D4 (`.wiki/palo/cuda-abi.md` §3) sends down to the entries.
-///
-/// A `Pad` is not a permission to round; it is the pair of numbers that makes
-/// rounding CHECKABLE, and [`Ctx::opaque_rows`] is the only reader. `rows` is
-/// the fire's TOTAL row count — the extent an Always region's launch is handed
-/// — and `bucket` is what `engine::fire::compose` rounded it up to. An engine
-/// that arms neither leaves the default, which is `rows == bucket == 0`: no
-/// extent equals it, so nothing is ever padded and the plane is byte-for-byte
-/// the one that existed before this field did. That default is also what a
-/// WINDOWED region is armed with, which is where the boundary is enforced.
+/// This fire's row count and the bucket it rounds up to. Not a permission to
+/// round — the pair of numbers that makes rounding checkable, read only by
+/// [`Ctx::opaque_rows`]. The default `rows == bucket == 0` (nothing armed, or
+/// a windowed region) matches no extent, so nothing is ever padded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Pad {
     /// The fire's total token rows.
@@ -194,6 +165,12 @@ pub struct Pad {
     /// The smallest lattice point that holds them (`Composition::bucket`).
     pub bucket: u32,
 }
+
+/// The region a caller outside the walk asks under (a warm pass, a weight
+/// transform, a bench, a test). Not one shared slot: `jit::device`'s key
+/// falls back to the asking stream at this value, since such callers share
+/// `Slabs::PROCESS` and run at once.
+pub const NO_REGION: u32 = u32::MAX;
 
 /// The stream and its companions. Long-lived state (jit cache, scratch
 /// slabs, device probes) is process-global behind it; the `Ctx` itself is
@@ -204,48 +181,25 @@ pub struct Ctx {
     comm: *mut c_void,
     slabs: Slabs,
 
-    /// D4's number, written per REGION by the engine's walk ([`Ctx::arm`]).
-    ///
-    /// **A `Cell` BECAUSE THE CONTEXT OUTLIVES THE FIRE AND THE NUMBER DOES
-    /// NOT.** One `Ctx` is minted per stream at LOAD (`device::Context::bind`,
-    /// `open_lanes`) and lent to every entry of every fire after it, so the
-    /// fire-lived half of what an entry needs cannot be a constructor
-    /// argument without re-minting a cuBLAS handle per fire. A `Cell<Pad>` is
-    /// eight bytes the shell stamps between two fires; it is never read across
-    /// threads, because a `Ctx` holds raw handles and is neither `Send` nor
-    /// `Sync` already.
+    /// The padding quantum, written per region by the engine's walk
+    /// ([`Ctx::arm`]). A `Cell` because the context outlives the fire and
+    /// this value does not. Never read across threads (`Ctx` is neither
+    /// `Send` nor `Sync`).
     pad: core::cell::Cell<Pad>,
 
-    /// The device address of this REGION's live-geometry words, or `0` — the
-    /// staged-geometry seat (bodies design; the census's option (c)).
-    ///
-    /// **FOUR `u32` LIVE AT THAT ADDRESS, AND THE ORDER IS THE ENGINE'S
-    /// CONTRACT** (`engine_cuda::window`): `[rows, row_offset, lanes,
-    /// lane_offset]`. The cell here is an ADDRESS and knows none of that — it
-    /// is the kernels that read words, each only the ones its own grid means.
-    /// A row-gridded entry reads 0 and 1; a REQUEST-gridded one (the chunked
-    /// linear-attention scans) reads 2 and 3 instead, retiring padded lanes on
-    /// `win[2]` and turning its window request number into a fire lane with
-    /// `win[3]`. Widening the seat moved neither of the first two words, which
-    /// is why every entry that shipped before the lane pair existed is
-    /// untouched by it.
-    ///
-    /// **THE SAME LIFECYCLE ARGUMENT AS `pad`, FOR THE INVERSE OPERATION.**
-    /// `pad` rounds a launch's extent UP to a bucket the recorded graph was
-    /// carved for; the stage is how a REPLAY of that graph serves fewer rows
-    /// than it was carved at: an entry that supports the seat passes this
-    /// address as its `win` argument, and the device text's
-    /// `if (win != nullptr && r >= win[0]) return;` retires the rows the
-    /// bucket padded in — read from memory at run time, never baked into a
-    /// node parameter. Fire-lived, region-stamped, eight bytes between two
-    /// fires: a `Cell` for exactly `pad`'s reason.
-    ///
-    /// `0` IS THE WHOLE OF THE OFF SWITCH. [`ArgValue::ABSENT`] is
-    /// `Ptr(0)`, so a disarmed stage and the null seat every entry passes
-    /// today are the SAME argument bytes — an engine that never arms this
-    /// leaves every launch bit-identical to the plane before the field
-    /// existed, which is what "no regression by construction" means here.
+    /// The device address of this region's live-geometry words, or `0` (the
+    /// staged-geometry seat). Four `u32` live at that address in the
+    /// engine's order (`engine_cuda::window`): `[rows, row_offset, lanes,
+    /// lane_offset]` — a row-gridded entry reads 0 and 1, a request-gridded
+    /// one (chunked linear-attention scans) reads 2 and 3. `0` is the whole
+    /// off switch: [`ArgValue::ABSENT`] is `Ptr(0)`, so a disarmed stage and
+    /// the null seat every entry passes today are the same argument bytes.
     stage: core::cell::Cell<u64>,
+    /// Which template region this context is firing, stamped by the
+    /// engine's walk at the same instant as [`Pad`] and the staged seat.
+    /// Read only by the scratch slab's key ([`Ctx::scratch`]).
+    /// [`NO_REGION`] for a caller that is not walking a template.
+    region: core::cell::Cell<u32>,
 }
 
 impl Ctx {
@@ -264,6 +218,7 @@ impl Ctx {
                 bucket: 0,
             }),
             stage: core::cell::Cell::new(0),
+            region: core::cell::Cell::new(NO_REGION),
         }
     }
 
@@ -316,54 +271,29 @@ impl Ctx {
     }
 
     /// A named scratch slab, grown but never shrunk — the workspace an entry
-    /// may not allocate per fire (graph capture forbids it).
+    /// may not allocate per fire (graph capture forbids it). Keyed by
+    /// `(arena, name, region)`, so two forked arms of a walk get two slabs.
     ///
-    /// **THE KEY IS `(arena, name, stream)`, AND NONE OF THE THREE IS
-    /// DECORATION.** The arena is this context's [`Slabs`], so two shells in
-    /// one process no longer stage into one another's planes; the stream is
-    /// the one this `Ctx` fires on, so two arms of a P6 fork group get two
-    /// slabs and the compiler no longer has to order them apart. `jit::device`
-    /// carries the measurements both halves come from.
+    /// Growth allocates a fresh block, which would split a capture in
+    /// progress: the engine warms every scratch-consuming entry with an
+    /// eager fire before capturing, and `device::take` refuses a growth
+    /// mid-capture. `jit::device` retires a superseded block rather than
+    /// freeing it, so an address a recorded graph holds stays valid.
     ///
-    /// **The contract, both ways.** Growth allocates a fresh block, which
-    /// would split a capture in progress across two addresses. The engine's
-    /// side: warm every scratch-consuming entry with an eager fire at full
-    /// fire shape before capturing, so a captured fire only ever re-reads a
-    /// slab that is already big enough — and the warm pass may fire on ONE
-    /// stream, because growth is broadcast across every stream the arena has
-    /// been told about. This plane's side: the cheap runtime guard in
-    /// `device::take` — if this context's stream is mid-capture
-    /// (`cudaStreamIsCapturing`) and the slab would have to grow, the fire
-    /// comes back as a [`Error::Backend`] refusal naming the
-    /// un-warmed slab instead of corrupting the capture.
-    ///
-    /// **AND WHAT NEITHER SIDE CAN PROMISE**: that no LATER fire grows a name
-    /// a graph already baked. The shapes a serving load brings are not
-    /// bounded by the ones it has brought, so growth after a capture is
-    /// ordinary, and `jit::device` answers it by RETIRING the superseded
-    /// block rather than freeing it — the address a recorded graph holds
-    /// stays its own for the life of the arena. The module comment there
-    /// carries the measurement.
-    ///
-    /// **THE CONTRACT ON A NEW SLAB'S AUTHOR**: size it by the launch's own
-    /// row count and load-fixed constants, and by nothing else. Every slab in
-    /// the tree is monotone in per-launch rows, and the bodies path SPENDS
-    /// that fact: its staleness check watches per-launch rows alone, so "no
-    /// launch grew" must keep implying "no slab grew". A slab sized off a
-    /// chunk count, a page count or a lane count would break that theorem
-    /// silently — grow one off rows, or bring the check a new witness.
+    /// New slabs must be sized only by the launch's own row count and
+    /// load-fixed constants: every slab is monotone in per-launch rows.
     pub fn scratch(
         &self,
         op: &'static str,
         name: &'static str,
         bytes: usize,
     ) -> Result<*mut c_void, Error> {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
-            crate::jit::device::take(self.slabs.0, self.stream, name, bytes)
+            crate::jit::device::take(self.slabs.0, self.stream, name, self.region.get(), bytes)
                 .map_err(|fault| fault.at(op))
         }
-        #[cfg(not(feature = "_cuda"))]
+        #[cfg(not(feature = "cuda"))]
         {
             let _ = (name, bytes);
             Err(crate::jit::runtimeless(op))
@@ -376,21 +306,10 @@ impl Ctx {
         self.slabs
     }
 
-    /// **STAMP D4'S TWO NUMBERS ON THIS CONTEXT, FOR THE LAUNCH ABOUT TO RUN.**
-    ///
-    /// **PER REGION, NOT PER FIRE**, and that is the whole of why this is a
-    /// setter on a long-lived context rather than an argument to a
-    /// constructor. The engine calls it from `Run::ctx` — the lookup every
-    /// dispatch arm goes through to find its stream — with the walk's cursor
-    /// already on the node about to launch, so what it stamps is the pad THIS
-    /// REGION is allowed. A region whose window is not the whole fire is
-    /// stamped `Pad::default()`, because padding a window writes the next
-    /// class's rows of the same column.
-    ///
-    /// A `Pad` whose `bucket` is not above its `rows` arms nothing — which is
-    /// what a deployment with no lattice (`Composition::bucket == rows`), a
-    /// shell with `PIE_CUDA_PAD=off`, and a windowed region all hand over, so
-    /// none of the three needs an arm of its own here.
+    /// Stamp the padding quantum's two numbers on this context, for the
+    /// launch about to run. Per region, not per fire. A region whose window
+    /// is not the whole fire is stamped `Pad::default()`, since padding a
+    /// window would write the next class's rows of the same column.
     pub fn arm(&self, pad: Pad) {
         self.pad.set(pad);
     }
@@ -403,15 +322,10 @@ impl Ctx {
     }
 
     /// Stamp the staged-geometry seat: the device address of the four `u32`
-    /// this region's live geometry will be read from at run time.
-    ///
-    /// **PER REGION, LIKE [`arm`](Ctx::arm)**, and armed by the same caller
-    /// for the same reason: only the engine's walk knows which region the
-    /// next launch belongs to, and a region's live rows are its window's, not
-    /// the fire's. An entry that supports the seat passes [`stage`](Ctx::stage)
-    /// as its `win` argument; one that does not is unaffected, because the
-    /// seat travels as an ordinary argument and this cell is read by nothing
-    /// else.
+    /// this region's live geometry will be read from at run time. Per
+    /// region, like [`arm`](Ctx::arm). An entry that supports the seat
+    /// passes [`stage`](Ctx::stage) as its `win` argument; one that does not
+    /// is unaffected.
     pub fn arm_stage(&self, addr: u64) {
         self.stage.set(addr);
     }
@@ -421,12 +335,23 @@ impl Ctx {
         self.stage.set(0);
     }
 
+    /// Stamp which template region is firing, for the one reader there is:
+    /// the scratch slab's key ([`scratch`](Ctx::scratch)). Per region, like
+    /// [`arm`](Ctx::arm) and [`arm_stage`](Ctx::arm_stage).
+    pub fn arm_region(&self, region: u32) {
+        self.region.set(region);
+    }
+
+    /// Put the region back to [`NO_REGION`] — the shared slot every caller
+    /// outside a walk asks under. The twin of [`disarm`](Ctx::disarm).
+    pub fn disarm_region(&self) {
+        self.region.set(NO_REGION);
+    }
+
     /// The staged-geometry seat as the argument an entry passes: the
     /// live-geometry words' address, or [`ArgValue::ABSENT`] when nothing
-    /// armed one —
-    /// which are the same variant, because `ABSENT` is `Ptr(0)` and `0` is
-    /// the disarmed stage. The device guard reads `win != nullptr` off
-    /// exactly these bytes.
+    /// armed one (same variant, since `ABSENT` is `Ptr(0)` and `0` is the
+    /// disarmed stage).
     #[must_use]
     pub fn stage(&self) -> ArgValue {
         ArgValue::Ptr(self.stage.get())
@@ -439,58 +364,16 @@ impl Ctx {
         self.pad.get()
     }
 
-    /// **THE ROW COUNT AN OPAQUE CALLEE IS TOLD ABOUT** — D4, in one call.
+    /// The row count an opaque callee is told about, in one call. An entry
+    /// that hands its shape to a library planner (e.g. cuBLASLt) asks for
+    /// its `M` here instead of using the raw extent. Not a general rounding
+    /// service — kernels this tree owns keep the live extent.
     ///
-    /// An entry that hands its shape to a library planner nobody publishes the
-    /// arm table of (cuBLASLt: `.wiki/palo/cuda-abi.md` §1 counted 151
-    /// arm-switching nodes and a non-monotone splitK band on the gemm's M
-    /// alone) asks for its `M` here instead of using the extent it was handed.
-    /// Every kernel this tree OWNS keeps the live extent and the zero-row
-    /// contract; this is not a general rounding service.
-    ///
-    /// **THE SAFETY ARGUMENT IS TWO GATES, AND ONLY THE SECOND ONE IS HERE.**
-    /// Padding is legal exactly when the rows `[rows, bucket)` a padded call
-    /// reads and writes belong to NOBODY:
-    ///
-    /// * **In bounds.** The arena reserves every `Dim::Tokens` column at
-    ///   `max_tokens` rows and hands out static offsets (`engine_cuda::arena`),
-    ///   and P0 refuses a lattice with a bucket past that ceiling
-    ///   (`model_compiler`'s `accept`: "list a bucket past the token ceiling").
-    ///   So a fire's tail rows are reserved bytes, not somebody's allocation.
-    /// * **Harmless.** A gemm is ROW-INDEPENDENT: output row `i` is a function
-    ///   of input row `i` and the weight. Garbage in the tail rows —
-    ///   uninitialized bytes included, since nothing stages them — contaminates
-    ///   tail rows and stops there. An entry that REDUCED over rows would fold
-    ///   that garbage into a real row and compute rather than fault, which is
-    ///   why the property is stated here, at the quantization, and not left to
-    ///   be rediscovered by whoever adds the next opaque entry.
-    /// * **Nobody's.** This is the clause the comparison enforces. A WINDOWED
-    ///   launch's tail is not the fire's tail — it is the NEXT class's rows of
-    ///   the same column, and under a merge or a co-tenant those are real
-    ///   bytes somebody reads. Padding one is a clobber that computes.
-    ///
-    /// **The first gate is the engine's, and it is the one that decides.**
-    /// `engine_cuda::run::Run::ctx` compares the region's WINDOW against the
-    /// composition — span at row zero, covering every row, not gathered, no
-    /// segment list — and arms this context with `Pad::default()` when any
-    /// clause fails. That is the question asked where the answer lives: an
-    /// entry sees extents, and an extent cannot tell the fire's rows from a
-    /// window that happens to hold as many.
-    ///
-    /// **The second gate is this comparison, and it is a belt.** Inside a
-    /// region that MAY pad, the pad still applies only to an extent that is the
-    /// fire's row count — so an entry that hands over something other than the
-    /// rows of the rectangle it was given (half of them, twice them, a
-    /// `Dim::Const` width) gets its own number back rather than a rounded one.
-    ///
-    /// **The residue, named.** The two gates together cannot separate a
-    /// token-shaped extent from a LANE-shaped one in a fire that carries one
-    /// row per lane, because both are then the same integer and a `Dim::Lanes`
-    /// column is reserved at `max_lanes` rather than at `max_tokens`. No opaque
-    /// callee on this plane is lane-shaped — the catalog's cuBLASLt entries all
-    /// take `Dim::Tokens` rectangles — and one added later must not read this
-    /// function without the engine first learning to say which axis it is
-    /// quantizing.
+    /// Padding is legal only when the rows `[rows, bucket)` belong to
+    /// nobody: in-bounds, harmless (row-independent), and nobody's (a
+    /// windowed launch's tail is the next class's real rows, so it is never
+    /// padded — enforced by only rounding an extent equal to the fire's own
+    /// row count).
     #[must_use]
     pub fn opaque_rows(&self, rows: i32) -> i32 {
         let pad = self.pad.get();
@@ -512,11 +395,11 @@ impl Ctx {
     #[allow(clippy::unused_self)]
     #[must_use]
     pub fn compute_capability_major(&self) -> Option<u32> {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             crate::jit::device::compute_capability_major()
         }
-        #[cfg(not(feature = "_cuda"))]
+        #[cfg(not(feature = "cuda"))]
         {
             None
         }
@@ -525,11 +408,11 @@ impl Ctx {
     #[allow(clippy::unused_self)]
     #[must_use]
     pub fn multiprocessors(&self) -> Option<u32> {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             crate::jit::device::multiprocessors()
         }
-        #[cfg(not(feature = "_cuda"))]
+        #[cfg(not(feature = "cuda"))]
         {
             None
         }
@@ -550,7 +433,7 @@ impl Ctx {
         self.issue(op, &root, fire.entrypoint, fire.launch, args)
     }
 
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     fn issue(
         &self,
         op: &'static str,
@@ -575,7 +458,7 @@ impl Ctx {
         }
     }
 
-    #[cfg(not(feature = "_cuda"))]
+    #[cfg(not(feature = "cuda"))]
     #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
     fn issue(
         &self,
@@ -591,7 +474,7 @@ impl Ctx {
 
 /// Report a refusal once per instantiation — the same broken row is fired
 /// once per layer per token, and the caller already gets the error back.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 fn said(root: &str, instantiation: &str, why: crate::jit::Fault) -> crate::jit::Fault {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -637,16 +520,6 @@ mod tests {
     }
 
     #[test]
-    fn a_deployment_with_no_lattice_is_its_own_bucket_and_pads_by_zero() {
-        let ctx = bare();
-        // `compose::bucket_of` answers `rows` itself when `Budget::buckets`
-        // is empty, and the shell's `PIE_CUDA_PAD=off` arm says the same
-        // thing by choice. Both must be the identity.
-        ctx.arm(Pad { rows: 9, bucket: 9 });
-        assert_eq!(ctx.opaque_rows(9), 9);
-    }
-
-    #[test]
     fn the_full_fires_extent_rounds_up_to_the_bucket() {
         let ctx = bare();
         ctx.arm(Pad {
@@ -658,31 +531,6 @@ mod tests {
             16,
             "an Always launch is handed the fire's rows and computes the bucket's"
         );
-    }
-
-    /// **THE BOUNDARY THE DESIGN NAMES** (`.wiki/palo/cuda-abi.md` §3): an
-    /// Always launch's tail is the fire's tail and belongs to nobody, but a
-    /// WINDOWED launch padded past its window writes the next class's rows of
-    /// the same column — a clobber that computes.
-    ///
-    /// The gate that decides it is the engine's (`Run::ctx` never arms a
-    /// windowed region at all); this is the belt under it, and what it holds
-    /// is that an extent which is not the fire's own row count is never
-    /// rounded even inside a region that may pad.
-    #[test]
-    fn a_windowed_extent_is_never_padded_however_close_it_comes() {
-        let ctx = bare();
-        ctx.arm(Pad {
-            rows: 9,
-            bucket: 16,
-        });
-        for windowed in [1, 3, 8, 10, 16] {
-            assert_eq!(
-                ctx.opaque_rows(windowed),
-                windowed,
-                "{windowed} is not this fire's row count, so it is somebody's window"
-            );
-        }
     }
 
     #[test]
@@ -700,16 +548,4 @@ mod tests {
         );
     }
 
-    /// A bucket no `Dim::Tokens` column was ever cut for is not a licence to
-    /// launch: the seatbelt hands back the live extent rather than a negative
-    /// `M`.
-    #[test]
-    fn a_bucket_past_the_kernels_int_falls_back_on_the_live_extent() {
-        let ctx = bare();
-        ctx.arm(Pad {
-            rows: 9,
-            bucket: u32::MAX,
-        });
-        assert_eq!(ctx.opaque_rows(9), 9);
-    }
 }

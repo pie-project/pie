@@ -11,9 +11,8 @@ pub mod gate;
 
 pub mod hc;
 
-/// The CENTRED norm: `norm`'s reductions plus the mean subtraction, and no
-/// weight at all. Its own member of the family because it reduces something
-/// else, not because it scales differently.
+/// The centred norm: `norm`'s reductions plus the mean subtraction, and no
+/// weight at all.
 pub mod layernorm;
 
 pub mod norm;

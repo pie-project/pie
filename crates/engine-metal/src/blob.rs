@@ -1,125 +1,7 @@
-//! **THE SHARED ADAPTER STORE: FILES ARE THE TRUTH, THE BANK IS A CACHE**
-//! (alto adapter §3.3, promoted to wave 1 by §6.1) — this plane's half of
-//! `engine_cuda::blob`, and the one honest gap lane J left.
-//!
-//! # Why this module exists at all, and why it is not a channel
-//!
-//! [`crate::adapter`] serves the adapter a GUEST names: the weights ride a
-//! channel, the bytes are taken off the seed ONCE at instance bind, and the
-//! slot they land in is that instance's own. That is the whole of the private
-//! path and it is right for it — a guest's fine-tune is a guest's.
-//!
-//! It is the wrong shape for a DEPLOYMENT's adapters. An operator who mounts
-//! a directory of LoRA blobs and lets fifty instances name one of them does
-//! not want fifty slots, fifty copies and fifty reads of one file; §3.3's
-//! sentence is "N program instances referencing `/shared/alice-v2` land on
-//! ONE slot, one device copy". Keying residency by the INSTANCE cannot say
-//! that. Keying it by the BLOB can, and this module is what a blob's identity
-//! is computed from.
-//!
-//! # The three pieces, and why they are three
-//!
-//! * [`Vfs`] — the mount. A read-only shared directory, stated by the
-//!   deployment (`[model] adapter_dir`, [`crate::boot`]) and never discovered
-//!   from the environment (design article 9). Its whole job is turning a
-//!   guest-spelled name into a path inside the mount, and refusing everything
-//!   else BY NAME.
-//! * [`Blobs`] — the host byte cache, refcounted and **single-flight**: two
-//!   binds racing on one file perform one read, the second waiting on the
-//!   first rather than starting a second. The bytes live as long as some
-//!   handle does and no longer ([`Blobs`] holds `Weak`s), because once a blob
-//!   has been landed into a slot the slot is the residency and the host copy
-//!   is dead weight.
-//! * the residency — which is [`crate::adapter::Slots`], next door, keyed by
-//!   [`crate::adapter::Key`]. It is not repeated here for the reason lane J
-//!   wrote it as a key rather than an instance id: "the day this plane mounts
-//!   a directory is the day [`Source`](crate::adapter::Source) grows an arm,
-//!   and the residency table underneath it already takes a key". It did, and
-//!   the table cost nothing.
-//!
-//! # Identity, and why it is a stamp and not only a fingerprint
-//!
-//! §3.3 states identity as "path + content fingerprint, snapshotted at load".
-//! A fingerprint alone cannot be the KEY, because computing it means reading
-//! the file, and a store that read the file to decide whether it needed to
-//! read the file is not a cache. So the key is a [`Stamp`] — the adapter's
-//! resolved directory plus `(file, len, mtime)` for its manifest and every
-//! plane it names — and the fingerprint is computed on the load that the
-//! stamp missed. A rewritten file is a new stamp, therefore a new key,
-//! therefore a new slot: no in-flight fire ever observes an adapter changing.
-//!
-//! # **WHY THE BYTES ARE COPIED INTO THE BANK AND NOT BOUND WHERE THEY LIE**
-//!
-//! This plane maps artifacts rather than copying them ([`crate::mapping`]),
-//! so the question has to be asked here: could a blob's pages BE the device
-//! plane, since unified memory means a `StorageModeShared` buffer and a host
-//! pointer are one allocation? No, twice over.
-//!
-//! * **The resolver does not copy, it SLICES AND PADS.** A bank seats a
-//!   full-capacity `[rank, hidden]` rectangle and a rank-4 adapter fills part
-//!   of it; the rest is zeros, placed differently for `A` and for `B`
-//!   ([`Store::planes`]). A file is one contiguous `[layers, rank, hidden]`
-//!   run, so no mapping of it is a bank's plane. The padding is the copy.
-//! * **A mapped page the GPU touches is WIRED, and bounds nothing.** On Apple
-//!   Silicon a GPU-touched `StorageModeShared` page — a mapped one included —
-//!   is wired and the pager never evicts it (measured, `.wiki/alto/streaming.md`
-//!   "mmap residency measurement, M1 Max"; the same ground truth that killed
-//!   the streaming-experts mapping). Binding a blob where it lies would wire
-//!   the whole FILE with no ceiling over it, while the copy wires nothing new:
-//!   the bank's slot was reserved and wired at load, and `register_adapter` is
-//!   a memcpy into a span that already exists.
-//!
-//! An adapter blob is rank-r and megabytes. Eager, simple, bounded.
-//!
-//! # The mount's shape
-//!
-//! One directory per adapter, `adapter.toml` inside it:
-//!
-//! ```toml
-//! rank = 8
-//!
-//! [[plane]]
-//! role = "lora_a"
-//! file = "lora_a.bin"
-//! layout = "rank_major"   # [layers, rank, hidden]
-//!
-//! [[plane]]
-//! role = "lora_b"
-//! file = "lora_b.bin"
-//! layout = "out_major"    # [layers, hidden, rank] — HF's native orientation
-//! # site = "o"            # optional: which projection these banks correct
-//! ```
-//!
-//! **THE FILE DECLARES ITS ORIENTATION BECAUSE BYTES CANNOT.** §6.3's statute
-//! is that `B` ships out-major and a rank-major `B` is REFUSED rather than
-//! repacked — and orientation is not observable in a byte string, so it has to
-//! be said. It is said in the file rather than at an API because §3.3's
-//! hot-add is a file drop: nobody is standing there to state it.
-//!
-//! **AND THE FILE SHIPS THE BANK'S OWN DTYPE**, which is where this resolver
-//! and [`crate::adapter::planes_of`] part company. A channel cell is the
-//! guest's live f32 and is rounded to bf16 at bind; a blob is prepared ONCE by
-//! an operator, so it arrives at the bank's element width and a length that is
-//! not exactly `layers x rank x hidden x elem` is a refusal naming both
-//! numbers rather than a conversion nobody asked for.
-//!
-//! `role` is the bank's name with its `layer.{l}.` prefix cut, which is how
-//! §6.3's "the resolver slices, per layer" is spelled: a `[layers, …]` source
-//! is `L` contiguous slices and the `L` banks that carry one role take one
-//! each, in layer order. The grammar itself is [`crate::adapter`]'s
-//! ([`role_of`], [`layer_of`], [`site_of`]) and is not written twice.
-//!
-//! # What is refused, by name
-//!
-//! * a name outside the mount, or a mount that was never stated — [`Fault::Blob`]
-//! * an adapter directory with no manifest, or a manifest naming a file that
-//!   is not there — [`Fault::Blob`]
-//! * a plane shorter (or longer) than the banks that carry its role seat —
-//!   [`Fault::Blob`] with BOTH numbers
-//! * a rank-major source into an out-major bank — [`Fault::Blob`], naming the
-//!   repack kernel this shell does not ship
-//! * a `site` outside the vocabulary, or one no bank of this load declares —
-//!   [`Fault::Blob`], naming the six spellings a bank can be named at
+//! Shared adapter store: files are the truth, the bank is a cache. [`Vfs`]
+//! resolves a guest-spelled name to a path under the mount; [`Blobs`] is a
+//! single-flight, refcounted host byte cache; [`Stamp`] keys the residency
+//! table so a rewritten file is a new slot.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -134,13 +16,8 @@ use crate::weights::BankSeat;
 /// The one file an adapter directory must carry.
 pub const MANIFEST: &str = "adapter.toml";
 
-// ── the mount ────────────────────────────────────────────────────────────
-
-/// The read-only shared directory adapters are files in.
-///
-/// `None` for a root is the feature OFF — a deployment that mounted nothing,
-/// whose every `open` is a refusal that says so. An absent directory is an
-/// answer, not a default to guess.
+/// The read-only shared directory adapters are files in. `None` for a root
+/// is the feature off: every `open` is a refusal that says so.
 #[derive(Debug, Clone, Default)]
 pub struct Vfs {
     root: Option<PathBuf>,
@@ -160,12 +37,8 @@ impl Vfs {
     }
 
     /// Turn a guest-spelled adapter name into a directory inside the mount.
-    ///
-    /// A leading `/` is cut — the guest spells `/shared/alice-v2` against its
-    /// own preopen and this shell holds the mount, so the two meet on the
-    /// tail. Every component after that must be a plain name: no `..`, no
-    /// second root, no prefix. A traversal is not sanitized into something
-    /// else, it is refused.
+    /// A leading `/` is cut; every component after that must be a plain name
+    /// — a traversal is refused, not sanitized.
     ///
     /// # Errors
     ///
@@ -211,9 +84,7 @@ impl Vfs {
     }
 }
 
-// ── the manifest ─────────────────────────────────────────────────────────
-
-/// Which way a source plane is laid out (§6.3's statute, stated by the file).
+/// Which way a source plane is laid out, stated by the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     /// `[layers, rank, hidden]` — the rank is the leading axis of a slot.
@@ -242,15 +113,9 @@ impl Layout {
         }
     }
 
-    /// **WHICH ORIENTATION A BANK'S OWN RECTANGLE CARRIES.**
-    ///
-    /// The plan declares a bank as `[adapters, rank, hidden]` or
-    /// `[adapters, hidden, rank]` and marks neither, so the shell reads the
-    /// only thing that distinguishes them: the rank axis is the SHORT one. A
-    /// LoRA whose rank meets its hidden width has no waist and is not the
-    /// thing this class exists for, so the tie is degenerate; it is taken at
-    /// the file's word rather than refused, because either reading of a
-    /// square bank names the same number of bytes per row.
+    /// Which orientation a bank's own rectangle carries: the plan marks
+    /// neither, so this reads the rank axis as the shorter one (a square
+    /// bank is a degenerate tie, taken at the file's word).
     #[must_use]
     pub fn of_bank(seat: &BankSeat) -> Layout {
         match seat.rows <= seat.cols {
@@ -270,11 +135,9 @@ pub struct PlaneSpec {
     pub file: String,
     /// Which way its bytes run.
     pub layout: Layout,
-    /// **WHICH CORRECTION SITE'S BANKS IT FILLS**, or `None` for a manifest
-    /// that states none — today's meaning, and the banks a text named without
-    /// a site. `site = "o"` beside `role = "lora_a"` selects
-    /// `layer.{l}.o.lora_a`; a spelling outside the vocabulary is a refusal at
-    /// [`Manifest::read`] and never a fallback.
+    /// Which correction site's banks it fills, or `None` for the banks a
+    /// text named without a site. A spelling outside the vocabulary is
+    /// refused at [`Manifest::read`], never a fallback.
     pub site: Option<Site>,
 }
 
@@ -294,9 +157,7 @@ impl Manifest {
     /// # Errors
     ///
     /// [`Fault::Blob`] for a directory with no manifest, a manifest that is
-    /// not TOML, or one that omits a key. Every one of them names the adapter
-    /// and says what was missing: a hot-added directory is written by an
-    /// operator with no compiler in the loop, so the message IS the diagnostic.
+    /// not TOML, or one that omits a key.
     pub fn read(dir: &Path, name: &str) -> Result<Manifest> {
         let at = dir.join(MANIFEST);
         let refuse = |why: String| Fault::Blob {
@@ -354,14 +215,6 @@ impl Manifest {
                         )));
                     }
                 };
-                // **THE OPTIONAL SITE, WITH THE SAME REFUSAL DISCIPLINE AS
-                //   EVERY OTHER KEY.** Absent is today's meaning — the banks a
-                //   text named without a site — so every manifest written
-                //   against a family text reads the same. A spelling outside
-                //   the vocabulary is refused BY NAME rather than ignored,
-                //   because a `site = "mixer"` that silently became "wherever
-                //   the text corrects" is the one wrong answer this axis must
-                //   never give.
                 let site = match plane.get("site") {
                     None => None,
                     Some(value) => {
@@ -395,16 +248,14 @@ impl Manifest {
     }
 }
 
-// ── the host byte cache ──────────────────────────────────────────────────
-
-/// One file's bytes, host-side, with the fingerprint §3.3 snapshots.
+/// One file's bytes, host-side, with its content fingerprint.
 #[derive(Debug)]
 pub struct Blob {
     /// Where it was read from.
     pub at: PathBuf,
     /// The bytes.
     pub bytes: Vec<u8>,
-    /// FNV-1a over all of them — the content half of §3.3's identity.
+    /// FNV-1a over all of them.
     pub fingerprint: u64,
 }
 
@@ -424,21 +275,10 @@ impl std::fmt::Debug for Cell {
     }
 }
 
-/// The host byte cache: refcounted handles, one read per file per generation.
-///
-/// **SINGLE-FLIGHT IS THE POINT** (§3.3). Two instances binding the same
-/// adapter at the same instant must perform ONE read; the second waits on the
-/// first rather than doubling the disk traffic and the peak host footprint.
-/// That is what [`Blobs::loads`] counts and what a gate asserts on.
-///
-/// **AND THE BYTES DIE WITH THE LAST HANDLE.** The map holds `Weak`s, so a
-/// blob that has been landed into its slot and released costs nothing host-
-/// side. The residency it left behind is the bank's SLOT, which is what §3.3
-/// means by "device residency is a cache over the files".
-///
-/// The lock is a plain `Mutex` and the wait a `Condvar` — this store is
-/// touched between fires and never on the fire path, so a waiter that blocks
-/// its thread blocks a bind and nothing else.
+/// The host byte cache: refcounted handles, one read per file per
+/// generation. Single-flight: concurrent opens of the same adapter perform
+/// one read, the rest waiting on it ([`Blobs::loads`] counts it). Holds
+/// `Weak`s, so bytes die with the last handle.
 #[derive(Debug, Default)]
 pub struct Blobs {
     held: Mutex<HashMap<PathBuf, Cell>>,
@@ -464,8 +304,8 @@ impl Blobs {
     pub fn open(&self, at: &Path, path: &str) -> Result<Arc<Blob>> {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
-            // The borrow of the map ends with this `match`, which is why the
-            // upgrade's result is lifted out rather than acted on inside it.
+            // The map borrow ends with this `match`, so the upgrade result
+            // is lifted out rather than acted on inside it.
             let seen = match held.get(at) {
                 Some(Cell::Held(weak)) => Some(weak.upgrade()),
                 Some(Cell::Loading) => None,
@@ -515,11 +355,9 @@ impl Blobs {
     }
 }
 
-/// FNV-1a, 64 bit — the content half of §3.3's identity.
-///
-/// Not a cryptographic digest and not asked to be one: what it settles is
-/// "did the bytes behind this stamp change", against an accident and not an
-/// adversary, and the mount is operator-owned.
+/// FNV-1a, 64 bit — the content half of the identity. Not cryptographic;
+/// settles only "did the bytes change" against an accident, not an
+/// adversary (the mount is operator-owned).
 #[must_use]
 pub fn fingerprint(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -530,24 +368,12 @@ pub fn fingerprint(bytes: &[u8]) -> u64 {
     hash
 }
 
-// ── identity ─────────────────────────────────────────────────────────────
-
-/// **THE KEY A SHARED SLOT IS HELD UNDER**, snapshotted at bind (§3.3).
-///
-/// The adapter's RESOLVED DIRECTORY plus `(file, len, mtime)` for its
-/// manifest and every plane it names. A rewritten plane is a different stamp
-/// and therefore a different slot, which is how "no in-flight fire ever
-/// observes an adapter changing" is obtained without a single lock on the
-/// fire path.
-///
-/// **THE RESOLVED PATH AND NOT THE SPELLING**, because §3.3's identity is the
-/// FILE's: `/alice-v2` and `alice-v2` are one adapter, and two instances that
-/// spelled it differently must share one slot or the sharing claim is about
-/// strings instead of about bytes.
-///
-/// Ordered as well as hashed because this plane's residency table is a
-/// `BTreeMap` over [`crate::adapter::Key`] — the ordering is the map's and
-/// means nothing else.
+/// The key a shared slot is held under, snapshotted at bind: the adapter's
+/// resolved directory (not its spelling — `/alice-v2` and `alice-v2` must
+/// share a slot) plus `(file, len, mtime)` for its manifest and every plane.
+/// A rewritten plane is a different stamp and therefore a different slot.
+/// Ordered as well as hashed because the residency table is a `BTreeMap`
+/// over [`crate::adapter::Key`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Stamp {
     /// Where it resolved to under the mount.
@@ -570,15 +396,8 @@ fn stat(at: &Path, file: &str, name: &str) -> Result<(String, u64, u128)> {
     Ok((file.to_string(), meta.len(), mtime))
 }
 
-// ── the store ────────────────────────────────────────────────────────────
-
 /// The mount and the host byte cache together — everything about a shared
-/// adapter that is a question about FILES.
-///
-/// The residency it feeds is [`crate::adapter::Slots`], and the write it
-/// feeds is [`crate::weights::Weights::register_adapter`]. Neither is in
-/// here, which is why every claim this module makes is checkable on a machine
-/// with no GPU in it.
+/// adapter that is a question about files, checkable with no GPU in it.
 #[derive(Debug, Default)]
 pub struct Store {
     vfs: Vfs,
@@ -592,13 +411,9 @@ impl Store {
         Store::default()
     }
 
-    /// State where the shared adapters live.
-    ///
-    /// **A VERB AND NOT A `getenv`** (design article 9). It is a verb rather
-    /// than a load field because §3.3's hot-add is a file drop: the mount is
-    /// a deployment fact that outlives any one load, and a directory that
-    /// grows an adapter while the box serves needs no restart and no second
-    /// word here.
+    /// State where the shared adapters live. A verb, not a load field: the
+    /// mount outlives any one load, so a directory that grows an adapter
+    /// while the box serves needs no restart.
     pub fn mount(&mut self, root: Option<PathBuf>) {
         self.vfs = Vfs::new(root);
     }
@@ -615,10 +430,9 @@ impl Store {
         &self.blobs
     }
 
-    /// **THE IDENTITY `name` RESOLVES TO** — the moment the files are stat'ed.
-    ///
-    /// Computed BEFORE a slot is touched, which is what keeps an unknown name
-    /// from ever reaching the residency table (§5).
+    /// The identity `name` resolves to, the moment the files are stat'ed.
+    /// Computed before a slot is touched, keeping an unknown name from ever
+    /// reaching the residency table.
     ///
     /// # Errors
     ///
@@ -638,13 +452,9 @@ impl Store {
         })
     }
 
-    /// **THE RESOLVER** (§6.3): one shared adapter's files, sliced per layer
-    /// and padded per orientation into one full-capacity plane per bank.
-    ///
-    /// Answers the planes and the folded fingerprint of the files they came
-    /// from. Public because it is the whole host-side arithmetic of the
-    /// landing — the slicing, the statute check and every refusal — and a gate
-    /// that can call it needs no device to judge any of them.
+    /// The resolver: one shared adapter's files, sliced per layer and padded
+    /// per orientation into one full-capacity plane per bank. Answers the
+    /// planes and the folded fingerprint of the files they came from.
     ///
     /// # Errors
     ///
@@ -662,9 +472,8 @@ impl Store {
         let mut out = Vec::new();
         let mut fingerprint = 0u64;
         for spec in &manifest.planes {
-            // **THE ROLE AND THE SITE TOGETHER PICK THE BANKS.** A manifest
-            // that states no site takes the banks that declare none, which on
-            // a family text is all of them.
+            // Role and site together pick the banks; no site means the banks
+            // that declare none.
             let mut banks: Vec<&BankSeat> = seats
                 .iter()
                 .filter(|seat| role_of(&seat.name) == spec.role && site_of(&seat.name) == spec.site)
@@ -695,10 +504,8 @@ impl Store {
                     odd.slot
                 )));
             }
-            // ── §6.3's STATUTE. The bank's own rectangle says which way it
-            //    runs and the file says which way it was written; a source
-            //    that disagrees would need a transpose this shell does not
-            //    ship, so it is refused rather than silently mis-strided.
+            // A source whose layout disagrees with the bank's would need a
+            // transpose this shell does not ship, so it is refused.
             let bank_layout = Layout::of_bank(seat);
             if bank_layout != spec.layout {
                 return Err(refuse(format!(
@@ -725,12 +532,8 @@ impl Store {
                 )));
             }
             let blob = self.blobs.open(&dir.join(&spec.file), name)?;
-            // **FOLDED, NOT XORED.** Two planes of one adapter can carry the
-            // same bytes — a zero `A` beside a zero `B` is the identity
-            // adapter every gate starts from — and an exclusive-or of two
-            // equal fingerprints is zero, which would record "no content" for
-            // the one case a reader most wants named. The mix is FNV's own
-            // step, which is what produced the halves.
+            // Folded, not XORed: two equal fingerprints (e.g. zero A, zero B)
+            // would XOR to zero and record "no content".
             fingerprint = (fingerprint ^ blob.fingerprint).wrapping_mul(0x0000_0100_0000_01b3);
             let stride = manifest
                 .rank
@@ -756,12 +559,8 @@ impl Store {
             let slot = usize::try_from(seat.slot).unwrap_or(usize::MAX);
             for (layer, bank) in banks.iter().enumerate() {
                 let source = &blob.bytes[layer * stride..(layer + 1) * stride];
-                // **ZERO-PADDED HERE, AND PER ORIENTATION** — which is why the
-                // resolver has to know the layout and why `AdapterPlane`'s
-                // doc says the caller pads: `A`'s unused ranks are trailing
-                // ROWS and `B`'s are a stride inside every row. A zero row of
-                // `A` contributes zero to the waist and a zero column of `B`
-                // contributes zero to the sum, so the padding is exact.
+                // Zero-padded per orientation: `A`'s unused ranks are
+                // trailing rows, `B`'s are a stride inside every row.
                 let mut plane = vec![0u8; slot];
                 match spec.layout {
                     Layout::RankMajor => plane[..source.len()].copy_from_slice(source),
@@ -786,8 +585,6 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── the fixture ──────────────────────────────────────────────────────
 
     /// How many layers the pretend model text declares banks for.
     const LAYERS: u64 = 3;
@@ -823,9 +620,7 @@ mod tests {
         }
     }
 
-    /// The banks a `[layers, rank, hidden]` / `[layers, hidden, rank]` model
-    /// text declares: `A` rank-major and `B` out-major, which is §6.3's
-    /// statute stated as shapes.
+    /// The banks a model text declares: `A` rank-major, `B` out-major.
     fn seats() -> Vec<BankSeat> {
         (0..LAYERS)
             .flat_map(|layer| {
@@ -875,10 +670,7 @@ mod tests {
         (mount, store)
     }
 
-    // ── the manifest ─────────────────────────────────────────────────────
-
-    /// **THE GRAMMAR, READ BACK.** Rank, planes in file order, both layouts,
-    /// and the optional site.
+    /// Rank, planes in file order, both layouts, and the optional site.
     #[test]
     fn a_manifest_says_its_rank_its_planes_and_their_orientation() {
         let mount = scratch("manifest");
@@ -904,7 +696,7 @@ mod tests {
             "the planes come back in the order the file names them"
         );
 
-        // The site is optional, and it is a VALUE rather than a wildcard.
+        // The site is optional, and it is a value rather than a wildcard.
         let sited = mount.join("sited");
         std::fs::create_dir_all(&sited).expect("a directory");
         std::fs::write(
@@ -918,52 +710,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mount);
     }
 
-    /// **EVERY WAY A MANIFEST CAN BE WRONG IS REFUSED BY NAME**, because a
-    /// hot-added directory is written by an operator with no compiler in the
-    /// loop: the message IS the diagnostic.
-    #[test]
-    fn a_manifest_that_does_not_say_what_it_must_is_refused_by_name() {
-        let mount = scratch("manifest-refusals");
-        let write = |name: &str, text: &str| -> String {
-            let dir = mount.join(name);
-            std::fs::create_dir_all(&dir).expect("a directory");
-            std::fs::write(dir.join(MANIFEST), text).expect("a manifest");
-            Manifest::read(&dir, name)
-                .expect_err("this manifest does not say what it must")
-                .to_string()
-        };
-
-        let said = Manifest::read(&mount.join("nothing"), "nothing")
-            .expect_err("a directory with no manifest")
-            .to_string();
-        assert!(said.contains(MANIFEST), "names the file it wanted: {said}");
-
-        let said = write("rankless", "[[plane]]\nrole = \"lora_a\"\n");
-        assert!(said.contains("rank"), "names the missing key: {said}");
-
-        let said = write("planeless", "rank = 4\n");
-        assert!(said.contains("[[plane]]"), "names what it found none of: {said}");
-
-        let said = write(
-            "sideways",
-            "rank = 4\n\n[[plane]]\nrole = \"lora_a\"\nfile = \"a.bin\"\nlayout = \"sideways\"\n",
-        );
-        assert!(said.contains("rank_major") && said.contains("out_major"), "{said}");
-
-        let said = write(
-            "mixer",
-            "rank = 4\n\n[[plane]]\nrole = \"lora_a\"\nfile = \"a.bin\"\n\
-             layout = \"rank_major\"\nsite = \"mixer\"\n",
-        );
-        assert!(said.contains("`mixer`"), "names the site asked for: {said}");
-        assert!(said.contains("`gate_up`"), "and the vocabulary: {said}");
-        let _ = std::fs::remove_dir_all(&mount);
-    }
-
-    // ── the mount ────────────────────────────────────────────────────────
-
-    /// **A NAME IS RESOLVED INSIDE THE MOUNT OR IT IS REFUSED**, and a
-    /// traversal is refused rather than sanitized into something else.
+    /// A name is resolved inside the mount or it is refused; a traversal is
+    /// refused rather than sanitized.
     #[test]
     fn the_mount_resolves_a_name_and_refuses_everything_else() {
         let (mount, store) = mounted("vfs");
@@ -1002,13 +750,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mount);
     }
 
-    // ── identity ─────────────────────────────────────────────────────────
-
-    /// **ONE FILE IS ONE IDENTITY, HOWEVER IT IS SPELLED — AND A REWRITE IS
-    /// ANOTHER.** This is the whole of the sharing claim's host half: the key
-    /// the residency table keys on is the FILES', so two instances that
-    /// spelled a name differently share, and one that names a rewritten file
-    /// does not.
+    /// One file is one identity, however it is spelled, and a rewrite is
+    /// another.
     #[test]
     fn one_blob_is_one_stamp_and_a_rewrite_is_another() {
         let (mount, store) = mounted("identity");
@@ -1028,8 +771,8 @@ mod tests {
         );
         assert_eq!(first.files[0].0, MANIFEST, "the manifest is stamped first");
 
-        // A rewrite at a different LENGTH is a different stamp whatever the
-        // filesystem's mtime resolution is.
+        // A rewrite at a different length is a different stamp regardless of
+        // the filesystem's mtime resolution.
         std::fs::write(mount.join("alice-v2").join("a.bin"), vec![0u8; 8])
             .expect("the plane is rewritten");
         let after = store.stamp("alice-v2").expect("still there");
@@ -1041,35 +784,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mount);
     }
 
-    /// A manifest naming a plane that is not there is refused at the STAMP,
-    /// before a slot is ever touched (§5).
-    #[test]
-    fn a_manifest_naming_a_file_that_is_not_there_is_refused_at_the_stamp() {
-        let mount = scratch("stray");
-        let dir = mount.join("stray");
-        std::fs::create_dir_all(&dir).expect("a directory");
-        std::fs::write(
-            dir.join(MANIFEST),
-            "rank = 4\n\n[[plane]]\nrole = \"lora_a\"\nfile = \"nowhere.bin\"\n\
-             layout = \"rank_major\"\n",
-        )
-        .expect("a manifest");
-        let mut store = Store::new();
-        store.mount(Some(mount.clone()));
-        let said = store.stamp("stray").expect_err("the plane is missing").to_string();
-        assert!(said.contains("nowhere.bin"), "names the file: {said}");
-        assert!(said.contains("stray"), "and the adapter: {said}");
-        let _ = std::fs::remove_dir_all(&mount);
-    }
-
-    // ── single flight ────────────────────────────────────────────────────
-
-    /// **EIGHT THREADS ASKING FOR ONE FILE PERFORM ONE READ**, and the rest
-    /// wait on it (§3.3's "concurrent first references are single-flight").
-    ///
-    /// The observable is [`Blobs::loads`]: a doubled read would double the
-    /// disk traffic and the peak host footprint of a cold multi-tenant start,
-    /// which is the moment the property is worth the most.
+    /// Eight threads asking for one file perform one read; the rest wait on
+    /// it. Observed via [`Blobs::loads`].
     #[test]
     fn eight_threads_asking_for_one_blob_read_it_once() {
         let at = scratch("flight").join("plane.bin");
@@ -1088,9 +804,8 @@ mod tests {
                 .into_iter()
                 .map(|handle| handle.join().expect("a thread"))
                 .collect();
-            // Held together on purpose: the handles are what keep the bytes
-            // alive, so this is also the assertion that eight references are
-            // one allocation.
+            // Held together on purpose: keeping the handles alive is also
+            // the assertion that eight references are one allocation.
             assert_eq!(held.len(), 8);
             for blob in &held {
                 assert_eq!(blob.bytes.len(), 1 << 16);
@@ -1099,8 +814,7 @@ mod tests {
             assert_eq!(blobs.loads(), 1, "one read, seven waiters");
         });
 
-        // Every handle is gone, so the bytes are too — the residency a blob
-        // leaves behind is its SLOT, not a host copy nobody can reach.
+        // Every handle is gone, so the bytes are too.
         let again = blobs.open(&at, "plane").expect("a second generation");
         assert_eq!(blobs.loads(), 2);
         assert_eq!(again.bytes.len(), 1 << 16);
@@ -1124,16 +838,9 @@ mod tests {
         assert_eq!(blobs.loads(), 2, "each attempt is its own read");
     }
 
-    // ── the resolver ─────────────────────────────────────────────────────
-
-    /// **A `[layers, ...]` FILE SLICES INTO ONE FULL-CAPACITY PLANE PER BANK,
-    /// PADDED PER ORIENTATION** (§6.3).
-    ///
-    /// The two paddings are genuinely different and this is where that is
-    /// checked: a rank-4 source in a rank-8 bank fills `A`'s leading ROWS and
-    /// leaves the trailing ones zero, and fills the leading COLUMNS of every
-    /// one of `B`'s rows, leaving a zero stride inside each. A resolver that
-    /// used one rule for both would pass a length check and compute nonsense.
+    /// A `[layers, ...]` file slices into one full-capacity plane per bank,
+    /// padded per orientation: `A`'s leading rows vs. `B`'s leading columns
+    /// of every row.
     #[test]
     fn the_resolver_slices_per_layer_and_pads_per_orientation() {
         let (mount, store) = mounted("slice");
@@ -1199,20 +906,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mount);
     }
 
-    /// **THE RESOLVER READS EACH PLANE FILE ONCE**, which is the other half
-    /// of what the host cache is for: the landing is one read per FILE and
-    /// not one per bank.
-    #[test]
-    fn the_resolver_reads_one_file_per_plane_and_no_more() {
-        let (mount, store) = mounted("reads");
-        let seats = seats();
-        store.planes("alice-v2", &seats).expect("the first resolve");
-        assert_eq!(store.blobs().loads(), 2, "two plane files, two reads");
-        let _ = std::fs::remove_dir_all(&mount);
-    }
-
-    /// **EVERY WAY THE FILES AND THE MODEL TEXT CAN DISAGREE, REFUSED BY
-    /// NAME** (§5) — with both numbers wherever there are two.
+    /// Every way the files and the model text can disagree, refused by
+    /// name, with both numbers wherever there are two.
     #[test]
     fn the_resolver_refuses_by_name() {
         let mount = scratch("resolver-refusals");

@@ -11,14 +11,11 @@ use crate::executor::ModelIdentity;
 
 use crate::executor;
 
-// `palo B-remote`: every field below is read by the dial path, which refuses
-// at its first line until the envelope exists (see `PartnerLinkManager::dial`
-// and `crate::executor`'s header). They are kept because they are what the
-// handshake states, and deleting them would make the next wave rediscover
-// which numbers a partner link needs.
+// fields read by the dial handshake once it exists; kept so a future
+// implementation doesn't need to rediscover which numbers it needs.
 #[allow(
     dead_code,
-    reason = "read by the dial handshake, which is palo B-remote"
+    reason = "read by the dial handshake once remote executors are supported"
 )]
 pub(crate) struct PartnerBootstrap {
     pub full_identity: ModelIdentity,
@@ -42,15 +39,14 @@ struct ClientNixl {
 struct PartnerLink {
     peer: NeighborPeer,
     engine_id: Option<usize>,
-    disconnect: Option<::runtime::engine::RemoteDisconnectHandle>,
-    role: ::runtime::offload::PartnerRole,
-    partner: std::sync::Arc<::runtime::offload::Partner>,
+    disconnect: Option<runtime::engine::RemoteDisconnectHandle>,
+    role: runtime::offload::PartnerRole,
+    partner: std::sync::Arc<runtime::offload::Partner>,
 }
 
 pub(crate) struct PartnerLinkManager {
-    /// This worker's own id, which the handshake's client nonce is.
-    /// See the note on [`PartnerBootstrap`].
-    #[allow(dead_code, reason = "read by the dial handshake, which is palo B-remote")]
+    /// This worker's own id; the handshake's client nonce.
+    #[allow(dead_code, reason = "read by the dial handshake once remote executors are supported")]
     worker_id: WorkerId,
     config: PartnerBootstrap,
     links: HashMap<WorkerId, PartnerLink>,
@@ -140,10 +136,8 @@ impl PartnerLinkManager {
         {
             return false;
         }
-        // palo B-remote: the liveness probe was one `LoadedModel` round trip.
-        // The envelope must carry a cheap "are you still serving the model
-        // you said you were" question, because a peer that answered a fire
-        // wrongly is worse than one that answered nothing.
+        // liveness probe needs a cheap "still serving the model" check; a
+        // wrong answer is worse than none.
         let healthy = false;
         if healthy
             && link
@@ -157,46 +151,30 @@ impl PartnerLinkManager {
         false
     }
 
-    /// Dial a controller-assigned executor partner.
+    /// Dial a controller-assigned executor partner. Not yet implemented.
     ///
-    /// # `palo B-remote`
-    ///
-    /// What stood here was the whole client handshake: a tarpc connect, a
-    /// `HelloRequest` carrying this worker's `REMOTE_WIRE_VERSION`, model
-    /// identity, `KvLayout` and (under NIXL) its own registered KV handle; a
-    /// `HelloResponse` whose scratch grant was range-checked against the
-    /// peer's advertised pool; then `register_remote_store`,
-    /// `register_engine_backend` with a `RemoteEngine` over the client, and
-    /// `spawn_engine`. Every noun in it lived in `engine::remote`.
-    ///
-    /// It refuses at the top rather than part way through, because a
-    /// half-dialled partner is a registered `EngineId` with no transport
-    /// behind it, and the offload planner would then select it.
-    ///
-    /// The envelope's own requirements are listed in `crate::executor`'s
-    /// header. What THIS half additionally needs: the grant's page range must
-    /// be validated against the peer's pool before any page id is minted
-    /// against it (`grant.end_page() <= capabilities.total_pages`, and a
-    /// ceiling on `grant.num_pages`), because those ids go straight into a
-    /// `KvCopy` this worker builds.
+    /// Once implemented, the grant's page range must be validated against
+    /// the peer's pool before any page id is minted against it
+    /// (`grant.end_page() <= capabilities.total_pages`), since those ids feed
+    /// a `KvCopy` this worker builds.
     ///
     /// # Errors
     ///
-    /// Always, until the envelope exists.
+    /// Always, until implemented.
     async fn dial(&self, peer: NeighborPeer) -> Result<PartnerLink> {
         let role = match peer.role {
-            Role::Prefill => ::runtime::offload::PartnerRole::Prefill,
-            Role::Encode => ::runtime::offload::PartnerRole::Encode,
+            Role::Prefill => runtime::offload::PartnerRole::Prefill,
+            Role::Encode => runtime::offload::PartnerRole::Encode,
             Role::Decode => anyhow::bail!("decode peer is not an executor partner"),
         };
         let identity = match role {
-            ::runtime::offload::PartnerRole::Prefill => self.config.full_identity.clone(),
-            ::runtime::offload::PartnerRole::Encode => self.config.encode_identity.clone(),
+            runtime::offload::PartnerRole::Prefill => self.config.full_identity.clone(),
+            runtime::offload::PartnerRole::Encode => self.config.encode_identity.clone(),
         };
         let _ = (identity, &self.config.kv_layout, self.config.transfer);
         executor::connect_with_local_ip(&peer.addr).await?;
         Err(anyhow!(
-            "executor partner {} at {} cannot be dialled: palo B-remote",
+            "executor partner {} at {} cannot be dialled: remote executors are not supported in this release",
             peer.id,
             peer.addr
         ))
@@ -209,7 +187,7 @@ impl PartnerLinkManager {
         if let Some(disconnect) = &link.disconnect {
             disconnect.disconnect(reason.to_string());
         }
-        ::runtime::offload::remove_partner(worker_id.0, link.role);
+        runtime::offload::remove_partner(worker_id.0, link.role);
         let model_idx = self.config.model_idx;
         let cleanup = tokio::spawn(async move {
             link.partner.wait_drained().await;
@@ -230,8 +208,8 @@ fn finish_cleanup(worker_id: WorkerId, link: PartnerLink, model_idx: usize) {
     let Some(engine_id) = link.engine_id else {
         return;
     };
-    ::runtime::offload::close_engine_surrogates(engine_id);
-    if let Err(error) = ::runtime::scheduler::stop_engine(engine_id) {
+    runtime::offload::close_engine_surrogates(engine_id);
+    if let Err(error) = runtime::scheduler::stop_engine(engine_id) {
         tracing::warn!(
             partner = %worker_id,
             engine_id,
@@ -239,7 +217,7 @@ fn finish_cleanup(worker_id: WorkerId, link: PartnerLink, model_idx: usize) {
             "stopping remote scheduler"
         );
     }
-    if let Err(error) = ::runtime::offload::unregister_remote_store(model_idx, engine_id) {
+    if let Err(error) = runtime::offload::unregister_remote_store(model_idx, engine_id) {
         tracing::warn!(
             partner = %worker_id,
             engine_id,
@@ -247,7 +225,7 @@ fn finish_cleanup(worker_id: WorkerId, link: PartnerLink, model_idx: usize) {
             "unregistering remote store"
         );
     }
-    if let Err(error) = ::runtime::engine::unregister_engine(engine_id) {
+    if let Err(error) = runtime::engine::unregister_engine(engine_id) {
         tracing::warn!(
             partner = %worker_id,
             engine_id,
@@ -300,7 +278,7 @@ impl Drop for PartnerLinkManager {
             if let Some(disconnect) = &link.disconnect {
                 disconnect.disconnect("partner manager dropped");
             }
-            ::runtime::offload::remove_partner(worker_id.0, link.role);
+            runtime::offload::remove_partner(worker_id.0, link.role);
             let _ = std::thread::Builder::new()
                 .name(format!("pie-partner-cleanup-{}", worker_id.0))
                 .spawn(move || {

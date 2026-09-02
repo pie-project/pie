@@ -16,10 +16,10 @@
 //!   `attention.masked` arm, and which run a `linear.lora_correct` one.
 //! * [`regions_shifting`] — the op vocabulary read a third time and answered
 //!   PER REGION instead of per class: which regions hold nothing but ops that
-//!   address off the staged seat's start ([`crate::SHIFTED`]), and can
+//!   address off the staged seat's start ([`crate::shifted`]), and can
 //!   therefore be replayed somewhere other than the fire's row zero.
 //! * [`regions_lane_shifting`] — the same reading one AXIS over
-//!   ([`crate::LANE_SHIFTED`]): which regions hold nothing but ops that find
+//!   ([`crate::lane_shifted`]): which regions hold nothing but ops that find
 //!   their own LANE inside the fire, and can therefore be replayed somewhere
 //!   other than the fire's lane zero.
 //!
@@ -245,38 +245,59 @@ pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> model_ir
     })
 }
 
-/// The classes whose window runs an `attention.decode` arm — the DECODE
-/// classes, in the only vocabulary this shell has for the word.
-///
-/// [`masked_classes`]'s third twin, read off the same template for the same
-/// reason, and it exists because the bodies path's load-time arming
-/// (`Shell::arm_bodies`) has to synthesize a decode composition before any
-/// fire has shown it one. A shell cannot compute a lane's fact word — the
-/// word comes from the model's own `Classify::of`, runtime-side (decision
-/// #18), and which bit is `qo_one` stays the model's business — so "the
-/// decode class" cannot be asked as a question about bits. It can be asked as
-/// a question about OPS, and this is that question: a class whose window runs
-/// the one-query-row attention arm is a class a decode lane lands in, and
-/// `Class::word` then names a word that resolves back to it.
-///
-/// A SET rather than one class, because a bake may split the decode world
-/// further — masked decode beside plain, corrected beside uncorrected — and
-/// each of those is a composition of its own with a body of its own. Empty
-/// for a plan with no `attention.decode` arm at all (a purely recurrent text,
-/// say), and then load-time arming has nothing to aim at and arms nothing.
+/// Every request shape, classified by the model: per class, the requests
+/// that land in it, fewest flags first. A class no request reaches is one
+/// no caller can bring, and the arming pass does not synthesize it.
 #[must_use]
-pub(crate) fn decoding_classes(trace: &Trace, compiled: &CompiledModel) -> model_ir::ClassSet {
-    classes_running(trace, compiled, |op| {
-        matches!(
-            op,
-            model_ir::Operation::Attention(model_ir::Attention::Decode { .. })
-        )
-    })
+pub(crate) fn landing_requests(
+    classify: model_ir::ClassifyFn,
+    classes: &model_ir::ClassTable,
+) -> Vec<Vec<model_ir::Request>> {
+    let mut landing = vec![Vec::new(); classes.classes.len()];
+    for bits in 0..64u32 {
+        let request = model_ir::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
+            .adapted(bits & 4 != 0)
+            .drafting(bits & 8 != 0)
+            .capturing_scores(bits & 16 != 0)
+            .with_media(bits & 32 != 0);
+        let word = classify(&request) & classes.mask;
+        if let Some(class) = classes.class_of(word) {
+            landing[class].push(request);
+        }
+    }
+    for requests in &mut landing {
+        requests.sort_by_key(request_flags);
+    }
+    landing
+}
+
+fn request_flags(request: &model_ir::Request) -> u32 {
+    u32::from(request.query_len() != 1)
+        + u32::from(request.has_custom_mask())
+        + u32::from(request.has_adapter())
+        + u32::from(request.drafts())
+        + u32::from(request.captures_scores())
+        + u32::from(request.has_media())
+}
+
+/// The DECODE classes: every request that lands in one carries a single
+/// row, so a lane of it is one row and its rung is the lane ceiling.
+#[must_use]
+pub(crate) fn decoding_of(landing: &[Vec<model_ir::Request>]) -> model_ir::ClassSet {
+    model_ir::ClassSet::of(
+        landing
+            .iter()
+            .enumerate()
+            .filter(|(_, requests)| {
+                !requests.is_empty() && requests.iter().all(|request| request.query_len() == 1)
+            })
+            .map(|(class, _)| class),
+    )
 }
 
 /// **WHICH TEMPLATE REGIONS CAN MOVE THEIR OWN BASE** — one `bool` per
 /// region of [`CompiledModel::template`], in region order, `true` when EVERY
-/// op in it is named by [`crate::SHIFTED`].
+/// op in it is named by [`crate::shifted`].
 ///
 /// [`masked_classes`]'s and [`corrected_classes`]'s structural twin — the
 /// same walk of the same template testing the same node ops — and it differs
@@ -309,7 +330,7 @@ pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<b
             region.nodes.clone().all(|node| {
                 trace.nodes.get(node as usize).is_some_and(|node| {
                     let name = model_ir::Operands::name(&node.op);
-                    crate::SHIFTED.contains(&name) || crate::PLANNED.contains(&name)
+                    crate::shifted(name) || crate::PLANNED.contains(&name)
                 })
             })
         })
@@ -318,7 +339,7 @@ pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<b
 
 /// **WHICH TEMPLATE REGIONS FIND THEIR OWN LANE** — one `bool` per region of
 /// [`CompiledModel::template`], in region order, `true` when every op in it
-/// either is named by [`crate::LANE_SHIFTED`] / [`crate::PLANNED`] or NAMES
+/// either is named by [`crate::lane_shifted`] / [`crate::PLANNED`] or NAMES
 /// NOTHING THAT IS LANE-INDEXED.
 ///
 /// [`regions_shifting`]'s twin one axis over, and everything that function's
@@ -340,7 +361,7 @@ pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<b
 /// refusing it would cost a body for no hazard.
 ///
 /// **WHICH LEAVES EXACTLY TWO WAYS TO PASS**, and they are the two
-/// [`crate::LANE_SHIFTED`] enumerates and the one this walk adds:
+/// [`crate::lane_shifted`] enumerates and the one this walk adds:
 ///
 /// * the op is on that list, so the tables it names are handed over WHOLE and
 ///   it finds its lane in a staged datum or off the seat's `win[3]`;
@@ -376,7 +397,7 @@ fn lane_shifting_node(trace: &Trace, node: u32) -> bool {
         return false;
     };
     let name = Operands::name(&node.op);
-    if crate::LANE_SHIFTED.contains(&name) || crate::PLANNED.contains(&name) {
+    if crate::lane_shifted(name) || crate::PLANNED.contains(&name) {
         return true;
     }
     // **INPUTS AND OUTPUTS BOTH**, `window::copyable`'s reason exactly: a
@@ -450,4 +471,3 @@ fn classes_running(
     }
     classes
 }
-

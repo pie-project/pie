@@ -1,28 +1,5 @@
-//! The shell's answer vocabulary: one enum, one `Result`, and the rule that
-//! a refusal names what refused.
-//!
-//! The split this file keeps is the dispatch contract's, restated one layer
-//! up: a [`KernelError`] is about the BACKEND — a geometry no shader is stamped
-//! for, a dtype no entry carries — and a [`Fault`] is about the SHELL: a
-//! device that would not allocate, a checkpoint that does not answer the
-//! plan, a count past a reserved ceiling. Integrity failures of the compiler
-//! or of this crate's own tables are neither; they panic with a sentence,
-//! because dressing a bug as a refusal teaches a caller to retry it.
-//!
-//! **`Device` carries a call name and a message, where the CUDA shell's
-//! twin carries a call name and an `i32`.** That is the platforms
-//! disagreeing rather than the shells: a CUDA entry point returns a status
-//! code from a closed ladder, and a Metal one returns `nil` beside an
-//! `NSError` whose `localizedDescription` is the only description of what
-//! went wrong. A shader that fails to compile says so in a paragraph with
-//! line numbers in it, and throwing that away for a number would be the
-//! worst trade in this file.
-//!
-//! **A THIRD VOCABULARY ARRIVES FROM BELOW** and is translated rather than
-//! carried: `kernels_metal::Error`, which the kernel library kept when the
-//! crate it shared with the contract was taken apart. [`kernel`] at the foot
-//! of this file is that seam, and its doc says why it is a function where a
-//! `From` impl would read better.
+//! The shell's error vocabulary: [`KernelError`] is about the backend,
+//! [`Fault`] is about the shell.
 
 use std::fmt;
 
@@ -31,9 +8,7 @@ use model_exec::KernelError;
 /// Every way this shell answers "no".
 #[derive(Debug)]
 pub enum Fault {
-    /// This build has no Metal in it — a non-Apple target. Every device
-    /// entry answers this, which is what lets the call-order code above be
-    /// type-checked by a workspace sweep on Linux.
+    /// No Metal in this build — a non-Apple target.
     Deviceless,
 
     /// A Metal call refused, and this is what it said.
@@ -65,16 +40,9 @@ pub enum Fault {
         have: u64,
     },
 
-    /// **A LANE WHOSE MEDIA GEOMETRY AND MEDIA PAYLOAD DISAGREE**
-    /// (multimodal §5.1, media-door §6).
-    ///
-    /// Every length here is a function of the lane's payload row count AND a
-    /// number only this shell holds — the plan's declared patch row width, its
-    /// position-table tap count, this fire's own token rows — which is exactly
-    /// the set `engine::fire::StepMedia::validate` cannot check and
-    /// deliberately does not. So the contract checks what it can and this
-    /// names the rest, with the vector it was: a submission that disagrees
-    /// with itself is refused before a row is seriated.
+    /// A lane's media geometry and media payload disagree — a check
+    /// `engine::fire::StepMedia::validate` cannot make since it needs shell-
+    /// only numbers (patch row width, position-table tap count).
     PatchPayload {
         /// Which lane of the submission.
         lane: u32,
@@ -93,16 +61,6 @@ pub enum Fault {
     Load(checkpoint::error::Error),
 
     /// The fire substrate refused the batch, or a dispatch refused the op.
-    ///
-    /// **IT USED TO CARRY A THIRD THING AND SHOULD NOT HAVE.** The substrate
-    /// was one crate with one `Error` enum, and its `Program { message }`
-    /// variant — a launch program the ETA interpreter could not read — arrived
-    /// here as a `Fire` like any other. `fault()` sorts `Fire` to
-    /// `Error::Invalid` and the guest-program refusals to `Error::Program`, so
-    /// every interpreter refusal crossed the contract wearing the wrong noun,
-    /// and a holder of this variant had to match an inner enum to find out
-    /// which. The substrate is two crates now and so is this: what is left
-    /// here is a batch the artifact cannot describe, and nothing else.
     Fire(model_exec::Error),
 
     /// A param the plan names that the checkpoint never published, or
@@ -114,24 +72,15 @@ pub enum Fault {
         why: &'static str,
     },
 
-    /// A region's classes are not one run AND the artifact owes it no answer —
-    /// P4's promise broke, and a windowed encode would read somebody else's
-    /// rows.
-    ///
-    /// **NOT THE SLOW PATH, WHICH IS SERVED.** P4 writes a `Fallback` row for
-    /// every consumer it could not seat, and such a region is encoded once per
-    /// interval of its window (`crate::window::Windows`,
-    /// `model_exec::fire::fallback`). What is left here is the case where the bake
-    /// and the fire disagree: a mask P4 promised consecutive that came back in
-    /// pieces, or one whose pieces outnumber the `Fallback::Split { r }` P4
-    /// counted on the order it shipped. Neither can happen to a `CompiledModel` and a
-    /// `WindowTable` built from each other.
+    /// A region's classes are not one run and the artifact owes it no
+    /// fallback: the bake and the fire disagree about the compiler's
+    /// consecutiveness promise.
     Fragmented {
         /// The template region.
         region: u32,
         /// How many runs its class mask fell into in this fire.
         runs: usize,
-        /// How many P4 wrote down, or `None` when it wrote nothing at all —
+        /// How many the compiler wrote down, or `None` when it wrote nothing at all —
         /// which is the promise being broken rather than exceeded.
         promised: Option<u32>,
     },
@@ -148,12 +97,8 @@ pub enum Fault {
         consumed: String,
     },
 
-    /// A lane's stated mask does not REACH the extent it will read.
-    ///
-    /// Short only. A mask longer than the extent is the page-padded shape
-    /// every masked guest states — the pool's width, not the sequence's — and
-    /// is clipped, because a position past the extent is one the causal bound
-    /// drops for every query row anyway. [`crate::mask`] argues it.
+    /// A lane's stated mask does not reach the extent it will read (a longer
+    /// mask is fine and gets clipped).
     Mask {
         /// The lane, in submission order.
         lane: u32,
@@ -164,32 +109,13 @@ pub enum Fault {
     },
 
     /// A lane carries a mask and this artifact bakes no masked class.
-    ///
-    /// The ARTIFACT's answer, not the plane's: `attention.masked` is a live
-    /// entry here and [`crate::mask`] stages both forms, so what is missing
-    /// when this is raised is a window for the rows to run in — a model text
-    /// that never states the masked arm has nowhere to put a masked lane, and
-    /// the unmasked continuation is the wrong answer that would look right.
     Maskless {
         /// The lane, in submission order.
         lane: u32,
     },
 
-    /// A lane's PER-ROW mask (`Masking::Rows`) states a different number of
+    /// A lane's per-row mask (`Masking::Rows`) states a different number of
     /// rows than the lane feeds.
-    ///
-    /// **THE FORM EXPANDS; THE HEIGHT IS WHAT IS REFUSED.** A windowed
-    /// prefill states one restriction per query row — row `i` keeps
-    /// `[i - w, i]` — and [`crate::mask`] walks each row under its own causal
-    /// bound, as the CUDA sibling does. What has no reading is a vector of
-    /// some other length: `Masking::Rows` is parallel to `Lane::tokens`, so a
-    /// short one would leave rows with no restriction and a long one would
-    /// state restrictions for rows nobody fires. The reading it would be
-    /// tempting to invent — row zero's mask on every row — is the silent
-    /// substitution the whole form exists to end, so the count is named here
-    /// instead. This sits BESIDE [`Fault::Maskless`] because they are
-    /// different sentences: that one is about the ARTIFACT having no masked
-    /// class, this one about the submission's own shape.
     MaskRows {
         /// The lane, in submission order.
         lane: u32,
@@ -199,20 +125,9 @@ pub enum Fault {
         rows: u32,
     },
 
-    /// A lane states its own token positions and states a different number
-    /// of them than it feeds tokens.
-    ///
-    /// **THE ONLY CHECK A STATED RUN GETS, AND IT IS THE ONLY ONE THERE IS AN
-    /// ANSWER TO.** Positions reach exactly one place on this plane — rope's
-    /// seat, one `i32` per fire row — so a vector of the lane's height is
-    /// servable whatever is in it, and the two neighbouring temptations are
-    /// both wrong: padding a short one would rotate the tail at position
-    /// zero, and clipping a long one would silently agree with a caller that
-    /// disagrees with the composition about how many rows this lane has.
-    /// Monotonicity and a page bound are NOT checked, and deliberately: the
-    /// page CSR and the write descriptors are carved from `held` and the row
-    /// count, never from this, so a non-monotone run is a rotation the caller
-    /// meant (an mRoPE lane, a re-fed rejected draft) and not a geometry.
+    /// A lane states its own token positions and a different number of them
+    /// than it feeds tokens. Monotonicity is deliberately not checked here —
+    /// a non-monotone run is a caller's rotation, not a geometry error.
     Positions {
         /// The lane, in submission order.
         lane: u32,
@@ -232,30 +147,15 @@ pub enum Fault {
         runs_masked_arm: bool,
     },
 
-    /// An adapted lane in a fire whose loaded artifact bakes no correction.
-    ///
-    /// [`Fault::Maskless`]'s twin, for the axis beside it and for the same
-    /// reason: an adapter bank is a seat the model text either declares or
-    /// does not (design §8), and a lane routed against a plan with no
-    /// `linear.lora_correct` arm would get the base model's answer under an
-    /// adapter's name. Named against the BAKE rather than against the class,
-    /// because when the correction is absent from the artifact no word could
-    /// have put the lane inside it.
+    /// An adapted lane in a fire whose loaded artifact bakes no correction
+    /// arm, so it would get the base model's answer under an adapter's name.
     Adapterless {
         /// The lane, in submission order.
         lane: u32,
     },
 
-    /// A lane whose fact word and whose adapter do not agree, in either
-    /// direction.
-    ///
-    /// [`Fault::MaskWord`]'s twin. The word chooses the class and the class
-    /// chooses whether this lane's rows fall inside the correction's WINDOW,
-    /// which is what design §8 means by "a correction op over the adapter
-    /// window". A lane inside the window with no adapter id would send the
-    /// arm at a routes vector this fire never staged; a lane outside it
-    /// carrying one would have its id staged and never read, and answer with
-    /// the base model's continuation under the adapter's name.
+    /// A lane whose fact word and whose adapter disagree: the word's class
+    /// decides whether the lane's rows fall inside the correction's window.
     AdapterWord {
         /// The lane, in submission order.
         lane: u32,
@@ -265,13 +165,8 @@ pub enum Fault {
         runs_correction: bool,
     },
 
-    /// A guest program this device would not compile.
-    ///
-    /// Carries `eta_exec::Failure`'s own split — a `Deterministic` refusal is
-    /// remembered forever (the source will not compile on this device, ever)
-    /// and a `Retryable` one is not (the machine was out of something). On
-    /// this plane the split comes off `MTLLibraryError`: a compile failure
-    /// is the source's, and anything else is the moment's.
+    /// A guest program this device would not compile: `eta_exec::Failure`'s
+    /// `Deterministic` vs `Retryable` split.
     Compile(eta_exec::Failure),
 
     /// The guest-program plane refused a call, and this is where and why.
@@ -282,31 +177,13 @@ pub enum Fault {
         why: String,
     },
 
-    /// The ETA substrate refused a launch program, in its own words.
-    ///
-    /// [`Fault::Program`] above is THIS crate's refusals about the guest-
-    /// program plane — a door here, spelled the way the rest of this enum
-    /// spells one. This is the substrate's, forwarded whole: a package whose
-    /// values do not resolve, an op the interpreter does not know, a channel
-    /// the plan does not declare. It is a separate variant because it is a
-    /// separate author, and it carries the error rather than a string because
-    /// the type is the only thing that says which author it was.
-    ///
-    /// Both sort to `Error::Program` at the contract, which is the point: the
-    /// crossing this replaces sorted to `Error::Invalid`, by riding inside
-    /// [`Fault::Fire`].
+    /// The ETA substrate refused a launch program, distinct from
+    /// [`Fault::Program`] (this crate's own guest-program refusals). Both
+    /// sort to `Error::Program` at the contract.
     Interpret(eta_exec::Error),
 
-    /// An adapter registration this load's banks cannot seat.
-    ///
-    /// **THE REGISTRATION'S REFUSAL, AND NOT THE AXIS'S.** A bank is a
-    /// `ParamSource::Registered` weight, so [`Weights`](crate::Weights)
-    /// reserves and zeroes one for any plan that declares it; this names the
-    /// three ways a caller's planes fail to describe it — a bank name the
-    /// plan never declared, an id past the capacity the model text stated,
-    /// and a plane that is not one whole slot. The axis's own two refusals
-    /// are [`Fault::Adapterless`] and [`Fault::AdapterWord`], which are about
-    /// a FIRE and not about a write.
+    /// An adapter registration this load's banks cannot seat: an undeclared
+    /// bank name, an id past capacity, or a plane that is not one whole slot.
     Adapter {
         /// The bank, as the plan's param names it.
         bank: String,
@@ -314,16 +191,8 @@ pub enum Fault {
         why: String,
     },
 
-    /// A shared adapter the mount, the manifest or the model text refuses.
-    ///
-    /// **THE DEPLOYMENT'S REFUSAL, AND NOT THE REGISTRATION'S.**
-    /// [`Fault::Adapter`] is about planes a caller built and handed over;
-    /// this is about FILES — a name that leaves the mount or is not in it, a
-    /// directory with no `adapter.toml`, a manifest naming a plane that is
-    /// not there or an orientation this shell will not repack, a plane whose
-    /// length is not the banks' rectangle. Every one of them is fixed by
-    /// writing different files, which is why they carry the adapter's name as
-    /// the bind spelled it rather than a bank's.
+    /// A shared adapter the mount, manifest or model text refuses — missing
+    /// file, directory, or plane mismatch.
     Blob {
         /// The adapter, as the bind spelled it.
         path: String,
@@ -332,29 +201,14 @@ pub enum Fault {
     },
 
     /// Every adapter slot this load's banks seat is pinned by a live bind.
-    ///
-    /// **A REFUSAL AND NOT AN EVICTION.** A slot's contents are read by a
-    /// fire that may be in flight, so taking one back from under a live bind
-    /// would answer somebody else's adapter under this one's name — the
-    /// silently-wrong answer the whole axis is written against. Capacity is
-    /// the model text's ([`Weights::adapter_seats`](crate::Weights)), so the
-    /// fix is a text that seats more, or a caller that closes the instances
-    /// it is done with.
+    /// A refusal, not an eviction: a slot in flight is never taken back.
     AdapterSlots {
         /// How many slots the banks seat.
         seats: u32,
     },
 
-    /// A quantity the ICB would have to rewrite per fire, and no affine law
-    /// over the descriptor's own numbers predicts it.
-    ///
-    /// **THE CONSTRUCTIVE FORM OF A REFUSAL** (`.wiki/palo/icb.md` §3): the
-    /// binding recipe is derived by walking one template against several
-    /// synthetic descriptors and fitting each moving component to
-    /// `v = base + Σ slope·axis`. A component that moves and does not fit is
-    /// named here rather than guessed at, because a wrong slope is a grid
-    /// that reads past a rectangle and no test between here and the tokens
-    /// would say so.
+    /// A quantity the ICB would rewrite per fire, and no affine law
+    /// (`v = base + sum(slope*axis)`) predicts it.
     Unaffine {
         /// The slot, in walk order — which is dispatch order and ICB index.
         slot: u32,
@@ -367,13 +221,8 @@ pub enum Fault {
         why: String,
     },
 
-    /// Two synthetic descriptors did not walk the same template.
-    ///
-    /// The claim design §5 makes — one artifact, all compositions inside it —
-    /// stated as a check: the slots have to be the same slots in the same
-    /// order, binding the same reservations at the same argument indices, or
-    /// no single indirect command buffer serves both compositions and the
-    /// exec key has not collapsed.
+    /// Two synthetic descriptors did not walk the same template (slots,
+    /// order, argument indices), so no single ICB can serve both.
     Unstructured {
         /// Where the two recordings first disagree.
         slot: u32,
@@ -387,47 +236,20 @@ pub enum Fault {
         what: String,
     },
 
-    /// **A residency this shell cannot arrange** (alto design §7,
-    /// `crate::experts`).
-    ///
-    /// Every sentence in it names both numbers, because there is exactly one
-    /// deployment action behind each: a `device_weight_budget` under the dense
-    /// planes, a budget under one expert seat, a capped budget over a plan
-    /// with nothing routed to hold less of, a segment routing to more distinct
-    /// experts than its slab seats, or a bake whose regions carry two
-    /// mixtures each.
-    ///
-    /// Carries a sentence rather than fields for the reason the constitution
-    /// gives a refusal: the five shapes share no arithmetic, and a struct
-    /// wide enough for all of them would print an empty half at every site.
-    /// It lifts to `Error::Impossible` and never to `Exhausted` — nothing the
-    /// deployment frees changes the answer.
+    /// A residency this shell cannot arrange (`crate::experts`). A
+    /// sentence, not fields — the shapes share no arithmetic. Lifts to
+    /// `Error::Impossible`, never `Exhausted` (freeing memory doesn't help).
     Residency(String),
 
-    // attn-score — appended, so every prior variant keeps its ordinal.
     /// A capturing lane in a fire whose loaded artifact declares no capture
-    /// arm (`.wiki/alto/attn-score.md` §4, palo C4).
-    ///
-    /// [`Fault::Maskless`]'s and [`Fault::Adapterless`]'s twin, one axis over
-    /// and for their reason: the observability column is a fact the MODEL
-    /// declares, so a plan with no `attn.scores` export has nowhere for the
-    /// mass to go, and answering `Ok` would hand the caller an empty capture
-    /// it could not tell from a captured nothing.
+    /// arm.
     Scoreless {
         /// The lane, in submission order.
         lane: u32,
     },
 
-    /// A lane whose fact word and whose capture ask do not agree, in either
-    /// direction.
-    ///
-    /// [`Fault::MaskWord`]'s and [`Fault::AdapterWord`]'s twin, and the same
-    /// sentence: the word chooses the class and the class chooses whether this
-    /// lane's rows fall inside the CAPTURE window. A capturing word with no
-    /// ask behind it writes a plane the shell bound no epilogue at; an ask
-    /// with a plain word lands the lane on a kernel that produces no mass at
-    /// all, and the caller is handed a row of zeros that reads as "this lane
-    /// attended to nothing".
+    /// A lane whose fact word and whose capture ask disagree: the word's
+    /// class decides whether the lane's rows fall inside the capture window.
     ScoreWord {
         /// The lane, in submission order.
         lane: u32,
@@ -437,22 +259,8 @@ pub enum Fault {
         runs_capture_arm: bool,
     },
 
-    // W-b — appended, so every prior variant keeps its ordinal.
-    /// **A streamed load whose host source has nothing behind it**
-    /// (`crate::host_source`).
-    ///
-    /// The source a seat is copied FROM is a mapping of an unlinked temporary
-    /// file, so that the kernel may write its pages back and reclaim them
-    /// instead of holding a whole routed bank in anonymous memory. Three OS
-    /// calls stand between the plan and that mapping, and each fails for its
-    /// own deployment reason: a temporary directory that is read-only or out
-    /// of descriptors (`open`), one with no room for the source (`size`), an
-    /// address space that will not take the span (`map`).
-    ///
-    /// Named rather than folded into [`Fault::Load`] because the checkpoint is
-    /// innocent: the artifact is fine, the contract is fine, and what refused
-    /// is the machine the load is running ON. The message says which call and
-    /// what the OS said, because that is the whole of the fix.
+    /// A streamed load whose backing temp-file mapping failed. Named
+    /// separately from [`Fault::Load`]: the checkpoint is innocent here.
     Backing {
         /// Which call refused: `open`, `size` or `map`.
         step: &'static str,
@@ -462,22 +270,8 @@ pub enum Fault {
         why: String,
     },
 
-    // M-1 — appended, so every prior variant keeps its ordinal.
-    /// **An artifact this shell could not map, could not bind zero-copy, or
-    /// was asked to write through** (`crate::mapping`).
-    ///
-    /// The warm-read path hands Metal the artifact's own mapped pages rather
-    /// than a copy of them, and the ways that refuses are all about the
-    /// machine and the file rather than about the checkpoint's contents: an
-    /// artifact that has moved or that this process may not read (`open`),
-    /// one whose size cannot be learned or is zero (`stat`, `size`), an
-    /// address space with no room for it (`map`), a device that declined the
-    /// span (`bind`).
-    ///
-    /// The last shape is not a failure at all but a REFUSAL, and it is
-    /// stated here because it is the same subject: a mapped reservation is
-    /// `PROT_READ`, so `write` and `zero_span` on one are a fault the type
-    /// catches before the page fault does.
+    /// An artifact this shell could not map, could not bind zero-copy, or
+    /// was asked to write through — a mapped reservation is `PROT_READ`.
     Mapped {
         /// Which call refused — `open`, `stat`, `size`, `map`, `bind` — or
         /// the method a read-only reservation refused: `write`, `zero_span`.
@@ -488,41 +282,14 @@ pub enum Fault {
         why: String,
     },
 
-    // M-4c — appended, so every prior variant keeps its ordinal.
-    /// **A SERVING ARTIFACT THIS DEPLOYMENT IS NOT THE ONE FOR** — the
-    /// `pie.serving/1` stamp gate, refused at the load's first instant and
-    /// before a byte of the device is reserved
-    /// (`Weights::resident`](crate::weights::Weights)).
-    ///
-    /// A serving artifact IS the model on this machine: its planes were
-    /// compiled under one recipe — a backend, a tensor-parallel degree, a SKU,
-    /// a precision, a layout revision — and landing them under another does not
-    /// fail, it answers nonsense at full speed. `checkpoint::serving::Stamp`
-    /// is the recipe, written into the file by `pie model import` and compared
-    /// FIELD BY FIELD here, so the sentence an operator reads names the fact
-    /// that differs rather than saying only *different*.
-    ///
-    /// **It carries a sentence rather than fields**, for [`Fault::Residency`]'s
-    /// reason one step further out: the sentence is not this crate's to write.
-    /// `checkpoint::serving::Mismatch::refuse` is the ONE place the refusal is
-    /// spelled — what disagreed, that nothing here rewrote or deleted the file,
-    /// and the `pie model import --force` that would write it again — and the
-    /// CUDA shell forwards the same string from the same call. A struct here
-    /// would be a second author for one paragraph.
-    ///
-    /// The one sentence this crate does write into it is the caller's own bug:
-    /// a load that landed a serving artifact while the door stated no
-    /// deployment stamp. That is an assembly failure upstream, not an
-    /// operator's file, and it is refused rather than skipped — a skip is
-    /// exactly the silent cross-recipe landing the stamp exists to prevent.
+    /// A serving artifact this deployment is not the one for — the
+    /// `pie.serving/1` stamp gate, refused before any device byte is
+    /// reserved. A sentence, not fields; shared wording with the CUDA shell.
     Recipe(String),
 }
 
 impl Fault {
     /// One guest-program refusal, named where it happened.
-    ///
-    /// The constructor the program plane reaches for forty times over, so
-    /// the two fields are never spelled at a call site.
     #[must_use]
     pub(crate) fn program(at: &'static str, why: impl Into<String>) -> Fault {
         Fault::Program {
@@ -641,7 +408,7 @@ impl fmt::Display for Fault {
                 f,
                 "lane {lane} routes to an adapter bank and this load's artifact bakes \
                  no corrected class: an adapter axis is a fact the MODEL declares \
-                 (design §8) and this plan has no `linear.lora_correct` arm for the id \
+                 and this plan has no `linear.lora_correct` arm for the id \
                  to reach"
             ),
             Self::AdapterWord {
@@ -704,11 +471,7 @@ impl fmt::Display for Fault {
                 "the artifact `{what}` is served from its own mapped pages and does not \
                  `{step}`: {why}"
             ),
-            // Forwarded whole, with no framing of this crate's own: the string
-            // is `serving::Mismatch::refuse`'s three-part paragraph and it
-            // already names its own subject ("checkpoint: the serving artifact
-            // …"). Wrapping it would give an operator two prefixes for one
-            // sentence and let the two shells' spellings drift apart.
+            // Forwarded whole: the string already names its own subject.
             Self::Recipe(refusal) => f.write_str(refusal),
             Self::Adapter { bank, why } => write!(f, "adapter bank `{bank}`: {why}"),
             Self::Blob { path, why } => write!(f, "the shared adapter `{path}` {why}"),
@@ -791,51 +554,21 @@ impl From<eta_exec::Error> for Fault {
 /// What every fallible entry in this shell answers.
 pub type Result<T> = std::result::Result<T, Fault>;
 
-/// A kernel entry's refusal, reaching a shell path that answers [`Fault`].
-///
-/// **NOT EVERY CALL INTO `kernels-metal` IS A DISPATCH ARM.** Weight staging,
-/// the wave's control launches and the fire's own scratch work all call
-/// entries there and answer `Fault`, not the contract; before the shared
-/// error crate came apart this was `From<KernelError>` and `?` did the work.
-/// It still can, because `Fault` is this crate's own type and the orphan rule
-/// only bites when NEITHER side is — which is the whole difference between
-/// this impl and [`kernel`] below.
+/// A kernel entry's refusal, reaching a shell path that answers [`Fault`]
+/// directly (weight staging, control launches, scratch work) rather than
+/// through the dispatch contract.
 impl From<kernels_metal::Error> for Fault {
     fn from(error: kernels_metal::Error) -> Self {
         Fault::from(kernel(error))
     }
 }
 
-// ---------------------------------------------------------------------------
-// the seam: this backend's refusal, said in the contract's words
-// ---------------------------------------------------------------------------
+// The seam: this backend's refusal, said in the contract's words.
 
-/// Say a [`kernels_metal::Error`] in the dispatch contract's words.
-///
-/// **THIS IS A FUNCTION AND NOT A `From` IMPL, AND THAT IS NOT A STYLE
-/// CHOICE.** Both types are foreign to this crate — one is the kernel
-/// library's, the other the contract's — and Rust's orphan rule (E0117)
-/// forbids a third crate from implementing `From` between two types it owns
-/// neither of. No arrangement of these three crates gets `?` to convert here
-/// without one of them naming a crate it must not: the kernel library would
-/// have to depend on `model-exec`, and so on `model-compiler` and `model-ir`,
-/// which is the whole edge deleting `crates/kernels` bought — or the two
-/// enums would have to be one type again in a shared leaf. So the conversion
-/// is called instead, once per `Dispatch*` impl, and each family's arms live
-/// in an inherent method that answers [`kernels_metal::Error`] so their own
-/// `?` still converts.
-///
-/// **The match is total on purpose.** The two enums are variant for variant
-/// identical today; they were one type until `crates/kernels` came apart, and
-/// `model_exec::KernelError`'s own doc says plainly that three copies is a
-/// prediction rather than a fact, with the falsifier written out. What makes
-/// the prediction safe to hold is this function: the day `kernels-metal`
-/// grows the `MTLLibrary` compile-failure variant it is expected to, this stops
-/// compiling, at the one line that has to decide what the new refusal means
-/// to a caller who can make nothing of a shader diagnostic. Nothing has to watch the
-/// copy — and a copy that needs watching is the one
-/// `crates/eta-exec/Cargo.toml` rules out: "a copy that is only safe because
-/// something watches it is a copy that costs the watch".
+/// Say a [`kernels_metal::Error`] in the dispatch contract's words. A
+/// function, not a `From` impl, since both types are foreign here (orphan
+/// rule). The match is deliberately total so a new variant fails to compile
+/// rather than being silently dropped.
 pub fn kernel(error: kernels_metal::Error) -> KernelError {
     match error {
         kernels_metal::Error::Unsupported { op } => KernelError::Unsupported { op },

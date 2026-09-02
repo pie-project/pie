@@ -296,6 +296,8 @@ __global__ void kv_append_fp8_per_tensor(
     // boundaries this resolves against are the window's own, rebased to its
     // zero, and the page tables are the lanes'.
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+    if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     int actual_page = 0;
     int offset_in_page = 0;
     resolve_dst(qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
@@ -343,6 +345,8 @@ __global__ void kv_append_per_token_head(
     // boundaries this resolves against are the window's own, rebased to its
     // zero, and the page tables are the lanes'.
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+    if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     const int h = blockIdx.y;
     const int tid = threadIdx.x;
     extern __shared__ float shmem[];
@@ -492,6 +496,8 @@ __global__ void kv_append_fp4_block(
     // boundaries this resolves against are the window's own, rebased to its
     // zero, and the page tables are the lanes'.
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+    if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     const int h = blockIdx.y;
     const int b = blockIdx.z;
     const int start = b * block_size;

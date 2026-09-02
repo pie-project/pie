@@ -1,22 +1,10 @@
-//! The passes that run over a finished plan, and the order they run in.
-//!
-//! The order is the whole file: every pass here reads a plan the one before it
-//! produced, and three of them only work because an earlier one has already
-//! run — nothing can be coalesced into arena-relative writes before
-//! `assign-persistent-offsets` has decided where the arena puts things, and
-//! nothing can be counted before the coalescing is done. Under v1 this order
-//! was seven consecutive statements in the middle of a 954-line file.
-//!
-//! The four modules split by what a pass *does*, not by what it touches:
-//! `arena` assigns the persistent offsets everything downstream reads,
-//! `rewrite` rewrites the schedule, `memory` recounts it, and `validate`
-//! only refuses. Nothing here is re-exported as a prelude — a pass names what
-//! it uses, so moving one is a matter of moving its imports with it.
-//!
-//! That last split is also a [`Stage`]: the validators come last because what
-//! they prove has to hold of the plan the compiler hands back, and a rewrite
-//! scheduled after one would quietly void it. `run_passes` enforces the
-//! ordering rather than leaving it to whoever appends the next line.
+//! The passes that run over a finished plan, and the order they run in: each
+//! pass reads a plan the one before it produced, and some only work because
+//! an earlier one already ran (e.g. coalescing needs `assign-persistent-offsets`
+//! to have placed things first). `arena` assigns persistent offsets,
+//! `rewrite` rewrites the schedule, `memory` recounts it, `validate` only
+//! refuses; the split is also a [`Stage`] order, enforced by `run_passes`
+//! since validators must run last.
 
 use crate::plan::pass::{Pass, Stage};
 

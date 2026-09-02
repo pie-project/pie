@@ -35,25 +35,15 @@ impl Tensor {
     /// A trace-known constant value. Accepts a scalar
     /// (`Tensor::constant(-1i32)`) or an array (`Tensor::constant([0u32, 1])`).
     ///
-    /// The op set carries constants as *scalars*: `const` holds one
-    /// [`Literal`] and nothing else. So the tensor constants that lower are
-    /// exactly the ones a scalar plus one op can spell — a uniform tensor
-    /// (`broadcast`), and a `u32` affine ramp `a + b*i` (`iota`, then the
-    /// arithmetic). Anything else — a per-token logit bias, a banned-token
-    /// set, a sampling schedule — is *bulk data*, and bulk data lives in a
-    /// channel:
+    /// `const` holds one [`Literal`] and nothing else, so only a uniform
+    /// tensor (`broadcast`) or a `u32` affine ramp `a + b*i` (`iota`) lowers
+    /// this way. Anything else — a per-token logit bias, a banned-token set —
+    /// is bulk data and belongs in a channel instead:
     ///
     /// ```ignore
     /// let bias = Channel::from(vec![0.0f32, -3.5, 0.0, 12.25]).named("bias");
-    /// // ... in a stage body:
     /// let logits = logits + bias.read();
     /// ```
-    ///
-    /// That is not a workaround for a missing op. The op stream is a stream of
-    /// fixed-size records — it is what lets a backend emit a kernel from an op
-    /// tag alone — and a buffer of arbitrary bytes is not a record. A channel
-    /// is this system's name for a buffer the device reads, so a constant
-    /// tensor is a channel that is seeded once and never written again.
     ///
     /// Passing anything else here records a trace error naming the shape and
     /// pointing at the channel.
@@ -80,15 +70,8 @@ impl Tensor {
     }
 
     /// Ceiling division, the same spelling std gives the host scalars
-    /// (`u32::div_ceil`): `n.div_ceil(page_size)` reads the same whether `n`
-    /// is a prompt length on the host or a device-resolved KV length.
-    ///
-    /// This is the page-count arithmetic every decode epilogue does, and
-    /// spelling it `(n + (page_size - 1)) / page_size` hid a rounding rule
-    /// behind an off-by-one that had to be re-read every time.
-    ///
-    /// A trace-known scalar divisor has its `- 1` folded here, so the emitted
-    /// ops are exactly the ones the hand-written form produced.
+    /// (`u32::div_ceil`). A trace-known scalar divisor has its `- 1` folded
+    /// here, so the emitted ops match the hand-written form.
     pub fn div_ceil(&self, rhs: impl AsTensor) -> Tensor {
         let d = rhs.to_arg();
         match const_scalar(&d) {
@@ -125,10 +108,8 @@ fn const_scalar(a: &Arg) -> Option<f64> {
         Dtype::F32 => f32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
         Dtype::I32 => i32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
         Dtype::U32 => u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
-        // Not a scalar this crate can read a number out of; see
-        // `poison_dtype`. `None` is already this function's answer for "not a
-        // trace-known scalar", and the mistake is recorded where the constant
-        // was built.
+        // Not a scalar this crate can read a number out of; `None` is already
+        // this function's answer for "not a trace-known scalar".
         _ => return None,
     })
 }
@@ -216,22 +197,15 @@ as_tensor_scalar!(u32, i32, f32, bool);
 /// Record an authoring mistake and return a well-typed stand-in value.
 ///
 /// The recorder keeps going on a poison rather than unwinding, so one
-/// `build()` reports every authoring mistake in the pass instead of the first.
-/// The stand-in is a real `Const`/`Broadcast` pair of the requested type, so
-/// ops downstream of the mistake still type and still get recorded — their
-/// diagnostics are about them, not about the recovery. `build()` refuses the
-/// trace before any of it reaches the wire.
-///
-/// Record an authoring mistake and stand in for the value it was supposed to
-/// produce, so the recorder keeps going and one `build()` reports every
-/// mistake instead of the first.
-///
-/// The stand-in is fully typed, which is what lets the rest of the trace keep
-/// type-checking against it rather than cascading.
+/// `build()` reports every authoring mistake in the pass instead of the
+/// first. The stand-in is a real `Const`/`Broadcast` pair of the requested
+/// type, so ops downstream of the mistake still type-check against it rather
+/// than cascading; `build()` refuses the trace before any of it reaches the
+/// wire.
 ///
 /// `#[track_caller]` here and on every op that can reach it is load-bearing:
-/// the span is the whole value of the report, and without an unbroken chain of
-/// it back to the author, the error names a line inside this file.
+/// without an unbroken chain of it back to the author, the error names a
+/// line inside this file instead.
 #[track_caller]
 pub(crate) fn poison(detail: alloc::string::String, ty: ValueType) -> Tensor {
     Tensor::node(poison_id(detail, ty), ty)
@@ -281,17 +255,12 @@ fn poison_shape(detail: alloc::string::String, fallback: Shape) -> Shape {
     fallback
 }
 
-/// Record an author naming a dtype ETA has no arithmetic for.
-///
-/// [`Dtype`] is the tree's enum — the loader, the kernels and the transfer
-/// contract all name it — and `eta_ir::types::class_of` says which four of its
-/// seventeen variants ETA computes in. Nothing this module offers hands out
-/// the other thirteen: [`crate::dtype`]'s consts are the four, and every
-/// [`IntoConst`] impl is one of the four Rust types. So reaching here means an
-/// author spelled `Dtype::Bf16` by hand, which is an authoring mistake and
-/// recovers the way every authoring mistake in this crate recovers — the error
-/// lands on the trace and tracing continues. The caller picks the stand-in;
-/// each of them picks the F32 one.
+/// Record an author naming a dtype ETA has no arithmetic for. Only four of
+/// [`Dtype`]'s variants are reachable through this module's own API
+/// ([`crate::dtype`]'s consts, [`IntoConst`]'s four Rust types), so reaching
+/// here means an author spelled e.g. `Dtype::Bf16` by hand. Recovers like
+/// every authoring mistake in this crate: the error lands on the trace and
+/// tracing continues with an F32 stand-in.
 #[track_caller]
 fn poison_dtype(dtype: Dtype) {
     context::record_error(
@@ -638,13 +607,10 @@ pub fn exp(x: impl AsTensor) -> Tensor {
 pub fn log(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::Log, |t| t)
 }
-/// `x` converted elementwise to dtype `to`, shape preserved.
-///
-/// A cast to the dtype `x` already has is the identity, and returns `x`
-/// unchanged rather than emitting an op. Worth doing here rather than asking
-/// authors not to write it: a cast is often applied to a value whose dtype
-/// depends on which branch produced it, and "cast it and let the trace decide"
-/// should not cost a device op when the answer is "nothing to do".
+/// `x` converted elementwise to dtype `to`, shape preserved. A cast to the
+/// dtype `x` already has is the identity and returns `x` unchanged rather
+/// than emitting an op — useful since a cast is often applied to a value
+/// whose dtype depends on which branch produced it.
 pub fn cast(x: impl AsTensor, to: Dtype) -> Tensor {
     let x = Tensor::from_arg(x.to_arg());
     if x.dtype() == to {
@@ -882,12 +848,7 @@ pub fn iota(len: u32) -> Tensor {
 }
 /// The CSR row-offset vector for `rows` runs of equal length `run_len`:
 /// `[0, run_len, 2*run_len, …, rows*run_len]`, one entry more than there are
-/// rows.
-///
-/// This is what a descriptor's `*_indptr` port wants, and the shape every
-/// decode epilogue rebuilds each fire as its page count grows. Spelled out it
-/// was `iota(2) * broadcast(&page_count, [2])` — arithmetic that happens to
-/// evaluate to `[0, page_count]` without ever saying so.
+/// rows. What a descriptor's `*_indptr` port wants.
 pub fn indptr(rows: u32, run_len: impl AsTensor) -> Tensor {
     let n = rows + 1;
     iota(n) * broadcast(run_len, [n])
@@ -1001,12 +962,9 @@ pub fn cumprod(x: impl AsTensor) -> Tensor {
 // -- normalize (eta_ir::expand sequences, type-tracked) --
 
 /// Records [`eta_ir::expand`] steps into the trace, attaching the result type
-/// each step lands in.
-///
-/// The op order lives in `eta_ir::expand`; this only knows how to name the
-/// three shapes an expansion step can have. Adding a step there needs no edit
-/// here, which is the point — the two are deliberately separate so a new
-/// expansion step is a single-crate change that cannot be half-done.
+/// each step lands in. The op order lives in `eta_ir::expand`; this only
+/// knows how to name the three shapes an expansion step can have, so adding
+/// a step there needs no edit here.
 struct Traced {
     row: ValueType,
     reduced: ValueType,
@@ -1075,10 +1033,9 @@ pub fn top_k(x: impl AsTensor, k: u32) -> (Tensor, Tensor) {
     let base = emit(Op::TopK { input: ix, k }, &[val_ty, idx_ty]);
     (Tensor::node(base, val_ty), Tensor::node(base + 1, idx_ty))
 }
-/// Descending sort of a 1-D row: `(values, original_indices)`.
-///
-/// Like [`top_k`], this is a library region in the compiler and therefore a
-/// hard fusion barrier — prefer a threshold or reduction when one suffices.
+/// Descending sort of a 1-D row: `(values, original_indices)`. Like
+/// [`top_k`], a library region in the compiler and a hard fusion barrier —
+/// prefer a threshold or reduction when one suffices.
 pub fn sort_desc(x: impl AsTensor) -> (Tensor, Tensor) {
     let (ix, tyx) = x.to_arg().materialize();
     let n = tyx.shape.dims().last().copied().unwrap_or(0);
@@ -1247,9 +1204,8 @@ pub fn row_membership(rows: impl AsTensor, keys: impl AsTensor) -> Tensor {
     let keys = keys.to_arg();
     let row_type = rows.ty();
     let key_type = keys.ty();
-    // The result is [R, K] whatever goes wrong, so every recovery below is a
-    // poison of that shape once `row_count`/`key_count` are known, and of the
-    // key shape while they are not.
+    // The result is [R, K] whatever goes wrong, so every recovery below
+    // poisons that shape once known, or the key shape while it is not.
     let [row_count, depth] = *row_type.shape.dims() else {
         return poison(
             alloc::format!(
@@ -1283,9 +1239,8 @@ pub fn row_membership(rows: impl AsTensor, keys: impl AsTensor) -> Tensor {
         );
     }
 
-    // The walk below indexes a [R, K, D] cross product flattened to one axis,
-    // so the extents multiply. `u32` is the wire's dim type: a product that
-    // leaves it would index a tensor the container cannot describe.
+    // The walk below indexes a [R, K, D] cross product flattened to one axis.
+    // `u32` is the wire's dim type; a product past it is not describable.
     let extents = key_count
         .checked_mul(depth)
         .zip(row_count.checked_mul(depth))
@@ -1433,10 +1388,9 @@ pub fn scalar_gather(src: impl AsTensor, index: impl AsTensor) -> Tensor {
 }
 
 /// Exact nucleus sampler expressed entirely as ordinary composable SSA.
-/// Temperature scaling remains an ordinary preceding operation.
-///
-/// The op sequence is [`expand::nucleus_sample`], shared with the region
-/// matcher that has to recognize it again on the way to a fused kernel.
+/// Temperature scaling remains an ordinary preceding operation. The op
+/// sequence is [`expand::nucleus_sample`], shared with the region matcher
+/// that recognizes it again on the way to a fused kernel.
 pub fn nucleus_sample(logits: impl AsTensor, top_p: impl AsTensor, state: impl AsTensor) -> Tensor {
     let (logits, logits_type) = logits.to_arg().materialize();
     let (top_p, _) = top_p.to_arg().materialize();

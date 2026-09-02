@@ -1,15 +1,11 @@
-//! Argument marshalling: the erased successor of the old `Abi`/`Bind` impl
-//! forest. Every launch argument is one [`ArgValue`]; the [`Arg`] trait
-//! keeps call sites reading `eps.arg()`; [`Bound`] turns a marshalled list
-//! into the `void**` cells `cuLaunchKernelEx` takes.
+//! Argument marshalling: every launch argument is one [`ArgValue`]; the
+//! [`Arg`] trait keeps call sites reading `eps.arg()`; [`Bound`] turns a
+//! marshalled list into the `void**` cells `cuLaunchKernelEx` takes.
 //!
-//! By-value aggregates arrived with the attn wave as promised: a
-//! [`ArgValue::Bytes`] argument copies a `#[repr(C)]` parameter block into
-//! its own pinned slot. The old `by_value!`/`Layout` measuring machinery is
-//! not carried — the one measured aggregate (the mla fa2 params) keeps its
-//! layout assertions inline where it is declared.
+//! A [`ArgValue::Bytes`] argument copies a `#[repr(C)]` parameter block
+//! into its own pinned slot for a by-value aggregate.
 
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 use core::ffi::c_void;
 
 /// One marshalled launch argument. Device buffers travel as the `u64`
@@ -73,8 +69,7 @@ impl ArgValue {
     }
 }
 
-/// Scalar-to-argument marshalling — the erased successor of the old `Bind`
-/// impls, so call sites still read `eps.arg()`.
+/// Scalar-to-argument marshalling, so call sites read `eps.arg()`.
 pub trait Arg: Copy {
     fn arg(self) -> ArgValue;
 }
@@ -124,7 +119,7 @@ impl Arg for bool {
 /// The marshalled list pinned into launch slots: one boxed cell per scalar
 /// argument, one 8-byte-aligned blob per aggregate, one `void*` per slot —
 /// all alive until the launch call returns.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 pub(crate) struct Bound {
     #[allow(dead_code, clippy::vec_box)]
     cells: Vec<Box<u64>>,
@@ -133,7 +128,7 @@ pub(crate) struct Bound {
     slots: Vec<*mut c_void>,
 }
 
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 impl Bound {
     pub(crate) fn new(values: &[ArgValue]) -> Self {
         let mut cells = Vec::with_capacity(values.len());

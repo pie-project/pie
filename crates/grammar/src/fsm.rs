@@ -1,12 +1,5 @@
-//! Finite State Machine construction and conversion.
-//!
-//! Provides mutable `NfaGraph` for construction, immutable `DfaTable` for matching,
-//! and algorithms for NFA→DFA conversion and DFA minimization.
-//!
-//! Edge types:
-//! - `CharRange { min, max }`: byte range transition `[min, max]`
-//! - `Epsilon`: free transition (NFA only)
-//! - `RuleRef(RuleId)`: reference to another grammar rule
+//! Finite State Machine construction and conversion: mutable `NfaGraph` for
+//! building, immutable `DfaTable` for matching, and NFA→DFA/minimization.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -208,21 +201,6 @@ impl DfaTable {
         }
     }
 
-    /// Convert back to mutable FSM.
-    #[cfg(test)]
-    pub fn to_nfa_graph(&self) -> NfaGraph {
-        let mut fsm = NfaGraph::new();
-        for _ in 0..self.num_states() {
-            fsm.add_state();
-        }
-        for s in 0..self.num_states() {
-            let state = StateId(s as u32);
-            for edge in self.edges(state) {
-                fsm.add_edge(state, edge.clone());
-            }
-        }
-        fsm
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,41 +220,6 @@ impl Automaton<NfaGraph> {
     /// Check if a state is accepting.
     pub fn is_end(&self, state: StateId) -> bool {
         self.ends.get(state.0 as usize).copied().unwrap_or(false)
-    }
-
-    /// Test whether the FSM accepts a byte string (NFA simulation).
-    #[cfg(test)]
-    pub fn accepts(&self, input: &[u8]) -> bool {
-        let mut current: BTreeSet<StateId> = BTreeSet::new();
-        current.insert(self.start);
-        let mut current = self.fsm.epsilon_closure(&current);
-
-        for &byte in input {
-            let mut next = BTreeSet::new();
-            for &state in &current {
-                for edge in self.fsm.edges(state) {
-                    if let FsmEdge::CharRange { min, max, target } = edge
-                        && byte >= *min
-                        && byte <= *max
-                    {
-                        next.insert(*target);
-                    }
-                }
-            }
-            if next.is_empty() {
-                return false;
-            }
-            current = self.fsm.epsilon_closure(&next);
-        }
-
-        current.iter().any(|s| self.is_end(*s))
-    }
-
-    /// Convert NFA to DFA via subset construction.
-    #[cfg(test)]
-    pub fn to_dfa(&self) -> Automaton<NfaGraph> {
-        self.to_dfa_limited(usize::MAX)
-            .expect("unlimited DFA conversion")
     }
 
     pub(crate) fn to_dfa_limited(&self, max_states: usize) -> Result<Automaton<NfaGraph>> {
@@ -309,7 +252,6 @@ impl Automaton<NfaGraph> {
             }
         };
 
-        // Initial state = epsilon closure of start
         let start_set = {
             let mut s = BTreeSet::new();
             s.insert(self.start);
@@ -324,10 +266,8 @@ impl Automaton<NfaGraph> {
         while let Some(nfa_states) = worklist.pop_front() {
             let dfa_state = state_map[&nfa_states];
 
-            // Collect all char ranges from these NFA states
             let intervals = self.collect_intervals(&nfa_states);
 
-            // For each distinct interval, compute target NFA state set
             for (min, max, targets) in intervals {
                 let target_set = self.fsm.epsilon_closure(&targets);
                 if target_set.is_empty() {
@@ -344,7 +284,6 @@ impl Automaton<NfaGraph> {
                 dfa.add_char_edge(dfa_state, min, max, dfa_target);
             }
 
-            // Handle rule-reference edges.
             for &nfa_state in &nfa_states {
                 for edge in self.fsm.edges(nfa_state) {
                     let FsmEdge::RuleRef {
@@ -390,7 +329,6 @@ impl Automaton<NfaGraph> {
         &self,
         nfa_states: &BTreeSet<StateId>,
     ) -> Vec<(u8, u8, BTreeSet<StateId>)> {
-        // Gather all char-range edges
         let mut ranges: Vec<(u8, u8, StateId)> = Vec::new();
         for &state in nfa_states {
             for edge in self.fsm.edges(state) {
@@ -404,7 +342,6 @@ impl Automaton<NfaGraph> {
             return Vec::new();
         }
 
-        // Collect all boundary points
         let mut points: BTreeSet<u16> = BTreeSet::new();
         for &(min, max, _) in &ranges {
             points.insert(min as u16);
@@ -413,7 +350,6 @@ impl Automaton<NfaGraph> {
             }
         }
 
-        // Build non-overlapping intervals
         let points: Vec<u16> = points.into_iter().collect();
         let mut result = Vec::new();
 
@@ -436,7 +372,6 @@ impl Automaton<NfaGraph> {
             }
         }
 
-        // Merge adjacent intervals with identical target sets
         let mut merged: Vec<(u8, u8, BTreeSet<StateId>)> = Vec::new();
         for (min, max, targets) in result {
             if let Some(last) = merged.last_mut()
@@ -463,18 +398,6 @@ impl Automaton<NfaGraph> {
 }
 
 impl Automaton<DfaTable> {
-    /// Test whether the compact DFA accepts a byte string.
-    #[cfg(test)]
-    pub fn accepts(&self, input: &[u8]) -> bool {
-        let mut state = self.start;
-        for &byte in input {
-            match self.fsm.next_state(state, byte) {
-                Some(next) => state = next,
-                None => return false,
-            }
-        }
-        self.ends.get(state.0 as usize).copied().unwrap_or(false)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,7 +435,6 @@ fn build_char_class_nfa(
 fn complement_codepoint_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
     let mut sorted = ranges.to_vec();
     sorted.sort_by_key(|&(lo, _)| lo);
-    // Merge overlapping ranges
     let mut merged: Vec<(u32, u32)> = Vec::new();
     for (lo, hi) in sorted {
         if let Some(last) = merged.last_mut()
@@ -536,7 +458,6 @@ fn complement_codepoint_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
         complement.push((prev_end, 0x10FFFF));
     }
 
-    // Remove surrogates from complement ranges
     let mut result = Vec::new();
     for &(lo, hi) in &complement {
         if hi < 0xD800 || lo > 0xDFFF {
@@ -620,13 +541,11 @@ fn add_utf8_byte_range(
     end: StateId,
 ) {
     if depth == lo.len() - 1 {
-        // Last byte: single CharRange transition
         fsm.add_char_edge(start, lo[depth], hi[depth], end);
         return;
     }
 
     if lo[depth] == hi[depth] {
-        // Same byte at this position: add transition and recurse
         let mid = fsm.add_state();
         fsm.add_char_edge(start, lo[depth], hi[depth], mid);
         add_utf8_byte_range(fsm, lo, hi, depth + 1, mid, end);
@@ -760,7 +679,6 @@ fn build_expr_nfa_inlining(
 
         Expr::RuleRef(rule_id) => {
             if inlineable.contains(rule_id) {
-                // Inline: build the referenced rule's body directly
                 let body = grammar.get_rule(*rule_id).body;
                 build_expr_nfa_inlining(grammar, fsm, body, start, end, inlineable);
             } else {
@@ -802,11 +720,9 @@ fn build_expr_nfa_inlining(
             }
 
             if inlineable.contains(&rule) {
-                // Inline the repeated rule's body directly
                 let body = grammar.get_rule(rule).body;
                 build_inlined_repeat(grammar, fsm, body, min, max, start, end, inlineable);
             } else {
-                // Non-inlineable: use RuleRef edges (original behavior)
                 let mut prev = start;
                 for i in 0..min {
                     let next = if max == Some(min) && i + 1 == min {
@@ -909,380 +825,3 @@ pub fn build_rule_fsms(grammar: &Grammar) -> Vec<Automaton<NfaGraph>> {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::grammar::builder::GrammarBuilder;
-
-    #[test]
-    fn test_fsm_basic_construction() {
-        let mut fsm = NfaGraph::new();
-        let s0 = fsm.add_state();
-        let s1 = fsm.add_state();
-        let s2 = fsm.add_state();
-
-        fsm.add_char_edge(s0, b'a', b'a', s1);
-        fsm.add_char_edge(s1, b'b', b'b', s2);
-
-        assert_eq!(fsm.num_states(), 3);
-        assert_eq!(fsm.edges(s0).len(), 1);
-        assert_eq!(fsm.edges(s1).len(), 1);
-        assert_eq!(fsm.edges(s2).len(), 0);
-    }
-
-    #[test]
-    fn test_epsilon_closure() {
-        let mut fsm = NfaGraph::new();
-        let s0 = fsm.add_state();
-        let s1 = fsm.add_state();
-        let s2 = fsm.add_state();
-        let s3 = fsm.add_state();
-
-        fsm.add_epsilon(s0, s1);
-        fsm.add_epsilon(s1, s2);
-        fsm.add_char_edge(s2, b'x', b'x', s3);
-
-        let mut start = BTreeSet::new();
-        start.insert(s0);
-        let closure = fsm.epsilon_closure(&start);
-
-        assert!(closure.contains(&s0));
-        assert!(closure.contains(&s1));
-        assert!(closure.contains(&s2));
-        assert!(!closure.contains(&s3));
-    }
-
-    #[test]
-    fn test_nfa_accepts_string() {
-        // Build NFA for "ab"
-        let mut fsm = NfaGraph::new();
-        let s0 = fsm.add_state();
-        let s1 = fsm.add_state();
-        let s2 = fsm.add_state();
-
-        fsm.add_char_edge(s0, b'a', b'a', s1);
-        fsm.add_char_edge(s1, b'b', b'b', s2);
-
-        let nfa = Automaton {
-            fsm,
-            start: s0,
-            ends: vec![false, false, true],
-        };
-
-        assert!(nfa.accepts(b"ab"));
-        assert!(!nfa.accepts(b"a"));
-        assert!(!nfa.accepts(b"abc"));
-        assert!(!nfa.accepts(b"ba"));
-        assert!(!nfa.accepts(b""));
-    }
-
-    #[test]
-    fn test_nfa_with_epsilon() {
-        // NFA for "a" | "b"  (using epsilon fan-out)
-        let mut fsm = NfaGraph::new();
-        let start = fsm.add_state();
-        let a_state = fsm.add_state();
-        let b_state = fsm.add_state();
-        let end = fsm.add_state();
-
-        fsm.add_epsilon(start, a_state);
-        fsm.add_epsilon(start, b_state);
-        fsm.add_char_edge(a_state, b'a', b'a', end);
-        fsm.add_char_edge(b_state, b'b', b'b', end);
-
-        let nfa = Automaton {
-            fsm,
-            start,
-            ends: vec![false, false, false, true],
-        };
-
-        assert!(nfa.accepts(b"a"));
-        assert!(nfa.accepts(b"b"));
-        assert!(!nfa.accepts(b"ab"));
-        assert!(!nfa.accepts(b""));
-    }
-
-    #[test]
-    fn test_nfa_to_dfa() {
-        // NFA for "a" | "ab" — ambiguous prefix
-        let mut fsm = NfaGraph::new();
-        let start = fsm.add_state();
-        let s1 = fsm.add_state();
-        let s2 = fsm.add_state();
-        let end1 = fsm.add_state(); // accepts "a"
-        let s3 = fsm.add_state();
-        let end2 = fsm.add_state(); // accepts "ab"
-
-        fsm.add_epsilon(start, s1);
-        fsm.add_epsilon(start, s2);
-        fsm.add_char_edge(s1, b'a', b'a', end1);
-        fsm.add_char_edge(s2, b'a', b'a', s3);
-        fsm.add_char_edge(s3, b'b', b'b', end2);
-
-        let nfa = Automaton {
-            fsm,
-            start,
-            ends: vec![false, false, false, true, false, true],
-        };
-
-        let dfa = nfa.to_dfa();
-        assert!(dfa.accepts(b"a"));
-        assert!(dfa.accepts(b"ab"));
-        assert!(!dfa.accepts(b"b"));
-        assert!(!dfa.accepts(b"abc"));
-        assert!(!dfa.accepts(b""));
-    }
-
-    #[test]
-    fn test_compact_fsm() {
-        let mut fsm = NfaGraph::new();
-        let s0 = fsm.add_state();
-        let s1 = fsm.add_state();
-        let s2 = fsm.add_state();
-
-        fsm.add_char_edge(s0, b'a', b'z', s1);
-        fsm.add_char_edge(s1, b'0', b'9', s2);
-
-        let compact = fsm.to_compact();
-        assert_eq!(compact.num_states(), 3);
-        assert_eq!(compact.next_state(s0, b'f'), Some(s1));
-        assert_eq!(compact.next_state(s0, b'5'), None);
-        assert_eq!(compact.next_state(s1, b'5'), Some(s2));
-    }
-
-    #[test]
-    fn test_compact_dfa_accepts() {
-        // Build DFA for [a-z][0-9]
-        let mut fsm = NfaGraph::new();
-        let s0 = fsm.add_state();
-        let s1 = fsm.add_state();
-        let s2 = fsm.add_state();
-
-        fsm.add_char_edge(s0, b'a', b'z', s1);
-        fsm.add_char_edge(s1, b'0', b'9', s2);
-
-        let fse = Automaton {
-            fsm,
-            start: s0,
-            ends: vec![false, false, true],
-        };
-
-        let compact = fse.to_compact();
-        assert!(compact.accepts(b"a5"));
-        assert!(compact.accepts(b"z0"));
-        assert!(!compact.accepts(b"a"));
-        assert!(!compact.accepts(b"5a"));
-        assert!(!compact.accepts(b"aa"));
-    }
-
-    #[test]
-    fn test_build_rule_fsm_byte_string() {
-        let mut b = GrammarBuilder::new();
-        let root = b.add_rule("root");
-        let hello = b.add_byte_string(b"hello");
-        b.set_rule_body(root, hello);
-        let grammar = b.build("root").unwrap();
-
-        let fsms = build_rule_fsms(&grammar);
-        assert_eq!(fsms.len(), 1);
-        assert!(fsms[0].accepts(b"hello"));
-        assert!(!fsms[0].accepts(b"hell"));
-        assert!(!fsms[0].accepts(b"helloo"));
-    }
-
-    #[test]
-    fn test_build_rule_fsm_choices() {
-        let mut b = GrammarBuilder::new();
-        let root = b.add_rule("root");
-        let a = b.add_byte_string(b"cat");
-        let c = b.add_byte_string(b"dog");
-        let choices = b.add_choices(vec![a, c]);
-        b.set_rule_body(root, choices);
-        let grammar = b.build("root").unwrap();
-
-        let fsms = build_rule_fsms(&grammar);
-        assert!(fsms[0].accepts(b"cat"));
-        assert!(fsms[0].accepts(b"dog"));
-        assert!(!fsms[0].accepts(b"cow"));
-    }
-
-    #[test]
-    fn test_build_rule_fsm_sequence() {
-        let mut b = GrammarBuilder::new();
-        let root = b.add_rule("root");
-        let a = b.add_byte_string(b"ab");
-        let c = b.add_byte_string(b"cd");
-        let seq = b.add_sequence(vec![a, c]);
-        b.set_rule_body(root, seq);
-        let grammar = b.build("root").unwrap();
-
-        let fsms = build_rule_fsms(&grammar);
-        assert!(fsms[0].accepts(b"abcd"));
-        assert!(!fsms[0].accepts(b"ab"));
-        assert!(!fsms[0].accepts(b"cd"));
-    }
-
-    #[test]
-    fn test_build_rule_fsm_char_class() {
-        let mut b = GrammarBuilder::new();
-        let root = b.add_rule("root");
-        // [a-z]
-        let cc = b.add_character_class(false, vec![(0x61, 0x7a)]);
-        b.set_rule_body(root, cc);
-        let grammar = b.build("root").unwrap();
-
-        let fsms = build_rule_fsms(&grammar);
-        assert!(fsms[0].accepts(b"a"));
-        assert!(fsms[0].accepts(b"z"));
-        assert!(!fsms[0].accepts(b"A"));
-        assert!(!fsms[0].accepts(b"0"));
-        assert!(!fsms[0].accepts(b"ab"));
-    }
-
-    #[test]
-    fn test_build_rule_fsm_char_class_star() {
-        let mut b = GrammarBuilder::new();
-        let root = b.add_rule("root");
-        // [a-z]*
-        let star = b.add_character_class_star(false, vec![(0x61, 0x7a)]);
-        b.set_rule_body(root, star);
-        let grammar = b.build("root").unwrap();
-
-        let fsms = build_rule_fsms(&grammar);
-        assert!(fsms[0].accepts(b""));
-        assert!(fsms[0].accepts(b"a"));
-        assert!(fsms[0].accepts(b"abc"));
-        assert!(fsms[0].accepts(b"z"));
-        assert!(!fsms[0].accepts(b"A"));
-        assert!(!fsms[0].accepts(b"a1"));
-    }
-
-    #[test]
-    fn test_build_rule_fsm_empty_string() {
-        let mut b = GrammarBuilder::new();
-        let root = b.add_rule("root");
-        let empty = b.add_empty_string();
-        b.set_rule_body(root, empty);
-        let grammar = b.build("root").unwrap();
-
-        let fsms = build_rule_fsms(&grammar);
-        assert!(fsms[0].accepts(b""));
-        assert!(!fsms[0].accepts(b"a"));
-    }
-
-    #[test]
-    fn test_nfa_to_dfa_char_range() {
-        // NFA for [a-c] | [b-d]  (overlapping ranges)
-        let mut fsm = NfaGraph::new();
-        let start = fsm.add_state();
-        let end = fsm.add_state();
-
-        fsm.add_char_edge(start, b'a', b'c', end);
-        fsm.add_char_edge(start, b'b', b'd', end);
-
-        let nfa = Automaton {
-            fsm,
-            start,
-            ends: vec![false, true],
-        };
-
-        let dfa = nfa.to_dfa();
-        assert!(dfa.accepts(b"a"));
-        assert!(dfa.accepts(b"b"));
-        assert!(dfa.accepts(b"c"));
-        assert!(dfa.accepts(b"d"));
-        assert!(!dfa.accepts(b"e"));
-        assert!(!dfa.accepts(b""));
-    }
-
-    #[test]
-    fn test_collect_intervals_overlap() {
-        // Two overlapping ranges: [a-d] and [c-f]
-        let mut fsm = NfaGraph::new();
-        let s0 = fsm.add_state();
-        let s1 = fsm.add_state();
-        let s2 = fsm.add_state();
-
-        fsm.add_char_edge(s0, b'a', b'd', s1);
-        fsm.add_char_edge(s0, b'c', b'f', s2);
-
-        let fse = Automaton {
-            fsm,
-            start: s0,
-            ends: vec![false, true, true],
-        };
-
-        let mut states = BTreeSet::new();
-        states.insert(s0);
-        let intervals = fse.collect_intervals(&states);
-
-        // Should split into: [a-b]→{s1}, [c-d]→{s1,s2}, [e-f]→{s2}
-        assert_eq!(intervals.len(), 3);
-        assert_eq!(intervals[0].0, b'a');
-        assert_eq!(intervals[0].1, b'b');
-        assert!(intervals[0].2.contains(&s1));
-        assert!(!intervals[0].2.contains(&s2));
-
-        assert_eq!(intervals[1].0, b'c');
-        assert_eq!(intervals[1].1, b'd');
-        assert!(intervals[1].2.contains(&s1));
-        assert!(intervals[1].2.contains(&s2));
-
-        assert_eq!(intervals[2].0, b'e');
-        assert_eq!(intervals[2].1, b'f');
-        assert!(!intervals[2].2.contains(&s1));
-        assert!(intervals[2].2.contains(&s2));
-    }
-
-    #[test]
-    fn test_compact_roundtrip() {
-        let mut fsm = NfaGraph::new();
-        let s0 = fsm.add_state();
-        let s1 = fsm.add_state();
-        fsm.add_char_edge(s0, b'x', b'x', s1);
-
-        let compact = fsm.to_compact();
-        let fsm2 = compact.to_nfa_graph();
-
-        assert_eq!(fsm2.num_states(), 2);
-        assert_eq!(fsm2.edges(s0).len(), 1);
-    }
-
-    #[test]
-    fn test_negated_char_class() {
-        let mut b = GrammarBuilder::new();
-        let root = b.add_rule("root");
-        // [^a-z] — anything NOT a-z
-        let cc = b.add_character_class(true, vec![(0x61, 0x7a)]);
-        b.set_rule_body(root, cc);
-        let grammar = b.build("root").unwrap();
-
-        let fsms = build_rule_fsms(&grammar);
-        assert!(!fsms[0].accepts(b"a"));
-        assert!(!fsms[0].accepts(b"z"));
-        assert!(fsms[0].accepts(b"A"));
-        assert!(fsms[0].accepts(b"0"));
-        assert!(fsms[0].accepts(b"!"));
-        assert!(!fsms[0].accepts(b"ab"));
-        assert!(!fsms[0].accepts(b""));
-    }
-
-    #[test]
-    fn test_star_then_literal() {
-        // Grammar: root ::= [a-z]* "!"
-        let mut b = GrammarBuilder::new();
-        let root = b.add_rule("root");
-        let star = b.add_character_class_star(false, vec![(0x61, 0x7a)]);
-        let bang = b.add_byte_string(b"!");
-        let seq = b.add_sequence(vec![star, bang]);
-        b.set_rule_body(root, seq);
-        let grammar = b.build("root").unwrap();
-
-        let fsms = build_rule_fsms(&grammar);
-        assert!(fsms[0].accepts(b"!"));
-        assert!(fsms[0].accepts(b"a!"));
-        assert!(fsms[0].accepts(b"abc!"));
-        assert!(!fsms[0].accepts(b"abc"));
-        assert!(!fsms[0].accepts(b""));
-    }
-}

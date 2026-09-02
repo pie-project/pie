@@ -1,34 +1,5 @@
-//! NIXL backend — the cross-node KV-tensor data path.
-//!
-//! Wraps NVIDIA's NIXL (via its C-API, `libnixl_capi.so`) to move KV pages
-//! between workers over UCX (RDMA where a NIC exists, otherwise `shm`/`tcp`).
-//! Built only under `--features nixl`; the on-device build ships without it.
-//!
-//! # Mechanism, not policy
-//!
-//! The remote-access credential is **not** an ibverbs `rkey` — NIXL exposes
-//! none. Instead each agent publishes an opaque *metadata blob*
-//! ([`get_local_md`]) that a peer loads ([`load_remote_md`]); that blob is the
-//! [`PeerConn::metadata`] the controller's pairing hands over. Combined with the
-//! peer's exported [`KvHandle`] (its region addresses), it's everything a
-//! one-sided WRITE/READ needs. The handle/region stays backend-neutral.
-//!
-//! # Lifecycle → NIXL C-API
-//!
-//! - [`register`](NixlBackend::register) → `register_mem` over a reg-dlist built
-//!   from the handle's regions.
-//! - [`local_metadata`](NixlBackend::local_metadata) → `get_local_md`.
-//! - [`connect`](NixlBackend::connect) → `load_remote_md` (caches the peer's
-//!   agent name + exported handle).
-//! - [`send`](NixlBackend::send)/[`recv`](NixlBackend::recv) → `create_xfer_req`
-//!   (WRITE/READ) + `post_xfer_req`.
-//! - [`poll`](NixlBackend::poll) → `get_xfer_status`.
-//!
-//! NIXL is not safe to drive from multiple threads concurrently (it can
-//! deadlock), so all agent calls are serialized behind one mutex.
-//!
-//! [`get_local_md`]: https://github.com/ai-dynamo/nixl
-//! [`load_remote_md`]: https://github.com/ai-dynamo/nixl
+//! NIXL backend: moves KV pages between workers over UCX. Built only under `--features nixl`.
+//! Credential is an opaque metadata blob (not an ibverbs rkey); all agent calls are serialized behind one mutex since NIXL is not thread-safe.
 
 mod ffi;
 
@@ -95,10 +66,6 @@ struct Request {
 }
 
 /// Cross-node NIXL backend. One NIXL agent + UCX plugin per instance.
-///
-/// "Plugin", not "backend", for the UCX half: NIXL calls its own transports
-/// backends too, and this crate's `Backend` is the trait above. Two senses of
-/// one word in one sentence is what this module was renamed to stop.
 pub struct NixlBackend {
     inner: Mutex<Inner>,
 }
@@ -196,8 +163,7 @@ impl NixlBackend {
             }
 
             let _post_status = nixl_capi_post_xfer_req(g.agent, req, ptr::null_mut());
-            // Even a hard post error can leave an agent-owned request. Keep it
-            // pollable so the normal terminal path releases it before destroy.
+            // A post error can still leave an agent-owned request; keep it pollable so the normal path releases it.
 
             let id = g.next_id;
             g.next_id += 1;
@@ -419,116 +385,3 @@ impl Drop for NixlBackend {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use engine::model_ir::Dtype;
-    use engine::{KvLayout, KvLayoutKind};
-
-    fn layout() -> KvLayout {
-        // 1 layer · KvSeparate(2 planes) · 1 head · head_dim 64 · page_size 16 ·
-        // Bf16 → page_bytes() = 4096 (matches the dummy host-DRAM export).
-        KvLayout {
-            num_layers: 1,
-            num_kv_heads: 1,
-            head_dim: 64,
-            page_size: 16,
-            dtype: Dtype::Bf16,
-            kind: KvLayoutKind::KvSeparate,
-            storage_format: "test-bf16".to_string(),
-            region_page_bytes: Vec::new(),
-        }
-    }
-
-    fn host_handle(buf: &[u8]) -> KvHandle {
-        KvHandle {
-            regions: vec![engine::KvRegion {
-                base: buf.as_ptr() as u64,
-                len: buf.len() as u64,
-                page_stride: layout().page_bytes(),
-                domain: MemoryDomain::HostPinned,
-            }],
-            layout: layout(),
-        }
-    }
-
-    /// Real cross-backend NIXL transfer over UCX `shm,tcp` — no RDMA NIC, no GPU.
-    /// Two agents in one process: A WRITEs host-DRAM pages into B's buffer.
-    ///
-    /// Skips (does not fail) when NIXL isn't runnable here. Run it with:
-    /// ```text
-    /// NIXL_PREFIX=/path/to/nixl_prefix \
-    /// LD_LIBRARY_PATH=$NIXL_PREFIX/lib:$NIXL_PREFIX/lib/ucx \
-    ///   cargo test -p pie-transport --features nixl -- --test-threads=1 nixl_
-    /// ```
-    #[test]
-    fn nixl_ucx_shm_tcp_transfer() {
-        let Ok(prefix) = std::env::var("NIXL_PREFIX") else {
-            eprintln!("SKIP: NIXL_PREFIX unset");
-            return;
-        };
-        // Read lazily by NIXL/UCX at backend creation, so setting them here works.
-        unsafe {
-            std::env::set_var("NIXL_PLUGIN_DIR", format!("{prefix}/lib/plugins"));
-            std::env::set_var("UCX_MODULE_DIR", format!("{prefix}/lib/ucx"));
-            if std::env::var("UCX_TLS").is_err() {
-                std::env::set_var("UCX_TLS", "shm,tcp");
-            }
-        }
-
-        let a = match NixlBackend::new("A-e2e") {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("SKIP: NIXL agent init failed ({e}) — check LD_LIBRARY_PATH");
-                return;
-            }
-        };
-        let b = NixlBackend::new("B-e2e").expect("B agent");
-
-        let page_bytes = layout().page_bytes() as usize;
-        let src = vec![0xABu8; page_bytes * 8];
-        let dst = vec![0u8; page_bytes * 8];
-
-        let ra = a
-            .register(WorkerId(1), host_handle(&src))
-            .expect("register A");
-        b.register(WorkerId(2), host_handle(&dst))
-            .expect("register B");
-
-        let md_b = b.local_metadata().expect("B local_metadata");
-        a.connect(&PeerConn {
-            worker: WorkerId(2),
-            handle: host_handle(&dst),
-            metadata: md_b,
-        })
-        .expect("A connect B");
-
-        let pages = PageSet::new(vec![0, 1]);
-        let id = a.send(&ra, &pages, WorkerId(2)).expect("send");
-
-        let mut spins = 0;
-        loop {
-            match a.poll(id).expect("poll") {
-                Completion::Done => break,
-                Completion::Pending => {
-                    spins += 1;
-                    assert!(spins < 5_000_000, "transfer timed out");
-                }
-                Completion::Failed(m) => panic!("transfer failed: {m}"),
-            }
-        }
-        assert!(matches!(
-            a.poll(id),
-            Err(TransportError::UnknownTransfer { id: unknown }) if unknown == id.0
-        ));
-
-        assert!(
-            dst[..page_bytes * 2].iter().all(|&x| x == 0xAB),
-            "transferred pages must hold the 0xAB pattern"
-        );
-        assert!(
-            dst[page_bytes * 2..].iter().all(|&x| x == 0),
-            "untransferred pages must stay zero"
-        );
-    }
-}

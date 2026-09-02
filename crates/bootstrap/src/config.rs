@@ -50,12 +50,8 @@ impl Origin {
 /// order the engine uses: `--config`, then `$PIE_CONFIG`, then the
 /// `$PIE_HOME` default.
 ///
-/// Public because `pie config` needs the same answer the engine gets. It used
-/// to resolve its own path from `$PIE_HOME` alone, so `pie --config other.toml
-/// config show` printed the default file -- the flag was accepted, initialised
-/// and ignored. Three other commands had their own copies with the same defect;
-/// this is deliberately the only implementation, so a fifth cannot appear
-/// quietly.
+/// Public because `pie config` needs the same answer the engine gets;
+/// deliberately the only implementation of this resolution.
 pub fn cli_config_path(global: &GlobalArgs) -> (PathBuf, Origin) {
     if let Some(flag) = global.config.as_deref() {
         return (PathBuf::from(flag), Origin::Flag);

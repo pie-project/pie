@@ -1,6 +1,6 @@
 [package]
 name = "checkpoint"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Typed checkpoint compiler: a checkpoint and a contract in, a verified memory layout a device can be pointed at out."
@@ -12,86 +12,36 @@ name = "checkpoint"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# This crate is the compiler alone. There is no C ABI and no sibling
-# `-capi` crate: the engines link the rlib and pass Rust types, and executing a
-# plan is `executor`'s — see `src/executor/arena.rs` for why the device half is
-# an `ArenaBacking` the consumer supplies rather than a second executor inside
-# each engine.
-#
-# THE PACKAGE WAS model-loader, and the name outran the code. A model loader
-# would know model semantics; this one knows checkpoints and refuses to know a
-# family — `tests/standalone.rs` is that refusal, written as four properties.
-# The rename came second on purpose: while a `cuda` feature here launched
-# kernels, "checkpoint" would have been the smaller lie of the two. The module
-# that reads a checkpoint's own bytes shared the word for a while and is `file`
-# now — `checkpoint::file::read`, `checkpoint::file::zt` — because a module
-# that repeats its crate names the crate twice and the module not at all.
+# The compiler alone: engines link the rlib and pass Rust types, and a device's
+# arena crosses as an `ArenaBacking` the consumer supplies. Nothing here knows
+# a model family — `tests/standalone.rs` pins that as four properties.
 
 [features]
 default = ["testkit"]
 
-# The parts of this crate that exist to *check* the loader rather than to be
-# the loader: the differential oracle plans are replayed against. (It said "and
-# the CPU plan executor the `checkpoint` tool replays with" -- that executor
-# was promoted out of `testkit` when it became `pie model import`'s production
-# path, and this crate declares no `[[bin]]`, so there is no such tool.)
-#
-# On by default so `cargo build` and `cargo test` work unasked.
-# `worker/Cargo.toml` turns it off, which is also the check: if the load path
-# ever grows a route into the oracle, the worker stops compiling.
+# The parts that exist to check the loader rather than to be it: the
+# differential oracle plans are replayed against. On by default so `cargo test`
+# works unasked; `worker` turns it off, which is also the check — a load path
+# that grows a route into the oracle stops compiling there.
 testkit = []
 
-# A `cuda` FEATURE STOOD HERE, with `cuda-12`/`cuda-13` beside it, and the
-# device half it gated — `executor::cuda::CudaArena`, which ran a plan's
-# `Cast`/`Scale`/`Encode` on the GPU rather than staging them back to the host
-# — is now `engine-cuda`'s `weights::arena`. It was measured before it moved:
-# no `src/` path in any engine ever constructed a `CudaArena`, and the only
-# target in the tree that turned the feature on was this crate's own parity
-# test, which moved with the arena.
-#
-# So the property that feature's own comment called load-bearing is now
-# unconditional rather than default: there is no configuration of this crate
-# that names `kernels-cuda`, `cudarc`, `kernels` or `model-ir`, and therefore
-# none that wants a CUDA toolkit. A plan for a CUDA target is a claim about
-# what a device will do, and making that claim must not require the device.
-# That is also what keeps the host executor the reference the device answer is
-# checked against — `engine-cuda/tests/gpu_transform_parity.rs` still diffs the
-# two, and still reaches the host side through this crate.
-#
-# What stays is the VOCABULARY, because it is the compiler's: `executor::arena`
-# (`ArenaBacking`, `TileMapOp`) and `plan::passes::tile`'s four `CUDA_*` kernel
-# words. Those say *what* transform a device should run; running it is the
-# device's crate's sentence.
+# No configuration of this crate names `kernels-cuda`, `cudarc` or `model-ir`,
+# so none wants a CUDA toolkit: a plan for a CUDA target is a claim about what
+# a device will do, and making the claim must not require the device. What
+# stays is the vocabulary — `executor::arena` and `plan::passes::tile`'s four
+# `CUDA_*` kernel words; running the transform is the device crate's sentence.
 
 [dependencies]
-# `DType`, re-exported by `types.rs` under the name this crate spells it. The
-# checkpoint's element vocabulary and the IR's are ONE enum now; this is the
-# leaf that holds it, and it deps serde and nothing else, so naming it here
-# costs the toolkit-free build nothing.
+# `DType`: the checkpoint's element vocabulary and the IR's are one enum.
 dtype = { path = "../dtype" }
 half = "2"
-# The checkpoint readers; the requirement itself lives in the workspace
-# manifest, because releasing them is a two-repo dance.
+# The checkpoint readers; the version floor lives in the workspace manifest.
 #
-# No `zstd` here, deliberately. The loader addresses checkpoint bytes where
-# they lie so a device can be pointed at them, and an encoded part has no
-# address at all -- `zt.zstd-seekable/1` payloads are refused by
-# `file::zt` whether or not the codec is linked. Registering the
-# encoding would only change the wording of the refusal, in exchange for
-# zstd-sys, whose build script is the single most expensive C compile in the
-# tree. It stays on under `[dev-dependencies]`, where a test needs to *write*
-# a compressed part to prove the refusal.
-# One call: `statvfs`, for `file/emit.rs`'s free-space refusal. The paragraph
-# above says this crate is `dtype`, `half`, `ztensor`, `serde` and `thiserror`
-# in every configuration, and this is the one addition to that list. It is
-# `engine-cuda/src/weight_cache.rs`'s own reasoning -- free space is one
-# `statvfs` and a multiply, and the standard library has no answer for it at
-# all -- and it is
-# a leaf with no build script, no toolkit and no platform beyond the unix this
-# crate already reads files on, so nothing about the toolkit-free build
-# changes. The span door of the serving reader needed no such thing: it maps
-# through `ztensor`'s own store, which is the same twelve lines this crate
-# would otherwise have written.
+# No `zstd` here, deliberately: this crate addresses checkpoint bytes where
+# they lie, and an encoded part has no address — `zt.zstd-seekable/1` payloads
+# are refused by `file::zt` whether or not the codec is linked.
+# One call: `statvfs`, for `file/emit.rs`'s free-space refusal; std has no
+# answer for it, and libc adds no build script, toolkit or platform.
 libc = "0.2"
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true, features = [
@@ -107,14 +57,9 @@ serde_json = "1.0"
 thiserror = "2.0"
 
 [dev-dependencies]
-# `zstd` is a test-only need: `a_part_with_no_address_is_refused` has to
-# produce a genuinely compressed part, and the writer will not record an
-# encoding it cannot perform. Dev-dependencies are not built for `cargo
-# build`, so this keeps zstd-sys out of every shipped binary.
+# Test-only: `a_part_with_no_address_is_refused` has to produce a genuinely
+# compressed part, and this keeps zstd-sys out of every shipped binary.
 ztensor = { workspace = true, features = ["zstd"] }
-# A SECOND DEV-DEPENDENCY STOOD HERE, introduced by a comment about "a dev-only
-# cycle, which cargo permits" onto the ABI crate whose marshalled plan view the
-# golden and verifier tests checked. That crate is deleted, the dependency line
-# went with it, and the comment did not — leaving a paragraph explaining a
-# split between this crate and one that does not exist. There is no cycle and
-# nothing to marshal: a plan is verified as a Rust value, in `verify.rs`.
+# `consume::release` is checked against a real file on a real filesystem
+# (`st_blocks` before and after).
+tempfile = "3"

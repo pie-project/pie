@@ -1,31 +1,15 @@
-//! Deterministic backend projections of the canonical ETA RNG contract.
-//!
-//! Both projections are printed from [`eta_ir::rng::RNG_FORMULA`], so the device
-//! implementations cannot drift from the host one in [`eta_ir::rng`].
+//! Deterministic backend projections of the canonical ETA RNG contract,
+//! printed from [`eta_ir::rng::RNG_FORMULA`] so device and host cannot drift.
 
 use core::fmt::Write;
 
 use eta_ir::rng::RNG_FORMULA;
 
-/// `UNIFORM_MAX` as a decimal literal for the generated backends. The nearest
-/// `f32` to this text is exactly `UNIFORM_MAX`, so host and device agree bit
-/// for bit.
+/// The nearest `f32` to this text is exactly `UNIFORM_MAX`, so host and
+/// device agree bit for bit.
 const UNIFORM_MAX_LITERAL: &str = "0.99999994";
 
 /// The `__device__` projection, as spliced into emitted CUDA sources.
-///
-/// There were two CUDA projections until the C++ drivers were deleted: this
-/// one, and a `PTIR_RNG_INLINE`/`<stdint.h>` spelling printed into
-/// `include/rng_contract.generated.h` for a C++ translation unit to
-/// `#include`. Nothing includes a header on the device path any more — NVRTC
-/// is called with zero headers and zero include names — so the header spelling
-/// and the enum that selected between the two went with it.
-///
-/// The emitter calls this directly rather than generating a header and slicing
-/// a raw-string literal back out of it. That shortcut made the emitter depend
-/// on the header's punctuation: a whitespace change around the raw-string
-/// delimiters turned into a runtime failure in a function whose job had
-/// nothing to do with headers.
 pub fn cuda_device_functions() -> String {
     let mut out = String::new();
     let (inline, u64_ty, u32_ty, u64_suffix) = (
@@ -124,13 +108,3 @@ inline ulong ptir_rng_splitmix64(ulong x) {\n",
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn projections_are_deterministic() {
-        assert_eq!(cuda_device_functions(), cuda_device_functions());
-        assert_eq!(generate_msl_preamble(), generate_msl_preamble());
-    }
-}

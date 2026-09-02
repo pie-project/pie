@@ -1,6 +1,6 @@
 [package]
 name = "inferlet"
-version = "0.4.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Inferlet support library for Pie"
@@ -9,23 +9,18 @@ repository = "https://github.com/pie-project/pie"
 keywords = ["wasi", "wasm", "pie", "inferlet"]
 categories = ["wasm"]
 
-# The WIT package is part of the crate's payload, not an input the build
-# ignores: `wit_bindgen::generate!` reads `wit/` at macro-expansion time, so a
-# published .crate that lacks it does not compile. Cargo would include `wit/`
-# by default (it is not in .gitignore), but say so, because the failure mode
-# is a broken release rather than a build error here.
+# `wit_bindgen::generate!` reads `wit/` at macro-expansion time, so a published
+# .crate that lacks it does not compile. Stated explicitly because the failure
+# mode is a broken release rather than a build error here.
 include = ["src/**/*", "wit/**/*"]
 
 [dependencies]
-# The guest bindings are generated here, from this crate's own `wit/` -- see
-# the `generate!` site in src/lib.rs for why the WIT cannot live in a sibling
-# crate while this one is published.
+# The guest bindings are generated from this crate's own `wit/`; see the
+# `generate!` site in src/lib.rs.
 wit-bindgen = { version = "0.59.0", features = ["async-spawn"] }
-inferlet-macros = { version = "0.4.0", path = "../inferlet-macros" }
+inferlet-macros = { version = "0.5.0", path = "../inferlet-macros" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# The ETA authoring DSL (eDSL + neutral trace Builder). Host-`cargo test`able,
-# wasm-buildable, no wit-bindgen (the single `wit_bindgen::generate!` stays here
-# in `inferlet`). The `inferlet::eta` bridge wraps the WIT forward resources and
-# drives this crate's `Builder`.
+# The ETA authoring DSL. It carries no wit-bindgen — the single `generate!`
+# stays here — and `inferlet::eta` drives its `Builder`.
 eta-dsl = { path = "../eta-dsl" }

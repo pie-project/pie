@@ -1,14 +1,9 @@
 //! Traces built by hand, one statement per line — the test vocabulary for
-//! every pass in this crate.
-//!
-//! `model-dsl` is the authoring surface and CANNOT be reached from a unit
-//! test here: it is a dev-dependency, which means it exists for
-//! `tests/every_sku_carves_an_arena.rs` and not for `src/`. So these say in
-//! `Def`, `Ty` and `Guard` what a forward pass says in `split` and
-//! `Value::merge`, the same way `model_ir::check::classes`' own tests do. The
-//! catalog test is the one that checks the two agree.
+//! every pass in this crate. `model-dsl` is a dev-dependency and cannot be
+//! reached from a unit test here, so these say in `Def`, `Ty` and `Guard`
+//! what a forward pass says in `split` and `Value::merge`.
 
-use model_ir::ops::{Attention, Collective, Elementwise};
+use model_ir::ops::{Attention, Elementwise};
 use model_ir::{
     CacheRow, Guard, Def, Dim, Dtype, Node, Trace, Platform, RuntimeInput, Seam, StructKind, Ty,
     ValueDecl, ValueId,
@@ -29,19 +24,8 @@ pub(crate) fn act(width: u64) -> Ty {
     }
 }
 
-/// A rectangle whose leading dim is a CONSTANT — a bias plane, a fixed block.
-/// No window cuts one (`RowExpr::cut_per_class`), which is what makes it the
-/// shape two classes may never share a column of.
-pub(crate) fn block(rows: u64, width: u64) -> Ty {
-    Ty::Tensor {
-        shape: vec![Dim::Const(rows), Dim::Const(width)],
-        dtype: Dtype::Bf16,
-    }
-}
-
-/// The TOWER's rectangle: one row per patch, `width` elements wide. The second
-/// row axis, in the only vocabulary a plan has for it — a leading
-/// `Dim::Patches` and nothing else said anywhere.
+/// The tower's rectangle: one row per patch, `width` elements wide (a
+/// leading `Dim::Patches`).
 pub(crate) fn patch(width: u64) -> Ty {
     Ty::Tensor {
         shape: vec![Dim::Patches, Dim::Const(width)],
@@ -93,8 +77,7 @@ impl Build {
     }
 
     /// One guarded op over `x`, minting a fresh `width`-wide rectangle.
-    /// `rmsnorm.no_scale` because it declares NO in-place alias — the ordinary
-    /// case, where a result needs bytes of its own.
+    /// `rmsnorm.no_scale` since it declares no in-place alias.
     pub(crate) fn op(&mut self, x: ValueId, width: u64, guard: Guard) -> ValueId {
         let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), act(width));
@@ -112,8 +95,7 @@ impl Build {
     }
 
     /// The same op, minting a rectangle of the declared `ty` instead of the
-    /// ordinary token-shaped one — what a test reaches for when the SHAPE is
-    /// the thing under test.
+    /// ordinary token-shaped one — for when the shape is under test.
     pub(crate) fn shaped(&mut self, x: ValueId, ty: Ty, guard: Guard) -> ValueId {
         let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), ty);
@@ -130,66 +112,10 @@ impl Build {
         y
     }
 
-    /// One op that writes THROUGH its operand — `Operands::aliases` says so,
-    /// and the carve is expected to fold the two onto one column.
-    pub(crate) fn in_place(&mut self, x: ValueId, width: u64, guard: Guard) -> ValueId {
-        let node = self.trace.nodes.len() as u32;
-        let x_out = self.value(Def::Op(node), act(width));
-        self.push(Elementwise::MulScalar { s: 2.0, x, x_out }.into(), guard);
-        x_out
-    }
-
-    /// `y_out = y + x`, written through `y` — the residual ledger every
-    /// transformer is, and the shape the carve's reuse claim is really about.
-    pub(crate) fn residual_add(
-        &mut self,
-        x: ValueId,
-        y: ValueId,
-        width: u64,
-        guard: Guard,
-    ) -> ValueId {
-        let node = self.trace.nodes.len() as u32;
-        let y_out = self.value(Def::Op(node), act(width));
-        self.push(Elementwise::ResidualAdd { x, y, y_out }.into(), guard);
-        y_out
-    }
-
-    /// A prepare node: it defines a `Ty::Struct`, which is the whole rule P5
-    /// reads. The reading it states is the one [`Build::decode`] restates —
-    /// one head of width 4, no window — because a schedule and its reader
-    /// disagreeing is a shell refusal rather than a fixture.
-    pub(crate) fn prepare(&mut self, guard: Guard) -> ValueId {
-        let kv_indptr = self.input(1);
-        let kv_indices = self.input(1);
-        let last_page_len = self.input(1);
-        let kv_len = self.input(1);
-        let node = self.trace.nodes.len() as u32;
-        let plan = self.value(Def::Op(node), Ty::Struct(StructKind::AttnDecodePlan));
-        self.push(
-            Attention::PlanDecode {
-                kv_indptr,
-                kv_indices,
-                last_page_len,
-                kv_len,
-                q_heads: 1,
-                kv_heads: 1,
-                head_dim: 4,
-                window: None,
-                plan,
-            }
-            .into(),
-            guard,
-        );
-        plan
-    }
-
     /// The same plan build, but reading its `kv_indptr` from a value the
-    /// caller names rather than from a fresh runtime input.
-    ///
-    /// THE ONE SHAPE `region::hoist` REFUSES, when the caller hands it an op's
-    /// output: a plan build over an activation is host work with no instant to
-    /// run in — after the graph computed the number, and before the graph the
-    /// build's own struct is read by.
+    /// caller names rather than from a fresh runtime input — the one shape
+    /// `region::hoist` refuses, since a plan build over an activation has no
+    /// instant to run in.
     pub(crate) fn prepare_over(&mut self, kv_indptr: ValueId, guard: Guard) -> ValueId {
         let kv_indices = self.input(1);
         let last_page_len = self.input(1);
@@ -235,14 +161,6 @@ impl Build {
         o
     }
 
-    /// A collective — the family P3 may never elide.
-    pub(crate) fn all_gather(&mut self, x: ValueId, width: u64, guard: Guard) -> ValueId {
-        let node = self.trace.nodes.len() as u32;
-        let y = self.value(Def::Op(node), act(width));
-        self.push(Collective::AllGather { x, y }.into(), guard);
-        y
-    }
-
     /// A cache write: an effect root, and it hands nothing back.
     pub(crate) fn append(&mut self, x: ValueId, guard: Guard) -> usize {
         let cache = self.cache();
@@ -265,8 +183,7 @@ impl Build {
         self.value(Def::Merge(arms.to_vec()), act(width))
     }
 
-    /// The `"out"` seam — what a trace writes the forward's return value as,
-    /// and therefore what roots the demand walk and pins the arena to fire end.
+    /// The `"out"` seam: roots the demand walk and pins the arena to fire end.
     pub(crate) fn out(&mut self, v: ValueId) -> &mut Build {
         self.trace.seams.push(Seam {
             seam: "out".to_string(),

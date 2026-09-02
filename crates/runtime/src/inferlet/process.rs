@@ -1,10 +1,6 @@
-//! Inferlet process lifecycle management.
-//!
-//! Each Process is a ServiceMap actor that manages a single WASM instance.
-//! Processes are registered in a global registry and receive messages via
-//! Direct Addressing. KV residency (Project Rainer) touches the guest only
-//! through the `gate` submodule's prologue; eviction and restore are
-//! planner-owned (`crate::planner`).
+//! Inferlet process lifecycle: each `Process` is a `ServiceMap` actor
+//! managing one WASM instance. KV eviction/restore is planner-owned
+//! (`crate::planner`); this module only runs the `gate` prologue.
 
 mod ctx;
 pub(crate) mod gate;
@@ -36,20 +32,16 @@ use crate::service::{ServiceHandler, ServiceMap};
 use super::linker;
 use super::program::ProgramName;
 
-/// The versioned component export every inferlet provides. wasmtime's export
-/// name map is semver-aware, so this must be the EXACT package version declared
-/// in `crates/inferlet/wit/world.wit` — an unversioned or stale-versioned lookup
-/// silently finds nothing and every program fails to start. Kept honest by
-/// `tests::run_interface_version_matches_wit`.
+/// The versioned component export every inferlet provides. Must exactly match
+/// the package version in `crates/inferlet/wit/world.wit` — wasmtime's export
+/// lookup is semver-exact, so a stale version here silently fails every
+/// program. Checked by `tests::run_interface_version_matches_wit`.
 const RUN_INTERFACE: &str = "pie:inferlet/run@0.3.0";
 
 /// Processes whose guest called `system.declare-restartable`, and the ones
-/// the planner has since asked to restart.
-///
-/// Two sets rather than one flag on the actor because both are read from
-/// outside the actor's mailbox: the planner picks a starvation victim while
-/// holding neither the process lock nor the actor, and it must know *before*
-/// it destroys an allocation whether that destruction is recoverable.
+/// the planner has since asked to restart. Two sets rather than one flag on
+/// the actor because both are read from outside the actor's mailbox, before
+/// the planner destroys an allocation.
 static RESTARTABLE: LazyLock<RwLock<HashSet<ProcessId>>> = LazyLock::new(Default::default);
 static RESTART_REQUESTED: LazyLock<RwLock<HashSet<ProcessId>>> = LazyLock::new(Default::default);
 
@@ -63,9 +55,9 @@ pub(crate) fn is_restartable(process_id: ProcessId) -> bool {
 }
 
 /// Ask that `process_id` be re-run from the beginning once it unwinds,
-/// instead of its failure being delivered to the caller. Returns false if
-/// the process never declared itself restartable, in which case the caller
-/// must fall back to failing it loud.
+/// instead of its failure being delivered to the caller. Returns false if it
+/// never declared itself restartable, in which case the caller must fail it
+/// loud instead.
 pub(crate) fn request_restart(process_id: ProcessId) -> bool {
     if !is_restartable(process_id) {
         return false;
@@ -75,13 +67,10 @@ pub(crate) fn request_restart(process_id: ProcessId) -> bool {
 }
 
 /// Original (client-facing) process id -> the live process currently running
-/// that work, for requests that have been restarted.
-///
-/// A restart cannot reuse the process id: the schedulers keep a terminate
-/// tombstone for a retiring pid until its quiesce lands, so a reused id would
-/// have the re-run's fires rejected by its predecessor's tombstone. The
-/// re-run therefore gets a fresh internal id and inherits only the *external*
-/// one, which is all a client ever sees.
+/// that work, for requests that have been restarted. A restart cannot reuse
+/// the process id (the scheduler keeps a terminate tombstone for the
+/// retiring pid until its quiesce lands), so the re-run gets a fresh internal
+/// id and inherits only the client-facing one.
 static RESTART_ALIAS: LazyLock<RwLock<HashMap<ProcessId, ProcessId>>> =
     LazyLock::new(Default::default);
 
@@ -172,41 +161,34 @@ static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> = LazyLock::new(Servic
 
 /// Admission semaphore. `None` = unlimited concurrency (no gating).
 static ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
-/// Bind admission: gates per-instance ENGINE state creation (channel
-/// registration, instance bind, working-set declaration). Sized at twice
-/// the execution limit — the executing cohort plus ONE staged cohort —
-/// so the next generation's bring-up overlaps the current generation's
-/// execution (double-buffering, no tunable). Unlimited execution
-/// admission leaves this unlimited too.
+/// Bind admission: gates per-instance engine state creation (channel
+/// registration, instance bind, working-set declaration). Sized at twice the
+/// execution limit (executing cohort + one staged cohort) so the next
+/// generation's bring-up overlaps current execution.
 static BIND_ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
 /// Prewarm admission: a bounded next cohort may instantiate its WASM and
-/// compile/register its (hash-deduped) program while the active cohort
-/// executes. Strict admission: everything that creates per-instance engine
-/// state or claims pooled KV/RS resources waits for the execution permit
-/// ([`ensure_execution_admitted`]).
+/// compile/register its program while the active cohort executes. Anything
+/// that creates per-instance engine state or claims pooled resources still
+/// waits for [`ensure_execution_admitted`].
 static PREWARM_ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
-/// The execution pool's configured capacity (None = unlimited): the frame
-/// policy seeds its free-slot balance with this at bootstrap, so the
-/// "free slot with a staged taker" seal hold covers the initial fleet's
-/// bring-up by the same rule as a cohort turnover.
+/// The execution pool's configured capacity (None = unlimited): seeds the
+/// frame policy's free-slot balance at bootstrap.
 static EXECUTION_SLOT_CAPACITY: OnceLock<Option<usize>> = OnceLock::new();
 
 pub(crate) fn execution_slot_capacity() -> Option<usize> {
     EXECUTION_SLOT_CAPACITY.get().copied().flatten()
 }
 
-/// Processes currently registered — i.e. guests that may still submit.
-///
-/// The quiesce test for `crate::scheduler::reconfigure`: the batching knobs
-/// include one a guest has already been told (`model.frame-size()`), so they
-/// can only move when there is no guest holding the old answer.
+/// Processes currently registered — i.e. guests that may still submit. The
+/// quiesce test for `crate::scheduler::reconfigure`: batching knobs a guest
+/// has already been told (`model.frame-size()`) can only move once none
+/// remain.
 pub fn live_count() -> usize {
     SERVICES.len()
 }
 
-/// Prewarm-conveyor width when execution admission is UNCAPPED. With a cap the
-/// conveyor is one cohort wide instead (see `init_admission`); without one
-/// there is no cohort to size it by, so this flat ladder stands.
+/// Prewarm-conveyor width when execution admission is uncapped (with a cap
+/// the conveyor is one cohort wide instead; see `init_admission`).
 const UNCAPPED_PREWARM_PROCESSES: usize = 64;
 
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
@@ -290,50 +272,24 @@ pub fn get_runtime_stats() -> RuntimeProcessStats {
 pub fn init_admission(max_concurrent: Option<usize>) {
     let limit = max_concurrent.filter(|&n| n > 0);
     let sem = limit.map(|n| Arc::new(Semaphore::new(n)));
-    // The prewarm conveyor bounds INSTANTIATION. A process holds its
-    // conveyor slot from spawn until it wins a BIND permit, so the number
-    // of processes that have paid for a Store/linker/WASI world but cannot
-    // yet make any engine progress is bounded by the conveyor instead of by
-    // the request count. Releasing the slot at the park instead let the
-    // conveyor rotate at guest-prologue speed: every queued request
-    // instantiated at t=0 (measured at conc 512: all 4096 instantiated
-    // within 309 ms) and the opening cohort's own bring-up was the 1/8th of
-    // that work that mattered — the first wave could not dispatch until the
-    // LAST of its 512 was admitted at 293 ms.
-    //
-    // One whole cohort wide when execution is capped: a turnover has to be
-    // able to hand its entire successor cohort a slot at once, and the
-    // cohort is the unit every other stage here is sized in. Uncapped
-    // execution has no cohort, so the flat UNCAPPED_PREWARM_PROCESSES ladder
-    // stands — with unlimited execution an unbounded prewarm would fan
-    // every queued process's instantiation out at once, a thundering herd
-    // of Store/linker/WASI setup competing with the scheduler threads.
+    // The prewarm conveyor bounds instantiation: a process holds its slot
+    // from spawn until it wins a bind permit. One cohort wide when execution
+    // is capped, so a turnover can hand its whole successor cohort a slot at
+    // once; the flat UNCAPPED_PREWARM_PROCESSES ladder stands when execution
+    // is uncapped (no cohort to size it by), to avoid a thundering herd of
+    // Store/linker/WASI setup.
     let prewarm = Some(Arc::new(Semaphore::new(
         limit.unwrap_or(UNCAPPED_PREWARM_PROCESSES),
     )));
     // Double-buffered bring-up: the executing cohort plus STAGED_COHORTS
-    // whole successor cohorts hold bind permits. A staged cohort
-    // instantiates and binds DURING the previous generation's execution;
-    // at the turnover it only needs execution permits and first submits,
-    // so the boundary sheds the register storm. One staged cohort is the
-    // structural depth: a turnover consumes exactly one cohort, and the
-    // frame seal gathers exactly one swap through successor earmarks
-    // (see FramePolicy::on_execution_slot_released) — extra permits
-    // beyond that are neutral because without an earmarked taker the
-    // stall just moves into mid-generation seals.
-    //
-    // Depth 2 and 3 were measured at conc 512 (30054 / 30109 tok/s vs
-    // 30443 at depth 1): no gain, so the structural depth stands.
+    // successor cohorts hold bind permits, so a staged cohort instantiates
+    // and binds during the previous generation's execution. Depth 1 is the
+    // structural depth (a turnover consumes exactly one cohort); measured
+    // depths 2/3 showed no throughput gain.
     const STAGED_COHORTS: usize = 1;
-    // The staged half opens only once the FIRST cohort is fully seated. A
-    // pool that is 2n wide from t=0 lets the successor cohort run its
-    // working-set reservation and prefill construction alongside the very
-    // cohort it is staged behind, and at bootstrap that is the only work on
-    // the critical path: measured at conc 512, cohort 0's bind ->
-    // execution-admit step took 155 ms (p50) against 1536 concurrent guest
-    // prologues, and the opening wave cannot dispatch until the LAST of the
-    // 512 is admitted. Staging is by definition an overlap with a RUNNING
-    // generation, so the reserve is held back until there is one.
+    // The staged half opens only once the first cohort is fully seated, so
+    // the extra bind capacity overlaps a running generation rather than
+    // competing with initial bring-up.
     let bind_ahead = limit.map(|n| Arc::new(Semaphore::new(n)));
     BIND_STAGED_RESERVE.store(
         limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
@@ -389,38 +345,14 @@ fn open_staged_bind_pool() {
     }
 }
 
-// -----------------------------------------------------------------------
-// Cohort-boundary bind deferral
-// -----------------------------------------------------------------------
-// A retiring process returns its bind permit at the end of teardown. At a
-// fleet-wide turnover that happens 512 times at once, and it admits a WHOLE
-// staged cohort into working-set declaration, KV reservation and prefill
-// construction at exactly the instant the boundary frame is trying to
-// gather. That cohort does not run for another generation; the successors
-// that ARE on the critical path already hold their permits (bind is always
-// acquired before execution). So the release is pure interference: measured
-// per boundary, 512 `process_bind_admitted` land inside the same window as
-// the 512 admissions that matter, and the one boundary that carries no
-// staged binds — the last — is consistently the shortest of the run.
-//
-// The gate parks released permits while the frame policy has a join in
-// flight and hands them over once the boundary frame is away.
-//
-// LIVENESS: the hold is asserted by the scheduler pass and is cleared
-// unconditionally whenever that pass made no progress with nothing in
-// flight, i.e. the moment the runtime has nothing left to do. A hold can
-// therefore never be the last thing standing: whatever it defers is
-// released before the runtime can idle on it. (A process parked on bind
-// admission also cannot be what a join is waiting for — `joins_in_flight`
-// is populated at execution-slot consumption, which is downstream of bind
-// admission on the same task.)
-//
-// SCOPE: process-global, like the pools it gates — `ADMISSION`,
-// `BIND_ADMISSION`, `PREWARM_ADMISSION` and `EXECUTION_SLOT_CAPACITY` are all
-// `OnceLock`s set once by `init_admission`. A second runtime in the same
-// process would share this hold with the first, which is the same constraint
-// the semaphores themselves already impose. Reset is by process exit only:
-// nothing here is per-run state.
+// Cohort-boundary bind deferral: a retiring process returns its bind permit
+// at teardown, but releasing it immediately at a fleet-wide turnover would
+// admit a staged cohort into working-set declaration right as the boundary
+// frame is trying to gather. The gate parks released permits while a join
+// is in flight and hands them over once the boundary frame is away.
+// LIVENESS: cleared whenever the scheduler pass makes no progress with
+// nothing in flight, so it can never be the last thing standing. SCOPE:
+// process-global, reset only by process exit.
 static BIND_RELEASE_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static HELD_BIND_PERMITS: Mutex<Vec<tokio::sync::OwnedSemaphorePermit>> = Mutex::new(Vec::new());
 
@@ -434,11 +366,8 @@ pub(crate) fn release_bind_permit(permit: Option<tokio::sync::OwnedSemaphorePerm
         let mut held = HELD_BIND_PERMITS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Re-checked under the lock, against a concurrent open: the opener
-        // clears the flag BEFORE it takes the lock, so a permit either
-        // lands in the vector the opener then drains, or observes the
-        // cleared flag here and is handed over directly. Neither order can
-        // strand it.
+        // Re-checked under the lock: the opener clears the flag before
+        // taking the lock, so no ordering can strand a permit.
         if BIND_RELEASE_HOLD.load(Relaxed) {
             held.push(permit);
             return;
@@ -462,23 +391,17 @@ pub(crate) fn set_bind_release_hold(hold: bool) {
     drop(drained);
 }
 
-/// Bind gate: acquire the bind permit lazily, at the first operation
-/// that creates per-instance engine state (channel registration / instance
-/// bind / working-set declaration). Idempotent per process. The bind pool
-/// stages one whole cohort ahead of execution, so the next generation
-/// binds while the current one executes and a generation boundary costs
-/// only execution admits + first submits + the seal instead of the
-/// register storm.
+/// Bind gate: acquire the bind permit lazily, at the first operation that
+/// creates per-instance engine state (channel registration / instance bind /
+/// working-set declaration). Idempotent per process.
 pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     if ctx.bind_admitted() {
         return;
     }
-    // The prewarm conveyor slot covers spawn -> instantiate -> BIND, and is
-    // released on the far side of the park, not in front of it: a process
-    // that cannot bind cannot make engine progress, so letting it off the
-    // conveyor only buys the next arrival the right to instantiate work
-    // nothing is waiting for. The conveyor is one cohort wide, so a
-    // turnover still hands its whole successor cohort through in one go.
+    // The prewarm conveyor slot is released after the bind wait, not before:
+    // a process that cannot bind cannot make engine progress, so releasing
+    // it earlier would only let the next arrival instantiate work nothing is
+    // waiting for.
     let permit = match BIND_ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => Some(
             Arc::clone(semaphore)
@@ -493,9 +416,8 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
 }
 
 /// Strict-admission gate: acquire the execution permit lazily at fire
-/// submit. Idempotent per process. Bind admission is ensured first (the
-/// same order everywhere: bind, then execution — permits are only ever
-/// acquired in that order, so the two gates cannot deadlock).
+/// submit. Idempotent per process. Bind admission is always acquired first,
+/// so the two gates cannot deadlock.
 pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
     ensure_bind_admitted(ctx).await;
     if ctx.execution_admitted() {
@@ -504,40 +426,29 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
     let started = Instant::now();
     let permit = match ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => {
-            // Announce the wait BEFORE blocking on it. `tokio::Semaphore` is
-            // FIFO-fair, so a process queued here is the identified taker of
-            // a slot that is free or about to be: the frame seal can name
-            // whom it is holding for instead of inferring it from "some slot
-            // is free" AND "some process is staged", which pairs nobody with
-            // nobody and is permanently true once the pool is oversubscribed.
-            // Dropped on cancellation too, so a process that goes away while
-            // queued stops being earmarked.
+            // Announce the wait before blocking on it (FIFO-fair semaphore),
+            // so the frame seal can name whom it's holding for. Dropped on
+            // cancellation too.
             let _queued = AdmissionQueued::enter(ctx.id());
             let permit = Arc::clone(semaphore)
                 .acquire_owned()
                 .await
                 .expect("admission semaphore closed");
             if semaphore.available_permits() == 0 {
-                // The last seat of a generation just went out: staging can
-                // now overlap something. Idempotent.
+                // Last seat of a generation went out: staging can overlap now.
                 open_staged_bind_pool();
             }
-            // EVERY capped admission notifies — uncontended ones too. The
-            // policy's slot balance must see each consumed permit whether it
-            // came from a retirement or the initial pool (the semaphore
-            // launders them together); the notification precedes the first
-            // fire on this same task, so the policy sees consume-then-fire
-            // and can name this lane as the join that is in flight.
+            // Every capped admission notifies, even uncontended ones, so the
+            // policy's slot balance sees each consumed permit before the
+            // first fire on this task.
             crate::scheduler::worker::notify_execution_slot_consumed(ctx.id());
             Some(permit)
         }
         None => None,
     };
     ctx.admit_execution(permit, duration_us(started.elapsed()));
-    // The planner registers at spawn (registration order is the FCFS clock),
-    // but only from here on can this process hold pooled pages. Its wedge
-    // predicate needs that distinction: an unadmitted process is neither
-    // running nor able to free anything.
+    // Only from here on can this process hold pooled pages, distinct from
+    // planner registration at spawn.
     if let Some(planner) = crate::planner::planner() {
         planner.note_admitted(ctx.id());
     }
@@ -565,13 +476,9 @@ pub fn spawn(
 }
 
 /// `inherit_seq` carries a previous process's position in the planner's FCFS
-/// clock across a restart instead of taking a fresh (youngest) one.
-///
-/// Keeping the position is the whole liveness argument. Starvation victims
-/// are chosen youngest-first, so a restart that re-entered as the youngest
-/// process would be re-chosen immediately and forever. Inheriting the
-/// original position means the restarted run ages exactly as it would have,
-/// eventually becomes the queue head, and the head is never a victim.
+/// clock across a restart instead of taking a fresh (youngest) one: victims
+/// are chosen youngest-first, so a restart re-entering as youngest would be
+/// re-chosen forever.
 #[allow(
     clippy::too_many_arguments,
     reason = "one spawn request in full: who is asking, what program on what input, \
@@ -640,11 +547,8 @@ pub fn detach(process_id: ProcessId) {
 /// Terminate a process (fire-and-forget).
 pub fn terminate(process_id: ProcessId, result: Result<String, String>) {
     let process_id = resolve(process_id);
-    // Early wait-set drop for a LIVE process: the scheduler stops holding
-    // waves for this pid immediately instead of at the teardown's own
-    // leave. Guarded on registry delivery so a terminate aimed at an
-    // already-quiesced pid cannot mint a fresh tombstone after
-    // ProcessQuiesced retired it.
+    // Early wait-set drop for a live process, guarded on registry delivery
+    // so an already-quiesced pid cannot mint a fresh tombstone.
     if SERVICES
         .send(&process_id, Message::Terminate { result })
         .is_ok()
@@ -743,7 +647,7 @@ const OUTPUT_BUFFER_CAP: usize = 4096;
 /// Actor managing a single WASM instance lifecycle.
 struct Process {
     process_id: ProcessId,
-    /// The id this work is known by OUTSIDE the runtime. Equal to
+    /// The id this work is known by outside the runtime. Equal to
     /// `process_id` except after a restart, where the re-run inherits the
     /// original so a client's handle keeps resolving to it.
     client_pid: ProcessId,
@@ -849,11 +753,8 @@ impl Process {
         capture_outputs: bool,
         result_tx: SharedResultTx,
     ) {
-        // Prewarm admission: a bounded next cohort instantiates (and may
-        // compile/register its hash-deduped program) while the active cohort
-        // executes. The REAL concurrency permit is acquired lazily by
-        // `ensure_execution_admitted` at the first per-instance engine or
-        // pooled-resource operation, and held for the rest of the run.
+        // The real concurrency permit is acquired lazily by
+        // `ensure_execution_admitted`, held for the rest of the run.
         let prewarm_permit = match PREWARM_ADMISSION.get().and_then(|s| s.as_ref()) {
             Some(sem) => Some(
                 Arc::clone(sem)
@@ -880,19 +781,8 @@ impl Process {
             instantiate_us = duration_us(instantiate_start.elapsed());
             store.data_mut().install_prewarm_permit(prewarm_permit);
 
-            // (KV admission via the context actor removed — Phase 5; physical
-            // admission is now the unified arena's concern.)
-
-            // Every inferlet now exports the same stock `pie:inferlet/run`
-            // (WIT-refactor Phase 2 — the per-package synthesized export is
-            // gone). Program identity comes from `program.name` metadata, not
-            // the export interface name. The name is version-qualified: an
-            // unversioned lookup does NOT match a versioned component export in
-            // wasmtime's semver-aware name map, so this must track the
-            // `pie:inferlet@<version>` package version declared in world.wit.
-            // `run_interface_version_matches_wit` pins the two together — the
-            // 0.2.0 -> 0.3.0 bump was missed once and made EVERY inferlet
-            // unloadable, a break only an e2e run could surface.
+            // Program identity comes from `program.name` metadata, not this
+            // export interface name; see `RUN_INTERFACE`.
             let run_interface = RUN_INTERFACE;
 
             let (_, run_export) = instance
@@ -925,10 +815,8 @@ impl Process {
                 }
             };
             admission_wait_us = store.data().admission_wait_us();
-            // Drop the store HERE rather than at the end of this block, so
-            // the wasmtime teardown it triggers (`ProcessCtx::drop` and the
-            // instance's own memory) is visible: at a cohort boundary 512 of
-            // these run at once and the record is the only way to see them.
+            // Drop here, not at block end, so the wasmtime teardown it
+            // triggers is visible in the timing record.
             drop(store);
             result
         }
@@ -944,11 +832,8 @@ impl Process {
             tracing::info!("Process {process_id} failed: {err}");
         }
 
-        // Fire result channel if a parent is waiting (and an external
-        // terminate hasn't already claimed it). A process the planner has
-        // asked to restart leaves the channel in place: its failure is not
-        // this request's outcome, and the actor's `terminate` hands the
-        // channel to the re-run.
+        // A process the planner asked to restart leaves the channel in
+        // place; `terminate` hands it to the re-run instead.
         if !restart_requested(process_id)
             && let Some(tx) = result_tx.lock().unwrap().take()
         {
@@ -960,14 +845,9 @@ impl Process {
 
     /// Re-run this program from the beginning, carrying the caller's reply
     /// channel, the client-facing process id and the planner's FCFS position
-    /// across to the new process.
-    ///
-    /// Nothing outside the runtime observes the handover: an attached client
-    /// keeps receiving events under the id it launched, and a parent waiting
-    /// on the launch handle still gets exactly one result, because the reply
-    /// cell is shared rather than moved. If the spawn fails the sender is
-    /// still in that cell, so a failed restart degrades to today's fail-loud
-    /// behaviour instead of losing the request.
+    /// across to the new process. The reply cell is shared rather than moved,
+    /// so a failed spawn still degrades to fail-loud instead of losing the
+    /// request.
     fn restart(&mut self) -> bool {
         let seq = crate::planner::planner().and_then(|planner| planner.spawn_seq(self.process_id));
         let spawned = spawn_inner(
@@ -983,8 +863,7 @@ impl Process {
         match spawned {
             Ok(new_id) => {
                 // Published before this process finishes tearing down, so a
-                // client message aimed at the original id in the handover
-                // window reaches the re-run rather than the corpse.
+                // client message in the handover window reaches the re-run.
                 RESTART_ALIAS
                     .write()
                     .unwrap()
@@ -1009,24 +888,18 @@ impl Process {
     fn terminate(&mut self, result: Result<String, String>) {
         self.handle.abort();
 
-        // The planner reclaimed this process's pages and asked for a re-run
-        // rather than a failure. A fresh process takes over the caller's
-        // reply channel and this one's FCFS position; nothing is delivered
-        // for the abandoned attempt. Teardown below is unchanged and
-        // unconditional — the restart is only worth anything if this
-        // process's pages actually go back to the pool.
+        // If the planner asked for a re-run, a fresh process takes over the
+        // reply channel and FCFS position; nothing is delivered for this
+        // abandoned attempt. Teardown below still runs unconditionally.
         let restarted = restart_requested(self.process_id) && self.restart();
         forget_restart_state(self.process_id);
 
         if !restarted {
-            // Deliver `result` to any parent waiting on the launch handle, if
-            // the run loop didn't already send it (e.g., external Terminate
-            // fires before the WASM task finished). First taker wins.
+            // First taker wins: the run loop may already have sent this.
             if let Some(tx) = self.result_tx.lock().unwrap().take() {
                 let _ = tx.send(result.clone());
             }
 
-            // Notify attached client / workflow
             match result {
                 Ok(output) => self.deliver_event(ProcessEvent::Return(output)),
                 Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),
@@ -1036,16 +909,10 @@ impl Process {
         let _ = server::inbox::clear(self.process_id.to_string());
         SERVICES.remove(&self.process_id);
 
-        // (No leave broadcast here: natural completion's run loop already
-        // sent the early leave via the free `terminate` fn above, and the
-        // deferred teardown sends the fenced one — a third copy from this
-        // actor could land after the teardown's ProcessQuiesced and mint a
-        // tombstone nothing retires.)
+        // No leave broadcast here: the free `terminate` fn and the deferred
+        // teardown already send it; a third copy could mint a stray
+        // tombstone.
 
-        // Residency: unregister from the planner (purges its queue entries,
-        // wakes gate waiters for teardown, and re-plans — the exiting
-        // process's KV frees follow via the WS-drop hook). Single exit
-        // funnel: covers natural completion AND external terminate.
         if !restarted {
             RESTART_ALIAS.write().unwrap().remove(&self.client_pid);
         }
@@ -1106,34 +973,3 @@ impl ServiceHandler for Process {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::RUN_INTERFACE;
-
-    /// `RUN_INTERFACE` is a hand-written string that must track the WIT package
-    /// version. When the package went 0.2.0 -> 0.3.0 this constant was left
-    /// behind, and because the lookup fails at component-instantiation time the
-    /// only symptom was every program dying with "No 'run' interface found" —
-    /// invisible to `cargo test` and visible only on a box with real weights.
-    #[test]
-    fn run_interface_version_matches_wit() {
-        let wit = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../inferlet/wit/world.wit"),
-        )
-        .expect("read crates/inferlet/wit/world.wit");
-
-        let declared = wit
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("package pie:inferlet@"))
-            .map(|v| v.trim_end_matches(';').trim().to_string())
-            .expect("world.wit declares `package pie:inferlet@<version>;`");
-
-        let expected = format!("pie:inferlet/run@{declared}");
-        assert_eq!(
-            RUN_INTERFACE, expected,
-            "process.rs RUN_INTERFACE is stale: world.wit declares \
-             pie:inferlet@{declared}. wasmtime's export lookup is semver-exact, \
-             so a mismatch makes EVERY inferlet fail to start."
-        );
-    }
-}

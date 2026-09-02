@@ -1,40 +1,8 @@
-//! What the plan says about its own caches: the rows' readings and the
-//! schedules the plan ops carve.
-//!
-//! **THE PAGE ARITHMETIC IS NO LONGER HERE.** `Paging`, `Seat`, `Geometry`,
-//! `geometry`/`geometry_with` and `indptr` — every item this file used to
-//! carry a `// model_exec::store candidate` marker over — live in
-//! [`model_exec::store::kv`], byte-identical on both shells and host-tested
-//! there. What is re-exported below is that module, spelled at the path this
-//! shell's callers already use; what is written out below it is the half that
-//! did NOT survive the merge, because the two shells' probes disagree.
-//!
-//! # Why this shell's `probe` stayed
-//!
-//! The Metal twin reads a schedule's reading off the LAUNCHES that consume
-//! it (two passes, refusing when two launches disagree). This one reads it
-//! off the plan op that CARVES it (three passes), keeps a [`StructKind`]
-//! beside the reading because the reading alone does not say which builder
-//! runs, and walks the latent (mla) arms the other shell has no kernels for.
-//! That is a behaviour difference rather than a spelling one, so it is stated
-//! twice on purpose until the Metal plane grows the same ops.
-//!
-//! # The three questions
-//!
-//! A paged kv space answers three, and confusing them is how a cache silently
-//! reads somebody else's tokens:
-//!
-//! ```text
-//! which pages does lane L own?     the PAGING — static, per slot, per load
-//! how much of them is live?        kv_len / last_page_len — per fire, per lane
-//! where does token T land?         write_page / write_offset — per fire, per row
-//! ```
-//!
-//! The first is a deployment's budget. The second is what the attention
-//! schedule is planned against. The third is what the append kernel writes
-//! through, and it is stated per token rather than derived from a position
-//! because a derivation cannot spell a fresh-page write that is not the page
-//! run's tail (`kernels/attn/kv.cuh`, the explicit-descriptor writer).
+//! What the plan says about its own caches: rows' readings and the schedules
+//! plan ops carve. Page arithmetic lives in [`model_exec::store::kv`] and is
+//! re-exported below; `probe` stays shell-local (three passes, including the
+//! latent/mla arms) since this shell reads a schedule off the op that carves
+//! it, unlike the Metal shell.
 
 use model_ir::{Attention, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
@@ -79,16 +47,11 @@ pub fn width_of(trace: &Trace, value: ValueId) -> Result<u64> {
     Ok(model_exec::store::kv::width_of(trace, value)?)
 }
 
-/// One attention schedule as its plan op states it: which struct it defines —
-/// the builder that runs, and the workspace the builder wants — and the
-/// reading it is carved for.
-///
-/// The two are not the same question, and the shell needs both. A latent
-/// schedule and a paged one can be carved for readings that look alike in
-/// [`SpaceFacts`] and still want workspaces two orders of magnitude apart,
-/// because the buffer each builder stages is shaped by its own kernels'
-/// grid ([`Inputs::reserve`](crate::inputs::Inputs::reserve)).
-///
+/// One attention schedule as its plan op states it: which struct it defines
+/// (the builder that runs) and the reading it is carved for. Both are needed:
+/// two schedules can share a [`SpaceFacts`] reading yet want workspaces of
+/// very different sizes, since the buffer each builder stages is shaped by
+/// its own kernel's grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScheduleFacts {
     /// The host struct the plan op's output value declares.
@@ -98,7 +61,6 @@ pub struct ScheduleFacts {
 }
 
 /// Everything the plan restates about its own caches, keyed two ways.
-///
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
     /// Per `Trace::caches` ROW: what the paged launches that walk it restate
@@ -113,12 +75,8 @@ pub struct Facts {
 
 impl Facts {
     /// What the paged launches restate about one cache row, or `None` for a
-    /// row none of them reads.
-    ///
-    /// A LOOKUP AND NOT A REFUSAL: the row's bytes come off its declaration,
-    /// so a row nothing restates is a row with nothing to check — the latent,
-    /// index and pool launches walk their pages without ever naming a kv head
-    /// count, and refusing them was the whole of the M22 finding.
+    /// row none of them reads (a lookup, not a refusal: the row's bytes come
+    /// off its declaration regardless).
     #[must_use]
     pub fn row(&self, at: usize) -> Option<SpaceFacts> {
         self.rows.get(at).copied().flatten()
@@ -144,9 +102,8 @@ pub fn probe(trace: &Trace) -> Result<Facts> {
         plans: vec![None; trace.values.len()],
     };
 
-    // Pass one: the rows. `kv_heads` is stated by the prefill arms alone, so
-    // a row only a decode reads carries zero — the reading this shell has
-    // always had, kept.
+    // Pass one: the rows. kv_heads is stated by the prefill arms alone, so a
+    // row only a decode reads carries zero.
     for node in &trace.nodes {
         let Some(read) = reads(&node.op) else {
             continue;
@@ -191,14 +148,9 @@ pub fn probe(trace: &Trace) -> Result<Facts> {
         }
     }
 
-    // Pass two: the schedules, off the ops that CARVE them. A plan value is
-    // carved for ONE reading — query heads, kv heads, head width, window — and
-    // the op that builds it is where that reading has an author, so this pass
-    // reads it there rather than inferring it from whoever happens to consume
-    // the value. Beside the reading it takes the value's declared STRUCT,
-    // because the reading alone does not say which builder runs: an absorbed
-    // latent schedule and a paged one both state a head width, and the two
-    // stage workspaces of entirely different shapes.
+    // Pass two: the schedules, off the ops that carve them (not off whoever
+    // consumes the value). Also records the declared struct kind, since the
+    // reading alone does not say which builder runs.
     for node in &trace.nodes {
         let Some(carve) = carves(&node.op) else {
             continue;
@@ -219,12 +171,8 @@ pub fn probe(trace: &Trace) -> Result<Facts> {
         });
     }
 
-    // Pass three: every launch restates its share of the reading it was handed
-    // — the paged ones a head width, a window, a kv head count (the prefill
-    // arms) and a q rectangle whose width names its query heads, the latent
-    // ones their `heads` and `kv_lora_rank` outright — and a restatement the
-    // schedule was not carved for is a refusal rather than a schedule read at
-    // the wrong tile.
+    // Pass three: every launch restates its share of the reading it was
+    // handed; a restatement the schedule was not carved for is a refusal.
     for node in &trace.nodes {
         if let Some(read) = reads(&node.op) {
             let width = width_of(trace, read.q)?;
@@ -303,15 +251,10 @@ fn carves(op: &Operation) -> Option<Carving> {
                 window: *window,
             },
         }),
-        // A latent schedule is carved in the ABSORBED reading, which is the
-        // only one its kernels have: every query head reads the one shared
-        // latent plane and writes `kv_lora_rank` floats, so the rank IS the
-        // head width the planner sizes at (`plan_mla`'s `head_dim_o`, which
-        // sizes the split-kv partial buffer at one packed row per (token,
-        // head) — `kernels-cuda/src/attn/sched_mla.rs`, and `mla_fa2::pack`'s
-        // `o_stride_h = rank` beside it). There is no second kv head count to
-        // state — the plane is shared, not per kv head — and no window: the
-        // latent kernels carve no sliding spans.
+        // A latent schedule is carved in the absorbed reading: every query
+        // head reads the one shared latent plane and writes kv_lora_rank
+        // floats, so rank is the head width. No kv head count (plane is
+        // shared, not per kv head) and no window (no sliding spans).
         Attention::MlaPlan {
             heads,
             kv_lora_rank,
@@ -330,13 +273,9 @@ fn carves(op: &Operation) -> Option<Carving> {
     }
 }
 
-/// The host struct a plan op's output value declares.
-///
-/// It is read off the VALUE rather than off the op because that is where the
-/// trace states it — one op family builds two of them (`attention.plan_prefill`
-/// mints an `AttnPrefillPlan` or, where the trace asks for the sm90 kernels, an
-/// `AttnPrefillPlanSm90`) and the value's `Ty` is what says which, the same way
-/// `Run::declared` reads it at build time.
+/// The host struct a plan op's output value declares. Read off the value
+/// rather than the op: one op family builds either an `AttnPrefillPlan` or
+/// an `AttnPrefillPlanSm90`, and the value's `Ty` says which.
 ///
 /// # Errors
 ///
@@ -421,10 +360,9 @@ fn agrees(facts: &Facts, plan: ValueId, launch: &'static str, restated: Restated
     })
 }
 
-/// What one latent (mla) launch restates. It states its numbers outright
-/// rather than through a rectangle: `q` here is the ABSORBED query, already
-/// mapped into latent space by `attention.mla_absorb_q`, so its width is the
-/// same `heads x kv_lora_rank` the op names.
+/// What one latent (mla) launch restates: `q` here is the absorbed query
+/// (already mapped into latent space), so its width is `heads x
+/// kv_lora_rank`.
 struct LatentReader {
     plan: ValueId,
     heads: u32,
@@ -432,8 +370,8 @@ struct LatentReader {
 }
 
 /// The four latent launches, as one shape. They do not feed the row pass:
-/// a latent cache's pages are the compressed plane and the rope plane, which
-/// `CacheRow::Kv` already states, and no latent op restates a kv head count.
+/// `CacheRow::Kv` already states a latent cache's pages, and no latent op
+/// restates a kv head count.
 fn latents(op: &Operation) -> Option<LatentReader> {
     let Operation::Attention(op) = op else {
         return None;
@@ -477,18 +415,15 @@ mod tests {
 
     #[test]
     fn a_rows_heads_are_read_off_the_ops_that_restate_them() {
-        // A `CacheRow::Kv` carries a per-token row and an element, and nothing
-        // else: a row's heads and head width live on `Attention::Decode`/
-        // `Prefill`, which walk it. A schedule's reading is stated by the plan
-        // op that carves it, and the launches restate their share. Reading
-        // both here is what keeps a pool's shape and a model's text from being
-        // two opinions.
-        let trace = models::trace_of("qwen35-d0.8b-bf16-kv-bf16")
-            .expect("the catalog ships the smoke's SKU");
+        // Pins probe() against a real hybrid SKU (qwen3.5): row/schedule
+        // facts, and that state (recurrent) caches are excluded.
+        let trace = models::sku("qwen35-d0.8b-bf16-kv-bf16")
+            .expect("the catalog ships the smoke's SKU")
+            .trace;
         let plan = trace(model_dsl::Platform::Cuda);
         let facts = probe(&plan).expect("a hybrid SKU's caches read");
 
-        // qwen's 18 attention layers each declare a kv row, and they agree.
+        // qwen's 18 attention layers each declare a kv row.
         let stated: Vec<SpaceFacts> = facts.rows.iter().flatten().copied().collect();
         assert!(!stated.is_empty(), "qwen3.5 declares kv rows");
         for row in &stated {
@@ -496,8 +431,6 @@ mod tests {
             assert_eq!(row.kv_heads, 2);
         }
 
-        // And one schedule of each kind, each carved for the one reading its
-        // launches share.
         let mut readings: Vec<SpaceFacts> = facts
             .plans
             .iter()
@@ -518,10 +451,6 @@ mod tests {
             ],
         );
 
-        // The kind rides beside the reading, because the reading does not say
-        // which builder runs: qwen's schedules share one reading and are still
-        // a decode schedule beside prefill ones, and each names the struct its
-        // own plan op defines.
         let kinds: Vec<StructKind> = facts
             .plans
             .iter()
@@ -537,9 +466,7 @@ mod tests {
             "and prefill ones: {kinds:?}"
         );
 
-        // And the recurrent rows are not in it: `space_of` answers `None` for
-        // a state cache, which is what keeps the 36 gdn banks out of the page
-        // arithmetic entirely.
+        // recurrent (state) rows are excluded: space_of answers None for them
         let states = plan
             .caches
             .iter()

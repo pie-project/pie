@@ -1,73 +1,4 @@
-//! `emit_scan_region_cuda` — the `cumsum` / `cumprod` library region.
-//!
-//! The partitioner cuts a scan into a region of its own
-//! ([`RegionKind::Library(LibraryOp::Scan)`]) for the same reason it cuts
-//! `top_k`: an inclusive prefix is a schedule barrier. This backend refused it,
-//! and because the CUDA shell runs compiled regions and nothing else the
-//! refusal was fatal at registration — `locally-typical-sampling` and
-//! `tail-free-sampling` both cut their candidate set with
-//! `cumsum(p) - p`, and `mtp-speculative-decoding` builds its accept prefix
-//! with `cumprod`, so all three failed with `stage 0 region N was declined by
-//! the emitter (generated region contains a non-generated boundary (scan))`.
-//!
-//! # THE SCAN IS SEQUENTIAL, AND THAT IS THE WHOLE DESIGN
-//!
-//! The reference — `engine::program`'s `tags::CUMSUM | tags::CUMPROD`, and the
-//! `ptir_m1_execute` block this replaces — is a strict left-to-right fold per
-//! row: `acc = acc ⊕ x[j]`, `acc` starting at the identity. Every parity gate
-//! over this plane compares BYTES, not tolerances, and the device compiles
-//! with `--fmad=false --prec-div=true --prec-sqrt=true` because bit-for-bit
-//! reproducibility is the channel plane's first contract.
-//!
-//! Floating-point addition is not associative, so **no parallel scan can
-//! reproduce that fold**. The usual chunked form — each worker folds its chunk
-//! from the identity, then a carry is added on — computes
-//! `(fold(c₀) ⊕ fold(c₁)) ⊕ …` where the reference computes one unbroken
-//! chain, and the two round differently. Re-folding each chunk from its true
-//! carry would fix the rounding, but obtaining the true carry at a chunk
-//! boundary *is* the sequential chain, so nothing is saved. The only exact
-//! parallel case is the integer one, where the wrapping arithmetic really is
-//! associative — and specialising on dtype to buy a path the ranking guests
-//! never take is complexity for nothing.
-//!
-//! So the fold stays sequential, and the parallelism this kernel does take is
-//! the one that costs no rounding: **one row per thread**. A rank-2 scan over
-//! `rows` rows runs `min(rows, blockDim.x)` folds at once; a rank-1 scan runs
-//! one. That is strictly better than the single-thread runtime block it
-//! replaces (which walked every row on one lane), and for the single-row case
-//! it is already at the floor: the dependent chain of `len` FADDs is what a
-//! left-to-right fold *is*, and no bit-exact implementation can be shorter.
-//! The loads are sequential and independent of the accumulator, so they
-//! pipeline; only the arithmetic serialises.
-//!
-//! In practice the rows are short. Both ranking guests scan their `k_max`
-//! candidate row (128 by default), not the vocabulary, and the speculative
-//! decoder's `cumprod` is over its draft length.
-//!
-//! # Dtype
-//!
-//! Scanned in the OPERAND's dtype, which the result type equals
-//! (`infer.rs` pushes the operand type unchanged). This is transcribed from
-//! the runtime block rather than simplified: a `u32` offset scan is exactly
-//! what ragged row offsets are built from, and accumulating one through
-//! `float` is exact only below 2^24 and silently is not above it — which is
-//! [`Op::CumSum`]'s own stated reason for not being F32-only.
-//!
-//! **AND IT DISAGREES WITH THE HOST INTERPRETER, WHICH IS WORTH WRITING DOWN.**
-//! `engine::program`'s scan is still the pre-widening form: it takes
-//! `lanes_f32()` and publishes `Value::F32` whatever the operand's dtype was.
-//! Both device runtimes widened and it did not, so an INTEGER scan is a
-//! host/device divergence — one that could not be observed here until now,
-//! because a scan region on this backend did not run at all. Following the
-//! runtime block is the right side to be on (it is what `ptir_m1_execute` and
-//! Metal do, and what the op's contract says), so this kernel does, and
-//! `program_parity`'s `scan_prefix` subject stays F32 — the dtype every guest
-//! that reaches a scan actually uses, and the only one the reference agrees
-//! about. Closing the gap belongs in `engine::program`, not here.
-//!
-//! [`Op::CumSum`]: eta_ir::op::Op::CumSum
-//!
-//! [`RegionKind::Library(LibraryOp::Scan)`]: crate::plan::LibraryOp::Scan
+//! `emit_scan_region_cuda`: the `cumsum`/`cumprod` library region. Float addition is not associative, so the fold stays sequential; parallelism is one row per thread. Scanned in the operand's dtype.
 
 use crate::codegen::error::{EmitError, EmitterKind, RegionForm, ValueLayoutSite};
 use alloc::string::String;
@@ -86,11 +17,8 @@ use super::singleton::valid_identifier;
 /// The kernel body, after the three `constexpr`s the emitter writes: the
 /// operand value id, the result value id, and which fold this is.
 ///
-/// No `__syncthreads()` anywhere, deliberately: the row loop's bound differs
-/// per thread, so a barrier inside it would be reached by some threads and not
-/// others, which is undefined behaviour rather than a slow path. Nothing here
-/// needs one — every thread writes only the row it folded, and the region
-/// boundary is a kernel boundary.
+/// No `__syncthreads()`: the row loop's bound differs per thread, so a
+/// barrier inside it would be UB, and nothing here needs one.
 const BODY: &str = r#"
   // Bound to the fused ABI, and this kernel reads only part of it.
   (void)channels;
@@ -141,13 +69,9 @@ const BODY: &str = r#"
 "#;
 
 /// Whether `region` is the single-node scan library region this emitter
-/// serves, with the operand and result the op table promises.
-///
-/// A library CLAIM is not evidence, so the tag is re-read off the node rather
-/// than taken from `region.kind`: a region mislabelled `Library(Scan)` around
-/// ordinary ops would otherwise be emitted here as a prefix over the wrong
-/// operand, which is precisely the failure `validate_generated_region`'s
-/// honesty check exists to stop.
+/// serves. The tag is re-read off the node rather than trusted from
+/// `region.kind`, since a mislabelled region would otherwise be emitted
+/// here over the wrong operand.
 pub fn is_scan_region(stage: &CompiledStage, region: &Region) -> bool {
     if region.kind != RegionKind::Library(LibraryOp::Scan) || region.nodes.len() != 1 {
         return false;

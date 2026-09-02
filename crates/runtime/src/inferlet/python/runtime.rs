@@ -1,19 +1,13 @@
 //! Python runtime resources shared across the linker and program services.
 //!
-//! Tracks the configured CPython runtime directory and lazily loads the stdlib
-//! shared modules from `<py-runtime>/shared/*.wasm` when a Python component is
-//! installed or instantiated. Non-Python components should not pay this
-//! compilation cost. Loaded modules are exposed as two variants:
-//!
-//! - **Full** modules — have their data segments and start functions intact.
-//!   Used when instantiating non-snapshotted Python components (CPython needs
-//!   to initialize from scratch) and during the snapshot creation pipeline.
-//! - **Stripped** modules — have data segments, data count, and start sections
-//!   removed. Used when instantiating snapshotted components so the shared
-//!   modules don't clobber the pre-initialized memory image.
-//!
-//! Both variants are compiled at most once; snapshot status is decided
-//! per-component at instantiate time.
+//! Tracks the configured CPython runtime directory and lazily loads the
+//! stdlib shared modules from `<py-runtime>/shared/*.wasm` when a Python
+//! component is installed or instantiated, so non-Python components don't
+//! pay this compilation cost. Loaded modules come in two variants: full
+//! (data segments and start functions intact, for non-snapshotted
+//! components and snapshot creation) and stripped (those sections removed,
+//! so the shared modules don't clobber a snapshotted component's
+//! pre-initialized memory image). Both are compiled at most once.
 
 use std::fs;
 use std::path::{Path, PathBuf};

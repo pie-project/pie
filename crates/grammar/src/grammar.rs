@@ -19,14 +19,10 @@ pub(crate) struct Rule {
     pub(crate) body: ExprId,
 }
 
-/// A grammar expression node.
-///
-/// Expressions are stored in an arena (`Grammar.exprs`) and referenced by `ExprId`.
-/// This gives cache-friendly access without lifetime issues, while being fully
-/// type-safe unlike the C++ CSR-encoded flat array.
+/// A grammar expression node. Expressions are stored in an arena
+/// (`Grammar.exprs`) and referenced by `ExprId`.
 #[derive(Debug, Clone)]
 pub(crate) enum Expr {
-    /// The empty string `""`.
     EmptyString,
 
     /// A literal byte string (UTF-8 encoded).
@@ -47,7 +43,6 @@ pub(crate) enum Expr {
         ranges: Vec<(u32, u32)>,
     },
 
-    /// A reference to another rule.
     RuleRef(RuleId),
 
     /// An ordered sequence of expressions (concatenation).
@@ -65,10 +60,8 @@ pub(crate) enum Expr {
     },
 }
 
-/// An immutable context-free grammar.
-///
-/// Constructed via `Grammar::from_ebnf()` or [`GrammarCompiler`](crate::compiler::GrammarCompiler).
-/// Expressions are stored in a flat arena for cache efficiency.
+/// An immutable context-free grammar, constructed via `Grammar::from_ebnf()`
+/// or [`GrammarCompiler`](crate::compiler::GrammarCompiler).
 #[derive(Debug, Clone)]
 pub struct Grammar {
     pub(crate) rules: Vec<Rule>,
@@ -77,32 +70,26 @@ pub struct Grammar {
 }
 
 impl Grammar {
-    /// Get the root rule id.
     pub(crate) fn root_rule(&self) -> RuleId {
         self.root_rule
     }
 
-    /// Get a rule by id.
     pub(crate) fn get_rule(&self, id: RuleId) -> &Rule {
         &self.rules[id.0 as usize]
     }
 
-    /// Get an expression by id.
     pub(crate) fn get_expr(&self, id: ExprId) -> &Expr {
         &self.exprs[id.0 as usize]
     }
 
-    /// Number of rules in the grammar.
     pub fn num_rules(&self) -> usize {
         self.rules.len()
     }
 
-    /// Iterate over all rules.
     pub(crate) fn rules(&self) -> &[Rule] {
         &self.rules
     }
 
-    /// Get the root rule.
     #[cfg(test)]
     pub(crate) fn root(&self) -> &Rule {
         self.get_rule(self.root_rule)

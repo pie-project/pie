@@ -87,10 +87,13 @@ __global__ void update_appended(
     int num_requests,
     int page_size,
     int num_kv_heads,
-    int head_dim)
+    int head_dim,
+    const u32* __restrict__ win)
 {
     const int slot = blockIdx.x;
     const int kh = blockIdx.y;
+    // `num_requests` may be the key's lane ceiling; `win[2]` is the live count.
+    if (win != nullptr && static_cast<int>(win[2]) < num_requests) num_requests = static_cast<int>(win[2]);
 
     int seen = 0;
     for (int r = 0; r < num_requests; ++r) {

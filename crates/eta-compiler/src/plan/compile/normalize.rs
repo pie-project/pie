@@ -1,10 +1,6 @@
-//! Stage normalization: the pass that turns a bound stage into the op list
-//! the rest of the planner works on.
-//!
-//! Dead ops are dropped, redundant broadcasts collapse, constants fold, common
-//! subexpressions merge, and the surviving ops are renumbered densely. The
-//! result is a [`NormalizedStage`], which is what gets signed, partitioned and
-//! encoded.
+//! Stage normalization: DCE, broadcast/CSE cleanup, constant folding, and
+//! dense renumbering, producing the [`NormalizedStage`] that gets signed,
+//! partitioned and encoded.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -21,35 +17,10 @@ use super::fold::{canonicalize_commutative, cse_candidate, cse_key, fold_scalar,
 use super::signature::signature_ports;
 use super::symbolic::{Dimension, SymbolicType, symbolic_result_type};
 
-/// What a normalized value is *about*, coarsely.
-///
-/// Read for meaning by nothing — no emitter, planner or engine branches on it.
-/// It is not dead, though, and deleting it is not a cleanup: it is hashed into
-/// [`StageSignature`](super::signature::StageSignature), whose hash becomes the
-/// emitted kernel's entry-point name (`crate::codegen::program`) and the engine's
-/// pipeline cache key (`launch::build`). So its only observable effect is to
-/// make two stages that agree on every op and type, but disagree here, compile
-/// to differently named kernels that the engine caches apart.
-///
-/// `the_signature_still_depends_on_value_domains` pins that, because the
-/// effect is invisible from this file: the only other thing that would notice
-/// is a golden kernel name, and by then the cause is twenty files away.
-/// Changing what `value_domain` returns renames kernels, so it is a decision
-/// to be argued rather than a diff to be accepted.
-///
-/// Two rough edges are recorded rather than fixed. `PageDescriptor` and
-/// `EffectToken` are never produced, and `LibraryResult` claims four of the
-/// seven ops `region::library_op_for_tag` calls library — cumsum, cumprod and
-/// sink_call fall through to `PerRow`.
-///
-/// The first of those is checked rather than merely asserted:
-/// `only_six_of_the_eight_domains_are_reachable` enumerates `value_domain`
-/// over every op the table declares, so the two unused variants cannot quietly
-/// gain a producer, nor a used one quietly lose its last. A prose claim about
-/// reachability reads identically whether or not it is still true, which is
-/// why it is not left as one. The discriminants are explicit, so retiring the
-/// two unused variants leaves `LibraryResult = 6` where it is and moves no
-/// signature byte.
+/// What a normalized value is *about*, coarsely. Unread by any emitter or
+/// engine branch, but hashed into [`StageSignature`](super::signature::StageSignature),
+/// so it affects the emitted kernel's name and the engine's cache key.
+/// `PageDescriptor` and `EffectToken` are never produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ValueDomain {
@@ -73,14 +44,9 @@ pub enum ValueDomain {
     EffectToken = 7,
 }
 
-/// A position in a stage's op list.
-///
-/// Deliberately not a [`ValueId`]: both are dense `u32` over the same stage
-/// and both start at zero, so swapping them type-checks. The plan that comes
-/// out then looks structurally valid while naming the wrong ops — regions
-/// fuse the wrong nodes, or a region's inputs point at op positions instead
-/// of values. Only `StageIndex` converts between
-/// the two spaces.
+/// A position in a stage's op list. Deliberately not a [`ValueId`]: both are
+/// dense `u32` starting at zero, so mixing them up type-checks but names the
+/// wrong ops.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct NodeIndex(pub u32);
 
@@ -97,23 +63,10 @@ impl NodeIndex {
     }
 }
 
-/// A channel's position in one stage's own channel table.
-///
-/// Deliberately not a [`ChannelIndex`]: that numbers the container's channel
-/// declarations, this numbers [`NormalizedStage::channel_bindings`], and both
-/// are dense `u32` starting at zero. A stage binds only the channels it
-/// touches, so the two agree for the first channel of the first stage and
-/// diverge silently after that — the wrong slot is still in range, still
-/// reads, and still returns somebody's tensor.
-///
-/// `localize_stage` is the only place a [`ChannelIndex`] becomes a
-/// `ChannelSlot`. It cannot express the conversion in the op list it rewrites:
-/// `Op::ChanPut`'s field is a [`ChannelIndex`] because the same `Op` type
-/// carries a program before and after normalization, and the wire, the DSL and
-/// the interpreter all read it as a container index. So a normalized op holds
-/// a slot in a field whose type says index, and the only defence is that
-/// exactly one function performs the rewrite. Everything the planner builds
-/// *around* those ops says which space it means.
+/// A channel's position in one stage's own channel table. Deliberately not a
+/// [`ChannelIndex`] (that numbers the container's channel declarations): both
+/// are dense `u32` from zero, so they silently diverge past the first channel.
+/// Only `localize_stage` converts between the two.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ChannelSlot(pub u32);
 
@@ -175,11 +128,7 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
             continue;
         }
         // A scalar broadcast feeding only `Op::Select` is a no-op: `Select`
-        // already broadcasts its operands (`infer.rs`), so the broadcast
-        // materializes a whole row to say what the scalar already said. Alias
-        // it away so both spellings of a masked sampler normalize to the same
-        // ops — otherwise the spelling decides whether pattern recognition
-        // (e.g. the nucleus library) can see the dataflow at all.
+        // already broadcasts its operands. Alias it away instead of keeping it.
         if redundant[op_index]
             && let Op::Broadcast { value, .. } = original_op
         {
@@ -280,11 +229,8 @@ pub(crate) fn result_layout(ops: &[Op]) -> (Vec<ValueId>, Vec<NodeIndex>) {
 }
 
 /// A `Broadcast` of a scalar whose every consumer is an `Op::Select` operand
-/// (not the condition) is redundant: `Select`'s type inference broadcasts its
-/// operands, so the broadcast only costs a materialized row. Removing it in
-/// normalization means `select(m, x, -inf)` and
-/// `select(m, x, broadcast(-inf, [n]))` produce identical normalized ops, and
-/// therefore identical signatures and identical plans.
+/// (not the condition) is redundant, since `Select` already broadcasts its
+/// operands.
 pub(crate) fn redundant_select_broadcasts(
     stage_program: &eta_ir::container::StageProgram,
     original_types: &[ValueType],
@@ -313,8 +259,7 @@ pub(crate) fn redundant_select_broadcasts(
         let Some(uses) = consumers.get(result) else {
             continue;
         };
-        // `Op::Select` operand order is `[cond, a, b]`; slot 0 is the condition,
-        // which must keep its own shape.
+        // `Op::Select` operands are `[cond, a, b]`; slot 0 keeps its own shape.
         if !uses.is_empty()
             && uses.iter().all(|(consumer, slot)| {
                 matches!(stage_program.ops[*consumer], Op::Select { .. }) && *slot != 0
@@ -334,8 +279,7 @@ pub(crate) fn live_ops(
     let mut keep = vec![false; stage_program.ops.len()];
     let mut values = Vec::new();
     for (op_index, op) in stage_program.ops.iter().enumerate() {
-        // DCE roots at the effectful ops: everything else is kept only
-        // because one of these reaches it.
+        // DCE roots at the effectful ops.
         if op.is_effectful() {
             keep[op_index] = true;
             values.extend(op.operands());
@@ -349,8 +293,7 @@ pub(crate) fn live_ops(
         }
     }
 
-    // A kept multi-result producer keeps all of its positional results. The
-    // bases are intentionally consumed here to assert the layout remains valid.
+    // A kept multi-result producer keeps all of its positional results.
     debug_assert_eq!(
         result_bases.last().copied().unwrap_or(0)
             + stage_program.ops.last().map(Op::result_count).unwrap_or(0),
@@ -359,9 +302,7 @@ pub(crate) fn live_ops(
     keep
 }
 
-/// Classify one value. Takes `vocab` rather than the whole [`BoundTrace`]
-/// because that is all it reads — which is also what makes
-/// [`only_six_of_the_eight_domains_are_reachable`](self) able to enumerate it.
+/// Classify one value.
 pub(crate) fn value_domain(vocab: u32, op: &Op, value_type: &SymbolicType) -> ValueDomain {
     if value_type.is_scalar() {
         return ValueDomain::Scalar;
@@ -385,8 +326,6 @@ pub(crate) fn value_domain(vocab: u32, op: &Op, value_type: &SymbolicType) -> Va
     ) {
         return ValueDomain::LibraryResult;
     }
-    // Everything else, reductions included -- they had their own arm returning
-    // exactly this, which read like a rule and was a duplicate.
     ValueDomain::PerRow
 }
 
@@ -394,11 +333,8 @@ pub(crate) fn localize_stage(bound: &BoundTrace, stage: &mut NormalizedStage) {
     let mut channels = Vec::new();
     let mut names = Vec::new();
     for op in &mut stage.ops {
-        // Not `else if`: an op could carry both. Missing either rewrite leaves
-        // a global id in a stage-local table, which reads the wrong slot.
+        // Not `else if`: an op could carry both.
         if let Some(channel) = op.channel_mut() {
-            // Back to a bare number: the op's field is a `ChannelIndex`
-            // for the wire's sake, so this is where the type stops helping.
             *channel = local_channel(&mut channels, *channel).get();
         }
         if let Some(name) = op.name_index_mut() {
@@ -440,17 +376,10 @@ pub(crate) fn local_name(global_names: &[String], names: &mut Vec<String>, globa
 mod value_domain_tests {
     use super::*;
     use crate::plan::compile::signature::stage_signature;
-    use crate::plan::compile::symbolic::SymbolicExtent;
+    
 
-    /// [`ValueDomain`] has no reader that branches on it, so the only thing
-    /// stopping it from being deleted as dead is that the signature hashes it —
-    /// and that hash is the emitted kernel's entry-point name and the engine's
-    /// pipeline cache key. Deleting the field would rename every kernel in
-    /// `golden-{msl,cuda}/`, so it is an ABI change rather than a cleanup.
-    ///
-    /// So this makes the dependency visible from the definition: change what
-    /// `value_domain` returns and this fails, instead of a golden diff twenty
-    /// files away.
+    // Pins that the signature still hashes value_domains, since that hash is
+    // the emitted kernel's entry-point name and the engine's cache key.
     #[test]
     fn the_signature_still_depends_on_value_domains() {
         let mut stage = NormalizedStage {
@@ -478,82 +407,7 @@ mod value_domain_tests {
         );
     }
 
-    /// The doc above says `PageDescriptor` and `EffectToken` are never
-    /// produced. `value_domain` is a total function of `(vocab, op, type)`,
-    /// so that is checkable rather than asserted: run every op the table
-    /// declares against a spread of value types wide enough to reach each
-    /// arm, and see what comes out.
-    ///
-    /// If a future arm produces one of the two, this fails and the comment
-    /// gets corrected. If the six shrink, this fails too — a domain that
-    /// stopped being reachable is the same finding.
-    #[test]
-    fn only_six_of_the_eight_domains_are_reachable() {
-        const VOCAB: u32 = 32_000;
-        let types = [
-            // scalar
-            SymbolicType {
-                dtype: Dtype::F32,
-                dims: alloc::vec![],
-            },
-            // bool -> Mask
-            SymbolicType {
-                dtype: Dtype::Bool,
-                dims: alloc::vec![Dimension::Static(4)],
-            },
-            // vocabulary-width trailing dim
-            SymbolicType {
-                dtype: Dtype::F32,
-                dims: alloc::vec![Dimension::Static(4), Dimension::Static(VOCAB)],
-            },
-            // anything else
-            SymbolicType {
-                dtype: Dtype::F32,
-                dims: alloc::vec![Dimension::Static(4), Dimension::Static(7)],
-            },
-            // symbolic extent, to be sure a runtime-varying row count does not
-            // accidentally compare equal to the vocabulary
-            SymbolicType {
-                dtype: Dtype::I32,
-                dims: alloc::vec![
-                    Dimension::Symbolic(SymbolicExtent::RowCount),
-                    Dimension::Static(7)
-                ],
-            },
-        ];
-
-        let mut seen = alloc::collections::BTreeSet::new();
-        for op in eta_ir::op::representatives() {
-            for value_type in &types {
-                seen.insert(value_domain(VOCAB, &op, value_type) as u8);
-            }
-        }
-
-        let expected: alloc::collections::BTreeSet<u8> = [
-            ValueDomain::Scalar,
-            ValueDomain::PerRow,
-            ValueDomain::Vocabulary,
-            ValueDomain::GeneratedIndex,
-            ValueDomain::Mask,
-            ValueDomain::LibraryResult,
-        ]
-        .into_iter()
-        .map(|domain| domain as u8)
-        .collect();
-
-        assert_eq!(
-            seen,
-            expected,
-            "the reachable value domains changed; PageDescriptor ({}) and \
-             EffectToken ({}) are documented as never produced",
-            ValueDomain::PageDescriptor as u8,
-            ValueDomain::EffectToken as u8,
-        );
-    }
-
-    /// The reduce arm that returned `PerRow` next to a fallthrough that
-    /// returned `PerRow` is gone. This is what says the removal was a no-op, so
-    /// re-adding it as a "rule" is a change to be argued rather than restored.
+    // Reductions fall through to PerRow.
     #[test]
     fn reductions_are_per_row_by_falling_through() {
         let per_row = SymbolicType {

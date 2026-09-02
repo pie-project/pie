@@ -12,7 +12,7 @@ on:
         required: true
         type: choice
         options:
-          - pie-client (crates/client/)
+          - client (crates/client/)
           - inferlet (crates/inferlet/)
           - inferlet-macros (crates/inferlet-macros/)
       dry_run:
@@ -37,9 +37,9 @@ jobs:
         id: info
         run: |
           case "${{ inputs.package }}" in
-            "pie-client (crates/client/)")
+            "client (crates/client/)")
               echo "path=crates/client" >> $GITHUB_OUTPUT
-              echo "name=pie-client" >> $GITHUB_OUTPUT
+              echo "name=client" >> $GITHUB_OUTPUT
               ;;
             "inferlet (crates/inferlet/)")
               echo "path=crates/inferlet" >> $GITHUB_OUTPUT

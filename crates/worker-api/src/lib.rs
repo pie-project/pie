@@ -1,10 +1,7 @@
-//! Gateway↔worker data-plane RPC — the `GatewayInbound` + `WorkerControl` tarpc
-//! services and the glue that splits one socket into both.
-//!
-//! The worker dials INTO the gateway (1:N fan-in), and that one connection
-//! carries BOTH traits, split at each end by [`spawn_twoway`]: bulk token
-//! traffic forward, latency-sensitive commands reverse. Defined ONCE here so
-//! the wire layout and channel ordering cannot drift between the two ends.
+//! Gateway<->worker data-plane RPC — the `GatewayInbound` + `WorkerControl`
+//! tarpc services and the glue that splits one socket into both. The worker
+//! dials into the gateway; [`spawn_twoway`] splits that one connection into
+//! forward token traffic and reverse control commands.
 
 use controller_api::WorkerStatus;
 use ids::{ReqId, WorkerId};

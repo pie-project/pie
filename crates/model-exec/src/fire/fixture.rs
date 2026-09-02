@@ -1,13 +1,9 @@
 //! Traces built by hand, a mock backend, and a sink that writes down what it
 //! was told — the test vocabulary for every file in `fire/`.
 //!
-//! `model-dsl` is the authoring surface and CANNOT be reached from a unit test
-//! here: it is a dev-dependency, which means it exists for
-//! `tests/every_sku_walks_its_classes.rs` and not for `src/`. So these say in
-//! `Def`, `Ty` and `Guard` what a forward pass says in `split` and
-//! `Value::merge`, the same way `model_compiler::fixture` and
-//! `model_ir::check::classes`' own tests do. The catalog test is the one that
-//! checks the two agree.
+//! `model-dsl` is a dev-dependency and can't be reached from a unit test
+//! here, so these say in `Def`, `Ty` and `Guard` what a forward pass says in
+//! `split` and `Value::merge`. The catalog test checks the two agree.
 
 use std::collections::HashMap;
 
@@ -36,15 +32,6 @@ pub(crate) struct Build {
 pub(crate) fn act(width: u64) -> Ty {
     Ty::Tensor {
         shape: vec![Dim::Tokens, Dim::Const(width)],
-        dtype: Dtype::Bf16,
-    }
-}
-
-/// The TOWER's rectangle: one row per patch, `width` elements wide — the
-/// second row axis, in the only vocabulary a plan has for it.
-pub(crate) fn patch(width: u64) -> Ty {
-    Ty::Tensor {
-        shape: vec![Dim::Patches, Dim::Const(width)],
         dtype: Dtype::Bf16,
     }
 }
@@ -109,34 +96,8 @@ impl Build {
         y
     }
 
-    /// The same op, minting a rectangle of the declared `ty` — what a test
-    /// reaches for when the SHAPE, and therefore the axis, is the thing under
-    /// test.
-    pub(crate) fn shaped(&mut self, x: ValueId, ty: Ty, guard: Guard) -> ValueId {
-        let node = self.trace.nodes.len() as u32;
-        let y = self.value(Def::Op(node), ty);
-        self.push(
-            Elementwise::RmsnormNoScale {
-                x,
-                head_dim: 1,
-                eps: 1e-6,
-                y,
-            }
-            .into(),
-            guard,
-        );
-        y
-    }
-
-    /// A patch-shaped runtime input — the door a tower's rows enter through.
-    pub(crate) fn pixels(&mut self, width: u64) -> ValueId {
-        self.value(Def::Input(RuntimeInput::Patches), patch(width))
-    }
-
-    /// A prepare node: it defines a `Ty::Struct`, which is the whole rule P5
-    /// reads. The reading it states is the one [`Build::decode`] restates —
-    /// one head of width 4, no window — because a schedule and its reader
-    /// disagreeing is a shell refusal rather than a fixture.
+    /// A prepare node: defines a `Ty::Struct`, one head of width 4, no
+    /// window, matching what [`Build::decode`] restates.
     pub(crate) fn prepare(&mut self, guard: Guard) -> ValueId {
         let kv_indptr = self.input(1);
         let kv_indices = self.input(1);
@@ -183,14 +144,6 @@ impl Build {
         o
     }
 
-    /// A collective — the family the walk may never elide.
-    pub(crate) fn all_gather(&mut self, x: ValueId, width: u64, guard: Guard) -> ValueId {
-        let node = self.trace.nodes.len() as u32;
-        let y = self.value(Def::Op(node), act(width));
-        self.push(Collective::AllGather { x, y }.into(), guard);
-        y
-    }
-
     pub(crate) fn merge(&mut self, arms: &[(ValueId, Guard)], width: u64) -> ValueId {
         self.value(Def::Merge(arms.to_vec()), act(width))
     }
@@ -218,19 +171,12 @@ impl Build {
 /// A backend that runs nothing and remembers everything: `(node index, op
 /// name)`, in the order the walk called it.
 ///
-/// **HOW IT KNOWS THE NODE INDEX**, since the contract does not tell it. A
-/// `Dispatch*` method is handed the OP and not the node — deliberately, since
-/// "`guard` and `layer` are the engine walk's business" — so the mock builds
-/// one map at construction from each node's op-payload ADDRESS to its index,
-/// and looks the incoming reference up in it. The payload lives inside the
-/// `Trace`'s node vector, which outlives the walk and is never moved during
-/// one, so the address is a stable identity. No `unsafe`: a reference cast to
-/// `usize` is a comparison of two things the borrow checker already proved are
-/// alive.
-///
-/// The alternative — recording only op names — cannot say whether a node ran
-/// twice or whether two same-named nodes swapped places, and both are exactly
-/// what these tests are about.
+/// `Dispatch*` methods are handed the op, not the node, so the mock builds a
+/// map at construction from each node's op-payload address to its index and
+/// looks the incoming reference up in it — a stable identity since the
+/// payload lives inside the `Trace`'s node vector for the whole walk.
+/// Recording only op names couldn't say whether a node ran twice or two
+/// same-named nodes swapped places, which is exactly what these tests check.
 pub(crate) struct MockDispatch<'p> {
     at: HashMap<usize, u32>,
     /// `(node, op name)` in call order.
@@ -238,15 +184,11 @@ pub(crate) struct MockDispatch<'p> {
     /// An op name this backend answers `Unsupported` for — what a real one
     /// does when a family reaches a `Run` that has no kernel for it.
     pub(crate) refuse: Option<&'static str>,
-    /// Does this backend claim to serve `Fallback::Copy`?
-    ///
-    /// **OFF BY DEFAULT, WHICH IS THE SHIPPING DEFAULT TOO.** A mock that
-    /// copied unasked would make every existing split assertion in this file
-    /// a statement about a path those tests were not written for.
-    /// Claim a row gather this mock does not have to own: it records the
-    /// two calls and moves nothing, which is exactly enough to check what
-    /// the WALK does about a `Fallback::Copy` row. What the bytes come out
-    /// as is a shell's gate, not this one's. Set it directly.
+    /// Does this backend claim to serve `Fallback::Copy`? Off by default,
+    /// matching the shipping default, so existing split assertions aren't
+    /// silently exercising a path they weren't written for. Records the
+    /// gather/scatter calls but moves nothing — enough to check what the
+    /// walk does, not what the bytes come out as. Set directly.
     pub(crate) copies: bool,
     /// `(region's first node, gather or scatter)` in call order — the record
     /// that says a copied region was bracketed exactly once.
@@ -271,7 +213,6 @@ impl<'p> MockDispatch<'p> {
             trace,
         }
     }
-
 
     /// The node indices the walk ran, in order.
     pub(crate) fn nodes(&self) -> Vec<u32> {
@@ -305,9 +246,8 @@ fn address<T>(value: &T) -> usize {
     std::ptr::from_ref(value).cast::<()>() as usize
 }
 
-/// The address of the op INSIDE the variant — the very reference a
-/// `Dispatch*` method receives, rather than the enum's own address, which an
-/// unspecified layout may place elsewhere.
+/// The address of the op inside the variant, not the enum's own address
+/// (unspecified layout may place that elsewhere).
 fn payload(op: &Operation) -> usize {
     match op {
         Operation::Attention(op) => address(op),
@@ -378,8 +318,8 @@ pub(crate) enum Event {
     /// their first node is what a failing assert should print anyway.
     Begin(u32),
     End(u32),
-    /// Run `run` of `runs` over the region's window — one for a window P4
-    /// seated, several for one it could not.
+    /// Run `run` of `runs` over the region's window — one for a window the
+    /// layout seated, several for one it could not.
     Run(u32, u32),
     CondBegin,
     CondArm(u8),
@@ -402,11 +342,9 @@ impl Sink for Recorder {
     fn region_end(&mut self, region: &Region) {
         self.events.push(Event::End(region.nodes.start));
     }
-    /// **RECORDED ONLY WHEN THE WINDOW SPLIT.** Every region announces a run,
-    /// so writing all of them down would bury every structural expectation in
-    /// this file under a `Run(0, 1)` per region and say nothing: one launch is
-    /// what P4 produces for the whole catalog. What a test wants to see is the
-    /// case P4 could not seat, and that is the case this records.
+    /// Recorded only when the window split: one launch (`Run(0, 1)`) is the
+    /// normal case, so only a window the layout could not seat is worth
+    /// writing down.
     fn run(&mut self, run: u32, runs: u32) {
         if runs > 1 {
             self.events.push(Event::Run(run, runs));

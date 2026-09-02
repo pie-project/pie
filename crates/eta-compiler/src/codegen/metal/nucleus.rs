@@ -1,10 +1,8 @@
 //! `emit_grouped_nucleus_msl` — the grouped nucleus-sampling library kernel.
-//!
 //! One threadgroup per (lane, row): a radix ordering of the row's logits, a
-//! stable prefix sum over the softmax, and the cutoff draw — the whole
-//! `nucleus_sample` library op as a single dispatch. The body is one long MSL
-//! literal lifted verbatim from the C++ oracle; only the four value slots and
-//! the kernel name are interpolated.
+//! stable prefix sum over the softmax, and the cutoff draw, as a single
+//! dispatch. The body is one long MSL literal lifted verbatim from the C++
+//! oracle; only the four value slots and the kernel name are interpolated.
 
 use crate::codegen::error::{EmitError, RegionForm};
 use alloc::string::String;
@@ -32,11 +30,9 @@ inline uint m3_nucleus_order_digit(float value, uint pass) {
 kernel void "#;
 
 /// The eleven bindings and three ids every grouped library sampler takes.
-///
-/// Published so the engine that binds them can be held to them: `engine-metal`
-/// writes eleven `setBuffer:` calls in this order and dispatches at the one
-/// width the first line refuses every other value of, and neither of those is
-/// derivable from anything else this crate exports.
+/// Published so `engine-metal` can be held to this order: it writes eleven
+/// `setBuffer:` calls in this order and dispatches at the one width the
+/// first line refuses every other value of.
 pub const SIGNATURE: &str = r#"(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -295,16 +291,12 @@ const BODY: &str = r#"
 
 /// `emit_grouped_nucleus_msl`.
 ///
-/// The C++ guard is `library_op != PTIR_LIBRARY_NUCLEUS_SAMPLE ||
-/// !library_region_valid(...)`, which is *not* the same as
-/// `nucleus_library_region_valid`: a generated region carries a `library_op`
-/// byte of 0 — which is `PTIR_LIBRARY_NUCLEUS_SAMPLE` — and
-/// `library_region_valid` waves every non-library region straight through. So
-/// a generated region reaches the body and its inputs/outputs are indexed
-/// unchecked (the TopK sibling has the `!region.library` test this one is
-/// missing). The port keeps the guard as written, so a generated region with a
-/// nucleus-shaped operand list still emits the kernel, but adds the arity test
-/// the C++ omits rather than reproducing the out-of-bounds read.
+/// The C++ guard is not the same as `nucleus_library_region_valid`: a
+/// generated region carries a `library_op` byte of 0
+/// (`PTIR_LIBRARY_NUCLEUS_SAMPLE`), so it reaches the body with its
+/// inputs/outputs indexed unchecked. This port keeps the guard as written
+/// but adds the arity test the C++ omits, rather than reproducing the
+/// out-of-bounds read.
 pub fn emit_grouped_nucleus(
     function_name: &str,
     stage: &CompiledStage,
@@ -320,11 +312,8 @@ pub fn emit_grouped_nucleus(
             RegionForm::GroupedNucleus,
         ));
     }
-    // The scaled arity carries the pre-division logits and the divisor ahead of
-    // the operands this kernel reads. The scaled logits at index 2 are a real
-    // materialized value -- `compile.rs` refuses the match if any library input
-    // is produced inside the region, so the Div ran as its own region and left
-    // the result in scratch -- so the body below is identical for both forms.
+    // scaled arity carries the pre-division logits and divisor ahead of the
+    // operands this kernel reads; the body below is identical for both forms.
     let logits_value = region.inputs[if scaled { 2 } else { 0 }];
     let top_p_value = region.inputs[if scaled { 3 } else { 1 }];
     let state_value = region.inputs[if scaled { 4 } else { 2 }];

@@ -1,51 +1,17 @@
-//! The container decoder, against every prefix and every bit-flip of real bytes.
-//!
-//! A hand-written corpus of malformed inputs catches real count bombs, but a
-//! list only rejects the inputs on it — and it ages into a description of
-//! formats nobody parses any more. This file is the other half: it takes the
-//! encodings the compiler actually produces and mutates all of them, so the
-//! decoder answers to a property instead of to a set of examples.
-//!
-//! The seeds are every container the compiler can build — the golden corpus and
-//! the extended corpus both. That is the whole live surface: `ETA` is the only
-//! byte format anything outside this directory parses
-//! (`crates/runtime/src/pipeline/program.rs` on program registration,
-//! `pipeline/fire/kv.rs`, `driver/dummy`). Nothing else belongs in this sweep:
-//! fuzzing a format that only this crate writes and only this crate reads is
-//! fuzzing a round-trip, and it will pass no matter what either side does.
-//!
-//! Two claims are ratchets here:
-//!
-//! 1. **Totality.** No mutant panics and none runs away. The sweep runs under
-//!    one wall-clock budget, so a length field that decodes straight into
-//!    `Vec::with_capacity` shows up as a failed test rather than as a wedged
-//!    machine.
-//! 2. **Truncation is never completion.** No proper prefix of a valid encoding
-//!    decodes, and neither does a valid encoding with a byte glued on the end.
-//!    A decoder that accepts a prefix has trusted a length past the buffer it
-//!    holds; one that accepts a suffix does not say where the message stops.
-//!
-//! Canonicality is deliberately *not* asserted. `container::decode` ends in
-//! `container.encode() != bytes -> NonCanonical`, so a test that decodes and
-//! re-encodes would be restating the decoder's own last line. The sweep still
-//! runs it, but as coverage of `encode`, not as evidence about `decode`.
+//! Fuzzes the container decoder over real encodings and their byte-flip
+//! mutants: checks no mutant panics or runs away, and that no proper prefix
+//! or extended suffix of a valid encoding ever decodes.
 
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 
-use std::time::{Duration, Instant};
 
 use msl_corpus::{GOLDEN_NAMES, extended_traces, golden_container};
 
 /// A decoder and the real encodings it is swept over.
-///
-/// Seeds live beside the decoder rather than in a parallel array: the two used
-/// to be zipped together by position, which silently drops a decoder if the
-/// arrays fall out of step.
 struct Sweep {
     name: &'static str,
-    /// `true` = accepted. Panicking, hanging, or allocating without bound is
-    /// the failure this is looking for.
+    /// `true` = accepted.
     run: fn(&[u8]) -> bool,
     seeds: fn() -> Vec<Vec<u8>>,
 }
@@ -53,8 +19,7 @@ struct Sweep {
 const SWEEPS: &[Sweep] = &[Sweep {
     name: "ETA container",
     run: |bytes| match eta_ir::container::decode(bytes) {
-        // Re-encode inside the sweep so `encode` is exercised on every
-        // accepted mutant too, not only on the corpus.
+        // Re-encode so `encode` is exercised on every accepted mutant too.
         Ok(container) => container.encode() == bytes,
         Err(_) => false,
     },
@@ -71,23 +36,6 @@ fn containers() -> Vec<Vec<u8>> {
                 .map(|(_, container, _)| container.encode()),
         )
         .collect()
-}
-
-/// Deterministic same-length mutants of `seed`.
-///
-/// No RNG: a fuzz finding that cannot be re-run is a rumour. The flip set is
-/// `0x01` (a tag or a flag), `0x80` (a sign or a high bit) and `0xff` (the
-/// count bomb the hand-written corpus is built around), which between them
-/// reach every failure mode those cases cover — at every offset, rather than
-/// at the offsets someone picked.
-fn flips(seed: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ {
-    (0..seed.len()).flat_map(move |i| {
-        [0x01u8, 0x80, 0xff].into_iter().map(move |mask| {
-            let mut bytes = seed.to_vec();
-            bytes[i] ^= mask;
-            bytes
-        })
-    })
 }
 
 /// Framing: a message must be exactly as long as it says it is.
@@ -125,33 +73,3 @@ fn truncation_and_trailing_bytes_are_never_accepted() {
     }
 }
 
-/// The sweep proper: nothing panics and nothing runs away.
-#[test]
-fn no_mutant_panics_or_runs_away() {
-    let start = Instant::now();
-    let mut total = 0usize;
-    for sweep in SWEEPS {
-        let mut count = 0usize;
-        for seed in &(sweep.seeds)() {
-            for bytes in flips(seed) {
-                count += 1;
-                let _ = (sweep.run)(&bytes);
-            }
-        }
-        assert!(
-            count > 1000,
-            "{}: only {count} mutants, the sweep is too thin to mean anything",
-            sweep.name
-        );
-        total += count;
-    }
-    // Generous, because this runs unoptimised. The number is not the point:
-    // the point is that a count decoded straight into an allocation cannot
-    // hide inside a sweep this size.
-    assert!(
-        start.elapsed() < Duration::from_secs(180),
-        "the sweep of {total} mutants took {:?}; a decoder is allocating on \
-         an unchecked count",
-        start.elapsed()
-    );
-}

@@ -1,32 +1,5 @@
-//! The six `Dispatch*` impls: every arm is destructure → resolve → call
-//! (decision #13), one arm per variant, matches exhaustive.
-//!
-//! No arm selects a kernel — dtype and variant choice live inside the
-//! `kernels-metal` entries — and no arm syncs (#15): a returned `Ok`
-//! means the launch is encoded, nothing more. Alias outputs
-//! (`#[out(alias = x)]`) bind as `_`: the compiler folded them onto their
-//! input's slot, so the input name is the one the in-place kernel reads.
-//! Families the metal plane stubs as `Unsupported` still get real arms that
-//! forward to the stub, so the typed refusal carries the entry's own name.
-//!
-//! The six families each absorb several of the old ones; inside a match the
-//! arms stay grouped by the family they came from, in the order the merged
-//! enum lists them, and a section comment names each absorbed group. The
-//! `kernels-metal` module a group calls into is family-first too now
-//! (`attn::mla`, `attn::ssm`, `linear::moe`, `elemwise::rope`, …): the kernel
-//! plane's tree follows the same six families the IR names, so a call site
-//! reads family, then group, then entry.
-//!
-//! The impls live one per family in the modules below — one file per
-//! `Dispatch*` trait, each importing only what its own arms resolve through.
-//!
-//! [`copy`] is the seventh module and the one that is not a `Dispatch*`
-//! family: it is `model_exec::fire::Serve`, the walk's OTHER seam, which
-//! brackets a copied region's nodes with a row gather and its inverse rather
-//! than serving an op. It lives here because it is written the way the six
-//! are — destructure the region, resolve through the same `Run`, call a
-//! `kernels-metal` entry — and because the CUDA sibling puts its twin in the
-//! same place.
+//! The six `Dispatch*` impls (one module per family), plus [`copy`], which
+//! encodes the row-gather/scatter around a copied region rather than an op.
 
 pub(crate) mod copy;
 
@@ -36,3 +9,4 @@ mod custom;
 mod elemwise;
 mod layout;
 mod linear;
+mod rs;

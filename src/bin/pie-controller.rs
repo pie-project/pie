@@ -1,4 +1,4 @@
-//! `controller` — standalone control-plane daemon (Seam 3 thin shell).
+//! `controller` — standalone control-plane daemon; a thin bin shell.
 //!
 //! Composes the shared [`bootstrap`] process skeleton (global flags, config
 //! sourcing, tracing, `/metrics`, signal lifecycle) with the [`controller`]

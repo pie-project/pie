@@ -1,46 +1,16 @@
 //! The lattice grids the IQ2 and IQ3 GGUF schemes index.
 //!
-//! These schemes do not code a weight's magnitude. They code an *address*: a
-//! byte of the payload selects one of a few hundred fixed eight- or
-//! four-element points, and the block's scale and a sign mask place it. Two
-//! bits per weight buys nothing unless the points are chosen well, which is
-//! what "IQ" is — the grids are the output of an offline search over real
-//! weight distributions, and they are not in the file. llama.cpp compiles them
-//! in, so anything that reads these formats must too.
+//! These schemes code an address, not a magnitude: a payload byte selects one of a few hundred fixed eight- or four-element points, and the block's scale and a sign mask place it. The grids are the output of an offline search over real weight distributions and are not in the file; llama.cpp compiles them in, so anything reading these formats must too.
 //!
-//! That is the whole reason `GgufIq4Nl` and `GgufIq4Xs` landed before these:
-//! IQ4's table is sixteen values and fits on a line, while `IQ2_S`'s is a
-//! thousand eight-element points.
-//!
-//! # Form
-//!
-//! Written the way `gguf-py`'s `gguf/quants.py` writes them — ASCII hex, with
-//! each grid element narrowed to an index into a three- or eight-entry map —
-//! rather than as expanded `i8` literals. Two reasons, and neither is size:
-//!
-//! - it can be **diffed against upstream**. These are 5 KB of magic numbers
-//!   whose only correctness argument is "the same as llama.cpp", and a
-//!   transcription into another shape cannot be checked by eye.
-//! - the narrowing is lossless and *stated*: `GRID_MAP_IQ2` has three entries
-//!   because an IQ2 grid point's components take exactly three values.
-//!
-//! The expansion runs in `const fn`, so what reaches the decoder is a flat
-//! table and there is no lazy initialization to synchronize.
+//! Written the way `gguf-py`'s `gguf/quants.py` writes them — ASCII hex, each grid element narrowed to an index into a three- or eight-entry map — so it can be diffed against upstream, and so the narrowing is stated rather than implicit. Expansion runs in `const fn`, so what reaches the decoder is a flat table with no lazy initialization to synchronize.
 
-/// The three magnitudes an IQ2 grid component takes.
-///
-/// A grid point is eight of these, all positive; the sign comes from the
-/// block's own mask and the scale from its `d`. Two bits index this.
+/// The three magnitudes an IQ2 grid component takes. A grid point is eight of these, all positive; sign comes from the block's mask, scale from its `d`. Two bits index this.
 const GRID_MAP_IQ2: [i8; 4] = [0x08, 0x19, 0x2b, 0];
 
-/// The eight magnitudes an `IQ3_XXS` grid component takes. Three bits index
-/// this, and the values are not evenly spaced -- the top step is 10, the rest
-/// are 8.
+/// The eight magnitudes an `IQ3_XXS` grid component takes. Three bits index this; not evenly spaced (top step 10, rest 8).
 const GRID_MAP_IQ3XXS: [i8; 8] = [0x04, 0x0c, 0x14, 0x1c, 0x24, 0x2c, 0x34, 0x3e];
 
-/// The eight magnitudes an `IQ3_S` grid component takes: the odd numbers 1
-/// through 15. A different set from `IQ3_XXS`'s and a different scale to
-/// match, which is why the two cannot share a grid or a decoder.
+/// The eight magnitudes an `IQ3_S` grid component takes: odd numbers 1-15. Different scale from `IQ3_XXS`'s, so the two cannot share a grid or decoder.
 const GRID_MAP_IQ3S: [i8; 8] = [0x01, 0x03, 0x05, 0x07, 0x09, 0x0b, 0x0d, 0x0f];
 
 /// Decodes one ASCII hex digit.
@@ -48,13 +18,8 @@ const fn nibble(c: u8) -> u8 {
     if c >= b'a' { c - b'a' + 10 } else { c - b'0' }
 }
 
-/// Expands a packed grid: components sit `SLOT` bits apart and are `BITS`
-/// wide, and `map` gives the value each index stands for.
-///
-/// The packing is `gguf-py`'s: two hex digits make a byte, and a byte holds
-/// `8 / SLOT` components starting at the low end. The two widths are separate
-/// because they differ — IQ3 stores three-bit indices in four-bit slots, so
-/// the fourth bit of every slot is padding that must not reach `map`.
+/// Expands a packed grid: components sit `SLOT` bits apart and are `BITS` wide, and `map` gives the value each index stands for.
+/// Two hex digits make a byte, holding `8 / SLOT` components from the low end. `SLOT` and `BITS` differ for IQ3, which stores three-bit indices in four-bit slots (the fourth bit is padding that must not reach `map`).
 const fn expand<const N: usize, const SLOT: u32, const BITS: u32>(
     hex: &[u8],
     map: &[i8],

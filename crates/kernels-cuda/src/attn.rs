@@ -1,24 +1,7 @@
-//! `Attention`: paged flash attention over the fire's kv pool — the fa2
-//! lattice, the appenders, and the plan machinery those launches ride on.
-//! One entry per IR variant; kernel *selection* (lattice point, variant arm,
-//! naive-vs-fa2, smem arm) lives below the entries, so a dispatch arm stays
-//! destructure → resolve → call (decision #13).
-//!
-//! **The §6 substitution, stated once for the whole family.** Everywhere the
-//! old path reached into implicit engine state — `Ctx.raised::<Fa2Decode>`,
-//! `Ctx.raised::<MlaPlanned>`, the pool row's smuggled `qo_indptr`, the
-//! raised mask/fire-table views — the new entries take explicit arguments
-//! instead: the plan structs built by [`plan`]'s pure builders, the
-//! [`RaggedTensor`] whose indptr is the fire's shared boundaries, and the
-//! geometry tensors the IR names on the op. What has no IR seat and no
-//! plan seat is an explicit argument marked `MENLO-SEAM` at its site; the
-//! engine binds it from fire state, visibly.
-//!
-//! The families that shared the old file keep their seats: [`mla`],
-//! [`index`], [`pool`], and the recurrent [`ssm`] mixers live as submodules;
-//! the tier-2 fused point moved out to [`custom`](crate::custom), the
-//! escape hatch's own family. `elementwise.res_blend`'s launch lives here
-//! too (the old CANON row `norm.res_blend -> attn::attn_res_blend`).
+//! Paged flash attention over the fire's kv pool: the fa2 lattice, the
+//! appenders, and the plan machinery those launches ride on. One entry per
+//! IR variant; kernel selection lives below the entries so a dispatch arm
+//! stays destructure → resolve → call.
 
 pub mod fa2;
 
@@ -112,21 +95,10 @@ fn lse_plane(op: &'static str, lse: &Tensor, rows: u32, heads: u32) {
     );
 }
 
-/// **THE BOUNDARY VECTOR MUST REACH EVERY LANE THE SCHEDULE NAMES.**
-///
-/// BOTH SIDES ARE DRIVER-BOUND — the ragged boundary vector is one the
-/// windowing rule names, the plan's shape is the engine's, and no op names
-/// either — so a disagreement is refused rather than asserted (the boundary
-/// rule at `refuse`). Asserted, a release build reads past the end of a
-/// shorter vector and takes the kv pool's spans from whatever follows it.
-///
-/// **AND IT IS `>=` AND NOT `==` BECAUSE THE VECTOR HAS TWO READINGS.** A
-/// launch cut to its window is handed its own `[lanes + 1]` boundaries and
-/// `lane_offset` is zero, which is the equality this door always checked. A
-/// launch handed the PLANE's base takes the FIRE's whole vector, whose length
-/// is the fire's lanes and not this window's — so what is left to check is
-/// the thing that was ever wrong: a vector too SHORT for the last request
-/// `lane_offset + num_requests - 1` the schedule staged.
+/// The boundary vector must reach every lane the schedule names; checked
+/// (refused, not asserted) because a shorter vector reads past its end in
+/// release. `>=` and not `==`: a windowed launch's own rebased vector hits
+/// equality, but a plane-base launch's vector is the fire's whole length.
 fn lanes_carry(
     op: &'static str,
     q: &RaggedTensor,
@@ -180,26 +152,11 @@ fn fa2_decode(
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
-    // **THE BOUNDARIES ARE AN ARGUMENT NOW**, because `decode.cuh` reads
-    // `q + q_indptr[batch_idx] * q_stride_n` where it used to take
-    // `batch_idx` itself. The two are the same number for a launch handed
-    // its own rebased vector — a decode request is one query row, so entry
-    // `l` of that vector IS `l` — and they part company exactly where they
-    // must: `batch_idx` is `lane_offset + r` and the rows it names are the
-    // plane's. Both readings are checked here, and the check is the one the
-    // prefill door keeps: a vector with fewer boundaries than the schedule
-    // names lets every work item past the first read whatever follows it.
+    // `decode.cuh` reads `q + q_indptr[batch_idx] * q_stride_n`, checked
+    // against a vector with fewer boundaries than the schedule names.
     lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
-    // **AND AN UNSPLIT DECODE HAS NO ABSOLUTE READING OF ITS OUTPUT.**
-    // `decode.cuh` writes `o + bx * ...` at the WORK ITEM, which is a row of
-    // whatever `o` points at and nothing the schedule can shift; under a
-    // split it writes the plan's partial plane instead and the fold behind it
-    // carries the window on the staged seat. A schedule naming fire lanes is
-    // one whose `o` is the plane's base, so the two cannot meet. They never
-    // do — a plane base means a body, a body means `Graphs::On`, and both
-    // decode planners take the split unconditionally under a graph-shaped
-    // build — and this is the refusal that says so out loud rather than the
-    // comment that hoped so.
+    // An unsplit decode writes `o` at the work item directly, with no shift
+    // for schedule-named fire lanes; refused rather than silently wrong.
     if plan.shape.lane_offset > 0 && !plan.info.split_kv {
         return Err(refuse(
             op,
@@ -397,31 +354,12 @@ pub fn prefill_lse(
 /// Prefill against the op's `mask` (packed `u8` bits) instead of the causal
 /// bound, optionally inside a sliding window.
 ///
-/// **THE WINDOW COMPOSES WITH THE MASK, AND ALWAYS DID.** C1 recorded a third
-/// blocker here — "fa2 instantiates no custom-mask + sliding-window arm" — and
-/// it was a misreading of the variant's own template arguments.
-/// `VariantCustom` is `flashinfer::DefaultAttention<use_custom_mask = true,
-/// use_sliding_window = true, ...>`: its `REGISTER_LOGITS_MASK` ANDs the
-/// custom bit with `kv_idx + qo_len + window_left >= kv_len + qo_idx`, and
-/// `window_left` is `params.window_left` when that is non-negative and
-/// `kv_len` — which makes the term vacuous — when it is not. So the arm the
-/// unwindowed masked path has been firing since C1 IS the windowed arm, run
-/// at `window_left = -1`. There was nothing to instantiate; there was a
-/// refusal in front of it.
-///
-/// What the refusal actually feared — "a windowed schedule would discard
-/// positions the mask may keep" — is the wrong way round for a model that
-/// states a window. Gemma's masked reading is *causal ∧ mask ∧ window*: the
-/// causal bound is already folded into the staged bits (`engine_cuda::mask`),
-/// the window is the model's own statement on the node, and a key outside it
-/// is dropped by the variant whether the schedule visited it or not. The
-/// schedule's window is not an approximation of the mask, it is the second
-/// conjunct — and it has to AGREE, because `sched_prefill` sizes its kv
-/// chunking from `window_left` and the kernel's own `num_kv_chunks` recomputes
-/// it from the same number. A full schedule under a windowed launch would put
-/// the partials and the merge at two different counts, which is the silent
-/// half of this failure and the reason [`PrefillPlan::accepts`] is asked with
-/// the stated window rather than with `None`.
+/// The window composes with the mask: the causal bound is already folded
+/// into the staged bits, the window is the model's own statement, and a key
+/// outside it is dropped regardless. The schedule's window must agree with
+/// the mask's, since `sched_prefill`'s kv chunking and the kernel's
+/// `num_kv_chunks` both derive from `window_left` — hence [`PrefillPlan::accepts`]
+/// is asked with the stated window rather than `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn masked(
     ctx: &Ctx,
@@ -464,8 +402,8 @@ pub fn masked(
 }
 
 /// The sm90 plan's consumer seat. The schedule builder is real
-/// ([`plan::plan_prefill_sm90`]); the launcher was never part of this
-/// lattice — the old plane refused the same way.
+/// ([`plan::plan_prefill_sm90`]); the launcher is not part of this lattice
+/// and refuses.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_sm90(
     _ctx: &Ctx,
@@ -511,8 +449,7 @@ pub fn sink(
             rows.arg(),
             stated(OP, heads)?.arg(),
             stated(OP, head_dim)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -570,8 +507,7 @@ pub fn merge_lse(
             lse.arg(),
             heads.arg(),
             head_dim.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -606,10 +542,6 @@ pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
 /// Appends `k`/`v` rows into the pool's pages, each row landing in the cell
 /// the op's `write_page`/`write_offset` descriptors state. Boundary-aware:
 /// the fire's shared indptr rides in `k` (the envelope refresh's lane walk).
-///
-/// (History: the op used to state kv_indices + positions, which this
-/// appender never read — that seam closed when the IR named the write
-/// geometry itself.)
 pub fn kv_append(
     ctx: &Ctx,
     k: RaggedTensor,
@@ -649,9 +581,8 @@ pub fn kv_append_shared(
     )
 }
 
-/// The residual-block blend `elementwise.res_blend` launches (the old CANON
-/// row `norm.res_blend -> attn::attn_res_blend`): RMS-score the prefix and `B`
-/// candidate blocks, softmax, blend — one fused pass.
+/// The residual-block blend `elementwise.res_blend` launches: RMS-score the
+/// prefix and `B` candidate blocks, softmax, blend — one fused pass.
 ///
 /// The kernel walks `blocks` as `B` stacked `[rows, hidden]` planes, so the
 /// block values must land adjacently; the arena hands them out that way,
@@ -682,32 +613,12 @@ pub fn res_blend(
             ),
         ));
     }
-    // **THE PITCH THIS ENTRY PASSES IS THE WINDOW'S, AND THE KERNEL NEEDS THE
-    // PLANE'S** — the one finding that keeps `elementwise.res_blend` off
-    // `engine_cuda::SHIFTED`, written here because this is where the number is
-    // chosen. The kernel walks `blocks + (j * block_rows + row) * hidden`, and
-    // `block_rows` is `y.rows` below: the WINDOW's row count, which is what
-    // `Run::cut` hands a shifting region while its pointers stay the plane's
-    // base. The stride between two stacked candidate planes is the PLANE's row
-    // capacity, and the two coincide only when the window is the whole plane.
-    //
-    // **THIS ENTRY CANNOT DERIVE THE PLANE'S CAPACITY.** A `Tensor` carries
-    // `ptr`, `rows`, `width`, `dtype` and no height; `rows` is the window's by
-    // the paragraph above. The only other witness in the room is the GAP
-    // between two consecutive candidate pointers — which is the true pitch,
-    // and is why the refusal below can be written at all — but it exists only
-    // when there are two of them, and a lone candidate never multiplies
-    // `block_rows` by anything. So the gap answers the case the kernel reads
-    // and says nothing in the case it does not, which is a coincidence to rest
-    // an addressing rule on rather than a derivation.
-    //
-    // **AND THE REFUSAL BELOW IS THE HONEST GUARD MEANWHILE**: it compares the
-    // pointers against the pitch this entry is about to pass, so a windowed
-    // fire whose planes are taller than its window is REFUSED here rather than
-    // blended off the wrong rows. What the name is owed is the plane's height,
-    // from the side that knows it — the engine's arena — either as a field on
-    // the handle or as a fifth seat word (the seat holds four now, and this
-    // entry reads only the row pair). Neither is this crate's to add.
+    // The kernel walks `blocks + (j * block_rows + row) * hidden` where
+    // `block_rows` is the window's row count (`y.rows`), but the true stride
+    // between stacked candidate planes is the plane's row capacity — which a
+    // `Tensor` cannot express (no height field). So a windowed fire whose
+    // planes are taller than its window is refused below, checked against
+    // the actual pointer gap, rather than blended off the wrong rows.
     let plane_bytes = u64::from(y.rows) * u64::from(y.width) * 2;
     for pair in blocks.windows(2) {
         if pair[1].ptr != pair[0].ptr.wrapping_add(plane_bytes) {
@@ -736,8 +647,7 @@ pub fn res_blend(
             hidden.arg(),
             rows.arg(),
             eps.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )

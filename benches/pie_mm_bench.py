@@ -122,7 +122,6 @@ def build_config(args: argparse.Namespace, port: int):
                 activation_dtype=args.activation_dtype,
                 # Stated once for every engine now, so it is a common
                 # `[engine]` key rather than one of the backend's options.
-                ready_timeout=f"{int(args.server_startup_timeout)}s",
                 options=engine_options,
             ),
         ),

@@ -76,8 +76,8 @@ pub fn embed(
             vocab.arg(),
             rows.arg(),
             stated(OP, per_row)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -118,8 +118,8 @@ pub fn split_qkv(
             v.arg(),
             q_dim.arg(),
             kv_dim.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -158,8 +158,8 @@ pub fn split_q_gate(
             stated(OP, q.rows)?.arg(),
             stated(OP, heads)?.arg(),
             stated(OP, head_dim)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -196,8 +196,8 @@ pub fn split_rows(
             right.arg(),
             left_dim.arg(),
             right_dim.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -246,24 +246,18 @@ pub fn select(
             stated(OP, table.width)?.arg(),
             stated(OP, offset)?.arg(),
             stated(OP, width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
 /// The copy unit a row of `bytes` bytes at `a` and `b` may move in, and the
-/// template argument that names it.
-///
-/// **WIDTH IS AN OPTIMIZATION; THE BYTES ARE THE CONTRACT.** [`gather_rows`]
-/// and [`scatter_rows`] are a permutation, so the only thing that may vary
-/// with this choice is how fast it runs — a 16-byte unit when both addresses
-/// and the row's width admit one, a 4-byte unit when they admit that, and a
-/// byte otherwise, which every row admits. There is no arithmetic in the
-/// kernel and no dtype in its signature, which is what lets a bf16 activation
-/// and an f32 log-sum-exp move through one instantiation and neither be
-/// rounded on the way.
+/// template argument that names it. Width is an optimization, not part of
+/// the contract: a 16-byte unit when both addresses and the row's width
+/// admit one, a 4-byte unit when they admit that, a byte otherwise. No
+/// arithmetic or dtype in the kernel, so any element type moves unrounded.
 fn unit(bytes: u64, a: u64, b: u64) -> (&'static str, u64) {
     if bytes.is_multiple_of(16) && aligned16(a) && aligned16(b) {
         ("::int4", 16)
@@ -289,10 +283,8 @@ fn row_bytes(op: &'static str, handle: Tensor) -> Result<u64, Error> {
 /// index is read — so they are one body, and the pair cannot drift apart into
 /// a gather and a scatter that disagree about what the map means.
 ///
-/// The row map is a fire table the shell assembles (`engine_cuda`'s window
-/// machinery); no op names it, so the trace-time validator never sees it and
-/// its dtype is refused on the same footing as its length — the boundary rule
-/// at [`refuse`].
+/// The row map is a fire table the shell assembles; no op names it, so its
+/// dtype is refused here rather than checked by a trace-time validator.
 fn move_rows(
     ctx: &Ctx,
     op: &'static str,
@@ -344,19 +336,15 @@ fn move_rows(
     )
 }
 
-/// **GATHER: the rows a fragmented window covers, laid down as one.**
+/// Gather: the rows a fragmented window covers, laid down as one.
+/// `Fallback::Copy`'s first half. A windowed consumer cannot seat stands
+/// over several intervals of the fire's rows, so this reads them out of
+/// `wide` in the order `index` names and writes them contiguously into
+/// `tight` — one launch over a rectangle rather than one per interval.
 ///
-/// `Fallback::Copy`'s first half (design §3; `model_compiler::layout`'s
-/// `menu` is what asks for it below the crossover). A windowed consumer P4
-/// could not seat stands over several intervals of the fire's rows; this
-/// reads them out of `wide` in the order `index` names and writes them
-/// contiguously into `tight`, so the consumer behind it is ONE launch over a
-/// rectangle rather than one launch per interval.
-///
-/// `index` is `i32`, one entry per row of `tight`: the FIRE row that row
-/// stands at. It is the caller's span list flattened, and the caller is the
-/// only one who knows it — this entry checks the shapes agree and moves
-/// bytes.
+/// `index` is `i32`, one entry per row of `tight`: the fire row that row
+/// stands at (the caller's span list flattened). This entry checks the
+/// shapes agree and moves bytes.
 ///
 /// # Errors
 ///
@@ -381,12 +369,10 @@ pub fn gather_rows(
     )
 }
 
-/// **SCATTER: the answers put back where their rows came from.**
-///
-/// `Fallback::Copy`'s second half, and the same map as [`gather_rows`] read
-/// the other way: row `i` of `tight` lands at fire row `index[i]` of `wide`.
-/// The rows the window does NOT cover are not written, which is what keeps a
-/// copy one consumer's slow path rather than a fact about the arena.
+/// Scatter: the answers put back where their rows came from.
+/// `Fallback::Copy`'s second half, the same map as [`gather_rows`] read the
+/// other way: row `i` of `tight` lands at fire row `index[i]` of `wide`.
+/// Rows the window does not cover are not written.
 ///
 /// # Errors
 ///

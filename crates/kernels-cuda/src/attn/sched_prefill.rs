@@ -1,8 +1,7 @@
 //! The fa2 prefill work split: tiles the packed query axis, binary-searches
 //! the kv chunk size that fills the grid, and stages the tile/merge index
 //! vectors the prefill kernel and the cascade merge walk. A native
-//! reimplementation of FlashInfer's host planner — the schedule is valid
-//! and deterministic, not byte-identical to the C++ reference (see
+//! reimplementation of FlashInfer's host planner (see
 //! [`sched`](crate::attn::sched)).
 
 use crate::error::Error;
@@ -17,22 +16,17 @@ pub struct Request<'a> {
     pub qo_indptr: &'a [i32],
     /// Host copy of the kv page indptr — `[batch_size + 1]`.
     pub kv_indptr: &'a [i32],
-    /// The row and lane counts this schedule is CARVED for: the graph
+    /// The row and lane counts this schedule is carved for: the graph
     /// shape's tile arithmetic, every allocation, and the padding.
     pub total_num_rows: u32,
     pub batch_size: u32,
-    /// **HOW FAR IN THE FIRE'S LANE ORDER THE `o_indptr` ALLOCATION HAS TO
-    /// REACH** ([`plan::Shape::lane_offset`](crate::attn::plan::Shape)) —
-    /// that vector is indexed by the absolute request id, so `layout` sizes
-    /// it `[lane_offset + batch_size + 1]`. The dead prefix the SCHEDULE
-    /// stages in front of its own numbers is `live.lane_offset`, which is
-    /// the same number today and the origin half of it always.
+    /// How far in the fire's lane order the `o_indptr` allocation reaches
+    /// ([`plan::Shape::lane_offset`](crate::attn::plan::Shape)); `layout`
+    /// sizes that vector `[lane_offset + batch_size + 1]`.
     pub lane_offset: u32,
-    /// **AND WHAT THIS FIRE ACTUALLY BROUGHT** ([`Live`]): the ids the work
-    /// items are staged under (`live.lane_offset + r`), the dead prefix and
-    /// the row those unsplit `o_indptr` entries count from
-    /// (`live.row_offset`), the walk over the two indptrs' live contents,
-    /// and the staged row-total word.
+    /// What this fire actually brought ([`Live`]): the ids work items are
+    /// staged under (`live.lane_offset + r`), the row unsplit `o_indptr`
+    /// entries count from (`live.row_offset`), and the live indptr walk.
     pub live: Live,
     pub num_qo_heads: u32,
     pub num_kv_heads: u32,
@@ -68,24 +62,12 @@ impl Request<'_> {
     }
 }
 
-/// FlashInfer's CTA tile chooser for the fa2 prefill query axis.
-///
-/// **AND ITS ANSWER PICKS THE KERNEL SYMBOL** — `PrefillPlan::cta_tile_q`
-/// reaches `fa2::PrefillPoint`, which spells `NUM_MMA_Q`, `NUM_WARPS_Q` and
-/// `NUM_WARPS_KV` into the instantiation a launch resolves. So under the
-/// bucket ceiling this is a HEURISTIC THAT HAS BEEN FROZEN: the graph shape
-/// feeds it the carved row and lane counts, those do not move inside a
-/// `record::BodyKey`, and one key therefore captures ONE symbol.
-///
-/// **THE PERFORMANCE CONSEQUENCE IS REAL AND THE CORRECTNESS ONE IS NOT.**
-/// A fire whose LIVE rows would have chosen a narrower tile replays the
-/// ceiling's wider one — a small fire in a big bucket runs the big tile, whose
-/// work items are mostly masked rows, and pays for them. What it does not pay
-/// is a wrong answer: every tile in `DISPATCH_CTA_TILE_Q` computes the same
-/// attention over the same rows, the tile only says how many query rows one
-/// CTA carries, and the `qo_upper_bound` inside the kernel is `qo_len`'s and
-/// not the tile's. Which is exactly why this number is allowed to be a
-/// function of the key rather than of the fire.
+/// FlashInfer's CTA tile chooser for the fa2 prefill query axis. Its answer
+/// picks the kernel symbol (`PrefillPlan::cta_tile_q` selects
+/// `NUM_MMA_Q`/`NUM_WARPS_Q`/`NUM_WARPS_KV`), so it must be a function of the
+/// carved row/lane counts, not the fire's live ones. A smaller-than-carved
+/// fire replaying the wider tile costs performance but not correctness:
+/// every tile computes the same attention over the same rows.
 #[must_use]
 const fn determine_cta_tile_q(avg_packed_qo_len: u64, head_dim: u32, cc_major: u32) -> u32 {
     if head_dim >= 512 {
@@ -134,14 +116,10 @@ fn search_kv_chunk_size(
     (enable_cuda_graph || low < max_kv_len, low)
 }
 
-/// **THE GRAPH SHAPE'S TILE AND WORK-ITEM COUNT**, at a stated row and lane
-/// count — the branch [`schedule`] takes under `enable_cuda_graph`, lifted out
-/// because it has a second caller ([`graph_padding`]) and one arithmetic is
-/// the whole point of lifting it.
-///
-/// The graph shape assumes the worst single request: all rows on one lane, the
-/// rest empty. That is what makes the tile a function of the CARVED counts
-/// rather than of how this fire happened to split its rows between lanes.
+/// The graph shape's tile and work-item count, at a stated row and lane
+/// count. The graph shape assumes the worst single request: all rows on one
+/// lane, the rest empty — which makes the tile a function of the carved
+/// counts rather than of how this fire split its rows.
 fn graph_tiles(rows: u32, batch: u32, group: u64, head_dim: u32, cc_major: u32) -> (u32, u64) {
     let batch = u64::from(batch.max(1));
     let max_seq_len = u64::from(rows).saturating_sub(batch - 1);
@@ -150,23 +128,12 @@ fn graph_tiles(rows: u32, batch: u32, group: u64, head_dim: u32, cc_major: u32) 
     (tile, tiles)
 }
 
-/// **THE TILE AND THE PADDED WORK-ITEM COUNT A GRAPH-SHAPED SCHEDULE WOULD PAD
-/// TO** at a stated row and lane CEILING — `(cta_tile_q, padded_batch_size)`,
-/// which is the pair the float grant is a function of.
-///
-/// **EXPORTED BECAUSE THE ENGINE HAS TO ASK BEFORE IT GRANTS.** A prefill
-/// schedule that does not fit its float grant does not fail — it silently
-/// retries without the graph shape and reports `graph_capturable = false`, and
-/// a body that reads that never captures. So the shell sizes the grant from
-/// the ceiling the plan-at-bucket-ceiling design carves at
-/// (`engine_cuda::inputs`'s `prefill_float_bytes`), and the arithmetic it
-/// sizes from is THIS one rather than a restatement of it: `layout` allocates
-/// `q_heads x padded x cta_tile_q x head_dim` floats for the partials and
-/// `q_heads x padded x cta_tile_q` for their log-sum-exps.
-///
-/// `lanes` is the lane ceiling and `rows` the row ceiling; a caller with only
-/// one of them passes the fire's own number for the other, and gets the
-/// schedule that fire would carve.
+/// The tile and padded work-item count a graph-shaped schedule would pad to,
+/// at a stated row and lane ceiling: `(cta_tile_q, padded_batch_size)`,
+/// which the float grant is a function of. Exported so the engine can size
+/// its grant from this arithmetic (`engine_cuda::inputs`'s
+/// `prefill_float_bytes`) rather than restate it. `lanes` is the lane
+/// ceiling, `rows` the row ceiling.
 #[must_use]
 pub fn graph_padding(
     rows: u32,
@@ -204,9 +171,8 @@ pub struct Schedule {
 #[allow(clippy::too_many_lines)]
 pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     req.check(op)?;
-    // The two indptrs bound THIS FIRE's rectangle, so the walk over them is
-    // the live lane count; the carved `batch_size` beside it is what the
-    // graph shape and the padding below are sized at.
+    // The two indptrs bound this fire's rectangle (live lane count); the
+    // carved `batch_size` is what the graph shape and padding size at.
     let batch = req.live.requests as usize;
     let qo_lens = spans(op, "qo_indptr", req.qo_indptr, batch)?;
     let kv_pages = spans(op, "kv_indptr", req.kv_indptr, batch)?;
@@ -269,20 +235,10 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     let mut qo_tile_indices = Vec::new();
     let mut kv_tile_indices = Vec::new();
     let mut merge_indptr = vec![0i64];
-    // **`o_indptr` IS INDEXED BY THE ABSOLUTE REQUEST ID, SO IT BEGINS WITH
-    // `lane_offset` DEAD ENTRIES.** The prefill kernel reads
-    // `o + o_indptr[request_idx] * stride` (and `o_indptr[request_idx] +
-    // kv_tile_idx` when the schedule split kv),
-    // and `request_idx` is now `lane_offset + r` — so the vector is
-    // `[lane_offset + batch + 1]` and this window's own numbers sit at
-    // `lane_offset`. The entries in front are dead: no work item names a lane
-    // below `lane_offset`, and they are zeros rather than a fork in the
-    // layout, because a layout that moved between the bodied and the keyed
-    // path would move the schedule hash with it and the A/B would stop
-    // comparing the same carving.
-    //
-    // Decode's `o_indptr` is the opposite reading and stays window-local; see
-    // `sched_decode::schedule`.
+    // `o_indptr` is indexed by the absolute request id (`lane_offset + r`),
+    // so it begins with `lane_offset` dead (zero) entries; this window's own
+    // numbers sit at `lane_offset`. Decode's `o_indptr` stays window-local;
+    // see `sched_decode::schedule`.
     let mut o_indptr = vec![0i64; req.live.lane_offset as usize + 1];
     let mut new_batch_size: u64 = 0;
     for (request_idx, (&packed, &kv)) in
@@ -313,16 +269,10 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         );
     }
     let merge_indptr = narrow_all(op, "batch_prefill_merge_indptr", &merge_indptr)?;
-    // **AND AN UNSPLIT SCHEDULE'S `o_indptr` IS A ROW OF THE FIRE'S OUTPUT
-    // PLANE, NOT OF THE PLAN'S WORKSPACE.** WITHOUT `split_kv` the chunk
-    // width covers every request whole, so each one contributes exactly one
-    // entry per query row and these numbers ARE the rows — which the kernel
-    // then adds to whatever `o` points at. A launch handed the PLANE's base
-    // therefore needs the fire's row and not the window's, and `row_offset`
-    // is that difference (zero on every path where `o` was sliced for the
-    // launch). A SPLIT schedule's numbers address the plan's partial planes,
-    // which begin at zero whatever the window is, so nothing is added there
-    // and the fold behind them carries the window on the staged seat instead.
+    // An unsplit schedule's `o_indptr` addresses a row of the fire's output
+    // plane, so it needs `row_offset` added (the fire's row, not the
+    // window's). A split schedule's numbers address the plan's own partial
+    // planes, which begin at zero regardless of window.
     let o_indptr: Vec<i64> = if split_kv {
         o_indptr
     } else {
@@ -469,10 +419,8 @@ fn stage(
         "batch_prefill_kv_chunk_size_ptr",
     )?;
     if req.enable_cuda_graph {
-        // **THE WORD THE FOLD READS IN PLACE OF ITS BAKED BOUND**
-        // (`fa2_abi`'s `seq_len` pointer), so it is this fire's own row
-        // total: the last LIVE boundary, where `info.total_num_rows` beside
-        // it is the carved count the params bake.
+        // The word the fold reads in place of its baked bound (`fa2_abi`'s
+        // `seq_len`): this fire's own row total, not the carved count.
         staging.put_i32(
             at(info.total_num_rows_offset),
             req.qo_indptr[req.live.requests as usize],
@@ -480,38 +428,16 @@ fn stage(
         )?;
     }
     if sched.split_kv {
-        // The staged vector is the LIVE walk's `[live rows + 1]`; `layout`
-        // allocated `[carved rows + 1]` above it. Nothing reads the tail: the
-        // fold walks `pos < min(win[0], *seq_len_ptr)`, which is this fire's
-        // rows, and no work item names a row past them.
+        // The staged vector is `[live rows + 1]`; `layout` allocated
+        // `[carved rows + 1]`. Nothing reads the tail.
         staging.put_i32s(
             at(info.merge_indptr_offset),
             &sched.merge_indptr,
             "batch_prefill_merge_indptr",
         )?;
-        // **AND THE PADDED WORK ITEMS ARE RETIRED BY A MASK LAID OVER THE
-        // WHOLE PADDED BATCH**, which is what makes a ceiling carve safe on
-        // this axis too (plan-at-bucket-ceiling, chunk 4). Three facts, and
-        // each is checkable from here:
-        //
-        // * the mask is `padded_batch_size` long — `layout` allocates exactly
-        //   that many bytes and this writes exactly that many — so every
-        //   `bx` the grid runs has an entry, and the entries past
-        //   `new_batch_size` are `false`.
-        // * `new_batch_size` counts the LIVE work items, because the loop that
-        //   emits them walks `packed_qo_lens`, which is `live.requests` long.
-        //   So the true prefix is the fire's own and the padding is the
-        //   ceiling's.
-        // * the kernel's `if (block_valid_mask && !block_valid_mask[bx])
-        //   return;` stands BEFORE it reads `request_indices[bx]`
-        //   (`prefill.cuh`), so a retired item touches neither the zeros in
-        //   the index vectors' tails nor the output plane.
-        //
-        // And the mask always exists where the padding does: padding happens
-        // only under `enable_cuda_graph`, and `search_kv_chunk_size` returns
-        // `split_kv` unconditionally true under that same word — so there is
-        // no arm where `padded_batch_size > new_batch_size` and the mask is
-        // null.
+        // Padded work items are retired by a mask over the whole padded
+        // batch: `padded_batch_size` long, `false` past `new_batch_size`.
+        // The kernel checks the mask before reading `request_indices[bx]`.
         staging.put_bools(
             at(info.block_valid_mask_offset),
             (0..sched.padded_batch_size).map(|i| i < sched.new_batch_size as usize),

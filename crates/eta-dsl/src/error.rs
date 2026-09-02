@@ -1,10 +1,6 @@
-//! Trace-time errors with source spans.
-//!
-//! Two layers: the SDK **span lints** (double-endpoint, readiness-direction,
-//! sink misplacement) caught during assembly with `#[track_caller]` source
-//! spans, and the authoritative **bind** verdict wrapping the IR's
-//! [`ValidateError`] on the
-//! canonical container.
+//! Trace-time errors with source spans: SDK span lints (double-endpoint,
+//! readiness-direction, sink misplacement) caught during assembly, and the
+//! authoritative bind verdict wrapping the IR's [`ValidateError`].
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -111,14 +107,9 @@ pub enum TraceError {
         span: Span,
     },
     /// The trace asked for something the op vocabulary cannot express, or
-    /// combined operands whose shapes or dtypes do not agree.
-    ///
-    /// Reported rather than panicked. `eta-dsl` traces inside a
-    /// `wasm32-wasip2` guest, where a panic is a trap: the inferlet aborts
-    /// and the author gets a stack-less abort code instead of the file and
-    /// line of the call that was wrong. Recording lets the recorder keep
-    /// going and [`Builder::build`](crate::builder::Builder::build) return
-    /// every authoring mistake in the pass at once, each with its span.
+    /// combined operands whose shapes or dtypes do not agree. Reported
+    /// rather than panicked: `eta-dsl` traces inside a `wasm32-wasip2` guest,
+    /// where a panic is a trap with no span.
     Authoring {
         /// What was wrong, phrased for the author of the trace.
         detail: String,

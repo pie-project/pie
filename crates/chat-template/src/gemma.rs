@@ -61,8 +61,7 @@ impl Gemma {
     }
 
     /// The turn that opens a conversation, and the ONLY place `<bos>` is
-    /// written. Three methods used to prepend it independently, which is three
-    /// chances for a fourth entry point to forget.
+    /// written — one entry point, so no caller can forget it.
     fn opening(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
         let mut tokens = vec![self.bos];
         tokens.extend(self.turn(prefix, msg));

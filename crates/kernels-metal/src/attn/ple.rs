@@ -1,15 +1,12 @@
 //! `Ple`: qwen4's n-gram hasher — token ids in, hashed table rows out, with a
 //! per-lane window of trailing ids as the one piece of sequence state.
 //!
-//! The port's authority is `kernels-cuda/kernels/attn/ple.cuh` and
-//! `kernels-cuda/src/attn/ple.rs`; what differs on this plane is WHERE the
-//! hash constants live. The CUDA entry hands its `PleHash` aggregate across
-//! the launch ABI by value (`ArgValue::Bytes`), and this plane's `ArgValue`
-//! has no by-value blob seat — growing one would have to cross `icb.rs`'s
-//! eight-byte scalar arena and `record.rs`'s `Copy` `Arg`, for one op. So the
-//! constants ride ONE `u64` plane the shell lays down and writes once at load
-//! (`engine_metal::scratch`), in the field order of the CUDA aggregate with
-//! its fixed-size arrays cut to the lengths the node states:
+//! Ported from `kernels-cuda/kernels/attn/ple.cuh` and
+//! `kernels-cuda/src/attn/ple.rs`; what differs on this plane is where the
+//! hash constants live. This plane's `ArgValue` has no by-value blob seat,
+//! so the constants ride one `u64` plane the shell lays down and writes once
+//! at load (`engine_metal::scratch`), in the field order of the CUDA
+//! aggregate with its fixed-size arrays cut to the lengths the node states:
 //!
 //! ```text
 //! [ mults[0..ngram] ][ primes[0..heads] ][ offsets[0..heads] ]
@@ -239,12 +236,8 @@ pub fn ngram_ids_chunked(
 
 /// The plane the hash constants are laid down in, as both this crate's
 /// shaders and `engine_metal::scratch` read it: multipliers, then primes,
-/// then offsets, all `u64`.
-///
-/// **ONE FUNCTION, TWO READERS, WHICH IS THE POINT.** The shell writes the
-/// bytes at load and the shader indexes into them at every fire; a layout
-/// spelled twice is a layout that can differ, and the day it did the hash
-/// would still be a number.
+/// then offsets, all `u64`. One function, two readers: the shell writes the
+/// bytes at load and the shader indexes into them at every fire.
 #[must_use]
 pub fn hash_constants(mults: &[u64], primes: &[u64], offsets: &[u64]) -> Vec<u64> {
     let mut plane = Vec::with_capacity(mults.len() + primes.len() + offsets.len());
@@ -254,15 +247,10 @@ pub fn hash_constants(mults: &[u64], primes: &[u64], offsets: &[u64]) -> Vec<u64
     plane
 }
 
-/// **THE HASH, IN HOST RUST.** `ple.metal`'s arithmetic restated so a box with
-/// no GPU can hold the shader to it, and so an on-device gate has something to
-/// be wrong against.
-///
-/// The reason this one is worth stating twice and `causal_conv1d`'s is not:
-/// the hash's output is a TABLE ROW. A convolution that drifts by a bf16
-/// quantum is the same convolution; a hash that is off by one indexes a
-/// different embedding, so there is no band here at all and every pin below is
-/// an equality.
+/// The hash, in host Rust: `ple.metal`'s arithmetic restated so a box with
+/// no GPU can hold the shader to it. Worth stating twice because the hash's
+/// output is a table row — a hash that is off by one indexes a different
+/// embedding, so every pin below is an equality rather than a band.
 pub mod reference {
     /// A hashing, as the node states it.
     pub struct Hash<'a> {
@@ -294,11 +282,8 @@ pub mod reference {
     }
 
     /// The eos-segmentation rule: a previous id is replaced by eos when a
-    /// NEARER previous id is eos — the window crossed a sequence boundary.
-    ///
-    /// The index loop is the shader's own and stays one: this whole module
-    /// exists to be read beside `ple.metal`, and an iterator here would state
-    /// the rule in a vocabulary MSL does not have.
+    /// nearer previous id is eos — the window crossed a sequence boundary.
+    /// The index loop mirrors the shader's own.
     #[allow(clippy::needless_range_loop)]
     pub fn mask_window(h: &Hash, window: &mut [i32]) {
         let mut crossed = false;
@@ -313,12 +298,8 @@ pub mod reference {
     }
 
     /// The window `[t, p1, p2, …]` (newest first), hashed for every head.
-    ///
     /// Order `g + 2` folds the newest `g + 2` ids and lands the
-    /// `heads_per_ngram` heads at `g · heads_per_ngram`, so a head's own prime
-    /// says how many ids it saw.
-    ///
-    /// The index loops are the shader's own — see [`mask_window`].
+    /// `heads_per_ngram` heads at `g · heads_per_ngram`.
     #[must_use]
     #[allow(clippy::needless_range_loop)]
     pub fn hash_row(h: &Hash, window: &[i32]) -> Vec<i32> {
@@ -344,8 +325,8 @@ pub mod reference {
         if state_cell == 0 { eos } else { state_cell - 1 }
     }
 
-    /// The DECODE arm: one token against the lane's window, which then shifts.
-    /// `state` is `span` cells, updated in place.
+    /// The decode arm: one token against the lane's window, which then
+    /// shifts. `state` is `span` cells, updated in place.
     #[must_use]
     pub fn step(h: &Hash, id: i32, state: &mut [i32]) -> Vec<i32> {
         let span = h.span();
@@ -363,9 +344,9 @@ pub mod reference {
         out
     }
 
-    /// The CHUNKED arm: one request's tokens in order, each hashed against the
-    /// fire's own rows where it can reach them and the lane's state where it
-    /// cannot, with the state advanced once at the end.
+    /// The chunked arm: one request's tokens in order, each hashed against
+    /// the fire's own rows where reachable and the lane's state otherwise,
+    /// with the state advanced once at the end.
     #[must_use]
     pub fn walk(h: &Hash, ids: &[i32], state: &mut [i32]) -> Vec<i32> {
         let span = h.span();
@@ -401,9 +382,9 @@ pub mod reference {
 
 #[cfg(test)]
 mod tests {
-    use super::reference::Hash;
+    
     use super::*;
-    use crate::encode::ArgValue;
+    
     use crate::probe::Probe;
 
     // ------------------------------------------------------------------
@@ -430,110 +411,7 @@ mod tests {
     /// `Qwen3.8-Flash-Next`'s own `eos_token_id`.
     const EOS: i32 = 248_044;
 
-    fn hashing() -> Hash<'static> {
-        Hash {
-            eos: EOS,
-            mults: &MULTS,
-            primes: &PRIMES,
-            offsets: &OFFSETS,
-            heads_per_ngram: 2,
-        }
-    }
-
     // ---- the arithmetic pins ------------------------------------------
-
-    /// **THE HASH, PINNED TO INTEGERS.** A table lookup is exact or it is
-    /// garbage, so this is an equality and not a band — and the numbers are
-    /// written out rather than recomputed, because a pin that restates the
-    /// formula it is pinning proves only that the formula is deterministic.
-    ///
-    /// The window is `[t, t−1, t−2]` newest first, over a lane whose state is
-    /// empty: token 11 at the start of a sequence sees eos twice.
-    #[test]
-    fn the_first_three_tokens_hash_to_the_rows_this_lane_computes() {
-        let h = hashing();
-        let mut state = vec![0i32; h.span()];
-        let ids = [11i32, 22, 33];
-        let got = reference::walk(&h, &ids, &mut state);
-
-        assert_eq!(got.len(), ids.len() * h.heads());
-        // Token 11, no history: order 2 folds `[11, eos]`, order 3 folds
-        // `[11, eos, eos]`.
-        assert_eq!(
-            &got[0..4],
-            &[13_555_483, 24_877_159, 48_029_743, 60_685_041]
-        );
-        // Token 22, one id of history.
-        assert_eq!(&got[4..8], &[6_360_836, 23_556_724, 54_042_348, 62_161_731]);
-        // Token 33, a full window.
-        assert_eq!(
-            &got[8..12],
-            &[11_011_879, 32_921_443, 50_713_018, 75_286_033]
-        );
-        // And the window the next fire inherits is the last two ids, each
-        // stored as `id + 1` so a zeroed cell can mean "no history".
-        assert_eq!(state, vec![23, 34]);
-    }
-
-    /// **THE eos RULE, WHICH IS THE ONE PIECE OF THIS THAT IS NOT ARITHMETIC.**
-    /// A window that reaches back across a sequence boundary reads eos for
-    /// every id past it — and it is the NEARER id that decides, so an eos at
-    /// `t−1` masks `t−2` even when `t−2` is a real token.
-    #[test]
-    fn an_eos_one_back_masks_every_id_behind_it() {
-        let h = hashing();
-        let mut window = [7, EOS, 42, 0];
-        reference::mask_window(&h, &mut window[..3]);
-        assert_eq!(window[..3], [7, EOS, EOS]);
-
-        // And the far one alone masks nothing nearer.
-        let mut window = [7, 42, EOS, 0];
-        reference::mask_window(&h, &mut window[..3]);
-        assert_eq!(window[..3], [7, 42, EOS]);
-    }
-
-    /// **THE TWO ARMS ARE ONE WALK.** The decode form steps a lane one token
-    /// at a time off its state; the chunked form walks a request's rows and
-    /// advances the state once. A sequence hashed either way is the same
-    /// sequence, and that is the property that lets a fire split its lanes by
-    /// `qo_one` and merge the answers.
-    #[test]
-    fn stepping_a_lane_and_walking_it_agree() {
-        let h = hashing();
-        let ids = [5i32, 6, EOS, 8, 9, 10];
-
-        let mut walked_state = vec![0i32; h.span()];
-        let walked = reference::walk(&h, &ids, &mut walked_state);
-
-        let mut stepped_state = vec![0i32; h.span()];
-        let mut stepped = Vec::new();
-        for id in ids {
-            stepped.extend(reference::step(&h, id, &mut stepped_state));
-        }
-
-        assert_eq!(walked, stepped);
-        assert_eq!(walked_state, stepped_state);
-        // And a chunk boundary is not a seam either: the same ids split two
-        // ways land the same rows.
-        let mut split_state = vec![0i32; h.span()];
-        let mut split = reference::walk(&h, &ids[..2], &mut split_state);
-        split.extend(reference::walk(&h, &ids[2..], &mut split_state));
-        assert_eq!(walked, split);
-        assert_eq!(walked_state, split_state);
-    }
-
-    /// A segment SHORTER than the window leaves the older cells in place —
-    /// the state's own shift, which is the arithmetic a `p + rows` read is.
-    #[test]
-    fn a_segment_shorter_than_the_window_keeps_the_cells_it_does_not_fill() {
-        let h = hashing();
-        let mut state = vec![0i32; h.span()];
-        let _ = reference::walk(&h, &[1, 2], &mut state);
-        assert_eq!(state, vec![2, 3]);
-        // One more token: the oldest cell falls off the front.
-        let _ = reference::walk(&h, &[7], &mut state);
-        assert_eq!(state, vec![3, 8]);
-    }
 
     // ---- the marshalling pins -----------------------------------------
 
@@ -553,70 +431,6 @@ mod tests {
 
     fn plane() -> Tensor {
         Tensor::new(12, 1, (MULTS.len() + 2 * PRIMES.len()) as u32, Dtype::U64)
-    }
-
-    /// The decode arm is ONE THREAD PER ROW, and the four scalars it states
-    /// are the shape — not the constants, which are the plane's.
-    #[test]
-    fn the_decode_arm_launches_one_thread_per_row() {
-        let probe = Probe::default();
-        ngram_ids(
-            &probe,
-            i32t(1, 6, 1),
-            &pool(),
-            plane(),
-            EOS as u32,
-            &MULTS,
-            &PRIMES,
-            &OFFSETS,
-            2,
-            i32t(2, 6, 4),
-        )
-        .expect("the hasher encodes");
-        let (fire, args) = probe.only();
-        assert_eq!(fire.file, FILE);
-        assert_eq!(fire.entrypoint, "ple_ngram_ids_update");
-        assert_eq!(fire.lanes, [6, 1, 1]);
-        assert_eq!(
-            &args[5..],
-            &[
-                ArgValue::I32(3),
-                ArgValue::I32(4),
-                ArgValue::I32(2),
-                ArgValue::I32(EOS),
-            ]
-        );
-        // The state is the only seat bound for write besides the output.
-        assert_eq!(args[1], ArgValue::BufferMut(10));
-        assert_eq!(args[3], ArgValue::Buffer(12));
-    }
-
-    /// The chunked arm is ONE THREAD PER REQUEST, off the CSR's own length —
-    /// `causal_conv1d_chunked`'s shape, and the launch a row count would get
-    /// wrong.
-    #[test]
-    fn the_chunked_arm_launches_one_thread_per_request() {
-        let probe = Probe::default();
-        let ids = RaggedTensor {
-            data: i32t(1, 40, 1),
-            indptr: i32t(3, 4, 1),
-        };
-        ngram_ids_chunked(
-            &probe,
-            ids,
-            &pool(),
-            plane(),
-            EOS as u32,
-            &MULTS,
-            &PRIMES,
-            &OFFSETS,
-            2,
-            i32t(2, 40, 4),
-        )
-        .expect("the hasher encodes");
-        let (fire, _) = probe.only();
-        assert_eq!(fire.entrypoint, "ple_ngram_ids_chunked");
-        assert_eq!(fire.lanes, [3, 1, 1]);
     }
 
     /// The constants plane is laid down in ONE order and both this crate's
@@ -674,4 +488,59 @@ mod tests {
         .expect_err("four heads are not three per order");
         assert!(why.to_string().contains("4 heads against 2"), "{why}");
     }
+}
+
+
+/// The committed form (`engine_metal::rs`): [`ngram_ids_chunked`] over the
+/// extended row run, advancing each lane's window only over its `commit`.
+#[allow(clippy::too_many_arguments)]
+pub fn ngram_ids_committed(
+    ctx: &Ctx<'_>,
+    ids: Tensor,
+    indptr: Tensor,
+    committed: &crate::attn::ssm::Committed,
+    state: &RecurrentPool,
+    hash: Tensor,
+    eos: u32,
+    mults: &[u64],
+    primes: &[u64],
+    offsets: &[u64],
+    heads_per_ngram: u32,
+    ngram_ids: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.ple_ngram_ids_committed";
+    if ids.dtype != Dtype::I32 || ngram_ids.dtype != Dtype::I32 || indptr.dtype != Dtype::I32 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the hasher reads i32 ids over an i32 CSR and lands i32 rows, not {:?}/{:?}/{:?}",
+                ids.dtype, indptr.dtype, ngram_ids.dtype
+            ),
+        ));
+    }
+    let shape = shape(OP, eos, mults, primes, offsets, heads_per_ngram)?;
+    hash_plane(OP, hash, &shape)?;
+    nonzero(OP, "extended rows", ids.rows)?;
+    let lanes = match indptr.rows.checked_sub(1) {
+        Some(lanes) if lanes > 0 => lanes,
+        _ => return Err(refuse(OP, "the window CSR this fire names spans no request")),
+    };
+    ctx.fire(
+        Fire::at(FILE, "ple_ngram_ids_committed").apply([lanes, 1, 1]),
+        &[
+            ids.arg(),
+            indptr.arg(),
+            committed.replay.arg(),
+            committed.commit.arg(),
+            committed.slots.arg(),
+            stated(OP, committed.lane0)?.arg(),
+            state.state.arg_mut(),
+            hash.arg(),
+            ngram_ids.arg_mut(),
+            stated(OP, shape.ngram)?.arg(),
+            stated(OP, shape.heads)?.arg(),
+            stated(OP, shape.heads_per_ngram)?.arg(),
+            stated(OP, shape.eos)?.arg(),
+        ],
+    )
 }

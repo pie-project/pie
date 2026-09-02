@@ -1,6 +1,4 @@
-//! The `attention` family: `impl DispatchAttention for Run<'_>`, holding the
-//! paged and plan arms plus the absorbed `mla`, `ssm`, `index`, and `pool`
-//! groups, in the order the merged enum lists them.
+//! The `attention` family: paged/plan arms plus the absorbed `mla`, `ssm`, `index`, and `pool` groups.
 
 use kernels_metal::attn;
 use model_exec::{DispatchAttention, KernelError};
@@ -15,32 +13,16 @@ impl DispatchAttention for Run<'_> {
 }
 
 impl Run<'_> {
-    /// How many requests the window's rows belong to.
-    ///
-    /// The one fact the sdpa arbitration turns on and no operand carries: a
-    /// prefill and a fleet of decodes can present the SAME row count, and
-    /// what separates them is how many key spans those rows sit over. The
-    /// window's qo boundaries are one entry per request plus a terminator,
-    /// so the count is already here and nothing has to be recomputed from
-    /// the composition.
+    /// How many requests the window's rows belong to — what the sdpa
+    /// arbitration turns on, since row count alone can't distinguish a
+    /// prefill from a fleet of decodes.
     fn requests(&self) -> u32 {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 
-    /// **THE CAPTURE ARM'S OBSERVATION** — one launch, or none at all
-    /// (`.wiki/alto/attn-score.md` §4).
-    ///
-    /// Returns `Ok(())` without touching an encoder in every case that is not
-    /// an observation: a load with no slab, a fire no lane captured, and a
-    /// `prefill_lse` node the plan's `attn.scores` seam does not name. That
-    /// last one matters — a text may write a log-sum-exp for its own reasons,
-    /// and a node the seam did not declare owns no plane.
-    ///
-    /// # Errors
-    ///
-    /// Whatever [`kernels_metal::attn::score::capture`] refuses: a sliding
-    /// window (the row would not be the softmax the eviction papers define), a
-    /// quantized key plane, a head this kernel is not stamped for.
+    /// One capture launch, or none: no-ops for a load with no slab, a fire no
+    /// lane captured, or a `prefill_lse` node the plan's `attn.scores` seam
+    /// does not name.
     #[allow(clippy::too_many_arguments)]
     fn capture_scores(
         &mut self,
@@ -59,10 +41,7 @@ impl Run<'_> {
         let Some(plane) = seat.plane_of(lse) else {
             return Ok(());
         };
-        // `lane_offset` is what turns this window's request number into a fire
-        // lane, which is the slab's row space; a window in two pieces
-        // therefore lands each piece on its own lanes with no lane map
-        // anywhere.
+        // Turns this window's request number into a fire lane (the slab's row space).
         let lane_offset = self.window().span.lane_offset;
         let requests = self.requests();
         attn::score::capture(
@@ -84,20 +63,13 @@ impl Run<'_> {
         )
     }
 
-    /// The arms themselves, in `kernels-metal`'s error vocabulary and not
-    /// the contract's — which is what keeps each one a plain tail call with
-    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
-    /// above that lifts the family, and says why it is a call and not a
-    /// `From` impl.
+    /// The arms themselves, in `kernels-metal`'s error vocabulary, lifted by
+    /// [`kernel`](crate::error::kernel) above.
     fn attention(&mut self, op: &Attention) -> Result<(), kernels_metal::Error> {
         match op {
-            // MENLO-SEAM (engine side): the op names kv geometry the metal
-            // builder never reads — kv_indptr/kv_indices/last_page_len stay
-            // unresolved, kv_len resolves and rides through unread — because
-            // the pool row carries the page tables; meanwhile the tables the
-            // builder does read (positions, request_of_token, mask) are no
-            // op's named inputs and bind from fire state here. The kernel
-            // side of this seam is marked in `kernels_metal::attn`.
+            // kv_indptr/kv_indices/last_page_len stay unresolved (the pool row
+            // carries the page tables); positions/request_of_token/mask bind
+            // from fire state here since no op input names them.
             Attention::PlanDecode {
                 kv_indptr: _,
                 kv_indices: _,
@@ -119,14 +91,9 @@ impl Run<'_> {
                 let kv_len = self.tensor(*kv_len);
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
-                // THE AMBIENT TABLES ARE CUT LIKE THE `q` THAT WILL BE READ
-                // BESIDE THEM. The sdpa shaders index `position_ids[row]`,
-                // `req_of_token[row]` and `attention_mask_enabled[row]` by the
-                // LOCAL row of the launch, so a plan built for a windowed
-                // class has to carry the window's own slice of each. What
-                // stays absolute is what those tables CONTAIN — a lane id
-                // into the fire-wide `page_indptr` — because slicing a vector
-                // does not renumber it.
+                // Ambient tables are cut like the `q` beside them: shaders index
+                // them by the launch's local row, but the lane ids they contain
+                // (into the fire-wide page_indptr) stay absolute.
                 let built = attn::plan_decode(
                     self.ctx(),
                     kv_len,
@@ -139,10 +106,8 @@ impl Run<'_> {
                 self.put(*plan, StructSlot::Decode(built));
                 Ok(())
             }
-            // MENLO-SEAM: same misalignment as `PlanDecode`. Which plan the
-            // trace declared is honored, not assumed: only the fa2 kind
-            // exists on this plane, so an sm90 declaration is answered with
-            // a panic, never a silently-substituted fa2 plan.
+            // Only the fa2 plan kind exists on this plane; an sm90 declaration
+            // panics rather than silently substituting an fa2 plan.
             Attention::PlanPrefill {
                 kv_indptr: _,
                 kv_indices: _,
@@ -199,14 +164,9 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
-            // **THE OP NAMES THE SHAPE, NOT THE KERNEL.** A `Prefill` is a
-            // statement that these rows have keys behind them, and the tiled
-            // shader is only the right answer when the rows SHARE those keys:
-            // a fleet of thirty-two one-row lanes has a prefill's row count
-            // and a decode's dataflow, and measures 370 tok/s tiled against
-            // 728 per-row. So the arbitration is here, off the window's own
-            // request count, and `kernels_metal::attn::arbiter` holds the
-            // rule. See its header.
+            // The op names the shape, not the kernel: the tiled shader only
+            // wins when the rows actually share keys, so the arbitration
+            // (off the window's request count) lives in attn::arbiter.
             Attention::Prefill {
                 q,
                 plan,
@@ -229,10 +189,7 @@ impl Run<'_> {
                 self.requests(),
                 &kernels_metal::tuning::current(),
             ),
-            // THE TOWER'S ATTENTION. A real arm and not a refusal: this
-            // plane's `attn::dense` is a written shader, so the family's rule
-            // holds — the arm forwards, and if the entry declines it declines
-            // by its own name.
+            // The tower's attention: attn::dense is a written shader here.
             Attention::Dense {
                 q,
                 k,
@@ -264,19 +221,10 @@ impl Run<'_> {
                 self.ctx(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
-                // THE OP-NAMED MASK IS CUT LIKE THE PLAN-CARRIED ONE, AND
-                // THAT IS WHAT MAKES THE SEAM'S CLAIM TRUE.
-                // `kernels_metal::attn::masked`'s MENLO-SEAM note says the
-                // op's `mask` and `plan.mask` are "one buffer wearing two
-                // names"; the plan's was built from `cut_rows` and this one
-                // resolves WHOLE (`Run::cut` excludes `RuntimeInput::Mask`,
-                // because a row offset is not a byte offset for a slab the IR
-                // spells in bits). `cut_rows` is what knows the stride, so
-                // applying it here is what makes the two names name the same
-                // rows — rather than leaving them equal only while the masked
-                // window happens to start at fire row zero, which today's
-                // split order (`[masked, captures_scores, qo_one, rest]`)
-                // makes true and no rule requires.
+                // The op-named mask and plan.mask are one buffer under two
+                // names; cut_rows here keeps them naming the same rows (Run::cut
+                // excludes RuntimeInput::Mask since a row offset isn't a byte
+                // offset for a bit-packed slab).
                 self.cut_rows(self.tensor(*mask)),
                 self.pool(*cache),
                 *window,
@@ -331,23 +279,9 @@ impl Run<'_> {
                     self.requests(),
                     &kernels_metal::tuning::current(),
                 )?;
-                // ── **THE OBSERVATION, BESIDE THE ARM THAT ALREADY RAN**
-                //    (`.wiki/alto/attn-score.md` §4: "the graph writes; the
-                //    epilogue reads").
-                //
-                //    MENLO-SEAM (engine side): the op names `o` and `lse` and
-                //    nothing else, because the per-key rectangle is not a
-                //    value another node consumes — it is what this layer paid
-                //    attention to, written into a slab the shell owns and the
-                //    epilogue binds. So the arm asks fire state for it, the
-                //    way the masked arm asks for its span table, and a load
-                //    that seats no slab launches nothing at all.
-                //
-                //    **THE NODE IS ASKED, NOT THE OP.** Which plane this layer
-                //    owns comes from the VALUE it writes, matched against the
-                //    plan's `attn.scores` exports — the only reading that
-                //    cannot be fooled by a text reusing `prefill_lse` somewhere
-                //    the seam does not name.
+                // The observation beside the arm that already ran: the op
+                // names only o/lse, so the capture asks fire state for its
+                // slab (a load that seated none launches nothing).
                 self.capture_scores(
                     *q, *plan, *cache, *window, *head_dim, *kv_heads, *sm_scale, *lse,
                 )
@@ -540,11 +474,8 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
-            // MENLO-SEAM (engine side): the op names a plan and kv geometry the
-            // metal flash engine never reads — it binds the fire's causal
-            // position and owning-request tables here (the paged sdpa family's
-            // seam), cut to the window like the `q` beside them, and walks the
-            // pool's pages by request.
+            // The plan/kv geometry the op names go unread; positions and
+            // request_of_token bind from fire state, cut to the window.
             Attention::MlaDecode {
                 q,
                 plan: _,
@@ -658,16 +589,157 @@ impl Run<'_> {
                 )
             }
 
-            // qwen4's n-gram hasher: token ids against the lane's trailing
-            // window, the same state discipline the convolution below keeps.
-            //
-            // **THE CONSTANTS COME OFF THE SHELL AND NOT OFF THE NODE.** The
-            // CUDA sibling hands its `PleHash` aggregate across the launch ABI
-            // by value; this plane's `ArgValue` has no by-value blob seat, so
-            // `crate::scratch` wrote the same numbers into a `u64` plane at
-            // load and the arm mints it here. `None` is a load that wrote no
-            // plane for these constants, which is a refusal by name and not a
-            // launch against primes that are not there.
+            // qwen4's n-gram hasher: token ids against the lane's trailing window.
+            // **THE COMMITTED ARM** (`crate::rs`, `crate::dispatch::rs`): a fire
+            // in which some lane buffers or replays recurrent state runs every
+            // state-bearing op — both the one-row and the chunked spelling — over
+            // the extended rows, persisting each lane's bank only as far as its
+            // verb says, and lands the lanes' own rows back into the op's
+            // rectangle. The decode spelling is routed here too: a one-row lane
+            // replaying a buffered prefix is a multi-row recurrence whatever its
+            // word says.
+            Attention::PleNgramIds {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                ngram_ids,
+            }
+            | Attention::PleNgramIdsChunked {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                ngram_ids,
+            } if self.rs_seat().is_some() => {
+                const OP: &str = "attention.ple_ngram_ids_committed";
+                let seat = self.rs_seat().expect("guarded");
+                let Some(hash) = self.ple_hash(mults, primes, offsets) else {
+                    return Err(kernels_metal::Error::Unsupported { op: op.name() });
+                };
+                let ext_ids = self.rs_extend(OP, &seat, *ids)?;
+                let ext_out = self.rs_out(OP, &seat, *ngram_ids)?;
+                attn::ple::ngram_ids_committed(
+                    self.ctx(),
+                    ext_ids,
+                    self.qo_indptr(),
+                    &self.rs_committed(&seat),
+                    &self.recurrent(*state),
+                    hash,
+                    *eos,
+                    mults,
+                    primes,
+                    offsets,
+                    *heads_per_ngram,
+                    ext_out,
+                )?;
+                self.rs_land(OP, &seat, ext_out, *ngram_ids)
+            }
+            Attention::SsmCausalConv1d {
+                x,
+                weight,
+                state,
+                conv_width,
+                dilation,
+                y,
+            }
+            | Attention::SsmCausalConv1dChunked {
+                x,
+                weight,
+                state,
+                conv_width,
+                dilation,
+                y,
+            } if self.rs_seat().is_some() => {
+                const OP: &str = "attention.ssm_causal_conv1d_committed";
+                let seat = self.rs_seat().expect("guarded");
+                let ext_x = self.rs_extend(OP, &seat, *x)?;
+                let ext_y = self.rs_out(OP, &seat, *y)?;
+                attn::ssm::causal_conv1d_committed(
+                    self.ctx(),
+                    ext_x,
+                    self.qo_indptr(),
+                    &self.rs_committed(&seat),
+                    self.tensor(*weight),
+                    &self.recurrent(*state),
+                    *conv_width,
+                    *dilation,
+                    ext_y,
+                )?;
+                self.rs_land(OP, &seat, ext_y, *y)
+            }
+            Attention::SsmGdnPrep {
+                ba,
+                dt_bias,
+                a_log,
+                gates,
+            } if self.rs_seat().is_some() => {
+                const OP: &str = "attention.ssm_gdn_prep";
+                let seat = self.rs_seat().expect("guarded");
+                let ext_ba = self.rs_extend(OP, &seat, *ba)?;
+                let ext_gates = self.rs_out(OP, &seat, *gates)?;
+                attn::ssm::gdn_prep(
+                    self.ctx(),
+                    ext_ba,
+                    self.tensor(*dt_bias),
+                    self.tensor(*a_log),
+                    ext_gates,
+                )?;
+                self.rs_land(OP, &seat, ext_gates, *gates)
+            }
+            Attention::SsmGatedDelta {
+                qkv,
+                z: _,
+                gates,
+                state,
+                k_heads,
+                v_heads,
+                k_dim,
+                v_dim,
+                y,
+            }
+            | Attention::SsmGatedDeltaChunked {
+                qkv,
+                z: _,
+                gates,
+                state,
+                k_heads,
+                v_heads,
+                k_dim,
+                v_dim,
+                y,
+            } if self.rs_seat().is_some() => {
+                const OP: &str = "attention.ssm_gated_delta_committed";
+                let seat = self.rs_seat().expect("guarded");
+                // The conv's and the prep's EXTENDED outputs, landed by the two
+                // arms above in this same window.
+                let ext_qkv = self.rs_ext_of(OP, &seat, *qkv)?;
+                let ext_gates = self.rs_ext_of(OP, &seat, *gates)?;
+                let ext_y = self.rs_out(OP, &seat, *y)?;
+                attn::ssm::gated_delta_committed(
+                    self.ctx(),
+                    ext_qkv,
+                    self.qo_indptr(),
+                    &self.rs_committed(&seat),
+                    ext_gates,
+                    &self.recurrent(*state),
+                    seat.work,
+                    *k_heads,
+                    *v_heads,
+                    *k_dim,
+                    *v_dim,
+                    ext_y,
+                )?;
+                self.rs_land(OP, &seat, ext_y, *y)
+            }
+            // Hash constants are read from a scratch plane crate::scratch wrote
+            // at load (ArgValue has no by-value blob seat); None refuses by name.
             Attention::PleNgramIds {
                 ids,
                 state,
@@ -721,10 +793,7 @@ impl Run<'_> {
                 )
             }
 
-            // The absorbed `ssm` family (`attention.ssm_*`), calling into
-            // `kernels_metal::attn::ssm`. The convolution takes its
-            // `dilation` whole now — qwen4's PLE mixes at three, every GDN
-            // mixer at one, and the undilated arm is the same launch it was.
+            // The absorbed `ssm` family, calling into kernels_metal::attn::ssm.
             Attention::SsmCausalConv1d {
                 x,
                 weight,
@@ -900,17 +969,9 @@ impl Run<'_> {
                 *rope_dim,
                 *theta,
             ),
-            // THE TWO TABLES AND THE SLAB ARE THIS PLANE'S, AND NO OP NAMES
-            // ANY OF THEM. `index_topk_paged` on the CUDA plane rebuilds each
-            // row's absolute query position from `qo_indptr` and
-            // `kv_last_page_lens`; the metal pool carries no last-page table,
-            // so the selection reads `positions`/`request_of_token` off the
-            // fire the way `mla_naive_paged` and `pool_lse_paged` do — cut to
-            // the window, because the shader indexes them by the LAUNCH's own
-            // row. The score slab is `crate::scratch`'s index role, reserved
-            // at the paging's per-request key ceiling; a load that reserved
-            // none has no `attention.index_topk` in its trace, so reaching
-            // here without one is the shell disagreeing with its own carve.
+            // positions/request_of_token bind from fire state (cut to the
+            // window) since the metal pool carries no last-page table; the
+            // score slab is crate::scratch's index role.
             Attention::IndexTopk {
                 q,
                 weights,
@@ -991,22 +1052,10 @@ impl Run<'_> {
                 self.tensor(*boundary_req),
                 self.tensor(*boundary_rope),
             ),
-            // MENLO-SEAM: the dsv4 compressor state (`state_kv`,
-            // `state_score`, `ape`) has no IR seat. The CUDA arm binds the
-            // slabs the shell staged into fire state (`Run::slabs`); this one
-            // binds `crate::scratch`'s pool role, reserved at the source
-            // paging's cell ceiling — the `index_topk` shape one family up,
-            // for the same reason. A load that reserved none has no
-            // `attention.pool_gather` in its trace, so reaching here without
-            // one is the shell disagreeing with its own carve.
-            //
-            // **AND THE ape SEAT IS AN OPERAND NOW.** The intra-block
-            // position plane is a checkpoint WEIGHT
-            // (`attn.compressor.ape`), not shell scratch, so it took an IR
-            // seat rather than a staged slab: `PoolGather.ape` is `Some` on
-            // a layer whose compressor states one and `None` on a
-            // parameter-free mean pool, which is the CUDA `ape == nullptr`
-            // path both shaders already carry.
+            // The dsv4 compressor state (state_kv, state_score) has no IR
+            // seat; it binds crate::scratch's pool role. `ape` is a real IR
+            // operand though (a checkpoint weight): Some when the layer's
+            // compressor states one, None for a parameter-free mean pool.
             Attention::PoolGather {
                 boundary_pos,
                 boundary_req,
@@ -1034,9 +1083,8 @@ impl Run<'_> {
                     self.tensor(*entries),
                 )
             }
-            // The gather's slabs, filled. Same seam and the same resolution:
-            // the state is keyed by the SOURCE space, which is this op's own
-            // `pages`, so a layer's writer and its reader find one plane.
+            // State is keyed by the source space (this op's own `pages`), so
+            // a layer's writer and reader find one plane.
             Attention::PoolStateWrite {
                 kv,
                 score,

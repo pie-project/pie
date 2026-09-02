@@ -1,44 +1,23 @@
-//! **THE `.zt` AS A SPILL SOURCE** (§M-4d) — the boot reading its planes out
-//! of the one file, instead of out of a second one beside it.
-//!
-//! Since §M-4b the artifact `pie model import` writes IS the serving file: it
-//! holds every plane of the trace, under this SKU's own names, in the order a
-//! boot reads them, with a digest table per plane and a stamp saying what
-//! deployment it was written for. Everything `weight_cache/tier.rs` exists to
-//! provide, the checkpoint now provides itself.
-//!
-//! # What this type is, and what it is not
-//!
-//! It is the ADDRESSING adapter and nothing else. `experts::Spill` asks for a
-//! plane by the param's ordinal in the trace; a serving artifact addresses an
-//! object by NAME, because a name is what survives being written to a file
-//! that another build will open. So this holds the trace's names in ordinal
-//! order and does one lookup.
-//!
-//! It is not a second reader. `checkpoint::file::serve::Artifact` is the
-//! reader — it opens without hashing, verifies the prefix a boot is about to
-//! serve, and maps nothing it was not asked for — and this borrows from it.
-//!
-//! # Why the names are carried and not re-derived
-//!
-//! `Spill::plane` is called once per plane of the load, and a lookup that
-//! walked the trace each time would be quadratic in the plane count. The
-//! catalog's widest row has 2030 params.
+//! Addressing adapter that reads model planes out of a serving `.zt`
+//! checkpoint by trace param name, rather than by file position.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use checkpoint::file::serve::Artifact;
+use checkpoint::serving::BlockAlgorithm;
 use model_ir::Trace;
 
 /// A serving artifact, plus the ordinal-to-name translation `Spill` needs.
 ///
-/// `Debug` prints the path and the plane count and NOT the names: `Spill`
-/// derives it, a refusal that formats a spill would otherwise put two
-/// thousand plane names in one line, and the two facts an operator reading
-/// such a line wants are which file and how much of it.
+/// `Debug` prints the path and the plane count and not the names, since a
+/// spill refusal formatting this would otherwise put thousands of names in
+/// one line.
+/// One mapping of a serving artifact, shared by every seat that reads it.
+#[derive(Clone)]
 pub struct Serving {
-    artifact: Artifact,
-    names: Vec<String>,
+    artifact: Arc<Artifact>,
+    names: Arc<[String]>,
     path: PathBuf,
 }
 
@@ -52,22 +31,14 @@ impl std::fmt::Debug for Serving {
 }
 
 impl Serving {
-    /// **Open `path` as this trace's serving artifact**, or say there is none.
-    ///
-    /// `None` for a file that is not a serving artifact at all, which is an
-    /// ordinary checkpoint and is the road every load had before §M-4. A file
-    /// that CLAIMS to be one and does not read back is not silently one of
-    /// those — `serve::stamp_of` keeps those two apart, and the load has
-    /// already refused on it at the door in `api.rs` before this is reached.
-    ///
-    /// The stamp is not re-checked here. It was checked before any plane
-    /// landed, which is the whole of §M-4c, and checking it twice would
-    /// invite the two checks to disagree.
+    /// Opens `path` as this trace's serving artifact, or `None` if it isn't
+    /// one. The stamp is checked once, before any plane lands; not
+    /// re-checked here.
     #[must_use]
     pub fn open(path: &Path, trace: &Trace) -> Option<Serving> {
         let artifact = Artifact::open(path).ok()?;
         Some(Serving {
-            artifact,
+            artifact: Arc::new(artifact),
             names: trace.params.iter().map(|param| param.name.clone()).collect(),
             path: path.to_path_buf(),
         })
@@ -79,13 +50,9 @@ impl Serving {
         &self.path
     }
 
-    /// **One plane's bytes**, borrowed from the mapping, or `None` for a name
-    /// this artifact does not carry.
-    ///
-    /// The part is `data`: a checkpoint's streamed object is single-part by
-    /// construction — `file/write.rs`'s `begin_tensor` declares one part and
-    /// names it that — and a split-plane bank is two `Trace::params` rows
-    /// here, so each is its own object rather than two parts of one.
+    /// One plane's bytes, borrowed from the mapping, or `None` if this
+    /// artifact does not carry that name. Each plane is its own object with
+    /// a single `data` part.
     #[must_use]
     pub fn plane(&self, id: u32) -> Option<&[u8]> {
         let name = self.names.get(id as usize)?;
@@ -97,6 +64,285 @@ impl Serving {
     #[must_use]
     pub fn artifact(&self) -> &Artifact {
         &self.artifact
+    }
+
+    /// The trace's name for this ordinal, or `None` past the end — so a
+    /// refusal can name the plane.
+    #[must_use]
+    pub fn name(&self, id: u32) -> Option<&str> {
+        self.names.get(id as usize).map(String::as_str)
+    }
+
+    /// One plane's bytes at the padded extent a deferred tier seat reads
+    /// (the declared length rounded up), or `None` if not carried that far.
+    ///
+    /// The last blob in the file has no padding behind it, so it can never
+    /// serve a deferred seat.
+    #[must_use]
+    pub fn plane_padded(&self, id: u32, reserved: u64) -> Option<&[u8]> {
+        let name = self.names.get(id as usize)?;
+        self.artifact.span(name, "data", reserved).ok()
+    }
+
+    /// Verifies the planes a seat will serve, before a kernel is pointed at
+    /// one. Each name is checked against its own stated block table.
+    pub fn verify_planes(&self, params: &[u32]) -> Result<(), String> {
+        let mut names = Vec::with_capacity(params.len());
+        for id in params {
+            let Some(name) = self.name(*id) else {
+                return Err(format!(
+                    "this deployment asks for param {id} and the trace it was opened with \
+                     names only {}",
+                    self.names.len()
+                ));
+            };
+            names.push(name);
+        }
+        self.artifact
+            .verify(&names)
+            .map_err(|why| format!("{}: {why}", self.path.display()))
+    }
+}
+
+/// One T1 plane as the background fill needs it: everything owned, nothing
+/// borrowed, since the fill runs on a thread that reopens the file by path.
+pub struct Landing {
+    /// Where this plane's blob starts in the file.
+    pub at: u64,
+    /// How many bytes to read: the seat's padded extent.
+    pub copy: u64,
+    /// How many of those the block table covers. Shorter than `copy`; the
+    /// gap is unhashed alignment padding.
+    pub hashed: u64,
+    /// Where they land in the page-locked image (`Plan::host_layout`'s offset).
+    pub into: u64,
+    /// This plane's own block digests, concatenated.
+    pub digests: Vec<u8>,
+}
+
+/// The whole background fill, stated before a thread is spawned for it.
+pub struct Refill {
+    pub path: PathBuf,
+    pub block_bytes: u64,
+    pub algorithm: BlockAlgorithm,
+    pub planes: Vec<Landing>,
+}
+
+impl Serving {
+    /// Whether this artifact carries every plane of `layout` out to the
+    /// extent a seat would read. A deferred seat needs the whole T1 set
+    /// (unlike a spill, which needs only its own subset), so this is
+    /// checked up front rather than left to fail inside `Tier::open`.
+    ///
+    /// # Errors
+    ///
+    /// Names the first plane that does not resolve, and at what extent.
+    pub fn covers(&self, layout: &[(u64, u64, u64, u64)]) -> Result<(), String> {
+        for (param, _, _, reserved) in layout.iter().copied() {
+            let id = u32::try_from(param).unwrap_or(u32::MAX);
+            if self.plane_padded(id, reserved).is_none() {
+                let plane = self
+                    .name(id)
+                    .map_or_else(|| format!("param {param}"), |name| format!("`{name}`"));
+                return Err(format!("it does not carry {plane} out to {reserved} bytes"));
+            }
+        }
+        Ok(())
+    }
+
+    /// What the background fill would have to do, or why it cannot. A fill
+    /// that can't be armed falls back to serving out of the mapping.
+    /// `layout` is `Plan::host_layout`'s quads: `(param, into, _, reserved)`.
+    ///
+    /// # Errors
+    ///
+    /// An unknown param, an uncarried plane, an unreadable block table, or a
+    /// plane in a shard (the fill reads the file by path with positioned
+    /// reads, and a sharded artifact's blobs live in sibling files).
+    pub fn refill(&self, layout: &[(u64, u64, u64, u64)]) -> Result<Refill, String> {
+        let spans = self.artifact.spans();
+        let padded = self.artifact.padded_spans();
+        let mut planes = Vec::with_capacity(layout.len());
+        for (param, into, _, reserved) in layout.iter().copied() {
+            let id = u32::try_from(param).unwrap_or(u32::MAX);
+            let Some(name) = self.name(id) else {
+                return Err(format!("param {param} is past the end of this trace"));
+            };
+            let Some(which) = spans
+                .iter()
+                .position(|span| span.object == name && span.part == "data")
+            else {
+                return Err(format!("`{name}` is not a serving part of this artifact"));
+            };
+            let span = spans[which];
+            if let Some(shard) = span.shard {
+                return Err(format!(
+                    "`{name}` lives in shard `{shard}`, and the fill reads the artifact by \
+                     path with positioned reads"
+                ));
+            }
+            let room = padded.get(which).copied().unwrap_or(span.length);
+            let copy = reserved.min(room);
+            // the block table covers the whole decoded size, so a `copy`
+            // shorter than it would hash a prefix against a whole-plane digest.
+            if copy < span.length {
+                return Err(format!(
+                    "`{name}` is {} bytes in the file and this plan reserves {copy} for it, \
+                     and a table that covers the whole plane cannot answer for a prefix",
+                    span.length,
+                ));
+            }
+            let digests = self
+                .artifact
+                .blocks(name, "data")
+                .map_err(|why| format!("`{name}` states no readable block table: {why}"))?
+                .as_bytes()
+                .to_vec();
+            planes.push(Landing {
+                at: span.offset,
+                copy,
+                hashed: span.length.min(copy),
+                into,
+                digests,
+            });
+        }
+        Ok(Refill {
+            path: self.path.clone(),
+            block_bytes: self.artifact.stamp().block_bytes,
+            algorithm: self.artifact.stamp().block_algorithm,
+            planes,
+        })
+    }
+}
+
+/// Thread count for reading behind a deferred seat: about the disk's queue
+/// depth, not this file (mirrors the tier road's measured `TIER_READERS`).
+const READERS: usize = 8;
+
+/// A destination pointer a scope thread may carry. Sound to move because
+/// `read_into`'s landings are disjoint windows on a mapping the caller has
+/// handed to nobody else.
+struct Carried(*mut u8);
+// SAFETY: see the type doc and `read_into`'s contract.
+unsafe impl Send for Carried {}
+// SAFETY: the work list is shared by reference and each lane touches only
+// its own slice of it.
+unsafe impl Sync for Carried {}
+
+/// Reads the whole fill into `into`, hashing each block as its bytes land.
+/// One work item per block rather than per plane, since plane sizes are
+/// very uneven. A landing's `copy` (padded, read) and `hashed` (block-table
+/// extent) can differ: the gap is file padding, read but not hashed.
+///
+/// # Safety
+///
+/// `into` must be valid for writes over every landing's `into..into + copy`,
+/// those windows must be disjoint, and nothing else may name a byte of them
+/// for the duration.
+///
+/// # Errors
+///
+/// A filesystem error first, then the first block whose digest disagrees.
+pub unsafe fn read_into(refill: &Refill, into: *mut u8) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
+
+    let file = std::fs::File::open(&refill.path)
+        .map_err(|why| format!("{}: {why}", refill.path.display()))?;
+    let width = refill.algorithm.width();
+    // (file offset, length, destination, digest to check — none for padding)
+    let mut work: Vec<(u64, u64, Carried, Option<&[u8]>)> = Vec::new();
+    for plane in &refill.planes {
+        let blocks = checkpoint::serving::block_count(plane.hashed, refill.block_bytes);
+        for which in 0..blocks {
+            let Some(span) = checkpoint::serving::block_span(plane.hashed, refill.block_bytes, which)
+            else {
+                continue;
+            };
+            let at = usize::try_from(which).unwrap_or(usize::MAX).saturating_mul(width);
+            // SAFETY: span.start < plane.hashed <= plane.copy, and the
+            // caller guarantees `into` valid over the landing's whole width.
+            let dst = Carried(unsafe {
+                into.add(
+                    usize::try_from(plane.into.saturating_add(span.start)).unwrap_or(usize::MAX),
+                )
+            });
+            work.push((
+                plane.at.saturating_add(span.start),
+                span.end.saturating_sub(span.start),
+                dst,
+                plane.digests.get(at..at.saturating_add(width)),
+            ));
+        }
+        // The padding, read and not hashed.
+        if plane.copy > plane.hashed {
+            // SAFETY: as above; this window starts where the last block
+            // ended, so it overlaps none of them.
+            let dst = Carried(unsafe {
+                into.add(
+                    usize::try_from(plane.into.saturating_add(plane.hashed)).unwrap_or(usize::MAX),
+                )
+            });
+            work.push((
+                plane.at.saturating_add(plane.hashed),
+                plane.copy - plane.hashed,
+                dst,
+                None,
+            ));
+        }
+    }
+
+    let found: Vec<Result<(), String>> = std::thread::scope(|scope| {
+        let width = READERS.min(work.len().max(1));
+        let per = work.len().div_ceil(width.max(1));
+        let mut reading = Vec::with_capacity(width);
+        for lane in 0..width {
+            let mine = work.get(lane * per..((lane + 1) * per).min(work.len())).unwrap_or(&[]);
+            let file = &file;
+            let algorithm = refill.algorithm;
+            reading.push(scope.spawn(move || {
+                let mut out = Vec::with_capacity(mine.len());
+                for (at, len, dst, stated) in mine {
+                    // SAFETY: caller's clause, plus the disjointness the
+                    // walk above preserves — no two items alias.
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts_mut(dst.0, usize::try_from(*len).unwrap_or(0))
+                    };
+                    out.push(match file.read_exact_at(bytes, *at) {
+                        Err(why) => Err(format!("read at {at}: {why}")),
+                        Ok(()) => match stated {
+                            None => Ok(()),
+                            Some(stated) if algorithm.digest(bytes) == *stated => Ok(()),
+                            Some(_) => Err(String::new()),
+                        },
+                    });
+                }
+                out
+            }));
+        }
+        reading
+            .into_iter()
+            .flat_map(|thread| {
+                thread.join().unwrap_or_else(|_| vec![Err("a read worker panicked".to_string())])
+            })
+            .collect()
+    });
+
+    let mut rotten = false;
+    for outcome in found {
+        match outcome {
+            Ok(()) => {}
+            // empty string is the digest-disagreement sentinel, held back so
+            // a filesystem error anywhere in the run is reported first.
+            Err(why) if why.is_empty() => rotten = true,
+            Err(why) => return Err(why),
+        }
+    }
+    match rotten {
+        true => Err(format!(
+            "{}: a block does not hash to what this artifact states for it",
+            refill.path.display()
+        )),
+        false => Ok(()),
     }
 }
 
@@ -114,9 +360,8 @@ mod tests {
         dir
     }
 
-    /// A trace of three named params, in an order that is not name order — a
-    /// serving artifact's is the boot's read order and this must not depend
-    /// on the alphabet.
+    /// Three named params in non-alphabetical order: serving order is the
+    /// boot's read order, not name order.
     fn trace(names: &[&str]) -> Trace {
         Trace {
             name: "qwen_3".to_string(),
@@ -138,14 +383,8 @@ mod tests {
         }
     }
 
-    /// **THE ORDINAL IS THE TRACE'S AND THE NAME IS THE FILE'S**, and this is
-    /// the whole of what this adapter does.
-    ///
-    /// The fixture writes the planes in a DIFFERENT order from the trace's, so
-    /// a lookup that used the file's position instead of the name — which is
-    /// what both indices this replaces do — comes back with the wrong bytes
-    /// rather than with none. Same lengths on purpose, so the wrong answer
-    /// would be the right SIZE.
+    /// A plane is found by name, not by file position — the fixture writes
+    /// planes in a different, same-length order from the trace's.
     #[test]
     fn a_plane_is_found_by_its_name_and_not_by_where_it_sits() {
         let dir = tmp("byname");
@@ -169,7 +408,7 @@ mod tests {
             .collect();
         emit::write(
             &path,
-            &Stamp::of("cuda", 1, "qwen_3", "bf16", None),
+            &Stamp::of("cuda", "qwen_3"),
             &BTreeMap::new(),
             4096,
             &objects,
@@ -188,45 +427,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A plane the trace declares and the artifact does not hold answers
-    /// `None` — the hole `Spill::remedy` has a sentence for — rather than
-    /// panicking or returning somebody else's bytes.
-    #[test]
-    fn a_name_the_artifact_does_not_hold_is_a_hole_and_not_a_neighbour() {
-        let dir = tmp("hole");
-        let path = dir.join("m.zt");
-        let data = vec![9u8; 4096];
-        emit::write(
-            &path,
-            &Stamp::of("cuda", 1, "qwen_3", "bf16", None),
-            &BTreeMap::new(),
-            4096,
-            &[Object {
-                name: "embed",
-                shape: vec![4096],
-                layout: "dense",
-                attributes: None,
-                parts: vec![Part {
-                    name: "data",
-                    dtype: ztensor::DType::U8,
-                    logical: None,
-                    payload: Payload::Whole(&data),
-                }],
-            }],
-            |o, p, _| panic!("{o}/{p} is not streamed"),
-        )
-        .unwrap();
-
-        let serving =
-            Serving::open(&path, &trace(&["embed", "gained_since"])).expect("it opens");
-        assert_eq!(serving.plane(0), Some(&data[..]));
-        assert_eq!(serving.plane(1), None, "a trace that gained a plane");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// An ordinary checkpoint is not a spill source, and saying so is how the
-    /// boot keeps its older roads: `Serving::open` answering `None` is what
-    /// sends it to the tier file and then to the resident snapshot.
+    /// An ordinary checkpoint is not a serving artifact; `Serving::open`
+    /// returns `None`, sending the boot to the tier file instead.
     #[test]
     fn an_ordinary_checkpoint_is_not_a_serving_artifact() {
         let dir = tmp("plain");

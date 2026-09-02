@@ -1,22 +1,8 @@
-//! Worker-facing **data plane** — the gateway is the SERVER; workers dial IN.
-//!
-//! Post-inversion (Pie 0.5.0, design §4/§8) the topology flips: instead of the
-//! gateway dialing each worker per session, every worker dials INTO the gateway
-//! (1:N fan-in). The gateway is the stable listening endpoint; the heavy token
-//! traffic flows worker→gateway on the plain client→server direction
-//! ([`GatewayInbound::push_tokens`]), and the latency-sensitive commands flow
-//! reverse ([`WorkerControl`]) over the SAME connection, split at accept time by
-//! [`accept_gateway_link`] (the `spawn_twoway` mux, isolated in `worker-api`).
-//!
-//! This module owns:
-//! - [`WorkerRegistry`] — the live `WorkerId → WorkerControlClient` map plus a
-//!   coalesced `connected_watch` of the connected set (the `(b)` half of routing:
-//!   a worker is dispatchable only once it has dialed in and `register`ed).
-//! - [`serve`] — the accept loop: per connection split the link, serve
-//!   `GatewayInbound`, and on the first `register` move the reverse
-//!   `WorkerControlClient` into the registry; on connection drop, evict it (the
-//!   worker-drop signal alpha's selector + charlie's `Sessions` re-dispatch react
-//!   to via `connected_watch`).
+//! Worker-facing data plane — the gateway is the server; workers dial in
+//! (1:N fan-in) over one connection split into a forward `GatewayInbound`
+//! side and a reverse `WorkerControl` side via [`accept_gateway_link`].
+//! [`WorkerRegistry`] tracks the live, dialed-in `WorkerId -> WorkerControlClient`
+//! map; [`serve`] is the accept loop that populates and evicts it.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -37,22 +23,20 @@ use worker_api::{
 
 use crate::session::Sessions;
 
-/// Max frame on the worker link. Far smaller than the old poll-based edge-rpc
-/// (which batched 64 × 256 KiB chunks): token chunks are small and large blobs
-/// ride out-of-band HTTP (`BlobRef`, design §9), so 8 MiB is ample headroom.
+/// Max frame on the worker link. Token chunks are small; large blobs ride
+/// out-of-band HTTP, so 8 MiB is ample headroom.
 const WORKER_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
-/// Why a [`WorkerRegistry::dispatch`] could not reach the worker — distinct from
-/// the worker's own [`Accepted`] answer. Both variants mean "advance to the next
-/// candidate" for alpha's retry loop (worker-drop re-route, design §8, idempotent
-/// on the stable per-turn `ReqId`).
+/// Why a [`WorkerRegistry::dispatch`] could not reach the worker — distinct
+/// from the worker's own [`Accepted`] answer. Both mean "advance to the next
+/// candidate" for the retry loop (idempotent on the stable per-turn `ReqId`).
 #[derive(Debug)]
 pub enum DispatchErr {
-    /// No live client for this `WorkerId` (never dialed in, or dropped between
-    /// the selector's read and the dispatch — the select→dispatch TOCTOU).
+    /// No live client for this `WorkerId` (never dialed in, or dropped
+    /// between the selector's read and the dispatch).
     NotConnected,
-    /// The reverse-channel RPC failed mid-dispatch — treat as a worker drop and
-    /// re-route (the re-sent `Request` carries the same `ReqId`, so it's safe).
+    /// The reverse-channel RPC failed mid-dispatch — treat as a worker drop
+    /// and re-route.
     Transport(String),
 }
 
@@ -67,10 +51,8 @@ impl std::fmt::Display for DispatchErr {
 
 impl std::error::Error for DispatchErr {}
 
-/// The live, dialed-in worker connections (the data-plane `(b)` view). Cloneable
-/// (`Arc`-backed) so the accept loop (writer), alpha's `route.rs` (reader of
-/// [`connected_watch`]), and charlie's `Sessions` (caller of [`dispatch`] /
-/// [`client`]) all share one instance.
+/// The live, dialed-in worker connections. Cloneable (`Arc`-backed) so the
+/// accept loop, `route.rs`, and `Sessions` all share one instance.
 ///
 /// [`connected_watch`]: WorkerRegistry::connected_watch
 /// [`dispatch`]: WorkerRegistry::dispatch
@@ -100,7 +82,7 @@ impl WorkerRegistry {
         }
     }
 
-    /// Subscribe to the connected-worker set. alpha's selector borrows the latest
+    /// Subscribe to the connected-worker set. The selector borrows the latest
     /// `Arc<HashSet>` once per turn (lock-free) and filters
     /// `RoutingTable.healthy ∩ connected`.
     pub fn connected_watch(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>> {
@@ -119,15 +101,13 @@ impl WorkerRegistry {
         self.inner.clients.read().unwrap().get(&id).cloned()
     }
 
-    /// Dispatch a turn to `id`. The registry owns the client lookup and classifies
-    /// a missing/failed client as [`DispatchErr`] — distinct from the worker's
-    /// [`Accepted`] answer, so alpha's loop branches cleanly: `Err(..)` ⇒ next
-    /// candidate (idempotent re-dispatch); `Ok(Accepted::{Reject|Redirect})` ⇒ a
-    /// real worker answer (also retry, but a different class).
+    /// Dispatch a turn to `id`. Classifies a missing/failed client as
+    /// [`DispatchErr`], distinct from the worker's own [`Accepted`] answer:
+    /// `Err(..)` means next candidate (idempotent re-dispatch);
+    /// `Ok(Accepted::{Reject|Redirect})` is a real worker answer (also retried).
     ///
-    /// Exposed via the [`WorkerDispatch`](crate::route::WorkerDispatch) seam (which
-    /// `route::dispatch_with_retry` is generic over) rather than an inherent method,
-    /// so `route` compiles floor-only without depending on the registry mechanism.
+    /// Exposed via [`WorkerDispatch`](crate::route::WorkerDispatch) rather than
+    /// an inherent method, so `route` doesn't depend on the registry mechanism.
     fn dispatch_impl(
         &self,
         id: WorkerId,
@@ -178,8 +158,8 @@ impl Default for WorkerRegistry {
 }
 
 /// The registry is the [`WorkerDispatch`](crate::route::WorkerDispatch) backend
-/// alpha's `dispatch_with_retry` is generic over — so `route` depends only on the
-/// the interface data floor, not the connection-registry mechanism.
+/// `dispatch_with_retry` is generic over, so `route` depends only on the
+/// interface, not the connection-registry mechanism.
 impl crate::route::WorkerDispatch for WorkerRegistry {
     type Err = DispatchErr;
 
@@ -192,10 +172,8 @@ impl crate::route::WorkerDispatch for WorkerRegistry {
     }
 }
 
-/// A running worker-facing server: its bound address (resolved, so an ephemeral
-/// `:0` bind surfaces the real port — needed by the single-node launcher to point
-/// its in-proc worker at the gateway, and by the smoke harness to dial it) and
-/// the accept-loop task.
+/// A running worker-facing server: its resolved bound address (so an
+/// ephemeral `:0` bind surfaces the real port) and the accept-loop task.
 pub struct WorkerServer {
     pub bound: SocketAddr,
     pub task: tokio::task::JoinHandle<()>,
@@ -211,13 +189,8 @@ pub async fn serve(
     sessions: Sessions,
     registry: WorkerRegistry,
 ) -> Result<WorkerServer> {
-    // Single-sourced self-describing codec (MessagePack via
-    // `worker_api::dispatch_codec`), NOT bincode: the data plane carries
-    // `Request{ message: ClientMessage }` / `Tokens::Chunk(ServerMessage)`, whose
-    // vocab enums are `#[serde(tag = "type")]` (internally tagged, for the
-    // self-describing client wire) — bincode cannot decode them
-    // (`deserialize_any` is unsupported). The worker's dial-in side calls the
-    // same `dispatch_codec`, so the two ends can't diverge.
+    // MessagePack (`dispatch_codec`), not bincode: the wire vocab enums are
+    // internally tagged (`#[serde(tag = "type")]`), which bincode can't decode.
     let mut incoming = tcp::listen(bind, dispatch_codec)
         .await
         .context("bind worker-facing listener")?;
@@ -256,9 +229,8 @@ pub async fn serve(
                         tokio::spawn(req);
                     })
                     .await;
-                // Connection closed → worker drop. Evict so the selector stops
-                // picking it and charlie's `Sessions` re-dispatches its in-flight,
-                // not-yet-emitted turns (design §8/§10).
+                // Connection closed -> worker drop. Evict so the selector stops
+                // picking it and `Sessions` re-dispatches its in-flight turns.
                 if let Some(id) = *conn_state.worker_id.lock().unwrap() {
                     registry.remove(id);
                     tracing::info!(worker = %id, "worker link closed; evicted from registry");
@@ -288,9 +260,6 @@ struct InboundServer {
 
 impl GatewayInbound for InboundServer {
     async fn register(self, _: tarpc::context::Context, worker_id: WorkerId) {
-        // The register-first invariant: bind the reverse client into the registry
-        // so this worker is now selectable + dispatchable, and remember the id for
-        // eviction on drop.
         *self.conn.worker_id.lock().unwrap() = Some(worker_id);
         self.registry.insert(worker_id, self.conn.client.clone());
         tracing::info!(worker = %worker_id, "worker dialed in + registered");
@@ -302,18 +271,15 @@ impl GatewayInbound for InboundServer {
         req_id: ReqId,
         chunk: Tokens,
     ) -> Control {
-        // Route the chunk to its turn's bounded pipe. Awaiting a full pipe here is
-        // THE backpressure point (§6): it stalls this reply → stalls the worker's
-        // push pump → fills its outbox → backpressures generation. The returned
-        // `Control` piggybacks ordinary cancel back to the worker.
+        // Route the chunk to its turn's bounded pipe. Awaiting a full pipe here
+        // is the backpressure point: it stalls this reply, which stalls the
+        // worker's push pump. `Control` piggybacks ordinary cancel back to it.
         self.sessions.feed(req_id, chunk).await
     }
 
     async fn report(self, _: tarpc::context::Context, worker_id: WorkerId, status: WorkerStatus) {
-        // Freshness-only (design §5, manager ruling): admission gates off the
-        // controller's `RoutingTable` coarse load, so the dial-in report is not a
-        // hard dependency. Logged for observability; a gateway-local freshness
-        // cache can layer in later without a contract change.
+        // Freshness-only: admission gates off the controller's RoutingTable
+        // coarse load, so this report is not a hard dependency. Logged only.
         tracing::trace!(
             worker = %worker_id,
             kv = status.kv_pressure_bucket,
@@ -323,8 +289,7 @@ impl GatewayInbound for InboundServer {
     }
 
     async fn redirect(self, _: tarpc::context::Context, req_id: ReqId) {
-        // Post-hoc final-admission reject: the worker accepted then could no longer
-        // serve the turn. Hand it back to the session to re-route (§7/§8).
+        // Post-hoc final-admission reject: hand it back to the session to re-route.
         self.sessions.redirect(req_id);
     }
 }

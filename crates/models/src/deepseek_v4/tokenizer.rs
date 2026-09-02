@@ -1,5 +1,4 @@
-//! What deepseek rows read from their vocabulary — the grammar's stop list,
-//! cited from where it lives.
+//! Tokenizer contract: the stop-token markers deepseek rows read from their vocabulary.
 
 use ::tokenizer::contract::Contract;
 

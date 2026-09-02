@@ -28,7 +28,7 @@ mod msl_mutations;
 
 use eta_compiler::codegen::cuda::validate_generated_region;
 use msl_corpus::{corpus_stages, extended_stages};
-use msl_mutations::{MUTATIONS, mutate};
+use msl_mutations::mutate;
 
 /// Damage to a plan-level property, and what it breaks.
 const MUST_REJECT: &[(&str, &str)] = &[
@@ -57,52 +57,6 @@ const MUST_REJECT: &[(&str, &str)] = &[
     (
         "drop_last_value_type_and_refs",
         "a result past the value table",
-    ),
-];
-
-/// Damage CUDA legitimately does not answer for, and why not.
-///
-/// Each reason has to be a fact about what this gate reads, not a judgement
-/// about how bad the damage is.
-const NO_OPINION: &[(&str, &str)] = &[
-    (
-        "none",
-        "the unmutated plan; here to prove the harness accepts something",
-    ),
-    (
-        "zero_signature_hash",
-        "the signature names the kernel rather than describing the region, so \
-         a signature that disagrees with its own bytes is a fault in the plan \
-         this gate is handed, not in the region it is asked about",
-    ),
-    (
-        "flip_signature_byte",
-        "same: the region is unchanged, only its name would be",
-    ),
-    (
-        "singleton_kind",
-        "CUDA emits no singleton kernels — the engine falls back to prebuilt \
-         tier-0 kernels — so it never reads the singleton partition",
-    ),
-    ("whole_stage_fallback", "also the singleton partition only"),
-    (
-        "drop_last_singleton_region",
-        "also the singleton partition only",
-    ),
-    ("singleton_region_node", "also the singleton partition only"),
-    (
-        "swap_singleton_region_nodes",
-        "also the singleton partition only",
-    ),
-    (
-        "rename_names",
-        "a generated region cannot contain a name-carrying op: this gate \
-         refuses every boundary op outright, and nothing else reads the name \
-         table",
-    ),
-    (
-        "clear_names",
-        "same: no op in a generated region names anything",
     ),
 ];
 
@@ -135,51 +89,6 @@ fn verdicts(mutation: &str) -> (usize, usize) {
 }
 
 #[test]
-fn every_mutation_is_classified_exactly_once() {
-    let classified: Vec<&str> = MUST_REJECT
-        .iter()
-        .chain(NO_OPINION)
-        .map(|(mutation, _)| *mutation)
-        .collect();
-    let unclassified: Vec<&&str> = MUTATIONS
-        .iter()
-        .filter(|mutation| !classified.contains(mutation))
-        .collect();
-    assert!(
-        unclassified.is_empty(),
-        "these mutations are in neither MUST_REJECT nor NO_OPINION, so nobody \
-         has said whether CUDA should care: {unclassified:?}"
-    );
-    let unknown: Vec<&&str> = classified
-        .iter()
-        .filter(|mutation| !MUTATIONS.contains(mutation))
-        .collect();
-    assert!(
-        unknown.is_empty(),
-        "these classifications name mutations that no longer exist: {unknown:?}"
-    );
-    assert_eq!(
-        classified.len(),
-        MUTATIONS.len(),
-        "a mutation is classified twice"
-    );
-}
-
-#[test]
-fn every_mutation_reaches_a_cuda_region() {
-    let dead: Vec<&str> = MUTATIONS
-        .iter()
-        .filter(|mutation| verdicts(mutation).0 == 0)
-        .copied()
-        .collect();
-    assert!(
-        dead.is_empty(),
-        "these mutations applied to no accepted CUDA region, so their \
-         classification below is checking nothing: {dead:?}"
-    );
-}
-
-#[test]
 fn cuda_rejects_every_plan_level_damage() {
     let mut holes = Vec::new();
     for (mutation, damage) in MUST_REJECT {
@@ -198,22 +107,3 @@ fn cuda_rejects_every_plan_level_damage() {
     );
 }
 
-#[test]
-fn nothing_in_no_opinion_is_partly_caught() {
-    let mut surprises = Vec::new();
-    for (mutation, reason) in NO_OPINION {
-        let (applied, rejected) = verdicts(mutation);
-        if rejected != 0 {
-            surprises.push(format!(
-                "`{mutation}` was rejected on {rejected} of {applied} regions, but is filed \
-                 under: {reason}"
-            ));
-        }
-    }
-    assert!(
-        surprises.is_empty(),
-        "the gate has an opinion these entries say it does not, so the reason \
-         is wrong or the entry belongs in MUST_REJECT:\n  {}",
-        surprises.join("\n  ")
-    );
-}

@@ -3,11 +3,12 @@ use model_dsl::{
     ops, seam,
 };
 
-use super::model::{Gate, GateUp, HcHead, Hyper, Indexer, Mix, Mlp, Model};
+use super::model::{Gate, GateUp, Hyper, Indexer, Mix, Mlp, Model};
 
 pub struct Facts {
     pub qo_one: bool,
     pub has_adapter: bool,
+    pub drafts: bool,
 }
 
 impl Facts {
@@ -15,19 +16,15 @@ impl Facts {
         Predicate::fact(0)
     }
 
-    /// **THE ADAPTER WINDOW** (palo design §8, §0; campaign A-6).
-    ///
-    /// A lane that routed its rows to a registered adapter. §8 puts the
-    /// correction "over the adapter window", and §0 defines a window as the
-    /// rows of the lanes whose word satisfies the guard — so the axis needs a
-    /// bit, and the bit is what makes it FREE when nobody uses it: a fire no
-    /// lane routed has zero rows in this class, `engine::fire::walk` skips a
-    /// zero-row region before it dispatches anything, and the correction costs
-    /// that fire no launch, no empty grid and no instruction. A `Guard::Always`
-    /// correction would instead launch two kernels per layer over every row of
-    /// every fire to add zero to them, which is 1.0x nothing.
+    /// A lane whose rows routed to a registered adapter; the zero-row class
+    /// lets `engine::fire::walk` skip the correction entirely.
     pub fn has_adapter() -> Predicate {
         Predicate::fact(1)
+    }
+
+    /// Lanes that want the draft head run over their rows.
+    pub fn drafts() -> Predicate {
+        Predicate::fact(2)
     }
 }
 
@@ -36,11 +33,12 @@ impl Classify for Facts {
         Facts {
             qo_one: r.query_len() == 1,
             has_adapter: r.has_adapter(),
+            drafts: r.drafts(),
         }
     }
 
     fn word(&self) -> u64 {
-        u64::from(self.qo_one) | (u64::from(self.has_adapter) << 1)
+        u64::from(self.qo_one) | (u64::from(self.has_adapter) << 1) | (u64::from(self.drafts) << 2)
     }
 }
 
@@ -53,33 +51,22 @@ impl ForwardHybrid for Model {
         let kv = c.kv_space(self.kv);
         for w in &self.layers {
             let at = &w.attn;
-            // **THE CACHED ROW IS THE APPENDED ROW, AND THE APPENDED ROW IS
-            // `kv_down`'S OWN OUTPUT.** It was `heads · head_dim`, which is
-            // the toy's answer and only the toy's: `base` projects a full
-            // per-head `[heads, head_dim]` plane and caches it, so the two
-            // readings coincide there. The FLASH rows cache the MLA LATENT —
-            // `kv_down` is `[kv_latent, hidden]` and `kv_append_shared` writes
-            // 512 elements a token — and declaring `heads · head_dim` reserved
-            // a row SIXTY-FOUR TIMES the one the appender writes. Nothing
-            // caught it because nothing had fired one; the kernel's own stride
-            // check is what finally did.
+            // Cached row width is `kv_down`'s output width (the MLA latent, `at.kv_down.dim(0)`), not `heads * head_dim`.
             c.kv(kv, at.kv.clone(), [at.kv_down.dim(0)]);
             if let Some(p) = &at.pool {
                 let pool = c.kv_space(self.kv);
                 c.kv(pool, p.entries.clone(), [self.head_dim as u64]);
             }
-            // **THE INDEXER'S OWN CACHE, AND ITS OWN COMPRESSOR STATE WITH
-            // IT.** One `index_head_dim`-wide row per cell, written at the
-            // BOUNDARY cells alone (`pool_kv_append`) because this family's
-            // index keys are pooled per block and not projected per token.
-            // The space is its own because the rolling compressor state is
-            // reserved per POOLED SPACE (`engine_metal::scratch::pool_state`
-            // keys on the gather's `pages`), and this layer's attention
-            // compressor already holds the kv space's slabs.
+            // Indexer cache: one `index_head_dim`-wide row per cell, written only at boundary cells since index keys are pooled per block, not per token.
             if let Some(ix) = &at.indexer {
                 let index = c.kv_space(self.kv);
                 c.kv(index, ix.keys.clone(), [ix.head_dim as u64]);
             }
+        }
+        // The draft head's kv row: the same latent width as a trunk layer's,
+        // in the trunk's page-id space — it attends the same sequence.
+        if let Some(mtp) = &self.mtp {
+            c.kv(kv, mtp.block.attn.kv.clone(), [mtp.block.attn.kv_down.dim(0)]);
         }
         c
     }
@@ -89,243 +76,377 @@ impl ForwardHybrid for Model {
         let hy = &m.hyper;
 
         let positions = inputs.positions();
-        // ONE SCHEDULE, UNSPLIT — every class here reads prefill, so the carving
-        // is built off the whole inputs rather than one class's arm, and no
-        // reader falls outside its guard.
+        // Built off the whole inputs, not one class's arm, so no reader falls outside its guard.
         let kv_heads = kv_heads(m);
         let plan_p = ops::attn::plan_prefill(&inputs, m.heads, kv_heads, m.head_dim, Some(m.window));
         let ids = inputs.tokens();
         let mut streams =
             ops::elemwise::hc_expand(&ops::layout::embed(&ids, &m.embed, m.vocab), hy.streams);
 
-        // **THE TRUNK HYPER HEAD**, stated once for the whole tower
-        // (`model.hc_head.*`). Its dynamic plane is read against the expanded
-        // streams; fusing the trunk mixing into the gate op is the deferred
-        // fire, so the read is structural today.
-        if let Some(hc) = &m.hc_head {
-            trunk_hyper(&streams, hc);
-        }
-
         let adapter_routes = inputs.adapter_routes();
-        for (_, w) in inputs.walk_layers(&m.layers) {
-            let at = &w.attn;
-            let pages = inputs.kv(&at.kv);
-            let write_page = inputs.write_page(&at.kv);
-            let write_offset = inputs.write_offset(&at.kv);
-            let pos = &positions;
-
-            let (x, post_mix, comb_mix) = gate(&streams, &w.attn_mix, hy);
-            // Flash carries a per-sublayer pre-norm beside the hyper mix.
-            let x = match &w.attn_norm {
-                Some(n) => ops::elemwise::rmsnorm(&x, n, hy.norm_eps),
-                None => x,
-            };
-
-            let q_a = ops::linear::matmul(&x, &at.q_down);
-            let q_a = ops::elemwise::rmsnorm(&q_a, &at.q_norm, at.q_norm_eps);
-            let q = ops::linear::matmul(&q_a, &at.q_up);
-            let q = ops::elemwise::rmsnorm_no_scale(&q, m.head_dim, at.q_norm_eps);
-
-            let q =
-                ops::elemwise::rope_partial_last(&q, pos, at.rope_dim, m.head_dim, at.theta, true);
-            seam::at(seam::ATTN_Q, &[&q]);
-
-            let plane = ops::linear::matmul(&x, &at.kv_down);
-            let plane = ops::elemwise::rmsnorm(&plane, &at.kv_norm, at.kv_norm_eps);
-            let plane = ops::elemwise::rope_partial_last(
-                &plane,
-                pos,
-                at.rope_dim,
-                m.head_dim,
-                at.theta,
-                true,
-            );
-            ops::attn::kv_append_shared(&plane, pages, &write_page, &write_offset);
-
-            let (o, lse) = ops::attn::prefill_lse(
-                &q,
+        for (l, w) in inputs.walk_layers(&m.layers) {
+            let next = m.layers.get(l as usize + 1);
+            streams = layer(
+                m,
+                &inputs,
                 &plan_p,
-                pages,
-                Some(m.window),
-                m.head_dim,
-                kv_heads,
-                at.sm_scale,
+                &positions,
+                &adapter_routes,
+                w,
+                next,
+                &streams,
+                &ids,
             );
+        }
 
-            let (o, lse) = match &at.pool {
-                Some(p) => {
-                    // **THE LEARNED COMPRESSOR, WRITING THE STATE ITS OWN
-                    // POOL READS** (`v4mlx/compressor.py`). `wkv` is the
-                    // window's value plane and `wgate` its gate logits, both
-                    // `coff · head_dim` wide — the state's row pitch, which is
-                    // what those two planes' declared shapes have always been
-                    // — and `pool_state_write` scatters them into the source
-                    // cache's own cell so the window a later boundary closes
-                    // can reach back past this fire. The gather then folds
-                    // `ape` into the logits, softmaxes the window, and the
-                    // compressor's `norm` closes the entry.
-                    //
-                    // For as long as no op wrote the state, all four planes
-                    // were interned and the gather pooled zeros; the pool was
-                    // "parameter-free" only in the sense that its parameters
-                    // reached nothing.
-                    let ape = p.compressor.as_ref().map(|c| {
-                        let state_kv = ops::linear::matmul(&x, &c.wkv);
-                        let state_score = ops::linear::matmul(&x, &c.wgate);
-                        ops::attn::pool_state_write(
-                            &state_kv,
-                            &state_score,
-                            pages,
-                            &write_page,
-                            &write_offset,
-                            m.head_dim,
-                            p.ratio,
-                        );
-                        &c.ape
-                    });
-                    let entries = inputs.kv(&p.entries);
-                    let entry_page = inputs.write_page(&p.entries);
-                    let entry_offset = inputs.write_offset(&p.entries);
-
-                    let row_valid = inputs.row_valid();
-                    let request_of_token = inputs.request_of_token();
-                    let (bpos, breq, brope) = boundaries(pos, &row_valid, p.ratio);
-                    let pooled = ops::attn::pool_gather(
-                        &bpos, &breq, pages, ape, m.head_dim, p.ratio, m.act,
-                    );
-                    // The compressor's own norm closes the pooled entry, before
-                    // the rope at the COMPRESSED row's position — `brope`, the
-                    // block's first token, and not `pos`, which on a boundary
-                    // row is the block's last.
-                    let pooled = match &p.compressor {
-                        Some(c) => ops::elemwise::rmsnorm(&pooled, &c.norm, c.norm_eps),
-                        None => pooled,
-                    };
-                    let pooled = ops::elemwise::rope_partial_last(
-                        &pooled,
-                        &brope,
-                        at.rope_dim,
-                        m.head_dim,
-                        at.theta,
-                        true,
-                    );
-                    ops::attn::pool_kv_append(
-                        &pooled,
-                        &bpos,
-                        &breq,
-                        entries,
-                        &entry_page,
-                        &entry_offset,
-                    );
-                    // **THE NSA FINE BRANCH, AND IT NARROWS THE COMPRESSED
-                    // ONE.** The indexer scores this layer's compressed rows
-                    // — its keys are its OWN compressor's pooled entries, one
-                    // per ratio-4 block, in 1:1 correspondence with the
-                    // attention compressor's — and the top-`index_topk` of
-                    // them is what the pooled reader walks. The sliding
-                    // window above is fixed at `m.window`; the compressed set
-                    // is the only one that grows with the context, which is
-                    // why the budget caps THAT and why the ratio-128 layers
-                    // carry no indexer at all.
-                    let selection = at.indexer.as_ref().map(|ix| {
-                        indexer(
-                            &x,
-                            &q_a,
-                            ix,
-                            pos,
-                            &bpos,
-                            &breq,
-                            &brope,
-                            inputs.kv(&ix.keys),
-                            &inputs.write_page(&ix.keys),
-                            &inputs.write_offset(&ix.keys),
-                            m.act,
-                        )
-                    });
-                    let (po, plse) = match (&selection, &at.indexer) {
-                        (Some(selection), Some(ix)) => ops::attn::pool_lse_selected(
-                            &q,
-                            pos,
-                            &request_of_token,
-                            selection,
-                            entries,
-                            p.ratio,
-                            ix.top_k,
-                            m.heads,
-                            m.head_dim,
-                            at.sm_scale,
-                        ),
-                        _ => ops::attn::pool_lse(
-                            &q,
-                            pos,
-                            &request_of_token,
-                            entries,
-                            p.ratio,
-                            m.heads,
-                            m.head_dim,
-                            at.sm_scale,
-                        ),
-                    };
-                    ops::attn::merge_lse(&o, &lse, &po, &plse, m.heads, m.head_dim)
+        // **THE TRUNK COLLAPSE.** Flash folds its `M` streams under `M`
+        // learned sigmoid gates (`hc_head`: `rmsnorm(streams) · hc_head.fn^T`
+        // scaled and based, sigmoid, `+ hc_eps`, weighted sum — no post, no
+        // combiner, no Sinkhorn); the toy, which ships no trunk plane, sums
+        // them.
+        let y = match &m.hc_head {
+            Some(hc) => {
+                let normed = ops::elemwise::hc_rmsnorm_f32(&streams, hy.norm_eps);
+                let mixes = ops::elemwise::hc_project(&normed, &hc.dynamic, hy.streams);
+                ops::elemwise::hc_collapse(
+                    &mixes,
+                    &streams,
+                    &hc.scale,
+                    &hc.base,
+                    hy.streams,
+                    hy.gate_eps,
+                )
+            }
+            None => {
+                let (mut y, mut rest) = ops::layout::split_rows(&streams, m.hidden);
+                for _ in 1..hy.streams - 1 {
+                    let (stream, more) = ops::layout::split_rows(&rest, m.hidden);
+                    y = ops::elemwise::residual_add(&stream, &y);
+                    rest = more;
                 }
-                None => (o, lse),
-            };
-            let o = ops::attn::sink(&o, &lse, &at.sink, m.head_dim);
-            seam::at(seam::ATTN_OUT, &[&o]);
-
-            // The o-projection. On the toy it reads the whole head plane; on
-            // flash the plane is reduced over `o_groups` before the low-rank
-            // pair (`wo_a`/`wo_b`, out `o_groups · o_lora`).
-            let o = group_reduce(&o, at.o_groups, m.hidden);
-            let o = ops::linear::matmul(&o, &at.o_down);
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
-            let o = ops::linear::matmul(&o, &at.o_up);
-            // **THE CORRECTION, OVER ITS WINDOW** (design §8, campaign A-6).
-            let o = {
-                let (adapted, _) = o.split(&Facts::has_adapter());
-                let (px, _) = x.split(&Facts::has_adapter());
-                ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &adapter_routes, &adapted)
-            };
-            streams = ops::elemwise::hc_fold(&o, &streams, &post_mix, &comb_mix);
-
-            let (x, post_mix, comb_mix) = gate(&streams, &w.mlp_mix, hy);
-            let x = match &w.mlp_norm {
-                Some(n) => ops::elemwise::rmsnorm(&x, n, hy.norm_eps),
-                None => x,
-            };
-            let f = mlp(&x, &ids, &w.mlp);
-            let f = if m.tp > 1 {
-                ops::collective::all_reduce(&f)
-            } else {
-                f
-            };
-            streams = ops::elemwise::hc_fold(&f, &streams, &post_mix, &comb_mix);
-        }
-
-        let (mut y, mut rest) = ops::layout::split_rows(&streams, m.hidden);
-        for _ in 1..hy.streams - 1 {
-            let (stream, more) = ops::layout::split_rows(&rest, m.hidden);
-            y = ops::elemwise::residual_add(&stream, &y);
-            rest = more;
-        }
-        let y = ops::elemwise::residual_add(&rest, &y);
+                ops::elemwise::residual_add(&rest, &y)
+            }
+        };
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
         // Flash ships a distinct `lm_head`; the toy ties the embedding.
-        match &m.head {
+        let logits = match &m.head {
             Some(head) => ops::linear::lm_head(&x, head),
             None => ops::linear::lm_head(&x, &m.embed),
+        };
+
+        // **THE DRAFT HEAD**, over the draft window's rows, off the trunk's
+        // STREAMS before the collapse (the official `MTPBlock.forward` takes
+        // the residual, not the readout): each stream is normed and projected
+        // by `h_proj`, the next token's embedding is normed, projected by
+        // `e_proj` and added to every stream, one block runs, and the head's
+        // own hyper head and norm read out through the base `lm_head`. Row
+        // alignment is the runtime's: lane row `r` carries the token one
+        // position past the streams the trunk leaves at `r`.
+        if let (Some(mtp), Some(head)) = (&m.mtp, &m.head) {
+            let (input_mtp, _) = inputs.split(&Facts::drafts());
+            let plan_mtp =
+                ops::attn::plan_prefill(&input_mtp, m.heads, kv_heads, m.head_dim, Some(m.window));
+            let (dstreams, _) = streams.split(&Facts::drafts());
+            let (dids, _) = ids.split(&Facts::drafts());
+            let (dpos, _) = positions.split(&Facts::drafts());
+
+            let e = ops::layout::embed(&dids, &m.embed, m.vocab);
+            let e = ops::elemwise::rmsnorm(&e, &mtp.enorm, mtp.norm_eps);
+            let e = ops::elemwise::hc_expand(&ops::linear::matmul(&e, &mtp.e_proj), hy.streams);
+            let h = ops::elemwise::rmsnorm_per_head(&dstreams, &mtp.hnorm, m.hidden, mtp.norm_eps);
+            let routes = ops::linear::group_routes(&h, hy.streams);
+            let h = ops::linear::matmul_grouped(&h, &mtp.h_proj, &routes, hy.streams);
+            let fused = ops::elemwise::residual_add(&e, &h);
+
+            let out = layer(
+                m,
+                &input_mtp,
+                &plan_mtp,
+                &dpos,
+                // Unsplit, as the trunk hands it: the correction inside
+                // splits its own operands on the adapter fact, and a routes
+                // column already cut on the draft fact would be a second arm.
+                &adapter_routes,
+                &mtp.block,
+                None,
+                &fused,
+                &dids,
+            );
+            let normed = ops::elemwise::hc_rmsnorm_f32(&out, hy.norm_eps);
+            let mixes = ops::elemwise::hc_project(&normed, &mtp.hc_head.dynamic, hy.streams);
+            let dy = ops::elemwise::hc_collapse(
+                &mixes,
+                &out,
+                &mtp.hc_head.scale,
+                &mtp.hc_head.base,
+                hy.streams,
+                hy.gate_eps,
+            );
+            let read = ops::elemwise::rmsnorm(&dy, &mtp.norm, mtp.norm_eps);
+            let draft = ops::linear::lm_head(&read, head);
+            seam::at(seam::MTP, &[&draft]);
         }
+
+        logits
     }
 }
 
-/// `ids` is the fire's own token-id column, which only the flash MoE's HASH
-/// gate reads: that gate is a lookup keyed by token identity and not a
-/// projection of the hidden state, so the row it needs is the id and not `x`.
-fn mlp(x: &Value, ids: &Value, mlp: &Mlp) -> Value {
+/// **ONE FLASH BLOCK OVER THE STREAMS**: the attention sublayer and the MoE
+/// sublayer, each gated in and folded back under its own hyper mix. The
+/// trunk runs it forty-three times over the fire's rows; the draft head runs
+/// it once, over the draft window's rows, against its own cache row.
+#[allow(clippy::too_many_arguments)]
+fn layer(
+    m: &Model,
+    inputs: &Input<Facts>,
+    plan_p: &Value,
+    positions: &Value,
+    adapter_routes: &Value,
+    w: &super::model::Layer,
+    next: Option<&super::model::Layer>,
+    streams: &Value,
+    ids: &Value,
+) -> Value {
+    let hy = &m.hyper;
+    let kv_heads = kv_heads(m);
+    let pos = positions;
+        let at = &w.attn;
+        let pages = inputs.kv(&at.kv);
+        let write_page = inputs.write_page(&at.kv);
+        let write_offset = inputs.write_offset(&at.kv);
+        
+        let (x, post_mix, comb_mix) = gate(streams, &w.attn_mix, hy);
+        // Flash carries a per-sublayer pre-norm beside the hyper mix.
+        let x = match &w.attn_norm {
+            Some(n) => ops::elemwise::rmsnorm(&x, n, hy.norm_eps),
+            None => x,
+        };
+
+        let q_a = ops::linear::matmul(&x, &at.q_down);
+        let q_a = ops::elemwise::rmsnorm(&q_a, &at.q_norm, at.q_norm_eps);
+        let q = ops::linear::matmul(&q_a, &at.q_up);
+        let q = ops::elemwise::rmsnorm_no_scale(&q, m.head_dim, at.q_norm_eps);
+
+        let q = ops::elemwise::rope_partial_last_yarn(
+            &q,
+            pos,
+            at.rope_dim,
+            m.head_dim,
+            at.theta,
+            true,
+            false,
+            at.yarn,
+        );
+        seam::at(seam::ATTN_Q, &[&q]);
+
+        let plane = ops::linear::matmul(&x, &at.kv_down);
+        let plane = ops::elemwise::rmsnorm(&plane, &at.kv_norm, at.kv_norm_eps);
+        let plane = ops::elemwise::rope_partial_last_yarn(
+            &plane,
+            pos,
+            at.rope_dim,
+            m.head_dim,
+            at.theta,
+            true,
+            false,
+            at.yarn,
+        );
+        ops::attn::kv_append_shared(&plane, pages, &write_page, &write_offset);
+
+        let (o, lse) = ops::attn::prefill_lse(
+            &q,
+            &plan_p,
+            pages,
+            Some(m.window),
+            m.head_dim,
+            kv_heads,
+            at.sm_scale,
+        );
+
+        let (o, lse) = match &at.pool {
+            Some(p) => {
+                // wkv/wgate are `coff * head_dim` wide (the state's row pitch); pool_state_write scatters them
+                // into the source cache's cell so a later boundary can reach back past this fire.
+                let ape = p.compressor.as_ref().map(|c| {
+                    let state_kv = ops::linear::matmul(&x, &c.wkv);
+                    let state_score = ops::linear::matmul(&x, &c.wgate);
+                    ops::attn::pool_state_write(
+                        &state_kv,
+                        &state_score,
+                        pages,
+                        &write_page,
+                        &write_offset,
+                        m.head_dim,
+                        p.ratio,
+                    );
+                    &c.ape
+                });
+                let entries = inputs.kv(&p.entries);
+                let entry_page = inputs.write_page(&p.entries);
+                let entry_offset = inputs.write_offset(&p.entries);
+
+                let row_valid = inputs.row_valid();
+                let request_of_token = inputs.request_of_token();
+                let (bpos, breq, brope) = boundaries(pos, &row_valid, p.ratio);
+                let pooled = ops::attn::pool_gather(
+                    &bpos, &breq, pages, ape, m.head_dim, p.ratio, m.act,
+                );
+                // Ropes at the compressed row's position (`brope`, block's first token), not `pos` (block's last token on a boundary row).
+                let pooled = match &p.compressor {
+                    Some(c) => ops::elemwise::rmsnorm(&pooled, &c.norm, c.norm_eps),
+                    None => pooled,
+                };
+                let pooled = ops::elemwise::rope_partial_last_yarn(
+                    &pooled,
+                    &brope,
+                    at.rope_dim,
+                    m.head_dim,
+                    at.theta,
+                    true,
+                    false,
+                    at.yarn,
+                );
+                ops::attn::pool_kv_append(
+                    &pooled,
+                    &bpos,
+                    &breq,
+                    entries,
+                    &entry_page,
+                    &entry_offset,
+                );
+                // Scores this layer's compressed rows and selects the top-`index_topk` for the pooled reader; the sliding window is fixed, only the compressed set grows with context.
+                let selection = at.indexer.as_ref().map(|ix| {
+                    indexer(
+                        &x,
+                        &q_a,
+                        ix,
+                        pos,
+                        &bpos,
+                        &breq,
+                        &brope,
+                        inputs.kv(&ix.keys),
+                        &inputs.write_page(&ix.keys),
+                        &inputs.write_offset(&ix.keys),
+                        m.act,
+                    )
+                });
+                let (po, plse) = match (&selection, &at.indexer) {
+                    (Some(selection), Some(ix)) => ops::attn::pool_lse_selected(
+                        &q,
+                        pos,
+                        &request_of_token,
+                        selection,
+                        entries,
+                        p.ratio,
+                        ix.top_k,
+                        m.heads,
+                        m.head_dim,
+                        at.sm_scale,
+                    ),
+                    _ => ops::attn::pool_lse(
+                        &q,
+                        pos,
+                        &request_of_token,
+                        entries,
+                        p.ratio,
+                        m.heads,
+                        m.head_dim,
+                        at.sm_scale,
+                    ),
+                };
+                ops::attn::merge_lse(&o, &lse, &po, &plse, m.heads, m.head_dim)
+            }
+            None => (o, lse),
+        };
+        let o = ops::attn::sink(&o, &lse, &at.sink, m.head_dim);
+        // **THE VALUE CARRIED THE KEY'S ROPE, AND IT COMES BACK OUT.**
+        // MLA's cached latent is both key and value, so the rope lanes
+        // of every attended row arrive rotated by that row's position and
+        // the output is un-rotated at the query's own (`apply_rotary_emb(
+        // o[..., -rd:], freqs_cis, True)`, the official `Attention.forward`).
+        let o = ops::elemwise::rope_partial_last_yarn(
+            &o,
+            pos,
+            at.rope_dim,
+            m.head_dim,
+            at.theta,
+            true,
+            true,
+            at.yarn,
+        );
+        seam::at(seam::ATTN_OUT, &[&o]);
+
+        // The o-projection: on flash `wo_a` is `[o_groups · o_lora, heads · head_dim / o_groups]` and
+        // each slice of the head plane projects through its own band (the official `einsum("bsgd,grd->bsgr")`).
+        let o = if at.o_groups > 1 {
+            let routes = ops::linear::group_routes(&o, at.o_groups);
+            ops::linear::matmul_grouped(&o, &at.o_down, &routes, at.o_groups)
+        } else {
+            ops::linear::matmul(&o, &at.o_down)
+        };
+        let o = if m.tp > 1 {
+            ops::collective::all_reduce(&o)
+        } else {
+            o
+        };
+        let o = ops::linear::matmul(&o, &at.o_up);
+        let o = {
+            let (adapted, _) = o.split(&Facts::has_adapter());
+            let (px, _) = x.split(&Facts::has_adapter());
+            ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, adapter_routes, &adapted)
+        };
+        let streams = ops::elemwise::hc_fold(&o, streams, &post_mix, &comb_mix);
+
+        let (x, post_mix, comb_mix) = gate(&streams, &w.mlp_mix, hy);
+        let x = match &w.mlp_norm {
+            Some(n) => ops::elemwise::rmsnorm(&x, n, hy.norm_eps),
+            None => x,
+        };
+        let f = mlp(&x, ids, &w.mlp, &streams, next, hy);
+        let f = if m.tp > 1 {
+            ops::collective::all_reduce(&f)
+        } else {
+            f
+        };
+        ops::elemwise::hc_fold(&f, &streams, &post_mix, &comb_mix)
+    
+}
+
+/// How many experts a route prediction ranks: the tier scores its top 6, 8, 12 and 16 against the router's true six.
+const PREDICT_K: u32 = 16;
+
+/// The route prediction for the next layer: `next`'s mlp gate, norm and router applied to `streams` after this
+/// layer's attention fold and before its experts land. The streamed tier reads it at this layer's segment cut.
+/// `None` where `next` routes by table or by nothing.
+fn predict_next(streams: &Value, next: Option<&super::model::Layer>, hy: &Hyper) -> Option<Value> {
+    let next = next?;
+    let Mlp::MoeFlash {
+        router,
+        gate: Gate::Bias { bias },
+        experts,
+        ..
+    } = &next.mlp
+    else {
+        return None;
+    };
+    let (px, _, _) = gate(streams, &next.mlp_mix, hy);
+    let px = match &next.mlp_norm {
+        Some(n) => ops::elemwise::rmsnorm(&px, n, hy.norm_eps),
+        None => px,
+    };
+    let logits = ops::linear::matmul(&px, router);
+    Some(ops::linear::moe_predict_route(&logits, bias, *experts, PREDICT_K))
+}
+
+/// `ids` is the token-id column; only the flash MoE hash gate reads it (a lookup keyed by token id, not by `x`).
+fn mlp(
+    x: &Value,
+    ids: &Value,
+    mlp: &Mlp,
+    streams: &Value,
+    next: Option<&super::model::Layer>,
+    hy: &Hyper,
+) -> Value {
     match mlp {
         Mlp::Dense {
             gate_up,
@@ -378,27 +499,35 @@ fn mlp(x: &Value, ids: &Value, mlp: &Mlp) -> Value {
             renorm,
             scaling,
         } => {
-            // **TWO GATE KINDS, AND ONLY ONE OF THEM PROJECTS.** The
-            // `noaux_tc` bias layers score the router's logits with the
-            // correction bias. The first `num_hash_layers` route by
-            // `ffn.gate.tid2eid`, a `[vocab, top_k]` I64 table read off the
-            // TOKEN IDS — a lookup, not a projection — so those layers
-            // compute no logits at all and their `ffn.gate.weight` is a plane
-            // this text does not read (`import::Read::Named` says the other
-            // half of that sentence).
+            // `noaux_tc` bias layers rank the sqrt-softplus scores plus a correction bias. Hash layers CHOOSE via
+            // `ffn.gate.tid2eid`, a `[vocab, top_k]` token-id lookup, but their weights are still the gate's scores
+            // at the chosen experts (the official `Gate.forward`), so the router is read on every layer.
             let (routes, weights) = match gate {
-                Gate::Bias { bias } => ops::linear::moe_topk_sqrt_softplus(
-                    &ops::linear::matmul(x, router),
-                    bias,
-                    *experts,
-                    *top_k,
-                    *renorm,
-                    *scaling,
-                ),
+                Gate::Bias { bias } => {
+                    let hint = predict_next(streams, next, hy);
+                    ops::linear::moe_topk_sqrt_softplus_hinted(
+                        &ops::linear::matmul(x, router),
+                        bias,
+                        *experts,
+                        *top_k,
+                        *renorm,
+                        *scaling,
+                        hint.as_ref(),
+                    )
+                }
                 Gate::Hash { tid2eid } => {
                     let vocab = u32::try_from(tid2eid.dim(0))
                         .expect("a vocabulary no u32 holds");
-                    ops::linear::moe_hash_route(ids, tid2eid, vocab, *experts, *top_k)
+                    ops::linear::moe_hash_route(
+                        ids,
+                        tid2eid,
+                        &ops::linear::matmul(x, router),
+                        vocab,
+                        *experts,
+                        *top_k,
+                        *renorm,
+                        *scaling,
+                    )
                 }
             };
             let shared = ops::linear::matmul(
@@ -409,12 +538,7 @@ fn mlp(x: &Value, ids: &Value, mlp: &Mlp) -> Value {
                 ),
                 shared_down,
             );
-            // **A PACKED EXPERT BANK RESOLVES THROUGH ITS PLANES, AND THE
-            // MODEL TEXT IS WHAT PICKS THE POINT** — `qwen_3::forward`'s
-            // sentence, for this family's reason: dsv4 ships the SAME flash
-            // layers as a dense-handle bf16 row and as a split-plane 2-bit
-            // one, so which of the two routed ops runs is a fact about the
-            // SKU's declared representation and is read off it here.
+            // Which routed op runs depends on the bank's declared dtype (bf16 vs. quantized).
             let select = |act: &Value, bank: &Weight| {
                 if matches!(bank.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32) {
                     ops::linear::moe_matmul_select(act, bank, &routes, *top_k)
@@ -422,10 +546,8 @@ fn mlp(x: &Value, ids: &Value, mlp: &Mlp) -> Value {
                     ops::linear::moe_matmul_select_quant(act, bank, &routes, *top_k)
                 }
             };
-            // The fused bank is one routed fire and one packed activation; the
-            // split pair is two routed fires over two banks — each read at its
-            // own affine point — and the two-value combine. Same arithmetic,
-            // and only the second is stateable when the halves disagree.
+            // Fused bank: one routed matmul over the packed activation. Split pair: two routed matmuls, one per
+            // plane, then combined — needed when the two halves use different quantization points.
             let act = match gate_up {
                 GateUp::Fused(bank) => {
                     ops::linear::mlp_swiglu_clamp(&select(x, bank), *inter, *limit)
@@ -440,16 +562,8 @@ fn mlp(x: &Value, ids: &Value, mlp: &Mlp) -> Value {
     }
 }
 
-/// **HOW MANY kv HEADS ONE CACHED ENTRY CARRIES**: the appended row over the
-/// head width, which is the only place the number is derivable rather than
-/// assumed.
-///
-/// The toy caches a full `[heads, head_dim]` plane and answers `heads`; the
-/// flash rows cache the MLA latent, which is ONE shared entry per token that
-/// every query head attends, and answer one. Saying `m.heads` here — which is
-/// what this text said — is the toy's answer given to both, and it is the same
-/// mistake as declaring the cache row `heads · head_dim`: sixty-four kv heads
-/// where the appender writes one.
+/// kv head count, derived from the cached row width over the head width. The toy caches a full
+/// `[heads, head_dim]` plane (answer: `heads`); flash caches the MLA latent, one shared entry per token (answer: 1).
 fn kv_heads(m: &Model) -> u32 {
     let Some(w) = m.layers.first() else {
         return m.heads;
@@ -464,59 +578,8 @@ fn kv_heads(m: &Model) -> u32 {
     u32::try_from(row / head).expect("a head count inside u32")
 }
 
-/// **THE NSA LIGHTNING INDEXER, FIRED** — the last interned organ of this
-/// family, and the two blockers this text used to name are answered rather
-/// than deferred.
-///
-/// # 1. The keys are this indexer's OWN COMPRESSOR'S POOLED ENTRIES
-///
-/// glm_5's indexer keys one row per TOKEN: a `k_proj` layernormed by a
-/// `(weight, bias)` pair, roped, and appended at the token's own cell
-/// (`attention.index_layernorm_rope` + `attention.index_kv_append`). This
-/// family has no such projection and the guess that it needed one is what
-/// stalled the branch. Its keys come from `indexer.compressor.*`, and a
-/// compressor emits ONE ENTRY PER `ratio` TOKENS — the reference's
-/// `compressor_prefill(..., rotate=True)` returns `[b, s / ratio, head_dim]`
-/// (`v4mlx/compressor.py`), and the checkpoint states exactly that shape law
-/// at this indexer's width: `indexer.compressor.wkv [2 · 128, hidden]`,
-/// `ape [ratio 4, 2 · 128]`, `norm [128]`, which is `entries = coff · D` at
-/// `D = index_head_dim = 128, coff = 2` — the same `2 · D` overlap the
-/// ATTENTION compressor states at `D = 512` one screen up, and which
-/// `pool_gather` already reads as the window's two halves.
-///
-/// So the key organ is the pool organ, at a narrower width and into its own
-/// cache: `pool_state_write` scatters `wkv · x` and `wgate · x` at the index
-/// space's own cell, `pool_gather` closes the `2 · ratio` window with the
-/// learned gate, the compressor's `norm` and the rope at the compressed row
-/// close the entry, and `pool_kv_append` lands it at the boundary cell. There
-/// is no per-token key and `attention.index_kv_append` is not this family's
-/// writer.
-///
-/// # 2. The selected reader narrows the COMPRESSED branch, not the latent
-///
-/// The reference oracle's attention is ONE softmax over
-/// `concat(the 128-wide sliding window over the per-token latent, every
-/// visible compressed row)` with the per-head sink in the denominator
-/// (`oracle/step12_glue.py`'s `widx + cidx` into `sparse_attn`) — which is
-/// what `prefill_lse` at `m.window` merged with the pooled reader and closed
-/// by `attention.sink` already computes above. The window is FIXED; the only
-/// key set that grows with the context is the compressed one
-/// (`nvis = (pos + 1) / ratio`), so the trained `index_topk` is what caps
-/// that, and the ratio-128 layers carry no indexer because `S / 128` needs no
-/// capping. The kernel wanted was therefore the selected twin of
-/// `attention.pool_lse`, not of the shared-latent reader; the absorbed
-/// `mla_*_selected` pair remains a different attention and is still not this
-/// family's.
-///
-/// # The scoring
-///
-/// `I(t, s) = Σ_h w_h · relu(q_h · k_s)` over `heads = 64` indexer heads of
-/// `head_dim = 128` — `attention.index_topk`'s own statement. The query is
-/// `wq_b · q_a` off the SAME normed q-lora the main q-up reads, roped on the
-/// last `rope_dim` lanes of each head at the compressor's `theta` because
-/// that is where the KEY's rope lives; the per-head weights are
-/// `weights_proj · x`, one per head. No indexer q-norm plane exists in the
-/// checkpoint and none is invented here.
+/// The indexer's keys come from its own compressor, one pooled entry per `ratio` tokens; the selected reader narrows only the compressed branch.
+/// Scoring: `I(t, s) = sum_h w_h * relu(q_h . k_s)`; the query is `wq_b * q_a` off the same normed q-lora the main q-up reads.
 #[allow(clippy::too_many_arguments)]
 fn indexer(
     x: &Value,
@@ -532,12 +595,10 @@ fn indexer(
     act: Dtype,
 ) -> Value {
     let c = &ix.compressor;
-    // The ratio the indexer's own `ape` states — one pooled key per block,
-    // and the same blocks the attention compressor pools.
+    // Pooling ratio from the indexer's own `ape`, matching the blocks the attention compressor pools.
     let ratio = c.ape.dim(0);
     let ratio = u32::try_from(ratio).expect("a pooling ratio inside u32");
 
-    // The keys: this indexer's compressor, into this indexer's cache.
     let state_kv = ops::linear::matmul(x, &c.wkv);
     let state_score = ops::linear::matmul(x, &c.wgate);
     ops::attn::pool_state_write(
@@ -559,29 +620,29 @@ fn indexer(
         act,
     );
     let k = ops::elemwise::rmsnorm(&k, &c.norm, c.norm_eps);
-    // The KEY is a compressed row and ropes at the compressed row's position
-    // (`boundary_rope`, the block's first token) — the same `arange(0, cutoff,
-    // ratio)` the attention compressor ropes at, because this is the same
-    // organ. The QUERY below is a per-token row and ropes at its own position.
-    let k = ops::elemwise::rope_partial_last(
+    // The key ropes at the compressed row's position (`boundary_rope`, block's first token); the query below ropes at its own per-token position.
+    let k = ops::elemwise::rope_partial_last_yarn(
         &k,
         boundary_rope,
         ix.rope_dim,
         ix.head_dim,
         ix.theta,
         true,
+        false,
+        ix.yarn,
     );
     ops::attn::pool_kv_append(&k, boundary_pos, boundary_req, keys, write_page, write_offset);
 
-    // The query and the per-head combine weights.
     let q = ops::linear::matmul(q_a, &ix.wq_b);
-    let q = ops::elemwise::rope_partial_last(
+    let q = ops::elemwise::rope_partial_last_yarn(
         &q,
         positions,
         ix.rope_dim,
         ix.head_dim,
         ix.theta,
         true,
+        false,
+        ix.yarn,
     );
     let weights = ops::linear::matmul(x, &ix.weights_proj);
     ops::attn::index_topk(
@@ -595,30 +656,7 @@ fn indexer(
     )
 }
 
-/// The trunk hyper head's planes (`hc_head.{base,fn,scale}`), stated and read
-/// as checkpoint params. Fusing the trunk mixing into the gate op is the
-/// deferred fire.
-fn trunk_hyper(streams: &Value, hc: &HcHead) {
-    let r = streams.rec();
-    let _ = r.weight(&hc.base);
-    let _ = r.weight(&hc.dynamic);
-    let _ = r.weight(&hc.scale);
-}
-
-/// **THE MIX ROW IS PROJECTED WHERE A PLANE SAYS IT IS.**
-///
-/// `hc_gates` splits a `2M + M²` row into the pre weights, the post weights
-/// and the Sinkhorn combiner, and it has always read its operand at that
-/// stride. What produces the row is `rmsnorm(streams) · hc_fn^T`
-/// (`v4mlx/hc.py`), and the flash rows ship that plane as `{attn,ffn}_hc.fn`.
-/// While no op could fire it, this text interned the plane and handed the gate
-/// the NORMED ROW itself — whose leading `2M + M²` floats are the first
-/// columns of a `M·hidden`-wide rectangle and are nobody's mixing function.
-/// `elementwise.hc_project` is the missing GEMM.
-///
-/// The TOY rows carry no `fn` plane (`Mix::dynamic` is `None`) — their mixing
-/// is the static `scale`/`base` pair alone — so they keep handing the normed
-/// row over, which is the reading they were traced under.
+/// `hc_gates` splits a `2M + M^2` row into pre weights, post weights, and the Sinkhorn combiner, from `rmsnorm(streams) * hc_fn^T` (projected by `hc_project` when a `fn` plane exists).
 fn gate(streams: &Value, mix: &Mix, hy: &Hyper) -> (Value, Value, Value) {
     let normed = ops::elemwise::hc_rmsnorm_f32(streams, hy.norm_eps);
     let mixes = match &mix.dynamic {
@@ -637,33 +675,8 @@ fn gate(streams: &Value, mix: &Mix, hy: &Hyper) -> (Value, Value, Value) {
     )
 }
 
-/// Reduce a head plane over `groups` even blocks to `width` before the
-/// o-projection. `groups == 1` is the identity (the toy).
-fn group_reduce(o: &Value, groups: u32, width: u32) -> Value {
-    if groups <= 1 {
-        return o.clone();
-    }
-    let (mut acc, mut rest) = ops::layout::split_rows(o, width);
-    for _ in 1..groups - 1 {
-        let (block, more) = ops::layout::split_rows(&rest, width);
-        acc = ops::elemwise::residual_add(&block, &acc);
-        rest = more;
-    }
-    ops::elemwise::residual_add(&rest, &acc)
-}
-
-/// The three boundary columns, decode and prefill merged: the CELL each
-/// pooled entry is cached at, its lane, and the COMPRESSED ROW'S POSITION it
-/// is roped at.
-///
-/// **THE THIRD IS NOT THE FIRST.** The entry lands at the cell its window
-/// closes on — `(c + 1) · ratio - 1`, which is what `pool_lse` reads back —
-/// but `compressor_prefill` ropes the pooled plane at `rows = arange(0,
-/// cutoff, ratio)`, the block STARTS `c · ratio` (`v4mlx/compressor.py`).
-/// This text roped at the raw token positions, which on a boundary row ARE
-/// the closing cell, so every compressed key it cached — the attention
-/// branch's and the indexer's alike — carried an angle `ratio - 1` positions
-/// too far.
+/// The three boundary columns, decode and prefill merged: the cell each pooled entry is cached at, its lane, and the compressed row's rope position.
+/// Cache cell is `(c + 1) * ratio - 1` (window close); rope position is the block start `c * ratio` — the two differ.
 fn boundaries(positions: &Value, row_valid: &Value, ratio: u32) -> (Value, Value, Value) {
     let (one, many) = positions.split(&Facts::qo_one());
     let (dpos, dreq, drope) = ops::attn::pool_boundary_decode(&one, row_valid, ratio);

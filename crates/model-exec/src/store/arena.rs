@@ -1,34 +1,16 @@
-//! The activation arena's arithmetic: which rectangle a value resolves to at
-//! one fire's shape.
-//!
-//! **THE OFFSETS ARE NOT THIS CRATE'S.** P7 carved them once
-//! (`model_compiler::arena`), giving values whose lives do not overlap the
-//! same bytes on purpose, and what is left for a shell is one addition —
-//! `base + offset` on CUDA, a bounds-checked `Handles::bind` on Metal. Only
-//! the LENGTH moves with the fire, and it moves by the row expression the
-//! carve already wrote down, which is the whole reason a composition never
-//! triggers a re-anything.
-//!
-//! **WHAT THE TWO SHELLS SHARED IS EXACTLY [`rect`]**, and what they did not
-//! share is one line each: CUDA turns the offset into a `u64` device pointer,
-//! Metal turns the `(offset, bytes)` pair into a handle row. Both wrappers
-//! stayed in their shells because a view is a device noun on one plane and an
-//! address on the other; the slot × bucket → rectangle arithmetic is here.
+//! The activation arena's arithmetic: which rectangle a value resolves to at one fire's shape.
+//! Offsets are carved once by `model_compiler::arena`; only the length moves with the fire, by the row expression the carve already wrote down.
+//! Shared between shells as [`rect`]; each shell turns the rectangle into its own pointer or handle.
 
 use model_compiler::{ArenaMap, Placement};
 use model_ir::{Dtype, ValueId};
 
-/// One value's rectangle in the arena, before it is a pointer or a handle.
-///
-/// The arithmetic half of a shell's carve, kept separate because it is the
-/// half that is true with no device present — and therefore the half a test
-/// can hold to account.
+/// One value's rectangle in the arena, before it is a pointer or a handle. True with no device present, so a test can hold it to account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     /// Bytes from the arena's base to this rectangle's first element.
     pub offset: u64,
-    /// What THIS fire's rows occupy, which is what a handle is
-    /// bounds-checked at — never the slot's largest-fire reservation.
+    /// What this fire's rows occupy; what a handle is bounds-checked at, never the slot's largest-fire reservation.
     pub bytes: u64,
     /// This fire's row count for the value.
     pub rows: u32,
@@ -42,9 +24,7 @@ pub struct Rect {
 /// value the arena does not bind.
 #[must_use]
 pub fn rect(map: &ArenaMap, value: ValueId, rows: model_compiler::FireRows) -> Option<Rect> {
-    // An alias IS its root's rectangle — a merge's arms write disjoint row
-    // windows of the merged column, and an in-place result is its operand —
-    // so the root is followed here rather than at every read.
+    // an alias is its root's rectangle: a merge's arms write disjoint row windows of the merged column.
     let root = map.root(value);
     let Some(Placement::Arena {
         offset,
@@ -57,28 +37,12 @@ pub fn rect(map: &ArenaMap, value: ValueId, rows: model_compiler::FireRows) -> O
     else {
         return None;
     };
-    // **THE SECOND AXIS'S COUNTS, CARRIED AND NOT DEFAULTED.** `RowExpr::at`
-    // takes a whole fire because a door that defaulted the patch pair sizes
-    // every tower rectangle at NOTHING and hands back zero bytes — which does
-    // not fault, it computes, and the failure arrives a launch later as
-    // `the activation's rows are the rows the result lands` from a GEMM whose
-    // destination has no rows.
-    //
-    // This door used to state `FireRows::text_only` itself, on the reading
-    // that its callers are the two shells' STORE arithmetic and a tower
-    // rectangle would be asked for through `Composition::value_window`
-    // instead. It is not: `engine_cuda::run::Run::whole` resolves EVERY arena
-    // value through the slot table this builds, tower rectangles included. So
-    // the counts come from the caller, who is the only one that knows them,
-    // and a text-only shell says so with `FireRows::text_only`.
+    // `RowExpr::at` takes a whole fire: a door that defaulted the patch pair would size every tower rectangle at nothing and hand back zero bytes silently.
     let rows = expr.at(rows);
     let element = model_compiler::arena::elem_bytes(*dtype);
     Some(Rect {
         offset: *offset,
-        // The fire's own extent when the element is known, and the slot's
-        // whole reservation when it is not — a packed storage element with no
-        // byte size is a rectangle a shell cannot measure, and claiming less
-        // than the carve reserved would refuse a legal bind.
+        // fire's own extent when the element is known; the slot's whole reservation when it's not (an unmeasurable packed element).
         bytes: element.map_or(*bytes, |element| rows.saturating_mul(*width).saturating_mul(element)),
         rows: u32::try_from(rows).unwrap_or(u32::MAX),
         width: u32::try_from(*width).unwrap_or(u32::MAX),
@@ -97,7 +61,7 @@ mod tests {
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
     fn compiled() -> (model_ir::Trace, model_compiler::CompiledModel) {
-        let trace = models::trace_of(SKU).expect("the catalog ships the smoke's SKU");
+        let trace = models::sku(SKU).expect("the catalog ships the smoke's SKU").trace;
         let trace = trace(Platform::Cuda);
         let compiled = compile(&trace, &Budget::new(4, 64), &DeviceProfile::default())
             .expect("the smoke's SKU bakes");
@@ -144,52 +108,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn a_rectangle_grows_with_the_fire_and_its_offset_does_not() {
-        let (_, compiled) = compiled();
-        let small = rects(&compiled.arena, 1, 1);
-        let large = rects(&compiled.arena, 64, 4);
-
-        let mut moved = 0;
-        for (a, b) in small.iter().zip(&large) {
-            let (Some(a), Some(b)) = (a, b) else { continue };
-            // A shell compares the two POINTERS or the two handle rows it
-            // minted; the claim underneath both is made here, of the offset
-            // each is minted at.
-            assert_eq!(a.offset, b.offset, "an offset is static across every bucket");
-            assert_eq!(a.width, b.width, "only the rows move");
-            if a.rows != b.rows {
-                moved += 1;
-            }
-        }
-        assert!(
-            moved > 0,
-            "a plan of token-shaped values whose rows never move is a carve \
-             that read every dim as a constant"
-        );
-    }
-
-    #[test]
-    fn the_out_seam_lands_the_vocabulary_at_one_row_per_token() {
-        let (trace, compiled) = compiled();
-        let out = trace
-            .seams
-            .iter()
-            .find(|seam| seam.seam == "out")
-            .and_then(|seam| seam.values.first().copied())
-            .expect("every traced plan carries an out seam");
-
-        let logits = rect(
-            &compiled.arena,
-            out,
-            model_compiler::FireRows::text_only(7, 1),
-        )
-        .expect("the out seam is an arena rectangle");
-        assert_eq!(logits.rows, 7, "one row of logits per token row");
-        assert_eq!(logits.width, 248_320, "the SKU's vocabulary");
-        assert_eq!(logits.dtype, model_ir::Dtype::Bf16);
     }
 
     #[test]

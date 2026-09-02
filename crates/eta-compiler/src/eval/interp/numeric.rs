@@ -1,10 +1,4 @@
-//! The pinned numeric contract: the parts of tier-0 that a backend has to
-//! reproduce bit-for-bit, kept together so they can be read together.
-//!
-//! Reduction is a canonical width-32 tree regardless of launch geometry,
-//! argmax breaks ties toward the lower index and never selects NaN, and every
-//! lane conversion is exact in the operands' dtype rather than in f32. Those
-//! are the rules the MSL and CUDA emitters are diffed against.
+//! The pinned numeric contract: the parts of tier-0 a backend must reproduce bit-for-bit. Reduction is a canonical width-32 tree regardless of launch geometry, argmax breaks ties toward the lower index and never selects NaN, and every lane conversion is exact in the operands' dtype rather than in f32.
 
 use alloc::vec::Vec;
 
@@ -154,14 +148,8 @@ pub(super) fn combine_argmax(left: ArgmaxCandidate, right: ArgmaxCandidate) -> A
     }
 }
 
-/// Inclusive prefix scan of each row, combining with `combine`.
-///
-/// Sequential and left-to-right, unlike [`reduce_tree`]'s width-32 tree: a
-/// scan's every prefix is an output, so there is no associativity freedom for
-/// a launch geometry to spend and no canonical tree to pin. The caller passes
-/// the combiner rather than an `Add` bound so that integer lanes can say
-/// `wrapping_add` — a scan whose sum leaves the dtype must wrap the way the
-/// device wraps, not panic in a debug build and wrap in a release one.
+/// Inclusive prefix scan of each row, combining with `combine`. Sequential and left-to-right, unlike the reduction's width-32 tree, since every prefix is an output.
+/// The caller passes the combiner rather than an `Add` bound so integer lanes can use `wrapping_add`, matching the device's wrap behavior.
 pub(super) fn scan_rows<T: Copy>(
     lanes: &[T],
     rows: usize,
@@ -228,17 +216,13 @@ pub(super) enum Extremum {
 /// and elementwise forms differ.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum NanPair {
-    /// A reduction folds NaN∧NaN to its identity, so an all-NaN row reduces to
-    /// ∓inf rather than to NaN. (A single NaN is already dropped by the
-    /// asymmetric arms, so this is what makes the fold associative.)
+    /// A reduction folds NaN∧NaN to its identity, so an all-NaN row reduces to ∓inf rather than to NaN.
     Identity,
     /// Elementwise `max`/`min` propagate: NaN∧NaN yields the left operand.
     Left,
 }
 
-/// The one extremum rule. IEEE leaves two cases to the caller — NaN pairs and
-/// signed zeros — and both matter here: this is the tier-0 oracle, so whatever
-/// it decides is the contract every backend is compared against.
+/// The one extremum rule. IEEE leaves NaN pairs and signed zeros to the caller; this is the tier-0 oracle, so whatever it decides is the contract every backend is compared against.
 pub(super) fn extremum(left: f32, right: f32, end: Extremum, pair: NanPair) -> f32 {
     match (left.is_nan(), right.is_nan()) {
         (true, true) => match pair {
@@ -250,10 +234,7 @@ pub(super) fn extremum(left: f32, right: f32, end: Extremum, pair: NanPair) -> f
         },
         (true, false) => right,
         (false, true) => left,
-        // `-0.0 == 0.0`, so `f32::max`/`min` are free to return either operand.
-        // Pin the sign instead: a max is negative only when both inputs are, a
-        // min whenever either is. Getting these backwards is invisible in every
-        // comparison and visible in `to_bits`.
+        // -0.0 == 0.0, so f32::max/min are free to return either operand; pin the sign instead.
         (false, false) if left == 0.0 && right == 0.0 => {
             let negative = match end {
                 Extremum::Max => left.is_sign_negative() && right.is_sign_negative(),
@@ -304,26 +285,12 @@ pub(super) fn sort_desc_order(row: &[f32]) -> Vec<u32> {
     idx
 }
 
-/// [`Shape::rows`] as an index type, saturating rather than truncating.
-///
-/// A row count only has to fit `u64`, so narrowing it is a real conversion
-/// even on a 64-bit host. Saturating keeps the answer conservative: every
-/// caller divides a materialized lane count by this, and no buffer the
-/// interpreter holds is `usize::MAX` long, so an unrepresentable row count
-/// yields an empty row rather than a wrapped-small one that would slice the
-/// data at the wrong stride.
+/// [`Shape::rows`] as an index type, saturating rather than truncating: no buffer the interpreter holds is `usize::MAX` long, so an unrepresentable row count yields an empty row rather than a wrapped-small one.
 pub(super) fn rows_of(shape: Shape) -> usize {
     usize::try_from(shape.rows()).unwrap_or(usize::MAX)
 }
 
-/// Which of the three row reductions [`eval_op`] is evaluating.
-///
-/// This exists because the dispatch it replaces re-matched `op` *inside* a
-/// combined `ReduceSum | ReduceMax | ReduceMin` arm and used `_` for the third
-/// case. That arm answered "minimum" for anything it did not recognise, so a
-/// fourth reduce op routed through it would have made the tier-0 oracle every
-/// backend diffs against return a silently wrong number -- not an error, a
-/// plausible one. Naming the three makes the compiler ask the question.
+/// Which of the three row reductions [`eval_op`] is evaluating. Named explicitly so an unmatched fourth reduce op is a compile error, not a silent fallback to one of these three.
 #[derive(Clone, Copy)]
 pub(super) enum ReduceKind {
     Sum,

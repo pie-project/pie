@@ -1,14 +1,12 @@
-//! Cluster state — the single source of truth, owned **solely** by the actor
-//! ([`crate::actor`]). No locks, no sharing: every mutation runs on the actor
-//! task. These are **internal** types and never cross the wire — the actor
-//! publishes the `controller_api` wire views ([`Neighbors`], [`RoutingTable`])
-//! derived from this state.
+//! Cluster state, owned solely by the actor ([`crate::actor`]); no locks, no
+//! sharing. Internal types that never cross the wire — the actor publishes
+//! the `controller_api` wire views ([`Neighbors`], [`RoutingTable`]) derived
+//! from this state.
 //!
-//! Two independent monotonic epochs version two independent full snapshots:
-//! `worker_epoch` tags the worker-facing topology, `gateway_epoch` the
-//! gateway-facing routing table. Membership changes bump both; a coarse
-//! load-bucket crossing bumps only the gateway epoch. An epoch is a version tag
-//! on a *whole* snapshot, never a delta. `role` is immutable once registered.
+//! Two monotonic epochs version two full snapshots: `worker_epoch` tags the
+//! worker-facing topology, `gateway_epoch` the gateway-facing routing table.
+//! Membership changes bump both; a load-bucket crossing bumps only the
+//! gateway epoch. An epoch versions a whole snapshot, never a delta.
 //!
 //! [`Neighbors`]: controller_api::Neighbors
 //! [`RoutingTable`]: controller_api::RoutingTable

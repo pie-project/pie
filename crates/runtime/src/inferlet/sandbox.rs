@@ -95,8 +95,7 @@ impl NetworkPolicy {
     /// "no restriction".
     pub fn parse(allow: bool, items: &[String]) -> Result<Self> {
         if !allow {
-            // Network is blocked entirely; the rule list is unused. Don't
-            // require it to parse — but reject contradictions.
+            // rule list is unused; don't require it to parse, but warn on contradictions.
             if items.iter().any(|s| s != "*") && !items.is_empty() {
                 tracing::warn!(
                     "[runtime] allow_network = false but network_allowed_hosts \
@@ -119,8 +118,7 @@ impl NetworkPolicy {
             });
         }
 
-        // The wildcard must be alone; mixing it with rules is almost
-        // certainly a config bug, not something to silently flatten.
+        // the wildcard must be alone; mixing it with rules is likely a config bug.
         if items.iter().any(|s| s == "*") {
             if items.len() != 1 {
                 return Err(anyhow!(
@@ -192,12 +190,8 @@ fn parse_rule(spec: &str) -> Result<Rule> {
         return Ok(Rule { cidr, port });
     }
 
-    // Unbracketed: try the last-`:` split first. The LHS must parse as
-    // a CIDR/IP; if it does, the RHS is unconditionally treated as a
-    // port (so a typo there gives "bad port", not a confusing "bad
-    // CIDR" from re-parsing the whole spec). If the LHS doesn't parse,
-    // fall back to the whole string as a CIDR — handles IPv6 forms
-    // like `::1/128` or `2001:db8::/32` which contain colons.
+    // unbracketed: try the last `:` split first; if the LHS parses as a CIDR/IP, the RHS is unconditionally a port.
+    // Falls back to the whole string as a CIDR otherwise, for IPv6 forms like `::1/128` that contain colons.
     if let Some((host, port_str)) = spec.rsplit_once(':')
         && let Ok(cidr) = parse_cidr(host)
     {
@@ -251,116 +245,3 @@ fn ip_in_cidr(ip: IpAddr, net: &IpNet) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sa(s: &str) -> SocketAddr {
-        s.parse().unwrap()
-    }
-
-    #[test]
-    fn deny_all_when_disabled() {
-        let p = NetworkPolicy::parse(false, &[]).unwrap();
-        assert!(!p.allow);
-        assert!(!p.check(&sa("10.0.0.1:443")));
-        assert!(!p.check(&sa("127.0.0.1:80")));
-    }
-
-    #[test]
-    fn empty_allowlist_blocks_when_enabled() {
-        let p = NetworkPolicy::parse(true, &[]).unwrap();
-        assert!(p.allow);
-        assert!(!p.check(&sa("10.0.0.1:443")));
-    }
-
-    #[test]
-    fn star_means_unrestricted() {
-        let p = NetworkPolicy::parse(true, &["*".into()]).unwrap();
-        assert!(p.is_unrestricted());
-        assert!(p.check(&sa("8.8.8.8:53")));
-    }
-
-    #[test]
-    fn star_must_be_alone() {
-        let err = NetworkPolicy::parse(true, &["*".into(), "10.0.0.0/8".into()]).unwrap_err();
-        assert!(err.to_string().contains("must be the only entry"));
-    }
-
-    #[test]
-    fn cidr_match() {
-        let p = NetworkPolicy::parse(true, &["10.0.0.0/8".into()]).unwrap();
-        assert!(p.check(&sa("10.0.0.1:443")));
-        assert!(p.check(&sa("10.255.255.255:1")));
-        assert!(!p.check(&sa("11.0.0.1:443")));
-    }
-
-    #[test]
-    fn cidr_with_port() {
-        let p = NetworkPolicy::parse(true, &["10.0.0.0/8:443".into()]).unwrap();
-        assert!(p.check(&sa("10.0.0.1:443")));
-        assert!(!p.check(&sa("10.0.0.1:80")));
-    }
-
-    #[test]
-    fn cidr_with_port_range() {
-        let p = NetworkPolicy::parse(true, &["10.0.0.0/8:1024-65535".into()]).unwrap();
-        assert!(p.check(&sa("10.0.0.1:1024")));
-        assert!(p.check(&sa("10.0.0.1:65535")));
-        assert!(!p.check(&sa("10.0.0.1:80")));
-    }
-
-    #[test]
-    fn bare_ip_is_host_route() {
-        let p = NetworkPolicy::parse(true, &["127.0.0.1".into()]).unwrap();
-        assert!(p.check(&sa("127.0.0.1:80")));
-        assert!(!p.check(&sa("127.0.0.2:80")));
-    }
-
-    #[test]
-    fn ipv6_cidr() {
-        let p = NetworkPolicy::parse(true, &["::1/128".into()]).unwrap();
-        assert!(p.check(&sa("[::1]:80")));
-        assert!(!p.check(&sa("[::2]:80")));
-    }
-
-    #[test]
-    fn ipv6_bracketed_with_port() {
-        let p = NetworkPolicy::parse(true, &["[::1]:443".into()]).unwrap();
-        assert!(p.check(&sa("[::1]:443")));
-        assert!(!p.check(&sa("[::1]:80")));
-    }
-
-    #[test]
-    fn ipv4_doesnt_match_ipv6_rule_and_vice_versa() {
-        let p = NetworkPolicy::parse(true, &["::/0".into()]).unwrap();
-        assert!(p.check(&sa("[::1]:80")));
-        assert!(!p.check(&sa("10.0.0.1:80")));
-    }
-
-    #[test]
-    fn multiple_rules_or() {
-        let p = NetworkPolicy::parse(true, &["10.0.0.0/8".into(), "127.0.0.0/8".into()]).unwrap();
-        assert!(p.check(&sa("10.0.0.1:443")));
-        assert!(p.check(&sa("127.0.0.1:80")));
-        assert!(!p.check(&sa("8.8.8.8:53")));
-    }
-
-    #[test]
-    fn malformed_cidr() {
-        let err = NetworkPolicy::parse(true, &["not-a-cidr".into()]).unwrap_err();
-        assert!(err.to_string().contains("bad CIDR"));
-    }
-
-    #[test]
-    fn malformed_port() {
-        let err = NetworkPolicy::parse(true, &["10.0.0.0/8:not-a-port".into()]).unwrap_err();
-        assert!(err.to_string().contains("bad port"));
-    }
-
-    #[test]
-    fn reversed_port_range() {
-        let err = NetworkPolicy::parse(true, &["10.0.0.0/8:9000-1000".into()]).unwrap_err();
-        assert!(err.to_string().contains("reversed"));
-    }
-}

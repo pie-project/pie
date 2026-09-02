@@ -1,12 +1,6 @@
 //! Observability — tracing init and a minimal Prometheus-text `/metrics`
-//! endpoint.
-//!
-//! Per ruling R2 (minimal-start, YAGNI): structured `tracing` logs plus a
-//! lightweight `/metrics` endpoint on every daemon. The full OTel collector
-//! pipeline is deferred behind this seam. The endpoint is a tiny hand-rolled
-//! HTTP/1.1 responder (no axum/hyper/metrics-ecosystem dep) serving a base set
-//! (`pie_build_info`, `pie_uptime_seconds`); richer metrics can graduate to a
-//! `metrics` facade later without changing the bin seam.
+//! endpoint: a tiny hand-rolled HTTP/1.1 responder (no axum/hyper/metrics
+//! dep) serving a base set (`pie_build_info`, `pie_uptime_seconds`).
 
 use std::net::SocketAddr;
 use std::time::Instant;

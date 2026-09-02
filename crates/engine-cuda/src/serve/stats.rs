@@ -1,24 +1,8 @@
-//! **WHAT A CALLER CAN ASK A LOADED SHELL** — the read-back surface, and the
-//! words that flip between fires.
+//! Read-back surface for `Shell` — accessors, counters, and mode toggles.
 //!
-//! A child module of [`serve`](super) rather than a sibling, because these
-//! are `Shell`'s own methods reading `Shell`'s own private fields: what moved
-//! is the TEXT, not the visibility. Nothing here binds a device, enqueues a
-//! launch or decides anything — every function is one of three shapes:
-//!
-//! * **an accessor**, handing back a fact the load already computed (the
-//!   trace, the bake, the paging, the export axes);
-//! * **a counter**, handing back what the last fire or the whole process
-//!   measured (the graph cache's census, the pools' committed bytes, the
-//!   weight cache's hits);
-//! * **a toggle**, moving one word between two fires so an A/B is ONE load
-//!   with one thing changed — [`Shell::set_mode`]'s argument, made three
-//!   times.
-//!
-//! It sat in `serve.rs` under a header saying that file has no logic and is
-//! the call order top to bottom, and thirty-seven methods of read-back is
-//! neither (alto survey §2 debt 6, wave P). The call order is next door; this
-//! is what a gate asks afterwards.
+//! Lives here rather than in `serve.rs` because these are `Shell`'s own
+//! methods over `Shell`'s own private fields; nothing here binds a device,
+//! enqueues a launch, or decides anything.
 
 use model_compiler::{Budget, CompiledModel};
 use model_ir::Trace;
@@ -66,96 +50,48 @@ impl Shell {
         self.device.device().num_sm
     }
 
-    /// The `out` seam's row width — the vocabulary, for a plan whose out seam
-    /// is logits.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Unbound`](crate::error::Fault::Unbound) for an out value
-    /// whose width is symbolic.
+    /// The `out` seam's row width — the vocabulary; errors on a symbolic width.
     pub fn out_width(&self) -> Result<u64> {
         kv::width_of(&self.trace, self.exports.out)
     }
 
-    /// Does this load's model text declare a draft head (design §8's MTP
-    /// row, palo C3)?
-    ///
-    /// What `engine_cuda::api::profile` answers `ModelProfile::has_mtp_logits`
-    /// with, and therefore what decides whether a guest program may declare
-    /// `IntrinsicId::MtpLogits` at all. A bind-time contract has to be true at
-    /// the FIRST fire, and it is true exactly when the plan states the export
-    /// this shell binds the intrinsic at.
+    /// Does this load's model text declare a draft head — gates `IntrinsicId::MtpLogits`.
     #[must_use]
     pub fn drafts(&self) -> bool {
         self.exports.mtp.is_some()
     }
 
-    /// Does this load's model text declare a capture arm (design §9, palo C4)?
-    ///
-    /// Empty means a `Lane::captures_scores` has nowhere to go, and the fire
-    /// says so by name rather than answering with an uncaptured continuation.
+    /// Does this load's model text declare a capture arm for attention scores?
     #[must_use]
     pub fn captures_scores(&self) -> bool {
         !self.exports.scores.is_empty()
     }
 
-    /// **THE ELEMENT THIS PLAN'S PATCH ROWS ARE WRITTEN IN**, or `None` for a
-    /// load whose plan states no patch row (media-door §6).
-    ///
-    /// Read off `RuntimeInput::Patches` at load, like the row's width is,
-    /// because `C·T·P²` and the dtype beside it are the model TEXT's numbers.
-    /// The submit path is what needs it: the contract carries a payload in
-    /// `f32` — a front-end's own answer, and a value no party above the load
-    /// could have converted, because none of them holds a trace — and the
-    /// marshal converts it here, where the number is a value this shell can
-    /// simply read.
+    /// The element type this plan's patch rows are written in, or `None` if none are declared.
     #[must_use]
     pub fn patch_element(&self) -> Option<model_ir::Dtype> {
         self.patch_seat.map(|seat| seat.dtype)
     }
 
-    /// Whether this load can serve `IntrinsicId::AttnScore` — the artifact
-    /// declares a capture column AND the slab that observes it was carved.
-    ///
-    /// Two conditions and not one, because they can disagree honestly: a
-    /// deployment whose lane budget or head count made the slab impossible
-    /// declares the seam and observes nothing, and a program that bound
-    /// against it would read address zero. `has_attn_score` is the answer to
-    /// "will a fire of this load write scores", not to "does this text have a
-    /// capture arm".
+    /// Can this load serve `IntrinsicId::AttnScore`? Only if the artifact declares a capture column AND the slab was carved.
     #[must_use]
     pub fn observes_scores(&self) -> bool {
         self.scores.is_some()
     }
 
-    /// How many planes the slab holds per lane — exported attention layers ×
-    /// query heads, and the ceiling a program's declared plane count is
-    /// refused against. `0` for a load that observes nothing.
+    /// Planes per lane in the slab — exported attention layers × query heads; `0` if unobserved.
     #[must_use]
     pub fn score_planes(&self) -> u32 {
         self.scores.as_ref().map_or(0, crate::scores::Scores::planes)
     }
 
-    /// How many query heads each exported layer contributes to the slab.
-    /// `0` for a load that observes nothing.
+    /// Query heads each exported layer contributes to the slab; `0` if unobserved.
     #[must_use]
     pub fn score_heads(&self) -> u32 {
         self.scores.as_ref().map_or(0, crate::scores::Scores::heads)
     }
 
-    /// **THE OBSERVABILITY CONTRACT, READ BACK** — one lane's whole block of
-    /// score planes, `score_planes()` rows of
-    /// [`ATTN_SCORE_KV_MAX`](eta_ir::registry::ATTN_SCORE_KV_MAX) F32 each,
-    /// row-major and layer-major.
-    ///
-    /// The bytes the epilogue's `attn_score` intrinsic is pointed at, at the
-    /// address it is pointed at, copied to the host for a gate that cannot
-    /// attach a guest program. `None` for a load that observes nothing.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`](crate::error::Fault::Ceiling) for a lane past the
-    /// slab; the device's own for the copy.
+    /// One lane's block of score planes: `score_planes()` rows of F32 each, or `None` if unobserved; errors on a lane past the slab.
     pub fn observed(&self, lane: u32) -> crate::error::Result<Option<Vec<f32>>> {
         self.scores
             .as_ref()
@@ -163,8 +99,7 @@ impl Shell {
             .transpose()
     }
 
-    /// The attention layers this load exports a capture column for, in the
-    /// plan's own order.
+    /// The attention layers this load exports a capture column for, in the plan's own order.
     #[must_use]
     pub fn score_layers(&self) -> Vec<u32> {
         self.exports.scores.iter().map(|e| e.layer).collect()
@@ -182,23 +117,13 @@ impl Shell {
         self.weights.banks()
     }
 
-    /// **Is the whole weight table on the device?** (alto design §7.)
-    ///
-    /// What [`LoadFacts::weights_resident`](engine::load::LoadFacts)
-    /// reports. `false` says this load opened the routed-expert tier, and
-    /// [`Shell::expert_residency`] is what says how much of it is where.
+    /// Is the whole weight table on the device? `false` means it opened the routed-expert tier.
     #[must_use]
     pub fn weights_resident(&self) -> bool {
         self.weights.all_resident()
     }
 
-    /// **What the rotating dense pump has done** (alto streaming §3 item 4,
-    /// D2b), or `None` for a load that armed none — which is every load whose
-    /// budget held its dense planes.
-    ///
-    /// A §14 register: nothing branches on it. `late` is the counted exception
-    /// the design names — a region that opened before its plane's copy had
-    /// been issued — and it is a stall, never a wrong answer.
+    /// What the rotating dense pump has done, or `None` if this load armed none; `late` is a stall, never a wrong answer.
     #[must_use]
     pub fn rotation(&self) -> Option<(crate::rotate::Observed, u32, u64, u64)> {
         let rotor = self.weights.rotor()?;
@@ -210,14 +135,7 @@ impl Shell {
         ))
     }
 
-    /// **Which expert is in which slot of each streamed bank, and how often
-    /// each has been routed to** — the promotion's only observable (alto
-    /// design §7, wave D2).
-    ///
-    /// Empty for a fully-resident load, which has no tier to report on. The
-    /// hit counts are the last settled readback's, so they lag the newest
-    /// airborne fire by design: they are carried out asynchronously on the
-    /// notify stream and nothing waits for them.
+    /// Which expert is in which slot of each streamed bank and how often routed to; empty if fully resident, and hit counts lag the newest fire.
     #[must_use]
     pub fn expert_residency(&self) -> Vec<crate::experts::BankResidency> {
         self.weights
@@ -225,9 +143,7 @@ impl Shell {
             .map_or_else(Vec::new, crate::experts::Tier::residency)
     }
 
-    /// `(experts promoted, experts demoted, promotion rounds skipped because
-    /// the previous one was still moving)` since load, or all zeros for a
-    /// fully-resident load.
+    /// `(experts promoted, experts demoted, rounds skipped)` since load; zeros if fully resident.
     #[must_use]
     pub fn expert_motion(&self) -> (u64, u64, u64) {
         self.weights
@@ -235,9 +151,7 @@ impl Shell {
             .map_or((0, 0, 0), crate::experts::Tier::motion)
     }
 
-    /// `(groups promoted, groups demoted, gaps a swap in flight held back)`
-    /// since load — the PACKED ladder's motion, beside [`Shell::expert_motion`]'s
-    /// per-expert one (alto streaming §3 item 3, wave B7).
+    /// `(groups promoted, groups demoted, gaps held back)` since load — the packed ladder's motion.
     #[must_use]
     pub fn group_ladder(&self) -> (u64, u64, u64) {
         self.weights
@@ -245,22 +159,7 @@ impl Shell {
             .map_or((0, 0, 0), crate::experts::Tier::ladder)
     }
 
-    /// **Take one rung of the packed ladder for the group `name` NOW** — the
-    /// gate's door, and nothing in the serving path calls it.
-    ///
-    /// [`experts::Tier::promote_now`](crate::experts::Tier::promote_now)
-    /// carries the argument for why a door exists at all: the vote is a
-    /// strict-improvement rule, so a deployment whose routed banks are all
-    /// read every fire reaches its steady state at the plan's own assignment
-    /// and never moves again, and a gate cannot observe a rung by waiting for
-    /// one. Answers `(from, to)`, or `None` when there is no berth of the
-    /// right shape on a faster rung — and `None` for a fully-resident load,
-    /// which has no tier at all.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Device`](crate::error::Fault) for a copy or an event the
-    /// runtime refused.
+    /// Take one rung of the packed ladder for `name` now; nothing on the serving path calls it. `None` if no berth or no tier.
     pub fn promote_group(
         &mut self,
         name: &str,
@@ -272,25 +171,7 @@ impl Shell {
         }
     }
 
-    /// **CLOSE THE DEFERRED SEAT'S WINDOW NOW** — the gate's door onto §L's
-    /// background promotion, and nothing in the serving path calls it.
-    ///
-    /// [`Shell::promote_group`]'s twin, and it exists for that method's
-    /// reason said one wave later: the install rides the inter-fire gap, so a
-    /// shell nobody is firing never takes it and a gate cannot observe a
-    /// promotion by waiting for one (§L, hazard H5). This joins the fill
-    /// thread and installs synchronously; the production path polls a channel
-    /// between two fires and never waits.
-    ///
-    /// Answers whether an image was installed — `false` for a load that was
-    /// never deferred, one already promoted, one whose fill failed (which is
-    /// counted and named where it happened, and leaves the seat serving), and
-    /// a fully-resident load, which has no tier at all.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Device`](crate::error::Fault) for a copy or an event the
-    /// runtime refused.
+    /// Close the deferred seat's window now, joining the fill thread synchronously; `false` if never deferred, already promoted, or fill failed.
     pub fn settle_tier_refill(&mut self) -> Result<bool> {
         let (compute, notify) = (self.device.stream(), self.device.notify_stream());
         match self.weights.experts_mut() {
@@ -299,8 +180,7 @@ impl Shell {
         }
     }
 
-    /// How many bytes the buffered-activation pool holds, and `0` for a plan
-    /// with no chunked recurrence to buffer.
+    /// Bytes the buffered-activation pool holds; `0` if there's no chunked recurrence to buffer.
     #[must_use]
     pub fn buffer_bytes(&self) -> u64 {
         self.buffers.as_ref().map_or(0, Buffers::bytes)
@@ -312,164 +192,57 @@ impl Shell {
         self.graphs
     }
 
-    /// Change the mode between fires.
-    ///
-    /// **THE A/B IS ONE LOAD, NOT TWO**: 1.7 GB of weights landed twice would
-    /// be two residencies, two arenas and two tuner histories, and a
-    /// difference between the runs could be any of those. One shell, one set
-    /// of addresses, one word changed — then the tokens either match or the
-    /// graph is wrong.
-    ///
-    /// Execs already captured stay cached: their key still means what it
-    /// meant, and going Off and back On is a policy change, not an
-    /// invalidation.
+    /// Change the mode between fires; one load so two residencies can't differ for unrelated reasons. Already-captured execs stay cached.
     pub fn set_mode(&mut self, graphs: Graphs) {
         self.graphs = graphs;
     }
 
-    /// Does this shell serve `Fallback::Copy`? See [`Shell::copies`]'s field.
+    /// Does this shell serve `Fallback::Copy`?
     #[must_use]
     pub fn copying(&self) -> bool {
         self.copies
     }
 
-    /// Turn the copy path on or off between fires — the other A/B, and the
-    /// one whose oracle is free.
-    ///
-    /// A copy and a split compute the same numbers over the same rows by
-    /// construction (a gather moves bytes), so flipping this word between two
-    /// otherwise identical fires and diffing the logits is a complete test of
-    /// the claim. One shell, for `set_mode`'s reason: two loads would be two
-    /// residencies and two tuner histories, and a difference could be either.
-    /// **AND IT SHAPES A BODY'S CUTS, WHICH IS WHAT TIER 2 CHANGED ABOUT
-    /// IT.** The copy policy was half of a graph KEY under the retired
-    /// exact-shape cache — a copied region records a gather, one launch and a
-    /// scatter where a split records `r` launches — and for one wave after
-    /// that it was a pure walk-shape word, because a gathered region was
-    /// refused admission and the fires the two policies shaped differently
-    /// were exactly the fires no body served. Neither is true now. A
-    /// `record::BodyKey` still carries no copy axis, and a gathered region is
-    /// now an ISLAND: so this word decides WHERE a body of that key is cut,
-    /// while the key itself cannot tell the two answers apart.
-    ///
-    /// **SO IT IS A BOOT-TIME A/B AND NOT A BETWEEN-FIRES ONE, ON A LOAD
-    /// WHOSE LATTICE HAS A COPY ROW — AND SINCE THE CAPACITY WAVE FLIPPING IT
-    /// ANYWAY IS SAFE, MERELY EXPENSIVE.** State it before `Shell::load` arms
-    /// (`[engine] fallback_copy`) and everything below is consistent: the
-    /// arming pass derives one segmentation per key and every replay wants
-    /// that one.
-    ///
-    /// Flip it between fires and every key this load armed is now in the
-    /// OTHER world from the fires arriving. `Shell::segments` stores the word
-    /// beside each memoized table, `Shell::segmentation` reports the
-    /// disagreement instead of re-deriving over it, and the bodies gate stands
-    /// the body down: the fires walk eagerly and are counted
-    /// (`record::BodyTally::eager_copy_world`). What used to happen is that
-    /// the memo re-derived, the resident exec stayed cut for the old policy,
-    /// and an island `debug_assert` — compiled out of a release build — was
-    /// the only thing between that and a wrong answer.
-    ///
-    /// So the reading is: on a load with no copy row this word is still the
-    /// pure walk-shape A/B it always was; on one with a copy row, flipping it
-    /// mid-load costs every replay until the load is restarted, which the
-    /// counter says out loud, and it belongs in the boot document.
-    ///
-    /// **AND THIS IS THE WHOLE OF WHAT CAN PUT A FIRE OUT OF ITS KEY'S
-    /// WORLD**, which is worth stating here because the counter is otherwise
-    /// unexplained: the other half of `window::Copies::enabled` — did the fire
-    /// stage mask bits — is decided by the fire's present SET
-    /// (`Fault::MaskWord`), which is in the key.
-    /// `crate::window::Windows::admits` derives it. So a nonzero
-    /// `record::BodyTally::eager_copy_world` names this method and nothing
-    /// else.
-    ///
-    /// What it still moves, and safely, is the WALK — `Windows`,
-    /// `FireCost::copied`, `Shell::last_fire_cost` — which is the whole of
-    /// what an eager-arm diff reads.
+    /// Turn the copy path on or off. Unlike [`Shell::set_mode`], NOT safe between fires once a copy-row load has armed — costly until the load restarts.
     pub fn set_copies(&mut self, copies: bool) {
         self.copies = copies;
     }
 
-    /// Does this shell serve fires from a recorded body? See
-    /// [`Shell::bodies`](super::Shell)'s field.
+    /// Does this shell serve fires from a recorded body?
     #[must_use]
     pub fn bodying(&self) -> bool {
         self.bodies
     }
 
-    /// Turn the bodies path on or off between fires — the fourth A/B, and one
-    /// load for [`Shell::set_mode`]'s reason: two loads would be two
-    /// residencies and two tuner histories, and a difference could be either.
-    ///
-    /// Bodies already captured stay captured; turning it off simply stops
-    /// routing fires through them — and stops staging the live-rows seat,
-    /// which is what makes the off arm the EAGER walk byte for byte rather
-    /// than the eager walk plus a copy.
-    ///
-    /// **IT TAKES EFFECT AT THE NEXT `prepare` AND NOT AT THE NEXT LAUNCH.**
-    /// Whether a fire is a body's is decided on the host half of the step,
-    /// because that is where the seat's words are written; a flip between a
-    /// step's prepare and its enqueue moves the step after it.
+    /// Turn the bodies path on or off; takes effect at the next `prepare`, not the next launch.
     pub fn set_bodies(&mut self, bodies: bool) {
         self.bodies = bodies;
     }
 
-    /// What the last fire's window table cost. See [`FireCost`].
+    /// What the last fire's window table cost.
     #[must_use]
     pub fn last_fire_cost(&self) -> FireCost {
         self.last
     }
 
-    /// **WHAT THIS LOAD'S GRAPH CACHE HAS DONE — THE WHOLE CENSUS, ON ONE
-    /// SURFACE.** There used to be three (`graph_stats`, `fold_stats` and this
-    /// one) and an operator had to add up two of them to ask "how many fires
-    /// ran outside every graph"; there is one recorded path now and one report
-    /// that answers for it.
-    ///
-    /// **AND THE REPORT SAYS WHICH OF ITS NUMBERS MEANS WHAT.**
-    /// [`record::BodyStats`] is three groups by LIFETIME:
-    /// `tally` accumulates for the life of the load and may be subtracted
-    /// between two readings, `last_capture` is the last capture's own
-    /// measurement and stands still, and `census` is refolded out of the
-    /// resident map every time this is called. A caller that reads the wrong
-    /// one gets a number that is honest about something else.
-    ///
-    /// **INCLUDING THE TWO NUMBERS THIS CACHE DID NOT DO**:
-    /// `eager_rotating` and `eager_buffered` count fires the ROUTER walked
-    /// eagerly while the mode said record — a rotating load, a buffered
-    /// recurrent fire — and they ride here rather than a surface of their own
-    /// for exactly that reason. Zero under `Graphs::Off` and `Graphs::Shaped`
-    /// by construction: eagerness is what those modes ARE. See
-    /// [`record::BodyTally::eager_rotating`].
+    /// This load's graph-cache census; [`record::BodyStats`] groups its numbers by lifetime — tally, last capture, and current census.
     #[must_use]
     pub fn body_stats(&self) -> record::BodyStats {
         self.cache.body_stats()
     }
 
-    /// **PROBE SEAM (`palo cuda-abi` wave), off by default.** Ask this load's
-    /// captures to keep their `cudaGraph_t` so a probe can walk the recorded
-    /// kernel nodes. The fire path does not read it.
+    /// Probe seam, off by default: ask captures to keep their `cudaGraph_t` so a probe can walk the recorded kernel nodes.
     pub fn keep_graphs(&mut self, keep: bool) {
         self.cache.keep_graphs(keep);
     }
 
-    /// The graphs kept by [`Shell::keep_graphs`], in capture order, each
-    /// beside the [`record::BodyKey`] its body was captured for.
+    /// Graphs kept by [`Shell::keep_graphs`], each beside the [`record::BodyKey`] its body was captured for.
     #[must_use]
     pub fn kept_graphs(&self) -> &[(record::BodyKey, crate::device::Graph)] {
         self.cache.kept()
     }
 
-    /// **WHAT P6 BAKED FOR THIS LOAD, AND WHAT THIS SHELL OPENED FOR IT**:
-    /// `(streams, events, forked regions, side streams open)`.
-    ///
-    /// The one observable of a fork from outside. A recorded graph does not
-    /// carry its event points as NODES — stream capture turns a
-    /// `cudaEventRecord` and the `cudaStreamWaitEvent` behind it into an edge
-    /// between the launches on either side, which is exactly what one wants
-    /// and exactly what makes `cudaGraphGetNodes` unable to tell a forked
-    /// graph from a sequential one. So a measurement that wants to say its two
-    /// arms are two different artifacts asks here.
+    /// `(streams, events, forked regions, side streams open)` — the only way to tell a fork from a sequential graph from outside.
     #[must_use]
     pub fn streams(&self) -> (u32, u32, usize, usize) {
         (
@@ -480,12 +253,7 @@ impl Shell {
         )
     }
 
-    /// What this load holds on the device: `(weights, arena, pools, inputs)`.
-    ///
-    /// The pool figure is the CEILING its address space was reserved at, which
-    /// is what this tuple has always meant and what a caller sizing a machine
-    /// wants. What is mapped right now is [`Shell::elastic`], and the two are
-    /// different numbers on purpose.
+    /// What this load holds: `(weights, arena, pools, inputs)`; the pool figure is the reserved ceiling, not what's mapped now.
     #[must_use]
     pub fn footprint(&self) -> (u64, u64, u64, u64) {
         (
@@ -496,40 +264,19 @@ impl Shell {
         )
     }
 
-    /// **The unified accounting sentence this load was admitted under** —
-    /// *weight tiers + elastic pool + safety floor = the card* (alto streaming
-    /// §3 item 5).
-    ///
-    /// The six numbers `Shell::load` refused ahead of every allocation, kept
-    /// so they can be read back: [`Accounting::pool`](crate::store::Accounting)
-    /// is what the elastic supply was PREDICTED to get, and
-    /// [`Shell::elastic`]'s budget pages is what it actually took. A
-    /// deployment stating `[engine] gpu_mem_utilization` can check the
-    /// fraction arrived by comparing the two.
+    /// The accounting this load was admitted under: weight tiers + elastic pool + safety floor; [`Shell::elastic`] is what it actually took.
     #[must_use]
     pub fn accounting(&self) -> crate::store::Accounting {
         self.accounting
     }
 
-    /// **Every pool arena's base address**, in row-then-plane order.
-    ///
-    /// The addresses a recorded graph reads. They are answered before one
-    /// byte is mapped and do not move for the load (article 7), which is the
-    /// property the whole elastic shape stands on and the one a gate should
-    /// be able to check.
+    /// Every pool arena's base address; fixed before one byte is mapped and never moves for the life of the load.
     #[must_use]
     pub fn pool_bases(&self) -> Vec<u64> {
         self.pools.bases()
     }
 
-    /// **What the elastic supply is actually holding**: `(committed bytes,
-    /// high-water bytes, page bytes, budget pages)`.
-    ///
-    /// **ONE NUMBER, ONE OWNER** (article 8). The engine owns physical commit
-    /// and trim, so the engine is what can be asked how much is committed and
-    /// how much has ever been — rather than the runtime re-deriving a high
-    /// water by scanning its own free list, which is what the 10-second
-    /// resize poll did and what died with it.
+    /// What the elastic supply holds: `(committed bytes, high-water bytes, page bytes, budget pages)`.
     #[must_use]
     pub fn elastic(&self) -> (u64, u64, u64, u64) {
         (
@@ -540,50 +287,24 @@ impl Shell {
         )
     }
 
-    /// How many steps this shell has registered a settlement for and not yet
-    /// seen a callback from — the run-ahead, as the shell sees it. Read by the
-    /// saturation gates and by nothing on the fire path.
+    /// Steps registered a settlement for with no callback seen yet — the run-ahead. Read by the saturation gates only.
     #[must_use]
     pub fn airborne_steps(&self) -> u64 {
         self.airborne.count()
     }
 
-    /// **Did this load's weight table come off the warm-boot artifact?**
-    /// (alto design §7.)
-    ///
-    /// `true` says the host-side transform pipeline never ran. The per-load
-    /// half of [`Shell::weight_cache_observed`], and what
-    /// `LoadFacts::weights_from_cache` carries home to the caller.
+    /// Did this load's weight table come off the warm-boot artifact? `true` means the transform pipeline never ran.
     #[must_use]
     pub fn weights_from_cache(&self) -> bool {
         self.weights.from_cache()
     }
 
     /// The digest of the weight bytes actually resident on this device.
-    ///
-    /// What a gate compares between a cold load and a warm one.
-    ///
-    /// # Errors
-    ///
-    /// A device failure reading the store back.
     pub fn weight_digest(&self) -> Result<u64> {
         self.weights.digest()
     }
 
-    /// The weight artifact cache's process-global census — restored, missed,
-    /// stored, corrupt, declined.
-    ///
-    /// Process-global because a gate at the runtime level holds the engine
-    /// behind `Box<dyn Engine>` on a lane thread and cannot ask a shell
-    /// instance anything. See [`crate::weight_cache::observed`].
-    #[must_use]
-    pub fn weight_cache_observed() -> crate::weight_cache::Observed {
-        crate::weight_cache::observed()
-    }
-
-    /// How many descriptor-port envelopes have been resolved off guest device
-    /// rings in this process. See [`crate::program::ports::resolved`], which
-    /// is where the counter lives and why it is process-global.
+    /// Descriptor-port envelopes resolved off guest device rings, process-global.
     #[must_use]
     pub fn envelopes_resolved() -> u64 {
         crate::program::ports::resolved()

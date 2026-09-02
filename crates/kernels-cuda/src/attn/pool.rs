@@ -1,9 +1,4 @@
-//! `Pool`: pooled (compressed) attention — every `ratio` tokens close a
-//! boundary whose pooled entry lands in its own cache. Transcribed from the
-//! old POOL claims. The pooled compressor state slabs still have no IR seat and arrive
-//! as explicit seam arguments the engine binds from fire state; the
-//! geometry the ops once smuggled (`row_valid`, `request_of_token`) is
-//! op-named now (see the remaining MENLO-SEAM notes per entry).
+//! `Pool`: pooled (compressed) attention — every `ratio` tokens close a boundary whose pooled entry lands in its own cache. The pooled compressor state slabs still have no IR seat and arrive as explicit seam arguments the engine binds from fire state.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -42,13 +37,7 @@ fn pooling_ratio(op: &'static str, ratio: u32) -> Result<i32, Error> {
     count(op, "the pooling ratio this statement states", ratio)
 }
 
-/// The boundary kernels' third column: the compressed row's rope position,
-/// `(p / ratio) * ratio` — the block's FIRST token, which is where
-/// `compressor_prefill` ropes the pooled entry (`rows = arange(0, cutoff,
-/// ratio)`), and NOT `boundary_pos`'s closing cell. This plane computed it
-/// from the day the kernels landed and dropped it into scratch, because the
-/// op published no seat for it; it publishes one now, so the column is an
-/// operand and the model text ropes at it.
+/// The boundary kernels' third column: the compressed row's rope position, `(p / ratio) * ratio` — the block's first token, not `boundary_pos`'s closing cell.
 fn boundary_rope_table(op: &'static str, boundary_pos: &Tensor, boundary_rope: &Tensor) {
     debug_assert_eq!(
         boundary_rope.dtype,
@@ -78,9 +67,7 @@ fn boundary_tables(op: &'static str, boundary_pos: &Tensor, boundary_req: &Tenso
     );
 }
 
-/// Marks which decode rows close a pooling boundary. `row_valid` (the
-/// CUDA-graph padding mask) is the op's own named input now — the seam that
-/// used to smuggle it in from fire state is closed.
+/// Marks which decode rows close a pooling boundary. `row_valid` is the CUDA-graph padding mask.
 #[allow(clippy::too_many_arguments)]
 pub fn boundary_decode(
     ctx: &Ctx,
@@ -112,9 +99,7 @@ pub fn boundary_decode(
     )
 }
 
-/// The prefill twin: boundaries within each request's ragged span, the
-/// op-named `row_valid` masking as in `boundary_decode`; the fire indptr
-/// rides in `positions`.
+/// The prefill twin: boundaries within each request's ragged span; the fire indptr rides in `positions`.
 #[allow(clippy::too_many_arguments)]
 pub fn boundary_prefill(
     ctx: &Ctx,
@@ -149,18 +134,9 @@ pub fn boundary_prefill(
     )
 }
 
-/// **THE ROLLING STATE'S WRITER.** `kv` is the compressor's `wkv · x` and
-/// `score` its `wgate · x`, both `[rows, coff * head_dim]`; each row is
-/// scattered into the cell `write_page`/`write_offset` name for it — the
-/// SOURCE cache's own slot, which is the cell the latent appender writes in
-/// the same fire.
+/// The rolling state's writer. `kv` is the compressor's `wkv * x` and `score` its `wgate * x`, both `[rows, coff * head_dim]`; each row scatters into the cell `write_page`/`write_offset` name for it.
 ///
-/// **THIS IS THE OP THAT MAKES [`gather`] POOL SOMETHING**: the two state
-/// slabs are a seam the shell owns and no IR value names, and until this
-/// entry existed nothing wrote a byte of either.
-///
-// MENLO-SEAM: as `gather` below — the slabs stay seam arguments, because
-// they are addressed by the cache's cell and not by the fire's row.
+/// The two state slabs are a seam the shell owns, no IR value names; this is the op that writes them, addressed by the cache's cell, not the fire's row.
 #[allow(clippy::too_many_arguments)]
 pub fn state_write(
     ctx: &Ctx,
@@ -217,10 +193,7 @@ pub fn state_write(
 
 /// Pools the closing window out of the kv cache into per-boundary entries.
 ///
-// MENLO-SEAM: the pooled compressor state (`state_kv`, `state_score`) has no
-// IR seat; the engine binds the slabs it staged for this cache. `ape` DOES
-// have one now — it is a checkpoint plane and not shell scratch — and the
-// arm hands over the shell's absent seat when the compressor states none.
+/// The pooled compressor state (`state_kv`, `state_score`) has no IR seat; the engine binds the slabs it staged for this cache. `ape` does have a seat (it's a checkpoint plane, not shell scratch); the arm hands over the shell's absent seat when the compressor states none.
 #[allow(clippy::too_many_arguments)]
 pub fn gather(
     ctx: &Ctx,
@@ -273,13 +246,9 @@ pub fn gather(
     )
 }
 
-/// Stores pooled entries into the compressed cache. The compressed pages
-/// are the pool row's storage plane (`pool.keys`).
+/// Stores pooled entries into the compressed cache. The compressed pages are the pool row's storage plane (`pool.keys`).
 ///
-// MENLO-SEAM: the op states its write geometry (`write_page`/
-// `write_offset`), but the pooled store still re-derives each entry's cell
-// from the boundary tables and the pool's read-side page tables — the
-// stated pair goes unread until the store takes explicit descriptors.
+/// The op states its write geometry (`write_page`/`write_offset`), but still re-derives each entry's cell from the boundary tables and the pool's read-side page tables — the stated pair goes unread until the store takes explicit descriptors.
 pub fn kv_append(
     ctx: &Ctx,
     entries: Tensor,
@@ -311,10 +280,7 @@ pub fn kv_append(
     )
 }
 
-/// Attention over the compressed entries, with the log-sum-exp plane a
-/// later `attention.merge_lse` folds against the dense pass.
-/// `request_of_token` (the owning request per token row) is the op's own
-/// named input now — the fire-table seam that used to carry it is closed.
+/// Attention over the compressed entries, with the log-sum-exp plane a later `attention.merge_lse` folds against the dense pass. `request_of_token` is the owning request per token row.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_lse(
     ctx: &Ctx,
@@ -370,8 +336,7 @@ pub fn attention_lse(
             ratio.arg(),
             entries.page_size.arg(),
             sm_scale.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // region's live-rows word when a body replay armed one, else the null seat.
             ctx.stage(),
         ],
     )

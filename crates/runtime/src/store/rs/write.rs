@@ -1,15 +1,12 @@
-//! `RsPreparedWrite`: the per-fire prepared RS operation (kv_refact.md,
-//! `store/rs/write.rs`). Same lifecycle discipline as `KvPreparedWrite`:
-//! prepare classifies and allocates, `RsStore::publish_batch` folds the
-//! result into the committed mapping in submission order, and
-//! [`RsPublished`] is the receipt the fire holds until it settles.
+//! `RsPreparedWrite`: the per-fire prepared RS operation. Same lifecycle
+//! discipline as `KvPreparedWrite`: prepare classifies and allocates,
+//! `RsStore::publish_batch` folds the result into the committed mapping in
+//! submission order, and [`RsPublished`] is the receipt the fire holds
+//! until it settles.
 //!
-//! Complete typed-store API (kv_refact.md): some methods here are not yet
-//! called by the live single-model fire path (only a subset of the typed
-//! store surface is currently wired) but are exercised by this module's
-//! own unit test suite and reserved for upcoming increments (contention/
-//! reclaim expansion, RS buffer-write paths, etc.) — kept rather than
-//! deleted, allowed rather than silently masked.
+//! Some methods here are not yet called by the live single-model fire path
+//! but are exercised by this module's own unit tests and reserved for
+//! upcoming increments — kept rather than deleted.
 #![allow(dead_code)]
 
 use super::{RsSlotId, RsWorkingSetId};
@@ -147,16 +144,11 @@ pub struct RsPendingFold {
     pub(crate) len_is_bound: bool,
 }
 
-/// The receipt for one fire's published RS rows. The mapping is already
-/// authoritative when this exists; it only carries what settlement needs —
-/// the submission sequences this fire holds open, so settling can release
-/// exactly them from the store's outstanding set.
-///
-/// The individual sequences are kept rather than just the newest one because
-/// retirement is bounded by the OLDEST sequence still outstanding across all
-/// fires. Fires settle out of order, so a receipt that only remembered its
-/// maximum could not say which sequences its settlement actually released,
-/// and the watermark would have to fall back to "nothing is in flight".
+/// The receipt for one fire's published RS rows: the submission sequences
+/// this fire holds open, so settling can release exactly them. Kept as a
+/// list rather than just the newest, since retirement is bounded by the
+/// oldest sequence outstanding across all fires and fires settle out of
+/// order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RsPublished {
     seqs: Vec<u64>,

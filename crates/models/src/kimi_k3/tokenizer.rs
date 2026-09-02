@@ -1,5 +1,4 @@
-//! What kimi rows read from their vocabulary — the grammar's stop list,
-//! cited from where it lives.
+//! Kimi's tokenizer contract: stop tokens.
 
 use ::tokenizer::contract::Contract;
 

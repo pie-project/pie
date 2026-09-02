@@ -11,10 +11,6 @@ use super::value::{Value, decode_wire};
 use crate::{Error, Result, shape_numel};
 
 /// True iff a channel bound to this port is consumed rather than peeked.
-///
-/// Was `port_consumes(port: u8)`, a `Port::from_u8` whose `None` arm answered
-/// "does not consume" for a byte that named no port at all. The contract types
-/// the port now, so there is no such byte.
 #[must_use]
 pub fn port_consumes(port: Port) -> bool {
     port.consumes()
@@ -52,16 +48,10 @@ pub struct ExecPlan {
 
     pub needs_mtp_logits: bool,
 
-    /// The program reads [`IntrinsicId::AttnScore`] — so this attachment's
-    /// lane must be a CAPTURING lane, and the shell must bind the score
-    /// rectangle before the epilogue runs.
-    ///
-    /// The third `needs_*` flag, and it earns one for the reason the second
-    /// did (palo C3b's argument, one axis over): a program that reads the
-    /// scores against a fire nobody captured dereferences the side table's
-    /// zero, and address zero poisons the CUDA context for the life of the
-    /// process. A flag the host can check before the launch is the only
-    /// thing standing between a mis-declared program and that.
+    /// The program reads [`IntrinsicId::AttnScore`]: the shell must bind the
+    /// score rectangle before the epilogue runs, since a program reading
+    /// scores from a fire nobody captured dereferences the side table's zero
+    /// and poisons the CUDA context for the life of the process.
     pub needs_attn_scores: bool,
 }
 
@@ -108,11 +98,6 @@ impl ExecPlan {
             || !self.package.ports.is_empty()
     }
 }
-
-// `bounded_mtp_row_base` stood here: the draft column's row bound, derived
-// from the logits values' shapes and a vocabulary, for a caller that had to
-// size an MTP readout before binding it. The shells bind `MtpLogits` at the
-// `mtp` export and read the rectangle's own extent, so nothing asks (alto E).
 
 #[must_use]
 pub fn const_port_value(port: &eta_compiler::codegen::launch::LaunchPort) -> Value {
@@ -213,12 +198,8 @@ pub fn classify_exec_plan(plan: &mut ExecPlan) {
                 plan.needs_logits = true;
                 plan.needs_mtp_logits = true;
             }
-            // **THE OBSERVABILITY DOOR, AND IT OPENS WITHOUT THE LOGITS**
-            // (attn-score §4). The score rectangle is a column of its own —
-            // the capture arm wrote it, the epilogue binds it at its own base
-            // — so reading it implies no readout row and does not set
-            // `needs_logits`. A program that also samples says so by reading
-            // `logits` itself, one line up.
+            // The score rectangle is a column of its own, bound at its own
+            // base, so reading it does not set `needs_logits`.
             Some(IntrinsicId::AttnScore) => plan.needs_attn_scores = true,
             _ => {
                 plan.executable = false;
@@ -254,19 +235,11 @@ pub struct Boundaries {
 }
 
 impl Boundaries {
-    /// **`lora` IS ADMITTED HERE BECAUSE A SINK CALL IS A DECLARATION AND NOT
-    /// AN OP** (alto adapter §6.1). `crate::op`'s `SINK_CALL` arm is `Ok(())`
-    /// — the interpreter runs nothing for it — and the effect is landed on the
-    /// HOST at instance bind, where `engine_metal::adapter::sink_of` reads the
-    /// call's channels off the launch package and
-    /// `engine_metal::adapter::planes_of` converts the seeded cells into the
-    /// banks' own bf16. So admitting it is not a claim that this backend
-    /// interprets a sink; it is the claim that this backend CONSUMES this
-    /// one, which `ModelProfile::has_lora` states at the other door and which
-    /// `eta_ir::validate` refuses a program for when it is false.
-    ///
-    /// It stays out of `kernel_calls` for the same reason it is in this list:
-    /// there is no entry to call, and there was never meant to be.
+    /// `lora` is admitted here because a sink call is a declaration, not an
+    /// op: the interpreter runs nothing for it, and the effect lands on the
+    /// host at instance bind. Admitting it is a claim that this backend
+    /// consumes it, not that it interprets it — so it stays out of
+    /// `kernel_calls` too.
     pub const METAL: Self = Self {
         kernel_calls: &["metal.identity"],
         sink_calls: &["metal.discard", "lora"],

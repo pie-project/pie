@@ -1,34 +1,10 @@
-//! The differential recorder: the walk, written down instead of encoded.
-//!
-//! **THIS FILE ADDS NO SECOND INTERPRETER.** It is one more implementation of
-//! `kernels_metal::Encode`, standing exactly where [`Sink`](crate::Sink)
-//! stands, and the walk over it is `model_exec::fire::walk` over the same
-//! [`Run`](crate::Run) resolving through the same tables. Decision #11's
-//! "captured is eager by construction" extended by one mode: what a `Sink`
-//! turns into a `dispatchThreads`, a [`Tape`] turns into a row.
-//!
-//! # Why the row holds the RESOLVED binding and not the argument
-//!
-//! `ArgValue::Buffer(h)` carries an engine-scoped handle, and a handle is an
-//! index into [`Handles`](crate::Handles) minted in walk order. Two walks of
-//! one template at two different descriptors mint the same COUNT of rows in
-//! the same order, so the same dispatch gets the same handle NUMBER at both —
-//! and the two rows point at different offsets. A recorder that wrote the
-//! handle down would therefore see no difference at all where the whole
-//! difference lives. So a buffer argument is recorded as the pair the encoder
-//! would have bound (`setBuffer:offset:atIndex:`): which reservation, and how
-//! far into it.
-//!
-//! That is also the pair an ICB slot binds, so the recording is in the
-//! vocabulary the thing it is for speaks.
-//!
-//! # What a slot is
-//!
-//! One `Encode::fire` is one Metal dispatch is one ICB slot (`.wiki/palo/icb.md`
-//! §1), so a [`Slot`] is all three. The region and run it stood in are
-//! recorded beside it — not because the fit needs them, but because a
-//! refusal has to be able to say WHERE, and "argument 3 of slot 412" is not
-//! an address a reader can find in a plan.
+//! The differential recorder: the walk, written down instead of encoded. One
+//! more implementation of `kernels_metal::Encode`, standing where
+//! [`Sink`](crate::Sink) stands. A buffer argument is recorded as the
+//! resolved (reservation, offset) pair rather than the handle, since two
+//! walks of one template mint the same handle number at different offsets.
+//! One `Encode::fire` is one Metal dispatch is one [`Slot`], with its
+//! region/run recorded beside it so a refusal can say where.
 
 use std::cell::RefCell;
 
@@ -124,16 +100,9 @@ pub struct Slot {
     pub region: u32,
     /// Which run of that region's window.
     pub run: u32,
-    /// How many token rows that run's window covered.
-    ///
-    /// **NOT A COMPONENT OF THE DISPATCH, AND RECORDED ANYWAY.** Nothing an
-    /// ICB slot holds is this number; it is the walk's own reading of the
-    /// descriptor at the moment the dispatch was made. Two things downstream
-    /// need it and neither can infer it: a tiling law is a ceiling over the
-    /// window's rows (`abi::Law::Ceil`), and an entry that picks its arm off
-    /// the window picks it off this (`abi::Pick::Rows`). Deriving it from the
-    /// dispatch's own numbers instead would be a model of what the entry did,
-    /// which is the one thing this recorder does not have.
+    /// How many token rows that run's window covered. Not a component of the
+    /// dispatch itself, but needed by a tiling law's ceiling
+    /// (`abi::Law::Ceil`) and an arm picked off the window (`abi::Pick::Rows`).
     pub window_rows: u32,
     /// How many lanes that run's window covered.
     pub window_lanes: u32,
@@ -173,17 +142,10 @@ impl std::fmt::Display for Point {
 }
 
 /// One walk, written down: the slots in dispatch order, the composition it
-/// was walked at, and where that composition sits in the fit's coordinates.
-///
-/// **THE TWO DESCRIPTIONS OF ONE POINT.** `classes` is the descriptor's own
-/// per-class `(rows, lanes)` vector — build log 10's exec key, verbatim, which
-/// is what the derivation is trying to eliminate. `coords` is where the probe
-/// harness placed this walk in the basis it chose to move the composition
-/// along, and the fit is written in THAT basis, because the two halves of a
-/// class's key are not always independently reachable: a decode class's word
-/// says one token per lane, so its rows and its lanes move together and no
-/// batch can separate them. A basis of reachable DIRECTIONS says what a pair
-/// of axes would have had to pretend.
+/// was walked at (`classes`), and where that composition sits in the fit's
+/// probe-basis coordinates (`coords`) — a basis of reachable directions,
+/// since a class's rows and lanes aren't always independently reachable
+/// (e.g. a decode class's word ties them together).
 #[derive(Clone, Debug)]
 pub struct Recording {
     /// Every dispatch, in walk order.
@@ -211,11 +173,6 @@ impl Recording {
 
 /// The recording `Encode`: everything a [`Sink`](crate::Sink) does, except
 /// the dispatch.
-///
-/// It holds the handle table for the same reason the sink does — a buffer
-/// argument is a handle and a handle is a row — and the cursor's cell for the
-/// reason the `Run` holds it: a slot has to know which region it stood in,
-/// and the walk's `Dispatch` signature carries no region.
 pub struct Tape<'a> {
     handles: &'a Handles,
     place: &'a At,
@@ -288,9 +245,8 @@ impl<'a> Tape<'a> {
 }
 
 impl Encode for Tape<'_> {
-    /// Write the dispatch down. **Every argument is resolved here**, not at
-    /// fit time, because the handle table is rewound at the end of the fire
-    /// and a row that outlived it would resolve against the next fire's carve.
+    /// Write the dispatch down. Every argument is resolved here, not at fit
+    /// time, since the handle table is rewound at the end of the fire.
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         let mut resolved = Vec::with_capacity(args.len());
         for (at, arg) in args.iter().enumerate() {

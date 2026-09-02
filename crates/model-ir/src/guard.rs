@@ -1,5 +1,4 @@
-//! Guard conditions over the plan's fact word. Ported from the old
-//! `model-ir::plan::Cond` unchanged in meaning: `Fact(bit)` names one bit of
+//! Guard conditions over the plan's fact word: `Fact(bit)` names one bit of
 //! the word the model's `Classify` computed, and the engine evaluates each
 //! node's guard against the fire's fact word.
 

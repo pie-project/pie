@@ -1,25 +1,8 @@
-//! Bound instances and their wait slots — the other half of the broker lift.
-//!
-//! **THIS CODE IS A LIFT, NOT A REWRITE**, on the same terms as
-//! [`completion`](crate::engine::completion): it stood in
-//! `engine::instance` and it is runtime bookkeeping, not a statement about
-//! what an engine is. It arrived comment-stripped and stays that way; what is
-//! documented is what this wave changed.
-//!
-//! # What changed on the way over
-//!
-//! * [`InstanceBindingPlan`] is now the runtime's THREE fields plus the
-//!   contract's [`InstanceBinding`](engine::InstanceBinding). The old
-//!   struct carried `engine_id`, `pacing_wait_id` and
-//!   `requested_instance_id` *through* the engine so they could come back
-//!   unchanged; the engine mints the id and the runtime keeps its own tables
-//!   (`engine::program`'s note on `InstanceBinding`). So the plan holds
-//!   the runtime's half and hands the engine only `binding`.
-//! * `validate_binding` no longer re-checks a native struct's fields. The
-//!   engine answers a typed
-//!   [`BoundInstance`](engine::BoundInstance) whose geometry class is an
-//!   enum; the one thing left to say is whether it acknowledged the class
-//!   that was asked for.
+//! Bound instances and their wait slots: runtime bookkeeping, not a
+//! statement about what an engine is. [`InstanceBindingPlan`] holds the
+//! runtime's own fields (`engine_id`, `pacing_wait_id`) plus the contract's
+//! [`InstanceBinding`](engine::InstanceBinding); the engine mints the
+//! instance id itself.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -234,10 +217,6 @@ pub struct BoundInstance {
 
 impl BoundInstance {
     /// Wrap the engine's answer in the runtime's bookkeeping.
-    ///
-    /// Takes the contract's [`BoundInstance`](engine::BoundInstance)
-    /// whole, where the lifted version took a `#[repr(C)]` binding struct and
-    /// re-derived a geometry class out of a `u32` it had already validated.
     #[must_use]
     pub fn new(
         engine_id: usize,

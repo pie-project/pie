@@ -97,14 +97,9 @@ impl Site {
 
 pub use eta_compiler::codegen::fault::FaultClass;
 
-/// What a raw fault code turned out to be, read against ONE program's table.
-///
-/// `class` borrows the name out of that table, which is why this carries a
-/// lifetime. It used to be `&'static str`, because the table was
-/// `eta_compiler::codegen::fault::CLASSES` re-exported from this module — the
-/// table the reading binary linked, not the one the kernel was emitted
-/// against. It is [`LaunchPackage::fault_classes`] now, and the borrow says
-/// so.
+/// What a raw fault code turned out to be, read against one program's table.
+/// `class` borrows the name out of that table (via
+/// [`LaunchPackage::fault_classes`]), which is why this carries a lifetime.
 ///
 /// [`LaunchPackage::fault_classes`]: eta_compiler::codegen::launch::LaunchPackage::fault_classes
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,16 +111,9 @@ pub struct Fault<'a> {
     pub ambiguous_with_op_tag: bool,
 }
 
-/// Name a raw fault code, against the table `package` shipped with.
-///
-/// **THE PACKAGE IS THE ARGUMENT, NOT A SLICE.** A `&[FaultClass]` parameter
-/// would say "some table" and let a caller hand back the ambient one; a
-/// package says "the table of the emitter that compiled the kernels this fire
-/// launched", which is the only reading that is sound. `package.fault_classes`
-/// travels inside the registration an engine executes, so the engine does not
-/// have to be the binary that compiled it — and today it uses
-/// `emitter_version` only as a cache key, so nothing else would notice if it
-/// were not.
+/// Name a raw fault code, against the table `package` shipped with. Takes
+/// the whole package rather than a `&[FaultClass]` so the table used is
+/// always the one the emitter that compiled this fire's kernels produced.
 #[must_use]
 pub fn describe_fault(package: &LaunchPackage, fault: u32, max_channel: u32) -> Fault<'_> {
     let mut found: Option<(&FaultClass, u32)> = None;

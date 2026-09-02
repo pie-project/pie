@@ -1,65 +1,40 @@
-//! `emit_order_region_cuda` — the `Order` library regions, generated.
+//! `emit_order_region_cuda`: the `Order` library regions, generated.
 //!
-//! Two ops, one kernel: [`Op::TopK`] and [`Op::SortDesc`]. The plan partitioner
-//! cuts each into a region of its own ([`RegionKind::Library`]) because both
-//! are schedule barriers — they read a whole row before they can write their
-//! first result — and every backend then has to answer for that region. Metal
-//! answers `top_k` with [`crate::codegen::metal::emit_grouped_topk`]; this
-//! backend used to answer `Slot::Refused` for both, and because the CUDA shell
-//! runs compiled regions and nothing else, a refusal was a region that did not
-//! run at all — the chain around it read the zeros `Prepared::build` had
-//! written and published a confident wrong answer, or, once `build_stage`
-//! learned to say so, the whole program failed to register (`beam-search`
-//! failed exactly here). So it answers with source now.
-//!
-//! **ONE EMITTER FOR BOTH, BECAUSE THEY ARE ONE OP.** `sort_desc` IS `top_k`
-//! at `k = n`: the host interpreter computes both from the same
-//! `sort_desc_order`, and both define the same two results in the same order —
-//! values F32, then indices U32. The only difference is how much of the order
-//! is written, and that is a number, not a code path. `kWidth` carries it, with
-//! [`ORDER_FULL_ROW`] the sentinel for `sort_desc`, whose result width the plan
-//! may only know symbolically (a `[vocab]` row is a `Dimension::Symbolic`) and
-//! which therefore has to come off the runtime descriptor.
+//! Two ops, one kernel: [`Op::TopK`] and [`Op::SortDesc`]. Both are schedule
+//! barriers (a region of their own, [`RegionKind::Library`]) since they
+//! read a whole row before writing their first result. `sort_desc` is
+//! `top_k` at `k = n`: both define the same two results (values F32, then
+//! indices U32) from the same `sort_desc_order`; `kWidth` carries how much
+//! of the order is written, with [`ORDER_FULL_ROW`] the sentinel for
+//! `sort_desc`, whose width the plan may only know symbolically.
 //!
 //! # The kernel
 //!
-//! One block per lane, the fused ABI verbatim — this kernel lands in the same
-//! `KernelKind::Fused` slot the shell reads for the region, so its signature
-//! is not ours to choose. Per row it runs a **stable LSD radix sort of the
-//! whole row** on [`m1_desc_key`], eight passes of four bits, and then writes
-//! the first `kWidth` entries of the resulting order to the two results.
+//! One block per lane, the fused ABI verbatim. Per row it runs a stable LSD
+//! radix sort of the whole row on [`m1_desc_key`] (eight passes of four
+//! bits) and writes the first `kWidth` entries of the resulting order to
+//! the two results.
 //!
-//! `m1_desc_key` is the runtime's own monotone `float -> u32` map that
-//! REVERSES value order, sends NaN to `0xFFFFFFFF` (which no finite float
-//! reaches, so NaNs sort last as a group) and normalises `-0.0` to `+0.0`.
-//! Sorting ascending on it therefore walks values descending, and because the
-//! sort is stable and starts from the identity order, equal values come out in
-//! ascending index order — which is exactly [`Op::TopK`]'s "ties → lower
-//! index" and exactly what `metal::topk`'s nine-pass form produces. (Metal
-//! spends a ninth pass separating NaNs; the `0xFFFFFFFF` sentinel does that
-//! work here in the same eight.)
+//! `m1_desc_key` is the runtime's monotone `float -> u32` map that reverses
+//! value order, sends NaN to `0xFFFFFFFF` (sorting NaNs last as a group),
+//! and normalises `-0.0` to `+0.0`. Sorting ascending on it walks values
+//! descending, and since the sort is stable, equal values come out in
+//! ascending index order -- `top_k`'s "ties -> lower index".
 //!
 //! # Why a full sort and not a selection
 //!
-//! Cost is `O(8·len)` **regardless of `k`**, which is the property that
-//! matters — and it is also what makes `sort_desc` free once `top_k` exists.
-//! `k` is not small in practice: `beam-search` asks for the beam width (2–3),
-//! but `locally-typical-sampling` and `tail-free-sampling` pass a `k_max`
-//! candidate bound that a caller may set anywhere up to the vocabulary, and
-//! their own module docs record that the `O(k·vocab)` shape — rescan the row
-//! once per pick — is what made an earlier ranking kernel "a performance knob
-//! with teeth" at a 151,936-token vocabulary. A selection loop would
-//! reintroduce exactly that, and would need a `k` ceiling refused by name to
-//! stay honest. A sort needs no ceiling: there is no `k` this emitter declines.
+//! Cost is `O(8*len)` regardless of `k`. `k` is not small in practice
+//! (`locally-typical-sampling` and `tail-free-sampling` pass a caller-set
+//! `k_max` up to the vocabulary), so a selection loop's `O(k*vocab)` shape
+//! would need a `k` ceiling refused by name to stay honest; a sort needs
+//! none.
 //!
 //! # What it costs in scratch
 //!
 //! Two `u32` order arrays over one row, taken from the fire's `temporary`
 //! arena. `engine::program::scratch::layout` sizes that arena at
-//! `4 · sizeof(u32)` per element of the WIDEST value in the stage, and the
-//! ranked input is one of those values, so `2 · sizeof(u32) · last` is inside
-//! it with a factor of two to spare — the same budget `metal::topk` spends,
-//! and the reason both can afford an out-of-place counting sort.
+//! `4 * sizeof(u32)` per element of the widest value in the stage, so
+//! `2 * sizeof(u32) * last` fits with a factor of two to spare.
 //!
 //! [`RegionKind::Library`]: crate::plan::RegionKind::Library
 //! [`Op::TopK`]: eta_ir::op::Op::TopK
@@ -80,34 +55,20 @@ use super::fused::{PREAMBLE, PROLOGUE, SIGNATURE};
 use super::runtime::singleton_runtime_source;
 use super::singleton::valid_identifier;
 
-/// `kCudaOrderWorkerCap` — how many threads take part in the counting sort.
-///
-/// The block width is the device's, not ours: `program::compile`'s
-/// `launch_width` reads `CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK` and rounds
-/// it down to a power of two anywhere in `[32, 1024]`. The per-worker digit
-/// table is `workers × 16` `u32`s of SHARED memory, so letting every thread be
-/// a worker would ask for 64 KiB at a 1024-wide block — past the 48 KiB a
-/// kernel gets without an opt-in. Capping the workers instead costs occupancy
-/// and nothing else: threads past the cap still run every barrier, they simply
-/// own no chunk of the row.
+/// `kCudaOrderWorkerCap`: how many threads take part in the counting sort.
+/// The per-worker digit table is `workers x 16` `u32`s of shared memory, so
+/// every thread being a worker could ask for more than a kernel gets
+/// without an opt-in; capping costs occupancy only.
 const ORDER_WORKER_CAP: u32 = 256;
 
-/// `kWidth`'s sentinel for "as wide as the row is at run time".
-///
-/// A NAMED value and not a bare `0` at the two sites that spell it, because it
-/// is a claim: `top_k` refuses `k < 1` in `infer.rs`, so zero is a width no
-/// legitimate `top_k` region can ask for and the sentinel cannot collide with
-/// one. `sort_desc` is the only op that reaches it.
+/// `kWidth`'s sentinel for "as wide as the row is at run time". Zero cannot
+/// collide with a legitimate `top_k` width, since `top_k` refuses `k < 1`.
 const ORDER_FULL_ROW: u32 = 0;
 
-/// The kernel body, after the six `constexpr`s the emitter writes: the worker
-/// cap, the input value id, the two result value ids, the result width, and
-/// the full-row sentinel.
-///
-/// Every `__syncthreads()` here is reached by the whole block: the loops are
-/// over uniform bounds and the guards inside them (`order_worker`,
-/// `threadIdx.x < kOrderDigits`) never contain one. A barrier inside a
-/// divergent branch is undefined behaviour on CUDA, not a slow path.
+/// The kernel body, after the six `constexpr`s the emitter writes (worker
+/// cap, input value id, two result value ids, result width, full-row
+/// sentinel). Every `__syncthreads()` is reached by the whole block: loop
+/// bounds are uniform and their guards never contain one.
 const BODY: &str = r#"
   // Bound to the fused ABI, and this kernel reads only part of it.
   (void)channels;
@@ -250,12 +211,9 @@ const BODY: &str = r#"
 "#;
 
 /// Whether `region` is one of the single-node `Order` library regions this
-/// emitter serves, with the results and operands the op table promises.
-///
-/// A library CLAIM is not evidence — the fused emitter's `validate` says the
-/// same thing at more length — so the tag is re-read off the node rather than
-/// taken from `region.kind`. A region mislabelled `Library(TopK)` around some
-/// other op would otherwise be emitted here as a ranking of the wrong operand.
+/// emitter serves. The tag is re-read off the node rather than trusted from
+/// `region.kind`, so a mislabelled region can't be emitted as a ranking of
+/// the wrong operand.
 pub fn is_order_region(stage: &CompiledStage, region: &Region) -> bool {
     let expected = match region.kind {
         RegionKind::Library(LibraryOp::TopK) => tags::TOP_K,
@@ -276,12 +234,10 @@ pub fn is_order_region(stage: &CompiledStage, region: &Region) -> bool {
 ///
 /// # Errors
 ///
-/// [`EmitError::EntryNameNotCIdentifier`] when the entry is not spellable in
-/// C, [`EmitError::LibraryRegionAbiInvalid`] when the region is not one of the
-/// single-node `Order` lifts this emitter serves, and the plan-well-formedness
-/// refusals `validate_generated_region` raises — an `Order` region sits in a
-/// stage whose value table and op list this kernel indexes exactly as the
-/// fused one does.
+/// [`EmitError::EntryNameNotCIdentifier`]: entry not spellable in C.
+/// [`EmitError::LibraryRegionAbiInvalid`]: not a single-node `Order` lift
+/// this emitter serves. Plus `validate_generated_region`'s
+/// plan-well-formedness refusals.
 pub fn emit_order_region(
     entry_name: &str,
     stage: &CompiledStage,
@@ -301,8 +257,7 @@ pub fn emit_order_region(
     let bases = result_bases(&ops);
     let node = region.nodes[0].index();
     let order = &ops[node];
-    // Two results, so the indices value is the id after the values one; both
-    // have to exist before either is spliced into a device pointer.
+    // The indices value is the id after the values one.
     if bases[node] as usize + 1 >= stage.normalized.value_types.len() {
         return Err(EmitError::RegionNodeOutOfRange(RegionForm::CudaOrder));
     }

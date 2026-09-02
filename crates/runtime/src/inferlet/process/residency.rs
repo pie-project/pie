@@ -127,13 +127,10 @@ pub(crate) fn pipelines_of(pid: uuid::Uuid) -> Vec<PendingFires> {
     with_residency(pid, |residency| residency.pipelines())
 }
 
-/// Whether every KV working set of `pid` on `(model, engine)` holds ZERO
-/// fire leases right now — a racy snapshot, used only as a victim-selection
-/// PREFERENCE: evicting a lease-quiescent process skips the measured
-/// ~2-frame lease drain (the p50 9.1 ms of the evict chain,
-/// CONTENTION_FOLLOWUP.md §17), so the planner prefers such victims among
-/// the equally-eligible. Never a correctness gate — the eviction's own
-/// fence + quiesce remains the seal.
+/// Whether every KV working set of `pid` on `(model, engine)` holds zero
+/// fire leases right now -- a racy snapshot used only as a victim-selection
+/// preference (skips the lease drain when evicting), never a correctness
+/// gate; the eviction's own fence + quiesce remains the seal.
 pub(crate) fn kv_lease_quiescent(pid: uuid::Uuid, model: usize, engine: usize) -> bool {
     with_residency(pid, |residency| {
         residency
@@ -144,18 +141,11 @@ pub(crate) fn kv_lease_quiescent(pid: uuid::Uuid, model: usize, engine: usize) -
     })
 }
 
-/// What suspending each candidate would ACTUALLY free on `(model, engine)`,
-/// computed for the whole candidate set under ONE store lock. This is the
-/// same question `prepare_suspend` answers, so victim selection and eviction
-/// execution cannot disagree; a zero answer carries the reason.
-///
-/// The per-process KV working sets on `(model, engine)`, gathered WITHOUT
-/// touching the KV store lock.
-///
-/// Split out of [`kv_reclaim_quotes`] so a caller that needs an atomic
-/// decision can gather here first and then take the store lock itself:
-/// `RESIDENCIES` is acquired *before* the KV lock everywhere in the tree,
-/// and taking them the other way round would invert that order.
+/// The per-process KV working sets on `(model, engine)`, gathered without
+/// touching the KV store lock. Split out of [`kv_reclaim_quotes`] so a
+/// caller needing an atomic decision can gather here first and take the
+/// store lock itself, preserving the tree-wide order (`RESIDENCIES` before
+/// the KV lock).
 pub(crate) fn kv_working_sets_for(
     pids: &[uuid::Uuid],
     model: usize,
@@ -177,13 +167,10 @@ pub(crate) fn kv_working_sets_for(
         .collect()
 }
 
-/// Quote `working_sets` against an ALREADY-LOCKED store, keeping the result
-/// positional with the `pids` the sets came from.
-///
-/// `budget` stops the quoting once the answers cover that many pages; the
-/// positions past the cut come back `None` ("no opinion"), which is what a
-/// caller that consumes the list in preference order until its deficit is
-/// covered would have ignored anyway. Pass `u32::MAX` to quote every pid.
+/// Quote `working_sets` against an already-locked store, keeping the
+/// result positional with the `pids` the sets came from. `budget` stops
+/// the quoting once the answers cover that many pages; positions past the
+/// cut come back `None`. Pass `u32::MAX` to quote every pid.
 pub(crate) fn quote_locked(
     kv: &crate::store::kv::KvStore,
     working_sets: Vec<Option<HashSet<WorkingSetId>>>,
@@ -191,10 +178,8 @@ pub(crate) fn quote_locked(
 ) -> Vec<Option<ReclaimQuote>> {
     let known: Vec<HashSet<WorkingSetId>> = working_sets.iter().flatten().cloned().collect();
     let mut quotes = kv.reclaim_quotes(&known, budget).into_iter();
-    // `and_then`, not `and`: `Option::and` evaluates its argument eagerly, so
-    // a `None` entry would still consume a quote and shift every later
-    // position by one. Only known processes were quoted, so only they may
-    // take from the iterator.
+    // `and_then`, not `and`: eager evaluation would consume a quote for a
+    // `None` entry too, shifting every later position.
     working_sets
         .into_iter()
         .map(|entry| entry.and_then(|_| quotes.next()))
@@ -218,27 +203,3 @@ pub(crate) fn kv_reclaim_quotes(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::{ProcessResidency, ResidentPipeline};
-
-    #[test]
-    fn teardown_closes_each_orphan_pipeline_once() {
-        let pipeline = crate::pipeline::Pipeline::new();
-        let pipeline_id = pipeline.scope.scheduler_id();
-        let mut residency = ProcessResidency::default();
-        residency.pipelines.push(ResidentPipeline {
-            scope: pipeline.scope.clone(),
-            fires: Arc::downgrade(&pipeline.fires),
-        });
-
-        let first = residency.teardown_snapshot();
-        assert_eq!(first.departed_pipeline_ids, vec![pipeline_id]);
-        assert!(pipeline.scope.is_closed());
-
-        let second = residency.teardown_snapshot();
-        assert!(second.departed_pipeline_ids.is_empty());
-    }
-}

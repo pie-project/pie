@@ -16,17 +16,10 @@ use crate::{Error, Result, shape_numel};
 pub struct PassInputs<'a> {
     pub logits: Option<&'a [f32]>,
 
-    /// The draft head's own readout, when the fire has one (palo C3b).
-    ///
-    /// **A SECOND COLUMN, BECAUSE THE FIRE HAS TWO** (design §9). The draft
-    /// logits are exported at `model_dsl::seam::MTP` and the carve gives them
-    /// a RECTANGLE OF THEIR OWN — `the_draft_readout_outlives_the_trunk_readout`
-    /// is the test that says so, and the shell's device path binds
-    /// [`IntrinsicId::MtpLogits`] at that rectangle's base rather than at an
-    /// offset into the trunk's. Leaving this `None` keeps the old reading, in
-    /// which a draft is rows `mtp_draft_row ..` of the ONE buffer — that is
-    /// [`super::plan::bounded_mtp_row_base`]'s layout, which no shipping shell
-    /// produces and which the parity fixtures still use.
+    /// The draft head's own readout, when the fire has one: a rectangle of
+    /// its own, bound at [`IntrinsicId::MtpLogits`]. Leaving this `None`
+    /// falls back to rows `mtp_draft_row ..` of the trunk buffer (the layout
+    /// [`super::plan::bounded_mtp_row_base`] computes).
     pub mtp_logits: Option<&'a [f32]>,
 
     pub rows: u32,
@@ -37,15 +30,9 @@ pub struct PassInputs<'a> {
 
     /// The fire's per-key attention rectangle, `[planes, ATTN_SCORE_KV_MAX]`
     /// F32 row-major, read by [`IntrinsicId::AttnScore`] at the epilogue.
-    ///
-    /// **A THIRD COLUMN, AND IT IS NOT LOGITS-SHAPED** — which is why it gets
-    /// a field instead of riding `logits` with an offset the way the draft
-    /// column may. Its rows are (layer, head) planes and its width is the
-    /// published KV ceiling; nothing about the readout's row count or the
-    /// vocabulary describes it. `None` is a fire whose lanes captured
-    /// nothing, and a program that reads the intrinsic against one is a
-    /// fault rather than a row of zeros: an empty capture and a captured
-    /// nothing are the pair this axis refuses to let anybody confuse.
+    /// Not logits-shaped, so it gets its own field. `None` means no lane
+    /// captured anything, and reading the intrinsic against it faults rather
+    /// than returning a row of zeros.
     pub attn_score: Option<&'a [f32]>,
 }
 
@@ -107,11 +94,8 @@ fn bind_intrinsic(
     root_numel: u64,
     inputs: &PassInputs,
 ) -> Result<Value> {
-    // **THE SCORE RECTANGLE IS ITS OWN BUFFER AND ITS OWN ANSWER**
-    // (attn-score §4). It is read before the logits family below because
-    // nothing about that family describes it: no vocabulary, no readout row,
-    // no draft base — the value is the whole rectangle the capture arm wrote,
-    // handed over at its declared extent.
+    // the score rectangle is its own buffer: nothing about the logits family
+    // below describes it (no vocabulary, no readout row, no draft base).
     if root_intr == Some(IntrinsicId::AttnScore) {
         let Some(scores) = inputs.attn_score else {
             return Err(Error {
@@ -137,12 +121,8 @@ fn bind_intrinsic(
             message: "unresolved value root (unsupported intrinsic) reached execution".to_owned(),
         });
     }
-    // WHICH COLUMN, AND THE ANSWER IS THE INTRINSIC'S OWN (palo C3b). A draft
-    // intrinsic reads the draft column when the caller bound one; when it did
-    // not, it falls back to rows `mtp_draft_row ..` of the trunk's, which is
-    // the one-buffer layout `plan::bounded_mtp_row_base` computes and the
-    // parity fixtures still state. Both readings index by `mtp_draft_row`, so
-    // the fallback costs nothing but the choice of base.
+    // a draft intrinsic reads the draft column when bound, else falls back
+    // to rows `mtp_draft_row ..` of the trunk's; both index by the same row.
     let drafts_column = matches!(
         root_intr,
         Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts)

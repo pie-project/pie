@@ -1,6 +1,6 @@
 //! Pure Metal kernel definitions — shader entry names, argument marshalling,
 //! and dispatch geometry; no IR types, no execution state. A driver `Run`
-//! resolves plan ids to handles and calls these entry functions (design §8).
+//! resolves plan ids to handles and calls these entry functions.
 
 pub mod attn;
 pub mod collective;

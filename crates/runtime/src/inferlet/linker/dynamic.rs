@@ -1,217 +1,6 @@
-//! Dynamic linking support for Wasm components.
-//!
-//! This module implements dynamic linking for WebAssembly Component Model components,
-//! enabling runtime composition where one component can import and use exports from
-//! another component. This is achieved through a "proxy registration" mechanism.
-//!
-//! # Overview
-//!
-//! When a program depends on library components, we need to:
-//! 1. Instantiate the library components first
-//! 2. Make their exports available to dependents (other libraries and the main program)
-//! 3. Handle resource handle translation between components
-//! 4. Track and properly end cross-component borrows
-//!
-//! # Proxy Registration
-//!
-//! The core mechanism is "proxy registration": For each export from a library component,
-//! we register a corresponding host-defined entity in the linker that acts as a proxy.
-//!
-//! ## Proxy Functions
-//!
-//! For each function exported by a library, we register a host function that:
-//! - Receives calls from the caller component
-//! - Transforms arguments (especially resource handles)
-//! - Forwards the call to the actual library function
-//! - Transforms return values back to the caller's view
-//!
-//! ## Proxy Resources
-//!
-//! For each resource type exported by a library, we register a host-defined resource type
-//! (`ProxyResource`) that:
-//! - Acts as a proxy for the actual guest resource
-//! - Maintains a mapping between host `rep` values and guest `ResourceAny` handles
-//! - Forwards destructor calls to the actual guest resource
-//!
-//! # Resource Handle Transformation
-//!
-//! Resource handle translation is necessary because the component that defines a resource
-//! type operates on the real guest resource handles, while components that depend on it
-//! receive host-defined proxy resource handles. When a dependent component passes a
-//! resource to the defining component (e.g., calling a method on a resource), the proxy
-//! handle must be translated back to the real guest handle.
-//!
-//! We maintain bidirectional mappings in `ProcessCtx`:
-//! - `dynamic_resource_map`: host rep → guest `ResourceAny`
-//! - `guest_resource_map`: guest `ResourceAny` → host rep (for identity preservation)
-//!
-//! ## Caller → Callee Transformation (Arguments)
-//!
-//! When a caller passes a resource to a callee:
-//!
-//! ```text
-//! ┌──────────────────────────────────────────────────────────────────────────────────┐
-//! │                    Argument Transformation (Caller → Callee)                     │
-//! └──────────────────────────────────────────────────────────────────────────────────┘
-//!
-//!   CASE 1: Callee defines the resource
-//!   ────────────────────────────────────
-//!
-//!   Caller sees:          Host does:                      Callee receives:
-//!   ┌──────────────┐      ┌────────────────────────┐      ┌──────────────────┐
-//!   │ Proxy Handle ├─────►│ Extract rep, look up   │─────►│ Original Guest   │
-//!   │ (rep=42)     │      │ guest ResourceAny      │      │ ResourceAny      │
-//!   └──────────────┘      └────────────────────────┘      └──────────────────┘
-//!
-//!   The caller holds a proxy handle. We extract the rep, look up the corresponding
-//!   guest ResourceAny in dynamic_resource_map, and pass that to the callee.
-//!
-//!
-//!   CASE 2: Callee doesn't define the resource
-//!   ──────────────────────────────────────────
-//!
-//!   Caller sees:          Host does:                      Callee receives:
-//!   ┌──────────────┐      ┌────────────────────────┐      ┌──────────────────┐
-//!   │ Proxy Handle ├─────►│ Pass through unchanged │─────►│ Same Proxy       │
-//!   │ (rep=99)     │      │                        │      │ Handle (rep=99)  │
-//!   └──────────────┘      └────────────────────────┘      └──────────────────┘
-//!
-//!   If the resource is not defined by the callee, the proxy handle passes through
-//!   unchanged. For borrow types, we additionally track them in borrows_to_end
-//!   for cleanup after the call completes.
-//! ```
-//!
-//! ## Callee → Caller Transformation (Return Values)
-//!
-//! When a callee returns a resource to a caller:
-//!
-//! ```text
-//! ┌──────────────────────────────────────────────────────────────────────────────────┐
-//! │                  Return Value Transformation (Callee → Caller)                   │
-//! └──────────────────────────────────────────────────────────────────────────────────┘
-//!
-//!   CASE 1: Resource defined by callee
-//!   ───────────────────────────────────
-//!
-//!   Callee returns:       Host does:                      Caller receives:
-//!   ┌──────────────┐      ┌────────────────────────┐      ┌──────────────────┐
-//!   │ Guest        │      │ 1. Check if already    │      │ Proxy Handle     │
-//!   │ ResourceAny  ├─────►│    known → reuse rep   │─────►│ (rep=42)         │
-//!   │              │      │ 2. Else alloc new rep  │      │                  │
-//!   │              │      │ 3. Store mapping       │      │                  │
-//!   └──────────────┘      └────────────────────────┘      └──────────────────┘
-//!
-//!   The callee returns a guest ResourceAny. If already in our map, we reuse
-//!   the same rep to preserve identity. Otherwise, allocate a new rep and
-//!   create the proxy handle.
-//!
-//!
-//!   CASE 2: Resource defined elsewhere
-//!   ───────────────────────────────────
-//!
-//!   Callee returns:       Host does:                      Caller receives:
-//!   ┌──────────────┐      ┌────────────────────────┐      ┌──────────────────┐
-//!   │ Proxy Handle ├─────►│ Pass through unchanged │─────►│ Same Proxy       │
-//!   │ (rep=99)     │      │                        │      │ Handle (rep=99)  │
-//!   └──────────────┘      └────────────────────────┘      └──────────────────┘
-//!
-//!   If the resource is not defined by the callee, the handle is already a
-//!   proxy handle and passes through unchanged.
-//! ```
-//!
-//! # Borrow Tracking
-//!
-//! The Component Model has "borrow" semantics where a resource can be temporarily
-//! lent to another component. The borrow must be "ended" after the call completes.
-//!
-//! ```text
-//! ┌──────────────────────────────────────────────────────────────────────────────────┐
-//! │                          Cross-Component Borrow Tracking                         │
-//! └──────────────────────────────────────────────────────────────────────────────────┘
-//!
-//!   Timeline of a call with a borrowed resource:
-//!
-//!   Caller                    Host (Proxy Function)                    Callee
-//!      │                              │                                   │
-//!      │  call foo(borrow<R>)         │                                   │
-//!      ├─────────────────────────────►│                                   │
-//!      │                              │  1. Transform args                │
-//!      │                              │     - Detect cross-component      │
-//!      │                              │       borrow (R not from callee)  │
-//!      │                              │     - Track in borrows_to_end     │
-//!      │                              │                                   │
-//!      │                              │  2. Forward call                  │
-//!      │                              ├──────────────────────────────────►│
-//!      │                              │                                   │
-//!      │                              │  3. Call returns                  │
-//!      │                              │◄──────────────────────────────────┤
-//!      │                              │                                   │
-//!      │                              │  4. End borrows:                  │
-//!      │                              │     resource_drop_async() on      │
-//!      │                              │     each borrow in borrows_to_end │
-//!      │                              │                                   │
-//!      │  return                      │  5. Transform return values       │
-//!      │◄─────────────────────────────┤                                   │
-//!      │                              │                                   │
-//!
-//!   Key insight: When a borrow crosses from Component A → Host → Component B,
-//!   the host must explicitly signal the end of the borrow by calling
-//!   resource_drop_async() on the borrowed ResourceAny handle AFTER the callee
-//!   returns but BEFORE returning to the caller.
-//!
-//!   Note: For borrows where the callee owns the resource (same component),
-//!   the borrow is automatically ended when we extract the rep from the
-//!   proxy handle via try_from_resource_any().
-//! ```
-//!
-//! # Call Forwarding Flow
-//!
-//! The complete flow for a forwarded function call:
-//!
-//! ```text
-//! ┌──────────────────────────────────────────────────────────────────────────────────┐
-//! │                              Call Forwarding Flow                                │
-//! └──────────────────────────────────────────────────────────────────────────────────┘
-//!
-//!   ┌─────────────────────────────────────────────────────────────────────────────┐
-//!   │ 1. TRANSFORM ARGUMENTS TO CALLEE VIEW                                       │
-//!   │    ┌─────────────────────────────────────────────────────────────────────┐  │
-//!   │    │ For each argument:                                                  │  │
-//!   │    │   • Primitive types: pass through                                   │  │
-//!   │    │   • Own<R> where callee defines R: proxy handle → guest resource    │  │
-//!   │    │   • Own<R> where callee doesn't define R: pass through              │  │
-//!   │    │   • Borrow<R> where callee defines R: proxy → guest (auto-ended)    │  │
-//!   │    │   • Borrow<R> cross-component: pass through + track for cleanup     │  │
-//!   │    │   • Composite types (list, record, etc.): recurse into elements     │  │
-//!   │    └─────────────────────────────────────────────────────────────────────┘  │
-//!   └─────────────────────────────────────────────────────────────────────────────┘
-//!                                       │
-//!                                       ▼
-//!   ┌─────────────────────────────────────────────────────────────────────────────┐
-//!   │ 2. CALL CALLEE FUNCTION                                                     │
-//!   │    call_async()                                                             │
-//!   └─────────────────────────────────────────────────────────────────────────────┘
-//!                                       │
-//!                                       ▼
-//!   ┌─────────────────────────────────────────────────────────────────────────────┐
-//!   │ 3. END CROSS-COMPONENT BORROWS                                              │
-//!   │    For each borrow in borrows_to_end:                                       │
-//!   │      resource_drop_async() to signal borrow completion                      │
-//!   └─────────────────────────────────────────────────────────────────────────────┘
-//!                                       │
-//!                                       ▼
-//!   ┌─────────────────────────────────────────────────────────────────────────────┐
-//!   │ 4. TRANSFORM RETURN VALUES TO CALLER VIEW                                   │
-//!   │    ┌─────────────────────────────────────────────────────────────────────┐  │
-//!   │    │ For each return value:                                              │  │
-//!   │    │   • Primitive types: pass through                                   │  │
-//!   │    │   • Own<R> where callee defines R: guest resource → proxy handle    │  │
-//!   │    │     (reuse existing rep if known, else allocate new)                │  │
-//!   │    │   • Own<R> where callee doesn't define R: pass through              │  │
-//!   │    │   • Composite types: recurse into elements                          │  │
-//!   │    └─────────────────────────────────────────────────────────────────────┘  │
-//!   └─────────────────────────────────────────────────────────────────────────────┘
-//! ```
+//! Dynamic linking for Wasm components: registers host-side proxy functions
+//! and resources so one component can import another's exports, translating
+//! resource handles and tracking cross-component borrows across the call.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -226,13 +15,9 @@ use wasmtime::{Engine, Store, StoreContextMut};
 
 use crate::inferlet::ProcessCtx;
 
-/// Proxy marker type for host-defined resources used in dynamic linking.
-/// This is a phantom type used to create host resource handles.
-///
-/// It is also how the host tracks resource handles that are DEFINED in guest
-/// components: when a component exports a resource type, we create
-/// `ProxyResource` instances to manage those resources from the host side,
-/// enabling cross-component resource passing.
+/// Phantom marker type for host-defined resource handles used in dynamic
+/// linking: when a component exports a resource type, `ProxyResource`
+/// instances manage it from the host side for cross-component passing.
 struct ProxyResource;
 
 /// Precomputed metadata for a forwarded function, consolidating all per-call data
@@ -313,24 +98,16 @@ impl FuncCategory {
     }
 }
 
-/// When function calls are forwarded from one component to another, the resource
-/// handles in the arguments sometimes need to be transformed. For example, consider
-/// the following scenario: Caller component A owns a resource defined in another
-/// component B, and A calls a method on that resource. The control flow will transfer
-/// from A to B. However, under our dynamic linking mechanism, the actual resource handle
-/// the component A is holding is the host-defined proxy resource handle. Therefore,
-/// during function call forwarding, we need to transform the resource handle from the
-/// proxy resource handle to the actual resource handle defined in the called component B.
-///
-/// In addition, during the transformation, we need to track any cross-component borrows
-/// that need to be ended after the call completes. This is because the cross-component
-/// borrows are not automatically ended when the call completes. Therefore, we need to
-/// track them and end them after the call completes.
+/// When a call forwards from component A to component B, A's resource
+/// handles are host-defined proxy handles and must be transformed into the
+/// actual handles B defines. Cross-component borrows made during that
+/// transform are not auto-ended, so they are tracked here to be dropped
+/// after the call completes.
 struct TransformedArgs {
     /// The transformed argument values
     args: SmallVec<[Val; 8]>,
-    /// Borrowed `ResourceAny` handles that need to be dropped after the call completes
-    /// to signal that the borrows have ended (cross-component borrows only)
+    /// Borrowed `ResourceAny` handles to drop after the call, ending the
+    /// cross-component borrow.
     borrows_to_end: SmallVec<[ResourceAny; 8]>,
 }
 
@@ -415,12 +192,10 @@ fn recursive_transform_args_to_callee_view(
     match ty {
         Type::Borrow(resource_type) => match val {
             Val::Resource(resource_any) => {
-                // If callee defines this resource type, convert the host-defined proxy resource
-                // handle to the actual resource handle defined in the callee component.
+                // Convert the proxy handle to the callee's own handle if it
+                // defines this resource type (cleanup happens inside
+                // `try_from_resource_any`, no explicit tracking needed here).
                 if callee_defined_resource_types.contains(resource_type) {
-                    // We need not explicitly track the borrow for cleanup here, because when the
-                    // resource handle in the argument is converted to the host-defined proxy
-                    // resource handle, the borrow is ended inside `try_from_resource_any`.
                     let host_resource: Resource<ProxyResource> =
                         Resource::try_from_resource_any(resource_any, &mut *store)?;
                     let rep = host_resource.rep();
@@ -429,9 +204,8 @@ fn recursive_transform_args_to_callee_view(
                             wasmtime::Error::msg(format!("unknown resource rep={}", rep))
                         })?;
                     Ok(Val::Resource(guest_resource))
-                // If the callee doesn't define this resource type, pass through the host-defined
-                // proxy resource handle. In addition, since this is a cross-component borrow,
-                // we need to track it for cleanup after the call completes.
+                // Otherwise pass the proxy handle through, tracked as a
+                // cross-component borrow for cleanup after the call.
                 } else {
                     borrows_to_end.push(resource_any);
                     Ok(Val::Resource(resource_any))
@@ -444,8 +218,8 @@ fn recursive_transform_args_to_callee_view(
         },
         Type::Own(resource_type) => match val {
             Val::Resource(resource_any) => {
-                // If callee defines this resource type, convert the host-defined proxy resource
-                // handle to the actual resource handle defined in the callee component.
+                // Convert to the callee's own handle if it defines this
+                // resource type; otherwise pass the proxy handle through.
                 if callee_defined_resource_types.contains(resource_type) {
                     let host_resource: Resource<ProxyResource> =
                         Resource::try_from_resource_any(resource_any, &mut *store)?;
@@ -456,8 +230,6 @@ fn recursive_transform_args_to_callee_view(
                         })?;
                     Ok(Val::Resource(guest_resource))
                 } else {
-                    // If the callee doesn't define this resource type, pass through the host-defined
-                    // proxy resource handle.
                     Ok(Val::Resource(resource_any))
                 }
             }
@@ -666,11 +438,11 @@ fn recursive_transform_returns_to_caller_view(
     match ty {
         Type::Own(resource_type) => match val {
             Val::Resource(resource_any) => {
-                // If the returned resource is defined in the callee component, convert the
-                // resource handle to a host-defined proxy resource handle.
+                // Convert to a host-defined proxy handle if the callee
+                // defines this resource type.
                 if callee_defined_resource_types.contains(resource_type) {
-                    // Reuse existing host rep if the callee returns an already-known resource.
-                    // This preserves identity and avoids double-dropping.
+                    // Reuse an existing host rep for an already-known resource,
+                    // to preserve identity and avoid double-dropping.
                     let rep =
                         if let Some(existing) = store.data().rep_for_guest_resource(resource_any) {
                             existing
@@ -685,8 +457,7 @@ fn recursive_transform_returns_to_caller_view(
                     let host_resource_any =
                         ResourceAny::try_from_resource(host_resource, &mut *store)?;
                     Ok(Val::Resource(host_resource_any))
-                // If the callee doesn't define this resource type, this resource handle is already
-                // the host-defined proxy resource handle, so we can pass it through unchanged.
+                // Otherwise this is already the proxy handle; pass it through.
                 } else {
                     Ok(Val::Resource(resource_any))
                 }
@@ -877,12 +648,8 @@ fn recursive_transform_returns_to_caller_view(
     }
 }
 
-/// Centralized call forwarding: transform arguments, call callee, transform results, end borrows.
-///
-/// 1. Transform arguments to callee view and collect any cross-component borrows
-/// 2. Call the callee function
-/// 3. End any cross-component borrows by dropping their `ResourceAny` handles
-/// 4. Transform results back to caller view
+/// Transform arguments to callee view, call the callee, end any
+/// cross-component borrows, then transform results back to caller view.
 async fn forward_call(
     store: &mut StoreContextMut<'_, ProcessCtx>,
     callee_func: &Func,
@@ -929,9 +696,8 @@ async fn forward_call(
     Ok(())
 }
 
-/// Register forwarding implementations for a library's exports.
-/// This scans the library component's exports and registers functions that forward calls
-/// to the library instance.
+/// Scans a library component's exports and registers functions that forward
+/// calls to the library instance.
 fn register_component_exports(
     engine: &Engine,
     linker: &mut Linker<ProcessCtx>,
@@ -941,10 +707,10 @@ fn register_component_exports(
 ) -> Result<(), wasmtime::Error> {
     let component_type = linker.substituted_component_type(library_component)?;
 
-    // First pass: collect ALL defined resource types across all interfaces of this component.
-    // A resource is "defined" in an interface if it has constructors, methods, or static methods
-    // there. Resources that appear via `use other-interface.{type}` are NOT defined — they are
-    // re-exported aliases and must reuse the proxy registered in their defining interface.
+    // First pass: collect all defined resource types across all interfaces.
+    // A resource is "defined" where it has constructors, methods, or static
+    // methods; one that only appears via `use other-interface.{type}` is a
+    // re-exported alias and must reuse that interface's proxy.
     let mut component_defined_resource_types: Vec<ResourceType> = Vec::new();
 
     for (_, export_item) in component_type.exports(engine) {
@@ -981,7 +747,7 @@ fn register_component_exports(
 
     let component_defined_resource_types = Arc::new(component_defined_resource_types);
 
-    // Second pass: register exports for each interface, passing the component-wide set.
+    // Second pass: register exports per interface, passing the component-wide set.
     for (interface_name, export_item) in component_type.exports(engine) {
         if let ComponentItem::ComponentInstance(instance_type) = export_item.ty {
             register_interface_exports(
@@ -1026,7 +792,7 @@ fn register_interface_exports(
         ))
     })?;
 
-    // First, collect all resources and functions without registering anything.
+    // Collect all resources and functions before registering anything.
     let mut resource_type_by_name: HashMap<String, ResourceType> = HashMap::new();
     let mut functions = Vec::new();
 
@@ -1042,8 +808,8 @@ fn register_interface_exports(
         }
     }
 
-    // Identify resources that this interface defines.
-    // Resources imported via `use` will not have constructor/method/static patterns here.
+    // Resources this interface defines (imported ones via `use` have no
+    // constructor/method/static pattern here).
     let mut defined_resource_names: HashSet<String> = HashSet::new();
     for (func_name, _func_type) in functions.iter() {
         match FuncCategory::from_name(func_name) {
@@ -1056,12 +822,9 @@ fn register_interface_exports(
         }
     }
 
-    // Only register proxy resources for resources DEFINED in this interface.
-    // Resources that appear via `use other-interface.{type}` must NOT get a new proxy
-    // definition — they reuse the proxy already registered in their defining interface.
-    // Registering a second proxy would create an incompatible resource type, causing
-    // handle type mismatches when the caller passes a handle obtained from the original
-    // interface.
+    // Only resources defined in this interface get a new proxy; a
+    // re-exported alias reuses its defining interface's proxy (a second one
+    // would be an incompatible resource type).
     for resource_name in resource_type_by_name.keys() {
         if !defined_resource_names.contains(resource_name) {
             continue;
@@ -1072,7 +835,6 @@ fn register_interface_exports(
             ResourceType::host::<ProxyResource>(),
             move |mut store, rep| {
                 Box::new(async move {
-                    // Look up and remove the guest resource from the resource map
                     let guest_resource = store
                         .data_mut()
                         .remove_dynamic_resource_mapping(rep)
@@ -1083,18 +845,15 @@ fn register_interface_exports(
                             ))
                         })?;
 
-                    // Call the destructor of the guest resource
                     guest_resource.resource_drop_async(&mut store).await
                 })
             },
         )?;
     }
 
-    // Register forwarding implementations for each function.
-    // Use the component-wide defined resource types so that resources defined in ANY
-    // interface of this component are correctly translated between proxy and guest handles.
+    // Use the component-wide defined resource types so resources defined
+    // in any interface of this component translate correctly.
     for (func_name, func_type) in functions {
-        // Look up the function.
         let (_, func_idx) = library_instance
             .get_export(&mut *store, Some(&interface_idx), &func_name)
             .ok_or_else(|| {
@@ -1112,7 +871,6 @@ fn register_interface_exports(
                 ))
             })?;
 
-        // Collect argument and return types.
         let arg_types: Vec<Type> = func_type.params().map(|(_, ty)| ty).collect();
         let return_types: Vec<Type> = func_type.results().collect();
 
@@ -1129,13 +887,10 @@ fn register_interface_exports(
     Ok(())
 }
 
-/// Register a function that forwards calls to the library instance.
-///
-/// For resource-free functions (the common case), registers a minimal closure that
-/// captures only the callee `Func` (which is `Copy`), avoiding Arc overhead and
-/// producing the smallest possible `Box<dyn Future>`. For functions with resource
-/// types in their signature, registers the full forwarding closure with argument
-/// and return value transformation.
+/// Register a function that forwards calls to the library instance. The
+/// common resource-free case gets a minimal closure capturing only the
+/// callee `Func`; a signature with resource types gets the full forwarding
+/// closure with argument/return transformation.
 fn register_call_forwarding(
     inst: &mut LinkerInstance<'_, ProcessCtx>,
     func_name: &str,
@@ -1148,10 +903,7 @@ fn register_call_forwarding(
     let has_resource_returns = return_types.iter().any(type_contains_resource);
 
     if !has_resource_args && !has_resource_returns {
-        // Fast path: the function signature has no resource types, so we can
-        // forward args and returns directly without any transformation. The
-        // closure captures only the callee `Func` (which is `Copy`), avoiding
-        // the Arc overhead and producing a smaller `Box<dyn Future>`.
+        // Fast path: no resource types, forward directly with no transform.
         inst.func_new_async(func_name, move |mut store, _ty, args, returns| {
             Box::new(async move {
                 func.call_async(&mut store, args, returns).await?;
@@ -1159,10 +911,8 @@ fn register_call_forwarding(
             })
         })
     } else {
-        // Slow path: the function signature involves resource types, so we must
-        // transform arguments from caller view to callee view (and vice versa
-        // for returns). This requires the full `FuncForwardingInfo` metadata,
-        // shared via Arc across invocations.
+        // Slow path: resource types need transforming both ways, via the
+        // shared `FuncForwardingInfo`.
         let info = Arc::new(FuncForwardingInfo {
             arg_types,
             return_types,
@@ -1177,11 +927,8 @@ fn register_call_forwarding(
     }
 }
 
-/// Instantiate library components and register their exports in the linker.
-///
-/// This iterates through library components in dependency order, instantiates each one,
-/// and registers forwarding implementations for their exports so that subsequent
-/// components can import them.
+/// Instantiate library components in dependency order and register their
+/// exports so subsequent components can import them.
 pub(crate) async fn instantiate_libraries(
     engine: &Engine,
     linker: &mut Linker<ProcessCtx>,
@@ -1193,7 +940,6 @@ pub(crate) async fn instantiate_libraries(
             .instantiate_async(&mut *store, &lib_component)
             .await?;
 
-        // Register forwarding implementations for this library's exports
         register_component_exports(engine, linker, store, &lib_component, lib_instance)?;
     }
 

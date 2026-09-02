@@ -1,44 +1,29 @@
-//! `worker` library — runtime boot path + supporting modules.
-//!
-//! The `pie` CLI binary and the `pie-server` pyo3 wheel both link against this
-//! lib, so [`runtime::start_runtime`] has a single source of truth. Modules are
-//! `pub` so the wheel can reach the surface it needs.
+//! `worker` library — runtime boot path + supporting modules. The `pie` CLI
+//! binary and the `pie-server` pyo3 wheel both link against this lib, so
+//! [`serve::start_runtime`] has a single source of truth.
 
-/// The process-wide allocator for every engine entry point.
-///
-/// Declared here rather than in each binary because `#[global_allocator]` is
-/// resolved at link time across the whole graph, and `worker` is the one crate
-/// the CLI, the standalone worker and the pyo3 wheel all link.
-///
-/// Measured, not preferred: retiring a wave frees 512 `LaunchPlan`s, thirty-odd
-/// `Vec`s each, on the single scheduler thread whose pass time is the critical
-/// path at a cohort boundary — 2.93 ms per pass under glibc malloc, 0.77 ms
-/// under mimalloc.
+/// The process-wide allocator for every engine entry point. Declared here
+/// (not per-binary) since `#[global_allocator]` resolves at link time and
+/// `worker` is the crate all three binaries link. Measured: mimalloc drops
+/// scheduler-thread wave-retirement pass time from 2.93ms to 0.77ms vs glibc.
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod backend;
 pub mod config;
-pub mod config_layout;
-pub mod config_schema;
-pub mod embedded_engine;
-pub mod engine_ffi;
-pub mod paths;
-pub mod state;
+pub mod disk;
+pub mod serve;
 pub mod translate;
 pub mod weights;
 
-mod client_server;
-pub mod runtime;
 mod executor;
-mod lifecycle;
 mod link;
-mod preflight;
 
-// Frozen crate-root public API (Seam 1): `bin/worker`, `bin/pie` and the pyo3
-// wheel code against these top-level paths, so impls can move underneath.
+// Frozen crate-root public API: `bin/worker`, `bin/pie` and the pyo3 wheel
+// code against these top-level paths, so impls can move underneath.
 pub use config::Config;
 pub use controller_api::Role;
-pub use runtime::{WorkerHandle, run, run_with};
-// The control-plane seam `run_with` is generic over — re-exported so the
-// composition root (`bin/pie`) can impl it for its `EmbeddedControl` adapter.
+pub use serve::{WorkerHandle, run, run_with};
+// The control-plane trait `run_with` is generic over, re-exported so
+// `bin/pie` can impl it for its `EmbeddedControl` adapter.
 pub use link::control::ControlLink;

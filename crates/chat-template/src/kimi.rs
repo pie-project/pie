@@ -1,12 +1,8 @@
-//! Kimi's turn format.
-//!
-//! It looks like ChatML from a distance and is not one: the role is announced
-//! by its OWN marker (`<|im_user|>`, `<|im_system|>`, `<|im_assistant|>`)
-//! rather than by a shared opener plus a role word, the header closes with
-//! `<|im_middle|>`, the turn ends without a trailing newline, and every
-//! assistant turn carries an explicit — usually empty — thinking block.
-//! Four knobs no other ChatML speaker would ever set is not a configuration
-//! of ChatML; it is a second format, and it gets a second module.
+//! Kimi's turn format. It looks like ChatML from a distance and is not one:
+//! the role is announced by its own marker (`<|im_user|>`, `<|im_system|>`,
+//! `<|im_assistant|>`) rather than a shared opener plus role word, the
+//! header closes with `<|im_middle|>`, the turn ends without a trailing
+//! newline, and every assistant turn carries an explicit thinking block.
 
 use std::sync::Arc;
 
@@ -64,11 +60,8 @@ impl Kimi {
     }
 
     /// Every assistant turn opens with a thinking block, so a replayed reply
-    /// that has none is given the empty one.
-    ///
-    /// The test is on the START of the message: `contains` said yes to a reply
-    /// that merely quoted the marker somewhere in its prose, and that reply
-    /// went back into the history with no block at all.
+    /// that has none is given the empty one. Checks the start of the message
+    /// only — a reply that merely quotes the marker mid-prose stays bodiless.
     fn assistant_body(msg: &str) -> String {
         if msg.trim_start().starts_with(THINK_OPEN) {
             msg.to_string()

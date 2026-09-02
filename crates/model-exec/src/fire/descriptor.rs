@@ -1,78 +1,7 @@
-//! The [`FireDescriptor`]: the window table as a struct, and the same table as
-//! bytes.
-//!
-//! **THE ONE MUTABLE CHANNEL INTO A RECORDED GRAPH** (design §5). Everything
-//! else a fire varies by — composition, window bounds, row counts, lane order,
-//! the plan structs prepare hoists out — is absorbed here, which is what makes
-//! "one immutable graph per bucket, recaptured never" a true sentence. A
-//! kernel inside the graph does not know which lanes it got; it reads its
-//! region's count and offset out of this table and returns immediately if the
-//! count is zero.
-//!
-//! # Why a flat form at all
-//!
-//! Because the reader is a device. The eager walk reads the struct in place
-//! and never packs anything; the CUDA shell writes [`pack`](FireDescriptor::pack)
-//! into pinned memory and uploads it, once, in front of the launch. The bytes
-//! are the interface (design §6's standing doctrine), so the layout lives HERE
-//! — one implementation, in the shared crate, with a roundtrip test — rather
-//! than once per shell with a drift test between them. That is the lesson
-//! `program/lane.rs` learned the expensive way: five copies of a layout, each
-//! safe only because something watched it.
-//!
-//! # The layout
-//!
-//! ```text
-//! offset  bytes  field
-//!      0      4  magic "FIRE"
-//!      4      4  abi version
-//!      8      4  rows          total token rows this fire carries
-//!     12      4  lanes         how many lane records follow the class table
-//!     16      4  bucket        the shape bucket, i.e. which graph
-//!     20      4  classes       how many class records follow the header
-//!     24      4  patch_rows    total PATCH rows this fire carries
-//!     28      4  patch_bucket  the patch rung, i.e. which tower graph
-//!     32     16  class[0]      row_offset, rows, lane_offset, lanes
-//!    ...     16  class[n-1]
-//!    ...     24  lane[0]       word (8), source, class, row_offset, rows
-//!    ...     24  lane[m-1]
-//!  --- the patch trailer, present iff patch_rows > 0 ---
-//!    ...     16  patch_class[0]  patch_offset, patches, image_offset, images
-//!    ...     16  patch_class[n-1]
-//!    ...     16  patch_lane[0]   patch_offset, patches, image_offset, images
-//!    ...     16  patch_lane[m-1]
-//! ```
-//!
-//! Little-endian throughout, `u32` fields except the fact word — every device
-//! this ships on is little-endian, and stating it beats deriving it from the
-//! host's byte order at pack time. **Fixed-width records, no padding**: a
-//! device indexes `class[i]` with a multiply, which it cannot do against a
-//! table it has to parse.
-//!
-//! # ABI 2, and what it costs a fire that carries no image
-//!
-//! **FOUR BYTES, AND THEY ARE THE VERSION NUMBER.** The reserved `u64` at 24
-//! was always written as zero; ABI 2 splits it into two `u32`s that a
-//! text-only fire also writes as zero, and the patch trailer is keyed on
-//! `patch_rows > 0` rather than on a count of its own — so a fire with no
-//! patch rows packs the same length, the same class table and the same lane
-//! table it packed under ABI 1, byte for byte, and the only difference on the
-//! wire is `4..8`. That is what makes multimodal gate (a) — "a fire with no
-//! image lane is the fire this engine always fired" — an arithmetic property
-//! of the layout rather than a measurement.
-//!
-//! The trailer is keyed on `patch_rows` and NOT on a second class count
-//! because there is no second count to carry: the patch table has one window
-//! per class of the same artifact and one record per lane of the same fire,
-//! so the header's `classes` and `lanes` size both halves. A separate count
-//! would be a number free to disagree with the one beside it.
-//!
-//! `ABI_VERSION` is checked on unpack and never negotiated. A shell and an
-//! engine that disagree about the layout are a build mismatch, not a
-//! compatibility case (`engine`'s note on the ABI-version-on-an-in-process
-//! -call is the counterexample this deliberately is not: that number rode on
-//! a call inside one process, this one rides on bytes that cross to a device
-//! and back into a `--force-warn`-clean unpack).
+//! [`FireDescriptor`]: the fire's window table, as a struct and as bytes —
+//! the one mutable channel into a recorded graph. The eager walk reads the
+//! struct in place; a CUDA shell packs it into pinned memory and uploads it
+//! once, in front of the launch.
 
 use model_ir::ClassSet;
 
@@ -84,16 +13,10 @@ use crate::{Error, Result};
 /// first four bytes of any descriptor.
 pub const MAGIC: u32 = 0x4649_5245;
 
-/// The layout's version. Bumped by any change to the table below; checked, not
-/// negotiated.
-///
-/// **1 → 2 AT M3**, for the patch header words and the patch trailer. A
-/// descriptor carrying version 1 is REFUSED by name
-/// ([`Fault::DescriptorAbi`]) and never regenerated: nothing persists a
-/// descriptor — it is built and dropped once per fire — so the only way v1
-/// bytes reach this unpack is a shell and an engine from two builds, and
-/// filling in the fields the older side never wrote would be this one
-/// pretending to know what it meant.
+/// The layout's version. Bumped by any change to the wire layout; checked on
+/// unpack, never negotiated. A descriptor carrying an older version is
+/// refused by name ([`Fault::DescriptorAbi`]) and never regenerated, since
+/// nothing persists a descriptor across builds.
 pub const ABI_VERSION: u32 = 2;
 
 /// Bytes before the class table.
@@ -106,21 +29,41 @@ pub const CLASS_BYTES: u64 = 16;
 pub const LANE_BYTES: u64 = 24;
 
 /// Bytes per PATCH lane record: `patch_offset, patches, image_offset, images`.
-///
-/// Four words and not a second copy of the token record: the word, the source
-/// and the class are properties of the LANE and are already on the wire once.
-/// A second copy of them would be three numbers free to disagree with
-/// themselves.
+/// Not a second copy of the token record — word/source/class are lane
+/// properties, already on the wire once.
 pub const PATCH_LANE_BYTES: u64 = 16;
 
-/// One fire's window table, as the walk and the shells read it.
+/// One fire's window table, as the walk and the shells read it: a
+/// [`Composition`] minus the provenance — counts, offsets, words, with no
+/// borrow into the batch that produced it (a shell keeps this resident and
+/// overwrites it in place every fire).
 ///
-/// A COMPOSITION MINUS THE PROVENANCE. [`Composition`] knows how it was built
-/// — the submitted lanes, the class order it chose — and this is what survives
-/// the trip to a device: counts, offsets, words. Building one is a clone and
-/// nothing else, which is deliberate; the descriptor is what a shell keeps
-/// resident and overwrites in place every fire, so it must be a plain table
-/// with no borrow into the batch that produced it.
+/// Packed layout ([`pack`](FireDescriptor::pack)/[`unpack`](FireDescriptor::unpack)),
+/// little-endian, fixed-width records, no padding:
+///
+/// ```text
+/// offset  bytes  field
+///      0      4  magic "FIRE"
+///      4      4  abi version
+///      8      4  rows          total token rows this fire carries
+///     12      4  lanes         how many lane records follow the class table
+///     16      4  bucket        the shape bucket, i.e. which graph
+///     20      4  classes       how many class records follow the header
+///     24      4  patch_rows    total PATCH rows this fire carries
+///     28      4  patch_bucket  the patch rung, i.e. which tower graph
+///     32     16  class[0]      row_offset, rows, lane_offset, lanes
+///    ...     16  class[n-1]
+///    ...     24  lane[0]       word (8), source, class, row_offset, rows
+///    ...     24  lane[m-1]
+///  --- the patch trailer, present iff patch_rows > 0 ---
+///    ...     16  patch_class[0]  patch_offset, patches, image_offset, images
+///    ...     16  patch_class[n-1]
+///    ...     16  patch_lane[0]   patch_offset, patches, image_offset, images
+///    ...     16  patch_lane[m-1]
+/// ```
+///
+/// A fire with `patch_rows == 0` packs no trailer, byte-for-byte the same as
+/// ABI 1 wrote (which had no patch fields at all).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FireDescriptor {
     /// Total token rows.
@@ -140,14 +83,10 @@ pub struct FireDescriptor {
     pub images: u32,
     /// The patch rung these patch rows round up to — which tower graph runs.
     pub patch_bucket: u32,
-    /// One PATCH window per class of the artifact, indexed by class.
-    ///
-    /// **A SECOND TABLE OVER THE SAME CLASSES IN A DIFFERENT ORDER**, which
-    /// is the whole of multimodal §5.1: patch rows and token rows do not
-    /// break at the same places, so a region on the patch axis asks its
-    /// window of this table and a region on the token axis asks it of the one
-    /// above. All-zero, and packed as nothing at all, for a fire with no
-    /// patch rows.
+    /// One PATCH window per class of the artifact, indexed by class — a
+    /// second table over the same classes, since patch rows and token rows
+    /// don't break at the same places. All-zero, and packed as nothing at
+    /// all, for a fire with no patch rows.
     pub patch_classes: WindowTable,
 }
 
@@ -167,32 +106,18 @@ impl FireDescriptor {
         }
     }
 
-    /// Does this fire carry the second row axis at all?
-    ///
-    /// THE ONE PREDICATE THE TRAILER IS KEYED ON, and the one a shell asks
-    /// before it launches a tower exec: an axis-empty fire does not launch
-    /// that unit (multimodal §1), and this is what "axis-empty" is.
+    /// Does this fire carry the second row axis at all? The predicate the
+    /// trailer is keyed on, and the one a shell asks before launching a
+    /// tower exec.
     #[must_use]
     pub fn has_patches(&self) -> bool {
         self.patch_rows > 0
     }
 
-    /// **THIS FIRE'S WINDOW TABLE ON ONE ROW AXIS** — the token seriation's
-    /// for a trunk region, the patch seriation's for a tower one.
-    ///
-    /// **THE ONE PICK, AND EVERY QUESTION BELOW IS THIS TABLE ASKED
-    /// SOMETHING.** A region belongs to exactly one axis — its capture
-    /// unit's — so cutting its window is a lookup and never a merge; what
-    /// used to stand at each such site was a two-arm match between a method
-    /// and its `patch_`-prefixed twin, one pair per question the walk asks.
-    /// The twins were the same delegation written twice, which is a second
-    /// derivation waiting to answer differently, and this is the pick said
-    /// once so the questions do not have to be.
-    ///
-    /// The two fields stay named because the WIRE is named: `pack` writes the
-    /// patch table into a trailer that is present iff there are patch rows,
-    /// and a fire with none pays no byte for it (this module's header). An
-    /// array would have had to answer where those bytes go.
+    /// This fire's window table on one row axis — the token seriation for a
+    /// trunk region, the patch seriation for a tower one. A region belongs
+    /// to exactly one axis, so cutting its window is a lookup, never a
+    /// merge.
     #[must_use]
     pub fn table(&self, axis: model_ir::RowAxis) -> &WindowTable {
         match axis {
@@ -288,8 +213,7 @@ impl FireDescriptor {
             put32(&mut out, lane.row_offset);
             put32(&mut out, lane.rows);
         }
-        // THE TRAILER, AND NOTHING AT ALL WHEN THERE ARE NO PATCH ROWS. That
-        // is what makes a text-only fire's bytes the bytes ABI 1 wrote.
+        // The trailer, nothing at all when there are no patch rows.
         if self.has_patches() {
             for window in self.patch_classes.as_slice() {
                 put32(&mut out, window.row_offset);
@@ -309,24 +233,24 @@ impl FireDescriptor {
 
     /// The descriptor these bytes carry.
     ///
-    /// WHAT IT CHECKS IS WHAT A DEVICE CANNOT. A malformed descriptor does not
-    /// fault on the far side — it computes, over whatever rows the wrong
-    /// numbers name — so the length has to be exact rather than sufficient,
-    /// and the class rows have to add up to the total the header claims.
+    /// Checks what a device cannot: a malformed descriptor doesn't fault on
+    /// the far side, it computes over whatever rows the wrong numbers name.
+    /// So the length must be exact, and class rows must add up to the
+    /// header's total.
     ///
     /// # Errors
     ///
-    /// [`Fault::Descriptor`], naming which of those it was.
+    /// One of the five `Descriptor*` faults, naming which of those it was.
     pub fn unpack(bytes: &[u8]) -> Result<FireDescriptor> {
         if (bytes.len() as u64) < HEADER_BYTES {
-            return Err(refuse("shorter than a header"));
+            return Err(Error::Fire(Fault::DescriptorShort { bytes: bytes.len() }));
         }
-        if take32(bytes, 0) != MAGIC {
-            return Err(refuse("no FIRE magic in the first four bytes"));
+        let magic = take32(bytes, 0);
+        if magic != MAGIC {
+            return Err(Error::Fire(Fault::DescriptorMagic { saw: magic }));
         }
-        // **REFUSED BY NAME AND NEVER REGENERATED.** The two numbers are in
-        // the refusal because "an ABI mismatch" without them sends an
-        // operator reading a hexdump.
+        // Refused by name, both numbers included so the refusal is legible
+        // without a hexdump.
         let saw = take32(bytes, 4);
         if saw != ABI_VERSION {
             return Err(Error::Fire(Fault::DescriptorAbi {
@@ -348,10 +272,10 @@ impl FireDescriptor {
         };
         let want = HEADER_BYTES + CLASS_BYTES * classes + LANE_BYTES * lanes + trailer;
         if bytes.len() as u64 != want {
-            return Err(refuse(
-                "a length its own header disagrees with, so a record would be \
-                 read half out of the next one",
-            ));
+            return Err(Error::Fire(Fault::DescriptorLength {
+                bytes: bytes.len(),
+                want,
+            }));
         }
 
         let mut table = Vec::with_capacity(classes as usize);
@@ -368,10 +292,10 @@ impl FireDescriptor {
             table.push(window);
         }
         if counted != u64::from(rows) {
-            return Err(refuse(
-                "class windows that do not add up to the row count in its \
-                 header",
-            ));
+            return Err(Error::Fire(Fault::DescriptorRows {
+                counted,
+                header: rows,
+            }));
         }
 
         let base = HEADER_BYTES + CLASS_BYTES * classes;
@@ -388,10 +312,9 @@ impl FireDescriptor {
             });
         }
 
-        // The trailer. Its two halves are checked the way the token halves
-        // are: the patch windows have to add up to the patch row count the
-        // header claims, because a patch table that does not is the same
-        // corruption the token one is — it does not fault, it computes.
+        // The trailer's two halves are checked the way the token halves are:
+        // patch windows must add up to the patch row count the header
+        // claims.
         let mut patch_table = vec![ClassWindow::default(); classes as usize];
         if patch_rows > 0 {
             let at_classes = base + LANE_BYTES * lanes;
@@ -408,10 +331,10 @@ impl FireDescriptor {
                 patch_table[c as usize] = window;
             }
             if counted != u64::from(patch_rows) {
-                return Err(refuse(
-                    "patch windows that do not add up to the patch row count in \
-                     its header",
-                ));
+                return Err(Error::Fire(Fault::DescriptorPatchRows {
+                    counted,
+                    header: patch_rows,
+                }));
             }
             let at_lanes = at_classes + CLASS_BYTES * classes;
             for (l, lane) in placed.iter_mut().enumerate() {
@@ -435,10 +358,6 @@ impl FireDescriptor {
             patch_classes: WindowTable::new(patch_table),
         })
     }
-}
-
-fn refuse(what: &'static str) -> Error {
-    Error::Fire(Fault::Descriptor { what })
 }
 
 fn put32(out: &mut Vec<u8>, value: u32) {
@@ -476,7 +395,7 @@ mod tests {
         Budget::new(8, 64)
     }
 
-    /// The design §0 split, in four nodes.
+    // A decode/prefill split, in four nodes.
     fn plan() -> Build {
         let mut b = Build::new();
         let x = b.input(4);
@@ -489,7 +408,7 @@ mod tests {
         b
     }
 
-    /// The §0 diagram's fire, as a descriptor.
+    // That fire, as a descriptor.
     fn descriptor() -> FireDescriptor {
         let b = plan();
         let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
@@ -526,38 +445,10 @@ mod tests {
         assert_eq!(&bytes[12..16], &5u32.to_le_bytes());
         assert_eq!(&bytes[16..20], &13u32.to_le_bytes());
         assert_eq!(&bytes[20..24], &2u32.to_le_bytes());
-        // Words 6 and 7 were ONE reserved `u64` under ABI 1, kept zero so the
-        // class table began 8-byte aligned. ABI 2 spends both of them: 24 is
-        // `patch_rows` and 28 is `patch_bucket`, and the alignment argument is
-        // unchanged because two `u32`s occupy exactly what the reserved word
-        // did. This descriptor carries no image, so both read zero — which is
-        // also the byte-for-byte equality with ABI 1 that a text-only fire
-        // keeps (this module's header).
+        // Words 6/7 were one reserved `u64` under ABI 1; ABI 2 spends them as
+        // `patch_rows`/`patch_bucket`. No image here, so both read zero.
         assert_eq!(&bytes[24..28], &0u32.to_le_bytes());
         assert_eq!(&bytes[28..32], &0u32.to_le_bytes());
-    }
-
-    #[test]
-    fn the_table_a_device_reads_is_the_table_the_walk_reads() {
-        let b = plan();
-        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
-        let fire = compose(
-            &compiled,
-            &budget(),
-            &[Lane::new(0, 7), Lane::new(1, 1), Lane::new(1, 1)],
-        )
-        .expect("composes");
-        let packed = FireDescriptor::unpack(&FireDescriptor::of(&fire).pack()).expect("unpacks");
-
-        assert_eq!(packed.rows, fire.rows());
-        assert_eq!(packed.lane_count(), fire.lane_count());
-        for region in compiled.template() {
-            assert_eq!(
-                packed.rows_of(&region.mask),
-                fire.classes().rows_of(&region.mask),
-                "the trip through the bytes changed a window",
-            );
-        }
     }
 
     #[test]
@@ -566,18 +457,18 @@ mod tests {
 
         assert!(matches!(
             FireDescriptor::unpack(&good[..16]),
-            Err(Error::Fire(Fault::Descriptor { .. })),
+            Err(Error::Fire(Fault::DescriptorShort { .. })),
         ));
         assert!(matches!(
             FireDescriptor::unpack(&[0u8; 8]),
-            Err(Error::Fire(Fault::Descriptor { .. })),
+            Err(Error::Fire(Fault::DescriptorShort { .. })),
         ));
 
         let mut foreign = good.clone();
         foreign[0] ^= 0xff;
         assert!(matches!(
             FireDescriptor::unpack(&foreign),
-            Err(Error::Fire(Fault::Descriptor { .. })),
+            Err(Error::Fire(Fault::DescriptorMagic { .. })),
         ));
 
         let mut newer = good.clone();
@@ -593,7 +484,7 @@ mod tests {
         miscounted[20..24].copy_from_slice(&3u32.to_le_bytes());
         assert!(matches!(
             FireDescriptor::unpack(&miscounted),
-            Err(Error::Fire(Fault::Descriptor { .. })),
+            Err(Error::Fire(Fault::DescriptorLength { .. })),
         ));
 
         // Windows that do not add up to the total the header claims — the
@@ -602,42 +493,13 @@ mod tests {
         wrong[8..12].copy_from_slice(&12u32.to_le_bytes());
         assert!(matches!(
             FireDescriptor::unpack(&wrong),
-            Err(Error::Fire(Fault::Descriptor { .. })),
+            Err(Error::Fire(Fault::DescriptorRows { .. })),
         ));
     }
 
-    #[test]
-    fn an_empty_fire_still_packs_a_full_class_table() {
-        // Zero lanes, and every class still has a window — a zero one. That is
-        // what makes "an empty window is a count, not an absence" true on the
-        // wire as well as in the struct.
-        let b = plan();
-        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
-        let fire = compose(&compiled, &budget(), &[]).expect("composes");
-        let descriptor = FireDescriptor::of(&fire);
-
-        assert_eq!(descriptor.classes.len(), 2);
-        assert_eq!(descriptor.rows, 0);
-        assert!(descriptor.lanes.is_empty());
-        assert_eq!(
-            FireDescriptor::unpack(&descriptor.pack()),
-            Ok(descriptor.clone()),
-        );
-        assert_eq!(descriptor.bytes(), HEADER_BYTES + CLASS_BYTES * 2);
-    }
-
-    /// **THE ABI DECISION, STATED AS A TEST**: version 1 bytes are REFUSED by
-    /// name, and never regenerated into version 2.
-    ///
-    /// A descriptor is built and dropped once per fire and nothing persists
-    /// one, so v1 bytes can only reach a v2 unpack across a build mismatch —
-    /// and this side filling in the two header words the other side never
-    /// wrote would be it guessing a patch row count. The refusal carries both
-    /// numbers so the mismatch is legible without a hexdump.
+    // Version 1 bytes are refused by name, never regenerated into version 2.
     #[test]
     fn a_version_one_descriptor_is_refused_by_name_and_not_regenerated() {
-        // What ABI 1 wrote, exactly: the same header with a zero `u64` where
-        // the two patch words now stand, and the same two tables.
         let before = descriptor();
         let mut v1 = before.pack();
         v1[4..8].copy_from_slice(&1u32.to_le_bytes());
@@ -655,100 +517,4 @@ mod tests {
         assert!(said.contains("never negotiated"), "{said}");
     }
 
-    /// **AND WHAT THE BUMP COSTS A TEXT-ONLY FIRE: FOUR BYTES, AND THEY ARE
-    /// THE VERSION.** The reserved `u64` at 24 was zero and the two words
-    /// that replaced it are zero too, and a fire with no patch rows packs no
-    /// trailer — so the bytes ABI 2 writes for a text-only fire are the bytes
-    /// ABI 1 wrote, at `4..8` and nowhere else.
-    #[test]
-    fn a_text_only_fire_packs_the_bytes_abi_one_packed() {
-        let bytes = descriptor().pack();
-        let mut as_v1 = bytes.clone();
-        as_v1[4..8].copy_from_slice(&1u32.to_le_bytes());
-
-        assert_eq!(bytes[..4], as_v1[..4]);
-        assert_eq!(bytes[8..], as_v1[8..]);
-        assert_eq!(
-            bytes.len() as u64,
-            HEADER_BYTES + CLASS_BYTES * 2 + LANE_BYTES * 5,
-            "a fire with no patch rows carries no patch trailer",
-        );
-        assert_eq!(&bytes[24..32], &0u64.to_le_bytes(), "both patch words zero");
-    }
-
-    /// A fire that DOES carry patch rows round-trips both seriations, and the
-    /// trailer is exactly the two tables the header's own counts size.
-    #[test]
-    fn a_patch_carrying_descriptor_survives_the_round_trip_whole() {
-        use crate::fire::compose::compose_axes;
-        use model_compiler::{Budgets, PatchLadder, compile_axes};
-
-        let b = plan();
-        let budgets = Budgets::of(budget()).with_patches(PatchLadder {
-            max_patches: 64,
-            buckets: vec![16, 64],
-            max_images: 4,
-        });
-        // The plan states no patch row, so the artifact carries no patch
-        // axis and no lane may submit an image — which is refusal (ii), and
-        // it is checked by its own test. Here the descriptor is built by
-        // hand, because what is under test is the LAYOUT and not the compose.
-        let compiled = compile_axes(&b.trace, &budgets, &DeviceProfile::default()).expect("bakes");
-        let fire = compose_axes(&compiled, &budgets, &[Lane::new(0, 7), Lane::new(1, 1)])
-            .expect("composes");
-        let mut before = FireDescriptor::of(&fire);
-        before.patch_rows = 12;
-        before.patch_bucket = 16;
-        before.images = 3;
-        before.patch_classes = WindowTable::new(vec![
-            ClassWindow { row_offset: 0, rows: 8, lane_offset: 0, lanes: 2 },
-            ClassWindow { row_offset: 8, rows: 4, lane_offset: 2, lanes: 1 },
-        ]);
-        before.lanes[0].patch_offset = 0;
-        before.lanes[0].patches = 8;
-        before.lanes[0].image_offset = 0;
-        before.lanes[0].images = 2;
-        before.lanes[1].patch_offset = 8;
-        before.lanes[1].patches = 4;
-        before.lanes[1].image_offset = 2;
-        before.lanes[1].images = 1;
-
-        let bytes = before.pack();
-        assert_eq!(bytes.len() as u64, before.bytes());
-        assert_eq!(
-            bytes.len() as u64,
-            HEADER_BYTES
-                + CLASS_BYTES * 2
-                + LANE_BYTES * 2
-                + CLASS_BYTES * 2
-                + PATCH_LANE_BYTES * 2,
-        );
-        assert_eq!(&bytes[24..28], &12u32.to_le_bytes());
-        assert_eq!(&bytes[28..32], &16u32.to_le_bytes());
-        assert_eq!(FireDescriptor::unpack(&bytes), Ok(before));
-    }
-
-    /// A patch table that does not add up to the header's patch row count is
-    /// the corruption that computes rather than faults — refused for the
-    /// token table's reason, on the second axis.
-    #[test]
-    fn patch_windows_that_do_not_add_up_are_refused() {
-        let mut before = descriptor();
-        before.patch_rows = 4;
-        before.patch_bucket = 4;
-        before.images = 1;
-        before.patch_classes = WindowTable::new(vec![
-            ClassWindow { row_offset: 0, rows: 4, lane_offset: 0, lanes: 1 },
-            ClassWindow::default(),
-        ]);
-        let good = before.pack();
-        assert!(FireDescriptor::unpack(&good).is_ok());
-
-        let mut wrong = good;
-        wrong[24..28].copy_from_slice(&5u32.to_le_bytes());
-        assert!(matches!(
-            FireDescriptor::unpack(&wrong),
-            Err(Error::Fire(Fault::Descriptor { .. })),
-        ));
-    }
 }

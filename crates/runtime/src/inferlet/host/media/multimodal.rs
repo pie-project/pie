@@ -1,34 +1,12 @@
-//! Host-side image, video and audio preprocessing — the arithmetic that turns
-//! encoded bytes into the patches, positions and log-mel frames a model was
-//! trained on.
+//! Host-side image, video and audio preprocessing — the arithmetic that
+//! turns encoded bytes into the patches, positions and log-mel frames a
+//! model was trained on. `media.rs` is the only caller in this crate.
 //!
-//! IT CAME FROM `models::serve::multimodal`, and it is here because M18 ruled
-//! that module out of `model`: that crate says what a model family *is*,
-//! backend-blind, and a `CatmullRom` resize behind twenty image crates is not
-//! a family fact. It was already the one part of `serve` behind a feature
-//! flag, for the same reason stated the other way round — an engine links
-//! `model` for its catalog and must not link a JPEG decoder to get one.
-//!
-//! So it lands beside its one consumer. `media.rs` is the only caller in the
-//! tree, the `image` dependency is this crate's now, and the flag is gone:
-//! a runtime that serves inferlets decodes media, and there is no build of it
-//! that does not.
-//!
-//! **AND THE VISION HALF IS GONE** (wave MD-C). Everything this module held
-//! about images — `GemmaImageConfig`, `QwenVisionConfig`, `Processor`,
-//! `ProcessedImage`, the patchifiers, the delimiter and placeholder tables —
-//! was the campaign's transcription written where a test helper could reach
-//! it, and `models::media` (the family modules `models::qwen_3::media`,
-//! `models::gemma_4::media`) is that arithmetic again with goldens
-//! pinning it against the reference processors (wave MD-B). Two spellings of
-//! one preprocessing is what article 8 forbids, and the surviving copy is the
-//! one a golden holds to its answer. What is left here is the two things
-//! the front-ends do not do: GIF demuxing, and gemma's audio front-end.
-//!
+//! Image preprocessing lives in `models::media` (with goldens pinning it
+//! against the reference processors). What is left here is what the
+//! front-ends do not do: GIF demuxing, and gemma's audio front-end.
 //! Dispatch is off the served model's `arch_name` —
-//! `models::media::vision_front_end` and [`audio_arch_supported`] — which is a
-//! serving row's column, so the processor and the chat template are chosen
-//! from the same fact.
+//! `models::media::vision_front_end` and [`audio_arch_supported`].
 
 use image::DynamicImage;
 

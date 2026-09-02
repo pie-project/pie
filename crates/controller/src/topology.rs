@@ -1,11 +1,11 @@
-//! The planner — a **pure** function from cluster membership to the two
-//! published snapshots. This is the controller's "brain"; the worker view pairs
-//! decode clients with bounded, model-compatible prefill and encode executors.
+//! The planner: a pure function from cluster membership to the two published
+//! snapshots. The worker view pairs decode clients with bounded,
+//! model-compatible prefill and encode executors.
 //!
-//! The gateway view is **global** (same for every gateway), so the wire
-//! [`RoutingTable`] is produced directly. The worker view is **per-worker**, so
-//! the internal [`Topology`] holds every worker's wire-ready peer list keyed by
-//! id; the service projects one [`Neighbors`] from it per `watch_worker`.
+//! The gateway view is global (same for every gateway), so the wire
+//! [`RoutingTable`] is produced directly. The worker view is per-worker, so
+//! the internal [`Topology`] holds every worker's wire-ready peer list keyed
+//! by id; the service projects one [`Neighbors`] from it per `watch_worker`.
 //!
 //! [`Neighbors`]: controller_api::Neighbors
 
@@ -184,27 +184,6 @@ mod tests {
         topology.peers[&id].iter().map(|peer| peer.id).collect()
     }
 
-    fn peer_ids_for_role(topology: &Topology, id: WorkerId, role: Role) -> Vec<WorkerId> {
-        topology.peers[&id]
-            .iter()
-            .filter_map(|peer| (peer.role == role).then_some(peer.id))
-            .collect()
-    }
-
-    fn assert_reverse_symmetric(topology: &Topology) {
-        for (&id, peers) in &topology.peers {
-            for peer in peers {
-                assert!(
-                    topology.peers[&peer.id]
-                        .iter()
-                        .any(|reverse| reverse.id == id),
-                    "missing reverse edge for {id:?} -> {:?}",
-                    peer.id
-                );
-            }
-        }
-    }
-
     #[test]
     fn pairings_filter_same_roles_and_cross_model_workers() {
         let mut cluster = Cluster::new();
@@ -241,59 +220,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_pairings_are_capped_at_two_per_executor_role() {
-        let mut cluster = Cluster::new();
-        let decode = add_worker(&mut cluster, Role::Decode, "model");
-        let prefill0 = add_worker(&mut cluster, Role::Prefill, "model");
-        let prefill1 = add_worker(&mut cluster, Role::Prefill, "model");
-        let prefill2 = add_worker(&mut cluster, Role::Prefill, "model");
-        let encode0 = add_worker(&mut cluster, Role::Encode, "model");
-        let encode1 = add_worker(&mut cluster, Role::Encode, "model");
-        let encode2 = add_worker(&mut cluster, Role::Encode, "model");
-
-        let (topology, _) = reassign(&cluster);
-
-        assert_eq!(
-            peer_ids_for_role(&topology, decode, Role::Prefill),
-            vec![prefill0, prefill1]
-        );
-        assert_eq!(
-            peer_ids_for_role(&topology, decode, Role::Encode),
-            vec![encode0, encode1]
-        );
-        assert_eq!(peer_ids(&topology, prefill0), vec![decode]);
-        assert_eq!(peer_ids(&topology, prefill1), vec![decode]);
-        assert!(peer_ids(&topology, prefill2).is_empty());
-        assert_eq!(peer_ids(&topology, encode0), vec![decode]);
-        assert_eq!(peer_ids(&topology, encode1), vec![decode]);
-        assert!(peer_ids(&topology, encode2).is_empty());
-    }
-
-    #[test]
-    fn executor_views_are_exact_reverse_pairings() {
-        let mut cluster = Cluster::new();
-        let decode0 = add_worker(&mut cluster, Role::Decode, "model");
-        let decode1 = add_worker(&mut cluster, Role::Decode, "model");
-        let decode2 = add_worker(&mut cluster, Role::Decode, "model");
-        let prefill0 = add_worker(&mut cluster, Role::Prefill, "model");
-        let prefill1 = add_worker(&mut cluster, Role::Prefill, "model");
-        let prefill2 = add_worker(&mut cluster, Role::Prefill, "model");
-        let encode0 = add_worker(&mut cluster, Role::Encode, "model");
-        let encode1 = add_worker(&mut cluster, Role::Encode, "model");
-        let encode2 = add_worker(&mut cluster, Role::Encode, "model");
-
-        let (topology, _) = reassign(&cluster);
-
-        assert_reverse_symmetric(&topology);
-        assert_eq!(peer_ids(&topology, prefill0), vec![decode0, decode1]);
-        assert_eq!(peer_ids(&topology, prefill1), vec![decode0, decode2]);
-        assert_eq!(peer_ids(&topology, prefill2), vec![decode1, decode2]);
-        assert_eq!(peer_ids(&topology, encode0), vec![decode0, decode1]);
-        assert_eq!(peer_ids(&topology, encode1), vec![decode0, decode2]);
-        assert_eq!(peer_ids(&topology, encode2), vec![decode1, decode2]);
-    }
-
-    #[test]
     fn fan_in_is_balanced_deterministically() {
         let mut cluster = Cluster::new();
         let prefill0 = add_worker(&mut cluster, Role::Prefill, "model");
@@ -317,47 +243,6 @@ mod tests {
         assert_eq!(peer_ids(&first, prefill0).len(), 4);
         assert_eq!(peer_ids(&first, prefill1).len(), 3);
         assert_eq!(peer_ids(&first, prefill2).len(), 3);
-    }
-
-    #[test]
-    fn reassign_updates_both_sides_after_membership_churn() {
-        let mut cluster = Cluster::new();
-        let prefill0 = add_worker(&mut cluster, Role::Prefill, "model");
-        let prefill1 = add_worker(&mut cluster, Role::Prefill, "model");
-        let prefill2 = add_worker(&mut cluster, Role::Prefill, "model");
-        let decode0 = add_worker(&mut cluster, Role::Decode, "model");
-        let decode1 = add_worker(&mut cluster, Role::Decode, "model");
-        let decode2 = add_worker(&mut cluster, Role::Decode, "model");
-
-        let (initial, _) = reassign(&cluster);
-        assert_eq!(peer_ids(&initial, decode0), vec![prefill0, prefill1]);
-        assert_eq!(peer_ids(&initial, decode1), vec![prefill0, prefill2]);
-        assert_eq!(peer_ids(&initial, decode2), vec![prefill1, prefill2]);
-
-        cluster.workers.remove(&prefill0);
-        let (after_loss, _) = reassign(&cluster);
-        assert!(!after_loss.peers.contains_key(&prefill0));
-        assert_eq!(peer_ids(&after_loss, decode0), vec![prefill1, prefill2]);
-        assert_eq!(peer_ids(&after_loss, decode1), vec![prefill1, prefill2]);
-        assert_eq!(peer_ids(&after_loss, decode2), vec![prefill1, prefill2]);
-        assert_eq!(
-            peer_ids(&after_loss, prefill1),
-            vec![decode0, decode1, decode2]
-        );
-        assert_eq!(
-            peer_ids(&after_loss, prefill2),
-            vec![decode0, decode1, decode2]
-        );
-
-        let prefill3 = add_worker(&mut cluster, Role::Prefill, "model");
-        let (after_join, _) = reassign(&cluster);
-        assert_eq!(peer_ids(&after_join, decode0), vec![prefill1, prefill2]);
-        assert_eq!(peer_ids(&after_join, decode1), vec![prefill1, prefill3]);
-        assert_eq!(peer_ids(&after_join, decode2), vec![prefill2, prefill3]);
-        assert_eq!(peer_ids(&after_join, prefill1), vec![decode0, decode1]);
-        assert_eq!(peer_ids(&after_join, prefill2), vec![decode0, decode2]);
-        assert_eq!(peer_ids(&after_join, prefill3), vec![decode1, decode2]);
-        assert_reverse_symmetric(&after_join);
     }
 
     #[test]

@@ -1,39 +1,16 @@
 //! Remote executor partners: the registry and the admission accounting, and a
-//! named hole where the transport was.
+//! named hole where the transport goes — remote is a property of a transport,
+//! not an encoding of a contract, so nothing here moves bytes.
 //!
-//! # `palo B-remote`: what this module lost, and why it kept its shape
-//!
-//! Every verb that moved bytes lived on `engine::remote` —
-//! `ExecutorRpcClient`, `ExecutorRequest`/`ExecutorResponse`, `PushKv`,
-//! `InlineKvPayload`, `RemoteEncode`, `RemoteEmbeddings`, `RemoteMediaBlob`,
-//! `ScratchGrant`, `REMOTE_WIRE_VERSION` — and the palo contract rewrite
-//! deleted the module whole, on the ruling that remote is a property of a
-//! transport and not an encoding of a contract (design §7, decision 19). So
-//! the ~1,300 lines that framed those messages are gone: the inline KV push
-//! and its host-side region import, the encode blob server and its TCP
-//! listener, the surrogate-instance cache, the prefix-adoption planner, and
-//! `try_prefill`.
-//!
-//! What is NOT gone is everything above the wire, because none of it was
-//! about the wire:
-//!
-//! * the **registry** — which peers exist, in which role, behind which
-//!   `EngineId`;
-//! * the **admission accounting** — `max_outstanding`, the claim/release
-//!   guard, the drain notification, power-of-two-choices selection;
-//! * the **settings** and the **counters** an operator reads.
-//!
-//! A registered peer is an `EngineId` like any other, and the engine behind it
-//! is `crate::engine::backend::remote::RemoteEngine`, which answers
-//! [`Error::Unsupported`](engine::Error::Unsupported) to
-//! every verb with the peer named. That is the shape the rewrite asks for: a
-//! remote engine is *a `dyn Engine` whose envelope is the transport's*, and
-//! until the transport exists the runtime can see the peer, refuse to use it,
-//! and say why — rather than silently dropping the request, which is what a
-//! stub that answered `Ok` would do.
-//!
-//! Each site the transport used to occupy carries a `palo B-remote:` marker
-//! naming what the future envelope has to carry there.
+//! What's kept is everything above the wire: the registry (which peers
+//! exist, in which role, behind which `EngineId`), admission accounting
+//! (`max_outstanding`, claim/release guard, drain notification,
+//! power-of-two-choices selection), and the settings/counters an operator
+//! reads. A registered peer's engine
+//! (`crate::engine::backend::remote::RemoteEngine`) answers
+//! [`Error::Unsupported`](engine::Error::Unsupported) to every verb, so the
+//! runtime can see the peer, refuse to use it, and say why — rather than
+//! silently dropping the request.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -51,13 +28,9 @@ pub enum PartnerRole {
     Encode,
 }
 
-/// How a peer's bytes are meant to reach this node.
-///
-/// **A RUNTIME TYPE NOW, NOT A CONTRACT ONE.** It was
-/// `engine::RemoteTransferKind`, sitting in the contract beside the tarpc
-/// service it selected a codec for. Which wire a deployment runs on is a
-/// deployment's decision and a transport's implementation; the runtime holds
-/// it because the runtime is what an operator configures.
+/// How a peer's bytes are meant to reach this node. A runtime type, not a
+/// contract one: which wire a deployment runs on is the runtime's to
+/// configure, not the contract's to encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TransferKind {
     /// The peer's pages travel inside the reply.
@@ -67,11 +40,8 @@ pub enum TransferKind {
     Nixl,
 }
 
-/// One registered peer.
-///
-/// The `client: Option<ExecutorRpcClient>` field is gone with the envelope
-/// (see the module header); what is left is the identity a scheduler routes
-/// on and the accounting an admission decision reads.
+/// One registered peer: the identity a scheduler routes on and the
+/// accounting an admission decision reads.
 pub struct Partner {
     worker_id: u64,
     destination_worker_id: u64,
@@ -161,17 +131,10 @@ impl Partner {
     ///
     /// # Errors
     ///
-    /// Always, until the envelope exists.
-    ///
-    /// **`palo B-remote`**: the envelope must carry, for each direction it
-    /// serves, either the page BYTES (the old `InlineKvPayload`: a page-stride
-    /// count, the destination page ids echoed back, and one flat buffer the
-    /// caller splits per region) or an RDMA registration
-    /// ([`KvHandle`](engine::KvHandle) is serde and already says where a
-    /// pool's regions are). It must also answer which one it used, because
-    /// the caller's next act differs: an inline reply is imported region by
-    /// region on the host; an RDMA push is already done when the reply
-    /// arrives.
+    /// Always, until the envelope exists: it must carry either page bytes
+    /// or an RDMA registration
+    /// ([`KvHandle`](engine::KvHandle)), and say which one it used, since
+    /// the caller's next act differs between them.
     pub async fn pull_kv(&self, src_page_ids: Vec<u32>, dst_page_ids: Vec<u32>) -> Result<()> {
         let _ = (src_page_ids, dst_page_ids);
         Err(self.no_transport("pull_kv"))
@@ -182,13 +145,8 @@ impl Partner {
     /// # Errors
     ///
     /// Always, until the envelope exists.
-    ///
-    /// **`palo B-remote`**: [`MediaEncode`](engine::MediaEncode) is serde
-    /// and carries its own bytes, so the message is that type and the answer
-    /// is the same value with `output_rows` filled. What the envelope must
-    /// add is a SIZE policy — an encode is megabytes, the old code stood up a
-    /// TCP blob server above four of them, and a frame limit is the
-    /// transport's business rather than the contract's.
+    /// [`MediaEncode`](engine::MediaEncode) already carries its own bytes;
+    /// what the envelope must add is a size policy for large payloads.
     pub async fn encode(&self, plan: engine::MediaEncode) -> Result<engine::MediaEncode> {
         let _ = plan;
         Err(self.no_transport("encode"))
@@ -197,9 +155,8 @@ impl Partner {
     fn no_transport(&self, verb: &'static str) -> anyhow::Error {
         COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
         anyhow!(
-            "partner {} cannot serve `{verb}`: the remote envelope \
-             `engine::remote` carried was deleted by the palo contract \
-             rewrite and its successor is palo B-remote",
+            "partner {} cannot serve `{verb}`: remote executors are not \
+             supported in this release",
             self.worker_id
         )
     }
@@ -262,11 +219,7 @@ type PartnerKey = (PartnerRole, u64);
 static PARTNERS: LazyLock<RwLock<HashMap<PartnerKey, Arc<Partner>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Register a peer, replacing (and suspecting) any earlier one in the same
-/// role.
-///
-/// The `client: Option<ExecutorRpcClient>` argument is gone: there is no
-/// client type to pass. Everything else is what it was.
+/// Register a peer, replacing (and suspecting) any earlier one in the same role.
 pub fn register_partner(
     worker_id: u64,
     destination_worker_id: u64,
@@ -304,22 +257,16 @@ pub fn remove_partner(worker_id: u64, role: PartnerRole) {
     }
 }
 
-/// Close every surrogate instance an engine holds.
-///
-/// **`palo B-remote`**: a surrogate was a bound instance on the HOME engine
-/// standing in for a peer's context extension, cached by
-/// `(engine, program, home_instance)` — the prefix-adoption machinery. It
-/// went with `try_prefill`; nothing holds a surrogate now, so this has
-/// nothing to close. Kept as a door because the link layer calls it on
-/// teardown and a peer's engine going away must remain a stated event.
+/// Close every surrogate instance an engine holds. Nothing holds a surrogate,
+/// so this has nothing to close; it stays as a door the link layer calls on
+/// teardown.
 pub fn close_engine_surrogates(engine_id: usize) {
     let _ = engine_id;
 }
 
-/// Note that a home instance is gone.
-///
-/// **`palo B-remote`**: as [`close_engine_surrogates`] — the home-state table
-/// this walked existed to keep surrogates alive across a peer's answer.
+/// Note that a home instance is gone. As with
+/// [`close_engine_surrogates`], there is nothing to do while no surrogate
+/// exists.
 pub(crate) fn close_home_instance(home_instance_id: u64) {
     let _ = home_instance_id;
 }
@@ -346,10 +293,8 @@ pub fn unregister_remote_store(model_idx: usize, engine_idx: usize) -> anyhow::R
     crate::store::registry::unregister_engine(model_idx, engine_idx)
 }
 
-/// Claim the least-loaded of two random available peers in `role`.
-///
-/// Power of two choices, unchanged: the selection policy is about load, and
-/// load is not an encoding.
+/// Claim the least-loaded of two random available peers in `role`
+/// (power-of-two-choices).
 pub fn select_partner(role: PartnerRole) -> Option<PartnerGuard> {
     let candidates = PARTNERS
         .read()
@@ -433,11 +378,8 @@ pub fn configure_encode_injection(enabled: bool, hidden_size: u32) {
 }
 
 /// Publish this node's own KV pool address, so a peer can be told where to
-/// write.
-///
-/// Still meaningful with no transport: [`KvHandle`](engine::KvHandle) is
-/// a fact about this node's pool, and it is what a future envelope's hello
-/// hands over.
+/// write. Still meaningful with no transport: [`KvHandle`](engine::KvHandle)
+/// is a fact about this node's pool.
 pub fn set_home_kv_handle(handle: engine::KvHandle) {
     *HOME_KV_HANDLE.write().unwrap() = Some(handle);
 }
@@ -514,26 +456,13 @@ pub fn counters() -> OffloadCounterSnapshot {
 }
 
 /// Offer this fire's media to an encode partner, and inject the rows it
-/// answers with.
-///
-/// Answers whether anything was injected — `false` every time, for now.
-///
-/// **`palo B-remote` AND `palo B-media`, IN ONE PLACE.** Two things stand
-/// between this and working, and they are independent:
-///
-/// 1. the envelope (see [`Partner::encode`]);
-/// 2. the fire's own seat for precomputed embedding rows. The wire plan
-///    carried them inline — `embed_rows`, `embed_indptr`, `embed_shapes`,
-///    `embed_anchor_rows`, `embed_block_indptr` — and the contract does not:
-///    what a fire needs after an encode is ROWS IN THE ARENA, which is a seam
-///    the shell resolves (design §9's export ops), not a payload the
-///    submission carries. A `crate::engine::Media` struct held the payload
-///    meanwhile and nothing ever wrote one, so alto E deleted it: the
-///    payload arrives with the verb that produces it.
-///
-/// The check that the module is even configured for it is kept, so an
-/// operator who turns encode injection on and sees nothing happen gets the
-/// refusal from the partner rather than silence from here.
+/// answers with. Answers whether anything was injected — `false` every
+/// time, for now: two things are still missing and independent, the
+/// envelope ([`Partner::encode`]) and the fire's own seat for precomputed
+/// embedding rows (what a fire needs after an encode is rows in the arena,
+/// a seam the shell resolves rather than a payload the submission carries).
+/// The configured-check is kept so a caller gets the partner's refusal
+/// rather than silence from here.
 pub(crate) async fn try_encode(request: &mut crate::engine::FireRequest) -> bool {
     // The request is the seam the injected rows land on; nothing reads it
     // until there are rows to land.
@@ -555,12 +484,9 @@ pub(crate) async fn try_encode(request: &mut crate::engine::FireRequest) -> bool
     false
 }
 
-/// Forget every peer.
-///
-/// The shutdown path's door, and the only way a test can start from a known
-/// registry — which is why it stays `pub` rather than `#[cfg(test)]`: the
-/// crate's public facade re-exports it (`crate::offload`), so a `cfg` would
-/// break the export rather than document the intent.
+/// Forget every peer. The shutdown path's door, and the only way a test can
+/// start from a known registry — `pub` rather than `#[cfg(test)]` since the
+/// crate's public facade re-exports it.
 pub fn clear_partners() {
     let partners: Vec<Arc<Partner>> = PARTNERS.write().unwrap().drain().map(|(_, p)| p).collect();
     for partner in partners {
@@ -568,81 +494,3 @@ pub fn clear_partners() {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::{Mutex, MutexGuard, PoisonError};
-
-    use super::*;
-
-    /// Serializes every test that reads or writes [`PARTNERS`].
-    ///
-    /// The registry is process-global and reachable only as a global: nothing
-    /// in [`register_partner`], [`select_partner`] or [`remove_partner`] takes
-    /// a registry to act on, because a node has exactly one set of peers and
-    /// the runtime's public facade publishes those free functions as its whole
-    /// interface to it. Threading a registry handle through them would be a
-    /// production shape invented for the tests, so the honest fix is here: the
-    /// tests take turns.
-    ///
-    /// Without a turn they wipe each other. Both start by calling
-    /// [`clear_partners`], and `cargo test` runs them on separate threads by
-    /// default, so under parallelism one test's `clear_partners` drains the
-    /// peer the other just registered and its `select_partner` answers `None`
-    /// — a flake that reported three times before it was read as a shared-state
-    /// problem rather than a scheduling one.
-    static REGISTRY: Mutex<()> = Mutex::new(());
-
-    /// Take the registry for the duration of a test, empty.
-    ///
-    /// A test that fails while holding the lock poisons it, and a poisoned
-    /// lock would turn one real failure into a cascade of unrelated ones. The
-    /// state the poison warns about is exactly the state this drains on the
-    /// way in, so [`PoisonError::into_inner`] is the correct reading and not a
-    /// suppressed one.
-    fn exclusive_registry() -> MutexGuard<'static, ()> {
-        let guard = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
-        clear_partners();
-        guard
-    }
-
-    #[test]
-    fn a_claim_is_released_when_its_guard_drops() {
-        let _registry = exclusive_registry();
-        let partner = register_partner(1, 2, 7usize, PartnerRole::Prefill, 2, TransferKind::Inline);
-        let first = select_partner(PartnerRole::Prefill).expect("a peer is available");
-        assert_eq!(partner.outstanding(), 1);
-        let second = select_partner(PartnerRole::Prefill).expect("two claims fit");
-        assert_eq!(partner.outstanding(), 2);
-        assert!(
-            select_partner(PartnerRole::Prefill).is_none(),
-            "a third claim is past max_outstanding"
-        );
-        drop(second);
-        drop(first);
-        assert_eq!(partner.outstanding(), 0);
-        clear_partners();
-    }
-
-    /// Holds the registry across `await` points, which is sound here because
-    /// `#[tokio::test]` drives the future to completion on this one thread: no
-    /// other task can be scheduled onto the lock while it is parked.
-    #[tokio::test]
-    async fn every_transfer_verb_refuses_by_name_rather_than_answering_ok() {
-        let _registry = exclusive_registry();
-        let partner = register_partner(3, 4, 0usize, PartnerRole::Prefill, 1, TransferKind::Inline);
-        let error = partner
-            .pull_kv(vec![0], vec![1])
-            .await
-            .expect_err("there is no transport");
-        assert!(
-            format!("{error}").contains("palo B-remote"),
-            "the refusal names the wave that owes the envelope: {error}"
-        );
-        let error = partner
-            .encode(engine::MediaEncode::default())
-            .await
-            .expect_err("there is no transport");
-        assert!(format!("{error}").contains("palo B-remote"), "{error}");
-        clear_partners();
-    }
-}

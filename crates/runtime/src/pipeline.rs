@@ -1,30 +1,17 @@
-//! THE forward path: guest-programmed pipelines. The wire format (the IR
-//! itself) lives in `eta_ir`; this module is the runtime domain that
-//! binds/instantiates/fires it.
+//! The forward path: guest-programmed pipelines. The wire format lives in
+//! `eta_ir`; this module is the runtime domain that binds/instantiates/fires
+//! it — [`program`] (bind/price/cache), [`instance`], [`channel`],
+//! [`Pipeline`] (the in-flight fire FIFO) and [`fire`] (one fire's
+//! prepare/submit/finalize).
 //!
-//! - [`program`]: container bytes -> bind -> price -> cache; absorbs
-//!   `model_profile()`.
-//! - [`instance`]: program + seeds -> [`instance::Instance`], plus
-//!   [`instance::ForwardPass`] (the WIT `forward-pass` resource's domain
-//!   state).
-//! - [`channel`]: [`channel::ChannelCell`] host endpoint, SPSC roles, plus
-//!   [`channel::Channel`] (the WIT `channel` resource's domain state).
-//! - [`Pipeline`]: the ordering-domain resource (the WIT `pipeline` resource's
-//!   domain state) — owns the in-flight fire FIFO.
-//! - [`fire`]: one fire: prepare -> run-ahead submit -> finalize/poison, plus
-//!   `geometry`/`kv`/`rs`/`lease`.
-//!
-//! Layering: this module imports only `scheduler`/`store`/`engine` plus the
-//! `eta_ir` IR crate and external leaf crates — never `inferlet`/`server`.
-//! The WIT resource *types* live here because they hold domain state;
-//! `inferlet::host` owns only the thin `Host*` trait impls that push/get/
-//! delete them from the WASM component resource table.
+//! This module imports only `scheduler`/`store`/`engine` plus `eta_ir` and
+//! external leaf crates, never `inferlet`/`server`.
 
 pub mod channel;
 pub mod fire;
 pub mod instance;
 /// The media door's runtime half: the run scan, its refusals, and the shape
-/// the contract's `Step` wants (`.wiki/alto/media-door.md` §3/§6).
+/// the contract's `Step` wants.
 pub mod media;
 pub mod program;
 
@@ -32,18 +19,12 @@ use std::sync::{Arc, Mutex};
 
 use fire::{PendingFireQueue, PendingFires, PipelineFailure};
 
-/// A run-ahead submission pipeline (overview §3): the ORDERING domain (W3.1,
-/// WIT `pie:inferlet/pipeline.pipeline`). Owns the in-flight fire FIFO;
-/// submission order rides the scheduler queue, completion order rides this
-/// FIFO.
+/// A run-ahead submission pipeline. Owns the in-flight fire FIFO; submission
+/// order rides the scheduler queue, completion order rides this FIFO.
 ///
-/// **FIFO INVARIANT (B3, mandatory).** Every pass binding a shared channel
-/// MUST submit on the SAME pipeline (enforced by
-/// [`fire::wire_channels_to_pipeline`]) — the entire correctness argument for
-/// run-ahead + multi-pass chaining, since fire t's epilogue channel puts
-/// happen-before fire t+1's descriptor reads. Domain state, not WIT glue:
-/// `inferlet::host::pipeline` only holds the thin `Host`/`HostPipeline`
-/// impls that push/get/delete it from the WASM component resource table.
+/// Every pass binding a shared channel must submit on the same pipeline
+/// (enforced by [`fire::wire_channels_to_pipeline`]), since fire t's
+/// epilogue channel puts happen-before fire t+1's descriptor reads.
 pub struct Pipeline {
     /// This pipeline's in-flight fires, oldest first — the FIFO above.
     pub fires: PendingFires,
@@ -52,10 +33,6 @@ pub struct Pipeline {
     /// Per-lane frame sequence for Vesuvius frame submission (k > 1): each
     /// `forward.submit` frame on this pipeline takes the next number.
     pub(crate) frame_seq: std::sync::atomic::AtomicU64,
-    // This branch does not carry upstream's `PIE_DEFER_ALLOC` handle: its
-    // frame-grant queuing is superseded by this branch's kv-contention
-    // rewrite of `prepare_submission`. Default behaviour is unaffected
-    // (upstream's path is opt-in and off unless asked for).
 }
 
 impl Pipeline {

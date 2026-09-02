@@ -161,13 +161,8 @@ impl Process {
     }
 
     /// Drain process events until the process returns, returning its `Return`
-    /// value (the inferlet's `Ok(String)`). `Stdout` / `Stderr` are forwarded
-    /// to the host process's stderr for live debugging; `Message` / `File`
-    /// events are ignored. Returns `Err` on a process `Error`, or if the event
-    /// channel closes before a return.
-    ///
-    /// Convenience for the common "launch and wait for the result" flow (e.g.
-    /// test harnesses that assert on a structured-JSON return value).
+    /// value. `Stdout`/`Stderr` are forwarded to the host's stderr;
+    /// `Message`/`File` are ignored. `Err` on a process `Error` or channel close.
     pub async fn wait_for_return(&mut self) -> Result<String> {
         loop {
             match self.recv().await? {
@@ -185,11 +180,8 @@ impl Client {
         Self::connect_inner(connect_async(ws_host).await?.0)
     }
 
-    /// Connect, injecting the `x-pie-identity` trust-edge header the gateway's
-    /// `/v1/ws` upgrade requires (a missing/empty header is rejected with 401
-    /// before the socket opens — see `gateway/src/ingress/identity.rs`).
-    /// Production deployments terminate identity at the edge proxy; in-process
-    /// / standalone harnesses must supply it on the client request directly.
+    /// Connect, injecting the `x-pie-identity` trust-edge header the
+    /// gateway's `/v1/ws` upgrade requires (missing/empty is rejected with 401).
     pub async fn connect_with_identity(ws_host: &str, identity: &str) -> Result<Client> {
         let mut request = ws_host.into_client_request()?;
         request
@@ -248,38 +240,18 @@ impl Client {
 
     /// Close the connection and clean up background tasks.
     ///
-    /// **The order below is the whole function.** The writer task ends when the
-    /// last sender for its channel drops, so awaiting it while anything still
-    /// holds one waits forever. Three things hold one, and each has to go
-    /// first:
-    ///
-    ///   * `self.inner`, which owns the sender.
-    ///   * The reader task, which holds its own `Arc` clone -- and which runs
-    ///     until the *server* closes the socket. Awaiting the writer before
-    ///     stopping the reader is therefore a deadlock against a peer that is
-    ///     waiting for us, not a slow path.
-    ///   * Any live [`Process`], which also clones the `Arc`. That one is the
-    ///     caller's to drop, and is a real precondition rather than something
-    ///     to defend against here: a `Process` can still send, and closing the
-    ///     connection under an in-flight signal would be worse than waiting.
-    ///
-    /// Nothing called `close` until `pie run` did, which is how a deadlock this
-    /// total went unnoticed -- the first version of that command printed its
-    /// completion and then hung with the model still resident on the device.
+    /// Order matters: the writer task ends only when every sender for its
+    /// channel drops. `self.inner`, the reader task, and any live [`Process`]
+    /// each hold one, so the reader must stop (and its `Arc` clone drop)
+    /// before the writer is awaited — otherwise this deadlocks.
     pub async fn close(self) -> Result<()> {
         let Client {
             inner,
             reader_handle,
             writer_handle,
         } = self;
-        // Explicit and ordered, not incidental. A later edit that reorders
-        // these hangs rather than fails, which is the hardest kind of breakage
-        // to attribute.
         reader_handle.abort();
-        // Awaited, not just aborted: `abort` only asks, and the task's `Arc`
-        // lives until it actually stops. Joining it is what makes the drop
-        // below the last one. The result is the cancellation, so it is
-        // discarded rather than reported.
+        // Awaited, not just aborted: the task's `Arc` lives until it stops.
         let _ = reader_handle.await;
         drop(inner);
         writer_handle.await?;
@@ -332,13 +304,8 @@ impl Client {
             anyhow::bail!("Username '{}' rejected by engine: {}", username, result)
         }
 
-        // Early-return on a no-challenge success. The engine answers a
-        // challenge-less `AuthIdentify` in two cases the client treats as
-        // already-good: legacy key-auth disabled, or the trust-edge gateway
-        // path where the session is pre-authenticated from the verified
-        // `x-pie-identity` header (the worker session starts authenticated, so
-        // an `AuthIdentify` comes back as "Already authenticated"). Neither
-        // carries a base64 challenge, so there is nothing to sign.
+        // Two no-challenge successes: key-auth disabled, or the trust-edge
+        // gateway path where the session is already pre-authenticated.
         if result == "Authenticated (Engine disabled authentication)"
             || result == "Already authenticated"
         {
@@ -654,10 +621,8 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
                     .insert(file_hash.clone(), Mutex::new(state));
             }
 
-            // Accumulate chunk data, then drop all guards before any remove().
-            // SAFETY: We must drop the DashMap Ref guard before calling .remove(),
-            // because .get() holds a shard read-lock and .remove() needs a write-lock
-            // on the same shard — holding both would deadlock.
+            // The DashMap Ref guard must drop before .remove(): .get() holds a
+            // shard read-lock and .remove() needs a write-lock on the same shard.
             let is_last = chunk_index == total_chunks - 1;
             if let Some(state_mutex) = inner.pending_downloads.get(&file_hash) {
                 let mut state = state_mutex.lock().await;

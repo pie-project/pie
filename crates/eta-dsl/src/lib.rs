@@ -1,22 +1,6 @@
-//! # `eta-dsl` — the ETA embedded DSL (Rust SDK)
-//!
-//! Author *programmable dataflows* as Rust closures that trace **once** into a
-//! canonical ETA trace container. A program is a closure whose effects are
-//! channel `put`/`take`s; `if`/`for` resolve at trace time, so a different
-//! branch is a different program (batch-by-program).
-//!
-//! This crate is the boundary-agnostic authoring core: the `Tensor`/`Channel`
-//! eDSL, the trace-recording session, the SDK span lints, and the neutral
-//! [`Builder`] that lowers stage closures and descriptor-port bindings into
-//! [`TraceContainer`](eta_ir::container::TraceContainer). It does **not**
-//! bind and knows nothing of WIT; the author-facing lifetime objects live in
-//! `inferlet`, which wraps the WIT resources and drives this builder.
-//!
-//! Two Rust-imposed deviations from the spec: model constants are functions
-//! (`intrinsics::vocab()`) rather than bare paths, and a value reused as an op
-//! operand takes `&`. A bare integer literal resolves to `i32`, but a scalar
-//! adopts the dtype of the tensor it meets, so the suffix only matters between
-//! two scalars.
+//! `eta-dsl`: the ETA embedded DSL (Rust SDK). Authors trace Rust closures
+//! once into a canonical [`TraceContainer`](eta_ir::container::TraceContainer)
+//! via [`Builder`]; it knows nothing of WIT, which `inferlet` wraps around it.
 
 extern crate alloc;
 

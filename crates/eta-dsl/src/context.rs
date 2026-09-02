@@ -1,11 +1,6 @@
-//! The trace-recording context: a thread-local **session** holding the stage
-//! currently being traced plus the channel registry. Channel/Tensor methods
-//! consult it — inside a traced stage closure they record the IR's canonical
-//! [`eta::op::Op`](eta_ir::op::Op); on the host they take the
-//! async path.
-//!
-//! Single-threaded by construction (wasm inferlets; host tests run each trace on
-//! one thread). `std` provides the `thread_local!`.
+//! The trace-recording context: a thread-local session holding the stage
+//! currently being traced plus the channel registry. Single-threaded by
+//! construction (wasm inferlets; host tests run each trace on one thread).
 
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -89,18 +84,10 @@ impl Recorder {
         }
     }
 
-    /// Records `op` and returns the id of its first result.
-    ///
-    /// The SSA id space has exactly one authority: `Op::result_count`. Every
-    /// consumer downstream -- `infer`, `stage_signature`, the container
-    /// encoder -- walks the op list advancing by it, so if the recorder
-    /// advanced by anything else the two numberings would separate and every
-    /// later id would name a different value. That is not a crash; it is a
-    /// structurally valid program that computes something else.
-    ///
-    /// So `result_tys` is checked against it rather than trusted, and with a
-    /// real assert — not a `debug_assert_eq!` — because debug-asserts are
-    /// compiled out of the release builds that actually run guest traces.
+    /// Records `op` and returns the id of its first result. `result_tys` is
+    /// checked against `op.result_count()` (a real assert, not
+    /// debug-only, since debug-asserts are compiled out of release guest
+    /// traces) — a mismatch would silently shift every later value id.
     fn push(&mut self, op: Op, result_tys: &[ValueType]) -> u32 {
         let base = self.types.len() as u32;
         assert_eq!(
@@ -161,39 +148,11 @@ thread_local! {
     /// constructor, which runs ahead of the trace body. Drained by
     /// [`with_session`] into the session it belongs to.
     static PENDING: RefCell<Vec<TraceError>> = const { RefCell::new(Vec::new()) };
-    /// gid → channel state, for the whole guest: the guest-facing
-    /// Channel is a Copy TOKEN holding only its gid; every op resolves
-    /// the shared state through this registry. Populated at construction,
-    /// owned here — handle lifetime belongs to the registry, not to leaked
-    /// references.
-    ///
-    /// ## The strong `Rc` is the design, not a leak
-    ///
-    /// This map holds a strong [`ChannelRef`] and nothing drops it when the
-    /// last user-visible handle goes away. That reads like a leak and is
-    /// worth stating plainly that it is not: the SDK's `Channel`
-    /// (`crates/inferlet/src/eta.rs`) is `Copy` and stores *only* a gid,
-    /// resolving through [`channel_state_by_gid`] on every operation. There
-    /// is no handle whose drop could mean "nobody wants this channel" —
-    /// a `Weak` here would free state that a live token still names, and
-    /// clearing the map at the end of a trace session would break the
-    /// host-side `put`/`take` that run after tracing. The registry *is* the
-    /// owner, so entries live until something says otherwise.
-    ///
-    /// ## What "otherwise" means
-    ///
-    /// [`release_channel_state`] is that something, and it is the only way
-    /// out. Until a caller invokes it, the retention is unbounded: a guest
-    /// that constructs a channel per request accumulates one entry per
-    /// request for the process's life. That is acceptable for the current
-    /// shape of an inferlet — channels are declared once at model setup, not
-    /// per request — and it is a real bug for any guest that does otherwise,
-    /// which is why the release path exists rather than being left implicit.
-    ///
-    /// Releasing is a decision only the frontend can make, because only it
-    /// knows a token will never be used again; the DSL cannot infer it from
-    /// a `Copy` token. The SDK keeps a second, parallel registry for WIT
-    /// handles and needs the mirrored release to fully reclaim a channel.
+    /// gid -> channel state. The guest-facing `Channel` is a `Copy` token
+    /// holding only its gid; every op resolves shared state through this
+    /// registry, which owns entries until [`release_channel_state`] is
+    /// called (unbounded retention otherwise — acceptable since channels are
+    /// declared once at model setup, not per request).
     static CHANNELS_BY_GID: RefCell<alloc::collections::BTreeMap<u64, ChannelRef>> =
         const { RefCell::new(alloc::collections::BTreeMap::new()) };
 }
@@ -247,13 +206,8 @@ pub(crate) fn with_session<R>(
 }
 
 /// Record an authoring mistake for the next [`Builder::build`] to report.
-///
-/// Channels are declared before the trace runs, so this has to work with no
-/// session active: a mistake made while building a `Channel` is still a
-/// mistake in the trace that channel belongs to. Errors recorded early land in
-/// [`PENDING`] and [`with_session`] adopts them, which keeps the alternative —
-/// panicking whenever no session happens to be open — out of a crate that
-/// traces inside a wasm guest.
+/// Works with no session active (channels are declared before the trace
+/// runs): errors land in [`PENDING`] and [`with_session`] adopts them.
 ///
 /// [`Builder::build`]: crate::builder::Builder::build
 pub(crate) fn record_error(detail: String, span: Span) {
@@ -346,23 +300,11 @@ pub(crate) fn record_channel_read(ch: &ChannelRef, consume: bool, span: Span) ->
 /// Record a channel `put` inside a stage (the value id must already match the
 /// channel's shape+dtype — the caller reshapes as needed).
 ///
-/// A put is a *producer* op and stays context-free for ordinary channels: an
-/// unconsumed put sits in the ring (dropped at instance teardown) or
-/// back-pressures honestly at ring-full. After `pipeline.close`, an
-/// already-submitted put still blocked with no attached consumer and no host
-/// role is a definite deadlock, surfaced by the fire's retry classifier.
-///
-/// The one exception is a channel bound to a **peeked** descriptor port
-/// ([`eta_ir::registry::Port::consumes`] false — geometry and masks). The
-/// descriptor phase reads its front without draining, so a bare re-put would
-/// grow the ring by one every fire until the port is reading a stale head
-/// behind a wall of queued updates. Such a put therefore drains first, and the
-/// author never has to know which side of `consumes()` a port falls on.
-///
-/// This is safe in every combination because take is a per-pass *flag*, not a
-/// counter (`Overlay::taken` is a `Vec<bool>`; the ring index bumps at most
-/// once per fire): a channel the guest already took explicitly is skipped
-/// here, and even a redundant take could not over-consume.
+/// A channel bound to a peeked descriptor port ([`eta_ir::registry::Port::consumes`]
+/// false — geometry and masks) is drained first: the descriptor phase reads
+/// its front without draining, so a bare re-put would grow the ring forever.
+/// Safe even if the guest already took explicitly, since take is a per-pass
+/// flag and not a counter.
 pub(crate) fn record_channel_put(ch: &ChannelRef, value: u32, span: Span) {
     SESSION.with_borrow_mut(|s| {
         let sess = s.as_mut().expect("session active");

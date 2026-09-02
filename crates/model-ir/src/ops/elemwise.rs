@@ -5,6 +5,18 @@ use crate::value::ValueId;
 
 /// Per-token math — tokens are independent. Per-token reductions like
 /// rmsnorm's mean-of-squares belong here.
+/// The YaRN interpolation a partial rope states beside its theta: the
+/// reference's `precompute_freqs(dim, original_seq_len, base, factor,
+/// beta_fast, beta_slow)` with `original_seq_len > 0`. The ramp bounds are
+/// derived on the device side from these and the rotated width.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Yarn {
+    pub factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    pub original_max_position: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Elementwise {
     Rmsnorm {
@@ -40,60 +52,18 @@ pub enum Elementwise {
         eps: f32,
         y: ValueId,
     },
-    /// **THE CENTRED NORM, AND THE ONLY PART OF A `LayerNorm` THAT DOES NOT
-    /// BAKE** (multimodal §6.1).
-    ///
-    /// `y = (x - mean(x)) / rms(x - mean(x))`, with no scale and no bias.
-    /// Every qwen vision block is `nn.LayerNorm` — the checkpoints publish
-    /// `blocks.{l}.norm1.bias` beside `.weight` to prove it, and an RMSNorm
-    /// has no bias — but the two learned vectors are not this op's business:
-    /// for the GEMM `M` that reads the norm,
-    /// `LN(x)·Mᵀ = (c/rms(c))·diag(w)·Mᵀ + b·Mᵀ` with `c = x − mean(x)`, so
-    /// `w` folds into `M` at import and `b·Mᵀ` folds into that GEMM's bias.
-    /// The merger's own norm folds the same way through the 2×2 merge, which
-    /// is a view. What is left over is exactly this row.
-    ///
-    /// A SEPARATE VARIANT FROM [`RmsnormNoScale`](Elementwise::RmsnormNoScale)
-    /// and not a flag on it: the mean subtraction is a second reduction over
-    /// the row, so the two are different kernels and not one kernel under a
-    /// boolean. gemma4's tower is RMSNorm (weight only) and reads the older
-    /// row unchanged.
-    ///
-    /// No `head_dim`: the towers norm whole rows. The per-head spelling is
-    /// the rms family's because a trunk norms its heads, and a variant with
-    /// a field nothing states would be a promise this campaign cannot check.
+    /// The centred norm: `y = (x - mean(x)) / rms(x - mean(x))`, no scale, no
+    /// bias. Separate from [`RmsnormNoScale`](Elementwise::RmsnormNoScale)
+    /// since the mean subtraction is a second reduction, a different kernel.
     LayernormNoScale {
         x: ValueId,
         eps: f32,
         y: ValueId,
     },
-    /// **THE WHOLE `nn.LayerNorm`, IN ONE ROW** (multimodal §9.1's owed
-    /// saving, next.md B5).
-    ///
-    /// `y = (x − mean(x)) · rsqrt(var(x) + eps) · w + b`, whole rows, the
-    /// scale and the bias read as `[width]` planes.
-    ///
-    /// **WHY THIS EXISTS BESIDE
-    /// [`LayernormNoScale`](Elementwise::LayernormNoScale).** §9.1 found the
-    /// import fold half-expressible — `Expr::Scale` bakes `w` into the GEMM
-    /// behind the norm, `Expr::Bias` adds one compile-time constant where
-    /// `b·Mᵀ` is a matrix-vector product, and the two do not compose — so the
-    /// towers spell the norm at RUNTIME. The spelling that stood until this
-    /// row is three nodes:
-    ///
-    /// ```text
-    /// add_bias(b, rmsnorm(layernorm_no_scale(x, eps), w, eps))
-    /// ```
-    ///
-    /// which is TWO elementwise passes and a third launch for the bias, times
-    /// twenty-five norms per qwen35 tower fire (`norm1`/`norm2` on twelve
-    /// blocks, plus `merger.norm`). This row is those three, and the
-    /// centred row it computes is never rounded to a storage type on the way
-    /// through — which is the one thing the composition cannot claim.
-    ///
-    /// The scale-less variant STAYS: it is what a text writes when the scale
-    /// really does bake, and the two differ in what they read and not in a
-    /// flag.
+    /// The whole `nn.LayerNorm` in one row: `y = (x - mean(x)) *
+    /// rsqrt(var(x) + eps) * w + b`, scale/bias read as `[width]` planes.
+    /// Exists beside [`LayernormNoScale`](Elementwise::LayernormNoScale)
+    /// because the import fold can't express this pair.
     Layernorm {
         x: ValueId,
         weight: ValueId,
@@ -101,14 +71,9 @@ pub enum Elementwise {
         eps: f32,
         y: ValueId,
     },
-    /// **THE HYPER-CONNECTION NORM** (qwen4's gated residual): moments per
-    /// `group`-wide slice, scale by `weight + 1` over the row's FULL width.
-    ///
-    /// [`RmsnormPerHeadPlusOne`](Elementwise::RmsnormPerHeadPlusOne) is the
-    /// near-miss, and the difference is the weight's width: a q/k norm shares
-    /// one `[head_dim]` plane across every head, while a residual stream's
-    /// scale is its own — `hc_norm.weight` is `[streams · hidden]` and no
-    /// two streams agree. So the moments group and the scale does not.
+    /// Hyper-connection norm (qwen4): moments per `group`-wide slice, scaled
+    /// by `weight + 1` over the full row width (per-stream weight, unlike
+    /// [`RmsnormPerHeadPlusOne`](Elementwise::RmsnormPerHeadPlusOne)).
     RmsnormGroupedPlusOne {
         x: ValueId,
         weight: ValueId,
@@ -116,65 +81,25 @@ pub enum Elementwise {
         eps: f32,
         y: ValueId,
     },
-    /// **THE CLIPPED LINEAR'S HALF THAT IS NOT A GEMM** (multimodal §6.5).
-    ///
-    /// `x = min(max(x, lo), hi)`, in place, with both bounds TRACE CONSTANTS.
-    /// gemma4's `vision_config.use_clipped_linears: true` publishes
-    /// `{input,output}_{min,max}` as scalars beside every
-    /// `encoder.layers.{l}.*.linear.weight`, so each projection clamps what it
-    /// reads and what it writes; the scalars are the checkpoint's and are
-    /// baked at import like every other number a text states.
-    ///
-    /// The only clamp this IR had was FUSED inside `linear.mlp_swiglu_clamp`,
-    /// which is a swiglu and not a projection. This one is free-standing for
-    /// the reason the clamp sites are: they sit on both sides of an ordinary
-    /// matmul, and a fused spelling would need one fusion per projection
-    /// shape.
+    /// `x = min(max(x, lo), hi)`, in place, bounds as trace constants
+    /// (gemma4's `use_clipped_linears`).
     Clamp {
         x: ValueId,
         lo: f32,
         hi: f32,
         x_out: ValueId,
     },
-    /// **THE SAME CLAMP, WITH THE BOUNDS THE CHECKPOINT STATES**
-    /// (multimodal §12.2): `lo` and `hi` are `[1]` weight planes read on the
-    /// device instead of two trace constants.
-    ///
-    /// `Gemma4ClippableLinear` clamps its input to `[input_min, input_max]`
-    /// and its output to `[output_min, output_max]`, and the E4B checkpoint
-    /// ships all of them FINITE — 448 scalars over the vision tower alone
-    /// (16 layers × 7 linears × 4), `mlp.down_proj.input_max = 12.1875` and so
-    /// on down. They are saturating bounds from quantization-aware training
-    /// and they differ per linear.
-    ///
-    /// **SO A TEXT CANNOT KNOW THEM.** A trace is built by `Model::new(w, kv,
-    /// tp, dims)` with no checkpoint in the room — that is the whole point of
-    /// the split — and a catalog row carrying 448 of them would be a
-    /// checkpoint transcribed into a `const`.
-    ///
-    /// **THE PRECEDENT IS IN THE FAMILY ALREADY**:
-    /// [`Scale`](Elementwise::Scale) reads a DEVICE-HELD scalar where
-    /// [`MulScalar`](Elementwise::MulScalar) states one, for exactly this
-    /// reason. Two rows and not one with an `Option`, for that pair's reason
-    /// too: a bound the CONFIG states is a different fact from a bound the
-    /// checkpoint ships, and `swiglu_limit` is the first kind — which is why
-    /// [`Clamp`](Elementwise::Clamp) stays and `linear.mlp_swiglu_clamp` keeps
-    /// its `f32`.
-    ///
-    /// Same kernel, same launch, one argument apart: the bounds ride the
-    /// activation's element, as `Scale`'s scalar does.
+    /// The same clamp, with `lo`/`hi` as `[1]` device-held planes instead of
+    /// trace constants (checkpoints shipping per-linear QAT bounds).
     ClampLearned {
         x: ValueId,
         lo: ValueId,
         hi: ValueId,
         x_out: ValueId,
     },
-    /// `x` is f32; the norm is gated by `act(gate)`, per group of `head_dim`.
-    ///
-    /// `act` is the checkpoint's `output_gate_type`: qwen3.5's GDN gates by
-    /// `silu`, qwen4's by `sigmoid`, and everything else about the site — the
-    /// f32 SSM output, the per-`v_dim` grouping, the ungated `weight` — is
-    /// identical, so the activation is a field and not a second variant.
+    /// `x` is f32; the norm is gated by `act(gate)`, per group of
+    /// `head_dim`. `act` is the checkpoint's `output_gate_type` (qwen3.5:
+    /// silu, qwen4: sigmoid).
     RmsnormGated {
         x: ValueId,
         gate: ValueId,
@@ -203,44 +128,8 @@ pub enum Elementwise {
         out: ValueId,
         out_out: ValueId,
     },
-    /// **THE VISION TOWER'S OUTPUT STANDARDIZATION** (`vision_config.
-    /// standardize: true`): `y = (x − bias) · scale`, per COLUMN, both planes
-    /// `[width]`, in place.
-    ///
-    /// `Gemma4VisionModel.forward` ends
-    ///
-    /// ```text
-    /// hidden_states = (hidden_states - self.std_bias.float()) * self.std_scale.float()
-    /// ```
-    ///
-    /// after the pooler's `√hidden` scaling and before the multimodal
-    /// embedder's projection. The two `[hidden]` buffers ride the checkpoint
-    /// (`vision_tower.std_{bias,scale}`) and only the towers that state the
-    /// flag ship them: gemma4's 27-block 1152-wide tower does, E4B's
-    /// 16-block 768-wide one does not.
-    ///
-    /// **WHY IT IS A ROW AND NOT A FOLD.** Both halves are per-column affine
-    /// and the node behind them is a GEMM, so the obvious move is to fold —
-    /// and §9.1 already measured that this pair does not compose: `Expr::Scale`
-    /// bakes a column scale into the bank, `Expr::Bias` adds a compile-time
-    /// constant where `(b·s)·Mᵀ` is a matrix-vector product, and the two do
-    /// not meet. **And the bank it would fold into is QUANTIZED**, which
-    /// settles it independently: `embed_vision.embedding_projection` is an
-    /// MLX affine triplet at `group_size: 64`, so a scale that varies WITHIN
-    /// a group cannot ride the group's own. The fold is unavailable twice.
-    ///
-    /// **AND IT IS NOT [`AddBias`](Elementwise::AddBias) PLUS
-    /// [`Scale`](Elementwise::Scale).** `AddBias` would answer the
-    /// subtraction with a negated plane, but `Scale` reads ONE device-held
-    /// scalar for the whole rectangle, and this multiplier is a column
-    /// vector — no row in this IR multiplies by a `[width]` plane. Two ops
-    /// where the reference states one would also round the difference to the
-    /// activation's storage type between them, which is the trap §20.2
-    /// itemised for the composed `LayerNorm`.
-    ///
-    /// Fires ONCE per tower fire — after the pool, on `rows / pool²` rows —
-    /// so it is a row on the cheapest edge of the plan and not a per-block
-    /// launch.
+    /// Vision tower output standardization (`vision_config.standardize`):
+    /// `y = (x - bias) * scale`, per column, both planes `[width]`, in place.
     Standardize {
         x: ValueId,
         bias: ValueId,
@@ -252,10 +141,10 @@ pub enum Elementwise {
         x: ValueId,
         x_out: ValueId,
     },
-    /// `silu(s · x)`, in place. The scalar sits INSIDE the activation — this
-    /// is the hyper-connection mixer's `silu(down(x) / streams)`, and
-    /// `silu(s·x) ≠ s·silu(x)`, so [`MulScalar`](Elementwise::MulScalar)
-    /// before a bare silu would have been two launches and this is one.
+    /// `silu(s * x)`, in place. The scalar is inside the activation
+    /// (`silu(s*x) != s*silu(x)`), so this is one launch where
+    /// [`MulScalar`](Elementwise::MulScalar) before a bare silu would be
+    /// two.
     SiluScaled {
         s: f32,
         x: ValueId,
@@ -295,24 +184,10 @@ pub enum Elementwise {
         q_out: ValueId,
         k_out: ValueId,
     },
-    /// **THE MULTIMODAL ROTARY**: [`RopePartial`](Elementwise::RopePartial)
-    /// over a position that is a TRIPLE (multimodal §2's second op).
-    ///
-    /// `positions` is `[rows, 3]` `i32` — one `(t, h, w)` per rotated row —
-    /// where the scalar arms read `[rows, 1]`; `sections` is the checkpoint's
-    /// own `mrope_section` (qwen36 states `[11, 11, 10]`) and is a TRACE
-    /// CONSTANT, so it arrives stated rather than read from device memory.
-    /// A separate variant rather than an `Option<[u32; 3]>` on `RopePartial`,
-    /// because "a fourth axis with a fourth fact, not a flag" is the ruling
-    /// this whole design descends from: scalar-rope lanes and triple-rope
-    /// lanes are CLASSES, and a class is what a guard splits on.
-    ///
-    /// Rotates in place, like every rope arm here — see [`Operands::aliases`].
-    ///
-    /// **AND `form` SAYS WHICH SECTION LAYOUT** (multimodal §6.3). The trunk's
-    /// rotation and the tower's disagree about how the sections map onto the
-    /// frequency pairs, and both checkpoints state which they mean
-    /// (`text_config.rope_parameters.mrope_interleaved`); see [`MropeForm`].
+    /// [`RopePartial`](Elementwise::RopePartial) over a position triple:
+    /// `positions` is `[rows, 3]` `i32` (one `(t, h, w)` per row); `sections`
+    /// is the checkpoint's `mrope_section`. `form` says which section layout
+    /// applies; see [`MropeForm`].
     RopeMrope {
         q: ValueId,
         k: ValueId,
@@ -334,6 +209,20 @@ pub enum Elementwise {
         q_out: ValueId,
     },
     /// Partial rope over the last `rotary_dim` lanes of each head.
+    ///
+    /// **`inverse` UNROTATES** — the angle is negated — for the one place a
+    /// value carries a key's rope: MLA's shared latent is both key and value,
+    /// so the attention output's rope lanes come back rotated by the query's
+    /// own position and the reference undoes it (`apply_rotary_emb(o[...,
+    /// -rd:], freqs, inverse=True)`, the official `Attention.forward`).
+    ///
+    /// **`yarn` IS THE LAYER'S OWN RULE, NOT THE MODEL'S.** DeepSeek-V4-Flash
+    /// ropes its compressor layers at `compress_rope_theta` WITH the YaRN
+    /// ramp and its pure sliding-window layers at `rope_theta` without one
+    /// (`if self.compress_ratio: original_seq_len, rope_theta =
+    /// args.original_seq_len, args.compress_rope_theta else 0, args.rope_theta`),
+    /// so the ramp rides the op beside the theta and is `None` where the
+    /// layer states none.
     RopePartialLast {
         q: ValueId,
         positions: ValueId,
@@ -341,6 +230,8 @@ pub enum Elementwise {
         head_dim: u32,
         theta: f32,
         interleaved: bool,
+        inverse: bool,
+        yarn: Option<Yarn>,
         q_out: ValueId,
     },
     RopeYarn {
@@ -376,16 +267,11 @@ pub enum Elementwise {
         eps: f32,
         y: ValueId,
     },
-    /// **THE PER-TOKEN MIX ROW**: `rmsnorm(streams) · hc_fn^T`, the `[N, M·H]`
-    /// normed stream row projected through the layer's dynamic hyper plane
-    /// (`{attn,ffn}_hc.fn`, `[2M + M², M·H]`) into the `[2M + M², ]` row
-    /// [`Self::HcGates`] splits into pre, post and the combiner.
-    ///
-    /// It is a GEMM and it is not [`Linear::Matmul`](crate::ops::Linear): both
-    /// operands are f32 (the mix coefficients are too sensitive for a bf16
-    /// round trip — [`Self::HcRmsnormF32`] widens for exactly that reason) and
-    /// the dense gemm points are bf16. The rectangle is also tiny: `2M + M²`
-    /// is twenty-four columns at `hc_mult 4`.
+    /// The per-token mix row: `rmsnorm(streams) . hc_fn^T`, the row
+    /// [`Self::HcGates`] splits into pre, post and the combiner. Not
+    /// [`Linear::Matmul`](crate::ops::Linear): kept f32, too sensitive for bf16.
+    /// The row is as wide as the plane says: `2M + M²` for a layer's
+    /// `{attn,ffn}_hc.fn`, `M` for the trunk's `hc_head.fn` ([`Self::HcCollapse`]).
     HcProject {
         normed: ValueId,
         weight: ValueId,
@@ -417,16 +303,24 @@ pub enum Elementwise {
         comb_mix: ValueId,
         y: ValueId,
     },
-    // `Hc::Collapse` was deleted: no platform can fire it honestly (review R5).
+    /// The trunk collapse (`hc_head`): the `M` streams folded into the row the
+    /// final norm reads under `M` sigmoid gates off the `[N, M]` mix row
+    /// [`Self::HcProject`] lands through `hc_head.fn` — no post, no combiner,
+    /// no Sinkhorn. `y[h] = Σₛ (σ(mixes[s]·scale[0] + base[s]) + hc_eps) · streams[s·H + h]`.
+    HcCollapse {
+        mixes: ValueId,
+        streams: ValueId,
+        scale: ValueId,
+        base: ValueId,
+        stream_count: u32,
+        hc_eps: f32,
+        y: ValueId,
+    },
 
-    // The GATED-RESIDUAL flavor (qwen4). Same residual-stream algebra, a
-    // different gate: where `HcGates`/`HcFold` mix M streams through a
-    // sinkhorn-normalized M×M matrix, this pair mixes through per-element
-    // sigmoid gates a low-rank GEMM chain produces — so the GEMMs stay
-    // `linear.matmul` nodes (they are quantized banks) and the two ops here
-    // are only the arithmetic no existing op says: the gated mean in, the
-    // gated broadcast out.
-    /// `y[h] = meanₛ(σ(gates[s·H + h]) · normed[s·H + h])` — one
+    // The gated-residual flavor (qwen4): mixes through per-element sigmoid
+    // gates instead of a sinkhorn-normalized matrix. The GEMMs stay
+    // `linear.matmul` nodes; these two ops are the arithmetic around them.
+    /// `y[h] = mean_s(sigmoid(gates[s*H + h]) * normed[s*H + h])` — one
     /// `hidden`-wide layer input mixed out of `streams` normed residual
     /// streams under per-element sigmoid gates.
     HcMix {
@@ -435,10 +329,9 @@ pub enum Elementwise {
         streams: u32,
         y: ValueId,
     },
-    /// `hyper[s·H + h] += 2·σ(gates[s] / streams) · o[h]` — the layer output
-    /// injected back into every stream under its own scalar gate. In place on
-    /// `hyper`; the `1/streams` damping and the doubling are the reference's
-    /// own constants, stated here once rather than as two more launches.
+    /// `hyper[s*H + h] += 2*sigmoid(gates[s] / streams) * o[h]` — the layer
+    /// output injected back into every stream under its own scalar gate. In
+    /// place on `hyper`.
     HcInject {
         o: ValueId,
         gates: ValueId,
@@ -446,13 +339,8 @@ pub enum Elementwise {
         hyper: ValueId,
         hyper_out: ValueId,
     },
-    /// The PLE gate (qwen4): per stream, the n-gram key row is dotted with
-    /// the normed residual stream, damped by a signed square root, squashed,
-    /// and the shared value row is scaled by the result —
-    /// `y[s·H+h] = σ(sgn(d)·√|d|) · value[h]` where
-    /// `d = Σⱼ key[s·H+j] · query[s·H+j] / √H`. One op because the IR has no
-    /// row-broadcast multiply and no free-standing reduction, and composing
-    /// this from ops it does have would have needed both.
+    /// PLE gate (qwen4): `y[s*H+h] = sigmoid(sgn(d)*sqrt(|d|)) * value[h]`
+    /// where `d = sum_j key[s*H+j] * query[s*H+j] / sqrt(H)`.
     PleGate {
         key: ValueId,
         query: ValueId,
@@ -470,44 +358,17 @@ pub enum GateActivation {
     Sigmoid,
 }
 
-/// **WHICH SECTION LAYOUT A [`RopeMrope`](Elementwise::RopeMrope) TURNS BY**
-/// (multimodal §6.3).
-///
-/// The sections say WHICH of `(t, h, w)` a frequency pair turns by; this says
-/// HOW the pairs are handed out, and the two checkpoints this campaign serves
-/// disagree. A form and not a `bool` because the word "interleaved" is already
-/// spent in this enum — [`RopeFull`](Elementwise::RopeFull) and
-/// [`RopeYarn`](Elementwise::RopeYarn) carry one, and it means the PAIR layout
-/// (`(d, d+1)` against `(d, d+half)`), which is a different question about a
-/// different index. Both arms here pair `(d, d + head_dim/2)`.
+/// Which section layout a [`RopeMrope`](Elementwise::RopeMrope) turns by —
+/// how `(t, h, w)` frequency pairs are handed out. Both arms pair
+/// `(d, d + head_dim/2)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MropeForm {
-    /// **THE TRUNK'S**, and what `mrope_interleaved: true` states. Pairs
-    /// alternate `t, h, w, t, h, w, …` for as far as the sections reach, and
-    /// the frequency ladder is the head's own: pair `p` turns at
-    /// `theta^(-2p/head_dim)` whichever axis it took. Both qwen SKUs'
-    /// `text_config.rope_parameters` state it, with `mrope_section`
-    /// `[11, 11, 10]`.
+    /// The trunk's (`mrope_interleaved: true`): pairs alternate `t, h, w, ...`;
+    /// pair `p` turns at `theta^(-2p/head_dim)` whichever axis it took.
     Interleaved,
-    /// **THE TOWER'S**, and what `apply_rotary_pos_emb_vision` does. Each
-    /// section is a CONTIGUOUS block of pairs — `sections[0]` of `t`, then
-    /// `sections[1]` of `h`, then `sections[2]` of `w` — and each block
-    /// RESTARTS the frequency ladder over the stated pairs as a whole:
-    /// the `i`-th pair of a block turns at `theta^(-2i/Σsections)`.
-    ///
-    /// That second half is the part a reader would not guess and the part a
-    /// wrong kernel would still look plausible under.
-    /// `Qwen3_5VisionRotaryEmbedding(head_dim // 2)` builds `head_dim/4`
-    /// frequencies over a `head_dim/2`-wide ladder and `freqs[pos_ids]`
-    /// indexes it once per AXIS before flattening, so the exponent's
-    /// numerator counts within the block and its denominator is the ladder —
-    /// which is `Σsections` exactly when the sections tile the rotated pairs,
-    /// as the tower's `[0, head_dim/4, head_dim/4]` does.
-    ///
-    /// The tower rotates over `(h, w)` and has no time axis, which it states
-    /// as `sections[0] == 0` rather than as a two-wide position stream: the
-    /// stream is `[rows, 3]` on both axes, and a patch's `t` is read by
-    /// nothing.
+    /// The tower's (`apply_rotary_pos_emb_vision`): each section is a
+    /// contiguous block of pairs, each restarting the frequency ladder
+    /// (`sections[0] == 0`, no time axis).
     Blocked,
 }
 
@@ -554,6 +415,9 @@ impl Operands for Elementwise {
             Self::HcFold { x, streams, post_mix, comb_mix, .. } => {
                 sink.extend([*x, *streams, *post_mix, *comb_mix]);
             }
+            Self::HcCollapse { mixes, streams, scale, base, .. } => {
+                sink.extend([*mixes, *streams, *scale, *base]);
+            }
             Self::HcMix { gates, normed, .. } => sink.extend([*gates, *normed]),
             Self::HcInject { o, gates, hyper, .. } => sink.extend([*o, *gates, *hyper]),
             Self::PleGate { key, query, value, .. } => sink.extend([*key, *query, *value]),
@@ -592,6 +456,7 @@ impl Operands for Elementwise {
             Self::HcProject { mixes, .. } => sink.push(*mixes),
             Self::HcGates { x, post_mix, comb_mix, .. } => sink.extend([*x, *post_mix, *comb_mix]),
             Self::HcFold { y, .. } => sink.push(*y),
+            Self::HcCollapse { y, .. } => sink.push(*y),
             Self::HcMix { y, .. } => sink.push(*y),
             Self::HcInject { hyper_out, .. } => sink.push(*hyper_out),
             Self::PleGate { y, .. } => sink.push(*y),
@@ -634,6 +499,7 @@ impl Operands for Elementwise {
             Self::HcProject { .. } => {}
             Self::HcGates { .. } => {}
             Self::HcFold { .. } => {}
+            Self::HcCollapse { .. } => {}
             Self::HcMix { .. } => {}
             Self::HcInject { hyper_out, hyper, .. } => sink.push((*hyper_out, *hyper)),
             Self::PleGate { .. } => {}
@@ -672,6 +538,7 @@ impl Operands for Elementwise {
             Self::HcProject { .. } => "elementwise.hc_project",
             Self::HcGates { .. } => "elementwise.hc_gates",
             Self::HcFold { .. } => "elementwise.hc_fold",
+            Self::HcCollapse { .. } => "elementwise.hc_collapse",
             Self::HcMix { .. } => "elementwise.hc_mix",
             Self::HcInject { .. } => "elementwise.hc_inject",
             Self::PleGate { .. } => "elementwise.ple_gate",

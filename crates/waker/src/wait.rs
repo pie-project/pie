@@ -1,5 +1,5 @@
-//! The waiting future — register-then-recheck (B9) encoded so callers cannot
-//! get the race wrong. Tolerates spurious wakes; resolves after a B12 sweep.
+//! The waiting future — register-then-recheck encoded so callers cannot get
+//! the race wrong. Tolerates spurious wakes; resolves after a sweep.
 
 use crate::table::{WakerSlotId, WakerTable};
 
@@ -16,7 +16,7 @@ pub enum Readiness<T> {
 /// A future that parks on `slot` until `check` returns [`Readiness::Ready`].
 /// Encodes register-then-recheck, tolerates spurious wakes, and resolves
 /// (via `check` observing poison and returning `Ready(Err(..))`-shaped
-/// values) after a B12 sweep.
+/// values) after a sweep.
 pub struct WaitFuture<'t, F> {
     table: &'t WakerTable,
     slot: WakerSlotId,
@@ -45,7 +45,7 @@ where
             Readiness::Ready(v) => return std::task::Poll::Ready(v),
             Readiness::Pending { observed_epoch } => observed_epoch,
         };
-        // Publish the waker, then MANDATORY re-check (see `register` docs).
+        // Publish the waker, then re-check (see `register` docs).
         if !this.table.register(this.slot, cx.waker(), observed) {
             // Stale slot: the channel died between checks — one more check
             // must surface the failure; poll again immediately.

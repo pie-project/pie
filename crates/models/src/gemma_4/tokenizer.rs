@@ -1,7 +1,4 @@
-//! What gemma rows read from their vocabulary. The stop list is the
-//! grammar's own and is cited from where it lives (`chat_template::gemma`)
-//! rather than restated; the delimiters are this family's, shared with
-//! `media::Gemma4Vision`.
+//! Gemma vocabulary constants: image delimiters and tokenizer contracts.
 
 use ::tokenizer::contract::Contract;
 

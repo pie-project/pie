@@ -12,17 +12,8 @@ impl Facts {
         Predicate::fact(0)
     }
 
-    /// **THE ADAPTER WINDOW** (palo design §8, §0; campaign A-6).
-    ///
-    /// A lane that routed its rows to a registered adapter. §8 puts the
-    /// correction "over the adapter window", and §0 defines a window as the
-    /// rows of the lanes whose word satisfies the guard — so the axis needs a
-    /// bit, and the bit is what makes it FREE when nobody uses it: a fire no
-    /// lane routed has zero rows in this class, `engine::fire::walk` skips a
-    /// zero-row region before it dispatches anything, and the correction costs
-    /// that fire no launch, no empty grid and no instruction. A `Guard::Always`
-    /// correction would instead launch two kernels per layer over every row of
-    /// every fire to add zero to them, which is 1.0x nothing.
+    /// True for rows routed to a registered adapter. A fire with no adapter
+    /// rows has zero rows in this class, so the correction dispatches nothing.
     pub fn has_adapter() -> Predicate {
         Predicate::fact(1)
     }
@@ -64,22 +55,8 @@ impl ForwardHybrid for Model {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
 
-        // ONE SCHEDULE PER READER. A plan struct is a CARVING — request count,
-        // rebased query boundaries, work-item split — and it carves for ONE
-        // class. Which class is no longer left to be inferred: each plan is
-        // built off that class's own arm of the inputs, so it carries the arm's
-        // cond as its guard, and a reader in the other arm is refused by the
-        // recorder at the line that mixed them. Hence two schedules over the
-        // same shape, [decode, prefill]. `latent_attention` cuts its q with the
-        // same `Facts::qo_one()`, so its arms' conds are exactly the ones these
-        // two plans were built under, and each reader finds its own.
-        //
-        // A carving is also carved for ONE READING, and each line states it:
-        // `m.heads` queries against the `m.kv_lora_rank`-wide absorbed plane,
-        // which is exactly what every layer's `mla_decode_selected` and
-        // `mla_prefill_selected` restate. The two lines are otherwise the same
-        // numbers — the only thing that differs is the ARM they are built off,
-        // and that is the truth: one reading, two classes.
+        // Two schedules, [decode, prefill], split by Facts::qo_one(); latent_attention
+        // splits q the same way so each reader finds its matching plan.
         let (input_d, input_p) = inputs.split(&Facts::qo_one());
         let plan = [
             ops::attn::mla_plan(&input_d, m.heads, m.kv_lora_rank),
@@ -97,16 +74,8 @@ impl ForwardHybrid for Model {
             } else {
                 o
             };
-            // **THE CORRECTION, OVER ITS WINDOW** (design §8, campaign A-6).
-            // One statement: the mixer's output, plus this row's adapter's
-            // `B·(A·x)`, in place. No merge and no arm — the op writes THROUGH
-            // `o`'s arena column, so a class outside the window never runs the
-            // node and reads the uncorrected value at the same address, which
-            // is the identity for free.
-            //
-            // AFTER the reduce, and `Layer::lora_a`'s own note argues why: a
-            // correction on a rows-cut partial product would be summed `tp`
-            // times.
+            // Applied after all_reduce: on a tp-split partial product the
+            // correction would be summed tp times.
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = x.split(&Facts::has_adapter());
@@ -172,10 +141,8 @@ impl ForwardHybrid for Model {
     }
 }
 
-/// The MLA reading — `m.heads` and `m.kv_lora_rank` — is the trunk's, stated
-/// on the schedule these two arms read; the layer's `a` carries only what
-/// varies below the reading (the head widths it splits and absorbs at, its
-/// rope theta, its scale, its weights, its spaces).
+/// `m.heads` and `m.kv_lora_rank` come from the trunk; `a` carries only what
+/// varies per layer (head widths, rope theta, scale, weights, spaces).
 fn latent_attention(
     x: &Value,
     inputs: &Input<Facts>,
@@ -290,9 +257,6 @@ fn index_select(x: &Value, q_a: &Value, inputs: &Input<Facts>, ix: &Indexer) -> 
         ix.theta,
     );
     let weights = ops::linear::matmul(q_a, &ix.weights_proj);
-    // ONE KEY PER TOKEN, so the ranking's stride is one: `index_kv_append`
-    // just wrote this row at the token's own cell, the visible count is the
-    // prefix length, and the ids this publishes are token positions the
-    // selected MLA readers walk directly.
+    // One key per token: stride 1, published ids are token positions.
     ops::attn::index_topk(&q, &weights, keys, ix.heads, ix.head_dim, ix.top_k, 1)
 }

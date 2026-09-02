@@ -12,7 +12,6 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::sync::OnceLock;
 
-/// Global metrics holder
 static METRICS: OnceLock<Metrics> = OnceLock::new();
 static METER_PROVIDER: OnceLock<SdkMeterProvider> = OnceLock::new();
 static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
@@ -20,19 +19,16 @@ static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 /// All metric instruments for the Pie runtime
 #[allow(dead_code)] // scaffolded for scheduler/store call sites not yet wired to record these.
 pub struct Metrics {
-    // Scheduler metrics
     pub scheduler_arrival_rate: Gauge<f64>,
     pub scheduler_estimated_latency_ms: Gauge<f64>,
     pub scheduler_batch_wait_time_ms: Histogram<f64>,
     pub scheduler_fire_decisions: Counter<u64>,
 
-    // Resource metrics
     pub kv_pages_allocated: Gauge<u64>,
     pub kv_pages_available: Gauge<u64>,
     pub kv_pages_oom_kills: Counter<u64>,
     pub instances_active: Gauge<u64>,
 
-    // FFI metrics
     pub ffi_serialize_us: Histogram<u64>,
     pub ffi_queue_push_us: Histogram<u64>,
     pub ffi_response_wait_us: Histogram<u64>,
@@ -43,7 +39,6 @@ pub struct Metrics {
 impl Metrics {
     fn new(meter: &Meter) -> Self {
         Self {
-            // Scheduler metrics
             scheduler_arrival_rate: meter
                 .f64_gauge("scheduler.arrival_rate")
                 .with_description("Requests per second (EMA-based)")
@@ -64,7 +59,6 @@ impl Metrics {
                 .with_description("Fire now vs wait decisions")
                 .build(),
 
-            // Resource metrics
             kv_pages_allocated: meter
                 .u64_gauge("kv_pages.allocated")
                 .with_description("Currently allocated KV pages")
@@ -82,7 +76,6 @@ impl Metrics {
                 .with_description("Active inference instances")
                 .build(),
 
-            // FFI metrics
             ffi_serialize_us: meter
                 .u64_histogram("ffi.serialize_us")
                 .with_description("Rust→Python serialization time")
@@ -132,12 +125,10 @@ where
 {
     eprintln!("[Telemetry] Initializing OTLP export to: {endpoint}");
 
-    // Build resource with service name
     let resource = Resource::builder_empty()
         .with_attribute(KeyValue::new("service.name", service_name.to_string()))
         .build();
 
-    // === Initialize Metrics ===
     let metrics_exporter = match opentelemetry_otlp::MetricExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
@@ -149,7 +140,6 @@ where
                 "Failed to create OTLP metrics exporter: {}, metrics disabled",
                 err
             );
-            // Continue without metrics
             return init_tracing_only(endpoint, resource);
         }
     };
@@ -161,15 +151,12 @@ where
         .with_reader(reader)
         .build();
 
-    // Create and store global metrics
     let meter = meter_provider.meter("pie-runtime");
     let _ = METRICS.set(Metrics::new(&meter));
 
-    // Set global meter provider
     let _ = METER_PROVIDER.set(meter_provider.clone());
     opentelemetry::global::set_meter_provider(meter_provider);
 
-    // === Initialize Tracing ===
     let span_exporter = match opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)

@@ -1,12 +1,4 @@
-//! `validate_singleton_plan` and the region ABI predicates it shares with the
-//! fused emitters.
-//!
-//! Three C++ rejections have no counterpart here because the Rust plan types
-//! cannot express the damage: `"invalid symbolic extent role"`
-//! ([`SymbolicExtent`](crate::plan::SymbolicExtent) is a closed enum of exactly
-//! the legal roles), the dtype half of `"invalid normalized value type"`
-//! ([`Dtype`] likewise), and `"unsupported singleton op <name>"`
-//! ([`Op`](eta_ir::op::Op) only names known tags).
+//! `validate_singleton_plan` and the region ABI predicates it shares with the fused emitters.
 
 use crate::codegen::error::{EmitError, RegionForm, ValueLayoutSite};
 use crate::codegen::wellformed::{op_valid, region_ranges_valid, value_types_valid};
@@ -37,32 +29,11 @@ pub(crate) fn is_library(region: &Region) -> bool {
     matches!(region.kind, RegionKind::Library(_))
 }
 
-/// `nucleus_library_region_valid` — the 3-input/1-output nucleus ABI.
-/// The intrinsics this backend can actually bind.
-///
-/// `ptir_m1_runtime.metal` handles op tag `0xA0` by reinterpreting its `a0`
-/// slot, and which element type it reinterprets to is an arm on `p.intr`:
-/// `float` for `AttnScore`, `bfloat` for everything else, with `MtpDrafts`
-/// taking a third arm of its own. **THE ELEMENT TYPE USED TO BE FIXED, AND
-/// THAT WAS THIS LIST'S FIRST REASON**: an id whose rectangle is not `bf16`
-/// would have been read as if it were — no fault, no bounds violation, just
-/// the wrong numbers. The score plane's F32 arm closed that
-/// (`.wiki/alto/attn-score.md` §4), and
-/// [`super::intrinsics::m2_intrinsic_element_bytes`] is the host-side reading
-/// of the same branch.
-///
-/// **AND THE OTHER HALF OF THIS USED TO BE THE BUFFER.** Every
-/// `INTRINSIC_VAL` op took one `logits [[buffer(6)]]`, so an id with no
-/// rectangle of its own read the trunk's logits under its own name — no fault
-/// there either (`hidden()` is declared `[rows, vocab]`, so the length even
-/// matched). [`super::intrinsics::m2_intrinsic_buffer`] gives each supported
-/// id an argument index now, and this list is what that table is asserted
-/// against: an id in one and not the other is exactly the mis-binding both
-/// exist to keep out.
-///
-/// CUDA has a per-intrinsic slot table and raises `"generated fused intrinsic
-/// is unavailable"`; this is the Metal equivalent, and it belongs in the
-/// compiler because the mis-binding is not observable downstream.
+/// The intrinsics this backend can actually bind. `ptir_m1_runtime.metal`
+/// reinterprets op tag `0xA0`'s `a0` slot per `p.intr`; an id not in this
+/// list would otherwise be read under the wrong element type or buffer
+/// binding with no fault, just wrong numbers. CUDA's equivalent is a
+/// per-intrinsic slot table raising `"generated fused intrinsic is unavailable"`.
 pub fn metal_intrinsic_supported(intr: u16) -> bool {
     matches!(
         intr,
@@ -82,22 +53,10 @@ pub fn intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitEr
     unbindable_intrinsic(ops, region, metal_intrinsic_supported)
 }
 
-/// [`intrinsics_bindable`]'s GROUPED twin, and the two now name the same set.
-///
-/// A grouped kernel binds no per-intrinsic buffer: every rectangle it reads
-/// arrives as an ADDRESS on the lane record. That is why this was one id
-/// narrower for as long as `lane.logits_base` was the only such address — the
-/// score slab is a different allocation entirely, the shell's rather than the
-/// arena's, so no displacement off the readout reaches it and a grouped region
-/// reading `attn_score` would have been emitted pointing at the trunk's
-/// logits. The record carries `attn_score_base` now, so the rectangle has an
-/// address of its own and the refusal has nothing left to protect.
-///
-/// It stays a separate function rather than collapsing into
-/// [`intrinsics_bindable`]: the two forms answer this question from two tables
-/// and the day they diverge again — a new id with an argument index and no
-/// lane-record word — the shape of the answer should not have to be
-/// reinvented. See [`super::intrinsics::m3_intrinsic_bindable`].
+/// [`intrinsics_bindable`]'s grouped twin. A grouped kernel binds no
+/// per-intrinsic buffer: every rectangle it reads arrives as an address on
+/// the lane record. Stays a separate function since the two forms answer
+/// from two tables that could diverge again.
 pub fn grouped_intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitError> {
     unbindable_intrinsic(ops, region, super::intrinsics::m3_intrinsic_bindable)
 }
@@ -127,15 +86,9 @@ fn unbindable_intrinsic(
 /// when the dividing `Div` stays outside the region.
 pub fn nucleus_library_region_valid(stage: &CompiledStage, region: &Region) -> bool {
     let value_types = &stage.normalized.value_types;
-    // Two arities are legal, and this only knew one. The plain form is
-    // [logits, top_p, state]; when the trace divides the logits by a
-    // temperature first, `compile.rs` leaves that Div outside the region and
-    // passes [raw_logits, scale, logits, top_p, state] instead, which is what
-    // `driver/cuda`'s `nucleus_library_region_valid` already accepts. Rejecting
-    // it here did not fall back to the generated region -- it failed
-    // `register_program` outright, so any temperature != 0 program was
-    // unrunnable on Metal, and the 256-thread parallel sampler was unreachable
-    // for the one case that most needs it.
+    // Plain form is [logits, top_p, state]; when the trace divides logits by
+    // a temperature first, `compile.rs` leaves that Div outside the region
+    // and passes [raw_logits, scale, logits, top_p, state] instead.
     let scaled = region.inputs.len() == 5;
     if !is_library(region)
         || library_op_byte(region) != LibraryOp::NucleusSample as u8
@@ -238,12 +191,7 @@ pub fn validate_singleton_plan(stage: &CompiledStage) -> Result<Vec<M1OpMeta>, E
 }
 
 /// [`validate_singleton_plan`], but also handing back the ops accepted before
-/// the rejection point.
-///
-/// The C++ fills its `std::vector<M1OpMeta>&` out-parameter as it walks the
-/// stage and leaves the partial contents behind when it returns `false`. No
-/// caller looks at them, but the conformance dump records them because they
-/// pin *where* validation gave up, not just that it did.
+/// the rejection point — the conformance dump records where validation gave up.
 pub fn validate_singleton_plan_partial(
     stage: &CompiledStage,
 ) -> (Vec<M1OpMeta>, Result<(), EmitError>) {

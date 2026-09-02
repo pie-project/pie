@@ -1,21 +1,5 @@
-//! Lowering the affine fragment of [`Expr`] to byte movement.
-//!
-//! Every expression built from `Src`, `Out`, `Fill`, `Slice`, `Concat` and
-//! `Transmute` denotes a piecewise-affine partial map from output coordinates to
-//! source coordinates. This module evaluates that map into a list of maximal
-//! contiguous [`Run`]s — the only form the rest of the loader needs — without
-//! materializing any intermediate buffer, however deeply the expression nests.
-//!
-//! The two escape hatches ([`Expr::Repack`], [`Expr::Cast`]) are rejected
-//! here by design: they need a kernel, so they are the planner's problem.
-//!
-//! [`Expr::Gather`] is the one node with a second answer. A permutation of
-//! single elements has no contiguous stretches to find, so the copy list is
-//! 1.18M runs of length one for the case that motivated it; where that
-//! happens, [`Lowering::Gather`] states the table instead. The copy list is
-//! still tried first, always — see [`compile`].
-//!
-//! See `loader/spec.md` §3.1, §3.3 and §3.4.
+//! Lowering the affine fragment of [`Expr`] to byte movement: maximal
+//! contiguous [`Run`]s, or [`Lowering::Gather`] where that is not affordable.
 
 use std::collections::HashMap;
 
@@ -49,8 +33,8 @@ impl Leaf {
 /// One maximal contiguous copy: `len` elements from `source`, landing at
 /// `dst_elem` in the output.
 ///
-/// Offsets are in *logical elements*, not bytes, because the element width
-/// depends on the encoding. Use [`CopyList::byte_runs`] to convert.
+/// Offsets are in logical elements, not bytes (element width depends on the
+/// encoding). Use [`CopyList::byte_runs`] to convert.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Run {
     pub source: RunSource,
@@ -67,25 +51,16 @@ pub enum RunSource {
     Zero,
 }
 
-/// What one expression compiles to.
+/// What one expression compiles to: the two shapes an executor can be asked
+/// for, not two encodings of one thing.
 ///
-/// The refusal this enum replaced named both members: an expression that breaks
-/// into more stretches than the walker will hold "needs a gather lowering, not
-/// a copy list". Those are the two, and they are not two encodings of one
-/// thing — they are the two shapes an executor can be asked for.
+/// * A [`CopyList`] is stretches of addresses. It folds into rectangles and
+///   prices as [`CopyList::cost`] strided copies.
+/// * A [`GatherList`] is a table of indices. It never folds and always costs
+///   one element-granular pass.
 ///
-/// * A [`CopyList`] is stretches of *addresses*. It folds into rectangles, it
-///   prices as [`CopyList::cost`] strided copies, and a cost of one is a copy
-///   that need not happen at all.
-/// * A [`GatherList`] is a table of *indices*. It never folds, it always costs
-///   one pass over the bytes, and the pass is element-granular: the executor
-///   walks the table while the bytes are in host memory on their way to the
-///   device.
-///
-/// Which one an expression gets is not a policy knob. Every expression that
-/// can be a copy list is one — [`compile`] tries that first and only falls
-/// back when the list would exceed `max_runs`, so nothing that lowers today
-/// lowers differently tomorrow.
+/// [`compile`] always tries a copy list first, falling back only when it
+/// would exceed `max_runs`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lowering {
     Copy(CopyList),
@@ -111,9 +86,7 @@ impl Lowering {
 
     /// What this expression costs to execute, in the units of
     /// [`CopyList::cost`]: a gather is one pass over the destination, so it
-    /// costs one — the same as a whole-tensor copy, and for the same reason.
-    /// It is the *element* count that differs, and no cost model this layer
-    /// has ever charged for elements.
+    /// costs one, same as a whole-tensor copy.
     pub fn cost(&self) -> usize {
         match self {
             Lowering::Copy(copies) => copies.cost(),
@@ -121,10 +94,8 @@ impl Lowering {
         }
     }
 
-    /// The copy list, or `None` for a gather.
-    ///
-    /// For callers that only ever see the affine fragment — the reference
-    /// oracle's own fixtures, and this module's tests.
+    /// The copy list, or `None` for a gather. For callers that only ever
+    /// see the affine fragment.
     pub fn as_copy(&self) -> Option<&CopyList> {
         match self {
             Lowering::Copy(copies) => Some(copies),
@@ -137,22 +108,17 @@ impl Lowering {
 /// `j` ranging over a [`block`](Self::block) of elements and `r` over
 /// [`rows`](Self::rows).
 ///
-/// This is the lowering the copy list cannot express *affordably*. Every
-/// gather is also a copy list — one run per index, or fewer where the indices
-/// happen to run consecutively — and for a permutation of rows that list is
-/// the better answer, which is why [`compile`] still produces it. What breaks
-/// is a permutation whose blocks are single elements: the MLX patch-embed
-/// bank is a `[768, 1536]` stride-3 deinterleave, which is 1.18M runs of one
-/// element each, folding to 3069 rectangles that no engine wants to issue.
-/// The same permutation is 1536 indices.
+/// The lowering the copy list cannot express affordably: a permutation whose
+/// blocks are single elements folds to a copy list of thousands of tiny
+/// rectangles, while the same permutation is one index per block.
 ///
-/// The table is stated once and repeated over `rows`, because that is what a
-/// gather along an axis *is*: the axes outside it are untouched, and writing
-/// their product into the table would be the same 1.18M numbers again.
+/// The table is stated once and repeated over `rows`: the axes outside the
+/// gathered one are untouched, so writing their product into the table
+/// would just repeat the same numbers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatherList {
     /// Leaves in first-use order, as [`CopyList::leaves`] is. A gather reads
-    /// exactly one of them; the vector is kept whole so that the two forms
+    /// exactly one of them, but the vector is kept whole so both forms
     /// answer [`Lowering::leaves`] the same way.
     pub leaves: Vec<Leaf>,
     /// Which leaf, indexing [`leaves`](Self::leaves).
@@ -173,7 +139,7 @@ pub struct GatherList {
 
 impl GatherList {
     /// Elements between consecutive destination rows. Derived, not stored: a
-    /// destination row is exactly the table, and a second field could disagree.
+    /// destination row is exactly the table.
     pub fn dst_row(&self) -> i64 {
         self.indices.len() as i64 * self.block
     }
@@ -184,17 +150,10 @@ impl GatherList {
         self.rows * self.src_row
     }
 
-    /// The table's geometry in bytes, under the encoding the tensor is stored
-    /// in.
-    ///
-    /// The conversion lives here because [`ByteScale`] does: a blocked payload
-    /// carries its scale inside the block, so "how many bytes is one gathered
-    /// block" is a question only this module answers correctly, and it is the
-    /// same answer [`CopyList::byte_pieces`] gets. A gather whose blocks do
-    /// not land on block boundaries is refused there rather than rounded here
-    /// — though `infer` has already refused a gather on a quantized axis, so
-    /// reaching that requires a gather on an axis *outside* the blocked one
-    /// with a partial block below it.
+    /// The table's geometry in bytes, under the encoding the tensor is
+    /// stored in. Lives here because [`ByteScale`] does: a blocked payload
+    /// carries its scale inside the block, and this gets the same answer
+    /// [`CopyList::byte_pieces`] does.
     pub fn byte_geometry(&self, encoding: &Encoding) -> Result<GatherBytes, Error> {
         let scale = ByteScale::of(encoding);
         Ok(GatherBytes {
@@ -205,13 +164,10 @@ impl GatherList {
         })
     }
 
-    /// The same mapping written as one rectangle per index.
-    ///
-    /// Not what an executor runs — that is the table, walked once — but what
-    /// the mapping MEANS, in the vocabulary the affine fragment already has.
-    /// The reference oracle replays these, so a gather is checked by the same
-    /// scatter that checks every copy list, and `indices.len()` rectangles is
-    /// a cost only a test pays.
+    /// The same mapping written as one rectangle per index. Not what an
+    /// executor runs (that is the table, walked once), but what the mapping
+    /// means, so the reference oracle can check a gather with the same
+    /// scatter it checks every copy list with.
     pub fn byte_rects(&self, encoding: &Encoding) -> Result<Vec<Rect>, Error> {
         let scale = ByteScale::of(encoding);
         let block = scale.extent(self.block, "gather block")?;
@@ -255,9 +211,8 @@ impl GatherList {
     }
 }
 
-/// A [`GatherList`]'s geometry in bytes. `indices` stays in blocks, because a
-/// block is the unit the table names and scaling it twice is how an index
-/// list stops meaning anything.
+/// A [`GatherList`]'s geometry in bytes. `indices` stays in blocks — a block
+/// is the unit the table names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GatherBytes {
     /// Bytes in one gathered block.
@@ -286,27 +241,17 @@ pub struct CopyList {
 }
 
 impl CopyList {
-    /// How many separate copies this expression costs.
-    ///
-    /// This is the cost model of `spec.md` §3.3: few long runs lower to DMA,
-    /// many short ones to a gather kernel. It is known before any I/O happens.
-    ///
-    /// Count [`CopyList::pieces`] instead when the executor can issue strided
-    /// copies — a row shard is thousands of runs but one piece.
-    ///
-    /// Nothing on the load path reads this: [`CopyList::cost`] is what picks a
-    /// lowering. It is here so this module's own tests can state the shape they
-    /// expect — "a row shard of a fused bank is 2048 runs averaging 3072
-    /// elements" is a claim about the algebra, and asserting it directly is how
-    /// a regression in `compile` shows up as a failing number rather than as a
-    /// slower plan nobody times.
+    /// How many separate copies this expression costs, known before any I/O
+    /// happens. Count [`CopyList::pieces`] instead when the executor can
+    /// issue strided copies — a row shard is thousands of runs but one
+    /// piece. Nothing on the load path reads this; it is test observability
+    /// ([`CopyList::cost`] picks the lowering).
     pub fn run_count(&self) -> usize {
         self.runs.len()
     }
 
-    /// Mean run length in elements, or 0 for an empty lowering.
-    ///
-    /// Test observability, as [`CopyList::run_count`] is.
+    /// Mean run length in elements, or 0 for an empty lowering. Test
+    /// observability, as [`CopyList::run_count`] is.
     pub fn mean_run_elements(&self) -> i64 {
         if self.runs.is_empty() {
             0
@@ -317,59 +262,41 @@ impl CopyList {
 
     /// Fold the runs back into loop nests.
     ///
-    /// Runs are the semantics; pieces are the cost. A column shard is one run
-    /// per row — thousands of them — but every row is the same length and the
-    /// source and destination both advance by a fixed stride, so the whole
-    /// thing is a single rectangular copy. That is exactly what the low IR's
-    /// `Extent` expresses, and emitting the unfolded run list instead
-    /// would inflate the plan by three orders of magnitude for every sharded
-    /// tensor in the model.
+    /// Runs are the semantics; pieces are the cost. A column shard is one
+    /// run per row, but every row is the same length with both offsets in
+    /// arithmetic progression, so the whole thing folds to a single
+    /// rectangular copy (the low IR's `Extent`).
     ///
-    /// The pass is a repeated sweep: find maximal consecutive groups of
-    /// same-source, same-size items whose source and destination offsets are
-    /// both in arithmetic progression, and wrap each group in one more loop.
-    /// Because it only ever rewrites a verified run list into a form that
-    /// enumerates the same `(src, dst)` pairs, it cannot change the meaning.
+    /// A repeated sweep: find maximal consecutive groups of same-source,
+    /// same-size items whose offsets are both in arithmetic progression, and
+    /// wrap each group in one more loop. Cannot change the meaning: it only
+    /// rewrites a run list into a form enumerating the same `(src, dst)`
+    /// pairs.
     pub fn pieces(&self) -> Vec<Piece> {
         fold(self.runs.iter().map(seed).collect())
     }
 
     /// What this expression costs to execute: the number of strided copies,
-    /// plus one fill if the destination has holes.
-    ///
-    /// This is the cost model of `spec.md` §3.3, and it is known before any I/O
-    /// happens. A whole tensor, a row shard and a strided expert select all
+    /// plus one fill if the destination has holes. Known before any I/O
+    /// happens. A whole tensor, a row shard, and a strided expert select all
     /// cost 1; a fusion of three sources costs 3.
     ///
-    /// `plan/build.rs` reads it to decide a lowering: cost 1 is one rectangle
-    /// covering the whole destination, so the tensor aliases the checkpoint
-    /// bytes or views a buffer instead of copying. That is the cheapest thing
-    /// the loader does and it is this number that selects it.
-    ///
-    /// It does *not* decide whether to slab-scatter. That choice weighs one
-    /// over-read against many small reads, so its inputs are the gaps between
-    /// source ranges and the ratio of span to payload — and it coalesces
-    /// *across tensors*, sorted by file offset. A `CopyList` is one tensor's
-    /// expression and has neither, which is why the decision lives in
-    /// `plan/passes/rewrite.rs` after the offsets are assigned, and why
-    /// `spec.md` §3.3 calls its thresholds a loader policy rather than a
-    /// function of the algebra.
+    /// `plan/build.rs` reads it to decide a lowering: cost 1 means one
+    /// rectangle covering the whole destination, so the tensor aliases the
+    /// checkpoint bytes instead of copying. It does not decide whether to
+    /// slab-scatter — that coalesces across tensors and lives in
+    /// `plan/passes/rewrite.rs` after offsets are assigned.
     pub fn cost(&self) -> usize {
         self.copy_pieces().len() + usize::from(self.needs_zero_fill())
     }
 
     /// The pieces that actually move data.
     ///
-    /// A hole is not produced by copying zeros into the destination; it is
-    /// produced by zeroing the destination once and then not writing there, so
-    /// padding costs one fill rather than one copy per band. For a head-dim
-    /// pad that halves the piece count: `2·n_heads` alternating data and zero
-    /// runs become `n_heads` data runs and one fill.
-    ///
-    /// They do not fold further. The destination stride across a padded row is
-    /// wider than the row, and `fold` refuses a destination that skips — see
-    /// `spec.md` §3.3, whose cost table prices exactly this case (a `[4, 4]`
-    /// padded by one column) at 5.
+    /// A hole is not copied as zeros; the destination is zeroed once and
+    /// then not written there, so padding costs one fill rather than one
+    /// copy per band. They do not fold further: the destination stride
+    /// across a padded row is wider than the row, and `fold` refuses a
+    /// destination that skips.
     pub fn copy_pieces(&self) -> Vec<Piece> {
         fold(
             self.runs
@@ -407,10 +334,9 @@ impl CopyList {
             .collect()
     }
 
-    /// The copy pieces with every offset, stride and extent converted to bytes.
-    ///
-    /// This is the form the low IR wants: `load_plan::Extent` addresses
-    /// bytes, and a sub-byte encoding has no element addresses to speak of.
+    /// The copy pieces with every offset, stride and extent converted to
+    /// bytes: the form the low IR wants (`load_plan::Extent` addresses
+    /// bytes; a sub-byte encoding has no element addresses).
     pub fn byte_pieces(&self, encoding: &Encoding) -> Result<Vec<Rect>, Error> {
         let scale = ByteScale::of(encoding);
         self.copy_pieces()
@@ -456,33 +382,19 @@ impl CopyList {
 
 /// Element index to byte offset, for one encoding.
 ///
-/// Sub-byte encodings (MXFP4, AWQ/GPTQ int4) only have byte addresses on group
-/// boundaries. The checker's block-alignment rules (`spec.md` §3.2) are what
-/// make this conversion total in practice, and a violation is reported rather
-/// than silently rounded.
+/// Sub-byte encodings (MXFP4, AWQ/GPTQ int4) only have byte addresses on
+/// group boundaries; a violation is reported rather than silently rounded.
 ///
-/// # Why a blocked scheme is not just a bit width
-///
-/// A GGUF block carries its own scale INSIDE the payload: Q4_0 spends 18
-/// bytes on 32 elements, of which 2 are the F16 scale and 16 are the codes.
-/// Reading that as "4 bits per element" prices the codes and forgets the
-/// scale, so element 32 -- the start of row 1 -- lands at byte 16 instead of
-/// byte 18, two bytes short, and every row after it drifts further.
-///
-/// Measured before this existed, on a four-row Q4_0 tensor: a band of rows 1
-/// and 2 came back the right length (36 bytes, exactly two blocked rows) and
-/// entirely wrong (it read from byte 16, the tail of row 0). Nothing refused
-/// it. A whole-tensor copy hid this completely, because offset zero is right
-/// under either rule, and a whole-tensor copy was all a GGUF had ever asked
-/// for.
+/// A blocked scheme is not just a bit width: a GGUF block carries its own
+/// scale inside the payload (Q4_0 spends 18 bytes on 32 elements, 2 for the
+/// F16 scale and 16 for the codes), so reading it as "4 bits per element"
+/// forgets the scale and drifts every row after the first.
 enum ByteScale {
     /// Elements are `bits` wide and pay for nothing else.
     Bits(i64),
-    /// Elements come in blocks that cost `bytes` per `elems`, scale included.
-    ///
-    /// Only whole blocks have addresses. That is stricter than the bit rule --
-    /// which admits any byte-aligned element -- and it is the truth: half a
-    /// block is codes with no scale to read them by.
+    /// Elements come in blocks that cost `bytes` per `elems`, scale
+    /// included. Only whole blocks have addresses: half a block is codes
+    /// with no scale to read them by.
     Blocked { elems: i64, bytes: i64 },
 }
 
@@ -568,13 +480,10 @@ pub enum ByteRunSource {
 /// One rectangular copy: a loop nest, outermost dimension first.
 ///
 /// Reading `dims` from the outside in, the element at loop counters
-/// `(i0, .., in)` moves from `src_elem + Σ iₖ·src_strideₖ` to
-/// `dst_elem + Σ iₖ·dst_strideₖ`. The innermost dimension always has unit
-/// strides, so every piece ends in a contiguous stretch.
-///
-/// This is the shape `load_plan::Extent` already carries, which is why
-/// the fold exists: it is the difference between one instruction and one
-/// instruction per row.
+/// `(i0, .., in)` moves from `src_elem + sum(ik*src_stride_k)` to
+/// `dst_elem + sum(ik*dst_stride_k)`. The innermost dimension always has
+/// unit strides, so every piece ends in a contiguous stretch — the shape
+/// `load_plan::Extent` already carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Piece {
     pub source: RunSource,
@@ -617,25 +526,18 @@ fn fold_once(items: &[Piece]) -> Option<Vec<Piece>> {
     let mut at = 0;
     while at < items.len() {
         let head = &items[at];
-        // How far does the arithmetic progression starting here extend? The
-        // first pair fixes the strides; the rest must match it exactly.
+        // The first pair fixes the strides; the rest must match exactly.
         let mut end = at + 1;
         let mut src_stride = 0;
         let mut dst_stride = 0;
         if let Some(next) = items.get(at + 1)
             && let Some(strides) = step_between(head, next)
-            // The destination must stay dense. A copy engine addresses a
-            // contiguous output range; a loop that skips in the destination is
-            // a scatter, and nothing below this layer can execute one. See
-            // `spec.md` §3.3.
+            // The destination must stay dense: a loop that skips in the
+            // destination is a scatter, which nothing below can execute.
             && strides.1 == head.elements()
-            // The source must advance forward. A plan addresses its source as
-            // a span starting at `file_offset`, so a descending progression
-            // would read below that anchor. Such a run is a perfectly good
-            // rectangle — it just is not one this ABI can name, and the pieces
-            // are individually copyable, so leave them unfolded. `Concat` in
-            // descending source order (e.g. re-joining a fused gate/up weight
-            // as `[up | gate]`) is the case that reaches this.
+            // The source must advance forward from `file_offset`; a
+            // descending progression (e.g. Concat re-joining `[up | gate]`)
+            // is left unfolded instead.
             && strides.0 >= 0
         {
             (src_stride, dst_stride) = strides;
@@ -669,12 +571,9 @@ fn fold_once(items: &[Piece]) -> Option<Vec<Piece>> {
     changed.then_some(out)
 }
 
-/// The `(src, dst)` step from `a` to `b`, if `b` is a translate of `a`.
-///
-/// Two pieces only compose into a loop when they read the same leaf — or are
-/// both padding — and have identical extents. A zero fill has no source
-/// address, so its source stride is fixed at zero and only the destination has
-/// to progress.
+/// The `(src, dst)` step from `a` to `b`, if `b` is a translate of `a`. Two
+/// pieces only compose when they read the same leaf (or are both padding)
+/// and have identical extents.
 fn step_between(a: &Piece, b: &Piece) -> Option<(i64, i64)> {
     if a.dims != b.dims {
         return None;
@@ -705,17 +604,10 @@ pub fn bits_per_element(encoding: &Encoding) -> u32 {
 /// resolver already resolved for it.
 ///
 /// `max_runs` bounds the walker's own output so a pathological expression
-/// cannot make the compiler allocate without limit. It is *not* the cost
-/// model — a row shard is thousands of runs and one copy. Ask
-/// [`CopyList::cost`] what the expression actually costs.
-///
-/// It is also the seam between the two lowerings. A copy list is tried first,
-/// always, and the cap is the point past which one stops being an answer: a
-/// list that long folds into thousands of rectangles at best, and every one of
-/// them is an instruction some engine has to issue. Where the expression is a
-/// [`Expr::Gather`] over a whole tensor, the same mapping is an index table
-/// instead; where it is not, there is nothing better to fall back to and the
-/// refusal stands.
+/// cannot make the compiler allocate without limit. It is not the cost model
+/// — ask [`CopyList::cost`] what the expression actually costs. A copy list
+/// is tried first, always; past the cap, an [`Expr::Gather`] over a whole
+/// tensor falls back to an index table, and anything else refuses.
 pub fn compile(expr: &Expr, checked: &Checked, max_runs: usize) -> Result<Lowering, Error> {
     let mut builder = Builder {
         checked,
@@ -932,12 +824,9 @@ impl Builder<'_> {
                     shape,
                 )
             }
-            // Nothing moves, so the only question is whether the operand's
-            // element grid survives. It does when the element width is
-            // unchanged, and flat order is then the identity; when it is not,
-            // `infer_transmute` has already proved the operand is a whole tensor,
-            // so the leaf is simply read under its new type over the same
-            // bytes.
+            // Nothing moves. When the element width changes, `infer_transmute`
+            // has already proved the operand is a whole tensor, so the leaf
+            // is simply read under its new type over the same bytes.
             Expr::Transmute { src, to } => match src.as_ref() {
                 Expr::Src(name) => {
                     let leaf = self.intern(Leaf::Checkpoint(name.clone()));
@@ -953,10 +842,9 @@ impl Builder<'_> {
                 }
             },
             Expr::Fill { ty, .. } => self.push(Kind::Fill, ty.shape.clone()),
-            // The kernel column of the algebra, as a set. Each of these costs
-            // something no arrangement of byte runs can express, so lowering
-            // them is `plan::build`'s job and reaching here means a kernel node
-            // was nested where only the affine fragment fits.
+            // Each of these needs a kernel; lowering them is `plan::build`'s
+            // job, and reaching here means one was nested where only the
+            // affine fragment fits.
             Expr::Repack { .. } | Expr::Cast { .. } | Expr::Scale { .. } | Expr::Bias { .. } => {
                 Err(Error::Contract(format!(
                     "{} needs a kernel and cannot be lowered to byte runs",
@@ -1002,13 +890,9 @@ impl Builder<'_> {
     }
 
     /// The index-table lowering, when the root is a [`Expr::Gather`] whose
-    /// operand is a whole tensor.
-    ///
-    /// Only then. A gather over a computed operand would have to materialize
-    /// the operand first, which is a second instruction and a second buffer —
-    /// a plan, not a lowering — and no contract asks for one. A gather nested
-    /// *inside* other placement is likewise out: the table addresses the leaf
-    /// directly, and it can only do that when nothing sits between them.
+    /// operand is a whole tensor. Only then: the table addresses the leaf
+    /// directly, so nothing may sit between them, and a gather over a
+    /// computed operand would need a second instruction to materialize it.
     fn gather(&mut self, root: usize) -> Result<Option<Lowering>, Error> {
         let Kind::Gather { src, axis, indices } = &self.nodes[root].kind else {
             return Ok(None);
@@ -1041,9 +925,9 @@ impl Builder<'_> {
     }
 
     /// Walk the output in flat order, emitting one run per maximal contiguous
-    /// stretch. `None` when the list would exceed `max_runs`, which is the
-    /// walker declining rather than failing: [`Builder::lower`] is where that
-    /// becomes an answer or an error.
+    /// stretch. `None` when the list would exceed `max_runs`: the walker
+    /// declines rather than fails, and [`Builder::lower`] turns that into an
+    /// answer or an error.
     fn walk(&mut self, root: usize, max_runs: usize) -> Result<Option<Vec<Run>>, Error> {
         let total = self.nodes[root].elements;
         let mut runs: Vec<Run> = Vec::new();
@@ -1059,8 +943,7 @@ impl Builder<'_> {
             };
             match runs.last_mut() {
                 // Each node's bound is conservative, so genuinely adjacent
-                // stretches can arrive as two runs. Merging keeps the cost model
-                // honest.
+                // stretches can arrive as two runs; merge them.
                 Some(last) if adjacent(last, source, flat) => last.len += span,
                 _ => {
                     if runs.len() >= max_runs {
@@ -1100,10 +983,8 @@ impl Builder<'_> {
                 inner.dims[*axis] = start + coord.dims[*axis];
                 let inner_flat = flatten(&inner, &self.nodes[*src].shape);
                 let (found, span) = self.step(*src, &inner, inner_flat)?;
-                // A band leaves every inner extent alone, so the source advances
-                // in lockstep with the output even across increments of `axis`.
-                // Only the wrap of `axis` breaks it — and not even that when the
-                // band covers the whole axis.
+                // A band leaves every inner extent alone, so the source
+                // advances in lockstep except across a wrap of `axis`.
                 let limit = if *whole || *axis == 0 {
                     i64::MAX
                 } else {
@@ -1111,9 +992,8 @@ impl Builder<'_> {
                 };
                 Ok((found, span.min(limit).min(remaining)))
             }
-            // Where a band advances in lockstep, a stride does not: the source
-            // jumps by `step` every time `axis` increments, so the run ends
-            // there. This is the whole cost difference between the two nodes.
+            // Where a band advances in lockstep, a stride does not: the
+            // source jumps by `step` every time `axis` increments.
             Kind::Stride {
                 src,
                 axis,
@@ -1127,11 +1007,8 @@ impl Builder<'_> {
                 let limit = distance_to(node, coord, flat, *axis, coord.dims[*axis] + 1);
                 Ok((found, span.min(limit).min(remaining)))
             }
-            // A gather's run ends at the first index that is not one past the
-            // last, which is what makes a list with consecutive stretches
-            // cheaper than one without: the byte runs coalesce over them, and a
-            // permutation of contiguous blocks costs one run per block rather
-            // than one per element.
+            // A gather's run ends at the first index not one past the last,
+            // so a permutation of contiguous blocks costs one run per block.
             Kind::Gather { src, axis, indices } => {
                 let at = coord.dims[*axis] as usize;
                 let mut inner = *coord;
@@ -1172,20 +1049,16 @@ impl Builder<'_> {
                 let (found, span) = self.step(*src, &inner, flat)?;
                 Ok((found, span.min(remaining)))
             }
-            // The whole node is a hole, so the walk can jump to its end in one
-            // step. Where the hole sits inside the output is the enclosing
-            // `Concat`'s business, which is the point of the node being a leaf.
+            // The whole node is a hole, so the walk can jump to its end.
             Kind::Fill => Ok((None, remaining)),
         }
     }
 }
 
-/// The operand's extent along `axis`, or an internal error if there is none.
-///
-/// The type checker bounds-checks every axis before lowering ever runs, so a
-/// failure here means the two disagree — a compiler bug. It is reported rather
-/// than panicked because this crate is reached across an FFI boundary, where an
-/// unwind is not recoverable.
+/// The operand's extent along `axis`, or an internal error if there is none
+/// (the type checker bounds-checks every axis first, so this means a
+/// compiler bug). Reported rather than panicked: this crate is reached
+/// across an FFI boundary, where an unwind is not recoverable.
 fn axis_extent(shape: &[i64], axis: usize, node: &str) -> Result<i64, Error> {
     shape.get(axis).copied().ok_or_else(|| {
         Error::Internal(format!(
@@ -1248,1016 +1121,3 @@ fn flatten(coord: &Coord, shape: &[i64]) -> i64 {
     flat
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::contract::infer::{Checked, CheckpointTypes, Resolver, infer_type};
-    use crate::contract::{ModelContract, Partition, TensorContract, TensorType};
-    use crate::types::{Axis, DType, QuantScheme, QuantSpec};
-
-    struct Fake(HashMap<String, TensorType>);
-
-    impl Fake {
-        fn new(entries: &[(&str, &[i64])]) -> Self {
-            Self(
-                entries
-                    .iter()
-                    .map(|(name, shape)| {
-                        (
-                            (*name).to_string(),
-                            TensorType::raw(shape.to_vec(), DType::Bf16),
-                        )
-                    })
-                    .collect(),
-            )
-        }
-    }
-
-    impl CheckpointTypes for Fake {
-        fn tensor_type(&self, name: &str) -> Option<TensorType> {
-            self.0.get(name).cloned()
-        }
-    }
-
-    /// What the retired `Pad` node meant, written as the composition that
-    /// replaced it. `shape` is the operand's, which the old node left implicit
-    /// and which the type checker now sees.
-    fn pad(src: Expr, shape: &[i64], axis: u8, before: i64, after: i64) -> Expr {
-        let leg = |extent: i64| {
-            let mut shape = shape.to_vec();
-            shape[usize::from(axis)] = extent;
-            Expr::fill(0.0, TensorType::raw(shape, DType::Bf16))
-        };
-        let mut parts = Vec::new();
-        if before > 0 {
-            parts.push(leg(before));
-        }
-        parts.push(src);
-        if after > 0 {
-            parts.push(leg(after));
-        }
-        Expr::concat(axis, parts)
-    }
-
-    /// Resolve a whole contract the way the frontend does, so that a view can
-    /// be compiled against the bank it reads.
-    fn resolve(contract: &ModelContract, checkpoint: &dyn CheckpointTypes) -> Checked {
-        let mut resolver = Resolver::new(checkpoint, Partition::WHOLE);
-        for tensor in &contract.tensors {
-            let ty = resolver
-                .infer(&tensor.expr, &tensor.name)
-                .expect("type check failed");
-            resolver.publish(&tensor.name, ty);
-        }
-        resolver.into_checked()
-    }
-
-    /// The copy list an expression lowers to. Every case in this module but
-    /// the gather ones is affine, so a gather here is the test's own mistake.
-    fn lower(expr: Expr, checkpoint: &dyn CheckpointTypes) -> CopyList {
-        lower_to(expr, checkpoint, 1_000_000)
-            .as_copy()
-            .expect("expected a copy list")
-            .clone()
-    }
-
-    fn lower_to(expr: Expr, checkpoint: &dyn CheckpointTypes, max_runs: usize) -> Lowering {
-        let (_, checked) = infer_type(&expr, checkpoint).expect("type check failed");
-        compile(&expr, &checked, max_runs).expect("lowering failed")
-    }
-
-    fn qwen3() -> Fake {
-        Fake::new(&[
-            ("q_proj", &[2048, 2048]),
-            ("k_proj", &[1024, 2048]),
-            ("v_proj", &[1024, 2048]),
-        ])
-    }
-
-    fn srcs(lowering: &CopyList) -> Vec<i64> {
-        lowering
-            .runs
-            .iter()
-            .map(|run| match run.source {
-                RunSource::Leaf { src_elem, .. } => src_elem,
-                RunSource::Zero => -1,
-            })
-            .collect()
-    }
-
-    fn mxfp4() -> QuantSpec {
-        QuantSpec {
-            scheme: QuantScheme::Mxfp4E2M1E8M0,
-            logical_dtype: DType::Bf16,
-            bits_per_element: 4,
-            group_size: 32,
-            channel_axis: Some(Axis(1)),
-        }
-    }
-
-    #[test]
-    fn a_bare_source_is_one_run() {
-        let out = lower(Expr::src("q_proj"), &qwen3());
-        assert_eq!(out.elements, 2048 * 2048);
-        assert_eq!(
-            out.runs,
-            vec![Run {
-                source: RunSource::Leaf {
-                    leaf: 0,
-                    src_elem: 0
-                },
-                dst_elem: 0,
-                len: 2048 * 2048,
-            }]
-        );
-    }
-
-    #[test]
-    fn qkv_fusion_is_three_runs() {
-        let out = lower(
-            Expr::concat(
-                0,
-                vec![
-                    Expr::src("q_proj"),
-                    Expr::src("k_proj"),
-                    Expr::src("v_proj"),
-                ],
-            ),
-            &qwen3(),
-        );
-        assert_eq!(out.run_count(), 3);
-        assert_eq!(out.leaves.len(), 3);
-        assert_eq!(srcs(&out), vec![0, 0, 0]);
-        let lens: Vec<i64> = out.runs.iter().map(|run| run.len).collect();
-        assert_eq!(lens, vec![2048 * 2048, 1024 * 2048, 1024 * 2048]);
-        let dsts: Vec<i64> = out.runs.iter().map(|run| run.dst_elem).collect();
-        assert_eq!(dsts, vec![0, 2048 * 2048, 3072 * 2048]);
-    }
-
-    #[test]
-    fn tp_shard_then_fuse_is_still_three_runs() {
-        // spec.md §5. Rows are contiguous, so sharding costs nothing extra.
-        let out = lower(
-            Expr::concat(
-                0,
-                vec![
-                    Expr::src("q_proj").slice(0, 1024, 1024),
-                    Expr::src("k_proj").slice(0, 512, 512),
-                    Expr::src("v_proj").slice(0, 512, 512),
-                ],
-            ),
-            &qwen3(),
-        );
-        assert_eq!(out.run_count(), 3);
-        assert_eq!(out.elements, 2048 * 2048);
-        assert_eq!(srcs(&out), vec![1024 * 2048, 512 * 2048, 512 * 2048]);
-    }
-
-    #[test]
-    fn column_shard_costs_one_run_per_row() {
-        // Slicing the innermost axis is inherently fragmented; the cost model
-        // must say so rather than hide it.
-        let checkpoint = Fake::new(&[("down_proj", &[2048, 6144])]);
-        let out = lower(Expr::src("down_proj").slice(1, 0, 3072), &checkpoint);
-        assert_eq!(out.run_count(), 2048);
-        assert_eq!(out.mean_run_elements(), 3072);
-        assert_eq!(srcs(&out)[1], 6144);
-        assert_eq!(out.runs[1].dst_elem, 3072);
-    }
-
-    #[test]
-    fn strided_select_picks_alternating_rows() {
-        let checkpoint = Fake::new(&[("gate_up", &[8, 4])]);
-        let gate = lower(Expr::src("gate_up").stride(0, 0, 4, 2), &checkpoint);
-        let up = lower(Expr::src("gate_up").stride(0, 1, 4, 2), &checkpoint);
-        assert_eq!(srcs(&gate), vec![0, 8, 16, 24]);
-        assert_eq!(srcs(&up), vec![4, 12, 20, 28]);
-        assert!(gate.runs.iter().all(|run| run.len == 4));
-    }
-
-    #[test]
-    fn expert_stack_is_one_run_per_expert() {
-        let checkpoint = Fake::new(&[("e0", &[6144, 2048]), ("e1", &[6144, 2048])]);
-        let out = lower(
-            Expr::concat(
-                0,
-                vec![
-                    Expr::src("e0").transmute(TensorType::raw(vec![1, 6144, 2048], DType::Bf16)),
-                    Expr::src("e1").transmute(TensorType::raw(vec![1, 6144, 2048], DType::Bf16)),
-                ],
-            ),
-            &checkpoint,
-        );
-        assert_eq!(out.run_count(), 2);
-        assert_eq!(out.elements, 2 * 6144 * 2048);
-    }
-
-    #[test]
-    fn interleaved_gate_up_shard_matches_the_qwen_moe_pass() {
-        // The hand-written MoE pass this replaced emitted two byte spans per
-        // expert: the local half of gate, then the local half of up. The
-        // algebra derives the same thing from a declaration that mentions
-        // neither experts nor MoE.
-        let checkpoint = Fake::new(&[("gate_up", &[2, 8, 4])]);
-        let out = lower(
-            Expr::concat(
-                1,
-                vec![
-                    Expr::src("gate_up").slice(1, 0, 2),
-                    Expr::src("gate_up").slice(1, 4, 2),
-                ],
-            ),
-            &checkpoint,
-        );
-        assert_eq!(out.run_count(), 4);
-        assert_eq!(out.elements, 2 * 4 * 4);
-        assert_eq!(srcs(&out), vec![0, 16, 32, 48]);
-        let dsts: Vec<i64> = out.runs.iter().map(|run| run.dst_elem).collect();
-        assert_eq!(dsts, vec![0, 8, 16, 24]);
-        // One leaf, read twice.
-        assert_eq!(out.leaves.len(), 1);
-    }
-
-    #[test]
-    fn pad_on_the_outer_axis_brackets_the_data() {
-        let checkpoint = Fake::new(&[("w", &[3, 4])]);
-        let out = lower(pad(Expr::src("w"), &[3, 4], 0, 1, 2), &checkpoint);
-        assert_eq!(out.elements, 6 * 4);
-        assert_eq!(out.run_count(), 3);
-        assert_eq!(out.runs[0].source, RunSource::Zero);
-        assert_eq!(out.runs[0].len, 4);
-        assert_eq!(out.runs[1].len, 12);
-        assert_eq!(out.runs[2].source, RunSource::Zero);
-        assert_eq!(out.runs[2].len, 8);
-    }
-
-    #[test]
-    fn pad_on_an_inner_axis_interleaves() {
-        let checkpoint = Fake::new(&[("w", &[3, 4])]);
-        let out = lower(pad(Expr::src("w"), &[3, 4], 1, 0, 2), &checkpoint);
-        assert_eq!(out.elements, 3 * 6);
-        assert_eq!(out.run_count(), 6);
-        assert_eq!(out.runs[0].len, 4);
-        assert_eq!(out.runs[1].source, RunSource::Zero);
-        assert_eq!(out.runs[1].len, 2);
-    }
-
-    #[test]
-    fn a_view_reads_from_the_contract_that_backs_it() {
-        let contract = ModelContract {
-            alignment: 256,
-            tensors: vec![
-                TensorContract::new(
-                    "qkv",
-                    Expr::concat(0, vec![Expr::src("q_proj"), Expr::src("k_proj")]),
-                    vec![3072, 2048],
-                    Encoding::Raw(DType::Bf16),
-                ),
-                TensorContract::new(
-                    "k_view",
-                    Expr::out("qkv").slice(0, 2048, 1024),
-                    vec![1024, 2048],
-                    Encoding::Raw(DType::Bf16),
-                ),
-            ],
-            groups: Vec::new(),
-        };
-        let checked = resolve(&contract, &qwen3());
-        let view = compile(&contract.tensors[1].expr, &checked, 1024).unwrap();
-        let view = view.as_copy().expect("a band is a copy list");
-        assert_eq!(view.leaves, vec![Leaf::Contract("qkv".to_string())]);
-        assert_eq!(
-            view.runs,
-            vec![Run {
-                source: RunSource::Leaf {
-                    leaf: 0,
-                    src_elem: 2048 * 2048
-                },
-                dst_elem: 0,
-                len: 1024 * 2048,
-            }]
-        );
-    }
-
-    #[test]
-    fn every_output_element_is_covered_exactly_once() {
-        let checkpoint = Fake::new(&[("a", &[4, 6]), ("b", &[2, 6])]);
-        let out = lower(
-            Expr::concat(
-                0,
-                vec![
-                    Expr::src("a").stride(0, 0, 2, 2),
-                    pad(Expr::src("b"), &[2, 6], 1, 1, 0).slice(1, 0, 6),
-                ],
-            ),
-            &checkpoint,
-        );
-        let mut next = 0;
-        for run in &out.runs {
-            assert_eq!(run.dst_elem, next, "gap or overlap at element {next}");
-            next += run.len;
-        }
-        assert_eq!(next, out.elements);
-    }
-
-    #[test]
-    fn deep_nesting_still_reaches_the_leaves() {
-        // Slice(Concat(Slice(...))) — the composition the hand-written per-model
-        // fusion pass refused.
-        let checkpoint = Fake::new(&[("a", &[8, 4]), ("b", &[8, 4])]);
-        let out = lower(
-            Expr::concat(
-                0,
-                vec![Expr::src("a").slice(0, 2, 4), Expr::src("b").slice(0, 0, 4)],
-            )
-            .slice(0, 2, 4),
-            &checkpoint,
-        );
-        assert_eq!(out.elements, 16);
-        // Rows 2,3 of the concat are a's rows 4,5; rows 4,5 are b's rows 0,1.
-        assert_eq!(srcs(&out), vec![16, 0]);
-        assert_eq!(out.runs.iter().map(|run| run.len).sum::<i64>(), 16);
-    }
-
-    #[test]
-    fn the_cost_model_charges_for_copies_not_for_runs() {
-        // These are the four shapes the plan is made of. Each costs what it
-        // should cost, and none of them costs what its run count says.
-        let ck = Fake::new(&[("w", &[2048, 6144]), ("e", &[8, 4]), ("p", &[4, 4])]);
-        // A whole tensor, a row shard and a strided select are each one copy.
-        assert_eq!(lower(Expr::src("w"), &ck).cost(), 1);
-        let shard = lower(Expr::src("w").slice(1, 0, 3072), &ck);
-        assert_eq!(shard.run_count(), 2048);
-        assert_eq!(shard.cost(), 1);
-        assert_eq!(lower(Expr::src("e").stride(0, 0, 4, 2), &ck).cost(), 1);
-        // Fusing three tensors is three copies: one per source.
-        assert_eq!(
-            lower(
-                Expr::concat(
-                    0,
-                    vec![
-                        Expr::src("q_proj"),
-                        Expr::src("k_proj"),
-                        Expr::src("v_proj")
-                    ],
-                ),
-                &qwen3(),
-            )
-            .cost(),
-            3
-        );
-        // A pad is one fill plus one copy per surviving band: the bands sit
-        // in a destination that skips, and a copy engine writes forwards.
-        assert_eq!(lower(pad(Expr::src("p"), &[4, 4], 1, 1, 1), &ck).cost(), 5);
-    }
-
-    #[test]
-    fn the_budget_rejects_a_fragmented_expression() {
-        let checkpoint = Fake::new(&[("w", &[64, 64])]);
-        let expr = Expr::src("w").slice(1, 0, 32);
-        let (_, checked) = infer_type(&expr, &checkpoint).unwrap();
-        assert_eq!(
-            compile(&expr, &checked, 64)
-                .unwrap()
-                .as_copy()
-                .unwrap()
-                .run_count(),
-            64
-        );
-        let err = compile(&expr, &checked, 16).unwrap_err();
-        assert!(err.to_string().contains("not a copy list"));
-    }
-
-    #[test]
-    fn escape_hatches_are_refused() {
-        let checkpoint = Fake::new(&[("w", &[4, 32])]);
-        let expr = Expr::src("w").cast(Encoding::Quant(mxfp4()));
-        let (_, checked) = infer_type(&expr, &checkpoint).unwrap();
-        let err = compile(&expr, &checked, 1024).unwrap_err();
-        assert!(err.to_string().contains("needs a kernel"));
-    }
-
-    #[test]
-    fn byte_runs_scale_by_the_encoding() {
-        let out = lower(Expr::src("k_proj"), &qwen3());
-        let bf16 = out.byte_runs(&Encoding::Raw(DType::Bf16)).unwrap();
-        assert_eq!(bf16[0].len, 1024 * 2048 * 2);
-        let fp8 = out.byte_runs(&Encoding::Raw(DType::E4m3)).unwrap();
-        assert_eq!(fp8[0].len, 1024 * 2048);
-    }
-
-    #[test]
-    fn sub_byte_encodings_need_byte_aligned_runs() {
-        let even = Fake::new(&[("w", &[4, 32])]);
-        let out = lower(Expr::src("w"), &even);
-        // 128 elements at 4 bits = 64 bytes.
-        assert_eq!(out.byte_runs(&Encoding::Quant(mxfp4())).unwrap()[0].len, 64);
-
-        let odd = Fake::new(&[("w", &[1, 5])]);
-        let ragged = lower(Expr::src("w"), &odd);
-        // 5 elements at 4 bits is 2.5 bytes: refused rather than rounded.
-        assert!(ragged.byte_runs(&Encoding::Quant(mxfp4())).is_err());
-    }
-
-    #[test]
-    fn bit_widths_match_the_encodings() {
-        assert_eq!(bits_per_element(&Encoding::Raw(DType::F32)), 32);
-        assert_eq!(bits_per_element(&Encoding::Raw(DType::Bf16)), 16);
-        assert_eq!(bits_per_element(&Encoding::Raw(DType::E4m3)), 8);
-        assert_eq!(bits_per_element(&Encoding::Quant(mxfp4())), 4);
-    }
-
-    // ---- differential test against an independent reference ----------------
-    //
-    // The run walker's job is two things at once: map each output position to a
-    // source, and prove how far that mapping stays contiguous. The mapping is
-    // easy to check by inspection; the contiguity bounds are not. So resolve
-    // every output element the slow, obvious way — one coordinate at a time,
-    // straight off the `Expr`, with no arena and no span reasoning — and require
-    // the compiled runs to reproduce it exactly.
-
-    fn shape_of(expr: &Expr, checkpoint: &dyn CheckpointTypes) -> Vec<i64> {
-        infer_type(expr, checkpoint)
-            .expect("type check failed")
-            .0
-            .shape
-    }
-
-    fn flat_of(coord: &[i64], shape: &[i64]) -> i64 {
-        coord
-            .iter()
-            .zip(shape)
-            .fold(0, |flat, (at, extent)| flat * extent + at)
-    }
-
-    fn unflat_of(mut flat: i64, shape: &[i64]) -> Vec<i64> {
-        let mut coord = vec![0; shape.len()];
-        for axis in (0..shape.len()).rev() {
-            coord[axis] = flat % shape[axis];
-            flat /= shape[axis];
-        }
-        coord
-    }
-
-    /// Resolve one output coordinate to `(leaf name, flat element)`, or `None`
-    /// for padding. Deliberately naive.
-    fn oracle(expr: &Expr, coord: &[i64], ck: &dyn CheckpointTypes) -> Option<(String, i64)> {
-        match expr {
-            Expr::Src(name) => {
-                let shape = ck.tensor_type(name).unwrap().shape;
-                Some((name.clone(), flat_of(coord, &shape)))
-            }
-            Expr::Slice {
-                src, axis, start, ..
-            } => {
-                let axis = usize::from(axis.0);
-                let mut inner = coord.to_vec();
-                inner[axis] = start + coord[axis];
-                oracle(src, &inner, ck)
-            }
-            Expr::Stride {
-                src,
-                axis,
-                start,
-                step,
-                ..
-            } => {
-                let axis = usize::from(axis.0);
-                let mut inner = coord.to_vec();
-                inner[axis] = start + coord[axis] * step;
-                oracle(src, &inner, ck)
-            }
-            Expr::Gather { src, axis, indices } => {
-                let axis = usize::from(axis.0);
-                let mut inner = coord.to_vec();
-                inner[axis] = indices[coord[axis] as usize];
-                oracle(src, &inner, ck)
-            }
-            Expr::Concat { axis, parts } => {
-                let axis = usize::from(axis.0);
-                let mut offset = 0;
-                for part in parts {
-                    let extent = shape_of(part, ck)[axis];
-                    if coord[axis] < offset + extent {
-                        let mut inner = coord.to_vec();
-                        inner[axis] = coord[axis] - offset;
-                        return oracle(part, &inner, ck);
-                    }
-                    offset += extent;
-                }
-                panic!("Concat coordinate out of range");
-            }
-            // Same elements in the same flat order, so the coordinate is
-            // simply re-indexed. The oracle's corpus is dense, and a rename
-            // that also changed the element width would have no coordinate
-            // correspondence to check.
-            Expr::Transmute { src, .. } => {
-                let mine = shape_of(expr, ck);
-                let theirs = shape_of(src, ck);
-                oracle(src, &unflat_of(flat_of(coord, &mine), &theirs), ck)
-            }
-            Expr::Fill { .. } => None,
-            Expr::Out(_)
-            | Expr::Repack { .. }
-            | Expr::Cast { .. }
-            | Expr::Scale { .. }
-            | Expr::Bias { .. }
-            | Expr::Shard { .. }
-            | Expr::SrcIndexed(_)
-            | Expr::Select { .. } => {
-                unreachable!("the oracle covers only Src-rooted affine expressions")
-            }
-        }
-    }
-
-    fn assert_matches_oracle(expr: Expr, checkpoint: &dyn CheckpointTypes) {
-        let out = lower(expr.clone(), checkpoint);
-        let shape = shape_of(&expr, checkpoint);
-
-        // Runs must tile the output exactly: no gaps, no overlaps, no slack.
-        let mut next = 0;
-        for run in &out.runs {
-            assert_eq!(run.dst_elem, next, "gap or overlap at element {next}");
-            assert!(run.len > 0, "empty run at element {next}");
-            next += run.len;
-        }
-        assert_eq!(next, out.elements, "runs do not cover the output");
-
-        // And they must be maximal: no neighbouring pair could have been one
-        // run. Correct-but-fragmented would pass every other assertion here
-        // while quietly wrecking the cost model.
-        for pair in out.runs.windows(2) {
-            assert!(
-                !adjacent(&pair[0], pair[1].source, pair[1].dst_elem),
-                "runs {:?} and {:?} should have merged",
-                pair[0],
-                pair[1]
-            );
-        }
-
-        for run in &out.runs {
-            for step in 0..run.len {
-                let flat = run.dst_elem + step;
-                let want = oracle(&expr, &unflat_of(flat, &shape), checkpoint);
-                let got = match run.source {
-                    RunSource::Leaf { leaf, src_elem } => {
-                        Some((out.leaves[leaf].name().to_string(), src_elem + step))
-                    }
-                    RunSource::Zero => None,
-                };
-                assert_eq!(got, want, "element {flat} of {shape:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn runs_agree_with_the_oracle() {
-        let ck = Fake::new(&[
-            ("a", &[6, 4]),
-            ("b", &[4, 4]),
-            ("c", &[2, 3, 4]),
-            ("d", &[24]),
-        ]);
-        let cases = vec![
-            // Leaves and plain slices.
-            Expr::src("a"),
-            Expr::src("a").slice(0, 2, 3),
-            Expr::src("a").slice(1, 1, 2),
-            Expr::src("a").stride(0, 1, 3, 2),
-            Expr::src("a").stride(1, 0, 2, 2),
-            // Concatenation on every axis.
-            Expr::concat(0, vec![Expr::src("a"), Expr::src("b")]),
-            Expr::concat(1, vec![Expr::src("b"), Expr::src("b")]),
-            // Shard-then-fuse, the spec.md §5 shape.
-            Expr::concat(
-                0,
-                vec![Expr::src("a").slice(0, 0, 3), Expr::src("b").slice(0, 2, 2)],
-            ),
-            // Slice above a Concat: a composition the hand-written per-model
-            // fusion pass could not express.
-            Expr::concat(0, vec![Expr::src("a"), Expr::src("b")]).slice(0, 3, 5),
-            Expr::concat(1, vec![Expr::src("b"), Expr::src("b")]).slice(1, 2, 4),
-            // Renaming in both directions, and above a Concat.
-            Expr::src("c").transmute(TensorType::raw(vec![6, 4], DType::Bf16)),
-            Expr::src("d").transmute(TensorType::raw(vec![2, 3, 4], DType::Bf16)),
-            Expr::concat(0, vec![Expr::src("b"), Expr::src("b")])
-                .transmute(TensorType::raw(vec![4, 8], DType::Bf16)),
-            Expr::concat(
-                0,
-                vec![
-                    Expr::src("b").transmute(TensorType::raw(vec![1, 4, 4], DType::Bf16)),
-                    Expr::src("b").transmute(TensorType::raw(vec![1, 4, 4], DType::Bf16)),
-                ],
-            ),
-            // Padding on each axis, and under a Concat.
-            pad(Expr::src("b"), &[4, 4], 0, 1, 2),
-            pad(Expr::src("b"), &[4, 4], 1, 2, 1),
-            pad(Expr::src("c"), &[2, 3, 4], 1, 1, 1),
-            Expr::concat(
-                0,
-                vec![
-                    pad(Expr::src("b"), &[4, 4], 1, 0, 2),
-                    pad(Expr::src("a"), &[6, 4], 1, 1, 1),
-                ],
-            ),
-            // Three levels deep, mixing every constructor.
-            Expr::concat(
-                0,
-                vec![
-                    pad(Expr::src("a").stride(0, 0, 3, 2), &[3, 4], 1, 1, 0),
-                    pad(
-                        Expr::src("c")
-                            .transmute(TensorType::raw(vec![6, 4], DType::Bf16))
-                            .slice(0, 1, 4),
-                        &[4, 4],
-                        1,
-                        1,
-                        0,
-                    ),
-                ],
-            )
-            .slice(0, 1, 5),
-        ];
-        for expr in cases {
-            assert_matches_oracle(expr, &ck);
-        }
-    }
-
-    // ---- folding runs back into loop nests ---------------------------------
-
-    /// Expand a piece list back into `(source leaf, src element, dst element)`
-    /// triples, in loop order. The fold is only allowed to change the *shape*
-    /// of the description, never which pairs it names.
-    fn expand(pieces: &[Piece]) -> Vec<(Option<usize>, i64, i64)> {
-        let mut out = Vec::new();
-        for piece in pieces {
-            let total: i64 = piece.elements();
-            for flat in 0..total {
-                let (mut src, mut dst) = (0_i64, 0_i64);
-                let mut rest = flat;
-                for dim in piece.dims.iter().rev() {
-                    let at = rest % dim.count;
-                    rest /= dim.count;
-                    src += at * dim.src_stride;
-                    dst += at * dim.dst_stride;
-                }
-                match piece.source {
-                    RunSource::Leaf { leaf, src_elem } => {
-                        out.push((Some(leaf), src_elem + src, piece.dst_elem + dst));
-                    }
-                    RunSource::Zero => out.push((None, 0, piece.dst_elem + dst)),
-                }
-            }
-        }
-        out
-    }
-
-    fn expand_runs(lowering: &CopyList) -> Vec<(Option<usize>, i64, i64)> {
-        let mut out = Vec::new();
-        for run in &lowering.runs {
-            for step in 0..run.len {
-                match run.source {
-                    RunSource::Leaf { leaf, src_elem } => {
-                        out.push((Some(leaf), src_elem + step, run.dst_elem + step))
-                    }
-                    RunSource::Zero => out.push((None, 0, run.dst_elem + step)),
-                }
-            }
-        }
-        out
-    }
-
-    fn assert_fold_preserves(lowering: &CopyList) -> Vec<Piece> {
-        let pieces = lowering.pieces();
-        assert_eq!(
-            pieces.iter().map(Piece::elements).sum::<i64>(),
-            lowering.elements,
-            "folded pieces do not cover the output"
-        );
-        let mut flat = expand_runs(lowering);
-        let mut folded = expand(&pieces);
-        folded.sort_unstable();
-        flat.sort_unstable();
-        assert_eq!(folded, flat, "the fold changed which elements move where");
-
-        // And the copy-only view must name exactly the non-hole pairs.
-        let mut copies = expand(&lowering.copy_pieces());
-        let mut want: Vec<_> = flat
-            .into_iter()
-            .filter(|(leaf, ..)| leaf.is_some())
-            .collect();
-        copies.sort_unstable();
-        want.sort_unstable();
-        assert_eq!(copies, want, "copy_pieces dropped or invented an element");
-        pieces
-    }
-
-    #[test]
-    fn a_row_shard_folds_to_a_single_strided_copy() {
-        // 2048 runs of 3072 elements, each advancing 6144 in the source and
-        // 3072 in the destination. That is one `Extent`, and emitting
-        // 2048 of anything instead would be the whole point missed.
-        let ck = Fake::new(&[("w", &[2048, 6144])]);
-        let out = lower(Expr::src("w").slice(1, 0, 3072), &ck);
-        assert_eq!(out.run_count(), 2048);
-        let pieces = assert_fold_preserves(&out);
-        assert_eq!(
-            pieces,
-            vec![Piece {
-                source: RunSource::Leaf {
-                    leaf: 0,
-                    src_elem: 0
-                },
-                dst_elem: 0,
-                dims: vec![
-                    Dim {
-                        count: 2048,
-                        src_stride: 6144,
-                        dst_stride: 3072
-                    },
-                    Dim {
-                        count: 3072,
-                        src_stride: 1,
-                        dst_stride: 1
-                    },
-                ],
-            }]
-        );
-    }
-
-    #[test]
-    fn a_strided_select_folds_too() {
-        let ck = Fake::new(&[("w", &[8, 4])]);
-        let out = lower(Expr::src("w").stride(0, 0, 4, 2), &ck);
-        assert_eq!(out.run_count(), 4);
-        let pieces = assert_fold_preserves(&out);
-        assert_eq!(pieces.len(), 1);
-        assert_eq!(
-            pieces[0].dims,
-            vec![
-                Dim {
-                    count: 4,
-                    src_stride: 8,
-                    dst_stride: 4
-                },
-                Dim {
-                    count: 4,
-                    src_stride: 1,
-                    dst_stride: 1
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn separate_leaves_stay_separate_pieces() {
-        // Fusion reads three different tensors, so there is no progression to
-        // find and the piece count equals the run count.
-        let out = lower(
-            Expr::concat(
-                0,
-                vec![
-                    Expr::src("q_proj"),
-                    Expr::src("k_proj"),
-                    Expr::src("v_proj"),
-                ],
-            ),
-            &qwen3(),
-        );
-        let pieces = assert_fold_preserves(&out);
-        assert_eq!(pieces.len(), 3);
-        assert!(pieces.iter().all(|piece| piece.dims.len() == 1));
-    }
-
-    #[test]
-    fn a_sharded_fusion_folds_each_part_but_not_across_them() {
-        // Three leaves, each contributing a strided half. Three pieces, each a
-        // two-deep nest — a shape the hand-written per-model fusion pass could
-        // not express.
-        let ck = Fake::new(&[("q", &[512, 256]), ("k", &[256, 256]), ("v", &[256, 256])]);
-        let out = lower(
-            Expr::concat(
-                0,
-                vec![
-                    Expr::src("q").slice(1, 0, 128),
-                    Expr::src("k").slice(1, 0, 128),
-                    Expr::src("v").slice(1, 0, 128),
-                ],
-            ),
-            &ck,
-        );
-        assert_eq!(out.run_count(), 512 + 256 + 256);
-        let pieces = assert_fold_preserves(&out);
-        assert_eq!(pieces.len(), 3);
-        assert_eq!(
-            pieces[0].dims,
-            vec![
-                Dim {
-                    count: 512,
-                    src_stride: 256,
-                    dst_stride: 128
-                },
-                Dim {
-                    count: 128,
-                    src_stride: 1,
-                    dst_stride: 1
-                },
-            ]
-        );
-        assert_eq!(pieces[1].dst_elem, 512 * 128);
-    }
-
-    #[test]
-    fn padding_costs_a_fill_and_a_copy_per_band() {
-        // Zeros and data alternate row by row, so the faithful description is
-        // one piece per band. Setting the holes aside leaves four data rows in
-        // arithmetic progression — but they are 4 elements apart in a
-        // destination whose rows are 6 wide, so widening them into one loop
-        // would need a copy that skips in the destination, and nothing below
-        // this layer can execute one. The honest answer is one copy per row.
-        let ck = Fake::new(&[("w", &[4, 4])]);
-        let out = lower(pad(Expr::src("w"), &[4, 4], 1, 1, 1), &ck);
-        assert!(out.needs_zero_fill());
-        let pieces = assert_fold_preserves(&out);
-        assert!(pieces.len() > 1);
-        for piece in &pieces {
-            if piece.source == RunSource::Zero {
-                assert!(piece.dims.iter().all(|dim| dim.src_stride == 0));
-            }
-        }
-        let copies = out.copy_pieces();
-        assert_eq!(copies.len(), 4);
-        for (row, piece) in copies.iter().enumerate() {
-            assert_eq!(
-                *piece,
-                Piece {
-                    source: RunSource::Leaf {
-                        leaf: 0,
-                        src_elem: row as i64 * 4,
-                    },
-                    dst_elem: row as i64 * 6 + 1,
-                    dims: vec![Dim {
-                        count: 4,
-                        src_stride: 1,
-                        dst_stride: 1,
-                    }],
-                }
-            );
-        }
-        assert_eq!(out.cost(), 5);
-    }
-
-    #[test]
-    fn an_unpadded_output_needs_no_fill() {
-        let out = lower(Expr::src("q_proj"), &qwen3());
-        assert!(!out.needs_zero_fill());
-        assert_eq!(out.copy_pieces(), out.pieces());
-    }
-
-    #[test]
-    fn folding_agrees_with_the_runs_on_every_oracle_case() {
-        let ck = Fake::new(&[("a", &[6, 4]), ("b", &[4, 4]), ("c", &[2, 3, 4])]);
-        let cases = vec![
-            Expr::src("a"),
-            Expr::src("a").slice(1, 1, 2),
-            Expr::src("a").stride(0, 1, 3, 2),
-            Expr::concat(0, vec![Expr::src("a"), Expr::src("b")]),
-            Expr::concat(1, vec![Expr::src("b"), Expr::src("b")]),
-            Expr::src("c").transmute(TensorType::raw(vec![6, 4], DType::Bf16)),
-            pad(Expr::src("b"), &[4, 4], 0, 1, 2),
-            pad(Expr::src("b"), &[4, 4], 1, 2, 1),
-            pad(Expr::src("c"), &[2, 3, 4], 1, 1, 1),
-            Expr::concat(0, vec![Expr::src("a"), Expr::src("b")]).slice(0, 3, 5),
-            Expr::concat(
-                0,
-                vec![
-                    pad(Expr::src("a").stride(0, 0, 3, 2), &[3, 4], 1, 1, 0),
-                    pad(
-                        Expr::src("c")
-                            .transmute(TensorType::raw(vec![6, 4], DType::Bf16))
-                            .slice(0, 1, 4),
-                        &[4, 4],
-                        1,
-                        1,
-                        0,
-                    ),
-                ],
-            )
-            .slice(0, 1, 5),
-        ];
-        for expr in cases {
-            assert_fold_preserves(&lower(expr, &ck));
-        }
-    }
-
-    #[test]
-    fn oracle_agreement_holds_for_views_over_contracts() {
-        // `Out` cannot go through the oracle (it needs a contract scope), so
-        // check the one property that matters: a view of a bank reads exactly
-        // the bank rows it names.
-        let contract = ModelContract {
-            alignment: 256,
-            tensors: vec![
-                TensorContract::new(
-                    "bank",
-                    Expr::concat(
-                        0,
-                        vec![
-                            Expr::src("q_proj"),
-                            Expr::src("k_proj"),
-                            Expr::src("v_proj"),
-                        ],
-                    ),
-                    vec![4096, 2048],
-                    Encoding::Raw(DType::Bf16),
-                ),
-                TensorContract::new(
-                    "q",
-                    Expr::out("bank").slice(0, 0, 2048),
-                    vec![2048, 2048],
-                    Encoding::Raw(DType::Bf16),
-                ),
-                TensorContract::new(
-                    "k",
-                    Expr::out("bank").slice(0, 2048, 1024),
-                    vec![1024, 2048],
-                    Encoding::Raw(DType::Bf16),
-                ),
-                TensorContract::new(
-                    "v",
-                    Expr::out("bank").slice(0, 3072, 1024),
-                    vec![1024, 2048],
-                    Encoding::Raw(DType::Bf16),
-                ),
-            ],
-            groups: Vec::new(),
-        };
-        let checked = resolve(&contract, &qwen3());
-        let starts: Vec<i64> = contract.tensors[1..]
-            .iter()
-            .map(|entry| {
-                let out = compile(&entry.expr, &checked, 16).unwrap();
-                let out = out.as_copy().expect("a band is a copy list");
-                assert_eq!(out.run_count(), 1);
-                assert_eq!(out.leaves, vec![Leaf::Contract("bank".to_string())]);
-                match out.runs[0].source {
-                    RunSource::Leaf { src_elem, .. } => src_elem,
-                    RunSource::Zero => panic!("view resolved to padding"),
-                }
-            })
-            .collect();
-        assert_eq!(starts, vec![0, 2048 * 2048, 3072 * 2048]);
-    }
-
-    /// A blocked payload is addressed in blocks, not in bits.
-    ///
-    /// The two numbers that must not be confused: Q4_0 spends 18 bytes on 32
-    /// elements, while "4 bits per element" prices the same 32 at 16. The gap
-    /// is the F16 scale that lives inside the block, and it compounds -- row
-    /// 1 is off by 2 bytes, row 100 by 200.
-    ///
-    /// Pinned at the boundaries rather than at one value, because an
-    /// off-by-one-block error and a correct answer agree at zero.
-    #[test]
-    fn a_blocked_element_offset_counts_whole_blocks() {
-        let q4_0 = Encoding::Quant(QuantSpec {
-            scheme: QuantScheme::GgufQ4_0,
-            logical_dtype: DType::Bf16,
-            bits_per_element: 4,
-            group_size: 32,
-            channel_axis: None,
-        });
-        let scale = ByteScale::of(&q4_0);
-        for (elems, bytes) in [(0i64, 0u64), (32, 18), (64, 36), (2048, 1152)] {
-            assert_eq!(
-                scale.offset(elems, "test").unwrap(),
-                bytes,
-                "{elems} elements"
-            );
-        }
-        // Under the bit rule these would have been 4, 16 and 20 bytes.
-        for partial in [8i64, 31, 33] {
-            let why = scale.offset(partial, "test").unwrap_err().to_string();
-            assert!(why.contains("block boundary"), "{partial}: {why}");
-        }
-    }
-
-    /// The bit rule still applies to everything that is not blocked.
-    #[test]
-    fn an_unblocked_encoding_is_still_priced_by_its_bits() {
-        assert_eq!(
-            ByteScale::of(&Encoding::Raw(DType::Bf16))
-                .offset(32, "test")
-                .unwrap(),
-            64
-        );
-        let awq = Encoding::Quant(QuantSpec {
-            scheme: QuantScheme::AwqInt4,
-            logical_dtype: DType::Bf16,
-            bits_per_element: 4,
-            group_size: 128,
-            channel_axis: None,
-        });
-        assert_eq!(ByteScale::of(&awq).offset(32, "test").unwrap(), 16);
-    }
-}

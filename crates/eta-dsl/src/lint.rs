@@ -1,10 +1,8 @@
-//! SDK span lints: SPSC double-endpoint, readiness-direction
-//! conflict, and sink stage-precedence — caught during assembly with source
-//! spans. The IR's [`bind`](eta_ir::validate::bind) is the
-//! authoritative SPSC gate (host-role vs pass; the descriptor + all stages are
-//! one pass endpoint, so a channel touched by both the descriptor and a stage is
-//! legal). These run first for friendly, span-rich author errors and mirror
-//! the IR's model.
+//! SDK span lints: SPSC double-endpoint, readiness-direction conflict, and
+//! sink stage-precedence — caught during assembly with source spans. The
+//! IR's [`bind`](eta_ir::validate::bind) is the authoritative SPSC gate;
+//! these run first for friendly, span-rich author errors and mirror its
+//! model.
 
 use alloc::vec::Vec;
 
@@ -32,10 +30,8 @@ pub(crate) fn lint(
         let stage_puts = !st.prog_puts.is_empty();
         let stage_consumes = !st.prog_takes.is_empty() || !st.desc_takes.is_empty();
 
-        // Double-endpoint (SPSC, T2): the host claims *both* endpoints (writes
-        // and consumes the same channel) — no pass endpoint remains. (Host-vs-
-        // stage conflicts are structurally avoided by role derivation; the IR's
-        // bind is the authoritative gate on the container.)
+        // Double-endpoint: the host claims both endpoints (writes and
+        // consumes the same channel) — no pass endpoint remains.
         if let (Some(w), Some(c)) = (host_writes, host_consumes) {
             errs.push(TraceError::DoubleEndpoint {
                 channel: name.clone(),

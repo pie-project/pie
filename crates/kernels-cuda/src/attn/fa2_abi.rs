@@ -8,14 +8,7 @@ use crate::attn::plan::{DecodePlan, PrefillPlan};
 
 pub type DevicePtr = u64;
 
-/// `::flashinfer::uint_fastdiv`, measured at 24 bytes / align 8 (the fa2
-/// and mla probe scripts agreed; this is the one spelling both param
-/// blocks now share). The C++ type's defined fields sit at bytes 0 (the
-/// divisor, u32), 8 (the magic, u64) and 16 (the divisor again, u32);
-/// encoding them as three fully-initialized u64 words `[d, magic, d]`
-/// lands each in place and writes the two padding holes a field-struct
-/// spelling would leave undefined as zeros — every byte of the by-value
-/// block is deterministic.
+/// `::flashinfer::uint_fastdiv`: 24 bytes / align 8. The C++ fields sit at bytes 0 (divisor, u32), 8 (magic, u64), 16 (divisor again, u32); encoding as three u64 words `[d, magic, d]` lands each in place and zeros the padding holes a field-struct spelling would leave undefined.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct UintFastdiv {
@@ -86,15 +79,7 @@ pub struct DecodeParams {
     pub kv_chunk_size_ptr: DevicePtr,
     pub block_valid_mask: DevicePtr,
     pub partition_kv: bool,
-    /// **THE DECODE SIDE'S ROW INDIRECTION** — `[lanes + 1]` query
-    /// boundaries, appended to `::flashinfer::BatchDecodeParams` where
-    /// prefill has carried a `q_indptr` all along. `decode.cuh` read
-    /// `q + batch_idx * q_stride_n` and now reads
-    /// `q + q_indptr[batch_idx] * q_stride_n`; for a decode lane the two are
-    /// the same number whenever the vector is the launch's own rebased one,
-    /// because a decode lane is exactly one query row. They part company when
-    /// `batch_idx` is a FIRE lane and the rows it names are the plane's,
-    /// which is the whole reason the field exists.
+    /// The decode side's row indirection — `[lanes + 1]` query boundaries. `decode.cuh` reads `q + q_indptr[batch_idx] * q_stride_n` rather than `q + batch_idx * q_stride_n`, which differs whenever `batch_idx` is a fire lane and the rows it names are the plane's.
     pub q_indptr: DevicePtr,
 }
 
@@ -174,10 +159,7 @@ pub struct Partials {
     pub head_dim: u32,
 }
 
-/// A workspace seat as the params spell it: base plus the laid offset. A
-/// `None` seat resolves to the base — exactly the byte value the old `-1`
-/// sentinel produced — and is guarded off by the schedule's flags before
-/// the device ever dereferences it.
+/// A workspace seat as the params spell it: base plus the laid offset. A `None` seat resolves to the base and is guarded off by the schedule's flags before the device ever dereferences it.
 pub(crate) const fn resolve(base: DevicePtr, off: Option<u32>) -> DevicePtr {
     match off {
         Some(off) => base.saturating_add(off as u64),
@@ -196,16 +178,7 @@ pub fn sm_scale_or_default(sm_scale: f32, head_dim: u32) -> f32 {
 
 /// The paged-kv view the fa2 kernels take by value.
 ///
-/// **`batch_size` IS THE INDEX THE PROTECTIVE PAGE BOUND IS READ AT**, and
-/// that is its only device meaning: three `indptr[batch_size]` sites
-/// (`decode.cuh`:479 and :753, `prefill.cuh`:3420) take it as `last_indptr`,
-/// the ceiling `paged_kv_t::protective_get_kv_offset` clamps an over-iterated
-/// page against. It is therefore ONE PAST THE LAST LANE OF THE VECTOR THIS
-/// LAUNCH WAS HANDED — `lane_offset + num_requests`, which is the request
-/// count itself wherever the table was sliced to the window, and the window's
-/// end inside the FIRE's table wherever it was handed over whole. Too SMALL
-/// is the silent failure: a legitimate page clamps to offset 0 and the fire
-/// reads page zero's bytes.
+/// `batch_size` is the index the protective page bound (`indptr[batch_size]`) is read at: it must be one past the last lane of the vector this launch was handed (`lane_offset + num_requests`). Too small is a silent failure — a legitimate page clamps to offset 0 and the fire reads page zero's bytes.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn make_paged_kv(
@@ -294,10 +267,7 @@ pub fn make_decode_params(
     p.kv_tile_indices = resolve(int_buf, info.kv_tile_indices_offset);
     p.o_indptr = resolve(int_buf, info.o_indptr_offset);
     p.kv_chunk_size_ptr = resolve(int_buf, info.kv_chunk_size_ptr_offset);
-    // The row indirection, from the same CSR the prefill side takes. It is
-    // never optional: `decode.cuh` dereferences it for every work item, so a
-    // caller that leaves it null faults loudly rather than reading the rows
-    // `batch_idx` used to name.
+    // never optional: decode.cuh dereferences it for every work item.
     p.q_indptr = bufs.qo_indptr;
     p.padded_batch_size = info.padded_batch_size as u32;
     p.partition_kv = info.split_kv;
@@ -379,16 +349,8 @@ pub fn make_prefill_params(
     p.partition_kv = info.split_kv;
 
     p.max_total_num_rows = info.total_num_rows as u32;
-    // **THE COUNT THE PLAN HAS BEEN STAGING ALL ALONG**, wired at last. The
-    // schedule writes `qo_indptr[batch_size]` — this window's own row total —
-    // at `total_num_rows_offset` whenever it laid one out, and the fold reads
-    // `*seq_len_ptr` in place of the baked `max_seq_len` when the pointer is
-    // not null. The two numbers are equal by construction (`Request::
-    // total_num_rows` IS that last boundary), so wiring it moves no token; it
-    // is the fold's bound becoming a word this fire wrote rather than one a
-    // capture froze. A schedule that laid no such word out keeps the null,
-    // which is why this is not `resolve` — `resolve` answers the workspace
-    // BASE for an absent seat, and the fold would read that as a count.
+    // the fold reads *seq_len_ptr in place of the baked max_seq_len when non-null.
+    // not `resolve`: an absent seat must stay null here, not resolve to the workspace base (which would be read as a count).
     p.total_num_rows = match info.total_num_rows_offset {
         Some(off) => int_buf.saturating_add(u64::from(off)),
         None => 0,

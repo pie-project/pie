@@ -1,47 +1,15 @@
-//! The handle table: what a `kernels_metal::Tensor`'s `u32` means.
-//!
-//! **THIS IS THE ONE PLACE THE TWO SHELLS GENUINELY DIVERGE.** A
-//! `kernels_cuda::Tensor` carries a device address, so its shell hands out
-//! `base + offset` and the resolution is arithmetic. Metal has no address to
-//! hand out: a compute encoder binds a BUFFER and an OFFSET
-//! (`setBuffer:offset:atIndex:`), so the number a `Tensor` carries has to be
-//! an index into something. This is that something — one row per carved
-//! view, minted by whoever carved it and read by the encode sink.
-//!
-//! **Two generations in one table, and the watermark is what separates
-//! them.** Weight rows are minted once at load and read by every fire
-//! afterwards; arena slots, pool views and staged input vectors are minted
-//! per fire and dead at the end of it. Both live here because a `Tensor` is
-//! one `u32` wide and cannot say which it is. [`Handles::seal`] records the
-//! load-time watermark and [`Handles::rewind`] drops everything past it, so
-//! a fire's minting costs one `Vec` push per view and its cleanup costs one
-//! truncate — and a stale fire handle cannot survive into the next fire to
-//! be resolved against the wrong offset.
-//!
-//! **THE REWIND IS AT ENQUEUE AND NOT AT SETTLE, AND THAT IS WHAT LETS TWO
-//! STEPS BE IN FLIGHT.** A row is read by the ENCODER, at
-//! `setBuffer:offset:`, and a command buffer retains what it was bound to —
-//! so a step's rows are dead the moment its last dispatch is encoded, long
-//! before the device has finished the work. Held until settlement instead,
-//! the table would have no room for the step behind. The one row a settlement
-//! still needs — the out seam's, for the readout copy — is resolved into a
-//! retained buffer and a `u64` offset while it is still alive, which is why
-//! nothing downstream of `enqueue` holds a handle at all.
-//!
-//! A row RETAINS its buffer. That is what lets the arena, the pools and the
-//! inputs slab each be owned by their own module while the sink resolves a
-//! handle without borrowing any of them.
+//! The handle table: a `kernels_metal::Tensor`'s `u32` is an index into this
+//! table, one row per carved view. Weight rows are minted once at load;
+//! arena/pool/input rows are minted per fire and dropped at [`Handles::seal`]'s
+//! watermark by [`Handles::rewind`], at enqueue rather than settle.
 
 use std::cell::{Ref, RefCell};
 
 use super::alloc::{Buffer, Slab};
 use crate::error::{Fault, Result};
 
-/// The handle every `absent` argument carries: a slot the shader declares
-/// nothing at, or an optional pointer this entry does not pass.
-///
-/// `u32::MAX` rather than 0 because 0 is a perfectly good handle — the first
-/// row minted — and a null spelled as a valid index is a silent bind of
+/// The handle for an absent argument. Not 0, since 0 is a valid handle (the
+/// first row minted) and a null spelled as a valid index silently binds
 /// somebody else's bytes.
 pub const NIL: u32 = u32::MAX;
 
@@ -74,16 +42,8 @@ impl std::fmt::Debug for Binding {
     }
 }
 
-/// Every view this load has minted, in minting order.
-///
-/// **INTERIOR-MUTABLE, AND THE WINDOW IS WHY.** A dispatch arm resolves its
-/// operands through `Run::tensor`, which cuts each one to the asking
-/// region's row window (design §0) — and on this plane a cut IS a new
-/// handle, because Metal has no address to add an offset to. `Run::tensor`
-/// takes `&self` (the walk's `Dispatch` contract), so the minting has to be
-/// a write through a shared reference. The `RefCell` is never borrowed
-/// across a call into another module, and the whole table lives on one
-/// thread.
+/// Every view this load has minted, in minting order. Interior-mutable
+/// because `Run::tensor` mints while taking `&self`.
 #[derive(Default)]
 pub struct Handles {
     rows: RefCell<Vec<Binding>>,
@@ -91,9 +51,8 @@ pub struct Handles {
     sealed: std::cell::Cell<usize>,
 }
 
-// SAFETY: the rows retain `MTLBuffer`s, which are documented thread-safe for
-// retain/release and for binding; the same argument `Buffer`'s own `Send`
-// makes, for the same move.
+// SAFETY: rows retain `MTLBuffer`s, documented thread-safe for retain/release
+// and binding.
 unsafe impl Send for Handles {}
 
 impl std::fmt::Debug for Handles {
@@ -112,11 +71,9 @@ impl Handles {
         Handles::default()
     }
 
-    /// Mint a handle for `len` bytes of `buffer` starting at `offset`.
-    ///
-    /// The length is not stored — a `Tensor` states its own rectangle and
-    /// the kernels read it from there — but it IS checked, here, because
-    /// this is the last place a carve can be caught before a shader
+    /// Mint a handle for `len` bytes of `buffer` starting at `offset`. The
+    /// length is not stored (a `Tensor` states its own rectangle) but is
+    /// checked here, the last place a carve can be caught before a shader
     /// dereferences past the reservation.
     ///
     /// # Errors
@@ -142,11 +99,6 @@ impl Handles {
     }
 
     /// Mint a handle `skip` bytes further into whatever `handle` names.
-    ///
-    /// The windowed cut, and the reason this table exists: a CUDA shell
-    /// answers this with `ptr + skip` and no state at all. The row is
-    /// bounds-checked against the buffer the parent row names, so a cut past
-    /// the end is refused here rather than in a shader.
     ///
     /// # Errors
     ///
@@ -195,12 +147,8 @@ impl Handles {
         Some(Ref::map(rows, |rows| &rows[handle as usize]))
     }
 
-    /// Declare everything minted so far to be load-lived.
-    ///
-    /// Called once, after the weight table is built and before the first
-    /// fire. Sealing twice would move the watermark past rows a fire minted,
-    /// which is the leak this method exists to prevent — so it takes the
-    /// first answer and keeps it.
+    /// Declare everything minted so far to be load-lived. Called once, before
+    /// the first fire; a second call is a no-op.
     pub fn seal(&self) {
         if self.sealed.get() == 0 {
             self.sealed.set(self.rows.borrow().len());

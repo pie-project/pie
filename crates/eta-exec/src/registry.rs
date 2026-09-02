@@ -10,14 +10,8 @@ use super::plan::{ExecPlan, adopt_launch_package};
 use super::value::{Value, concrete_dtype, decode_wire, wire_cell_bytes};
 use crate::{Error, Result};
 
-/// How much of a fire's geometry an instance's descriptor resolves on device.
-///
-/// The port registry's, now that the ports live there (palo decision 19). This
-/// plane used to declare a three-variant copy of it plus `from_wire`/`to_wire`
-/// against three `PIE_GEOMETRY_CLASS_*` `u32` constants, which a `const`
-/// assertion in the runtime↔engine contract held in step with a fourth
-/// spelling. Naming the crate here was the last trace of that; this plane does
-/// not depend on it, so it does not cite it either.
+/// How much of a fire's geometry an instance's descriptor resolves on
+/// device. The port registry's own type, re-exported here.
 pub use eta_ir::registry::GeometryClass as Geometry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -31,13 +25,6 @@ pub enum Direction {
 
 impl Direction {
     /// Which way `channel` crosses, if it crosses.
-    ///
-    /// This function and the `from_wire` that stood beside it read the SAME
-    /// axis out of two different encodings — `extern_dir: i8` as `0 => Import,
-    /// 1 => Export, else Private`, and `PIE_CHANNEL_EXTERN_*` as
-    /// `1 => Import, 2 => Export, 0 => Private` — and nothing said they were
-    /// about the same thing. There is one encoding now, and it is an
-    /// `Option<ExternDir>`.
     #[must_use]
     pub const fn of(channel: &LaunchChannel) -> Self {
         match channel.extern_dir {
@@ -48,11 +35,7 @@ impl Direction {
     }
 }
 
-/// Which end of a channel the host holds.
-///
-/// ETA's own, re-exported. This plane used to declare a three-variant copy
-/// and derive it from two `flags` bits — a two-bit encoding of three states,
-/// whose fourth pattern was reachable and meant nothing.
+/// Which end of a channel the host holds. ETA's own, re-exported.
 pub use eta_ir::container::HostRole;
 
 pub use eta_compiler::codegen::program::EmittedKernel;
@@ -135,13 +118,6 @@ pub struct Endpoint {
 
     pub word_bytes: usize,
 }
-
-// `mirror_base` and `word_base` — the host ring's cell allocation and word
-// array as raw addresses — stood beside them. They were the neutral half of
-// the address-publishing contract F2a replaced: an engine adopts a host ring
-// by taking the pinned half over, not by being handed a `u64` to dereference.
-// Nothing has read either since, and the two `ChannelState` accessors that
-// produced them are gone with the fields (alto E).
 
 #[derive(Debug)]
 pub struct Instance {

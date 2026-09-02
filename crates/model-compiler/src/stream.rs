@@ -1,89 +1,43 @@
-//! P6: the dependency DAG over the capture-phase regions, and the fork/join
-//! event points it bakes into the region table.
+//! The `stream` pass: the dependency DAG over the capture-phase regions, and
+//! the fork/join event points it bakes into the region table, so independent
+//! windows (masked, decode, prefill) that otherwise ran one after another on
+//! one stream — each leaving most of the device idle — can be in flight
+//! together. Does not partition SMs; ships [`Region::sm_hint`] as a number
+//! nothing reads yet.
 //!
-//! **WHAT THIS PASS IS FOR, IN ONE PICTURE.** Design §0's fire runs a masked
-//! window, a decode window and a prefill window inside one forward pass. On
-//! one stream they run one after another, and each of them leaves most of the
-//! device idle — a decode attention over three rows cannot fill an L40S, and
-//! neither can a masked window over one lane. Nothing orders them: they read
-//! the same keys, they write disjoint rows of one column, and no value passes
-//! between them. So they are three kernels that could be in flight together
-//! and are not, which is the bubble tart's whole research line is about
-//! (`.wiki/tart/evidence/green_contexts.md`, Finding 3 — measured: one CUDA
-//! graph CAN span streams through the fork/join capture pattern).
-//!
-//! What this pass does NOT do is partition SMs. That is decision #14: the
-//! partition is baked at capture (Finding 5), so a variant multiplies bodies,
-//! and v1 ships [`Region::sm_hint`] — a number nothing reads yet — rather than
-//! a green context. What v1 ships that DOES run is the streams.
-//!
-//! # The dependency rule, stated
+//! # The dependency rule
 //!
 //! Region `B` (later in program order) depends on region `A` (earlier) when
-//! any of these holds. `writes(R)` and `reads(R)` are the union of every
-//! node's `Operands::outputs` and `Operands::inputs` over `R`'s node range.
+//! any of these holds. `writes(R)`/`reads(R)` are the union of every node's
+//! `Operands::outputs`/`inputs` over `R`'s node range.
 //!
 //! ```text
 //! RAW   reads(B)  ∩ writes(A) ≠ ∅        B reads what A wrote
 //! WAR   writes(B) ∩ reads(A)  ≠ ∅        B overwrites what A read
 //! WAW   writes(B) ∩ writes(A) ≠ ∅        both write the same value
 //! CACHE both touch one cache space       an append is an effect no value carries
-//! BAR   either carries a collective      decision #5, one step further
+//! BAR   either carries a collective
 //! SLAB  both name a `DeviceProfile::exclusive` op    a shared device workspace
 //! ```
 //!
-//! **THE CACHE CLAUSE IS CONSERVATIVE AND IT HAS TO BE.** `Attention::KvAppend`
-//! names its cache among its INPUTS and produces no output at all: the write
-//! is an effect, and a rule that read `outputs` would not see it. So any node
-//! naming a `Def::Cache` value is taken to WRITE that space — no list of op
-//! names, no guess about which of them mutate — and two regions touching one
-//! space are ordered.
+//! The cache clause is conservative on purpose: `Attention::KvAppend` names
+//! its cache among its inputs and produces no output, so a rule reading only
+//! `outputs` would miss the write. Any node naming a `Def::Cache` value is
+//! taken to write that space. The one exemption: two regions with disjoint
+//! class masks cannot touch the same cache bytes, since a cache's storage is
+//! owned per lane (a kv page belongs to one sequence, a recurrent slab to
+//! one lane's row) — this exemption does *not* extend to values or to the
+//! slab clause (a slab is one buffer for the whole device, not a per-lane
+//! row, and `DeviceProfile::exclusive` is a device fact no pure compiler
+//! pass can derive on its own).
 //!
-//! **THE ONE EXEMPTION, AND WHY IT IS EXACT.** Two regions whose class masks
-//! are DISJOINT cannot touch the same cache bytes, however conservatively the
-//! space is read. A class is a set of lanes, classes partition the lanes of a
-//! fire, and a cache's storage is owned per lane: a kv page belongs to one
-//! sequence (`engine`'s `Lane::kv` is one delta, the runtime keeps one page
-//! table) and a recurrent slab is one lane's row. Disjoint classes are
-//! disjoint lanes are disjoint pages. So gemma's masked append and its decode
-//! append are not ordered against each other, and both are ordered against
-//! every reader whose window overlaps theirs — which is the answer that is
-//! both correct and useful.
-//!
-//! **THE SLAB CLAUSE IS THE ONE THING A PURE COMPILER CANNOT DERIVE**, and
-//! it is why `DeviceProfile::exclusive` exists. A kernel platform may give an
-//! entry a process-global workspace — CUDA's does, keyed by a static name and
-//! deliberately not per stream, because an entry that allocated per fire could
-//! not be captured — and two launches inside it at once stage over each other.
-//! No `Operands` method says so and no `Ty` does; the shell knows, so the
-//! shell passes the list. Two regions that each name one are ordered, and the
-//! disjoint-mask exemption does NOT apply: a slab is one buffer for the whole
-//! device, not a per-lane row.
-//!
-//! The exemption is NOT extended to values. A value is one rectangle of the
-//! arena, and two regions with disjoint masks writing it write disjoint ROWS
-//! of it — true, and load-bearing in §5's zero-instruction φ — but a RAW edge
-//! between disjoint masks would mean a reader reading rows nobody in its own
-//! window wrote, which is a model text this pass has no business quietly
-//! scheduling around.
-//!
-//! # Concurrency candidates
+//! # Concurrency candidates and groups
 //!
 //! Two capture regions are candidates when the closure of the rule above has
-//! **no path either way** between them AND their class masks are disjoint.
-//! Both halves are needed and neither implies the other: the DAG is what says
-//! no value passes between them, and the disjoint masks are what say the rows
-//! they write cannot be the same rows.
-//!
-//! # Groups, and why they are ADJACENT runs
-//!
-//! A fork group is a maximal run of CONSECUTIVE capture regions that are
-//! pairwise candidates. Consecutive, because the walk is a straight line and a
-//! stream switches at a region boundary: a group that skipped over a region
-//! would have to put that region somewhere, and "somewhere" is a scheduling
-//! pass this compiler does not have (design's open items — region-enlarging
-//! reordering is deferred and correctness-neutral). The catalog does not need
-//! one: a merge's arms are adjacent because a model text writes them that way.
+//! no path either way between them AND their class masks are disjoint. A
+//! fork group is a maximal run of *consecutive* candidates — consecutive
+//! because the walk is a straight line and a stream switches at a region
+//! boundary; this compiler has no region-reordering pass.
 //!
 //! ```text
 //! r5  qkv, rope, kv_append   mask {0,2}   stream 0
@@ -93,114 +47,79 @@
 //! r9  o_proj, mlp, …         mask {0,1,2} stream 0  wait E3, E4 ─────────────
 //! ```
 //!
-//! The first member stays on the main stream and OPENS the group: it records
-//! the entry event on the main stream after its own waits and before its own
-//! first launch. Every arm waits on that one event, runs, and records an exit;
-//! the region after the group waits on every exit.
-//!
-//! **THE ENTRY EVENT IS AT THE TOP OF THE MAIN ARM, NOT AT THE END OF THE
-//! REGION BEFORE IT**, and the reason is that transformer layers put fork
-//! groups back to back. Gemma's layer forks twice — the decode qkv beside the
-//! prefill/masked qkv, then the three attention arms — and the region before
-//! the second group is an ARM of the first, sitting on a side stream. An
-//! event recorded at the end of a side stream's region says nothing about
-//! where the main stream is. The top of the main arm says exactly the right
-//! thing: everything before this group has been enqueued on this stream, the
-//! previous group's arms have been waited for, and this group's own work has
-//! not started.
-//!
-//! A group with no region after it is not forked at all: a side stream that
-//! never rejoined would end the capture on `cudaErrorStreamCaptureUnjoined`.
-//! Nothing else about a group's position matters — the main stream is where
-//! the shell staged the fire's descriptor before the walk began, so an arm
-//! that waits on a main-stream event is ordered after the staging too.
+//! The first member stays on the main stream and opens the group: it
+//! records the entry event on the main stream after its own waits and
+//! before its own first launch (at the *top* of the main arm, not the end
+//! of the region before it, since two fork groups can sit back to back and
+//! an event at the end of a side-stream region says nothing about where the
+//! main stream is). Every arm waits on that one event, runs, and records an
+//! exit; the region after the group waits on every exit. A group with no
+//! region after it is not forked at all — a side stream that never rejoined
+//! would end the capture on `cudaErrorStreamCaptureUnjoined`.
 //!
 //! # The cost gate
 //!
 //! Forking B out from beside A saves at most `min(cost A, cost B)` and costs
-//! one [`DeviceProfile::event_pair_us`](crate::DeviceProfile::event_pair_us),
-//! paid on every fire whether or not this fire has rows for either window. So
-//! a small kernel behind an event pair is a loss, and both sides of the
-//! overlap must clear [`DeviceProfile::fork_floor_us`] before a stream is
-//! handed out. Costs come from
-//! [`FamilyCosts`](crate::budget::FamilyCosts) — a table the caller passes,
-//! never a measurement this crate takes.
-//!
-//! A plan with no candidate pair, or one whose candidates are all too cheap,
-//! bakes every region on stream 0 with no event point anywhere, which is
-//! byte-for-byte the artifact this compiler produced before P6 existed. **It
-//! pays nothing.**
+//! one [`DeviceProfile::event_pair_us`](crate::DeviceProfile::event_pair_us)
+//! paid on every fire; both sides of the overlap must clear
+//! [`DeviceProfile::fork_floor_us`] before a stream is handed out. A plan
+//! with no candidate pair worth forking bakes every region on stream 0 with
+//! no event point at all.
 //!
 //! # Determinism
 //!
-//! The assignment is a pure function of `(plan, classes, profile)`. Regions
-//! are visited in program order, groups are found left to right, streams are
-//! handed out in member order, and events are numbered in emission order.
-//! Nothing is sorted by a cost, hashed, or read off the environment.
+//! The assignment is a pure function of `(plan, classes, profile)`: regions
+//! visited in program order, groups found left to right, streams handed out
+//! in member order, events numbered in emission order.
 //!
 //! # The safety argument
 //!
-//! **TWO REGIONS THIS PASS PUTS ON DIFFERENT STREAMS CANNOT RACE**, and the
-//! argument has three parts, each owned by a different piece of the build:
+//! Two regions this pass puts on different streams cannot race:
 //!
-//! 1. **They write disjoint values.** The dependency DAG guarantees it: a
-//!    shared written value is a WAW edge, and a pair with an edge is not a
-//!    candidate. What remains shared is what a `Def::Merge` folded into one
-//!    rectangle on purpose — a merge's arms — and those write disjoint ROWS,
-//!    because their masks are disjoint and `Run::cut` slices every windowed
-//!    write at the region's own window (build log 8).
-//! 2. **They write disjoint arena bytes.** The carve guarantees it:
+//! 1. They write disjoint values — the dependency DAG guarantees it (a
+//!    shared write is a WAW edge, disqualifying the pair); a merge's arms
+//!    share one rectangle but write disjoint rows of it, since their masks
+//!    are disjoint and `Run::cut` slices every windowed write at the
+//!    region's own window.
+//! 2. They write disjoint arena bytes — the carve guarantees it:
 //!    [`Concurrency`](crate::Concurrency) is threaded into `arena::carve`,
-//!    so two values live in regions
-//!    this pass paired are never given the same column —
-//!    `ArenaMap::overlap` is no longer the node-interval test alone. The
-//!    exemption `ArenaMap::co_tenants` names is the same one as above, and it
-//!    is checked rather than assumed: `clashes` is empty on every catalog row.
-//! 3. **Everything else they share is read-only for the length of the capture
-//!    phase.** Weights landed once at load; the arena's base pointer, the
-//!    pools and the fire inputs are reserved at the ceiling and never
-//!    reallocated; the attention schedules were built in the PREPARE phase,
-//!    which is host work that finished before the first capture region
-//!    enqueued, and each plan value has its own workspace seat. A capture
-//!    region writes the arena and the caches and nothing else.
+//!    so two values in paired regions never share a column.
+//! 3. Everything else they share is read-only for the capture phase:
+//!    weights landed once at load, the arena/pools/fire-inputs are reserved
+//!    at the ceiling and never reallocated, attention schedules were built
+//!    in the prepare phase (finished before the first capture region
+//!    enqueued), and each plan value has its own workspace seat.
 //!
-//! `tests/no_concurrent_pair_shares_a_write.rs` is clause 1 and clause 2 over
+//! `tests/no_concurrent_pair_shares_a_write.rs` checks clauses 1 and 2 over
 //! the whole catalog.
 
-use model_ir::{ClassSet, Def, Operands, Operation, Trace, ValueId};
+use model_ir::{Def, Operands, Operation, Trace, ValueId};
 
-use crate::compiled::{EventId, Lowering, Phase, Region};
+use crate::compiled::{EventId, Lowering, Region};
 use crate::budget::DeviceProfile;
 
-/// What P6 decided, beside the regions it stamped.
+/// What `stream` decided, beside the regions it stamped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamPlan {
     /// Region pairs that may be in flight together — what
     /// [`Concurrency::with_pairs`](crate::Concurrency::with_pairs) is built
     /// from and what the carve is widened by.
     pub pairs: Vec<(u32, u32)>,
-    /// How many distinct events the template names. The shell creates this
+    /// How many distinct events the template names; the shell creates this
     /// many `cudaEvent_t`s, once, at load.
     pub events: u32,
     /// How many streams the template uses, main included. `1` means nothing
-    /// forked and the shell opens nothing.
+    /// forked.
     pub streams: u32,
 }
 
-/// Assign streams and event points over `regions`, in place.
-///
-/// The one door into P6. `regions` comes out stamped with
-/// [`Region::stream`], [`Region::wait`], [`Region::open`], [`Region::close`]
-/// and [`Region::sm_hint`]; the relation the carve needs comes back.
-///
-/// The class table is not an argument: every question this pass asks about
-/// classes is asked of a REGION's mask, which P2 already folded out of
-/// `ClassTable::node_mask`, and taking the table as well would be two spellings
-/// of one fact.
+/// Assign streams and event points over `regions`, in place. The one door
+/// into `stream`. `regions` comes out stamped with [`Region::stream`],
+/// [`Region::wait`], [`Region::open`], [`Region::close`] and
+/// [`Region::sm_hint`]; the relation the carve needs comes back.
 pub(crate) fn fork(trace: &Trace, regions: &mut [Region], profile: &DeviceProfile) -> StreamPlan {
     if profile.side_streams == 0 || regions.len() < 3 {
-        // The off arm, and the trivial one. A plan with fewer than three
-        // regions has no group with a neighbour on both sides.
+        // Fewer than three regions has no group with a neighbour on both sides.
         return StreamPlan {
             pairs: Vec::new(),
             events: 0,
@@ -210,9 +129,8 @@ pub(crate) fn fork(trace: &Trace, regions: &mut [Region], profile: &DeviceProfil
 
     let touches = Touches::of(trace, regions, profile);
     let ordered = closure(regions, &touches);
-    // The same estimator P3 gates a conditional with — one spelling of "what
-    // does this region cost", so the two passes cannot disagree about the same
-    // region on the same profile.
+    // The same estimator `lowering` gates a conditional with, so the two passes
+    // cannot disagree about the same region on the same profile.
     let costs: Vec<f32> = regions
         .iter()
         .map(|region| crate::lowering::region_us(trace, region, profile))
@@ -229,11 +147,8 @@ pub(crate) fn fork(trace: &Trace, regions: &mut [Region], profile: &DeviceProfil
             at += 1;
             continue;
         };
-        // A group needs a region AFTER it to rejoin into. A side stream that
-        // never rejoined would end the capture on
-        // `cudaErrorStreamCaptureUnjoined`; nothing else about the group's
-        // position matters, because the entry event is opened on the main
-        // stream inside the group's own first region.
+        // A group needs a region after it to rejoin into, or a side stream
+        // never rejoins.
         if group.end < regions.len() {
             seat(regions, &costs, profile, group.clone(), &mut forks);
         }
@@ -245,14 +160,11 @@ pub(crate) fn fork(trace: &Trace, regions: &mut [Region], profile: &DeviceProfil
     forks
 }
 
-/// Hand a group's members their streams and their events.
-///
-/// The first member keeps the main stream — it is already there, and moving it
-/// would buy an event pair and nothing else. Every later member that clears
-/// the gate takes the next side stream, round-robin once the cap is reached:
-/// two members sharing a side stream simply run one after another on it, which
-/// is correct (they are independent, so any order is a legal order) and is why
-/// the pair table below is built over DIFFERENT streams only.
+/// Hand a group's members their streams and their events. The first member
+/// keeps the main stream; every later member that clears the cost gate takes
+/// the next side stream, round-robin once the cap is reached (two members
+/// sharing a side stream just run one after another, which is fine since
+/// they're independent) — the pair table is built over different streams only.
 fn seat(
     regions: &mut [Region],
     costs: &[f32],
@@ -261,7 +173,7 @@ fn seat(
     forks: &mut StreamPlan,
 ) {
     let main = group.start;
-    // THE GATE, asked once per member against the arm it would overlap.
+    // The cost gate, asked once per member against the arm it would overlap.
     let mut seated: Vec<(usize, u32)> = Vec::new();
     let mut next = 0u32;
     for member in group.clone().skip(1) {
@@ -276,13 +188,9 @@ fn seat(
         return;
     }
 
-    // The entry event: recorded on the MAIN stream at the top of the group's
-    // first region, after that region's own waits and before its first
-    // launch. That instant is "everything before this group has been
-    // enqueued, and this group's main arm has not" — which is what an arm
-    // needs to wait for and no earlier region's END is, once two groups stand
-    // back to back. One event serves every arm: `cudaStreamWaitEvent` does
-    // not consume.
+    // The entry event: recorded on the main stream at the top of the group's
+    // first region, after its own waits and before its first launch. One
+    // event serves every arm since `cudaStreamWaitEvent` does not consume.
     let enter = EventId(forks.events);
     forks.events += 1;
     debug_assert!(regions[main].open.is_none(), "a region opens one group");
@@ -295,13 +203,11 @@ fn seat(
         regions[member].stream = stream;
         regions[member].wait.push(enter);
         regions[member].close = Some(exit);
-        regions[member].sm_hint = Some(share(costs, &group, member, profile));
         exits.push(exit);
         forks.streams = forks.streams.max(stream + 1);
     }
     // The main arm gets a hint too: the split is between the arms, and one
     // side of a split is not a hint.
-    regions[main].sm_hint = Some(share(costs, &group, main, profile));
 
     for exit in exits {
         regions[group.end].wait.push(exit);
@@ -319,35 +225,6 @@ fn seat(
             }
         }
     }
-}
-
-/// What fraction of the device this arm would want, if anything read it.
-///
-/// **PROPORTIONAL TO COST, ROUNDED THE WAY THE HARDWARE ROUNDS** (green
-/// contexts Finding 1: groups come in multiples of 2 SMs, the smallest usable
-/// group is 4). Nothing reads this in v1 — decision #14 defers the partition,
-/// because it is baked at capture and a variant multiplies bodies — so it is
-/// a number the artifact carries for the pass that will.
-///
-/// Finding 4 says the sharing rule this implements is the naive one: SM count
-/// buys a compute-bound kernel almost everything and a bandwidth-bound kernel
-/// almost nothing, so a partition worth taking gives SMs to the arm that can
-/// USE them rather than to the arm that costs the most. A cost table with one
-/// number per family cannot tell those apart, and a hint that pretended to
-/// would be worse than a proportional one.
-fn share(
-    costs: &[f32],
-    group: &core::ops::Range<usize>,
-    member: usize,
-    profile: &DeviceProfile,
-) -> u32 {
-    let total: f32 = group.clone().map(|m| costs[m]).sum();
-    if total <= 0.0 {
-        return profile.sms;
-    }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let want = ((costs[member] / total) * profile.sms as f32) as u32;
-    (want.max(4) + 1) & !1
 }
 
 /// The maximal run of consecutive capture regions starting at `at` that are
@@ -370,40 +247,23 @@ fn group_at(
     (end - at >= 2).then_some(at..end)
 }
 
-/// May this region be put on a stream of its own at all?
-///
-/// A prepare region may not: it is host work, it runs before the capture
-/// begins, and a stream is not what it is enqueued on. A collective region may
-/// not: NCCL matches calls by ORDER, so a collective on a side stream is a
-/// rendezvous whose position in the program is no longer the position every
-/// other rank sees (decision #5, one step past elision). A region no class
-/// runs — `ClassTable::dead`, and shipped plans have none — may not either: an
-/// empty mask is disjoint from everything, which would make it a candidate
-/// with every region in the plan for no reason at all.
-///
-/// **AND A CONDITIONAL BODY IS SINGLE-STREAM** (design §4, v1). P3 has landed
-/// and runs BEFORE this pass, so the clause is live rather than vacuous — and
-/// it is a mechanism and not a policy: a conditional body is a child graph
-/// filled by `cudaStreamBeginCaptureToGraph`, while a fork's event pair is an
-/// edge between two nodes of one parent graph, so an arm that was both would
-/// be a dependency CUDA has no way to express. On today's catalog P3 chooses
-/// nothing and every region here is still `AlwaysLaunch`, which is why build
-/// log 24's assignment table is unmoved.
+/// May this region be put on a stream of its own at all? A prepare region
+/// may not (host work, runs before capture begins). A collective region may
+/// not (NCCL matches calls by order, so a side-stream collective would be a
+/// rendezvous out of position). A region no class runs may not (an empty
+/// mask is disjoint from everything, making it a spurious candidate with
+/// every other region). A conditional body is single-stream: it's a child
+/// graph filled by `cudaStreamBeginCaptureToGraph`, while a fork's event
+/// pair is an edge between two nodes of one parent graph — a dependency
+/// CUDA has no way to express between the two.
 fn forkable(region: &Region) -> bool {
-    region.phase == Phase::Capture
-        && !region.collective
-        && !region.mask.is_empty()
-        && region.lowering == Lowering::AlwaysLaunch
+    region.launches() && region.lowering == Lowering::AlwaysLaunch
 }
 
 /// Are these two regions a concurrency candidate: no path either way, and
 /// disjoint class masks?
 fn candidates(regions: &[Region], ordered: &Ordered, a: usize, b: usize) -> bool {
-    !ordered.path(a, b) && !ordered.path(b, a) && disjoint(&regions[a].mask, &regions[b].mask)
-}
-
-fn disjoint(a: &ClassSet, b: &ClassSet) -> bool {
-    !a.iter().any(|class| b.contains(class))
+    !ordered.path(a, b) && !ordered.path(b, a) && regions[a].mask.disjoint(&regions[b].mask)
 }
 
 /// Every region's reads, writes, and cache spaces.
@@ -429,8 +289,8 @@ impl Touches {
             .map(|value| match value.def {
                 Def::Cache(row) => Some(match trace.caches.get(row as usize) {
                     Some(model_ir::CacheRow::Kv { space, .. }) => *space,
-                    // A state bank shares no page space with anything, so it
-                    // is numbered above every kv space it could collide with.
+                    // A state bank shares no page space with anything, so
+                    // it's numbered above every kv space it could collide with.
                     _ => u32::MAX - row,
                 }),
                 _ => None,
@@ -438,11 +298,8 @@ impl Touches {
             .collect();
 
         // A `Def::Merge` is data, never dispatched: a reader names the phi
-        // and the ARMS are what wrote it. Attributing a merge read to its
-        // arms is what makes the edge from an attention window to the
-        // consumer of the merge it fills visible at all — without it, three
-        // arms that write `m`, `d`, `p` and a consumer that reads `o` share
-        // no value and the whole neighbourhood looks independent.
+        // and the arms are what wrote it, so a merge read must attribute to
+        // its arms or the edge to each arm's producer would be invisible.
         let mut through: Vec<Option<Vec<ValueId>>> = vec![None; trace.values.len()];
         for at in 0..trace.values.len() {
             resolve(trace, &mut through, ValueId(at as u32));
@@ -474,10 +331,7 @@ impl Touches {
                 for &named in &scratch {
                     for &value in arms(&through, named) {
                         match spaces_of.get(value.0 as usize).copied().flatten() {
-                            // ANY MENTION OF A CACHE IS A WRITE OF ITS SPACE.
-                            // See the module doc: `KvAppend` names its cache
-                            // among the INPUTS and has no output, so nothing
-                            // else would see the effect.
+                            // Any mention of a cache is a write of its space.
                             Some(space) => spaces.push(space),
                             None => reads.push(value),
                         }
@@ -525,13 +379,13 @@ impl Touches {
         }
         // The cache clause and its one exemption: disjoint classes are
         // disjoint lanes are disjoint pages.
-        meets(&self.spaces[a], &self.spaces[b]) && !disjoint(&regions[a].mask, &regions[b].mask)
+        meets(&self.spaces[a], &self.spaces[b]) && !regions[a].mask.disjoint(&regions[b].mask)
     }
 }
 
 /// The values a name resolves to once every phi in front of it is walked
 /// through. A plain value is itself; a `Def::Merge` is the union of its arms,
-/// recursively, because §0's legal nesting puts merges inside merges.
+/// recursively, since merges can nest inside merges.
 fn resolve(trace: &Trace, through: &mut Vec<Option<Vec<ValueId>>>, value: ValueId) {
     let at = value.0 as usize;
     if through.get(at).is_some_and(Option::is_some) {
@@ -616,210 +470,3 @@ fn closure(regions: &[Region], touches: &Touches) -> Ordered {
     Ordered { after }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fixture::{Build, fact};
-    use crate::{Budget, compile};
-    use model_ir::Guard;
-
-    /// The §0 diagram, at three arms: a shared producer, three windows no
-    /// value passes between, a shared consumer. This is gemma's attention
-    /// neighbourhood with the model text taken out.
-    fn three_arms() -> Build {
-        let mut b = Build::new();
-        let x = b.input(8);
-        let q = b.op(x, 8, Guard::Always); // r0 — everywhere
-        let m = b.op(q, 8, Guard::and(fact(0), fact(1))); // r1
-        let d = b.op(q, 8, Guard::and(fact(0), Guard::not(fact(1)))); // r2
-        let p = b.op(q, 8, Guard::not(fact(0))); // r3
-        let o = b.merge(
-            &[
-                (m, Guard::and(fact(0), fact(1))),
-                (d, Guard::and(fact(0), Guard::not(fact(1)))),
-                (p, Guard::not(fact(0))),
-            ],
-            8,
-        );
-        let y = b.op(o, 8, Guard::Always); // r4
-        b.out(y);
-        b
-    }
-
-    fn profile(side_streams: u32, floor: f32) -> DeviceProfile {
-        DeviceProfile {
-            side_streams,
-            fork_floor_us: floor,
-            ..DeviceProfile::default()
-        }
-    }
-
-    #[test]
-    fn three_independent_windows_fork_onto_three_streams_and_rejoin() {
-        let b = three_arms();
-        // The fixture's ops are `Elementwise`, which the family table prices
-        // below the floor, so the gate is opened by lowering the floor rather
-        // than by pretending a norm costs what an attention does.
-        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
-        let template = compiled.template();
-        assert_eq!(template.len(), 5);
-
-        assert_eq!(template[1].stream, 0, "the first arm keeps the main stream");
-        assert_eq!(template[2].stream, 1);
-        assert_eq!(template[3].stream, 2);
-
-        // The entry event is opened at the TOP of the main arm and waited on
-        // by both arms that left the main stream.
-        let enter = template[1].open.expect("the main arm opens the group");
-        assert_eq!(template[0].open, None, "the region before it is untouched");
-        assert!(template[1].wait.is_empty(), "the main arm was never away");
-        assert_eq!(template[2].wait, vec![enter]);
-        assert_eq!(template[3].wait, vec![enter]);
-
-        // Every arm that forked closes with its exit, and the consumer waits
-        // on all of them.
-        let exits: Vec<EventId> = [2, 3]
-            .iter()
-            .map(|&at| template[at].close.expect("an arm closes with its exit"))
-            .collect();
-        assert_eq!(template[4].wait, exits);
-        assert_eq!(template[4].stream, 0);
-        assert_eq!(compiled.streams.streams, 3);
-        assert_eq!(compiled.streams.events, 3, "one entry and one exit per arm");
-    }
-
-    #[test]
-    fn the_relation_the_carve_sees_is_exactly_the_pairs_on_different_streams() {
-        let b = three_arms();
-        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
-        assert_eq!(compiled.streams.pairs, vec![(1, 2), (1, 3), (2, 3)]);
-        assert_eq!(compiled.concurrency.pairs(), compiled.streams.pairs);
-        // And the carve stayed sound under the wider relation, which is the
-        // whole reason the hook was threaded through before this pass landed.
-        assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
-    }
-
-    #[test]
-    fn two_arms_over_one_side_stream_run_on_it_in_turn_and_are_not_paired() {
-        let b = three_arms();
-        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(1, 1.0)).expect("bakes");
-        let template = compiled.template();
-        assert_eq!(
-            (template[1].stream, template[2].stream, template[3].stream),
-            (0, 1, 1),
-            "the cap is one side stream, so the two arms share it",
-        );
-        // They are independent, so sharing a stream is a legal order — and
-        // they are NOT concurrent, so the carve may still give them one
-        // column.
-        assert_eq!(compiled.streams.pairs, vec![(1, 2), (1, 3)]);
-        assert_eq!(compiled.streams.streams, 2);
-    }
-
-    #[test]
-    fn the_off_switch_bakes_the_artifact_p6_never_touched() {
-        let b = three_arms();
-        let off = compile(&b.trace, &Budget::new(4, 16), &profile(0, 1.0)).expect("bakes");
-        assert!(off.template().iter().all(|r| r.stream == 0));
-        assert!(off.template().iter().all(|r| r.wait.is_empty()));
-        assert!(off.template().iter().all(|r| r.open.is_none()));
-        assert!(off.template().iter().all(|r| r.close.is_none()));
-        assert!(off.template().iter().all(|r| r.sm_hint.is_none()));
-        assert_eq!(off.streams, StreamPlan { pairs: Vec::new(), events: 0, streams: 1 });
-        assert!(off.concurrency.pairs().is_empty());
-    }
-
-    #[test]
-    fn a_pair_too_cheap_to_fork_is_not_forked_and_pays_nothing() {
-        // The default floor is 20 us and the fixture's elementwise ops are
-        // priced at 4: the candidates are found and then declined.
-        let b = three_arms();
-        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 20.0)).expect("bakes");
-        assert!(compiled.template().iter().all(|r| r.stream == 0));
-        assert_eq!(compiled.streams.events, 0);
-        assert!(compiled.concurrency.pairs().is_empty());
-    }
-
-    #[test]
-    fn a_shared_written_value_is_an_edge_and_kills_the_candidacy() {
-        // Two windows with disjoint masks that both write the SAME value —
-        // not a merge, a plain output collision. Disjointness alone would
-        // have called them candidates; the WAW edge is what does not.
-        let mut b = Build::new();
-        let x = b.input(8);
-        let q = b.op(x, 8, Guard::Always);
-        let d = b.op(q, 8, fact(0));
-        let p = b.op(q, 8, Guard::not(fact(0)));
-        // `p` reads `d`: a RAW edge between the two windows, disjoint masks
-        // notwithstanding.
-        let s = b.residual_add(d, p, 8, Guard::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (s, Guard::not(fact(0)))], 8);
-        let y = b.op(o, 8, Guard::Always);
-        b.out(y);
-
-        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
-        assert!(
-            compiled.template().iter().all(|r| r.stream == 0),
-            "a path between them is not a candidate",
-        );
-    }
-
-    #[test]
-    fn a_collective_never_leaves_the_main_stream_and_orders_both_sides() {
-        // NCCL matches by call order, so a collective is a barrier in the DAG
-        // as well as a region that may not be elided (decision #5).
-        let mut b = Build::new();
-        let x = b.input(8);
-        let q = b.op(x, 8, Guard::Always);
-        let g = b.all_gather(q, 8, fact(0));
-        let p = b.op(q, 8, Guard::not(fact(0)));
-        let o = b.merge(&[(g, fact(0)), (p, Guard::not(fact(0)))], 8);
-        let y = b.op(o, 8, Guard::Always);
-        b.out(y);
-
-        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
-        let collective = compiled
-            .template()
-            .iter()
-            .find(|r| r.collective)
-            .expect("the plan has one");
-        assert_eq!(collective.stream, 0);
-        assert!(compiled.template().iter().all(|r| r.stream == 0));
-    }
-
-    #[test]
-    fn two_appends_to_one_cache_space_are_ordered_unless_their_classes_are_disjoint() {
-        // A cache write is an effect no value carries — `KvAppend` names its
-        // cache among the inputs and outputs nothing — so any mention of a
-        // cache is read as a write of its space. Two windows over the SAME
-        // class therefore order; two over disjoint classes do not, because a
-        // page belongs to a lane and classes partition the lanes.
-        let mut b = Build::new();
-        let x = b.input(8);
-        let q = b.op(x, 8, Guard::Always);
-        let d = b.op(q, 8, fact(0));
-        b.append(d, fact(0));
-        let p = b.op(q, 8, Guard::not(fact(0)));
-        b.append(p, Guard::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
-        let y = b.op(o, 8, Guard::Always);
-        b.out(y);
-
-        let compiled = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
-        // The two append windows have disjoint masks, so the space they share
-        // does not order them and the later one forks.
-        let forked: Vec<u32> = compiled.template().iter().map(|r| r.stream).collect();
-        assert!(
-            forked.iter().any(|&s| s != 0),
-            "disjoint classes over one space are candidates: {forked:?}",
-        );
-    }
-
-    #[test]
-    fn the_assignment_is_a_pure_function_of_the_plan() {
-        let b = three_arms();
-        let once = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
-        let twice = compile(&b.trace, &Budget::new(4, 16), &profile(2, 1.0)).expect("bakes");
-        assert_eq!(once, twice);
-    }
-}

@@ -1,35 +1,14 @@
-//! **THE METAL SHELL'S HALF OF THE SECOND SERIATION**, with no device in the
-//! room: which window a region's launches are cut at, which rectangle a node
-//! that reads ACROSS the two axes is handed, and how big the arena sizes a
-//! patch column.
-//!
-//! # What this pins, and why it needs no GPU
-//!
-//! `Windows::of` is arithmetic — a compiled artifact, a fire's two class
-//! tables and a boundary vector in, one window per region per run out — and
-//! `model_exec::store::arena::rect` is arithmetic too. Every claim below is
-//! about that arithmetic, so it runs on any box:
-//!
-//! * a TOWER region — one whose capture unit is `RowAxis::Patches` — is cut at
-//!   the PATCH table: its rows are patch rows and its lanes are IMAGES. A
-//!   shell that cut it at the token table would hand the tower one class's
-//!   token interval of somebody else's rows (multimodal §5.1);
-//! * a TRUNK region carries the patch interval BESIDE its own, because the
-//!   embed merge (`layout.scatter_rows`) is a token-unit node that reads a
-//!   patch rectangle — the one node in a tower plan that touches both axes;
-//! * a patch region gets NO rebased qo boundaries, because P4's fallback menu
-//!   is the token axis's and the patch axis's bounds vector is
-//!   `RuntimeInput::PatchSegments`;
-//! * a text-only fire of the same artifact gets zero patch windows and its
-//!   token windows are the ones it always had — the window-table half of
-//!   metal-verify-queue Session I's text-lane invariance gate;
-//! * and the arena sizes a patch rectangle at the composition's own patch
-//!   rows, which is the line this plane got wrong for as long as it refused
-//!   the axis: `FireRows::text_only` does not fault on a tower, it COMPUTES,
-//!   and the failure arrives inside a GEMM whose destination has no rows.
-//!
-//! What is NOT here is a launch. `attention.dense` firing on real patch rows
-//! is a device gate and is banked in `.wiki/alto/metal-verify-queue.md`.
+//! The metal shell's half of the second seriation, with no device in the
+//! room: which window a region's launches are cut at (`Windows::of`, pure
+//! arithmetic), which rectangle a node reading across both axes is handed,
+//! and how big the arena sizes a patch column. A tower region (capture unit
+//! `RowAxis::Patches`) is cut at the patch table, not the token table; a
+//! trunk region carries the patch interval beside its own since the embed
+//! merge reads a patch rectangle from a token-unit node; a patch region gets
+//! no rebased qo boundaries; a text-only fire gets zero patch windows; and
+//! the arena sizes a patch rectangle at the composition's own patch rows
+//! (`FireRows::text_only` used to silently compute zero rows instead of
+//! faulting). No launch here — that's a device gate.
 
 use engine_metal::window::{Copies, Windows};
 use model_compiler::{
@@ -87,9 +66,7 @@ impl Build {
         ValueId((self.trace.values.len() - 1) as u32)
     }
 
-    /// A generic shaped op. `RmsnormNoScale` because the claim is about the
-    /// SHAPES a region's operands carry and not about what it computes —
-    /// which is exactly what `Windows::of` reads.
+    /// A generic shaped op: the claim is about operand shapes, not computation.
     fn op(&mut self, x: ValueId, ty: Ty, guard: Guard) -> ValueId {
         let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), ty);
@@ -168,7 +145,7 @@ fn axis_of(compiled: &CompiledModel, region: usize) -> RowAxis {
     compiled.units[compiled.unit_of(region) as usize]
 }
 
-/// **THE TOWER IS CUT AT THE PATCH TABLE AND THE TRUNK AT THE TOKEN ONE.**
+/// The tower is cut at the patch table and the trunk at the token one.
 #[test]
 fn each_region_is_cut_at_its_own_axis_s_window() {
     let (trace, compiled) = baked();
@@ -195,11 +172,7 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
 
     let mut towers = 0;
     let mut trunks = 0;
-    // Does some TOKEN region see the whole patch rectangle? The embed merge
-    // is `Guard::Always`, so its mask holds every class and its patch window
-    // is the fire's whole one — which is the rectangle `layout.scatter_rows`
-    // reads, and the thing a shell carrying only one window pair could not
-    // have handed it.
+    // Does some token region see the whole patch rectangle (the embed merge's read)?
     let mut merge_saw_the_tower = false;
     for (at, region) in compiled.template().iter().enumerate() {
         let window = windows.at(at as u32, 0);
@@ -217,10 +190,8 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
                     "and its lane count is images",
                 );
                 assert_eq!(window.span, window.patch, "one axis, one window");
-                // **AND NO REBASED QO BOUNDARIES.** P4's menu is the token
-                // axis's; the patch axis's bounds vector is
-                // `RuntimeInput::PatchSegments`, which the shell stages beside
-                // the payload and no window carries.
+                // No rebased qo boundaries: the patch axis's bounds vector is
+                // RuntimeInput::PatchSegments, which no window carries.
                 assert!(
                     window.indptr_host.is_empty(),
                     "region {at} is a tower and was handed token qo boundaries",
@@ -233,9 +204,7 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
                     fire.classes().rows_of(&region.mask),
                     "a trunk region's launch runs over token rows",
                 );
-                // The patch interval rides along, cut at THIS region's own
-                // classes — a class with token rows and no image contributes
-                // none, which is the invariant break.
+                // The patch interval rides along, cut at this region's own classes.
                 assert_eq!(
                     window.patch.rows,
                     fire.patch_classes().rows_of(&region.mask),
@@ -252,21 +221,15 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
          would read somebody else's rows",
     );
 
-    // AND THE BREAK ITSELF, at the window table: the class that carries no
-    // image has token rows and no patch rows in the same fire.
+    // The class that carries no image has token rows and no patch rows.
     let text_class = compiled.classes.class_of(0).expect("word 0 is a class");
     assert!(fire.classes().as_slice()[text_class].rows > 0);
     assert_eq!(fire.patch_classes().as_slice()[text_class].rows, 0);
 }
 
-/// **THE TEXT-LANE INVARIANCE GATE, AT THE WINDOW TABLE** (Session I, entry
-/// e). A fire of the same artifact whose lanes carry no image gets the token
-/// windows it would have had before the axis existed, and a patch window of
-/// nothing.
-///
-/// It is a PROPERTY and not a hope: the tower's rectangles are all
-/// `Dim::Patches`, so an axis-empty fire has zero of them and every tower
-/// launch runs over zero rows — which the walk skips before it dispatches.
+/// A fire whose lanes carry no image gets the token windows it always had,
+/// and a patch window of nothing: the tower's rectangles are all
+/// `Dim::Patches`, so an axis-empty fire has zero of them.
 #[test]
 fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
     let (trace, compiled) = baked();
@@ -310,21 +273,16 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
             assert_eq!(a.span, b.span, "region {at}'s token window moved");
             assert_eq!(a.indptr_host, b.indptr_host);
         }
-        // And the imageless fire's patch window is the zero window, which is
-        // what an axis-empty fire has: the tower's launches read zero rows and
-        // return.
+        // The imageless fire's patch window is the zero window.
         assert_eq!(a.patch.rows, 0, "region {at} found patch rows in a text fire");
     }
     assert_eq!(plain.patch_rows(), 0);
     assert_eq!(mixed.patch_rows(), 128);
 }
 
-/// **THE ARENA SIZES A PATCH COLUMN AT THE FIRE'S PATCH ROWS**, which is the
-/// line this plane carried wrong for as long as it refused the axis:
-/// `crate::arena::carve` stated `FireRows::text_only`, which sizes every
-/// `Dim::Patches` rectangle at NO ROWS — and that does not fault, it computes.
-/// The failure would have arrived inside a tower GEMM whose destination has
-/// no rows to write.
+/// The arena sizes a patch column at the fire's patch rows. Previously
+/// `crate::arena::carve` used `FireRows::text_only`, sizing every
+/// `Dim::Patches` rectangle at zero rows without faulting.
 #[test]
 fn a_patch_rectangle_is_carved_at_the_compositions_own_patch_rows() {
     let (trace, compiled) = baked();
@@ -336,9 +294,7 @@ fn a_patch_rectangle_is_carved_at_the_compositions_own_patch_rows() {
     )
     .expect("composes");
 
-    // A patch-shaped value the ARENA carves — a tower op's own output, not
-    // the input, which is staged in `crate::inputs` and resolved through
-    // `Run::whole` rather than through a placement.
+    // A patch-shaped value the arena carves: a tower op's own output, not the input.
     let pixels = trace
         .values
         .iter()
@@ -368,8 +324,7 @@ fn a_patch_rectangle_is_carved_at_the_compositions_own_patch_rows() {
     );
     assert_eq!(honest.width as u64, WIDTH);
 
-    // And the failure the fix removes, stated so it cannot come back: the
-    // token-only reading answers a rectangle with no rows at all.
+    // The failure the fix removes: the token-only reading answers a rectangle with no rows.
     let text_only = rect(
         &compiled.arena,
         pixels,

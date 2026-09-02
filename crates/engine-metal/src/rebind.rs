@@ -1,45 +1,4 @@
-//! `icb::rebind`, host side: the derived [`DescriptorAbi`] lowered into device
-//! tables, and the two-pass fire that reads them.
-//!
-//! **THIS IS THE JOIN THE PREVIOUS WAVE LEFT OPEN.** Build log 30's verdict
-//! was that the ICB makes the exec key unnecessary and the derived table would
-//! make the WALK unnecessary, and that the wave built the first and derived
-//! the second without wiring them together. The wire is here. What crosses to
-//! the device is:
-//!
-//! ```text
-//! once, at load          every fire
-//! ─────────────          ──────────
-//! the law table          the packed FireDescriptor (one memcpy)
-//! the arm table            ↓
-//! the binding lists      dispatch icb_rebind, one thread per slot
-//! the pipeline table       ↓  (a pass boundary — the commands were WRITTEN)
-//! the reservation table  executeCommandsInBuffer(icb, 0..slots)
-//! ```
-//!
-//! and the host does not walk. `model_exec::fire::walk` is still what the eager
-//! path runs and still what the recorder recorded — the shader is a
-//! translation of `abi::Law::at` and of nothing else, which is why a test can
-//! diff the two in host arithmetic before ever dispatching.
-//!
-//! # What the shader may rewrite, and what it may not
-//!
-//! `MTLIndirectComputeCommand`'s whole vocabulary: the pipeline state, every
-//! kernel buffer binding, the grid, the threadgroup, the barrier, and
-//! `reset()`. What it may NOT do is carry inline bytes — there is no
-//! `setBytes:` on an indirect compute command — so a scalar argument is a
-//! staged cell and the shader writes the CELL. That reservation is this
-//! module's own ([`Rebinder::cells`]) rather than the builder's, because a
-//! slot's second arm binds a different argument list and needs cells the
-//! build never allocated.
-//!
-//! # Two passes, and the reason is not caution
-//!
-//! The rebind kernel writes the commands that `executeCommandsInBuffer:` then
-//! runs. A compute pass serialises DISPATCHES against each other;
-//! `executeCommandsInBuffer:` is not a dispatch. So the two live in two
-//! passes of one command buffer ([`Frame::next_pass`](crate::device::Frame)),
-//! which is one encoder open and no second commit.
+//! `icb::rebind`, host side: the derived [`DescriptorAbi`] lowered into device tables, and the two-pass fire that reads them without the host ever walking.
 
 #![cfg(target_vendor = "apple")]
 
@@ -159,14 +118,9 @@ impl Rebinder {
         self.census
     }
 
-    /// Say that something other than this shader last wrote the buffer, so
-    /// every slot is encoded again on the next rebind.
-    ///
-    /// **THE TWO PATHS SHARE ONE BUFFER AND NEITHER TRUSTS THE OTHER'S
-    /// BOOKKEEPING.** `Icb::rebind` diffs against a host-side record of what
-    /// is encoded; this shader diffs against `live`. A fire through one after
-    /// a fire through the other would diff against a record of somebody
-    /// else's writes, so the crossing is marked rather than assumed away.
+    /// Mark every slot for re-encode: `Icb::rebind` diffs against a host-side
+    /// record while this shader diffs against `live`, so crossing from one
+    /// path to the other must be marked rather than assumed consistent.
     pub(crate) fn desync(&mut self) -> Result<()> {
         let mut word = Vec::with_capacity(self.census.slots * 4);
         for _ in 0..self.census.slots {
@@ -176,7 +130,9 @@ impl Rebinder {
     }
 }
 
-/// One argument's place in the staged-scalar arena, when it has one.
+/// One argument's place in the staged-scalar arena, when it has one. Scalars
+/// have no `setBytes:` on an indirect compute command, so they go through
+/// staged cells instead.
 fn cell_of(arg: Arg) -> Option<usize> {
     match arg {
         Arg::I32(_) | Arg::U32(_) | Arg::F32(_) | Arg::Usize(_) => Some(8),
@@ -209,9 +165,7 @@ fn fire_of(slot: &Slot) -> kernels_metal::Fire {
 }
 
 fn resource_id(id: MTLResourceID) -> u64 {
-    // `MTLResourceID` is `#[repr(C)]` over one `u64` and its field is
-    // crate-private, so the bytes are taken rather than named — the same
-    // reading the kill-factor probe took, and the only one available.
+    // MTLResourceID is #[repr(C)] over one u64 with a crate-private field.
     // SAFETY: both types are eight bytes of plain data with no niche.
     unsafe { std::mem::transmute::<MTLResourceID, u64>(id) }
 }
@@ -392,9 +346,7 @@ pub(crate) fn lower(
                         let place = argument_place(arm, index as usize, &slab_index, &cells_of_arg);
                         law_row(law, layout::AT_ARG, u32::from(index), Some(place))
                     }
-                    // `abi::read` enumerates exactly the three places above,
-                    // so a derived table holds no other kind and the shader
-                    // has no row shape for one.
+                    // abi::read enumerates only the three places above.
                     At::Entry | At::Shared | At::Shape => {
                         return Err(Fault::Unstructured {
                             slot: slot_rows.len() as u32,
@@ -503,10 +455,9 @@ pub(crate) fn lower(
         room: room.max(64),
         census,
     };
-    // **NOTHING IS ASSUMED TO BE ENCODED.** The buffer was built by a walk
-    // and the shader diffs against `live`; starting every word at "the host
-    // touched this" makes the first rebind a full re-encode, which is the one
-    // state that is right whatever the builder left behind.
+    // Nothing is assumed encoded: starting every word "host touched this"
+    // makes the first rebind a full re-encode, correct regardless of what
+    // the walk-built buffer left behind.
     rebinder.desync()?;
     Ok(rebinder)
 }
@@ -540,10 +491,7 @@ fn law_row(law: &Law, at_kind: u32, at_index: u32, place: Option<(u32, u32, u32)
             row.div = narrow(*div);
             row
         }
-        // The one form no fit produces (`model_exec::law::Law::Slot`): a number
-        // read out of the fire's own descriptor rather than solved from its
-        // coordinates. The rebind shader has no row for it, and
-        // `lower` refuses the table before it reaches here.
+        // No Metal fit ever produces Law::Slot; `lower` refuses such a table earlier.
         Law::Slot(id) => unreachable!("the Metal fit never states {id}"),
     };
     if let Some((arg_kind, slab, cell)) = place {
@@ -613,8 +561,7 @@ pub(crate) fn fire(
             have: rebinder.room,
         });
     }
-    // **THE ONE HOST WRITE OF A FIRE**, and it is a memcpy into a Shared
-    // mapping: the reservation IS the bytes the GPU reads.
+    // The one host write of a fire: a memcpy into a Shared mapping.
     rebinder.descriptor.write(0, descriptor)?;
     rebinder.status.write(0, &0u64.to_ne_bytes())?;
 

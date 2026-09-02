@@ -1,6 +1,3 @@
-//! pie:core/inference - ForwardPass + sampler programs; pie:core/tensor -
-//! Tensor + Program resources.
-
 //! `pie:inferlet/grammar` — the `Grammar` + `Matcher` resources (grammar-mask
 //! compilation and stateful matching).
 
@@ -18,8 +15,7 @@ use wasmtime_wasi::WasiView;
 impl pie::inferlet::grammar::Host for ProcessCtx {}
 
 /// Aggregate interface-level `Host` for `pie:core/working-set`, required by
-/// the generated `HostKvWorkingSet` (charlie) + `HostRsWorkingSet` (delta)
-/// resource impls. echo owns this (central bindgen) since it spans both lanes.
+/// the generated `HostKvWorkingSet` + `HostRsWorkingSet` resource impls.
 impl pie::inferlet::working_set::Host for ProcessCtx {}
 
 pub struct Grammar {
@@ -89,9 +85,7 @@ impl pie::inferlet::grammar::HostGrammar for ProcessCtx {
     }
 }
 
-// =============================================================================
 // Matcher resource
-// =============================================================================
 
 /// How many accepted tokens a matcher retains for `rollback`.
 const MAX_ROLLBACK_TOKENS: usize = 64;
@@ -112,10 +106,8 @@ impl pie::inferlet::grammar::HostMatcher for ProcessCtx {
         let model = crate::model::model();
         let stop_tokens = model.instruct().seal();
         let compiled = self.ctx().table.get(&grammar)?.compiled.clone();
-        // Rollback history depth. Deep enough for the draft lengths that
-        // speculative decoding and tree drafting actually use; a token of
-        // history costs a `usize` plus a `u16`, so the bound is about
-        // memory hygiene, not a real constraint.
+        // Deep enough for the draft lengths speculative/tree decoding use;
+        // the bound is about memory hygiene, not a real constraint.
         let inner = GrammarMatcher::with_compiled(compiled, stop_tokens, MAX_ROLLBACK_TOKENS);
 
         let matcher = Matcher { inner };
@@ -138,9 +130,8 @@ impl pie::inferlet::grammar::HostMatcher for ProcessCtx {
 
     async fn mask(&mut self, this: Resource<Matcher>) -> Result<Vec<u32>> {
         let matcher = self.ctx().table.get_mut(&this)?;
-        // The packed allowed-token bitmask (`[ceil(vocab/32)]` u32, bit 1 =
-        // allowed) — the `mask-apply` (0x65) mask operand. Returned directly,
-        // no BRLE round-trip.
+        // Packed allowed-token bitmask (`[ceil(vocab/32)]` u32, bit 1 =
+        // allowed), returned directly with no BRLE round-trip.
         Ok(matcher.inner.fill_next_token_mask())
     }
 

@@ -1,14 +1,9 @@
 //! Memory accounting: recompute the plan's persistent / temporary / scratch
 //! peaks and its checkpoint-read and device-write totals.
 //!
-//! `live_peak` is a running total, not a liveness analysis: buffers enter the
-//! `live` set at `Allocate` and never leave, because the plan has no instruction
-//! that frees one and the executor frees nothing until its destructor
-//! (`load_plan_executor.hpp:57-61`). The peak and the sum are therefore the same
-//! number today, and this is written as a max so it stays right rather than
-//! because anything currently makes it fall. Adding a free — to the plan or to
-//! the executor — means removing from `live` here too, or the "peak" silently
-//! becomes an over-estimate.
+//! `live_peak` is a running total, not a liveness analysis: buffers enter
+//! `live` at `Allocate` and never leave, since nothing frees one today. It is
+//! written as a max so it stays correct if a free is ever added.
 
 use std::collections::HashSet;
 
@@ -53,9 +48,7 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
             StorageInstr::Allocate { buffer, .. } => {
                 let decl = program.buffer(*buffer)?;
                 // A staging buffer is arena memory, counted in
-                // `scratch_bytes`. Letting it into `live` would report device
-                // bytes as host ones, and report them summed rather than
-                // reused.
+                // `scratch_bytes`, not `live`.
                 if decl.scratch_offset.is_some() {
                     continue;
                 }
@@ -129,8 +122,8 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
     }
 
     program.memory.persistent_bytes = persistent_bytes;
-    // Scratch sits BEHIND the resident tensors, so its own offsets already
-    // include them; what the caller has to add is the difference.
+    // Scratch sits behind the resident tensors, so its offsets already
+    // include them; the caller only adds the difference.
     program.memory.scratch_bytes = scratch_end.saturating_sub(persistent_bytes);
     program.memory.temporary_peak_bytes = live_peak.saturating_sub(persistent_bytes);
     program.memory.transform_scratch_peak_bytes = transform_scratch_peak_bytes;

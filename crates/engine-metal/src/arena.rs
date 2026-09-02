@@ -1,66 +1,6 @@
 //! The activation arena: one allocation for the model's whole load, and the
-//! per-fire table that turns the compiler's static offsets into handles.
-//!
-//! **THE OFFSETS ARE NOT THIS CRATE'S.** P7 carved them once
-//! (`model_compiler::arena`), giving values whose lives do not overlap the
-//! same bytes on purpose, and what is left for a shell is one addition:
-//! `base + offset`. Only the LENGTH moves with the fire, and it moves by the
-//! row expression the carve already wrote down — which is the whole reason a
-//! composition never triggers a re-anything.
-//!
-//! # What "base + offset" means here, and why it costs a table
-//!
-//! **A METAL VIEW IS A HANDLE, NOT AN ADDRESS.** The CUDA sibling's carve is
-//! pure arithmetic — it holds one `cudaMalloc`'d base and hands out
-//! `base + offset`, a `u64` a kernel dereferences. Metal has no address to
-//! hand out: a compute encoder binds a BUFFER and an OFFSET
-//! (`setBuffer:offset:atIndex:`), so a `kernels_metal::Tensor` carries a
-//! `u32` row into [`Handles`] and the resolution is a table lookup at encode
-//! time. So every function here that builds a `Tensor` takes a
-//! `handles: &Handles` and MINTS, where its CUDA twin only added — and every
-//! one of them is fallible for the same reason, because minting is where the
-//! rectangle is bounds-checked against the reservation it claims to live in
-//! (`Handles::bind` calls `Buffer::span`).
-//!
-//! That is the whole structural divergence. The offsets, the row expressions,
-//! the aliasing through `root`, the rule that a rectangle spans the whole
-//! fire — none of it moves.
-//!
-//! # Why the table is rebuilt every fire, and why that is cheap
-//!
-//! [`SlotTable`] is `ValueId`-indexed and every row is a `Copy` handle, so
-//! rebuilding it is one pass of arithmetic over the plan's values — 855 of
-//! them for the smoke's SKU — plus one `Vec` push per bound row into
-//! [`Handles`], which the fire drops in one `truncate` at
-//! [`Handles::rewind`]. The alternative, mutating a resident table in place,
-//! would save that pass and cost the property that makes it easy to reason
-//! about: a `Run` borrows a table that describes exactly one fire. On this
-//! plane it would cost more than that — a resident handle row whose offset is
-//! rewritten between fires is exactly the stale-resolution bug the seal/rewind
-//! watermark exists to make impossible.
-//!
-//! # A row count here is THE FIRE'S, and that is what makes windows work
-//!
-//! Every rectangle in this table spans the whole fire: a `Dim::Tokens` value
-//! gets one column of `rows` rows, indexed by ABSOLUTE fire row. That is not
-//! a simplification waiting to be narrowed — it is the substrate design §0's
-//! window-split stands on. A merge lowers to "the arms write disjoint row
-//! ranges of one buffer", which is a sentence about one column with two
-//! writers, and the compiler's carve aliases the arms onto exactly that
-//! column ([`arena`](model_compiler::arena)'s union-find through `root`).
-//!
-//! So the window is applied by the READER, not by the carve:
-//! [`Run::tensor`] cuts each operand to the window of the node asking for it
-//! ([`window`](crate::window)), which is what lets a decode node take rows
-//! `[10,13)` of the same `q` a prefill node takes `[0,10)` of. A per-value
-//! span would not answer that, because `Value::split` refines a cond and
-//! hands back the SAME `ValueId`. On this plane the cut is
-//! [`Handles::cut`] — a second row naming the same buffer further in —
-//! rather than a pointer addition, which is the one place the reader pays for
-//! the handle too.
-//!
-//! [`Run::tensor`]: crate::run::Run
-//! [`SlotTable`]: crate::run::SlotTable
+//! per-fire table that resolves the compiler's static offsets to handles
+//! (a Metal view is a `u32` row into [`Handles`], not an address).
 
 use kernels_metal::Tensor;
 use model_compiler::{ArenaMap, FireRows};
@@ -78,18 +18,7 @@ pub struct Arena {
 }
 
 impl Arena {
-    /// Reserve what the carve says the largest admissible fire needs.
-    ///
-    /// Takes the [`Context`] because a Metal reservation is a call ON a
-    /// device — `newBufferWithLength:options:` — where `cudaMalloc` reads the
-    /// thread's current one out of ambient state. The parameter is the
-    /// platform's difference showing through, not a preference.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Deviceless`] for a non-Apple build, [`Fault::Ceiling`] for an
-    /// arena past `maxBufferLength`, [`Fault::Device`] when the device
-    /// declined the length.
+    /// Reserve what the carve says the largest admissible fire needs. Errs [`Fault::Deviceless`] for a non-Apple build, [`Fault::Ceiling`] for an arena past `maxBufferLength`, [`Fault::Device`] when the device declined the length.
     pub fn reserve(device: &Context, map: &ArenaMap) -> Result<Arena> {
         Ok(Arena {
             store: Buffer::zeroed(device, map.bytes)?,
@@ -97,12 +26,8 @@ impl Arena {
     }
 
     /// The reservation itself, for whoever needs to mint a view into it that
-    /// is not one of the carve's.
-    ///
-    /// There is no `base()` twin of the CUDA sibling's here, and that is the
-    /// point: an address is the thing this platform does not have, so the
-    /// buffer is what a caller is handed and [`Handles::bind`] is how a view
-    /// of it is named.
+    /// is not one of the carve's. No `base()`: use [`Handles::bind`] to name
+    /// a view.
     #[must_use]
     pub fn store(&self) -> &Buffer {
         &self.store
@@ -114,17 +39,7 @@ impl Arena {
         self.store.bytes()
     }
 
-    /// The table a fire of `tokens` rows over `lanes` requests resolves
-    /// through.
-    ///
-    /// `handles` is the fire's minting table: one row per bound rectangle,
-    /// dropped wholesale by [`Handles::rewind`] when the fire ends.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] for a rectangle that leaves the reservation — which
-    /// is a carve that disagrees with its own `ArenaMap::bytes` — or for a
-    /// handle table already full.
+    /// The table a fire of `tokens` rows over `lanes` requests resolves through. `handles` is the fire's minting table, dropped wholesale by [`Handles::rewind`] when the fire ends. Errs [`Fault::Ceiling`] for a rectangle that leaves the reservation, or a full handle table.
     pub fn slots(
         &self,
         handles: &Handles,
@@ -134,48 +49,12 @@ impl Arena {
         carve(handles, &self.store, map, rows)
     }
 
-    /// Copy `into.len()` bytes back from `offset` bytes into this arena.
-    ///
-    /// The one read a fire ends with: the `"out"` seam's rows, whose slot the
-    /// carve deliberately holds open past the last node so that nothing
-    /// shares its bytes with the reader that has not run yet.
-    ///
-    /// **AN OFFSET, WHERE THE CUDA TWIN TAKES AN ADDRESS.** That shell had to
-    /// subtract its own base back off a pointer a caller read out of a
-    /// `Tensor`; here the `Tensor` never carried an address in the first
-    /// place, so the subtraction — and the `Fault::Ceiling` it raised on a
-    /// pointer from another allocation — has nothing to guard. The bound is
-    /// checked once, in `Buffer::span`. A caller holding the seam's handle
-    /// rather than its offset wants [`Arena::read_view`].
-    ///
-    /// On Apple silicon this is a `memcpy` out of a shared mapping and not a
-    /// device-to-host transfer; what makes it correct is that the fire's
-    /// command buffer was committed and waited on first, which is the call
-    /// order in the shell.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`] for a span that leaves the arena,
-    /// [`Fault::Deviceless`] for a non-Apple build.
+    /// Copy `into.len()` bytes back from `offset` bytes into this arena. Takes an offset, not an address — a caller holding the seam's handle wants [`Arena::read_view`] instead. Correct only once the fire's command buffer has been committed and waited on.
     pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         self.store.read(offset, into)
     }
 
-    /// Copy `into.len()` bytes back from `skip` bytes into whatever `handle`
-    /// names.
-    ///
-    /// The call the CUDA sibling spells `arena.read(tensor.ptr + skip, ..)`.
-    /// A `Tensor` on this plane carries a handle, so the row is resolved
-    /// first and the offset comes out of it — and the handle had better name
-    /// a view of THIS arena, which is the caller's business: the table is one
-    /// table across every reservation the load made, exactly so that a
-    /// `Tensor` is one `u32` wide.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Unbound`] for a handle no row answers, [`Fault::Ceiling`] for
-    /// a span that leaves the arena, [`Fault::Deviceless`] for a non-Apple
-    /// build.
+    /// Copy `into.len()` bytes back from `skip` bytes into whatever `handle` names. `handle` must name a view of this arena; the handle table spans every reservation the load made.
     pub fn read_view(
         &self,
         handles: &Handles,
@@ -198,24 +77,7 @@ impl Arena {
     }
 }
 
-/// One fire's slot table: the carve's arithmetic, and one minted handle per
-/// rectangle it names.
-///
-/// Separated from [`Arena`] so it can be driven over a buffer the caller
-/// chose. The CUDA original's stronger claim — that this is exercisable with
-/// no device in the room — does not survive the handle: a view must name a
-/// buffer, and a buffer is a device call. What survives is the property
-/// underneath it, that every value resolves to the rectangle its root names
-/// at the row count this fire has, and that is
-/// [`model_exec::store::arena::rect`] — neutral, and held to account host-side
-/// in the tests beside it. What is left here is the one line a Metal view
-/// is: an `(offset, bytes)` pair minted into a bounds-checked handle row,
-/// where the CUDA plane adds `base + offset` and hands out a `u64`.
-///
-/// # Errors
-///
-/// [`Fault::Ceiling`] for a rectangle that leaves `store` — a carve
-/// disagreeing with its own `ArenaMap::bytes` — or for a full handle table.
+/// One fire's slot table: the carve's arithmetic, and one minted handle per rectangle it names. Separated from [`Arena`] so it can be driven over a buffer the caller chose. Errs [`Fault::Ceiling`] for a rectangle that leaves `store`, or a full handle table.
 pub fn carve(
     handles: &Handles,
     store: &Buffer,
@@ -225,13 +87,7 @@ pub fn carve(
     let mut rows: Vec<Option<Tensor>> = Vec::with_capacity(map.placements.len());
     for value in 0..map.placements.len() {
         let value = ValueId(value as u32);
-        // **ALL FOUR COUNTS, AND STATING ONLY THE TOKEN PAIR IS THE FAILURE
-        // MODE WORTH NAMING.** `FireRows::text_only` sizes `Dim::Patches` and
-        // `Dim::Images` at zero, which does not fault — it COMPUTES — and the
-        // failure would arrive inside a tower GEMM whose destination has no
-        // rows. So the caller states the composition's own patch counts, and a
-        // fire with no image gets the zeros because it has no patch rows and
-        // not because this line assumed so.
+        // FireRows::text_only sizes Dim::Patches/Dim::Images at zero rather than faulting.
         rows.push(match rect(map, value, fire) {
             Some(rect) => Some(Tensor::new(
                 handles.bind(store, rect.offset, rect.bytes)?,
@@ -245,23 +101,7 @@ pub fn carve(
     Ok(SlotTable(rows))
 }
 
-/// How many ROWS each value's slot can hold, `ValueId`-indexed.
-///
-/// **THE SLOT'S RESERVATION, NOT THE FIRE'S EXTENT**, and that is the whole
-/// reason this is a second table rather than a field of [`SlotTable`]. A
-/// carved rectangle states what THIS fire touches ([`rect`]'s `bytes`); what a
-/// padding decision needs is the other number — how far past its own last row
-/// a launch may write before it runs into the next value's slot. `Placement::
-/// Arena::bytes` is that number, carved once at the budget's ceiling, so this
-/// is a load-time constant and is asked for once.
-///
-/// `0` for a value the arena binds no rectangle for and for one whose element
-/// has no byte size, which is the answer that makes a caller fall back to the
-/// unpadded width rather than pad into somebody else's bytes.
-///
-/// The consumer is `kernels_metal::linear::quant::mb_block`, whose `capacity`
-/// argument is exactly this: "the rows its activation and result rectangles
-/// actually hold, not the rows this fire uses".
+/// How many rows each value's slot can hold, `ValueId`-indexed — the slot's reservation, not the fire's extent. `0` for a value with no rectangle or no element byte size.
 #[must_use]
 pub fn capacities(map: &ArenaMap) -> Vec<u32> {
     (0..map.placements.len())

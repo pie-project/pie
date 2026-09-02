@@ -2,25 +2,18 @@
 # enforces, and rustfmt's output are the same on every machine. Without this
 # file the workspace silently tracks whatever `stable` happens to be, which
 # means a clippy release can turn a green CI red on an unchanged tree — and
-# the compiler crates' `-D warnings` gate makes that failure blocking.
+# the gated crates' `-D warnings` step makes that failure blocking.
 #
-# Bumping: change `channel`, run
-# `cargo clippy --no-deps -p pie-ir -p pie-plan -p pie-eval -p pie-codegen \
-#   -p pie-dsl -p pie-compiler-tests --all-targets -- -D warnings`
-# and fix whatever the new release found in the same commit.
+# Bumping: change `channel`, run the `cargo clippy` and `cargo fmt` steps of
+# `.github/workflows/ci.yml`'s `workspace-check` job, and fix whatever the new
+# release found in the same commit.
 [toolchain]
 channel = "1.97.1"
-# `llvm-tools` is what `scripts/coverage-audit.py` measures with. It has to
-# be THIS toolchain's copy: `-C instrument-coverage` writes profraw in the
-# format of the LLVM rustc was built against (22.1.6 here), and a system
-# llvm-profdata of a different major version refuses to merge it. Declaring
-# it here rather than in the CI action is the same reason the target below
-# is here -- the action's toolchain is not the one that compiles anything.
-components = ["rustfmt", "clippy", "llvm-tools"]
-# `bin/pie/tests/*` shell out to `cargo build --target wasm32-wasip2` for the
-# inferlet fixtures. Those nested invocations run inside the repo, so rustup
-# resolves them through THIS file rather than through whatever the CI action
-# installed — declaring the target here is what makes them work. CI's
+components = ["rustfmt", "clippy"]
+# `crates/inferlet` and the guest fixtures under `tests/inferlets` are built
+# with `--target wasm32-wasip2`. Those invocations run inside the repo, so
+# rustup resolves them through THIS file rather than through whatever the CI
+# action installed — declaring the target here is what makes them work. CI's
 # `targets: wasm32-wasip2` input installs it for the action's own toolchain,
 # which is not the one that ends up compiling anything.
 targets = ["wasm32-wasip2"]

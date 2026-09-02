@@ -1,23 +1,12 @@
 //! Groups: one plan, compiled once, run `arity` times.
 //!
-//! A [`GroupContract`](crate::contract::GroupContract) declares a set of
-//! tensors that differ from each other only in which bytes they read -- routed
-//! experts being the case that motivated it, but nothing here knows that word.
-//! The loader's job is to prove that claim and to say what "which bytes"
-//! resolves to for each index; what the engine then *does* with a group (stack
-//! every instance into an arena, or page instances through a fixed set of
-//! slots) is policy, and policy is not in the plan.
-//!
-//! The proof is the compile. Every instance is compiled independently and then
-//! required to be identical to instance 0 in every field except the three that
-//! locate bytes in a checkpoint: `file_id`, `tensor_id`, `file_offset`. If two
-//! instances disagree about anything else -- a buffer size, a transform, an
-//! instruction count -- they are not interchangeable, and the group is
-//! rejected here rather than producing slots that quietly differ in layout.
-//!
-//! That equality is also the compression. The plan carries one instance's
-//! instructions plus an `arity`-long table of source rebindings, instead of
-//! `arity` copies of a plan that agree everywhere but three integers.
+//! A [`GroupContract`](crate::contract::GroupContract) declares tensors that
+//! differ from each other only in which bytes they read. Every instance is
+//! compiled independently and required to be identical to instance 0 in
+//! every field except `file_id`, `tensor_id`, `file_offset`; any other
+//! disagreement rejects the group rather than producing slots that quietly
+//! differ in layout. The plan then carries one instance's instructions plus
+//! an `arity`-long table of source rebindings.
 
 use std::collections::HashMap;
 
@@ -65,10 +54,8 @@ fn compile_one(
         )));
     }
 
-    // A group is compiled as a contract of its own. It has to be: the whole
-    // point is that its instructions are a self-contained program the engine
-    // can run against a destination of its choosing, which it would not be if
-    // its buffers were numbered inside the resident plan.
+    // compiled as a contract of its own, so its instructions are a
+    // self-contained program the engine can run against any destination.
     let sub = ModelContract {
         alignment: contract.alignment,
         tensors: group.tensors.clone(),
@@ -109,10 +96,8 @@ fn compile_instance(
     Ok(plan)
 }
 
-/// Name the instance in a group's diagnostics.
-///
-/// Without this a failure reports a checkpoint tensor nobody wrote down --
-/// the substituted name -- with no way back to the template that produced it.
+/// Name the instance in a group's diagnostics, so a failure can point back
+/// to the template that produced it.
 fn at_index(err: Error, group: &GroupContract, index: u32) -> Error {
     Error::Contract(format!("group '{}' index {index}: {err}", group.name))
 }
@@ -143,13 +128,9 @@ fn read_bindings(plan: &LoadPlan) -> Vec<SourceBinding> {
         .collect()
 }
 
-/// Prove that `instance` differs from `template` only where a binding says it
-/// may.
-///
-/// Implemented by rewriting the instance back onto the template's sources and
-/// demanding exact equality: it is the cheap direction of the same statement,
-/// and it cannot miss a field the way an enumerated comparison would drift as
-/// [`StorageInstr`] grows.
+/// Prove that `instance` differs from `template` only where a binding says
+/// it may, by rewriting the instance back onto the template's sources and
+/// demanding exact equality.
 fn assert_interchangeable(
     template: &LoadPlan,
     instance: &LoadPlan,

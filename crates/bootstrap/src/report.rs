@@ -1,15 +1,8 @@
-//! What [`crate::init`] *would* resolve, computed without booting anything.
-//!
-//! This is the model behind the `pie-env` command. Every value is produced by
-//! the same code the daemons run ([`crate::config::resolve_path`],
-//! [`crate::paths`], the [`BootSpec`] role defaults), so the tool cannot report a
-//! path or port that the daemon would disagree with. Nothing here spawns a task,
-//! initialises tracing, or holds a socket: the metrics check binds and
-//! immediately drops, so running it against a live host is safe.
-//!
-//! The CLI (flags, `--field` selection, exit codes) lives in the binary's
-//! `main.rs`; this module stops at the model and its rendering. `Display` has to
-//! be here rather than there because of the orphan rule.
+//! What [`crate::init`] *would* resolve, computed without booting anything —
+//! the model behind the `pie-env` command. Every value is produced by the
+//! same code the daemons run, so the tool cannot report a path or port the
+//! daemon would disagree with. Nothing here spawns a task, initialises
+//! tracing, or holds a socket.
 
 use std::fmt;
 use std::net::SocketAddr;

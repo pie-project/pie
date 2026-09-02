@@ -1,31 +1,12 @@
-//! The planner's transfer executors — eviction (D2H) and restore (H2D),
-//! run on the planner's own tasks. Nothing here negotiates with the victim:
-//! quiescence is ESTABLISHED, not requested.
+//! The planner's transfer executors: eviction (D2H) and restore (H2D), run on
+//! the planner's own tasks. Quiescence is established, not requested; each
+//! failed step abandons the attempt and leaves the process resident.
 //!
-//! Eviction sequence (each step's failure abandons the attempt; the process
-//! stays resident and the next poke re-plans):
-//!
-//! 1. The residency gate is already closed (state = `Evicting`, flipped by
-//!    the planner before spawning), so no new WIT call enters.
-//! 2. **Fence** every working set (an atomic on the set's lifecycle, Dekker-
-//!    paired with the fire lease): no new fire can lease, prepare, or submit
-//!    against the victim's sets from here on.
-//! 3. The lane leaves the wait-all quorum (`Close`: the submitted tail
-//!    drains untracked; frames seal without the victim immediately).
-//! 4. **Drain** the victim's pipeline FIFOs detachably — finalizing the
-//!    already-settled host ops releases their fire leases. Unsettled or
-//!    non-detachable entries are LEFT for the victim's own yielded task to
-//!    settle (see `drain_detachable`); step 5's quiescence is the gate.
-//! 5. **Quiesce**: await zero fire leases per set. With the fence up the
-//!    count is monotone non-increasing, so this is a finite wait for the
-//!    mid-build stragglers that raced step 2 — the exact seal against a
-//!    launch writing pages while the copy reads them.
-//! 6. prepare → D2H → commit, transactional (`KvSuspendTxn` + guard).
-//!
-//! Fences stay up for the whole evicted period (the gate parks the guest,
-//! but a straggler op already past the gate must still bounce) and clear at
-//! restore commit — or at working-set release, which ends the lifecycle the
-//! fence lives on.
+//! Eviction: gate already closed -> fence every working set (blocks new
+//! lease/prepare/submit) -> lane leaves the wait-all quorum -> drain settled
+//! host-KV ops -> quiesce to zero fire leases per set -> prepare/D2H/commit.
+//! Fences stay up for the whole evicted period and clear at restore commit
+//! or working-set release.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -37,12 +18,9 @@ use crate::store::kv::page_table::WorkingSetId;
 use crate::store::kv::working_set::KvSuspendHandle;
 use crate::store::kv::{KvRestoreTxn, KvSuspendPrepare, KvSuspendTxn};
 
-/// Spawn one executor plus its join watcher. A panicking executor must
-/// never strand its in-flight mark (Evicting gates all further eviction
-/// planning; Restoring gates the queue head): the watcher fails the attempt
-/// on an abnormal join. Returns false when no runtime exists — the unpolled
-/// future drops (releasing anything it captured) and the caller runs its
-/// no-runtime fallback.
+/// Spawn one executor plus its join watcher, which fails the attempt on an
+/// abnormal join. Returns false when no runtime exists, so the caller can
+/// run its no-runtime fallback.
 fn spawn_watched(
     planner: Arc<ResidencyPlanner>,
     pid: ProcessId,
@@ -78,9 +56,7 @@ pub(super) fn spawn_restore(
     pid: ProcessId,
     pages: super::grant::DevicePageReservation,
 ) {
-    // On the no-runtime path the unpolled future drops `pages` back to the
-    // pool; the entry re-queues. Nothing was attempted, so that one is worth
-    // a retry — an abnormal join is not: a panicking executor panics again.
+    // No-runtime path drops `pages` back to the pool; the entry re-queues.
     let task = restore(planner.clone(), pid, pages);
     let spawned = spawn_watched(planner.clone(), pid, "restore", task, |planner, pid| {
         planner.restore_failed(pid, "restore executor died")
@@ -236,15 +212,11 @@ impl Drop for ResidencyTxnGuard {
     }
 }
 
-/// Best-effort detachable drain of `pid`'s pipeline FIFOs — SETTLED host-KV
-/// ops only. The planner must NEVER await an unsettled fire completion: the
-/// waker table parks ONE waker per slot, and the owning guest may be (or
-/// later start) awaiting the same completion from `drain_pipeline_fires`
-/// or a channel materialize — the second registration would overwrite the
-/// first and strand whichever task lost (the lost-wakeup wedge behind the
-/// 2026-07-25 bench freezes). Finalizing a SETTLED op never registers a
-/// waker (its poll completes on the first check). Everything unsettled or
-/// non-detachable is left to the guest's own settle path, and the lease
+/// Best-effort detachable drain of `pid`'s pipeline FIFOs — settled host-KV
+/// ops only. The planner must never await an unsettled fire completion: the
+/// waker table parks one waker per slot, and a second registration would
+/// overwrite the first and strand whichever task lost. Unsettled or
+/// non-detachable entries are left to the guest's own settle path; the lease
 /// quiescence wait below is the actual correctness gate.
 async fn drain_detachable(pid: ProcessId) {
     let pipelines = crate::inferlet::process::residency::pipelines_of(pid);
@@ -284,13 +256,9 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     }
     // Step 2: fences up — no new fire can lease/prepare against these sets.
     let mut fence = FenceGuard::raise(handles);
-    // Step 3: EVERY lane the victim owns leaves the wait-all quorum
-    // (process-wide — the planner does not know pipeline-scope lane ids),
-    // while its submitted tail stays sealable and drains untracked; those
-    // finalizations release the leases step 5 waits on. A lane-keyed Close
-    // here would match nothing and wedge the fleet's next boundary on the
-    // victim's silent lane. Rejoin is implicit on the next accepted fire
-    // (post-restore).
+    // Step 3: every lane the victim owns leaves the wait-all quorum
+    // (process-wide, not lane-keyed); rejoin is implicit on the next
+    // accepted fire post-restore.
     crate::scheduler::worker::notify_process_suspend(pid);
     // Step 4: settle what the planner can (host-KV ops); the victim's own
     // yielded fire task settles the rest. Quiescence below is the gate.
@@ -311,9 +279,8 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
             return;
         }
         Err(error @ crate::store::kv::KvStoreError::HostSwapFull { .. }) => {
-            // No kill rung here: without swap room this victim cannot move,
-            // and the head waits for completions instead. Park the victim so
-            // the deterministic re-pick cannot spin on it (§20.6).
+            // Without swap room this victim cannot move; park it so the
+            // deterministic re-pick cannot spin on it.
             tracing::warn!(pid = %pid, %error, "planner: eviction blocked on host swap");
             planner.eviction_failed_host_swap_full(pid);
             return;
@@ -416,10 +383,8 @@ async fn restore(
         Ok(completion) => completion,
         Err(error) => {
             restore.abort_now();
-            // Provisionally retryable: a submit that fails once may be a
-            // transient engine refusal rather than a dead context. Nobody has
-            // measured which, so this keeps the benefit of the doubt — for
-            // exactly one attempt.
+            // Retried once: a failed submit may be a transient refusal
+            // rather than a dead context.
             planner.restore_deferred(pid, &format!("H2D submit: {error:#}"));
             return;
         }

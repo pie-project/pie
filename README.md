@@ -76,21 +76,18 @@ pie run --path ./target/wasm32-wasip2/debug/text_completion.wasm \
 
 ### Backends
 
-CUDA is the plane that serves today, and it is a compile-time feature — the
-number in it is the CUDA runtime ABI the binary will load, which is why there
-is no version-less spelling to guess at:
+Two engines serve today, each a compile-time feature:
 
 ```bash
-cargo build --release -p pie --bin pie --features engine-cuda-13
+cargo build --release -p pie --bin pie --features cuda    # NVIDIA, Linux/Windows
+cargo build --release -p pie --bin pie --features metal   # Apple silicon, macOS
 ```
+
+`metal` is Apple-only at the crate level: a non-Apple build with the flag on
+links no Metal device half, and a config naming that engine is told so.
 
 A binary built with no engine feature has nothing true to put in `[engine]`,
 so `pie config init` says so instead of writing a config that will not parse.
-
-The Metal, Vulkan and WGPU planes are mid-migration. Their kernel tables are
-in the workspace and green; their engines are not, and a config naming one is
-told what happened at boot rather than falling back to something slower. They
-return when each has an executor for the compiled forward pass (P5).
 
 ## Project Layout
 
@@ -102,7 +99,7 @@ return when each has an executor for the compiled forward pass (P5).
 | `crates/model*/` | What a model is: the catalog, the authoring eDSL and its traced IR, the forward compiler, the checkpoint loader |
 | `crates/controller/` | Cluster-coordination control plane (pairing · roles · health) |
 | `crates/transport/` | Worker↔worker P2P KV-tensor data plane |
-| `crates/engine*/` | Backend engines: the CUDA shell + the shared execution-shell substrate (the three shader shells are out of the workspace until P5) |
+| `crates/engine*/` | Backend engines: the CUDA and Metal engines + the shared execution-shell substrate |
 | `crates/*-api` | Boundary contracts (`client` · `controller` · `worker` · `engine`) — the dependency floor |
 | `tests/inferlets/` | Curated inferlet E2E fixtures |
 | `sdk/inferlet/` | SDKs for programs that run ON pie (Python · JavaScript · tools) |

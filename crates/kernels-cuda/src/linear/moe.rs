@@ -321,26 +321,19 @@ fn selected(op: &'static str, x: Tensor, routes: Tensor, y: &Tensor) -> Result<S
 
 /// Grouped matmul over a dense bank: each routed row multiplies the expert
 /// its route selects — the decode GEMV, one warp-column per output tile.
-/// **WHERE A ROUTED BANK'S EXPERTS ARE** (alto design §7, wave D2).
 ///
-/// The two device addresses a streamed bank hands the select, and the two
-/// zeros a fully-resident one hands it:
+/// A streamed bank hands the select two device addresses; a fully-resident
+/// one hands two zeros:
+/// * `table` — `expert_id -> base address`, one fixed-address entry per
+///   expert. Points into the device slab when resident, or pinned host
+///   bytes over UVA otherwise, so a miss costs PCIe bandwidth, never a sync.
+/// * `hits` — per-expert usage counters; the select does one `atomicAdd`
+///   per routed expert per fire, and the host reads them between fires to
+///   promote.
 ///
-/// * `table` — the bank's device-resident indirection table, `expert_id ->
-///   base address`, one fixed-address entry per expert. An entry points into
-///   the device slab when the expert is resident and at its PINNED HOST bytes
-///   over UVA when it is not, so a miss costs PCIe bandwidth and never a sync
-///   (article 2). Entries are DATA (article 5), which is what lets a captured
-///   graph survive a promotion.
-/// * `hits` — the bank's per-expert usage counters, one `u32` per expert. The
-///   select does one `atomicAdd` per routed expert per fire; the host reads
-///   the buffer between fires and promotes (article 3, applied to weights).
-///
-/// [`ExpertTable::RESIDENT`] is both zeros, and it is the DEGENERATE case
-/// rather than an off switch: with no table the kernel computes the same
-/// `bank_base + expert * stride` it always did, and with no counters it
-/// counts nothing. A load whose device budget covers the whole table passes
-/// it and pays for D2 exactly nothing (dev's `place_all()`).
+/// [`ExpertTable::RESIDENT`] (both zeros) is the degenerate case, not an
+/// off switch: with no table the kernel computes the same
+/// `bank_base + expert * stride` it always did, and counts nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExpertTable {
     /// Device address of the `expert_id -> base address` table, or 0.
@@ -360,28 +353,19 @@ impl ExpertTable {
     }
 }
 
-/// **WHERE A PACKED GROUP'S TWO PLANES ARE** (alto streaming §3 item 3, wave
-/// B7) — [`ExpertTable`]'s twin for the split-plane path, one granularity up.
+/// [`ExpertTable`]'s twin for the split-plane path, one granularity up: the
+/// mxfp4 select computes each plane's expert base itself and dereferences
+/// no per-expert table, fixing the unit of residency at the group. A
+/// streamed group hands two addresses:
+/// * `cell` — one 16-byte, 16-byte-aligned cell holding this group's
+///   `(codes, scales)` base pair, read with a single `ld.global.v2.u64`
+///   (one extra load per group per launch, an L1 broadcast). Writing it is
+///   how a promotion moves a group.
+/// * `hits` — this group's usage counter; one `atomicAdd` per routed row
+///   per fire, by the block that owns that route's first row tile.
 ///
-/// The mxfp4 select computes each plane's expert base itself and dereferences
-/// no per-expert table (W-5's finding; `experts.rs`' header argues why that
-/// fixes the unit of residency at the GROUP). Until B7 that also fixed the
-/// group's TIER at load, because the two plane bases were kernel PARAMETERS
-/// and a captured graph holds its parameters forever (article 7). So a
-/// streamed group hands two addresses instead:
-///
-/// * `cell` — one 16-byte, 16-byte-aligned cell of DATA holding this group's
-///   `(codes, scales)` base pair. The kernel reads it with a single
-///   `ld.global.v2.u64` — **one extra load per group per launch**, at one
-///   address the whole grid shares, so it is an L1 broadcast and not a load
-///   per route. Writing it is how a promotion moves a group; the pair is one
-///   word, so no cell state can name one group's codes and another's scales.
-/// * `hits` — this group's usage counter, one `u32`. One `atomicAdd` per
-///   routed row per fire, by the block that owns that route's first row tile.
-///
-/// [`GroupSeat::RESIDENT`] is both zeros and is the DEGENERATE case, not an
-/// off switch: the kernel reads the bases it was handed and counts nothing,
-/// which is the launch this entry made before B7 existed.
+/// [`GroupSeat::RESIDENT`] (both zeros) is the degenerate case: the kernel
+/// reads the bases it was handed and counts nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupSeat {
     /// Device address of this group's 16-byte `(codes, scales)` base cell,
@@ -413,22 +397,13 @@ pub fn matmul_select(
     select_gemv(ctx, "linear.moe_matmul_select", x, bank, routes, y, experts)
 }
 
-/// The routed dense GEMV itself, under the caller's own op name.
-///
-/// **NAMED SEPARATELY BECAUSE A SECOND OP IS THE SAME LAUNCH.** LoRA's
-/// projection half — `t[row] = A[routes[row]] · x[row]` — is a routed
-/// matmul-select at fan-out one and nothing else: same bank indexing, same
-/// per-route zero for a negative id, same float4 ladder. `linear::lora` fires
-/// this rather than stamping a twin, and passes its own `op` so that a refusal
-/// or a launch failure comes back attributed to the correction the author
-/// wrote instead of to an MoE the plan does not contain.
-///
-/// **AND THE STAGED-GEOMETRY SEAT RIDES THE SAME PATH**, which costs the
-/// borrower nothing: `linear.lora_correct` is `engine_cuda::GROUPED`'s single
-/// name and a grouped region is refused admission to a body, so no lora fire
-/// can happen with a stage armed and the seat it passes is always `ABSENT` —
-/// the null pointer the kernel reads as the arithmetic it did before the seat
-/// existed. Only `linear.moe_matmul_select` ever arms it.
+/// The routed dense GEMV itself, under the caller's own op name. LoRA's
+/// projection half is a routed matmul-select at fan-out one and nothing
+/// else, so `linear::lora` fires this directly and passes its own `op` so
+/// a refusal is attributed to the correction rather than to an MoE the
+/// plan does not contain. Its staged-geometry seat rides the same path but
+/// is always `ABSENT`, since a grouped region is refused admission to a
+/// body; only `linear.moe_matmul_select` ever arms it.
 pub(crate) fn select_gemv(
     ctx: &Ctx,
     op: &'static str,
@@ -487,16 +462,12 @@ pub(crate) fn select_gemv(
             k.arg(),
             n.arg(),
             (i64::from(n) * i64::from(k)).arg(), // the bank's expert stride
-            // THE TWO D2 SEATS, both `ABSENT` for a resident bank — see
-            // [`ExpertTable`]. `ABSENT` is a null pointer and the kernel's
-            // arm on it is the arithmetic it did before the seats existed.
+            // The two seats, both `ABSENT` for a resident bank — see [`ExpertTable`].
             ArgValue::Ptr(experts.table),
             ArgValue::Ptr(experts.hits),
-            // The staged-geometry seat, read here in ROUTE space off words
-            // written in TOKEN space: the grid's route axis is `top_k` of the
-            // region's rows, so the kernel multiplies the pair by the fan-out
-            // (`moe.cuh` states the conversion). `ABSENT` when no body armed
-            // one, which is the arithmetic this leg always did.
+            // The staged-geometry seat, read in route space off words
+            // written in token space (the grid's route axis is `top_k` of
+            // the region's rows). `ABSENT` when no body armed one.
             ctx.stage(),
         ],
     )
@@ -571,16 +542,11 @@ fn matmul_select_mxfp4(
             act_div.arg(),
             n.arg(),
             k.arg(),
-            // THE TWO B7 SEATS, both zero for a group the store holds — see
-            // [`GroupSeat`]. A null cell is the arithmetic this entry did
-            // before the ladder existed, and a null counter counts nothing.
+            // The two seats, both zero for a group the store holds — see [`GroupSeat`].
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
-            // The staged-geometry seat, read in ROUTE space off words written
-            // in TOKEN space — the fan-out is the conversion, which is why
-            // `top_k` rides beside it (`linear/quant.cuh` states it, after
-            // `moe.cuh`). Unconditional: `ABSENT` when no body armed one,
-            // which is the arithmetic this leg always did.
+            // The staged-geometry seat, read in route space off words
+            // written in token space. `ABSENT` when no body armed one.
             ctx.stage(),
         ],
     )
@@ -751,16 +717,10 @@ pub fn weighted_sum(
 }
 
 /// The routed bias mixture, stated once on an activation that already holds
-/// the fold: `y[t] = x[t] + sum_k weights[t, k] * bias[routes[t, k]]`.
-///
-/// It is its own fire because the expert down-projection is rows-cut under
-/// tp: each rank's routed matmul is a *partial* product and the all_reduce
-/// sums the ranks, so a replicated bias folded into that matmul would land
-/// once per rank. Routing is computed from replicated inputs, so `routes`
-/// and `weights` are the same on every rank and the mixture can be stated
-/// after the reduce, on the reduced activation. At tp = 1 the value is
-/// identical (the weights sum to one), so the statement has one path and no
-/// tp branch.
+/// the fold: `y[t] = x[t] + sum_k weights[t, k] * bias[routes[t, k]]`. Its
+/// own fire because the down-projection is rows-cut under tp — a
+/// replicated bias folded into that partial matmul would land once per
+/// rank, so this is stated after the all_reduce instead.
 pub fn bias_sum(
     ctx: &Ctx,
     x: Tensor,
@@ -847,8 +807,8 @@ pub fn sigmoid_gate_add(
             gate.arg(),
             stated(OP, y.width)?.arg(),
             // The gate's row pitch: handles are dense, so the scalar sits at
-            // the head of a `gate.width`-wide row (the old strided column,
-            // stated on the handle).
+            // the head of a `gate.width`-wide row, whose pitch the handle
+            // states.
             stated(OP, nonzero(OP, "the gate row's pitch", gate.width)?)?.arg(),
             // The staged-geometry seat: the region's live-rows word when a
             // body replay armed one, and the null seat (`ABSENT`) otherwise.

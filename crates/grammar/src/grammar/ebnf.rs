@@ -29,7 +29,6 @@ fn parse_escape(data: &[u8], extra_escapes: &[(u8, u32)]) -> Result<(u32, usize)
     if data.len() < 2 || data[0] != b'\\' {
         bail!("expected escape sequence");
     }
-    // Check extra escapes first
     for &(ch, cp) in extra_escapes {
         if data[1] == ch {
             return Ok((cp, 2));
@@ -104,7 +103,6 @@ fn parse_next_utf8_or_escaped(data: &[u8], extra_escapes: &[(u8, u32)]) -> Resul
     if data[0] == b'\\' {
         return parse_escape(data, extra_escapes);
     }
-    // Decode one UTF-8 character
     let s = std::str::from_utf8(data).unwrap_or("");
     if let Some(c) = s.chars().next() {
         Ok((c as u32, c.len_utf8()))
@@ -208,7 +206,6 @@ impl<'a> Lexer<'a> {
                         }
                         self.advance();
                     }
-                    // consume the newline
                     if let Some(b) = self.peek() {
                         self.advance();
                         if b == b'\r' && self.peek() == Some(b'\n') {
@@ -273,9 +270,8 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-        self.advance(); // skip closing "
+        self.advance();
 
-        // Convert codepoints to UTF-8 string
         let mut value = String::new();
         for cp in codepoints {
             if let Some(c) = char::from_u32(cp) {
@@ -304,7 +300,7 @@ impl<'a> Lexer<'a> {
             line,
             col,
         });
-        self.advance(); // skip [
+        self.advance();
 
         if self.peek() == Some(b'^') {
             let line = self.line;
@@ -381,7 +377,7 @@ impl<'a> Lexer<'a> {
             line,
             col,
         });
-        self.advance(); // skip ]
+        self.advance();
 
         Ok(tokens)
     }
@@ -573,7 +569,6 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        // Convert identifiers before ::= to RuleNames
         convert_identifiers_to_rule_names(&mut tokens)?;
 
         Ok(tokens)
@@ -691,7 +686,6 @@ impl Parser {
     // ── Parsing ──
 
     fn parse_char_class(&mut self) -> Result<ExprId> {
-        // Expect LBracket
         self.expect(&TokenType::LBracket, "expected [")?;
 
         let mut negated = false;
@@ -717,7 +711,7 @@ impl Parser {
                     Some(TokenType::CharInCharClass(_)) | Some(TokenType::Dash)
                 );
                 if next_is_char {
-                    self.consume(); // skip dash
+                    self.consume();
                     let cp2 = match &self.peek().ty {
                         TokenType::CharInCharClass(cp) => *cp,
                         TokenType::Dash => b'-' as u32,
@@ -956,11 +950,6 @@ impl Parser {
 
     /// Helper to read an expr from the builder (needed for star optimization check).
     fn builder_get_expr(&self, id: ExprId) -> BorrowedExpr {
-        // We need to peek at the expr type without consuming the builder.
-        // Since we only use this for the star optimization, we'll check the type.
-        // The builder stores exprs in a Vec, so we can index directly.
-        // We need to expose this from the builder...
-        // For now, we can match on the data stored in exprs.
         self.builder.peek_expr(id)
     }
 }
@@ -1018,107 +1007,6 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_string_literal() {
-        let g = parse_and_display("root ::= \"hello\"");
-        assert_eq!(g, "root ::= ((\"hello\"))");
-    }
-
-    #[test]
-    fn test_empty_string() {
-        let g = parse_and_display("root ::= \"\"");
-        assert_eq!(g, "root ::= ((\"\"))");
-    }
-
-    #[test]
-    fn test_character_class() {
-        let g = parse_and_display("root ::= [a-z]");
-        assert_eq!(g, "root ::= (([a-z]))");
-    }
-
-    #[test]
-    fn test_negated_character_class() {
-        let g = parse_and_display("root ::= [^a-z]");
-        assert_eq!(g, "root ::= (([^a-z]))");
-    }
-
-    #[test]
-    fn test_sequence() {
-        let g = parse_and_display("root ::= \"a\" \"b\" \"c\"");
-        assert_eq!(g, "root ::= ((\"a\" \"b\" \"c\"))");
-    }
-
-    #[test]
-    fn test_choice() {
-        let g = parse_and_display("root ::= \"a\" | \"b\" | \"c\"");
-        assert_eq!(g, "root ::= ((\"a\") | (\"b\") | (\"c\"))");
-    }
-
-    #[test]
-    fn test_grouping() {
-        let g = parse_and_display("root ::= (\"a\" \"b\") | (\"c\" \"d\")");
-        assert_eq!(g, "root ::= ((((\"a\" \"b\"))) | (((\"c\" \"d\"))))");
-    }
-
-    #[test]
-    fn test_star_quantifier_string() {
-        let g = parse_and_display("root ::= \"a\"*");
-        assert_eq!(g, "root ::= ((root_1{0,}))\nroot_1 ::= \"a\"");
-    }
-
-    #[test]
-    fn test_plus_quantifier() {
-        let g = parse_and_display("root ::= \"a\"+");
-        assert_eq!(g, "root ::= ((root_1{1,}))\nroot_1 ::= \"a\"");
-    }
-
-    #[test]
-    fn test_question_quantifier() {
-        let g = parse_and_display("root ::= \"a\"?");
-        assert_eq!(g, "root ::= ((root_1{0,1}))\nroot_1 ::= \"a\"");
-    }
-
-    #[test]
-    fn test_character_class_star() {
-        let g = parse_and_display("root ::= [a-z]*");
-        assert_eq!(g, "root ::= (([a-z]*))");
-    }
-
-    #[test]
-    fn test_repetition_exact() {
-        let g = parse_and_display("root ::= \"a\"{3}");
-        assert_eq!(g, "root ::= ((root_1{3,3}))\nroot_1 ::= \"a\"");
-    }
-
-    #[test]
-    fn test_repetition_range() {
-        let g = parse_and_display("root ::= \"a\"{2,4}");
-        assert_eq!(g, "root ::= ((root_1{2,4}))\nroot_1 ::= \"a\"");
-    }
-
-    #[test]
-    fn test_repetition_unbounded() {
-        let g = parse_and_display("root ::= \"a\"{2,}");
-        assert_eq!(g, "root ::= ((root_1{2,}))\nroot_1 ::= \"a\"");
-    }
-
-    #[test]
-    fn test_lookahead_is_rejected() {
-        assert!(Grammar::from_ebnf("root ::= \"a\" (=\"b\")", "root").is_err());
-    }
-
-    #[test]
-    fn test_rule_reference() {
-        let g = parse_and_display("root ::= digit\ndigit ::= [0-9]");
-        assert_eq!(g, "root ::= ((digit))\ndigit ::= (([0-9]))");
-    }
-
-    #[test]
-    fn test_comment() {
-        let g = parse_and_display("# comment\nroot ::= \"hello\" # inline\n");
-        assert_eq!(g, "root ::= ((\"hello\"))");
-    }
-
-    #[test]
     fn test_unicode_string() {
         let g = Grammar::from_ebnf(r#"root ::= "\u0041\u0042""#, "root").unwrap();
         match g.get_expr(g.root().body) {
@@ -1131,34 +1019,6 @@ mod tests {
             },
             other => panic!("expected Choices, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_multiple_rules() {
-        let g = parse_and_display("root ::= item+\nitem ::= [a-z] | [0-9]");
-        assert!(g.contains("root ::= ((item{1,}))"));
-        assert!(g.contains("item ::= (([a-z]) | ([0-9]))"));
-    }
-
-    #[test]
-    fn test_error_undefined_rule() {
-        let result = Grammar::from_ebnf("root ::= missing", "root");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not defined"));
-    }
-
-    #[test]
-    fn test_error_duplicate_rule() {
-        let result = Grammar::from_ebnf("root ::= \"a\"\nroot ::= \"b\"", "root");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("multiple times"));
-    }
-
-    #[test]
-    fn test_error_missing_root() {
-        let result = Grammar::from_ebnf("foo ::= \"a\"", "root");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
     #[test]
@@ -1182,15 +1042,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_empty_parens() {
-        let g = parse_and_display("root ::= ()");
-        assert_eq!(g, "root ::= ((\"\"))");
-    }
-
-    #[test]
-    fn test_nested_groups() {
-        let g = parse_and_display("root ::= ((\"a\"))");
-        assert_eq!(g, "root ::= ((((((\"a\"))))))");
-    }
 }

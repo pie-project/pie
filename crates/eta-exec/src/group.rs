@@ -59,10 +59,3 @@ pub fn used_channel_slots(ops: &[LaunchOp]) -> Result<usize, TooManyChannels> {
     }
     Ok(needed)
 }
-
-// SIX `CHANNEL_*` FLAG BITS AND THE `channel_flags` THAT PACKED THEM stood
-// here: the per-channel word a device lane table used to carry so a kernel
-// could read a program's declared requirement out of the table. Nothing in
-// either shell packs one — readiness is `Readiness`/`Effect` on the host and
-// the ticket words on the device — and the re-exports were the only thing
-// keeping them compiled (alto E).

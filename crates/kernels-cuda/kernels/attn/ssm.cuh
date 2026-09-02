@@ -2138,7 +2138,9 @@ __global__ void ssm_kda_step_batched(
     const float* g_h = gate   + rh * D;
     const float beta_h = beta[rh];
 
-    float* st = state_base + (long long)slot_ids[r] * slot_stride_elems +
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    float* st = state_base + (long long)slot * slot_stride_elems +
                 (long long)h * D * D;
     float* out_h = out + ((long long)r_row * H + h) * D;
 

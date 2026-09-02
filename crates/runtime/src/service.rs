@@ -1,29 +1,7 @@
-//! Service Framework
-//!
-//! A lightweight actor model implementation for asynchronous message-passing services.
-//! Each service runs in a dedicated async task and processes messages sequentially.
-//!
-//! # Architecture
-//!
-//! - **Handle**: Trait for implementing message handlers
-//! - **Service**: Single service address (for singletons)
-//! - **ServiceMap**: Map of service addresses indexed by custom keys
-//!
-//! # Usage
-//!
-//! ## Singleton Service
-//! ```ignore
-//! static SVC: Service<MyMessage> = Service::new();
-//! SVC.spawn(|| MyHandler::new());
-//! SVC.send(msg)?;
-//! ```
-//!
-//! ## Keyed Services (for registries)
-//! ```ignore
-//! static REGISTRY: LazyLock<ServiceMap<ClientId, SessionMessage>> = LazyLock::new(ServiceMap::new);
-//! REGISTRY.spawn(client_id, || SessionHandler::new());
-//! REGISTRY.send(client_id, msg)?;
-//! ```
+//! A lightweight actor model for asynchronous message-passing services: each
+//! service runs in a dedicated async task and processes messages
+//! sequentially. [`Service`] is a singleton address; [`ServiceMap`] is a
+//! registry of addresses indexed by key.
 
 use anyhow::{Result, anyhow, bail, ensure};
 use dashmap::DashMap;
@@ -53,7 +31,6 @@ pub(crate) trait ServiceHandler: Send + 'static {
 }
 
 /// Runs a handler in a spawned task with lifecycle hooks.
-/// Returns a JoinHandle to await shutdown.
 fn run_handler<H: ServiceHandler>(
     mut handler: H,
     mut rx: UnboundedReceiver<H::Message>,
@@ -84,14 +61,12 @@ pub struct Service<Msg: Send + 'static> {
 }
 
 impl<Msg: Send + 'static> Service<Msg> {
-    /// Creates a new empty service.
     pub const fn new() -> Self {
         Self {
             state: Mutex::new(None),
         }
     }
 
-    /// Spawns the service using a factory function for custom initialization.
     pub fn spawn<H, F>(&self, factory: F) -> Result<()>
     where
         H: ServiceHandler<Message = Msg>,
@@ -107,7 +82,6 @@ impl<Msg: Send + 'static> Service<Msg> {
         Ok(())
     }
 
-    /// Sends a message to the service.
     pub fn send(&self, msg: Msg) -> Result<()> {
         let tx = self
             .state
@@ -119,7 +93,6 @@ impl<Msg: Send + 'static> Service<Msg> {
         tx.send(msg).map_err(|_| anyhow!("Service channel closed"))
     }
 
-    /// Stops the service and awaits its shutdown.
     #[allow(dead_code)] // framework completeness; no current caller needs a singleton shutdown.
     pub async fn shutdown(&self) -> Result<()> {
         let Some(SingletonState { tx, handle }) = self.state.lock().unwrap().take() else {
@@ -131,7 +104,6 @@ impl<Msg: Send + 'static> Service<Msg> {
             .map_err(|e| anyhow!("Service task panicked: {}", e))
     }
 
-    /// Returns true if the service has been spawned.
     pub fn is_spawned(&self) -> bool {
         self.state.lock().unwrap().is_some()
     }
@@ -159,7 +131,6 @@ where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     Msg: Send + 'static,
 {
-    /// Creates a new empty service map.
     pub fn new() -> Self {
         Self {
             map: DashMap::new(),
@@ -167,7 +138,6 @@ where
         }
     }
 
-    /// Spawns a new service with the given key.
     pub fn spawn<H, F>(&self, key: K, factory: F) -> Result<()>
     where
         H: ServiceHandler<Message = Msg>,
@@ -205,7 +175,7 @@ where
         Ok(())
     }
 
-    /// Removes a service by key. Returns true if a service was removed.
+    /// Removes a service by key. Returns true if one was registered.
     pub fn remove(&self, key: &K) -> bool {
         self.handles.remove(key);
         self.map.remove(key).is_some()
@@ -224,24 +194,20 @@ where
             .map_err(|e| anyhow!("Service task panicked: {}", e))
     }
 
-    /// Returns true if a service with the given key exists.
     #[allow(dead_code)] // framework completeness; `server::exists` is its only (currently uncalled) caller.
     pub fn contains(&self, key: &K) -> bool {
         self.map.contains_key(key)
     }
 
-    /// Returns all keys in the map.
     pub fn keys(&self) -> Vec<K> {
         self.map.iter().map(|r| r.key().clone()).collect()
     }
 
-    /// Returns the number of services.
     #[allow(dead_code)] // framework completeness alongside `is_empty`.
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
-    /// Returns true if no services exist.
     #[allow(dead_code)] // framework completeness alongside `len`.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()

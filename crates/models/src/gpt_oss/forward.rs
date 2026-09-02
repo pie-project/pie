@@ -12,17 +12,8 @@ impl Facts {
         Predicate::fact(0)
     }
 
-    /// **THE ADAPTER WINDOW** (palo design §8, §0; campaign A-6).
-    ///
-    /// A lane that routed its rows to a registered adapter. §8 puts the
-    /// correction "over the adapter window", and §0 defines a window as the
-    /// rows of the lanes whose word satisfies the guard — so the axis needs a
-    /// bit, and the bit is what makes it FREE when nobody uses it: a fire no
-    /// lane routed has zero rows in this class, `engine::fire::walk` skips a
-    /// zero-row region before it dispatches anything, and the correction costs
-    /// that fire no launch, no empty grid and no instruction. A `Guard::Always`
-    /// correction would instead launch two kernels per layer over every row of
-    /// every fire to add zero to them, which is 1.0x nothing.
+    /// True for rows routed to a registered adapter. A fire with no adapter
+    /// rows has zero rows in this class, so the correction dispatches nothing.
     pub fn has_adapter() -> Predicate {
         Predicate::fact(1)
     }
@@ -58,20 +49,8 @@ impl ForwardHybrid for Model {
         let m = self;
 
         let positions = inputs.positions();
-        // ONE SCHEDULE PER READING, PER CLASS. gpt-oss alternates a 128-wide
-        // sliding window with full attention over one page-id space, and a
-        // schedule is carved for one window or the other: `sched_prefill`
-        // sizes its kv chunking from `window_left` and the kernel recomputes
-        // the same count when it merges the partials, so a schedule shared
-        // between the two would put the work items and the merge at two
-        // different numbers. Each pair below IS that reading axis: its two
-        // lines differ by the window the schedule states, `Some(m.window)`
-        // against `None`, and a layer indexes its pair by the discriminant of
-        // the `Reading` it carries (0 windowed, 1 full). The class is the arm
-        // the plan is built off — a decode schedule reads the decode arm's
-        // geometry, a prefill schedule the prefill arm's, so each plan node's
-        // guard IS the class it was carved for and the recorder refuses a
-        // reader from the other arm.
+        // gpt-oss layers alternate sliding-window and full attention; each
+        // reading gets its own plan (window vs None), indexed by Reading.
         let (input_d, input_p) = inputs.split(&Facts::qo_one());
         let plan_d = [
             ops::attn::plan_decode(&input_d, m.q_heads, m.kv_heads, m.head_dim, Some(m.window)),
@@ -152,15 +131,7 @@ impl ForwardHybrid for Model {
             } else {
                 o
             };
-            // **THE CORRECTION, OVER ITS WINDOW** (design §8, campaign A-6).
-            // One statement: the site's output — the reduced projection plus
-            // its bias — and this row's adapter's `B·(A·x)`, in place. No merge
-            // and no arm: the op writes THROUGH the arena column, so a class
-            // outside the window never runs the node and reads the uncorrected
-            // value at the same address, which is the identity for free.
-            //
-            // AFTER the reduce and after the bias, and `Layer::lora_a`'s own
-            // note argues both.
+            // Applied after all_reduce and after the output bias.
             let o = ops::elemwise::add_bias(&at.o_bias, &o);
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());

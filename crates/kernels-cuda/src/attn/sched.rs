@@ -3,14 +3,10 @@
 //! a plan's `int_upload`, the host-table validators every planner opens
 //! with, and the cost heap the load balancers ride.
 //!
-//! The planners themselves (`sched_decode`, `sched_prefill`, `sched_sm90`,
-//! `sched_mla`) are native reimplementations of FlashInfer's host
-//! scheduling. A schedule here is valid and deterministic — the same input
-//! always balances the same way — but not byte-identical to the C++
-//! reference: the reference's libstdc++ tie orders and machine-int
-//! overflows are not part of the contract, only the staged encoding is
-//! (i32 little-endian vectors at 16-byte-aligned offsets the info structs
-//! name). Where the reference wrapped, this plane widens or refuses.
+//! The planners themselves are native reimplementations of FlashInfer's host
+//! scheduling: valid and deterministic, but not byte-identical to the C++
+//! reference. Only the staged encoding (i32 little-endian vectors at
+//! 16-byte-aligned offsets) is part of the contract.
 
 use core::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
@@ -18,8 +14,6 @@ use std::collections::BinaryHeap;
 use crate::error::Error;
 
 use crate::jit::refuse;
-
-// ─── the workspace allocator and staging buffer ─────────────────────────────
 
 /// An aligned bump allocator that carves offsets out of a granted
 /// workspace. It carries the plan op's name so an overflow refuses with
@@ -149,8 +143,6 @@ impl Staging {
     }
 }
 
-// ─── the host-table validators ──────────────────────────────────────────────
-
 /// Walks a host indptr once and hands back the per-request span widths it
 /// spells. Indptrs are engine-bound host twins, so a short or non-monotone
 /// table is refused, not asserted.
@@ -224,8 +216,6 @@ pub fn narrow(op: &'static str, what: &'static str, value: i64) -> Result<i32, E
 pub fn narrow_all(op: &'static str, what: &'static str, values: &[i64]) -> Result<Vec<i32>, Error> {
     values.iter().map(|&v| narrow(op, what, v)).collect()
 }
-
-// ─── the load balancer's cost heap ──────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
 struct Lane {

@@ -1,6 +1,6 @@
 [package]
 name = "eta-compiler"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version.workspace = true
 authors = ["In Gim <in.gim@yale.edu>"]
@@ -14,31 +14,20 @@ name = "eta_compiler"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# Host-only, and that is a CONSEQUENCE of the fold rather than a choice:
-# `plan` alone was `no_std` (+ alloc), but `eval`'s extern channels are
-# `std::sync::{Arc, Mutex}` and `codegen` writes files, so one crate holding
-# all three cannot be. Nothing depended on the `no_std` mode -- the guest
-# imports `eta-ir` and `eta-dsl`, which keep theirs, and those are the
-# two the wasm build actually reaches. `plan`'s `std` feature is dropped with
-# it; `eta-ir` is taken with defaults here for the same reason.
+# Host-only by construction: `eval`'s extern channels are `std::sync` and
+# `codegen` writes files. The guest imports `eta-ir` and `eta-dsl`, which keep
+# their `no_std` modes.
 [dependencies]
-# `serde` is ON here now, and `eta-ir` is taken WITH its `serde` feature,
-# because this crate declares the launch package (`codegen::launch`) — the
-# artifact an engine executes — and every noun in it serializes. Both of those
-# used to arrive through `engine`, which declared the package on this
-# crate's behalf; the producer owns its output type now, so the dependency
-# that carried the derives comes here with it.
-#
-# `default-features = false` + `alloc` on serde for the reason `eta-ir` states
-# at its own edge: the guest half of the toolchain is `no_std` wasm, and a
-# `std` serde in the graph is a `std` serde for everyone Cargo unifies with.
+# `serde` is on, and `eta-ir` is taken with its `serde` feature, because this
+# crate declares the launch package an engine executes and every noun in it
+# serializes. `default-features = false` + `alloc` on serde because a `std`
+# serde in the graph is a `std` serde for everyone Cargo unifies with.
 eta-ir = { path = "../eta-ir", features = ["serde"] }
 serde = { version = "1.0", default-features = false, features = [
     "alloc",
     "derive",
 ] }
 
-# Shared ratchet from the root manifest. The toolchain's three crates are gated
-# with `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+# The toolchain's three crates are the ones CI gates with `-D warnings`.
 [lints]
 workspace = true

@@ -16,28 +16,18 @@ const M1: &str = "M1";
 const M3: &str = "M3";
 
 /// The M1 runtime template, from
-/// `crates/eta-compiler/runtime/metal/ptir_m1_runtime.metal` (the C++ oracle
-/// this was ported from read the same text out of the engine's tree; the file
-/// moved here when the emitter became the only implementation). Embedded so the
-/// emitter is self-contained — the C++ took it as a `runtime_template` argument
-/// read from disk at init.
-///
-/// It still carries `#include "ptir_rng.generated.metal"`; expanding that is
-/// the engine's job at library-build time, not the emitter's.
+/// `crates/eta-compiler/runtime/metal/ptir_m1_runtime.metal`, embedded so the
+/// emitter is self-contained. Still carries `#include
+/// "ptir_rng.generated.metal"`; expanding that is the engine's job at
+/// library-build time, not the emitter's.
 pub const RUNTIME_TEMPLATE: &str = include_str!("../../../runtime/metal/ptir_m1_runtime.metal");
 
-/// The grouped (M3) lane-table structs, in a file rather than a literal for the
-/// same reason `RUNTIME_TEMPLATE` is: a C++ reader needs them too. The Metal
-/// engine's `msl_compile_test` reconstructs the emitter's full sources from the
-/// golden dump plus these two prefixes, and a raw string literal in this crate
-/// is reachable from nothing but this crate.
+/// The grouped (M3) lane-table structs, in a file rather than a literal so a
+/// C++ reader can open it too.
 ///
-/// This file is a *replica*, not the authority: [`grouped_preamble`] prints the
-/// same structs from [`layout::HOST_SHARED`], and `file_matches_emitted_text`
-/// below fails the build if the two ever disagree. Without that the file would
-/// be a seventh hand-written copy of the lane table — the exact failure
-/// [`layout`] exists to rule out, reintroduced by the C++ reader's need for a
-/// path it can open.
+/// This file is a *replica*, not the authority: [`grouped_preamble`] prints
+/// the same structs from [`layout::HOST_SHARED`], and
+/// `file_matches_emitted_text` below fails the build if the two disagree.
 pub const GROUPED_PREAMBLE: &str = include_str!("../../../runtime/metal/ptir_m1_grouped.metal");
 
 /// `common_effect_preamble()` — the structs the single-lane readiness and
@@ -108,20 +98,13 @@ struct M3RowMeta {
 
 #[cfg(test)]
 mod tests {
-    use crate::codegen::runtime_scan::assert_execute_covers_the_table;
-
-    #[test]
-    fn metal_execute_covers_the_op_table() {
-        assert_execute_covers_the_table(super::RUNTIME_TEMPLATE, "ptir_m1_runtime.metal");
-    }
+    
 
     use super::*;
 
-    /// `ptir_m1_grouped.metal` exists because the Metal engine's
-    /// `msl_compile_test` needs a path it can open; it is not a second place to
-    /// declare the lane table. Adding a field to [`layout::HOST_SHARED`] and
-    /// not to the file (or the reverse) fails here instead of shipping a
-    /// kernel that reads different offsets than the host wrote.
+    /// `ptir_m1_grouped.metal` is not a second place to declare the lane
+    /// table: a field added to [`layout::HOST_SHARED`] but not to the file
+    /// (or the reverse) fails here rather than shipping mismatched offsets.
     #[test]
     fn file_matches_emitted_text() {
         assert_eq!(

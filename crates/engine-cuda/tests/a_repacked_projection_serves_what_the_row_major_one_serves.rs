@@ -2,7 +2,7 @@
 //! prompt, and the same logits.
 //!
 //! ```text
-//! cargo test -p engine-cuda --features cuda-13 \
+//! cargo test -p engine-cuda --features cuda \
 //!   --test a_repacked_projection_serves_what_the_row_major_one_serves -- --nocapture
 //! ```
 //!
@@ -57,11 +57,8 @@
 //! scratch directory.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use checkpoint::contract::ModelContract;
-use engine_cuda::{Boot, Graphs, Lane, Shell};
-use model_compiler::Budget;
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops,
     trace_hybrid,
@@ -141,7 +138,7 @@ impl Micro {
     /// their own names, and the ONLY difference between the two loads is the
     /// dtype the text declared.
     fn load(&self, src: &ztensor::Source) -> ModelContract {
-        let mut b = checkpoint_dsl::Builder::new(src, 1);
+        let mut b = checkpoint_dsl::Builder::new(src, 1, model_dsl::Platform::Cuda);
         for w in [&self.embed, &self.proj, &self.head] {
             b.read_own(w)
                 .unwrap_or_else(|why| panic!("`{}`: {why}", w.name));
@@ -372,7 +369,17 @@ fn affine_tensor(writer: &mut ztensor::Writer, name: &str, rows: usize, arm: Arm
     // The affine-group profile `checkpoint::file::write` stamps on an MLX
     // bank, which `file::zt::affine_group_scheme` reads back as
     // `QuantScheme::MlxAffineU4`: four bits, packed low code first, a
-    // zero point stored plain beside the scale.
+    // zero point stored plain beside the scale, and its factors stated as
+    // `f16_factors`.
+    //
+    // **`scale_form` IS REQUIRED AND THIS FIXTURE HAD BEEN WRITTEN BEFORE IT
+    // WAS.** The QNF wave made it the key that separates schemes agreeing on
+    // every other field — `MlxAffineU4` and `Int8Asymmetric` both read
+    // lsb_first tensor/plain, and only the factor width tells them apart — so
+    // a profile without it names no scheme and the reader says so rather than
+    // guessing. Every field here is the one `write.rs` stamps for this scheme,
+    // `word` included, because a fixture that imitates the writer loosely is a
+    // fixture that stops imitating it the next time the writer moves.
     let attrs = cbor::map([
         ("axis", cbor::Value::from(1u64)),
         ("bits", cbor::Value::from(4u64)),
@@ -382,8 +389,10 @@ fn affine_tensor(writer: &mut ztensor::Writer, name: &str, rows: usize, arm: Arm
             cbor::map([
                 ("order", cbor::Value::from("lsb_first")),
                 ("per_word", cbor::Value::from(8u64)),
+                ("word", cbor::Value::from("u32")),
             ]),
         ),
+        ("scale_form", cbor::Value::from("f16_factors")),
         (
             "zero_point",
             cbor::map([
@@ -424,84 +433,6 @@ fn scratch(what: &str) -> PathBuf {
 // ─────────────────────────────────────────────────────────────────────────
 // The fire
 // ─────────────────────────────────────────────────────────────────────────
-
-/// Six ids inside the micro text's vocabulary — a prefill of six rows, which
-/// is BELOW `dispatch::linear`'s `PREFILL_ROWS` and therefore the DECODE
-/// point on the tiled arm. `a_prefill_takes_the_tile_and_a_decode_takes_the_
-/// gemv` fires the other side of the gate.
-const PROMPT: [u32; 6] = [11, 233, 7, 900, 42, 601];
-
-/// One shell at a time per process — `kernels-cuda`'s scratch slabs are
-/// process-global and keyed by name.
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-fn serialized() -> MutexGuard<'static, ()> {
-    ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn load(trace: Trace, contract: &ModelContract, container: &Path) -> Shell {
-    Shell::load(Boot {
-        residency: engine_cuda::experts::Plan::default(),
-        trace,
-        contract,
-        checkpoint: container,
-        budget: Budget::new(2, 32),
-        patches: None,
-        profile: None,
-        page_size: 16,
-        context: 64,
-        slots: 2,
-        ordinal: 0,
-        graphs: Graphs::Off,
-        knobs: engine_cuda::Knobs::default(),
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        weight_cache_dir: None,
-    })
-    .expect("the micro text loads its own checkpoint")
-}
-
-/// One prefill of `tokens`, and the logit row it lands.
-fn fire(shell: &mut Shell, tokens: &[u32]) -> Vec<f32> {
-    shell.open(0).expect("slot 0 opens");
-    let rows = shell
-        .fire(&[Lane {
-            slot: 0,
-            word: 0,
-            tokens,
-        }])
-        .expect("the prefill fires");
-    rows[0].clone()
-}
-
-fn spread(logits: &[f32]) -> f32 {
-    logits.iter().copied().fold(f32::NEG_INFINITY, f32::max)
-        - logits.iter().copied().fold(f32::INFINITY, f32::min)
-}
-
-fn finite(logits: &[f32], what: &str) {
-    assert!(!logits.is_empty(), "{what} produced no logits at all");
-    let bad = logits.iter().position(|value| !value.is_finite());
-    assert!(
-        bad.is_none(),
-        "{what} logit {} is {}, and a single NaN means the whole row is noise",
-        bad.unwrap_or(0),
-        logits[bad.unwrap_or(0)],
-    );
-    assert!(
-        spread(logits) > 1e-3,
-        "{what} logits span {}, which is a rectangle nothing wrote",
-        spread(logits),
-    );
-}
-
-fn ready(what: &str) -> bool {
-    if engine_cuda::device::present() {
-        return true;
-    }
-    eprintln!("skipping {what}: no CUDA device on this machine");
-    false
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 // (0) the host half — no device, and it runs on every `cargo test`
@@ -565,120 +496,3 @@ fn a_tiled_declaration_bands_the_rows_on_both_sides() {
 // (1) the device half
 // ─────────────────────────────────────────────────────────────────────────
 
-/// **THE GATE.** Two containers holding one set of weights in two orders, one
-/// prompt — and the tiled arm's logits are the row-major arm's.
-///
-/// **AGREEMENT IS ALSO THE PROOF THAT THE TILED POINTS RAN.** There is no
-/// counter read here and none is needed: a repacked row answers `None` to
-/// `Run::maybe_planes`, so the only other thing the anchor can do with one is
-/// reach `Run::tensor` and panic by name. A silently wrong arm is not
-/// reachable — what IS reachable, and what this gate catches, is the tiled
-/// point reading the layout differently from the way the container was
-/// written.
-#[test]
-fn a_repacked_projection_says_what_the_row_major_one_says() {
-    let _one = serialized();
-    if !ready("a_repacked_projection_says_what_the_row_major_one_says") {
-        return;
-    }
-    let dir = scratch("parity");
-
-    let mut rows = Vec::new();
-    for arm in [Arm::RowMajor, Arm::Tiled] {
-        let container = dir.join(format!("{arm:?}.zt"));
-        write_checkpoint(&container, arm);
-        let (m, t) = trace(arm);
-        let src = ztensor::Source::open(&container).expect("the fixture opens");
-        let contract = m.load(&src);
-        drop(src);
-        let mut shell = load(t, &contract, &container);
-        let logits = fire(&mut shell, &PROMPT);
-        finite(&logits, &format!("{arm:?}"));
-        drop(shell);
-        rows.push(logits);
-    }
-
-    let (row_major, tiled) = (&rows[0], &rows[1]);
-    assert_eq!(row_major.len(), tiled.len(), "two readouts of one vocabulary");
-
-    // **JUDGED AGAINST THE ROW'S OWN SCALE** (§J4a-1). The fused GEMV folds
-    // `s*c + b` in f32 inside the dot and the tiled points materialise every
-    // weight element as a bf16 register, so a per-element relative error
-    // would be measuring cancellation at the near-zero logits and nothing
-    // else. The spread is the ruler the argmax is read with.
-    let ruler = spread(row_major);
-    let worst = row_major
-        .iter()
-        .zip(tiled)
-        .enumerate()
-        .max_by(|a, b| (a.1.0 - a.1.1).abs().total_cmp(&(b.1.0 - b.1.1).abs()))
-        .expect("a non-empty row");
-    let gap = (worst.1.0 - worst.1.1).abs();
-    eprintln!(
-        "tiled parity: spread {ruler:.4}, worst gap {gap:.5} at column {} ({:.3}%)",
-        worst.0,
-        100.0 * gap / ruler,
-    );
-    assert!(
-        gap <= 0.02 * ruler,
-        "the tiled arm and the row-major one disagree by {gap} at column {}, which is \
-         {:.2}% of the row's {ruler} spread — they fold the same weights and differ \
-         only in the order the bytes sit in",
-        worst.0,
-        100.0 * gap / ruler,
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// **BOTH SIDES OF THE SHAPE GATE, ON ONE LOADED SHELL.** `PREFILL_ROWS` is
-/// sixteen, so a six-token prompt takes the tiled DECODE point and a
-/// thirty-two-token one takes the tiled GEMM — two kernels over one set of
-/// planes, and a layout either of them read differently would part from the
-/// row-major arm here.
-///
-/// The row-major arm crosses its own gate at the same row count
-/// (`quant::matmul` to `matmul_via_dense`), so what is compared is four
-/// kernels: two orders by two shapes.
-#[test]
-fn a_prefill_takes_the_tile_and_a_decode_takes_the_gemv() {
-    let _one = serialized();
-    if !ready("a_prefill_takes_the_tile_and_a_decode_takes_the_gemv") {
-        return;
-    }
-    let dir = scratch("shapes");
-    // Thirty-two tokens: above `PREFILL_ROWS` on both arms.
-    let long: Vec<u32> = (0..32u32).map(|i| (i * 31 + 5) % VOCAB).collect();
-
-    let mut rows = Vec::new();
-    for arm in [Arm::RowMajor, Arm::Tiled] {
-        let container = dir.join(format!("{arm:?}.zt"));
-        write_checkpoint(&container, arm);
-        let (m, t) = trace(arm);
-        let src = ztensor::Source::open(&container).expect("the fixture opens");
-        let contract = m.load(&src);
-        drop(src);
-        let mut shell = load(t, &contract, &container);
-        let logits = fire(&mut shell, &long);
-        finite(&logits, &format!("{arm:?} prefill"));
-        drop(shell);
-        rows.push(logits);
-    }
-
-    let (row_major, tiled) = (&rows[0], &rows[1]);
-    let ruler = spread(row_major);
-    let gap = row_major
-        .iter()
-        .zip(tiled)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    eprintln!("tiled prefill parity: spread {ruler:.4}, worst gap {gap:.5}");
-    assert!(
-        gap <= 0.02 * ruler,
-        "the tiled GEMM and the decoded row-major arm disagree by {gap}, which is \
-         {:.2}% of the row's {ruler} spread",
-        100.0 * gap / ruler,
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}

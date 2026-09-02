@@ -30,8 +30,7 @@ type CollectedSection = (&'static str, Vec<(String, String, Status)>);
 ///
 /// Collected first and rendered second, so the table and the JSON cannot drift
 /// into disagreeing about `ready` -- which is the one thing a readiness probe
-/// reads. That discipline used to be this command's alone, held by a comment;
-/// it is [`crate::ui::Report`] now and every command has it.
+/// reads. [`crate::ui::Report`] is what holds every command to it.
 #[derive(serde::Serialize)]
 pub struct DoctorReport {
     ready: bool,
@@ -127,11 +126,16 @@ pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
 
     let mut sections: Vec<CollectedSection> = Vec::new();
 
+    // The config decides whether an NVIDIA probe is even the right question,
+    // so it is read here rather than inside `check_config` alone -- the section
+    // order below is unchanged, only where the path is computed.
+    let (path, origin) = bootstrap::cli_config_path(global);
+
     sections.push(("system", vec![check_platform(), check_py_runtime()]));
-    sections.push(("gpus", check_gpus()));
+    sections.push(("gpus", check_gpus(configured_engine(&path).as_deref())));
     sections.push((
         "engines",
-        worker::engine_ffi::compiled_embedded()
+        worker::backend::flavor::compiled_embedded()
             .iter()
             .map(|(name, on)| {
                 if *on {
@@ -147,7 +151,6 @@ pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
     // Last, because its verdict depends on everything above: whether a config
     // is servable is a question about this binary and this machine, not about
     // the file alone.
-    let (path, origin) = bootstrap::cli_config_path(global);
     sections.push(("config", check_config(&path, origin)));
     sections.push(("tuning", check_tuning(&path)));
 
@@ -276,7 +279,7 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Vec<(String, String, 
     // isolation: the config names an engine, and this binary either has it or
     // does not.
     let kind = worker.model.engine.kind.as_str();
-    let compiled = worker::engine_ffi::compiled_embedded()
+    let compiled = worker::backend::flavor::compiled_embedded()
         .iter()
         .find(|(name, _)| *name == kind)
         .map(|(_, on)| *on)
@@ -301,21 +304,31 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Vec<(String, String, 
     out
 }
 
+/// The engine types this build knows how to host, for the message below.
+///
+/// Not `flavor::compiled_summary()`, which lists what this binary HAS: the
+/// point of naming an unknown type is to say which spellings exist at all,
+/// and on a binary with no feature on that summary is empty.
+const KNOWN_ENGINES: &str = "cuda, metal";
+
 /// Why an engine flavor this binary does not have is missing.
 ///
-/// TWO reasons, and only one of them is a build choice. CUDA is absent
-/// because a feature was off, and the feature carries the CUDA runtime ABI
-/// in its name -- there is no version-less `engine-cuda` to advise. The three
-/// shader flavors are absent because no build of pie hosts them: their crates
-/// left the workspace and no feature would bring one back. Advice that would
-/// not work is worse than no advice, which is the distinction
-/// `worker::engine_ffi` draws between its two error messages.
+/// THREE answers, because there are three ways to not have one and only two
+/// of them are a build choice. A feature was off (rebuild with it); the
+/// feature cannot apply here, because Metal's device half is Apple-only at
+/// the crate level and telling a Linux operator to enable a flag they may
+/// already have on is advice that cannot work; or the config named a
+/// spelling this build does not know. It is the distinction
+/// `worker::backend::flavor` draws between `missing_feature_msg` and
+/// `non_apple_msg`, kept in the same words here.
 fn absent_because(name: &str) -> String {
     match name {
-        "cuda_native" => {
-            "not compiled — build with `--features engine-cuda-13` (or `-12`)".to_string()
+        "cuda_native" => "not compiled — build with `--features cuda`".to_string(),
+        "metal" if cfg!(target_vendor = "apple") => {
+            "not compiled — build with `--features metal`".to_string()
         }
-        shader => format!("retired — no build of pie hosts `engine-{shader}`; it returns at P5"),
+        "metal" => "metal engines run on Apple hardware only".to_string(),
+        other => format!("unknown engine type `{other}`; this build knows: {KNOWN_ENGINES}"),
     }
 }
 
@@ -340,11 +353,8 @@ fn check_platform() -> (String, String, Status) {
 
 /// Whether Python inferlets can run.
 ///
-/// A warning rather than a failure, and it used to be `pie runtime status` --
-/// a top-level command for a question, next to `pie runtime install` for
-/// something `serve` already does on the way up. Both are gone: the answer
-/// belongs with the other "will this work here" answers, and the fix happens
-/// by itself.
+/// A warning rather than a failure: the answer belongs with the other "will
+/// this work here" answers, and the fix happens by itself on the next `serve`.
 fn check_py_runtime() -> (String, String, Status) {
     let dir = crate::local::py_runtime::runtime_dir();
     if crate::local::py_runtime::is_installed() {
@@ -364,7 +374,50 @@ fn check_py_runtime() -> (String, String, Status) {
     }
 }
 
-fn check_gpus() -> Vec<(String, String, Status)> {
+/// The engine type this config names, without parsing the whole document.
+///
+/// The same `schema::lookup` `check_tuning` reads keys with, and for the same
+/// reason: a config too broken to parse still has to be looked at, and the
+/// real verdict on it is `check_config`'s.
+fn configured_engine(config_path: &Path) -> Option<String> {
+    let file: toml::Value = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|content| toml::from_str(&content).ok())?;
+    worker::config::schema::lookup(&file, "engine.type")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Whether `nvidia-smi` answers a question this deployment is asking.
+///
+/// A probe for a vendor the config does not name is not a check: running it
+/// unconditionally tells a Metal config on a Mac "no NVIDIA GPUs detected" --
+/// a true sentence about a card nothing here wants, filed as a warning against
+/// an installation that is fine.
+fn nvidia_probe_applies(named_engine: Option<&str>) -> bool {
+    match named_engine {
+        // `cuda` as well as `cuda_native`: `pie config set` accepts both
+        // spellings for `engine.type` (see `ops::config::engine_kind`).
+        Some(kind) => kind == "cuda_native" || kind == "cuda",
+        // No config, or one that names no engine: fall back to what the binary
+        // carries, which is the same question one step earlier.
+        None => worker::backend::flavor::compiled_embedded()
+            .iter()
+            .any(|(name, on)| *name == "cuda_native" && *on),
+    }
+}
+
+fn check_gpus(named_engine: Option<&str>) -> Vec<(String, String, Status)> {
+    if !nvidia_probe_applies(named_engine) {
+        return vec![(
+            "GPU".into(),
+            match named_engine {
+                Some(kind) => format!("not probed — this config names the {kind} engine"),
+                None => "not probed — this binary carries no CUDA engine".to_string(),
+            },
+            Status::Pass,
+        )];
+    }
     // nvidia-smi is the cheapest "GPU visible" probe — no link to
     // libnvidia-ml needed.
     match Command::new("nvidia-smi")
@@ -402,27 +455,19 @@ fn check_gpus() -> Vec<(String, String, Status)> {
 /// Has this machine been measured, or is it running on defaults someone else
 /// measured?
 ///
-/// The plan's §7 makes this mandatory rather than nice. `pie config tune`
-/// measures the batching knobs on this machine; the forward-shape keys are
-/// stated by the operator or left to the engine's own defaults. A machine
-/// where neither has happened runs on numbers measured somewhere else.
-/// That is a perfectly serviceable state -- it is what every deployment has had
-/// until now -- but it is not one an operator should have to infer from the
-/// absence of keys in a file.
+/// `pie config tune` measures the batching knobs on this machine; the
+/// forward-shape keys are stated by the operator or left to the engine's own
+/// defaults. A machine where neither has happened runs on numbers measured
+/// somewhere else. That is a perfectly serviceable state, but not one an
+/// operator should have to infer from the absence of keys in a file.
 ///
 /// Warnings, never failures. An unmeasured machine serves.
-///
-/// Two checks retired from here, each because what it guarded is gone: a
-/// blocking check for a `calibrate_planner` left on in the config (the key
-/// became unwritable, then left the config altogether), and a "planner
-/// profile" row over `cuda_memory_profiles.json` (the planner that wrote and
-/// read that file left with the boot document).
 fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> {
     let file: toml::Value = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|content| toml::from_str(&content).ok())
         .unwrap_or_else(|| toml::Value::Table(Default::default()));
-    let set = |key: &str| worker::config_schema::lookup(&file, key).map(|v| v.to_string());
+    let set = |key: &str| worker::config::schema::lookup(&file, key).map(|v| v.to_string());
 
     let mut checks = Vec::new();
 
@@ -502,9 +547,9 @@ mod tests {
     #[test]
     fn the_unmeasured_machine_still_serves() {
         // This section describes the machine rather than faulting the config,
-        // and an unmeasured machine is a perfectly serviceable one -- it is
-        // what every deployment had until now. Nothing here may block a boot.
-        for config in ["", "[engine]\nmemory_profile = \"latency\"\n"] {
+        // and an unmeasured machine is a perfectly serviceable one. Nothing
+        // here may block a boot.
+        for config in ["", "[engine]\nkv_page_size = 32\n"] {
             let checks = tuning_of(config);
             assert!(
                 !checks.iter().any(|(_, _, status)| *status == Status::Fail),

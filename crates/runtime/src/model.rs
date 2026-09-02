@@ -1,27 +1,6 @@
 //! The served model: the runtime's global model/tokenizer cache, and the
-//! serving table it is built from.
-//!
-//! Set once at bootstrap and read from everywhere after. It lived in
-//! `model` while that crate was the only place a `Tokenizer` and an
-//! `Instruct` could be assembled; it is here now because `model` defines
-//! itself as *what each model family is, backend-blind*, and a process-global
-//! `OnceLock` holding whatever this runtime happens to have booted is a fact
-//! about the process, not about any model.
-//!
-//! # What M18 sent over the wall
-//!
-//! `models::serve` was that crate's answer to four serving questions, and this
-//! runtime plus `worker` were its only readers. M18 deleted it whole. Two of
-//! the four are still `model`'s to answer and are asked through its own doors
-//! — [`models::template::template_of`] writes a turn, and the decoders that
-//! read the tokens back are `models::template` re-exports. The other two are
-//! HERE, because a serving fabric is the party that asks them:
-//!
-//! * [`ROWS`], the `(layers, vocab, arch)` a sampler, the ETA lowering and
-//!   the media front-ends are sized and dispatched from;
-//! * [`ModelMetadata`], the shape an artifact's compiled metadata arrives in.
-//!   `worker` lifts it off the checkpoint and hands it here in the boot
-//!   bundle; it is stated in this crate because this crate is what reads it.
+//! serving table ([`ROWS`], [`ModelMetadata`]) it is built from. Set once at
+//! bootstrap and read from everywhere after.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -34,92 +13,42 @@ use tokenizer::Tokenizer;
 /// The single model this runtime serves. Set once at bootstrap.
 static MODEL: OnceLock<Arc<Model>> = OnceLock::new();
 
-// =============================================================================
-// What an artifact carried
-// =============================================================================
-
 /// The compiled metadata a `.zt` artifact carries, lifted once by the worker.
 ///
-/// Two objects and no schema: the checkpoint's own `config.json` bytes,
-/// verbatim, and — for an artifact, absent for a snapshot — the compiled
-/// tokenizer as the named objects that make up a `pie.tokenizer/1`.
-///
-/// It was `models::serve::ModelMetadata`, six lines with no method on it, and
-/// it names nothing `model` knows: not a family, not a plan, not a load
-/// contract. It is the shape one process hands another across the boot
-/// bundle, so it is stated where that bundle is defined.
+/// The checkpoint's `config.json` bytes, verbatim, and — for an artifact,
+/// absent for a snapshot — the compiled tokenizer objects for `pie.tokenizer/1`.
 #[derive(Clone, Debug)]
 pub struct ModelMetadata {
-    /// The compiled tokenizer's objects, `(name, bytes)`. `None` for a
-    /// snapshot, whose tokenizer is a file beside the weights, and `None`
-    /// too when only *some* of the objects were found — see
-    /// `worker::weights`, which treats a partial one as absent.
+    /// `(name, bytes)` per compiled tokenizer object. `None` for a snapshot
+    /// (tokenizer is a file beside the weights) or when only some objects
+    /// were found.
     pub tokenizer: Option<Vec<(String, Vec<u8>)>>,
     /// The checkpoint's `config.json`, verbatim.
     pub config: Vec<u8>,
 }
 
-// =============================================================================
-// The serving table
-// =============================================================================
-
 /// One shipping SKU, as a *serving* runtime sees it.
 ///
-/// Three columns, and each is here because a serving process needs it before
-/// it holds a plan:
-///
-/// * `layers` and `vocab` are computation facts — the tower's depth and the
-///   `embed` table's leading extent — that the sampler and the ETA lowering
-///   are sized from at boot, when nothing in this process has traced
-///   anything;
-/// * `arch` is a deployment fact and no plan states one: a trace says what a
-///   layer computes, not what a fleet calls the model. The vision and speech
-///   front-ends dispatch on it.
-///
-/// # The pin that came off, named rather than hidden
-///
-/// `model/tests/rows_are_the_traces.rs` held `layers` and `vocab` equal to
-/// what the row's own trace says, which is what made them a measurement
-/// rather than a claim. That test died with `models::serve` and with
-/// `models::deployment`, and this crate cannot restate it: reading a plan
-/// means linking `model-dsl` and tracing at test time, which is a dependency
-/// this crate does not have and a port this milestone is not. So the numbers
-/// below are the ones the pin last held, and re-establishing the pin — here,
-/// or back in `model` against a table it can see — is open work.
-///
-/// `max_model_len` STOOD as a fourth column and does not survive the move.
-/// Nothing in this crate ever read it; the context ceiling a worker admits
-/// comes off the engine's own capabilities (`EngineCapabilities::max_model_len`),
-/// which is a different number from a different party. A column with no
-/// reader is a fact this table cannot be held to.
+/// `layers`/`vocab` size the sampler and ETA lowering at boot, before a plan
+/// is traced; `arch` is the label the vision/speech front-ends dispatch on.
 pub struct Row {
-    /// The SKU — a `models::catalog()` row name, and the id every part of
-    /// the tree spells. The engine identifies a checkpoint against
-    /// `models::imports()` and reports the SKU it matched; this is that
-    /// string.
+    /// The SKU — a `models::skus()` row name and the id every part of the
+    /// tree spells.
     pub id: &'static str,
     /// Transformer layers in the tower.
     pub layers: u32,
-    /// The LOGITS width — the leading extent of the `embed` table, which is
-    /// the dim the sampler operates on and the engine's recognizer table is
-    /// keyed by.
-    ///
-    /// It may EXCEED the tokenizer's token count (qwen3: 151 936 logits vs
-    /// 151 669 tokens). Sizing a sampler from the tokenizer instead is the
-    /// vocab-padding device fault.
+    /// Logits width: the leading extent of the `embed` table. May exceed the
+    /// tokenizer's token count (qwen3: 151 936 logits vs 151 669 tokens) —
+    /// size a sampler from this, not the tokenizer vocab.
     pub vocab: u32,
-    /// The architecture label an engine advertises and a control plane files
-    /// this model under, and the string the vision and speech front-ends
-    /// dispatch on.
+    /// Architecture label the vision/speech front-ends dispatch on.
     pub arch: &'static str,
 }
 
-/// Every SKU this build can serve, in `models::catalog()` order.
+/// Every SKU this build can serve, in `models::skus()` order.
 ///
-/// One row per catalog entry, keyed by the SKU — which is the only id space
-/// in the tree. The chat template is NOT a column: it is
-/// [`models::template::template_of`], keyed by the same string, so the two
-/// tables cannot disagree about which model a build is formatting turns for.
+/// The chat template is not a column here: it is
+/// [`models::template::template_of`], keyed by the same SKU string.
 pub const ROWS: &[Row] = &[
     Row {
         id: "dsv4-base-bf16-kv-bf16",
@@ -139,13 +68,17 @@ pub const ROWS: &[Row] = &[
         vocab: 129_280,
         arch: "deepseek_v4",
     },
-    // The mini DQ snapshot: FIVE layers, because that is what the artifact
-    // ships (`num_hidden_layers: 5` — the original 0, 1, 2, 3 and 42,
-    // renumbered), over the same 129 280-token vocabulary and the same
-    // `model_type: deepseek_v4` a front-end dispatches on.
+    // Mini snapshot: 5 layers (`num_hidden_layers: 5`, renumbered from 0,1,2,3,42).
     Row {
-        id: "dsv4-flash-mlxu2-kv-bf16",
+        id: "dsv4-flash-u4g64-u2g64-kv-bf16",
         layers: 5,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+    },
+    // Full checkpoint the row above is a mini carve of, at its own 43 layers.
+    Row {
+        id: "dsv4-flash-full-u4g64-u2g64-kv-bf16",
+        layers: 43,
         vocab: 129_280,
         arch: "deepseek_v4",
     },
@@ -168,22 +101,15 @@ pub const ROWS: &[Row] = &[
         arch: "gemma4",
     },
     Row {
-        id: "gemma4-26b-a4b-mlxu4-kv-bf16",
+        id: "gemma4-26b-a4b-u4g64-kv-bf16",
         layers: 30,
         vocab: 262_144,
         arch: "gemma4",
     },
-    // **THE `-vision-` U4 ROWS, WHICH THE CATALOG HAS AND THIS TABLE DID NOT.**
-    // `the_catalog_and_the_serving_table_are_the_same_ids` was red before this
-    // landed: the vision lane added these SKUs to `::model`'s catalog and not
-    // here, so an engine could load one and this runtime could not name it —
-    // `pie serve` refused at bootstrap with "which this build's model catalog
-    // does not contain", which is a packaging gap wearing an engine's error.
-    // The numbers are not new measurements: a `-vision-mlxu4-` row is its
-    // already-listed twin's trunk, and neither the quantization nor the tower
-    // moves `layers`, `vocab` or `arch`.
+    // Same trunk as its already-listed twin; neither quant nor the vision
+    // tower moves layers, vocab or arch.
     Row {
-        id: "gemma4-26b-a4b-vision-mlxu4-kv-bf16",
+        id: "gemma4-26b-a4b-vision-u4g64-kv-bf16",
         layers: 30,
         vocab: 262_144,
         arch: "gemma4",
@@ -194,16 +120,15 @@ pub const ROWS: &[Row] = &[
         vocab: 262_144,
         arch: "gemma4",
     },
-    // mlx 4-bit row: same trunk geometry as its bf16 sibling (see the qwen
-    // mlxu4 rows below for the argument).
+    // mlx 4-bit: same trunk geometry as its bf16 sibling.
     Row {
-        id: "gemma4-31b-mlxu4-kv-bf16",
+        id: "gemma4-31b-u4g64-kv-bf16",
         layers: 60,
         vocab: 262_144,
         arch: "gemma4",
     },
     Row {
-        id: "gemma4-31b-vision-mlxu4-kv-bf16",
+        id: "gemma4-31b-vision-u4g64-kv-bf16",
         layers: 60,
         vocab: 262_144,
         arch: "gemma4",
@@ -215,13 +140,13 @@ pub const ROWS: &[Row] = &[
         arch: "gemma4",
     },
     Row {
-        id: "glm5-a12b-bf16-bf16-kv-bf16",
+        id: "glm5-a12b-bf16-kv-bf16",
         layers: 46,
         vocab: 151_552,
         arch: "glm_moe_dsa",
     },
     Row {
-        id: "glm5-a12b-bf16-bf16-kv-bf16-tp2",
+        id: "glm5-a12b-bf16-kv-bf16-tp2",
         layers: 46,
         vocab: 151_552,
         arch: "glm_moe_dsa",
@@ -232,10 +157,9 @@ pub const ROWS: &[Row] = &[
         vocab: 201_088,
         arch: "gptoss",
     },
-    // mlx 4-bit row: same trunk geometry as its bf16 sibling (the qwen mlxu4
-    // rows state the argument).
+    // mlx 4-bit: same trunk geometry as its bf16 sibling.
     Row {
-        id: "gptoss-20b-mlxu4-mxfp4-kv-bf16",
+        id: "gptoss-20b-u4g64-mxfp4-kv-bf16",
         layers: 24,
         vocab: 201_088,
         arch: "gptoss",
@@ -264,76 +188,60 @@ pub const ROWS: &[Row] = &[
         vocab: 163_840,
         arch: "kimi_k3",
     },
-    // The one shipping SKU whose checkpoint publishes a draft head (palo C3).
-    // FIRST among the qwen rows, as it is first in `models::catalog()` — this
-    // table is that one in order, and `the_catalog_and_the_serving_table_are_the_same_ids`
-    // is what says so. `arch` is `qwen3_5` because that is what the SKU IS: a
-    // qwen3_5 tower with fifteen `mtp.*` tensors on the end, not one trunk op
-    // changed.
+    // Ships a draft head (fifteen `mtp.*` tensors); arch stays qwen3_5 since
+    // the trunk is unchanged.
     Row {
         id: "qwen36-27b-bf16-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // **QWEN3.8-27B: THE SAME NUMBERS, AND THAT IS THE FINDING.** The 3.8
-    // checkpoint is 3.6's artifact surface tensor for tensor (the catalog's
-    // qwen38 comment carries the evidence); what changed is the chat template
-    // (interleaved thinking) and seven reserved audio/tts specials INSIDE the
-    // same vocab — so every number here is its twin's, and `arch` stays
-    // `qwen3_5` because the checkpoint's own `architectures` field says so.
-    // Reachable by `[model] sku`, never by identify (the twin shadows it).
+    // 3.8 checkpoint is 3.6's artifact tensor-for-tensor; only the chat
+    // template and seven reserved specials differ, not these numbers.
     Row {
         id: "qwen38-27b-bf16-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // The mlx 4-bit rows: same trunk geometry as their bf16 siblings — the
-    // quant is a storage fact, and nothing in this table reads storage.
+    // mlx 4-bit rows: same trunk geometry as their bf16 siblings.
     Row {
-        id: "qwen36-27b-mlxu4-kv-bf16",
+        id: "qwen36-27b-u4g64-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen38-27b-mlxu4-kv-bf16",
+        id: "qwen38-27b-u4g64-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // **THE 35B MIXTURE, OFF ITS OWN CONFIG AND NOT A GUESS.** The last three
-    // catalog ids this table could not name. The 4-bit artifact's own
-    // `text_config` reads `num_hidden_layers: 40, vocab_size: 248320` — the
-    // qwen35-a3b geometry exactly, which is what the SKU is: the 3.6 mixture
-    // in the 3.5 shape, `architectures: Qwen3_5MoeForConditionalGeneration`.
+    // From the 4-bit artifact's own text_config (num_hidden_layers: 40,
+    // vocab_size: 248320) — the qwen35-a3b geometry.
     Row {
-        id: "qwen36-35b-a3b-mlxu4-kv-bf16",
+        id: "qwen36-35b-a3b-u4g64-kv-bf16",
         layers: 40,
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // The `mini-l5-e16-k8` carve of that same artifact: five of its forty
-    // layers, its vocabulary whole.
+    // `mini-l5-e16-k8` carve of that artifact: 5 of its 40 layers, vocab whole.
     Row {
-        id: "qwen36-35b-a3b-mini-mlxu4-kv-bf16",
+        id: "qwen36-35b-a3b-mini-u4g64-kv-bf16",
         layers: 5,
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // And its `mini-l5-e64-k8` twin, which differs from the row above only in
-    // the routed bank's width — a fact this table does not carry, so the two
-    // rows read identically here and that is correct: depth, vocabulary and
-    // arch are what a front-end dispatches on, and the carves share all three.
+    // `mini-l5-e64-k8` twin: differs only in routed-bank width, which this
+    // table doesn't carry, so it reads identically to the row above.
     Row {
-        id: "qwen36-35b-a3b-mini64-mlxu4-kv-bf16",
+        id: "qwen36-35b-a3b-mini64-u4g64-kv-bf16",
         layers: 5,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen35-d0.8b-mlxu4-kv-bf16",
+        id: "qwen35-d0.8b-u4g64-kv-bf16",
         layers: 24,
         vocab: 248_320,
         arch: "qwen3_5",
@@ -350,12 +258,10 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // The qwen4 hybrid: numbers read off `Model::flash`'s own Dims (the model
-    // text states its geometry; no checkpoint lives on this box to disagree),
-    // and the arch is the checkpoint's `model_type: qwen4_exp` — a new label
-    // because the family is one, not a 3.5 reading of a hybrid trace.
+    // qwen4 hybrid: geometry off `Model::flash`'s own Dims; arch is the
+    // checkpoint's `model_type: qwen4_exp`.
     Row {
-        id: "qwen38-flash-mlxu4-kv-bf16",
+        id: "qwen38-flash-u4g64-kv-bf16",
         layers: 48,
         vocab: 248_320,
         arch: "qwen4_exp",
@@ -366,13 +272,18 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen4_exp",
     },
-    // The mini 2-bit snapshot: FOUR layers, because that is what the artifact
-    // ships (`num_hidden_layers: 4`, `layer_types` linear/linear/linear/full),
-    // over the same 248 320-token vocabulary and the same `model_type:
-    // qwen4_exp` a front-end dispatches on.
+    // Mini 2-bit snapshot: 4 layers (`num_hidden_layers: 4`,
+    // layer_types linear/linear/linear/full).
     Row {
-        id: "qwen38-flash-mlxu2-kv-bf16",
+        id: "qwen38-flash-u4g64-u2g128-kv-bf16",
         layers: 4,
+        vocab: 248_320,
+        arch: "qwen4_exp",
+    },
+    // Shipped 2-bit artifact: the mini's parent, 48 layers again.
+    Row {
+        id: "qwen38-flash-full-u4g64-u2g128-kv-bf16",
+        layers: 48,
         vocab: 248_320,
         arch: "qwen4_exp",
     },
@@ -388,19 +299,8 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
-    // **THE SAME TRUNK, WITH AN OVERLAID DRAFT HEAD** (campaign M-4). Every
-    // number here is a fact about the TRUNK — layers, logits width, the
-    // architecture a front-end dispatches on — and a draft head changes none
-    // of them: it is a second readout of the same twenty-four layers, not a
-    // second model. What makes the row necessary is the id space, which this
-    // table and `models::catalog()` share by the test below: a catalog SKU
-    // with no serving row is a model an engine can load and this runtime
-    // cannot name, and that is exactly the refusal an overlay artifact hit.
-    // The M-1 and M-2 rows. Every number is the TRUNK's, for the eagle row's
-    // reason: a vision tower is a second row axis over the same twenty-four
-    // (or sixty-four) layers, and `arch` is what a front-end dispatches its
-    // image preprocessing on — which is the same `qwen3_5` either way, because
-    // the tower these rows read is the one that family's checkpoints ship.
+    // Overlaid draft head: a second readout of the same 24 trunk layers, not
+    // a second model, so the numbers are the trunk's.
     Row {
         id: "qwen35-d0.8b-vision-eagle-bf16-kv-bf16",
         layers: 24,
@@ -414,7 +314,7 @@ pub const ROWS: &[Row] = &[
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen35-d0.8b-vision-mlxu4-kv-bf16",
+        id: "qwen35-d0.8b-vision-u4g64-kv-bf16",
         layers: 24,
         vocab: 248_320,
         arch: "qwen3_5",
@@ -426,7 +326,7 @@ pub const ROWS: &[Row] = &[
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen36-27b-vision-mlxu4-kv-bf16",
+        id: "qwen36-27b-vision-u4g64-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
@@ -438,7 +338,7 @@ pub const ROWS: &[Row] = &[
         arch: "qwen3_5",
     },
     Row {
-        id: "qwen38-27b-vision-mlxu4-kv-bf16",
+        id: "qwen38-27b-vision-u4g64-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
@@ -492,10 +392,6 @@ fn edit_distance(a: &str, b: &str) -> usize {
 
 /// Rebuild the compiled tokenizer an artifact carried, without touching the
 /// filesystem. `None` when the model is a snapshot, whose tokenizer is a file.
-///
-/// Here rather than on [`ModelMetadata`] because it is *consumption*: the type
-/// says what an artifact carries, and this says what this runtime does with
-/// it.
 fn compiled_tokenizer(metadata: &ModelMetadata) -> Option<Result<Tokenizer>> {
     let objects = metadata.tokenizer.as_ref()?;
     Some((|| {
@@ -510,17 +406,6 @@ fn compiled_tokenizer(metadata: &ModelMetadata) -> Option<Result<Tokenizer>> {
 }
 
 /// The row the engine loaded, or a refusal naming what is close.
-///
-/// Two numbers used to come from a `pie.model/1` descriptor parsed
-/// here — `vocab_size` and `num_hidden_layers` — and a third place
-/// parsed the same document with a different failure policy. The
-/// descriptor was one document with two readers, and this was the
-/// second one.
-///
-/// It is the row now: [`ROWS`], the serving face of the same catalog the
-/// engine identified the checkpoint against. Both sides knowing one fact
-/// differently is not a bug that got fixed; it is a sentence that can no
-/// longer be written.
 fn loaded_row(model_id: &str) -> Result<&'static Row> {
     row(model_id).ok_or_else(|| {
         anyhow!(
@@ -540,34 +425,13 @@ pub fn register(
     tokenizer_path: PathBuf,
     metadata: &ModelMetadata,
 ) -> Result<()> {
-    // Logits dim = the model's `vocab_size`. This is the dim the sampler
-    // operates on and the engine's recognizer table is keyed by — NOT the
-    // tokenizer token count, which may be smaller (qwen3: 151669 vs 151936).
-    // Getting that wrong is the vocab-padding device fault the note above
-    // describes.
-    //
-    // Both facts come off the ROW, which is the same table the engine
-    // linked. They used to come from a descriptor parsed here; before
-    // that, a snapshot got them from two probes right here that walked
-    // `text_config` nesting and key alternatives by hand and had to
-    // agree with the engine's parser by coincidence. `pie.model/1`
-    // removed the second parser and left one document with two readers;
-    // this removes the document.
+    // Logits dim = the model's `vocab_size`, keyed by the engine's recognizer
+    // table — not the tokenizer token count, which may be smaller (qwen3:
+    // 151669 vs 151936).
     let row = loaded_row(model_id)?;
     let num_layers = row.layers;
-    // `vocab` is the LOGICAL width and does not shard, so one number answers it
-    // at any tensor-parallel width.
-    //
-    // IT USED TO BE A SECOND REFUSAL: the width came out of
-    // `row.deployment(Deployed::single())`, which could fail, and this line
-    // turned that failure into "the engine loaded X but this build refuses it".
-    // Three of the fourteen rows do fail it — the MLA ones — and the refusal
-    // they raise is about the PAGER ("this build provisions no MLA latent
-    // store"), not about the model. Asking it HERE was asking the wrong party
-    // twice: by the time `register` runs, the engine has already loaded the
-    // model, so a second opinion on whether it can be loaded is either
-    // redundant or wrong. The width is a fact about the row and is stated as
-    // one.
+    // `vocab` is the logical width and does not shard, so one number answers
+    // it at any tensor-parallel width.
     let vocab_size = row.vocab;
     // The tokenizer is the half that genuinely differs: compiled objects from
     // an artifact, a file beside a snapshot.
@@ -576,16 +440,9 @@ pub fn register(
         None => Tokenizer::from_file(&tokenizer_path)?,
     };
     let tokenizer = Arc::new(tokenizer);
-    // THE TOKENIZER CONTRACT, CHECKED BEFORE THE TEMPLATE RESOLVES A MARKER.
-    //
-    // The row declares what it reads from a vocabulary (stop markers, media
-    // delimiters, pinned specials — `model/<family>/tokenizer.rs`) and the
-    // artifact supplied one; whether they are each other's is settled here,
-    // as a named refusal, rather than by `chat_template::special`'s panic or
-    // by a media request failing an hour in. The pins are the teeth: a
-    // `qwen38` row pins the seven audio specials only a 3.8 tokenizer holds,
-    // so a 3.6 artifact deployed under the 3.8 SKU refuses at boot instead
-    // of serving bytes under a reading they were never trained for.
+    // Verify the row's tokenizer contract (stop markers, media delimiters,
+    // pinned specials) against the artifact's tokenizer before the template
+    // resolves a marker, so a mismatched artifact refuses at boot.
     match models::tokenizer::contract_of(row.id) {
         Some(contract) => contract.verify(&tokenizer).map_err(|fault| {
             anyhow!("`{}` refuses this artifact's tokenizer: {fault}", row.id)
@@ -599,29 +456,8 @@ pub fn register(
             ));
         }
     }
-    // THE CHAT TEMPLATE, CHOSEN BY THE ROW THE ENGINE LOADED.
-    //
-    // `create` used to take `arch_name` — a `model_type` string off the
-    // checkpoint's `config.json` — and match it against a thirty-arm
-    // table ending in `_ => QwenInstruct`. A model the table did not
-    // know got ChatML, silently: no error, no warning, just a model
-    // generating fluent turns of a conversation it was never trained to
-    // hold, terminated with an `<|im_end|>` its tokenizer does not
-    // contain. The bug was invisible precisely because the output read
-    // well.
-    //
-    // The id names a serving row, every SKU states a template, and there
-    // is no arm left to fall through. An unknown id was already an error
-    // above, at `loaded_row`, with the nearest known ids named — before
-    // the first token rather than after a thousand plausible ones.
-    //
-    // The template is `model`'s to state and this crate's table does not
-    // restate it — `models::template::templates()` is keyed by the SAME
-    // string that answered the two numbers, which is the property worth
-    // having: a build cannot size its sampler from one model and format its
-    // prompts for another. A SKU with no template row is a coverage hole in
-    // `model`'s own `every_sku_ships_whole`, and it is named here rather than
-    // answered with ChatML.
+    // Chat template chosen by the row the engine loaded. No fallback to
+    // ChatML: an unrecognized SKU is refused above at `loaded_row`.
     let instruct = match models::template::template_of(row.id) {
         Some(make) => make(tokenizer.clone()),
         None => {
@@ -633,11 +469,9 @@ pub fn register(
         }
     };
 
-    // THE CLASSIFY COLUMN, off the same row. It is not optional and it has no
-    // fallback: word 0 is the all-false class, so a runtime that could not
-    // find its SKU's classifier would not fail — it would fire every decode
-    // lane through the prefill arm and return plausible garbage.
-    let classify = models::classify_of(row.id).ok_or_else(|| {
+    // Classify column, off the same row: no fallback, since word 0 is the
+    // all-false class and would silently fire every decode lane as prefill.
+    let classify = models::sku(row.id).map(|sku| sku.classify).ok_or_else(|| {
         anyhow!(
             "this build serves {:?} but its model catalog states no classifier \
              for it; a lane's fact word cannot be computed",
@@ -670,68 +504,37 @@ pub fn model() -> &'static Arc<Model> {
     MODEL.get().expect("model accessed before registration")
 }
 
-/// **THE RESERVED PAD THIS MODEL SPELLS A MEDIA RUN WITH** (media-door §3), or
-/// `None` for a model with no media front-end at all.
-///
-/// One id, cached once: `MODEL` is a `OnceLock` and one process serves one
-/// model, so the tokenizer is asked once and every fire after that reads an
-/// integer. That matters because this is on the SUBMIT PATH of every fire,
-/// media or not — a run with no span attached is one of the door's four
-/// refusals, and finding it means scanning the tokens of passes that carry no
-/// media at all.
-///
-/// It lives here rather than beside the media host because it is a fact about
-/// the bound MODEL, and because `pipeline::fire` may read the model and may
-/// not read the guest boundary.
+/// The reserved token id this model spells a media run's placeholder with,
+/// or `None` for a model with no media front-end. Cached once (one process
+/// serves one model).
 pub fn media_pad() -> Option<u32> {
     static PAD: OnceLock<Option<u32>> = OnceLock::new();
     *PAD.get_or_init(|| {
         use crate::inferlet::host::media::multimodal;
         let m = model();
         let arch = m.arch_name();
-        // **THE PAD IS THE FRONT-END'S OWN, AND ONLY ITS OWN** (wave MD-C).
-        // A second table of placeholder strings stood here and it had already
-        // gone stale: it answered gemma's pad as `<image_soft_token>`, which
-        // is gemma-3's spelling, while the front-end that actually spells a
-        // gemma span answers `<|image|>`. Two spellings of one id is what
-        // article 8 forbids, and this is what a disagreement between them
-        // costs — the orphan-run scan looking for a token no span is ever
-        // written with, on the one model where it matters.
+        // The pad spelling is the front-end's own; read from it directly
+        // rather than a second table that can drift out of sync.
         let spelling = models::media::vision_front_end(arch)
             .map(|fe| fe.delimiters().placeholder)
             .or_else(|| multimodal::audio_arch_supported(arch).then(multimodal::audio_placeholder))?;
         match m.tokenize(spelling)[..] {
             [id] => Some(id),
-            // A checkpoint whose tokenizer cannot spell its architecture's pad
-            // has no run for the scan to find, and `from_bytes` refuses such a
-            // span before it can be attached — so there is nothing to look for
-            // and saying so is the right answer, not a panic.
+            // Tokenizer can't spell the arch's pad as one token: nothing to
+            // look for.
             _ => None,
         }
     })
 }
 
-// =============================================================================
-// Model
-// =============================================================================
-
 pub struct Model {
     name: String,
-    /// The family label the vision front-end and the speech front-end dispatch
-    /// on (e.g. "gemma4", "qwen3_5"). The ROW's, like the chat template and
-    /// the two numbers: the engine advertises the same string off the same
-    /// row, so reading its copy only opened the way for a build to select a
-    /// processor for one model and a template for another.
+    /// Family label the vision/speech front-ends dispatch on (e.g. "gemma4",
+    /// "qwen3_5"). Taken from the row, matching what the engine advertises.
     arch_name: &'static str,
     instruct: Arc<dyn Instruct>,
-    /// How this SKU sorts a request into the fact word its lanes carry — the
-    /// catalog's fourth column, taken once at registration.
-    ///
-    /// IT IS A COLUMN OF THE ROW, like the template and the two numbers, and
-    /// for the same reason: the fire path holds this handle and nothing else,
-    /// and a build that classified its lanes for one model while tracing
-    /// another would compose every fire out of windows the plan does not
-    /// have. See [`Model::word`].
+    /// How this SKU sorts a request into the fact word its lanes carry.
+    /// Taken from the row once at registration. See [`Model::word`].
     classify: models::ClassifyFn,
     kv_page_size: u32,
     /// Recurrent-state (working-set) capabilities surfaced via model.wit
@@ -740,19 +543,9 @@ pub struct Model {
     rs_caps: RsCaps,
     eta_caps: EtaCaps,
     tokenizer: Arc<Tokenizer>,
-    /// **THE TOKEN TABLE, BUILT ONCE PER RUNTIME.**
-    ///
-    /// [`Model::get_vocabs`] walks `id_to_token` over the whole vocabulary and
-    /// mints one `Vec<u8>` per token — 248 070 of them on qwen3.6, ~16 ms —
-    /// and it used to do that on every guest call, which is once per LAUNCH
-    /// for any inferlet that asks. A runtime serves exactly one model and a
-    /// model's tokenizer never changes, so the table is a constant and is
-    /// treated as one; it is also what
-    /// [`tokens_with_prefix`](Model::tokens_with_prefix) scans instead of
-    /// shipping.
-    ///
-    /// Built lazily rather than at registration: a deployment whose guests
-    /// never ask should not pay 16 ms and ~20 MiB for a table nobody reads.
+    /// Token table, built lazily on first ask and kept: a model's tokenizer
+    /// never changes, and a deployment whose guests never ask should not pay
+    /// to build one.
     vocab: OnceLock<(Vec<u32>, Vec<Vec<u8>>)>,
     /// Logits/output vocab dimension (= hf_config.vocab_size from the model's
     /// config.json). May EXCEED tokenizer.vocab_size() due to padding — use
@@ -820,10 +613,9 @@ impl Model {
         &self.tokenizer
     }
 
-    /// Logits/output vocab dimension (= hf_config.vocab_size). The dim the
-    /// sampler operates on and the engine's recognizer table is keyed by. May
-    /// EXCEED the tokenizer's vocab (qwen3: 151936 logits vs 151669 tokens) —
-    /// use this for sampler lowering / logits-shaped ops, NOT tokenizer vocab.
+    /// Logits/output vocab dimension (= hf_config.vocab_size). May exceed the
+    /// tokenizer's vocab (qwen3: 151936 logits vs 151669 tokens) — use this
+    /// for sampler lowering / logits-shaped ops, not tokenizer vocab.
     pub fn vocab_size(&self) -> u32 {
         self.vocab_size
     }
@@ -839,14 +631,10 @@ impl Model {
     }
 
     /// The whole vocabulary as parallel vectors of (token IDs, token bytes) —
-    /// a COPY of the table built once by [`Model::vocab`].
-    ///
-    /// The copy is unavoidable: the WIT surface hands the guest an owned list.
-    /// What is avoidable, and now avoided, is rebuilding the table from
-    /// `id_to_token` on every call. Callers that want a few tokens' bytes or a
-    /// prefix match should take [`token_bytes`](Model::token_bytes) or
-    /// [`tokens_with_prefix`](Model::tokens_with_prefix) instead and copy
-    /// nothing.
+    /// a copy of the table built once by [`Model::vocab`]. Callers that want
+    /// a few tokens' bytes or a prefix match should use
+    /// [`token_bytes`](Model::token_bytes) or
+    /// [`tokens_with_prefix`](Model::tokens_with_prefix) instead.
     pub fn get_vocabs(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
         self.vocab().clone()
     }
@@ -869,13 +657,6 @@ impl Model {
 
     /// The raw bytes each of `tokens` stands for, in order; an empty vector
     /// for an id the vocabulary does not hold.
-    ///
-    /// The same answer indexing a table built from [`get_vocabs`] gives, at
-    /// the size of the QUESTION rather than the size of the vocabulary —
-    /// which is the whole point (see [`tokens_with_prefix`]).
-    ///
-    /// [`get_vocabs`]: Model::get_vocabs
-    /// [`tokens_with_prefix`]: Model::tokens_with_prefix
     pub fn token_bytes(&self, tokens: &[u32]) -> Vec<Vec<u8>> {
         tokens
             .iter()
@@ -883,24 +664,11 @@ impl Model {
             .collect()
     }
 
-    /// Every token id whose bytes begin with `prefix`, ascending.
-    ///
-    /// **THIS IS THE QUERY THE GUESTS WERE SHIPPING A VOCABULARY TO ASK.**
-    /// Token healing rolls a prompt back by a token or two and re-expands it
-    /// under the mask of every token that reproduces the rolled-back BYTES as
-    /// a prefix. It was building that mask guest-side, which meant lowering
-    /// 248 070 records across the component boundary and looping over them
-    /// twice — ~115 ms of a 158 ms per-launch constant (palo build log 23) to
-    /// compute a set the host can name from a table it already holds.
-    ///
-    /// The set is exactly the one that loop produced: the ids the token table
-    /// holds whose bytes start with `prefix`, and no others. An empty prefix
-    /// matches the whole vocabulary, because every byte string starts with
-    /// nothing — the caller that cares (a rollback that carried no bytes) has
-    /// to say so itself, as it did before.
-    /// It is the tokenizer's own table that is scanned, borrowed rather than
-    /// copied — so this asks nothing of [`Model::vocab`]'s cache and a
-    /// deployment whose guests only ever heal never builds one.
+    /// Every token id whose bytes begin with `prefix`, ascending. Used for
+    /// token healing (mask of tokens that reproduce rolled-back bytes as a
+    /// prefix). An empty prefix matches the whole vocabulary. Scans the
+    /// tokenizer's own table directly, so this does not build
+    /// [`Model::vocab`]'s cache.
     pub fn tokens_with_prefix(&self, prefix: &[u8]) -> Vec<u32> {
         self.tokenizer.ids_with_prefix(prefix)
     }
@@ -915,63 +683,13 @@ impl Model {
         self.tokenizer.get_special_tokens()
     }
 
-    /// The fact word a lane carries: `query_len` rows, whether the lane states
-    /// a custom attention mask of its own, whether it routes to an adapter
-    /// bank, whether it wants the model's draft head run over its rows,
-    /// whether it wants its attention's mass kept, and whether its submission
-    /// carried media spans.
-    ///
-    /// **THIS IS WHAT A FIRE IS COMPOSED FROM** (palo design §0). The engine
-    /// turns a lane's word into a class, and the class into the row WINDOW
-    /// every guarded node runs over — so `qo_one` decides whether a lane's
-    /// rows go through the decode attention or the prefill one, and `masked`
-    /// (gemma) whether they go through the mask-aware arm. Which bit is which
-    /// is the model's own business and stays there: this calls the family's
-    /// `Classify::of(..).word()` through the catalog pointer and never reads a
-    /// bit.
-    ///
-    /// The runtime states all six because it knows all six: a lane's rows are
-    /// the tokens it submits, a custom mask is a lane's only once the fire's
-    /// mask has lowered, the adapter, the draft ask and the capture ask are
-    /// what whoever built the lane put on it, and the media fact is whether
-    /// the submission the lane came from attached spans
-    /// (`pipeline::fire::stamp_lane_words`).
-    ///
-    /// **AND THE SIXTH RIDES THE COMMIT THAT MADE IT REACHABLE**
-    /// (`.wiki/alto/multimodal.md` §15's hard constraint; media-door.md §4).
-    /// §15 wrote the field, the builder and the two families' predicates and
-    /// then had to leave the serving path stamping `false`, because no
-    /// submission could carry a span for it to read: "until a media submission
-    /// reaches `Step`, nothing on the serving path can set it, and the honest
-    /// default is `false`". `forward-pass.media` is that submission, and this
-    /// argument lands in the same commit as the verb — because the alternative
-    /// is not a missing feature, it is an image lane silently composing as the
-    /// TEXT-ONLY class: `qwen_3`'s embed merge and `gemma_4`'s both guard on
-    /// `Facts::media`, so a lane whose word says `false` runs a graph with no
-    /// node to land its patch rows in and answers fluently about an image it
-    /// never saw.
-    ///
-    /// **THE LIST GROWS ONE ARGUMENT PER AXIS, AND SO DOES THE REFUSAL SET**
-    /// (palo C3b/C4b). `drafts` and `captures_scores` join on `adapter`'s
-    /// terms exactly: the shell asks per lane whether the class the word
-    /// resolved to runs the export's arm, and refuses BOTH directions by name
-    /// — `engine_cuda::Fault::DraftWord` and `Fault::ScoreWord`. What is
-    /// different is that these two carry no runtime input, so the wrong answer
-    /// they prevent is not "staged and never read" but "computed and nobody
-    /// told": a drafting class runs a whole transformer block into a column
-    /// no reader collects, and a capturing class writes a mass column the
-    /// readout skips. Stamping all five from ONE reading of ONE lane at one
-    /// instant is what makes the refusals unreachable from this path.
-    ///
-    /// **`adapter` HAS TO AGREE WITH `Lane::adapter`, AND THE SHELL CHECKS
-    /// THAT IT DOES.** The word puts the lane's rows inside the correction's
-    /// window or outside it (palo design §8); the id is what the arm routes
-    /// with. A word that said `has_adapter` with no id behind it would send
-    /// the arm at a routes vector nobody staged, and an id with no word would
-    /// be staged and never read — `engine_cuda::Fault::AdapterWord` refuses
-    /// both, by name, before anything launches. So the two are stamped from
-    /// ONE reading of the lane, at one instant, which is what
-    /// `stamp_lane_words` is.
+    /// The fact word a lane carries: `query_len` rows, custom mask,
+    /// adapter routing, draft head, attention mass capture, media spans.
+    /// The engine turns this word into a class, and the class into the row
+    /// window every guarded node runs over. This calls the family's
+    /// `Classify::of(..).word()` through the catalog pointer and never
+    /// reads a bit itself; all six facts are stamped from one reading of
+    /// the lane at one instant.
     #[must_use]
     pub fn word(
         &self,
@@ -1011,136 +729,3 @@ impl Model {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_row_is_found_by_its_own_id() {
-        for r in ROWS {
-            assert_eq!(row(r.id).map(|found| found.id), Some(r.id));
-        }
-    }
-
-    #[test]
-    fn ids_are_unique() {
-        let mut seen = ids();
-        let before = seen.len();
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(seen.len(), before, "two rows share an id");
-    }
-
-    /// **THE §15 STAMP, AND THE COMMIT IT HAD TO RIDE**
-    /// (`.wiki/alto/multimodal.md` §15; media-door.md §4).
-    ///
-    /// The media fact is a real axis of the word, not an argument that is
-    /// accepted and dropped: a lane whose submission carried spans resolves to
-    /// a DIFFERENT class than the same lane text-only, in both families that
-    /// have a tower. That is what `Facts::media` guards the embed merge with,
-    /// and it is why the argument could not land a commit later than the verb
-    /// that makes it reachable — a `false` here is not a missing feature, it
-    /// is an image lane composing as the text-only class and answering
-    /// fluently about a picture whose patch rows had no node to land in.
-    ///
-    /// Read through the catalog's own `classify` pointer, which is exactly
-    /// what [`Model::word`] calls, so this pins the path and not a copy of it.
-    #[test]
-    fn a_media_submission_resolves_to_a_different_class_than_the_same_text_lane() {
-        let tower_skus: Vec<&'static str> = ROWS
-            .iter()
-            .filter(|r| matches!(r.arch, "qwen3_5" | "gemma4"))
-            .map(|r| r.id)
-            .collect();
-        assert!(!tower_skus.is_empty(), "the catalog has no tower models");
-        for sku in tower_skus {
-            let classify = models::classify_of(sku).expect("every row has a classify");
-            let plain = models::Request::new(7, false);
-            let text = classify(&plain);
-            let imaged = classify(&plain.clone().with_media(true));
-            assert_ne!(
-                text, imaged,
-                "{sku}: a media lane and a text lane resolve to the same word, \
-                 so the embed merge's guard cannot see the difference"
-            );
-        }
-    }
-
-    /// And the other direction, which is the one a regression would take: a
-    /// text-only lane's word does not move because the argument exists.
-    #[test]
-    fn a_text_only_lane_is_the_word_it_always_was() {
-        for sku in ROWS.iter().map(|r| r.id) {
-            let classify = models::classify_of(sku).expect("every row has a classify");
-            let request = models::Request::new(3, false)
-                .adapted(false)
-                .drafting(false)
-                .capturing_scores(false);
-            assert_eq!(
-                classify(&request.clone().with_media(false)),
-                classify(&request),
-                "{sku}: stamping `false` is not the same as stamping nothing"
-            );
-        }
-    }
-
-    /// A typo is answered with the row it is a typo OF — the property the
-    /// runtime's "the engine loaded X, nearest ids: .." refusal rests on.
-    #[test]
-    fn an_unknown_id_is_none_and_names_its_near_misses() {
-        assert!(row("qwen35-d0.8b-bf16-kv-bf1").is_none());
-        assert_eq!(
-            nearest_ids("qwen35-d0.8b-bf16-kv-bf1", 1),
-            vec!["qwen35-d0.8b-bf16-kv-bf16"]
-        );
-        assert!(row("gptoss-21b-bf16-mxfp4-kv-bf16").is_none());
-        assert_eq!(
-            nearest_ids("gptoss-21b-bf16-mxfp4-kv-bf16", 1),
-            vec!["gptoss-20b-bf16-mxfp4-kv-bf16"]
-        );
-    }
-
-    /// This table and `model`'s are ONE id space.
-    ///
-    /// It is what is left of `model/tests/rows_are_the_traces.rs` after M18:
-    /// the numbers can no longer be held against a trace from here, but the
-    /// KEYS can be held against the catalog the engine identifies checkpoints
-    /// against. A catalog SKU with no serving row is a model an engine can load
-    /// and this runtime cannot name; a serving row with no catalog SKU is two
-    /// numbers for a model nothing traces.
-    #[test]
-    fn the_catalog_and_the_serving_table_are_the_same_ids() {
-        let mut catalog: Vec<&str> = models::catalog().into_iter().map(|(id, ..)| id).collect();
-        let mut serving = ids();
-        catalog.sort_unstable();
-        serving.sort_unstable();
-        assert_eq!(catalog, serving);
-    }
-
-    /// Every serving row has the template `register` will ask for.
-    ///
-    /// `register` refuses a SKU with no template rather than falling through
-    /// to ChatML, and this is what keeps that refusal unreachable for a model
-    /// this build actually ships.
-    #[test]
-    fn every_serving_row_ships_a_chat_template() {
-        for r in ROWS {
-            assert!(
-                models::template::template_of(r.id).is_some(),
-                "`{}` is a serving row with no chat template",
-                r.id
-            );
-        }
-    }
-
-    #[test]
-    fn every_serving_row_ships_a_tokenizer_contract() {
-        for r in ROWS {
-            assert!(
-                models::tokenizer::contract_of(r.id).is_some(),
-                "`{}` is a serving row with no tokenizer contract",
-                r.id
-            );
-        }
-    }
-}

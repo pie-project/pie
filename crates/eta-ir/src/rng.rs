@@ -16,14 +16,7 @@ pub struct SplitMix64Round {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-/// Every constant the ETA RNG is made of, in one value.
-///
-/// These numbers are ABI: a backend that reproduces the ops but not the
-/// constants produces a different token stream from the same seed, and the
-/// difference is invisible until a replay is compared against its original.
-/// Emitters must project this struct rather than transcribe the literals,
-/// because a transcribed constant is a copy that can drift while still
-/// compiling.
+/// Every constant the ETA RNG is made of, in one value. These numbers are ABI: a backend that reproduces the ops but not the constants produces a different token stream from the same seed. Emitters must project this struct rather than transcribe the literals.
 pub struct RngFormula {
     /// The three mixing rounds, applied in order.
     pub splitmix64_rounds: [SplitMix64Round; 3],
@@ -113,14 +106,7 @@ pub fn keyed_seed(key: u32, counter: u32) -> u64 {
 
 /// The largest `f32` strictly below `1.0`.
 ///
-/// `(bits + 0.5) / 2^24` is mathematically in `(0, 1)`, but for the single top
-/// mantissa value `bits = 2^24 - 1` the quotient is `1 - 2^-25`, which sits
-/// exactly halfway between `0x1.fffffep-1` and `1.0` and so rounds to **`1.0`
-/// exactly** in `f32`. That one draw in `2^24` breaks every consumer that
-/// assumes a half-open range: `gumbel = -log(-log(u))` evaluates to `+inf` at
-/// `u = 1`, and `+inf` unconditionally wins `argmax(logits + gumbel)`, so the
-/// sampler returns a uniformly random token. At `vocab = 262144` that is
-/// `262144 / 2^24 ≈ 1.6 %` of decode steps.
+/// For the top mantissa value, `(bits + 0.5) / 2^24` rounds to `1.0` exactly in `f32`, which breaks any consumer assuming a half-open range: `gumbel = -log(-log(u))` evaluates to `+inf` at `u = 1`, and `+inf` unconditionally wins `argmax(logits + gumbel)`.
 pub const UNIFORM_MAX: f32 = 1.0 - f32::EPSILON / 2.0;
 
 #[inline]

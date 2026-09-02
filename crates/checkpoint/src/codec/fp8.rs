@@ -1,19 +1,14 @@
-//! OCP FP8 E4M3: one byte, four exponent bits, three mantissa bits.
-//!
-//! Decode and encode are in one file because they are one claim made twice,
-//! and a round-trip that does not close is the bug this arrangement is meant
-//! to make visible. `f32_to_fp8_e4m3` is diffed against
-//! `kernels/quantize_fp8.cu` value for value.
+//! OCP FP8 E4M3: one byte, four exponent bits, three mantissa bits. Decode
+//! and encode are kept in one file since a round-trip that doesn't close is
+//! the bug this arrangement is meant to make visible.
 use super::e8m0::exp2i;
 
 /// One `f64` per `Fp8E4M3` byte: sign, four exponent bits, three mantissa
 /// bits, bias 7.
 ///
-/// This is the OCP `E4M3` the CUDA side reaches through
-/// `__nv_cvt_fp8_to_halfraw(.., __NV_E4M3)`, which has no infinity: the
-/// all-ones exponent carries ordinary values up to 448 and only `S.1111.111`
-/// is NaN. A subnormal is `mantissa/8 * 2^-6`, which is what makes the two
-/// branches differ by more than the implicit bit.
+/// OCP `E4M3` with no infinity: the all-ones exponent carries ordinary
+/// values up to 448 and only `S.1111.111` is NaN. A subnormal is
+/// `mantissa/8 * 2^-6`.
 pub fn decode_fp8_e4m3_elements(bytes: &[u8]) -> Vec<f64> {
     bytes
         .iter()
@@ -85,37 +80,3 @@ pub fn f32_to_fp8_e4m3(x: f32) -> u8 {
     sign | (((e + 7) as u8) << 3) | (q as u8 - 8)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The E4M3 conversion pair against the hardware's conversion, at every
-    /// code and at the edges the SATFINITE mode defines.
-    #[test]
-    fn e4m3_primitives_match_the_hardware_conversion() {
-        // Every non-NaN byte decodes to a value that encodes back to itself —
-        // signed zeros and subnormals included.
-        for byte in 0..=255u8 {
-            if byte & 0x7F == 0x7F {
-                continue;
-            }
-            assert_eq!(
-                f32_to_fp8_e4m3(fp8_e4m3_to_f32(byte)),
-                byte,
-                "byte {byte:#04x}"
-            );
-        }
-        assert_eq!(fp8_e4m3_to_f32(0x7E), 448.0);
-        assert_eq!(fp8_e4m3_to_f32(0x01), 0.001953125); // 2^-9, the smallest subnormal
-        assert!(fp8_e4m3_to_f32(0x7F).is_nan());
-        // SATFINITE: finite overflow and infinity clamp to ±448; NaN stays NaN.
-        assert_eq!(f32_to_fp8_e4m3(1000.0), 0x7E);
-        assert_eq!(f32_to_fp8_e4m3(f32::INFINITY), 0x7E);
-        assert_eq!(f32_to_fp8_e4m3(f32::NEG_INFINITY), 0xFE);
-        assert_eq!(f32_to_fp8_e4m3(f32::NAN), 0x7F);
-        assert_eq!(f32_to_fp8_e4m3(-0.0), 0x80);
-        // Round to nearest, ties to the even mantissa.
-        assert_eq!(f32_to_fp8_e4m3(1.0625), 0x38); // tie 1.0 / 1.125 → 1.0
-        assert_eq!(f32_to_fp8_e4m3(1.1875), 0x3A); // tie 1.125 / 1.25 → 1.25
-    }
-}

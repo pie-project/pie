@@ -22,51 +22,20 @@ impl Facts {
         Predicate::fact(1)
     }
 
-    /// **THE ADAPTER WINDOW** (palo design §8, §0; campaign A-6).
-    ///
-    /// A lane that routed its rows to a registered adapter. §8 puts the
-    /// correction "over the adapter window", and §0 defines a window as the
-    /// rows of the lanes whose word satisfies the guard — so the axis needs a
-    /// bit, and the bit is what makes it FREE when nobody uses it: a fire no
-    /// lane routed has zero rows in this class, `engine::fire::walk` skips a
-    /// zero-row region before it dispatches anything, and the correction costs
-    /// that fire no launch, no empty grid and no instruction. A `Guard::Always`
-    /// correction would instead launch two kernels per layer over every row of
-    /// every fire to add zero to them, which is 1.0x nothing.
-    ///
-    /// **BIT TWO, AND THE POSITION IS DELIBERATE.** The masked window was
-    /// declared at bit one before this axis existed, and a word is what the
-    /// runtime hands the shell — renumbering it would move every masked lane's
-    /// class for no reason but tidiness. The correction is orthogonal to the
-    /// attention split anyway: it reads no plan and takes no arm of the merge,
-    /// so where its bit sits changes nothing but the arithmetic of the word.
+    /// Rows routed to a registered adapter. Bit 2 of the fact word; a fire
+    /// with no adapter rows costs nothing (the walk skips the empty class).
     pub fn has_adapter() -> Predicate {
         Predicate::fact(2)
     }
 
-    /// **THE MEDIA WINDOW, AND IT GUARDS THE MERGE AND NOTHING ELSE**
-    /// (multimodal §15). The tower's rectangles are `Dim::Patches`, so an
-    /// axis-empty fire has zero patch rows and `engine::fire::walk` skips the
-    /// whole unit; the embed merge writes TOKEN rows, so its window is full on
-    /// every fire and unguarded it would resolve `PatchRoutes` on a text-only
-    /// one. Bit three, after `has_adapter`, for the reason `masked` kept bit
-    /// one: a word is what the runtime hands the shell and renumbering it
-    /// moves classes for nothing.
+    /// Rows the embed merge writes tower output into. Bit 3 of the fact word.
     pub fn media() -> Predicate {
         Predicate::fact(3)
     }
 
-    /// **THE DRAFT WINDOW** (palo C3, design §8; campaign M-4).
-    ///
-    /// A lane that wants the aux head run over its rows. The head is a whole
-    /// decoder block plus two projections and a vocabulary-wide readout, and
-    /// the bit is what makes it cost a non-drafting fire NOTHING: zero rows in
-    /// this class, and `engine::fire::walk` does not issue the arm's launches,
-    /// does not issue them empty, and does not record them.
-    ///
-    /// AND IT IS AN ARM, NOT A CORRECTION: the draft logits are a SECOND
-    /// readout with a column of their own at `seam::MTP`, so a class outside
-    /// the window reads no draft at all — which is the honest answer.
+    /// Rows that run the aux draft head. A second readout with its own
+    /// column (`seam::MTP`), not a correction to the trunk's. Bit 4 of the
+    /// fact word.
     pub fn drafts() -> Predicate {
         Predicate::fact(4)
     }
@@ -109,11 +78,8 @@ impl ForwardHybrid for Model {
                 c.kv(kv, w.attn.kv.clone(), [plane, plane]);
             }
         }
-        // The head's own kv row, in the SAME page-id space: it attends the
-        // same sequence at the same lengths the trunk does, so a second space
-        // would be a second bit-identical page table and a false distinction.
-        // Its planes are a GLOBAL layer's, because that is the reading its
-        // block states.
+        // The draft head's kv lives in the same page-id space as the trunk
+        // (same sequence, same lengths); its planes use the global reading.
         if let Some(a) = &self.draft {
             let plane = self.global.kv_heads as u64 * self.global.head_dim as u64;
             c.kv(kv, a.attn.kv.clone(), [plane, plane]);
@@ -128,26 +94,9 @@ impl ForwardHybrid for Model {
         let qo_one = Facts::qo_one();
         let fused = qo_one.clone() & !Facts::masked();
 
-        // SIX SCHEDULES, AND EVERY ONE OF THEM IS A DIFFERENT CARVING.
-        //
-        // A gemma layer is one of two READINGS of the one sequence — sliding
-        // layers are 2 kv heads of 256 under a 512-wide window, global layers
-        // 2 heads of 512 with none — and an attention schedule is carved for
-        // exactly one of those: the head width picks the CTA tile, the window
-        // sizes the kv chunking, and the kernel recomputes both from the same
-        // numbers when it merges the partials. So the reading axis is the
-        // literal pair below, whose two lines differ by the reading's numbers
-        // — the ones each plan op now states — and the layer indexes it.
-        //
-        // The class axis is the split. One `plan_prefill` read by both the
-        // prefill arm (the rest class) and the masked arm (its own) would be
-        // carved over both windows, and each arm would then hand it its own
-        // rebased boundaries, which end before the schedule's work items do —
-        // the shell refuses that by name at load (`Fault::Straddled`). So each
-        // plan is built off ONE class's arm of `inputs` and carries that class
-        // as its guard. The layer loop cuts `q` with the SAME `classes` array,
-        // so the arms carry structurally equal conds and the recorder refuses
-        // a reader from another arm at the line that mixes them.
+        // Sliding/global readings need separate plans (head width, kv chunk
+        // size, window differ); classes need separate plans too, or sharing
+        // one would straddle rebased boundaries (`Fault::Straddled`).
         let classes = [Facts::masked(), qo_one.clone(), Predicate::rest()];
         let [input_m, input_d, input_p] = inputs.split(classes.clone());
         let plan_m = [
@@ -200,18 +149,15 @@ impl ForwardHybrid for Model {
         ];
         let mask = inputs.mask();
 
-        // **THE TOWER FIRST**, because the two capture units are the two RUNS
-        // of this node list and a trunk node emitted before it would interleave
-        // them (`Error::UnitsInterleave`).
+        // Emitted before any trunk node: interleaving the tower's node runs
+        // with the trunk's would trigger `Error::UnitsInterleave`.
         let towered = m.tower.as_ref().map(|t| tower(&inputs, t));
 
         let ids = inputs.tokens();
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
 
-        // The embed merge, over the media window and nowhere else (§15), with
-        // the drop sentinel `pool_rows` compaction owes it (§8.6). The value
-        // comes back unguarded: the column it writes through is the embedding
-        // every row already has.
+        // Embed merge runs only over media-window rows; other rows keep the
+        // token embedding already written.
         if let Some(t) = &towered {
             let (imaged, _) = y.split(&Facts::media());
             y = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
@@ -234,8 +180,7 @@ impl ForwardHybrid for Model {
         for (l, w) in inputs.walk_layers(&m.layers) {
             let normed = ops::elemwise::rmsnorm(&y, &w.attn_norm, w.attn_norm_eps);
             let at = &w.attn;
-            // Every number this layer's attention is carved for comes off its
-            // reading, once: the head width, the kv heads, and the window.
+            // Head width, kv heads, and window all come from this layer's reading.
             let (d, kv_heads, win) = match at.reading {
                 Reading::Sliding => (
                     m.sliding.head_dim,
@@ -340,15 +285,9 @@ impl ForwardHybrid for Model {
             } else {
                 o
             };
-            // **THE CORRECTION, OVER ITS WINDOW** (design §8, campaign A-6).
-            // One statement: the sublayer's output, plus this row's adapter's
-            // `B·(A·x)`, in place. No merge and no arm — the op writes THROUGH
-            // `o`'s arena column, so a class outside the window never runs the
-            // node and reads the uncorrected value at the same address, which
-            // is the identity for free.
-            //
-            // After the reduce and before `post_attn_norm`; `Layer::lora_a`'s
-            // own note argues both.
+            // Adds the adapter's `B*(A*x)` in place, over the adapter window;
+            // rows outside the window keep the unmodified value (write-through,
+            // no merge). Applied after the reduce, before `post_attn_norm`.
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = normed.split(&Facts::has_adapter());
@@ -371,27 +310,20 @@ impl ForwardHybrid for Model {
             } else {
                 f
             };
-            // **THE SECOND BRANCH, WHERE THE CHECKPOINT SHIPS ONE**
-            // (`model::Moe`). `None` on every dense row, and then this whole
-            // block is not written: `f` reaches the sandwich's closing norm
-            // exactly as it did, one statement and the same one.
+            // `None` on a dense layer: the whole MoE block is skipped and `f`
+            // passes through unchanged.
             let f = match &w.moe {
                 None => f,
                 Some(x) => {
-                    // The dense branch's own exit norm. It exists only here —
-                    // a dense layer's FFN output goes straight into
-                    // `post_ffw_norm`, and this one has a sibling to be added
-                    // to first.
+                    // Dense-layer FFN output would go straight to
+                    // `post_ffw_norm`; here it has a routed sibling to sum with first.
                     let h1 = ops::elemwise::rmsnorm(
                         &f,
                         &x.post_ffw_norm_1,
                         x.post_ffw_norm_1_eps,
                     );
-                    // **BOTH BRANCHES AND THE ROUTER READ `y`**, the
-                    // post-attention residual, and NOT the dense branch's
-                    // norm. `mlx_lm` routes on `h` and norms `h` twice more;
-                    // reading `mlp_in` here would chain what the checkpoint
-                    // states as siblings.
+                    // Both branches and the router read `y` (the
+                    // post-attention residual), not the dense branch's norm output.
                     let (routes, weights) = ops::linear::moe_topk_softmax_scaled(
                         &ops::linear::matmul(
                             &ops::elemwise::rmsnorm(
@@ -407,24 +339,12 @@ impl ForwardHybrid for Model {
                     );
                     let moe_in =
                         ops::elemwise::rmsnorm(&y, &x.pre_ffw_norm_2, x.pre_ffw_norm_2_eps);
-                    // **THE EXPERTS ARE GeGLU, NOT SwiGLU**, and that costs no
-                    // op: `mlp_geglu_tanh_packed` reads a `[rows, 2·inter]`
-                    // block and the routed matmul writes one — the rows are
-                    // `tokens × top_k` rather than `tokens`, which the
-                    // activation does not ask about. `SwitchGLU`'s activation
-                    // is `GeGLU()`, which is `gelu_approx(gate) * up` — the
-                    // dense `mlp`'s own `geglu`, on the routed stack.
+                    // Routed activation is GeGLU (`gelu_approx(gate) * up`),
+                    // same as the dense MLP's, just over `tokens * top_k` rows.
                     //
-                    // **THE DENSE FORMS ARE THE LIST, AND EVERYTHING ELSE IS
-                    // QUANTIZED** — `qwen_4::forward`'s twin of this line was
-                    // an ALLOW-list of quantized dtypes and the 2-bit row it
-                    // never learned fell through to the DENSE select, which
-                    // resolves three planes as one handle and panics. Today
-                    // the two readings agree on every row this family ships
-                    // (`Bf16` dense both ways, `U4g64` quantized both ways);
-                    // they stop agreeing the day a dtype naming a different
-                    // group lands, and a new quantized dtype is a thing this
-                    // tree adds where a new DENSE one is not.
+                    // Matches against dense dtypes (not quantized ones): an
+                    // unrecognized quantized dtype should fall through to the
+                    // quantized path, not the dense one.
                     let select = |act: &Value, bank: &Weight| {
                         if matches!(bank.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32) {
                             ops::linear::moe_matmul_select(act, bank, &routes, x.top_k)
@@ -436,12 +356,9 @@ impl ForwardHybrid for Model {
                         ops::linear::mlp_geglu_tanh_packed(&select(&moe_in, &x.gate_up), x.inter);
                     let routed =
                         ops::linear::moe_weighted_sum(&select(&hidden, &x.down), &weights);
-                    // After the fold and before the branch norm, for
-                    // `o_proj`'s reason: `down` is rows-cut, so each rank holds
-                    // a partial product, and the mixture's weights are
-                    // replicated — so the weighted sum of the partials is the
-                    // partial of the weighted sum, and one reduce here answers
-                    // both.
+                    // `down` is rows-cut so each rank holds a partial; weights
+                    // are replicated, so summing then reducing equals
+                    // reducing then summing.
                     let routed = if m.tp > 1 {
                         ops::collective::all_reduce(&routed)
                     } else {
@@ -473,12 +390,8 @@ impl ForwardHybrid for Model {
                 y = ops::elemwise::scale(&lp.scalar, &ops::elemwise::residual_add(&out, &y));
             }
 
-            // **THE PER-LAYER SCALAR, AFTER EVERYTHING THE LAYER DID.**
-            // `gemma4_text`'s decoder ends `h = h * self.layer_scalar`, after
-            // the PLE relay's own addition and not before it — so this is the
-            // same statement as the one closing the branch above, at the one
-            // site the branch does not run. See `model::Layer::scalar` for why
-            // exactly one of the two fires.
+            // Applied after the PLE relay's own addition, at the site the
+            // branch above doesn't run. See `model::Layer::scalar`.
             if let Some(scalar) = &w.scalar {
                 y = ops::elemwise::scale(scalar, &y);
             }
@@ -492,20 +405,11 @@ impl ForwardHybrid for Model {
             logits
         };
 
-        // **THE AUX HEAD, OVER THE DRAFT WINDOW** (campaign M-4).
-        //
-        // STATED AFTER THE TRUNK'S READOUT, and that is not cosmetic:
-        // `model_compiler::arena` gives the delivery tail to the export set,
-        // and a draft column stated before the trunk's `lm_head` would have
-        // its span end at its own producing node with a vocabulary-wide GEMM
-        // free to be carved on top of the bytes the sampler reads. Stated
-        // last, nothing runs after it. `qwen_3::forward` argues it at length
-        // and `the_draft_readout_outlives_the_trunk_readout` notices if either
-        // moves.
+        // Stated after the trunk's own readout: the export arena gives the
+        // delivery tail to the last-stated node, so an earlier draft column
+        // would let a vocabulary-wide GEMM be carved on top of the sampler's bytes.
         if let Some(a) = &m.draft {
-            // Minted inside the arm and off the draft window's own arm of the
-            // inputs, so the schedule states which class it was carved for and
-            // a SKU with no head carries no plan build nothing reads.
+            // Built inside the arm so a SKU without a draft head builds no plan for it.
             let (input_draft, _) = inputs.split(&Facts::drafts());
             let plan_draft = ops::attn::plan_prefill(
                 &input_draft,
@@ -517,21 +421,15 @@ impl ForwardHybrid for Model {
             let (dx, _) = x.split(&Facts::drafts());
             let (dids, _) = ids.split(&Facts::drafts());
 
-            // The fusion: `[a|b]·[Wₑ|W_h]ᵀ = a·Wₑᵀ + b·W_hᵀ`, two matmuls and
-            // one add because this IR states no concatenation. RAW streams —
-            // EAGLE has no pre-fusion norms, which is the recipe and not an
-            // omission (`Draft`'s own note).
-            //
-            // The embedding is scaled the way this family scales every
-            // embedding it reads, because that is what `layout.embed` answers
-            // here and the head was trained against the trunk's own stream.
+            // `[a|b]·[We|Wh]^T = a·We^T + b·Wh^T`: two matmuls and an add
+            // since this IR has no concat op. No pre-fusion norms (EAGLE's
+            // design). Embedding scale matches the trunk's own.
             let e = ops::layout::embed(&dids, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
             let mut dy = ops::elemwise::residual_add(
                 &ops::linear::matmul(&e, &a.fc_embed),
                 &ops::linear::matmul(&dx, &a.fc_hidden),
             );
 
-            // One block, in THIS FAMILY'S four-norm sentence.
             let normed = ops::elemwise::rmsnorm(&dy, &a.attn_norm, a.norm_eps);
             let o = draft_attn(&normed, &inputs, m, &plan_draft, a);
             let o = if m.tp > 1 {
@@ -557,9 +455,7 @@ impl ForwardHybrid for Model {
                 &dy,
             );
 
-            // The readout, through the BASE head and past the same softcap the
-            // trunk's answer goes through: one vocabulary projection in this
-            // model, and one squashing of it.
+            // Uses the trunk's own lm_head and softcap.
             let draft = ops::linear::lm_head(
                 &ops::elemwise::rmsnorm(&dy, &m.final_norm, m.final_norm_eps),
                 &m.embed,
@@ -589,9 +485,8 @@ fn draft_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Dra
     else {
         panic!("an aux head owns its own qkv and borrows nobody's kv row");
     };
-    // Taken unrefined, as the trunk's own mixer takes them: `x` already
-    // carries the draft window, and a `Guard::Always` runtime input narrows to
-    // the window of whatever it is read beside.
+    // `x` already carries the draft window; a `Guard::Always` input narrows
+    // to whatever window it's read beside.
     let q = qkv_unfused(
         x,
         &inputs.positions(),
@@ -609,22 +504,12 @@ fn draft_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Dra
     ops::linear::matmul(&o, &a.o_proj)
 }
 
-/// **A CLIPPABLE LINEAR**: clamp the input to the bounds the checkpoint
-/// states, apply the bank, clamp the output (multimodal §12) — or, where the
-/// tower states `use_clipped_linears: false`, just the bank.
+/// Clamp input to checkpoint-stated bounds, apply the bank, clamp output —
+/// or just the bank, when the tower has no clip bounds.
 ///
-/// The bounds are WEIGHTS and not plan constants, because a trace is built
-/// with no checkpoint in the room and these are 448 learned scalars —
-/// `elemwise::clamp_learned` is the form that reads them, and its precedent is
-/// `Elementwise::Scale`, which has read a device-held scalar for the same
-/// reason since before this axis existed.
-///
-/// **AND THE `None` ARM EMITS NOTHING, NOT A ±∞ CLAMP.** Upstream's buffers
-/// initialize to infinities and a tower that shipped them would be clamping
-/// to nothing at all; a text that spelled that anyway would put fourteen
-/// inert elementwise launches in every block of a 27-block tower — 378 a
-/// fire — and would need two `[1]` planes per projection that the checkpoint
-/// does not hold.
+/// Bounds are weights, not plan constants: trace building has no checkpoint
+/// present yet. The `None` arm emits no clamp at all (not a ±∞ one), since
+/// an unclipped tower has no clip planes to read.
 fn clipped(x: &Value, c: &Clippable) -> Value {
     let Some(k) = &c.clip else {
         return ops::linear::matmul(x, &c.bank);
@@ -633,21 +518,17 @@ fn clipped(x: &Value, c: &Clippable) -> Value {
     ops::elemwise::clamp_learned(&ops::linear::matmul(&held, &c.bank), &k.out_lo, &k.out_hi)
 }
 
-/// **GEMMA'S TOWER, AS ONE FUNCTION AND ONE CAPTURE UNIT** (multimodal §12).
-///
-/// Emitted before one trunk node, for `qwen_3::tower`'s reason: a unit is a
-/// RUN of the node list. Returns the pooled `[Dim::Patches, trunk hidden]`
-/// rectangle whose leading `rows / pool²` rows are live.
+/// Gemma's vision tower, as one capture unit (emitted before any trunk
+/// node). Returns the pooled `[Dim::Patches, trunk hidden]` rectangle whose
+/// leading `rows / pool^2` rows are live.
 fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
     let d = t.head_dim;
     let x = inputs.patches(t.patch_width);
     let segments = inputs.patch_segments();
     let grid = inputs.patch_positions();
 
-    // The patch embed is a plain matmul — `input_proj` carries no bias and no
-    // clip — and the position table is TWO separable lookups summed, which is
-    // one `embed_weighted` over the two axis tables laid end to end with
-    // weights of one (`Tower`'s own note argues why that is exact).
+    // Position table is two separable lookups: one `embed_weighted` over
+    // both axis tables laid end to end, weights of one.
     let mut y = ops::linear::matmul(&x, &t.patch_embed);
     let pos = ops::layout::embed_weighted(
         &inputs.patch_embed_rows(2),
@@ -661,14 +542,10 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
         let n = ops::elemwise::rmsnorm(&y, &b.attn_norm, t.norm_eps);
         let q = ops::elemwise::rmsnorm_per_head(&clipped(&n, &b.q), &b.q_norm, d, t.norm_eps);
         let k = ops::elemwise::rmsnorm_per_head(&clipped(&n, &b.k), &b.k_norm, d, t.norm_eps);
-        // `with_scale = False`: a per-head norm that reads no weight, which is
-        // the line the trunk's own `qkv_unfused` writes for its `v`.
+        // A per-head norm with no learned weight (same as the trunk's `v` leg).
         let v = ops::elemwise::rmsnorm_no_scale(&clipped(&n, &b.v), d, t.norm_eps);
-        // Two axes, contiguous blocks, and the ladder RESTARTS per axis --
-        // `compute_default_rope_parameters` says so in its own comment
-        // ("computes RoPE frequencies INDEPENDENTLY for each spatial
-        // dimension using the partitioned head_dim"), which is exactly what
-        // `MropeForm::Blocked` means.
+        // RoPE restarts per spatial axis (`MropeForm::Blocked`), matching
+        // upstream's `compute_default_rope_parameters`.
         let (q, k) = ops::elemwise::rope_mrope(
             &q,
             &k,
@@ -686,9 +563,8 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
         );
 
         let n = ops::elemwise::rmsnorm(&y, &b.pre_ffw_norm, t.norm_eps);
-        // UNFUSED, and §12 argues it: `gate` and `up` read the same `n` and
-        // clamp it to DIFFERENT learned bounds, so they cannot share a packed
-        // bank the way the trunk's `gate_up` does.
+        // Unfused: gate and up clamp to different learned bounds, so they
+        // can't share a packed bank.
         let act = ops::linear::mlp_geglu_tanh(&clipped(&n, &b.gate), &clipped(&n, &b.up));
         y = ops::elemwise::residual_add(
             &ops::elemwise::rmsnorm(&clipped(&act, &b.down), &b.post_ffw_norm, t.norm_eps),
@@ -696,18 +572,9 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
         );
     }
 
-    // The pool, then the scaling the pooler states, then the standardization
-    // the tower states, then the projection that makes a soft token a token
-    // row — `Gemma4VisionModel.forward`'s own last four lines, in its own
-    // order.
-    //
-    // The `√hidden` is `Gemma4VisionPooler`'s, and upstream computes it in
-    // f32 because "the sqrt(hidden_size) scaling can push the activations
-    // past the float16 range (max 65504)". This rectangle is bf16, which has
-    // f32's exponent and none of that range problem; what it gives up is
-    // mantissa, and the standardize below is the step that brings the
-    // magnitude back down — which is the same reason upstream defers the cast
-    // to after it rather than before.
+    // Order: pool, scale by sqrt(hidden), standardize, project — matching
+    // `Gemma4VisionModel.forward`. Standardize brings the magnitude back
+    // down after the scale.
     let pooled = ops::layout::pool_rows(&y, t.pool);
     let pooled = pooled * (t.hidden as f32).sqrt();
     let pooled = match &t.std {

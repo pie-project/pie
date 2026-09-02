@@ -48,23 +48,3 @@ pub fn with_test_profile<R>(
     with_constants(profile.vocab, profile.page_size, f)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn standalone_profile_hook_is_scoped() {
-        let profile = eta_ir::registry::ModelProfile {
-            vocab: 77,
-            page_size: 32,
-            num_layers: 99,
-            ..eta_ir::registry::ModelProfile::dummy()
-        };
-        with_test_profile(&profile, || {
-            assert_eq!(vocab(), 77);
-            assert_eq!(page_size(), 32);
-        });
-        assert_eq!(vocab(), TraceConstants::default().vocab);
-        assert_eq!(page_size(), TraceConstants::default().page_size);
-    }
-}

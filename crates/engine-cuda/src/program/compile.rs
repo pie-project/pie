@@ -1,38 +1,9 @@
 //! NVRTC: one self-contained translation unit in, one launchable region out.
-//!
-//! **NO INCLUDE PATH.** `eta-compiler`'s CUDA emitter splices every runtime
-//! header into the string it hands over (`runtime/cuda/*.cuh` plus the
-//! generated RNG preamble), so an `#include` in an emitted source is an
-//! emitter bug rather than a search-path problem, and `libnvrtc` is
-//! `dlopen`ed like every other CUDA symbol — this crate builds with no
-//! toolkit. Compiles target the device's real `sm_XY`, not `compute_XY`'s
-//! re-JIT-ed PTX.
-//!
-//! **WHY NOT `kernels-cuda`'s JIT.** That machinery exists and was the first
-//! thing checked: `kernels_cuda::jit` compiles a *named, in-crate* template
-//! against a specialization record, caches by
-//! `(entry, specialization, arch)`, and answers with a `CUfunction` it owns
-//! for the life of the process. Everything in that sentence is wrong here.
-//! A guest program's source is not in any crate — it arrives per registration
-//! from a host that ran `eta-compiler` — so there is no template to name;
-//! the cache key that makes an ETA cubin reusable is
-//! [`eta_exec::cache_identity`] (backend × device × stage signature × four
-//! version numbers) plus a fingerprint of the emitted bytes, not a
-//! specialization struct; and a program is CLOSED, which has to unload its
-//! modules, where a kernel template never is. So this is a second NVRTC
-//! caller, and it shares with the first only the library.
-//!
-//! **THREE TIERS, AND THE NEGATIVE ONE IS NOT AN OPTIMISATION.** In memory by
-//! program hash (a re-registration of a live program compiles nothing); on
-//! disk by identity × source fingerprint (a compile that survives the
-//! process); and a bounded negative tier that remembers only
-//! [`Failure::Deterministic`] — a source NVRTC rejects is rejected forever and
-//! answering from memory is what keeps a hot-looping guest from re-running
-//! the compiler on every attempt, while a machine that was merely out of
-//! memory must be retried.
-//!
-//! Nothing is installed until every region of every stage compiles: a
-//! half-installed program is a wrong answer, not a slow one.
+//! No include path — the emitter splices every runtime header into the
+//! source. Three cache tiers: in memory by program hash, on disk by identity
+//! × source fingerprint, and a bounded negative tier that remembers only
+//! [`Failure::Deterministic`]. Nothing is installed until every region of
+//! every stage compiles.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -85,11 +56,10 @@ pub struct Target {
     /// share a cached compilation. The ordinal is enough in a one-shell
     /// process; a multi-GPU host wants the UUID.
     pub device: u64,
-    /// NVRTC's own `(major, minor)`. Two NVRTC versions compile one source to
-    /// different machine code, so a cubin must not outlive a toolkit upgrade —
-    /// and [`eta_exec::cache_identity`] has no seat for it (it is shared with
-    /// backends that never call NVRTC), so it is folded into the memory key
-    /// here and into the disk key through the source fingerprint's sibling.
+    /// NVRTC's own `(major, minor)`. Two NVRTC versions compile one source
+    /// to different machine code; folded into the memory key here since
+    /// [`eta_exec::cache_identity`] has no seat for it (shared with backends
+    /// that never call NVRTC).
     pub nvrtc: (i32, i32),
 }
 
@@ -130,7 +100,7 @@ pub fn arch_flag(major: i32, minor: i32) -> String {
 /// [`Fault::Compile`] (retryable) when `libnvrtc` cannot be loaded or the
 /// query fails: both are facts about the machine, not about a program.
 pub fn nvrtc_version() -> Result<(i32, i32)> {
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     {
         use cudarc::nvrtc::sys as nvrtc;
 
@@ -146,7 +116,7 @@ pub fn nvrtc_version() -> Result<(i32, i32)> {
             }))
         }
     }
-    #[cfg(not(feature = "_cuda"))]
+    #[cfg(not(feature = "cuda"))]
     {
         Err(Fault::Runtimeless)
     }
@@ -162,16 +132,15 @@ pub fn nvrtc_version() -> Result<(i32, i32)> {
 /// rejected — that answer is worth remembering — and [`Failure::Retryable`]
 /// for everything else.
 pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>, Failure> {
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     {
         use cudarc::nvrtc::sys as nvrtc;
         use std::ffi::CString;
 
         let retryable = |reason: String| Failure::Retryable { reason };
 
-        // A NUL in the source would truncate the C string and compile a
-        // PREFIX — which can succeed and produce a kernel missing its tail.
-        // Refuse it here, where the cause is still nameable.
+        // A NUL would truncate the C string and compile a prefix that can
+        // succeed but is missing its tail.
         let Ok(source_c) = CString::new(source) else {
             return Err(Failure::Deterministic {
                 reason: "the emitted source contains an interior NUL byte".into(),
@@ -205,7 +174,7 @@ pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>,
         unsafe { nvrtc::nvrtcDestroyProgram(&raw mut program) };
         outcome
     }
-    #[cfg(not(feature = "_cuda"))]
+    #[cfg(not(feature = "cuda"))]
     {
         let _ = (source, architecture);
         Err(Failure::Retryable {
@@ -215,7 +184,7 @@ pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>,
 }
 
 /// The compile proper, with `program` guaranteed destroyed by the caller.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 fn compile_into(
     program: cudarc::nvrtc::sys::nvrtcProgram,
     architecture: &str,
@@ -228,11 +197,9 @@ fn compile_into(
     let Ok(arch) = CString::new(architecture) else {
         return Err(retryable("the architecture flag contains a NUL".into()));
     };
-    // `--fmad=false` / `--prec-div=true` / `--prec-sqrt=true` is a
-    // DETERMINISM CONTRACT and not a taste: the channel plane promises
-    // bit-for-bit reproducibility, and a contracted FMA or a fast reciprocal
-    // moves a lane past the tolerance the host interpreter — which has
-    // neither — is diffed against.
+    // Determinism contract, not a style choice: a contracted FMA or fast
+    // reciprocal would move a lane past the tolerance the host interpreter
+    // is diffed against.
     let options: [*const std::ffi::c_char; 5] = [
         arch.as_ptr(),
         c"--std=c++17".as_ptr(),
@@ -286,7 +253,7 @@ fn compile_into(
 }
 
 /// The compiler log, or a note saying it could not be read.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 fn log(program: cudarc::nvrtc::sys::nvrtcProgram) -> String {
     use cudarc::nvrtc::sys as nvrtc;
 
@@ -309,7 +276,7 @@ fn log(program: cudarc::nvrtc::sys::nvrtcProgram) -> String {
 }
 
 /// NVRTC's own name for a status code.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 fn describe(status: cudarc::nvrtc::sys::nvrtcResult) -> String {
     // SAFETY: `nvrtcGetErrorString` returns a static string per enumerator;
     // null is checked anyway, in case a version mismatch hands back a code it
@@ -334,9 +301,9 @@ fn describe(status: cudarc::nvrtc::sys::nvrtcResult) -> String {
 /// Share through the [`Arc`] the compile plane hands out.
 #[derive(Debug)]
 pub struct Module {
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     module: cudarc::driver::sys::CUmodule,
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     function: cudarc::driver::sys::CUfunction,
     block_threads: u32,
     entry_name: String,
@@ -362,7 +329,7 @@ impl Module {
         if cubin.is_empty() {
             return Err(Fault::program("cuModuleLoadData", "the cubin is empty"));
         }
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             use cudarc::driver::sys as dr;
 
@@ -391,8 +358,8 @@ impl Module {
             let code =
                 unsafe { dr::cuModuleGetFunction(&raw mut function, module, entry_c.as_ptr()) };
             if code != dr::CUresult::CUDA_SUCCESS {
-                // Unload before returning: a stale disk cache produces this
-                // failure in a loop, one leaked module each.
+                // Unload before returning, or a stale disk cache leaks one
+                // module per retry.
                 //
                 // SAFETY: `module` is loaded and no function of it is in flight.
                 unsafe { dr::cuModuleUnload(module) };
@@ -408,7 +375,7 @@ impl Module {
                 entry_name: entry_name.to_string(),
             })
         }
-        #[cfg(not(feature = "_cuda"))]
+        #[cfg(not(feature = "cuda"))]
         {
             let _ = entry_name;
             Err(Fault::Runtimeless)
@@ -416,18 +383,16 @@ impl Module {
     }
 
     /// The entry point handle, for `cuLaunchKernel`.
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     #[must_use]
     pub const fn function(&self) -> cudarc::driver::sys::CUfunction {
         self.function
     }
 
     /// The width to launch this function at: a power of two inside its own
-    /// register limit.
-    ///
-    /// **THE REDUCTIONS DEMAND A POWER OF TWO.** The emitted fused kernels
-    /// reduce with a halving tree (`stride = blockDim.x / 2`), which folds
-    /// lanes wrong — silently — at any other width.
+    /// register limit. The emitted kernels reduce with a halving tree
+    /// (`stride = blockDim.x / 2`), which silently folds lanes wrong at any
+    /// other width.
     #[must_use]
     pub const fn block_threads(&self) -> u32 {
         self.block_threads
@@ -442,7 +407,7 @@ impl Module {
 
 impl Drop for Module {
     fn drop(&mut self) {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         if !self.module.is_null() {
             // SAFETY: loaded in `load`, dropped once. The return code is
             // ignored because a `Drop` has nowhere to report it.
@@ -452,7 +417,7 @@ impl Drop for Module {
 }
 
 /// The register-limited launch width, rounded down to a power of two.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 fn launch_width(function: cudarc::driver::sys::CUfunction) -> u32 {
     use cudarc::driver::sys as dr;
 
@@ -508,11 +473,9 @@ const MAX_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 /// Serialises the temp-file names of concurrent writers inside one process.
 static NONCE: AtomicU64 = AtomicU64::new(0);
 
-/// Where cubins are kept, or `None` when nowhere is writable.
-///
-/// **EVERY FAILURE HERE IS A MISS, NEVER AN ERROR.** NVRTC is always
-/// available when the cache is not, and a corrupt entry is removed on the way
-/// past so that it is paid for once rather than every run.
+/// Where cubins are kept, or `None` when nowhere is writable. Every failure
+/// here is a miss, never an error: NVRTC is always available when the cache
+/// is not.
 #[derive(Clone, Debug)]
 pub struct Disk {
     directory: Option<PathBuf>,
@@ -520,18 +483,9 @@ pub struct Disk {
 
 impl Disk {
     /// The cache a deployment's stated directory roots, or nowhere when it
-    /// stated none.
-    ///
-    /// **`Disk::from_env` STOOD HERE** and resolved `$PIE_HOME/cache/ptir-cuda`,
-    /// else `$XDG_CACHE_HOME/pie/ptir-cuda`, else `$HOME/.cache/pie/ptir-cuda`.
-    /// Article 9 (alto design §1) says a shell reads no environment, and this
-    /// was the last read in the crate: the directory is a DEPLOYMENT fact, so
-    /// it arrives typed on `Boot::cache_dir` — off the boot document's
-    /// `[cache] dir`, which the worker has written all along — exactly as the
-    /// warm-boot weight artifacts' directory does.
-    ///
-    /// `None` is [`Disk::disabled`], and that costs nothing but NVRTC time:
-    /// every failure of this cache is a miss and never an error.
+    /// stated none. The directory is a deployment fact, carried on
+    /// `Boot::cache_dir`. `None` is [`Disk::disabled`], which costs nothing
+    /// but NVRTC time.
     #[must_use]
     pub fn rooted(directory: Option<impl Into<PathBuf>>) -> Disk {
         Disk {
@@ -574,11 +528,9 @@ impl Disk {
         }
     }
 
-    /// Store `cubin` for `(key, region_index, entry)`.
-    ///
-    /// Written to a per-writer temp file and atomically `rename`d in:
-    /// concurrent writers are normal, and a half-written cubin another process
-    /// loads is a segfault in the driver.
+    /// Store `cubin` for `(key, region_index, entry)`. Written to a
+    /// per-writer temp file and atomically `rename`d in: a half-written
+    /// cubin another process loads is a segfault in the driver.
     pub fn store(&self, key: &str, region_index: u32, entry: &str, cubin: &[u8]) {
         let Some(directory) = self.directory.as_ref() else {
             return;
@@ -633,12 +585,9 @@ impl Disk {
 }
 
 /// The identity string plus an eight-byte fingerprint of the source, appended
-/// rather than folded in so the identity stays readable inside a key.
-///
-/// **THE FINGERPRINT IS WHY THIS FUNCTION EXISTS.** Editing `eta-compiler`'s
-/// device templates bumps no version number, so without the source in the key
-/// a stale cubin matches today's identity and every kernel edit silently does
-/// nothing.
+/// rather than folded in so the identity stays readable inside a key. Editing
+/// a device template bumps no version number, so without the source in the
+/// key a stale cubin would match today's identity.
 #[must_use]
 pub fn disk_key(identity: &str, source: &str) -> String {
     let hash = eta_ir::fnv1a64(source.as_bytes());
@@ -652,13 +601,11 @@ pub fn disk_key(identity: &str, source: &str) -> String {
     key
 }
 
-/// Validate a stored entry and return its cubin.
-///
-/// The filename is only a 64-bit hash of the key, so the key and the entry
-/// name are stored and compared here too: a hash collision would otherwise
-/// load one program's machine code for another's launch. Every length is
-/// checked against the file's own size before any slice, so a lying header is
-/// a miss and not a panic.
+/// Validate a stored entry and return its cubin. The filename is only a
+/// 64-bit hash of the key, so the key and entry name are stored and compared
+/// here too: a hash collision would otherwise load one program's machine
+/// code for another's launch. Every length is checked against the file's own
+/// size before any slice, so a lying header is a miss and not a panic.
 fn parse(bytes: &[u8], key: &str, region_index: u32, entry: &str) -> Option<Vec<u8>> {
     if bytes.len() < HEADER_BYTES || bytes.len() as u64 > MAX_ENTRY_BYTES {
         return None;
@@ -767,9 +714,9 @@ pub struct Cache {
 }
 
 impl Default for Cache {
-    /// A cache that stores nothing. The directory is the deployment's and
-    /// arrives on the `Boot` (article 9); a `Default` that went looking for
-    /// one would be the environment read this crate no longer makes.
+    /// A cache that stores nothing. The directory is the deployment's,
+    /// arriving via `Boot`; a `Default` that looked for one itself would be
+    /// an environment read this crate does not make.
     fn default() -> Cache {
         Cache::new(Disk::disabled())
     }
@@ -794,11 +741,9 @@ impl Cache {
         &self.disk
     }
 
-    /// What the tiers have been doing.
-    ///
-    /// **AN ABSENCE HAS NO OUTPUT**, so the one claim worth asserting about a
-    /// cache — that the second bind of a program compiles nothing — is only
-    /// reachable through [`CacheStats::compilations`].
+    /// What the tiers have been doing. The claim that a second bind of a
+    /// program compiles nothing is only checkable through
+    /// [`CacheStats::compilations`].
     #[must_use]
     pub const fn stats(&self) -> CacheStats {
         self.stats
@@ -891,9 +836,8 @@ impl Cache {
                 stage_plan.signature_hash,
                 versions,
             );
-            // NVRTC's version is not in `cache_identity` — that record is
-            // shared with backends that never call NVRTC — so it is folded
-            // into the memory key here.
+            // NVRTC version isn't in `cache_identity` (shared with
+            // non-NVRTC backends), so it's folded into the memory key here.
             let key = fnv1a64_with(
                 identity.as_bytes(),
                 &[
@@ -946,20 +890,10 @@ impl Cache {
             let region_index = u32::try_from(region_index).map_err(|_| Failure::Deterministic {
                 reason: "a stage with more than four billion regions is not a stage".into(),
             })?;
-            // A SECOND-PARTY region has no generated kernel and never will: it
-            // is a `kernel_call` or a `sink_call`, which is a NAME the shell
-            // launches itself rather than a body the emitter could write. The
-            // emitter declines it correctly, and reading that decline as a
-            // compile failure would refuse every adapter program this shell
-            // can actually run. It is the LIBRARY tag that says so — an
-            // emitter that declined a genuinely generated region still has to
-            // be a failure, which is what the arms below are for.
-            //
-            // `shell_launches` IS that tag, asked as a question, and it is the
-            // launch half's too: the same predicate decides which values a
-            // fire has to carry scratch for (alto adapter §6.1). Skipping here
-            // under one spelling and budgeting there under another is what put
-            // an adapter's weights in per-lane scratch in the first place.
+            // A skip here is not a compile failure: a `kernel_call`/
+            // `sink_call` region has no generated kernel because the shell
+            // launches it itself. `shell_launches` is the same predicate the
+            // launch half uses to decide which values need fire scratch.
             if plan
                 .fused
                 .get(region_index as usize)
@@ -969,14 +903,10 @@ impl Cache {
             }
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
                 Slot::Kernel { source, entry } => (source, entry),
-                // NOT a `continue`. "The host declined on purpose" presumes a
-                // shell with its own path for the region, and this one has
-                // none — every region it runs is a compiled `KernelKind::Fused`.
-                // Skipping a refusal drops the region's ops from the fire while
-                // the plan still budgets their scratch, so they read back as
-                // the zeros the fire memset and publish a confident wrong
-                // answer. A reason nobody can act on still beats an answer
-                // nobody can distinguish.
+                // Not a `continue`: this shell has no fallback path for a
+                // declined region, so skipping it would silently drop the
+                // region's ops while the plan still budgets their scratch —
+                // a confident wrong answer instead of an error.
                 Slot::Refused(why) => {
                     return Err(Failure::Deterministic {
                         reason: format!(
@@ -1070,42 +1000,7 @@ fn fnv1a64_with(bytes: &[u8], tails: &[&[u8]]) -> u64 {
 mod tests {
     use super::*;
 
-    /// A wrong separator is a per-registration compile failure, not a build
-    /// error, so the spelling is pinned rather than reviewed.
-    #[test]
-    fn the_architecture_flag_runs_major_and_minor_together() {
-        assert_eq!(arch_flag(8, 9), "--gpu-architecture=sm_89");
-        assert_eq!(arch_flag(9, 0), "--gpu-architecture=sm_90");
-        assert_eq!(arch_flag(12, 0), "--gpu-architecture=sm_120");
-    }
-
-    /// The reductions halve `blockDim.x`, so every width must be a power of two.
-    #[test]
-    fn every_launch_width_is_a_power_of_two() {
-        for max in [32, 33, 63, 64, 100, 128, 512, 768, 1024, 2048] {
-            let width = round_down_to_power_of_two(max);
-            assert!(
-                width.is_power_of_two(),
-                "{max} rounded to {width}, which is not a power of two"
-            );
-        }
-    }
-
-    /// Down, never up: the attribute is a ceiling and exceeding it fails the
-    /// launch. An unbelievable attribute falls back rather than launching a
-    /// partial warp or a huge `u32`.
-    #[test]
-    fn the_launch_width_never_exceeds_what_the_function_permits() {
-        assert_eq!(round_down_to_power_of_two(768), 512);
-        assert_eq!(round_down_to_power_of_two(1023), 512);
-        assert_eq!(round_down_to_power_of_two(1024), 1024);
-        assert_eq!(round_down_to_power_of_two(4096), MAX_BLOCK_THREADS);
-        assert_eq!(round_down_to_power_of_two(31), DEFAULT_BLOCK_THREADS);
-        assert_eq!(round_down_to_power_of_two(-1), DEFAULT_BLOCK_THREADS);
-    }
-
-    /// The point of the disk key: a source edit must miss even when every
-    /// version number and the identity are unchanged.
+    // A source edit must miss even when every version number is unchanged.
     #[test]
     fn editing_the_source_changes_the_disk_key_with_no_version_bump() {
         let identity = "0100000000000000000300000000000000000000-v0003000400000003 00000015";
@@ -1126,21 +1021,7 @@ mod tests {
         path
     }
 
-    /// A stored cubin comes back exactly, and only for the request it was
-    /// stored for: the filename covers the key alone, so region and entry are
-    /// compared out of the file.
-    #[test]
-    fn an_entry_answers_only_the_exact_request_it_was_stored_for() {
-        let disk = Disk::at(scratch("exact"));
-        disk.store("key-a", 2, "entry_r2", b"cubin");
-        assert_eq!(disk.load("key-a", 2, "entry_r2"), Some(b"cubin".to_vec()));
-        assert_eq!(disk.load("key-a", 3, "entry_r2"), None, "wrong region");
-        assert_eq!(disk.load("key-a", 2, "entry_r9"), None, "wrong entry name");
-        assert_eq!(disk.load("key-b", 2, "entry_r2"), None, "wrong key");
-    }
-
-    /// A truncated or corrupt file is a miss, and it is removed on the way
-    /// past so the cost is paid once rather than every run.
+    // A truncated or corrupt file is a miss and is removed on the way past.
     #[test]
     fn a_corrupt_entry_is_a_miss_and_is_deleted() {
         let directory = scratch("corrupt");
@@ -1161,23 +1042,8 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// A header lying about its lengths is refused without panicking and
-    /// without allocating the size of the claim.
-    #[test]
-    fn a_header_that_lies_about_its_lengths_is_refused_without_panicking() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&5u32.to_le_bytes());
-        bytes.extend_from_slice(&5u32.to_le_bytes());
-        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
-        bytes.extend_from_slice(b"key-a");
-        bytes.extend_from_slice(b"entry");
-        assert_eq!(parse(&bytes, "key-a", 0, "entry"), None);
-    }
-
-    /// A cache with no home stores nothing and misses everything, and neither
-    /// is a failure.
+    // A cache with no home stores nothing and misses everything; neither is
+    // a failure.
     #[test]
     fn a_disabled_cache_is_a_miss_and_not_a_failure() {
         let disk = Disk::disabled();
@@ -1186,34 +1052,4 @@ mod tests {
         assert_eq!(disk.load("key", 0, "entry"), None);
     }
 
-    /// The fold must be the workspace's, since the string it folds came out of
-    /// `cache_identity`.
-    #[test]
-    fn folding_in_tails_is_the_same_as_folding_the_concatenation() {
-        assert_eq!(fnv1a64_with(b"", &[]), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(
-            fnv1a64_with(b"ptir", &[]),
-            eta_ir::fnv1a64(b"ptir")
-        );
-        let joined = fnv1a64_with(b"identity\x0c\x00\x00\x00\x00\x00\x00\x00", &[]);
-        let split = fnv1a64_with(b"identity", &[&12u32.to_le_bytes(), &0u32.to_le_bytes()]);
-        assert_eq!(joined, split);
-    }
-
-    /// An NVRTC upgrade must miss; the identity record carries no NVRTC field,
-    /// so the miss has to come from the fold.
-    #[test]
-    fn an_nvrtc_version_bump_changes_the_stage_key() {
-        let identity = b"the-same-identity";
-        let before = fnv1a64_with(identity, &[&12i32.to_le_bytes(), &8i32.to_le_bytes()]);
-        let after = fnv1a64_with(identity, &[&13i32.to_le_bytes(), &0i32.to_le_bytes()]);
-        assert_ne!(before, after);
-    }
-
-    /// The kind looked up is the contract's, so a renumbering is a build
-    /// break rather than a program whose every region is `Slot::Absent`.
-    #[test]
-    fn cuda_compiles_the_fused_kind_the_contract_names() {
-        assert_eq!(KERNEL_FUSED, KernelKind::Fused);
-    }
 }

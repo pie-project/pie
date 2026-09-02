@@ -1,25 +1,12 @@
-//! The completion broker — run-ahead's bookkeeping, home at last.
+//! The completion broker: run-ahead's bookkeeping. A waker table, a
+//! recycling pool of atomic terminal cells, and a per-work-item lease, for
+//! how the runtime decides to run ahead of a device.
 //!
-//! **THIS CODE IS A LIFT, NOT A REWRITE.** It stood in `engine` as
-//! `completion.rs` (807 lines) plus the terminal cell out of `local.rs`, and
-//! the palo rewrite evicted it: a waker table, a recycling pool of atomic
-//! terminal cells and a per-work-item lease are how the RUNTIME decides to run
-//! ahead of a device, not part of the description of what an engine is
-//! (design §7, decision 19). It arrived comment-stripped and is kept that way
-//! — only what this wave CHANGED is documented, below and at the sites.
-//!
-//! # What changed on the way over
-//!
-//! * The terminal cell is local. It was `engine::local::TerminalCell`, a
-//!   `#[repr(C)]` word a C engine published into across the ABI. Nothing
-//!   crosses the boundary now — [`engine::Engine::fire`] answers a
-//!   `Result<FireTicket>` and the settle happens on this side of it — so the
-//!   cell is the runtime's private word and its `#[repr(C)]` is gone with the
-//!   caller that needed it.
-//! * [`settle`] is new: the one place a `Result<FireTicket, Error>`
-//!   becomes a published outcome. A synchronous shell answers before the
-//!   runtime ever polls, so the cell is written here rather than by the
-//!   engine.
+//! The terminal cell is local (no longer crossing an ABI boundary): nothing
+//! crosses now, since [`engine::Engine::fire`] answers a
+//! `Result<FireTicket>` and the settle happens on this side of it. [`settle`]
+//! is the one place a `Result<FireTicket, Error>` becomes a published
+//! outcome, written here rather than by the engine.
 
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -871,21 +858,14 @@ impl Drop for WorkItemCompletion {
 }
 
 
-/// Publish one answer into every terminal cell a submission reserved.
-///
-/// **NEW IN THE LIFT, AND IT IS WHERE THE BOUNDARY MOVED.** A C engine used
-/// to write these words itself: the runtime handed `*mut TerminalCell` across
-/// the ABI inside `StepSubmission` and the device's completion thread stored
-/// into them. The contract has no such field any more —
-/// [`Engine::fire`](engine::Engine::fire) answers a
-/// `Result<FireTicket, Error>` and the shells in this workspace are
-/// synchronous — so the runtime writes them, once, from the answer it got.
+/// Publish one answer into every terminal cell a submission reserved. The
+/// runtime writes them, once, from the answer
+/// [`Engine::fire`](engine::Engine::fire) gave.
 ///
 /// Which outcome a caller passes is the whole of the run-ahead policy:
-/// [`TERMINAL_OUTCOME_RETRY`] for a
-/// [scheduling](engine::Error::is_scheduling) refusal, because the
-/// work item is still alive and its next attempt resets the cell;
-/// [`TERMINAL_OUTCOME_FAILED`] for anything else.
+/// [`TERMINAL_OUTCOME_RETRY`] for a [scheduling](engine::Error::is_scheduling)
+/// refusal (the work item is still alive and its next attempt resets the
+/// cell); [`TERMINAL_OUTCOME_FAILED`] for anything else.
 pub fn settle(cells: &[*mut TerminalCell], outcome: TerminalOutcomeCode) {
     for &cell in cells {
         if cell.is_null() {
@@ -901,19 +881,14 @@ pub fn settle(cells: &[*mut TerminalCell], outcome: TerminalOutcomeCode) {
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────
-// F2b: settlement through the broker, for engines that answer before the
-// device is done.
-// ─────────────────────────────────────────────────────────────────────────
+// Settlement through the broker, for engines that answer before the device
+// is done.
 
-/// **One admitted frame's settlement, waiting for the device.**
-///
-/// Registered by the engine lane the instant `submit` answers `Ok`, resolved
-/// by the engine's own completion callback — which, for the CUDA shell, runs
-/// on the driver's host-function thread. Everything in here is therefore
-/// either an atomic, a `Vec` read under one briefly-held lock, or a waker
-/// publish; nothing calls back into the engine and nothing takes a second
-/// lock.
+/// One admitted frame's settlement, waiting for the device. Registered by
+/// the engine lane the instant `submit` answers `Ok`, resolved by the
+/// engine's own completion callback (for the CUDA shell, the driver's
+/// host-function thread). Everything here is an atomic, a `Vec` read under
+/// one briefly-held lock, or a waker publish.
 struct PendingFrame {
     /// How many of the frame's steps have not reported yet.
     remaining: usize,
@@ -921,21 +896,15 @@ struct PendingFrame {
     /// once, when the last step reports.
     cells: Vec<*mut TerminalCell>,
     /// The frame's own completion cell: what the engine lane's
-    /// `SubmissionCompletion` is parked on, so the run-ahead depth accounting
+    /// `SubmissionCompletion` is parked on, so run-ahead depth accounting
     /// retires the batch only when the device is actually done with it.
     frame_cell: *mut TerminalCell,
     /// Its waker slot, and the epoch to publish there.
     wait_id: u64,
     epoch: u64,
-    /// **The adopted channels' reader slots** — the wake that used to happen
-    /// in `pump_out` right after `submit` returned.
-    ///
-    /// F2a made the cell cross by device access: `channel::scatter_publish`
-    /// writes it into the guest's mirror and the engine advances the tail
-    /// word, so the host pump moves nothing and the wake is all that is left.
-    /// Waking it at submit-return was a lie the moment settlement went
-    /// asynchronous — the guest would have been told to read a cell the device
-    /// had not written yet — so it moves here, behind the completion.
+    /// The adopted channels' reader slots: waking them here (rather than at
+    /// submit-return) matters because the guest must not be told to read a
+    /// cell the device has not written yet.
     wakes: Vec<u64>,
 }
 
@@ -945,29 +914,19 @@ struct PendingFrame {
 // is a release store into an `AtomicU32`. The waker ids are integers.
 unsafe impl Send for PendingFrame {}
 
-/// **The engine lane's book of frames the device has not finished.**
-///
-/// One per engine lane, shared with the completion sink that lane installs on
-/// its engine. The map is the correlation the receipt promised: `FrameTicket::id`
-/// in, the frame's terminal cells and wakes out.
+/// The engine lane's book of frames the device has not finished. One per
+/// engine lane, shared with the completion sink that lane installs on its
+/// engine: `FrameTicket::id` in, the frame's terminal cells and wakes out.
 #[derive(Default)]
 pub struct FrameSettlements {
     inner: Mutex<Book>,
 }
 
-/// **THE RACE THIS BOOK EXISTS TO LOSE SAFELY.**
-///
-/// `submit` returns with the device already running, so a step can complete —
-/// and its callback can arrive on the driver's thread — BEFORE the lane has
-/// got as far as registering the frame it belongs to. Measured, on the first
-/// e2e boot: the frame was registered a few microseconds after both of its
-/// steps had already reported, and the batch sat unsettled forever behind a
-/// completion nobody would send twice.
-///
-/// So completions for a frame nobody is expecting yet are not dropped: they
-/// are counted in [`Book::early`], and [`FrameSettlements::expect`] subtracts
-/// what already arrived. A registration whose steps have all reported resolves
-/// on the spot.
+/// The race this book exists to lose safely: `submit` returns with the
+/// device already running, so a step's callback can arrive before the lane
+/// has registered the frame it belongs to. Completions for a frame nobody is
+/// expecting yet are counted in [`Book::early`] instead of dropped, and
+/// [`FrameSettlements::expect`] subtracts what already arrived.
 #[derive(Default)]
 struct Book {
     frames: std::collections::HashMap<u64, PendingFrame>,
@@ -983,12 +942,9 @@ impl FrameSettlements {
         Arc::new(FrameSettlements::default())
     }
 
-    /// **Register an admitted frame.** Called on the engine lane, after
-    /// `submit` answered `Ok`.
-    ///
-    /// `steps` is how many completions to expect; the cells are published when
-    /// the last one arrives, because a frame is admitted whole and its work
-    /// items are the frame's rather than any one step's.
+    /// Register an admitted frame. Called on the engine lane, after `submit`
+    /// answered `Ok`. `steps` is how many completions to expect; the cells
+    /// are published when the last one arrives.
     pub fn expect(
         &self,
         frame: u64,
@@ -1027,38 +983,26 @@ impl FrameSettlements {
         }
     }
 
-    /// **Forget a frame nobody will complete** — the poison path.
-    ///
-    /// A frame whose step k faulted has its terminal cells published FAILED by
-    /// the lane, and the settlement callbacks of steps `0..k` are still coming:
-    /// they are real work the device is really doing, so they will arrive and
-    /// they must find nothing. Dropping the registration is what makes a late
-    /// completion harmless instead of a frame that reports success after it
-    /// was failed.
+    /// Forget a frame nobody will complete — the poison path. A frame whose
+    /// step k faulted has its terminal cells published failed by the lane;
+    /// dropping the registration makes the still-coming completions of
+    /// steps `0..k` harmless instead of reporting success after failure.
     pub fn forget(&self, frame: u64) {
         let mut book = self.inner.lock().unwrap();
         book.frames.remove(&frame);
         book.early.remove(&frame);
     }
 
-    /// **One step of one frame has completed.** Called from the engine's
-    /// settlement thread — for CUDA, the driver's host-function thread.
-    ///
-    /// Publishes nothing until the frame's LAST step reports, except on a
-    /// fault, which resolves the frame immediately: the steps behind a faulted
-    /// one were poisoned at submit and are never coming.
+    /// One step of one frame has completed. Called from the engine's
+    /// settlement thread. Publishes nothing until the frame's last step
+    /// reports, except on a fault, which resolves the frame immediately.
     pub fn settled(&self, frame: u64, outcome: &engine::StepOutcome, broker: &CompletionBroker) {
         let failed = matches!(outcome, engine::StepOutcome::Faulted(_));
         let pending = {
             let mut book = self.inner.lock().unwrap();
             let Some(pending) = book.frames.get_mut(&frame) else {
-                // **EITHER ALREADY RESOLVED, OR AHEAD OF ITS REGISTRATION.**
-                // The second is the race `Book` exists to lose safely: the
-                // device finished this step before the lane got as far as
-                // `expect`, so the completion is banked and `expect` will
-                // subtract it. A frame the poison path forgot has no `early`
-                // entry either — `forget` clears both — so nothing accretes
-                // for a frame nobody will register.
+                // Either already resolved, or ahead of its registration: the
+                // completion is banked here and `expect` will subtract it.
                 let seen = book.early.entry(frame).or_insert((0, false));
                 seen.0 += 1;
                 seen.1 |= failed;
@@ -1086,12 +1030,10 @@ impl FrameSettlements {
     }
 }
 
-/// **Resolve one frame**: its work items, then its own cell, then the guests.
-///
-/// The order is the argument. The lane's `SubmissionCompletion` is what
-/// retires the batch, so publishing it before its work items would let the
-/// scheduler read a cell nobody had written; and a guest wake is a promise
-/// that its cell is readable, which is true only after both.
+/// Resolve one frame: its work items, then its own cell, then the guests.
+/// The order matters: publishing the frame cell before its work items would
+/// let the scheduler read a cell nobody had written, and a guest wake
+/// promises its cell is readable only after both.
 fn publish(pending: &PendingFrame, failed: bool, broker: &CompletionBroker) {
     let code = if failed {
         TERMINAL_OUTCOME_FAILED

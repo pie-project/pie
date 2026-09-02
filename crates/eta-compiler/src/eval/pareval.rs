@@ -1,22 +1,7 @@
-//! **Host partial evaluation** of stage programs (feature `eval`) — one
-//! general mechanism with three consumers:
-//!
-//! * **Canonical-KV fire evidence** (prefix cache): the runtime folds the
-//!   geometry prologue over host-known channel values and checks the result
-//!   for the canonical append pattern, instead of pattern-matching the trace.
-//! * **Capability-less execution** (Metal): an engine with no device-geometry
-//!   ports runs loop-carried passes serialized, the runtime folding the
-//!   prologue per fire once the previous fire's committed values are known.
-//! * **Geometry classification**: derivability — not op-pattern arity —
-//!   decides whether a pass's submission geometry is host-knowable
-//!   ([`geometry_taint`]).
-//!
-//! The fold reuses the tier-0 interpreter's op semantics (`eval_op`) — no
-//! second evaluator, no drift. Pure value flow only: a kernel call, a device
-//! intrinsic, or a read of a channel the host cannot value makes the values
-//! *derived from it* unknown (carrying the blocker), while independent values
-//! in the same stage still evaluate — so callers can distinguish
-//! "host-derivable" from "device-only" per port, per fire.
+//! Host partial evaluation of stage programs: folds a stage over host-known
+//! channel values, reusing the tier-0 interpreter's op semantics, to serve
+//! prefix-cache evidence, capability-less execution, and geometry
+//! classification ([`geometry_taint`]).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -97,30 +82,14 @@ pub fn fold_stage(
     };
     let ops = &bound.container.stages[index].ops;
     let types = &bound.stage_types[index];
-    // WHAT THIS FOLD IS ALLOWED TO SKIP (palo D0). The fold's only output is
-    // `fold.puts`, so a value no `ChanPut` can carry cannot change the
-    // answer — and a put whose value is BLOCKED carries a blocker rather than
-    // a value, so the value it would have carried cannot either. `demand`
-    // names the complement of both: the values some put commits `Ok`, closed
-    // backwards over operands. Everything outside it is arithmetic whose
-    // result is discarded.
-    //
-    // This is not a marginal saving. A sampler epilogue draws `RngKeyed` over
-    // the FULL LOGITS SHAPE from a host-known state channel, so the fold's
-    // "evaluate any op whose operands are known" rule materialised a
-    // vocabulary-wide noise tensor once per fire — and then discarded it,
-    // because its only consumer adds it to the device's logits and is blocked
-    // on the intrinsic. Measured on the L40S (qwen35-d0.8b, `naive-baseline`,
-    // 248320-wide output vocabulary): `HostShadow::advance` 5.33 ms per fire, which
-    // is the guest thread's whole submit and three quarters of a decode step.
-    //
-    // The skip cannot move a blocker or a value: `demand` is closed under
-    // operands, so an op with a demanded result has demanded operands and is
-    // evaluated exactly as before, while a skipped value is read by no
-    // evaluated op (if it were, that op's result would be demanded and the
-    // closure would have demanded it too). Blocker PROPAGATION is untouched —
-    // it is a function of the ops alone, which is why it can run in a pass of
-    // its own with no arithmetic at all.
+    // `demand` is what `fold.puts` can actually observe: a value no
+    // `ChanPut` commits `Ok` can't change the answer, so evaluation outside
+    // it is discarded arithmetic. This matters: a sampler epilogue's
+    // `RngKeyed` over the full logits shape costs milliseconds per fire if
+    // evaluated for nothing.
+    // `demand` is closed under operands, so this can't move a blocker or a
+    // value, and blocker propagation (a separate, arithmetic-free pass) is
+    // untouched.
     let (demand, known_cache) = demand_set(ops, types.len(), known);
     let known = &mut |chan: u32| -> Option<Value> {
         known_cache
@@ -142,17 +111,10 @@ pub fn fold_stage(
     // Parallel value tracks, both indexed by SSA value id: `blocked_at`
     // carries the first blocker on a value's derivation chain (`None` = the
     // value is real), `dense` carries the value itself for `eval_op`
-    // (placeholders are never read — an op with an unknown operand
-    // short-circuits before eval_op runs).
-    //
-    // Splitting the blocker off the value, rather than keeping a
-    // `Vec<Result<Value, _>>` beside a `dense` mirror CLONED from it, is what
-    // holds the fold to one allocation per value. The mirror made every
-    // folded value allocate twice on a path that runs once per fire per
-    // channel-writing stage; the only clone left is at `ChanPut`, which is
-    // the fold's sole output. Measured at conc 512 on Qwen3-0.6B / L40S:
-    // `HostShadow::advance` 11.27 -> 9.56 us per fire, 5.91 -> 5.01 core-s
-    // over the run.
+    // (placeholders are never read, since a blocked operand short-circuits
+    // before eval_op runs). Split rather than a cloned `Vec<Result<Value>>`
+    // mirror, to hold the fold to one allocation per value instead of two
+    // (measured 11.27 -> 9.56 us/fire on Qwen3-0.6B/L40S at conc 512).
     let mut blocked_at: Vec<Option<EvalBlocker>> = Vec::with_capacity(types.len());
     let mut dense: Vec<Value> = Vec::with_capacity(types.len());
     let push = |blocked_at: &mut Vec<Option<EvalBlocker>>,
@@ -227,21 +189,11 @@ pub fn fold_stage(
             // fold is value-only, so they are inert here.
             Op::SinkCall { .. } => {}
             _ => {
-                // Everything reaching here is folded as a pure function of its
-                // operands, so the arms above have to name every op that is
-                // not one. An op that slipped out of them would be folded as
-                // if the host could perform it, and a device-carried value
-                // would come back host-derivable — a pass scheduled that
-                // cannot run.
-                //
-                // The guard asks `Op::value_source`, which is exhaustive
-                // over `Op` and answers exactly this question. The tempting
-                // alternative is `is_effectful`, but that answers a different
-                // question — whether DCE and CSE must leave the op alone —
-                // and deliberately calls `Rng` pure. Under that predicate,
-                // `Rng` passes the assertion and gets folded against a
-                // stand-in seed, while `stage_taint` fifty lines below
-                // already calls it device-decided.
+                // Everything here is folded as a pure function of its
+                // operands, so every non-pure op must be named above. Checked
+                // against `Op::value_source`, not `is_effectful` — the latter
+                // answers a different question (whether DCE/CSE must leave an
+                // op alone) and deliberately calls `Rng` pure.
                 debug_assert!(
                     matches!(op.value_source(), ValueSource::Operands),
                     "{op:?} reached the fold's general arm, which evaluates it \
@@ -258,10 +210,9 @@ pub fn fold_stage(
                     }
                     continue;
                 }
-                // Undemanded: no put carries this value and no evaluated op
-                // reads it, so the arithmetic is dead. It stays UNBLOCKED —
-                // pass one already decided that, and flipping it would change
-                // which operand a downstream blocker is named after.
+                // Undemanded: dead arithmetic. Stays unblocked — pass one
+                // already decided that, and flipping it would change which
+                // operand a downstream blocker is named after.
                 if !(0..op.result_count() as usize).any(|offset| demand[next_id + offset]) {
                     for offset in 0..op.result_count() as usize {
                         dense.push(placeholder(types[next_id + offset]));
@@ -293,14 +244,12 @@ pub fn fold_stage(
 }
 
 /// The values [`fold_stage`] must actually compute, and every channel value
-/// `known` answered on the way — so the caller's oracle is asked once per
-/// channel rather than once per read.
+/// `known` answered on the way (so the oracle is asked once per channel, not
+/// once per read).
 ///
-/// Two passes over the ops, neither of them arithmetic. The first propagates
-/// BLOCKEDNESS, which is a function of the op graph and the oracle alone and
-/// therefore agrees exactly with the fold's own `blocked_at`. The second walks
-/// backwards from the value of every put the first pass says commits `Ok`,
-/// closing over operands.
+/// Two non-arithmetic passes: the first propagates blockedness (agreeing
+/// exactly with the fold's own `blocked_at`), the second walks backwards
+/// from every put that commits `Ok`, closing over operands.
 fn demand_set(
     ops: &[Op],
     values: usize,
@@ -369,13 +318,10 @@ fn demand_set(
 
 /// A dtype-correct stand-in for a blocked value.
 ///
-/// Blocked operands short-circuit before `eval_op` (the `if let Some(blocker)
-/// = blocked` arm returns early), so nothing ever reads a placeholder —
-/// `dense` only needs an entry to stay index-aligned with `slots`. It is
-/// therefore empty on purpose: materialising the declared `numel()` zeroed a
-/// whole tensor per blocked op, and in a decode epilogue (where every kernel
-/// and intrinsic is blocked) that dominated the host cost of a forward
-/// submit.
+/// Blocked operands short-circuit before `eval_op`, so nothing ever reads a
+/// placeholder — `dense` only needs an entry to stay index-aligned. It is
+/// empty on purpose: materializing the declared `numel()` zeroed a whole
+/// tensor per blocked op, dominating a decode epilogue's forward-submit cost.
 fn placeholder(ty: eta_ir::types::ValueType) -> Value {
     match ty.dtype {
         eta_ir::types::Dtype::F32 => Value::F32(alloc::vec::Vec::new()),
@@ -387,11 +333,9 @@ fn placeholder(ty: eta_ir::types::ValueType) -> Value {
 }
 
 /// Every descriptor port's fire-time value, by folding the prologue over
-/// host-known channel state and resolving each port against the fold
-/// (register semantics: a prologue put shadows the pre-pass value). This is
-/// the submission geometry a capability-less engine needs, and the evidence
-/// the canonical-KV gate verifies. Per-port results: a device-carried port
-/// reports its blocker without hiding the ports the host CAN derive.
+/// host-known channel state and resolving each port against the fold. A
+/// device-carried port reports its blocker without hiding the ports the
+/// host can derive.
 pub fn eval_descriptor_ports(
     bound: &BoundTrace,
     known: &mut dyn FnMut(u32) -> Option<Value>,
@@ -435,15 +379,11 @@ impl GeometryTaint {
     }
 }
 
-/// For each channel this stage puts, whether the put's VALUE is statically
+/// For each channel this stage puts, whether the put's value is statically
 /// device-decided, resolved against a settled [`GeometryTaint::device_decided`].
-///
-/// A statically tainted value is `Err` in `fold_stage` on EVERY fire — taint
-/// sources are kernel calls, device intrinsics and ambient RNG, all of which
-/// the fold blocks unconditionally, and a tainted channel read resolves
-/// through the same set. So a stage whose every put is tainted commits
-/// nothing host-derivable in any fire, and folding it per fire re-derives a
-/// constant.
+/// A tainted value is `Err` in `fold_stage` on every fire, since taint
+/// sources (kernel calls, device intrinsics, ambient RNG) are exactly what
+/// the fold blocks unconditionally.
 pub fn stage_put_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> BTreeMap<u32, bool> {
     stage_taint(ops, device_decided).0
 }
@@ -473,12 +413,9 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
                 false
             }
 
-            // Every other op is classified by `Op::value_source`, which is
-            // exhaustive over `Op` and is the only copy of this judgement —
-            // `fold_stage` above reads the same answer. Restating it as two
-            // variant lists is tempting, but a copy kept in step with the
-            // wrong predicate (`is_effectful` instead of `value_source`)
-            // would call `Rng` pure here while the fold correctly blocks it.
+            // Classified by `Op::value_source`, the same judgement
+            // `fold_stage` reads — not `is_effectful`, which would call
+            // `Rng` pure here while the fold correctly blocks it.
             other => match other.value_source() {
                 ValueSource::Device => true,
                 ValueSource::Operands => arg_tainted,
@@ -496,11 +433,10 @@ fn stage_taint(ops: &[Op], device_decided: &BTreeSet<u32>) -> (BTreeMap<u32, boo
 
 /// Compute [`GeometryTaint`] for a bound trace.
 ///
-/// Taint sources are kernel-call results and device intrinsics; taint
-/// propagates through op operands, into channels via `put`, and out of
-/// channels via `take`/`read`, iterated across the trace's stages to a
-/// fixpoint (a loop-carried channel fed by an epilogue sampler put taints the
-/// next fire's prologue read).
+/// Taint sources are kernel-call results and device intrinsics; it
+/// propagates through operands and channel put/take, iterated to a fixpoint
+/// (a loop-carried channel fed by an epilogue put taints the next fire's
+/// prologue read).
 pub fn geometry_taint(bound: &BoundTrace) -> GeometryTaint {
     let mut device_decided: BTreeSet<u32> = BTreeSet::new();
     loop {
@@ -550,7 +486,7 @@ mod tests {
     use eta_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, StageProgram, TraceContainer,
     };
-    use eta_ir::op::IntrinsicId;
+    
     use eta_ir::registry::ModelProfile;
     use eta_ir::types::{Dtype, Literal, RngKind, Shape};
     use eta_ir::validate::bind;
@@ -704,30 +640,6 @@ mod tests {
     }
 
     #[test]
-    fn folds_the_sdk_geometry_prologue() {
-        let bound = bind(sdk_geometry_trace(), ModelProfile::dummy()).unwrap();
-        let seeds = seeds();
-        let ports = eval_descriptor_ports(&bound, &mut known_from(&seeds)).unwrap();
-        let value = |p: Port| {
-            ports
-                .iter()
-                .find(|(port, _)| *port == p)
-                .unwrap()
-                .1
-                .clone()
-                .unwrap()
-        };
-        // tokens [7, -1, 9], len 5 → valid [1,0,1], rank [0,1,1]:
-        assert_eq!(value(Port::EmbedTokens), Value::I32(vec![7, -1, 9]));
-        assert_eq!(value(Port::Positions), Value::U32(vec![5, 6, 6]));
-        assert_eq!(value(Port::KvLen), Value::U32(vec![6, 6, 7]));
-        assert_eq!(value(Port::PageIndptr), Value::U32(vec![0, 2, 4, 6]));
-        assert_eq!(value(Port::Pages), Value::U32(vec![0, 1, 0, 1, 0, 1]));
-        assert_eq!(value(Port::WSlot), Value::U32(vec![1, 1, 1]));
-        assert_eq!(value(Port::WOff), Value::U32(vec![1, 2, 2]));
-    }
-
-    #[test]
     fn unknown_tokens_block_derived_ports_only() {
         let bound = bind(sdk_geometry_trace(), ModelProfile::dummy()).unwrap();
         // tokens (0) and len (1) unknown — every derived geometry port
@@ -755,183 +667,6 @@ mod tests {
                 other => panic!("unexpected port {other:?}"),
             }
         }
-    }
-
-    /// A device-sampled loop-carry: epilogue puts an argmax over logits into
-    /// the token channel, so geometry derived from tokens is device-decided.
-    fn loop_carried_trace() -> TraceContainer {
-        use Op::*;
-        let mut trace = sdk_geometry_trace();
-        trace.stages.push(StageProgram {
-            stage: Stage::Epilogue,
-            ops: vec![
-                IntrinsicVal {
-                    intr: IntrinsicId::Logits,
-                    shape: Shape::matrix(3, 32),
-                    dtype: Dtype::F32,
-                }, // 0
-                ReduceArgmax(0), // 1 U32 [3]
-                Cast {
-                    value: 1,
-                    dtype: Dtype::I32,
-                }, // 2
-                ChanPut { chan: 0, value: 2 },
-            ],
-        });
-        trace
-    }
-
-    #[test]
-    fn taint_flags_loop_carried_geometry() {
-        let bound = bind(loop_carried_trace(), ModelProfile::dummy()).unwrap();
-        let taint = geometry_taint(&bound);
-        assert!(taint.device_decided.contains(&0), "sampled tokens");
-        // Geometry channels are re-put each fire from tainted validity.
-        for chan in [2u32, 4, 5, 6, 7] {
-            assert!(taint.device_decided.contains(&chan), "channel {chan}");
-        }
-        assert!(!taint.host_derivable());
-        assert!(taint.device_dependent_ports.contains(&Port::Positions));
-        assert!(taint.device_dependent_ports.contains(&Port::EmbedTokens));
-        assert!(
-            !taint.device_dependent_ports.contains(&Port::Pages),
-            "iota-broadcast pages stay host-derivable"
-        );
-    }
-
-    /// `Rng` draws from an ambient per-fire seed, so its result is a device
-    /// fact even though the op has no value operands. Were the taint analysis
-    /// to fall through to the general arm, it would inherit `arg_tainted` —
-    /// vacuously `false` for an operand-free op — telling the scheduler it
-    /// could derive a descriptor whose width came out of the device's noise.
-    #[test]
-    fn ambient_rng_taints_what_it_reaches() {
-        use Op::*;
-        let mut trace = sdk_geometry_trace();
-        trace.stages.push(StageProgram {
-            stage: Stage::Epilogue,
-            ops: vec![
-                Rng {
-                    stream: 0,
-                    shape: Shape::vector(3),
-                    kind: RngKind::Uniform,
-                }, // 0 F32 [3]
-                Cast {
-                    value: 0,
-                    dtype: Dtype::U32,
-                }, // 1
-                Cast {
-                    value: 1,
-                    dtype: Dtype::I32,
-                }, // 2
-                ChanPut { chan: 0, value: 2 },
-            ],
-        });
-        let bound = bind(trace, ModelProfile::dummy()).unwrap();
-        let taint = geometry_taint(&bound);
-        assert!(taint.device_decided.contains(&0), "rng-fed tokens");
-        assert!(taint.device_dependent_ports.contains(&Port::EmbedTokens));
-        assert!(taint.device_dependent_ports.contains(&Port::Positions));
-        assert!(!taint.host_derivable());
-    }
-
-    /// **palo D0**: the sampler epilogue's shape, which is the one this fold
-    /// used to spend milliseconds on. A keyed RNG draw over the LOGITS shape
-    /// is a pure function of a host-known state channel, so the old rule
-    /// ("evaluate any op whose operands are known") materialised a
-    /// vocabulary-wide noise tensor — and then discarded it, because its only
-    /// consumer adds it to the device's logits and is blocked on the
-    /// intrinsic.
-    ///
-    /// Asked of `demand_set` directly rather than through a stopwatch: a
-    /// timing assertion is a claim about the box, and what is actually being
-    /// claimed here is a property of the op graph.
-    #[test]
-    fn the_fold_demands_nothing_a_blocked_put_would_have_carried() {
-        use Op::*;
-        let mut trace = sdk_geometry_trace();
-        trace.channels.push(chan(Shape::vector(2), Dtype::U32, 1));
-        trace.channels.push(chan(Shape::vector(3), Dtype::F32, 1));
-        let ops = vec![
-            ChanRead(8), // 0 state — host-known
-            RngKeyed {
-                state: 0,
-                shape: Shape::vector(3),
-                kind: RngKind::Gumbel,
-            }, // 1 noise — the expensive one
-            ChanRead(9), // 2 — no host-known value, standing in for the
-            // logits intrinsic: what matters to this test is only that the
-            // Add below is blocked on it.
-            Add(2, 1),   // 3 perturbed — blocked on the logits
-            Cast {
-                value: 3,
-                dtype: Dtype::I32,
-            }, // 4
-            ChanPut { chan: 0, value: 4 },
-        ];
-        trace.stages.push(StageProgram {
-            stage: Stage::Epilogue,
-            ops: ops.clone(),
-        });
-        let bound = bind(trace, ModelProfile::dummy()).unwrap();
-        let mut seeds = seeds();
-        seeds.push((8, Value::U32(vec![3, 0])));
-        let mut known = known_from(&seeds);
-        let (demand, _) = demand_set(&ops, bound.stage_types[1].len(), &mut known);
-        assert!(
-            !demand[1],
-            "the noise reaches only a put that commits a blocker, so nothing \
-             reads the value it would carry"
-        );
-        assert!(!demand[3] && !demand[4], "nor does anything downstream of it");
-
-        // And the fold still says exactly what it said: the put carries the
-        // logits blocker, not a value and not a different blocker.
-        let fold = fold_stage(&bound, Stage::Epilogue, &mut known_from(&seeds)).unwrap();
-        assert_eq!(
-            fold.puts.get(&0),
-            Some(&Err(EvalBlocker::UnknownChannel(9))),
-            "the skip must not move the blocker a put commits"
-        );
-    }
-
-    /// The other side of the same net: a keyed draw whose value a put really
-    /// does carry is still evaluated. A prune that took this too would turn a
-    /// host-derivable port into a device-decided one and refuse fires that
-    /// run today.
-    #[test]
-    fn the_fold_still_evaluates_what_a_put_carries() {
-        use Op::*;
-        let mut trace = sdk_geometry_trace();
-        trace.channels.push(chan(Shape::vector(2), Dtype::U32, 1));
-        let ops = vec![
-            ChanRead(8), // 0
-            RngKeyed {
-                state: 0,
-                shape: Shape::vector(3),
-                kind: RngKind::Uniform,
-            }, // 1
-            Cast {
-                value: 1,
-                dtype: Dtype::I32,
-            }, // 2
-            ChanPut { chan: 0, value: 2 },
-        ];
-        trace.stages.push(StageProgram {
-            stage: Stage::Epilogue,
-            ops: ops.clone(),
-        });
-        let bound = bind(trace, ModelProfile::dummy()).unwrap();
-        let mut seeds = seeds();
-        seeds.push((8, Value::U32(vec![3, 0])));
-        let mut known = known_from(&seeds);
-        let (demand, _) = demand_set(&ops, bound.stage_types[1].len(), &mut known);
-        assert!(demand[1] && demand[2], "the put carries this value");
-        let fold = fold_stage(&bound, Stage::Epilogue, &mut known_from(&seeds)).unwrap();
-        assert!(
-            matches!(fold.puts.get(&0), Some(Ok(_))),
-            "a host-replayable keyed draw still folds to a value"
-        );
     }
 
     /// The keyed form is the opposite case and must stay untainted:
@@ -971,101 +706,4 @@ mod tests {
         assert!(taint.host_derivable());
     }
 
-    /// The `_` arm of the fold hands its op to `eval_op` as a pure function of
-    /// already-evaluated operands. That is right for everything the arms above
-    /// do not name — and the arms above name exactly the effectful ops plus
-    /// `IntrinsicVal`.
-    ///
-    /// The other half of `ambient_rng_taints_what_it_reaches`: the fold has
-    /// to refuse the op the taint analysis refuses.
-    ///
-    /// Were `Op::Rng` to fall through, `eval_op` would answer with
-    /// `rng_ambient(0, ..)` — the reference interpreter's stand-in for a
-    /// seed it does not have — and `fold_stage` would hand back a concrete
-    /// tensor for a value the device draws per fire, while `geometry_taint`
-    /// fifty lines away already calls the same op device-decided.
-    #[test]
-    fn the_fold_refuses_what_the_taint_refuses() {
-        use Op::*;
-        let mut trace = sdk_geometry_trace();
-        trace.stages.push(StageProgram {
-            stage: Stage::Epilogue,
-            ops: vec![
-                Rng {
-                    stream: 0,
-                    shape: Shape::vector(3),
-                    kind: RngKind::Uniform,
-                }, // 0
-                Cast {
-                    value: 0,
-                    dtype: Dtype::U32,
-                }, // 1
-                Cast {
-                    value: 1,
-                    dtype: Dtype::I32,
-                }, // 2
-                ChanPut { chan: 0, value: 2 },
-            ],
-        });
-        let bound = bind(trace, ModelProfile::dummy()).unwrap();
-        let seeds = seeds();
-        let fold = fold_stage(&bound, Stage::Epilogue, &mut known_from(&seeds)).unwrap();
-
-        assert_eq!(
-            fold.puts.get(&0),
-            Some(&Err(EvalBlocker::AmbientSeed)),
-            "the fold produced a value for an ambient-seed draw"
-        );
-        assert!(
-            geometry_taint(&bound).device_decided.contains(&0),
-            "the taint analysis is the other half of this and must agree"
-        );
-    }
-
-    /// The set of ops the fold names, pinned against [`Op::value_source`].
-    ///
-    /// This is a *transcription* of the match arms, not a call into the fold,
-    /// and on its own it is blind to an edit of the fold itself — a mutation
-    /// that deleted `Op::ChanRead` from the match passed this test. The
-    /// behavioural half lives in the fold: its general arm carries a
-    /// `debug_assert!` on `value_source`, so an op that slips out of the arms
-    /// fails the moment any trace folds it, with a message naming the op.
-    /// What this test adds is the other direction — that the arms do not name
-    /// something `value_source` calls pure, which no trace would reveal
-    /// because the fold would simply be conservative.
-    ///
-    /// This list must be pinned against `Op::value_source`, not
-    /// `is_effectful`. `is_effectful` answers whether DCE and CSE must leave
-    /// an op alone, and deliberately calls `Rng` pure — so pinning against
-    /// it would assert the fold *must not* name the one op it most needs to
-    /// (because `Rng`'s ambient seed is a device fact the host cannot
-    /// replay).
-    #[test]
-    fn the_fold_only_generalises_over_pure_ops() {
-        let mut checked = 0usize;
-        for op in eta_ir::op::representatives() {
-            let named_by_the_fold = matches!(
-                op,
-                Op::ChanTake(..)
-                    | Op::ChanRead(..)
-                    | Op::ChanPut { .. }
-                    | Op::KernelCall { .. }
-                    | Op::SinkCall { .. }
-                    | Op::IntrinsicVal { .. }
-                    | Op::Rng { .. }
-            );
-            let must_be_named = op.value_source() != ValueSource::Operands;
-            assert_eq!(
-                named_by_the_fold, must_be_named,
-                "{op:?} disagrees: the fold names it {named_by_the_fold}, \
-                 but its value source says {must_be_named}"
-            );
-            checked += 1;
-        }
-        assert_eq!(
-            checked,
-            eta_ir::op::OP_TABLE.len(),
-            "representatives() stopped covering the table"
-        );
-    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "runtime"
-version = "0.4.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Programmable Inference Engine (Pie)"
@@ -13,64 +13,17 @@ crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-# tart: the declared-forward toolchain, and OPTIONAL now.
-#
 engine = { path = "../engine" }
-# `engine` IS GONE FROM THIS MANIFEST ENTIRELY, and the two steps that emptied
-# it are worth keeping because each one was a smaller claim than it looked.
-#
-# First it became a dev-dependency: `runahead` was this crate's one library
-# reader and it lives in `engine` now — where a formula both sides of the
-# load boundary derive from belongs — so every remaining mention of the
-# substrate in `src/` was PROSE, and the one code reader was a test.
-#
-# Then that test went too. tests/cuda_program_epilogue.rs — unbackticked
-# because it is gone, which is this tree's convention for naming something a
-# reader cannot open — drove the guest-program plane's host interpreter
-# against the CUDA shell, which is a
-# claim about a SHELL and not about this crate: it reached past the pipeline it
-# nominally tested and used `runtime` only for the three load helpers
-# (`engine::load::{contract_for, request, classify}`). Its four siblings that
-# do exactly that — `cuda_kv_page_graft`, `cuda_row_selected_readout`,
-# `cuda_shared_device_ring`, `cuda_width_invariance` — live in `tests/gpu/`,
-# which is the workspace member for a test that depends on the runtime rather
-# than being one.
-#
-# The consequence is worth the line: `worker` no longer reaches the
-# model-execution substrate through this crate at all, in any profile.
 eta-ir = { path = "../eta-ir" }
-# The trace vocabulary this crate hands across the load boundary (`Trace`,
-# `Platform`, `ParamSource`). Named directly rather than through `engine`'s
-# re-export, which is gone: a crate that spells a type depends on the crate
-# that owns it.
 model-ir = { path = "../model-ir" }
 eta-compiler = { path = "../eta-compiler" }
-# THE CUTOVER, DONE. This was `engine-cuda-new` beside a C++ `engine-cuda`
-# that supplied the same thirteen `pie_cuda_*` symbols, so which archive
-# the seam linked was the whole switch and the boot reader was unchanged
-# either way. There is one now, and it has the name. (That reader was
-# `backend/cuda.rs`; it is `engine_cuda::boot` now.)
-# `default-features = false` drops the shell's `probe` feature — the gate-only
-# hooks (`Session::skew_prediction`) that exist to make the engine disagree
-# with itself on purpose. A serving binary has no business compiling one.
+# `default-features = false` drops the shell's `probe` feature: gate-only hooks
+# that make the engine disagree with itself on purpose. Not for a serving binary.
 engine-cuda = { path = "../engine-cuda", optional = true, default-features = false }
-# BACK AT P5, and only this one of the three. R3 cut the edge rather than
-# gating it, on the reading that "an optional path dependency is enough to drag
-# one back in: cargo adopts a path dep inside the workspace directory as a
-# member whatever its features say" -- which was right while `engine-metal` was
-# NOT a member. It is one now (see the root manifest's `members`), CI builds it
-# with `--features metal-4`, and it walks a `model_compiler::program::Program`
-# through a baker executor of its own. That was the stated P5 precondition, and
-# it is met; `engine-vulkan` and `engine-wgpu` are still waiting on theirs.
+# Declared twice — here portably, and again in the Apple target table below,
+# which is where the device half (`metal-4`) can be turned on. Naming `metal-4`
+# here would make `--features metal` a build error off Apple.
 engine-metal = { path = "../engine-metal", optional = true }
-# `metal-4` IS NOT LISTED THERE, and that is the whole shape of this feature.
-# It is the engine's DEVICE half, and that crate `compile_error!`s it off an
-# Apple target -- so naming it in the line above would make
-# `--features engine-metal` a build error everywhere else, rather than a build
-# with no metal seam in it. The target table below turns it on exactly where it
-# can exist; cargo unifies the two entries on Apple and applies only the first
-# anywhere else. See the seam's own `#[cfg(all(feature = .., target_vendor =
-# "apple"))]`, which is the same rule stated in the code.
 
 client = { path = "../client" }
 tokio = { version = "1.53", features = ["full"] }
@@ -86,21 +39,17 @@ tracing-appender = "0.2"
 tracing-opentelemetry = "0.33"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-# default-features off: the default set drags in the HTTP transports
-# (`http-proto` → prost/opentelemetry-http → a second reqwest client) which
-# `telemetry.rs` never reaches — it only ever calls `.with_tonic()`.
+# default-features off: the default set drags in the HTTP transports (and a
+# second reqwest client); `telemetry.rs` only ever calls `.with_tonic()`.
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "grpc-tonic",
     "trace",
     "metrics",
 ] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
-# default-features off, because wasmtime's default set is the *tooling*
-# build, not the embedder one: `wat`/`wit-parser` (text and WIT parsing we
-# never do — inferlets arrive as binary components), `cache` (module cache on
-# disk), `coredump`, `profiling`, `debug-builtins`, the three GC collectors,
-# `stack-switching` and `threads` (no guest uses them). Everything the runtime
-# actually reaches is listed here.
+# default-features off: wasmtime's default set is the tooling build (text/WIT
+# parsing, on-disk cache, coredump, profiling, GC). Inferlets arrive as binary
+# components, so everything the runtime reaches is listed explicitly.
 wasmtime = { version = "47.0.1", default-features = false, features = [
     "runtime",
     "std",
@@ -115,20 +64,18 @@ wasmtime = { version = "47.0.1", default-features = false, features = [
     "addr2line",
     "demangle",
 ] }
-# p1 off (it is a default): nothing here links preview1 — the runtime only ever
-# calls `p2::add_to_linker_async` and `p3::add_to_linker`, and p1 is what drags
-# in wiggle → witx → a second, ancient `wast`.
+# p1 off (a default): nothing links preview1, and it drags in wiggle → witx →
+# a second, ancient `wast`.
 wasmtime-wasi = { version = "47.0.1", default-features = false, features = ["p2", "p3"] }
-# `default-send-request` stays on (it is a default): it is what supplies the
-# blanket `WasiHttpHooks::send_request`, and its rustls is the ring build, not
-# aws-lc.
+# `default-send-request` stays on: it supplies the blanket
+# `WasiHttpHooks::send_request`, and its rustls is the ring build, not aws-lc.
 wasmtime-wasi-http = { version = "47.0.1", default-features = false, features = [
     "p2",
     "p3",
     "default-send-request",
 ] }
-# Names `http::uri::Scheme` for the wasi:http@0.3 network-policy hook
-# (ProcessCtx::PieHttpHooks); shared with wasmtime-wasi-http's http 1.x.
+# `http::uri::Scheme` for the wasi:http@0.3 network-policy hook; shares
+# wasmtime-wasi-http's http 1.x.
 http = "1"
 bytes = "1.12.1"
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
@@ -139,50 +86,19 @@ futures = "0.3.33"
 waker = { path = "../waker" }
 tokenizer = { path = "../tokenizer" }
 grammar = { path = "../grammar" }
-# What this runtime needs to know about the model it serves that is NOT its
-# forward pass. It used to be the whole of `model::serve`, a module this crate
-# and `worker` were the only consumers of. M18 deleted it, on the ruling that
-# `model` says what a model family IS, backend-blind, and a serving process's
-# questions are not family questions. Two of the four came back through doors
-# `model` still keeps, and they are all this edge carries now:
-#
-#   * the chat template a turn is written with -- `model::template::template_of`,
-#     keyed by the same SKU the engine reports having loaded;
-#   * the decoders that read the generated tokens back as chat, reasoning and
-#     tool events -- `model::template`, re-exported from `chat_template`.
-#
-# The other two RE-HOMED HERE, because a serving fabric is what asks them:
-# `(layers, vocab, arch)` per SKU and the shape an artifact's metadata arrives
-# in are `src/model.rs`, and host-side media decode is
-# `src/inferlet/host/media/multimodal.rs`.
+# The model catalog: chat templates keyed by SKU, and the decoders that read
+# generated tokens back as chat, reasoning and tool events.
 models = { path = "../models" }
-# THE RUNTIME TRACES, AND THE RUNTIME STATES THE LOAD CONTRACT (palo design §7,
-# decision 18). `model` above supplies the catalog and the per-SKU import; the
-# three edges below are what it takes to USE them at the boundary:
-#
-#   * `checkpoint` names `ModelContract`, the value `model::import_of`
-#     builds and `engine`'s `LoadRequest` deliberately has no seat for —
-#     the contract's dependency floor is `model-ir`/`eta-ir`/serde/thiserror,
-#     and a loader type in it would put the whole checkpoint plane in the graph
-#     of everyone who reads a `KvHandle`. So the shell takes it through a
-#     function pointer this crate installs (`engine::load`).
-#   * `ztensor` + `ztensor-compat` open the checkpoint the import is checked
-#     against — the same pair `checkpoint` itself takes, for the reason its
-#     manifest gives: `ztensor` owns the container format, `ztensor-compat`
-#     owns the foreign projections (a stock safetensors snapshot is one).
-#
-# `default-features = false` on the loader drops its testkit (oracle, contract
-# fixture builder, CPU executor); nothing here reaches them.
+# `checkpoint` names `ModelContract`, which this crate installs into the engine
+# shell through a function pointer (`engine::load`) so the checkpoint plane
+# stays out of every `KvHandle` reader's graph. `ztensor`/`ztensor-compat` open
+# the checkpoint it is checked against.
+# `default-features = false` drops the loader testkit (oracle, fixtures, CPU executor).
 checkpoint = { path = "../checkpoint", default-features = false }
+checkpoint-dsl = { path = "../checkpoint-dsl" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
-# THE CODEC (`inferlet::host::media::decode`): container decode and the lent
-# resample. It rode `model`'s `serve` feature while multimodal lived over
-# there -- a flag whose whole purpose was to keep image crates out of an
-# engine's link. The catalog now carries only the front-end ARITHMETIC
-# (`model::media` and the family modules), and this crate -- where every build
-# decodes media -- carries the codec, so the dependency is plain and the
-# catalog's own "every consumer needs every dependency" rule stands.
+# Host-side media decode: only the container formats the host accepts.
 image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
@@ -195,10 +111,9 @@ wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }
 wasmparser = "0.254.0"
 wasm-metadata = "0.254.0"
 libc = "0.2"
-# default-features off so reqwest's `default-tls` (native-tls → openssl) is
-# never pulled in: it dynamically links libssl.so.1.1, which doesn't exist on
-# OpenSSL-3 distros (Ubuntu 22.04+) and breaks the manylinux_2_28 release
-# binary. rustls is statically linked and distro-independent.
+# default-features off so `default-tls` (native-tls → openssl) is never pulled
+# in: it dynamically links libssl.so.1.1, which breaks the manylinux_2_28
+# release binary on OpenSSL-3 distros. rustls links statically.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 rustc-hash = "2.1"
@@ -206,89 +121,29 @@ smallvec = "1"
 lru = "0.18.1"
 ipnet = "2"
 
+# The Apple half of the `metal` feature; cargo unifies this with the portable
+# entry above on Apple targets and applies only that one elsewhere.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 engine-metal = { path = "../engine-metal", optional = true }
 
 [features]
 default = []
-# The CUDA shell. It used to share these symbols with a C++ archive of the
-# same name, and enabling both was a duplicate-symbol error -- the right
-# failure, since the seam must not be ambiguous about which engine it is
-# calling. Only one supplies them now.
-#
-# It needs a CUDA runtime ABI chosen, for the reason that crate's own
-# `compile_error!` gives: guessing wrong is a segfault inside the engine
-# rather than a build error.
-#
-# So the version is IN THE NAME, and there is no version-less `engine-cuda`
-# to select. This crate used to offer one, defined as `engine-cuda/cuda-13`,
-# and that is precisely the guess `engine-cuda` refuses to make: `pie` exposed
-# only the bare name, so `cuda-12` was unreachable from any binary while CI
-# shipped six `cuda12.8`-labelled artifacts built against the 13 ABI. Naming
-# the version is what makes forgetting it impossible -- Cargo answers a stale
-# `--features engine-cuda` with "the package does not contain this feature",
-# which is a better error than a segfault in `cudaGraphAddNode`.
-#
-# `_engine-cuda` is the private "the CUDA shell is linked" gate, the same
-# shape and the same underscore as `engine-cuda`'s own `_cuda`: every
-# `#[cfg]` in this crate is written against it, so the modules do not have to
-# name a version they do not care about.
-_engine-cuda = ["dep:engine-cuda"]
-# THE FORWARDS ARE BACK, and this is what they are for. `engine-cuda` builds
-# with no runtime selected and every device call answers `Fault::Runtimeless`
-# — deliberately, so its host tests run on a laptop — so a binary that names
-# `engine-cuda-13` here and nothing over there LINKS a shell that cannot bind
-# a device. They were dropped in the palo step-4 wave as dead refs, which they
-# were while nothing in this crate constructed a shell;
-# `engine::backend::open::cuda` constructs one now.
-engine-cuda-12 = ["_engine-cuda", "engine-cuda/cuda-12"]
-engine-cuda-13 = ["_engine-cuda", "engine-cuda/cuda-13"]
-# The Metal shell. There is no ABI to choose and so no version in the name:
-# `engine-metal` is TARGET-gated rather than feature-gated (Metal is the
-# platform, not a choice a machine makes), so the crate builds and host-tests
-# everywhere and its device half exists on Apple targets only. The flag alone
-# is therefore not a build that links a device, which is why every `#[cfg]`
-# reading it pairs it with `target_vendor = "apple"`, and why the dependency
-# is declared twice below -- once portably, once in the Apple target table.
-engine-metal = ["dep:engine-metal"]
-# Host-side performance probes. Each scenario is a separate flag so you
-# only pay for the probes you ask for — different domains have different
-# sample rates and different audiences. The `probe_<domain>!` macros in
-# `src/scheduler/probe.rs` expands to zero code when its feature is off.
-#
-# Adding a new domain: define it under `src/scheduler/probe.rs` (or an
-# `src/scheduler/probe/` submodule) with its probe-holder
-# struct + `probe_<domain>!` macro pair, then add a feature flag here.
+# The CUDA shell. `engine-cuda/cuda` must ride along: the shell builds with no
+# runtime selected (every device call answers `Fault::Runtimeless`), so naming
+# the dep alone links a shell that cannot bind a device. If a second CUDA ABI
+# ever returns, the version returns to the feature name — never a bare alias.
+cuda = ["dep:engine-cuda", "engine-cuda/cuda"]
+# The Metal shell. `engine-metal` is target-gated rather than feature-gated, so
+# this flag alone is not a build that links a device: every `#[cfg]` reading it
+# pairs it with `target_vendor = "apple"`.
+metal = ["dep:engine-metal"]
+# Host-side performance probes, one flag per domain so you pay only for what
+# you ask for; `probe_<domain>!` in `src/scheduler/probe.rs` expands to nothing
+# when its feature is off.
 profile-fire = []          # per-fire scheduler lifecycle (90×/sec at conc=256)
-# `profile-hot-path` and `profile-all` STOOD HERE, both defined as
-# `["profile-fire"]` -- three names for one domain, because `probe.rs` has
-# only ever had one. Neither carried a `#[cfg]` of its own and neither was
-# forwarded past `worker`, so no binary could select them and no code could
-# tell them apart. Bring them back when a SECOND domain makes a bundle mean
-# something; a bundle of one is a promise the catalog does not keep.
 
 [dev-dependencies]
 tempfile = "3"
-# The text-format parser, for tests only. The linker tests build their
-# fixtures as `(module ...)` source, which `Module::new` will only accept
-# with `wat` on; nothing in the runtime itself ever compiles text, so the
-# parser has no business in a shipped binary. Dev-dependencies are not built
-# for `cargo build`, which is exactly the line we want here.
+# `wat` for tests only: the linker tests build `(module ...)` fixtures from
+# text. The runtime itself never compiles text.
 wasmtime = { version = "47", default-features = false, features = ["wat"] }
-# `model-dsl` STOOD HERE, for the boot smoke and for nothing else: `Lane::word`
-# is the one genuinely new submission field, the catalog shipped
-# `(sku, tp, TraceFn)` and no `ClassifyFn`, and the only way to state a word
-# was to name a family's own `Facts` — which a test could do and the fire path
-# could not (`palo B-word`). The catalog has the column now. Both the fire path
-# and the smoke reach it through `model`, which re-exports the `Request` a
-# `ClassifyFn` takes, so nothing here authors a forward pass and nothing here
-# needs the authoring eDSL.
-# `criterion` and `mimalloc` STOOD HERE, for benchmarks: this crate has no
-# `benches/` directory and no `[[bench]]`, and neither name appears in a line
-# of its source. The mimalloc line carried the one fact worth keeping — a
-# bench of a runtime entry point has to link the allocator `worker` installs
-# or it measures glibc malloc — so bring both back together when a bench does.
-
-#[profile.release]
-#lto = "fat"
-#codegen-units = 1

@@ -122,14 +122,10 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         on: Resource<Pipeline>,
     ) -> Result<Result<Resource<RsWorkingSet>, String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        // No drain: RS mappings publish at prepare, in submission order, so
-        // the committed mapping already carries every fire submitted on `on`
-        // before this call. Fork therefore snapshots exactly the state the
-        // guest's submission order asks for, and the shared slot's CONTENTS
-        // are ordered by the stream — a later CoW copy is issued behind the
-        // fires that wrote the parent. `KvWorkingSet::fork` takes the same
-        // lock-only path for the same reason. The pipeline argument remains
-        // the scope and ordering declaration.
+        // no drain: RS mappings publish at prepare, in submission order, so
+        // the committed mapping already carries every fire submitted on
+        // `on` before this call; a later CoW copy is issued behind the
+        // fires that wrote the parent.
         let (failure, scope) = {
             let pipeline = self.ctx().table.get(&on)?;
             (pipeline.failure.clone(), pipeline.scope.clone())
@@ -152,9 +148,8 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         let forked = stores.rs.lock().unwrap().fork(ws.id);
         match forked {
             Ok(id) => {
-                // A distinct working-set id gets its OWN fresh lifecycle —
-                // never a clone of the parent's (see the KV working-set
-                // `fork`/`slice` for the identical rationale).
+                // a distinct working-set id gets its own fresh lifecycle,
+                // never a clone of the parent's.
                 let child = RsWorkingSet::new(ws.model, ws.engine, id, ws.geom);
                 self.register_rs_working_set(ws.model, ws.engine, id);
                 Ok(Ok(self.ctx().table.push(child)?))
@@ -165,10 +160,9 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
 
     async fn drop(&mut self, this: Resource<RsWorkingSet>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        // `release` performs the exact `release_working_set` /
-        // `retire_idle` sequence and marks the shared lifecycle done; `ws`'s
-        // own drop just below (and the fallback `RsLifecycle::drop` it would
-        // otherwise trigger) is then a no-op.
+        // `release` performs the `release_working_set`/`retire_idle`
+        // sequence and marks the shared lifecycle done, so `ws`'s own drop
+        // is a no-op.
         let ws = self.ctx().table.delete(this)?;
         self.unregister_rs_working_set(ws.model, ws.engine, ws.id);
         ws.release();

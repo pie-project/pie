@@ -1,6 +1,6 @@
 [package]
 name = "controller-api"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Controller control-plane RPC contract: the `Control` tarpc service plus its registry/liveness/routing data types, shared by the controller (server) and worker/gateway (clients)."

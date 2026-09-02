@@ -235,6 +235,12 @@ template <typename T>
 
 instantiate_rope_freqs(bfloat16, bfloat)
 
+// The tail rotation, with the two facts a layer may state beside its theta:
+// `sign` (-1 un-rotates: the MLA attention output whose latent was both key
+// and value) and a YaRN ramp (`yarn_factor > 1`: the frequency ramp of the
+// reference's `precompute_freqs`, `low`/`high` derived host-side over the
+// rotated width — pairs below `low` keep their frequency, pairs above `high`
+// are divided by the factor, and the band between interpolates).
 template <typename T>
 [[kernel]] void rope_neox_last_mb(
     device T* x                       [[buffer(0)]],
@@ -242,6 +248,10 @@ template <typename T>
     const constant float& base        [[buffer(2)]],
     const constant int& head_dim      [[buffer(3)]],
     const constant int& interleaved   [[buffer(4)]],
+    const constant float& sign        [[buffer(5)]],
+    const constant float& yarn_factor [[buffer(6)]],
+    const constant float& yarn_low    [[buffer(7)]],
+    const constant float& yarn_high   [[buffer(8)]],
     uint3 pos  [[thread_position_in_grid]],
     uint3 grid [[threads_per_grid]]) {
   const int i = int(pos.x);
@@ -253,8 +263,14 @@ template <typename T>
   const int offset = head_dim - rotary;
 
   const float d = 2.0f * static_cast<float>(i) / static_cast<float>(rotary);
-  const float inv_freq = exp2(-d * base);
-  const float theta = static_cast<float>(position[m]) * inv_freq;
+  float inv_freq = exp2(-d * base);
+  if (yarn_factor > 1.0f) {
+    const float span = max(yarn_high - yarn_low, 0.001f);
+    const float ramp = clamp((static_cast<float>(i) - yarn_low) / span, 0.0f, 1.0f);
+    const float smooth = 1.0f - ramp;
+    inv_freq = inv_freq / yarn_factor * (1.0f - smooth) + inv_freq * smooth;
+  }
+  const float theta = sign * static_cast<float>(position[m]) * inv_freq;
   const float costheta = fast::cos(theta);
   const float sintheta = fast::sin(theta);
 
@@ -271,7 +287,9 @@ template <typename T>
   template [[host_name("neox_last_mb_" #name)]]                  \
   [[kernel]] void rope_neox_last_mb<itype>(                      \
       device itype*, const device int*, const constant float&,   \
-      const constant int&, const constant int&, uint3, uint3);
+      const constant int&, const constant int&,                  \
+      const constant float&, const constant float&,              \
+      const constant float&, const constant float&, uint3, uint3);
 
 instantiate_rope_neox_last_mb(bfloat16, bfloat)
 

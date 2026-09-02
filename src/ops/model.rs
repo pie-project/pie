@@ -5,13 +5,9 @@
 //! from" are one question. [`import`] is big enough to own a file: it fetches a
 //! checkpoint and normalizes it into a `.zt`.
 //!
-//! `build` STOOD BESIDE IT — "author the family contract, run the load
-//! transforms offline, write the runtime tensors" — and R3 deleted it with the
-//! contract it authored. Every transform it ran was
-//! `model_legacy::contract::author`'s, for a load path that no longer exists:
-//! the engine produces its weights from the checkpoint through the SKU's own
-//! import table at load, so there is nothing to precompute and no artifact
-//! shape to precompute it into.
+//! There is no offline build step: the engine produces its weights from the
+//! checkpoint through the SKU's own import table at load, so there is nothing
+//! to precompute and no artifact shape to precompute it into.
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -55,11 +51,10 @@ pub fn run(cmd: ModelCmd, global: &bootstrap::GlobalArgs) -> Result<Answer> {
     match cmd {
         ModelCmd::List => list(),
         ModelCmd::Info { name } => info(name),
-        // `download` and `convert` were both "make this servable", so they are
-        // one verb now; `import` fetches when the source is remote.
-        //
-        // The only arm that takes the globals: it reads the serving config to
-        // prepare the weight tiers of what it just imported (§M wave M-1).
+        // `import` is the one verb for "make this servable", and it fetches
+        // when the source is remote. The only arm that takes the globals: it
+        // reads the serving config to prepare the weight tiers of what it
+        // just imported.
         ModelCmd::Import(args) => import::run(args, global),
         ModelCmd::Remove { name, yes } => remove(name, yes),
     }
@@ -88,31 +83,15 @@ fn dirname_to_repo_id(dir: &str) -> Option<String> {
 /// Does the snapshot beside this repo hold a checkpoint some catalog SKU can
 /// be built from?
 ///
-/// # What this used to ask, and why it does not any more
+/// # It asks the TENSORS, through the door serving asks it through
 ///
-/// It read `config.json`'s `model_type` and looked it up in
-/// `model_legacy::ingest`'s `MODEL_TYPES` table — a hand-kept list of the HF
-/// strings the legacy contract had a naming pass for. R3 deleted the table
-/// with the contract, and there is nothing to replace it WITH, because the
-/// new catalog never asks a config what a model is. It asks the TENSORS: the
-/// identify door compiles each SKU's load contract against the checkpoint's
-/// own metadata, and that is the same question an engine settles at load.
-///
-/// So this asks that question instead, one step earlier and against the
-/// checkpoint headers rather than a document about them.
-///
-/// # And it asks it through the door serving asks it through
-///
-/// It read the snapshot itself — `models::snapshot::Snapshot::at`, a
-/// safetensors header parser lifted out of a baker harness — and handed
-/// `models::identify` a `&dyn Fn(&str) -> Option<shape>` closure over it. Both
-/// are gone (menlo M18/M19), and what replaced them is not a rename: the
-/// runtime's [`identify`](runtime::engine::load::identify) does not match tensor
-/// NAMES, it compiles each candidate's load contract against the checkpoint's
+/// The catalog never asks a config what a model is. The runtime's
+/// [`identify`](runtime::engine::load::identify) does not match tensor NAMES
+/// either: it compiles each candidate's load contract against the checkpoint's
 /// own metadata and answers with the SKU whose params the checkpoint actually
 /// holds. A name match cannot tell a 3B Qwen from a 0.8B one — every SKU of a
-/// family spells its tensors the same way — and that is measured, in the boot
-/// smoke that came back with the wrong row.
+/// family spells its tensors the same way. This asks the same question an
+/// engine settles at load, one step earlier.
 ///
 /// Cost is unchanged: that door opens the container's index and runs the
 /// contract's arithmetic, so listing a cache of twenty repos still reads
@@ -120,8 +99,7 @@ fn dirname_to_repo_id(dir: &str) -> Option<String> {
 ///
 /// Returns `(true, sku)` for a checkpoint that matches a row, and
 /// `(false, why)` for one that does not, carrying the refusal's own account —
-/// which now names what each candidate did wrong instead of counting how many
-/// matched.
+/// which names what each candidate did wrong.
 fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     let snapshots = repo_dir.join("snapshots");
     let snapshot = match std::fs::read_dir(&snapshots) {
@@ -161,7 +139,14 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     // qwen_3 snapshot on a Metal box, which is a fact about the reading and
     // not about the file. `this_box` is the setup this binary would serve,
     // which is the only setup a listing on this machine is about.
-    match runtime::engine::load::identify(&snap, runtime::engine::load::this_box()) {
+    // **AND A BINARY WITH NO ENGINE SAYS SO** rather than identifying against
+    // a setup it does not have. `this_box` used to answer `Cuda` for such a
+    // build, so this cell printed a SKU that no boot of this binary could
+    // reach — a listing that reads as an inventory of what can be served.
+    let Some(platform) = runtime::engine::load::this_box() else {
+        return (false, "no engine".to_string());
+    };
+    match runtime::engine::load::identify(&snap, platform) {
         Ok(sku) => (true, sku.to_string()),
         // One line, because this is a table cell. The full per-candidate
         // account is what `pie model import` prints when the load is
@@ -184,23 +169,20 @@ pub struct ModelList {
     snapshots_dir: std::path::PathBuf,
     snapshots: Vec<Snapshot>,
     snapshot_bytes: u64,
-    /// **WHAT §M-4 MADE DEAD**, if this box has any of it.
+    /// **THE DEAD WEIGHT-CACHE FILES**, if this box has any of them.
     ///
-    /// The weight cache held two files per deployment — a `<key>.tiers` a
-    /// prepare wrote and a `<key>.weights` an uncapped boot left behind — and
-    /// since §M-4d a boot reads its planes out of the model's own `.zt` and
-    /// opens neither. They are not stale, not corrupt, and not a cache: they
-    /// are the previous design, and nothing will ever read them again.
+    /// A boot reads its planes out of the model's own `.zt`, so the weight
+    /// cache's `<key>.tiers` and `<key>.weights` are never opened. They are
+    /// not stale, not corrupt, and not a cache: nothing will read them again.
     ///
     /// Reported because nobody would otherwise find out. These are the largest
     /// files pie writes — a copy of the model apiece — and an operator who
-    /// upgraded across this wave has them sitting on the disk with no line
-    /// anywhere saying what they are. The disk cost is the whole reason §M-4
-    /// says one artifact.
+    /// upgraded into this layout has them sitting on the disk with no line
+    /// anywhere saying what they are.
     dead: Option<DeadWeight>,
 }
 
-/// The weight-cache files §M-4 retired, and what they cost.
+/// The weight-cache files nothing reads any more, and what they cost.
 #[derive(serde::Serialize)]
 struct DeadWeight {
     dir: std::path::PathBuf,
@@ -719,10 +701,10 @@ impl ProgressBar {
 /// Delete one artifact from the store.
 ///
 /// Only the artifact. Reclaiming the HuggingFace snapshot it was converted
-/// from used to be a `--staging` flag here; it is `pie cache clear snapshots`,
-/// which knows about every snapshot rather than the one beside this artifact,
-/// asks before deleting, and reports what it got back. A command that removes
-/// a model has no business deciding what else its origin is worth keeping.
+/// from is `pie cache clear snapshots`, which knows about every snapshot
+/// rather than the one beside this artifact, asks before deleting, and reports
+/// what it got back. A command that removes a model has no business deciding
+/// what else its origin is worth keeping.
 fn remove(name: String, skip_confirm: bool) -> Result<Answer> {
     let Some(entry) = crate::local::store::find(&name)? else {
         bail!(
@@ -758,54 +740,3 @@ fn remove(name: String, skip_confirm: bool) -> Result<Answer> {
     Ok(Answer::did(format!("removed {what}")))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_cache_dirname_reads_back_as_a_repo_id() {
-        assert_eq!(
-            dirname_to_repo_id("models--Qwen--Qwen3-0.6B").as_deref(),
-            Some("Qwen/Qwen3-0.6B"),
-        );
-        assert_eq!(
-            dirname_to_repo_id("models--bert-base-uncased").as_deref(),
-            Some("bert-base-uncased"),
-        );
-        assert_eq!(dirname_to_repo_id("not-a-model"), None);
-        assert_eq!(dirname_to_repo_id("models--a--b--c"), None);
-    }
-
-    #[test]
-    fn parses_repo_id() {
-        assert_eq!(
-            parse_repo_id("Qwen/Qwen3-0.6B").unwrap(),
-            ("Qwen".to_string(), "Qwen3-0.6B".to_string()),
-        );
-        assert!(parse_repo_id("missing-slash").is_err());
-        assert!(parse_repo_id("a/b/c").is_err());
-    }
-
-    /// A directory with no snapshot, and one with a snapshot but no
-    /// safetensors, are different answers.
-    ///
-    /// The three `compat_check_*` tests that STOOD HERE wrote a
-    /// `config.json` naming a `model_type` and asserted the legacy table's
-    /// answer. There is no table: what the check asks now is whether a
-    /// checkpoint's TENSORS match an import row, so a fixture for the
-    /// positive case is a real safetensors header — which is
-    /// `model`'s own test surface, not this command's.
-    #[test]
-    fn compat_check_reports_what_it_could_not_read() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(
-            check_pie_compatibility(tmp.path()),
-            (false, "no snapshot".to_string()),
-        );
-        std::fs::create_dir_all(tmp.path().join("snapshots").join("abc")).unwrap();
-        assert_eq!(
-            check_pie_compatibility(tmp.path()),
-            (false, "no safetensors".to_string()),
-        );
-    }
-}

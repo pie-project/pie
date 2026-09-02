@@ -78,14 +78,12 @@ fn normalize_sequence_element(
 ) -> ExprId {
     match grammar.get_expr(expr_id) {
         Expr::Choices(_) | Expr::Sequence(_) => {
-            // Extract to auxiliary rule
             let aux_name = format!("__aux_{}", builder.num_rules());
             let aux_rule = builder.add_rule(&aux_name);
             let normalized = normalize_expr(grammar, builder, expr_id);
             builder.set_rule_body(aux_rule, normalized);
             builder.add_rule_ref(aux_rule)
         }
-        // Leaves are fine as-is
         _ => normalize_expr(grammar, builder, expr_id),
     }
 }

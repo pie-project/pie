@@ -1,9 +1,8 @@
-//! The dense host programs: `cublasGemmEx`, the `cublasLtMatmul` plan cache,
-//! the per-WEIGHT family algorithm that makes a row's arithmetic independent
-//! of the fire's width, and the per-shape autotuner that races gemv, GemmEx
-//! and every Lt heuristic for the shapes no family covers, then remembers the
-//! winner in memory and on disk keyed by device and cuBLAS version. All of it
-//! is selection, so all of it lives below the entry (decision #13).
+//! Dense host programs: `cublasGemmEx`, the `cublasLtMatmul` plan cache, the
+//! per-weight family algorithm that makes a row's arithmetic independent of
+//! the fire's width, and the per-shape autotuner (gemv/GemmEx/Lt heuristics)
+//! for shapes no family covers, cached in memory and on disk by device and
+//! cuBLAS version.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -112,46 +111,35 @@ pub(crate) fn act_x_wt(
     let call = Call { act, w, y, m, n, k };
     let capturing = capture_status(stream);
 
-    // **THE SETTLE IS AN EAGER-ONLY ERRAND**, for the reason the tuner's is:
-    // [`settle_small`] blocks the host, and a host block inside a capture
-    // takes the capture with it. A captured first sighting leaves the family
-    // unsettled and the primary serving every width; the next eager fire
-    // settles it (decision #15's exception, same guard).
+    // The settle is eager-only: it blocks the host, which would take a
+    // capture down with it. A captured first sighting leaves the family
+    // unsettled; the next eager fire settles it.
     let eager = matches!(
         capturing,
         Some(cudaStreamCaptureStatus::cudaStreamCaptureStatusNone)
     );
     let (plan, tactic, lt_handle, want) = with_device(|device| {
         let plan = device.plan_for(call, stream, eager);
-        // **THE TUNER IS THE M-DEPENDENCE, SO A SHAPE WITH A FAMILY NEVER
-        // REACHES IT.** Racing tactics per `(m, n, k)` is exactly the thing
-        // this wave removed: the winner at eight rows and the winner at
-        // sixty-four are different kernels, and a lane that fired under each
-        // gets two different answers to one question. The bench stays for the
-        // shapes no family algorithm would take.
+        // The tuner races tactics per (m, n, k); a shape with a family
+        // algorithm never reaches it, since that would answer one lane
+        // differently depending on who else rode in the same fire.
         let tuned = plan.as_deref().is_none_or(|plan| plan.invariant.is_none());
         let tactic = capturing
             .filter(|_| tuned)
             .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status));
         (plan, tactic, device.lt.handle, device.lt.workspace_bytes)
     });
-    // **THE Lt WORKSPACE IS A SLAB, FOR THE REASON EVERY SLAB IS ONE.** It
-    // was one 64 MiB buffer per DEVICE, which two shells firing at once — and
-    // two arms of a P6 fork group — scribble over together while cuBLASLt
-    // reports success on both. `Ctx::scratch` keys it by `(arena, name,
-    // stream)` like the staging planes, so the sharing ends where the streams
-    // do. Absent is not fatal: Lt takes a null workspace at zero bytes, and
-    // the tactic ladder below has three rungs that need none at all.
+    // The Lt workspace is a per-(arena, name, stream) slab, not a
+    // per-device buffer: two concurrent matmuls sharing one workspace would
+    // silently corrupt each other. Absent is not fatal — Lt takes a null
+    // workspace at zero bytes.
     let (ws, ws_bytes) = match ctx.scratch(op, LT_WORKSPACE, want) {
         Ok(ws) if !ws.is_null() => (ws, want),
         _ => (std::ptr::null_mut(), 0),
     };
-    // **THE BATCH-INVARIANT RUNG, ABOVE EVERY OTHER.** The weight's own
-    // algorithm, walking the contraction unsplit, whatever this fire's row
-    // count turned out to be — which is what makes a lane's logits its own.
-    // Up to the family's measured ceiling that may be its SECOND algorithm;
-    // it is there only because it was shown to land the first one's bits, so
-    // this sentence is as true of a narrow fire as of a wide one.
+    // The batch-invariant rung, above every other: the weight's own
+    // algorithm, walking the contraction unsplit regardless of this fire's
+    // row count, so a lane's logits depend only on the lane.
     if let Some(plan) = plan.as_deref()
         && let Some((algo, needs)) = plan.invariant
         && ws_bytes >= needs
@@ -297,14 +285,9 @@ fn gemm_ex(handle: cublasHandle_t, call: Call, algo: cublasGemmAlgo_t) -> cublas
 /// other scratch entry uses.
 const LT_WORKSPACE: &str = "linear.lt_workspace";
 
-/// The Lt handle, created on first use, and the workspace byte count — the
-/// single source the heuristic preference, the tuner's bench and the fire
-/// path's slab all read.
-///
-/// **THE BUFFER ITSELF IS NOT HERE ANY MORE.** It was a `cudaMalloc` per
-/// device, shared by every stream in the process; it is a per-`(arena,
-/// stream)` slab now (`act_x_wt` takes it), because a workspace two
-/// concurrent matmuls write is a wrong answer neither of them reports.
+/// The Lt handle (created on first use) and the workspace byte count — the
+/// single source the heuristic preference, tuner and fire path all read. The
+/// buffer itself lives in a per-`(arena, stream)` slab, not here.
 struct LtCtx {
     handle: lt::cublasLtHandle_t,
     workspace_bytes: usize,
@@ -332,21 +315,10 @@ struct LtPlan {
     b_desc: lt::cublasLtMatrixLayout_t,
     c_desc: lt::cublasLtMatrixLayout_t,
     heuristics: Vec<lt::cublasLtMatmulHeuristicResult_t>,
-    /// **THE WEIGHT'S ALGORITHM, ACCEPTED FOR THIS M**, and the workspace it
-    /// asked for — the one rung that makes a lane's row a function of the lane
-    /// and not of the fire it rode in. `None` is a shape whose family had
-    /// nothing this M would take, and the caller walks the ladder below it.
-    ///
-    /// It is [`Family::small`] when this M is at or below that algorithm's
-    /// measured ceiling, and [`Family::algos`]' first acceptance otherwise —
-    /// a distinction with no numerical content, which is the only reason it is
-    /// allowed to be a distinction at all (see [`Family`]).
-    ///
-    /// **THE BYTES ARE CARRIED SO THE RUNG IS TAKEN OR SKIPPED BEFORE THE
-    /// CALL, NEVER FAILED INSIDE ONE.** The Lt workspace is a per-stream slab
-    /// and a stream that could not get one runs at zero bytes; a `cublasLtMatmul`
-    /// that refuses for want of scratch is an error raised inside a graph
-    /// capture, which takes the whole capture with it.
+    /// The weight's algorithm accepted for this M, and the workspace it
+    /// needs. `None` means the family had nothing this M would take, and the
+    /// caller walks the ladder below it. Bytes are carried so the rung is
+    /// taken or skipped before the call, never failed inside a graph capture.
     invariant: Option<(lt::cublasLtMatmulAlgo_t, usize)>,
 }
 
@@ -373,7 +345,7 @@ impl Drop for LtPlan {
     }
 }
 
-/// How many heuristics a plan keeps by default — the ladder's last rungs and
+/// How many heuristics a plan keeps by default: the ladder's last rungs, and
 /// the tuner's `Tactic::Lt` indices, which the disk cache spells by position.
 const HEURISTICS: usize = 8;
 
@@ -388,13 +360,9 @@ fn build_lt_plan(
 }
 
 /// The same plan, asking Lt for `wanted` heuristics rather than [`HEURISTICS`].
-///
-/// **THE EXTRA ONES ARE FOR THE SETTLE, NOT FOR THE LADDER.** The pool
-/// [`settle_small`] races is Lt's own estimate at eight rows, and its estimate
-/// is an ORDER, not a measurement: the algorithm that actually wins a decode
-/// projection on this device sat at position eleven in two of this SKU's seven
-/// families. The ladder and the tuner keep the first eight, because the disk
-/// cache spells a tactic by its position in that list.
+/// The extra ones are for [`settle_small`]'s race, not the ladder: Lt's
+/// estimated order is not a measurement, so the actual winner can sit well
+/// past [`HEURISTICS`].
 fn build_lt_plan_wide(
     lt_handle: lt::cublasLtHandle_t,
     workspace_bytes: usize,
@@ -532,45 +500,17 @@ fn build_lt_plan_wide(
 
 // ─── the batch-invariant rung ───────────────────────────────────────────────
 
-/// **THE ROW COUNT EVERY SHAPE FAMILY'S ALGORITHM IS CHOSEN AT.**
-///
-/// A family is a `(n, k)` pair — the WEIGHT, which is a checkpoint constant —
-/// and its algorithm is picked once, at this M. The number itself is a
-/// performance choice and not a correctness one: whatever it is, the algorithm
-/// chosen there is the same for a lane alone and for the same lane in a crowd,
-/// which is the whole property.
-///
-/// **IT IS LARGE ON PURPOSE.** A tile chosen for a wide fire and used on a
-/// narrow one wastes arithmetic; a tile chosen for a narrow fire and used on a
-/// wide one re-reads the weights, and the weights are the bytes. A decode
-/// fire's projections are weight-bound (1.40 GiB of reads against eight rows
-/// of activation), so the wasted lanes of a 128-row tile ride reads that were
-/// happening anyway, and the converse does not hold.
-///
-/// **AND SOME OF THAT WASTE IS PAID BACK, WITHOUT SPENDING THE PROPERTY.**
-/// The argument above says a wide tile on a narrow fire is CHEAP, not that it
-/// is free: measured on an L40S over this catalog's qwen35-d0.8b, the pinned
-/// algorithm cost 2.50 ms of a token step's projections against 2.27 ms for
-/// the best split-free algorithm at eight rows. What buys that back is
-/// [`Family::small`] — a second algorithm below this threshold, admitted only
-/// after it is shown to land the FIRST one's bits on this device. Where it
-/// stops serving is NOT this number: it is measured per weight over
-/// [`SMALL_RUNGS`], because "fastest at eight rows" turned out to say nothing
-/// at all about sixty-four.
+/// The row count every shape family's `(n, k)` algorithm is chosen at; a
+/// performance choice, not a correctness one. Set large: a wide tile reused
+/// on a narrow (weight-bound) fire wastes little, but the converse re-reads
+/// weights.
 const FAMILY_ROWS: i32 = 128;
 
 /// The algorithms a `(n, k)` family offers, in Lt's own estimated order, each
-/// pinned to a split-free K walk.
-///
-/// **SPLIT-K IS THE WHOLE MECHANISM AND THIS IS WHERE IT DIES.** cuBLASLt's
-/// shape→algorithm heuristic reads M, and on small M it buys parallelism by
-/// cutting the contraction into pieces and summing the pieces afterwards. Two
-/// fires that differ only in how many OTHER lanes rode along then walk K in
-/// different orders, and a bf16 accumulation in a different order is different
-/// numbers — 2-4 ulp per projection, compounding through 28 layers into a
-/// greedy tie that flips. `CUBLASLT_ALGO_CONFIG_SPLITK_NUM = 1` with
-/// `CUBLASLT_REDUCTION_SCHEME_NONE` says: one CTA owns each output element and
-/// walks the whole contraction itself, in the order its tile fixes.
+/// pinned to a split-free K walk: at small M, Lt's heuristic may split the
+/// contraction across CTAs for parallelism, and a differently-split walk sums
+/// bf16 in a different order (different bits). Pinning
+/// `CUBLASLT_ALGO_CONFIG_SPLITK_NUM = 1` makes one CTA own the whole walk.
 fn family_algos(
     lt_handle: lt::cublasLtHandle_t,
     workspace_bytes: usize,
@@ -593,8 +533,8 @@ fn family_algos(
 fn split_free(mut algo: lt::cublasLtMatmulAlgo_t) -> lt::cublasLtMatmulAlgo_t {
     let splits: i32 = 1;
     let scheme = lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_NONE as u32;
-    // A setter that refuses is an algorithm with no such knob, which is an
-    // algorithm that never splits — the same promise, spelled by absence.
+    // A setter that refuses means the algorithm has no such knob, and so
+    // never splits anyway.
     let _ = unsafe {
         lt::cublasLtMatmulAlgoConfigSetAttribute(
             &raw mut algo,
@@ -614,13 +554,9 @@ fn split_free(mut algo: lt::cublasLtMatmulAlgo_t) -> lt::cublasLtMatmulAlgo_t {
     algo
 }
 
-/// The first family algorithm cuBLASLt accepts for THIS M, workspace and all.
-///
-/// A tile is a rectangle over `(m, n)` and cuBLASLt refuses one it cannot
-/// place, so the family's best is not always available at every M — the list
-/// is walked in Lt's own order and the first acceptance wins. `None` sends the
-/// caller down the untuned ladder, which is width-dependent again and says so
-/// in the log.
+/// The first family algorithm cuBLASLt accepts for this M and workspace. A
+/// tile is a rectangle over `(m, n)`, so the family's best is not always
+/// available at every M; `None` sends the caller down the untuned ladder.
 fn accepted(
     lt_handle: lt::cublasLtHandle_t,
     plan: &LtPlan,
@@ -650,75 +586,40 @@ fn accepted(
     None
 }
 
-/// **THE ROW COUNTS BELOW [`FAMILY_ROWS`] THAT A FIRE ACTUALLY LANDS ON.**
-///
-/// `engine_cuda::api::default_lattice` is the powers of two from
-/// `LATTICE_FLOOR` = 8 up to `max_tokens`, and `Ctx::opaque_rows` rounds every
-/// fire onto it — so a padded fire below the threshold is one of exactly these
-/// four widths and no other. They are the rungs [`settle_small`] measures the
-/// crossover at, because a width nobody fires is a width not worth timing.
-///
-/// **A DEPLOYMENT THAT STATES ITS OWN LATTICE GETS ITS OWN WIDTHS, AND THIS
-/// LIST STILL WORKS.** The ceiling that comes out of the measurement is a row
-/// COUNT, not an index, and the serving test is `m <= ceiling` — so a fire at
-/// forty rows on some other lattice is served by whichever algorithm won the
-/// rung at or below it, which is the conservative half of the pair.
+/// The row counts below [`FAMILY_ROWS`] that a padded fire actually lands
+/// on (the deployment's lattice, rounded); the rungs [`settle_small`]
+/// measures the crossover at. A fire on some other lattice is still served
+/// conservatively, since the ceiling is a row count and the test is `m <=
+/// ceiling`.
 const SMALL_RUNGS: [i32; 4] = [8, 16, 32, 64];
 
-/// The narrowest of [`SMALL_RUNGS`], where the candidate pool is raced.
-///
-/// Eight rows is the SMALLEST fire this tree ever hands cuBLASLt and every
-/// single-stream decode step is one, so a second algorithm that cannot win
-/// here has nothing to offer at any width — the family's own was chosen at a
-/// hundred and twenty-eight and only gets better as M climbs toward it.
+/// The narrowest of [`SMALL_RUNGS`], where the candidate pool is raced: the
+/// smallest fire this tree ever hands cuBLASLt, so a candidate that can't
+/// win here has nothing to offer at any width.
 const SMALL_ROWS: i32 = SMALL_RUNGS[0];
 
 /// One weight's algorithms: the family, and the second one that serves below
-/// [`FAMILY_ROWS`].
-///
-/// **THE SECOND ALGORITHM IS AN EMPIRICAL FACT ABOUT THIS DEVICE AND NOTHING
-/// ELSE.** No part of the cuBLASLt contract says two algorithms sum a
-/// contraction in the same order, and NVIDIA is free to break it in a driver
-/// update without telling anyone. What is true is checkable: an output
-/// element's K-order is set by its algorithm's K-SCHEDULE — instruction
-/// shape, K-tile, stage order — and not by its M-tiling, so two algorithms
-/// that differ only in how they cut the OUTPUT rows land the same bits. On
-/// this SKU's seven projection families every split-free candidate but one
-/// was bit-identical to the family's own, at every width from one row to a
-/// hundred and twenty-eight.
-///
-/// **SO THE CHECK IS THE CONTRACT.** [`settle_small`] runs both algorithms
-/// over this weight's real bytes before either serves a fire, and a candidate
-/// that differs in one bit is not admitted — with a receipt in the log rather
-/// than a silent demotion. A driver that changes its mind about any of this
-/// changes what the check answers, and the family falls back to one algorithm
-/// at every width, which is where it started.
+/// [`FAMILY_ROWS`]. cuBLASLt makes no contractual promise that two
+/// algorithms sum a contraction in the same order, so [`settle_small`]
+/// checks it empirically against this weight's real bytes and admits a
+/// candidate only if it lands identical bits; a driver change that breaks
+/// the assumption just falls the family back to one algorithm.
 struct Family {
-    /// The algorithms accepted at [`FAMILY_ROWS`], in Lt's own order — the
-    /// primary, and the only rung a fire at or above `FAMILY_ROWS` takes.
+    /// Algorithms accepted at [`FAMILY_ROWS`], in Lt's own order: the
+    /// primary, taken by every fire at or above `FAMILY_ROWS`.
     algos: Vec<lt::cublasLtMatmulAlgo_t>,
-    /// The algorithm that serves the narrow fires, and the LARGEST row count
-    /// it was measured to be faster at — it serves `m <= ceiling` and the
-    /// primary takes every width above. Bit-identical to the primary at every
-    /// rung it serves, or absent. See [`settle_small`].
+    /// The algorithm serving narrow fires (`m <= ceiling`), and that
+    /// ceiling; bit-identical to the primary at every rung it serves. See
+    /// [`settle_small`].
     small: Option<(lt::cublasLtMatmulAlgo_t, i32)>,
-    /// Whether the settle has run. `false` is a family whose first sighting
-    /// was a capturing fire, which cannot bench; the next eager one settles
-    /// it.
+    /// Whether the settle has run; `false` means the first sighting was a
+    /// capturing fire, which cannot bench.
     settled: bool,
 }
 
-/// A bf16 pattern with a spread of exponents, so the fp32 accumulation of `k`
-/// products is INEXACT.
-///
-/// **A CONSTANT FILL WOULD PASS THIS CHECK BLIND.** `TuneArena` memsets its
-/// synthetic operands to one repeated byte, which is right for a bench —
-/// timings do not read the values — and exactly wrong for an identity check:
-/// every product is then the same number, the partial sums are exact for the
-/// whole first stretch of the contraction, and two genuinely different K
-/// orders answer the same bits. Values that span seven binades cancel against
-/// each other, so a different order lands different low bits and the check has
-/// something to see.
+/// A bf16 pattern with a spread of exponents, so fp32 accumulation of `k`
+/// products is inexact — a constant fill would make every product identical
+/// and pass the identity check blind regardless of K order.
 fn inexact_bf16(len: usize) -> Vec<u16> {
     let mut state = 0x243f_6a88_85a3_08d3_u64;
     (0..len)
@@ -737,15 +638,11 @@ fn inexact_bf16(len: usize) -> Vec<u16> {
         .collect()
 }
 
-/// The second algorithm for this weight, or `None`.
-///
-/// Two questions, in this order, because the second is only worth asking of a
-/// candidate that answers the first: **does it land the primary's bits**, and
-/// **is it faster at [`SMALL_ROWS`]**. The reference is the primary's own
-/// output over the first `SMALL_ROWS` rows of a `FAMILY_ROWS` fire — the
-/// exact comparison the invariance claim is about, since those rows share
-/// their inputs with the narrow fire's and differ only in how many other rows
-/// rode along.
+/// The second algorithm for this weight, or `None`. A candidate must land
+/// the primary's bits AND be faster at [`SMALL_ROWS`]; the reference is the
+/// primary's own output over the first `SMALL_ROWS` rows of a `FAMILY_ROWS`
+/// fire, which share inputs with the narrow fire and differ only in how many
+/// other rows rode along.
 fn settle_small(
     lt: &LtCtx,
     caller_stream: *mut c_void,
@@ -758,9 +655,9 @@ fn settle_small(
         return None;
     }
     let workspace_bytes = lt.workspace_bytes;
-    // The candidate pool is Lt's estimate at eight rows, deeper than the
-    // ladder keeps, plus the family itself — the family's second and third
-    // entries are often the small-M winner, and cost nothing to try.
+    // Candidate pool: Lt's estimate at SMALL_ROWS (deeper than the ladder
+    // keeps) plus the family itself, whose second/third entries are often
+    // the small-M winner.
     let narrow = build_lt_plan_wide(lt.handle, workspace_bytes, SMALL_ROWS, n, k, 16)?;
     let wide = build_lt_plan(lt.handle, workspace_bytes, FAMILY_ROWS, n, k)?;
     let lone = build_lt_plan(lt.handle, workspace_bytes, 1, n, k)?;
@@ -782,8 +679,8 @@ fn settle_small(
     }
     let rows = (SMALL_ROWS as usize) * (n as usize);
     let reference = bench.rows(lt.handle, &wide, &primary_wide, w, rows)?;
-    // The rung as it stands must already agree with itself across widths, or
-    // there is nothing here for a second algorithm to be identical TO.
+    // The primary must already agree with itself across widths, or there is
+    // nothing for a second algorithm to be identical to.
     let anchor = primary[0]?;
     if bench.rows(lt.handle, &narrow, &anchor, w, rows)? != reference {
         tracing::warn!(
@@ -794,9 +691,8 @@ fn settle_small(
         );
         return None;
     }
-    // What the family costs at every rung as it stands. This is both the bar a
-    // candidate has to clear to serve a rung AND the price of every rung it
-    // does not, which is what makes the two comparable in one number below.
+    // What the family costs at every rung: the bar a candidate must clear to
+    // serve a rung, and the price of every rung it doesn't.
     let standing: Vec<Option<f32>> = ladder
         .iter()
         .zip(&primary)
@@ -804,11 +700,10 @@ fn settle_small(
         .collect();
     let bar = standing[0]?;
 
-    // **PASS ONE: WHO IS EVEN IN THE RACE.** Eight rows is where the pool is
-    // raced, because it is the narrowest width a fire lands on and the one a
-    // single-stream decode is. A candidate that cannot win here has nothing to
-    // offer at any rung — the family's own algorithm was chosen at a hundred
-    // and twenty-eight and only gets better as M climbs toward it.
+    // Pass one: who is even in the race, at SMALL_ROWS (the narrowest width
+    // a fire lands on). A candidate that can't win there has nothing to
+    // offer at any rung, since the primary only gets better as M climbs
+    // toward FAMILY_ROWS.
     let mut divergent = 0_u32;
     let mut survivors: Vec<(lt::cublasLtMatmulAlgo_t, f32)> = Vec::new();
     let mut fastest = bar;
@@ -831,8 +726,7 @@ fn settle_small(
         let Some(ms) = bench.time(lt.handle, &narrow, &candidate, w) else {
             continue;
         };
-        // Only a candidate that would actually be an improvement is worth
-        // running the identity check over — the check is the expensive half.
+        // Only an actual improvement is worth the (expensive) identity check.
         if ms >= fastest * 0.98 {
             continue;
         }
@@ -844,30 +738,14 @@ fn settle_small(
         survivors.push((candidate, ms));
     }
 
-    // **PASS TWO: WHERE IT STOPS BEING RIGHT, MEASURED.**
-    //
-    // A fixed ceiling was a bug, and this is the shape of it: the second
-    // algorithm was chosen at eight rows and then served every fire up to a
-    // hundred and twenty-seven, including the sixty-four-row decode wave a
-    // concurrency-64 deployment spends its whole steady state in. Two of this
-    // SKU's families pick a candidate that is 1.1x faster at eight rows and
-    // 3.2x SLOWER at sixty-four — `gdn.in_qkvz` measured 11.9 us against the
-    // family's 13.0 at eight, and 29.3 against 13.3 at sixty-four, eighteen
-    // times per token step. Throughput fell 8% while latency held, which is
-    // exactly what a decode-tuned choice serving a batched wave looks like.
-    //
-    // So the ceiling is measured, per family, at the widths a padded fire
-    // actually lands on: the candidate serves up to the LAST rung it is still
-    // winning at, walking up from eight and stopping at the first loss.
-    // Contiguous from the bottom on purpose — a candidate that loses at
-    // sixteen and wins again at sixty-four is a candidate whose curve nobody
-    // understands, and the rung between them would be served by the wrong one.
-    //
-    // The winner is then the candidate with the lowest TOTAL across the whole
-    // ladder, counting the family's own time for every rung it declined. That
-    // is what makes "fast at eight, hopeless at sixty-four" lose to "a little
-    // slower at eight and still winning at sixty-four" without anyone having
-    // to weight the two by hand.
+    // Pass two: the ceiling is measured, per family, at every rung a padded
+    // fire actually lands on. A fixed ceiling was a bug: a candidate can be
+    // faster at SMALL_ROWS and markedly slower by FAMILY_ROWS. The candidate
+    // serves up to the last rung it's still winning at, walking up from
+    // SMALL_ROWS and stopping at the first loss (contiguous from the bottom,
+    // so no rung is served by an algorithm whose curve isn't understood).
+    // The winner is the one with the lowest total across the whole ladder,
+    // counting the family's own time for every rung it declined.
     let mut best: Option<(lt::cublasLtMatmulAlgo_t, usize, f32)> = None;
     for (candidate, ms) in survivors {
         let mut top = 0_usize;
@@ -900,8 +778,7 @@ fn settle_small(
             top = rung;
             total += ours;
         }
-        // Every rung it declined costs the family's own time — which is what
-        // puts two candidates with different ceilings on one scale.
+        // Every declined rung costs the family's own time.
         total += standing[top + 1..]
             .iter()
             .filter_map(|rung| *rung)
@@ -922,12 +799,9 @@ fn settle_small(
     let (algo, top, _) = best?;
     let ceiling = SMALL_RUNGS[top];
 
-    // **THE BELT: ONE ROW BELOW THE RANGE, ONE RUNG ABOVE IT.** Every rung the
-    // second algorithm will actually serve was compared above, as it was
-    // admitted. These two were not: a single row, which is below the lattice
-    // floor and is where the gemv arm flip used to live, and the first width
-    // the family takes back — because a ceiling is a claim about a BOUNDARY,
-    // and a boundary neither side of which was checked is a guess.
+    // Belt: check one row below the range and the first rung the family
+    // takes back — a ceiling is a claim about a boundary, and a boundary
+    // neither side of which was checked is a guess.
     let overshoot: &LtPlan = if top + 1 < ladder.len() {
         ladder[top + 1]
     } else {
@@ -969,14 +843,10 @@ fn settle_small(
 }
 
 /// The settle's bench: a stream of its own, timing events, one synthetic
-/// activation block and one output block, all sized at [`FAMILY_ROWS`].
-///
-/// **THE WEIGHT IS NOT SYNTHETIC.** It is the caller's own `w`, which is a
-/// checkpoint constant already resident — so the identity check is over the
-/// bytes the deployment will actually contract, and the bench costs no copy
-/// of the largest operand. The `#15` exception applies here exactly as it
-/// does to [`TuneArena`]: this blocks the host, and only an eager fire
-/// reaches it.
+/// activation block and one output block, sized at [`FAMILY_ROWS`]. The
+/// weight itself is not synthetic — it's the caller's own resident `w`, so
+/// the identity check is over the bytes the deployment actually contracts.
+/// Blocks the host; only an eager fire reaches this.
 struct PairBench {
     stream: *mut c_void,
     start: cudaEvent_t,
@@ -985,9 +855,8 @@ struct PairBench {
     y: *mut c_void,
     workspace: *mut c_void,
     workspace_bytes: usize,
-    /// How many bf16 the identity check reads back: the first [`SMALL_ROWS`]
-    /// columns of the column-major result, which are its first `SMALL_ROWS`
-    /// ROWS and are contiguous.
+    /// bf16 count the identity check reads back: the first [`SMALL_ROWS`]
+    /// columns of the column-major result (contiguous).
     compared: usize,
     n: i32,
     k: i32,
@@ -1039,8 +908,7 @@ impl PairBench {
         let rows = FAMILY_ROWS as usize;
         let act_bytes = rows * (k as usize) * 2;
         let y_bytes = rows * (n as usize) * 2;
-        // The tuner's rule, for the tuner's reason: a synthetic output past
-        // 256 MiB is not worth the malloc.
+        // A synthetic output past this size is not worth the malloc.
         if y_bytes > 256 * 1024 * 1024 {
             return false;
         }
@@ -1098,8 +966,8 @@ impl PairBench {
         }
     }
 
-    /// One fire, and the first `count` bf16 of what it landed — which, in a
-    /// column-major `[n, m]` result, are its first `count / n` ROWS.
+    /// One fire, and the first `count` bf16 of what it landed (the first
+    /// `count / n` rows of the column-major `[n, m]` result).
     fn rows(
         &self,
         lt_handle: lt::cublasLtHandle_t,
@@ -1238,9 +1106,8 @@ fn run_lt(
 struct Device {
     lt: LtCtx,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
-    /// One algorithm list per WEIGHT — `(n, k)` — chosen once at
-    /// [`FAMILY_ROWS`] and reused at every M, plus the second algorithm that
-    /// serves below it. See [`family_algos`] and [`Family`].
+    /// One algorithm list per weight `(n, k)`, chosen at [`FAMILY_ROWS`] and
+    /// reused at every M, plus the second algorithm that serves below it.
     families: HashMap<(i32, i32), Arc<Family>>,
     chosen: HashMap<u64, Tactic>,
     seen: HashMap<u64, u32>,
@@ -1273,21 +1140,16 @@ impl Device {
         if !self.lt.ensure() {
             return None;
         }
-        // The family FIRST: a settle here evicts this weight's cached plans,
-        // so the lookup below must not have answered from one of them.
+        // Family first: a settle here evicts this weight's cached plans, so
+        // the lookup below must not have answered from one of them.
         let family = self.family_for(n, k, call.w, stream, eager);
         if let Some(plan) = self.plans.get(&(m, n, k)) {
             return Some(Arc::clone(plan));
         }
         let mut plan = build_lt_plan(self.lt.handle, self.lt.workspace_bytes, m, n, k)?;
-        // **THE THRESHOLD IS MEASURED, NOT ASSUMED.** Above the ceiling the
-        // family algorithm is the one that was measured to be right; at or
-        // below it, the second one is — and the two land the same bits, which
-        // is the only reason the split is allowed to exist at all. The
-        // ceiling itself is per weight and comes out of `settle_small`
-        // walking the row lattice: `FAMILY_ROWS` was the obvious boundary and
-        // it was the wrong one, because "fastest at eight rows" says nothing
-        // about sixty-four and two of this SKU's families are 3x slower there.
+        // Threshold is measured per weight (by `settle_small`), not assumed
+        // at FAMILY_ROWS: the two algorithms land the same bits, which is
+        // the only reason the split is allowed to exist.
         plan.invariant = family
             .small
             .filter(|(_, ceiling)| m <= *ceiling)
@@ -1385,13 +1247,12 @@ impl Device {
             self.chosen.insert(key, tactic);
             return Some(tactic);
         }
-        // The capture guard bounding the #15 exception (see [`TuneArena`]):
-        // a capturing stream never reaches the bench's host syncs — this
+        // A capturing stream never reaches the bench's host syncs: this
         // fire walks the ladder, and a later eager fire tunes the shape.
         if capturing != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone {
             return None;
         }
-        // A bench output past 256 MiB is not worth the synthetic malloc.
+        // A bench output past this size is not worth the synthetic malloc.
         if (call.m as usize) * (call.n as usize) * 2 > 256 * 1024 * 1024 {
             return None;
         }
@@ -1478,16 +1339,10 @@ fn tune(
 }
 
 /// The autotuner's private bench: a non-blocking stream of its own, timing
-/// events, and synthetic operands to race the tactics over.
-///
-/// **The #15 exception.** Dispatch is enqueue-only (decision #15) — except
-/// here. [`TuneArena::init`] and [`TuneArena::time`] block the host
-/// (`cudaStreamSynchronize`, `cudaEventSynchronize`): a tactic cannot be
-/// timed without waiting for it. The exception is capture-guarded — the
-/// `cudaStreamIsCapturing` check in [`Device::tactic_for`] turns a
-/// capturing fire away before the bench is ever built. The standing
-/// invariant: **a captured fire never tunes; an eager fire may block once
-/// per untuned shape** (the choice is then cached in memory and on disk).
+/// events, and synthetic operands to race the tactics over. `init`/`time`
+/// block the host, guarded by the `cudaStreamIsCapturing` check in
+/// [`Device::tactic_for`]: a captured fire never tunes, an eager fire may
+/// block once per untuned shape (then cached in memory and on disk).
 struct TuneArena {
     stream: *mut c_void,
     start: cudaEvent_t,
@@ -1599,7 +1454,7 @@ impl TuneArena {
     }
 
     /// Times one tactic on the bench: warmup fires, then the best of the
-    /// event-timed fires. Host-blocking between phases — the #15 exception.
+    /// event-timed fires. Blocks the host between phases.
     fn time(
         &self,
         tactic: Tactic,
@@ -1745,14 +1600,9 @@ impl DiskCache {
     }
 }
 
-/// The measured table, under the deployment's stated cache root.
-///
-/// **THE TWO `env::var` CALLS STOOD HERE** and resolved
-/// `$XDG_CACHE_HOME/pie/dense_gemm.txt`, else `$HOME/.cache/pie/dense_gemm.txt`
-/// — which is why `worker::state`'s claim to cover "GEMM autotuning results"
-/// under `$PIE_HOME/cache` was false. The root arrives through [`crate::disk`]
-/// now; `None` is a process that stated none, and the disk half is then off
-/// while the in-memory half still works.
+/// The measured table, under the deployment's stated cache root. `None` is a
+/// process that stated none: the disk half is off, the in-memory half still
+/// works.
 fn cache_path() -> Option<PathBuf> {
     Some(crate::disk::dir(crate::disk::GEMM_ALGOS)?.join("dense.txt"))
 }

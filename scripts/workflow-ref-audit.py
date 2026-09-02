@@ -29,7 +29,7 @@ This tree has now paid for that three times over, all in one branch:
   since the crate left it, and `--test shader_backends_agree` named a
   test target that is not in `crates/kernels/tests` at all.
 * `build.yml`'s `aarch64-macos-metal` release leg built
-  `-p pie --features engine-metal`, so an entire published artifact was
+  `-p pie --features metal`, so an entire published artifact was
   produced by a command that could not run.
 
 None of that was caught by anything. `scripts/ci-gate-audit.py` reads two

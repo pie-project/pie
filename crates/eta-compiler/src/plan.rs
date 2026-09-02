@@ -1,13 +1,8 @@
-//! # `eta-compiler` — ETA execution planning
-//!
-//! The backend-neutral middle end: given a bound trace, it normalizes each
-//! stage, derives its signature, classifies value domains, partitions the op
-//! DAG into generated / library / second-party regions, and lays out the
-//! lane-table ABI. Runtime extents stay symbolic, so one plan keyed by a
-//! [`StageSignature`] serves many batch shapes, and nothing is serialized.
-//! Entry points are infallible because [`eta_ir::validate::bind`] has
-//! already settled arity, SSA dominance, value-id range and stage ordering;
-//! invariants are `expect`s naming that check, never silent fallbacks.
+//! ETA execution planning: the backend-neutral middle end. Given a bound
+//! trace, normalizes each stage, derives its signature, classifies value
+//! domains, partitions the op DAG into regions, and lays out the lane-table
+//! ABI. Entry points are infallible since [`eta_ir::validate::bind`] has
+//! already settled arity, SSA dominance, value-id range and stage ordering.
 
 mod compile;
 pub mod lane_table;

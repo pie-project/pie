@@ -13,14 +13,11 @@ impl DispatchElementwise for Run<'_> {
 }
 
 impl Run<'_> {
-    /// The arms themselves, in `kernels-cuda`'s error vocabulary and not
-    /// the contract's — which is what keeps each one a plain tail call with
-    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
-    /// above that lifts the family, and says why it is a call and not a
-    /// `From` impl.
+    /// Dispatch arms, in `kernels-cuda`'s error vocabulary rather than the
+    /// contract's, so each arm is a plain tail call with a plain `?`.
     fn elementwise(&mut self, op: &Elementwise) -> Result<(), kernels_cuda::Error> {
         match op {
-            // ---- norm (anchor) ----
+            // norm (anchor)
             Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
                 self.ctx(),
                 self.tensor(*x),
@@ -75,20 +72,15 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*y),
             ),
-            // **THE CENTRED NORM** (multimodal §6.1). The one part of the
-            // towers' `nn.LayerNorm` that does not fold into the GEMM behind
-            // it; the scale and the bias do, at import.
+            // The one part of nn.LayerNorm that does not fold into the
+            // preceding GEMM at import.
             Elementwise::LayernormNoScale { x, eps, y } => elemwise::layernorm::layernorm_no_scale(
                 self.ctx(),
                 self.tensor(*x),
                 *eps,
                 &mut self.tensor(*y),
             ),
-            // **AND THE WHOLE OF IT, IN ONE LAUNCH** (next.md B5). §9.1 read
-            // the fold again and found it half expressible, so the towers say
-            // the norm at runtime; this arm is the three nodes they used to
-            // say it in — `add_bias(b, rmsnorm(layernorm_no_scale(x), w))` —
-            // collapsed to one.
+            // add_bias(b, rmsnorm(layernorm_no_scale(x), w)) collapsed into one launch.
             Elementwise::Layernorm {
                 x,
                 weight,
@@ -103,15 +95,11 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*y),
             ),
-            // **THE CLIPPED LINEAR'S CLAMP** (multimodal §6.5), in place on
-            // `x` — the IR aliases `x_out` onto it.
+            // In place on x; the IR aliases x_out onto it.
             Elementwise::Clamp { x, lo, hi, x_out: _ } => {
                 elemwise::clip::clamp(self.ctx(), *lo, *hi, &mut self.tensor(*x))
             }
-            // **AND THE FORM WHOSE BOUNDS THE CHECKPOINT SHIPS** (multimodal
-            // §12.2): two `[1]` planes resolved like any other weight, which
-            // is `Elementwise::Scale`'s arm one row up read for a bound
-            // instead of a gain.
+            // Bounds are two [1] planes resolved like any other weight.
             Elementwise::ClampLearned {
                 x,
                 lo,
@@ -201,7 +189,7 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            // ---- rope ----
+            // rope
             Elementwise::RopeFull {
                 q,
                 k,
@@ -238,12 +226,8 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            // **THE SECTION LAYOUT PICKS THE ENTRY** (multimodal §6.3). The
-            // trunk states `mrope_interleaved: true` and the tower's
-            // `apply_rotary_pos_emb_vision` hands its sections out in
-            // contiguous blocks; the two entries share every refusal and
-            // differ in one symbol, so this arm is a choice of function and
-            // not a second arm.
+            // Interleaved vs blocked just selects the function; both share
+            // the same refusals.
             Elementwise::RopeMrope {
                 q,
                 k,
@@ -290,6 +274,8 @@ impl Run<'_> {
                 head_dim,
                 theta,
                 interleaved,
+                inverse,
+                yarn,
                 q_out: _,
             } => elemwise::rope::partial_last(
                 self.ctx(),
@@ -299,6 +285,13 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
                 *interleaved,
+                *inverse,
+                yarn.map(|y| elemwise::rope::Yarn {
+                    factor: y.factor,
+                    beta_fast: y.beta_fast,
+                    beta_slow: y.beta_slow,
+                    original_max_position: y.original_max_position,
+                }),
             ),
             Elementwise::RopeYarn {
                 q,
@@ -328,11 +321,12 @@ impl Run<'_> {
                 *original_max_position,
                 *interleaved,
             ),
-            // ---- gate ----
+            // gate
             Elementwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), &mut self.tensor(*x))
+                let fan = self.plane_fan(self.tensor(*x).rows);
+                elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), fan, &mut self.tensor(*x))
             }
-            // ---- hc ----
+            // hc
             Elementwise::RmsnormGroupedPlusOne {
                 x,
                 weight,
@@ -435,6 +429,24 @@ impl Run<'_> {
                 &mut self.tensor(*x),
                 &mut self.tensor(*post_mix),
                 &mut self.tensor(*comb_mix),
+            ),
+            Elementwise::HcCollapse {
+                mixes,
+                streams,
+                scale,
+                base,
+                stream_count,
+                hc_eps,
+                y,
+            } => elemwise::hc::collapse(
+                self.ctx(),
+                self.tensor(*mixes),
+                self.tensor(*streams),
+                self.tensor(*scale),
+                self.tensor(*base),
+                *stream_count,
+                *hc_eps,
+                &mut self.tensor(*y),
             ),
             Elementwise::HcFold {
                 x,

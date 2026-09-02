@@ -1,20 +1,17 @@
-//! The trace-time validator (design §3). Everything monomorphization and the
-//! old string tables used to guarantee is checked here, once, right after
-//! every trace. Faults, never panics — these messages are the developer's
-//! first error surface, so each reads like a sentence and names the node, the
-//! op, and the value it is about. All faults are collected in one pass over
-//! the plan; nothing stops at the first.
+//! The trace-time validator. Everything a plan's ports, shapes and dtypes
+//! must satisfy is checked here, once, right after every trace.
+//! Faults, never panics — each message reads like a sentence and names the
+//! node, the op, and the value it is about. All faults are collected in one
+//! pass over the plan; nothing stops at the first.
 //!
 //! Port expectations — the struct kind a plan port takes, the cache storage a
-//! cache port names, the dtypes the old signatures pinned — live in one table
+//! cache port names, the dtypes each op pins — live in one table
 //! (`expect`), matched per op right next to the rules that read it.
 //!
 //! [`classes`] is the second thing checked about a trace and the one thing
 //! computed from it: the 2^F class sweep and the backward demand walk that
 //! resolves every `Def::Merge`. It is a sibling rather than a rule of `check`
-//! because it answers a question the rules cannot — coverage is a property of
-//! a whole class, not of a value — and because its answer is data the compiler
-//! keeps (palo design §1).
+//! because coverage is a property of a whole class, not of a value.
 
 pub mod classes;
 
@@ -115,7 +112,7 @@ pub enum Fault {
     PortDtype { node: usize, op: &'static str, port: Port, id: ValueId, want: Dtype, ty: Ty },
 }
 
-/// Validate a traced plan against the §3 rules, collecting every fault.
+/// Validate a traced plan, collecting every fault.
 pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
     let mut faults = Vec::new();
     let len = trace.values.len();
@@ -190,10 +187,9 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
         }
 
         // Port expectations: plan ports carry their struct kind, cache ports
-        // name storage, pinned ports their dtype (§3). The table indexes the
-        // same declaration order `Operands` reads; with the impls hand-written,
-        // a position the node never produced is drift between the two, and
-        // faults as `PortMissing` rather than being skipped.
+        // name storage, pinned ports their dtype. The table indexes the same
+        // declaration order `Operands` reads; a position the node never
+        // produced is drift, and faults as `PortMissing`.
         for &(port, want) in expect(&node.op) {
             let id = match port {
                 Port::In(i) => ins.get(i),
@@ -234,7 +230,7 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             Ty::Struct(kind) => Some(*kind),
             Ty::Tensor { .. } => None,
         };
-        // Struct values are defined only by plan-building ops (§6).
+        // Struct values are defined only by plan-building ops.
         if let (Some(kind), false) = (struct_kind, matches!(decl.def, Def::Op(_))) {
             faults.push(Fault::StructDef { id, kind, def: DefKind::of(&decl.def) });
         }
@@ -339,15 +335,12 @@ fn available(
     }
 }
 
-/// The per-op port-expectation table (§3: struct-kind agreement on struct
-/// ports). Struct and cache coverage is complete: every plan-consuming
-/// variant names its exact `StructKind`s, and every `cache`/`pages`/`state`/
-/// `keys`/`pool`/`entries` field demands `Def::Cache` — including
-/// `Attention::PoolLse.entries`, settled as the pool cache space rather than
-/// `PoolGather`'s tensor. Dtype rows port the pins of the old signatures
-/// (positions- and indptr-like inputs i32; gate/lse/routing-weight outputs
-/// f32; the `row_valid` padding mask u8) — advisory coverage, not an
-/// exhaustive typing of every port.
+/// The per-op port-expectation table. Struct and cache coverage is complete:
+/// every plan-consuming variant names its exact `StructKind`s, and every
+/// `cache`/`pages`/`state`/`keys`/`pool`/`entries` field demands
+/// `Def::Cache`. Dtype rows pin the conventional element types (positions-
+/// and indptr-like inputs i32; gate/lse/routing-weight outputs f32; the
+/// `row_valid` padding mask u8) — advisory, not an exhaustive typing.
 fn expect(op: &Operation) -> &'static [(Port, Expect)] {
     use Port::{In, Out};
 
@@ -404,13 +397,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::IndexTopk { .. } => &[(In(2), CACHE), (Out(0), I32)],
             Attention::IndexKvAppend { .. } => &[(In(1), CACHE), (In(2), I32), (In(3), I32)],
             // `row_valid` is one byte per padded row, not an index vector:
-            // `kernels/attn/pool.cuh` takes it as `const u8* __restrict__` in
-            // both boundary kernels and tests it against zero, and the C++
-            // lineage held it the same way (`DeviceBuffer<std::uint8_t>` in
-            // the dev engine's persistent inputs, memset to 1). The mask is
-            // what `model_dsl::ops::geometry` has always declared for
-            // `GeomKind::RowValid`; this row read i32 only because it was
-            // copied off the positions port beside it.
+            // `kernels/attn/pool.cuh` takes it as `const u8* __restrict__`.
             Attention::PoolBoundaryDecode { .. } | Attention::PoolBoundaryPrefill { .. } => {
                 &[
                     (In(0), I32),
@@ -454,11 +441,16 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Linear::MoeTopkSoftmax { .. }
             | Linear::MoeTopkSoftmaxScaled { .. }
             | Linear::MoeTopkSigmoid { .. }
-            | Linear::MoeTopkSqrtSoftplus { .. } => &[(Out(0), I32), (Out(1), F32)],
+            | Linear::MoeTopkSqrtSoftplus { .. }
+            | Linear::MoePredictRoute { .. } => &[(Out(0), I32), (Out(1), F32)],
             // The lookup router lands the same pair off a token-id column and
             // an I64 table: the ids are the fire's own `RuntimeInput::Tokens`
             // stream, i32 like every other id column in this table.
             Linear::MoeHashRoute { .. } => &[(In(0), I32), (Out(0), I32), (Out(1), F32)],
+            // The grouped projection's static routes: i32, like every route
+            // plane the routed selects read.
+            Linear::GroupRoutes { .. } => &[(Out(0), I32)],
+            Linear::MatmulGrouped { .. } => &[(In(2), I32)],
             Linear::MoeMatmulSelect { .. } => &[(In(2), I32)],
             Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
             // The bias-free quantized twin carries no bias port, so `routes`
@@ -500,6 +492,8 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // widened, the dynamic plane, and the row the sinkhorn splits.
             Elementwise::HcProject { .. } => &[(In(0), F32), (In(1), F32), (Out(0), F32)],
             Elementwise::HcGates { .. } => &[(In(0), F32), (Out(1), F32), (Out(2), F32)],
+            // The trunk collapse reads the f32 mix row and the f32 gate planes.
+            Elementwise::HcCollapse { .. } => &[(In(0), F32), (In(2), F32), (In(3), F32)],
             // Per-token math with nothing pinned: the norms, the residual and
             // scaling arithmetic, and the gate take and return the activation
             // dtype they are given.
@@ -541,8 +535,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // places: one destination TOKEN row per source row, i32 like
             // every other index vector this IR names.
             // The dropping twin pins the same port for the same reason;
-            // what differs is which VALUES it admits, which is a host-side
-            // check and not a dtype (multimodal §8.6).
+            // what differs is which values it admits, a host-side check.
             Layout::ScatterRows { .. } | Layout::ScatterLiveRows { .. } => &[(In(1), I32)],
             // The pool pins nothing: it folds rows of the activation dtype
             // into fewer rows of the same one, and its `side` is a stated

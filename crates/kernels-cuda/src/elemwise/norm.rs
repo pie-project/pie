@@ -1,6 +1,4 @@
-//! `Norm`: the rms family, residual folds, and scalar gains — one entry per
-//! IR variant. Selection (which unit, which element stamp) lives here, so
-//! the engine's dispatch arm stays destructure → resolve → call.
+//! `Norm`: the rms family, residual folds, and scalar gains — one entry per IR variant.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -45,10 +43,8 @@ fn rows_per_head(op: &'static str, rows: u32, width: u32, head_dim: u32) -> Resu
     Ok(Launch::per_row(blocks, BLOCK))
 }
 
-/// The head count [`rows_per_head`] flattens into `blockIdx.x`, which the
-/// seated kernels divide by to recover the token row: one, when the launch is
-/// one block per row. Read only after [`rows_per_head`] has refused a width
-/// the head does not divide, so the division is exact here.
+/// The head count `rows_per_head` flattens into `blockIdx.x`; seated kernels
+/// divide by it to recover the token row.
 const fn per_head_split(width: u32, head_dim: u32) -> u32 {
     if head_dim == 0 { 1 } else { width / head_dim }
 }
@@ -106,9 +102,7 @@ fn rms_row(
         )?,
     )?;
     let launch = rows_per_head(op, y.rows, y.width, per_head_dim)?;
-    // How many blocks stand in one token row. The PER-HEAD launch flattens
-    // `rows x heads` into `blockIdx.x`; the whole-row launch is the same
-    // flattening with one head, which is why the kernel needs no second arm.
+    // How many blocks stand in one token row.
     let heads = stated(op, per_head_split(y.width, per_head_dim))?;
     ctx.fire(
         op,
@@ -128,11 +122,7 @@ fn rms_row(
             hidden.arg(),
             eps.arg(),
             heads.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
-            // A PER-HEAD launch flattens `rows x heads` into `blockIdx.x`, and
-            // the kernel divides by `heads` to find the row again, so this
-            // seat is unconditional too.
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -248,11 +238,7 @@ pub fn rmsnorm_no_scale(
             hidden.arg(),
             eps.arg(),
             heads.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
-            // A PER-HEAD launch flattens `rows x heads` into `blockIdx.x`, and
-            // the kernel divides by `heads` to find the row again, so this
-            // seat is unconditional too.
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -300,11 +286,7 @@ pub fn rmsnorm_gated(
             eps.arg(),
             i32::from(sigmoid_gate).arg(),
             heads.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
-            // A PER-HEAD launch flattens `rows x heads` into `blockIdx.x`, and
-            // the kernel divides by `heads` to find the row again, so this
-            // seat is unconditional too.
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -352,8 +334,7 @@ pub fn rmsnorm_grouped_plus_one(
             stated(OP, group)?.arg(),
             stated(OP, groups)?.arg(),
             eps.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -409,8 +390,7 @@ pub fn rmsnorm_gated_by(
             stated(OP, heads)?.arg(),
             stated(OP, d)?.arg(),
             eps.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -428,12 +408,10 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
             y.arg(),
             x.arg(),
             n.arg(),
-            // The element-form seat's width: this launch is flat over
-            // `rows * width`, so the kernel needs the row's width to read the
-            // staged row count and row start as elements.
+            // Element-form seat's width: launch is flat over rows*width, so
+            // the kernel needs it to read the staged row count/start as elements.
             stated(OP, y.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -453,26 +431,20 @@ pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> 
             out.arg(),
             bias.arg(),
             width.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
 /// `out = (out - bias) * scale` per row, in place on `out`, both planes
-/// `[width]` — `vision_config.standardize`'s own line.
-///
-/// The difference is taken and scaled in f32 and rounded once, at the store:
-/// the pooler's `√hidden` has already expanded the magnitude and this is what
-/// brings it back, so where `out` and `bias` nearly cancel the surviving
-/// number is many ulps of what a composed spelling would have rounded away.
+/// `[width]`. The difference is taken and scaled in f32 and rounded once at
+/// the store, to avoid rounding error where `out` and `bias` nearly cancel.
 ///
 /// # Errors
 ///
 /// [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for a
-/// plane that is not one row of the rectangle's own width and element, for an
-/// empty rectangle, and for an extent past a 32-bit launch.
+/// mismatched plane, an empty rectangle, or an extent past a 32-bit launch.
 pub fn standardize(
     ctx: &Ctx,
     bias: Tensor,
@@ -483,9 +455,7 @@ pub fn standardize(
     let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "rows", out.rows)?;
     let width = stated(OP, nonzero(OP, "the standardized row's width", out.width)?)?;
-    // **BOTH PLANES ARE PER-COLUMN**, which is the whole difference from
-    // `scale`'s one device-held scalar — so a plane of the wrong width is a
-    // silent misread of every column past the first, and gets a refusal.
+    // Both planes are per-column (unlike `scale`'s one device-held scalar).
     for (what, plane) in [("bias", bias), ("scale", scale)] {
         if plane.dtype != out.dtype {
             return Err(refuse(
@@ -529,12 +499,10 @@ pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
             x.arg(),
             s.arg(),
             n.arg(),
-            // The element-form seat's width: this launch is flat over
-            // `rows * width`, so the kernel needs the row's width to read the
-            // staged row count and row start as elements.
+            // Element-form seat's width: launch is flat over rows*width, so
+            // the kernel needs it to read the staged row count/start as elements.
             stated(OP, x.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -551,12 +519,10 @@ pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
             x.arg(),
             s.arg(),
             n.arg(),
-            // The element-form seat's width: this launch is flat over
-            // `rows * width`, so the kernel needs the row's width to read the
-            // staged row count and row start as elements.
+            // Element-form seat's width: launch is flat over rows*width, so
+            // the kernel needs it to read the staged row count/start as elements.
             stated(OP, x.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -574,21 +540,17 @@ pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
             x.arg(),
             s.arg(),
             n.arg(),
-            // The element-form seat's width: this launch is flat over
-            // `rows * width`, so the kernel needs the row's width to read the
-            // staged row count and row start as elements.
+            // Element-form seat's width: launch is flat over rows*width, so
+            // the kernel needs it to read the staged row count/start as elements.
             stated(OP, x.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// This plane claims the point, but its launch lives with the attention
-/// family (the old CANON row `norm.res_blend -> attn::attn_res_blend`,
-/// now `elemwise::res_blend` in the device text); this entry is the seam,
-/// [`crate::attn::res_blend`] is the launch.
+/// This plane claims the point, but the launch lives with the attention
+/// family; this entry is the seam, `crate::attn::res_blend` is the launch.
 pub fn res_blend(
     ctx: &Ctx,
     prefix: Tensor,

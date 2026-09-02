@@ -44,7 +44,7 @@ const fn rotate_launch(num_tokens: u32, total_heads: u32, per_block: u32, smem: 
     .smem(smem)
 }
 
-/// The YaRN interpolation ramp, precomputed host-side as before.
+/// The YaRN interpolation ramp, precomputed host-side.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn ramp_bounds(
@@ -155,8 +155,7 @@ pub fn full(
             ArgValue::ABSENT,
             0_i32.arg(),
             0_i32.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -195,6 +194,21 @@ pub fn partial_q(
 }
 
 /// Partial rope over the last `rotary_dim` lanes of each head.
+/// The YaRN ramp a partial rope states beside its theta (the IR's
+/// `elemwise::Yarn`, restated here because this crate names no IR).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Yarn {
+    pub factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    pub original_max_position: u32,
+}
+
+/// `inverse` negates the angle (the MLA attention output, whose latent was
+/// both key and value, un-rotated at the query's position); `yarn` is the
+/// layer's ramp, derived over the ROTATED width as the reference's
+/// `precompute_freqs(dim = rotary, ...)` derives it, or `None`.
+#[allow(clippy::too_many_arguments)]
 pub fn partial_last(
     ctx: &Ctx,
     q: &mut Tensor,
@@ -203,8 +217,28 @@ pub fn partial_last(
     head_dim: u32,
     theta: f32,
     interleaved: bool,
+    inverse: bool,
+    yarn: Option<Yarn>,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial_last";
+    let (factor, low_dim, high_dim) = match yarn {
+        Some(y) => {
+            let max_position = nonzero(
+                OP,
+                "the position span this layer's YaRN ramp states",
+                y.original_max_position,
+            )?;
+            let (low, high) = ramp_bounds(
+                stated(OP, rotary_dim)?,
+                theta,
+                y.beta_fast,
+                y.beta_slow,
+                stated(OP, max_position)?,
+            );
+            (y.factor, low, high)
+        }
+        None => (UNSCALED, 0.0, 0.0),
+    };
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     positions_stream(OP, positions, q);
     if rotary_dim > head_dim {
@@ -230,13 +264,12 @@ pub fn partial_last(
             stated(OP, head_dim)?.arg(),
             stated(OP, rotary_dim)?.arg(),
             theta.arg(),
-            false.arg(),
+            inverse.arg(),
             interleaved.arg(),
-            UNSCALED.arg(),
-            0.0_f32.arg(),
-            0.0_f32.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            factor.arg(),
+            low_dim.arg(),
+            high_dim.arg(),
+            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -303,8 +336,7 @@ pub fn yarn(
             interleaved.arg(),
             stated(OP, per_block)?.arg(),
             stated(OP, pairs)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -336,8 +368,7 @@ fn rope_partial(
             stated(op, head_dim)?.arg(),
             stated(op, rotary_dim)?.arg(),
             theta.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )

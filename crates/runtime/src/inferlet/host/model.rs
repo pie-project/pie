@@ -21,14 +21,10 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(false)
     }
 
-    /// Which forward-pass interface the bound model requires, over STATE
-    /// SEMANTICS rather than architecture name. Recurrent state is present iff
-    /// the engine handshake reports a non-zero folded-state size — the same
-    /// predicate the CUDA executor keys fold-commit on (`use_slots` /
-    /// `rs_cache` present); paged KV is present iff the model has a KV
-    /// page size. Today every registered linear model (Qwen3.5 GDN dense/MoE,
-    /// Nemotron-H Mamba2) interleaves attention layers and therefore reports
-    /// `hybrid`; `recurrent` is reachable only for a model with no KV at all.
+    /// Which forward-pass interface the bound model requires, keyed on state
+    /// semantics: recurrent state is present iff the engine handshake
+    /// reports a non-zero folded-state size; paged KV is present iff the
+    /// model has a KV page size.
     async fn pass_kind(&mut self) -> Result<pie::inferlet::model::ForwardKind> {
         use pie::inferlet::model::ForwardKind;
         let model = model::model();
@@ -41,9 +37,8 @@ impl pie::inferlet::model::Host for ProcessCtx {
         })
     }
 
-    /// LM-head output dimension = `hf_config.vocab_size` (e.g. 151936 for
-    /// qwen3), NOT the tokenizer vocab — the vocab the recognizer / program
-    /// lowering targets. Sourced from the model config, not hardcoded.
+    /// LM-head output dimension (`hf_config.vocab_size`), not the tokenizer
+    /// vocab.
     async fn output_vocab_size(&mut self) -> Result<u32> {
         Ok(model::model().vocab_size())
     }
@@ -78,11 +73,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(crate::engine::get_spec(0)?.limits.max_forward_tokens as u32)
     }
 
-    // ── Working-set / arena capabilities (global over the bound model) ──────
-    //
-    // Real values come from the engine handshake `EngineCapabilities`
-    // (`rs_cache_slot_bytes` etc.), carried on the global `model::Model` via
-    // `RsCaps` (populated at registration alongside the arena `ArenaConfig`).
+    // working-set / arena capabilities, global over the bound model.
 
     /// Bytes of one folded recurrent-state object (0 if the model has no RS).
     async fn rs_state_size(&mut self) -> Result<u64> {
@@ -94,9 +85,8 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(model::model().rs_caps().buffer_page_size)
     }
 
-    /// Fold granularity in tokens. 1 = unconstrained (token-causal: Qwen3.5 GDN,
-    /// Nemotron-H Mamba2). An RS fold of `n` tokens requires `n` to be a
-    /// positive multiple of this.
+    /// Fold granularity in tokens; 1 = unconstrained. An RS fold of `n`
+    /// tokens requires `n` to be a positive multiple of this.
     async fn rs_fold_granularity(&mut self) -> Result<u32> {
         Ok(model::model().rs_caps().fold_granularity)
     }

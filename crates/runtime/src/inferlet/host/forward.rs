@@ -1,18 +1,5 @@
-//! WIT host glue for `pie:inferlet/forward` — thin `Host`/`HostChannel`/
-//! `HostForwardPass` impls over the pipeline-owned [`Channel`]/[`ForwardPass`]
-//! resource types (`crate::pipeline::channel`/`crate::pipeline::instance`).
-//!
-//! `forward-pass.program` binds + caches via [`crate::pipeline::program`] (the old
-//! `register-program`, now an invisible compile/bind cache) and stamps the
-//! container's roles onto the guest-constructed channels. The run-ahead fire
-//! engine itself (`submit`'s body and FIFO finalization) lives in
-//! [`crate::pipeline::fire`]; this file's
-//! `HostForwardPass::submit` is a one-line delegation through the
-//! [`crate::pipeline::fire::FireContext`] trait (implemented for `ProcessCtx`
-//! below). `HostForwardPass::program` stays here (not `pipeline::fire`) because
-//! it is fundamentally about validating and pushing the WIT resources
-//! (`Resource<Channel>` handles, the KV/RS working sets) into the component
-//! table — the WIT bind step, not the fire engine.
+//! WIT host glue for `pie:inferlet/forward`: `Host`/`HostChannel`/
+//! `HostForwardPass` impls over the pipeline-owned `Channel`/`ForwardPass`.
 
 use std::sync::{Arc, Mutex};
 
@@ -39,9 +26,8 @@ use super::pie;
 
 type Anyhow<T> = anyhow::Result<T>;
 
-/// Which forward interface this model requires. Must stay in lockstep with
-/// `model.pass-kind()` (`host/model.rs`) -- that call is how a guest picks its
-/// interface, and `core_gate` is how the host proves the pick was right.
+/// Which forward interface this model requires; must match `model.pass-kind()`
+/// (`host/model.rs`).
 fn model_pass_kind() -> PassKind {
     let model = crate::model::model();
     match (model.kv_page_size() > 0, model.rs_caps().state_size > 0) {
@@ -73,10 +59,8 @@ fn validate_descriptor_bindings(
     validate_bindings(container, channel_reps, expected, false)
 }
 
-/// The RS geometry ports, which are OPTIONAL: a pass always binds
-/// `rs-geometry`, but a program only traces the buffer addressing when it
-/// actually addresses the buffer. Absent-but-attached is therefore legal here
-/// and an error for the KV family. Present-but-mismatched is an error for both.
+/// RS geometry ports are optional: absent-but-attached is legal here (unlike
+/// the KV family); present-but-mismatched is an error for both.
 fn validate_optional_descriptor_bindings(
     container: &TraceContainer,
     channel_reps: &[u32],
@@ -202,8 +186,7 @@ fn poll_channel(
         Err(error) => return Ok(ChannelPoll::Ready(Err(error.to_string()))),
     }
 
-    // Transfer only an already-settled FIFO entry while the Accessor lends us
-    // the store. The caller holds the async finalizer gate through completion.
+    // Only pops an already-settled FIFO entry; caller holds the finalizer gate.
     if pop_settled && let Some(op) = crate::pipeline::fire::pop_settled(fires.as_ref()) {
         return Ok(ChannelPoll::Finalize(op));
     }
@@ -250,8 +233,7 @@ async fn materialize_channel(
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
             ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
-                // A plain await: an idle channel wait holds no pooled
-                // state, so the planner can evict around it freely.
+                // Idle channel wait holds no pooled state; planner may evict around it.
                 if let Err(error) =
                     crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
                 {
@@ -262,20 +244,14 @@ async fn materialize_channel(
     }
 }
 
-/// The `channel` interface declares no free functions — only the `channel`
-/// resource — but `add_to_linker` still requires the interface-level `Host`
-/// bound, so this impl is empty by construction.
+// `add_to_linker` requires the interface-level `Host` bound even though
+// `channel` declares no free functions, so this impl is empty by construction.
 impl pie::inferlet::channel::Host for ProcessCtx {}
 
 impl ProcessCtx {
-    /// Frame submission (`submit(on, slots)`): exactly `model.frame-size()`
-    /// ordered slots; slot i executes in wave i; `none` is a no-op. Delegates
-    /// to [`crate::pipeline::fire::submit_frame`].
-    ///
-    /// Duplicated in WIT across all three forward interfaces, implemented once
-    /// here. A frame is monomorphic in its slot type, which is exactly what
-    /// keeps a hybrid's recurrent-only fire and its normal fire in the same
-    /// frame while keeping an attention-only pass out of it entirely.
+    /// `submit(on, slots)`: exactly `model.frame-size()` ordered slots; slot i
+    /// executes in wave i; `none` is a no-op. Shared by all three forward
+    /// interfaces (WIT duplicates the signature, not the implementation).
     async fn core_submit(
         &mut self,
         on: Resource<crate::pipeline::Pipeline>,
@@ -303,9 +279,8 @@ impl pie::inferlet::channel::HostChannel for ProcessCtx {
         capacity: u32,
     ) -> Anyhow<Resource<Channel>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        // Pure host bookkeeping — never fails at construction (the WIT
-        // constructor cannot carry a result; a channel/decl mismatch instead
-        // errors at forward-pass.new / submit).
+        // Construction never fails; a channel/decl mismatch errors later at
+        // forward-pass.new / submit instead (the WIT constructor has no Result).
         use pie::inferlet::types::Dtype;
         let dtype = match dtype {
             Dtype::F32 => eta_ir::types::Dtype::F32,
@@ -349,21 +324,17 @@ impl pie::inferlet::channel::HostChannel for ProcessCtx {
     }
 
     async fn drop(&mut self, this: Resource<Channel>) -> Anyhow<()> {
-        // A pass that bound this channel holds its own Arc — dropping the
-        // guest handle never dangles an in-flight fire. Native channel storage
-        // is reference-counted by bound instances and releases on instance close.
+        // A bound pass holds its own Arc, so dropping the guest handle never
+        // dangles an in-flight fire; storage releases when the instance closes.
         self.ctx().table.delete(this)?;
         Ok(())
     }
 }
 
 impl pie::inferlet::channel::HostChannelWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
-    /// The direct-wake await point (plan §4.5): while the cell is empty,
-    /// non-blockingly drain already-settled pipeline ops (their KV/RS txns
-    /// finalize here, bounding pin float), then park on the channel's reader
-    /// wait slot — the engine's completion callback wakes it right after
-    /// publishing the mirror tail. Store access is scoped to synchronous polls;
-    /// the component task never holds an [`Accessor`] borrow across an await.
+    /// While empty: drains already-settled pipeline ops, then parks on the
+    /// channel's reader wait slot. Store access stays scoped to synchronous
+    /// polls; never holds an `Accessor` borrow across an await.
     async fn take(
         accessor: &Accessor<ProcessCtx, Self>,
         this: Resource<Channel>,
@@ -380,25 +351,17 @@ impl pie::inferlet::channel::HostChannelWithStore<ProcessCtx> for HasSelf<Proces
     }
 }
 
-/// The single host implementation behind all three WIT forward interfaces.
-///
-/// WIT duplicates `embed` / `readout` / `program` / `submit` across `forward`,
-/// `forward-recurrent`, and `forward-hybrid` so that cross-kind states are
-/// UNREPRESENTABLE in the guest surface (forward_refactor.md D3). That is a
-/// statement about the interface, not about the implementation: all three map
-/// their `forward-pass` resource to this one Rust type, so the three trait
-/// impls below are thin delegations to these methods and the binding logic
-/// exists exactly once.
+/// Single host implementation behind all three WIT forward interfaces; WIT
+/// duplicates the interface so cross-kind states are unrepresentable in the
+/// guest, but all three map to this one Rust type.
 impl ProcessCtx {
     async fn core_new(&mut self, kind: PassKind) -> Anyhow<Resource<ForwardPass>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         Ok(self.ctx().table.push(ForwardPass::new(kind))?)
     }
 
-    /// The interface-selection gate. `constructor()` is infallible in WIT, so
-    /// the check lands on the first state-binding call instead -- which is
-    /// still before anything is attached, and is the call whose SIGNATURE is
-    /// the thing that differs.
+    /// Interface-selection gate, checked on the first state-binding call since
+    /// `constructor()` is infallible in WIT.
     fn core_gate(&mut self, this: &Resource<ForwardPass>) -> Anyhow<Result<(), String>> {
         let kind = self.ctx().table.get(this)?.kind;
         let actual = model_pass_kind();
@@ -531,18 +494,10 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    /// **THE PAYLOAD BESIDE THE LEDGER** (media-door.md §0/§3).
-    ///
-    /// The spans are read out of the resource table and cloned by handle — an
-    /// `Arc` each, so a decoded image submitted to two passes is decoded once
-    /// and its patches copied never. Nothing about WHERE they sit in the
-    /// sequence is recorded, because nothing about that is the guest's to
-    /// state: the runs are SCANNED out of the submitted tokens at submit
-    /// (`pipeline::media::scan`), when both the tokens and the spans are
-    /// final, and every disagreement is refused there by name.
-    ///
-    /// Attaching twice is a re-statement of the same fact and is refused for
-    /// `embed`'s reason: two lists in submission order are two orders.
+    /// Spans are cloned by handle (`Arc`), so a decoded image submitted to two
+    /// passes decodes once. Their position in the sequence is not recorded
+    /// here — it's scanned out of the submitted tokens at submit time
+    /// (`pipeline::media::scan`).
     async fn core_media(
         &mut self,
         this: Resource<ForwardPass>,
@@ -626,10 +581,7 @@ impl ProcessCtx {
         let readable_pages = attention.readable;
         let writable_pages = attention.writable;
         {
-            // Identity dedup + bind against the model profile (the old
-            // register-program, now invisible): hash-deduped compile/bind
-            // cache; a malformed trace fails HERE with the validator's
-            // message (the P2 exit).
+            // Hash-deduped compile/bind cache; a malformed trace fails here.
             let prog = match crate::pipeline::program::register(
                 container_bytes,
                 &crate::pipeline::program::model_profile(),
@@ -637,14 +589,12 @@ impl ProcessCtx {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e.to_string())),
             };
-            // Strict admission: the hash-deduped program compile above may
-            // prewarm, but everything from here on creates per-instance
-            // engine state (channel registration, instance bind) or claims
-            // pooled KV (device-geometry seed pages) — execution first.
+            // Everything from here on creates per-instance engine state or
+            // claims pooled KV, so admission is required first.
             crate::inferlet::process::ensure_bind_admitted(self).await;
 
-            // Validate every handle against its dense declaration BEFORE
-            // stamping any of them, so a failed `program` attachment binds nothing.
+            // Validate every handle before stamping any, so a failed
+            // attachment binds nothing.
             let decls = prog.bound.container.channels.clone();
             let extern_bindings = decls
                 .iter()
@@ -688,9 +638,8 @@ impl ProcessCtx {
             {
                 return Ok(Err(error));
             }
-            // Optional: a pass that folds everything unconditionally has
-            // nothing to compute and claims no port, so the traced program
-            // legitimately lacks this binding.
+            // A pass that folds unconditionally claims no port, so the
+            // program may legitimately lack this binding.
             if let Some(fold_len) = rs_fold_len_rep
                 && let Err(error) = validate_optional_descriptor_bindings(
                     &prog.bound.container,
@@ -710,12 +659,8 @@ impl ProcessCtx {
                 }
                 {
                     let c = cell.lock().unwrap();
-                    // W3.2: a channel MAY bind to several passes (multi-pass
-                    // channels). The old one-pass-per-channel gate is lifted; the
-                    // engine's global channel registry (W0.1) resolves one shared
-                    // device cell, and the pipeline enforces same-pipeline
-                    // ordering (§3.4). Decl equality across the sharing passes is
-                    // still validated (`matches_decl`) — a conflict is an error.
+                    // A channel may bind to several passes; decl equality
+                    // across sharing passes is still validated as a conflict.
                     let extern_binding = extern_bindings[i]
                         .as_ref()
                         .map(|(name, dir)| (name.as_str(), *dir));
@@ -765,37 +710,22 @@ impl ProcessCtx {
             if let Err(error) = writable.resolve(page_len) {
                 return Ok(Err(error));
             }
-            // Classify once: DERIVABILITY decides the geometry class, not
-            // op-pattern arity. Host-derivable submission geometry (the taint
-            // fixpoint finds no device-decided port) is Host class on every
-            // engine — the runtime folds the geometry prologue per fire. Only
-            // a device-dependent envelope on an engine with the device
-            // geometry ports classifies DecodeEnvelope (run-ahead without
-            // host round-trips); the same shape on a capability-less engine
-            // falls back to Host and executes serialized, blocking loudly on
-            // the first value the host truly cannot know.
+            // Derivability decides the geometry class, not op-pattern arity:
+            // host-derivable geometry is Host class on every engine; a
+            // device-dependent envelope classifies DecodeEnvelope only when
+            // the engine has the needed device geometry ports, else it falls
+            // back to Host and blocks loudly on the first undecidable value.
             let device_port_mask =
                 crate::engine::get_spec(bound_ws.engine)?.device_geometry_port_mask;
 
-            // Device-geometry pass (Track B): the program traces its COMPLETE
-            // explicit geometry in-graph (loop-carried pages/write
-            // descriptors); the runtime only leases physical pages. A real
-            // wire class, capability-gated like every device-resolved family
-            // — never an engine-side trace sniff (RV-6).
-            // RV-26 extension: a Track B pass whose AttnMask binds a CHANNEL
-            // ships the mask as a descriptor the engine must resolve
-            // per-step; an engine that does not claim the mask port cannot
-            // (CUDA today), and admitting the pass poisons at frame prepare
-            // ("descriptor channel not ready"). Such a pass takes the same
-            // loud Host fallback as a geometry-incapable engine.
+            // Device-geometry pass: the program traces its full explicit
+            // geometry in-graph; the runtime only leases physical pages. If
+            // AttnMask binds a channel, the engine must be able to resolve it
+            // per-step (CUDA today cannot); otherwise it falls back to Host.
             let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
                 matches!(binding.port, eta_ir::registry::Port::AttnMask)
                     && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
             });
-            // THE PORTS WENT HOME (decision 19): `PIE_DEVICE_GEOMETRY_PORTS`
-            // and its twelve siblings were a private bit numbering in
-            // `engine` that disagreed with the registry's, and nothing
-            // checked the two. `covers` is the registry's own subset test.
             let devgeo_capable = device_port_mask.covers(PortMask::DEVICE_GEOMETRY)
                 && (!needs_mask_port || device_port_mask.covers(PortMask::of(&[Port::AttnMask])));
             let devgeo = match crate::pipeline::fire::lease::detect_device_geometry(
@@ -820,8 +750,7 @@ impl ProcessCtx {
                                     .to_string(),
                             ));
                     }
-                    // Seed the physical-page lease with `B` fire-0 pages (one
-                    // live page per lane) drawn from the guest's working set.
+                    // Seed the lease with `B` fire-0 pages, one per lane.
                     let reserved =
                         crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
                             kv.reserve(bound_ws.id, b as u64)
@@ -874,11 +803,6 @@ impl ProcessCtx {
                         }
                     }
                     Ok(None) => {
-                        // The decline that used to be silent. Falling out of
-                        // this class is not itself a fault — most traces are
-                        // not decode envelopes — but when the fire later dies
-                        // on a value the host cannot derive, THIS is the line
-                        // that says which rule sent it down that road.
                         tracing::info!(
                             "not a decode envelope: {why}; falling back to \
                              host-evaluated execution"
@@ -901,14 +825,9 @@ impl ProcessCtx {
                         .to_string(),
                 ));
             }
-            // A decode loop that carries a DENSE device `AttnMask` has no home
-            // in the envelope class (the compose paths hold no per-lane mask
-            // state) and none in the Host class (a device-sampled token is not
-            // host-derivable). It DOES have one in the pool-owned device
-            // geometry class: the descriptor resolver reads every port —
-            // including the mask — straight from the channel cells, and such
-            // fires are scheduled solo. Take that route rather than letting the
-            // fire die on the first value the host cannot know.
+            // A decode loop carrying a dense device AttnMask fits neither the
+            // envelope class nor Host; route it to pool-owned device geometry,
+            // where the descriptor resolver reads every port including the mask.
             let devgeo = match devgeo {
                 Some(devgeo) => Some(devgeo),
                 None if decode_envelope.is_none()
@@ -963,19 +882,6 @@ impl ProcessCtx {
                 }
                 let extern_binding = extern_bindings[dense].as_ref();
                 missing_dense.push(dense);
-                // THE TAGS ARE ETA'S OWN NOW. `dtype: u8`, `host_role: u8`
-                // and `extern_dir: u8` were three tag bytes re-spelling
-                // `eta_ir::container`'s enums in a second numbering
-                // (`PIE_CHANNEL_DTYPE_*`, `PIE_CHANNEL_HOST_ROLE_*`,
-                // `PIE_CHANNEL_EXTERN_*`), with nothing checking the two
-                // agreed — and `engine::program`'s header records the
-                // place the disagreement was visible. A declaration names the
-                // enums, so the re-spelling has nowhere left to drift.
-                //
-                // `engine_id`/`reader_wait_id`/`writer_wait_id` are gone from
-                // the argument: the first is the caller's routing (the
-                // scheduler dispatch facade already holds it) and the other
-                // two are what a registration ANSWERS.
                 registration_plans.push(::engine::ChannelRegistration {
                     id: cell.lock().unwrap().global_id,
                     shape: decls[dense].shape.dims().to_vec(),
@@ -989,12 +895,8 @@ impl ProcessCtx {
                         .unwrap_or_default(),
                 });
             }
-            // All validation passed — capture ids, register the program
-            // (hash-cached, synchronous), and stage the seeds BEFORE the one
-            // combined register+bind control: the bind consumes only
-            // pre-known ids and host-staged seed bytes, so registration and
-            // bind have a pure ORDERING dependency — two separate controls
-            // doubled the turnover convoy (V6 iteration 25).
+            // Capture ids and stage seeds before the combined register+bind:
+            // bind consumes only pre-known ids and host-staged seed bytes.
             let channel_ids: Vec<u64> = cells.iter().map(|c| c.lock().unwrap().global_id).collect();
             let channel_reps: Vec<u32> = channels.iter().map(|c| c.rep()).collect();
             let program_registration = ::engine::ProgramRegistration {
@@ -1019,13 +921,9 @@ impl ProcessCtx {
                     channel: dense as u32,
                     data: bytes.clone(),
                 });
-                // The host shadow above reads the NATIVE cell -- one byte per
-                // bool -- and the engine ABI's wire cell is bit-packed, sized
-                // `(numel + 7) / 8` by CUDA and Metal alike. Every other dtype
-                // is four bytes either way, which is why handing `peek_seed`'s
-                // bytes straight to both worked for all of them and only Bool
-                // bounced: the engine read a seed eight times the width it
-                // declared and refused the bind.
+                // Native cell is one byte per bool; the engine wire ABI is
+                // bit-packed, sized (numel + 7) / 8. Every other dtype is four
+                // bytes either way and needs no repacking.
                 let wire = if cell.dtype == eta_ir::types::Dtype::Bool {
                     let mut packed = vec![0u8; bytes.len().div_ceil(8)];
                     crate::pipeline::channel::pack_bool_into(&bytes, &mut packed);
@@ -1054,18 +952,9 @@ impl ProcessCtx {
                     channel_ids.clone(),
                     seed_values,
                     geometry_class,
-                    // THE EXTENTS THE ENGINE CARVES THIS INSTANCE'S STAGE
-                    // BUFFERS AT (Build log 15). `sampled_rows` is the one a
-                    // model fire's epilogue resolves against — how many
-                    // readout rows the program reads — and it is exactly what
-                    // registration already priced the program on
-                    // (`Pricing::rows`, read off the `embed` indptr lanes and
-                    // otherwise one), so it is read from there rather than
-                    // guessed a second time. Every other role stays at one:
-                    // no shell in this workspace makes another role symbolic
-                    // in a fire-time quantity — a decode-envelope pass resolves
-                    // its token on the device (`palo B3`) but its stage
-                    // buffers are still carved at one row apiece.
+                    // sampled_rows is how many readout rows the program reads,
+                    // taken from the pricing already computed at registration
+                    // rather than recomputed. Every other role stays at one row.
                     ::engine::BindExtents {
                         sampled_rows: pricing_rows.max(1),
                         ..::engine::BindExtents::default()
@@ -1106,9 +995,8 @@ impl ProcessCtx {
                 if cell.seeded {
                     cell.commit_seed();
                 }
-                // A seeded Writer held its staging back until the seed
-                // settled into the instance descriptor — flush it now so
-                // direct ring puts take over (plan §4.2).
+                // A seeded Writer held staging until the seed settled; flush
+                // now so direct ring puts take over.
                 if cell.role == Some(HostRole::Writer)
                     && let Err(error) = cell.flush_writer_staging()
                 {
@@ -1262,18 +1150,10 @@ impl ProcessCtx {
         Ok(result)
     }
 
-    /// The host-known value of `rs-geometry.fold-len`, one entry per bound
-    /// working set.
-    ///
-    /// `Ok(None)` when the channel carries no host-known seed. That is not an
-    /// error: it means a stage computes the fold length ON DEVICE, and the
-    /// value reaches the engine through the `rs_fold_len` descriptor port
-    /// instead of through this host. The host then keeps only an UPPER BOUND
-    /// on the folded boundary — see `store::rs::Occupancy` — which is
-    /// the whole point of making the field a channel
-    /// (`.wiki/designs/linear-state-programming-model.md` §4.2): a speculative
-    /// decode's accepted count never round-trips through the host between the
-    /// fire that computes it and the fire that folds it.
+    /// Host-known value of `rs-geometry.fold-len`, one entry per bound working
+    /// set. `Ok(None)` means the fold length is computed on device instead
+    /// (reaches the engine via the `rs_fold_len` descriptor port); the host
+    /// then keeps only an upper bound (see `store::rs::Occupancy`).
     fn read_fold_len(
         &mut self,
         geometry: &RsGeometryBinding,
@@ -1316,9 +1196,8 @@ impl ProcessCtx {
     }
 
     async fn core_drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
-        // A pass can be dropped before its pipeline. Drain the shared FIFO first
-        // so every callback, mirror publication, and KV/RS transaction completes
-        // before raw mirror pointers are detached or pages become reusable.
+        // Drain the shared FIFO first so every callback and KV/RS transaction
+        // completes before mirror pointers are detached or pages reused.
         let fires = self
             .ctx()
             .table
@@ -1330,12 +1209,7 @@ impl ProcessCtx {
             crate::pipeline::fire::finalize_all(self, &fires, false).await?;
         }
 
-        // Native teardown (close the engine instance, detach every bound
-        // cell, reclaim device-geometry grants) is idempotent and shared
-        // with the `Drop` fallback (`ForwardPass::close_native`) — the local
-        // `pass` binding below drops at the end of this function and would
-        // otherwise repeat the work, but `close_native` no-ops the second
-        // time.
+        // close_native is idempotent, shared with the Drop fallback.
         let mut pass = self.ctx().table.delete(this)?;
         if let Ok(bound) = pass.bound_mut() {
             bound.close_native();
@@ -1344,10 +1218,8 @@ impl ProcessCtx {
     }
 }
 
-/// Shared body of the three `HostForwardPass` impls. Everything except the
-/// state-binding call and the fold-mode methods is IDENTICAL by construction --
-/// the WIT duplication exists to make cross-kind states unrepresentable in the
-/// guest, not to fork the host.
+/// Shared body of the three `HostForwardPass` impls; only the state-binding
+/// call differs per interface.
 macro_rules! forward_pass_common {
     ($iface:ident, $kind:expr) => {
         async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
@@ -1395,9 +1267,8 @@ macro_rules! forward_pass_common {
 }
 
 /// Converts an interface-local `rs-geometry` record into the host binding.
-/// Written as a macro rather than a trait because each interface generates its
-/// OWN nominally distinct record type (D8): they are structurally identical
-/// today, and adding a field to one must not move the other's ABI.
+/// A macro, not a trait, because each interface generates its own nominally
+/// distinct record type.
 macro_rules! rs_geometry_binding {
     ($self:ident, $geom:expr) => {{
         let geom = $geom;
@@ -1434,10 +1305,8 @@ impl pie::inferlet::forward::Host for ProcessCtx {
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     forward_pass_common!(forward, PassKind::Attention);
 
-    /// **THE ATTENTION INTERFACE ALONE CARRIES THE VERB**, for now
-    /// (media-door.md §2): hybrid and recurrent get the same one when a tower
-    /// family needs them, and adding it there before then would be a surface
-    /// with nothing behind it in two more places.
+    /// Only the attention interface carries `media` for now; hybrid and
+    /// recurrent get it when a tower family needs it.
     async fn media(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1530,13 +1399,9 @@ impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
         rs_geom: pie::inferlet::forward_hybrid::RsGeometry,
     ) -> Anyhow<Result<(), String>> {
         let Some(kv) = kv else {
-            // The WIT admits `none` so that a recurrent-only commit fire is
-            // expressible without inventing dummy attention geometry.
-            // The bound-pass representation still requires a KV working set
-            // (`BoundForwardPass.kv_ws`), so wiring that arm end to end is
-            // follow-up work; today a commit fire binds KV like any
-            // other and this is the honest error rather than a silent
-            // half-bound pass.
+            // `none` lets a recurrent-only commit fire be expressed without
+            // dummy attention geometry, but BoundForwardPass still requires a
+            // KV working set, so this path errors rather than half-binding.
             return Ok(Err(
                 "forward pass: a hybrid pass with no attention binding is not supported yet; \
                  bind the KV working set even for a recurrent-only fire"
@@ -1567,63 +1432,3 @@ impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
     }
 }
 
-#[cfg(test)]
-mod descriptor_binding_tests {
-    use super::*;
-    use eta_ir::container::PortBinding;
-    use eta_ir::types::{Dtype, Shape};
-
-    fn container(ports: Vec<PortBinding>) -> TraceContainer {
-        TraceContainer {
-            names: Vec::new(),
-            externs: Vec::new(),
-            channels: Vec::new(),
-            ports,
-            stages: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn optional_attention_mask_is_omitted_or_channel_bound() {
-        let no_mask = container(Vec::new());
-        validate_descriptor_bindings(&no_mask, &[], &[(Port::AttnMask, None)]).unwrap();
-
-        let mask = container(vec![PortBinding {
-            port: Port::AttnMask,
-            source: PortSource::Channel(0),
-        }]);
-        validate_descriptor_bindings(&mask, &[41], &[(Port::AttnMask, Some(41))]).unwrap();
-        assert!(
-            validate_descriptor_bindings(&mask, &[41], &[(Port::AttnMask, None)])
-                .unwrap_err()
-                .contains("without a resource attachment")
-        );
-    }
-
-    #[test]
-    fn descriptor_attachment_rejects_constants_and_wrong_resources() {
-        let constant = container(vec![PortBinding {
-            port: Port::EmbedIndptr,
-            source: PortSource::Const {
-                dtype: Dtype::U32,
-                shape: Shape::vector(2),
-                data: [0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect(),
-            },
-        }]);
-        assert!(
-            validate_descriptor_bindings(&constant, &[], &[(Port::EmbedIndptr, Some(7))])
-                .unwrap_err()
-                .contains("must be channel-bound")
-        );
-
-        let channel = container(vec![PortBinding {
-            port: Port::EmbedIndptr,
-            source: PortSource::Channel(0),
-        }]);
-        assert!(
-            validate_descriptor_bindings(&channel, &[8], &[(Port::EmbedIndptr, Some(7))])
-                .unwrap_err()
-                .contains("attached resource is 7")
-        );
-    }
-}

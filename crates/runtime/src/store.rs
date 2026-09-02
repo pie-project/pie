@@ -1,19 +1,6 @@
-//! Typed resource stores (kv_refact.md): device memory as pages, slots, and
-//! mappings. Replaces the generic KV-page-sized `Arena` with resource-specific
-//! stores over typed static backing pools.
-//!
-//! - [`kv`]: `KvStore` — the mapping trie, hash lifecycle, and prepare/commit/
-//!   abort protocol over the physical KV page pool.
-//! - `rs`: `RsStore` — the recurrent-state slot store (GDN/Mamba2 folded
-//!   state) with the same prepare/commit/abort protocol.
-//! - [`seat`]: `SeatBook` — which pool slot each working set's sequences sit
-//!   in, which is what `Lane::slot` states to a shell.
-//! - `pool`/`genmap`: the physical-id free list and generational key map the
-//!   typed stores are built on.
-//! - `registry`: per-(model, engine) lookup of the owning `KvStore`/`RsStore`.
-//!
-//! KV-contention policy lives ABOVE this module in `crate::planner` (Project
-//! Rainer); the stores own only physics (pools, transactions, swap).
+//! Typed resource stores: device memory as pages, slots, and mappings, over
+//! typed static backing pools. KV-contention policy lives in `crate::planner`;
+//! these stores own only physics (pools, transactions, swap).
 
 pub(crate) mod genmap;
 pub(crate) mod kv;

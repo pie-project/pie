@@ -7,21 +7,14 @@ use model_ir::CustomCuda;
 use crate::run::Run;
 
 impl DispatchCustomCuda for Run<'_> {
-    /// The cuda-plane fused family on its home `Run` — this is the shell
-    /// the trace emitted it for, so the arm dispatches the real entry. The
-    /// write side lands by the op's own `write_page`/`write_offset`
-    /// descriptors; `positions` stays the rope input.
+    /// Write side uses the op's own `write_page`/`write_offset`; `positions` is the rope input.
     fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
         self.custom_cuda(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    /// The arms themselves, in `kernels-cuda`'s error vocabulary and not
-    /// the contract's — which is what keeps each one a plain tail call with
-    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
-    /// above that lifts the family, and says why it is a call and not a
-    /// `From` impl.
+    /// Returns `kernels_cuda::Error`, lifted by [`kernel`](crate::error::kernel) in `dispatch` above.
     fn custom_cuda(&mut self, op: &CustomCuda) -> Result<(), kernels_cuda::Error> {
         match op {
             CustomCuda::QkvFusedQknormRopeVnormWrite {

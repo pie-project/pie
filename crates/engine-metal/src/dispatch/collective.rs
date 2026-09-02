@@ -13,11 +13,8 @@ impl DispatchCollective for Run<'_> {
 }
 
 impl Run<'_> {
-    /// The arms themselves, in `kernels-metal`'s error vocabulary and not
-    /// the contract's — which is what keeps each one a plain tail call with
-    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
-    /// above that lifts the family, and says why it is a call and not a
-    /// `From` impl.
+    /// The arms themselves, in `kernels-metal`'s error vocabulary, lifted by
+    /// [`kernel`](crate::error::kernel) above.
     fn collective(&mut self, op: &Collective) -> Result<(), kernels_metal::Error> {
         match op {
             Collective::AllReduce { buf, buf_out: _ } => {

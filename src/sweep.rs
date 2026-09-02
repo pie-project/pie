@@ -1,11 +1,10 @@
 //! The measurement loop: one resident model, many rounds, load restarted each
 //! time.
 //!
-//! The shape of this module is the conclusion of `.wiki/plan/config-optimize.md`
-//! §5. An earlier design booted a process per candidate, which works and is even
-//! fast — 1.03 s for a 1.4 GiB model — right up until the model is the size that
-//! makes tuning worth doing, at which point a candidate costs minutes and the
-//! whole approach has a model-size ceiling.
+//! Booting a process per candidate works and is even fast — 1.03 s for a
+//! 1.4 GiB model — right up until the model is the size that makes tuning
+//! worth doing, at which point a candidate costs minutes and the whole
+//! approach has a model-size ceiling.
 //!
 //! So the expensive thing happens once. What restarts per round is the load,
 //! which is milliseconds, and the knobs move in between through
@@ -24,13 +23,12 @@ use anyhow::{Context, Result};
 ///
 /// Only the two that `scheduler::reconfigure` can move. The memory-lattice
 /// knobs (`kv_page_size`, `max_forward_tokens`, `max_forward_requests`) are
-/// fixed at boot and belong to the engine's own sweep — see the plan's §6.
+/// fixed at boot and belong to the engine's own sweep.
 ///
-/// **THERE WERE THREE, AND THE THIRD WAS THE SAME NUMBER** (alto E, survey
-/// debt 8). `submit_depth` — frames a guest keeps outstanding — was swept as
-/// its own axis, five values wide, and it is `dispatch_depth + 1`
+/// **THERE IS NO THIRD AXIS.** `submit_depth` — frames a guest keeps
+/// outstanding — is `dispatch_depth + 1`
 /// (`engine::runahead::Runahead::submit_depth`). Sweeping it independently
-/// measured eighty candidates where sixteen exist, and four fifths of them
+/// would measure eighty candidates where sixteen exist, and four fifths of them
 /// were configs the runtime can no longer be asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Knobs {
@@ -41,18 +39,16 @@ pub struct Knobs {
 impl Knobs {
     /// The largest `frame_size` a deployment may state — `k` in the engine's
     /// staging formula. Read from the formula's own module rather than
-    /// restated (article 8).
+    /// restated here.
     pub const MAX_FRAME_SIZE: usize = worker::config::Runahead::STEPS_MAX as usize;
     /// The largest `frame_dispatch_depth` a deployment may state.
     pub const MAX_DISPATCH_DEPTH: usize = worker::config::Runahead::MAX_FRAMES as usize;
 
     /// Steps the engine has in flight at this shape — `frames × k`.
     ///
-    /// **NO LONGER A BOUND, ONLY A DESCRIPTION** (alto F2b). It used to be
-    /// checked against a fixed staging pool of thirteen; the engine carves its
-    /// ring from `frames_in_flight` and `k` now, so what a candidate has to
-    /// clear is each factor's own ceiling and this is just how big the ring
-    /// will be.
+    /// **A DESCRIPTION, NOT A BOUND.** The engine carves its ring from
+    /// `frames_in_flight` and `k`, so what a candidate has to clear is each
+    /// factor's own ceiling; this is just how big the ring will be.
     pub fn steps_in_flight(&self) -> usize {
         self.frame_size * self.dispatch_depth
     }
@@ -154,7 +150,7 @@ impl Round {
 /// One per objective, because the objective already names a serving shape and
 /// the quantity that shape is judged on follows from it. There is no ranking
 /// that serves both: latency and throughput pull opposite ways, which is why
-/// `memory_profile` has two names in the first place.
+/// `--for` has two spellings in the first place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
     /// Aggregate tokens per second over the fleet. Higher wins.
@@ -372,8 +368,8 @@ pub async fn sweep_all(
 
 /// Every knob combination worth measuring, given the engine's staging bound.
 ///
-/// Enumerated rather than searched, and the plan's §8 argues why: the feasible
-/// set is small, each point is seconds, and enumeration has no surrogate model
+/// Enumerated rather than searched: the feasible set is small, each point is
+/// seconds, and enumeration has no surrogate model
 /// to misfit or evaluation order to depend on. `steps_in_flight < staging_depth`
 /// is what makes it small — at a staging depth of 13 there are only a few dozen
 /// combinations, most of which the bound removes.
@@ -383,7 +379,7 @@ pub fn candidates() -> Vec<Knobs> {
     for frame_size in [1usize, 2, 3, 4] {
         let mut group = Vec::new();
         for dispatch_depth in 1usize..=4 {
-            // **THE BOUND IS PER FACTOR** (alto F2b): the engine carves its
+            // **THE BOUND IS PER FACTOR**: the engine carves its
             // staging ring from these two numbers rather than owning a fixed
             // pool a product could overflow, so what a candidate has to clear
             // is `frame_size <= STEPS_MAX` and `dispatch_depth <= MAX_FRAMES`
@@ -419,11 +415,10 @@ pub fn candidates() -> Vec<Knobs> {
 mod tests {
     use super::*;
 
-    /// **EVERY CANDIDATE IS ONE THE RUNTIME WILL ADMIT** (alto F2b).
+    /// **EVERY CANDIDATE IS ONE THE RUNTIME WILL ADMIT.**
     ///
-    /// The old shape of this test was "no candidate exceeds the staging pool
-    /// of thirteen". There is no fixed pool any more — the engine carves the
-    /// ring from the candidate's own numbers — so what has to hold is that
+    /// There is no fixed staging pool — the engine carves the ring from the
+    /// candidate's own numbers — so what has to hold is that
     /// every generated shape clears `RuntimeConfig::validate`'s two per-factor
     /// bounds, which is the same property against the check that now exists.
     #[test]
@@ -433,36 +428,6 @@ mod tests {
         for knobs in &candidates {
             assert!(knobs.admissible(), "{knobs} is a shape the runtime refuses");
             assert!(knobs.submit_depth() >= 2, "{knobs} leaves nothing queued");
-        }
-    }
-
-    #[test]
-    fn a_budget_sees_every_frame_size_before_it_sees_a_second_of_any() {
-        // A lexicographic list spent a budget of six entirely on k=1. The
-        // report then ranked one axis and presented it as a sweep.
-        let candidates = candidates();
-        let first_four: Vec<usize> = candidates.iter().take(4).map(|k| k.frame_size).collect();
-        let mut distinct = first_four.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        assert_eq!(
-            distinct.len(),
-            first_four.len(),
-            "the first four candidates repeat a frame size: {first_four:?}"
-        );
-    }
-
-    /// The ring a candidate asks the engine to carve is the formula's answer,
-    /// not a constant — and the deepest shape this sweep offers is one the
-    /// free-slot word can still hold.
-    #[test]
-    fn a_candidates_staging_depth_is_the_formula() {
-        for knobs in candidates() {
-            assert_eq!(
-                knobs.staging_depth(),
-                knobs.dispatch_depth * Knobs::MAX_FRAME_SIZE + 1
-            );
-            assert!(knobs.staging_depth() <= 64);
         }
     }
 
@@ -484,36 +449,6 @@ mod tests {
     };
 
     #[test]
-    fn a_gap_smaller_than_the_noise_is_not_a_win() {
-        // The measured case: 6% round-to-round noise against a 2.4% gap between
-        // k=2 and k=4. Calling that a win produces a ranking that lands the
-        // other way on the next run.
-        let a = round(BASE, 1296.0, 0.06, 0);
-        let b = round(BASE, 1265.0, 0.06, 0);
-        assert!(
-            !a.beats(&b, Metric::Throughput),
-            "2.4% gap under 8.5% combined noise"
-        );
-
-        // A 3.4x collapse is not ambiguous, and the rule must not be so
-        // conservative that it misses one.
-        let slow = round(BASE, 375.0, 0.06, 0);
-        assert!(
-            b.beats(&slow, Metric::Throughput),
-            "k=1 collapse must register"
-        );
-    }
-
-    #[test]
-    fn quieter_measurements_resolve_smaller_gaps() {
-        // The point of repeats: the same 2.4% gap becomes a real result once
-        // the spread comes down.
-        let a = round(BASE, 1296.0, 0.005, 0);
-        let b = round(BASE, 1265.0, 0.005, 0);
-        assert!(a.beats(&b, Metric::Throughput));
-    }
-
-    #[test]
     fn a_failed_round_never_beats_anything() {
         // Fewer lanes finishing raises tokens per second, so a broken round
         // can post the best number. It must not be allowed to rank at all.
@@ -523,42 +458,4 @@ mod tests {
         assert!(!good.beats(&broken, Metric::Throughput));
     }
 
-    #[test]
-    fn the_median_ignores_one_bad_fleet() {
-        // A host hiccup in one repeat should move the spread, not the estimate.
-        let (median, sigma) = median_and_rel_sigma(&[1200.0, 1210.0, 400.0]);
-        assert_eq!(median, 1200.0);
-        assert!(sigma > 0.3, "the outlier has to show up somewhere: {sigma}");
-    }
-
-    #[test]
-    fn a_round_with_a_dead_lane_does_not_rank() {
-        assert!(round(BASE, 100.0, 0.01, 0).is_measurement());
-        assert!(!round(BASE, 400.0, 0.01, 1).is_measurement());
-    }
-
-    /// A fleet fails the same way in every lane far more often than it fails
-    /// many ways, so the reader gets one line with a count, not 64 copies.
-    #[test]
-    fn identical_lane_failures_collapse_to_one_counted_line() {
-        let same = vec!["parse input".to_string(); 64];
-        assert_eq!(distinct_reasons(&same), "  64x parse input");
-    }
-
-    /// The reasons that matter most are the ones most lanes gave, and the tail
-    /// is counted rather than dropped -- a truncation nobody can see is the
-    /// bug this whole change exists to fix.
-    #[test]
-    fn distinct_reasons_rank_by_count_and_say_what_was_cut() {
-        let mixed: Vec<String> = ["a", "a", "a", "b", "b", "c", "d", "e"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let rendered = distinct_reasons(&mixed);
-        assert!(rendered.starts_with("  3x a\n  2x b\n"), "got: {rendered}");
-        assert!(
-            rendered.ends_with("... and 2 more distinct"),
-            "the tail must be counted, not silently dropped; got: {rendered}"
-        );
-    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "dtype"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The one element-type enum: what a weight plane, a kv page, a checkpoint tensor and a compute value all say when asked what they hold. A leaf crate — the enum, its width in bits, plain serde, no internal deps."
@@ -13,17 +13,15 @@ name = "dtype"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# On by default, so every host consumer that named this crate before the
-# feature existed sees exactly what it saw. It is a feature at all for one
-# consumer: `eta-ir`, the crate a wasm guest imports, which is `no_std` with
-# its own `serde` off by default and takes this one with
-# `default-features = false`. `default-features = false` + `alloc` keeps the
-# `no_std` promise in the lib.rs header true even when the feature is on.
+# A feature for one consumer: `eta-ir`, which a wasm guest imports and which
+# takes this crate with `default-features = false`. On by default for everyone else.
 [features]
 default = ["serde"]
 serde = ["dep:serde"]
 
 [dependencies]
+# `default-features = false` + `alloc` keeps the `no_std` promise in the lib.rs
+# header true even when the feature is on.
 serde = { version = "1.0", default-features = false, features = [
     "alloc",
 ], optional = true }

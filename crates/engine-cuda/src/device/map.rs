@@ -1,100 +1,17 @@
-//! **THE NODE MAP, PROMOTED** (`.wiki/palo/cuda-abi.md` §7, step 3): the walk
-//! stops being a census and becomes a coordinate system.
+//! Rebind coordinate system over a captured graph: per node the live
+//! `CUgraphNode_t`, entrypoint, parameter cells, grid/block/shared memory —
+//! indexed so two captures of the same walk agree, which is what lets
+//! [`diff`] say what moved. Measures only; writes nothing.
 //!
-//! [`nodes::walk`](crate::device::nodes::walk) reads a captured graph and
-//! hands back what the driver said. This module turns one such reading into a
-//! coordinate system over it: per node the live `CUgraphNode_t`, its
-//! entrypoint, its `(offset, size)` parameter cells and the bytes the capture
-//! froze into them, its grid, block and shared memory — all indexed so that
-//! TWO captures of the same walk agree, which is what makes [`diff`] able to
-//! say WHAT MOVED between one composition's capture and another's.
-//!
-//! **AND WHAT IT WAS BUILT FOR NO LONGER EXISTS, WHICH IS WORTH SAYING
-//! PLAINLY.** Step 4 of `.wiki/palo/cuda-abi.md` §7 kept one of these tables
-//! beside each exec and applied [`diff`]'s [`Patch`]es with
-//! `cudaGraphExecKernelNodeSetParams` — the FOLD, which the tier-2 campaign
-//! deleted along with the keyed capture path. A body writes into no exec at
-//! all (`record.rs`'s header states why: absence rides the key, and the row
-//! count rides a staged seat), so nothing on the fire path holds a table or
-//! wants a patch.
-//!
-//! What survives is the measurement surface, and it survives on its own
-//! merits. Two captures of two compositions, diffed here, are how this shell
-//! answers "how much of a graph is actually a function of the fire" without
-//! running one — the question every future device-side-descriptor wave opens
-//! with, and the question poc1-24's cost laws were measured against. The
-//! probe gates (`cuda_node_map`, `cuda_descriptor_abi_probe`) are its
-//! callers, `record::Graphs::keep_graphs` is the seam that hands them real
-//! captured bodies, and this module is what they read those bodies through.
-//!
-//! **This module writes nothing**, which is the part of step 4's design that
-//! was right independently of step 4: what moved is derivable from the two
-//! graphs ALONE and is therefore testable without an exec, a fire, or a
-//! checkpoint, while the write needs a policy (which exec, which fire,
-//! whether the pass is worth its 68 µs) that no pair of graphs contains. The
-//! mechanical write half stood here — `apply`, one
-//! `cudaGraphExecKernelNodeSetParams` per [`Patch`] — and went out with the
-//! fold that called it. What a measurement still needs from that call is its
-//! PRICE and the fields the driver validates, and that is
-//! [`nodes::rebind`](crate::device::nodes::rebind), which has a probe caller.
-//! [`Patch`] stays what it always was: the report `diff` writes, carrying the
-//! live handles because a table that held only the numbers could describe a
-//! rebind without being able to perform one — and [`Patch::block`] stays
-//! beside it, because the ABI packing is a fact this module's own unit test
-//! asserts and the next writer of a captured node will need.
-//!
-//! # The fingerprint hashes a multiset, and the reason is the tiebreak
-//!
-//! `cuGraphGetNodes` returns nodes in an order the driver never specified, so
-//! the walk canonicalises: longest-path depth, then symbol, then the
-//! enumeration index. The first two keys are facts about the GRAPH. The third
-//! is a fact about the ENUMERATION, and the driver has not promised to
-//! enumerate the same way twice — which means that for a class of same-depth
-//! same-symbol nodes the canonical index is a coin the driver flips. A
-//! fingerprint taken over the canonical SEQUENCE would therefore be a
-//! fingerprint of that coin: two captures of one walk could disagree about
-//! their own identity, and the disagreement would present as a permanent
-//! cache miss nobody could explain.
-//!
-//! So [`Topology`] hashes only material a permutation inside a class cannot
-//! move:
-//!
-//! ```text
-//! nodes  the multiset of (depth, kind, symbol)
-//! edges  the multiset of ((depth, kind, symbol) -> (depth, kind, symbol))
-//! ```
-//!
-//! and two counts beside it. Both multisets are hashed in the canonical order
-//! precisely because that order sorts them: equal multisets give equal
-//! sequences of `(depth, symbol, kind)`, which is the alignment [`diff`]
-//! needs and is why the fingerprint is worth taking rather than merely
-//! comparing lengths.
-//!
-//! What the fingerprint deliberately does NOT hash: any argument, any grid,
-//! any pointer. Those are exactly what a rebind exists to move, and a
-//! fingerprint that noticed them would call every fire a new topology — which
-//! is the retired exact-shape key wearing a hash's costume.
-//!
-//! # The ambiguity census is a result, not a warning
-//!
-//! The probe counted 78 same-depth same-symbol nodes on the mixed
-//! composition, and that number is the whole risk in this module. Within such
-//! a class the canonical index is a guess, so a [`diff`] that aligned two
-//! captures by index would be aligning two guesses. Where the guesses cannot
-//! matter — every member of the class carries byte-identical arguments in
-//! both captures — the alignment is unobservable and the class passes with no
-//! patch. Where they can, this module refuses by name
-//! ([`Refused::Ambiguous`]): **aligning them by guess can hand node A node
-//! B's buffer, and the mistake computes.** It does not fault, it does not
-//! diverge, it returns slightly wrong numbers forever, which is the failure
-//! mode the whole `palo` graph plane is built to keep structural.
-//!
-//! Note what is refused along with it: a class whose two captures hold the
-//! SAME SET of arguments in a different index order. It looks like a swap and
-//! a swap looks repairable, but a permutation that is right about the bytes
-//! can still be wrong about the edges — the two nodes have different
-//! successors, and only the driver knows which handle it gave to which. A
-//! guess that is right by luck is not a mechanism.
+//! `cuGraphGetNodes` returns nodes in an undocumented order, so nodes are
+//! canonicalized by `(depth, symbol, enumeration index)`, and [`Topology`]
+//! hashes only the multiset of `(depth, kind, symbol)` nodes/edges (never
+//! the enumeration index or an argument/grid/pointer value), so it's stable
+//! across captures of one composition. Within a same-depth-same-symbol
+//! class, the canonical index is an unspecified tiebreak; [`diff`] refuses
+//! ([`Refused::Ambiguous`]) rather than align such a class by guess when the
+//! guess could matter, since a wrong alignment would silently compute wrong
+//! numbers rather than fault.
 
 use core::ffi::c_void;
 use core::fmt;
@@ -105,49 +22,24 @@ use crate::device::graph::Graph;
 use crate::device::nodes::{self, Node, Param, Walked};
 use crate::error::Result;
 
-/// The shared vocabulary this module is written in (seat wave B-law).
-///
-/// **THE NOUNS MOVED AND THE MACHINERY DID NOT.** `diff` still aligns two
-/// captures by canonical index and still reports what moved per eight-byte
-/// word; what changed is that the report is spelled in the language the Metal
-/// plane's `abi` fits laws in, so one reader can put the two censuses side by
-/// side. The mapping this module used to spell privately:
-///
-/// ```text
-/// was (map::Component)   is now
-/// Component::Func        Component { at: At::Entry, .. }
-/// Component::Grid(k)     Component { at: At::Grid(k), .. }
-/// Component::Block(k)    Component { at: At::Block(k), .. }
-/// Component::Smem        Component { at: At::Shared, .. }
-/// Component::Arg{at,w}   Component { at: At::Arg { at, word: w }, .. }
-/// Component::Shape       Component { at: At::Shape, .. }
-/// ```
-///
-/// and every one of them now also carries WHICH node (the canonical index,
-/// which the caller previously had to read off the enclosing [`Patch`]) and
-/// WHAT the number is. A two-capture diff observes rather than solves, so the
-/// law is always a [`Law::Const`] of the value the new capture wants — which
-/// is exactly the claim `cudaGraphExecKernelNodeSetParams` is handed.
+/// Shared vocabulary this module reports diffs in (from `model_exec::law`).
+/// A two-capture diff observes rather than solves, so the law is always a
+/// [`Law::Const`] of the value the new capture wants.
 pub use model_exec::law::{At, Component, Law};
 
 // ─────────────────────────────────────────────────────────────────────────
 // The fingerprint
 
-/// The order-invariant identity of a captured graph's SHAPE.
+/// The order-invariant identity of a captured graph's shape.
 ///
-/// Equality is what [`diff`] requires before it aligns anything, and the
-/// three fields are compared together on purpose: the hash is 64 bits of
-/// FNV-1a over a multiset, and a collision that also matched both counts
-/// would still be caught by the per-node `(depth, symbol, kind)` check
-/// [`diff`] runs before it trusts an index.
+/// Equality is what [`diff`] requires before it aligns anything; a hash
+/// collision would still be caught by [`diff`]'s per-node
+/// `(depth, symbol, kind)` check before trusting an index.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Topology {
-    /// FNV-1a over the node multiset and the edge multiset.
-    ///
-    /// FNV rather than [`std::hash::DefaultHasher`] because that one is
-    /// SipHash with a per-process seed in the general case and its output is
-    /// explicitly not a stable value; this number is meant to be printable in
-    /// a log and comparable to the same graph's number in another process.
+    /// FNV-1a over the node and edge multisets. FNV rather than the stdlib
+    /// hasher, whose output is seeded per-process and not stable across runs
+    /// or comparable in a log.
     pub hash: u64,
     /// How many nodes the graph holds, kernel and otherwise.
     pub nodes: usize,
@@ -160,17 +52,16 @@ impl Topology {
     #[must_use]
     pub fn of(walked: &Walked) -> Topology {
         let mut hash = FNV_OFFSET;
-        // The nodes, in the canonical order — which IS the sorted multiset,
-        // because the sort's first two keys are the material being hashed.
+        // Nodes in canonical order, which is already the sorted multiset
+        // (the sort keys are the material being hashed).
         for node in &walked.nodes {
             fold(&mut hash, &node.depth.to_le_bytes());
             fold(&mut hash, &node.kind.to_le_bytes());
             fold(&mut hash, node.symbol.as_bytes());
             fold(&mut hash, b"|");
         }
-        // The edges, named by what their endpoints ARE rather than by where
-        // the enumeration put them, and sorted so the driver's edge order is
-        // as unobservable as its node order.
+        // Edges named by endpoint identity, not enumeration position, then
+        // sorted so the driver's edge order is unobservable too.
         let mut edges: Vec<(usize, u32, &str, usize, u32, &str)> = walked
             .links
             .iter()
@@ -243,10 +134,7 @@ pub struct Ambiguous {
 }
 
 /// What one [`NodeMap`] is, in numbers — the line a probe prints and a load
-/// logs.
-///
-/// Printed, not pinned. The probe's own lesson: pin the rules, print the
-/// catalogs — a census that was asserted would fail on the next driver
+/// logs. Printed, not asserted: pinning it would fail on the next driver
 /// version for reasons that are nobody's bug.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Census {
@@ -294,12 +182,9 @@ impl fmt::Display for Census {
 
 /// One captured graph, as a rebind coordinate system.
 ///
-/// Built once per capture and held for the life of the exec instantiated from
-/// the same graph. **It borrows nothing and owns no handle**: the
-/// `CUgraphNode_t` in every [`Node`] belongs to the `cudaGraph_t` the walk
-/// read, so the graph has to outlive the map for a [`Patch`] taken from it to
-/// be applicable — which is the same rule `record.rs` already keeps for the
-/// graph a kept exec was instantiated from.
+/// Built once per capture, held for the exec's life. Owns no handle: the
+/// `CUgraphNode_t` in every [`Node`] belongs to the source `cudaGraph_t`, so
+/// that graph must outlive the map for a [`Patch`] taken from it to apply.
 #[derive(Clone, Debug)]
 pub struct NodeMap {
     topology: Topology,
@@ -326,12 +211,10 @@ impl NodeMap {
         Ok(NodeMap::from_walk(nodes::walk(graph)?))
     }
 
-    /// Build the map from a walk somebody else took.
+    /// Builds the map from a walk somebody else took.
     ///
-    /// Takes the walk by value: the map IS the walk plus the two indices
-    /// derived from it, and a version that cloned would put a second copy of
-    /// every argument block — ~52 KiB of by-value structs on the mixed
-    /// composition — beside the first for no reader.
+    /// Takes the walk by value rather than cloning it, since a clone would
+    /// duplicate every argument block for no reader.
     #[must_use]
     pub fn from_walk(walked: Walked) -> NodeMap {
         let topology = Topology::of(&walked);
@@ -339,9 +222,8 @@ impl NodeMap {
             nodes, ambiguous, ..
         } = walked;
 
-        // The classes: runs of equal `(depth, symbol)` in the canonical
-        // order. They ARE runs — the order sorts by exactly those two keys
-        // before it reaches the tiebreak — so one pass finds every class.
+        // Classes are runs of equal (depth, symbol) in canonical order,
+        // since the sort's primary keys are exactly those two.
         let mut classes: Vec<Ambiguous> = Vec::new();
         let mut class_of: Vec<Option<usize>> = vec![None; nodes.len()];
         let mut at = 0usize;
@@ -459,12 +341,9 @@ fn words(param: &Param) -> usize {
 /// One node's worth of rebind: everything
 /// `cudaGraphExecKernelNodeSetParams` wants, plus the reason it is here.
 ///
-/// **THE HANDLE IS THE OLD MAP'S AND THE VALUES ARE THE NEW WALK'S**, which
-/// is the whole point: the exec was instantiated from the graph the map was
-/// built from, so that is the node the driver will accept, and the numbers
-/// written into it come from the walk that says what this fire wants. A patch
-/// is valid only while both graphs are alive — the old one owns
-/// [`node`](Patch::node), the new one's module owns [`entry`](Patch::entry).
+/// The handle is the old map's (the node the driver accepts, since the exec
+/// was instantiated from the old graph); the values are the new walk's.
+/// Valid only while both graphs are alive.
 #[derive(Clone, Debug)]
 pub struct Patch {
     /// Which node, in the map's canonical order.
@@ -481,29 +360,19 @@ pub struct Patch {
     pub block: [u32; 3],
     /// Dynamic shared memory, in bytes.
     pub smem: u32,
-    /// The WHOLE parameter block, not only the cells that moved: the driver
-    /// call takes all of it, so a patch that carried a delta would make its
-    /// consumer reconstruct the rest and get one wrong on the day a component
-    /// this module does not compare starts moving.
+    /// The whole parameter block, not only the cells that moved: the driver
+    /// call takes all of it, so a delta would leave the consumer to
+    /// reconstruct the rest.
     pub params: Vec<Param>,
     /// What differed — reported, so a caller can say WHY it rebound.
     pub moved: Vec<Component>,
 }
 
-
 impl Patch {
     /// The parameter block as the ABI lays it out: one buffer, each parameter
-    /// at its own `offset`.
-    ///
-    /// **THE ABI FACT, KEPT AS CODE BECAUSE A UNIT TEST ASSERTS IT**
-    /// (`a_patch_packs_its_parameters_where_the_abi_puts_them`). The
-    /// `CU_LAUNCH_PARAM_BUFFER_POINTER` form of
-    /// `cudaGraphExecKernelNodeSetParams` takes exactly this — one `Vec<u8>`
-    /// per node, no per-kernel pointer array to keep alive — which is what
-    /// made the fold's application mechanical. The fold is deleted and the
-    /// call has no in-tree caller; the PACKING is still the thing every
-    /// future writer of a captured node has to get right, and the cheapest
-    /// place to state it is beside the type that carries the cells.
+    /// at its own `offset`. Matches what `CU_LAUNCH_PARAM_BUFFER_POINTER`
+    /// expects; asserted by `a_patch_packs_its_parameters_where_the_abi_puts_them`
+    /// below.
     #[must_use]
     pub fn block(&self) -> Vec<u8> {
         let len = self
@@ -524,15 +393,8 @@ impl Patch {
 /// What two captures of one shape have to say to each other.
 #[derive(Clone, Debug)]
 pub enum Diff {
-    /// The two walks are not the same graph, so no alignment between them
-    /// exists.
-    ///
-    /// **NOT A REFUSAL.** A composition no capture has stood for yet is the
-    /// ordinary case — it is captured and keyed, which is what
-    /// `record::Graphs` does for every present set its lattice enumerates.
-    /// Naming it here keeps the caller from having to tell "this is a
-    /// different graph" apart from "this graph cannot be trusted", which are
-    /// answers with different consequences.
+    /// The two walks are not the same graph, so no alignment exists. Not a
+    /// refusal: an uncaptured composition is the ordinary case.
     NotSameTopology {
         /// What the map was built from.
         held: Topology,
@@ -551,21 +413,14 @@ pub enum Diff {
     },
 }
 
-/// Why a rebind cannot be derived from these two captures.
-///
-/// A refusal, not a diff: nothing here is repairable by trying harder, and
-/// every variant names the symbol and the depth so the operator can find the
-/// launch in the model rather than in the graph.
+/// Why a rebind cannot be derived from these two captures. Not repairable by
+/// trying harder; every variant names the symbol and depth so the operator
+/// can find the launch in the model rather than the graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
     /// A class of same-depth same-symbol nodes whose arguments disagree
-    /// between the two captures.
-    ///
-    /// Aligning them by guess can hand node A node B's buffer, and the
-    /// mistake COMPUTES — no fault, no divergence, slightly wrong numbers
-    /// forever. The fix is upstream: make the two launches distinguishable
-    /// (a depth apart, or a symbol apart), or key the exec rather than
-    /// rebinding it.
+    /// between the two captures. Aligning by guess could hand one node
+    /// another's buffer and silently compute wrong numbers forever.
     Ambiguous {
         /// The depth the class shares.
         depth: usize,
@@ -579,17 +434,12 @@ pub enum Refused {
         differing: usize,
         /// The first component that differed, in canonical order.
         component: Component,
-        /// How many OTHER refusals this diff also found — the scale, so a
-        /// caller does not learn it one capture at a time.
+        /// How many other refusals this diff also found.
         more: usize,
     },
-    /// A node whose parameter block could not be read, and which moved.
-    ///
-    /// The driver call restates a node's parameters in full, so a block that
-    /// was never readable cannot be written either: patching its grid alone
-    /// would mean handing the driver argument cells this module never had.
-    /// A node like this that did NOT move is fine and is not reported — the
-    /// refusal is against rewriting it, not against its existence.
+    /// A node whose parameter block could not be read, and which moved. The
+    /// driver call restates a node's parameters in full, so an unreadable
+    /// block can't be patched at all.
     Opaque {
         /// Its canonical index.
         at: usize,
@@ -649,11 +499,8 @@ impl fmt::Display for Refused {
 }
 
 impl Refused {
-    /// This refusal's shared reason (seat wave B-law).
-    ///
-    /// The payloads stay this module's — a depth, a symbol, a class size and
-    /// the scale of the rest are what an operator needs to find the launch in
-    /// the model — and the REASON is the one both planes tally by.
+    /// This refusal's shared reason. Payloads stay module-specific (depth,
+    /// symbol, class size); the reason is what both planes tally by.
     #[must_use]
     pub fn reason(&self) -> Refuse {
         match self {
@@ -673,14 +520,11 @@ fn plural(more: usize) -> String {
     }
 }
 
-/// Align a fresh walk against a map, and say what a rebind would write.
+/// Aligns a fresh walk against a map, and says what a rebind would write.
 ///
-/// The three answers are deliberately three types and not two: a topology
-/// that does not match is [`Diff::NotSameTopology`] and is ORDINARY (capture
-/// a new graph); a topology that matches produces [`Diff::Aligned`] and a
-/// patch list; a topology that matches but cannot be aligned truthfully is
-/// [`Refused`] and is an error. Nothing here applies a patch — see the module
-/// docs for why the write lives in `record.rs`.
+/// Three outcomes: a topology mismatch is [`Diff::NotSameTopology`]; a match
+/// produces [`Diff::Aligned`] with a patch list; a match that can't be
+/// aligned truthfully is [`Refused`]. Nothing here applies a patch.
 ///
 /// # Errors
 ///
@@ -698,10 +542,8 @@ pub fn diff(held: &NodeMap, brought: &Walked) -> core::result::Result<Diff, Refu
         return Ok(mismatch());
     }
 
-    // Equal multisets give equal `(depth, kind, symbol)` sequences — the sort
-    // is over exactly those keys. Checking it anyway is what keeps a 64-bit
-    // collision from becoming an alignment: the check costs one comparison a
-    // node and it is the only thing standing between a hash and a buffer.
+    // Equal multisets give equal (depth, kind, symbol) sequences; checked
+    // anyway so a 64-bit hash collision can't become a wrong alignment.
     for (was, now) in held.nodes.iter().zip(&brought.nodes) {
         if was.depth != now.depth || was.kind != now.kind || was.symbol != now.symbol {
             return Ok(mismatch());
@@ -722,8 +564,8 @@ pub fn diff(held: &NodeMap, brought: &Walked) -> core::result::Result<Diff, Refu
         })
         .collect();
 
-    // Every refusal is collected before one is returned, so the sentence can
-    // say how big the problem is rather than how early it was found.
+    // Every refusal is collected before one is returned, so the report can
+    // say how big the problem is.
     let mut refusals: Vec<Refused> = Vec::new();
     for class in &held.classes {
         let differing = class.at.iter().filter(|at| !moved[**at].is_empty()).count();
@@ -750,8 +592,8 @@ pub fn diff(held: &NodeMap, brought: &Walked) -> core::result::Result<Diff, Refu
         if held.ambiguous(at) || moved[at].is_empty() {
             continue;
         }
-        // A non-kernel node never reaches here: `moved_of` is only asked of
-        // kernel nodes, so its list is empty and the line above skipped it.
+        // Non-kernel nodes never reach here: `moved_of` only runs on kernel
+        // nodes, so their list is empty and the line above skipped them.
         if let Some(why) = node.opaque.or(brought.nodes[at].opaque) {
             refusals.push(Refused::Opaque {
                 at,
@@ -810,14 +652,10 @@ pub fn diff(held: &NodeMap, brought: &Walked) -> core::result::Result<Diff, Refu
     })
 }
 
-/// Every component of `was` that `now` disagrees with, in the shared
-/// language: which node, which of its numbers, and what the number now is.
-///
-/// **THE LAW IS ALWAYS A CONSTANT AND THAT IS THE HONEST FORM.** Two captures
-/// are two samples of one composition each, not a ladder, so nothing here is
-/// solved — the diff states the value the new capture wants and lets the
-/// caller decide what to do with it. The Metal plane's ladder is what turns
-/// the same vocabulary into an `Affine` or a `Ceil`.
+/// Every component of `was` that `now` disagrees with: which node, which of
+/// its numbers, and what the number now is. The law is always a constant —
+/// two captures are two independent samples, not a ladder — so nothing here
+/// is solved; the diff states the value the new capture wants.
 fn moved_of(node: u32, was: &Node, now: &Node) -> Vec<Component> {
     let mut moved = Vec::new();
     let mut push = |at: At, value: i128| moved.push(Component::new(node, at, Law::Const(value)));
@@ -950,24 +788,6 @@ mod tests {
     }
 
     #[test]
-    fn a_permuted_ambiguous_class_does_not_move_the_fingerprint() {
-        // Two same-depth same-symbol nodes, enumerated in either order.
-        let mut one = chain(vec![
-            node(0, 0, "fork", 1, &[0]),
-            node(1, 1, "leaf", 2, &[7]),
-            node(2, 1, "leaf", 2, &[9]),
-        ]);
-        one.links = vec![(0, 1), (0, 2)];
-        let mut other = chain(vec![
-            node(0, 0, "fork", 1, &[0]),
-            node(1, 1, "leaf", 2, &[9]),
-            node(2, 1, "leaf", 2, &[7]),
-        ]);
-        other.links = vec![(0, 2), (0, 1)];
-        assert_eq!(Topology::of(&one), Topology::of(&other));
-    }
-
-    #[test]
     fn one_scalar_that_moved_is_the_only_component_the_patch_names() {
         let held = NodeMap::from_walk(chain(vec![
             node(0, 0, "load", 1, &[0xdead_0000]),
@@ -990,106 +810,6 @@ mod tests {
     }
 
     #[test]
-    fn a_by_value_block_names_the_word_that_moved_and_not_the_block() {
-        let mut wide = node(0, 0, "cutlass", 1, &[]);
-        wide.params = vec![Param {
-            offset: 0,
-            size: 24,
-            bytes: (0u64..3).flat_map(u64::to_le_bytes).collect(),
-        }];
-        let held = NodeMap::from_walk(chain(vec![wide.clone()]));
-        let mut moved = wide;
-        moved.params[0].bytes[16..24].copy_from_slice(&99u64.to_le_bytes());
-        let (patches, ..) = aligned(diff(&held, &chain(vec![moved])).expect("no refusal"));
-        assert_eq!(
-            patches[0].moved,
-            vec![Component::new(0, At::Arg { at: 0, word: 2 }, Law::Const(99))]
-        );
-    }
-
-    #[test]
-    fn a_walk_with_a_node_more_is_not_the_same_topology() {
-        let held = NodeMap::from_walk(chain(vec![
-            node(0, 0, "load", 1, &[1]),
-            node(1, 1, "gemm", 2, &[1]),
-        ]));
-        let brought = chain(vec![
-            node(0, 0, "load", 1, &[1]),
-            node(1, 1, "gemm", 2, &[1]),
-            node(2, 2, "store", 3, &[1]),
-        ]);
-        assert!(matches!(
-            diff(&held, &brought).expect("a different shape is not a refusal"),
-            Diff::NotSameTopology { .. }
-        ));
-    }
-
-    #[test]
-    fn a_walk_that_swapped_a_symbol_is_not_the_same_topology() {
-        let held = NodeMap::from_walk(chain(vec![
-            node(0, 0, "load", 1, &[1]),
-            node(1, 1, "cublas", 2, &[1]),
-        ]));
-        let brought = chain(vec![
-            node(0, 0, "load", 1, &[1]),
-            node(1, 1, "cutlass", 3, &[1]),
-        ]);
-        assert!(matches!(
-            diff(&held, &brought).expect("an arm switch is not a refusal"),
-            Diff::NotSameTopology { .. }
-        ));
-    }
-
-    #[test]
-    fn an_ambiguous_pair_that_agrees_byte_for_byte_needs_no_patch() {
-        let mut walk = chain(vec![
-            node(0, 0, "fork", 1, &[0]),
-            node(1, 1, "leaf", 2, &[7]),
-            node(2, 1, "leaf", 2, &[7]),
-        ]);
-        walk.links = vec![(0, 1), (0, 2)];
-        let held = NodeMap::from_walk(walk.clone());
-        assert_eq!(held.census().ambiguous, 2, "the pair is counted");
-        assert_eq!(held.classes().len(), 1);
-        let (patches, unmoved, agreed) = aligned(diff(&held, &walk).expect("no refusal"));
-        assert!(patches.is_empty());
-        assert_eq!((unmoved, agreed), (1, 2));
-    }
-
-    #[test]
-    fn an_ambiguous_pair_whose_arguments_differ_refuses_by_name() {
-        let mut walk = chain(vec![
-            node(0, 0, "fork", 1, &[0]),
-            node(1, 1, "leaf", 2, &[7]),
-            node(2, 1, "leaf", 2, &[9]),
-        ]);
-        walk.links = vec![(0, 1), (0, 2)];
-        let held = NodeMap::from_walk(walk.clone());
-        let mut brought = walk;
-        brought.nodes[2].params[0].bytes = 11u64.to_le_bytes().to_vec();
-
-        let refused = diff(&held, &brought).expect_err("the guess is refused");
-        let Refused::Ambiguous {
-            depth,
-            symbol,
-            count,
-            differing,
-            more,
-            ..
-        } = &refused
-        else {
-            panic!("the ambiguity is what refused, not {refused}")
-        };
-        assert_eq!((*depth, symbol.as_str(), *count, *differing), (1, "leaf", 2, 1));
-        assert_eq!(*more, 0);
-        assert_eq!(refused.reason(), Refuse::Ambiguous);
-        assert!(
-            format!("{refused}").contains("the mistake COMPUTES"),
-            "the refusal says why: {refused}"
-        );
-    }
-
-    #[test]
     fn a_node_whose_block_was_never_read_refuses_to_be_rewritten() {
         let mut blind = node(0, 0, "opaque", 1, &[1]);
         blind.opaque = Some("a kernelParams cell is null");
@@ -1106,13 +826,4 @@ mod tests {
         assert_eq!(component.law, Law::Const(4), "the grid the new capture wants");
     }
 
-    #[test]
-    fn a_patch_packs_its_parameters_where_the_abi_puts_them() {
-        let held = NodeMap::from_walk(chain(vec![node(0, 0, "gemm", 1, &[1, 2])]));
-        let brought = chain(vec![node(0, 0, "gemm", 1, &[1, 3])]);
-        let (patches, ..) = aligned(diff(&held, &brought).expect("no refusal"));
-        let block = patches[0].block();
-        assert_eq!(block.len(), 16);
-        assert_eq!(&block[8..], &3u64.to_le_bytes());
-    }
 }

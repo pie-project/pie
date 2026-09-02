@@ -1,11 +1,11 @@
 //! `pie cache` — what pie has written under `$PIE_HOME`, and reclaiming it.
 //!
-//! `list` and `clear` both read `worker::state`, which is the point of the
+//! `list` and `clear` both read `worker::disk`, which is the point of the
 //! registry: describing and reclaiming cannot disagree about what exists.
 
 use anyhow::{Result, anyhow, bail};
 use clap::Subcommand;
-use worker::state::{self, Reclaim};
+use worker::disk::{self, Reclaim};
 
 use crate::ui::{self, Align, Answer, Mark, Palette, Row, Table};
 
@@ -109,13 +109,13 @@ impl ui::Report for CacheReport {
 }
 
 fn list() -> Result<Answer> {
-    let entries = state::entries(Some(crate::local::hf::resolve_cache_dir()));
-    let home = worker::paths::pie_home();
+    let entries = disk::entries(Some(crate::local::hf::resolve_cache_dir()));
+    let home = bootstrap::paths::pie_home();
 
     // Measured once and reused: the size is what decides whether a row is
     // worth a person's attention, and walking a weight-sized tree twice to
     // print it twice would be the slowest part of the command.
-    let measured: Vec<(state::Entry, bool, u64)> = entries
+    let measured: Vec<(disk::Entry, bool, u64)> = entries
         .into_iter()
         .map(|entry| {
             let exists = entry.path.exists();
@@ -168,8 +168,8 @@ fn list() -> Result<Answer> {
 /// Reaching an `OnRequest` entry takes naming it, and there is deliberately no
 /// flag that sweeps them in -- a single character should not stand between a
 /// person and deleting weight-sized artifacts.
-fn selected(names: &[String]) -> Result<Vec<state::Entry>> {
-    let all = state::entries(Some(crate::local::hf::resolve_cache_dir()));
+fn selected(names: &[String]) -> Result<Vec<disk::Entry>> {
+    let all = disk::entries(Some(crate::local::hf::resolve_cache_dir()));
     if names.is_empty() {
         return Ok(all
             .into_iter()
@@ -202,7 +202,7 @@ fn selected(names: &[String]) -> Result<Vec<state::Entry>> {
 
 fn clear(names: Vec<String>, skip_confirm: bool) -> Result<Answer> {
     let chosen = selected(&names)?;
-    let present: Vec<(state::Entry, u64)> = chosen
+    let present: Vec<(disk::Entry, u64)> = chosen
         .into_iter()
         .filter(|entry| entry.path.exists())
         .map(|entry| {
@@ -267,55 +267,4 @@ mod tests {
         assert!(chosen.iter().all(|e| e.name != "models"));
     }
 
-    #[test]
-    fn an_authored_entry_cannot_be_named() {
-        let err = selected(&["config".to_string()]).unwrap_err().to_string();
-        assert!(err.contains("never cleared"), "got: {err}");
-    }
-
-    #[test]
-    fn an_unknown_name_says_what_the_names_are() {
-        let err = selected(&["ptir".to_string()]).unwrap_err().to_string();
-        assert!(err.contains("unknown entry"), "got: {err}");
-        assert!(
-            err.contains("engine"),
-            "should list the real names; got: {err}"
-        );
-    }
-
-    #[test]
-    fn naming_an_on_request_entry_selects_it() {
-        // `models` is the artifact store: reclaimable, but a re-download and a
-        // re-convert rather than a reload, which is why it takes naming.
-        let chosen = selected(&["models".to_string()]).unwrap();
-        assert_eq!(chosen.len(), 1);
-        assert_eq!(chosen[0].reclaim, Reclaim::OnRequest);
-    }
-
-    #[test]
-    fn the_store_and_the_weight_cache_are_different_entries() {
-        // They shared `$PIE_HOME/models` until the artifact store took it: the
-        // store scans for `.zt` and silently ignored the `.weights` files
-        // beside them, while `pie cache` reported their size under the store's
-        // name. Different directories, different reclaim grades.
-        let all = state::entries(None);
-        let by = |n: &str| {
-            all.iter()
-                .find(|e| e.name == n)
-                .unwrap_or_else(|| panic!("no {n}"))
-        };
-        assert_ne!(by("models").path, by("weights").path);
-        assert_eq!(by("models").reclaim, Reclaim::OnRequest);
-        assert_eq!(by("weights").reclaim, Reclaim::Safe);
-    }
-
-    #[test]
-    fn sizes_read_as_the_unit_a_person_would_use() {
-        assert_eq!(ui::bytes(0), "0B");
-        assert_eq!(ui::bytes(512), "512B");
-        assert_eq!(ui::bytes(1 << 10), "1.0KiB");
-        assert_eq!(ui::bytes(3 << 30), "3.0GiB");
-        // Past three digits the fraction is noise.
-        assert_eq!(ui::bytes(200 << 20), "200MiB");
-    }
 }

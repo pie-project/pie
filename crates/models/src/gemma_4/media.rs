@@ -1,44 +1,5 @@
-//! **GEMMA-4 VISION PREPROCESSING — the pooling tower's half of the statute.**
-//!
-//! Qwen merges by 2 and gemma pools by 3 (multimodal §8.4: "same rectangle,
-//! same axis, same file, one row apart in what they do to the `k` rows they
-//! read"), and everything that follows from that is the same sentence at
-//! `k = 3`: the resize makes the grid a whole number of `k × k` blocks, the
-//! patchifier emits POOL-BLOCK-MAJOR rows so `layout.pool_rows` reads no
-//! geometry, and the placeholder run is one token per block.
-//!
-//! Like [`qwen_3::media`](crate::qwen_3::media), this lives in the family's
-//! own house, does only arithmetic, and takes the resample lent
-//! (`model::media`'s rule: the codec is the host's).
-//!
-//! **THE CHECKPOINT'S OWN NUMBERS**, read off `Gemma4VisionConfig` and
-//! `Gemma4ImageProcessor` (transformers v5.15.1) and the E4B snapshot:
-//!
-//! | fact | value | where it is stated |
-//! |---|---|---|
-//! | `patch_size` | 16 | `Gemma4VisionConfig.patch_size` |
-//! | `pooling_kernel_size` | 3 | `Gemma4VisionConfig.pooling_kernel_size` |
-//! | `max_soft_tokens` | 280 | `Gemma4ImageProcessor.max_soft_tokens` |
-//! | `position_embedding_size` | 10240 | `Gemma4VisionConfig` — the `[2, 10240, 768]` table of multimodal §12.3 |
-//! | rescale / normalize | `v / 255`, mean 0, std 1 | `Gemma4ImageProcessor.image_mean/std` — a plain rescale, unlike qwen's ±1 |
-//! | resample | bicubic, antialias | `Gemma4ImageProcessor.resample` |
-//!
-//! **280 IS A BUDGET, NOT A LENGTH — and upstream says so in one line.**
-//! `Gemma4Processor.replace_image_token` writes
-//! `boi + image_token * num_soft_tokens + eoi`, and `num_soft_tokens` is
-//! `patches.shape[0] // pooling_kernel_size**2`, which is at most
-//! `max_soft_tokens` and equals it only when the resize landed on the budget
-//! exactly. So the run this front-end spells is `gh · gw / 9`, capped by 280
-//! through `max_patches = max_soft_tokens · k²` and not clamped to it.
-//!
-//! **AND THE PAYLOAD IS NOT PADDED.** `Gemma4ImageProcessor` pads every image's
-//! patch rows out to `max_patches` with zeros and position `-1`, because it
-//! stacks a ragged batch into one rectangle. Alto does not need that: the
-//! submission's `rows` field says how many rows each image contributes and the
-//! engine's own patch ladder does the padding, at the rung — §5.4's reasoning
-//! about not paying for vectors nobody fills, and §7.4's "the only partial
-//! block it tolerates is the RUNG TAIL, which is padding by construction". So
-//! this front-end ships `gh · gw` real rows and no zeros.
+//! Gemma-4 vision preprocessing: resize to a whole `k x k` block grid,
+//! patchify in pool-block-major order, and emit one soft token per block.
 
 use crate::media::{Budget, Delimiters, EncodedSpan, Fault, Grid, Resample, Result, Rgb8,
     VisionFrontEnd};
@@ -46,16 +7,15 @@ use crate::media::{Budget, Delimiters, EncodedSpan, Fault, Grid, Resample, Resul
 /// The `ROWS.arch` this front-end answers for.
 pub const ARCH: &str = "gemma4";
 
-/// **THE PROCESSOR'S CONSTANTS.**
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GemmaVisionConfig {
     /// Pixels per patch side.
     pub patch_size: u32,
-    /// `pooling_kernel_size` — the soft-token pool folds `k²` patch rows.
+    /// The soft-token pool folds `k²` patch rows.
     pub pooling_kernel_size: u32,
     /// A still image's soft-token ceiling.
     pub max_soft_tokens: u32,
-    /// One video frame's, which is the whole reason [`Budget`] is an argument.
+    /// A video frame's soft-token ceiling (lower than a still image's).
     pub video_soft_tokens: u32,
     /// The separable position table's per-axis length — `[2, this, hidden]`.
     pub position_embedding_size: u32,
@@ -74,15 +34,14 @@ impl Default for GemmaVisionConfig {
 }
 
 impl GemmaVisionConfig {
-    /// `pooling_kernel_size · patch_size` — `side_mult` upstream, 48 here, and
-    /// the multiple BOTH sides are rounded down to.
+    /// `pooling_kernel_size * patch_size`; both resize sides round down to
+    /// this multiple.
     #[must_use]
     pub const fn side_mult(&self) -> u32 {
         self.pooling_kernel_size * self.patch_size
     }
 
-    /// How wide one patch row is: `C · P²`. No temporal axis — gemma's patch
-    /// embedder is `[768, 768]` (multimodal §12.3), which is `3 · 16²`.
+    /// One patch row's width: `3 * patch_size^2` (RGB, no temporal axis).
     #[must_use]
     pub const fn patch_width(&self) -> usize {
         3 * self.patch_size as usize * self.patch_size as usize
@@ -97,44 +56,18 @@ impl GemmaVisionConfig {
         }
     }
 
-    /// `max_patches = max_soft_tokens · k²` — `Gemma4ImageProcessor._preprocess`'s
-    /// own first line.
+    /// `max_patches = max_soft_tokens * pooling_kernel_size^2`.
     #[must_use]
     pub const fn max_patches(&self, budget: Budget) -> u32 {
         self.soft_tokens(budget) * self.pooling_kernel_size * self.pooling_kernel_size
     }
 
-    /// **`get_aspect_ratio_preserving_size`, TRANSCRIBED** from
-    /// `transformers/models/gemma4/image_processing_gemma4.py` (v5.15.1),
-    /// including both zero-side rescues and the final refusal.
-    ///
-    /// **THIS IS THE NO-EDGE PROOF, AND IT IS THE ROUNDING DIRECTION THAT
-    /// CARRIES IT** (multimodal §7.4). The target is the largest aspect-
-    /// preserving size that fits `max_patches` patches AND is divisible by
-    /// `side_mult = k · patch` on both axes, and it is reached by rounding
-    /// DOWN:
-    ///
-    /// ```text
-    /// factor = sqrt(max_patches · patch² / (h · w))
-    /// target = floor(factor · side / side_mult) · side_mult
-    /// ```
-    ///
-    /// Rounding down is what makes every image's patch run a whole number of
-    /// `k × k` blocks, which is what lets `layout.pool_rows` read no geometry:
-    /// whole-block runs laid end to end never put a block across an image
-    /// boundary, so the pool needs no indptr, no grid width and no atomics.
-    /// Rounding UP would fit the patch budget's ceiling and break exactly that.
-    ///
-    /// And the edge case genuinely does not exist: upstream's
-    /// `_avg_pool_by_positions` *raises* rather than rounding
-    /// (`if k_squared * length != input_seq_len: raise`), so a non-divisible
-    /// grid is not pooled by floor, ceil or pad — it is refused, and this
-    /// resize is why it never arrives.
+    /// Rounds the target size down to `side_mult`, so every image's patch
+    /// grid is a whole number of `k x k` blocks.
     ///
     /// # Errors
     ///
-    /// [`Fault::Empty`] where upstream raises: an image whose aspect ratio is
-    /// so extreme that both sides round to zero, and one whose rescued target
+    /// [`Fault::Empty`] if both sides round to zero, or the rescued target
     /// exceeds the patch budget.
     pub fn aspect_ratio_preserving_size(
         &self,
@@ -161,8 +94,8 @@ impl GemmaVisionConfig {
             )));
         }
 
-        // The two rescues, upstream's own: one side survived, so give the other
-        // one block and let the survivor take the aspect ratio, capped.
+        // One side survived: give the other one block, cap the survivor by
+        // aspect ratio.
         let max_side_length =
             (max_patches / (self.pooling_kernel_size * self.pooling_kernel_size)) * side_mult;
         if target_h == 0 {
@@ -183,34 +116,13 @@ impl GemmaVisionConfig {
         Ok((target_h, target_w))
     }
 
-    /// **THE POOL-BLOCK-MAJOR PATCH ORDER AND THE PER-PATCH VECTOR.**
-    ///
-    /// Two orderings, and only the second is upstream's verbatim:
-    ///
-    /// * **rows** come out block-row, block-column, then row and column INSIDE
-    ///   the `k × k` block — the statute `layout.pool_rows` asks for
-    ///   (multimodal §7.4). Upstream emits RASTER order and builds the pooling
-    ///   as a one-hot matmul at runtime
-    ///   (`Gemma4VisionPooler._avg_pool_by_positions`), which is a legible way
-    ///   to write it in torch and an `O(patches²)` way to run it. Reordering
-    ///   here turns the 2-D pool into a 1-D reduction that reads no geometry.
-    ///   It is the same sentence qwen's `merge_size = 2` already writes.
-    /// * **lanes within a row** are patch row, patch column, then CHANNEL —
-    ///   `convert_image_to_patches`' `permute(1, 3, 2, 4, 0)`, i.e. HWC inside
-    ///   the patch, which is the opposite of qwen's channel-major layout and is
-    ///   what the `[768, 768]` patch embedder was trained against.
-    ///
-    /// Values are `v / 255`: `do_rescale` with `rescale_factor = 1/255` and
-    /// `do_normalize = False` (`image_mean` 0, `image_std` 1).
-    ///
-    /// Answers the payload and each row's `(y, x)` in the patch grid.
-    ///
-    /// `rgb` is `h · w · 3` bytes, row-major HWC — a plain slice rather than
-    /// [`Rgb8`] so a golden can feed pixels it wrote by hand.
+    /// Emits patch rows in pool-block-major order (block-row, block-column,
+    /// then row/column within the block) so pooling needs no geometry. Each
+    /// row is HWC, values rescaled to `v / 255`.
     ///
     /// # Panics
     ///
-    /// If `rgb` is shorter than `h · w · 3`.
+    /// If `rgb` is shorter than `h * w * 3`.
     #[must_use]
     pub fn patchify(&self, rgb: &[u8], h: u32, w: u32) -> (Vec<f32>, Vec<u32>) {
         let p = self.patch_size as usize;
@@ -259,33 +171,9 @@ impl GemmaVisionConfig {
         (pix, pos)
     }
 
-    /// **THE SEPARABLE POSITION TABLE'S TWO TAPS, EACH AT WEIGHT ONE.**
-    ///
-    /// `Gemma4VisionEmbeddings.position_embedding_table` is
-    /// `[2, position_embedding_size, hidden]` and
-    /// `_position_embeddings` reads it as
-    ///
-    /// ```text
-    /// x_emb = embedding(pixel_position_ids[..., 0], table[0])
-    /// y_emb = embedding(pixel_position_ids[..., 1], table[1])
-    /// position_embeddings = x_emb + y_emb
-    /// ```
-    ///
-    /// — two gathers and a sum, where `[..., 0]` is the patch's COLUMN and
-    /// `[..., 1]` is its ROW (the processor's `meshgrid(…, indexing="xy")`
-    /// stacks `(x, y)`). A sum of two table rows is `embed_weighted` with two
-    /// taps at weight 1, over the table flattened to `[2 · size, hidden]`
-    /// — the leading axis of a `[2, size, hidden]` weight is "a `Slice` away"
-    /// (multimodal §12.3), and flattened it is just the row offset below.
-    ///
-    /// So gemma resamples nothing and interpolates nothing: qwen's four taps
-    /// carry a bilinear resample of a 48 × 48 grid, gemma's two carry a
-    /// factorization. Same op, same stream, different arithmetic upstream of
-    /// it — which is why [`EncodedSpan::embed_rows`] is a stream and not a
-    /// resample.
-    ///
-    /// `positions` is [`patchify`](GemmaVisionConfig::patchify)'s `(y, x)`
-    /// output; the taps swap them back to the table's `(x, y)` plane order.
+    /// Two gathers into the `[2, position_embedding_size, hidden]` position
+    /// table, summed as two `embed_weighted` taps over the table flattened
+    /// to `[2 * size, hidden]`.
     #[must_use]
     pub fn pos_embed_taps(&self, positions: &[u32]) -> (Vec<i32>, Vec<f32>) {
         let plane = self.position_embedding_size;
@@ -303,7 +191,6 @@ impl GemmaVisionConfig {
     }
 }
 
-/// **GEMMA-4'S VISION FRONT-END.**
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Gemma4Vision {
     /// The processor's constants.
@@ -323,19 +210,7 @@ impl VisionFrontEnd for Gemma4Vision {
         ARCH
     }
 
-    /// **GEMMA-4'S OWN DELIMITERS, AND THEY ARE NOT GEMMA-3'S.** This
-    /// vocabulary spells its markers `<|x>` … `<x|>` with `<|x|>` for the
-    /// standalone form — `<|turn>` / `<turn|>` is the pair
-    /// `chat_template::gemma` already reads by name, and `<|audio>` /
-    /// `<audio|>` is the pair the campaign's `audio_delimiters` pinned. Image
-    /// is the third member of that family: `<|image>` opens,
-    /// `<|image|>` is `image_token` (the reserved pad the run scan finds a
-    /// span by), `<image|>` closes. `<start_of_image>` is gemma-3's spelling
-    /// and is not in this checkpoint's vocabulary.
-    ///
-    /// The multimodal helper this module promotes answered `("", "")` for
-    /// gemma's delimiters — a gap left when only qwen had a served tower, and
-    /// closed here.
+    /// Gemma-4's own delimiters, not gemma-3's `<start_of_image>`.
     fn delimiters(&self) -> Delimiters {
         Delimiters {
             prefix: super::tokenizer::IMAGE_PREFIX,
@@ -344,8 +219,7 @@ impl VisionFrontEnd for Gemma4Vision {
         }
     }
 
-    /// Gemma DOES read the budget: a video frame gets the smaller soft-token
-    /// cap, which is the whole reason [`Budget`] is an argument.
+    /// A video frame gets a smaller soft-token cap than a still image.
     fn encode(&self, src: &Rgb8, budget: Budget, resample: Resample) -> Result<EncodedSpan> {
         let c = self.config;
         let (target_h, target_w) = c.aspect_ratio_preserving_size(src.h, src.w, budget)?;
@@ -368,9 +242,7 @@ impl VisionFrontEnd for Gemma4Vision {
 
         Ok(EncodedSpan {
             token_count,
-            // **1-D, AND THE GRID SAYS SO.** Gemma's trunk rotates scalar —
-            // no mrope, no triple — so the span advances the cursor by exactly
-            // the rows it occupies and its merged "grid" is a run.
+            // No mrope: position advances by the rows occupied (1-D).
             position_span: token_count,
             grid: Grid::still(1, token_count),
             patch_grid: Grid::still(gh, gw),

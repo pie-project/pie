@@ -1,18 +1,10 @@
-//! Where a resident plan's persistent arena actually LIVES.
-//!
-//! [`execute_plan_into_arena`](super::host::execute_plan_into_arena) took
-//! a `&mut [u8]`, which fits a host-addressable backend but not a
-//! discrete GPU, reachable only through a copy. So the arena becomes a
-//! BACKING the caller supplies: the executor keeps every decision, and
-//! the backing keeps only the verbs those decisions bottom out in.
+//! Where a resident plan's persistent arena lives: a backing the caller supplies. The executor keeps every decision; the backing keeps only the verbs those decisions bottom out in.
 
 use std::borrow::Cow;
 
 use crate::error::Error;
 
-/// The bytes an executed plan's persistent arena is made of. Offsets
-/// are the plan's own (`BufferDecl::persistent_offset`,
-/// `BulkExtentWrite::dest_offset`).
+/// The bytes an executed plan's persistent arena is made of. Offsets are the plan's own (`BufferDecl::persistent_offset`, `BulkExtentWrite::dest_offset`).
 pub trait ArenaBacking {
     /// The arena's capacity. The executor refuses a plan needing more.
     fn len(&self) -> usize;
@@ -31,13 +23,13 @@ pub trait ArenaBacking {
     /// The range is out of bounds, or the backing could not take the bytes.
     fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error>;
 
-    /// Set `len` bytes at `offset` to `byte`. Its own verb rather than a `write` of a synthesized buffer: materializing 39 GB of poison to hand across would defeat the point of the trait.
+    /// Set `len` bytes at `offset` to `byte`. Its own verb rather than a `write` of a synthesized buffer, to avoid materializing gigabytes of poison just to hand it across.
     ///
     /// # Errors
     /// The range is out of bounds, or the backing could not fill it.
     fn fill(&mut self, offset: usize, len: usize, byte: u8) -> Result<(), Error>;
 
-    /// Wait until everything this backing has queued has happened. The executor calls this once, after the last instruction; the default (`Ok(())`) is correct for every host-addressable backing, and only one that overlaps its transfers (like CUDA's) overrides it.
+    /// Wait until everything this backing has queued has happened. Called once, after the last instruction; the default is correct for any host-addressable backing.
     ///
     /// # Errors
     /// The queued work faulted.
@@ -45,14 +37,12 @@ pub trait ArenaBacking {
         Ok(())
     }
 
-    /// Whether this backing launches the kernels the plan names. `false` -- the default -- is the whole of "host mode", keeping `pie model import` working on a machine with no GPU. One bit, read ONCE before the first instruction: the plan already names a kernel row per instruction, so this only states whether a device was handed over at all.
+    /// Whether this backing launches the kernels the plan names. `false` (the default) is "host mode". Read once before the first instruction.
     fn runs_named_kernels(&self) -> bool {
         false
     }
 
-    /// Launch the kernel the plan named for one transform whose operands are already in this arena. Called only when [`runs_named_kernels`](Self::runs_named_kernels) is `true` and every operand resolved to an arena span.
-    ///
-    /// **There is no decline.** The compiler already decided this backing can run the named row; failing to run it is a compiler that named the wrong one, not a case to fall back to the host for.
+    /// Launch the kernel the plan named for one transform whose operands are already in this arena. Called only when [`runs_named_kernels`](Self::runs_named_kernels) is `true`.
     ///
     /// # Errors
     /// The kernel has no launcher, the operands contradict the named row, or the dispatch failed.
@@ -74,25 +64,20 @@ pub struct ArenaSpan {
     pub len: usize,
 }
 
-/// One transform, addressed entirely in arena offsets. Deliberately not the [`StorageInstr`](crate::plan::StorageInstr): the executor resolves extents to spans once, so a backing receives operands, not the job of finding them.
-///
-/// **A fact no backing READS does not belong here** -- a struct carrying operand dtypes invites a backing to match on them, which is the compiler's job now.
+/// One transform, addressed entirely in arena offsets: the executor resolves extents to spans once, so a backing receives operands, not the job of finding them. Carries no fact a backing does not read (e.g. no dtypes).
 #[derive(Clone, Debug)]
 pub struct TileMapOp<'a> {
-    /// The `kernels-cuda` table symbol the PLAN named for this instruction. A backing looks it up and launches it; it is not given what it would need to disagree.
+    /// The `kernels-cuda` table symbol the plan named for this instruction.
     pub kernel: &'a str,
     /// The operand read.
     pub src: ArenaSpan,
-    /// Where the result lands. May equal [`src`](Self::src) for a transform
-    /// that rewrites in place, which `Scale` does.
+    /// Where the result lands. May equal [`src`](Self::src) for a transform that rewrites in place, which `Scale` does.
     pub dst: ArenaSpan,
-    /// `Encode`'s SECOND output: the scales its payload cannot be read without. `None` for every kind that publishes one tensor. Its own field, not a list, since writing them swapped would load a wrong tensor.
+    /// `Encode`'s second output: the scales its payload cannot be read without. `None` for every kind that publishes one tensor.
     pub dst_scales: Option<ArenaSpan>,
-    /// The per-group factors a blocked [`TileMapKind::Scale`] READS (`None` for a uniform constant carried by the kernel itself). Distinct from [`dst_scales`](Self::dst_scales): this is an input, that an output.
+    /// The per-group factors a blocked [`TileMapKind::Scale`] reads (`None` for a uniform constant carried by the kernel itself).
     pub factors: Option<ArenaSpan>,
-    /// The primary output's declared shape as `(rows, cols)`, from the
-    /// TENSOR's declaration -- not derived from the destination extent,
-    /// which can disagree on a strided destination.
+    /// The primary output's declared shape as `(rows, cols)`, from the tensor's declaration, not derived from the destination extent (which can disagree on a strided destination).
     pub shape: Option<(u32, u32)>,
 }
 

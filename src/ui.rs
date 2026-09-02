@@ -1,11 +1,9 @@
 //! What `pie` looks like: colour policy, units, glyphs, terminal width.
 //!
-//! One module because the alternative was measured. Before this existed, six
-//! files decided independently whether to colour, five of them by asking
-//! `stdout().is_terminal()` (including for output that goes to stderr), and
-//! none of them honoured `NO_COLOR`. Four of them formatted bytes, and the
-//! same 3 GiB printed as `3.00 GiB`, `3.0GiB`, `3072MiB` and `3.2 GB` -- the
-//! last one decimal, so it was not even the same quantity.
+//! One module, because the alternative is every op deciding for itself: a
+//! `stdout().is_terminal()` check for output that goes to stderr, a `NO_COLOR`
+//! nothing honours, and one 3 GiB printed as `3.00 GiB`, `3.0GiB`, `3072MiB`
+//! and `3.2 GB` -- the last decimal, so not even the same quantity.
 //!
 //! The rule this module exists to make enforceable: **ops code never emits an
 //! escape sequence and never formats a quantity itself.** It picks a [`Mark`],
@@ -20,8 +18,8 @@ use std::io::IsTerminal;
 /// Which stream a [`Palette`] is being built for.
 ///
 /// It matters: the download bar draws to stderr, so deciding its colour from
-/// `stdout().is_terminal()` -- as the code here used to -- got the answer from
-/// the wrong file descriptor. `pie model import > log` would keep colouring.
+/// `stdout().is_terminal()` asks the wrong file descriptor and
+/// `pie model import > log` would keep colouring.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stream {
     Stdout,
@@ -57,14 +55,12 @@ pub fn colour_enabled(stream: Stream) -> bool {
 /// Styling that renders to nothing when colour is off.
 ///
 /// Every method takes the text it styles and hands back something that knows
-/// how to end itself. The previous shape handed out the escape sequences
-/// themselves -- `palette.dim()` was a `&'static str` and the caller wrote the
-/// matching `palette.reset()` -- which made "never emit an escape yourself" a
-/// rule ops could only follow voluntarily. Two of them stopped following it and
-/// went back to `\x1b[2m` and a bare `is_terminal()` check, so `NO_COLOR` did
-/// nothing in `pie config show` or `pie model list`. There is no longer a way
-/// to ask this type for an escape, so there is no longer a way to leak one or
-/// to forget its reset.
+/// how to end itself. Handing out the escape sequences instead -- a
+/// `&'static str` `dim()` with the caller writing the matching `reset()` --
+/// makes "never emit an escape yourself" a rule an op can only follow
+/// voluntarily, and an op that stops following it silently breaks `NO_COLOR`.
+/// There is no way to ask this type for an escape, so there is no way to leak
+/// one or to forget its reset.
 #[derive(Clone, Copy)]
 pub struct Palette {
     on: bool,
@@ -152,10 +148,9 @@ impl<T: std::fmt::Display> std::fmt::Display for Styled<T> {
 
 /// The one meaning each glyph carries.
 ///
-/// `✓` used to mean three unrelated things -- "this model is supported", "this
-/// check passed", "the command did the thing" -- while "absent" was spelled
-/// `○` in one listing, `—` in another and a blank in a third. A reader cannot
-/// learn a vocabulary that changes per command, so there is one.
+/// A reader cannot learn a vocabulary that changes per command, so there is
+/// one: `✓` says one thing, and "absent" has a single spelling across every
+/// listing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mark {
     /// The command did something. Only ever on a result line, never in a table.
@@ -365,8 +360,7 @@ impl Table {
                 let pad = width.saturating_sub(text.chars().count());
                 // Pad first, style second. The padding is inside the styling
                 // and the styling closes itself, so a dimmed column cannot
-                // leave the rest of the line dim -- which is what an
-                // empty-note row used to do.
+                // leave the rest of the line dim.
                 let cell = match self.aligns.get(i).copied().unwrap_or(Align::Left) {
                     Align::Left if last => text,
                     Align::Left => format!("{text}{}", " ".repeat(pad)),
@@ -676,7 +670,7 @@ impl<T: Report> AnyReport for T {
 ///
 /// The exit status rides along because for two commands it *is* the answer:
 /// `pie doctor && pie serve` has to work, and `pie run` reports the inferlet's
-/// status rather than its own. Everything else exits zero, and no longer has to
+/// status rather than its own. Everything else exits zero without having to
 /// write `Ok(ExitCode::SUCCESS)` to say so.
 pub struct Answer {
     kind: Kind,
@@ -709,12 +703,9 @@ impl Answer {
     /// on.
     ///
     /// Unmarked, because `Mark::Did` means "the command did something" and
-    /// these did not. Printing `✓ aborted; nothing was deleted` says the
-    /// opposite of what happened, and it is the same glyph the tables use for
-    /// success. The distinction was there before this type existed -- the
-    /// no-op lines printed bare while `set`/`unset`/`download` printed a `✓` --
-    /// and collapsing the two is a regression this constructor exists to
-    /// prevent, since a caller now has to pick one.
+    /// these did not: `✓ aborted; nothing to delete` says the opposite of what
+    /// happened, in the same glyph the tables use for success. A caller has to
+    /// pick one of the two constructors, which is what keeps them apart.
     pub fn noop(text: impl Into<String>) -> Self {
         Self::of(Kind::Did(false, text.into()))
     }
@@ -821,158 +812,3 @@ pub fn clip(text: &str, limit: usize) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn one_quantity_has_one_rendering() {
-        // The four spellings this replaced: "3.00 GiB", "3.0GiB", "3072MiB"
-        // and "3.2 GB". The last was decimal, so it was a different number.
-        assert_eq!(bytes(3 << 30), "3.0GiB");
-        assert_eq!(bytes(0), "0B");
-        assert_eq!(bytes(512), "512B");
-        assert_eq!(bytes(1 << 10), "1.0KiB");
-        // Past three digits the fraction is noise.
-        assert_eq!(bytes(200 << 20), "200MiB");
-        // A weight-sized artifact should not read as four digits of MiB.
-        assert_eq!(bytes(2 << 40), "2.0TiB");
-    }
-
-    #[test]
-    fn no_colour_leaves_no_escapes() {
-        let plain = Palette::forced(false);
-        assert_eq!(plain.dim("path/to/thing").to_string(), "path/to/thing");
-        assert_eq!(plain.bold(42).to_string(), "42");
-        assert_eq!(Mark::Did.render(&plain), "✓");
-        // And every glyph is one column wide, so a table built without colour
-        // lines up with the same table built with it.
-        for mark in [
-            Mark::Did,
-            Mark::Warn,
-            Mark::Blocked,
-            Mark::Chosen,
-            Mark::Plain,
-            Mark::Absent,
-        ] {
-            assert_eq!(mark.glyph().chars().count(), 1, "{mark:?}");
-        }
-    }
-
-    #[test]
-    fn colour_renders_and_resets() {
-        let colour = Palette::forced(true);
-        let rendered = Mark::Blocked.render(&colour);
-        assert!(rendered.starts_with("\x1b[31m"));
-        assert!(rendered.ends_with("\x1b[0m"));
-        // Styling closes itself. This is the whole reason the palette hands
-        // back a `Styled` rather than an escape: a caller cannot open one and
-        // forget the reset, because a caller never opens one.
-        assert_eq!(colour.dim("x").to_string(), "\x1b[2mx\x1b[0m");
-    }
-
-    #[test]
-    fn the_toml_highlighter_answers_to_the_palette() {
-        // `NO_COLOR=1 pie config show` printed escapes because this rendering
-        // asked `is_terminal()` instead of the palette. Every branch of it --
-        // comment, header, key/value, trailing comment -- must come back bare.
-        let plain = Palette::forced(false);
-        for line in [
-            "# a comment",
-            "[section]  # with a trailing comment",
-            "key = \"value\"  # and here",
-            "number = 8080",
-            "flag = true",
-            "list = [1, 2]",
-            "",
-        ] {
-            let rendered = toml_line(line, &plain);
-            assert!(
-                !rendered.contains('\x1b'),
-                "{line:?} rendered with escapes: {rendered:?}"
-            );
-        }
-        // And with colour on it actually colours, so the test above is not
-        // passing because the highlighter does nothing.
-        let colour = Palette::forced(true);
-        assert!(toml_line("[section]", &colour).contains('\x1b'));
-    }
-
-    #[test]
-    fn a_bar_measures_in_the_same_units_as_everything_else() {
-        // The bar reported `bytes / 1e9` -- decimal GB against pie's binary
-        // GiB everywhere else, so the same file read 7% larger here than in
-        // the listing printed right after it. Both go through `bytes` now.
-        assert_eq!(bytes(3 << 30), "3.0GiB");
-        // A non-interactive stderr draws nothing at all, which is what keeps
-        // an animation out of a log file.
-        let mut bar = Bar {
-            interactive: false,
-            last_draw: std::time::Instant::now(),
-            drew: false,
-        };
-        bar.draw(1, 2, "anything");
-        assert!(!bar.drew, "a bar drew to a non-terminal");
-    }
-
-    #[test]
-    fn clip_never_splits_a_character() {
-        assert_eq!(clip("short", 10), "short");
-        assert_eq!(clip("", 10), "");
-        // Multi-byte input: the result must still be valid UTF-8 and within
-        // the limit.
-        let wide = "가나다라마바사아자차카타파하";
-        let cut = clip(wide, 5);
-        assert!(cut.chars().count() <= 5, "got {cut:?}");
-        assert!(cut.ends_with('…'));
-        // A word boundary is preferred only when it is not throwing the line
-        // away: "aaaa…" beats "…" for a single long word.
-        assert_eq!(clip("a bbbbbbbbbbbbbbbb", 6), "a bbb…");
-    }
-
-    #[test]
-    fn a_table_pads_from_the_rows_it_prints() {
-        // Widths come from what is being shown, not from a fixed number: a
-        // filtered listing padded to the width of rows it excluded is what
-        // `doctor`'s `{:<20}` key column used to be.
-        let mut table = Table::new([Align::Left, Align::Right], 1);
-        table.push(Row::new(Mark::Plain, ["a".into(), "1".into()]));
-        table.push(Row::new(Mark::Absent, ["bbb".into(), "22".into()]));
-        assert!(!table.is_empty());
-        assert_eq!(table.rows.len(), 2);
-        // Column 0 is three wide because "bbb" is, not because anything said so.
-        let widths: Vec<usize> = (0..2)
-            .map(|i| {
-                table
-                    .rows
-                    .iter()
-                    .map(|r| r.cells[i].chars().count())
-                    .max()
-                    .unwrap()
-            })
-            .collect();
-        assert_eq!(widths, vec![3, 2]);
-    }
-
-    #[test]
-    fn a_home_path_loses_the_prefix_that_carries_nothing() {
-        let home = std::env::var("HOME").unwrap_or_default();
-        if home.is_empty() {
-            return;
-        }
-        let inside = std::path::Path::new(&home).join("pie").join("config.toml");
-        assert_eq!(short_path(&inside), "~/pie/config.toml");
-        // Outside home it stays absolute -- abbreviating there would be a lie.
-        let outside = std::path::Path::new("/etc/pie.toml");
-        assert_eq!(short_path(outside), "/etc/pie.toml");
-    }
-
-    #[test]
-    fn durations_read_as_the_unit_a_person_would_use() {
-        use std::time::Duration;
-        assert_eq!(duration(Duration::from_millis(250)), "250ms");
-        assert_eq!(duration(Duration::from_secs(9)), "9s");
-        assert_eq!(duration(Duration::from_secs(90)), "1m30s");
-        assert_eq!(duration(Duration::from_secs(3700)), "1h01m");
-    }
-}

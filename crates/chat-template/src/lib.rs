@@ -1,16 +1,9 @@
-//! What a turn of conversation looks like on the way in, and what a stream of
-//! tokens means on the way back out.
-//!
-//! A chat template is two halves of one agreement. The writing half turns a
-//! role and a message into the exact tokens the model was trained to see
-//! around them; the reading half watches generated tokens go by and says when
-//! a reply began, when the reasoning block closed, and when a tool was called.
-//! Both halves name the same markers, which is the whole reason they live in
-//! one file per format rather than one file per direction.
-//!
-//! This crate knows nothing about model SKUs. It ships the formats —
-//! [`chatml`], [`harmony`], [`gemma`], [`deepseek`], [`kimi`] — and the
-//! catalog beside it names which model speaks which.
+//! A chat template is two halves of one agreement, sharing the same markers:
+//! the writing half turns a role and a message into the tokens the model was
+//! trained to see around them, and the reading half watches generated tokens
+//! go by and says when a reply began, a reasoning block closed, or a tool
+//! was called. This crate ships the formats — [`chatml`], [`harmony`],
+//! [`gemma`], [`deepseek`], [`kimi`] — knowing nothing about model SKUs.
 
 use std::sync::Arc;
 
@@ -33,12 +26,9 @@ pub struct ToolGrammar {
 
 /// The id of a marker the template spells, or a panic naming the marker.
 ///
-/// Every marker in every format here is one token in the vocabulary the model
-/// was trained with — that is what makes it a marker rather than a phrase. A
-/// tokenizer that cannot spell one is a tokenizer paired with the wrong model,
-/// and the failure belongs at the moment the template is built. It used to be
-/// a `filter_map` over the stop list, which turned a missing `<|im_end|>` into
-/// a model that generates until the token budget runs out.
+/// Every marker is one token in the vocabulary the model was trained with. A
+/// tokenizer that cannot spell one is paired with the wrong model, and the
+/// failure belongs at the moment the template is built.
 #[must_use]
 pub fn special(tokenizer: &Tokenizer, marker: &str) -> u32 {
     match tokenizer.token_to_id(marker) {
@@ -78,10 +68,9 @@ pub enum ReasoningEvent {
 
 #[derive(Debug, Clone)]
 pub enum ToolEvent {
-    /// Nothing has happened yet. A decoder never yields this — an idle batch
-    /// yields no events at all — but a caller that must answer with one event
-    /// per feed needs a value for "still nothing", and inventing `Start` for
-    /// it is what made `Start` meaningless in the first place.
+    /// Nothing has happened yet. A decoder never yields this (an idle batch
+    /// yields no events), but a caller that must answer with one event per
+    /// feed needs a value for "still nothing".
     None,
 
     /// A tool-call span opened.
@@ -92,12 +81,7 @@ pub enum ToolEvent {
 }
 
 /// The three readers all take a batch of tokens and answer with everything
-/// that batch contained.
-///
-/// The `Vec` is not decoration. Each of these used to return one event and
-/// drop the rest of the batch on the floor: a batch that carried the stop
-/// token in the middle lost every token after it, and a batch carrying two
-/// tool calls surfaced one. Whatever a batch says, it says here in order.
+/// that batch contained, in order — the `Vec` is not decoration.
 pub trait ChatDecoder: Send {
     fn feed(&mut self, tokens: &[u32]) -> Vec<ChatEvent>;
     fn reset(&mut self);
@@ -113,11 +97,8 @@ pub trait ToolDecoder: Send {
     fn reset(&mut self);
 }
 
-/// One format, both directions.
-///
-/// `equip` and `answer` default to writing nothing, because a format without
-/// a tool grammar has nothing to write there and a stub that says `Vec::new()`
-/// in four files says it four times.
+/// One format, both directions. `equip` and `answer` default to writing
+/// nothing, for a format without a tool grammar.
 pub trait Instruct: Send + Sync {
     fn system(&self, msg: &str) -> Vec<u32>;
 

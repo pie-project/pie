@@ -1,22 +1,11 @@
 //! Scheduler-affine dispatch trampolines: the engine ABI's per-`engine_id`
-//! verbs (`register_program`, `register_channel`, `bind_instance`,
-//! `close_instance`, the `copy_*` family, `resize_pool`). Each looks up
-//! [`super::scheduler_handle`] to reach the `BatchScheduler` that owns that
-//! `engine_id`'s native handle (single-owner/thread-affine to its
-//! scheduler's run loop) and forwards the call — callers (`pipeline`,
-//! `inferlet::host`) never touch the native engine handle directly.
+//! verbs. Each looks up [`super::scheduler_handle`] to reach the
+//! `BatchScheduler` that owns that `engine_id`'s native handle and forwards
+//! the call — callers never touch the native engine handle directly.
 //!
-//! These functions were moved up from `engine.rs` (L0): they call
-//! `scheduler_handle`, which is scheduler (L2) state, so scheduler is the
-//! correct owner and L0 stays free of any upward import.
-//!
-//! `copy_d2h`/`copy_h2d`/`copy_h2h` (the host-pinned <-> device KV copy
-//! directions) are part of the complete engine ABI verb set but aren't yet
-//! issued by the single-GPU mock-engine fire path (`copy_d2d`/`copy_kv_cells`
-//! are, plus `copy_rs_d2d`) — hence `#![allow(dead_code)]` rather than
-//! deleting a documented ABI verb. `resize_pool` was in this list and is
-//! gone: elasticity is a side effect of frame admission now (alto design §8,
-//! wave C).
+//! `copy_d2h`/`copy_h2d`/`copy_h2h` are part of the complete engine ABI verb
+//! set but aren't yet issued by the single-GPU mock-engine fire path, hence
+//! `#![allow(dead_code)]` rather than deleting a documented ABI verb.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -50,21 +39,13 @@ pub(crate) async fn register_channel(
     let result = handle.register_channel(engine_idx, plan.clone()).await;
     match result {
         Ok(channel) => {
-            // Installs the close-notification callback (`ChannelEndpoint`
-            // itself names no scheduler type — see its doc); this closure
-            // captures the already-resolved handle rather than doing a
+            // Captures the already-resolved handle rather than doing a
             // second `scheduler_handle` lookup at close time.
             let closer_handle = handle.clone();
             let closer: crate::engine::ChannelCloser =
                 Arc::new(move |channel_id| closer_handle.close_channel(channel_id));
             Ok(Arc::new(ChannelEndpoint::new(channel).with_closer(closer)))
         }
-        // THE WAIT SLOTS ARE THE REGISTRATION'S ANSWER NOW, not its
-        // argument: the runtime used to allocate them and hand them across so
-        // a C engine could publish into them, and the contract's
-        // `RegisteredChannel` answers them instead. So there is nothing to
-        // free on a failed registration here — whoever allocated them frees
-        // them, and that is the scheduler that made the ring.
         Err(error) => Err(error),
     }
 }
@@ -95,27 +76,12 @@ pub(crate) async fn register_channels(
 
 /// The seeds, renumbered from the runtime's ids into the contract's.
 ///
-/// **THE TWO PLANES NUMBER A CHANNEL DIFFERENTLY, AND THIS IS THE ONE PLACE
-/// THAT KNOWS BOTH.** The runtime's channel plane addresses a channel by its
-/// GLOBAL id — [`ChannelValue::channel`](crate::engine::ChannelValue), the id
-/// a `ChannelRegistration` was minted with — and the contract's
-/// [`ChannelSeed`](engine::ChannelSeed) addresses it by its index in the
-/// package's DECLARATION order, the same numbering
-/// [`Engine::publish_channel`](engine::Engine::publish_channel) uses and
-/// the numbering an instance's rings are carved in.
-///
-/// Both sites below used to spell the conversion `u32::try_from(global_id)`,
-/// which is not a conversion at all: it is the identity, and the two
-/// numberings are not the same one. A global id is minted when the GUEST
-/// constructs a channel; declaration order is the order the TRACE holds them
-/// in (`Traced::channel_order`), which the builder derives from how the ports
-/// and stages use them. They coincide by accident or not at all — the first
-/// ETA inferlet through this door seeded a five-token `toks` cell into a
-/// two-lane `rng` ring, which is where the CUDA shell caught it
-/// ("a i32 wire cell of 2 lane(s) is 8 bytes and 20 were offered").
-///
-/// `binding.channels` IS the declaration order (the contract says so on the
-/// field), so the position of a seed's id in it is the seed's number.
+/// The runtime's channel plane addresses a channel by its global id
+/// ([`ChannelValue::channel`](crate::engine::ChannelValue), minted when the
+/// guest constructs it); the contract's [`ChannelSeed`](engine::ChannelSeed)
+/// addresses it by index in the package's declaration order (the trace's
+/// `channel_order`). The two do not coincide in general. `binding.channels`
+/// is the declaration order, so a seed's position in it is the seed's number.
 ///
 /// # Errors
 ///
@@ -174,11 +140,9 @@ pub(crate) async fn register_channels_bind_classified(
     BoundInstance,
     super::worker::SchedulerHandle,
 )> {
-    // `requested_instance_id` NO LONGER TRAVELS. The contract's
-    // `InstanceBinding` carries what an engine needs and nothing the runtime
-    // wanted back unchanged; the engine mints the id and the runtime keeps its
-    // own tables (`engine::program`'s note). The argument survives because
-    // callers still name the instance they staged channels for.
+    // requested_instance_id does not travel: the engine mints the id. The
+    // argument survives because callers still name the instance they staged
+    // channels for.
     let _ = requested_instance_id;
     let handle = scheduler_handle(engine_idx)?;
     let table = waker::WakerTable::global();

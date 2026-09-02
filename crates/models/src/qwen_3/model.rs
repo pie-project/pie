@@ -1,32 +1,19 @@
-use checkpoint::contract::ModelContract;
 use model_dsl::{Dtype, Weight};
 
-use checkpoint_dsl::{Builder, Error};
 
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
     pub tp: u32,
 
-    /// **THE ONE READING EVERY ATTENTION SITE OF THIS FAMILY IS CARVED FOR**
-    /// (build log 21). An attention schedule is carved for a reading — query
-    /// heads, kv heads, per-head width — so the reading is stated ONCE, here,
-    /// and not once per site: the trunk's full-attention layers and the draft
-    /// head's own block are built by one `gated_attn` from these very numbers
-    /// (`mtp.layers.0.self_attn.*` has a trunk layer's shapes tensor for
-    /// tensor), and this family has no second reading for a layer to carry.
-    /// `forward` states them on the plan ops it builds, and every launch that
-    /// reads one of those plans restates its share of them.
-    ///
-    /// PER RANK, both head counts: `Model::new` cuts them by `tp`, which is
-    /// what the banks are cut by and therefore what a rank's own schedule
-    /// reads. `head_dim` is not cut — a head is whole wherever it lands.
+    /// The one attention reading this whole family (trunk and draft head)
+    /// shares. Per-rank: `q_heads`/`kv_heads` are already divided by `tp`;
+    /// `head_dim` is not.
     pub q_heads: u32,
     pub kv_heads: u32,
     pub head_dim: u32,
 
-    /// The adapter banks this family seats (palo design §8). Per layer, and
-    /// the same two numbers at every one of them: the correction is a
+    /// Adapter banks, one pair of numbers per layer — the correction is a
     /// per-lane axis, not a per-layer one.
     pub adapters: Adapters,
 
@@ -37,96 +24,33 @@ pub struct Model {
     pub final_norm: Weight,
     pub final_norm_eps: f32,
 
-    /// **THE VISION TOWER, WHEN THE CHECKPOINT SHIPS ONE** (multimodal §0,
-    /// campaign M-1/M-2).
-    ///
-    /// `Option` for [`mtp`](Model::mtp)'s reason and one more. It is a fact
-    /// about the ARTIFACT — Qwen3.5-0.8B publishes a twelve-block
-    /// `model.visual.*` and Qwen3.6-27B a twenty-seven-block one, and the
-    /// 4-bit conversions of both publish neither — and it is the whole of what
-    /// makes this plan a TWO-UNIT one: the tower's rectangles are
-    /// `Dim::Patches`, `model_compiler::unit` reads the axis off the shapes,
-    /// and a `None` here is a plan with one capture unit and not one node of a
-    /// second.
-    ///
-    /// **AND IT IS WHY THE TRUNK'S ROTATION IS A PROPERTY OF THIS FIELD.** A
-    /// lane carrying an image needs the three-section mrope both qwen SKUs'
-    /// `text_config` states; a lane that cannot carry one never has a position
-    /// that is not `(p, p, p)`, and `elemwise.rope_mrope` over three copies of
-    /// a scalar is `rope_partial` to the last bit. So a text-only row keeps
-    /// the scalar rotation and its artifact is the artifact it was — which is
-    /// what G4 and `the_new_axes_cost_the_old_words_nothing` are pinned on —
-    /// and a tower row states the triple once, here, for every layer.
+    /// `None` for a text-only checkpoint (4-bit conversions ship no tower
+    /// either) — a single-unit plan rather than the two-unit plan a tower
+    /// adds. Also decides the trunk's rotation: `Some` gives every layer the
+    /// three-section mrope; `None` keeps the plain scalar rotation.
     pub tower: Option<Tower>,
 
-    /// **THE DRAFT HEAD, WHEN THE ARTIFACT CARRIES ONE** (palo C3, design §8;
-    /// campaign M-4).
-    ///
-    /// `Option` because it is a fact about the ARTIFACT and not about the
-    /// family: Qwen3.6-27B publishes `mtp.*` — one `fc`, two pre-norms, one
-    /// full transformer block and a final norm, fifteen tensors, verified
-    /// name-for-name against the cached checkpoint index — and no earlier
-    /// qwen35 SKU publishes anything of the kind. A `None` here is not a
-    /// disabled feature; it is a model that has no second head, and its trace
-    /// carries not one node of the arm.
-    ///
-    /// **AND "ONE" IS NOW TWO RECIPES OF ONE DECLARATION** ([`Recipe`]). An
-    /// EAGLE head arrives in a SECOND checkpoint rather than in the base one,
-    /// and what it is once it arrives is this same shape with two pieces
-    /// missing. So the axis did not grow a second field, a second fact bit, a
-    /// second seam or a second kv row — it grew two `Option`s.
+    /// `None` if the artifact carries no draft head. [`Recipe`] distinguishes
+    /// the checkpoint's own `mtp.*` head from an EAGLE overlay imported from
+    /// a second checkpoint; both share this same declaration.
     pub mtp: Option<Mtp>,
 }
 
-/// One MTP (multi-token-prediction / NEXTN) head: the fusion of a hidden state
-/// with the next token's embedding, one transformer block over the fused
-/// stream, and a readout through the base model's own `lm_head`.
-///
-/// **THE ALGEBRA, AS THE CHECKPOINT AND THE DEV LINEAGE BOTH STATE IT.** Read
-/// off `mtp.*` in `Qwen3.6-27B` and off `qwen3_5_mtp_forward`
-/// (`origin/dev:driver/cuda/src/model/qwen3_5/qwen3_5_forward.cpp`):
+/// One MTP (multi-token-prediction / NEXTN) head: fuses a hidden state with
+/// the next token's embedding, runs one transformer block over the fused
+/// stream, and reads out through the base model's own `lm_head`.
 ///
 /// ```text
 /// h = fc · [ rms(embed(tok)) · Wₑ | rms(hidden) · W_h ]
-/// h += attn(rms(h))            one gated full-attention block, own kv row
-/// h += mlp(rms(h))             the family's own dense SwiGLU
-/// draft = lm_head(rms(h))      the BASE head — `mtp_use_dedicated_embeddings`
-///                              is false and no `mtp.lm_head` is published
+/// h += attn(rms(h))
+/// h += mlp(rms(h))
+/// draft = lm_head(rms(h))
 /// ```
 ///
-/// **`fc` IS DECLARED AS TWO BANKS AND THE CHECKPOINT SHIPS ONE.** The stored
-/// `mtp.fc.weight` is `[hidden, 2·hidden]`, multiplying a row-concatenation of
-/// the two normed streams; `[a|b]·[Wₑ|W_h]ᵀ = a·Wₑᵀ + b·W_hᵀ` exactly, so the
-/// text states two `[hidden, hidden]` banks and one `residual_add` instead of
-/// a concatenation. That is not a convenience: **the IR has no concat op**,
-/// and adding one would be a variant every shell's `Dispatch` would have to
-/// grow an arm for. The import contract slices the stored bank at column
-/// `hidden` and the halves are named in the order dev concatenates them —
-/// embedding first, hidden second (`launch_concat_bf16_rows(ws.q /* normed
-/// embedding */, ws.y /* normed hidden */, ...)`). The one thing this costs is
-/// a rounding: two fp32 accumulations summed in the output dtype instead of
-/// one accumulation over 2·hidden. On a DRAFT whose every token is verified by
-/// the target model, that is a proposal that may differ, never an answer that
-/// may be wrong.
-///
-/// # And the same eight sentences are EAGLE's ([`Recipe::Eagle`], M-4)
-///
-/// An EAGLE head is this head with two pieces absent. Its own recipe fuses the
-/// RAW embedding with the RAW hidden — no pre-fusion norms — and reads out
-/// through the base `lm_head` with no final norm of its own, because the
-/// hidden it was trained against is the one the trunk's `final_norm` already
-/// produced. Everything between is identical: one `fc` over a concatenation,
-/// one prenorm block with its own kv row, one readout through the base head.
-///
-/// So the declaration is one declaration with two `Option`s, and NOT a second
-/// struct. What a second struct would have bought is a second name for the
-/// same fifteen-minus-three planes; what it would have cost is a second arm in
-/// `forward`, a second seam, a second fact bit and a second kv row — four
-/// engine-side spellings of `mtp` that are the contract, not the vocabulary
-/// (`seam::MTP`, `kv.mtp`, `Facts::drafts`, `IntrinsicId::MtpLogits`). This
-/// type keeps the MTP name for exactly that reason: it is the name the ENGINE
-/// knows the axis by, and a text that renamed it would be renaming a contract
-/// it does not own.
+/// The stored `mtp.fc.weight` is one `[hidden, 2·hidden]` bank, split into
+/// `fc_embed`/`fc_hidden` and summed via `residual_add` (the IR has no
+/// concat op). An EAGLE head ([`Recipe::Eagle`]) reuses this struct with
+/// `pre_fc` and `norm` both `None`.
 pub struct Mtp {
     /// Which recipe this head was trained under — the one thing that is not
     /// derivable from the planes, because it is what says which planes exist.
@@ -140,9 +64,8 @@ pub struct Mtp {
     pub fc_hidden: Weight,
     pub mixer_norm: Weight,
     pub mixer_norm_eps: f32,
-    /// The head's own block. Full attention with the family's q-gate, its own
-    /// kv row in the model's one page-id space — `mtp.layers.0.self_attn`,
-    /// shapes identical to a trunk attention layer's.
+    /// The head's own block: full attention with the family's q-gate and its
+    /// own kv row (`mtp.layers.0.self_attn`), same shape as a trunk layer.
     pub attn: Attn,
     pub mlp_norm: Weight,
     pub mlp_norm_eps: f32,
@@ -154,10 +77,8 @@ pub struct Mtp {
     pub norm_eps: f32,
 }
 
-/// The two pre-fusion norms, when the recipe has them. One epsilon for the
-/// pair, as every norm in this family shares one: `rms_norm_eps` is a single
-/// number in the config, and stating it per site is what keeps a site from
-/// silently inheriting another's.
+/// The two pre-fusion norms, when the recipe has them. One shared epsilon,
+/// since `rms_norm_eps` is a single config value for this family.
 pub struct PreFc {
     /// Scales the embedding of the row's token before the fusion.
     pub embedding: Weight,
@@ -166,29 +87,17 @@ pub struct PreFc {
     pub eps: f32,
 }
 
-/// **WHICH DRAFT-HEAD RECIPE AN ARTIFACT CARRIES** (campaign M-4).
-///
-/// Not a flag on a shape — the two recipes have DIFFERENT PLANES, under
-/// different names, and this is what says which. It is read by
-/// `Model::new` (which pieces to declare, and under which prefix) and by
-/// `import` (which stored tensors to bind them to), and by nothing at fire
-/// time: once the trace is written, a head is a head.
+/// Which draft-head recipe an artifact carries. Read by `Model::new` (which
+/// pieces to declare) and `import` (which tensors to bind); irrelevant once
+/// the trace is built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recipe {
-    /// **THE CHECKPOINT'S OWN.** Fifteen `mtp.*` tensors published inside the
-    /// base artifact, pre-fusion norms and a final norm included. Qwen3.6-27B
-    /// is the one shipping SKU that carries them.
+    /// The checkpoint's own head: 15 `mtp.*` tensors in the base artifact,
+    /// with pre-fusion norms and a final norm.
     Mtp,
-    /// **AN OVERLAY.** A separately-obtained head, baked into the artifact
-    /// beside the base by `pie model import --aux` under an `aux.` prefix, and
-    /// therefore under a prefix that cannot collide with anything a base
-    /// checkpoint publishes. No pre-fusion norms, no final norm.
-    ///
-    /// **THE PREFIX IS THE WHOLE OF THE OVERLAY CONTRACT.** `--aux` is
-    /// family-blind — it copies a second checkpoint's tensors into the same
-    /// `.zt` with every name prefixed — so what makes those bytes a draft head
-    /// rather than a second model is this text naming them, exactly as the
-    /// base's own names are the text's to name.
+    /// A separately-obtained head baked into the artifact by
+    /// `pie model import --aux` under an `aux.` prefix (can't collide with
+    /// base checkpoint names). No pre-fusion norms, no final norm.
     Eagle,
 }
 
@@ -203,94 +112,50 @@ impl Recipe {
     }
 }
 
-/// **THE SECOND ROW AXIS'S MODEL** (multimodal §0–§2): a windowed region of the
-/// SAME fire whose rows are PATCHES and whose lanes are IMAGES.
-///
-/// # The algebra, transcribed
-///
-/// Off `Qwen3_5VisionModel.forward` and `Qwen3_5VisionBlock`
-/// (`transformers/models/qwen3_5/modeling_qwen3_5.py`, v5.15.1), which the two
-/// checkpoints' own tensors agree with plane for plane:
+/// The vision tower: a windowed region of the same fire whose rows are
+/// patches and whose lanes are images.
 ///
 /// ```text
-/// y  = patch_embed(x) + pos_embed[interp(grid)]     one GEMM, one gather
+/// y  = patch_embed(x) + pos_embed[interp(grid)]
 /// per block:
-///   y += proj(dense_attn(rope(qkv(LN(y)))))         bidirectional, per image
-///   y += fc2(gelu(fc1(LN(y))))                      UNGATED gelu_pytorch_tanh
-/// out = mfc2(gelu(mfc1(merge(LN(y)))))              4 rows in, 1 row out
+///   y += proj(dense_attn(rope(qkv(LN(y)))))
+///   y += fc2(gelu(fc1(LN(y))))
+/// out = mfc2(gelu(mfc1(merge(LN(y)))))
 /// ```
 ///
-/// # Four sentences that are not obvious, and what settles each
-///
-/// **THE NORMS ARE `nn.LayerNorm`, AND THE TEXT SAYS THE WHOLE OF ONE**
-/// (multimodal §6.1, §9.1; next.md B5). The checkpoints publish `norm1.bias`
-/// beside `.weight`, which an RMSNorm has none of. The fold into the
-/// following GEMM that §6.1 proposed is HALF expressible (`Expr::Scale` can
-/// scale a bank, `Expr::Bias` cannot add `b·Mᵀ`) and the two halves do not
-/// compose, so the text says the whole norm in ops and the import contract
-/// stays a copy. `LN` above is `elemwise.layernorm` — one node, centred and
-/// scaled and biased. It was three (`layernorm_no_scale`, then an
-/// `rmsnorm` that normalized nothing and only read the weight, then
-/// `add_bias`) until B5 fused them: 25 norms a tower fire, 75 launches down
-/// to 25.
-///
-/// **THE MLP IS UNGATED** (§6.2): `linear_fc2(act(linear_fc1(x)))` with
-/// nothing to multiply, which is `linear.mlp_gelu_tanh` and not a geglu.
-///
-/// **THE ROTATION IS TWO-AXIS AND BLOCK-LAID** (§6.3, §7.2).
-/// `Qwen3_5VisionRotaryEmbedding(head_dim / 2)` builds `head_dim/4`
-/// frequencies and `freqs[pos_ids].flatten(1)` indexes that ONE ladder once
-/// per axis, so each section restarts it — [`MropeForm::Blocked`] — and the
-/// tower has no time axis, which it states as `sections[0] == 0` rather than
-/// as a two-wide position stream. `theta` is 10 000: the class default, and
-/// neither SKU's `vision_config` overrides it.
-///
-/// **AND IT IS REPLICATED UNDER `tp`, EVERY PLANE.** A tower is twelve or
-/// twenty-seven blocks of 768 or 1152 — under a gibibyte against the trunk's
-/// tens — and cutting it would put a collective inside the patch unit for a
-/// rectangle every rank can hold whole. What the ranks then duplicate is the
-/// tower's arithmetic; what they save is a reduce per block per image.
+/// Norms are real `nn.LayerNorm`, not RMSNorm. MLP is ungated. Rotation is
+/// two-axis, block-laid ([`MropeForm::Blocked`]), no time axis. Replicated
+/// whole under `tp` rather than sharded — too small to be worth a collective.
 ///
 /// [`MropeForm::Blocked`]: model_dsl::MropeForm::Blocked
 pub struct Tower {
     /// The tower's own residual width — NOT the trunk's.
     pub hidden: u32,
     pub heads: u32,
-    /// `hidden / heads`. Stated rather than derived at each site for the
-    /// reason `Model::head_dim` is: an attention schedule is carved for a
-    /// reading, and the reading is said once.
+    /// `hidden / heads`, stated rather than derived (same reason as
+    /// `Model::head_dim`).
     pub head_dim: u32,
-    /// `spatial_merge_size`. The merger folds `merge²` consecutive patch rows
-    /// into one, which is `layout.merge_rows` and is why the submission's
-    /// merge-block-major ordering is a statute (§2).
+    /// `spatial_merge_size`: the merger folds `merge²` consecutive patch rows
+    /// into one (`layout.merge_rows`).
     pub merge: u32,
-    /// `C · T · P²` — the width of one PRE-UNFOLDED patch row, and therefore
-    /// the carve size `Input::patches` states. A submission that unfolded to a
-    /// different width would be describing a different rectangle.
+    /// `C · T · P²`: width of one pre-unfolded patch row, the carve size
+    /// `Input::patches` uses.
     pub patch_width: u32,
-    /// How many rows of [`pos_embed`](Tower::pos_embed) one patch gathers:
-    /// 4 for the bilinear resample every non-native grid needs (§11.2).
-    ///
-    /// **FOUR AND NOT ONE, AND THE DEGENERATE CASE IS FREE ANYWAY.** A
-    /// deployment whose resize policy locks every image to the stored 48×48
-    /// grid could state 1 and reserve no weight stream at all; one that
-    /// resizes — which is every policy that admits a second aspect ratio —
-    /// needs the hat weights, and §11.4's gate proves the native grid
-    /// degenerates to weight 1 on the patch's own row under exactly this
-    /// call. So four is the reading that is always right, and one is an
-    /// optimization a grid-locked deployment may take by changing this line.
+    /// Rows of [`pos_embed`](Tower::pos_embed) gathered per patch: 4 for
+    /// bilinear resample of a non-native grid. Could be 1 only for a
+    /// deployment that never resizes.
     pub taps: u32,
-    /// `num_position_embeddings` — the learned table's row count, and the
-    /// square of the grid side the host resamples from.
+    /// `num_position_embeddings`: learned table row count, the square of the
+    /// grid side the host resamples from.
     pub positions: u32,
     pub theta: f32,
     pub norm_eps: f32,
     pub sm_scale: f32,
-    /// `[hidden, patch_width]` — the patch "convolution", which is a matmul
-    /// because the submission ships patch VECTORS (§2's contract decision).
+    /// `[hidden, patch_width]`: patch embedding as a matmul (patches arrive
+    /// as vectors, not images).
     pub patch_embed: Weight,
     pub patch_embed_bias: Weight,
-    /// `[positions, hidden]`, gathered per patch row (§11.3).
+    /// `[positions, hidden]`, gathered per patch row.
     pub pos_embed: Weight,
     pub blocks: Vec<TowerBlock>,
     pub merger: Merger,
@@ -315,21 +180,15 @@ pub struct TowerBlock {
     pub fc2_bias: Weight,
 }
 
-/// The patch merger: the one place the patch rectangle's row COUNT changes.
-///
-/// **THE NORM IS ON THE UNMERGED ROWS, AND THE CHECKPOINT SAYS SO.**
-/// `Qwen3_5VisionPatchMerger` norms before the shuffle by default
-/// (`use_postshuffle_norm = False`) and its `norm` is `[hidden]` and not
-/// `[merge²·hidden]`, which is the same fact read off the shapes. So the text
-/// writes the norm at `hidden` and `layout.merge_rows` after it.
+/// The patch merger: the one place the patch rectangle's row count changes.
+/// Norm runs before the merge shuffle, on `[hidden]`, not `[merge²·hidden]`.
 pub struct Merger {
     pub norm: Weight,
     pub norm_bias: Weight,
     /// `[merge²·hidden, merge²·hidden]`.
     pub fc1: Weight,
     pub fc1_bias: Weight,
-    /// `[out_hidden, merge²·hidden]` — `out_hidden` is the TRUNK's width, which
-    /// is what makes the tower's answer a token row.
+    /// `[out_hidden, merge²·hidden]`; `out_hidden` is the trunk's width.
     pub fc2: Weight,
     pub fc2_bias: Weight,
 }
@@ -350,18 +209,11 @@ pub struct Layer {
     pub mlp: Mlp,
     /// This layer's adapter bank, `[slots, rank, hidden]` and
     /// `[slots, hidden, rank]` — the down and up planes of one correction
-    /// site (design §8).
+    /// site.
     ///
-    /// **THE SITE IS THE MIXER SUBLAYER, AND IT IS THE SITE BECAUSE OF THE
-    /// COLLECTIVE.** Both ends are REPLICATED values: the input is this
-    /// layer's normed residual, and the output is the mixer's result AFTER
-    /// `all_reduce`. A correction stated one statement earlier — on
-    /// `o_proj`'s own output, which is what a checkpoint's `o_proj` LoRA
-    /// names — reads a rows-cut partial product and lands before the reduce,
-    /// so every rank would contribute the whole `ΔW·x` and the sum would
-    /// carry it `tp` times. `MoeBiasSum` states the identical argument about
-    /// the identical hazard, and takes the identical way out: say the
-    /// additive term once, after the reduce, where it lands exactly once.
+    /// Sits on the mixer sublayer's replicated input/output, after the
+    /// `all_reduce` — not on `o_proj`'s own (rank-cut) output, which would
+    /// have every rank add the full `ΔW·x` and sum it `tp` times.
     pub lora_a: Weight,
     pub lora_b: Weight,
 }
@@ -444,13 +296,10 @@ enum MlpDims {
     Routed(MoeDims),
 }
 
-/// A tower's own numbers, read off `config.json`'s `vision_config`.
-///
-/// Separate from [`Dims`] because they size a DIFFERENT ROW SPACE: nothing
-/// here divides by `tp` (the tower is replicated, see [`Tower`]) and nothing
-/// here is a trunk fact. `out_hidden` is the one number that crosses — it is
-/// the trunk's `hidden`, which is what makes the tower's answer a token row —
-/// and it is asserted against it rather than restated.
+/// A tower's own numbers, read off `config.json`'s `vision_config`. Separate
+/// from [`Dims`] since nothing here divides by `tp` (the tower is
+/// replicated). `out_hidden` is the trunk's `hidden`, asserted against it
+/// rather than restated.
 #[derive(Clone, Copy)]
 struct TowerDims {
     depth: u32,
@@ -462,8 +311,7 @@ struct TowerDims {
     merge: u32,
     positions: u32,
     out_hidden: u32,
-    /// `Qwen3_5VisionRotaryEmbedding`'s own default; neither SKU's
-    /// `vision_config` states a `rope_parameters` block at all.
+    /// Rotary embedding class default; not set by either SKU's `vision_config`.
     theta: f32,
     norm_eps: f32,
     /// How many table rows a patch's position gathers ([`Tower::taps`]).
@@ -471,14 +319,9 @@ struct TowerDims {
 }
 
 impl TowerDims {
-    /// **THE TWO SHIPPED TOWERS, AND EVERY NUMBER IS `vision_config`'s.**
-    ///
-    /// qwen35-0.8B (snapshot `2fc06364`) and qwen36-27B (`6a9e13bd`) publish
-    /// the same tower with two sizes: `patch_size: 16`, `temporal_patch_size:
-    /// 2`, `in_channels: 3` (so `patch_width` is 1536 in both),
-    /// `spatial_merge_size: 2`, `num_position_embeddings: 2304`,
-    /// `hidden_act: "gelu_pytorch_tanh"`. What differs is depth, width, head
-    /// count, the MLP's waist and `out_hidden_size`.
+    /// The two shipped towers share `patch_width`, `merge`, `positions` and
+    /// `theta`/`norm_eps`; they differ in depth, hidden, heads, inter and
+    /// `out_hidden`.
     const fn qwen35() -> TowerDims {
         TowerDims {
             depth: 12,
@@ -532,11 +375,9 @@ struct Dims {
     norm_eps: f32,
     /// The vision tower this SKU's checkpoint publishes, or `None`.
     tower: Option<TowerDims>,
-    /// Which draft-head recipe this SKU's artifact carries, or `None` for one
-    /// that carries none. One layer is all any shipped qwen states
-    /// (`mtp_num_hidden_layers: 1`) and EAGLE's own recipe is one decoder
-    /// layer too, so there is no count here — a second layer would be a
-    /// second block in the text, and no artifact asks for one.
+    /// Which draft-head recipe this SKU's artifact carries, or `None`. No
+    /// layer count: every shipped draft head (either recipe) is exactly one
+    /// decoder layer.
     draft: Option<Recipe>,
 }
 
@@ -576,70 +417,25 @@ impl Model {
         }
     }
 
-    /// **THE WIDTH-INVARIANCE FIXTURE'S ROW** — `mini-l5-e16-k8`, the snapshot
-    /// `benches/shrink_checkpoint.py --family qwen3_5_moe_mlx` carves out of
-    /// `mlx-community/Qwen3.6-35B-A3B-4bit`.
-    ///
-    /// It is a catalog row, unlike `a3b_micro`: a real checkpoint ships it and
-    /// `identify` has to land on it, which is the whole point — the CUDA node
-    /// gates its tiled `Linear::Matmul` and `LmHead` on this artifact, and a
-    /// gate reads a file only if a SKU claims it.
-    ///
-    /// **TWO NUMBERS MOVE, AND ONLY TWO.** Depth goes to five and the routed
-    /// bank to sixteen. Everything else is `a3b_dims()` verbatim, and that is
-    /// the fixture's substance rather than an economy: the fault under test is
-    /// accumulation ORDER over K, so `hidden`, the expert `inter`, the whole
-    /// attention block that computes the router's input, and `vocab` — the
-    /// other tiled entry, and where the delta is finally read — all keep
-    /// production width. Halving any of them halves the partial sums and can
-    /// hide the thing the artifact exists to expose.
-    ///
-    /// `top_k` stays 8 against 16 experts because the failure needs a
-    /// CONTESTED tail: several experts whose logits sit within a ulp of each
-    /// other, so a ulp moved by the tiled projection changes which expert a
-    /// token takes. 8-of-8 is not a choice at all, and 8-of-256 spreads the
-    /// gaps wider than a ulp can cross.
-    ///
-    /// See [`Model::a3b_mini64`] for the sharper vehicle at the same five
-    /// layers; this row does not move, because it is the one the CUDA gate is
-    /// already standing on.
+    /// Width-invariance fixture (`mini-l5-e16-k8`), carved from the shipped
+    /// A3B checkpoint. Only depth (5) and expert count (16) change from
+    /// `a3b_dims`; everything else stays production width so accumulation
+    /// order over K stays comparable. `top_k` stays 8 to keep a contested
+    /// tail among the 16 experts.
     pub fn a3b_mini(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::a3b_mini_dims(16))
     }
 
-    /// **THE SAME FIXTURE WITH A CROWDED TAIL** — `mini-l5-e64-k8`, carved by
-    /// the same one command with `--experts 64`.
-    ///
-    /// This row exists because the 16-expert carve did its job and then stopped
-    /// short of the last claim. Run on the CUDA node it reproduced the tiled
-    /// path's fault structure exactly — the routed delta came out at 0.078 —
-    /// but 0.078 crossed no expert boundary: at 8-of-16 the gap between the
-    /// eighth and ninth logit is wider than the perturbation, so the routing
-    /// decision never actually changed and the gate measured a numeric delta
-    /// rather than a behavioural one.
-    ///
-    /// Sixty-four is the same bet [`Model::a3b_mini`]'s doc makes, taken one
-    /// notch further along the axis it names. Top-k stays 8, so the tail the
-    /// router has to break ties in goes from eight rejected experts to
-    /// fifty-six, and the eighth-to-ninth gap contracts with it — a ulp now has
-    /// somewhere to cross. It is still short of the shipped 256, whose gaps the
-    /// original doc calls wider than a ulp can cross, and short of it
-    /// deliberately: the artifact has to stay a fixture (a few gibibytes, one
-    /// download) rather than become the model.
-    ///
-    /// **AND ONLY THE BANK MOVES BETWEEN THE TWO ROWS.** Both are
-    /// `a3b_mini_dims`, so depth, `hidden`, the expert `inter`, the attention
-    /// block that computes the router's input and `vocab` are production width
-    /// in both — which is what lets a difference between the two gates' verdicts
-    /// be read as the bank's crowding and nothing else.
+    /// Same fixture with a crowded tail (`mini-l5-e64-k8`): 64 routed
+    /// experts instead of 16, top-k still 8, so the router has more rejected
+    /// experts to break ties among. Only the expert count differs from
+    /// `a3b_mini`.
     pub fn a3b_mini64(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::a3b_mini_dims(64))
     }
 
-    /// The miniature's geometry, with the one number the two rows disagree on
-    /// passed in. Everything else is [`Model::a3b_dims`] verbatim, and the two
-    /// public rows above are thin on purpose: a fixture whose contraction could
-    /// drift between its own two widths would be measuring the drift.
+    /// The miniature's geometry; only `experts` varies between the two
+    /// public rows above.
     fn a3b_mini_dims(experts: u32) -> Dims {
         let mut d = Model::a3b_dims();
         d.layers = 5;
@@ -650,30 +446,12 @@ impl Model {
         d
     }
 
-    /// **A ROUTED MoE THIS FAMILY'S SHAPE, SMALL ENOUGH TO HOLD TWICE** — the
-    /// text the weight-residency gate loads (alto design §7, wave D2).
-    ///
-    /// Not a catalog row and deliberately not one: no checkpoint ships it, no
-    /// deployment selects it, and adding it to `CATALOG` would oblige an
-    /// import contract and a chat template for a model nobody serves. What it
-    /// is for is the one claim `a3b` cannot be used to make on a single card —
-    /// that a load whose `device_weight_budget` holds HALF the experts
-    /// produces the logits full residency produces — because that claim needs
-    /// BOTH loads on one device and `a3b` is sixty-four gibibytes.
-    ///
-    /// Every number below is `a3b`'s, divided until two copies fit in a
-    /// gate's patience, with two deliberate exceptions:
-    ///
-    /// * `attn_every: 1` — every layer is a gated-attention layer rather than
-    ///   one in four. The residency tier is about the MLP's expert banks and
-    ///   the GDN mixer is orthogonal to it; holding the mixer fixed is what
-    ///   makes a difference in the logits a difference in the weights.
-    /// * `tied: true` — no `lm_head` plane, because a second
-    ///   `[vocab, hidden]` rectangle is the largest dense thing here and the
-    ///   dense floor is not what is under test.
-    ///
-    /// It is built through the same `Model::new` every shipped size is, so
-    /// nothing about its banks, cuts or names can drift from `a3b`'s.
+    /// Test-only routed MoE, `a3b`'s shape scaled down to fit two copies on
+    /// one device. Not a catalog row — no checkpoint ships it. Used to check
+    /// that a load holding half the experts produces the same logits as
+    /// full residency. `attn_every: 1` isolates the MLP's expert banks from
+    /// the (orthogonal) GDN mixer; `tied: true` drops the `lm_head` plane
+    /// since the dense floor isn't under test.
     pub fn a3b_micro(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -712,36 +490,17 @@ impl Model {
         Model::new(w, kv, tp, Model::d0_8b_dims(None, None))
     }
 
-    /// **THE SAME TWENTY-FOUR LAYERS, WITH AN EAGLE HEAD OVERLAID** (campaign
-    /// M-4).
-    ///
-    /// A SECOND ROW AND NOT A FLAG, for [`d27b_undrafted`]'s reason read the
-    /// other way round: whether a head is there is a fact about the ARTIFACT,
-    /// and this artifact is a different one — `pie model import <base> --aux
-    /// <head>` writes the base's tensors and a second checkpoint's under an
-    /// `aux.` prefix into one `.zt`. A row that declared the head optionally
-    /// would be a row that loads a plain qwen35 artifact and zeroes eleven
-    /// planes, which is a draft head that proposes noise and a gate that
-    /// cannot tell that from a bug.
-    ///
-    /// The trunk is `d0_8b`'s, sentence for sentence — one `d0_8b_dims` builds
-    /// both — so nothing about this row can drift from the row it drafts for.
-    ///
-    /// [`d27b_undrafted`]: Model::d27b_undrafted
+    /// Same 24-layer trunk as `d0_8b`, with an EAGLE head from a second
+    /// checkpoint overlaid via `pie model import <base> --aux <head>`. A
+    /// separate row rather than an optional field, since whether the head
+    /// exists is a fact about which artifact was imported.
     pub fn d0_8b_eagle(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d0_8b_dims(None, Some(Recipe::Eagle)))
     }
 
-    /// **THE PILOT** (campaign M-1): the same twenty-four layers, reading the
-    /// twelve-block 768 → 1024 tower its own checkpoint has always shipped.
-    ///
-    /// A SECOND ROW AND NOT A WIDENED ONE, for `d0_8b_eagle`'s reason and one
-    /// that is sharper here: a tower is the whole of what makes this plan a
-    /// TWO-UNIT one, and a text that declared it optionally would bake a patch
-    /// axis into every qwen35 artifact — a `PatchLadder` every deployment
-    /// would have to state, a second exec every fire would have to skip, and
-    /// G4's "every pre-campaign SKU is exactly one capture unit" gone. The
-    /// trunk is `d0_8b`'s, sentence for sentence, out of one `d0_8b_dims`.
+    /// Same 24-layer trunk as `d0_8b`, reading the 12-block tower its own
+    /// checkpoint ships. A separate row rather than an optional tower field,
+    /// since a tower makes this a two-unit plan.
     pub fn d0_8b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -751,17 +510,10 @@ impl Model {
         )
     }
 
-    /// **THE M-4 RIG'S OWN ROW** (campaign M-4, and the shadowing the M-1 flip
-    /// would otherwise cause).
-    ///
-    /// An overlay artifact is a base checkpoint plus `aux.*`, and a base
-    /// checkpoint SHIPS `model.visual.*` — so once a vision row precedes the
-    /// text-only one, an eagle artifact lands on the vision row and its draft
-    /// head is never bound. No row read both, and the gate that exercises the
-    /// draft mechanism went quietly unloadable. This is that row: the same
-    /// trunk, the tower its checkpoint ships, and the head `--aux` wrote
-    /// beside them, so the strictly most demanding artifact has a row that
-    /// asks for everything it holds.
+    /// Trunk, tower and EAGLE head together. Needed because vision rows are
+    /// ordered ahead of the plain eagle row, so a checkpoint that has both
+    /// the tower and the overlaid head would otherwise match the vision row
+    /// and never bind its draft head.
     pub fn d0_8b_vision_eagle(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -824,62 +576,25 @@ impl Model {
         )
     }
 
-    /// **Qwen3.6-27B, and it is a SKU of this family and not a family of its
-    /// own** (palo C3).
-    ///
-    /// The ruling, and the evidence for it, read off
-    /// `~/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B` at snapshot
-    /// `6a9e13bd`. `config.json` says `model_type: "qwen3_5"` and
-    /// `architectures: ["Qwen3_5ForConditionalGeneration"]` — the checkpoint
-    /// names ITSELF a Qwen3.5 — and every structural number the trunk of this
-    /// text reads is the same KIND of number one layer up: `layer_types`
-    /// alternates three `linear_attention` to one `full_attention`, so
-    /// `attn_every = 4` and the full layers land at `l % 4 == 3` (verified:
-    /// layer 0 publishes `linear_attn.*`, layer 3 publishes `self_attn.*`);
-    /// `attn_output_gate: true`, so `q_proj` is `[2·q·d, hidden]`;
-    /// `partial_rotary_factor: 0.25` of `head_dim: 256`, so `rotary_dim = 64`.
-    /// Not one op of the trunk changes. What is NEW is the `mtp.*` head, and a
-    /// head is a declaration, not an architecture.
-    ///
-    /// **THE TWO THINGS THIS SKU DOES NOT SERVE, SAID OUT LOUD.** The
-    /// checkpoint also ships a 27-block SigLIP-shaped `model.visual.*` tower
-    /// and an interleaved-mrope section (`rope_parameters.mrope_interleaved`,
-    /// `mrope_section: [11, 11, 10]`). This row is the TEXT-ONLY reading of the
-    /// artifact — `config.json`'s own `language_model_only` switch names that
-    /// reading — and it declares neither. A text lane's positions are scalar,
-    /// which is what `elemwise.rope_partial` takes; an image lane's are a
-    /// three-section triple, and that is a fourth axis with a fourth fact, not
-    /// a flag on this one.
+    /// Qwen3.6-27B: a SKU of this family, not a separate one —
+    /// `config.json` names itself `qwen3_5`. `attn_every = 4` (3 linear : 1
+    /// full attention), `q_proj` is gated (`attn_output_gate`), `rotary_dim
+    /// = 64` (`partial_rotary_factor: 0.25` of `head_dim: 256`). Adds the
+    /// `mtp.*` draft head. Text-only reading: the checkpoint also ships a
+    /// 27-block tower and interleaved mrope, neither declared here.
     pub fn d27b(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::Mtp)))
     }
 
-    /// The same sixty-four layers and the same one reading, read WITHOUT the
-    /// draft head.
-    ///
-    /// Not a smaller model and not a disabled feature — [`Mtp`]'s own doc says
-    /// a `None` there is a model that has no second head, and this is how a
-    /// SKU says so. It exists because the fifteen `mtp.*` planes are a fact
-    /// about the ARTIFACT: the 4-bit conversions of this model are produced by
-    /// `mlx_lm`, which implements no multi-token-prediction arm for the family
-    /// and therefore carries none of them, and a text that demanded them would
-    /// refuse every 4-bit artifact of the model it is named after. What it
-    /// costs is the draft path and nothing else — the trunk is the same
-    /// sentences, and `mtp.*` planes an artifact happens to ship are simply
-    /// not read.
+    /// Same 64 layers without the draft head. Used for 4-bit conversions:
+    /// `mlx_lm` implements no MTP arm for this family, so those artifacts
+    /// carry none of the `mtp.*` planes.
     pub fn d27b_undrafted(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, None))
     }
 
-    /// **THE COMBINED SKU** (campaign M-2): the twenty-seven-block SigLIP-shaped
-    /// tower AND the `mtp.*` draft head, which is the row multimodal §0 said
-    /// this checkpoint gives for free.
-    ///
-    /// Free is not the same as absent. What it means is that the two axes are
-    /// declared by two independent fields and share nothing — the tower is a
-    /// patch-axis unit and the head is a token-axis window — so this row is
-    /// `d27b`'s sentences plus `d0_8b_vision`'s, and neither had to learn
-    /// about the other.
+    /// Both the 27-block tower and the `mtp.*` head — two independent
+    /// fields, so this row is `d27b`'s dims plus a tower.
     pub fn d27b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -889,17 +604,8 @@ impl Model {
         )
     }
 
-    /// **THE TOWER WITHOUT THE HEAD**, which is the pairing the 4-bit
-    /// artifact actually publishes.
-    ///
-    /// [`d27b_undrafted`](Model::d27b_undrafted) makes the argument for the
-    /// missing head and it applies here unchanged — `mlx_lm` implements no
-    /// MTP arm for this family, so its conversions carry none of the fifteen
-    /// `mtp.*` planes — and the tower is orthogonal to it: `mlx-community/
-    /// Qwen3.6-27B-4bit` ships all 333 of `vision_tower.*` and not one
-    /// `mtp.*`. Two independent fields, and the artifact sets them
-    /// independently, which is why this is a fourth row rather than a flag on
-    /// one of the other three.
+    /// Tower without the draft head — the pairing the 4-bit artifact
+    /// actually ships (tower present, no `mtp.*` planes).
     pub fn d27b_vision_undrafted(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -938,79 +644,25 @@ impl Model {
             matches!(tp, 1 | 2 | 4 | 8),
             "tp {tp} is not a world this catalog ships"
         );
-        // Everything this text declares that is NOT a matmul bank: the norms,
-        // the depthwise convolution, the deltanet's per-head biases, and the
-        // adapter planes the host writes. See `crate::dense` for why they are
-        // asked for rather than assumed to be `w`.
+        // Non-matmul values (norms, depthwise conv, deltanet per-head
+        // biases, adapter planes) use `dense`, not `w`. See `crate::dense`.
         let dense = crate::dense(w);
-        // **THE TWO ROUTING GATES, AT THEIR OWN WIDTH** (campaign M-5) — the
-        // rule `gpt_oss::model` states for its single gate, in this family's
-        // spelling of it. That comment names this family as carrying the same
-        // predicate and it does: `mlx_lm`'s `qwen3_5_moe.py` raises every
-        // `mlp.gate` AND every `mlp.shared_expert_gate` to eight bits whatever
-        // the rest of the stack is at, and
-        // `mlx-community/Qwen3.6-35B-A3B-4bit`'s `config.json` lists all
-        // EIGHTY of them — forty of each, one pair per layer — under
-        // `bits: 8` beside the affine-U4 entries.
-        //
-        // The shapes say it too, and they are what was checked. A `[256,
-        // 2048]` router stored four bits to a code would ship `2048 / 64 = 32`
-        // scales per row in a `[256, 512]` `u32` plane; the file ships `[256,
-        // 512]` codes with `[256, 32]` scales, which is `512 * 4 = 2048`
-        // codes to a row and thirty-two groups of sixty-four — eight bits, not
-        // four. `shared_expert_gate` reads the same way at `[1, 2048]`.
-        //
-        // A bf16 stack's gates stay bf16: the raise is from four bits to
-        // eight, not to eight from anywhere.
+        // Router gates (`mlp.gate`, `mlp.shared_expert_gate`) are stored at
+        // 8 bits even when the rest of a 4-bit stack is 4-bit; a bf16 stack
+        // keeps its gates at bf16.
         let gate = match w {
             Dtype::U4g64 => Dtype::U8g64,
             other => other,
         };
-        // **THE TILED FLIP, TAKEN ON THIS FAMILY'S PROJECTIONS** (§J4b).
-        //
-        // `U4g64tiled` is `U4g64`'s codes in m16n8k16 fragment order: the
-        // same scheme, the same group of sixty-four, the same two bf16
-        // companions, and a different ORDER — which `linear::tiled` reads
-        // 2.5-6x faster at the decode point and at cublas parity in prefill.
-        // The declaration is the whole of the flip: `Weight::planes` bands
-        // the rows, `checkpoint_dsl::claim` claims the banded rectangle, and
-        // `Run::maybe_tiled_planes` routes the row to the tiled kernels.
-        //
-        // **WHICH WEIGHTS, AND WHY NOT THE OTHERS.** The tiled point serves
-        // `y = act x W^T` over a two-dimensional weight and nothing else, so
-        // this width reaches the dense PROJECTIONS alone — the ones the
-        // forward hands to `ops::linear::matmul`. Three sets are deliberately
-        // left row-major:
-        //
-        // - `embed` (and the head that ties to it) is read by the affine
-        //   GATHER, which has no tiled reader. §J4b's recipe says never, and
-        //   for a tied row the head is the same tensor.
-        // - the ROUTED EXPERT BANKS are three-dimensional and read by the
-        //   grouped select; `Weight::planes` refuses a tiled one by name.
-        // - the MTP draft stack, whose `fc` legs are read as SLICES of one
-        //   stored tensor — a chain no repack verb states.
-        //
-        // **AND `place` IS WHY THE SENTENCE ABOVE IS ABOUT WEIGHTS AND NOT
-        // ABOUT SHELLS** (§J4c's correction). The list is the text's, because
-        // only a text knows which of its weights the arrangement is legal on.
-        // WHETHER the arrangement is taken is not the text's: a repack moves
-        // no value, so an order is only ever an order, and a kernel with no
-        // reader for it computes finite, deterministic nonsense off the same
-        // bytes. This match stated `U4g64tiled` outright for a while and the
-        // whole `*-mlxu4-*` half of this family stopped serving on Metal for
-        // it — `kernels_metal::linear::quant` indexes an affine bank
-        // row-major and has no fragment-order twin, so a raw snapshot refused
-        // at `validate_target_support` and an imported artifact answered
-        // `"一时的وات**!.energy…"`. `model_dsl::place` asks the setup instead
-        // (`model_ir::Platform::placement`), and both readings of this text
-        // are read under one — the trace through `catalog!`, the load
-        // contract through `runtime::engine::load` — so a CUDA row still
-        // declares every projection tiled and a Metal row declares the
-        // canonical `U4g64` its qmm and qmv arms already read. That is §M's
-        // own ruling in a dtype: a `.zt` is a function of the RECIPE, so one
-        // text is two artifacts and neither is wrong.
+        // `U4g64tiled` reorders `U4g64` codes into m16n8k16 fragment order
+        // for `linear::tiled`. Applies only to 2D dense projections read by
+        // `ops::linear::matmul`: `embed`/tied head (gather), routed expert
+        // banks (3D, grouped select) and the MTP `fc` slices stay row-major
+        // since none have a tiled reader. `model_dsl::place` resolves the
+        // actual per-platform layout: CUDA gets tiled, Metal gets canonical
+        // `U4g64` (Metal's quant kernels have no fragment-order reader).
         let proj = match w {
-            Dtype::U4g64 => model_dsl::place(Dtype::U4g64tiled),
+            Dtype::U4g64 => Dtype::U4g64tiled,
             other => other,
         };
         let q_heads = d.q_heads / tp;
@@ -1050,10 +702,8 @@ impl Model {
                             .packed([k_w, k_w, v_w, v_w]),
                         in_ba: Weight::sym(n("in_ba"), [2 * v_heads as u64, hidden], proj)
                             .packed([v_heads as u64, v_heads as u64]),
-                        // NOT BANKS, EITHER OF THEM. The convolution contracts
-                        // over four taps and the bias over nothing, and a
-                        // sixty-four-code group has neither to group; MLX ships
-                        // both unquantized for exactly that reason.
+                        // conv and dt_bias stay unquantized: neither has 64
+                        // values to group.
                         conv: Weight::sym(n("conv"), [qkv, d.conv_kernel as u64], dense)
                             .packed([k_w, k_w, v_w]),
                         dt_bias: Weight::sym(n("dt_bias"), [v_heads as u64], dense).columns(),
@@ -1114,27 +764,20 @@ impl Model {
                     mlp_norm: norm("mlp_norm", hidden),
                     mlp_norm_eps: d.norm_eps,
                     mlp,
-                    // REPLICATED under tp, because both ends of this site are:
-                    // the input is the replicated normed residual and the output
-                    // is the reduced mixer result. Nothing here is cut, so
-                    // nothing here is summed twice. `crate::adapter::banks` is
-                    // where the orientations and the registration live, for
-                    // every family at once.
+                    // Replicated under tp: both ends (normed residual in,
+                    // reduced mixer result out) are replicated, so nothing
+                    // here is summed twice.
                     lora_a,
                     lora_b,
                 }
             })
             .collect();
 
-        // The draft head, when the artifact publishes one. Its mlp is stated at
-        // the trunk's own dense width whatever the trunk's own mlp is: the
-        // checkpoint's `mtp.layers.0.mlp` is dense even where the trunk routes,
-        // because a draft block is one block and has no experts to route to.
-        // **THE TOWER, WHEN THE CHECKPOINT PUBLISHES ONE** (multimodal §2).
-        // Every plane replicated — `Tower`'s own note argues why — and every
-        // name under `visual.`, which is the checkpoint's own namespace with
-        // its `model.` stripped, so a reader can hold the two lists side by
-        // side.
+        // Draft head's mlp is always dense at the trunk's width, even when
+        // the trunk routes — one block, no experts to route to.
+        //
+        // Tower, when published: every plane replicated, names under
+        // `visual.` (checkpoint's own namespace, `model.` stripped).
         let tower = d.tower.map(|t| {
             assert_eq!(
                 t.out_hidden, d.hidden,
@@ -1154,19 +797,9 @@ impl Model {
             let merged = u64::from(t.merge) * u64::from(t.merge) * th;
             let head_dim = t.hidden / t.heads;
             let n = |s: String| format!("visual.{s}");
-            // **EVERY TOWER PLANE IS `dense(w)`, THE MERGER INCLUDED**, and
-            // that is the artifact's statement rather than this text's.
-            // `mlx-community/Qwen3.6-27B-4bit` publishes 333 tensors under
-            // `vision_tower.` and NOT ONE `.scales` or `.biases` among them —
-            // every projection, every bias and both merger banks stored
-            // whole beside a 4-bit trunk. gemma's sibling row reads the same
-            // way, with the one exception its own note names (a projection
-            // that is trunk-width and lives outside the tower's namespace).
-            //
-            // So a `-vision-mlxu4` row is a bf16 tower over a U4 trunk, and
-            // it is not a mixed-precision CHOICE: a tower declared at `w`
-            // would ask this file for triplets it does not hold and refuse at
-            // the door.
+            // Every tower plane is `dense(w)`, merger included: 4-bit
+            // checkpoints still ship the tower unquantized, so a
+            // `-vision-u4g64` row is a bf16 tower over a U4 trunk.
             let plane = |s: String, dims: [u64; 2]| Weight::sym(n(s), dims, dense);
             let vec1 = |s: String, len: u64| Weight::sym(n(s), [len], dense);
             Tower {
@@ -1213,12 +846,9 @@ impl Model {
             }
         });
 
-        //
-        // **THE KV ROW STAYS `kv.mtp` UNDER EITHER RECIPE, AND THE PREFIX DOES
-        // NOT REACH IT.** A cache row's name is what `caches()` seats and what
-        // `Input::kv` asks by; it is a fact about THIS PLAN's page-id space and
-        // not about which checkpoint the bytes came out of. Two spellings of
-        // one row would be two page tables for one sequence.
+        // kv row stays `kv.mtp` under either recipe — a fact about this
+        // plan's page-id space, not about which checkpoint the bytes came
+        // from.
         let mtp = d.draft.map(|recipe| {
             let inter = match &d.mlp {
                 MlpDims::Dense { inter } => *inter,
@@ -1233,11 +863,8 @@ impl Model {
                     hidden: Weight::sym(n("pre_fc_norm_hidden"), [hidden], dense),
                     eps: d.norm_eps,
                 }),
-                // REPLICATED, both halves. A fusion bank contracts over `hidden`
-                // and produces `hidden`, and both ends of it are replicated
-                // values — the embedding of a token every rank holds, and the
-                // trunk's residual stream after its reduce. Cutting either way
-                // would put a partial sum where a whole one is read.
+                // Replicated, both halves: token embedding and the trunk's
+                // reduced residual stream are both replicated values.
                 fc_embed: Weight::sym(n("fc_embed"), [hidden, hidden], w),
                 fc_hidden: Weight::sym(n("fc_hidden"), [hidden, hidden], w),
                 mixer_norm: Weight::sym(n("mixer_norm"), [hidden], dense),
@@ -1276,33 +903,15 @@ impl Model {
     }
 }
 
-/// What every SKU of this family seats.
-///
-/// One pair of numbers rather than a `Dims` field, because they are not a
-/// fact about the checkpoint the way `hidden` and `layers` are — no
-/// pretrained artifact states them. They are the DEPLOYMENT's ceiling written
-/// where a shape has to be written, and a deployment that wants a different
-/// one changes this line and re-traces, which is exactly the "load-time
-/// recompile, never a runtime extension" design §9 asks for.
-///
-/// Eight slots of rank sixteen is what a bank costs at qwen35-d0.8b: two
-/// planes of `8 x 16 x 1024` bf16 per layer, 512 KiB a layer, 12 MiB over
-/// twenty-four — against 1.40 GiB of weights.
+/// Adapter ceiling for every SKU of this family. Not a checkpoint fact (no
+/// pretrained artifact states it) — a deployment setting baked in at trace
+/// time; changing it means re-tracing.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
-/// One gated full-attention site's banks, named under `prefix`.
-///
-/// SHARED BY THE TRUNK AND THE DRAFT HEAD because the checkpoint shares them:
-/// `mtp.layers.0.self_attn.*` has the shapes of
-/// `model.language_model.layers.3.self_attn.*` tensor for tensor —
-/// `q_proj [2·q·d, hidden]`, `k_proj`/`v_proj [kv·d, hidden]`,
-/// `o_proj [hidden, q·d]`, per-head `q_norm`/`k_norm [d]`. Two spellings of
-/// one site would be two places for a head count to be wrong in.
-///
-/// The head counts and the per-head width are not written into the returned
-/// site at all: they are the model's ONE reading (`Model::q_heads`,
-/// `kv_heads`, `head_dim`), and what this function takes them for is shaping
-/// the banks — the per-rank counts, because the banks are cut by `tp`.
+/// One gated full-attention site's banks, named under `prefix`. Shared by
+/// trunk and draft head — `mtp.layers.0.self_attn.*` matches a trunk
+/// layer's shapes tensor for tensor. `q_heads`/`kv_heads` passed in here are
+/// already per-rank (cut by `tp`).
 fn gated_attn(w: Dtype, d: &Dims, q_heads: u32, kv_heads: u32, prefix: &str, kv: String) -> Attn {
     let n = |s: &str| format!("{prefix}.{s}");
     let dense = crate::dense(w);
@@ -1325,8 +934,7 @@ fn gated_attn(w: Dtype, d: &Dims, q_heads: u32, kv_heads: u32, prefix: &str, kv:
 }
 
 /// One dense SwiGLU sublayer's banks, named under `prefix`. The draft head's
-/// mlp is the trunk's at the same intermediate width — `mtp.layers.0.mlp.*` is
-/// `[17408, 5120]` twice and `[5120, 17408]` once, exactly a trunk layer's.
+/// mlp is the trunk's at the same intermediate width.
 fn dense_mlp(w: Dtype, hidden: u64, inter: u32, prefix: &str) -> Mlp {
     let n = |s: &str| format!("{prefix}.{s}");
     Mlp::Dense {
@@ -1338,137 +946,4 @@ fn dense_mlp(w: Dtype, hidden: u64, inter: u32, prefix: &str) -> Mlp {
 }
 
 impl Model {
-    pub fn load(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp);
-        b.read_own(&self.embed)?;
-        b.read_own(&self.final_norm)?;
-
-        match &self.head {
-            Head::Tied => {}
-            Head::Bank(head) => b.read_own(head)?,
-        }
-
-        for layer in &self.layers {
-            b.read_own(&layer.mixer_norm)?;
-            b.read_own(&layer.mlp_norm)?;
-
-            match &layer.mixer {
-                Mixer::Attn(a) => {
-                    b.read_own(&a.qg_proj)?;
-                    b.read_own(&a.k_proj)?;
-                    b.read_own(&a.v_proj)?;
-                    b.read_own(&a.o_proj)?;
-                    b.read_own(&a.q_norm)?;
-                    b.read_own(&a.k_norm)?;
-                }
-                Mixer::Gdn(g) => {
-                    b.read_own(&g.in_qkvz)?;
-                    b.read_own(&g.in_ba)?;
-                    b.read_own(&g.conv)?;
-                    b.read_own(&g.dt_bias)?;
-                    b.read_own(&g.a_log)?;
-                    b.read_own(&g.norm)?;
-                    b.read_own(&g.out_proj)?;
-                }
-            }
-
-            match &layer.mlp {
-                Mlp::Dense { gate_up, down, .. } => {
-                    b.read_own(gate_up)?;
-                    b.read_own(down)?;
-                }
-                Mlp::Routed {
-                    router,
-                    gate_up,
-                    down,
-                    shared_gate_up,
-                    shared_down,
-                    shared_gate,
-                    ..
-                } => {
-                    b.read_own(router)?;
-                    b.read_own(gate_up)?;
-                    b.read_own(down)?;
-                    b.read_own(shared_gate_up)?;
-                    b.read_own(shared_down)?;
-                    b.read_own(shared_gate)?;
-                }
-            }
-        }
-
-        // The tower's planes. Stated in one walk rather than folded into the
-        // layer loop above because they are a different row space's weights:
-        // nothing here is cut by `tp`, and nothing here has an adapter bank.
-        if let Some(t) = &self.tower {
-            b.read_own(&t.patch_embed)?;
-            b.read_own(&t.patch_embed_bias)?;
-            b.read_own(&t.pos_embed)?;
-            for blk in &t.blocks {
-                for w in [
-                    &blk.norm1,
-                    &blk.norm1_bias,
-                    &blk.qkv,
-                    &blk.qkv_bias,
-                    &blk.proj,
-                    &blk.proj_bias,
-                    &blk.norm2,
-                    &blk.norm2_bias,
-                    &blk.fc1,
-                    &blk.fc1_bias,
-                    &blk.fc2,
-                    &blk.fc2_bias,
-                ] {
-                    b.read_own(w)?;
-                }
-            }
-            let m = &t.merger;
-            for w in [
-                &m.norm,
-                &m.norm_bias,
-                &m.fc1,
-                &m.fc1_bias,
-                &m.fc2,
-                &m.fc2_bias,
-            ] {
-                b.read_own(w)?;
-            }
-        }
-
-        // The draft head's own planes. Stated here and not folded into the
-        // layer walk because a head is not a layer: it has no adapter bank
-        // (nothing routes a correction into a draft), and its `fc` halves are
-        // two claims over one stored bank — which `import.rs` is where the
-        // slicing is said, and this is where the shapes are demanded.
-        if let Some(mtp) = &self.mtp {
-            if let Some(pre) = &mtp.pre_fc {
-                b.read_own(&pre.embedding)?;
-                b.read_own(&pre.hidden)?;
-            }
-            b.read_own(&mtp.fc_embed)?;
-            b.read_own(&mtp.fc_hidden)?;
-            b.read_own(&mtp.mixer_norm)?;
-            b.read_own(&mtp.attn.qg_proj)?;
-            b.read_own(&mtp.attn.k_proj)?;
-            b.read_own(&mtp.attn.v_proj)?;
-            b.read_own(&mtp.attn.o_proj)?;
-            b.read_own(&mtp.attn.q_norm)?;
-            b.read_own(&mtp.attn.k_norm)?;
-            b.read_own(&mtp.mlp_norm)?;
-            match &mtp.mlp {
-                Mlp::Dense { gate_up, down, .. } => {
-                    b.read_own(gate_up)?;
-                    b.read_own(down)?;
-                }
-                Mlp::Routed { .. } => panic!(
-                    "`{}`: a draft head is one block and routes to no experts",
-                    mtp.mixer_norm.name,
-                ),
-            }
-            if let Some(norm) = &mtp.norm {
-                b.read_own(norm)?;
-            }
-        }
-
-        Ok(b.build())
-    }
-}
+ }

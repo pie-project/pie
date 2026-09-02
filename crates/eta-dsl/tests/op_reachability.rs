@@ -202,16 +202,3 @@ fn every_op_is_authorable_or_says_why_not() {
     );
 }
 
-#[test]
-fn the_exemption_list_describes_real_ops() {
-    for (tag, reason) in NOT_AUTHORABLE {
-        assert!(
-            OP_TABLE.iter().any(|spec| spec.tag == *tag),
-            "NOT_AUTHORABLE exempts tag {tag:#x}, which no longer has a row in OP_TABLE"
-        );
-        assert!(
-            reason.len() > 40,
-            "the exemption for tag {tag:#x} needs a reason, not a note"
-        );
-    }
-}

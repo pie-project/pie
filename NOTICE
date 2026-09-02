@@ -1,0 +1,53 @@
+Pie (pie-project)
+Copyright 2025 Pie Team
+
+This product includes software developed at the Pie project, licensed under the
+Apache License, Version 2.0 (see LICENSE).
+
+It also includes or is derived from the following third-party work.
+
+--------------------------------------------------------------------------------
+XGrammar
+https://github.com/mlc-ai/xgrammar
+Apache License 2.0
+Copyright (c) 2024 by XGrammar Contributors
+
+  The constrained-decoding engine in `crates/grammar` is a Rust rewrite derived
+  in part from XGrammar; parts of its test suite are ported from XGrammar's.
+
+--------------------------------------------------------------------------------
+FlashInfer
+https://github.com/flashinfer-ai/flashinfer
+Apache License 2.0
+Copyright (c) 2023-2025 by FlashInfer team
+Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+
+  The CUDA headers under `crates/kernels-cuda/kernels/flashinfer/` are vendored
+  from FlashInfer, with local modifications marked in-file.
+
+--------------------------------------------------------------------------------
+MLX
+https://github.com/ml-explore/mlx
+MIT License
+Copyright (c) 2023 Apple Inc.
+
+  The Metal shaders under `crates/kernels-metal/kernels/third_party/` are
+  vendored from MLX, as each file's header states.
+
+--------------------------------------------------------------------------------
+NIXL
+https://github.com/ai-dynamo/nixl
+Apache License 2.0
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved.
+
+  `crates/transport/src/backends/nixl/wrapper.h` is NIXL's C API header.
+
+--------------------------------------------------------------------------------
+component-init
+https://github.com/dicej/component-init
+Apache License 2.0 with LLVM exception
+
+  `instrument()` and `apply()` in `crates/runtime/src/inferlet/python/snapshot.rs`
+  are adapted from the `component_init_transform` crate, as that file's header
+  states.

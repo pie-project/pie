@@ -1,4 +1,4 @@
-//! The waker slot table (B9/B10): generation-tagged SPSC slots, epoch-filtered
+//! The waker slot table: generation-tagged SPSC slots, epoch-filtered
 //! wakes, and the two-fixed-slots-per-channel [`ChannelWakers`].
 //!
 //! Every generation-sensitive field is protected by one per-slot mutex. An old
@@ -378,24 +378,6 @@ impl WakerTable {
         }
     }
 
-    #[cfg(all(test, not(loom)))]
-    pub(crate) fn force_generation_for_test(
-        &self,
-        id: WakerSlotId,
-        generation: u32,
-    ) -> Option<WakerSlotId> {
-        if generation == 0 {
-            return None;
-        }
-        let (current, index) = split_id(id);
-        let slot = self.slot(index)?;
-        let mut state = slot.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !Self::is_live(&state, current) {
-            return None;
-        }
-        state.generation = generation;
-        Some(slot_id(generation, index))
-    }
 }
 
 impl Default for WakerTable {

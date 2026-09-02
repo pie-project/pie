@@ -1,76 +1,18 @@
-//! Host channel cells (thrust-3 P3) — the host endpoint of a first-class
-//! guest-constructed channel (overview §1, §3's `mask`/`out`).
-//!
-//! Under the first-class WIT surface a channel exists BEFORE any forward pass:
-//! the guest constructs it (shape/dtype/capacity), stages seeds via `put`, and
-//! only later binds it into a `forward-pass` (which stamps the container's
-//! declared `HostRole` + `seeded` onto the cell). One [`ChannelCell`] is the
-//! shared state behind one guest `channel` resource; a forward pass holds
-//! `Arc` clones of its bound cells (dense declaration order), so a guest drop
-//! of the handle never dangles the pass.
-//!
-//! SPSC discipline (echo's T2): a **Writer** channel is host-puts /
-//! pass-consumes (§3's `mask`), a **Reader** channel is pass-puts / host-takes
-//! (§3's `out`). Pre-bind, `put` stages freely (it may be a seed); post-bind
-//! the container's role is enforced: `put` is Writer-only (plus the one seed
-//! put on a `seeded` channel before its first fire), `take`/`read` are
-//! Reader-only.
-//!
-//! Fire lifecycle (the pure host halves, unit-testable here):
-//!   1. guest `channel.put`s cells: pre-endpoint they stage host-side; once
-//!      the Writer endpoint exists a put writes the wire bytes straight into
-//!      the engine-shared pinned ring and release-publishes the tail word
-//!      (bool packed to the wire, D1) — no launch-descriptor involvement;
-//!   2. first bind: [`peek_seed`](ChannelCell::peek_seed) +
-//!      [`commit_seed`](ChannelCell::commit_seed) move each `seeded`
-//!      channel's staged cell into the instance descriptor's seed table
-//!      (peek-then-commit, so a failed bind does not consume it), then
-//!      [`flush_writer_staging`](ChannelCell::flush_writer_staging) moves any
-//!      remaining staged Writer cells into the ring;
-//!   3. the engine pulls Writer ring entries pre-pass, and publishes Reader
-//!      cells and the tail word into the bound mirror at pass completion;
-//!   4. guest `channel.take`/`read` load that mirror directly. A poisoned channel turns
-//!      every host `take`/`read` into an error (device-side fault surfaced to
-//!      the guest).
-//!
-//! Cells are dtype-native (1 byte / bool); only the wire packs bool to bits
-//! (`pack_bool`/`unpack_bool`), matching `PortSource::Const`'s D1 note.
-//!
-//! There is no module-level `dead_code` allow: every item here is on a
-//! production path, and the three test-only affordances
-//! ([`ChannelCell::matches_decl`], [`ChannelCell::take_seed`],
-//! [`pack_bool`]) are `#[cfg(test)]` so the compiler keeps guarding the rest.
+//! Host channel cells: the host endpoint of a guest-constructed channel (Writer = host-puts/pass-consumes, Reader = pass-puts/host-takes; cells are dtype-native, only the wire packs bool to bits).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-// THE RING IS THE RUNTIME'S NOW. `ChannelBinding` was
-// `engine::local::ChannelBinding` — an engine's private ring layout,
-// published into the contract so a C caller could poke it — and the palo
-// rewrite deleted it. Every word of arithmetic below is unchanged; what
-// changed is that the bytes it reads belong to a `HostRing` this runtime
-// allocated (`crate::engine::channel`, whose header argues it) rather than to
-// an engine's device memory.
 use crate::engine::{ChannelBinding, ChannelEndpoint};
 use eta_ir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
 use eta_ir::types::Dtype;
 
-/// The ticket a channel endpoint that neither consumes nor publishes states.
-///
-/// Was `engine::plan::CHANNEL_TICKET_NONE`, and it moved for the reason
-/// every sentinel in the rewrite moved: it is the runtime's own bookkeeping —
-/// the run-ahead cursor a fire reserves and rolls back. What DOES cross is a
-/// stated prediction on the lane that carries the pass
-/// ([`engine::Ticket`] via `Lane::channels`), and it crosses only for an
-/// engine whose control kernels check it; this sentinel never travels.
+/// Sentinel: a run-ahead ticket that neither consumes nor publishes.
 pub const TICKET_NONE: u64 = u64::MAX;
 
-/// Process-wide monotonic source of GLOBAL channel identities (0 reserved as a
-/// null sentinel). Minted when the guest constructs a `channel` resource; a
-/// channel keeps its id across every forward-pass it binds into, so the engine
-/// resolves one device cell for a channel shared by many passes (multi-pass
-/// channels — W0/W3). Inferlet-scoped in practice (one runtime per inferlet).
+/// Process-wide monotonic channel id source (0 is a null sentinel). A
+/// channel keeps its id across every pass it binds into.
 static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Mint the next process-wide global channel identity.
@@ -81,18 +23,14 @@ pub fn next_channel_id() -> u64 {
 /// The shared host state behind one guest `channel` resource.
 #[derive(Clone, Debug)]
 pub struct ChannelCell {
-    /// Global channel id (minted at construction) — the engine's device
-    /// channel-registry key, stable across every pass this channel binds into.
+    /// Engine device channel-registry key, stable across every bound pass.
     pub global_id: u64,
-    /// Declared dims (guest constructor). Checked against the container decl
-    /// at bind.
+    /// Declared dims; checked against the container decl at bind.
     pub shape: Vec<u32>,
     pub dtype: Dtype,
     pub capacity: u32,
-    /// The container's role, stamped at bind (`None` = not yet bound to a
-    /// forward pass).
+    /// Stamped at bind; `None` = not yet bound to a forward pass.
     pub role: Option<HostRole>,
-    /// The container's `seeded` flag, stamped at bind.
     pub seeded: bool,
     /// Whether this cell's seed was consumed by a first fire.
     pub seed_taken: bool,
@@ -100,32 +38,24 @@ pub struct ChannelCell {
     declared_dtype: Option<ChanDType>,
     extern_name: Option<String>,
     attachments: Vec<ChannelAttachment>,
-    /// Host-staged cells (seeds pre-first-fire; Writer stage cells otherwise),
-    /// FIFO, dtype-native.
+    /// Host-staged cells (seeds pre-first-fire, Writer cells otherwise), FIFO.
     staged: VecDeque<Vec<u8>>,
     /// Host copies of Writer ring entries not yet claimed by a submitted
-    /// fire, FIFO, dtype-native. The host shadow reads the front as the next
-    /// fire's value and pops it when that fire submits — the runtime's only
-    /// record of post-bind Writer puts (the ring itself is engine-shared).
+    /// fire; the runtime's only record of post-bind Writer puts.
     ring_host_copies: VecDeque<Vec<u8>>,
     writer_tail: u64,
-    /// Device-produced cells awaiting host `take`/`read`, FIFO, dtype-native.
+    /// Device-produced cells awaiting host `take`/`read`, FIFO.
     produced: VecDeque<Vec<u8>>,
-    /// Logical device-ring sequences assigned to submitted fires. These are
-    /// immutable tickets, not availability projections.
+    /// Device-ring sequences assigned to submitted fires; immutable tickets.
     device_reserved_head: u64,
     device_reserved_tail: u64,
-    /// Direct engine-owned mirror endpoints for every pass that binds this
-    /// Reader channel. Submission completion publishes each endpoint's visible tail; the
-    /// guest host operation copies only then.
+    /// Engine-owned mirror for every pass bound to this Reader channel.
     reader: Option<ReaderMirror>,
-    /// `Some(reason)` once a fire that feeds this channel failed: every later
-    /// host `take`/`read` errors with the reason. Under run-ahead the submit
-    /// returns before the fire resolves, so poison IS the error channel.
+    /// `Some(reason)` once a fire feeding this channel failed; every later
+    /// `take`/`read` errors with it.
     poisoned: Option<String>,
-    /// Host replacement for the current committed front. The per-pass host
-    /// shadow consults this after a staged Writer put, so `set` changes the
-    /// standing cell without displacing a value queued for the next fire.
+    /// Host replacement for the current committed front, so `set` changes
+    /// the standing cell without displacing a value queued for next fire.
     front_override: Option<Vec<u8>>,
 }
 
@@ -139,9 +69,7 @@ struct ReaderMirror {
     tail_word_index: usize,
     poison_word_index: usize,
     closed_word_index: usize,
-    /// Sequences already copied out of the mirror — the reader-side cursor.
-    /// Visibility is the release-published tail word itself; there is no
-    /// separate runtime-side publication step.
+    /// Sequences already copied out of the mirror (reader-side cursor).
     copied_tail: u64,
 }
 
@@ -152,28 +80,18 @@ struct ChannelAttachment {
 }
 
 /// A channel host-op failure (surfaced to the guest as a WIT `result` error).
-/// Cells don't know their dense index — the host layer prefixes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChannelError {
-    /// `put` on a bound non-Writer (past its seed), or `take`/`read` on a
-    /// bound non-Reader.
     WrongRole { role: HostRole, op: &'static str },
-    /// A host `take`/`read` with no produced cell available yet.
     Empty,
-    /// The channel is poisoned (a device-side fault), with the fire's error.
     Poisoned(String),
-    /// A put or mirror payload's length doesn't match the channel's shape×dtype.
     BadLength { expected: usize, got: usize },
-    /// A first fire found no staged seed on a `seeded` channel.
     MissingSeed,
-    /// A second `put` on a seeded non-Writer channel before its first fire —
-    /// the seed is exactly one staged cell.
+    /// A second `put` on a seeded non-Writer channel before its first fire.
     SeedAlreadyStaged,
-    /// A bounded channel has no host capacity.
     Full,
     /// The committed front is currently claimed by a submitted fire.
     InFlight,
-    /// The native endpoint was closed.
     Closed,
 }
 
@@ -198,8 +116,7 @@ impl std::fmt::Display for ChannelError {
 impl std::error::Error for ChannelError {}
 
 impl ChannelCell {
-    /// A fresh, unbound cell (the guest `channel` constructor). Mints a fresh
-    /// global channel id (the engine's device-registry key).
+    /// A fresh, unbound cell (the guest `channel` constructor).
     pub fn new(shape: Vec<u32>, dtype: Dtype, capacity: u32) -> Self {
         ChannelCell {
             global_id: next_channel_id(),
@@ -235,9 +152,7 @@ impl ChannelCell {
     }
 
     /// Whether the cell's constructor-declared geometry matches a container
-    /// channel declaration (bind-time validation). Test affordance: the host
-    /// layer calls [`Self::validate_attachment`] directly, since it also has
-    /// the extern binding to pass.
+    /// channel declaration (bind-time validation).
     #[cfg(test)]
     pub fn matches_decl(&self, decl: &ChannelDecl) -> Result<(), String> {
         self.validate_attachment(decl, None)
@@ -275,16 +190,9 @@ impl ChannelCell {
         }
         if !self.attachments.is_empty() {
             let Some((name, dir)) = extern_binding else {
-                // Same-guest cross-pass chaining (task #32 / R4-4 single-
-                // pipeline streams): a DEVICE-ONLY channel — no host role,
-                // never seeded — may attach to multiple passes. The cell is
-                // the ring-ticket source, so fires of both passes take
-                // sequential tickets in submission order, and the pipeline
-                // FIFO (same-pipeline constraint, §3.4) orders producer
-                // puts before consumer reads on the one device ring — the
-                // prefill→decode `tok_in` handoff. Host-visible or seeded
-                // channels keep the one-pass rule: their host endpoint,
-                // reader mirror, and seed staging are per-pass state.
+                // Same-guest cross-pass chaining: a device-only channel (no
+                // host role, never seeded) may attach to multiple passes.
+                // Host-visible or seeded channels keep the one-pass rule.
                 if decl.host_role != HostRole::None
                     || decl.seeded
                     || self.role != Some(HostRole::None)
@@ -451,9 +359,8 @@ impl ChannelCell {
             )?;
         }
         self.endpoint = Some(endpoint);
-        // Direct puts start here: move any pre-endpoint staged Writer cells
-        // into the shared ring (a seeded Writer flushes after its seed is
-        // settled instead — see `flush_writer_staging`).
+        // Flush any pre-endpoint staged Writer cells into the shared ring
+        // (a seeded Writer flushes only after its seed settles).
         if self.role == Some(HostRole::Writer)
             && let Err(error) = self.flush_writer_staging()
         {
@@ -465,13 +372,10 @@ impl ChannelCell {
         Ok(())
     }
 
-    /// Host `put` a dtype-native cell. Pre-bind this stages freely (seed or
-    /// early Writer cell); post-bind it must be a Writer stage cell or the one
-    /// seed on a not-yet-fired `seeded` channel. Once the Writer endpoint
-    /// exists (and the seed, when declared, is settled), a put is a direct
-    /// shared-memory write: wire bytes land in the pinned ring cell and the
-    /// tail word is release-published (plan §4.2) — independent of pipelines
-    /// and submissions.
+    /// Host `put` a dtype-native cell. Pre-bind this stages freely; post-bind
+    /// it must be a Writer stage cell or the one seed on a not-yet-fired
+    /// `seeded` channel. Once the Writer endpoint exists, a put writes
+    /// directly into the pinned ring cell and release-publishes the tail word.
     pub fn put(&mut self, native: Vec<u8>) -> Result<(), ChannelError> {
         self.put_ref(&native)
     }
@@ -522,17 +426,10 @@ impl ChannelCell {
     }
 
     /// Atomically replace the committed front cell. Queue cursors and
-    /// occupancy are unchanged, so a later queued put cannot move forward
-    /// between a take and put. A front already claimed by a fire is immutable
-    /// until that fire advances the device head.
-    ///
-    /// A front that has already been DELIVERED — a seed, which crossed at bind
-    /// and left this ring empty — is replaced in the runtime's record of it
-    /// rather than in the ring, because a delivered cell is not this ring's to
-    /// rewrite and re-producing it is refused by the far side. [`set_ref`]
-    /// argues that case where it is decided.
-    ///
-    /// [`set_ref`]: Self::set_ref
+    /// occupancy are unchanged. A front already claimed by a fire is
+    /// immutable until that fire advances the device head. A front already
+    /// delivered (a seed, which crossed at bind and left this ring empty) is
+    /// replaced in `front_override` instead of in the ring.
     pub fn set(&mut self, native: Vec<u8>) -> Result<(), ChannelError> {
         self.set_ref(&native)
     }
@@ -562,8 +459,7 @@ impl ChannelCell {
             }
 
             // Pull visible Reader cells into the host queue before replacing
-            // its front copy. Other roles read the same head/tail words
-            // directly below.
+            // its front copy.
             if self.role == Some(HostRole::Reader) {
                 self.refresh_reader_mirrors()?;
             }
@@ -575,65 +471,18 @@ impl ChannelCell {
                 tail
             };
             if committed_tail <= head {
-                // A DELIVERED SEED IS STILL THE STANDING CELL.
-                // [`commit_seed`](Self::commit_seed) states, in this ring's own
-                // control words, that sequence 0 was produced AND delivered —
-                // the seed rode `InstanceBinding::seeds` into the SHELL's ring
-                // and never travelled through this one — and `committed_tail`
-                // counts exactly the cells this ring still holds that have not
-                // crossed. A seeded channel has none, which is how the honest
-                // arithmetic above turns the one channel class that exists to
-                // be `set` into [`Empty`](ChannelError::Empty): a latest-value
-                // control word is bound to a port that does not `consumes()`
-                // (`KvLen`, `PageIndptr`, `AttnMask`), so NOTHING ever advances
-                // its head, its seed is its front for the whole run, and `set`
-                // is the only verb that can move it. A guest that seeds `klen`
-                // and then `set`s it once per step — the decode loop
-                // `tests/inferlets/tart-masked` spells out in its own comment —
-                // was told `no cell available` on its very first step.
-                //
-                // AND THE REPLACEMENT CANNOT BE PRODUCED AS A FRESH CELL. The
-                // tempting fall-through — write it into the ring and let the
-                // newer cell win — is refused twice over by the far side.
-                // [`ChannelJoin::pump_in`](crate::engine::ChannelJoin::pump_in)
-                // is the runtime's only door into a device ring and it APPENDS:
-                // the shell answers `false` once that ring's `tail - head`
-                // reaches the declared capacity, which a capacity-1
-                // latest-value ring reached the moment the seed landed. The
-                // cell never crosses, `pump_in` never advances this ring's
-                // head, and the guest's next `put` then reads
-                // `writer_tail - head >= capacity` and answers
-                // [`Full`](ChannelError::Full) for ever — the very parked lane
-                // `commit_seed` exists to prevent. Give the device ring room
-                // and it is still refused, silently: the shell resolves a port
-                // by reading the cell at `head` (`engine_cuda::program::ports`,
-                // whose header says so), and `head` moves only for ports that
-                // consume, so the second cell would sit at a sequence nothing
-                // ever reads.
-                //
-                // What replaces a DELIVERED front is therefore the runtime's own
-                // record of it, which is what `front_override` is for: the host
-                // shadow reads it as the value this channel presents to the
-                // next fire (`pipeline::fire::shadow::HostShadow::fire_value`),
-                // and the geometry the runtime composes out of that shadow is
-                // how a latest-value cell reaches the device on every path that
-                // does not resolve its ports off a device ring. It does not
-                // correct the shell's own copy of a cell that already crossed —
-                // nothing the runtime holds can — so a device-resolved `KvLen`
-                // goes on reading the seed and refuses the fire it disagrees
-                // with by name (`Envelope::check_extent`). That is a named
-                // failure at the one place able to see the disagreement,
-                // instead of a guest that cannot advance at all.
+                // A delivered seed rode `InstanceBinding::seeds` straight
+                // into the shell's ring, so `committed_tail` is 0 even
+                // though the seed is the front for the whole run. It can't
+                // be rewritten in the ring (already full at capacity 1), so
+                // the replacement is recorded in `front_override` instead.
                 if self.role == Some(HostRole::Writer)
                     && self.seeded
                     && self.seed_taken
                     && head == tail
                     && self.ring_host_copies.is_empty()
                 {
-                    // A submitted fire that already claimed the seed owns it:
-                    // the consume ticket is immutable and names the cell that
-                    // fire will read, which is what the `device_reserved_head >
-                    // head` rule below says for a front still in the ring.
+                    // A submitted fire that already claimed the seed owns it.
                     if self.device_reserved_head >= self.writer_tail {
                         return Err(ChannelError::InFlight);
                     }
@@ -686,8 +535,8 @@ impl ChannelCell {
         } else {
             cell.copy_from_slice(native);
         }
-        // Re-publish the unchanged tail so the replacement bytes happen-before
-        // the next consumer's acquire of queue state without changing occupancy.
+        // Re-publish the unchanged tail so the replacement happens-before
+        // the next consumer's acquire.
         let tail = load_word(binding.word_base, binding.tail_word_index as usize);
         store_word(binding.word_base, binding.tail_word_index as usize, tail);
         Ok(())
@@ -701,11 +550,9 @@ impl ChannelCell {
         self.front_override = None;
     }
 
-    /// Write one cell into the engine-shared Writer ring (plan §4.2): check
-    /// poison/closed/backpressure via the shared words, write the wire bytes
-    /// at `tail % cap1`, then release-publish the incremented tail word. The
-    /// spare `+1` ring cell distinguishes full from empty and holds the
-    /// not-yet-consumed producer cell.
+    /// Write one cell into the engine-shared Writer ring at `tail % cap1`,
+    /// then release-publish the incremented tail word. The spare `+1` ring
+    /// cell distinguishes full from empty.
     fn write_writer_ring(
         &mut self,
         binding: ChannelBinding,
@@ -738,9 +585,9 @@ impl ChannelCell {
         }
         let cap1 = u64::from(binding.capacity).saturating_add(1);
         let offset = (self.writer_tail % cap1) * cell_bytes as u64;
-        // SAFETY: the binding's pinned mirror was validated at registration
-        // (`mirror_bytes >= cell_bytes * cap1`) and stays alive until the
-        // channel's ordered close; the SPSC discipline makes this cell ours.
+        // SAFETY: mirror validated at registration (mirror_bytes >=
+        // cell_bytes * cap1) and stays alive until channel close; SPSC
+        // discipline makes this cell ours.
         let cell = unsafe {
             std::slice::from_raw_parts_mut((binding.mirror_base + offset) as *mut u8, cell_bytes)
         };
@@ -760,8 +607,6 @@ impl ChannelCell {
     }
 
     /// Flush pre-endpoint staged Writer cells into the shared ring, FIFO.
-    /// Runs once the endpoint exists and the seed (when declared) has been
-    /// settled into the instance descriptor; steady state has no staging.
     pub fn flush_writer_staging(&mut self) -> Result<(), ChannelError> {
         if self.role != Some(HostRole::Writer) || (self.seeded && !self.seed_taken) {
             return Ok(());
@@ -779,30 +624,21 @@ impl ChannelCell {
         Ok(())
     }
 
-    /// Number of host-staged cells (bind-time validation against the declared
-    /// role: a Reader / non-seeded device-private channel must have none, a
-    /// seeded non-Writer channel at most one).
+    /// Number of host-staged cells.
     pub fn staged_len(&self) -> usize {
         self.staged.len()
     }
 
-    /// Frame validation (Vesuvius, k > 1): host-known cells a Writer channel
-    /// can still feed to future fires. Counted by ring sequence — the seed
-    /// plus every flushed ring write (`writer_tail`) plus pre-endpoint
-    /// staging, minus the consume tickets already reserved by submitted
-    /// fires — so a seeded descriptor Writer's committed initial cell counts
-    /// exactly once.
+    /// Frame validation: host-known cells a Writer channel can still feed to
+    /// future fires.
     pub fn writer_available_cells(&self) -> u64 {
         self.writer_tail
             .saturating_add(self.staged.len() as u64)
             .saturating_sub(self.device_reserved_head)
     }
 
-    /// Frame validation (Vesuvius, k > 1): the Reader ring's reservation
-    /// pressure as (publications reserved by accepted unsettled fires, cells
-    /// the host has already consumed). Their difference is the worst-case
-    /// ring occupancy if the guest drains nothing before the frame executes —
-    /// deterministic at submit time, never a function of drain timing.
+    /// Frame validation: the Reader ring's (reserved publications, consumed)
+    /// pressure pair.
     pub fn reader_ring_pressure(&self) -> (u64, u64) {
         let consumed = self
             .reader
@@ -812,19 +648,15 @@ impl ChannelCell {
         (self.device_reserved_tail, consumed)
     }
 
-    /// Frame validation (Vesuvius, k > 1): a device-only ring's structural
-    /// backlog — publish tickets reserved by accepted unsettled fires minus
-    /// consume tickets likewise reserved. The worst-case occupancy the ring
-    /// reaches once every reserved fire settles, before anything not yet
-    /// submitted consumes — deterministic at submit time, never a function
-    /// of drain timing.
+    /// Frame validation: a device-only ring's structural backlog (reserved
+    /// publish tickets minus reserved consume tickets).
     pub fn device_ring_backlog(&self) -> u64 {
         self.device_reserved_tail
             .saturating_sub(self.device_reserved_head)
     }
 
-    /// Frame validation (Vesuvius, k > 1): whether the host side knows a
-    /// committed value exists for a latest-value (read-only-bound) channel.
+    /// Frame validation: whether the host side knows a committed value
+    /// exists for a latest-value (read-only-bound) channel.
     pub fn has_committed_front(&self) -> bool {
         self.seeded
             || !self.staged.is_empty()
@@ -833,8 +665,7 @@ impl ChannelCell {
             || self.device_reserved_tail > 0
     }
 
-    /// Host `take` a produced cell (Reader), FIFO. An unbound channel is
-    /// simply empty.
+    /// Host `take` a produced cell (Reader), FIFO.
     pub fn take(&mut self) -> Result<Vec<u8>, ChannelError> {
         self.refresh_reader_mirrors()?;
         if let Some(reason) = &self.poisoned {
@@ -868,20 +699,15 @@ impl ChannelCell {
         self.produced.front().cloned().ok_or(ChannelError::Empty)
     }
 
-    /// Poison the cell with the failed fire's error: every later host
-    /// `take`/`read` errors with it. First poison wins (the earliest failure
-    /// is the root cause).
+    /// Poison the cell with the failed fire's error. First poison wins.
     pub fn poison(&mut self, reason: &str) {
         if self.poisoned.is_none() {
             self.poisoned = Some(reason.to_string());
         }
     }
 
-    /// Pop this `seeded` channel's staged seed for the first fire (D2 —
-    /// per-instance data, never identity). Errors if nothing was staged.
-    /// Test affordance: the production bind path splits the same work into
-    /// [`Self::peek_seed`] + [`Self::commit_seed`] so a failed bind does not
-    /// consume the seed.
+    /// Pop this `seeded` channel's staged seed for the first fire. Errors if
+    /// nothing was staged.
     #[cfg(test)]
     pub fn take_seed(&mut self) -> Result<Vec<u8>, ChannelError> {
         let seed = self.staged.pop_front().ok_or(ChannelError::MissingSeed)?;
@@ -896,51 +722,14 @@ impl ChannelCell {
             .ok_or(ChannelError::MissingSeed)
     }
 
-    /// The seed has landed in the ENGINE. Drop the host copy and record, in
-    /// this cell's own ring, that the cell it accounts for has already
-    /// crossed.
-    ///
-    /// # The seed is not in the host ring, and the ring has to know
-    ///
-    /// A seed rides [`InstanceBinding::seeds`](engine::InstanceBinding)
-    /// straight into the shell's ring — it never travels through the host
-    /// ring the runtime owns, so both of that ring's words are still zero when
-    /// the bind returns. [`ChannelCell::bind`] meanwhile charges
-    /// `writer_tail` with it, because from the guest's side one cell HAS been
-    /// put. Those two facts contradict each other at the guest's NEXT put:
-    /// [`write_writer_ring`](Self::write_writer_ring) asks
-    /// `writer_tail - head >= capacity`, reads `1 - 0` against the default
-    /// capacity of one, and answers [`Full`](ChannelError::Full) — for ever,
-    /// because the only thing that moves `head` is
-    /// [`ChannelJoin::pump_in`](crate::engine::ChannelJoin::pump_in) draining
-    /// a ring that has nothing in it. A guest whose put is refused stages no
-    /// cell, its next fire finds a consuming port with nothing to consume,
-    /// and the whole lane parks: 0% on the GPU, nothing in any log.
-    ///
-    /// `cuda_seeded_channel_cursors` is the gate for exactly this, and the
-    /// fix it names — "publish the seed into the mirror as well as the ring"
-    /// — was inside the C++ engine's `ensure_sessions` and did not survive
-    /// the rewrite. The runtime owns the host ring now, so it is the runtime's
-    /// to say: sequence 0 was produced AND delivered, `head == tail ==
-    /// writer_tail`, and the guest's next put takes sequence 1.
-    ///
-    /// # And none of that is true of an ADOPTED ring (alto F2a)
-    ///
-    /// The paragraph above holds while the runtime owns the host ring and the
-    /// seed crosses past it. An engine that publishes its own pinned ring
-    /// ([`HostRing::adopt`](crate::engine::HostRing::adopt)) writes the seed
-    /// INTO THESE VERY BYTES at bind — cell zero, tail one — so the ring is
-    /// not "still zero" and the cell is not "already delivered": it is sitting
-    /// at sequence 0 waiting for the pass to consume it.
-    ///
-    /// Charging the cursors here would then steal the ENGINE's counter. On a
-    /// `Writer` channel the head is the engine's — its fire predicts it and
-    /// `channel::pull_validate` checks the prediction against this word — so
-    /// storing `writer_tail` into it says the seed was consumed by a fire that
-    /// never ran, and every fire afterwards is refused for a prediction that
-    /// was right. The deadlock this method exists to prevent cannot happen
-    /// there either: what moves the head is the engine's own settlement, and
-    /// it moves once the pass has taken the cell.
+    /// The seed has landed in the engine. Drop the host copy and reconcile
+    /// this cell's ring: a seed rides `InstanceBinding::seeds` straight into
+    /// the shell's ring (never through this host ring), so this ring's words
+    /// are still zero at bind even though `bind` already charged
+    /// `writer_tail`. Unreconciled, the next put would see
+    /// `writer_tail - head >= capacity` and answer `Full` forever; this sets
+    /// `head == tail == writer_tail`. No-op for an *adopted* ring, where the
+    /// engine already wrote the seed at bind and owns the head cursor.
     pub fn commit_seed(&mut self) {
         let _ = self.staged.pop_front();
         self.seed_taken = true;
@@ -954,8 +743,8 @@ impl ChannelCell {
             return;
         }
         let binding = endpoint.registered().binding;
-        // Only when the ring is untouched: a second instance attaching the
-        // same cell must not rewind cursors that fires have moved.
+        // Only when the ring is untouched, so this never rewinds cursors a
+        // fire has already moved.
         if load_word(binding.word_base, binding.tail_word_index as usize) == 0
             && load_word(binding.word_base, binding.head_word_index as usize) == 0
         {
@@ -1028,8 +817,8 @@ impl ChannelCell {
         Ok(())
     }
 
-    /// Peek the most recently release-published mirror cell (device-geometry
-    /// reclaim reads `w_cont` this way) without touching the take cursor.
+    /// Peek the most recently release-published mirror cell without
+    /// touching the take cursor.
     pub fn latest_reader_value(
         &mut self,
         _instance_id: u64,
@@ -1052,9 +841,6 @@ impl ChannelCell {
         let dtype = self.dtype;
         let numel = self.numel();
         let native_len = self.native_len();
-        // Direct-word visibility: the engine release-publishes the tail,
-        // poison, and closed words from its completion callback; the gate is
-        // the word itself, not a runtime-side finalize step.
         let mut poison_reason = None;
         let mut closed = false;
         let mut visible_tail = 0;
@@ -1098,33 +884,21 @@ impl ChannelCell {
 /// container's channel `i`).
 pub type BoundCells = Vec<Arc<Mutex<ChannelCell>>>;
 
-/// A first-class, guest-constructed channel (overview §1) — the WIT
-/// `pie:inferlet/forward.channel` resource. The SAME handle is bound into a
-/// forward pass (dense declaration index) and used for host
-/// `put`/`take`/`read`; the shared [`ChannelCell`] is Arc'd so a pass that
-/// bound it survives the guest dropping the handle. Domain state (not WIT
-/// glue), so it lives here rather than in `inferlet::host::forward`, which
-/// only holds the `Host`/`HostChannel` impls that push/get/delete it from the
-/// WASM component resource table.
+/// A first-class, guest-constructed channel — the WIT
+/// `pie:inferlet/forward.channel` resource. The shared [`ChannelCell`] is
+/// Arc'd so a pass that bound it survives the guest dropping the handle.
 pub struct Channel {
     pub cell: Arc<Mutex<ChannelCell>>,
-    /// Set at SUBMIT: the feeding PIPELINE's in-flight fire queue (W3.1). A
-    /// channel may be fed by several passes, but all must submit on the SAME
-    /// pipeline (§3.4) — so `take`/`read` await + finalize fires from one FIFO
-    /// (submission order) until the cell fills. `None` until first submit.
+    /// Set at submit: the feeding pipeline's in-flight fire queue.
+    /// `None` until first submit.
     pub fires: Option<crate::pipeline::fire::PendingFires>,
 }
 
 /// Process-teardown close batching: walks the process's resource table,
 /// takes over the engine close notification from every guest channel
 /// endpoint still holding one, and returns the channel ids grouped by
-/// owning engine. The caller posts one batched close per engine AFTER
-/// dropping the table (whose pass drops post the instance closes) — the
-/// scheduler mailbox's per-producer FIFO then delivers every instance
-/// close before the channel batch, preserving the engine's
-/// instance-before-channel close order. Endpoints this walk cannot reach
-/// (a cell kept alive only by a pass after the guest dropped its channel
-/// handle) keep notifying one-by-one from their own drop.
+/// owning engine. The caller posts one batched close per engine, preserving
+/// the engine's instance-before-channel close order.
 pub fn detach_channel_close_notifications(
     resources: &mut wasmtime::component::ResourceTable,
 ) -> Vec<(usize, Vec<u64>)> {
@@ -1150,10 +924,7 @@ pub fn detach_channel_close_notifications(
 
 /// The next host-known Writer value on `cell` — the native value the engine
 /// will pull for the next submitted fire (`None`: not a Writer channel, or
-/// nothing pending). Pre-endpoint values sit in `staged`; post-bind puts go
-/// straight to the engine-shared ring with a host copy retained in
-/// `ring_host_copies` until a consuming fire submits. The host shadow (and
-/// through it the canonical-KV fire gate) reads Writer values through this.
+/// nothing pending).
 pub fn staged_put_bytes(cell: &Arc<Mutex<ChannelCell>>) -> Option<Vec<u8>> {
     let c = cell.lock().unwrap();
     if c.role != Some(HostRole::Writer) {
@@ -1166,9 +937,7 @@ pub fn staged_put_bytes(cell: &Arc<Mutex<ChannelCell>>) -> Option<Vec<u8>> {
 }
 
 /// A submitted fire consumed one Writer entry: drop the ring host copy
-/// backing [`staged_put_bytes`]'s front so the next fire sees the next
-/// value. (`staged` is never popped here — pre-flush entries are pending
-/// ring writes, not yet consumable by any fire.)
+/// backing [`staged_put_bytes`]'s front so the next fire sees the next value.
 pub fn consume_writer_host_copy(cell: &Arc<Mutex<ChannelCell>>) {
     let mut c = cell.lock().unwrap();
     c.consume_front_override();
@@ -1179,9 +948,8 @@ pub fn consume_writer_host_copy(cell: &Arc<Mutex<ChannelCell>>) {
 }
 
 fn load_word(word_base: u64, index: usize) -> u64 {
-    // SAFETY: direct-engine bind returns an aligned atomic word array that
-    // remains alive until the instance is closed. Channel mirrors detach before
-    // that close.
+    // SAFETY: aligned atomic word array alive until instance close; mirrors
+    // detach before that close.
     unsafe { (&*((word_base as *const AtomicU64).add(index))).load(Ordering::Acquire) }
 }
 
@@ -1192,8 +960,8 @@ fn store_word(word_base: u64, index: usize, value: u64) {
 fn read_mirror_cell(reader: &ReaderMirror, sequence: u64) -> Vec<u8> {
     let slot = (sequence % reader.cap1) * reader.cell_bytes as u64;
     let ptr = (reader.mirror_base + slot) as *const u8;
-    // SAFETY: the binding validates the mirror extent, and the engine owns it
-    // through instance close.
+    // SAFETY: binding validates the mirror extent; engine owns it through
+    // instance close.
     unsafe { std::slice::from_raw_parts(ptr, reader.cell_bytes).to_vec() }
 }
 
@@ -1221,9 +989,7 @@ fn decode_reader_cell(
     Ok(native)
 }
 
-/// Pack a 1-byte-per-bool cell to the bit-packed wire (LSB-first, D1).
-/// Test affordance: production packs in place through
-/// [`pack_bool_into`], straight into the pinned ring cell.
+/// Pack a 1-byte-per-bool cell to the bit-packed wire (LSB-first).
 #[cfg(test)]
 pub fn pack_bool(native: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; native.len().div_ceil(8)];
@@ -1268,8 +1034,7 @@ mod tests {
         }
     }
 
-    /// §3 shape: mask (bool [8], host Writer) + out (i32 [1], host Reader) +
-    /// a device-private seeded channel (tok).
+    // mask (bool[8], host Writer), out (i32[1], host Reader), tok (device-private, seeded)
     fn bound() -> BoundCells {
         let mk = |shape: Vec<u32>, dtype, d: &ChannelDecl| {
             let mut c = ChannelCell::new(shape, dtype, 1);
@@ -1325,14 +1090,12 @@ mod tests {
                 3,
             )
             .unwrap();
-        // The release-published tail word IS the visibility gate (§4.5).
         words[1].store(1, Ordering::Release);
         let _ = instance_id;
     }
 
     #[test]
     fn prebind_put_stages_and_seed_pops() {
-        // A guest seeds a channel BEFORE any forward pass exists.
         let mut c = ChannelCell::new(vec![1], Dtype::I32, 1);
         c.put(7i32.to_le_bytes().to_vec()).unwrap();
         c.bind(&decl(Shape::vector(1), Dtype::I32, HostRole::None, true));
@@ -1442,47 +1205,6 @@ mod tests {
     }
 
     #[test]
-    fn mirror_tail_word_is_the_visibility_gate() {
-        // Direct-word visibility (plan §4.5): the release-published tail word
-        // is the gate. A zero tail hides the cell; storing the tail makes it
-        // takeable with no runtime-side finalize step in between.
-        let cells = bound();
-        let instance_id = 77;
-        let mirror = Box::leak(9i32.to_le_bytes().to_vec().into_boxed_slice());
-        let words = Box::leak(
-            vec![
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ]
-            .into_boxed_slice(),
-        );
-        cells[1]
-            .lock()
-            .unwrap()
-            .attach_reader_mirror(
-                instance_id,
-                mirror.as_ptr() as u64,
-                words.as_ptr() as u64,
-                4,
-                1,
-                0,
-                0,
-                1,
-                2,
-                3,
-            )
-            .unwrap();
-        assert_eq!(
-            cells[1].lock().unwrap().take().unwrap_err(),
-            ChannelError::Empty
-        );
-        words[1].store(1, Ordering::Release);
-        assert_eq!(cells[1].lock().unwrap().take().unwrap(), 9i32.to_le_bytes());
-    }
-
-    #[test]
     fn packed_bool_mirror_decodes_to_native_bytes() {
         let mut cell = ChannelCell::new(vec![10], Dtype::Bool, 1);
         cell.bind(&decl(
@@ -1497,397 +1219,4 @@ mod tests {
         assert_eq!(cell.lock().unwrap().take().unwrap(), native);
     }
 
-    #[test]
-    fn role_discipline_enforced() {
-        let cells = bound();
-        // put on the Reader `out` is illegal.
-        assert_eq!(
-            cells[1]
-                .lock()
-                .unwrap()
-                .put(0i32.to_le_bytes().to_vec())
-                .unwrap_err(),
-            ChannelError::WrongRole {
-                role: HostRole::Reader,
-                op: "put"
-            }
-        );
-        // take on the Writer `mask` is illegal.
-        assert_eq!(
-            cells[0].lock().unwrap().take().unwrap_err(),
-            ChannelError::WrongRole {
-                role: HostRole::Writer,
-                op: "take"
-            }
-        );
-        // seeded device-private `tok`: put stages until its seed is taken.
-        assert!(
-            cells[2]
-                .lock()
-                .unwrap()
-                .put(1i32.to_le_bytes().to_vec())
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn put_length_validated() {
-        let cells = bound();
-        // mask is bool[8] → 8 native bytes.
-        assert_eq!(
-            cells[0].lock().unwrap().put(vec![1, 0, 1]).unwrap_err(),
-            ChannelError::BadLength {
-                expected: 8,
-                got: 3
-            }
-        );
-        assert!(
-            cells[0]
-                .lock()
-                .unwrap()
-                .put(vec![1, 0, 1, 0, 1, 0, 1, 0])
-                .is_ok()
-        );
-    }
-
-    /// Builds a Writer ring, attached via the direct-write path so `put`
-    /// lands wire bytes in it.
-    ///
-    /// **THE RING IS ALLOCATED THE WAY PRODUCTION ALLOCATES IT.** The fixture
-    /// used to `Box::leak` a mirror and a word block and hand the addresses
-    /// to a hand-built `ChannelBinding` — which is what an ENGINE filled in,
-    /// across an ABI. The runtime owns the ring now
-    /// (`crate::engine::channel`), so the test builds a
-    /// `RegisteredChannel` and reads the same bytes back through its binding:
-    /// the arithmetic under test is unchanged, and the fixture is no longer
-    /// an imitation of a caller that does not exist.
-    ///
-    /// Leaked because the slices below point into it and the tests hold them
-    /// for their whole body.
-    fn writer_ring(
-        capacity: u32,
-        cell_bytes: usize,
-    ) -> (
-        ChannelCell,
-        &'static [u8],
-        &'static [AtomicU64],
-        &'static crate::engine::RegisteredChannel,
-    ) {
-        let mut declaration = decl(Shape::vector(8), Dtype::Bool, HostRole::Writer, false);
-        declaration.capacity = capacity;
-        let mut writer = ChannelCell::new(vec![8], Dtype::Bool, capacity);
-        writer.matches_decl(&declaration).unwrap();
-        writer.bind(&declaration);
-        let table = waker::WakerTable::global();
-        let registered: &'static crate::engine::RegisteredChannel =
-            Box::leak(Box::new(crate::engine::RegisteredChannel::new(
-                usize::MAX,
-                writer.global_id,
-                cell_bytes as u32,
-                capacity,
-                table.alloc(),
-                table.alloc(),
-            )));
-        let binding = registered.binding;
-        // SAFETY: `registered` is leaked, so the ring it owns outlives every
-        // borrow below; the two spans are exactly what the binding describes.
-        let (mirror, words) = unsafe {
-            (
-                std::slice::from_raw_parts(
-                    binding.mirror_base as *const u8,
-                    binding.mirror_bytes as usize,
-                ),
-                std::slice::from_raw_parts(binding.word_base as *const AtomicU64, 4),
-            )
-        };
-        (writer, mirror, words, registered)
-    }
-
-    /// Write one byte of a ring's mirror, the way the device half would.
-    ///
-    /// The fixtures below start from a ring that already holds a committed
-    /// cell; they used to state that by leaking a `Vec<u8>` with the byte in
-    /// it. The ring is allocated zeroed now, so the byte is poked in.
-    fn poke_cell(mirror: &[u8], at: usize, value: u8) {
-        // SAFETY: the ring is leaked, the tests drive it from one thread,
-        // and `at` is inside the mirror the binding describes.
-        unsafe {
-            *mirror.as_ptr().add(at).cast_mut() = value;
-        }
-    }
-
-    fn attach_writer(writer: &mut ChannelCell, registered: &crate::engine::RegisteredChannel) {
-        let endpoint = ChannelEndpoint::new(registered.clone());
-        writer.attach_endpoint(Arc::new(endpoint)).unwrap();
-    }
-
-    #[test]
-    fn writer_put_writes_the_shared_ring_directly() {
-        // Plan §4.2: with an endpoint attached, `put` is a shared-memory
-        // write — wire bytes at `tail % cap1`, then the release-published
-        // tail word. No staging, no launch-descriptor involvement.
-        let (mut writer, mirror, words, registered) = writer_ring(2, 1);
-        attach_writer(&mut writer, registered);
-        writer.put(vec![1, 0, 1, 0, 0, 0, 0, 0]).unwrap(); // bits 0,2 → 5
-        assert_eq!(words[1].load(Ordering::Acquire), 1, "tail word published");
-        assert_eq!(mirror[0], 5, "wire bytes written to the pinned ring");
-        writer.put(vec![0, 1, 0, 0, 0, 0, 0, 1]).unwrap(); // bits 1,7 → 130
-        assert_eq!(words[1].load(Ordering::Acquire), 2);
-        assert_eq!(mirror[1], 130);
-        // capacity 2, nothing consumed → the third put backpressures.
-        assert_eq!(
-            writer.put(vec![0; 8]).unwrap_err(),
-            ChannelError::Full,
-            "tail - head >= capacity is Full"
-        );
-        // The engine consuming one (head word advance) frees a cell; the
-        // spare +1 ring slot means the write wraps into slot 0's successor.
-        words[0].store(1, Ordering::Release);
-        writer.put(vec![1, 1, 0, 0, 0, 0, 0, 0]).unwrap(); // bits 0,1 → 3
-        assert_eq!(words[1].load(Ordering::Acquire), 3);
-        assert_eq!(mirror[2], 3, "sequence 2 lands at slot 2 of cap1=3");
-    }
-
-    /// A SEEDED host-writer's SECOND put has to fit.
-    ///
-    /// The seed rides the bind into the engine's ring and never touches this
-    /// one, so both control words are zero when the bind returns — while
-    /// [`ChannelCell::bind`] has charged `writer_tail` with it. Left
-    /// unreconciled the guest's next put reads `writer_tail(1) - head(0) >=
-    /// capacity(1)` and answers [`Full`](ChannelError::Full) for ever, which
-    /// is a lane that parks with no error anywhere.
-    /// [`ChannelCell::commit_seed`] is where the two are reconciled.
-    #[test]
-    fn a_seeded_writers_second_put_is_not_full_for_ever() {
-        let mut declaration = decl(Shape::vector(8), Dtype::Bool, HostRole::Writer, true);
-        declaration.capacity = 1;
-        let (mut writer, mirror, words, registered) = writer_ring(1, 1);
-        // The seed, as the guest staged it before the bind.
-        writer.bind(&declaration);
-        writer.staged.push_back(vec![0, 0, 0, 0, 0, 0, 0, 1]);
-        attach_writer(&mut writer, registered);
-        assert_eq!(
-            words[1].load(Ordering::Acquire),
-            0,
-            "the seed is not in this ring; it rode the bind"
-        );
-
-        writer.commit_seed();
-        assert_eq!(
-            (
-                words[0].load(Ordering::Acquire),
-                words[1].load(Ordering::Acquire)
-            ),
-            (1, 1),
-            "sequence 0 was produced AND delivered"
-        );
-
-        writer.put(vec![1, 0, 1, 0, 0, 0, 0, 0]).unwrap(); // bits 0,2 -> 5
-        assert_eq!(words[1].load(Ordering::Acquire), 2);
-        assert_eq!(mirror[1], 5, "sequence 1 lands at slot 1 of cap1=2");
-    }
-
-    /// A SEEDED latest-value writer's `set` has to REPLACE the seed.
-    ///
-    /// The other half of the same seed. `commit_seed` reconciles the ring by
-    /// recording the seed as produced AND delivered, which is true and which
-    /// leaves this ring holding nothing — so `set`'s `committed_tail <= head`
-    /// answered [`Empty`](ChannelError::Empty) on the one channel class that
-    /// exists to be `set`. A latest-value control word is bound to a
-    /// non-consuming port, so nothing anywhere ever advances its head: its seed
-    /// is its front for the whole run, and a `set` that is refused leaves the
-    /// guest with no verb at all for advancing it. Re-producing the value
-    /// through the ring is not the alternative — the device ring a seed landed
-    /// in is full at capacity 1 and a port reads the cell at its own head — so
-    /// the replacement lands in the runtime's record of the front, and nothing
-    /// is written to the ring or published to the tail word.
-    #[test]
-    fn a_seeded_latest_value_writers_set_replaces_the_delivered_seed() {
-        let mut declaration = decl(Shape::vector(8), Dtype::Bool, HostRole::Writer, true);
-        declaration.capacity = 1;
-        let (mut writer, mirror, words, registered) = writer_ring(1, 1);
-        // The seed, as the guest staged it before the bind.
-        writer.bind(&declaration);
-        writer.staged.push_back(vec![0, 0, 0, 0, 0, 0, 0, 1]);
-        attach_writer(&mut writer, registered);
-        writer.commit_seed();
-
-        let first = vec![1, 0, 1, 0, 0, 0, 0, 0];
-        writer.set(first.clone()).unwrap();
-        assert_eq!(
-            writer.front_override(),
-            Some(first),
-            "the replacement is the front the next fire reads"
-        );
-        assert_eq!(
-            (
-                words[0].load(Ordering::Acquire),
-                words[1].load(Ordering::Acquire)
-            ),
-            (1, 1),
-            "no cell was produced: a second one could not cross and would be read by nothing"
-        );
-        assert_eq!(
-            mirror[0], 0,
-            "the seed never travelled through this ring, so there is no slot to rewrite"
-        );
-
-        // Repeat `set` is what a decode loop does: one per step, for ever.
-        let second = vec![0, 1, 0, 0, 0, 0, 0, 0];
-        writer.set(second.clone()).unwrap();
-        assert_eq!(writer.front_override(), Some(second));
-        assert!(
-            writer.has_committed_front(),
-            "frame validation's latest-value class must still see a committed cell"
-        );
-
-        // A submitted fire that claimed the seed owns it, exactly as it owns a
-        // front still sitting in the ring.
-        assert_eq!(writer.reserve_device_ticket(true, false), (0, TICKET_NONE));
-        assert_eq!(writer.set(vec![1; 8]).unwrap_err(), ChannelError::InFlight);
-    }
-
-    #[test]
-    fn writer_set_replaces_only_committed_front_and_rejects_in_flight_use() {
-        let mut declaration = decl(Shape::vector(8), Dtype::Bool, HostRole::Writer, true);
-        declaration.capacity = 2;
-        let (mut writer, mirror, words, registered) = writer_ring(2, 1);
-        writer.bind(&declaration);
-        writer.seed_taken = true;
-        writer.writer_tail = 1;
-        // The ring already holds one committed cell: byte 1 at slot 0, tail
-        // at 1.
-        poke_cell(mirror, 0, 1);
-        words[1].store(1, Ordering::Release);
-        attach_writer(&mut writer, registered);
-        let second = vec![0, 1, 0, 0, 0, 0, 0, 0];
-        writer.put(second).unwrap();
-
-        writer.set(vec![0, 0, 1, 0, 0, 0, 0, 0]).unwrap();
-        writer.set(vec![0, 0, 0, 1, 0, 0, 0, 0]).unwrap();
-        assert_eq!(words[0].load(Ordering::Acquire), 0);
-        assert_eq!(words[1].load(Ordering::Acquire), 2);
-        assert_eq!(mirror[0], 8, "repeat set replaces the same front slot");
-        assert_eq!(mirror[1], 2, "capacity>1 replacement leaves the next slot");
-        assert_eq!(
-            writer.put(vec![0; 8]).unwrap_err(),
-            ChannelError::Full,
-            "set does not release put backpressure"
-        );
-
-        assert_eq!(
-            writer.reserve_device_ticket(true, false),
-            (0, TICKET_NONE)
-        );
-        assert_eq!(writer.set(vec![1; 8]).unwrap_err(), ChannelError::InFlight);
-        assert_eq!(mirror[0], 8, "an in-flight front is never overwritten");
-        assert_eq!(mirror[1], 2, "queued put remains intact");
-    }
-
-    #[test]
-    fn cold_rebind_resynchronizes_device_tickets_from_the_live_ring() {
-        let mut declaration = decl(Shape::vector(8), Dtype::Bool, HostRole::Writer, false);
-        declaration.capacity = 2;
-        let (mut writer, _mirror, words, registered) = writer_ring(2, 1);
-        writer.attach(11, &declaration, None).unwrap();
-        attach_writer(&mut writer, registered);
-
-        words[0].store(3, Ordering::Release);
-        words[1].store(5, Ordering::Release);
-        writer.detach(11);
-        writer.attach(12, &declaration, None).unwrap();
-
-        assert_eq!(
-            writer.reserve_device_ticket(true, true),
-            (3, 5),
-            "a persistent endpoint's actual words define the first rebind ticket"
-        );
-    }
-
-    #[test]
-    fn writer_staging_flushes_into_the_ring_at_attach() {
-        // Pre-endpoint puts stage host-side; attaching the endpoint flushes
-        // them FIFO into the ring (plan §4.2 pre-endpoint staging).
-        let (mut writer, mirror, words, registered) = writer_ring(2, 1);
-        writer.put(vec![1, 0, 1, 0, 0, 0, 0, 0]).unwrap(); // 5
-        writer.put(vec![0, 1, 0, 0, 0, 0, 0, 1]).unwrap(); // 130
-        assert_eq!(writer.staged_len(), 2);
-        assert_eq!(words[1].load(Ordering::Acquire), 0, "nothing published yet");
-        attach_writer(&mut writer, registered);
-        assert_eq!(writer.staged_len(), 0, "staging drained");
-        assert_eq!(words[1].load(Ordering::Acquire), 2, "both cells published");
-        assert_eq!(&mirror[..2], &[5, 130]);
-    }
-
-    #[test]
-    fn writer_put_surfaces_poison_and_close() {
-        let (mut writer, _mirror, words, registered) = writer_ring(2, 1);
-        attach_writer(&mut writer, registered);
-        words[2].store(9, Ordering::Release);
-        assert!(matches!(
-            writer.put(vec![0; 8]).unwrap_err(),
-            ChannelError::Poisoned(_)
-        ));
-        assert!(matches!(
-            writer.set(vec![0; 8]).unwrap_err(),
-            ChannelError::Poisoned(_)
-        ));
-        words[2].store(0, Ordering::Release);
-        words[3].store(1, Ordering::Release);
-        assert_eq!(writer.put(vec![0; 8]).unwrap_err(), ChannelError::Closed);
-        assert_eq!(writer.set(vec![0; 8]).unwrap_err(), ChannelError::Closed);
-    }
-
-    #[test]
-    fn poison_faults_reader_with_reason() {
-        let cells = bound();
-        let out_id = cells[1].lock().unwrap().global_id;
-        publish_wire(&cells[1], out_id, &7i32.to_le_bytes());
-        cells[1].lock().unwrap().poison("fire 3 failed: OOM");
-        assert_eq!(
-            cells[1].lock().unwrap().take().unwrap_err(),
-            ChannelError::Poisoned("fire 3 failed: OOM".into())
-        );
-        assert_eq!(
-            cells[1].lock().unwrap().read().unwrap_err(),
-            ChannelError::Poisoned("fire 3 failed: OOM".into())
-        );
-        // First poison wins — a later failure doesn't mask the root cause.
-        cells[1].lock().unwrap().poison("fire 4 cascade");
-        assert_eq!(
-            cells[1].lock().unwrap().take().unwrap_err(),
-            ChannelError::Poisoned("fire 3 failed: OOM".into())
-        );
-    }
-
-    #[test]
-    fn mirror_binding_rejects_non_reader() {
-        let cells = bound();
-        let err = cells[0]
-            .lock()
-            .unwrap()
-            .attach_reader_mirror(1, 1, 1, 1, 1, 0, 0, 1, 2, 3)
-            .unwrap_err();
-        assert!(err.contains("expected Reader"));
-    }
-
-    #[test]
-    fn bool_pack_unpack_roundtrip() {
-        let native = vec![1u8, 0, 0, 1, 1, 0, 1, 0, 1, 1]; // 10 bools → 2 wire bytes
-        let wire = pack_bool(&native);
-        assert_eq!(wire.len(), 2);
-        assert_eq!(unpack_bool(&wire, native.len()), native);
-    }
-
-    #[test]
-    fn direct_mirror_roundtrips() {
-        let cells = bound(); // `out` is the host-Reader at channel 1
-        let out_id = cells[1].lock().unwrap().global_id;
-        publish_wire(&cells[1], out_id, &5i32.to_le_bytes());
-        assert_eq!(
-            cells[1].lock().unwrap().take().unwrap(),
-            5i32.to_le_bytes().to_vec(),
-            "the fired token reaches the guest"
-        );
-    }
 }

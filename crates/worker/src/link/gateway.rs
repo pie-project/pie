@@ -1,42 +1,17 @@
-//! Worker data-plane: **dial INTO the gateway** (post-inversion, design §8/M3).
-//!
-//! Pre-0.5.0 the gateway dialed the worker's edge-rpc listener and pulled the
-//! session stream (`WorkerSessionApi::recv` long-poll). Post-inversion the
-//! topology flips: the **gateway is the listening server** (1:N fan-in) and the
-//! worker **dials in**. One worker-initiated connection carries both data-plane
-//! services, split with [`worker_api::connect_gateway_link`]:
-//!
-//! - the worker **serves** [`worker_api::WorkerControl`] (the gateway calls
-//!   `dispatch`/`cancel`/`set_priority`/`drain`), and
-//! - the worker **holds** a [`GatewayInboundClient`] to push the token stream
-//!   back (`push_tokens`), announce itself (`register`), and bounce turns
-//!   (`redirect`).
-//!
-//! The token stream rides the plain client→server direction (worker→gateway
-//! `push_tokens`); latency-sensitive commands go reverse. `register(worker_id)`
-//! is the FIRST call on a fresh connection so the gateway can key this worker's
-//! reverse `WorkerControlClient` into its registry before any `dispatch`.
-//!
-//! ## Runtime bridge
-//! Each gateway logical [`SessionId`] maps to one runtime session
-//! ([`::runtime::server::open_session`]) — warm KV across a multi-turn session. A
-//! per-session driver task feeds each turn's [`Request::message`] into the
-//! runtime ([`::runtime::server::send_client_message`]) and pumps the resulting
-//! `ServerMessage`s back out as [`Tokens::Chunk`], terminated by one
-//! [`Tokens::Eos`] when the turn completes. Backpressure is inherent: the
-//! runtime outbox is bounded, so a slow `push_tokens` (slow gateway/user) stalls
-//! the pump and backpressures generation (design §6).
+//! Worker data-plane: the worker dials into the gateway (1:N fan-in),
+//! serving `WorkerControl` while pushing tokens back over the same
+//! connection.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use ::runtime::server::ClientId;
 use anyhow::{Context, Result, anyhow};
 use client_api::{ClientMessage, ServerMessage};
 use controller_api::GatewayEndpoint;
 use futures::StreamExt;
 use ids::{ReqId, SessionId, WorkerId};
+use runtime::server::ClientId;
 use tarpc::serde_transport::{tcp, unix};
 use tarpc::server::{BaseChannel, Channel};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -45,33 +20,25 @@ use worker_api::{
     connect_gateway_link, dispatch_codec,
 };
 
-/// Max frame on the gateway link's read side. A `dispatch` carries one
-/// `Request` whose `ClientMessage` can hold a large prompt / upload chunk, so we
-/// keep the generous cap the old edge path used. Token chunks (the reverse,
-/// gateway-decoded direction) are small now that blobs ride HTTP, so the
-/// gateway sets its own (smaller) cap independently.
+/// Max read-side frame size; generous since a `dispatch` can carry a large
+/// upload chunk. The gateway sets its own (smaller) cap for the reverse
+/// direction independently.
 const LINK_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
-/// `push_tokens` client deadline. Generous so a backpressured (slow-consumer)
-/// push blocks rather than spuriously erroring — the gateway replies `Control`
-/// once its bounded pipe has room (design §6). A true transport error surfaces
-/// immediately regardless of this bound.
+/// `push_tokens` deadline, generous so a backpressured push blocks rather
+/// than errors; a real transport error still surfaces immediately.
 const PUSH_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Per-session driver mailbox depth: queued turns awaiting the in-flight one.
 const TURN_QUEUE_DEPTH: usize = 64;
 
-/// A live dial-in connection to one gateway: the task serving `WorkerControl`
-/// over the split's server-half. The connection's mux pump tasks are spawned
-/// inside [`connect_gateway_link`] and die with the transport; aborting the
-/// serve task tears the link down on shutdown.
+/// A live dial-in connection to one gateway: the task serving `WorkerControl`.
 pub struct GatewayLink {
     serve_task: tokio::task::JoinHandle<()>,
 }
 
-/// Tear the dial-in serve loop down when the link is dropped, so reconciliation
-/// (dropping a link that left the roster) and shutdown (dropping the manager)
-/// both stop the connection.
+/// Aborting the serve task tears the connection down when the link is
+/// dropped.
 impl Drop for GatewayLink {
     fn drop(&mut self) {
         self.serve_task.abort();
@@ -102,8 +69,8 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
         connect_gateway_link(transport)
     };
 
-    // Register FIRST: keys this worker's reverse WorkerControlClient into the
-    // gateway's registry before any dispatch can target it.
+    // Register before serving, so the gateway's registry has this worker
+    // before any dispatch.
     gateway
         .register(tarpc::context::current(), worker_id)
         .await
@@ -126,14 +93,11 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
     Ok(GatewayLink { serve_task })
 }
 
-/// The worker's live dial-in links, reconciled against the controller-pushed
-/// gateway roster (design `gateway.md`). Owns one [`GatewayLink`] per dialed
-/// gateway, keyed by dial address.
+/// The worker's live dial-in links, reconciled against the gateway roster.
+/// Owns one [`GatewayLink`] per dialed gateway, keyed by dial address.
 ///
-/// `pinned` addresses (the static `--gateway` override) are always kept dialed
-/// regardless of the roster — the override for fixed/local topologies and the
-/// single-node in-proc gateway. Roster-derived links are added and dropped as
-/// the gateway fleet scales up/down within one watch round-trip.
+/// `pinned` addresses (the static `--gateway` override) are always kept
+/// dialed regardless of the roster.
 pub struct GatewayLinkManager {
     worker_id: WorkerId,
     pinned: HashSet<String>,
@@ -141,14 +105,9 @@ pub struct GatewayLinkManager {
 }
 
 impl GatewayLinkManager {
-    /// A manager for `worker_id`, pinning `pinned` addresses (never dropped by
-    /// reconciliation). Nothing is dialed yet — call [`dial_pinned`] for boot
-    /// readiness and [`reconcile`] on each roster update. Addresses are
-    /// canonicalized (see [`canonical_addr`]) so a pinned `tcp://h:p` and a
+    /// A manager for `worker_id`, pinning `pinned` addresses. Nothing is
+    /// dialed yet. Addresses are canonicalized so a pinned `tcp://h:p` and a
     /// roster `h:p` for the same gateway resolve to a single link.
-    ///
-    /// [`dial_pinned`]: Self::dial_pinned
-    /// [`reconcile`]: Self::reconcile
     pub fn new(worker_id: WorkerId, pinned: Vec<String>) -> Self {
         Self {
             worker_id,
@@ -157,9 +116,9 @@ impl GatewayLinkManager {
         }
     }
 
-    /// Dial every pinned address now, failing if any pinned dial fails — the
-    /// static override is a hard boot requirement (matches the pre-dynamic
-    /// contract). Roster dials, by contrast, are best-effort and never fail boot.
+    /// Dial every pinned address now, failing if any pinned dial fails (a
+    /// hard boot requirement). Roster dials are best-effort and never fail
+    /// boot.
     pub async fn dial_pinned(&mut self) -> Result<()> {
         let mut pinned: Vec<String> = self.pinned.iter().cloned().collect();
         pinned.sort(); // deterministic dial order / logs
@@ -175,11 +134,9 @@ impl GatewayLinkManager {
         Ok(())
     }
 
-    /// Reconcile dial-in links against a fresh gateway roster: the desired set is
-    /// `pinned ∪ roster` (canonicalized). Drop (and abort, via [`GatewayLink`]'s
-    /// `Drop`) every link no longer desired, then dial every desired address not
-    /// yet linked. A roster dial that fails is logged and retried on the next
-    /// roster update.
+    /// Reconcile dial-in links against a fresh roster: desired = `pinned ∪
+    /// roster`. Drops undesired links, dials newly-desired ones. A failed
+    /// roster dial is logged and retried on the next update.
     pub async fn reconcile(&mut self, roster: &[GatewayEndpoint]) {
         let desired: HashSet<String> = self
             .pinned
@@ -232,10 +189,9 @@ impl GatewayLinkManager {
     }
 }
 
-/// Canonicalize a dial address so the same gateway reached via a pinned
-/// `tcp://host:port` and a roster `host:port` maps to one link key. Strips the
-/// `tcp://` scheme (which [`connect_gateway`] also treats as optional) while
-/// leaving `unix:` addresses intact.
+/// Canonicalizes a dial address so pinned and roster forms of the same
+/// gateway map to one link key. Strips the `tcp://` scheme, leaves `unix:`
+/// addresses intact.
 fn canonical_addr(addr: &str) -> String {
     if addr.starts_with("unix:") {
         addr.to_string()
@@ -249,8 +205,7 @@ fn canonical_addr(addr: &str) -> String {
 #[derive(Clone)]
 struct WorkerControlServer {
     worker_id: WorkerId,
-    /// Push side back to THIS gateway; cloned into each session driver so a
-    /// turn's tokens return to the gateway that dispatched it.
+    /// Push side back to this gateway, cloned into each session driver.
     gateway: GatewayInboundClient,
     sessions: Arc<SessionRegistry>,
 }
@@ -267,8 +222,7 @@ struct SessionRegistry {
 struct SessionHandle {
     /// Hands turns to the driver (it feeds the runtime + pumps tokens back).
     turns: mpsc::Sender<Request>,
-    /// One abort signal PER live turn. A session runs its turns concurrently,
-    /// so a session-wide `Notify` could only cancel an arbitrary one of them.
+    /// One cancel signal per live turn (turns run concurrently).
     cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>>,
 }
 
@@ -292,13 +246,9 @@ impl WorkerControl for WorkerControlServer {
         {
             let notify = handle.cancels.lock().await.get(&req_id).cloned();
             if let Some(notify) = notify {
-                // `notify_one`, not `notify_waiters`: only the former stores a
-                // permit when nobody is parked yet. `run_turn` has a waiter
-                // registered only while it sits in its `select!` -- not while
-                // it is between `cancels.insert` and its first poll, and not
-                // during `push_tokens`, which is the backpressure path and may
-                // block for the whole 300 s `PUSH_DEADLINE`. A cancel arriving
-                // in either window would simply vanish.
+                // `notify_one`, not `notify_waiters`: stores a permit so a
+                // cancel racing before `run_turn` reaches its `select!` isn't
+                // lost.
                 notify.notify_one();
                 tracing::debug!(%req_id, %session, "reverse cancel signalled");
             }
@@ -306,24 +256,23 @@ impl WorkerControl for WorkerControlServer {
     }
 
     async fn set_priority(self, _: tarpc::context::Context, req_id: ReqId, p: Priority) {
-        // Spec-locked surface; the runtime has no priority hook yet (M5).
+        // Spec-locked surface; the runtime has no priority hook.
         tracing::debug!(%req_id, ?p, "set_priority: no runtime hook (no-op)");
     }
 
     async fn drain(self, _: tarpc::context::Context) {
-        // Spec-locked surface; the runtime has no drain hook yet (M5).
+        // Spec-locked surface; the runtime has no drain hook.
         tracing::info!("drain: no runtime hook (best-effort no-op)");
     }
 }
 
 impl WorkerControlServer {
-    /// Worker-final-admission + turn hand-off. Fetches/verifies any blobs,
-    /// ensures the logical session's runtime broker + driver exist, then queues
-    /// the turn. Errors map to `Accepted::Reject` (the gateway re-routes).
+    /// Worker-final-admission + turn hand-off: verifies blobs, ensures the
+    /// session driver exists, then queues the turn. Errors map to
+    /// `Accepted::Reject`.
     async fn admit(&self, req: Request) -> Result<()> {
-        // Blob bytes ride out-of-band over HTTP (design §9); fetch + verify here.
-        // Feeding them into the runtime needs a runtime image API — a tracked
-        // follow-on, so for now we verify integrity and log.
+        // Blobs ride out-of-band over HTTP; fetched + verified here
+        // (runtime-consume pending).
         for blob in &req.blobs {
             let bytes = super::blob::fetch(blob).await?;
             tracing::debug!(
@@ -341,9 +290,8 @@ impl WorkerControlServer {
         Ok(())
     }
 
-    /// The turn sender for `session`, opening the runtime broker session +
-    /// spawning its driver on first use (warm KV anchor across the session's
-    /// turns).
+    /// Turn sender for `session`; opens the runtime session and spawns its
+    /// driver on first use.
     async fn session_turns(&self, session: SessionId) -> Result<mpsc::Sender<Request>> {
         let mut map = self.sessions.sessions.lock().await;
         if let Some(handle) = map.get(&session)
@@ -352,7 +300,7 @@ impl WorkerControlServer {
             return Ok(handle.turns.clone());
         }
         let client_id =
-            ::runtime::server::open_session().map_err(|e| anyhow!("open session: {e}"))?;
+            runtime::server::open_session().map_err(|e| anyhow!("open session: {e}"))?;
         let (turns_tx, turns_rx) = mpsc::channel::<Request>(TURN_QUEUE_DEPTH);
         let cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>> = Arc::default();
         tokio::spawn(session_driver(
@@ -384,14 +332,12 @@ enum TurnEnd {
     LinkGone,
 }
 
-/// Routing table for one session's live turns. The runtime hands every message
-/// for a session to ONE mailbox (`recv_messages(client_id, ..)`), so with
-/// concurrent turns something has to say which turn each message belongs to.
+/// Routing table for one session's live turns. The runtime delivers all
+/// messages to one mailbox, so this fans them out by identity (`corr_id` for
+/// a reply, `process_id` for a process event).
 ///
-/// Draining that mailbox from the turns themselves cannot work: whichever turn
-/// polled first would steal the others' messages and push them to the gateway
-/// under its own `req_id`. A single router owns the drain instead and fans out
-/// by identity — `corr_id` for a reply, `process_id` for a process event.
+/// A single router owns the drain rather than the turns themselves, since
+/// concurrent polling would let one turn steal another's messages.
 #[derive(Default)]
 struct TurnRoutes {
     /// Turn awaiting the reply to this `corr_id`.
@@ -404,27 +350,11 @@ struct TurnRoutes {
     awaiting_pid: HashSet<u32>,
 }
 
-/// How many routed messages may queue for one turn before the router stops
-/// draining the runtime.
+/// Queue depth for one turn's routed messages before the router stalls.
 ///
-/// The mailbox the router drains is bounded, and design §6 leans on that: a
-/// slow `push_tokens` stalls the pump and backpressures generation. Unbounded
-/// per-turn queues would have deleted that invariant, letting the worker buffer
-/// a whole generation in memory against a stalled consumer. Deep enough that a
-/// turn briefly behind its own pushes does not stall its siblings, shallow
-/// enough that a genuinely stuck one still pushes back.
-///
-/// A full inbox stalls the router and so the whole session, siblings included.
-/// That is deliberate, not a limitation to route around: a session's lifetime
-/// is ONE websocket connection (`gateway/src/ingress/ws.rs`), so every turn on
-/// it egresses through the same socket. For this inbox to fill while a sibling
-/// still wants to drain, that shared socket must already be stalled -- which
-/// stalls the sibling anyway. The runtime's outbox is bounded per session
-/// (`server.rs`, `open_session`) for the same reason: the bound is scoped to
-/// the real shared resource. Splitting either per turn would buy no isolation
-/// and would oblige the runtime to keep its own `corr_id`/`process_id` routing
-/// table -- the exact machinery that made attached processes unroutable here --
-/// one layer below where "turn" is even a concept.
+/// A full inbox stalls the whole session (all turns share one websocket
+/// egress), which is deliberate: it's the backpressure mechanism limiting
+/// in-memory generation buffering.
 const TURN_INBOX_DEPTH: usize = 256;
 
 impl TurnRoutes {
@@ -442,10 +372,9 @@ impl TurnRoutes {
                 self.awaiting_pid.insert(corr);
             }
         }
-        // An attach names its process in the REQUEST. Its reply's `result` is
-        // the literal string "Process attached" (`handler.rs`), so learning the
-        // id from the reply would key `by_pid` on that text and silently drop
-        // every event the attached process emits.
+        // An attach names its process in the request; its reply is a fixed
+        // "Process attached" string, so only launches learn the id from the
+        // reply.
         if let ProcBinding::Known(pid) = binding {
             self.by_pid.insert(pid.clone(), req_id);
         }
@@ -454,13 +383,8 @@ impl TurnRoutes {
 
     fn close(&mut self, req_id: ReqId) {
         self.inboxes.remove(&req_id);
-        // `awaiting_pid` is retired alongside `by_corr`, not left behind. A
-        // launch turn that ends before its `Response` arrives (reverse cancel,
-        // `Control::Abort`, `LinkGone`) never reaches the `remove` in `target`
-        // -- that path returns early once `by_corr` no longer has the entry --
-        // so the set would grow for the session's life, and a later non-launch
-        // turn reusing the `corr_id` would take the launch branch and register
-        // its arbitrary `result` string as a process id.
+        // Retire `awaiting_pid` alongside `by_corr`: an ended launch must not
+        // leave a stale corr_id for a later turn to inherit as its process id.
         let stale: Vec<u32> = self
             .by_corr
             .iter()
@@ -474,11 +398,8 @@ impl TurnRoutes {
         self.by_pid.retain(|_, id| *id != req_id);
     }
 
-    /// The turn `msg` belongs to, learning a launch's `process_id` on the way.
-    ///
-    /// A process's events can only follow the launch reply that named it, and
-    /// the mailbox is FIFO, so recording the id here — before the next message
-    /// is looked at — is enough for every later event to find its turn.
+    /// The turn `msg` belongs to; learns a launch's `process_id` from its
+    /// reply along the way.
     fn target(&mut self, msg: &ServerMessage) -> Option<ReqId> {
         match msg {
             ServerMessage::Response {
@@ -496,23 +417,13 @@ impl TurnRoutes {
     }
 }
 
-/// One logical session's driver: owns the runtime session and runs its turns
-/// CONCURRENTLY. Each turn feeds the runtime and streams its own messages back
-/// to the gateway under its own `req_id`; a session-wide router decides which
-/// turn each runtime message belongs to.
+/// One logical session's driver: owns the runtime session and runs turns
+/// concurrently, each streaming its own messages back under its own
+/// `req_id`.
 ///
-/// Turns used to run strictly one at a time, and a process-launching turn does
-/// not end until its process does — so a client that launched two processes on
-/// one connection could never have them resident together, and the second
-/// launch sat in this queue behind the first. Concurrency here is what lets one
-/// session put more than one lane in front of the scheduler.
-///
-/// Exits (closing the runtime session) when the connection's server drops the
-/// turn sender (link gone) or a push fails.
-///
-/// Holds the registry by [`Weak`] so an idle driver never keeps the registry
-/// (and thus its own turn-sender) alive: when the connection's server drops,
-/// the registry — and the sender in it — drop, unblocking `turns.recv()`.
+/// Exits when the turn sender is dropped (link gone) or a push fails. Holds
+/// the registry by [`Weak`] so an idle driver doesn't keep it (and its own
+/// sender) alive.
 async fn session_driver(
     session: SessionId,
     client_id: ClientId,
@@ -548,14 +459,9 @@ async fn session_driver(
             reg.active.lock().await.insert(req_id, session);
         }
 
-        // The runtime is fed HERE, in the driver loop, and not from the spawned
-        // task. Chunked `AddProgram` uploads arrive as one turn per chunk, and
-        // `crates/runtime/src/server/data_transfer.rs` hard-rejects a chunk
-        // that is not the one it expects next, tearing the upload down. Feeding
-        // from the tasks would have made chunk order depend on `JoinSet::spawn`
-        // first-poll order across worker threads, which tokio's LIFO slot and
-        // work stealing actively reorder. Dequeue order is the only order there
-        // is, so the feed has to happen in the dequeue.
+        // Fed here in the driver loop, not the spawned task: chunk order must
+        // match dequeue order, since the runtime rejects out-of-order
+        // `AddProgram` chunks and task spawn/poll order isn't guaranteed.
         let fed = feed_turn(client_id, req_id, req.message);
 
         let gateway = gateway.clone();
@@ -584,9 +490,8 @@ async fn session_driver(
 
     router.abort();
     running.shutdown().await;
-    ::runtime::server::close_session(client_id);
-    // Best-effort removal; if the registry is already gone (the connection's
-    // server dropped) the stale entry died with it.
+    runtime::server::close_session(client_id);
+    // Best-effort: if the registry is already gone, the entry died with it.
     if let Some(reg) = registry.upgrade() {
         reg.sessions.lock().await.remove(&session);
     }
@@ -597,7 +502,7 @@ async fn session_driver(
 /// turn that owns it. Runs until aborted by `session_driver`.
 async fn message_router(client_id: ClientId, routes: Arc<Mutex<TurnRoutes>>) {
     loop {
-        let msgs = match ::runtime::server::recv_messages(client_id, 200, 64).await {
+        let msgs = match runtime::server::recv_messages(client_id, 200, 64).await {
             Ok(msgs) => msgs,
             Err(e) => {
                 tracing::warn!(error = %e, "runtime recv failed; router stopping");
@@ -605,17 +510,14 @@ async fn message_router(client_id: ClientId, routes: Arc<Mutex<TurnRoutes>>) {
             }
         };
         for msg in msgs {
-            // The sender is cloned out and the lock released BEFORE awaiting
-            // the send: the inbox is bounded now, so this await can block, and
-            // blocking under the lock would stop the turn tasks that need it to
-            // retire their routes.
+            // Clone the sender and release the lock before awaiting the send:
+            // the inbox is bounded, and blocking under the lock would starve
+            // turns retiring their routes.
             let inbox = {
                 let mut routes = routes.lock().await;
                 match routes.target(&msg) {
                     Some(req_id) => routes.inboxes.get(&req_id).cloned(),
-                    // A message whose turn already ended (a late event on a
-                    // cancelled turn, say) has nowhere to go. Dropping it is the
-                    // only option, but it is worth seeing.
+                    // No live turn for this message; drop it, but log.
                     None => {
                         tracing::debug!(?msg, "runtime message matched no live turn");
                         None
@@ -623,27 +525,20 @@ async fn message_router(client_id: ClientId, routes: Arc<Mutex<TurnRoutes>>) {
                 }
             };
             if let Some(inbox) = inbox {
-                // Awaited, not `try_send`: a full inbox must stall this drain,
-                // which stalls the bounded runtime outbox, which backpressures
-                // generation (design §6). That chain is the whole mechanism.
+                // Awaited, not `try_send`: a full inbox stalls this drain,
+                // backpressuring generation via the bounded runtime outbox.
                 let _ = inbox.send(msg).await;
             }
         }
     }
 }
 
-/// Push one turn's message into the runtime, in the caller's order.
-///
-/// Split out of `run_turn` because ordering across turns is only guaranteed
-/// where the turns are dequeued; see the call site.
+/// Whether feeding a turn into the runtime produced a reply.
 enum Fed {
     /// Accepted, and the turn now streams the runtime's replies.
     Streaming,
-    /// Nothing will come back for this turn: a non-final upload chunk (accepted
-    /// as `InProgress` with no reply), a `corr_id`-less signal the runtime never
-    /// answers, or a feed that failed. Close the stream immediately -- waiting
-    /// for a terminal message that can never arrive would leave the turn open
-    /// forever.
+    /// Nothing will come back: a non-final upload chunk, a corr_id-less
+    /// signal, or a failed feed. Close the stream immediately.
     Silent,
 }
 
@@ -651,7 +546,7 @@ fn feed_turn(client_id: ClientId, req_id: ReqId, message: ClientMessage) -> Fed 
     let non_final_chunk =
         matches!(upload_chunk_info(&message), Some((idx, total)) if idx + 1 < total);
     let expects_reply = corr_id_of(&message).is_some();
-    if let Err(e) = ::runtime::server::send_client_message(client_id, message) {
+    if let Err(e) = runtime::server::send_client_message(client_id, message) {
         tracing::warn!(%req_id, error = %e, "feeding turn into runtime failed");
         return Fed::Silent;
     }
@@ -696,16 +591,14 @@ async fn run_turn(
             _ = cancel.notified() => {
                 tracing::debug!(%req_id, "turn cancelled");
                 if let Some(pid) = &process_id {
-                    let _ = ::runtime::server::send_client_message(client_id, terminate(pid));
+                    let _ = runtime::server::send_client_message(client_id, terminate(pid));
                 }
-                // Abort = bare channel-close on the gateway side (no Eos), per
-                // the Tokens contract; the gateway's TokenRx observes the close.
+                // Abort = channel close with no Eos, per the Tokens contract.
                 return TurnEnd::Aborted;
             }
             msg = inbox.recv() => {
                 let Some(msg) = msg else {
-                    // The router closed this turn's inbox: the session is
-                    // going away.
+                    // Inbox closed: session going away.
                     return TurnEnd::Aborted;
                 };
                 let terminal = turn_terminal(&msg, corr, proc_launch, &mut process_id);
@@ -714,7 +607,7 @@ async fn run_turn(
                     Ok(Control::Abort) => {
                         tracing::debug!(%req_id, "gateway piggybacked abort");
                         if let Some(pid) = &process_id {
-                            let _ = ::runtime::server::send_client_message(client_id, terminate(pid));
+                            let _ = runtime::server::send_client_message(client_id, terminate(pid));
                         }
                         return TurnEnd::Aborted;
                     }
@@ -749,13 +642,12 @@ fn push_ctx() -> tarpc::context::Context {
     ctx
 }
 
-/// Whether `msg` ends the current turn, learning the launched `process_id` from
-/// the launch ack along the way.
+/// Whether `msg` ends the turn, learning a launched `process_id` from the ack
+/// along the way.
 ///
-/// - A process-launching turn's first matching `Response{corr}` carries the
-///   `process_id` as its `result`; the turn then runs until that process emits a
-///   terminal `ProcessEvent` (`event == "return" | "error"`).
-/// - A non-process command's single matching `Response{corr}` is itself terminal.
+/// A launch's first matching reply carries `process_id` as `result`; the turn
+/// then runs until that process emits a terminal event. A non-process reply
+/// is itself terminal.
 fn turn_terminal(
     msg: &ServerMessage,
     corr: Option<u32>,
@@ -811,14 +703,8 @@ fn corr_id_of(m: &ClientMessage) -> Option<u32> {
     }
 }
 
-/// Whether a turn launches/attaches a process (so its output streams as process
-/// events terminated by `return`/`error`, not a single `Response`).
-/// How a turn comes to own a process's event stream.
-///
-/// The two process-bearing messages name their process at opposite ends:
-/// `LaunchProcess` learns the id from its reply, `AttachProcess` states it in
-/// the request and gets back a fixed "Process attached" string. Treating them
-/// alike keyed the routing table on that string.
+/// How a turn comes to own a process's event stream: `LaunchProcess` learns
+/// its id from the reply, `AttachProcess` states it in the request.
 enum ProcBinding {
     /// Not a process turn.
     None,
@@ -844,10 +730,8 @@ impl ProcBinding {
     }
 }
 
-/// `(chunk_index, total_chunks)` for a chunked upload message, else `None`.
-/// `AddProgram` is delivered as `total_chunks` messages sharing one `corr_id`;
-/// only the final chunk produces a `Response`, so the bridge must not await a
-/// reply for the earlier ones (see `run_turn`).
+/// `(chunk_index, total_chunks)` for a chunked `AddProgram` upload; only the
+/// final chunk gets a `Response`.
 fn upload_chunk_info(m: &ClientMessage) -> Option<(usize, usize)> {
     match m {
         ClientMessage::AddProgram {
@@ -859,111 +743,3 @@ fn upload_chunk_info(m: &ClientMessage) -> Option<(usize, usize)> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn response(corr_id: u32, result: &str) -> ServerMessage {
-        ServerMessage::Response {
-            corr_id,
-            ok: true,
-            result: result.to_string(),
-        }
-    }
-
-    fn event(process_id: &str, event: &str) -> ServerMessage {
-        ServerMessage::ProcessEvent {
-            process_id: process_id.to_string(),
-            event: event.to_string(),
-            value: String::new(),
-        }
-    }
-
-    /// The regression this whole seam exists for: two processes launched on ONE
-    /// session must each get their OWN events. Every message used to be pumped
-    /// by whichever turn happened to poll the shared mailbox first, so the older
-    /// launch lost its `return` and its client waited forever.
-    #[test]
-    fn two_concurrent_launches_each_receive_their_own_events() {
-        let (a, b) = (ReqId(1), ReqId(2));
-        let mut routes = TurnRoutes::default();
-        let _a_inbox = routes.open(a, Some(10), &ProcBinding::FromReply);
-        let _b_inbox = routes.open(b, Some(11), &ProcBinding::FromReply);
-
-        // Each launch reply names its process; the router learns the mapping.
-        assert_eq!(routes.target(&response(10, "pid-a")), Some(a));
-        assert_eq!(routes.target(&response(11, "pid-b")), Some(b));
-
-        // Events then route by process, in any interleaving.
-        assert_eq!(routes.target(&event("pid-b", "token")), Some(b));
-        assert_eq!(routes.target(&event("pid-a", "token")), Some(a));
-        assert_eq!(routes.target(&event("pid-a", "return")), Some(a));
-        assert_eq!(routes.target(&event("pid-b", "return")), Some(b));
-    }
-
-    /// A finished turn releases both of its routing keys, so a later message
-    /// naming it is reported as unroutable instead of being handed to whatever
-    /// turn reused the id.
-    #[test]
-    fn closing_a_turn_retires_its_routes() {
-        let a = ReqId(1);
-        let mut routes = TurnRoutes::default();
-        let _inbox = routes.open(a, Some(10), &ProcBinding::FromReply);
-        assert_eq!(routes.target(&response(10, "pid-a")), Some(a));
-
-        routes.close(a);
-        assert_eq!(routes.target(&event("pid-a", "return")), None);
-        assert_eq!(routes.target(&response(10, "pid-a")), None);
-    }
-
-    /// A non-launch turn owns only its reply — it must never capture the
-    /// `result` string as a process id and start stealing another turn's
-    /// events.
-    #[test]
-    fn a_plain_command_turn_claims_no_process() {
-        let (query, launch) = (ReqId(1), ReqId(2));
-        let mut routes = TurnRoutes::default();
-        let _q = routes.open(query, Some(10), &ProcBinding::None);
-        let _l = routes.open(launch, Some(11), &ProcBinding::FromReply);
-
-        assert_eq!(routes.target(&response(10, "pid-a")), Some(query));
-        assert_eq!(routes.target(&response(11, "pid-a")), Some(launch));
-        assert_eq!(routes.target(&event("pid-a", "return")), Some(launch));
-    }
-
-    /// An attach names its process in the REQUEST and gets back the literal
-    /// string "Process attached" as its `result`. Learning the id from that
-    /// reply would key the table on the message text and silently drop every
-    /// event the attached process emits — the turn would then block forever.
-    #[test]
-    fn an_attached_process_routes_by_its_requested_id() {
-        let a = ReqId(1);
-        let mut routes = TurnRoutes::default();
-        let _inbox = routes.open(a, Some(10), &ProcBinding::Known("pid-a".into()));
-
-        // Events route before the reply is even seen.
-        assert_eq!(routes.target(&event("pid-a", "stdout")), Some(a));
-        assert_eq!(routes.target(&response(10, "Process attached")), Some(a));
-        assert_eq!(routes.target(&event("pid-a", "return")), Some(a));
-        // The reply text never becomes a process id.
-        assert_eq!(routes.target(&event("Process attached", "return")), None);
-    }
-
-    /// A launch that ends before its `Response` (reverse cancel, abort, link
-    /// gone) must not leave its `corr_id` in `awaiting_pid`: a later turn
-    /// reusing that id would take the launch branch and register whatever its
-    /// reply happened to say as a process id.
-    #[test]
-    fn closing_a_turn_retires_a_pending_launch() {
-        let (launch, query) = (ReqId(1), ReqId(2));
-        let mut routes = TurnRoutes::default();
-        let _l = routes.open(launch, Some(10), &ProcBinding::FromReply);
-        routes.close(launch);
-        assert!(routes.awaiting_pid.is_empty());
-
-        // Same `corr_id`, reused by a plain command turn.
-        let _q = routes.open(query, Some(10), &ProcBinding::None);
-        assert_eq!(routes.target(&response(10, "some-result")), Some(query));
-        assert_eq!(routes.target(&event("some-result", "return")), None);
-    }
-}

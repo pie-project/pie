@@ -12,14 +12,10 @@ fn main() {
         Some("vulkan") => Platform::Vulkan,
         Some(other) => panic!("unknown platform `{other}`"),
     };
-    let rows = models::catalog();
-    let row = rows
-        .iter()
-        .find(|(name, ..)| *name == sku)
-        .unwrap_or_else(|| {
-            let names: Vec<&str> = rows.iter().map(|(n, ..)| *n).collect();
-            panic!("`{sku}` is not a catalog row; rows: {names:#?}")
-        });
-    let plan = row.2(platform);
+    let row = models::sku(&sku).unwrap_or_else(|| {
+        let names: Vec<&str> = models::skus().map(|row| row.name.as_str()).collect();
+        panic!("`{sku}` is not a catalog row; rows: {names:#?}")
+    });
+    let plan = (row.trace)(platform);
     println!("{}", serde_json::to_string_pretty(&plan).unwrap());
 }

@@ -3,6 +3,8 @@
 
 use super::*;
 
+pub use model_ir::ops::elemwise::Yarn;
+
 pub fn rmsnorm(x: &Value, weight: &Weight, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
@@ -80,13 +82,10 @@ pub fn rmsnorm_no_scale(x: &Value, head_dim: u32, eps: f32) -> Value {
     y
 }
 
-/// **THE CENTRED NORM** (multimodal §6.1): mean-subtract, then rms-normalize,
-/// with no scale and no bias.
-///
-/// The vision towers' `nn.LayerNorm`, minus the two learned vectors, which
-/// BAKE: `LN(x)·Mᵀ = (c/rms(c))·diag(w)·Mᵀ + b·Mᵀ` for `c = x − mean(x)`, so
-/// a text folds `w` into the GEMM that reads the norm and `b·Mᵀ` into that
-/// GEMM's bias at import, and writes this. Whole rows, no head grouping.
+/// The centred norm: mean-subtract, then rms-normalize, no scale or bias.
+/// The vision towers' `nn.LayerNorm` minus its two learned vectors, which
+/// bake into the GEMM that reads the norm at import. Whole rows, no head
+/// grouping.
 pub fn layernorm_no_scale(x: &Value, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
@@ -101,15 +100,9 @@ pub fn layernorm_no_scale(x: &Value, eps: f32) -> Value {
     y
 }
 
-/// **THE WHOLE `nn.LayerNorm`, IN ONE NODE** (multimodal §9.1's owed saving,
-/// next.md B5): centred, scaled by `weight`, biased by `bias`.
-///
-/// `y = (x − mean(x)) · rsqrt(var(x) + eps) · w + b`. What a qwen vision block
-/// writes, and what it wrote before this row existed is three nodes —
-/// `add_bias(b, rmsnorm(layernorm_no_scale(x, eps), w, eps))` — because §9.1
-/// found the import fold half-expressible and the halves non-composing. Three
-/// launches and two extra device rectangles per norm, twenty-five norms per
-/// qwen35 tower fire; this is the one node they collapse to.
+/// The whole `nn.LayerNorm` in one node: centred, scaled by `weight`, biased
+/// by `bias`. `y = (x − mean(x)) · rsqrt(var(x) + eps) · w + b`. One node
+/// rather than three, saving two device rectangles per norm.
 ///
 /// [`layernorm_no_scale`] stays for the text whose scale genuinely bakes.
 pub fn layernorm(x: &Value, weight: &Weight, bias: &Weight, eps: f32) -> Value {
@@ -128,26 +121,14 @@ pub fn layernorm(x: &Value, weight: &Weight, bias: &Weight, eps: f32) -> Value {
     y
 }
 
-/// **THE CLIPPED LINEAR'S CLAMP** (multimodal §6.5): `min(max(x, lo), hi)`,
-/// in place, both bounds trace constants.
+/// The clipped linear's clamp: `min(max(x, lo), hi)`, in place, both bounds
+/// trace constants. gemma4's `use_clipped_linears` publishes
+/// `{input,output}_{min,max}` beside every vision projection.
+/// The same clamp, with the bounds the checkpoint ships as `[1]` weight
+/// planes rather than trace constants — gemma4's per-projection scalars are
+/// too many and too checkpoint-specific to state as a `const`.
 ///
-/// gemma4's `use_clipped_linears` publishes `{input,output}_{min,max}` beside
-/// every vision projection; a text writes `clamp` before the matmul and after
-/// it. Both bounds are the checkpoint's own numbers, so they are stated here
-/// and never read from device memory.
-/// **THE SAME CLAMP, WITH THE BOUNDS THE CHECKPOINT SHIPS** (multimodal
-/// §12.2): `lo` and `hi` are `[1]` weight planes.
-///
-/// gemma4's `use_clipped_linears` is not a flag, it is 448 learned scalars —
-/// `input_min`/`input_max` and `output_min`/`output_max` beside every vision
-/// projection, all finite in the E4B checkpoint and all different. A text
-/// cannot state them: `Model::new(w, kv, tp, dims)` has no checkpoint in the
-/// room, and a catalog row carrying 448 numbers would be a checkpoint
-/// transcribed into a `const`.
-///
-/// [`clamp`] stays for a bound the CONFIG states — `swiglu_limit` is one — the
-/// way [`mul_scalar`] and [`scale`] both stay. Which one a text writes is a
-/// question about where the number lives, and that is the only question.
+/// [`clamp`] stays for a bound the config states, like [`mul_scalar`]/[`scale`].
 pub fn clamp_learned(x: &Value, lo: &Weight, hi: &Weight) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
@@ -266,15 +247,10 @@ pub fn add_bias(bias: &Weight, out: &Value) -> Value {
     out_out
 }
 
-/// **THE TOWER'S OUTPUT STANDARDIZATION** (`vision_config.standardize`):
-/// `y = (x − bias) · scale`, per column, in place.
-///
-/// The last thing `Gemma4VisionModel.forward` does to a pooled soft token
-/// before the multimodal embedder projects it into trunk space. Both planes
-/// are `[tower hidden]` and both are the checkpoint's
-/// (`vision_tower.std_{bias,scale}`); the op's own note argues why they can
-/// neither fold into the projection behind them nor be spelled as
-/// [`add_bias`] followed by [`scale`].
+/// The tower's output standardization (`vision_config.standardize`):
+/// `y = (x − bias) · scale`, per column, in place. The last thing
+/// `Gemma4VisionModel.forward` does to a pooled soft token before the
+/// multimodal embedder projects it into trunk space.
 pub fn standardize(x: &Value, bias: &Weight, scale: &Weight) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
@@ -445,6 +421,24 @@ pub fn rope_partial_last(
     theta: f32,
     interleaved: bool,
 ) -> Value {
+    rope_partial_last_yarn(q, positions, rotary_dim, head_dim, theta, interleaved, false, None)
+}
+
+/// [`rope_partial_last`] with the two facts a layer may state beside its
+/// theta: `inverse` (un-rotate — the attention output of an MLA whose latent
+/// is both key and value) and a YaRN ramp (`Some` on the layers whose
+/// checkpoint states one).
+#[allow(clippy::too_many_arguments)]
+pub fn rope_partial_last_yarn(
+    q: &Value,
+    positions: &Value,
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+    interleaved: bool,
+    inverse: bool,
+    yarn: Option<Yarn>,
+) -> Value {
     let r = q.rec();
     let q_out = r.fresh(q.ty().clone());
     r.push(
@@ -455,6 +449,8 @@ pub fn rope_partial_last(
             head_dim,
             theta,
             interleaved,
+            inverse,
+            yarn,
             q_out: q_out.id(),
         },
         &[q, positions],
@@ -548,14 +544,17 @@ pub fn hc_project(normed: &Value, dynamic: &Weight, stream_count: u32) -> Value 
     let r = normed.rec();
     let count = u64::from(stream_count);
     let mix_hc = 2 * count + count * count;
-    assert_eq!(
-        dynamic.dim(0),
-        mix_hc,
-        "`{}` lands {} rows and a {stream_count}-stream mix row is {mix_hc} wide",
+    // The row is as wide as the plane says: a layer's plane lands the
+    // `2M + M²` row `hc_gates` splits, the trunk's lands the `M` gates
+    // `hc_collapse` folds under. Anything else is nobody's mixing function.
+    assert!(
+        dynamic.dim(0) == mix_hc || dynamic.dim(0) == count,
+        "`{}` lands {} rows; a {stream_count}-stream mix row is {mix_hc} wide and a trunk \
+         collapse row is {count}",
         dynamic.name,
         dynamic.dim(0),
     );
-    let mixes = r.fresh(tensor(normed.rows(), mix_hc, Dtype::F32));
+    let mixes = r.fresh(tensor(normed.rows(), dynamic.dim(0), Dtype::F32));
     r.push(
         Elementwise::HcProject {
             normed: normed.id(),
@@ -604,6 +603,39 @@ pub fn hc_gates(
         &[normed, streams],
     );
     (x, post_mix, comb_mix)
+}
+
+/// **THE TRUNK COLLAPSE**: the `M` streams folded into the one `hidden`-wide
+/// row the final norm reads, under the `M` sigmoid gates `mixes` (the
+/// `[N, M]` row [`hc_project`] lands through `hc_head.fn`) state.
+pub fn hc_collapse(
+    mixes: &Value,
+    streams: &Value,
+    scale: &Weight,
+    base: &Weight,
+    stream_count: u32,
+    hc_eps: f32,
+) -> Value {
+    let r = mixes.rec();
+    let count = u64::from(stream_count);
+    let y = r.fresh(tensor(
+        streams.rows(),
+        streams.width() / count,
+        streams.dtype(),
+    ));
+    r.push(
+        Elementwise::HcCollapse {
+            mixes: mixes.id(),
+            streams: streams.id(),
+            scale: r.weight(scale),
+            base: r.weight(base),
+            stream_count,
+            hc_eps,
+            y: y.id(),
+        },
+        &[mixes, streams],
+    );
+    y
 }
 
 pub fn hc_fold(x: &Value, streams: &Value, post_mix: &Value, comb_mix: &Value) -> Value {
@@ -683,20 +715,13 @@ pub fn ple_gate(key: &Value, query: &Value, value: &Value, streams: u32) -> Valu
     y
 }
 
-/// **THE MULTIMODAL ROTARY**: [`rope_partial`] over a position that is a
-/// triple (multimodal §2's second op).
+/// The multimodal rotary: [`rope_partial`] over a position that is a triple.
+/// `positions` is `[rows, 3]` `i32`, one `(t, h, w)` per rotated row;
+/// `sections` is the checkpoint's `mrope_section` trace constant. Rotates in
+/// place, like every rope arm beside it.
 ///
-/// `positions` is `[rows, 3]` `i32`, one `(t, h, w)` per rotated row, and
-/// `sections` is the checkpoint's own `mrope_section` — a trace constant, so
-/// it is stated here rather than read from device memory. Rotates in place,
-/// like every rope arm beside it.
-///
-/// `form` is the section LAYOUT (multimodal §6.3): the trunk states
-/// [`MropeForm::Interleaved`] (`mrope_interleaved: true`), the tower states
-/// [`MropeForm::Blocked`], and the feeder is
-/// [`Input::mrope_positions`](crate::Input::mrope_positions) on the token axis
-/// or [`Input::patch_positions`](crate::Input::patch_positions) on the patch
-/// one.
+/// `form` is the section layout: the trunk states [`MropeForm::Interleaved`],
+/// the tower states [`MropeForm::Blocked`].
 pub fn rope_mrope(
     q: &Value,
     k: &Value,

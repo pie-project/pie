@@ -27,9 +27,8 @@ impl SingleDfaEngine {
         }
     }
 
-    /// Advance through all bytes via byte_table lookup.
-    /// On success, pushes previous state to history and updates current state.
-    /// On failure, returns false without modifying state.
+    /// On success, pushes the previous state to history. On failure, leaves
+    /// state unmodified.
     pub(super) fn advance_bytes(&mut self, compiled: &CompiledGrammar, bytes: &[u8]) -> bool {
         let bt = compiled.rule_dfas[self.rule_idx].fsm.byte_table();
         let mut state = self.state as usize;
@@ -45,12 +44,10 @@ impl SingleDfaEngine {
         true
     }
 
-    /// Whether the DFA is in an accepting state.
     pub(super) fn is_completed(&self, compiled: &CompiledGrammar) -> bool {
         compiled.rule_dfas[self.rule_idx].ends[self.state as usize]
     }
 
-    /// Rollback num_tokens tokens by popping from history.
     pub(super) fn rollback(&mut self, num_tokens: usize) -> usize {
         let n = num_tokens.min(self.history.len());
         for _ in 0..n {
@@ -59,7 +56,6 @@ impl SingleDfaEngine {
         n
     }
 
-    /// Reset to the DFA start state.
     pub(super) fn reset(&mut self, compiled: &CompiledGrammar) {
         self.state = compiled.rule_dfas[self.rule_idx].start.0 as u16;
         self.history.clear();
@@ -82,7 +78,6 @@ impl SingleDfaEngine {
                 Some(b) => b,
                 None => break,
             };
-            // Find the target state for this byte
             let bt = rule_dfa.fsm.byte_table();
             let next = bt[state as usize * 256 + byte as usize];
             if next == 0xFFFF {
@@ -173,7 +168,6 @@ impl SingleDfaEngine {
                 active_prefix.truncate(common);
             }
 
-            // Advance through remaining bytes
             let mut dead = false;
             for &byte in &bytes[common..] {
                 let state = *stack.last().unwrap() as usize;

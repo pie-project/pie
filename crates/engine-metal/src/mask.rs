@@ -1,136 +1,31 @@
-//! The `masked` axis's one piece of arithmetic: a lane's run-length mask,
-//! expanded into the table `attention.masked` actually reads.
+//! Expands a lane's run-length mask ([`Mask`]) into the dense table
+//! `attention.masked` reads: one byte per (fire token row, key position)
+//! pair, rows are absolute fire rows, and `attention_mask_enabled[row]`
+//! gates the row. Differs from the CUDA sibling (which packs bits with a
+//! per-lane byte-offset span table): this plane's shaders take one scalar
+//! stride and treat `kp >= stride` as masked out, so there's no per-lane
+//! offset to put.
 //!
-//! **THE TWO FORMS ARE NOT THE SAME SHAPE, AND THAT IS THE WHOLE FILE.** A
-//! submission states one mask per lane over that lane's readable extent —
-//! [`Mask`] is a run-length encoding over `total` KV positions, because a
-//! prefix drop, a retained-block set and a sliding window are each a handful
-//! of runs over thousands of positions. The shader reads something else:
-//! `attn/sdpa_paged.metal` and its mma twin index
-//! `attention_mask[row * attention_mask_stride + kp]`, one `uchar` per
-//! (fire token row, key position) PAIR, with `attention_mask_enabled[row]`
-//! gating the row. So the shell owns one expansion, and it is here rather
-//! than inside the fire path because it is the only place in this crate
-//! where a wrong cell is silently a different sentence rather than a fault.
+//! Causality is folded into the expansion even though the shaders also
+//! apply their own causal bound (redundant, but keeps the staged table
+//! meaning the same regardless of which sdpa arm runs). The sliding window
+//! is NOT folded in: `Attention::Masked` states it per node, so the shaders
+//! take it as their own scalar argument.
 //!
-//! # Where this diverges from the CUDA shell, and why it must
-//!
-//! The sibling stages PACKED BITS with a per-lane BYTE-OFFSET span table,
-//! because flashinfer's fa2 custom-mask arm reads `qo_idx * kv_len + kv_idx`
-//! LSB-first inside each byte and takes `maybe_custom_mask +
-//! maybe_mask_indptr[batch_idx]` as pointer arithmetic on a `uint8_t*`.
-//! Neither half of that survives the crossing:
-//!
-//! ```text
-//! CUDA   one BIT per pair, LSB-first     Metal   one BYTE per pair, != 0
-//! CUDA   per-lane byte offsets, indptr   Metal   one uniform row STRIDE
-//! CUDA   rows are lane-relative          Metal   rows are ABSOLUTE fire rows
-//! ```
-//!
-//! The stride is not a shell preference: the shaders take
-//! `attention_mask_stride` as a scalar (`buffer(13)`), address the plane by
-//! the absolute token row they are already resolving `position_ids` and
-//! `req_of_token` at, and treat `kp >= attention_mask_stride` as MASKED OUT.
-//! So there is no lane base to hand them and no place to put one — the
-//! rectangle is `[fire rows][stride]`, dense, and the stride must cover the
-//! widest masked lane in the fire or that lane's tail silently drops. A
-//! packed-bit slab with a span table would be a table nothing on this plane
-//! can bind; porting the CUDA layout verbatim is the one way to get this
-//! file wrong.
-//!
-//! The cost of the byte form is real and is the platform's: a masked prefill
-//! of `n` rows over `n` keys is `n²` bytes here against `n²/8` there. It is
-//! paid rather than argued with, because the alternative is a shader change.
-//!
-//! # Causality is folded IN, and the sliding window is not
-//!
-//! `keep(q, k) = the lane's runs keep k ∧ k <= have + q`, which is exactly
-//! `Lane::mask`'s own words — "which readable extent of a slot a lane's
-//! attention may reach" — intersected with the order the cache is written
-//! in. On a one-row lane the second term is vacuous and the two readings
-//! coincide, which is why a decode-shaped mask needs no special case.
-//!
-//! **THE FOLD IS REDUNDANT ON THIS PLANE AND IS KEPT ANYWAY.** Unlike the
-//! fa2 custom arm — which reads the bit and nothing else, so a multi-row
-//! lane given its mask verbatim would let row 0 attend row 4's key — the
-//! metal shaders apply the causal bound themselves: `sdpa_paged.metal` walks
-//! `kp` up to `q_pos` and no further, and the mma arm spells
-//! `keep = kp <= q_pos && kp >= my_start` before it consults the mask at
-//! all. Folding it in costs nothing (the plane is written row by row
-//! regardless), makes the staged table MEAN the same thing on both planes,
-//! and keeps this file correct against whichever sdpa arm the dispatcher
-//! picks rather than against the two that exist today. An intersection with
-//! a bound the shader also applies is idempotent.
-//!
-//! The SLIDING window is deliberately not folded in, and the reason is that
-//! it is not a property of the lane. `Attention::Masked` states its window
-//! per NODE — gemma's text alternates `Some(512)` and `None` down its layer
-//! stack — so one slab cannot serve both, and a fold would have to be per
-//! layer. The metal shaders take the window as their own scalar argument and
-//! apply it beside the mask (`my_start`), which is the right place for a
-//! per-node fact and the reason it must not be baked into a per-lane table.
-//!
-//! # BOTH FORMS EXPAND, AND THE SECOND IS ONE WALK PER ROW
-//!
-//! `Masking` has two shapes: `Extent`, one restriction of the lane's readable
-//! extent re-applied to every query row, and `Rows`, one restriction PER
-//! query row — the windowed prefill, where row `i` keeps `[i - w, i]` and no
-//! single extent mask is any of them. Both land in the same cells here,
-//! because the plane is a dense `[fire rows][stride]` rectangle addressed by
-//! ABSOLUTE fire row: the extent form walks its runs ONCE and applies them to
-//! every row of the lane, the per-row form walks row `i`'s runs under row
-//! `i`'s own causal bound. That is the CUDA sibling's split term for term,
-//! which is what makes the two planes stage the same sentence out of the same
-//! submission.
-//!
-//! A per-row mask may only CHOOSE AMONG the keys causality already allows,
-//! never add one: the inner walk stops at `have + q` inclusive, so a row that
-//! states a kept run past its own position keeps nothing there. The extent
-//! form gets the same bound from the other side, as the first row that may
-//! see a key (`key - have`), and the two spellings are the same intersection.
-//!
-//! What the per-row form is still refused for is a row COUNT that is not the
-//! lane's ([`Fault::MaskRows`]). `Masking::Rows` is parallel to
-//! `Lane::tokens`, so a vector of some other length has no reading — and the
-//! reading it would be tempting to invent, row zero's mask on every row, is
-//! the silent substitution the whole form exists to end.
-//!
-//! # `enabled` is per ROW, not per lane
-//!
-//! `kernels_metal::attn`'s field doc calls `mask_enabled` "one per request",
-//! and the shaders index it `attention_mask_enabled[row]` at the absolute
-//! token row. The shaders are what runs, so this file stages one flag per
-//! fire ROW — every row of a masked lane set, every row of an unmasked one
-//! clear. A lane's rows all carry the same flag, so the two readings agree
-//! for every fire the composition can build; stating it per row is what
-//! makes them agree by construction rather than by coincidence.
+//! `Masking::Extent` (one restriction re-applied to every row) and
+//! `Masking::Rows` (one restriction per row) both land in the same dense
+//! plane. A per-row mask may only choose among keys causality already
+//! allows, never add one; a mismatched row count is refused
+//! ([`Fault::MaskRows`]) rather than silently reused.
 
 use engine::fire::{Mask, Masking};
 
 use crate::error::{Fault, Result};
 
-/// **A DEVICE-RESOLVED DENSE RECTANGLE, AS THE RESTRICTIONS THIS FILE ALREADY
-/// EXPANDS.**
-///
-/// A guest whose ancestry mask is device data states it as a `[rows, keys]`
-/// rectangle of bools on a channel, and the descriptor-port plane reads that
-/// cell (`program::ports`). What the attention arm reads is the dense plane
-/// [`stage`] builds, and the ONE thing that must be true of a device mask is
-/// that it expands into the very same plane a host-stated mask of the same
-/// bools expands into — otherwise a guest that moved its mask onto the device
-/// would silently change which keys its beams reach.
-///
-/// So the dense form is not given a second walk. It is run-length encoded
-/// here, one [`Mask`] per row over the rectangle's own key width, and handed
-/// to [`stage`] — which is the host path, cell for cell, and is why the gate
-/// for this is an EQUALITY against a host-stated control rather than a smoke
-/// test.
-///
-/// `stride` is the rectangle's own key width and not the lane's extent, which
-/// is deliberate: a guest builds its rectangle at the width of the POOL it
-/// reserved and the pool does not shrink as the extent grows, so the surplus
-/// is exactly the "a mask may be LONGER" case the module doc argues and it
-/// takes the same clip.
+/// A device-resolved dense `[rows, keys]` rectangle of bools, run-length
+/// encoded here and handed to [`stage`]. `stride` is the rectangle's own
+/// key width (the pool's, not the lane's extent), clipped the same as any
+/// longer mask.
 #[must_use]
 pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
     let rows = cells.len().checked_div(stride).unwrap_or(0);
@@ -138,8 +33,8 @@ pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
         (0..rows)
             .map(|row| {
                 let mut runs: Vec<u32> = Vec::new();
-                // Alternating lengths, MASKED-OUT FIRST — `Mask`'s own
-                // encoding, so a row that opens with a kept key opens with a
+                // Alternating lengths, masked-out first — `Mask`'s own
+                // encoding, so a row that opens kept opens with a
                 // zero-length dropped run.
                 let mut keeping = false;
                 let mut run = 0u32;
@@ -165,10 +60,8 @@ pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
 #[derive(Debug, Clone, Copy)]
 pub struct LaneMask<'a> {
     /// The lane's masking, or `None` for a lane that carries none.
-    ///
-    /// **BOTH FORMS EXPAND.** A `Masking::Rows` states one restriction per
-    /// query row and must state exactly [`rows`](LaneMask::rows) of them;
-    /// any other number is refused by name ([`Fault::MaskRows`]).
+    /// `Masking::Rows` must state exactly [`rows`](LaneMask::rows) of them,
+    /// or it's refused by name ([`Fault::MaskRows`]).
     pub mask: Option<&'a Masking>,
     /// How many KV tokens the slot held BEFORE this fire.
     pub have: u32,
@@ -176,12 +69,8 @@ pub struct LaneMask<'a> {
     pub rows: u32,
 }
 
-/// A fire's mask plane and the flags that gate it, ready to write into the
-/// input reservation.
-///
-/// One dense `[rows][stride]` rectangle in fire row order, which is the
-/// order the shaders address it in — no lane offsets, because there is
-/// nowhere to state one (see the module doc).
+/// A fire's mask plane and the flags that gate it: one dense
+/// `[rows][stride]` rectangle in fire row order (no lane offsets).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Staged {
     /// `[rows * stride]`: 1 keeps the pair, 0 drops it. Row `r` of the fire
@@ -197,51 +86,34 @@ pub struct Staged {
     pub stride: u32,
 }
 
-/// Expand a fire's lane masks, in fire (seriated) row order.
-///
-/// `Ok(None)` is a fire no lane put a mask on — the shell then binds neither
-/// seat, and a masked consumer gets `attn::masked`'s own typed refusal
-/// instead of a rectangle of zeros that would blank every logit.
+/// Expand a fire's lane masks, in fire (seriated) row order. `Ok(None)`
+/// means no lane stated a mask, so the shell binds neither seat.
 ///
 /// # Errors
 ///
-/// [`Fault::Mask`] for a mask SHORTER than the lane's post-append KV length.
-/// Short is the dangerous direction — the missing positions read as
-/// MASKED-OUT and quietly truncate the attention — so it is refused rather
-/// than padded. A LONGER mask is accepted and clipped to the extent (the
-/// module doc's page-padded shape).
-///
-/// [`Fault::MaskRows`] for a [`Masking::Rows`] that states some other number
-/// of rows than the lane feeds: the form is parallel to `Lane::tokens`, so a
-/// vector of another length has no reading.
-///
-/// [`Fault::Ceiling`] for a fire whose widest masked lane needs more key
-/// positions than a `u32` stride can name, or whose whole plane does not fit
-/// in host memory this process can address.
+/// [`Fault::Mask`]: a mask shorter than the lane's post-append KV length
+/// (refused, not padded, since the missing positions would read as masked
+/// out); a longer mask is accepted and clipped. [`Fault::MaskRows`]: a
+/// [`Masking::Rows`] with a different row count than the lane feeds.
+/// [`Fault::Ceiling`]: more key positions than a `u32` stride can name, or a
+/// plane too large for host memory.
 pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     if lanes.iter().all(|lane| lane.mask.is_none()) {
         return Ok(None);
     }
 
-    // Pass one: check every stated extent, and find the stride. The widest
-    // MASKED lane sets it — an unmasked lane's rows are never consulted, so
-    // a long unmasked neighbour must not make every masked row pay for it.
+    // Pass one: check every stated extent, and find the stride (the widest
+    // masked lane's; an unmasked neighbour must not make every masked row
+    // pay for it).
     let mut widest = 0u64;
     for (at, lane) in lanes.iter().enumerate() {
         let kv = u64::from(lane.have) + u64::from(lane.rows);
         let Some(masking) = lane.mask else {
             continue;
         };
-        // SHORT IS THE FAULT; LONGER IS THE ECOSYSTEM'S ORDINARY SHAPE and is
-        // clipped, exactly as the CUDA sibling takes it — a guest states its
-        // mask over the pages it RESERVED (48 keys for a 3-page pool holding
-        // 23 tokens), and a position past the extent is one no query row can
-        // attend under the causal bound anyway. The stride below is the
-        // EXTENT's, not the mask's, so the surplus never reaches the plane.
-        //
-        // EVERY stated restriction, not the first: a per-row masking is as
-        // many masks as the lane has rows, and one short row truncates that
-        // row's attention exactly as one short extent truncates the lane's.
+        // The stride is the extent's, not the mask's, so a longer mask's
+        // surplus is clipped. Every stated restriction is checked, not just
+        // the first, since a short row truncates like a short extent.
         for mask in masking.masks() {
             if mask.total < kv {
                 return Err(Fault::Mask {
@@ -251,10 +123,8 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                 });
             }
         }
-        // AND THE ROW COUNT, AFTER THE EXTENTS AND BEFORE THE ALLOCATION.
-        // `Masking::Rows` is parallel to the lane's tokens; the CUDA sibling
-        // checks the same two things in the same order, so a mask that is
-        // both short and miscounted is refused for its extent on both planes.
+        // Row count, checked after the extents and before the allocation,
+        // same order as the CUDA sibling.
         if let Some(stated) = masking.stated_rows()
             && stated != lane.rows as usize
         {
@@ -285,11 +155,9 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
         stride,
     };
 
-    // Pass two: the runs. The extent form is walked ONCE per lane and applied
-    // to every query row — one pass over the encoding rather than `rows`
-    // passes, because a prefill lane's mask is the same runs at every row and
-    // only the causal bound moves. The per-row form is one walk per row, each
-    // under that row's own bound, because that is what it means.
+    // Pass two: the runs. `Extent` is walked once per lane and applied to
+    // every row (only the causal bound moves); `Rows` walks once per row,
+    // each under its own bound.
     let mut row = 0usize;
     for lane in lanes {
         let Some(masking) = lane.mask else {
@@ -308,10 +176,8 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                     let end = at_position.saturating_add(u64::from(run)).min(kv);
                     if index % 2 == 1 {
                         for key in at_position..end {
-                            // Causal: query row `q` stands at absolute
-                            // position `have + q`, and a key past it has not
-                            // been written. Read from the key's side: the
-                            // first row that may see it is `key - have`.
+                            // Causal, read from the key's side: the first
+                            // row that may see key `key` is `key - have`.
                             let first = key.saturating_sub(u64::from(lane.have));
                             for q in first..u64::from(lane.rows) {
                                 keep(&mut out.bytes, stride, base + q, key);
@@ -327,11 +193,8 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
             Masking::Rows(masks) => {
                 for (q, mask) in masks.iter().enumerate() {
                     let q = q as u64;
-                    // The same bound, read from the ROW's side, and inclusive:
-                    // row `q` stands at `have + q` and may reach its own key.
-                    // A row's runs choose among the keys causality allows and
-                    // never add one, so the kept walk stops here even where
-                    // the run does not.
+                    // Same bound, read from the row's side, inclusive: row
+                    // `q` stands at `have + q` and may reach its own key.
                     let bound = u64::from(lane.have) + q;
                     let mut at_position = 0u64;
                     for (index, &run) in mask.runs.iter().enumerate() {
@@ -354,13 +217,10 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     Ok(Some(out))
 }
 
-/// One cell of the plane, kept.
-///
-/// A free function rather than a closure so that the two walks above write
-/// through the same three-term address — `row * stride + key`, absolute fire
-/// row — and a bounds miss stays a no-op instead of a panic: the stride and
-/// the row count were both chosen from the same `have + rows` the callers
-/// walk, so an out-of-range cell would be this file disagreeing with itself.
+/// One cell of the plane, kept. A free function so both walks above write
+/// through the same address (`row * stride + key`, absolute fire row); a
+/// bounds miss is a no-op rather than a panic, since stride and row count
+/// come from the same `have + rows` the callers walk.
 fn keep(bytes: &mut [u8], stride: u32, row: u64, key: u64) {
     let cell = row * u64::from(stride) + key;
     if let Some(word) = bytes.get_mut(cell as usize) {
@@ -372,176 +232,7 @@ fn keep(bytes: &mut [u8], stride: u32, row: u64, key: u64) {
 mod tests {
     use super::*;
 
-    /// Is `(row, k)` kept, read the way the shader reads it?
-    fn keeps(staged: &Staged, row: u64, k: u64) -> bool {
-        staged.enabled[row as usize] != 0
-            && k < u64::from(staged.stride)
-            && staged.bytes[(row * u64::from(staged.stride) + k) as usize] != 0
-    }
-
-    /// A one-row lane is the decode-shaped mask, and its plane is the runs
-    /// verbatim: the causal bound at `have + 0` keeps every key the cache
-    /// holds.
-    #[test]
-    fn a_decode_lane_expands_to_its_runs() {
-        // 7 held + 1 new = 8 positions; drop the first three, keep the rest.
-        let mask = Masking::Extent(Mask::new(vec![3, 5], 8));
-        let staged = stage(&[LaneMask {
-            mask: Some(&mask),
-            have: 7,
-            rows: 1,
-        }])
-        .expect("the mask covers the lane's extent")
-        .expect("a masked fire stages a plane");
-        assert_eq!(staged.stride, 8, "one lane of 8 keys is an 8-wide row");
-        assert_eq!(staged.enabled, vec![1]);
-        assert_eq!(staged.bytes.len(), 8, "one row, one byte per key");
-        for k in 0..8 {
-            assert_eq!(
-                keeps(&staged, 0, k),
-                k >= 3,
-                "key {k} of a three-position prefix drop"
-            );
-        }
-    }
-
-    /// A multi-row lane gets the causal bound, which the shaders also apply
-    /// — the intersection is the point, not the redundancy.
-    #[test]
-    fn a_prefill_lane_gets_its_causal_bound() {
-        // A fresh 4-token prompt, nothing masked out by the runs.
-        let mask = Masking::Extent(Mask::new(vec![0, 4], 4));
-        let staged = stage(&[LaneMask {
-            mask: Some(&mask),
-            have: 0,
-            rows: 4,
-        }])
-        .expect("the mask covers the lane's extent")
-        .expect("a masked fire stages a plane");
-        assert_eq!(staged.stride, 4);
-        assert_eq!(staged.enabled, vec![1, 1, 1, 1]);
-        assert_eq!(staged.bytes.len(), 16, "4 rows of 4 keys");
-        for q in 0..4 {
-            for k in 0..4 {
-                assert_eq!(keeps(&staged, q, k), k <= q, "row {q} must not reach key {k}");
-            }
-        }
-    }
-
-    /// The runs and the causal bound are ANDed, not chosen between.
-    #[test]
-    fn the_runs_and_the_causal_bound_intersect() {
-        // 2 held + 3 new = 5; keep positions 1..4 (drop 0 and 4).
-        let mask = Masking::Extent(Mask::new(vec![1, 3, 1], 5));
-        let staged = stage(&[LaneMask {
-            mask: Some(&mask),
-            have: 2,
-            rows: 3,
-        }])
-        .expect("the mask covers the lane's extent")
-        .expect("a masked fire stages a plane");
-        for q in 0..3u64 {
-            for k in 0..5u64 {
-                let want = (1..4).contains(&k) && k <= 2 + q;
-                assert_eq!(keeps(&staged, q, k), want, "cell ({q}, {k})");
-            }
-        }
-    }
-
-    /// Lanes without a mask still own their rows of the plane — the rows are
-    /// ABSOLUTE fire rows on this plane — and their flag is what turns the
-    /// plane off for them.
-    #[test]
-    fn unmasked_lanes_own_their_rows_and_their_flag_is_clear() {
-        let mask = Masking::Extent(Mask::new(vec![0, 8], 8));
-        let staged = stage(&[
-            LaneMask {
-                mask: None,
-                have: 3,
-                rows: 1,
-            },
-            LaneMask {
-                mask: Some(&mask),
-                have: 7,
-                rows: 1,
-            },
-            LaneMask {
-                mask: None,
-                have: 1,
-                rows: 1,
-            },
-        ])
-        .expect("the mask covers its lane's extent")
-        .expect("a masked fire stages a plane");
-        assert_eq!(staged.stride, 8, "the masked lane sets the stride alone");
-        assert_eq!(staged.enabled, vec![0, 1, 0]);
-        assert_eq!(staged.bytes.len(), 24, "3 fire rows of 8");
-        assert!(staged.bytes[..8].iter().all(|&cell| cell == 0));
-        assert!(staged.bytes[8..16].iter().all(|&cell| cell == 1));
-        assert!(staged.bytes[16..].iter().all(|&cell| cell == 0));
-    }
-
-    /// **THE PER-ROW FORM IS ONE WALK PER ROW, AND THE ROWS NEED NOT NEST.**
-    /// A windowed prefill keeps `[i - w, i]` at row `i`, which is a set no
-    /// single restriction of the lane's extent is any of — serving it as row
-    /// zero's mask on every row is the substitution the form exists to end.
-    #[test]
-    fn a_per_row_mask_expands_row_by_row() {
-        // Three rows over three keys, row `i` keeping `[i - 1, i]`. The runs
-        // are masked-out first, so row 2 opens with a two-position drop.
-        let windowed = Masking::Rows(vec![
-            Mask::new(vec![0, 1], 3),
-            Mask::new(vec![0, 2], 3),
-            Mask::new(vec![1, 2], 3),
-        ]);
-        let staged = stage(&[LaneMask {
-            mask: Some(&windowed),
-            have: 0,
-            rows: 3,
-        }])
-        .expect("every row covers the lane's extent")
-        .expect("a masked fire stages a plane");
-        assert_eq!(staged.stride, 3);
-        assert_eq!(staged.enabled, vec![1, 1, 1]);
-        for q in 0..3u64 {
-            for k in 0..3u64 {
-                assert_eq!(
-                    keeps(&staged, q, k),
-                    k + 1 >= q && k <= q,
-                    "row {q} of a one-key sliding window must not reach key {k}"
-                );
-            }
-        }
-    }
-
-    /// A row's runs CHOOSE AMONG the keys causality already allows and never
-    /// add one — the walk stops at `have + q`, inclusive.
-    #[test]
-    fn a_per_row_mask_may_not_widen_causality() {
-        // Two rows over four keys; both rows state "keep everything", and
-        // row 0 stands at position 2 so keys 3 are not written yet.
-        let greedy = Masking::Rows(vec![Mask::new(vec![0, 4], 4), Mask::new(vec![0, 4], 4)]);
-        let staged = stage(&[LaneMask {
-            mask: Some(&greedy),
-            have: 2,
-            rows: 2,
-        }])
-        .expect("both rows cover the lane's extent")
-        .expect("a masked fire stages a plane");
-        for q in 0..2u64 {
-            for k in 0..4u64 {
-                assert_eq!(
-                    keeps(&staged, q, k),
-                    k <= 2 + q,
-                    "row {q} must not reach key {k}, whatever its runs say"
-                );
-            }
-        }
-    }
-
-    /// **A ROW COUNT THAT IS NOT THE LANE'S IS REFUSED BY NAME.**
-    /// `Masking::Rows` is parallel to `Lane::tokens`; a vector of some other
-    /// length has no reading, and inventing one is inventing rows.
+    /// A row count that is not the lane's is refused by name.
     #[test]
     fn a_per_row_mask_of_the_wrong_height_is_refused() {
         let short = Masking::Rows(vec![Mask::new(vec![0, 3], 3), Mask::new(vec![0, 3], 3)]);
@@ -573,9 +264,8 @@ mod tests {
         );
     }
 
-    /// A per-row masking whose rows are short of the extent is refused for
-    /// the EXTENT, before the row count is looked at — the same order the
-    /// CUDA sibling checks them in.
+    /// A per-row masking short of the extent is refused for the extent
+    /// first, before the row count is checked.
     #[test]
     fn a_short_per_row_mask_is_refused_for_its_extent_first() {
         let short = Masking::Rows(vec![Mask::new(vec![0, 2], 2), Mask::new(vec![0, 2], 2)]);
@@ -597,69 +287,6 @@ mod tests {
         );
     }
 
-    /// **THE PAGE-PADDED MASK IS THE ORDINARY ONE, AND IT STAGES THE SAME
-    /// PLANE.** A guest reserves three 16-token pages for a 23-token lane and
-    /// builds its rectangle 48 keys wide; the fire reads 23. The surplus is
-    /// clipped — including out of the STRIDE, which is the extent's and not
-    /// the mask's — so the padded spelling and the exact one are one plane.
-    #[test]
-    fn a_page_padded_mask_stages_what_the_exact_one_does() {
-        const HAVE: u32 = 20;
-        const ROWS: u32 = 3;
-        const KV: u64 = 23;
-        // Keep keys 15..23; the padded spelling adds a kept run past the
-        // extent, out to the 48-key pool width.
-        let exact = Masking::Extent(Mask::new(vec![15, 8], KV));
-        let padded = Masking::Extent(Mask::new(vec![15, 8, 0, 25], 48));
-        let lane = |mask| LaneMask {
-            mask: Some(mask),
-            have: HAVE,
-            rows: ROWS,
-        };
-        let staged = stage(&[lane(&padded)]).expect("a padded mask is accepted");
-        assert_eq!(staged, stage(&[lane(&exact)]).expect("the exact one stages"));
-        let staged = staged.expect("a masked fire stages a plane");
-        assert_eq!(staged.stride, KV as u32, "the stride is the EXTENT's");
-        for q in 0..u64::from(ROWS) {
-            for k in 0..KV {
-                assert_eq!(
-                    keeps(&staged, q, k),
-                    (15..23).contains(&k) && k <= u64::from(HAVE) + q,
-                    "cell ({q}, {k}) of a page-padded window"
-                );
-            }
-        }
-    }
-
-    /// The stride is the widest MASKED lane's extent, and a shorter lane's
-    /// tail past its own KV length stays masked out — which is what the
-    /// shaders' own `kp >= stride` bound would say anyway.
-    #[test]
-    fn the_stride_is_the_widest_masked_lanes_extent() {
-        let short = Masking::Extent(Mask::new(vec![0, 2], 2));
-        let long = Masking::Extent(Mask::new(vec![0, 6], 6));
-        let staged = stage(&[
-            LaneMask {
-                mask: Some(&short),
-                have: 1,
-                rows: 1,
-            },
-            LaneMask {
-                mask: Some(&long),
-                have: 5,
-                rows: 1,
-            },
-        ])
-        .expect("both masks cover their lanes")
-        .expect("a masked fire stages a plane");
-        assert_eq!(staged.stride, 6);
-        assert_eq!(staged.enabled, vec![1, 1]);
-        for k in 0..6 {
-            assert_eq!(keeps(&staged, 0, k), k < 2, "the short lane holds 2 keys");
-            assert!(keeps(&staged, 1, k), "the long lane holds all 6");
-        }
-    }
-
     /// A fire nobody masked binds nothing, so a masked consumer refuses in
     /// its own name rather than reading a blanked rectangle.
     #[test]
@@ -673,8 +300,7 @@ mod tests {
         assert_eq!(staged, None);
     }
 
-    /// A mask that covers a different extent than the lane is refused by
-    /// name. Short would truncate the attention silently.
+    /// A mask short of its lane's extent is refused by name.
     #[test]
     fn a_mask_short_of_its_lanes_extent_is_refused() {
         let mask = Masking::Extent(Mask::new(vec![0, 4], 4));

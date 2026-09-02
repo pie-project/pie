@@ -1,9 +1,7 @@
-//! One op, evaluated against already-evaluated operands.
-//!
-//! No channel state, no readiness, no instance: everything `eval_op` needs
-//! arrives as an argument. That is what lets `pareval` fold the same function
-//! over host-known values without a second evaluator — the property the
-//! module doc of `pareval.rs` rests on.
+//! One op, evaluated against already-evaluated operands. No channel state,
+//! no readiness, no instance: everything `eval_op` needs arrives as an
+//! argument, which is what lets `pareval` fold the same function over
+//! host-known values without a second evaluator.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -46,9 +44,8 @@ pub(crate) fn eval_op(
         Op::Abs(a) => One(match v(a) {
             Value::F32(x) => Value::F32(x.iter().map(|&a| a.abs()).collect()),
             Value::I32(x) => Value::I32(x.iter().map(|&a| a.wrapping_abs()).collect()),
-            // Already non-negative. Spelled out because the `_ => clone()`
-            // this replaces would answer "abs is the identity" for a signed
-            // dtype added later.
+            // spelled out rather than a `_ => clone()` wildcard, which would
+            // wrongly answer "abs is the identity" for a signed dtype added later.
             Value::U32(x) => Value::U32(x.clone()),
             Value::Bool(x) => Value::Bool(x.clone()),
         }),
@@ -309,10 +306,8 @@ pub(crate) fn eval_op(
             let rows = rows_of(ty_of(a).shape);
             let is_sum = matches!(op, Op::CumSum(_));
 
-            // Scanned in the input's own dtype rather than through f32, which
-            // is the whole reason the op is not F32-only: a u32 offset scan
-            // past 2^24 is not representable in f32 and must not be rounded
-            // on its way through the interpreter either.
+            // scanned in the input's own dtype, not through f32: a u32
+            // offset scan past 2^24 is not representable in f32.
             match v(a) {
                 Value::I32(x) if is_sum => {
                     One(Value::I32(scan_rows(x, rows, 0, i32::wrapping_add)))
@@ -529,11 +524,9 @@ pub(crate) fn eval_op(
         }
         Op::Iota { len } => One(Value::U32((0..len).collect())),
         Op::MaskApply { logits, mask } => {
-            // Per-row over the LAST axis: the single packed mask (one word
-            // row, [ceil(n/32)] — the validator's shape rule) broadcasts
-            // across rows; the bit index is the COLUMN `j % n`, never the
-            // flat element index. Per-row *distinct* masks use the composed
-            // bool-mask form (select), not this packed op.
+            // per-row over the last axis: the single packed mask broadcasts
+            // across rows; the bit index is the column `j % n`, never the
+            // flat element index. Per-row distinct masks use `select` instead.
             let n = ty_of(logits).shape.last_len().unwrap_or(1) as usize;
             let x = lanes_f32(v(logits));
             let Value::U32(words) = v(mask) else {
@@ -605,9 +598,8 @@ pub(crate) fn eval_op(
             shape,
             kind,
         } => {
-            // Ambient-seed form: the per-fire seed is 0 in the reference
-            // interpreter unless the harness overrides via a keyed op —
-            // ETA programs use rng_keyed; this stays for PSIR parity work.
+            // ambient-seed form: the per-fire seed is 0 here unless the
+            // harness overrides; ETA programs use rng_keyed instead.
             One(Value::F32(rng_ambient(
                 0,
                 stream,
@@ -749,5 +741,3 @@ pub(super) fn rng_ambient(seed: u32, stream: u32, kind: RngKind, len: usize) -> 
         })
         .collect()
 }
-
-// Re-export for parity harnesses.

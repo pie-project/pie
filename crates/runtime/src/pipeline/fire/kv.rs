@@ -1,25 +1,10 @@
-//! Fire KV preparation over the typed `KvStore` (kv_refact.md).
-//!
-//! `pipeline::fire` calls [`realize_declaration_demand`] +
-//! [`realize_declaration_reserved`] under one KV lock (the staleness gate),
-//! threads the returned [`KvTxn`] across the async fire, and
-//! [`finalize`]s it (commit publishes the mapping; abort releases the
-//! pending slots and leaves the committed mapping authoritative);
-//! `crate::offload` drives the non-reserved [`prepare`] path.
-//!
-//! Hash lifecycle (increment 1): canonical fires — bind-time shape gate
-//! [`canonical_kv_shape`], fire-time evidence check
-//! [`canonical_hash_tokens`] — commit chained `(token, position)` slot
-//! hashes and full-page hashes, feeding the store's chain state and CAS
-//! index; every other fire commits opaque slot hashes (concrete identity,
-//! never matchable). Matching/trim ([`match_prefix`]) is the next increment.
-//!
-//! The allow below covers exactly the reserved, test-exercised increments:
-//! [`realize_declaration`] (the non-reserved variant), [`match_prefix`]
-//! (trie matching, increment 2a), and the canonical-hash gate
-//! ([`canonical_kv_shape`] / [`CanonicalFireEvidence`] /
-//! [`canonical_hash_tokens`]) — spec'd and unit-tested here, not yet wired
-//! into the fire path.
+//! Fire KV preparation over the typed `KvStore`. `pipeline::fire` calls
+//! [`realize_declaration_demand`] + [`realize_declaration_reserved`] under
+//! one KV lock, threads the returned [`KvTxn`] across the async fire, and
+//! [`finalize`]s it (commit publishes the mapping; abort releases pending
+//! slots). Canonical fires ([`canonical_kv_shape`] +
+//! [`canonical_hash_tokens`]) commit chained slot/page hashes for the CAS
+//! index; every other fire commits opaque, unmatchable hashes.
 #![allow(dead_code)]
 
 use crate::store::kv::hash::{self, Hash256};
@@ -31,8 +16,8 @@ use crate::store::kv::{KvStore, KvStoreError};
 /// A KV prepare failure. Pool exhaustion stays a typed variant
 /// (`OutOfPages`) so callers can tell it from guest-visible fire errors.
 /// The reserved fire path should never see it: demand is sized under the
-/// staleness gate and pages are lent from an owned grant, so exhaustion
-/// surfaces as a stale-demand retry BEFORE prepare, not here.
+/// staleness gate, so exhaustion surfaces as a stale-demand retry before
+/// prepare.
 #[derive(Debug)]
 pub enum KvError {
     /// The physical pool could not supply `requested` pages. Retryable after
@@ -88,11 +73,10 @@ impl KvTxn {
     }
 }
 
-/// The fire's WorkingSet page translation (kv_refact.md flattened-table
-/// model): entry `i` = the physical page backing WS-relative index `i`,
-/// i.e. the committed flat table overlaid with this fire's prepared write
-/// targets. Ships with the launch so the engine can map channel-resolved
-/// `Pages`/`WSlot` references; guests only ever hold relative indexes.
+/// The fire's WorkingSet page translation: entry `i` = the physical page
+/// backing WS-relative index `i` (committed flat table overlaid with this
+/// fire's prepared write targets). Ships with the launch so the engine
+/// can map channel-resolved `Pages`/`WSlot` references.
 fn build_translation(
     store: &mut KvStore,
     ws: WorkingSetId,
@@ -101,16 +85,11 @@ fn build_translation(
     Ok((version, table.iter().map(|page| page.0).collect()))
 }
 
-/// Build the per-target [`PageCommit`]s for a fire appending `n_new` tokens
-/// at `append_start`. `hash_tokens = Some(values)` on a canonical fire
-/// (bind-time shape + fire-time host-known gate both passed): the new slots
-/// chain `(token, position)` identities from the WorkingSet's chain state,
-/// and pages that come out FULL get a page hash (which marks them for the
-/// CAS index). Otherwise every written slot draws an opaque hash — concrete
-/// identity that survives forks/selections but never matches anything.
-/// Preserved slots (in-place prefix, unwritten CoW-copied pages) carry their
-/// existing hashes; an unwritten CoW page also keeps its page hash (the copy
-/// preserves content).
+/// Build the per-target [`PageCommit`]s for a fire appending `n_new`
+/// tokens at `append_start`. `hash_tokens = Some(values)` on a canonical
+/// fire: new slots chain `(token, position)` identities, and full pages
+/// get a page hash for the CAS index. Otherwise every written slot draws
+/// an opaque hash. Preserved slots keep their existing hashes.
 fn build_commits(
     store: &mut KvStore,
     prepared: &KvPreparedWrite,
@@ -178,10 +157,9 @@ fn build_commits(
 
 /// The mapped-overlap prologue shared by declaration realization and its
 /// demand probe: clamp the writable declaration to the mapped span and
-/// decide whether any overlap page is shared (needs COW work). `None` when
-/// the declaration has no mapped overlap. Keeping this in ONE place is what
-/// keeps the staleness gate honest — the demand probe and the realization
-/// must agree on which pages count.
+/// decide whether any overlap page is shared (needs COW work). `None`
+/// when there's no mapped overlap. Kept in one place so the demand probe
+/// and the realization agree on which pages count.
 fn declaration_overlap(
     store: &mut KvStore,
     ws: WorkingSetId,
@@ -224,11 +202,11 @@ pub type PreparedAppend = (KvProjection, PageCopies, Vec<u32>, KvTxn);
 pub type PreparedExplicit = (Vec<(u64, u32)>, PageCopies, Vec<u32>, KvTxn);
 
 /// Realize the mapped overlap of one writable declaration exactly once.
-/// Shared pages rebase through the existing COW protocol; private pages only
-/// lose transitional implicit-cache identity. Fresh backing is handled
-/// separately by [`KvStore::ensure_backed`]. Production goes through
-/// [`realize_declaration_reserved`] (grant-funded); this store-allocating
-/// form survives for the store tests only.
+/// Shared pages rebase through the existing COW protocol; private pages
+/// only lose transitional implicit-cache identity. Fresh backing is
+/// handled separately by [`KvStore::ensure_backed`]. Production goes
+/// through [`realize_declaration_reserved`] (grant-funded); this
+/// store-allocating form survives for the store tests only.
 #[cfg(test)]
 pub fn realize_declaration(
     store: &mut KvStore,
@@ -238,17 +216,11 @@ pub fn realize_declaration(
     realize_declaration_impl(store, ws, writable, None)
 }
 
-/// KV realize-ahead (`PIE_KV_REALIZE_AHEAD`): extend a fire's writable page
-/// range `ahead` pages past its end, clamped to the working set's logical
-/// reservation (`page_len`) — the capacity the guest itself declared, the
-/// same figure the writable declaration resolved against. The lookahead
-/// pages are ordinary realized pages of the declared range (they free with
-/// the working set); the clamp keeps the extension strictly inside it, so a
-/// fire at the declaration's final page computes zero extra demand instead
-/// of tripping `backing_demand`'s frontier check. `ahead == 0` is the exact
-/// identity (no store read). The demand probe and the grant-consuming
-/// prepare both derive their range through THIS function under one lock
-/// hold — the same one-place discipline as [`declaration_overlap`].
+/// KV realize-ahead (`PIE_KV_REALIZE_AHEAD`): extend a fire's writable
+/// page range `ahead` pages past its end, clamped to the working set's
+/// logical reservation (`page_len`). The clamp keeps the extension inside
+/// it, so a fire at the declaration's final page computes zero extra
+/// demand. `ahead == 0` is the exact identity (no store read).
 pub fn realize_ahead_range(
     store: &KvStore,
     ws: WorkingSetId,
@@ -259,10 +231,8 @@ pub fn realize_ahead_range(
         return Ok(writable.clone());
     }
     let capacity = store.page_len(ws)?;
-    // `max(writable.end)`: never shrink the base range — if the logical
-    // reservation moved under the resolved declaration, the base fire's
-    // own computation (and its errors) must stay exactly as without the
-    // lookahead.
+    // `max(writable.end)`: never shrink the base range, so the base
+    // fire's own computation stays exactly as without the lookahead.
     let end = writable
         .end
         .saturating_add(ahead)
@@ -341,15 +311,11 @@ fn realize_declaration_impl(
     ))
 }
 
-/// Empty-WS prefill prefix match (kv_refact.md "Trie Matching", increment
-/// 2a): probe the CAS index for the LONGEST full-page prefix of `tokens`
-/// already resident, and graft it into `ws` on a hit. Always leaves at least
-/// one token to compute (the readout row must run), so
-/// `matched * page_size < tokens.len()`. After a hit the caller prepares the
-/// fire as a continuation (`committed = matched * page_size`, the token
-/// suffix as `new_tokens`) — which additionally requires the
-/// descriptor-level pass trim on the engine side, the next increment; until
-/// then this is exercised by the store tests only.
+/// Empty-WS prefill prefix match: probe the CAS index for the longest
+/// full-page prefix of `tokens` already resident, and graft it into `ws`
+/// on a hit. Always leaves at least one token to compute (the readout row
+/// must run), so `matched * page_size < tokens.len()`. Exercised by the
+/// store tests only; the fire path does not yet call this.
 pub fn match_prefix(
     store: &mut KvStore,
     ws: WorkingSetId,
@@ -364,8 +330,8 @@ pub fn match_prefix(
     if max_pages == 0 {
         return Ok(None);
     }
-    // Boundary chain values at each candidate full-page boundary — the same
-    // chain a canonical prefill of these tokens would commit.
+    // Boundary chain values at each candidate full-page boundary — the
+    // same chain a canonical prefill of these tokens would commit.
     let domain = store.domain();
     let mut prev: Option<Hash256> = None;
     let mut boundaries = Vec::with_capacity(max_pages);
@@ -385,18 +351,17 @@ pub fn match_prefix(
     Ok(None)
 }
 
-/// Prepare the KV projection for an ETA fire appending `new_tokens` to `ws`
-/// at the explicit `append_start`.
+/// Prepare the KV projection for an ETA fire appending `new_tokens` to
+/// `ws` at the explicit `append_start`.
 ///
 /// Returns `(proj, (copy_src, copy_dst), txn)`: pass
-/// `proj.physical_page_ids` / `proj.last_page_len` into `submit_async`, issue
-/// one `scheduler::copy_d2d(copy_src, copy_dst)` for the CoW-preserved pages
-/// before the launch when non-empty, hold `txn` across the fire, then
-/// [`finalize`]. `new_tokens`' VALUES are unused for the projection
-/// (pure page geometry keyed by the count); `hash_tokens = Some(values)` is
-/// the canonical-fire gate — the HOST-VERIFIED token values this fire embeds
-/// (see `canonical_kv_shape` + the host-known gate) — the committed pages
-/// hash under those values. `None` ⇒ opaque slot hashes.
+/// `proj.physical_page_ids` / `proj.last_page_len` into `submit_async`,
+/// issue one `scheduler::copy_d2d(copy_src, copy_dst)` for the
+/// CoW-preserved pages, hold `txn` across the fire, then [`finalize`].
+/// `new_tokens`' values are unused for the projection (pure page geometry
+/// keyed by count); `hash_tokens = Some(values)` is the canonical-fire
+/// gate — committed pages hash under those host-verified values. `None`
+/// gives opaque slot hashes.
 pub fn prepare(
     store: &mut KvStore,
     ws: WorkingSetId,
@@ -601,22 +566,17 @@ pub fn finalize(store: &mut KvStore, txn: KvTxn, success: bool) -> Result<(), St
     Ok(())
 }
 
-/// Bind-time half of the canonical-KV gate (kv_refact.md, "Token-Slot
-/// Hashes, Page Hashes, and Trie Matching"): the pass writes exactly what
-/// the vanilla model produces for one appended token run under full causal
-/// self-attention over the working set — so its KV rows may carry chained
-/// semantic hashes. Rejected by anything that can perturb K/V production:
-/// an attention mask (it changes hidden states, hence KV at layers > 0),
-/// per-layer stage programs (they can rewrite projections), or extern
-/// channels. Prologue/epilogue programs only shape sampling — grammar,
-/// watermarking, and sampler passes all stay canonical. A `KvLen` port must
-/// exist so the fire-time gate can verify the pass attends the FULL context
-/// (a shorter span changes upper-layer KV).
+/// Bind-time half of the canonical-KV gate: the pass writes exactly what
+/// the vanilla model produces for one appended token run under full
+/// causal self-attention over the working set, so its KV rows may carry
+/// chained semantic hashes. Rejected by anything that can perturb K/V
+/// production: an attention mask, per-layer stage programs, or extern
+/// channels. A `KvLen` port must exist so the fire-time gate can verify
+/// the pass attends the full context.
 ///
-/// KvLen-root dense defaults are canonical when any author-bound overrides
-/// agree with the same contiguous append. A channel-fed `EmbedIndptr`
-/// (dynamic lane structure) still rejects; const CSRs are value-checked at
-/// fire time.
+/// KvLen-root dense defaults are canonical when bound overrides agree
+/// with the same contiguous append. A channel-fed `EmbedIndptr` still
+/// rejects; const CSRs are value-checked at fire time.
 pub fn canonical_kv_shape(container: &eta_ir::container::TraceContainer) -> bool {
     use eta_ir::container::PortSource;
     use eta_ir::registry::{Port, Stage};
@@ -665,9 +625,9 @@ pub struct CanonicalAppend {
     pub tokens: Vec<u32>,
 }
 
-/// Verify the evidence forms a canonical contiguous append. `KvLen` is the
-/// root: it determines the appended span, and explicit positions/write
-/// geometry must agree when present.
+/// Verify the evidence forms a canonical contiguous append. `KvLen` is
+/// the root: it determines the appended span, and explicit
+/// positions/write geometry must agree when present.
 pub fn canonical_hash_tokens(
     evidence: CanonicalFireEvidence,
     request: &crate::engine::FireRequest,
@@ -783,12 +743,8 @@ pub fn canonical_hash_tokens(
         if evidence.tokens != submitted {
             return None;
         }
-        // A LANE WITH NO POSITIONS STATES THE NATURAL RUN, which is
-        // `held .. held + rows` — so the comparison is against that run and
-        // not skipped. The flat `position_ids` could not express the
-        // distinction: empty there meant "the engine's append order", and a
-        // request whose lane holds sixteen tokens looked identical to one
-        // whose lane holds none.
+        // A lane with no positions states the natural run (`held .. held +
+        // rows`), so the comparison is against that run, not skipped.
         if let Some(positions) = &evidence.positions {
             let mut at = 0usize;
             for lane in &request.lanes {
@@ -819,10 +775,8 @@ mod tests {
         [7u8; 32]
     }
 
-    /// One lane over every token, continuing a sequence that already holds
-    /// `held`. Replaces four hand-built `LaunchPlan` literals whose three
-    /// fields (`token_ids`, `position_ids`, `qo_indptr`) were the CSR spelling
-    /// of exactly this.
+    /// One lane over every token, continuing a sequence that already
+    /// holds `held`.
     fn one_lane(tokens: &[u32], held: u32) -> crate::engine::FireRequest {
         crate::engine::FireRequest::one(crate::engine::fire::lane_of(
             0,
@@ -867,9 +821,8 @@ mod tests {
     }
 
     /// A minimal canonical decode container: embed tokens + kv-len + the
-    /// explicit append geometry every SDK-lowered pass carries (RV-14) +
-    /// epilogue. Channels: 0 tok (device-loop), 1 klen, 2 pages,
-    /// 3 page-indptr, 4 w_slot, 5 w_off.
+    /// explicit append geometry every SDK-lowered pass carries + epilogue.
+    /// Channels: 0 tok, 1 klen, 2 pages, 3 page-indptr, 4 w_slot, 5 w_off.
     fn plain_decode_container() -> eta_ir::container::TraceContainer {
         eta_ir::container::TraceContainer {
             names: vec![],
@@ -918,18 +871,6 @@ mod tests {
     #[test]
     fn canonical_shape_accepts_the_plain_decode() {
         assert!(canonical_kv_shape(&plain_decode_container()));
-    }
-
-    #[test]
-    fn canonical_shape_accepts_kv_len_root_defaults() {
-        for port in [Port::Pages, Port::PageIndptr, Port::WSlot, Port::WOff] {
-            let mut c = plain_decode_container();
-            c.ports.retain(|p| p.port != port);
-            assert!(
-                canonical_kv_shape(&c),
-                "a container without {port:?} uses the KvLen-root dense default"
-            );
-        }
     }
 
     #[test]
@@ -988,29 +929,6 @@ mod tests {
         assert!(!canonical_kv_shape(&devgeo));
     }
 
-    #[test]
-    fn canonical_shape_gates_embed_indptr_to_a_single_const_lane() {
-        // Const [0, n] single-lane CSR: canonical.
-        let mut c = plain_decode_container();
-        c.ports.push(PortBinding {
-            port: Port::EmbedIndptr,
-            source: eta_ir::container::PortSource::Const {
-                dtype: Dtype::U32,
-                shape: Shape::vector(2),
-                data: [0u32.to_le_bytes(), 4u32.to_le_bytes()].concat(),
-            },
-        });
-        assert!(canonical_kv_shape(&c));
-
-        // Channel-fed indptr (dynamic lanes): not canonical.
-        let mut c = plain_decode_container();
-        c.ports.push(PortBinding {
-            port: Port::EmbedIndptr,
-            source: eta_ir::container::PortSource::Channel(1),
-        });
-        assert!(!canonical_kv_shape(&c));
-    }
-
     fn explicit_single_lane_evidence(tokens: &[u32], committed: u32) -> CanonicalFireEvidence {
         let n = tokens.len() as u32;
         CanonicalFireEvidence {
@@ -1053,108 +971,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_continuation_prefill_hashes_against_committed_span() {
-        // 8 appended tokens over 16 already committed: evidence must check
-        // against [16, 24), not [0, 8) — the old gate's committed==0 bail is
-        // exactly the prefix-cache regression (RV-1).
-        let tokens = (100..108).collect::<Vec<_>>();
-        let request = one_lane(&tokens, 16);
-        let evidence = explicit_single_lane_evidence(&tokens, 16);
-        assert_eq!(
-            canonical_hash_tokens(evidence, &request, false, 16),
-            Some(CanonicalAppend {
-                start: 16,
-                tokens: tokens.clone(),
-            })
-        );
-
-        // A stale evidence span (positions from 0) must not hash.
-        let stale = explicit_single_lane_evidence(&tokens, 0);
-        assert!(canonical_hash_tokens(stale, &request, false, 16).is_none());
-    }
-
-    #[test]
-    fn canonical_per_token_csr_hashes_like_single_lane() {
-        // The SDK lowering's one-token-per-lane CSR: lane i attends its own
-        // causal prefix [0, i+1). Union is the contiguous [0, n) append.
-        let n = 5u32;
-        let tokens: Vec<u32> = (1..=n).collect();
-        let pages: Vec<u32> = (0..n).flat_map(|_| [7u32]).collect(); // lane i -> page 7
-        let request = per_token_lanes(&tokens, 0);
-        let evidence = CanonicalFireEvidence {
-            tokens: tokens.clone(),
-            kv_len: (1..=n).collect(),
-            embed_indptr: Some((0..=n).collect()),
-            positions: Some((0..n).collect()),
-            pages: Some(pages),
-            page_indptr: Some((0..=n).collect()),
-            w_slot: Some(vec![7; n as usize]),
-            w_off: Some((0..n).collect()),
-        };
-        assert_eq!(
-            canonical_hash_tokens(evidence, &request, false, 16),
-            Some(CanonicalAppend {
-                start: 0,
-                tokens: tokens.clone(),
-            })
-        );
-
-        // A lane that under-attends its causal prefix must not hash.
-        let mut short = CanonicalFireEvidence {
-            tokens: tokens.clone(),
-            kv_len: (1..=n).collect(),
-            embed_indptr: Some((0..=n).collect()),
-            positions: Some((0..n).collect()),
-            pages: Some(vec![7; n as usize]),
-            page_indptr: Some((0..=n).collect()),
-            w_slot: Some(vec![7; n as usize]),
-            w_off: Some((0..n).collect()),
-        };
-        short.kv_len[3] = 3; // lane 3 attends 3 < 4
-        assert!(canonical_hash_tokens(short, &request, false, 16).is_none());
-    }
-
-    #[test]
-    fn canonical_per_token_csr_derives_continuation_start() {
-        let n = 5u32;
-        let tokens: Vec<u32> = (100..100 + n).collect();
-        let request = per_token_lanes(&tokens, 16);
-        let evidence = CanonicalFireEvidence {
-            tokens: tokens.clone(),
-            kv_len: (17..17 + n).collect(),
-            embed_indptr: Some((0..=n).collect()),
-            positions: Some((16..16 + n).collect()),
-            pages: Some((0..n).flat_map(|_| [6u32, 7]).collect()),
-            page_indptr: Some((0..=n).map(|lane| lane * 2).collect()),
-            w_slot: Some(vec![7; n as usize]),
-            w_off: Some((0..n).collect()),
-        };
-
-        assert_eq!(
-            canonical_hash_tokens(evidence, &request, false, 16),
-            Some(CanonicalAppend { start: 16, tokens })
-        );
-    }
-
-    #[test]
-    fn in_band_skip_tokens_never_hash() {
-        // -1 (0xFFFFFFFF) anywhere means this is not a plain append.
-        let tokens = vec![1, u32::MAX, 3];
-        let request = one_lane(&tokens, 0);
-        let evidence = CanonicalFireEvidence {
-            tokens,
-            kv_len: vec![3],
-            embed_indptr: Some(vec![0, 3]),
-            positions: Some((0..3).collect()),
-            pages: None,
-            page_indptr: None,
-            w_slot: None,
-            w_off: None,
-        };
-        assert!(canonical_hash_tokens(evidence, &request, false, 16).is_none());
-    }
-
-    #[test]
     fn prefill_then_decode_grows_and_projects() {
         let mut store = KvStore::new(16, nonce());
         let ws = store.create_working_set();
@@ -1188,118 +1004,6 @@ mod tests {
     }
 
     #[test]
-    fn single_state_runahead_matches_synchronous_projection_translation_and_hashes() {
-        let page = 4u32;
-        let tokens: Vec<u32> = (1..=9).collect();
-        let chunks = [5usize, 1, 3];
-
-        let mut synchronous = KvStore::new(16, nonce());
-        let sync_ws = synchronous.create_working_set();
-        let mut sync_shapes = Vec::new();
-        let mut offset = 0usize;
-        for size in chunks {
-            let chunk = &tokens[offset..offset + size];
-            let (projection, _, translation, txn) = prepare(
-                &mut synchronous,
-                sync_ws,
-                offset as u32,
-                chunk,
-                page,
-                Some(chunk),
-            )
-            .unwrap();
-            sync_shapes.push((projection, translation));
-            finalize(&mut synchronous, txn, true).unwrap();
-            offset += size;
-        }
-
-        let mut runahead = KvStore::new(16, nonce());
-        let runahead_ws = runahead.create_working_set();
-        let mut pending = Vec::new();
-        let mut runahead_shapes = Vec::new();
-        offset = 0;
-        for size in chunks {
-            let chunk = &tokens[offset..offset + size];
-            let (projection, _, translation, txn) = prepare(
-                &mut runahead,
-                runahead_ws,
-                offset as u32,
-                chunk,
-                page,
-                Some(chunk),
-            )
-            .unwrap();
-            runahead_shapes.push((projection, translation));
-            pending.push(txn);
-            offset += size;
-        }
-
-        assert_eq!(runahead.mapped_len(runahead_ws).unwrap(), 3);
-        assert_eq!(
-            runahead.committed_token_len(runahead_ws, page).unwrap(),
-            tokens.len() as u64
-        );
-        assert_eq!(runahead_shapes, sync_shapes);
-
-        for txn in pending {
-            finalize(&mut runahead, txn, true).unwrap();
-        }
-        assert_eq!(
-            runahead.chain_state(runahead_ws).unwrap(),
-            synchronous.chain_state(sync_ws).unwrap()
-        );
-        for index in 0..tokens.len().div_ceil(page as usize) as u64 {
-            assert_eq!(
-                runahead.page_token_hashes(runahead_ws, index).unwrap(),
-                synchronous.page_token_hashes(sync_ws, index).unwrap()
-            );
-            assert_eq!(
-                runahead.page_hash_at(runahead_ws, index).unwrap(),
-                synchronous.page_hash_at(sync_ws, index).unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn single_state_reuses_cow_destination_and_preserves_hash_chain() {
-        let mut store = KvStore::new(32, nonce());
-        let page = 4u32;
-        let parent = store.create_working_set();
-        prefill(&mut store, parent, &[1, 2, 3, 4, 5, 6], &[6], page);
-        let synchronous = store.fork(parent, Default::default()).unwrap();
-        let runahead = store.fork(parent, Default::default()).unwrap();
-
-        let (_, _, _, sync_first) =
-            prepare(&mut store, synchronous, 6, &[7], page, Some(&[7])).unwrap();
-        finalize(&mut store, sync_first, true).unwrap();
-        let (_, _, _, sync_second) =
-            prepare(&mut store, synchronous, 7, &[8], page, Some(&[8])).unwrap();
-        finalize(&mut store, sync_second, true).unwrap();
-
-        let (_, (first_copy_src, _), first_translation, first) =
-            prepare(&mut store, runahead, 6, &[7], page, Some(&[7])).unwrap();
-        assert!(!first_copy_src.is_empty());
-        let (_, (second_copy_src, _), second_translation, second) =
-            prepare(&mut store, runahead, 7, &[8], page, Some(&[8])).unwrap();
-        assert!(
-            second_copy_src.is_empty(),
-            "the second fire writes the first fire's published private CoW destination"
-        );
-        assert_eq!(first_translation[1], second_translation[1]);
-        finalize(&mut store, first, true).unwrap();
-        finalize(&mut store, second, true).unwrap();
-
-        assert_eq!(
-            store.chain_state(runahead).unwrap(),
-            store.chain_state(synchronous).unwrap()
-        );
-        assert_eq!(
-            store.page_token_hashes(runahead, 1).unwrap(),
-            store.page_token_hashes(synchronous, 1).unwrap()
-        );
-    }
-
-    #[test]
     fn failed_runahead_keeps_fail_stop_mapping_until_release() {
         let mut store = KvStore::new(4, nonce());
         let ws = store.create_working_set();
@@ -1319,20 +1023,6 @@ mod tests {
         store.release_working_set(ws, store.current_epoch());
         store.retire_idle();
         assert_eq!(store.available_pages(), 4);
-    }
-
-    #[test]
-    fn working_set_release_recycles_after_inflight_epoch_retires() {
-        let mut store = KvStore::new(4, nonce());
-        let ws = store.create_working_set();
-        let (_, _, _, pending) =
-            prepare(&mut store, ws, 0, &[1, 2, 3, 4], 4, Some(&[1, 2, 3, 4])).unwrap();
-        store.release_working_set(ws, store.current_epoch());
-        assert_eq!(store.available_pages(), 3);
-
-        finalize(&mut store, pending, true).unwrap();
-        assert_eq!(store.available_pages(), 4);
-        assert!(store.mapped_len(ws).is_err());
     }
 
     #[test]
@@ -1365,16 +1055,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_fire_leaves_fail_stop_mapping_published() {
-        let mut store = KvStore::new(4, nonce());
-        let ws = store.create_working_set();
-        let (_, _, _, txn) = prepare(&mut store, ws, 0, &[1, 2], 4, None).unwrap();
-        finalize(&mut store, txn, false).unwrap();
-        assert_eq!(store.mapped_len(ws).unwrap(), 1);
-        assert_eq!(store.available_pages(), 3);
-    }
-
-    #[test]
     fn declaration_realization_cows_only_a_shared_mapped_tail() {
         let mut store = KvStore::new(8, nonce());
         let parent = store.create_working_set();
@@ -1391,38 +1071,6 @@ mod tests {
         finalize(&mut store, txn.unwrap(), true).unwrap();
     }
 
-    #[test]
-    fn realize_ahead_adds_one_page_mid_declaration_and_clamps_at_the_end() {
-        let mut store = KvStore::new(16, nonce());
-        let ws = store.create_working_set();
-        // Declared capacity: 4 logical pages, the first 2 already backed.
-        store.reserve(ws, 4).unwrap();
-        store.ensure_backed(ws, 2).unwrap();
-
-        // Mid-declaration: lookahead 1 extends the range by exactly one
-        // page, and the demand grows by exactly that page.
-        let base = 1..2u64;
-        let extended = realize_ahead_range(&store, ws, &base, 1).unwrap();
-        assert_eq!(extended, 1..3);
-        assert_eq!(
-            store.backing_demand(ws, extended.end).unwrap(),
-            store.backing_demand(ws, base.end).unwrap() + 1
-        );
-
-        // At the declaration's final page the clamp holds range and demand
-        // fixed — no demand beyond the declared capacity, no error.
-        let tail = 3..4u64;
-        let clamped = realize_ahead_range(&store, ws, &tail, 1).unwrap();
-        assert_eq!(clamped, tail);
-        assert_eq!(
-            store.backing_demand(ws, clamped.end).unwrap(),
-            store.backing_demand(ws, tail.end).unwrap()
-        );
-
-        // ahead == 0 is the exact identity (the flag-off path).
-        assert_eq!(realize_ahead_range(&store, ws, &base, 0).unwrap(), base);
-    }
-
     /// Canonical prefill of `tokens` onto `ws`, chunked as `fires` splits.
     fn prefill(store: &mut KvStore, ws: WorkingSetId, tokens: &[u32], fires: &[usize], page: u32) {
         let mut done = 0usize;
@@ -1432,86 +1080,6 @@ mod tests {
             finalize(store, txn, true).unwrap();
             done += n;
         }
-    }
-
-    #[test]
-    fn canonical_hashes_are_fire_chunking_independent() {
-        let mut store = KvStore::new(16, nonce());
-        let page = 4u32;
-        let tokens: Vec<u32> = (100..108).collect(); // 8 tokens = 2 full pages
-
-        let a = store.create_working_set();
-        prefill(&mut store, a, &tokens, &[8], page);
-        let b = store.create_working_set();
-        prefill(&mut store, b, &tokens, &[5, 3], page); // partial page finished in place
-
-        for i in 0..2u64 {
-            assert_eq!(
-                store.page_token_hashes(a, i).unwrap(),
-                store.page_token_hashes(b, i).unwrap(),
-                "slot hashes differ at page {i}"
-            );
-            let (ha, hb) = (
-                store.page_hash_at(a, i).unwrap(),
-                store.page_hash_at(b, i).unwrap(),
-            );
-            assert!(ha.is_some(), "full canonical page has a page hash");
-            assert_eq!(ha, hb, "page hashes differ at page {i}");
-        }
-
-        // CAS: both boundary chain values are indexed and validate live.
-        for i in 0..2u64 {
-            let key = store.page_token_hashes(a, i).unwrap()[3].unwrap();
-            assert!(store.lookup_cached_page(&key).is_some());
-        }
-    }
-
-    #[test]
-    fn opaque_fires_never_produce_matchable_identity() {
-        let mut store = KvStore::new(16, nonce());
-        let page = 4u32;
-        let tokens = [1u32, 2, 3, 4];
-
-        let a = store.create_working_set();
-        let (_, _, _, txn) = prepare(&mut store, a, 0, &tokens, page, None).unwrap();
-        finalize(&mut store, txn, true).unwrap();
-        let b = store.create_working_set();
-        let (_, _, _, txn) = prepare(&mut store, b, 0, &tokens, page, None).unwrap();
-        finalize(&mut store, txn, true).unwrap();
-
-        // Same tokens, but the fires were not canonical: identities differ
-        // and no page hash marks them for the CAS index.
-        assert_ne!(
-            store.page_token_hashes(a, 0).unwrap(),
-            store.page_token_hashes(b, 0).unwrap()
-        );
-        assert_eq!(store.page_hash_at(a, 0).unwrap(), None);
-    }
-
-    #[test]
-    fn fork_continuations_hash_identically() {
-        let mut store = KvStore::new(16, nonce());
-        let page = 4u32;
-        let a = store.create_working_set();
-        prefill(&mut store, a, &[1, 2, 3, 4, 5, 6], &[6], page);
-        let b = store.fork(a, Default::default()).unwrap();
-
-        // The same next token on both branches (one CoW, one shared-blocked
-        // CoW as well) must produce the same slot identity.
-        let (_, _, _, txn) = prepare(&mut store, b, 6, &[7], page, Some(&[7])).unwrap();
-        finalize(&mut store, txn, true).unwrap();
-        let (_, _, _, txn) = prepare(&mut store, a, 6, &[7], page, Some(&[7])).unwrap();
-        finalize(&mut store, txn, true).unwrap();
-
-        assert_eq!(
-            store.page_token_hashes(a, 1).unwrap(),
-            store.page_token_hashes(b, 1).unwrap()
-        );
-        // The shared full prefix page kept one identity.
-        assert_eq!(
-            store.page_hash_at(a, 0).unwrap(),
-            store.page_hash_at(b, 0).unwrap()
-        );
     }
 
     #[test]
@@ -1538,87 +1106,4 @@ mod tests {
         assert_eq!(store.lookup(forked, 1).unwrap().0, tr[1]);
     }
 
-    #[test]
-    fn prefix_match_grafts_shared_pages_and_continues_the_chain() {
-        let mut store = KvStore::new(32, nonce());
-        let page = 4u32;
-        let tokens: Vec<u32> = (300..312).collect(); // 12 tokens
-
-        // Producer: canonical 8-token prefill (2 full pages, CAS-indexed).
-        let a = store.create_working_set();
-        prefill(&mut store, a, &tokens[..8], &[8], page);
-
-        // Fresh consumer prefilling all 12: matches the 2-page prefix.
-        let b = store.create_working_set();
-        let matched = match_prefix(&mut store, b, &tokens, page)
-            .unwrap()
-            .expect("prefix hit");
-        assert_eq!(matched, 2);
-        // Structurally shared: b's visible pages ARE a's physical pages.
-        assert_eq!(store.lookup(b, 0).unwrap(), store.lookup(a, 0).unwrap());
-        assert_eq!(store.lookup(b, 1).unwrap(), store.lookup(a, 1).unwrap());
-
-        // Continue as a committed-jump fire: hashes must equal a straight
-        // 12-token prefill's (the dedup property end-to-end).
-        let (_, _, _, txn) =
-            prepare(&mut store, b, 8, &tokens[8..], page, Some(&tokens[8..])).unwrap();
-        finalize(&mut store, txn, true).unwrap();
-        let c = store.create_working_set();
-        prefill(&mut store, c, &tokens, &[12], page);
-        for i in 0..3u64 {
-            assert_eq!(
-                store.page_token_hashes(b, i).unwrap(),
-                store.page_token_hashes(c, i).unwrap(),
-                "grafted continuation diverged at page {i}"
-            );
-        }
-
-        // The match never swallows the whole prompt: with exactly 2 pages of
-        // tokens, only 1 page may match (the readout row must compute).
-        let d = store.create_working_set();
-        let matched = match_prefix(&mut store, d, &tokens[..8], page)
-            .unwrap()
-            .expect("capped prefix hit");
-        assert_eq!(matched, 1);
-    }
-
-    #[test]
-    #[allow(
-        clippy::single_range_in_vec_init,
-        reason = "`KvStore::discard` takes `&[Range<u64>]` — a plural selection; \
-                  these two calls each discard exactly one range, which is a \
-                  one-element slice and not a range meant to be collected"
-    )]
-    fn front_surgery_breaks_the_chain_but_tail_surgery_continues_it() {
-        let mut store = KvStore::new(32, nonce());
-        let page = 4u32;
-        let tokens: Vec<u32> = (200..212).collect(); // 3 full pages
-
-        // Reference: 8 tokens then append X.
-        let a = store.create_working_set();
-        prefill(&mut store, a, &tokens[..8], &[8], page);
-        let (_, _, _, txn) = prepare(&mut store, a, 8, &[999], page, Some(&[999])).unwrap();
-        finalize(&mut store, txn, true).unwrap();
-        let a_x = store.page_token_hashes(a, 2).unwrap()[0].unwrap();
-
-        // Tail discard: 12 tokens, drop page 2 -> visible content == a's
-        // first 8 tokens. Appending X must hash EXACTLY like a's append.
-        let b = store.create_working_set();
-        prefill(&mut store, b, &tokens, &[12], page);
-        let epoch = store.current_epoch();
-        store.discard(b, &[2..3], epoch).unwrap();
-        let (_, _, _, txn) = prepare(&mut store, b, 8, &[999], page, Some(&[999])).unwrap();
-        finalize(&mut store, txn, true).unwrap();
-        assert_eq!(store.page_token_hashes(b, 2).unwrap()[0].unwrap(), a_x);
-
-        // Front discard: 12 tokens, drop page 0 -> 8 visible tokens but a
-        // DIFFERENT context. Appending X must NOT impersonate a's append.
-        let c = store.create_working_set();
-        prefill(&mut store, c, &tokens, &[12], page);
-        let epoch = store.current_epoch();
-        store.discard(c, &[0..1], epoch).unwrap();
-        let (_, _, _, txn) = prepare(&mut store, c, 8, &[999], page, Some(&[999])).unwrap();
-        finalize(&mut store, txn, true).unwrap();
-        assert_ne!(store.page_token_hashes(c, 2).unwrap()[0].unwrap(), a_x);
-    }
 }

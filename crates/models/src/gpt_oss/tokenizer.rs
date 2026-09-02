@@ -1,5 +1,4 @@
-//! What gpt-oss rows read from their vocabulary — Harmony's stop list,
-//! cited from where it lives.
+//! gpt-oss tokenizer contract (stop tokens from Harmony).
 
 use ::tokenizer::contract::Contract;
 

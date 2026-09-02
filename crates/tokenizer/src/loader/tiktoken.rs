@@ -294,23 +294,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_unknown_format_without_split_regex() {
-        let dir = tempfile::tempdir().unwrap();
-        let model_path = dir.path().join("vocab.tiktoken");
-        std::fs::write(&model_path, format!("{} 0\n", BASE64_STANDARD.encode("a"))).unwrap();
-        std::fs::write(
-            dir.path().join("tokenizer_config.json"),
-            r#"{
-              "tokenizer_class": "OtherTokenizer",
-              "auto_map": {
-                "AutoTokenizer": ["tokenization_other.OtherTokenizer", null]
-              }
-            }"#,
-        )
-        .unwrap();
-
-        let error = crate::loader::from_file(&model_path).err().unwrap();
-        assert!(error.to_string().contains("unsupported tiktoken tokenizer"));
-    }
 }

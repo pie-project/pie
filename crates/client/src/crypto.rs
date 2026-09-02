@@ -25,21 +25,14 @@ pub struct ParsedPrivateKey {
 }
 
 impl ParsedPrivateKey {
-    /// Parse a private key from PEM or SSH format string.
-    ///
-    /// Supports:
-    /// - OpenSSH format for RSA, ED25519, and ECDSA keys
-    /// - PKCS#8 PEM format for RSA, ED25519, and ECDSA keys
-    /// - PKCS#1 PEM format for RSA keys
-    /// - ECDSA curves supported: P-256 (nistp256), P-384 (nistp384)
-    /// - RSA keys must be at least 2048 bits (minimum enforced for security)
+    /// Parse a private key from PEM or SSH format: OpenSSH or PKCS#8 for
+    /// RSA/ED25519/ECDSA (P-256, P-384), or PKCS#1 for RSA. RSA keys must be
+    /// at least 2048 bits.
     pub fn parse(key_content: &str) -> Result<Self> {
-        // Try parsing as OpenSSH format first (most common)
         if let Ok(ssh_key) = SshPrivateKey::from_openssh(key_content) {
             return Self::from_ssh_key(ssh_key);
         }
 
-        // Try parsing as PEM format (PKCS#8 or PKCS#1)
         if key_content.contains("-----BEGIN") {
             return Self::from_pem(key_content);
         }
@@ -262,16 +255,12 @@ impl ParsedPrivateKey {
         Ok(())
     }
 
-    /// Sign data with the private key.
-    ///
-    /// For RSA keys: Uses PKCS#1 v1.5 signature scheme with SHA-256.
-    /// For ED25519 keys: Uses Ed25519 signature scheme.
-    /// For ECDSA keys: Uses ECDSA with SHA-256 (P-256) or SHA-384 (P-384).
+    /// Sign data: RSA uses PKCS#1 v1.5 with SHA-256, ED25519 its own scheme,
+    /// ECDSA SHA-256 (P-256) or SHA-384 (P-384).
     pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
         match &self.key_pair {
             KeyPair::Rsa(rsa_key_pair) => {
-                // The random number generator is required by the function signature.
-                // It is not used for our deterministic signing.
+                // Required by the function signature; unused for deterministic signing.
                 let rng = ring::rand::SystemRandom::new();
 
                 let mut signature = vec![0u8; rsa_key_pair.public().modulus_len()];

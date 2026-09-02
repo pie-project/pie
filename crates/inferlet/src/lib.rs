@@ -1,18 +1,12 @@
-//! Inferlet SDK for Pie
-//!
-//! This crate provides the core types and traits for building inferlets
-//! that run on the Pie inference engine.
+//! Inferlet SDK for Pie: core types and traits for building inferlets that
+//! run on the Pie inference engine.
 
 /// Result type for inferlet operations (compatible with WIT bindings).
 pub type Result<T> = std::result::Result<T, String>;
 
-/// Add context to a failure on its way up.
-///
-/// `pie:inferlet` declares `type error = string`, so every fallible call
-/// across the ABI already fails with a message and there is no error type to
-/// introduce. What is missing is the standard way of saying WHERE the message
-/// came from, which is why the inferlets were writing
-/// `map_err(|e| format!("reserve KV: {e}"))` by hand.
+/// Add context to a failure on its way up. `pie:inferlet` declares
+/// `type error = string`, so every fallible call already fails with a
+/// message; this adds the standard way to say where it came from.
 ///
 /// ```ignore
 /// ws.reserve(pages).context("reserve KV")?;
@@ -79,7 +73,7 @@ pub mod working_set {
 }
 
 pub mod mask;
-/// The author-facing ETA bridge (overview §3/§5): `ForwardPass`/`Pipeline`/
+/// The author-facing ETA bridge: `ForwardPass`/`Pipeline`/
 /// `WorkingSet`/`Channel` over the WIT forward resources, driving the `eta-dsl`
 /// trace `Builder`. The single home of the ETA authoring surface.
 pub mod eta;
@@ -95,8 +89,8 @@ pub mod model {
         frame_size, kv_page_size, max_embed_length, name, output_vocab_size, pass_kind,
         rs_buffer_page_size, rs_fold_granularity, rs_state_size, submit_deadline_us,
     };
-    // Tokenizer functions split into the `tokenizer` interface (§2.2); re-exported
-    // here so `model::encode`/`model::decode`/… keep working for inferlet source.
+    // Tokenizer functions live in the `tokenizer` interface; re-exported here
+    // so `model::encode`/`model::decode`/… read off `model` in inferlet source.
     pub use crate::pie::inferlet::tokenizer::{
         Token, decode, encode, special_tokens, split_regex, token_bytes, tokens_with_prefix,
         vocabs,
@@ -141,12 +135,10 @@ pub mod grammar {
 /// Multimodal input. The inferlet hands the host raw encoded bytes —
 /// [`Image::from_bytes`](media::Image) (PNG/JPEG), [`Video::from_bytes`](media::Video)
 /// (animated GIF), [`Audio::from_bytes`](media::Audio) (WAV) — and the host
-/// decodes + preprocesses per the bound model. No model-specific code lives in
-/// the inferlet.
+/// decodes + preprocesses per the bound model.
 ///
-/// **ONE LEDGER, ONE LINE** (`.wiki/alto/media-door.md` §0/§1). A span enters
-/// the sequence as the token run its handle answers, and the handle crosses
-/// again beside the tokens to carry the payload:
+/// A span enters the sequence as the token run its handle answers, and the
+/// handle crosses again beside the tokens to carry the payload:
 ///
 /// ```ignore
 /// let img = media::Image::from_bytes(&bytes)?;
@@ -157,14 +149,9 @@ pub mod grammar {
 /// pass.media(&[media::Span::Image(&img)])?;
 /// ```
 ///
-/// The host scans the submitted tokens for the placeholder runs and matches
-/// them to the attached spans in order, refusing every disagreement by name
-/// before anything launches — so the correspondence is checked, not promised.
-///
-/// **AND `digest()` IS NOT OPTIONAL IF YOU CACHE.** Two different images
-/// produce identical token lists, so any reuse keyed on tokens across a media
-/// run must fold the span's digest into its key. See the statute in
-/// `media.wit`'s interface doc.
+/// The host matches placeholder runs to attached spans in order, refusing
+/// every disagreement by name. Two different images can produce identical
+/// token lists, so any cache keyed on tokens must fold in the span's digest.
 pub mod media {
     pub use crate::pie::inferlet::media::{Audio, Image, Video};
     /// One attached span, by the resource you hold — `forward-pass.media`'s

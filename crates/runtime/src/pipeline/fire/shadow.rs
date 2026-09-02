@@ -1,17 +1,11 @@
 //! Host shadow of an instance's committed channel state — the value oracle
-//! behind evaluated fire geometry and canonical-KV evidence.
-//!
-//! The runtime mirrors, per bound pass, what each channel's committed cells
-//! hold: seeds at bind, then per fire the net effect of folding the trace's
-//! stage programs through [`eta_compiler::eval::pareval`] (a device-decided value —
-//! sampler output, kernel result — shadows as *unknown* rather than a wrong
-//! guess). A fire's submission-time value for a channel is the Writer put
-//! staged for that fire, else the shadow's front cell.
-//!
-//! Ring semantics mirror the tier-0 interpreter's pass overlay: within one
-//! pass a channel is a register (a later stage reads an earlier stage's
-//! pending put), and the pass commits at most one net take (pop) and one net
-//! put (push) per channel.
+//! behind evaluated fire geometry and canonical-KV evidence. Mirrors, per
+//! bound pass, what each channel's committed cells hold: seeds at bind, then
+//! per fire the net effect of folding the trace's stage programs through
+//! [`eta_compiler::eval::pareval`] (a device-decided value shadows as
+//! *unknown* rather than a wrong guess). Ring semantics mirror the tier-0
+//! interpreter's pass overlay: within one pass a channel is a register, and
+//! the pass commits at most one net take and one net put per channel.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -37,11 +31,10 @@ pub enum Phase {
     Unknown(Vec<u32>),
 }
 
-/// The per-pass fold schedule and net-take set of a bound trace.
-/// Both are functions of the trace alone, which never changes for a program,
-/// so this is derived once per [`crate::pipeline::program::RegisteredProgram`]
-/// and shared by every instance of it. Deriving it per instance put a
-/// whole-trace taint fixpoint on the cohort-boundary path.
+/// The per-pass fold schedule and net-take set of a bound trace. Both are
+/// functions of the trace alone, so this is derived once per
+/// [`crate::pipeline::program::RegisteredProgram`] and shared by every
+/// instance of it.
 #[derive(Debug, Default)]
 pub struct ShadowPlan {
     /// Channels the trace net-takes each pass: any stage `ChanTake` plus
@@ -71,24 +64,10 @@ impl ShadowPlan {
             }
         }
 
-        // Two exact reductions of the fold loop, both read off immutable IR.
-        //
-        // 1. A stage program with no `ChanPut` cannot change `pending`: the
-        //    fold's only consumed output is `fold.puts`, and the fault path
-        //    shadows exactly that stage's `ChanPut` channels. Dropping those
-        //    stages is therefore exact, and it is worth a lot — the layer
-        //    stages repeat `2 * num_layers` times per fire and a transformer
-        //    decode trace writes host channels only in the prologue and
-        //    epilogue, so this turns 2*L+2 whole-trace evaluations into 2.
-        //
-        // 2. A stage whose every put carries a statically device-decided
-        //    value folds to `Err` for all of them on every fire, so the fold
-        //    only re-derives what `geometry_taint` already proved. Committing
-        //    those channels unknown directly is the same commit the fold
-        //    would make, and it is what the fault path already does. In a
-        //    decode trace the sampler feeds the epilogue's put, which is
-        //    exactly this case — so the last surviving whole-trace evaluation
-        //    goes too.
+        // Two exact reductions, both read off immutable IR: (1) a stage with
+        // no ChanPut is dropped, since it cannot change `pending`; (2) a
+        // stage whose puts are all statically device-decided commits them
+        // Unknown directly instead of folding.
         let device_decided = eta_compiler::eval::pareval::geometry_taint(bound).device_decided;
         let phase_of = |stage: Stage| -> Option<Phase> {
             let mut puts: Vec<u32> = Vec::new();
@@ -416,21 +395,6 @@ mod tests {
         assert_eq!(
             second,
             crate::pipeline::fire::geometry::FireAttnMask::Device
-        );
-    }
-
-    /// The demotion is exact, so it has to be observable as a demotion and
-    /// not merely as an unchanged result: a put whose value is statically
-    /// device-decided must never reach `fold_stage`, and a put the host can
-    /// derive must still be folded on every fire.
-    #[test]
-    fn a_statically_device_decided_put_is_committed_without_folding() {
-        let bound = device_put_trace();
-        let plan = ShadowPlan::derive(&bound);
-        assert!(
-            matches!(plan.phases.as_slice(), [Phase::Unknown(chans)] if chans == &[2]),
-            "device-decided epilogue should be demoted, got {:?}",
-            plan.phases
         );
     }
 

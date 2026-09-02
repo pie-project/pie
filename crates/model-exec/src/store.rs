@@ -1,13 +1,7 @@
 //! The shared model-state geometry: where a lane's kv rows land, what the
-//! arena's rectangles are, and what a load-time reading of the IR may refuse.
-//!
-//! **NOT ONE LINE OF THIS NAMES A DEVICE**, and that is the whole reason the
-//! module exists. Design §3 gives `model_exec::store` the page arithmetic and
-//! leaves only the BYTES to a shell — buffers, pools, dtype pinning, device
-//! pointers — so what lands here is exactly what two shells were computing
-//! twice: `Paging`/`Seat`/`Geometry`/`indptr` (the 27 self-accusing
-//! `model_exec::store candidate` markers of survey §2 debt 3), the arena carve's
-//! `slot × bucket → rectangle`, and the bake-time schedule/window check.
+//! arena's rectangles are, and what a load-time reading of the IR may
+//! refuse. Backend-neutral — no device, buffer, pool, or dtype pinning here;
+//! that stays with the shell.
 //!
 //! # The three questions the page arithmetic answers
 //!
@@ -20,29 +14,19 @@
 //! where does token T land?         write_page / write_offset — per fire, per row
 //! ```
 //!
-//! The first is a deployment's budget. The second is what the attention
-//! schedule is planned against. The third is what the append kernel writes
-//! through, and it is stated per token rather than derived from a position
-//! because a derivation cannot spell a fresh-page write that is not the page
-//! run's tail. Both backends' writers agree on that and neither could do
-//! otherwise: CUDA's explicit-descriptor writer (`kernels/attn/kv.cuh`) and
-//! Metal's `attn/kv_write.metal` `kv_append_paged_*` entries both take
-//! `write_page` and `write_offset` as declared buffers and derive nothing,
-//! and the ops themselves name them (`attention.kv_append`), so a shell that
-//! wanted a derivation would have nowhere to put it.
+//! The third is stated per token rather than derived from a position, since a
+//! derivation cannot spell a fresh-page write that is not the page run's
+//! tail; both backends' writers take `write_page`/`write_offset` as declared
+//! buffers and derive nothing.
 //!
 //! # What is NOT here
 //!
-//! The IR probe that reads a plan's cache facts (`probe`, `Facts`) stayed in
-//! the shells: the two copies genuinely disagree about where a schedule's
-//! reading has an author — CUDA reads it off the plan op that CARVES the
-//! schedule (three passes, `ScheduleFacts`, the latent arms), Metal infers it
-//! from the launches that consume it (two passes). That is a behaviour
-//! difference, not a spelling one, and picking either would change a shell.
-//! What the two do agree on — [`SpaceFacts`](kv::SpaceFacts), the launch
-//! flattening [`reads`](kv::reads), [`row_of`](kv::row_of),
-//! [`space_of`](kv::space_of), [`width_of`](kv::width_of) — is here, and both
-//! probes are written over it.
+//! The IR probe that reads a plan's cache facts stayed in the shells: CUDA
+//! and Metal genuinely disagree about where a schedule's reading has an
+//! author, which is a behavior difference, not a spelling one. What the two
+//! agree on — [`SpaceFacts`](kv::SpaceFacts), [`reads`](kv::reads),
+//! [`row_of`](kv::row_of), [`space_of`](kv::space_of),
+//! [`width_of`](kv::width_of) — is here, and both probes are written over it.
 
 use std::fmt;
 
@@ -52,14 +36,10 @@ pub mod kv;
 
 pub use kv::{Geometry, Paging, Reader, Seat, SpaceFacts, geometry, geometry_with, indptr};
 
-/// What the neutral store refuses.
-///
-/// **THREE VARIANTS BECAUSE THE ARITHMETIC HAS THREE WAYS TO BE WRONG**, and
-/// each one is a variant both shells already carry under the same name and the
-/// same fields — `Ceiling`, `Unbound`, `Straddled`. A shell converts on the
-/// way out (`impl From<store::Fault> for crate::error::Fault`) and keeps its
-/// own sentence for the reader, which is why the wording of a refusal is still
-/// the shell's and the CONDITION for it is no longer duplicated.
+/// What the neutral store refuses: the three ways the arithmetic can be
+/// wrong, each already a variant both shells carry under the same name and
+/// fields. A shell converts on the way out and keeps its own wording for the
+/// reader; the condition itself is stated once, here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
     /// A count past a ceiling somebody reserved bytes for.

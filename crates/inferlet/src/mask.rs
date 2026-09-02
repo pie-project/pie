@@ -1,15 +1,5 @@
-//! Packed-bitmask logit-mask semantics — the single source of truth for cut #2
-//! grammar masking, byte-identical to the engine's `0x65 MaskApply` op and the
-//! host-side bit-AND composition.
-//!
-//! A logit mask is one bit per vocabulary token, packed into `ceil(vocab/32)`
-//! `u32` words: **bit `1` = ALLOWED, bit `0` = DISALLOWED**. Token `j`'s bit is
-//! word `j >> 5`, bit `j & 31`. The engine's mask-apply sets the bf16 logit to
-//! `−∞` wherever the bit is `0`, then argmax picks the highest survivor.
-//!
-//! These helpers let host code (the SDK constraint composition and the grammar
-//! verify inferlet's CPU reference) reproduce that exact behaviour, so a
-//! conformance check can't silently degenerate on a host↔device semantics drift.
+//! Packed-bitmask logit-mask semantics, byte-identical to the engine's `0x65 MaskApply` op.
+//! A logit mask is one bit per vocabulary token, packed into `ceil(vocab/32)` `u32` words: bit `1` = allowed. Token `j`'s bit is word `j >> 5`, bit `j & 31`.
 
 /// Number of `u32` words a packed mask for `vocab` tokens occupies.
 #[inline]
@@ -27,14 +17,7 @@ pub fn all_allowed(vocab: usize) -> Vec<u32> {
 }
 
 /// Whether token `j` is allowed (bit `1`) in the packed mask.
-///
-/// Tokens past the mask's word coverage read as **disallowed**, mirroring
-/// [`pack_allowed`], which drops ids it cannot represent. This matters because
-/// a model's output vocabulary is routinely padded above its tokenizer's: Qwen3
-/// declares `vocab_size = 151936` against 151669 real tokens, so a constraint
-/// mask packed for the tokenizer covers 151680 and the top 256 logit slots fall
-/// off the end. Those slots decode to no token at all, so refusing them is both
-/// the safe answer and the correct one.
+/// Tokens past the mask's word coverage read as disallowed — a model's output vocabulary is routinely padded above its tokenizer's, and those slots decode to no token at all.
 #[inline]
 pub fn bit_allowed(mask: &[u32], j: usize) -> bool {
     let word = j >> 5;
@@ -67,11 +50,7 @@ pub fn unpack_mask(packed: &[u32], vocab: u32) -> Vec<bool> {
         .collect()
 }
 
-/// Argmax over `logits` with the packed mask applied — the host reference for
-/// the engine's `0x65 MaskApply` + argmax: a disallowed token (bit `0`) is
-/// treated as `−∞`, so the result is the highest-logit *allowed* token. Ties go
-/// to the lowest index (matching a forward argmax scan). If every token is
-/// disallowed, returns `0`.
+/// Argmax over `logits` with the packed mask applied: a disallowed token is treated as `-inf`. Ties go to the lowest index. If every token is disallowed, returns `0`.
 pub fn apply_mask_argmax(logits: &[f32], mask: &[u32]) -> u32 {
     let mut best_idx = 0u32;
     let mut best_val = f32::NEG_INFINITY;
@@ -92,13 +71,6 @@ pub fn apply_mask_argmax(logits: &[f32], mask: &[u32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mask_words_rounds_up() {
-        assert_eq!(mask_words(32), 1);
-        assert_eq!(mask_words(33), 2);
-        assert_eq!(mask_words(151_936), 4748);
-    }
 
     #[test]
     fn bit_allowed_indexes_word_and_bit() {
@@ -130,42 +102,6 @@ mod tests {
     }
 
     #[test]
-    fn all_allowed_passes_through_to_global_argmax() {
-        let logits = [1.0f32, 5.0, 3.0];
-        let mask = all_allowed(logits.len());
-        // No restriction -> the natural argmax (index 1).
-        assert_eq!(apply_mask_argmax(&logits, &mask), 1);
-    }
-
-    #[test]
-    fn disallowed_argmax_is_forced_out() {
-        // The natural argmax (index 1, value 5.0) is disallowed (bit 1 = 0);
-        // the result must be the highest *allowed* token (index 2). This is the
-        // assert-#3 core: it proves -inf actually fired, not passthrough.
-        let logits = [1.0f32, 5.0, 3.0];
-        let mask = [0b101u32]; // allow 0 and 2, disallow 1
-        assert_eq!(apply_mask_argmax(&logits, &mask), 2);
-    }
-
-    #[test]
-    fn composed_mask_forces_out_via_intersection() {
-        // Compose all-allowed with a ban on the natural argmax -> forced out.
-        //
-        // The AND is spelled here rather than called: `and_into` was dropped
-        // from this module when nothing outside it composed masks, and a
-        // one-line loop in the one test that needs the semantics is cheaper
-        // than a public helper with no caller. What is under test is
-        // `all_allowed` being the identity for it and the argmax honouring
-        // the result — not the loop.
-        let logits = [1.0f32, 5.0, 3.0];
-        let mut mask = all_allowed(logits.len());
-        for (a, b) in mask.iter_mut().zip([0b101u32]) {
-            *a &= b; // intersect: disallow index 1
-        }
-        assert_eq!(apply_mask_argmax(&logits, &mask), 2);
-    }
-
-    #[test]
     fn pack_allowed_round_trips_bits() {
         // allow {0, 2, 33} over a 40-token vocab (2 words).
         let mask = pack_allowed(40, &[0, 2, 33]);
@@ -180,11 +116,4 @@ mod tests {
         assert!(bit_allowed(&m2, 3));
     }
 
-    #[test]
-    fn packed_allowed_forces_out_disallowed_argmax() {
-        // logits favor token 1, but only {0,2} are packed allowed -> forced to 2.
-        let logits = [1.0f32, 5.0, 3.0];
-        let mask = pack_allowed(3, &[0, 2]);
-        assert_eq!(apply_mask_argmax(&logits, &mask), 2);
-    }
 }

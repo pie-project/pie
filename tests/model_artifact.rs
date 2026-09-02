@@ -19,8 +19,6 @@
 
 use std::path::Path;
 
-use checkpoint::file::zt;
-use checkpoint::types::{DType, Encoding};
 
 /// A dense llama-shaped snapshot: `config.json` plus one real safetensors
 /// file of zeroed `dtype` weights.
@@ -138,117 +136,6 @@ fn write_snapshot(dir: &Path, dtype: &str) {
 // deletion: a backend that starts persisting a fusion again fails here and
 // says so, which is what the old assertion did in the other direction.
 
-/// import on an F32 snapshot decodes *everything* — the whole-model case
-/// the streaming executor and the disk spool exist for — and the artifact
-/// holds BF16 under the original names.
-///
-/// **"THE ORIGINAL NAMES" IS NOW A CLAIM WITH A CONDITION ON IT** (§M-4a).
-/// Since the promotion gate widened past `Cast{Quant}`/`Repack` to the whole
-/// landing, a source some SKU in this build CLAIMS comes out under that SKU's
-/// plane names — the fusion, the band, the rename and the fold are performed
-/// here, so the artifact holds `layer.0.qg_proj` where the checkpoint held
-/// `model.layers.0.self_attn.q_proj.weight`. This fixture is two layers of
-/// 64 hidden over a 128-token vocabulary and no row in `models::catalog()`
-/// has that geometry, so `conversion_contract` answers `None`, nothing is
-/// promoted, and every name below is the source's own.
-///
-/// That is asserted rather than assumed, because it is exactly the shape of
-/// gate that passes for the wrong reason: a fixture that quietly started
-/// matching a SKU would keep the count at 21 and change every name, and the
-/// encoding sweep above would not notice. The day a row claims this snapshot,
-/// this assertion is what says so.
-///
-/// **AND `no_prepare: true` IS LOAD-BEARING NOW, NOT SCENERY** (§M-4g). An
-/// import that is going to prepare the artifact for THIS box refuses a source
-/// no SKU in this build claims, because `prepare` swallows its own refusals
-/// and so cannot be the party that says nothing will ever serve the file.
-/// `--no-prepare` is the path that legitimately converts one — a shelf
-/// converted for machines whose build ships the row — and that is the path
-/// this test is on. The line below it says the artifact is not served here; it
-/// is now also what says the conversion is allowed to happen at all. The other
-/// side of the same fact is
-/// `an_import_that_will_prepare_refuses_a_source_no_sku_claims`.
-#[test]
-fn import_streams_a_fully_decoded_model_through_the_spool() {
-    let staging = tempfile::tempdir().expect("staging");
-    write_snapshot(staging.path(), "F32");
-    let store = tempfile::tempdir().expect("store");
-    let artifact = store.path().join("converted.zt");
-
-    // The prepare arm reads the box's config through these; `no_prepare`
-    // below keeps this import conversion-only, so bare defaults suffice.
-    let global = bootstrap::GlobalArgs {
-        config: None,
-        log_level: "info".into(),
-        metrics_addr: None,
-    };
-    pie::ops::model::import::run(pie::ops::model::import::ImportArgs {
-        source: staging.path().to_string_lossy().into_owned(),
-        aux: None,
-        out: Some(artifact.clone()),
-        dry_run: false,
-        force: false,
-        max_shard_size: None,
-        delete_source: false,
-        consume_source: false,
-        keep_source: false,
-        // The artifact is parsed below, not served: baking a tier for it
-        // would want an engine and a config this test rightly has neither of.
-        no_prepare: true,
-        // And this is the CONVERSION half of the command, which is the half
-        // §M-3's rebuild door skips — `--prepare-only` returns before the
-        // first line of what this test is about.
-        prepare_only: false,
-    }, &global)
-    .expect("import failed");
-
-    let parsed = zt::parse(&artifact).expect("parse artifact");
-    for tensor in parsed.weights() {
-        assert_eq!(
-            tensor.encoding,
-            Encoding::Raw(DType::Bf16),
-            "{} was not normalized to BF16",
-            tensor.name
-        );
-    }
-    assert_eq!(parsed.weights().count(), 21, "every tensor came through");
-    let names: Vec<&str> = parsed.weights().map(|t| t.name.as_str()).collect();
-    for expected in [
-        "model.embed_tokens.weight",
-        "model.norm.weight",
-        "lm_head.weight",
-        "model.layers.1.self_attn.q_proj.weight",
-        "model.layers.1.mlp.down_proj.weight",
-    ] {
-        assert!(
-            names.contains(&expected),
-            "no SKU claims this snapshot, so `{expected}` is still spelled the \
-             source's way; the artifact holds {names:?}"
-        );
-    }
-    assert!(
-        !store.path().join("converted.spool.tmp").exists(),
-        "the spool was not cleaned up"
-    );
-    let verified = zt::verify(&artifact).expect("digests verify");
-    assert_eq!(verified as usize, parsed.tensors.len());
-}
-
-/// **THE SAME SNAPSHOT, WITHOUT `--no-prepare`, IS A REFUSAL** (§M-4g).
-///
-/// The fixture above converts a checkpoint no catalog row claims and is right
-/// to: it passes `no_prepare`, which is the operator saying this box is not
-/// making the model servable. Drop that one flag and the command is promising
-/// something it cannot deliver — since §M-4a the import runs the SKU's own
-/// contract to produce the planes a serving load binds, so with no SKU there
-/// are no planes, and the artifact it would write is one no serve boot and no
-/// `--prepare-only` on any box with this catalog can open.
-///
-/// The two tests are one property read from both sides, which is what keeps
-/// the green one green for a reason rather than by luck: the discriminator is
-/// `--no-prepare` and nothing else — not `--out` (both pass one; a `[model]`
-/// key takes a path as readily as a store name), not the geometry, not the
-/// destination.
 #[test]
 fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
     let staging = tempfile::tempdir().expect("staging");
@@ -270,13 +157,9 @@ fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
             out: Some(artifact.clone()),
             dry_run: false,
             force: false,
-            max_shard_size: None,
             delete_source: false,
             consume_source: false,
             keep_source: false,
-            // The one difference from the test above, and the whole of it.
-            no_prepare: false,
-            prepare_only: false,
         },
         &global,
     );
@@ -285,7 +168,12 @@ fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
     };
 
     let said = format!("{why:#}");
-    for expected in ["no SKU this build ships claims", "--no-prepare"] {
+    // `--no-prepare` STOOD IN THIS LIST as the fix the sentence had to name.
+    // §M-4d retired the flag: there is no conversion for elsewhere, so an
+    // unclaimed source has no remedy other than a build whose catalog ships
+    // the row, and a sentence naming a flag that does not exist is worse than
+    // one naming none.
+    for expected in ["no SKU this build ships claims", "pie model list"] {
         assert!(
             said.contains(expected),
             "the refusal has to name the source, the fact and the fix; it said {said:?}"
@@ -296,3 +184,4 @@ fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
         "the refusal has to come before the write, not after it"
     );
 }
+

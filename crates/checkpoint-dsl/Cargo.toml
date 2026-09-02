@@ -1,6 +1,6 @@
 [package]
 name = "checkpoint-dsl"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The checkpoint-provenance authoring eDSL over the typed load contract: a Builder that reads each declared weight out of a checkpoint's stored tensors and finishes as the ModelContract the loader checks and runs. What a family's import is WRITTEN IN; it knows no family and traces no forward pass."
@@ -12,15 +12,12 @@ name = "checkpoint_dsl"
 path = "src/lib.rs"
 
 [dependencies]
-# The IR this surface authors onto: `contract::Expr` and `ModelContract` are
-# the typed load-contract language, and `infer`/`compile`/`executor` are what
-# check and run it. The same edge `model-ir` is to `model-dsl`.
+# The IR this surface authors onto: `contract::Expr`/`ModelContract`, plus the
+# `infer`/`compile`/`executor` that check and run it.
 checkpoint = { path = "../checkpoint" }
 # The noun both surfaces share: a `Weight` is declared by the forward text and
-# read by this one. It stays model-dsl's -- the recorder interns it into
-# `Trace::params` -- and this crate is a second reader, not a second home.
+# read here. It stays `model-dsl`'s; this crate is a second reader, not a home.
 model-dsl = { path = "../model-dsl" }
-# The container a checkpoint is: a `Builder` is handed an open source and
-# reads the file's own stored facts before it decides between an identity
-# read, a cast, and a refusal.
+# The container a checkpoint is: a `Builder` reads the file's own stored facts
+# before choosing between an identity read, a cast, and a refusal.
 ztensor = { workspace = true }

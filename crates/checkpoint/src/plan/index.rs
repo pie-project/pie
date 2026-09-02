@@ -1,13 +1,6 @@
-//! Finding things in a plan.
-//!
-//! Every id a plan carries is dense and assigned in push order, so a lookup is
-//! an array index. It was not written that way: `buffers.iter().find()` and
-//! `tensors.iter().find()` appeared in the passes, in the memory accounting and
-//! in the backend lowering, which made compilation quadratic in tensor count —
-//! 2.1 s for a 32k-tensor checkpoint, of which two scans were most of it.
-//!
-//! The fix is not a cache but an invariant, checked on every access: if
-//! `buffers[i].id != BufferId(i)` something built the plan wrong, and that is
+//! Finding things in a plan. Every id a plan carries is dense and assigned
+//! in push order, so a lookup is an array index, checked on every access: if
+//! `buffers[i].id != BufferId(i)` something built the plan wrong, which is
 //! an `Internal` error rather than a silently slow path.
 
 use std::collections::HashMap;
@@ -36,11 +29,9 @@ impl LoadPlan {
     }
 }
 
-/// Resolve a scheduled instruction by id, against a slice the caller owns.
-///
-/// The passes clone `instrs` before rewriting it, so they cannot go through
-/// [`LoadPlan::instr`]. Same invariant, same refusal: ids are dense, and a
-/// position that holds a different id means something built the plan wrong.
+/// Resolve a scheduled instruction by id, against a slice the caller owns
+/// (passes clone `instrs` before rewriting it, so they can't go through
+/// [`LoadPlan::instr`]). Same invariant: ids are dense.
 pub(crate) fn instr_by_id(instrs: &[StorageInstr], id: InstrId) -> Result<&StorageInstr> {
     let found = instrs
         .get(id.0 as usize)
@@ -91,13 +82,10 @@ fn dense(found: u32, wanted: u32, what: &str) -> Result<()> {
     )))
 }
 
-/// Lookups that are *not* an array index.
-///
-/// Tensor ids interleave two allocators — a contract's own tensors take their
-/// declaration order, and generated scale tensors continue past the end — so
-/// the tensor table is sparse where the buffer table is not. Built once by a
-/// pass that needs it rather than carried on the plan, because a plan that
-/// owned an index would have to keep it right through every rewrite.
+/// Lookups that are *not* an array index: tensor ids interleave two
+/// allocators (a contract's own tensors, then generated scale tensors), so
+/// the tensor table is sparse where the buffer table is not. Built once by
+/// a pass that needs it rather than carried on the plan.
 pub struct PlanIndex {
     tensor: HashMap<TensorId, u32>,
     source: HashMap<TensorId, u32>,
@@ -131,16 +119,10 @@ impl PlanIndex {
 
     /// The declaration behind a buffer, chasing views.
     ///
-    /// A `CreateView` output declares no tensor: it is a window onto one, and a
-    /// window has the elements of what it looks at. The executor already
-    /// chases the chain for BYTES — `resolve` walks `BufferLoc::View` to a
-    /// root — and the type has to follow the same links or the two answers
-    /// disagree: a transform reading a view gets its bytes and is then refused
-    /// for having no type, from a plan the compiler accepted.
-    ///
-    /// The chain terminates because `CreateView` names an input that is
-    /// already allocated, so the links only ever point backwards in the
-    /// schedule.
+    /// A `CreateView` output declares no tensor: it is a window onto one, and
+    /// takes the elements of what it looks at, following the same chain
+    /// `resolve` walks for bytes. The chain terminates because `CreateView`
+    /// names an input that is already allocated.
     pub fn buffer_tensor<'a>(&self, plan: &'a LoadPlan, id: BufferId) -> Option<&'a TensorDecl> {
         let mut at = id;
         loop {

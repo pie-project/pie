@@ -1,17 +1,8 @@
-//! Recognizing the nucleus-sampling dataflow.
-//!
-//! One question: does this run of normalized ops spell the `softmax -> top-p
-//! mask -> Gumbel noise -> argmax` pipeline that a backend can hand to a
-//! single library call? Everything here exists to answer it, and the answer
-//! is a [`LibraryMatch`]; [`super::region`] decides what to do with one.
-//!
-//! The match is deliberately narrow. Four independent conditions have to hold
-//! -- the ops are the right ops, the library's inputs are recoverable, the
-//! chain is used by nothing outside itself, and the types line up -- and each
-//! is a separate function that returns `None` rather than one predicate that
-//! returns a reason. Refusing to match is always correct: the ops then go
-//! down the generated path and produce the same numbers more slowly. Matching
-//! wrongly is not, so every condition is checked, never inferred.
+//! Recognizes the `softmax -> top-p mask -> Gumbel noise -> argmax` dataflow
+//! and reports it as a [`LibraryMatch`]; [`super::region`] decides what to do
+//! with one. Four independent conditions gate a match (right ops, recoverable
+//! inputs, exclusive chain, types agree), each its own function returning
+//! `None` — refusing to match is always safe, matching wrongly is not.
 
 use alloc::collections::BTreeSet;
 use alloc::vec;
@@ -92,14 +83,6 @@ struct Softmax {
 
 /// Invert [`eta_ir::expand::softmax`], checking that both reductions read the
 /// same `logits` the caller already found.
-///
-/// Only the `ReduceMax` identity has a mutation of its own
-/// (`NucleusMutation::ForeignMaximum`). The `ReduceSum` one and the two
-/// declared-shape comparisons cannot fail alone: the sum is already named as a
-/// consumer of the exponentials by [`Chain::expected_consumers`], and two ops
-/// in one chain that declare different shapes have different types, which
-/// `eta_ir::infer` rejects before this runs. They are here so that reading
-/// this function tells you it matched a softmax.
 fn match_softmax(
     stage: &NormalizedStage,
     probabilities: ValueId,
@@ -182,15 +165,10 @@ fn match_softmax(
 }
 
 /// The chain [`eta_ir::expand::nucleus_sample`] emits, read backwards.
-///
-/// Recovering the chain and judging it are separate jobs, kept separate.
-/// [`match_chain`] does the recovery and answers nothing about whether the
-/// match may be taken; three named predicates do that, so each can be read and
-/// tested on its own rather than as an unmarked phase of one long function.
-/// The three questions asked of a `Chain`: which values enter the library call
-/// ([`nucleus_library_inputs`]), whether the chain is the library's alone to
-/// take ([`chain_is_exclusive`]), and whether the types line up
-/// ([`chain_types_agree`]).
+/// [`match_chain`] does recovery only; three named predicates judge it:
+/// which values enter the library call ([`nucleus_library_inputs`]), whether
+/// the chain is exclusively its own ([`chain_is_exclusive`]), and whether
+/// types line up ([`chain_types_agree`]).
 struct Chain {
     softmax: Softmax,
     pivot_node: NodeIndex,
@@ -237,11 +215,9 @@ impl Chain {
         ]
     }
 
-    /// Each intermediate and the nodes the chain expects to read it.
-    ///
-    /// This is the chain's fan-out, and it is what makes the match exclusive
-    /// rather than merely present: an intermediate read by anything outside is
-    /// still live after the library call replaces the ops that produced it.
+    /// Each intermediate and the nodes the chain expects to read it — the
+    /// chain's fan-out, which is what makes a match exclusive rather than
+    /// merely present.
     fn expected_consumers(&self) -> [(ValueId, Vec<NodeIndex>); 12] {
         let s = &self.softmax;
         [
@@ -262,12 +238,9 @@ impl Chain {
 }
 
 /// Walk back from an `argmax(masked + noise)` over the shape
-/// [`eta_ir::expand::nucleus_sample`] emits.
-///
-/// The order mirrors that function read bottom-up: `mask_apply`, then
-/// `gumbel`, then the pivot that decides the kept set, then the softmax the
-/// pivot ranks. Nothing here looks at types or at who else reads what; this
-/// only answers "are these the right ops, wired the right way".
+/// [`eta_ir::expand::nucleus_sample`] emits: `mask_apply`, then `gumbel`,
+/// then the pivot, then the softmax it ranks. Only checks wiring, not types
+/// or other readers.
 fn match_chain(
     stage: &NormalizedStage,
     final_node: NodeIndex,
@@ -354,13 +327,9 @@ struct LibraryInputs {
 }
 
 /// The values the library call reads, and the temperature divide it absorbs.
-///
 /// A `logits / t` feeding the chain is folded in when the chain is the only
-/// thing that reads the scaled result, because the library kernel divides on
-/// the way in; the scaled value stays an input so the region still names what
-/// it replaced. A `reshape` between the two is seen through. When the divide
-/// is shared the fold is dropped rather than the match: the divide is then a
-/// real op that has to survive.
+/// reader of the scaled result (a `reshape` in between is seen through);
+/// when the divide is shared, the fold is dropped rather than the match.
 fn nucleus_library_inputs(
     stage: &NormalizedStage,
     chain: &Chain,
@@ -406,24 +375,11 @@ fn nucleus_library_inputs(
 }
 
 /// Whether the chain is the library call's alone to take, and the nodes it
-/// would take.
-///
-/// Three ways it is not: a node appears twice, so the "chain" folded back on
-/// itself; an input is produced inside, so replacing the nodes would delete
-/// its own argument; or an intermediate is read from outside, so it outlives
-/// the ops that made it.
-///
-/// The third subsumes the second. Twelve of the thirteen chain nodes define a
-/// value the table names, and the thirteenth defines the result, which nothing
-/// earlier can read -- so an input produced inside the chain always shows up as
-/// a consumer the table did not expect. The explicit test stays because it is
-/// the cheaper statement of a property the table only implies.
-///
-/// The result also has to escape, for the opposite reason: a chain nothing
-/// reads is dead code, and a library call is not how to delete it. That one
-/// cannot currently fire -- normalization deletes the chain first, which
-/// `a_sampler_nobody_reads_is_deleted_before_it_is_matched` pins -- and it
-/// stays only because it is what this function is for.
+/// would take. Three ways it is not: a node appears twice (the "chain"
+/// folded back on itself); an input is produced inside (replacing the nodes
+/// would delete its own argument); or an intermediate is read from outside
+/// (it outlives the ops that made it). The result must also escape (a chain
+/// nothing reads is dead code, not a library call).
 fn chain_is_exclusive(
     chain: &Chain,
     library_inputs: &[ValueId],
@@ -462,18 +418,10 @@ fn chain_is_exclusive(
     Some(ordered_nodes)
 }
 
-/// Whether every value in the chain has the type the library kernel assumes.
-///
-/// The kernel takes f32 logits over rows, one `u32[2]` rng state, an f32
-/// `top_p` that is either scalar or one per row, and writes one i32 per row.
-/// Everything in between is either logits-shaped, row-shaped or scalar.
-///
-/// No test reaches a rejection here, and the two attempts recorded in
-/// `nucleus_lookalikes_remain_generic`'s history -- a `top_p` with the wrong
-/// row count, and rank-3 logits -- were both rejected by `eta_ir::infer`
-/// first: `Op::PivotThreshold` already requires rank 1 or 2 and a scalar or
-/// per-row threshold, and the elementwise ops already force the chain to one
-/// shape. This is a second opinion on a bound stage, not the first one.
+/// Whether every value in the chain has the type the library kernel assumes:
+/// f32 logits over rows, one `u32[2]` rng state, an f32 `top_p` scalar or
+/// per-row, and one i32 per row out. Everything else is logits-shaped,
+/// row-shaped or scalar.
 fn chain_types_agree(
     stage: &NormalizedStage,
     chain: &Chain,

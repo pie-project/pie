@@ -331,22 +331,54 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
   device float* frow = scores + size_t(t) * size_t(score_stride);
   const device bfloat* qi = idx_q + size_t(t) * size_t(H) * size_t(D);
   const device bfloat* wi = idx_w + size_t(t) * size_t(H);
-  for (int j = tid; j < nkeys; j += kIndexBlock) {
-    const int cell = (j + 1) * stride - 1;
-    const int page = int(kv_page_indices[pages_first + cell / page_size]);
-    const int off = cell % page_size;
-    const device bfloat* kj =
-        key_pages + (size_t(page) * size_t(page_size) + size_t(off)) * size_t(D);
+
+  // **SIXTY-FOUR LANES PER KEY, ONE PER HEAD** — and not one thread per key.
+  // A thread scoring a whole key walks `H * D` dependent scalar loads
+  // (8 192 at this family's `H 64, D 128`), which is ~700 us of load latency
+  // per key on this plane whatever `nkeys` is — the kernel profile put this
+  // entry at 19% of a decoded token's device time for a context whose keys
+  // fit the budget and whose selection was therefore the identity. So a
+  // pass scores `kKeysPerPass` keys at once: lane `hh` of key `slot` reduces
+  // head `hh` (and every head `hh + 64k` past it) over `D`, the relu'd,
+  // weighted per-head terms fold across the key's two simdgroups, and one
+  // thread lands the key's score. Same arithmetic, same summation order
+  // within a head; the cross-head sum is now a tree rather than a chain,
+  // which moves nothing a 40-halving threshold can see.
+  constexpr int kLanesPerKey = 64;
+  constexpr int kKeysPerPass = kIndexBlock / kLanesPerKey;
+  constexpr int kSimdsPerKey = kLanesPerKey / 32;
+  threadgroup float key_partials[kIndexSimds];
+  const int slot = tid / kLanesPerKey;
+  const int hh = tid % kLanesPerKey;
+  for (int j0 = 0; j0 < nkeys; j0 += kKeysPerPass) {
+    const int j = j0 + slot;
     float acc = 0.0f;
-    for (int h = 0; h < H; ++h) {
-      const device bfloat* qh = qi + size_t(h) * size_t(D);
-      float dot = 0.0f;
-      for (int d = 0; d < D; ++d) {
-        dot += float(qh[d]) * float(kj[d]);
+    if (j < nkeys) {
+      const int cell = (j + 1) * stride - 1;
+      const int page = int(kv_page_indices[pages_first + cell / page_size]);
+      const int off = cell % page_size;
+      const device bfloat* kj =
+          key_pages + (size_t(page) * size_t(page_size) + size_t(off)) * size_t(D);
+      for (int h = hh; h < H; h += kLanesPerKey) {
+        const device bfloat* qh = qi + size_t(h) * size_t(D);
+        float dot = 0.0f;
+        for (int d = 0; d < D; ++d) {
+          dot += float(qh[d]) * float(kj[d]);
+        }
+        acc += max(dot, 0.0f) * float(wi[h]);
       }
-      acc += max(dot, 0.0f) * float(wi[h]);
     }
-    frow[j] = acc;
+    const float folded = simd_sum(acc);
+    if (simd_lane == 0) key_partials[simd_group] = folded;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < kKeysPerPass && j0 + tid < nkeys) {
+      float total = 0.0f;
+      for (int g = 0; g < kSimdsPerKey; ++g) {
+        total += key_partials[tid * kSimdsPerKey + g];
+      }
+      frow[j0 + tid] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 

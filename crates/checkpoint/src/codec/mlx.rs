@@ -2,23 +2,18 @@
 //! schemes this one stores an offset, so a group's minimum is
 //! representable exactly and the zero point need not be a codepoint.
 
-/// One group's affine scale and zero point, by MLX's rule (transcribed
-/// from `mlx/backend/cpu/quantized.cpp::quantize`, so a checkpoint this
-/// produces is bit-compatible with one `mlx_lm convert` produced). Five
-/// details, since none is what an independently written affine quantizer
-/// would do:
+/// One group's affine scale and zero point, by MLX's rule (bit-compatible
+/// with `mlx_lm convert`). Four details an independently written affine
+/// quantizer would get wrong:
 ///
-///  * **The scale is usually negative** -- negated unless the group's
-///    minimum is larger in magnitude, putting code 0 on whichever end
-///    dominates. A producer that "fixed" the sign would misplace the codes.
-///  * **The endpoint is snapped, not the scale**: recomputed as
+///  * the scale is negated unless the group's minimum is larger in
+///    magnitude, putting code 0 on whichever end dominates.
+///  * the endpoint is snapped, not the scale: recomputed as
 ///    `edge / round(edge / scale)`, keeping the largest magnitude exact.
-///  * **`w_max` starts at zero**, not negative infinity, so an all-negative
-///    group quantizes over the range up to zero, not up to its own max.
-///  * **The rounding is half AWAY FROM ZERO**, not half to even -- the
-///    source of an 8.2% disagreement with `mx.quantize` on an
-///    MXFP4-derived expert bank, whose values sit on half-integers.
-///  * **`eps` floors the scale**, so a constant group (all-zero bias row) divides by `1e-7` instead of by zero.
+///  * `w_max` starts at zero, not negative infinity, so an all-negative
+///    group quantizes over the range up to zero.
+///  * rounding is half away from zero, not half to even; `eps` floors the
+///    scale so a constant group divides by `1e-7` instead of by zero.
 pub fn mlx_affine_group_params(values: &[f64]) -> (f32, f32) {
     const N_BINS: f32 = 15.0;
     const EPS: f32 = 1e-7;
@@ -64,11 +59,7 @@ pub fn decode_mlx_affine_codes(bytes: &[u8], bits: u32) -> Vec<f64> {
             }
             values
         }
-        // Four codes a byte, least significant first — the same walk as the
-        // four-bit arm at half the stride. Defensive rather than load-bearing:
-        // the serving path passes the codes through as stored
-        // (`contract/materialize.rs`), and this decoder is what a REPACK and
-        // the fixtures read them by.
+        // four codes a byte, least significant first.
         2 => {
             let mut values = Vec::with_capacity(bytes.len() * 4);
             for byte in bytes {

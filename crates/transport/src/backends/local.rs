@@ -1,16 +1,11 @@
-//! Local backend — same-node device-to-device KV copy.
-//!
-//! The minimal baseline for co-located prefill+decode: a prefill worker's KV
-//! pages are copied directly into a co-located decode worker's cache, with zero
-//! network and zero serialization. The actual D2D memcpy is issued through the
-//! [`D2dCopier`] seam — a real implementation wraps `cudaMemcpyDeviceToDevice` /
-//! `hipMemcpy` (issued by the engine/runtime that owns the buffers), kept behind
-//! a trait so the backend compiles and is testable without a device.
+//! Local backend: same-node device-to-device KV copy, with zero network and
+//! zero serialization. The D2D memcpy is issued through the [`D2dCopier`]
+//! seam (wraps `cudaMemcpyDeviceToDevice`/`hipMemcpy`), kept behind a trait
+//! so the backend is testable without a device.
 //!
 //! Push semantics: [`send`](LocalBackend) drives the copy from the sender's
 //! handle into the co-located destination's region; [`recv`](LocalBackend)
-//! acknowledges (the bytes are placed by the paired send). This matches a
-//! same-node DMA where one side issues the transfer.
+//! only acknowledges, since the bytes are placed by the paired send.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -139,13 +134,10 @@ impl Backend for LocalBackend {
 
     /// Receive `pages` into the local `slot` from co-located worker `src`.
     ///
-    /// INVARIANT — no-op-ack semantics: in the same-node local path the bytes are
-    /// moved by the *paired* [`send`](LocalBackend::send) (push: the sender drives
-    /// the D2D copy into the receiver's region). `recv` therefore intentionally
-    /// **ignores `slot` and `pages`** and only (a) validates that `src` is a
-    /// registered co-located peer and (b) acknowledges with `Completion::Done`.
-    /// It performs no copy. The arguments are kept for interface uniformity with
-    /// a future cross-node (`nixl`) backend, where `recv` posts the actual pull.
+    /// No-op ack: the bytes are moved by the paired [`send`](LocalBackend::send),
+    /// so this ignores `slot` and `pages`, only validating `src` is a
+    /// registered peer and acknowledging. Arguments are kept for interface
+    /// uniformity with a future cross-node (`nixl`) backend.
     fn recv_mapped(
         &self,
         slot: &RegisteredHandle,

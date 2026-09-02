@@ -1,6 +1,6 @@
 [package]
 name = "engine-cuda"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The menlo CUDA engine's dispatch layer: a Run that resolves plan ids to device handles and answers every Dispatch* trait by calling kernels-cuda entries on the stream Ctx. Merges into engine-cuda when the old stack is deleted."
@@ -12,98 +12,46 @@ name = "engine_cuda"
 path = "src/lib.rs"
 
 [dependencies]
-# For `blob.rs`'s `adapter.toml` manifest — the one document this crate still
-# reads. The boot document's parser left with the typed `DeviceBoot` seam, so
-# the mount's manifest is the only reason a parser is linked at all.
+# For `blob.rs`'s `adapter.toml` manifest — the one document this crate reads.
 toml = "1.1"
-# The vocabulary the resolver routes on: `ValueDecl`, `Def`, `RuntimeInput`,
-# `StructKind` — and the 15 family enums the dispatch arms destructure.
-# `statvfs`, for the one question the standard library cannot answer:
-# how much room is left on the disk the weight artifact cache writes to. The
-# cache DECLINES a write it has no room for rather than filling the operator's
-# disk (dev's `weight_artifact_cache.hpp`), and that refusal needs the number.
+# `statvfs`: the weight artifact cache declines a write it has no room for,
+# and the standard library cannot answer how much room is left.
 libc = "0.2"
-# The weight artifact cache hashes the WHOLE `LoadPlan` — the plan IS the
-# recipe, so hashing it whole is the only formulation that cannot go stale
-# when a plan grows a field (dev's `cache_key.rs`). `serde_json` is the
-# serializer the plan already derives for.
+# The weight artifact cache hashes the whole `LoadPlan`, so the key cannot go
+# stale when a plan grows a field.
 serde_json = "1"
 model-ir = { path = "../model-ir" }
-# `kernels` STOOD HERE for the contract this crate implements — the six
-# `Dispatch*` traits and `KernelError` — and the crate is gone. Both halves
-# went to `model-exec`, which is already below (the walk written over the
-# contract has always lived there and is driven over this crate's `Run` from
-# there), so this line was subtracted rather than replaced: the same names
-# arrive over an edge this manifest already declared.
-# The entries called and the handles resolved to: `Tensor`, `RaggedTensor`,
-# `KvPool`, `RecurrentPool`, the four plan structs and their pure builders.
-# No `cuda-12`/`cuda-13` feature is named here on purpose: picking the
-# runtime version is the BINARY's decision (the two disagree on
-# `cudaGraphAddNode`'s arity), and this crate builds and tests everywhere —
-# a fire without a runtime answers with a typed refusal.
+# No `cuda-12`/`cuda-13` feature is named here on purpose: the runtime version
+# is the binary's decision, and this crate builds and tests everywhere — a fire
+# with no runtime answers with a typed refusal.
 kernels-cuda = { path = "../kernels-cuda" }
 
-# The runtime↔engine contract: `trait Engine` and every noun its verbs take.
-# This shell IMPLEMENTS it; nothing here is re-exported onward.
+# The runtime↔engine contract. This shell implements it; nothing is re-exported.
 engine = { path = "../engine" }
 
-# The shared fire substrate: `compose`, `FireDescriptor`, `walk`, `EagerSink`
-# (palo design §6). The shell supplies the two traits and calls the walk; it
-# never re-implements one.
+# The shared fire substrate: `compose`, `FireDescriptor`, `walk`, `EagerSink`.
 model-exec = { path = "../model-exec" }
 
-# The ETA host half: launch-package adoption, the channel ring, the reference
-# pass. It was one crate with `model-exec` until the two were measured apart,
-# and this shell is the reason there is no umbrella left to depend on instead:
-# it uses BOTH halves, so a re-exporting parent would only have hidden which.
+# The ETA host half: launch-package adoption, the channel ring, the reference pass.
 eta-exec = { path = "../eta-exec" }
 
-# NAMED DIRECTLY, AND THEY USED TO ARRIVE FOUR HOPS AWAY. `eta_ir::registry`'s
-# ports and `eta_compiler::codegen::launch`'s stage plans were reached by
-# spelling the substrate crate, then the contract crate it re-exported, then
-# the IR the contract re-exported, and only then the item: a leaf enum took
-# four crate names. The substrate's re-exports are gone; the edges they hid
-# are these two lines, which is what they always were.
 eta-ir = { path = "../eta-ir" }
 eta-compiler = { path = "../eta-compiler" }
-# `CompiledModel` — the artifact this shell records and replays: the region template,
-# the class table a descriptor's counts index, and the arena's static offsets.
+# `CompiledModel`: the region template, the class table, the arena's offsets.
 model-compiler = { path = "../model-compiler" }
-# The residency half: `ModelContract` (the caller's, per decision #18 — the
-# shell is handed a contract, never a model family), `plan::compile` and the
-# `Execution` that runs it against the checkpoint. No family name crosses
-# this edge; `model` is a dev-dependency of the smoke and nothing more.
-#
-# AND THE PLAN VOCABULARY THE DEVICE ARENA SPEAKS: `executor::arena`'s
-# `ArenaBacking`/`TileMapOp` and `plan::passes::tile`'s four `CUDA_*` kernel
-# words, which `src/weights/arena.rs` implements against. The arrow runs this
-# way on purpose — the loader says *what* transform a plan calls for and
-# compiles that claim on a machine with no CUDA; this crate is where the claim
-# is cashed. It used to run both ways, through an optional `cuda` feature on
-# the loader that pulled `kernels-cuda` back across; nothing but the loader's
-# own test ever turned it on.
+# The residency half: `ModelContract`, `plan::compile`, and the `Execution` that
+# runs it against the checkpoint. No model family name crosses this edge.
+# The dependency points this way only: `checkpoint` says what transform a plan
+# calls for on a machine with no CUDA, and this crate cashes the claim.
 checkpoint = { path = "../checkpoint" }
 
 # The CUDA runtime, for the bytes this crate owns that no kernel entry
 # allocates: the arena, the weight store, the pool pages, the resident fire
-# inputs, and the stream they are all written on. `kernels-cuda` allocates
-# only its own process-global scratch, by design — see its `Ctx::scratch`.
+# inputs, and their stream.
 #
-# Optional and version-pinned the same way, for the same reason: the runtime
-# ABI is the BINARY's choice, and Cargo unifies features across the graph, so
-# a `cudarc` version selected here and a different one selected in
-# `kernels-cuda` would silently become one.
-#
-# THAT IS NOT HYPOTHETICAL, and the episode is worth carrying because of how
-# it surfaced. `checkpoint` used to hold a `cuda` feature of its own that
-# pinned `cudarc/cuda-12080` while this crate selected `cuda-13000`; the two
-# unified, cudarc's cublas `sys` module declared every enum twice, and the
-# build failed in `cargo test --doc` — nowhere near anything that named a
-# version. The rule the episode leaves behind is that a version is selected in
-# ONE place and inherited everywhere, which is what `cuda-12`/`cuda-13` below
-# do. There are two crates voting now rather than three: the loader's arm is
-# gone (its device half is `src/weights/arena.rs` in this crate), so the vote
-# is this manifest's and `kernels-cuda`'s, cast by the same two lines.
+# Cargo unifies features across the graph, so the `cudarc` version must be
+# selected identically here and in `kernels-cuda` or the two silently become
+# one build with duplicate cublas declarations.
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
     "std",
     "driver",
@@ -113,51 +61,30 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
 ] }
 
 [features]
-# `probe` only. Every item below compiles with no runtime selected and every
-# device call answers `Fault::Runtimeless` — the same property `kernels-cuda`
-# keeps, and what lets a plain workspace check carry this crate's host tests on
-# a machine with no GPU in it.
+# Every item compiles with no runtime selected, and every device call then
+# answers `Fault::Runtimeless` — which is what lets a plain workspace check
+# carry this crate's host tests on a machine with no GPU.
 default = ["probe"]
 
-# **THE GATE-ONLY HOOKS**, on the `checkpoint/testkit` pattern: on by default
-# so this crate's own gates build with a plain `cargo test`, and dropped by a
-# serving binary with `default-features = false` (which `runtime` does), so
-# nothing a serving path could call is compiled into one.
-#
-# It carries `Session::skew_prediction` — "state a prediction the device will
-# refuse", which exists because alto's channel protocol says a pass whose
-# prediction disagrees with the ring must be unobservable, and a correct engine
-# never disagrees with itself, so a gate has to make it disagree on purpose.
+# Gate-only hooks, on by default so this crate's gates build under a plain
+# `cargo test` and dropped by a serving binary with `default-features = false`.
+# It carries `Session::skew_prediction` ("state a prediction the device will
+# refuse"), which a correct engine never does on its own.
 probe = []
 
-# Exactly one of these turns the runtime on, and it must name the libcudart
-# this binary will LOAD. Forwarded to `kernels-cuda`, whose manifest explains
-# why guessing is unrecoverable (`cudaGraphAddNode`'s arity differs), and
-# pinned to the same `cudarc` version here so the two cannot disagree.
-cuda-12 = ["_cuda", "kernels-cuda/cuda-12", "cudarc/cuda-12080"]
-cuda-13 = ["_cuda", "kernels-cuda/cuda-13", "cudarc/cuda-13000"]
-
-# Private: "some CUDA version was chosen".
-_cuda = ["dep:cudarc"]
+# Turns the runtime on, pinned to the same `cudarc` version as `kernels-cuda`
+# so the two cannot disagree.
+cuda = ["dep:cudarc", "kernels-cuda/cuda", "cudarc/cuda-13000"]
 
 [dev-dependencies]
-# The smoke's catalog row and its load contract. A DEV dependency on purpose:
-# the runtime traces and hands a `Plan` and a `ModelContract` across (design
-# §7, decision #18), so the shell itself must not know a model family.
+# Dev-only on purpose: the runtime hands this shell a `Plan` and a
+# `ModelContract`, so the shell itself must not know a model family or how a
+# contract is written.
 models = { path = "../models" }
-# `Platform`, and the `Facts`/`Request` pair the smoke computes each lane's word
-# with — `Classify::of`, runtime-side in production.
 model-dsl = { path = "../model-dsl" }
-# The prompt in, the continuation out.
 tokenizer = { path = "../tokenizer" }
-# The checkpoint container the import contract is checked against, and the
-# projection that lets a stock safetensors snapshot BE one — the same pair
-# `checkpoint` uses, and for the same reason its manifest gives: `ztensor`
-# owns the container format, `ztensor-compat` owns the foreign projections.
+# The checkpoint container the import contract is checked against, plus the
+# projection that lets a stock safetensors snapshot be one.
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
-# The load-contract builder a synthetic text states its own claims through --
-# `a_stored_k_quant_row_serves_as_stored.rs` declares a model nobody ships and
-# so cannot borrow a family's `Model::load`. DEV only, for the same reason
-# `model` is: the shell must not know how a contract is written.
 checkpoint-dsl = { path = "../checkpoint-dsl" }

@@ -107,6 +107,8 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLResource",
     "MTLCommandQueue",
     "MTLCommandBuffer",
+    # `GPUStartTime`/`GPUEndTime` for the kernel profile (`encode::kernel_profile`).
+    "objc2-core-foundation",
     "MTLCommandEncoder",
     "MTLComputeCommandEncoder",
     "MTLComputePipeline",
@@ -125,6 +127,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+checkpoint-dsl = { path = "../checkpoint-dsl" }
 # The smoke's catalog row and its load contract. A DEV dependency on purpose:
 # the runtime traces and hands a `Plan` and a `ModelContract` across (design
 # §7, decision #18), so the shell itself must not know a model family.

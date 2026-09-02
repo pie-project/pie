@@ -72,18 +72,34 @@ pub fn ensure_installed(quiet: bool) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Best-effort install for the engine bootstrap path. Logs and swallows
-/// failures so a missing network doesn't block users who aren't
-/// running Python inferlets at all.
-pub fn ensure_installed_best_effort() {
-    if is_installed() {
+/// Best-effort install for the engine bootstrap path.
+///
+/// `enabled` is the effective `[sandbox] python_runtime` flag: when it is
+/// off the caller has said it wants nothing to do with the Python runtime,
+/// so we neither fetch nor warn. Otherwise a missing runtime is fetched and
+/// failures are logged, not fatal — a firewalled machine still serves Rust
+/// inferlets.
+pub fn ensure_installed_best_effort(enabled: bool) {
+    let dir = runtime_dir();
+    if !enabled {
+        tracing::debug!(
+            "python runtime download skipped: `python_runtime = false` under [sandbox]"
+        );
         return;
     }
+    if is_installed() {
+        tracing::debug!("python runtime already installed at {}", dir.display());
+        return;
+    }
+    tracing::info!(
+        "fetching the Python WASM runtime from {RUNTIME_URL} into {}",
+        dir.display()
+    );
     if let Err(e) = ensure_installed(/*quiet=*/ true) {
-        eprintln!(
-            "warning: could not auto-install Python WASM runtime ({e}); \
-             Python inferlets will fail to instantiate until you run \
-             `pie config init` manually."
+        tracing::warn!(
+            "could not fetch the Python WASM runtime from {RUNTIME_URL}: {e}. \
+             Python inferlets will not run until this download succeeds; set \
+             `python_runtime = false` under [sandbox] in the config to skip it."
         );
     }
 }
@@ -94,10 +110,9 @@ pub fn ensure_installed_best_effort() {
 /// `#[tokio::main]`, so there is no non-async context in this binary — the
 /// client here builds a tokio runtime of its own and dropping that inside an
 /// async one is an error tokio reports at runtime rather than a compile error.
-/// `pie config init` used to reach this directly and printed "Cannot drop a
-/// runtime in a context where blocking is not allowed" every time; it goes
-/// through `spawn_blocking` now, as `runtime install` and the bootstrap
-/// best-effort install already did.
+/// Reaching it from an async context prints "Cannot drop a runtime in a
+/// context where blocking is not allowed", so every caller goes through
+/// `spawn_blocking`.
 fn fetch() -> Result<Vec<u8>> {
     let resp = reqwest::blocking::Client::new()
         .get(RUNTIME_URL)

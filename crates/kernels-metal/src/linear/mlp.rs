@@ -135,7 +135,7 @@ pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<
     )
 }
 
-/// The ungated map (multimodal §6.2): gelu_tanh over one projection, no
+/// The ungated map: gelu_tanh over one projection, no
 /// `up` multiply — a tower MLP's spelling, not a gated trunk's with ones.
 pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.mlp_gelu_tanh";
@@ -164,8 +164,7 @@ pub fn geglu_tanh_packed(
     )
 }
 
-/// `up_cap: None` means uncapped; the shader reads 0 as "no cap", which is
-/// how the old DSL resolved the option too.
+/// `up_cap: None` means uncapped; the shader reads 0 as "no cap".
 pub fn situ(
     ctx: &Ctx<'_>,
     packed: Tensor,

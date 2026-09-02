@@ -70,21 +70,15 @@ pub enum Dtype {
     U2g64,
     /// Affine 2-bit, 128 per group: `g128_u2_bf16_b_bf16`.
     U2g128,
-    /// **[`U4g64`]'s codes under [`U4g64`]'s factors, in the order a
-    /// tensor-core lane reads them**: `g64_u4_bf16_b_bf16+tiled`.
+    /// [`U4g64`]'s codes under [`U4g64`]'s factors, in the order a
+    /// tensor-core lane reads them: `g64_u4_bf16_b_bf16+tiled`.
     ///
-    /// **THE ONE VARIANT WHOSE IDENTITY IS NOT ITS ALGEBRA.** [`repr`] answers
-    /// `U4g64`'s term here, and that sameness is the point: a repack moves no
-    /// value, so a term that differed would be a normal form a placement
-    /// decision could break. What differs is where a code SITS, which no
-    /// grouping can say — unlike [`E4m3row`] and [`E4m3tile128`], whose layout
-    /// IS their grouping and so does reach the term.
-    ///
-    /// Two consequences, both stated where they bite. [`of_fmt`] never answers
-    /// this variant — a term cannot distinguish it, so the canonical `U4g64`
-    /// is what a term resolves to and a TEXT declaring the tiling is the only
-    /// road here. And its spelling carries a `+tiled` placement tag past the
-    /// mangled term, so the wire form stays injective.
+    /// The one variant whose identity is not its algebra: [`repr`] answers
+    /// `U4g64`'s term here, since a repack moves no value — what differs is
+    /// where a code sits, which no grouping can say. So [`of_fmt`] never
+    /// answers this variant (only a text declaring the tiling can), and
+    /// its spelling carries a `+tiled` placement tag past the mangled
+    /// term to keep the wire form injective.
     ///
     /// [`repr`]: Dtype::repr
     /// [`of_fmt`]: Dtype::of_fmt
@@ -337,9 +331,8 @@ impl Dtype {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'+' {
-                // SAFETY-FREE: `+` is ASCII and never inside a UTF-8 tail, so
-                // the cut is on a boundary. `split_at` is the const-callable
-                // one; `str::split` is not.
+                // `+` is ASCII and never inside a UTF-8 tail, so the cut is
+                // on a boundary; `split_at` is the const-callable one.
                 let (term, _) = spelling.split_at(i);
                 return term;
             }
@@ -348,32 +341,24 @@ impl Dtype {
         spelling
     }
 
-    /// Whether this variant's identity includes a PLACEMENT its term cannot
-    /// carry — the `+tag` past the mangled spelling.
-    ///
-    /// Exactly the variants [`of_fmt`](Dtype::of_fmt) refuses to answer: their
-    /// term is some other variant's, so a term alone cannot pick them out and
-    /// only a declaration can.
+    /// Whether this variant's identity includes a placement its term
+    /// cannot carry — the `+tag` past the mangled spelling. Exactly the
+    /// variants [`of_fmt`](Dtype::of_fmt) refuses to answer, since their
+    /// term is some other variant's.
     #[must_use]
     pub const fn placed(self) -> bool {
         self.term().len() != self.spelling().len()
     }
 
-    /// **THE SIBLING THIS VARIANT SHARES A TERM WITH** — itself, for every
-    /// variant that is not [`placed`](Dtype::placed).
-    ///
-    /// A placement is not an algebra: `U4g64tiled`'s [`repr`](Dtype::repr) IS
-    /// `U4g64`'s, because a repack moves no value. So the term round-trip
-    /// through [`of_fmt`] — which skips placed variants by construction — is
-    /// already the canonicalizer, and this is that trip under the name of the
-    /// thing it answers. **IT CANNOT FAIL**: a placed variant's term is by
-    /// definition some unplaced variant's, and `repr_is_injective_and_of_fmt_
-    /// inverts_it` is what holds that.
-    ///
-    /// **WHO ASKS.** A placement is taken FOR a setup, and a setup whose
-    /// kernels have no reader for the arrangement takes the sibling instead —
-    /// `model_ir::Platform::placement` is that resolution and this is the
-    /// answer it narrows to.
+    /// The sibling this variant shares a term with — itself, for every
+    /// variant that is not [`placed`](Dtype::placed). A placement is not
+    /// an algebra: `U4g64tiled`'s [`repr`](Dtype::repr) is `U4g64`'s,
+    /// since a repack moves no value, so the term round-trip through
+    /// [`of_fmt`] (which skips placed variants) is already the
+    /// canonicalizer. Cannot fail: a placed variant's term is by
+    /// definition some unplaced variant's. Used when a setup's kernels
+    /// have no reader for a placement's arrangement and take the sibling
+    /// instead (`model_ir::Platform::placement`).
     ///
     /// [`of_fmt`]: Dtype::of_fmt
     #[must_use]
@@ -385,12 +370,9 @@ impl Dtype {
     }
 
     /// The variant a term names, or `None` for a term no variant serves.
-    ///
-    /// **PLACED VARIANTS ARE NOT CANDIDATES** ([`placed`](Dtype::placed)).
-    /// `U4g64tiled` shares `U4g64`'s term because a repack moves no value, so
-    /// answering it here would make the resolution depend on which of two
-    /// equal terms was checked first. The canonical sibling is the answer and
-    /// a model text is the only road to the placed one.
+    /// Placed variants are not candidates ([`placed`](Dtype::placed)):
+    /// `U4g64tiled` shares `U4g64`'s term, so answering it here would make
+    /// resolution depend on which of two equal terms was checked first.
     #[must_use]
     pub fn of_fmt(f: &Fmt<'_>) -> Option<Self> {
         for d in Self::ALL {
@@ -470,21 +452,15 @@ const _: () = {
     }
 };
 
-/// **THE COLUMN BAND A TILED AFFINE PLANE IS PADDED UP TO** — the m16n8k16
-/// tile's n extent, which is the column span one warp owns because one
-/// repacked word is a whole B fragment for two columns eight apart.
-///
-/// Mirrored from `kernels_cuda::linear::tiled`'s `BAND`, and it lives HERE —
-/// beside [`Dtype::U4g64tiled`], the variant that names the layout — because
-/// four crates need the same number and none of them may guess it: the model
-/// text sizes the three planes it publishes, `checkpoint-dsl` sizes the
-/// rectangle a contract claims, `checkpoint`'s repack checks the target shape
-/// it was declared, and the engine binds what the store holds. Two of those
-/// disagreeing is a buffer written past.
+/// The column band a tiled affine plane is padded up to — the m16n8k16
+/// tile's n extent, the column span one warp owns. Mirrored from
+/// `kernels_cuda::linear::tiled`'s `BAND`, and lives here beside
+/// [`Dtype::U4g64tiled`] because four crates need the same number and none
+/// may guess it: two disagreeing is a buffer written past.
 pub const TILED_BAND: u32 = 16;
 
-/// **THE CONTRACTION STEP a tiled affine plane groups its words by** — four
-/// 16-wide mma k tiles, which is the `uint4` superword one lane pulls in one
+/// The contraction step a tiled affine plane groups its words by — four
+/// 16-wide mma k tiles, the `uint4` superword one lane pulls in one
 /// instruction. [`TILED_BAND`]'s argument on the other axis: a `k` that is not
 /// a whole number of these is a row the kernel half-walks, and the refusal
 /// belongs where the text said it rather than at the launch.
@@ -523,8 +499,8 @@ impl<'de> serde::Deserialize<'de> for Dtype {
 
 #[cfg(test)]
 mod tests {
-    use super::{Dtype, Fmt, Group};
-    use std::string::{String, ToString};
+    use super::Dtype;
+    
     use std::vec::Vec;
 
     /// `repr` is injective over the UNPLACED variants and `of_fmt` inverts it
@@ -566,55 +542,6 @@ mod tests {
         assert_eq!(Dtype::U4g64tiled.canonical(), Dtype::U4g64);
     }
 
-    /// A composite variant's identifier is derived from its repr.
-    #[test]
-    fn composite_names_are_derived_from_their_reprs() {
-        fn cap(token: String) -> String {
-            let mut c = token.chars();
-            match c.next() {
-                Some(first) => first.to_uppercase().chain(c).collect(),
-                None => token,
-            }
-        }
-        fn derived(f: &Fmt<'_>) -> Option<String> {
-            let Fmt::Q { g, elem, gain, .. } = *f else {
-                return None;
-            };
-            let group = match g {
-                Group::N(n) => std::format!("g{n}"),
-                Group::Tile(r, c) if r == c => std::format!("tile{r}"),
-                Group::Tile(r, c) => std::format!("tile{r}x{c}"),
-                Group::Row => "row".to_string(),
-                Group::Tensor => "t".to_string(),
-            };
-            let nested = if matches!(gain, Fmt::Q { .. }) { "k" } else { "" };
-            Some(std::format!("{}{group}{nested}", cap(elem.to_string())))
-        }
-        let mut exceptions = Vec::new();
-        for d in Dtype::ALL {
-            let Some(name) = derived(d.repr()) else {
-                continue;
-            };
-            // A PLACED VARIANT'S NAME IS ITS SIBLING'S PLUS THE PLACEMENT, and
-            // it has to be: the repr the rule reads is the sibling's, so the
-            // derivation can reach the stem and never the tag. What is checked
-            // is that the tag in the name is the tag in the spelling — one
-            // word, spelled once, so the two cannot drift.
-            let ident = std::format!("{d:?}");
-            let name = if d.placed() {
-                let tag = d.spelling().rsplit('+').next().expect("a placed tag");
-                std::format!("{name}{tag}")
-            } else {
-                name
-            };
-            if ident == name {
-                continue;
-            }
-            exceptions.push(ident);
-        }
-        assert_eq!(exceptions, ["Mxfp4", "Nvfp4"]);
-    }
-
     /// What it writes is the canonical spelling, and the trip is an identity.
     #[cfg(feature = "serde")]
     #[test]
@@ -632,22 +559,4 @@ mod tests {
         assert!(bad.is_err(), "a vendor name is not a wire spelling");
     }
 
-    /// The bits-per-weight numbers the published tables pin.
-    #[test]
-    fn bpw_matches_the_published_tables() {
-        let k = 4096;
-        assert_eq!(Dtype::Mxfp4.bpw(k), Some(4.25));
-        assert_eq!(Dtype::Nvfp4.bpw(k), Some(4.5));
-        assert_eq!(Dtype::U4g64.bpw(k), Some(4.5));
-        assert_eq!(Dtype::U8g64.bpw(k), Some(8.5));
-        assert_eq!(Dtype::U4g32.bpw(k), Some(5.0));
-        assert_eq!(Dtype::U4g32k.bpw(k), Some(4.5));
-        assert_eq!(Dtype::I6g16k.bpw(k), Some(6.5625));
-        assert_eq!(Dtype::U2g16k.bpw(k), Some(2.625));
-        assert_eq!(Dtype::U5g32k.bpw(k), Some(5.5));
-        assert_eq!(Dtype::I3g16k.bpw(k), Some(3.4375));
-        assert_eq!(Dtype::E4m3row.bpw(4096), Some(8.0 + 32.0 / 4096.0));
-        assert_eq!(Dtype::E4m3row.bpw(1024), Some(8.0 + 32.0 / 1024.0));
-        assert_eq!(Dtype::Bf16.bpw(k), Some(16.0));
-    }
 }

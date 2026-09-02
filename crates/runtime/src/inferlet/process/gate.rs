@@ -1,14 +1,7 @@
-//! The residency gate — the only guest-side vestige of KV contention under
-//! Project Rainer (`rainer.md`).
-//!
-//! Every WIT host method that can touch pooled state passes through
-//! [`residency_gate`] in its prologue. The fast path is one relaxed atomic
-//! load of THIS process's own residency flag. When this process has been
-//! evicted by the planner, the gate first settles the process's own
-//! in-flight fire tail (releasing the fire leases the eviction's quiescence
-//! wait needs), then parks until the planner restores residency. There is
-//! no park protocol, no decline, no safe-point state — the guest simply
-//! waits out its own eviction.
+//! The residency gate. Every WIT host method that can touch pooled state
+//! passes through [`residency_gate`] in its prologue: a relaxed atomic load
+//! on the fast path, or, if evicted by the planner, settling this process's
+//! in-flight fire tail and parking until residency is restored.
 
 use anyhow::{Context, Result};
 
@@ -29,9 +22,8 @@ pub(crate) async fn residency_gate(ctx: &mut ProcessCtx) -> Result<()> {
     if planner.is_resident(pid) {
         return Ok(());
     }
-    // Settle our own submitted tail: the parked task must hold no pins, and
-    // these finalizations release the fire leases the eviction quiesces on.
-    // `wait_resident` re-posts the process-wide leave before parking.
+    // The parked task must hold no pins; these finalizations release the
+    // fire leases the eviction quiesces on.
     drain_pending_fires(ctx).await?;
     planner
         .wait_resident(pid)

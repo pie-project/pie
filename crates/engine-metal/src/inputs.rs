@@ -1,126 +1,7 @@
-//! The resident fire inputs: one allocation, carved once, overwritten every
-//! fire and never moved — **and one of them per in-flight step.**
-//!
-//! # Why there is more than one, and it is the whole run-ahead
-//!
-//! A `Shell` holds a `Vec<Inputs>`, one per arm, and a step writes only into
-//! its own. That is not a convenience: this store is `StorageModeShared`, so
-//! [`Inputs::write`] is a `memcpy` into the very bytes a shader will read, and
-//! a second frame staging into the same plane would rewrite the first frame's
-//! tokens under a running dispatch with nothing anywhere to fault on. One
-//! plane is what made frames-in-flight structurally one however deep a
-//! deployment asked to run.
-//!
-//! Everything below this paragraph is about ONE plane, and every word of it
-//! still holds: the ceiling reservation, the absent stream, the mint per
-//! staged vector. What the duplication adds is the seat, and the seat is
-//! `serve.rs`'s.
-//!
-//! **RESERVED AT THE CEILING, AND ON THIS PLANE THE REASON IS NOT CAPTURE.**
-//! The CUDA sibling reserves because its step 5 records device ADDRESSES into
-//! a graph that is never re-captured, so a buffer that were reallocated when a
-//! fire got bigger would leave the graph reading the old one — which does not
-//! even fault, because the old allocation is still mapped. This shell records
-//! nothing: design §6 gives it no `record.rs`, dispatch is encode-only, and
-//! eager IS the mode. That argument is therefore not copied here; two honest
-//! ones survive it, and they are enough.
-//!
-//! The first is arithmetic: ONE allocation at load, rather than one per fire.
-//! `newBufferWithLength:options:` is a kernel-side reservation and a
-//! zero-fill, and paying for one every fire to hold vectors whose ceiling a
-//! deployment already stated is work with nothing to show for it.
-//!
-//! The second is ordering: **a fire's staged vectors must not move while a
-//! command buffer that binds them is in flight.** The failure that would
-//! follow is shaped differently here than on the CUDA plane, and worse for
-//! it. A handle row RETAINS its `MTLBuffer` ([`crate::device::Handles`]), so a
-//! reallocation would not dangle — the old bytes stay mapped and stay alive —
-//! it would simply mean the encoded work reads the previous reservation while
-//! the host writes the next one, with nothing anywhere to fault on. So every
-//! vector is reserved at the budget's ceiling at load and a smaller fire
-//! writes its prefix; the LENGTH rides on the `Tensor` the handle is wrapped
-//! in and on the geometry, and the carve never moves.
-//!
-//! # There is no stream here, and nothing to be asynchronous about
-//!
-//! The CUDA `Inputs::write` takes a `stream` and pushes every vector across
-//! the bus with an async H2D memcpy, because on that plane host memory and
-//! device memory are two places and a copy between them is real work that can
-//! overlap. Apple silicon has one physical pool behind the CPU and the GPU,
-//! and this shell's reservations are `StorageModeShared`
-//! ([`crate::device::Buffer`]), so a write IS a `memcpy` into the very bytes a
-//! shader will read. There is no transfer to put on a queue, so the parameter
-//! is DROPPED rather than answered with a null: a stream argument nobody could
-//! pass anything meaningful to is a lie about what this plane does.
-//!
-//! **What survives the drop is ORDER, not asynchrony.** A host write must
-//! happen before the command buffer that reads those bytes is committed. That
-//! is a fact about the call sequence in `serve` — write the fire's vectors,
-//! then encode, then commit — and not a flag on a buffer, an event on a queue,
-//! or anything this module can enforce. It is stated here because it is the
-//! one piece of the CUDA stream discipline that did not evaporate.
-//!
-//! # A carved view is a handle, not an address
-//!
-//! A `kernels_cuda::Tensor` carries a device address, so its shell answers
-//! "where did the tokens land" with `base + offset` and no state. A
-//! `kernels_metal::Tensor` carries a `u32` row of [`crate::device::Handles`],
-//! because an encoder binds a BUFFER and an OFFSET rather than a pointer. So
-//! every vector this module stages is followed by a MINT: one row naming the
-//! store and the offset the vector was written at. The rows are per-fire and
-//! `Handles::rewind` drops them at the end of one, which is why minting here
-//! costs a `Vec` push and no bookkeeping.
-//!
-//! Two tables in this crate are called `Handles`, and the collision is worth
-//! naming once: [`Handles`] in this file is the fire's RESOLVED VIEWS, one
-//! `Tensor` per input the plan or the engine reads, and
-//! [`crate::device::Handles`] is the shell's handle table those `Tensor`s are
-//! rows of. This file spells the second by path everywhere, and never imports
-//! it.
-//!
-//! # What is here, and what the plan names
-//!
-//! ```text
-//! tokens, positions        RuntimeInput::Tokens / ::Positions
-//! per space: indptr,       RuntimeInput::Geometry { space, kind }
-//!   indices, last_page_len,
-//!   kv_len, write_page,
-//!   write_offset
-//! window boundaries        ambient — no op names it (design §5); one
-//!                          rebased `[lanes + 1]` run per WINDOW, not one
-//!                          per fire
-//! per space: mask bits     RuntimeInput::Mask { space }
-//! adapter routes           RuntimeInput::AdapterRoutes
-//! mask spans               ambient — `attention.masked`'s op-named bits have
-//!                          no seat for their per-request byte offsets, so
-//!                          the plan-prefill arm binds one onto the schedule
-//! row_valid                the padding mask the kv writers read past the IR
-//! slot_ids                 which recurrent bank each lane owns
-//! plan workspace           the prepare phase's staging, granted per plan kind
-//! ```
-//!
-//! The unseated ones are not oversights: the qo boundaries were deliberately
-//! unnamed, and `row_valid`/`slot_ids`/the mask spans/the workspace are
-//! engine facts the entries take beside the ops' operands (the `MENLO-SEAM`
-//! markers `run.rs` catalogues).
-//!
-//! # The mask slab is reserved against the CONTEXT, not measured
-//!
-//! A lane's mask expands to `rows x (held + rows)` bits ([`crate::mask`]), so
-//! the fire-wide worst case is every row of the ceiling against a full
-//! context — `max_tokens * pages_per_slot * page_size / 8`, plus one byte per
-//! lane because each lane's region starts on a byte boundary. Reserved like
-//! everything else here, for the reason the top of this file states: the carve
-//! happens once, at load, and a fire past it is `Fault::Ceiling` naming the
-//! mask bits, never a reallocation under an encoder that has already bound the
-//! old one.
-//!
-//! # Grants are disjoint carvings, one per plan kind
-//!
-//! `CachePlanning` wants a separate [`Workspace`] for the decode and prefill
-//! builders because their staged int images coexist within a fire — the
-//! prepare phase builds both before either is consumed. One pool, cut in two,
-//! is what that sentence means in bytes.
+//! Resident fire inputs: one allocation per in-flight step, carved once at
+//! load and never moved. Writes are direct memcpys (`StorageModeShared`);
+//! ordering is write, then encode, then commit. Each staged vector is
+//! followed by a mint into [`crate::device::Handles`].
 
 use kernels_metal::Tensor;
 use model_compiler::Budget;
@@ -131,38 +12,18 @@ use crate::error::{Fault, Result};
 use crate::store::SpaceSeat;
 use crate::store::kv::{Geometry, Paging};
 
-/// **THERE IS NO SCHEDULE GRANT ON THIS PLANE, AND THE ABSENCE IS THE POINT.**
-/// The CUDA sibling carves one workspace per PLAN VALUE at this point in the
-/// file — `graph_float_bytes` of split-kv partial outputs beside a flat
-/// integer slab — because `kernels-cuda`'s `plan_prefill` builds a schedule
-/// whose partials it owns, and because a captured schedule's footprint has to
-/// be a function of the KEY (build log 13, where a 10 MiB shortfall silently
-/// declined every capture and cost only speed).
-///
-/// `kernels-metal` builds no schedule at all. `attn::plan_decode` and
-/// `attn::plan_prefill` are pure carriers — they check the fire tables agree
-/// and hand them back — and the sdpa shaders split no kv, so there are no
-/// partials to hold. A grant here would be a reservation nothing reads: at
-/// qwen35-d0.8b's four plan values it measured 216 MiB of one, which was most
-/// of this shell's whole `inputs` footprint. The arithmetic is not kept "for
-/// the day"; it lives in the CUDA shell, where it has a consumer, and the day
-/// a metal builder wants a workspace it arrives with one.
+// No schedule-grant workspace on this plane: `kernels-metal`'s sdpa shaders
+// split no kv, so there are no partials to hold.
 
 /// The alignment every carved region starts on.
 const ALIGN: u64 = 256;
 
-/// The axes a multimodal position carries: time, and the patch's row and
-/// column in its grid. `kernels_metal::elemwise::rope_mrope::AXES` is the
-/// same number where the shader reads it; this is where the seat is sized.
+/// The axes a multimodal position carries: time, row, column. Matches
+/// `kernels_metal::elemwise::rope_mrope::AXES`.
 const AXES: u64 = 3;
 
-/// **WHAT A PLAN'S PATCH AXIS ASKS OF THE STORE** (multimodal §5.5), read off
-/// the trace and the deployment's ladder at load and `None` for every plan
-/// that states no patch row.
-///
-/// `None` is what makes the axis free: a text-only load carves none of the
-/// six regions below and the whole of the second row axis costs it zero
-/// bytes.
+/// What a plan's patch axis asks of the store, read off the ladder at load;
+/// `None` for a plan with no patch row, so a text-only load carves nothing.
 #[derive(Debug, Clone, Copy)]
 pub struct PatchSeat {
     /// The most patch rows one fire may carry — the ladder's `max_patches`.
@@ -216,12 +77,9 @@ pub struct Handles {
     pub tokens: Tensor,
     /// `RuntimeInput::Positions`.
     pub positions: Tensor,
-    /// The handle the packed per-window boundary vectors were minted at —
-    /// [`Windows::bind`](crate::window::Windows::bind) cuts them apart, one
-    /// row per window, through
-    /// [`Handles::cut`](crate::device::Handles::cut). A `u32` where the CUDA
-    /// shell carries a `u64` base address, for the reason the top of this
-    /// file states: on this plane the cut IS a handle.
+    /// The handle the packed per-window boundary vectors were minted at;
+    /// [`Windows::bind`](crate::window::Windows::bind) cuts one row per
+    /// window out of it.
     pub windows: u32,
     /// One entry per kv geometry space, in space order.
     pub spaces: Vec<SpaceHandles>,
@@ -233,41 +91,32 @@ pub struct Handles {
     /// The padding mask the kv writers read.
     pub row_valid: Tensor,
     /// `RuntimeInput::AdapterRoutes`: `i32`, one adapter id per token row.
-    /// `None` when no lane of this fire carried one — the shell then binds no
-    /// seat, exactly as it does for the mask, and the correction's window is
-    /// empty so nothing reads it.
+    /// `None` when no lane of this fire carried one, and no seat is bound.
     pub adapter_routes: Option<Tensor>,
     /// `i32`, one per token row: which lane owns it. Read directly by every
-    /// sdpa entry, which is why this plane stages it and the CUDA one does
-    /// not.
+    /// sdpa entry.
     pub request_of_token: Tensor,
     /// `u8`, `[rows * mask_stride]`: 1 keeps the (query, key) pair. Always
     /// bound — see [`mask_enabled`](Handles::mask_enabled).
     pub mask: Tensor,
     /// `u8`, one per token row: whether that row's mask plane is consulted.
-    ///
-    /// **ALWAYS BOUND, NEVER OPTIONAL.** Every shipped sdpa entry
-    /// instantiates `FAST_FULL = false` and therefore reads
-    /// `attention_mask_enabled[row]` on every launch, masked fire or not. An
-    /// unbound seat here is a null dereference on the first decode; a zeroed
-    /// one is the unmasked reading, which is what a fire no lane masked
-    /// wants.
+    /// Always bound, never optional — every sdpa entry reads it on every
+    /// launch; zeroed means unmasked.
     pub mask_enabled: Tensor,
     /// Key positions from one row's plane to the next, as the shaders read
     /// it.
     pub mask_stride: u32,
-    /// **THE SECOND ROW AXIS'S SEATS**, or `None` for a fire whose lanes
-    /// carried no image — which is every fire of a text-only load and every
-    /// image-free fire of a vision one.
+    /// The second row axis's seats, or `None` for a fire whose lanes carried
+    /// no image.
     pub patches: Option<PatchHandles>,
-    /// `RuntimeInput::MropePositions`: `i32`, `[rows, 3]` — the TRUNK's
-    /// triple-wide position stream, on the TOKEN axis.
-    ///
-    /// `None` for a load whose plan declares no `rope_mrope`, and filled with
-    /// the scalar reading `(p, p, p)` for a lane under M-RoPE that submitted
-    /// no stream of its own, which is what makes a text-only fire of a vision
-    /// row rotate exactly as its plain twin does.
+    /// `RuntimeInput::MropePositions`: `i32`, `[rows, 3]`, the trunk's
+    /// triple-wide position stream. `None` for a plan with no `rope_mrope`.
     pub mrope_positions: Option<Tensor>,
+    /// `i32`, `[lanes]`: buffered tokens each lane replays ahead of its rows,
+    /// and the rows of its extended run whose recurrent state persists
+    /// (`crate::rs`). `None` for a fire every lane of which folds.
+    pub rs_replay: Option<Tensor>,
+    pub rs_commit: Option<Tensor>,
 }
 
 /// The patch axis's device seats, as one fire resolved them.
@@ -321,10 +170,9 @@ pub struct Fire<'a> {
     /// The same fact per token ROW, in fire row order — what the ssm
     /// shaders index.
     pub slot_of_row: &'a [i32],
-    /// Which adapter each token ROW routes to, in fire row order, or `None`
-    /// when no lane carried one. Per ROW and not per lane, because that is
-    /// what the correction kernel indexes with: `routes[row]` beside
-    /// `x[row]`, the same shape `tokens` and `positions` have.
+    /// Which adapter each token row routes to, in fire row order (the
+    /// correction kernel indexes `routes[row]` beside `x[row]`), or `None`
+    /// when no lane carried one.
     pub adapter_routes: Option<&'a [i32]>,
     /// Which lane owns each token row, in fire row order.
     pub request_of_token: &'a [i32],
@@ -338,14 +186,15 @@ pub struct Fire<'a> {
     /// The trunk's `(t, h, w)` stream, three per TOKEN row in fire row order,
     /// or `None` for a plan that declares no `rope_mrope`.
     pub mrope_positions: Option<&'a [i32]>,
+    /// The recurrent seat's two per-lane tables (`crate::rs`), or `None` for
+    /// a fire every lane of which folds in the forward.
+    pub rs_replay: Option<&'a [i32]>,
+    pub rs_commit: Option<&'a [i32]>,
 }
 
-/// The patch axis's six vectors, host side, in fire patch order.
-///
-/// **ALREADY PLACED, NOT APPENDED.** Every one of these is written at the
-/// composition's own `patch_offset` for the lane that submitted it, which is
-/// why this struct is six flat slices and carries no per-lane structure: the
-/// seriation happened in `serve`, where the composition is.
+/// The patch axis's six vectors, host side, in fire patch order. Already
+/// placed at each lane's own `patch_offset`; the seriation happened upstream
+/// in `serve`.
 #[derive(Debug, Clone, Copy)]
 pub struct PatchFire<'a> {
     /// `[patch rows, C·T·P²]` in the plan's element, little-endian.
@@ -389,15 +238,15 @@ pub struct Inputs {
     /// `RuntimeInput::MropePositions`' region, or `None` for a plan that
     /// declares no multimodal rotation. `rows * 3` `i32` at the ceiling.
     mrope: Option<u64>,
+    /// The recurrent seat's per-lane tables, `lanes` `i32` each. Reserved
+    /// unconditionally: two words a lane.
+    rs_replay: u64,
+    rs_commit: u64,
 }
 
 impl Inputs {
-    /// Reserve the vectors a deployment's ceilings admit.
-    ///
-    /// `device` is taken where the CUDA sibling takes nothing: a
-    /// `cudaMalloc` addresses the thread's bound context implicitly, and an
-    /// `MTLBuffer` is made BY a device object, so the reservation has to be
-    /// handed the one this shell bound.
+    /// Reserve the vectors a deployment's ceilings admit. `device` is taken
+    /// because an `MTLBuffer` is made by a device object.
     ///
     /// # Errors
     ///
@@ -419,29 +268,9 @@ impl Inputs {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
         let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
-        // A window is one contiguous run of the fire's class order, so a plan
-        // of `k` classes has at most `k(k+1)/2` of them — plus one for the
-        // zero window every empty region shares. Reserved rather than
-        // measured, because this carve is made once at load and a fire that
-        // grew it would move bytes an encoder has already bound (the note at
-        // the top of this file).
-        //
-        // **AND A GATHERED WINDOW IS BIGGER THAN A BOUNDARY VECTOR.** A
-        // `Fallback::Copy` window (`crate::window::Gathered`) writes its row
-        // map, the two ambient row tables re-laid under it, and — per kv
-        // space — a fresh page-bounds prefix sum, the compacted page-id list
-        // and the two per-lane vectors. Every one of those is HOST-written,
-        // which is precisely why they belong in this plane and not in
-        // `crate::scratch`: that plane rests on nothing there ever being
-        // touched by the host, and these are computed on it.
-        //
-        // `gathered` is how many DISTINCT windows this artifact can ever
-        // gather — the masks P4 wrote a `Fallback::Copy` row for, counted at
-        // load off the bake, and `0` for an artifact that owes no row at all.
-        // Counted rather than bounded by the window count above, because the
-        // per-window cost here is `3 * max_tokens` plus a page list and a
-        // reservation at the whole triangle would be tens of MiB for a path
-        // one or two masks can take.
+        // At most `k(k+1)/2` windows for `k` classes, plus one shared zero
+        // window; `gathered` bounds how many need the larger `Fallback::Copy`
+        // layout.
         let per_gathered =
             3 * rows + spaces as u64 * (2 * lanes + (lanes + 1) + pages);
         let window_ints =
@@ -458,49 +287,21 @@ impl Inputs {
         let windows = take(window_ints * 4);
         let row_valid = take(rows);
         let slot_ids = take(lanes * 4);
-        // **THE RECURRENT SLOT MAP IS PER ROW ON THIS PLANE, NOT PER LANE.**
-        // The CUDA sibling's `RecurrentPool::slot_ids` is one entry per lane
-        // and its scans read `slot_ids[lane]`; every metal ssm shader reads
-        // `slots[r]` where `r` is a TOKEN ROW — the decode arms index the
-        // grid row directly (`ssm_causal_conv1d.metal`'s `slots[r]`,
-        // `ssm_gated_delta.metal`'s `slots[n]`) and the chunked arms index
-        // the request's FIRST row (`slots[indptr[r]]`). For a fire of one
-        // lane the two readings coincide, which is exactly why the
-        // difference survived every solo gate and only showed up when a
-        // decode lane stood beside a prefill one.
+        // Per row, not per lane: every metal ssm shader indexes `slots[r]` by
+        // token row.
         let slot_of_row = take(rows * 4);
-        // The adapter axis's one vector, reserved at the row ceiling like
-        // every other row-shaped table here — 32 KiB at `max_tokens = 8192`,
-        // paid by every load whether or not the plan declares a correction,
-        // because a conditional carve would make the STORE's layout depend on
-        // the plan and this layout is fixed at load.
+        // Reserved unconditionally so the store's layout does not depend on
+        // whether the plan declares a correction.
         let adapter_routes = take(rows * 4);
-        // WHICH LANE EACH TOKEN ROW BELONGS TO, and it is reserved here
-        // rather than derived at the shader because the metal sdpa entries
-        // read it directly: `req_of_token[row]` is what indexes the page
-        // table. The CUDA sibling has no such seat — its plan builders walk
-        // the boundaries host-side and bake the answer into a schedule — so
-        // this vector is one of the two places the two planes' fire inputs
-        // genuinely differ.
         let request_of_token = take(rows * 4);
-        // **THE MASKED AXIS, IN THIS PLANE'S OWN ABI.** The CUDA shell packs
-        // one BIT per (query, key) pair with a per-lane indptr; the metal
-        // shaders read one BYTE per pair out of a row-major plane with a
-        // stated stride (`attention_mask[row * stride + kp]`), gated per row
-        // by `attention_mask_enabled[row]`. So the carve is a rectangle:
-        // `max_tokens` rows of `context` bytes, plus the enable column. It is
-        // eight times the CUDA reservation for the same fire and it is the
-        // ABI the shipped shaders read; `crate::mask` argues the expansion.
+        // One byte per (query, key) pair, row-major with a stated stride
+        // (`attention_mask[row * stride + kp]`).
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
         let mask_stride = u32::try_from(context).unwrap_or(u32::MAX);
         let mask_plane_bytes = rows * context;
         let mask_planes = take(mask_plane_bytes);
-        // Always bound, never optional: `attention_mask_enabled[row]` is read
-        // on EVERY sdpa launch (the shipped entries instantiate
-        // `FAST_FULL = false`), so an unbound seat is a null dereference on
-        // the first decode rather than a mask nobody asked for. Zeroed at
-        // reservation and rewritten per fire, which is what makes "no lane
-        // masked" cost one `memset` of `rows` bytes.
+        // Always bound: read on every sdpa launch, so an unbound seat would
+        // be a null dereference.
         let mask_enabled = take(rows);
         let spaces: Vec<SpaceAt> = (0..spaces)
             .map(|_| SpaceAt {
@@ -512,16 +313,7 @@ impl Inputs {
                 write_offset: take(rows * 4),
             })
             .collect();
-        // **THE SECOND ROW AXIS'S SIX REGIONS** (multimodal §5.5). Carved at
-        // the patch ladder's own ceilings, which are not the token axis's:
-        // a fire's patch rows are `max_patches` at most whatever `max_tokens`
-        // says, because patches-per-image is fixed by the resize policy and
-        // tokens-per-fire is not.
-        //
-        // **AND THE WHOLE AXIS IS `None` FOR A TEXT-ONLY LOAD**, which is
-        // what makes it free: no region is taken, `at` does not move, and the
-        // reservation is byte-identical to the one this plane made before the
-        // door was cut.
+        // `None` for a text-only load: no region taken, `at` does not move.
         let patch = patch.map(|seat| PatchAt {
             payload: take(seat.rows * seat.row_bytes),
             segments: take((seat.images + 1) * 4),
@@ -535,10 +327,9 @@ impl Inputs {
             },
             seat,
         });
-        // The trunk's triple, on the TOKEN axis and therefore at the token
-        // ceiling — three `i32` per row of `max_tokens`, which is 96 KiB at
-        // 8192 and is taken only for a plan that declares the rotation.
         let mrope = mrope.then(|| take(rows * AXES * 4));
+        let rs_replay = take(lanes * 4);
+        let rs_commit = take(lanes * 4);
         let total = at;
 
         let store = Buffer::zeroed(device, total)?;
@@ -560,13 +351,13 @@ impl Inputs {
             spaces,
             patch,
             mrope,
+            rs_replay,
+            rs_commit,
         })
     }
 
     /// The patch element this load computes in, or `None` for a plan that
-    /// states no patch row — which is what the marshal one crate boundary up
-    /// converts a submission's `f32` payload into, and what makes a media
-    /// submission against a text-only load a refusal rather than a guess.
+    /// states no patch row.
     #[must_use]
     pub fn patch_element(&self) -> Option<Dtype> {
         self.patch.map(|at| at.seat.dtype)
@@ -579,19 +370,8 @@ impl Inputs {
     }
 
     /// Write one fire's vectors into the store and hand back their handles.
-    ///
-    /// **THE WRITES ARE `memcpy`, AND THE ORDER IS THE CALLER'S.** The CUDA
-    /// twin of this method takes a stream and stages every vector
-    /// asynchronously on it, because there the copy is a transfer that can
-    /// overlap. Here the store is `StorageModeShared` — one physical pool,
-    /// mapped — so each write lands in the bytes a shader will read and
-    /// there is nothing to overlap and nothing to order against. What the
-    /// caller still owes is the sequence: every call to this method must
-    /// precede the commit of the command buffer that reads what it wrote.
-    ///
-    /// Each staged vector is followed by a MINT: one row of `handles` naming
-    /// the store and the offset, which is what a `kernels_metal::Tensor`
-    /// carries in place of an address. The rows die with the fire.
+    /// The caller must call this before committing the command buffer that
+    /// reads what it wrote.
     ///
     /// # Errors
     ///
@@ -606,11 +386,7 @@ impl Inputs {
         let rows = fire.tokens.len() as u32;
         let lanes = fire.slot_ids.len() as u32;
 
-        // The padding mask is all-valid in an eager fire: every row a fire
-        // carries is a row it means. It exists as a vector rather than as an
-        // absent argument because the kv writers read it unconditionally, and
-        // because a plane that ever pads a bucket's rows would have exactly
-        // this table to say which of them are real.
+        // All-valid in an eager fire; the kv writers read this unconditionally.
         let valid = vec![1u8; rows as usize];
 
         self.store.write(self.tokens, bytes_of(fire.tokens))?;
@@ -629,12 +405,23 @@ impl Inputs {
             .write(self.request_of_token, bytes_of(fire.request_of_token))?;
         self.store
             .write(self.slot_of_row, bytes_of(fire.slot_of_row))?;
+        let rs_tables = match (fire.rs_replay, fire.rs_commit) {
+            (Some(replay), Some(commit)) => {
+                if replay.len() != lanes as usize || commit.len() != lanes as usize {
+                    return Err(Fault::Ceiling {
+                        what: "recurrent seat tables, one entry per lane",
+                        need: replay.len().max(commit.len()) as u64,
+                        have: u64::from(lanes),
+                    });
+                }
+                self.store.write(self.rs_replay, bytes_of(replay))?;
+                self.store.write(self.rs_commit, bytes_of(commit))?;
+                true
+            }
+            _ => false,
+        };
 
-        // THE ADAPTER AXIS, WRITTEN OR NOT WRITTEN — the mask's rule, for the
-        // mask's reason. A fire no lane routed writes nothing here and binds
-        // no seat, so a correction that somehow reached a launch would hit
-        // `Run::tensor`'s named panic rather than read a slab of zeros, which
-        // is every row routed to adapter 0 of a bank nobody registered.
+        // A fire no lane routed writes nothing here and binds no seat.
         let adapter_routes = match fire.adapter_routes {
             None => None,
             Some(routes) => {
@@ -643,15 +430,8 @@ impl Inputs {
             }
         };
 
-        // **THE MASKED AXIS, IN THIS PLANE'S ROW-MAJOR ABI.** The metal sdpa
-        // entries read `attention_mask[row * stride + kp]` gated by
-        // `attention_mask_enabled[row]`, and both seats are read on EVERY
-        // launch — the shipped instantiations are `FAST_FULL = false`. So the
-        // choice the CUDA sibling has (bind no seat at all, and let a masked
-        // consumer refuse) does not exist here: an unbound seat is a null
-        // dereference on the first decode of every fire. What replaces it is
-        // the enable column, written to zeros for a fire no lane masked,
-        // which is exactly the unmasked reading.
+        // Both are read on every launch, so always bound; no lane masked
+        // means the enable column is zeroed, not that the seat is absent.
         let stride = fire.mask.map_or(0, |staged| staged.stride);
         if u64::from(stride) > u64::from(self.mask_stride) {
             return Err(Fault::Ceiling {
@@ -662,8 +442,6 @@ impl Inputs {
         }
         match fire.mask {
             None => {
-                // One `memset` of `rows` bytes, and nothing else: the plane
-                // itself is never read when no row enables it.
                 self.store
                     .zero_span(self.mask_enabled, u64::from(rows))?;
             }
@@ -680,13 +458,7 @@ impl Inputs {
             }
         }
 
-        // **THE SECOND ROW AXIS, STAGED OR NOT STAGED** — the adapter axis's
-        // rule, for the adapter axis's reason. A fire with no image writes
-        // nothing here and binds no seat, so a tower node that somehow
-        // reached a launch would hit `Run::whole`'s named panic rather than
-        // read a slab of zeros; and it cannot reach one, because the tower's
-        // capture unit has zero patch rows and the walk skips a zero-row
-        // region before it dispatches.
+        // A fire with no image writes nothing here and binds no seat.
         let patches = match (fire.patches, self.patch) {
             (None, _) => None,
             (Some(_), None) => {
@@ -698,10 +470,8 @@ impl Inputs {
             }
             (Some(staged), Some(at)) => {
                 let seat = at.seat;
-                // Every one of the six is checked against the RESERVATION and
-                // not against the other five: a fire past the ladder is
-                // `Fault::Ceiling` naming the vector it overran, never a
-                // write into the region behind it.
+                // Each of the six is checked against its own reservation,
+                // never against the region behind it.
                 let rows = (staged.payload.len() as u64)
                     .checked_div(seat.row_bytes)
                     .unwrap_or(0);
@@ -751,8 +521,7 @@ impl Inputs {
                         staged.segments.len() as u32,
                     )?,
                     routes: i32s(handles, &self.store, at.routes, staged.routes.len() as u32)?,
-                    // `[patch rows, 3]`, which is the rectangle the rotation
-                    // reads one triple per row out of — not a column.
+                    // `[patch rows, 3]`: one triple per row, not a column.
                     positions: Tensor::new(
                         handles.bind(
                             &self.store,
@@ -795,9 +564,7 @@ impl Inputs {
             }
         };
 
-        // **THE TRUNK'S TRIPLE**, on the token axis: `[rows, 3]` `i32`. A
-        // plan that declares no multimodal rotation reserves nothing and
-        // binds nothing.
+        // `[rows, 3]` `i32`. A plan with no multimodal rotation binds nothing.
         let mrope_positions = match (fire.mrope_positions, self.mrope) {
             (None, _) | (_, None) => None,
             (Some(triples), Some(at)) => {
@@ -847,9 +614,8 @@ impl Inputs {
         Ok(Handles {
             tokens: i32s(handles, &self.store, self.tokens, rows)?,
             positions: i32s(handles, &self.store, self.positions, rows)?,
-            // The packed run is minted WHOLE, at the bytes this fire wrote:
-            // `Windows::bind` cuts one row per window out of it, and a cut
-            // past what was written is refused there rather than read here.
+            // Minted whole, at the bytes this fire wrote; `Windows::bind`
+            // cuts one row per window out of it.
             windows: handles.bind(
                 &self.store,
                 self.windows,
@@ -869,10 +635,7 @@ impl Inputs {
                 Dtype::U8,
             ),
             request_of_token: i32s(handles, &self.store, self.request_of_token, rows)?,
-            // The plane is minted at the fire's OWN rectangle — `rows` of
-            // `stride` bytes — so a windowed launch's `Run::cut_rows` steps
-            // by the stride the shader was told, and a cut past what this
-            // fire wrote is refused by the handle table rather than read.
+            // Minted at the fire's own rectangle: `rows` of `stride` bytes.
             mask: Tensor::new(
                 handles.bind(
                     &self.store,
@@ -892,18 +655,22 @@ impl Inputs {
             mask_stride: stride,
             patches,
             mrope_positions,
+            rs_replay: if rs_tables {
+                Some(i32s(handles, &self.store, self.rs_replay, lanes)?)
+            } else {
+                None
+            },
+            rs_commit: if rs_tables {
+                Some(i32s(handles, &self.store, self.rs_commit, lanes)?)
+            } else {
+                None
+            },
         })
     }
 
-    /// The pool seats one fire lends its cache table.
-    ///
-    /// **NOTHING IS MINTED HERE, AND THE TABLE IS TAKEN ANYWAY.** Every seat
-    /// below is a view [`write`](Inputs::write) already minted a row for, and
-    /// a handle is minted once and shared rather than re-minted per reader —
-    /// so this entry stays infallible, as its CUDA twin is. `_handles` is
-    /// taken so the call reads like every other fire-time entry in this
-    /// module and so the caller must have the table these `Tensor`s resolve
-    /// through in hand at the moment it lends them.
+    /// The pool seats one fire lends its cache table. Nothing is minted
+    /// here — every seat is a view [`write`](Inputs::write) already minted,
+    /// so this stays infallible.
     #[must_use]
     pub fn seats(
         &self,
@@ -934,11 +701,7 @@ impl Inputs {
 }
 
 /// One `i32` column, `rows` tall, as a freshly minted handle into `store`.
-///
-/// The CUDA shell spells this `Tensor::new(base + offset, rows, 1, I32)` and
-/// needs no fallibility, because address arithmetic cannot fail. Here the
-/// same sentence is a row in a table that is bounds-checked and finite, so it
-/// answers a `Result`.
+/// Fallible: the handle table is bounds-checked and finite.
 fn i32s(
     handles: &crate::device::Handles,
     store: &Buffer,
@@ -949,19 +712,8 @@ fn i32s(
     Ok(Tensor::new(buf, rows, 1, Dtype::I32))
 }
 
-/// The same column, wearing `u32` — for the two seats whose shader says so.
-///
-/// **THE HOST STAGES THESE AS `i32` AND THE SHADER READS THEM AS `uint`, AND
-/// BOTH ARE RIGHT.** `store::kv::Geometry` carries every vector as `Vec<i32>`
-/// because that is the one integer the geometry arithmetic is written in, but
-/// a write page and an in-page offset are counts — never negative, derived
-/// from a `u32` page table — so `attn/kv_write.metal` declares them
-/// `const device uint*` and `kernels_metal::attn::append_paged` refuses a
-/// write table that is not `U32`. Four bytes either way and the same
-/// little-endian bits, so the relabel copies nothing; what it does is let the
-/// seat state what the kernel it is bound to actually reads. The other
-/// seats — indptr, indices, the two lengths — stay `i32` because their
-/// shaders do.
+/// The same column, wearing `u32` — for `write_page`/`write_offset`, which
+/// `attn/kv_write.metal` declares `const device uint*` (same bytes).
 fn u32s(
     handles: &crate::device::Handles,
     store: &Buffer,
@@ -973,32 +725,20 @@ fn u32s(
 }
 
 /// A vector of `f32` as the bytes a copy takes — [`bytes_of`]'s twin for the
-/// one staged vector that is not an integer.
-///
-/// The interpolation weights are the preprocessor's arithmetic and
-/// `layout.embed_weighted` refuses anything but `f32` for them
-/// (`kernels_metal::layout::embed_weighted`), so this is the one place the
-/// shell writes a float vector that is not a payload.
+/// one staged vector that is not an integer (interpolation weights).
 fn f32_bytes_of(values: &[f32]) -> &[u8] {
-    // SAFETY: `f32` is `Copy`, has no padding and no niche, so all `4 * len`
-    // of its bytes are initialized and readable as `u8`. The result borrows
-    // the input and is read, never written, for the length of one `memcpy`.
+    // SAFETY: `f32` is `Copy` with no padding/niche; all bytes are init and
+    // readable as `u8`.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
     }
 }
 
-/// A vector of `i32` as the bytes a copy takes.
-///
-/// Little-endian, stated rather than derived: every device this ships on is,
-/// and the fire descriptor's own layout says the same thing for the same
-/// reason. The one reinterpretation in the shell, and it is the operation
-/// `bytemuck::cast_slice` exists to name — pulling a crate in for three lines
-/// would add a dependency and say nothing this comment does not.
+/// A vector of `i32` as the bytes a copy takes. Little-endian, which every
+/// device this ships on is.
 fn bytes_of(values: &[i32]) -> &[u8] {
-    // SAFETY: `i32` is `Copy`, has no padding and no niche, so all `4 * len`
-    // of its bytes are initialized and readable as `u8`. The result borrows
-    // the input and is read, never written, for the length of one `memcpy`.
+    // SAFETY: `i32` is `Copy` with no padding/niche; all bytes are init and
+    // readable as `u8`.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
     }

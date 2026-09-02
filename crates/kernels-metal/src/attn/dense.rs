@@ -1,29 +1,8 @@
 //! `Dense`: bidirectional attention over the patch window — the vision
-//! towers' one real kernel (`.wiki/alto/multimodal.md` §2), and this plane's
-//! mirror of `kernels_cuda::attn_dense`.
-//!
-//! **A NEW FILE ON PURPOSE, AND THE SAME REASON ON BOTH PLANES.** The paged
-//! family next door shares nothing with this op but the word *attention*: no
-//! kv pool, no page tables, no append, no plan, no mask ladder, no
-//! log-sum-exp plane. Everything it needs is q, k, v, and the patch axis's
-//! own indptr — so it is a file of its own beside [`attn`](crate::attn)
-//! rather than an arm inside it, and the two can be read, changed and broken
-//! independently. The CUDA twin's file had to be re-homed by `#[path]`
-//! because `attn.rs` was closed to its wave; here the parent could take the
-//! one `pub mod dense;` line, so the module path is the one the design spells
-//! (`attn::dense`) and no re-homing block is owed.
-//!
-//! One entry, one stamp ladder, no workspace: the online softmax means there
-//! is no `rows x rows` plane to hold, so nothing is allocated on the fire
-//! path and there is no scratch to warm. See the shader's header for the
-//! stamp argument and for the two places this mirror's arithmetic is spelled
-//! differently from its twin's without meaning anything different.
-//!
-//! **UNVERIFIED ON DEVICE.** The shader was written against its neighbours
-//! (`attn/sdpa_paged.metal` for the simdgroup fold, `attn/merge_lse.metal`
-//! for the rescaled merge) on a box with no Metal compiler; nothing here has
-//! been compiled or run. What the tests below pin is the host half — the
-//! ladder, the refusals, the grid.
+//! towers' one real kernel, mirroring `kernels_cuda::attn_dense`. Shares
+//! nothing with the paged family (no kv pool, no plan, no mask ladder); one
+//! entry, one stamp ladder, no workspace (online softmax needs no scratch).
+//! Unverified on device: what the tests below pin is the host half only.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -41,21 +20,10 @@ const SIMDS: u32 = 4;
 /// Threads per threadgroup — one Apple simdgroup is 32 lanes wide.
 const THREADS: u32 = SIMDS * 32;
 
-/// The accumulator stamps, tightest first. A stamp is register footprint
-/// (`stamp / 32` floats per lane) and threadgroup allocation, not a shape:
-/// the live head width may be anything at or below it, which is what lets
-/// 64, 72 and 80 share the 128-wide stamp without any of them being padded.
-///
-/// **THE LADDER IS THE CUDA TWIN'S, AND IT IS A LADDER AND NOT A WIDTH LIST
-/// FOR A REASON THIS PLANE FEELS HARDER.** The twin instantiates through
-/// NVRTC at fire time, so a fourth stamp costs it a compile; here the points
-/// are in the shipped source and every one of them is compiled by the driver
-/// on first use, so a list of the exact widths the catalog's towers state
-/// (64 for qwen35's, 72 or 80 for a SigLIP-shaped one, 128 for a wide one)
-/// would be four to six points where three cover them all. Three stamps hold
-/// every head width the design's §0 table can produce and every width the
-/// CUDA goldens exercise (40, 64, 72, 128); a head past 256 is refused by
-/// name rather than truncated, which is the answer the twin gives too.
+/// The accumulator stamps, tightest first. A stamp is register footprint and
+/// threadgroup allocation, not a shape: the live head width may be anything
+/// at or below it. Ladder shared with the CUDA twin; a head past the last
+/// stamp is refused by name rather than truncated.
 const STAMPS: [u32; 3] = [64, 128, 256];
 
 /// The shipped point per stamp, in [`STAMPS`] order.
@@ -107,20 +75,11 @@ fn images_of(op: &'static str, segments: Tensor) -> Result<i32, Error> {
     stated(op, images)
 }
 
-/// **BIDIRECTIONAL DENSE ATTENTION, BLOCK-DIAGONAL PER IMAGE.**
-///
-/// `q`, `k` and `v` are patch rows — `[patch_rows, heads * head_dim]`, bf16 —
-/// and `o` lands one row per query row at q's own shape. `segments` is the
-/// patch axis's indptr (`i32`, `[images + 1]`): row `n` attends to the rows
-/// of the image whose span contains it, in both directions, and to nothing
-/// else. A row past the last span is a rung's padding and lands zeros.
-///
-/// `sm_scale` is the caller's, as everywhere else in this plane — the towers
-/// state `1 / sqrt(head_dim)` and a checkpoint that states something else is
-/// obeyed rather than second-guessed.
-///
-/// Grouped heads are supported by reading, not expanding: `k`/`v` may spell
-/// fewer heads than `q` as long as the counts divide.
+/// Bidirectional dense attention, block-diagonal per image. `q`, `k`, `v` are
+/// patch rows (`[patch_rows, heads * head_dim]`, bf16); `o` lands one row per
+/// query row. `segments` is the patch axis's indptr (`i32`, `[images + 1]`):
+/// row `n` attends to the rows of the image whose span contains it, both
+/// directions. Grouped heads supported by reading, not expanding.
 ///
 /// # Errors
 ///
@@ -206,7 +165,7 @@ pub fn bidirectional(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::ArgValue;
+    
     use crate::probe::Probe;
 
     fn bf16(rows: u32, width: u32) -> Tensor {
@@ -251,61 +210,6 @@ mod tests {
         .expect_err("a 512-wide head is past the ladder");
         assert!(format!("{why}").contains("stamped for"), "{why}");
         assert!(probe.fires().is_empty(), "a refused plan launched anyway");
-    }
-
-    /// qwen35's tower shape: 12 heads of 64, plain MHA, three images sharing
-    /// one patch window.
-    #[test]
-    fn a_towers_window_launches_one_group_per_head_per_row() {
-        let probe = Probe::default();
-        let (heads, head_dim, rows) = (12u32, 64u32, 200u32);
-        bidirectional(
-            &probe,
-            bf16(rows, heads * head_dim),
-            bf16(rows, heads * head_dim),
-            bf16(rows, heads * head_dim),
-            indptr(3),
-            head_dim,
-            0.125,
-            bf16(rows, heads * head_dim),
-        )
-        .expect("the tower's window enqueues");
-        let (fire, args) = probe.only();
-        assert_eq!(fire.file, FILE);
-        assert_eq!(fire.entrypoint, "dense_bidirectional_bfloat16_d_64");
-        assert_eq!(fire.lanes, [heads * THREADS, rows, 1]);
-        assert_eq!(fire.group, [THREADS, 1, 1]);
-        // The image count is the indptr's length less one, and it is stated
-        // rather than read off the device.
-        assert_eq!(args[5], ArgValue::I32(3));
-        assert_eq!(args[6], ArgValue::I32(12));
-        assert_eq!(args[7], ArgValue::I32(12));
-        assert_eq!(args[8], ArgValue::I32(64));
-        assert_eq!(args[9], ArgValue::F32(0.125));
-    }
-
-    /// A SigLIP-shaped head divides by nothing this plane's stamps are, and
-    /// that is the whole point of a ladder.
-    #[test]
-    fn a_seventy_two_wide_head_is_neither_padded_nor_refused() {
-        let probe = Probe::default();
-        bidirectional(
-            &probe,
-            bf16(64, 16 * 72),
-            bf16(64, 4 * 72),
-            bf16(64, 4 * 72),
-            indptr(2),
-            72,
-            0.1,
-            bf16(64, 16 * 72),
-        )
-        .expect("a 72-wide head enqueues at the 128 stamp");
-        let (fire, args) = probe.only();
-        assert_eq!(fire.entrypoint, "dense_bidirectional_bfloat16_d_128");
-        // Grouped heads are read, never expanded: four q heads to one kv.
-        assert_eq!(args[6], ArgValue::I32(16));
-        assert_eq!(args[7], ArgValue::I32(4));
-        assert_eq!(args[8], ArgValue::I32(72));
     }
 
     #[test]

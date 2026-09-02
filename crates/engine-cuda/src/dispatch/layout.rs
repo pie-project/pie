@@ -13,11 +13,8 @@ impl DispatchLayout for Run<'_> {
 }
 
 impl Run<'_> {
-    /// The arms themselves, in `kernels-cuda`'s error vocabulary and not
-    /// the contract's — which is what keeps each one a plain tail call with
-    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
-    /// above that lifts the family, and says why it is a call and not a
-    /// `From` impl.
+    /// Arms in `kernels-cuda`'s error vocabulary, lifted by
+    /// [`kernel`](crate::error::kernel) above the match.
     fn layout(&mut self, op: &Layout) -> Result<(), kernels_cuda::Error> {
         match op {
             Layout::Embed {
@@ -26,10 +23,8 @@ impl Run<'_> {
                 vocab,
                 y,
             } => match self.maybe_planes(*table) {
-                // A token embedding stored as its affine triplet (qwen4's
-                // eight-bit table) reads through the concatenating gather at
-                // one head — dequantized for exactly the rows the step
-                // touches, never landed dense.
+                // Affine-quantized table (e.g. qwen4's 8-bit): dequantized
+                // only for the rows this step touches.
                 Some((codes, scales, biases, seat)) => {
                     kernels_cuda::layout_embed_concat::embed_mlx_affine(
                         self.ctx(),
@@ -56,9 +51,8 @@ impl Run<'_> {
                 vocab,
                 y,
             } => match self.maybe_planes(*table) {
-                // The 51-billion-row table lands as its affine triplet — the
-                // one rectangle a dense landing could not afford — and the
-                // gather dequantizes the sixteen rows it touches per token.
+                // Large table lands as its affine triplet; the gather
+                // dequantizes only the rows touched per token.
                 Some((codes, scales, biases, seat)) => {
                     kernels_cuda::layout_embed_concat::embed_concat_mlxu4(
                         self.ctx(),
@@ -119,14 +113,8 @@ impl Run<'_> {
                 &mut self.tensor(*left),
                 &mut self.tensor(*right),
             ),
-            // **THE SPATIAL POOL** (multimodal §6.5, §7.4), through the
-            // `#[path]`-rehomed unit: the file is `layout/pool.rs`, the module
-            // is `kernels_cuda::layout_pool`, and `layout.rs` is closed to the
-            // wave that wrote it.
-            // **THE GATHER THAT INTERPOLATES** (multimodal §9.2), through its
-            // own `#[path]`-rehomed unit. The plain `layout.embed` arm above
-            // serves the native grid; this one serves the resampled table, and
-            // a text picks by which op it writes.
+            // Interpolating gather: the resampled table, vs the
+            // native-grid embed arm above.
             Layout::EmbedWeighted {
                 ids,
                 weights,
@@ -147,20 +135,16 @@ impl Run<'_> {
                 *side,
                 &mut self.tensor(*y),
             ),
-            // **THE MERGING FOLD** (multimodal §8.1), the same unit's other
-            // entry: `side²` rows concatenated rather than averaged, and the
-            // one op here whose destination is wider than its source.
+            // side² rows concatenated rather than averaged; the one op here
+            // whose destination is wider than its source.
             Layout::MergeRows { x, side, y } => kernels_cuda::layout_fold::merge_rows(
                 self.ctx(),
                 self.tensor(*x),
                 *side,
                 &mut self.tensor(*y),
             ),
-            // **THE EMBED MERGE WITH A DROP SENTINEL** (multimodal §8.6),
-            // through its own `#[path]`-rehomed unit: `scatter_rows` below,
-            // plus a guard on a negative route. The shell admits a `-1` in
-            // `patch_routes` only for a plan that names THIS op, so the arm
-            // below keeps the contract it always had.
+            // Embed merge with a drop sentinel: the shell admits -1 in
+            // patch_routes only for a plan that names this op.
             Layout::ScatterLiveRows {
                 src,
                 routes,
@@ -170,18 +154,13 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*src),
                 self.tensor(*routes),
-                // **THE DESTINATION GOES OVER WHOLE** (multimodal §18): the
-                // routes are absolute fire rows, so a window-cut `y` would
-                // count the region's offset twice. `Run::fire_wide` carries
-                // the argument.
+                // Routes are absolute fire rows; a window-cut `y` would
+                // double-count the region's offset.
                 &mut self.fire_wide(*y),
             ),
-            // THE EMBED MERGE. `src` resolves at the PATCH window and `y` at
-            // the token one — the one node in a tower plan whose two operands
-            // come out of two seriations — and the routes vector has already
-            // been checked against this fire's token row count host-side
-            // (`Fault::PatchRoute`), because an out-of-range entry here is an
-            // out-of-bounds device write the kernel cannot see.
+            // src resolves at the patch window, y at the token window — the
+            // one node whose operands come from two seriations. routes are
+            // already validated host-side (Fault::PatchRoute).
             Layout::ScatterRows {
                 src,
                 routes,

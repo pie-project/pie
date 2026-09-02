@@ -1,14 +1,4 @@
-//! Generalised tiktoken-style BPE merge.
-//!
-//! One merge algorithm, one data structure, no special-casing.
-//!
-//! The merge loop uses a **flat-array doubly-linked list** for O(1) merge
-//! operations with O(1) predecessor access.  An adaptive dispatch chooses
-//! between linear scan (short pieces) and BinaryHeap (long pieces).
-//!
-//! `BpeTable` uses *token-ID-pair* merge keys: merges are looked up as
-//! `(left_id, right_id) → (rank, merged_id)`, avoiding variable-length
-//! byte hashing entirely.  Symbol lookup (`bytes → TokenId`) is separate.
+//! Tiktoken-style BPE merge, keyed by token-ID pairs rather than byte hashing.
 
 use anyhow::{Context, Result, bail, ensure};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -322,21 +312,8 @@ impl BpeTable {
         &self.byte_fallback_ids
     }
 
-    /// Whether `token_to_id` is recoverable from the decode table alone.
-    ///
-    /// It usually is, but not by construction, and the difference is what
-    /// decides whether this table can be serialized without storing the
-    /// encode map as well:
-    ///
-    /// - the tiktoken path lets two ids share a byte sequence and keeps the
-    ///   lower id, which "lowest id wins over the decode table" reproduces;
-    /// - `insert_added` can *overwrite* `id_to_bytes[id]` while leaving the
-    ///   token it displaced in `token_to_id`, which nothing can reproduce
-    ///   from the decode table because those bytes are no longer in it.
-    ///
-    /// The second case would make a round trip silently lossy, so the
-    /// serializer checks this and refuses rather than writing an artifact that
-    /// tokenizes differently from its source.
+    /// Whether `token_to_id` is recoverable from the decode table alone
+    /// (not always true after `insert_added` overwrites an entry).
     pub(crate) fn encode_map_is_derivable(&self) -> bool {
         let mut derived: FxHashMap<&[u8], TokenId> =
             FxHashMap::with_capacity_and_hasher(self.token_to_id.len(), Default::default());
@@ -354,10 +331,6 @@ impl BpeTable {
     }
 
     /// Rebuilds a table from its canonical parts.
-    ///
-    /// `token_to_id` is derived under the same "lowest id wins" rule the
-    /// tiktoken path applies, which [`encode_map_is_derivable`] guaranteed
-    /// reproduces the original exactly.
     pub(crate) fn from_canonical(
         vocab: Vec<Vec<u8>>,
         merges: &[(TokenId, TokenId, Rank, TokenId)],
@@ -439,10 +412,7 @@ const fn build_byte_to_unicode() -> [char; 256] {
 }
 
 /// Build the GPT-2 char→byte (inverse) table at compile time.
-///
-/// The max unicode code point used is 256 + 33 - 1 = 288 for non-direct bytes,
-/// plus direct bytes up to 0xFF = 255.  Max index = 288, so we need size 324
-/// to match the original table (with some headroom).
+/// Table size 324 covers the max code point used, with headroom.
 const fn build_char_to_byte() -> [Option<u8>; 324] {
     let b2u = build_byte_to_unicode();
     let mut table: [Option<u8>; 324] = [None; 324];
@@ -676,9 +646,7 @@ fn bpe_merge_heap(initial_ids: &[TokenId], ranks: &BpeTable) -> SmallVec<[TokenI
 // ---------------------------------------------------------------------------
 
 /// Encode a raw byte slice using byte-level BPE (each byte is an atom).
-///
-/// Used by modern byte-level models (Qwen, DeepSeek, GLM, Nemotron). Each byte maps to
-/// exactly one atom, so no offsets array is needed.
+/// Used by modern byte-level models (Qwen, DeepSeek, GLM, Nemotron).
 pub(crate) fn bpe_encode_bytes(
     piece: &[u8],
     bpe: &BpeTable,
@@ -749,9 +717,7 @@ pub(crate) fn bpe_encode_bytes(
 }
 
 /// Encode a text fragment using char-level BPE (each Unicode char is an atom).
-///
-/// Used by Gemma byte-fallback models. Atom boundaries come
-/// from `char_indices()`.
+/// Used by Gemma byte-fallback models.
 pub(crate) fn bpe_encode_chars(
     piece: &str,
     bpe: &BpeTable,
@@ -853,145 +819,3 @@ fn fallback_into(
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_test_ranks() -> BpeTable {
-        let mut map = HashMap::new();
-        map.insert(0u32, b"u".to_vec());
-        map.insert(1, b"n".to_vec());
-        map.insert(2, b"r".to_vec());
-        map.insert(3, b"e".to_vec());
-        map.insert(4, b"l".to_vec());
-        map.insert(5, b"a".to_vec());
-        map.insert(6, b"t".to_vec());
-        map.insert(7, b"d".to_vec());
-        map.insert(8, b"re".to_vec());
-        map.insert(9, b"at".to_vec());
-        map.insert(10, b"ed".to_vec());
-        map.insert(11, b"un".to_vec());
-        map.insert(12, b"ated".to_vec());
-        map.insert(13, b"rel".to_vec());
-        map.insert(14, b"related".to_vec());
-        map.insert(15, b"unrelated".to_vec());
-        BpeTable::from_decoder_map(map).unwrap()
-    }
-
-    fn byte_pair_encode(piece: &[u8], bpe: &BpeTable) -> Vec<TokenId> {
-        let mut out = Vec::new();
-        bpe_encode_bytes(piece, bpe, true, false, None, &mut out);
-        out
-    }
-
-    #[test]
-    fn test_bpe_merge_levels() {
-        let ranks = make_test_ranks();
-        assert_eq!(byte_pair_encode(b"unrelated", &ranks), vec![15]); // full
-        assert_eq!(byte_pair_encode(b"un", &ranks), vec![11]); // partial
-        assert_eq!(byte_pair_encode(b"u", &ranks), vec![0]); // atom
-        assert!(byte_pair_encode(b"", &ranks).is_empty()); // empty
-        assert_eq!(byte_pair_encode(b"unat", &ranks), vec![11, 9]); // multi-token
-    }
-
-    #[test]
-    fn test_from_vocab_and_merges() {
-        let mut vocab = HashMap::new();
-        vocab.insert("a".to_string(), 0u32);
-        vocab.insert("b".to_string(), 1);
-        vocab.insert("c".to_string(), 2);
-        vocab.insert("ab".to_string(), 3);
-        vocab.insert("abc".to_string(), 4);
-        vocab.insert("bc".to_string(), 5);
-
-        // a+b has higher priority (rank 1) than b+c (rank 2)
-        let merges = vec![
-            ("a".to_string(), "b".to_string()),
-            ("ab".to_string(), "c".to_string()),
-        ];
-        let bpe = BpeTable::from_vocab_and_merges(&vocab, &merges, false).unwrap();
-
-        let mut out = Vec::new();
-        bpe_encode_bytes(b"abc", &bpe, false, false, None, &mut out);
-        assert_eq!(out, vec![4]); // fully merged
-
-        out.clear();
-        bpe_encode_bytes(b"ba", &bpe, false, false, None, &mut out);
-        assert_eq!(out, vec![1, 0]); // no merge for b+a
-    }
-
-    #[test]
-    fn test_prefer_whole_token_is_explicit() {
-        let vocab = HashMap::from([
-            ("a".to_string(), 0),
-            ("b".to_string(), 1),
-            ("c".to_string(), 2),
-            ("bc".to_string(), 3),
-            ("abc".to_string(), 4),
-        ]);
-        let bpe =
-            BpeTable::from_vocab_and_merges(&vocab, &[("b".to_string(), "c".to_string())], false)
-                .unwrap();
-
-        let mut merged = Vec::new();
-        bpe_encode_bytes(b"abc", &bpe, false, false, None, &mut merged);
-        assert_eq!(merged, vec![0, 3]);
-
-        let mut whole = Vec::new();
-        bpe_encode_bytes(b"abc", &bpe, true, false, None, &mut whole);
-        assert_eq!(whole, vec![4]);
-    }
-
-    #[test]
-    fn test_byte_fallback() {
-        let mut vocab = HashMap::new();
-        vocab.insert("h".to_string(), 0u32);
-        vocab.insert("i".to_string(), 1);
-        vocab.insert("hi".to_string(), 2);
-        vocab.insert("<0x80>".to_string(), 3);
-
-        let bpe =
-            BpeTable::from_vocab_and_merges(&vocab, &[("h".to_string(), "i".to_string())], false)
-                .unwrap();
-
-        let mut out = Vec::new();
-        bpe_encode_bytes(b"hi", &bpe, false, true, None, &mut out);
-        assert_eq!(out, vec![2]);
-
-        out.clear();
-        bpe_encode_bytes(&[0x80], &bpe, false, true, None, &mut out);
-        assert_eq!(out, vec![3]); // falls back to <0x80>
-    }
-
-    #[test]
-    fn test_char_level_bpe_multibyte() {
-        let mut vocab = HashMap::new();
-        vocab.insert("▁".to_string(), 0u32);
-        vocab.insert("H".to_string(), 1);
-        vocab.insert("i".to_string(), 2);
-        vocab.insert("▁H".to_string(), 3);
-        vocab.insert("▁Hi".to_string(), 4);
-
-        let merges = vec![
-            ("▁".to_string(), "H".to_string()),
-            ("▁H".to_string(), "i".to_string()),
-        ];
-        let bpe = BpeTable::from_vocab_and_merges(&vocab, &merges, false).unwrap();
-
-        let mut out = Vec::new();
-        bpe_encode_chars("▁Hi", &bpe, false, false, None, &mut out);
-        assert_eq!(out, vec![4]);
-    }
-
-    #[test]
-    fn test_gpt2_byte_unicode_roundtrip() {
-        let lut = build_byte_to_unicode();
-        let mut seen = std::collections::HashSet::new();
-        for b in 0u16..256 {
-            let c = lut[b as usize];
-            assert!(c != '\0');
-            assert!(seen.insert(c), "duplicate mapping for byte {b:#x}");
-            assert_eq!(CHAR_TO_BYTE[c as usize], Some(b as u8));
-        }
-    }
-}

@@ -2,8 +2,8 @@
 //! `pie` CLI binary.
 //!
 //! Both surfaces drive the same library (`worker`); this crate
-//! is just a pyo3 wrapper around [`worker::runtime::start_runtime`]
-//! plus a [`worker::runtime::RuntimeHandle`] handle. Lifecycle:
+//! is just a pyo3 wrapper around [`worker::serve::start_runtime`]
+//! plus a [`worker::serve::RuntimeHandle`] handle. Lifecycle:
 //! when the Python `EngineHandle` is dropped (or the user's interpreter
 //! exits), the embedded tokio runtime + every subprocess engine are
 //! torn down — combined with the `PR_SET_PDEATHSIG` hook in
@@ -16,7 +16,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use worker::config::Config as ServeConfig;
-use worker::runtime::{self, RuntimeHandle as ServeHandle};
+use worker::serve::{self, RuntimeHandle as ServeHandle};
 
 /// Live engine returned by `bootstrap`. Holds the tokio runtime that
 /// keeps the WS scheduler + engine supervisors alive.
@@ -116,18 +116,18 @@ fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
         .map_err(|e| PyValueError::new_err(format!("validate config: {e:#}")))?;
 
     py.detach(|| -> PyResult<PyEngineHandle> {
-        let runtime = runtime::build_runtime(&cfg)
+        let runtime = serve::build_runtime(&cfg)
             .map_err(|e| PyRuntimeError::new_err(format!("build tokio runtime: {e:#}")))?;
         let runtime = Arc::new(runtime);
 
         // The embedded engine wheel is always single-node: embed an in-proc
         // controller and self-register before booting the engine.
         let control_addr = format!("{}:{}", cfg.server.host, cfg.server.port);
-        let coordinator = runtime::connect(&runtime::TopologyMode::SingleNode, control_addr)
+        let coordinator = serve::connect(&serve::TopologyMode::SingleNode, control_addr)
             .map_err(|e| PyRuntimeError::new_err(format!("join control plane: {e:#}")))?;
 
         let handle = runtime
-            .block_on(runtime::start_runtime(cfg, coordinator))
+            .block_on(serve::start_runtime(cfg, coordinator))
             .map_err(|e| PyRuntimeError::new_err(format!("start_runtime: {e:#}")))?;
 
         let url = handle.url.clone();

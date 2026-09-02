@@ -80,9 +80,8 @@ pub struct SchedulerStats {
 }
 
 impl SchedulerStats {
-    /// Record one fire's inter-batch bubble (µs) into the HOST-PROXY histogram.
-    /// Called only from the single per-engine scheduler thread (race-free plain
-    /// fetch_add).
+    /// Record one fire's inter-batch bubble (µs) into the host-proxy
+    /// histogram. Called only from the single per-engine scheduler thread.
     pub fn record_bubble_us(&self, us: u64) {
         self.bubble_us_hist[Self::bubble_bucket(us)].fetch_add(1, Relaxed);
     }
@@ -137,9 +136,7 @@ pub(crate) fn record_fire_stats(
     });
 }
 
-// =============================================================================
-// AggregateStats (cross-engine stats, aggregated over per-worker stats)
-// =============================================================================
+// AggregateStats: cross-engine stats, aggregated over per-worker stats.
 
 use std::sync::Arc;
 
@@ -164,16 +161,14 @@ pub struct AggregateStats {
     /// `profile-fire`. Mirrors `crate::scheduler::probe::FireProbes`.
     pub fire: FireStats,
 
-    /// The guest thread's own submit cost, phase by phase (palo D0). Zero
+    /// The guest thread's own submit cost, phase by phase. Zero
     /// without `profile-fire`, and process-global rather than per-engine
     /// because a submit runs on the guest's task.
     pub host_submit: HostSubmitStats,
 
-    /// Inter-batch bubble histogram — for the p50/p99 bubble gate (masterplan
-    /// M1). HOST PROXY (device-idle stamped at the Rust enqueue point →
-    /// over-counts by the host submit/handshake delay). See
-    /// [`Self::bubble_p50`], and [`SchedulerStats::bubble_us_hist`] for what
-    /// its denominator is — one count per STARVATION, not per fire.
+    /// Inter-batch bubble histogram: host proxy (device-idle stamped at the
+    /// Rust enqueue point, so it over-counts by the submit/handshake
+    /// delay). See [`Self::bubble_p50`] and [`SchedulerStats::bubble_us_hist`].
     pub bubble_us_hist: [u64; BUBBLE_HIST_UPPER_US.len()],
 }
 
@@ -231,12 +226,10 @@ pub struct FireStats {
     pub quorum: QuorumStats,
 }
 
-/// Quorum-rule probe averages/counters (overview §7.2; thrust-2 §3 F1–F6).
-/// The wave counters (`wave_*`) populate in every build.
-/// Legacy straggler counters remain zero under strict wait-all.
-/// The latency probes (bubble/quorum-latency sums, escape/submit-ahead)
-/// still require `profile-fire`. Populated by the quorum core (thrust-2
-/// phase S5). Mirrors `crate::scheduler::probe::QuorumProbes`.
+/// Quorum-rule probe averages/counters. The wave counters (`wave_*`)
+/// populate in every build; legacy straggler counters stay zero under
+/// strict wait-all; the latency probes still require `profile-fire`.
+/// Mirrors `crate::scheduler::probe::QuorumProbes`.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct QuorumStats {
     /// Mean device idle between a batch retiring and the next launching (F1).
@@ -254,9 +247,9 @@ pub struct QuorumStats {
     pub straggler_fires: u64,
     /// Legacy field: strict wait-all never demotes pipelines.
     pub straggler_demotions: u64,
-    /// Dummy-run / readiness-miss count (M3 gate: rate < 1%).
+    /// Dummy-run / readiness-miss count; a healthy fleet holds it under 1%.
     pub readiness_miss: u64,
-    /// Wait-for-all wave (M-AB): mean active_pipelines (wait-set size) sampled
+    /// Wait-for-all wave: mean active_pipelines (wait-set size) sampled
     /// at each WaitAll fire. ≈ fleet width ⇒ persistent wait-set (waves should
     /// be dense); ≈1 ⇒ transient/singleton. 0 if no WaitAll fire.
     pub avg_active_pipelines_at_fire: u64,
@@ -324,7 +317,7 @@ pub struct ExecuteStats {
     pub engine_fire_us_sum: u64,
 }
 
-/// Guest-thread submit phases (palo D0). Mirrors
+/// Guest-thread submit phases. Mirrors
 /// [`crate::scheduler::probe::HostSubmitProbes`]; every field is a cumulative
 /// sum in microseconds beside the count that divides it.
 #[derive(Debug, Default, serde::Serialize)]
@@ -361,9 +354,7 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     let mut bubble_hist = [0u64; BUBBLE_HIST_UPPER_US.len()];
     let mut last_latency = 0u64;
     let mut cumulative_latency = 0u64;
-    // Per-engine sums of probe atomics. Walked in the same shape
-    // as AggregateStats.fire / FireProbes so the relationship is
-    // self-evident.
+    // Per-engine sums of probe atomics, in AggregateStats.fire's shape.
     let mut fire_inter = 0u64;
     let mut fire_post_dispatch_to_fire = 0u64;
     let mut fire_recv_block_wait = 0u64;
@@ -464,9 +455,8 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     }
 
     let avg = |value: u64| value.checked_div(total_batches).unwrap_or(0);
-    // Inter-fire is sampled starting at the 2nd batch (first one has
-    // no prior to diff against), so divide by max(total_batches-1, 1)
-    // to get a stable mean.
+    // Inter-fire is sampled starting at the 2nd batch (no prior to diff
+    // against for the 1st), so divide by max(total_batches-1, 1).
     let avg_pair = |value: u64| {
         if total_batches > 1 {
             value / (total_batches - 1)
@@ -484,9 +474,7 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
         cumulative_batch_latency_us: cumulative_latency,
         avg_batch_latency_us: avg(cumulative_latency),
         host_submit: {
-            // Process-global, so it is READ here rather than summed over the
-            // per-engine slots — folding it into the same snapshot keeps one
-            // door for telemetry.
+            // Process-global, so read here rather than summed per-engine.
             let h = crate::scheduler::probe::host_submit();
             HostSubmitStats {
                 submits: h.submits.load(Relaxed),

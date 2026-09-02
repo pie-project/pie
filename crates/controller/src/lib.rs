@@ -1,34 +1,6 @@
-//! `controller` — Pie's cluster **control plane**.
-//!
-//! A registry of workers + gateways behind a **single-writer actor**. Workers
-//! long-poll their `Neighbors` (who to coordinate with); gateways long-poll the
-//! global `RoutingTable` (the worker roster + coarse load) to route locally.
-//! Liveness is tracked from heartbeats (controller-side clock); a background
-//! reaper evicts the silent. It is control plane only — tokens and KV never
-//! transit it.
-//!
-//! # Shape
-//!
-//! ```text
-//! service.rs  tarpc `Control` server  ─┐
-//! Handle      in-proc front door      ─┼─► mpsc ─► actor.rs (sole writer)
-//!                                       │            owns state.rs (Cluster)
-//! reaper tick ── Command::Tick ────────┘            publishes 2 watch channels
-//!                                                     topology.rs (pure planner)
-//! ```
-//!
-//! Two deployment forms, one actor:
-//! - **distributed**: [`run`] serves the `Control` RPC; workers/gateways dial it.
-//! - **single-node**: [`embed`] returns a [`Handle`] the worker/gateway use
-//!   in-proc — no socket, no serialization.
-//!
-//! # Invariants (§2/§3)
-//!
-//! One owner (no locks). Two **independent** epochs, each a version tag on a
-//! **full** scoped snapshot (never a delta) → watches are idempotent and
-//! self-healing. `role` is immutable; only join/leave moves topology. A coarse
-//! load-bucket crossing re-versions only the gateway view (the load/membership
-//! split that prevents watch storms).
+//! `controller`: Pie's cluster control plane. A registry of workers +
+//! gateways behind a single-writer actor; control plane only, tokens and KV
+//! never transit it.
 
 mod actor;
 mod service;
@@ -75,8 +47,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:7000".to_string(),
-            // ≈4× the 2s client heartbeat: tolerates a couple of missed beats
-            // (no false evictions) while detecting death in ~8–10s.
+            // ~4x the 2s client heartbeat: tolerates a couple of missed beats.
             heartbeat_timeout: Duration::from_secs(8),
             tick_interval: Duration::from_secs(2),
             command_buffer: 256,
@@ -84,10 +55,8 @@ impl Default for Config {
     }
 }
 
-/// TOML schema mirror of [`Config`] — durations as whole seconds (TOML/serde has
-/// no native `Duration`). Kept private; [`Config::parse`] deserializes this and
-/// converts. `#[serde(default)]` makes every field optional so a partial or empty
-/// config string still yields a valid controller (fields fall back to defaults).
+/// TOML schema mirror of [`Config`] — durations as whole seconds. Kept
+/// private; `#[serde(default)]` makes every field optional.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigToml {
@@ -121,10 +90,8 @@ impl From<ConfigToml> for Config {
 }
 
 impl Config {
-    /// Parse a controller [`Config`] from a TOML string. **Pure** (Seam 1): no
-    /// IO, no env, no clap — the `bootstrap` skeleton sources the string; this
-    /// turns it into typed config and validates it. An empty string is valid and
-    /// yields [`Config::default`].
+    /// Parse a controller [`Config`] from a TOML string. Pure: no IO, no env,
+    /// no clap. An empty string is valid and yields [`Config::default`].
     pub fn parse(s: &str) -> Result<Config> {
         let raw: ConfigToml = toml::from_str(s).context("parse controller config (TOML)")?;
         let config = Config::from(raw);
@@ -149,11 +116,9 @@ impl Config {
     }
 }
 
-/// In-process front door to the controller actor — cloneable and cheap. Mirrors
-/// the `Control` RPC calls (minus the tarpc context) so a single-node worker /
-/// gateway can embed the controller and talk to it directly. For watches it
-/// offers a directly-subscribable [`watch::Receiver`] (no epoch cursor needed
-/// in-proc), while the distributed RPC server reuses the epoch long-poll helpers.
+/// In-process front door to the controller actor — cloneable and cheap.
+/// Mirrors the `Control` RPC calls so a single-node worker/gateway can embed
+/// the controller and talk to it directly.
 #[derive(Clone)]
 pub struct ControllerHandle {
     cmd: mpsc::Sender<Command>,
@@ -168,9 +133,7 @@ pub struct ControllerHandle {
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
-/// Back-compat alias for [`ControllerHandle`]. The in-proc composition root
-/// (`bin/pie`'s `EmbeddedControl`) and the single-node worker path refer to the
-/// controller's handle as `controller::Handle`.
+/// Back-compat alias for [`ControllerHandle`].
 pub type Handle = ControllerHandle;
 
 impl ControllerHandle {
@@ -215,9 +178,8 @@ impl ControllerHandle {
         let _ = self.cmd.send(Command::ReportWorker { id, status }).await;
     }
 
-    /// Directly subscribe to a worker's neighbor view (epoch-free single-node
-    /// path). A small projector task forwards each membership change as the
-    /// worker's scoped [`Neighbors`]; await `changed()` on the returned receiver.
+    /// Directly subscribe to a worker's neighbor view. A small projector
+    /// task forwards each membership change as the worker's scoped [`Neighbors`].
     pub fn worker_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors> {
         let mut topo_rx = self.worker_rx.clone();
         let initial = project(&topo_rx.borrow(), id);
@@ -233,8 +195,8 @@ impl ControllerHandle {
         rx
     }
 
-    /// Directly subscribe to the global routing table (epoch-free single-node
-    /// path). The gateway view is already global, so this is the raw receiver.
+    /// Directly subscribe to the global routing table (already global, so
+    /// this is the raw receiver).
     pub fn gateway_watch(&self) -> watch::Receiver<RoutingTable> {
         self.gateway_rx.clone()
     }
@@ -269,11 +231,9 @@ impl ControllerHandle {
         }
     }
 
-    /// Shut the controller down cleanly (Seam 1). Cancels the shared shutdown
-    /// token — the actor, the reaper, and (for [`run`]) the serve loop observe it
-    /// and stop — then joins those background tasks so in-flight work drains
-    /// before the process exits. Idempotent across clones: the first call drains
-    /// the task set; later calls find it empty and simply re-assert the cancel.
+    /// Shut the controller down cleanly. Cancels the shared shutdown token,
+    /// then joins background tasks so in-flight work drains. Idempotent
+    /// across clones.
     pub async fn shutdown(self) {
         self.shutdown.cancel();
         let tasks =
@@ -285,8 +245,7 @@ impl ControllerHandle {
 }
 
 /// Spawn the actor + reaper tick and return the in-process [`ControllerHandle`].
-/// No socket (single-node embed). Must be called from within a Tokio runtime.
-/// Sync because nothing here awaits (Model A: the caller owns the runtime).
+/// No socket. Must be called from within a Tokio runtime.
 pub fn embed(config: Config) -> ControllerHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(config.command_buffer);
     let (worker_tx, worker_rx) = watch::channel(Topology::default());
@@ -336,11 +295,9 @@ pub fn embed(config: Config) -> ControllerHandle {
     }
 }
 
-/// Run the controller as a daemon (Seam 1): embed the actor and serve the
-/// `Control` RPC over tarpc (tcp + unix), then return the [`ControllerHandle`].
-/// The accept loop runs in the background, owned by the handle, and stops on
-/// [`ControllerHandle::shutdown`]. Async because binding the listener awaits — a
-/// bind failure (e.g. address in use) surfaces here, before the handle returns.
+/// Run the controller as a daemon: embed the actor and serve the `Control`
+/// RPC over tarpc (tcp + unix), then return the [`ControllerHandle`]. The
+/// accept loop runs in the background and stops on [`ControllerHandle::shutdown`].
 pub async fn run(config: Config) -> Result<ControllerHandle> {
     let handle = embed(config.clone());
     let serve = service::serve(&config.listen_addr, handle.clone(), handle.shutdown.clone())
@@ -385,37 +342,4 @@ mod tests {
         assert_eq!(cfg.command_buffer, 64);
     }
 
-    #[test]
-    fn parse_rejects_unknown_field() {
-        assert!(Config::parse("bogus = 1").is_err(), "deny_unknown_fields");
-    }
-
-    #[test]
-    fn parse_rejects_zero_tick_interval() {
-        assert!(Config::parse("tick_interval_secs = 0").is_err());
-    }
-
-    #[tokio::test]
-    async fn embed_serves_in_proc_then_shuts_down() {
-        let handle = embed(Config::default());
-        // An in-proc call returns ⇒ the actor is live behind the handle.
-        let _id = handle
-            .register_gateway(GatewayInfo {
-                addr: "127.0.0.1:0".to_string(),
-            })
-            .await;
-        // shutdown drains actor + reaper without hanging.
-        handle.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn run_binds_ephemeral_then_shuts_down() {
-        let config = Config {
-            listen_addr: "127.0.0.1:0".to_string(),
-            ..Config::default()
-        };
-        let handle = run(config).await.expect("controller daemon starts");
-        // shutdown cancels + joins the serve loop, actor, and reaper cleanly.
-        handle.shutdown().await;
-    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "client"
-version = "0.4.0"
+version.workspace = true
 edition = "2024"
 authors = ["Pie Team"]
 description = "Pie Client"
@@ -11,16 +11,14 @@ repository = "https://github.com/pie-project/pie"
 
 [dependencies]
 anyhow = "1.0.104"
-# Floor: the client/server `message` vocabulary lives in pie-client-api (the
-# client-facing interface crate) so the floor-resident `edge` frames can embed
-# it; this crate re-exports it. Edge points downward (pie-client -> pie-client-api).
+# The client/server `message` vocabulary, re-exported from here.
 client-api = { path = "../client-api" }
 rmp-serde = "1.3.1"
 num-traits = "0.2.19"
 bytes = "1.12.1"
 blake3 = "1.8.5"
 dashmap = "6.2.1"
-tokio = { version = "1.53.1", features = ["full"] } # ["full", "tracing"]
+tokio = { version = "1.53.1", features = ["full"] }
 tokio-tungstenite = "0.30.0"
 futures = "0.3.33"
 uuid = { version = "1.24.0", features = ["serde", "v4"] }

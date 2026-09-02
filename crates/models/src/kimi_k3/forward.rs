@@ -14,17 +14,7 @@ impl Facts {
         Predicate::fact(0)
     }
 
-    /// **THE ADAPTER WINDOW** (palo design §8, §0; campaign A-6).
-    ///
-    /// A lane that routed its rows to a registered adapter. §8 puts the
-    /// correction "over the adapter window", and §0 defines a window as the
-    /// rows of the lanes whose word satisfies the guard — so the axis needs a
-    /// bit, and the bit is what makes it FREE when nobody uses it: a fire no
-    /// lane routed has zero rows in this class, `engine::fire::walk` skips a
-    /// zero-row region before it dispatches anything, and the correction costs
-    /// that fire no launch, no empty grid and no instruction. A `Guard::Always`
-    /// correction would instead launch two kernels per layer over every row of
-    /// every fire to add zero to them, which is 1.0x nothing.
+    /// True for rows whose request routed to a registered adapter; a fire with no such rows costs nothing.
     pub fn has_adapter() -> Predicate {
         Predicate::fact(1)
     }
@@ -76,16 +66,7 @@ impl ForwardHybrid for Model {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
 
-        // ONE SCHEDULE PER READER. A plan struct is a CARVING — request count,
-        // rebased query boundaries, work-item split — so it is only a carving
-        // OF the class it was cut for. Each schedule is therefore built off
-        // that class's own arm of the inputs: the geometry it reads carries
-        // the arm's cond, so the plan node's guard IS the class, and a reader
-        // sitting in the other arm is refused by the recorder at the line that
-        // mixed them. The pair is [decode, prefill]. Both lines state the same
-        // reading — this text has ONE, `m.mla_heads × m.kv_lora_rank` — so what
-        // the two lines differ by is the arm, which is the whole truth of the
-        // pair.
+        // plan[0] is the decode schedule, plan[1] the prefill schedule; each is built from its own arm.
         let (input_d, input_p) = inputs.split(&Facts::qo_one());
         let plan = [
             ops::attn::mla_plan(&input_d, m.mla_heads, m.kv_lora_rank),
@@ -112,16 +93,7 @@ impl ForwardHybrid for Model {
             } else {
                 o
             };
-            // **THE CORRECTION, OVER ITS WINDOW** (design §8, campaign A-6).
-            // One statement: the mixer's output, plus this row's adapter's
-            // `B·(A·x)`, in place. No merge and no arm — the op writes THROUGH
-            // `o`'s arena column, so a class outside the window never runs the
-            // node and reads the uncorrected value at the same address, which
-            // is the identity for free.
-            //
-            // AFTER the reduce, and `Layer::lora_a`'s own note argues why: a
-            // correction on a rows-cut partial product would be summed `tp`
-            // times.
+            // Must run after all_reduce: correcting a tp-split partial product would sum the correction tp times.
             let o = {
                 let (adapted, _) = o.split(&Facts::has_adapter());
                 let (px, _) = x.split(&Facts::has_adapter());
@@ -231,9 +203,7 @@ fn mla_mixer(x: &Value, inputs: &Input<Facts>, plan: &[Value; 2], m: &Model, a: 
     );
     seam::at(seam::ATTN_Q, &[&q]);
 
-    // The same predicate `forward` split the inputs by, so these arms' conds
-    // are structurally equal to the arms the two schedules were built off —
-    // which is what the recorder compares when a reader meets its plan.
+    // Must split by the same predicate `forward` used to build plan[0]/plan[1].
     let one = Facts::qo_one();
     let (dq, p) = q.split(&one);
     let (dpe, ppe) = q_pe.split(&one);

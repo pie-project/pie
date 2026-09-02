@@ -1,30 +1,14 @@
-//! Finding the model a worker is configured to serve — **load-at-boot only**.
-//!
-//! The worker never downloads and never converts (R3). What it resolves is a
-//! name or a path to something already on disk, and under this plan that
-//! something is one `.zt` artifact: weights, compiled tokenizer and compiled
-//! checkpoint config together, written by `pie model import`.
-//!
-//! Two forms, told apart by shape rather than by what happens to exist:
-//!
-//! - anything path-like — absolute, `./`-relative, or ending in a checkpoint
-//!   extension — is used as given, so an artifact outside the store works;
-//! - anything else is a store name, looked up in `PIE_HOME/models/`.
-//!
-//! Deciding by shape and not by probing is deliberate. A rule that fell back
-//! from one to the other would make the error depend on which file happened to
-//! be missing, and would let a typo in a store name quietly become a relative
-//! path that does not exist either.
-//!
-//! An HF snapshot directory still resolves, because the engine can still load
-//! one and the migration is not finished. It is not the intended input: it
-//! carries no compiled metadata, so serving it goes back to parsing
-//! `config.json` at boot, which is the thing the artifact exists to stop.
+//! Finding the model a worker is configured to serve — load-at-boot only,
+//! never downloaded or converted. Resolves a store name or a path to a `.zt`
+//! artifact (or, as a legacy fallback, an HF snapshot directory).
 
 use std::path::{Path, PathBuf};
 
-use ::runtime::model::ModelMetadata;
-use anyhow::{Result, anyhow, bail};
+use runtime::model::ModelMetadata;
+use anyhow::{Context, Result, anyhow, bail};
+
+use crate::backend::EngineCapabilities;
+use crate::config;
 // By item, not by module. The crate is `checkpoint` and the local below is
 // also called `checkpoint`; spelling the calls `checkpoint::file::read::…`
 // would put a third use of the word between them, and both names here say
@@ -32,21 +16,10 @@ use anyhow::{Result, anyhow, bail};
 use checkpoint::file::read::{parse_metadata, read_meta};
 
 /// The artifact object the checkpoint's own `config.json` is written under.
-///
-/// It was `models::serve::encoding::CONFIG_OBJECT`, beside an `Encoding` that
-/// parsed the document. M18 deleted that module, and the parser did not come
-/// with it: the loader reads a checkpoint's quantization off its STORED
-/// tensor encodings now, not off what its config claims, so the one reader
-/// this name had is gone. The NAME still has two — the writer below in this
-/// file's tests, and the reader in [`Model::metadata`] — and both are here.
 pub const CONFIG_OBJECT: &str = "model/config";
 
-/// What the worker was pointed at.
-///
-/// The distinction is drawn **once**, here, and then carried. Everything
-/// downstream asks this type rather than re-reading the extension: the answer
-/// was already paid for, and a second derivation is a second chance to
-/// disagree with the first.
+/// What the worker was pointed at, decided once here and carried, rather
+/// than re-derived downstream from the extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Model {
     /// A `.zt` artifact: everything the engine needs, in one file.
@@ -63,23 +36,12 @@ impl Model {
         }
     }
 
-    /// Everything the runtime and the engines need, lifted in **one** open.
+    /// Everything the runtime and the engines need, lifted in one open.
     ///
-    /// The config is always produced: an artifact carries it embedded and a
-    /// snapshot has it on disk, and both hand over the SAME bytes. That is
-    /// what lets everything downstream read one document instead of keeping a
-    /// second path that parses the files beside a snapshot.
-    ///
-    /// It is carried and not parsed. The last in-tree reader of the config's
-    /// own fields was `models::serve::encoding::Encoding`, which asked what
-    /// quantization the checkpoint declared; M18 deleted it, because the
-    /// loader reads that off the stored tensor encodings instead of believing
-    /// the document. Everything else the old `pie.model/1` document carried
-    /// is a catalog row's.
-    ///
-    /// The tokenizer half stays optional, and all-or-nothing: half the
-    /// tokenizer compiled and half probed from files is the skew the artifact
-    /// removes, so a partial one is treated as absent and the files win.
+    /// The config is always produced (embedded in an artifact, on disk for a
+    /// snapshot) and carried, not parsed: quantization is read off the
+    /// stored tensor encodings instead. The tokenizer half is optional and
+    /// all-or-nothing — a partial one is treated as absent.
     pub fn metadata(&self) -> Result<ModelMetadata> {
         let Model::Artifact(path) = self else {
             return Ok(ModelMetadata {
@@ -118,39 +80,12 @@ impl Model {
     }
 }
 
-/// Lift a snapshot's `config.json`, verbatim.
+/// Lift a snapshot's `config.json`, verbatim: a model's facts (besides
+/// declared quantization) come from the catalog now, matched by tensors
+/// rather than believed from the config, so nothing here parses or
+/// normalizes the document.
 ///
-/// # Why verbatim, when this used to normalize
-///
-/// It used to run the config through an 845-line normalizer into a
-/// `pie.model/1` descriptor — ~40 fields, resolved from a 136-field
-/// schema — so that an engine would not have to parse HuggingFace's
-/// spelling variations itself. That was the right shape of answer to
-/// the wrong question. Every one of those fields except three is a
-/// fact about the MODEL, and a model is a catalog row now: the row
-/// states its geometry, and a checkpoint is matched to it by its
-/// TENSORS rather than believed on the strength of what its config
-/// claims.
-///
-/// The three that remain are the declared quantization — method, bits,
-/// group size — and they are the only ones a row cannot state, because
-/// they are properties of the FILES and Qwen3-8B ships as four
-/// different sets of them. Nothing in the tree reads them out of this
-/// document any more — the loader takes a checkpoint's encodings off the
-/// tensors themselves — but the config still crosses whole, because
-/// carrying the checkpoint's own bytes is cheaper than deciding, here, which
-/// of its fields a future reader will want.
-///
-/// Verbatim also removes a class of failure the normalizer had by
-/// construction: it was a second reader of a document the checkpoint
-/// already carries, and a normalizer that defaults a missing field
-/// cannot be told apart from a config that states that value.
-///
-/// A missing or unreadable `config.json` is an error here, not a
-/// fallback. It used to be one: the engine would find nothing and parse
-/// the file itself. That branch is what this function exists to delete,
-/// so restoring it as an error path would restore the thing being
-/// removed.
+/// A missing or unreadable `config.json` is an error here, not a fallback.
 fn lift_snapshot_config(path: &Path) -> Result<Vec<u8>> {
     // A snapshot may be the directory or a lone checkpoint file inside it.
     let dir = if path.is_dir() {
@@ -172,9 +107,8 @@ fn lift_snapshot_config(path: &Path) -> Result<Vec<u8>> {
             config.display(),
         )
     })?;
-    // Parsed only to REFUSE a config that is not JSON. An engine that
-    // received an unparseable document would refuse it too, but several
-    // frames later and with a snapshot already half-opened.
+    // Parsed only to refuse a config that is not JSON, before a snapshot is
+    // half-opened.
     serde_json::from_str::<serde_json::Value>(&raw)
         .map_err(|err| anyhow!("cannot parse {}: {err}", config.display()))?;
     Ok(raw.into_bytes())
@@ -187,7 +121,7 @@ fn lift_snapshot_config(path: &Path) -> Result<Vec<u8>> {
 /// owns it and is where the shape is explained; this repeats only enough of it
 /// to find a file, because the worker cannot depend on the CLI crate.
 fn store_dir() -> PathBuf {
-    crate::paths::pie_home().join("models")
+    bootstrap::paths::pie_home().join("models")
 }
 
 /// The archive of the model stored under `name`, if there is one.
@@ -196,9 +130,14 @@ fn store_dir() -> PathBuf {
 /// gained a directory per model. Read, never written: a store that predates
 /// the change should keep serving rather than report every model missing.
 fn archive_in(store: &Path, name: &str) -> Option<PathBuf> {
-    let two_layer = store.join(name).join("archive.zt");
-    if two_layer.is_file() {
-        return Some(two_layer);
+    // `archive.zt` if present, else the specialized name a stamped import
+    // gives — asked through the reader's own discovery so this isn't a
+    // second, disagreeing answer to the same question.
+    let model_dir = store.join(name);
+    if model_dir.is_dir()
+        && let Some(found) = checkpoint::file::read::discover_zt_file(&model_dir)
+    {
+        return Some(found);
     }
     let flat = store.join(format!("{name}.zt"));
     flat.is_file().then_some(flat)
@@ -277,21 +216,6 @@ mod tests {
     use checkpoint::types::{DType, Encoding, TensorDecl, TensorId};
 
     #[test]
-    fn a_path_is_a_path_and_a_name_is_a_name() {
-        assert!(looks_like_path("/data/model.zt"));
-        assert!(looks_like_path("./model.zt"));
-        assert!(looks_like_path("../models/foo.zt"));
-        assert!(looks_like_path("relative/thing.zt"));
-        assert!(looks_like_path("weights.gguf"));
-        // Model names are full of dots, and a "has an extension" rule would
-        // read `Qwen--Qwen3-0.6B` as a file with extension `6B`.
-        assert!(!looks_like_path("Qwen--Qwen3-0.6B"));
-        assert!(!looks_like_path("Qwen/Qwen3-0.6B"));
-        assert!(!looks_like_path("meta-llama--Llama-3.1-8B"));
-        assert!(!looks_like_path("mymodel"));
-    }
-
-    #[test]
     fn an_artifact_path_resolves_to_itself() {
         let dir = tempfile::tempdir().unwrap();
         let artifact = dir.path().join("model.zt");
@@ -302,67 +226,38 @@ mod tests {
         );
     }
 
-    /// A snapshot directory and a lone checkpoint still resolve, and say they
-    /// are legacy — the engine reads `config.json` for those, which is what
-    /// the artifact removes.
+    // It also finds the specialized name a stamped import writes:
+    // `<slug>.<sku>.<backend>.zt`, so one model at two
+    // quantizations can sit in one directory.
     #[test]
-    fn snapshots_resolve_as_legacy() {
-        let dir = tempfile::tempdir().unwrap();
-        let snapshot = dir.path().join("snap");
-        std::fs::create_dir(&snapshot).unwrap();
-        let resolved = resolve(snapshot.to_str().unwrap()).unwrap();
-        assert_eq!(resolved, Model::Snapshot(snapshot));
-
-        let gguf = dir.path().join("model.gguf");
-        std::fs::write(&gguf, b"x").unwrap();
-        assert_eq!(
-            resolve(gguf.to_str().unwrap()).unwrap(),
-            Model::Snapshot(gguf)
-        );
-    }
-
-    /// A store name finds `<name>/archive.zt`, and falls back to `<name>.zt`.
-    ///
-    /// The two-layer store gives each model a directory so that per-target
-    /// builds have somewhere to live that is not a sibling of the archive.
-    /// The flat spelling is what pie wrote before that, and it still resolves:
-    /// dropping it would have made every model a user already had report as
-    /// missing, which reads as data loss whether or not the bytes are there.
-    ///
-    /// The archive wins when both exist, because it is the one a current pie
-    /// wrote.
-    #[test]
-    fn a_store_name_finds_the_archive_and_falls_back_to_the_flat_spelling() {
+    fn a_store_name_finds_the_name_a_stamped_import_wrote() {
         let store = tempfile::tempdir().unwrap();
         let store = store.path();
-        assert_eq!(archive_in(store, "qwen"), None);
 
-        let flat = store.join("qwen.zt");
-        std::fs::write(&flat, b"stand-in").unwrap();
-        assert_eq!(archive_in(store, "qwen"), Some(flat));
-
-        let archive = store.join("qwen").join("archive.zt");
-        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
-        std::fs::write(&archive, b"stand-in").unwrap();
+        let model = store.join("deepseek");
+        std::fs::create_dir_all(&model).unwrap();
+        let specialized =
+            model.join("deepseek.dsv4-flash-full-u4g64-u2g64-kv-bf16.metal-tp1.u4g64-u2g64.zt");
+        std::fs::write(&specialized, b"stand-in").unwrap();
         assert_eq!(
-            archive_in(store, "qwen"),
-            Some(archive),
-            "the two-layer archive wins over a leftover flat file"
+            archive_in(store, "deepseek"),
+            Some(specialized),
+            "the name `pie model import` writes under a serving stamp has to \
+             be the name the worker resolves"
         );
 
-        // A model directory with no archive in it is not a model. `runtime/`
-        // alone is what an interrupted `pie model remove` can leave behind.
-        std::fs::create_dir_all(store.join("empty").join("runtime")).unwrap();
-        assert_eq!(archive_in(store, "empty"), None);
-    }
-
-    #[test]
-    fn a_missing_name_says_how_to_get_one() {
-        let err = resolve("definitely-not-a-model").unwrap_err().to_string();
-        assert!(err.contains("pie model import"), "{err}");
-        let err = resolve("./nowhere.zt").unwrap_err().to_string();
-        assert!(err.contains("does not exist"), "{err}");
-        assert!(resolve("").is_err());
+        // Two specializations is the case the naming exists for; picking one
+        // would answer a question nobody asked.
+        std::fs::write(
+            model.join("deepseek.dsv4-flash-bf16-kv-bf16.metal-tp1.bf16.zt"),
+            b"stand-in",
+        )
+        .unwrap();
+        assert_eq!(
+            archive_in(store, "deepseek"),
+            None,
+            "two specializations in one directory is ambiguous, not a pick"
+        );
     }
 
     /// Writes an artifact carrying `config` plus, optionally, the whole
@@ -398,8 +293,8 @@ mod tests {
         Model::Artifact(path)
     }
 
-    /// An artifact hands over its compiled metadata whole, and the tokenizer
-    /// that comes back tokenizes like the one that went in.
+    // An artifact hands over its compiled metadata whole, and the tokenizer
+    // that comes back tokenizes like the one that went in.
     #[test]
     fn an_artifact_hands_over_its_compiled_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -420,42 +315,13 @@ mod tests {
         })
         .unwrap();
         let rebuilt = tokenizer::Tokenizer::from_canonical(&rebuilt).unwrap();
-        // AGAINST THE ORIGINAL, not against a number. `from_vocab(["a","b"])`
-        // builds a byte-level tokenizer, so its vocabulary is 258 -- the 256
-        // single-byte tokens plus the two named ones -- and the literal `2`
-        // that used to be here was a guess about the constructor rather than
-        // a claim about the round trip. Comparing the two ends says the thing
-        // this test is named for, and says it whatever the constructor does.
+        // Against the original, not a literal count, so the comparison holds
+        // whatever the constructor's vocab size is.
         let original = tokenizer::Tokenizer::from_vocab(&["a".to_string(), "b".to_string()]);
         assert_eq!(rebuilt.vocab_size(), original.vocab_size());
     }
 
-    /// All of the tokenizer or none of it: half compiled and half probed from
-    /// files beside a snapshot is the skew the artifact removes.
-    ///
-    /// The config is unaffected — it is a different object with a
-    /// different completeness question, and an artifact that carries one but
-    /// not a whole tokenizer still has a model config worth reading.
-    #[test]
-    fn an_artifact_missing_part_of_its_tokenizer_hands_over_none_of_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = br#"{"version":"pie.model/1","vocab_size":7}"#;
-        let lifted = artifact(dir.path(), config, false).metadata().unwrap();
-        assert!(lifted.tokenizer.is_none());
-        assert_eq!(lifted.config, config);
-    }
-
-    /// **Both input forms hand over the checkpoint's own config, byte
-    /// for byte.**
-    ///
-    /// This is the property that let the second and third normalizers go — the
-    /// engines' `config.json` parsers and the runtime's own key probes — so it
-    /// is pinned rather than left implied. If a snapshot ever again reaches
-    /// them without one, there is nothing left to fall back to.
-    ///
-    /// Verbatim is stronger than the normalized document it replaced: two
-    /// forms of the same model now hand over IDENTICAL bytes, where before
-    /// they handed over two normalizations that had to agree.
+    // Both input forms hand over the checkpoint's own config, byte for byte.
     #[test]
     fn every_model_form_produces_the_checkpoints_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -482,19 +348,13 @@ mod tests {
         let lifted = Model::Snapshot(snap.clone()).metadata().unwrap();
         assert!(lifted.tokenizer.is_none());
         let doc: serde_json::Value = serde_json::from_slice(&lifted.config).unwrap();
-        // VERBATIM: the keys are the checkpoint's own spelling, not a
-        // normalizer's. `num_hidden_layers` and `vocab_size` are a row's
-        // answers now, and nothing downstream reads them from here — this
-        // asserts only that the bytes arrived unaltered.
+        // Verbatim: the keys are the checkpoint's own spelling, asserting
+        // only that the bytes arrived unaltered.
         assert_eq!(doc["num_hidden_layers"], 2);
         assert_eq!(doc["vocab_size"], 32);
         assert_eq!(doc["model_type"], "llama");
-        // THE QUANTIZATION BLOCK, absent here, which is not a defect: most
-        // checkpoints declare none, and an absent block is an unquantized
-        // checkpoint rather than a missing answer. This used to run it
-        // through `models::serve::encoding::Encoding`; that parser is deleted
-        // and had no non-test caller, so what is left to assert is that the
-        // block is not there and nothing invented one.
+        // Absent quantization block is not a defect: most checkpoints
+        // declare none.
         assert!(
             doc.get("quantization_config").is_none() && doc.get("quantization").is_none(),
             "an unquantized snapshot declares nothing"
@@ -520,3 +380,116 @@ mod tests {
         assert!(err.contains("config.json"), "{err}");
     }
 }
+
+/// The engine's self-report, deliberately, not the catalog row: this is the
+/// token two workers compare before they trade KV pages, so what must agree
+/// is what the two engines actually loaded, not what their catalogs claim.
+pub(crate) fn model_identity(
+    user_cfg: &config::Config,
+    caps: &EngineCapabilities,
+    artifact_digest: &[u8; 32],
+    component: crate::executor::ModelComponent,
+) -> Result<crate::executor::ModelIdentity> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(user_cfg.model.name.as_bytes());
+    hasher.update(artifact_digest);
+    // The engine's answer, whole: no `arch_name` (names the catalog row the
+    // caller resolved, shared by both peers already) or `hidden_size` (no
+    // seat in `ModelProfile`).
+    hasher.update(caps.device.backend.as_bytes());
+    hasher.update(&caps.profile.vocab.to_le_bytes());
+    hasher.update(&caps.profile.num_layers.to_le_bytes());
+    hasher.update(&caps.limits.max_context.to_le_bytes());
+    hasher.update(caps.profile.activation_name().as_bytes());
+    hasher.update(&caps.pools.kv_page_size.to_le_bytes());
+    hasher.update(format!("{:?}", user_cfg.model.engine.kind).as_bytes());
+    hasher.update(user_cfg.model.engine.activation_dtype.as_bytes());
+    // A `[model]` key rather than an engine option: what the checkpoint holds
+    // is a fact about the weights, so it discriminates for every kind.
+    hasher.update(user_cfg.model.weight_dtype.as_bytes());
+    // Nothing from the engine options, for any kind: the identity already
+    // carries the kind, and no option changes what the weights are.
+    Ok(crate::executor::ModelIdentity {
+        hash: *hasher.finalize().as_bytes(),
+        component,
+    })
+}
+
+/// The identity of a `.zt` artifact, or `None` for anything else.
+///
+/// The loader answers what identifies a checkpoint; this only folds its answer
+/// into the 32-byte shape the identity plumbing expects.
+pub(crate) fn manifest_digest(path: &Path) -> Result<Option<[u8; 32]>> {
+    let identity = checkpoint::file::zt::artifact_identity(path)
+        .map_err(|err| anyhow!("reading the identity of {path:?}: {err}"))?;
+    Ok(identity.map(|bytes| *blake3::hash(&bytes).as_bytes()))
+}
+
+pub(crate) fn model_artifact_digest(snapshot_dir: &Path) -> Result<[u8; 32]> {
+    // A `.zt` artifact's manifest digest covers every tensor, the compiled
+    // tokenizer and the config together, and survives the file being moved.
+    if let Some(digest) = manifest_digest(snapshot_dir)? {
+        return Ok(digest);
+    }
+
+    // Legacy snapshots: the revision in `snapshots/<rev>/` is HF's own
+    // content identity, beating a full re-hash; the walk is the last resort.
+    let components = snapshot_dir.components().collect::<Vec<_>>();
+    for pair in components.windows(2) {
+        if pair[0].as_os_str() == "snapshots" {
+            let revision = pair[1].as_os_str().to_string_lossy();
+            if !revision.is_empty() {
+                return Ok(*blake3::hash(revision.as_bytes()).as_bytes());
+            }
+        }
+    }
+
+    fn collect_files(current: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> {
+        if current.is_file() {
+            files.push(current.to_path_buf());
+            return Ok(());
+        }
+        let mut entries = std::fs::read_dir(current)
+            .with_context(|| format!("reading model artifact directory {current:?}"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                let target = std::fs::canonicalize(&path)?;
+                if target.is_file() {
+                    files.push(path);
+                }
+            } else if metadata.is_dir() {
+                collect_files(&path, files)?;
+            } else if metadata.is_file() {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    collect_files(snapshot_dir, &mut files)?;
+    files.sort();
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    for path in files {
+        use std::io::Read;
+
+        let relative = path.strip_prefix(snapshot_dir).unwrap_or(&path);
+        hasher.update(relative.to_string_lossy().as_bytes());
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("opening model artifact {path:?}"))?;
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+

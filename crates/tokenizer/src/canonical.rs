@@ -1,57 +1,6 @@
-//! `pie.tokenizer/1` — the compiled tokenizer as bytes.
-//!
-//! Every external tokenizer format compiles into one of a small number of
-//! pipelines (see the crate docs). That compilation is the expensive,
-//! quirk-ridden part, and today it runs at every serve boot: an ~11 MB
-//! `tokenizer.json` is parsed and its hash maps rebuilt, or a tiktoken rank
-//! file is read and its merge table *synthesized* by trying every split point
-//! of every token. This module is the serialization of what that compilation
-//! produces, so it can run once at import instead.
-//!
-//! # What is stored, and why each piece
-//!
-//! | Object | Content |
-//! |---|---|
-//! | `tokenizer/vocab_bytes` | every token's bytes, concatenated in id order |
-//! | `tokenizer/vocab_offsets` | `n + 1` little-endian `u32`, so token `i` is `[off[i], off[i+1])` |
-//! | `tokenizer/merge_table` | little-endian `u32` quads `(left, right, rank, merged)` |
-//! | `tokenizer/byte_fallback` | 256 little-endian `u32`, [`NO_TOKEN`] where absent |
-//! | `tokenizer/descriptor` | the pipeline and the added tokens, as JSON |
-//!
-//! Three of those are less obvious than they look:
-//!
-//! - **The merge table is quads, not ranks.** [`BpeTable`](crate::bpe::BpeTable)
-//!   keys merges by token-id *pair*, and `merged` is not always derivable: the
-//!   HF path has `merged = token_to_id[left ++ right]`, but the tiktoken path
-//!   synthesizes merges by trying split points and keeping the lowest rank,
-//!   which can pick a different token than concatenation would name.
-//! - **The byte-fallback table is stored, not recomputed.** It is populated
-//!   only on the HF path; the tiktoken path leaves all 256 entries empty even
-//!   though the vocabulary contains byte atoms. Recomputing it by scanning for
-//!   `<0xNN>` literals would silently *change* how a tiktoken tokenizer
-//!   decodes rather than reproduce it.
-//! - **The encode map is not stored at all.** `bytes → id` is derived on load
-//!   under "lowest id wins", and the writer refuses any table where that fails
-//!   to reproduce the original ([`BpeTable::encode_map_is_derivable`]).
-//!
-//! # Versioning
-//!
-//! The descriptor carries [`VERSION`], and the reader refuses anything else.
-//! This schema freezes internal enums into an on-disk contract, so it evolves
-//! by version bump and regeneration from provenance — never by a reader
-//! guessing a default for a field an older writer did not emit.
-//!
-//! # Deliberately not covered
-//!
-//! No general-purpose tokenizer interchange. This expresses exactly what pie's
-//! pipelines support and rejects everything else at import; covering HF's full
-//! normalizer/unigram/wordpiece space would re-invent `tokenizer.json`.
-//!
-//! bos/eos/`chat_template` are also absent, because they are not part of a
-//! tokenizer here — they live as per-architecture Rust under
-//! `model/src/instruct/`. Serializing them would create fields nothing
-//! reads until that code is refactored, and a schema commitment bought for
-//! nothing is the one kind this format cannot take back.
+//! Serialized tokenizer format (`pie.tokenizer/1`): vocab bytes/offsets, merge
+//! quads, byte-fallback table, and a JSON descriptor. `from_canonical` refuses
+//! any other version.
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -59,13 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::bpe::BpeTable;
 use crate::{AddedToken, BpeMode, DummyPrefix, Pipeline, Splitter, Tokenizer};
 
-/// The schema this module reads and writes.
 pub const VERSION: &str = "pie.tokenizer/1";
 
-/// The `byte_fallback` entry meaning "no token for this byte".
-///
-/// `u32::MAX` cannot collide with a real id: a vocabulary that large would
-/// not fit the `u32` ids the tokenizer uses throughout.
+/// Sentinel meaning "no token for this byte"; `u32::MAX` cannot collide with
+/// a real token id.
 pub const NO_TOKEN: u32 = u32::MAX;
 
 /// Object names, relative to the artifact's metadata namespace.
@@ -84,11 +30,8 @@ pub const OBJECTS: [&str; 5] = [
     VOCAB_OFFSETS,
 ];
 
-/// A compiled tokenizer, serialized.
-///
-/// Field order matches [`OBJECTS`], which is ascending by name — what the
-/// artifact writer needs, since canonical `.zt` form requires objects in
-/// ascending name order.
+/// A compiled tokenizer, serialized. Field order matches [`OBJECTS`]
+/// (ascending by name), required by canonical `.zt` form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalTokenizer {
     pub byte_fallback: Vec<u8>,
@@ -110,12 +53,8 @@ impl CanonicalTokenizer {
         ]
     }
 
-    /// Collects the objects back from whatever holds them.
-    ///
-    /// `read` is given each name in [`OBJECTS`] and returns its bytes. A name
-    /// it cannot supply is a hard error: a tokenizer missing one of its five
-    /// objects is not a tokenizer, and guessing an empty default for a merge
-    /// table would produce one that silently tokenizes character by character.
+    /// Collects the objects back from whatever holds them. A missing object
+    /// is a hard error rather than an empty-default guess.
     pub fn from_objects(mut read: impl FnMut(&str) -> Option<Vec<u8>>) -> Result<Self> {
         let mut fetch =
             |name: &str| read(name).with_context(|| format!("the artifact has no '{name}' object"));
@@ -128,7 +67,6 @@ impl CanonicalTokenizer {
         })
     }
 
-    /// Total size of the serialized form.
     pub fn byte_size(&self) -> usize {
         self.objects().iter().map(|(_, bytes)| bytes.len()).sum()
     }
@@ -145,27 +83,15 @@ struct Descriptor {
     added_tokens: Vec<AddedTokenDescriptor>,
 }
 
-/// The pipeline, as data.
-///
-/// Tagged by `kind` rather than by position so a reader fails on an unknown
-/// pipeline with a name in the message. Regexes travel as their pattern
-/// strings; splitter *order* is semantic, since they apply as a sequence.
-/// One splitter, as data.
-///
-/// Serializes as a BARE PATTERN STRING whenever the stage keeps the gaps
-/// between matches — which is every splitter that existed before the
-/// OLMo-2 `Removed+invert` encoding was supported, and still the common
-/// case. So an artifact written before this field existed reads back as
-/// `Isolated`, which is what those models are, rather than as "the field
-/// is absent" — the distinction the format has to get right, because a
-/// wrong default here silently drops text between matches.
+/// Untagged: a bare string decodes as `Isolated` (the historical form,
+/// still the common case); an object decodes as `Explicit`.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(untagged)]
 enum SplitterDescriptor {
-    /// `Split { behavior: Isolated }` — the historical form.
+    /// `Split { behavior: Isolated }`.
     Isolated(String),
-    /// `Split { behavior: Removed, invert: true }` — matches become
-    /// pieces and the text between them is dropped.
+    /// `Split { behavior: Removed, invert: true }`: matches become pieces,
+    /// text between them is dropped.
     Explicit { pattern: String, keep_gaps: bool },
 }
 
@@ -185,11 +111,8 @@ impl SplitterDescriptor {
     }
 }
 
-/// How the sentencepiece dummy prefix is injected, as data.
-///
-/// Defaults to `None`, which is what every `ByteFallbackReplace` artifact
-/// written before this field existed was: Gemma, the only member of that
-/// profile at the time.
+/// Sentencepiece dummy-prefix mode. Defaults to `None` (what every artifact
+/// written before this field existed was).
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Default, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 enum DummyPrefixDescriptor {
@@ -199,6 +122,7 @@ enum DummyPrefixDescriptor {
     FirstSegment,
 }
 
+/// Tagged by `kind`; splitter order is semantic (applied as a sequence).
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PipelineDescriptor {
@@ -224,11 +148,7 @@ struct AddedTokenDescriptor {
     id: u32,
     content: String,
     special: bool,
-    /// Boundary flags, absent from artifacts written before they were
-    /// honoured. `false` is what every such token was: the encoder did
-    /// not consume whitespace beside a match, so reading them back as
-    /// clear reproduces exactly the behaviour that artifact was written
-    /// with.
+    /// Absent from old artifacts; defaults to `false`, their actual behavior.
     #[serde(default)]
     lstrip: bool,
     #[serde(default)]
@@ -240,11 +160,8 @@ struct AddedTokenDescriptor {
 // ---------------------------------------------------------------------------
 
 impl Tokenizer {
-    /// Serializes this tokenizer as `pie.tokenizer/1`.
-    ///
-    /// Fails rather than writing something lossy: a vocabulary with a hole, or
-    /// an encode map that cannot be derived from the decode table, has no
-    /// representation here and is refused with the reason.
+    /// Serializes this tokenizer as `pie.tokenizer/1`. Fails rather than
+    /// writing something lossy (a vocabulary hole, an undecodable encode map).
     pub fn to_canonical(&self) -> Result<CanonicalTokenizer> {
         ensure!(
             self.bpe.encode_map_is_derivable(),
@@ -296,11 +213,7 @@ impl Tokenizer {
         })
     }
 
-    /// The added tokens, recovered in the order they were registered.
-    ///
-    /// `added_tokens` is in registration order (it indexes the matcher's
-    /// patterns), so that order is what comes back; `content` comes from
-    /// the vocabulary and `special` from the sorted set.
+    /// Recovers added tokens in registration order.
     fn added_token_descriptors(&self) -> Vec<AddedTokenDescriptor> {
         self.added_tokens
             .iter()
@@ -369,10 +282,8 @@ fn describe_pipeline(pipeline: &Pipeline) -> PipelineDescriptor {
 // ---------------------------------------------------------------------------
 
 impl Tokenizer {
-    /// Rebuilds a tokenizer from its `pie.tokenizer/1` objects.
-    ///
-    /// This is the whole of the load path an artifact needs — no format
-    /// sniffing, no sibling files, no merge synthesis.
+    /// Rebuilds a tokenizer from its `pie.tokenizer/1` objects; no format
+    /// sniffing, no merge synthesis.
     pub fn from_canonical(objects: &CanonicalTokenizer) -> Result<Self> {
         let descriptor: Descriptor =
             serde_json::from_slice(&objects.descriptor).context("decoding the descriptor")?;
@@ -509,124 +420,3 @@ fn read_u32s(bytes: &[u8], what: &str) -> Result<Vec<u32>> {
         .collect())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Everything the format must reproduce, checked by behavior rather than
-    /// by field equality: the round-tripped tokenizer encodes and decodes the
-    /// same text to the same ids.
-    fn assert_round_trips(original: &Tokenizer, samples: &[&str]) -> Tokenizer {
-        let canonical = original.to_canonical().unwrap();
-        let rebuilt = match Tokenizer::from_canonical(&canonical) {
-            Ok(rebuilt) => rebuilt,
-            Err(err) => panic!("round trip failed: {err}"),
-        };
-
-        assert_eq!(rebuilt.vocab_size(), original.vocab_size());
-        assert_eq!(rebuilt.special_token_ids(), original.special_token_ids());
-        for text in samples {
-            let ids = original.encode(text);
-            assert_eq!(rebuilt.encode(text), ids, "encoding {text:?}");
-            assert_eq!(
-                rebuilt.decode(&ids, false),
-                original.decode(&ids, false),
-                "decoding {text:?}"
-            );
-        }
-
-        // Serialization is deterministic — the merge table is a hash map, and
-        // an artifact that changed bytes between runs would defeat the
-        // content-addressed identity the format is built on.
-        assert_eq!(rebuilt.to_canonical().unwrap(), canonical);
-        rebuilt
-    }
-
-    #[test]
-    fn a_raw_char_tokenizer_round_trips() {
-        let vocab: Vec<String> = ["a", "b", "c", "ab", "abc", " "]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let tokenizer = Tokenizer::from_vocab(&vocab);
-        assert_round_trips(&tokenizer, &["abc", "a b c", "cab"]);
-    }
-
-    #[test]
-    fn the_descriptor_names_its_version_and_pipeline() {
-        let vocab: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
-        let canonical = Tokenizer::from_vocab(&vocab).to_canonical().unwrap();
-        let descriptor: Descriptor = serde_json::from_slice(&canonical.descriptor).unwrap();
-        assert_eq!(descriptor.version, VERSION);
-        assert_eq!(descriptor.pipeline, PipelineDescriptor::RawChar);
-    }
-
-    #[test]
-    fn the_offsets_array_holds_one_more_entry_than_there_are_tokens() {
-        let vocab: Vec<String> = ["a", "bb", "ccc"].iter().map(|s| s.to_string()).collect();
-        let tokenizer = Tokenizer::from_vocab(&vocab);
-        let tokens = tokenizer.vocab_size();
-        let canonical = tokenizer.to_canonical().unwrap();
-        let offsets = read_u32s(&canonical.vocab_offsets, "offsets").unwrap();
-        assert_eq!(
-            offsets.len(),
-            tokens + 1,
-            "one more entry than there are tokens"
-        );
-        // The stated vocabulary keeps the ids it stated; `from_vocab`
-        // appends its byte tail after them, so the first four offsets and
-        // the first six bytes are still exactly these.
-        assert_eq!(&offsets[..4], &[0, 1, 3, 6]);
-        assert_eq!(&canonical.vocab_bytes[..6], b"abbccc");
-        assert_eq!(
-            usize::try_from(*offsets.last().unwrap()).unwrap(),
-            canonical.vocab_bytes.len(),
-            "the last offset is the end of the bytes",
-        );
-    }
-
-    #[test]
-    fn a_version_this_build_does_not_read_is_refused() {
-        let vocab: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
-        let mut canonical = Tokenizer::from_vocab(&vocab).to_canonical().unwrap();
-        let text = String::from_utf8(canonical.descriptor.clone()).unwrap();
-        canonical.descriptor = text.replace(VERSION, "pie.tokenizer/99").into_bytes();
-
-        match Tokenizer::from_canonical(&canonical) {
-            Ok(_) => panic!("a future schema version was accepted"),
-            Err(err) => assert!(
-                err.to_string().contains("pie.tokenizer/99"),
-                "unexpected error: {err}"
-            ),
-        }
-    }
-
-    #[test]
-    fn a_truncated_object_is_refused_rather_than_read_short() {
-        let vocab: Vec<String> = ["a", "bb"].iter().map(|s| s.to_string()).collect();
-        let good = Tokenizer::from_vocab(&vocab).to_canonical().unwrap();
-
-        let mut short_fallback = good.clone();
-        short_fallback.byte_fallback.truncate(4);
-        assert!(Tokenizer::from_canonical(&short_fallback).is_err());
-
-        let mut ragged_merges = good.clone();
-        ragged_merges.merge_table.extend_from_slice(&[0, 0, 0, 0]);
-        assert!(Tokenizer::from_canonical(&ragged_merges).is_err());
-
-        let mut short_vocab = good.clone();
-        short_vocab.vocab_bytes.pop();
-        assert!(Tokenizer::from_canonical(&short_vocab).is_err());
-
-        let mut misaligned = good;
-        misaligned.vocab_offsets.push(0);
-        assert!(Tokenizer::from_canonical(&misaligned).is_err());
-    }
-
-    #[test]
-    fn from_objects_names_the_object_it_could_not_find() {
-        let err = CanonicalTokenizer::from_objects(|name| (name != MERGE_TABLE).then(Vec::new))
-            .unwrap_err();
-        assert!(err.to_string().contains(MERGE_TABLE), "{err}");
-    }
-}

@@ -3,65 +3,17 @@ use checkpoint::types::{DType, Encoding};
 use model_dsl::{Dtype, Weight};
 
 use super::model::Model;
+use model_dsl::Platform;
 use checkpoint_dsl::{Builder, Error, divided, encoding, extents, grouped, scaling, stored_encoding};
 
 const BANK_ROWS: u8 = 1;
 
-/// **HOW A CHECKPOINT OF THIS FAMILY SPELLS ITS EXPERT BANKS**, which is the
-/// only thing two otherwise identical files disagree about.
-///
-/// The trunk does NOT move here, unlike qwen's and gemma's: gpt-oss is a plain
-/// causal LM with no multimodal wrapper, so `mlx_lm`'s `sanitize` leaves
-/// `model.layers.{l}.*`, `model.embed_tokens.*` and `lm_head.*` exactly where
-/// transformers put them, and every name outside the MoE below is shared.
-///
-/// What `GptOssModel.sanitize` does do is take the fused, row-interleaved
-/// `gate_up_proj` apart:
-///
-/// ```python
-/// if "gate_up_proj" in k and "bias" not in k:
-///     if "_blocks" in k:
-///         v = v.view(mx.uint32).flatten(-2)
-///         k = k.replace("_blocks", ".weight")
-///     if "_scales" in k:
-///         k = k.replace("_scales", ".scales")
-///     new_weights[k.replace("gate_up_proj", "gate_proj")] = mx.contiguous(v[..., ::2, :])
-///     new_weights[k.replace("gate_up_proj", "up_proj")]   = mx.contiguous(v[..., 1::2, :])
-/// ```
-///
-/// Three changes in one pass, and all three have to be read back out:
-///
-/// 1. **The seam moves from a stride to a name.** Transformers interleaves
-///    gate and up rows inside one tensor, which is what [`deinterleaved`]
-///    un-picks with a pair of strided reads. `mlx_lm` writes two tensors whose
-///    rows are already contiguous — so the same declared bank is a `concat`
-///    of two whole sources instead, on the same axis, gate leg first, which is
-///    the order the strided pair produced.
-///
-/// 2. **The codes change container.** `v.view(mx.uint32).flatten(-2)` turns
-///    the OCP `_blocks` layout — a `[.., 16]` tail of bytes per 32-code block
-///    — into `u32` words, so what transformers ships as `Raw(U8)` this ships
-///    as `Raw(U32)`. **The BYTES are identical**: OCP packs E2M1 low nibble
-///    first, `mx.uint32` is little-endian, so byte `b` of a word still holds
-///    codes `2b` and `2b+1` in that order. It is a reinterpret and
-///    [`Expr::transmute`] is exactly the node for one — which is why
-///    [`bank_planes`] takes the container it should expect rather than
-///    asserting one.
-///
-/// 3. **`_bias` splits the same way**, into `gate_proj.bias` and
-///    `up_proj.bias`, and joins back with a plain `concat` on the same axis.
-///
-/// The `down_proj` bank takes changes 2 and 3 and not 1: it was never fused,
-/// so it is one source under a renamed suffix.
-///
-/// **THE DISCRIMINATOR WAS THE FIRST LAYER'S GATE-UP CODES AND IS NOW THE
-/// READING ITSELF** (§M-4a-3). That one name is the only one the two
-/// spellings do not share, which made it the cheapest possible witness — and
-/// a witness is a proxy for "does this arm build", which promotion can
-/// falsify: the plane it names is one `pie model import` moves. So both arms
-/// are built and the first that succeeds is the answer, and the name that
-/// used to decide is now just one of the names an arm looks for. The argument
-/// in full, and the file it was measured on, is at `qwen_3::Model::import`.
+/// How this family spells its expert banks; every name outside the MoE is
+/// shared between the two spellings. `mlx_lm` un-fuses the row-interleaved
+/// `gate_up_proj` into two contiguous tensors (gate first) joined by
+/// `concat`, and its codes container is `Raw(U32)` instead of `Raw(U8)` —
+/// same bytes, reinterpreted ([`Expr::transmute`]). `_bias` splits the same
+/// way; `down_proj` only renames.
 #[derive(Clone, Copy)]
 enum Layout {
     /// `mlp.experts.gate_up_proj_blocks` / `_scales` / `_bias`, fused and
@@ -73,9 +25,8 @@ enum Layout {
 }
 
 impl Layout {
-    /// The container the expert CODE planes arrive in. The scales are `u8` in
-    /// both spellings — one OCP E8M0 exponent byte per block, which neither
-    /// conversion repacks.
+    /// The container the expert code planes arrive in. Scales are `u8` in
+    /// both spellings: one E8M0 exponent byte per block.
     fn codes(self) -> DType {
         match self {
             Self::Transformers => DType::U8,
@@ -85,29 +36,19 @@ impl Layout {
 }
 
 impl Model {
-    pub fn import(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
-        // **THE NATIVE DOOR, ASKED BEFORE THE WITNESS SNIFF** (§M-4a). A file
-        // holding every plane this contract declares, under this contract's
-        // names, is an artifact `pie model import` wrote out of this very
-        // text, and [`Model::load`] is its reader: `read_own` throughout, no
-        // transform at all. `load` failing is what says the file is foreign,
-        // and it fails on the first plane it cannot find. The argument in full
-        // is at `qwen_3::Model::import`.
-        if let Ok(native) = self.load(src) {
-            return Ok(native);
-        }
-        // **AND THE ARM IS CHOSEN BY BUILDING IT, NOT BY SNIFFING A NAME.**
-        // The witness this used to look for — the embedding, spelled the way
-        // each layout spells it — is one of the planes a promotion MOVES, so
-        // an artifact this build wrote could satisfy neither door. The
-        // argument in full, and the file it was measured on, is at
-        // `qwen_3::Model::import`.
+    pub fn import(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        // `load` fails on the first plane not found under this contract's
+        // own names, which is how a foreign file is detected.
         let mut refusals: Vec<String> = Vec::new();
         for (what, layout) in [
             ("transformers", Layout::Transformers),
             ("mlx_lm", Layout::Mlx),
         ] {
-            match self.import_from(src, layout) {
+            match self.import_from(src, platform, layout) {
                 Ok(contract) => return Ok(contract),
                 Err(why) => refusals.push(format!("as {what}, {why}")),
             }
@@ -124,17 +65,13 @@ impl Model {
 
     fn import_from(
         &self,
-        src: &ztensor::Source,
+        src: &ztensor::Source, platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
-        // **ONE `read` PER BANK, HOWEVER MANY TENSORS THAT IS.** These
-        // names are the same in both spellings; what differs is how many
-        // TENSORS each one is, and that is a fact about the weight's declared
-        // dtype rather than about the layout. A bf16 SKU reads one `.weight`
-        // here exactly as it always did; an `mlxu4` SKU reads the
-        // `.weight`/`.scales`/`.biases` triplet MLX ships beside it —
-        // `read` says the logical name once and lets the dtype answer.
-        let mut b = Builder::new(src, self.tp);
+        // How many tensors one `read` covers depends on the weight's dtype,
+        // not the layout: bf16 reads one `.weight`, u4g64 reads the
+        // `.weight`/`.scales`/`.biases` triplet.
+        let mut b = Builder::new(src, self.tp, platform);
         b.read(&self.embed, "model.embed_tokens.weight")?;
         b.read(&self.final_norm, "model.norm.weight")?;
         b.read(&self.head, "lm_head.weight")?;
@@ -154,12 +91,9 @@ impl Model {
             b.read(&attn.o_proj, ck("self_attn.o_proj.weight"))?;
             b.read(&attn.o_bias, ck("self_attn.o_proj.bias"))?;
             b.read(&attn.sinks, ck("self_attn.sinks"))?;
-            // **THE ROUTER GATE, AT ITS OWN WIDTH.** `Moe::router` is declared
-            // `U8g64` wherever the stack is `U4g64` — `gpt_oss.py`'s
-            // `quant_predicate`, read at `Model::new` — and `read` asks the
-            // weight rather than the file, so the same call reads a bf16
-            // tensor here from a transformers checkpoint and an eight-bit
-            // affine triplet from an MLX one.
+            // `Moe::router` is declared `U8g64` wherever the stack is
+            // `U4g64` (`gpt_oss.py`'s `quant_predicate`, read at
+            // `Model::new`).
             b.read(&mlp.router, ck("mlp.router.weight"))?;
             b.read(&mlp.router_bias, ck("mlp.router.bias"))?;
 
@@ -167,53 +101,51 @@ impl Model {
             match layout {
                 Layout::Transformers => {
                     let rows = i64::from(mlp.inter);
-                    b.extend(banked_interleaved(
-                        src,
-                        &mlp.gate_up,
-                        ck("mlp.experts.gate_up_proj_blocks"),
-                        ck("mlp.experts.gate_up_proj_scales"),
-                        rows,
-                        layout,
-                    )?);
+                    b.extend({
+                        banked_interleaved(
+                            src,
+                            &mlp.gate_up,
+                            ck("mlp.experts.gate_up_proj_blocks"),
+                            ck("mlp.experts.gate_up_proj_scales"),
+                            rows,
+                            layout,
+                        )
+                    }?);
                     b.read_expr(
                         &mlp.gate_up_bias,
                         deinterleaved(Expr::src(ck("mlp.experts.gate_up_proj_bias")), rows),
                     )?;
 
-                    b.extend(banked(
-                        src,
-                        &mlp.down,
-                        ck("mlp.experts.down_proj_blocks"),
-                        ck("mlp.experts.down_proj_scales"),
-                        layout,
-                    )?);
+                    b.extend({
+                        banked(
+                            src,
+                            &mlp.down,
+                            ck("mlp.experts.down_proj_blocks"),
+                            ck("mlp.experts.down_proj_scales"),
+                            layout,
+                        )
+                    }?);
                     b.read(&mlp.down_bias, ck("mlp.experts.down_proj_bias"))?;
                 }
                 Layout::Mlx => {
-                    b.extend(banked_split(
-                        src,
-                        &mlp.gate_up,
-                        &[
-                            ck("mlp.experts.gate_proj"),
-                            ck("mlp.experts.up_proj"),
-                        ],
-                        layout,
-                    )?);
-                    // Two contiguous halves of the declared `[experts,
-                    // 2*inter]` bias, joined on the bank's own seam — the same
-                    // axis and the same gate-first order `deinterleaved`
-                    // produces above.
+                    b.extend({
+                        banked_split(
+                            src,
+                            &mlp.gate_up,
+                            &[ck("mlp.experts.gate_proj"), ck("mlp.experts.up_proj")],
+                            layout,
+                        )
+                    }?);
+                    // Halves of the declared `[experts, 2*inter]` bias,
+                    // joined gate-first, same axis as `deinterleaved` above.
                     b.read_concat(
                         &mlp.gate_up_bias,
                         [ck("mlp.experts.gate_proj.bias"), ck("mlp.experts.up_proj.bias")],
                     )?;
 
-                    b.extend(banked_split(
-                        src,
-                        &mlp.down,
-                        &[ck("mlp.experts.down_proj")],
-                        layout,
-                    )?);
+                    b.extend({
+                        banked_split(src, &mlp.down, &[ck("mlp.experts.down_proj")], layout)
+                    }?);
                     b.read(&mlp.down_bias, ck("mlp.experts.down_proj.bias"))?;
                 }
             }
@@ -245,22 +177,11 @@ fn banked_interleaved(
     })
 }
 
-/// **ONE DECLARED BANK OUT OF THE `stem`s THE CHECKPOINT SPLIT IT INTO** —
-/// `mlx_lm`'s spelling, where a `gate_up` is two whole tensors rather than one
-/// tensor read at a stride, and a `down` is the degenerate one-stem case.
-///
-/// Each stem contributes a `<stem>.weight` of codes and a `<stem>.scales` of
-/// E8M0 exponents; the legs join on [`BANK_ROWS`], which is the axis
-/// `Weight::bank` cut and therefore the axis the declared shape's `2 * inter`
-/// spans. **THE SCALES JOIN ON THE SAME AXIS AS THE CODES**, because a block's
-/// exponent belongs to the row it scales, and this axis is not the blocked one
-/// — the contracted axis is the last, and each leg's group count is untouched
-/// by the seam.
-///
-/// The leg's own extents are the declared bank's with that axis divided by the
-/// number of stems, which is what makes the arithmetic checkable rather than
-/// assumed: a transmute whose byte count did not match the source would be
-/// refused by `infer_transmute` at the plane it was wrong about.
+/// A declared bank from `mlx_lm`'s split stems (`gate_up` = 2 tensors,
+/// `down` = 1). Each stem gives a `<stem>.weight` of codes and a
+/// `<stem>.scales` of E8M0 exponents; legs join on [`BANK_ROWS`], the axis
+/// `Weight::bank` cut. Leg extents are the bank's with that axis divided by
+/// the stem count; a mismatched byte count is caught by `infer_transmute`.
 fn banked_split(
     src: &ztensor::Source,
     w: &Weight,

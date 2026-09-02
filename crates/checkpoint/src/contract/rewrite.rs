@@ -1,17 +1,14 @@
 //! Contract-to-contract rewrites that run before the plan is built.
 //!
-//! These are optimizations, not semantics: each one returns a contract that
-//! declares exactly the same tensors as the one it was given. They live in the
-//! planner because they reason about *shape and cost*, never about which model
-//! a tensor belongs to — a rewrite that needed the model's name would be the
-//! engine's business, not the compiler's.
+//! Optimizations, not semantics: each one returns a contract declaring
+//! exactly the same tensors as the one it was given, reasoning only about
+//! shape and cost.
 //!
-//! What they return is a contract for ONE RANK. A rewrite runs with the target
-//! in hand and resolves the shards it rewrites, so the expressions it emits
-//! name concrete bands and the shapes it declares are those bands. The
-//! rank-independent contract is the *input*: a declaration there is the whole
-//! tensor's, which is what [`coalesce_direct_row_shards`] matches against, and
-//! it is the last place in the pipeline where that is so.
+//! What they return is a contract for one rank: a rewrite runs with the
+//! target in hand and resolves the shards it rewrites, so its expressions
+//! name concrete bands. The rank-independent input contract still declares
+//! whole-tensor shapes, which is what [`coalesce_direct_row_shards`]
+//! matches against.
 
 use crate::file::{Metadata, RawTensor};
 use crate::contract::{Expr, ModelContract, TensorContract, local_range};
@@ -47,7 +44,6 @@ pub fn coalesce_direct_row_shards(
     let mut buckets: Vec<(GroupKey, Vec<usize>)> = Vec::new();
     let mut local_bytes_by_index = vec![0_u64; contract.tensors.len()];
     for (index, tensor) in contract.tensors.iter().enumerate() {
-        // One pattern says everything the old flag-plus-match pair said:
         // this tensor is a whole checkpoint tensor, split by row.
         let Expr::Shard { src, axis: Axis(0) } = &tensor.expr else {
             continue;
@@ -58,10 +54,7 @@ pub fn coalesce_direct_row_shards(
         let Some(raw) = metadata.tensor_by_name(name) else {
             continue;
         };
-        // Extents come off the checkpoint. The contract's own shape says the
-        // same thing -- a declaration is the whole tensor's -- but only for a
-        // tensor that declares one, and the band this pass emits has to be
-        // derived either way.
+        // extents come off the checkpoint, not the contract's own shape.
         if raw.shape.len() != 2 || raw.shape[0] <= 0 || raw.shape[1] <= 0 {
             continue;
         }
@@ -78,12 +71,7 @@ pub fn coalesce_direct_row_shards(
             target.tp_rank,
             &format!("the row count of '{}'", tensor.name),
         )?;
-        // A declaration is a claim about the whole tensor, so a row shard of a
-        // whole checkpoint tensor claims that tensor's own shape. This used to
-        // ask for `[local_rows, cols]`, which was the same claim read as this
-        // rank's band; a contract that says what it means says the whole, and
-        // reading it the old way would have quietly stopped matching -- and
-        // this pass with it.
+        // a declaration claims the whole tensor's shape, not this rank's band.
         if tensor.shape.as_deref() != Some(&raw.shape[..]) {
             continue;
         }
@@ -188,8 +176,7 @@ fn emit_row_shard_bank(
         &format!("the row count of '{}'", first.name),
     )?;
 
-    // The bank is the local row band of every member, end to end. Stated as
-    // an expression the offsets are the compiler's problem, not this pass's.
+    // the bank is the local row band of every member, end to end.
     let mut parts = Vec::with_capacity(indices.len());
     for &old_index in indices {
         let raw = direct_raw(metadata, &contract.tensors[old_index])?;

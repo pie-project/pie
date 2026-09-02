@@ -81,7 +81,7 @@ pub struct Root {
 
 /// The units that do not take the defaults. The rows live here rather than
 /// with the entries that fire them, so the configuration travels with the
-/// file name — the attn wave landed on rows that were already waiting.
+/// file name.
 const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
     (
         "attn/mla.cuh",

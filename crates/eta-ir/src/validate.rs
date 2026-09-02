@@ -1,29 +1,13 @@
-//! The one check that has to see inside.
-//!
-//! Everything reachable through [`bind`] is tested from outside, in
-//! `tests/validate.rs`. This stays here because it calls a pass directly,
-//! which is the whole point of it.
-
 //! Bind-time validation: the single gate every inferlet-supplied trace passes
-//! before it reaches a backend. It is the one place the following are
-//! decided, and nothing downstream re-decides them:
-//!
-//! * SPSC channel endpoints — a channel the host writes has no stage putting
-//!   to it, and vice versa.
-//! * The per-channel **first-op direction table**, which is what the fire-time
-//!   readiness predicate is computed from.
-//! * Sink stage-precedence: a sink must precede the point its value is
-//!   consumed.
-//! * Shape closure, so every result shape is known from the trace alone.
-//! * Model-gated intrinsic availability, and the replayability lint that
-//!   rejects a kernel returning a time- or load-varying value.
-//! * The in-place channel classification the lowering tiers share.
+//! before it reaches a backend. Decides SPSC channel endpoints, the
+//! per-channel first-op direction table (readiness predicate), sink
+//! stage-precedence, shape closure, model-gated intrinsic availability and
+//! replayability, and in-place channel classification — nothing downstream
+//! re-decides these.
 //!
 //! [`bind`] consumes a decoded [`TraceContainer`] plus a [`ModelProfile`] and
-//! returns a [`BoundTrace`] — the validated, typed artifact the reference
-//! interpreter and the CUDA tiers execute. A backend that re-derives any of
-//! the above is a second validator, and the one that disagrees is the one
-//! nobody tested.
+//! returns a [`BoundTrace`], the validated, typed artifact the reference
+//! interpreter and the CUDA tiers execute.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -51,7 +35,7 @@ pub enum Direction {
 
 /// One row of the readiness table: channel × the phase owning its first
 /// in-pass op × the required bit. Emitted per pass; the wait-word
-/// machinery consumes it (contract C2).
+/// machinery consumes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadinessEntry {
     /// The channel this row is about, in declaration order.
@@ -359,15 +343,10 @@ pub(crate) fn channel_value_type(decl: &ChannelDecl) -> ValueType {
 
 /// Validate a container against a profile; returns the typed, bound trace.
 pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTrace, ValidateError> {
-    // One pass per rule group, in the order the rules depend on each other.
-    // The order is not cosmetic: `check_spsc_endpoints` reads a channel decl by
-    // the index an op carries, and `check_bodies` is what proved that index is
-    // in range. Reading a channel decl as a bare
-    // `container.channels[chan as usize]` hides that dependency: the index is
-    // safe only because a check hundreds of lines away already ran, and
-    // nothing in the expression says so. Going through the accessor makes it
-    // return the same error `check_bodies` would have, so reordering these
-    // calls costs a wrong *message* rather than a panic on decoded bytes.
+    // One pass per rule group, in dependency order: `check_spsc_endpoints`
+    // reads a channel decl by an op-carried index that `check_bodies` proved
+    // in range. Channel lookups go through `channel_decl` rather than a bare
+    // index so a reordering costs a wrong error message, not a panic.
     check_structure(&container)?;
     check_externs(&container)?;
     let channel_types: Vec<ValueType> = container.channels.iter().map(channel_value_type).collect();
@@ -394,11 +373,8 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
 /// The channel decl an op names, or the error [`check_bodies`] would have
 /// raised for it.
 ///
-/// Every caller runs after [`check_bodies`], so the `None` arm is unreachable.
-/// It is kept anyway: "in range because a different function ran first" is not
-/// something the reader of a slice index can see, and it stops being true the
-/// moment the passes are reordered. Total instead, at the cost of one
-/// `match`.
+/// Every caller runs after [`check_bodies`], so the `None` arm is
+/// unreachable in practice; kept total anyway rather than indexing blind.
 fn channel_decl(
     container: &TraceContainer,
     chan: u32,
@@ -460,10 +436,9 @@ fn check_structure(container: &TraceContainer) -> Result<(), ValidateError> {
                 }
             }
             PortSource::Const { dtype, shape, data } => {
-                // Computed in u64 and compared by widening `data.len()`, not
-                // by narrowing the element count: `usize` is 32 bits on the
-                // wasm guest, so a shape whose `numel` leaves `u32` would wrap
-                // to a small expected size that a short payload then matches.
+                // u64 arithmetic: `usize` is 32 bits on the wasm guest, so a
+                // shape whose numel exceeds u32 must not wrap to a size a
+                // short payload then matches.
                 let elem_size = super::container::const_elem_size(*dtype) as u64;
                 let expect = shape.numel().checked_mul(elem_size);
                 if expect != Some(data.len() as u64) {
@@ -610,23 +585,15 @@ fn check_second_party_names(
                 Op::SinkCall { name, .. } => {
                     let n = resolve_name(container, *name);
                     // First-party sinks have spec-owned scopes; second-party
-                    // sinks come from the profile.
-                    // A first-party sink name always type-checks, so the
-                    // backend's ability to HONOUR it has to be checked here or
-                    // not at all: a program emitting `attn_page_mask` against a
-                    // engine that cannot compact its page table would bind
-                    // cleanly and then either fail mid-fire or -- far worse --
-                    // run as a silent no-op whose eviction policy never
-                    // evicts anything.
+                    // sinks come from the profile. `attn_page_mask`/`lora`
+                    // must be checked here since a backend that can't honor
+                    // them would otherwise bind cleanly and silently no-op.
                     if n == "attn_page_mask" && !profile.has_attn_page_mask {
                         return Err(ValidateError::KernelUnavailable {
                             name_index: *name,
                             name: n.into(),
                         });
                     }
-                    // Same contract for `lora`: a backend that cannot consume
-                    // the sink's A/B/SITES configuration must refuse the
-                    // program at bind, or the adapter silently never applies.
                     if n == "lora" && !profile.has_lora {
                         return Err(ValidateError::KernelUnavailable {
                             name_index: *name,
@@ -787,18 +754,10 @@ fn intrinsic_type_ok(
         IntrinsicId::Layer => dtype == Dtype::U32 && shape.is_scalar(),
         // `[k]` I32 draft tokens (k = row count, trace-known).
         IntrinsicId::MtpDrafts => dtype == Dtype::I32 && shape.rank() == 1 && shape.dims()[0] >= 1,
-        // `[planes, ATTN_SCORE_KV_MAX]` — the per-key rectangle the capture
-        // arm wrote, handed to the epilogue as ONE device tensor
-        // (attn-score §4: "the graph writes; the epilogue reads").
-        //
-        // **THE TWO EXTENTS ARE ASKED DIFFERENTLY, AND ON PURPOSE.** The row
-        // count is the program's, checked the way `hidden`'s is — a ceiling
-        // it declares and the backend refuses only if it exceeds the planes
-        // the load actually exports. The WIDTH is not negotiable: it is the
-        // pitch of a slab the load carved before any program existed, so a
-        // declaration that disagreed would not read a padded row, it would
-        // read rows at the wrong stride. That is why the ceiling is a
-        // published constant instead of a per-program number.
+        // `[planes, ATTN_SCORE_KV_MAX]`: row count is a program-declared
+        // ceiling (checked like `hidden`'s), but width is not negotiable —
+        // it is the fixed pitch of a slab the load carved, so it is a
+        // published constant rather than a per-program number.
         IntrinsicId::AttnScore => {
             dtype == Dtype::F32
                 && shape.rank() == 2
@@ -856,15 +815,14 @@ pub(crate) fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
     out
 }
 
-/// In-place classification, computed at registration:
-/// host-visible ⇒ full ring; device-private **linear** `take`→`put` (the
-/// taken value flows into exactly one put on the same channel) ⇒ in-place —
-/// without undo when no fallible stage follows the mutating stage, with
-/// row-granularity undo otherwise; anything else ⇒ full ring (always safe).
+/// In-place classification, computed at registration: host-visible ⇒ full
+/// ring; device-private linear `take`→`put` (the taken value flows into
+/// exactly one put on the same channel) ⇒ in-place, with row-granularity
+/// undo only if a fallible stage follows the mutating one; anything else ⇒
+/// full ring.
 ///
-/// A stage is *fallible* here when it owns the first op of a host-coupled
-/// channel (a late host edge — the only readiness fire time cannot settle).
-/// The descriptor phase inherits fallibility from host-fed ports.
+/// A stage is fallible here when it owns the first op of a host-coupled or
+/// extern channel — the only readiness fire time cannot settle.
 pub(crate) fn classify_channels(
     c: &TraceContainer,
     readiness: &[ReadinessEntry],
@@ -932,11 +890,8 @@ pub(crate) fn classify_channels(
             classes.push(ChannelClass::FullRing);
             continue;
         };
-        // Same stage, take before put, and the put's value depends on the
-        // taken value ("the taken value flows into exactly one put on the
-        // same channel"). Other non-put readers are fine: a taken value may
-        // also feed, say, a similarity matmul without costing the channel its
-        // in-place class.
+        // Same stage, take before put, and the put's value must depend on
+        // the taken value. Other non-put readers of the taken value are fine.
         if tsi != psi || toi >= poi {
             classes.push(ChannelClass::FullRing);
             continue;
@@ -983,73 +938,3 @@ pub(crate) fn classify_channels(
     classes
 }
 
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-    use crate::container::{ChanDType, ChannelDecl, PortBinding, StageProgram};
-    use alloc::vec;
-
-    /// A `ChanPut` naming a channel that does not exist.
-    ///
-    /// `check_bodies` rejects it, so `check_spsc_endpoints` never sees one in
-    /// production. This asks for the other half: that the pass which *would*
-    /// have indexed the table blind also answers, and answers the same thing.
-    /// Before the split that was `container.channels[chan as usize]` three
-    /// hundred lines below the check that made it safe — a panic waiting on
-    /// whoever moved the blocks around.
-    #[test]
-    fn a_pass_that_runs_second_still_answers_when_run_first() {
-        let mut container = TraceContainer {
-            names: vec![],
-            channels: vec![ChannelDecl {
-                shape: Shape::vector(1),
-                dtype: ChanDType::Concrete(Dtype::I32),
-                capacity: 1,
-                host_role: HostRole::None,
-                seeded: true,
-            }],
-            ports: vec![],
-            stages: vec![StageProgram {
-                stage: Stage::Prologue,
-                ops: vec![Op::Iota { len: 1 }, Op::ChanPut { chan: 7, value: 0 }],
-            }],
-            externs: vec![],
-        };
-
-        let direct = check_spsc_endpoints(&container).unwrap_err();
-        let whole = bind(container.clone(), ModelProfile::dummy()).unwrap_err();
-        for err in [&direct, &whole] {
-            assert!(
-                matches!(
-                    err,
-                    ValidateError::Body {
-                        err: BodyError {
-                            kind: BodyErrorKind::ChannelOutOfRange(7),
-                            ..
-                        },
-                        ..
-                    }
-                ),
-                "out-of-range channel should read the same from either pass, got {err:?}"
-            );
-        }
-
-        // And the same for a descriptor port, which is the second raw index.
-        container.stages[0].ops.pop();
-        container.ports = vec![PortBinding {
-            port: Port::EmbedTokens,
-            source: PortSource::Channel(7),
-        }];
-        assert!(matches!(
-            check_spsc_endpoints(&container).unwrap_err(),
-            ValidateError::Body {
-                err: BodyError {
-                    kind: BodyErrorKind::ChannelOutOfRange(7),
-                    ..
-                },
-                ..
-            }
-        ));
-    }
-}

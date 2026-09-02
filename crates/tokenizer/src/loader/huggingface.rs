@@ -1,18 +1,7 @@
 //! Strict loader for modern Hugging Face `tokenizer.json` BPE pipelines.
-//!
-//! Pie supports two structural profiles:
-//! - Byte-level BPE with optional NFC and one or more isolated regex splitters
-//!   (Qwen 3+, DeepSeek V4, GLM 5.2, Nemotron 3).
-//! - String replacement plus byte-fallback BPE (Gemma 4).
-//! - Legacy Llama-2-style sentencepiece BPE: no pre-tokenizer, a
-//!   `Prepend` + `Replace` normalizer (dummy prefix), and a decoder that
-//!   ends in `Strip` (Phi-3 and other Llama-2 relatives).
-//! - Metaspace sentencepiece BPE: no normalizer, a `Metaspace` pre-tokenizer
-//!   with `prepend_scheme: "first"` and `split: false`, and the same
-//!   `Strip`-terminated decoder (Mistral 7B v0.3 and relatives).
-//!
-//! Other component combinations are rejected instead of being partially
-//! interpreted.
+//! Supports byte-level, string-replacement+byte-fallback, legacy
+//! sentencepiece, and Metaspace sentencepiece profiles; other component
+//! combinations are rejected rather than partially interpreted.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -139,9 +128,7 @@ fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {
             "duplicate added-token content {:?}",
             token.content
         );
-        // `lstrip`/`rstrip` are honoured by the encoder (the whitespace run
-        // beside the match joins it); `single_word` is not expressible by an
-        // Aho-Corasick match and is refused rather than ignored.
+        // `single_word` is not expressible by an Aho-Corasick match, so it is refused rather than ignored.
         ensure!(
             !token.single_word,
             "unsupported added-token single_word flag for {:?}",
@@ -289,10 +276,7 @@ fn compile_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
     }
 }
 
-/// Legacy Llama-2-style sentencepiece BPE (Phi-3 and relatives): no
-/// pre-tokenizer, a `Prepend` + `Replace` normalizer injecting the dummy
-/// prefix, and a `Replace` + `ByteFallback` + `Fuse` + `Strip` decoder that
-/// removes it again.
+/// Legacy Llama-2-style sentencepiece BPE (Phi-3 and relatives): a `Prepend` + `Replace` normalizer injecting the dummy prefix, undone by a `Strip` decoder.
 fn compile_sentencepiece_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
     ensure!(
         hf.model.byte_fallback,
@@ -360,15 +344,7 @@ fn compile_sentencepiece_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile
     })
 }
 
-/// Mistral-style Metaspace BPE: no normalizer, a `Metaspace` pre-tokenizer
-/// with `prepend_scheme: "first"` and `split: false` (space→marker mapping
-/// plus a dummy prefix only at the very start of the input), and the same
-/// `Replace` + `ByteFallback` + `Fuse` + `Strip` decoder as the legacy
-/// sentencepiece profile.
-///
-/// Other Metaspace parameterizations (`split: true`, `prepend_scheme:
-/// "always"` / `"never"`) have different segmentation semantics and are
-/// rejected instead of approximated.
+/// Mistral-style Metaspace BPE: a `Metaspace` pre-tokenizer with `prepend_scheme: "first"` and `split: false`. Other parameterizations have different segmentation semantics and are rejected instead of approximated.
 fn compile_metaspace_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
     ensure!(
         hf.model.byte_fallback,
@@ -492,13 +468,7 @@ fn compile_byte_level_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
             "unsupported pre-tokenizer: {}",
             node_type(node)
         );
-        // Two encodings of a match-driven split ship in the wild:
-        //   * `Isolated` + `invert: false` (qwen/llama-3): pattern matches
-        //     become pieces AND the text between them survives;
-        //   * `Removed` + `invert: true` (GPT-2 lineage, OLMo-2): the
-        //     pattern matches the pieces THEMSELVES and the gaps are
-        //     dropped. The classic exhaustive patterns leave no gaps, but
-        //     the drop is honored exactly rather than assumed away.
+        // `Isolated`+`invert: false` keeps the gaps between matches; `Removed`+`invert: true` drops them.
         let behavior = node.get("behavior").and_then(serde_json::Value::as_str);
         let invert = node.get("invert").and_then(serde_json::Value::as_bool) == Some(true);
         let keep_gaps = match (behavior, invert) {

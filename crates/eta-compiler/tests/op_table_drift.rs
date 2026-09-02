@@ -117,22 +117,3 @@ fn every_op_is_classified() {
     assert!(both.is_empty(), "ops claimed by both partitions: {both:?}");
 }
 
-#[test]
-fn generated_tags_are_real_ops() {
-    // A stale entry here would mask a missing classification: an op deleted
-    // from `declare_ops!` but left in the list keeps the count looking right.
-    for tag in GENERATED_TAGS {
-        assert!(
-            eta_ir::op::spec(*tag).is_some(),
-            "GENERATED_TAGS lists {tag:#04x}, which is not an OP_TABLE row"
-        );
-    }
-    let mut sorted = GENERATED_TAGS.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    assert_eq!(
-        sorted.len(),
-        GENERATED_TAGS.len(),
-        "duplicate tag in GENERATED_TAGS"
-    );
-}

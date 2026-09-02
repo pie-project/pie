@@ -40,18 +40,9 @@ eta_ir::declare_tagged_enum! {
 
 eta_ir::declare_tagged_enum! {
     /// A region a backend implements with a library kernel rather than
-    /// generated code.
-    ///
-    /// Enumerated into the C header as `PtirLibraryOp`.
-    ///
-    /// **This is also the launch package's spelling.** It was declared a
-    /// second time in the contract crate, as `LibraryOp` over the
-    /// `PIE_LIBRARY_*` numbering, with a six-arm `match` in
-    /// [`crate::codegen::launch`] mapping this enum onto that one — arm for
-    /// arm, same tags, one variant spelled `Matmul` instead of `MatMul`. The
-    /// second declaration is gone and the `match` with it; the wire numbering
-    /// an engine reads is the `= 0` … `= 5` written above, which is why the
-    /// tags are written out rather than left to declaration order.
+    /// generated code. Enumerated into the C header as `PtirLibraryOp`; the
+    /// wire numbering is the `= 0` ... `= 5` written below, so tags are
+    /// explicit rather than left to declaration order.
     #[derive(serde::Serialize, serde::Deserialize)]
     pub enum LibraryOp {
         /// Fused nucleus (top-p) sampling: softmax, top-p mask, Gumbel noise,
@@ -72,13 +63,6 @@ eta_ir::declare_tagged_enum! {
 }
 
 /// Whether a region is emitted as generated code or dispatched to a library.
-///
-/// **Also the launch package's spelling**, for the same reason [`LibraryOp`]
-/// is: the contract crate declared a second `RegionKind` with these two arms
-/// and [`crate::codegen::launch`] mapped one onto the other. Before either
-/// existed it was a `(kind: u8, library: u8)` pair, where `library` meant
-/// nothing unless `kind == PIE_REGION_LIBRARY` and was `0` — a perfectly valid
-/// `NucleusSample` — the rest of the time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum RegionKind {
@@ -163,10 +147,8 @@ pub(crate) fn fused_partition(
     let matches_by_end: BTreeMap<NodeIndex, &LibraryMatch> = library_matches
         .iter()
         .map(|candidate| {
-            // Invariant: a `LibraryMatch` is only ever built by
-            // `recognize_library_dataflows` from a matched pattern, and every
-            // pattern names at least one node — an empty match would describe
-            // a library call over no ops.
+            // Every pattern names at least one node (an empty match would
+            // describe a library call over no ops).
             (
                 *candidate.nodes.last().expect("library match has nodes"),
                 candidate,
@@ -191,14 +173,8 @@ pub(crate) fn fused_partition(
             continue;
         }
 
-        // Nothing else can break the run, and a per-op schedule check here
-        // would be dead code: the only ops worth refusing to fuse --
-        // cumsum, cumprod, sort_desc, top_k, matmul -- are all
-        // `library_op_for_tag` ops, so the branch above takes them and
-        // `continue`s before this line can see one. Such a check reads as a
-        // scheduling policy the planner does not have while being provably
-        // `true`. If a *generated* op ever needs a run of its own, the check
-        // belongs here and must be driven by a table, not a hand-kept list.
+        // The only ops worth refusing to fuse are all `library_op_for_tag`
+        // ops, already routed above, so nothing else can break the run here.
         generated.push(node);
     }
     flush_generated_region(stage, index, &mut regions, &mut generated);
@@ -242,18 +218,10 @@ pub(crate) fn build_library_match_region(
 }
 
 /// The library kernel a wire tag is routed to, or `None` when the fused
-/// generated kernel emits it inline.
-///
-/// Keyed on the tag rather than the `Op` variant so the classification can be
-/// enumerated against [`eta_ir::op::OP_TABLE`]: `every_op_is_classified` in
-/// `compiler/tests` partitions the whole table into this set and the generated
-/// set, which is what makes a new op fail the build until someone says which
-/// side it is on. The `_ => None` arm alone would answer "emit it inline" for
-/// a new library op, and inline is not a kernel that exists.
-///
-/// `Family` cannot drive this: `Order` holds `sort_desc` and `top_k` (library)
-/// alongside `pivot_threshold` (generated), and `ReduceScan` holds `cumsum`
-/// and `cumprod` (library) alongside the four reductions (generated).
+/// generated kernel emits it inline. Keyed on the tag, not the `Op` variant
+/// or `Family` (a `Family` can mix library and generated ops), so a new op
+/// can be enumerated against [`eta_ir::op::OP_TABLE`] and classified rather
+/// than silently emitted inline.
 pub fn library_op_for_tag(tag: u8) -> Option<LibraryOp> {
     use eta_ir::op::tags;
     match tag {
@@ -273,25 +241,12 @@ pub(crate) fn region_kind_for_node(stage: &NormalizedStage, node: NodeIndex) -> 
     }
 }
 
-/// A stage's SSA layout and consumer map, computed once.
-///
-/// Computed once per stage and shared, which is what keeps partitioning
-/// linear. `singleton_partition` calls `build_region` once per op, so a
-/// `build_region` that recomputed the result layout and consumer map itself
-/// would do N passes over N ops — a clean quadratic, measured at 1.2 ms for
-/// 128 ops, 65 ms for 1024 and 1.1 s for 4096, with `singleton_partition`
-/// accounting for over 95% of it. A stage body is bounded only by the
-/// container length and the container is guest-supplied, so that curve is
-/// reachable from untrusted input rather than being a benchmark curiosity.
-/// Anything derived from the whole stage belongs here, not inside a per-op
-/// call.
-///
-/// It is also the only place the node space and the value space meet: every
-/// table here is keyed by one and yields the other, and the accessors are what
-/// make that direction checkable. Passing `bases`, `producer` and `consumers`
-/// down as three bare slices instead puts three same-shaped `Vec`s next to
-/// each other with nothing but argument order distinguishing a node index from
-/// a value id, and every use needs a cast.
+/// A stage's SSA layout and consumer map, computed once per stage and
+/// shared: `build_region` runs once per op, so recomputing this per call
+/// would be quadratic in stage size, and a stage body is guest-supplied
+/// (untrusted) length. Also the only place the node space and value space
+/// meet, keyed one way with typed accessors rather than three bare parallel
+/// slices.
 pub(crate) struct StageIndex {
     /// First SSA id each op defines.
     bases: Vec<ValueId>,
@@ -377,14 +332,10 @@ pub(crate) fn build_region(
     let schedule = match kind {
         RegionKind::Library(_) => ScheduleTemplate::Library,
         RegionKind::Generated => {
-            // A generated region that is nothing but channel traffic gets
-            // the effects-only schedule. `Family::Channel` is the whole
-            // answer here: `library_op_for_tag` already routed `kernel_call`
-            // and `sink_call` to `RegionKind::Library`, so the only ops that
-            // can reach this arm and emit no arithmetic are the channel ops.
-            // The variant list this replaces named `sink_call` (unreachable)
-            // and omitted `kernel_call` (also unreachable) — two mistakes
-            // that cancelled, and would not have next time.
+            // Channel-only traffic gets the effects-only schedule;
+            // `kernel_call`/`sink_call` are already routed to
+            // `RegionKind::Library`, so no other op here emits no arithmetic
+            // except channel ops.
             let has_compute = nodes
                 .iter()
                 .any(|node| stage.ops[node.index()].family() != Family::Channel);

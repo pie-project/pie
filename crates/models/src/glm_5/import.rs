@@ -2,36 +2,25 @@ use checkpoint::contract::{Expr, ModelContract, TensorType};
 use checkpoint::types::Encoding;
 
 use super::model::{Mlp, Model};
+use model_dsl::Platform;
 use checkpoint_dsl::{Builder, Error, encoding};
 
 impl Model {
-    pub fn import(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
-        // **THE NATIVE DOOR, ASKED BEFORE THE WITNESS SNIFF** (§M-4a). A file
-        // holding every plane this contract declares, under this contract's
-        // names, is an artifact `pie model import` wrote out of this very
-        // text, and [`Model::load`] is its reader: `read_own` throughout, no
-        // transform at all. `load` failing is what says the file is foreign,
-        // and it fails on the first plane it cannot find. The argument in full
-        // is at `qwen_3::Model::import`.
-        if let Ok(native) = self.load(src) {
-            return Ok(native);
-        }
-        // **AND THE ARM IS RUN, NOT GATED ON A WITNESS.** With one layout
-        // there is nothing to choose between, so the sniff was only ever a
-        // cheaper way to fail — and a wrong one since §M-4a, because the
-        // embedding it looked for is a plane a promotion MOVES. The arm's own
-        // refusal names the first plane it could not find, which is more than
-        // the witness could say. The argument in full is at
-        // `qwen_3::Model::import`.
-        self.import_from_huggingface(src)
+    pub fn import(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        // Try the native layout first; fall back to Hugging Face if any plane is missing.
+        self.import_from_huggingface(src, platform)
     }
 
     pub fn import_from_huggingface(
         &self,
-        src: &ztensor::Source,
+        src: &ztensor::Source, platform: Platform,
     ) -> Result<ModelContract, Error> {
         let hidden = i64::from(self.hidden);
-        let mut b = Builder::new(src, self.tp);
+        let mut b = Builder::new(src, self.tp, platform);
         b.read(&self.embed, "model.embed_tokens.weight")?;
         b.read(&self.final_norm, "model.norm.weight")?;
         b.read(&self.head, "lm_head.weight")?;

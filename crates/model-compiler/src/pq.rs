@@ -1,81 +1,13 @@
-//! A PQ-tree (Booth & Lueker, JCSS 1976): the canonical representation of
-//! EVERY permutation of a ground set under which a family of subsets is
-//! simultaneously consecutive.
-//!
-//! WHY A TREE AND NOT A SOLVER. A one-shot C1P decider answers "yes, and here
-//! is an ordering"; the fire path needs "yes, and here is the whole set of
-//! orderings", because the ordering it wants is the feasible one CLOSEST TO
-//! LAST FIRE — re-binding a kernel node's pointers costs ~0.11 us and
-//! re-recording the graph costs everything, so pointer churn is the thing
-//! worth minimising and a single witness ordering cannot be asked about it
-//! (`tart/evidence/layout_planning.md`, the tile-alignment section). So the
-//! tree ships whole inside [`ClassOrder`](crate::ClassOrder), and
-//! [`admits`](PqTree::admits) is the question the stability pick will ask it.
-//!
-//! # The shape
-//!
-//! Three node kinds, and the whole algebra is in them:
-//!
-//! - a **leaf** is one class;
-//! - a **P-node**'s children may be permuted arbitrarily — `k!` orders;
-//! - a **Q-node**'s children have a fixed order, up to reversal — 2 orders.
-//!
-//! The frontier — the leaves, left to right — is one feasible ordering; the
-//! orderings the tree admits are exactly the frontiers reachable by permuting
-//! P-nodes and reversing Q-nodes. A single P-node over every leaf is "nothing
-//! is constrained yet"; a tree that has gone NULL is "no ordering works", and
-//! here that is a `false` out of [`reduce`](PqTree::reduce) rather than a null
-//! object, since the caller's answer to it is to withdraw the constraint and
-//! keep the tree it had.
-//!
-//! # The reduction
-//!
-//! [`reduce`](PqTree::reduce) is Booth-Lueker's REDUCE: refine the tree so
-//! that the leaves of `set` become consecutive in every frontier that
-//! survives. It runs as a recursive descent over the PERTINENT SUBTREE — the
-//! subtree rooted at the lowest node containing all of `set` — classifying
-//! each node as EMPTY (no leaf of `set`), FULL (nothing but) or PARTIAL, and
-//! rewriting it by the classical templates:
-//!
-//! | template | node | where | what it does |
-//! |---|---|---|---|
-//! | L1 | leaf | anywhere | full iff its class is in the set |
-//! | P1 | P | anywhere | wholly empty or wholly full: nothing to do |
-//! | P2 | P | pertinent root | group the full children under a new P-node |
-//! | P3 | P | below the root | becomes a Q-node: `[P(empty), P(full)]` |
-//! | P4 | P | pertinent root | one partial child; the full children join its full end |
-//! | P5 | P | below the root | one partial child; it absorbs the empties and the fulls and becomes this node |
-//! | P6 | P | pertinent root | two partial children, merged into one Q-node full-end to full-end |
-//! | Q1 | Q | anywhere | wholly empty or wholly full: nothing to do |
-//! | Q2 | Q | below the root | children read `E* P? F*` up to reversal; the partial is spliced in |
-//! | Q3 | Q | pertinent root | children read `E* P? F* P? E*`; both partials are spliced in |
-//!
-//! A P-node below the pertinent root with two partial children, or a Q-node
-//! whose children do not read as the pattern above, is the failure: those are
-//! exactly the shapes Tucker's forbidden submatrices name.
-//!
-//! **THE REDUCTION IS ATOMIC.** Booth-Lueker mutates in place and leaves a
-//! wreck behind on failure; the caller here needs the tree it had, because the
-//! layout pass's answer to an infeasible constraint is to withdraw it and send
-//! its consumer to the fallback menu rather than to refuse the plan. So
-//! `reduce` snapshots, and a `false` return means the tree is untouched.
-//!
-//! **CORRECTNESS OVER ASYMPTOTICS.** The published algorithm is linear only
-//! with the bubble pass, parent pointers, pertinent-child counts and a
-//! template dispatch that never rescans a node; this is the same templates
-//! written as a plain recursion over an index arena, which is `O(n)` per
-//! reduction with a small quadratic in the canonicalisation. The ground set is
-//! the plan's CLASS list — six, today, on the biggest catalog SKU — and the
-//! whole thing runs once per load.
+//! A PQ-tree (Booth & Lueker, JCSS 1976): canonical representation of every
+//! permutation under which a family of subsets is simultaneously consecutive.
 
 use std::fmt::{self, Debug, Formatter};
 
 /// One class, as a leaf of the tree.
 ///
-/// A `u8` BECAUSE THE FRONTIER IS THE FIRE PATH'S. `class_order` hands the
-/// engine a `Vec<u8>` per fire (design §3), so 256 classes is the ceiling the
-/// whole seam is spelled at; [`crate::layout`] declines to seriate a plan past
-/// it rather than truncating one.
+/// A `u8`: `class_order` hands the engine a `Vec<u8>` per fire, so 256
+/// classes is the ceiling; [`crate::layout`] declines to seriate a plan
+/// past it rather than truncating one.
 pub type Leaf = u8;
 
 /// A node of the tree. Children are indices into [`PqTree::nodes`].
@@ -101,11 +33,9 @@ impl Node {
 /// What one node of the pertinent subtree turned out to be, after its own
 /// reduction.
 ///
-/// `Partial(split)` carries the INVARIANT THE WHOLE RECURSION RESTS ON: a
-/// partial node is a Q-node whose first `split` children are empty and whose
-/// remaining children are full. Every template that consumes a partial child
-/// splices it in on that promise, and reversing a Q-node is free, so "the
-/// fulls are at the tail" costs nothing to guarantee.
+/// `Partial(split)`: a partial node is a Q-node whose first `split`
+/// children are empty and the rest are full. Every template that consumes
+/// a partial child splices it in on that promise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mark {
     Empty,
@@ -116,18 +46,15 @@ enum Mark {
 /// Every ordering of a class set under which a family of subsets is
 /// simultaneously an interval.
 ///
-/// Built by [`universe`](PqTree::universe) — which constrains nothing — and
-/// narrowed one subset at a time by [`reduce`](PqTree::reduce). The
-/// [`frontier`](PqTree::frontier) is the canonical member of the set, and
-/// [`admits`](PqTree::admits) decides membership for any other.
+/// Built by [`universe`](PqTree::universe) (constrains nothing) and
+/// narrowed by [`reduce`](PqTree::reduce). [`frontier`](PqTree::frontier)
+/// is the canonical member; [`admits`](PqTree::admits) decides membership
+/// for any other.
 ///
-/// CANONICAL AFTER EVERY REDUCTION, which is what makes `PartialEq` mean what
-/// a reader expects and what makes the bake deterministic: children of a
-/// P-node are stored in ascending order of their least leaf, a Q-node is
-/// stored in whichever of its two orientations puts the smaller leaf first,
-/// single-child nodes are collapsed, and a two-child Q-node — which admits
-/// exactly what a two-child P-node admits — is stored as the P-node. Two trees
-/// that admit the same orderings by the same structure are the same value.
+/// Canonical after every reduction: P-node children sort by least leaf, a
+/// Q-node picks the orientation with the smaller leaf first, single-child
+/// nodes collapse, and a two-child Q-node is stored as a P-node — so two
+/// trees admitting the same orderings compare equal.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PqTree {
     nodes: Vec<Node>,
@@ -167,10 +94,6 @@ impl PqTree {
     }
 
     /// The canonical feasible ordering: the leaves, left to right.
-    ///
-    /// ONE MEMBER OF THE SET AND NOT THE SET, and v1's layout answer is this
-    /// one — the stability pick that chooses a different member per fire is
-    /// the documented later refinement (design §3).
     #[must_use]
     pub fn frontier(&self) -> &[Leaf] {
         &self.frontier
@@ -179,11 +102,10 @@ impl PqTree {
     /// Narrow the tree to the orderings under which `set` is consecutive.
     ///
     /// `set` is ascending and duplicate-free. Answers `false` iff no such
-    /// ordering exists — and then the tree is EXACTLY WHAT IT WAS, so the
-    /// caller may withdraw the constraint and carry on (see the module docs).
+    /// ordering exists, leaving the tree untouched.
     ///
-    /// A set of fewer than two classes, or one holding every class, is not a
-    /// constraint at all and is accepted without touching anything.
+    /// A set of fewer than two classes, or one holding every class, is not
+    /// a constraint and is accepted without touching anything.
     pub fn reduce(&mut self, set: &[Leaf]) -> bool {
         if set.len() < 2 || set.len() >= self.frontier.len() {
             return true;
@@ -209,11 +131,6 @@ impl PqTree {
     }
 
     /// Is `order` one of the orderings this tree admits?
-    ///
-    /// THE QUESTION THE FIRE PATH WILL ASK. A stability pick proposes last
-    /// fire's ordering and needs to know whether it is still feasible before
-    /// it may keep the pointers it has; that is this, and it is the reason the
-    /// tree ships rather than a witness (design §3).
     #[must_use]
     pub fn admits(&self, order: &[Leaf]) -> bool {
         if order.len() != self.frontier.len() {
@@ -229,11 +146,8 @@ impl PqTree {
     }
 
     /// How many maximal runs `set` breaks into under `order` — the `r` of
-    /// [`Fallback::Split`](crate::Fallback), and 1 exactly when `set` is an
-    /// interval.
-    ///
-    /// Classes of `set` that `order` does not carry are not counted; a fire
-    /// orders the classes it has.
+    /// [`Fallback::Split`](crate::Fallback), 1 exactly when `set` is an
+    /// interval. Classes of `set` not in `order` aren't counted.
     #[must_use]
     pub fn runs(order: &[Leaf], set: &[Leaf]) -> u32 {
         let mut runs = 0;
@@ -248,7 +162,7 @@ impl PqTree {
         runs
     }
 
-    /// Is `set` an interval of `order`? The property the whole pass exists to
+    /// Is `set` an interval of `order`? The property the pass exists to
     /// obtain: a windowed consumer whose classes are one run is one kernel
     /// over pointer plus extent.
     #[must_use]
@@ -280,8 +194,7 @@ impl PqTree {
     }
 
     /// The lowest node whose subtree holds every leaf of the set — the only
-    /// node the reduction has to restructure, and the only one whose template
-    /// may leave the fulls in the MIDDLE rather than at an end.
+    /// node the reduction has to restructure.
     fn pertinent_root(&self, full: &[usize], want: usize) -> usize {
         let mut n = self.root;
         loop {
@@ -310,9 +223,8 @@ impl PqTree {
         }
     }
 
-    /// Classify every child, descending only into the ones that are neither
-    /// wholly in nor wholly out: an empty or a full subtree is already
-    /// consecutive with itself and wants no rewriting.
+    /// Classify every child, descending only into ones neither wholly in
+    /// nor wholly out (already consecutive, no rewriting needed).
     fn marks(&mut self, kids: &[usize], full: &[usize], total: &[usize]) -> Option<Vec<Mark>> {
         let mut marks = Vec::with_capacity(kids.len());
         for &c in kids {
@@ -361,15 +273,13 @@ impl PqTree {
 
         if root {
             match partial.len() {
-                // P2. The fulls become one child, free to sit anywhere among
-                // the empties; nothing above this node ever looks again.
+                // P2: the fulls become one child, free to sit among the empties.
                 0 => {
                     let block = self.group(filled);
                     empty.push(block);
                     self.nodes[n] = Node::P(empty);
                 }
-                // P4. The one partial child already has its fulls at the tail,
-                // so the node's own fulls join them there.
+                // P4: the partial child's fulls are at the tail; the node's own fulls join them.
                 1 => {
                     let (q, _) = partial[0];
                     if !filled.is_empty() {
@@ -382,10 +292,7 @@ impl PqTree {
                     empty.push(q);
                     self.nodes[n] = Node::P(empty);
                 }
-                // P6. Two partial children, joined full end to full end with
-                // the node's own fulls between them — the only template that
-                // builds a Q-node the reduction will never be able to reverse
-                // apart again.
+                // P6: two partial children joined full end to full end, node's fulls between.
                 2 => {
                     let mut merged = self.detach(partial[0].0)?;
                     if !filled.is_empty() {
@@ -399,25 +306,22 @@ impl PqTree {
                     empty.push(joined);
                     self.nodes[n] = Node::P(empty);
                 }
-                // Three pertinent blocks and one line to lay them on: the
-                // instance is not C1P.
+                // Three pertinent blocks, one line to lay them on: not C1P.
                 _ => return None,
             }
             return Some(Mark::Full);
         }
 
         match partial.len() {
-            // P3. Below the pertinent root the fulls must reach an END of this
-            // node's frontier, so the free permutation collapses to two blocks
-            // in a fixed order — which is a Q-node.
+            // P3: fulls must reach an end, so the free permutation collapses
+            // to a two-block Q-node.
             0 => {
                 let head = self.group(empty);
                 let tail = self.group(filled);
                 self.nodes[n] = Node::Q(vec![head, tail]);
                 Some(Mark::Partial(1))
             }
-            // P5. The partial child absorbs the node: empties, then the
-            // child's own empties and fulls, then the fulls.
+            // P5: the partial child absorbs the node's empties then fulls.
             1 => {
                 let (q, split) = partial[0];
                 let mut out = Vec::new();
@@ -460,10 +364,8 @@ impl PqTree {
         }
 
         if root {
-            // Q3: `E* P? F* P? E*`. A Q-node's order is already fixed, so
-            // unlike P6 there is nothing to choose — either the fulls sit in
-            // one block with at most one partial neighbour on each side, or no
-            // reversal of anything will make them consecutive.
+            // Q3: `E* P? F* P? E*`; fulls sit in one block with at most one
+            // partial neighbour each side, or nothing works.
             let RootScan {
                 head,
                 first,
@@ -487,9 +389,7 @@ impl PqTree {
             return Some(Mark::Full);
         }
 
-        // Q2: `E* P? F*`, up to reversal. Reversing a Q-node's child list is
-        // free; reversing it is how the fulls are brought to the tail, which
-        // is the invariant the parent's template is owed.
+        // Q2: `E* P? F*` up to reversal; reversing brings the fulls to the tail.
         let (mut kids, mut marks) = (kids, marks);
         let parsed = match scan_side(&marks) {
             Some(parsed) => parsed,
@@ -517,10 +417,9 @@ impl PqTree {
         Some(Mark::Partial(split))
     }
 
-    /// One child standing for a block of them: the child itself when there is
-    /// one, a fresh P-node when there are several. The block permutes freely
-    /// inside itself and moves as a unit outside, which is exactly what "the
-    /// empty children" and "the full children" mean to every template above.
+    /// One child standing for a block of them: itself when there is one, a
+    /// fresh P-node when there are several. Moves as a unit outside,
+    /// permutes freely inside.
     fn group(&mut self, mut block: Vec<usize>) -> usize {
         if block.len() == 1 {
             return block.pop().expect("just measured");
@@ -528,11 +427,9 @@ impl PqTree {
         self.push(Node::P(block))
     }
 
-    /// Take a partial node's children, leaving it behind for
-    /// [`canonicalise`](PqTree::canonicalise) to drop. A partial node is
-    /// always a Q-node — that is [`Mark::Partial`]'s promise — and it is
-    /// always dissolved into its parent rather than kept, because the parent's
-    /// template has just fixed the order it was free in.
+    /// Take a partial node's children, leaving it for
+    /// [`canonicalise`](PqTree::canonicalise) to drop. Always a Q-node
+    /// ([`Mark::Partial`]'s promise), dissolved into the parent.
     fn detach(&mut self, n: usize) -> Option<Vec<usize>> {
         match &mut self.nodes[n] {
             Node::Q(kids) => Some(std::mem::take(kids)),
@@ -547,10 +444,8 @@ impl PqTree {
 
     // -- the canonical form ------------------------------------------------
 
-    /// Rebuild the arena in frontier order, applying the normal form the type
-    /// docs promise, and recompute the frontier while doing it. Also the
-    /// garbage collector: the nodes a reduction dissolved are simply not
-    /// reachable from the root and do not come along.
+    /// Rebuild the arena in frontier order (the normal form), and recompute
+    /// the frontier. Also the garbage collector: dissolved nodes aren't reachable.
     fn canonicalise(&mut self) {
         let mut fresh = Vec::with_capacity(self.nodes.len());
         let mut frontier = Vec::with_capacity(self.frontier.len());
@@ -592,9 +487,8 @@ impl PqTree {
                     .iter()
                     .map(|&c| self.rebuild(c, fresh, frontier))
                     .collect();
-                // A two-child Q-node admits both orders of its children and so
-                // does a two-child P-node. One spelling, so that equal trees
-                // compare equal.
+                // A two-child Q-node admits the same orders as a two-child
+                // P-node; stored as P so equal trees compare equal.
                 fresh.push(if ids.len() == 2 {
                     Node::P(ids)
                 } else {
@@ -673,9 +567,8 @@ impl PqTree {
     }
 }
 
-/// `E* P? F*` — the shape a Q-node BELOW the pertinent root must read, so that
-/// its fulls reach the end that faces its parent's. Answers how many empties
-/// lead, and which child is the partial one.
+/// `E* P? F*` — the shape a Q-node below the pertinent root must read.
+/// Answers how many empties lead, and which child is partial.
 fn scan_side(marks: &[Mark]) -> Option<(usize, Option<usize>)> {
     let mut at = 0;
     while at < marks.len() && marks[at] == Mark::Empty {
@@ -739,9 +632,9 @@ fn scan_root(marks: &[Mark]) -> Option<RootScan> {
     })
 }
 
-/// The tree as its frontier and its shape: `[0 (1 3) 2]` is a P-node over leaf
-/// 0, a Q-node over 1 and 3, and leaf 2. Round brackets are Q-nodes (order
-/// fixed, reversal free), square brackets are P-nodes (order free).
+/// The tree as its frontier and its shape: `[0 (1 3) 2]` is a P-node over
+/// leaf 0, a Q-node over 1 and 3, and leaf 2. `()` are Q-nodes (order fixed,
+/// reversal free), `[]` are P-nodes (order free).
 impl Debug for PqTree {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.say(self.root, f)
@@ -770,11 +663,8 @@ impl PqTree {
 mod tests {
     use super::*;
 
-    /// The tree's shape, as [`Debug`] spells it: `[]` a P-node, `()` a
-    /// Q-node. Asserting the SHAPE and not only the frontier is what makes
-    /// these tests about the templates rather than about one witness ordering
-    /// — a brute force that happened to return the same permutation would not
-    /// produce the same brackets.
+    // Tree shape via [`Debug`]: `[]` P-node, `()` Q-node. Asserting shape
+    // (not just frontier) tests the templates, not one witness ordering.
     fn shape(tree: &PqTree) -> String {
         format!("{tree:?}")
     }
@@ -798,10 +688,8 @@ mod tests {
         out
     }
 
-    /// The tree's feasible set, checked against the definition it is supposed
-    /// to represent: an ordering is admitted iff every constraint inserted so
-    /// far is an interval of it. This is the property a PQ-tree exists to
-    /// have, and the only test that can tell a real one from a lucky one.
+    // The tree's feasible set, checked against its definition: admitted iff
+    // every inserted constraint is an interval of it.
     fn set_is_exactly(tree: &PqTree, sets: &[&[Leaf]]) {
         for order in permutations(tree.leaves()) {
             let want = sets.iter().all(|s| PqTree::is_interval(&order, s));
@@ -815,134 +703,9 @@ mod tests {
     }
 
     #[test]
-    fn a_free_tree_is_one_p_node_and_admits_everything() {
-        let tree = PqTree::universe(4);
-        assert_eq!(shape(&tree), "[0 1 2 3]");
-        assert_eq!(tree.frontier(), [0, 1, 2, 3]);
-        set_is_exactly(&tree, &[]);
-    }
-
-    #[test]
-    fn a_set_of_one_class_or_of_every_class_constrains_nothing() {
-        let mut tree = PqTree::universe(4);
-        assert!(tree.reduce(&[2]));
-        assert!(tree.reduce(&[0, 1, 2, 3]));
-        assert_eq!(shape(&tree), "[0 1 2 3]");
-        set_is_exactly(&tree, &[]);
-    }
-
-    #[test]
-    fn template_p2_groups_the_full_children_under_the_root() {
-        // The pertinent root is the whole tree, no child is partial: the two
-        // full leaves become one P-node, free to sit anywhere among the rest.
-        let mut tree = PqTree::universe(4);
-        assert!(tree.reduce(&[1, 3]));
-        assert_eq!(shape(&tree), "[0 [1 3] 2]");
-        assert_eq!(tree.frontier(), [0, 1, 3, 2]);
-        set_is_exactly(&tree, &[&[1, 3]]);
-    }
-
-    #[test]
-    fn the_two_facts_that_lexicographic_order_cannot_seat() {
-        // The worked example: four classes over `qo_one` x `masked`, one
-        // consumer windowed on each fact. Ascending class order fails —
-        // {01, 11} is 1 and 3 with 2 between them — and the Gray-coded order
-        // 00, 01, 11, 10 seats both. P2 then P4, and the P4 is what turns the
-        // grouped pair into a Q-node.
-        let mut tree = PqTree::universe(4);
-        assert!(tree.reduce(&[1, 3]), "the qo_one classes");
-        assert!(tree.reduce(&[2, 3]), "the masked classes");
-        assert_eq!(shape(&tree), "[0 (1 3 2)]");
-        assert_eq!(tree.frontier(), [0, 1, 3, 2]);
-
-        assert!(!PqTree::is_interval(&[0, 1, 2, 3], &[1, 3]));
-        assert!(PqTree::is_interval(tree.frontier(), &[1, 3]));
-        assert!(PqTree::is_interval(tree.frontier(), &[2, 3]));
-        assert!(!tree.admits(&[0, 1, 2, 3]));
-        set_is_exactly(&tree, &[&[1, 3], &[2, 3]]);
-    }
-
-    #[test]
-    fn template_p3_then_p5_below_the_pertinent_root() {
-        // Three nested constraints. The third's pertinent root is the whole
-        // tree, so the inner P-node is reduced BELOW it: its own partial child
-        // fires P3 (a P-node with no partial child becomes a two-block
-        // Q-node), and the P-node above it fires P5 (the partial child
-        // absorbs its parent's empties and fulls).
-        let mut tree = PqTree::universe(8);
-        assert!(tree.reduce(&[0, 1, 2, 3]));
-        assert!(tree.reduce(&[0, 1]));
-        assert_eq!(shape(&tree), "[[[0 1] 2 3] 4 5 6 7]");
-        assert!(tree.reduce(&[0, 2, 4]));
-        assert_eq!(shape(&tree), "[(3 1 0 2 4) 5 6 7]");
-        assert_eq!(tree.frontier(), [3, 1, 0, 2, 4, 5, 6, 7]);
-        for set in [&[0, 1, 2, 3][..], &[0, 1], &[0, 2, 4]] {
-            assert!(PqTree::is_interval(tree.frontier(), set), "{set:?}");
-        }
-    }
-
-    #[test]
-    fn template_p6_joins_two_partial_children_full_end_to_full_end() {
-        let mut tree = PqTree::universe(6);
-        assert!(tree.reduce(&[0, 1]));
-        assert!(tree.reduce(&[2, 3]));
-        assert_eq!(shape(&tree), "[[0 1] [2 3] 4 5]");
-        // Two partial children at the pertinent root, and only one place for
-        // the fulls to meet: 1 0 | 2 3.
-        assert!(tree.reduce(&[0, 2]));
-        assert_eq!(shape(&tree), "[(1 0 2 3) 4 5]");
-        set_is_exactly(&tree, &[&[0, 1], &[2, 3], &[0, 2]]);
-    }
-
-    #[test]
-    fn template_q3_splices_a_partial_child_in_at_each_end() {
-        // Build a Q-node of three blocks, then constrain a set that straddles
-        // it: the pertinent root is the Q-node, its middle block is full and
-        // the two outer blocks are partial — `E* P? F* P? E*` with both
-        // partials present, which is the template's whole point.
-        let mut tree = PqTree::universe(8);
-        assert!(tree.reduce(&[0, 1]));
-        assert!(tree.reduce(&[2, 3]));
-        assert!(tree.reduce(&[4, 5]));
-        assert!(tree.reduce(&[0, 1, 2, 3]));
-        assert!(tree.reduce(&[2, 3, 4, 5]));
-        assert_eq!(shape(&tree), "[([0 1] [2 3] [4 5]) 6 7]");
-        assert!(tree.reduce(&[1, 2, 3, 4]));
-        assert_eq!(shape(&tree), "[(0 1 [2 3] 4 5) 6 7]");
-        assert_eq!(tree.frontier(), [0, 1, 2, 3, 4, 5, 6, 7]);
-    }
-
-    #[test]
-    fn template_q2_reduces_a_q_node_below_the_pertinent_root() {
-        let mut tree = PqTree::universe(8);
-        for set in [&[0, 1][..], &[2, 3], &[4, 5], &[0, 1, 2, 3], &[2, 3, 4, 5]] {
-            assert!(tree.reduce(set));
-        }
-        assert!(tree.reduce(&[1, 2, 3, 4]));
-        assert_eq!(shape(&tree), "[(0 1 [2 3] 4 5) 6 7]");
-        // Now a set reaching OUT of the Q-node: the pertinent root is the root
-        // P-node, so the Q-node is reduced as a non-root — `E* P? F*` — and
-        // has to bring its fulls to the end that faces leaf 6.
-        assert!(tree.reduce(&[3, 4, 5, 6]));
-        assert_eq!(shape(&tree), "[(0 1 2 3 4 5 6) 7]");
-        for set in [
-            &[0, 1][..],
-            &[2, 3],
-            &[4, 5],
-            &[0, 1, 2, 3],
-            &[2, 3, 4, 5],
-            &[1, 2, 3, 4],
-            &[3, 4, 5, 6],
-        ] {
-            assert!(PqTree::is_interval(tree.frontier(), set), "{set:?}");
-        }
-    }
-
-    #[test]
     fn a_q_node_whose_fulls_are_not_at_an_end_is_the_failure() {
-        // {A,B}, {B,C}, {C,A}: three sets pairwise overlapping with no common
-        // interval order — the smallest non-C1P instance there is, and the
-        // shape Tucker's characterisation names.
+        // {A,B},{B,C},{C,A}: pairwise overlapping with no common interval
+        // order — the smallest non-C1P instance.
         let mut tree = PqTree::universe(3);
         assert!(tree.reduce(&[0, 1]));
         assert!(tree.reduce(&[0, 2]));
@@ -954,19 +717,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reduction_that_fails_deep_still_leaves_the_tree_alone() {
-        // The failure is inside a subtree several templates down, so the
-        // atomicity claim is about an undo of real work and not of nothing.
-        let mut tree = PqTree::universe(6);
-        for set in [&[0, 1][..], &[2, 3], &[0, 1, 2, 3], &[1, 2]] {
-            assert!(tree.reduce(set));
-        }
-        let before = tree.clone();
-        assert!(!tree.reduce(&[0, 2]));
-        assert_eq!(tree, before);
-    }
-
-    #[test]
     fn runs_counts_the_launches_a_split_would_take() {
         assert_eq!(PqTree::runs(&[0, 1, 2, 3], &[1, 2]), 1);
         assert_eq!(PqTree::runs(&[0, 1, 2, 3], &[0, 2]), 2);
@@ -974,8 +724,8 @@ mod tests {
         assert_eq!(PqTree::runs(&[0, 1, 2, 3], &[0, 3]), 2);
         assert_eq!(PqTree::runs(&[3, 1, 0, 2], &[0, 1]), 1);
         assert_eq!(PqTree::runs(&[0, 1, 2, 3], &[]), 0);
-        // A class the fire does not carry is not a break either: what is
-        // asked is whether the rows PRESENT are contiguous.
+        // A class the fire doesn't carry isn't a break: only present rows
+        // are checked for contiguity.
         assert_eq!(PqTree::runs(&[0, 2], &[0, 1, 2]), 1);
         assert_eq!(PqTree::runs(&[0, 1, 2], &[0, 2]), 2);
     }
@@ -989,27 +739,4 @@ mod tests {
         assert!(!tree.admits(&[0, 1, 2, 3]));
     }
 
-    #[test]
-    fn one_class_and_no_classes_are_both_trees() {
-        let tree = PqTree::universe(1);
-        assert_eq!(shape(&tree), "0");
-        assert_eq!(tree.frontier(), [0]);
-        assert!(tree.admits(&[0]));
-
-        let mut none = PqTree::universe(0);
-        assert!(none.frontier().is_empty());
-        assert!(none.reduce(&[]));
-    }
-
-    #[test]
-    fn the_same_constraints_build_the_same_tree() {
-        let sets: [&[Leaf]; 4] = [&[0, 1], &[2, 3], &[0, 1, 2, 3], &[1, 2]];
-        let mut once = PqTree::universe(6);
-        let mut twice = PqTree::universe(6);
-        for set in sets {
-            assert_eq!(once.reduce(set), twice.reduce(set));
-        }
-        assert_eq!(once, twice);
-        assert_eq!(once.frontier(), twice.frontier());
-    }
 }

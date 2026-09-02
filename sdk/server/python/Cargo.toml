@@ -1,6 +1,6 @@
 [package]
 name = "pie-server-py"
-version = "0.4.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Python bindings for the pie engine — embed `pie serve` inside a Python script via `pie.server.Server`."
@@ -10,33 +10,14 @@ repository = "https://github.com/pie-project/pie"
 [features]
 profile-fire = ["worker/profile-fire"]
 
-# Which backends the embedded engine can host.
-#
-# `default` keeps what this wheel has always built. The three shader flavors
-# (`engine-metal`, `engine-vulkan`, `engine-wgpu`) STOOD HERE and went with
-# R3, which took those engines out of the workspace until their baker
-# executors land (P5). What is left is what `pie serve` itself can host: CUDA.
-# The CUDA default is a GUESS, and it is spelled out here so that it is a
-# greppable one. It used to read `engine-cuda`, which resolved to the 13 ABI
-# three manifests away; a wheel built for a CUDA 12 box got no error, only a
-# segfault inside `cudaGraphAddNode`. Naming the ABI does not remove the
-# guess -- a wheel has to default to something -- but it puts it where a
-# packager can see and override it with `--no-default-features`.
-default = ["engine-cuda-13"]
-engine-cuda-12 = ["worker/engine-cuda-12"]
-engine-cuda-13 = ["worker/engine-cuda-13"]
-# **THE METAL SHELL, WHICH CAME BACK AT P5 AND WAS NEVER RE-EXPOSED HERE.**
-# The paragraph above still says the shader flavors "went with R3"; `worker`'s
-# own manifest has said "the Metal shell, BACK AT P5" since that landing, so
-# the engine has been hostable by `pie serve` and NOT by this wheel — which is
-# the only door `tests/inferlets/conftest.py` opens (`from pie.server import
-# Server`). Every inferlet gate that names `--engine metal` was therefore
-# unreachable on an Apple box for a packaging reason and not an engine one.
+# Which backends the embedded engine can host. The CUDA default is spelled out
+# so it is greppable; a packager overrides with `--no-default-features`.
+default = ["cuda"]
+cuda = ["worker/cuda"]
 # Apple-only at the crate level, so this flag alone is not a build that links:
 # `runtime`'s seam pairs it with `target_vendor = "apple"`. Build it with
-# `--no-default-features --features engine-metal`, since the CUDA default
-# wants `libnccl` and an Apple box has none.
-engine-metal = ["worker/engine-metal"]
+# `--no-default-features --features metal` — the CUDA default wants `libnccl`.
+metal = ["worker/metal"]
 
 [lib]
 name = "pie_engine"
@@ -44,25 +25,17 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-# TLS backend selection, not TLS use: the engine's HTTPS clients are built on
-# reqwest's `rustls-no-provider`, so *something* in the process has to name a
-# provider. The CLI has `bootstrap` for that; the wheel has this.
+# TLS backend selection, not TLS use: the HTTPS clients are built on reqwest's
+# `rustls-no-provider`, so something in the process must name a provider. The
+# CLI has `bootstrap` for that; the wheel has this.
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
-# `worker` is the runtime library — we link the same `serve::start_runtime`
-# the CLI uses, so the CLI and the pyo3 wheel can never drift in their boot
-# behavior.
-#
-# WHICH engines is a build choice now, made by the `[features]` table above
-# rather than pinned here. It used to say `features = ["engine-cuda"]` under a
-# comment claiming the wheel hosted "the same local flavors as `pie serve`",
-# and a claim nobody could act on is what that was: the feature list was not
-# forwarded, so no build command could select anything else.
+# The wheel links the same `serve::start_runtime` the CLI does, so the two
+# cannot drift in boot behavior. Which engines is the `[features]` table's
+# choice above, not a pin here.
 worker = { path = "../../../crates/worker", default-features = false }
 pyo3 = { version = "0.29", features = ["extension-module"] }
 tokio = { version = "1.53", features = ["rt-multi-thread"] }
 toml = "1.1"
-# The embedded engine emits `tracing` events exactly as the CLI does, but a
-# `tracing` event with no subscriber installed is discarded silently. Without
-# this the wheel is mute: an engine-side WARN explaining why a request failed
-# never reaches the Python process, and `RUST_LOG` appears to do nothing.
+# Without a subscriber installed the wheel is mute: engine-side events are
+# discarded silently and `RUST_LOG` appears to do nothing.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

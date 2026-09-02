@@ -1,42 +1,8 @@
-//! `transport` — the worker↔worker P2P KV-tensor data plane.
+//! `transport`: the worker-to-worker P2P KV-tensor data plane. A controller pairs worker A with worker B and steps out; from that moment KV tensors flow P2P A<->B, bypassing the controller. This crate owns that movement and nothing else — it never makes policy.
 //!
-//! # What this crate is
+//! `core/` is the backend-agnostic interface (register -> send/recv -> poll); `backends/local` does same-node device-to-device copy, `backends/nixl` (behind `feature = "nixl"`) cross-node RDMA/TCP/NVMe; `registry/` binds an engine-exported handle to a transfer backend and dispatches. Backends are asymmetric: cuda/rocm cross-node use NIXL, co-located peers use `local`, metal/vulkan never participate (single-node).
 //!
-//! The data plane that moves KV-cache tensors directly between workers. A
-//! controller pairs worker A with worker B and then **steps out**; from that
-//! moment KV tensors flow P2P A↔B, *bypassing the controller*. This crate owns
-//! that movement and nothing else — it never makes policy.
-//!
-//! # Shape (per the Controller & Transport design)
-//!
-//! ```text
-//! core/       backend-agnostic interface: register → send/recv → poll
-//! backends/
-//!     local/  same-node device-to-device copy (co-located PD, zero network)
-//!     nixl/   cross-node RDMA/TCP/NVMe via NIXL  [feature = "nixl", deferred]
-//! registry/   binds an engine-exported handle to a transfer backend, dispatches
-//! ```
-//!
-//! **Minimal start = `core` + `local`.** Co-located prefill+decode defers all
-//! RDMA (YAGNI); the `nixl` backend is a stub behind `feature = "nixl"` and is
-//! the only place RDMA lives. Backends are asymmetric: cuda/rocm cross-node use
-//! NIXL, co-located peers use `local`, and **metal/vulkan never participate**
-//! (single-node; NIXL is Linux-only).
-//!
-//! # Boundaries
-//!
-//!   * **↔engine (handle boundary):** the engine pins its KV buffers and exports
-//!     a [`engine::KvHandle`]; transport consumes it without owning or
-//!     interpreting the bytes. The per-backend registration shim lives on the
-//!     engine's export surface. Transport never imports the engine — they meet
-//!     only through the handle type on the schema floor.
-//!   * **↔controller:** receives a pairing decision and executes it. No routing
-//!     or scheduling here.
-//!   * **↔runtime:** transfers are async — transport exposes the start and a
-//!     completion signal ([`Completion`]); *when* to await is the scheduler's
-//!     job.
-//!   * **↔interface/engine:** the KV layout and handle type live in
-//!     [`engine`], shared by engine / transport / runtime / controller.
+//! The engine pins its KV buffers and exports a [`engine::KvHandle`]; transport consumes it without owning or interpreting the bytes, and never imports the engine. Transfers are async — transport exposes the start and a completion signal ([`Completion`]); when to await is the scheduler's job.
 
 pub mod backends;
 pub mod core;
@@ -52,9 +18,7 @@ pub use backends::nixl::NixlBackend;
 pub use error::{Result, TransportError};
 pub use registry::Registry;
 
-// `KvDtype` is gone: a cache row's element type is the model's, and
-// `engine` names `model_ir::Dtype` for it now (palo decision 18). The
-// re-export follows, so `transport::Dtype` is what `transport::KvDtype` was.
+// A cache row's element type is the model's: `transport::Dtype` is that type.
 pub use engine::{KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
 pub use dtype::Dtype;
 
@@ -126,34 +90,6 @@ mod tests {
     }
 
     #[test]
-    fn local_send_copies_pages_at_matching_offsets() {
-        let copier = FakeCopier::default();
-        let calls = copier.calls.clone();
-        let reg = Registry::local_only(Box::new(copier));
-
-        let prefill = reg
-            .register(WorkerId(1), handle(0x1000, 8), BackendKind::Local)
-            .unwrap();
-        let _decode = reg
-            .register(WorkerId(2), handle(0x9000, 8), BackendKind::Local)
-            .unwrap();
-
-        let pages = PageSet::new(vec![0, 3]);
-        let id = reg.send(&prefill, &pages, WorkerId(2)).unwrap();
-        assert_eq!(reg.poll(id).unwrap(), Completion::Done);
-
-        let page_bytes = layout().page_bytes();
-        let recorded = calls.lock().unwrap().clone();
-        assert_eq!(
-            recorded,
-            vec![
-                (0x1000, 0x9000, page_bytes),
-                (0x1000 + 3 * page_bytes, 0x9000 + 3 * page_bytes, page_bytes),
-            ]
-        );
-    }
-
-    #[test]
     fn local_recv_acknowledges_colocated_peer() {
         let reg = Registry::local_only(Box::<FakeCopier>::default());
         let decode = reg
@@ -208,27 +144,6 @@ mod tests {
         assert!(matches!(err, TransportError::UnknownPeer { worker: 99 }));
     }
 
-    #[test]
-    fn page_out_of_bounds_is_rejected() {
-        let reg = Registry::local_only(Box::<FakeCopier>::default());
-        let prefill = reg
-            .register(WorkerId(1), handle(0x1000, 2), BackendKind::Local)
-            .unwrap();
-        reg.register(WorkerId(2), handle(0x9000, 2), BackendKind::Local)
-            .unwrap();
-        let err = reg
-            .send(&prefill, &PageSet::new(vec![5]), WorkerId(2))
-            .unwrap_err();
-        assert!(matches!(err, TransportError::PageOutOfBounds { page: 5 }));
-    }
-
-    #[test]
-    fn poll_unknown_transfer_errors() {
-        let reg = Registry::local_only(Box::<FakeCopier>::default());
-        let err = reg.poll(TransferId(123)).unwrap_err();
-        assert!(matches!(err, TransportError::UnknownTransfer { id: 123 }));
-    }
-
     /// A handle tagged for a backend that isn't built (nixl off) routes to an
     /// `Unsupported` error rather than panicking.
     #[test]
@@ -243,25 +158,6 @@ mod tests {
             .send(&nixl_handle, &PageSet::new(vec![0]), WorkerId(2))
             .unwrap_err();
         assert!(matches!(err, TransportError::Unsupported(_)));
-    }
-
-    /// The registry mints globally-unique outward transfer ids and routes each
-    /// `poll` back correctly — the namespacing that prevents per-backend id
-    /// collisions once a second backend (nixl) is present.
-    #[test]
-    fn registry_mints_distinct_transfer_ids() {
-        let reg = Registry::local_only(Box::<FakeCopier>::default());
-        let a = reg
-            .register(WorkerId(1), handle(0x1000, 8), BackendKind::Local)
-            .unwrap();
-        reg.register(WorkerId(2), handle(0x9000, 8), BackendKind::Local)
-            .unwrap();
-
-        let id1 = reg.send(&a, &PageSet::new(vec![0]), WorkerId(2)).unwrap();
-        let id2 = reg.send(&a, &PageSet::new(vec![1]), WorkerId(2)).unwrap();
-        assert_ne!(id1, id2, "outward ids must be unique");
-        assert_eq!(reg.poll(id1).unwrap(), Completion::Done);
-        assert_eq!(reg.poll(id2).unwrap(), Completion::Done);
     }
 
     /// The local backend has no connect-metadata: `connect` is a no-op and

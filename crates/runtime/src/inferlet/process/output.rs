@@ -1,8 +1,5 @@
-//! Output streaming for WASM instance stdout/stderr.
-//!
-//! Provides `LogStream` — a WASI-compatible stream that routes output either
-//! through the process actor (`process::stdout` / `process::stderr`, read by an
-//! attached client) or to pie-worker's own `tracing` log when no client is
+//! `LogStream`: a WASI-compatible stream that routes WASM guest stdout/stderr
+//! either through the process actor, or to `tracing` when no client is
 //! attached.
 
 use bytes::Bytes;
@@ -98,9 +95,7 @@ impl LogStream {
     }
 }
 
-// =============================================================================
-// WASI Trait Implementations
-// =============================================================================
+// WASI trait implementations
 
 impl StdoutStream for LogStream {
     fn p2_stream(&self) -> Box<dyn OutputStream> {

@@ -7,76 +7,117 @@ pub mod tokenizer;
 use model::{Model, Routed};
 use model_dsl::Dtype;
 
-/// **THE 2-BIT DQ ROW'S OWN MODEL**, said once and read by all four registries
-/// below.
-///
-/// Four dtypes and not one: the trunk (attention, the shared expert, the
-/// embedding and the head) is MLX's own 4-bit at group 64, and the ROUTED
-/// experts are the per-tensor mix [`Routed::DQ_2BIT`] states. The rest of the
-/// text — norms, the compressor's position embedding, the router gate — reads
-/// what those banks compute in, which is bf16.
-pub fn flash_mlxu2(tp: u32) -> Model {
+/// Trunk (attention, shared expert, embedding, head) is 4-bit at group 64;
+/// routed experts use the [`Routed::DQ_2BIT`] mix; norms, position embedding,
+/// and router gate stay bf16.
+pub fn flash_u2g64(tp: u32) -> Model {
     Model::flash_mini(Dtype::U4g64, Routed::DQ_2BIT, Dtype::Bf16, Dtype::Bf16, tp)
 }
 
-pub const CATALOG: &[crate::Row] = model_dsl::catalog![
-    (
-        "dsv4-base-bf16-kv-bf16",
-        1,
-        model_dsl::trace_hybrid,
-        Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 1)
-    ),
-    (
-        "dsv4-base-bf16-kv-bf16-tp2",
-        2,
-        model_dsl::trace_hybrid,
-        Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 2)
-    ),
-    (
-        "dsv4-flash-bf16-kv-bf16",
-        1,
-        model_dsl::trace_hybrid,
-        Model::flash(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, 1)
-    ),
-    // The mini DQ snapshot's row: the same flash organs at the artifact's own
-    // five layers and sixteen experts, its trunk 4-bit and its routed experts
-    // the 2-bit mix.
-    (
-        "dsv4-flash-mlxu2-kv-bf16",
-        1,
-        model_dsl::trace_hybrid,
-        flash_mlxu2(1)
-    ),
-];
+/// [`flash_u2g64`] with the draft head over it (`--aux` from
+/// `scripts/dsv4_mtp_companion.py`'s overlay).
+pub fn flash_u2g64_mtp(tp: u32) -> Model {
+    Model::flash_mini_mtp(Dtype::U4g64, Routed::DQ_2BIT, Dtype::Bf16, Dtype::Bf16, tp)
+}
 
-pub const IMPORTS: &[crate::ImportRow] = &[
-    // **THE 2-BIT DQ ROW LEADS**, for `qwen_3::IMPORTS`'s reason: every
-    // projection it names is a `.weight`/`.scales`/`.biases` triplet, so it
-    // MISSES on a bf16 artifact and the next row gets its turn — where a bf16
-    // row listed first would claim a quantized checkpoint and fail four stages
-    // later.
-    ("dsv4-flash-mlxu2-kv-bf16", 1, |src, tp| flash_mlxu2(tp).import(src)),
-    ("dsv4-base-bf16-kv-bf16", 1, |src, tp| {
-        Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, tp).import(src)
-    }),
-    ("dsv4-base-bf16-kv-bf16-tp2", 2, |src, tp| {
-        Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, tp).import(src)
-    }),
-    ("dsv4-flash-bf16-kv-bf16", 1, |src, tp| {
-        Model::flash(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, tp).import(src)
-    }),
-];
+/// [`flash_u2g64_full`] with the draft head over it.
+pub fn flash_u2g64_full_mtp(tp: u32) -> Model {
+    Model::flash_mixed_mtp(
+        Dtype::U4g64,
+        Routed::DQ_2BIT_FULL,
+        Dtype::Bf16,
+        Dtype::Bf16,
+        tp,
+    )
+}
 
-pub const TEMPLATES: &[crate::template::TemplateRow] = &[
-    ("dsv4-base-bf16-kv-bf16", template::r1),
-    ("dsv4-base-bf16-kv-bf16-tp2", template::r1),
-    ("dsv4-flash-bf16-kv-bf16", template::r1),
-    ("dsv4-flash-mlxu2-kv-bf16", template::r1),
-];
+/// Same four dtypes as [`flash_u2g64`], over the full 43-layer, 256-expert
+/// geometry ([`Routed::DQ_2BIT_FULL`]); the mini's group-32 gate exception at
+/// layer 4 corresponds to layer 42 here.
+pub fn flash_u2g64_full(tp: u32) -> Model {
+    Model::flash_mixed(
+        Dtype::U4g64,
+        Routed::DQ_2BIT_FULL,
+        Dtype::Bf16,
+        Dtype::Bf16,
+        tp,
+    )
+}
 
-pub const TOKENIZERS: &[crate::tokenizer::ContractRow] = &[
-    ("dsv4-base-bf16-kv-bf16", &tokenizer::CONTRACT),
-    ("dsv4-base-bf16-kv-bf16-tp2", &tokenizer::CONTRACT),
-    ("dsv4-flash-bf16-kv-bf16", &tokenizer::CONTRACT),
-    ("dsv4-flash-mlxu2-kv-bf16", &tokenizer::CONTRACT),
-];
+/// Identification order: the first row whose import fits the checkpoint wins.
+pub fn skus() -> Vec<crate::Sku> {
+    crate::skus![
+        // The drafting rows first: they fit only an artifact that carries the
+        // `aux.` overlay, and a plain one falls through to the rows below.
+        (
+            "dsv4-flash-full-mtp",
+            1,
+            [Dtype::U4g64, Dtype::U2g64, Dtype::Mxfp4],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::r1,
+            &tokenizer::CONTRACT,
+            |tp: u32| flash_u2g64_full_mtp(tp),
+        ),
+        (
+            "dsv4-flash-mtp",
+            1,
+            [Dtype::U4g64, Dtype::U2g64, Dtype::Mxfp4],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::r1,
+            &tokenizer::CONTRACT,
+            |tp: u32| flash_u2g64_mtp(tp),
+        ),
+        (
+            "dsv4-flash-full",
+            1,
+            [Dtype::U4g64, Dtype::U2g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::r1,
+            &tokenizer::CONTRACT,
+            |tp: u32| flash_u2g64_full(tp),
+        ),
+        (
+            "dsv4-flash",
+            1,
+            [Dtype::U4g64, Dtype::U2g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::r1,
+            &tokenizer::CONTRACT,
+            |tp: u32| flash_u2g64(tp),
+        ),
+        (
+            "dsv4-base",
+            1,
+            [Dtype::Bf16],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::r1,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, tp),
+        ),
+        (
+            "dsv4-base",
+            2,
+            [Dtype::Bf16],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::r1,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::base(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, tp),
+        ),
+        (
+            "dsv4-flash",
+            1,
+            [Dtype::Bf16],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::r1,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::flash(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16, tp),
+        ),
+    ]
+}

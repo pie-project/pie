@@ -1,22 +1,11 @@
-//! WebSocket adapter: a **multi-turn** interactive session. Lifetime = the
-//! connection (§6). The general case; `http.rs` is its 1-turn degenerate form.
+//! WebSocket adapter: a multi-turn interactive session, lifetime the
+//! connection. The general case; `http.rs` is its 1-turn degenerate form.
 //!
-//! One `select!` multiplexes the two directions on charlie's `Session` seam:
-//!   * worker→user: drain EVERY live turn's `TokenRx` to WS frames, and
-//!   * user→worker: read the next client turn (`handle.turn`) or a `cancel`.
-//!
-//! Turns are CONCURRENT, not one-at-a-time. A client may launch several
-//! processes on one socket and await them together, so the socket has to carry
-//! as many open token streams as the client has live turns. Holding a single
-//! `Option<TokenRx>` here dropped the previous turn's receiver the moment a
-//! second turn opened: the worker's `push_tokens` then saw the closed channel
-//! as an abort, terminated that process, and the client — whose `ServerMessage`
-//! demux is keyed by `process_id` — waited forever for a `return` that could
-//! no longer be sent. Every stream is therefore kept until it ends on its own.
-//!
-//! The `&self`-control (`turn`/`cancel`) + owned-`TokenRx` split is what lets
-//! both arms live in one `select!` with no borrow clash. With no live turn the
-//! token arm is parked (`pending()`), so the loop waits only on the client.
+//! One `select!` multiplexes both directions: worker->user drains every live
+//! turn's `TokenRx` to WS frames, user->worker reads the next client turn or
+//! a `cancel`. Turns are concurrent, not one-at-a-time — a client may launch
+//! several processes on one socket, so every stream is kept until it ends on
+//! its own rather than being dropped when a second turn opens.
 
 use axum::{
     extract::{
@@ -59,12 +48,9 @@ enum Incoming {
 /// turns, which is what parks the token arm.
 struct LiveTurns {
     streams: Vec<TokenRx>,
-    /// Where the next poll starts. `select_all` polls its iterator in order and
-    /// returns the FIRST ready future, so always building the set from index 0
-    /// means a turn that always has a token buffered is served to completion
-    /// while every later turn waits — deterministically, not occasionally, and
-    /// on exactly the two-concurrent-turns case this type exists for. Advancing
-    /// the start makes the poll order round-robin.
+    /// Where the next poll starts. Always polling from index 0 would starve
+    /// later turns whenever an earlier one has a token buffered; advancing
+    /// this makes the poll order round-robin.
     cursor: usize,
 }
 
@@ -88,14 +74,11 @@ impl LiveTurns {
         self.streams.push(rx);
     }
 
-    /// Await the next item from ANY live turn, parking forever when there is
+    /// Await the next item from any live turn, parking forever when there is
     /// none so the caller's `select!` waits only on the client. A stream that
-    /// ends is dropped from the set: `Eos` is the clean end, `None` without one
-    /// is the abort the Tokens contract defines.
-    ///
-    /// Turns are polled round-robin from `cursor`, so no turn can starve
-    /// another. Dropping the losing futures loses nothing: `Receiver::recv` is
-    /// cancel-safe, and an un-polled receiver keeps everything already queued.
+    /// ends is dropped: `Eos` is the clean end, `None` without one is the
+    /// abort the Tokens contract defines. Polled round-robin from `cursor`,
+    /// so no turn can starve another.
     async fn next(&mut self) -> TurnEvent {
         let live = self.streams.len();
         if live == 0 {
@@ -140,8 +123,7 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
         Some(req) => req,
         None => return, // closed / errored before any turn
     };
-    // Multi-turn ⇒ sticky affinity so every turn prefers the warm-KV worker
-    // (HRW; `turn()` reuses the key automatically). §7.
+    // Multi-turn: sticky affinity so every turn prefers the warm-KV worker.
     let (handle, first_rx) = match state.sessions.create(ident, first, Affinity::Sticky).await {
         Ok(pair) => pair,
         Err(e) => {
@@ -161,12 +143,8 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
         tokio::select! {
             ev = live.next() => match ev {
                 TurnEvent::Item(Tokens::Chunk(msg)) => {
-                    // `pie-client` decodes `ServerMessage` as MessagePack over
-                    // binary frames (its reader drops Text), so the turn's
-                    // response stream must be binary msgpack — not JSON text.
-                    // On the (near-impossible) encode failure, log + drop the
-                    // frame rather than send an empty binary the client can't
-                    // decode.
+                    // `pie-client` decodes as MessagePack over binary frames
+                    // (its reader drops Text). Encode failure: log + drop.
                     match encode(&msg) {
                         Some(bytes) => {
                             if tx.send(Message::Binary(bytes.into())).await.is_err() {
@@ -282,8 +260,8 @@ fn parse_incoming_bytes(bytes: &[u8]) -> Result<Incoming, String> {
     Ok(Incoming::Turn(into_turn(payload)))
 }
 
-/// Wrap a client payload into per-turn content. `req_id`/`session` stay charlie's
-/// to mint in `turn`/`create`. Blob ingest (if any) attaches `blobs` here.
+/// Wrap a client payload into per-turn content. `req_id`/`session` are minted
+/// by `Session` in `turn`/`create`. Blob ingest (if any) attaches `blobs` here.
 fn into_turn(payload: ClientMessage) -> TurnInput {
     TurnInput {
         message: payload,

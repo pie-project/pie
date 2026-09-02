@@ -1,0 +1,16 @@
+[package]
+name = "rs-speculative-decoding"
+version = "0.1.0"
+description = "Speculative decoding on a hybrid (recurrent + attention) model: the verify window is BUFFERED in the recurrent state, and only the accepted prefix is ever folded"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to continue (raw encoding, no chat template)"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 64)"}
+k = {type = "int", optional = true, description = "Draft-window length (default: 4; 0 is the sequential control)"}
+draft = {type = "string", optional = true, description = "Draft source: `ngram` (prompt-lookup over the committed text, default) or `mtp` (the model's own draft head)"}
+max_ngram = {type = "int", optional = true, description = "Longest suffix the n-gram drafter matches (default: 3)"}
+mask_mode = {type = "string", optional = true, description = "`none` (default: the engine's own causal bound) or `causal` (an explicit per-row staircase mask)"}

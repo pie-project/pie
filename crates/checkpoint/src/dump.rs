@@ -5,20 +5,8 @@ use serde::Serialize;
 
 use crate::plan::{LoadPlan, StorageInstr, TileMapKind};
 
-// `dump_load_plan_json` STOOD HERE: `serde_json::to_string_pretty(plan)`, one
-// line, wrapped so a caller could name the failure. It had none -- not in this
-// crate, not in an engine, not in a test. A plan is `Serialize`, so anyone who
-// wants its full text can write that line where they need it, and the golden
-// tests already do exactly that. What survives below is the surface that is
-// actually read: `describe` for the boot log, `plan_stats_json` for the
-// operator-facing shape.
-
-/// The plan's own name for an instruction.
-///
-/// An engine that renders a plan needs these names, and the table it used to keep
-/// was a `switch` with a `"Unknown"` fallthrough: adding a variant here left that
-/// table quietly wrong. Matching exhaustively on the enum makes the same change a
-/// compile error instead.
+/// The plan's own name for an instruction. Exhaustive match: a new variant
+/// must be named here or the build fails.
 fn instr_name(instr: &StorageInstr) -> &'static str {
     match instr {
         StorageInstr::Allocate { .. } => "Allocate",
@@ -84,12 +72,8 @@ struct PlanStats<'a> {
     tile_map_kinds: BTreeMap<&'static str, usize>,
 }
 
-/// A compiled plan's shape as JSON: the counts plus instruction and transform
-/// histograms.
-///
-/// The small operator-facing dump. It is deliberately not the whole plan: the
-/// counts are what a human reads, and a plan that must be read instruction by
-/// instruction is `Serialize` and can be dumped by whoever needs that.
+/// A compiled plan's shape as JSON: counts plus instruction and transform
+/// histograms — not the whole plan.
 pub fn plan_stats_json(plan: &LoadPlan) -> String {
     let mut instruction_kinds: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut tile_map_kinds: BTreeMap<&'static str, usize> = BTreeMap::new();

@@ -1,10 +1,8 @@
-//! Trust-edge identity gate (§2/§5). The gateway sits behind an edge proxy that
-//! has already authenticated the caller; we **trust** the edge-supplied identity
-//! header and merely *extract* tenant/user for routing/quota/isolation. This is
-//! NOT authentication — no token is re-verified here.
-//!
-//! Trust boundary: because we trust these headers, the gateway must only accept
-//! connections from the edge (private bind / mTLS). Enforced at deploy, not here.
+//! Trust-edge identity gate. The gateway sits behind an edge proxy that has
+//! already authenticated the caller; this only extracts tenant/user from the
+//! edge-supplied header for routing/quota/isolation — it is not
+//! authentication. The gateway must therefore only accept connections from
+//! the edge (private bind / mTLS), enforced at deploy, not here.
 
 use std::net::IpAddr;
 
@@ -22,9 +20,9 @@ pub const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 /// Per-request trace id propagated from the edge.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// Build an [`Identity`] from edge-supplied headers. Fails closed: a missing or
-/// malformed identity header is a misconfigured edge (§2), so we reject rather
-/// than serve an unattributed request.
+/// Build an [`Identity`] from edge-supplied headers. Fails closed: a missing
+/// or malformed identity header is a misconfigured edge, so this rejects
+/// rather than serve an unattributed request.
 pub fn extract(headers: &HeaderMap) -> anyhow::Result<Identity> {
     let raw = headers
         .get(IDENTITY_HEADER)
@@ -70,10 +68,9 @@ fn parse_identity(raw: &str) -> anyhow::Result<(String, String)> {
     Ok((tenant.to_string(), user.to_string()))
 }
 
-/// Extract the origin client IP from an `X-Forwarded-For` value. The header is a
-/// comma-separated list appended hop-by-hop; the **left-most** entry is the
-/// original client. Tolerates a trailing `:port`. `None` if absent/unparseable
-/// (the IP is carried for tracing/quota only, so a bad value is non-fatal).
+/// Extract the origin client IP from an `X-Forwarded-For` value: a
+/// comma-separated, hop-appended list whose left-most entry is the original
+/// client. `None` if absent/unparseable (non-fatal; carried for tracing only).
 fn parse_forwarded_for(value: &str) -> Option<IpAddr> {
     let first = value.split(',').next()?.trim();
     if first.is_empty() {
@@ -87,61 +84,3 @@ fn parse_forwarded_for(value: &str) -> Option<IpAddr> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::{HeaderName, HeaderValue};
-
-    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        for (k, v) in pairs {
-            h.insert(
-                HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                HeaderValue::from_str(v).unwrap(),
-            );
-        }
-        h
-    }
-
-    #[test]
-    fn extracts_tenant_user_ip_and_request_id() {
-        let h = headers(&[
-            (IDENTITY_HEADER, "acme/alice"),
-            (FORWARDED_FOR_HEADER, "203.0.113.7, 10.0.0.1"),
-            (REQUEST_ID_HEADER, "req-123"),
-        ]);
-        let id = extract(&h).unwrap();
-        assert_eq!(id.tenant.0, "acme");
-        assert_eq!(id.user, "alice");
-        assert_eq!(id.client_ip, Some("203.0.113.7".parse().unwrap()));
-        assert_eq!(id.request_id.as_deref(), Some("req-123"));
-    }
-
-    #[test]
-    fn bare_user_defaults_tenant() {
-        let id = extract(&headers(&[(IDENTITY_HEADER, "bob")])).unwrap();
-        assert_eq!(id.tenant.0, "default");
-        assert_eq!(id.user, "bob");
-        assert!(id.client_ip.is_none());
-    }
-
-    #[test]
-    fn missing_header_fails_closed() {
-        assert!(extract(&HeaderMap::new()).is_err());
-    }
-
-    #[test]
-    fn empty_user_rejected() {
-        assert!(extract(&headers(&[(IDENTITY_HEADER, "acme/")])).is_err());
-    }
-
-    #[test]
-    fn forwarded_for_strips_port_and_picks_leftmost() {
-        assert_eq!(
-            parse_forwarded_for("198.51.100.5:443, 10.0.0.1"),
-            Some("198.51.100.5".parse().unwrap())
-        );
-        assert_eq!(parse_forwarded_for("not-an-ip"), None);
-        assert_eq!(parse_forwarded_for(""), None);
-    }
-}

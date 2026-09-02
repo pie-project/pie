@@ -1,14 +1,5 @@
 //! The bound device: an ordinal, a stream, a cuBLAS handle, and the
 //! [`Ctx`] every kernel entry fires on.
-//!
-//! ONE CONTEXT PER SHELL, BOUND ON THE THREAD THAT WILL FIRE. `cudaSetDevice`
-//! is per-thread state, so binding somewhere other than where the fires
-//! happen strands every later call on device 0 — the rewrite's shell learned
-//! that and said so in a comment; this states it in the constructor instead.
-//!
-//! The cuBLAS handle is not optional decoration: `linear.matmul` reaches for
-//! it through [`Ctx::cublas`] on every projection in the model, and a context
-//! without one answers a typed refusal that would read as a missing kernel.
 
 use core::ffi::c_void;
 
@@ -17,30 +8,20 @@ use kernels_cuda::{Ctx, Slabs};
 
 use crate::error::{Fault, Result};
 
-/// Is there a CUDA device on this machine?
-///
-/// **A BUILD THAT NAMES CUDA IS NOT A MACHINE THAT HAS IT**, and the probe
-/// has to survive both halves of that: no runtime library at all (cudarc is
-/// built `fallback-dynamic-loading`, so a missing `libcudart` PANICS from
-/// inside the shim rather than returning a code) and a library with no device
-/// behind it. This is the door a GPU test knocks on before it asks for
-/// anything; the idiom is `checkpoint`'s `device_or_skip`, kept whole
-/// because its comment is the reason it is written this way.
+/// Whether a CUDA device is present. Must survive both a missing runtime
+/// library (cudarc's fallback-dynamic-loading panics on a missing
+/// `libcudart` rather than returning a code) and a library with no device.
 #[must_use]
 pub fn present() -> bool {
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     {
-        // Only the FIRST runtime call is wrapped: past it the library is
-        // known loaded, and catching panics any wider would turn a real
-        // failure into a skip.
+        // only the first runtime call is wrapped; later ones are known-loaded.
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let probe = std::panic::catch_unwind(|| {
-            // The count lives INSIDE the closure: a `&mut i32` captured
-            // across a catch is not `UnwindSafe`, and it does not need to be.
+            // count lives inside the closure: a captured &mut i32 is not UnwindSafe.
             let mut count: i32 = 0;
-            // SAFETY: `count` is a live local, and this is the process's
-            // first cudarc call.
+            // SAFETY: count is a live local, and this is the process's first cudarc call.
             let status = unsafe { cudarc::runtime::sys::cudaGetDeviceCount(&raw mut count) };
             (status, count)
         });
@@ -50,29 +31,16 @@ pub fn present() -> bool {
             Ok((cudarc::runtime::sys::cudaError::cudaSuccess, count)) if count > 0
         )
     }
-    #[cfg(not(feature = "_cuda"))]
+    #[cfg(not(feature = "cuda"))]
     {
         false
     }
 }
 
-/// One side stream: a second place to enqueue, and the companions an entry
-/// firing on it needs.
-///
-/// **A cuBLAS HANDLE PER STREAM, AND IT IS NOT OPTIONAL.** A handle carries
-/// the stream its GEMMs go on (`cublasSetStream_v2`), so one handle shared
-/// between two streams would mean either re-pointing it per launch — a host
-/// call inside a capture, ordering nothing — or every projection landing on
-/// the main stream whatever the region said. Gemma forks a region containing
-/// `linear.matmul` on the very first layer, so this is the ordinary case
-/// rather than a corner.
-///
-/// **NO COMMUNICATOR, DELIBERATELY.** P6 never puts a collective on a side
-/// stream (decision #5: NCCL matches by call order), so a context here that
-/// carried one would be a capability nothing may use. A collective fired on a
-/// side stream answers `Ctx::comm`'s typed refusal, which is the diagnostic
-/// worth having if the pass ever regresses.
-#[cfg_attr(not(feature = "_cuda"), allow(dead_code))]
+/// A second stream to enqueue on, with its own cuBLAS handle (a handle is
+/// bound to one stream via `cublasSetStream_v2`) and no communicator — a
+/// collective fired on a side stream answers `Ctx::comm`'s typed refusal.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct Side {
     stream: *mut c_void,
     cublas: *mut c_void,
@@ -83,52 +51,26 @@ struct Side {
 pub struct Context {
     ordinal: i32,
     stream: *mut c_void,
-    /// **THE NOTIFY STREAM, AND IT CARRIES NOTHING BUT CALLBACKS** (survey §7,
-    /// I7).
-    ///
-    /// `cudaLaunchHostFunc` HOLDS its stream: nothing enqueued behind the
-    /// callback on that stream begins until the host function has returned.
-    /// Put a settlement callback on the compute stream and the next wave —
-    /// already enqueued behind it, which is the whole of article 1 — waits on
-    /// a host thread, which is article 2's forbidden transition wearing a
-    /// different hat. Dev measured this and gave the callbacks a stream of
-    /// their own (`dispatch.cu:5928-5943`); this is that stream.
-    ///
-    /// Non-blocking, so it never orders against the legacy default stream, and
-    /// it carries exactly two things per settled step: a wait on the compute
-    /// stream's completion event, and the host function that follows it.
+    /// The notify stream: carries only callbacks, never work.
+    /// `cudaLaunchHostFunc` holds its stream, so a callback enqueued on the
+    /// compute stream would block the next wave behind it; non-blocking, so
+    /// it never orders against the default stream.
     notify: *mut c_void,
     // Read only by `Drop`, which has nothing to destroy in a build with no
     // runtime — the handle is null there and was never created.
-    #[cfg_attr(not(feature = "_cuda"), allow(dead_code))]
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     cublas: *mut c_void,
     ctx: Ctx,
-    /// P6's side streams, in stream order: `side[0]` is stream 1. Empty until
-    /// [`Context::open_lanes`] is told how many the artifact asked for, and
-    /// empty forever for an artifact that forked nothing.
+    /// Side streams, in order (`side[0]` is stream 1). Empty until
+    /// [`Context::open_lanes`].
     side: Vec<Side>,
-    /// **THE STREAM A CONDITIONAL BODY IS CAPTURED ON**, opened by
-    /// [`Context::open_conditional`] and `None` for the artifacts P3 declined
-    /// — which is every SKU in the catalog but the drafting ones.
-    ///
-    /// Not one of [`side`](Context::side), even though it is built exactly
-    /// like one, because it is not a STREAM ASSIGNMENT: no region names it,
-    /// `model_compiler::stream` cannot reach it, and nothing is ever enqueued
-    /// on it outside a `cuStreamBeginCaptureToGraph`. It exists because
-    /// beginning a capture needs a stream that is not already capturing, and
-    /// the parent capture is on the main one.
+    /// The stream a conditional body is captured on, opened by
+    /// [`Context::open_conditional`]. Not a side stream: no region names it,
+    /// and nothing is enqueued on it outside a `cuStreamBeginCaptureToGraph`.
     conditional: Option<Side>,
     /// One `cudaEvent_t` per `model_compiler::EventId`, created once at load.
     events: Vec<crate::device::graph::Event>,
-    /// **THIS SHELL'S SCRATCH SLABS, AND NOBODY ELSE'S.**
-    ///
-    /// `kernels_cuda::Ctx::scratch` used to hand back a slab keyed by a
-    /// static name alone, which made every workspace in the process one
-    /// buffer: two shells staged into each other and both computed (build log
-    /// 18), and two arms of a P6 fork group did the same, which is the whole
-    /// reason [`crate::EXCLUSIVE`] existed (build log 24). An arena is one
-    /// context's, every stream in it gets its own slab, and [`Drop`] gives
-    /// the bytes back.
+    /// This context's own scratch slabs, not shared with any other context.
     slabs: Slabs,
     device: Device,
     toggles: Toggles,
@@ -136,27 +78,22 @@ pub struct Context {
 }
 
 impl Context {
-    /// Bind `ordinal`, open a stream and a cuBLAS handle on it, and probe the
-    /// facts every plan builder takes as an argument.
-    ///
-    /// The probes happen ONCE, here: `Device::probe` and `Toggles::from_env`
-    /// are the two reads `kernels-cuda` deliberately refuses to do inside a
-    /// builder, because purity is what makes a schedule reproducible. Their
-    /// answers ride into every fire on [`FireBindings`](crate::FireBindings).
+    /// Binds `ordinal`, opens a stream and cuBLAS handle on it, and probes
+    /// device facts once (`Device::probe`, `Toggles::from_env`) that ride
+    /// into every fire via `FireBindings`.
     ///
     /// # Errors
     ///
     /// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`]
     /// for a runtime that refused.
     pub fn bind(ordinal: i32) -> Result<Context> {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             use cudarc::cublas::sys as blas;
             use cudarc::runtime::sys as rt;
 
-            // SAFETY: every call below takes a live local out-parameter and
-            // the handles the ones before it produced. `cudaSetDevice` binds
-            // THIS thread, which is the thread that will fire.
+            // SAFETY: each call takes a live out-parameter and the handles
+            // the prior calls produced. cudaSetDevice binds this thread.
             unsafe {
                 check("cudaSetDevice", rt::cudaSetDevice(ordinal))?;
                 let mut stream: rt::cudaStream_t = core::ptr::null_mut();
@@ -181,9 +118,7 @@ impl Context {
                     });
                 }
 
-                // The notify stream, opened with the compute stream and never
-                // used for work — see the field's own doc for why a callback
-                // must not sit where the next wave is queued.
+                // notify stream, opened with the compute stream, never used for work.
                 let mut notify: rt::cudaStream_t = core::ptr::null_mut();
                 let status = rt::cudaStreamCreateWithFlags(
                     &raw mut notify,
@@ -202,14 +137,12 @@ impl Context {
                 let notify: *mut c_void = notify.cast();
                 let cublas: *mut c_void = handle.cast();
                 let slabs = Slabs::open();
-                // The main stream is attached before anything fires on it,
-                // which is what `Slabs::attach` asks for: growth broadcasts
-                // across an arena's attached streams, and a stream that
-                // arrives after a name has grown misses that name's slab.
+                // main stream attached before anything fires on it; slabs
+                // are keyed by (name, region), not stream, so this registers
+                // nothing extra.
                 slabs.attach(stream);
                 let ctx = Ctx::on(stream).with_cublas(cublas).with_slabs(slabs);
-                // A probe that fails is not a load that fails: the facts have
-                // a stated fallback, and the builders take them as data.
+                // a failed probe isn't a failed load: builders take the fallback as data.
                 let device = Device::probe(&ctx).unwrap_or(Device::L40S);
                 Ok(Context {
                     ordinal,
@@ -227,30 +160,16 @@ impl Context {
                 })
             }
         }
-        #[cfg(not(feature = "_cuda"))]
+        #[cfg(not(feature = "cuda"))]
         {
             let _ = ordinal;
             Err(Fault::Runtimeless)
         }
     }
 
-    /// **BIND THIS THREAD TO THIS CONTEXT'S DEVICE.** The other half of
-    /// [`Context::bind`]'s own doctrine — one context per shell, bound on the
-    /// thread that will fire — for the case where those are not the same
-    /// thread.
-    ///
-    /// The runtime loads an engine on the thread that boots the worker and then
-    /// hands it to a lane thread that owns it for the rest of the process.
-    /// `cudaSetDevice` is per-thread and did not travel with it. The CUDA RUNTIME
-    /// api forgave that on device 0, where an unbound thread's default is the
-    /// right one; the DRIVER api did not — `cuModuleLoadData` on a thread with
-    /// no current context answers `CUDA_ERROR_INVALID_CONTEXT` (201), which is
-    /// what every guest-program registration met.
-    ///
-    /// Since CUDA 12 `cudaSetDevice` initializes the device's primary context
-    /// and makes it current, so this one call is the whole binding; the
-    /// `cudaFree(0)` that used to be needed to force it is not, and is not
-    /// written here as a cargo-culted second call.
+    /// Binds this thread to this context's device — for the case where
+    /// `bind` and the fire don't happen on the same thread. `cudaSetDevice`
+    /// is per-thread and doesn't travel across a handoff.
     ///
     /// # Errors
     ///
@@ -277,39 +196,30 @@ impl Context {
         self.notify
     }
 
-    /// **Run `work` on the host once everything enqueued on the notify stream
-    /// so far has happened** (survey §7, I7).
+    /// Runs `work` on the host once everything enqueued on the notify stream
+    /// so far has completed.
     ///
-    /// The one door onto `cudaLaunchHostFunc` in this crate, and it is fixed
-    /// to the notify stream on purpose: the API takes a stream and the whole
-    /// point of the invariant is WHICH one. A caller orders the callback by
-    /// making the notify stream wait on an event recorded on the compute
-    /// stream; it never enqueues the callback on the compute stream itself.
+    /// Fixed to the notify stream: a caller orders the callback by making
+    /// the notify stream wait on a compute-stream event, never by enqueuing
+    /// the callback on the compute stream itself.
     ///
-    /// **WHAT `work` MAY DO.** It runs on a driver-owned thread and may make
-    /// no CUDA call at all — not a memcpy, not an event query, not a
-    /// synchronize — and it must not block for long, because the driver's
-    /// callback thread is shared. Atomics, a briefly-held lock and a waker
-    /// publish are the whole vocabulary. It must also not panic across the FFI
-    /// boundary, which the trampoline below enforces by catching.
+    /// `work` runs on a driver-owned thread: it must make no CUDA call, must
+    /// not block for long, and must not panic across the FFI boundary (the
+    /// trampoline below catches it).
     ///
     /// # Errors
     ///
     /// [`Fault::Runtimeless`], or [`Fault::Device`] for a launch the runtime
-    /// refused — in which case `work` is dropped without running and the
-    /// caller must settle whatever it stood for by hand.
+    /// refused — in which case `work` is dropped without running.
     pub fn host_fn(&self, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             use cudarc::runtime::sys as rt;
 
-            // The double box is the ABI: `Box<dyn FnOnce>` is a fat pointer
-            // and `void*` is thin, so the fat one is boxed again to get an
-            // address the driver can hold.
+            // double box is the ABI: Box<dyn FnOnce> is a fat pointer, void* is thin.
             let carried: *mut Box<dyn FnOnce() + Send + 'static> = Box::into_raw(Box::new(work));
-            // SAFETY: `carried` is a live leaked allocation; the trampoline
-            // below reclaims it exactly once, and on the failure path this
-            // function reclaims it instead.
+            // SAFETY: carried is a live leaked allocation, reclaimed exactly
+            // once — here on the failure path, or by the trampoline.
             let code = unsafe {
                 rt::cudaLaunchHostFunc(
                     self.notify.cast(),
@@ -319,8 +229,7 @@ impl Context {
             };
             if code != rt::cudaError::cudaSuccess {
                 // SAFETY: the launch failed, so nothing else will ever see
-                // this pointer; reclaiming it here is what keeps a refused
-                // callback from leaking its payload.
+                // this pointer; reclaiming it here avoids a leak.
                 drop(unsafe { Box::from_raw(carried) });
                 return Err(Fault::Device {
                     call: "cudaLaunchHostFunc",
@@ -329,34 +238,31 @@ impl Context {
             }
             Ok(())
         }
-        #[cfg(not(feature = "_cuda"))]
+        #[cfg(not(feature = "cuda"))]
         {
             let _ = work;
             Err(Fault::Runtimeless)
         }
     }
 
-    /// **OPEN P6'S SIDE STREAMS AND ITS EVENTS**, once, at load, for the
-    /// counts the artifact asked for (`CompiledModel::streams`).
+    /// Opens the side streams and events, once, at load, for the counts the
+    /// artifact asked for (`CompiledModel::streams`).
     ///
-    /// Called after `compile`, because how many streams a plan wants is
-    /// something the plan decides — and called at LOAD rather than per fire,
-    /// because a `cudaStreamCreate` inside a capture is exactly the host work
-    /// `Graph::capture`'s thread-local mode exists to refuse.
+    /// Called after `compile` (the plan decides the counts) and at load
+    /// rather than per fire, since a `cudaStreamCreate` inside a capture is
+    /// host work the capture mode refuses.
     ///
-    /// Idempotent in the direction that matters: asking for what is already
-    /// open does nothing, and asking for fewer keeps what is there. An
-    /// artifact that forked nothing asks for `(0, 0)` and this is a no-op with
-    /// no handle created, which is the "pays nothing" half of the off arm.
+    /// Idempotent: opening more grows what's there; asking for fewer is a
+    /// no-op.
     ///
     /// # Errors
     ///
     /// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`]
-    /// for a stream, a handle or an event the runtime refused. A failure part
-    /// way through leaves the streams already opened in place; they are
-    /// destroyed with the context.
+    /// for a stream, handle or event the runtime refused. A partial failure
+    /// leaves what was already opened in place; it is destroyed with the
+    /// context.
     pub fn open_lanes(&mut self, side: u32, events: u32) -> Result<()> {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             while self.side.len() < side as usize {
                 let opened = self.open_side()?;
@@ -367,7 +273,7 @@ impl Context {
             }
             Ok(())
         }
-        #[cfg(not(feature = "_cuda"))]
+        #[cfg(not(feature = "cuda"))]
         {
             if side == 0 && events == 0 {
                 return Ok(());
@@ -379,14 +285,13 @@ impl Context {
 
     /// One more stream, its cuBLAS handle, and its seat in the scratch arena
     /// — the shape every companion stream this context opens has.
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     fn open_side(&mut self) -> Result<Side> {
         use cudarc::cublas::sys as blas;
         use cudarc::runtime::sys as rt;
 
-        // SAFETY: every call takes a live local out-parameter, and the
-        // handles below are the ones the calls before them produced.
-        // This thread bound the device.
+        // SAFETY: each call takes a live out-parameter, using handles the
+        // prior calls produced; this thread bound the device.
         unsafe {
             let mut stream: rt::cudaStream_t = core::ptr::null_mut();
             check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
@@ -410,9 +315,9 @@ impl Context {
             }
             let stream: *mut c_void = stream.cast();
             let cublas: *mut c_void = handle.cast();
-            // Attached at LOAD, before the first fire, because the warm pass
-            // runs eagerly on the main stream and its growth has to reach
-            // this one — see `Slabs::attach`.
+            // attached at load, before the first fire; slabs are keyed by
+            // region, so the warm pass and the capture share one block
+            // whichever stream either fires on.
             self.slabs.attach(stream);
             Ok(Side {
                 stream,
@@ -422,34 +327,23 @@ impl Context {
         }
     }
 
-    /// **OPEN THE STREAM A CONDITIONAL BODY IS RECORDED ON**, or do nothing
-    /// when one is already open.
-    ///
-    /// Asked once at load, and only of an artifact P3 stamped a
-    /// `Lowering::If` or `Lowering::Switch` on — which is the drafting SKUs
-    /// and nothing else in today's catalog. The stream costs what a side
-    /// stream costs and carries what one carries (a cuBLAS handle, a seat in
-    /// the scratch arena), because a conditional body may hold a projection
-    /// and a body's launches must be the launches they would have been.
-    ///
-    /// **AT LOAD AND NEVER ON THE FIRE PATH**, for the reason
-    /// [`open_lanes`](Context::open_lanes) is: a `cudaStreamCreate` between
-    /// two launches is host work, and inside a capture it is what the
-    /// thread-local mode refuses by name.
+    /// Opens the stream a conditional body is recorded on, or does nothing
+    /// if one is already open. Asked once at load, only for artifacts with
+    /// an `If`/`Switch` lowering; costs what a side stream does.
     ///
     /// # Errors
     ///
     /// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`]
-    /// for a stream or a handle the runtime refused.
+    /// for a stream or handle the runtime refused.
     pub fn open_conditional(&mut self) -> Result<()> {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             if self.conditional.is_none() {
                 self.conditional = Some(self.open_side()?);
             }
             Ok(())
         }
-        #[cfg(not(feature = "_cuda"))]
+        #[cfg(not(feature = "cuda"))]
         {
             Err(Fault::Runtimeless)
         }
@@ -516,46 +410,22 @@ impl Context {
         self.toggles
     }
 
-    /// This device's compute capability, `(major, minor)`, probed once at bind.
-    ///
-    /// NVRTC's `--gpu-architecture` and the guest-program cubin cache's key
-    /// are the only readers ([`program`](crate::program)): a cubin built for
-    /// `sm_89` neither loads nor answers on an `sm_90` part, so the pair is
-    /// probed at bind and carried rather than asked for per compile.
+    /// This device's compute capability, `(major, minor)`, probed once at
+    /// bind. A cubin built for one `sm_XX` won't load or run on another, so
+    /// this is carried rather than re-queried per compile.
     #[must_use]
     pub fn capability(&self) -> (i32, i32) {
         self.capability
     }
 
-    /// Wait for everything enqueued so far — **both streams**.
-    ///
-    /// The shell's, not the kernels': every entry in `kernels-cuda` is
-    /// enqueue-only and `Ctx` has no sync at all (decision #15), so the one
-    /// place a fire becomes observable is a caller that asks for it — reading
-    /// logits back, or timing a decode.
-    ///
-    /// # Why the notify stream is drained too (alto F2b)
-    ///
-    /// "Everything enqueued" has to include the SETTLEMENTS, or the word means
-    /// less than it says. A settlement callback releases a staging slot,
-    /// returns an event to its pool and bumps the settled count that
-    /// `record::Graphs` reads before it destroys an exec — and it runs on the
-    /// notify stream, which the compute stream's synchronize does not touch.
-    /// Drained only on the compute side, a caller that had just waited for its
-    /// fire would still see every resident body as possibly-in-flight, and
-    /// `record::Graphs::insert_body` would decline every capture and every
-    /// re-capture for the life of the load.
-    ///
-    /// So the compute stream first (the work), then the notify stream (what
-    /// the work's completion set in motion). After this call, `issued` and
-    /// `settled` agree — which is exactly the state F1's per-fire sync left
-    /// the shell in, and what makes depth 1 behave as it always did.
+    /// Waits for everything enqueued so far, on both streams. Compute stream
+    /// first (the work), then notify (what its completion triggers).
     ///
     /// # Errors
     ///
     /// [`Fault::Device`] for whatever either stream had queued.
     pub fn synchronize(&self) -> Result<()> {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             // SAFETY: both handles are live for this context's lifetime.
             unsafe {
@@ -569,7 +439,7 @@ impl Context {
                 )
             }
         }
-        #[cfg(not(feature = "_cuda"))]
+        #[cfg(not(feature = "cuda"))]
         {
             Err(Fault::Runtimeless)
         }
@@ -578,16 +448,14 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             // SAFETY: the shell is being torn down, so nothing else holds
             // either handle; both were produced by this context's `bind`.
             unsafe {
-                // The events first: they name points on the streams below.
+                // events first: they name points on the streams below.
                 self.events.clear();
-                // Then the slabs, before the streams they were sized for:
-                // freeing is what makes a SECOND shell in this process cost
-                // what the first one did.
+                // slabs freed before the streams they were sized for.
                 self.slabs.release();
                 for side in self.side.drain(..).chain(self.conditional.take()) {
                     if !side.cublas.is_null() {
@@ -603,9 +471,8 @@ impl Drop for Context {
                 if !self.stream.is_null() {
                     let _ = cudarc::runtime::sys::cudaStreamDestroy(self.stream.cast());
                 }
-                // The notify stream last: a teardown that destroyed it first
-                // would be destroying the stream a still-queued settlement
-                // callback is holding.
+                // notify stream destroyed last: a queued settlement callback
+                // may still hold it.
                 if !self.notify.is_null() {
                     let _ = cudarc::runtime::sys::cudaStreamDestroy(self.notify.cast());
                 }
@@ -616,17 +483,14 @@ impl Drop for Context {
 
 /// The C entry point [`Context::host_fn`] hands the driver.
 ///
-/// Reclaims the payload, runs it, and swallows a panic rather than unwinding
-/// into the CUDA driver — where unwinding is undefined behaviour. A panicking
-/// settlement is a bug that shows up as a step nobody completed, which the
-/// runtime's own hang backstop names; a panicking settlement that unwound into
-/// libcuda is a process that dies without saying anything.
-#[cfg(feature = "_cuda")]
+/// Reclaims the payload, runs it, and catches a panic rather than unwinding
+/// into the CUDA driver, where unwinding is undefined behaviour.
+#[cfg(feature = "cuda")]
 extern "C" fn host_fn_trampoline(user: *mut c_void) {
     if user.is_null() {
         return;
     }
-    // SAFETY: `user` is the pointer `host_fn` leaked and the driver calls this
+    // SAFETY: user is the pointer host_fn leaked; the driver calls this
     // exactly once per successful launch, so this reclaims it exactly once.
     let work = unsafe { Box::from_raw(user.cast::<Box<dyn FnOnce() + Send + 'static>>()) };
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || work()));
@@ -641,20 +505,18 @@ impl std::fmt::Debug for Context {
     }
 }
 
-/// This device's compute capability, or `(0, 0)` when it cannot be read.
-///
-/// `(0, 0)` rather than a guess: it becomes `sm_00`, which NVRTC refuses by
-/// name, and a refusal naming the architecture is recoverable in a way that a
-/// cubin built for the wrong part is not.
+/// This device's compute capability, or `(0, 0)` if it cannot be read —
+/// which becomes `sm_00` and is refused by NVRTC by name, rather than
+/// silently building for the wrong part.
 fn capability(ordinal: i32) -> (i32, i32) {
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     {
         use cudarc::runtime::sys as rt;
 
         let attribute = |which: rt::cudaDeviceAttr| -> i32 {
             let mut value = 0i32;
-            // SAFETY: `value` is a live out-parameter and `ordinal` was
-            // accepted by `cudaSetDevice` immediately above the caller.
+            // SAFETY: value is a live out-parameter; ordinal was just
+            // accepted by cudaSetDevice above.
             let status = unsafe { rt::cudaDeviceGetAttribute(&raw mut value, which, ordinal) };
             if status == rt::cudaError::cudaSuccess {
                 value
@@ -667,33 +529,25 @@ fn capability(ordinal: i32) -> (i32, i32) {
             attribute(rt::cudaDeviceAttr::cudaDevAttrComputeCapabilityMinor),
         )
     }
-    #[cfg(not(feature = "_cuda"))]
+    #[cfg(not(feature = "cuda"))]
     {
         let _ = ordinal;
         (0, 0)
     }
 }
 
-/// **WHICH DEVICE IS THIS THREAD ON?** `cudaGetDevice`, and nothing else.
-///
-/// The question a thread asks before it hands its ordinal to ANOTHER thread.
-/// `cudaSetDevice` is per-thread state and does not travel with a spawn
-/// ([`Context::bind_thread`] is that lesson learned once already), so a worker
-/// that will allocate or copy on this shell's device has to be told which one
-/// that is — and the only agent that knows is the bound thread doing the
-/// spawning. It reads the runtime rather than a `Context` field because the
-/// callers that need it hold neither: `weights::resident` runs below the shell
-/// and the tier knows nothing about contexts.
+/// Which device this thread is on (`cudaGetDevice`). Reads the runtime
+/// rather than a `Context` field because some callers hold neither.
 ///
 /// # Errors
 ///
 /// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`] when
 /// the runtime has no current device to name.
 pub fn current() -> Result<i32> {
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     {
         let mut ordinal = 0i32;
-        // SAFETY: `ordinal` is a live out-parameter.
+        // SAFETY: ordinal is a live out-parameter.
         unsafe {
             check(
                 "cudaGetDevice",
@@ -702,27 +556,21 @@ pub fn current() -> Result<i32> {
         }
         Ok(ordinal)
     }
-    #[cfg(not(feature = "_cuda"))]
+    #[cfg(not(feature = "cuda"))]
     {
         Err(Fault::Runtimeless)
     }
 }
 
-/// **BIND THE CALLING THREAD TO `ordinal`** — [`Context::bind_thread`]'s body,
-/// for a thread that carries an ordinal instead of a context.
-///
-/// The pair to [`current`], and the reason that one exists: a spawned worker
-/// takes the number across and calls this first, before it allocates a byte or
-/// enqueues a copy. `Context::bind_thread` is this function with the ordinal
-/// the context already holds — the doctrine and the argument for it are stated
-/// there.
+/// Binds the calling thread to `ordinal` — [`Context::bind_thread`]'s body,
+/// for a thread that carries a plain ordinal instead of a context.
 ///
 /// # Errors
 ///
 /// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`] when
 /// the runtime refuses the ordinal.
 pub fn bind_thread(ordinal: i32) -> Result<()> {
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     {
         // SAFETY: an ordinal the runtime itself answered with.
         unsafe {
@@ -732,21 +580,21 @@ pub fn bind_thread(ordinal: i32) -> Result<()> {
             )
         }
     }
-    #[cfg(not(feature = "_cuda"))]
+    #[cfg(not(feature = "cuda"))]
     {
         let _ = ordinal;
         Err(Fault::Runtimeless)
     }
 }
 
-/// **Wait for one stream**, for the callers that hold a raw handle rather than
-/// a [`Context`] — `record`'s last-resort seat stall.
+/// Waits for one stream, for callers holding a raw handle rather than a
+/// [`Context`] — `record`'s last-resort seat stall.
 ///
 /// # Errors
 ///
 /// [`Fault::Runtimeless`] or [`Fault::Device`].
 pub fn sync(stream: *mut c_void) -> Result<()> {
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     {
         // SAFETY: the handle is the caller's, live for the call.
         unsafe {
@@ -756,7 +604,7 @@ pub fn sync(stream: *mut c_void) -> Result<()> {
             )
         }
     }
-    #[cfg(not(feature = "_cuda"))]
+    #[cfg(not(feature = "cuda"))]
     {
         let _ = stream;
         Err(Fault::Runtimeless)
@@ -764,7 +612,7 @@ pub fn sync(stream: *mut c_void) -> Result<()> {
 }
 
 /// One runtime status, as a shell fault.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 pub(crate) fn check(
     call: &'static str,
     status: cudarc::runtime::sys::cudaError,

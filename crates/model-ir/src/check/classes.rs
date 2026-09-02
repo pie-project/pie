@@ -1,41 +1,13 @@
-//! The class sweep and the backward demand walk (palo design §1). One
-//! utility, two callers: the model test suite, where it is authoring-time
-//! feedback, and the compiler's P0+P1, where it is the accept pass and the
-//! class table at once — the check IS the sweep, so neither side pays for the
-//! other (decision #7).
-//!
-//! WHAT IT ANSWERS: for every behavior a plan can exhibit, which nodes run,
-//! and which arm of each `Def::Merge` writes the rows. A merge whose arms
-//! leave a hole is the bug that presents as "nondeterministic garbage tokens
-//! under specific batch mixes"; two arms holding at once is two writers of one
-//! row range, and which one lands is a race. Both are one sentence here.
-//!
-//! WHY BACKWARD, NOT FORWARD. A forward rule — "a merge's arms must cover
-//! every word" — refuses legal nesting: an inner merge that covers only the
-//! `masked` world is fine precisely because in the `¬masked` classes the outer
-//! merge never asks it for anything. A merge arm is a CONDITIONAL read and an
-//! op input an unconditional one, so the only pass that can tell the two apart
-//! is one that starts from what a class must produce and walks back to what
-//! that needs (decision #6).
-//!
-//! WHAT A CLASS IS DEMANDED FOR — the roots of the walk:
-//!
-//! - cache writes: the kv/state appends and the fused write op, which exist
-//!   for their effect and hand nothing back that a later node reads;
-//! - `Trace::seams`: a value that materializes outside the graph (design §9),
-//!   and — the discovery that settled the third root — THE PLAN'S OUTPUT IS
-//!   ONE OF THESE. The IR has no `Trace::outputs` field, and the trace does not
-//!   need one: `model_dsl::trace_hybrid` ends with
-//!   `rec.seam(seam::OUT.name, &[&logits])`, so the value a `forward` returns
-//!   is recorded as the `"out"` seam row. Rooting every seam value roots the
-//!   output with it, and a model that exports a second value gets the same
-//!   treatment without this file learning a new name.
-//!
-//! Collectives are NOT rooted here, deliberately. "A collective is never
-//! elided" (decision #5) is a LOWERING rule — the compiler's P3 keeps every
-//! Collective-family node always-launch so the NCCL rendezvous still pairs by
-//! call order — and stating it twice would mean a `dead` report that quietly
-//! disagreed with itself about what demand means.
+//! The class sweep and the backward demand walk: for every behavior a plan
+//! can exhibit, which nodes run and which arm of each `Def::Merge` writes the
+//! rows. Walking backward (from what a class must produce) rather than
+//! forward (requiring every merge to cover every word) is what lets legal
+//! nesting through — an inner merge covering only the `masked` world is fine
+//! when the outer merge never asks it for anything outside that world. The
+//! walk roots on cache writes and `Trace::seams` (which is how the plan's
+//! output is reached — there is no separate `Trace::outputs`). Collectives
+//! are deliberately not rooted here: never-elide is a lowering rule, not a
+//! demand fact.
 
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -76,18 +48,10 @@ pub struct ClassSet {
 }
 
 impl ClassSet {
-    /// The set of exactly these class indices, in any order.
-    ///
-    /// WHY A NON-COMPILER CALLER BUILDS ONE. The sweep below answers what a
-    /// plan CAN run, once, at bake — that is [`ClassTable::node_mask`], and
-    /// nobody outside this crate has any business writing it. The fire path
-    /// asks the mirror-image question every launch and gets a set of classes
-    /// back for its trouble: which classes did this batch TURN OUT to contain?
-    /// That answer is the argument `model_compiler::ClassOrder::class_order`
-    /// takes, so an engine composing a fire has to be able to say it in this
-    /// type — otherwise the one caller the seriation exists for is the one
-    /// caller that cannot knock on the door, and reaches a layer further down
-    /// for the ordering instead.
+    /// The set of exactly these class indices, in any order. A non-compiler
+    /// caller builds one to answer the fire path's mirror-image question —
+    /// which classes did this batch turn out to contain — the argument
+    /// `model_compiler::ClassOrder::class_order` takes.
     #[must_use]
     pub fn of(classes: impl IntoIterator<Item = usize>) -> ClassSet {
         let mut set = ClassSet::default();
@@ -98,16 +62,20 @@ impl ClassSet {
     }
 
     /// Add a class to the set, widening it if the class is past the end.
-    ///
     /// The companion to [`of`](ClassSet::of) for a caller that discovers its
-    /// classes one at a time — a fire walking its lanes, say — rather than
-    /// having an iterator of them in hand.
+    /// classes one at a time.
     pub fn insert(&mut self, class: usize) {
         let (w, bit) = (class / 64, class % 64);
         if self.words.len() <= w {
             self.words.resize(w + 1, 0);
         }
         self.words[w] |= 1 << bit;
+    }
+
+    /// No class in common.
+    #[must_use]
+    pub fn disjoint(&self, other: &ClassSet) -> bool {
+        !self.iter().any(|class| other.contains(class))
     }
 
     #[must_use]
@@ -138,8 +106,9 @@ impl ClassSet {
     }
 }
 
-/// What one sweep of a plan found. This is P1's whole output as well as the
-/// author's report: the compiler keeps it, the test suite throws it away.
+/// What one sweep of a plan found. This is the class sweep's whole output as
+/// well as the author's report: the compiler keeps it, the test suite throws
+/// it away.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassTable {
     /// The deduplicated behaviors, in ascending order of representative word.
@@ -156,19 +125,13 @@ pub struct ClassTable {
     /// by `ValueId`.
     pub merge_arm: Vec<Vec<Option<u8>>>,
     /// The bits the sweep ran over: `(1 << F) - 1` for the `F` this plan's
-    /// guards reach, and 0 for a plan no guard splits.
-    ///
-    /// A fire's word comes from the model's own `Classify`, which packs every
-    /// fact the model COMPUTES; the sweep enumerates only the bits some guard
-    /// READS. The two agree in every catalog text today and are not required
-    /// to: a model may state a fact it does not yet split on, and a word with
-    /// that bit set names no class here. Masking with this before
-    /// [`class_of`](ClassTable::class_of) is what keeps that from reading as "the
-    /// runtime and the shell disagree about what is loaded".
+    /// guards reach, and 0 for a plan no guard splits. A fire's word may set
+    /// bits no guard reads (a fact the model computes but doesn't split on);
+    /// masking with this before [`class_of`](ClassTable::class_of) is what
+    /// makes that not read as a shell/runtime disagreement.
     pub mask: u64,
-    /// Node indices demanded in no class at all. A report, not a fault: a plan
-    /// may legitimately compute something only a later revision will read, and
-    /// the compiler is free to drop these — but a surprise here is usually a
+    /// Node indices demanded in no class at all. A report, not a fault: the
+    /// compiler is free to drop these, but a surprise here is usually a
     /// forgotten consumer.
     pub dead: Vec<u32>,
 }
@@ -190,12 +153,9 @@ impl ClassTable {
 }
 
 /// A merge that does not resolve. Both kinds name the merge and the fact
-/// combination, which is the whole point: uncaught, these are a garbled token
-/// under one batch mix; caught, they are one line.
-///
-/// The validator next door owns the name `check::Fault` already, so this one
-/// keeps the design's spelling inside its own module and is re-exported from
-/// the crate root as `ClassFault`.
+/// combination: uncaught, these are a garbled token under one batch mix;
+/// caught, they are one line. Re-exported from the crate root as
+/// `ClassFault` (`check::Fault` is already taken next door).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
     /// No arm holds for a class that demands the merge — those rows are never
@@ -228,12 +188,9 @@ impl Fault {
         }
     }
 
-    /// The fault as a sentence with the fact word spelled at the plan's own
-    /// width. `resolve_classes` returns faults without the plan attached — a
-    /// `Fault` is small, comparable data — and `Display` therefore has only
-    /// the word, which prints `0b1` for a plan whose classes are four bits
-    /// wide and says nothing about the three bits that are off. The plan comes
-    /// back in here for exactly that: the width to pad to.
+    /// The fault as a sentence with the fact word padded to the plan's own
+    /// width (unlike `Display`, whose word has no width to pad to since
+    /// `Fault` carries no plan reference).
     #[must_use]
     pub fn say(&self, trace: &Trace) -> String {
         let width = fact_width(trace).max(1);
@@ -279,18 +236,11 @@ impl Display for Fault {
 impl std::error::Error for Fault {}
 
 /// How many fact bits this plan actually splits on: one past the highest bit
-/// any guard names, and 0 for a plan no `Guard::Fact` appears in.
-///
-/// THE PLAN NO LONGER DECLARES A VOCABULARY, AND DOES NOT NEED TO. A fact list
-/// was a second statement of what the guards already say, free to disagree
-/// with them — a name nothing splits on doubled the sweep, and a bit some
-/// guard read past the end of the list was a word the sweep never visited.
-/// Reading the width off the guards themselves makes both impossible, and
-/// costs one walk of the conds the sweep is about to intern anyway.
-///
-/// The arm guards count as much as the node guards do: an arm is what a merge
-/// resolves by, so a bit that only ever appears in one is still a bit two fact
-/// words can be told apart by.
+/// any guard names, and 0 for a plan no `Guard::Fact` appears in. Read off
+/// the guards themselves rather than a declared vocabulary, so a name nothing
+/// splits on can't double the sweep and a bit past a declared list can't go
+/// unswept. Arm guards count as much as node guards: an arm is what a merge
+/// resolves by.
 #[must_use]
 pub fn fact_width(trace: &Trace) -> usize {
     let nodes = trace.nodes.iter().map(|node| &node.guard);
@@ -311,13 +261,13 @@ pub fn fact_width(trace: &Trace) -> usize {
 }
 
 /// Sweep every fact word, deduplicate the words into classes, and resolve
-/// every demanded merge in every class. Collects ALL faults before returning:
-/// a coverage hole is usually one authoring mistake seen from several classes
-/// at once, and stopping at the first would hide the shape of it.
+/// every demanded merge in every class. Collects all faults before
+/// returning, since a coverage hole is usually one mistake seen from several
+/// classes at once.
 ///
-/// Assumes a plan that already passed [`check`](crate::check) — but refuses to
-/// panic on one that did not, since this is also the compiler's front door: an
-/// id that indexes nothing is skipped here and named there.
+/// Assumes a plan that already passed [`check`](crate::check), but refuses to
+/// panic on one that did not: an id that indexes nothing is skipped here and
+/// named there.
 ///
 /// # Panics
 ///
@@ -331,9 +281,8 @@ pub fn resolve_classes(trace: &Trace) -> Result<ClassTable, Vec<Fault>> {
     // Every guard the plan states, deduplicated by structure. Two fact words
     // belong to the same class iff every one of these answers the same for
     // both — node guards say what runs, arm guards say which arm writes, and
-    // BOTH matter. Deduplicating on the live node set alone would conflate two
-    // words that resolve a merge differently, which is possible whenever an
-    // arm is a split of a value no node guards (a runtime input, say).
+    // both matter (deduplicating on live nodes alone would conflate two words
+    // that resolve a merge differently).
     let mut guards: Vec<&Guard> = Vec::new();
     let node_guard: Vec<usize> = trace
         .nodes
@@ -426,41 +375,24 @@ pub fn resolve_classes(trace: &Trace) -> Result<ClassTable, Vec<Fault>> {
             match &decl.def {
                 // Bound before the first node: the walk ends here.
                 Def::Input(_) | Def::Weight(_) | Def::Cache(_) => {}
-                // An op input is an UNCONDITIONAL read: every input of a
+                // An op input is an unconditional read: every input of a
                 // demanded op is demanded. Aliases add nothing — an in-place
-                // pair's `in` is already among `inputs()`, which is what makes
-                // the overwrite visible to a liveness pass in the first place.
+                // pair's `in` is already among `inputs()`.
                 Def::Op(i) => {
                     let i = *i as usize;
                     // A producer the class does not run cannot be walked
-                    // through. That hole is only ever reached through a merge,
-                    // and a merge is where this pass faults.
+                    // through except via an alias (below); otherwise this
+                    // hole is only ever reached through a merge.
                     if trace.nodes.get(i).is_some_and(|n| n.guard.holds(word)) {
                         walk.demand(i, &mut node_mask);
                     } else if let Some(through) = passes_through(trace, i, id) {
-                        // **A GUARDED IN-PLACE OP IS A PASS-THROUGH IN THE
-                        // CLASSES IT SKIPS** — palo design §8's correction
-                        // class, in the one pass that had to learn it.
-                        //
-                        // `linear.lora_correct` writes THROUGH the value it
-                        // corrects: `y_out` aliases `y`, one arena column,
-                        // and a class outside the adapter window simply never
-                        // runs the node and reads what the trunk already put
-                        // there. That is the identity for free — no merge, no
-                        // arm, no φ — and it is the whole reason the axis
-                        // costs a fire with no adapter lane nothing at all.
-                        //
-                        // But a demand walk that stopped here would conclude
-                        // that NOTHING produces `y_out` in those classes, and
-                        // therefore that the trunk which produces `y` is dead
-                        // in them. So the alias is followed: the demand moves
-                        // from the overwrite to the value it would have
-                        // overwritten, which is exactly what the fire will
-                        // read.
-                        //
-                        // Stated over `Operands::aliases` rather than over an
-                        // op list, so it is a fact about the IR and not a
-                        // table somebody has to remember to add to.
+                        // A guarded in-place op is a pass-through in the
+                        // classes it skips: e.g. `linear.lora_correct` writes
+                        // through the value it corrects (`y_out` aliases `y`),
+                        // so a class outside the adapter window reads what
+                        // the trunk already put there. Without following the
+                        // alias, the walk would wrongly conclude the trunk
+                        // that produces `y` is dead in those classes.
                         walk.stack.push(through);
                     }
                 }
@@ -515,9 +447,9 @@ pub fn resolve_classes(trace: &Trace) -> Result<ClassTable, Vec<Fault>> {
     })
 }
 
-/// One class's walk: what it has already been through, and what it still owes
-/// a visit. `ins` is borrowed from the caller because every class refills it
-/// once per demanded node and none of them wants its own allocation.
+/// One class's walk: what it has already been through, and what it still
+/// owes a visit. `ins` is borrowed from the caller so no class needs its own
+/// allocation for it.
 struct Walk<'a> {
     trace: &'a Trace,
     class: usize,
@@ -543,9 +475,8 @@ impl Walk<'_> {
 }
 
 /// The index of a guard in the interned list, appending it if it is new.
-/// Structural equality is the right identity here: two spellings of one
-/// predicate are two guards, which costs a class the sweep would otherwise
-/// merge and never costs correctness.
+/// Structural equality: two spellings of one predicate are two guards, which
+/// costs a class the sweep would otherwise merge, never correctness.
 fn intern<'a>(guards: &mut Vec<&'a Guard>, cond: &'a Guard) -> usize {
     guards.iter().position(|g| *g == cond).unwrap_or_else(|| {
         guards.push(cond);
@@ -561,9 +492,8 @@ fn intern<'a>(guards: &mut Vec<&'a Guard>, cond: &'a Guard) -> usize {
 /// does not run the node, that slot holds the operand, so a reader of `id`
 /// reads `input`.
 ///
-/// `None` for every other output, and that is the standing rule this is the
-/// one exception to: a value whose producer the class does not run is a hole,
-/// and the only legal way to reach one is a merge arm.
+/// `None` for every other output: a value whose producer the class does not
+/// run is a hole, reachable only through a merge arm.
 fn passes_through(trace: &Trace, i: usize, id: ValueId) -> Option<ValueId> {
     let mut aliases = Vec::new();
     trace.nodes.get(i)?.op.aliases(&mut aliases);
@@ -574,39 +504,27 @@ fn passes_through(trace: &Trace, i: usize, id: ValueId) -> Option<ValueId> {
 }
 
 /// Does this op write a cache — is it demanded for its effect, whatever a
-/// class does with what it returns?
-///
-/// Hand-written and exhaustive, like the port table next door and the
-/// `Operands` impls it reads: a new op variant must answer this question
-/// before it compiles, because getting it wrong by default is a kv append
-/// that a class silently drops.
-///
-/// Reading a cache is not writing one. `Attention::Decode` and its kin name
-/// their pool pointer too, and rooting them would make every attention node
-/// live-and-demanded everywhere, which is exactly the "schedule the classes
-/// apart" answer this design exists to replace.
-///
-/// Only two families can touch a cache at all — the family procedure in
-/// `ops.rs` sends anything that touches a sequence cache to `Attention` (rule
-/// 1), and `CustomCuda` is where a backend's fusion of one goes — so the other
-/// four answer as families rather than variant by variant.
+/// class does with what it returns? Hand-written and exhaustive: a new op
+/// variant must answer this question before it compiles, since getting it
+/// wrong by default is a kv append a class silently drops. Reading a cache is
+/// not writing one — rooting a mere reader would make every attention node
+/// live-and-demanded everywhere. Only `Attention` and `CustomCuda` can touch
+/// a cache at all; the other families answer `false` wholesale.
 fn writes_cache(op: &Operation) -> bool {
     match op {
         Operation::Attention(op) => match op {
             // The appends: kv pages, the indexer's key cache, the pooled
-            // entries. All of them return nothing at all.
+            // entries. All return nothing at all.
             Attention::KvAppend { .. }
             | Attention::KvAppendShared { .. }
             | Attention::MlaKvAppend { .. }
             | Attention::IndexKvAppend { .. }
             | Attention::PoolKvAppend { .. }
-            // The compressor's rolling state is a slab the shell owns and no
-            // value names — written here, read by the gather two lines down —
-            // so its write is invisible in `outputs` the way the appenders'
-            // and the recurrent mixers' are.
+            // The compressor's rolling state: a shell-owned slab no value
+            // names, written here and read by the gather below.
             | Attention::PoolStateWrite { .. } => true,
-            // The recurrent mixers: their sequence cache is a state slab
-            // updated IN PLACE, so the fire's write is invisible in `outputs`.
+            // The recurrent mixers: sequence cache updated in place, so the
+            // write is invisible in `outputs`.
             Attention::SsmCausalConv1d { .. }
             | Attention::SsmCausalConv1dChunked { .. }
             | Attention::SsmGatedDelta { .. }
@@ -616,17 +534,13 @@ fn writes_cache(op: &Operation) -> bool {
             // The n-gram hasher's window of token ids is a state slab too.
             | Attention::PleNgramIds { .. }
             | Attention::PleNgramIdsChunked { .. } => true,
-            // Everything else reads: the plan builders, the attention kernels
-            // and their epilogues, the MLA projections, the indexer's scoring,
-            // the pool's boundary math and gather.
+            // Everything else reads.
             Attention::PlanDecode { .. }
             | Attention::PlanPrefill { .. }
             | Attention::Decode { .. }
             | Attention::Prefill { .. }
             | Attention::Masked { .. }
-            // The tower's attention touches no sequence cache at all — no kv
-            // pool, no page table, no append. It is an `Attention` by rule 1's
-            // first clause (tokens interact) and by nothing else.
+            // The tower's attention touches no sequence cache at all.
             | Attention::Dense { .. }
             | Attention::DecodeLse { .. }
             | Attention::PrefillLse { .. }
@@ -653,8 +567,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::PoolLse { .. }
             | Attention::PoolLseSelected { .. } => false,
         },
-        // The one fused variant says so in its name: it lands k and v in the
-        // pages on its way to returning q.
+        // Lands k and v in the pages on its way to returning q.
         Operation::CustomCuda(op) => match op {
             CustomCuda::QkvFusedQknormRopeVnormWrite { .. } => true,
         },
@@ -671,10 +584,8 @@ mod tests {
     use crate::ops::{Attention, Elementwise};
     use crate::{Dim, Dtype, Node, RuntimeInput, Ty, ValueDecl};
 
-    /// A plan built by hand, one statement per line. `model-dsl` is the
-    /// authoring surface and cannot be reached from here — it depends on this
-    /// crate — so these tests say in `Def` and `Guard` what a forward pass says
-    /// in `split` and `Value::merge`.
+    // A plan built by hand: these tests say in `Def`/`Guard` what a forward
+    // pass says in `split`/`Value::merge` (model-dsl can't be reached here).
     struct Build {
         trace: Trace,
         inputs: u32,
@@ -716,7 +627,7 @@ mod tests {
             ValueId((self.trace.values.len() - 1) as u32)
         }
 
-        /// A demand sink: something the engine binds, distinct per call.
+        // A demand sink: something the engine binds, distinct per call.
         fn input(&mut self) -> ValueId {
             self.inputs += 1;
             let which = RuntimeInput::Mask {
@@ -729,7 +640,7 @@ mod tests {
             self.value(Def::Cache(0))
         }
 
-        /// One guarded op over `x`, handing back its output.
+        // One guarded op over `x`, handing back its output.
         fn op(&mut self, x: ValueId, guard: Guard) -> ValueId {
             let node = self.trace.nodes.len() as u32;
             let y = self.value(Def::Op(node));
@@ -746,7 +657,7 @@ mod tests {
             y
         }
 
-        /// A cache write: an effect root, and it returns nothing.
+        // A cache write: an effect root, and it returns nothing.
         fn append(&mut self, x: ValueId, guard: Guard) -> usize {
             let cache = self.cache();
             let page = self.input();
@@ -769,8 +680,7 @@ mod tests {
             self.value(Def::Merge(arms.to_vec()))
         }
 
-        /// The `"out"` seam — what a trace writes the forward's return value
-        /// as, and therefore what roots the walk.
+        // The "out" seam: what roots the walk.
         fn out(&mut self, v: ValueId) -> &mut Build {
             self.trace.seams.push(crate::Seam {
                 seam: "out".to_string(),
@@ -787,9 +697,7 @@ mod tests {
 
     #[test]
     fn a_split_and_its_merge_resolve_to_one_arm_per_class() {
-        // The decode/prefill shape every shipped model has:
-        //   let (dq, p) = q.split(&Facts::qo_one());
-        //   let o = Value::merge(vec![decode(&dq), prefill(&p)]);
+        // The decode/prefill shape every shipped model has.
         let mut b = Build::new();
         let q = b.input();
         let d = b.op(q, fact(0));
@@ -801,8 +709,7 @@ mod tests {
         assert_eq!(classes.classes.len(), 2);
         assert_eq!(classes.classes[0].words, vec![0]);
         assert_eq!(classes.classes[1].words, vec![1]);
-        // Class 0 is the ¬qo_one world: the prefill arm writes, and only the
-        // prefill node runs.
+        // Class 0 is ¬qo_one: the prefill arm writes, only prefill runs.
         assert_eq!(classes.arms_of(o), Some([Some(1), Some(0)].as_slice()));
         assert!(classes.node_mask[0].contains(1) && !classes.node_mask[0].contains(0));
         assert!(classes.node_mask[1].contains(0) && !classes.node_mask[1].contains(1));
@@ -811,9 +718,7 @@ mod tests {
 
     #[test]
     fn a_gap_in_the_arms_is_uncovered_and_names_the_word() {
-        // masked is bit 1, and the second arm forgot the ¬qo_one ∧ ¬masked
-        // world entirely. Both bits are guarded on, so the word `say` spells
-        // is two wide.
+        // masked is bit 1; the second arm forgot the ¬qo_one ∧ ¬masked world.
         let mut b = Build::new();
         let q = b.input();
         let d = b.op(q, fact(0));
@@ -832,8 +737,7 @@ mod tests {
 
     #[test]
     fn two_arms_holding_at_once_are_ambiguous() {
-        // An `Always` arm beside a guarded one: in the qo_one world both write
-        // the same rows.
+        // An `Always` arm beside a guarded one: in qo_one both write.
         let mut b = Build::new();
         let q = b.input();
         let a = b.op(q, Guard::Always);
@@ -853,82 +757,6 @@ mod tests {
     }
 
     #[test]
-    fn an_inner_merge_covering_only_masked_is_legal() {
-        // design §1, verbatim:
-        //   let (m, um) = x.split(&Facts::masked());
-        //   let (md, mp) = m.split(&Facts::qo_one());
-        //   let o_m = Value::merge(vec![attn_md(&md), attn_mp(&mp)]);  // masked only
-        //   let o   = Value::merge(vec![o_m, attn_plain(&um)]);        // everything
-        // The inner merge has NO arm in the ¬masked classes, and that is fine
-        // because the outer merge never asks it there. A forward coverage rule
-        // would refuse this plan; the backward walk accepts it.
-        let masked = fact(0);
-        let qo_one = fact(1);
-        let mut b = Build::new();
-        let x = b.input();
-        let md = Guard::and(masked.clone(), qo_one.clone());
-        let mp = Guard::and(masked.clone(), Guard::not(qo_one));
-        let attn_md = b.op(x, md.clone());
-        let attn_mp = b.op(x, mp.clone());
-        let inner = b.merge(&[(attn_md, md), (attn_mp, mp)]);
-        let plain = b.op(x, Guard::not(masked.clone()));
-        let outer = b.merge(&[(inner, masked.clone()), (plain, Guard::not(masked))]);
-        b.out(outer);
-
-        let classes = b.resolve().expect("legal nesting resolves");
-        // Three behaviors, not four: with masked off, qo_one changes nothing
-        // — no guard in the plan can tell those two words apart.
-        assert_eq!(classes.classes.len(), 3);
-        let plain_class = classes.class_of(0b10).expect("qo_one ∧ ¬masked");
-        assert_eq!(classes.class_of(0b00), Some(plain_class));
-        assert_eq!(classes.arms_of(inner).unwrap()[plain_class], None);
-        assert_eq!(classes.arms_of(outer).unwrap()[plain_class], Some(1));
-        // …and in the masked ∧ qo_one world both merges resolve.
-        let inner_class = classes.class_of(0b11).expect("masked ∧ qo_one");
-        assert_eq!(classes.arms_of(inner).unwrap()[inner_class], Some(0));
-        assert_eq!(classes.arms_of(outer).unwrap()[inner_class], Some(0));
-        assert!(classes.dead.is_empty());
-    }
-
-    #[test]
-    fn a_merge_no_class_demands_may_have_a_gap() {
-        // Both arms of `inner` are guarded by qo_one, so the ¬qo_one classes
-        // have nothing to pick — and never ask, because the only consumer of
-        // `inner` is a node those classes do not run. The gap is legal exactly
-        // as long as nothing demands it, which is the same rule the nested
-        // case above passes under, stated with one merge instead of two.
-        let qo_one = fact(0);
-        let masked = fact(1);
-        let mut b = Build::new();
-        let q = b.input();
-        let hot = Guard::and(qo_one.clone(), masked.clone());
-        let cold = Guard::and(qo_one.clone(), Guard::not(masked));
-        let one = b.op(q, hot.clone());
-        let two = b.op(q, cold.clone());
-        let inner = b.merge(&[(one, hot), (two, cold)]);
-        let used = b.op(inner, qo_one.clone());
-        let rest = b.op(q, Guard::not(qo_one.clone()));
-        let o = b.merge(&[(used, qo_one.clone()), (rest, Guard::not(qo_one))]);
-        b.out(o);
-
-        let classes = b.resolve().expect("an undemanded gap is not a fault");
-        let off = classes.class_of(0b00).expect("¬qo_one");
-        assert_eq!(
-            classes.class_of(0b10),
-            Some(off),
-            "masked alone runs nothing new",
-        );
-        assert_eq!(classes.arms_of(inner).unwrap()[off], None);
-        assert_eq!(classes.arms_of(o).unwrap()[off], Some(1));
-        // …and inside qo_one the same merge resolves, one arm per class.
-        let hot = classes.class_of(0b11).expect("qo_one ∧ masked");
-        let cold = classes.class_of(0b01).expect("qo_one ∧ ¬masked");
-        assert_eq!(classes.arms_of(inner).unwrap()[hot], Some(0));
-        assert_eq!(classes.arms_of(inner).unwrap()[cold], Some(1));
-        assert!(classes.dead.is_empty());
-    }
-
-    #[test]
     fn a_cache_write_is_its_own_root_and_an_unread_op_is_dead() {
         let mut b = Build::new();
         let q = b.input();
@@ -940,8 +768,7 @@ mod tests {
         let classes = b.resolve().expect("no merges, no faults");
         assert_eq!(classes.classes.len(), 1, "nothing here is guarded");
         assert_eq!(classes.mask, 0, "and so the sweep is over no bits at all");
-        // The append is demanded for its effect, and drags its input in with
-        // it — nothing downstream reads either one.
+        // The append is demanded for its effect and drags its input with it.
         assert!(classes.node_mask[append].contains(0));
         assert!(classes.node_mask[0].contains(0));
         assert_eq!(classes.dead, vec![2]);

@@ -4,32 +4,14 @@
 use super::*;
 use crate::forward::Input;
 
-/// Builds the decode plan off `inputs`' geometry and the reading it is carved
-/// for — once per (reading × class) at the top of `forward`, shared visibly by
-/// every layer's `decode` (§6).
+/// Builds the decode plan off `inputs`' geometry and reading, once per
+/// (reading × class) at the top of `forward`, shared by every layer's decode.
 ///
-/// **A SCHEDULE IS A CARVING FOR ONE CLASS, AND ITS GUARD IS THE ARM IT WAS
-/// BUILT OFF.** The four geometry vectors come off `inputs`, so they carry
-/// whatever class that arm carries, and `Recorder::push` meets their conds
-/// into the plan node's guard. Build it off `inputs` whole and it is the
-/// whole fire's; build it off `inputs.split(..)`'s decode arm and it is the
-/// decode class's, and a query from another arm that reaches for it is
-/// refused by `push` at the line that mixed them. The old
-/// `(r: &Recorder, space: u32)` shape could not say any of that: every plan
-/// was unguarded, and which class it belonged to had to be inferred backwards
-/// from who read it (`model/tests/no_schedule_straddles_its_readers.rs`).
-/// Now the text says it.
-///
-/// **AND IT IS CARVED FOR ONE READING**, which `q_heads`, `kv_heads`,
-/// `head_dim` and `window` state outright — the shell no longer probes it off
-/// the launches that consume the plan. There is no interning and no dedup:
-/// the text builds one plan per (reading × class) at the top of `forward` and
-/// every layer READS it, and that hoisting IS the statement of reuse — two
-/// layers share a schedule because the text says so, not because a cache
-/// noticed their numbers matched. So the numbers stated here are facts about
-/// the MODEL, held once on `Model` rather than on each layer's attention
-/// struct; a family whose layers read at two readings names those readings and
-/// hoists one plan for each.
+/// The plan is guarded by the arm it was built off (`Recorder::push` meets
+/// that arm's conds into the plan node's guard), so a query from another arm
+/// is refused. There is no interning or dedup: sharing a plan across layers
+/// is a fact the text states by hoisting it once, not something a cache
+/// inferred from matching numbers.
 pub fn plan_decode<F>(
     inputs: &Input<F>,
     q_heads: u32,
@@ -324,9 +306,7 @@ pub fn ssm_causal_conv1d(x: &Value, weight: &Weight, state: ValueId, conv_width:
     ssm_causal_conv1d_dilated(x, weight, state, conv_width, 1)
 }
 
-/// The dilated form: tap `j` reads `dilation · j` positions back (qwen4's
-/// PLE convolution, `dilation = ngram_size`). The undilated spelling above
-/// stays because a dilation of one is what the bare name means.
+/// Dilated form: tap `j` reads `dilation · j` positions back.
 pub fn ssm_causal_conv1d_dilated(
     x: &Value,
     weight: &Weight,
@@ -382,11 +362,8 @@ pub fn ssm_causal_conv1d_chunked_dilated(
     y
 }
 
-/// The PLE n-gram hasher ([`Attention::PleNgramIds`]): every token's hashed
-/// n-gram table rows, one column per head. `state` is the lane's window of
-/// trailing token ids; `mults`, `primes` and `offsets` are the seed-derived
-/// hash constants the text computes — no checkpoint plane is read to know
-/// them. The answer is `[rows, primes.len()]` `i32`.
+/// PLE n-gram hasher: `state` is the lane's trailing-token-id window; `mults`,
+/// `primes`, `offsets` are seed-derived hash constants. Answer is `[rows, primes.len()]` `i32`.
 pub fn ple_ngram_ids(
     ids: &Value,
     state: ValueId,
@@ -582,16 +559,9 @@ pub fn ssm_kda_chunked(
     y
 }
 
-/// Builds the one MLA plan — one shape serving both decode and prefill — off
-/// `inputs`' geometry and its reading. Like [`plan_decode`], the plan's guard
-/// is the arm it was built off, so an MLA text that wants one per class calls
-/// this once per arm.
-///
-/// `heads` and `kv_lora_rank` are the absorbed reading: the latent launches
-/// size their output at `heads × kv_lora_rank`, and each of them restates that
-/// pair. Same discipline as [`plan_decode`] — no interning, one hoisted plan
-/// per (reading × class) that every layer reads, so the pair is a fact about
-/// the `Model` and lives there once.
+/// Builds the one MLA plan (serves both decode and prefill) off `inputs`'
+/// geometry and reading. Guard and hoisting discipline as [`plan_decode`];
+/// `heads` and `kv_lora_rank` are the absorbed reading the latent launches size against.
 pub fn mla_plan<F>(inputs: &Input<F>, heads: u32, kv_lora_rank: u32) -> Value {
     let kv_indptr = inputs.kv_indptr();
     let kv_indices = inputs.kv_indices();
@@ -722,10 +692,7 @@ pub fn mla_absorb_q(
     q_latent
 }
 
-/// The trailing pair reads `nope_dim, v_head_dim`, the same order
-/// [`mla_absorb_q`] takes it in: the two calls sit a dozen lines apart in every
-/// MLA text, take the same four numbers, and used to take the last two the
-/// other way round — which no call site can see and no type can catch.
+/// Trailing pair is `nope_dim, v_head_dim`, same order as [`mla_absorb_q`].
 pub fn mla_absorb_out(
     latent: &Value,
     kv_b: &Weight,
@@ -940,11 +907,9 @@ pub fn index_rope(
     q_out
 }
 
-/// `ratio` is which cached rows are keys: `1` for a per-token key cache
-/// (glm_5's `k_proj` indexer), the compressor's own ratio for a per-block one
-/// (dsv4-flash's, whose keys are its compressor's pooled entries stored at
-/// the boundary cell). The published ids are positions at `ratio == 1` and
-/// COMPRESSED ROW indices otherwise.
+/// `ratio` is which cached rows are keys: `1` for a per-token key cache, the
+/// compressor's own ratio for a per-block one. Published ids are positions at
+/// `ratio == 1`, compressed-row indices otherwise.
 #[allow(clippy::too_many_arguments)]
 pub fn index_topk(
     q: &Value,
@@ -987,11 +952,8 @@ pub fn index_kv_append(k: &Value, keys: ValueId, write_page: &Value, write_offse
 }
 
 /// `row_valid` masks graph-padding rows out of the boundary math.
-///
-/// Returns `(boundary_pos, boundary_req, boundary_rope)` — the CELL the
-/// pooled entry is cached at, its lane, and the COMPRESSED ROW'S POSITION the
-/// entry is roped at. The last is not the first: see
-/// [`model_ir::ops::Attention::PoolBoundaryDecode`].
+/// Returns `(boundary_pos, boundary_req, boundary_rope)`: the cache cell,
+/// its lane, and the compressed row's roped position (not the same as the cell).
 pub fn pool_boundary_decode(
     positions: &Value,
     row_valid: &Value,
@@ -1041,9 +1003,8 @@ pub fn pool_boundary_prefill(
     (boundary_pos, boundary_req, boundary_rope)
 }
 
-/// `dtype` is the pooled entries' element type — the wrapper has no data
-/// input to inherit it from, so the model states its activation dtype
-/// here, from its own declaration (`m.act`): no implicit engine state.
+/// `dtype` is the pooled entries' element type; stated explicitly since the
+/// wrapper has no data input to infer it from.
 pub fn pool_gather(
     boundary_pos: &Value,
     boundary_req: &Value,
@@ -1070,11 +1031,9 @@ pub fn pool_gather(
     entries
 }
 
-/// **THE COMPRESSOR'S ROLLING STATE, WRITTEN AT THE SOURCE CACHE'S OWN
-/// SLOT.** `kv` is `wkv · x` and `score` is `wgate · x`, both
-/// `[tokens, coff · head_dim]`; [`pool_gather`] reads them back at
-/// `write_page`/`write_offset`'s cell, because a pooling window closing in
-/// this fire straddles tokens earlier fires wrote.
+/// Compressor's rolling state, written at the source cache's own slot.
+/// `kv` is `wkv · x`, `score` is `wgate · x`, both `[tokens, coff · head_dim]`;
+/// [`pool_gather`] reads them back at `write_page`/`write_offset`'s cell.
 pub fn pool_state_write(
     kv: &Value,
     score: &Value,
@@ -1159,9 +1118,8 @@ pub fn pool_lse(
     (o, lse)
 }
 
-/// [`pool_lse`] over the `selection` [`index_topk`] published — the NSA fine
-/// branch. `top_k` is the selection's own width, restated so the reader knows
-/// how many ids a row carries.
+/// [`pool_lse`] over the `selection` [`index_topk`] published (NSA fine branch).
+/// `top_k` is the selection's own width.
 #[allow(clippy::too_many_arguments)]
 pub fn pool_lse_selected(
     q: &Value,
@@ -1198,14 +1156,9 @@ pub fn pool_lse_selected(
     (o, lse)
 }
 
-/// **BIDIRECTIONAL ATTENTION OVER THE PATCH WINDOW** — the vision towers' one
-/// real kernel (multimodal §2), block-diagonal per image.
-///
-/// `segments` is the patch axis's own indptr
-/// ([`Input::patch_segments`](crate::Input::patch_segments)): patch row `n`
-/// attends over the rows of the image whose span contains it, both ways, and
-/// over nothing else. No cache, no plan, no mask — everything this op needs is
-/// four tensors and two numbers.
+/// Bidirectional attention over the patch window, block-diagonal per image.
+/// `segments` is the patch axis's indptr: patch row `n` attends over the rows
+/// of the image whose span contains it, both ways, and nothing else.
 pub fn dense(
     q: &Value,
     k: &Value,

@@ -1,5 +1,4 @@
-//! What glm rows read from their vocabulary — the stop list
-//! `template::instruct` interrupts on, spelled once and cited from both.
+//! GLM tokenizer contract and stop tokens.
 
 use ::tokenizer::contract::Contract;
 

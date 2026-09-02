@@ -1,8 +1,7 @@
 //! pie:inferlet/system - runtime information (version, instance-id, username).
 //!
-//! Timing moved to the standard `wasi:clocks/monotonic-clock@0.3` import in
-//! Phase 3 (native async `wait-for`), so the host timer that backed the old
-//! `system.sleep` is gone.
+//! Timing is the standard `wasi:clocks/monotonic-clock@0.3` import, not a
+//! host timer of this module's own.
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;

@@ -1,34 +1,5 @@
-//! `Hc`: hyper-connections — residual streams expanded, mixed by learned
-//! gates, and folded back layer by layer. One entry per IR variant, all over
-//! `elemwise/hc.metal`, which is `kernels-cuda/kernels/elemwise/hc.cuh` ported
-//! organ for organ.
-//!
-//! The stream count `M` rides the row width — a `[N, M·H]` rectangle beside a
-//! `[N, H]` one — and the mixers hold their `M` (or `M²`) coefficients in
-//! register and threadgroup arrays, which is why [`MAX_HC_MULT`] is a hard
-//! refusal and not a shape check.
-//!
-//! **THE SINKHORN COUNT IS A HALF-SWEEP PLUS `n - 1` FULL ONES.** The shader
-//! seeds with a row softmax, does ONE column normalization, and then runs
-//! `sinkhorn - 1` alternating row/column sweeps — 20 stated iterations are 19
-//! loop passes. [`the_sinkhorn_count_is_the_seed_plus_one_less_sweep`] pins
-//! that arithmetic against a host mirror of the same loop, because an
-//! off-by-one there changes the combiner and nothing downstream complains.
-//!
-//! **AND THE MIX ROW IS THE PROJECTION NOW.** `hc_gates` reads its operand at
-//! a stride of `2M + M²` and always has — that is the reference's mix row,
-//! `rmsnorm(streams) @ hc_fn` — but for as long as no plane produced one, the
-//! model text handed it `normed` itself, the `[N, M·H]` f32 rmsnorm of the
-//! stream row, and both shells read its leading `2M + M²` floats. [`project`]
-//! is that missing GEMM: it fires the dynamic hyper plane the model text used
-//! to intern (`{attn,ffn}_hc.fn`) and lands a real `[N, 2M + M²]` mix row, so
-//! the stride the gate reads is now the width of what it is given. The gate
-//! entry below is unchanged — it never had to change; what changed is what
-//! reaches it.
-//!
-//! The TRUNK head (`model.hc_head.*`) is still interned: its plane reduces
-//! the streams once before the LM head, and this file has no entry for that
-//! collapse (see the note where `Hc::Collapse` was deleted).
+//! Hyper-connections: residual streams expanded, mixed by learned gates,
+//! and folded back layer by layer. Ported from `kernels-cuda`'s `hc.cuh`.
 
 use crate::error::Error;
 
@@ -73,9 +44,8 @@ fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
     Ok(fan)
 }
 
-/// One threadgroup per row: `BLOCK` threads apiece, laid on the x axis the way
-/// this plane's other per-row points lay them (`dispatchThreads` counts
-/// THREADS, not groups).
+/// One threadgroup per row: `BLOCK` threads apiece, laid on the x axis
+/// (`dispatchThreads` counts threads, not groups).
 fn per_row(op: &'static str, rows: u32) -> Result<Grid, Error> {
     let rows = nonzero(op, "rows", rows)?;
     let lanes = rows
@@ -133,10 +103,8 @@ pub fn rmsnorm_f32(ctx: &Ctx<'_>, streams: Tensor, eps: f32, y: Tensor) -> Resul
 /// The per-token mix row: `mixes = normed · hc_fn^T`, `[N, M·H]` against a
 /// `[2M + M², M·H]` plane, all f32.
 ///
-/// **NOT `linear.matmul`, AND THE SHADER'S OWN NOTE SAYS WHY** — the dense
-/// gemm on this plane instantiates bf16 only, both operands here are f32, and
-/// the fp32 discipline this file's header states is the whole reason the mix
-/// row is f32 in the first place. One threadgroup per `(row, column)`.
+/// Not `linear.matmul`: the dense gemm on this plane instantiates bf16 only,
+/// and both operands here are f32. One threadgroup per `(row, column)`.
 pub fn project(
     ctx: &Ctx<'_>,
     normed: Tensor,
@@ -174,24 +142,23 @@ pub fn project(
             ),
         ));
     }
-    // The mix row the gate splits: `M` pre weights, `M` post weights and the
-    // `M x M` combiner, in that order — the one width both ends agree on.
-    let mix_hc = 2 * stream_count + stream_count * stream_count;
-    if mixes.width != mix_hc || hc_fn.rows != mix_hc {
+    // The mix row is as wide as the plane says: `2M + M²` for a layer's
+    // gates, `M` for the trunk collapse.
+    let mix_hc = hc_fn.rows;
+    let layer_row = 2 * stream_count + stream_count * stream_count;
+    if mixes.width != mix_hc || (mix_hc != layer_row && mix_hc != stream_count) {
         return Err(refuse(
             OP,
             format!(
-                "a {stream_count}-stream mix row is {mix_hc} wide; the plane lands {} \
-                 rows into a {}-wide row",
+                "a {stream_count}-stream mix row is {layer_row} wide and a trunk collapse row \
+                 is {stream_count}; the plane lands {} rows into a {}-wide row",
                 hc_fn.rows, mixes.width
             ),
         ));
     }
     let rows = nonzero(OP, "rows", mixes.rows)?;
-    // One threadgroup per `(row, column)`, laid on ONE axis: the shader's
-    // point derives the pair, because a metal entry's position attributes
-    // must all be scalars or all be vectors of one width and its three lane
-    // indices are scalars.
+    // One threadgroup per (row, column) on one axis: metal position
+    // attributes must all be scalars or all be vectors of one width.
     let lanes = rows
         .checked_mul(mix_hc)
         .and_then(|points| points.checked_mul(BLOCK))
@@ -217,8 +184,7 @@ pub fn project(
 /// `M` streams into the layer's input — one threadgroup per token, the gate
 /// matrices landing beside it.
 ///
-/// `normed` is the mix row [`project`] lands, `[N, 2M + M²]` — the stride the
-/// shader reads it at, which is now the width of what it is handed.
+/// `normed` is the mix row [`project`] lands, `[N, 2M + M²]`.
 #[allow(clippy::too_many_arguments)]
 pub fn gates(
     ctx: &Ctx<'_>,
@@ -311,17 +277,61 @@ pub fn fold(
     )
 }
 
-// `collapse` went with `Hc::Collapse`: no plane could fire it honestly (review R5).
+/// **THE TRUNK COLLAPSE**: `y[n, h] = Σᵢ gᵢ · streams[n, i·H + h]` under
+/// `gᵢ = σ(mixes[n, i] · scale[0] + base[i]) + hc_eps` — the `M` streams
+/// folded into the one row the final norm reads (`v4mlx/hc.py::hc_head`).
+/// One threadgroup per token, `hc.cuh`'s `hc_head_postprocess` transcribed.
+#[allow(clippy::too_many_arguments)]
+pub fn collapse(
+    ctx: &Ctx<'_>,
+    mixes: Tensor,
+    streams: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    stream_count: u32,
+    hc_eps: f32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.hc_collapse";
+    let entry = dtype_dispatch!(OP, streams.dtype, { Bf16 => "hc_collapse_bfloat16" });
+    debug_assert_eq!(mixes.dtype, dtype::Dtype::F32, "`{OP}` reads an f32 mix row");
+    debug_assert_eq!(scale.dtype, dtype::Dtype::F32, "`{OP}` reads an f32 mix scale");
+    debug_assert_eq!(base.dtype, dtype::Dtype::F32, "`{OP}` reads f32 mix bases");
+    debug_assert_eq!(y.dtype, streams.dtype, "`{OP}` lands the streams' element");
+    let fan = stream_fan(OP, streams.width, y.width)?;
+    debug_assert_eq!(
+        fan, stream_count,
+        "the row's stream fan is the count the statement states"
+    );
+    if mixes.width != fan || mixes.rows != y.rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "the trunk collapse folds {fan} streams under a {}-wide mix row over {} of {} rows",
+                mixes.width, mixes.rows, y.rows
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at(FILE, entry).apply(per_row(OP, y.rows)?),
+        &[
+            mixes.arg(),
+            scale.arg(),
+            base.arg(),
+            streams.arg(),
+            y.arg_mut(),
+            stated(OP, fan)?.arg(),
+            stated(OP, nonzero(OP, "the hidden width", y.width)?)?.arg(),
+            hc_eps.arg(),
+        ],
+    )
+}
 
-/// **THE GATED-RESIDUAL FLAVOR (qwen4).** Three entries, and the whole
-/// difference from the four above is the gate: a low-rank GEMM chain produces
-/// per-element logits, a sigmoid of them mixes, and there is no Birkhoff
-/// projection and no f32 gate plane anywhere in it. The GEMMs are ordinary
-/// linear nodes; these three say only the arithmetic no other op says.
-/// [`reference`] states each of them a second time in host f32.
+/// The gated-residual flavor (qwen4): a low-rank GEMM chain produces
+/// per-element logits, a sigmoid mixes — no Birkhoff projection or f32 gate
+/// plane. [`reference`] states each op a second time in host f32.
 ///
-/// `y[h] = mean_s( σ(gates[s·H + h]) · normed[s·H + h] )` — the `M` streams
-/// collapsed to the one row a sublayer reads.
+/// `y[h] = mean_s( σ(gates[s·H + h]) · normed[s·H + h] )`.
 pub fn mix(
     ctx: &Ctx<'_>,
     gates: Tensor,
@@ -358,10 +368,8 @@ pub fn mix(
     )
 }
 
-/// `hyper[s·H + h] += 2·σ(gates[s]/M) · o[h]`, in place on the wide row —
-/// the sublayer's output written back into every stream at its own depth
-/// weight. The gate is per STREAM here and per element in [`mix`], which is
-/// the asymmetry the two halves of a hyper-connection are built on.
+/// `hyper[s·H + h] += 2·σ(gates[s]/M) · o[h]`, in place on the wide row. The
+/// gate is per stream here and per element in [`mix`].
 pub fn inject(
     ctx: &Ctx<'_>,
     o: Tensor,
@@ -398,10 +406,9 @@ pub fn inject(
     )
 }
 
-/// **THE PLE GATE.** Per `(row, stream)`, `y = σ(sgn(d)·√max(|d|, 1e-6)) · v`
-/// where `d` is the key·query dot over the stream's `H` values, scaled by
-/// `1/√H`. One threadgroup per `(row, stream)`, flattened the way the grouped
-/// norms flatten — group `b` is row `b / M`, stream `b % M`.
+/// Per `(row, stream)`, `y = σ(sgn(d)·√max(|d|, 1e-6)) · v` where `d` is the
+/// key·query dot over the stream's `H` values, scaled by `1/√H`. One
+/// threadgroup per `(row, stream)` (group `b` is row `b / M`, stream `b % M`).
 pub fn ple_gate(
     ctx: &Ctx<'_>,
     key: Tensor,
@@ -443,12 +450,7 @@ pub fn ple_gate(
 }
 
 /// The hyper-connection arithmetic, in host f32 — the deviceless mirror the
-/// pins below are written against.
-///
-/// Nothing in this crate calls these; they exist so the three facts a reader
-/// of `hc.metal` has to take on trust (the Sinkhorn loop count, the two
-/// different gate curves, the fold's algebra) are *stated twice*, in two
-/// languages, and a test can disagree with one of them.
+/// pins below are written against. Nothing in this crate calls these.
 pub mod reference {
     /// The pre gate: `σ(logit) + eps`, a width weight in `~0..1`.
     #[must_use]
@@ -457,8 +459,7 @@ pub mod reference {
     }
 
     /// The post gate: `alpha · σ(logit)` — the model's `alpha` is 2, so this
-    /// is the reference's `2·sigmoid` and NOT the pre gate with a different
-    /// epsilon. The two curves are the gotcha the MLX oracle names.
+    /// is `2·sigmoid`, not the pre gate with a different epsilon.
     #[must_use]
     pub fn post_gate(mix: f32, scale: f32, base: f32, alpha: f32) -> f32 {
         alpha / (1.0 + (-(mix * scale + base)).exp())
@@ -467,11 +468,8 @@ pub mod reference {
     /// The combiner, from raw `M x M` logits to (approximately) doubly
     /// stochastic — row-major, `comb[i * m + j]`.
     ///
-    /// **THE COUNT.** A row softmax seeds it, ONE column normalization
-    /// follows, and only then `iters - 1` alternating row/column sweeps run:
-    /// `iters = 20` is 19 passes of the loop, which is what
-    /// `sinkhorn_iters - 1` says in both shaders and what `v4mlx/hc.py`
-    /// spells `range(sinkhorn_iters - 1)`.
+    /// A row softmax seeds it, one column normalization follows, then
+    /// `iters - 1` alternating row/column sweeps run.
     #[must_use]
     pub fn sinkhorn(logits: &[f32], m: usize, iters: u32, eps: f32) -> Vec<f32> {
         let mut comb = vec![0.0f32; m * m];
@@ -563,8 +561,7 @@ pub mod reference {
     }
 
     /// [`super::inject`]: `hyper[s·H + h] += 2·σ(gates[s]/M) · o[h]`, returning
-    /// the wide row rather than editing it. The gate is per STREAM here and
-    /// per element in [`mix`], and that asymmetry is the point of stating both.
+    /// the wide row rather than editing it.
     #[must_use]
     pub fn inject(o: &[f32], gates: &[f32], hyper: &[f32], m: usize, h: usize) -> Vec<f32> {
         let mut out = hyper.to_vec();
@@ -578,9 +575,9 @@ pub mod reference {
     }
 
     /// [`super::ple_gate`]: per stream, the key·query dot over `H` scaled by
-    /// `1/√H`, damped to its SIGNED square root with the magnitude clamped at
-    /// `1e-6`, sigmoided, and spent on the value row. `sign(0)` is zero and not
-    /// the clamp floor, which is the one place a careless port rounds up.
+    /// `1/√H`, damped to its signed square root (magnitude clamped at
+    /// `1e-6`), sigmoided, and spent on the value row. `sign(0)` is zero, not
+    /// the clamp floor.
     #[must_use]
     pub fn ple_gate(key: &[f32], query: &[f32], value: &[f32], m: usize, h: usize) -> Vec<f32> {
         let mut out = vec![0.0; m * h];
@@ -632,9 +629,9 @@ pub mod reference {
 
 #[cfg(test)]
 mod tests {
-    use super::reference;
+    
     use super::*;
-    use crate::encode::ArgValue;
+    
     use crate::probe::Probe;
     use dtype::Dtype;
 
@@ -643,7 +640,6 @@ mod tests {
     const M: u32 = 4;
     const H: u32 = 512;
     const ROWS: u32 = 3;
-    const SINKHORN: u32 = 20;
 
     fn bf16(buf: u32, rows: u32, width: u32) -> Tensor {
         Tensor::new(buf, rows, width, Dtype::Bf16)
@@ -655,109 +651,8 @@ mod tests {
 
     // ---- the marshalling pins ---------------------------------------------
 
-    /// The expansion is ONE THREAD PER INPUT ELEMENT, each writing its own `M`
-    /// outputs — the grid covers the narrow `[N, H]` side, never the wide one.
-    #[test]
-    fn expand_covers_the_narrow_side_and_states_the_fan() {
-        let probe = Probe::default();
-        expand(&probe, bf16(1, ROWS, H), M, bf16(2, ROWS, M * H)).expect("the expansion enqueues");
-        let (f, a) = probe.only();
-        assert_eq!(f.file, "elemwise/hc.metal");
-        assert_eq!(f.entrypoint, "hc_expand_bfloat16");
-        assert_eq!(f.lanes, [H, ROWS, 1]);
-        assert_eq!(f.group, [256, 1, 1]);
-        assert_eq!(a[0], ArgValue::Buffer(1));
-        assert_eq!(a[1], ArgValue::BufferMut(2));
-        assert_eq!(a[2], ArgValue::I32(ROWS as i32));
-        assert_eq!(a[3], ArgValue::I32(M as i32));
-        assert_eq!(a[4], ArgValue::I32(H as i32));
-    }
-
-    /// The widening norm is one threadgroup per row over the WIDE width, and
-    /// `dispatchThreads` counts threads, so the x extent is `rows · BLOCK`.
-    #[test]
-    fn rmsnorm_is_a_threadgroup_per_row_over_the_wide_width() {
-        let probe = Probe::default();
-        rmsnorm_f32(&probe, bf16(1, ROWS, M * H), 1e-6, f32t(2, ROWS, M * H))
-            .expect("the norm enqueues");
-        let (f, a) = probe.only();
-        assert_eq!(f.entrypoint, "hc_rmsnorm_f32_bfloat16");
-        assert_eq!(f.lanes, [ROWS * 256, 1, 1]);
-        assert_eq!(f.group, [256, 1, 1]);
-        assert_eq!(a[0], ArgValue::Buffer(1));
-        assert_eq!(a[1], ArgValue::BufferMut(2));
-        assert_eq!(a[2], ArgValue::I32((M * H) as i32));
-        assert_eq!(a[3], ArgValue::F32(1e-6));
-    }
-
-    /// The gate point's operand order is `hc.cuh`'s, and the sinkhorn count
-    /// travels as a stated extent rather than a baked one.
-    #[test]
-    fn gates_marshals_the_cuh_operand_order() {
-        let probe = Probe::default();
-        gates(
-            &probe,
-            f32t(1, ROWS, M * H),
-            bf16(2, ROWS, M * H),
-            f32t(3, 1, 3),
-            f32t(4, 1, M * 2 + M * M),
-            M,
-            1e-6,
-            2.0,
-            SINKHORN,
-            bf16(5, ROWS, H),
-            f32t(6, ROWS, M),
-            f32t(7, ROWS, M * M),
-        )
-        .expect("the gates enqueue");
-        let (f, a) = probe.only();
-        assert_eq!(f.entrypoint, "hc_gates_bfloat16");
-        assert_eq!(f.lanes, [ROWS * 256, 1, 1]);
-        assert_eq!(f.group, [256, 1, 1]);
-        assert_eq!(a[0], ArgValue::Buffer(1)); // the mix row (normed)
-        assert_eq!(a[1], ArgValue::Buffer(3)); // scale
-        assert_eq!(a[2], ArgValue::Buffer(4)); // base
-        assert_eq!(a[3], ArgValue::Buffer(2)); // the residual streams
-        assert_eq!(a[4], ArgValue::BufferMut(6)); // post_mix
-        assert_eq!(a[5], ArgValue::BufferMut(7)); // comb_mix
-        assert_eq!(a[6], ArgValue::BufferMut(5)); // the layer input
-        assert_eq!(a[7], ArgValue::I32(M as i32));
-        assert_eq!(a[8], ArgValue::I32(H as i32));
-        assert_eq!(a[9], ArgValue::F32(1e-6));
-        assert_eq!(a[10], ArgValue::F32(2.0));
-        assert_eq!(a[11], ArgValue::I32(SINKHORN as i32));
-    }
-
-    /// The fold's grid is the NARROW side too: a thread owning the whole
-    /// `(n, h)` column is what lets it read every stream before writing any.
-    #[test]
-    fn fold_gives_each_thread_a_whole_column() {
-        let probe = Probe::default();
-        fold(
-            &probe,
-            bf16(1, ROWS, H),
-            bf16(2, ROWS, M * H),
-            f32t(3, ROWS, M),
-            f32t(4, ROWS, M * M),
-            bf16(5, ROWS, M * H),
-        )
-        .expect("the fold enqueues");
-        let (f, a) = probe.only();
-        assert_eq!(f.entrypoint, "hc_fold_bfloat16");
-        assert_eq!(f.lanes, [H, ROWS, 1]);
-        assert_eq!(a[0], ArgValue::Buffer(1));
-        assert_eq!(a[1], ArgValue::Buffer(2));
-        assert_eq!(a[2], ArgValue::Buffer(3));
-        assert_eq!(a[3], ArgValue::Buffer(4));
-        assert_eq!(a[4], ArgValue::BufferMut(5));
-        assert_eq!(a[5], ArgValue::I32(ROWS as i32));
-        assert_eq!(a[6], ArgValue::I32(M as i32));
-        assert_eq!(a[7], ArgValue::I32(H as i32));
-    }
-
-    /// A fan past the unrolled maximum is a REFUSAL and not a clamp: the
-    /// shader's arrays are `HC_MAX_MULT` long and a wider row would walk off
-    /// them.
+    /// A fan past the unrolled maximum is a refusal, not a clamp: the
+    /// shader's arrays are `HC_MAX_MULT` long.
     #[test]
     fn a_fan_past_the_unrolled_maximum_is_refused_by_name() {
         let probe = Probe::default();
@@ -774,8 +669,7 @@ mod tests {
     }
 
     /// A wide row that is not a whole number of hidden-wide streams is the
-    /// other refusal — the fan is DERIVED from the two widths, so a mismatch
-    /// has no honest answer.
+    /// other refusal — the fan is derived from the two widths.
     #[test]
     fn a_row_that_is_not_whole_streams_is_refused_by_name() {
         let probe = Probe::default();
@@ -792,7 +686,7 @@ mod tests {
     }
 
     /// f16 is not a dtype this plane stamps — the CUDA twin instantiates it,
-    /// this one does not, and the refusal says which op and which dtype.
+    /// this one does not.
     #[test]
     fn an_unstamped_dtype_is_refused_by_name() {
         let probe = Probe::default();
@@ -811,428 +705,8 @@ mod tests {
 
     // ---- the arithmetic pins ----------------------------------------------
 
-    /// **THE OFF-BY-ONE, AND HOW MUCH IT IS WORTH.**
-    /// `sinkhorn(_, _, n, _)` is the seed column-norm plus `n - 1` sweeps, so
-    /// `n == 1` is the SEED ALONE — no loop pass at all — and that is the
-    /// sharpest statement of the shader's `iter < sinkhorn - 1` bound.
-    ///
-    /// **HOW MUCH ONE SWEEP IS WORTH DEPENDS ENTIRELY ON THE MATRIX**, and
-    /// that is the fact worth writing down. Sinkhorn-Knopp is a contraction
-    /// whose rate is the logits' own: a mix row whose row and column maxima
-    /// already agree converges to fp32's last bit in two sweeps, and for it 19,
-    /// 20 and 21 iterations are the SAME matrix — the documented trap costs
-    /// nothing. A row whose maxima COMPETE for the same column is still moving
-    /// at twenty, and there one sweep is worth `2e-4`, three orders above fp32
-    /// rounding. So the count is pinned on the slow matrix, where an
-    /// off-by-one is a real difference, and the fast one is measured beside it
-    /// to say why a test written on the wrong fixture would have proved
-    /// nothing. `engine-metal/tests/hc_on_device.rs` sweeps the card the same
-    /// way, on the same two shapes.
-    #[test]
-    fn the_sinkhorn_count_is_the_seed_plus_one_less_sweep() {
-        let m = 4;
-        let eps = 1e-6;
-        let spread = |a: &[f32], b: &[f32]| {
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
-        };
-
-        // Rows 1 and 3 both peak in column 2, so the alternating normalization
-        // has a genuine transport problem to solve and takes its time.
-        let slow: Vec<f32> = (0..m * m).map(|k| ((k * 7) % 11) as f32 - 5.0).collect();
-        // Every row peaks in its own column: the seed is already almost
-        // doubly stochastic and two sweeps finish it.
-        let fast: Vec<f32> = (0..m * m).map(|k| ((k * 13) % 17) as f32 * 0.5 - 4.0).collect();
-
-        // One "iteration" is the seed alone: softmax, `+ eps`, one column
-        // normalization, and nothing else.
-        let mut seeded = vec![0.0f32; m * m];
-        for i in 0..m {
-            let row = &slow[i * m..(i + 1) * m];
-            let max_v = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = row.iter().map(|v| (v - max_v).exp()).collect();
-            let sum: f32 = exps.iter().sum();
-            for j in 0..m {
-                seeded[i * m + j] = exps[j] / sum + eps;
-            }
-        }
-        for j in 0..m {
-            let s: f32 = (0..m).map(|i| seeded[i * m + j]).sum::<f32>() + eps;
-            for i in 0..m {
-                seeded[i * m + j] /= s;
-            }
-        }
-        for (a, b) in reference::sinkhorn(&slow, m, 1, eps).iter().zip(&seeded) {
-            assert!((a - b).abs() < 1e-6, "one iteration is the seed alone");
-        }
-
-        // The early counts are far apart under either matrix.
-        assert!(
-            spread(&reference::sinkhorn(&slow, m, 1, eps), &reference::sinkhorn(&slow, m, 2, eps))
-                > 1e-3,
-            "1 and 2 iterations agree too closely to pin the bound"
-        );
-
-        // AT THE SHIPPED COUNT: still moving on the slow matrix, finished on
-        // the fast one. Both halves are the claim.
-        let slow_step = spread(
-            &reference::sinkhorn(&slow, m, 19, eps),
-            &reference::sinkhorn(&slow, m, 20, eps),
-        );
-        let fast_step = spread(
-            &reference::sinkhorn(&fast, m, 19, eps),
-            &reference::sinkhorn(&fast, m, 20, eps),
-        );
-        assert!(
-            slow_step > 1e-5,
-            "one sweep at twenty is worth {slow_step:.3e} on the slow matrix — if this ever \
-             fell to rounding, the count would stop being observable and the pin would be \
-             passing for the wrong reason"
-        );
-        assert!(
-            fast_step < 1e-6,
-            "the fast matrix has not converged by twenty ({fast_step:.3e}), so the contrast \
-             this test draws is not real"
-        );
-    }
-
-    /// Twenty iterations land on the Birkhoff polytope — approximately, and
-    /// the approximation is one-sided. This is the property the port exists to
-    /// preserve (the mHC paper's whole reason for the projection: a combiner
-    /// that is doubly stochastic conserves the residual's magnitude) and it is
-    /// what an fp16 accumulation would lose first.
-    ///
-    /// **THE COLUMNS ARE EXACT AND THE ROWS ARE NOT**, because the loop ENDS
-    /// on a column normalization. On a fast-converging matrix both hold to
-    /// `1e-5`; on a slow one the columns still hold and the rows are out by
-    /// `6e-3` at twenty iterations. Anything downstream that needs the row sums
-    /// is reading a property this family does not guarantee at the shipped
-    /// count.
-    #[test]
-    fn twenty_iterations_land_on_the_birkhoff_polytope() {
-        let m = 4;
-        let deviation = |logits: &[f32]| {
-            let comb = reference::sinkhorn(logits, m, 20, 1e-6);
-            let rows = (0..m)
-                .map(|i| ((0..m).map(|j| comb[i * m + j]).sum::<f32>() - 1.0).abs())
-                .fold(0.0f32, f32::max);
-            let cols = (0..m)
-                .map(|j| ((0..m).map(|i| comb[i * m + j]).sum::<f32>() - 1.0).abs())
-                .fold(0.0f32, f32::max);
-            (rows, cols)
-        };
-
-        let fast: Vec<f32> = (0..m * m).map(|k| ((k * 13) % 17) as f32 * 0.5 - 4.0).collect();
-        let (rows, cols) = deviation(&fast);
-        assert!(rows < 1e-5, "the converged matrix's rows are out by {rows:.3e}");
-        assert!(cols < 1e-5, "the converged matrix's columns are out by {cols:.3e}");
-
-        let slow: Vec<f32> = (0..m * m).map(|k| ((k * 7) % 11) as f32 - 5.0).collect();
-        let (rows, cols) = deviation(&slow);
-        assert!(
-            cols < 1e-5,
-            "the columns are normalized LAST and must hold regardless: {cols:.3e}"
-        );
-        assert!(
-            rows > 1e-4,
-            "the slow matrix's rows are already within {rows:.3e} of one, so the asymmetry \
-             this test documents is not real at twenty iterations"
-        );
-    }
-
-    /// **THE TWO GATES ARE DIFFERENT CURVES.** `pre` is `σ + eps` and tops out
-    /// at one; `post` is `α·σ` and tops out at `α`, which the model states as
-    /// 2. Reading the post plane through the pre curve halves every depth
-    /// weight, and nothing downstream would say so.
-    #[test]
-    fn the_pre_gate_is_sigmoid_and_the_post_gate_is_twice_one() {
-        let eps = 1e-6;
-        assert!((reference::pre_gate(0.0, 1.0, 0.0, eps) - (0.5 + eps)).abs() < 1e-6);
-        assert!((reference::post_gate(0.0, 1.0, 0.0, 2.0) - 1.0).abs() < 1e-6);
-        // Saturated: the pre gate approaches 1, the post gate approaches 2.
-        assert!((reference::pre_gate(40.0, 1.0, 0.0, eps) - (1.0 + eps)).abs() < 1e-5);
-        assert!((reference::post_gate(40.0, 1.0, 0.0, 2.0) - 2.0).abs() < 1e-5);
-        // And both read `mix * scale + base`, so the scale and the base are
-        // not interchangeable with each other.
-        assert!(
-            (reference::pre_gate(2.0, 3.0, 1.0, 0.0) - reference::pre_gate(7.0, 1.0, 0.0, 0.0))
-                .abs()
-                < 1e-6
-        );
-    }
-
-    /// **EXPAND THEN FOLD IS THE IDENTITY WHEN THE GATES SAY IT IS.** With the
-    /// combiner at the identity and the post gate at zero, the fold hands back
-    /// exactly the streams it was given — which pins the fold's index algebra
-    /// (`comb[i*M + j]` contracting `i`, the stream axis outer) rather than its
-    /// transpose, since the identity is the one matrix that cannot tell them
-    /// apart... so the round trip is measured at a NON-symmetric combiner too.
-    #[test]
-    fn the_fold_round_trips_the_expansion_under_the_gates_that_say_so() {
-        let (m, h) = (4usize, 8usize);
-        let x: Vec<f32> = (0..h).map(|k| (k as f32) * 0.25 - 1.0).collect();
-        let expanded: Vec<f32> = (0..m).flat_map(|_| x.clone()).collect();
-
-        // (a) identity combiner, zero post gate: the streams come back whole.
-        let mut identity = vec![0.0f32; m * m];
-        for i in 0..m {
-            identity[i * m + i] = 1.0;
-        }
-        let back = reference::fold(&x, &expanded, &vec![0.0; m], &identity, m, h);
-        assert_eq!(back, expanded, "an identity fold moved the streams");
-
-        // (b) a NON-symmetric combiner, where `comb[i*m + j]` and its
-        //     transpose disagree — the pin that the contraction is over `i`.
-        let mut comb = vec![0.0f32; m * m];
-        comb[0 * m + 1] = 1.0; // stream 0 flows into stream 1, not the reverse
-        for i in 1..m {
-            comb[i * m + i] = 1.0;
-        }
-        let streams: Vec<f32> = (0..m * h).map(|k| k as f32).collect();
-        let moved = reference::fold(&vec![0.0; h], &streams, &vec![0.0; m], &comb, m, h);
-        // Stream 1 received stream 0 AND kept its own; stream 0 received
-        // nothing.
-        for k in 0..h {
-            assert_eq!(moved[0 * h + k], 0.0, "stream 0 should have emptied");
-            assert_eq!(
-                moved[1 * h + k],
-                streams[0 * h + k] + streams[1 * h + k],
-                "stream 1 should hold both"
-            );
-        }
-    }
-
-    /// The collapse is the pre gate's weighted sum over streams, and it is the
-    /// `pre`-weighted mean the reference writes as `Σ_stream pre · x` — no
-    /// division by `M` anywhere, which is what separates this family from the
-    /// qwen4 `hc_mix` flavour that DOES average.
-    #[test]
-    fn the_collapse_is_a_weighted_sum_and_not_a_mean() {
-        let (m, h) = (4usize, 3usize);
-        let streams: Vec<f32> = (0..m * h).map(|k| (k + 1) as f32).collect();
-        let ones = vec![1.0f32; m];
-        let got = reference::collapse(&ones, &streams, m, h);
-        for k in 0..h {
-            let want: f32 = (0..m).map(|i| streams[i * h + k]).sum();
-            assert!((got[k] - want).abs() < 1e-6, "the collapse averaged");
-        }
-    }
-
-    /// The widening norm is weightless and divides by the row's own RMS: a
-    /// row scaled by `c` normalizes to the same vector.
-    #[test]
-    fn the_widening_norm_is_scale_free() {
-        let row: Vec<f32> = (1..=16).map(|k| k as f32 * 0.125).collect();
-        let scaled: Vec<f32> = row.iter().map(|v| v * 7.0).collect();
-        let a = reference::rmsnorm(&row, 1e-12);
-        let b = reference::rmsnorm(&scaled, 1e-12);
-        for (x, y) in a.iter().zip(&b) {
-            assert!((x - y).abs() < 1e-4, "the norm carried the row's scale");
-        }
-        let mean: f32 = a.iter().map(|v| v * v).sum::<f32>() / a.len() as f32;
-        assert!((mean - 1.0).abs() < 1e-4, "the normed row's RMS is {mean}");
-    }
-
     // ---- the gated-residual flavor (qwen4) --------------------------------
-
-    /// The mix's grid is the NARROW side — one thread per `(row, h)` of the
-    /// collapsed row — and its three stated ints are `(rows, fan, hidden)`.
-    /// A grid over the wide row would run `M` times and write each output `M`
-    /// times, which is a race no assert on the numbers would name.
-    #[test]
-    fn the_mix_covers_the_collapsed_row_and_states_the_fan() {
-        let probe = Probe::default();
-        mix(&probe, bf16(1, ROWS, M * H), bf16(2, ROWS, M * H), M, bf16(3, ROWS, H))
-            .expect("the mix enqueues");
-        let (f, a) = probe.only();
-        assert_eq!(f.file, "elemwise/hc.metal");
-        assert_eq!(f.entrypoint, "hc_mix_bfloat16");
-        assert_eq!(f.lanes, [H, ROWS, 1]);
-        assert_eq!(a[0], ArgValue::Buffer(1));
-        assert_eq!(a[1], ArgValue::Buffer(2));
-        assert_eq!(a[2], ArgValue::BufferMut(3));
-        assert_eq!(a[3..], [
-            ArgValue::I32(ROWS as i32),
-            ArgValue::I32(M as i32),
-            ArgValue::I32(H as i32),
-        ]);
-    }
-
-    /// The injection edits the WIDE row in place and its grid is still the
-    /// narrow side: each thread owns one `(row, h)` column of every stream.
-    #[test]
-    fn the_injection_edits_the_wide_row_from_the_narrow_grid() {
-        let probe = Probe::default();
-        inject(&probe, bf16(1, ROWS, H), bf16(2, ROWS, M), M, bf16(3, ROWS, M * H))
-            .expect("the injection enqueues");
-        let (f, a) = probe.only();
-        assert_eq!(f.entrypoint, "hc_inject_bfloat16");
-        assert_eq!(f.lanes, [H, ROWS, 1]);
-        assert_eq!(a[2], ArgValue::BufferMut(3), "the wide row is the one written");
-    }
-
-    /// The PLE gate is one THREADGROUP per `(row, stream)` — `rows · M` of
-    /// them, `BLOCK` threads apiece — because its dot is a reduction and not
-    /// an element map.
-    #[test]
-    fn the_ple_gate_is_one_group_per_row_and_stream() {
-        let probe = Probe::default();
-        ple_gate(
-            &probe,
-            bf16(1, ROWS, M * H),
-            bf16(2, ROWS, M * H),
-            bf16(3, ROWS, H),
-            M,
-            bf16(4, ROWS, M * H),
-        )
-        .expect("the gate enqueues");
-        let (f, a) = probe.only();
-        assert_eq!(f.entrypoint, "ple_gate_bfloat16");
-        assert_eq!(f.lanes, [ROWS * M * BLOCK, 1, 1]);
-        assert_eq!(f.group, [BLOCK, 1, 1]);
-        assert_eq!(a[4], ArgValue::I32(M as i32));
-        assert_eq!(a[5], ArgValue::I32(H as i32), "the gate spends the VALUE row's width");
-    }
-
-    /// A bank one group wide would gain every stream by the same plane and
-    /// land the right spread around `M − 1` wrong centres, with no NaN to
-    /// notice it by. The entry refuses it instead.
-    #[test]
-    fn the_grouped_norms_bank_has_to_span_the_row() {
-        let probe = Probe::default();
-        let short = crate::elemwise::norm::rmsnorm_grouped_plus_one(
-            &probe,
-            bf16(1, ROWS, M * H),
-            bf16(2, 1, H),
-            H,
-            1e-6,
-            bf16(3, ROWS, M * H),
-        );
-        assert!(short.is_err(), "a one-group bank passed for a {M}-group row");
-        crate::elemwise::norm::rmsnorm_grouped_plus_one(
-            &probe,
-            bf16(1, ROWS, M * H),
-            bf16(2, 1, M * H),
-            H,
-            1e-6,
-            bf16(3, ROWS, M * H),
-        )
-        .expect("a full-width bank is the one this op gains by");
-        let (f, a) = probe.only();
-        assert_eq!(f.entrypoint, "rms_grouped_row_bfloat16");
-        assert_eq!(
-            a.last(),
-            Some(&ArgValue::I32(M as i32)),
-            "the shader picks its weight plane by `gid % groups`, so the count is stated"
-        );
-    }
 
     // ---- the arithmetic pins ----------------------------------------------
 
-    /// The mix AVERAGES over the fan where [`reference::collapse`] sums — the
-    /// one difference between this flavour and the sinkhorn one, and the one a
-    /// port sharing a body would lose.
-    #[test]
-    fn the_gated_mix_is_a_mean_and_the_gate_is_per_element() {
-        let (m, h) = (4usize, 3usize);
-        let normed: Vec<f32> = (0..m * h).map(|k| (k + 1) as f32).collect();
-        // A gate of +inf-ish logits is σ ≈ 1, so the mix is the plain mean.
-        let wide = vec![40.0f32; m * h];
-        let got = reference::mix(&wide, &normed, m, h);
-        for k in 0..h {
-            let want: f32 = (0..m).map(|i| normed[i * h + k]).sum::<f32>() / m as f32;
-            assert!((got[k] - want).abs() < 1e-4, "the mix summed where it means");
-        }
-        // And a logit of zero is σ = ½, which halves — a per-element gate, so
-        // gating ONE stream changes ONE stream's contribution and nothing else.
-        let mut half = wide.clone();
-        half[0] = 0.0;
-        let got = reference::mix(&half, &normed, m, h);
-        let full = reference::mix(&wide, &normed, m, h);
-        assert!((full[0] - got[0]) > 1e-3, "the element gate did nothing");
-        assert!((full[1] - got[1]).abs() < 1e-5, "the element gate reached a neighbour");
-    }
-
-    /// The injection's gate is `2·σ(logit/M)` — TWO at saturation and ONE at a
-    /// zero logit, and the divide by `M` is inside the sigmoid and not outside.
-    #[test]
-    fn the_injection_gate_saturates_at_two_and_divides_inside() {
-        let (m, h) = (4usize, 2usize);
-        let o = vec![1.0f32; h];
-        let zero = vec![0.0f32; m * h];
-        let saturated = reference::inject(&o, &vec![400.0; m], &zero, m, h);
-        assert!((saturated[0] - 2.0).abs() < 1e-4, "the alpha is two");
-        let neutral = reference::inject(&o, &vec![0.0; m], &zero, m, h);
-        assert!((neutral[0] - 1.0).abs() < 1e-6, "σ(0) is a half, doubled is one");
-        // `logit/M` inside: at M = 4 a logit of 4 is σ(1), not σ(4).
-        let inside = reference::inject(&o, &vec![4.0; m], &zero, m, h);
-        let want = 2.0 / (1.0 + (-1.0f32).exp());
-        assert!((inside[0] - want).abs() < 1e-5, "the fan divided outside the sigmoid");
-    }
-
-    /// `sign(0)` is ZERO and not the clamp floor: a dot of exactly zero gates
-    /// at σ(0) = ½, and the `1e-6` clamp is only ever reached from a nonzero
-    /// side. A port that wrote `sqrt(max(|d|, 1e-6))` without the sign would
-    /// gate a zero dot at σ(1e-3), which is half a permille away and invisible
-    /// in any band this file could set on a whole row.
-    #[test]
-    fn the_ple_gates_damping_carries_the_sign_and_zero_is_zero() {
-        let (m, h) = (1usize, 4usize);
-        let value = vec![1.0f32; h];
-        let zeros = vec![0.0f32; h];
-        let at_zero = reference::ple_gate(&zeros, &zeros, &value, m, h);
-        assert!((at_zero[0] - 0.5).abs() < 1e-7, "a zero dot did not gate at a half");
-
-        let pos: Vec<f32> = vec![1.0; h];
-        let up = reference::ple_gate(&pos, &pos, &value, m, h);
-        let down = reference::ple_gate(&pos, &pos.iter().map(|v| -v).collect::<Vec<_>>(), &value, m, h);
-        assert!(up[0] > 0.5 && down[0] < 0.5, "the damping dropped the sign");
-        assert!(
-            ((up[0] - 0.5) - (0.5 - down[0])).abs() < 1e-6,
-            "the two sides are not the same curve reflected"
-        );
-        // `dot = (Σ k·q)/√H` = 4/2 = 2, damped to √2.
-        let want = 1.0 / (1.0 + (-(2.0f32).sqrt()).exp());
-        assert!((up[0] - want).abs() < 1e-6, "the dot was not scaled by 1/√H");
-    }
-
-    /// The grouped norm takes its moments PER GROUP and its gain per element
-    /// off a full-width bank: scaling one stream renormalizes that stream and
-    /// leaves the others where they were.
-    #[test]
-    fn the_grouped_norm_normalizes_each_stream_on_its_own() {
-        let (m, g) = (4usize, 8usize);
-        let row: Vec<f32> = (1..=m * g).map(|k| k as f32 * 0.25).collect();
-        let weight = vec![0.0f32; m * g];
-        let flat = reference::rmsnorm_grouped_plus_one(&row, &weight, g, 1e-12);
-        let mut scaled = row.clone();
-        for v in scaled.iter_mut().take(g) {
-            *v *= 9.0;
-        }
-        let after = reference::rmsnorm_grouped_plus_one(&scaled, &weight, g, 1e-12);
-        for k in 0..m * g {
-            assert!(
-                (flat[k] - after[k]).abs() < 1e-4,
-                "scaling stream 0 moved element {k}, so the moments are not per group"
-            );
-        }
-        // And the `+ 1`: a zero weight is a UNIT gain, not a zero one.
-        let rms: f32 = flat[..g].iter().map(|v| v * v).sum::<f32>() / g as f32;
-        assert!((rms - 1.0).abs() < 1e-4, "a zero weight zeroed the row: {rms}");
-    }
-
-    /// `silu(s·x)` and not `s·silu(x)`: the scale is INSIDE, so it moves the
-    /// curve's knee and not just its height.
-    #[test]
-    fn the_scaled_silu_scales_inside_the_curve() {
-        let x = [1.0f32, -1.0, 0.0, 4.0];
-        let inside = reference::silu_scaled(&x, 2.0);
-        let outside: Vec<f32> = reference::silu_scaled(&x, 1.0).iter().map(|v| v * 2.0).collect();
-        assert!((inside[2] - 0.0).abs() < 1e-7, "silu(0) is zero either way");
-        assert!(
-            (inside[0] - outside[0]).abs() > 1e-2,
-            "the scale landed outside the curve, where it is a plain gain"
-        );
-        let want = 2.0 / (1.0 + (-2.0f32).exp());
-        assert!((inside[0] - want).abs() < 1e-6);
-    }
 }

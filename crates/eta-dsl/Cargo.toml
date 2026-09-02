@@ -1,6 +1,6 @@
 [package]
 name = "eta-dsl"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version.workspace = true
 authors = ["In Gim <in.gim@icloud.com>"]
@@ -11,35 +11,26 @@ keywords = ["pie", "eta", "tracing", "inferlet"]
 categories = ["api-bindings"]
 
 # A host workspace member that also builds for `wasm32-wasip2`: it has no
-# wasm-only dependencies, so unlike `sdk/rust/*` it does not need to be excluded,
-# and being a member is what puts its tests in the CI battery. It lowers to the
-# canonical `eta-ir` primitives (Shape / DType / container encoding
-# / FNV-1a identity hash). The authoritative validator (`pie_ir::validate::bind`)
-# is a dev-only parity dependency: the guest does not bind — `forward-pass.new`
-# is the authoritative gate.
+# wasm-only dependencies, and being a member is what puts its tests in CI.
 [lib]
 name = "eta_dsl"
 path = "src/lib.rs"
 
+# `std` enables the thread-local trace context and the `std::error::Error`
+# impls. The crate still traces inside a `wasm32-wasip2` inferlet as-is (wasip2
+# provides std `thread_local!`); `no_std` is only for other no_std targets.
 [features]
-# `std` (default, host-side) enables the thread-local trace context + the
-# `std::error::Error` impls. The crate builds + traces in a `wasm32-wasip2`
-# inferlet AS-IS (wasip2 provides std `thread_local!`): the `inferlet` crate
-# depends on this one, drives the neutral `Builder`, then `traced.encode()`
-# → the WIT `forward-pass.new`/`register-program` runs it. A `no_std`
-# single-threaded context is only needed for non-wasip2 no_std targets.
 default = ["std"]
 std = ["eta-ir/std"]
 
 [dependencies]
 eta-ir = { path = "../eta-ir", default-features = false }
 
-# Host-only: the CPU reference interpreter for tier-0 result-parity tests.
-# Dev-deps are excluded from the wasm build, so this never reaches the SDK.
+# Host-only: the CPU reference interpreter for tier-0 parity tests. Dev-deps
+# are excluded from the wasm build, so this never reaches the SDK.
 [dev-dependencies]
 eta-compiler = { path = "../eta-compiler" }
 
-# Shared ratchet from the root manifest. The toolchain's three crates are gated
-# with `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+# The toolchain's three crates are the ones CI gates with `-D warnings`.
 [lints]
 workspace = true

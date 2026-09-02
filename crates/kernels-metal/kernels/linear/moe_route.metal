@@ -217,7 +217,8 @@ inline float sqrt_softplus(float x) {
   return metal::sqrt(max(sp, 0.0f));
 }
 
-[[kernel]] void router_topk_sqrt_softplus(
+template <int TAG>
+[[kernel]] void router_topk_sqrt_softplus_t(
     const device bfloat* logits    [[buffer(0)]],
     const device float* correction [[buffer(1)]],
     device int* expert_ids         [[buffer(2)]],
@@ -293,10 +294,27 @@ inline float sqrt_softplus(float x) {
   }
 }
 
+/* The ranked router under its own name, and — same arithmetic, same
+ * ranking — the ROUTE PREDICTION (`linear.moe_predict_route`) under another:
+ * the encode sink cuts a streamed segment after every `router_topk…` point,
+ * and a prediction is exactly the router point that must NOT cut, because
+ * nothing behind it reads its routes and the real router is about to. */
+#define instantiate_router_sqrt_softplus(name, tag)                          \
+  template [[host_name(#name)]]                                              \
+  [[kernel]] void router_topk_sqrt_softplus_t<tag>(                          \
+      const device bfloat*, const device float*, device int*, device float*, \
+      const constant uint&, const constant uint&, const constant uint&,      \
+      const constant float&, uint3, uint, uint, uint3, uint3);
+
+instantiate_router_sqrt_softplus(router_topk_sqrt_softplus, 0)
+instantiate_router_sqrt_softplus(router_predict_sqrt_softplus, 1)
+
 /* The hash router's gather: layers 0..num_hash_layers route by a per-token
  * LOOKUP, not a learned gate. `tid2eid [vocab, top_k]` (I64) names `top_k`
  * expert ids for every token id; this reads the row the token id selects and
- * lays down UNIFORM weights, so its (expert_ids, expert_weights) are the same
+ * weights each slot by the GATE'S sqrt-softplus score at the named expert
+ * (renormalized and scaled, as the official `Gate.forward` does on every
+ * layer), so its (expert_ids, expert_weights) are the same
  * pair `router_topk` writes above -- `int` ids and `float` weights, row-major
  * at `top_k` per token -- and drop straight into the `route_sort` /
  * `expert_combine` path with nothing between.
@@ -322,20 +340,54 @@ inline float sqrt_softplus(float x) {
 [[kernel]] void hash_route_gather(
     const device uint* token_ids   [[buffer(0)]],
     const device long* tid2eid     [[buffer(1)]],
-    device int* expert_ids         [[buffer(2)]],
-    device float* expert_weights   [[buffer(3)]],
-    const constant uint& vocab             [[buffer(4)]],
-    const constant uint& experts_per_token [[buffer(5)]],
-    uint2 gid                      [[thread_position_in_grid]]) {
-  const uint k = experts_per_token;
-  const uint slot = gid.x;
-  const uint row = gid.y;
-  if (slot >= k) return;
+    const device bfloat* logits    [[buffer(2)]],
+    device int* expert_ids         [[buffer(3)]],
+    device float* expert_weights   [[buffer(4)]],
+    const constant uint& vocab             [[buffer(5)]],
+    const constant uint& n_experts         [[buffer(6)]],
+    const constant uint& experts_per_token [[buffer(7)]],
+    const constant uint& renormalize       [[buffer(8)]],
+    const constant float& scaling          [[buffer(9)]],
+    const constant uint& rows              [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+  // One thread per token row: the row's `top_k` weights normalize together,
+  // exactly as `router_topk_sqrt_softplus`'s lane 0 normalizes its picks.
+  const uint row = gid;
+  if (row >= rows) return;
+  const uint k = min(experts_per_token, kRouterMaxTopK);
   const uint raw = token_ids[row];
   const uint tid = (vocab > 0u && raw < vocab) ? raw : 0u;
-  const size_t at = size_t(row) * size_t(k) + size_t(slot);
-  expert_ids[at] = int(tid2eid[size_t(tid) * size_t(k) + size_t(slot)]);
-  expert_weights[at] = 1.0f / float(k);
+  const device long* picks = tid2eid + size_t(tid) * size_t(experts_per_token);
+  const device bfloat* score = logits + size_t(row) * size_t(n_experts);
+  device int* ids = expert_ids + size_t(row) * size_t(experts_per_token);
+  device float* ws = expert_weights + size_t(row) * size_t(experts_per_token);
+  float sum = 0.0f;
+  for (uint r = 0; r < k; ++r) {
+    const long e = picks[r];
+    // The table names an expert the logits must span; a row outside them is
+    // a checkpoint fault the consumers refuse by name, and reads score 0 here.
+    const float w = (e >= 0 && ulong(e) < ulong(n_experts))
+        ? sqrt_softplus(float(score[uint(e)])) : 0.0f;
+    ids[r] = int(e);
+    ws[r] = w;
+    sum += w;
+  }
+  const float scale = (renormalize != 0u && sum > 0.0f) ? scaling / sum : scaling;
+  for (uint r = 0; r < k; ++r) ws[r] *= scale;
+}
+
+/* The static routes of a grouped projection (`linear.group_routes`): slot `g`
+ * of every token row names group `g`, so the routed select walking them reads
+ * block `g` of the row against block `g` of the plane. One thread per
+ * (row, slot), `hash_route_gather`'s old grid. */
+[[kernel]] void group_routes(
+    device int* routes             [[buffer(0)]],
+    const constant uint& groups    [[buffer(1)]],
+    uint2 gid                      [[thread_position_in_grid]]) {
+  const uint slot = gid.x;
+  const uint row = gid.y;
+  if (slot >= groups) return;
+  routes[size_t(row) * size_t(groups) + size_t(slot)] = int(slot);
 }
 
 constant constexpr uint kMaxExperts = 1024;

@@ -8,12 +8,9 @@
 //!   filesystem/network policy — internal.
 
 pub(crate) mod host;
-/// **THE MEDIA CODEC AND THE SPAN DIGEST, RE-EXPORTED** — the two pieces of
-/// the media pipe that are the HOST'S half (`models::media`'s dependency rule:
-/// the catalog does arithmetic, the host decodes and hashes), surfaced so the
-/// whole-pipe gate in `tests/media_pipe_is_the_pinned_preprocessing` can
-/// compose them exactly as `image.from-bytes` does. The guest boundary
-/// (`host`) itself stays private.
+/// The media codec and span digest: the host's half of the media pipe
+/// (`models::media`'s catalog does arithmetic, the host decodes and hashes).
+/// The guest boundary (`host`) itself stays private.
 pub use host::media::{decode as media_codec, span_digest};
 pub(crate) mod linker;
 pub mod process;

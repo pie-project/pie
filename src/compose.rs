@@ -1,8 +1,8 @@
-//! P5a compose — the real in-proc standalone: an embedded controller actor, a
-//! gateway, and a worker co-resident over loopback. golf's overlay of delta's
-//! stub contract (`StandaloneHandle`, `run_standalone`).
+//! The in-proc standalone: an embedded controller actor, a gateway, and a
+//! worker co-resident over loopback, behind `StandaloneHandle` /
+//! `run_standalone`.
 //!
-//! Topology is the same M3 dial-in as a real cluster, just collapsed into one
+//! Topology is the same dial-in as a real cluster, just collapsed into one
 //! process: the controller actor is embedded and a single cloneable `Handle`
 //! drives BOTH control planes through [`EmbeddedControl`] (no control sockets).
 //! The gateway binds an ephemeral loopback worker-facing port; the embedded
@@ -86,7 +86,7 @@ impl StandaloneHandle {
 }
 
 /// Boot the embedded controller + gateway + worker over loopback from the
-/// pre-derived typed Configs (delta's `derive_standalone`) and return a handle.
+/// pre-derived typed Configs (see `derive::derive_standalone`) and return a handle.
 pub async fn run_standalone(
     controller: controller::Config,
     mut gateway: gateway::Config,
@@ -114,11 +114,9 @@ pub async fn run_standalone(
     // The client edge binds `[worker.server] host:port` -- the only address in
     // the standalone file that looks like it decides this.
     //
-    // It did not. `[gateway] listen` decided it, that section is empty in every
-    // generated config, and its default is 0.0.0.0:8080 -- so a file saying
-    // `host = "127.0.0.1"` was serving on every interface. `pie local` used to
-    // paper over it by forcing loopback; deleting `pie local` removed the paper
-    // rather than the hole.
+    // On its own it does not: `[gateway] listen` decides it, that section is
+    // empty in every generated config, and its default is 0.0.0.0:8080 -- so a
+    // file saying `host = "127.0.0.1"` would serve on every interface.
     //
     // Overwritten rather than defaulted-from, because two spellings for one
     // bind address is what produced this: whichever loses is a line in a config
@@ -137,7 +135,7 @@ pub async fn run_standalone(
     let worker_addr = gw.worker_addr;
 
     // Boot the embedded worker against the injected control link, dialing INTO
-    // the in-proc gateway (M3 inversion — the same path a remote worker takes).
+    // the in-proc gateway — the same path a remote worker takes.
     let worker = worker::run_with(
         worker,
         control,

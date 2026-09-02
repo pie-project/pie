@@ -1,23 +1,8 @@
-//! Per-(model, engine) store registry (kv_refact.md, `store/registry.rs`).
+//! Per-(model, engine) store registry.
 //!
-//! Maps a model/engine pair to its owning `KvStore` and `RsStore` so
-//! `pipeline::fire` and the WIT host resources resolve handles without each
-//! component holding a direct store reference. Mirrors the retired
-//! `arena::registry` shape: an append-only static keyed by `model_idx`
-//! (lock-step with bootstrap model registration), each entry a `Vec` indexed
-//! by engine ordinal.
+//! Maps a model/engine pair to its owning `KvStore` and `RsStore` so `pipeline::fire` and the WIT host resources resolve handles without each component holding a direct store reference. An append-only static keyed by `model_idx` (lock-step with bootstrap model registration), each entry a `Vec` indexed by engine ordinal.
 //!
-//! ## Locking discipline (required)
-//! Lock a store **synchronously** for prepare/publication/settlement and release it
-//! **before** awaiting the engine — never across an `await`:
-//! ```text
-//! prepare: let mut kv = registry.kv.lock();   // sync
-//!          kv.prepare_write(..)               // sync
-//!          drop(kv);                          // unlock
-//!          engine copies + launch, await      // no lock held
-//! settle: let mut kv = registry.kv.lock();    // re-lock
-//!         kv.settle(..)                       // sync
-//! ```
+//! Locking discipline (required): lock a store synchronously for prepare/publication/settlement and release it before awaiting the engine — never across an `await`.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -26,17 +11,8 @@ use super::kv::KvStore;
 use super::rs::RsStore;
 use super::seat::SeatBook;
 
-/// parking_lot mutexes do not poison: a panic unwinding mid-mutation would
-/// leave a half-updated `KvStore` silently live (std's poisoning made the
-/// next `lock().unwrap()` crash loud). This taint flag restores fail-loud —
-/// set on unwind inside [`with_kv_lock`], asserted on every entry.
-///
-/// KNOWN BLAST RADIUS: the flag is process-global, not per-store — one
-/// panic taints every `(model, engine)` store in the process, and in the
-/// test binary a single panicking `with_kv_lock` cascades into every later
-/// KV test in the same process. Acceptable while deployment is one store;
-/// a multi-store runtime should move the flag beside the mutex it guards
-/// (a `KvStoreLock { mutex, tainted }` newtype in `Stores`).
+/// parking_lot mutexes do not poison, so this taint flag restores fail-loud on a panic mid-mutation: set on unwind inside [`with_kv_lock`], asserted on every entry.
+/// Process-global, not per-store: one panic taints every `(model, engine)` store in the process. Acceptable while deployment is one store.
 static KV_TAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct KvTaintOnPanic;
@@ -70,16 +46,10 @@ pub fn with_kv_lock<T>(
 /// The typed stores for one (model, engine).
 #[derive(Clone)]
 pub struct Stores {
-    // parking_lot: adaptive spinning beats the futex round trip under the
-    // contended herd (every guest's finalize/prepare takes this lock; the
-    // measured wake-herd lock storm cost ~2 ms per wave — §15).
+    // parking_lot: adaptive spinning beats the futex round trip under the contended herd (every guest's finalize/prepare takes this lock).
     pub kv: Arc<parking_lot::Mutex<KvStore>>,
     pub rs: Arc<Mutex<RsStore>>,
-    /// Which pool slot each working set's sequences sit in — the seat
-    /// `Lane::slot` states to the shell. Sized by the same `num_slots` the
-    /// `RsStore` is, because it is the same number: the engine advertises it
-    /// as `PoolFacts::state_slots` and the contract calls it
-    /// `Budgets::slots`, "how many sequences the pools seat at once".
+    /// Which pool slot each working set's sequences sit in — the seat `Lane::slot` states to the shell. Sized by the same `num_slots` as `RsStore`: both are "how many sequences the pools seat at once".
     pub seats: Arc<Mutex<SeatBook>>,
     /// Tokens per KV page for this model/engine.
     pub kv_page_size: u32,
@@ -100,14 +70,9 @@ pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[us
     )
 }
 
-/// Register a model's per-engine stores at bootstrap. Capacities come from
-/// the engine-preallocated static pools. Returns the assigned model index.
+/// Register a model's per-engine stores at bootstrap. Capacities come from the engine-preallocated static pools. Returns the assigned model index.
 ///
-/// `num_slots` is the engine's advertised `PoolFacts::state_slots` — the
-/// contract's `Budgets::slots`, "how many sequences the pools seat at once".
-/// It sizes both the recurrent-state pool and the [`SeatBook`], because a
-/// sequence's recurrent bank row and its seat are the same seat
-/// (`engine::fire`'s header: `Lane::slot` is the seat in BOTH pools).
+/// `num_slots` (the engine's `PoolFacts::state_slots`) sizes both the recurrent-state pool and the [`SeatBook`], since a sequence's recurrent bank row and its seat are the same seat.
 pub fn register_model_with_swap(
     kv_page_size: u32,
     num_kv_pages: &[usize],

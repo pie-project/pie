@@ -44,10 +44,8 @@ jobs:
       
       # The generated bindings under src/bindings are not checked by
       # `npm run build`, so an interface the runtime no longer offers would
-      # publish silently. This needs no toolchain and is what would have caught
-      # the actual drift; it also refuses to pass while the SDK reaches no
-      # forward-pass surface at all, which is the state today. See
-      # forward_refactor.md 10.4.
+      # publish silently. This needs no toolchain and is the check that
+      # catches that drift.
       - name: Check SDK targets a live WIT surface
         if: steps.info.outputs.path == 'sdk/inferlet/javascript'
         run: scripts/check-sdk-interfaces.sh

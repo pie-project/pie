@@ -1,20 +1,12 @@
 //! `RopeMrope`: the multimodal rotary — [`rope`](crate::elemwise::rope)'s
-//! partial arm over a position that is a triple (`.wiki/alto/multimodal.md`
-//! §2's second op).
+//! partial arm over a position that is a triple. A file of its own beside
+//! `rope.rs` since it reads a different stream (`[rows, 3]`) under a
+//! different section split, not just a differently-shaped position.
 //!
-//! A file of its own beside `rope.rs` rather than an arm inside it: the
-//! scalar rotations are one op family with one position stream, and this one
-//! reads a different stream (`[rows, 3]`) under a different statute (the
-//! section split). Sharing the file would have meant one entry with a
-//! sometimes-absent section triple, which is the shape the design's "a fourth
-//! axis with a fourth fact, not a flag" ruling says not to build.
-//!
-//! What is NOT here, deliberately: the fused `qk_rmsnorm_rotate_mrope` the
-//! unit next door already carries. That kernel is a fused norm-and-rotate for
-//! a trunk that norms its heads; this op is the plain rotation the trace
-//! names, and the two agree on the one thing that matters — the section
-//! formula, transcribed rather than shared, with the argument for that at the
-//! unit's header.
+//! Deliberately not here: the fused `qk_rmsnorm_rotate_mrope` the unit next
+//! door carries, for trunks that norm their heads. This op is the plain
+//! rotation the trace names; both agree on the section formula
+//! (transcribed, not shared).
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -29,14 +21,11 @@ const FILE: &str = "elemwise/rope_mrope.cuh";
 /// column in its grid.
 pub const AXES: u32 = 3;
 
-/// **THE 3D ROTARY, SECTION-SPLIT AND INTERLEAVED.**
-///
-/// `q` and `k` are rotated in place at their stated head geometry.
-/// `positions` is `i32`, one `(t, h, w)` triple per rotated row — a
-/// `[rows, 3]` rectangle, which is the mrope shape of the scalar entries'
-/// `[rows, 1]` position stream. `sections` is the checkpoint's own
-/// `mrope_section` (qwen36 states `[11, 11, 10]`); it is a trace constant,
-/// so it arrives stated rather than read from device memory.
+/// The 3D rotary, section-split and interleaved. `q` and `k` are rotated in
+/// place at their stated head geometry. `positions` is `i32`, one `(t, h, w)`
+/// triple per rotated row — a `[rows, 3]` rectangle. `sections` is the
+/// checkpoint's own `mrope_section`; a trace constant, so it arrives stated
+/// rather than read from device memory.
 ///
 /// `rotary_dim` is the rotated prefix of each head, as in
 /// [`rope::partial`](crate::elemwise::rope::partial) — state it equal to
@@ -71,23 +60,13 @@ pub fn interleaved(
     )
 }
 
-/// **THE TOWER'S ROTATION: CONTIGUOUS SECTIONS, EACH RESTARTING THE LADDER**
-/// (multimodal §6.3).
-///
-/// The operands and the refusals of [`interleaved`], over the other section
-/// layout — and the layout is the whole difference, so the two share every
-/// check and differ in one symbol. Pairs `[0, s0)` turn by `t`,
-/// `[s0, s0+s1)` by `h`, `[s0+s1, s0+s1+s2)` by `w`, and the `i`-th pair OF
-/// ITS BLOCK turns at `theta^(-2i / Σsections)`. `apply_rotary_pos_emb_vision`
-/// is what that transcribes; the tower states `[0, head_dim/4, head_dim/4]`,
-/// so it rotates by `(h, w)` and reads no `t`.
-///
-/// **THE PAIRING WAS NEVER THE DIFFERENCE.** §6.3 calls this "the half-split
-/// arm" against the interleaved one; both arms pair `(d, d + head_dim/2)`,
-/// which is `rotate_half`, and what the checkpoints' `mrope_interleaved`
-/// actually selects is how the SECTIONS are handed out. Recorded here so the
-/// next reader does not go looking for an adjacent-pair kernel that was never
-/// owed.
+/// The tower's rotation: contiguous sections, each restarting the ladder.
+/// Same operands and refusals as [`interleaved`], differing only in section
+/// layout: pairs `[0, s0)` turn by `t`, `[s0, s0+s1)` by `h`,
+/// `[s0+s1, s0+s1+s2)` by `w`, and the `i`-th pair of its block turns at
+/// `theta^(-2i / Σsections)`. Both arms pair `(d, d + head_dim/2)`
+/// (`rotate_half`); `mrope_interleaved` selects how the sections are handed
+/// out, not the pairing.
 ///
 /// # Errors
 ///
@@ -203,8 +182,8 @@ fn fire(
             stated(OP, sections[0])?.arg(),
             stated(OP, sections[1])?.arg(),
             stated(OP, sections[2])?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )

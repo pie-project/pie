@@ -1,14 +1,12 @@
 //! `MergeLse`: the cascade merge — two attention readings taken over
-//! DISJOINT key sets, folded back into one by their log-sum-exp columns.
+//! disjoint key sets, folded back into one by their log-sum-exp columns.
 //!
 //! The arms reach here already softmaxed against their own denominators, so
 //! neither `o` is a partial sum: the fold reweights them,
 //! `o = (o1 * 2^(lse1 - m) + o2 * 2^(lse2 - m)) / (2^(lse1 - m) + 2^(lse2 - m))`
-//! with `m = max(lse1, lse2)`, and publishes `m + log2(...)` as the merged
-//! column. The planes are base 2 because that is the base every lse in this
-//! crate is published in (`sdpa_lse_base2`), and the base cancels out of the
-//! weights either way — what it may not do is disagree with the consumer,
-//! and `attention.sink` reads base 2.
+//! with `m = max(lse1, lse2)`, publishing `m + log2(...)` as the merged
+//! column. The base is 2 because that is what every lse in this crate is
+//! published in, and `attention.sink` expects.
 //!
 //! A non-finite column is the empty reading — a fire whose arm saw no key —
 //! and its whole side is dropped rather than weighted, which is the only

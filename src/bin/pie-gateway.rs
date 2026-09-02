@@ -1,5 +1,5 @@
 //! `gateway` daemon — the client-facing edge plane (REST/SSE + WebSocket);
-//! workers dial IN. A thin bin shell (Seam 3): the `bootstrap` process skeleton
+//! workers dial IN. A thin bin shell: the `bootstrap` process skeleton
 //! composed with the `gateway` role library — only the two domain lines
 //! (`Config::parse` + `run`) and the role-specific flags differ from the other
 //! role bins.

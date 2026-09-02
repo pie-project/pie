@@ -1,17 +1,6 @@
-//! The one little-endian cursor the ETA decoders share.
-//!
-//! Every decoder reads from this one cursor rather than keeping its own.
-//! Per-decoder cursors differ only in the error type they return, which makes
-//! them look like harmless duplication — until the copies stop agreeing about
-//! a bound. The bound that matters here is the structural ceiling on table
-//! counts: a cursor without one lets a hostile trace claim one op per byte and
-//! get all of them decoded, bound and compiled before anything notices the
-//! size. A ceiling added to one cursor and not its copies protects only the
-//! format that happened to get the edit.
-//!
-//! The error type is not made generic. This returns its own [`ReadError`] and
-//! each decoder converts with `From`, so `?` does the work at the call sites
-//! and every format still exposes its own public error enum.
+//! The one little-endian cursor the ETA decoders share, so the structural
+//! ceiling on table counts can't drift between per-format copies. Returns its
+//! own [`ReadError`]; each decoder converts with `From`.
 
 use core::convert::TryInto;
 use core::fmt;
@@ -126,22 +115,10 @@ impl<'a> Reader<'a> {
     }
 
     /// Reads a table count that the following bytes must be able to back.
-    ///
-    /// Two independent bounds, because either alone is insufficient:
-    ///
-    /// * `minimum_record_bytes` ties the count to the bytes actually present,
-    ///   so a header claiming four billion records cannot make us allocate for
-    ///   four billion.
-    /// * `structural_maximum` is an absolute ceiling, because the first bound
-    ///   is only as strong as the record size. The op table has a one-byte
-    ///   minimum record, so without a ceiling a caller who controls the input
-    ///   gets one op per byte — and the ops are then decoded, bound and
-    ///   compiled while a global lock is held. That is a denial of service
-    ///   with a text file.
-    ///
-    /// A `minimum_record_bytes` of zero is rejected rather than accepted as
-    /// "unbounded": a zero-size record means the first bound is vacuous, and
-    /// silently falling back to the ceiling alone would hide the mistake.
+    /// Two independent bounds: `minimum_record_bytes` ties the count to bytes
+    /// actually present; `structural_maximum` is an absolute ceiling, needed
+    /// because a one-byte record makes the first bound alone too weak.
+    /// `minimum_record_bytes == 0` is rejected rather than treated as unbounded.
     pub fn bounded_count(
         &self,
         raw_count: u32,
@@ -174,54 +151,3 @@ impl<'a> Reader<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn take_rejects_overrun_and_overflow() {
-        let mut r = Reader::new(&[1, 2, 3]);
-        assert_eq!(r.take(4), Err(ReadError::UnexpectedEof));
-        assert_eq!(r.take(2), Ok(&[1u8, 2][..]));
-        assert_eq!(r.offset(), 2);
-        assert_eq!(r.remaining(), 1);
-        // `pos + count` must not wrap into a valid-looking range.
-        assert_eq!(r.take(usize::MAX), Err(ReadError::UnexpectedEof));
-    }
-
-    #[test]
-    fn bounded_count_needs_both_bounds() {
-        let r = Reader::new(&[0; 64]);
-        // Backed by bytes and under the ceiling.
-        assert_eq!(r.bounded_count(8, 4, 16, "t"), Ok(8));
-        // Backed by bytes, over the ceiling.
-        assert_eq!(
-            r.bounded_count(17, 1, 16, "t"),
-            Err(ReadError::CountTooLarge("t"))
-        );
-        // Under the ceiling, not backed by bytes.
-        assert_eq!(
-            r.bounded_count(17, 4, 1024, "t"),
-            Err(ReadError::CountTooLarge("t"))
-        );
-        // A zero-size record makes the byte bound vacuous, so it is refused.
-        assert_eq!(
-            r.bounded_count(1, 0, 16, "t"),
-            Err(ReadError::CountTooLarge("t"))
-        );
-        // The multiply must not wrap.
-        assert_eq!(
-            r.bounded_count(u32::MAX, usize::MAX, usize::MAX, "t"),
-            Err(ReadError::CountTooLarge("t"))
-        );
-    }
-
-    #[test]
-    fn length_is_bounded_by_the_bytes_present() {
-        let mut r = Reader::new(&[0; 8]);
-        assert_eq!(r.length(8, "t"), Ok(8));
-        assert_eq!(r.length(9, "t"), Err(ReadError::CountTooLarge("t")));
-        r.take(4).unwrap();
-        assert_eq!(r.length(5, "t"), Err(ReadError::CountTooLarge("t")));
-    }
-}

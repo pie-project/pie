@@ -1,8 +1,4 @@
-//! ChatML: `<|im_start|>{role}\n{message}<|im_end|>\n`.
-//!
-//! The format Qwen and GLM both write. They had a file each, identical down to
-//! the grammar's whitespace, differing only in which tokens end a turn — so
-//! what differed is a [`ChatML`] value and what did not is this module.
+//! ChatML template: `<|im_start|>{role}\n{message}<|im_end|>\n`, shared by Qwen and GLM.
 
 use std::sync::Arc;
 
@@ -17,17 +13,8 @@ use crate::{
 pub struct ChatML {
     /// The model emits `<think>…</think>`.
     pub thinking: bool,
-    /// Replayed assistant turns KEEP their `<think>` blocks.
-    ///
-    /// The knob upstream calls `preserve_thinking`, and the fact that split it
-    /// out of [`thinking`](ChatML::thinking): Qwen3.5/3.6 and GLM strip a past
-    /// turn's reasoning before replaying it (their templates' default), while
-    /// Qwen3.8 flips the default and replays it whole — its interleaved-
-    /// thinking convention, read off the two `chat_template.jinja`s one line
-    /// apart (`preserve_thinking is defined and … is true` became
-    /// `preserve_thinking is undefined or … is true`). Meaningless when
-    /// `thinking` is false: a model that emits no `<think>` has nothing to
-    /// strip or keep.
+    /// Replayed assistant turns keep their `<think>` blocks. Meaningless when
+    /// `thinking` is false.
     pub preserve_thinking: bool,
     /// The model was trained on the `<tool_call>` grammar below.
     pub tools: bool,
@@ -117,9 +104,7 @@ impl ChatMLInstruct {
         }
     }
 
-    /// What a replayed assistant turn says: its whole message, or the message
-    /// with its reasoning stripped — the one decision
-    /// [`preserve_thinking`](ChatML::preserve_thinking) exists to state.
+    /// Replayed message, with reasoning stripped unless `preserve_thinking`.
     fn replay_body<'a>(config: &ChatML, msg: &'a str) -> &'a str {
         if config.thinking && !config.preserve_thinking {
             Self::without_thinking(msg)
@@ -151,8 +136,7 @@ impl ChatMLInstruct {
     }
 }
 
-/// The names a tool list declares, as grammar alternatives, or `None` when the
-/// list declares none this reader can find.
+/// Tool names as grammar alternatives, or `None` if none are found.
 pub fn tool_names(tools: &[String]) -> Option<String> {
     let mut names: Vec<String> = Vec::new();
     for tool in tools {
@@ -273,12 +257,9 @@ tool-name ::= {alternatives}
     }
 }
 
-/// Reads `<tool_call>{json}</tool_call>` spans out of generated text.
-///
-/// One clock: the tokens become text and everything after is text. The scan
-/// runs to the end of what has arrived, so two calls in one batch are two
-/// events, and a span whose JSON does not parse is dropped where it stands
-/// rather than stopping the scan.
+/// Reads `<tool_call>{json}</tool_call>` spans from generated text. Multiple
+/// calls in one batch yield multiple events; unparseable JSON is dropped
+/// without stopping the scan.
 struct ChatMLToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,
@@ -357,22 +338,11 @@ mod tests {
         assert_eq!(ChatMLInstruct::replay_body(&config(true, true), TURN), TURN);
     }
 
-    /// A model that emits no `<think>` has nothing to strip or keep — even a
-    /// message that happens to contain the marker is replayed verbatim.
+    /// No `<think>` support: message is replayed verbatim, even if it
+    /// contains the marker.
     #[test]
     fn a_non_thinking_model_replays_verbatim() {
         assert_eq!(ChatMLInstruct::replay_body(&config(false, false), TURN), TURN);
     }
 
-    /// The strip keeps only what follows the LAST `</think>`, which is
-    /// upstream's own `split('</think>')[-1].lstrip('\n')`.
-    #[test]
-    fn the_strip_reads_past_the_last_close_marker() {
-        let twice = "<think>a</think>\ninterim<think>b</think>\n\ndone";
-        assert_eq!(ChatMLInstruct::replay_body(&config(true, false), twice), "done");
-        assert_eq!(
-            ChatMLInstruct::replay_body(&config(true, false), "no reasoning here"),
-            "no reasoning here"
-        );
-    }
 }

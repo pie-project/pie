@@ -26,13 +26,9 @@ pub use region::*;
 pub use signature::*;
 pub use symbolic::*;
 
-/// Cache-identity tokens, not wire-format versions.
-///
-/// Both engines fold these into the key of their compiled-module caches
-/// (`crates/driver-cuda/csrc/.../module_cache.hpp`, `crates/engine-metal/csrc/.../m1_runtime.cpp`), so
-/// bumping one is how a change in this crate's planning semantics invalidates
-/// everything a device already built. Nothing parses a byte stream stamped with
-/// them.
+/// Cache-identity tokens, not wire-format versions. Both engines fold these
+/// into their compiled-module cache keys, so bumping one invalidates
+/// everything a device already built.
 pub const COMPILER_VERSION: u16 = 3;
 /// Bumped when region partitioning changes shape. See [`COMPILER_VERSION`].
 pub const REGION_PLAN_VERSION: u16 = 4;
@@ -222,20 +218,11 @@ pub fn debug_stage_plan(stage: &CompiledStage) -> String {
     output
 }
 
-/// The graph-cache identity of one compiled stage.
-///
-/// An engine keys its graph cache on this value, so it is a decision about the
-/// program and belongs to the host. Every engine is handed the bytes rather
-/// than deriving them — the Metal runtime reads them out of
-/// `interface/driver/src/plan.rs`'s `identity` — because an engine-side copy of
-/// this derivation is a second definition of a cache key, and two definitions
-/// of a cache key that drift apart share graphs between programs that are not
-/// the same program.
-///
-/// Because the key is published, moving it is an operational event and not a
-/// refactor: a stale key is silent, reusing a graph built by a different
-/// planner. `stage_identity_is_pinned` in `compiler/tests` catches the move,
-/// and [`COMPILER_VERSION`] must be bumped alongside it.
+/// The graph-cache identity of one compiled stage. Every engine is handed
+/// the bytes rather than deriving them, so an engine-side copy can never
+/// drift into a second definition of the same key. A stale key is silent
+/// (reuses a graph built by a different planner), so [`COMPILER_VERSION`]
+/// must be bumped alongside any change here.
 pub fn stage_identity(stage: &CompiledStage) -> u64 {
     let mut hash = Fnv1a::new();
     hash.byte(stage.normalized.stage as u8);

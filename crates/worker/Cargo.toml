@@ -1,173 +1,93 @@
 [package]
 name = "worker"
-version = "0.4.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Standalone Pie server (no Python). Embeds a native engine in-process."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
-# Library half — the runtime boot path (serve::start_runtime, config types,
-# the supervisors). The `pie` CLI binary below is one consumer; the
-# `pie-server` Python wheel under `sdk/server/python/` is another.
+# The runtime boot path (serve::start_runtime, config types, the supervisors).
+# Consumed by the `pie` CLI and by the `pie-server` wheel under `sdk/server/python/`.
 [lib]
 name = "worker"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 
-# Binary half — the `pie` CLI. Parses argv via clap and dispatches into
-# the lib.
 [features]
-# Default = no embedded backend feature. Enable `engine-cuda-12` /
-# `engine-cuda-13` (Linux/NVIDIA -- the number is the CUDA runtime ABI this
-# binary will LOAD) to reach a device; without it, this crate builds and
-# serves nothing locally. `engine-metal` returned at P5; the other two shader
-# flavors (`engine-vulkan`, `engine-wgpu`) left the workspace with R3 and return at
-# P5 — see the root manifest's `exclude`.
-#
-# There used to be a third: an always-linked `driver-dummy` selected at
-# runtime, plus a `driver-dummy = []` no-op kept for older build commands.
-# Both are gone with the crate.
+# No embedded backend by default: without one this crate builds but serves
+# nothing locally.
 default = []
-# Each flavor turns on a DEPENDENCY, not a branch in this crate's build
-# script. Both engines are Rust now, so what this crate needs from them is
-# that they be in the graph.
-#
-# CUDA carries its runtime ABI in the name, and `_engine-cuda` is the private
-# "the CUDA shell is linked" gate every `#[cfg]` here is written against. See
-# `runtime`'s manifest for why there is no version-less `engine-cuda`.
-_engine-cuda = ["runtime/_engine-cuda"]
-engine-cuda-12 = ["_engine-cuda", "runtime/engine-cuda-12"]
-engine-cuda-13 = ["_engine-cuda", "runtime/engine-cuda-13"]
-# The Metal shell, BACK AT P5. Apple-only at the crate level, so unlike the
-# CUDA pair there is no ABI in the name and the flag alone is not a build that
-# links -- `runtime`'s seam pairs it with `target_vendor = "apple"`. Named
-# without an underscore because `worker` has no private gate to hide behind:
-# every `#[cfg]` here reads this flag directly.
-engine-metal = ["runtime/engine-metal"]
+# Each flavor turns on a dependency rather than a branch in this crate; both
+# engines are Rust, so all it needs is that they be in the graph.
+cuda = ["runtime/cuda"]
+# Apple-only at the crate level, so the flag alone is not a build that links:
+# `runtime`'s seam pairs it with `target_vendor = "apple"`.
+metal = ["runtime/metal"]
 nixl = ["dep:transport", "transport/nixl"]
 
-# Per-domain probe passthroughs. Each forwards to the runtime crate's
-# corresponding flag. See `crates/runtime/src/scheduler/probe.rs` for the
-# catalog of domains.
+# Probe passthrough to `runtime`; see `crates/runtime/src/scheduler/probe.rs`.
 profile-fire = ["runtime/profile-fire"]
 
 [dependencies]
-# `pie` is the runtime crate. After Phase 8 deleted the legacy
-# `pie._runtime` maturin module, runtime has no `python` feature to
-# disable — pyo3 only lives in `engine/bridge_py/` (the Rust extension
-# bundled into the `pie-driver-bridge` wheel via maturin), not in the
-# runtime crate itself.
 runtime = { path = "../runtime" }
 # Shared tarpc control-plane contract.
 controller-api = { path = "../controller-api" }
-# Gateway data-plane RPC contract (post-inversion M3): GatewayInbound +
-# WorkerControl traits + the shared spawn_twoway link glue. The worker dials
-# INTO the gateway and serves WorkerControl over the split connection.
+# Gateway data-plane RPC contract: the worker dials INTO the gateway and serves
+# WorkerControl over the split connection.
 worker-api = { path = "../worker-api" }
 
-# The runtime <-> engine vocabulary. A direct dep because this crate names
-# those types, not (as it once did) so its build script could receive a C
-# header directory through a `links` handoff.
+# The runtime↔engine vocabulary this crate names.
 engine = { path = "../engine" }
-# `Platform`, to say which shell a boot is for. One enum, from the crate that
-# owns it — this used to arrive through `engine`'s re-export of the whole IR.
+# `Platform`, to say which shell a boot is for.
 model-ir = { path = "../model-ir" }
 transport = { path = "../transport", optional = true }
-# Shared id atoms (WorkerId / NodeId / ReqId / SessionId) and the client wire
-# vocabulary (ClientMessage / ServerMessage) the gateway data plane carries.
+# Shared id atoms and the client wire vocabulary the gateway data plane carries.
 ids = { path = "../ids" }
 client-api = { path = "../client-api" }
 anyhow = "1.0"
-# `$PIE_HOME` fallback to the home directory (`crate::paths`).
-dirs = "6.0"
+# `$PIE_HOME` resolution (`bootstrap::paths::pie_home`); `bootstrap` is a leaf
+# crate and depends on no role library.
+bootstrap = { path = "../bootstrap" }
 rmp-serde = "1.3"
-# Verify content-addressed blob fetches (design §9): blake3(body) == BlobRef.hash.
+# Verify content-addressed blob fetches: blake3(body) == BlobRef.hash.
 blake3 = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
 tokio = { version = "1.53", features = ["full"] }
-# `serde-transport-bincode` = control-plane codec (pie-controller-rpc client). The
-# data-plane codec is single-sourced in `worker-api` (`dispatch_codec`,
-# MessagePack), so no `serde-transport-json` here.
+# `serde-transport-bincode` is the control-plane codec. The data-plane codec is
+# single-sourced in `worker-api` (MessagePack), so no `serde-transport-json`.
 tarpc = { version = "0.37", features = [
 	"serde-transport",
 	"serde-transport-bincode",
 	"tcp",
 	"unix",
 ] }
-# The WebSocket the standalone client server terminates (client wire vocabulary
-# comes from `pie-client`, already a dependency below).
+# The WebSocket the standalone client server terminates.
 tokio-tungstenite = "0.30.0"
 futures = "0.3.33"
 # `local_dynamic_tls`: the pyo3 wheel is dlopen()ed, and mimalloc's default
 # initial-exec TLS model cannot be satisfied by a late-loaded library.
 mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 tracing = "0.1"
-# Async HTTP client for the data-plane blob fetch (gateway_link.rs): the
-# worker pulls `GET {origin}/blob/{hash}` for multimodal inputs during
-# inference (design §9). Provisioning downloads (weights, py-runtime) live in
-# `bin/pie`, so no `blocking` here — blob fetch is async.
+# Data-plane blob fetch for multimodal inputs. No `blocking`: the fetch is
+# async, and provisioning downloads live in the `pie` binary.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 
-# Always-linked Rust dummy engine — random tokens, no model load.
 # `default-features = false` drops the loader's testkit (oracle, contract
-# fixture builder, CPU executor). Nothing under `ffi/` reaches them, and this is
-# what keeps that true.
+# fixture builder, CPU executor); nothing here reaches them.
 checkpoint = { path = "../checkpoint", default-features = false }
-# `model-compiler` STOOD HERE, with the note "no Rust in this process calls the
-# forward toolchain — the engines reach it over its C ABI — so the dependency
-# exists to put the rlib in the link and to order the build-script include
-# handoff." Neither half survives inspection: `build.rs` is a no-op since the
-# engines started building their own `csrc/`, and each engine names the
-# toolchain itself, so the rlib is in the link because an engine put it there.
-# The toolchain split made the dead edge visible — `model-compiler` means the
-# LOWERING now, and this crate does not lower anything — so it went.
-# The loader's C ABI. Depended on for two build-time reasons: the entry-point
-# anchor in `embedded_engine.rs`, and `DEP_PIE_LOADER_INCLUDE` — this crate's
-# `links = "pie_loader"` metadata — which `build.rs` hands to the C++ engines.
-# The artifact's compiled metadata is lifted here and handed to the runtime
-# whole. `tokenizer` names the objects that make up a `pie.tokenizer/1`, and
-# `runtime::model::ModelMetadata` is the shape the two halves travel in -- so
-# the worker lifts a snapshot's own `config.json` and reads it back out of an
-# artifact under the same name `convert` writes it under.
-#
-# `model` STOOD HERE and does not any more. It was here for `model::serve`, and
-# for nothing else: `ModelMetadata`, `encoding::CONFIG_OBJECT` and
-# `encoding::Encoding` were the only three names this crate ever spelled out of
-# that crate. M18 deleted the module, and the three did not land back in
-# `model` -- the first is `runtime`'s (the serving fabric states the shape of
-# its own boot bundle), the second is `weights.rs`'s own const, and the third
-# had no non-test caller left, because a checkpoint's quantization is read off
-# its stored tensor encodings now rather than off what its config claims.
-# Which leaves an edge to a crate this one names nowhere.
-#
-# THE LEGACY CRATE went the same way one wave earlier, and for the record: it
-# was here for the `contract` feature, whose whole use was those names, and for
-# `catalog::identify_artifact`, whose only reachable leg was "is the row this
-# artifact names one this build ships" -- `runtime::model::row` answers exactly
-# that, and `weights.rs` records the measurement that the other leg never once
-# succeeded.
+# The artifact's compiled metadata: `tokenizer` names the objects that make up
+# a `pie.tokenizer/1`, which the worker lifts and hands to the runtime whole.
 tokenizer = { path = "../tokenizer" }
 
-# Pie websocket client — used by `pie run` to drive an inferlet against
-# the engine subprocess we boot. Same crate the dummy_roundtrip example
-# uses.
+# Used by `pie run` to drive an inferlet against the engine subprocess we boot.
 client = { path = "../client" }
 
 [dev-dependencies]
 tempfile = "3"
-# So `RUST_LOG=error` reaches the CUDA harness. `kernels-cuda`'s `said` puts
-# the whole of WHY a device instantiation would not fire behind
-# `tracing::error!` -- the returned `KernelError::Device { call, code }` is a
-# `&'static str` and cannot carry it -- so without a subscriber a real fault
-# reads as "the compile, the load or the launch refused; see the log" and
-# there is no log. Finding one such fault meant patching an `eprintln!` into
-# another crate; this is that, once.
+# So `RUST_LOG=error` reaches the CUDA harness: `kernels-cuda` reports why a
+# device instantiation would not fire through `tracing::error!`, and the
+# returned `KernelError` cannot carry it.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-# `eta-ir` STOOD HERE and no test in this crate ever named it: the single
-# occurrence was `cuda_canaries.rs` quoting `eta_ir::validate`'s refusal
-# TEXT in a `//!` census, which is prose about another crate's message and
-# needs no edge. `[build-dependencies]` stood below it with no entries, which
-# is a section header for a `build.rs` this crate does not have.

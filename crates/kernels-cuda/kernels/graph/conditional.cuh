@@ -50,19 +50,48 @@ namespace pie::graph {
 /// `absent`: the caller states what an absent window means rather than having
 /// this kernel guess, because "no rows" and "no table" are not the same
 /// sentence.
+///
+/// # **THE `win` GUARD, AND WHY THE LANE COUNT COULD NOT STAY AN IMMEDIATE**
+///
+/// `set_conditional_byte` below says the rule this kernel had to learn: an
+/// immediate is a NODE PARAMETER, frozen at capture, which is the host branch
+/// a conditional exists to replace. `indptr` was a pointer for exactly that
+/// reason and `lanes` was not — and `lanes` is a LANE COUNT, which is the one
+/// number a `record::BodyKey` deliberately does not fix (it fixes each present
+/// class's row RUNG, a bound on the lane count and not the lane count). So a
+/// body captured at one split replayed its predicate at another: the setter
+/// read `indptr[lanes_at_capture]` out of a CSR holding `lanes_at_fire + 1`
+/// real bounds and a zeroed tail, read the zero as "this region has no rows",
+/// and SKIPPED THE BODY. The region never ran, its output rectangle kept the
+/// bytes the fire before it left there, and two identical fires answered
+/// differently — coherent, deterministic, and with no fault anywhere.
+///
+/// `win` is the region's staged live-geometry seat, whose word 2 is this
+/// fire's own lane count for this window (`engine_cuda::window::Windows::live`
+/// writes `[rows, row_offset, lanes, lane_offset]`, and
+/// `engine_cuda::window::Cursor::count_of` hands the address). It is the same
+/// `win` guard every seated point in this tree takes, for the same reason and
+/// with the same null: a fire that staged no seat — which is every fire off
+/// the bodies path, and those are never captured — falls back to the
+/// immediate, which is its own lane count and always was.
 __global__ void set_conditional(
     unsigned long long handle,
     const int* __restrict__ indptr,
     int lanes,
     unsigned int absent,
-    int arm)
+    int arm,
+    const unsigned int* __restrict__ win)
 {
     if (arm == 0) return;
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
+    // THE FIRE'S LANE COUNT, NOT THE CAPTURE'S. `win[2]` is this window's
+    // live lanes, staged per fire at an address the graph may bake.
+    const int at = (win != nullptr) ? static_cast<int>(win[2]) : lanes;
+
     unsigned int value = absent;
-    if (indptr != nullptr && lanes >= 0) {
-        value = (indptr[lanes] != 0) ? 1u : 0u;
+    if (indptr != nullptr && at >= 0) {
+        value = (indptr[at] != 0) ? 1u : 0u;
     }
     cudaGraphSetConditional(handle, value);
 }
@@ -119,17 +148,27 @@ namespace pie::graph {
 /// row count, because "take it anyway" is the safe direction for an `IF` and
 /// there is no such direction here — so the null is the gate's spelling of an
 /// arm that stands down.
+///
+/// **AND THE `win` GUARD IS `set_conditional`'s, FOR ITS REASON.** A SWITCH
+/// group only forms at `max_lanes == 1` today (`switch_groups`), so the stale
+/// immediate that broke the `IF` could not reach this arm — the lane count is
+/// one at capture and one at every replay. The seat is taken anyway: what
+/// makes the number safe here is a property of the GROUPING RULE, not of this
+/// kernel, and a predicate whose correctness rests on a bound somebody else
+/// may widen is a predicate that will be wrong quietly.
 __global__ void set_switch(
     unsigned long long handle,
     unsigned int arm,
     const int* __restrict__ indptr,
     int lanes,
-    int armed)
+    int armed,
+    const unsigned int* __restrict__ win)
 {
     if (armed == 0) return;
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    if (indptr == nullptr || lanes < 0) return;
-    if (indptr[lanes] == 0) return;
+    const int at = (win != nullptr) ? static_cast<int>(win[2]) : lanes;
+    if (indptr == nullptr || at < 0) return;
+    if (indptr[at] == 0) return;
 
     cudaGraphSetConditional(handle, arm);
 }

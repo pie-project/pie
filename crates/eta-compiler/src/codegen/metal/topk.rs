@@ -32,11 +32,8 @@ inline uint m3_topk_order_digit(float value, uint pass) {
 kernel void "#;
 
 /// The eleven bindings and three ids every grouped library sampler takes.
-///
-/// Published so the engine that binds them can be held to them: `engine-metal`
-/// writes eleven `setBuffer:` calls in this order and dispatches at the one
-/// width the first line refuses every other value of, and neither of those is
-/// derivable from anything else this crate exports.
+/// `engine-metal` writes eleven `setBuffer:` calls in this exact order and
+/// dispatches at the one width the first line accepts.
 pub const SIGNATURE: &str = r#"(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -155,7 +152,7 @@ const BODY: &str = r#"
   threadgroup_barrier(mem_flags::mem_device);
 "#;
 
-/// `emit_grouped_topk_msl`.
+/// Emits the grouped top-k MSL kernel source for one region.
 pub fn emit_grouped_topk(
     function_name: &str,
     stage: &CompiledStage,

@@ -1,19 +1,4 @@
-//! The §8 `Run`, in metal's encode world: one fire's dispatch state, and the
-//! one function that turns a plan id into a device handle.
-//!
-//! Long-lived state — the weight and arena tables, the cache pools — arrives
-//! pre-built and borrowed: building those tables is the shell's binding
-//! business (the successor of the old `bind/`), not this layer's. Fire-lived
-//! state — the input bindings, the plan payloads — is owned: a `Run` is
-//! constructed per fire and dropped with it.
-//!
-//! Everything here answers to one rule: a [`KernelError`] is about the
-//! backend, never about the plan (`model_exec::error`). A hole in a table,
-//! a cache id in a tensor seat, a plan consumed before its plan op — those
-//! are integrity failures of the shell or the compiler, and they panic with
-//! a sentence instead of dressing up as a backend refusal.
-//!
-//! [`KernelError`]: model_exec::KernelError
+//! One fire's dispatch state: resolves plan ids to device handles. Integrity failures panic rather than returning backend errors.
 
 use kernels_metal::attn::mla::MlaPlan;
 use kernels_metal::linear::moe::RoutedScratch;
@@ -27,19 +12,9 @@ use crate::dispatch::copy::CopyPlan;
 use crate::scratch::Scratch;
 use crate::window::{At, Window, Windows};
 
-/// One loader-resolved weight. Most rows are one dense handle; a quantized
-/// weight is two or three device planes under one `Def::Weight` id — the form
-/// this shell's one-handle rows once refused.
-///
-/// **THE ROW IS WHERE THE FORMAT IS SETTLED, AND IT IS SETTLED ONCE.** The
-/// two four-bit formats this shell serves differ in what a scale entry means
-/// (mxfp4's e8m0 byte is the whole dequantization; MLX affine's bf16 factor
-/// is half of it, the other half being the bank's zero points) and in how
-/// many codes share one — and a checkpoint is not uniform in either
-/// (`mlx_lm` publishes a 4-bit stack whose router gate is 8-bit). So the
-/// group size, the bit width and the presence of the third plane travel with
-/// the planes, inside [`Bank`], and every dispatch arm downstream picks its
-/// point off that one value rather than off a model-wide setting.
+/// One loader-resolved weight: most rows are a single dense handle; a quantized weight is 2-3
+/// device planes under one `Def::Weight` id, with group size and bit width traveling per-bank
+/// rather than model-wide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeightRow {
     /// One dense handle, resolved by [`Run::tensor`].
@@ -51,21 +26,18 @@ pub enum WeightRow {
 }
 
 /// Loader-resolved weights, one row per `Trace::params` entry —
-/// `Def::Weight(i)` resolves to row `i`. `None` marks a param the shell has
-/// not bound; resolving such a row is a binding bug and panics.
+/// `Def::Weight(i)` resolves to row `i`.
+/// `None` marks an unbound param; resolving it is a binding bug and panics.
 #[derive(Clone, Debug, Default)]
 pub struct WeightTable(pub Vec<Option<WeightRow>>);
 
-/// Arena slots at the compiler's offsets, `ValueId`-indexed. Op outputs and
-/// merges alike land here: the compiler aliased every merge arm onto one
-/// slot and wrote that slot at the merged id's row too, so a φ resolves like
-/// any op output. Rows for ids that own no arena slot (inputs, weights,
-/// caches, structs) stay `None`.
+/// Arena slots at the compiler's offsets, `ValueId`-indexed. A merge aliases onto its op's slot,
+/// so both resolve the same row. `None` for ids with no arena slot (inputs, weights, caches,
+/// structs).
 #[derive(Clone, Debug, Default)]
 pub struct SlotTable(pub Vec<Option<Tensor>>);
 
-/// One resolved cache space — the storage pointer and nothing else (design
-/// §7); its geometry rides in [`FireBindings`] as declared inputs.
+/// One resolved cache space: the storage pointer only; geometry rides in [`FireBindings`].
 #[derive(Clone, Copy, Debug)]
 pub enum CachePool {
     /// A paged kv space (`CacheRow::Kv`).
@@ -78,9 +50,8 @@ pub enum CachePool {
 #[derive(Clone, Debug, Default)]
 pub struct CacheTable(pub Vec<CachePool>);
 
-/// The geometry vectors one cache space declared. Only what the plan names
-/// gets bound, so every seat is optional; resolving an unbound seat is a
-/// binding bug and panics.
+/// The geometry vectors one cache space declared. Only what the plan names gets bound, so every
+/// seat is optional; resolving an unbound seat is a binding bug and panics.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CacheGeometry {
     /// `RuntimeInput::Geometry { kind: Indptr }`.
@@ -111,21 +82,15 @@ pub struct CacheGeometry {
     pub write_offset: Option<Tensor>,
 }
 
-/// The per-fire tables the sdpa shaders read beside the pool. Positions ride
-/// in [`FireBindings::positions`]; these are the rest. `attention.plan_*`
-/// names kv geometry instead of these, so the plan-building arms bind them
-/// from here; `mask` alone is op-named too now (`attention.masked`), and
-/// [`Run::tensor`] resolves `RuntimeInput::Mask` onto the same seat. This is
-/// the engine side of the seam the `MENLO-SEAM` markers in
-/// `kernels_metal::attn` describe.
+/// Per-fire tables the sdpa shaders read alongside the pool; positions live in
+/// [`FireBindings::positions`].
 #[derive(Clone, Copy, Debug)]
 pub struct FireTables {
     /// `i32`, one per token: the owning request.
     pub request_of_token: Tensor,
 
-    /// `u8` packed mask planes, one row per request — the plan builders'
-    /// table and `RuntimeInput::Mask`'s resolution, one seat wearing both
-    /// names.
+    /// `u8` packed mask planes, one row per request — shared with `RuntimeInput::Mask`'s
+    /// resolution.
     pub mask: Tensor,
 
     /// `u8`, one per request: whether its mask row is live.
@@ -135,30 +100,8 @@ pub struct FireTables {
     pub mask_stride: u32,
 }
 
-/// The dsv4 compressor state `attention.pool_gather` reads beside its cache —
-/// the engine side of the `MENLO-SEAM` marker at
-/// `kernels_metal::attn::pool::gather`.
-///
-/// **NOT A FIELD OF [`FireTables`], AND THE CUDA SIBLING'S SEAT IS WHERE IT
-/// WOULD HAVE GONE.** `engine_cuda::FireTables` carries a
-/// `pool_state: Option<PoolSlabs>` because on that plane the shell binds the
-/// slabs into every fire's tables. This plane already has the shape for a
-/// state slab no op names and no fire stages: [`crate::scratch`]'s `index`
-/// role, reserved at load iff the trace names the op that reads it and minted
-/// at the node that does. The pool state is that same noun — bytes the shell
-/// owns, addressed by the paged slot and not by a fire row — so it is
-/// reserved the same way, and a fire whose plan has no pooled layer pays it
-/// no handle row and no bytes.
-///
-/// **AND WHAT IS INSIDE THEM IS WRITTEN NOW.** The two slabs are the
-/// `wkv`/`wgate` projections' outputs, and for as long as no node computed
-/// either the shell reserved the room the addressing needs and the room held
-/// zeros — the gather fired and pooled nothing.
-/// `attention.pool_state_write` is the writer: the model text projects the
-/// compressor's two planes per token and scatters them into the source
-/// cache's own cell, which is why this reservation is now ONE PLANE PER
-/// POOLED SPACE (`crate::scratch`'s `pool` field) rather than one for the
-/// artifact.
+/// The dsv4 compressor state `attention.pool_gather` reads beside its cache. Reserved only when
+/// the trace has a pooled layer, so a fire with none pays no bytes.
 #[derive(Clone, Copy, Debug)]
 pub struct PoolSlabs {
     /// The rolling kv window: `[the source pool's cells, coff * head_dim]`,
@@ -171,20 +114,8 @@ pub struct PoolSlabs {
 
 /// What the engine binds each fire, owned by the [`Run`] for its lifetime.
 ///
-/// `tokens`, `positions`, and `geometry` are the op-visible inputs —
-/// `RuntimeInput` routes onto them in [`Run::tensor`]. The `tables` are
-/// ambient: the plan builders read them and no op names them.
-///
-/// **TWO FIELDS THE CUDA SIBLING'S TWIN CARRIED ARE GONE, AND FOR THE
-/// REASONS THAT SIBLING RECORDED.** `facts` — the fire-wide fact word — was
-/// deleted from the CUDA shell in palo build log 8 with zero readers, and
-/// deleted here for the same reason: which classes run a node is
-/// `Region::mask` resolved per region against the window table, which is
-/// exactly what a fire-wide word cannot say (design §0's collapse). And the
-/// shared `indptr` is gone because a ragged view is assembled from the
-/// WINDOW's own rebased boundaries ([`Run::qo_indptr`]) — a fire-wide vector
-/// handed to a windowed launch sends every entry past the end of the
-/// rectangle it was given, by exactly the rows the classes before it hold.
+/// `tokens`, `positions`, and `geometry` are op-visible (`RuntimeInput` routes onto them in
+/// [`Run::tensor`]); `tables` are ambient — read by the plan builders without an op naming them.
 #[derive(Clone, Debug)]
 pub struct FireBindings {
     /// `RuntimeInput::Tokens`: ragged `i32`, one id per token.
@@ -194,25 +125,11 @@ pub struct FireBindings {
     /// token — also the plan builders' causal-bound table.
     pub positions: Tensor,
 
-    // adapter — lane J's one field here, kept contiguous.
-    /// `RuntimeInput::AdapterRoutes`: `i32`, one adapter id per token row,
-    /// `-1` for a row whose lane routes nowhere.
-    ///
-    /// **HERE AND NOT IN [`FireTables`], BECAUSE AN OP NAMES IT.** Everything
-    /// on `tables` is a seat no `Operands` impl mentions; this one is a
-    /// declared `RuntimeInput` that `linear.lora_correct` lists among its
-    /// inputs, so it stands beside `tokens` and `positions`.
-    ///
-    /// `None` for a fire no lane carried an adapter into, and that absence is
-    /// load-bearing: nothing staged, no seat bound, and the axis costs the
-    /// fire zero bytes and zero launches, because its window is empty and the
-    /// walk skips it.
+    /// `RuntimeInput::AdapterRoutes`: `i32`, one adapter id per token row, `-1` for a row whose
+    /// lane routes nowhere. `None` for a fire no lane carried an adapter into — costs zero bytes
+    /// and zero launches.
     pub adapter_routes: Option<Tensor>,
 
-    // patch — the second row axis's six inputs plus the trunk's triple, kept
-    // contiguous for `adapter_routes`' reason: every one is a declared
-    // `RuntimeInput` an op names, and every one is `None` for a fire whose
-    // lanes carried no image.
     /// `RuntimeInput::Patches`: `[patch rows, C·T·P²]` in the plan's element.
     pub patches: Option<Tensor>,
 
@@ -221,13 +138,9 @@ pub struct FireBindings {
     /// out of.
     pub patch_segments: Option<Tensor>,
 
-    /// `RuntimeInput::PatchRoutes`: `i32`, `[patch rows]`, one destination
-    /// TOKEN row per tower row, `-1` for a row the fold spends and nothing
-    /// places.
-    ///
-    /// **THE ONE VECTOR THAT CROSSES THE TWO AXES**, and therefore the one
-    /// the shell has to check host-side: an entry past the fire's token rows
-    /// is an out-of-bounds device write no arena faults on.
+    /// `RuntimeInput::PatchRoutes`: `i32`, `[patch rows]`, one destination token row per tower
+    /// row, `-1` for a row the fold spends. Host-checked: an out-of-range entry is an OOB device
+    /// write the arena doesn't catch.
     pub patch_routes: Option<Tensor>,
 
     /// `RuntimeInput::PatchPositions`: `i32`, `[patch rows, 3]`.
@@ -240,9 +153,9 @@ pub struct FireBindings {
     /// `RuntimeInput::PatchEmbedWeights`: `f32`, `[patch rows, taps]`.
     pub patch_embed_weights: Option<Tensor>,
 
-    /// `RuntimeInput::MropePositions`: `i32`, `[rows, 3]` — the TRUNK's
-    /// triple-wide stream, on the TOKEN axis and staged for every fire of a
-    /// plan that declares the rotation, image or no image.
+    /// `RuntimeInput::MropePositions`: `i32`, `[rows, 3]` — staged for every fire of a plan that
+    /// declares the rotation, image or no image; a lane with no stream of its own reads the
+    /// scalar `(p, p, p)`.
     pub mrope_positions: Option<Tensor>,
 
     /// Per cache space, aligned with `Trace::caches`:
@@ -252,26 +165,18 @@ pub struct FireBindings {
     /// The fire tables the attention plan builders consume.
     pub tables: FireTables,
 
-    /// **THE OBSERVABILITY SEAT** (`.wiki/alto/attn-score.md` §4), `None` for
-    /// a load whose plan declares no `attn.scores` export and for every fire
-    /// of a load whose lanes all asked for nothing.
-    ///
-    /// A `MENLO-SEAM` in the strict sense — no `Operands` impl mentions the
-    /// slab, and no `Operands` impl should: the score write is not a value the
-    /// graph computes for another node, it is an OBSERVATION the graph makes
-    /// on its way past. What the IR names is the capture arm, and the capture
-    /// arm is `attention.prefill_lse`, which the plan already carried.
-    ///
-    /// It stands here rather than on [`FireTables`] for `adapter_routes`'s
-    /// reason one field up: the seat carries a list (which value is which
-    /// plane) and `FireTables` is the `Copy` half.
+    /// Score-capture output slab. `None` unless the plan
+    /// declares an `attn.scores` export and a lane in this fire asks for it.
     pub scores: Option<crate::scores::ScoreSeat>,
+
+    /// **The recurrent-state seat** (`crate::rs`): `Some` only for a fire in which a lane
+    /// buffers or replays recurrent state, and then the SSM and hasher ops take the committed
+    /// arm (`crate::dispatch::rs`). `None` is every fire that folds in the forward, whose walk
+    /// is byte for byte what it was before the seat existed.
+    pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
 }
 
-/// One built plan payload. An enum over the three kinds this plane can be
-/// asked to build, not `Box<dyn Any>`: the IR's `StructKind` is closed, and
-/// this crate names every payload type at compile time — erasure would buy
-/// no generality, only a silent-downcast failure mode. Here a wrong kind is
+/// One built plan payload — closed enum over the three kinds this plane builds; a wrong kind is
 /// a named panic.
 #[derive(Clone, Copy, Debug)]
 pub enum StructSlot {
@@ -281,37 +186,29 @@ pub enum StructSlot {
     /// `StructKind::AttnPrefillPlan`.
     Prefill(PrefillPlan),
 
-    /// `StructKind::MlaPlan` — an empty payload: this plane's mla flash engine
-    /// reads the fire's position/owning-request tables and the pool page walk
-    /// at each attention arm, so the plan carries no device state and is stored
-    /// only to give decode and prefill the struct value they name.
+    /// `StructKind::MlaPlan` — empty: this engine reads the fire's position/owning-request
+    /// tables and the pool page walk directly at each attention op, so no payload is needed.
     Mla(MlaPlan),
 }
 
-/// One fire's dispatch state: the encode sink, the resolution tables, the
-/// fire bindings, and the plan payloads this fire builds. The shell
-/// constructs one per fire and drives the substrate's walk
-/// (`model_exec::fire::walk`) over it — prepare phase first, so every plan
-/// payload exists before its consumers encode.
+/// One fire's dispatch state: encode sink, resolution tables, fire bindings and plan payloads.
+/// Constructed once per fire; the walk runs prepare phase first so every plan payload exists
+/// before its consumers encode.
 pub struct Run<'c> {
-    /// The encode sink — the real shell behind `dyn Encode`. Everything this
-    /// crate does to the device goes through it; nothing here names Metal.
+    /// The encode sink; everything device-facing goes through it — nothing here names Metal
+    /// directly.
     ctx: &'c Ctx<'c>,
 
-    /// The handle table every carve is minted into and every argument is
-    /// resolved through. A windowed cut IS a new row here — Metal binds a
-    /// buffer and an offset, so there is no address to add a row stride to.
+    /// Handle table every carve is minted into and every argument resolves through. A windowed
+    /// cut is a new row here (Metal binds a buffer and an offset, so there is no address to add
+    /// a stride to).
     handles: &'c Handles,
 
-    /// The routing: `Trace::values`, read by [`Run::tensor`] to send each id
-    /// to its table.
+    /// The routing: `Trace::values`, read by [`Run::tensor`] to send each id to its table.
     values: &'c [ValueDecl],
 
-    /// `Trace::nodes`, read by ONE caller and named here rather than passed
-    /// to it: `crate::dispatch::copy` walks a copied region's node range to
-    /// find which rectangles it moves, and the walk's `Serve` signature hands
-    /// it a `&Region` and nothing else. Same borrow, same lifetime and same
-    /// reason as [`values`](Run::values) beside it.
+    /// `Trace::nodes` — read only by `crate::dispatch::copy`, which walks a copied region's node
+    /// range.
     nodes: &'c [Node],
 
     /// `Def::Weight` rows, loader-resolved.
@@ -324,21 +221,9 @@ pub struct Run<'c> {
     /// [`Run::recurrent`], never through [`Run::tensor`].
     caches: &'c CacheTable,
 
-    /// Plan payloads: filled by the plan-building arms in the prepare phase,
-    /// read by the consuming arms afterwards.
-    ///
-    /// **KEYED BY `(RUN, VALUE)`, NOT BY VALUE**, and the extra key is P4's
-    /// split (design §3). A schedule is carved for ONE window, so a region the
-    /// layout could not seat carves one per interval of it — all built in the
-    /// prepare phase, all read in the capture phase. One slot per value would
-    /// let run 1's builder overwrite run 0's, and run 0's encode would then
-    /// read a schedule describing run 1's requests: not a fault, just wrong
-    /// logits for the lanes in the first interval.
-    ///
-    /// Flat rather than nested, at `run * values + value`: a plan has
-    /// thousands of values and a `Vec` per value would be thousands of
-    /// allocations per fire, where this is one. The width is
-    /// [`Windows::max_runs`] — `1` for every artifact P4 seated whole.
+    /// Plan payloads, filled in the prepare phase and read in the capture phase. Keyed by
+    /// `(run, value)` — flat at `run * values_wide + value` — since a region split into multiple
+    /// window-runs needs one slot per run, not per value.
     structs: Vec<Option<StructSlot>>,
     /// How many values one run's slice of [`structs`](Run::structs) holds.
     values_wide: usize,
@@ -350,41 +235,18 @@ pub struct Run<'c> {
     /// class table. Indexed by [`place`](Run::place).
     windows: &'c Windows,
 
-    /// Which region the walk is inside and which run of its window, written
-    /// by [`Cursor`](crate::window::Cursor) on `region_begin` and on `run` —
-    /// before that region's nodes are dispatched, and before each encode of
-    /// them. **THIS IS THE WHOLE MIXED-FIRE MECHANISM**: the walk's `Dispatch`
-    /// signature is fixed and carries no region, so the sink and the resolver
-    /// share one cell instead.
+    /// Which region/run the walk is currently on, written by [`Cursor`](crate::window::Cursor)
+    /// before each region's dispatch and before each encode within it.
     place: &'c At,
 
-    // fallback.copy — the one field a copied region adds, seated by the
-    // gather and read until the scatter.
-    /// **The copied region the walk is inside**, or the default no cursor
-    /// ever names.
-    ///
-    /// `model_exec::fire::walk` brackets a copied region's nodes with
-    /// `Serve::gather` and `Serve::scatter`, and the gather is what decides
-    /// where in the scratch role each of the region's rectangles was laid
-    /// down. Every operand resolved between the two brackets has to answer
-    /// THAT layout, so the plan is seated here on the way past and read back
-    /// by [`Run::compacted`]. It carries the region index it was built for,
-    /// so a stale plan is a panic with a sentence rather than a silent read
-    /// of another region's offsets.
+    /// The copied region the walk is inside, or the default when none is active. Carries the
+    /// region index it was built for, so a stale plan (built for a different region) panics
+    /// rather than reading the wrong offsets.
     copy: CopyPlan,
 
-    // scratch — the load-time working plane and the two tables that ride
-    // with it, kept contiguous.
-    /// The shell's scratch reservation (`crate::scratch`): the working
-    /// rectangles a dispatch arm needs and no op names, plus the arena's slot
-    /// capacities and the routers' expert counts.
-    ///
-    /// **BORROWED, NOT OWNED, AND MINTED PER FIRE.** The reservation is one
-    /// allocation made at load and never moved; what a fire has is a handle
-    /// row into it, minted on the way past like every arena row and dropped
-    /// by the same `Handles::rewind`. So this field is the same kind of thing
-    /// [`weights`](Run::weights) is — a table the shell built once — and the
-    /// accessors below are where a rectangle of it becomes a `Tensor`.
+    /// Load-time scratch reservation: working rectangles no op names, plus arena slot capacities
+    /// and router expert counts. Borrowed, not owned — built once at load; each fire mints its
+    /// own handle row into it, like every other arena row.
     scratch: &'c Scratch,
 }
 
@@ -427,11 +289,8 @@ impl<'c> Run<'c> {
         self.windows.at(self.place.region.get(), self.place.run.get())
     }
 
-    /// Where this run's payload for `id` sits in [`structs`](Run::structs).
-    ///
-    /// The run comes off the same cell the window does, so a schedule is
-    /// stored and read at the same key by construction — a builder cannot
-    /// carve for one interval and an encode read another.
+    /// Where this run's payload for `id` sits in [`structs`](Run::structs); same run/window
+    /// pairing as [`window`](Run::window).
     fn struct_at(&self, id: ValueId) -> usize {
         self.place.run.get() as usize * self.values_wide + id.0 as usize
     }
@@ -441,15 +300,7 @@ impl<'c> Run<'c> {
         self.window().indptr
     }
 
-    /// The same vector, host-side — what an entry that needs to READ a
-    /// boundary (rather than bind it) takes.
-    ///
-    /// Unread today: every metal entry that is boundary-aware takes the
-    /// pair (`RaggedTensor`) and walks it on the device. Kept beside
-    /// [`Run::multi_token`] and [`Run::total_tokens`], which are the two
-    /// questions a host-side arm-picking builder would ask of it, because
-    /// the answer is one line and re-deriving it in a dispatch arm is how
-    /// two readings of one window come to disagree.
+    /// Host-side copy of the qo boundaries, for an arm that needs to read rather than bind them.
     #[allow(dead_code)]
     pub(crate) fn qo_indptr_host(&self) -> &'c [i32] {
         &self.window().indptr_host
@@ -470,46 +321,9 @@ impl<'c> Run<'c> {
             .any(|pair| pair[1] - pair[0] > 1)
     }
 
-    /// A raw ambient table, cut to this window's ROWS.
-    ///
-    /// The plan builders' tables (`positions`, `request_of_token`, the mask
-    /// planes) are staged once per fire at absolute fire rows, and the
-    /// shaders index them by the LOCAL row of the launch — `req_of_token[row]`
-    /// where `row` runs `0..q.rows`. So a windowed launch needs them cut the
-    /// way its `q` is. They are not `ValueId`s, so [`Run::tensor`]'s
-    /// declaration-driven cut cannot reach them and this is the same
-    /// arithmetic, stated for a bare handle.
-    ///
-    /// What stays ABSOLUTE is what the shaders index by lane through a
-    /// value the table itself holds: `request_of_token`'s entries are lane
-    /// ids into the fire-wide `page_indptr`, and cutting the vector does not
-    /// renumber its contents — which is exactly the property that makes one
-    /// page table serve every window.
-    ///
-    /// **AND A GATHERED WINDOW'S ROWS ARE NOT A SLICE, SO TWO OF THESE
-    /// TABLES ARE ANSWERED BY NAME.** A `Fallback::Copy` window covers rows
-    /// the fire keeps in several intervals, laid down contiguously by the
-    /// gather (`crate::window::Gathered`); the shaders still index them by the
-    /// launch's own row, so `positions` and `request_of_token` have to be
-    /// PERMUTED and not cut. They are `i32`, which
-    /// `kernels_metal::layout::gather_rows` does not stamp, so the permutation
-    /// is done on the host at `Windows::of` and staged
-    /// ([`Gathered::positions_host`](crate::window::Gathered::positions_host))
-    /// — and this is where the twin is handed back.
-    ///
-    /// **WHICH TABLE IS ASKED BY THE HANDLE, AND THAT IS THE HONEST KEY.**
-    /// This method takes a bare `Tensor` because the plan builders' tables are
-    /// not `ValueId`s, so there is no declaration to route on; what identifies
-    /// the vector is the row [`crate::inputs::Inputs::write`] minted for it,
-    /// one per table per fire. Answering here rather than at each call site is
-    /// deliberate: a gather is a permutation, and a call site that forgot to
-    /// ask for the twin would read the first `n` fire rows in fire order —
-    /// plausible numbers, wrong requests, no fault.
-    ///
-    /// The mask plane and its enable column are NOT permuted, and
-    /// [`Copies::enabled`](crate::window::Copies::enabled) is why: a fire any
-    /// lane masked never copies, so the enable column is all zeros and any
-    /// `rows` of it are the same `rows` of zeros.
+    /// A raw ambient table (not a `ValueId`), cut to this window's rows. For a
+    /// gathered window, `positions`/`request_of_token` are permuted rather
+    /// than sliced (a gather's rows aren't contiguous); the mask is never permuted.
     pub(crate) fn cut_rows(&self, handle: Tensor) -> Tensor {
         if let Some(gathered) = &self.window().gathered {
             if handle.buf == self.fire.positions.buf {
@@ -541,30 +355,15 @@ impl<'c> Run<'c> {
         self.values
     }
 
-    /// One value's FIRE-WIDE rectangle, uncut — what a copy plan compacts
-    /// FROM, and what a scatter puts back.
+    /// One value's fire-wide rectangle, uncut — what a copy plan compacts from, and what a
+    /// scatter puts back.
     pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
         self.whole(id)
     }
 
-    /// Where a handle actually points: which reservation, and how far into
-    /// it.
-    ///
-    /// **THIS IS THE COPY PLAN'S KEY, AND ON THIS PLANE IT CANNOT BE THE
-    /// HANDLE.** The CUDA sibling keys its plan by `Tensor::ptr`, an address,
-    /// which two values the carve aliased onto one column answer identically —
-    /// so an in-place op reads and writes one compacted rectangle. Here
-    /// `crate::arena::carve` mints a row per VALUE, following the arena root
-    /// for the offset but never for the row, so two aliased values answer two
-    /// different `u32`s at one offset. Keying by the handle would give an
-    /// in-place op two staging rectangles and stop it being in place; keying
-    /// by the resolved `(reservation, offset)` is the same fact the address
-    /// was.
-    ///
-    /// `None` for [`NIL`](crate::device::handles::NIL) and for a row this
-    /// fire did not mint — neither of which a plan operand can be, and both
-    /// of which are answered rather than panicked because a copy plan that
-    /// cannot key a rectangle simply does not move it.
+    /// Where a handle actually points: `(reservation, offset)` — the copy
+    /// plan's key, since two values aliased onto one arena slot get
+    /// different handle rows at the same offset. `None` for an unminted row.
     pub(crate) fn address(&self, handle: u32) -> Option<(u64, u64)> {
         let row = self.handles.get(handle)?;
         Some((crate::device::alloc::slab_id(row.slab()), row.offset()))
@@ -572,7 +371,7 @@ impl<'c> Run<'c> {
 
     /// Seat the plan a copied region's gather just built — read back by
     /// [`Run::compacted`] for every operand until the region's scatter.
-    pub(crate) fn seat_copy(&mut self, plan: CopyPlan) {
+    pub(crate) fn set_copy(&mut self, plan: CopyPlan) {
         self.copy = plan;
     }
 
@@ -582,13 +381,8 @@ impl<'c> Run<'c> {
         &self.copy
     }
 
-    /// One rectangle of the copy role, minted for this fire.
-    ///
-    /// A mint that fails is an INTEGRITY failure and not a refusal, for
-    /// [`Run::slice`]'s reason; a role that does not HOLD the span is the
-    /// caller's refusal to make, so the two are separated: `None` is
-    /// "reserved smaller than this", and the panic is "the handle table is
-    /// full".
+    /// One rectangle of the copy role, minted for this fire. `None` means the load reserved too
+    /// little for it; a panic means the handle table itself is full.
     pub(crate) fn copy_room(&self, offset: u64, bytes: u64) -> Option<u32> {
         Some(
             self.scratch
@@ -600,6 +394,17 @@ impl<'c> Run<'c> {
     }
 
     /// The encode sink, for the arms.
+    /// The fire's handle table, for an arm that mints its own cuts.
+    pub(crate) fn handles(&self) -> &'c Handles {
+        self.handles
+    }
+
+    /// This fire's recurrent seat (`crate::rs`), or `None` for a fire every
+    /// lane of which folds in the forward — the ordinary path, untouched.
+    pub(crate) fn rs_seat(&self) -> Option<std::sync::Arc<crate::rs::Seat>> {
+        self.fire.rs.clone()
+    }
+
     pub(crate) fn ctx(&self) -> &'c Ctx<'c> {
         self.ctx
     }
@@ -609,18 +414,9 @@ impl<'c> Run<'c> {
         &self.fire
     }
 
-    /// One rectangle, sliced to `keep` rows starting at `skip`.
-    ///
-    /// The one place a windowed cut becomes a handle. A CUDA shell answers
-    /// this with `ptr + skip * stride` and no state; here the row is minted
-    /// into [`Handles`], which is also where the bounds check lives — a cut
-    /// past the end of the reservation is caught before a shader
-    /// dereferences it.
-    ///
-    /// A cut that fails is an INTEGRITY failure, not a refusal: the offsets
-    /// come from the compiler's carve and the composition's window table,
-    /// and a disagreement between those two is a bug in this crate or in the
-    /// bake. It panics with a sentence, per the file's rule.
+    /// One rectangle, sliced to `keep` rows starting at `skip`; minted into
+    /// [`Handles`], which bounds-checks it. A failing cut is an integrity
+    /// failure (compiler carve vs. window table disagreement), and panics.
     fn slice(&self, handle: Tensor, skip: u32, keep: u32) -> Tensor {
         if skip == 0 && keep >= handle.rows {
             return handle;
@@ -647,34 +443,13 @@ impl<'c> Run<'c> {
     }
 
     /// One value's rectangle, cut to the window of the node asking for it.
-    ///
-    /// **EVERY ROW-SHAPED TABLE IN THIS SHELL IS INDEXED BY ABSOLUTE FIRE
-    /// ROW** — the arena carve gives a `Dim::Tokens` value one column at the
-    /// fire's row count, the geometry vectors one entry per fire lane — so a
-    /// window is a slice, and which slice is read off the value's own leading
-    /// `Dim`. A `Dim::Const` column (a weight plane, a bias) is not
-    /// fire-aligned and is handed over whole.
-    ///
-    /// `GeomKind::Indices` is the one declared shape that is not what it
-    /// says: the IR spells the flat page-id list `Dim::Lanes` because it has
-    /// no page symbol, and its entries are pages rather than lanes. Slicing
-    /// it by a lane offset would hand a windowed consumer somebody else's
-    /// pages, so it is excluded — and its bounds vector stays absolute,
-    /// which is what makes a sliced `Indptr` still address the whole list.
-    ///
-    /// `RuntimeInput::Mask` is the second of those, for the same reason: the
-    /// IR spells the mask slab `Dim::Tokens` and its entries are (query,
-    /// key) BITS, so a row offset is not a byte offset. This plane binds the
-    /// mask through [`FireTables`] rather than through a declared input and
-    /// cuts it with [`Run::cut_rows`], which knows the stride.
+    /// Row-shaped values are indexed by absolute fire row; a `Dim::Const`
+    /// column is handed over whole. `GeomKind::Indices` and
+    /// `RuntimeInput::Mask` are never fire-row-indexed and are never sliced here.
     fn cut(&self, id: ValueId, handle: Tensor) -> Tensor {
         let at = id.0 as usize;
-        // **THE OTHER ANSWER, ASKED FIRST** (design §3). A gathered window's
-        // rows do not lie in the arena at all — they were compacted into the
-        // copy role of `crate::scratch` before the region's first node — so a
-        // slice of the fire-wide column is not a narrower reading of the same
-        // bytes, it is the wrong bytes. [`Run::compacted`] is the whole of
-        // what a copy changes about resolution.
+        // A gathered window's rows were compacted into scratch by the gather; resolve
+        // through `compacted` instead of slicing the fire-wide column.
         if self.window().gathered.is_some() {
             return self.compacted(id, handle);
         }
@@ -693,14 +468,9 @@ impl<'c> Run<'c> {
         };
         let seated = self.window();
         let window = seated.span;
-        // **THE SECOND ROW AXIS, CUT AT ITS OWN WINDOW** (multimodal §5.1).
-        // `Window::patch` is this region's mask read against the PATCH table
-        // — patch rows where `span` has token rows and IMAGES where it has
-        // lanes — so a tower rectangle is cut by the seriation that placed it
-        // and never by the token one. The two pairs are carried separately
-        // rather than chosen between, because the embed merge is a TOKEN
-        // region that reads a patch column and needs both in the same
-        // resolution.
+        // The patch axis has its own window (`Window::patch`), cut separately from the
+        // token axis's `span` — needed because the embed merge is a token region that also
+        // reads a patch column.
         let patch = seated.patch;
         let (skip, keep) = match shape.first() {
             Some(Dim::Tokens) => (window.row_offset, window.rows),
@@ -715,25 +485,10 @@ impl<'c> Run<'c> {
         self.slice(handle, skip, keep)
     }
 
-    /// [`Run::cut`]'s other half: what a `Fallback::Copy` resolves to.
-    ///
-    /// **THREE ANSWERS, AND THEY ARE THE THREE `window::copyable` ADMITS.**
-    /// A row-shaped value is the staging rectangle the region's gather laid
-    /// it in; the four kv geometry vectors are the twins re-cut for the
-    /// gathered lanes
-    /// ([`GatheredSpace`](crate::window::GatheredSpace)); everything
-    /// window-free is handed over whole, exactly as a split hands it over.
-    /// Nothing else can arrive — `Windows::of` declines to gather a region
-    /// naming anything else, and the region then takes the split, which is
-    /// always correct.
-    ///
-    /// The POOL is not among them, and that is this plane's own line. A
-    /// gathered lane's page tables are re-cut here for the ops that NAME a
-    /// geometry vector and index it by the launch's own lane; the sdpa
-    /// entries do not — they read `kv_page_indptr[req_of_token[row]]` with
-    /// absolute lane ids, and the gather permutes `request_of_token` without
-    /// renumbering it, so the fire-wide pool is still the right table
-    /// ([`Run::pool`] argues the same thing for a split window).
+    /// [`Run::cut`]'s counterpart for a gathered window: resolves to the
+    /// gather's staging rectangle, a re-cut kv-geometry twin, or the value
+    /// unchanged. The kv pool itself is never re-cut here — sdpa indexes it
+    /// via the permuted `request_of_token`.
     fn compacted(&self, id: ValueId, handle: Tensor) -> Tensor {
         let at = id.0 as usize;
         let gathered = self
@@ -750,10 +505,8 @@ impl<'c> Run<'c> {
                 GeomKind::Indices => space.page_indices,
                 GeomKind::LastPageLen => space.last_page_lens,
                 GeomKind::KvLen => space.kv_len,
-                // `window::copyable` admits no other kind into a copied
-                // region, so this is the arm nothing reaches — and it
-                // answers the fire-wide vector rather than a wrong window,
-                // which is the conservative direction.
+                // Unreachable in practice; falls back to the fire-wide vector rather than
+                // guessing a window.
                 _ => handle,
             };
         }
@@ -789,14 +542,9 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The crate's heart: one plan id in, one device handle out, routed on
-    /// the id's `Def`. Every dispatch arm resolves through here, so
-    /// provenance handling exists exactly once.
-    ///
-    /// Cache ids never resolve to a tensor — a cache is a pool pointer and
-    /// resolves through [`Run::pool`] or [`Run::recurrent`]; a cache id
-    /// arriving here is a dispatch-arm bug, answered with a panic. So is a
-    /// split-plane weight: two planes resolve through [`Run::planes`].
+    /// One plan id in, one device handle out. Cache ids and split-plane
+    /// weights don't resolve to a tensor here; they panic (use
+    /// [`Run::pool`]/[`Run::recurrent`]/[`Run::planes`] instead).
     pub(crate) fn tensor(&self, id: ValueId) -> Tensor {
         self.cut(id, self.whole(id))
     }
@@ -807,21 +555,12 @@ impl<'c> Run<'c> {
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
             Def::Input(RuntimeInput::Positions) => self.fire.positions,
-            // The op-named mask (`attention.masked`) resolves onto the fire
-            // table the plan builders already carry: this plane binds one
-            // mask per fire — every sdpa launch reads its seats — so a
-            // second seat would only exist to drift, and the space
-            // collapses onto it.
+            // One mask per fire; the op-named mask resolves onto the same seat the plan
+            // builders use.
             Def::Input(RuntimeInput::Mask { space: _ }) => self.fire.tables.mask,
-            // THE ADAPTER AXIS'S ONE RUNTIME INPUT (design §8). Bound only
-            // when a lane of this fire carried an adapter — a fire none did
-            // stages nothing, and nothing can reach this arm either, because
-            // the correction's window is empty and the walk skips a zero-row
-            // region before it dispatches a node. So the panic is not a hole:
-            // it is the same "unbound seat" statement the mask makes, and
-            // reaching it would mean a word said `has_adapter` where the
-            // submission said no adapter — which `Fault::AdapterWord` refuses
-            // before anything launches.
+            // Bound only if a lane carried an adapter; otherwise the correction's window is
+            // empty and this arm is never reached, so the panic below is unreachable rather
+            // than a real gap.
             Def::Input(RuntimeInput::AdapterRoutes) => {
                 self.fire.adapter_routes.unwrap_or_else(|| {
                     panic!(
@@ -830,17 +569,8 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            // **THE SECOND ROW AXIS'S SIX INPUTS**, on the adapter axis's
-            // terms one arm up: bound only when a lane of this fire carried
-            // an image, and a fire none did stages nothing. Nothing can reach
-            // these arms then either — the tower's capture unit has zero
-            // patch rows, and the walk skips a zero-row region before it
-            // dispatches a node — so each panic is the same "unbound seat"
-            // statement the mask and the adapter make, and never a hole.
-            //
-            // Named one per input rather than as one arm, because a plan that
-            // reached one of them is a plan that reached exactly one and the
-            // message should say which.
+            // Bound only when a lane carried an image; named per-input so a panic message
+            // says which one is missing.
             Def::Input(RuntimeInput::Patches) => self.fire.patches.unwrap_or_else(|| {
                 panic!("value {at} reads this fire's patch rows, which no lane of it submitted")
             }),
@@ -882,12 +612,8 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            // **THE TRUNK'S TRIPLE-WIDE POSITION STREAM** (multimodal §6.3),
-            // on the FIRST axis and therefore staged for EVERY fire of a plan
-            // that declares it — image or no image. A lane that submitted no
-            // stream of its own gets the scalar reading `(p, p, p)`, which is
-            // what makes a text-only fire of a `-vision-` row rotate exactly
-            // as its plain twin does.
+            // Staged for every fire of a plan that declares rotation, image or not; a
+            // text-only lane reads the scalar (p, p, p).
             Def::Input(RuntimeInput::MropePositions) => {
                 self.fire.mrope_positions.unwrap_or_else(|| {
                     panic!(
@@ -934,9 +660,8 @@ impl<'c> Run<'c> {
                     None => panic!("value {at} is weight {row}, which the shell has not bound"),
                 }
             }
-            // A φ resolves like the op output it merges: the compiler
-            // aliased every arm onto one arena slot, written at this id's
-            // row — so `Merge` is the same read as `Op`.
+            // A merge aliases onto its op's arena slot, so it resolves the same way as an
+            // op output.
             Def::Op(_) | Def::Merge(_) => self
                 .arena
                 .0
@@ -953,14 +678,8 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// A fire-aligned value viewed through THIS WINDOW's boundaries. The
-    /// indptr is ambient (design §5): no op names it, and this pairing is
-    /// where it re-enters.
-    ///
-    /// The boundaries are the window's own, rebased: `data` already points
-    /// at the window's first row, so a fire-wide vector would send every
-    /// ragged entry past the end of the rectangle it was handed, by exactly
-    /// the number of rows the classes before it occupy.
+    /// A fire-aligned value viewed through this window's boundaries; the indptr is rebased to
+    /// start at zero, since a fire-wide indptr would run past a windowed rectangle's end.
     pub(crate) fn ragged(&self, id: ValueId) -> RaggedTensor {
         RaggedTensor {
             data: self.tensor(id),
@@ -968,13 +687,8 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The planes of a split-plane bank — the resolution
-    /// `linear.moe_matmul_select_bias` needs where [`Run::tensor`] would have
-    /// to lie with one handle.
-    ///
-    /// For the ops whose IR variant names a bank UNCONDITIONALLY. An arm that
-    /// serves both forms of weight asks [`Run::banked`] instead, because for
-    /// it a dense row is a selection and not a bug.
+    /// The planes of a split-plane bank. For ops whose IR variant unconditionally names a bank;
+    /// an op serving both forms uses [`Run::banked`] instead.
     pub(crate) fn planes(&self, id: ValueId) -> Bank {
         self.banked(id).unwrap_or_else(|| {
             panic!(
@@ -985,13 +699,8 @@ impl<'c> Run<'c> {
         })
     }
 
-    /// The bank behind a weight id, or `None` when the row is one dense
-    /// handle — the question the arms that serve BOTH forms ask.
-    ///
-    /// `None` is an answer and not a refusal: `linear.matmul` and
-    /// `layout.embed` name a weight, not a format, and which point they fire
-    /// is exactly this. An unbound row is still a binding bug and still
-    /// panics, because a weight nothing seated is not a dense weight.
+    /// The bank behind a weight id, or `None` when the row is one dense handle. An unbound row
+    /// is still a binding bug and still panics.
     pub(crate) fn banked(&self, id: ValueId) -> Option<Bank> {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
@@ -1005,34 +714,15 @@ impl<'c> Run<'c> {
         }
     }
 
-    // scratch — the four accessors the working plane is read through, kept
-    // contiguous with the field they resolve against.
-
-    /// How many experts the router that wrote `routes` declared.
-    ///
-    /// **THE ROUTER OP NAMES IT AND NO OPERAND OF THE SELECT OPS DOES.**
-    /// `moe::tile_rows` prices its tile off rows per expert, and
-    /// `MoeMatmulSelect*` states `x`, `bank`, `routes` and `y` — none of
-    /// which carries a count. What does carry it is the `MoeTopk*` node that
-    /// wrote this very `routes` vector, so the fact travels the edge the plan
-    /// already drew: resolved once at load into a `ValueId`-indexed table
-    /// (`crate::scratch`), read here per node. `0` for a routing vector no
-    /// router in this artifact wrote, which is a plan the sorted arm declines
-    /// rather than guesses at.
+    /// How many experts the router that wrote `routes` declared; resolved once at load into a
+    /// table indexed by `routes`. `0` if no router in this artifact wrote it.
     pub(crate) fn experts(&self, routes: ValueId) -> u32 {
         self.scratch.experts(routes)
     }
 
-    /// The sorted arm's working rectangles, minted into this fire.
-    ///
-    /// `None` when the load reserved none — no mixture, or a mixture whose
-    /// expert count no router stated — and the arm answering `None` takes the
-    /// matvec, which needs no plane.
-    ///
-    /// A mint that fails is an INTEGRITY failure and not a refusal, for
-    /// [`Run::slice`]'s reason: the rectangles were sized against the budget's
-    /// ceiling at load, so a span that does not land is this crate
-    /// disagreeing with its own reservation.
+    /// The sorted MoE arm's working rectangles, minted into this fire. `None` if the load
+    /// reserved none (no mixture, or one with no stated expert count); the matvec arm is used
+    /// instead.
     pub(crate) fn routed_scratch(&self) -> Option<RoutedScratch> {
         Some(
             self.scratch
@@ -1043,14 +733,8 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// The NSA indexer's score slab, minted into this fire.
-    ///
-    /// `None` when the load reserved none — a trace with no
-    /// `attention.index_topk` — and the arm answering `None` refuses by name,
-    /// because there is no selection arithmetic that does not need it.
-    ///
-    /// A mint that fails is an INTEGRITY failure and not a refusal, for
-    /// [`Run::routed_scratch`]'s reason.
+    /// The NSA indexer's score slab, minted into this fire. `None` if the trace has no
+    /// `attention.index_topk`.
     pub(crate) fn index_scores(&self) -> Option<Tensor> {
         Some(
             self.scratch
@@ -1061,20 +745,8 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// The rolling compressor state of the SPACE `pages` names, minted into
-    /// this fire.
-    ///
-    /// One plane per pooled space, so the argument is the cache id the asking
-    /// op walks: the gather and the state write of one layer resolve to the
-    /// same space and therefore to the same two slabs, and a second pooled
-    /// layer resolves to its own.
-    ///
-    /// `None` when the load reserved none for that space — a trace with no
-    /// `attention.pool_gather` over it — and the arm answering `None` refuses
-    /// by name, because there is no gated pool that does not read the state.
-    ///
-    /// A mint that fails is an INTEGRITY failure and not a refusal, for
-    /// [`Run::index_scores`]'s reason.
+    /// The pooled-compressor rolling state for cache space `pages`, minted into this fire.
+    /// `None` if the trace has no `attention.pool_gather` over that space.
     pub(crate) fn pool_state(&self, pages: ValueId) -> Option<PoolSlabs> {
         let at = pages.0 as usize;
         let Some(Def::Cache(space)) = self.values.get(at).map(|v| &v.def) else {
@@ -1089,14 +761,8 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// qwen4's PLE hash constants, minted into this fire.
-    ///
-    /// `None` when the load wrote no plane for THESE constants — a trace with
-    /// no `attention.ple_ngram_ids` — and the arm answering `None` refuses by
-    /// name, because there is no hashing that does not read its own primes.
-    ///
-    /// A mint that fails is an INTEGRITY failure and not a refusal, for
-    /// [`Run::index_scores`]'s reason.
+    /// qwen4's PLE hash constants, minted into this fire. `None` if the trace has no
+    /// `attention.ple_ngram_ids`.
     pub(crate) fn ple_hash(
         &self,
         mults: &[u64],
@@ -1112,40 +778,17 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// How many rows the arena slot behind `id` can hold — its whole
-    /// reservation at the budget's ceiling, not this fire's extent.
-    ///
-    /// **READ AT THE DENSE QUANTIZED ARMS, AND THE READER IS NAMED.**
-    /// `kernels_metal::linear::quant::mb_block` takes exactly this as its
-    /// `capacity`: the rows a launch may write into before it runs into the
-    /// next value's slot, which is what makes padding a fire up to its row
-    /// rung free of consequence. `dispatch::linear` hands it the MINIMUM over
-    /// the two slots a padded launch touches — the activation it reads and
-    /// the result it writes — because a rung either rectangle cannot hold is
-    /// a rung neither takes.
+    /// Rows the arena slot behind `id` can hold at the budget's ceiling (not this fire's
+    /// extent) — used by the dense quantized linear arms as launch capacity, so padding never
+    /// overruns into the next value's slot.
     pub(crate) fn capacity(&self, id: ValueId) -> u32 {
         self.scratch.capacity(id)
     }
 
-    /// The FP16 staging plane at `rows x contraction`.
+    /// The FP16 staging plane at `rows x contraction`, minted for the quantized linear pre-cast
+    /// path. `None` if the load-time reservation doesn't hold that shape.
     ///
-    /// **SEATED AT `quant::Scratch`, AND AS A MINT RATHER THAN AS A
-    /// RECTANGLE.** `quant::precast_stage`/`quant::precast_point` are the
-    /// consumers and the shape they want is `quant::mb_block`'s answer,
-    /// decided inside `quant::act_x_wt` several guards past the call. So
-    /// `dispatch::linear` hands the entry a closure over this and the entry
-    /// asks with the number it selected; `None` is this shell saying the
-    /// load-time reservation does not hold that shape, and the ladder answers
-    /// it by taking the rung that needs no plane.
-    ///
-    /// **IT USED TO BE A PAIR AND THE SECOND IS GONE.** The split-K partials
-    /// plane went out with the split arm — nothing wrote it — and a
-    /// reservation nothing writes is not free on a checkpoint that reaches no
-    /// pre-cast, where no routed plane aliases it.
-    ///
-    /// The reservation costs nothing besides on a mixture: the roles alias,
-    /// so this is inside the routed plane's bytes there, which is also why a
-    /// chain may be inside ONE of them and never both.
+    /// On a mixture, this aliases the routed plane's bytes rather than costing extra.
     pub(crate) fn precast(&self, rows: u32, contraction: u32) -> Option<Tensor> {
         Some(
             self.scratch
@@ -1156,10 +799,8 @@ impl<'c> Run<'c> {
         )
     }
 
-    /// The `StructKind` a plan op's output value declares — how the
-    /// plan-building arms check the trace against what this plane can build:
-    /// the trace wrote the choice into `Trace::values`, the arm only follows
-    /// it.
+    /// The `StructKind` a plan op's output value declares, checked by the plan-building arms
+    /// against the trace.
     pub(crate) fn declared(&self, id: ValueId) -> StructKind {
         match &self.values[id.0 as usize].ty {
             Ty::Struct(kind) => *kind,
@@ -1170,29 +811,9 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The paged kv pool a cache id names.
-    ///
-    /// **NOTHING IS CUT HERE, AND THAT IS A STATEMENT ABOUT THIS PLANE'S
-    /// ABI.** The CUDA sibling slices its pool's `page_indptr`,
-    /// `last_page_lens` and `row_valid` to the window, because its schedules
-    /// number requests from the launch's own zero. The metal sdpa entries
-    /// read the page table through `kv_page_indptr[req_of_token[row]]`, and
-    /// `request_of_token` is staged with ABSOLUTE lane ids — so the table
-    /// stays fire-wide and the two agree. Slicing it here would send every
-    /// windowed launch to somebody else's pages. (`page_indices` is absolute
-    /// on both planes, for the reason `Run::cut` gives.)
-    ///
-    /// **AND A GATHERED WINDOW CHANGES NOTHING HERE EITHER**, which is the
-    /// one place this plane's copy is simpler than the CUDA one. There the
-    /// pool's lane tables are SLICED per window, so a copy has to re-cut them
-    /// over the gathered lanes; here they are never sliced, and the vector
-    /// that does the addressing — `request_of_token` — is PERMUTED by the
-    /// gather with its absolute lane ids intact
-    /// (`crate::window::Gathered::request_of_token_host`). So the fire-wide
-    /// page tables answer a gathered launch exactly as they answer every
-    /// other one. The re-cut `GatheredSpace` twins exist for the other
-    /// reading: an op that NAMES a geometry vector and indexes it by the
-    /// launch's own lane, which `Run::compacted` answers.
+    /// The paged kv pool a cache id names. Never sliced to the window: sdpa
+    /// shaders index it via `request_of_token`'s absolute lane ids, so the
+    /// fire-wide table is always correct.
     pub(crate) fn pool(&self, id: ValueId) -> &KvPool {
         match self.cache(id) {
             CachePool::Kv(pool) => pool,
@@ -1203,13 +824,8 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The recurrent state pool a cache id names, with its slot map cut to
-    /// the asking node's window.
-    ///
-    /// A recurrent bank is addressed by SLOT, and every metal ssm shader
-    /// reads its slot out of `slots[r]` where `r` counts from the LAUNCH's
-    /// own zero — so a windowed scan gets the window's rows of that vector
-    /// and nothing else. The banks themselves are the model's state, whole.
+    /// The recurrent state pool a cache id names, with its slot map cut to the asking node's
+    /// window — banks are addressed by slot, read as `slots[r]` from the launch's own zero.
     pub(crate) fn recurrent(&self, id: ValueId) -> RecurrentPool {
         match self.cache(id) {
             CachePool::Recurrent(pool) => RecurrentPool {

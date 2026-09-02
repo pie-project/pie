@@ -3,6 +3,7 @@ use checkpoint::types::Encoding;
 use model_dsl::{Shard, Weight};
 
 use super::model::{Kda, Mixer, Mla, Mlp, Model};
+use model_dsl::Platform;
 use checkpoint_dsl::{Builder, Error};
 
 const HF_EMBED: &str = "language_model.model.embed_tokens.weight";
@@ -10,28 +11,17 @@ const HF_EMBED: &str = "language_model.model.embed_tokens.weight";
 const GGUF_EMBED: &str = "token_embd.weight";
 
 impl Model {
-    pub fn import(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
-        // **THE NATIVE DOOR, ASKED BEFORE THE WITNESS SNIFF** (§M-4a). A file
-        // holding every plane this contract declares, under this contract's
-        // names, is an artifact `pie model import` wrote out of this very
-        // text, and [`Model::load`] is its reader: `read_own` throughout, no
-        // transform at all. `load` failing is what says the file is foreign,
-        // and it fails on the first plane it cannot find. The argument in full
-        // is at `qwen_3::Model::import`.
-        if let Ok(native) = self.load(src) {
-            return Ok(native);
-        }
-        // **AND THE ARM IS CHOSEN BY BUILDING IT, NOT BY SNIFFING A NAME.**
-        // The witness this used to look for — the embedding, spelled the way
-        // each layout spells it — is one of the planes a promotion MOVES, so
-        // an artifact this build wrote could satisfy neither door. The
-        // argument in full, and the file it was measured on, is at
-        // `qwen_3::Model::import`.
-        let huggingface = match self.import_from_huggingface(src) {
+    pub fn import(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        // Try the native (already-imported) layout first.
+        let huggingface = match self.import_from_huggingface(src, platform) {
             Ok(contract) => return Ok(contract),
             Err(why) => why,
         };
-        let gguf = match self.import_from_gguf(src) {
+        let gguf = match self.import_from_gguf(src, platform) {
             Ok(contract) => return Ok(contract),
             Err(why) => why,
         };
@@ -46,9 +36,9 @@ impl Model {
 
     pub fn import_from_huggingface(
         &self,
-        src: &ztensor::Source,
+        src: &ztensor::Source, platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp);
+        let mut b = Builder::new(src, self.tp, platform);
         b.read(&self.embed, HF_EMBED)?;
         b.read(&self.final_norm, "language_model.model.norm.weight")?;
         b.read(&self.head, "language_model.lm_head.weight")?;
@@ -114,8 +104,8 @@ impl Model {
         Ok(b.build())
     }
 
-    pub fn import_from_gguf(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp);
+    pub fn import_from_gguf(&self, src: &ztensor::Source, platform: Platform) -> Result<ModelContract, Error> {
+        let mut b = Builder::new(src, self.tp, platform);
         b.read(&self.embed, GGUF_EMBED)?;
         b.read(&self.final_norm, "output_norm.weight")?;
         b.read(&self.head, "output.weight")?;
@@ -195,17 +185,9 @@ impl Model {
                 at(l, "self_attn.v_proj.weight"),
             ],
         )?;
-        // SQUEEZED, THEN FUSED, and the squeeze is not optional. HF stores a
-        // depthwise convolution bank `[channels, 1, kernel]` — the singleton
-        // is `groups`, and PyTorch's Conv1d wants it — while this model
-        // declares one rank-2 `[3 * kda_width, kernel]` bank. `read_concat`
-        // alone concatenates three rank-3 legs into a rank-3 expression and the
-        // declaration it is checked against has rank 2, so the contract is
-        // refused at compile time rather than landing anything wrong. Same
-        // fact qwen_3's `squeezed` states for its own KDA conv, with the same
-        // per-family copy the redundancy ruling asks for; the GGUF path below
-        // needs none, because gguf ships the bank pre-squeezed.
-        b.read_derived(&k.conv, || {
+        // HF stores the conv bank as [channels, 1, kernel] (the 1 is `groups`); the declared
+        // type is rank-2 [3*kda_width, kernel], so each leg is squeezed before concatenation.
+        b.read_expr(&k.conv, (|| -> Result<Expr, Error> {
             Ok(Expr::concat(
                 as_axis(cut_axis(&k.conv), &k.conv.name),
                 vec![
@@ -214,7 +196,7 @@ impl Model {
                     squeezed(src, at(l, "self_attn.v_conv1d.weight"))?,
                 ],
             ))
-        })?;
+        })()?)?;
         b.read(&k.f_a, at(l, "self_attn.f_a_proj.weight"))?;
         b.read(&k.f_b, at(l, "self_attn.f_b_proj.weight"))?;
         b.read(&k.b, at(l, "self_attn.b_proj.weight"))?;
@@ -264,23 +246,8 @@ impl Model {
         Ok(())
     }
 
-    /// One expert bank, in the SOURCE spelling: `n` separate `w1`/`w3`/`w2`
-    /// legs, stored bf16, which this family declares `Mxfp4`. That gap is an
-    /// encode, and an encode is a conversion — `pie model import` is where it
-    /// runs, and no device target may carry one
-    /// ([`CUDA_TILE_MAP_MASK`](checkpoint::plan::CUDA_TILE_MAP_MASK)). So
-    /// this states the conversion for the importer to run and is refused
-    /// with the tensor named on any serving load that reaches it.
-    ///
-    /// **THE ARM THAT READ THE ALREADY-STACKED BANK MOVED** (§M-3, §M-4a).
-    /// It opened `if src.get(&w.name).is_some() { b.read_own(w) }`: `w.name`
-    /// is what an import writes this bank under once it has done the stacking
-    /// and the encoding — one plane and its `.scales` companion, under the
-    /// model's own spelling — so a file holding that name holds the served
-    /// form already. §M-4a promotes every transform a contract states and not
-    /// only this one, so the question is now asked of every weight by every
-    /// verb: [`Builder::holds_the_landed_plane`]. The reading is unchanged and
-    /// the banding a sharded rank needs still comes from `read_own`.
+    /// Stacks the source's per-expert w1/w3/w2 legs (stored bf16) into the Mxfp4 bank this
+    /// model declares; the bf16→Mxfp4 conversion runs here, at import time.
     fn expert_bank(
         &self,
         src: &ztensor::Source,
@@ -302,13 +269,7 @@ impl Model {
     }
 }
 
-/// One depthwise convolution bank, with the singleton `groups` axis dropped.
-///
-/// A `Transmute` and not a reshape node: the bytes of `[channels, 1, kernel]`
-/// and `[channels, kernel]` are the same bytes in the same order, so this
-/// renames the type and moves nothing. The stored encoding is read off the
-/// tensor rather than assumed, because a transmute may not change what an
-/// element means.
+/// Drops the singleton `groups` axis: [channels, 1, kernel] -> [channels, kernel], same bytes.
 fn squeezed(src: &ztensor::Source, from: String) -> Result<Expr, Error> {
     let Some(tensor) = src.get(&from) else {
         return Err(Error::Missing(from));

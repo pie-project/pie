@@ -15,20 +15,14 @@
 //! A **runtime** is that same model already laid out for one target — a
 //! particular backend, quantization and MoE lowering. There can be many, they
 //! are all derivable from the archive, and deleting one costs a rebuild and
-//! nothing else. `<key>` named the target the artifact was built for, so two
-//! targets could not land on the same file.
+//! nothing else. `<key>` names the target the artifact was built for, so two
+//! targets cannot land on the same file.
 //!
-//! NOTHING IN THIS BUILD WRITES ONE. The only producer was `pie model build`,
-//! deleted in R3, and the key it stemmed the filename from was deleted with
-//! this crate's last reader of it. What survives here is the *reading* half —
-//! a store an older pie wrote still lists its runtimes rather than going
-//! partly invisible — and it is why the vocabulary is documented at all.
-//!
-//! This replaced a flat directory of `<name>.zt` beside `<name>-optimized.zt`,
-//! where the relationship between an archive and its build was a name suffix,
-//! only one build could exist at a time, and nothing recorded which backend it
-//! was for. Flat entries are still *listed* so that a store written by an
-//! older pie does not go invisible, but nothing writes them any more.
+//! NOTHING IN THIS BUILD WRITES ONE: this build ships no command that lays a
+//! model out per target. Only the *reading* half is here, so that a store
+//! another pie wrote still lists its runtimes rather than going partly
+//! invisible — which is why the vocabulary is documented at all. Flat entries
+//! (`<name>.zt` beside `<name>-optimized.zt`) are listed for the same reason.
 //!
 //! The only thing that makes this a *store* rather than a directory tree is
 //! the two questions asked of it: what is in it, and which files make up each
@@ -76,14 +70,11 @@ pub fn archive_path(name: &str) -> PathBuf {
     model_dir(name).join(ARCHIVE_FILE)
 }
 
-// `runtime_dir(name)` and `runtime_path(name, key)` STOOD HERE: the two path
-// constructors a `pie model build` used to write `<name>/runtime/<key>.zt`
-// with. That command is deleted, so nothing in this build constructs either
-// path, and the cache key the second one spelled its stem from went with it.
-// [`RUNTIME_DIR`] and [`read_runtimes`] stay, because reading is the half that
-// still has a job: an operator may hold a directory an older pie wrote, and
-// `pie model list` reports whatever is actually there -- which, in this build,
-// is nothing.
+// Nothing in this build constructs a `<name>/runtime/<key>.zt` path, so there
+// are no constructors for one. [`RUNTIME_DIR`] and [`read_runtimes`] stay
+// because reading is the half that still has a job: an operator may hold a
+// directory another pie wrote, and `pie model list` reports whatever is
+// actually there.
 
 /// One per-target build of a model.
 pub struct Runtime {
@@ -156,7 +147,15 @@ fn entries_in(dir: &Path) -> Result<Vec<Entry>> {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let Some(mut entry) = read_entry(&child.join(ARCHIVE_FILE), name) else {
+        // `archive.zt` when that is the name, and otherwise the specialized
+        // one the import states a servable artifact's SKU and target in.
+        // Asked through the checkpoint reader's own discovery rather than
+        // spelled again here — see `discover_zt_file`, and the note below about
+        // the worker and this scan not being allowed to disagree.
+        let Some(root) = checkpoint::file::read::discover_zt_file(child) else {
+            continue;
+        };
+        let Some(mut entry) = read_entry(&root, name) else {
             continue;
         };
         entry.dir = Some(child.clone());
@@ -517,41 +516,38 @@ mod tests {
         assert_eq!(names, ["legacy", "qwen"]);
     }
 
-    /// A store written by an older pie still lists.
+    /// **A STAMPED IMPORT'S OWN FILENAME IS AN ENTRY.**
     ///
-    /// Flat `<name>.zt` is read but never written. Dropping the old shape
-    /// outright would have made every previously imported model report as
-    /// missing, which reads as data loss whether or not the files are still
-    /// there.
+    /// A servable artifact is named for what it is —
+    /// `<slug>.<sku>.<backend>.zt` — so that one model at two
+    /// quantizations can share a directory. A scan that only opened
+    /// `<name>/archive.zt` would find nothing and skip the entry: a
+    /// `--features metal` import of the DeepSeek-V4 mini wrote
+    /// `mini-l5-e16.dsv4-flash-u4g64-u2g64-kv-bf16.metal.zt` into the
+    /// store, exited zero, and `pie model list` showed an empty shelf. Three
+    /// artifacts were invisible on this box when the fix went in.
+    ///
+    /// The scan asks `checkpoint`'s own discovery, which is the same answer the
+    /// worker resolves with — the two are not allowed to disagree, and this is
+    /// the disagreement they had.
     #[test]
-    fn a_flat_artifact_from_an_older_pie_is_still_an_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let flat = dir.path().join("legacy.zt");
-        let mut writer = Writer::create(&flat, &Default::default()).unwrap();
+    fn an_artifact_named_for_its_specialization_is_listed() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("deepseek");
+        let specialized =
+            model.join("deepseek.dsv4-flash-full-u4g64-u2g64-kv-bf16.metal.zt");
+        let mut writer = Writer::create(&specialized, &Default::default()).unwrap();
         writer.add_tensor(&decl("w"), &vec![7u8; 32_000]).unwrap();
         writer.finish().unwrap();
 
-        let found = entries_from(vec![flat]);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].name, "legacy");
-        assert!(
-            found[0].dir.is_none(),
-            "a flat artifact has no model directory, and `remove` must not \
-             delete the store root looking for one"
+        let found = entries_in(root.path()).unwrap();
+        assert_eq!(found.len(), 1, "the store holds one model and shows it");
+        assert_eq!(
+            found[0].name, "deepseek",
+            "the entry is named for its directory, as every entry is"
         );
+        assert_eq!(found[0].root, specialized);
+        assert_eq!(found[0].tensors, 1);
     }
 
-    /// The store's paths agree with each other.
-    ///
-    /// Three functions name places under one model directory, and the layout
-    /// is only a layout if they nest. Stated as a test rather than by deriving
-    /// each from the last, so that a change to any one of them has to be a
-    /// change here too.
-    #[test]
-    fn every_store_path_is_under_the_model_directory() {
-        let model = model_dir("qwen--qwen3-0.6b");
-        assert_eq!(model.parent().unwrap(), dir());
-        assert_eq!(archive_path("qwen--qwen3-0.6b"), model.join("archive.zt"));
-        assert_eq!(model.join(RUNTIME_DIR), model.join("runtime"));
-    }
 }

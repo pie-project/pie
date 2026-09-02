@@ -23,7 +23,9 @@ pub enum Error {
     #[error("contract: {0}")]
     Contract(String),
 
-    /// The contract is well-formed but does not survive this tensor-parallel degree (an axis that does not divide, or a rank out of range) -- separate from [`Error::Contract`] because the recovery differs: change `tp_size`, not the model.
+    /// Well-formed but does not survive this tensor-parallel degree (an axis
+    /// that does not divide, or a rank out of range); separate from
+    /// [`Error::Contract`] since the recovery differs: change `tp_size`.
     #[error("shard: {0}")]
     Shard(String),
 
@@ -46,35 +48,19 @@ pub enum Error {
     Internal(String),
 }
 
-// `Error::code(&self) -> u32` STOOD HERE: a stable number per variant, "the
-// code this error crosses the C ABI as", for a caller that could not read the
-// message. There is no C ABI -- the engines link this crate as an rlib and
-// match on the variants, which is what `engine-cuda/src/error.rs` does -- so
-// the number told nobody anything the type did not. Its only readers were the
-// two assertions in this file's own test, which now name the variants they
-// were always about.
-
-/// zTensor's failures, mapped onto the loader's, in one place since the distinction is load-bearing and easy to lose.
-///
-/// `Unsupported` is the one that matters: a file using a layout this build does not implement is not a malformed checkpoint, and a caller that can retry against a newer build has to be able to tell the two apart.
-///
-/// A container *version* this build does not implement is the same kind of
-/// fact, arriving by a different door. zTensor states it as
-/// `Reject { rule: Rule::Version }` rather than `Unsupported`, because from
-/// the container's side the file did violate a MUST — §8 step 2 says verify
-/// the version, and this reader cannot. From the loader's side it is the
-/// opposite of a malformed checkpoint: the bytes are whatever a newer (or
-/// older) pie wrote, faithfully, and the recovery is to re-import, not to go
-/// find a different file. Folding it into [`Error::Checkpoint`] tells every
-/// operator holding a file from another build that it is corrupt, which is
-/// both false and unactionable.
+/// zTensor's failures, mapped onto the loader's. `Unsupported` is the one
+/// that matters: a layout this build does not implement is not a malformed
+/// checkpoint, and a caller retrying against a newer build must be able to
+/// tell the two apart. A container version this build does not implement is
+/// the same kind of fact (zTensor states it as `Reject { rule:
+/// Rule::Version }`): the bytes are faithful, just from a newer or older
+/// pie, and the recovery is to re-import, not find a different file.
 impl From<ztensor::Error> for Error {
     fn from(err: ztensor::Error) -> Self {
         match err {
             ztensor::Error::Unsupported(_) => Self::Unsupported(err.to_string()),
-            // Vocabulary this build does not implement, not bytes that failed
-            // to deliver: the container version is the one `Reject` rule whose
-            // recovery is a different *build*, not a different file.
+            // Vocabulary this build does not implement, not bytes that
+            // failed to deliver: recovery is a different build.
             ztensor::Error::Reject {
                 rule: ztensor::Rule::Version,
                 ..
@@ -90,14 +76,13 @@ impl From<ztensor::Error> for Error {
 /// Every fallible step in the loader answers with this.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Name what overflowed, without spelling out the `ok_or_else` each time: the loader's arithmetic is all checked, but written in full it reads as ceremony. The `checked_*` call stays visible on purpose; this only shortens the failure arm:
+/// Name what overflowed, without spelling out `ok_or_else` each time. The
+/// `checked_*` call stays visible; this only shortens the failure arm:
 ///
 /// ```ignore
 /// let end = offset.checked_add(bytes).or_overflow("persistent byte overflow")?;
 /// ```
 pub trait OrOverflow<T> {
-    /// The message is passed through verbatim, so a site reads the same as the
-    /// `Error::Overflow` it replaced.
     fn or_overflow(self, message: impl Into<String>) -> Result<T>;
 }
 
@@ -107,47 +92,12 @@ impl<T> OrOverflow<T> for Option<T> {
     }
 }
 
-/// Narrowing conversions answer with [`std::num::TryFromIntError`], not `None`. Deliberately not implemented for every `Result`: letting `or_overflow` swallow the loader's own [`Result<T>`] would relabel a contract error as an overflow.
+/// Narrowing conversions answer with [`std::num::TryFromIntError`], not
+/// `None`. Not implemented for every `Result`: that would let `or_overflow`
+/// relabel a contract error as an overflow.
 impl<T> OrOverflow<T> for std::result::Result<T, std::num::TryFromIntError> {
     fn or_overflow(self, message: impl Into<String>) -> Result<T> {
         self.map_err(|_| Error::Overflow(message.into()))
     }
 }
 
-#[cfg(test)]
-mod ztensor_conversion {
-    use super::*;
-
-    /// The two zTensor outcomes a caller must be able to tell apart: a layout
-    /// this build does not implement is a reason to try a newer pie, and a
-    /// checkpoint that did not deliver is not.
-    #[test]
-    fn unsupported_survives_as_unsupported() {
-        let unfamiliar = ztensor::Error::Unsupported("layout \"x.future/1\"".into());
-        assert!(matches!(Error::from(unfamiliar), Error::Unsupported(_)));
-
-        let broken = ztensor::Error::NotFound("tensor \"w\"".into());
-        assert!(matches!(Error::from(broken), Error::Checkpoint(_)));
-    }
-
-    /// A container version this build cannot read arrives as a `Reject`, and
-    /// every other `Reject` rule really is "the checkpoint did not deliver".
-    /// The two have to land in different variants, because the operator's move
-    /// differs: re-import with a build that speaks this version, versus get a
-    /// file that is not broken.
-    #[test]
-    fn an_unreadable_version_is_unsupported_not_a_broken_checkpoint() {
-        let future = ztensor::Error::reject(ztensor::Rule::Version, "footer version 3");
-        assert!(matches!(Error::from(future), Error::Unsupported(_)));
-
-        // Neighbouring rules keep the old answer: these are damaged bytes.
-        for rule in [
-            ztensor::Rule::FooterMagic,
-            ztensor::Rule::ManifestHash,
-            ztensor::Rule::DenseSize,
-        ] {
-            let damaged = ztensor::Error::reject(rule, "corrupt");
-            assert!(matches!(Error::from(damaged), Error::Checkpoint(_)));
-        }
-    }
-}

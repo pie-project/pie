@@ -1,48 +1,20 @@
-//! The qwen4 import contracts: foreign checkpoints of `Qwen3.8-Flash-Next`,
-//! read into the declaration `model.rs` states.
-//!
-//! Two layouts, `qwen_3::import`'s own pair: transformers
-//! (`model.language_model.*`, `lm_head.weight`) and `mlx_lm`
-//! (`language_model.model.*`, `language_model.lm_head.weight`). The MLX
-//! spelling folds `+1.0` into every plain-RMSNorm plane — measured for this
-//! family the way it was for qwen_3: the 4-bit conversion's `hc_norm` and
-//! `q_norm` planes cluster around one where transformers' initialization
-//! centres them at zero — and splits the fused expert banks at the seam
-//! `read_concat` rejoins. What no layout of this family does is fuse the
-//! GDN in-projections: both publish `in_proj_qkv | z | b | a` as four
-//! tensors, so both spellings concatenate.
-//!
-//! **EVERY PROJECTION READS AS STORED** — the mixed-4/8 file's eight-bit
-//! triplets land as the `U8g64` planes `model.rs` declares, the four-bit
-//! banks land as theirs, and the one weight transform this import states is
-//! the norm fold above, taken back out. The dequantizing landing this file
-//! shipped first (`Builder::read_dequant`, still the door for a scheme with
-//! no kernel) was retired when the affine gemm point arrived: a text
-//! declares what the file holds, and the device reads it there.
-//!
-//! **WHAT IS DELIBERATELY NOT READ**: `visual.*` (this SKU is text-only; a
-//! vision row is a second declaration when a deployment wants one),
-//! `mtp.*` (a draft arm this text does not yet carry), the
-//! `self_attn.indexer.*` planes (the QSA cut — `model::Mixer::Attn`'s doc
-//! names it), and the PLE's three hash buffers, which are derived and verified
-//! rather than read (`model::Ple`'s doc says why).
+//! Import contracts for qwen4 checkpoints (transformers and mlx_lm layouts) into the model.rs declaration.
 
 use checkpoint::contract::{Expr, ModelContract};
 
 use super::model::{Mixer, Mlp, Model};
 use model_dsl::Weight;
 use crate::qwen_3::import::squeezed;
+use model_dsl::Platform;
 use checkpoint_dsl::{Builder, Error};
 
 #[derive(Clone, Copy)]
 enum Layout {
     /// `model.language_model.*` + `lm_head.weight` — transformers.
     Transformers,
-    /// `language_model.model.*` + `language_model.lm_head.weight` —
-    /// `mlx_lm`. Whether the file is the mixed-4/8 stack or a plain bf16
-    /// re-spelling is not asked here: each catalog row declares its own
-    /// widths, a read that misses its triplet is a miss, and `identify`'s
-    /// ladder hands the file to the row whose declaration it matches.
+    /// `language_model.model.*` + `language_model.lm_head.weight` — mlx_lm.
+    /// Layout doesn't distinguish dtype width; that's decided by which
+    /// catalog row's declared widths the read matches.
     Mlx,
 }
 
@@ -68,9 +40,7 @@ impl Layout {
         }
     }
 
-    /// `mlx_lm`'s `sanitize` bakes the `+1.0` of every plain RMSNorm into
-    /// the stored plane — `qwen_3::import`'s measurement, repeated on this
-    /// family's own file.
+    /// True for mlx_lm, which stores each plain-RMSNorm weight already offset by +1.0.
     fn folds_the_norm_one(self) -> bool {
         match self {
             Self::Transformers => false,
@@ -80,29 +50,17 @@ impl Layout {
 }
 
 impl Model {
-    pub fn import(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
-        // **THE NATIVE DOOR, ASKED BEFORE THE WITNESS SNIFF** (§M-4a). A file
-        // holding every plane this contract declares, under this contract's
-        // names, is an artifact `pie model import` wrote out of this very
-        // text, and [`Model::load`] is its reader: `read_own` throughout, no
-        // transform at all. `load` failing is what says the file is foreign,
-        // and it fails on the first plane it cannot find. The argument in full
-        // is at `qwen_3::Model::import`.
-        if let Ok(native) = self.load(src) {
-            return Ok(native);
-        }
-        // **AND THE ARM IS CHOSEN BY BUILDING IT, NOT BY SNIFFING A NAME.**
-        // The witness this used to look for — the embedding, spelled the way
-        // each layout spells it — is one of the planes a promotion MOVES, so
-        // an artifact this build wrote could satisfy neither door. The
-        // argument in full, and the file it was measured on, is at
-        // `qwen_3::Model::import`.
+    pub fn import(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
         let mut refusals: Vec<String> = Vec::new();
         for (what, layout) in [
             ("transformers", Layout::Transformers),
             ("mlx_lm", Layout::Mlx),
         ] {
-            match self.import_from_safetensors(src, layout) {
+            match self.import_from_safetensors(src, platform, layout) {
                 Ok(contract) => return Ok(contract),
                 Err(why) => refusals.push(format!("as {what}, {why}")),
             }
@@ -119,18 +77,14 @@ impl Model {
 
     fn import_from_safetensors(
         &self,
-        src: &ztensor::Source,
+        src: &ztensor::Source, platform: Platform,
         layout: Layout,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp);
+        let mut b = Builder::new(src, self.tp, platform);
         for read in self.reads(layout) {
             match read {
                 Read::One(w, name) => b.read(w, name)?,
-                // **A JOINED BANK GOES THROUGH THE VERB THAT KNOWS ABOUT
-                // COMPANIONS.** `read_concat` joins each part's
-                // `.scales`/`.biases` at the same seams its codes join at,
-                // which is the whole story for an affine pair and the identity
-                // for a dense one.
+                // read_concat also joins each part's .scales/.biases at the same seam.
                 Read::Concat(w, names) => b.read_concat(w, names)?,
                 // Undo the MLX fold on the planes the text scales by
                 // `weight + 1`.
@@ -143,22 +97,15 @@ impl Model {
                     };
                     b.read_expr(w, e)?;
                 }
-                Read::Squeeze(w, name) => b.read_derived(w, || squeezed(src, name))?,
+                Read::Squeeze(w, name) => b.read_expr(w, squeezed(src, name)?)?,
             }
         }
         Ok(b.build())
     }
 
-    /// **EVERY SOURCE NAME THIS IMPORT READS, IN READ ORDER, WITH THE PLANE
-    /// IT LANDS IN BESIDE IT.**
-    ///
-    /// One list drives both [`import_from_safetensors`](Model::import_from_safetensors)
-    /// and the censuses below, so a census cannot drift from the names the
-    /// import actually reads — `deepseek_v4::import`'s rule, held here for the
-    /// same reason: a per-tensor quantization mix is a claim about the
-    /// PAIRING of a stored triplet with a declared width, so the pairing is
-    /// what a census has to be able to read. A joined bank appears once per
-    /// stored part, because every part lands in the one declaration.
+    /// Every source name this import reads, in order, paired with the plane
+    /// it lands in. Drives both the actual import and the census below, so
+    /// they cannot drift; a joined bank appears once per stored part.
     #[must_use]
     pub fn mlx_planes(&self) -> Vec<(&Weight, String)> {
         self.reads(Layout::Mlx)
@@ -172,13 +119,14 @@ impl Model {
             .collect()
     }
 
-    /// The same census with the planes dropped — the name half, which is what
-    /// a bijection against a snapshot's `weight_map` is held against.
+    /// The same census, names only — checked against a snapshot's `weight_map`.
     #[must_use]
     pub fn mlx_source_names(&self) -> Vec<String> {
         self.mlx_planes().into_iter().map(|(_, name)| name).collect()
     }
 
+    // Deliberately not read: `visual.*`, `mtp.*`, `self_attn.indexer.*`, and
+    // the PLE hash buffers (derived, not stored).
     fn reads(&self, layout: Layout) -> Vec<Read<'_>> {
         let mut reads = Vec::new();
         reads.push(Read::One(&self.embed, layout.embed().to_string()));
@@ -189,8 +137,7 @@ impl Model {
 
             match &w.mixer {
                 Mixer::Attn(a) => {
-                    // The stored `q_proj` is the fused query|gate bank —
-                    // `[2 · q_heads · head_dim, hidden]`, `attn_output_gate`.
+                    // Stored q_proj is the fused query|gate bank: [2 · q_heads · head_dim, hidden].
                     reads.push(Read::One(&a.qg_proj, n("self_attn.q_proj.weight")));
                     reads.push(Read::One(&a.k_proj, n("self_attn.k_proj.weight")));
                     reads.push(Read::One(&a.v_proj, n("self_attn.v_proj.weight")));
@@ -216,8 +163,7 @@ impl Model {
                     reads.push(Read::Squeeze(&g.conv, n("linear_attn.conv1d.weight")));
                     reads.push(Read::One(&g.dt_bias, n("linear_attn.dt_bias")));
                     reads.push(Read::One(&g.a_log, n("linear_attn.A_log")));
-                    // The gated norm's weight is NOT plus-one-scaled, and MLX
-                    // does not fold it — `qwen_3::import`'s ruling, held.
+                    // Not plus-one-scaled; mlx_lm does not fold it either.
                     reads.push(Read::One(&g.norm, n("linear_attn.norm.weight")));
                     reads.push(Read::One(&g.out_proj, n("linear_attn.out_proj.weight")));
                 }
@@ -257,9 +203,8 @@ impl Model {
                     ..
                 } => {
                     reads.push(Read::One(router, n("mlp.gate.weight")));
-                    // The expert banks part the way qwen_3's do: transformers
-                    // fuses gate|up, `mlx_lm` splits them into `switch_mlp`
-                    // and `read_concat` rejoins the pair at the bank seam.
+                    // transformers stores gate_up fused; mlx_lm splits it into
+                    // switch_mlp.{gate,up}_proj and this rejoins them.
                     match layout {
                         Layout::Transformers => {
                             reads.push(Read::One(gate_up, n("mlp.experts.gate_up_proj")));
@@ -294,9 +239,7 @@ impl Model {
 
         if let Some(p) = &self.ple {
             let n = |tail: &str| layout.trunk(&format!("layers.{}.ple.{tail}", p.layer));
-            // The table: `split_ngram_parts` shards, rejoined at the seams
-            // the declaration banded — one row space, the hashed offsets'
-            // own.
+            // Stored sharded; shards are concatenated back into one row space.
             let shards: Vec<String> = (0..shard_count(p))
                 .map(|i| n(&format!("ple_embedding.ngram_embedding.shard_{i}.weight")))
                 .collect();
@@ -339,8 +282,7 @@ enum Read<'a> {
     Squeeze(&'a Weight, String),
 }
 
-/// How many shards the table's band list declares — the weight's own seams,
-/// counted rather than restated.
+/// Number of shards declared by the table's own seams.
 fn shard_count(p: &super::model::Ple) -> usize {
     match &p.table.shard {
         model_dsl::Shard::Cut { segments, .. } => segments.len(),

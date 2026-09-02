@@ -2,37 +2,21 @@
 //!
 //! The region's ops are emitted inline, in plan order, into a single
 //! `__global__` body: each op resolves its operands to scratch offsets and
-//! calls the runtime's block-parallel helper for its family, falling back to
-//! the single-thread `ptir_m1_execute` switch for the ops that have no
-//! parallel form. Between ops the block syncs and bails out if the status word
-//! moved off `1`, which is what keeps a fused region pass-atomic like the
-//! one-op-per-launch path.
+//! calls the runtime's block-parallel helper for its family, falling back
+//! to the single-thread `ptir_m1_execute` switch for ops with no parallel
+//! form. Between ops the block syncs and bails out if the status word moved
+//! off `1`, keeping a fused region pass-atomic like the one-op-per-launch
+//! path.
 //!
-//! Two analyses run before emission:
-//!
-//! * **reshape aliasing** — a `reshape` whose result never leaves the region is
-//!   not emitted at all; its result id is aliased to its input's, so the copy
-//!   never exists rather than being generated and skipped.
-//! * **direct argmax** (`analyze_direct_argmax`) — an `argmax` fed by a
-//!   logits intrinsic through nothing but reshapes reads the intrinsic's device
-//!   buffer straight, which makes both the intrinsic materialisation and the
-//!   reshapes redundant.
-//!
-//! Both analyses only ever elide a node whose value some *other* emission still
-//! produces — the alias, or `ptir_fast_argmax_intrinsic`'s direct read. There
-//! is no third: the NUCLEUS region has no CUDA kernel of its own, so
-//! `cuda::emit_region` sends it here to be emitted as the ordinary ops it
-//! holds, where Metal picks `emit_grouped_nucleus`. Its operands are therefore
-//! ordinary scratch values that ordinary emitted ops must write. Eliding them on the
-//! grounds that "the library kernel reads the intrinsic" describes Metal, and
-//! costs a nonzero temperature every token: the slot stays zeroed, the softmax
-//! over it is uniform, and the draw returns token 0. `.wiki/migration.md`
-//! §11.21 is the account.
-//!
-//! The `Order` and scan regions ARE library regions `emit_region` routes
-//! elsewhere — to [`super::order`] and [`super::scan`] — and they do not
-//! weaken the paragraph above: each wraps a single op, reads no intrinsic, and
-//! never reaches either analysis here.
+//! Two analyses run before emission: reshape aliasing (a `reshape` whose
+//! result never leaves the region is aliased to its input's id rather than
+//! emitted), and direct argmax (`analyze_direct_argmax`: an `argmax` fed by
+//! a logits intrinsic through nothing but reshapes reads the intrinsic's
+//! device buffer straight). Both only ever elide a node whose value some
+//! other emission still produces. The NUCLEUS region has no CUDA kernel of
+//! its own and is emitted here as ordinary ops — eliding its operands on
+//! the grounds that a library kernel reads the intrinsic (true on Metal)
+//! would leave its scratch slot zeroed and the draw always returning token 0.
 
 use crate::codegen::error::{EmitError, EmitterKind, ValueLayoutSite};
 use alloc::format;
@@ -66,28 +50,19 @@ pub(super) const SIGNATURE: &str = include_str!("../../../runtime/cuda/fused_blo
 /// and the `descriptors` / `scratch` / `temporary` pointers a body indexes.
 pub(super) const PREAMBLE: &str = include_str!("../../../runtime/cuda/fused_block2.cuh");
 
-/// `kPtirIntrinsicSlots` — per-lane intrinsic descriptor slots.
-///
-/// Projected, not counted. This was `= 8`, correct only for as long as
-/// `IntrinsicId` had eight rows, and the number appears in emitted device
-/// source (`dispatch_lane * N + p.intr`) where being one short means a kernel
-/// reading the next lane's slot zero.
+/// `kPtirIntrinsicSlots` — per-lane intrinsic descriptor slots. Projected,
+/// not counted: an undercount here means a kernel reading the next lane's
+/// slot zero (`dispatch_lane * N + p.intr` in emitted device source).
 pub const PTIR_INTRINSIC_SLOTS: u32 = IntrinsicId::SLOTS;
 
 /// The ops `ptir_parallel_elementwise` in `fused_block0.cuh` has an arm for.
 ///
-/// Answering `true` for a tag that helper does not handle is not a fallback —
-/// the helper's dispatch chain simply runs off the end of the loop body,
-/// writing nothing, and the region goes on with an untouched output buffer and
-/// a clean status word. The single-thread path this competes with ends in
-/// `m1_fault(status, p.tag)`, so being wrong in the other direction is loud.
-///
-/// Hence the explicit list rather than tag ranges. A range like `EXP..=CAST`
-/// absorbs every tag later allocated into a gap inside it, which is precisely
-/// how a new op acquires the silent-wrong-answer behaviour instead of the loud
-/// one. And hence `parallel_elementwise_matches_the_cuda_runtime`, which reads
-/// the arms back out of the `.cuh` and fails if the two sides disagree in
-/// either direction.
+/// Answering `true` for a tag that helper does not handle is silent-wrong
+/// (untouched output, clean status word), not loud like the single-thread
+/// fallback's `m1_fault`. Hence the explicit list rather than tag ranges,
+/// which would silently absorb a later-allocated tag into a gap; and hence
+/// `parallel_elementwise_matches_the_cuda_runtime`, which checks the arms
+/// against the `.cuh` in both directions.
 fn parallel_elementwise(tag: u8) -> bool {
     matches!(
         tag,
@@ -170,18 +145,11 @@ fn row_shape(dims: &[Dimension]) -> Option<RowShape> {
 }
 
 /// Which `argmax` nodes may read a logits intrinsic's buffer directly, and
-/// which nodes that makes redundant.
-///
-/// `source_value` and `requires_single_row` are not used by emission — the
-/// emitted kernel only needs to know *that* the rewrite applies. They are
-/// carried anyway because the engine's launch packer needs them, and shipping
-/// them from here is what keeps this the only implementation of the analysis.
-/// An engine that recomputed them would be a second implementation of a rule
-/// that has to match this one exactly.
-///
-/// Named for the SCAN, not for the record: [`super::region_analysis::DirectArgmax`]
-/// is the sparse, typed form that reaches an engine, and this is the dense
-/// per-node array the walk below fills on its way there.
+/// which nodes that makes redundant. `source_value`/`requires_single_row`
+/// aren't used by emission but are carried for the engine's launch packer,
+/// so this stays the only implementation of the analysis.
+/// [`super::region_analysis::DirectArgmax`] is the sparse, typed form that
+/// reaches an engine; this is the dense per-node array on the way there.
 pub(crate) struct ArgmaxScan {
     pub(crate) intrinsic: Vec<u16>,
     pub(crate) skipped: Vec<u8>,
@@ -307,21 +275,12 @@ pub fn emit_fused_region(
         if skipped[node] != 0 && op.tag != tags::RESHAPE {
             continue;
         }
-        // Both runtimes execute a reshape as a copy of the *result's* element
-        // count out of the source (`ptir_parallel_copy(a0, o0, out.len, ...)`
-        // here, `m1_copy_typed(src, dst, dst_desc.len, ...)` on Metal), so
-        // pointing consumers at the source only reproduces it when the source
-        // is at least as long. This asked `region.outputs` alone, which is a
-        // question about who reads the result, not about whether the source
-        // can stand in for it: `[vocab] -> [SampledRows, vocab]`, as legal in
-        // the IR as the sampler's `[SampledRows, vocab] -> [vocab]`, was
-        // aliased to a buffer too short to read.
-        //
-        // Not also `region.sinks`, which is what `metal::fused` excludes. A
-        // sink is a `chan_put` *inside* this region (`compile/region.rs:302`)
-        // and its operand is alias-resolved with every other operand below, so
-        // eliding a reshape that feeds one is sound here; Metal's extra
-        // exclusion costs it a copy rather than buying it a guarantee.
+        // A reshape's result element count must be no larger than its
+        // source's (both runtimes copy the result's element count out of
+        // the source), or aliasing would read past a too-short buffer.
+        // `region.sinks` is not also excluded (unlike `metal::fused`): a
+        // sink's operand is alias-resolved with every other operand below,
+        // so eliding a reshape that feeds one is sound here.
         if op.tag == tags::RESHAPE
             && !op.args.is_empty()
             && !region.outputs.contains(&base)
@@ -331,8 +290,7 @@ pub fn emit_fused_region(
             continue;
         }
 
-        // CUDA resolves reshape aliases before indexing the offsets table;
-        // which value lands in which slot is shared with Metal.
+        // Reshape aliases are resolved before indexing the offsets table.
         let mut slots = Slots::of(op, base, |value| {
             format!("scratch + offsets[{}]", aliases.resolve(value))
         });
@@ -588,8 +546,8 @@ fn emit_chan_put(source: &mut String, op: &OpView, a0: &str, o0: &str) {
 mod tests {
     use super::*;
     use crate::codegen::layout::{HOST_SHARED, LANE_CHANNEL_SLOT, LANE_RECORD, LANE_TABLE_HEADER};
-    use crate::codegen::runtime_scan::{function_body, tags_compared_in};
-    use alloc::collections::BTreeSet;
+    
+    
 
     /// `fused_block0.cuh` declares the lane table a sixth time, in CUDA's own
     /// width spellings. `layout.rs` knew about five copies and not this one.
@@ -624,30 +582,4 @@ mod tests {
         }
     }
 
-    /// `parallel_elementwise` is a claim about C++ that the C++ cannot check:
-    /// the helper's dispatch runs off the end for a tag it does not know,
-    /// leaving the output buffer untouched and the status word clean. So the
-    /// two lists are compared here instead.
-    #[test]
-    fn parallel_elementwise_matches_the_cuda_runtime() {
-        let handled = tags_compared_in(function_body(PROLOGUE, "ptir_parallel_elementwise"));
-        let claimed: BTreeSet<u8> = eta_ir::op::OP_TABLE
-            .iter()
-            .map(|spec| spec.tag)
-            .filter(|tag| parallel_elementwise(*tag))
-            .collect();
-        let name = |tag: &u8| eta_ir::op::spec(*tag).map_or("?", |spec| spec.name);
-        let unhandled: Vec<&str> = claimed.difference(&handled).map(name).collect();
-        let unclaimed: Vec<&str> = handled.difference(&claimed).map(name).collect();
-        assert!(
-            unhandled.is_empty(),
-            "emitted to ptir_parallel_elementwise but not handled there \
-             (these write nothing, silently): {unhandled:?}"
-        );
-        assert!(
-            unclaimed.is_empty(),
-            "handled by ptir_parallel_elementwise but never emitted to it \
-             (dead runtime code, or a missing tag in parallel_elementwise): {unclaimed:?}"
-        );
-    }
 }

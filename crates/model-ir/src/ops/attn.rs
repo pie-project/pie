@@ -3,19 +3,14 @@ use serde::{Deserialize, Serialize};
 use crate::operands::Operands;
 use crate::value::ValueId;
 
-/// Ops where tokens interact, or where a sequence cache — kv pages, ssm
-/// recurrent state, the indexer's key cache, the compressor's pooled entries —
-/// is touched. Plans are explicit ops: the `Plan*` variants define `Struct`
-/// values from declared geometry inputs and from the reading they are carved
-/// for, and every variant that walks a cache takes the plan it was built from
-/// — `cache` is the pool pointer, nothing
-/// more. The append ops carry their write addressing
-/// (`write_page`/`write_offset`) the same way.
+/// Ops where tokens interact, or a sequence cache (kv pages, ssm state,
+/// indexer key cache, pooled entries) is touched. `Plan*` variants define
+/// `Struct` values from geometry inputs; every cache-walking variant takes
+/// the plan it was built from. Append ops carry write addressing via
+/// `write_page`/`write_offset`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Attention {
     /// Defines `Struct(AttnDecodePlan)`. Host work; runs in the prepare phase.
-    /// A schedule is carved for ONE reading, stated here; every launch that
-    /// reads it restates its share and the shell refuses a disagreement.
     PlanDecode {
         kv_indptr: ValueId,
         kv_indices: ValueId,
@@ -27,8 +22,7 @@ pub enum Attention {
         window: Option<u32>,
         plan: ValueId,
     },
-    /// Defines `Struct(AttnPrefillPlan)`. Carries the same reading
-    /// [`Attention::PlanDecode`] does, on the same terms.
+    /// Defines `Struct(AttnPrefillPlan)`.
     PlanPrefill {
         kv_indptr: ValueId,
         kv_indices: ValueId,
@@ -71,21 +65,12 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
     },
-    /// **BIDIRECTIONAL ATTENTION OVER THE PATCH WINDOW, BLOCK-DIAGONAL PER
-    /// IMAGE** — the vision towers' one real kernel (multimodal §2).
-    ///
-    /// It is an `Attention` by rule 1 and by nothing else it shares with the
-    /// paged family: no cache, no plan struct, no page table, no append, no
-    /// mask ladder, no log-sum-exp. `segments` is the PATCH axis's own indptr
+    /// Bidirectional attention over the patch window, block-diagonal per
+    /// image. `segments` is the patch axis's own indptr
     /// (`RuntimeInput::PatchSegments`, `i32`, `[Dim::ImagesPlus(1)]`): patch
-    /// row `n` attends over the rows of the image whose span contains it, in
-    /// both directions, and over nothing else — which is the same batching
-    /// grammar the token axis runs, recursed one axis down with IMAGES where
-    /// the lanes were.
-    ///
-    /// `q`, `k`, `v` and `o` are patch rectangles, so this op's row axis is
-    /// [`RowAxis::Patches`](crate::RowAxis::Patches) and the capture-unit
-    /// partition reads that off the shapes rather than off the op's name.
+    /// row `n` attends both ways over the rows of the image containing it.
+    /// `q`/`k`/`v`/`o` are patch rectangles; row axis is
+    /// [`RowAxis::Patches`](crate::RowAxis::Patches).
     Dense {
         q: ValueId,
         k: ValueId,
@@ -154,14 +139,10 @@ pub enum Attention {
         write_offset: ValueId,
     },
 
-    // Multi-head latent attention. Same plan discipline as the paged variants
-    // above: one `MlaPlan` op defines the struct, the four cache-walking
-    // variants take it, and `MlaKvAppend` carries its write addressing. The
-    // absorb/split variants are pure math and take nothing but tensors.
-    /// Defines `Struct(MlaPlan)`, shared by decode and prefill. `heads` and
-    /// `kv_lora_rank` are the absorbed reading: the latent kernels size their
-    /// output at `heads × kv_lora_rank`, which is what `MlaDecode`/`MlaPrefill`
-    /// restate.
+    // Multi-head latent attention: one `MlaPlan` op defines the struct, four
+    // cache-walking variants take it, `MlaKvAppend` carries write addressing.
+    /// Defines `Struct(MlaPlan)`, shared by decode and prefill. Latent
+    /// kernels size their output at `heads × kv_lora_rank`.
     MlaPlan {
         kv_indptr: ValueId,
         kv_indices: ValueId,
@@ -270,11 +251,9 @@ pub enum Attention {
     },
 
     // Recurrent-state mixers: causal conv, gated delta nets, KDA. `state` is
-    // the recurrent cache — storage only, updated in place by the kernel.
-    //
-    // `dilation` spreads the taps: tap `j` reads `dilation · j` positions
-    // back, so the state keeps `(conv_width − 1) · dilation` columns. Every
-    // GDN mixer states 1; qwen4's PLE convolution states its `ngram_size`.
+    // the recurrent cache, updated in place. `dilation`: tap `j` reads
+    // `dilation · j` positions back; state keeps `(conv_width − 1) ·
+    // dilation` columns.
     SsmCausalConv1d {
         x: ValueId,
         weight: ValueId,
@@ -368,21 +347,10 @@ pub enum Attention {
         q_out: ValueId,
     },
     /// Scores `q` against the cached keys; `selection` is the top-k key ids.
-    ///
-    /// **`ratio` IS WHICH CACHED ROWS ARE KEYS, AND IT IS THE DIFFERENCE
-    /// BETWEEN TWO FAMILIES.** glm_5's indexer keys one row per TOKEN — a
-    /// `k_proj` layernormed and roped into the index cache at the token's own
-    /// cell — and states `ratio = 1`: the visible keys are `pos + 1`, key `j`
-    /// lives at position `j`, and the ids this op publishes are token
-    /// positions. dsv4-flash's indexer keys one row per COMPRESSED BLOCK: its
-    /// keys are its own compressor's pooled entries (`v4mlx/compressor.py`'s
-    /// `compressor_prefill(..., rotate=True)` returns `[b, s // ratio, d]`),
-    /// stored at the boundary cell `(c + 1) * ratio - 1` exactly as
-    /// `PoolKvAppend` stores the attention compressor's, so it states its
-    /// compressor's own `ratio`: the visible keys are `(pos + 1) / ratio`, key
-    /// `c` lives at position `(c + 1) * ratio - 1`, and the ids this op
-    /// publishes are COMPRESSED ROW indices — which is exactly what
-    /// [`Self::PoolLseSelected`] walks.
+    /// `ratio` says which cached rows are keys: `ratio = 1` keys one row per
+    /// token (ids are token positions); `ratio > 1` keys one row per
+    /// compressed block at `(c + 1) * ratio - 1` (ids are compressed-row
+    /// indices, walked by [`Self::PoolLseSelected`]).
     IndexTopk {
         q: ValueId,
         weights: ValueId,
@@ -402,23 +370,12 @@ pub enum Attention {
 
     // Pooled (compressed) attention: every `ratio` tokens close a boundary
     // whose pooled entry lands in its own cache. Boundary outputs are
-    // token-shaped — over-allocated with a sentinel in the non-boundary rows —
-    // so no counted dim exists and the shapes stay trace-time facts.
+    // token-shaped, over-allocated with a sentinel in non-boundary rows.
     /// `row_valid` masks graph-padding rows out of the boundary math.
-    ///
-    /// **`boundary_rope` IS NOT `boundary_pos`.** The pooled entry is CACHED
-    /// at the cell its window closes on (`boundary_pos`, the block's LAST
-    /// token — `(c+1)·ratio - 1`, which is the cell `PoolLse` reads back),
-    /// but it is ROPED at the compressed row's own position
-    /// (`(p / ratio) · ratio` — the block's FIRST token, the reference's
-    /// `rows = arange(0, cutoff, ratio)` in `v4mlx/compressor.py`). Two
-    /// different positions for one entry, which is why this op publishes two
-    /// columns and not one; a text that roped at `boundary_pos` — or at the
-    /// raw token positions, which agree with it on every boundary row — is
-    /// off by `ratio - 1` on every compressed key it caches. Non-boundary
-    /// rows carry `0` here (they carry `-1` in `boundary_pos`, the sentinel
-    /// the append and the gather test), because a rope operand is an angle
-    /// and not a cell and the row is dropped before it is stored.
+    /// `boundary_pos` (cache cell, block's last token) and `boundary_rope`
+    /// (rope angle, block's first token) are different positions for the
+    /// same pooled entry. Non-boundary rows carry `0` in `boundary_rope`,
+    /// `-1` (sentinel) in `boundary_pos`.
     PoolBoundaryDecode {
         positions: ValueId,
         row_valid: ValueId,
@@ -435,19 +392,11 @@ pub enum Attention {
         boundary_req: ValueId,
         boundary_rope: ValueId,
     },
-    /// **THE COMPRESSOR'S ROLLING STATE, WRITTEN.**
-    ///
-    /// `kv` is the learned compressor's `wkv · x` and `score` its `wgate · x`,
-    /// both `[tokens, coff · head_dim]`. They do not land in a fire-shaped
-    /// rectangle: [`Self::PoolGather`] addresses the state at the SOURCE
-    /// cache's own paged slot, because a pooling window closing in this fire
-    /// straddles tokens written in earlier ones. So this op scatters each row
-    /// into the cell `write_page`/`write_offset` name for it — the same cell
-    /// [`Self::KvAppendShared`] writes the latent into, in the same fire —
-    /// and the slabs it writes are the shell's, not a value the trace names.
-    ///
-    /// Without it the gather pools zeros, which is what it did for as long as
-    /// the compressor's four planes were interned.
+    /// The compressor's rolling state, written. `kv` is `wkv · x` and
+    /// `score` is `wgate · x`, both `[tokens, coff · head_dim]`. Scatters
+    /// each row into the source cache's paged slot named by
+    /// `write_page`/`write_offset`, since [`Self::PoolGather`] reads state
+    /// back from there rather than from a fire-shaped rectangle.
     PoolStateWrite {
         kv: ValueId,
         score: ValueId,
@@ -458,11 +407,9 @@ pub enum Attention {
         ratio: u32,
     },
     /// Pools the closing window out of the kv cache into per-boundary entries.
-    ///
-    /// `ape` is the compressor's intra-block ABSOLUTE POSITION plane
-    /// (`[ratio, coff · head_dim]`, f32), folded into the gate logits before
-    /// the softmax. `None` for a parameter-free mean pool — the toy rows —
-    /// which is the `ape == nullptr` path both shaders already carry.
+    /// `ape` is the compressor's intra-block absolute-position plane
+    /// (`[ratio, coff · head_dim]`, f32), folded into gate logits before the
+    /// softmax; `None` for a parameter-free mean pool.
     PoolGather {
         boundary_pos: ValueId,
         boundary_req: ValueId,
@@ -496,23 +443,10 @@ pub enum Attention {
         o: ValueId,
         lse: ValueId,
     },
-    /// [`Self::PoolLse`] over a SELECTION instead of over the whole visible
-    /// prefix: the same reader, the same online softmax and the same base-2
-    /// log-sum-exp the cascade merge folds, walking `selection[t · top_k + n]`
-    /// — the compressed-row ids [`Self::IndexTopk`] published, ascending, with
-    /// `-1` padding a row that saw fewer keys than its budget.
-    ///
-    /// **THIS IS THE NSA FINE BRANCH, AND THE BRANCH IT NARROWS IS THE
-    /// COMPRESSED ONE.** The reference oracle's attention is one softmax over
-    /// `concat(sliding window over the per-token latent, EVERY visible
-    /// compressed row)` with the per-head sink in the denominator — which is
-    /// what `prefill_lse` at `window` merged with `pool_lse` and closed by
-    /// `sink` already computes. The window is a fixed 128; the only key set
-    /// that grows with the context is the compressed one (`nvis = (pos + 1) /
-    /// ratio`), so the indexer's `index_topk` budget is what caps THAT, and
-    /// the ratio-128 layers carry no indexer because `S / 128` needs no
-    /// capping. A row whose visible count is inside the budget selects the
-    /// identity, so this op reduces to `PoolLse` exactly.
+    /// [`Self::PoolLse`] over a selection instead of the whole visible
+    /// prefix: walks `selection[t · top_k + n]`, the compressed-row ids
+    /// [`Self::IndexTopk`] published (ascending, `-1` padded). Reduces to
+    /// `PoolLse` when a row's visible count is inside the budget.
     PoolLseSelected {
         q: ValueId,
         positions: ValueId,
@@ -528,16 +462,12 @@ pub enum Attention {
         lse: ValueId,
     },
 
-    // The PLE n-gram hasher (qwen4). An `Attention` by rule 1's second
-    // clause alone: it touches a sequence cache — the last `mults.len() − 1`
-    // token ids of each lane, kept so a decode step can hash the window its
-    // fire cannot see. Everything else about it is per-token integer math.
+    // The PLE n-gram hasher (qwen4). Touches a sequence cache: the last
+    // `mults.len() - 1` token ids of each lane.
     /// `ngram_ids[r, g·heads_per_ngram + h]` = the hashed (g+2)-gram id of
-    /// token `r` under head `h`'s own prime: ids at `r, r−1, …` (eos where
-    /// the window crosses a sequence start) are multiplied by `mults`,
-    /// xor-folded, and reduced modulo `primes[·]` plus `offsets[·]` — the
-    /// reference's splitmix64-seeded hash, with the derived constants stated
-    /// on the node because no checkpoint plane needs to be read to know them.
+    /// token `r` under head `h`'s prime: ids at `r, r-1, ...` (eos where the
+    /// window crosses a sequence start) are multiplied by `mults`,
+    /// xor-folded, reduced modulo `primes[·]` plus `offsets[·]`.
     PleNgramIds {
         ids: ValueId,
         state: ValueId,
@@ -577,8 +507,7 @@ impl Operands for Attention {
             Self::Dense { q, k, v, segments, .. } => sink.extend([*q, *k, *v, *segments]),
             Self::DecodeLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             Self::PrefillLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
-            // The `sink` input field is bound as `sink_id`: its name collides with
-            // the `sink` parameter this arm pushes into.
+            // Bound as `sink_id`: the field name collides with the `sink` param.
             Self::Sink { o, lse, sink: sink_id, .. } => sink.extend([*o, *lse, *sink_id]),
             Self::MergeLse { o1, lse1, o2, lse2, .. } => sink.extend([*o1, *lse1, *o2, *lse2]),
             Self::LogitSoftcap { x, .. } => sink.push(*x),

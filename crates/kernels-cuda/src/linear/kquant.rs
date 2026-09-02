@@ -1,35 +1,10 @@
 //! GGUF K-quant gemm points: the whole K family — `q2_k`, `q3_k`, `q4_k`,
-//! `q5_k`, `q6_k` — read as stored, dequantized inside the dot. `q4_k` and
-//! `q6_k` were the mandatory pair (Q4_K_M mixes are the most-distributed
-//! quant artifacts there are, and their `output.weight` is q6_k); `q3_k`
-//! has a real user in this tree's own import history, `q5_k` is a
-//! top-distributed mix in Q5_K_M, and `q2_k` is the family's floor. Filled
-//! by the QNF wave (wiki alto/next.md §J2, priority 3), which asked for the
-//! pair first and these three after.
-//!
-//! **THE WEIGHT ARRIVES AS ONE BYTE PLANE, AND THE ROW'S BYTE WIDTH NAMES
-//! THE SCHEME.** A K-quant carries its scales INSIDE the super-block, so
-//! there is no second plane to bind and no dtype to dispatch on: a `[n, k]`
-//! weight is `n` rows of `k / 256` consecutive super-blocks, and a
-//! super-block is 84 bytes at `q2_k`, 110 at `q3_k`, 144 at `q4_k`, 176 at
-//! `q5_k` and 210 at `q6_k`.
-//!
-//! **THE DISCRIMINATION IS TOTAL, AND THE ARGUMENT IS ONE LINE.** `k` is
-//! checked to be a whole number of super-blocks BEFORE any width is looked
-//! at, so `blocks = k / 256` is a fixed positive integer and the five
-//! candidate row widths are `blocks·{84, 110, 144, 176, 210}` — one common
-//! positive factor against five pairwise-distinct widths. A common positive
-//! factor preserves distinctness, so the five candidates are pairwise
-//! distinct for every `blocks ≥ 1`, which is every legal `k`. [`scheme`]
-//! answers one of the five or refuses by name, and no width is ever
-//! ambiguous between two schemes.
-//!
-//! **A PLANE-FORM VARIANT MAY SUPERSEDE THESE ENTRY SHAPES.** Serving AS
-//! STORED is the ruling these entries answer (§J); the canonical `.zt`
-//! container is leaf-per-plane and k-group-major, so a later import wave may
-//! re-seat these weights as separate code and scale planes and want entries
-//! that take them apart. The decode arithmetic in `linear/kquant.cuh` is the
-//! format's and would not move — only the addressing would.
+//! `q5_k`, `q6_k` — read as stored, dequantized inside the dot. A K-quant
+//! carries its scales inside the super-block, so there's no second plane to
+//! bind and no dtype to dispatch on: a `[n, k]` weight is `n` rows of
+//! consecutive super-blocks ([`SUPER`] elements each), and each scheme's
+//! super-block byte width is distinct, so a row's byte width names the
+//! scheme unambiguously.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -113,13 +88,10 @@ const FAMILY: [(u32, Scheme); 5] = [
     (Q6K_BYTES, Scheme::Q6K),
 ];
 
-/// **HOW A STORED K-QUANT ROW SAYS WHAT IT IS.** `k` fixes the super-block
-/// count; the row's byte width then divides out to exactly one of [`FAMILY`]
-/// and to nothing else (the module doc carries the argument). A row that
-/// matches none of the five is refused rather than read at a guess — the
-/// schemes disagree about every byte after the first, so a misread would
-/// decode to plausible garbage instead of failing, and the refusal names all
-/// five widths so the caller can see which conversion its artifact wants.
+/// How a stored K-quant row says what it is: `k` fixes the super-block
+/// count, and the row's byte width divides out to exactly one of [`FAMILY`].
+/// A row matching none of the five is refused rather than read at a guess,
+/// naming all five widths so the caller can see which conversion it wants.
 fn scheme(op: &'static str, k: u32, row_bytes: u32) -> Result<Scheme, Error> {
     let blocks = k / SUPER;
     for (width, scheme) in FAMILY {

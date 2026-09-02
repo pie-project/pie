@@ -13,11 +13,7 @@ impl DispatchCollective for Run<'_> {
 }
 
 impl Run<'_> {
-    /// The arms themselves, in `kernels-cuda`'s error vocabulary and not
-    /// the contract's — which is what keeps each one a plain tail call with
-    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
-    /// above that lifts the family, and says why it is a call and not a
-    /// `From` impl.
+    /// Returns `kernels_cuda::Error`, lifted by [`kernel`](crate::error::kernel) in `dispatch` above.
     fn collective(&mut self, op: &Collective) -> Result<(), kernels_cuda::Error> {
         match op {
             Collective::AllReduce { buf, buf_out: _ } => {

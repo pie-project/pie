@@ -349,6 +349,8 @@ __global__ void mla_naive_paged_kernel(
     // PLANES move by it — the qo boundaries this searches are the window's
     // own, rebased to its zero, so the token ordinal they answer stays `t`.
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+    if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -585,6 +587,8 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     // PLANES move by it — the qo boundaries this scans are the window's own,
     // rebased to its zero, so the token ordinal they answer stays `t`.
     const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+    // `R` may be the key's lane ceiling; `win[2]` is the live request count.
+    if (win != nullptr && static_cast<int>(win[2]) < R) R = static_cast<int>(win[2]);
     const int h0 = blockIdx.x * kBM;
 
     __shared__ int s_req;

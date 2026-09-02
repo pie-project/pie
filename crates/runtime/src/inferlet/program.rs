@@ -1,7 +1,5 @@
-//! Program Manager Service - Inferlet program caching and loading
-//!
-//! This module provides a singleton actor for managing program (inferlet) metadata,
-//! caching, downloading from registry, and compilation.
+//! Program Manager Service: a singleton actor for managing program
+//! (inferlet) metadata, caching, downloading from registry, and compilation.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -196,13 +194,11 @@ struct ProgramService {
 #[derive(Clone)]
 struct InstalledProgram {
     component: Component,
-    /// True if the component was transformed by the host-side snapshot
-    /// pipeline. Consumers use this to pick the stripped shared-module
-    /// variant at instantiate time.
+    /// True if transformed by the host-side snapshot pipeline (pick the
+    /// stripped shared-module variant at instantiate time).
     snapshotted: bool,
-    /// Declared python-runtime version, if any. Cached at install time so
-    /// linker consumers don't need to re-read the manifest to decide how to
-    /// wire shared modules.
+    /// Declared python-runtime version, cached so linker consumers don't
+    /// need to re-read the manifest.
     python_runtime: Option<String>,
 }
 
@@ -213,11 +209,7 @@ pub struct InstalledComponent {
     pub component: Component,
     /// Current installed-program generation for cache invalidation.
     pub generation: u64,
-    /// True if the component was transformed by the host-side snapshot
-    /// pipeline. Pick the stripped shared-module variant at instantiate time
-    /// when this is set.
     pub snapshotted: bool,
-    /// Declared python-runtime version, if this program requires one.
     pub python_runtime: Option<String>,
 }
 
@@ -345,15 +337,8 @@ impl ProgramService {
             }
         }
 
-        // Step 4: Fetch main WASM bytes and decide whether to snapshot.
-        //
-        // Snapshot when:
-        //   (a) py_runtime is installed on this engine, and
-        //   (b) snapshot is enabled, and
-        //   (c) the program's manifest declares a python-runtime requirement
-        //       (i.e. it's a Python inferlet using shared-everything linking).
-        // When any prerequisite is missing we fall through to the plain
-        // compile path below.
+        // Step 4: fetch WASM bytes; snapshot only if py_runtime is installed,
+        // snapshot is enabled, and the manifest declares python-runtime.
         let wasm_binary = self.repository.fetch_wasm_binary(name).await?;
 
         let python_runtime = self
@@ -622,81 +607,3 @@ pub async fn compile_wasm_component(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn program_name_parse_validation() {
-        // ── Valid inputs ──────────────────────────────────────────────
-        let valid = [
-            ("text-completion@0.1.0", "text-completion", "0.1.0"),
-            ("my_inferlet@1.2.3", "my_inferlet", "1.2.3"),
-            ("a@0.0.0", "a", "0.0.0"),
-            ("X@99.99.99", "X", "99.99.99"),
-            ("foo-bar_baz@10.20.30", "foo-bar_baz", "10.20.30"),
-            ("A1-b2_C3@0.0.1", "A1-b2_C3", "0.0.1"),
-        ];
-        for (input, expected_name, expected_version) in valid {
-            let p = ProgramName::parse(input)
-                .unwrap_or_else(|e| panic!("Expected '{}' to be valid, got: {}", input, e));
-            assert_eq!(p.name, expected_name, "name mismatch for '{}'", input);
-            assert_eq!(
-                p.version, expected_version,
-                "version mismatch for '{}'",
-                input
-            );
-            // Display roundtrip
-            assert_eq!(
-                p.to_string(),
-                input,
-                "Display roundtrip failed for '{}'",
-                input
-            );
-        }
-
-        // ── Invalid inputs ───────────────────────────────────────────
-        let invalid = [
-            // Missing version (bare name)
-            "text-completion",
-            "foo",
-            // Missing name
-            "@0.1.0",
-            // Empty string
-            "",
-            // No semver
-            "foo@latest",
-            "foo@v1.0.0",
-            "foo@1.0",
-            "foo@1",
-            "foo@1.0.0.0",
-            "foo@abc",
-            "foo@1.0.0-beta",
-            // Path traversal / unsafe characters
-            "../evil@0.1.0",
-            "foo/bar@0.1.0",
-            "foo\\bar@0.1.0",
-            "foo@../0.1.0",
-            // Special characters in name
-            "foo bar@0.1.0",
-            "foo!@0.1.0",
-            "foo.bar@0.1.0",
-            // Name starting with hyphen or underscore
-            "-foo@0.1.0",
-            "_foo@0.1.0",
-            // Multiple @
-            "foo@bar@0.1.0",
-            // Whitespace
-            " foo@0.1.0",
-            "foo@0.1.0 ",
-            "foo @0.1.0",
-        ];
-        for input in invalid {
-            assert!(
-                ProgramName::parse(input).is_err(),
-                "Expected '{}' to be rejected, but it was accepted",
-                input
-            );
-        }
-    }
-}

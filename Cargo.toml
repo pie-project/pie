@@ -1,161 +1,68 @@
-# Top-level Cargo workspace for the host-side Rust crates.
-#
-# ONE workspace, ONE lockfile. Every Rust crate in the repo is a member and
-# lives under `crates/`; the only Rust outside it is `sdk/server/python`, which
-# stays beside the python package it ships with (maturin convention).
-#
-# Guest-target crates (`crates/inferlet`, wasm32-wasip2) are MEMBERS but sit
-# outside `default-members`: that is what gives them this lockfile — the old
-# excluded `sdk/rust` workspace resolved eta-dsl a second, independent time —
-# while keeping them out of host sweeps. CI builds them explicitly with
-# `--target wasm32-wasip2`. `tests/inferlets` stays excluded: those carry their
-# own lockfiles on purpose, as fixtures of a published guest contract.
+# One workspace, one lockfile: every Rust crate in the repo is a member.
 [workspace]
-# Resolver 3 is the edition-2024 default and is MSRV-aware: it will not pick a
-# dependency version that needs a newer rustc than the `rust-version` declared
-# below. Nothing in the current lockfile changes under it — the point is that a
-# future `cargo update` cannot silently raise the floor.
+# Resolver 3 is MSRV-aware: it will not pick a dependency version that needs a
+# newer rustc than the `rust-version` below.
 resolver = "3"
 members = [
-    # -- serving fabric and its foundation leaves (bare names) ---------------
-    # Process skeleton: CLI flag skeleton, path/config sourcing, tracing +
-    # /metrics, signal/panic/exit lifecycle. Depends on no role lib. Also ships
-    # the `pie-env` diagnostic bin ("do this role's boot preconditions hold").
+    # serving roles and their leaf crates
     "crates/bootstrap",
     "crates/runtime",
-    # Role libraries (pure libs: run(Config) -> Handle; no bin).
-    #
-    # "…and never dep each other" STOOD HERE, and it is not true: `worker`
-    # takes `client` (`crates/worker/Cargo.toml:157`), to drive an inferlet
-    # against the engine subprocess it boots. One edge among the four, and it
-    # is a role using another role's CLIENT rather than its service — which is
-    # the shape that does not couple two servers. The sentence is written this
-    # way rather than deleted because the property it was reaching for is
-    # still worth having: no role library depends on another role's SERVER.
-    # `tests/crate_layering.rs` is where a rule of that shape would go if it
-    # is ever worth enforcing; it is not enforced today.
     "crates/controller",
     "crates/gateway",
     "crates/worker",
     "crates/client",
     "crates/transport",
-    # Keystone leaf: BPE tokenizer (encode/decode) loaded from HF tokenizer.json.
     "crates/tokenizer",
-    # Constrained-decoding grammar engine (EBNF/regex/json-schema/matcher/bitmask).
     "crates/grammar",
-    # X0 tensor-waker substrate (leaf crate; loom-model-checked in isolation).
     "crates/waker",
-    # Id atoms, serde leaf — what the roles and the contracts all sit on.
     "crates/ids",
-    # The element type, serde leaf — the one enum the IR, the loader, the
-    # kernels and the transfer contract all name.
     "crates/dtype",
 
-    # -- boundary contracts, suffix-named after their subject ---------------
-    # `-api` = wire/message contract. They stay extracted because a
-    # bidirectional pair of roles naming each other's types directly would
-    # cycle. (Not because roles never depend on each other -- see the note
-    # above `crates/controller`: `worker` takes `client`.)
-    #
-    # `-abi` was the other suffix, for the repr(C) FFI contract, and no crate
-    # carries it any more: every engine on the far side is Rust, so the
-    # marshalling shapes went. `engine` kept the shape of one for a while
-    # after the C++ left -- an `i32` status ladder, an ABI version on an
-    # in-process call, `u8` tag constants re-spelling `eta-ir`'s vocabulary
-    # -- and the palo rewrite (design §7) deleted the last of it. It is owned
-    # Rust types over `model-ir` and `eta-ir` now, with no `#[repr(C)]` left
-    # in it at all.
+    # boundary contracts (`-api` = wire/message contract), extracted so that
+    # two roles naming each other's types do not cycle
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
     "crates/engine",
 
-    # -- engine-*: execution shells ----------------------------------------
-    # The two deviceless execution substrates, shared by both Rust shells. One
-    # crate held both until they were measured: `fire`/`store`/`law` reach for
-    # the model toolchain, the guest-program plane reaches for the ETA
-    # toolchain, and the cross-references between them were zero. The half that
-    # was `src/pipeline/` inside `engine-metal` until the CUDA shell reached
-    # the same file is `eta-exec`; the move cost nothing then because not one
-    # line of it named a Metal type, and this one costs nothing because neither
-    # half named the other. Both are `default-member`s, unlike every engine
-    # below them: they need no GPU, no toolkit and no OS, so there is no reason
-    # a workspace sweep should not carry their tests.
+    # deviceless execution substrates, shared by both engine shells
     "crates/model-exec",
     "crates/eta-exec",
 
-    # -- how a checkpoint gets onto a device -------------------------------
-    # Checkpoints -> verified memory layouts a device can be pointed at.
-    # Consumed by engines at cold start, not by the serving runtime. One
-    # crate: the engines link the rlib and pass Rust types, and a device's
-    # arena crosses as an `ArenaBacking` rather than as a second executor
-    # inside each engine.
-    #
-    # It was crates/model-loader, and it sat under a `model-*` heading it
-    # never belonged to: nothing in it knows a model family, which is the
-    # property `crates/checkpoint/tests/standalone.rs` exists to pin. What it
-    # knows is a checkpoint.
+    # checkpoints -> verified memory layouts a device can be pointed at
     "crates/checkpoint",
 
-    # -- eta-*: the guest-program toolchain ---------------------------------
-    # authoring eDSL -> ETA -> planning -> CUDA/Metal codegen, plus the
-    # reference interpreter every backend diffs against.
+    # the guest-program toolchain: eDSL -> ETA -> planning -> CUDA/Metal codegen
     "crates/eta-ir",
     "crates/eta-dsl",
     "crates/eta-compiler",
 
-    # -- guest-target members (outside default-members, see below) ----------
-    # `inferlet` owns the canonical `pie:inferlet` WIT package (`wit/`) AND is
-    # the wit-bindgen site over it -- it has to be both, because `generate!`
-    # resolves its path on the filesystem and this crate is published. It is a
-    # guest crate because the generated import shims are wasm, even though the
-    # host reads its `wit/` directory by path.
+    # guest-target crates (wasm32-wasip2); members for the shared lockfile, but
+    # kept out of `default-members` because they have no host target.
+    # `inferlet` owns the `pie:inferlet` WIT package and is the bindgen site
+    # over it, because `generate!` resolves `wit/` on the filesystem.
     "crates/inferlet",
     "crates/inferlet-macros",
 
-    # -- menlo: the typed-IR rewrite (.wiki/menlo/design.md) ------------------
-    # The old model/kernel stack (string plans, #[points], claim tables, the
-    # per-plane baker shells) was deleted in one commit and these took the
-    # names. Layering: model-ir is a leaf of pure data; kernels-* are entry
-    # functions with no IR knowledge, each answering with an `Error` of its
-    # own; model-exec holds the dispatch contract AND the one walk written
-    # over it; engine-* own the Run and translate the kernel library's
-    # refusal into the contract's at six points apiece.
-    # The IR: typed op enums, Def x Ty value declarations, the validator.
+    # the typed-IR model stack: leaf IR, authoring surface, plan baking,
+    # catalog, kernel libraries, engine shells
     "crates/model-ir",
-    # The authoring surface: Recorder/Value, wrappers that own their shapes.
     "crates/model-dsl",
-    # Bakes a Plan once (palo design §2): classes, regions, the arena carve.
     "crates/model-compiler",
-    # The model catalog: six forwards on the new surface, SKU names verbatim.
     "crates/models",
-    # The provenance authoring surface: Builder over checkpoint's contract IR.
     "crates/checkpoint-dsl",
-    # The prompt formats: ChatML/Harmony/Gemma/DeepSeek/Kimi, both directions.
     "crates/chat-template",
-    # Pure CUDA kernel definitions: jit machinery, owned attention plans,
-    # NCCL collectives; device text carried in-tree.
     "crates/kernels-cuda",
-    # Pure Metal kernel definitions over the encode sink.
     "crates/kernels-metal",
-    # The CUDA Run: one resolver, host-twin geometry, plan staging.
     "crates/engine-cuda",
-    # The Metal Run over dyn Encode -- OS-portable like the walk it uses.
     "crates/engine-metal",
 
-    # -- Rust that lives outside crates/ on purpose -------------------------
-    # The python SDK's backend: pyo3/maturin want the Rust half beside its
-    # product, not in the workspace tree.
+    # Rust outside crates/: the python SDK's backend sits beside the package
+    # maturin builds.
     "sdk/server/python",
-    # The runtime's on-device end-to-end suite. No code of its own; it exists so
-    # that `cargo test -p pie` means the CLI's own tests rather than
-    # "compile thirty GPU test binaries". Almost everything in it is `#[ignore]`d
-    # and asks for a real device.
-    "tests/gpu",
 ]
-# Host sweeps (`cargo check`, `cargo test` with no `-p`/`--workspace`) run this
-# set. It is every member except the wasm32-wasip2 guest crate, which has no
-# host target and would fail the sweep it is not part of.
+# Host sweeps run this set: every member except the wasm32-wasip2 guest crates,
+# which have no host target.
 default-members = [
     "crates/bootstrap",
     "crates/runtime",
@@ -175,13 +82,10 @@ default-members = [
     "crates/engine",
     "crates/model-exec",
     "crates/eta-exec",
-    # The three shader drivers stood here through R2's quarantine and are out
-    # of the workspace altogether now — see `exclude`.
     "crates/models",
     "crates/model-ir",
     "crates/model-dsl",
     "crates/checkpoint-dsl",
-    # Pure, deviceless and fast to check — a workspace sweep should carry it.
     "crates/model-compiler",
     "crates/checkpoint",
     "crates/kernels-cuda",
@@ -191,35 +95,20 @@ default-members = [
     "crates/eta-compiler",
     "crates/inferlet-macros",
     "sdk/server/python",
-    "tests/gpu",
 ]
 exclude = [
-    # ALL THREE SHADER PLANES ARE IN THE WORKSPACE NOW. `engine-metal` came
-    # back at P5a, `engine-wgpu` at P5b and `engine-vulkan` at P5c; this list
-    # held the last of them for the whole of the quarantine and holds none.
+    # Fixtures of the published guest contract; they carry their own lockfiles.
     "tests/inferlets",
-    # Worktree checkouts under .claude/worktrees/ must never be captured by
-    # THIS manifest when cargo walks up from a worktree's excluded package
-    # (e.g. .claude/worktrees/<x>/tests/inferlets/<name> — the worktree's own root
-    # excludes it, so the walk continues up to here).
+    # Keeps cargo from capturing worktree checkouts when it walks up from an
+    # excluded package under `.claude/worktrees/`.
     ".claude",
 ]
 
-# Shared package metadata. Opt in per field with `<field>.workspace = true`;
-# today only the `compiler/*` crates do.
-# ── The `pie` package ────────────────────────────────────────────────
-#
-# The root is a package as well as the workspace (the wasmtime pattern):
-# `cargo run` here boots the standalone. It used to be `bin/pie`, one of four
-# thin bin shells; the other three ride this same package as `src/bin/*`.
-#
-# That costs nothing, because `pie` already depended on all three role libs --
-# it is the composition root, the one crate that deps controller AND gateway
-# AND worker. Four packages whose union of dependencies equals one of them is
-# four manifests to keep in step for no boundary.
+# The root is a package as well as the workspace: `cargo run` boots the
+# standalone, and the three role daemons ride it as `src/bin/*`.
 [package]
 name = "pie"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The pie standalone: multi-call CLI (local/serve + ops) composing the bootstrap skeleton and the controller/gateway/worker role libs in-proc, plus the three role daemons."
@@ -234,8 +123,6 @@ path = "src/lib.rs"
 name = "pie"
 path = "src/main.rs"
 
-# The three role daemons. `src/bin/<name>.rs` names the binary, which is why
-# the files are hyphenated: the user-facing commands are unchanged.
 [[bin]]
 name = "pie-controller"
 path = "src/bin/pie-controller.rs"
@@ -249,65 +136,31 @@ name = "pie-worker"
 path = "src/bin/pie-worker.rs"
 
 [features]
-# This package selects the engine backend; it forwards the flavors to the
-# embedded worker. Default = none, and none means none: the always-linked
-# `Dummy` flavor that used to catch a featureless build went with its crate,
-# so `pie config init` refuses rather than writing a config naming it. Enable
-# engine-cuda-12 / engine-cuda-13 for real inference.
+# Backend selection, forwarded to the embedded worker. No default backend:
+# `pie config init` refuses rather than writing a config with no engine.
 default = []
-# NVIDIA. The number is the CUDA runtime ABI the binary will LOAD, and it is
-# in the name because this is the last package in the chain -- the one that
-# actually produces a binary, and so the one where guessing is unrecoverable.
-# `engine-cuda` STOOD HERE and meant `cuda-13` silently; the release workflow
-# built six `cuda12.8`-labelled artifacts through it. See `crates/runtime`.
-_engine-cuda = ["worker/_engine-cuda"]
-engine-cuda-12 = ["_engine-cuda", "worker/engine-cuda-12"]
-engine-cuda-13 = ["_engine-cuda", "worker/engine-cuda-13"]
-# BACK, forwarding to `worker`. No ABI in the name because Metal has none to
-# choose: `engine-metal/metal-4` is the device half's gate and the version it
-# states. Apple-only, and the seam that reads it says so with a target cfg
-# rather than this flag -- so a non-Apple build with the feature on is a build
-# with no metal seam in it, not a link error.
-engine-metal = ["worker/engine-metal"]
-# Probe passthroughs to the embedded worker (→ runtime).
+cuda = ["worker/cuda"]
+# Apple-only; the seam that reads it uses a target cfg, so a non-Apple build
+# with the feature on has no metal seam rather than a link error.
+metal = ["worker/metal"]
+# Probe passthrough to the embedded worker (→ runtime).
 profile-fire = ["worker/profile-fire"]
 
 [dependencies]
-# Shared process skeleton (imports as `bootstrap`): CLI flags, paths, tracing,
-# signals, /metrics, banner.
 bootstrap = { path = "crates/bootstrap" }
-# The three role libs — this is the ONE package that deps all three (Seam 4).
 controller = { path = "crates/controller" }
 gateway = { path = "crates/gateway" }
 worker = { path = "crates/worker", default-features = false }
 runtime = { path = "crates/runtime" }  # program/manifest types for `pie inferlet`
-# `pie model import` — the host-side load-plan executor and checkpoint
-# writer. Pure Rust; needs no driver and no GPU, in every configuration:
-# the CUDA arena it used to gate behind a `cuda` feature is `engine-cuda`'s
-# now, and nothing here names a kernel crate.
+# `pie model import`: load-plan executor, checkpoint writer, and the tokenizer
+# compiler whose result is serialized into the artifact (`pie.tokenizer/1`).
 checkpoint = { path = "crates/checkpoint" }
-# The tokenizer compiler — `pie model import` runs it once and serializes the
-# result into the artifact (`pie.tokenizer/1`), so the runtime never parses
-# `tokenizer.json` again.
+checkpoint-dsl = { path = "crates/checkpoint-dsl" }
+ztensor = { workspace = true }
 tokenizer = { path = "crates/tokenizer" }
-# `model-config` STOOD HERE, the HF `config.json` normalizer. It is gone, and
-# the config now rides into the artifact verbatim under `CONFIG_OBJECT` below.
-# Client edge for `pie config tune`: the sweep generates load through
-# the same websocket path a deployment is reached by, because measuring an
-# in-process shortcut would measure something nobody runs.
+# `pie config tune` drives load through the same websocket path a deployment
+# is reached by, rather than an in-process shortcut.
 client = { path = "crates/client" }
-# `model` STOOD HERE, and after R3 it was the catalog: `pie model import` took
-# `serve::encoding::CONFIG_OBJECT` off it, and `pie model list` took
-# `snapshot::Snapshot` and `identify` to answer "can pie serve this?". M18/M19
-# deleted all three names, and their replacements are not in that crate. The
-# object name lives with its readers in `worker::weights`; the identity
-# question is `runtime::engine::load::identify`, which compiles each SKU's load
-# contract against the checkpoint rather than matching tensor names — a name
-# match cannot tell a 3B Qwen from a 0.8B one, which is measured. This package
-# links `worker` and `runtime` already, so the edge went with the names.
-# Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
-# GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
-# the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.
 ids = { path = "crates/ids" }
 controller-api = { path = "crates/controller-api" }
 
@@ -319,16 +172,12 @@ tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# R3 weight/runtime provisioning downloaders — these live ONLY here (the worker
-# lib links zero provisioning machinery). `reqwest` carries `blocking` because
-# the CLI `runtime install` download is synchronous; the HF snapshot fetch in
-# `local::hf::download` is async and streams.
+# Provisioning downloaders live only here. `blocking` because `runtime install`
+# is synchronous; `stream` for the async HF snapshot fetch.
 #
-# `rustls-no-provider`, not `rustls`: reqwest's `rustls` feature hard-selects
-# the aws-lc backend (`rustls = ["__rustls-aws-lc-rs", ...]`), whose build
-# script was the single most expensive unit in a cold build and a second crypto
-# backend beside the `ring` the client crate and wasmtime-wasi-http already
-# link. `bootstrap::install_crypto_provider` picks ring at process boot.
+# `rustls-no-provider`, not `rustls`: the latter hard-selects the aws-lc backend,
+# a second crypto backend beside the `ring` this tree already links.
+# `bootstrap::install_crypto_provider` picks ring at process boot.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking", "stream"] }
 tar = "0.4"
 xz2 = "0.1"
@@ -336,112 +185,36 @@ toml_edit = "0.25.13"
 
 [dev-dependencies]
 tempfile = "3"
-# The `client` dev-dep STOOD HERE for `tests/boot_smoke.rs`, which drove
-# `run_standalone` the way a client does. That test is deleted (`src/lib.rs`
-# says so) and `client` is a plain dependency of this package besides, so the
-# line named a reason that no longer exists for an edge that already did.
-
 
 # SIGPIPE disposition — see `die_quietly_on_closed_pipe` in main.rs.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [workspace.package]
-# The floor is verified, not assumed: `cargo +1.91.1 check --all-targets` builds
-# all six compiler crates. `rust-toolchain.toml` pins 1.97.1 because that is the
-# version CI's `-D warnings` gate is calibrated against, but pinning a toolchain
-# is not the same claim as requiring one — a consumer of `eta-ir` needs only
-# what the source actually uses.
-#
-# Lowering this further needs a toolchain to check it against; raising it needs
-# a reason in the diff. Either way the number is a measurement, so re-measure
-# rather than edit it to match whatever is installed.
+# One product version for every package; each member says `version.workspace = true`.
+version = "0.5.0"
+
+# Measured, not assumed: `cargo +1.91.1 check --all-targets` builds all six
+# compiler crates. `rust-toolchain.toml` pins a newer toolchain for CI's
+# `-D warnings` gate, which is a different claim.
 rust-version = "1.91"
 
-# The checkpoint readers, in one place because releasing them is a two-repo
-# dance: `ztensor` owns the container format and its validation,
-# `ztensor-compat` owns the foreign-format projections.
-#
-# An ordinary version requirement. It was a revision-pinned git dependency
-# while the two were developed together, which `Cargo.lock` not being tracked
-# here made necessary: a branch would have resolved to whatever v2's tip was at
-# clone time, and v2 moved under us.
-#
-# The patch is named, not just `"2.1"`, because 2.1.1 broke the API on purpose
-# and says so in its changelog. This is still a caret range — it does not pin —
-# but it puts the floor above the break, so no resolution can land on 2.1.0 and
-# fail to compile. `Cargo.lock` is not tracked here, which is what makes the
-# floor the only thing deciding that.
-#
-# 2.1.0 put the modules on the spec's layers (`format` is L0+L1 and opens no
-# file, `provide` is the projection face) and scoped the object builders. 2.1.1
-# narrowed what is left: bytes are reached through `Tensor::data`, since the
-# nine shorthands for it addressed one part while `verify` on the same receiver
-# covered them all, and `Part::bytes` hands back a `Cow` rather than a
-# lookalike of one.
 [workspace.dependencies]
-# THE ROUTINE REGISTRY. `#[routine]` emits a row beside its `fn`, and a
-# distributed slice is what collects them without a list: each row lands in a
-# `linkme_ROUTINES` link section and the linker hands back the bounds, so
-# nothing enumerates and nothing can be left out of an enumeration.
-#
-# Chosen over `inventory` because it needs no life-before-main constructor --
-# the slice IS the section, resolved at link time, so the first read costs
-# nothing. Its two documented hazards do not reach this tree: every crate here
-# is an `rlib` (no `staticlib` a foreign linker would half-swallow), and the
-# collection was measured surviving `lto = "thin"`, `lto = "fat"`,
-# `strip = "symbols"` and `--gc-sections`.
-#
-# IT DOES NOT REACH `wasm32-unknown-unknown`, and that is why the crate below
-# is here beside it. A distributed slice is a link SECTION whose bounds the
-# linker is asked for, and the wasm object format offers no such facility, so
-# `linkme` refuses the target by name: "distributed_slice is not implemented
-# for this platform" (dtolnay/linkme#86 -- not an omission, a missing
-# primitive). `engine-wgpu/tests/browser.rs` claims the kernel table reaches a
-# browser, so a plane with no table there would be that claim quietly ending.
+# The routine registry: `#[routine]` rows land in a link section the linker
+# bounds, so nothing has to enumerate them. No life-before-main cost.
 linkme = "0.3"
-# THE SAME REGISTRY, FOR WASM ONLY. `inventory` collects by running a
-# constructor per row before `main` -- on this target through
-# `__wasm_call_ctors` -- and builds a linked list the first read walks.
-#
-# That is strictly worse than a link section on every count the note above
-# gives: it costs life-before-main, it turns a link-time constant into a
-# run-time initialisation, and it is a list rather than a contiguous slice.
-# It is used ONLY where the better mechanism does not exist. `#[routine]`
-# emits a `linkme` row on every target with a linker to ask and an
-# `inventory` row on wasm, both behind the same `cfg`, so no target carries
-# two rows for one `fn` and none carries zero.
+# The same registry on wasm, where the object format has no link sections and
+# `linkme` refuses the target. `#[routine]` emits one row per target, never two.
 inventory = "0.3"
+# 2.1.1 floor: 2.1.0 has an API this tree does not compile against.
 ztensor = "2.1.1"
 ztensor-compat = "2.1.1"
 
-# Shared lint table. Opt in per crate with `[lints] workspace = true`; today
-# only the `compiler/*` crates do, because they are the only ones at zero
-# clippy warnings and therefore the only ones CI can gate with `-D warnings`
-# (`.github/workflows/ci.yml`). The rest of the workspace still carries ~240
-# warnings; wire a crate in here once it is clean rather than all at once.
-#
-# Everything below is at zero occurrences across the compiler crates as of this
-# commit, so each is a ratchet that costs nothing today and blocks a
-# regression tomorrow. Lints that would need a cleanup first are deliberately
-# absent — notably `clippy::wildcard_enum_match_arm`, the lint that would have
-# caught the catch-all `_ =>` arms that silently absorbed new ops. Down from 38
-# sites to 26; the survivors were each read and are fail-safe (`_ => None`,
-# `_ => {}`, "skip this optimization") or delegate to a match that *is*
-# exhaustive, so a new variant inherits a conservative answer rather than a
-# confident wrong one. Turning the lint on would now mean 26 `#[allow]`s or 26
-# hand-written variant lists that drift, which buys less than it costs.
+# Opt in per crate with `[lints] workspace = true`. Today only the compiler
+# crates do: they are the only ones at zero warnings, so the only ones CI can
+# gate with `-D warnings`. Wire a crate in once it is clean.
 [workspace.lints.rust]
-# Promoted from `eta-dsl`, which was the only crate carrying it. There is no
-# `unsafe` anywhere in the ETA toolchain, so this extends that crate's
-# existing guarantee to `eta-ir` and `eta-compiler` at zero cost.
 unsafe_code = "forbid"
-# Every public item in the ETA toolchain is documented, and this keeps it
-# that way. These crates are read far more often than they are written -- the op
-# table, the wire layout and the type rules are all consulted from other
-# crates and from generated backend sources -- so an undocumented public item
-# is a rule someone has to reconstruct from the implementation, and the
-# reconstruction is what silently disagrees with it later.
 missing_docs = "deny"
 
 [workspace.lints.clippy]
@@ -449,48 +222,22 @@ todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
 mem_forget = "deny"
-# A compiler crate that writes to a stream is either debugging scaffolding left
-# behind or a diagnostic that belongs behind an explicit, annotated `allow`.
+# A compiler crate writing to a stream is either leftover scaffolding or a
+# diagnostic that belongs behind an annotated `allow`.
 print_stdout = "deny"
 print_stderr = "deny"
-# `cast_possible_truncation` is deliberately NOT set here. It fires on ~130
-# `usize as u32` sites that are all bounded -- by the container ceilings, by
-# the `u32` value-id space, or by `usize` being 64 bits on the only targets
-# `eta-compiler` and `eta-compiler` build for -- so denying it workspace-wide buys
-# ~130 `#[allow]` and no guarantee.
-#
-# It is denied at the top of `compiler/ir/src/lib.rs` instead, which is where
-# it earns its keep: that crate narrows counts that came from bytes it did not
-# write. Anywhere else, a narrowing cast still deserves the same question --
-# what is the bound, and who enforces it -- the lint just cannot ask it
-# usefully.
 
-# Distribution profile for `worker`. Use
-# `cargo build --profile release-min -p pie-worker`. The regular
-# `release` profile stays as the default dev/bench path (no LTO).
+# Distribution profile for `worker`:
+# `cargo build --profile release-min -p pie-worker`.
 #
-# Thin LTO over fat: ~10× faster link than fat with most of the size
-# and runtime win. Fat LTO doubled CI build time on the cuda matrix
-# (CUDA kernel compile + Rust+C++ link grew from ~1h to many hours)
-# without measurably better artifacts. Thin LTO parallelizes across
-# codegen units, so we leave codegen-units at the default (16) too.
+# Thin LTO, not fat: fat doubled CI build time on the cuda matrix for no
+# measurable gain, and thin parallelizes across the default 16 codegen units.
 #
-# NO `panic = "abort"`. It was here, and it was quietly deleting behaviour
-# this tree goes to some length to provide: three `catch_unwind` barriers
-# turn a panic into an answer rather than a dead process -- the engine lane
-# in `runtime::scheduler::worker` (which drains and fails the requests behind
-# a poisoned lane instead of leaving a frame in flight, after one was
-# measured stalled for 7030s), and the two C ABI seams in
-# `engine_cuda::serve::guard` and `pie_wake`, whose whole documented purpose
-# is that an operator gets a message naming the entry point "instead of a
-# bare SIGABRT". Under `abort` every one of them is dead code and the
-# shipped binary does exactly what those comments say it must not.
-#
-# Each of the three now fails the build under `cfg(panic = "abort")`, so
-# this is not a line anyone can put back by accident. It cost ~8 MiB of
-# binary, which is not a currency this project trades in.
+# Do NOT add `panic = "abort"`. Three `catch_unwind` barriers turn a panic into
+# an answer instead of a dead process — the engine lane in
+# `runtime::scheduler::worker` and the C ABI seams in `engine_cuda::serve::guard`
+# and `pie_wake`. Each fails the build under `cfg(panic = "abort")`.
 [profile.release-min]
 inherits = "release"
 lto = "thin"
 strip = "symbols"
-

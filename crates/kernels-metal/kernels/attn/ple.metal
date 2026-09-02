@@ -176,3 +176,76 @@ inline void ple_hash_row(
     state[slab + size_t(p)] = next[p];
   }
 }
+
+/// The committed form (`engine_metal::rs`): `ple_ngram_ids_chunked` over the
+/// extended row run `ssm_causal_conv1d.metal`'s committed conv describes —
+/// `replay[lane0 + r]` buffered ids gathered ahead of the lane's own rows —
+/// with the window state advanced only over the first `commit[lane0 + r]`
+/// rows. Zero leaves the window as it was.
+[[kernel]] void ple_ngram_ids_committed(
+    const device int* ids                   [[buffer(0)]],
+    const device int* indptr                [[buffer(1)]],
+    const device int* replay                [[buffer(2)]],
+    const device int* commit                [[buffer(3)]],
+    const device int* slots                 [[buffer(4)]],
+    const constant int& lane0               [[buffer(5)]],
+    device int* state                       [[buffer(6)]],
+    const device ulong* hash                [[buffer(7)]],
+    device int* ngram_ids                   [[buffer(8)]],
+    const constant int& ngram               [[buffer(9)]],
+    const constant int& heads               [[buffer(10)]],
+    const constant int& heads_per_ngram     [[buffer(11)]],
+    const constant int& eos                 [[buffer(12)]],
+    uint pos [[thread_position_in_grid]]) {
+  const int r = int(pos);
+  int begin = indptr[r];
+  for (int j = 0; j < r; ++j) {
+    begin += replay[lane0 + j];
+  }
+  const int rows = (indptr[r + 1] - indptr[r]) + replay[lane0 + r];
+  if (rows <= 0) {
+    return;
+  }
+  const int slot = slots[lane0 + r];
+  if (slot < 0) {
+    return;
+  }
+  const int span = ngram - 1;
+  const size_t slab = size_t(slot) * size_t(span);
+
+  for (int t = 0; t < rows; ++t) {
+    int window[PLE_MAX_NGRAM];
+    window[0] = ids[begin + t];
+    for (int p = 1; p <= span; ++p) {
+      if (t - p >= 0) {
+        window[p] = ids[begin + t - p];
+      } else {
+        const int cell = state[slab + size_t(span - (p - t))];
+        window[p] = cell == 0 ? eos : cell - 1;
+      }
+    }
+    ple_mask_window(window, ngram, eos);
+
+    int out[PLE_MAX_HEADS];
+    ple_hash_row(hash, window, ngram, heads, heads_per_ngram, out);
+    for (int k = 0; k < heads; ++k) {
+      ngram_ids[size_t(begin + t) * size_t(heads) + size_t(k)] = out[k];
+    }
+  }
+
+  int keep = commit[lane0 + r];
+  if (keep > rows) {
+    keep = rows;
+  }
+  if (keep <= 0) {
+    return;
+  }
+  int next[PLE_MAX_NGRAM];
+  for (int p = 0; p < span; ++p) {
+    const int src = keep - span + p;
+    next[p] = src >= 0 ? ids[begin + src] + 1 : state[slab + size_t(p + keep)];
+  }
+  for (int p = 0; p < span; ++p) {
+    state[slab + size_t(p)] = next[p];
+  }
+}

@@ -58,7 +58,7 @@ at 8-of-16 the eighth-to-ninth logit gap is wider than the perturbation, so the
 routing decision never changed. Sixty-four leaves fifty-six rejected experts in
 that tail instead of eight and contracts the gap with them, which is the whole
 reason the second row exists. Both land their own SKU
-(`qwen36-35b-a3b-mini-mlxu4-kv-bf16` and `…-mini64-…`) and both are held by
+(`qwen36-35b-a3b-mini-u4g64-kv-bf16` and `…-mini64-…`) and both are held by
 `crates/models/tests/the_a3b_text_reads_the_routed_miniature.rs`.
 """
 

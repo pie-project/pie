@@ -6,7 +6,6 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{FnArg, GenericArgument, ItemFn, PatType, PathArguments, Type, parse_macro_input};
 
-/// Returns `true` if `ty` is exactly `String`.
 fn is_string(ty: &Type) -> bool {
     matches!(ty, Type::Path(p) if p.path.is_ident("String"))
 }
@@ -60,8 +59,6 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
 
-    // --- Detect input/output conventions ---
-
     let first_param_ty = input_fn.sig.inputs.first().and_then(|arg| {
         if let FnArg::Typed(PatType { ty, .. }) = arg {
             Some(ty.as_ref())
@@ -76,9 +73,6 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
         _ => false,
     };
 
-    // --- Build code-gen fragments ---
-
-    // Deserialize the JSON input into the user's typed parameter.
     let input_prep = if typed_input {
         quote! {
             let typed_input = ::inferlet::serde_json::from_str(&input)
@@ -100,7 +94,6 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { result }
     };
 
-    // Rename user's function so we can wrap it
     input_fn.sig.ident = inner_fn_name.clone();
 
     let expanded = quote! {
@@ -118,9 +111,8 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        // `inferlet` is both the generator's crate and the leaf's dependency,
-        // so the types path is the plain crate root: the expansion reaches
-        // generator-internal items that only the real crate root carries.
+        // plain crate root: the expansion reaches generator-internal items
+        // that only the real crate root carries.
         ::inferlet::export!(__PieMain with_types_in ::inferlet);
     };
 

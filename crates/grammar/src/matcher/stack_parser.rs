@@ -1,9 +1,6 @@
-//! DFA-based pushdown automaton (stack parser).
-//!
-//! `StackParser` drives per-rule DFA transitions with a pushdown stack. States are
-//! 8-byte `StackState` values (rule_id + dfa_state + return_level). The DFA encodes
-//! all intra-rule transitions, so predict/complete cycles are only needed at rule
-//! boundaries (RuleRef edges and accepting states).
+//! DFA-based pushdown automaton (stack parser): drives per-rule DFA
+//! transitions with a pushdown stack; predict/complete cycles happen only
+//! at rule boundaries.
 
 use std::cell::Cell;
 use std::hash::{Hash, Hasher};
@@ -21,10 +18,9 @@ use crate::grammar::RuleId;
 
 pub(super) const NO_PARENT: u32 = u32::MAX;
 
-/// DFA-based parser state: tracks position within a grammar rule via DFA state.
-///
-/// 8 bytes (down from 28-byte ParserState), since the DFA encodes all intra-rule
-/// transitions (ByteString offsets, CharacterClass, CharacterClassStar, Repeat).
+/// DFA-based parser state: tracks position within a grammar rule via DFA
+/// state. 8 bytes (down from 28-byte ParserState), since the DFA encodes
+/// all intra-rule transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub(super) struct StackState {
@@ -124,12 +120,10 @@ enum SteadyAdvance {
     NotActive,
 }
 
-/// Encapsulates the steady-state detection and acceleration fields.
-///
-/// When consecutive advance() calls produce structurally identical state sets
-/// (same rule_id + dfa_state, only return_level differs by a uniform delta),
-/// the parser enters steady-state mode. In lazy mode (zero delta), only a counter
-/// is incremented. In delta mode, states are copied with adjusted return_levels.
+/// Steady-state detection and acceleration fields. When consecutive
+/// advance() calls produce structurally identical state sets differing
+/// only by a uniform return_level delta, the parser enters steady-state
+/// mode: a lazy counter when the delta is zero, else copy-with-delta.
 #[derive(Clone)]
 struct SteadyState {
     active: bool,
@@ -183,12 +177,9 @@ impl SteadyState {
 // Stack parser (DFA-based pushdown automaton)
 // ---------------------------------------------------------------------------
 
-/// DFA-based pushdown automaton parser.
-///
-/// Replaces the Earley parser with per-rule DFA transitions. States are 8-byte
-/// `StackState` values (rule_id + dfa_state + return_level). The DFA encodes all
-/// intra-rule transitions, so predict/complete cycles are only needed at rule
-/// boundaries (RuleRef edges and accepting states).
+/// DFA-based pushdown automaton parser. Replaces the Earley parser with
+/// per-rule DFA transitions; predict/complete cycles happen only at rule
+/// boundaries.
 #[derive(Clone)]
 pub(super) struct StackParser {
     compiled: Arc<CompiledGrammar>,
@@ -209,13 +200,9 @@ pub(super) struct StackParser {
     buf_return: Vec<(u16, StackState)>,
     // Steady-state acceleration
     steady: SteadyState,
-    /// Cached terminal level for completion chain short-circuit.
-    /// When a self-referencing rule (e.g., CharacterClassStar) completes,
-    /// it creates a chain of ghost completions cascading through ALL previous
-    /// return levels — O(N) per advance. This cache stores the terminal level
-    /// where the chain reaches a different parent rule, enabling O(1) lookups.
-    /// Format: (chain_rule_id, chain_dfa_state, terminal_level, last_walk_start).
-    /// Cache hit requires start_level == last_walk_start + 1 (consecutive advance).
+    /// Cached terminal level for completion-chain short-circuit (O(N) ->
+    /// O(1)): (chain_rule_id, chain_dfa_state, terminal_level,
+    /// last_walk_start); valid only when start_level == last_walk_start + 1.
     chain_terminal: Cell<Option<(u16, u16, usize, usize)>>,
 }
 
@@ -428,10 +415,9 @@ impl StackParser {
         }
     }
 
-    /// Scan phase: advance each state by one byte via DFA.
-    ///
-    /// States whose successors have only CharRange edges go to `scanable` (pure scan
-    /// optimization). All others go to `queue` for predict/complete processing.
+    /// Scan phase: advance each state by one byte via DFA. States whose
+    /// successors have only CharRange edges go to `scanable` (pure scan);
+    /// others go to `queue` for predict/complete.
     fn scan_states(
         &self,
         states: &[StackState],
@@ -460,12 +446,10 @@ impl StackParser {
         }
     }
 
-    /// Process the queue: run predict/complete until fixed point.
-    ///
-    /// Tracks which rules have completed at the current level so that when a
-    /// nullable rule is expanded again (deduped by `visited`), the parent can
-    /// be advanced immediately. This handles the Earley "forward prediction"
-    /// case where a new return entry is added after the rule already completed.
+    /// Process the queue: run predict/complete until fixed point. Tracks
+    /// which rules completed at the current level so a nullable rule
+    /// expanded again (deduped by `visited`) can advance its parent
+    /// immediately — the Earley "forward prediction" case.
     fn process_queue(
         &self,
         queue: &mut Vec<StackState>,
@@ -496,11 +480,9 @@ impl StackParser {
                 };
                 returns.push((rule_id, parent_after));
 
-                // Ancestor flattening: if parent_after is pass-through (accepting,
-                // no char edges, no rule_ref), it will immediately complete when the
-                // child finishes. Pre-register grandparents as also waiting for this
-                // child rule, so complete() finds them directly without cascading
-                // through the pass-through intermediate.
+                // Ancestor flattening: if parent_after is pass-through, it
+                // completes immediately when the child finishes, so
+                // pre-register grandparents as also waiting for this child.
                 let parent_action = self
                     .compiled
                     .action(parent_after.rule_id, parent_after.dfa_state);
@@ -624,15 +606,9 @@ impl StackParser {
         }
     }
 
-    /// Follow a self-referencing completion chain to its terminal level.
-    ///
-    /// When a rule like `[^"\\]*` completes, it creates a chain of ghost
-    /// completions that cascade through all previous return levels:
-    /// `(R,D,ret=K) → (R,D,ret=K-1) → ... → terminal`. Only the terminal
-    /// produces a useful parent state (e.g., the root rule).
-    ///
-    /// This method follows the chain in a tight loop, using a cached terminal
-    /// level for O(1) amortized cost.
+    /// Follow a self-referencing completion chain (e.g. `[^"\\]*`) to its
+    /// terminal level — only the terminal produces a useful parent state.
+    /// Uses a cached terminal level for O(1) amortized cost.
     fn follow_chain_to_terminal(
         &self,
         chain_rule_id: u16,
@@ -642,8 +618,7 @@ impl StackParser {
         visited: &mut SmallDedup<StackState>,
         accept_stop: &mut bool,
     ) {
-        // Check cache — only valid for consecutive advances (start == last + 1).
-        // This ensures the chain is growing from the same context, not a new one.
+        // Cache is valid only for consecutive advances (start == last + 1).
         if let Some((cached_rid, cached_dfa, terminal, last_start)) = self.chain_terminal.get()
             && cached_rid == chain_rule_id
             && cached_dfa == chain_dfa_state
@@ -658,10 +633,8 @@ impl StackParser {
             return;
         }
 
-        // Walk the chain to find the terminal level.
-        // At each level, process ALL non-chain parents (they may go to the
-        // parent rule, e.g., object rule from pair star). The chain link is
-        // followed to the next level.
+        // Walk the chain to find the terminal level, processing all
+        // non-chain parents at each level along the way.
         let mut level = start_level;
         loop {
             if level >= self.return_offsets.len() {
@@ -753,10 +726,8 @@ impl StackParser {
         }
     }
 
-    /// Like `advance`, but doesn't commit to the arenas. Used for trie walk probing.
-    /// Probe advance for trie walk: advance states by one byte without committing
-    /// to arenas. Returns true if any states survived. Results are appended to
-    /// `scanable_buf` and `returns_buf`.
+    /// Like `advance`, but doesn't commit to the arenas — used for trie walk
+    /// probing. Results are appended to `scanable_buf` and `returns_buf`.
     #[allow(
         clippy::too_many_arguments,
         reason = "the four `_buf` parameters exist so the caller can reuse \
@@ -1000,12 +971,10 @@ impl StackParser {
         }
     }
 
-    /// Extract accepted byte ranges for steady-state optimization.
-    ///
-    /// Uses the "same-target-as-ch" approach: for each state that directly
-    /// advances on `ch`, collect all byte ranges leading to the same DFA target.
-    /// States that don't have a DFA transition for `ch` are "reborn" states
-    /// (re-added by process_queue each advance) and don't constrain the ranges.
+    /// Extract accepted byte ranges for steady-state optimization: for each
+    /// state that directly advances on `ch`, collect byte ranges leading to
+    /// the same DFA target. States with no transition on `ch` are "reborn"
+    /// (re-added by process_queue each advance) and don't constrain ranges.
     fn extract_steady_ranges(&self, states: &[StackState], ch: u8) -> Option<Vec<(u8, u8)>> {
         let mut winner: Option<Vec<(u8, u8)>> = None;
         let mut found_direct = false;
@@ -1055,110 +1024,3 @@ impl StackParser {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    use crate::compiled_grammar::CompiledGrammar;
-    use tokenizer::Tokenizer;
-
-    #[test]
-    #[ignore = "per-byte statistics, not an assertion; -- --ignored --nocapture"]
-    fn diagnostic_per_byte_stats() {
-        let json_schema = r#"{
-            "type": "object",
-            "properties": {
-                "id": {"type": "integer"},
-                "name": {"type": "string"},
-                "status": {"type": "string", "enum": ["active", "inactive"]},
-                "address": {
-                    "type": "object",
-                    "properties": {
-                        "street": {"type": "string"},
-                        "city": {"type": "string"},
-                        "state": {"type": "string"},
-                        "zip": {"type": "string"}
-                    },
-                    "required": ["street", "city", "state", "zip"],
-                    "additionalProperties": false
-                },
-                "scores": {
-                    "type": "array",
-                    "items": {"type": "integer"}
-                }
-            },
-            "required": ["id", "name", "status", "address", "scores"],
-            "additionalProperties": false
-        }"#;
-        let grammar = Arc::new(
-            crate::json_schema::json_schema_to_grammar(
-                json_schema,
-                &crate::json_schema::JsonSchemaOptions::default(),
-            )
-            .unwrap(),
-        );
-        let vocab: Vec<String> = (0..256u16).map(|b| String::from(b as u8 as char)).collect();
-        let tokenizer = Arc::new(Tokenizer::from_vocab(&vocab));
-        let compiled = Arc::new(CompiledGrammar::new(&grammar, &tokenizer));
-        let mut parser = StackParser::new(compiled.clone());
-
-        let input = r#"{"id":42,"name":"Alice","status":"active","address":{"street":"123 Main St","city":"Springfield","state":"IL","zip":"62704"},"scores":[95,87,92]}"#;
-
-        eprintln!("\n=== PER-BYTE DIAGNOSTIC: {} bytes ===", input.len());
-        eprintln!(
-            "{:<5} {:<5} {:<8} {:<8} {:<6}",
-            "pos", "char", "states", "returns", "steady"
-        );
-
-        for (pos, &byte) in input.as_bytes().iter().enumerate() {
-            let prev_states =
-                parser.state_arena.len() - parser.state_offsets.last().copied().unwrap_or(0);
-            let was_steady = parser.steady.active;
-            assert!(
-                parser.advance(byte),
-                "failed at pos {} char '{}'",
-                pos,
-                byte as char
-            );
-            let new_states =
-                parser.state_arena.len() - parser.state_offsets.last().copied().unwrap_or(0);
-            let new_returns =
-                parser.return_arena.len() - parser.return_offsets.last().copied().unwrap_or(0);
-            let is_steady = parser.steady.active;
-            let steady_str = if was_steady && is_steady {
-                "lazy"
-            } else if !was_steady && is_steady {
-                "ENTER"
-            } else if was_steady && !is_steady {
-                "EXIT"
-            } else {
-                "-"
-            };
-            eprintln!(
-                "{:<5} {:<5} {:<8} {:<8} {:<6}",
-                pos,
-                format!("'{}'", byte as char),
-                format!("{}→{}", prev_states, new_states),
-                format!("→{}", new_returns),
-                steady_str
-            );
-        }
-        eprintln!("\n=== ARENA SIZES ===");
-        eprintln!(
-            "state_arena: {} entries, return_arena: {} entries",
-            parser.state_arena.len(),
-            parser.return_arena.len()
-        );
-        eprintln!("\n=== RULE DFA SIZES ===");
-        for (i, dfa) in compiled.rule_dfas.iter().enumerate() {
-            let name = &compiled.grammar.rules()[i].name;
-            eprintln!(
-                "  rule {} ({}): {} DFA states",
-                i,
-                name,
-                dfa.fsm.num_states()
-            );
-        }
-    }
-}

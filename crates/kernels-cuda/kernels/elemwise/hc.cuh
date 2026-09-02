@@ -226,6 +226,9 @@ __global__ void hc_fold(
     }
 }
 
+// **THE TRUNK COLLAPSE** (`elementwise.hc_collapse`, `hc_head`): `M` sigmoid
+// gates off the `[N, M]` mix row `hc_project` lands through `hc_head.fn`, and
+// the streams folded under them — no post, no combiner, no Sinkhorn.
 template <class T, int BLOCK = 256>
 __global__ void hc_head_postprocess(
     const float* __restrict__ mixes,
@@ -235,9 +238,15 @@ __global__ void hc_head_postprocess(
     T* __restrict__ out,
     int M,
     int H,
-    float hc_eps)
+    float hc_eps,
+    const u32* __restrict__ win)
 {
-    const int n = blockIdx.x;
+    const int block_row = blockIdx.x;
+    // The staged-geometry seat (hc_gates' idiom): a replay whose grid was
+    // carved at a bucket retires its padded rows here, off a word the fire
+    // staged; `win[1]` is where the live rows start.
+    if (win != nullptr && block_row >= static_cast<int>(win[0])) return;
+    const int n = win != nullptr ? block_row + static_cast<int>(win[1]) : block_row;
     const int tid = threadIdx.x;
 
     __shared__ float gates[MAX_HC_MULT];

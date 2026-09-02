@@ -1,13 +1,7 @@
-//! The encode plane: how a kernel entry talks to its driver.
-//!
-//! A kernel entry never touches Metal. It names a shader ([`Fire`]),
-//! marshals arguments ([`ArgValue`]), and hands both to an [`Encode`] sink —
-//! the driver's `Run` behind `dyn` — which resolves buffer handles and
-//! encodes the dispatch into the current command buffer. Encode only, never
-//! sync (decision #15).
-//!
-//! Where the old plane monomorphized `<T: Scalar>`, entries here match on
-//! the handle's runtime dtype with [`dtype_dispatch!`] (design item E4).
+//! The encode plane: a kernel entry names a shader ([`Fire`]), marshals
+//! arguments ([`ArgValue`]), and hands both to an [`Encode`] sink, which
+//! resolves buffer handles and encodes the dispatch into the current command
+//! buffer. Encode only, never sync.
 
 use crate::error::Error;
 
@@ -37,8 +31,7 @@ impl ArgValue {
     }
 }
 
-/// Scalar-to-argument marshalling — the erased successor of the old `Bind`
-/// impls, so call sites still read `eps.arg()`.
+/// Scalar-to-argument marshalling.
 pub trait Arg: Copy {
     fn arg(self) -> ArgValue;
 }
@@ -82,10 +75,8 @@ pub trait Encode {
 /// this crate never names a driver type.
 pub type Ctx<'a> = dyn Encode + 'a;
 
-/// One shader launch, fully named: the `.metal` file, the entrypoint, the
-/// dispatch geometry, and the jit stamp a specialized point carries. These
-/// are the fields the Metal driver reads — the old `Fire`'s CUDA-plane
-/// fields (`unit`, `smem`, `cooperative`) are not carried.
+/// One shader launch: the `.metal` file, the entrypoint, the dispatch
+/// geometry, and the jit stamp a specialized point carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fire {
     pub file: &'static str,
@@ -211,14 +202,8 @@ pub const fn head_group(grid: [u32; 3]) -> [u32; 3] {
 }
 
 /// An encode this backend cannot perform: degenerate or overflowing
-/// geometry, an axis point no shader is stamped for.
-///
-/// The boundary rule, stated once: a fact only the driver binds — pool
-/// strides, fire tables, the ragged boundary vector — is refused on
-/// disagreement, because the trace-time validator never sees it and nothing
-/// upstream vouches for it. Cross-operand *shape agreement* between values
-/// the ops do name is never reported this way — that is the validator's
-/// guarantee, restated as `debug_assert!` at the entries.
+/// geometry, an axis point no shader is stamped for. Reserved for facts only
+/// the driver binds; cross-operand shape agreement is the validator's job.
 pub(crate) fn refuse(op: &'static str, detail: impl Into<String>) -> Error {
     Error::Backend {
         op,
@@ -238,9 +223,9 @@ pub(crate) fn stated(op: &'static str, v: u32) -> Result<i32, Error> {
     i32::try_from(v).map_err(|_| refuse(op, format!("{v} does not fit the shader's int")))
 }
 
-/// The runtime successor of `<T: Scalar>` monomorphization: name the dtypes
-/// this entry is stamped for and get the named arm's value; any other dtype
-/// **returns** [`Error::DtypeUnsupported`] from the enclosing function.
+/// Name the dtypes this entry is stamped for and get the named arm's value;
+/// any other dtype returns [`Error::DtypeUnsupported`] from the enclosing
+/// function.
 macro_rules! dtype_dispatch {
     ($op:expr, $dtype:expr, { $($stamped:ident => $arm:expr),+ $(,)? }) => {
         match $dtype {

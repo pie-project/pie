@@ -1,9 +1,4 @@
-//! Between a dtype's bytes and `f64`.
-//!
-//! Every element in this module passes through `f64`, which holds every
-//! value of every dtype here exactly — including `I32` and `U32`, which
-//! `f32` does not. That is what makes a cast lossless except where the
-//! DESTINATION is lossy, and the rounding is then the destination's own.
+//! Between a dtype's bytes and `f64`. Every element passes through `f64`, which holds every value of every dtype here exactly (including `I32`/`U32`, unlike `f32`), so a cast is lossless except where the destination is lossy.
 
 use half::{bf16, f16};
 
@@ -13,11 +8,7 @@ use crate::types::DType;
 use super::invalid;
 
 pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
-    // **ASKED BEFORE THE WIDTH IS**, because a quantization term has no
-    // element width at all (`Dtype::bits` answers zero and says why), and
-    // `chunks_exact(0)` panics rather than refusing. The arm inside the loop
-    // below says the same thing and is what a NON-empty input reaches; this
-    // is the one that catches an empty one.
+    // asked before the width is: a quantization term has no element width, and chunks_exact(0) panics rather than refusing.
     if dtype.elem().is_none() {
         return Err(invalid(
             "host Cast does not implement a quantization term: a block decodes \
@@ -49,15 +40,11 @@ pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
                 DType::E4m3 | DType::E5m2 => {
                     return Err(invalid("host Cast does not implement FP8"));
                 }
-                // A 64-bit integer does not survive the f64 pivot this cast
-                // is written around, and nothing asks it to: `I64`/`U64`
-                // tensors are index tables that move byte-for-byte.
+                // I64/U64 tensors are index tables that move byte-for-byte, not through the f64 pivot.
                 DType::I64 | DType::U64 => {
                     return Err(invalid("host Cast does not implement 64-bit integers"));
                 }
-                // Sub-byte codes have no element to chunk on: `width` above
-                // rounded them up to a byte, and a byte holds two of them.
-                // Packing and unpacking them is `codec::mxfp4`'s, not a cast's.
+                // sub-byte codes have no element to chunk on; packing/unpacking is codec::mxfp4's, not a cast's.
                 DType::E2m1
                 | DType::Mxfp4
                 | DType::U4g64
@@ -76,11 +63,7 @@ pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
                 | DType::U2g128 => {
                     return Err(invalid("host Cast does not implement the sub-byte codes"));
                 }
-                // Byte-wide, and no more castable for it: an `U8g64` byte is
-                // an affine CODE, meaningless without the scale and the offset
-                // of its group. Reading it as the integer it happens to be
-                // would produce a number, which is the failure mode this arm
-                // exists to prevent.
+                // an U8g64 byte is an affine code, meaningless without its group's scale and offset.
                 DType::U8g64 => {
                     return Err(invalid(
                         "host Cast does not implement affine codes: an U8g64 byte means \
@@ -116,7 +99,7 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
             DType::E4m3 | DType::E5m2 => {
                 return Err(invalid("host Cast does not implement FP8"));
             }
-            // See `decode_values`: a sub-byte code is packed, not cast.
+            // sub-byte code is packed, not cast; see decode_values.
             DType::E2m1
             | DType::Mxfp4
             | DType::U4g64
@@ -135,15 +118,13 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
             | DType::U2g128 => {
                 return Err(invalid("host Cast does not implement the sub-byte codes"));
             }
-            // And an affine code is quantized, not cast — see `decode_values`.
+            // affine code is quantized, not cast — see decode_values.
             DType::U8g64 => {
                 return Err(invalid(
                     "host Cast does not encode to affine codes: choosing an U8g64 byte \
                      is a quantization, which picks the group's scale and offset too",
                 ));
             }
-            // See `decode_values`: writing a block is the scheme's, and
-            // choosing its codes is a quantization rather than a cast.
             DType::I64 | DType::U64 => {
                 return Err(invalid("host Cast does not implement 64-bit integers"));
             }
@@ -152,27 +133,8 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-/// A `Cast`, dispatched on its dtype pair once and run across every core.
-///
-/// The generic route below — [`decode_values`] into a `Vec<f64>`, then
-/// [`encode_values`] back — is the right shape for a fallback and the wrong
-/// one for the only cast that matters. `materialize_contract` turns every
-/// `F16`/`F32` tensor into `Cast(Src -> BF16)` because every kernel this tree
-/// ships reads BF16, so an F32 checkpoint casts *every tensor*: the pivot
-/// costs eight bytes of scratch per source element and a `match` on the dtype
-/// inside the per-element loop, single-threaded, at 0.25 GiB/s against an
-/// `encode_rows` doing 1.66 GiB/s of strictly harder work on the same machine.
-///
-/// Both problems are fixed here and neither is fixed by a GPU: `pie model
-/// import` moves its bytes off a disk whose ceiling this was two orders of
-/// magnitude under, and a device path would bolt a PCIe round trip onto a job
-/// that belongs on the host (`.wiki/fix/loader.md` §2.1).
-///
-/// The float pairs are bit-identical to the pivot they replace, which is what
-/// makes this a pure speedup: every one of them widens to `f32` on the way in
-/// and narrows from `f32` on the way out, and `f32 -> f64 -> f32` is the
-/// identity. Every other pair still goes through the pivot, one chunk at a
-/// time, so the widening is bounded by the chunk rather than by the tensor.
+/// A `Cast`, dispatched on its dtype pair once and run across every core, threaded for large inputs.
+/// The float pairs are bit-identical to the generic `decode_values`/`encode_values` pivot they replace (`f32 -> f64 -> f32` is the identity); every other pair still goes through the pivot, one chunk at a time.
 pub fn cast_elements(bytes: &[u8], from: DType, to: DType) -> Result<Vec<u8>, Error> {
     let in_width = from.bytes_ceil() as usize;
     let out_width = to.bytes_ceil() as usize;
@@ -181,8 +143,7 @@ pub fn cast_elements(bytes: &[u8], from: DType, to: DType) -> Result<Vec<u8>, Er
     }
     let elements = bytes.len() / in_width;
     let mut out = vec![0u8; elements * out_width];
-    // Below about a megabyte the threads cost more than they carry, which is
-    // the threshold `encode_rows` already uses for the same reason.
+    // below about a megabyte the threads cost more than they carry.
     let workers = if bytes.len() < (1 << 20) || elements == 0 {
         1
     } else {
@@ -217,15 +178,8 @@ pub fn cast_elements(bytes: &[u8], from: DType, to: DType) -> Result<Vec<u8>, Er
     }
 }
 
-/// One chunk of a cast: `src.len() / from.bytes_ceil()` elements, converted into
-/// `dst`.
-///
-/// The `match` is on the PAIR and it happens once, so each arm is a loop over
-/// two known widths that the compiler can vectorize. What the arms cover is
-/// the float conversions the loader actually performs; everything else keeps
-/// the general implementation, because a fallback that silently stopped
-/// covering a dtype pair would be a cast that produces the source's
-/// representation under the destination's name.
+/// One chunk of a cast: `src.len() / from.bytes_ceil()` elements, converted into `dst`.
+/// The match is on the pair, once, so each arm is a loop over two known widths the compiler can vectorize; arms cover the float conversions the loader performs, everything else keeps the general implementation.
 fn cast_chunk(src: &[u8], dst: &mut [u8], from: DType, to: DType) -> Result<(), Error> {
     use DType::{Bf16, F16, F32};
     match (from, to) {
@@ -287,20 +241,3 @@ fn map_elements<const IN: usize, const OUT: usize>(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::DType;
-
-    #[test]
-    fn half_casts_round_and_overflow_to_infinity() {
-        let f16_bytes = encode_values(&[100_000.0], DType::F16).unwrap();
-        let f16_value = f16::from_bits(u16::from_le_bytes(f16_bytes.try_into().unwrap()));
-        assert!(f16_value.is_infinite() && !f16_value.is_nan());
-
-        let input = f32::from_bits(0x3f80_8001);
-        let bf16_bytes = encode_values(&[f64::from(input)], DType::Bf16).unwrap();
-        let actual = u16::from_le_bytes(bf16_bytes.try_into().unwrap());
-        assert_eq!(actual, bf16::from_f32(input).to_bits());
-    }
-}

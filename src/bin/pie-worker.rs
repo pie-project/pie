@@ -1,6 +1,6 @@
 //! `worker` daemon — runs the inference runtime: boots engines, serves the
 //! engine, and (distributed) dials into the gateway + registers with the
-//! controller. A thin bin shell (Seam 3): the `bootstrap` process skeleton
+//! controller. A thin bin shell: the `bootstrap` process skeleton
 //! composed with the `worker` role library — only the two domain lines
 //! (`Config::parse` + `run`) and the role-specific flags differ from the other
 //! role bins.

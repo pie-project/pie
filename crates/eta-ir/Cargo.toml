@@ -1,6 +1,6 @@
 [package]
 name = "eta-ir"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version.workspace = true
 authors = ["In Gim <in.gim@yale.edu>"]
@@ -14,49 +14,34 @@ name = "eta_ir"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# `std` (default) is host-side and only adds the `std::error::Error` impls on the
-# decode/validate error types. The wasm SDK depends on this crate with
-# `default-features = false` to keep the IR core `no_std` (+ `alloc`).
+# `std` adds only the `std::error::Error` impls on the decode/validate error
+# types; the wasm SDK takes this crate with `default-features = false` to keep
+# the IR core `no_std` (+ `alloc`).
 [features]
 default = ["std"]
 std = []
 
-# `serde` is OFF by default and exists for ONE consumer: `engine`, whose
-# nouns all have to serialize (palo design §7, decision 4 — "remote is a
-# property, not an encoding"). The contract's guest-program half is spelled in
-# THIS crate's vocabulary rather than in a second copy of it — `ChanDType`,
-# `HostRole`, `ExternDir`, `Port`, `Stage`, `IntrinsicId`, and the `Dtype` it
-# re-exports from the leaf below — and a type you cannot serialize is a type a
-# contract has to re-spell. That
-# re-spelling is exactly what the rewrite deleted.
-#
-# Off by default because the guest half of this crate is `no_std` wasm reached
-# through `eta-dsl`, and it has no business carrying a serialization
-# framework it never calls. The derives are `cfg_attr`-gated, so the guest
-# build is byte-identical to what it was before this feature existed.
+# Off by default: the guest half of this crate is `no_std` wasm reached through
+# `eta-dsl` and has no business carrying a serialization framework. It exists
+# for `engine`, whose contract nouns are spelled in this crate's vocabulary
+# rather than in a second, serializable copy of it.
 serde = ["dep:serde", "dtype/serde"]
 
 [dependencies]
-# The element type, which is the tree's and not this crate's: `DType` stood
-# here as a four-variant `#[repr(u8)]` enum, and it said the same word the
-# loader, the kernels and the transfer contract were each saying about the same
-# values. There is one enum now, seventeen wide, and the four ETA computes in
-# are gated in `types::class_of` rather than by the enum's shape.
-#
-# `default-features = false` because this crate is what a wasm guest imports:
-# the leaf's serde is on by default for every host consumer and is forwarded
-# here only when this crate's own `serde` feature is on. The numbering is NOT
-# forwarded — see `types::to_wire` for why the wire bytes stayed behind.
+# The element type, one enum for the whole tree; ETA gates the four it computes
+# in via `types::class_of`. `default-features = false` because this crate is
+# what a wasm guest imports — the leaf's serde is forwarded only when this
+# crate's own `serde` feature is on, and the wire numbering never is (see
+# `types::to_wire`).
 dtype = { path = "../dtype", default-features = false }
 
-# See the `serde` feature. `default-features = false` + `alloc` keeps the
-# `no_std` promise in the lib.rs header true even when the feature is on.
+# `default-features = false` + `alloc` keeps the `no_std` promise in the lib.rs
+# header true even when the feature is on.
 serde = { version = "1.0", default-features = false, features = [
     "alloc",
     "derive",
 ], optional = true }
 
-# Shared ratchet from the root manifest. The toolchain's three crates are gated
-# with `-D warnings` in CI; see `[workspace.lints]` in the workspace `Cargo.toml`.
+# The toolchain's three crates are the ones CI gates with `-D warnings`.
 [lints]
 workspace = true

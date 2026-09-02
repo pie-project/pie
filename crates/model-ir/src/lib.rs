@@ -7,6 +7,7 @@ pub mod check;
 pub mod guard;
 pub mod operands;
 pub mod ops;
+pub mod request;
 pub mod trace;
 pub mod value;
 
@@ -19,6 +20,7 @@ pub use check::classes::{
 pub use check::{Fault, check, checked};
 pub use guard::Guard;
 pub use operands::Operands;
+pub use request::{ClassifyFn, Request};
 pub use ops::{
     Attention, Collective, CustomCuda, Elementwise, GateActivation, Layout, Linear, MropeForm,
     Operation,

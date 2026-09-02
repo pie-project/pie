@@ -208,10 +208,8 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         });
         match forked {
             Ok(id) => {
-                // A distinct working-set id gets its OWN fresh lifecycle —
-                // never a clone of the parent's, which would (a) share its
-                // release-once guard for an unrelated id and (b) release the
-                // WRONG working set when the last clone drops.
+                // a distinct working-set id gets its own fresh lifecycle,
+                // never a clone of the parent's release-once guard.
                 let child = ws.forked(id);
                 self.register_kv_working_set(&child);
                 Ok(Ok(self.ctx().table.push(child)?))
@@ -275,10 +273,8 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
 
     async fn drop(&mut self, this: Resource<KvWorkingSet>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        // `release` performs the exact release/retire/contention-drain
-        // sequence and marks the shared
-        // lifecycle done; `ws`'s own drop just below (and the fallback
-        // `KvLifecycle::drop` it would otherwise trigger) is then a no-op.
+        // `release` performs the release/retire/contention-drain sequence
+        // and marks the shared lifecycle done, so `ws`'s own drop is a no-op.
         let ws = self.ctx().table.delete(this)?;
         self.unregister_kv_working_set(ws.model, ws.engine, ws.id);
         ws.release();

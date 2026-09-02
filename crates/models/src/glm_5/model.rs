@@ -1,4 +1,3 @@
-use checkpoint::contract::ModelContract;
 use model_dsl::{Dtype, Weight};
 
 pub struct Model {
@@ -6,17 +5,12 @@ pub struct Model {
     pub vocab: u32,
     pub tp: u32,
 
-    /// The MLA reading, stated once for the whole trunk. Every layer scores
-    /// the same latent plane the same way — `heads` queries against a
-    /// `kv_lora_rank`-wide absorbed output — so the numbers the plan op
-    /// states are facts about the model, not about a layer, and the one
-    /// schedule built at the top of `forward` is carved for all of them.
+    /// MLA reading shared by every layer: `heads` queries against a
+    /// `kv_lora_rank`-wide absorbed plane.
     pub heads: u32,
     pub kv_lora_rank: u32,
 
-    /// The adapter banks this family seats (palo design §8). Per layer, and
-    /// the same two numbers at every one of them: the correction is a
-    /// per-lane axis, not a per-layer one.
+    /// Adapter bank shape (slots, rank); same at every layer.
     pub adapters: Adapters,
 
     pub kv_dtype: Dtype,
@@ -36,20 +30,10 @@ pub struct Layer {
     pub mlp_norm: Weight,
     pub mlp_norm_eps: f32,
     pub mlp: Mlp,
-    /// This layer's adapter bank, `[slots, rank, hidden]` and
-    /// `[slots, hidden, rank]` — the down and up planes of one correction site
-    /// (palo design §8, campaign A-6).
-    ///
-    /// **THE SITE IS THE ATTENTION SUBLAYER, AND IT IS THE SITE BECAUSE OF THE
-    /// COLLECTIVE.** Both ends are REPLICATED values: the input is this
-    /// layer's normed residual and the output is `latent_attention`'s result
-    /// AFTER `all_reduce`. A correction stated one statement earlier — on
-    /// `o_proj`'s own output, which is what a checkpoint's `o_proj` LoRA names
-    /// — reads a rows-cut partial product and lands before the reduce, so
-    /// every rank would contribute the whole `ΔW·x` and the sum would carry it
-    /// `tp` times. The MLA absorption between them changes nothing about that
-    /// argument: `q_b_proj`/`kv_b_proj` are cut and `o_proj` is rows-cut, so
-    /// the first replicated pair around the whole mixer is exactly this one.
+    /// Adapter bank for the attention sublayer: `[slots, rank, hidden]` down,
+    /// `[slots, hidden, rank]` up. Applied after `all_reduce`, on the
+    /// replicated output, since `o_proj`'s output is rows-cut and would be
+    /// summed `tp` times if corrected before the reduce.
     pub lora_a: Weight,
     pub lora_b: Weight,
 }
@@ -316,69 +300,9 @@ impl Model {
     }
 }
 
-/// What every SKU of this family seats.
-///
-/// Not a `Dims` field, because it is not a fact about the checkpoint the way
-/// `hidden` and `layers` are — no pretrained artifact states it. It is the
-/// DEPLOYMENT's ceiling written where a shape has to be written, and a
-/// deployment that wants a different one changes this line and re-traces,
-/// which is exactly the "load-time recompile, never a runtime extension"
-/// design §9 asks for.
-///
-/// Eight slots of rank sixteen costs glm5-a12b 2 MiB a layer — two planes of
-/// `8 x 16 x 4096` in the compute element — and 96 MiB over forty-six, against
-/// a table hundreds of gibibytes wide.
+/// Adapter capacity for this family. A deployment choice, not a checkpoint
+/// fact; changing it requires a re-trace.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
 impl Model {
-    pub fn load(
-        &self,
-        src: &ztensor::Source,
-    ) -> Result<ModelContract, checkpoint_dsl::Error> {
-        let mut b = checkpoint_dsl::Builder::new(src, self.tp);
-        let mut claim = |w: &Weight| b.read_own(w);
-        claim(&self.embed)?;
-        claim(&self.final_norm)?;
-        claim(&self.head)?;
-        for layer in &self.layers {
-            let attn = &layer.attn;
-            let index = &attn.indexer;
-            claim(&layer.attn_norm)?;
-            claim(&layer.mlp_norm)?;
-            claim(&attn.q_a_proj)?;
-            claim(&attn.q_a_norm)?;
-            claim(&attn.q_b_proj)?;
-            claim(&attn.kv_a_proj)?;
-            claim(&attn.kv_a_norm)?;
-            claim(&attn.kv_b_proj)?;
-            claim(&attn.o_proj)?;
-            claim(&index.q_proj)?;
-            claim(&index.k_proj)?;
-            claim(&index.weights_proj)?;
-            claim(&index.k_norm)?;
-            claim(&index.k_norm_bias)?;
-            match &layer.mlp {
-                Mlp::Dense { gate_up, down, .. } => {
-                    claim(gate_up)?;
-                    claim(down)?;
-                }
-                Mlp::Routed {
-                    router,
-                    gate_up,
-                    down,
-                    shared,
-                    ..
-                } => {
-                    claim(router)?;
-                    claim(gate_up)?;
-                    claim(down)?;
-                    if let Some(shared) = shared {
-                        claim(&shared.gate_up)?;
-                        claim(&shared.down)?;
-                    }
-                }
-            }
-        }
-        Ok(b.build())
-    }
-}
+ }

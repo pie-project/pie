@@ -1,24 +1,7 @@
-//! `EmbedWeighted`: the gather that interpolates
-//! (`.wiki/alto/multimodal.md` §9.2).
-//!
-//! **THIS FILE IS `src/layout/embed_weighted.rs` AND ITS MODULE PATH IS
-//! `kernels_cuda::layout_embed_weighted`**, behind the door `attn/dense.rs`
-//! opened — `src/layout.rs` is closed to this wave, and a child module can
-//! only be declared by its parent.
-//!
-//! # Why the position embedding is a gather at all
-//!
-//! §6.4 proposed baking it: widen the patch vector by a one-hot of the patch's
-//! index within its image and give the patch-embed bank that many extra
-//! columns, so one GEMM answers `proj(patch) + pos_embed[i]`. Two things kill
-//! it, and §9.2 names both. The one-hot is `num_position_embeddings` wide, so
-//! an image of 2304 patches ships 10.6 MiB of bf16 zeros to address a 3.4 MiB
-//! table — §5.4's own objection, on the other axis. And the table is
-//! RESAMPLED per image grid, which an import cannot compute, because
-//! `checkpoint::contract::Expr` places bytes and does not do arithmetic.
-//!
-//! So the table is read at fire time. On the native grid that is `layout.embed`
-//! unchanged; off it, it is this.
+//! `EmbedWeighted`: the interpolating gather for position embeddings. The
+//! table is resampled per image grid, which an import cannot precompute, so
+//! it is read at fire time; on the native grid, `layout.embed` is used
+//! unchanged.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -34,11 +17,9 @@ const MAX_BLOCK: u32 = 1024;
 
 /// **`y[r] = Σₜ weights[r, t] · table[ids[r, t]]`.**
 ///
-/// `ids` is `[rows, taps]` `i32` and `weights` is `[rows, taps]` `f32`; `taps`
-/// is read off their width — 4 for the bilinear resample, 16 for bicubic —
-/// because the operands carry it and a stated second spelling could disagree
-/// with them. `vocab` is the table's row count, stated as
-/// [`crate::layout::embed`] states it.
+/// `ids` is `[rows, taps]` `i32` and `weights` is `[rows, taps]` `f32`;
+/// `taps` is read off their width (4 for bilinear, 16 for bicubic). `vocab`
+/// is the table's row count.
 ///
 /// # Errors
 ///
@@ -109,8 +90,7 @@ pub fn embed_weighted(
             hidden.arg(),
             vocab.arg(),
             taps.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // staged-geometry seat: live-rows word, or the null seat (`ABSENT`).
             ctx.stage(),
         ],
     )

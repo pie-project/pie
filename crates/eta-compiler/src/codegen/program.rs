@@ -1,17 +1,8 @@
-//! Whole-program emission: a bound trace in, one kernel table out.
-//!
-//! The per-region emitters in [`crate::codegen::cuda`] and [`crate::codegen::metal`] handle one
-//! region at a time. This module owns the walk above them: which emitter each
-//! region goes through, and what its entry point is called. That decision
-//! belongs here rather than in an engine, so an engine receives a table and
-//! compiles it instead of re-deriving from the plan what the host already
-//! worked out.
-//!
-//! Entry names and the emitter-selection rules are shared with
-//! `crates/engine-metal/csrc/src/pipeline/m1_runtime.cpp` and
-//! `crates/driver-cuda/csrc/src/pipeline/generated/module_cache.hpp` — an engine reading
-//! this table has to find exactly the names it looks up, so the naming scheme
-//! is an ABI and not a formatting choice.
+//! Whole-program emission: a bound trace in, one kernel table out. Owns the
+//! walk over the per-region emitters in [`crate::codegen::cuda`] and
+//! [`crate::codegen::metal`]: which emitter each region goes through, and
+//! what its entry point is called. Entry names and emitter-selection rules
+//! are an ABI shared with the engines' runtime C++.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,13 +15,8 @@ use crate::plan::{CompiledStage, LibraryOp, Region, RegionKind};
 use eta_ir::op::tags;
 use eta_ir::validate::BoundTrace;
 
-/// What an emitted kernel is for.
-///
-/// It was five `PIE_KERNEL_*` `u32` constants, and the discriminants are
-/// written out here because they are a wire numbering an engine reads — a
-/// discriminant is a wire numbering only by accident. Typed, the five arms
-/// below are a `match` the compiler checks instead of five integers it does
-/// not.
+/// What an emitted kernel is for. Discriminants are a wire numbering an
+/// engine reads, written out explicitly rather than left implicit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[derive(Serialize, Deserialize)]
 #[repr(u32)]
@@ -48,14 +34,8 @@ pub enum KernelKind {
     Commit = 4,
 }
 
-/// One emitted kernel, or the reason it could not be emitted.
-///
-/// **This is the record an engine receives**, not a private staging form of
-/// one. It was declared twice — here and again in the contract crate, with a
-/// six-field struct copy in the runtime and in five integration tests
-/// converting one into the other — because the contract crate could not name
-/// this one. It can now: the producer owns its output type, and
-/// `ProgramRegistration::emitted_kernels` is a `Vec` of exactly this.
+/// One emitted kernel, or the reason it could not be emitted — the record
+/// an engine receives, not a private staging form of one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[derive(Serialize, Deserialize)]
 pub struct EmittedKernel {
@@ -83,8 +63,7 @@ impl EmittedKernel {
         entry_name: String,
         emitted: Result<String, EmitError>,
     ) -> Self {
-        // The typed refusal becomes text here and only here: `error` is ABI,
-        // copied across the C boundary for a human to read.
+        // The typed refusal becomes text here and only here.
         let (source, error) = match emitted {
             Ok(source) => (source, String::new()),
             Err(error) => (String::new(), error.to_string()),
@@ -116,12 +95,6 @@ pub enum Backend {
 
 impl Backend {
     /// Every backend, for callers that mean "all of them".
-    ///
-    /// A test that wants both backends would otherwise write the pair out,
-    /// and a third backend would leave that test quietly covering two of
-    /// three. `every_backend_is_in_all` keeps this honest against [`parse`].
-    ///
-    /// [`parse`]: Backend::parse
     pub const ALL: &'static [Backend] = &[Backend::Cuda, Backend::Metal];
 
     /// Parse an engine's advertised backend. Unknown names mean "no host code
@@ -151,15 +124,8 @@ impl Backend {
     }
 }
 
-/// Emit every kernel an engine needs for `stages`, in stage then region order.
-///
-/// One `match` owns the whole backend decision, and everything a backend does
-/// lives inside its arm.
-///
-/// Program-level work placed outside the match — an `if backend ==
-/// Backend::Metal` after the loop, say — is invisible to exhaustiveness
-/// checking, so a third backend would compile, run, and quietly emit no
-/// readiness or commit kernels at all. Inside the match, adding a backend is a
+/// Emit every kernel an engine needs for `stages`, in stage then region
+/// order. One `match` owns the whole backend decision so a new backend is a
 /// compile error here rather than a missing kernel in an engine.
 pub fn emit_program(
     backend: Backend,
@@ -191,14 +157,8 @@ fn signature(stage: &CompiledStage) -> String {
 
 fn emit_cuda_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<EmittedKernel>) {
     let signature = signature(stage);
-    // The CUDA engine compiles one kernel per generated region and falls back
-    // to the prebuilt tier-0 kernels elsewhere, so singleton regions need no
-    // emission — the shell only ever reads the `KernelKind::Fused` slot.
-    //
-    // WHICH emitter fills that slot is `cuda::emit_region`'s to say, not this
-    // walk's: the fused emitter is the usual answer and `top_k` has a library
-    // kernel of its own. Metal's arms are below because Metal emits three
-    // kernel families per region and the choice is per family.
+    // Singleton regions need no emission: the shell only ever reads the
+    // `KernelKind::Fused` slot; CUDA falls back to prebuilt tier-0 kernels.
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
         let entry = format!("ptir_fused_{signature}_r{region_index}");
         let emitted = crate::codegen::cuda::emit_region(&entry, stage, region);
@@ -231,8 +191,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             }
         }
         Err(error) => {
-            // The whole stage is unrepresentable on the singleton path; say so
-            // once rather than per region.
+            // Unrepresentable on the singleton path; say so once, not per region.
             out.push(EmittedKernel::new(
                 KernelKind::Singleton,
                 stage_index,
@@ -243,9 +202,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
         }
     }
 
-    // M2: one kernel per fused region, bound directly to channel cells. The
-    // engine refuses this form above `kMetalM2MaxFusedChannels`, and so do we —
-    // emitting it anyway would produce a kernel that cannot be bound.
+    // M2: one kernel per fused region, bound directly to channel cells.
     let fused_supported = stage.normalized.channel_bindings.len()
         <= crate::codegen::metal::METAL_M2_MAX_FUSED_CHANNELS;
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
@@ -267,9 +224,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
         ));
     }
 
-    // M3: the grouped forms, which serve every lane in a group from one launch.
-    // Singleton regions get the grouped-fused treatment; fused regions pick the
-    // library kernel their `library_op` names.
+    // M3: grouped forms, serving every lane in a group from one launch.
     for (region_index, region) in stage.singleton.regions.iter().enumerate() {
         let entry = format!("ptir_m3s_{signature}_r{region_index}");
         let emitted = crate::codegen::metal::emit_grouped_fused_region(&entry, stage, region);
@@ -301,11 +256,8 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
         ));
     }
 
-    // The grouped readiness and commit kernels are shared across a group, so
-    // they are named by emitter version rather than by program. They sit at
-    // region 0; the per-program single-lane forms the M1 and M2 launch paths
-    // bind are emitted once per program at region 1 by `emit_program`, because
-    // their channel effects are program-wide and a stage cannot see them.
+    // Shared across a group, so named by emitter version, not program; sit
+    // at region 0 (the per-program single-lane forms are region 1).
     let version = crate::codegen::metal::METAL_M1_EMITTER_VERSION;
     let ready = format!("ptir_m3_generic_ready_v{version}");
     let source = crate::codegen::metal::emit_grouped_readiness(&ready);
@@ -327,12 +279,9 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
     ));
 }
 
-/// The single-lane readiness and commit kernels, specialised to this program's
-/// channel effects.
-///
-/// These are what `m1_runtime.cpp` binds on the M1 and M2 paths — a different
-/// buffer shape from the grouped M3 forms above, so they cannot share a slot.
-/// They are program-wide rather than per-stage, hence `(stage 0, region 1)`.
+/// The single-lane readiness and commit kernels, specialised to this
+/// program's channel effects — a different buffer shape from the grouped M3
+/// forms, so they cannot share a slot. Program-wide, hence `(stage 0, region 1)`.
 fn emit_metal_program_effects(bound: &BoundTrace, out: &mut Vec<EmittedKernel>) {
     let effects = crate::codegen::metal::channel_effects(bound);
     let signature = format!("{:016x}", bound.hash);
@@ -359,16 +308,13 @@ fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> 
     match op {
         LibraryOp::NucleusSample => Some(LibraryOp::NucleusSample),
         LibraryOp::TopK => {
-            // The engine additionally checks the node really is a `top_k`, so a
-            // mislabelled region falls to the generic emitter instead of a
+            // A mislabelled region falls to the generic emitter instead of a
             // kernel that would read the wrong operands.
             let node = region.nodes.first()?.index();
             let op = stage.normalized.ops.get(node)?;
             (crate::codegen::op_view::OpView::of(op).tag == tags::TOP_K).then_some(LibraryOp::TopK)
         }
-        // Listed rather than caught by `_`: a new library op has no grouped
-        // kernel until someone writes one, and it should be this match that
-        // says so.
+        // Listed rather than caught by `_` so a new library op is a compile error.
         LibraryOp::Sort | LibraryOp::Scan | LibraryOp::MatMul | LibraryOp::SecondParty => None,
     }
 }

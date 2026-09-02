@@ -1,35 +1,6 @@
-//! One fire: prepare → run-ahead submit → finalize/poison — the non-glue
-//! run-ahead engine (the WIT host glue lives one layer up, in the
-//! `inferlet::host` forward/pipeline modules).
-//!
-//! **Run-ahead** (overview §3): pure-attention `pipeline.submit` does not block.
-//! RS-bound submission first finalizes prior FIFO operations so folded-state
-//! preparation observes the preceding commit. It then prepares the
-//! fire (seeds, host puts, KV/RS projection), hands the request to the
-//! scheduler, and enqueues a [`PendingFire`] (the payload-free completion + the
-//! open KV/RS txns) on the pass — the classic `execute()`/`output()` split
-//! (`PendingForward`, Option A) applied to this runtime. Pure-attention fires
-//! read a standing WorkingSet translation; RS step t+1 waits for t's committed
-//! folded mapping.
-//! `channel.take`/`read` also finalize in-flight fires FIFO until the cell
-//! fills. A failed fire **poisons** the pass's host-reader channels and fails
-//! the pass for further submits.
-//!
-//! **Layering.** The orchestration functions below (`submit_pass_stamped`,
-//! `finalize_op`, `drain_settled`, `wire_channels_to_pipeline`,
-//! `fire_device_geometry`, `pipeline_close`/`pipeline_drop`, `copy_into_inner`)
-//! need to get/get_mut/delete/push `Resource<Channel>`/`Resource<ForwardPass>`/
-//! `Resource<Pipeline>` handles in the WASM component resource table, but they
-//! are plain functions generic over [`FireContext`] — a narrow trait this
-//! module defines (naming only the external `wasmtime::component::
-//! ResourceTable` leaf type, never `ProcessCtx`/`inferlet`). `inferlet::host`
-//! (L4) implements `FireContext` for `ProcessCtx` and its `Host*` impls call
-//! these functions with `self`. This keeps `pipeline/` strictly below
-//! `inferlet/` in the layering while the fire engine still owns every bit of
-//! the algorithm — see [`FireContext`]'s doc for the design rationale.
+//! Fire engine: prepare, run-ahead submit, finalize/poison a pass's fires.
 
-/// tart (0.3 re-port step 1): whether the bound container carries
-/// attention-stage programs — the fire planner's hook divergence fact.
+/// Whether the bound container carries attention-stage programs.
 fn container_has_attention_stages(container: &eta_ir::container::TraceContainer) -> bool {
     use eta_ir::registry::Stage;
     container
@@ -37,14 +8,6 @@ fn container_has_attention_stages(container: &eta_ir::container::TraceContainer)
         .iter()
         .any(|s| matches!(s.stage, Stage::OnAttnProj | Stage::OnAttn))
 }
-
-// `container_writes_page_mask` stood here: does the pass write the
-// `attn_page_mask` sink? Its one consumer was `LaunchGrouping`, which kept
-// such a fire out of a group that carried a multi-token row because the
-// deleted driver's page-list substitution needed the paged decode path. The
-// palo shells have no such path and no such refusal (grep: `attn_page_mask`
-// appears in engine-metal only as a capability bit it answers `false` to), so
-// the question has no asker. Deleted with the rule (alto E).
 
 fn container_has_lora_sink(container: &eta_ir::container::TraceContainer) -> bool {
     container
@@ -201,11 +164,9 @@ type PreparedExplicitKv = kv::PreparedExplicit;
 /// transaction (`None` when nothing rebased).
 type PreparedHostKv = kv::RealizedDeclaration;
 
-/// A reserved-path preparation error. `Stale` means the demand grew between
-/// its phase-A computation and this prepare (a peer lane touched the same
-/// working set while the requester awaited its grant): nothing was consumed;
-/// the caller recomputes both demands and re-acquires, bounded. `Fatal` is a
-/// real preparation failure.
+/// `Stale`: demand grew between phase-A computation and prepare, nothing was
+/// consumed, caller recomputes and re-acquires (bounded). `Fatal`: a real
+/// preparation failure.
 enum ReservedError {
     Stale,
     Fatal(String),
@@ -222,10 +183,8 @@ fn stale_demand_error() -> String {
 /// grant when the demand drifts while it awaits the previous one.
 const STALE_DEMAND_ATTEMPTS: usize = 3;
 
-/// Abort-on-drop guard for a fire's prepared KV transaction: armed from
-/// preparation until the fire is enqueued on the pipeline FIFO (from there
-/// [`PendingFire`] owns commit/abort). Drop settles the write as failed, so
-/// error returns between prepare and enqueue need no hand-written rollback.
+/// Abort-on-drop guard for a fire's prepared KV transaction, armed until the
+/// fire is enqueued (from there [`PendingFire`] owns commit/abort).
 struct KvTxnGuard {
     model: usize,
     engine: usize,
@@ -263,9 +222,9 @@ impl Drop for KvTxnGuard {
     }
 }
 
-/// Settle-on-drop guard for a fire's published RS transaction (which has no
-/// store-side Drop of its own). Same protocol as [`KvTxnGuard`]: the mapping
-/// is already authoritative, so dropping only releases the in-flight hold.
+/// Settle-on-drop guard for a fire's published RS transaction; same protocol
+/// as [`KvTxnGuard`], but the mapping is already authoritative so dropping
+/// only releases the in-flight hold.
 struct RsTxnsGuard {
     model: usize,
     engine: usize,
@@ -332,19 +291,10 @@ fn host_kv_demand(
     .map_err(|error| format!("pipeline: KV demand: {error}"))
 }
 
-/// Acquire this fire's grant (KV pages and RS slots together — a fire never
+/// Acquire this fire's grant (KV pages and RS slots together; never
 /// half-succeeds) from the residency planner. Zero demand yields an empty
-/// grant so the build path stays uniform — every fire shape goes through
-/// prefix lending against one owned grant.
-///
-/// Uncontended (no waiters, everyone resident) this is two free-list pops
-/// with no planner lock. Under pressure the ask parks FCFS at the process's
-/// spawn position; the parked task holds no lease, no pins, and no open
-/// transaction, so the planner is free to evict around (or through) it.
-/// On [`crate::planner::Acquired::Yield`] the process was chosen for
-/// eviction (or is already out of the set): settle its tail HERE — the ask
-/// holds no lease, no pins, and no open transaction, so this is the one
-/// safe point — then wait out the eviction and re-ask.
+/// grant. On `Yield` the process was chosen for eviction: settle its tail
+/// (holding no lease/pins/txn at that point), wait out the eviction, re-ask.
 async fn acquire_grant<C: FireContext>(
     ctx: &mut C,
     pipeline_id: uuid::Uuid,
@@ -369,12 +319,8 @@ async fn acquire_grant<C: FireContext>(
     }
 }
 
-/// Back off for THIS process's eviction: settle its pipeline tails (the
-/// parked task must hold no pins, and those finalizations release the fire
-/// leases the eviction's quiescence waits on), then wait out the eviction.
-/// `wait_resident` re-posts the process-wide leave before parking (the
-/// lane-resurrection seal wedge, CONTENTION_FOLLOWUP.md §15.2). One owner
-/// for the back-off protocol — every fire-submit park site calls this.
+/// Back off for this process's eviction: settle its pipeline tails (releases
+/// the fire leases the eviction's quiescence waits on), then wait it out.
 async fn settle_and_wait_resident<C: FireContext>(ctx: &mut C) -> Result<(), String> {
     let Some(planner) = crate::planner::planner() else {
         return Err("pipeline: KV working set is suspend-fenced".to_string());
@@ -413,41 +359,18 @@ fn bound_rs_working_set_ids<C: FireContext>(
 }
 
 /// Resolve the fire's `rs-geometry.fold-len` into the per-row plan the
-/// lowering needs.
-///
-/// `fold-len` says where each request's folded boundary lands, counted from
-/// the current boundary over `[buffer | this fire's tokens]`. That single
-/// scalar subsumes the three fold-mode methods this replaced:
+/// lowering needs. `fold-len` counts the folded boundary from the current
+/// boundary over `[buffer | this fire's tokens]`, clamped to `B + T`
+/// (`u32::MAX` means "fold everything").
 ///
 /// | `fold_len`   | buffer    | plan                       |
 /// |--------------|-----------|----------------------------|
-/// | `> 0`        | empty     | `Fold` — the fast path     |
-/// | `0`          | empty     | `Buffer` — open a chunk    |
-/// | `0 < n <= B` | non-empty | `FoldBuffered` — commit    |
+/// | `> 0`        | empty     | `Fold`                     |
+/// | `0`          | empty     | `Buffer`                   |
+/// | `0 < n <= B` | non-empty | `FoldBuffered`             |
 ///
-/// `fold-len` is CLAMPED to `B + T`, so "fold everything" is the fire-invariant
-/// constant `u32::MAX` — the SDK's default — rather than a value the guest
-/// would have to recompute from each fire's token count.
-///
-/// Every remaining position needs the SAME missing primitive: a recurrence
-/// that starts from `folded ⊕ replay(buffer)` rather than from `folded`. The
-/// engine has no such read path (see
-/// `.wiki/designs/linear-state-programming-model.md` §2), so all of them are
-/// refused:
-///
-/// - `n == B + T` with `B > 0` — the fast path, "fold everything I have".
-/// - `B < n < B + T` — a boundary inside this fire's own new tokens. The
-///   extended layout describes it fine; the KERNELS do not, because
-///   `commit_len` truncates the sequence rather than merely moving the state
-///   snapshot, so the tokens past the boundary would get no outputs.
-/// - `n == 0` with `B > 0` — appending a second chunk. This one is quiet: the
-///   fire happily emits logits computed as though the buffer were empty.
-///   (Both of the above now RUN; only the interior boundary is still refused.)
-///
-/// They are errors rather than silent approximations because approximating a
-/// fold in either direction is unrecoverable: folding early destroys tokens
-/// the guest still wanted, and folding late silently drops them from the
-/// context.
+/// A boundary strictly inside this fire's own new tokens (`B < n < B + T`)
+/// is refused, not approximated: the tokens past it would get no outputs.
 fn rs_plan_for(
     fold_len: &Option<Vec<u32>>,
     stores: &crate::store::registry::Stores,
@@ -475,24 +398,14 @@ fn rs_plan_for(
                 .unwrap_or(0)
         })
         .collect();
-    // Buffer occupancy in TOKENS, exactly. This used to be a page-granular
-    // upper bound (`buffer_size() * page_tokens`), which is wrong in the one
-    // way that matters: you must reserve a page BEFORE you can buffer into it,
-    // so a freshly allocated, genuinely empty buffer reported a full page of
-    // occupancy and the legal "append onto an empty buffer" fire was refused
-    // as an append onto a non-empty one. The store now publishes the written
-    // span, so `buffer_tokens` is exact.
+    // Buffer occupancy, in tokens, exact (not page-granular).
     let mut buffered: Vec<u32> = {
         let store = stores.rs.lock().unwrap();
         let mut out = Vec::with_capacity(rows);
         for (row, id) in ids.iter().enumerate() {
             match store.buffer_tokens(*id) {
                 Ok(tokens) => out.push(tokens),
-                // A working set whose last fold had a device-resident length
-                // has no exact occupancy any more, and classifying a fire
-                // against a bound would either replay absorbed tokens (a
-                // double fold) or drop live ones. The store says so; say it
-                // back with the row that tripped it.
+                // No exact occupancy after a device-resident fold length.
                 Err(crate::store::rs::RsError::BufferOccupancyIndeterminate { bound }) => {
                     return Err(format!(
                         "request row {row} needs its exact buffer occupancy, but the working \
@@ -507,19 +420,9 @@ fn rs_plan_for(
         out
     };
 
-    // The fold length lives on device: only the engine will ever resolve it.
-    // The host can still PLAN, because the engine CLAMPS the resolved count to
-    // the bound the host publishes — the row's whole live buffer `b`. That
-    // clamp is what makes the dispatch knowable in advance: every value the
-    // device can name lies in `[1, b]`, and every value in `[1, b]` is the
-    // same `FoldBuffered` replay. The fire's own new tokens are irrelevant to
-    // the choice for the same reason they are irrelevant to any commit — the
-    // linear layers do not compute them, they replay the slabs.
-    //
-    // The price is that the boundary can never land INSIDE this fire's own new
-    // tokens under a device-resident length, because the clamp forbids it.
-    // That is the interior-boundary case, which is refused for host-known
-    // lengths too, so nothing is lost here that is available elsewhere.
+    // fold_len is device-resident; the host can still plan because the
+    // engine clamps the resolved count to [1, b] (the row's live buffer),
+    // always the same FoldBuffered replay regardless of this fire's tokens.
     if fold_len.is_none() {
         if let Some(row) = (0..rows).find(|row| buffered[*row] == 0) {
             return Err(format!(
@@ -534,13 +437,10 @@ fn rs_plan_for(
     }
     let fold_len = fold_len.as_deref().expect("checked above");
 
-    // Classify each row independently, then decide what the PASS can be.
-    // `Fold` and `Buffer` mix freely: both run this fire's own tokens through
-    // the full stack over the extended layout, and they differ only in whether
-    // the row's recurrence persists — which the engine now expresses as a
-    // per-row mask rather than a per-pass flag. `Commit` does not mix with
-    // anything: it replays activations out of the slabs instead of computing
-    // them, which is a different dispatch, not a different flag.
+    // Classify each row, then decide what the pass can be. Fold and Buffer
+    // mix freely (both compute over the extended layout, differing only in
+    // whether the recurrence persists); Commit does not mix with anything,
+    // since it replays slabs instead of computing.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum Position {
         Fold,
@@ -554,18 +454,8 @@ fn rs_plan_for(
         let n = fold_len[row].min(b + t);
         fold_tokens[row] = n;
         let here = if t == 0 {
-            // The guest said, in the only way that cannot be confused with
-            // anything else, "I have nothing to compute; only move the
-            // boundary". A row spanning no tokens is a PURE REPLAY: the
-            // linear layers gather the buffered prefix [0, n) out of the
-            // slabs and return before the output projection.
-            //
-            // This used to be inferred from `n <= b`, which is an incidental
-            // property of a commit rather than a statement of intent -- and
-            // it is exactly the condition a fire folding BEHIND its own new
-            // tokens satisfies while meaning the opposite. Reading the
-            // emptiness of the row directly frees `n <= b` to mean what it
-            // says.
+            // A row spanning no tokens is a pure replay: gather the buffered
+            // prefix [0, n) and return before the output projection.
             if n == 0 {
                 return Err(format!(
                     "request row {row} carries no tokens and folds nothing: it neither \
@@ -576,50 +466,29 @@ fn rs_plan_for(
             }
             Position::Commit
         } else if n == 0 {
-            // A pure append. Still the extended layout when b > 0, but the
-            // folded boundary does not move.
+            // Pure append: extended layout when b > 0, boundary unmoved.
             Position::Buffer
         } else if n == b + t {
-            // The fold takes the WHOLE row. With nothing buffered that is the
-            // plain in-forward advance and no buffer is involved at all; with
-            // a non-empty buffer it is the same thing over the extended
-            // `[b | t]` layout, and since the boundary is the last extended
-            // token the ordinary end-of-sequence state writeback lands exactly
-            // on it -- no `commit_len`, no kernel work.
+            // Fold takes the whole row: plain in-forward advance if b == 0,
+            // else the same over the extended [b|t] layout (boundary is the
+            // last token, so ordinary EOS writeback covers it).
             if b == 0 {
                 Position::Fold
             } else {
                 Position::Buffer
             }
         } else {
-            // Everything else runs over the extended `[b | t]` layout, which
-            // IS the row's buffer token space. The engine replays the b
-            // buffered tokens ahead of the t new ones (every recurrence
-            // initializes from `recurrent_state[slot]`, the state at F),
-            // scatters all t new ones into the buffer, and snapshots the
-            // recurrent state at extended token n. So one shape covers the
-            // append (n == 0), the fold through a non-empty buffer
-            // (n == b + t), the boundary landing strictly INSIDE this fire's
-            // own new tokens (b < n < b + t), and the boundary landing BEHIND
-            // them (n < b) -- folding a previous window's accepted prefix in
-            // the very fire that writes the next one.
-            //
-            // The interior case is not `commit_len`: that TRUNCATES the
-            // sequence, and a fire folding at an interior boundary still owes
-            // logits for the tokens past it. The engine cuts the row in two
-            // instead and runs the recurrence twice on one stream -- the head
-            // persisting its end-of-sequence state onto the boundary, the tail
-            // continuing from that state to produce the remaining outputs
-            // without moving it again.
+            // Otherwise runs over the extended [b|t] layout: replays the b
+            // buffered tokens ahead of the t new ones and snapshots recurrent
+            // state at extended token n. Not `commit_len` (which truncates):
+            // an interior boundary still owes logits past it.
             Position::Buffer
         };
         kinds.push(here);
     }
 
-    // A pure commit cannot share a fire. Its rows are not computed at all --
-    // the linear layers gather already-buffered activations and return before
-    // the output projection -- so there is no per-row switch that would let a
-    // computing row ride along.
+    // A pure commit cannot share a fire: its rows are not computed at all, so
+    // there is no per-row switch that would let a computing row ride along.
     if kinds.contains(&Position::Commit) && !kinds.iter().all(|k| *k == Position::Commit) {
         let row = kinds
             .iter()
@@ -637,16 +506,15 @@ fn rs_plan_for(
     } else if kinds.iter().all(|k| *k == Position::Fold) {
         Position::Fold
     } else {
-        // Mixed, or uniformly buffered. Either way the pass runs the buffered
-        // shape; an `in_forward` row simply owns no buffer inside it.
+        // Mixed or uniformly buffered: pass runs the buffered shape; an
+        // `in_forward` row simply owns no buffer inside it.
         Position::Buffer
     };
     let in_forward: Vec<bool> = kinds.iter().map(|k| *k == Position::Fold).collect();
     for (row, forward) in in_forward.iter().enumerate() {
         if *forward {
-            // Its boundary moves through its OWN tokens, not through a buffer,
-            // so it carries no fold length: `validate_fold` measures against
-            // buffered capacity, which this row does not have.
+            // Boundary moves through its own tokens, not a buffer: no fold
+            // length (validate_fold measures against buffered capacity).
             fold_tokens[row] = 0;
             buffered[row] = 0;
             row_tokens[row] = 0;
@@ -655,10 +523,7 @@ fn rs_plan_for(
 
     Ok(match pass {
         Position::Fold => rs::RsPlan::Fold,
-        // Each row opens at its own exact occupancy. The planner still refuses
-        // a non-zero one above until the recurrence can read the buffer, but
-        // the plan carries the truth either way, so relaxing that refusal is a
-        // one-line change rather than a re-derivation.
+        // Each row opens at its own exact occupancy.
         Position::Buffer => rs::RsPlan::Buffer {
             start_tokens: buffered,
             row_tokens,
@@ -667,43 +532,17 @@ fn rs_plan_for(
         },
         Position::Commit => rs::RsPlan::FoldBuffered {
             fold_len_is_device: false,
-            // `fold_tokens`, not the raw `fold_len`: the WIT promises the
-            // length is CLAMPED to the tail, which is what makes "fold
-            // everything" a fire-invariant `u32::MAX`. Under the old rule a
-            // commit was selected by `fold_len <= buffered`, so the raw value
-            // was already clamped by construction and the distinction never
-            // showed. A row that carries no tokens is a commit whatever its
-            // fold length says, so an unclamped `u32::MAX` would now reach
-            // `validate_fold` and be REFUSED as exceeding capacity.
+            // fold_tokens, not raw fold_len: WIT clamps the length to the
+            // tail, so "fold everything" is the fire-invariant u32::MAX.
             tokens: fold_tokens,
         },
     })
 }
 
-/// Drop the SYNTHESIZED read-out rows from a fire that replays the BUFFER.
-///
-/// A `FoldBuffered` fire scans activations that were computed by an earlier
-/// fire and are already sitting in buffer slabs. It exists only to move the
-/// folded boundary, so it returns from the linear layers before the output
-/// projection and produces no logits; the engine refuses one that declares
-/// sample rows. But an absent `readout` binding does not mean "sample nothing"
-/// — it means "sample each lane's last row" — and an empty readout channel has
-/// no expressible shape. So a guest that simply committed got a sample row it
-/// never asked for and a fire that could not run.
-///
-/// **Only `FoldBuffered`.** A plain `RsPlan::Fold` also advances the folded
-/// state, but it does so over the fire's OWN new tokens, running them through
-/// the full stack exactly as a prefill does — because that is what a prefill
-/// on a linear model IS. Its logits are ordinary and required. Suppressing
-/// them left `sampled_rows` at zero and the fused epilogue failed to launch
-/// with a zero extent, which is to say: every prefill on a linear model. The
-/// engine draws this line correctly already — its `rs_is_fold` is
-/// `mode == BufferFold`, nothing wider — so this must match it and not the
-/// looser "does this fire fold at all".
-///
-/// Only the default is dropped. An EXPLICIT readout on a buffered fold still
-/// reaches the engine and is still refused, loudly: asking for logits that
-/// cannot exist is a guest bug worth reporting, not one worth papering over.
+/// Drop the synthesized readout for a `FoldBuffered` fire: it produces no
+/// logits, and a defaulted readout has no expressible shape here. An
+/// explicit readout on a buffered fold still reaches the engine (and is
+/// refused there).
 fn suppress_defaulted_readout_for_fold(
     req: &mut crate::engine::FireRequest,
     readout_defaulted: bool,
@@ -713,11 +552,7 @@ fn suppress_defaulted_readout_for_fold(
     if !replays_buffer || !readout_defaulted {
         return;
     }
-    // `Readout::None` is the contract's way of saying "this lane runs for its
-    // cache writes alone", which is exactly what a buffered fold does. The
-    // wire form had to say it by clearing an index vector and zeroing a CSR,
-    // and could not tell that apart from a lane whose readout was empty for
-    // some other reason.
+    // Readout::None: this lane runs for its cache writes alone.
     for lane in &mut req.lanes {
         lane.readout = ::engine::Readout::None;
     }
@@ -736,12 +571,8 @@ fn rs_slot_demand(
     u32::try_from(demand).map_err(|_| "pipeline: RS demand exceeds the contention ABI".to_string())
 }
 
-/// Prepare the host-projected KV write from the fire's grant, all under one
-/// store lock: re-check the demand (the staleness gate), realize the
-/// declaration, and back the writable frontier — draining exactly the
-/// consumed prefix from the grant. On `Stale` nothing was consumed. The
-/// grant's Drop returns whatever this did not consume; nothing is ever
-/// hand-released.
+/// Prepare the host-projected KV write from the fire's grant, under one
+/// store lock (staleness gate re-checked). On `Stale` nothing was consumed.
 fn prepare_host_kv_reserved(
     stores: &crate::store::registry::Stores,
     ws: &KvWorkingSet,
@@ -797,9 +628,9 @@ fn prepare_explicit_kv_reserved(
     })
 }
 
-/// A pipeline FIFO entry: a forward FIRE holding its ordered slot on the
-/// stream; `take`/`read` drain entries in submit order. (KV cell moves are
-/// awaited inline by `copy_into_inner` and never enter the FIFO.)
+/// A pipeline FIFO entry: a forward fire holding its ordered slot on the
+/// stream; `take`/`read` drain entries in submit order. KV cell moves are
+/// awaited inline by `copy_into_inner` and never enter the FIFO.
 pub enum PendingOp {
     Fire(PendingFire),
     #[cfg(test)]
@@ -879,29 +710,20 @@ impl std::future::Future for OpSignal {
     }
 }
 
-/// Test-only inert FIFO entry: enough to make a pass's shared fires queue
-/// non-empty for `ForwardPass::can_close_native_on_drop`/`Drop` tests
-/// (`pipeline::instance`'s `native_cleanup` test module), without needing a
-/// live completion. `PendingFire`'s fields are private
-/// to this module, so cross-module tests construct a stub through here
-/// rather than reaching in directly.
+/// Test-only inert FIFO entry: makes a pass's shared fires queue non-empty
+/// for `ForwardPass` drop tests without needing a live completion.
 #[cfg(test)]
 pub(crate) fn test_pending_op_stub() -> PendingOp {
     PendingOp::TestStub
 }
 
-/// The open KV/arena transaction(s) one in-flight fire holds until it resolves.
-/// Two shapes: the ordinary single-seq / MTP projection ([`kv`]), or a
-/// device-geometry fire whose KV the engine resolves+writes itself (B2's
-/// explicit-KV path) — the runtime only pins the [`lease::PageLease`]-granted
-/// physical pages for the fire, released at finalize (per-fire arena txn; the
-/// plan's "pin float bounded by run-ahead depth × B, riding the per-fire arena
-/// txns").
+/// The open KV/arena transaction(s) one in-flight fire holds until it
+/// resolves. Two shapes: the ordinary single-seq / MTP projection ([`kv`]),
+/// or a device-geometry fire whose KV the engine resolves+writes itself.
 enum FireKv {
     Host(Option<kv::KvTxn>),
-    /// A device-geometry fire's prepared write over the lease-granted slots
-    /// (B2's explicit-KV path): same commit/abort protocol, no host
-    /// projection.
+    /// A device-geometry fire's prepared write over the lease-granted
+    /// slots: same commit/abort protocol, no host projection.
     DeviceGeom {
         kvtxn: kv::KvTxn,
     },
@@ -917,8 +739,7 @@ pub struct PendingFire {
     ws_guard: KvFireLease,
     model: usize,
     engine: usize,
-    /// The owning pass, to fail it on a fire error (rep — the guest may have
-    /// dropped the handle; failure marking is then moot).
+    /// The owning pass, to fail it on a fire error.
     fwd_rep: u32,
     instance_id: u64,
     cells: BoundCells,
@@ -953,8 +774,7 @@ fn prepare_bound_rs<C: FireContext>(
         return Ok(Ok(rs::PreparedRs::empty()));
     }
 
-    // Resolution + model/engine validation live in the phase-A resolver;
-    // only the scope claim is prepare-time work.
+    // Resolution + model/engine validation live in the phase-A resolver.
     let working_sets = match bound_rs_working_set_ids(ctx, model, engine, rs_reps)? {
         Ok(ids) => ids,
         Err(error) => return Ok(Err(ReservedError::Fatal(error))),
@@ -972,9 +792,9 @@ fn prepare_bound_rs<C: FireContext>(
 
     let prepared = {
         let mut store = stores.rs.lock().unwrap();
-        // Staleness gate under the same lock as the prepare: if the demand
-        // grew while the requester awaited its grant, nothing is consumed
-        // and the caller re-acquires.
+        // Staleness gate under the same lock as the prepare: if demand grew
+        // while awaiting the grant, nothing is consumed and the caller
+        // re-acquires.
         let required = match rs::demand(&store, &working_sets, plan) {
             Ok(required) => required,
             Err(error) => {
@@ -991,13 +811,10 @@ fn prepare_bound_rs<C: FireContext>(
     Ok(prepared.map_err(|error| ReservedError::Fatal(format!("pipeline: rs prepare: {error}"))))
 }
 
-/// Drain EVERY in-flight fire on this pipeline to settlement.
-///
-/// This is not an RS ordering rule (RS mappings publish at prepare, in
-/// submission order, so a recurrent-state fire never needs to wait for its
-/// predecessors). It is the host-side ordering seam for out-of-band ops that
-/// read committed physical ids and then act on them off the fire path —
-/// `copy_into`, whose page translation must not race a same-WS CoW rebase.
+/// Drain every in-flight fire on this pipeline to settlement. This is the
+/// host-side ordering seam for out-of-band ops (`copy_into`) that read
+/// committed physical ids and act on them off the fire path — not an RS
+/// ordering rule, since RS mappings publish at prepare in submission order.
 pub(crate) async fn drain_pipeline_fires<C: FireContext>(
     ctx: &mut C,
     fires: &PendingFires,
@@ -1011,8 +828,8 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
         let Some(completion) = completion else {
             return Ok(());
         };
-        // Predecessor fires retire with their frames regardless of this
-        // process's residency, so a plain await cannot deadlock the planner.
+        // Predecessor fires retire regardless of this process's residency,
+        // so a plain await cannot deadlock the planner.
         completion.await;
 
         let _finalize_guard = fires.finalize_guard().await;
@@ -1030,58 +847,13 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
     }
 }
 
-/// **THE LANE WORD, STAMPED ONCE THE LANE IS FINISHED** (`palo B-word`).
-///
-/// A lane's word is its fact bits, and `engine::fire::compose` turns it into
-/// a class and therefore into the row WINDOW every guarded node runs over
-/// (palo design §0, decision 18). Both lane-construction sites left it at
-/// zero — the all-false class — so every decode lane went out composed as a
-/// prefill one; the runtime could not do better while `models::catalog()` shipped
-/// three columns, because a plan's `Guard::Fact(bit)` numbers its bits and no
-/// reader outside a family's own module can say which one `qo_one` is. The
-/// catalog carries a `ClassifyFn` now and `crate::model::Model::word` calls
-/// it; nothing here reads a bit.
-///
-/// **WHY HERE AND NOT IN `ReqGeometry::lanes`.** A lane's word depends on its
-/// mask, and a lane does not have its mask until the fire's mask has lowered:
-/// `FireAttnMask::apply_to` is what cuts the mask CSR onto the lanes. So the
-/// two facts the runtime states — how many rows a lane has, and whether it
-/// carries a mask of its own — are only both true at one point in each path,
-/// and that is where this is called.
-///
-/// `fire_wide_mask` is the device-resident case, which has no `Lane::mask` to
-/// read: the engine's descriptor resolver reads the `AttnMask` channel cell on
-/// every fire, so the mask is on the FIRE and covers every lane in it. A model
-/// that splits on `masked` (gemma) would otherwise run those rows through the
-/// arm for lanes that have no mask.
-///
-/// **AND IT IS THE COLLAPSE §0 WARNS ABOUT, STATED RATHER THAN HIDDEN.** One
-/// dense mask in one channel cell, shared by every lane of the pass, is a
-/// per-fire reading of a per-LANE axis — the runtime cannot do better here
-/// because the device value it is reading has no per-lane state to cut
-/// (`geometry::detect_pooled_device_geometry`'s ruling). What it must not do
-/// is let that reading reach a masked arm with nothing behind it: the word
-/// says `masked` and no `Lane::mask` follows, so the engine would send the
-/// arm at a slab the fire never staged. The CUDA shell refuses exactly that
-/// pairing by name — `Fault::MaskWord`, asked per lane against the class the
-/// word resolved to — so the narrowing costs a refusal and never an answer.
-///
-/// **AND THE SIXTH FACT IS THE SUBMISSION'S, NOT THE LANE'S** (multimodal §15,
-/// media-door §4). `media` says the submission this fire came from attached
-/// spans — one reading of one `forward-pass.media` call, stamped on every lane
-/// the submission fires, because the pass is one pass and its images are its
-/// images whichever row groups it splits into. It joins here rather than
-/// earlier for the reason `drafts` and `captures_scores` do: it imposes no
-/// ordering of its own, so it takes the instant that already exists.
-///
-/// §15's constraint is that this argument and the verb that makes it
-/// reachable land TOGETHER. A lane whose word said `false` while its
-/// submission carried images would compose as the text-only class — and both
-/// `qwen_3` and `gemma_4` guard their embed merge on `Facts::media`, so the
-/// patch rows would have no node to land in and the pass would answer
-/// fluently about an image it never saw. That is not a failure any test
-/// downstream of here catches, which is why it is a constraint and not a
-/// follow-up.
+/// Stamp each lane's fact word, which `engine::fire::compose` turns into a
+/// class and therefore the row window every guarded node runs over. Called
+/// here because a lane's mask is only known once the fire's mask has
+/// lowered. `fire_wide_mask` covers the device-resident case, where the mask
+/// lives on the fire's channel cell rather than any `Lane::mask`.
+/// `carries_media` is the submission's fact, not the lane's, and must be set
+/// wherever a model guards its embed merge on `Facts::media`.
 fn stamp_lane_words(
     req: &mut crate::engine::FireRequest,
     fire_wide_mask: bool,
@@ -1090,23 +862,8 @@ fn stamp_lane_words(
     let model = crate::model::model();
     for lane in &mut req.lanes {
         let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
-        // THE FACTS AFTER THE FIRST ARE READ OFF THE LANE ITSELF, and that is
-        // the whole reason they are stamped here rather than anywhere
-        // earlier: `word` and the intents it names have to be ONE READING OF
-        // ONE LANE, or the shell refuses the fire (`Fault::AdapterWord`,
-        // `Fault::DraftWord`, `Fault::ScoreWord`). Whoever put them on the
-        // lane — the working set, `crate::engine::fire` — has already run by
-        // now, so this asks the lane rather than re-deriving the answers from
-        // the request they came from.
-        //
-        // **THE TWO EXPORT AXES NEEDED NO NEW INSTANT** (palo C3b/C4b). The
-        // mask is why this function exists at all: a lane does not have its
-        // mask until `FireAttnMask::apply_to` has cut the fire's, so a word
-        // stated earlier would be stated before its inputs. `drafts` and
-        // `captures_scores` are not like that — they are on the lane from the
-        // moment the lane is built, and nothing downstream can change them —
-        // so they impose no ordering of their own and simply join the reading
-        // that already happens at the latest of the five instants.
+        // Word and the intents it names must be one reading of one lane, or
+        // the shell refuses the fire (Fault::AdapterWord/DraftWord/ScoreWord).
         lane.word = model.word(
             rows,
             lane.mask.is_some() || fire_wide_mask,
@@ -1118,42 +875,15 @@ fn stamp_lane_words(
     }
 }
 
-/// Seat this fire's lanes: `Lane::slot`, from the working set that owns it.
-///
-/// **THE SLOT HAD NO OWNER, AND THAT IS WHAT A MULTI-LANE FIRE FOUND OUT**
-/// (`palo` build log 28's headline). Both paths built their lanes with the
-/// field at zero — `ReqGeometry::lanes` under a comment saying "the caller
-/// stamps it", `fire_device_geometry` through `Lane::default()` — and the
-/// caller it named did not exist. A solo fire is one lane and zero is a
-/// perfectly good seat for it, so every gate in the tree passed; the batcher
-/// concatenates the lanes of every member of a step (`scheduler::batch`), so
-/// the second concurrent guest in one wave made the fire two lanes both
-/// seated at zero and `Step::validate` refused the batch by name.
-/// Concurrent multi-lane serving was broken for exactly as long as nothing
-/// covered it.
-///
-/// **WHO OWNS A SLOT.** It is the sequence's seat in the shell's pools — the
-/// kv block a shell-owned page table hands it, the recurrent bank row
-/// `Pools::clear` zeroes on the fire where `held == 0`, the id
-/// `slot_ids[lane]` a linear-attention scan indexes with. The runtime's
-/// per-sequence identity is the KV WORKING SET: it is one sequence's page
-/// table, minted at create/fork/slice and released with its last handle. So
-/// the working set owns the seat, [`crate::store::seat`] is the book it owns
-/// it in, and this is where the book's answer meets the lanes.
-///
-/// One seat per LANE, because a request is lanes plural: a beam fires B row
-/// groups against one page table and each of those rows is a sequence as far
-/// as the pools are concerned. The book keeps the run, so lane `i` of every
-/// fire of a working set sits in the same seat — which is what a recurrent
-/// bank row depends on, and why a seat cannot be handed out per fire.
+/// Seat this fire's lanes (`Lane::slot`) from the KV working set that owns
+/// them. A slot is a sequence's seat in the shell's pools (kv block,
+/// recurrent bank row, `slot_ids[lane]`). Lane `i` of every fire of a
+/// working set sits in the same seat, which a recurrent bank row depends on.
 ///
 /// # Errors
 ///
-/// The refusal, ready to return, when this fire would seat more sequences
-/// than the deployment's pools hold (`Budgets::slots`, which the engine
-/// advertises as `PoolFacts::state_slots`). Named here, with both numbers,
-/// rather than reaching the shell and coming back as a `Fault::Ceiling`
-/// naming a lane index.
+/// When this fire would seat more sequences than the deployment's pools
+/// hold (`Budgets::slots`).
 pub(crate) fn stamp_lane_slots(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
@@ -1171,39 +901,11 @@ pub(crate) fn stamp_lane_slots(
     Ok(())
 }
 
-/// **REWRITE EVERY LANE'S PAGE TABLE FROM WORKING-SET INDEXES TO POOL PAGE
-/// IDS**, which is the only spelling [`KvDelta::pages`] has.
-///
-/// A guest states its `pages` channel in WorkingSet-RELATIVE indexes — it
-/// asked for `ws.reserve(n)` and holds `0..n`, and `crate::store::kv` is what
-/// maps those onto the pool. [`KvDelta::pages`] is the other thing:
-/// `engine::store::kv::geometry_with` pushes each entry it is given STRAIGHT
-/// into the page CSR, with no per-slot base and no lookup, because "the ids
-/// are the runtime's and the bytes under them are the engine's" (article 8).
-/// Between the guest's spelling and the engine's there was no translation, so
-/// every lane in the system addressed pool pages `0, 1, …`:
-///
-/// * **alone it is invisible** — a lane reads back the pages it wrote, so a
-///   sequence that never shares a fire is self-consistent whatever ids it used;
-/// * **under a HOMOGENEOUS load it is invisible** — colliding lanes write the
-///   same prompt and the same continuation, so the bytes they overwrite each
-///   other with are the bytes that were there;
-/// * **under a heterogeneous one it is a wrong answer** — a fresh sequence
-///   prefilling six tokens over pool page 0 walks over the first six positions
-///   of every other live sequence's cache, and the lane decoding beside it
-///   attends a prompt it never had. Measured: a greedy lane over "The capital
-///   of France is" answers " Paris.\nThe capital of France is Paris." alone and
-///   " Paris.\nThe following are the results of the following:" with any
-///   two-token neighbour co-resident, deterministically, from the fifth token.
-///
-/// **IT RUNS AFTER THE FIRE'S KV PREPARE.** `flat_table` answers the committed
-/// mapping overlaid with the write targets this fire has just reserved, and a
-/// first prefill's own pages are in it only then — which is also why this is
-/// not folded into [`stamp_lane_slots`], whose instant is before the acquire.
-///
-/// A page a lane names and the working set has not mapped is a refusal: the
-/// alternative is addressing a pool page belonging to somebody else, which is
-/// the failure this function exists to end.
+/// Rewrite each lane's page list from working-set-relative indexes to pool
+/// page ids: [`KvDelta::pages`] takes ids directly, so the guest's relative
+/// indexing must be translated here. Runs after the fire's KV prepare, so a
+/// first prefill's own pages are already in the mapping. A page the working
+/// set hasn't mapped is refused, rather than aliasing another sequence's page.
 ///
 /// [`KvDelta::pages`]: ::engine::KvDelta::pages
 pub(crate) fn map_lane_pages(
@@ -1230,12 +932,7 @@ pub(crate) fn map_lane_pages(
 }
 
 /// The working set's flattened logical-to-physical table: entry `i` is the
-/// pool page backing WorkingSet-relative index `i`.
-///
-/// **ONE READER, BECAUSE ONE MAPPING** (article 8). [`map_lane_pages`] applies
-/// it and [`stamp_lane_translation`] quotes it, and the two must be the same
-/// bytes at the same instant or the host path and the device path would be
-/// translating through two tables.
+/// pool page backing working-set-relative index `i`.
 fn working_set_flat_table(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
@@ -1248,24 +945,9 @@ fn working_set_flat_table(
     .map_err(|error| format!("pipeline: KV page translation: {error}"))
 }
 
-/// **HAND THE ENGINE THE TABLE, FOR THE ONE CLASS WHOSE PAGE REFERENCES THE
-/// RUNTIME CANNOT REACH.**
-///
-/// [`map_lane_pages`] is the same rule applied one step earlier: for a
-/// host-resolved geometry the runtime folds the guest's `Pages` port itself,
-/// so it can rewrite the relative indexes into pool ids and ship the RESULT.
-/// A device-geometry pass states its pages, its page CSR and its write
-/// descriptor in channel cells its own epilogue wrote — `gather(pool_ids, ..)`
-/// over a `ws.reserve` grant, which is relative like every other guest's — and
-/// the host never reads them. There is nothing to rewrite, so the TABLE
-/// crosses instead and the engine applies it where it resolves the cells.
-///
-/// The mapping still has one owner: this is `kv::build_translation`'s vector,
-/// quoted onto the lanes, and the engine may only index it.
-///
-/// **AT THE SAME INSTANT [`map_lane_pages`] RUNS**, and for its reason: a
-/// pooled pass prepares its whole writable span before this point, so the
-/// table answered here already covers every cell the device may pick.
+/// Hand the engine the page table directly, for the device-geometry class
+/// whose page references the host never reads (nothing to rewrite as in
+/// [`map_lane_pages`]).
 fn stamp_lane_translation(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
@@ -1317,36 +999,9 @@ impl TicketReservation {
         }
     }
 
-    /// **AND NOW IT CROSSES, ONTO THE LANE** (alto design §1 article 3,
-    /// waves F2a and E).
-    ///
-    /// These heads and tails were `channel_expected_head` /
-    /// `channel_expected_tail` on the old wire plan — a per-fire assertion,
-    /// shipped, that a guest program's rings stood where the runtime thought —
-    /// and F1 stopped shipping them because nothing on the far side could
-    /// check one: the engine gated its own cursors on the host before it
-    /// launched anything, so a stated claim had nothing to add.
-    ///
-    /// An engine with the pull-validate and commit-bump kernels checks them
-    /// where the data is, and that is the whole of article 3: the host owns a
-    /// prediction and the device owns the truth. F2a stated the reservation
-    /// on the REQUEST and had `scheduler::batch` transcribe it onto the
-    /// attached lane; wave E stamps it here instead, because this is the one
-    /// place that mints the prediction and the one place that knows whether
-    /// the instance's channels were ADOPTED — and two spellings of one number
-    /// is what article 8 forbids.
-    ///
-    /// It lands on the request's FIRST lane, which is the lane the batcher's
-    /// attachment names: a member that fires three row groups is one bound
-    /// instance running one pass with one commit. And it lands only when
-    /// every channel was adopted, because an engine with no device half
-    /// refuses a stated prediction by name (`Lane::validate_for`) rather than
-    /// ignoring it, and a prediction nobody checks is worse than none.
-    ///
-    /// What the reservation and the LIFO rollback below were always also for
-    /// is the OTHER question — how many cells a frame of k fires could need
-    /// before any of them settles — and that is runtime bookkeeping,
-    /// unchanged.
+    /// The host predicts these head/tail reservations; the device checks
+    /// them where the data is. Lands on the request's first lane, and only
+    /// when every channel was adopted.
     fn apply_to(&self, request: &mut crate::engine::FireRequest) {
         if self.cells.is_empty() {
             return;
@@ -1397,10 +1052,8 @@ impl Drop for TicketReservation {
 }
 
 /// Park until the channel can make progress: its endpoint's reader word
-/// advances (the engine's completion callback wakes the reader wait slot
-/// directly), or the oldest in-flight pipeline op settles so the caller can
-/// drain it. Errors surface poison/closure or a definitively empty channel
-/// (no endpoint and nothing in flight: nothing can ever fill the cell).
+/// advances, or the oldest in-flight pipeline op settles so the caller can
+/// drain it. Errors surface poison/closure or a definitively empty channel.
 pub(crate) async fn await_channel_progress(
     cell: &Arc<Mutex<crate::pipeline::channel::ChannelCell>>,
     fires: Option<&PendingFires>,
@@ -1439,27 +1092,19 @@ pub async fn submit_pass_stamped<C: FireContext>(
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
 ) -> Anyhow<Result<(), String>> {
-    // palo D0: the guest thread's own submit, phase by phase. Compiles away
-    // without `profile-fire` (see `scheduler::probe::HostSubmitProbes`).
+    // Compiles away without `profile-fire`.
     let submit_probe = crate::scheduler::probe::host_submit();
     let submit_clock = crate::scheduler::probe::ProbeClock::start();
     {
-        // Device-geometry pass (Track B): the [B,P] geometry is
-        // device-produced (the program traces the wire form in-graph) and
-        // the engine resolves it pre-forward, so this pass leases physical
-        // pages and fires prebuilt — but it RUNS AHEAD like any pass (the
-        // FIFO carries it; NOT synchronous like the deleted host-replay beam
-        // branch).
+        // Device-geometry pass: geometry is device-produced, so this pass
+        // leases physical pages and fires prebuilt, still running ahead via
+        // the FIFO like any pass.
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
             return fire_device_geometry(ctx, this, fwd, frame).await;
         }
-        // Contention-probe marker: when the guest's WIT call reached the
-        // host (vs `hp-acquire` below — the delta is the build preamble,
-        // including the settlement drain).
-        // W3.1: the PIPELINE owns the in-flight FIFO. Point each of this
-        // pass's channels at this pipeline's queue so their `take`/`read`
-        // await the right FIFO — enforcing the same-pipeline constraint
-        // (§3.4): every pass binding a channel must submit on one pipeline.
+        // Point this pass's channels at this pipeline's FIFO so take/read
+        // await the right queue; every pass binding a channel must submit
+        // on one pipeline.
         let (pipe_fires, pipeline_failure, pipeline_scope) = {
             let pipeline = ctx.resources().get(&this)?;
             if pipeline.scope.is_closed() {
@@ -1471,9 +1116,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 pipeline.scope.clone(),
             )
         };
-        // Non-blocking settlement drain (plan §6): resolved fires' KV/RS
-        // txns finalize here so arena pins stay bounded by run-ahead depth
-        // even when the guest never takes.
+        // Non-blocking settlement drain: resolved fires' KV/RS txns finalize
+        // here so arena pins stay bounded even when the guest never takes.
         {
             let began = crate::scheduler::probe::ProbeClock::start();
             drain_settled(ctx, Some(&pipe_fires)).await?;
@@ -1485,9 +1129,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if let Err(error) = wire_channels_to_pipeline(ctx, &fwd, &pipe_fires)? {
             return Ok(Err(error));
         }
-        // An RS-binding pass needs no extra serialization here: its mapping
-        // publishes at prepare, in submission order, so it runs ahead like
-        // any other pass.
+        // An RS-binding pass needs no extra serialization: its mapping
+        // publishes at prepare, in submission order.
         let (
             geometry,
             cells,
@@ -1503,6 +1146,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             accesses,
             decode_envelope,
             p_reads_attn_score,
+            p_reads_mtp_logits,
         ) = {
             let p = ctx.resources().get_mut(&fwd)?;
             if let Some(e) = &p.failed {
@@ -1510,24 +1154,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     "pipeline: forward-pass failed by an earlier fire: {e}"
                 )));
             }
-            // WHICH PORTS THE ENGINE WILL RESOLVE, AND NOTHING ELSE (`palo
-            // B3`). A decode-envelope pass carries exactly one value the host
-            // cannot fold — the sampled token, which the shadow commits
-            // unknown — and the CUDA shell reads it off the ring the previous
-            // epilogue wrote. Everything else the pass's epilogue carries is
-            // arithmetic over the KV length, and folding it here is what
-            // gives the fire a page table: the RUNTIME owns this working set's
-            // physical pages, so a submission that stated none would leave
-            // the engine deriving a block formula for a pool it does not
-            // allocate from.
-            //
-            // An all-placeholder geometry is the other reading — an engine
-            // that resolves the WHOLE envelope from its own page segments,
-            // which is what `fire::envelope::compose` did one generation back
-            // — and no shell in this workspace owns a page segment to resolve
-            // one from. `DecodeEnvelope::template` was that reading written
-            // down, and it is deleted rather than kept as an unreachable
-            // alternative.
+            // A decode-envelope pass carries exactly one value the host
+            // cannot fold: the sampled token, read off the ring the
+            // previous epilogue wrote.
             let device_resolved = if p.decode_envelope.is_some() {
                 PortMask::of(&[Port::EmbedTokens])
             } else {
@@ -1540,11 +1169,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
                 match geometry::map_geometry_evaluated_with(bound, &mut known, device_resolved) {
                     Ok((geometry, evaluated)) => {
-                        // In-band -1 skips are the DEVICE-resolved contract
-                        // (rank compaction happens in the compose kernels); a
-                        // host-wire fire would embed the sentinel as a real
-                        // token. Loud rejection, never silent execution
-                        // (RV-12).
+                        // In-band -1 skips are the device-resolved contract;
+                        // a host-wire fire would embed the sentinel as a
+                        // real token.
                         if device_resolved.is_empty() && geometry.token_ids.contains(&u32::MAX) {
                             return Ok(Err(
                                 "pipeline: fire geometry: in-band -1 skip tokens require a \
@@ -1573,6 +1200,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             crate::probe_fire_record!(submit_probe.geometry_us, geometry_clock.elapsed());
             let accesses = p.instance.program.channel_accesses.clone();
             let reads_attn_score = p.instance.program.reads_attn_score;
+            let reads_mtp_logits = p.instance.program.reads_mtp_logits;
             (
                 geometry,
                 p.cells.clone(),
@@ -1588,74 +1216,48 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 accesses,
                 p.decode_envelope.clone(),
                 reads_attn_score,
+                reads_mtp_logits,
             )
         };
         let mut req = crate::engine::FireRequest::default();
         let readout_defaulted = geometry.readout_defaulted;
         geometry.apply_to(&mut req);
-        // A BOUND PASS *IS* A GUEST PROGRAM AT THE FIRE'S BOUNDARY (`palo
-        // B2`, design §9). Every fire that comes through here fires a
-        // `BoundForwardPass` — an instance whose channels the engine carved
-        // and whose stages it compiled — so the fire carries an attachment
-        // for it and the engine runs its pass after the forward, with this
-        // lane's logits row bound as the `logits` intrinsic. The requests
-        // that do NOT come through here (a prebuilt rider, a geometry
-        // lowering under test) leave the flag false and submit exactly the
-        // fire they always did.
+        // Every fire through here fires a `BoundForwardPass`: the engine
+        // runs its pass after the forward with this lane's logits row bound
+        // as the `logits` intrinsic.
         req.boundary_program = true;
-        // **AND A PROGRAM THAT READS THE SCORES IS A CAPTURING LANE**
-        // (`.wiki/alto/attn-score.md` §4, wave S1). The capture bit was
-        // hard-`false` on every path in this crate under a note saying the
-        // port vocabulary named no capture port — and the note was right and
-        // the port was never the answer. The observability contract is that
-        // the graph writes and the EPILOGUE reads, so the ask and the read
-        // are one act: an attached program that materializes
-        // `IntrinsicId::AttnScore` is asking, and one that does not is not.
-        //
-        // Stamped on every lane of the member, because a member firing three
-        // row groups is one bound instance running one pass and its epilogue
-        // is pointed at the first lane's block — but the capture arm writes
-        // whichever lanes the fire seats, and `Fault::ScoreWord` refuses a
-        // lane whose word and whose ask disagree, so the two readings have to
-        // be the same reading.
+        // A program that materializes `IntrinsicId::AttnScore` is a
+        // capturing lane, stamped on every lane of the member.
         if p_reads_attn_score {
             for lane in &mut req.lanes {
                 lane.captures_scores = true;
             }
         }
-        // A CLASS AND NOT A BOOL, and the bool beside it is gone (alto E).
-        // `device_resolved_geometry` said the same fact with two values where
-        // there are three ways to read a fire's geometry; its only readers
-        // were the deleted co-batching rules, and `fire_device_geometry`
-        // stamps the third class this path cannot reach.
+        // A program that materializes `IntrinsicId::MtpLogits` is a drafting
+        // lane: the fact selects the model text's draft arm for its rows, and
+        // the engine binds the `mtp` seam's rectangle to the intrinsic.
+        if p_reads_mtp_logits {
+            for lane in &mut req.lanes {
+                lane.drafts = true;
+            }
+        }
+        // A class, not a bool: `fire_device_geometry` stamps the third class
+        // this path cannot reach.
         req.geometry = if decode_envelope.is_some() {
             GeometryClass::DecodeEnvelope
         } else {
             GeometryClass::Host
         };
         req.single_token_mode = req.lanes.iter().all(|lane| lane.tokens.len() == 1);
-        // tart (0.3 re-port step 2): the pass's layer truncation rides
-        // every fire; the scheduler's region table carries it to the
-        // engine as per-region k.
+        // The pass's layer truncation rides every fire; the scheduler's
+        // region table carries it to the engine as per-region k.
         req.max_layers = {
             let p = ctx.resources().get(&fwd)?;
             p.max_layers
         };
-        // **THE RUN SCAN** (`.wiki/alto/media-door.md` §3, wave MD-A).
-        //
-        // THE TOKENS ARE THE LEDGER AND THIS IS THE AUDIT. A span entered the
-        // sequence as the run `image.tokens()` answered; the handle crossed
-        // again beside it through `forward-pass.media` carrying only the
-        // payload; nothing said where the two meet. So the host finds the
-        // model's reserved placeholder runs in the submitted tokens — a
-        // tokenizer never emits that id from text — and matches them to the
-        // attached spans IN ORDER, refusing every disagreement by name.
-        //
-        // It stands HERE, at the first instant both halves are final: the
-        // tokens are the lanes' only once `geometry.apply_to` has split them,
-        // and the spans are the pass's from the moment `media` was called. A
-        // scan any earlier would be a scan of half the fact, and any later
-        // would be after the fire had staged.
+        // The run scan finds the model's reserved placeholder runs in the
+        // submitted tokens and matches them to the attached media spans in
+        // order, refusing any disagreement.
         let media_spans = ctx.resources().get(&fwd)?.bindings.media.clone();
         let carries_media = !media_spans.is_empty();
         let matched = {
@@ -1664,10 +1266,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let scanned = if carries_media {
                 crate::pipeline::media::scan(&lane_tokens, &media_spans)
             } else {
-                // THE OTHER DIRECTION, and it costs one pass over the tokens
-                // on a text-only fire: a run with no span behind it would
-                // otherwise embed the pad id as an ordinary token and decode
-                // as nonsense nothing named.
+                // Text-only fire: a run with no span behind it would embed
+                // the pad id as an ordinary token.
                 crate::pipeline::media::refuse_orphan_runs(
                     &lane_tokens,
                     crate::model::media_pad(),
@@ -1679,29 +1279,17 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(refusal) => return Ok(Err(format!("pipeline: {refusal}"))),
             }
         };
-        // The mask is on the FIRE when it stays device-resident, and there is
-        // no `Lane::mask` to read it back off — so the class is read here,
-        // before `apply_to` consumes it, and handed to the word stamp.
+        // The mask is on the fire when it stays device-resident, with no
+        // `Lane::mask` to read it back off — so the class is read here,
+        // before `apply_to` consumes it.
         let fire_wide_mask = matches!(attn_mask, geometry::FireAttnMask::Device);
         if let Err(error) = attn_mask.apply_to(&mut req) {
             return Ok(Err(format!("pipeline: fire attention mask: {error}")));
         }
-        // THE LANES ARE FINISHED, so their words can be stated: rows from the
-        // geometry above, mask from the lowering just now (`palo B-word`), and
-        // the media fact from the scan above — multimodal §15's constraint,
-        // landing in the same commit as the verb that makes it reachable.
         stamp_lane_words(&mut req, fire_wide_mask, carries_media);
-        // **AND THE DOOR IS CUT** (media-door §6, wave MD-C). What stood here
-        // was `Refusal::EngineDoor` — a typed stop, refusing rather than
-        // dropping, because the rows the spans land in did not exist. They
-        // exist: `engine::fire::StepMedia` is the contract's parallel slice
-        // keyed by lane, `lane_media` answers it directly, and the request
-        // carries it to `scheduler::batch`, which rebases each row's lane onto
-        // the step it co-batches into.
-        //
-        // Everything above this line is unchanged and is MD-A's: the scan, its
-        // four refusals, and the word stamp. The attachment is the last act
-        // and it is a move, not a computation.
+        // `engine::fire::StepMedia` is the parallel slice keyed by lane;
+        // `scheduler::batch` rebases each row's lane onto its co-batched
+        // step.
         if !matched.is_empty() {
             let lane_rows: Vec<u32> = req
                 .lanes
@@ -1712,17 +1300,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         }
         crate::offload::try_encode(&mut req).await;
         // Resource preparation is independent of token position: realize the
-        // declaration once, back only its missing frontier, then snapshot the
-        // WorkingSet translation.
+        // declaration once, back only its missing frontier.
         let kv_clock = crate::scheduler::probe::ProbeClock::start();
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
         let ws = ctx.resources().get(&ws_res)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.engine);
-        // THE LANES' SEATS, and they stand here rather than beside the word
-        // stamp for one reason: the seat is the WORKING SET's, and the
-        // working set is resolved on the line above. Nothing between the two
-        // points touches `Lane::slot`, and everything after this reads a
-        // seated fire.
         if let Err(refusal) = stamp_lane_slots(&mut req, &stores, ws.id) {
             return Ok(Err(refusal));
         }
@@ -1769,20 +1351,15 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let engine = ws.engine;
         let pid = ctx.process_id();
         let quorum_pipeline_id = pipeline_scope.scheduler_id();
-        // Scope claim precedes acquisition (symmetric with the
-        // device-geometry path).
         if let Err(owner) = ws.claim_pipeline_scope(&pipeline_scope) {
             return Ok(Err(format!(
                 "pipeline: KV working set is already scoped to pipeline {owner:032x}"
             )));
         }
-        // Phase A: pure demand for both resources, holding nothing. Phase
-        // B: acquire the one grant (KV pages + RS slots — a fire never
-        // half-succeeds); the acquire awaits are the only awaits in this
-        // build, and the requester waits at the safe point with no pins, no
-        // lease, no open transaction. Phase C: prepare from the grant; if
-        // the demand drifted while waiting (a peer lane touched the same
-        // working set), recompute both demands and re-acquire, bounded.
+        // Phase A: pure demand, holding nothing. Phase B: acquire the one
+        // grant (KV pages + RS slots; never half-succeeds). Phase C: prepare
+        // from the grant, re-acquiring (bounded) if demand drifted while
+        // waiting.
         let rs_ws_ids = match bound_rs_working_set_ids(ctx, model, engine, &rs_reps)? {
             Ok(ids) => ids,
             Err(error) => return Ok(Err(error)),
@@ -1822,11 +1399,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Ok(grant) => grant,
                 Err(error) => return Ok(Err(error)),
             };
-            // The lease is the suspend seal: acquired AFTER any park (a
-            // parked ask must hold no lease, or the planner could never
-            // quiesce it) and BEFORE the prepare (so an eviction either
-            // sees this fire's lease and waits it out, or fenced first and
-            // this fire backs off to wait out the eviction).
+            // The lease is the suspend seal: acquired after any park (a
+            // parked ask must hold no lease) and before the prepare (so an
+            // eviction either sees this lease and waits it out, or fences
+            // first and this fire backs off to wait it out).
             let ws_guard = match ws.fire_lease() {
                 Ok(lease) => lease,
                 Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
@@ -1855,8 +1431,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             };
             let kvtxn = KvTxnGuard::new(model, engine, kvtxn);
             // Recurrent-state rows are lowered independently, in resolved
-            // request order. Their CoW copies ride the scheduler's typed
-            // pre-launch state copy so a copy failure rejects this fire
+            // request order; their CoW copies ride the scheduler's typed
+            // pre-launch state copy so a copy failure rejects the fire
             // before model execution.
             match prepare_bound_rs(
                 ctx,
@@ -1880,9 +1456,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
         };
         crate::probe_fire_record!(submit_probe.kv_prepare_us, kv_clock.elapsed());
-        // THE PAGE IDS BECOME THE ENGINE'S HERE, and this is the earliest
-        // instant they can: the mapping is only complete once this fire's own
-        // write targets are reserved (`map_lane_pages` argues it).
+        // Earliest instant the mapping is complete: this fire's own write
+        // targets are reserved only now.
         if let Err(refusal) = map_lane_pages(&mut req, &stores, ws.id) {
             return Ok(Err(refusal));
         }
@@ -1967,14 +1542,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
     }
 }
 
-/// The body behind the interface-level `forward.submit(on, slots)` —
-/// Vesuvius frame submission. Exactly `model.frame-size()` ordered slots;
-/// slot i executes in wave i; `none` is a no-op. At k = 1 a single-slot frame
-/// IS today's per-pass submit (identical semantics — a 1-slot frame runs the
-/// same unified FramePolicy path). At k > 1 the frame validates structurally (Section 5 of the
-/// design: staged / device-advanced / latest-value host-writer classes,
-/// static reader-capacity overflow prevention), then prepares and enqueues
-/// each slot in order under one frame stamp.
+/// Frame submission: exactly `model.frame-size()` ordered slots; slot i
+/// executes in wave i; `none` is a no-op. At k = 1 this is identical to a
+/// per-pass submit; at k > 1 the frame validates structurally, then prepares
+/// and enqueues each slot in order under one frame stamp.
 pub async fn submit_frame<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
@@ -2039,13 +1610,10 @@ pub async fn submit_frame<C: FireContext>(
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
         let outcome = submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await;
         if !matches!(outcome, Ok(Ok(()))) && index > 0 {
-            // Mid-frame failure: the fires already submitted stand and
-            // execute as a truncated frame; tell the scheduler how many
-            // exist so the frame can still seal. This must cover the host
-            // trap path too — returning through `?` without truncating
-            // strands the frame arrival-incomplete, and the wait-all gate
-            // then holds the whole fleet on a frame that can never
-            // complete (CONTENTION_FOLLOWUP §20.8).
+            // Mid-frame failure: fires already submitted stand and execute
+            // as a truncated frame; tell the scheduler how many exist so it
+            // can still seal (else the wait-all gate holds the fleet on a
+            // frame that can never complete).
             let first: Resource<ForwardPass> = Resource::new_borrow(fired[0].1);
             if let Ok(pass) = ctx.resources().get(&first)
                 && let Ok(bound) = pass.bound()
@@ -2066,14 +1634,8 @@ pub async fn submit_frame<C: FireContext>(
 
 /// `forward.park()`: leave the frame wait-set on `this` until it submits
 /// again. Consumes a frame seq so the exit orders against this pipeline's own
-/// submits — every frame submitted before it must seal first, which is what
-/// makes it legal to park with fires still outstanding.
-///
-/// Silent no-op when there is no wait-set to leave: `k == 1` never batches
-/// across pipelines (`submit_frame` bypasses stamping entirely there), and a
-/// closed pipeline has already left. The WIT signature returns nothing for
-/// the same reason — parking is a statement about the future, and there is no
-/// state in which it can fail to be true.
+/// submits, which is what makes it legal to park with fires still
+/// outstanding. Silent no-op when there is no wait-set to leave.
 pub fn park_frame<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
     if crate::scheduler::configured_frame_size() == 1 {
         return Ok(());
@@ -2087,11 +1649,9 @@ pub fn park_frame<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyh
     Ok(())
 }
 
-/// **STATIC ADMISSION FOR A FRAME** (alto design §1 article 4; survey §7 I8).
-///
-/// Walks the frame's steps in slot order and proves, against the channels'
-/// DECLARED capacities, that no step of this frame can meet a gate the device
-/// would refuse. Three classes, three proofs:
+/// Static admission for a frame: walks the frame's steps in slot order and
+/// proves, against the channels' declared capacities, that no step can meet
+/// a gate the device would refuse. Three classes, three proofs:
 ///
 /// ```text
 /// device-only ring   occupancy in SLOT ORDER: reserved backlog plus this
@@ -2102,41 +1662,13 @@ pub fn park_frame<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyh
 ///                    fires, minus host-consumed, plus this frame's writes —
 ///                    fits the capacity
 /// ```
-///
-/// **THIS IS WHAT MAKES RETRY DELETABLE.** Article 4: everything a device
-/// gate could refuse is proved impossible here, so a surviving refusal past
-/// this door is a contract violation and not a replay. The engine lane no
-/// longer sleeps on `Exhausted`, and a readiness miss at an attached pass is
-/// a loud fault naming the instance and the channel
-/// (`engine_cuda::serve::committed_or`).
-///
-/// # What stood here and is gone (wave E)
-///
-/// A fourth rule refused a frame whose slot *j* consumed a channel an earlier
-/// slot published, whenever slot *j* "resolved its descriptors on the HOST".
-/// Its entire justification was a C++ engine: `FramePrepare` ran every step's
-/// host work at frame entry, and a step whose descriptor ports were
-/// device-carried escaped that only if `try_device_composed_template` in
-/// `crates/engine-cuda/csrc/src/pipeline/dispatch.cu` accepted it — so the
-/// rule enumerated the two RS shapes and the one geometry shape that template
-/// refused, and reached into the recurrent store to ask whether a row was
-/// buffered. Neither the file nor the template nor the frame-entry host pass
-/// exists in this tree: `Cuda::submit` drives `prepare`/`enqueue`/`settle` per
-/// step, and a step's descriptor ports are read in ITS prepare, off the
-/// committed front of the rings the step before it advanced. The
-/// `EngineSpec::resolves_geometry_per_step` capability that let a backend opt
-/// out of the rule is deleted with it — no shell in the workspace answered
-/// anything but `false`, and the rule the `false` selected is gone.
 fn validate_frame<C: FireContext>(
     ctx: &mut C,
     k: usize,
     fired: &[(u32, u32)],
 ) -> Anyhow<Result<(), String>> {
-    // The walk is separated from the resource lookup so it can be tested
-    // against channels rather than against a wasm store: `prove_frame_admissible`
-    // is the proof and this is the gather. One `Arc` clone per channel per
-    // slot, at k <= 4 and a handful of channels — the same clone the use map
-    // made anyway.
+    // Separated from the resource lookup so it can be tested against
+    // channels rather than a wasm store.
     let mut slots: Vec<SlotAccess> = Vec::with_capacity(fired.len());
     for &(_, rep) in fired {
         let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
@@ -2159,8 +1691,8 @@ struct SlotAccess {
     accesses: Vec<(bool, bool)>,
 }
 
-/// The proof [`validate_frame`] gathers for — see its doc for the three
-/// classes and why each one is what makes retry deletable.
+/// The proof [`validate_frame`] gathers for; see its doc for the three
+/// classes.
 fn prove_frame_admissible(k: usize, slots: &[SlotAccess]) -> Result<(), String> {
     /// One channel's part in this frame: how many steps take from it and how
     /// many put into it.
@@ -2190,23 +1722,10 @@ fn prove_frame_admissible(k: usize, slots: &[SlotAccess]) -> Result<(), String> 
             entry.consumes += usize::from(consume);
             entry.publishes += usize::from(publish);
 
-            // ── DEVICE-ONLY RING OCCUPANCY, WALKED IN SLOT ORDER. The
-            //    device publish gate admits a publish only while occupancy
-            //    stays below capacity (+1 when the same fire also consumes,
-            //    which is the same-fire-consume credit the counter form of
-            //    the ring-full test gives). An accepted frame that
-            //    structurally exceeds it would jam on the device with no
-            //    retry left to absorb it. Consumes not yet reserved by any
-            //    accepted fire grant no relief — this is a worst case, not a
-            //    schedule. Seeded descriptor channels are exempt: their
-            //    occupancy belongs to the seed protocol, not to the
-            //    reserved-ticket ledger.
-            //
-            //    The capacity is the CHANNEL's own declared capacity
-            //    (`ChannelCell::capacity`, set from the program's channel
-            //    registration at bind), and the starting pressure is
-            //    `device_ring_backlog()` — the reservations accepted fires
-            //    hold and have not settled.
+            // Device-only ring occupancy, walked in slot order: the device
+            // publish gate admits a publish only while occupancy stays below
+            // capacity (+1 on same-fire consume credit). Seeded descriptor
+            // channels are exempt.
             if consume || publish {
                 let guard = cell.lock().unwrap();
                 if guard.role == Some(HostRole::None) && !guard.seeded {
@@ -2236,13 +1755,9 @@ fn prove_frame_admissible(k: usize, slots: &[SlotAccess]) -> Result<(), String> 
         match cell.role {
             Some(HostRole::Writer) => {
                 if entry.publishes == 0 && entry.consumes > 0 {
-                    // ── HOST-WRITER, *staged* class: each consuming fire
-                    //    drains one host cell, and every one of them must
-                    //    already exist. A frame executes uninterrupted, so no
-                    //    mid-frame host `put` can arrive to make up a
-                    //    shortfall. The capacity here is not a ring size but
-                    //    an inventory: `writer_available_cells()` is what the
-                    //    guest has staged and not yet had taken.
+                    // Host-writer, staged class: each consuming fire drains
+                    // one host cell, and every one must already exist (a
+                    // frame executes uninterrupted).
                     let available = cell.writer_available_cells();
                     if available < entry.consumes as u64 {
                         return Err(format!(
@@ -2253,9 +1768,8 @@ fn prove_frame_admissible(k: usize, slots: &[SlotAccess]) -> Result<(), String> 
                         ));
                     }
                 } else if entry.publishes == 0 && entry.consumes == 0 {
-                    // ── HOST-WRITER, *latest-value* class: a control word the
-                    //    program only reads. One committed cell suffices; the
-                    //    host's `set` may replace it at any time.
+                    // Host-writer, latest-value class: a control word the
+                    // program only reads. One committed cell suffices.
                     if !cell.has_committed_front() {
                         return Err(format!(
                             "pipeline: channel {}: latest-value control word has \
@@ -2264,16 +1778,13 @@ fn prove_frame_admissible(k: usize, slots: &[SlotAccess]) -> Result<(), String> 
                         ));
                     }
                 }
-                // publishes > 0: *device-advanced* — the program carries an
+                // publishes > 0: device-advanced, the program carries an
                 // advance rule for it, so the host stages nothing.
             }
             Some(HostRole::Reader) if entry.publishes > 0 => {
-                // ── READER RING, WORST CASE. Overflow is prevented here and
-                //    never by back-pressure: the cells reserved by accepted
-                //    unsettled fires, minus what the host has consumed, plus
-                //    everything this frame writes, must fit the channel's
-                //    declared capacity. `reader_ring_pressure()` is the first
-                //    two numbers; `entry.publishes` is the third.
+                // Reader ring, worst case: cells reserved by accepted
+                // unsettled fires, minus host-consumed, plus this frame's
+                // writes, must fit the channel's declared capacity.
                 let (reserved_tail, consumed) = cell.reader_ring_pressure();
                 let needed = reserved_tail
                     .saturating_sub(consumed)
@@ -2299,10 +1810,10 @@ fn prove_frame_admissible(k: usize, slots: &[SlotAccess]) -> Result<(), String> 
     Ok(())
 }
 
-/// Compaction (Design-B lazy KV GC): move `n` token KV cells within `ws`,
-/// all layers, from (`src_page_ids[i]`, `src_tok_idx[i]`) -> (`dst_page_ids[i]`,
-/// `dst_tok_idx[i]`). The copy is submitted in pipeline order and awaited here,
-/// so no separate pending-move lifetime or recycle epoch exists.
+/// Compaction (lazy KV GC): move `n` token KV cells within `ws`, all layers,
+/// from (`src_page_ids[i]`, `src_tok_idx[i]`) -> (`dst_page_ids[i]`,
+/// `dst_tok_idx[i]`). Submitted in pipeline order and awaited here, so no
+/// separate pending-move lifetime or recycle epoch exists.
 pub async fn copy_into_inner<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
@@ -2343,12 +1854,10 @@ pub async fn copy_into_inner<C: FireContext>(
     }
     let ws_handle = ctx.resources().get(&ws)?.clone();
 
-    // The WIT contract passes WorkingSet-RELATIVE page indexes (guests
-    // never hold physical ids); translate through the flattened table so
-    // the move lands on exactly the physical pages the fires read/write.
-    // Translated at enqueue against the committed mapping: same-WS
-    // in-flight fires that could remap these pages (a CoW rebase) are the
-    // guest's ordering hazard, like any same-WS run-ahead write overlap.
+    // The WIT contract passes working-set-relative page indexes (guests
+    // never hold physical ids); translate through the flattened table.
+    // Translated at enqueue against the committed mapping — a same-WS
+    // in-flight fire that remaps these pages is the guest's ordering hazard.
     let (kv_move_dst_pages, kv_move_src_pages): (Vec<u32>, Vec<u32>) = {
         let stores = crate::store::registry::get(ws_handle.model, ws_handle.engine);
         if let Err(owner) = ws_handle.claim_pipeline_scope(&pipeline_scope) {
@@ -2404,16 +1913,8 @@ pub async fn copy_into_inner<C: FireContext>(
             Ok(lease) => break lease,
             Err(crate::store::kv::working_set::FireLeaseError::Fenced) => {
                 // The planner is suspending this working set; wait out the
-                // eviction and retry against the restored pages
-                // (`wait_resident` posts the leave before parking).
-                //
-                // DIVERGENCE, kept deliberately un-"fixed": unlike the
-                // fire-submit back-off (`settle_and_wait_resident`), this
-                // park does not settle the process's pipeline tails first.
-                // An unsettled fire elsewhere keeps its lease, and the
-                // eviction's quiescence then depends on another finalizer —
-                // a liveness question under watch (CONTENTION_FOLLOWUP.md
-                // §16.2), not a cleanup-pass alignment.
+                // eviction and retry. Unlike `settle_and_wait_resident`,
+                // this does not settle the process's pipeline tails first.
                 let pid = ctx.process_id();
                 let Some(planner) = crate::planner::planner() else {
                     return Ok(Err(
@@ -2454,10 +1955,9 @@ pub async fn copy_into_inner<C: FireContext>(
 
 /// Shared close/drop body. Close is the sole end-of-stream verb: it rejects
 /// later submissions and releases the scheduler wait-set immediately. Already
-/// settled FIFO entries are finalized opportunistically, but close never waits
-/// for an unsettled fire: a full reader ring may require a post-close `take`
-/// before the next submitted fire can settle. Channel reads and process
-/// teardown retain the FIFO and finish that drain without cancelling work.
+/// settled FIFO entries are finalized opportunistically, but close never
+/// waits for an unsettled fire — a full reader ring may require a post-close
+/// `take` before the next submitted fire can settle.
 async fn pipeline_close_inner<C: FireContext>(
     ctx: &mut C,
     this: &Resource<Pipeline>,
@@ -2474,9 +1974,6 @@ async fn pipeline_close_inner<C: FireContext>(
         if first_close {
             crate::scheduler::worker::notify_lane_close(pipeline_id, None);
         }
-        // Measured at conc 512: 3 us p50 with zero pending fires, i.e. the
-        // guest's run-ahead window is always already settled by the time it
-        // closes. Close is not a boundary cost.
         drain_settled(ctx, Some(&fires)).await?;
     }
     Ok(())
@@ -2517,9 +2014,9 @@ pub async fn working_set_copy_into<C: FireContext>(
 }
 
 /// Pop and finalize pipeline ops whose completions have already settled,
-/// without blocking (plan §6): submit and take/read entry call this so
-/// KV/RS transaction pins stay bounded by run-ahead depth while value
-/// waiting rides the channel wait slots. Returns whether anything drained.
+/// without blocking: submit and take/read entry call this so KV/RS
+/// transaction pins stay bounded by run-ahead depth while value waiting
+/// rides the channel wait slots. Returns whether anything drained.
 pub async fn drain_settled<C: FireContext>(
     ctx: &mut C,
     fires: Option<&PendingFires>,
@@ -2540,12 +2037,10 @@ pub async fn drain_settled<C: FireContext>(
     }
 }
 
-/// Pop and finalize EVERY pending op of one pipeline FIFO, in submit order,
+/// Pop and finalize every pending op of one pipeline FIFO, in submit order,
 /// under the queue's finalize guard — the full-drain sibling of
-/// [`drain_settled`], shared by the residency gate, forward-pass drop, and
-/// process teardown. `continue_on_error` is the teardown policy (log and
-/// keep draining — the table is about to drop); the strict form propagates
-/// the first failure.
+/// [`drain_settled`]. `continue_on_error` is the teardown policy (log and
+/// keep draining); the strict form propagates the first failure.
 pub(crate) async fn finalize_all<C: FireContext>(
     ctx: &mut C,
     fires: &PendingFires,
@@ -2623,10 +2118,9 @@ pub(crate) fn complete_finalize<C: FireContext>(ctx: &mut C, finalized: Finalize
 }
 
 /// Finalize an ordinary host-geometry op without a `ResourceTable` borrow.
-/// Used by the idle-park drain (accessor-based long host awaits), which runs
-/// before the scheduler freeze barrier. Device-geometry fires are excluded
-/// because their lease reclamation lives on the `ForwardPass` resource and
-/// still requires `FireContext`.
+/// Used by the idle-park drain, before the scheduler freeze barrier.
+/// Device-geometry fires are excluded: their lease reclamation lives on the
+/// `ForwardPass` resource and still requires `FireContext`.
 pub(crate) async fn finalize_op_detached(op: PendingOp) -> Anyhow<()> {
     debug_assert!(op.is_preemption_detachable());
     let FinalizeOutcome { action, ws_guard } = finalize_op_await(op).await?;
@@ -2675,10 +2169,10 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
 
     let (kv_failure, rs_failure) = {
         let stores = crate::store::registry::get(model, engine);
-        // RS transactions have no Drop rollback. Settle them before the only
-        // await below so process cancellation cannot leak their slots. The
-        // mapping is already published (fail-stop either way), so settlement
-        // cannot fail and does not depend on `success`.
+        // RS transactions have no Drop rollback: settle them before the only
+        // await below so process cancellation cannot leak their slots.
+        // Settlement doesn't depend on `success` — the mapping is already
+        // published.
         let rs_failure: Option<String> = if rstxn.is_some() {
             let mut rs_store = stores.rs.lock().unwrap();
             rs::settle(&mut rs_store, rstxn);
@@ -2700,17 +2194,16 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         (kv_failure, rs_failure)
     }; // store locks released before the contention drain re-locks pools
 
-    // The fire's sequence retired: recycled slots (aborts, CoW'd tails,
-    // collected suffixes) are allocatable now — wake parked asks. This is
-    // also the planner's per-fire quiescence event: the lease this fire
-    // held has just released.
+    // The fire's sequence retired: recycled slots are allocatable now, and
+    // this is the planner's per-fire quiescence event (the fire's lease has
+    // just released).
     if let Some(planner) = crate::planner::planner() {
         planner.pages_freed();
     }
 
-    // Values are already visible through the release-published tail words
-    // (plan §4.5) — resolving the fire only classifies success and settles
-    // the transactions above.
+    // Values are already visible through the release-published tail words;
+    // resolving the fire only classifies success and settles the
+    // transactions above.
     let failure_reason = prior_failure
         .or_else(|| {
             result
@@ -2776,30 +2269,22 @@ fn reclaim_pending_device_grant<C: FireContext>(ctx: &mut C, fwd: &Resource<Forw
     }
 }
 
-/// Device-geometry fire (Track B): the pass's [B,P] geometry is
-/// DEVICE-produced (the program traces `page_indptr = CumSum(np)` + packed
-/// live pages in-graph) and the engine resolves it pre-forward, so the host
-/// neither replays the epilogue arithmetic nor projects per-lane KV. The
-/// runtime leases `B` fresh physical pages, delivers them to the program as a
-/// host-put on the `fresh` channel, submits the fire prebuilt (the host wire
-/// geometry stays empty — `geometry::map_geometry_evaluated_with` maps what the
-/// engine resolved), and fires it RUN-AHEAD onto the pipeline FIFO (unlike
-/// the deleted synchronous host-replay beam branch).
-/// The per-fire arena/write txns ride the `PendingFire`; `finalize_op`
-/// commits/aborts them and reclaims continuing heirs' unused grants (w_cont).
+/// Device-geometry fire: the pass's [B,P] geometry is device-produced and the
+/// engine resolves it pre-forward, so the host neither replays the epilogue
+/// arithmetic nor projects per-lane KV. The runtime leases `B` fresh physical
+/// pages, delivers them via a host-put on the `fresh` channel, submits the
+/// fire prebuilt, and runs it ahead onto the pipeline FIFO. Per-fire
+/// arena/write txns ride the `PendingFire`; `finalize_op` commits/aborts
+/// them and reclaims continuing heirs' unused grants.
 async fn fire_device_geometry<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
 ) -> Anyhow<Result<(), String>> {
-    // **A DEVICE-RESOLVED GEOMETRY CANNOT CARRY MEDIA, AND SAYS SO FIRST**
-    // (media-door §3). This path's token ids never reach the host — the
-    // engine resolves the embed port in-graph — so there is no submitted
-    // token list to scan for placeholder runs, and the door's whole safety
-    // argument is that the correspondence is CHECKED rather than promised.
-    // Taking the spans anyway would be taking the guest's word for exactly
-    // the thing the scan exists to not take on trust.
+    // A device-resolved geometry cannot carry media: its token ids never
+    // reach the host, so there is no submitted token list to scan for
+    // placeholder runs.
     if !ctx.resources().get(&fwd)?.bindings.media.is_empty() {
         return Ok(Err(
             "pipeline: MediaDeviceGeometry: this pass attached media spans \
@@ -2809,12 +2294,8 @@ async fn fire_device_geometry<C: FireContext>(
                 .to_string(),
         ));
     }
-    // Contention-probe marker: when the guest's WIT call reached the host
-    // (vs when its build reaches `acquire` — the delta is the build
-    // preamble, including the settlement drain below).
-    // Wire each of this pass's channels at this pipeline's FIFO (§3.4: all
-    // passes binding a channel must submit on ONE pipeline — the entire
-    // ordering/FIFO correctness argument).
+    // Wire each of this pass's channels at this pipeline's FIFO: all passes
+    // binding a channel must submit on one pipeline.
     let (pipe_fires, pipeline_failure, pipeline_scope) = {
         let pipeline = ctx.resources().get(&this)?;
         if pipeline.scope.is_closed() {
@@ -2826,7 +2307,7 @@ async fn fire_device_geometry<C: FireContext>(
             pipeline.scope.clone(),
         )
     };
-    // Non-blocking settlement drain (plan §6), as in the ordinary submit.
+    // Non-blocking settlement drain, as in the ordinary submit.
     drain_settled(ctx, Some(&pipe_fires)).await?;
     if let Some(error) = pipeline_failed(&pipeline_failure) {
         return Ok(Err(error));
@@ -2861,18 +2342,11 @@ async fn fire_device_geometry<C: FireContext>(
         }
     }
 
-    // Grant B logical slots and size the physical demand — DevGeo STAYS in
-    // the resource table throughout (no take/put-back dance); every error
-    // path reverts the lease grant through `reclaim_pending_device_grant`.
-    // The lease grant is purely logical (free-list reuse, then fresh
-    // logical reserves) — it can never exhaust the pool, so it runs ONCE;
-    // only the physical prepare below retries under contention.
+    // Grant B logical slots and size the physical demand; every error path
+    // reverts the lease grant through `reclaim_pending_device_grant`.
     // A pool-owned pass resolves its own write targets in-graph, so the host
-    // cannot name them: materialize the program's declared WRITABLE span and let
-    // the translation cover every slot the device might pick. The declaration is
-    // the containment promise — preparing outside it would copy-on-write a
-    // shared prefix the program never touches. Resolved before the `devgeo`
-    // borrow below, which would otherwise alias the pass's declaration.
+    // materializes the program's declared writable span instead, to cover
+    // every slot the device might pick.
     let pooled = ctx
         .resources()
         .get(&fwd)?
@@ -2895,9 +2369,8 @@ async fn fire_device_geometry<C: FireContext>(
                     "pipeline: pool-owned device geometry: {error}"
                 )));
             }
-            // Not pooled: the declaration is not needed to place writes, so a
-            // span that will not resolve is not fatal here — it only costs the
-            // containment bound below.
+            // Not pooled: a span that won't resolve isn't fatal here — it
+            // only costs the containment bound below.
             Err(_) => None,
         }
     };
@@ -2918,11 +2391,9 @@ async fn fire_device_geometry<C: FireContext>(
         let fresh_dense = devgeo.fresh_dense;
         let devgeo_b = devgeo.b;
 
-        // Grant B slots: lease free-list first, then fresh logical
-        // reserves. Purely logical — this can never exhaust the pool, so
-        // it runs ONCE; only the physical prepare below retries under
-        // contention. A pool-owned pass resolves its own write targets
-        // in-graph, so it grants nothing.
+        // Grant B slots: lease free-list first, then fresh logical reserves.
+        // Purely logical, so it runs once (only the physical prepare below
+        // retries). A pool-owned pass grants nothing.
         let grant_slots = if devgeo.pooled {
             Vec::new()
         } else {
@@ -2945,10 +2416,9 @@ async fn fire_device_geometry<C: FireContext>(
         (grant_slots, write_indexes, fresh_dense, devgeo_b)
     };
 
-    // Device geometry resolves B request rows in-graph. Validate the bound
-    // RS list against that resolved arity before the launch and prepare one
-    // folded target per row. The zero-valued `qo_indptr` carries only the
-    // known row count; the engine still resolves its values in-graph.
+    // Device geometry resolves B request rows in-graph; the zero-valued
+    // `qo_indptr` carries only the known row count, since the engine still
+    // resolves its values in-graph.
     let resolved_qo_indptr = vec![0; devgeo_b + 1];
     let rs_ws_ids = match bound_rs_working_set_ids(ctx, ws.model, ws.engine, &rs_reps)? {
         Ok(ids) => ids,
@@ -2961,11 +2431,8 @@ async fn fire_device_geometry<C: FireContext>(
     // awaits in this build; nothing physical is held. Phase C: prepare from
     // it; on stale demand recompute both figures and re-acquire, bounded.
     let mut attempts = 0;
-    // `pages` WAS READ ONLY BY THE WIRE FORM'S `last_page_len`: a
-    // device-geometry fire leases pages and the DEVICE picks which of them a
-    // token lands in, so the host's `kv_last_page_lens` for it was a guess
-    // dressed as a fact (`if pages.is_empty() { 0 } else { page_size }`).
-    // `KvDelta` has no seat for a guess.
+    // `_pages` is unused: the device picks which leased page a token lands
+    // in, so the host cannot state a last-page-length for it.
     let (ws_guard, _pages, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
         let kv_demand =
             match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
@@ -3081,11 +2548,9 @@ async fn fire_device_geometry<C: FireContext>(
     let rstxns = RsTxnsGuard::new(ws.model, ws.engine, rs_prepared.txn.take());
 
     // Deliver the fresh grant to the program as a direct put on its `fresh`
-    // channel — a shared-ring write the engine pulls before the pass (plan
-    // §4.2/§4.3). The grants are WorkingSet-RELATIVE indexes — the
-    // program's in-graph geometry stays logical end-to-end and the prepared
-    // write above backs the physical pages behind it. This also matches the
-    // bind-time seed (`reserve(b)`), which was already logical.
+    // channel. The grants are working-set-relative indexes: the program's
+    // in-graph geometry stays logical end-to-end, backed by the prepared
+    // write above.
     let (completion, instance_id, scheduler, cells, fwd_rep, accesses) = {
         let p = ctx.resources().get_mut(&fwd)?;
         let bytes: Vec<u8> = grant_slots.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -3122,20 +2587,11 @@ async fn fire_device_geometry<C: FireContext>(
         "device-geometry fire always holds a KV transaction"
     );
 
-    // Device geometry and mask provenance are NOT independent, which is what
-    // the previous version of this comment had wrong. For a device-geometry
-    // instance the engine's descriptor resolver reads the `AttnMask` channel
-    // cell on EVERY fire — that is what the class means — so lowering a
-    // host-KNOWN mask to wire BRLE here reports the same mask twice, and the
-    // engine fails the step loud:
-    //
-    //   ptir: structured mask pack collides with staged wire custom masks
-    //   structured=[kind=3 sink=2 window=4 key_len=48] dense_mask_bytes=4
-    //
-    // Fire 0 is exactly where it bites: the mask arrives as a SEED, so the
-    // host shadow knows it and took the wire path, while the seed is already
-    // in the device cell for the resolver to read. Bind the whole pass to the
-    // channel instead — one mask, one reader.
+    // For a device-geometry instance, the engine's descriptor resolver reads
+    // the `AttnMask` channel cell on every fire — that is what the class
+    // means — so lowering a host-known mask to wire BRLE here would report
+    // the same mask twice and the engine refuses the step. Bind the whole
+    // pass to the channel instead: one mask, one reader.
     let mask_qo_indptr: Vec<u32> = (0..resolved_qo_indptr.len() as u32).collect();
     let attn_mask = {
         let p = ctx.resources().get(&fwd)?;
@@ -3162,22 +2618,13 @@ async fn fire_device_geometry<C: FireContext>(
         }
     };
 
-    // A DEVICE-GEOMETRY FIRE STATES ITS ROW SPLIT AND NOTHING ELSE. The wire
-    // plan carried `qo_indptr` — a CSR whose only content here was "this many
-    // lanes, one row each" — because the engine read the geometry out of a
-    // channel the device wrote and the CSR was the only shape the host still
-    // had to state. Lanes say it directly: one lane per entry, and its tokens
-    // are the ones the device will resolve.
+    // A device-geometry fire states its row split and nothing else: one lane
+    // per entry, tokens resolved by the device.
     let mut req = crate::engine::FireRequest {
-        // As the host-geometry path above: this fire is a bound pass, so its
-        // guest program runs at the boundary.
         boundary_program: true,
-        // `Lane::word` is left at its default here and stamped below, once
-        // the mask has lowered — see `stamp_lane_words`, which is the one
-        // place either path states a word. `Lane::slot` is defaulted for the
-        // same shape of reason and stamped at the same place by
-        // `stamp_lane_slots`: a seat belongs to the working set, and B lanes
-        // of one beam are B sequences that each need one.
+        // `Lane::word` and `Lane::slot` are left at their defaults here and
+        // stamped below by `stamp_lane_words`/`stamp_lane_slots`, once the
+        // mask has lowered and the working set is known.
         lanes: resolved_qo_indptr
             .windows(2)
             .map(|span| ::engine::Lane {
@@ -3195,54 +2642,28 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
-    // The same stamp as the wire path, for the same reason and at the same
-    // point: rows from the lanes above, mask from the lowering just now.
-    //
-    // **AND `false` IS THE ONLY WORD THIS PATH CAN STATE** (media-door §3). A
-    // device-geometry fire's token ids are resolved ON THE DEVICE — the lanes
-    // above are built with `vec![0; rows]` — so there is no host-side token
-    // list to scan for placeholder runs, and a media submission here could
-    // only be taken on the guest's word. `fire_device_geometry`'s entry
-    // refuses that combination by name, so by this line the submission
-    // carries no spans and `false` is a fact rather than a default.
+    // `false` is the only word this path can state: token ids are resolved
+    // on the device, so there is no host-side token list to scan (this entry
+    // point already refused a media binding).
     stamp_lane_words(&mut req, fire_wide_mask, false);
-    // And the same seating, from the same owner: this pass's working set.
-    // A device-geometry fire resolves its ROW SPLIT on the device and its
-    // seats here, because a seat is not geometry — it is which sequence each
-    // row group IS, which only the host knows (`stamp_lane_slots`).
+    // A device-geometry fire resolves its row split on the device but its
+    // seats here: a seat is which sequence each row group is.
     if let Err(refusal) = stamp_lane_slots(&mut req, &stores, ws.id) {
         reclaim_pending_device_grant(ctx, &fwd);
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
     }
-    // AND THE TABLE THE ENGINE RESOLVES THIS PASS'S PAGE REFERENCES THROUGH.
-    // The host path's `map_lane_pages` has no work here — a device-geometry
-    // lane's `KvDelta::pages` is empty, because its pages are in a channel —
-    // so this is where the same translation crosses instead. See
-    // `stamp_lane_translation`.
+    // A device-geometry lane's `KvDelta::pages` is empty (its pages live in
+    // a channel), so the page table crosses via `stamp_lane_translation`.
     if let Err(refusal) = stamp_lane_translation(&mut req, &stores, ws.id) {
         reclaim_pending_device_grant(ctx, &fwd);
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
     }
-    // The CLASS this fire is, said on the wire.
-    //
-    // A POOLED device-geometry fire states its pages in a channel and picks a
-    // subset of them in-graph, so there is nothing for the engine to read in
-    // the wire plan -- and until this line there was nothing in the wire
-    // TABLES either: `scheduler::batch` stamps from the request, this path
-    // never set anything, and the fire went out as class 0 (`Host`). Every
-    // portable engine then looked for geometry in the plan, found none, and
-    // refused with `no page span in a CSR of 0 entries` -- a true statement
-    // about a plan that was never the place to look. The runtime's own log
-    // ("executes as a pool-owned device-geometry pass") had already named the
-    // class; it just never travelled.
-    //
-    // The NON-pooled device-geometry fire (the Track B page lease) keeps
-    // class 0 deliberately. It is what CUDA runs today, its engine resolves
-    // geometry from the device-composed template whatever the wire says, and
-    // its scheduling was measured with the stamp it has. Nothing here is an
-    // argument for moving it.
+    // A pooled device-geometry fire states its pages in a channel and picks
+    // a subset in-graph, so the engine needs the class stamped explicitly.
+    // The non-pooled case keeps class 0 (`Host`): its engine resolves
+    // geometry from the device-composed template regardless.
     if ctx
         .resources()
         .get(&fwd)?
@@ -3323,8 +2744,8 @@ async fn fire_device_geometry<C: FireContext>(
 }
 
 /// Point each of a pass's channels at `pipe_fires` (the feeding pipeline's
-/// FIFO), enforcing the same-pipeline invariant (§3.4). Returns `Ok(Err(..))`
-/// if a channel is already bound to a DIFFERENT pipeline.
+/// FIFO), enforcing the same-pipeline invariant. Returns `Ok(Err(..))` if a
+/// channel is already bound to a different pipeline.
 fn wire_channels_to_pipeline<C: FireContext>(
     ctx: &mut C,
     fwd: &Resource<ForwardPass>,
@@ -3356,10 +2777,9 @@ fn wire_channels_to_pipeline<C: FireContext>(
     Ok(Ok(()))
 }
 
-/// Device-geometry per-fire page reclaim: read the harvested `w_cont`
-/// (`[B]` bool: heir(true)/fork(false)) from its bound mirror, reclaim the
-/// continuing heirs' UNUSED fresh page grants into the lease free-list, and
-/// free those ws slots. No-op for a non-device-geometry pass.
+/// Device-geometry per-fire page reclaim: read the harvested `w_cont` (`[B]`
+/// bool: heir/fork) from its bound mirror, reclaim the continuing heirs'
+/// unused fresh page grants, and free those ws slots. No-op otherwise.
 fn reclaim_device_geometry_grants<C: FireContext>(ctx: &mut C, fwd_rep: u32, instance_id: u64) {
     let res: Resource<ForwardPass> = Resource::new_borrow(fwd_rep);
     let Ok(p) = ctx.resources().get_mut(&res) else {
@@ -3384,8 +2804,7 @@ fn reclaim_device_geometry_grants<C: FireContext>(ctx: &mut C, fwd_rep: u32, ins
     let w_cont: Vec<bool> = w_cont.iter().map(|&byte| byte != 0).collect();
     // Reclaimed grants return to the lease free-list and are re-granted to
     // later fires; the store mapping keeps their committed pages until the
-    // working set discards or drops them (a discard here would shift live
-    // indexes under the pass — see the pass-drop note).
+    // working set discards or drops them.
     devgeo.lease.reclaim_after_fire(&w_cont);
 }
 
@@ -3407,96 +2826,6 @@ mod lifecycle_tests {
         fn process_id(&self) -> uuid::Uuid {
             self.id
         }
-    }
-
-    /// §8 guard contract, failure-injected: a prepared KV write whose fire
-    /// never submits is rolled back by the guard's Drop — every page
-    /// returns to the pool, exactly once, through the destructor.
-    #[tokio::test(flavor = "current_thread")]
-    async fn kv_txn_guard_drop_returns_every_prepared_page() -> anyhow::Result<()> {
-        let model = crate::store::registry::register_model(16, &[8], &[0]);
-        let stores = crate::store::registry::get(model, 0);
-        let (ws, before) = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
-            let ws = kv.create_working_set();
-            kv.reserve(ws, 2).unwrap();
-            (ws, kv.available_pages())
-        });
-        // Reserve pages as a grant would, lend them to the prepare, then
-        // drop the armed guard without submitting.
-        let (txn, leftover) = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
-            let mut granted = kv.reserve_device_pages(3).expect("pool has pages");
-            let (_, txn) =
-                kv::realize_declaration_reserved(kv, ws, 0..2, &mut granted).expect("realize");
-            let txn = kv.ensure_backed_reserved(ws, 2, &mut granted).map(|_| txn);
-            (txn.expect("backed"), granted)
-        });
-        let guard = KvTxnGuard::new(model, 0, txn);
-        // The surplus page returns through the store, the prepared pages
-        // through the guard's abort — nothing needs a hand-written path.
-        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
-            kv.release_device_reservation(leftover);
-        });
-        drop(guard);
-        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
-            let epoch = kv.current_epoch();
-            kv.release_working_set(ws, epoch);
-            kv.retire_idle();
-            assert_eq!(
-                kv.available_pages(),
-                before,
-                "every page returned exactly once"
-            );
-        });
-        Ok(())
-    }
-
-    /// The RS contract under publish-at-prepare: the guard SETTLES rather
-    /// than rolls back. The folded slot the prepare adopted stays owned by
-    /// the working set (fail-stop, as for KV), the unconsumed reservation
-    /// returns immediately, and settling releases the in-flight hold so a
-    /// later release retires everything.
-    #[tokio::test(flavor = "current_thread")]
-    async fn rs_txns_guard_drop_settles_without_rolling_back_the_mapping() -> anyhow::Result<()> {
-        let model = crate::store::registry::register_model(16, &[4], &[4]);
-        let stores = crate::store::registry::get(model, 0);
-        let (txn, ws, before) = {
-            let mut store = stores.rs.lock().unwrap();
-            let ws = store.create_working_set(crate::store::rs::RsGeometry {
-                state_size: 64,
-                buffer_page_tokens: 4,
-                fold_granularity: 1,
-            });
-            let before = store.available_slots();
-            let mut granted = store.reserve_slots(2).expect("slots available");
-            let prepared =
-                rs::prepare_many_reserved(&mut store, &[ws], &rs::RsPlan::Fold, &mut granted)
-                    .expect("prepare");
-            let txn = prepared.txn;
-            store.release_slot_reservation(granted);
-            assert!(
-                store.folded_slot(ws).expect("live working set").is_some(),
-                "prepare publishes the folded slot before the fire is submitted"
-            );
-            (txn, ws, before)
-        };
-        drop(RsTxnsGuard::new(model, 0, txn));
-        {
-            let mut store = stores.rs.lock().unwrap();
-            assert_eq!(
-                store.available_slots(),
-                before - 1,
-                "the published folded slot stays owned by the working set"
-            );
-            let epoch = store.current_epoch();
-            store.release_working_set(ws, epoch);
-            store.retire_idle();
-            assert_eq!(
-                store.available_slots(),
-                before,
-                "settling released the in-flight hold, so release retires everything"
-            );
-        }
-        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3542,18 +2871,8 @@ mod lifecycle_tests {
     }
 }
 
-/// **STATIC ADMISSION, PROVED AGAINST CHANNELS** (alto E; design §1 article 4,
-/// survey §7 I8).
-///
-/// These drive [`prove_frame_admissible`] — the half of `validate_frame` that
-/// is the proof rather than the resource lookup — because what article 4 asks
-/// is a statement about rings and capacities, not about a wasm store. Each
-/// test builds the channels a frame would touch, states what each slot does to
-/// them, and asserts the frame is admitted or refused BY NAME.
-///
-/// The rule these replaced is in `validate_frame`'s own doc: a chained-slot
-/// refusal justified by a `try_device_composed_template` in a `csrc/` this
-/// tree does not contain.
+/// Tests [`prove_frame_admissible`] directly against channels rather than a
+/// wasm store.
 #[cfg(test)]
 mod static_admission_tests {
     use super::*;
@@ -3582,39 +2901,8 @@ mod static_admission_tests {
         }
     }
 
-    /// Reserve `n` publish tickets on a channel — what an accepted, unsettled
-    /// fire leaves behind. This is the state the walk starts from.
-    fn reserve_publishes(cell: &Arc<Mutex<ChannelCell>>, n: usize) {
-        for _ in 0..n {
-            cell.lock().unwrap().reserve_device_ticket(false, true);
-        }
-    }
-
-    /// **A DEVICE-ONLY RING IS WALKED IN SLOT ORDER**, and a frame whose net
-    /// growth fits its declared capacity is admitted.
-    ///
-    /// Two slots, each publishing one cell and consuming the one before it:
-    /// occupancy goes 0 → 1 → 1, which a capacity of 2 holds with room. The
-    /// walk has to be ordered for this to be provable at all — the same two
-    /// accesses counted as a set say "two publishes, two consumes" and cannot
-    /// tell this frame from one that publishes both before consuming either.
-    #[test]
-    fn a_device_ring_frame_that_fits_in_slot_order_is_admitted() {
-        let ring = channel(HostRole::None, 2, false);
-        let slots = [
-            slot(std::slice::from_ref(&ring), &[(false, true)]),
-            slot(std::slice::from_ref(&ring), &[(true, true)]),
-        ];
-        assert_eq!(prove_frame_admissible(2, &slots), Ok(()));
-    }
-
-    /// The same shape past the capacity is refused, and the refusal names the
-    /// channel, the slot and the capacity.
-    ///
-    /// This is the whole of why retry is deletable: a frame that structurally
-    /// overfills a device-only ring would jam on the device with nothing left
-    /// to absorb it, so it must not be admitted rather than admitted and
-    /// re-offered.
+    /// The same shape past the capacity is refused, and the refusal names
+    /// the channel, the slot, and the capacity.
     #[test]
     fn a_device_ring_frame_that_overflows_is_refused_by_name() {
         let ring = channel(HostRole::None, 1, false);
@@ -3625,24 +2913,6 @@ mod static_admission_tests {
         let refusal = prove_frame_admissible(2, &slots).expect_err("two publishes, capacity one");
         assert!(refusal.contains("device-ring occupancy past capacity 1"), "{refusal}");
         assert!(refusal.contains("frame slot 1"), "{refusal}");
-    }
-
-    /// **THE BACKLOG OF ACCEPTED FIRES IS WHERE THE WALK STARTS.** A ring with
-    /// room for two that already owes one publish to an unsettled fire has
-    /// room for one more, not two.
-    #[test]
-    fn a_reserved_backlog_counts_against_the_frame() {
-        let ring = channel(HostRole::None, 2, false);
-        reserve_publishes(&ring, 1);
-        let one = [slot(std::slice::from_ref(&ring), &[(false, true)])];
-        assert_eq!(prove_frame_admissible(2, &one), Ok(()));
-
-        let two = [
-            slot(std::slice::from_ref(&ring), &[(false, true)]),
-            slot(std::slice::from_ref(&ring), &[(false, true)]),
-        ];
-        let refusal = prove_frame_admissible(2, &two).expect_err("backlog + 2 > capacity 2");
-        assert!(refusal.contains("device-ring occupancy past capacity 2"), "{refusal}");
     }
 
     /// A seeded descriptor channel is exempt: its occupancy belongs to the
@@ -3657,12 +2927,8 @@ mod static_admission_tests {
         assert_eq!(prove_frame_admissible(2, &slots), Ok(()));
     }
 
-    /// **EVERY HOST-WRITER CELL A FRAME DRAINS MUST ALREADY BE STAGED.**
-    ///
-    /// A frame executes uninterrupted, so a `put` arriving mid-frame is not a
-    /// thing that can happen: two consuming slots against one staged cell is
-    /// a frame that would run dry, and it is refused at submit with the two
-    /// numbers in the message.
+    /// Every host-writer cell a frame drains must already be staged: two
+    /// consuming slots against one staged cell is refused at submit.
     #[test]
     fn a_frame_that_drains_more_writer_cells_than_are_staged_is_refused() {
         let writer = channel(HostRole::Writer, 4, false);
@@ -3702,12 +2968,8 @@ mod static_admission_tests {
         assert_eq!(prove_frame_admissible(2, &slots), Ok(()));
     }
 
-    /// **THE READER RING IS SIZED FOR THE WORST CASE**, which is the guest
-    /// draining nothing before the frame executes.
-    ///
-    /// Capacity `2k - 1` is the message's own advice at k = 2: a frame of two
-    /// publishing slots needs two cells, and a ring of one is refused with the
-    /// number it would have needed.
+    /// The reader ring is sized for the worst case: the guest draining
+    /// nothing before the frame executes.
     #[test]
     fn a_reader_ring_too_small_for_the_frames_writes_is_refused() {
         let reader = channel(HostRole::Reader, 1, false);
@@ -3727,15 +2989,8 @@ mod static_admission_tests {
         assert_eq!(prove_frame_admissible(2, &ok), Ok(()));
     }
 
-    /// **A CHAINED SLOT IS ADMITTED**, which is the rule wave E deleted.
-    ///
-    /// Slot 0 publishes a device-only descriptor ring and slot 1 consumes it —
-    /// the shape `validate_frame` used to refuse whenever slot 1's descriptors
-    /// "resolved on the HOST", on behalf of a `FramePrepare` that ran every
-    /// step's host work at frame entry. `Cuda::submit` prepares each step in
-    /// turn, off the committed front the step before it advanced, so the
-    /// frame is ordinary and the only question left is whether the ring holds
-    /// it.
+    /// A chained slot is admitted: slot 0 publishes a device-only descriptor
+    /// ring and slot 1 consumes it.
     #[test]
     fn a_slot_that_consumes_what_an_earlier_slot_published_is_admitted() {
         let chained = channel(HostRole::None, 2, false);

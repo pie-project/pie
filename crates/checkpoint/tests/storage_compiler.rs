@@ -1,11 +1,4 @@
-/// A contract stored next to the test that compiles it.
-///
-/// The families these exercise — GPT-OSS's native MXFP4 expert groups,
-/// Nemotron-H's packed experts, Kimi's MLA joins — are authored by the engine
-/// now, so there is no function in this crate that could rebuild one. That is
-/// the point: what these tests are about is the *plan* the compiler produces
-/// for a contract shaped like that, and the contract is an input like any
-/// other.
+/// Loads a contract fixture stored next to the test that compiles it.
 fn stored_contract(name: &str) -> ModelContract {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/contracts")
@@ -88,11 +81,8 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
         preferred_alignment: 256,
         ..StorageTarget::default()
     };
-    // The MLX schema states 4-bit weights that the checkpoint packs eight to a
-    // u32 word: a bitcast to the logical shape and an affine-U4 encoding, with
-    // the scales and biases named as the tensors they are. The engine authors
-    // this; the test states it directly, because what is under test here is the
-    // arena the compiler builds from it, not who wrote it down.
+    // 4-bit weights packed eight to a u32 word: bitcast to logical shape,
+    // affine-U4 encoding, scales/biases as named tensors.
     let affine_u4 = |group_size: u32| {
         Encoding::Quant(
             QuantSpec {
@@ -204,9 +194,8 @@ fn buffer_join_tile_maps_carry_destination_offsets() {
     assert_eq!(reblocks[0].stride.element_bytes, 2);
     assert_eq!(reblocks[1].stride.element_bytes, 2);
     assert_eq!(program.memory.device_write_bytes, 16);
-    // The public contract has no ephemeral declarations, so the two cast inputs
-    // to the join are now named tensors and count toward persistent memory
-    // instead of temporary peak.
+    // No ephemeral declarations, so the two cast inputs count toward
+    // persistent memory instead of temporary peak.
     assert_eq!(program.memory.persistent_bytes, 16);
     assert_eq!(program.memory.temporary_peak_bytes, 0);
 }
@@ -303,15 +292,8 @@ fn packed_quant_row_select_uses_byte_exact_offsets() {
     assert_eq!(program.memory.device_write_bytes, 4);
 }
 
-/// An expression bigger than the tensor it is declared for is refused.
-///
-/// This used to inject a gather whose byte offsets ran past its output, which a
-/// contract cannot author: every destination offset the builder emits is
-/// derived from a declared shape. The byte-level property did not go away, it
-/// moved down to where the offsets are actually produced —
-/// `reference::replay` refuses a lowering that writes outside its output, and
-/// `tests/algebra.rs` pins that. What is checkable *here* is the declaration
-/// that would have led to one.
+/// An expression bigger than the tensor it is declared for is refused at
+/// the declaration, before any offset is produced.
 #[test]
 fn an_expression_may_not_outgrow_the_tensor_it_is_declared_for() {
     let contract = ModelContract {
@@ -359,26 +341,8 @@ fn target_support_rejects_cuda_decode_at_compile_time() {
     assert!(err.contains("does not support Decode"), "{err}");
 }
 
-/// The two-step re-encode [`Expr::Cast`]'s doc promises, actually spelled.
-///
-/// A quantized tensor cannot be cast straight to another scheme -- no kernel
-/// does it, and the destination's scales are not a function of the source's --
-/// so the doc offers the route through a decoded intermediate. That route was
-/// unspellable until the kernel-operand rule stopped refusing an `Expr::Out`:
-/// step two is a `Cast` over the intermediate, and `plan::build` rejected any
-/// kernel operand whose lowering read another contract. The refusal was an
-/// artifact of the aliasing path claiming the declaration's own tensor id, not
-/// anything about the algebra, so the escape route the doc names is the test.
-///
-/// The decode here is a per-group `Scale`, which is what decodes a block-scaled
-/// scheme; `TileMapKind::Decode` is in the plan vocabulary but no backend
-/// implements it yet.
-///
-/// **COMPILED AS A CONVERSION AND NOT FOR A DEVICE** (§M-3). The route this
-/// pins ends in an encode, and no device target carries one any more — the
-/// stored form is the served form, and re-encoding is `pie model import`'s
-/// work. Which target the algebra is checked against was never the subject
-/// here; that it can be SPELLED is.
+/// A quantized tensor can't cast straight to another scheme, so the route
+/// is decode (a per-group `Scale`) then `Cast` over the intermediate.
 #[test]
 fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
     let int8 = Encoding::Quant(QuantSpec {
@@ -389,8 +353,7 @@ fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
         channel_axis: Some(Axis(1)),
     });
     let mut contract = block_scaled_contract("scales", "s", vec![4, 1]);
-    // `w` is the decoded BF16 tensor the fixture publishes. Make it the
-    // intermediate and re-encode it.
+    // `w` is the decoded BF16 tensor the fixture publishes.
     contract.tensors[1] = contract.tensors[1].clone().internal();
     contract.tensors.push(TensorContract::new(
         "w_int8",
@@ -420,13 +383,10 @@ fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
         "decode then encode, each its own kernel"
     );
 
-    // 64 payload + 4 exponents, read once. If the encode had gone back to the
-    // checkpoint rather than reading what the decode wrote, this would be more.
+    // 64 payload + 4 exponents, read once.
     assert_eq!(plan.memory.checkpoint_read_bytes, 68);
-    // `Finalize` is what puts a name in the engine's bind table, and an
-    // internal declaration gets none. Asserted on the instruction rather than
-    // on `plan.tensors`, which lists internal declarations too so a kernel can
-    // know their type.
+    // `Finalize` puts a name in the engine's bind table; internal
+    // declarations get none.
     let bound: Vec<&str> = plan
         .instrs
         .iter()
@@ -437,26 +397,15 @@ fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
         .collect();
     assert_eq!(
         bound,
-        // `w_int8_scale_inv` is the encoder's own factors -- the second half of
-        // what a raw-to-quantized cast publishes. `w`, the decoded
-        // intermediate, is the one name missing, which is the point.
+        // `w`, the decoded intermediate, is the one name missing.
         vec!["scales", "w_int8_scale_inv", "w_int8"],
         "the intermediate is not bound"
     );
 }
 
-/// **A SERVING TARGET REFUSES THE ENCODE A CONVERSION TARGET RUNS** (§M-3).
-///
-/// The same contract the test above compiles, asked of a device. Serve-as-
-/// stored says the stored form IS the served form; an encode in a serving
-/// plan says the opposite, and one shipped SKU — kimi's mxfp4 expert banks
-/// over a bf16 checkpoint — was the whole of why the bit was ever set. It is
-/// clear now, so a load that would quantize on the way in is refused before
-/// it reads a byte, and the refusal names the command that fixes it.
-///
-/// Both halves, because a refusal alone would be satisfied by deleting the
-/// transform: it did not die, it MOVED. `CONVERT_TILE_MAP_MASK` still carries
-/// the bit, and `pie model import` compiles against it.
+/// A serving target refuses the encode a conversion target runs: the stored
+/// form is the served form, so quantizing on the way in is refused, naming
+/// `pie model import` as the fix.
 #[test]
 fn a_serving_target_refuses_the_encode_a_conversion_target_runs() {
     let int8 = Encoding::Quant(QuantSpec {
@@ -524,10 +473,8 @@ fn a_serving_target_refuses_the_encode_a_conversion_target_runs() {
     );
 }
 
-/// Casting one quantization scheme straight to another stays refused.
-///
-/// The companion to the test above: the two-step exists because the one-step
-/// does not, so if this ever starts compiling the intermediate is dead weight.
+/// Casting one quantization scheme straight to another stays refused — the
+/// two-step exists because the one-step does not.
 #[test]
 fn a_quantized_tensor_may_not_be_cast_straight_to_another_scheme() {
     let err = compile_load_plan(
@@ -583,11 +530,8 @@ fn packed_quant_source_requires_exact_affine_size() {
 fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        // A target claiming the native MXFP4 GEMM is claiming the Marlin
-        // repack that builds its operand. `CUDA_TILE_MAP_MASK` used to carry
-        // `Repack` for every CUDA target and so this pairing was implicit; it
-        // is stated now, because no engine in this tree sets the flag and a
-        // mask claiming a kernel nothing implements refused nothing.
+        // A target claiming the native MXFP4 GEMM must also claim the Marlin
+        // repack that builds its operand.
         tile_map_mask: checkpoint::plan::CUDA_TILE_MAP_MASK | checkpoint::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
@@ -608,8 +552,8 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
             _ => None,
         })
         .collect();
-    // Six, not eight: the two biases are a row selection and nothing else, so
-    // they are affine and never reach a kernel.
+    // Six, not eight: the two biases are a row selection, affine, never
+    // reaching a kernel.
     assert_eq!(repacks.len(), 6);
     assert!(repacks.iter().any(|spec| {
         spec.repack
@@ -631,24 +575,14 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     assert!(program.memory.transform_scratch_peak_bytes > 0);
 }
 
-/// A repack declaration is checked against its transform like every other node.
-///
-/// The `Repack` arm used to be the one path through `Builder::tensor` that
-/// inferred a type and then discarded it, taking `to.shape` as the answer
-/// instead of comparing the two. A declaration that disagreed with the
-/// transform compiled silently, and the plan carried the transform's shape
-/// under the declaration's name. Found by adding 7 to each of gpt-oss's six
-/// repack declarations and watching a clean plan come out; this is that
-/// experiment kept.
+/// A repack declaration that disagrees with its transform must be refused,
+/// not silently replaced by the transform's own shape.
 #[test]
 fn a_repack_declaration_is_checked_against_its_transform() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        // A target claiming the native MXFP4 GEMM is claiming the Marlin
-        // repack that builds its operand. `CUDA_TILE_MAP_MASK` used to carry
-        // `Repack` for every CUDA target and so this pairing was implicit; it
-        // is stated now, because no engine in this tree sets the flag and a
-        // mask claiming a kernel nothing implements refused nothing.
+        // A target claiming the native MXFP4 GEMM must also claim the Marlin
+        // repack that builds its operand.
         tile_map_mask: checkpoint::plan::CUDA_TILE_MAP_MASK | checkpoint::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
@@ -672,21 +606,14 @@ fn a_repack_declaration_is_checked_against_its_transform() {
     assert!(error.contains("declares shape"), "{error}");
 }
 
-/// GPT-OSS's gate and up halves are the even and odd rows of one block.
-///
-/// Each is now an `Expr::Stride`, so each repack reads only the rows it wants:
-/// two interleaved gathers of half the block instead of two full reads of all
-/// of it that an executor had to cache to make cheap. The two spans are equal,
-/// they start one row apart, and together they are the block exactly once.
+/// GPT-OSS's gate and up halves are the even and odd rows of one block:
+/// each repack reads only the rows it wants, covering the block once.
 #[test]
 fn gpt_oss_native_mxfp4_reads_each_interleaved_half_once() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        // A target claiming the native MXFP4 GEMM is claiming the Marlin
-        // repack that builds its operand. `CUDA_TILE_MAP_MASK` used to carry
-        // `Repack` for every CUDA target and so this pairing was implicit; it
-        // is stated now, because no engine in this tree sets the flag and a
-        // mask claiming a kernel nothing implements refused nothing.
+        // A target claiming the native MXFP4 GEMM must also claim the Marlin
+        // repack that builds its operand.
         tile_map_mask: checkpoint::plan::CUDA_TILE_MAP_MASK | checkpoint::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
@@ -698,7 +625,7 @@ fn gpt_oss_native_mxfp4_reads_each_interleaved_half_once() {
     )
     .unwrap();
 
-    // `gate_up_proj_blocks` is [2, 128, 2, 16] u8, so a row is 32 bytes and the
+    // `gate_up_proj_blocks` is [2, 128, 2, 16] u8: a row is 32 bytes, the
     // whole tensor is 8192.
     let blocks = TensorId(10);
     let mut halves: Vec<(u64, u64)> = program
@@ -719,26 +646,13 @@ fn gpt_oss_native_mxfp4_reads_each_interleaved_half_once() {
     assert_eq!(halves[0].1 + halves[1].1, 8192, "the block, once");
 }
 
-/// The acceptance test for moving the repack's source selection into the
-/// algebra.
-///
-/// The old contract carried `source_row_offset: 64` -- `rank * local` for rank
-/// one -- as an integer inside the spec, so the *contract* was valid for
-/// exactly one rank and the engine had to re-author it per rank. Flipping the
-/// target's rank then changed exactly one line of the plan: the recorded
-/// `tp_rank`. Every read offset was identical.
-///
-/// Now the selection is an `Expr::Shard`, so one contract serves every rank and
-/// the rank reaches the plan only through the target. Both halves of that are
-/// asserted here: the contract holds no rank-derived integer, and compiling it
-/// at two ranks reads two different bands.
+/// The repack's source selection is an `Expr::Shard`, so one contract serves
+/// every rank: compiling it at two ranks reads two different bands.
 #[test]
 fn gpt_oss_native_mxfp4_tp_resolves_the_rank_from_the_target() {
     let metadata = gpt_oss_mxfp4_metadata_with_intermediate(128);
     let contract = stored_contract("gpt_oss_native_mxfp4_tp1_of_2");
 
-    // Every repack now takes a composed operand, which is the shape of the
-    // claim: the selection is stated in the algebra, not in the spec.
     let repacks = contract
         .tensors
         .iter()
@@ -790,8 +704,8 @@ fn gpt_oss_native_mxfp4_tp_resolves_the_rank_from_the_target() {
     );
     assert_eq!(bytes0, bytes1, "and each rank must read the same volume");
 
-    // The gate/up block is [2, 256, 2, 16], so a row is 32 bytes and an expert
-    // is 8192. Rank one's band starts halfway into each expert.
+    // The gate/up block is [2, 256, 2, 16]: a row is 32 bytes, an expert is
+    // 8192. Rank one's band starts halfway into each expert.
     let band_start = |reads: &[(u32, u64, u64)]| {
         reads
             .iter()
@@ -821,10 +735,8 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
         contract.name == "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight"
             && contract.shape.as_deref() == Some(&[4, 3][..])
     }));
-    // The packed bank declares the WHOLE `[6, 4]`; the `Shard` on axis 1 is
-    // what says this rank binds `[6, 2]` of it. The two views below are cut
-    // out of what that bank published, which is already this rank's, so their
-    // declarations are the halves they slice.
+    // The packed bank declares the whole `[6, 4]`; the `Shard` on axis 1
+    // says this rank binds `[6, 2]` of it.
     assert!(contract.tensors.iter().any(|contract| {
         contract.name
             == "language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight"
@@ -865,7 +777,7 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    // Experts are packed contiguously *within* their backing buffer (tight
+    // Experts are packed contiguously within their backing buffer (tight
     // 0/12 offsets), so the exposed `*.packed.weight` view is contiguous.
     assert!(
         writes
@@ -878,10 +790,8 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
             .any(|(_, bytes, off)| *bytes == 12 && *off == 12)
     );
 
-    // Each expert pack is one persistent backing buffer (2 experts × 12 B =
-    // 24 B). The CUDA target reports a 256-byte operand alignment, so
-    // cuBLAS(Lt) can select its fast `align8` kernels. Packing tightness is
-    // internal to each backing and unaffected by the base alignment.
+    // Each expert pack is one persistent backing buffer (2 experts x 12 B =
+    // 24 B), 256-byte aligned for cuBLAS(Lt)'s fast `align8` kernels.
     let backings = program
         .buffers
         .iter()
@@ -893,7 +803,7 @@ fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
         assert_eq!(*offset % 256, 0, "operand base must be 256-aligned");
     }
 
-    // Raw data moved is unchanged (4 experts × 12 B); persistent arena grows
+    // Raw data moved is unchanged (4 experts x 12 B); persistent arena grows
     // only by the per-backing alignment padding (2nd backing at offset 256).
     assert_eq!(program.memory.checkpoint_read_bytes, 48);
     assert_eq!(program.memory.device_write_bytes, 48);
@@ -940,19 +850,9 @@ fn a_contract_whose_declared_shape_is_wrong_is_rejected() {
     assert!(error.contains("yields [2]"), "{error}");
 }
 
-/// A shard that must land on a unit boundary is said by reshaping the axis.
-///
-/// `Shard` splits an extent, and an extent cannot say what it is a
-/// concatenation *of*: `[heads * head_dim, cols]` divides by a `tp_size` that
-/// does not divide `heads`, and the split then cuts a head in half. Reshaping
-/// to `[heads, head_dim * cols]` first moves the divisibility question onto the
-/// thing that has to answer it, and reshaping back afterwards costs nothing --
-/// both are byte identities, so the whole composition still compiles to one
-/// contiguous run.
-///
-/// Nemotron-H's Mamba mixer depends on this for every band of its fused
-/// `in_proj`. The engine used to shard those on the host after the load, which
-/// is how the rule ended up restated as a hand-written divisibility check.
+/// A shard that must land on a unit boundary is said by reshaping the axis
+/// first, sharding, then reshaping back — a byte identity that still
+/// compiles to one contiguous run.
 #[test]
 fn a_head_boundary_shard_is_one_contiguous_run() {
     // 4 heads of 2 rows, 2 columns; rank 1 of 2 takes heads 2 and 3, which is
@@ -975,8 +875,8 @@ fn a_head_boundary_shard_is_one_contiguous_run() {
         tensors: vec![TensorContract::new(
             "local",
             expr,
-            // The whole tensor, which is what a declaration is: this rank
-            // binds `[4, 2]` and the `Shard` is what says so.
+            // The whole tensor: this rank binds `[4, 2]`, and the `Shard`
+            // is what says so.
             vec![8, 2],
             Encoding::Raw(DType::F32),
         )],
@@ -1023,9 +923,8 @@ fn a_head_boundary_shard_rejects_an_indivisible_world() {
                 .transmute(TensorType::raw(vec![3, 4], DType::F32))
                 .shard(0)
                 .transmute(TensorType::raw(vec![-1, 2], DType::F32)),
-            // The whole tensor's, so that what this test pins is the shard
-            // being refused and not a declaration disagreeing on the way in:
-            // the shape claim is checked first, and it is checked at one rank.
+            // The whole tensor's shape, so what this pins is the shard being
+            // refused and not a declaration mismatch.
             vec![6, 2],
             Encoding::Raw(DType::F32),
         )],
@@ -1057,15 +956,8 @@ fn metadata() -> Metadata {
     }
 }
 
-/// The escape hatches lower through their own arm of `Builder::tensor` instead
-/// of through `affine`, so each one has to reach the type checker on its own.
-///
-/// `Scale` shipped without doing so, and the unit tests over `infer_scale` all
-/// passed: they call `infer_type` directly, which the arm that handles the only
-/// supported form of the node never did. A zero factor — the value an FFI node
-/// carries when the author forgets to set it — compiled to a plan that loaded a
-/// tensor of zeros, cached it, and ran. Everything asserted below is a rule
-/// `infer_scale` already stated; what is under test is that `compile` asks.
+/// A contract that scales `source` by `factor`, for pinning `compile`
+/// against `infer_scale`'s rules.
 fn scale_contract(factor: f32, source: &str, dtype: DType) -> ModelContract {
     ModelContract {
         alignment: 256,
@@ -1155,13 +1047,8 @@ fn a_scale_whose_declared_shape_is_wrong_is_rejected() {
     assert!(error.contains("declares shape [4]"), "{error}");
 }
 
-/// Every path through the compiler names the contract its error came from.
-///
-/// `Builder::tensor` used to annotate the affine path at the call site and the
-/// kernel paths call by call, so the same mistake read `'out': declares shape
-/// [4] ...` through one and `declares shape [4] ...` through the other. In a
-/// contract with hundreds of tensors the second message names nothing. The
-/// annotation now happens once, at the boundary, for every path.
+/// Every path through the compiler names the contract its error came from —
+/// annotated once, at the boundary, for every path (affine and kernel alike).
 #[test]
 fn every_path_names_the_contract_its_error_came_from() {
     for expr in [
@@ -1187,12 +1074,8 @@ fn every_path_names_the_contract_its_error_came_from() {
     }
 }
 
-/// A checkpoint holding one block-scaled MXFP4 tensor and its factors.
-///
-/// Both arrive as the bytes a safetensors file actually stores — `U8` payloads
-/// with no encoding of their own — because that is what a checkpoint records.
-/// The contract is what says one of them is four rows of thirty-two MXFP4
-/// elements and the other is one E8M0 exponent per row.
+/// A checkpoint holding one block-scaled MXFP4 tensor (4 rows of 32
+/// elements) and its factors (one E8M0 exponent per row), both raw `U8`.
 fn block_scaled_metadata() -> Metadata {
     Metadata {
         files: vec![File {
@@ -1204,9 +1087,8 @@ fn block_scaled_metadata() -> Metadata {
         tensors: vec![
             sized_raw(0, "w", 0, 64, &[4, 16], DType::U8),
             sized_raw(1, "s", 64, 4, &[4, 1], DType::U8),
-            // Two more factor tensors, sized so that the shapes the rejection
-            // tests need are legal renames of *something*: three exponents do
-            // not divide four rows, and 128 give one per element.
+            // Rejection-test factors: 3 exponents don't divide 4 rows; 128
+            // give one per element.
             sized_raw(2, "s3", 68, 3, &[3, 1], DType::U8),
             sized_raw(3, "s128", 71, 128, &[128], DType::U8),
         ],
@@ -1220,16 +1102,9 @@ fn mxfp4(channel_axis: u8) -> QuantSpec {
     }
 }
 
-/// The dequantization an engine used to do by hand, said as one declaration.
-///
-/// `factors` names the tensor holding the exponents, and is the whole point:
-/// the payload and its factors are paired by a name the contract already
-/// checks, not by a suffix the executor appends to a name and hopes for.
-///
-/// `from` and `shape` are what the factors are, because **the factors' shape
-/// is the whole statement of how the payload is blocked**. There is no group
-/// size and no axis to pass: `[4, 1]` over `[4, 32]` says one factor per row,
-/// `[2, 2]` says 2x16 tiles. Every rejection below is therefore a shape.
+/// A block-scaled dequant: the factors' shape is the whole statement of how
+/// the payload is blocked — `[4, 1]` over `[4, 32]` is one factor per row,
+/// `[2, 2]` is 2x16 tiles.
 fn block_scaled_contract(factors: &str, from: &str, shape: Vec<i64>) -> ModelContract {
     ModelContract {
         alignment: 256,
@@ -1296,14 +1171,9 @@ fn a_block_scaled_dequant_is_one_scale_with_its_factors_as_an_operand() {
     );
 }
 
-/// The capability the routed-expert families need: each rank dequantizes the
-/// shard it will compute with, and never sees the rest.
-///
-/// The shard is byte spans and the multiply is a kernel, so the two compose
-/// without either one learning about the other. What makes this worth pinning
-/// is the alignment it depends on: the factors were sharded by the contract
-/// that published them, and the payload is sharded here, and `infer` compares
-/// the two *after* both have been specialized for the rank.
+/// Each rank dequantizes only the shard it will compute with: `infer`
+/// compares the sharded factors and sharded payload after both are
+/// specialized for the rank.
 #[test]
 fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
     let contract = ModelContract {
@@ -1317,8 +1187,8 @@ fn a_sharded_block_scaled_dequant_scales_only_its_own_rank() {
                         encoding: Encoding::Raw(DType::E8m0),
                     })
                     .shard(0),
-                // Both declarations are the whole tensor's; rank 1 binds half
-                // of each, which is what the two `Shard`s say.
+                // Both declarations are the whole tensor's; rank 1 binds
+                // half of each, per the two `Shard`s.
                 vec![4, 1],
                 Encoding::Raw(DType::E8m0),
             ),
@@ -1391,12 +1261,8 @@ fn a_scale_by_a_tensor_no_contract_declares_is_rejected() {
     assert!(error.contains("is declared before this one"), "{error}");
 }
 
-/// Blocks on two axes at once, which one group size could not have said.
-///
-/// `[2, 2]` factors over a `[4, 32]` payload is a 2x16 tile. Nothing in the
-/// contract names either number: both fall out of the ratio, and the plan is
-/// where they first appear as numbers -- which is what makes them checkable
-/// against the two shapes rather than trusted.
+/// Blocks on two axes at once: `[2, 2]` factors over a `[4, 32]` payload is
+/// a 2x16 tile, neither number named in the contract.
 #[test]
 fn a_scale_blocks_every_axis_the_factors_divide() {
     let plan = compile_load_plan(
@@ -1465,12 +1331,8 @@ fn a_scale_by_one_factor_per_element_is_rejected() {
     assert!(error.contains("they group nothing"), "{error}");
 }
 
-/// Scaling by an expression, rather than by a tensor some contract published,
-/// is refused — and refused with the fix in the message.
-///
-/// The restriction is what keeps one copy of the factors: an engine reads them
-/// anyway, so the contract that publishes them is the one that should say what
-/// they are.
+/// Scaling by an expression, rather than a published tensor, is refused —
+/// the engine reads factors by name.
 #[test]
 fn a_scale_by_an_undeclared_expression_is_rejected() {
     let contract = ModelContract {
@@ -1823,13 +1685,8 @@ fn instr_id(instr: &StorageInstr) -> checkpoint::types::InstrId {
     }
 }
 
-/// A block-scaled FP8 source names its scale tensor on the instruction.
-///
-/// The executor used to rebuild the name by appending `_scale_inv` and looking
-/// it up (`crates/driver-cuda/csrc/src/loader/transcode_engine.hpp`), which is the same
-/// guess-what-the-loader-decided pattern `attachments` removed from the output
-/// side. The loader has the tensor table, so it answers; this pins that the
-/// answer travels.
+/// A block-scaled FP8 source names its scale tensor on the instruction,
+/// rather than the executor reconstructing it by appending `_scale_inv`.
 #[test]
 fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
     let metadata = Metadata {
@@ -1919,9 +1776,7 @@ fn a_source_without_a_scale_sibling_names_none() {
 
 #[test]
 fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
-    // `crates/driver-cuda/csrc/src/model/llama_like/llama_like.cpp:640` wants this: pad Q/K/V
-    // up to a head_dim the attention kernel takes. Until `Fill` existed the
-    // compiler priced the pad (spec.md §3.3) and then refused to build it.
+    // Pads Q/K/V up to a head_dim the attention kernel takes.
     let metadata = Metadata {
         files: vec![File {
             id: FileId(0),
@@ -1970,8 +1825,8 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
     assert_eq!(fills.len(), 1, "one fill, not one per band");
     let (fill_id, filled) = fills[0];
 
-    // Four rows, because the destination stride is wider than the row and
-    // `fold` will not skip in the destination. spec.md §3.3 prices this at 5.
+    // Four rows: the destination stride is wider than the row and `fold`
+    // will not skip in the destination.
     let writes: Vec<_> = program
         .instrs
         .iter()
@@ -1998,23 +1853,17 @@ fn a_padded_head_dim_zeroes_the_buffer_before_it_writes_the_rows() {
     assert_eq!(program.buffer(filled).unwrap().bytes, 40);
 }
 
-/// And the padding is actually zero when the plan runs.
-///
-/// The test above proves the *plan* says `Fill`; nothing proved that executing
-/// it produces zeros, because no golden carries a `Fill` and the goldens are
-/// what drive the host executor. So `HostExecutor::fill` was reachable code
-/// that no test had ever run. The pad is the one region of a materialized
-/// tensor whose bytes come from no source, which makes it exactly the region a
-/// missing zeroing would leave holding whatever the allocator last had.
+/// The padding is actually zero when the plan runs — the test above only
+/// proves the plan says `Fill`, not that executing it produces zeros.
 #[test]
 fn a_padded_head_dim_materializes_zeros_where_no_source_covers() {
     let dir = std::env::temp_dir().join(format!("pie_fill_replay_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let snapshot = dir.join("model.safetensors");
 
-    // Four rows of four bf16 elements, every byte non-zero, so a pad that was
-    // left uninitialised cannot pass by coincidence and a pad written from the
-    // wrong offset shows up as source bytes rather than zeros.
+    // Every byte non-zero, so an uninitialised pad cannot pass by
+    // coincidence and a pad written from the wrong offset shows up as
+    // source bytes rather than zeros.
     let source: Vec<u8> = (0..32).map(|i| (i as u8) | 0x80).collect();
     std::fs::write(&snapshot, &source).unwrap();
 
@@ -2076,18 +1925,8 @@ fn a_padded_head_dim_materializes_zeros_where_no_source_covers() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A block scale is bytes in the file and an exponent to the GEMM.
-///
-/// DeepSeek-V4 pairs FP8-E4M3 weights with OCP Microscaling E8M0 scales --
-/// a combination `QuantScheme::Mxfp4E2M1E8M0` cannot name, because that symbol
-/// bundles the element format together with the scale format. The engine used
-/// to bridge the gap by copying the scales to the host and running `ldexpf`
-/// over them at bind time.
-///
-/// No new expression is needed for this. `Bitcast` names the reading of the
-/// bytes and the declaration names the type wanted, so the existing
-/// dtype-mismatch rule inserts the cast -- which is the whole argument for
-/// `E8M0` being a dtype rather than an arithmetic escape hatch.
+/// Reading raw bytes as `E8m0` and declaring `F32` hits the ordinary
+/// dtype-mismatch rule, which inserts the cast.
 #[test]
 fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
     let metadata = Metadata {
@@ -2134,15 +1973,8 @@ fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
 }
 
 // ── quant attachments ──────────────────────────────────
-//
-// A quantized weight and its scales are two runtime tensors, and the engine has
-// to know they belong together. The loader used to work that out after the fact,
-// by matching `_scale_inv` / `.scale` suffixes over the finished tensor table
-// with the group size hardcoded to 128 beside them, in
-// `plan::derive_quant_attachments`. Every entry is now recorded by whoever
-// declared the scale tensor, at the point of declaring it — which is why these
-// exercise `compile` rather than a name-matching function: there is no longer
-// anything to call in between.
+// A quantized weight and its scales are two runtime tensors, paired by
+// whoever declares the scale tensor.
 
 fn scale_target() -> StorageTarget {
     StorageTarget {
@@ -2184,13 +2016,10 @@ fn scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0() {
     assert_eq!(attach.scale_form, ScaleForm::RawE8M0);
     assert_eq!(attach.granularity, QuantGranularity::PerGroup);
     assert_eq!(attach.group_size, 32);
-    // Both halves name real entries, which is the part the name matching could
-    // get wrong without anything noticing.
+    // Both halves name real entries.
     assert_eq!(program.tensors[attach.tensor.0 as usize].name, "runtime.w");
-    // `.scales`, THE ONE SPELLING. It was `_scale`, which nothing in this tree
-    // ever looked for: an engine binds an encoded plane out of the same table
-    // as a shipped one, by name, and the name the model plane binds is
-    // `<w>.scales`. See `ScaleLayout::for_encode`'s MXFP4 arm for the ruling.
+    // `.scales` is the one spelling: an encoded plane binds under the same
+    // name as a shipped one, `<w>.scales`. See `ScaleLayout::for_encode`.
     assert_eq!(
         program.tensors[attach.scale_tensor.0 as usize].name,
         "runtime.w.scales"
@@ -2228,15 +2057,8 @@ fn scales_the_loader_writes_while_encoding_fp8_are_f32_factors() {
     );
 }
 
-/// Block-scaled FP8 (DeepSeek-V3 and its descendants) arrives already
-/// quantized: the loader writes no scales, so the contract states the pairing.
-///
-/// This is the case the suffix matching existed for, and the case it was worst
-/// at. It tried `{name}_scale_inv` and then `{base}.scale`, and hardcoded
-/// `group_size: 128` — while the only authoring site in the tree,
-/// `dsv4_block_scales_to_fp32`, publishes `<base>.scale` and knows the real
-/// block size. Note the 64 here: a checkpoint that blocks by anything other
-/// than 128 used to be silently mislabelled.
+/// Block-scaled FP8 arrives already quantized: the loader writes no
+/// scales, so the contract states the pairing.
 #[test]
 fn scales_the_checkpoint_shipped_are_paired_by_the_contract() {
     let metadata = Metadata {
@@ -2288,17 +2110,12 @@ fn scales_the_checkpoint_shipped_are_paired_by_the_contract() {
     );
 }
 
-/// A contract that names a tensor no earlier entry declares is rejected.
-///
-/// The suffix matching could not fail: a name that resolved to nothing produced
-/// no attachment, and the plan came out of the compiler silently missing the
-/// metadata its kernels would go looking for at bind time.
+/// A contract that names a tensor no earlier entry declares is rejected,
+/// rather than silently producing a plan with no attachment.
 #[test]
 fn scales_named_for_a_weight_the_loader_quantizes_are_a_contract_error() {
-    // The loader writes this weight's scales itself while encoding it, and
-    // states that pairing. A contract that names a second set would attach
-    // quant metadata to one weight twice, which the engine discovers only at
-    // load time.
+    // The loader writes this weight's scales itself while encoding it. A
+    // contract naming a second set would attach quant metadata twice.
     let metadata = Metadata {
         files: vec![File {
             id: FileId(0),
@@ -2381,11 +2198,6 @@ fn scales_naming_an_undeclared_tensor_are_a_contract_error() {
 }
 
 /// Scales may be declared before the tensor they scale.
-///
-/// `dsv4_block_scales_to_fp32` runs before `author_dense_contract`, so the real
-/// contract declares every block scale ahead of its weight. Resolving `of`
-/// against earlier entries only — the rule `Expr::Out` follows — would reject
-/// every DeepSeek-V4 contract in the tree.
 #[test]
 fn scales_may_name_a_tensor_declared_after_them() {
     let metadata = Metadata {
@@ -2436,8 +2248,7 @@ fn scales_may_name_a_tensor_declared_after_them() {
 }
 
 /// A quantized weight without its scales is not a smaller weight, it is an
-/// unreadable one. Each of these used to compile, publish exactly one tensor,
-/// and hand the engine an encoding whose scales did not exist.
+/// unreadable one.
 fn encode_to(
     name: &str,
     shape: &[i64],
@@ -2472,20 +2283,8 @@ fn encode_to(
     compile_load_plan(&metadata, &contract, scale_target())
 }
 
-/// A rank-3 expert bank encodes, and its scales keep its leading axis.
-///
-/// THIS TEST ASSERTED THE OPPOSITE. It said "the encode kernels walk `[rows,
-/// cols]` tiles, so a rank-3 output has no scale layout at all -- not a
-/// different one", and pinned the refusal. The kernels do walk `[rows, cols]`
-/// tiles; they also walk them row-major, indexing `row * cols + c`, so
-/// `[experts, rows, cols]` is the same rectangle with the leading axes folded
-/// (`types::rectangle`). What was rank-2-only was the arithmetic above them,
-/// and what it cost is a family: kimi's mxfp4 expert banks over a bf16
-/// checkpoint could not be compiled at all.
-///
-/// The scales keep the payload's axes rather than the fold, because the plane
-/// an engine BINDS is bound at its declared rank -- `[experts, rows, cols/32]`
-/// is what `model_dsl`'s `Weight::planes` interns for it.
+/// A rank-3 expert bank encodes, and its scales keep the leading (expert)
+/// axis, since the engine binds the plane at its declared rank.
 #[test]
 fn a_rank_3_bank_encodes_and_its_scales_keep_the_expert_axis() {
     let plan = encode_to("runtime.w", &[2, 64, 64], QuantScheme::Mxfp4E2M1E8M0).unwrap();
@@ -2494,17 +2293,13 @@ fn a_rank_3_bank_encodes_and_its_scales_keep_the_expert_axis() {
     let scales = &plan.tensors[attach.scale_tensor.0 as usize];
     assert_eq!(scales.name, "runtime.w.scales");
     assert_eq!(scales.shape, vec![2, 64, 2]);
-    // The blocked axis is the last one, at whatever rank the bank has.
+    // The blocked axis is the last one, whatever rank the bank has.
     assert_eq!(attach.channel_axis, 2);
     assert_eq!(attach.group_size, 32);
 }
 
-/// A rank-1 declaration still has no scale layout, and that is not the same
-/// refusal wearing a different rank.
-///
-/// A vector has no axis left over to hold one scale per row, so there is
-/// nothing for `for_encode` to shape the plane like. Refused here rather than
-/// folded into a plausible one-row weight.
+/// A rank-1 declaration has no axis left to hold one scale per row, so it
+/// is refused rather than folded into a plausible one-row weight.
 #[test]
 fn an_encode_that_cannot_place_its_scales_is_refused() {
     let err = encode_to("runtime.w", &[64], QuantScheme::Mxfp4E2M1E8M0).unwrap_err();
@@ -2519,17 +2314,16 @@ fn an_encode_whose_columns_do_not_fill_a_block_is_refused() {
     assert!(err.to_string().contains("blocks 32 columns"), "{err}");
 }
 
-/// `QuantScheme` names every format the loader can *read*. Only three have an
-/// encoder, and asking for one of the others used to be accepted in silence.
+/// `QuantScheme` names every format the loader can *read*; only three have
+/// an encoder.
 #[test]
 fn an_encode_into_a_scheme_no_kernel_writes_is_refused() {
     let err = encode_to("runtime.w", &[64, 64], QuantScheme::AwqInt4).unwrap_err();
     assert!(err.to_string().contains("no encode kernel writes"), "{err}");
 }
 
-/// Re-encoding one quantized scheme as another produced a `Transcode` neither
-/// backend implements, and no scale tensor for the new scheme's blocks. It is
-/// now refused where it is written.
+/// Re-encoding one quantized scheme as another is refused — no backend
+/// implements a `Transcode`.
 #[test]
 fn re_encoding_one_quantized_scheme_as_another_is_refused() {
     let metadata = Metadata {
@@ -2570,10 +2364,8 @@ fn re_encoding_one_quantized_scheme_as_another_is_refused() {
     );
 }
 
-/// The defect `Expr::Cast` closes: a declaration that disagreed with its
-/// expression used to *cause* a conversion, so two lines that were merely
-/// inconsistent silently ran a kernel and — encoding — invented a scale tensor
-/// nothing in the type layer had checked.
+/// A declaration that disagrees with its expression is a compile error, not
+/// something that silently triggers a conversion kernel.
 #[test]
 fn a_declaration_that_disagrees_with_its_expression_is_a_mistake_not_a_kernel() {
     let metadata = Metadata {
@@ -2602,8 +2394,8 @@ fn a_declaration_that_disagrees_with_its_expression_is_a_mistake_not_a_kernel() 
     assert!(err.contains("explicit cast"), "{err}");
 }
 
-/// And with the cast written down, the same pair compiles and publishes the
-/// scales the encoder needs — so the assertion is not merely refusing work.
+/// With the cast written down, the same pair compiles and publishes the
+/// scales the encoder needs.
 #[test]
 fn the_same_pair_with_the_cast_written_down_encodes() {
     let plan = encode_to("runtime.w", &[64, 64], QuantScheme::Fp8E4M3).unwrap();

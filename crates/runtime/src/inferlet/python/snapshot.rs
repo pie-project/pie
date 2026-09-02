@@ -1,88 +1,16 @@
-//! Host-side snapshot optimization for Python (shared-modules) components.
+//! Host-side snapshot optimization for Python (shared-modules) components:
+//! [`instrument`] exposes memory/globals via synthesized getters, the
+//! runtime calls `prepare-snapshot` and reads them back, and [`apply`] bakes
+//! the captured post-init state into a new component binary so later
+//! instantiations skip the CPython bootstrap. [`strip_module_data`] strips
+//! data/start sections from shared modules so instantiating a snapshotted
+//! component does not overwrite the captured state.
 //!
-//! # Overview
-//!
-//! Python components built with shared-everything dynamic linking pay a
-//! significant initialization cost: each time the component is instantiated the
-//! CPython interpreter must start up, import the standard library, and execute
-//! top-level module code. This module eliminates that repeated cost by taking a
-//! *snapshot* of the Wasm linear memory and mutable globals immediately after
-//! initialization, then baking those values directly into the component binary.
-//! Subsequent instantiations start from the post-init state with no interpreter
-//! bootstrap overhead.
-//!
-//! # Snapshot Pipeline
-//!
-//! The end-to-end process performed by [`snapshot_component()`] is:
-//!
-//! ```text
-//! ┌──────────────────────────────────────────────────────────────────────────┐
-//! │                          Snapshot Pipeline                               │
-//! └──────────────────────────────────────────────────────────────────────────┘
-//!
-//!   Original Component
-//!          │
-//!          ▼
-//!   1. instrument()
-//!      Rewrite the component to expose memory contents and mutable globals
-//!      through synthesized getter functions (e.g., `snapshot-memory-N`,
-//!      `snapshot-global-N`). A `prepare-snapshot` export triggers the
-//!      original initialization code and then makes the state readable.
-//!          │
-//!          ▼
-//!   2. Instantiate + call prepare-snapshot
-//!      Compile and instantiate the instrumented component with a full
-//!      linker (including shared modules). Calling `prepare-snapshot`
-//!      runs the real initialization (CPython bootstrap, user code, etc.).
-//!          │
-//!          ▼
-//!   3. Read back snapshot data
-//!      Invoke the synthesized getter functions to capture every page of
-//!      linear memory and the value of every mutable global.
-//!          │
-//!          ▼
-//!   4. apply()
-//!      Produce a new component binary that:
-//!        - Replaces data segments with the captured memory snapshot
-//!        - Replaces global initializers with the captured values
-//!        - Strips the original start/init functions so the heavy
-//!          initialization is never executed again
-//!
-//!   Result: a component that instantiates into the post-init state directly.
-//! ```
-//!
-//! # Stripped Shared Modules
-//!
-//! A snapshotted component already contains the fully initialized memory image,
-//! including the portions that would normally be populated by the data segments
-//! and start functions of shared modules (e.g., libc, CPython). If those shared
-//! modules were instantiated normally, their data segments and start sections
-//! would overwrite the snapshot. [`strip_module_data()`] produces *stripped*
-//! variants of shared modules — identical except that data segments, the data
-//! count section, and start sections are removed — so that instantiation of a
-//! snapshotted component preserves the captured state.
-//!
-//! # Public API
-//!
-//! This module exposes two `pub(super)` entry points consumed by the parent
-//! runtime module:
-//!
-//! - [`snapshot_component()`] — end-to-end orchestrator: instruments, runs,
-//!   captures, and applies the snapshot, returning the new component bytes.
-//! - [`strip_module_data()`] — strips data/start sections from a shared module
-//!   so it can be used when instantiating snapshotted components.
-//!
-//! # Source Attribution
-//!
-//! The `instrument()` and `apply()` functions are adapted from the
-//! `component_init_transform` crate:
-//!   <https://github.com/dicej/component-init>
-//!   rev 1de5906ca8c5f7093eaa9f6565f1dde5fc9608d3
-//!   file: transform/src/lib.rs
-//!
-//! Key adaptation: both functions count `ComponentTypeRef::Module` imports in
-//! `module_count`, correctly handling shared-everything dynamically linked
-//! components that import core modules (e.g., libc, CPython).
+//! `instrument()` and `apply()` are adapted from the `component_init_transform`
+//! crate (<https://github.com/dicej/component-init>, rev
+//! 1de5906ca8c5f7093eaa9f6565f1dde5fc9608d3, file transform/src/lib.rs), with
+//! both functions counting `ComponentTypeRef::Module` imports in
+//! `module_count` to handle shared-everything dynamically linked components.
 
 use {
     anyhow::{Context, Result, anyhow, bail},
@@ -1279,15 +1207,12 @@ impl<T: Send + 'static> Invoker for HostInvoker<T> {
 // Public entry point: build a throwaway linker/store, then run the pipeline.
 // ---------------------------------------------------------------------------
 
-/// Run the host-side snapshot pipeline for a Python component.
-///
-/// Builds a throwaway linker (WASI + HTTP + API + full shared modules + deps),
-/// runs the instrumented initialization, and returns the snapshotted bytes.
-/// The caller compiles the result back into a Component.
-///
-/// This is a synchronous helper (not going through the actor) because snapshot
-/// only runs during program installation, which already holds the program
-/// service lock.
+/// Run the host-side snapshot pipeline for a Python component. Builds a
+/// throwaway linker (WASI + HTTP + API + full shared modules + deps), runs
+/// the instrumented initialization, and returns the snapshotted bytes.
+/// Synchronous (not going through the actor) since snapshot only runs
+/// during program installation, which already holds the program service
+/// lock.
 pub(crate) async fn snapshot_from_bytes(
     engine: &Engine,
     raw_bytes: &[u8],

@@ -1,10 +1,9 @@
 //! `pie:inferlet` WIT host boundary: bindgen! + `add_to_linker`, one thin
 //! host-glue file per interface.
 //!
-//! **Accepted layering exception.** `session.rs` calls
-//! `crate::server::send_file` and `crate::server::inbox::receive`: guest-to-
-//! client I/O goes through the server's facade. This is the one documented
-//! upward exception in this crate; revisit only if a second one appears.
+//! `session.rs` calls `crate::server::send_file` and
+//! `crate::server::inbox::receive`: the one accepted upward layering
+//! exception in this crate.
 
 pub mod chat;
 pub mod forward;
@@ -47,16 +46,13 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
 wasmtime::component::bindgen!({
     path: "../inferlet/wit",
     world: "inferlet",
-    // wasmtime 46 split `wasmtime::Error` from `anyhow::Error`; keep the
-    // generated host traits on `anyhow::Result` so the existing host/*.rs
-    // impls (anyhow `?`/`bail!`/`anyhow!`) continue to compile unchanged.
+    // keeps generated host traits on `anyhow::Result` so existing host/*.rs
+    // impls continue to compile unchanged.
     anyhow: true,
     with: {
-        // Standard wasi 0.3 surfaces the world imports resolve to the wasmtime
-        // p3 host bindings (what the p3 linkers in linker.rs implement) rather
-        // than generating fresh host code. Package-level keys cover every
-        // reachable sub-interface (http/{client,types}, clocks/{types,
-        // monotonic-clock,system-clock}, filesystem/{types,preopens}).
+        // world imports resolve to the wasmtime p3 host bindings rather than
+        // generating fresh host code; package-level keys cover every
+        // reachable sub-interface.
         "wasi:http": wasmtime_wasi_http::p3::bindings::http,
         "wasi:clocks": wasmtime_wasi::p3::bindings::clocks,
         "wasi:filesystem": wasmtime_wasi::p3::bindings::filesystem,
@@ -71,10 +67,9 @@ wasmtime::component::bindgen!({
         // pie:inferlet/forward — forward-pass submission (the registry surface
         // folded into forward-pass.new).
         "pie:inferlet/forward.forward-pass": forward::ForwardPass,
-        // All three forward interfaces map their `forward-pass` to the SAME
-        // Rust type: WIT scopes resource names per interface, so the guest
-        // still cannot pass a hybrid pass to an attention-only call, while the
-        // host keeps one implementation (`ProcessCtx::core_*`).
+        // all three forward interfaces map `forward-pass` to the same Rust
+        // type; WIT still scopes resource names per interface, so a hybrid
+        // pass can't reach an attention-only call.
         "pie:inferlet/forward-recurrent.forward-pass": forward::ForwardPass,
         "pie:inferlet/forward-hybrid.forward-pass": forward::ForwardPass,
         // pie:inferlet/pipeline — the ordering domain (hoisted out of forward
@@ -100,9 +95,8 @@ wasmtime::component::bindgen!({
 pub fn add_to_linker(
     linker: &mut wasmtime::component::Linker<ProcessCtx>,
 ) -> Result<(), wasmtime::Error> {
-    // Concrete on ProcessCtx: the async-func imports (execute/receive/pull/
-    // subscribe) are generated on `HostWithStore` traits implemented for
-    // `HasSelf<ProcessCtx>`, so the linker `D` type must be concrete.
+    // must be concrete: async-func imports are generated on `HostWithStore`
+    // traits implemented for `HasSelf<ProcessCtx>`.
     type D = HasSelf<ProcessCtx>;
     pie::inferlet::types::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::pipeline::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;

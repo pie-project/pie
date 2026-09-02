@@ -1,40 +1,4 @@
-//! The fire submission — one forward pass over the batch the runtime assembled.
-//!
-//! ```text
-//! fire (R=5):        lane0 prefill(7 rows)  lane1 prefill(3)  lane2..4 decode(1 each)
-//! rows (seriated):   [··············· 10 ···············|········ 3 ········]
-//! ```
-//!
-//! # `Lane::word` is the one genuinely new field
-//!
-//! Everything else in this module is a rename of something the old
-//! `LaunchPlan` carried. [`Lane::word`] is not: it is the per-lane fact bits
-//! `Classify::of(&Request)` computed runtime-side, and it is what
-//! `model_exec::fire::compose` turns into a class, and therefore into the row
-//! WINDOW every guarded node of the artifact runs over (design §0,
-//! decision 18).
-//!
-//! It is per-LANE and this matters. The contract it replaces had one fact word
-//! per FIRE — `FireBindings::facts` — which forced a mixed batch to be split
-//! into a decode fire and a prefill fire, or to be run through a kernel
-//! general enough for both. Window-split is the mechanism that makes neither
-//! necessary, and a per-fire word is exactly the collapse that makes
-//! window-split unexpressible.
-//!
-//! # Why the submission is this small
-//!
-//! The `LaunchPlan` this replaces had **62 fields**, most of them parallel
-//! `Vec<u32>` CSR arms — `qo_indptr`, `kv_page_indptr`, `rs_translation_indptr`,
-//! `embed_block_indptr`, `image_mrope_indptr`, … — plus a 420-line
-//! `StepSubmission::validate` whose job was to check that they were all the
-//! same length as each other. That is a serialized data structure, not a
-//! submission: the runtime flattened its per-request state into eleven CSRs,
-//! and the engine's first act was to walk them back into per-request form.
-//!
-//! Here a lane is a lane. The CSRs are the SHELL's — it builds them in
-//! `compose`, from a `Vec<Lane>` — and a whole class of "these two arms
-//! disagree" failures cannot be submitted. What is left to validate is
-//! arithmetic about one lane at a time.
+//! The fire submission: one forward pass over the batch the runtime assembled.
 
 use serde::{Deserialize, Serialize};
 
@@ -45,41 +9,17 @@ use crate::program::InstanceId;
 /// A fire's id, minted by the engine, unique for the life of a load.
 pub type FireId = u64;
 
-/// A frame's id, minted by the engine, unique for the life of a load.
-///
-/// One frame is one [`submit`](crate::Engine::submit): 1..=k steps, sealed in
-/// order, admitted together (alto design §1 article 4).
+/// A frame's id, minted by the engine, unique for the life of a load. One
+/// frame is one [`submit`](crate::Engine::submit): 1..=k steps, sealed in
+/// order, admitted together.
 pub type FrameId = u64;
 
 /// Which readable extent of a slot a lane's attention may reach.
 ///
-/// A run-length encoding: alternating lengths of masked-out and kept
-/// positions, starting with masked-out. `total` is how many positions the runs
-/// describe, so a truncated run list is a detectable submission rather than a
-/// silently short mask.
-///
-/// This is `EncodedMask`, kept: an explicit mask is a real axis (the `masked`
-/// fact) and the run form is genuinely how a mask arrives — a prefix drop, a
-/// sliding window, a set of retained blocks are all a handful of runs over
-/// thousands of positions.
-///
-/// # `total` MAY EXCEED the lane's readable extent, and may not fall short
-///
-/// A caller states its mask over the width it KNOWS, and for a guest that is
-/// the pool it reserved — 48 key positions for a three-page pool of sixteen,
-/// while the lane holds 23 tokens — because the reservation's width does not
-/// move as the sequence grows a token per fire. An engine expands the runs
-/// into a `rows x extent` rectangle and CLIPS the surplus: a position past
-/// `KvDelta::held + tokens.len()` is one this fire has not written, so the
-/// causal bound drops it for every query row whatever its bit says, and
-/// dropping it is therefore not a choice between readings.
-///
-/// The other direction is not symmetric and is not accepted. A mask whose
-/// `total` is SHORT of the extent expands with its tail bits zero, and zero
-/// is MASKED-OUT — an attention silently truncated to the stated prefix. That
-/// is what `total` being stated at all is for: a truncated run list is a
-/// detectable submission, and the engines refuse it by name
-/// (`engine_cuda::Fault::Mask`) rather than pad it.
+/// Run-length encoding: alternating masked-out/kept lengths, starting
+/// masked-out. `total` may exceed the lane's readable extent (clipped at the
+/// causal bound) but must not fall short (refused rather than silently
+/// truncated).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Mask {
     /// Alternating run lengths, masked-out first.
@@ -113,12 +53,8 @@ impl Mask {
         usize::try_from(self.total.div_ceil(32)).unwrap_or(usize::MAX)
     }
 
-    /// Expand into a bitmap: bit `i` set iff position `i` is KEPT.
-    ///
-    /// Writes into `dst`, which must hold at least [`Mask::words`] entries.
-    /// Anything past the runs stays as it was, which is why the buffer is
-    /// zeroed by the caller rather than here — a shell expands many lanes'
-    /// masks into one slab.
+    /// Expand into a bitmap: bit `i` set iff position `i` is kept. `dst` must
+    /// hold at least [`Mask::words`] entries and is zeroed by the caller.
     pub fn expand_into(&self, dst: &mut [u32]) {
         let total = usize::try_from(self.total).unwrap_or(usize::MAX);
         let mut at = 0usize;
@@ -139,53 +75,22 @@ impl Mask {
     }
 }
 
-/// **How a lane's attention is restricted: over its EXTENT, or per ROW.**
+/// How a lane's attention is restricted: over its extent, or per row.
 ///
-/// [`Mask`] is one run-length restriction of a lane's readable extent, and
-/// for most masks that is the whole truth: a prefix drop, a retained-block
-/// set, an attention sink are each one set of keys that every query row of
-/// the lane reads under, with the causal bound doing the rest. That mask is
-/// [`Masking::Extent`], it is what every caller before this type wrote, and
-/// an engine re-applies the causal bound to it per row.
-///
-/// **WHAT THAT SHAPE CANNOT SAY IS A WINDOW.** A sliding-window prefill asks
-/// row `i` to keep `[i - w, i]` and row `i + 1` to keep `[i + 1 - w, i + 1]`:
-/// two restrictions that are not nested, so no single mask under the causal
-/// bound is either of them. The lowering that had only [`Masking::Extent`]
-/// to write into refused such a fire by name rather than pick one row — the
-/// old one silently picked row ZERO, which is every later row truncated to
-/// the first one's causal bound — and [`Masking::Rows`] is the form that
-/// refusal was waiting for.
-///
-/// **`Rows` IS PARALLEL TO THE LANE'S QUERY ROWS**, one [`Mask`] per entry of
-/// [`Lane::tokens`], each over that row's own readable extent — which is the
-/// lane's post-append extent for every row, the same number
-/// [`Masking::Extent`]'s single mask covers, because the causal bound and not
-/// the mask is what keeps row `i` off the keys row `i + 1` writes. A count
-/// that is not the lane's row count is refused by [`Lane::validate`]: it is
-/// the one thing about a per-row mask a lane can check about itself.
-///
-/// **AN ENGINE MAY NOT WIDEN CAUSALITY WITH EITHER FORM.** Both are
-/// intersected with `k <= held + row` on expansion. A mask states which of
-/// the readable positions a row may reach, never that a row may reach a
-/// position the fire has not written yet.
+/// [`Masking::Extent`] applies one mask to every query row under the causal
+/// bound; it cannot express a sliding window (rows keep non-nested ranges),
+/// which [`Masking::Rows`] does with one [`Mask`] per token. Both are
+/// intersected with `k <= held + row` on expansion.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Masking {
-    /// ONE restriction over the lane's readable extent, re-applied to every
-    /// query row under the causal bound. Every mask written before per-row
-    /// masks existed is this one.
+    /// One restriction over the lane's readable extent, applied to every row.
     Extent(Mask),
-    /// ONE restriction PER QUERY ROW, parallel to [`Lane::tokens`]: entry `i`
-    /// is row `i`'s mask, over the lane's readable extent.
+    /// One restriction per query row, parallel to [`Lane::tokens`].
     Rows(Vec<Mask>),
 }
 
 impl Masking {
-    /// The masks this states, in row order — one for [`Masking::Extent`].
-    ///
-    /// The one-element slice is not a convenience: it is what lets a shell's
-    /// extent check ("does every stated mask cover this lane's extent?") be
-    /// one loop over both forms rather than two spellings of one rule.
+    /// The masks this states, in row order.
     #[must_use]
     pub fn masks(&self) -> &[Mask] {
         match self {
@@ -196,10 +101,6 @@ impl Masking {
 
     /// The mask query row `row` reads under, or `None` for a row this
     /// masking does not describe.
-    ///
-    /// [`Masking::Extent`] describes EVERY row — that is what "over the
-    /// extent" means — so it answers for any index; [`Masking::Rows`]
-    /// answers for the rows it carries and for no others.
     #[must_use]
     pub fn of_row(&self, row: usize) -> Option<&Mask> {
         match self {
@@ -209,7 +110,7 @@ impl Masking {
     }
 
     /// How many query rows this masking states one each for, or `None` for
-    /// [`Masking::Extent`], which states one for all of them.
+    /// [`Masking::Extent`].
     #[must_use]
     pub fn stated_rows(&self) -> Option<usize> {
         match self {
@@ -219,74 +120,26 @@ impl Masking {
     }
 }
 
-/// What this fire does to a lane's KV.
-///
-/// `held` is the state the shell already has and `pages` is the addressing it
-/// may use; the number of tokens WRITTEN is `Lane::tokens.len()`, never stated
-/// separately, because a submission where those two numbers disagreed had one
-/// of them wrong and no way to tell which.
+/// What this fire does to a lane's KV. Token count written is
+/// `Lane::tokens.len()`, not stated separately here.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvDelta {
     /// How many tokens this lane's slot already holds — the first position
     /// this fire writes. Zero on a first prefill.
     pub held: u32,
-    /// The KV pages this lane may address, in sequence order.
-    ///
-    /// Empty means the SHELL owns the page table for this slot: it allocated
-    /// the pages at `open` and grows them itself. A non-empty list is the
-    /// runtime keeping the page table, which is what a load with an exported
-    /// [`KvHandle`](crate::transfer::KvHandle) and a remote peer writing into
-    /// it needs.
-    ///
-    /// **THESE ARE POOL PAGE IDS AND NOTHING ELSE.** An engine pushes each
-    /// entry straight into its page CSR, so the space is the POOL's — the ids
-    /// its own allocator minted. A guest states its pages in a different space
-    /// (see [`KvDelta::translation`]) and the runtime translates before it
-    /// submits.
+    /// The KV pages this lane may address, in sequence order. Empty means the
+    /// shell owns the page table for this slot; non-empty means the runtime
+    /// keeps it (needed for an exported [`KvHandle`](crate::transfer::KvHandle)).
+    /// Pool page ids, not the guest's own page space (see
+    /// [`KvDelta::translation`]).
     pub pages: Vec<u32>,
-    /// **THE WORKING SET'S FLAT TABLE: entry `i` is the pool page backing that
-    /// working set's relative index `i`.** Empty for every lane whose page
-    /// references the runtime has already resolved, which is every lane of
-    /// every class but one.
-    ///
-    /// # Two spaces, and which side crosses between them
-    ///
-    /// A guest never holds a pool page id. `kv-working-set`'s whole surface is
-    /// WORKING-SET-RELATIVE indexes — `reserve` hands back `0 .. n`, a fork is
-    /// O(1) precisely because a relative index survives the copy-on-write that
-    /// moves the physical page under it — and the runtime translates through
-    /// this table at the point where a page reference stops being the guest's
-    /// and becomes an address.
-    ///
-    /// For every host-resolved geometry that point is inside the runtime:
-    /// `pipeline::fire::map_lane_pages` rewrites the folded `Pages` port into
-    /// [`KvDelta::pages`] and an engine sees only pool ids.
-    ///
-    /// [`GeometryClass::DeviceGeometry`](eta_ir::registry::GeometryClass)
-    /// is the one class where that point cannot be inside the runtime: the
-    /// lane's page ids and its write descriptor are computed by the guest's
-    /// own epilogue and live in a channel cell the host never reads. So the
-    /// runtime ships the TABLE instead of the result, and the engine applies
-    /// it to the `pages`, `page_indptr` and `w_slot` values it resolves off
-    /// those cells.
-    ///
-    /// **THE MAPPING STILL HAS ONE OWNER** (article 8). The KV store mints it
-    /// and nothing else may compute one; this field is that table quoted, and
-    /// an engine may only index it. An index the table does not cover is a
-    /// refusal by name — the alternative is addressing a pool page belonging
-    /// to somebody else, which is exactly what the two-spaces confusion costs.
-    ///
-    /// Empty beside device-resolved page references is therefore a refusal and
-    /// not a default: "translate by identity" is the bug, spelled.
-    ///
-    /// This arm existed once and was deleted in alto E, on the ground that its
-    /// only implementation was a refusal — it then meant "rewritten page ids
-    /// for a fork that moved this lane's pages", which needed a page mover
-    /// neither shell had. It comes back with the meaning
-    /// `pipeline::fire::kv`'s `build_translation` was already written for and
-    /// documented for ("ships with the launch so the engine can map
-    /// channel-resolved `Pages`/`WSlot` references"), against a consumer that
-    /// exists.
+    /// The working set's flat table: entry `i` is the pool page backing
+    /// working-set-relative index `i`. Empty for every lane whose page
+    /// references the runtime has already resolved (every class but
+    /// [`GeometryClass::DeviceGeometry`](eta_ir::registry::GeometryClass)).
+    /// Minted only by the KV store; an engine may only index it, so empty
+    /// beside unresolved device-geometry page references is a refusal, not a
+    /// default.
     #[serde(default)]
     pub translation: Vec<u32>,
 }
@@ -309,117 +162,47 @@ pub enum Readout {
 pub struct Lane {
     /// Which pool slot this request's sequence lives in.
     pub slot: u32,
-    /// **The lane's fact bits.** `Guard::Fact(bit)` indexes them; the model's
-    /// own `Classify::of` computed them (decision 18). A word this load's
-    /// artifact has no class for is a refusal, not a default: it means the
-    /// runtime and the shell disagree about what is loaded.
+    /// The lane's fact bits, indexed by `Guard::Fact(bit)`; computed by the
+    /// model's `Classify::of`. A word the loaded artifact has no class for
+    /// is a refusal.
     pub word: u64,
-    /// The token ids this fire feeds the lane — a prompt on the first fire,
-    /// one token on every fire after, `1 + drafts` under speculation.
-    ///
-    /// **The lane's row count is this length.** There is no separate `rows`
-    /// field, for the same reason there is no separate KV write count.
+    /// Token ids fed this fire — a prompt on the first fire, one token after,
+    /// `1 + drafts` under speculation. Also the lane's row count.
     pub tokens: Vec<u32>,
-    /// Each token's position in its sequence.
-    ///
-    /// Empty means the natural run `held .. held + tokens.len()`, which is
-    /// every case but the ones that are the point of stating it: a
-    /// speculative fire re-feeding rejected positions, and an mRoPE lane whose
-    /// positions are not one-dimensional.
+    /// Each token's position in its sequence. Empty means the natural run
+    /// `held .. held + tokens.len()`; non-empty for a speculative re-feed of
+    /// rejected positions or an mRoPE lane with non-1-D positions.
     pub positions: Vec<u32>,
     /// What this fire does to the lane's cache.
     pub kv: KvDelta,
-    /// An explicit attention mask, replacing the derived causal one. `Some`
-    /// is what makes the lane's `masked` fact true.
-    ///
-    /// **THE PAYLOAD IS A [`Masking`], NOT A [`Mask`], AND THAT IS THE
-    /// SLIDING WINDOW BEING EXPRESSIBLE.** A restriction of the lane's whole
-    /// readable extent is [`Masking::Extent`] and is what this field carried
-    /// when it was a bare `Mask`; a mask whose ROWS differ — the windowed
-    /// prefill, where row `i` keeps `[i - w, i]` — is [`Masking::Rows`], one
-    /// mask per entry of [`Lane::tokens`]. `Masking` argues both.
+    /// An explicit attention mask, replacing the derived causal one; `Some`
+    /// makes the lane's `masked` fact true. A [`Masking`] rather than a bare
+    /// [`Mask`] so a sliding window is expressible.
     pub mask: Option<Masking>,
-    /// Which adapter bank this lane routes to (design §8). `None` is the base
-    /// model.
+    /// Which adapter bank this lane routes to. `None` is the base model.
     pub adapter: Option<u32>,
-    /// **Run the model's draft head over this lane's rows** (design §8's MTP
-    /// row, palo C3). `true` is what makes the lane's `drafts` fact true.
-    ///
-    /// **A BARE BOOLEAN, AND THAT IS THE AXIS BEING HONEST ABOUT ITSELF.**
-    /// [`Lane::mask`] and [`Lane::adapter`] are payloads whose PRESENCE states
-    /// the fact, because each axis needs something from the submission that
-    /// only the caller has — a mask's bits, a bank's row. This axis needs
-    /// nothing: the draft head reads the lane's own hidden and the lane's own
-    /// tokens, over the lane's own rows, and there is no third thing to carry.
-    /// So the intent is the whole of the field.
-    ///
-    /// **IT IS STILL A SECOND STATEMENT AND IT STILL HAS TO AGREE WITH
-    /// [`Lane::word`].** The word decides the CLASS, and the class decides
-    /// whether the head's arm covers this lane's rows. A lane whose word says
-    /// `drafts` and whose submission does not is a fire whose caller will be
-    /// handed a draft column it never asked for and will not read; a lane that
-    /// asks and whose word does not is a lane that gets no draft and is not
-    /// told. Both are refused by name before anything launches
-    /// (`engine_cuda::Fault::DraftWord`), which is [`Lane::mask`]'s rule and
-    /// [`Lane::adapter`]'s rule for the third time.
-    ///
-    /// **THE ROW ALIGNMENT IS THE CALLER'S** (`models::qwen_3`'s own note): the
-    /// head was trained on `(hidden at p, token at p+1)` and is fed `(x, tok)`
-    /// at one row, so a drafting lane's row `r` must carry the token one
-    /// position past the hidden the trunk leaves at `r`. The contract states
-    /// the requirement; no engine can check it.
+    /// Run the model's draft head over this lane's rows; must agree with
+    /// [`Lane::word`]'s class. Row alignment is the caller's: the head reads
+    /// `(hidden at p, token at p+1)`, so row `r` must carry the token one
+    /// position past the hidden the trunk leaves at `r`.
     pub drafts: bool,
-    /// **Keep this lane's attention mass** (design §9's score-capture
-    /// archetype, palo C4). `true` is what makes the lane's `captures_scores`
-    /// fact true, and what puts its per-layer log-sum-exp into
-    /// [`LaneReadout::scores`].
-    ///
-    /// [`Lane::drafts`]'s twin in every respect, including the refusal
-    /// (`engine_cuda::Fault::ScoreWord`) and including being a bare boolean:
-    /// what the capture arm needs is the bit, and everything else about the
-    /// observation — which layers, how wide, how many rows — is the model
-    /// text's to declare and the artifact's to carry.
+    /// Keep this lane's attention mass; puts its per-layer log-sum-exp into
+    /// [`LaneReadout::scores`]. [`Lane::drafts`]'s twin in validation.
     pub captures_scores: bool,
-    /// **The recurrent-state verb this lane asks for** (alto design §2/§6).
-    ///
-    /// The typed verb HEAD never gave a seat: RS was a fold-per-token in the
-    /// forward and there was nothing in the contract that could say otherwise,
-    /// so speculation over a Mamba family was unexpressible rather than
-    /// refused. [`RsVerb`] is that vocabulary.
-    ///
-    /// **AN ENGINE THAT SERVES THE OTHER TWO SAYS SO** ([`Serves::rs_verbs`],
-    /// from [`Capabilities::rs_verbs`](crate::Capabilities::rs_verbs)); every
-    /// other refuses them by name at [`Lane::validate`] rather than quietly
-    /// folding — a lane that asked for a buffered scatter and got a
-    /// destructive fold would have its speculation corrupt the state it was
-    /// speculating over.
+    /// The recurrent-state verb this lane asks for ([`RsVerb`]). An engine
+    /// that does not serve the non-default verbs
+    /// ([`Serves::rs_verbs`]) refuses them by name rather than folding.
     #[serde(default)]
     pub rs: RsVerb,
-    /// **Whether this lane's recurrent slot arrives fresh** (alto survey §9's
-    /// gap list, wave F3).
-    ///
-    /// The fact belongs to the RS store and to nothing else. Until F3 the
-    /// shells derived it from the KV side — a lane stating `kv.held == 0` was
-    /// taken to be a sequence beginning, so its recurrent bank was zeroed —
-    /// which is a coincidence and not an identity: a runtime that forks a
-    /// sequence, restores a prefix or reuses a seat can hand a slot that must
-    /// be zeroed while its KV count is non-zero, and can hand one whose KV was
-    /// trimmed to nothing while its recurrence must continue.
-    ///
-    /// [`RsReset::Inferred`] is the default and IS the old rule, restated
-    /// where it can be seen: a caller that says nothing gets exactly the
-    /// behaviour it had.
+    /// Whether this lane's recurrent slot arrives fresh. Owned by the RS
+    /// store; not derivable from `kv.held == 0` (fork/restore/seat reuse can
+    /// disagree). [`RsReset::Inferred`] (default) is that old rule.
     #[serde(default)]
     pub rs_reset: RsReset,
-    /// **What this lane predicts its channels' cursors will be** (alto design
-    /// §1 article 3). Empty is "the host makes no prediction", which is every
-    /// lane in this tree today.
-    ///
-    /// Accepted by an engine that declares
-    /// [`device_channel_commit`](crate::Capabilities::device_channel_commit)
-    /// — the pull-validate and commit-bump kernels landed for CUDA in wave
-    /// F2a — and refused by name by every other, because a stated-and-ignored
-    /// prediction is worse than a refusal (see [`Ticket`]).
+    /// What this lane predicts its channels' cursors will be. Empty means no
+    /// prediction. Accepted only by an engine declaring
+    /// [`device_channel_commit`](crate::Capabilities::device_channel_commit);
+    /// others refuse it by name.
     #[serde(default)]
     pub channels: Vec<Ticket>,
     /// Which rows come back.
@@ -459,15 +242,8 @@ impl Lane {
     }
 
     /// As [`Lane::validate`], for an engine that states whether it validates
-    /// channel tickets on the device.
-    ///
-    /// **THE ONE THING A LANE CANNOT CHECK ABOUT ITSELF.** Every other clause
-    /// below is a fact about the lane's own shape; whether a stated prediction
-    /// will be honoured is a fact about the ENGINE, and
-    /// [`Capabilities::device_channel_commit`](crate::Capabilities::device_channel_commit)
-    /// is where an engine says so. An engine that validates them passes
-    /// `true`; one that would ignore them passes `false` and the ticket is
-    /// refused by name rather than dropped.
+    /// channel tickets on the device
+    /// ([`Capabilities::device_channel_commit`](crate::Capabilities::device_channel_commit)).
     ///
     /// # Errors
     ///
@@ -491,15 +267,7 @@ impl Lane {
                 self.rows()
             )));
         }
-        // A PER-ROW MASK IS PARALLEL TO THE ROWS OR IT IS NOT A PER-ROW MASK.
-        // `Masking::Rows` states one restriction per query row, so a count
-        // that is not the lane's row count leaves some row either undescribed
-        // (an engine would have to invent one, and inventing it is exactly
-        // the silent row-zero substitution this form exists to end) or
-        // describes a row the lane does not carry. It is the one thing about
-        // a masking a LANE can check about itself: the extent each row covers
-        // is `held + rows` and the shell owns that arithmetic, but the count
-        // is right here.
+        // A per-row mask must be parallel to the rows.
         if let Some(masking) = &self.mask
             && let Some(stated) = masking.stated_rows()
             && stated != self.tokens.len()
@@ -510,36 +278,35 @@ impl Lane {
                 self.rows()
             )));
         }
-        // ── THE TWO F1 SHAPES WITH NO F1 MECHANISM, REFUSED BY NAME.
-        //    Both are contract nouns this wave lands so that F2/F3 have
-        //    somewhere to put their work; neither has a device half yet, and
-        //    an accepted-then-ignored field is the one failure mode a typed
-        //    contract exists to prevent (design §1 article 3's own argument
-        //    about predictions, and §6's about the fold).
         if !self.channels.is_empty() && !serves.device_channel_commit {
             return Err(Error::unsupported("engine", F3_CHANNEL_TICKETS));
         }
         if !matches!(self.rs, RsVerb::Fold) && !serves.rs_verbs {
-            return Err(Error::unsupported("engine", F3_RS_VERBS));
+            return Err(Error::unsupported("engine", RS_VERBS_WITHOUT_DEVICE_HALF));
         }
-        // **THE MIXED ROW IS SERVED NOW** (design §6's "fused collapse",
-        // survey §9's last bullet; wave F3b built the 2R-segment split). What
-        // is left is the one thing about it a lane CAN check about itself:
-        // a boundary is a position among this fire's own rows, so a host
-        // stated one past them names a token this fire does not carry. A
-        // device-stated one is clamped by the shell at compose and cannot be
-        // checked here at all — which is `FoldLen`'s own rule.
+        // A host-stated fold boundary must be among this fire's own rows; a
+        // device-stated one is clamped by the shell at compose.
         if let RsVerb::Buffer {
             fold: FoldLen::Host(fold),
+            replay,
             ..
         } = &self.rs
-            && *fold > self.rows()
+            && *fold > replay.saturating_add(self.rows())
         {
-            return Err(Error::Invalid(format!(
-                "lane in slot {} folds {fold} of the {} rows it carries",
-                self.slot,
-                self.rows()
-            )));
+            return Err(Error::Invalid(if *replay == 0 {
+                format!(
+                    "lane in slot {} folds {fold} of the {} rows it carries",
+                    self.slot,
+                    self.rows()
+                )
+            } else {
+                format!(
+                    "lane in slot {} folds {fold} of the {} rows it carries plus the {replay} \
+                     buffered token(s) it replays ahead of them",
+                    self.slot,
+                    self.rows()
+                )
+            }));
         }
         Ok(())
     }
@@ -550,20 +317,10 @@ const F3_CHANNEL_TICKETS: &str =
     "Lane::channels against an engine without the pull-validate and commit-bump kernels";
 
 /// The verb spelling for the recurrent verbs an engine has no device half for.
-const F3_RS_VERBS: &str = "Lane::rs beyond RsVerb::Fold (wave F3: the RS device half)";
+const RS_VERBS_WITHOUT_DEVICE_HALF: &str = "Lane::rs beyond RsVerb::Fold: this engine has no device half for it";
 
-/// **What an engine states it will actually honour**, carried into
+/// What an engine states it will actually honour, carried into
 /// [`Lane::validate_for`].
-///
-/// **A STATED-AND-IGNORED FIELD IS THE ONE FAILURE A TYPED CONTRACT EXISTS TO
-/// PREVENT** (design §1 article 3). Two fields of [`Lane`] are predictions an
-/// engine either checks or cannot: the channel tickets and the recurrent verb.
-/// Neither is a fact about the lane, so neither can be checked by the lane
-/// alone — the engine answers, and a lane that asked for something this engine
-/// would drop is refused BY NAME instead of quietly served as something else.
-///
-/// It is a struct rather than two positional `bool`s because it grew from one
-/// to two in a single wave and would have grown a third silently.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Serves {
     /// This engine advances its channel rings on the device
@@ -575,127 +332,85 @@ pub struct Serves {
 }
 
 impl Serves {
-    /// The shape every engine had before F2a: neither prediction honoured.
+    /// Neither prediction honoured.
     pub const NONE: Serves = Serves {
         device_channel_commit: false,
         rs_verbs: false,
     };
 }
 
-/// **Whether a lane's recurrent slot begins here** (alto survey §9).
-///
-/// A recurrent slot IS its history: opening a sequence in a slot another
-/// sequence used means zeroing what that one left, because the scan reads the
-/// whole bank on its first step. Who KNOWS a slot is fresh is the question
-/// this type answers, and until F3 the answer was the wrong store's — the
-/// shells keyed the zeroing on `KvDelta::held == 0`.
+/// Whether a lane's recurrent slot begins here. Opening a sequence in a slot
+/// another sequence used means zeroing what that one left, since the scan
+/// reads the whole bank on its first step.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RsReset {
-    /// **The caller states nothing, so the engine keeps its old rule**: a lane
-    /// arriving with `kv.held == 0` is a sequence beginning. Exactly the
-    /// behaviour every caller had before this field existed, which is why it
-    /// is the default.
+    /// No statement: the engine's old rule applies (`kv.held == 0` means a
+    /// sequence beginning).
     #[default]
     Inferred,
-    /// The RS store classified this slot as FRESH: zero its banks before the
-    /// fire reads them, whatever the KV side says.
+    /// The RS store classified this slot as fresh: zero its banks first.
     Fresh,
-    /// The RS store classified this slot as CONTINUING: leave its banks
-    /// alone, whatever the KV side says.
+    /// The RS store classified this slot as continuing: leave its banks alone.
     Held,
 }
 
-/// **What this lane's pass does to its recurrent state** (alto design §6).
-///
-/// Dev's programming model, typed. The default is the only shape that
-/// graph-replays and the only one this tree serves; the other two are the
-/// speculation vocabulary the Mamba families need, named here so that the
-/// exception register has something to point at and so that asking for one is
-/// a refusal rather than a silent fold.
+/// What this lane's pass does to its recurrent state. The default is the
+/// only shape this tree serves today; the other two are the Mamba-family
+/// speculation vocabulary, refused by name rather than silently folded.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RsVerb {
-    /// Fold each token into the recurrent state inside the forward. The
-    /// default, and a predicated commit like every other durable advance
-    /// (article 3).
+    /// Fold each token into the recurrent state inside the forward.
     #[default]
     Fold,
-    /// Scatter the in-projection activations into `pages` and leave the folded
+    /// Scatter the in-projection activations into `pages`, leaving folded
     /// state untouched: a draft whose rejection is pure host bookkeeping.
     Buffer {
-        /// **The lane's whole buffer run**, as a LIST of physical buffer-page
-        /// slot ids in buffer order: entry `j` holds buffer tokens
-        /// `[j * page_tokens, (j + 1) * page_tokens)`, where `page_tokens` is
-        /// the engine's kv page size ([`PoolFacts`](crate::caps::PoolFacts)).
-        ///
-        /// The whole run and not this fire's share of it, because
-        /// [`RsVerb::FoldBuffered`] addresses the same run from the same
-        /// origin and the two spellings must agree without a second field.
-        ///
-        /// **A LIST AND NOT A RANGE** (wave F3-tail), which is
-        /// [`KvDelta::pages`]'s shape for [`KvDelta::pages`]'s reason: the
-        /// runtime's recurrent store allocates buffer pages one at a time and
-        /// copies them on write after a fork, so a lane's run is contiguous
-        /// only by luck. A range forced the runtime to state a first page and
-        /// a count it could not honour, and the list IS the translation the
-        /// runtime used to carry beside it — `pages[j]` is the physical slot
-        /// logical buffer page `j` currently lives in.
+        /// The lane's whole buffer run as physical buffer-page slot ids, in
+        /// buffer order: entry `j` holds tokens `[j*page_tokens, (j+1)*page_tokens)`.
+        /// A list, not a range: pages are copy-on-write after a fork, so a
+        /// run is contiguous only by luck.
         pages: Vec<u32>,
-        /// **Which buffer token this fire's first row lands at.** A pure
-        /// append states its current occupancy; a re-drafted window states the
-        /// accepted boundary it is re-filling from.
+        /// Which buffer token this fire's first row lands at.
         at: u32,
-        /// **How many of this fire's rows this lane also FOLDS** (design
-        /// §6's fused collapse).
-        ///
-        /// **`FoldLen::Host(0)` IS THE PURE SCATTER** — the draft whose
-        /// rejection is host bookkeeping, with the folded state untouched.
-        /// Anything else is the MIXED ROW: one fire that writes every row
-        /// into the buffer AND lands the durable state on row `fold`, so the
-        /// next window's speculation begins at the accepted boundary without
-        /// a second fire.
-        ///
-        /// Counted in THIS FIRE'S ROWS and bounded by them: `fold == rows`
-        /// is the fire that buffers a window and folds all of it, and a
-        /// boundary strictly inside the row is what takes the engine's
-        /// 2R-segment split (wave F3b).
+        /// How many of this fire's rows this lane also folds.
+        /// `FoldLen::Host(0)` is the pure scatter; otherwise the fire also
+        /// lands durable state on row `fold`. Counted in the lane's EXTENDED
+        /// layout `[replay | rows]`, so it is bounded by `replay + rows`.
         fold: FoldLen,
+        /// **The buffer read path**: how many already-buffered tokens sit
+        /// immediately before `at` and must be replayed through the
+        /// recurrence AHEAD of this fire's rows, so the rows start from
+        /// `folded (+) replay(buffer)` rather than from the folded state
+        /// alone. The tokens live at buffer positions `[at - replay, at)`.
+        /// Zero is the ordinary scatter onto an empty buffer. A speculative
+        /// decoder's every round but the first has one: the accepted prefix
+        /// of the last window survives in the buffer unfolded, and the next
+        /// window's fire folds it (`fold == replay`) while buffering its own
+        /// rows. Engines that serve no read path refuse a non-zero value by
+        /// name.
+        #[serde(default)]
+        replay: u32,
     },
     /// Replay the buffer through conv+recurrence, truncated at the accepted
-    /// boundary — the batch fold, skipping the in-projection GEMM.
+    /// boundary: the batch fold, skipping the in-projection GEMM.
     FoldBuffered {
         /// The lane's buffer run, addressed exactly as [`RsVerb::Buffer`]
-        /// wrote it: the same list of physical page slot ids, page-major from
-        /// buffer token zero.
+        /// wrote it.
         pages: Vec<u32>,
-        /// **Which buffer token the replay starts at** — [`RsVerb::Buffer`]'s
-        /// `at`, from the same origin (wave F3b).
-        ///
-        /// **THE GAP F3 DOCUMENTED AND DID NOT CLOSE.** A fold absorbs tokens
-        /// off the FRONT of a lane's buffer but can only release whole
-        /// covered pages, so a fold that lands mid-page leaves the survivors
-        /// physically offset inside their first page — and a replay that
-        /// started at buffer token zero would fold the absorbed tokens a
-        /// second time before it reached the live ones. The runtime knew the
-        /// number (`buffer_heads[r]`) and had nowhere to state it, so every
-        /// fold this tree served had to take the buffer whole or land on a
-        /// page boundary. It states it here.
+        /// Buffer-token offset the replay starts at — [`RsVerb::Buffer`]'s
+        /// `at`. A fold can only release whole covered pages, so survivors
+        /// may sit offset inside their first page; this is that offset.
         at: u32,
-        /// The host's upper bound on the accepted length, which is what sizes
-        /// the launch. The device clamps to it.
+        /// The host's upper bound on the accepted length, sizing the launch.
+        /// The device clamps to it.
         bound: u32,
         /// The accepted length itself.
         len: FoldLen,
     },
 }
 
-/// **How long a fold is, and who knows it** (dev ABI v24's `FOLD_LEN_DEVICE`,
-/// promoted from a sentinel to a type).
-///
-/// The accepted count of a speculative pass is device data — it is computed by
-/// the verifier on the stream — and article 3 forbids round-tripping it
-/// through the host. A shell resolves the port at compose, clamps it to the
-/// verb's `bound`, and nothing downstream may branch on which variant it was:
-/// the two spellings must produce the same launch.
+/// How long a fold is, and who knows it. The accepted count is device data
+/// computed by the verifier and must not round-trip through the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FoldLen {
     /// The host knows it: a fixed count it computed itself.
@@ -704,11 +419,8 @@ pub enum FoldLen {
     Device(eta_ir::registry::Port),
 }
 
-/// Where a guest program runs relative to the immutable graph.
-///
-/// Two points, and there is no third (design §9): guest computation attaches
-/// **only** before and after. A mid-graph hook would tear the recorded graph at
-/// every layer, which is what the axis mechanism exists to make unnecessary.
+/// Where a guest program runs relative to the immutable graph: before or
+/// after, never mid-graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Boundary {
     /// Before the graph: token preparation, channel reads, state.
@@ -717,22 +429,13 @@ pub enum Boundary {
     Epilogue,
 }
 
-/// One guest-program instance attached to this fire.
-///
-/// **ONE ATTACHMENT PER INSTANCE PER FIRE, AND [`Attachment::at`] SAYS WHERE
-/// THE WHOLE PROGRAM RUNS.** A guest program's `Stage::Prologue` and
-/// `Stage::Epilogue` bodies are not two attachments: they are one pass with
-/// one readiness gate and one pass-atomic commit, and an engine fires all of a
-/// program's stages together. So this names an instance and the side of the
-/// graph its pass runs on — a program that reads
-/// [`IntrinsicId::Logits`](eta_ir::op::IntrinsicId) must be
-/// [`Boundary::Epilogue`], because before the graph there is no readout to
-/// point it at. Naming one instance twice in one submission would run its
-/// pass twice and commit its channels twice, and an engine refuses it.
+/// One guest-program instance attached to this fire. One attachment per
+/// instance per fire: `Stage::Prologue`/`Stage::Epilogue` are one pass with
+/// one commit. A program reading [`IntrinsicId::Logits`](eta_ir::op::IntrinsicId)
+/// must be [`Boundary::Epilogue`]. Naming one instance twice is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
-    /// Which lane of this submission it runs for. The lane whose readout row
-    /// an epilogue's `logits` intrinsic is pointed at.
+    /// Which lane of this submission it runs for.
     pub lane: u32,
     /// Which bound instance.
     pub instance: InstanceId,
@@ -740,85 +443,37 @@ pub struct Attachment {
     pub at: Boundary,
 }
 
-/// **ONE LANE'S MEDIA SPANS, AS THE SUBMISSION CARRIES THEM** (media-door §6).
+/// One lane's media spans, as the submission carries them. A parallel slice
+/// keyed by lane, like [`Attachment`]: most lanes have no media.
 ///
-/// **A PARALLEL SLICE KEYED BY LANE, WHICH IS [`Attachment`]'S PRECEDENT AND
-/// NOT A NEW IDEA.** A guest attachment is a property of one lane that most
-/// lanes do not have, so it rides beside the lanes rather than as a field on
-/// every [`Lane`]; media is exactly the same shape of fact, and a text-only
-/// submission constructs nothing, assembles no vector and stages no byte.
-///
-/// It is `runtime::pipeline::media::LaneMedia` field for field, and that is
-/// deliberate: MD-A derives every one of these numbers from the run scan, so
-/// the contract is where they are STATED and not where they are computed.
-/// Below it, `engine_cuda::serve::Media` borrows straight out of this record —
-/// the same fields, borrowed rather than owned — so the marshal at an engine's
-/// submit is a borrow and one conversion, and no arithmetic of its own.
-///
-/// # `patches` is `f32`, and the conversion is the ENGINE's
-///
-/// The payload a front-end computes is real-valued; the element a plan
-/// computes in is the plan's — `bf16` for every tower in this catalog, and a
-/// fact no party above the load knows. So the contract carries the numbers and
-/// the engine converts them at the marshal, where `PatchSeat::dtype` is a
-/// value it can read. A submission stated in bytes would have had to guess it.
+/// `patches` is `f32`; conversion to the plan's element type happens at the
+/// engine's marshal.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StepMedia {
-    /// Which lane of THIS STEP the spans belong to. A submission states its
-    /// own lane numbering and the batcher rebases it, exactly as it rebases
-    /// [`Attachment::lane`].
+    /// Which lane of this step the spans belong to; rebased by the batcher
+    /// like [`Attachment::lane`].
     pub lane: u32,
-    /// How many payload rows each span contributes, in submission order. Its
-    /// length is the lane's span count and its sum is its payload row count.
+    /// Payload rows per span, in submission order; length is the span count,
+    /// sum is the payload row count.
     pub rows: Vec<u32>,
-    /// The payload rows themselves, concatenated over this lane's spans:
-    /// `rows.iter().sum()` rows of the plan's declared patch width, in the
-    /// order the front-end laid them (merge- or pool-block-major, by statute).
+    /// Payload rows concatenated over this lane's spans:
+    /// `rows.iter().sum()` rows of the plan's declared patch width.
     pub patches: Vec<f32>,
-    /// Where this lane's tower output lands in the TOKEN rectangle — one
-    /// entry per payload row, as an offset into THIS LANE's token rows.
-    ///
-    /// **THE LIVE PREFIX IS FOLD-SPACE AND SPANS THE WHOLE LANE.** A route is
-    /// read at the FOLD's output row: a plan that merges `side²` payload rows
-    /// into one answers `payload_rows / fold` rows, and an engine pairs output
-    /// row `j` with `routes[j]`. So the addresses are the lane's spans'
-    /// `token_count`s CONCATENATED — span 0's, then span 1's, back to back,
-    /// with no per-span padding between them — and the `-1` tail is ONE tail
-    /// at the end of the lane, padding the vector out to the
-    /// `[Dim::Patches]` rectangle's own length. Per-span padding is the same
-    /// vector for one span and drops every span after the first.
-    ///
-    /// **LANE-RELATIVE, AND REBASED BY THE ENGINE.** A submission cannot know
-    /// the seriated fire it will land in, so a route says "my seventh token
-    /// row" and the shell adds the lane's own row offset. `-1` names no row,
-    /// so it is NOT rebased, and an engine admits it only for a plan that
-    /// declares an op honouring it.
+    /// Where this lane's tower output lands in the token rectangle — one
+    /// entry per payload row, as an offset into this lane's token rows.
+    /// Lane-relative; `-1` names no row and is not rebased.
     pub routes: Vec<i32>,
-    /// **THE TOWER'S ROTATION STREAM**: three `i32` per payload row — each
-    /// row's own `(t, h, w)` in its span's grid, in [`patches`](StepMedia::patches)'
-    /// own order.
-    ///
-    /// **NOT REBASED, AND THAT IS THE DIFFERENCE FROM `routes`.** A route
-    /// names a token row, which only the seriated fire knows the number of; a
-    /// grid coordinate is a property of the span and means the same thing in
-    /// every fire it lands in.
+    /// The tower's rotation stream: three `i32` per payload row, each row's
+    /// `(t, h, w)` in its span's grid. Not rebased (a grid coordinate is a
+    /// span property, same in every fire it lands in).
     pub positions: Vec<i32>,
-    /// **WHICH ROWS OF THE LEARNED POSITION TABLE EACH ROW GATHERS**: `taps`
-    /// entries per payload row, in `patches`' own order. Both this and
-    /// [`embed_weights`](StepMedia::embed_weights) are EMPTY on the native
-    /// grid — the cheap path, where the plan declares no resampling and
-    /// nothing is staged. `taps` is the PLAN's, so the engine is what checks
-    /// the length.
+    /// Which rows of the learned position table each row gathers: `taps`
+    /// entries per payload row. Empty on the native grid (no resampling).
     pub embed_rows: Vec<i32>,
     /// Beside [`embed_rows`](StepMedia::embed_rows), same length.
     pub embed_weights: Vec<f32>,
-    /// **THE TRUNK'S ROTATION STREAM FOR THIS LANE**: three `i32` per TOKEN
-    /// row of the lane.
-    ///
-    /// **EMPTY IS LEGAL AND MEANS SCALAR `(p, p, p)`**, which is what every
-    /// lane under 1-D RoPE writes and what an engine fills for every lane that
-    /// submitted nothing at all. A lane under M-RoPE owes one triple per token
-    /// row.
+    /// The trunk's rotation stream for this lane: three `i32` per token row.
+    /// Empty means scalar `(p, p, p)` (1-D RoPE); M-RoPE owes one triple per row.
     pub token_positions: Vec<i32>,
 }
 
@@ -829,14 +484,9 @@ impl StepMedia {
         self.rows.iter().copied().fold(0u32, u32::saturating_add)
     }
 
-    /// **THE PARTS A CONTRACT CAN CHECK, AND NOT ONE MORE.**
-    ///
-    /// Every length here is a function of `rows` alone. The two that are NOT
-    /// — the payload's width (`C·T·P²`) and the position table's tap count —
-    /// are the PLAN's numbers, read off a trace an engine holds and this
-    /// crate does not, so they are refused at the shell by name
-    /// (`Fault::PatchPayload`) and stating a second opinion here would be a
-    /// check that could disagree with the one that matters.
+    /// Checks only what a length function of `rows` alone can settle; payload
+    /// width and tap count are the plan's own numbers, refused at the shell
+    /// instead (`Fault::PatchPayload`).
     ///
     /// # Errors
     ///
@@ -878,8 +528,6 @@ impl StepMedia {
                 self.embed_weights.len()
             )));
         }
-        // Empty is the scalar-rope answer; anything else is one triple per
-        // token row of the lane it names.
         if !self.token_positions.is_empty()
             && self.token_positions.len() != 3 * lane_rows as usize
         {
@@ -894,30 +542,19 @@ impl StepMedia {
     }
 }
 
-/// **One forward pass over the assembled batch — one STEP of a frame.**
+/// One forward pass over the assembled batch — one step of a frame (1..=k
+/// steps, sealed in order).
 ///
-/// This is what `FireSubmission` was, under the name the execution plane gives
-/// it (alto design §2). A frame is 1..=k of these, sealed in order; the
-/// degenerate one-step frame is exactly the fire that used to be the contract's
-/// unit of work.
-/// **`Eq` CAME OFF WHEN THE MEDIA ROWS WENT ON.** A payload row is real-valued
-/// and `f32` is not `Eq`; the derive was never load-bearing (nothing in the
-/// tree keyed a `Step`), and `PartialEq` — which every test that compares two
-/// submissions actually uses — survives.
+/// No `Eq`: a payload row is `f32`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Step {
     /// The requests in this fire, in submission order. Answers come back in
-    /// the same order, whatever order the fire ran them in.
+    /// the same order.
     pub lanes: Vec<Lane>,
     /// The guest programs attached at this fire's boundaries.
     pub attachments: Vec<Attachment>,
-    /// **THE MEDIA SPANS THIS FIRE'S LANES SUBMITTED** (media-door §6), keyed
-    /// by lane and empty for every text-only fire — which is every fire in
-    /// this tree before the media door was cut.
-    ///
-    /// A `Vec` that a text-only submission never allocates is the whole point
-    /// of the shape: `Step::default()` is the struct it always was, and the
-    /// engines that refuse media refuse it by looking at one `is_empty`.
+    /// The media spans this fire's lanes submitted, keyed by lane; empty for
+    /// every text-only fire.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<StepMedia>,
 }
@@ -929,10 +566,9 @@ impl Step {
         self.lanes.iter().map(Lane::rows).sum()
     }
 
-    /// Is this a submission the contract describes?
-    ///
-    /// Per-lane arithmetic plus the two things that are about the batch: no
-    /// slot appears twice, and every attachment names a lane that exists.
+    /// Is this a submission the contract describes? Checks per-lane
+    /// arithmetic plus batch-wide invariants: no slot twice, every
+    /// attachment names an existing lane.
     ///
     /// # Errors
     ///
@@ -968,9 +604,7 @@ impl Step {
                     attachment.lane
                 )));
             }
-            // One pass per instance per fire: see [`Attachment`]. A second
-            // one would re-run the readiness gate against cursors the first
-            // already advanced, and commit the same channel effects twice.
+            // One pass per instance per fire: see [`Attachment`].
             if self.attachments[..index]
                 .iter()
                 .any(|earlier| earlier.instance == attachment.instance)
@@ -982,12 +616,7 @@ impl Step {
                 )));
             }
         }
-        // **AND THE MEDIA ROWS, ON THE ATTACHMENTS' OWN TERMS** (media-door
-        // §6). The same two batch-wide questions an attachment answers — does
-        // the lane it names exist, and is one lane named twice — plus the
-        // lengths [`StepMedia::validate`] can settle from `rows` alone. A lane
-        // handed two media rows is two concatenations with two payload orders
-        // for one rectangle, which is not a submission any engine can seriate.
+        // Same batch-wide checks as an attachment, plus StepMedia::validate.
         for (index, media) in self.media.iter().enumerate() {
             let Some(lane) = self.lanes.get(media.lane as usize) else {
                 return Err(Error::Invalid(format!(
@@ -1008,30 +637,9 @@ impl Step {
     }
 }
 
-/// **The unit of work the contract admits: 1..=k steps, sealed in order.**
-///
-/// The one forward verb takes this and nothing else (alto design §2). Three
-/// articles are why it is a frame rather than a fire:
-///
-/// * **Article 4 (static admission).** Every step is validated, the union of
-///   their demands is taken, and it is committed ONCE. `Exhausted` and
-///   `Impossible` return with zero side effects; past the commit, stream work
-///   is success-only. A per-step admission could refuse step 3 of a frame
-///   whose steps 1 and 2 had already written KV, which is a partial frame the
-///   caller cannot retry and cannot undo.
-/// * **Article 1 (saturation).** `submit` enqueues all k steps before it
-///   returns, so step W+1 is on the stream before step W completes. A caller
-///   that fired k times could not have been ahead of the device by
-///   construction.
-/// * **Article 2 (untouched transition).** Nothing host-side stands between
-///   consecutive steps — no read, no decision, no synchronize. The steps are
-///   handed over together precisely so that no host loop can creep between
-///   them.
-///
-/// **F1 SHIPS THE SHAPE, NOT YET THE PHYSICS.** The shells in this tree run a
-/// frame's steps back to back, synchronously, and a k-step frame costs exactly
-/// what k fires cost. What changed is that the seam where the saturation goes
-/// now exists and the runtime speaks through it.
+/// The unit of work the contract admits: 1..=k steps, sealed in order,
+/// validated and committed together as one frame rather than a partial one
+/// the caller can neither retry nor undo.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FrameSubmission {
     /// The steps, in the order the device runs them. At least one.
@@ -1039,7 +647,7 @@ pub struct FrameSubmission {
 }
 
 impl FrameSubmission {
-    /// The degenerate one-step frame — the fire that `fire` used to be.
+    /// The degenerate one-step frame.
     #[must_use]
     pub fn of(step: Step) -> FrameSubmission {
         FrameSubmission { steps: vec![step] }
@@ -1051,10 +659,8 @@ impl FrameSubmission {
         self.steps.iter().map(Step::rows).sum()
     }
 
-    /// Is this a frame the contract describes?
-    ///
-    /// Article 4's first half: **every** step is checked before any of them is
-    /// admitted, which is what makes a refusal free.
+    /// Is this a frame the contract describes? Every step is checked before
+    /// any is admitted.
     ///
     /// # Errors
     ///
@@ -1066,12 +672,8 @@ impl FrameSubmission {
     }
 
     /// As [`FrameSubmission::validate`], carrying the admitting engine's own
-    /// answer about channel tickets down to [`Lane::validate_for`].
-    ///
-    /// **AN ENGINE CALLS THIS ONE**, with its own
-    /// [`Capabilities::device_channel_commit`](crate::Capabilities::device_channel_commit),
-    /// because whether a stated prediction will be honoured is a fact about
-    /// the engine and not about the frame.
+    /// [`Capabilities::device_channel_commit`](crate::Capabilities::device_channel_commit)
+    /// down to [`Lane::validate_for`].
     ///
     /// # Errors
     ///
@@ -1087,12 +689,10 @@ impl FrameSubmission {
     }
 }
 
-/// **The receipt for one admitted frame**, one entry per step.
-///
-/// Synchronous shells fill every step's readouts before `submit` returns, which
-/// is what F1 preserves. An asynchronous one answers the id with empty
-/// readouts and the runtime's broker correlates the completion on
-/// [`FrameTicket::id`].
+/// The receipt for one admitted frame, one entry per step. A synchronous
+/// shell fills every step's readouts before `submit` returns; an
+/// asynchronous one answers with empty readouts and correlates completion
+/// on [`FrameTicket::id`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FrameTicket {
     /// This frame's id, unique for the life of the load.
@@ -1101,15 +701,9 @@ pub struct FrameTicket {
     pub steps: Vec<FireTicket>,
 }
 
-/// One attention layer's captured mass, for one lane (design §9, palo C4).
-///
-/// **THE LSE, NOT A SCORE MATRIX, AND THAT IS THE HONEST EXPORT.** A full
-/// `[query, key]` score matrix is not a value a paged attention kernel ever
-/// materializes — it is streamed tile by tile and never exists whole. The
-/// log-sum-exp is what the kernel DOES hand back beside `o`; it is the
-/// normalizer every per-key score is a ratio against, and it is the quantity a
-/// capture consumer can actually be given without the graph growing a second
-/// attention.
+/// One attention layer's captured mass, for one lane. The log-sum-exp (the
+/// normalizer per-key scores are a ratio against), not a full score matrix —
+/// a paged attention kernel never materializes that.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LayerScores {
     /// Which transformer layer this column came from, as the plan's `Seam`
@@ -1135,47 +729,14 @@ pub struct LaneReadout {
     /// This lane's captured attention mass, one entry per attention layer the
     /// model text exports at `model_dsl::seam::SCORES`, in layer order. Empty
     /// unless the lane set [`Lane::captures_scores`].
-    ///
-    /// **THE READOUT IS THE SCORE DOOR, AND THE CHOICE WAS BETWEEN THREE**
-    /// (palo C4b). Design §9 prefers the guest-at-the-boundary route — an
-    /// intrinsic the way [`Boundary::Epilogue`] binds
-    /// `IntrinsicId::Logits` — and that route is genuinely shut for this
-    /// value: the intrinsic that exists for scores
-    /// ([`IntrinsicId::AttnScore`](eta_ir::op::IntrinsicId)) is registered
-    /// at `Stage::OnAttn`, a MID-GRAPH tap, and §9 abolished the third
-    /// boundary. It also promises the wrong numbers — `[num_heads, kv_len]`
-    /// per-key softmax weights, not a per-query mass — so pointing it at this
-    /// column would be a lie that computes. The other candidate, a
-    /// [`Pool`](crate::transfer::Pool) variant and a copy verb, is the wrong
-    /// noun: a pool is pages a caller resizes and maps, and this is an arena
-    /// rectangle the carve placed. What is left is the door the trunk's logits
-    /// already take when no guest is attached — this one — and it costs the
-    /// contract one field that is empty in every fire nobody captured.
-    ///
-    /// An epilogue-legal score intrinsic would bind against exactly the
-    /// rectangle this field is read from, so nothing here is in that route's
-    /// way; what it needs is a row in `eta-ir`'s intrinsic table, which is
-    /// the frozen side of this wave's seam.
     #[serde(default)]
     pub scores: Vec<LayerScores>,
 }
 
-/// The receipt for one accepted fire.
-///
-/// **This is all that is left of `completion.rs`.** That module was 807 lines
-/// of run-ahead machinery — a `CompletionBroker` with a live registry and a
-/// recycling pool of terminal cells, a `SubmissionCompletion` future parked on
-/// a `waker` slot table, per-work-item leases, a four-state `TerminalOutcome`
-/// written through a `#[repr(C)]` atomic cell — living inside the contract
-/// that describes what an engine *is*. None of it is: it is how the RUNTIME
-/// decides to run ahead of a device, and it belongs beside the scheduler that
-/// makes that decision (decision 19). The contract keeps the receipt.
-///
-/// The shells this contract has are synchronous: the eager walk completes
-/// before `fire` returns, and [`FireTicket::readouts`] is already filled. An
-/// asynchronous shell answers with the id and an empty readout list, and
-/// [`FireTicket::id`] is what the runtime-side broker correlates its completion
-/// on.
+/// The receipt for one accepted fire. A synchronous shell fills
+/// [`FireTicket::readouts`] before returning; an asynchronous one answers
+/// with the id and empty readouts, correlating completion on
+/// [`FireTicket::id`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FireTicket {
     /// This fire's id, unique for the life of the load.
@@ -1186,9 +747,7 @@ pub struct FireTicket {
 }
 
 /// The `encode` verb's argument: non-text modalities in, embedding rows out.
-///
-/// Kept whole from `MediaEncodePlan` — it is a batch of independent blobs with
-/// an anchor row each, and there is no per-lane structure in it to purify.
+/// A batch of independent blobs with an anchor row each.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaEncode {
     /// Per image: `(temporal, height, width)` patch counts, three entries each.
@@ -1219,8 +778,8 @@ impl MediaEncode {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for a payload with no anchor, an anchor with
-    /// no payload, or a partition that does not cover its bytes.
+    /// [`Error::Invalid`] for a payload with no anchor, an anchor with no
+    /// payload, or a partition that does not cover its bytes.
     pub fn validate(&self) -> Result<()> {
         const F32: usize = size_of::<f32>();
         const U16: usize = size_of::<u16>();

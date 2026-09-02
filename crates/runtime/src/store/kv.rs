@@ -1,27 +1,18 @@
 //! KV store: WorkingSets, the mapping trie, typed pool access, implicit CoW
-//! allocation, hash lifecycle, and the prepare/commit/abort protocol
-//! (kv_refact.md, Runtime Module Architecture).
+//! allocation, hash lifecycle, and the prepare/commit/abort protocol.
 //!
-//! Layering:
-//! - [`hash`]: pure token-slot / page / cached-path hash calculations.
-//! - [`page_table`]: `KvPageTable` — the radix-compressed mapping trie,
-//!   `Pages::ParentSelection` structural sharing, reachability lifetime, and
-//!   flattening. It never allocates physical ids or calls engine APIs.
-//! - [`write`]: `KvPreparedWrite`, the per-fire prepared operation.
-//! - [`KvStore`] (this module): the single authority over which
-//!   `PhysicalKvPageId`s are live. Owns the table and the typed pool,
-//!   classifies write intents (fresh / in-place / CoW), and commits or aborts
-//!   prepared writes on engine completion epochs.
+//! Layering: [`hash`] is pure hash calculations; [`page_table`] owns
+//! `KvPageTable` (the radix-compressed mapping trie, structural sharing,
+//! reachability, flattening) and never allocates physical ids or calls
+//! engine APIs; [`write`] holds the per-fire prepared operation
+//! (`KvPreparedWrite`); [`KvStore`] (this module) is the single authority
+//! over which `PhysicalKvPageId`s are live — it owns the table and typed
+//! pool, classifies write intents (fresh/in-place/CoW), and commits or
+//! aborts prepared writes on engine completion epochs.
 //!
-//! WIT resource wiring (`store/kv/working_set.rs`) and CAS/CacheFabric
-//! integration (`store/kv/cas.rs`) land in later increments.
-//!
-//! Complete typed-store API (kv_refact.md): some methods here are not yet
-//! called by the live single-model fire path (only a subset of the typed
-//! store surface is currently wired) but are exercised by this module's
-//! own unit test suite and reserved for upcoming increments (contention/
-//! reclaim expansion, RS buffer-write paths, etc.) — kept rather than
-//! deleted, allowed rather than silently masked.
+//! `#![allow(dead_code)]`: some methods here aren't yet called by the live
+//! fire path but are exercised by this module's tests and reserved for
+//! upcoming work.
 #![allow(dead_code)]
 
 pub mod hash;
@@ -125,11 +116,8 @@ impl Default for FlatEntry {
 }
 
 /// A fresh working set's heap state, built *outside* the global KV lock.
-///
-/// `FlatEntry::default()` allocates. Doing that while holding the store mutex
-/// means one slow `malloc` -- e.g. a direct-reclaim stall when the host is
-/// under memory pressure -- blocks every lane that needs the KV store, which
-/// has been measured at over a second. Allocate first, then take the lock.
+/// `FlatEntry::default()` allocates, and doing that while holding the store
+/// mutex would block every lane needing the KV store on one slow `malloc`.
 pub struct PreparedWorkingSet {
     entry: FlatEntry,
 }

@@ -1,52 +1,7 @@
-//! The indirect command buffer: the walk, encoded ONCE, and rewritten
-//! afterwards instead of re-encoded (`.wiki/palo/icb.md` §2).
-//!
-//! **THE ONE THING THIS BUYS.** A fire's dispatches are encoded into a fresh
-//! `MTLComputeCommandEncoder` every time, and that encode is host work
-//! proportional to the artifact: measured on the M1 Max, 465 dispatches of
-//! eighteen bindings each cost **319 µs of host time per fire**. An
-//! `MTLIndirectCommandBuffer` holds the same 465 commands permanently; a fire
-//! rewrites the components that moved and issues one
-//! `executeCommandsInBuffer:`, which costs **4.4 µs**. Nothing about the GPU
-//! work changes — a barriered ICB slot is the same serialized dispatch a
-//! compute pass gives — so what is removed is exactly the encode.
-//!
-//! # What an ICB slot is not, measured on the M1 Max
-//!
-//! Three differences from a compute pass, none of them optional:
-//!
-//! - **There is no `setBytes:`.** `MTLIndirectComputeCommand` binds buffers
-//!   and nothing else, so every scalar a `kernels-metal` entry marshals as
-//!   `ArgValue::I32`/`U32`/`F32`/`Usize` has to live in a device buffer and
-//!   be bound at its index. That is what [`Icb::constants`] is: one
-//!   reservation, one cell per scalar argument of every slot, written at
-//!   build and rewritten in place when a value moves. **The shaders need no
-//!   change** — a `constant int&` parameter reads a buffer binding and an
-//!   inline `setBytes` identically, which is measured, not assumed.
-//! - **Commands are CONCURRENT unless a barrier says otherwise.** A compute
-//!   pass is `MTLDispatchTypeSerial` and the walk relies on it. An ICB's
-//!   dispatch types are the concurrent ones, so every slot carries
-//!   `setBarrier()` — measured: sixteen chained slots produce the serial
-//!   answer with barriers and a raced one without, every run.
-//! - **A pipeline must be built for it.** `MTLComputePipelineDescriptor`'s
-//!   `supportIndirectCommandBuffers` is false by default and a pipeline
-//!   without it cannot be set into a slot, so [`Pipelines`] builds every
-//!   pipeline through the descriptor now — one path, both consumers.
-//!
-//! # Rebinding, and what this wave does and does not claim
-//!
-//! [`Icb::rebind`] takes a [`Recording`] of the walk at the target
-//! composition and writes only what differs — grids, buffer offsets, scalar
-//! cells, and the pipeline of a slot whose entry picked another arm. So ONE
-//! indirect command buffer serves every composition, which is decision #2's
-//! own promise, and the exec key is gone: there is no key.
-//!
-//! What it does not yet do is read the descriptor on the DEVICE. The
-//! recording that drives the rebind is host arithmetic — the same walk,
-//! without the encode — and `crate::abi` is the table that would replace it
-//! with a `v = base + Σ slope · axis` per component. That table is derived
-//! and verified separately; wiring it into a rebind SHADER is the next step
-//! and is stated here rather than implied.
+//! Indirect command buffer: dispatches encoded once, rewritten per fire
+//! instead of re-encoded each time. `Icb::rebind` diffs a recorded walk
+//! against what is currently encoded; `crate::rebind` does the same on
+//! device from a lowered descriptor table.
 
 #![cfg(target_vendor = "apple")]
 
@@ -69,14 +24,8 @@ use crate::device::{Context, Handles, Pipelines, handles::NIL};
 use crate::error::{Fault, Result};
 use crate::record::{Arg, Recording, Slot};
 
-/// The widest argument list any `kernels-metal` entry marshals, plus room.
-///
-/// Measured rather than guessed: `engine-metal`'s own recording of
-/// qwen35-d0.8b binds at most eighteen arguments in one dispatch
-/// (`descriptor_abi::every_capture_phase_slot_is_a_dispatch`). The ceiling is
-/// stated at ICB creation and cannot be raised afterwards, and the M1 Max
-/// accepts 8, 16, 31, 32, 64 and 128 alike, so this is a `Budget`-shaped
-/// number with room rather than a device limit.
+/// Max kernel buffer bindings per ICB slot; fixed at creation and cannot be
+/// raised afterwards. Headroom above the widest entry actually marshaled.
 pub const MAX_BINDINGS: usize = 32;
 
 /// How a rebind writes one argument back.
@@ -84,72 +33,58 @@ pub const MAX_BINDINGS: usize = 32;
 enum Bound {
     /// A buffer binding: the reservation stays, the offset can move.
     Buf { slab: Slab, offset: u64 },
-    /// A scalar, living in [`Icb::constants`] at this byte offset. The
-    /// BINDING never moves; the bytes do.
+    /// A scalar living in [`Icb::constants`] at this byte offset. The
+    /// binding never moves; only the bytes do.
     Scalar { at: u64, width: u8 },
     /// An index the shader does not dereference on this arm. Bound to the
-    /// constants reservation at zero, because `setKernelBuffer:offset:atIndex:`
-    /// takes a buffer and not an option — the one place this path cannot say
-    /// what `Sink` says (`setBuffer:nil`), and it is equivalent for exactly
-    /// the reason `absent` exists: nothing reads the slot.
+    /// constants reservation at offset zero, since
+    /// `setKernelBuffer:offset:atIndex:` takes a buffer, not an option.
     Absent,
 }
 
 /// One encoded slot, as the rebind needs to see it.
 struct Built {
     point: crate::record::Point,
-    /// The compiled pipeline, retained — a slot that was RESET has to be
-    /// encoded again from here, and the cache would answer the same object
-    /// anyway.
+    /// Retained compiled pipeline; a reset slot re-encodes from here.
     pipeline: Pipeline,
     args: Vec<Bound>,
     lanes: [u32; 3],
     group: MTLSize,
-    /// Which template region and which run of its window this slot stood in.
-    /// **THE ALIGNMENT KEY**: a composition with an empty window walks fewer
-    /// dispatches, and this is what says which of the buffer's slots the ones
-    /// it did walk are.
+    /// Template region and run this slot stood in; the alignment key used to
+    /// match slots across compositions with different-sized windows.
     region: u32,
     run: u32,
-    /// Whether the slot currently holds a command. A slot standing in a
-    /// window this composition has no rows for is `reset()` and skipped by
-    /// the execution — the device-side reading of `walk`'s rule 1.
+    /// Whether the slot currently holds a command; a slot standing in an
+    /// empty window is `reset()` and skipped at execution.
     live: bool,
 }
 
 /// One artifact's dispatches, encoded once.
 pub struct Icb {
     icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
-    /// The scalar arena: an ICB slot cannot carry inline bytes, so every
-    /// scalar argument of every slot has a cell here.
+    /// Scalar arena: an ICB slot cannot carry inline bytes, so every scalar
+    /// argument of every slot has a cell here.
     constants: Buffer,
     /// Per slot, what was encoded — the rebind's diff base.
     built: Vec<Built>,
     /// Every reservation any slot binds, once each: the residency list a
     /// fire declares with `useResource:`.
     residents: Vec<Slab>,
-    /// Reservation identity → the retained buffer, so a rebind can move an
-    /// offset without re-resolving a handle table that has been rewound.
+    /// Reservation id -> retained buffer, so a rebind can move an offset
+    /// without re-resolving a handle table that has been rewound.
     slabs: HashMap<u64, Slab>,
-    /// The device-side rebind, once a derived table has been lowered into it
-    /// (`crate::rebind`). `None` until [`Icb::attach`], and this buffer is
-    /// rewritten by the HOST meanwhile — which is what keeps the shader an
-    /// ADDITION rather than a fork.
+    /// Device-side rebind, once a derived table is lowered into it
+    /// (`crate::rebind`). `None` until [`Icb::attach`].
     rebinder: Option<crate::rebind::Rebinder>,
     /// Whether something other than the host rebind last wrote the commands.
-    ///
-    /// **TWO REBINDS, ONE BUFFER, AND NEITHER TRUSTS THE OTHER'S RECORD.**
-    /// `rebind` diffs against `built`; the shader diffs against its own
-    /// `live` words. A fire through one after a fire through the other would
-    /// diff against a record of somebody else's writes, so each marks the
-    /// other stale and a stale rebind writes every component rather than the
-    /// ones it believes moved.
+    /// `rebind` diffs against `built`, the shader diffs against its own
+    /// `live` words; a stale rebind rewrites every component instead of
+    /// diffing.
     stale: bool,
 }
 
-// SAFETY: as `Buffer` and `Pipelines` — the Metal objects here are
-// documented thread-safe for retain/release and for binding, and an `Icb` is
-// built, rebound and executed on the one lane thread that owns the shell.
+// SAFETY: Metal objects here are thread-safe for retain/release/binding, and
+// an `Icb` is built, rebound, and executed on the one owning lane thread.
 unsafe impl Send for Icb {}
 
 impl std::fmt::Debug for Icb {
@@ -189,18 +124,12 @@ impl Icb {
     }
 
     /// Lower a derived [`DescriptorAbi`](crate::abi::DescriptorAbi) into the
-    /// device tables `icb::rebind` reads, so this buffer can be rewritten by
-    /// the GPU from the descriptor alone.
-    ///
-    /// `room` is how many bytes of packed fire descriptor to reserve — a
-    /// number the caller has, since it is `FireDescriptor::bytes()` at the
-    /// widest batch its budgets admit.
+    /// device tables `icb::rebind` reads. `room` is the packed fire
+    /// descriptor byte budget to reserve.
     ///
     /// # Errors
     ///
-    /// As `crate::rebind::lower`: [`Fault::Unstructured`] when the table is
-    /// not this buffer's, [`Fault::Ceiling`] past the shader's fixed arrays,
-    /// [`Fault::Shader`] for an arm that will not compile.
+    /// See `crate::rebind::lower`.
     pub fn attach(
         &mut self,
         device: &Context,
@@ -220,9 +149,8 @@ impl Icb {
         )?;
         let census = rebinder.census();
         self.rebinder = Some(rebinder);
-        // The lowering says nothing about what the builder left encoded, and
-        // the first shader rebind writes every slot from scratch — so the
-        // host's record of what is in the buffer is void from here.
+        // The first shader rebind after lowering writes every slot from
+        // scratch, so the host's record of the buffer is void from here.
         self.stale = true;
         Ok(census)
     }
@@ -242,16 +170,9 @@ impl Icb {
     /// One fire with no host walk at all: write the descriptor, dispatch
     /// `icb::rebind`, execute the buffer.
     ///
-    /// **THIS IS THE WAVE'S WHOLE CLAIM IN ONE FUNCTION.** What reaches the
-    /// device is the packed descriptor and nothing else; the grids, the
-    /// windowed cuts, the staged scalars, the arm of every entry that has two
-    /// and the reset of every slot standing in an empty window are all
-    /// computed by the GPU out of the law table lowered at load.
-    ///
     /// # Errors
     ///
-    /// [`Fault::Unbound`] when no table was lowered, and whatever
-    /// `crate::rebind::fire` said.
+    /// [`Fault::Unbound`] when no table was lowered.
     pub fn execute_rebound(&mut self, device: &Context, descriptor: &[u8]) -> Result<()> {
         let Icb {
             icb,
@@ -268,31 +189,21 @@ impl Icb {
     }
 
     /// Rewrite every component of every slot that this composition moves.
-    ///
     /// `taped` is the walk at the target composition, recorded rather than
-    /// encoded — so this function compares what the fire WOULD have encoded
-    /// against what the buffer holds, and writes the difference.
+    /// encoded, diffed against what the buffer holds.
     ///
     /// # Errors
     ///
-    /// [`Fault::Unstructured`] when the recording is not this artifact's —
-    /// a different slot count, an argument that changed kind, or a binding
-    /// into a reservation this build never saw. [`Fault::Shader`] when a slot
-    /// switched to an entry that will not compile.
+    /// [`Fault::Unstructured`] when the recording is not this artifact's.
     pub fn rebind(
         &mut self,
         device: &Context,
         pipelines: &Pipelines,
         taped: &Recording,
     ) -> Result<Rebound> {
-        // **THE ALIGNMENT, AND IT IS THE WHOLE OF WHAT MAKES ONE BUFFER SERVE
-        // EVERY COMPOSITION.** `model_exec::fire::walk` skips a zero-row region's
-        // nodes, so an all-decode fire walks FEWER dispatches than the mixed
-        // one this buffer was built at. Design §5's answer is that the
-        // artifact holds every launch and the fire turns the absent ones off,
-        // and `(region, run)` is what says which. A region is dispatched
-        // whole or not at all — that equality is what defines a region (P2) —
-        // so the key is exact rather than a heuristic.
+        // A composition may walk fewer dispatches than the buffer was built
+        // at; unused slots are turned off by `(region, run)` key. A region
+        // is dispatched whole or not at all.
         let mut wanted: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
         for (at, slot) in taped.slots.iter().enumerate() {
             wanted.entry((slot.region, slot.run)).or_default().push(at);
@@ -316,18 +227,15 @@ impl Icb {
             }
         }
 
-        // A buffer the shader last wrote is a buffer this record does not
-        // describe, so every slot is written again rather than diffed.
+        // If the shader last wrote this buffer, this record doesn't describe
+        // it, so every slot is written again rather than diffed.
         let forced = std::mem::take(&mut self.stale);
         let mut moved = Rebound::default();
         for (key, slots) in &held {
             match wanted.get(key) {
                 None => {
-                    // The window is empty in this composition. Turn the slots
-                    // off rather than dispatching them at zero rows: measured
-                    // on the M1 Max, a reset slot inside an executed range is
-                    // skipped with no error, and a barriered slot that merely
-                    // exits immediately still costs 2.13 µs.
+                    // Window is empty in this composition: turn slots off
+                    // rather than dispatching at zero rows.
                     for index in slots {
                         if self.built[*index].live || forced {
                             unsafe { self.icb.indirectComputeCommandAtIndex(*index).reset() };
@@ -363,8 +271,8 @@ impl Icb {
                 }
             }
         }
-        // And the shader's own record is void for the same reason this one
-        // was: the host has just written every command it names.
+        // The shader's own record is now void too: the host just wrote
+        // every command it names.
         if let Some(rebinder) = self.rebinder.as_mut() {
             rebinder.desync()?;
         }
@@ -382,15 +290,13 @@ impl Icb {
         moved: &mut Rebound,
     ) -> Result<()> {
         let command = unsafe { self.icb.indirectComputeCommandAtIndex(index) };
-        // A slot that was reset holds nothing at all, so every part of it is
-        // written again rather than diffed against a command that is gone.
+        // A reset slot holds nothing, so it's written again rather than
+        // diffed against a command that's gone.
         let revived = forced || !self.built[index].live;
         let rearmed = revived || self.built[index].point != wanted.point;
         if rearmed {
-            // The entry picked another arm — `linear`'s gemv/gemm split is the
-            // live one — so the slot is a different pipeline. Measured on the
-            // M1 Max: a compute ICB slot's pipeline state is settable, from
-            // the host here and from a shader in the step after this one.
+            // The entry picked another arm, so the slot needs a different
+            // pipeline.
             let pipeline = pipelines.at(device.device(), fire_of(wanted))?;
             command.setComputePipelineState(&pipeline);
             self.built[index].pipeline = pipeline;
@@ -483,11 +389,9 @@ impl Icb {
                             ),
                         });
                     }
-                    // **A REVIVED SLOT HAS NO BINDINGS AT ALL.** `reset()`
-                    // clears the command, so a scalar's cell has to be bound
-                    // again and not merely refilled — the bug this line exists
-                    // to state, and the one a test that never turned a slot
-                    // back on would not have found.
+                    // A revived slot has no bindings at all: `reset()` clears
+                    // the command, so the cell must be bound again, not
+                    // merely refilled.
                     if revived {
                         unsafe {
                             command.setKernelBuffer_offset_atIndex(
@@ -502,15 +406,14 @@ impl Icb {
                     if held[..bytes.len()] == bytes[..] {
                         continue;
                     }
-                    // The BINDING does not move: the cell is where the shader
-                    // already looks, and only the bytes in it change.
+                    // The binding does not move: only the bytes change.
                     self.constants.write(cell, &bytes)?;
                     moved.scalars += 1;
                 }
                 (Bound::Absent, Arg::Absent) => {
                     if revived {
-                        // As above: the nil stand-in is a binding like any
-                        // other and a reset slot lost it.
+                        // The nil stand-in is a binding like any other, lost
+                        // on reset.
                         unsafe {
                             command.setKernelBuffer_offset_atIndex(self.constants.slab(), 0, at);
                         }
@@ -537,11 +440,8 @@ impl Icb {
     }
 
     /// Execute the whole buffer: one command buffer, one pass, one call.
-    ///
-    /// The residency declaration is the whole of the ceremony an ICB adds —
-    /// its commands bind by address, so the reservations behind those
-    /// addresses have to be declared. Measured at 135 ns per resource on the
-    /// M1 Max, over a list this shell can count on one hand.
+    /// Commands bind by address, so every reservation they touch must be
+    /// declared resident first.
     ///
     /// # Errors
     ///
@@ -560,9 +460,9 @@ impl Icb {
             let constants: &ProtocolObject<dyn MTLResource> =
                 ProtocolObject::from_ref(&**self.constants.slab());
             encoder.useResource_usage(constants, MTLResourceUsage::Read);
-            // SAFETY: the range is `0..len` of a buffer whose every slot was
-            // encoded by `Builder::finish`, and the buffer outlives the
-            // command buffer because `self` does.
+            // SAFETY: range is `0..len` of a buffer whose every slot was
+            // encoded by `Builder::finish`; the buffer outlives the command
+            // buffer since `self` does.
             unsafe {
                 encoder.executeCommandsInBuffer_withRange(
                     &self.icb,
@@ -574,8 +474,7 @@ impl Icb {
     }
 }
 
-/// What one rebind moved — the observable behind "the descriptor is the one
-/// mutable channel".
+/// What one rebind moved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rebound {
     /// Buffer bindings re-pointed.
@@ -611,22 +510,18 @@ impl Rebound {
     }
 }
 
-/// The `Encode` that builds an [`Icb`] instead of encoding a pass.
-///
-/// Stands exactly where [`Sink`](crate::Sink) and [`Tape`](crate::Tape)
-/// stand, over the same walk and the same `Run`: one `Encode::fire` is one
-/// Metal dispatch is one ICB slot, and this is where the third reading of
-/// that sentence is written down.
+/// The `Encode` that builds an [`Icb`] instead of encoding a pass: one
+/// `Encode::fire` is one Metal dispatch is one ICB slot.
 pub struct Builder<'a> {
     device: &'a Context,
     pipelines: &'a Pipelines,
     handles: &'a Handles,
-    /// Where the walk is — the region and run a slot stood in, which is the
-    /// key a later composition is aligned onto.
+    /// Region and run a slot stood in; the key a later composition aligns
+    /// onto.
     place: &'a crate::window::At,
     icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
     constants: RefCell<Buffer>,
-    /// The next free byte of the scalar arena.
+    /// Next free byte of the scalar arena.
     cursor: std::cell::Cell<u64>,
     built: RefCell<Vec<Built>>,
     slabs: RefCell<HashMap<u64, Slab>>,
@@ -635,15 +530,8 @@ pub struct Builder<'a> {
 
 impl<'a> Builder<'a> {
     /// Reserve an indirect command buffer for `slots` dispatches and a scalar
-    /// arena of `constants` bytes, both sized from a prior recording of the
-    /// same walk.
-    ///
-    /// **THE CEILING IS FIXED AT CREATION AND THAT IS FINE.** `maxCommandCount`
-    /// cannot be raised, so it is known after the recording and allocated
-    /// after it — `.wiki/palo/icb.md` §8's own answer. Measured on the M1 Max:
-    /// 4 194 304 commands allocate (729 bytes each); 8 388 608 aborts the
-    /// process inside the driver rather than answering nil, so a shell that
-    /// asks for one must have counted first.
+    /// arena of `constants` bytes. `maxCommandCount` cannot be raised after
+    /// creation, so the caller must have counted first.
     ///
     /// # Errors
     ///
@@ -661,8 +549,8 @@ impl<'a> Builder<'a> {
         descriptor.setInheritPipelineState(false);
         descriptor.setInheritBuffers(false);
         descriptor.setMaxKernelBufferBindCount(MAX_BINDINGS);
-        // SAFETY: the descriptor is fully stated above and the count is a
-        // number this shell counted from a recording of the same walk.
+        // SAFETY: descriptor is fully stated above; count is from a
+        // recording of the same walk.
         let icb = unsafe {
             device
                 .device()
@@ -694,9 +582,7 @@ impl<'a> Builder<'a> {
     ///
     /// # Errors
     ///
-    /// [`Fault::Ceiling`] when the walk encoded fewer slots than were
-    /// reserved — a buffer with an unencoded slot in its range is a command
-    /// nothing wrote, and executing it is undefined.
+    /// [`Fault::Ceiling`] when the walk encoded fewer slots than reserved.
     pub fn finish(self) -> Result<Icb> {
         let built = self.built.into_inner();
         if built.len() != self.ceiling {
@@ -776,10 +662,8 @@ impl Builder<'_> {
             size(fire.group)
         };
         command.concurrentDispatchThreads_threadsPerThreadgroup(size(fire.lanes), group);
-        // **EVERY SLOT CARRIES A BARRIER.** An indirect command buffer's
-        // dispatches are concurrent by kind; the walk assumes a serial pass.
-        // Measured: without this, sixteen slots chained through one word
-        // produce the raced answer on every run.
+        // ICB dispatches are concurrent by kind; the walk assumes a serial
+        // pass, so every slot carries a barrier.
         command.setBarrier();
 
         self.built.borrow_mut().push(Built {

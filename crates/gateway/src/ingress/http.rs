@@ -1,8 +1,6 @@
-//! REST + SSE adapter: a **one-shot** turn. Lifetime = the request. POST a
-//! client payload, stream the token chunks back as Server-Sent Events. A 1-turn
-//! session is the degenerate case of the general multi-turn `Session` (§6) — the
-//! same `create → drain TokenRx → drop(=close)` path as `ws.rs`, just bounded to
-//! one turn.
+//! REST + SSE adapter: a one-shot turn, lifetime = the request. POSTs a
+//! client payload and streams token chunks back as Server-Sent Events, using
+//! the same `create -> drain TokenRx -> drop` path as `ws.rs`.
 
 use std::convert::Infallible;
 
@@ -31,7 +29,7 @@ pub async fn generate(
     headers: HeaderMap,
     Json(payload): Json<ClientMessage>,
 ) -> Response {
-    // Trust-edge identity gate (§5). Fails closed on a misconfigured edge.
+    // Trust-edge identity gate. Fails closed on a misconfigured edge.
     let ident: Identity = match identity::extract(&headers) {
         Ok(id) => id,
         Err(e) => {
@@ -43,19 +41,15 @@ pub async fn generate(
         }
     };
 
-    // Build the turn content. ingress hands charlie the user-turn payload only;
-    // `create` mints `req_id` + `session` + derives `tenant` from `ident` (seam
-    // option (a)) — no gateway-minted id is ever constructed here.
-    // Image ingest (when present) would go out-of-band first:
-    //   let blob = state.blobs.put(kind, bytes).await?;  // → blobs.push(blob)
+    // `create` mints `req_id` + `session` + derives `tenant` from `ident`; no
+    // gateway-minted id is constructed here.
     let turn = TurnInput {
         message: payload,
         blobs: Vec::new(),
         priority: Priority::Normal,
     };
 
-    // One-shot ⇒ no warm-KV to preserve across turns: ephemeral affinity → p2c
-    // load-spread (§7).
+    // One-shot: no warm-KV to preserve, so affinity is ephemeral (p2c spread).
     let (handle, rx) = match state
         .sessions
         .create(ident, turn, Affinity::Ephemeral)

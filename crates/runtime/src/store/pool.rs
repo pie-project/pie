@@ -1,17 +1,14 @@
 //! Typed physical-id free list over an engine-preallocated static pool.
 //!
-//! One pool per resource kind (`KvBackingPool`, `StateBackingPool`, ...).
-//! A pool only reserves and releases stable ids over static device memory; it
-//! owns no CoW logic, hash maintenance, mapping, residency, or refcounts
-//! (kv_refact.md, `store/pool.rs`). Freed ids are recycled only after the
-//! completion epoch of their last in-flight user retires.
+//! One pool per resource kind (`KvBackingPool`, `StateBackingPool`, ...). A
+//! pool only reserves and releases stable ids over static device memory; it
+//! owns no CoW logic, hash maintenance, mapping, residency, or refcounts.
+//! Freed ids are recycled only after the completion epoch of their last
+//! in-flight user retires.
 //!
-//! Complete typed-store API (kv_refact.md): some methods here are not yet
-//! called by the live single-model fire path (only a subset of the typed
-//! store surface is currently wired) but are exercised by this module's
-//! own unit test suite and reserved for upcoming increments (contention/
-//! reclaim expansion, RS buffer-write paths, etc.) — kept rather than
-//! deleted, allowed rather than silently masked.
+//! Some methods here are not yet called by the live single-model fire path,
+//! but are exercised by this module's own tests and reserved for upcoming
+//! increments; kept rather than deleted.
 #![allow(dead_code)]
 
 /// A typed physical id backed by a pool slot. Implemented by
@@ -108,13 +105,4 @@ impl<I: PoolId> Pool<I> {
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
-
-    // `highest_in_use_exclusive` stood here: an O(capacity) scan of the free
-    // set, allocating a `HashSet` per call, that answered "how many low ids
-    // are in use right now". Its only reader was the runtime's 10-second
-    // elastic-trim poll, which fed the number to `resize_pool`. Both are gone
-    // (alto design §8, wave C): committed and high-water bytes are a SUPPLY
-    // question and the engine owns and reports them
-    // (`LoadFacts::pool_high_water_bytes`), rather than a policy free list
-    // being scanned for an answer it only approximated.
 }

@@ -58,18 +58,6 @@ EMBEDDED_CLI_ENGINES: set[str] = {
 }
 
 
-KV_CACHE_DTYPES = [
-    "auto",
-    "bf16",
-    "bfloat16",
-    "fp8_e4m3",
-    "fp8_e5m2",
-    "int8_per_token_head",
-    "fp8_per_token_head",
-    "fp4_e2m1",
-    "nvfp4",
-]
-
 
 def reconstruct_token_arrivals(
     first_arrival_s: float,
@@ -263,24 +251,13 @@ def build_config(args: argparse.Namespace):
         engine_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
         }
-        if args.memory_profile != "auto":
-            engine_options["memory_profile"] = args.memory_profile
-        if args.kv_cache_dtype != "auto":
-            engine_options["kv_cache_dtype"] = args.kv_cache_dtype
-        if args.runtime_quant:
-            engine_options["runtime_quant"] = args.runtime_quant
-        if args.mxfp4_moe:
-            engine_options["mxfp4_moe"] = args.mxfp4_moe
-        if getattr(args, "stream_routed_experts", False):
-            engine_options["stream_routed_experts"] = True
-        if args.mtp_assistant_snapshot_dir:
-            engine_options["mtp_assistant_snapshot_dir"] = (
-                args.mtp_assistant_snapshot_dir
-            )
-        if args.mtp_num_drafts is not None:
-            engine_options["mtp_num_drafts"] = args.mtp_num_drafts
-        if args.enable_system_speculation:
-            engine_options["enable_system_speculation"] = True
+        # Eight `engine_options` writes STOOD HERE (`memory_profile`,
+        # `kv_cache_dtype`, `runtime_quant`, `mxfp4_moe`,
+        # `stream_routed_experts`, `mtp_assistant_snapshot_dir`,
+        # `mtp_num_drafts`, `enable_system_speculation`). Every one of those
+        # keys is retired in the worker's config, which refuses unknown
+        # options BY NAME -- so each write produced a config the server
+        # would not boot. The flags went with the writes.
         # `gpu_mem_utilization` sizes only the memory planner's *logical* KV
         # budget; the runtime is free to exceed it, so it cannot create KV
         # pressure. `max_total_pages` is the one binding cap, and
@@ -323,16 +300,9 @@ def build_config(args: argparse.Namespace):
         # `gpu_mem_utilization` has nowhere to go; the batching caps are the
         # only tunables it reads.
         engine_options = {}
-        # Same key, same name, both backends -- the switch is a residency trade
-        # an operator makes about a model, not a backend detail.
-        if getattr(args, "stream_routed_experts", False):
-            engine_options["stream_routed_experts"] = True
-        # The bounded form of the same trade, and the only one that can admit a
-        # checkpoint bigger than the machine: streaming maps the bank and every
-        # mapped page is wired, so it moves bytes off the heap without capping
-        # them, while a slab caps them and pays a submit-and-wait per layer.
-        if getattr(args, "expert_slab_mb", 0):
-            engine_options["expert_slab_bytes"] = int(args.expert_slab_mb) * 1024 * 1024
+        # `stream_routed_experts` / `expert_slab_bytes` writes STOOD HERE;
+        # both keys retired from `MetalEngineOptions` (the residency lever is
+        # `[model] device_weight_budget` / `host_weight_budget`).
         if getattr(args, "max_forward_tokens", 0):
             engine_options["max_forward_tokens"] = args.max_forward_tokens
         if getattr(args, "max_forward_requests", 0):
@@ -513,9 +483,6 @@ def build_config(args: argparse.Namespace):
                 type=args.engine,
                 device=device,
                 tensor_parallel_size=args.tp_size,
-                # Stated once for every engine now, so it is a common
-                # `[engine]` key rather than one of the backend's options.
-                ready_timeout=f"{int(args.server_startup_timeout)}s",
                 options=engine_options,
             )
         ),
@@ -573,9 +540,7 @@ async def cli_pie_client(args: argparse.Namespace):
 
     pie_bin = Path(args.pie_bin)
     if not pie_bin.exists():
-        feature = {"metal": "engine-metal", "vulkan": "engine-vulkan"}.get(
-            args.engine, "engine-cuda"
-        )
+        feature = {"metal": "metal"}.get(args.engine, "cuda")
         raise FileNotFoundError(
             f"missing {pie_bin}; build with: cargo build --release -p pie "
             f"--no-default-features --features {feature}"
@@ -1425,11 +1390,6 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0)
         sp.add_argument("--cpu-mem-budget", type=int, default=0)
         sp.add_argument(
-            "--memory-profile",
-            default="auto",
-            choices=["auto", "latency", "throughput"],
-        )
-        sp.add_argument(
             "--kv-pages", type=int, default=2048,
             help="DEAD for cuda_native: never reaches engine_options, so it "
                  "silently does nothing. Use --total-pages to cap KV.",
@@ -1474,36 +1434,10 @@ def build_parser() -> argparse.ArgumentParser:
                  "without it, with unit (e.g. '50ms'). Omit for the engine "
                  "default.",
         )
-        sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
-        sp.add_argument(
-            "--stream-routed-experts",
-            action="store_true",
-            help="Bind a MoE checkpoint's routed experts over the file instead "
-                 "of copying them into the device heap. Both backends take the "
-                 "same `[model].stream_routed_experts` key; what they do with "
-                 "it differs (cuda stages through a cache, Metal demand-faults "
-                 "a page-aligned pack).",
-        )
-        sp.add_argument(
-            "--expert-slab-mb",
-            type=int,
-            default=0,
-            help="Metal only. Cap the routed experts at this many MiB of device "
-                 "memory and page them through a slab, instead of keeping the "
-                 "whole bank resident. 0 leaves the bank resident. This is what "
-                 "runs a checkpoint that does not fit; it is not a faster "
-                 "--stream-routed-experts.",
-        )
         sp.add_argument("--max-forward-tokens", type=int,
                         default=PIE_MAX_FORWARD_TOKENS_DEFAULT)
         sp.add_argument("--max-forward-requests", type=int,
                         default=PIE_MAX_FORWARD_REQUESTS_DEFAULT)
-        sp.add_argument("--runtime-quant", choices=["fp8", "int8"], default=None)
-        sp.add_argument(
-            "--mxfp4-moe",
-            choices=["auto", "routed_dequant", "packed", "bf16", "dequant", "eager_bf16", "native"],
-            default=None,
-        )
         sp.add_argument("--worker-threads", type=int, default=None)
         # `choices.values()` can yield the same parser under an alias, and
         # `common.py` registers some of these already; a duplicate
@@ -1618,27 +1552,6 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="Override system speculation. Omit to use the model default; "
                  "--no-system-speculation forces the no-spec baseline.",
-        )
-        sp.add_argument(
-            "--mtp-assistant-snapshot-dir",
-            default=None,
-            help="cuda_native Gemma4 MTP assistant snapshot path used by .system_speculation(); "
-                 "auto-discovered from the HF cache when omitted.",
-        )
-        sp.add_argument(
-            "--mtp-num-drafts",
-            type=int,
-            default=None,
-            help="Number of native MTP draft tokens per accepted token.",
-        )
-        sp.add_argument(
-            "--enable-system-speculation",
-            action=argparse.BooleanOptionalAction,
-            default=False,
-            help="cuda_native deployment opt-in for system speculation (MTP). "
-                 "Sets the engine config [model].enable_system_speculation; the "
-                 "runtime drives the auto-drafter only when this is on. Default "
-                 "off (latency-regime feature).",
         )
         sp.add_argument("--vllm-attention-backend", default=None)
         sp.add_argument("--vllm-max-num-seqs", type=int, default=None)

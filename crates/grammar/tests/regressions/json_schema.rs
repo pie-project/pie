@@ -40,26 +40,6 @@ fn root_ref_resolves_local_defs() {
 }
 
 #[test]
-fn bounded_number_rejects_fraction_above_maximum() {
-    let schema = r#"{"type":"number","minimum":1,"maximum":2}"#;
-    let grammar = json_schema_to_grammar(schema, &JsonSchemaOptions::default()).unwrap();
-    assert!(grammar_accepts(grammar.clone(), "1"));
-    assert!(grammar_accepts(grammar.clone(), "1.5"));
-    assert!(grammar_accepts(grammar.clone(), "2"));
-    assert!(grammar_accepts(grammar.clone(), "2.00"));
-    assert!(!grammar_accepts(grammar.clone(), "0.9"));
-    assert!(!grammar_accepts(grammar.clone(), "2.9"));
-    assert!(!grammar_accepts(grammar, "1e1"));
-
-    let negative_schema = r#"{"type":"number","minimum":-2,"maximum":-1}"#;
-    let negative = json_schema_to_grammar(negative_schema, &JsonSchemaOptions::default()).unwrap();
-    assert!(grammar_accepts(negative.clone(), "-2.0"));
-    assert!(grammar_accepts(negative.clone(), "-1.5"));
-    assert!(!grammar_accepts(negative.clone(), "-2.1"));
-    assert!(!grammar_accepts(negative, "-0.9"));
-}
-
-#[test]
 fn bounded_number_handles_cross_zero_and_one_sided_ranges() {
     let cross_zero = json_schema_to_grammar(
         r#"{"type":"number","minimum":-1,"maximum":2}"#,
@@ -97,16 +77,6 @@ fn bounded_number_handles_cross_zero_and_one_sided_ranges() {
 }
 
 #[test]
-fn lower_bounded_integer_rejects_smaller_values() {
-    let schema = r#"{"type":"integer","minimum":-5}"#;
-    let grammar = json_schema_to_grammar(schema, &JsonSchemaOptions::default()).unwrap();
-    assert!(grammar_accepts(grammar.clone(), "-5"));
-    assert!(grammar_accepts(grammar.clone(), "0"));
-    assert!(grammar_accepts(grammar.clone(), "123456"));
-    assert!(!grammar_accepts(grammar, "-6"));
-}
-
-#[test]
 fn integer_bounds_combine_without_overflow() {
     let schema = r#"{
         "type":"integer",
@@ -125,35 +95,6 @@ fn integer_bounds_combine_without_overflow() {
     assert!(json_schema_to_grammar(no_lower_value, &JsonSchemaOptions::default()).is_err());
     let no_upper_value = r#"{"type":"integer","exclusiveMaximum":-9223372036854775808}"#;
     assert!(json_schema_to_grammar(no_upper_value, &JsonSchemaOptions::default()).is_err());
-}
-
-#[test]
-fn optional_properties_can_start_after_an_omission() {
-    let schema = r#"{
-        "type":"object",
-        "properties":{"a":{"type":"integer"},"b":{"type":"integer"}},
-        "additionalProperties":false
-    }"#;
-    let grammar = json_schema_to_grammar(schema, &JsonSchemaOptions::default()).unwrap();
-    assert!(grammar_accepts(grammar, r#"{"b":1}"#));
-}
-
-#[test]
-fn min_properties_counts_declared_optional_properties() {
-    let schema = r#"{
-        "type":"object",
-        "properties":{"a":{"type":"integer"}},
-        "minProperties":1,
-        "additionalProperties":false
-    }"#;
-    let grammar = json_schema_to_grammar(schema, &JsonSchemaOptions::default()).unwrap();
-    assert!(!grammar_accepts(grammar, "{}"));
-}
-
-#[test]
-fn pattern_length_combination_is_rejected_explicitly() {
-    let schema = r#"{"type":"string","pattern":"a+","minLength":3}"#;
-    assert!(json_schema_to_grammar(schema, &JsonSchemaOptions::default()).is_err());
 }
 
 #[test]

@@ -1,14 +1,4 @@
-//! The qwen4 forward: qwen_3's hybrid walk under a residual that is not a
-//! sum.
-//!
-//! Every sublayer is bracketed by its [`Residual`] site — grouped norm,
-//! low-rank sigmoid mix in, per-stream gated injection out — so the wide
-//! `[streams · hidden]` row is what rides the layer loop, and the narrow
-//! `hidden` row exists only between a site's mix and its inject. The PLE
-//! folds its n-gram enrichment into the wide row at its one declared layer;
-//! the final mixer folds the wide row down for the head, and is the last
-//! normalization the logits see (there is no `final_norm` — see
-//! [`Model::mixer`]).
+//! Forward pass for the qwen4 hybrid model.
 
 use model_dsl::{
     Classify, Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, Predicate, Request, Value,
@@ -29,16 +19,14 @@ impl Facts {
         Predicate::fact(0)
     }
 
-    /// The observability window — `qwen_3::forward::Facts::captures_scores`'
-    /// bit, one family over: a lane that asked for its attention scores gets
-    /// its own prefill schedule and an lse the seam captures.
+    /// Requests that captured attention scores get their own prefill
+    /// schedule so the seam can record lse.
     #[must_use]
     pub fn captures_scores() -> Predicate {
         Predicate::fact(1)
     }
 
-    /// The custom-mask window, constraining attention layers only — the GDN
-    /// and PLE state walks are sequential by construction and take no mask.
+    /// Custom-mask requests only; GDN and PLE state walks take no mask.
     #[must_use]
     pub fn masked() -> Predicate {
         Predicate::fact(2)
@@ -90,10 +78,7 @@ impl ForwardHybrid for Model {
         }
         if let Some(p) = &self.ple {
             let wide = u64::from(self.streams) * u64::from(self.hidden);
-            // The hasher's window holds token IDS — the one state row whose
-            // element is an integer (see `CacheRow::State`'s doc). Its length
-            // is the n-gram context, and the dilation IS `ngram_size` (the
-            // model.rs declaration says why).
+            // ids_state holds token ids (i32); its length is the n-gram context window.
             c.state(p.ids_state.clone(), [u64::from(p.dilation) - 1], Dtype::I32);
             c.state(
                 p.conv_state.clone(),
@@ -107,8 +92,8 @@ impl ForwardHybrid for Model {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
 
-        // The four-way attention carve, `qwen_3::forward`'s own: one
-        // schedule per class, each built off that class's arm of `inputs`.
+        // Split by request class: masked, scores-capturing, single-token
+        // decode, and the rest each get their own attention plan.
         let classes = [
             Facts::masked(),
             Facts::captures_scores(),
@@ -124,9 +109,7 @@ impl ForwardHybrid for Model {
 
         let ids = inputs.tokens();
         let narrow = ops::layout::embed(&ids, &m.embed, m.vocab);
-        // The stream fan opens here and closes at the final mixer: the
-        // embedding is tiled across every stream, which is the reference's
-        // `repeat(1, 1, hc_count)`.
+        // Streams fan out here from the embedding; they fold back down at the final mixer.
         let mut y = ops::elemwise::hc_expand(&narrow, m.streams);
 
         for (l, w) in m.layers.iter().enumerate() {
@@ -154,9 +137,8 @@ impl ForwardHybrid for Model {
     }
 }
 
-/// One residual site's inward half: the grouped norm over the wide row, and
-/// the low-rank sigmoid mix that folds it to the sublayer's input. Returns
-/// the normed wide row too — the injection gates read it.
+/// Normalizes the wide row and mixes it down to the sublayer input. Returns
+/// the normed row too; injection gates read it.
 fn mix_in(y: &Value, res: &Residual, m: &Model) -> (Value, Value) {
     let normed = ops::elemwise::rmsnorm_grouped_plus_one(y, &res.norm, m.hidden, res.eps);
     let mix = ops::linear::matmul(
@@ -169,8 +151,8 @@ fn mix_in(y: &Value, res: &Residual, m: &Model) -> (Value, Value) {
     (ops::elemwise::hc_mix(&mix, &normed, m.streams), normed)
 }
 
-/// The outward half: the sublayer output returns into every stream under its
-/// own gate. The final mixer never comes here — it has no `inject` bank.
+/// Returns the sublayer output into every stream under its own gate. The
+/// final mixer has no inject bank.
 fn inject(o: &Value, normed: &Value, res: &Residual, m: &Model, y: &Value) -> Value {
     let gates = ops::linear::matmul(
         normed,
@@ -181,15 +163,13 @@ fn inject(o: &Value, normed: &Value, res: &Residual, m: &Model, y: &Value) -> Va
     ops::elemwise::hc_inject(o, &gates, m.streams, y)
 }
 
-/// The PLE enrichment, transcribed from `Qwen4ExpTextPLELayer.forward`:
-/// hash, gather, gate per stream, and mix locally through the dilated
-/// depthwise convolution. Answers the wide addend; the trunk adds it.
+/// PLE enrichment: hash, gather, per-stream gate, then a dilated depthwise
+/// conv. Returns the addend added into the wide row by the caller.
 fn ple(y: &Value, ids: &Value, inputs: &Input<Facts>, m: &Model, p: &Ple) -> Value {
     let ids_state = inputs.state(&p.ids_state);
     let conv_state = inputs.state(&p.conv_state);
 
-    // The hasher is a state walk, so it splits the way the GDN mixers do:
-    // one-token lanes step, the rest walk their request's rows.
+    // Splits like the GDN mixers: single-token requests step; others walk in chunks.
     let one = Facts::qo_one();
     let (ids_d, ids_p) = ids.split(&one);
     let grams = Value::merge(vec![
@@ -249,9 +229,7 @@ fn ple(y: &Value, ids: &Value, inputs: &Input<Facts>, m: &Model, p: &Ple) -> Val
     ops::elemwise::residual_add(&conv, &gated)
 }
 
-/// The gated-attention arm — `qwen_3::forward::attn_mixer`, minus the tower
-/// (this SKU is text-only, so the rotation is the scalar one) and minus the
-/// adapter window (this family declares no adapter banks).
+/// Gated attention: text-only so rotation is scalar; no adapter banks in this family.
 #[allow(clippy::too_many_arguments)]
 fn attn_mixer(
     x: &Value,
@@ -297,9 +275,8 @@ fn attn_mixer(
     ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
 }
 
-/// The GatedDeltaNet arm — `qwen_3::forward::gdn_mixer` with the one
-/// difference the config states: `output_gate_type: "sigmoid"`, so the gated
-/// norm squashes its gate instead of siluing it.
+/// GatedDeltaNet mixer; output_gate_type is sigmoid, so the gated norm
+/// squashes the gate instead of applying silu.
 fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
     let conv_state = inputs.state(&g.conv_state);
     let delta_state = inputs.state(&g.delta_state);
@@ -356,7 +333,7 @@ fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
     ops::linear::matmul(&o, &g.out_proj)
 }
 
-/// The routed arm — `qwen_3::forward`'s, dtype-selected select and all.
+/// Routed MLP arm.
 fn moe(x: &Value, mlp: &Mlp) -> Value {
     match mlp {
         Mlp::Dense { .. } => unreachable!("every qwen4 layer routes"),
@@ -377,16 +354,8 @@ fn moe(x: &Value, mlp: &Mlp) -> Value {
                 *experts,
                 *top_k,
             );
-            // **THE DENSE FORMS ARE THE LIST, AND EVERYTHING ELSE IS
-            // QUANTIZED** — `deepseek_v4::forward`'s own spelling, one family
-            // over, and it is the right way round for a reason this row paid
-            // for. An ALLOW-list of quantized dtypes was here, naming
-            // `Mxfp4 | U4g64 | U8g64`, and it silently omitted every dtype
-            // that carries a different group in its name: the 2-bit
-            // miniature's `U2g128` expert bank fell through to the DENSE
-            // select, which resolves the bank as one handle and panics against
-            // the three-plane row the loader seated. A new quantized dtype is
-            // a thing this tree adds; a new DENSE one is not.
+            // Dense dtypes are the explicit list; every other dtype falls
+            // through to the quantized path, so new quantized dtypes need no update here.
             let select = |act: &Value, bank: &model_dsl::Weight| {
                 if matches!(bank.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32) {
                     ops::linear::moe_matmul_select(act, bank, &routes, *top_k)

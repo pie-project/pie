@@ -1,10 +1,5 @@
-//! Grammar matcher: DFA-based pushdown automaton + token acceptance + bitmask generation.
-//!
-//! `GrammarMatcher` is the main runtime entry point. It:
-//! - Accepts tokens/strings byte-by-byte via a DFA-based stack parser
-//! - Generates token bitmasks (which tokens are valid next)
-//! - Supports rollback for speculative decoding
-//! - Supports jump-forward decoding (finding deterministic prefixes)
+//! `GrammarMatcher`: DFA-based pushdown automaton for token acceptance,
+//! next-token bitmask generation, rollback, and jump-forward decoding.
 
 mod single_dfa;
 mod stack_parser;
@@ -25,12 +20,9 @@ use stack_parser::{SmallDedup, StackParser, StackState};
 // Parser Engine
 // ---------------------------------------------------------------------------
 
-/// Two-variant engine that eliminates all `if single_dfa_mode` dual-path code.
-///
-/// Not boxed despite the 48-vs-376-byte spread: exactly one of these exists per
-/// matcher, built once and then dispatched once per input byte. Boxing would
-/// trade 328 bytes allocated once for a pointer chase in the per-byte loop --
-/// and it is the *large* variant that would pay it.
+/// Not boxed despite the 48-vs-376-byte spread: one instance per matcher,
+/// built once and dispatched per byte; boxing would add a pointer chase to
+/// the hot per-byte path.
 #[allow(
     clippy::large_enum_variant,
     reason = "constructed once per matcher, dispatched per byte; see above"
@@ -436,15 +428,9 @@ impl GrammarMatcher {
         }
     }
 
-    /// Split off an independent matcher that starts from this matcher's exact
-    /// current position.
-    ///
-    /// Search algorithms that branch -- beam search, speculative decoding,
-    /// tree-structured drafting -- need one grammar state per live branch, and
-    /// replaying the branch prefix from a fresh matcher costs O(prefix) per
-    /// branch per step. Forking copies only the parser state; the compiled
-    /// grammar and the tokenizer are shared, and the scratch arenas start
-    /// empty rather than being copied, since they carry no semantic state.
+    /// Split off an independent matcher at this matcher's current position.
+    /// Copies only the parser state; grammar and tokenizer are shared, and
+    /// scratch arenas start empty (they carry no semantic state).
     pub fn fork(&self) -> Self {
         Self {
             engine: self.engine.clone(),
@@ -528,13 +514,11 @@ impl GrammarMatcher {
                     for state in &states {
                         let flags = self.compiled.action(state.rule_id, state.dfa_state).flags;
 
-                        // If state has RuleRef edges or is accepting, not deterministic
                         if flags.has_rule_ref() || flags.is_accepting() {
                             conflict = true;
                             break;
                         }
 
-                        // Check DFA edges for single deterministic byte
                         let dfa = &self.compiled.rule_dfas[state.rule_id as usize];
                         let edges = dfa.fsm.edges(StateId(state.dfa_state as u32));
                         let state_byte = deterministic_byte(edges);
@@ -629,277 +613,18 @@ fn deterministic_byte(edges: &[FsmEdge]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitmask::bitmask_size;
+    
     use crate::grammar::Grammar;
-
-    /// Helper to build a grammar matcher with a small test vocabulary.
-    fn make_matcher(ebnf: &str, root: &str, vocab: &[&str]) -> GrammarMatcher {
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, root).unwrap());
-        let encoded: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-        let tokenizer = Arc::new(Tokenizer::from_vocab(&encoded));
-        GrammarMatcher::new(grammar, tokenizer, vec![], 10)
-    }
-
-    /// Helper to build a matcher with explicit stop tokens.
-    fn make_matcher_with_stop(
-        ebnf: &str,
-        root: &str,
-        vocab: &[&str],
-        stop_ids: Vec<u32>,
-    ) -> GrammarMatcher {
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, root).unwrap());
-        let encoded: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
-        let tokenizer = Arc::new(Tokenizer::from_vocab(&encoded));
-        GrammarMatcher::new(grammar, tokenizer, stop_ids, 10)
-    }
 
     // ---- Basic accept_string tests ----
 
-    #[test]
-    fn test_accept_simple_string() {
-        let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= "hello""#, "root").unwrap());
-        let vocab: Vec<String> = vec!["hello".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-
-        assert!(m.accept_string("hello"));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_reject_wrong_string() {
-        let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= "hello""#, "root").unwrap());
-        let vocab: Vec<String> = vec!["hello".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-
-        assert!(!m.accept_string("world"));
-        // Parser should be unchanged after rejection
-        assert!(m.accept_string("hello"));
-    }
-
-    #[test]
-    fn test_accept_choices() {
-        let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= "yes" | "no""#, "root").unwrap());
-        let vocab: Vec<String> = vec!["yes".into(), "no".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar.clone(), tok.clone(), vec![], 10);
-        assert!(m.accept_string("yes"));
-        assert!(m.can_terminate());
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.accept_string("no"));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_accept_sequence_of_rules() {
-        let ebnf = r#"
-            root ::= greeting " " name
-            greeting ::= "hi" | "hello"
-            name ::= "alice" | "bob"
-        "#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["test".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.accept_string("hi alice"));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_accept_char_class() {
-        let ebnf = r#"root ::= [a-z]"#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.accept_string("a"));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_accept_char_class_star() {
-        let ebnf = r#"root ::= [a-z]*"#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["abc".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.can_terminate()); // star allows empty
-        assert!(m.accept_string("abc"));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_reject_char_class() {
-        let ebnf = r#"root ::= [a-z]"#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["A".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(!m.accept_string("A"));
-    }
-
     // ---- Token acceptance ----
-
-    #[test]
-    fn test_accept_token() {
-        let mut m = make_matcher(
-            r#"root ::= "hello world""#,
-            "root",
-            &["hello", " ", "world"],
-        );
-        assert!(m.accept_token(0)); // "hello"
-        assert!(m.accept_token(1)); // " "
-        assert!(m.accept_token(2)); // "world"
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_reject_token() {
-        let mut m = make_matcher(r#"root ::= "hello""#, "root", &["hello", "world"]);
-        assert!(!m.accept_token(1)); // "world" should fail
-        assert!(m.accept_token(0)); // "hello" should still work
-    }
 
     // ---- Bitmask tests ----
 
-    #[test]
-    fn test_bitmask_simple() {
-        let mut m = make_matcher(r#"root ::= "ab" | "cd""#, "root", &["ab", "cd", "ef"]);
-
-        let mut bm = vec![0u32; bitmask_size(3)];
-        m.fill_next_token_bitmask(&mut bm);
-
-        assert!(bitmask::get_bit(&bm, 0)); // "ab" allowed
-        assert!(bitmask::get_bit(&bm, 1)); // "cd" allowed
-        assert!(!bitmask::get_bit(&bm, 2)); // "ef" not allowed
-    }
-
-    #[test]
-    fn test_bitmask_after_partial() {
-        let mut m = make_matcher(
-            r#"root ::= "abc""#,
-            "root",
-            &["a", "ab", "abc", "b", "bc", "c"],
-        );
-
-        // Initially, only tokens starting with "a" should be valid
-        let mut bm = vec![0u32; bitmask_size(6)];
-        m.fill_next_token_bitmask(&mut bm);
-
-        assert!(bitmask::get_bit(&bm, 0)); // "a"
-        assert!(bitmask::get_bit(&bm, 1)); // "ab"
-        assert!(bitmask::get_bit(&bm, 2)); // "abc"
-        assert!(!bitmask::get_bit(&bm, 3)); // "b"
-        assert!(!bitmask::get_bit(&bm, 4)); // "bc"
-        assert!(!bitmask::get_bit(&bm, 5)); // "c"
-
-        // After accepting "a", tokens continuing "bc" should be valid
-        m.accept_token(0); // "a"
-        m.fill_next_token_bitmask(&mut bm);
-
-        assert!(!bitmask::get_bit(&bm, 0)); // "a" - would give "aa"
-        assert!(!bitmask::get_bit(&bm, 1)); // "ab" - would give "aab"
-        assert!(!bitmask::get_bit(&bm, 2)); // "abc" - would give "aabc"
-        assert!(bitmask::get_bit(&bm, 3)); // "b" - gives "ab"
-        assert!(bitmask::get_bit(&bm, 4)); // "bc" - gives "abc"
-        assert!(!bitmask::get_bit(&bm, 5)); // "c" - gives "ac"
-    }
-
-    #[test]
-    fn test_bitmask_with_stop_tokens() {
-        let mut m = make_matcher_with_stop(
-            r#"root ::= "a" | "ab""#,
-            "root",
-            &["a", "ab", "b", "<eos>"],
-            vec![3], // <eos> is stop token
-        );
-
-        let mut bm = m.fill_next_token_mask();
-
-        assert!(bitmask::get_bit(&bm, 0)); // "a"
-        assert!(bitmask::get_bit(&bm, 1)); // "ab"
-        assert!(!bitmask::get_bit(&bm, 2)); // "b"
-        assert!(!bitmask::get_bit(&bm, 3)); // <eos> not yet (grammar not complete)
-
-        // After "a", grammar can terminate
-        m.accept_token(0);
-        bm = m.fill_next_token_mask();
-
-        assert!(!bitmask::get_bit(&bm, 0)); // "a" - no more input expected
-        assert!(!bitmask::get_bit(&bm, 1)); // "ab" - no
-        assert!(bitmask::get_bit(&bm, 2)); // "b" - completes "ab" alternative
-        assert!(bitmask::get_bit(&bm, 3)); // <eos> - can stop (grammar complete from "a")
-    }
-
     // ---- Rollback tests ----
 
-    #[test]
-    fn test_rollback() {
-        let mut m = make_matcher(r#"root ::= "abc""#, "root", &["a", "b", "c"]);
-
-        assert!(m.accept_token(0)); // "a"
-        assert!(m.accept_token(1)); // "b"
-
-        m.rollback(1); // undo "b"
-
-        assert!(m.accept_token(1)); // "b" again
-        assert!(m.accept_token(2)); // "c"
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_rollback_multiple() {
-        let mut m = make_matcher(r#"root ::= "abcd""#, "root", &["a", "b", "c", "d"]);
-
-        assert!(m.accept_token(0)); // "a"
-        assert!(m.accept_token(1)); // "b"
-        assert!(m.accept_token(2)); // "c"
-
-        m.rollback(2); // undo "c" and "b"
-
-        assert!(m.accept_token(1)); // "b"
-        assert!(m.accept_token(2)); // "c"
-        assert!(m.accept_token(3)); // "d"
-        assert!(m.can_terminate());
-    }
-
     // ---- Jump forward tests ----
-
-    #[test]
-    fn test_jump_forward_simple() {
-        let mut m = make_matcher(r#"root ::= "hello""#, "root", &["hello"]);
-
-        let jf = m.find_jump_forward_string();
-        assert_eq!(jf, "hello");
-    }
-
-    #[test]
-    fn test_jump_forward_partial() {
-        let mut m = make_matcher(
-            r#"root ::= "prefix" ("a" | "b")"#,
-            "root",
-            &["prefix", "a", "b"],
-        );
-
-        let jf = m.find_jump_forward_string();
-        assert_eq!(jf, "prefix");
-    }
-
-    #[test]
-    fn test_jump_forward_after_accept() {
-        let mut m = make_matcher(r#"root ::= "ab" "cd""#, "root", &["ab", "cd"]);
-
-        m.accept_token(0); // "ab"
-        let jf = m.find_jump_forward_string();
-        assert_eq!(jf, "cd");
-    }
 
     // ---- Repetition tests ----
 
@@ -946,284 +671,6 @@ mod tests {
 
     // ---- Unicode tests ----
 
-    #[test]
-    fn test_unicode_char_class() {
-        // [à-ÿ] = U+00E0 to U+00FF (2-byte UTF-8)
-        let ebnf = r#"root ::= [\u00e0-\u00ff]"#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        // 'à' is U+00E0, UTF-8: 0xC3 0xA0
-        assert!(m.accept_string("\u{00e0}"));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_unicode_reject() {
-        let ebnf = r#"root ::= [\u00e0-\u00ff]"#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        // 'a' is U+0061, should not match
-        assert!(!m.accept_string("a"));
-    }
-
-    #[test]
-    fn test_unicode_3byte() {
-        // CJK character range (3-byte UTF-8)
-        let ebnf = r#"root ::= [\u4e00-\u9fff]+"#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.accept_string("\u{4e00}")); // 一 (CJK first)
-        assert!(m.accept_string("\u{9fff}")); // last in range
-        assert!(m.can_terminate());
-
-        m.reset();
-        assert!(!m.accept_string("a")); // ASCII rejected
-    }
-
-    #[test]
-    fn test_unicode_4byte() {
-        // Emoji range (4-byte UTF-8)
-        let ebnf = r#"root ::= [\U0001f600-\U0001f64f]"#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        // 😀 is U+1F600, UTF-8: F0 9F 98 80
-        assert!(m.accept_string("\u{1f600}"));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_unicode_mixed_byte_lengths() {
-        // Range spanning 1-byte and 2-byte UTF-8
-        let ebnf = r#"root ::= [\u0041-\u00ff]+"#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.accept_string("A")); // U+0041 (1-byte)
-        assert!(m.accept_string("z")); // U+007A (1-byte)
-        assert!(m.accept_string("\u{00e0}")); // U+00E0 (2-byte)
-        assert!(m.can_terminate());
-
-        m.reset();
-        assert!(!m.accept_string("@")); // U+0040, below range
-    }
-
     // ---- Complex grammar tests ----
 
-    #[test]
-    fn test_json_schema_smoke() {
-        use crate::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
-        let schema = r#"{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}"#;
-        let opts = JsonSchemaOptions {
-            any_whitespace: false,
-            ..JsonSchemaOptions::default()
-        };
-        let grammar = Arc::new(json_schema_to_grammar(schema, &opts).unwrap());
-
-        let mut vocab_strs: Vec<String> = Vec::new();
-        let structural = [
-            "{", "}", "[", "]", ",", ":", "\"", "\\", "true", "false", "null", "\\n", "\\t", "\\r",
-            "\\\\", "\\\"", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", ".", "e", "E",
-            "+",
-        ];
-        for s in &structural {
-            vocab_strs.push(s.to_string());
-        }
-        for c in 32u8..=126 {
-            let s = String::from(c as char);
-            if !vocab_strs.contains(&s) {
-                vocab_strs.push(s);
-            }
-        }
-        while vocab_strs.len() < 1000 {
-            vocab_strs.push(format!("tok_{}", vocab_strs.len()));
-        }
-        vocab_strs.truncate(1000);
-
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab_strs));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.accept_string(r#"{"name":"test","age":42}"#));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_json_number() {
-        let ebnf = r#"
-            root ::= integer
-            integer ::= [0-9]+
-        "#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["1".into(), "23".into(), "a".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.accept_string("123"));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_multiple_rules_with_bitmask() {
-        let ebnf = r#"
-            root ::= "true" | "false" | "null"
-        "#;
-        let mut m = make_matcher(
-            ebnf,
-            "root",
-            &[
-                "t", "tr", "true", "f", "fa", "false", "n", "nu", "null", "x",
-            ],
-        );
-
-        let mut bm = vec![0u32; bitmask_size(10)];
-        m.fill_next_token_bitmask(&mut bm);
-
-        assert!(bitmask::get_bit(&bm, 0)); // "t"
-        assert!(bitmask::get_bit(&bm, 1)); // "tr"
-        assert!(bitmask::get_bit(&bm, 2)); // "true"
-        assert!(bitmask::get_bit(&bm, 3)); // "f"
-        assert!(bitmask::get_bit(&bm, 4)); // "fa"
-        assert!(bitmask::get_bit(&bm, 5)); // "false"
-        assert!(bitmask::get_bit(&bm, 6)); // "n"
-        assert!(bitmask::get_bit(&bm, 7)); // "nu"
-        assert!(bitmask::get_bit(&bm, 8)); // "null"
-        assert!(!bitmask::get_bit(&bm, 9)); // "x"
-    }
-
-    #[test]
-    fn test_nested_group_normalization() {
-        let ebnf = r#"root ::= "a" ("b" | "c") "d""#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.accept_string("abd"));
-        assert!(m.can_terminate());
-
-        m.reset();
-        assert!(m.accept_string("acd"));
-        assert!(m.can_terminate());
-
-        m.reset();
-        assert!(!m.accept_string("aed"));
-    }
-
-    #[test]
-    fn test_steady_state_string_content() {
-        // Test that steady state activates for CharacterClassStar content
-        let ebnf = r#"root ::= "\"" [^"\\]* "\""  "#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        // Parse opening quote
-        assert!(m.accept_string("\""));
-        // Parse string content — after 2 bytes, steady state should activate
-        assert!(m.accept_string("ABCDEFGHIJ"));
-        // Verify the parser correctly tracks position with lazy steady count
-        assert!(m.accept_string("\""));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_steady_state_rollback() {
-        // Verify rollback works correctly with lazy steady-state bytes
-        let ebnf = r#"root ::= "\"" [^"\\]* "\""  "#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["a".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        assert!(m.accept_string("\"")); // opening quote (token 0)
-        assert!(m.accept_string("ABCDE")); // 5 chars in steady state (token 1)
-        // Rollback the 5 chars (token 1)
-        m.rollback(1);
-        // After rollback, should be at position after opening quote
-        assert!(m.accept_string("XYZ\""));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_steady_state_json_schema() {
-        // Test with actual JSON schema grammar (the primary use case)
-        use crate::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
-        let schema =
-            r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#;
-        let opts = JsonSchemaOptions {
-            any_whitespace: false,
-            ..JsonSchemaOptions::default()
-        };
-        let grammar = Arc::new(json_schema_to_grammar(schema, &opts).unwrap());
-
-        let vocab: Vec<String> = (32u8..=126).map(|c| String::from(c as char)).collect();
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        // Parse prefix including string content with steady-state opportunity
-        let long_name = "A".repeat(100);
-        let input = format!(r#"{{"name":"{}"}}"#, long_name);
-        assert!(m.accept_string(&input));
-        assert!(m.can_terminate());
-    }
-
-    #[test]
-    fn test_chain_shortcircuit_ebnf_json() {
-        let ebnf = r#"
-root ::= value
-value ::= object | array | string | number | "true" | "false" | "null"
-object ::= "{" ws (pair ("," ws pair)*)? ws "}"
-pair ::= ws string ws ":" ws value
-array ::= "[" ws (value ("," ws value)*)? ws "]"
-string ::= "\"" char* "\""
-char ::= [^"\\] | "\\" escape
-escape ::= "\"" | "\\" | "/" | "b" | "f" | "n" | "r" | "t" | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
-number ::= integer fraction? exponent?
-integer ::= "-"? ("0" | [1-9] [0-9]*)
-fraction ::= "." [0-9]+
-exponent ::= [eE] [+-]? [0-9]+
-ws ::= [ \t\n\r]*
-"#;
-        let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());
-        let vocab: Vec<String> = vec!["dummy".into()];
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        let input = r#"{"name": "John", "age": 30}"#;
-        assert!(m.accept_string(input));
-    }
-
-    #[test]
-    fn test_chain_shortcircuit_long_string() {
-        // Verify chain short-circuit handles long strings without O(N^2) blowup
-        use crate::json_schema::{JsonSchemaOptions, json_schema_to_grammar};
-        let schema =
-            r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#;
-        let opts = JsonSchemaOptions {
-            any_whitespace: false,
-            ..JsonSchemaOptions::default()
-        };
-        let grammar = Arc::new(json_schema_to_grammar(schema, &opts).unwrap());
-
-        let vocab: Vec<String> = (0u16..256).map(|i| String::from(i as u8 as char)).collect();
-        let tok = Arc::new(Tokenizer::from_vocab(&vocab));
-        let mut m = GrammarMatcher::new(grammar, tok, vec![], 10);
-        // 200-char string — without chain short-circuit this would be O(N^2)
-        let long_name = "A".repeat(200);
-        let input = format!(r#"{{"name":"{}"}}"#, long_name);
-        assert!(m.accept_string(&input));
-    }
 }

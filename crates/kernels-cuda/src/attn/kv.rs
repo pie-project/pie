@@ -47,20 +47,15 @@ fn scheme_of(op: &'static str, pool: &KvPool) -> Result<KvScheme, Error> {
     })
 }
 
-/// The `__nv_fp8_interpretation_t` the fp8 paths read: e4m3.
-///
-// MENLO-SEAM: the erased pool spells fp8 storage as `keys.dtype == U8` plus
-// the scheme byte; the old `storage_dtype` field that could say e5m2 is
-// retired, so this plane always states e4m3 — the only kind the old drivers
-// ever configured.
+/// The `__nv_fp8_interpretation_t` the fp8 paths read: e4m3, the only kind
+/// this plane configures.
 const FP8_E4M3: u32 = 0;
 
 const fn fp4_block_size(block_size: i32) -> i32 {
     if block_size > 0 { block_size } else { 16 }
 }
 
-/// Whether the pool stores native bf16 pages — the reading that used to be
-/// the `native_bf16` field, now spelled by the storage handle's dtype.
+/// Whether the pool stores native bf16 pages.
 #[must_use]
 pub fn native_bf16(pool: &KvPool) -> bool {
     pool.keys.dtype == Dtype::Bf16
@@ -106,10 +101,8 @@ pub(crate) fn head_split(
     Ok((row / head_dim, head_dim))
 }
 
-/// The lane count an indptr spells: `rows - 1`, refused when degenerate. The
-/// boundary vector is driver-assembled, not an operand the validator sees, so
-/// a wrong dtype is refused on the same footing as a degenerate length, not
-/// asserted (the boundary rule at [`refuse`]).
+/// The lane count an indptr spells: `rows - 1`, refused when degenerate or
+/// the wrong dtype (the boundary vector is driver-assembled, not validated).
 pub(crate) fn lanes_of(op: &'static str, indptr: Tensor) -> Result<i32, Error> {
     if indptr.dtype != Dtype::I32 {
         return Err(refuse(
@@ -157,20 +150,16 @@ pub(crate) fn write_kv_to_pages(
             head_dim,
         )
     } else {
-        // MENLO-SEAM: the quantized writers predate the explicit write
-        // descriptors — they still re-derive each token's cell from the
-        // read-side page tables, so the stated pair goes unread on these
-        // schemes until the device text grows explicit quantized writers.
+        // Quantized writers still re-derive each token's cell from the
+        // read-side page tables, so this pair is unread here.
         let _ = (write_page, write_offset);
         write_kv_quantised(ctx, op, k, v, indptr, pool, kv_heads, head_dim)
     }
 }
 
-/// The general explicit-descriptor write (`kv_append_explicit`): each token
-/// row lands in the ONE `(write_page[t], write_offset[t])` cell the op
-/// states — never a position→(page, offset) derivation, which cannot spell
-/// a fresh-page write that is not the page-run tail. `indptr` is only the
-/// envelope refresh's lane walk.
+/// The explicit-descriptor write: each token row lands in the one
+/// `(write_page[t], write_offset[t])` cell the op states. `indptr` is only
+/// the envelope refresh's lane walk.
 #[allow(clippy::too_many_arguments)]
 fn write_kv_bf16(
     ctx: &Ctx,
@@ -205,8 +194,7 @@ fn write_kv_bf16(
             pool.page_size.arg(),
             kv_heads.arg(),
             head_dim.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed one, else `ABSENT`.
             ctx.stage(),
         ],
     )?;
@@ -269,6 +257,8 @@ fn envelope_update_appended(
             pool.page_size.arg(),
             kv_heads.arg(),
             head_dim.arg(),
+            // Live-lanes word bounds the request walk when a body replay armed one.
+            ctx.stage(),
         ],
     )
 }
@@ -401,8 +391,7 @@ fn active_geometry(
 }
 
 /// Dequantizes this fire's active pages into the bf16 shadow the fa2
-/// kernels read. A no-op on native pools; on quantized ones the fa2
-/// entries fire it best-effort before attending, as the old plane did.
+/// kernels read. A no-op on native pools.
 pub(crate) fn dequant_active(
     ctx: &Ctx,
     op: &'static str,

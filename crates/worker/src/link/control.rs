@@ -1,22 +1,9 @@
-//! Worker control-plane **seam**: the [`ControlLink`] trait the worker's
+//! Worker control-plane seam: the [`ControlLink`] trait the worker's
 //! register + heartbeat/report/watch loops run against, plus the distributed
-//! [`controller_api::ControlClient`] implementation.
-//!
-//! The seam is what keeps `worker` depending only on the *contract*
-//! (`controller-api`) and never on the controller *implementation* (`controller`):
-//!
-//! - **distributed** (always linked): [`ControlLink`] for [`ControlClient`]
-//!   dials the standalone controller over tarpc; [`neighbors_watch`] spawns the
-//!   `watch_worker` long-poll loop and republishes each view into a local
-//!   `watch` channel.
-//! - **single-node** (`single-node` feature): an `EmbeddedControl(Handle)`
-//!   newtype at the composition root (the worker bin's `single_node` module)
-//!   implements the same trait against the in-proc controller `Handle` — no
-//!   sockets, `neighbors_watch` returns the controller's `worker_watch(id)`
-//!   receiver directly.
-//!
-//! Either backend is injected into [`spawn_control_tasks`], so the three loops
-//! are transport-agnostic.
+//! [`controller_api::ControlClient`] implementation. Keeps `worker` depending
+//! only on the `controller-api` contract, never the controller
+//! implementation; a single-node build injects an in-proc adapter behind the
+//! same trait so [`spawn_control_tasks`]'s loops stay transport-agnostic.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -31,20 +18,15 @@ use tokio::sync::watch;
 use super::gateway::GatewayLinkManager;
 use super::partner::PartnerLinkManager;
 
-/// Worker→controller heartbeat cadence. Matches the gateway's interval and sits
-/// well under the controller's liveness timeout (8s) → ~4× margin, so a few
-/// dropped beats never trip a false eviction.
+/// Worker→controller heartbeat cadence; well under the controller's liveness
+/// timeout so a few dropped beats never trip a false eviction.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-/// Coarse-load report cadence. The controller coalesces these per epoch (only a
-/// `kv_pressure_bucket` cross advances the gateway epoch), so the exact period
-/// is a liveness floor, not a wire-churn source.
+/// Coarse-load report cadence; the controller coalesces these per epoch.
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
-/// `watch_worker` long-poll client deadline. Must exceed the controller's
-/// `T_HANG` (20s) so the server's same-epoch keepalive return always lands
-/// before we time out; on error we back off and re-poll.
+/// `watch_worker` long-poll client deadline; must exceed the controller's
+/// `T_HANG` keepalive so its same-epoch return always lands before we time out.
 const WATCH_DEADLINE: Duration = Duration::from_secs(300);
-/// Backoff before re-polling `watch_worker` after a transport error, so a wedged
-/// or restarting controller doesn't spin the loop.
+/// Backoff before re-polling `watch_worker` after a transport error.
 const WATCH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 fn restart_after_lost_registration(kind: &str) -> ! {
@@ -57,11 +39,8 @@ fn restart_after_lost_registration(kind: &str) -> ! {
     }
 }
 
-/// The control-plane operations the worker's loops need, abstracted over the
-/// transport (distributed tarpc client vs in-proc controller handle).
-///
-/// Mirrors the relevant `controller_api::Control` calls minus the tarpc context.
-/// `Clone` so each of the three loops can hold its own cheap copy.
+/// Control-plane operations the worker's loops need, abstracted over the
+/// transport. `Clone` so each of the three loops can hold its own cheap copy.
 pub trait ControlLink: Clone + Send + Sync + 'static {
     /// Register this worker; returns its controller-minted [`WorkerId`].
     fn register_worker(&self, info: WorkerInfo) -> impl Future<Output = Result<WorkerId>> + Send;
@@ -77,17 +56,14 @@ pub trait ControlLink: Clone + Send + Sync + 'static {
         status: WorkerStatus,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// A receiver of this worker's latest neighbor view. The distributed impl
-    /// spawns the `watch_worker` long-poll loop and republishes into the
-    /// returned channel; the in-proc impl returns the controller's
-    /// `worker_watch(id)` receiver directly (epoch-free).
+    /// A receiver of this worker's latest neighbor view.
     fn neighbors_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors>;
 }
 
 impl ControlLink for ControlClient {
     async fn register_worker(&self, info: WorkerInfo) -> Result<WorkerId> {
-        // The inherent (tarpc-generated) method shadows the trait method for
-        // method-call syntax, so this dispatches to the RPC, not back into us.
+        // The tarpc-generated inherent method shadows this trait method, so
+        // this dispatches to the RPC, not back into itself.
         self.register_worker(tarpc::context::current(), info)
             .await
             .context("register_worker rpc")
@@ -117,10 +93,8 @@ impl ControlLink for ControlClient {
 }
 
 /// Long-poll `watch_worker`, republishing each new [`Neighbors`] view into the
-/// shared channel. The controller blocks until the worker epoch advances past
-/// `since` (or its `T_HANG` keepalive fires); we re-poll with the returned
-/// epoch. On a transport error we back off and retry. Exits when all receivers
-/// drop (the worker is shutting down).
+/// shared channel; re-polls with the returned epoch, backs off on transport
+/// error, exits when all receivers drop.
 async fn watch_neighbors_loop(
     client: ControlClient,
     worker_id: WorkerId,
@@ -149,10 +123,8 @@ async fn watch_neighbors_loop(
     }
 }
 
-/// Dial the controller's tarpc endpoint and spawn the request dispatcher,
-/// returning a [`ControlClient`]. `addr` is `tcp://host:port`, a bare
-/// `host:port`, or `unix:/path`. Control messages are tiny → tarpc's default
-/// frame cap is fine.
+/// Dial the controller's tarpc endpoint and spawn the request dispatcher.
+/// `addr` is `tcp://host:port`, a bare `host:port`, or `unix:/path`.
 pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
     let cfg = tarpc::client::Config::default();
     if let Some(path) = addr
@@ -172,20 +144,14 @@ pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
     }
 }
 
-/// Spawn the worker's three control-plane loops against `ctrl` (the dialed
-/// client or the in-proc adapter) and return their join handles, aborted on
-/// runtime shutdown.
+/// Spawn the worker's three control-plane loops against `ctrl` and return
+/// their join handles.
 ///
-/// - **heartbeat** every [`HEARTBEAT_INTERVAL`]; an [`Ack::ReRegister`] is fatal
-///   because the controller may mint a new worker id and all gateway/partner
-///   state is keyed by the old one. The process supervisor restarts cleanly.
-/// - **report** coarse load every [`REPORT_INTERVAL`].
-/// - **watch** the neighbor view: read-before-wait over the
-///   [`ControlLink::neighbors_watch`] receiver (full snapshots, coalesced). Each
-///   view also carries the global gateway roster; the watch loop owns the
-///   [`GatewayLinkManager`] and reconciles its dial-in links against every
-///   update (dial newly-added gateways, drop removed ones). Aborting this task
-///   on shutdown drops the manager, tearing down every dial-in link.
+/// - heartbeat every [`HEARTBEAT_INTERVAL`]; [`Ack::ReRegister`] is fatal since
+///   gateway/partner state is keyed by the old worker id.
+/// - report coarse load every [`REPORT_INTERVAL`].
+/// - watch the neighbor view and reconcile the [`GatewayLinkManager`]'s
+///   dial-in links against each update.
 pub fn spawn_control_tasks<C: ControlLink>(
     ctrl: C,
     worker_id: WorkerId,
@@ -223,8 +189,8 @@ pub fn spawn_control_tasks<C: ControlLink>(
         loop {
             ticker.tick().await;
             let status = WorkerStatus {
-                kv_pressure_bucket: ::runtime::store::kv_pressure_bucket(),
-                inflight: ::runtime::inferlet::process::list()
+                kv_pressure_bucket: runtime::store::kv_pressure_bucket(),
+                inflight: runtime::inferlet::process::list()
                     .len()
                     .min(u32::MAX as usize) as u32,
             };
@@ -241,8 +207,6 @@ pub fn spawn_control_tasks<C: ControlLink>(
     let watch_task = tokio::spawn(async move {
         let mut rx = ctrl.neighbors_watch(worker_id);
         loop {
-            // Read-before-wait: take the current snapshot, then block for the
-            // next change. A fresh subscriber's first borrow is the seeded view.
             let neighbors = rx.borrow_and_update().clone();
             tracing::debug!(
                 worker = %worker_id,
@@ -251,7 +215,6 @@ pub fn spawn_control_tasks<C: ControlLink>(
                 epoch = neighbors.epoch,
                 "neighbor view updated"
             );
-            // Reconcile dial-in links against the freshly-pushed gateway roster.
             gateways.reconcile(&neighbors.gateways).await;
             if let Some(partners) = partners.as_ref() {
                 partners.lock().await.reconcile(&neighbors.peers).await;
@@ -265,9 +228,8 @@ pub fn spawn_control_tasks<C: ControlLink>(
     vec![heartbeat_task, report_task, watch_task]
 }
 
-/// Spawn controller liveness loops for an executor. Executors deliberately do
-/// not dial gateways and do not query runtime/store globals: until the verb
-/// service is active their queue and leased scratch occupancy are both zero.
+/// Spawn controller liveness loops for an executor. Executors do not dial
+/// gateways or query runtime/store globals.
 pub fn spawn_executor_control_tasks<C: ControlLink>(
     ctrl: C,
     worker_id: WorkerId,

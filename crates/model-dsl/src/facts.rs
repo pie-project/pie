@@ -8,12 +8,9 @@ use std::ops::{BitAnd, Not};
 /// A formula over fact bits, stated at trace time. `Rest` is the n-way
 /// split's catch-all arm and legal nowhere else.
 ///
-/// A bit is a POSITION AND NOTHING ELSE. The name a model calls it by lives in
-/// that model's own `Facts` impl, where it is the name of the constructor and
-/// of the struct field, and it never travels into the plan: `Guard::Fact(bit)`
-/// is what a guard is, `fact_width` reads the plan's F off those guards, and a
-/// second list of names would be a second statement of the same fact, free to
-/// disagree with them.
+/// A bit is a position and nothing else. The name a model calls it by lives
+/// in that model's own `Facts` impl and never travels into the plan:
+/// `Guard::Fact(bit)` is what a guard is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
     Fact { bit: u8 },

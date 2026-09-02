@@ -1,11 +1,9 @@
-//! FFI — the only surface the other side of the boundary sees (B10): opaque
-//! `u64` slot ids in, `0/1` out, callable from any thread, never unwinds.
+//! FFI — the only surface the other side of the boundary sees: opaque `u64`
+//! slot ids in, `0/1` out, callable from any thread, never unwinds.
 
-// "Never unwinds" is enforced by catching, and catching needs something to
-// catch. Under `panic = "abort"` a panic in the table takes the caller's
-// process down instead of returning `0`, which is not what this module's
-// contract says and not what its callers -- an engine's completion thread,
-// often not Rust -- can cope with.
+// Under `panic = "abort"` a panic in the table takes the caller's process
+// down instead of returning `0`, which its callers (often non-Rust) cannot
+// cope with; `catch_unwind` needs `panic = "unwind"` to do its job.
 #[cfg(panic = "abort")]
 compile_error!(
     "the waker's C ABI contract is `never unwinds, returns 0/1`, which is \
@@ -25,7 +23,7 @@ pub extern "C" fn pie_wake(slot_id: u64) -> u8 {
     matches!(r, Ok(WakeOutcome::Woken)) as u8
 }
 
-/// Epoch-filtered wake (B9): wake the waiter parked on `slot_id` iff the
+/// Epoch-filtered wake: wake the waiter parked on `slot_id` iff the
 /// committed `ring_index` has passed its registered observation. Callable
 /// from any thread; never unwinds.
 #[cfg(not(loom))]

@@ -174,7 +174,7 @@ class Server:
                 "the in-process engine (`pie._engine`) is unavailable and no `pie` "
                 "binary was found. Set $PIE_BIN, or build one, e.g.:\n"
                 "  cargo build --release -p pie-bin --no-default-features "
-                "--features engine-metal"
+                "--features metal"
             )
 
         # The CLI needs a concrete port; `port = 0` is an in-process-only affordance.

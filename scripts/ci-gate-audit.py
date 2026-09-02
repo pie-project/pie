@@ -165,7 +165,6 @@ EXCLUSIONS = {
         # test and `tests/entrypoints.rs`). Re-excluding it here would turn
         # a red gate into a silent one, which is the trade this whole file
         # exists to refuse.
-        "pie-gpu-tests": "needs a GPU to be worth compiling",
         "pie-server-py": "a pyo3 extension; built by maturin, not by this job",
     },
 }

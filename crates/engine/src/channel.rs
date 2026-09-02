@@ -1,24 +1,6 @@
-//! The typed channel declaration — what `register_channel` states and answers.
-//!
-//! A channel is ETA's only stateful construct: a bounded SPSC ring between
-//! the pass and either the host or another instance. The runtime registers one
-//! before it binds the instances that share it, which is why this is its own
-//! verb and not a field of [`InstanceBinding`](crate::program::InstanceBinding).
-//!
-//! # What died here
-//!
-//! `RegisteredChannel` carried a `ChannelBinding` — eleven `u64`/`u32` fields
-//! naming device addresses and word indices (`mirror_base`, `word_base`,
-//! `head_word_index`, `poison_word_index`, …) — plus a
-//! `validate_channel_endpoint_binding` that checked the engine had filled them
-//! consistently. That is an engine's private ring layout, published into the
-//! contract so a C caller could poke it; the shells in this workspace are Rust
-//! and drive their own rings. What the runtime needs back is the id and the two
-//! wait slots, and that is what comes back.
-//!
-//! The dtype and role bytes went the way of [`program`](crate::program)'s: a
-//! declaration names [`ChanDType`], [`HostRole`] and [`ExternDir`], the three
-//! types ETA already has for them.
+//! The typed channel declaration — what `register_channel` states and
+//! answers: a bounded SPSC ring between the pass and either the host or
+//! another instance, registered before the instances that share it bind.
 
 use serde::{Deserialize, Serialize};
 
@@ -73,41 +55,9 @@ impl Default for ChannelRegistration {
     }
 }
 
-/// **THE HOST END OF A CHANNEL, AS THE ENGINE ALLOCATED IT** (alto design §5,
-/// survey §7 invariant I5).
-///
-/// An engine that declares
-/// [`device_channel_commit`](crate::Capabilities::device_channel_commit) does
-/// not want the caller's cells handed to it; it wants the caller to WRITE
-/// THEM WHERE ITS KERNELS WILL READ THEM. So it allocates the ring's host
-/// half itself — mapped pinned memory, addressable from both sides — and
-/// publishes the two addresses here. The caller's ring becomes a view of
-/// these bytes rather than a second allocation, and a guest round trip makes
-/// no device call at all.
-///
-/// The layout is the one both sides already speak: `capacity + 1` cells of
-/// `cell_bytes` at [`mirror`](Self::mirror), and four `u64` control words
-/// `[head, tail, poison, closed]` at [`words`](Self::words).
-///
-/// **THE MEMORY IS THE ENGINE'S**, and it lives until `close_channel` — an
-/// adopted view must not outlive the registration it came from.
-///
-/// # Why this type is NOT serde, alone among the contract's nouns
-///
-/// This crate's header says every noun here is serde and that *"remote is a
-/// property of a transport, not an encoding of a contract"*. Two of these
-/// fields are host ADDRESSES. They mean nothing in another process and less
-/// than nothing on another machine, and `u64` is a shape the compiler is
-/// happy to move anywhere — so a `HostMirror` that derived `Deserialize`
-/// would hand a remote reader two plausible-looking pointers with no error
-/// at any layer.
-///
-/// Removing the derive does not decide what a remote channel looks like;
-/// that question is open and PD disaggregation is unfinished. It decides the
-/// smaller thing that can be decided now: **absence is representable and a
-/// pointer is not forgeable.** [`RegisteredChannel::mirror`] is already an
-/// `Option`, so a registration that crosses a wire arrives with `None` — a
-/// fact a caller can check — instead of an address it cannot.
+/// Host end of a channel, as the engine allocated it: mapped pinned memory, addressable from both sides. Owned by the engine until `close_channel`.
+/// Layout: `capacity + 1` cells of `cell_bytes` at [`mirror`](Self::mirror), four `u64` control words `[head, tail, poison, closed]` at [`words`](Self::words).
+/// Not `Deserialize`: these are host addresses, meaningless across a wire, so a serialized registration must arrive with `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostMirror {
     /// Address of cell zero, host side.
@@ -125,53 +75,19 @@ pub struct HostMirror {
 pub struct RegisteredChannel {
     /// The channel's id.
     pub id: ChannelId,
-    /// The wait slot a reader parks on until the ring is non-empty.
-    ///
-    /// **Zero means the engine keeps no waker table and the caller mints its
-    /// own slot.** An engine whose only business with this channel is the
-    /// memory below has no park/wake machinery to offer, and inventing an id
-    /// it would never signal is worse than saying so.
+    /// The wait slot a reader parks on until the ring is non-empty. Zero
+    /// means the engine keeps no waker table; the caller mints its own slot.
     pub reader_wait_id: u64,
     /// The wait slot a writer parks on until the ring has room. As
     /// [`reader_wait_id`](Self::reader_wait_id), zero means "mint your own".
     pub writer_wait_id: u64,
-    /// The pinned host half of this channel's ring, when the engine allocated
-    /// one. `None` is the pre-F2a shape: the caller owns its ring and cells
-    /// cross through `publish_channel`/`take_channel`.
-    ///
-    /// **`#[serde(skip)]`, and that is the point** — see [`HostMirror`]. In
-    /// this process the field is the fast path; across a wire it is two
-    /// meaningless addresses, so it does not travel. A registration that was
-    /// serialized arrives `None`, which is a shape every reader of this field
-    /// already handles.
+    /// The pinned host half of this channel's ring, when the engine allocated one; `None` if the caller owns its ring instead.
     #[serde(skip)]
     pub mirror: Option<HostMirror>,
 }
 
-/// **A prediction about where a channel's cursors will be when this lane's
-/// pass runs** (alto design §1 article 3: *programs own channels; the host
-/// owns the predictions*).
-///
-/// The host never reads device state to learn a cursor. It COUNTS — tickets
-/// are minted from monotone counters runtime-side — and states what it
-/// believes the ring's head and tail will be at the instant the lane's pass
-/// takes and puts. The device validates the prediction where the data is, in
-/// the pull-validate kernel, and advances durable state only through the
-/// predicated commit-bump kernel; a refused pass is unobservable and its
-/// refusal reaches its successors as data on the stream, at stream speed.
-///
-/// **AN ENGINE VALIDATES ONE ONLY IF IT SAYS IT DOES.** The two control
-/// kernels landed for CUDA in wave F2a, and
-/// [`Capabilities::device_channel_commit`](crate::Capabilities::device_channel_commit)
-/// is where an engine states that they did. An engine that does not is handed
-/// [`Lane::channels`] only EMPTY and refuses a stated ticket by name
-/// ([`Lane::validate_for`]) rather than dropping it silently — because a host
-/// that predicted a cursor and was ignored would be told its pass ran against
-/// the cell it named when it ran against whatever the ring happened to hold.
-///
-/// The counters are `u64` and MONOTONE — they are counted, not wrapped, which
-/// is what lets emptiness be `tail > head` and fullness a subtraction.
-/// [`Ticket::NONE`] is "this end of the ring is not claimed".
+/// A prediction of where a channel's cursors will be when this lane's pass runs. The host never reads device state; it counts from monotone `u64` counters (never wrapped, so emptiness is `tail > head`).
+/// Validated device-side only if [`Capabilities::device_channel_commit`](crate::Capabilities::device_channel_commit); otherwise a stated ticket is refused by name rather than dropped silently.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ticket {
     /// Which channel this predicts about.
@@ -183,8 +99,7 @@ pub struct Ticket {
 }
 
 impl Ticket {
-    /// The absent prediction: this fire makes no claim about that end of the
-    /// ring. The same sentinel the device kernels read
-    /// (`kernels_cuda::channel::NO_TICKET`).
+    /// No claim about this end of the ring (same sentinel
+    /// `kernels_cuda::channel::NO_TICKET` reads).
     pub const NONE: u64 = u64::MAX;
 }

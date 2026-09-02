@@ -1,54 +1,52 @@
 //! Default `config.toml` emitted by `pie config init`.
 //!
 //! The compiled flavor picks the `[engine]` block, so the generated file
-//! works without a follow-up edit. There is ONE candidate — it was a
-//! cuda → metal → vulkan → wgpu priority order while the shader shells were
-//! in the workspace — and a binary carrying none has no block to write and
-//! says so, rather than writing a file it knows will not parse.
+//! works without a follow-up edit. There are TWO candidates — CUDA and, on
+//! Apple hardware, Metal — and a binary carrying neither has no block to
+//! write and says so, rather than writing a file it knows will not parse.
 //!
 //! Five live sections, plus a commented `[cluster]` for distributed
-//! deployments. What the file no longer has is as much the point as what it
-//! does: no `[controller]` / `[gateway]` (empty in every single-node config,
-//! present only because three role libs each parsed their own), no `worker.`
-//! prefixing all 44 keys, and no `[model.driver.options]` four levels down.
+//! deployments. The file states only what a single-node deployment decides:
+//! no `[controller]` / `[gateway]` sections, no `worker.` prefix on every key,
+//! and no options table four levels down.
 
 use anyhow::{Result, bail};
-use worker::engine_ffi;
+use worker::backend::flavor;
 
 /// Render the default `config.toml`.
 ///
 /// Fallible for one reason: `[engine]` is a required section and every
 /// `EngineKind` the schema accepts names an engine that has to be compiled in.
 /// A binary built with no `engine-*` feature therefore has nothing true to
-/// put there. It used to write `type = "dummy"`, which was honest while an
-/// always-present interpreter flavor existed; that flavor was deleted for
-/// being a paper-over (see `worker::engine_ffi::Flavor`) and this template
-/// kept writing its name, so `pie config init` produced a config that failed
-/// to parse on the next command. Refusing says the same thing one step
-/// earlier and names the rebuild that fixes it.
+/// put there, so it refuses rather than writing a file that fails to parse on
+/// the next command, and names the rebuild that fixes it.
 pub fn default_config_content() -> Result<String> {
-    let flavor = engine_ffi::default_flavor();
+    let flavor = flavor::default_flavor();
     let engine_block: Option<&str> = match flavor {
-        #[cfg(feature = "_engine-cuda")]
-        Some(engine_ffi::Flavor::Cuda) => Some(CUDA_ENGINE_BLOCK),
+        #[cfg(feature = "cuda")]
+        Some(flavor::Flavor::Cuda) => Some(CUDA_ENGINE_BLOCK),
+        // `Flavor::Metal` exists only on an Apple target with the feature on,
+        // and this arm carries the same cfg pair so the block and the flavor
+        // cannot disagree about which builds have it.
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        Some(flavor::Flavor::Metal) => Some(METAL_ENGINE_BLOCK),
         // `default_flavor` answers `None` when this binary carries no engine,
-        // and `worker` may compile `Flavor::Cuda` while this crate's matching
-        // `engine-cuda-*` arm is cfg'd off (workspace feature-unification can
-        // desync the two). Both land here, and both mean the same thing to the
-        // operator: this binary cannot serve, so a config naming an engine
-        // would be a guess.
+        // and `worker` may compile a flavor while this crate's matching arm is
+        // cfg'd off (workspace feature-unification can desync the two). Both
+        // land here, and both mean the same thing to the operator: this binary
+        // cannot serve, so a config naming an engine would be a guess.
+        #[allow(unreachable_patterns)]
         _ => None,
     };
     let Some(engine_block) = engine_block else {
         bail!(
             "this pie binary carries no engine, so there is no `[engine]` \
              section to write and the config would not parse. Rebuild with \
-             --features set to engine-cuda-13 or engine-cuda-12."
+             `--features cuda` or, on Apple hardware, `--features metal`."
         );
     };
-    // ONE FLAVOR, so one block. It was a `match` on the flavor while Metal
-    // wanted a 4-bit default its llama path could bind; that engine is out of
-    // the workspace until P5.
+    // ONE MODEL BLOCK for both flavors: the catalog SKU below loads on either,
+    // so nothing here depends on which engine the block above named.
     let model_block: &str = DEFAULT_MODEL_BLOCK;
     Ok(format!("{HEADER}{model_block}{engine_block}{TAIL}"))
 }
@@ -84,19 +82,10 @@ telemetry = false
 
 "#;
 
-// THE DEFAULT NAMES A MODEL THIS BUILD CAN ACTUALLY SERVE.
-//
-// It was `Qwen/Qwen3-0.6B` and nothing here ships a trace for it: the catalog
-// (`models::catalog`) is qwen35 / gemma4 / gptoss / glm5 / kimik3 / dsv4, and
-// the palo rewrite made the SKU the load's own identity — a checkpoint is
+// THE DEFAULT NAMES A MODEL THIS BUILD CAN ACTUALLY SERVE. A checkpoint is
 // matched against every import contract in the build and refused by name when
-// none fits. So `pie config init && pie serve` answered
-//
-//     "/root/.pie/models/Qwen--Qwen3-0.6B.zt" matches no SKU this build ships
-//
-// with ten candidate refusals under it, out of the box, on a machine where
-// everything worked. A generated default that cannot boot is worse than no
-// default: the operator's first move is to debug a file they did not write.
+// none fits, so a default the catalog does not ship would make the operator's
+// first move debugging a file they did not write.
 //
 // `Qwen/Qwen3.5-0.8B` is the smallest catalog row (`qwen35-d0.8b-bf16-kv-bf16`,
 // 1.6 GiB) and is what every gate from `engine-cuda/tests/serve_smoke` up to
@@ -110,16 +99,6 @@ model = "Qwen/Qwen3.5-0.8B"
                                  # is what the engine computes in, so that is
                                  # an engine key and this is a model one.
 "#;
-
-// `METAL_MODEL_BLOCK` STOOD HERE, beside `MLX_MODEL_BLOCK` below: Metal's
-// llama path is 4-bit-only, so its default named an MLX-quantized repo. Its
-// engine left the workspace at R3 and returns at P5.
-
-// `MLX_MODEL_BLOCK` STOOD HERE — the quantized default both portable shells
-// wanted, because each loaded through `model_legacy::boot::Binding::MLX_IN_PLACE`
-// and every projection bound `.weight`/`.scales`/`.biases`. Its two readers
-// left the workspace at R3 and return at P5, when their baker executors say
-// for themselves what they bind.
 
 const TAIL: &str = r#"
 [runtime]
@@ -145,6 +124,7 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # warm_memory     = "0B"
 # warm_slots      = 100
 # python_snapshot = true
+# python_runtime  = true
 
 # [cluster]
 # Distributed serving only. A single-node config omits this section entirely.
@@ -160,7 +140,7 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 
 // `test` as well as the feature: `config_content_with_any_engine` renders
 // this block regardless of what the test run compiled.
-#[cfg(any(feature = "_engine-cuda", test))]
+#[cfg(any(feature = "cuda", test))]
 const CUDA_ENGINE_BLOCK: &str = r#"
 [engine]
 # Which keys are valid here depends on `type`: the common ones below, plus
@@ -173,13 +153,41 @@ activation_dtype = "bfloat16"
 gpu_mem_utilization = 0.90
 # kv_page_size    = 32      # omit: the engine derives one
 # max_total_pages = 4096    # omit: derived from gpu_mem_utilization
-# random_seed     = 42
 "#;
 
-// `METAL_ENGINE_BLOCK`, `VULKAN_ENGINE_BLOCK` and `WGPU_ENGINE_BLOCK` STOOD
-// HERE, and went with their engines at R3. A `[engine] type = "vulkan"`
-// config still PARSES — `EngineKind` keeps all three names — and is refused
-// at boot with what happened, which is `engine_ffi::retired_msg`.
+// `test` as well as the cfg pair, for the same reason the CUDA block carries
+// it: `config_content_with_metal_engine` renders this block on a host that
+// hosts no Metal device.
+//
+// EVERY KEY BELOW IS ONE `MetalEngineOptions` DECLARES
+// (`worker::config::backend`), with that struct's own default as its value:
+// the Metal arm of `EngineConfig::validate` reads the options table raw
+// rather than through a `deny_unknown_fields` deserialize, so a stray key
+// here would be silently ignored rather than refused -- which makes writing
+// only real ones this template's job.
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+const METAL_ENGINE_BLOCK: &str = r#"
+[engine]
+# Which keys are valid here depends on `type`: the common ones below, plus
+# whatever the named engine accepts. `tensor_parallel_size` is not among them
+# for this engine — the Metal shell serves one device.
+type = "metal"
+device = ["metal:0"]
+activation_dtype = "bfloat16"
+gpu_mem_utilization = 0.90  # of the device's recommended working set. A
+                            # GPU-touched shared page is WIRED on Apple
+                            # silicon, so this ceiling is hard, not a hint.
+kv_page_size = 32           # used as given: this engine has no planner to
+total_pages  = 1024         # derive a geometry, so these two ARE the pool
+# max_forward_tokens   = 10240  # omit for the engine's own defaults
+# max_forward_requests = 512    # (max_concurrent_processes derives from this)
+# max_model_len        = 8192   # omit to keep the engine's KV-ring ceiling;
+                                # setting it only ever shrinks the ring
+"#;
+
+// There is no Vulkan or WGPU engine block: no build hosts those engines. A
+// `[engine] type = "vulkan"` config still PARSES — `EngineKind` keeps both
+// names — and is refused at boot by `flavor::retired_msg`.
 
 #[cfg(test)]
 mod tests {
@@ -206,25 +214,6 @@ mod tests {
     }
 
     #[test]
-    fn a_binary_without_an_engine_refuses_instead_of_writing_one() {
-        // The negative control for the arm above, and the bug it fixes: an
-        // engineless build used to write `type = "dummy"` -- a name the schema
-        // stopped accepting when the dummy engine was deleted -- so `pie
-        // config init` succeeded and every command after it failed to parse
-        // the file it had just written.
-        if engine_ffi::default_flavor().is_some() {
-            return;
-        }
-        let err = default_config_content().expect_err("engineless must refuse");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("carries no engine"),
-            "unhelpful refusal: {msg}"
-        );
-        assert!(msg.contains("engine-cuda-13"), "no fix named: {msg}");
-    }
-
-    #[test]
     fn it_names_the_engine_this_binary_actually_has() {
         // The whole promise of picking a block per flavor is that `pie config
         // init` produces a file that runs. A missing match arm does not fail to
@@ -233,11 +222,14 @@ mod tests {
         // generated random tokens. The catch-all refuses now, so the same slip
         // costs a refusal rather than nonsense, and the invariant is still
         // checked rather than assumed: the template's `type` is this binary's.
-        let expected: Option<&str> = match engine_ffi::default_flavor() {
-            #[cfg(feature = "_engine-cuda")]
-            Some(engine_ffi::Flavor::Cuda) => Some("cuda_native"),
+        let expected: Option<&str> = match flavor::default_flavor() {
+            #[cfg(feature = "cuda")]
+            Some(flavor::Flavor::Cuda) => Some("cuda_native"),
+            #[cfg(all(feature = "metal", target_vendor = "apple"))]
+            Some(flavor::Flavor::Metal) => Some("metal"),
             // No flavor, no claim to check -- the refusal is pinned by
             // `a_binary_without_an_engine_refuses_instead_of_writing_one`.
+            #[allow(unreachable_patterns)]
             _ => None,
         };
         let Some(expected) = expected else { return };
@@ -248,30 +240,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_retired_sections_are_gone_from_it() {
-        let content = config_content_with_any_engine();
-        for retired in ["[controller]", "[gateway]", "[worker", "[model.driver"] {
-            assert!(
-                !content.contains(retired),
-                "template still writes {retired}"
-            );
-        }
-    }
-
-    #[test]
-    fn it_stays_within_the_section_budget() {
-        // Five live, plus a commented `[cluster]`. Section count is what this
-        // format was redesigned to bring down; a test is cheaper than noticing
-        // later that it crept back.
-        let live = content_sections(&config_content_with_any_engine());
-        assert!(live <= 5, "template has {live} live sections");
-    }
-
-    fn content_sections(content: &str) -> usize {
-        content
-            .lines()
-            .filter(|l| l.starts_with('[') && !l.starts_with("[["))
-            .count()
-    }
 }

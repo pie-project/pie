@@ -1,8 +1,8 @@
-//! Gateway↔worker data-plane wire vocabulary: the turn types
-//! [`GatewayInbound`](crate::GatewayInbound) / [`WorkerControl`](crate::WorkerControl)
-//! carry, flat-re-exported at the crate root. CODEC CONSTRAINT: a *self-describing*
-//! codec ([`dispatch_codec`](crate::dispatch_codec)'s MessagePack, NOT bincode):
-//! [`Request`] and [`Tokens`] need `deserialize_any`.
+//! Gateway<->worker data-plane wire vocabulary: the turn types
+//! [`GatewayInbound`](crate::GatewayInbound) /
+//! [`WorkerControl`](crate::WorkerControl) carry. Needs a self-describing
+//! codec ([`dispatch_codec`](crate::dispatch_codec)'s MessagePack, not
+//! bincode): [`Request`] and [`Tokens`] need `deserialize_any`.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,9 +1,9 @@
-//! `pie` — the standalone composition root (Seam 4). A multi-call CLI that either
+//! `pie` — the standalone composition root. A multi-call CLI that either
 //! boots the full engine in-proc (`local`/`serve`, composing the controller +
 //! gateway + worker libs over loopback) or runs a one-shot operational command
 //! (`model`/`doctor`/...). The only crate that depends on all three role libs.
 //!
-//! Process model (Model A): `#[tokio::main]` owns the one runtime; every
+//! Process model: `#[tokio::main]` owns the one runtime; every
 //! subcommand runs on it. `local`/`serve` use the full daemon `bootstrap::init`
 //! + `run_until_signal`; one-shot ops use the light `bootstrap::init_cli`.
 
@@ -142,17 +142,12 @@ async fn run() -> anyhow::Result<ExitCode> {
         return serve(cli.global).await;
     }
 
-    // Once, for every op. It was written out at the head of all six arms, which
-    // is the kind of repetition that stays correct only until somebody adds a
-    // seventh arm.
+    // Once, for every op, rather than at the head of each arm.
     bootstrap::init_cli(&cli.global)?;
 
     // What each op decides for itself is whether it blocks and what it answers
-    // with. The threading policy used to be made arm by arm -- `model` got a
-    // `spawn_blocking`, `cache` walked weight-sized directory trees on the
-    // reactor, and `config` carried a comment explaining why it was no longer
-    // `spawn_blocking` -- so it is stated here instead, in one place where the
-    // three answers can be compared.
+    // with. The threading policy is stated here rather than arm by arm, in one
+    // place where the three answers can be compared.
     let answer = match cli.command {
         // Handled above; `Command` has no other arm that skips `init_cli`.
         Command::Serve => unreachable!("serve returns before the op dispatch"),
@@ -161,8 +156,8 @@ async fn run() -> anyhow::Result<ExitCode> {
         Command::Model { cmd } => {
             // The globals travel because `import` reads the SERVING config to
             // decide whether it can prepare the weight tiers it just made
-            // importable (§M wave M-1), and `--config` has to name the same
-            // file every other command resolves.
+            // importable, and `--config` has to name the same file every
+            // other command resolves.
             let global = cli.global.clone();
             tokio::task::spawn_blocking(move || ops::model::run(cmd, &global)).await??
         }
@@ -189,20 +184,23 @@ async fn run() -> anyhow::Result<ExitCode> {
 }
 
 /// The `serve` path: full daemon `init` → derive the three typed role Configs
-/// from the standalone TOML → boot the in-proc cluster (golf's compose) → run
-/// until SIGINT/SIGTERM, then drain.
+/// from the standalone TOML → boot the in-proc cluster → run until
+/// SIGINT/SIGTERM, then drain.
 async fn serve(global: bootstrap::GlobalArgs) -> anyhow::Result<ExitCode> {
     let ctx = bootstrap::init(
         bootstrap::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
         global,
     )?;
+    let (controller, gateway, worker) = derive::derive_standalone(ctx.config_str())?;
     // Provision the embedded Python-WASM runtime before booting — the worker
-    // daemon never downloads (R3), so the standalone root does it. Best-effort:
-    // a present runtime is a no-op; a failure is logged, not fatal here.
-    tokio::task::spawn_blocking(local::py_runtime::ensure_installed_best_effort)
+    // daemon never downloads, so the standalone root does it. Only when
+    // the config asks for Python at all, so an offline or Rust-only deployment
+    // makes no network call. Best-effort: a present runtime is a no-op; a
+    // failure is logged, not fatal here.
+    let want_python = worker.sandbox.python_runtime;
+    tokio::task::spawn_blocking(move || local::py_runtime::ensure_installed_best_effort(want_python))
         .await
         .ok();
-    let (controller, gateway, worker) = derive::derive_standalone(ctx.config_str())?;
     let handle = compose::run_standalone(controller, gateway, worker).await?;
     tracing::info!(
         listen = %handle.listen_addr,

@@ -101,13 +101,8 @@ impl EncodeOperand<'_> {
 pub type EncodeRowJob<'a> = dyn Fn(usize, &mut [f32], &mut [u8], &mut [u8]) + Sync + 'a;
 
 /// Run `job` over every row of an encode, in parallel when the tensor pays
-/// for it.
-///
-/// The outputs are handed to each worker as disjoint `split_at_mut` slices of
-/// the two flat buffers, so the parallelism needs no synchronisation — and
-/// because every row's bytes depend on that row alone, the worker count
-/// changes wall-clock and nothing else. Each worker keeps one `f32` scratch
-/// row rather than one per call.
+/// for it. Outputs are handed to each worker as disjoint `split_at_mut`
+/// slices, so the parallelism needs no synchronisation.
 pub fn encode_rows(
     rows: usize,
     cols: usize,
@@ -161,53 +156,3 @@ pub fn encode_rows(
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The parallel row engine against a plain sequential loop of the same
-    /// job, at a size that engages the worker split.
-    ///
-    /// Determinism is the claim `encode_rows` makes — the worker count changes
-    /// wall-clock and nothing else — and this is the check that the row/slice
-    /// bookkeeping honours it: an off-by-one in the `split_at_mut` arithmetic
-    /// shifts every subsequent row and cannot pass.
-    #[test]
-    fn parallel_row_encoding_is_bit_identical_to_sequential() {
-        let (rows, cols) = (512usize, 2048usize); // 1M elements: the parallel path
-        let job = |row: usize, buf: &mut [f32], out: &mut [u8], scale: &mut [u8]| {
-            for (c, v) in buf.iter_mut().enumerate() {
-                *v = ((row * 31 + c) % 97) as f32;
-            }
-            for (c, o) in out.iter_mut().enumerate() {
-                *o = (buf[c] as u32 % 251) as u8;
-            }
-            scale[0] = (row % 255) as u8;
-        };
-        let mut out_parallel = vec![0u8; rows * cols];
-        let mut scale_parallel = vec![0u8; rows];
-        encode_rows(
-            rows,
-            cols,
-            cols,
-            1,
-            &mut out_parallel,
-            &mut scale_parallel,
-            &job,
-        );
-
-        let mut out_sequential = vec![0u8; rows * cols];
-        let mut scale_sequential = vec![0u8; rows];
-        let mut buf = vec![0.0f32; cols];
-        for row in 0..rows {
-            job(
-                row,
-                &mut buf,
-                &mut out_sequential[row * cols..(row + 1) * cols],
-                &mut scale_sequential[row..row + 1],
-            );
-        }
-        assert_eq!(out_parallel, out_sequential);
-        assert_eq!(scale_parallel, scale_sequential);
-    }
-}

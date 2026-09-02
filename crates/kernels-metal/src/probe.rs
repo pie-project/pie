@@ -1,17 +1,7 @@
 //! A recording [`Encode`] sink — the host-side half of a kernel entry's
-//! contract, made assertable on a box with no GPU.
-//!
-//! Every entry in this crate answers two questions before any device sees
-//! it: WHICH point it selected, and WHAT geometry it hands the driver. Both
-//! are pure functions of the handles, and both are exactly what a stamp
-//! ladder or a grid formula gets wrong. A probe stands where the driver
-//! stands, records the [`Fire`] and its marshalled arguments, and lets a unit
-//! test read them back — so `dense_bidirectional_bfloat16_d_128` being the
-//! point a 72-wide head selects is a test rather than a comment.
-//!
-//! It is deliberately not a fake driver: it resolves no handle, allocates
-//! nothing, and never claims a launch RAN. What a passing test here proves
-//! is that the entry would have asked for the right thing.
+//! contract, made assertable with no GPU. Records the [`Fire`] and its
+//! marshalled arguments; resolves no handle, allocates nothing, and never
+//! claims a launch ran.
 
 use core::cell::RefCell;
 
@@ -33,14 +23,6 @@ impl Probe {
         self.fires.borrow().clone()
     }
 
-    /// The one launch an entry that fires once was handed. Panics if the
-    /// entry fired a different number of times, which is itself the claim
-    /// most of these tests are making.
-    pub(crate) fn only(&self) -> Recorded {
-        let fires = self.fires();
-        assert_eq!(fires.len(), 1, "expected exactly one launch");
-        fires.into_iter().next().expect("one launch")
-    }
 }
 
 impl Encode for Probe {

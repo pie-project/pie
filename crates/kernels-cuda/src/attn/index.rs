@@ -1,6 +1,5 @@
 //! `Index`: the sparse-attention indexer — a small key cache scored against
-//! queries to select which pages the main attention will read. One entry
-//! per IR variant, transcribed from the old INDEX claims.
+//! queries to select which pages the main attention will read.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -73,8 +72,7 @@ pub fn layernorm_rope(
             rope_dim.arg(),
             theta.arg(),
             eps.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
@@ -107,20 +105,15 @@ pub fn rope(
             head_dim.arg(),
             rope_dim.arg(),
             theta.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
 /// Appends index key rows into the pool's pages: the mla latent writer with
-/// a null rope plane.
-///
-// MENLO-SEAM: as `attention.mla_kv_append` — the op states `write_page`/
-// `write_offset`, but the latent writer still re-derives each token's cell
-// from the read-side CSR and the fire indptr riding in `k`, so the stated
-// pair goes unread.
+/// a null rope plane. `write_page`/`write_offset` are stated but unread —
+/// the writer re-derives each token's cell from the CSR and `k`'s indptr.
 pub fn kv_append(
     ctx: &Ctx,
     k: RaggedTensor,
@@ -224,8 +217,7 @@ pub fn topk(
             keys.page_size.arg(),
             max_kv.arg(),
             top_k.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )

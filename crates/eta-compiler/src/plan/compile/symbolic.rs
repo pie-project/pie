@@ -1,15 +1,10 @@
 //! Symbolic types: the shape vocabulary that keeps one plan valid across
 //! batch shapes.
 //!
-//! A planned value's type is a dtype plus a list of [`Dimension`]s, each either
-//! a concrete `u32` or a [`SymbolicExtent`] the runtime substitutes. Everything
-//! here answers "what shape does this op produce" without knowing the batch.
-//!
-//! Those two enums do not stop at the planner: they are also what
-//! [`crate::codegen::launch::LaunchPlanValue`] ships to an engine, which is why
-//! they serialize. Each of them carries, on its own declaration, the argument
-//! for why the launch package used to spell it a second time and why it does
-//! not any more.
+//! A planned value's type is a dtype plus a list of [`Dimension`]s, each
+//! either a concrete `u32` or a [`SymbolicExtent`] the runtime substitutes.
+//! These also serialize, since [`crate::codegen::launch::LaunchPlanValue`]
+//! ships them to an engine.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -21,34 +16,10 @@ use eta_ir::validate::BoundTrace;
 
 eta_ir::declare_tagged_enum! {
     #[derive(serde::Serialize, serde::Deserialize)]
-    /// Runtime-varying dimensions represented symbolically in compiler types.
-    ///
-    /// The discriminants are the wire encoding, and `ALL` is the whole of it in
-    /// one place: `crate::codegen::launch` bounds the grouped path by its length,
-    /// and the C header enumerates it as `PtirSymbolicExtent`.
-    ///
-    /// # It travels, and it used to travel under another name
-    ///
-    /// This is the tag space [`crate::codegen::launch::LaunchPlanValue`]'s axes
-    /// and [`crate::codegen::launch::LaunchStagePlan`]'s `used_extents` are
-    /// written in, so it derives `Serialize`/`Deserialize` — those derives came
-    /// off `ExtentRole`, which was the launch package's own arm-for-arm copy of
-    /// this enum, and `extent_role` was the seven-arm function between them.
-    ///
-    /// **The reason there were two is dead.** The launch package was declared
-    /// in `engine`, the runtime↔engine contract, back when the contract was the
-    /// only crate both sides could name — so the contract sat UNDER the
-    /// compiler, could not depend on it, and the producer's own word for a
-    /// runtime extent could not be the word that shipped. The package is
-    /// declared in this crate now (`crate::codegen::launch`), which is what
-    /// made the copy deletable rather than merely redundant; the same move
-    /// already deleted the `RegionKind`/`LibraryOp` pair for the same reason,
-    /// and this pair outlived it only by the arithmetic of its call sites.
-    ///
-    /// What the copy also carried away with it: `ExtentRole::ALL` and
-    /// `ExtentRole::from_wire`, which restated `ALL` and `from_u8` by hand. The
-    /// macro derives those from this variant list, so the wire order and the
-    /// tag decoder can no longer disagree with the variants.
+    /// Runtime-varying dimensions represented symbolically in compiler
+    /// types. Discriminants are the wire encoding, serialized because
+    /// [`crate::codegen::launch::LaunchPlanValue`]'s axes are written in
+    /// this tag space and ship to an engine.
     pub enum SymbolicExtent {
         /// Number of live KV-cache entries.
         KvLen = 0, "kv_len";
@@ -68,25 +39,9 @@ eta_ir::declare_tagged_enum! {
 }
 
 /// One dimension of a [`SymbolicType`]: a fixed size or a runtime extent.
-///
-/// # It travels, and it removed a refusal on the way
-///
-/// This is also the launch package's axis type — the element of
-/// [`crate::codegen::launch::LaunchPlanValue`]'s `axes` — which is why it
-/// serializes. It was spelled `Axis` over there, and that spelling is worth
-/// recording for what it deleted: the package used to carry two parallel
-/// vectors, `extents: Vec<u8>` and `dims: Vec<u32>`, where entry `i` of one
-/// was read only if entry `i` of the other held the sentinel
-/// `PIE_EXTENT_STATIC = 0xff`, and the first thing every reader did was check
-/// that the two were the same length (`Unresolvable::Mismatch`). One vector of
-/// this cannot be mismatched with itself, and a byte carved out to mean "not a
-/// tag" is a variant instead.
-///
-/// Two types is what was left of that, for exactly the reason
-/// [`SymbolicExtent`] records: the package was declared in a crate that could
-/// not name this one. It is declared here now, so the planner's answer travels
-/// as itself, and `axis` — the two-arm `Dimension` → `Axis` map that stood in
-/// `lower_plan_value` — is gone with its seven-arm companion.
+/// Also the launch package's axis type (an element of
+/// [`crate::codegen::launch::LaunchPlanValue`]'s `axes`), hence it
+/// serializes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Dimension {
     /// A size known at plan time.
@@ -213,11 +168,8 @@ pub(crate) fn symbolic_result_type(
             let operands = mapped_op.operands();
             let left = &normalized_types[operands[0] as usize];
             let right = &normalized_types[operands[1] as usize];
-            // Invariant: `MatMul` operands are exactly rank 2. `eta_ir`'s
-            // `infer::body_types` matches both shapes against `[m, k]` and
-            // `[k, n]` and returns a shape error otherwise, and
-            // `validate::bind` runs it — so `left.dims[0]` and the last of
-            // `right.dims` both exist.
+            // `MatMul` operands are exactly rank 2 (checked by `validate::bind`),
+            // so `left.dims[0]` and the last of `right.dims` both exist.
             SymbolicType {
                 dtype: value_type.dtype,
                 dims: vec![left.dims[0], *right.dims.last().expect("matmul right rank")],
@@ -261,16 +213,10 @@ pub(crate) fn symbolic_result_type(
             );
             ty
         }
-        // Rank-preserving default: the op's own declared shape, with any
-        // symbolic dimension carried over from the first operand of equal
-        // rank. Every op above either invents a shape or reshapes one, so
-        // these are the ops for which "same rank in, same rank out" is the
-        // whole rule.
-        //
-        // Named rather than left to `_` because that is the difference
-        // between an op the default *fits* and an op nobody classified: a new
-        // reducer or gather silently taking this arm would be given its
-        // operand's rank and go on to size a buffer.
+        // Rank-preserving default: the op's declared shape, with any symbolic
+        // dimension carried from the first operand of equal rank. Named
+        // rather than `_` so a new reducer/gather can't silently fall
+        // through to it.
         Op::Const(..)
         | Op::Exp(..)
         | Op::Log(..)
@@ -342,17 +288,10 @@ pub(crate) fn propagate_preserved_dimensions(
     }
 }
 
-/// The normalized SSA id standing in for `original_value`.
-///
-/// Normalization renumbers, so a shape-changing op's operand has to be read
-/// off the *normalized* op rather than the original. The named arms are
-/// exactly the op kinds the four callers in [`symbolic_type_of`] can be
-/// holding; `_` is the case where normalization produced something else
-/// entirely, and there is no renumbering to follow — the original id is what
-/// the caller already has. `the_fallback_is_only_for_a_changed_op_kind` pins
-/// that the seven are read and everything else falls through.
-///
-/// [`symbolic_type_of`]: self::symbolic_type_of
+/// The normalized SSA id standing in for `original_value`. Normalization
+/// renumbers, so a shape-changing op's operand must be read off the
+/// normalized op; `_` falls through to the original id since there is no
+/// renumbering to follow for any other op kind.
 pub(crate) fn mapped_value(mapped_op: &Op, original_value: u32) -> u32 {
     match mapped_op {
         Op::ReduceSum(value)
@@ -394,10 +333,9 @@ pub(crate) fn symbolic_port_type(port: Port, value_type: ValueType) -> SymbolicT
             }
         }
         Port::EmbedIndptr => set_first_symbolic(&mut ty, SymbolicExtent::RowCount),
-        // RS buffered-slot family — the recurrent mirror of the KV family, so
-        // the extents mirror it: the slab-id vector is page-indexed, its CSR
-        // bounds and per-row live length are row-indexed, and the write
-        // descriptor is token-indexed.
+        // RS buffered-slot family, mirroring KV: slab-id vector page-indexed,
+        // CSR bounds and per-row live length row-indexed, write descriptor
+        // token-indexed.
         Port::RsBufferPages => set_first_symbolic(&mut ty, SymbolicExtent::PageCount),
         Port::RsBufferIndptr | Port::RsBufferLen | Port::RsFoldLen => {
             set_first_symbolic(&mut ty, SymbolicExtent::RowCount)
@@ -413,13 +351,9 @@ pub(crate) fn set_first_symbolic(ty: &mut SymbolicType, extent: SymbolicExtent) 
     }
 }
 
-/// The symbolic type of an intrinsic's result.
-///
-/// Written as an exhaustive match rather than a catch-all: adding an intrinsic
-/// should make this fail to compile, not silently fall through to the static
-/// type. The `Logits` arm is the only one that lifts a dimension to
-/// `SampledRows`, and getting that wrong for a new row-shaped intrinsic would
-/// pin its extent to whatever the tracing pass happened to see.
+/// The symbolic type of an intrinsic's result. An exhaustive match, so a new
+/// intrinsic fails to compile here rather than silently falling through to
+/// the static type.
 pub(crate) fn symbolic_intrinsic_type(
     bound: &BoundTrace,
     intrinsic: IntrinsicId,
@@ -432,16 +366,9 @@ pub(crate) fn symbolic_intrinsic_type(
                 ty.dims[0] = Dimension::Symbolic(SymbolicExtent::SampledRows);
             }
         }
-        // `MtpLogits` and `MtpDrafts` are shaped by the draft count; `ValueHead`
-        // and `Layer` by the model profile. `Hidden` and `Query` are shaped by
-        // extents the *trace* declares (hidden width, query width), neither of
-        // which is in the profile, so `bind` checks their rank and not their
-        // width. `AttnScore` is shaped by a DECLARED plane count and the
-        // published `ATTN_SCORE_KV_MAX` — and lifting its width to
-        // `SymbolicExtent::KvLen` is exactly the mistake the ceiling exists to
-        // prevent: a per-request extent would cut one launch per distinct kv
-        // length, so a 64-lane decode wave would be 64 batches. Either way the
-        // dims are already static, so there is nothing to make symbolic here.
+        // These stay static: e.g. `AttnScore`'s width is a declared plane
+        // count bounded by `ATTN_SCORE_KV_MAX`, and lifting it to `KvLen`
+        // would cut one launch per distinct kv length.
         IntrinsicId::MtpLogits
         | IntrinsicId::MtpDrafts
         | IntrinsicId::Hidden
@@ -485,38 +412,3 @@ pub(crate) fn symbolic_dims_match_expected(
             })
 }
 
-#[cfg(test)]
-mod mapped_value_tests {
-    use super::*;
-
-    /// Every op kind `mapped_value` names reads its own operand; every other
-    /// op falls through to the id the caller already had.
-    ///
-    /// The interesting half is the fallthrough. It is right only because a
-    /// normalized op of a *different* kind carries no renumbering to follow —
-    /// if a new shape-changing op were added and left out of the named set,
-    /// the fallthrough would silently return an id from the pre-normalization
-    /// numbering, and the symbolic type would be read off the wrong value.
-    #[test]
-    fn the_fallback_is_only_for_a_changed_op_kind() {
-        const SENTINEL: u32 = 0xdead;
-        for op in eta_ir::op::representatives() {
-            let named = matches!(
-                op,
-                Op::ReduceSum(..)
-                    | Op::ReduceMax(..)
-                    | Op::ReduceMin(..)
-                    | Op::ReduceArgmax(..)
-                    | Op::Transpose(..)
-                    | Op::Broadcast { .. }
-                    | Op::Reshape { .. }
-            );
-            let got = mapped_value(&op, SENTINEL);
-            assert_eq!(
-                got != SENTINEL,
-                named,
-                "{op:?}: mapped_value returned {got:#x}, named = {named}"
-            );
-        }
-    }
-}

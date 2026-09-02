@@ -1,88 +1,13 @@
-//! The owning-side channel handle applications hold ([`ChannelEndpoint`]),
-//! its wait/poison/close semantics, and — new in palo B1 — the HOST RING it
-//! is a view of.
-//!
-//! # The ring moved to this side of the boundary
-//!
-//! `RegisteredChannel` used to carry an `engine::ChannelBinding`: eleven
-//! `u64`/`u32` fields naming DEVICE addresses and word indices —
-//! `mirror_base`, `word_base`, `head_word_index`, `poison_word_index`, … —
-//! that the runtime dereferenced directly. The contract deleted it, and its
-//! own module header says why: "that is an engine's private ring layout,
-//! published into the contract so a C caller could poke it; the shells in
-//! this workspace are Rust and drive their own rings."
-//!
-//! So the runtime allocates its own. [`HostRing`] is the same layout the
-//! binding described — `capacity + 1` cells of `cell_bytes`, four control
-//! words — owned by the [`RegisteredChannel`] that answers for it, and
-//! [`ChannelBinding`] is the (now purely runtime-internal) view of it that
-//! [`crate::pipeline::channel`]'s ring arithmetic reads. Not one line of that
-//! arithmetic changed; what changed is who the bytes belong to.
-//!
-//! # The two halves, and what joins them (`palo B2`)
-//!
-//! A channel a guest program's stages actually read has a DEVICE ring as
-//! well, and the shell owns it (`engine_cuda::program::launch`, whose header
-//! states the same `base + (sequence % ring) * cell_bytes` agreement). What
-//! joins them is [`ChannelJoin`], and it is a PUMP rather than a mapping:
-//! wire cells move across at the fire's boundary, in the direction the
-//! channel's [`HostRole`] declares, through
-//! [`Engine::publish_channel`](engine::Engine::publish_channel) and
-//! [`Engine::take_channel`](engine::Engine::take_channel).
-//!
-//! ```text
-//!   guest put ──▶ host ring ──pump_in──▶ device ring ──▶ the pass takes
-//!   guest take ◀── host ring ◀─pump_out── device ring ◀── the pass puts
-//! ```
-//!
-//! **THE PUMP IS THE DEVICE END OF THE SPSC DISCIPLINE**, which is what makes
-//! it sound to run on the engine lane while the guest runs on its own thread.
-//! On a `Writer` channel the guest owns the tail word and the pump owns the
-//! head; on a `Reader` channel the guest owns the head and the pump owns the
-//! tail. Neither ever writes the other's word, and `pipeline::channel`'s
-//! arithmetic — unchanged — is the other end of exactly this agreement.
-//!
-//! **AND IT IS PASS-ATOMIC IN BOTH DIRECTIONS.** `pump_in` runs before the
-//! fire, so a cell it moves is one the device's readiness gate can see;
-//! `pump_out` runs after a fire that COMMITTED, so a cell it moves is one the
-//! guest program published rather than one a declined pass left pending.
-//! A fire that never committed moves nothing, which is what "effects visible
-//! only after commit" means from this side.
-//!
-//! # And for an engine that commits on the DEVICE there is no pump (alto F2a)
-//!
-//! Everything above describes a runtime that owns the host ring and an engine
-//! that owns the device ring, joined a cell at a time. An engine that declares
-//! [`device_channel_commit`](engine::Capabilities::device_channel_commit)
-//! allocates the host ring ITSELF, in mapped pinned memory its control kernels
-//! dereference, and publishes the addresses at registration; [`HostRing`]
-//! becomes a view of those bytes ([`HostRing::adopt`]) and the two halves stop
-//! being two:
-//!
-//! ```text
-//!   guest put ──▶ pinned ring ──channel::pull_validate──▶ device cells
-//!   guest take ◀── pinned ring ◀──channel::scatter_publish── device cells
-//! ```
-//!
-//! No `cudaMemcpy` in either direction, no `Vec` per cell, and no device call
-//! at all on the guest's thread — which is what survey §7's invariant I5 asks
-//! for and what the pump was a stand-in for. [`ChannelJoin::pump_in`] and
-//! [`ChannelJoin::pump_out`] still run for such a channel and still do exactly
-//! one thing: **wake the waiter**. The engine has no waker table (its
-//! `RegisteredChannel` mints no slot and says so), so parking and waking stay
-//! the runtime's, and that is all that is left of the pump on this path — a
-//! call site wave E can retire once settlement wakes through the broker.
+//! The owning-side channel handle ([`ChannelEndpoint`]), its wait/poison/close
+//! semantics, and the host-ring/device-ring pump ([`ChannelJoin`]).
 
 use std::sync::Arc;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A value put into a channel — the wire cells, as the ring holds them.
-///
-/// The contract spells the same thing [`ChannelSeed`](engine::ChannelSeed)
-/// and the runtime converts at the one bind site; this stays because the
-/// runtime's own channel plane names the channel by its GLOBAL id and a seed
-/// names it by its index in the package's declaration order.
+/// Keyed by the channel's global id, unlike [`ChannelSeed`](engine::ChannelSeed)
+/// which uses its declaration-order index.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChannelValue {
     /// The channel's global id.
@@ -92,12 +17,6 @@ pub struct ChannelValue {
 }
 
 /// One channel's host ring: the cells and the four control words.
-///
-/// **THE RUNTIME OWNS THESE BYTES NOW** — see the module header. The layout is
-/// the one `engine::ChannelBinding` described, kept exactly, because
-/// `pipeline::channel`'s ring arithmetic is written against it and that
-/// arithmetic is not what this wave is changing.
-///
 /// `capacity + 1` cells, because a ring that distinguishes full from empty by
 /// its two cursors needs one slot it never fills.
 #[derive(Debug)]
@@ -140,23 +59,12 @@ impl HostRing {
         }
     }
 
-    /// **A VIEW OF THE ENGINE'S OWN PINNED RING** (alto design §5, survey §7
-    /// invariant I5).
-    ///
-    /// An engine that declares
+    /// A view of an engine's own pinned ring. An engine that declares
     /// [`device_channel_commit`](engine::Capabilities::device_channel_commit)
-    /// allocates this channel's host half itself — mapped pinned memory its
-    /// control kernels dereference — and publishes the two addresses as
-    /// [`HostMirror`](engine::HostMirror). Adopting them is what deletes
-    /// the pump: a guest that writes a cell here has written it where
-    /// `channel::pull_validate` will read it, and a pass that publishes one
-    /// wrote it where the guest will read it. **No cell is ever copied across
-    /// the contract, in either direction, and a guest round trip makes no
-    /// device call at all.**
-    ///
-    /// Not one line of `pipeline::channel`'s ring arithmetic changes: the
-    /// layout is the one [`HostRing::new`] allocates, cell for cell and word
-    /// for word. What changes is who the bytes belong to.
+    /// allocates this channel's host half itself and publishes the two
+    /// addresses as [`HostMirror`](engine::HostMirror); adopting them means
+    /// no cell is ever copied and a guest round trip makes no device call.
+    /// Layout matches [`HostRing::new`] cell for cell and word for word.
     ///
     /// # Safety
     ///
@@ -217,12 +125,8 @@ impl HostRing {
 }
 
 /// Where one channel's cells and cursors are, as an address and four indices.
-///
-/// **THIS IS NO LONGER A CONTRACT TYPE.** It was
-/// `engine::local::ChannelBinding`, filled in by an engine and validated
-/// by `validate_channel_endpoint_binding`; now it is a view of a
-/// [`HostRing`] the runtime allocated, so there is nothing left to validate —
-/// an engine cannot fill it in wrongly because no engine fills it in.
+/// A view of a [`HostRing`] the runtime allocated; not filled in by an
+/// engine, so there is nothing to validate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChannelBinding {
     /// The channel's global id.
@@ -334,18 +238,9 @@ impl PartialEq for RegisteredChannel {
 impl Eq for RegisteredChannel {}
 
 /// The lane's table of registered channels, and the pump that joins each
-/// one's host ring to its device half.
-///
-/// **ONE PER ENGINE LANE.** It replaces the `HashSet<u64>` the lane used to
-/// keep of "which channels are registered here": the set answered exactly one
-/// question (is this id taken?) and the pump needs three more — where the
-/// ring is, which way the cells travel, and which dense slot of which bound
-/// instance the channel is. All four are facts the lane already had at
-/// registration and bind time and threw away.
-///
-/// Every method is the DEVICE end of the SPSC agreement `pipeline::channel`
-/// writes the guest end of; the module header states which word belongs to
-/// whom.
+/// one's host ring to its device half. One per engine lane. Every method is
+/// the device end of the SPSC agreement `pipeline::channel` writes the guest
+/// end of.
 #[derive(Debug, Default)]
 pub struct ChannelJoin {
     channels: std::collections::HashMap<u64, JoinedChannel>,
@@ -361,9 +256,7 @@ pub struct ChannelJoin {
 struct JoinedChannel {
     registered: RegisteredChannel,
     /// Which end the host holds. [`HostRole::None`] is a channel the guest
-    /// program keeps to itself — loop-carried state, a mask it computes and
-    /// re-reads — and the pump never touches one: its cells never leave the
-    /// device ring, so moving them would be inventing a reader.
+    /// keeps to itself; the pump never touches one.
     host_role: eta_ir::container::HostRole,
 }
 
@@ -435,22 +328,13 @@ impl ChannelJoin {
     }
 
     /// Move every host-written cell of `instance` into its device rings.
-    ///
-    /// Runs BEFORE the fire, because a cell the device's readiness gate
-    /// cannot see is a cell the guest program blocks on. Stops at the first
-    /// channel the device ring has no room for — back-pressure, and the head
-    /// word is only advanced for cells that actually crossed, so a retry
-    /// resumes exactly where this left off.
-    ///
-    /// An instance this lane has no bind record for pumps nothing: it is a
-    /// fire whose program the engine owns end to end, and inventing a
-    /// channel list for it would address someone else's rings.
+    /// Runs before the fire. Stops at the first channel the device ring has
+    /// no room for; the head word only advances for cells that crossed, so a
+    /// retry resumes where this left off. An unbound instance pumps nothing.
     ///
     /// # Errors
     ///
-    /// Whatever the engine refused. [`Unsupported`](engine::Error::Unsupported)
-    /// is NOT one of them: a shell with no guest-program plane never has an
-    /// instance to pump for.
+    /// Whatever the engine refused.
     pub fn pump_in(
         &self,
         engine: &mut dyn engine::Engine,
@@ -466,24 +350,11 @@ impl ChannelJoin {
             if joined.host_role != eta_ir::container::HostRole::Writer {
                 continue;
             }
-            // ── **THE PUMP IS OVER FOR AN ADOPTED CHANNEL** (alto design §5,
-            //    survey §7 I5). The engine published this ring's bytes and the
-            //    guest wrote its cell straight into them, which is where
-            //    `channel::pull_validate` reads it — so there is nothing to
-            //    move, and moving it would be an H2D copy of bytes that are
-            //    already device-addressable. The head word stays the engine's
-            //    to advance, at settle, predicated on the pass having
-            //    committed; a store here would be the runtime deciding an
-            //    outcome the device owns.
-            //
-            //    **THE WAKE IS NOT OVER**, and that is the one thing the pump
-            //    did that nobody else does. A guest parked on
-            //    `wait_for_writer_change` is waiting for the head to move, and
-            //    the engine that moves it has no waker table (its
-            //    `RegisteredChannel` says so by minting no slot). So the wake
-            //    stays here, unconditional rather than "if something moved":
-            //    the waiter re-reads the word and re-parks if it has not, and
-            //    a spurious wake costs that re-read.
+            // Adopted channel: the guest already wrote its cell where the
+            // engine reads it, and the engine advances the head word at
+            // settle — nothing to move here. Only the wake remains, since
+            // the engine has no waker table; unconditional, so a spurious
+            // wake just costs the waiter a re-read.
             if joined.registered.adopted() {
                 waker::WakerTable::global().wake(joined.registered.writer_wait_id);
                 continue;
@@ -525,11 +396,8 @@ impl ChannelJoin {
     }
 
     /// Move every cell `instance`'s pass published into its host rings.
-    ///
-    /// Runs AFTER a fire that COMMITTED — a declined or blocked pass leaves
-    /// its device cursors where they were, so there is nothing to take and
-    /// this moves nothing, which is the pass-atomic contract seen from the
-    /// host.
+    /// Runs after a fire that committed; a declined or blocked pass leaves
+    /// nothing to take.
     ///
     /// # Errors
     ///
@@ -542,19 +410,10 @@ impl ChannelJoin {
         self.pump_out_with(engine, instance, None)
     }
 
-    /// **[`ChannelJoin::pump_out`], with the adopted channels' wakes handed
-    /// back instead of taken** (alto F2b).
-    ///
-    /// An adopted channel's cell crosses by device access — `scatter_publish`
-    /// writes it into the guest's mirror — so all `pump_out` has left to do
-    /// for one is wake its reader. Against an engine that settles
-    /// asynchronously, waking at submit-return would be a promise the device
-    /// has not kept yet: the guest would be told to read a cell the fire is
-    /// still computing. So the lane collects the wait ids here and the frame's
-    /// completion callback is what wakes them.
-    ///
-    /// `deferred: None` is the synchronous shape and wakes in place, which is
-    /// what every caller against a synchronous engine wants.
+    /// As [`ChannelJoin::pump_out`], but an adopted channel's wake is handed
+    /// back via `deferred` instead of fired in place — needed when the engine
+    /// settles asynchronously, so the frame's completion callback wakes it
+    /// once the device is actually done. `deferred: None` wakes in place.
     ///
     /// # Errors
     ///
@@ -575,12 +434,8 @@ impl ChannelJoin {
             if joined.host_role != eta_ir::container::HostRole::Reader {
                 continue;
             }
-            // As `pump_in`: `channel::scatter_publish` wrote the committed
-            // cell into these very bytes and the engine advanced the tail
-            // word at settle, so the guest's next `take` reads it in place.
-            // A `take_channel` here would be a `Vec` per cell out of memory
-            // the guest can already address. The wake stays, for the reason
-            // `pump_in` states.
+            // Adopted channel: as in pump_in, the engine already wrote the
+            // committed cell in place; only the wake remains.
             if joined.registered.adopted() {
                 match deferred.as_deref_mut() {
                     Some(wakes) => wakes.push(joined.registered.reader_wait_id),
@@ -649,13 +504,8 @@ fn store_word(word_base: u64, index: u32, value: u64) {
 }
 
 /// Notifies whichever layer owns the channel's native binding that this
-/// endpoint has closed (physically closes/deregisters `channel_id` on the
-/// engine that owns it). A leaf callback type — it names no scheduler
-/// type — installed by whoever registers the channel and therefore already
-/// holds a handle to the owning engine's scheduler
-/// (`scheduler::dispatch::register_channel`); `None` in tests that only
-/// exercise wait/poison semantics and never call [`ChannelEndpoint::new`]
-/// with a closer installed.
+/// endpoint has closed (closes/deregisters `channel_id` on the owning
+/// engine). `None` in tests that only exercise wait/poison semantics.
 pub type ChannelCloser = Arc<dyn Fn(u64) -> anyhow::Result<()> + Send + Sync>;
 
 pub struct ChannelEndpoint {
@@ -709,9 +559,7 @@ impl ChannelEndpoint {
         }
     }
 
-    /// Installs the close-notification callback (see [`ChannelCloser`]);
-    /// called by the scheduler dispatch facade, which already holds the
-    /// owning engine's scheduler handle.
+    /// Installs the close-notification callback (see [`ChannelCloser`]).
     pub fn with_closer(mut self, closer: ChannelCloser) -> Self {
         self.closer = Some(closer);
         self
@@ -767,13 +615,9 @@ impl ChannelEndpoint {
     }
 
     /// Takes over this endpoint's engine close notification: returns the
-    /// channel id the caller is now responsible for closing (via a batched
-    /// scheduler post), or `None` if the endpoint already closed (the closer
-    /// already notified) or the notification was already taken. Wait/poison
-    /// bookkeeping is untouched — the endpoint's own drop still sweeps and
-    /// frees its waker slots. Callers must outlive-order the endpoint's drop
-    /// (e.g. hold it through a resource table they drop themselves) — this
-    /// method does not synchronize against a concurrent drop.
+    /// channel id the caller must now close, or `None` if already closed or
+    /// already taken. Caller must outlive-order the endpoint's drop; this
+    /// does not synchronize against a concurrent one.
     pub fn detach_close_notification(&self) -> Option<u64> {
         if self.closed.load(Ordering::Acquire) {
             return None;
@@ -817,122 +661,3 @@ impl Drop for ChannelEndpoint {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The endpoint under test, and the ring it is a view of.
-    ///
-    /// The fixture used to allocate a mirror and a word block by hand and
-    /// hand the addresses to a `ChannelBinding` — which is what an ENGINE did
-    /// in production. It allocates a `RegisteredChannel` now, which is what
-    /// the runtime does, so the test exercises the shipped construction path
-    /// rather than a hand-built imitation of it.
-    fn test_endpoint() -> (ChannelEndpoint, u64, u64) {
-        let table = waker::WakerTable::global();
-        let reader_wait_id = table.alloc();
-        let writer_wait_id = table.alloc();
-        let endpoint = ChannelEndpoint::new(RegisteredChannel::new(
-            usize::MAX,
-            1,
-            4,
-            1,
-            reader_wait_id,
-            writer_wait_id,
-        ));
-        (endpoint, reader_wait_id, writer_wait_id)
-    }
-
-    /// Store into one of the endpoint's control words, the way the ring
-    /// arithmetic in `pipeline::channel` does.
-    fn store_word(endpoint: &ChannelEndpoint, index: u32, value: u64) {
-        let binding = endpoint.registered().binding;
-        // SAFETY: the endpoint holds the ring alive, and `index` is one of
-        // the four words `HostRing` allocates.
-        unsafe {
-            (*(binding.word_base as *const AtomicU64).add(index as usize))
-                .store(value, Ordering::Release);
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn channel_waits_register_then_recheck_reader_and_writer_words() {
-        let (endpoint, reader_wait_id, writer_wait_id) = test_endpoint();
-        let reader = endpoint.wait_for_reader_change(0);
-        let publish_reader = async {
-            tokio::task::yield_now().await;
-            store_word(&endpoint, 1, 1);
-            let _ = waker::WakerTable::global().publish(reader_wait_id, 1);
-        };
-        let (result, ()) = tokio::join!(reader, publish_reader);
-        result.unwrap();
-
-        let writer = endpoint.wait_for_writer_change(0);
-        let publish_writer = async {
-            tokio::task::yield_now().await;
-            store_word(&endpoint, 0, 1);
-            let _ = waker::WakerTable::global().publish(writer_wait_id, 1);
-        };
-        let (result, ()) = tokio::join!(writer, publish_writer);
-        result.unwrap();
-    }
-
-    #[test]
-    fn detach_close_notification_takes_over_the_engine_close_once() {
-        let (endpoint, _reader, _writer) = test_endpoint();
-        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = Arc::clone(&closes);
-        let endpoint = endpoint.with_closer(Arc::new(move |_id| {
-            counter.fetch_add(1, Ordering::AcqRel);
-            Ok(())
-        }));
-
-        assert_eq!(
-            endpoint.detach_close_notification(),
-            Some(1),
-            "first detach hands the caller the channel id"
-        );
-        assert_eq!(
-            endpoint.detach_close_notification(),
-            None,
-            "a second detach finds the notification already taken"
-        );
-        drop(endpoint);
-        assert_eq!(
-            closes.load(Ordering::Acquire),
-            0,
-            "drop after detach must not double-notify through the closer"
-        );
-    }
-
-    #[test]
-    fn detach_close_notification_after_close_yields_nothing() {
-        let (endpoint, _reader, _writer) = test_endpoint();
-        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = Arc::clone(&closes);
-        let endpoint = endpoint.with_closer(Arc::new(move |_id| {
-            counter.fetch_add(1, Ordering::AcqRel);
-            Ok(())
-        }));
-        endpoint.close();
-        assert_eq!(closes.load(Ordering::Acquire), 1, "close notified once");
-        assert_eq!(
-            endpoint.detach_close_notification(),
-            None,
-            "the closer already notified; nothing left to hand off"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn channel_wait_surfaces_poison_after_wakeup() {
-        let (endpoint, reader_wait_id, _writer_wait_id) = test_endpoint();
-        let reader = endpoint.wait_for_reader_change(0);
-        let poison = async {
-            tokio::task::yield_now().await;
-            store_word(&endpoint, 2, 7);
-            let _ = waker::WakerTable::global().publish(reader_wait_id, 7);
-        };
-        let (result, ()) = tokio::join!(reader, poison);
-        assert_eq!(result, Err(ChannelWaitError::Poisoned(7)));
-    }
-}

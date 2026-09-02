@@ -1,14 +1,6 @@
-//! `Clip`: the free-standing activation clamp (`.wiki/alto/multimodal.md`
-//! §6.5).
+//! `Clip`: the free-standing activation clamp.
 //!
-//! gemma4's `vision_config.use_clipped_linears: true` publishes
-//! `{input,output}_{min,max}` as scalars beside every
-//! `encoder.layers.{l}.*.linear.weight`, so each projection clamps what it
-//! reads and what it writes. The only clamp this plane had was FUSED inside
-//! `linear::mlp::swiglu_clamp`, which is a swiglu and not a projection; this
-//! is the clamp on its own, because the sites it serves sit on both sides of
-//! an ordinary matmul and a fused spelling would need one fusion per
-//! projection shape.
+//! gemma4's `vision_config.use_clipped_linears: true` publishes `{input,output}_{min,max}` as scalars beside every `encoder.layers.{l}.*.linear.weight`, so each projection clamps what it reads and writes. This is a standalone clamp (unlike the one fused inside `linear::mlp::swiglu_clamp`), since it serves sites on both sides of an ordinary matmul.
 
 use crate::error::Error;
 
@@ -19,18 +11,9 @@ const FILE: &str = "elemwise/clip.cuh";
 
 const BLOCK: u32 = 256;
 
-/// `x = min(max(x, lo), hi)`, in place, one thread per element.
+/// `x = min(max(x, lo), hi)`, in place, one thread per element. Both bounds are trace constants, rounded through the element before the comparison.
 ///
-/// Both bounds are TRACE CONSTANTS — the checkpoint's own scalars — and are
-/// rounded through the element before the comparison, so a value already at
-/// the stated bound is left where it is.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for
-/// bounds that cross (`lo > hi`, which would collapse the row to `hi`
-/// silently), for an empty rectangle, and for an extent past a 32-bit launch
-/// — clamped rather than truncated is the one thing this must not do.
+/// Errs [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for crossed bounds (`lo > hi`), an empty rectangle, or an extent past a 32-bit launch.
 pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.clamp";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -57,37 +40,19 @@ pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
             lo.arg(),
             hi.arg(),
             n.arg(),
-            // The element-form seat's width: this launch is flat over
-            // `rows * width`, so the kernel needs the row's width to read the
-            // staged row count and row start as elements.
+            // flat over rows * width; the kernel needs the row width to read the staged row count/start as elements.
             stated(OP, x.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // region's live-rows word when a body replay armed one, else the null seat.
             ctx.stage(),
         ],
     )
 }
 
-/// **THE SAME CLAMP, WITH THE BOUNDS THE CHECKPOINT STATES** (multimodal
-/// §12.2): `lo` and `hi` are one-element planes read on the device.
+/// The same clamp, with the bounds the checkpoint states: `lo` and `hi` are one-element planes read on the device (a property of the artifact, not the text).
 ///
-/// gemma4 ships 448 of them over its vision tower — `input_min`/`input_max`
-/// and `output_min`/`output_max` beside every `.linear.weight`, all finite,
-/// all different — so they are a property of the artifact and not of the text.
-/// [`crate::elemwise::norm::scale`] reads its scalar this way for the same
-/// reason, and this entry is that argument applied to a bound.
+/// No crossed-bounds refusal here, unlike [`clamp`]: comparing would require reading device memory. A checkpoint whose `input_min` exceeds its `input_max` is an import-time refusal instead.
 ///
-/// **NO CROSSED-BOUNDS REFUSAL HERE**, and that is the one difference from
-/// [`clamp`]: the plain form compares two numbers the host holds, and this one
-/// would have to read device memory to compare anything. A checkpoint whose
-/// `input_min` exceeds its `input_max` is an import to refuse, where the two
-/// planes are still on the host.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for a
-/// bound plane that is not one element of the activation's own type, for an
-/// empty rectangle, and for an extent past a 32-bit launch.
+/// Errs [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for a bound plane that isn't one element of the activation's own type, an empty rectangle, or an extent past a 32-bit launch.
 pub fn clamp_learned(
     ctx: &Ctx,
     lo: Tensor,
@@ -134,12 +99,9 @@ pub fn clamp_learned(
             lo.arg(),
             hi.arg(),
             n.arg(),
-            // The element-form seat's width: this launch is flat over
-            // `rows * width`, so the kernel needs the row's width to read the
-            // staged row count and row start as elements.
+            // flat over rows * width; the kernel needs the row width to read the staged row count/start as elements.
             stated(OP, x.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // region's live-rows word when a body replay armed one, else the null seat.
             ctx.stage(),
         ],
     )

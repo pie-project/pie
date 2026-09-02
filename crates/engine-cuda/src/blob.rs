@@ -1,107 +1,6 @@
-//! **THE SHARED ADAPTER STORE: FILES ARE THE TRUTH, THE BANK IS A CACHE**
-//! (alto adapter §3.3, promoted to wave 1 by §6.1).
-//!
-//! # Why this module exists at all, and why it is not a channel
-//!
-//! The 0.3 surface seeds an adapter through a channel, and the audit
-//! (adapter.md §6.1) ruled that a smell rather than a transport: a 12 MiB
-//! cell is legal, but `CHAN_READ` materialises the whole cell into per-lane
-//! scratch and `pull_validate` re-drags the mirror over mapped-pinned PCIe
-//! **every fire**, so the weights would be re-paid per token forever. The
-//! ruling: an adapter channel is a NAMING device, the bytes come off a file,
-//! and the landing happens ONCE at instance bind. Nothing in this module is
-//! reachable from the fire path — `Shell::fire` never calls into it, which is
-//! the A-5 gate's whole claim.
-//!
-//! # The three pieces, and why they are three
-//!
-//! * [`Vfs`] — the mount. A read-only shared directory, stated by the
-//!   deployment and never discovered from the environment (design article 9).
-//!   Its whole job is turning a guest-spelled name into a path inside the
-//!   mount, and refusing everything else BY NAME.
-//! * [`Blobs`] — the host byte cache, refcounted and **single-flight**: two
-//!   binds racing on one file perform one read, the second waiting on the
-//!   first rather than starting a second. The bytes live as long as some
-//!   handle does and no longer ([`Blobs`] holds `Weak`s), because once a blob
-//!   has been landed into a slot the slot is the residency and the host copy
-//!   is dead weight.
-//! * [`Slots`] — the device residency, keyed by BLOB IDENTITY. This is where
-//!   "N instances of one adapter occupy ONE slot" is decided; it is a pure
-//!   host table, which is why every claim about sharing, eviction and
-//!   exhaustion is checkable with no GPU in the machine.
-//!
-//! # Identity, and why it is a stamp and not only a fingerprint
-//!
-//! §3.3 states identity as "path + content fingerprint, snapshotted at load".
-//! A fingerprint alone cannot be the KEY, because computing it means reading
-//! the file, and a store that read the file to decide whether it needed to
-//! read the file is not a cache. So the key is a [`Stamp`] — the adapter's
-//! resolved directory plus `(file, len, mtime)` for its manifest and every
-//! plane it names —
-//! and the fingerprint is computed on the load that the stamp missed and
-//! recorded on the occupant ([`Slots::resident`]) as the snapshot §3.3 asks
-//! for. A rewritten file is a new stamp, therefore a new key, therefore a new
-//! slot: no in-flight fire ever observes an adapter changing, which is the
-//! property the sentence was protecting.
-//!
-//! # The mount's shape
-//!
-//! One directory per adapter, `adapter.toml` inside it:
-//!
-//! ```toml
-//! rank = 8
-//!
-//! [[plane]]
-//! role = "lora_a"
-//! file = "lora_a.bin"
-//! layout = "rank_major"   # [layers, rank, hidden]
-//!
-//! [[plane]]
-//! role = "lora_b"
-//! file = "lora_b.bin"
-//! layout = "out_major"    # [layers, hidden, rank] — HF's native orientation
-//! # site = "o"            # optional (alto next B3): which projection these
-//! #                       # banks correct, when the text named a site
-//! ```
-//!
-//! **THE FILE DECLARES ITS ORIENTATION BECAUSE BYTES CANNOT.** §6.3's statute
-//! is that `B` ships out-major and a rank-major `B` is REFUSED rather than
-//! repacked — and orientation is not observable in a byte string, so it has to
-//! be said. It is said in the file rather than at the API because §3.3's
-//! hot-add is a file drop: nobody is standing there to state it.
-//!
-//! **AND `site` IS OPTIONAL BECAUSE A NAME'S SITE IS** (alto next B3). Until
-//! this wave a bank name was `layer.{l}.{role}` and could not say WHICH
-//! projection it corrected, so a guest's `Site::Q` silently took the one site
-//! the text happened to correct. A name may now carry the site
-//! (`layer.{l}.o.lora_a`, [`Site`]) and a manifest may state it; a manifest
-//! that states none takes the banks that declare none, which is every bank of
-//! every text written before this wave. Absent is not a wildcard — it is a
-//! VALUE, the unstated default site — which is why the widening costs the six
-//! family texts nothing and still refuses a mismatch by name.
-//!
-//! `role` is the bank's name with its `layer.{l}.` prefix cut, which is how
-//! §6.3's "the resolver slices, per layer" is spelled: a `[layers, …]` source
-//! is `L` contiguous slices and the `L` banks that carry one role take one
-//! each, in layer order. [`crate::weights`] itself still pairs nothing and
-//! matches no suffix — that module's promise is intact, and the convention
-//! lives here, in the resolver, which is where §6.3 put it.
-//!
-//! # What is refused, by name
-//!
-//! * a name outside the mount, or a mount that was never stated — [`Fault::Blob`]
-//! * an adapter directory with no manifest, or a manifest naming a file that
-//!   is not there — [`Fault::Blob`], the "unknown blob path" of §5
-//! * a plane shorter (or longer) than the banks that carry its role seat —
-//!   [`Fault::Blob`] with BOTH numbers
-//! * a rank-major source into an out-major bank — [`Fault::Blob`], naming the
-//!   repack kernel this shell does not ship
-//! * a `site` outside the vocabulary — [`Fault::Blob`], naming the six
-//!   spellings a bank can be named at ([`Site::vocabulary`])
-//! * a `site` no bank of this load declares — [`Fault::Blob`], naming the
-//!   site asked for and the banks there are
-//! * every slot pinned by a live bind — [`Fault::AdapterSlots`], refused at
-//!   the keying moment rather than by evicting something in flight (§5)
+//! The shared adapter store: [`Vfs`] resolves adapter names to
+//! directories, [`Blobs`] caches host bytes, [`Slots`] tracks device
+//! residency by content identity — N instances of one adapter share one slot.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -120,10 +19,7 @@ pub const MANIFEST: &str = "adapter.toml";
 
 /// The read-only shared directory adapters are files in.
 ///
-/// `None` for a root is the feature OFF — a deployment that mounted nothing,
-/// whose every `open` is a refusal that says so. That is the same posture
-/// [`Boot::weight_cache_dir`](crate::Boot::weight_cache_dir) takes, and for
-/// the same reason: an absent directory is an answer, not a default to guess.
+/// `None` for a root means the feature is off: every `open` refuses.
 #[derive(Debug, Clone, Default)]
 pub struct Vfs {
     root: Option<PathBuf>,
@@ -143,17 +39,13 @@ impl Vfs {
     }
 
     /// Turn a guest-spelled adapter name into a directory inside the mount.
-    ///
-    /// A leading `/` is cut — the guest spells `/shared/alice-v2` against its
-    /// own preopen and this shell holds the mount, so the two meet on the
-    /// tail. Every component after that must be a plain name: no `..`, no
-    /// second root, no prefix. A traversal is not sanitized into something
-    /// else, it is refused.
+    /// A leading `/` is cut; every component must be plain (no `..`, no
+    /// root, no prefix) — traversal is refused, not sanitized.
     ///
     /// # Errors
     ///
-    /// [`Fault::Blob`] for an unmounted shell, an empty name, a component
-    /// that is not a plain one, or a directory that is not there.
+    /// [`Fault::Blob`] for an unmounted shell, an empty name, a bad
+    /// component, or a missing directory.
     pub fn resolve(&self, name: &str) -> Result<PathBuf> {
         let root = self.root.as_ref().ok_or_else(|| Fault::Blob {
             path: name.to_string(),
@@ -196,7 +88,7 @@ impl Vfs {
 
 // ── the manifest ─────────────────────────────────────────────────────────
 
-/// Which way a source plane is laid out (§6.3's statute, stated by the file).
+/// Which way a source plane is laid out, as stated by the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     /// `[layers, rank, hidden]` — the rank is the leading axis of a slot.
@@ -214,15 +106,8 @@ impl Layout {
         }
     }
 
-    /// **WHICH ORIENTATION A BANK'S OWN RECTANGLE CARRIES.**
-    ///
-    /// The plan declares a bank as `[adapters, rank, hidden]` or
-    /// `[adapters, hidden, rank]` and marks neither, so the shell reads the
-    /// only thing that distinguishes them: the rank axis is the SHORT one. A
-    /// LoRA whose rank meets its hidden width has no waist and is not the
-    /// thing this class exists for, so the tie is degenerate; it is taken at
-    /// the file's word rather than refused, because either reading of a
-    /// square bank names the same number of bytes per row.
+    /// Which orientation a bank's rectangle carries: the rank axis is the
+    /// short one. A square bank is degenerate, taken as rank-major.
     fn of_bank(seat: &BankSeat) -> Layout {
         match seat.rows <= seat.cols {
             true => Layout::RankMajor,
@@ -241,11 +126,8 @@ pub struct PlaneSpec {
     pub file: String,
     /// Which way its bytes run.
     pub layout: Layout,
-    /// **WHICH CORRECTION SITE'S BANKS IT FILLS** (alto next B3), or `None`
-    /// for a manifest that states none — today's meaning, and the banks a
-    /// text named without a site. `site = "o"` beside `role = "lora_a"`
-    /// selects `layer.{l}.o.lora_a`; a spelling outside the vocabulary is a
-    /// refusal at [`Manifest::read`] and never a fallback.
+    /// Which correction site's banks it fills; `None` selects the banks
+    /// declaring no site. An unknown spelling is refused at [`Manifest::read`].
     pub site: Option<Site>,
 }
 
@@ -265,9 +147,7 @@ impl Manifest {
     /// # Errors
     ///
     /// [`Fault::Blob`] for a directory with no manifest, a manifest that is
-    /// not TOML, or one that omits a key. Every one of them names the adapter
-    /// and says what was missing: a hot-added directory is written by an
-    /// operator with no compiler in the loop, so the message IS the diagnostic.
+    /// not TOML, or one that omits a key.
     pub fn read(dir: &Path, name: &str) -> Result<Manifest> {
         let at = dir.join(MANIFEST);
         let refuse = |why: String| Fault::Blob {
@@ -325,14 +205,8 @@ impl Manifest {
                         )));
                     }
                 };
-                // **THE OPTIONAL SITE, WITH THE SAME REFUSAL DISCIPLINE AS
-                //   EVERY OTHER KEY** (alto next B3). Absent is today's
-                //   meaning — the banks a text named without a site — so
-                //   every manifest written before this wave reads the same.
-                //   A spelling outside the vocabulary is refused BY NAME
-                //   rather than ignored, because a `site = "mixer"` that
-                //   silently became "wherever the text corrects" is the one
-                //   wrong answer this axis must never give.
+                // Absent site keeps the banks that declare none; an unknown
+                // spelling is refused rather than silently ignored.
                 let site = match plane.get("site") {
                     None => None,
                     Some(value) => {
@@ -368,23 +242,9 @@ impl Manifest {
 
 // ── the name convention ──────────────────────────────────────────────────
 
-/// **WHICH PROJECTION A BANK CORRECTS** (alto next B3; the vocabulary is the
-/// guest surface's, verbatim).
-///
-/// `inferlet::eta::adapter::Site` is the ONE site vocabulary in this tree —
-/// six llama-like projection sites, `Q`/`K`/`V`/`O`/`GateUp`/`Down`, carried
-/// to the engine as the trace-known placement constant `Site::bit()` sets
-/// (`1 << 0` … `1 << 5`, `crates/inferlet/src/eta.rs:883`). A bank name and a
-/// manifest spell the same six in snake case, and the bits here are that
-/// enum's bits so a guest's ask and a bank's declaration are ONE number to
-/// compare.
-///
-/// **THE SPELLING IS THE CONTRACT AND IT IS WRITTEN IN THREE PLACES** — the
-/// guest's `Site`, the model text's [`models::adapter::Site`], and this one —
-/// for exactly the reason `lora_a` is: a name crosses a crate boundary as a
-/// string, and the three crates cannot depend on each other in a circle. What
-/// keeps them one vocabulary is that a spelling nobody here knows is REFUSED
-/// rather than guessed at.
+/// Which projection a bank corrects — six llama-like sites, mirrored by
+/// the guest surface's own `Site::bit()`. Spelling is duplicated across
+/// three crates since they can't depend on each other in a circle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Site {
     /// The query projection.
@@ -393,8 +253,7 @@ pub enum Site {
     K,
     /// The value projection.
     V,
-    /// The mixer's output projection — the site every family text corrects
-    /// today, and therefore the one an untagged bank means.
+    /// The mixer's output projection — what an untagged bank means.
     O,
     /// The fused gate/up projection of the feed-forward sublayer.
     GateUp,
@@ -426,8 +285,8 @@ impl Site {
         }
     }
 
-    /// The guest surface's own bit for it — `inferlet::eta::adapter::Site`'s
-    /// `bit()`, which is what rides the `lora` sink's placement constant.
+    /// The guest surface's own bit for it, riding the `lora` sink's placement
+    /// constant.
     #[must_use]
     pub const fn bit(self) -> u32 {
         match self {
@@ -440,12 +299,8 @@ impl Site {
         }
     }
 
-    /// A spelling, or `None` for a word outside the vocabulary.
-    ///
-    /// `None` is what keeps `layer.3.mixer.lora_a` refusing exactly as it did
-    /// before this widening: an unknown middle segment is not a site, so the
-    /// name has no `layer.{l}.` prefix to cut and the WHOLE name is its role —
-    /// which matches no bank.
+    /// A spelling, or `None` for a word outside the vocabulary. An unknown
+    /// middle segment is not a site, so the whole name becomes the role.
     #[must_use]
     pub fn parse(word: &str) -> Option<Site> {
         Site::ALL.into_iter().find(|site| site.spelled() == word)
@@ -471,19 +326,9 @@ impl Site {
     }
 }
 
-/// The bank name's role — everything after a `layer.{l}.` prefix and the
-/// OPTIONAL site segment that may follow it.
-///
-/// `layer.7.lora_a` is the seventh layer's `lora_a` and states no site;
-/// `layer.7.o.lora_a` is the same role at the same layer, declaring that it
-/// corrects [`Site::O`]. A bank named without a numbered component is its own
-/// role at layer zero, and a middle segment outside the site vocabulary is NOT
-/// a site — `layer.3.mixer.lora_a` is a role called `layer.3.mixer.lora_a`,
-/// which is how an unknown site goes on being refused rather than landed at
-/// whatever the text's default happens to be.
-///
-/// This is the ONLY name convention in the adapter axis and it lives here
-/// rather than in [`crate::weights`] on purpose (§6.3: the resolver slices).
+/// The bank name's role — everything after an optional `layer.{l}.`
+/// prefix and an optional site segment. A name with no numbered
+/// component is its own role at layer zero.
 #[must_use]
 pub fn role_of(bank: &str) -> &str {
     parsed(bank).map_or(bank, |(_, _, role)| role)
@@ -495,14 +340,9 @@ pub fn layer_of(bank: &str) -> u64 {
     parsed(bank).map_or(0, |(layer, _, _)| layer)
 }
 
-/// **WHICH SITE A BANK DECLARES IT CORRECTS**, or `None` for a name that
-/// declares none.
-///
-/// `None` is not "no site": it is TODAY'S MEANING — the text's own default
-/// site, the one every A-6 family text corrects, unstated because until this
-/// wave a name had no way to state it. What it buys is the byte-compatible
-/// half of the widening: a load whose banks all answer `None` behaves exactly
-/// as it did, and only a text that opts in gets a site checked against it.
+/// Which site a bank declares it corrects. `None` means the text's own
+/// default site, not "no site" — a load whose banks all answer `None`
+/// behaves as it always did.
 #[must_use]
 pub fn site_of(bank: &str) -> Option<Site> {
     parsed(bank).and_then(|(_, site, _)| site)
@@ -512,14 +352,11 @@ pub fn site_of(bank: &str) -> Option<Site> {
 fn parsed(bank: &str) -> Option<(u64, Option<Site>, &str)> {
     let (head, role) = bank.rsplit_once('.')?;
     let last = head.rsplit('.').next()?;
-    // `layer.{l}.{role}` — the pre-B3 spelling, and the one the six family
-    // texts write. Read first, so nothing about the widening costs it a step.
+    // `layer.{l}.{role}`, no site.
     if let Some(layer) = numbered(last) {
         return Some((layer, None, role));
     }
-    // `layer.{l}.{site}.{role}` — a site of the vocabulary, with the layer
-    // right in front of it. Anything else falls through to `None` and the
-    // caller reads the whole name as a role.
+    // `layer.{l}.{site}.{role}`.
     let site = Site::parse(last)?;
     let (rest, _) = head.rsplit_once('.')?;
     let layer = numbered(rest.rsplit('.').next()?)?;
@@ -535,15 +372,14 @@ fn numbered(part: &str) -> Option<u64> {
 
 // ── the host byte cache ──────────────────────────────────────────────────
 
-/// One file's bytes, host-side, with the fingerprint §3.3 snapshots.
+/// One file's bytes, host-side, with its content fingerprint.
 #[derive(Debug)]
 pub struct Blob {
     /// Where it was read from.
     pub at: PathBuf,
     /// The bytes.
     pub bytes: Vec<u8>,
-    /// FNV-1a over all of them — the content half of §3.3's identity,
-    /// recorded on the slot that the bytes land in.
+    /// FNV-1a over all of them, recorded on the slot the bytes land in.
     pub fingerprint: u64,
 }
 
@@ -554,17 +390,10 @@ enum Cell {
     Held(Weak<Blob>),
 }
 
-/// The host byte cache: refcounted handles, one read per file per generation.
-///
-/// **SINGLE-FLIGHT IS THE POINT** (§3.3). Two instances binding the same
-/// adapter at the same instant must perform ONE read; the second waits on the
-/// first rather than doubling the disk traffic and the peak host footprint.
-/// That is what [`Blobs::loads`] counts and what a gate asserts on.
-///
-/// **AND THE BYTES DIE WITH THE LAST HANDLE.** The map holds `Weak`s, so a
-/// blob that has been landed into its slot and released costs nothing host-
-/// side. The residency it left behind is the SLOT ([`Slots`]), which is what
-/// §3.3 means by "device residency is a cache over the files".
+/// The host byte cache: refcounted handles, one read per file per
+/// generation. Single-flight: concurrent opens of one path wait on the
+/// first read. `Weak` handles let bytes die with the last one; residency
+/// after that lives in [`Slots`].
 #[derive(Debug, Default)]
 pub struct Blobs {
     held: Mutex<HashMap<PathBuf, Cell>>,
@@ -582,10 +411,8 @@ impl std::fmt::Debug for Cell {
 }
 
 impl Blobs {
-    /// How many times this store has actually read a file.
-    ///
-    /// The single-flight observable: `n` concurrent opens of one path move it
-    /// by one.
+    /// How many times this store has actually read a file. `n` concurrent
+    /// opens of one path move it by one.
     #[must_use]
     pub fn loads(&self) -> u64 {
         self.loads.load(Ordering::Relaxed)
@@ -599,8 +426,6 @@ impl Blobs {
     pub fn open(&self, at: &Path, path: &str) -> Result<Arc<Blob>> {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
-            // The borrow of the map ends with this `match`, which is why the
-            // upgrade's result is lifted out rather than acted on inside it.
             let seen = match held.get(at) {
                 Some(Cell::Held(weak)) => Some(weak.upgrade()),
                 Some(Cell::Loading) => None,
@@ -635,8 +460,7 @@ impl Blobs {
                 Ok(blob)
             }
             Err(error) => {
-                // The claim is dropped rather than left behind: a waiter that
-                // woke onto a `Loading` nobody is in reads a stale promise.
+                // Drop the claim so a waiter doesn't wake onto a stale promise.
                 held.remove(at);
                 Err(Fault::Blob {
                     path: path.to_string(),
@@ -650,11 +474,8 @@ impl Blobs {
     }
 }
 
-/// FNV-1a, 64 bit — the content half of §3.3's identity.
-///
-/// Not a cryptographic digest and not asked to be one: what it settles is
-/// "did the bytes behind this stamp change", against an accident and not an
-/// adversary, and the mount is operator-owned.
+/// FNV-1a, 64 bit. Not cryptographic; only defends against accidental
+/// change, not an adversary — the mount is operator-owned.
 #[must_use]
 pub fn fingerprint(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -667,18 +488,9 @@ pub fn fingerprint(bytes: &[u8]) -> u64 {
 
 // ── identity ─────────────────────────────────────────────────────────────
 
-/// **THE KEY A SLOT IS HELD UNDER**, snapshotted at bind (§3.3).
-///
-/// The adapter's RESOLVED DIRECTORY plus `(file, len, mtime)` for its
-/// manifest and every plane it names. A rewritten plane is a different stamp
-/// and therefore a different slot, which is how "no in-flight fire ever
-/// observes an adapter changing" is obtained without a single lock on the
-/// fire path.
-///
-/// **THE RESOLVED PATH AND NOT THE SPELLING**, because §3.3's identity is the
-/// FILE's: `/alice-v2` and `alice-v2` are one adapter, and two instances that
-/// spelled it differently must share one slot or the sharing claim is about
-/// strings instead of about bytes.
+/// The key a slot is held under, snapshotted at bind: the adapter's
+/// resolved directory plus `(file, len, mtime)` for its manifest and
+/// every plane. A rewritten file is a different stamp and a different slot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Stamp {
     /// Where it resolved to under the mount.
@@ -693,8 +505,7 @@ pub struct Stamp {
 pub enum Key {
     /// A file in the mount. N instances naming it share ONE slot.
     Shared(Stamp),
-    /// An instance's own bytes. Never shared — content-hash dedup across
-    /// byte-seeded instances is §3.3's explicit "later optimization, not v1".
+    /// An instance's own bytes. Never shared.
     Own(u64),
 }
 
@@ -718,23 +529,17 @@ fn stat(at: &Path, file: &str, name: &str) -> Result<(String, u64, u128)> {
 pub struct Occupant {
     /// What it is holding.
     pub key: Key,
-    /// How many live binds name it. Zero is RECLAIMABLE and not reclaimed:
-    /// §3.3's "eviction is LRU under pressure, not eager", so intermittent
-    /// traffic on one adapter does not re-pay its H2D each time.
+    /// How many live binds name it. Zero is reclaimable but not reclaimed
+    /// eagerly (LRU under pressure only).
     pub refs: u32,
     /// The tick of the last acquire or release — the LRU order.
     pub used: u64,
-    /// The content fingerprint of what landed, or zero for a byte-seeded
-    /// slot. §3.3's snapshot, kept where a gate can read it.
+    /// The content fingerprint of what landed, or zero for a byte-seeded slot.
     pub fingerprint: u64,
 }
 
-/// The bank's slots, as a host table.
-///
-/// **THIS IS WHERE SHARING IS DECIDED, AND IT IS PURE.** No device call, no
-/// bytes: a key in, a slot number out, and the answer to "must the caller
-/// land anything". Which is why A-3 — N instances of one blob occupy one slot
-/// — is assertable with no GPU in the machine.
+/// The bank's slots, as a host table. Pure: a key in, a slot number and
+/// whether the caller must land anything out. No device call, no bytes.
 #[derive(Debug)]
 pub struct Slots {
     seats: u32,
@@ -746,8 +551,7 @@ pub struct Slots {
 /// a landing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grant {
-    /// Which slot. This is §6.4's "the slot id is the engine's bind-time
-    /// answer".
+    /// Which slot.
     pub slot: u32,
     /// `true` when this bind is the one that must write the bytes; `false`
     /// when the slot already holds this exact identity.
@@ -790,18 +594,14 @@ impl Slots {
             .unwrap_or(0)
     }
 
-    /// Take a reference on the slot `key` belongs in, seating it if it is not
-    /// seated.
-    ///
-    /// The order is: the same identity (share it), then an empty slot, then
-    /// the least-recently-used slot NO BIND HOLDS. There is no fourth arm —
-    /// evicting a slot a live fire routes to is the one thing this table must
-    /// never do, so it refuses instead (§5).
+    /// Take a reference on the slot `key` belongs in, seating it if not
+    /// seated. Order: same identity, then an empty slot, then
+    /// least-recently-used unheld. Never evicts a slot a live fire routes to.
     ///
     /// # Errors
     ///
-    /// [`Fault::AdapterSlots`] when every slot is pinned; the same fault with
-    /// zero seats for a load whose model text declares no bank at all.
+    /// [`Fault::AdapterSlots`] when every slot is pinned (or zero seats
+    /// for a load with no bank at all).
     pub fn acquire(&mut self, key: Key) -> Result<Grant> {
         self.clock += 1;
         let clock = self.clock;
@@ -862,11 +662,8 @@ impl Slots {
         }
     }
 
-    /// Give a slot back UNSEATED — a landing that refused holds nothing.
-    ///
-    /// Distinct from [`Slots::release`] on purpose: a released slot keeps its
-    /// contents and its key because they are true, and a slot whose landing
-    /// failed has neither.
+    /// Give a slot back unseated — a landing that failed holds nothing.
+    /// Distinct from [`Slots::release`], which keeps the slot's contents.
     pub fn abandon(&mut self, slot: u32) {
         if let Some(held) = self.occupants.get_mut(slot as usize) {
             *held = None;
@@ -885,9 +682,7 @@ pub enum Source<'a> {
         /// The adapter's name, as the guest spells it.
         name: &'a str,
     },
-    /// An instance's own full-capacity planes — the private-adapter path of
-    /// §3.3, and the shape [`crate::weights::Weights::register_adapter`]
-    /// already took (§6.2).
+    /// An instance's own full-capacity planes.
     Own {
         /// Which instance. Its slot is its own and is never shared.
         instance: u64,
@@ -896,18 +691,14 @@ pub enum Source<'a> {
     },
 }
 
-/// What a bind answers (§6.4).
+/// What a bind answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Binding {
-    /// The slot every lane of this instance routes to — what the runtime
-    /// stamps onto `Lane::adapter`.
+    /// The slot every lane of this instance routes to.
     pub slot: u32,
     /// Did this bind name a file in the mount?
     pub shared: bool,
-    /// Did THIS bind pay the landing, or did it join one already resident?
-    ///
-    /// The A-3 observable: the second instance of one blob answers `false`
-    /// with the first one's slot.
+    /// Did this bind pay the landing, or join one already resident?
     pub landed: bool,
 }
 
@@ -930,13 +721,8 @@ impl Adapters {
         }
     }
 
-    /// State where the shared adapters live.
-    ///
-    /// **A VERB AND NOT A `getenv`** (design article 9). It is a verb rather
-    /// than a load field because §3.3's hot-add is a file drop: the mount is
-    /// a deployment fact that outlives any one load, and a directory that
-    /// grows an adapter while the box serves needs no restart and no second
-    /// word here.
+    /// State where the shared adapters live. A verb rather than a load field:
+    /// the mount is a deployment fact that outlives any one load.
     pub fn mount(&mut self, root: Option<PathBuf>) {
         self.vfs = Vfs::new(root);
     }
@@ -959,36 +745,22 @@ impl Adapters {
         &self.slots
     }
 
-    /// **BIND ONE INSTANCE TO ONE ADAPTER, LANDING ITS BYTES AT MOST ONCE.**
-    ///
-    /// The whole of §6.1's ruling in one function: the identity is computed
-    /// from the files, the slot is keyed by it, and `land` — which is
-    /// `register_adapter`, the verb §6.2 says already fits — runs only for
-    /// the bind that seated the slot. N instances of one blob call this N
-    /// times and the device sees one copy.
-    ///
-    /// `land` is a parameter rather than a field because the residency this
-    /// table decides is a pure host question and the write is a device one:
-    /// with the two apart, every claim about sharing, eviction and exhaustion
-    /// is checkable on a machine with no GPU in it.
-    ///
-    /// **A REFUSED LANDING HOLDS NO SLOT.** Anything that goes wrong after
-    /// the slot is seated abandons it, so no key is ever left pointing at
-    /// bytes that did not arrive.
+    /// Bind one instance to one adapter, landing its bytes at most once:
+    /// the identity is computed from the files, the slot keyed by it, and
+    /// `land` runs only for the bind that seats the slot. A failed landing
+    /// abandons its slot.
     ///
     /// # Errors
     ///
-    /// [`Fault::Blob`] for every way the mount, the manifest or the shapes
-    /// can disagree; [`Fault::AdapterSlots`] when every slot is pinned;
-    /// whatever `land` answers.
+    /// [`Fault::Blob`] for the mount, manifest, or shape disagreeing;
+    /// [`Fault::AdapterSlots`] when every slot is pinned; whatever `land` answers.
     pub fn bind<L>(&mut self, source: Source<'_>, seats: &[BankSeat], land: L) -> Result<Binding>
     where
         L: FnOnce(u32, &[AdapterPlane<'_>]) -> Result<()>,
     {
         let shared = matches!(source, Source::Shared { .. });
-        // **THE UNKNOWN PATH REFUSES BEFORE A SLOT IS TOUCHED** (§5): the key
-        // cannot be formed without the files, so a name that is not there
-        // never reaches the residency table at all.
+        // An unknown name never reaches the residency table: the key can't
+        // be formed without the files.
         let key = self.key(&source)?;
         let grant = self.slots.acquire(key)?;
         if !grant.fresh {
@@ -1018,9 +790,8 @@ impl Adapters {
         }
     }
 
-    /// Give a bind back. The slot keeps what it holds (§3.3: eviction is
-    /// under pressure, not eager), so re-binding the same adapter later is a
-    /// hit rather than a second H2D.
+    /// Give a bind back. The slot keeps what it holds, so re-binding the
+    /// same adapter later is a hit rather than a second H2D.
     pub fn release(&mut self, binding: Binding) {
         self.slots.release(binding.slot);
     }
@@ -1029,8 +800,8 @@ impl Adapters {
     ///
     /// # Errors
     ///
-    /// [`Fault::Blob`] for a name outside the mount, a directory with no
-    /// manifest, or a manifest naming a file that is not there.
+    /// [`Fault::Blob`] for a name outside the mount, a missing manifest,
+    /// or a manifest naming a missing file.
     pub fn key(&self, source: &Source<'_>) -> Result<Key> {
         match source {
             Source::Own { instance, .. } => Ok(Key::Own(*instance)),
@@ -1077,19 +848,15 @@ impl Adapters {
         Ok(fingerprint)
     }
 
-    /// **THE RESOLVER** (§6.3): one shared adapter's files, sliced per layer
-    /// and padded per orientation into one full-capacity plane per bank.
-    ///
-    /// Public because it is the whole host-side arithmetic of the landing —
-    /// the slicing, the statute check and both refusals — and a gate that can
-    /// call it needs no device to judge any of them.
+    /// One shared adapter's files, sliced per layer and padded per
+    /// orientation into one full-capacity plane per bank. Public so a
+    /// gate can call it with no device.
     ///
     /// # Errors
     ///
-    /// [`Fault::Blob`] for a role this load declares no bank for, banks of one
-    /// role that do not agree on a slot, a source whose orientation the bank's
-    /// is not, a rank past the bank's, or a file whose length is not exactly
-    /// `layers x rank x hidden` elements.
+    /// [`Fault::Blob`] for a role with no declared bank, banks of one
+    /// role disagreeing on shape, a mismatched orientation, a rank past
+    /// the bank's, or a wrong file length.
     pub fn planes(
         &self,
         name: &str,
@@ -1104,10 +871,8 @@ impl Adapters {
         let mut out = Vec::new();
         let mut fingerprint = 0u64;
         for spec in &manifest.planes {
-            // **THE ROLE AND THE SITE TOGETHER PICK THE BANKS** (alto next
-            // B3). A manifest that states no site takes the banks that
-            // declare none, which on a text written before this wave is all
-            // of them — byte for byte the filter this line used to be.
+            // Role and site together pick the banks; no site takes the
+            // banks that declare none.
             let mut banks: Vec<&BankSeat> = seats
                 .iter()
                 .filter(|seat| role_of(&seat.name) == spec.role && site_of(&seat.name) == spec.site)
@@ -1138,10 +903,8 @@ impl Adapters {
                     odd.slot
                 )));
             }
-            // ── §6.3's STATUTE. The bank's own rectangle says which way it
-            //    runs and the file says which way it was written; a source
-            //    that disagrees would need a transpose this shell does not
-            //    ship, so it is refused rather than silently mis-strided.
+            // A layout mismatch would need a transpose this shell doesn't
+            // ship, so it's refused rather than silently mis-strided.
             let bank_layout = Layout::of_bank(seat);
             if bank_layout != spec.layout {
                 return Err(refuse(format!(
@@ -1168,12 +931,8 @@ impl Adapters {
                 )));
             }
             let blob = self.blobs.open(&dir.join(&spec.file), name)?;
-            // **FOLDED, NOT XORED.** Two planes of one adapter can carry the
-            // same bytes — a zero `A` beside a zero `B` is the identity
-            // adapter every gate starts from — and an exclusive-or of two
-            // equal fingerprints is zero, which would record "no content" for
-            // the one case a reader most wants named. The mix is FNV's own
-            // step, which is what produced the halves.
+            // Folded (not xored): two equal planes would xor to zero and
+            // read as "no content".
             fingerprint = (fingerprint ^ blob.fingerprint).wrapping_mul(0x0000_0100_0000_01b3);
             let stride = manifest
                 .rank
@@ -1199,12 +958,8 @@ impl Adapters {
             let slot = usize::try_from(seat.slot).unwrap_or(usize::MAX);
             for (layer, bank) in banks.iter().enumerate() {
                 let source = &blob.bytes[layer * stride..(layer + 1) * stride];
-                // **ZERO-PADDED HERE, AND PER ORIENTATION** — which is why the
-                // resolver has to know the layout and why `AdapterPlane`'s
-                // doc says the caller pads: `A`'s unused ranks are trailing
-                // ROWS and `B`'s are a stride inside every row. A zero row of
-                // `A` contributes zero to the waist and a zero column of `B`
-                // contributes zero to the sum, so the padding is exact.
+                // Zero-padded per orientation: A's unused ranks are trailing
+                // rows, B's are a stride inside every row.
                 let mut plane = vec![0u8; slot];
                 match spec.layout {
                     Layout::RankMajor => plane[..source.len()].copy_from_slice(source),

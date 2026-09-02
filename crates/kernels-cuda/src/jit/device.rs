@@ -1,70 +1,30 @@
 //! The device probe and the scratch slabs. Every probe runs once and is
-//! cached; the slabs grow and never shrink, because an entry may not
-//! allocate per fire (graph capture forbids it). A slab that would have to
-//! grow under a capturing stream is refused, not grown — the contract lives
-//! on [`Ctx::scratch`](crate::jit::Ctx::scratch).
+//! cached; slabs grow and never shrink, since an entry may not allocate per
+//! fire (graph capture forbids it). A slab that would have to grow under a
+//! capturing stream is refused, not grown.
 //!
-//! # A GROWN SLAB RETIRES ITS PREDECESSOR; IT DOES NOT FREE IT
+//! A grown slab retires its predecessor rather than freeing it: a
+//! `cudaGraphExec_t` recorded at fire N holds the staging pointer the entry
+//! took then, so freeing the old block on growth would leave earlier-recorded
+//! graphs replaying against freed memory. The retired block stays alive,
+//! unreferenced by this map, freed only with the arena. Growth is geometric
+//! (a slab at least doubles), so a name grows a bounded number of times and
+//! everything retired for it sums to less than what it currently holds.
 //!
-//! **ADDRESSES ARE BAKE-TIME** (alto article 7), and a scratch address is
-//! baked exactly like a pool address: a `cudaGraphExec_t` recorded at fire N
-//! holds the staging pointer the entry took THEN, and a folded bucket replays
-//! that exec for the rest of the load. Growth used to be `cudaFree` +
-//! `cudaMalloc`, which made every graph recorded before the growth hold a
-//! freed block — a `cudaErrorIllegalAddress` on the first replay after a fire
-//! brought one more row than any fire before it. (Measured: the fold-hint gate
-//! died in `ssm_gdn_prep_v_gates` writing `g_log_out` into
-//! `attn.ssm_gdn_chunk_gates` at the address a five-row fire grew and a
-//! six-row fire freed.)
+//! A slab is keyed by `(arena, name, region, scope)`. The arena is the
+//! shell's own CUDA context (minted by [`Slabs::open`](crate::Slabs::open),
+//! released with it), so two shells in one process never share a slab. The
+//! region is the template region the walk was inside when the entry asked:
+//! two regions are disjoint by construction (two arms of one fork group run
+//! at the same instant), regardless of which stream the walk put them on.
+//! For a caller in no region ([`super::ctx::NO_REGION`]), the stream is the
+//! separation instead — see [`scope_of`].
 //!
-//! `Ctx::scratch`'s "warm at full fire shape before capturing" is what keeps a
-//! capture IN PROGRESS from growing, and it is all it can keep: the shapes a
-//! serving load brings are not bounded by the ones it has already brought, so
-//! a later, larger fire will grow a name whatever the warm pass did. So the
-//! superseded block is RETIRED — kept alive, unreferenced by this map, freed
-//! with the arena — and a graph recorded against it keeps reading and writing
-//! a block that is still its own and still big enough for the shape it was
-//! recorded at. Growth is geometric (a slab at least doubles), so a name
-//! grows a bounded number of times and everything retired for it sums to less
-//! than what it currently holds: the ceiling is twice the live scratch, once,
-//! rather than an unbounded ladder.
-//!
-//! # A slab is per `(arena, name, stream)`, and each of the three is a bug
-//! that was measured
-//!
-//! It was keyed by NAME alone, process-wide, and that key was wrong twice.
-//!
-//! **The ARENA is the shell.** Two `Shell`s in one process fired into one
-//! another's staging planes and both computed: build log 18 measured a
-//! continuation of `"PPP is目前是. \{ a a \)"` where the same load alone says
-//! `" Paris"`, and the whole tree worked around it by admitting one shell per
-//! process. An arena is minted by [`Slabs::open`](crate::Slabs::open), one per
-//! CUDA context, and [`released`](crate::Slabs::release) with it, so two
-//! shells now share nothing and neither leaks the other's slabs at teardown.
-//!
-//! **The STREAM is P6.** Two arms of one fork group run at the same instant
-//! by construction, so two regions staging through one slab stage over each
-//! other — which is why `engine_cuda::EXCLUSIVE` named eleven entries and
-//! ordered every linear-attention split in qwen and kimi back into a line
-//! (build log 24). Per stream, they are disjoint by the same argument that
-//! makes two streams worth having.
-//!
-//! # Growth is BROADCAST across the arena's streams, and that is the warming
-//! contract
-//!
-//! The shell warms a load by firing it EAGERLY — one stream, program order —
-//! and only then records the same regions across the side streams. A slab
-//! sized on the eager pass's stream would therefore be missing on every
-//! stream the capture actually uses, and [`take`] would answer
-//! [`Fault::Unwarmed`] for a load that did exactly what the contract asked.
-//!
-//! So a name that grows on one of an arena's streams grows on all of them, at
-//! the same instant and to the same size. The eager warm pass is then the
-//! warm pass for the capture too, unchanged, and the cost is the honest one:
-//! an arena holds `streams × bytes` of a name it uses on one stream. Side
-//! streams are counted in ones and twos (`DeviceProfile::side_streams`), and
-//! the alternative — allocating on the stream that asks — is a load that
-//! refuses.
+//! The shell warms a load by firing it eagerly on one stream, then records
+//! the same regions across side streams; keying by region (not stream) means
+//! the eager warm pass and the capture of the same region resolve to the
+//! same block regardless of which stream either fires on, so [`take`] never
+//! spuriously answers [`Fault::Unwarmed`] for a properly warmed load.
 
 use core::ffi::c_void;
 use std::collections::HashMap;
@@ -79,23 +39,14 @@ struct Slab {
     bytes: usize,
 }
 
-/// One arena: the streams a context fires on, and one slab per
-/// `(name, stream)`.
-///
-/// The streams are addresses rather than pointers because that is all a key
-/// needs, and because a `usize` is `Send` without an unsafe promise about a
-/// handle this map never dereferences.
+/// One arena: one slab per `(name, region, scope)`. See module docs for what
+/// region and scope key against.
 #[derive(Default)]
 struct Arena {
-    /// Every stream this arena's growth must cover. Registered at
-    /// [`attach`], which the shell calls when it opens a stream — before its
-    /// first fire, which is what makes the broadcast above complete.
-    streams: Vec<usize>,
-    slabs: HashMap<(&'static str, usize), Slab>,
-    /// **Superseded allocations, still live.** A slab that grew handed its
-    /// old block here instead of to `cudaFree`, because a graph recorded
-    /// before the growth still launches against that address (the module
-    /// comment argues it). Freed with the arena, and with nothing else.
+    slabs: HashMap<(&'static str, u32, usize), Slab>,
+    /// Superseded allocations, still live: a slab that grew handed its old
+    /// block here instead of to `cudaFree`, since a graph recorded before
+    /// the growth still launches against that address. Freed only with the arena.
     retired: Vec<*mut c_void>,
 }
 
@@ -116,29 +67,16 @@ fn locked() -> std::sync::MutexGuard<'static, HashMap<u32, Arena>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Tell `arena` that it fires on `stream` too, so a slab grown anywhere in it
-/// is grown here as well.
-///
-/// Idempotent, and deliberately not retroactive: a stream attached AFTER a
-/// name has already grown gets its slab on that name's next growth, which for
-/// the shell is never a question because [`Context::open_lanes`] runs at load
-/// and every fire is after it.
+/// Tell `arena` that it fires on `stream` too. A no-op now that a slab is
+/// keyed by region rather than stream; kept as a seam for the day a
+/// per-stream fact is needed again.
 pub(crate) fn attach(arena: u32, stream: *mut c_void) {
-    let mut arenas = locked();
-    let held = arenas.entry(arena).or_default();
-    let at = stream.addr();
-    if !held.streams.contains(&at) {
-        held.streams.push(at);
-    }
+    let _ = (arena, stream);
 }
 
-/// Free every slab this arena holds and forget its streams.
-///
-/// **THE SHELL'S TEARDOWN IS THE ONLY CALLER**, and it is what makes a second
-/// shell in one process cost what the first one did rather than twice it. A
-/// slab is only ever read by a launch that was enqueued on one of this
-/// arena's streams, so a context that has synchronized and is dropping them
-/// has nothing left in flight.
+/// Free every slab this arena holds. Called only at the shell's teardown; a
+/// slab is only ever read by a launch enqueued on one of this arena's
+/// streams, so a synchronized, dropping context has nothing left in flight.
 pub(crate) fn release(arena: u32) {
     let mut arenas = locked();
     let Some(held) = arenas.remove(&arena) else {
@@ -151,9 +89,8 @@ pub(crate) fn release(arena: u32) {
             let _ = unsafe { rt::cudaFree(slab.ptr) };
         }
     }
-    // The blocks that growth superseded. The same argument frees them: the
-    // only thing that ever read one is a launch on a stream this arena's
-    // owner has synchronized and is dropping.
+    // The blocks growth superseded free the same way: only a launch on a
+    // stream this arena's owner has synchronized ever read one.
     for ptr in held.retired {
         if !ptr.is_null() {
             // SAFETY: as above — an address this map allocated and never
@@ -178,10 +115,26 @@ pub(crate) fn capture_status(stream: *mut c_void) -> Option<rt::cudaStreamCaptur
     Some(status)
 }
 
+/// What separates two askers that are not in a region: the stream. Every
+/// caller outside a walk keys [`NO_REGION`](super::ctx::NO_REGION), so
+/// without this they would share one block despite running at once (ad-hoc
+/// contexts — a transform executor, a bench, test threads — share one arena
+/// on `Slabs::PROCESS`). Inside a walk the region separates and the stream
+/// is not asked; outside one the stream separates. Neither subsumes the
+/// other.
+fn scope_of(stream: *mut c_void, region: u32) -> usize {
+    if region == super::ctx::NO_REGION {
+        stream.addr()
+    } else {
+        0
+    }
+}
+
 pub(crate) fn take(
     arena: u32,
     stream: *mut c_void,
     name: &'static str,
+    region: u32,
     bytes: usize,
 ) -> Result<*mut c_void, Fault> {
     if bytes == 0 {
@@ -189,8 +142,8 @@ pub(crate) fn take(
     }
     let mut arenas = locked();
     let held = arenas.entry(arena).or_default();
-    let here = stream.addr();
-    if let Some(slab) = held.slabs.get(&(name, here))
+    let scope = scope_of(stream, region);
+    if let Some(slab) = held.slabs.get(&(name, region, scope))
         && slab.bytes >= bytes
     {
         return Ok(slab.ptr);
@@ -203,40 +156,31 @@ pub(crate) fn take(
     {
         return Err(Fault::Unwarmed {
             name,
-            have: held.slabs.get(&(name, here)).map_or(0, |slab| slab.bytes),
+            have: held.slabs.get(&(name, region, scope)).map_or(0, |slab| slab.bytes),
             need: bytes,
         });
     }
-    // Every stream at once, so that the eager pass that warms this name warms
-    // it for the capture pass that will run the same region elsewhere.
-    let mut on = held.streams.clone();
-    if !on.contains(&here) {
-        on.push(here);
-    }
-    for at in on {
-        grow(held, name, at, bytes)?;
-    }
-    Ok(held.slabs[&(name, here)].ptr)
+    // One block, no broadcast: the eager pass that warms this name warms the
+    // one block the capture pass will bake, since both walks ask for the
+    // same region's slab.
+    grow(held, name, region, scope, bytes)?;
+    Ok(held.slabs[&(name, region, scope)].ptr)
 }
 
-/// Size one `(name, stream)` slab to at least `bytes`, allocating a fresh
-/// block and RETIRING the old one when it is short. Never called under
-/// capture — [`take`] refuses there first.
-///
-/// Three properties this shape has and the `cudaFree`-then-`cudaMalloc` one
-/// did not:
-///
-/// * **The old address stays valid** for the graphs that baked it (the module
-///   comment).
-/// * **Growth is geometric**, so a name is reallocated a bounded number of
-///   times and what it retires sums to less than what it holds.
-/// * **A failed `cudaMalloc` leaves the slab it had.** The old order freed
-///   first, so an out-of-memory growth left a null slab behind a `Fault` the
-///   caller could survive.
-fn grow(arena: &mut Arena, name: &'static str, stream: usize, bytes: usize) -> Result<(), Fault> {
+/// Size one `(name, region, scope)` slab to at least `bytes`, allocating a
+/// fresh block and retiring the old one when short. Never called under
+/// capture — [`take`] refuses there first. Growth is geometric, and a failed
+/// `cudaMalloc` leaves the old slab intact rather than freeing it first.
+fn grow(
+    arena: &mut Arena,
+    name: &'static str,
+    region: u32,
+    scope: usize,
+    bytes: usize,
+) -> Result<(), Fault> {
     let (old_ptr, old_bytes) = arena
         .slabs
-        .get(&(name, stream))
+        .get(&(name, region, scope))
         .map_or((core::ptr::null_mut(), 0), |slab| (slab.ptr, slab.bytes));
     if old_bytes >= bytes {
         return Ok(());
@@ -257,7 +201,7 @@ fn grow(arena: &mut Arena, name: &'static str, stream: usize, bytes: usize) -> R
         arena.retired.push(old_ptr);
     }
     arena.slabs.insert(
-        (name, stream),
+        (name, region, scope),
         Slab {
             ptr: fresh,
             bytes: want,
@@ -322,9 +266,6 @@ pub(crate) fn max_shared_memory_per_block_optin() -> Option<u32> {
 
 pub(crate) fn properties(ordinal: i32) -> Option<rt::cudaDeviceProp> {
     let mut prop: rt::cudaDeviceProp = unsafe { core::mem::zeroed() };
-    #[cfg(feature = "cuda-12")]
-    let code = unsafe { rt::cudaGetDeviceProperties_v2(&raw mut prop, ordinal) };
-    #[cfg(feature = "cuda-13")]
     let code = unsafe { rt::cudaGetDeviceProperties(&raw mut prop, ordinal) };
     (code == rt::cudaError::cudaSuccess).then_some(prop)
 }

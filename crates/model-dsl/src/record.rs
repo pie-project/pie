@@ -1,8 +1,4 @@
-//! The trace machinery: a `Recorder` accumulating a `Trace`, and the `Value`
-//! handles a forward pass passes around. Re-imagined from the old `record.rs`
-//! for the `Def` × `Ty` world — the string `Stmt` builder is gone; wrappers
-//! build typed op variants, declare their outputs with `fresh`, and `push`
-//! stitches the def-use bookkeeping through the `Operands` marks.
+//! The trace machinery: a `Recorder` accumulating a `Trace`, and the `Value` handles a forward pass passes around.
 
 use std::cell::{Cell, RefCell};
 use std::ops::Mul;
@@ -106,11 +102,11 @@ impl Recorder {
     }
 
     /// Intern a weight — one `Param` per stored plane, one `ValueId` per
-    /// weight name. The value's ty is the LOGICAL tensor (all-const dims,
-    /// activation dtype): what an mxfp4 bank stores is the params' business,
-    /// what it multiplies as is the trace's.
+    /// weight name. The value's ty is the logical tensor; what a bank stores
+    /// is the params' business, what it multiplies as is the trace's.
     pub fn weight(&self, w: &Weight) -> ValueId {
         let mut p = self.inner.borrow_mut();
+        let w = &w.placed(p.platform);
         let mut first = None;
         for plane in w.planes() {
             let name = format!("{}{}", w.name, plane.suffix);
@@ -146,9 +142,7 @@ impl Recorder {
             return ValueId(seen as u32);
         }
         // Deliberately shapeless: a cache value is the pool pointer and
-        // nothing more (design §7). Its geometry enters the graph as
-        // `RuntimeInput::Geometry`, and its element layout is the cache row's
-        // load-time business.
+        // nothing more. Its geometry enters the graph as `RuntimeInput::Geometry`.
         p.values.push(ValueDecl {
             def: Def::Cache(index),
             ty: Ty::Tensor {
@@ -384,27 +378,12 @@ impl Value {
         }
     }
 
-    /// **THE SAME VALUE, READ WITHOUT ITS PRODUCER'S GUARD.**
-    ///
-    /// A normal op output is narrow exactly where its node is: the decode
-    /// attention's result exists on decode rows and nowhere else, so a
-    /// consumer that took it unguarded would be reading rows nobody wrote.
-    /// An IN-PLACE output under a guard is the other case, and design §8's
-    /// correction class is what made it real: `linear.lora_correct`'s `y_out`
-    /// aliases the `y` it adds to, so its column is written on every row of
-    /// the fire — by the trunk everywhere, and by the correction again inside
-    /// the adapter window. The value is defined everywhere; only the
-    /// CORRECTION is narrow.
-    ///
-    /// Without this, the guard would leak: `residual_add(correction, y)` would
-    /// take the correction's cond, the residual stream would be guarded from
-    /// that layer on, and the next layer's split would refuse to mix with it.
-    /// With it, the model text reads the way the mechanism works — one
-    /// statement, no merge, no arm.
-    ///
-    /// `model_ir::check::classes` is the other half: its demand walk follows
-    /// the alias when the node is not live, so the classes that skip the
-    /// correction still demand the trunk that filled the column.
+    /// The same value, read without its producer's guard. For an in-place
+    /// output under a guard (e.g. `linear.lora_correct`'s `y_out`, which
+    /// aliases the `y` it adds to): the value is defined everywhere, only
+    /// the correction itself is narrow. Without this the guard would leak
+    /// into the residual stream and the next layer's split would refuse to
+    /// mix with it.
     #[must_use]
     pub fn everywhere(&self) -> Value {
         Value {
@@ -446,11 +425,7 @@ impl Mul<f32> for Value {
 
 /// What a split hands out arms of. One algorithm, two carriers: a [`Value`]
 /// arm is the same traced value read under a narrower guard, and an
-/// [`Input`](crate::Input) arm is the same handle whose every value comes out
-/// under that guard. Cut by the same spec they carry structurally equal conds,
-/// which is exactly what [`Recorder::push`]'s compatibility check compares —
-/// so a schedule built off one class's arm and a query read off another's is
-/// refused at the line that mixed them.
+/// [`Input`](crate::Input) arm is the same handle under that guard.
 pub trait Refine: Sized {
     fn refined(&self, cond: Guard) -> Self;
 }

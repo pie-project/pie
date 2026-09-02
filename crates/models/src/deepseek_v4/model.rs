@@ -1,4 +1,4 @@
-use checkpoint::contract::ModelContract;
+use model_dsl::ops::elemwise::Yarn;
 use model_dsl::{Dtype, Weight};
 
 pub struct Model {
@@ -8,18 +8,17 @@ pub struct Model {
 
     pub act: Dtype,
 
-    /// The one attention reading this text is carved for. Every layer reads
-    /// the same schedule, so the numbers that schedule states — query heads,
-    /// kv heads, head width, window — are facts about the model, not about a
-    /// layer. The latent plane is shared across heads, so the kv heads a
-    /// reader restates are these query `heads`.
+    /// The one attention reading this text is carved for; every layer
+    /// shares this schedule (query heads, kv heads, head width, window).
+    /// The latent plane is shared across heads, so kv heads are these
+    /// query `heads`.
     pub heads: u32,
     pub head_dim: u32,
     pub window: u32,
 
-    /// The adapter banks this family seats (palo design §8). Per layer, and
-    /// the same two numbers at every one of them: the correction is a
-    /// per-lane axis, not a per-layer one.
+    /// The adapter banks this family seats. Per layer, and the same two
+    /// numbers at every one: the correction is a per-lane axis, not a
+    /// per-layer one.
     pub adapters: Adapters,
 
     pub kv: Dtype,
@@ -36,6 +35,50 @@ pub struct Model {
     pub layers: Vec<Layer>,
     pub final_norm: Weight,
     pub final_norm_eps: f32,
+    /// The draft head, or `None` for a row without one.
+    pub mtp: Option<Mtp>,
+}
+
+/// **THE DRAFT HEAD** — DeepSeek-V4-Flash's one `nextn` layer (the official
+/// `MTPBlock`): the next token's embedding and the trunk's residual STREAMS
+/// fused, one flash block over the fused streams, the block's own hyper head
+/// and norm, and the base `lm_head`.
+///
+/// ```text
+/// x[s] = e_proj(enorm(embed(tok))) + h_proj(hnorm(streams[s]))   per stream s
+/// x    = block(x)                                                 (attn + MoE, hc gated)
+/// out  = lm_head(norm(hc_head(x)))
+/// ```
+pub struct Mtp {
+    pub enorm: Weight,
+    pub hnorm: Weight,
+    pub e_proj: Weight,
+    /// `h_proj`, `streams` times over as one block-diagonal bank.
+    pub h_proj: Weight,
+    pub block: Layer,
+    pub hc_head: HcHead,
+    pub norm: Weight,
+    pub norm_eps: f32,
+}
+
+/// Where one block is stated: its name prefix, cadence, gate kind, dtypes
+/// and cache rows — the trunk's per-layer facts, and the draft head's.
+struct Site {
+    prefix: String,
+    ratio: Option<u32>,
+    hash: bool,
+    /// The routed bank's expert count: the trunk's row states it, the draft
+    /// head is always the checkpoint's full 256.
+    experts: u32,
+    split: bool,
+    gate: Dtype,
+    up: Dtype,
+    down: Dtype,
+    weights: Dtype,
+    dense: Dtype,
+    kv: String,
+    pool: String,
+    index: String,
 }
 
 pub struct Hyper {
@@ -46,10 +89,9 @@ pub struct Hyper {
     pub sinkhorn: u32,
 }
 
-/// The trunk hyper-connection head: `base [streams]`, `fn [streams,
-/// streams*hidden]`, `scale [1]` (config `hc_head`). The dynamic `fn` plane is
-/// the per-token mixing function; today it is stated and read but its fusion
-/// into the gate op is deferred (see `forward::flash`).
+/// Trunk hyper-connection head: `base [streams]`, `fn [streams,
+/// streams*hidden]` (per-token mixing function, stated but not yet fused
+/// into the gate op — see `forward::flash`), `scale [1]` (config `hc_head`).
 pub struct HcHead {
     pub base: Weight,
     pub dynamic: Weight,
@@ -79,29 +121,30 @@ pub struct Layer {
     pub mlp_norm: Option<Weight>,
     pub mlp: Mlp,
     /// This layer's adapter bank, `[slots, rank, hidden]` and
-    /// `[slots, hidden, rank]` — the down and up planes of one correction site
-    /// (palo design §8, campaign A-6).
+    /// `[slots, hidden, rank]` — the down and up planes of one correction site.
     ///
-    /// **THE SITE IS THE ATTENTION SUBLAYER, AND IT IS THE SITE BECAUSE OF THE
-    /// COLLECTIVE.** Both ends are REPLICATED values: the input is the gated
-    /// stream `hc_gates` hands the mixer, and the output is what `o_up`
-    /// answers — which is already past `all_reduce`, because this text reduces
-    /// between its two output projections (`o_down` is rows-cut, `o_up` is
-    /// replicated). A correction stated before the reduce would read a rows-cut
-    /// partial product, and every rank would contribute the whole `ΔW·x` for
-    /// the sum to carry `tp` times.
+    /// The site is the attention sublayer because both ends are replicated
+    /// values: the input is the gated stream `hc_gates` hands the mixer, and
+    /// the output is `o_up`'s, already past `all_reduce` (`o_down` is
+    /// rows-cut, `o_up` is replicated). A correction stated before the
+    /// reduce would read a rows-cut partial product and be summed `tp` times.
     ///
-    /// AND BEFORE `hc_fold`, not after: the fold writes the correction into
-    /// the hyper-connection streams the way it writes the mixer's own output,
-    /// so a corrected site stays one site instead of becoming a second
-    /// contribution with its own mixing weights.
+    /// Applied before `hc_fold`, not after, so a corrected site stays one
+    /// site instead of becoming a second contribution with its own mixing
+    /// weights.
     pub lora_a: Weight,
     pub lora_b: Weight,
 }
 
 pub struct Attn {
     pub rope_dim: u32,
+    /// **THE LAYER'S OWN THETA.** Flash ropes its compressor layers at
+    /// `compress_rope_theta` with the YaRN ramp beside it and its pure
+    /// sliding-window layers at `rope_theta` with none — the official
+    /// `Attention.__init__`'s `if self.compress_ratio` — and the pooled
+    /// entries and the attention output's un-rotation ride the same pair.
     pub theta: f32,
+    pub yarn: Option<Yarn>,
     pub sm_scale: f32,
     pub q_down: Weight,
     pub q_norm: Weight,
@@ -119,13 +162,11 @@ pub struct Attn {
     pub sink: Weight,
     pub kv: String,
     pub pool: Option<Pool>,
-    /// The NSA sparse-selection indexer, present on the ratio-4 layers only
-    /// (`self_attn.indexer.*`). Its top-k narrows THIS LAYER'S COMPRESSED
-    /// BRANCH: the keys it ranks are its own compressor's pooled entries, one
-    /// per ratio-4 block and in 1:1 correspondence with the attention
-    /// compressor's, and `attention.pool_lse_selected` reads the rows it
-    /// chose. The ratio-128 layers carry none because `S / 128` is a key set
-    /// no budget needs to cap.
+    /// The NSA sparse-selection indexer, present on the ratio-4 layers only.
+    /// Narrows this layer's own compressed branch: it ranks its own
+    /// compressor's pooled entries (1:1 with the attention compressor's).
+    /// Ratio-128 layers carry none, since `S / 128` is a key set no budget
+    /// needs to cap.
     pub indexer: Option<Indexer>,
 }
 
@@ -155,6 +196,7 @@ pub struct Indexer {
     pub top_k: u32,
     pub rope_dim: u32,
     pub theta: f32,
+    pub yarn: Option<Yarn>,
     pub window: u32,
     pub wq_b: Weight,
     pub weights_proj: Weight,
@@ -171,27 +213,12 @@ pub enum Gate {
     Bias { bias: Weight },
 }
 
-/// **THE ROUTED EXPERTS' TWO PROJECTIONS, FUSED OR NOT.**
-///
-/// [`Fused`](GateUp::Fused) is the cheaper form and the one every SKU of this
-/// family said until the DQ artifact arrived: ONE `[experts, 2·inter, hidden]`
-/// bank read as the concat of the stored `gate_proj` and `up_proj`, one routed
-/// matmul, one packed swiglu-clamp.
-///
-/// [`Split`](GateUp::Split) is the form an artifact can force. A [`Weight`]
-/// carries ONE `Dtype`, and `Dtype` is where an MLX affine GROUP is written
-/// down; `mlx-community/DeepSeek-V4-Flash-2bit-DQ` stores its routed
-/// `gate_proj` at group 32 and its `up_proj` at group 64 on four of its five
-/// layers, so the two halves' `.scales` planes are 2048 rows of 128 beside
-/// 2048 rows of 64 and join into NO rectangle at any axis. The fused
-/// declaration is not awkward there; it is unstateable. Split, each half is
-/// its own bank with its own dtype, the routed matmul fires twice, and
-/// `linear.mlp_swiglu_clamp_split` combines the pair.
-///
-/// **AND ONLY THE ROWS THAT NEED IT SAY IT.** Splitting costs a second routed
-/// launch and a second bank's residency for nothing when both halves share a
-/// point, so every bf16 and every uniform-4-bit row keeps `Fused` and keeps
-/// its trace byte for byte.
+/// The routed experts' two projections, fused or not.
+/// [`Fused`](GateUp::Fused) is one bank, one routed matmul, one packed
+/// swiglu-clamp. [`Split`](GateUp::Split) is forced when `gate_proj`/
+/// `up_proj` are quantized at different MLX group sizes so their scales
+/// can't join one bank — each half gets its own bank and dtype, the
+/// matmul fires twice, and `linear.mlp_swiglu_clamp_split` combines them.
 pub enum GateUp {
     Fused(Weight),
     Split { gate: Weight, up: Weight },
@@ -264,10 +291,8 @@ struct Dims {
     norm_eps: f32,
 }
 
-/// The flash geometry, whose extra facts the toy `Dims` has no field for: the
-/// MLA latent width and o-projection groups, the two hyper planes' `fn`, the
-/// indexer, and the shared expert. It is a superset built beside the toy so
-/// the toy `new` stays byte-identical.
+/// The flash geometry's extra facts a toy [`Dims`] has no field for — a
+/// superset kept beside the toy so the toy's own `new` stays byte-identical.
 struct FlashDims {
     hidden: u32,
     layers: u32,
@@ -285,6 +310,10 @@ struct FlashDims {
     rope_dim: u32,
     theta: f32,
     compress_theta: f32,
+    /// The YaRN ramp the compressor layers rope under (`rope_scaling`).
+    yarn: Yarn,
+    /// Whether this row carries the draft head ([`Mtp`]).
+    draft: bool,
     window: u32,
     index_heads: u32,
     index_head_dim: u32,
@@ -305,28 +334,28 @@ struct FlashDims {
     norm_eps: f32,
 }
 
-/// The full DeepSeek-V4-Flash `compress_ratios`, one per layer. Layers 0, 1
-/// and the last carry no compressor (ratio 0); twenty-one layers carry a
-/// compressor and an indexer (ratio 4); the remaining nineteen carry a
-/// compressor only (ratio 128). The COUNTS are the artifact's; the block
-/// ORDER here is a placeholder cadence — the mini snapshot fixes only the
-/// first four layers and the last, and the full artifact's exact interleave of
-/// the ratio-4/ratio-128 middle is not what a bf16 structure text is held to.
-#[rustfmt::skip]
-const FLASH_RATIOS: [Option<u32>; 43] = [
-    // layers 0,1: ratio 0 (no compressor)
-    None, None,
-    // 21 layers: ratio 4 (compressor + indexer)
-    Some(4), Some(4), Some(4), Some(4), Some(4), Some(4), Some(4),
-    Some(4), Some(4), Some(4), Some(4), Some(4), Some(4), Some(4),
-    Some(4), Some(4), Some(4), Some(4), Some(4), Some(4), Some(4),
-    // 19 layers: ratio 128 (compressor only)
-    Some(128), Some(128), Some(128), Some(128), Some(128), Some(128), Some(128),
-    Some(128), Some(128), Some(128), Some(128), Some(128), Some(128), Some(128),
-    Some(128), Some(128), Some(128), Some(128), Some(128),
-    // layer 42: ratio 0 (no compressor)
-    None,
-];
+/// The full DeepSeek-V4-Flash `compress_ratios`, one per layer. Layers 0-1
+/// carry no compressor; from layer 2 up, even layers carry a compressor and
+/// indexer (ratio 4), odd layers a compressor only (ratio 128):
+///
+/// ```text
+/// [0, 0, 4, 128, 4, 128, …, 4, 128, 4, 0]
+/// ```
+///
+/// The trailing 0 is the multi-token-prediction layer (`num_nextn_predict_layers`
+/// = 1), not one of the 43 this text builds.
+const FLASH_RATIOS: [Option<u32>; 43] = flash_ratios();
+
+/// [`FLASH_RATIOS`], stated as the rule rather than forty-three literals.
+const fn flash_ratios() -> [Option<u32>; 43] {
+    let mut out = [None; 43];
+    let mut layer = 2;
+    while layer < 43 {
+        out[layer] = if layer % 2 == 0 { Some(4) } else { Some(128) };
+        layer += 1;
+    }
+    out
+}
 
 /// The mini `mlx-community/DeepSeek-V4-Flash-2bit-DQ` snapshot's five-layer
 /// schedule (original layers 0, 1, 2, 3, 42, renumbered), which the name
@@ -334,28 +363,19 @@ const FLASH_RATIOS: [Option<u32>; 43] = [
 const FLASH_MICRO_RATIOS: [Option<u32>; 5] =
     [None, None, Some(4), Some(128), Some(4)];
 
-/// **WHAT THE ROUTED EXPERT BLOCK IS STORED AS**, which one `weights` dtype
-/// cannot always say.
-///
-/// A DQ conversion states its quantization PER TENSOR: the artifact's
-/// `config.json` carries one default `(bits, group)` and then a list of
-/// overrides, and the routed experts are where the overrides land because the
-/// routed experts are where the bytes are. So this mirrors that shape — one
-/// representation per projection plus the per-layer exceptions the file states
-/// — rather than pretending a single dtype covers the block. Everything else
-/// in the text still reads the trunk's `weights`, which is what the overrides
-/// are exceptions TO.
+/// What the routed expert block is stored as, when one `weights` dtype
+/// cannot say it: one representation per projection plus per-layer
+/// exceptions, mirroring the DQ conversion's per-tensor quantization.
+/// Everything else in the text still reads the trunk's `weights`.
 #[derive(Clone, Copy, Debug)]
 pub struct Routed {
     /// The routed gate projection's representation.
     pub gate: Dtype,
-    /// The layers whose gate is NOT [`gate`](Routed::gate), read exactly as
-    /// the conversion's per-tensor overrides read. **THIS IS THE LANDMINE**:
-    /// on the 2-bit DQ artifact the routed `gate_proj` groups by 32 on layers
-    /// 0-3 and by 64 on the LAST — original layer 42, renumbered to 4 — while
-    /// `up_proj` and `down_proj` group by 64 throughout. One layer is the
-    /// difference between a text that reads this artifact and one that reads
-    /// four fifths of it.
+    /// The layers whose gate is NOT [`gate`](Routed::gate), read from the
+    /// conversion's per-tensor overrides. On the 2-bit DQ artifact the
+    /// routed `gate_proj` groups by 32 on layers 0-3 and by 64 on the last
+    /// (original layer 42, renumbered to 4); `up_proj`/`down_proj` group by
+    /// 64 throughout.
     pub gate_at: &'static [(u32, Dtype)],
     /// The routed up projection's.
     pub up: Dtype,
@@ -368,9 +388,8 @@ pub struct Routed {
 }
 
 impl Routed {
-    /// The whole block in the trunk's own representation, fused — what every
-    /// row that is not a per-tensor mix says, and the reading under which this
-    /// type is invisible.
+    /// The whole block in the trunk's own representation, fused — the
+    /// reading under which this type is invisible.
     #[must_use]
     pub const fn uniform(w: Dtype) -> Routed {
         Routed {
@@ -389,6 +408,23 @@ impl Routed {
     pub const DQ_2BIT: Routed = Routed {
         gate: Dtype::U2g32,
         gate_at: &[(4, Dtype::U2g64)],
+        up: Dtype::U2g64,
+        down: Dtype::U2g64,
+        split: true,
+    };
+
+    /// The same mix over the full forty-three layers, where the exception
+    /// sits at its own layer number rather than the mini snapshot's
+    /// renumbered one (mini layer 4 == full layer 42).
+    ///
+    /// Taken from the full artifact's `config.json`: routed `gate_proj` is
+    /// `(bits 2, group 32)` on layers 0–41 and `(bits 2, group 64)` on
+    /// layer 42; `up_proj`/`down_proj` are `(bits 2, group 64)` throughout.
+    /// Everything outside the routed block uses the file's
+    /// `(bits 4, group 64)` default (`U4g64`).
+    pub const DQ_2BIT_FULL: Routed = Routed {
+        gate: Dtype::U2g32,
+        gate_at: &[(42, Dtype::U2g64)],
         up: Dtype::U2g64,
         down: Dtype::U2g64,
         split: true,
@@ -446,9 +482,20 @@ impl Model {
     /// 256-expert top-6 MoE with one shared expert, and the hyper-connection
     /// tower (`hc_mult 4`).
     pub fn flash(w: Dtype, act: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::flash_mixed(w, Routed::uniform(w), act, kv, tp)
+    }
+
+    /// The real flash geometry with a routed block that is not the trunk's
+    /// dtype: same forty-three layers, cadence and 256-expert top-6 MoE,
+    /// but the routed experts are stated per projection instead of taken
+    /// from `w`. `flash` is now this with [`Routed::uniform`].
+    ///
+    /// What the full 2-bit artifact is read through — a 4-bit trunk over a
+    /// 2-bit routed block.
+    pub fn flash_mixed(w: Dtype, routed: Routed, act: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new_flash(
             w,
-            Routed::uniform(w),
+            routed,
             act,
             kv,
             tp,
@@ -456,17 +503,33 @@ impl Model {
         )
     }
 
-    /// **THE MINI DQ SNAPSHOT'S OWN GEOMETRY** — the real DeepSeek-V4-Flash
-    /// everything (hidden 4096, 64 MLA heads of width 512, moe_inter 2048, the
-    /// 129 280-token vocabulary) over the FIVE renumbered layers and SIXTEEN
-    /// routed experts `mlx-community/DeepSeek-V4-Flash-2bit-DQ` publishes.
+    /// [`flash_mixed`](Model::flash_mixed) with the draft head ([`Mtp`]).
+    pub fn flash_mixed_mtp(w: Dtype, routed: Routed, act: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::flash_dims(43, &FLASH_RATIOS, 3);
+        d.draft = true;
+        Model::new_flash(w, routed, act, kv, tp, d)
+    }
+
+    /// The mini DQ snapshot's own geometry: the real DeepSeek-V4-Flash
+    /// dimensions (hidden 4096, 64 MLA heads of width 512, moe_inter 2048,
+    /// 129,280-token vocabulary) over the five renumbered layers and
+    /// sixteen routed experts `mlx-community/DeepSeek-V4-Flash-2bit-DQ`
+    /// publishes.
     ///
-    /// **NOT [`flash_micro`](Model::flash_micro), and the difference is what
-    /// each is for.** `flash_micro` shrinks every dimension so the trace is
-    /// cheap; it exists to hold this family's NAMES against the snapshot's
-    /// census, and its shapes are nobody's. This one is a text a checkpoint can
-    /// actually be read through: the names are the same and the rectangles are
-    /// the file's.
+    /// Not [`flash_micro`](Model::flash_micro): that shrinks every
+    /// dimension to hold this family's names against the snapshot's
+    /// census, with shapes nobody's. This one is a text a checkpoint can
+    /// actually be read through.
+    /// [`flash_mini`](Model::flash_mini) with the draft head — the real
+    /// head over the five-layer miniature, which is where the mechanism is
+    /// gated before the full artifact carries it.
+    pub fn flash_mini_mtp(w: Dtype, routed: Routed, act: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::flash_dims(5, &FLASH_MICRO_RATIOS, 3);
+        d.experts = 16;
+        d.draft = true;
+        Model::new_flash(w, routed, act, kv, tp, d)
+    }
+
     pub fn flash_mini(w: Dtype, routed: Routed, act: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::flash_dims(5, &FLASH_MICRO_RATIOS, 3);
         d.experts = 16;
@@ -486,8 +549,8 @@ impl Model {
         d.rope_dim = 16;
         d.q_lora = 128;
         d.kv_latent = 64;
-        // `heads * head_dim == o_groups * hidden` (8·64 == 2·256), the o-group
-        // invariant the real geometry meets at 64·512 == 8·4096.
+        // heads * head_dim == o_groups * hidden (8*64 == 2*256), the same
+        // o-group invariant the real geometry meets at 64*512 == 8*4096.
         d.o_groups = 2;
         d.o_lora = 128;
         d.index_heads = 8;
@@ -515,6 +578,13 @@ impl Model {
             rope_dim: 64,
             theta: 10_000.0,
             compress_theta: 160_000.0,
+            yarn: Yarn {
+                factor: 16.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                original_max_position: 65_536,
+            },
+            draft: false,
             window: 128,
             index_heads: 64,
             index_head_dim: 128,
@@ -578,6 +648,7 @@ impl Model {
                     attn: Attn {
                         rope_dim: d.rope_dim,
                         theta: d.theta,
+                        yarn: None,
                         sm_scale: (d.head_dim as f32).sqrt().recip(),
                         q_down: Weight::sym(n("q_down"), [q_lora, hidden], weights),
                         q_norm: norm("q_norm", q_lora),
@@ -665,6 +736,7 @@ impl Model {
             layers,
             final_norm: Weight::sym("final_norm", [hidden], weights),
             final_norm_eps: d.norm_eps,
+            mtp: None,
         }
     }
 
@@ -681,14 +753,10 @@ impl Model {
             "tp {tp} is not a world this catalog ships"
         );
 
-        // **WHAT A QUANTIZED SKU'S NEIGHBOURS ARE.** Norms, the compressor's
-        // absolute position embedding and the routed ROUTER are shipped
-        // unquantized by every MLX conversion of this family — a 16-row gate
-        // and a 4096-wide norm are not where a checkpoint's bytes are — so
-        // they are stated in what the banks beside them COMPUTE in, which is
-        // exactly what `model_dsl::compute_dtype` answers. At `weights =
-        // bf16` this is `weights`, so every row that shipped before this line
-        // existed declares what it declared.
+        // norms, the compressor's absolute-position embedding, and the
+        // routed router ship unquantized by every MLX conversion of this
+        // family, so they're stated in the compute dtype
+        // (model_dsl::compute_dtype) rather than `weights`.
         let dense = crate::dense(weights);
 
         let heads = d.heads / tp;
@@ -712,192 +780,252 @@ impl Model {
         let compressor = |prefix: String, ratio: u32, entries: u64, norm_w: u64| Compressor {
             wkv: Weight::sym(format!("{prefix}.wkv"), [entries, hidden], weights),
             wgate: Weight::sym(format!("{prefix}.wgate"), [entries, hidden], weights),
-            // **THE POSITION PLANE RIDES WHAT THE GATHER READS, WHICH IS
-            // f32.** It is added to the gate LOGITS before their softmax —
-            // `pool_gather_paged` takes it as `const device float*` and the
-            // CUDA twin as `const float*` — so f32 is the width both shaders
-            // agree on, and the artifact's own element is the import's
-            // business, exactly as `attn_sink`'s note one screen down argues
-            // in the other direction.
+            // position plane rides the gather's dtype, f32: added to gate
+            // logits pre-softmax on both shaders (pool_gather_paged / the
+            // CUDA twin), so f32 is what they agree on regardless of the
+            // artifact's own element width.
             ape: Weight::sym(format!("{prefix}.ape"), [ratio as u64, entries], Dtype::F32),
             norm: Weight::sym(format!("{prefix}.norm"), [norm_w], dense),
             norm_eps: d.norm_eps,
         };
 
+        // **ONE LAYER, STATED FOR A SITE.** The trunk's forty-three and the
+        // draft head's one are the same block; what differs per site is its
+        // name prefix, its pool cadence, its gate kind, its routed dtypes, its
+        // dense dtype and its cache rows — so the block is a closure over a
+        // `Site`, and the trunk and the head each state theirs.
+        let layer_at = |site: Site| -> Layer {
+            let prefix = site.prefix;
+            let n = |s: &str| format!("{prefix}.{s}");
+            let weights = site.weights;
+            let dense = site.dense;
+            let norm = |s: &str, dim: u64| Weight::sym(n(s), [dim], dense);
+            let mix = |s: &str| Mix {
+                scale: Weight::sym(n(&format!("{s}_scale")), [3], Dtype::F32),
+                base: Weight::sym(n(&format!("{s}_base")), [hc_base], Dtype::F32),
+                dynamic: Some(Weight::sym(
+                    n(&format!("{s}_fn")),
+                    [hc_base, hc_fan],
+                    Dtype::F32,
+                )),
+            };
+            let (lora_a, lora_b) = crate::adapter::banks(&prefix, ADAPTERS, hidden, dense);
+
+            let ratio = site.ratio;
+            let has_indexer = ratio == Some(4);
+            let pool = ratio.map(|ratio| {
+                // the 2x is the overlap, not a k/v pair: overlap_transform
+                // reshapes a [ratio, 2d] block into a [2*ratio, d] window
+                // — half the columns serve this block's own positions,
+                // half serve the previous block's — so
+                // pool_gather_paged's fanout is 2 at ratio 4 and 1 at
+                // ratio 128 (which pools its own block alone).
+                let entries = if has_indexer { 2 * kv_latent } else { kv_latent };
+                Pool {
+                    ratio,
+                    entries: site.pool.clone(),
+                    compressor: Some(compressor(
+                        n("compressor"),
+                        ratio,
+                        entries,
+                        kv_latent,
+                    )),
+                }
+            });
+            let indexer = has_indexer.then(|| Indexer {
+                heads: d.index_heads,
+                head_dim: d.index_head_dim,
+                top_k: d.index_top_k,
+                rope_dim: d.rope_dim,
+                theta: d.compress_theta,
+                yarn: Some(d.yarn),
+                window: d.index_window,
+                wq_b: Weight::sym(n("indexer.wq_b"), [idx_w, q_lora], weights),
+                weights_proj: Weight::sym(
+                    n("indexer.weights_proj"),
+                    [d.index_heads as u64, hidden],
+                    weights,
+                ),
+                compressor: compressor(
+                    n("indexer.compressor"),
+                    ratio.unwrap_or(4),
+                    2 * d.index_head_dim as u64,
+                    d.index_head_dim as u64,
+                ),
+                keys: site.index.clone(),
+            });
+
+            let gate = if site.hash {
+                Gate::Hash {
+                    tid2eid: Weight::sym(
+                        n("gate.tid2eid"),
+                        [d.vocab as u64, d.top_k as u64],
+                        Dtype::I64,
+                    ),
+                }
+            } else {
+                Gate::Bias {
+                    bias: Weight::sym(n("gate.bias"), [site.experts as u64], Dtype::F32),
+                }
+            };
+
+            Layer {
+                attn_mix: mix("attn_mix"),
+                attn_norm: Some(norm("attn_norm", hidden)),
+                mlp_norm: Some(norm("ffn_norm", hidden)),
+                attn: Attn {
+                    rope_dim: d.rope_dim,
+                    // A compressor layer ropes at the compress theta
+                    // under the YaRN ramp; a pure window layer at the
+                    // base theta with none (official `Attention.__init__`).
+                    theta: if ratio.is_some() { d.compress_theta } else { d.theta },
+                    yarn: ratio.map(|_| d.yarn),
+                    sm_scale: (d.head_dim as f32).sqrt().recip(),
+                    q_down: Weight::sym(n("q_down"), [q_lora, hidden], weights),
+                    q_norm: norm("q_norm", q_lora),
+                    q_norm_eps: d.norm_eps,
+                    q_up: Weight::sym(n("q_up"), [q_w, q_lora], weights).columns(),
+                    kv_down: Weight::sym(n("kv_down"), [kv_latent, hidden], weights),
+                    kv_norm: norm("kv_norm", kv_latent),
+                    kv_norm_eps: d.norm_eps,
+                    o_down: Weight::sym(n("o_down"), [o_out, hidden], weights),
+                    o_up: Weight::sym(n("o_up"), [hidden, o_out], weights).rows(),
+                    o_groups: d.o_groups,
+                    // sink rides the activation's dtype, not the
+                    // checkpoint's: attention.sink templates the sink
+                    // plane on the activation dtype (kernels_metal::
+                    // attn::sink dispatches on o.dtype, CUDA the same),
+                    // so an f32 plane at a bf16 seat would return NaN.
+                    // The checkpoint's own width is the import's
+                    // business (matches gpt_oss's convention).
+                    sink: Weight::sym(n("attn_sink"), [heads as u64], dense).columns(),
+                    kv: site.kv.clone(),
+                    pool,
+                    indexer,
+                },
+                mlp_mix: mix("mlp_mix"),
+                mlp: Mlp::MoeFlash {
+                    router: Weight::sym(n("gate"), [site.experts as u64, hidden], dense),
+                    gate,
+                    gate_up: if site.split {
+                        // two banks, each with its own dtype — both cut
+                        // on the same intermediate axis the fused bank
+                        // was, so a rank still holds a whole gate row
+                        // beside the up row it multiplies.
+                        let half = |what: &str, dtype: Dtype| {
+                            Weight::sym(
+                                n(what),
+                                [site.experts as u64, moe_inter as u64, hidden],
+                                dtype,
+                            )
+                            .bank([moe_inter as u64])
+                        };
+                        GateUp::Split {
+                            gate: half("experts_gate", site.gate),
+                            up: half("experts_up", site.up),
+                        }
+                    } else {
+                        GateUp::Fused(
+                            Weight::sym(
+                                n("experts_gate_up"),
+                                [site.experts as u64, 2 * moe_inter as u64, hidden],
+                                site.gate,
+                            )
+                            .bank([moe_inter as u64, moe_inter as u64]),
+                        )
+                    },
+                    down: Weight::sym(
+                        n("experts_down"),
+                        [site.experts as u64, hidden, moe_inter as u64],
+                        site.down,
+                    )
+                    .rows(),
+                    shared_gate_up: Weight::sym(
+                        n("shared_gate_up"),
+                        [2 * shared_inter as u64, hidden],
+                        weights,
+                    )
+                    .packed([shared_inter as u64, shared_inter as u64]),
+                    shared_down: Weight::sym(
+                        n("shared_down"),
+                        [hidden, shared_inter as u64],
+                        weights,
+                    )
+                    .rows(),
+                    experts: site.experts,
+                    top_k: d.top_k,
+                    inter: moe_inter,
+                    shared_inter,
+                    limit: d.swiglu_limit,
+                    renorm: d.renorm,
+                    scaling: d.scaling,
+                },
+                lora_a,
+                lora_b,
+            }
+        };
+
         let layers = (0..d.layers)
             .map(|l| {
-                let n = |s: &str| format!("layer.{l}.{s}");
-                let norm = |s: &str, dim: u64| Weight::sym(n(s), [dim], dense);
-                let mix = |s: &str| Mix {
-                    scale: Weight::sym(n(&format!("{s}_scale")), [3], Dtype::F32),
-                    base: Weight::sym(n(&format!("{s}_base")), [hc_base], Dtype::F32),
-                    dynamic: Some(Weight::sym(
-                        n(&format!("{s}_fn")),
-                        [hc_base, hc_fan],
-                        Dtype::F32,
-                    )),
-                };
-                let (lora_a, lora_b) =
-                    crate::adapter::banks(&format!("layer.{l}"), ADAPTERS, hidden, dense);
-
-                let ratio = d.pool[l as usize];
-                let has_indexer = ratio == Some(4);
-                let pool = ratio.map(|ratio| {
-                    // **THE `2 x` IS THE OVERLAP AND NOT A k/v PAIR.** The
-                    // reference's `overlap_transform` reshapes a
-                    // `[ratio, 2d]` block into a `[2 * ratio, d]` WINDOW —
-                    // the second half of a row's columns serves the block's
-                    // own positions and the first half serves the previous
-                    // block's, so a pooled entry straddles two blocks
-                    // (`v4mlx/compressor.py`). `pool_gather_paged`'s
-                    // `col = (i >= ratio ? head_dim : 0) + d` is that
-                    // reshape, and `coff` is the fanout: 2 at ratio 4, and 1
-                    // at ratio 128, which pools its own block alone.
-                    let entries = if has_indexer { 2 * kv_latent } else { kv_latent };
-                    Pool {
-                        ratio,
-                        entries: format!("pool.{l}"),
-                        compressor: Some(compressor(
-                            n("compressor"),
-                            ratio,
-                            entries,
-                            kv_latent,
-                        )),
-                    }
-                });
-                let indexer = has_indexer.then(|| Indexer {
-                    heads: d.index_heads,
-                    head_dim: d.index_head_dim,
-                    top_k: d.index_top_k,
-                    rope_dim: d.rope_dim,
-                    theta: d.compress_theta,
-                    window: d.index_window,
-                    wq_b: Weight::sym(n("indexer.wq_b"), [idx_w, q_lora], weights),
-                    weights_proj: Weight::sym(
-                        n("indexer.weights_proj"),
-                        [d.index_heads as u64, hidden],
-                        weights,
-                    ),
-                    compressor: compressor(
-                        n("indexer.compressor"),
-                        ratio.unwrap_or(4),
-                        2 * d.index_head_dim as u64,
-                        d.index_head_dim as u64,
-                    ),
-                    keys: format!("index.{l}"),
-                });
-
-                let gate = if l < d.num_hash_layers {
-                    Gate::Hash {
-                        tid2eid: Weight::sym(
-                            n("gate.tid2eid"),
-                            [d.vocab as u64, d.top_k as u64],
-                            Dtype::I64,
-                        ),
-                    }
-                } else {
-                    Gate::Bias {
-                        bias: Weight::sym(n("gate.bias"), [d.experts as u64], Dtype::F32),
-                    }
-                };
-
-                Layer {
-                    attn_mix: mix("attn_mix"),
-                    attn_norm: Some(norm("attn_norm", hidden)),
-                    mlp_norm: Some(norm("ffn_norm", hidden)),
-                    attn: Attn {
-                        rope_dim: d.rope_dim,
-                        theta: d.theta,
-                        sm_scale: (d.head_dim as f32).sqrt().recip(),
-                        q_down: Weight::sym(n("q_down"), [q_lora, hidden], weights),
-                        q_norm: norm("q_norm", q_lora),
-                        q_norm_eps: d.norm_eps,
-                        q_up: Weight::sym(n("q_up"), [q_w, q_lora], weights).columns(),
-                        kv_down: Weight::sym(n("kv_down"), [kv_latent, hidden], weights),
-                        kv_norm: norm("kv_norm", kv_latent),
-                        kv_norm_eps: d.norm_eps,
-                        o_down: Weight::sym(n("o_down"), [o_out, hidden], weights),
-                        o_up: Weight::sym(n("o_up"), [hidden, o_out], weights).rows(),
-                        o_groups: d.o_groups,
-                        // **THE SINK RIDES THE ACTIVATION'S DTYPE, NOT THE
-                        // CHECKPOINT'S.** The artifact ships `attn.attn_sink`
-                        // as f32 and this text declared f32 to match it — but
-                        // `attention.sink` templates its sink plane on the
-                        // ACTIVATION (`kernels_metal::attn::sink` dispatches
-                        // on `o.dtype`, and the CUDA twin on the same), so an
-                        // f32 plane arrived at a `bfloat*` seat and every
-                        // logit came back NaN. The checkpoint's own width is
-                        // the import's business — a bf16 declaration reads the
-                        // f32 tensor through an honest cast — and gpt_oss has
-                        // always declared its `attn_sinks` this way.
-                        sink: Weight::sym(n("attn_sink"), [heads as u64], dense).columns(),
-                        kv: format!("kv.{l}"),
-                        pool,
-                        indexer,
-                    },
-                    mlp_mix: mix("mlp_mix"),
-                    mlp: Mlp::MoeFlash {
-                        router: Weight::sym(n("gate"), [d.experts as u64, hidden], dense),
-                        gate,
-                        gate_up: if routed.split {
-                            // Two banks, EACH WITH ITS OWN DTYPE — the whole
-                            // point of the form. Both are cut on the same
-                            // intermediate axis the fused bank was cut on, at
-                            // its one remaining seam, so a rank still holds a
-                            // whole gate row beside the up row it multiplies.
-                            let half = |what: &str, dtype: Dtype| {
-                                Weight::sym(
-                                    n(what),
-                                    [d.experts as u64, moe_inter as u64, hidden],
-                                    dtype,
-                                )
-                                .bank([moe_inter as u64])
-                            };
-                            GateUp::Split {
-                                gate: half("experts_gate", routed.gate_of(l)),
-                                up: half("experts_up", routed.up),
-                            }
-                        } else {
-                            GateUp::Fused(
-                                Weight::sym(
-                                    n("experts_gate_up"),
-                                    [d.experts as u64, 2 * moe_inter as u64, hidden],
-                                    routed.gate,
-                                )
-                                .bank([moe_inter as u64, moe_inter as u64]),
-                            )
-                        },
-                        down: Weight::sym(
-                            n("experts_down"),
-                            [d.experts as u64, hidden, moe_inter as u64],
-                            routed.down,
-                        )
-                        .rows(),
-                        shared_gate_up: Weight::sym(
-                            n("shared_gate_up"),
-                            [2 * shared_inter as u64, hidden],
-                            weights,
-                        )
-                        .packed([shared_inter as u64, shared_inter as u64]),
-                        shared_down: Weight::sym(
-                            n("shared_down"),
-                            [hidden, shared_inter as u64],
-                            weights,
-                        )
-                        .rows(),
-                        experts: d.experts,
-                        top_k: d.top_k,
-                        inter: moe_inter,
-                        shared_inter,
-                        limit: d.swiglu_limit,
-                        renorm: d.renorm,
-                        scaling: d.scaling,
-                    },
-                    lora_a,
-                    lora_b,
-                }
+                layer_at(Site {
+                    prefix: format!("layer.{l}"),
+                    ratio: d.pool[l as usize],
+                    hash: l < d.num_hash_layers,
+                    experts: d.experts,
+                    split: routed.split,
+                    gate: routed.gate_of(l),
+                    up: routed.up,
+                    down: routed.down,
+                    weights,
+                    dense,
+                    kv: format!("kv.{l}"),
+                    pool: format!("pool.{l}"),
+                    index: format!("index.{l}"),
+                })
             })
             .collect();
+
+        // **THE DRAFT HEAD** (`DeepSeek-V4-Flash`'s one `nextn` layer,
+        // `mlx-community/DeepSeek-V4-Flash-MTP-bf16` restated by
+        // `scripts/dsv4_mtp_companion.py`): the same block at ratio zero with
+        // a bias gate, its experts in the companion's own mxfp4 and every
+        // dense plane in bf16, behind the two fusion projections and its own
+        // hyper head and norm. Its planes come in under `mtp.`, which the
+        // `--aux` overlay lands as `aux.`.
+        let mtp = d.draft.then(|| {
+            let streams_n = d.streams as u64;
+            Mtp {
+                enorm: Weight::sym("mtp.enorm", [hidden], Dtype::Bf16),
+                hnorm: Weight::sym("mtp.hnorm", [hidden], Dtype::Bf16),
+                e_proj: Weight::sym("mtp.e_proj", [hidden, hidden], Dtype::Bf16),
+                // `h_proj` applies per STREAM: one `[hidden, hidden]` plane
+                // read `streams` times over, as the `[streams·hidden,
+                // hidden]` block-diagonal bank `linear.matmul_grouped` walks.
+                h_proj: Weight::sym("mtp.h_proj", [streams_n * hidden, hidden], Dtype::Bf16),
+                block: layer_at(Site {
+                    prefix: "mtp.decoder".to_string(),
+                    ratio: None,
+                    hash: false,
+                    experts: DRAFT_EXPERTS,
+                    split: true,
+                    gate: Dtype::Mxfp4,
+                    up: Dtype::Mxfp4,
+                    down: Dtype::Mxfp4,
+                    weights: Dtype::Bf16,
+                    dense: Dtype::Bf16,
+                    kv: "kv.mtp".to_string(),
+                    pool: "pool.mtp".to_string(),
+                    index: "index.mtp".to_string(),
+                }),
+                hc_head: HcHead {
+                    base: Weight::sym("mtp.hc_head.base", [streams], Dtype::F32),
+                    dynamic: Weight::sym("mtp.hc_head.fn", [streams, hc_fan], Dtype::F32),
+                    scale: Weight::sym("mtp.hc_head.scale", [1], Dtype::F32),
+                },
+                norm: Weight::sym("mtp.norm", [hidden], Dtype::Bf16),
+                norm_eps: d.norm_eps,
+            }
+        });
 
         Model {
             hidden: d.hidden,
@@ -926,137 +1054,19 @@ impl Model {
             layers,
             final_norm: Weight::sym("final_norm", [hidden], dense),
             final_norm_eps: idx_norm_eps,
+            mtp,
         }
     }
 }
 
-/// What every SKU of this family seats.
-///
-/// Not a `Dims` field, because it is not a fact about the checkpoint the way
-/// `hidden` and `layers` are — no pretrained artifact states it. It is the
-/// DEPLOYMENT's ceiling written where a shape has to be written, and a
-/// deployment that wants a different one changes this line and re-traces,
-/// which is exactly the "load-time recompile, never a runtime extension"
-/// design §9 asks for.
-///
-/// Eight slots of rank sixteen costs the `base` row 1 MiB a layer — two planes
-/// of `8 x 16 x 2048` in the compute element — and 6 MiB over its six.
+/// What every SKU of this family seats. Not a `Dims` field: no pretrained
+/// artifact states it; a deployment that wants a different one changes this
+/// line and re-traces (load-time recompile, never a runtime extension).
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
+/// The draft head's routed bank is always the checkpoint's own 256 experts,
+/// whatever miniature the trunk was cut to.
+const DRAFT_EXPERTS: u32 = 256;
+
 impl Model {
-    pub fn load(
-        &self,
-        src: &ztensor::Source,
-    ) -> Result<ModelContract, checkpoint_dsl::Error> {
-        let mut b = checkpoint_dsl::Builder::new(src, self.tp);
-        let mut stated = |w: &Weight| b.read_own(w);
-        stated(&self.embed)?;
-        if let Some(head) = &self.head {
-            stated(head)?;
-        }
-        stated(&self.final_norm)?;
-        if let Some(hc) = &self.hc_head {
-            stated(&hc.base)?;
-            stated(&hc.dynamic)?;
-            stated(&hc.scale)?;
-        }
-
-        for layer in &self.layers {
-            for mix in [&layer.attn_mix, &layer.mlp_mix] {
-                stated(&mix.scale)?;
-                stated(&mix.base)?;
-                if let Some(dynamic) = &mix.dynamic {
-                    stated(dynamic)?;
-                }
-            }
-            if let Some(n) = &layer.attn_norm {
-                stated(n)?;
-            }
-            if let Some(n) = &layer.mlp_norm {
-                stated(n)?;
-            }
-
-            let at = &layer.attn;
-            stated(&at.q_down)?;
-            stated(&at.q_norm)?;
-            stated(&at.q_up)?;
-            stated(&at.kv_down)?;
-            stated(&at.kv_norm)?;
-            stated(&at.o_down)?;
-            stated(&at.o_up)?;
-            stated(&at.sink)?;
-            if let Some(pool) = &at.pool {
-                if let Some(c) = &pool.compressor {
-                    stated(&c.wkv)?;
-                    stated(&c.wgate)?;
-                    stated(&c.ape)?;
-                    stated(&c.norm)?;
-                }
-            }
-            if let Some(ix) = &at.indexer {
-                stated(&ix.wq_b)?;
-                stated(&ix.weights_proj)?;
-                stated(&ix.compressor.wkv)?;
-                stated(&ix.compressor.wgate)?;
-                stated(&ix.compressor.ape)?;
-                stated(&ix.compressor.norm)?;
-            }
-
-            match &layer.mlp {
-                Mlp::Dense { gate_up, down, .. } => {
-                    stated(gate_up)?;
-                    stated(down)?;
-                }
-                Mlp::Routed {
-                    router,
-                    bias,
-                    gate_up,
-                    down,
-                    ..
-                } => {
-                    stated(router)?;
-                    stated(bias)?;
-                    stated(gate_up)?;
-                    stated(down)?;
-                }
-                Mlp::MoeFlash {
-                    router,
-                    gate,
-                    gate_up,
-                    down,
-                    shared_gate_up,
-                    shared_down,
-                    ..
-                } => {
-                    // **THE HASH LAYERS STATE THE TABLE AND NOT THE ROUTER**,
-                    // which is the exact inverse of what this arm said while
-                    // `linear.moe_hash_route` was missing. A lookup gate
-                    // computes no logits, so `ffn.gate.weight` is a plane the
-                    // forward never reads on those layers and a load that
-                    // published it would hand `Shell::load` a plane no plan
-                    // names; `tid2eid` is what the route now comes out of, so
-                    // it is what the contract demands.
-                    match gate {
-                        Gate::Hash { tid2eid } => stated(tid2eid)?,
-                        Gate::Bias { bias } => {
-                            stated(router)?;
-                            stated(bias)?;
-                        }
-                    }
-                    match gate_up {
-                        GateUp::Fused(bank) => stated(bank)?,
-                        GateUp::Split { gate, up } => {
-                            stated(gate)?;
-                            stated(up)?;
-                        }
-                    }
-                    stated(down)?;
-                    stated(shared_gate_up)?;
-                    stated(shared_down)?;
-                }
-            }
-        }
-
-        Ok(b.build())
-    }
-}
+ }

@@ -1,28 +1,4 @@
-//! **THE SHELL'S HALF OF THE SECOND SERIATION**, with no device in the room:
-//! which window a region's launches are cut at, and which rectangle a node
-//! that reads ACROSS the two axes is handed.
-//!
-//! # What this pins, and why it needs no GPU
-//!
-//! `Windows::of` is arithmetic — a compiled artifact, a fire's two class
-//! tables and a boundary vector in, one window per region per run out. Every
-//! claim below is about that arithmetic, so it runs on any box:
-//!
-//! * a TOWER region — one whose capture unit is `RowAxis::Patches` — is cut at
-//!   the PATCH table: its rows are patch rows and its lanes are IMAGES. A
-//!   shell that cut it at the token table would hand the tower one class's
-//!   token interval of somebody else's rows (multimodal §5.1);
-//! * a TRUNK region carries the patch interval BESIDE its own, because the
-//!   embed merge (`layout.scatter_rows`) is a token-unit node that reads a
-//!   patch rectangle — the one node in a tower plan that touches both axes;
-//! * a text-only fire of the same artifact gets zero patch windows and its
-//!   token windows are the ones it always had, which is gate (a) at the
-//!   window table;
-//! * and the descriptor round-trips both tables, so the answer a device reads
-//!   is the answer the walk reads.
-//!
-//! What is NOT here is a launch. `attention.dense` firing on real patch rows
-//! is the text wave's gate, and it needs a model text that declares a tower.
+//! Pins `Windows::of`: a tower region is cut at the patch table, a trunk region carries the patch interval it reads, and both round-trip through the descriptor.
 
 use engine_cuda::window::{Copies, Windows};
 use model_compiler::{
@@ -31,10 +7,8 @@ use model_compiler::{
 use model_exec::fire::{FireDescriptor, Lane, compose_axes};
 use model_ir::ops::Elementwise;
 
-/// A slot table generously above every hand-built fire below — the tests ask
-/// about window semantics, not the carve, so the ceiling only has to hold.
-/// The last three are what one GATHERED payload is bounded by (rows, kv
-/// spaces, pages), which `Slots` owns since the tail acquired a stride.
+/// Slot ceiling well above any fire built below; last three args bound one
+/// gathered payload (rows, kv spaces, pages).
 fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
 }
@@ -105,8 +79,7 @@ impl Build {
     }
 }
 
-/// A tower, then a trunk that reads it. Two capture units, split on one fact
-/// so that the class tables have something to say.
+/// A tower, then a trunk that reads it.
 fn tower_and_trunk() -> Trace {
     let mut b = Build::new();
     let pixels = b.value(Def::Input(RuntimeInput::Patches), patch());
@@ -160,12 +133,11 @@ fn indptr(rows: &[u32]) -> Vec<i32> {
     out
 }
 
-/// Which regions are on which axis, as the shell reads it.
 fn axis_of(compiled: &CompiledModel, region: usize) -> RowAxis {
     compiled.units[compiled.unit_of(region) as usize]
 }
 
-/// **THE TOWER IS CUT AT THE PATCH TABLE AND THE TRUNK AT THE TOKEN ONE.**
+/// The tower is cut at the patch table, the trunk at the token one.
 #[test]
 fn each_region_is_cut_at_its_own_axis_s_window() {
     let (trace, compiled) = baked();
@@ -192,11 +164,8 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
 
     let mut towers = 0;
     let mut trunks = 0;
-    // Does some TOKEN region see the whole patch rectangle? The embed merge
-    // is `Guard::Always`, so its mask holds every class and its patch window
-    // is the fire's whole one — which is the rectangle `layout.scatter_rows`
-    // reads, and the thing a shell carrying only one window pair could not
-    // have handed it.
+    // Tracks whether some token region sees the whole patch rectangle
+    // (the embed merge's `layout.scatter_rows` input).
     let mut merge_saw_the_tower = false;
     for (at, region) in compiled.template().iter().enumerate() {
         let window = windows.at(at as u32, 0);
@@ -222,9 +191,8 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
                     fire.classes().rows_of(&region.mask),
                     "a trunk region's launch runs over token rows",
                 );
-                // The patch interval rides along, cut at THIS region's own
-                // classes — a class with token rows and no image contributes
-                // none, which is the invariant break.
+                // Patch interval is cut at this region's own classes: a
+                // class with token rows and no image contributes none.
                 assert_eq!(
                     window.on(RowAxis::Patches).rows,
                     fire.patch_classes().rows_of(&region.mask),
@@ -241,16 +209,14 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
          would read somebody else's rows",
     );
 
-    // AND THE BREAK ITSELF, at the window table: the class that carries no
-    // image has token rows and no patch rows in the same fire.
+    // The class with no image has token rows and no patch rows.
     let text_class = compiled.classes.class_of(0).expect("word 0 is a class");
     assert!(fire.classes().as_slice()[text_class].rows > 0);
     assert_eq!(fire.patch_classes().as_slice()[text_class].rows, 0);
 }
 
-/// **GATE (a), AT THE WINDOW TABLE.** A fire of the same artifact whose lanes
-/// carry no image gets the token windows it would have had before the axis
-/// existed, and a patch window of nothing.
+/// A fire whose lanes carry no image gets the same token windows as before
+/// the axis existed, and a patch window of nothing.
 #[test]
 fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
     let (trace, compiled) = baked();
@@ -294,17 +260,13 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
             assert_eq!(a.span(), b.span(), "region {at}'s token window moved");
             assert_eq!(a.indptr_host, b.indptr_host);
         }
-        // And the imageless fire's patch window is the zero window, which is
-        // what an axis-empty fire has: the tower's launches read zero rows and
-        // return, so the unit's exec runs nothing.
         assert_eq!(a.on(RowAxis::Patches).rows, 0, "region {at} found patch rows in a text fire");
     }
     assert_eq!(plain.patch_rows(), 0);
     assert_eq!(mixed.patch_rows(), 128);
 }
 
-/// The descriptor a device reads carries both tables, and the tower's window
-/// survives the trip through the bytes.
+/// The descriptor round-trips both tables through pack/unpack.
 #[test]
 fn the_table_a_device_reads_carries_both_seriations() {
     let (_, compiled) = baked();

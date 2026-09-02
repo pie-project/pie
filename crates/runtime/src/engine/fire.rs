@@ -1,20 +1,8 @@
-//! What the runtime assembles a fire out of.
-//!
-//! # The CSRs were never a submission
-//!
-//! This module replaces `engine::plan::LaunchPlan` — sixty-two fields,
-//! most of them parallel `Vec<u32>` arms (`qo_indptr`, `kv_page_indptr`,
-//! `rs_translation_indptr`, `embed_block_indptr`, `image_mrope_indptr`, …)
-//! — and the four-hundred-line `StepSubmission::validate` whose whole job was
-//! checking that they were the same length as each other. The runtime
-//! flattened its per-request state into eleven CSRs and the engine's first
-//! act was to walk them back into per-request form.
-//!
-//! The contract's [`Lane`] is the per-request form, so the flattening is
-//! gone. What survives here is what the CSRs were NOT saying: the
-//! runtime's own bookkeeping about a request — which geometry class it fires
-//! in, which page rewrite is outstanding, which recurrent slots it folds —
-//! none of which is a shape the engine reads.
+//! What the runtime assembles a fire out of. The contract's [`Lane`] is the
+//! per-request form that crosses the boundary, so nothing here flattens it;
+//! what this module holds is the runtime's own bookkeeping about a request —
+//! geometry class, outstanding page rewrites, folded recurrent slots — none of
+//! which the engine reads.
 //!
 //! ```text
 //!   FireRequest            = the runtime's record of one submitted request
@@ -25,58 +13,14 @@
 //!   FrameSubmission        = the frame's steps, sealed — what `submit` takes
 //! ```
 //!
-//! # A request is LANES, plural, and always was
-//!
-//! `qo_indptr` had `rows + 1` entries and a "prebuilt" request could carry
-//! several — the SDK's one-token-per-lane lowering is the standing example.
-//! So the natural per-request shape is a `Vec<Lane>` rather than one, and
-//! batch assembly is a concatenation instead of eleven simultaneous CSR
-//! merges (`scheduler::wire`, which was that merge and is now the trim).
+//! A request is lanes, plural: a "prebuilt" request can carry several (the
+//! SDK's one-token-per-lane lowering is the standing example), so batch
+//! assembly is a concatenation rather than several simultaneous CSR merges.
 
 use engine::fire::{Step, KvDelta, Lane};
 use eta_ir::registry::GeometryClass;
 
 use crate::engine::completion::TerminalCell;
-
-// **`palo B-rs` CLOSED, AND THE VERB CROSSES NOW** (alto wave F3-tail). An
-// `RsPlan` struct stood here: eleven parallel `Vec<u32>` arms — `slot_ids`,
-// `slot_flags`, `fold_lens`, `buffer_slot_ids` + its CSR, `buffer_read_*`,
-// `buffer_heads`, `translation` + its CSR — the last survivors of
-// `LaunchPlan`'s recurrent half, carried on `FireRequest::rs` because the
-// contract had no recurrent field at all and the runtime's own store was
-// built on them. Nothing across the boundary could read one, so a lane that
-// meant to scatter a speculative window into a buffer was submitted as an
-// ordinary fold and the device folded it.
-//
-// `engine::RsVerb` and `engine::RsReset` are that vocabulary, and
-// they are fields of the LANE — so the arms have nowhere left to be:
-// `pipeline::fire::rs::PreparedRs::apply_to` stamps one verb and one reset
-// fact onto the lane that carries each row, `RsVerb::Buffer::pages` IS the
-// translation the ninth and tenth arms carried, and everything else was
-// either the runtime store's own bookkeeping (which never left
-// `PreparedRs`) or a second spelling of a number the verb states once
-// (article 8).
-
-// **`palo B-media` CLOSED THE OTHER WAY** (alto E). A `Media` struct stood
-// here — twenty fields of pixel bytes, patch grids, mRoPE positions, audio
-// features and precomputed embedding rows, kept so the runtime would have
-// somewhere to hold an encode's payload. Nothing ever wrote one. Every
-// `FireRequest` built in this tree left it `Default`, so
-// `offload::try_encode`'s `media.is_empty()` gate was true on every fire and
-// the encode seam was dead in front of a payload that did not exist. The
-// payload comes back with the verb that produces it
-// (`engine::MediaEncode` is `encode`'s argument, and what a fire needs
-// afterwards is rows in the arena — a seam the shell resolves).
-//
-// A `ChannelTicket` struct stood here too: a channel's expected ring cursors,
-// stated on the REQUEST as `FireRequest::tickets` beside a
-// `device_channel_tickets` flag that said whether the engine had a device
-// half to check them, which `scheduler::batch` then transcribed onto the
-// attached lane. Both are gone. The reservation is stamped straight onto the
-// lane that carries the pass (`engine::Lane::channels`) by
-// `pipeline::fire`'s `TicketReservation::apply_to` — the party that mints it
-// and the party that knows whether the instance's channels were adopted. Two
-// spellings of one number is what article 8 forbids.
 
 /// One request, as the runtime holds it between submit and fire.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -96,37 +40,17 @@ pub struct FireRequest {
     pub single_token_mode: bool,
     /// The mask came from the guest rather than from the causal derivation.
     pub has_user_mask: bool,
-    /// **Does this request's bound instance run a pass at the fire's
-    /// boundary?** (`palo B2`, design §9.)
-    ///
-    /// It is a per-request FACT rather than a fire-wide policy because the
-    /// two ways a request reaches the engine lane are genuinely different: a
-    /// pipeline submit fires a `BoundForwardPass`, which IS a guest program
-    /// attached to a model fire, and everything else — a prebuilt rider, a
-    /// test that builds a `FireRequest` by hand — has no instance whose
-    /// channels the engine carved. Defaulting to `false` is what makes the
-    /// second kind byte-identical to what it was: an empty
-    /// [`Step::attachments`] is the same submission it always was,
-    /// down to the shell taking the same branch.
-    ///
-    /// Which BOUNDARY it runs at is not a field: a program's stages are one
-    /// pass with one commit, and a pass that reads the fire's logits can only
-    /// be the epilogue ([`Attachment`](engine::fire::Attachment)'s own doc).
-    /// `batch` stamps [`Boundary::Epilogue`](engine::fire::Boundary::Epilogue).
+    /// Does this request's bound instance run a pass at the fire's boundary?
+    /// A per-request fact, not a fire-wide policy: a pipeline submit fires a
+    /// `BoundForwardPass` attached to a model fire, while everything else (a
+    /// prebuilt rider, a hand-built test request) has no such instance.
+    /// Defaults to `false`. Which boundary it runs at is not a field —
+    /// `batch` always stamps [`Boundary::Epilogue`](engine::fire::Boundary::Epilogue).
     pub boundary_program: bool,
-    /// **THE MEDIA SPANS THIS REQUEST'S PASS ATTACHED** (media-door §6, wave
-    /// MD-C), keyed by lane and empty for every text-only request — which is
-    /// every request that does not call `forward-pass.media`.
-    ///
-    /// `lane` is an index into THIS REQUEST's [`lanes`](FireRequest::lanes),
-    /// because a submission cannot know which step it co-batches into;
-    /// `scheduler::batch` rebases it by the member's own lane offset when it
-    /// concatenates, exactly as it stamps an [`Attachment`](engine::fire::Attachment)'s lane.
-    ///
-    /// **IT IS THE CONTRACT'S OWN RECORD AND NOT A RUNTIME COPY OF IT.**
-    /// `pipeline::media::lane_media` derives the rows from the run scan and
-    /// answers `engine::fire::StepMedia` directly, so `batch` moves them into
-    /// the step and nothing between here and the engine re-states a number.
+    /// The media spans this request's pass attached, keyed by lane; empty
+    /// for every text-only request. `lane` indexes this request's own
+    /// [`lanes`](FireRequest::lanes) (a submission can't know which step it
+    /// co-batches into); `scheduler::batch` rebases it on concatenation.
     pub media: Vec<engine::fire::StepMedia>,
 }
 
@@ -170,12 +94,8 @@ impl FireRequest {
     }
 
     /// The token-row CSR over this request's lanes — `[lanes + 1]` entries.
-    ///
-    /// **A VIEW, NOT A FIELD.** `qo_indptr` was a stored arm of the wire plan
-    /// and half the runtime read it; it is derived here because a CSR and the
-    /// lanes it cuts cannot disagree if only one of them exists. The readers
-    /// that still want the flat shape — the recurrent planner, the geometry
-    /// validators — ask for it.
+    /// A view, not a field: derived here so a CSR and the lanes it cuts
+    /// cannot disagree.
     #[must_use]
     pub fn qo_indptr(&self) -> Vec<u32> {
         let mut out = Vec::with_capacity(self.lanes.len() + 1);
@@ -189,11 +109,7 @@ impl FireRequest {
     }
 
     /// How full the last lane's last KV page is once this request has fired.
-    ///
-    /// Was `kv_last_page_lens`, an arm of the wire plan with one entry per
-    /// lane, of which the scheduler read exactly the last. It is arithmetic
-    /// over the lane's own `held` and rows, so it is computed rather than
-    /// carried.
+    /// Arithmetic over the lane's own `held` and rows, computed rather than carried.
     #[must_use]
     pub fn last_page_len(&self, page_size: u32) -> u32 {
         if page_size == 0 {
@@ -211,56 +127,31 @@ impl FireRequest {
     }
 }
 
-/// One step of a frame, as the engine lane fires it.
-///
-/// **A STEP IS ONE FIRE NOW.** `StepSubmission` carried a `LaunchPlan` plus
-/// eleven side tables — `roster_rows`, `sub_batch_indptr`,
-/// `sub_batch_class`, `program_row_indptr`, `channel_ticket_indptr`,
-/// `region_row_indptr`, `region_sig`, `region_k`, … — every one of them a
-/// mapping from the flattened CSRs back to the per-request state they were
-/// flattened from. Lanes are that state, so the tables have nothing left to
-/// map and what a step carries is the submission plus the runtime's own
-/// bookkeeping about it.
+/// One step of a frame, as the engine lane fires it. A step is one fire: the
+/// per-request state lives on the lanes, so a step carries only the submission
+/// plus the runtime's own bookkeeping about it.
 pub struct StepFire {
-    /// What crosses the boundary.
-    ///
-    /// **MOVED OUT AT SUBMISSION, NOT COPIED.** `fire_frame` takes every
-    /// step's submission into the one `FrameSubmission` the engine is handed
-    /// (alto design §2), so this is empty from the instant the frame reaches
-    /// the device — everything the runtime still needs after that point is the
-    /// two fields below, which is why they are fields rather than lookups
-    /// into the submission.
+    /// What crosses the boundary. Moved out at submission, not copied:
+    /// `fire_frame` takes every step's submission into the one
+    /// `FrameSubmission` the engine is handed, so this is empty from the
+    /// instant the frame reaches the device.
     pub submission: Step,
     /// The terminal cell each lane's work item settles through, parallel to
-    /// [`Step::lanes`]. Runtime-side: the engine answers a
-    /// `Result<FrameTicket>` — one `FireTicket` per step — and
-    /// [`crate::engine::completion::settle`] writes these from it.
+    /// [`Step::lanes`]. The engine answers a `Result<FrameTicket>` (one
+    /// `FireTicket` per step), and [`crate::engine::completion::settle`]
+    /// writes these from it.
     pub terminal_cells: Vec<*mut TerminalCell>,
     /// Which bound instance each lane belongs to, parallel to the lanes.
-    ///
-    /// This is what
-    /// [`Step::attachments`](engine::Step) carries
-    /// for every lane whose request set
-    /// [`FireRequest::boundary_program`] — `batch` builds the attachments out
-    /// of exactly this vector. It stays here as well because the scheduler's
-    /// own in-flight tables read the association for lanes that carry no
-    /// attachment too, and because the engine lane pumps a bound instance's
-    /// channels by id.
+    /// `batch` builds [`Step::attachments`](engine::Step) out of exactly
+    /// this vector; it also stays here because the scheduler's own
+    /// in-flight tables read the association for lanes with no attachment,
+    /// and the engine lane pumps a bound instance's channels by id.
     pub instances: Vec<u64>,
     /// Each lane's logical fire id, for the log and the watchdog.
     pub logical_fire_ids: Vec<u64>,
 }
 
 /// One sealed frame: its steps, in order.
-///
-/// `FrameSubmission`'s four frame-level fields are gone with the wire form.
-/// `instance_ids` was the roster the step tables indexed;
-/// `kv_translation`/`kv_translation_indptr` were a per-roster-lane page
-/// rewrite for a fork mover no shell in this tree has — both spellings are
-/// deleted rather than carried (alto E); `required_kv_pages` was a
-/// frame-union high-water the engine used to size an admission check it
-/// makes for itself now ([`Error::Exhausted`](engine::Error::Exhausted)
-/// carries the numbers).
 #[derive(Default)]
 pub struct FrameFire {
     /// The steps, in the order the lane fires them.
@@ -290,17 +181,11 @@ pub struct MaskWords {
     pub words: Vec<u32>,
 }
 
-/// Expand every lane's mask into bitmap words.
-///
-/// **`request_indptr` CUTS `word_indptr` PER LANE BECAUSE A LANE CAN CARRY
-/// MORE THAN ONE MASK**, and since `Masking::Rows` it actually does: a
-/// windowed prefill states one restriction per query row, and each of them
-/// expands into its own bitmap. The two-level CSR was already this shape when
-/// every lane put exactly one mask in it — `LaunchPlan::bitmask_words` came
-/// off a wire form that cut a flat mask vector per request — so a per-row
-/// lane fills it rather than changing it. The causal bound is NOT folded in
-/// here: this is the run encoding expanded, and every consumer that reads the
-/// bits intersects them with the row's own bound (`engine_cuda::mask`).
+/// Expand every lane's mask into bitmap words. `request_indptr` cuts
+/// `word_indptr` per lane because a lane can carry more than one mask (a
+/// windowed prefill states one restriction per query row). The causal bound
+/// is not folded in here — this is the run encoding expanded; every consumer
+/// intersects the bits with the row's own bound.
 #[must_use]
 pub fn bitmask_words(lanes: &[Lane]) -> MaskWords {
     let mut request_indptr = Vec::with_capacity(lanes.len() + 1);
@@ -332,15 +217,10 @@ pub fn lane_of(slot: u32, tokens: Vec<u32>, held: u32, pages: Vec<u32>) -> Lane 
         kv: KvDelta {
             held,
             pages,
-            // Stamped only where a page reference is the guest's to resolve
-            // (`pipeline::fire::stamp_lane_translation`); every other lane's
-            // pages are pool ids by the time they reach here.
+            // Stamped only where a page reference is the guest's to resolve;
+            // every other lane's pages are pool ids by the time they reach here.
             translation: Vec::new(),
         },
         ..Lane::default()
     }
 }
-
-// `pub use engine::fire::{Attachment, Boundary, FireTicket, LaneReadout}`
-// STOOD HERE — the same aliasing the parent module dropped: a contract noun
-// is spelled at its owner (`::engine::fire::…`) now, one name per type.

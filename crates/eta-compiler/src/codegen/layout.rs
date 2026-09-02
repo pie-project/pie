@@ -1,40 +1,19 @@
-//! The device-side struct layouts, declared once.
-//!
-//! The lane table is the ABI between the host planner and the kernels it
-//! emits, and it was written out seven times. Nothing tied the copies
-//! together. Adding a field meant editing all seven, and getting it wrong did
-//! not fail to compile — it shifted every field after it, so the kernel read a
-//! different offset than the host wrote. Wrong numbers, no error.
-//!
-//! Here the field list is data, and each copy is either printed from it or
-//! read back and compared against it:
+//! The device-side struct layouts, declared once. The lane table is the ABI
+//! between the host planner and the kernels it emits; each copy below is
+//! either printed from this field list or read back and compared against it,
+//! so a field added on one side and not the other is a compile error or test
+//! failure rather than a silent reinterpretation.
 //!
 //! | copy | how it is tied here |
 //! |---|---|
 //! | `#[repr(C)]` structs in `eta-compiler` | `offset_of!` in `static_assertions` |
-//! | MSL `M1*` in `metal::preamble` | printed by [`DeviceStruct::emit_msl`] |
-//! | MSL `M3*` in `metal::preamble` | printed by [`DeviceStruct::emit_msl`] |
+//! | MSL `M1*`/`M3*` in `metal::preamble` | printed by [`DeviceStruct::emit_msl`] |
 //! | MSL `M1Status` in the effect emitters | printed by [`DeviceStruct::emit_msl`] |
 //! | `runtime/cuda/fused_block0.cuh` | [`DeviceStruct::emit_cuda`], compared in `cuda::fused` |
 //! | `runtime/metal/ptir_m1_grouped.metal` | `metal::preamble::tests::file_matches_emitted_text` |
 //!
-//! The two runtime files are hand-written C++/MSL that cannot be generated
-//! wholesale — they are compiled by NVRTC and the Metal compiler as text and
-//! carry far more than the struct declarations — so they are checked rather
-//! than produced. A seventh row stood above until the C++ drivers were
-//! deleted: a plain-C printing (`DeviceStruct::emit_c`) into the generated
-//! `ptir_abi.h`, which those engines `#include`d instead of retyping the
-//! table. The Rust engines that replaced them read this module directly, and a
-//! printer whose only consumer was a deleted header is not a tie to anything.
-//!
-//! A field added on one side and not the other is now a compile error or a
-//! test failure rather than a silent reinterpretation.
-//!
-//! The emitted text is byte-identical to what was hand-written, which the MSL
-//! goldens (and the `# @grouped:` length+hash pin in `emit_grouped_*.txt`)
-//! check on every run. Those bytes came from the deleted C++ oracle, so they
-//! are an independent witness that this generator reproduces the ABI the
-//! engine was built against.
+//! The two runtime files are hand-written C++/MSL and so checked rather than
+//! produced; the MSL goldens pin the emitted text byte-identical to them.
 
 use alloc::format;
 use alloc::string::String;
@@ -84,10 +63,8 @@ pub struct Field {
     /// The field's name in the generated C header and in `eta-compiler`'s
     /// `#[repr(C)]` struct.
     pub name: &'static str,
-    /// The name MSL uses, when it differs. It differs in exactly one place —
-    /// see [`LANE_TABLE_HEADER`] — and carrying the difference here is what
-    /// lets the generator reproduce the existing bytes instead of quietly
-    /// renaming a field the goldens and the engine already agree on.
+    /// The name MSL uses, when it differs (exactly one place, see
+    /// [`LANE_TABLE_HEADER`]).
     pub msl_name: &'static str,
     /// The field's scalar width.
     pub ty: FieldType,
@@ -221,10 +198,9 @@ impl DeviceStruct {
     }
 }
 
-/// The status word a lane's commit slot points at. Written by the readiness
-/// and commit kernels, read by the engine. It has no `eta-compiler` counterpart —
-/// the host never builds one, it only hands out the address — so it is pinned
-/// by the goldens alone.
+/// The status word a lane's commit slot points at. No `eta-compiler`
+/// counterpart (the host only hands out the address), so pinned by the
+/// goldens alone.
 pub const STATUS: DeviceStruct = DeviceStruct {
     c_name: "PtirStatus",
     msl_suffix: "Status",
@@ -238,9 +214,7 @@ pub const STATUS: DeviceStruct = DeviceStruct {
 };
 
 /// Header of the grouped-dispatch lane table. MSL calls the third field
-/// `channel_count`; the host and the C header call it
-/// `channel_slots_per_lane`. Same offset, same width, different word — a drift
-/// that survived precisely because nothing compared the copies.
+/// `channel_count`; host/C header call it `channel_slots_per_lane`.
 pub const LANE_TABLE_HEADER: DeviceStruct = DeviceStruct {
     c_name: "PtirLaneTableHeader",
     msl_suffix: "LaneHeader",
@@ -300,13 +274,9 @@ pub const LANE_CHANNEL_SLOT: DeviceStruct = DeviceStruct {
 /// them.
 pub const HOST_SHARED: &[DeviceStruct] = &[LANE_TABLE_HEADER, LANE_RECORD, LANE_CHANNEL_SLOT];
 
-/// Compile-time proof that this table describes the `eta-compiler` structs the
-/// host actually writes.
-///
-/// Without these, a field added to `LaneRecord` and not to [`LANE_RECORD`]
-/// would compile, emit a kernel that reads the old layout, and produce wrong
-/// numbers at run time. `offset_of!` is a constant, so the mismatch is caught
-/// before anything runs.
+/// Compile-time proof that this table describes the `eta-compiler` structs
+/// the host actually writes: without these, a field added to `LaneRecord`
+/// and not [`LANE_RECORD`] would compile and produce wrong numbers silently.
 mod static_assertions {
     use super::*;
     use crate::plan::{LaneChannelSlot, LaneRecord, LaneTableHeader};

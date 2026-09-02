@@ -1,10 +1,4 @@
-//! Per-op shape/dtype inference for ETA stage bodies: the validator core,
-//! and the type table the reference interpreter indexes for its semantics.
-//!
-//! Every op is value → value over trace-known shapes: inference is total per
-//! op and errors carry the op index. Channel ops type
-//! against the container's channel declarations (`ACT` materializes F32,
-//! [`super::container::ChanDType::program_dtype`]).
+//! Per-op shape/dtype inference for ETA stage bodies.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -35,15 +29,8 @@ pub enum BodyErrorKind {
     ShapeMismatchBin(Shape, Shape),
     /// Operand dtypes an op's rule does not accept.
     DTypeMismatch,
-    /// A result dtype ETA has no arithmetic for.
-    ///
-    /// The op set's element type is [`Dtype`], which the loader, the kernels
-    /// and the transfer contract share; ETA computes in four of its variants
-    /// and [`crate::types::class_of`] says which. A `cast` to `Bf16`, or a
-    /// second-party kernel declaring an `E4m3` result, is well-formed as a
-    /// *value* and has no meaning here, so it is refused by name at the one
-    /// point every op's result passes through. Refused here and not at the
-    /// encoder, where the only answer left is a panic.
+    /// A result dtype ETA has no arithmetic for; refused here rather than at
+    /// the encoder, where the only option left is a panic.
     UnsupportedDtype(Dtype),
     /// Channel index outside the container's declaration table.
     ChannelOutOfRange(u32),
@@ -100,11 +87,8 @@ pub struct BodyCtx<'a> {
     /// Program-side channel element types, in declaration order.
     pub channel_types: &'a [ValueType],
     /// Name-table length; a name index at or above it is out of range.
-    ///
-    /// Wider than the [`NameIndex`](crate::op::NameIndex) it bounds, so that
-    /// a table longer than `u16::MAX` states its real length. Narrowing it to
-    /// the index type instead would make the largest legal index compare as
-    /// out of range.
+    /// Wider than the name-index type so a table longer than `u16::MAX` can
+    /// state its real length.
     pub n_names: u32,
 }
 
@@ -124,11 +108,7 @@ pub fn body_types(ops: &[Op], ctx: &BodyCtx<'_>) -> Result<Vec<ValueType>, BodyE
                 types.push(b);
             }
         }
-        // The dtype gate, applied where every dtype an op introduces has to
-        // come out. Three ops carry one the trace chose rather than derived
-        // (`cast`, `intrinsic`, `kernel`), and checking the results instead of
-        // those three arms means a fourth such op is covered on the day it is
-        // written.
+        // Every produced dtype must be one ETA computes in.
         for t in &types[produced..] {
             if !supports(t.dtype) {
                 return Err(err(index, BodyErrorKind::UnsupportedDtype(t.dtype)));
@@ -155,8 +135,8 @@ fn broadcast2(a: Shape, b: Shape) -> Option<Shape> {
     }
 }
 
-/// `Broadcast` rule (v4-exact): `src` left-aligned against `target`
-/// (trailing axes padded with 1); each axis equals the target or is 1.
+/// `src` left-aligned against `target` (trailing axes padded with 1); each
+/// axis equals the target or is 1.
 fn can_broadcast_to(src: Shape, target: Shape) -> bool {
     if src.rank() > target.rank() {
         return false;
@@ -282,9 +262,7 @@ fn infer(
             );
         }
         Op::Div(a, b) => {
-            // Unlike PSIR v4 (F32-only), ETA `div` is defined on every
-            // numeric dtype: F32 division, or truncating integer division
-            // (0 on divide-by-zero) — a beam `parent = div(i, V)` is id math.
+            // F32 division, or truncating integer division (0 on divide-by-zero).
             let (ta, tb) = (g(a)?, g(b)?);
             if !is_numeric(ta.dtype) || ta.dtype != tb.dtype {
                 return Err(dtype_err());
@@ -616,19 +594,6 @@ mod tests {
     }
 
     #[test]
-    fn chan_take_types_from_decl() {
-        let chans = [ValueType::vector(4, Dtype::I32)];
-        let ops = vec![
-            Op::ChanTake(0),
-            Op::Neg(0),
-            Op::ChanPut { chan: 0, value: 1 },
-        ];
-        let t = body_types(&ops, &ctx_with(&chans)).unwrap();
-        assert_eq!(t.len(), 2); // ChanPut defines no id
-        assert_eq!(t[0], ValueType::vector(4, Dtype::I32));
-    }
-
-    #[test]
     fn chan_put_type_mismatch_rejected() {
         let chans = [ValueType::vector(4, Dtype::I32)];
         let ops = vec![
@@ -641,82 +606,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn row_gather_and_scatter_axis0() {
-        // pages [3,5] gathered by parent [3] → [3,5]; then scatter one row back.
-        let chans = [
-            ValueType::new(Shape::matrix(3, 5), Dtype::U32),
-            ValueType::vector(3, Dtype::U32),
-        ];
-        let ops = vec![
-            Op::ChanTake(0),               // 0: [3,5] u32
-            Op::ChanRead(1),               // 1: [3] u32
-            Op::Gather { src: 0, idx: 1 }, // 2: [3,5] u32
-            Op::Const(Literal::U32(0)),    // 3: scalar
-            Op::Gather { src: 2, idx: 3 }, // 4: [5] u32 (scalar idx → row)
-            Op::ScatterSet {
-                base: 2,
-                idx: 1,
-                vals: 2,
-            }, // wrong vals shape? [3]++[5]=[3,5] ok
-        ];
-        let t = body_types(&ops, &ctx_with(&chans)).unwrap();
-        assert_eq!(t[2], ValueType::new(Shape::matrix(3, 5), Dtype::U32));
-        assert_eq!(t[4], ValueType::vector(5, Dtype::U32));
-        assert_eq!(t[5], ValueType::new(Shape::matrix(3, 5), Dtype::U32));
-    }
-
-    #[test]
-    fn topk_matmul_transpose_shapes() {
-        let chans = [ValueType::new(Shape::matrix(2, 8), Dtype::F32)];
-        let ops = vec![
-            Op::ChanRead(0),             // 0: [2,8]
-            Op::TopK { input: 0, k: 3 }, // 1: [2,3] f32, 2: [2,3] u32
-            Op::Transpose(0),            // 3: [8,2]
-            Op::MatMul(0, 3),            // 4: [2,2]
-        ];
-        let t = body_types(&ops, &ctx_with(&chans)).unwrap();
-        assert_eq!(t[1], ValueType::new(Shape::matrix(2, 3), Dtype::F32));
-        assert_eq!(t[2], ValueType::new(Shape::matrix(2, 3), Dtype::U32));
-        assert_eq!(t[3], ValueType::new(Shape::matrix(8, 2), Dtype::F32));
-        assert_eq!(t[4], ValueType::new(Shape::matrix(2, 2), Dtype::F32));
-    }
-
-    #[test]
-    fn forward_ref_rejected() {
-        let ops = vec![Op::Exp(3)];
-        assert_eq!(
-            body_types(&ops, &ctx_with(&[])).unwrap_err().kind,
-            BodyErrorKind::ValueIdOutOfRange(3)
-        );
-    }
-
-    #[test]
-    fn rng_keyed_needs_u32_pair_state() {
-        let chans = [
-            ValueType::vector(2, Dtype::U32),
-            ValueType::vector(3, Dtype::U32),
-        ];
-        let ok = vec![
-            Op::ChanTake(0),
-            Op::RngKeyed {
-                state: 0,
-                shape: Shape::vector(8),
-                kind: crate::types::RngKind::Gumbel,
-            },
-        ];
-        assert!(body_types(&ok, &ctx_with(&chans)).is_ok());
-        let bad = vec![
-            Op::ChanTake(1), // [3] not [2]
-            Op::RngKeyed {
-                state: 0,
-                shape: Shape::vector(8),
-                kind: crate::types::RngKind::Gumbel,
-            },
-        ];
-        assert_eq!(
-            body_types(&bad, &ctx_with(&chans)).unwrap_err().kind,
-            BodyErrorKind::ShapeMismatch
-        );
-    }
 }

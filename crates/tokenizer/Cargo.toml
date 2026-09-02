@@ -1,6 +1,6 @@
 [package]
 name = "tokenizer"
-version = "0.4.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "BPE tokenizer for Pie, loaded from Hugging Face tokenizer.json or native tiktoken rank files. A leaf crate with no runtime dependencies."

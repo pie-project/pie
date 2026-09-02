@@ -2,11 +2,8 @@
 //! arena-relative bulk copies and hoist them ahead of the transforms.
 //!
 //! Both passes merge adjacent writes, and both do it through
-//! [`try_merge_bulk_extent_write`], because by the time anything here has run
-//! an `ExtentWrite` that *could* be merged is already a `BulkExtentWrite`. A
-//! second merger over the leftovers was carried here until it was measured:
-//! across all eighteen shipping contracts, every surviving `ExtentWrite` is
-//! strided, so its byte-run guard rejected all of them and it rewrote nothing.
+//! [`try_merge_bulk_extent_write`], because by the time anything here has
+//! run an `ExtentWrite` that could be merged is already a `BulkExtentWrite`.
 
 use std::collections::HashSet;
 
@@ -21,21 +18,13 @@ pub(super) fn coalesce_persistent_arena_writes(program: &mut LoadPlan) -> Result
     if program.schedule.is_empty() {
         return Ok(0);
     }
-    // Coalescing serves a device arena: one H2D covering adjacent buffers
+    // coalescing serves a device arena: one H2D covering adjacent buffers
     // beats one copy per tensor. A host-executed plan has the opposite
-    // interest — the streaming executor owns each buffer separately and
-    // frees it at its last use, and an instruction that addresses the arena
-    // by offset is the one thing it cannot honour. The backend says which
-    // world the plan is for.
-    //
-    // AND IT IS NO LONGER THE ONLY THING THAT SAYS SO. A device-targeted plan
-    // can now be compiled for a streaming execution too — a capped load whose
-    // finalized tensors go to a pinned tier rather than into an arena — and it
-    // says so by leaving this pass out of the pipeline entirely
-    // (`plan::compile_streaming`, `pass::Pass::for_arena`) rather than by
-    // pretending its backend is unknown, which would change the lowering with
-    // it. The guard below stays for the host-targeted plan, which reaches this
-    // pass through the ordinary pipeline and still wants nothing from it.
+    // interest: the streaming executor owns each buffer separately and
+    // frees it at its last use, and cannot honour an instruction that
+    // addresses the arena by offset. A device-targeted plan compiled for
+    // streaming execution instead leaves this pass out of the pipeline
+    // entirely, so the guard below only ever sees the host-targeted plan.
     if program.target.backend == BackendKind::Unknown {
         return Ok(0);
     }
@@ -92,9 +81,8 @@ pub(super) fn hoist_bulk_extent_writes(program: &mut LoadPlan) -> Result<usize> 
     }
     let old_instrs = program.instrs.clone();
     let mut pending_bulk: Vec<StorageInstr> = Vec::new();
-    // Everything that has to happen before a byte is written: the allocations,
-    // and the fills. A fill after the write it was meant to precede erases it,
-    // so `Fill` cannot be left in `rest` — `validate-fill-order` is the check.
+    // allocations and fills must happen before a byte is written: a fill
+    // after the write it was meant to precede erases it.
     let mut prologue: Vec<StorageInstr> = Vec::new();
     let mut rest: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
     let mut result: Vec<StorageInstr> = Vec::with_capacity(old_instrs.len());
@@ -145,12 +133,8 @@ pub(super) fn flush_pending_bulk(
             source.file_offset + source.stride.base_offset,
             *dest_offset,
         ),
-        // Nothing else is put in this list — the loop above routes every other
-        // instruction to `prologue` or `rest`. Named rather than left to a
-        // wildcard: an instruction added later that *does* belong here would
-        // otherwise sort silently to the end and defeat the merge it was added
-        // to take part in, where this way it fails to compile until someone
-        // decides what its sort key is.
+        // named rather than left to a wildcard, so a future variant that
+        // belongs here fails to compile rather than sorting silently to the end.
         StorageInstr::Allocate { .. }
         | StorageInstr::Fill { .. }
         | StorageInstr::ExtentWrite { .. }

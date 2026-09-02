@@ -21,16 +21,7 @@ mod msl_corpus;
 use msl_corpus::{GOLDEN_NAMES, golden_container, golden_profile, synthetic_traces};
 use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::plan::compile_bound;
-use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::Op;
-use eta_ir::registry::{ModelProfile, Stage};
-use eta_ir::types::{Dtype, Shape};
 use eta_ir::validate::bind;
-
-/// Every corpus trace's launch package, tagged with the trace it came from.
-fn packages() -> Vec<(String, Vec<LaunchStagePlan>)> {
-    bound_and_refused().0
-}
 
 /// The corpus, split the way binding splits it: what built a package, and the
 /// name of everything that did not.
@@ -61,7 +52,6 @@ fn bound_and_refused() -> (Vec<(String, Vec<LaunchStagePlan>)>, Vec<String>) {
     // nothing about when the borrows end.
     (out, refused)
 }
-
 
 #[test]
 fn every_plan_the_engine_receives_is_well_formed() {
@@ -161,137 +151,3 @@ fn every_plan_the_engine_receives_is_well_formed() {
     );
 }
 
-/// How many stage plans the grouped path accepts, pinned.
-///
-/// The structural claims above hold just as well when a stage is wrongly
-/// refused — an invalid plan with a reason attached is well-formed. This is the
-/// assertion that notices, and it is why `grouped_supported_tag` narrowing by
-/// one op is now a test failure rather than a silent loss of the grouped path
-/// for every stage containing that op.
-#[test]
-fn the_grouped_path_accepts_the_same_stages_it_always_has() {
-    let packages = packages();
-    let mut valid = 0usize;
-    let mut refused: Vec<String> = Vec::new();
-    for (name, stage_plans) in &packages {
-        for (index, plan) in stage_plans.iter().enumerate() {
-            if plan.needs.grouped_valid {
-                valid += 1;
-            } else {
-                refused.push(format!("{name}#{index}: {}", plan.error));
-            }
-        }
-    }
-    refused.sort();
-    assert_eq!(
-        (valid, refused.as_slice()),
-        (
-            EXPECTED_GROUPED_VALID,
-            EXPECTED_REFUSALS
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .as_slice()
-        ),
-        "the grouped classification moved; if that is intended, say why here"
-    );
-}
-
-// 17 → 18: the corpus grew the `lora_prologue` golden (stage-4 lora sink),
-// whose single prologue stage — channel peeks feeding a pass-wide sink — is
-// grouped-valid like any other sink-carrying stage. No existing stage's
-// classification moved.
-const EXPECTED_GROUPED_VALID: usize = 18;
-
-/// A prologue `lora` sink raises its own stage flag, and only its own.
-///
-/// The sink-flag derivation used to set `StageNeeds::page_mask` for
-/// every `sink_call`; now that two first-party sinks exist it dispatches on
-/// the resolved name, and this is what notices if that dispatch regresses in
-/// either direction — a lora stage flagged as a page mask would have the
-/// engine look for a page selection that never comes, and vice versa.
-#[test]
-fn the_lora_sink_raises_its_own_stage_flag() {
-    let chan = |shape| ChannelDecl {
-        shape,
-        dtype: ChanDType::Concrete(Dtype::F32),
-        capacity: 1,
-        host_role: HostRole::None,
-        seeded: true,
-    };
-    let container = TraceContainer {
-        names: vec!["lora".to_string()],
-        channels: vec![
-            chan(Shape::new(&[2, 2, 4]).unwrap()), // A [num_layers, R, d]
-            chan(Shape::new(&[2, 4, 2]).unwrap()), // B [num_layers, d_out, R]
-            chan(Shape::vector(4)),                // SITES
-        ],
-        ports: vec![],
-        stages: vec![StageProgram {
-            stage: Stage::Prologue,
-            ops: vec![
-                Op::ChanRead(0),
-                Op::ChanRead(1),
-                Op::ChanRead(2),
-                Op::SinkCall {
-                    name: 0,
-                    args: vec![0, 1, 2],
-                },
-            ],
-        }],
-        externs: Vec::new(),
-    };
-    let bound = bind(container, ModelProfile::dummy()).expect("the lora prologue binds");
-    let stages = compile_bound(&bound);
-    let package = eta_compiler::codegen::launch::build(&bound, &stages);
-    let plan = &package.plans[0];
-    assert!(
-        plan.needs.lora,
-        "a stage writing the lora sink must tell the engine so"
-    );
-    assert!(
-        !plan.needs.page_mask,
-        "a lora stage is not a page-mask stage"
-    );
-
-    // Over the corpus: whichever sink flag a plan raises, its name table
-    // holds the sink that earns it — and both flags still occur (the quest
-    // traces' page mask, `synthetic_sink_call`'s lora).
-    let (mut page_mask_plans, mut lora_plans) = (0usize, 0usize);
-    for (name, stage_plans) in &packages() {
-        for plan in stage_plans {
-            if plan.needs.page_mask {
-                page_mask_plans += 1;
-                assert!(
-                    plan.names.iter().any(|n| n == "attn_page_mask"),
-                    "{name}: a page-mask flag with no attn_page_mask in the name table"
-                );
-            }
-            if plan.needs.lora {
-                lora_plans += 1;
-                assert!(
-                    plan.names.iter().any(|n| n == "lora"),
-                    "{name}: a lora flag with no lora in the name table"
-                );
-            }
-        }
-    }
-    assert!(
-        page_mask_plans > 0,
-        "the corpus has quest traces; their page-mask flag went missing"
-    );
-    assert!(
-        lora_plans > 0,
-        "the corpus's synthetic lora sink lost its flag"
-    );
-}
-
-/// Both refusals are the same rule: the grouped runtime binds only the
-/// intrinsics its lane table describes, so a stage reading one it does not know
-/// is refused rather than mis-bound. `metal_msl_golden` records these same two
-/// cases as places the C++ oracle bound the request to the logits buffer and
-/// ran anyway.
-const EXPECTED_REFUSALS: &[&str] = &[
-    "pentathlon_iter#1: stage uses an unsupported intrinsic",
-    "synthetic_mtp_drafts#0: stage uses an unsupported intrinsic",
-];

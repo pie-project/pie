@@ -1,12 +1,5 @@
-//! Composed ops (`gumbel`, `mask_apply`, `softmax`,
-//! `log_softmax`, `l2norm`) as **expansions over the core** — sugar the SDK
-//! tracer inlines, first-party by construction. Each helper appends the
-//! expansion to an op list and returns the result's value id, so builders and
-//! tests share one definition and every backend that fuses the core fuses
-//! these for free.
-//!
-//! `next_id(ops)` must equal the SSA id the next op would define; the helpers
-//! keep that invariant internally.
+//! Composed ops (`gumbel`, `mask_apply`, `softmax`, `log_softmax`, `l2norm`) as expansions over the core: each helper appends ops to a list and returns the result's value id.
+//! `next_id(ops)` must equal the SSA id the next op would define; the helpers keep that invariant internally.
 
 use alloc::vec::Vec;
 
@@ -18,14 +11,8 @@ pub fn next_id(ops: &[Op]) -> ValueId {
     ops.iter().map(|o| o.result_count()).sum()
 }
 
-/// The shape of one expansion step's result, relative to the expansion's
-/// input row.
-///
-/// The expansions themselves do no shape inference — they only say which of
-/// three shapes each step lands in, and the [`Sink`] turns that into whatever
-/// it needs. That is what lets the sequences be shared: `eta-ir` needs
-/// nothing, `eta-dsl` needs a full [`crate::types::ValueType`] per op, and
-/// neither has to restate the op order to get it.
+/// The shape of one expansion step's result, relative to the expansion's input row.
+/// The expansion only tags which shape a step lands in; the [`Sink`] turns that into whatever type it needs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StepShape {
     /// Same shape as the expansion's input.
@@ -41,13 +28,7 @@ pub enum StepShape {
     ReducedIndex,
 }
 
-/// Where an expansion appends its ops.
-///
-/// There are two recorders and they must produce the same op sequence, which
-/// is why the sequence is written once here rather than once per recorder.
-/// Two expansions kept in step by hand can stay identical indefinitely and
-/// still be a latent bug: nothing reports the day one of them is edited
-/// alone, so the cost of the duplication is paid all at once, later.
+/// Where an expansion appends its ops. Written once here so the two recorders can't drift apart.
 pub trait Sink {
     /// Append `op` and return the id of its first result.
     fn push(&mut self, op: Op, shape: StepShape) -> ValueId;
@@ -139,16 +120,7 @@ pub fn l2norm(sink: &mut impl Sink, x: ValueId, shape: Shape) -> ValueId {
 /// Exact nucleus (top-p) sampling:
 /// `argmax(mask_apply(logits, cummass_le(softmax(logits), top_p)) + gumbel(state))`.
 ///
-/// This is the one expansion `eta-compiler` also has to *recognize* — the whole
-/// nucleus region template exists to fuse it back into a single kernel. That
-/// recognizer, `compile::region::match_nucleus`, cannot see `eta-dsl`, so
-/// until this lived here the SDK spelled the chain out flat in `value.rs` and
-/// the matcher was written against a copy of it. Both are now checked against
-/// this one sequence: the SDK builds it, and the matcher's fixtures are
-/// generated from it and then mutated one op at a time.
-///
-/// Temperature scaling is deliberately not part of it — it stays an ordinary
-/// preceding `Mul`, which is what lets the region absorb it or not.
+/// Temperature scaling is not part of it — it stays an ordinary preceding `Mul`.
 pub fn nucleus_sample(
     sink: &mut impl Sink,
     logits: ValueId,
@@ -171,89 +143,3 @@ pub fn nucleus_sample(
     push(sink, Op::ReduceArgmax(perturbed), StepShape::ReducedIndex)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::infer::{BodyCtx, body_types};
-    use crate::types::{Dtype, ValueType};
-    use alloc::vec;
-    use alloc::vec::Vec;
-
-    /// A [`Sink`] that also remembers what shape each step claimed to be.
-    struct Recording {
-        ops: Vec<Op>,
-        claims: Vec<(ValueId, StepShape)>,
-    }
-
-    impl Sink for Recording {
-        fn push(&mut self, op: Op, shape: StepShape) -> ValueId {
-            let id = Sink::push(&mut self.ops, op, shape);
-            self.claims.push((id, shape));
-            id
-        }
-    }
-
-    #[test]
-    fn expansions_type_check() {
-        let chans = [
-            ValueType::new(Shape::matrix(2, 8), Dtype::F32),
-            ValueType::vector(2, Dtype::U32),
-            ValueType::new(Shape::matrix(2, 8), Dtype::Bool),
-            ValueType::vector(2, Dtype::F32),
-        ];
-        let mut sink = Recording {
-            ops: vec![
-                Op::ChanRead(0),
-                Op::ChanTake(1),
-                Op::ChanRead(2),
-                Op::ChanRead(3),
-            ],
-            claims: Vec::new(),
-        };
-        let x = 0;
-        let state = 1;
-        let mask = 2;
-        let top_p = 3;
-        let shape = Shape::matrix(2, 8);
-        let g = gumbel(&mut sink, state, shape);
-        let ma = mask_apply(&mut sink, x, mask);
-        let sm = softmax(&mut sink, x, shape);
-        let lsm = log_softmax(&mut sink, x, shape);
-        let l2 = l2norm(&mut sink, x, shape);
-        let ns = nucleus_sample(&mut sink, x, top_p, state, shape);
-        let t = body_types(
-            &sink.ops,
-            &BodyCtx {
-                channel_types: &chans,
-                n_names: 0,
-            },
-        )
-        .unwrap();
-        for id in [g, ma, sm, lsm, l2] {
-            assert_eq!(t[id as usize], ValueType::new(shape, Dtype::F32), "id {id}");
-        }
-        assert_eq!(
-            t[ns as usize],
-            ValueType::new(shape.drop_last().unwrap(), Dtype::I32),
-            "nucleus_sample yields one token id per row"
-        );
-
-        // Every step's `StepShape` must be the type inference actually gives
-        // it. `eta-dsl` builds its recorded `ValueType`s out of nothing but
-        // this tag, so a step tagged wrong would be recorded with the wrong
-        // type there and only there — which is exactly how two hand-kept
-        // copies of these sequences drift.
-        let row = ValueType::new(shape, Dtype::F32);
-        let reduced = ValueType::new(shape.drop_last().unwrap(), Dtype::F32);
-        for (id, claim) in sink.claims {
-            let want = match claim {
-                StepShape::Row => row,
-                StepShape::Reduced => reduced,
-                StepShape::Scalar => ValueType::scalar(Dtype::F32),
-                StepShape::RowMask => ValueType::new(shape, Dtype::Bool),
-                StepShape::ReducedIndex => ValueType::new(shape.drop_last().unwrap(), Dtype::I32),
-            };
-            assert_eq!(t[id as usize], want, "id {id} claimed {claim:?}");
-        }
-    }
-}

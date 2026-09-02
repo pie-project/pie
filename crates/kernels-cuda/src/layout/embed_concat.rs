@@ -50,18 +50,15 @@ pub fn embed_concat(
             stated(OP, heads)?.arg(),
             stated(OP, width)?.arg(),
             stated(OP, vocab)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// The gather over an AFFINE-LANDED table: MLX 4-bit codes under bf16
-/// scales and zero points, dequantized for exactly the rows a token touches.
-/// The group width is recovered from the factor plane's own rectangle — the
-/// n-gram table groups by thirty-two where the rest of the tree groups by
-/// sixty-four, and the plane already says so.
+/// The gather over an affine-landed table: MLX 4-bit codes under bf16 scales
+/// and zero points, dequantized for exactly the rows a token touches. Group
+/// width is recovered from the factor plane's own rectangle.
 #[allow(clippy::too_many_arguments)]
 pub fn embed_concat_mlxu4(
     ctx: &Ctx,
@@ -94,9 +91,8 @@ pub fn embed_concat_mlxu4(
         ));
     }
     let width = y.width / heads;
-    // The factors plane is `[vocab, width / group]` bf16, bound as its BYTE
-    // rectangle: `bytes / rows / 2` factors a row, and the group divides the
-    // row width by construction.
+    // Factors plane is `[vocab, width / group]` bf16, bound as its byte
+    // rectangle: `bytes / rows / 2` factors a row.
     let factor_rows = nonzero(OP, "the factor plane's rows", scales.rows)?;
     let per_row = scales.width / 2;
     if factor_rows != vocab || per_row == 0 || !width.is_multiple_of(per_row) {
@@ -135,18 +131,16 @@ pub fn embed_concat_mlxu4(
             stated(OP, vocab)?.arg(),
             crate::jit::ArgValue::Ptr(seat.cell),
             crate::jit::ArgValue::Ptr(seat.hits),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )
 }
 
-/// The PLAIN embedding read (`layout.embed`) over an affine-landed table —
-/// the concatenating gather at one head, which is what a token embedding
-/// is. The bit width is the codes plane's own rectangle: a `[vocab, width]`
-/// table stores `width` bytes a row at eight bits and `width / 2` at four;
-/// the group is the factor plane's, exactly as the concat entry reads it.
+/// The plain embedding read (`layout.embed`) over an affine-landed table:
+/// the concatenating gather at one head. Bit width comes from the codes
+/// plane's own rectangle: `width` bytes a row at eight bits, `width / 2` at
+/// four.
 #[allow(clippy::too_many_arguments)]
 pub fn embed_mlx_affine(
     ctx: &Ctx,
@@ -221,8 +215,7 @@ pub fn embed_mlx_affine(
             stated(OP, vocab)?.arg(),
             crate::jit::ArgValue::Ptr(seat.cell),
             crate::jit::ArgValue::Ptr(seat.hits),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],
     )

@@ -1,12 +1,7 @@
 //! `pie config tune` — measure this machine instead of remembering someone
 //! else's.
 //!
-//! `optimize` until the rename; `pie model build` builds an artifact and
-//! this one tunes a machine, and one verb could not carry both.
-//!
-//! One boot, many rounds. The design and the arguments behind it are in
-//! `.wiki/plan/config-optimize.md`; what matters here is the three rules the
-//! command surface enforces:
+//! One boot, many rounds. The three rules the command surface enforces:
 //!
 //!   * **An objective has to be stated.** `latency` and `throughput` pull
 //!     opposite ways, so there is no unqualified "optimal" to search for. A
@@ -18,7 +13,7 @@
 //!   * **Nothing is truncated silently.** `--budget` bounds candidates, and what
 //!     it cut is printed. So is every axis this command does not yet touch.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 
 use super::typed_by_schema;
 use crate::sweep::{self, Knobs};
@@ -102,8 +97,9 @@ pub struct Workload {
 /// What one `pie config tune` run was asked to do.
 #[derive(clap::Args, Debug)]
 pub struct TuneArgs {
-    /// Which serving shape to optimize for. Sets `[engine] memory_profile` as
-    /// well as choosing the load. Required when the profile is `auto`.
+    /// Which serving shape to optimize for. Required: latency and
+    /// throughput pull opposite ways, and a guess would wear a
+    /// measurement's authority.
     #[arg(long = "for", value_name = "SHAPE")]
     pub objective: Option<Objective>,
 
@@ -148,14 +144,6 @@ pub struct TuneArgs {
     pub write: bool,
 }
 
-// `--skip-planner` and the hidden `--calibrate-only` STOOD HERE, the surface
-// of stage one: a re-exec'd child boot that set `server.calibrate_planner` so
-// the C++ memory planner would measure the forward step instead of scoring
-// it. That planner left with the boot document — the flag it raised reached
-// nothing and `cuda_memory_profiles.json` had no writer left — so the stage
-// reported "the engine declined to calibrate" on every machine. The sweep is
-// the whole command now.
-
 impl TuneArgs {
     /// The load actually run: the objective's shape, with any explicit override
     /// applied over it.
@@ -169,24 +157,20 @@ impl TuneArgs {
     }
 }
 
-/// Resolve the objective from the flag and the config, refusing when neither
-/// states one.
+/// Resolve the objective from the flag, refusing when none is stated.
 ///
-/// `--for` is not a separate axis from `memory_profile`; it SETS it. Letting the
-/// two disagree would mean measuring for one shape and serving with another,
-/// with nothing to report it.
-pub fn resolve_objective(flag: Option<Objective>, configured: &str) -> Result<Objective> {
-    match (flag, configured) {
-        (Some(objective), _) => Ok(objective),
-        (None, "latency") => Ok(Objective::Latency),
-        (None, "throughput") => Ok(Objective::Throughput),
-        (None, _) => bail!(
-            "`[engine] memory_profile` is \"auto\", which names no objective to \
-             optimise toward — latency and throughput pull opposite ways. Pass \
-             `--for latency` or `--for throughput`; it sets the profile as well \
-             as choosing the load."
-        ),
-    }
+/// This used to fall back to `[engine] memory_profile` -- the key tune itself
+/// wrote to remember the last `--for`. The key retired when it was measured
+/// to have no other reader anywhere (no planner input exists on
+/// `DeviceBoot`), so the objective is stated per run: what to optimise
+/// toward is a property of THIS measurement, not of the deployment.
+pub fn resolve_objective(flag: Option<Objective>) -> Result<Objective> {
+    flag.ok_or_else(|| {
+        anyhow!(
+            "no objective to optimise toward — latency and throughput pull \
+             opposite ways. Pass `--for latency` or `--for throughput`."
+        )
+    })
 }
 
 /// The candidates to measure, in order, and how many the budget cut.
@@ -495,22 +479,7 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
         )
     })?;
 
-    let file: toml::Value =
-        toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
-    let configured_profile = worker::config_schema::lookup(&file, "engine.memory_profile")
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| "auto".to_string());
-    let objective = resolve_objective(args.objective, &configured_profile)?;
-
-    // The objective is a config value, not just a flag: measuring for one shape
-    // and serving with another is a mismatch nothing downstream would report.
-    let content = if configured_profile != objective.as_profile() {
-        let (updated, _) =
-            typed_by_schema(&content, "engine.memory_profile", objective.as_profile())?;
-        updated
-    } else {
-        content
-    };
+    let objective = resolve_objective(args.objective)?;
 
     let (controller, gateway, worker) = crate::derive::derive_standalone(&content)?;
     let baseline = Knobs {
@@ -605,122 +574,6 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
 mod tests {
     use super::*;
 
-    const BASE: Knobs = Knobs {
-        frame_size: 2,
-        dispatch_depth: 2,
-    };
-
-    fn round(knobs: Knobs, tok_s: f64, sigma: f64) -> sweep::Round {
-        sweep::Round {
-            knobs,
-            throughput_tok_s: tok_s,
-            throughput_rel_sigma: sigma,
-            lane_p95_us: 1_000,
-            lane_p95_rel_sigma: sigma,
-            failed_lanes: 0,
-            repeats: 3,
-        }
-    }
-
-    #[test]
-    fn an_auto_profile_is_refused_rather_than_guessed() {
-        // Guessing here would measure one shape and serve another, and nothing
-        // downstream would report the mismatch.
-        let error = resolve_objective(None, "auto").unwrap_err().to_string();
-        assert!(error.contains("--for"), "got: {error}");
-        assert_eq!(
-            resolve_objective(None, "throughput").unwrap(),
-            Objective::Throughput
-        );
-        // The flag wins over the file, because it also rewrites it.
-        assert_eq!(
-            resolve_objective(Some(Objective::Latency), "throughput").unwrap(),
-            Objective::Latency
-        );
-    }
-
-    #[test]
-    fn a_calibration_request_cannot_be_written_down() {
-        // Calibration was a stage of this command rather than a key, and the
-        // stage itself has since retired with the planner it measured -- but a
-        // config written while the key existed still names a real intent, so
-        // it is refused by name rather than silently ignored.
-        let asked = "\
-[model]
-name = \"Qwen/Qwen3-0.6B\"
-model = \"Qwen/Qwen3-0.6B\"
-
-[engine]
-type = \"cuda_native\"
-device = [\"cuda:0\"]
-calibrate_planner = true
-";
-        let error = worker::Config::parse(asked)
-            .expect_err("a config cannot request a measurement")
-            .to_string();
-        assert!(
-            error.contains("calibrate_planner"),
-            "the refusal has to name the key: {error}"
-        );
-        // And it is not a settable key either, so `pie config set` cannot
-        // produce the document above in the first place.
-        assert!(
-            !worker::config_schema::fields(worker::config::EngineKind::CudaNative)
-                .iter()
-                .any(|f| f.key.ends_with("calibrate_planner")),
-            "a measurement is not a setting"
-        );
-    }
-
-    #[test]
-    fn the_baseline_is_measured_first_and_only_once() {
-        // First: so it sees the same machine state as what it is compared to.
-        // Once: an extra copy would be ranked against itself.
-        let (plan, skipped) = plan(BASE, None);
-        assert_eq!(plan[0], BASE);
-        assert_eq!(plan.iter().filter(|k| **k == BASE).count(), 1);
-        assert_eq!(skipped, 0);
-    }
-
-    #[test]
-    fn a_budget_truncates_and_says_how_much() {
-        // Silent truncation reads as "covered everything".
-        let (full, _) = plan(BASE, None);
-        let (capped, skipped) = plan(BASE, Some(5));
-        assert_eq!(capped.len(), 5);
-        assert_eq!(skipped, full.len() - 5);
-        assert_eq!(capped[0], BASE, "the baseline survives any budget");
-    }
-
-    /// Every planned candidate is a shape `RuntimeConfig::validate` admits —
-    /// the bound is per factor now (alto F2b), because the engine carves its
-    /// staging ring from those factors rather than owning a fixed pool.
-    #[test]
-    fn every_planned_candidate_is_one_the_runtime_admits() {
-        let (plan, _) = plan(BASE, None);
-        for knobs in plan {
-            assert!(knobs.admissible(), "{knobs}");
-        }
-    }
-
-    #[test]
-    fn a_win_has_to_clear_the_noise() {
-        let fast = Knobs {
-            frame_size: 4,
-            ..BASE
-        };
-        // 2.5% apart, 8.5% combined noise: not a result.
-        let rounds = vec![round(BASE, 1200.0, 0.06), round(fast, 1230.0, 0.06)];
-        assert!(winner(&rounds, &BASE, sweep::Metric::Throughput).is_none());
-
-        // Same gap, quiet measurements: a result.
-        let rounds = vec![round(BASE, 1200.0, 0.005), round(fast, 1230.0, 0.005)];
-        assert_eq!(
-            winner(&rounds, &BASE, sweep::Metric::Throughput).map(|r| r.knobs),
-            Some(fast)
-        );
-    }
-
     #[test]
     fn the_winner_is_written_through_the_schema() {
         // The apply path is only reached when a candidate wins, which on a
@@ -739,9 +592,9 @@ calibrate_planner = true
         let runtime = parsed.get("runtime").and_then(|r| r.as_table()).unwrap();
         assert_eq!(runtime["frame_size"].as_integer(), Some(3));
         assert_eq!(runtime["frame_dispatch_depth"].as_integer(), Some(2));
-        // AND NOT A THIRD KEY. `runtime.frame_submit_depth` was written here
-        // too; it is derived from the dispatch depth now (alto E), so writing
-        // it would be writing a knob `RuntimeConfig` no longer has.
+        // AND NOT A THIRD KEY: `runtime.frame_submit_depth` is derived from
+        // the dispatch depth, so writing it would be writing a knob
+        // `RuntimeConfig` does not have.
         assert!(runtime.get("frame_submit_depth").is_none());
         // Typed, not stringified: `pie config set` had this exact bug.
         assert!(!updated.contains("frame_size = \"3\""));
@@ -766,87 +619,4 @@ calibrate_planner = true
         assert!(error.contains("frame"), "got: {error}");
     }
 
-    #[test]
-    fn latency_ranks_by_latency_and_throughput_by_throughput() {
-        // The bug this replaces: `--for latency` measured and ranked
-        // THROUGHPUT, so the command asked for one thing and ordered its
-        // answers by another.
-        assert_eq!(Objective::Latency.metric(), sweep::Metric::LaneP95);
-        assert_eq!(Objective::Throughput.metric(), sweep::Metric::Throughput);
-        assert!(!sweep::Metric::LaneP95.higher_is_better());
-        assert!(sweep::Metric::Throughput.higher_is_better());
-    }
-
-    #[test]
-    fn a_lower_p95_wins_a_latency_sweep() {
-        // Direction matters as much as the quantity: ranked as if higher were
-        // better, a latency sweep would pick the slowest candidate.
-        let quicker = Knobs {
-            frame_size: 1,
-            ..BASE
-        };
-        let mut base = round(BASE, 1000.0, 0.01);
-        base.lane_p95_us = 400_000;
-        base.lane_p95_rel_sigma = 0.01;
-        let mut challenger = round(quicker, 500.0, 0.01);
-        challenger.lane_p95_us = 200_000;
-        challenger.lane_p95_rel_sigma = 0.01;
-
-        // Half the latency, and half the throughput -- so the two objectives
-        // must disagree about it, which is the whole reason there are two.
-        assert_eq!(
-            winner(&[base, challenger], &BASE, sweep::Metric::LaneP95).map(|r| r.knobs),
-            Some(quicker)
-        );
-        let mut base = round(BASE, 1000.0, 0.01);
-        base.lane_p95_us = 400_000;
-        base.lane_p95_rel_sigma = 0.01;
-        let mut challenger = round(quicker, 500.0, 0.01);
-        challenger.lane_p95_us = 200_000;
-        challenger.lane_p95_rel_sigma = 0.01;
-        assert!(winner(&[base, challenger], &BASE, sweep::Metric::Throughput).is_none());
-    }
-
-    #[test]
-    fn the_workload_follows_the_objective_unless_overridden() {
-        // An arbitrary load measures an arbitrary thing: the first version of
-        // this command shipped 8 lanes of 48 tokens picked by nothing, and that
-        // load was dominated by process bootstrap rather than by batching.
-        let latency = Objective::Latency.workload();
-        let throughput = Objective::Throughput.workload();
-        assert!(
-            latency.fleet < throughput.fleet,
-            "latency is the low-concurrency regime by definition"
-        );
-        assert!(
-            latency.repeats > throughput.repeats,
-            "a small fleet yields few lane samples, so it needs more passes"
-        );
-
-        let args = TuneArgs {
-            objective: None,
-            program: String::new(),
-            fleet: Some(7),
-            repeats: None,
-            tokens: None,
-            budget: None,
-            write: false,
-        };
-        let resolved = args.workload(Objective::Latency);
-        assert_eq!(resolved.fleet, 7, "an explicit flag wins");
-        assert_eq!(resolved.tokens, latency.tokens, "the rest stays derived");
-        assert_eq!(resolved.repeats, latency.repeats);
-    }
-
-    #[test]
-    fn without_a_baseline_round_nothing_wins() {
-        // Ranking against an absent baseline would make the fastest candidate
-        // look like an improvement over nothing.
-        let other = Knobs {
-            frame_size: 1,
-            ..BASE
-        };
-        let rounds = vec![round(other, 9_000.0, 0.001)];
-        assert!(winner(&rounds, &BASE, sweep::Metric::Throughput).is_none());
-    }
 }

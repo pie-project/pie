@@ -100,27 +100,10 @@ class EngineConfig:
     device: list[str] = field(default_factory=list)
     tensor_parallel_size: Optional[int] = None
     activation_dtype: Optional[str] = None
-    random_seed: Optional[int] = None
-    # How many KV pages a shell opens with. `None` is the backend's own
-    # default, which is what every ordinary run wants.
-    #
-    # It sits with the rest of the KV geometry (`kv_page_size`,
-    # `kv_cache_dtype`, `swap_pool_size`, `cpu_pages`) because it is one
-    # decision with them, and because `engine-vulkan` and `engine-wgpu` both
-    # take it. A boot key no config object can express is reachable only by
-    # hand-writing TOML, which means the harnesses that would most want it
-    # cannot ask.
-    #
-    # What wants it is a SMALL number. Two defects in `engine-vulkan`'s
-    # elastic pool were found by running the curated sweep and both lived in
-    # the growth path, which the default of 1024 pages barely enters; a sweep
-    # run at a handful of pages exercises it on every request.
-    kv_pages: Optional[int] = None
-    # Stated once for every engine rather than per backend: what "ready" and
-    # "shut down" mean is a property of the launch, not of the hardware.
-    # Durations carry their unit ("600s").
-    ready_timeout: Optional[str] = None
-    shutdown_timeout: Optional[str] = None
+    # `random_seed`, `kv_pages`, `ready_timeout` and `shutdown_timeout`
+    # STOOD HERE. All four retired from the Rust schema (no reader survived
+    # the subprocess era), and the worker refuses a retired key by name --
+    # so carrying a seat for one here would emit a config that cannot boot.
     options: dict = field(default_factory=dict)
 
 
@@ -317,10 +300,6 @@ def _engine_block(d: EngineConfig) -> dict:
     for name in (
         "tensor_parallel_size",
         "activation_dtype",
-        "random_seed",
-        "kv_pages",
-        "ready_timeout",
-        "shutdown_timeout",
     ):
         v = getattr(d, name)
         if v is not None:

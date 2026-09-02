@@ -26,6 +26,7 @@ members = [
     "trackb-h2o",
     "trackb-snapkv",
     "repetition-penalty",
+    "rs-speculative-decoding",
     "dry-repetition-penalty",
     "gumbel-watermark",
     "synthid-tournament-sampling",

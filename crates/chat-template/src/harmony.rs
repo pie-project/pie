@@ -257,12 +257,9 @@ impl Instruct for Harmony {
 }
 
 /// Reads the commentary channel's tool calls back out of generated text.
-///
-/// gpt-oss had a `NoopToolDecoder` here: this same module rendered a tool
-/// namespace into the developer turn and then nothing read the calls it
-/// produced. The span is the one the header above names —
-/// `<|channel|>commentary to=functions.{name}<|message|>{json}<|call|>` — with
-/// harmony's optional `<|constrain|>json` between the name and the message.
+/// The span read is
+/// `<|channel|>commentary to=functions.{name}<|message|>{json}<|call|>`,
+/// with harmony's optional `<|constrain|>json` between name and message.
 struct HarmonyToolDecoder {
     decoder: TokenizerDecoder,
     accumulated: String,

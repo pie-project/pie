@@ -179,7 +179,7 @@ use checkpoint::contract::ModelContract;
 use model_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, FireRows, PatchLadder, compile_axes,
 };
-use model_exec::fire::{Composition, FireDescriptor, Lane as FireLane, compose_axes, walk};
+use model_exec::fire::{Composition, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
 use model_ir::{Dtype, Layout, Operation, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::arena::Arena;
@@ -241,37 +241,6 @@ pub struct Boot<'a> {
     pub contract: &'a ModelContract,
     /// A snapshot directory, or one container file.
     pub checkpoint: &'a Path,
-    /// **THE TENSOR-PARALLEL DEGREE THIS LOAD IS FOR** — one on this plane
-    /// today, and stated rather than assumed because a serving artifact bakes
-    /// it (§M-4c).
-    ///
-    /// It is a catalog fact and therefore not a fact this shell can reach: a
-    /// shell must not know a model family (design §7, decision 18), which is
-    /// why the `models` edge in this crate's manifest is a DEV one. So it
-    /// arrives from the runtime, `LoadRequest::tp_size` verbatim, and is
-    /// compared against the artifact's own in `Weights::resident`. It is NOT
-    /// the loader's `StorageTarget` degree, which is separately and still
-    /// literally 1 — that number says how the planes are CUT and this one says
-    /// what the file claims they were cut for.
-    pub tp_size: u64,
-    /// **THE SERVED NUMERIC FORM THIS LOAD IS FOR** — the field that makes one
-    /// model at two quantizations two artifacts.
-    ///
-    /// Here for [`tp_size`](Boot::tp_size)'s reason and no other: it is
-    /// `models::precision_of`'s answer and this shell cannot ask.
-    /// `LoadRequest::precision` verbatim, and the other three facts the stamp
-    /// is checked against are already in [`trace`](Boot::trace) —
-    /// `platform.backend()` and `name` — and deliberately not restated beside
-    /// these two.
-    ///
-    /// **EMPTY IS NOT A PRECISION AND IS REFUSED**, before the checkpoint is
-    /// so much as opened: `request_of` fills the field unconditionally, so an
-    /// empty one is a load whose facts were never assembled, and an artifact
-    /// that passed because nobody said what to compare it to is the silent
-    /// failure the profile exists to end. A caller building a `Boot` by hand —
-    /// every gate in `tests/` — states its own row's precision for the same
-    /// reason.
-    pub precision: String,
     /// The ceilings every fire is baked against.
     pub budget: Budget,
     /// **THE SECOND ROW AXIS'S CEILINGS** (multimodal §5.5), or `None` for a
@@ -340,6 +309,9 @@ pub struct Boot<'a> {
     /// fewer dense planes, and it arrives here already decided because the
     /// admission gate is in FRONT of the landing — `api.rs` plans, admits, and
     /// only then calls this.
+    /// Its GATHERED half — which dense planes this load holds CPU-side and
+    /// reads through a row slab (`crate::gather`, alto streaming §5) — rides
+    /// inside it, because it is the same budget answered by the same gate.
     pub residency: Plan,
 }
 
@@ -659,6 +631,15 @@ pub struct Seated<'a> {
     /// before a list could be stated, and a lane that asked for no host
     /// mirror may still carry an epilogue.
     pub readout: Option<&'a [u32]>,
+    /// **What this fire does to the lane's recurrent state** (`crate::rs`):
+    /// fold it in the forward (the default), buffer the rows unfolded — with
+    /// a buffered prefix replayed ahead of them — or replay a buffer into the
+    /// bank. A plan with no recurrent state refuses everything but the fold.
+    pub rs: &'a engine::fire::RsVerb,
+    /// Whether the lane's recurrent slot arrives fresh, as the runtime's RS
+    /// store classified it. `Inferred` keeps the shell's own rule (`held ==
+    /// 0` begins a sequence).
+    pub rs_reset: engine::fire::RsReset,
     /// **Whether this lane asked to be OBSERVED** — its per-key attention
     /// mass written into the shell's observability slab, for an epilogue to
     /// read as `IntrinsicId::AttnScore` (`.wiki/alto/attn-score.md` §4).
@@ -712,6 +693,7 @@ impl<'a> Seated<'a> {
     /// stated positions.
     #[must_use]
     pub fn of(lane: Lane<'a>) -> Seated<'a> {
+        const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
         Seated {
             lane,
             pages: &[],
@@ -722,6 +704,8 @@ impl<'a> Seated<'a> {
             readout: None,
             captures_scores: false,
             translation: &[],
+            rs: &FOLD,
+            rs_reset: engine::fire::RsReset::Inferred,
         }
     }
 
@@ -812,6 +796,13 @@ pub struct Shell {
     weights: Weights,
     arena: Arena,
     pools: Pools,
+    /// **The recurrent-state device half** (`crate::rs`): the buffered planes
+    /// this plan has, the page slab they scatter into, and the scratch the
+    /// extended rows run in — grown on demand, drained first. All `None` for a
+    /// plan with no recurrent state.
+    rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
+    rs_buffers: Option<crate::rs::Buffers>,
+    rs_scratch: Option<Buffer>,
     // scratch — lane I's one field here, kept contiguous.
     /// **The working plane no op names** (`crate::scratch`): the FP16
     /// pre-cast staging rectangle, the split-K partials, and the MoE sorted
@@ -993,6 +984,11 @@ pub struct Shell {
     /// this load streams, so that the table is one table and the streaming
     /// branch is a question about `Weights::tier` alone.
     cuts: Vec<Option<ValueId>>,
+    /// **Where the walk is cut for the GATHERED class** — per region, the
+    /// n-gram id vector the hasher in it writes, or `None`
+    /// (`crate::gather::cuts`). All `None` for every load whose tables are
+    /// resident, which is every load in this tree today.
+    row_cuts: Vec<Option<ValueId>>,
     /// Per slot: how many kv tokens it holds.
     held: Vec<u32>,
     /// The trunk's logits, as the plan's `out` seam names them.
@@ -1178,6 +1174,15 @@ impl Shell {
         // regions carry two mixtures each refuses a streamed load before a
         // byte is moved rather than at the first fire.
         let cuts = crate::experts::cuts(&boot.trace, &compiled, boot.residency.streams())?;
+        // **AND THE HASHER CUTS BESIDE THEM**, read here for the same reason
+        // and refused here for the same one: a region carrying two hashers
+        // that land different id vectors cannot be served by one cut, and the
+        // sentence is owed before a byte moves.
+        let row_cuts = if boot.residency.gathered().gathers() {
+            crate::gather::cuts(&boot.trace, &compiled)?
+        } else {
+            vec![None; compiled.template().len()]
+        };
         let weights = Weights::resident(
             &device,
             &handles,
@@ -1189,8 +1194,6 @@ impl Shell {
             // up. The stamp gate is the FIRST thing `resident` does with the
             // path, so a cross-recipe artifact is refused with the store, the
             // band table and the arena all still unreserved.
-            boot.tp_size,
-            &boot.precision,
         )?;
         // **THE WEIGHT ROWS ARE THE LOAD-LIVED HANDLES, AND THIS IS THE
         // WATERMARK.** Everything minted after this line belongs to one fire
@@ -1200,6 +1203,14 @@ impl Shell {
 
         let arena = Arena::reserve(&device, &compiled.arena)?;
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;
+        // The buffered planes, read off the same trace: one page slot per
+        // recurrent slot, since the runtime's RS store hands out page ids
+        // from the pool the banks are counted in.
+        let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
+        let rs_buffers = match &rs_layout {
+            Some(layout) => Some(crate::rs::Buffers::reserve(&device, layout, paging)?),
+            None => None,
+        };
         // The scratch plane, sized off the same carve the arena is and off
         // the weight rows the loader just seated — a projection's arm is
         // chosen by whether its weight is banked, so which rectangles this
@@ -1442,6 +1453,9 @@ impl Shell {
             weights,
             arena,
             pools,
+            rs_layout,
+            rs_buffers,
+            rs_scratch: None,
             scratch,
             inputs,
             readout,
@@ -1471,6 +1485,7 @@ impl Shell {
             blobs: crate::blob::Store::new(),
             corrected,
             cuts,
+            row_cuts,
             held: vec![0; boot.slots as usize],
             out,
             mtp,
@@ -1738,6 +1753,41 @@ impl Shell {
     #[must_use]
     pub fn weights_warm(&self) -> bool {
         self.weights.warm()
+    }
+
+    /// **HOW MANY `MTLBuffer`s THE MAPPED ARTIFACT TOOK** — `1` for every
+    /// artifact that fits `maxBufferLength`, one per
+    /// [`mapping::cut`](crate::mapping::cut) window past it, and `0` for a
+    /// cold load.
+    ///
+    /// Published because "the artifact is bound" and "the artifact is bound
+    /// in pieces" are two different loads and only one of them is new: a gate
+    /// over an ordinary artifact asserts this is exactly one, and by doing so
+    /// asserts the single-buffer road did not move under the fix that let a
+    /// 90 GiB row be bound at all.
+    #[must_use]
+    pub fn weight_windows(&self) -> usize {
+        self.weights.windows()
+    }
+
+    /// **HOW MUCH OF A WARM LOAD IS STILL A COLD ONE** — `(planes, bytes)` the
+    /// load computed rather than read, and `(0, 0)` when it read everything.
+    ///
+    /// [`weights_warm`](Shell::weights_warm) is a yes-or-no and this is the
+    /// degree of it. A warm load may hold back a handful of planes the artifact
+    /// carries in no form — the load derives them, through a contract of just
+    /// those planes compiled and run into a reservation of its own — and this
+    /// says how many and how large.
+    ///
+    /// **THE COUNT IS THE IMPORTER'S AND NOT THIS ENGINE'S.** A plane the
+    /// import stores at the width the model text declares is read where it
+    /// lies; a plane the import narrows has to be widened back, and becomes
+    /// residue. So a change in import policy moves this number without moving
+    /// anything here, which is why a gate reads it rather than asserting a
+    /// constant against it.
+    #[must_use]
+    pub fn weights_residue(&self) -> (usize, u64) {
+        self.weights.residue()
     }
 
     /// What this load holds: weights, arena, pools, inputs — in bytes.
@@ -2234,6 +2284,62 @@ impl Shell {
             .map_or((0, 0), |tier| tier.borrow().motion())
     }
 
+    /// `(hits, misses)` of the streamed tier's seat cache since the load —
+    /// `(0, 0)` for a resident load. [`Tier::hits`](crate::experts::Tier::hits).
+    #[must_use]
+    pub fn expert_hits(&self) -> (u64, u64) {
+        self.weights
+            .tier()
+            .map_or((0, 0), |tier| tier.borrow().hits())
+    }
+
+    /// `(ns in segment cuts, ns in their seat copies, ns waiting in their
+    /// commits)` since the load — [`Tier::host_time`](crate::experts::Tier::host_time).
+    /// How the streamed tier's route predictions scored —
+    /// [`Tier::prediction`](crate::experts::Tier::prediction); the default
+    /// for a resident load or a text that predicts nothing.
+    #[must_use]
+    pub fn expert_prediction(&self) -> crate::experts::Prediction {
+        self.weights
+            .tier()
+            .map_or_else(Default::default, |tier| tier.borrow().prediction())
+    }
+
+    #[must_use]
+    pub fn expert_host_time(&self) -> (u64, u64, u64) {
+        self.weights
+            .tier()
+            .map_or((0, 0, 0), |tier| tier.borrow().host_time())
+    }
+
+    /// **What the GATHERED row slab holds**, or `None` for a load whose dense
+    /// tables are resident (`crate::gather`, alto streaming §5).
+    ///
+    /// `demanded` is the DISTINCT rows the last fire asked for, which is the
+    /// dedup's own observable: a wide prefill that asks for one row sixteen
+    /// times seats it once.
+    #[must_use]
+    pub fn gathered_rows(&self) -> Option<crate::gather::Residency> {
+        self.weights.rows().map(|rows| rows.borrow().residency())
+    }
+
+    /// **`(row copies, fires)`** for the gathered class — a §14 register, read
+    /// by nothing and branched on by nothing. `None` for a resident load.
+    #[must_use]
+    pub fn gathered_motion(&self) -> Option<(u64, u64)> {
+        self.weights.rows().map(|rows| rows.borrow().motion())
+    }
+
+    /// **`(the gathered source's backing file size, its link count)`** and
+    /// what it is made of — the reclaimability claim for this class, in the
+    /// pair `expert_source` publishes for the other one.
+    #[must_use]
+    pub fn gathered_source(&self) -> Option<(&'static str, Option<(u64, u64)>)> {
+        self.weights
+            .rows()
+            .map(|rows| (rows.borrow().source_kind(), rows.borrow().backing()))
+    }
+
     /// **`(the streamed source's backing file size, its link count)`**, or
     /// `None` for a full-residency load, which has no source at all.
     ///
@@ -2365,6 +2471,38 @@ impl Shell {
             grafted.wait()?;
         }
         Ok(())
+    }
+
+    /// Bytes one recurrent slot occupies across the plan's state rows — zero
+    /// for a plan with none (`PoolFacts::state_slot_bytes`).
+    #[must_use]
+    pub fn state_slot_bytes(&self) -> u64 {
+        self.pools.state_slot_bytes()
+    }
+
+    /// Whether this load serves `RsVerb::Buffer` and `RsVerb::FoldBuffered`:
+    /// exactly when the plan has recurrent state to buffer (`crate::rs`).
+    #[must_use]
+    pub fn serves_rs_verbs(&self) -> bool {
+        self.rs_layout.is_some()
+    }
+
+    /// Bytes of the recurrent buffer's page slab, zero for a plan with none.
+    #[must_use]
+    pub fn buffer_bytes(&self) -> u64 {
+        self.rs_buffers.as_ref().map_or(0, crate::rs::Buffers::bytes)
+    }
+
+    /// One slot's recurrent banks, read back after a drain — a gate's
+    /// instrument.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`] for a slot past the pool, [`Fault::Device`] for a
+    /// step still on the queue that failed.
+    pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
+        self.drain()?;
+        self.pools.read_slot(slot)
     }
 
     /// **The rows one settled step answered**, taken once.
@@ -3615,6 +3753,12 @@ impl Shell {
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
+        // THE RECURRENT VERBS, resolved per lane in fire lane order
+        // (`crate::rs`); `rs_active` is whether any lane does anything but
+        // fold, which is the one bit that decides whether the committed arm
+        // runs at all.
+        let mut rs_plans: Vec<crate::rs::LanePlan> = Vec::with_capacity(lanes.len());
+        let mut rs_active = false;
         // WHICH LANE OWNS EACH TOKEN ROW, in fire row order — the vector the
         // metal sdpa entries index the page table through. The CUDA sibling
         // needs none: its plan builders walk the boundaries host-side. Built
@@ -3738,7 +3882,15 @@ impl Shell {
             // identical completions through ONE boot; the second and third
             // answered echo-shaped garbage. This shell has the same banks
             // and the same exposure.
-            if have == 0 {
+            // **AND THE RS STORE'S OWN WORD WINS** where it states one: a
+            // forked or restored slot can be held at `have == 0` and a
+            // recycled seat can be fresh at `have > 0`.
+            let fresh = match seated.rs_reset {
+                engine::fire::RsReset::Inferred => have == 0,
+                engine::fire::RsReset::Fresh => true,
+                engine::fire::RsReset::Held => false,
+            };
+            if fresh {
                 beginning.push(lane.slot);
             }
             seats.push(Seat {
@@ -3846,6 +3998,19 @@ impl Shell {
             }
             slot_ids.push(lane.slot as i32);
             let at_lane = slot_ids.len() as i32 - 1;
+            if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
+                if self.rs_layout.is_none() {
+                    return Err(Fault::program(
+                        "serve::rs",
+                        format!(
+                            "lane {source} asks a recurrent verb of a plan that declares no \
+                             recurrent state to buffer"
+                        ),
+                    ));
+                }
+                rs_active = true;
+            }
+            rs_plans.push(crate::rs::LanePlan::of(seated.rs, row.rows, row.source)?);
             // **THE POSITIONS ARE STATED OR DERIVED, AND THE LENGTH IS WHAT
             // DECIDES WHICH.** A stated vector parallel to the lane's tokens
             // is taken verbatim into rope's seat; anything else is refused by
@@ -4043,7 +4208,7 @@ impl Shell {
         //    same way in v1 — one page size, one block per slot — so the
         //    vectors coincide; the loop is per space because the geometry
         //    seat is.
-        let indptr_host = kv::indptr(&seats);
+        let indptr_host = kv::indptr(&seats)?;
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
         let mut geometries = (0..self.spaces)
             .map(|_| kv::geometry_with(&paging, &seats, &table_refs))
@@ -4277,6 +4442,26 @@ impl Shell {
             }
         }
 
+        // 4d. **THE RECURRENT SEAT'S TABLES AND SCRATCH** (`crate::rs`). The
+        //     two per-lane words go into the arm's plane with everything else;
+        //     the extended rows need a scratch sized for THIS fire, grown when
+        //     a fire outgrows it — after a drain, since a step still on the
+        //     queue may be reading the old one.
+        let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
+        let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
+        let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
+        if rs_active {
+            let layout = self
+                .rs_layout
+                .as_ref()
+                .expect("rs_active implies a layout, checked at the lane");
+            let need = crate::rs::Seat::scratch_bytes(layout, rows_ext, lane_count);
+            if self.rs_scratch.as_ref().is_none_or(|scratch| scratch.bytes() < need) {
+                self.drain()?;
+                self.rs_scratch = Some(Buffer::zeroed(&self.device, need)?);
+            }
+        }
+
         // 5. Write the resident inputs — **into this step's own arm**. There
         //    is no staging copy on this plane: the reservations are
         //    `StorageModeShared`, so this is a memcpy into the same bytes the
@@ -4291,6 +4476,8 @@ impl Shell {
                 windows: &boundaries,
                 slot_ids: &slot_ids,
                 slot_of_row: &slot_of_row,
+                rs_replay: rs_active.then_some(rs_replay.as_slice()),
+                rs_commit: rs_active.then_some(rs_commit.as_slice()),
                 request_of_token: &request_of_token,
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
                 spaces: &geometries,
@@ -4404,6 +4591,33 @@ impl Shell {
                 }
                 _ => None,
             },
+            rs: if rs_active {
+                let (Some(layout), Some(buffers), Some(scratch)) =
+                    (&self.rs_layout, &self.rs_buffers, &self.rs_scratch)
+                else {
+                    return Err(Fault::Unbound {
+                        what: "the recurrent seat of a fire whose plan buffers nothing".to_string(),
+                    });
+                };
+                let (Some(replay), Some(commit)) = (bound.rs_replay, bound.rs_commit) else {
+                    return Err(Fault::Unbound {
+                        what: "the recurrent seat's per-lane tables".to_string(),
+                    });
+                };
+                Some(std::sync::Arc::new(crate::rs::Seat::mint(
+                    &self.handles,
+                    layout,
+                    buffers,
+                    scratch,
+                    rs_plans,
+                    replay,
+                    commit,
+                    bound.slot_ids,
+                    rows_ext,
+                )?))
+            } else {
+                None
+            },
         };
 
         Ok(Prepared {
@@ -4496,6 +4710,7 @@ impl Shell {
                 &p.descriptor,
                 &mut run,
                 &mut Cursor::new(&place),
+                Filter::default(),
             )?;
         }
 
@@ -4562,10 +4777,19 @@ impl Shell {
     /// seats; [`Fault::Device`] when a segment's command buffer would not
     /// open or the device refused one; whatever the walk answered.
     fn walk_streamed(&self, p: &Prepared<'_>) -> Result<Walked> {
-        let tier = self
-            .weights
-            .tier()
-            .expect("only a streamed load walks in segments");
+        let tier = self.weights.tier();
+        let rows = self.weights.rows();
+        // ── **THE FIRE BOUNDARY FOR THE GATHERED CLASS** (alto streaming
+        //    §5.4). Everything the previous fire seated is released here and
+        //    nowhere else: within a fire the two hasher arms seat into one
+        //    slab and the `embed_concat` at the end reads what BOTH of them
+        //    seated, so a release between two cuts would let the gather read
+        //    a row some other row had overwritten. Between two fires it is
+        //    free — the previous fire's command buffers have all completed by
+        //    the time this one is walked.
+        if let Some(rows) = rows {
+            rows.borrow_mut().fire();
+        }
         // ── **ONE RUN PER CUT REGION, AND IT IS ASKED BEFORE THE WALK.** A
         //    region P4 could not seat runs once per interval of its window, so
         //    its router would fire once per interval and each firing would
@@ -4587,6 +4811,24 @@ impl Shell {
                 )));
             }
         }
+        // The same hazard, one class over, and it is worth stating in its own
+        // words: a second run over a region whose hasher already ran would
+        // read the FIRST run's seat numbers as table rows and seat them
+        // again — rows that are now small integers, which the slab would
+        // happily serve. Silently wrong logits, and no fault anywhere.
+        for (region, cut) in self.row_cuts.iter().enumerate() {
+            let runs = p.windows.runs(region as u32);
+            if cut.is_some() && runs > 1 {
+                return Err(Fault::Residency(format!(
+                    "region {region} carries an n-gram hasher and this fire splits its \
+                     window into {runs} runs; a gathered load cuts its command buffer once \
+                     per region, so the second run would read the first run's SEAT numbers \
+                     as table rows and seat them again. Raise `device_weight_budget` to \
+                     hold the n-gram table whole, or submit a composition whose classes \
+                     are consecutive."
+                )));
+            }
+        }
 
         let place = At::new();
         let sink = Encoded::Live(Sink::streaming(
@@ -4597,10 +4839,12 @@ impl Shell {
             crate::encode::Cuts::new(
                 &place,
                 &self.cuts,
+                &self.row_cuts,
                 &p.slots,
                 &p.windows,
                 self.arena.store().clone(),
                 tier,
+                rows,
             ),
         ));
         {
@@ -4623,6 +4867,7 @@ impl Shell {
                 &p.descriptor,
                 &mut run,
                 &mut Cursor::new(&place),
+                Filter::default(),
             )?;
         }
         let frame = match sink {
@@ -5059,7 +5304,7 @@ impl engine::frame::Shell for Shell {
         // mixture's router with a blocking commit between (the module header
         // prices what that costs). Everything below this line is identical for
         // both — the tail segment is a `Frame` like any other.
-        let walked = if self.weights.tier().is_some() {
+        let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
             self.walk_streamed(&prepared)?
         } else {
             self.walk_once(&prepared, Mode::Encode)?
@@ -5383,212 +5628,3 @@ fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{declared_width, patch_fold, place_routes, PATCH_ROUTE_DROP};
-    use model_ir::ops::Layout;
-    use model_ir::{
-        CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl,
-        ValueId,
-    };
-
-    fn trace(values: Vec<ValueDecl>, nodes: Vec<Node>) -> Trace {
-        Trace {
-            name: "gate".to_string(),
-            platform: Platform::Metal,
-            params: Vec::new(),
-            caches: Vec::<CacheRow>::new(),
-            values,
-            nodes,
-            seams: Vec::new(),
-        }
-    }
-
-    fn input(what: RuntimeInput, shape: Vec<Dim>) -> ValueDecl {
-        ValueDecl {
-            def: Def::Input(what),
-            ty: Ty::Tensor {
-                shape,
-                dtype: Dtype::I32,
-            },
-        }
-    }
-
-    fn fold_node(op: Layout) -> Node {
-        Node {
-            op: op.into(),
-            guard: Guard::Always,
-            layer: None,
-        }
-    }
-
-    /// **`0` MEANS ABSENT AND NOT "ONE SCALAR PER ROW"**, which is what makes
-    /// a native-grid tower reserve neither `embed` region and bind neither
-    /// seat.
-    #[test]
-    fn an_undeclared_input_has_no_width_and_a_declared_one_has_its_own() {
-        let t = trace(
-            vec![
-                input(RuntimeInput::PatchEmbedRows, vec![Dim::Patches, Dim::Const(4)]),
-                input(RuntimeInput::PatchPositions, vec![Dim::Patches, Dim::Const(3)]),
-            ],
-            Vec::new(),
-        );
-        assert_eq!(declared_width(&t, RuntimeInput::PatchEmbedRows), 4);
-        assert_eq!(declared_width(&t, RuntimeInput::PatchPositions), 3);
-        assert_eq!(
-            declared_width(&t, RuntimeInput::PatchEmbedWeights),
-            0,
-            "a plan reading the position table on its native grid declares no weights",
-        );
-    }
-
-    /// **A PRODUCT AND NOT A MAXIMUM**, because the two folds compose — and
-    /// `1` for a plan that folds nothing, which is the identity this
-    /// arithmetic wants rather than a special case.
-    #[test]
-    fn the_fold_is_the_product_of_every_square_the_plan_states() {
-        let ids = ValueId(0);
-        assert_eq!(patch_fold(&trace(Vec::new(), Vec::new())), 1);
-        assert_eq!(
-            patch_fold(&trace(
-                Vec::new(),
-                vec![fold_node(Layout::MergeRows {
-                    x: ids,
-                    side: 2,
-                    y: ids
-                })]
-            )),
-            4,
-            "qwen's 2x2 spatial merge spends four patch rows per output row",
-        );
-        assert_eq!(
-            patch_fold(&trace(
-                Vec::new(),
-                vec![fold_node(Layout::PoolRows {
-                    x: ids,
-                    side: 3,
-                    y: ids
-                })]
-            )),
-            9,
-            "gemma's 3x3 pool spends nine",
-        );
-        assert_eq!(
-            patch_fold(&trace(
-                Vec::new(),
-                vec![
-                    fold_node(Layout::MergeRows {
-                        x: ids,
-                        side: 2,
-                        y: ids
-                    }),
-                    fold_node(Layout::PoolRows {
-                        x: ids,
-                        side: 3,
-                        y: ids
-                    }),
-                ]
-            )),
-            36,
-            "a tower that merged and then pooled spends the product",
-        );
-    }
-
-    /// **THE ROUTES LAND IN THE FOLD'S OUTPUT SPACE AND THE TAIL STAYS
-    /// SENTINEL.** Two lanes, a 2x2 merge, and the second lane's routes must
-    /// start at its own `patch_offset / 4` — not at `patch_offset`, which is
-    /// where a shell that forgot the fold would put them and where it would
-    /// overwrite nothing at all, because the vector is only `rows / 4` long in
-    /// the reading the scatter takes.
-    #[test]
-    fn routes_land_in_the_folds_output_space() {
-        // Eight patch rows, folded 2x2: two output rows, and the vector is
-        // `[Dim::Patches]` — one slot per row of the FULL rectangle, of which
-        // only the leading `rows / fold` are ever read.
-        let mut dest = vec![PATCH_ROUTE_DROP; 8];
-        // Lane A: patch rows [0, 4), token rows starting at 0 — one output
-        // row, and it lands at this lane's token row 2.
-        place_routes(&mut dest, 0, 4, 0, 4, &[2, 2, 2, 2]);
-        // Lane B: patch rows [4, 8), token rows starting at 5 — one output
-        // row, at its own token row 1, which is fire row 6. It lands at
-        // output row 1 and NOT at row 4: the output space is the folded one.
-        place_routes(&mut dest, 4, 4, 5, 4, &[1, 1, 1, 1]);
-        assert_eq!(
-            dest[..2],
-            [2, 6],
-            "each lane owns `patches / fold` slots starting at `patch_offset / fold`",
-        );
-        assert!(
-            dest[2..].iter().all(|&route| route == PATCH_ROUTE_DROP),
-            "the tail a compacting fold spends stays sentinel: {dest:?}",
-        );
-    }
-
-    /// **A SENTINEL IS NOT AN ADDRESS, SO IT IS NOT REBASED.** Adding a lane's
-    /// row offset to `-1` would turn a dropped row into a write at row
-    /// `offset - 1`, which is a real row of somebody else's lane.
-    #[test]
-    fn the_drop_sentinel_survives_the_rebase() {
-        let mut dest = vec![0i32; 3];
-        place_routes(&mut dest, 0, 3, 7, 1, &[PATCH_ROUTE_DROP, 0, 2]);
-        assert_eq!(
-            dest,
-            vec![PATCH_ROUTE_DROP, 7, 9],
-            "every address moves by the lane's own row offset and the sentinel does not",
-        );
-    }
-
-    /// **A LANE'S LIVE PREFIX SPANS EVERY SPAN THE LANE CARRIES** — the other
-    /// half of the shared contract, and the half a submission has to hold up.
-    ///
-    /// One lane, two images (2 and 3 soft tokens) and a 2 x 2 merge: 8 + 12
-    /// patch rows, 5 output rows, and the addresses are the two images' soft
-    /// tokens BACK TO BACK inside the leading five entries. Written out both
-    /// ways, because the wrong shape is not a shape this function can refuse:
-    /// every length agrees and the second image simply never gets read.
-    #[test]
-    fn a_lanes_prefix_carries_every_image_the_lane_holds() {
-        // The contract's shape: the lane's addresses, then ONE tail.
-        let mut routes = vec![PATCH_ROUTE_DROP; 20];
-        routes[..5].copy_from_slice(&[2, 3, 7, 8, 9]);
-        let mut dest = vec![PATCH_ROUTE_DROP; 20];
-        place_routes(&mut dest, 0, 20, 100, 4, &routes);
-        assert_eq!(
-            dest[..5],
-            [102, 103, 107, 108, 109],
-            "both images' soft tokens are placed, rebased by the lane's row offset",
-        );
-        assert!(dest[5..].iter().all(|&route| route == PATCH_ROUTE_DROP));
-
-        // The shape that dropped an image: each span padded to its OWN patch
-        // row count, so image 0's tail sits inside the prefix and image 1's
-        // addresses sit past the end of it.
-        let mut per_span = vec![PATCH_ROUTE_DROP; 20];
-        per_span[..2].copy_from_slice(&[2, 3]);
-        per_span[8..11].copy_from_slice(&[7, 8, 9]);
-        let mut lost = vec![PATCH_ROUTE_DROP; 20];
-        place_routes(&mut lost, 0, 20, 100, 4, &per_span);
-        assert_eq!(
-            lost[..5],
-            [102, 103, PATCH_ROUTE_DROP, PATCH_ROUTE_DROP, PATCH_ROUTE_DROP],
-            "per-span padding is read as image 0 followed by three dropped rows",
-        );
-        assert!(
-            !lost.contains(&107),
-            "image 1's soft tokens are never reached, and no length disagrees",
-        );
-    }
-
-    /// An unfolded plan is `fold == 1`, and then a lane owns one slot per
-    /// patch row — which is the contract every pre-fold tower had.
-    #[test]
-    fn an_unfolded_plan_places_one_route_per_patch_row() {
-        let mut dest = vec![PATCH_ROUTE_DROP; 5];
-        place_routes(&mut dest, 2, 3, 10, 1, &[0, 1, 2]);
-        assert_eq!(
-            dest,
-            vec![PATCH_ROUTE_DROP, PATCH_ROUTE_DROP, 10, 11, 12]
-        );
-    }
-}

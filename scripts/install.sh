@@ -2,11 +2,11 @@
 # pie installer — served at https://pie-project.org/install.sh
 #
 #   curl -fsSL https://pie-project.org/install.sh | bash
-#   curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda12.8 bash
-#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.4.0 bash
+#   curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda13.0 bash
+#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.5.0 bash
 #
 # Environment overrides:
-#   PIE_VERSION       Release tag (default: 0.4.0).
+#   PIE_VERSION       Release tag (default: 0.5.0).
 #   PIE_FLAVOR        metal (macOS arm64) | cuda{12.8,13.0} (Linux NVIDIA). Auto-detected when unset.
 #   PIE_CC            GPU compute capability for CUDA flavors, e.g. 90, 100
 #                     (auto-detected via nvidia-smi; selects the per-CC binary).
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 PIE_REPO="${PIE_REPO:-pie-project/pie}"
-PIE_VERSION="${PIE_VERSION:-0.4.0}"
+PIE_VERSION="${PIE_VERSION:-0.5.0}"
 PIE_INSTALL_DIR="${PIE_INSTALL_DIR:-${HOME}/.local/bin}"
 PIE_DOWNLOAD_BASE="${PIE_DOWNLOAD_BASE:-https://github.com/${PIE_REPO}/releases/download/${PIE_VERSION}}"
 PIE_DETECTED_FLAVOR=""
@@ -120,11 +120,10 @@ detect_cuda_flavor() {
   if [ "$major" -ge 580 ]; then
     PIE_FLAVOR_REASON="NVIDIA driver $driver supports CUDA 13"
     PIE_DETECTED_FLAVOR=cuda13.0
-  elif [ "$major" -ge 525 ]; then
-    PIE_FLAVOR_REASON="NVIDIA driver $driver supports CUDA 12"
-    PIE_DETECTED_FLAVOR=cuda12.8
   else
-    PIE_FLAVOR_REASON="NVIDIA driver $driver is older than 525 (CUDA 12 minimum)"
+    # CUDA 12 builds (driver floor 525) were published through 0.4.x and are
+    # no longer: pie ships the 13 ABI only, which needs the r580 driver.
+    PIE_FLAVOR_REASON="NVIDIA driver $driver is older than 580 (CUDA 13 minimum; CUDA 12 builds are no longer published)"
   fi
 }
 
@@ -161,8 +160,7 @@ fi
 assets_for() {
   case "$os/$arch/$1" in
     darwin/aarch64/metal)             echo "pie-aarch64-macos-metal.tar.gz" ;;
-    linux/x86_64/cuda12.8 | linux/x86_64/cuda13.0 \
-    | linux/aarch64/cuda12.8 | linux/aarch64/cuda13.0)
+    linux/x86_64/cuda13.0 | linux/aarch64/cuda13.0)
       # Per-compute-capability binary, selected from the detected (or
       # PIE_CC-overridden) compute capability.
       if [ -n "${PIE_CC:-}" ]; then
@@ -174,7 +172,7 @@ assets_for() {
 }
 
 candidates="$(assets_for "$PIE_FLAVOR")" || err \
-  "no prebuilt 'pie' binary for $os/$arch (flavor '${PIE_FLAVOR:-unset}'). Published builds: macOS arm64 -> metal; Linux x86_64/aarch64 -> cuda12.8 / cuda13.0 (NVIDIA GPU required). No CPU/Vulkan build is published.${PIE_FLAVOR_REASON:+ [$PIE_FLAVOR_REASON]}"
+  "no prebuilt 'pie' binary for $os/$arch (flavor '${PIE_FLAVOR:-unset}'). Published builds: macOS arm64 -> metal; Linux x86_64/aarch64 -> cuda13.0 (NVIDIA GPU required, driver r580+). No CPU/Vulkan build is published.${PIE_FLAVOR_REASON:+ [$PIE_FLAVOR_REASON]}"
 
 # CUDA flavors select per-compute-capability binaries; without a CC we have
 # nothing to download. Guide the user to set PIE_CC.

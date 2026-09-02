@@ -1,26 +1,8 @@
-//! The plan structs and their builders — the §6 payoff. What the old engine
-//! conjured behind `Ctx.raised` (`Fa2Decode`, `Fa2Prefill`, `MlaPlanned`,
-//! mutable `*PlanCache`s) is now four owned structs, each defined by an
-//! explicit plan op in the IR and built by a **pure function** of:
-//!
-//! - host copies of the geometry the IR names (`kv_indptr`, `kv_len`,
-//!   `qo_indptr`) — the planners walk their contents, and device handles
-//!   cannot be read host-side (see the MENLO-SEAM notes on each builder);
-//! - the shape facts of the attention being planned ([`Shape`]) — the
-//!   STRUCTURE the schedule is carved at — and the per-fire origin and
-//!   extent beside them ([`Live`]), which reach the device only through the
-//!   staged image;
-//! - the device facts ([`Device`]) and the workspace grant ([`Workspace`]) —
-//!   the engine owns where both come from;
-//! - the operator toggles ([`Toggles`]) — the engine resolves them from the
-//!   environment once ([`Toggles::from_env`]) and hands them in, so a
-//!   builder never reads the environment itself.
-//!
-//! A build stages the schedule's index vectors into `int_upload` and records
-//! byte offsets into the granted workspace. Nothing device-side happens at
-//! build time: the engine copies `int_upload` to `workspace.int_ptr` in the
-//! prepare phase (a [`stage`](DecodePlan::stage) call, or its own memcpy),
-//! and the capture-phase attention entries then only read.
+//! The plan structs and their builders: four owned structs, each built as a
+//! pure function of host geometry copies, shape facts ([`Shape`]/[`Live`]),
+//! device facts ([`Device`]), the workspace grant ([`Workspace`]), and the
+//! toggles ([`Toggles`]). A build stages index vectors into `int_upload`,
+//! copied to the device in the prepare phase.
 
 use crate::error::Error;
 
@@ -29,10 +11,9 @@ use crate::attn::{sched_decode, sched_mla, sched_prefill, sched_sm90};
 use crate::jit::{Ctx, refuse};
 use crate::tensor::Tensor;
 
-/// The device facts every builder takes as an argument (never probed inside
-/// a builder — purity is the design). Schedule math reads `num_sm` and
-/// `cc_major`; the fa2 launch geometry carried on the plan reads the two
-/// shared-memory bounds.
+/// The device facts every builder takes as an argument (never probed
+/// inside a builder). Schedule math reads `num_sm`/`cc_major`; the fa2
+/// launch geometry reads the two shared-memory bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Device {
     pub num_sm: u32,
@@ -42,8 +23,7 @@ pub struct Device {
 }
 
 impl Device {
-    /// The fallback facts the old plane assumed when the probe failed: an
-    /// L40S.
+    /// The facts assumed when the device probe fails: an L40S.
     pub const L40S: Self = Self {
         num_sm: 148,
         cc_major: 8,
@@ -55,7 +35,7 @@ impl Device {
     /// builders themselves never call it.
     #[must_use]
     pub fn probe(ctx: &Ctx) -> Option<Self> {
-        #[cfg(feature = "_cuda")]
+        #[cfg(feature = "cuda")]
         {
             let _ = ctx;
             Some(Self {
@@ -65,7 +45,7 @@ impl Device {
                 max_smem_per_block_optin: crate::jit::device::max_shared_memory_per_block_optin()?,
             })
         }
-        #[cfg(not(feature = "_cuda"))]
+        #[cfg(not(feature = "cuda"))]
         {
             let _ = ctx;
             None
@@ -73,11 +53,10 @@ impl Device {
     }
 }
 
-/// The workspace grant a plan is carved into: the engine's bounded pool,
-/// as base addresses plus byte bounds. The builders read only the bounds
-/// (an offset past them is a refusal at build time, not a device fault at
-/// fire time); the addresses ride the plan so the launches can resolve the
-/// staged offsets.
+/// The workspace grant a plan is carved into: base addresses plus byte
+/// bounds. Builders read only the bounds (an offset past them is a build-
+/// time refusal, not a device fault); addresses ride the plan for launches
+/// to resolve staged offsets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Workspace {
     pub int_ptr: u64,
@@ -88,34 +67,15 @@ pub struct Workspace {
 
 /// The kv-side shape a plan is built at. The attention entries restate
 /// `head_dim` and `kv_heads` from the IR op and refuse a plan built at a
-/// different shape — the old `agrees` check, kept.
+/// different shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shape {
-    /// **THE LANE COUNT THIS SCHEDULE IS CARVED FOR**, which is not always
-    /// the lane count the fire brought — see [`Live::requests`] for the twin
-    /// and `engine_cuda::run::Run::planning` for who raises this one and why.
+    /// The lane count this schedule is carved for, not always the count
+    /// this fire brought (see [`Live::requests`]).
     pub num_requests: u32,
-    /// **HOW FAR INTO THE FIRE'S LANE ORDER THIS SCHEDULE MAY REACH BEFORE
-    /// ITS OWN LANES BEGIN**, and `0` for every window that begins at the
-    /// fire's own first lane — which is every window a launch is handed
-    /// SLICED per-lane tables for.
-    ///
-    /// The schedules stage their request ids as [`Live::lane_offset`] `+ r`,
-    /// so a launch handed the fire's WHOLE page bounds, last-page fills and
-    /// mask spans reaches its own lanes and no one else's. This twin is the
-    /// STRUCTURE reading of that number, and the two need not be equal: it is
-    /// what `lane_offset + num_requests` bounds the protective page index at
-    /// (`fa2_abi::make_paged_kv`) and what sizes the absolutely-indexed
-    /// `o_indptr` (`sched_prefill::layout`), so the engine may raise it to a
-    /// ceiling its key spells while the staged ids keep naming this fire's
-    /// own lanes — the allocation between the two is a dead prefix, exactly
-    /// as that vector's own note in `sched_prefill::schedule` says. It is
-    /// never LESS than the live origin, and `lane_offset + num_requests` is
-    /// never less than the live end.
-    ///
-    /// The engine sets this only where the pointers beside it are the plane's
-    /// (`Run::plane_base`); everywhere else it is zero and every expression
-    /// below reads exactly what it read before this field existed.
+    /// How far into the fire's lane order this schedule may reach before
+    /// its own lanes begin; `0` unless raised to a bucket ceiling
+    /// ([`Live::lane_offset`] is the twin naming this fire's own lanes).
     pub lane_offset: u32,
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
@@ -136,63 +96,20 @@ impl Shape {
     }
 }
 
-/// **WHAT THIS FIRE ACTUALLY BROUGHT**, beside the [`Shape`] the schedule is
-/// CARVED AT — the second of the two channels every plan build now takes,
-/// and the whole reason the split exists.
-///
-/// `Run::schedule_shape` hashes the Debug image of every plan payload this
-/// fire built and exempts exactly one field: `int_upload`, the schedule's
-/// staged CONTENTS. A recorded body replays only while that hash holds — so
-/// everything a builder puts ON a payload (`info`'s offsets, grids and
-/// tiles, `workspace`, `shape`) has to be a function of the key, and
-/// everything that is a function of THIS FIRE has to reach the device
-/// through the staged image instead.
-///
-/// So the builders take both. [`Shape`] is STRUCTURE: what to allocate, how
-/// wide to pad, which tile to cut at — the numbers the engine raises to the
-/// bucket CEILING (every builder's lane count, and the row total beside it
-/// for the three that read one — decode is the one that does not), where they
-/// stop moving between fires of one key.
-/// `Live` is ORIGIN AND EXTENT: which fire lanes the staged request ids
-/// name, where the staged output positions start, how many of the padded
-/// work items are real. It rides in as a builder ARGUMENT and flows only
-/// into `int_upload`-bound staging; it is a field of no plan struct, so it
-/// reaches no hashed number. (`Debug` is derived because the sched
-/// `Request`s carry it and derive theirs — those live on the host side of a
-/// build and are on no payload.)
-///
-/// The precedent is the cascade fold's own pair: `fa2_abi` bakes
-/// `max_seq_len` into the params a capture freezes and hands the fold a
-/// `seq_len` POINTER beside it, aimed at the word the plan staged this fire.
-/// One quantity, two channels, one of them hash-stable.
-///
-/// **AND SINCE THE BUCKET CEILING THEY DO PART.** `Run::planning` raises
-/// [`Shape::num_requests`] to the bucket's lane ceiling for every schedule it
-/// carves for the bodies path, and the row argument beside it —
-/// the prefill builders' `total_tokens`, the latent builder's carved row
-/// count — to the same key's rows; it leaves [`requests`](Live::requests) and
-/// [`rows`](Live::rows) at what that fire brought. Everywhere else the two are still built side by side out of
-/// one window span. What survives as a pin is the direction: a carve is wider
-/// than the fire or the same, never narrower, and its lane INTERVAL contains
-/// the fire's — [`Shape::lane_offset`] may sit ahead of
-/// [`lane_offset`](Live::lane_offset) wherever the engine carves a windowed
-/// class at its own class ceiling, and `lane_offset + num_requests` still
-/// covers the live end. The row origin is the window's on both channels,
-/// because nothing raises one.
+/// What this fire actually brought, alongside the [`Shape`] the schedule is
+/// carved at. [`Shape`] is structure (hash-stable, what to allocate); `Live`
+/// is origin and extent (which lanes/rows this fire brought), and flows
+/// into staging only, never into a hashed plan field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Live {
     /// The lanes this fire actually brought, where [`Shape::num_requests`]
     /// is the count the schedule is carved for.
     pub requests: u32,
     /// Where the first of them sits in the fire's lane order — the number
-    /// the schedules add to every staged request id, and the dead prefix
-    /// `sched_prefill`'s staged `o_indptr` carries in front of its own.
-    /// [`Shape::lane_offset`] is the twin, and carries the argument for when
-    /// either is not zero.
+    /// the schedules add to every staged request id. [`Shape::lane_offset`]
+    /// is the twin.
     pub lane_offset: u32,
-    /// And where their first query row sits in the fire's row order
-    /// ([`Shape::row_offset`]'s twin) — `sched_prefill`'s unsplit `o_indptr`
-    /// is the one reader.
+    /// Where their first query row sits in the fire's row order.
     pub row_offset: u32,
     /// The rows this fire actually brought, where the builders'
     /// `total_tokens` argument is the row count the schedule is carved for.
@@ -228,7 +145,7 @@ pub struct DecodePlan {
     pub workspace: Workspace,
     pub shape: Shape,
     /// The sliding window this plan was carved for; the entries check the
-    /// stated window against it (the old `variant_agrees`).
+    /// stated window against it.
     pub window: Option<u32>,
     pub device: Device,
 }
@@ -241,8 +158,8 @@ impl DecodePlan {
 
     /// The op's restated facts must be the ones this plan was carved at —
     /// plan facts are engine-supplied, so disagreement is refused, not
-    /// asserted (the old `agrees`/`variant_agrees`). Decode states no kv
-    /// head count and no exact window: only the windowed/full reading has
+    /// asserted. Decode states no kv head count and no exact window: only
+    /// the windowed/full reading has
     /// to match.
     pub fn accepts(
         &self,
@@ -286,13 +203,12 @@ pub struct PrefillPlan {
     pub causal: bool,
     /// Whether the schedule kept its graph-shaped padding. A build asked to
     /// be capturable may fall back to an uncapturable schedule rather than
-    /// decline (the old retry, kept); the engine reads this before capture.
+    /// decline; the engine reads this before capture.
     pub graph_capturable: bool,
     /// `i32`, `[lanes + 1]`: each request's span of the mask bits
     /// `attention.masked` names. Bound only when this plan serves that op.
-    // MENLO-SEAM: the op states the mask bits themselves, but this span
-    // table has no IR seat — the engine derives it and binds it here at
-    // build time.
+    /// The span table itself has no IR seat; the engine derives and binds
+    /// it here at build time.
     pub mask_indptr: Option<Tensor>,
     pub device: Device,
 }
@@ -355,9 +271,8 @@ impl PrefillPlan {
     }
 }
 
-/// The sm90 prefill plan. The builder is real (the schedule and its staging
-/// are ported); the launcher that would consume it was never part of this
-/// lattice, so `attn::prefill_sm90` answers a typed refusal.
+/// The sm90 prefill plan. The builder is real, but no launcher consumes it
+/// yet; `attn::prefill_sm90` answers a typed refusal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrefillPlanSm90 {
     pub info: PrefillPlanSm90Info,
@@ -390,14 +305,8 @@ pub struct MlaPlan {
     pub float_bytes: usize,
     pub workspace: Workspace,
     pub num_heads: u32,
-    /// **THE ONE BUILDER INPUT THIS PAYLOAD DID NOT CARRY.** The latent
-    /// schedule's kv extents are causal or they are not (`sched_mla`'s
-    /// `effective`), and the engine derives the word per fire from the
-    /// window's own boundaries rather than seating it — so it is not
-    /// recoverable from any other field here, and the offsets beside it can
-    /// agree across a flip. Written so `Run::schedule_shape` can hash it;
-    /// nothing on the launch path reads it (the dense dispatch takes its
-    /// `causal` from the op it is, decode or prefill).
+    /// Not derivable from any other field here: decided per fire from the
+    /// window's own boundaries. Carried so `Run::schedule_shape` can hash it.
     pub causal: bool,
     pub device: Device,
 }
@@ -466,8 +375,7 @@ pub(crate) fn window_left(op: &'static str, window: Option<u32>) -> Result<i32, 
     }
 }
 
-/// The old `agrees`: a stated head width must be the one the plan was
-/// carved at.
+/// A stated head width must be the one the plan was carved at.
 fn planned_head_dim(op: &'static str, planned: u32, stated: u32) -> Result<(), Error> {
     if planned == stated {
         return Ok(());
@@ -500,23 +408,10 @@ fn some_requests(op: &'static str, shape: &Shape) -> Result<(), Error> {
     Ok(())
 }
 
-/// Builds the fa2 decode plan.
-///
-/// `max_grid_size` is a device fact the engine obtains from
-/// [`crate::attn::fa2::decode_max_grid_size`] (an occupancy probe, so it
-/// cannot live inside a pure builder); `toggles` is the engine's one
-/// [`Toggles::from_env`] read, for the same reason. `shape` says what to
-/// allocate and how wide to pad; `live` says which lanes this fire brought,
-/// and reaches the device only through the staged image ([`Live`] carries
-/// the argument, and every builder below takes the pair on those terms).
-///
-// MENLO-SEAM: `attention.plan_decode` in the IR names on-device geometry
-// (kv_indptr/kv_indices/last_page_len/kv_len); this builder walks
-// `kv_indptr`'s CONTENTS, so the engine binds a host copy beside the device
-// tensor — and the same duality serves `kv_len` here. kv_indices and
-// last_page_len are never read at build time (they ride the pool row into
-// the launch), and the fa2 decode schedule derives its extents from
-// kv_indptr alone, so the op-named `kv_len` goes unread on this builder.
+/// Builds the fa2 decode plan. `max_grid_size` is a device fact from an
+/// occupancy probe. `shape` says what to allocate; `live` says which lanes
+/// this fire brought. `kv_len` goes unread since the schedule derives its
+/// extents from `kv_indptr` alone.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_decode(
     kv_indptr: &[i32],
@@ -585,15 +480,8 @@ pub fn plan_decode(
 }
 
 /// Builds the fa2 prefill plan. When a graph-shaped schedule does not fit
-/// the workspace, the build falls back to an uncapturable one and records
-/// that on `graph_capturable` — the old retry, kept.
-///
-// MENLO-SEAM: as `plan_decode`, plus the qo side — the builder walks host
-// copies of both indptrs, bound by the engine beside the device tensors the
-// IR names. The fa2 prefill schedule, too, derives its extents from
-// kv_indptr alone, so the op-named `kv_len` goes unread here (the sm90
-// twin reads it); `mask_indptr` is the span table `attention.masked`'s
-// op-named bits ride with — engine-derived, see the field's seam note.
+/// the workspace, falls back to an uncapturable one and records that on
+/// `graph_capturable`. `kv_len` goes unread here, unlike the sm90 twin.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_prefill(
     qo_indptr: &[i32],
@@ -673,22 +561,13 @@ pub fn plan_prefill(
     })
 }
 
-/// **WHAT A GRAPH-SHAPED FA2 PREFILL WOULD PAD TO AT A STATED CEILING** —
-/// [`sched_prefill::graph_padding`], re-exported beside the builder that runs
-/// it because the ENGINE is the caller.
-///
-/// The shell sizes a plan's float grant before any fire arrives, and a grant
-/// too small for the schedule the bucket ceiling carves does not fail — it
-/// makes `plan_prefill` retry unshaped and answer `graph_capturable = false`,
-/// which is a body that never captures. So the sizing has to be the planner's
-/// own arithmetic rather than the engine's guess at it, and this is the door
-/// it comes through (`engine_cuda::inputs`'s `prefill_float_bytes`).
+/// What a graph-shaped fa2 prefill would pad to at a stated ceiling —
+/// re-exported so the engine can size a plan's float grant before any fire
+/// arrives, using the planner's own arithmetic rather than a guess.
 pub use crate::attn::sched_prefill::graph_padding as prefill_graph_padding;
 
-/// Builds the sm90 prefill plan — the schedule the `AttnPrefillPlanSm90`
-/// struct kind names. `kv_len` is the op's own named input now (per-request
-/// kv lengths in tokens); as with the indptrs, the builder walks the host
-/// twin the engine binds beside the device tensor.
+/// Builds the sm90 prefill plan. `kv_len` is the op's own named input
+/// (per-request kv lengths in tokens).
 #[allow(clippy::too_many_arguments)]
 pub fn plan_prefill_sm90(
     qo_indptr: &[i32],
@@ -731,17 +610,8 @@ pub fn plan_prefill_sm90(
 }
 
 /// Builds the latent-attention plan, shared by mla decode (`causal` false,
-/// one token per lane) and prefill. As on `plan_prefill_sm90`, `kv_len` is
-/// the op's named input, walked as the host twin beside qo_indptr and the
-/// kv element offsets.
-///
-/// `total_tokens` and `num_requests` are the CARVED pair — the row and lane
-/// counts the cluster split averages over, which the engine raises to the
-/// bucket's together and leaves at the fire's own together
-/// (`engine_cuda::Run::planning`). They are the whole of this payload's
-/// hashed half: `cluster_size` picks `num_blks_x`, `num_clusters` picks
-/// `num_blks_y`, and every offset beneath them is a constant of the device
-/// and the workspace.
+/// one token per lane) and prefill. `total_tokens` and `num_requests` are
+/// the carved row/lane counts the cluster split averages over.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_mla(
     qo_indptr: &[i32],
@@ -783,10 +653,8 @@ pub fn plan_mla(
 
 /// Copies a plan's staged int workspace to the device, async on the
 /// context's stream. Prepare-phase work: the source is pageable host
-/// memory, which CUDA graph capture would refuse — the engine runs this
-/// before capture, never inside it (the old plane pinned these bytes to
-/// smuggle the copy into capture; the prepare/capture split makes that
-/// machinery unnecessary).
+/// memory, which CUDA graph capture would refuse, so the engine runs this
+/// before capture and never inside it.
 pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result<(), Error> {
     if bytes.is_empty() {
         return Ok(());
@@ -794,7 +662,7 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
     if int_ptr == 0 {
         return Err(refuse(op, "the plan's int workspace is null"));
     }
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     {
         use cudarc::runtime::sys as rt;
 
@@ -818,19 +686,17 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
         }
         Ok(())
     }
-    #[cfg(not(feature = "_cuda"))]
+    #[cfg(not(feature = "cuda"))]
     {
         let _ = ctx;
         Err(crate::jit::runtimeless(op))
     }
 }
 
-// ─── the offset tables a plan build produces (was plan/info.rs) ────────────
+// ─── the offset tables a plan build produces ───────────────────────────────
 
-// The offset tables a plan build produces: every field is either a launch
-// shape fact or a byte offset into the int/float workspace the schedule was
-// staged for. These are the payloads the plan structs carry across the
-// prepare/capture boundary (design §6) — pure data, device-pointer-free.
+// Every field here is either a launch shape fact or a byte offset into the
+// int/float workspace the schedule was staged for.
 
 /// The fa2 decode schedule's workspace map. An offset is `Some` exactly
 /// when the schedule laid that table out; `None` seats resolve to the
@@ -871,9 +737,7 @@ pub struct PrefillPlanInfo {
     pub split_kv: bool,
 }
 
-/// The sm90 prefill schedule's workspace map. The builder exists so the
-/// `AttnPrefillPlanSm90` struct kind has an honest payload; the sm90
-/// launcher itself was never part of this lattice (see `attn::prefill_sm90`).
+/// The sm90 prefill schedule's workspace map.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PrefillPlanSm90Info {
     pub qo_tile_indices_offset: Option<u32>,

@@ -1,6 +1,6 @@
 [package]
 name = "model-ir"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The typed IR of a traced forward pass: op enums per family, the Operands def-use trait, ValueDecl (Def x Ty), Cond, the Plan container, and the post-trace validator. A leaf crate — pure data plus serde, no backend edges."
@@ -11,14 +11,8 @@ repository = "https://github.com/pie-project/pie"
 name = "model_ir"
 path = "src/lib.rs"
 
-# Contrast with old `model-ir`, whose manifest named every `kernels-*` platform
-# to reach their claim tables: coverage is a missing match arm now, and the
-# `Operands` impls are hand-written beside their own op enums — serde is the
-# only edge left.
 [dependencies]
-# `Dtype`, re-exported from `value.rs` at the path this crate has always spelled
-# it. A leaf beneath a leaf: it deps serde and nothing else, and it is here
-# because the checkpoint loader names the same element type and used to name it
-# a second time.
+# `Dtype`, re-exported from `value.rs` at the path this crate spells it. A leaf
+# beneath a leaf: the checkpoint loader names the same element type.
 dtype = { path = "../dtype" }
 serde = { version = "1.0", features = ["derive"] }

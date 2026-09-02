@@ -1,6 +1,6 @@
 [package]
 name = "transport"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Worker↔worker P2P KV-tensor data plane (RDMA) for pie."
@@ -9,34 +9,27 @@ repository = "https://github.com/pie-project/pie"
 
 [dependencies]
 thiserror = "2.0"
-# `PeerConn` (the pairing payload: peer id + exported handle + opaque connect
-# creds) crosses the control channel, so it derives serde — like the floor's
-# control-plane vocab (`cluster`/`transfer`).
+# `PeerConn` (peer id + exported handle + opaque connect creds) crosses the
+# control channel, so it derives serde.
 serde = { version = "1.0", features = ["derive"] }
 
-# KV layout + handle vocabulary live in `engine` (the dependency floor):
-# `engine::{KvLayout, KvLayoutKind, KvHandle, KvRegion, MemoryDomain}` — pure
-# -Rust types (the engine crate has no features at all, so the
-# `default-features = false` below is a no-op kept for the day it does).
+# The KV layout and handle vocabulary: `engine::{KvLayout, KvLayoutKind,
+# KvHandle, KvRegion, MemoryDomain}`. `engine` has no features, so
+# `default-features = false` is a no-op kept for the day it does.
 engine = { path = "../engine", default-features = false }
-# The element type a `KvLayout` names, from the leaf that owns it rather than
-# through `engine`. This crate wants a dtype and not an IR; it reached the
-# enum as `engine::model_ir::Dtype` only because the contract re-exported the
-# whole IR, and `model_ir::Dtype` was always a re-export of this.
+# The element type a `KvLayout` names, from the leaf that owns it: this crate
+# wants a dtype, not an IR.
 dtype = { path = "../dtype" }
-# `WorkerId` now lives on the interface leaf (`ids`); transport names a
-# transfer's src/dst by it. Plain serde, no internal deps.
+# `WorkerId`, which a transfer names its src/dst by.
 ids = { path = "../ids" }
 
 [features]
 # Cross-node RDMA/TCP/NVMe path via NIXL. Off by default: the on-device build
-# ships NIXL-free with only the `local` backend; the datacenter build enables it
-# and bundles NIXL (only cuda/rocm pull it). Enabling it turns on the `bindgen`
-# build-dependency, which generates the C-API bindings from the vendored
-# `backends/nixl/wrapper.h` and links the wheel's `libnixl_capi.so` from
+# ships NIXL-free with only the `local` backend. Enabling it turns on `bindgen`,
+# which generates the C-API bindings and links `libnixl_capi.so` from
 # `$NIXL_PREFIX` (see `build.rs`).
 nixl = ["dep:bindgen"]
 
 [build-dependencies]
-# Only pulled in under `--features nixl` (generates the NIXL C-API bindings).
+# Only pulled in under `--features nixl`.
 bindgen = { version = "0.72", optional = true }

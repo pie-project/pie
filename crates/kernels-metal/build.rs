@@ -1,20 +1,7 @@
-//! Stage the RNG preamble beside the shaders that `#include` it.
-//!
-//! **THE ONLY THING THIS SCRIPT DOES, AND IT IS A COPY.** `eta-compiler` owns
-//! the preamble's text and commits it once, under `include/`, where
-//! `tests/rng_contract.rs` regenerates and verifies it. Metal's runtime shader
-//! compiler resolves a `#include "..."` against the including file's directory
-//! and nothing else — `newLibraryWithSource:` has no header search path — so
-//! `ptir_m1_runtime.metal` can only reach the preamble if a copy sits in
-//! `kernels/ptir/` too. This writes that copy; `.gitignore` keeps it from
-//! becoming a second committed source.
-//!
-//! **IT IS NOT GATED, AND THE PREDECESSOR'S GATE IS WHY IT SAYS SO.** The
-//! build script this one restores staged the file only under a `native`
-//! feature. This crate no longer has one, and `sources.rs` reaches the staged
-//! copy with an unconditional `include_str!`, so a gate here would be a
-//! checkout that does not compile rather than a checkout without a device.
-//! The copy is cheap and the write is skipped when the bytes already match.
+//! Stages the RNG preamble beside the shaders that `#include` it, since
+//! Metal's shader compiler resolves `#include "..."` only against the
+//! including file's own directory. `eta-compiler` owns the source text
+//! (under `include/`); this writes an untracked copy into `kernels/ptir/`.
 
 use std::path::PathBuf;
 

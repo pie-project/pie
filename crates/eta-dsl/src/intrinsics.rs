@@ -1,9 +1,8 @@
-//! `intrinsics::*` — first-party stage-scoped values + model constants.
-//! Model constants are functions (a runtime value can't be a bare path in
-//! Rust; deviation approved). Stage-scoped values emit the IR's
-//! [`Op::IntrinsicVal`](eta_ir::op::Op::IntrinsicVal) with the
-//! trace-known shape/dtype the registry checks. `intrinsics::kernel::*` second-
-//! party surface: a minimal `attn_page_mask` sink now; full rollout deferred.
+//! `intrinsics::*`: first-party stage-scoped values and model constants
+//! (functions, since a runtime value can't be a bare path in Rust). Stage-
+//! scoped values emit the IR's
+//! [`Op::IntrinsicVal`](eta_ir::op::Op::IntrinsicVal). `intrinsics::kernel::*`
+//! is the second-party surface, minimal for now.
 
 use eta_ir::op::IntrinsicId;
 use eta_ir::types::{Dtype, Shape};
@@ -20,13 +19,9 @@ pub fn vocab() -> u32 {
 pub fn page_size() -> u32 {
     model::page_size()
 }
-/// The interpreter-visible activation dtype.
-///
-/// Named `activation_type` because the backend's activation dtype is
-/// late-bound, but this constant is not late-bound and never was: the
-/// materialization every intrinsic declares — and every tier-0 run produces —
-/// is F32. A backend storing bf16/fp8 does so beneath this; nothing in a trace
-/// observes that choice, so nothing here can vary with it.
+/// The interpreter-visible activation dtype. Always F32: a backend storing
+/// bf16/fp8 does so beneath this, and nothing in a trace observes that
+/// choice.
 #[allow(non_upper_case_globals)]
 pub const activation_type: Dtype = Dtype::F32;
 
@@ -44,11 +39,9 @@ pub fn logits() -> Tensor {
     single_row_reshape(t)
 }
 /// `intrinsics::mtp_logits(k)` — the model's `k` draft/future-token heads,
-/// decl'd `[k, vocab]` regardless of the embed row count. The contract:
-/// the classic `K` drafts vs `K+1` verify window are DISTINCT shapes — the CUDA engine's
-/// Stage-2 resolves the MtpLogits rows FROM THIS DECL (`mtp_draft_row .. +k`), so
-/// a `[K+1,V]` decl would request more rows than the head produces. Model-gated
-/// on `has_mtp_logits`. Mirrors the eDSL's `intrinsic_mtp_logits_matrix_dyn(k)`.
+/// decl'd `[k, vocab]` regardless of the embed row count. The classic `K`
+/// drafts vs `K+1` verify window are distinct shapes; a `[K+1,V]` decl would
+/// request more rows than the head produces. Model-gated on `has_mtp_logits`.
 pub fn mtp_logits(k: u32) -> Tensor {
     intrinsic_val(
         IntrinsicId::MtpLogits,
@@ -57,14 +50,10 @@ pub fn mtp_logits(k: u32) -> Tensor {
     )
 }
 /// `intrinsics::hidden(width)` — the residual stream at read-out (epilogue),
-/// `[n_out, width]`.
-///
-/// `width` is a parameter because the hidden size is not in
-/// [`ModelProfile`](eta_ir::registry::ModelProfile) and the SDK cannot derive
-/// it. `bind` deliberately checks only the rank and row count for this
-/// intrinsic, so a wrong width is not refused — it is carried into the plan's
-/// extents. Pass the model's hidden size; it is the same kind of declared
-/// ceiling as `mtp_logits`'s `k` and `attn_score`'s `kv_max`.
+/// `[n_out, width]`. `width` is a parameter because the hidden size is not
+/// in [`ModelProfile`](eta_ir::registry::ModelProfile); `bind` checks only
+/// rank and row count, so a wrong width is carried into the plan's extents
+/// rather than refused.
 pub fn hidden(width: u32) -> Tensor {
     let rows = current_rows().max(1);
     intrinsic_val(
@@ -94,51 +83,28 @@ pub fn value_head() -> Tensor {
 pub fn layer() -> Tensor {
     intrinsic_val(IntrinsicId::Layer, Shape::SCALAR, Dtype::U32)
 }
-/// `intrinsics::attn_score(planes)` — how much attention EVERY exported layer
+/// `intrinsics::attn_score(planes)` — how much attention every exported layer
 /// paid to each live KV position this fire, `[planes, ATTN_SCORE_KV_MAX]` F32.
-/// Readable at the **epilogue** and model-gated on `has_attn_score`.
-///
-/// **THE GRAPH WROTE IT; THIS READS IT** (`.wiki/alto/attn-score.md` §4).
-/// The rectangle is not computed here and it is not recomputed anywhere: the
-/// attention capture arm accumulated it as it ran, one plane per (exported
-/// layer, query head), and the epilogue is handed the whole thing as a device
-/// tensor. So there is no per-layer tap, no mid-forward stage, and no host in
-/// the loop — the three things the C++ lineage's `attn_score` needed and the
-/// three things alto's one-captured-graph fire cannot give it.
+/// Readable at the epilogue, model-gated on `has_attn_score`. Not computed
+/// here: the attention capture arm accumulated it as it ran, one plane per
+/// (exported layer, query head), handed to the epilogue as a device tensor.
 ///
 /// # The rectangle
 ///
-/// Row `layer * heads + head` is that (layer, head)'s distribution, and rows
-/// run LAYER-MAJOR so a program that declares fewer planes than the load
-/// exports reads a prefix of the layers rather than a stripe of the heads.
-/// Slot semantics per row:
-///
-///   - `i < kv_len` → the attention probability that (layer, head) assigned to
-///     KV position `i`, averaged over the observation window's query rows. The
-///     live prefix sums to 1;
-///   - `kv_len <= i < ATTN_SCORE_KV_MAX` → exactly `0.0`. A position that does
-///     not exist received no attention, so it sorts to the bottom of every
-///     eviction ranking without a sentinel — and the backend writes the whole
-///     row every fire, so this is never a stale tail.
+/// Row `layer * heads + head` is that (layer, head)'s distribution, rows run
+/// layer-major. Per row: `i < kv_len` is the attention probability assigned
+/// to KV position `i` (live prefix sums to 1); `kv_len <= i < ATTN_SCORE_KV_MAX`
+/// is exactly `0.0`, written every fire (never a stale tail).
 ///
 /// # Why per-head, and why the program folds
 ///
-/// Observability wants per-head (§4's table: "per-head is the better answer");
-/// the eviction papers want it head-folded. Folding in the kernel would make
-/// the second free and the first impossible, so the rectangle is per-head and
-/// a program that wants TOVA's or H2O's quantity means `mean` over its own
-/// heads — one in-graph reduction at the epilogue, on the device, which is
-/// where §4 puts every reduction anyway.
+/// Folding in the kernel would make head-folded free and per-head
+/// impossible, so the rectangle is per-head; a program wanting TOVA's or
+/// H2O's quantity means `mean` over its own heads, in-graph at the epilogue.
 ///
-/// # `planes` is declared, exactly like `hidden`'s width
-///
-/// The load's plane count (`exported attention layers × query heads`) is not
-/// in [`ModelProfile`](eta_ir::registry::ModelProfile) and the SDK has no host
-/// call for it, so the program states it and the backend refuses a claim
-/// larger than it exports — the same contract `hidden(width)` and
-/// `mtp_logits(k)` already carry. The WIDTH is not declared: see
-/// [`ATTN_SCORE_KV_MAX`](eta_ir::registry::ATTN_SCORE_KV_MAX) for why a slab
-/// pitch cannot be a per-program number.
+/// `planes` is declared, like `hidden`'s width, since the load's plane count
+/// is not in [`ModelProfile`](eta_ir::registry::ModelProfile). The width is
+/// not declared: see [`ATTN_SCORE_KV_MAX`](eta_ir::registry::ATTN_SCORE_KV_MAX).
 pub fn attn_score(planes: u32) -> Tensor {
     intrinsic_val(
         IntrinsicId::AttnScore,
@@ -176,30 +142,16 @@ pub mod kernel {
     use eta_ir::registry::SinkScope;
     use eta_ir::types::{Dtype, Shape, ValueType};
 
-    /// `envelope_dot(p_max)` — Quest page criticality for THIS layer, `[p_max]`
+    /// `envelope_dot(p_max)` — Quest page criticality for this layer, `[p_max]`
     /// F32 (Tang et al., arXiv:2406.10774). Model-gated on the backend's
-    /// `envelope_dot` kernel; a backend without per-page key envelopes refuses
-    /// the program at bind.
-    ///
-    /// Slot semantics, so a consumer can be written without guessing:
-    ///   - a page this request owns whose contents are final -> its criticality
-    ///     upper bound, `max` over kv heads of `Σ_qh Σ_d max(q·kmin, q·kmax)`;
-    ///   - a page the current forward is still filling -> `+inf`, i.e. always
-    ///     selected. Quest keeps the local window anyway, and a stale bound
-    ///     would be a silent mis-rank;
-    ///   - a slot past this request's page list -> `-inf`, so a `rank_le` never
-    ///     picks one.
-    ///
-    /// `p_max` is the program's own page ceiling; the backend refuses a request
-    /// whose page list is longer, rather than truncating it.
-    ///
-    /// Takes no argument even though the underlying op is
-    /// `KernelCall(envelope_dot, [query])`: the query it scores is the model's
-    /// projected query for this fire's last token, whose width
-    /// (`num_q_heads * head_dim`) is a backend constant ETA has no extent for.
-    /// The declared query is therefore a HANDLE — the backend binds the real
-    /// row — and the DSL emits it rather than asking an author to invent a
-    /// width.
+    /// `envelope_dot` kernel. Per slot: a finalized owned page gets its
+    /// criticality upper bound; a page still filling gets `+inf` (always
+    /// selected); a slot past the request's page list gets `-inf`. `p_max`
+    /// is the program's own page ceiling, refused rather than truncated if
+    /// exceeded. Takes no argument even though the op is
+    /// `KernelCall(envelope_dot, [query])`: the query's width is a backend
+    /// constant ETA has no extent for, so the declared query is a handle
+    /// the backend binds the real row onto.
     #[track_caller]
     pub fn envelope_dot(p_max: u32) -> Tensor {
         let query_ty = ValueType::new(Shape::vector(1), super::activation_type);
@@ -227,15 +179,12 @@ pub mod kernel {
         )
     }
 
-    /// `attn_page_mask(mask)` — a configuration sink: this
-    /// layer's attention consumes the page mask. Returns nothing.
-    ///
-    /// `mask` is `[p_max]`, one entry per page of the request's page list in
-    /// order; a nonzero entry keeps the page. It is recorded twice on purpose:
-    /// as an `Op::SinkCall` so the mask VALUE reaches the backend, and in the
-    /// session's sink list so T11 can check this call precedes the layer's
-    /// attention. Dropping the argument (as this did before it had a lowering)
-    /// makes the sink a no-op that still type-checks.
+    /// `attn_page_mask(mask)` — a configuration sink: this layer's attention
+    /// consumes the page mask. `mask` is `[p_max]`, one entry per page of
+    /// the request's page list in order; nonzero keeps the page. Recorded
+    /// both as an `Op::SinkCall` (so the value reaches the backend) and in
+    /// the session's sink list (so T11 can check it precedes the layer's
+    /// attention).
     #[track_caller]
     pub fn attn_page_mask(mask: impl AsTensor) {
         let span = Span::here();
@@ -253,21 +202,12 @@ pub mod kernel {
 
     /// `lora(a, b, sites)` — a pass-wide configuration sink: the whole forward
     /// applies the low-rank delta `W'x = Wx + B(Ax)` at the declared
-    /// projection sites. Returns nothing; legal only in the pass prologue
-    /// (T11 — a pass-wide sink must precede everything that consumes it).
-    ///
-    /// Three invariants carried from the design (`eta-ir-log.md` §6.5 —
-    /// doc not in tree; the three are stated in full below):
-    ///
-    /// * `a` is `[num_layers, R, d]` and `b` is `[num_layers, d_out, R]`, with
-    ///   the rank `R` trace-known — a different rank is a different traced
-    ///   program (a different bucket). The weight *contents* are data (fed
-    ///   through channels or computed in-graph), so swapping an adapter is
-    ///   re-seeding, never re-tracing.
-    /// * The LoRA scale `alpha/R` is folded into `b`'s contents — per-adapter
-    ///   data, so there is no scalar argument here.
-    /// * `sites` is a trace-known constant over the model's site vocabulary
-    ///   (q/k/v/o/up/..): placement is structure, weights are contents.
+    /// projection sites. Legal only in the pass prologue (T11). `a` is
+    /// `[num_layers, R, d]` and `b` is `[num_layers, d_out, R]`, rank `R`
+    /// trace-known (a different rank re-traces); the LoRA scale `alpha/R`
+    /// is folded into `b`'s contents; `sites` is a trace-known constant over
+    /// the model's site vocabulary (placement is structure, weights are
+    /// contents).
     #[track_caller]
     pub fn lora(a: impl AsTensor, b: impl AsTensor, sites: impl AsTensor) {
         let span = Span::here();

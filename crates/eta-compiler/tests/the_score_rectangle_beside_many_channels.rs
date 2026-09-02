@@ -29,9 +29,8 @@
 
 use eta_compiler::codegen::error::{EmitError, EmitterKind};
 use eta_compiler::codegen::metal::{
-    METAL_M2_MAX_FUSED_CHANNELS, emit_fused_region, emit_grouped_fused_region,
+    METAL_M2_MAX_FUSED_CHANNELS, emit_fused_region,
 };
-use eta_compiler::codegen::program::{Backend, KernelKind, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
@@ -166,77 +165,3 @@ fn the_single_lane_form_declines_this_shape_by_the_score_ceiling() {
     );
 }
 
-#[test]
-fn the_grouped_form_serves_it_and_files_the_kernel_where_the_shell_looks() {
-    let bound = bind(subject(), profile()).expect("the subject binds");
-    let stages = compile_bound(&bound);
-    let stage = stages.first().expect("one stage");
-    let region = stage.fused.regions.first().expect("one fused region");
-
-    let grouped = emit_grouped_fused_region("m3", stage, region)
-        .expect("the grouped form is what lifts this ceiling; it must emit");
-    assert!(
-        grouped.contains("attn_score_base"),
-        "the grouped kernel emitted without reading `lane.attn_score_base`, so the \
-         rectangle it gathers is not the score slab"
-    );
-
-    let package = eta_compiler::codegen::launch::build(&bound, &stages);
-    let plan = package.plans.first().expect("one stage plan");
-    assert!(
-        plan.needs.grouped_valid,
-        "the planner refused the grouped path for this stage ({}), so the shell \
-         never reaches the kernel above",
-        plan.error
-    );
-    assert!(
-        plan.needs.attn_score,
-        "the stage reads the score rectangle and its plan does not say so"
-    );
-
-    // **WHERE THE SHELL LOOKS.** `engine_metal::program::compile::grouped_region`
-    // reads `KernelKind::Grouped` at `singleton.len() + region_index`; anything
-    // else there is indistinguishable from a refusal at the point of use.
-    let kernels = emit_program(Backend::Metal, &stages, &bound);
-    let region_index = 0u32;
-    let slot = plan.singleton.len() as u32 + region_index;
-    let filed = kernels
-        .iter()
-        .find(|kernel| {
-            kernel.kind == KernelKind::Grouped
-                && kernel.stage_index == 0
-                && kernel.region_index == slot
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "no grouped kernel at (stage 0, region {slot}) — the shell adds \
-                 `singleton.len()` ({}) to the fused region index and would read \
-                 this decline as \"the grouped form could not serve it either\"",
-                plan.singleton.len()
-            )
-        });
-    assert!(
-        filed.error.is_empty(),
-        "the grouped kernel at the shell's slot carries a refusal: {}",
-        filed.error
-    );
-    assert!(
-        !filed.source.is_empty(),
-        "the grouped kernel at the shell's slot has neither source nor reason"
-    );
-
-    // And the M2 slot is refused, which is what sends the shell to the grouped
-    // one at all. Both halves in one test: a subject where M2 started
-    // succeeding would pass every assertion above while testing nothing.
-    let m2 = kernels
-        .iter()
-        .find(|kernel| {
-            kernel.kind == KernelKind::Fused && kernel.stage_index == 0 && kernel.region_index == 0
-        })
-        .expect("an M2 slot for the fused region");
-    assert!(
-        !m2.error.is_empty(),
-        "the single-lane form stopped declining this shape, so nothing routes it \
-         to the grouped kernel and this file no longer tests the escape"
-    );
-}

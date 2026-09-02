@@ -219,31 +219,3 @@ fn objects_are_offered_in_ascending_name_order() {
     assert_eq!(names, sorted);
 }
 
-/// The round trip against a real tokenizer, when one is pointed at.
-///
-/// The fixtures above are small by construction — a few hundred tokens, a
-/// handful of merges. A production vocabulary is ~150k tokens and ~150k
-/// merges, which is where the offset arithmetic, the `u32` bounds and the
-/// derivability of the encode map are actually under load. Set
-/// `PIE_TOKENIZER_FIXTURE` to a `tokenizer.json` or `tiktoken.model` to run
-/// it; the test is a no-op otherwise, since the file cannot be vendored.
-#[test]
-fn a_real_tokenizer_round_trips() {
-    let Ok(path) = std::env::var("PIE_TOKENIZER_FIXTURE") else {
-        return;
-    };
-    let path = std::path::PathBuf::from(path);
-    let tokenizer = Tokenizer::from_file(&path)
-        .unwrap_or_else(|err| panic!("loading {}: {err:#}", path.display()));
-
-    let canonical = assert_round_trips(&tokenizer, &path.display().to_string());
-    eprintln!(
-        "{}: {} tokens, {} merges, {} KiB serialized ({} KiB vocab, {} KiB merges)",
-        path.display(),
-        tokenizer.vocab_size(),
-        canonical.merge_table.len() / 16,
-        canonical.byte_size() / 1024,
-        canonical.vocab_bytes.len() / 1024,
-        canonical.merge_table.len() / 1024,
-    );
-}

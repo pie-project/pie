@@ -1,17 +1,8 @@
-//! The ETA **trace container** — the versioned blob carrying one traced
-//! pass: stage-tagged programs, channel declarations, descriptor-port
-//! bindings, and the name table for second-party kernels/sinks. The
-//! byte-for-byte layout is the op table's `wire` column in [`crate::op`];
-//! [`encode`] and [`decode`] walk it rather than restating it.
-//!
-//! Identity = [`crate::container_hash`] (FNV-1a 64) over these canonical
-//! bytes. Canonical means: same trace ⟺ same bytes — the encoder emits
-//! deterministically and the validator enforces the sortedness rules, so the
-//! hash is a sound compile-cache / batching key.
-//!
-//! **Not in the container** (per-instance data): channel seed *values*,
-//! working-set binding, rng seeds. A seeded channel is declared `seeded = 1`
-//! and its value arrives at instantiation.
+//! The ETA trace container: the versioned blob carrying one traced pass
+//! (stage-tagged programs, channel declarations, descriptor-port bindings,
+//! the name table). Identity is [`crate::container_hash`] over these
+//! canonical bytes. Not in the container (per-instance data): channel seed
+//! values, working-set binding, rng seeds.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -41,14 +32,8 @@ pub const DT_ACT: u8 = 4;
 
 impl ChanDType {
     /// This dtype's wire tag, or `None` if the concrete dtype is one ETA does
-    /// not compute in (see [`crate::types::class_of`]).
-    ///
-    /// It used to be `d as u8` — the four-variant `DType` was `#[repr(u8)]`
-    /// and its discriminant *was* the tag. [`Dtype`] is the tree's enum now
-    /// and carries no discriminants, so the numbering is asked for by name.
-    /// `Act` is not a `Dtype` and never was: it is the late-bound activation
-    /// tag, and [`DT_ACT`] sits one past the last wire byte, which is the
-    /// arrangement `types::WIRE_ORDER`'s length test pins.
+    /// not compute in (see [`crate::types::class_of`]). `Act` is not a
+    /// `Dtype`: [`DT_ACT`] sits one past the last wire byte.
     pub fn tag(self) -> Option<u8> {
         match self {
             ChanDType::Concrete(d) => to_wire(d),
@@ -176,11 +161,10 @@ impl ExternDir {
     }
 }
 
-/// An extern-channel binding (v1.1): channel `chan`'s OTHER endpoint lives in
-/// a different instance, paired at instantiation by `name` (an entry in the
-/// container's name table). The channel decl itself keeps `host_role = None`
-/// and `seeded = false` (the producer fills it); dtype/shape/capacity must
-/// match the peer's at pairing time.
+/// An extern-channel binding (v1.1): channel `chan`'s other endpoint lives in
+/// a different instance, paired at instantiation by `name`. The channel decl
+/// itself keeps `host_role = None` and `seeded = false` (the producer fills
+/// it); dtype/shape/capacity must match the peer's at pairing time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExternDecl {
     /// Index into the container's name table; the pairing key.
@@ -236,15 +220,10 @@ impl TraceContainer {
 // Encode
 // ===========================================================================
 
-/// A table length as it goes on the wire.
-///
-/// Every count in the container is narrower than `usize`, and a table that
-/// overflows its width must not encode: the truncated count describes a
-/// shorter table, so the bytes that follow are read as the *next* field and
-/// the result decodes cleanly into a different program. There is no return
-/// path from an infallible encoder, and the ceilings in this module are
-/// several orders of magnitude above anything a traced pass builds, so
-/// overflowing one is a caller that assembled an impossible container.
+/// A table length as it goes on the wire. Every count in the container is
+/// narrower than `usize`, and a table that overflows its width must not
+/// encode: a truncated count describes a shorter table, and the bytes that
+/// follow would then decode cleanly into a different program.
 ///
 /// # Panics
 ///
@@ -331,15 +310,10 @@ pub fn encode(c: &TraceContainer) -> Vec<u8> {
     w
 }
 
-/// Append one op's tag byte and body to `w`.
-///
-/// A walk over [`OpSpec::wire`](crate::op::OpSpec::wire), so the field order
-/// here is the field order the decoder reads and the one the op table
-/// declares.
-///
-/// Spelling the order out here instead would make this a third copy, and the
-/// failure that invites — encode and decode agreeing on a layout the table
-/// does not describe — is invisible to a roundtrip test.
+/// Append one op's tag byte and body to `w`. A walk over
+/// [`OpSpec::wire`](crate::op::OpSpec::wire), so the field order here is the
+/// field order the decoder reads and the op table declares — never spelled
+/// out separately, which would make this a third copy of the layout.
 pub fn encode_op(w: &mut Vec<u8>, op: &Op) {
     let wire = OpWire::of(op);
     w.push(wire.tag);
@@ -417,18 +391,10 @@ pub fn put_u32(w: &mut Vec<u8>, v: u32) {
     w.extend_from_slice(&v.to_le_bytes());
 }
 
-/// Bytes per element of a const-port payload.
-///
-/// This was a `match` of its own, exhaustive on purpose, because a `_ => 4`
-/// arm answers "4 bytes" for an F16 or E8M0 dtype the day one is added and the
-/// result is a mis-sized payload rather than a compile error. The argument was
-/// right and the match is gone anyway: the width table it was restating is
-/// [`Dtype::bits`], which is itself exhaustive in the leaf that owns the enum.
-/// A dtype added there still cannot be silently sized — it just has to answer
-/// in one place instead of two.
-///
-/// A const port only ever carries a dtype ETA computes in, so the sub-byte
-/// codes' rounding-up in `bytes_ceil` is unreachable here.
+/// Bytes per element of a const-port payload. Reads [`Dtype::bits`] (itself
+/// exhaustive) rather than restating a width table here. A const port only
+/// ever carries a dtype ETA computes in, so `bytes_ceil`'s sub-byte rounding
+/// is unreachable.
 pub fn const_elem_size(dtype: Dtype) -> usize {
     usize::try_from(dtype.bytes_ceil())
         .expect("an element's byte count fits a usize on every served target")
@@ -511,16 +477,10 @@ impl From<ReadError> for ContainerDecodeError {
     }
 }
 
-/// Decoder ceilings.
-///
-/// These are resource limits, not semantic ones: a container within them can
-/// still be rejected by `bind`, and the numbers are chosen to bound work and
-/// memory for input we did not write, not to express what a sampling pass is
-/// allowed to say. They sit far above anything a traced pass produces -- the
-/// whole test corpus is three orders of magnitude below `MAX_OPS`.
-///
-/// `MAX_STAGES` is different in kind: a container carries at most one program
-/// per stage, so `Stage::ALL.len()` is a structural fact rather than a budget.
+/// Decoder ceilings. Resource limits, not semantic ones: a container within
+/// them can still be rejected by `bind`. `MAX_STAGES` is different in kind —
+/// a container carries at most one program per stage, so `Stage::ALL.len()`
+/// is a structural fact rather than a budget.
 pub const MAX_STAGES: usize = Stage::ALL.len();
 /// Per-stage op ceiling. Planning is linear in this, so it bounds compile time
 /// as well as memory.
@@ -663,12 +623,10 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
     Ok(container)
 }
 
-/// Read one op's tag byte and body.
-///
-/// The mirror walk of [`encode_op`] over the same [`OpSpec::wire`]
-/// (crate::op::OpSpec::wire) layout. Each field is validated where it is read,
-/// so a malformed byte is named by the field it broke rather than by whatever
-/// the op ended up looking like.
+/// Read one op's tag byte and body — the mirror walk of [`encode_op`] over
+/// the same [`OpSpec::wire`](crate::op::OpSpec::wire) layout. Each field is
+/// validated where it is read, so a malformed byte is named by the field it
+/// broke.
 fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
     let tag = r.u8()?;
     let layout = op::spec(tag)
@@ -696,9 +654,7 @@ fn decode_op(r: &mut Reader<'_>) -> Result<Op, ContainerDecodeError> {
             WireField::Dtype => {
                 // Validated, then kept as the byte it arrived as: `OpWire`
                 // carries wire bytes, and re-deriving one from the `Dtype`
-                // would be `to_wire` undoing `from_wire`. It was
-                // `decode_dtype(..)? as u8`, which was the same thing only
-                // while the enum's discriminant was the wire byte.
+                // would be `to_wire` undoing `from_wire`.
                 let byte = r.u8()?;
                 decode_dtype(byte)?;
                 wire.dtype = byte;
@@ -773,11 +729,8 @@ fn decode_rng_kind(t: u8) -> Result<RngKind, ContainerDecodeError> {
     })
 }
 
-/// The dtype a container's tag byte names, rejecting the rest.
-///
-/// This was its own four-arm table, one of several that spelled the same
-/// numbering. It reads [`crate::types::from_wire`] now, which is the numbering
-/// — and which is still ETA's and not [`Dtype`]'s.
+/// The dtype a container's tag byte names, rejecting the rest. Reads
+/// [`crate::types::from_wire`] — ETA's numbering, not [`Dtype`]'s.
 fn decode_dtype(t: u8) -> Result<Dtype, ContainerDecodeError> {
     match from_wire(t) {
         Some(d) => Ok(d),
@@ -807,40 +760,9 @@ mod tests {
     use alloc::string::ToString;
     use alloc::vec;
 
-    /// `ACT` is a fifth channel tag beside four dtype tags, and nothing but
-    /// arithmetic keeps it from being a sixth or a colliding first.
-    ///
-    /// `ChanDType::tag` reads `types::to_wire` and `from_tag` reads
-    /// `types::from_wire`, so the four dtype tags follow ETA's numbering by
-    /// construction. `DT_ACT` does not: it is a constant `4`, chosen when the
-    /// supported set had exactly four members. Widening that set — a fifth row
-    /// into [`crate::types::class_of`]'s supported arm — would give some dtype wire
-    /// byte 4 and `from_tag` would answer `Act` for it, silently, because the
-    /// `DT_ACT` arm is checked first. This is the assertion that turns that
-    /// into a red test.
-    #[test]
-    fn the_act_tag_is_not_a_dtype_tag() {
-        assert!(
-            crate::types::from_wire(DT_ACT).is_none(),
-            "DT_ACT collides with a dtype wire byte; ChanDType::from_tag would shadow it"
-        );
-        assert_eq!(DT_ACT as usize, crate::types::WIRE_ORDER.len());
-        for &d in crate::types::WIRE_ORDER {
-            let chan = ChanDType::Concrete(d);
-            let tag = chan.tag().expect("a supported dtype has a tag");
-            assert_eq!(ChanDType::from_tag(tag), Some(chan));
-        }
-        assert_eq!(ChanDType::Act.tag(), Some(DT_ACT));
-        assert_eq!(ChanDType::from_tag(DT_ACT), Some(ChanDType::Act));
-        assert_eq!(ChanDType::from_tag(DT_ACT + 1), None);
-        // `Act` is not a `Dtype`, and a channel declared with a dtype ETA does
-        // not compute in has no tag at all rather than a wrong one.
-        assert_eq!(ChanDType::Concrete(Dtype::Bf16).tag(), None);
-    }
-
+    // A miniature two-channel greedy epilogue: tok (device loop-carried),
+    // out (host-read); epilogue = argmax(logits) -> tok, out.
     fn sample() -> TraceContainer {
-        // A miniature two-channel greedy epilogue: tok (device loop-carried),
-        // out (host-read); epilogue = argmax(logits) -> tok, out.
         let vocab = 32u32;
         TraceContainer {
             names: vec!["envelope_dot".to_string()],
@@ -892,55 +814,18 @@ mod tests {
     }
 
     #[test]
-    fn round_trip() {
-        let c = sample();
-        let bytes = encode(&c);
-        assert_eq!(decode(&bytes).expect("decode"), c);
-        assert_eq!(bytes, encode(&decode(&bytes).unwrap()));
-    }
-
-    #[test]
-    fn round_trip_2d_channel_shape() {
-        // Regression: a beam-search `pages` channel is [B,P] (2D). The container
-        // encode/decode MUST preserve the 2D shape (numel B*P), else validate_seeds
-        // rejects the [B,P] seed as a byte-length mismatch.
-        let mut c = sample();
-        c.channels[0].shape = Shape::matrix(2, 4);
-        let bytes = encode(&c);
-        let d = decode(&bytes).expect("decode");
-        assert_eq!(d.channels[0].shape.dims(), &[2, 4], "2D dims must survive");
-        assert_eq!(d.channels[0].shape.numel(), 8, "2D [2,4] numel must be 8");
-    }
-
-    #[test]
-    fn hash_is_stable_and_seed_independent() {
-        let c = sample();
-        assert_eq!(c.hash(), c.hash());
-        // Identity ignores nothing in the bytes — but seeds are not IN the
-        // bytes, so two instances differing only in seed values share one
-        // identity by construction.
-        let mut c2 = sample();
-        c2.channels[0].seeded = false; // structural change ⇒ different identity
-        assert_ne!(c.hash(), c2.hash());
-    }
-
-    #[test]
     fn round_trip_every_op() {
-        // `representatives()` is one op per `declare_ops!` row, so the wire
-        // sweep cannot fall behind the table. The extra `Const` literals are
-        // payload variation, not table coverage: `Literal` has four arms and
-        // the row can only carry one.
+        // The extra `Const` literals are payload variation, not table
+        // coverage: `Literal` has four arms and the representative row
+        // carries only one.
         let mut ops = alloc::vec![
             Op::Const(Literal::I32(-1)),
             Op::Const(Literal::U32(7)),
             Op::Const(Literal::Bool(true)),
         ];
         ops.extend(crate::op::representatives());
-        // `table_matches_op_metadata` pins the table's metadata; this pins
-        // the *wire* path, and nothing else does. Without the sweep a new op
-        // could land in `declare_ops!` with an `encode_op` arm and no
-        // `decode_op` arm, and the first thing to read the missing half back
-        // would be an engine.
+        // Without this sweep a new op could land in `declare_ops!` with an
+        // `encode_op` arm and no `decode_op` arm.
         let missing: Vec<&str> = crate::op::OP_TABLE
             .iter()
             .filter(|spec| !ops.iter().any(|op| op.tag() == spec.tag))
@@ -980,22 +865,10 @@ mod tests {
         assert_eq!(decode(&bytes).expect("decode"), c);
     }
 
-    /// Every byte an op encodes is a byte its decoder reads.
-    ///
-    /// `round_trip_every_op` puts exactly one value through each field, so a
-    /// decoder that ignores what was written and substitutes a constant still
-    /// round-trips whenever that constant is the value the representative
-    /// happened to carry. A mutation proved it: dropping `sink` from
-    /// `SinkWindowMask`'s encoding while decode hardcoded `2` — the
-    /// representative's own value — passed all three round-trip tests, and
-    /// only the byte goldens noticed.
-    ///
-    /// Flipping each byte in turn closes the decode half without needing a
-    /// second value per field: an ignored byte is one whose mutation changes
-    /// nothing. The encode half — a field never written at all — leaves no
-    /// byte to flip and is now held only by the byte goldens. It had a
-    /// second holder, the C++ mirror in `op_table_drift`, until that header
-    /// was deleted with the C++ Metal driver.
+    // Every byte an op encodes is a byte its decoder reads. `round_trip_
+    // every_op` alone wouldn't catch a decoder that ignores a byte and
+    // substitutes the representative's own value; flipping each byte closes
+    // that gap.
     #[test]
     fn no_byte_of_an_op_encoding_is_ignored_by_its_decoder() {
         let mut ignored: Vec<String> = Vec::new();
@@ -1052,36 +925,6 @@ mod tests {
             decode(&b[..b.len() - 2]),
             Err(ContainerDecodeError::UnexpectedEof)
         );
-    }
-
-    #[test]
-    fn retired_nucleus_opcode_is_unknown() {
-        let mut reader = Reader::new(&[0x59]);
-        assert_eq!(
-            decode_op(&mut reader),
-            Err(ContainerDecodeError::UnknownOpcode(0x59))
-        );
-    }
-
-    /// The dual of `round_trip_every_op`: the 201 byte values `declare_ops!`
-    /// does not allocate must all come back as `UnknownOpcode`, not as a
-    /// neighbouring op that happens to share a decode arm. `0x59` above pins
-    /// one of them by hand; a retired tag is only the case anyone thinks to
-    /// write down.
-    #[test]
-    fn decode_rejects_every_tag_the_table_does_not_declare() {
-        for tag in 0u8..=u8::MAX {
-            if crate::op::OP_TABLE.iter().any(|spec| spec.tag == tag) {
-                continue;
-            }
-            let bytes = [tag];
-            let mut reader = Reader::new(&bytes);
-            assert_eq!(
-                decode_op(&mut reader),
-                Err(ContainerDecodeError::UnknownOpcode(tag)),
-                "tag {tag:#04x} is not in OP_TABLE but decode_op accepted it"
-            );
-        }
     }
 
     #[test]

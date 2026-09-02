@@ -817,9 +817,9 @@ def _load_cudart():
     candidates.extend(
         [
             "libcudart.so",
-            "libcudart.so.12",
+            "libcudart.so.13",
             "/usr/local/cuda/lib64/libcudart.so",
-            "/usr/local/cuda-12.8/lib64/libcudart.so",
+            "/usr/local/cuda-13.0/lib64/libcudart.so",
         ]
     )
     last_error: Exception | None = None

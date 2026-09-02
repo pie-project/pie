@@ -4,12 +4,12 @@
 //! banks they read. One submodule per member of the family; the entries
 //! inside keep one entry per IR variant.
 
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 mod dense;
 
 pub mod gemm;
 
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 mod gemv;
 
 /// The correction class: `y += B[a]·(A[a]·x)` over a routed adapter bank.

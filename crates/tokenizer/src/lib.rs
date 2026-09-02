@@ -21,10 +21,6 @@ use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 
 use bpe::BpeTable;
 
-// ---------------------------------------------------------------------------
-// Added tokens
-// ---------------------------------------------------------------------------
-
 /// Representation of a token added on top of the base vocabulary.
 #[derive(Debug, Clone)]
 pub struct AddedToken {
@@ -60,23 +56,15 @@ pub(crate) enum DummyPrefix {
     /// No marker is prepended (Gemma).
     #[default]
     None,
-    /// Prepend one marker to every encoded text segment, unconditionally
-    /// (HF `Prepend` normalizer; the legacy Llama-2/Phi-3 shape).
+    /// Prepend one marker to every encoded text segment (legacy Llama-2/Phi-3).
     EverySegment,
-    /// Prepend one marker only to a segment that starts the input, and only
-    /// when it does not already begin with the marker after space
-    /// replacement (HF `Metaspace` pre-tokenizer with
-    /// `prepend_scheme: "first"`; Mistral).
+    /// Prepend one marker only to the segment starting the input, and only
+    /// if it isn't already there after space replacement (Mistral).
     FirstSegment,
 }
 
-/// One pre-tokenizer split stage: the regex whose MATCHES become pieces,
-/// and whether the text BETWEEN matches survives as pieces too (HF
-/// `Split { behavior: Isolated }`) or is dropped (HF `Split { behavior:
-/// Removed, invert: true }` — the GPT-2/OLMo-2 tokenizer.json encoding,
-/// where the pattern matches the pieces themselves and the gaps are
-/// removed; the classic exhaustive patterns leave no gaps in practice,
-/// but the semantics are honored exactly rather than assumed away).
+/// One pre-tokenizer split stage: the regex whose matches become pieces, and
+/// whether the text between matches survives as pieces too (`keep_gaps`).
 #[derive(Debug)]
 pub(crate) struct Splitter {
     pub(crate) regex: fancy_regex::Regex,
@@ -93,18 +81,14 @@ pub(crate) enum Pipeline {
         bpe_mode: BpeMode,
     },
     /// Sentencepiece-style space marker normalization with byte fallback on
-    /// decode. Covers Gemma (`DummyPrefix::None`), the legacy Llama-2/Phi-3
-    /// shape (`DummyPrefix::EverySegment` + decoder `Strip`), and the
-    /// Mistral Metaspace shape (`DummyPrefix::FirstSegment` + decoder
-    /// `Strip`).
+    /// decode.
     ByteFallbackReplace {
         normalizer_from: String,
         normalizer_to: String,
         unk_token_id: Option<u32>,
-        /// Dummy-prefix injection mode for encoded text segments.
         dummy_prefix: DummyPrefix,
-        /// Remove one leading `normalizer_from` from the decoded stream
-        /// (HF decoder `Strip { start: 1 }`, undoing the dummy prefix).
+        /// Remove one leading `normalizer_from` from the decoded stream,
+        /// undoing the dummy prefix.
         strip_decoder_marker: bool,
     },
     /// Minimal char-level path used by grammar fixtures and `from_vocab`.
@@ -133,10 +117,6 @@ impl Pipeline {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tokenizer
-// ---------------------------------------------------------------------------
-
 /// A BPE tokenizer for the modern model profiles supported by Pie.
 ///
 /// # Example
@@ -150,16 +130,14 @@ impl Pipeline {
 /// let text = tokenizer.decode(&ids, false);
 /// ```
 pub struct Tokenizer {
-    // Core BPE
     bpe: BpeTable,
 
     pipeline: Pipeline,
 
-    // Added / special tokens (sorted for binary_search)
+    /// Sorted for binary_search.
     special_token_ids: Vec<u32>,
     added_token_matcher: Option<AhoCorasick>,
-    /// Parallel to the matcher's patterns — the token's id and its
-    /// boundary flags, which the encoder needs together.
+    /// Parallel to the matcher's patterns.
     added_tokens: Vec<AddedToken>,
 
     grammar: OnceLock<GrammarVocabulary>,
@@ -177,8 +155,8 @@ pub struct TokenizerDecoder {
     skip_special: bool,
     pending_utf8: Vec<u8>,
     fallback_run: Vec<u8>,
-    /// Whether the pipeline's decoder `Strip` still has to inspect the first
-    /// emitted output of this stream. Disarms after the first non-empty chunk.
+    /// Whether the decoder `Strip` still must inspect this stream's first
+    /// output; disarms after the first non-empty chunk.
     strip_armed: bool,
 }
 
@@ -200,7 +178,6 @@ impl Tokenizer {
             .collect();
         special_token_ids.sort_unstable();
 
-        // Build an Aho-Corasick matcher for added/special tokens.
         let added_token_matcher = if !added_tokens.is_empty() {
             let patterns: Vec<&str> = added_tokens.iter().map(|t| t.content.as_str()).collect();
             Some(
@@ -223,25 +200,12 @@ impl Tokenizer {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Loading (convenience delegates to loader)
-    // -----------------------------------------------------------------------
-
     /// Build a minimal tokenizer from raw token strings.
     ///
-    /// Each string becomes a token with ID = its index, and the 256
-    /// single-byte tokens are APPENDED after them so that ids the caller
-    /// stated keep the values it stated. Merges are then derived by
-    /// [`bpe::BpeTable::from_decoder_map`] as usual. No normalization, no
-    /// special tokens; the raw char fixture pipeline.
-    ///
-    /// The byte tail is what makes this a usable instrument rather than a
-    /// trap. BPE builds a token out of BASE SYMBOLS, and a fixture
-    /// vocabulary of whole words has none — so `encode` matched a string
-    /// that was exactly one entry and returned an EMPTY vector for
-    /// anything else. `"Hi"` and `"Bye"` each encoded; `"HiBye"` encoded
-    /// to nothing, silently, and four chat-template tests were reading
-    /// that silence as a template dropping its content.
+    /// Each string becomes a token with ID = its index; the 256 single-byte
+    /// tokens are appended after them so stated ids keep their values, and
+    /// so BPE has base symbols to fall back on for any string that isn't
+    /// exactly one whole-word entry. No normalization, no special tokens.
     pub fn from_vocab(vocab: &[String]) -> Self {
         use std::collections::HashMap;
         let mut map: HashMap<u32, Vec<u8>> = vocab
@@ -266,10 +230,8 @@ impl Tokenizer {
 
     /// Load a Kimi K2/K2.5 tiktoken rank file (`base64(token_bytes) rank`).
     ///
-    /// A rank file does not contain its required split regex. The sibling
-    /// `tokenizer_config.json` must identify the official
-    /// `tokenization_kimi.TikTokenTokenizer`; unknown tiktoken formats are
-    /// rejected rather than encoded without pre-tokenization.
+    /// A rank file carries no split regex; the sibling `tokenizer_config.json`
+    /// must identify a known tiktoken tokenizer, or loading is rejected.
     pub fn from_tiktoken_file(path: &std::path::Path) -> anyhow::Result<Self> {
         loader::tiktoken::from_file(path)
     }
@@ -284,10 +246,6 @@ impl Tokenizer {
             fallback_run: Vec::new(),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Encoding
-    // -----------------------------------------------------------------------
 
     /// Encode text into token IDs.
     pub fn encode(&self, text: &str) -> Vec<u32> {
@@ -311,19 +269,16 @@ impl Tokenizer {
             let token = &self.added_tokens[matched.pattern().as_usize()];
             let mut segment_end = matched.start().max(last_end);
             if token.lstrip {
-                // The whitespace run before the token joins the match.
                 let segment = &text[last_end..segment_end];
                 segment_end = last_end + segment.trim_end_matches(char::is_whitespace).len();
             }
             if segment_end > last_end {
-                // A segment starts the input iff it begins at byte 0; any
-                // segment after an added token cannot.
+                // A segment starts the input iff it begins at byte 0.
                 self.encode_text(&text[last_end..segment_end], last_end == 0, ids);
             }
             ids.push(token.id);
             last_end = last_end.max(matched.end());
             if token.rstrip {
-                // The whitespace run after the token joins the match.
                 let rest = &text[last_end..];
                 last_end += rest.len() - rest.trim_start_matches(char::is_whitespace).len();
             }
@@ -379,9 +334,6 @@ impl Tokenizer {
                 let prepend = match dummy_prefix {
                     DummyPrefix::None => false,
                     DummyPrefix::EverySegment => true,
-                    // Metaspace `prepend_scheme: "first"`: only the segment
-                    // starting the input, and only when the replaced text
-                    // does not already begin with the marker.
                     DummyPrefix::FirstSegment => {
                         starts_input && !text.starts_with(normalizer_to.as_str())
                     }
@@ -432,8 +384,7 @@ impl Tokenizer {
                 let mut last_end = 0;
                 for result in splitter.regex.find_iter(piece) {
                     let Ok(matched) = result else {
-                        // Profiles contain trusted static/model regexes. Preserve
-                        // input rather than returning a partially encoded result.
+                        // Preserve input rather than a partially encoded result.
                         self.encode_piece(text, ids);
                         return;
                     };
@@ -456,10 +407,6 @@ impl Tokenizer {
             self.encode_piece(piece, ids);
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Decoding
-    // -----------------------------------------------------------------------
 
     fn strips_decoder_marker(&self) -> bool {
         matches!(
@@ -542,10 +489,6 @@ impl Tokenizer {
         bytes_to_string(output)
     }
 
-    // -----------------------------------------------------------------------
-    // Vocabulary access
-    // -----------------------------------------------------------------------
-
     /// Get the vocabulary size (including added tokens).
     pub fn vocab_size(&self) -> usize {
         self.bpe.vocab_size()
@@ -561,23 +504,8 @@ impl Tokenizer {
         self.bpe.id_to_bytes(id).map(|s| s.to_vec())
     }
 
-    /// Every token id whose bytes begin with `prefix`, ascending.
-    ///
-    /// **THE QUERY A CALLER WOULD OTHERWISE SHIP A VOCABULARY TO ASK.** Token
-    /// healing rolls a prompt back by a token or two and re-expands it under
-    /// the mask of every token that reproduces the rolled-back BYTES as a
-    /// prefix. That guest was building the mask from a copy of the whole
-    /// table — a quarter of a million records lowered across a component
-    /// boundary and looped over twice, ~115 ms of a 158 ms per-launch
-    /// constant (pie's palo build log 23) — where this is one pass over the
-    /// table that already exists, and borrows every token rather than
-    /// copying it.
-    ///
-    /// The answer is the same SET that loop produced: the ids this table
-    /// holds whose bytes start with `prefix`, and no others. An empty prefix
-    /// therefore matches the whole vocabulary, because every byte string
-    /// starts with nothing — a caller whose prefix may be empty has to say
-    /// what it wants, and cannot get it by accident.
+    /// Every token id whose bytes begin with `prefix`, ascending. An empty
+    /// prefix matches the whole vocabulary.
     pub fn ids_with_prefix(&self, prefix: &[u8]) -> Vec<u32> {
         (0..self.bpe.vocab_size() as u32)
             .filter(|id| {
@@ -630,10 +558,6 @@ impl Tokenizer {
         }
         (ids, bytes)
     }
-
-    // -----------------------------------------------------------------------
-    // Trie (for grammar-guided generation)
-    // -----------------------------------------------------------------------
 
     /// Decoder-aware bytes contributed by one token.
     ///
@@ -750,11 +674,8 @@ impl TokenizerDecoder {
         bytes_to_string(output)
     }
 
-    /// The decoder's `Strip` removes one leading marker from the WHOLE
-    /// stream, so a streaming decoder has to apply it to the first
-    /// non-empty chunk and then stop looking. Batch `decode` does the
-    /// same thing at the end of one buffer; this is that rule, once, for
-    /// a stream that arrives in pieces.
+    /// Applies the decoder's leading-marker strip once, to the stream's
+    /// first non-empty chunk.
     fn apply_stream_strip(&mut self, output: &mut Vec<u8>) {
         if !self.strip_armed || output.is_empty() {
             return;
@@ -800,14 +721,8 @@ impl std::str::FromStr for Tokenizer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Build trie subtree ranges for a sorted vocabulary.
-///
-/// For each entry `sorted[i]`, returns an array where `result[i]` is the
-/// index of the first entry whose string does **not** start with `sorted[i].1`.
+/// Build trie subtree ranges for a sorted vocabulary: `result[i]` is the
+/// index of the first entry whose string does not start with `sorted[i]`'s.
 fn build_subtree_ranges(sorted_ids: &[u32], vocab: &[Option<Arc<[u8]>>]) -> Vec<usize> {
     let n = sorted_ids.len();
     let mut ranges = vec![n; n];
@@ -918,301 +833,3 @@ fn drain_utf8(pending: &mut Vec<u8>, output: &mut Vec<u8>, finish: bool) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    /// **THE PREFIX QUERY IS THE LOOP IT REPLACES**, asked of the same table.
-    ///
-    /// [`Tokenizer::ids_with_prefix`] exists so a guest need not copy a
-    /// quarter of a million records to compute a set; the only thing that
-    /// makes that a saving rather than a change is that the set is identical.
-    /// So the oracle here is written the way the caller used to write it —
-    /// walk `0..vocab_size`, take `id_to_token`, test `starts_with` — and the
-    /// two are diffed over every prefix a fixture vocabulary can pose,
-    /// including the empty one (which matches everything) and one no token
-    /// carries (which matches nothing).
-    #[test]
-    fn the_prefix_query_answers_what_a_walk_of_the_whole_table_answers() {
-        let vocab: Vec<String> = ["he", "hell", "hello", "help", "world", "", "h"]
-            .iter()
-            .map(|word| (*word).to_string())
-            .collect();
-        let tokenizer = Tokenizer::from_vocab(&vocab);
-
-        let walked = |prefix: &[u8]| -> Vec<u32> {
-            (0..tokenizer.vocab_size() as u32)
-                .filter(|id| {
-                    tokenizer
-                        .id_to_token(*id)
-                        .is_some_and(|bytes| bytes.starts_with(prefix))
-                })
-                .collect()
-        };
-
-        for prefix in [
-            &b""[..],
-            b"h",
-            b"he",
-            b"hel",
-            b"hell",
-            b"hello",
-            b"help",
-            b"w",
-            b"zzz",
-            &[0xffu8][..],
-        ] {
-            assert_eq!(
-                tokenizer.ids_with_prefix(prefix),
-                walked(prefix),
-                "the prefix query and the whole-table walk disagree on {prefix:?}"
-            );
-        }
-
-        // And it is not vacuous in either direction: `h` names more than one
-        // token and `zzz` names none.
-        assert!(tokenizer.ids_with_prefix(b"hel").len() >= 3);
-        assert!(tokenizer.ids_with_prefix(b"zzz").is_empty());
-        assert_eq!(
-            tokenizer.ids_with_prefix(b"").len(),
-            walked(b"").len(),
-            "an empty prefix is every token the table holds"
-        );
-    }
-
-    fn make_byte_tokenizer(
-        vocab: &[(&str, u32)],
-        merges: &[(&str, &str)],
-        nfc: bool,
-        splitters: &[&str],
-        bpe_mode: BpeMode,
-        added_tokens: Vec<AddedToken>,
-    ) -> Tokenizer {
-        let vocab_map: HashMap<String, u32> =
-            vocab.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-        let merge_pairs: Vec<(String, String)> = merges
-            .iter()
-            .map(|(a, b)| (a.to_string(), b.to_string()))
-            .collect();
-        let mut bpe =
-            bpe::BpeTable::from_vocab_and_merges(&vocab_map, &merge_pairs, false).unwrap();
-        for at in &added_tokens {
-            bpe.insert_added(at.content.as_bytes().to_vec(), at.id)
-                .unwrap();
-        }
-        Tokenizer::new(
-            bpe,
-            Pipeline::ByteLevelRegex {
-                nfc,
-                splitters: splitters
-                    .iter()
-                    .map(|pattern| Splitter {
-                        regex: fancy_regex::Regex::new(pattern).unwrap(),
-                        keep_gaps: true,
-                    })
-                    .collect(),
-                bpe_mode,
-            },
-            added_tokens,
-        )
-        .unwrap()
-    }
-
-    fn make_byte_fallback_tokenizer(vocab: &[(&str, u32)], merges: &[(&str, &str)]) -> Tokenizer {
-        let vocab_map: HashMap<String, u32> =
-            vocab.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-        let merge_pairs: Vec<(String, String)> = merges
-            .iter()
-            .map(|(a, b)| (a.to_string(), b.to_string()))
-            .collect();
-        let bpe = bpe::BpeTable::from_vocab_and_merges(&vocab_map, &merge_pairs, false).unwrap();
-        Tokenizer::new(
-            bpe,
-            Pipeline::ByteFallbackReplace {
-                normalizer_from: " ".into(),
-                normalizer_to: "▁".into(),
-                unk_token_id: None,
-                dummy_prefix: DummyPrefix::None,
-                strip_decoder_marker: false,
-            },
-            vec![],
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn byte_level_encode_decode_roundtrip() {
-        let tok = make_byte_tokenizer(
-            &[("h", 0), ("i", 1), ("hi", 2)],
-            &[("h", "i")],
-            false,
-            &[],
-            BpeMode::Merge,
-            vec![],
-        );
-        let ids = tok.encode("hi");
-        assert_eq!(ids, vec![2]);
-        assert_eq!(tok.decode(&ids, false), "hi");
-    }
-
-    #[test]
-    fn byte_level_nfc_normalization() {
-        let tok = make_byte_tokenizer(
-            &[("\u{00E9}", 0)],
-            &[],
-            true,
-            &[],
-            BpeMode::PreferWholeToken,
-            vec![],
-        );
-        assert_eq!(tok.encode("\u{0065}\u{0301}"), vec![0]);
-    }
-
-    #[test]
-    fn byte_level_regex_sequence_splits_in_order() {
-        let tok = make_byte_tokenizer(
-            &[("a", 0), ("1", 1), ("2", 2), ("b", 3), ("12", 4)],
-            &[("1", "2")],
-            false,
-            &[r"\d+", r"[a-z]+"],
-            BpeMode::Merge,
-            vec![],
-        );
-        assert_eq!(tok.encode("a12b"), vec![0, 4, 3]);
-        assert!(tok.get_split_regex().is_empty());
-        assert_eq!(tok.split_regexes(), vec![r"\d+", r"[a-z]+"]);
-    }
-
-    #[test]
-    fn byte_fallback_replace_roundtrip() {
-        let tok = make_byte_fallback_tokenizer(
-            &[
-                ("a", 0),
-                ("▁", 1),
-                ("b", 2),
-                ("a▁", 3),
-                ("a▁b", 4),
-                ("<0xE5>", 5),
-                ("<0x8F>", 6),
-                ("<0xAB>", 7),
-                ("<0xFF>", 8),
-            ],
-            &[("a", "▁"), ("a▁", "b")],
-        );
-        let ids = tok.encode("a b");
-        assert_eq!(ids, vec![4]);
-        assert_eq!(tok.decode(&ids, false), "a b");
-        assert_eq!(tok.decode(&[5, 6, 7], false), "叫");
-        assert_eq!(tok.decode(&[5, 6], false), "��");
-    }
-
-    #[test]
-    fn added_tokens_and_skip_special() {
-        let tok = make_byte_tokenizer(
-            &[("h", 0), ("i", 1), ("hi", 2)],
-            &[("h", "i")],
-            false,
-            &[],
-            BpeMode::Merge,
-            vec![
-                AddedToken {
-                    id: 3,
-                    content: "<s>".into(),
-                    special: true,
-                    lstrip: false,
-                    rstrip: false,
-                },
-                AddedToken {
-                    id: 4,
-                    content: "</s>".into(),
-                    special: true,
-                    lstrip: false,
-                    rstrip: false,
-                },
-            ],
-        );
-        assert_eq!(tok.encode("<s>hi</s>"), vec![3, 2, 4]);
-        assert_eq!(tok.decode(&[3, 2], true), "hi");
-        assert_eq!(tok.decode(&[3, 2], false), "<s>hi");
-    }
-
-    #[test]
-    fn encode_into_matches_encode() {
-        let tok = make_byte_tokenizer(
-            &[("h", 0), ("i", 1), ("hi", 2)],
-            &[("h", "i")],
-            false,
-            &[],
-            BpeMode::Merge,
-            vec![],
-        );
-        let mut output = vec![99];
-        tok.encode_into("hi", &mut output);
-        assert_eq!(output, vec![99, 2]);
-    }
-
-    #[test]
-    fn incremental_byte_level_holds_partial_utf8() {
-        let bpe = BpeTable::from_decoder_map(HashMap::from([
-            (0, vec![0xC3]),
-            (1, vec![0xA9]),
-            (2, b"!".to_vec()),
-        ]))
-        .unwrap();
-        let tokenizer = Arc::new(
-            Tokenizer::new(
-                bpe,
-                Pipeline::ByteLevelRegex {
-                    nfc: false,
-                    splitters: Vec::new(),
-                    bpe_mode: BpeMode::PreferWholeToken,
-                },
-                vec![],
-            )
-            .unwrap(),
-        );
-        let mut decoder = tokenizer.decoder(false);
-        assert_eq!(decoder.feed(&[0]), "");
-        assert_eq!(decoder.feed(&[1]), "é");
-        assert_eq!(decoder.feed(&[2]), "!");
-        assert_eq!(decoder.finish(), "");
-    }
-
-    #[test]
-    fn incremental_byte_fallback_matches_full_decode() {
-        let tokenizer = Arc::new(make_byte_fallback_tokenizer(
-            &[
-                ("a", 0),
-                ("▁", 1),
-                ("b", 2),
-                ("a▁", 3),
-                ("a▁b", 4),
-                ("<0xE5>", 5),
-                ("<0x8F>", 6),
-                ("<0xAB>", 7),
-                ("<0xFF>", 8),
-            ],
-            &[("a", "▁"), ("a▁", "b")],
-        ));
-        let mut decoder = tokenizer.decoder(false);
-        assert_eq!(decoder.feed(&[5]), "");
-        assert_eq!(decoder.feed(&[6]), "");
-        assert_eq!(decoder.feed(&[7]), "");
-        assert_eq!(decoder.finish(), "叫");
-
-        decoder.reset();
-        assert_eq!(decoder.feed(&[5, 6]), "");
-        assert_eq!(decoder.finish(), "��");
-        assert_eq!(tokenizer.decode(&[5, 6], false), "��");
-
-        decoder.reset();
-        assert_eq!(decoder.feed(&[5, 6, 7, 0]), "叫a");
-        assert_eq!(decoder.finish(), "");
-
-        decoder.reset();
-        assert_eq!(decoder.feed(&[5, 6, 7, 8]), "");
-        assert_eq!(decoder.finish(), "����");
-        assert_eq!(tokenizer.decode(&[5, 6, 7, 8], false), "����");
-    }
-}

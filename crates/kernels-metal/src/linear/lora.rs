@@ -1,33 +1,8 @@
-//! `Lora`: the correction class (palo design §8, decision 17).
+//! `Lora`: the correction class. One entry, [`correct`], for `linear.lora_correct` — `y += B[a]*(A[a]*x)` over the rows `routes` gives an adapter.
 //!
-//! One entry, [`correct`], for one IR variant — `linear.lora_correct` —
-//! `y += B[a]·(A[a]·x)` over the rows `routes` gives an adapter.
-//!
-//! **ONE LAUNCH, WHERE THE CUDA PLANE TAKES TWO.** That plane's projection
-//! half is `moe`'s routed GEMV at fan-out one, fired verbatim so no second
-//! copy of that ladder exists to drift, with the `rows x rank` waist between
-//! the halves living in a named process-global scratch slab. Here there is no
-//! slab to name: a kernel entry talks to an [`Encode`](crate::encode::Encode)
-//! sink, which binds the handles an op declared and offers no allocation
-//! door. So the waist lives where its lifetime is — `rank` floats in
-//! threadgroup memory, inside one threadgroup's own two halves — and the
-//! whole correction is `linear/lora.metal`'s single entrypoint. The routed
-//! GEMV is not reused because at fan-out one, with the waist never leaving
-//! the threadgroup, there is nothing left of it to reuse.
-//!
-//! **THE SCALE IS NOT AN ARGUMENT.** `α/r` is folded into the up bank's
-//! contents at registration (`model_ir::Linear::LoraCorrect`'s own note, and
-//! the eta-dsl adapter surface says the same thing about the same scale), so
-//! this entry states shapes and nothing else. Rank diversity is bucketed by
-//! BANK rather than by a runtime table: an adapter shorter than its bank's
-//! rank was registered zero-padded, which contributes exactly zero.
-//!
-//! **AND NO SEGMENTS.** The CUDA entry takes `Fallback::Grouped`'s interval
-//! list, because that shell names this op in its `DeviceProfile::grouped`.
-//! This one names none — `engine_metal::window` serves `Fallback::Split` and
-//! says so — so every row of the rectangle handed here is a row of the
-//! correction, and the day that changes is the day this signature grows the
-//! list rather than the day it silently computes the first interval.
+//! One launch, unlike CUDA's two: the `rows x rank` waist lives in threadgroup memory inside one threadgroup's own two halves, since a kernel entry here has no scratch slab to name.
+//! `alpha/r` is folded into the up bank's contents at registration, so this entry states shapes and nothing else. Rank diversity is bucketed by bank: an adapter shorter than its bank's rank was registered zero-padded.
+//! No segments: `engine_metal::window` serves `Fallback::Split`, so every row of the rectangle handed here is a row of the correction.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -45,26 +20,10 @@ const MAX_RANK: u32 = 128;
 
 /// `y += B[a]·(A[a]·x)` over the rows `routes` gives an adapter.
 ///
-/// `x` is `[rows, in]`, `y` is `[rows, out]`, `bank_a` is `[adapters,
-/// rank·in]` and `bank_b` is `[adapters, out·rank]` — the weight table's
-/// `rows x width` reading of the `[adapters, rank, in]` and `[adapters, out,
-/// rank]` shapes the model text declared. The rank is not an argument: it is
-/// `bank_a.width / x.width`, and the two banks are checked against each
-/// other, because a rank stated twice is a rank free to disagree with itself.
+/// `x` is `[rows, in]`, `y` is `[rows, out]`, `bank_a` is `[adapters, rank*in]`, `bank_b` is `[adapters, out*rank]`. The rank is not an argument: it is `bank_a.width / x.width`, checked against `bank_b`.
+/// `routes` is `[rows, 1]` i32; `-1` is the base model, whose row is skipped and `y` keeps the trunk's value. In place: `y` is read, added to, and written back.
 ///
-/// `routes` is `[rows, 1]` i32 and `-1` is the base model: such a row is
-/// returned on before anything is read, and `y` keeps the value the trunk
-/// wrote. The op is IN PLACE — `y` is read, added to, and written back — and
-/// that aliasing is the whole reason a class whose guard does not hold is the
-/// identity without a merge.
-///
-/// # Errors
-///
-/// [`Error::Backend`] for banks whose widths do not divide into a common
-/// rank, for a bank pair that names two different adapter counts, for a rank
-/// past the shader's threadgroup array, or for a degenerate extent;
-/// [`Error::DtypeUnsupported`] for an activation this plane has no
-/// entrypoint for.
+/// Errs [`Error::Backend`] for banks whose widths don't divide into a common rank, mismatched adapter counts, a rank past the shader's threadgroup array, or a degenerate extent; [`Error::DtypeUnsupported`] otherwise.
 pub fn correct(
     ctx: &Ctx<'_>,
     x: Tensor,

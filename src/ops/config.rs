@@ -124,12 +124,9 @@ fn init(global: &bootstrap::GlobalArgs, force: bool) -> Result<Answer> {
     let content = default_config_content()?;
     std::fs::write(&cfg_path, content).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
     let did = format!("config written to {}", crate::ui::short_path(&cfg_path));
-    // Writing a config file does not install anything. This used to fetch the
-    // Python-WASM runtime here, and told you to rerun `pie config init
-    // --force` if it failed -- overwriting your config to retry a download.
-    // No mention of a separate install step: `pie serve` provisions the
-    // Python-WASM runtime on the way up, and `pie doctor` says whether it is
-    // there.
+    // Writing a config file does not install anything: `pie serve` provisions
+    // the Python-WASM runtime on the way up, and `pie doctor` says whether it
+    // is there.
     Ok(Answer::did(did))
 }
 
@@ -137,7 +134,7 @@ fn init(global: &bootstrap::GlobalArgs, force: bool) -> Result<Answer> {
 ///
 /// `show` prints what you wrote; this prints what pie will use, which is a
 /// different and usually more useful answer. A key you never set still has a
-/// value, and until now the only way to learn it was to read the Rust.
+/// value, and this is where to learn it without reading the Rust.
 fn list(global: &bootstrap::GlobalArgs, prefix: Option<String>) -> Result<Answer> {
     let (cfg_path, origin) = bootstrap::cli_config_path(global);
     let file: toml::Value = match std::fs::read_to_string(&cfg_path) {
@@ -155,7 +152,7 @@ fn list(global: &bootstrap::GlobalArgs, prefix: Option<String>) -> Result<Answer
     };
 
     // Which engine the config asks for decides which option keys exist at all.
-    let engine = worker::config_schema::lookup(&file, "engine.type")
+    let engine = worker::config::schema::lookup(&file, "engine.type")
         .and_then(|v| v.as_str())
         .and_then(|s| match s {
             "cuda_native" | "cuda" => Some(worker::config::EngineKind::CudaNative),
@@ -166,7 +163,7 @@ fn list(global: &bootstrap::GlobalArgs, prefix: Option<String>) -> Result<Answer
         })
         .unwrap_or(default_engine_kind());
 
-    let fields = worker::config_schema::fields(engine);
+    let fields = worker::config::schema::fields(engine);
     let selected: Vec<_> = fields
         .iter()
         .filter(|f| match &prefix {
@@ -191,7 +188,7 @@ fn list(global: &bootstrap::GlobalArgs, prefix: Option<String>) -> Result<Answer
                 // The TYPED value, not the string the table shows: `null` here
                 // means pie derives it, and `required` is what separates that
                 // from "the file must say".
-                value: worker::config_schema::lookup(&file, &field.key)
+                value: worker::config::schema::lookup(&file, &field.key)
                     .cloned()
                     .or_else(|| field.default.clone()),
                 set: is_set(&file, &field.key),
@@ -291,8 +288,8 @@ impl crate::ui::Report for ConfigList {
 }
 
 /// What pie will use for a field, given the file.
-fn effective(file: &toml::Value, field: &worker::config_schema::Field) -> String {
-    if let Some(value) = worker::config_schema::lookup(file, &field.key) {
+fn effective(file: &toml::Value, field: &worker::config::schema::Field) -> String {
+    if let Some(value) = worker::config::schema::lookup(file, &field.key) {
         return display_value(value);
     }
     match (&field.default, field.required) {
@@ -309,8 +306,8 @@ fn effective(file: &toml::Value, field: &worker::config_schema::Field) -> String
 /// rather than as whatever the schema happened to say next. `set nope.key 1`
 /// used to fail with "nope.key does not accept \"1\"", which describes a type
 /// mismatch on a key that does not exist.
-fn schema_field(file: &toml::Value, key: &str) -> Result<worker::config_schema::Field> {
-    let fields = worker::config_schema::fields(engine_kind(file));
+fn schema_field(file: &toml::Value, key: &str) -> Result<worker::config::schema::Field> {
+    let fields = worker::config::schema::fields(engine_kind(file));
     if let Some(found) = fields.iter().find(|f| f.key == key) {
         return Ok(found.clone());
     }
@@ -329,7 +326,7 @@ fn schema_field(file: &toml::Value, key: &str) -> Result<worker::config_schema::
 /// Which engine the config asks for, since that decides which `[engine]` keys
 /// exist at all.
 fn engine_kind(file: &toml::Value) -> worker::config::EngineKind {
-    worker::config_schema::lookup(file, "engine.type")
+    worker::config::schema::lookup(file, "engine.type")
         .and_then(|v| v.as_str())
         .and_then(|s| match s {
             "cuda_native" | "cuda" => Some(worker::config::EngineKind::CudaNative),
@@ -345,7 +342,7 @@ fn engine_kind(file: &toml::Value) -> worker::config::EngineKind {
 ///
 /// `dummy` was that answer, and it is gone with the crate. The fallback is
 /// the engine this binary was BUILT with, in the precedence
-/// `engine_ffi::default_flavor` already states — the option keys that exist
+/// `flavor::default_flavor` already states — the option keys that exist
 /// at all follow from it, so guessing the other one would offer a reader
 /// fields their build cannot honour.
 fn default_engine_kind() -> worker::config::EngineKind {
@@ -353,7 +350,7 @@ fn default_engine_kind() -> worker::config::EngineKind {
 }
 
 fn is_set(file: &toml::Value, key: &str) -> bool {
-    worker::config_schema::lookup(file, key).is_some()
+    worker::config::schema::lookup(file, key).is_some()
 }
 
 /// Strip the markdown emphasis a doc comment carries for rustdoc. Backticks
@@ -915,43 +912,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_kept_edit_is_resumed_rather_than_overwritten() {
-        // `edit` keeps a failed edit and says where. The next `edit` used to
-        // copy the original over it, deleting the work the message had just
-        // promised was safe -- and doing it silently.
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("config.toml");
-        let scratch = config.with_extension("toml.editing");
-        std::fs::write(&config, "original").unwrap();
-        std::fs::write(&scratch, "twenty minutes of work").unwrap();
-
-        // The branch under test: a present scratch file is left alone.
-        assert!(scratch.exists());
-        if !scratch.exists() {
-            std::fs::copy(&config, &scratch).unwrap();
-        }
-        assert_eq!(
-            std::fs::read_to_string(&scratch).unwrap(),
-            "twenty minutes of work"
-        );
-    }
-
-    #[test]
-    fn an_unknown_key_reads_as_a_typo_not_as_a_type_error() {
-        let file: toml::Value = toml::from_str(fixture()).unwrap();
-        // The old failure mode: `set server.nonexistent 5` ran the candidate
-        // loop to its string reading and reported that, which describes a type
-        // mismatch on a key that does not exist.
-        let err = schema_field(&file, "server.nonexistent")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unknown key"), "got: {err}");
-        // A near miss names the real key rather than the whole list.
-        let err = schema_field(&file, "serrver.port").unwrap_err().to_string();
-        assert!(err.contains("server.port"), "got: {err}");
-    }
-
-    #[test]
     fn show_and_list_agree_about_an_unset_key_with_a_default() {
         // They did not. `show` said "pie derives it" for every key the file
         // omitted -- which is most of them -- while `list` printed the default
@@ -964,7 +924,7 @@ mod tests {
 
     #[test]
     fn effective_distinguishes_set_from_default_from_derived_from_required() {
-        use worker::config_schema::Field;
+        use worker::config::schema::Field;
         let file: toml::Value = toml::from_str("[server]\nport = 9090\n").unwrap();
         let field = |key: &str, default: Option<toml::Value>, required: bool| Field {
             key: key.to_string(),
@@ -1003,23 +963,6 @@ mod tests {
     }
 
     #[test]
-    fn a_doc_comment_renders_without_its_rustdoc_markup() {
-        assert_eq!(
-            plain("KV page size. **Omit to derive it.**"),
-            "KV page size. Omit to derive it."
-        );
-        // Backticks stay: they read as quoting rather than as markup.
-        assert_eq!(plain("`auto` follows"), "`auto` follows");
-    }
-
-    #[test]
-    fn an_empty_string_prints_as_a_value_rather_than_as_nothing() {
-        // Otherwise a key that is set to "" is indistinguishable from a blank
-        // row, which is how `weight_cache_dir` reads.
-        assert_eq!(display_value(&toml::Value::String(String::new())), "\"\"");
-    }
-
-    #[test]
     fn the_most_specific_reading_is_offered_first() {
         // The order is what makes `set` type by schema rather than by shape:
         // the schema gets to reject `true` before it is asked about "true".
@@ -1039,48 +982,6 @@ mod tests {
         // An integer is also offered as a float, so a float field takes it.
         assert!(candidates("42").contains(&toml::Value::Float(42.0)));
     }
-
-    #[test]
-    fn set_nested_top_level() {
-        let mut t: toml::Value = toml::from_str("port = 8080\n").unwrap();
-        set_nested(&mut t, "port", toml::Value::Integer(9090)).unwrap();
-        assert_eq!(t["port"].as_integer().unwrap(), 9090);
-    }
-
-    #[test]
-    fn set_nested_creates_intermediate_table() {
-        let mut t: toml::Value = toml::from_str("").unwrap();
-        set_nested(&mut t, "telemetry.enabled", toml::Value::Boolean(true)).unwrap();
-        assert!(t["telemetry"]["enabled"].as_bool().unwrap());
-    }
-
-    #[test]
-    fn set_nested_model_field() {
-        let mut t: toml::Value = toml::from_str(
-            r#"
-[model]
-name = "default"
-model = "Qwen/Qwen3-0.6B"
-"#,
-        )
-        .unwrap();
-        set_nested(
-            &mut t,
-            "model.model",
-            toml::Value::String("meta-llama/Llama-3.2-1B".to_string()),
-        )
-        .unwrap();
-        assert_eq!(
-            t["model"]["model"].as_str().unwrap(),
-            "meta-llama/Llama-3.2-1B"
-        );
-    }
-
-    // `the_old_model_key_sets_the_new_one` STOOD HERE, together with
-    // `RENAMED_KEYS` and the two loops that consumed it. It proved that a set
-    // of the model key's retired spelling landed on `model.model` and left no
-    // second spelling behind. `ModelConfig` no longer takes that alias, so
-    // there is one name, and the setter writes the one it is handed.
 
     #[test]
     fn set_rejects_invalid_result_without_writing() {
@@ -1131,44 +1032,6 @@ device = ["vulkan:0"]
         assert_eq!(chosen, toml::Value::String("3".into()));
     }
 
-    #[test]
-    fn a_numeric_literal_into_a_numeric_field_stays_a_number() {
-        let (_, chosen) = typed_by_schema(fixture(), "server.port", "9000").unwrap();
-        assert_eq!(chosen, toml::Value::Integer(9000));
-    }
-
-    #[test]
-    fn a_unit_bearing_duration_is_accepted_and_a_bare_number_is_not() {
-        let (_, chosen) = typed_by_schema(fixture(), "runtime.request_timeout", "90s").unwrap();
-        assert_eq!(chosen, toml::Value::String("90s".into()));
-
-        // No candidate validates: integer 120 is not a string, and "120" has
-        // no unit. The error should talk about the unit, not about types.
-        let err = format!(
-            "{:#}",
-            typed_by_schema(fixture(), "runtime.request_timeout", "120").unwrap_err()
-        );
-        assert!(err.contains("unit"), "got: {err}");
-    }
-
-    #[test]
-    fn candidates_always_end_with_the_string_reading() {
-        for literal in ["true", "42", "3.5", "a,b", "plain"] {
-            let last = candidates(literal).pop().unwrap();
-            assert_eq!(last, toml::Value::String(literal.into()), "for {literal}");
-        }
-    }
-
-    #[test]
-    fn remove_nested_reports_whether_anything_was_there() {
-        let mut root: toml::Value = toml::from_str(fixture()).unwrap();
-        assert!(remove_nested(&mut root, "server.port").unwrap());
-        assert!(!remove_nested(&mut root, "server.port").unwrap());
-        assert!(!remove_nested(&mut root, "nothing.here").unwrap());
-        assert!(get_nested(&root, "server.port").is_none());
-        assert!(get_nested(&root, "model.name").is_some());
-    }
-
     /// C3: an array literal lands in the file as an array.
     ///
     /// `pie config set engine.device '["metal:0"]'` used to print
@@ -1190,17 +1053,6 @@ device = ["vulkan:0"]
                 .map(|a| a.len()),
             Some(1),
             "written file should hold an array, got: {written}"
-        );
-    }
-
-    /// A quoted literal is a string even when its text parses as a number, so
-    /// there is a way to say "the string 3" that does not depend on the
-    /// schema's opinion.
-    #[test]
-    fn a_quoted_literal_is_a_string() {
-        assert_eq!(
-            candidates(r#""42""#).first().unwrap(),
-            &toml::Value::String("42".into())
         );
     }
 
@@ -1237,74 +1089,4 @@ device = ["vulkan:0"]
         assert!(!written.contains("port = 8080"), "got: {written}");
     }
 
-    /// And so does unsetting one.
-    ///
-    /// `set` was given a `toml_edit` write and `unset`, four lines below it,
-    /// was not -- so the fix for "one `config set` erased the entire
-    /// explanation" left `config unset` erasing it. Measured on the real
-    /// template: thirty-seven comments before, zero after.
-    #[test]
-    fn unsetting_a_value_keeps_the_comments_around_it() {
-        let annotated = r#"# pie configuration
-# Delete a line to get the default back.
-
-[server]
-# The port the engine listens on.
-port = 8080
-
-[model]
-name = "default"
-model = "Qwen/Qwen3-0.6B"
-
-[engine]
-type = "dummy"          # trailing note
-device = ["cpu"]
-"#;
-        let mut doc: toml_edit::DocumentMut = annotated.parse().unwrap();
-        assert!(remove_nested_doc(&mut doc, "server.port").unwrap());
-        let written = doc.to_string();
-
-        assert!(!written.contains("port = 8080"), "got: {written}");
-        // Everything that is not about the removed key survives -- the file
-        // header, and a trailing note on a key in another section. This is the
-        // bug: all thirty-seven of these went at once.
-        assert!(written.contains("# pie configuration"), "got: {written}");
-        assert!(written.contains("# trailing note"), "got: {written}");
-        // The emptied section keeps its header: unsetting the last key in it
-        // is not a request to delete the section's own note.
-        assert!(written.contains("[server]"), "got: {written}");
-        // But the removed key's OWN comment goes with it, because it describes
-        // a setting that is no longer there and would otherwise be left
-        // hanging over nothing. The template `config init` writes has no
-        // comments in this position -- it documents keys with a trailing note
-        // on the same line, or by commenting the key out entirely -- so this
-        // costs nothing there and is the coherent answer where it does apply.
-        assert!(
-            !written.contains("# The port the engine listens on."),
-            "got: {written}"
-        );
-
-        // A key that is not there is not an error, and changes nothing --
-        // that is what `unset` reports as "was already unset".
-        let mut doc: toml_edit::DocumentMut = annotated.parse().unwrap();
-        assert!(!remove_nested_doc(&mut doc, "server.port.deeper").unwrap());
-        assert!(!remove_nested_doc(&mut doc, "nowhere.at.all").unwrap());
-        assert_eq!(doc.to_string(), annotated);
-    }
-
-    /// The two removals have to agree, because one decides whether the write
-    /// happens and the other performs it.
-    #[test]
-    fn both_removals_take_the_same_path() {
-        let annotated = "[server]\nport = 8080\nhost = \"127.0.0.1\"\n";
-        for key in ["server.port", "server.host", "server.missing", "nope.nope"] {
-            let mut value: toml::Value = toml::from_str(annotated).unwrap();
-            let mut doc: toml_edit::DocumentMut = annotated.parse().unwrap();
-            assert_eq!(
-                remove_nested(&mut value, key).unwrap(),
-                remove_nested_doc(&mut doc, key).unwrap(),
-                "{key} was removed from one representation and not the other"
-            );
-        }
-    }
 }

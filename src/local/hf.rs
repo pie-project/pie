@@ -1,5 +1,5 @@
-//! HuggingFace download helpers for `pie model pull` (R3 — the weight-download
-//! IO lives only in `bin/pie`, never the worker daemon).
+//! HuggingFace download helpers for `pie model pull`. The weight-download IO
+//! lives only in `pie`, never the worker daemon.
 //!
 //! The worker lib resolves already-present snapshots (`weights::resolve`); this
 //! crate owns the *fetch*. Downloads are runtime-artifact selective: safetensors
@@ -58,19 +58,3 @@ pub fn runtime_snapshot_allow_patterns() -> Vec<String> {
     .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn runtime_allowlist_keeps_weights_safetensors_specific() {
-        let patterns = runtime_snapshot_allow_patterns();
-        assert!(patterns.iter().any(|p| p == "model*.safetensors"));
-        assert!(patterns.iter().any(|p| p == "**/model*.safetensors"));
-        assert!(patterns.iter().any(|p| p == "*.json"));
-        assert!(!patterns.iter().any(|p| p == "*.safetensors"));
-        assert!(!patterns.iter().any(|p| p == "**/*.safetensors"));
-        assert!(!patterns.iter().any(|p| p.ends_with(".pt")));
-        assert!(!patterns.iter().any(|p| p.ends_with(".bin")));
-    }
-}

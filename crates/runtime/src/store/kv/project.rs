@@ -1,21 +1,8 @@
-//! KV forward-prepare projection: a pure view over the store's resolved
-//! physical pages, so it lives in `store/kv/` even though `pipeline/fire/`
-//! is what calls it.
+//! KV forward-prepare projection: a pure view over the store's resolved physical pages, living in `store/kv/` even though `pipeline/fire/` is what calls it.
 //!
-//! Pure projection at the heart of the forward transaction's `prepare` step:
-//! it takes the resolved physical pages (from charlie's `KvWorkingSet::resolve_*`
-//! over bravo's arena) plus the inferlet's `kv-output` per-page valid lengths and
-//! produces the `(physical_page_ids, last_page_len, active_page_idx)` triple that
-//! the scheduler/`wire` build path consumes. It enforces the brief §5 forward-contract
-//! validations and the v1 dense-array contiguity rule (the v1 engine ABI's
-//! `kv_page_indices` / `kv_last_page_lens` express only a contiguous ordered
-//! active page run) and owns the seal-eligibility split (full vs partial pages, W7).
+//! Takes the resolved physical pages plus the inferlet's `kv-output` per-page valid lengths and produces the `(physical_page_ids, last_page_len, active_page_idx)` triple the scheduler/`wire` build path consumes. Enforces the v1 dense-array contiguity rule (the v1 engine ABI's `kv_page_indices`/`kv_last_page_lens` express only a contiguous ordered active page run) and owns the seal-eligibility split (full vs partial pages).
 //!
-//! `PrepareError` lives here (not `pipeline::fire::kv`) because it is
-//! `project_kv`'s error type and `store/` must not import upward into
-//! `pipeline/`; `pipeline::fire::kv::{check_generation, check_input_nonempty}`
-//! import it from here (the WIT-descriptor validation half of the fire
-//! `prepare` gate).
+//! `PrepareError` lives here, not `pipeline::fire::kv`, because it is `project_kv`'s error type and `store/` must not import upward into `pipeline/`.
 
 /// Physical block id within one pool's id-space.
 pub type BlockId = u32;
@@ -73,16 +60,9 @@ pub struct KvProjection {
     pub full_page_writes: Vec<u32>,
 }
 
-/// Project explicit KV read/write descriptors onto the engine's contiguous
-/// active page run.
+/// Project explicit KV read/write descriptors onto the engine's contiguous active page run.
 ///
-/// `context_pages` are the resolved physical pages for read slots
-/// `[0, context_pages.len())` (v1 requires the read window to start at slot 0;
-/// RoPE positions run from 0). `context_valid_tokens` is how many tokens are
-/// valid across that window. `writes` are the resolved (post-CoW) output
-/// targets. `physical_page_ids` covers the contiguous active run `[0, active_len)`
-/// where `active_len = max(context_len, max_output_slot + 1)`; every slot in that
-/// run must be backed by either an output target or a context page (no gaps).
+/// `context_pages` are the resolved physical pages for read slots `[0, context_pages.len())` (v1 requires the read window to start at slot 0; RoPE positions run from 0). `active_len = max(context_len, max_output_slot + 1)`; every slot in `[0, active_len)` must be backed by an output target or a context page (no gaps).
 pub fn project_kv(
     context_pages: &[PhysicalPageId],
     context_valid_tokens: u32,

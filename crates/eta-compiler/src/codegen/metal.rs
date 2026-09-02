@@ -1,16 +1,10 @@
-//! # Metal (MSL) region emitters
+//! Metal (MSL) region emitters: the only producer of Pie's generated MSL.
+//! Emission is a pure function of the plan, so the same stage emits the
+//! same bytes every time and `compiler/tests/golden-msl/` pins them.
 //!
-//! The only producer of Pie's generated MSL. Emission is a pure function of the
-//! plan — no device-architecture inputs — so the same stage emits the same bytes
-//! every time and `compiler/tests/golden-msl/` pins them. Those goldens are the
-//! contract itself: nothing can re-derive them, so a diff is a decision to be
-//! justified rather than a comparison to be re-run.
-//!
-//! Most emitters return `Result<String, EmitError>` and refuse rather than emit
-//! a kernel they cannot justify; the three taking no plan return a bare `String`
-//! because their inputs are a name and a closed-enum tag. For the same reason
-//! there is no out-of-range extent-role, dtype or op-tag refusal — a refusal the
-//! types make unrepresentable is dead code that reads like a live guard.
+//! Most emitters return `Result<String, EmitError>` and refuse rather than
+//! emit a kernel they cannot justify; the three taking no plan return a bare
+//! `String` because their inputs are a name and a closed-enum tag.
 
 pub mod effects;
 pub mod fused;
@@ -41,19 +35,13 @@ pub const METAL_M1_EMITTER_VERSION: u16 = 42;
 
 /// `kMetalM1MaxChannels` — the single-lane readiness/commit kernels bind one
 /// `words_N` buffer per channel starting at buffer 2, and Metal's highest
-/// buffer index is 30. Enforced by `emit_readiness` / `emit_commit`; it used to
-/// be a comment, and a program with one channel more emitted `[[buffer(31)]]`.
+/// buffer index is 30. Enforced by `emit_readiness` / `emit_commit`.
 pub const METAL_M1_MAX_CHANNELS: usize = 29;
 
 /// `kMetalM2MaxFusedChannels` — a fused region binds committed/pending pairs
-/// from buffer 7, which caps the direct-binding form at 12 channels.
-///
-/// **THE CEILING FOR A REGION THAT ALSO READS A SECOND INTRINSIC RECTANGLE IS
-/// LOWER**, because those bind down from index 30 while the channels bind up
-/// from 7. [`intrinsics::fused_channel_ceiling`] is the one that knows which
-/// of the two applies; this is the ceiling when nothing but the trunk's
-/// `logits` is read, which is every stage the corpus had before the slot
-/// table existed.
+/// from buffer 7, which caps the direct-binding form at 12 channels. Lower
+/// for a region that also reads a second intrinsic rectangle (binding down
+/// from index 30); [`intrinsics::fused_channel_ceiling`] knows which applies.
 pub const METAL_M2_MAX_FUSED_CHANNELS: usize = 12;
 
 /// `M1ChannelEffect` — what one channel needs before a lane may run, and what

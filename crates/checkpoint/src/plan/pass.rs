@@ -1,16 +1,6 @@
-//! The pass pipeline.
-//!
-//! A pass is a named function over a finished plan that says how many rewrites
-//! it made. Both halves matter. The name means a new pass is a line in
-//! `passes::all()` rather than a line buried in the middle of the compiler; the
-//! count means a pass that never fires is *visible* rather than inferred.
-//!
-//! v1 had neither. Its seven passes were seven statements in the middle of
-//! `StorageCompiler::lower`, and its eighth — the `optimizer`, 276 lines — was
-//! a separate stage over a separate IR that reported `rewrites: 0` on all
-//! fourteen goldens because the frontend could not construct the patterns it
-//! matched. Nobody noticed, because the only reader of the report was a debug
-//! dump.
+//! The pass pipeline: a pass is a named function over a finished plan that
+//! reports how many rewrites it made, so a pass that never fires is visible
+//! rather than inferred.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,12 +8,8 @@ use crate::error::Result;
 use crate::plan::LoadPlan;
 
 /// What a pass is allowed to do, and therefore where it may sit in the order.
-///
-/// The distinction is load-bearing rather than descriptive: a check proves
-/// something about the plan the compiler hands back, and that proof only holds
-/// if nothing rewrites the plan afterwards. [`run_all`] enforces it, so the
-/// guarantee survives someone appending a rewrite to the end of
-/// [`super::passes::all`].
+/// A check's proof only holds if nothing rewrites the plan afterwards;
+/// [`run_all`] enforces the ordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     /// May change the plan.
@@ -33,12 +19,9 @@ pub enum Stage {
     Check,
 }
 
-/// One rewrite or check over a finished plan.
-///
-/// A pass is a name and a function, so this is a struct rather than a trait: no
-/// pass has ever had state of its own, and a trait with one implementor buys
-/// dispatch nobody calls for. Keeping it concrete makes [`super::passes::all`] a
-/// `static` the compiler lays out once, instead of nine boxes built per compile.
+/// One rewrite or check over a finished plan. A struct rather than a trait,
+/// since no pass has state of its own, and it lets [`super::passes::all`] be
+/// a `static` the compiler lays out once.
 #[derive(Clone, Copy)]
 pub struct Pass {
     pub name: &'static str,
@@ -46,31 +29,16 @@ pub struct Pass {
     /// Whether this pass may rewrite, or may only refuse.
     pub stage: Stage,
 
-    /// Whether this pass exists FOR the arena — the one allocation a plan's
-    /// persistent buffers and its staging region are laid out in.
-    ///
-    /// True of exactly the two that rewrite buffer-relative writes into
-    /// arena-ABSOLUTE ones and hoist them to the front of the schedule. Both
-    /// are the right rewrite for a load staging a device image and the wrong
-    /// one for a load with no arena at all: the executor refuses the
-    /// instruction the first emits ([`Residency::Streaming`]), and the second
-    /// pulls every `Allocate` to the head of the schedule, which is the one
-    /// arrangement under which "freed at its last use" frees nothing until the
-    /// whole model is live.
-    ///
-    /// So [`crate::plan::compile_streaming`] runs the pipeline without them,
-    /// and this field is what says which. Stated per pass rather than matched
-    /// on a list of names elsewhere, because a name is a thing a rename can
-    /// silently take out of such a list — where a field added here does not
-    /// compile until whoever adds the next pass decides its answer.
-    ///
-    /// [`Residency::Streaming`]: crate::executor::Residency::Streaming
+    /// Whether this pass exists for the arena (the allocation a plan's
+    /// persistent buffers and staging region are laid out in). True of
+    /// exactly the two passes that rewrite buffer-relative writes into
+    /// arena-absolute ones and hoist `Allocate`s to the schedule head — both
+    /// wrong for a load with no arena, so [`crate::plan::compile_streaming`]
+    /// runs the pipeline without them.
     pub for_arena: bool,
 
-    /// Rewrite the plan, returning how many rewrites were made.
-    ///
-    /// A validator returns `0`: it is the honest answer, and it is why the
-    /// count is "rewrites" rather than "did something".
+    /// Rewrite the plan, returning how many rewrites were made. A validator
+    /// returns `0`.
     pub run: fn(&mut LoadPlan) -> Result<usize>,
 }
 
@@ -83,26 +51,17 @@ pub struct PassStats {
     pub rewrites: usize,
 }
 
-/// Run the standard pipeline, in order, recording what each pass did.
-///
-/// Every pass is recorded, including the ones that rewrote nothing. Dropping
-/// the zeroes is what let v1's dead optimizer hide: a pass that never fires
-/// then looks exactly like a pass that is not in the pipeline, and telling
-/// those two apart is the whole reason the count is kept.
-///
-/// The [`Stage`] split is enforced here rather than trusted: a rewrite after a
-/// check would silently void what the check proved, and a check that reports a
-/// rewrite is not a check.
+/// Run the standard pipeline, in order, recording what each pass did —
+/// including passes that rewrote nothing, so a dead pass is distinguishable
+/// from one not in the pipeline. The [`Stage`] split is enforced here rather
+/// than trusted.
 pub fn run_all(plan: &mut LoadPlan) -> Result<Vec<PassStats>> {
     run_passes(plan, super::passes::all())
 }
 
 /// The same pipeline with the arena's own passes left out — see
-/// [`Pass::for_arena`] and [`crate::plan::compile_streaming`].
-///
-/// Filtered from [`super::passes::all`] rather than written out a second time:
-/// two lists would be two places to add a pass to, and the one somebody forgot
-/// would differ from the other in a way no test names.
+/// [`Pass::for_arena`] and [`crate::plan::compile_streaming`]. Filtered from
+/// [`super::passes::all`] rather than written out a second time.
 pub fn run_arenaless(plan: &mut LoadPlan) -> Result<Vec<PassStats>> {
     let pipeline: Vec<Pass> = super::passes::all()
         .iter()

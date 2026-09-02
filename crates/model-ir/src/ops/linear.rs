@@ -3,10 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::operands::Operands;
 use crate::value::ValueId;
 
-/// Learned-weight channel mixing and its epilogues: the plain matmuls, the
-/// fused MLP activations that consume a projection's packed output, the MoE
-/// routing and grouped-matmul ops that pick which weights a row multiplies, and
-/// the low-rank CORRECTION that adds a routed bank's `ΔW·x` to one of them.
+/// Learned-weight channel mixing and its epilogues: plain matmuls, fused
+/// MLP activations, MoE routing/grouped-matmul, and the low-rank correction
+/// that adds a routed bank's `dW*x` to one of them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Linear {
     Matmul {
@@ -37,27 +36,10 @@ pub enum Linear {
         alpha: f32,
         y: ValueId,
     },
-    /// **[`MlpSwigluClamp`](Linear::MlpSwigluClamp)'S ARITHMETIC OVER TWO
-    /// VALUES INSTEAD OF ONE ROW** — the same `min(g, limit)`, the same
-    /// `clamp(u, ±limit)`, the same `silu(g)·u`, with the halves arriving as
-    /// separate tensors rather than as the two halves of a `2·inter` row.
-    ///
-    /// **A ROW, BECAUSE A FUSED BANK IS NOT ALWAYS STATEABLE.** The packed
-    /// form is the cheaper one and stays the default: one bank, one GEMM, one
-    /// pass. But a bank carries ONE representation, and a per-tensor
-    /// quantization can give an artifact's `gate_proj` and `up_proj`
-    /// DIFFERENT ones — `mlx-community/DeepSeek-V4-Flash-2bit-DQ` groups the
-    /// gate by 32 and the up by 64 on four of its five layers, so the two
-    /// halves' scales planes join into no rectangle at any axis and the fused
-    /// declaration is not awkward there but unstateable. The model text that
-    /// meets such an artifact declares the pair, fires the routed matmul
-    /// twice, and combines here.
-    ///
-    /// The naming follows [`MlpGegluTanh`](Linear::MlpGegluTanh) /
-    /// [`MlpGegluTanhPacked`](Linear::MlpGegluTanhPacked), where the bare name
-    /// is the two-value form and `Packed` is the fused one — inverted only
-    /// because `MlpSwigluClamp` spent the bare name on the packed row first,
-    /// and renaming it would move every trace that already says it.
+    /// [`MlpSwigluClamp`](Linear::MlpSwigluClamp)'s arithmetic over two
+    /// separate tensors instead of one packed `2*inter` row — needed when a
+    /// per-tensor quantization gives `gate_proj`/`up_proj` different scale
+    /// planes that can't join into one bank.
     MlpSwigluClampSplit {
         gate: ValueId,
         up: ValueId,
@@ -69,21 +51,9 @@ pub enum Linear {
         up: ValueId,
         y: ValueId,
     },
-    /// **THE UNGATED GELU** (multimodal §6.2): `y = gelu_tanh(x)`, no `up`
-    /// half.
-    ///
-    /// `Qwen3_5VisionMLP` is `linear_fc2(act(linear_fc1(x)))` with
-    /// `hidden_act: gelu_pytorch_tanh` — NOT gated — and the merger is the
-    /// same shape. Every other gelu row here multiplies by an `up` half.
-    ///
-    /// **A ROW AND NOT A BAKE, AND THE BAKE IS THE ARGUMENT FOR THE ROW.**
-    /// It is expressible without this: declare `gate_up` at `[2·inter, hidden]`
-    /// with the `up` half ZERO and the `up` half of the bias ONE, and
-    /// [`MlpGegluTanhPacked`](Linear::MlpGegluTanhPacked) computes
-    /// `gelu_tanh(fc1(x)) · 1`. That pays the GEMM and the bank twice over —
-    /// 268 M parameters and 0.5 GiB of bf16 on qwen36's 27 blocks at
-    /// 1152 → 4304, written and multiplied to produce ones. The row costs one
-    /// kernel and one arm per shell.
+    /// The ungated GELU: `y = gelu_tanh(x)`, no `up` half. Every other gelu
+    /// row here multiplies by an `up` half; this one avoids paying the GEMM
+    /// and bank twice over to fake an all-ones `up`.
     MlpGeluTanh {
         x: ValueId,
         y: ValueId,
@@ -107,15 +77,10 @@ pub enum Linear {
         routes: ValueId,
         weights: ValueId,
     },
-    /// **ADDITIVE, FOR GEMMA 4's MIXTURE.** Softmax over the selected `top_k`
-    /// — the same denominator [`Self::MoeTopkSoftmax`] takes — and then one
-    /// more factor: the learned gain the router publishes for the expert each
-    /// slot chose, gathered by the routing vector this op just wrote.
-    ///
-    /// A variant rather than an optional operand on the plain softmax router,
-    /// for the reason [`Self::MoeTopkSqrtSoftplus`] is one: an unbound buffer
-    /// is not a null pointer on either shell, so a family with no gain would
-    /// have to bind a tensor it does not have.
+    /// For Gemma 4's mixture: [`Self::MoeTopkSoftmax`]'s softmax, times a
+    /// learned per-expert gain gathered by the routing vector this op wrote.
+    /// A variant rather than an optional operand, since an unbound buffer is
+    /// not a null pointer on either shell.
     MoeTopkSoftmaxScaled {
         logits: ValueId,
         /// `[experts]`, indexed by EXPERT and not by slot.
@@ -135,6 +100,13 @@ pub enum Linear {
         weights: ValueId,
     },
     /// Sigmoid routing with a per-expert bias; weights pass through sqrt-softplus.
+    ///
+    /// **`hint` IS A PREDICTION OF THE NEXT LAYER'S ROUTES, READ BY NOBODY.**
+    /// A [`Self::MoePredictRoute`] output the text hands this router so that
+    /// it stays LIVE across the router — the streamed tier reads it out of
+    /// the arena at this router's segment cut, beside the real routes, and
+    /// what it does with it (count, or prefetch) is the tier's. The kernel
+    /// never sees it.
     MoeTopkSqrtSoftplus {
         logits: ValueId,
         bias: ValueId,
@@ -142,41 +114,68 @@ pub enum Linear {
         top_k: u32,
         renormalize: bool,
         scaling: f32,
+        hint: Option<ValueId>,
         routes: ValueId,
         weights: ValueId,
     },
-    /// **ROUTING BY LOOKUP, NOT BY A GATE.** `tid2eid` is `[vocab, top_k]`
-    /// I64: for every token id it NAMES the `top_k` experts that id routes
-    /// to, at the uniform weight `1/top_k`. No router logits are computed at
-    /// all — the op reads the token ids and the table and lands the same
-    /// `routes` I32 / `weights` F32 pair every gate above it lands, so the
-    /// sorted-MoE path behind it cannot tell the two apart.
-    ///
-    /// DeepSeek-V4-Flash's first `num_hash_layers` layers route this way
-    /// (`ffn.gate.tid2eid`); every later layer carries the `noaux_tc`
-    /// correction bias and takes [`Self::MoeTopkSqrtSoftplus`].
-    ///
-    /// **AND IT STATES `experts` THOUGH IT READS NO LOGITS.** The kernel does
-    /// not need the number — the table names ids and the gather is over
-    /// `top_k` of them — but this op is a ROUTER, and the expert count is the
-    /// router's field for everything downstream that has to divide a bank by
-    /// it: the sorted-MoE tile (`engine_metal::scratch`) and, since wave W-a,
-    /// the residency plan that seats a fraction of a routed band
-    /// (`engine_metal::experts`). Neither can read it anywhere else — no
-    /// operand of `MoeMatmulSelect*` carries it and a bank's `[E, N·K]`
-    /// rectangle is a convention of the text that emitted it — so a hash
-    /// router that omitted it would make every layer it routes unseatable and
-    /// untileable, which is exactly what it did until this field existed.
-    MoeHashRoute {
-        ids: ValueId,
-        tid2eid: ValueId,
-        vocab: u32,
-        /// How many experts the bank behind this router declares. Not read by
-        /// the kernel; read by every pass that has to divide a band by it.
+    /// **A ROUTE PREDICTION**: the same sqrt-softplus-plus-bias ranking as
+    /// [`Self::MoeTopkSqrtSoftplus`], over logits computed EARLY — a later
+    /// layer's gate applied to the residual before this layer's experts
+    /// land — so that a streamed load can learn which experts the later
+    /// layer will want before its router runs. Not a router: no select reads
+    /// its `routes`, no segment is cut after it, and its `weights` are
+    /// unscaled scores nobody reads.
+    MoePredictRoute {
+        logits: ValueId,
+        bias: ValueId,
         experts: u32,
         top_k: u32,
         routes: ValueId,
         weights: ValueId,
+    },
+    /// Routing by lookup, not by a gate. `tid2eid` is `[vocab, top_k]` I64:
+    /// for every token id it names the `top_k` experts that id routes to, at
+    /// uniform weight `1/top_k`. No router logits computed; lands the same
+    /// `routes`/`weights` pair every gate above it lands.
+    /// The weights are the gate's: sqrt-softplus scores at the table's picks,
+    /// renormalized and scaled (the official `Gate.forward`), so `logits` is
+    /// read too — only the ranking is skipped.
+    MoeHashRoute {
+        ids: ValueId,
+        tid2eid: ValueId,
+        logits: ValueId,
+        vocab: u32,
+        /// Not read by the kernel; read by every pass that divides a band by it.
+        experts: u32,
+        top_k: u32,
+        renormalize: bool,
+        scaling: f32,
+        routes: ValueId,
+        weights: ValueId,
+    },
+    /// **THE STATIC ROUTES OF A GROUPED PROJECTION**: `routes[n, g] = g` for
+    /// every token row — the constant [`Self::MatmulGrouped`] walks.
+    GroupRoutes {
+        groups: u32,
+        routes: ValueId,
+    },
+    /// **A BLOCK-DIAGONAL PROJECTION**: `y[n, g·N + j] = Σₖ x[n, g·K + k] ·
+    /// w[g·N + j, k]` over `groups` even blocks of the row — one `[G·N, K]`
+    /// plane read as `G` independent `[N, K]` projections of `G` slices of the
+    /// input, which is a `[G, N, K]` bank walked by [`Self::GroupRoutes`].
+    ///
+    /// DeepSeek-V4-Flash's grouped o-projection is this: `wo_a` is `[o_groups
+    /// · o_lora, heads · head_dim / o_groups]` and the official forward is
+    /// `einsum("bsgd,grd->bsgr", o.view(b, s, groups, -1), wo_a.view(groups,
+    /// o_lora, -1))`. Summing the `G` slices first and projecting once — the
+    /// reading this tree fired before the reference was run against it —
+    /// hands every group the sum of every other group's slice.
+    MatmulGrouped {
+        x: ValueId,
+        w: ValueId,
+        routes: ValueId,
+        groups: u32,
+        y: ValueId,
     },
     /// Grouped matmul: each routed row multiplies the expert `routes` selects from `bank`.
     MoeMatmulSelect {
@@ -193,8 +192,7 @@ pub enum Linear {
         y: ValueId,
     },
     /// The bias-free twin of `MoeMatmulSelectBias`: a split-plane quantized
-    /// bank, nothing added inside the fold. `MoeMatmulSelect` cannot say this —
-    /// its `bank` resolves as one dense handle — and the routed bias a rows-cut
+    /// bank, nothing added inside the fold. The routed bias a rows-cut
     /// expert wants is said after the reduce, by `MoeBiasSum`.
     MoeMatmulSelectQuant {
         x: ValueId,
@@ -208,12 +206,9 @@ pub enum Linear {
         weights: ValueId,
         y: ValueId,
     },
-    /// The routed bias mixture, stated once on an already-folded activation:
-    /// `y[t] = x[t] + Σ_k weights[t, k] · bias[routes[t, k]]`. A replicated
-    /// bias folded into a rows-cut expert matmul would be summed once per rank
-    /// by the all_reduce that follows it; routing is computed from replicated
-    /// inputs, so the mixture can be said after the reduce instead, where it
-    /// lands exactly once.
+    /// The routed bias mixture, on an already-folded activation:
+    /// `y[t] = x[t] + sum_k weights[t,k] * bias[routes[t,k]]`, applied after
+    /// the reduce so it lands exactly once (not once per rank).
     MoeBiasSum {
         x: ValueId,
         bias: ValueId,
@@ -227,33 +222,14 @@ pub enum Linear {
         gate: ValueId,
         y: ValueId,
     },
-    /// **THE CORRECTION CLASS** (design §8, decision 17): `y += B[a]·(A[a]·x)`,
-    /// where `a = routes[row]` is the adapter this row's lane registered.
+    /// The correction class: `y += B[a]*(A[a]*x)`, where `a = routes[row]`
+    /// is the adapter this row's lane registered. In place (`y_out` aliases
+    /// `y`): a class whose guard does not hold reads `y` unchanged.
     ///
-    /// Family `Linear` by the ordered procedure's second criterion, and it is
-    /// the second criterion rather than the third: no token interacts with
-    /// another and no sequence cache is touched (so not `Attention`), and the
-    /// weights are LEARNED and the mixing is over channels (so not `Layout`'s
-    /// movement-without-compute). It reads as the MoE selects read — one bank
-    /// id, one `routes` id, the runtime index inside the op — because that is
-    /// what design §8's "follow that" names.
-    ///
-    /// **IN PLACE, AND THAT IS WHAT MAKES IT A CORRECTION.** `y_out` aliases
-    /// `y`, so the op owns no column of its own and the arena carve costs
-    /// nothing; a class whose guard does not hold never runs the node and
-    /// reads `y` unchanged, which is the identity without a merge, without an
-    /// arm, and without a φ. The additive form is the whole economy tart
-    /// measured at 1.01× the no-divergence floor: the trunk is `O(h·i)` and
-    /// this rides on it at `O(r·h)`.
-    ///
-    /// `bank_a` is `[adapters, rank, in]` and `bank_b` is `[adapters, out,
-    /// rank]` — first axis indexed by `routes`, and the LoRA scale `α/r` is
-    /// folded into `bank_b`'s contents at registration, which is where every
-    /// per-adapter number belongs (the eta-dsl adapter surface says the
-    /// same thing about the same scale). Rank diversity is bucketed by BANK,
-    /// not by a runtime table: an adapter shorter than its bank's rank is
-    /// registered zero-padded, which is exact, and a deployment that mixes
-    /// ranks widely declares a second bank rather than a branch.
+    /// `bank_a` is `[adapters, rank, in]`, `bank_b` is `[adapters, out,
+    /// rank]`, indexed by `routes`; the LoRA scale `alpha/r` is folded into
+    /// `bank_b` at registration. An adapter shorter than its bank's rank is
+    /// registered zero-padded.
     LoraCorrect {
         x: ValueId,
         bank_a: ValueId,
@@ -280,8 +256,14 @@ impl Operands for Linear {
             Self::MoeTopkSoftmax { logits, .. } => sink.push(*logits),
             Self::MoeTopkSoftmaxScaled { logits, scale, .. } => sink.extend([*logits, *scale]),
             Self::MoeTopkSigmoid { logits, .. } => sink.push(*logits),
-            Self::MoeTopkSqrtSoftplus { logits, bias, .. } => sink.extend([*logits, *bias]),
-            Self::MoeHashRoute { ids, tid2eid, .. } => sink.extend([*ids, *tid2eid]),
+            Self::MoeTopkSqrtSoftplus { logits, bias, hint, .. } => {
+                sink.extend([*logits, *bias]);
+                sink.extend(*hint);
+            }
+            Self::MoePredictRoute { logits, bias, .. } => sink.extend([*logits, *bias]),
+            Self::MoeHashRoute { ids, tid2eid, logits, .. } => sink.extend([*ids, *tid2eid, *logits]),
+            Self::GroupRoutes { .. } => {}
+            Self::MatmulGrouped { x, w, routes, .. } => sink.extend([*x, *w, *routes]),
             Self::MoeMatmulSelect { x, bank, routes, .. } => sink.extend([*x, *bank, *routes]),
             Self::MoeMatmulSelectBias { x, bank, bias, routes, .. } => {
                 sink.extend([*x, *bank, *bias, *routes]);
@@ -315,7 +297,10 @@ impl Operands for Linear {
             Self::MoeTopkSoftmaxScaled { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeTopkSigmoid { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeTopkSqrtSoftplus { routes, weights, .. } => sink.extend([*routes, *weights]),
+            Self::MoePredictRoute { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeHashRoute { routes, weights, .. } => sink.extend([*routes, *weights]),
+            Self::GroupRoutes { routes, .. } => sink.push(*routes),
+            Self::MatmulGrouped { y, .. } => sink.push(*y),
             Self::MoeMatmulSelect { y, .. } => sink.push(*y),
             Self::MoeMatmulSelectBias { y, .. } => sink.push(*y),
             Self::MoeMatmulSelectQuant { y, .. } => sink.push(*y),
@@ -327,10 +312,7 @@ impl Operands for Linear {
     }
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
         match self {
-            // The correction writes THROUGH the output it corrects: one
-            // column, read and added to, so the compiler folds the SSA pair
-            // onto one arena slot and a class that skips the node reads the
-            // uncorrected value at the same address.
+            // Writes through the output it corrects: one arena slot.
             Self::LoraCorrect { y, y_out, .. } => sink.push((*y_out, *y)),
             Self::Matmul { .. }
             | Self::LmHead { .. }
@@ -346,7 +328,10 @@ impl Operands for Linear {
             | Self::MoeTopkSoftmaxScaled { .. }
             | Self::MoeTopkSigmoid { .. }
             | Self::MoeTopkSqrtSoftplus { .. }
+            | Self::MoePredictRoute { .. }
             | Self::MoeHashRoute { .. }
+            | Self::GroupRoutes { .. }
+            | Self::MatmulGrouped { .. }
             | Self::MoeMatmulSelect { .. }
             | Self::MoeMatmulSelectBias { .. }
             | Self::MoeMatmulSelectQuant { .. }
@@ -371,7 +356,10 @@ impl Operands for Linear {
             Self::MoeTopkSoftmaxScaled { .. } => "linear.moe_topk_softmax_scaled",
             Self::MoeTopkSigmoid { .. } => "linear.moe_topk_sigmoid",
             Self::MoeTopkSqrtSoftplus { .. } => "linear.moe_topk_sqrt_softplus",
+            Self::MoePredictRoute { .. } => "linear.moe_predict_route",
             Self::MoeHashRoute { .. } => "linear.moe_hash_route",
+            Self::GroupRoutes { .. } => "linear.group_routes",
+            Self::MatmulGrouped { .. } => "linear.matmul_grouped",
             Self::MoeMatmulSelect { .. } => "linear.moe_matmul_select",
             Self::MoeMatmulSelectBias { .. } => "linear.moe_matmul_select_bias",
             Self::MoeMatmulSelectQuant { .. } => "linear.moe_matmul_select_quant",

@@ -75,9 +75,10 @@ pub enum Residency<'a> {
     Streaming,
 }
 
-/// Run a finished plan. One entry point for four independent decisions
+/// Run a finished plan. One entry point for five independent decisions
 /// -- where the arena is, where finalized tensors go, whether anyone is
-/// watching, whether to stream -- so a caller states only the ones that
+/// watching, whether to stream, whether the source is consumed on the way
+/// through -- so a caller states only the ones that
 /// differ from the defaults a test wants:
 ///
 /// ```ignore
@@ -98,6 +99,7 @@ pub struct Execution<'a> {
     streaming: bool,
     sink: Option<&'a mut dyn TensorSink>,
     progress: Option<&'a mut dyn FnMut(Progress<'_>)>,
+    consume: Option<&'a crate::consume::SourceLedger>,
 }
 
 impl<'a> Execution<'a> {
@@ -116,7 +118,30 @@ impl<'a> Execution<'a> {
             streaming: false,
             sink: None,
             progress: None,
+            consume: None,
         }
+    }
+
+    /// **CONSUME THE CHECKPOINT WHILE READING IT** — `pie model import
+    /// --consume-source`'s fifth decision, and the one that changes what is on
+    /// the disk rather than where the bytes go.
+    ///
+    /// Each source range this execution reads for the last time is handed back
+    /// to the filesystem as the read returns, so the source shrinks while the
+    /// output grows and the conversion needs room for one checkpoint rather
+    /// than two. On a 90 GiB 2-bit MoE whose schedule is not ascending — the
+    /// shape that spools the decoded set to disk before the artifact starts —
+    /// that is the difference between a 180 GiB peak and a 90 GiB one.
+    ///
+    /// `ledger` is what decides which ranges qualify; see
+    /// [`consume`](crate::consume) for the proof it carries and for what an
+    /// aborted import leaves behind. Without this the executor opens every
+    /// source file READ-ONLY, so an execution that was not asked to consume
+    /// cannot.
+    #[must_use]
+    pub fn consuming(mut self, ledger: &'a crate::consume::SourceLedger) -> Self {
+        self.consume = Some(ledger);
+        self
     }
 
     /// Write the plan's persistent buffers into an arena the CALLER owns.
@@ -185,6 +210,7 @@ impl<'a> Execution<'a> {
             streaming,
             sink,
             progress,
+            consume,
         } = self;
         let mut owned_sink = MemorySink::default();
         let mut unwatched = |_: Progress<'_>| {};
@@ -216,8 +242,10 @@ impl<'a> Execution<'a> {
                 (None, false) => Residency::Arena(&mut owned_backing),
             };
             match sink {
-                Some(sink) => walk::run(plan, snapshot_dir, residency, sink, progress)?,
-                None => walk::run(plan, snapshot_dir, residency, &mut owned_sink, progress)?,
+                Some(sink) => walk::run(plan, snapshot_dir, residency, sink, progress, consume)?,
+                None => {
+                    walk::run(plan, snapshot_dir, residency, &mut owned_sink, progress, consume)?;
+                }
             }
         }
         Ok(HostStorage {

@@ -1,6 +1,5 @@
-//! `Gate`: the one-variant family — a sigmoid gate applied in place. It
-//! lived beside `Mlp` in the old plane (its unit still does); the IR gives
-//! the family its own file, one entry per variant like every other.
+//! `Gate`: the one-variant family — a sigmoid gate applied in place. The
+//! family has its own file, one entry per variant like every other.
 
 use crate::error::Error;
 
@@ -11,7 +10,7 @@ const BLOCK: u32 = 256;
 
 /// `x *= sigmoid(gate)`, per element, in place on `x` (the IR aliases
 /// `x_out` onto `x`).
-pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, x: &mut Tensor) -> Result<(), Error> {
+pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.gate_sigmoid_mul";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert_eq!(gate.dtype, x.dtype, "the gate rides the rectangle's dtype");
@@ -42,6 +41,7 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, x: &mut Tensor) -> Result<(), Error>
             // `rows * width`, so the kernel needs the row's width to read the
             // staged row count and row start as elements.
             stated(OP, x.width)?.arg(),
+            stated(OP, fan)?.arg(),
             // The staged-geometry seat: the region's live-rows word when a
             // body replay armed one, and the null seat (`ABSENT`) otherwise.
             ctx.stage(),

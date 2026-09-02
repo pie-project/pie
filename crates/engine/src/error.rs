@@ -1,64 +1,18 @@
 //! `Error` — what an engine says when it will not do the thing.
 //!
-//! # The `PIE_STATUS_*` graveyard
-//!
-//! This enum replaces a block of `i32` constants that outlived the C ABI they
-//! were the return type of:
-//!
-//! ```text
-//! PIE_STATUS_OK               =  0   ->  Ok(_)
-//! PIE_STATUS_INVALID_ARGUMENT = -1   ->  Error::Invalid
-//! PIE_STATUS_BAD_ABI_VERSION  = -2   ->  (nothing — see below)
-//! PIE_STATUS_UNSUPPORTED      = -3   ->  Error::Unsupported
-//! PIE_STATUS_CLOSED           = -4   ->  Error::Closed
-//! PIE_STATUS_DRIVER_ERROR     = -5   ->  Error::Device
-//! PIE_STATUS_EXHAUSTED        = -6   ->  Error::Exhausted
-//! PIE_STATUS_IMPOSSIBLE       = -7   ->  Error::Impossible
-//! ```
-//!
-//! Every engine in this workspace is Rust and is called in-process through a
-//! `&mut dyn Engine`. Nothing marshals, so a status code bought nothing and
-//! cost the two things a code always costs: the caller had to keep a table to
-//! read it, and a code with no message attached had to be paired with a
-//! separate string that nothing made it agree with. `Err(Error::…)`
-//! carries both halves in one value and `match` checks the table.
-//!
-//! **`BAD_ABI_VERSION` has no successor, on purpose.** It guarded
-//! `PIE_DRIVER_ABI_VERSION`, a `u32` stamped into `DeviceFacts` and compared
-//! on every load — an ABI version on an in-process Rust call between two
-//! crates that Cargo compiles together, which cannot disagree. Where two
-//! *processes* really do face each other, the version is the transport's
-//! (decision 19: "remote is a property, not an encoding") and it is checked
-//! where the bytes are, not here.
-//!
-//! # Two of these are scheduling answers, not failures
-//!
-//! [`Error::Exhausted`] and [`Error::Impossible`] are what the old
-//! `FrameLaunchOutcome::{Exhausted, Impossible}` said, and they are the reason
-//! the runtime matched on the status ladder at all. A fire that does not fit
-//! **right now** is `Exhausted` — retry it behind something that frees pages.
-//! A fire that will never fit is `Impossible` — refuse the request. Keeping
-//! them as error variants rather than as a third `Ok` shape is deliberate:
-//! there is no ticket to hand back, and a caller that ignores the distinction
-//! gets a loud failure rather than a silently dropped submission.
+//! [`Error::Exhausted`] and [`Error::Impossible`] are scheduling answers, not
+//! faults: a fire that does not fit right now is `Exhausted` (retryable); one
+//! that never fits is `Impossible`.
 
 use std::fmt;
 
-/// What an engine answers when a verb does not complete.
-///
-/// One enum for every verb, because the shells answer a `Result` and the
-/// runtime's dispatch loop wants one `match`. Variants carry a message where a
-/// human is the audience and a number where the caller can act on it.
+/// What an engine answers when a verb does not complete. One enum for every
+/// verb, so the runtime's dispatch loop wants one `match`.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// This engine does not serve this verb at all.
-    ///
-    /// The one failure the runtime has always matched on rather than logged —
-    /// a Metal shell has no `copy_kv`, and a caller that asked is expected to
-    /// route around it rather than fail the request. Both halves are
-    /// `&'static str` so the value is `Copy`-cheap to build on the default
-    /// method bodies in [`Engine`](crate::Engine).
+    /// This engine does not serve this verb at all (e.g. Metal has no
+    /// `copy_kv`); the runtime matches on this rather than logging it.
     #[error("the {engine} engine does not serve `{verb}`")]
     Unsupported {
         /// The verb, spelled as the trait method.
@@ -67,11 +21,8 @@ pub enum Error {
         engine: &'static str,
     },
 
-    /// The submission is malformed: a CSR that decreases, a lane naming a slot
-    /// the pools do not have, a shape that does not multiply out.
-    ///
-    /// The caller built something the contract does not describe. It is not a
-    /// device condition and retrying it verbatim cannot help.
+    /// The submission is malformed (e.g. a CSR that decreases, a lane naming
+    /// a slot the pools do not have); retrying verbatim cannot help.
     #[error("invalid submission: {0}")]
     Invalid(String),
 
@@ -84,12 +35,8 @@ pub enum Error {
         id: u64,
     },
 
-    /// The device cannot fit this fire **now**, but a later one could.
-    ///
-    /// A scheduling answer (see the module header). `wanted`/`available` are
-    /// in whatever unit the exhausted resource counts in — pages, slots,
-    /// adapter banks — and `resource` names it, because a bare "exhausted" is
-    /// a log line and these three are a decision.
+    /// The device cannot fit this fire now, but a later one could.
+    /// `wanted`/`available` are in whatever unit `resource` names.
     #[error("{resource} exhausted: wanted {wanted}, {available} available")]
     Exhausted {
         /// Which pool ran out.
@@ -154,11 +101,6 @@ impl Error {
 
     /// True for the two variants that are scheduling answers rather than
     /// failures — see the module header.
-    ///
-    /// A caller that retries on [`Error::Exhausted`] and drops the
-    /// request on [`Error::Impossible`] is reading this correctly; one
-    /// that treats either as a device fault will either spin or give up on
-    /// work that would have run.
     #[must_use]
     pub const fn is_scheduling(&self) -> bool {
         matches!(
@@ -167,24 +109,8 @@ impl Error {
         )
     }
 
-    /// **True for the one refusal the runtime answers by submitting the same
-    /// frame again** (alto design §1 article 4).
-    ///
-    /// Article 4 splits [`is_scheduling`](Error::is_scheduling) in two, and
-    /// the split is the point of the article. Admission is atomic: a frame
-    /// that does not fit is refused **before any stream work**, with zero side
-    /// effects, so the identical frame is a legal thing to submit again the
-    /// moment something frees what it wanted. That is [`Error::Exhausted`],
-    /// and it is what the engine lane's retry-in-place loop turns on.
-    ///
-    /// [`Error::Impossible`] is scheduling too — it is an answer about
-    /// capacity rather than a fault — but it is permanent for this deployment
-    /// and retrying it is a spin. Everything else is a fault to surface.
-    ///
-    /// **RETRY IS NOT A LAUNCH OUTCOME.** This predicate reads an ADMISSION
-    /// refusal. A device gate that answered "retry" after the commit would be
-    /// a contract violation, because everything such a gate could refuse was
-    /// proved impossible at submit.
+    /// True only for [`Error::Exhausted`]: legal to resubmit unchanged once
+    /// something frees what it wanted. Never applies past admission.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         matches!(self, Error::Exhausted { .. })

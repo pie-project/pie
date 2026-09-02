@@ -1,11 +1,7 @@
-//! Submit a single inferlet to a running Pie engine and print its return value.
-//!
-//! This is the **client-submit** slice of the programmable-sampler 4090
-//! real-engine harness (Lane L6): it boots no engine of its own — point it at
-//! an already-running engine's client WebSocket (echo's `worker::runtime`
-//! boot on the GPU) — adds the inferlet program, launches it, and prints the
-//! `Return` value (the inferlet's `Result<String>`, e.g. the mirostat/grammar
-//! structured-JSON result hotel's assertions consume).
+//! Submit a single inferlet to a running Pie engine and print its return
+//! value. Boots no engine of its own: point it at an already-running
+//! engine's client WebSocket, and it adds the inferlet program, launches
+//! it, and prints the `Return` value (the inferlet's `Result<String>`).
 //!
 //! Usage:
 //! ```text
@@ -43,15 +39,14 @@ async fn main() -> Result<()> {
     let input = args.get(5).cloned().unwrap_or_else(|| "{}".to_string());
 
     let result = submit_inferlet(ws_host, inferlet, wasm_path, manifest_path, &input).await?;
-    // The structured-JSON result on stdout; a harness can parse it directly.
     println!("{result}");
     Ok(())
 }
 
-/// Connect to an already-running engine, register the inferlet program, launch
-/// it with `input`, and return the inferlet's `Return` value. Mirrors the
-/// canonical `pie` CLI submit flow (connect → authenticate → add → launch →
-/// recv) so echo's in-process harness can reuse the same sequence.
+/// Connect to an already-running engine, register the inferlet program,
+/// launch it with `input`, and return the inferlet's `Return` value.
+/// Mirrors the canonical `pie` CLI submit flow (connect, authenticate,
+/// add, launch, recv).
 pub async fn submit_inferlet(
     ws_host: &str,
     inferlet: &str,
@@ -59,16 +54,14 @@ pub async fn submit_inferlet(
     manifest_path: &Path,
     input: &str,
 ) -> Result<String> {
-    // The gateway's `/v1/ws` upgrade rejects a missing `x-pie-identity` with a
-    // 401 before the socket opens, so a standalone engine (no edge proxy to
-    // terminate identity) needs the header supplied here.
+    // the gateway's `/v1/ws` upgrade rejects a missing `x-pie-identity`, so a
+    // standalone engine needs the header supplied here.
     let identity = std::env::var("PIE_IDENTITY").unwrap_or_else(|_| "test-user".to_string());
     let client = Client::connect_with_identity(ws_host, &identity)
         .await
         .with_context(|| format!("connect to engine at {ws_host}"))?;
 
-    // No-auth path: the bench/test engine disables public-key auth, so
-    // `authenticate` returns early. (A keyed engine would pass a private key.)
+    // no-auth path: the bench/test engine disables public-key auth.
     client
         .authenticate("test-user", &None)
         .await
@@ -84,7 +77,6 @@ pub async fn submit_inferlet(
         .await
         .with_context(|| format!("launch_process {inferlet}"))?;
 
-    // Drain events until the process returns. `wait_for_return` forwards
-    // inferlet stdout/stderr for live debugging of the first real decode.
+    // forwards inferlet stdout/stderr for live debugging.
     proc.wait_for_return().await
 }

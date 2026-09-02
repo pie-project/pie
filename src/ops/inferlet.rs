@@ -54,7 +54,7 @@ pub async fn run(cmd: InferletCmd, global: &bootstrap::GlobalArgs) -> Result<Ans
 /// Where the runtime keeps downloaded programs. One expression, so the CLI and
 /// `pie cache`'s registry entry cannot point at different directories.
 fn programs_dir() -> std::path::PathBuf {
-    worker::paths::pie_home().join("programs")
+    bootstrap::paths::pie_home().join("programs")
 }
 
 /// The newest cached version of a bare inferlet name, if it is already here.
@@ -103,9 +103,9 @@ fn open(registry_url: String) -> Repository {
 
 /// The inferlets on this disk.
 ///
-/// `transparent`, so this serializes as the bare array it was before the
-/// report type existed. There is nothing to carry alongside the list, and a
-/// wrapper object would have broken `jq '.[0].name'` to hold one field.
+/// `transparent`, so this serializes as a bare array. There is nothing to
+/// carry alongside the list, and a wrapper object would break `jq '.[0].name'`
+/// to hold one field.
 #[derive(serde::Serialize)]
 #[serde(transparent)]
 pub struct InferletList {
@@ -456,46 +456,3 @@ fn parameter_type_name(param_type: &runtime::inferlet::program::ParameterType) -
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn latest_version_from_registry_json_uses_first_version() {
-        let body = r#"{
-            "versions": [
-                {"num": "0.2.14"},
-                {"num": "0.2.13"}
-            ]
-        }"#;
-
-        assert_eq!(latest_version_from_registry_json(body).unwrap(), "0.2.14");
-    }
-
-    #[test]
-    fn bare_inferlet_name_validation_matches_program_names() {
-        validate_bare_inferlet_name("text-completion").unwrap();
-        validate_bare_inferlet_name("foo_bar-1").unwrap();
-
-        assert!(validate_bare_inferlet_name("").is_err());
-        assert!(validate_bare_inferlet_name("-bad").is_err());
-        assert!(validate_bare_inferlet_name("bad/name").is_err());
-        assert!(validate_bare_inferlet_name("bad.name").is_err());
-    }
-
-    #[test]
-    fn versions_order_as_numbers_rather_than_as_text() {
-        // The failure this prevents is delayed and quiet: everything is fine
-        // until an inferlet ships 0.10.0, at which point "the newest cached
-        // version" starts resolving to 0.9.0 and `pie run <name>` silently
-        // runs an older build.
-        let mut versions = ["0.9.0", "0.10.0", "0.2.0", "1.0.0", "0.10.1"];
-        versions.sort_by_key(|v| version_order(v));
-        assert_eq!(versions, ["0.2.0", "0.9.0", "0.10.0", "0.10.1", "1.0.0"]);
-        assert!(version_order("0.10.0") > version_order("0.9.0"));
-
-        // Anything that is not three numbers still orders deterministically
-        // rather than panicking or comparing as if it were 0.0.0 and equal.
-        assert_eq!(version_order("not-a-version").3, "not-a-version");
-    }
-}

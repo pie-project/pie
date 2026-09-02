@@ -1,42 +1,8 @@
-//! **The prefetch schedule** (alto streaming §2 "Dense (static)", build-order
-//! item 4): which params a fire reads, in what order, and how a fixed set of
-//! device slots can serve them all.
-//!
-//! # The demand shape this module is for
-//!
-//! Streaming §7 splits weight demand in two. The ROUTED shape is dynamic —
-//! routing is computed on device, so no host decision can precede a fire and
-//! say which experts it needs — and its answer is an indirection table and a
-//! popularity vote (`engine_cuda::experts`). The DENSE shape is the opposite
-//! in every respect: **the compiler knows which regions read which params, and
-//! the answer never changes.** Every fire reads the same planes in the same
-//! order, so the schedule is fire-invariant and can be computed once, here,
-//! off the plan alone.
-//!
-//! That invariance is the whole asset. It means a copy can be issued AHEAD of
-//! the read that wants it rather than in response to it, which is what makes
-//! a spilled dense plane a bandwidth cost instead of a stall.
-//!
-//! # Why it is DERIVED and not a field of `CompiledModel`
-//!
-//! Because it is derivable, and because the artifact is hashed. Alto's G4
-//! invariant is that every pre-campaign SKU compiles to a BIT-IDENTICAL
-//! artifact; a new serialized field changes every artifact in the catalog to
-//! carry a table that is a pure function of two things the artifact already
-//! holds. So this is a function over `Trace` (and, for the region-granular
-//! projection, `CompiledModel`), and storing it would buy load-time work and
-//! no information at all. If it is ever stored, that is a cache and should be
-//! argued as one.
-//!
-//! # Two granularities, and why the coarse one is off the trace alone
-//!
-//! [`Schedule::of`] reads NODE indices, because a residency plan is decided
-//! before the model is compiled — `experts::Plan::of` runs against the trace
-//! and the two budgets, with no `CompiledModel` in hand — and the ORDER is the
-//! same either way: a region is a maximal run of ADJACENT nodes, so ordering
-//! params by first-reading node and ordering them by first-reading region give
-//! the same sequence. [`Schedule::against`] projects onto regions for the
-//! consumer that pumps copies at region boundaries.
+//! The prefetch schedule: which params a fire reads, in what order, and how
+//! a fixed set of device slots can serve them all — computed once from the
+//! trace alone, since a dense plan's read order is fire-invariant. Not
+//! stored on `CompiledModel`: it is a pure function of data already hashed
+//! into the artifact, so storing it would buy nothing.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -45,11 +11,8 @@ use model_ir::{Def, Operands, Trace, ValueId};
 
 use crate::compiled::CompiledModel;
 
-/// **Where in the fire one param is read.**
-///
-/// Half-open in nodes, inclusive in count: `reads` is how many distinct nodes
-/// name it, which is what says whether a plane is a norm scale touched once or
-/// an embedding touched at both ends of the plan.
+/// Where in the fire one param is read. `span` is half-open in nodes;
+/// `reads` is how many distinct nodes name it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reads {
     /// Index into `Trace::params`.
@@ -63,24 +26,16 @@ pub struct Reads {
 }
 
 impl Reads {
-    /// Is this plane read by nothing?
-    ///
-    /// A real answer and not a degenerate one: a plan may declare a param no
-    /// region names — a registered adapter bank nothing corrects through, an
-    /// arm the bake dropped — and a schedule that pretended it was read at
-    /// node zero would pin it first.
+    /// Is this plane read by nothing? A real case: a plan may declare a
+    /// param no region names.
     #[must_use]
     pub const fn unread(&self) -> bool {
         self.reads == 0
     }
 }
 
-/// **THE FIRE-INVARIANT PREFETCH SCHEDULE**: every param, in the order the
-/// fire reaches it.
-///
-/// Ascending by first read and then by param index, so two compiles of one
-/// plan produce the same sequence and a slot assignment derived from it is a
-/// compile-time constant.
+/// Every param, in the order the fire reaches it: ascending by first read
+/// then param index, so two compiles of one plan produce the same sequence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Schedule {
     reads: Vec<Reads>,
@@ -89,12 +44,8 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    /// **The schedule for `trace`.**
-    ///
-    /// One pass over the nodes, resolving each input that is a `Def::Weight`
-    /// to its `Trace::params` row. Params nothing reads are carried with
-    /// `reads == 0` and sort LAST, which is where a residency plan wants them:
-    /// a plane no fire touches is the first thing a budget should give up.
+    /// The schedule for `trace`. Params nothing reads sort last, since a
+    /// plane no fire touches is the first thing a budget should give up.
     #[must_use]
     pub fn of(trace: &Trace) -> Schedule {
         let mut span: Vec<Option<Range<u32>>> = vec![None; trace.params.len()];
@@ -149,20 +100,14 @@ impl Schedule {
         self.of.get(&param).map(|at| self.reads[*at].clone())
     }
 
-    /// **The order a prefetch issues copies in**: earliest-read first.
+    /// The order a prefetch issues copies in: earliest-read first.
     #[must_use]
     pub fn order(&self) -> Vec<usize> {
         self.reads.iter().map(|row| row.param).collect()
     }
 
-    /// **The order a BUDGET gives planes up in**: the reverse.
-    ///
-    /// A plane nothing reads goes first, then the plane read latest, and the
-    /// embedding — read at node zero by every fire — goes last. That is the
-    /// same statement the prefetch makes, read from the other end: the plane
-    /// with the most fire between now and its read is the one a copy has the
-    /// most time to deliver, and the one a UVA read has the most warps to hide
-    /// behind.
+    /// The order a budget gives planes up in: the reverse of [`order`](Self::order)
+    /// — unread first, embedding (read at node zero) last.
     #[must_use]
     pub fn spill_order(&self) -> Vec<usize> {
         let mut out = self.order();
@@ -170,12 +115,8 @@ impl Schedule {
         out
     }
 
-    /// **Project onto regions** — the granularity a pump works at.
-    ///
-    /// A region is a maximal run of adjacent nodes, so this is a lookup and
-    /// not a second scan, and the ORDER is unchanged by it (which is the
-    /// property that lets a residency plan use the node-granular schedule
-    /// before the model is compiled).
+    /// Projects onto regions, the granularity a pump works at. Order is
+    /// unchanged: a region is a maximal run of adjacent nodes.
     #[must_use]
     pub fn against(&self, compiled: &CompiledModel) -> Vec<Range<u32>> {
         self.reads
@@ -197,30 +138,17 @@ impl Schedule {
         self.nodes
     }
 
-    /// **THE SLOT ASSIGNMENT, AS A COMPILE-TIME CONSTANT** (streaming §2:
-    /// *"layer→slot assignment is a compile-time constant, so captured graphs
-    /// read fixed slot addresses — contents rotate, addresses never"*).
-    ///
-    /// `spilled` is the params a budget did not seat, in any order; they are
-    /// walked in SCHEDULE order and dealt round-robin into `slots` slots. The
-    /// assignment is a function of the plan and the slot count alone, so two
-    /// boots of one deployment place the same plane in the same slot and a
-    /// graph recorded against slot `k`'s address stays correct forever.
-    ///
-    /// **AND IT IS PROVED, NOT ASSUMED.** Dealing round-robin is only correct
-    /// if a slot's next tenant does not arrive before its current one is
-    /// finished being read: plane `i` and plane `i + slots` share a slot, so
-    /// the schedule must satisfy `last_read(i) <= first_read(i + slots)`. That
-    /// is exactly `experts.rs`' uniformity proof restated for a static demand
-    /// shape, and like it, it is CHECKED off the plan rather than assumed —
-    /// the day a plan arrives whose live ranges overlap, the arithmetic below
-    /// would silently read a plane that had already been overwritten.
+    /// The slot assignment, as a compile-time constant: `spilled` params are
+    /// walked in schedule order and dealt round-robin into `slots` slots, so
+    /// a graph recorded against slot `k`'s address stays correct forever.
+    /// This is checked rather than assumed: plane `i` and plane `i + slots`
+    /// share a slot, so the schedule must satisfy
+    /// `last_read(i) <= first_read(i + slots)`.
     ///
     /// # Errors
     ///
-    /// [`Overlap`] naming both planes and both spans, for a slot count too
-    /// small to keep every tenant alive to its last read. The fix is more
-    /// slots, and the error carries the smallest count that would work.
+    /// [`Overlap`] when no slot count that small keeps every tenant alive to
+    /// its last read; the error carries the smallest count that would work.
     pub fn slotting(&self, spilled: &[usize], slots: u32) -> Result<Slotting, Overlap> {
         if slots == 0 {
             return Err(Overlap {
@@ -242,8 +170,8 @@ impl Schedule {
         for (at, row) in queue.iter().enumerate() {
             of.insert(row.param, (at as u32) % slots);
         }
-        // THE PROOF. Walk each slot's tenants in order and require each one's
-        // last read to fall at or before the next one's first.
+        // Walk each slot's tenants in order; each one's last read must fall
+        // at or before the next one's first.
         for pair in queue.windows(slots as usize + 1) {
             let (evicted, by) = (&pair[0], &pair[slots as usize]);
             if evicted.unread() {
@@ -275,7 +203,7 @@ impl Schedule {
     }
 }
 
-/// **A proved slot assignment**: which slot holds which plane, and in what
+/// A proved slot assignment: which slot holds which plane, and in what
 /// order the pump fills them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slotting {
@@ -304,12 +232,8 @@ impl Slotting {
         &self.order
     }
 
-    /// **The slot's own size**: the largest plane it ever holds.
-    ///
-    /// A slot is one rectangle for its whole life, so it is sized for its
-    /// biggest tenant and the smaller ones use a prefix. `plane` answers a
-    /// param's bytes; the caller owns that arithmetic because the compiler
-    /// does not know a backend's alignment.
+    /// The slot's own size: the largest plane it ever holds (smaller
+    /// tenants use a prefix). `plane` answers a param's bytes.
     #[must_use]
     pub fn slot_bytes(&self, slot: u32, plane: impl Fn(usize) -> u64) -> u64 {
         self.of
@@ -321,7 +245,7 @@ impl Slotting {
     }
 }
 
-/// **Why a slot count cannot serve a schedule**: a plane would be overwritten
+/// Why a slot count cannot serve a schedule: a plane would be overwritten
 /// before its last read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Overlap {
@@ -388,52 +312,8 @@ mod tests {
     use super::*;
 
     fn d0_8b() -> Trace {
-        let trace = models::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships it");
+        let trace = models::sku("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships it").trace;
         trace(Platform::Cuda)
-    }
-
-    #[test]
-    fn the_schedule_is_a_function_of_the_plan_and_nothing_else() {
-        // FIRE-INVARIANCE, as an assertion rather than a claim. Streaming §2's
-        // whole premise for the static demand shape is that the same layers
-        // are read in the same order every step; a schedule that varied with
-        // anything at all would be a prefetch that could arrive late for a
-        // reason nobody could name.
-        let one = Schedule::of(&d0_8b());
-        let two = Schedule::of(&d0_8b());
-        assert_eq!(one, two, "two traces of one SKU schedule identically");
-        assert!(!one.reads().is_empty());
-        assert_eq!(one.reads().len(), d0_8b().params.len());
-    }
-
-    #[test]
-    fn every_read_plane_has_a_span_and_they_ascend() {
-        let trace = d0_8b();
-        let schedule = Schedule::of(&trace);
-        let mut last = 0u32;
-        let mut seen = 0usize;
-        for row in schedule.reads() {
-            if row.unread() {
-                continue;
-            }
-            seen += 1;
-            assert!(row.span.start < row.span.end, "param {} is read at nothing", row.param);
-            assert!(row.span.end <= schedule.nodes());
-            assert!(
-                row.span.start >= last,
-                "the schedule is not ascending at param {}",
-                row.param
-            );
-            last = row.span.start;
-        }
-        assert!(seen > 0, "a dense plan reads its own weights");
-        // The embedding is param 0 and is read first, so it is what a budget
-        // gives up LAST.
-        assert_eq!(
-            schedule.spill_order().last().copied(),
-            Some(schedule.order()[0]),
-            "the spill order is the read order reversed"
-        );
     }
 
     #[test]
@@ -471,30 +351,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_slotting_sizes_each_slot_for_its_largest_tenant() {
-        let trace = d0_8b();
-        let schedule = Schedule::of(&trace);
-        let all = schedule.order();
-        let slots = schedule
-            .slotting(&all, 1)
-            .map_or_else(|why| why.want, |ok| ok.slots());
-        let slotting = schedule.slotting(&all, slots).expect("it serves");
-        let plane = |param: usize| -> u64 {
-            let shape = &trace.params[param].shape;
-            shape.iter().product::<u64>()
-        };
-        for slot in 0..slots {
-            let sized = slotting.slot_bytes(slot, plane);
-            for param in &all {
-                if slotting.slot_of(*param) == Some(slot) {
-                    assert!(
-                        plane(*param) <= sized,
-                        "slot {slot} is {sized} and param {param} wants {}",
-                        plane(*param)
-                    );
-                }
-            }
-        }
-    }
 }

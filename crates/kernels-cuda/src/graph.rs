@@ -1,17 +1,5 @@
-//! `graph`: the launches a CUDA graph's own control flow is made of.
-//!
-//! **NOT A MODEL OP, AND THAT IS WHY IT IS ITS OWN FAMILY.** Every other
-//! family here computes something a `Trace` node names; this one computes
-//! nothing and appears in no plan. It exists because
-//! `cudaGraphSetConditional` is DEVICE-side — the only way a recorded `IF`
-//! node learns whether to take its body is a store a kernel makes into a
-//! handle the driver minted during the capture — so the engine's recording
-//! cursor needs a launch to put in the graph, and a launch is this plane's
-//! currency.
-//!
-//! The engine side is `engine_cuda::device::conditional`, which mints the
-//! handle, places the node and captures its body; this is the one piece of
-//! that sequence that has to be device text.
+//! Launches that set a CUDA graph's own conditional control flow (device-side
+//! stores into a `cudaGraphSetConditional` handle).
 
 use crate::error::Error;
 
@@ -24,17 +12,11 @@ fn once() -> Launch {
     Launch::grid([1, 1, 1], [1, 1, 1])
 }
 
-/// Whether a launch of a setter ARMS it or merely warms it.
+/// Whether a launch of a setter arms it or merely warms it.
 ///
-/// **THE WARM ARM IS NOT A COURTESY, IT IS THE ONLY PLACE THE MODULE CAN BE
-/// LOADED.** A unit is compiled and its module loaded on first launch; that is
-/// host work, and host work inside `cudaStreamBeginCapture` is what the
-/// thread-local capture mode exists to refuse. So a shell that is about to
-/// record a conditional fires the setter EAGERLY once with [`Arm::Warm`] —
-/// which returns before it reaches the handle, because a
-/// `cudaGraphSetConditional` outside a conditional graph's launch has nothing
-/// to store into — and the captured launch that follows finds the module
-/// resident.
+/// Warm loads the kernel module without storing; module load is host work,
+/// which is disallowed during stream capture, so a `Warm` fire runs eagerly
+/// once before the captured `Set` launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arm {
     /// Compile and load, store nothing.
@@ -52,15 +34,11 @@ impl Arm {
     }
 }
 
-/// **SET A CONDITIONAL HANDLE FROM A WINDOW'S ROW COUNT.**
+/// Sets a conditional handle from a window's row count.
 ///
-/// `indptr` is the device address of a window's rebased row CSR and `lanes`
-/// its lane count, so `indptr[lanes]` is the window's rows and the handle is
-/// set to `rows != 0` — the zero-row rule of decision #3, read on the device
-/// instead of taken on the host. `absent` is what a null `indptr` means: `1`
-/// for "a window with no staged table runs anyway", `0` for "it does not".
-///
-/// `handle` is a `CUgraphConditionalHandle`, which is a `u64`.
+/// `indptr` is the device address of a window's rebased row CSR; `lanes` its
+/// lane count. The handle is set to `indptr[lanes] != 0`. `absent` says what
+/// a null `indptr` means: `true` runs the body anyway, `false` skips it.
 ///
 /// # Errors
 ///
@@ -72,6 +50,7 @@ pub fn set_conditional(
     lanes: u32,
     absent: bool,
     arm: Arm,
+    win: u64,
 ) -> Result<(), Error> {
     const OP: &str = "graph.set_conditional";
     let lanes = i32::try_from(lanes).unwrap_or(i32::MAX);
@@ -84,12 +63,14 @@ pub fn set_conditional(
             lanes.arg(),
             u32::from(absent).arg(),
             arm.armed().arg(),
+            // win[2] is this fire's live lane count; `lanes` is the count seen
+            // at capture time, which a replay may not match.
+            crate::ArgValue::Ptr(win),
         ],
     )
 }
 
-/// The same store, from a device byte the caller staged rather than from a
-/// window table — the form a gate drives both arms of.
+/// Same store, from a device byte the caller staged rather than a window table.
 ///
 /// # Errors
 ///
@@ -114,23 +95,14 @@ pub fn set_conditional_byte(
     )
 }
 
-/// **SET A SWITCH HANDLE TO THIS ARM'S INDEX, IF THIS ARM HAS ROWS.**
+/// Sets a switch handle to this arm's index, if this arm has rows.
 ///
-/// The `SWITCH` twin of [`set_conditional`], and the difference is what a
-/// handle holds: an `IF`'s is a bool and a `SWITCH`'s is an arm index in
-/// `0..arms`, with "at or past `arms`" meaning no body runs at all. So a
-/// group's empty fire needs no store — the handle's DEFAULT is what says
-/// nothing runs, and the recorder mints it out of range on purpose.
+/// The `SWITCH` twin of [`set_conditional`]: the handle holds an arm index in
+/// `0..arms`, and any value at or past `arms` means no body runs (the
+/// recorder mints that as the default, so an empty fire needs no store).
 ///
-/// **CALLED ONCE PER ARM.** There is no single vector holding every arm's row
-/// count (each arm is its own region with its own window), so each arm gets
-/// its own launch with its own `indptr`, and each stores only if it is live.
-/// P3 proves at most one arm is demanded by any admissible composition, so at
-/// most one of those stores happens and their order cannot matter.
-///
-/// `indptr` at zero stores nothing: this arm stands down. The recorder never
-/// passes one — it refuses a SWITCH whose arm cannot state a row count — so
-/// that spelling belongs to a gate.
+/// Called once per arm, each with its own `indptr`; a null `indptr` (zero)
+/// means this arm stands down.
 ///
 /// # Errors
 ///
@@ -142,6 +114,7 @@ pub fn set_switch(
     indptr: u64,
     lanes: u32,
     warm: Arm,
+    win: u64,
 ) -> Result<(), Error> {
     const OP: &str = "graph.set_switch";
     let lanes = i32::try_from(lanes).unwrap_or(i32::MAX);
@@ -154,6 +127,8 @@ pub fn set_switch(
             crate::ArgValue::Ptr(indptr),
             lanes.arg(),
             warm.armed().arg(),
+            // Same live-lane-count seat as set_conditional's win arg.
+            crate::ArgValue::Ptr(win),
         ],
     )
 }

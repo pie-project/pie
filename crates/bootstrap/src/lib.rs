@@ -1,71 +1,7 @@
-//! `bootstrap` — the shared process skeleton for the pie bins, imported as
-//! `bootstrap`, plus the `pie-env` command that reports what that skeleton would
-//! resolve.
-//!
-//! Every bin (`bin/{worker,gateway,controller,pie}`) is a thin shell that
-//! composes `bootstrap` with one or more role libraries. `bootstrap` owns the
-//! cross-cutting, domain-agnostic concerns so each role lib stays a pure library:
-//!
-//! - the shared CLI flags as [`GlobalArgs`] (a `clap::Args` the bin flattens into
-//!   its own `Parser`, keeping one `--help` and typed role flags);
-//! - path/dir resolution ([`paths`]);
-//! - config *sourcing* — locate + read the config file into a **String**
-//!   ([`Ctx::config_str`]); the role lib's `Config::parse(&str)` owns all domain
-//!   parsing (the skeleton never sees a typed `Config`);
-//! - observability — `tracing` init + a minimal Prometheus-text `/metrics`
-//!   endpoint (ruling R2);
-//! - lifecycle — signal/panic handling, the boot banner, and the unified
-//!   wait-for-signal-then-drain loop ([`Ctx::run_until_signal`]).
-//!
-//! Dependency rule (Seam 2): `bootstrap` depends on **no role library**, and no
-//! role library depends on `bootstrap`. It is **runtime-agnostic** — the *bin*
-//! owns the tokio runtime (`#[tokio::main]`); the skeleton only `spawn`s onto the
-//! ambient one and its async surface is `.await`ed by the bin. The shutdown seam
-//! is a future, not a trait (ruling R1), so role `Handle`s never depend on
-//! the skeleton.
-//!
-//! ## The bin shape (Seam 3) — identical across all four but the middle lines
-//!
-//! ```ignore
-//! use clap::Parser;
-//!
-//! #[derive(Parser)]
-//! #[command(version)]
-//! struct Cli {
-//!     #[command(flatten)]
-//!     global: bootstrap::GlobalArgs,
-//!     // role-specific flags, read directly off `cli` (typed):
-//!     #[arg(long)]
-//!     listen: Option<String>,
-//! }
-//!
-//! #[tokio::main]
-//! async fn main() -> anyhow::Result<std::process::ExitCode> {
-//!     let cli = Cli::parse();
-//!     let ctx = bootstrap::init(
-//!         bootstrap::BootSpec::controller()
-//!             .version(env!("CARGO_PKG_VERSION")),
-//!         cli.global,
-//!     )?;
-//!     let cfg = controller::Config::parse(ctx.config_str())?;
-//!     let handle = controller::run(cfg).await?;            // async role run, awaited
-//!     Ok(ctx.run_until_signal(async move { handle.shutdown().await }).await)
-//! }
-//! ```
-//!
-//! `init` must be called inside the runtime (from the `#[tokio::main]` body) — it
-//! `spawn`s the `/metrics` task. `--version`/`--help` are handled by the bin's
-//! own `clap::Parser`. The `?`→`ExitCode` plumbing is just
-//! `-> anyhow::Result<ExitCode>` (both `Termination`), so no wrapper is needed.
-//!
-//! ## The `bootstrap` binary
-//!
-//! Everything above happens *inside* a daemon that is about to start listening.
-//! `bootstrap` runs the same resolution ([`report::resolve`]) and prints it
-//! instead — which config file a given role will actually read, where each value
-//! came from (flag / env / default), and whether the boot preconditions hold. It
-//! shares the resolution code with [`init`], so it cannot disagree with the
-//! daemons.
+//! Shared process skeleton for the pie bins: CLI flags, config sourcing,
+//! observability, and lifecycle (signal/panic handling, boot banner, drain).
+//! `bootstrap` depends on no role library; the `pie-env` binary reports what
+//! the skeleton would resolve without booting a daemon.
 
 mod config;
 pub use config::{Origin, cli_config_path};
@@ -145,14 +81,9 @@ impl BootSpec {
         self
     }
 
-    // ── Per-role conveniences ──────────────────────────────────────────────
-    //
-    // Just static identity (name + a per-role default config filename + a
-    // default metrics port) — NO role-lib dependency. Each daemon gets its own
-    // config filename because their `Config`s use `deny_unknown_fields` and so
-    // can't share one top-level file (the multi-section standalone file is
-    // `bin/pie`'s concern). Bins still chain `.version(env!("CARGO_PKG_VERSION"))`
-    // (the bin's own version), and may override any field.
+    // Per-role conveniences: static identity only, no role-lib dependency.
+    // Each daemon gets its own config filename since `deny_unknown_fields`
+    // rules out sharing one top-level file.
 
     /// `bin/worker` daemon identity (`worker.toml`, metrics `127.0.0.1:9100`).
     pub fn worker() -> Self {
@@ -215,7 +146,7 @@ impl Ctx {
     /// caller's `shutdown` future (typically
     /// `async move { handle.shutdown().await }`) and return an [`ExitCode`].
     ///
-    /// The shutdown seam is a future, not a trait (R1). `.await` this from the
+    /// The shutdown seam is a future, not a trait. `.await` this from the
     /// bin's `#[tokio::main]` body — the skeleton owns no runtime.
     pub async fn run_until_signal(self, shutdown: impl Future<Output = ()>) -> ExitCode {
         lifecycle::wait_for_signal().await;
@@ -234,44 +165,24 @@ fn init_observability(log_level: &str) {
     install_crypto_provider();
 }
 
-/// Choose the process-wide TLS backend.
-///
-/// Every HTTPS client in a pie process is built on reqwest's
-/// `rustls-no-provider`: rustls then refuses to guess a crypto backend, and the
-/// first `Client::builder().build()` fails at runtime unless someone has said
-/// which one to use. That someone is process boot, once, before any role can
-/// reach the network -- the alternative is each of four bins plus the embedded
-/// Python engine remembering to do it, and only finding out they forgot when a
-/// model download fails on a user's machine.
-///
-/// Idempotent by construction: `install_default` returns `Err` when a provider
-/// is already installed, which is a fact rather than a failure (the Python
-/// wheel boots the engine in a host process that may have installed its own).
+/// Installs the process-wide TLS backend rustls needs (reqwest is built on
+/// `rustls-no-provider`, so this must run before any HTTPS client is built).
+/// Idempotent: an already-installed provider is not an error.
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// **CLI invocation** init for one-shot ops subcommands (`pie model list`,
-/// `doctor`, `config show`, …): tracing + the panic hook only — **no** banner,
-/// config sourcing, or `/metrics` (that daemon ceremony is odd UX on a one-shot
-/// op, and an op shouldn't error just because no config file exists). Pair with
-/// [`paths`] for any path lookups. Daemon/serving paths use the full [`init`].
-///
-/// Runtime-free, so it's callable from a sync `main` too. Returns `Result<()>`
-/// for symmetry with [`init`] and headroom for future fallible CLI setup
-/// (today it cannot fail).
+/// Init for one-shot ops subcommands (`pie model list`, `doctor`, ...):
+/// tracing and the panic hook only, no banner/config/metrics. Runtime-free.
+/// Daemon/serving paths use the full [`init`].
 pub fn init_cli(global: &GlobalArgs) -> Result<()> {
     init_observability(&global.log_level);
     Ok(())
 }
 
-/// **Daemon boot** init: source the config string, init tracing, install the
-/// panic hook, start `/metrics`, and print the banner. Call once near the top of
-/// a bin's `#[tokio::main]` body, passing the bin's flattened [`GlobalArgs`].
-///
-/// Must run inside a tokio runtime (it `spawn`s the `/metrics` task). Returns an
-/// error only for genuine bootstrap failures (bad config path, unparsable /
-/// unbindable `--metrics-addr`).
+/// Daemon boot init: sources the config string, inits tracing, installs the
+/// panic hook, starts `/metrics`, and prints the banner. Call once near the
+/// top of a bin's `#[tokio::main]` body; must run inside a tokio runtime.
 pub fn init(spec: BootSpec, global: GlobalArgs) -> Result<Ctx> {
     // Same observability setup as the CLI flavor (single-sourced, can't drift).
     init_observability(&global.log_level);

@@ -1,44 +1,18 @@
-//! `Attention`: paged sdpa over the fire's kv pool — the vector (decode) and
-//! tiled (prefill) shaders, the appenders, and the plan payloads this plane's
-//! attention carries. One entry per IR variant.
-//!
-//! The plans hold what the old plane's `AttnFireView` carried beside the
-//! pool: the per-token fire tables (positions, owning request, mask) every
-//! sdpa launch reads. Metal splits nothing — no partials, no split-k policy —
-//! so a plan is tables, not workspaces, and building one encodes no device
-//! work. The driver stores it behind `Box<dyn Any>` (design §6) and hands it
-//! back to every fire built from it. The appenders are plan-free: they
-//! address by the `write_page`/`write_offset` tables their ops state.
-//!
-//! The attention families that shared the old file keep their seats here:
-//! [`mla`], [`index`], and [`pool`] are ported whole now, and the only typed
-//! refusals left in the three are the two that name a SLAB THE LOAD DID NOT
-//! RESERVE — which no plan naming the op can reach, because the reservation is
-//! made from the op. [`ssm`], the recurrent mixer, sits beside them. `gate`
-//! left for [`elemwise::gate`](crate::elemwise::gate):
-//! it is elementwise, not attention.
+//! `Attention`: paged sdpa over the fire's kv pool — the vector/tiled shaders, appenders, and plan payloads this plane's attention carries.
 
 pub mod arbiter;
 
-/// The vision towers' bidirectional attention over the patch window — a
-/// file of its own beside this one, sharing nothing with the paged family
-/// but the word (`.wiki/alto/multimodal.md` §2). The CUDA twin had to be
-/// re-homed by `#[path]` because its wave could not touch `attn.rs`; this
-/// line is the declaration that one is owed.
+/// The vision towers' bidirectional attention over the patch window,
+/// sharing nothing with the paged family but the word.
 pub mod dense;
 
 pub mod merge;
 
-/// qwen4's PLE n-gram hasher — a file of its own beside [`ssm`], whose
-/// chunked shape it borrows: it is an `Attention` only by the clause that
-/// counts a sequence cache, and everything else about it is per-token integer
-/// arithmetic over token ids.
+/// qwen4's ple n-gram hasher: an `Attention` only by the clause that
+/// counts a sequence cache; otherwise per-token integer arithmetic over token ids.
 pub mod ple;
 
-/// The alto observability door's capture — per-key attention mass over an
-/// observation window, a file of its own beside this one for the reason
-/// `.wiki/alto/attn-score.md` §5 states in as many words ("agent-built in a
-/// NEW FILE outside `attn.rs`/`attn/kv.rs`").
+/// The observability door's capture: per-key attention mass over an observation window.
 pub mod score;
 
 pub mod ssm;
@@ -110,9 +84,9 @@ pub struct DecodePlan {
     pub mask_stride: u32,
 }
 
-/// The prefill twin of [`DecodePlan`] — the tiled shader reads the same
-/// tables, so the payloads agree; the types stay distinct because the IR
-/// declares distinct struct kinds and the driver downcasts by them.
+/// The prefill twin of [`DecodePlan`] — same tables (the tiled shader
+/// reads them the same way), kept a distinct type since the IR declares
+/// distinct struct kinds the driver downcasts by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefillPlan {
     /// `i32`, one per token: absolute position — the causal bound.
@@ -131,11 +105,9 @@ pub struct PrefillPlan {
     pub mask_stride: u32,
 }
 
-/// The fire tables the driver binds beside the ops' named operands. They
-/// reach the plan builders without an op naming them (`attention.masked`
-/// names the mask alone, and only for its own launch), so the trace-time
-/// validator never sees this binding — disagreement is refused, not
-/// asserted (the boundary rule at [`refuse`]).
+/// The fire tables the driver binds beside the ops' named operands,
+/// reaching the plan builders without any op naming them, so the
+/// trace-time validator never sees this binding — disagreement is refused, not asserted.
 fn tables_agree(
     op: &'static str,
     positions: Tensor,
@@ -195,16 +167,13 @@ fn tables_agree(
 }
 
 /// Builds the decode plan. Metal derives no split policy and sizes no
-/// partials — everything else the old plane computed rode on the operands —
-/// so the context encodes nothing, and the build fails only by refusing
+/// partials, so building encodes no device work; it fails only by refusing
 /// fire tables the driver bound wrong.
 ///
-// MENLO-SEAM: `attention.plan_decode` in the IR names kv geometry —
-// kv_indptr/kv_indices/last_page_len (never even seated here) and the
-// `kv_len` this entry takes to stay aligned with the op — that this plan
-// never reads: the pool row carries the page walk and the shaders bound by
-// `positions`. The fire tables the plan does carry are not named by the op;
-// the driver binds them from its fire state.
+// The IR's `plan_decode` op names kv geometry (kv_indptr/kv_indices/
+// last_page_len/kv_len) this plan never reads — the pool row carries the
+// page walk instead. The fire tables it does carry aren't named by the
+// op; the driver binds them from its own fire state.
 pub fn plan_decode(
     ctx: &Ctx<'_>,
     kv_len: Tensor,
@@ -231,12 +200,8 @@ pub fn plan_decode(
     })
 }
 
-/// Builds the prefill plan; see [`plan_decode`] — the same tables, the same
-/// absence of device work.
-///
-// MENLO-SEAM: same misalignment as `plan_decode` — the op names kv geometry
-// (`kv_len` seated, the rest never even taken) the plan never reads, and
-// the fire tables come from driver fire state.
+/// Builds the prefill plan; see [`plan_decode`] — the same tables, the
+/// same absence of device work and the same op/plan geometry mismatch.
 pub fn plan_prefill(
     ctx: &Ctx<'_>,
     kv_len: Tensor,
@@ -343,8 +308,8 @@ fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> 
     Ok(width / head_dim)
 }
 
-/// The paged shape one sdpa fire launches over, derived where the old plane
-/// derived it: heads from the query row, kv heads from the pool strides.
+/// The paged shape one sdpa fire launches over: heads from the query row,
+/// kv heads from the pool strides.
 struct Paged {
     q_heads: u32,
 
@@ -589,8 +554,7 @@ pub fn decode_lse(
 }
 
 /// The boundaries ride in `q`, but this shader walks the plan's
-/// `request_of_token` instead — the indptr goes unread, as the old plane's
-/// did.
+/// `request_of_token` instead — the indptr goes unread.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill(
     ctx: &Ctx<'_>,
@@ -644,11 +608,9 @@ pub fn prefill_lse(
 /// the same tiled shader, with `mask` in the seat the causal entries fill
 /// from the plan.
 ///
-// MENLO-SEAM: the plan carries mask tables of its own — every sdpa launch
-// reads the mask seats, so the causal entries need them too — and the
-// driver resolves `RuntimeInput::Mask` onto that same fire table: the
-// op-named `mask` and `plan.mask` are one buffer wearing two names, and
-// `mask_stride`/`mask_enabled` stay plan-carried because no op names them.
+// The op-named `mask` and `plan.mask` are one buffer wearing two names:
+// the driver resolves `RuntimeInput::Mask` onto the same fire table every
+// sdpa launch reads. `mask_stride`/`mask_enabled` stay plan-carried since no op names them.
 #[allow(clippy::too_many_arguments)]
 pub fn masked(
     ctx: &Ctx<'_>,
@@ -884,11 +846,9 @@ pub mod mla {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MlaPlan;
 
-    // MENLO-SEAM (kernel side): the op names kv geometry
-    // (kv_indptr/kv_indices/last_page_len/kv_len) that this plane's attention
-    // never reads — the pool row carries the page walk and the shaders bound by
-    // `positions` — so the builder takes them only to stay shaped like the
-    // paged plan builders and encodes nothing.
+    // The op names kv geometry (kv_indptr/kv_indices/last_page_len/kv_len)
+    // this plane's attention never reads (the pool row carries the page
+    // walk); the builder takes them only to stay shaped like the paged plan builders.
     pub fn plan(
         _ctx: &Ctx<'_>,
         _kv_indptr: Tensor,
@@ -1075,23 +1035,16 @@ pub mod mla {
         )
     }
 
-    /// The absorb's other half — the latent attention reading mapped back
-    /// through `kv_b`'s value planes: `o[t,h,:] = latent[t,h,:] · W_UV[h]ᵀ`,
-    /// where `W_UV[h]` is the `[v_dim, rank]` block sitting immediately after
-    /// head `h`'s `[nope, rank]` key-up block inside the same
-    /// `[heads·(nope+v_dim), rank]` checkpoint weight `absorb_q` reads.
+    /// The absorb's other half — latent attention read back through
+    /// `kv_b`'s value planes: `o[t,h,:] = latent[t,h,:] · W_UV[h]ᵀ`, where
+    /// `W_UV[h]` is the `[v_dim, rank]` block right after head `h`'s
+    /// `[nope, rank]` key-up block, inside the same `[heads·(nope+v_dim),
+    /// rank]` checkpoint weight `absorb_q` reads.
     ///
-    /// **THE V-BLOCK BASE, WHICH THIS ENTRY WAS ONCE DEFERRED OVER.**
-    /// `mla.rs` starts its A operand at `kv_b.ptr.wrapping_add(2·nope·rank)`,
-    /// which read as an element count is not the standard packing and is what
-    /// stopped the port. `Tensor::ptr` is a device ADDRESS and that add is in
-    /// BYTES (`kernels-cuda`'s own `plane_bytes = rows·width·2` guard is
-    /// written in the same units); the `2` is `sizeof(bf16)`. The base is
-    /// `nope·rank` ELEMENTS, the per-head stride is `(nope+v_dim)·rank`, and
-    /// the packing is exactly the standard one — heads outer, the key-up and
-    /// value-up blocks contiguous within a head, each row `rank` wide.
-    /// `engine-metal/tests/mla_on_device.rs` measures it end to end against
-    /// the unabsorbed attention rather than resting on the reading.
+    /// The V-block base is `nope·rank` elements (`Tensor::ptr`'s offset is
+    /// in bytes, not elements); the per-head stride is `(nope+v_dim)·rank`,
+    /// heads outer with key-up/value-up blocks contiguous within a head.
+    /// `mla_on_device.rs` measures this end to end against the unabsorbed attention.
     #[allow(clippy::too_many_arguments)]
     pub fn absorb_out(
         ctx: &Ctx<'_>,
@@ -1385,7 +1338,7 @@ pub mod mla {
     /// Prefill over the sparse selection; same engine, same selection row, the
     /// causal bound per row read from `positions` as the dense prefill reads it.
     ///
-    /// **CAUSALITY IS ONE BOUND HERE, NOT TWO.** `mla.rs` splits the two
+    /// Causality is one bound here, not two. `mla.rs` splits the two
     /// selected entries by a `causal` flag (`false` for decode, `true` for
     /// prefill) that only ever chooses between `kv_len` and `abs_q + 1`. This
     /// plane's engine bounds by `positions[row] + 1` for both, which is
@@ -1423,10 +1376,10 @@ pub mod mla {
     }
 
     /// The key walk a selected reader performs, in host arithmetic — the
-    /// deviceless pin on the ONE part of `mla_naive_paged_selected` that is a
+    /// deviceless pin on the one part of `mla_naive_paged_selected` that is a
     /// semantic rather than a launch.
     ///
-    /// **IT IS HERE SO THE SELECTION READ CAN BE TESTED WITHOUT A GPU**, the
+    /// It is here so the selection read can be tested without a gpu, the
     /// way [`super::index::bisect_select`] pins the selection *write*. Nothing
     /// on the fire path calls it: the sweep runs on the device, in the shader,
     /// over the row `index_topk_paged` wrote. Every line has a line above it in
@@ -1480,7 +1433,7 @@ pub mod mla {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::encode::ArgValue;
+        
         use crate::probe::Probe;
 
         const RANK: u32 = 512;
@@ -1514,157 +1467,6 @@ pub mod mla {
             }
         }
 
-        /// **THE LATENT SPLIT IS ONE THREADGROUP PER ROW**, over `mla.metal`'s
-        /// rms-reducing entry, with the rank/rope/stride/eps the shader reads.
-        #[test]
-        fn latents_marshals_a_per_row_reduce() {
-            let probe = Probe::default();
-            let kv_a = bf16(1, 3, RANK + ROPE);
-            latents(&probe, kv_a, bf16(2, 1, RANK), 1e-6, RANK, bf16(3, 3, RANK), bf16(4, 3, ROPE))
-                .expect("the latent split enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "mla_latents_bfloat16");
-            assert_eq!(f.file, "attn/mla.metal");
-            assert_eq!(f.lanes, [PREP_THREADS * 3, 1, 1]);
-            assert_eq!(f.group, [PREP_THREADS, 1, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1));
-            assert_eq!(a[1], ArgValue::Buffer(2));
-            assert_eq!(a[2], ArgValue::BufferMut(3));
-            assert_eq!(a[3], ArgValue::BufferMut(4));
-            assert_eq!(a[4], ArgValue::I32(RANK as i32));
-            assert_eq!(a[5], ArgValue::I32(ROPE as i32));
-            assert_eq!(a[6], ArgValue::I32((RANK + ROPE) as i32));
-            assert_eq!(a[7], ArgValue::F32(1e-6));
-        }
-
-        /// The `_rope` twin is the split THEN a proportional neox over the tail
-        /// — two launches, `mla.cuh`'s `latents` + `rope::partial_q`.
-        #[test]
-        fn latents_rope_is_the_split_then_a_tail_rotation() {
-            let probe = Probe::default();
-            let kv_a = bf16(1, 2, RANK + ROPE);
-            latents_rope(
-                &probe, kv_a, i32t(9, 2), bf16(2, 1, RANK), 1e-6, RANK, ROPE, 10000.0,
-                bf16(3, 2, RANK), bf16(4, 2, ROPE),
-            )
-            .expect("the roped split enqueues");
-            let fires = probe.fires();
-            assert_eq!(fires.len(), 2, "the split and the tail rotation");
-            assert_eq!(fires[0].0.entrypoint, "mla_latents_bfloat16");
-            assert_eq!(fires[1].0.entrypoint, "neox_prop_mb_bfloat16");
-            assert_eq!(fires[1].0.file, "elemwise/rope_neox.metal");
-            // The rotation turns the tail in place: k_pe is the mutated buffer.
-            assert_eq!(fires[1].1[0], ArgValue::BufferMut(4));
-        }
-
-        /// The q split is one thread per source element; the flat lane count is
-        /// `rows · heads · (nope + rope)`.
-        #[test]
-        fn split_q_b_is_flat_over_every_source_element() {
-            let probe = Probe::default();
-            let per = NOPE + ROPE;
-            let q_b = bf16(1, 2, HEADS * per);
-            split_q_b(&probe, q_b, HEADS, NOPE, ROPE, bf16(2, 2, HEADS * NOPE), bf16(3, 2, HEADS * ROPE))
-                .expect("the q split enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "mla_split_q_b_bfloat16");
-            let total = 2 * HEADS * per;
-            assert_eq!(f.lanes, [total, 1, 1]);
-            assert_eq!(a[3], ArgValue::I32(total as i32));
-            assert_eq!(a[4], ArgValue::I32(HEADS as i32));
-            assert_eq!(a[5], ArgValue::I32(NOPE as i32));
-            assert_eq!(a[6], ArgValue::I32(ROPE as i32));
-        }
-
-        /// The latent appender writes both planes by the op-named write tables:
-        /// ckv into the keys pages, kpe into the values pages.
-        #[test]
-        fn kv_append_addresses_both_planes_by_the_write_tables() {
-            let probe = Probe::default();
-            let pool = latent_pool();
-            kv_append(&probe, bf16(1, 3, RANK), bf16(2, 3, ROPE), &pool, u32t(5, 3), u32t(6, 3))
-                .expect("the latent append enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "mla_kv_append_bfloat16");
-            assert_eq!(f.lanes, [RANK, 3, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1));
-            assert_eq!(a[1], ArgValue::Buffer(2));
-            assert_eq!(a[2], ArgValue::BufferMut(30)); // keys pages == ckv
-            assert_eq!(a[3], ArgValue::BufferMut(31)); // values pages == kpe
-            assert_eq!(a[4], ArgValue::Buffer(5));
-            assert_eq!(a[5], ArgValue::Buffer(6));
-            assert_eq!(a[6], ArgValue::I32(16));
-            assert_eq!(a[7], ArgValue::I32(RANK as i32));
-            assert_eq!(a[8], ArgValue::I32(ROPE as i32));
-        }
-
-        /// The q-absorb is one thread per `(rank lane, head, token)`, over the
-        /// `[heads·(nope+v_dim), rank]` weight.
-        #[test]
-        fn absorb_q_is_one_thread_per_latent_output() {
-            let probe = Probe::default();
-            let q_nope = bf16(1, 2, HEADS * NOPE);
-            absorb_q(&probe, q_nope, bf16(2, HEADS * (NOPE + NOPE), RANK), HEADS, RANK, NOPE, NOPE, bf16(3, 2, HEADS * RANK))
-                .expect("the q absorb enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "mla_absorb_q_bfloat16");
-            assert_eq!(f.lanes, [RANK, HEADS, 2]);
-            assert_eq!(f.group, [SIMD, 1, 1]);
-            assert_eq!(a[3], ArgValue::I32(HEADS as i32));
-            assert_eq!(a[4], ArgValue::I32(RANK as i32));
-            assert_eq!(a[5], ArgValue::I32(NOPE as i32));
-            assert_eq!(a[6], ArgValue::I32(NOPE as i32));
-        }
-
-        /// The dense reader is one simdgroup per `(head, row)`; keys/values ride
-        /// the ckv/kpe seats, and the causal bound rides `positions`.
-        #[test]
-        fn decode_is_a_simdgroup_per_head_row() {
-            let probe = Probe::default();
-            let pool = latent_pool();
-            attention_decode(
-                &probe, bf16(1, 2, HEADS * RANK), bf16(2, 2, HEADS * ROPE), &pool,
-                i32t(7, 2), i32t(8, 2), HEADS, RANK, 0.5, bf16(3, 2, HEADS * RANK),
-            )
-            .expect("the latent decode enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "mla_naive_paged_bfloat16");
-            assert_eq!(f.lanes, [HEADS * SIMD, 2, 1]);
-            assert_eq!(f.group, [SIMD, 1, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1)); // q_latent
-            assert_eq!(a[1], ArgValue::Buffer(2)); // q_pe
-            assert_eq!(a[2], ArgValue::Buffer(30)); // ckv pages
-            assert_eq!(a[3], ArgValue::Buffer(31)); // kpe pages
-            assert_eq!(a[4], ArgValue::BufferMut(3)); // o
-            assert_eq!(a[5], ArgValue::Buffer(7)); // positions
-            assert_eq!(a[6], ArgValue::Buffer(8)); // request_of_token
-            assert_eq!(a[9], ArgValue::I32(16)); // page_size
-            assert_eq!(a[10], ArgValue::I32(HEADS as i32));
-            assert_eq!(a[11], ArgValue::I32(RANK as i32));
-            assert_eq!(a[12], ArgValue::I32(ROPE as i32));
-            assert_eq!(a[13], ArgValue::F32(0.5));
-        }
-
-        /// Prefill is the same flash engine over `q.data`.
-        #[test]
-        fn prefill_shares_the_flash_engine() {
-            let probe = Probe::default();
-            let pool = latent_pool();
-            let q = RaggedTensor {
-                data: bf16(1, 5, HEADS * RANK),
-                indptr: i32t(9, 3),
-            };
-            attention_prefill(
-                &probe, q, bf16(2, 5, HEADS * ROPE), &pool, i32t(7, 5), i32t(8, 5),
-                HEADS, RANK, 0.5, bf16(3, 5, HEADS * RANK),
-            )
-            .expect("the latent prefill enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "mla_naive_paged_bfloat16");
-            assert_eq!(f.lanes, [HEADS * SIMD, 5, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1)); // q.data, not the indptr
-        }
-
         /// A latent rank the register strips cannot hold is refused by name,
         /// not launched.
         #[test]
@@ -1680,32 +1482,6 @@ pub mod mla {
             assert!(probe.fires().is_empty());
         }
 
-        /// The output-absorb is one thread per `(value lane, head, token)`,
-        /// over the same `[heads·(nope+v_dim), rank]` weight the q-absorb
-        /// reads — and its trailing pair is `v_dim, nope`, the reverse of the
-        /// q-absorb's `nope, v_dim`, because that is the order `mla.rs`'s two
-        /// entries take them in and the seat order no type can catch.
-        #[test]
-        fn absorb_out_is_one_thread_per_value_output() {
-            const VDIM: u32 = 128;
-            let probe = Probe::default();
-            let latent = bf16(1, 2, HEADS * RANK);
-            absorb_out(&probe, latent, bf16(2, HEADS * (NOPE + VDIM), RANK), HEADS, RANK, VDIM, NOPE, bf16(3, 2, HEADS * VDIM))
-                .expect("the output absorb enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "mla_absorb_out_bfloat16");
-            assert_eq!(f.file, "attn/mla.metal");
-            assert_eq!(f.lanes, [VDIM, HEADS, 2]);
-            assert_eq!(f.group, [SIMD, 1, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1));
-            assert_eq!(a[1], ArgValue::Buffer(2));
-            assert_eq!(a[2], ArgValue::BufferMut(3));
-            assert_eq!(a[3], ArgValue::I32(HEADS as i32));
-            assert_eq!(a[4], ArgValue::I32(RANK as i32));
-            assert_eq!(a[5], ArgValue::I32(VDIM as i32));
-            assert_eq!(a[6], ArgValue::I32(NOPE as i32));
-        }
-
         /// A zero value width sizes an empty threadgroup as well as an empty
         /// grid; it is refused by name rather than launched.
         #[test]
@@ -1717,95 +1493,9 @@ pub mod mla {
             assert!(probe.fires().is_empty());
         }
 
-        /// **THE V-BLOCK BASE, IN HOST ARITHMETIC.** The one number the port
-        /// was deferred over, stated where it can be read without a GPU: the
-        /// CUDA entry's `wv = kv_b.ptr.wrapping_add(2·nope·rank)` is a BYTE
-        /// add over a device address, so at `sizeof(bf16) == 2` the value-up
-        /// block begins `nope·rank` ELEMENTS in — the standard packing, and
-        /// the offset the shader spells. The device gate measures it; this
-        /// records the reconciliation so the byte/element reading cannot be
-        /// lost again.
-        #[test]
-        fn the_value_block_base_is_the_byte_add_read_as_elements() {
-            let (nope, v_dim, rank) = (128u64, 128u64, 512u64);
-            let cuda_byte_offset = 2 * nope * rank;
-            let elements = cuda_byte_offset / 2;
-            assert_eq!(elements, nope * rank, "the `2` is sizeof(bf16), not a stride");
-            // Head h's value block, as the shader addresses it.
-            for h in 0..4u64 {
-                let shader = h * (nope + v_dim) * rank + nope * rank;
-                let cuda = h * (nope + v_dim) * rank + elements;
-                assert_eq!(shader, cuda, "head {h}'s value block is one place");
-            }
-        }
-
         /// A selection row, `TOPK` wide, one per query row.
         fn sel(buf: u32, rows: u32, top_k: u32) -> Tensor {
             Tensor::new(buf, rows, top_k, Dtype::I32)
-        }
-
-        /// **THE SELECTED READER IS THE DENSE ONE PLUS TWO SEATS.** Same
-        /// engine, same grid, the first fourteen arguments unmoved; the index
-        /// plane and its budget ride behind them, and the entrypoint is the
-        /// sparse point.
-        #[test]
-        fn decode_selected_is_the_dense_launch_with_the_index_row_behind_it() {
-            const TOPK: u32 = 128;
-            let probe = Probe::default();
-            let pool = latent_pool();
-            attention_decode_selected(
-                &probe, bf16(1, 2, HEADS * RANK), bf16(2, 2, HEADS * ROPE), sel(4, 2, TOPK),
-                &pool, i32t(7, 2), i32t(8, 2), HEADS, RANK, 0.5, bf16(3, 2, HEADS * RANK),
-            )
-            .expect("the selected decode enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "mla_naive_paged_selected_bfloat16");
-            assert_eq!(f.file, "attn/mla.metal");
-            assert_eq!(f.lanes, [HEADS * SIMD, 2, 1]);
-            assert_eq!(f.group, [SIMD, 1, 1]);
-            assert_eq!(a.len(), 16, "the dense fourteen, then selection and top_k");
-            assert_eq!(a[0], ArgValue::Buffer(1));
-            assert_eq!(a[4], ArgValue::BufferMut(3));
-            assert_eq!(a[5], ArgValue::Buffer(7)); // positions: the causal bound
-            assert_eq!(a[6], ArgValue::Buffer(8)); // request_of_token
-            assert_eq!(a[13], ArgValue::F32(0.5));
-            assert_eq!(a[14], ArgValue::Buffer(4)); // the index row, read-only
-            assert_eq!(a[15], ArgValue::I32(TOPK as i32)); // top_k IS its width
-        }
-
-        /// Prefill-selected is the same engine over `q.data`.
-        #[test]
-        fn prefill_selected_shares_the_selected_engine() {
-            const TOPK: u32 = 64;
-            let probe = Probe::default();
-            let pool = latent_pool();
-            let q = RaggedTensor { data: bf16(1, 5, HEADS * RANK), indptr: i32t(9, 3) };
-            attention_prefill_selected(
-                &probe, q, bf16(2, 5, HEADS * ROPE), sel(4, 5, TOPK), &pool,
-                i32t(7, 5), i32t(8, 5), HEADS, RANK, 0.5, bf16(3, 5, HEADS * RANK),
-            )
-            .expect("the selected prefill enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "mla_naive_paged_selected_bfloat16");
-            assert_eq!(f.lanes, [HEADS * SIMD, 5, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1)); // q.data, not the indptr
-            assert_eq!(a[15], ArgValue::I32(TOPK as i32));
-        }
-
-        /// The dense readers keep the dense point and its fourteen seats — the
-        /// selected pair did not move anything under them.
-        #[test]
-        fn the_dense_reader_keeps_its_own_entrypoint() {
-            let probe = Probe::default();
-            let pool = latent_pool();
-            attention_decode(
-                &probe, bf16(1, 2, HEADS * RANK), bf16(2, 2, HEADS * ROPE), &pool,
-                i32t(7, 2), i32t(8, 2), HEADS, RANK, 0.5, bf16(3, 2, HEADS * RANK),
-            )
-            .expect("the dense decode enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "mla_naive_paged_bfloat16");
-            assert_eq!(a.len(), 14);
         }
 
         /// A selection carrying a different row count than the reading is
@@ -1840,107 +1530,16 @@ pub mod mla {
 
         // ── the sweep semantics, deviceless ────────────────────────────────
 
-        /// **THE -1 PADDED TAIL CONTRIBUTES NO KEY.** `index_topk_paged` pads
-        /// a short row with -1; the reader drops those slots rather than
-        /// attending key 0 or stopping the row early.
-        #[test]
-        fn the_padded_tail_is_dropped_not_attended() {
-            assert_eq!(selected_sweep(&[0, 2, 5, -1, -1], 8), vec![0, 2, 5]);
-            assert_eq!(selected_sweep(&[-1, -1, -1], 8), Vec::<i32>::new());
-            assert_eq!(selected_sweep(&[], 8), Vec::<i32>::new());
-        }
-
-        /// A -1 in the MIDDLE of the row is skipped, not a stop: the CUDA
-        /// reader `continue`s, and the keys behind it are still attended.
-        #[test]
-        fn a_hole_in_the_row_is_skipped_and_the_walk_continues() {
-            assert_eq!(selected_sweep(&[1, -1, 4, -1, 6], 8), vec![1, 4, 6]);
-        }
-
-        /// The causal bound still binds: a selected id at or past `j_end` is
-        /// dropped, not clamped into the visible range.
-        #[test]
-        fn the_causal_bound_drops_a_key_the_row_cannot_see() {
-            assert_eq!(selected_sweep(&[0, 3, 7, 9], 4), vec![0, 3]);
-            assert_eq!(selected_sweep(&[0, 3, 7, 9], 0), Vec::<i32>::new());
-            // A row whose whole budget is visible walks all of it, in order.
-            assert_eq!(selected_sweep(&[0, 1, 2, 3], 4), vec![0, 1, 2, 3]);
-        }
-
-        /// The selection is a SET, not a re-ordering: the streaming softmax
-        /// the shader runs over the selected keys equals the batch softmax the
-        /// dense reader would produce restricted to exactly those keys.
-        #[test]
-        fn the_selected_reading_is_the_dense_reading_restricted_to_those_keys() {
-            const W: usize = 3;
-            // Eight cached keys, one w-wide value strip each.
-            let logits: Vec<f32> = vec![0.4, -1.2, 2.0, 0.1, -0.7, 1.5, 0.9, -2.3];
-            let values: Vec<f32> = (0..8 * W).map(|i| (i as f32) * 0.25 - 1.0).collect();
-
-            // A row selecting {1, 2, 5, 6} out of a visible [0, 7], padded.
-            let row = [1, 2, 5, 6, -1, -1];
-            let keys = selected_sweep(&row, 8);
-            assert_eq!(keys, vec![1, 2, 5, 6]);
-
-            let picked_logits: Vec<f32> = keys.iter().map(|&j| logits[j as usize]).collect();
-            let picked_values: Vec<f32> = keys
-                .iter()
-                .flat_map(|&j| values[j as usize * W..(j as usize + 1) * W].to_vec())
-                .collect();
-            let got = flash_reading(&picked_logits, &picked_values, W);
-
-            // The batch reference: softmax over the restricted set, no
-            // rescaling, no streaming.
-            let m = picked_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let e: Vec<f32> = picked_logits.iter().map(|s| (s - m).exp()).collect();
-            let z: f32 = e.iter().sum();
-            for i in 0..W {
-                let want: f32 = e
-                    .iter()
-                    .enumerate()
-                    .map(|(n, p)| p * picked_values[n * W + i])
-                    .sum::<f32>()
-                    / z;
-                assert!((got[i] - want).abs() < 1e-5, "lane {i}: {} vs {want}", got[i]);
-            }
-        }
-
-        /// And the whole-budget case closes the loop: a selection naming every
-        /// visible key, in key order, reads exactly what the dense sweep reads.
-        #[test]
-        fn selecting_everything_visible_is_the_dense_reading() {
-            const W: usize = 2;
-            let logits: Vec<f32> = vec![0.3, 1.1, -0.5, 2.2, 0.0];
-            let values: Vec<f32> = (0..5 * W).map(|i| 1.0 - (i as f32) * 0.4).collect();
-            let row = [0, 1, 2, 3, 4, -1, -1, -1];
-            // The sweep IS the dense sweep: `0..j_end`, in order.
-            assert_eq!(selected_sweep(&row, 5), (0..5).collect::<Vec<i32>>());
-            let got = flash_reading(&logits, &values, W);
-            let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let e: Vec<f32> = logits.iter().map(|s| (s - m).exp()).collect();
-            let z: f32 = e.iter().sum();
-            for i in 0..W {
-                let want: f32 =
-                    e.iter().enumerate().map(|(n, p)| p * values[n * W + i]).sum::<f32>() / z;
-                assert!((got[i] - want).abs() < 1e-5, "lane {i}: {} vs {want}", got[i]);
-            }
-            // A row selecting nothing at all reads zero, not NaN: `lsum` never
-            // leaves zero and the shader's `inv` guard holds.
-            assert_eq!(flash_reading(&[], &[], W), vec![0.0; W]);
-        }
     }
 }
 
 /// `Index`: the NSA sparse-attention indexer — the metal mirror of
 /// `kernels-cuda`'s `attn/index.rs`/`attn/index.cuh`, kernel for kernel.
 ///
-/// This is the top-k SELECTION in front of the sparse attention: the small
-/// index key cache is layernormed and roped as it is appended, the index
-/// query is roped per head, and `attention.index_topk` scores every visible
-/// cached key against it and publishes the `i32` selection row the
-/// `attention.mla_*_selected` readers walk.
-///
-/// The shaders live in `attn/index.metal`. All four IR ops fire:
+/// Top-k selection in front of sparse attention: the index key cache is
+/// layernormed and roped as it's appended, the index query is roped per
+/// head, and `attention.index_topk` scores every visible cached key and
+/// publishes the selection row the `attention.mla_*_selected` readers walk.
 ///
 /// | op                              | shader                       |
 /// |---------------------------------|------------------------------|
@@ -1949,20 +1548,14 @@ pub mod mla {
 /// | `attention.index_kv_append`     | `mla_kv_append_bfloat16`     |
 /// | `attention.index_topk`          | `index_topk_paged_bfloat16`  |
 ///
-/// **`index_kv_append` ROUTES TO THE MLA APPENDER, AND THE CUDA TWIN DOES
-/// TOO.** `index.rs`'s entry calls `kv::write_mla_to_pages` with both rope
-/// arguments `ABSENT` — an index key row is one contiguous plane with no
-/// rotated tail to store beside it, which is exactly the latent writer with
-/// its rope plane nulled. So this entry calls [`mla::kv_append`] with a
-/// zero-wide rope plane rather than shipping a second store that would
-/// differ from it in the value of one `int`.
+/// `index_kv_append` routes to the mla appender (as the CUDA twin does): an
+/// index key row is one contiguous plane with no rotated tail, exactly the
+/// latent writer with its rope plane nulled, so this calls
+/// [`mla::kv_append`] with a zero-wide rope plane.
 ///
-/// **`index_topk_mask` IS INTENTIONALLY UNPORTED.** `index.cuh`'s fourth
-/// kernel is the dense (unpaged) variant publishing a `u8` mask row. No IR
-/// op names it and neither host plane fires it — `index.rs` fires
-/// `index_topk_paged` alone — so a metal twin would be a shader with no
-/// caller. The shader header states what it would take if a mask-shaped op
-/// ever lands.
+/// `index_topk_mask` (the dense/unpaged variant) is intentionally
+/// unported: no IR op names it and no host plane fires it, so a metal
+/// twin would be a shader with no caller.
 pub mod index {
     use dtype::Dtype;
 
@@ -2022,7 +1615,7 @@ pub mod index {
     }
 
     /// The index pool stores whole key rows contiguously; its token pitch
-    /// must spell exactly that. `index.rs`'s `pool_pitch`, minus the HND
+    /// must spell exactly that. `index.rs`'s `pool_pitch`, minus the hnd
     /// clause — the metal pool carries no layout enumerator, and the pitch
     /// question is the same question that clause was asking.
     fn pool_pitch(op: &'static str, pool: &KvPool, row: u32) -> Result<(), Error> {
@@ -2043,7 +1636,7 @@ pub mod index {
 
     /// Layernorms the index key row and ropes its head, in place on `k`.
     ///
-    /// **A MEAN-SUBTRACTING LAYERNORM WITH A LEARNED BIAS**, not the rms norm
+    /// A mean-subtracting layernorm with a learned bias, not the rms norm
     /// every other entry in this file reaches for — two reductions and an
     /// affine, which is what `index_knorm_rope` is.
     #[allow(clippy::too_many_arguments)]
@@ -2110,13 +1703,12 @@ pub mod index {
     }
 
     /// Appends index key rows into the pool's pages, at the op-named write
-    /// tables — the mla latent writer with a null rope plane, which is what
-    /// `index.rs` routes to as well.
+    /// tables — the mla latent writer with a null rope plane, which is
+    /// what `index.rs` routes to as well.
     ///
-    // MENLO-SEAM: as `attention.mla_kv_append`. The op states
-    // `write_page`/`write_offset` and on THIS plane the appender reads
-    // exactly them, so the seam the CUDA note describes (the stated pair
-    // going unread while the writer re-derives the cell) is closed here.
+    // Unlike `attention.mla_kv_append`'s CUDA twin: the op states
+    // `write_page`/`write_offset` and this appender actually reads them,
+    // rather than re-deriving the cell.
     pub fn kv_append(
         ctx: &Ctx<'_>,
         k: Tensor,
@@ -2140,12 +1732,12 @@ pub mod index {
     /// beside the pool, and they are this plane's divergence from the CUDA
     /// twin: `index_topk_paged` re-derives each row's absolute query position
     /// from `qo_indptr` and `kv_last_page_lens`, which the metal pool does not
-    /// carry, so the two numbers are READ here the way `mla::flash` and
+    /// carry, so the two numbers are read here the way `mla::flash` and
     /// `pool::attention_lse` already read them.
     ///
     /// `scores` is the per-row working slab the selection writes and then
     /// bisects over — `crate::scratch`'s index role on the shell side, the
-    /// process-global scratch on the CUDA one. Its WIDTH is the `score_stride`
+    /// process-global scratch on the CUDA one. Its width is the `score_stride`
     /// the shader clamps `nkeys` against, so a row that can see more keys than
     /// the slab is wide scores its first `score_stride` and no more — which is
     /// `index.cuh`'s own clamp against its own slab, at the same place.
@@ -2175,9 +1767,9 @@ pub mod index {
         let heads = nonzero(OP, "the head count this ranking states", heads)?;
         let head_dim = nonzero(OP, "the key width this ranking states", head_dim)?;
         let top_k = nonzero(OP, "the selection budget this ranking states", top_k)?;
-        // **THE KEY STRIDE, WHICH IS WHICH CACHED ROWS ARE KEYS.** `1` reads
+        // The key stride, which is which cached rows are keys. `1` reads
         // one key per token at its own cell (glm_5); a compressor's ratio
-        // reads one key per COMPRESSED BLOCK at the boundary cell
+        // reads one key per compressed block at the boundary cell
         // `(c+1)*ratio - 1` (dsv4-flash), and the ids published are then
         // compressed rows. Zero is no stride at all and is refused rather
         // than silently taken for one.
@@ -2242,10 +1834,10 @@ pub mod index {
     }
 
     /// The bisection this family selects by, in host arithmetic — the
-    /// deviceless pin on the ONE part of `index_topk_paged` that is an
+    /// deviceless pin on the one part of `index_topk_paged` that is an
     /// algorithm rather than a launch.
     ///
-    /// **IT IS HERE SO THE SEMANTICS CAN BE TESTED WITHOUT A GPU.** Nothing on
+    /// It is here so the semantics can be tested without a gpu. Nothing on
     /// the fire path calls it: the selection runs on the device, in the
     /// shader, over scores the device wrote. What the tests below ask of it is
     /// what no `Probe` can ask of a `Fire` — that 40 halvings of `[min, max]`
@@ -2296,7 +1888,7 @@ pub mod index {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::encode::ArgValue;
+        
         use crate::probe::Probe;
 
         /// dsv4-flash's indexer geometry: 64 index heads of 128 lanes, a 512
@@ -2318,7 +1910,7 @@ pub mod index {
             Tensor::new(buf, rows, width, Dtype::F32)
         }
 
-        /// The index cache: whole `DIM`-wide key rows, one per cached token.
+        /// The index cache: whole `dim`-wide key rows, one per cached token.
         fn index_pool() -> KvPool {
             KvPool {
                 keys: bf16(50, 4096, DIM),
@@ -2329,85 +1921,6 @@ pub mod index {
                 seq_stride: u64::from(DIM),
                 head_stride: u64::from(DIM),
             }
-        }
-
-        /// The norm is one threadgroup of 256 per cached key row; the row is
-        /// the mutated plane and `w`/`b` are the learned affine.
-        #[test]
-        fn layernorm_rope_is_a_threadgroup_per_key_row() {
-            let probe = Probe::default();
-            layernorm_rope(&probe, bf16(1, 6, DIM), i32t(2, 6, 1), bf16(3, 1, DIM), bf16(4, 1, DIM), 1e-6, 64, 10_000.0)
-                .expect("the index norm enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.file, "attn/index.metal");
-            assert_eq!(f.entrypoint, "index_knorm_rope_bfloat16");
-            assert_eq!(f.lanes, [K_BLOCK, 6, 1]);
-            assert_eq!(f.group, [K_BLOCK, 1, 1]);
-            assert_eq!(a[0], ArgValue::BufferMut(1)); // idx_k, in place
-            assert_eq!(a[1], ArgValue::Buffer(3)); // w
-            assert_eq!(a[2], ArgValue::Buffer(4)); // b
-            assert_eq!(a[3], ArgValue::Buffer(2)); // positions
-            assert_eq!(a[4], ArgValue::I32(DIM as i32));
-            assert_eq!(a[5], ArgValue::I32(64)); // rope_dim
-            assert_eq!(a[6], ArgValue::F32(10_000.0));
-            assert_eq!(a[7], ArgValue::F32(1e-6));
-        }
-
-        /// The query rotation is one thread per `(row, head)`, the block
-        /// rounded up to a whole simdgroup — `index.rs`'s `q_rope_block`.
-        #[test]
-        fn rope_is_a_thread_per_row_head_on_a_simd_rounded_block() {
-            let probe = Probe::default();
-            rope(&probe, bf16(1, 3, HEADS * DIM), i32t(2, 3, 1), HEADS, DIM, 64, 10_000.0)
-                .expect("the index query rotation enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "index_q_rope_bfloat16");
-            assert_eq!(f.lanes, [HEADS, 3, 1]);
-            assert_eq!(f.group, [HEADS, 1, 1]);
-            assert_eq!(a[0], ArgValue::BufferMut(1)); // idx_q, in place
-            assert_eq!(a[1], ArgValue::Buffer(2)); // positions
-            assert_eq!(a[2], ArgValue::I32(HEADS as i32));
-            assert_eq!(a[3], ArgValue::I32(DIM as i32));
-            assert_eq!(a[4], ArgValue::I32(64));
-            assert_eq!(a[5], ArgValue::F32(10_000.0));
-        }
-
-        /// A head count that is not a whole simdgroup still launches one:
-        /// 40 heads round to a 64-thread block, and the shader drops the tail.
-        #[test]
-        fn rope_rounds_a_ragged_head_count_up_to_a_simdgroup() {
-            assert_eq!(q_rope_block(40), 64);
-            assert_eq!(q_rope_block(64), 64);
-            assert_eq!(q_rope_block(1), 32);
-            let probe = Probe::default();
-            rope(&probe, bf16(1, 2, 40 * DIM), i32t(2, 2, 1), 40, DIM, 64, 10_000.0)
-                .expect("a ragged head count enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.lanes, [64, 2, 1]);
-            assert_eq!(f.group, [64, 1, 1]);
-            assert_eq!(a[2], ArgValue::I32(40));
-        }
-
-        /// The append is the mla latent writer with a null rope plane: the
-        /// index row lands in the key pages, the value pages go untouched
-        /// because the store's rope bound is zero.
-        #[test]
-        fn kv_append_is_the_latent_writer_with_a_null_rope_plane() {
-            let probe = Probe::default();
-            let pool = index_pool();
-            kv_append(&probe, bf16(1, 4, DIM), &pool, u32t(7, 4), u32t(8, 4))
-                .expect("the index append enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.file, "attn/mla.metal");
-            assert_eq!(f.entrypoint, "mla_kv_append_bfloat16");
-            assert_eq!(f.lanes, [DIM, 4, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1)); // the index key rows
-            assert_eq!(a[1], ArgValue::Buffer(1)); // the null rope plane
-            assert_eq!(a[2], ArgValue::BufferMut(50)); // key pages
-            assert_eq!(a[4], ArgValue::Buffer(7)); // write_page
-            assert_eq!(a[5], ArgValue::Buffer(8)); // write_offset
-            assert_eq!(a[7], ArgValue::I32(DIM as i32)); // kv_lora = the row
-            assert_eq!(a[8], ArgValue::I32(0)); // rope = 0: nothing else stored
         }
 
         /// A pool whose token pitch is not the index row refuses by name — the
@@ -2421,61 +1934,6 @@ pub mod index {
                 .expect_err("a doubled pitch is not this row");
             assert!(format!("{why}").contains("token pitch"), "{why}");
             assert!(probe.fires().is_empty());
-        }
-
-        /// The selection at the served geometry — 512 of 64x128 — is one
-        /// threadgroup of 256 per query row, with the fire tables in the seats
-        /// the CUDA twin fills from `qo_indptr`/`kv_last_page_lens`.
-        #[test]
-        fn topk_is_a_threadgroup_per_query_row_at_the_dsv4_geometry() {
-            let probe = Probe::default();
-            let pool = index_pool();
-            topk(
-                &probe, bf16(1, 3, HEADS * DIM), bf16(2, 3, HEADS), &pool,
-                i32t(9, 3, 1), i32t(10, 3, 1), f32t(11, 3, 8192),
-                HEADS, DIM, TOPK, 1, i32t(12, 3, TOPK),
-            )
-            .expect("the selection enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.file, "attn/index.metal");
-            assert_eq!(f.entrypoint, "index_topk_paged_bfloat16");
-            assert_eq!(f.lanes, [K_BLOCK, 3, 1]);
-            assert_eq!(f.group, [K_BLOCK, 1, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1)); // idx_q
-            assert_eq!(a[1], ArgValue::Buffer(2)); // idx_w
-            assert_eq!(a[2], ArgValue::Buffer(50)); // the index key pages
-            assert_eq!(a[3], ArgValue::Buffer(9)); // positions: the causal bound
-            assert_eq!(a[4], ArgValue::Buffer(10)); // request_of_token
-            assert_eq!(a[5], ArgValue::Buffer(52)); // page_indices
-            assert_eq!(a[6], ArgValue::Buffer(53)); // page_indptr
-            assert_eq!(a[7], ArgValue::BufferMut(11)); // the score slab
-            assert_eq!(a[8], ArgValue::BufferMut(12)); // selection
-            assert_eq!(a[9], ArgValue::I32(HEADS as i32));
-            assert_eq!(a[10], ArgValue::I32(DIM as i32));
-            assert_eq!(a[11], ArgValue::I32(16)); // page_size
-            assert_eq!(a[12], ArgValue::I32(8192)); // score_stride = the slab width
-            assert_eq!(a[13], ArgValue::I32(TOPK as i32));
-            // glm_5's stride: one key per token, so the cell IS the id.
-            assert_eq!(a[14], ArgValue::I32(1));
-        }
-
-        /// **THE dsv4 STRIDE.** The same launch with `ratio = 4`: the shader
-        /// then sees `(pos+1)/4` keys and reads key `c` at the boundary cell
-        /// `(c+1)*4 - 1`, which is where `pool_kv_append` put the indexer
-        /// compressor's pooled entry. Only the last argument moves.
-        #[test]
-        fn topk_states_the_compressors_stride_when_the_keys_are_pooled() {
-            let probe = Probe::default();
-            let pool = index_pool();
-            topk(
-                &probe, bf16(1, 3, HEADS * DIM), bf16(2, 3, HEADS), &pool,
-                i32t(9, 3, 1), i32t(10, 3, 1), f32t(11, 3, 8192),
-                HEADS, DIM, TOPK, 4, i32t(12, 3, TOPK),
-            )
-            .expect("the selection enqueues at the compressor's stride");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "index_topk_paged_bfloat16");
-            assert_eq!(a[14], ArgValue::I32(4));
         }
 
         /// A zero stride is no stride at all — refused by name rather than
@@ -2546,121 +2004,15 @@ pub mod index {
             assert!(probe.fires().is_empty());
         }
 
-        /// The rotated prefix is refused above `kMaxRopeDim`, odd, and wider
-        /// than the row it turns — on both rotations.
-        #[test]
-        fn a_rotation_past_the_authority_is_refused() {
-            let probe = Probe::default();
-            let over = layernorm_rope(&probe, bf16(1, 1, 512), i32t(2, 1, 1), bf16(3, 1, 512), bf16(4, 1, 512), 1e-6, 384, 10_000.0)
-                .expect_err("384 is past kMaxRopeDim");
-            assert!(format!("{over}").contains("above the 256"), "{over}");
-            let odd = rope(&probe, bf16(1, 1, HEADS * DIM), i32t(2, 1, 1), HEADS, DIM, 63, 10_000.0)
-                .expect_err("an odd prefix has no last pair");
-            assert!(format!("{odd}").contains("odd"), "{odd}");
-            let wide = rope(&probe, bf16(1, 1, HEADS * DIM), i32t(2, 1, 1), HEADS, DIM, 256, 10_000.0)
-                .expect_err("256 is wider than the 128-wide head");
-            assert!(format!("{wide}").contains("wider than"), "{wide}");
-            assert!(probe.fires().is_empty());
-        }
-
-        /// A pool of a dtype no point is stamped for is refused, not
-        /// mis-fired: bf16 is the one the indexer ships.
-        #[test]
-        fn a_dtype_no_point_is_stamped_for_is_refused() {
-            let probe = Probe::default();
-            let pool = index_pool();
-            let why = topk(
-                &probe, Tensor::new(1, 1, HEADS * DIM, Dtype::F32), bf16(2, 1, HEADS), &pool,
-                i32t(9, 1, 1), i32t(10, 1, 1), f32t(11, 1, 8192),
-                HEADS, DIM, TOPK, 1, i32t(12, 1, TOPK),
-            )
-            .expect_err("f32 index queries are not stamped");
-            assert!(
-                matches!(why, Error::DtypeUnsupported { op: "attention.index_topk", .. }),
-                "{why}"
-            );
-            assert!(probe.fires().is_empty());
-        }
-
         // ── the selection semantics, pinned without a device ────────────────
 
-        /// Fewer visible keys than the budget: the selection is the identity
-        /// over what exists, and the tail is `-1` — the early path, taken
-        /// before the bisection runs at all.
-        #[test]
-        fn a_row_that_sees_fewer_keys_than_the_budget_selects_all_of_them() {
-            assert_eq!(bisect_select(&[3.0, 1.0, 2.0], 5), vec![0, 1, 2, -1, -1]);
-            assert_eq!(bisect_select(&[3.0, 1.0, 2.0], 3), vec![0, 1, 2]);
-            assert_eq!(bisect_select(&[], 2), vec![-1, -1]);
-        }
-
-        /// The bisection picks the budget's worth of largest scores, and
-        /// publishes them in ASCENDING KEY ORDER — the selection is a set of
-        /// positions, not a ranking.
-        #[test]
-        fn the_bisection_selects_the_largest_scores_in_key_order() {
-            let scores = [0.1f32, 9.0, 0.2, 8.0, 0.3, 7.0, 0.4, 6.0];
-            assert_eq!(bisect_select(&scores, 3), vec![1, 3, 5]);
-            assert_eq!(bisect_select(&scores, 1), vec![1]);
-            let mut all = bisect_select(&scores, 4);
-            all.sort_unstable();
-            assert_eq!(all, vec![1, 3, 5, 7]);
-        }
-
-        /// **TIES AT THE THRESHOLD GO TO THE EARLIER KEY.** Eight equal
-        /// scores and a budget of three: the walk is ascending and stops at
-        /// the budget, so it is keys 0, 1, 2 — never a later three, and never
-        /// more than the budget however many clear the threshold.
-        #[test]
-        fn a_tie_at_the_threshold_is_broken_by_position() {
-            assert_eq!(bisect_select(&[1.0; 8], 3), vec![0, 1, 2]);
-            let scores = [5.0f32, 1.0, 5.0, 1.0, 5.0, 1.0];
-            assert_eq!(bisect_select(&scores, 2), vec![0, 2]);
-            // Every score identical AND the budget met exactly: the threshold
-            // admits all six, and the collect still stops at four.
-            assert_eq!(bisect_select(&[2.5; 6], 4), vec![0, 1, 2, 3]);
-        }
-
-        /// Negative and zero scores are ordinary: the relu is inside the
-        /// per-head dot, so a row's total can still be zero for every head
-        /// that contributes nothing, and the bisection brackets `[min, max]`
-        /// wherever they are.
-        #[test]
-        fn the_bracket_is_the_row_s_own_range_wherever_it_sits() {
-            let scores = [-4.0f32, -1.0, -3.0, -2.0];
-            assert_eq!(bisect_select(&scores, 2), vec![1, 3]);
-            assert_eq!(bisect_select(&[0.0, 0.0, 1e-30, 0.0], 1), vec![2]);
-        }
-
-        /// **FORTY HALVINGS, AND THE NUMBER IS THE CONTRACT.** A budget of
-        /// `k` over distinct scores selects exactly `k` real keys and pads
-        /// nothing — which is only true if the bisection has converged past
-        /// every gap in the row. Run it over a long ramp, where the gap
-        /// between neighbouring scores is small enough that a shorter
-        /// bisection would admit the wrong count.
-        #[test]
-        fn forty_halvings_converge_past_every_gap_in_a_long_row() {
-            let scores: Vec<f32> = (0..4096).map(|j| j as f32 * 1e-4).collect();
-            for topk in [1usize, 7, 512, 4095] {
-                let picked = bisect_select(&scores, topk);
-                assert_eq!(picked.len(), topk);
-                assert!(picked.iter().all(|j| *j >= 0), "budget {topk} padded");
-                // The top `topk` of a strictly ascending ramp is its tail.
-                assert_eq!(picked[0], (4096 - topk) as i32);
-                assert_eq!(*picked.last().expect("nonempty"), 4095);
-            }
-        }
     }
 }
 
-/// `Pool`: pooled (compressed) attention — the dsv4 compressor's KV-time-axis
-/// pooling, ported organ-for-organ from `kernels-cuda/kernels/attn/pool.cuh`.
-///
-/// The paged shaders live in `attn/pool.metal`. All five ops are wired here:
-/// the two boundary detectors, the gated softmax pool ([`gather`]), the
-/// compressed-cache store, and the log-sum-exp reader over the compressed
-/// entries. Four of them read only what their IR op names; the fifth is the
-/// family's one MENLO-SEAM, and it is spelled out on [`gather`] itself.
+/// `Pool`: pooled (compressed) attention — the dsv4 compressor's
+/// KV-time-axis pooling, ported from `kernels-cuda/kernels/attn/pool.cuh`.
+/// The paged shaders live in `attn/pool.metal`. All five ops are wired
+/// here; four read only what their IR op names, the fifth ([`gather`]) does not — spelled out there.
 pub mod pool {
     use dtype::Dtype;
 
@@ -2684,7 +2036,7 @@ pub mod pool {
     /// `2` for the overlapping `2*ratio` window of the ratio-4 compressor,
     /// `1` otherwise — the twin of `pool.rs`'s `compressor_coff`.
     ///
-    /// **DERIVED HERE AND NOT STATED BY THE CALLER**, which is the CUDA
+    /// Derived here and not stated by the caller, which is the CUDA
     /// entry's choice for the CUDA entry's reason: `coff` is a function of the
     /// ratio the op already states, so a caller that could pass a third answer
     /// could bind a window the state slabs are not laid out for.
@@ -2719,7 +2071,7 @@ pub mod pool {
     /// CUDA-graph padding mask, an op-named `u8` input.
     ///
     /// `boundary_rope` is the compressed row's own rope position — the
-    /// block's FIRST token `(p / ratio) · ratio`, not `boundary_pos`'s LAST
+    /// block's first token `(p / ratio) · ratio`, not `boundary_pos`'s last
     /// one — which the CUDA twin has always computed and which had nowhere to
     /// land on this plane until the compressor fired. See the shader's note.
     pub fn boundary_decode(
@@ -2789,13 +2141,13 @@ pub mod pool {
         )
     }
 
-    /// **THE ROLLING STATE'S WRITER.** `kv` is the compressor's `wkv · x` and
+    /// The rolling state's writer. `kv` is the compressor's `wkv · x` and
     /// `score` its `wgate · x`, both `[rows, coff · head_dim]`; each row is
     /// scattered into the cell `write_page`/`write_offset` name for it — the
-    /// SOURCE cache's own slot, which is the cell the latent appender writes
+    /// source cache's own slot, which is the cell the latent appender writes
     /// in the same fire.
     ///
-    /// **THIS IS THE OP THAT MAKES [`gather`] POOL SOMETHING.** The two state
+    /// This is the op that makes [`gather`] pool something. The two state
     /// slabs are a seam the shell owns and no IR value names, and until this
     /// entry existed nothing wrote a byte of either: the gather fired, read
     /// zeros, and the compressor's four checkpoint planes were interned. The
@@ -2834,7 +2186,7 @@ pub mod pool {
         let head_dim = nonzero(OP, "the head width this compressor states", head_dim)?;
         let ratio = nonzero(OP, "the pooling ratio", ratio)?;
         let coff = compressor_coff(ratio);
-        // The columns one state row holds for THIS layer — what the gather
+        // The columns one state row holds for this layer — what the gather
         // over the same ratio reads back.
         let width = head_dim.saturating_mul(coff.unsigned_abs());
         if kv.width != width || score.width != width {
@@ -2891,37 +2243,20 @@ pub mod pool {
     }
 
     /// Pools the closing window out of the rolling compressor state into
-    /// per-boundary entries — the learned gated softmax pool.
+    /// per-boundary entries — the learned gated softmax pool. One thread
+    /// per `(entry, head-dim lane)`; each walks its `coff * ratio` window
+    /// serially, so the whole gate is one launch and no threadgroup memory.
     ///
-    /// One thread per `(entry, head-dim lane)`; each walks its `coff * ratio`
-    /// window serially, so the whole gate is one launch and no threadgroup
-    /// memory.
+    /// `state_kv`/`state_score` have no IR seat: the engine binds them
+    /// from its own scratch reservation (`crate::scratch`'s pool role),
+    /// addressed by the same paged slot the `pages` cache uses, at a row
+    /// pitch of `coff * head_dim` — not a fire-shaped rectangle.
+    /// [`state_write`] is what fills them.
     ///
-    // MENLO-SEAM: the rolling compressor state (`state_kv`, `state_score`)
-    // has no IR seat; the engine binds the slabs it staged for the pooled
-    // space's SOURCE cache. `ape` closed its half of the seam — it is a
-    // checkpoint plane and takes an operand.
-    ///
-    /// **THE TWO STATE SLABS ARE SEAM ARGUMENTS AND NOT OPERANDS.**
-    /// `state_kv` (the rolling kv window, the `wkv` projection's output) and
-    /// `state_score` (the rolling gate logits, `wgate`'s) are addressed by the
-    /// SAME paged slot the `pages` cache is, at a row pitch of
-    /// `coff * head_dim` — so a slab is `[the source pool's cells,
-    /// coff * head_dim]` and not a fire-shaped rectangle. Neither is named by
-    /// `attention.pool_gather`; the CUDA twin binds them off fire state
-    /// (`Run::slabs()`) and engine-metal off its scratch reservation
-    /// (`crate::scratch`'s pool role, the `index` role's shape).
-    /// [`state_write`] is what puts numbers in them.
-    ///
-    /// **`ape` IS AN OPERAND**, and the third slab it used to be counted
-    /// beside. It is a checkpoint WEIGHT — the compressor's intra-block
-    /// absolute-position plane, `[ratio, coff * head_dim]` f32 — not shell
-    /// scratch, so it took an IR seat (`Attention::PoolGather.ape`) rather
-    /// than a staged rectangle. It stays an `Option` because the CUDA shader
-    /// keys the position fold on `ape != nullptr` and Metal has no null
-    /// buffer: `None` binds `state_score`'s handle into the unread seat and
-    /// states `has_ape = 0`, which is the same path by a different spelling,
-    /// and is what a parameter-free mean pool passes.
+    /// `ape` is a real operand: the compressor's absolute-position weight
+    /// (`[ratio, coff * head_dim]` f32), kept `Option` because the CUDA
+    /// shader keys on `ape != nullptr` and Metal has no null buffer —
+    /// `None` binds `state_score`'s handle into the unread seat and states `has_ape = 0`.
     #[allow(clippy::too_many_arguments)]
     pub fn gather(
         ctx: &Ctx<'_>,
@@ -2973,16 +2308,12 @@ pub mod pool {
         let coff = compressor_coff(ratio);
         // The columns this gather reads out of one state row.
         let width = head_dim.saturating_mul(coff.unsigned_abs());
-        // **AND THE ROW PITCH IS THE SLAB'S, WHICH IS NOT ALWAYS THIS
-        // GATHER'S WIDTH.** One artifact can hold pooled layers at two ratios
-        // — dsv4-flash carries ratio 4 (coff 2) and ratio 128 (coff 1) in the
-        // same tower — and the reservation lays ONE plane for all of them, at
-        // the widest pitch any of its gathers states
-        // (`engine_metal::scratch::pool_state`). So a narrower gather strides
-        // by the plane's row and reads its own `coff x head_dim` columns
-        // inside it. What is still refused is a slab NARROWER than the columns
-        // read, which is a launch reading somebody else's cells, and a pair
-        // that disagrees with each other, which is two pitches for one plane.
+        // The row pitch is the slab's, which is not always this gather's
+        // width: one artifact can hold pooled layers at two ratios in the
+        // same tower, and the reservation lays one plane at the widest
+        // pitch any of its gathers states. A narrower gather strides by
+        // the plane's row and reads its own `coff x head_dim` columns
+        // inside it; a slab narrower than the columns read is still refused.
         let pitch = state_kv.width;
         if state_score.width != pitch {
             return Err(refuse(
@@ -3044,9 +2375,8 @@ pub mod pool {
     /// Stores each pooled entry into its cell of the compressed cache. One
     /// threadgroup lane per `(entry, head-dim)`; a masked boundary writes
     /// nothing. `write_page`/`write_offset` are the op's stated write
-    /// descriptors — the store still re-derives its cell from the boundary
-    /// tables and the pool's page tables, the same MENLO-SEAM the CUDA twin
-    /// carries, so the stated pair goes unread.
+    /// descriptors, but (like the CUDA twin) the store still re-derives its
+    /// cell from the boundary and page tables, so the stated pair goes unread.
     #[allow(clippy::too_many_arguments)]
     pub fn kv_append(
         ctx: &Ctx<'_>,
@@ -3146,12 +2476,12 @@ pub mod pool {
     }
 
     /// [`attention_lse`] over the compressed rows `attention.index_topk`
-    /// chose — the NSA fine branch, and the ONE reader this family was
+    /// chose — the NSA fine branch, and the one reader this family was
     /// missing.
     ///
-    /// **THE SELECTED BRANCH IS THE COMPRESSED ONE, NARROWED.** The
+    /// The selected branch is the compressed one, narrowed. The
     /// reference oracle attends `concat(the 128-wide sliding window over the
-    /// per-token latent, EVERY visible compressed row)` under one softmax
+    /// per-token latent, every visible compressed row)` under one softmax
     /// with the per-head sink in the denominator; pie computes that as
     /// `prefill_lse` at `window` merged with `pool_lse` and closed by `sink`.
     /// The window is fixed, so the only key set the indexer's budget can cap
@@ -3243,15 +2573,15 @@ pub mod pool {
         )
     }
 
-    /// **THE SELECTED READER'S KEY WALK, IN HOST ARITHMETIC** — the deviceless
+    /// The selected reader's key walk, in host arithmetic — the deviceless
     /// pin on the one part of `pool_lse_selected_paged` that is a decision
     /// rather than a launch, in the idiom of
     /// [`index::bisect_select`](super::index::bisect_select).
     ///
     /// Given a row's selection and how many compressed rows it can see, this
-    /// is the sequence of CELLS the shader reads, in the order it reads them:
+    /// is the sequence of cells the shader reads, in the order it reads them:
     /// ids below zero are the pad and ids at or past the visible count are
-    /// out of the causal bound, both SKIPPED rather than clamped, and a kept
+    /// out of the causal bound, both skipped rather than clamped, and a kept
     /// id `c` becomes the boundary cell `(c + 1) * ratio - 1` — the same
     /// arithmetic `pool_lse_paged` walks densely and `index_topk_paged` keys
     /// by.
@@ -3264,15 +2594,15 @@ pub mod pool {
             .collect()
     }
 
-    /// **THE COMPRESSED ROW'S ROPE POSITION, IN HOST ARITHMETIC** — the
+    /// The compressed row's rope position, in host arithmetic — the
     /// deviceless twin of the boundary kernels' `out_rope` column, and the
     /// other half of [`selected_cells`]'s claim.
     ///
-    /// A pooled entry has TWO positions and they are `ratio - 1` apart. The
-    /// CELL it is cached at is the one its window closes on — `selected_cells`
-    /// above, `(c + 1) · ratio - 1`, the block's LAST token — because that is
-    /// the cell the readers address. The POSITION IT IS ROPED AT is the
-    /// compressed row's own, `c · ratio`, the block's FIRST token: the
+    /// A pooled entry has two positions and they are `ratio - 1` apart. The
+    /// cell it is cached at is the one its window closes on — `selected_cells`
+    /// above, `(c + 1) · ratio - 1`, the block's last token — because that is
+    /// the cell the readers address. The position IT IS roped AT is the
+    /// compressed row's own, `c · ratio`, the block's first token: the
     /// reference ropes the pooled plane at `rows = arange(0, cutoff, ratio)`
     /// = `0, ratio, 2·ratio, …` (`v4mlx/compressor.py`'s `compressor_prefill`,
     /// both the attention compressor and the `rotate=True` indexer one), not
@@ -3286,399 +2616,4 @@ pub mod pool {
         (closing_pos / ratio) * ratio
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::encode::ArgValue;
-        use crate::probe::Probe;
-
-        const HEAD_DIM: u32 = 512;
-        const HEADS: u32 = 4;
-
-        fn bf16(buf: u32, rows: u32, width: u32) -> Tensor {
-            Tensor::new(buf, rows, width, Dtype::Bf16)
-        }
-        fn i32t(buf: u32, rows: u32) -> Tensor {
-            Tensor::new(buf, rows, 1, Dtype::I32)
-        }
-        fn u32t(buf: u32, rows: u32) -> Tensor {
-            Tensor::new(buf, rows, 1, Dtype::U32)
-        }
-        fn u8t(buf: u32, rows: u32) -> Tensor {
-            Tensor::new(buf, rows, 1, Dtype::U8)
-        }
-
-        /// The compressed cache: `keys` are the pooled entry pages.
-        fn comp_pool() -> KvPool {
-            KvPool {
-                keys: bf16(40, 4096, HEAD_DIM),
-                values: bf16(41, 4096, HEAD_DIM),
-                page_indices: u32t(42, 64),
-                page_indptr: u32t(43, 8),
-                page_size: 16,
-                seq_stride: u64::from(HEAD_DIM),
-                head_stride: u64::from(HEAD_DIM),
-            }
-        }
-
-        /// The decode detector is one flat lane per token; its outputs are the
-        /// THREE boundary tables — the cell, the lane and the compressed row's
-        /// rope position — `n`/`ratio` follow, and `row_valid` is the mask.
-        #[test]
-        fn boundary_decode_is_flat_over_tokens_ratio_4() {
-            let probe = Probe::default();
-            boundary_decode(&probe, i32t(1, 6), u8t(2, 6), 4, i32t(3, 6), i32t(4, 6), i32t(5, 6))
-                .expect("the decode detector enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.file, "attn/pool.metal");
-            assert_eq!(f.entrypoint, "pool_boundary_decode");
-            assert_eq!(f.lanes, [6, 1, 1]);
-            assert_eq!(f.group, [META_BLOCK, 1, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1)); // positions
-            assert_eq!(a[1], ArgValue::BufferMut(3)); // boundary_pos
-            assert_eq!(a[2], ArgValue::BufferMut(4)); // boundary_req
-            assert_eq!(a[3], ArgValue::BufferMut(5)); // boundary_rope
-            assert_eq!(a[4], ArgValue::I32(6)); // n
-            assert_eq!(a[5], ArgValue::I32(4)); // ratio
-            assert_eq!(a[6], ArgValue::Buffer(2)); // row_valid
-        }
-
-        /// The ratio-128 detector selects the same point — the window arithmetic
-        /// lives in the gather, not the boundary mark.
-        #[test]
-        fn boundary_decode_takes_ratio_128() {
-            let probe = Probe::default();
-            boundary_decode(&probe, i32t(1, 3), u8t(2, 3), 128, i32t(3, 3), i32t(4, 3), i32t(5, 3))
-                .expect("ratio 128 enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "pool_boundary_decode");
-            assert_eq!(a[5], ArgValue::I32(128));
-        }
-
-        /// **THE ROPE COLUMN IS ITS OWN PLANE.** The cell the entry is cached
-        /// at and the position it is roped at are two different numbers for
-        /// one entry (`(c+1)·ratio - 1` against `c·ratio`), so a shell that
-        /// bound one buffer to both seats — the reading the model text had
-        /// while this column did not exist — is the `ratio - 1` skew, and it
-        /// is visible here without a device.
-        #[test]
-        fn the_rope_column_is_not_the_cell_column() {
-            let probe = Probe::default();
-            boundary_decode(&probe, i32t(1, 6), u8t(2, 6), 4, i32t(3, 6), i32t(4, 6), i32t(5, 6))
-                .expect("the decode detector enqueues");
-            let (_, a) = probe.only();
-            assert_ne!(a[1], a[3], "the rope operand is not the cell operand");
-        }
-
-        /// The prefill detector adds the request indptr (buffer 1) and the
-        /// request count for its binary search.
-        #[test]
-        fn boundary_prefill_carries_the_indptr_and_request_count() {
-            let probe = Probe::default();
-            let positions = RaggedTensor { data: i32t(1, 6), indptr: u32t(9, 3) };
-            boundary_prefill(&probe, positions, u8t(2, 6), 4, i32t(3, 6), i32t(4, 6), i32t(5, 6))
-                .expect("the prefill detector enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "pool_boundary_prefill");
-            assert_eq!(f.lanes, [6, 1, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1)); // positions.data
-            assert_eq!(a[1], ArgValue::Buffer(9)); // qo_indptr, not the data
-            assert_eq!(a[2], ArgValue::BufferMut(3)); // boundary_pos
-            assert_eq!(a[3], ArgValue::BufferMut(4)); // boundary_req
-            assert_eq!(a[4], ArgValue::BufferMut(5)); // boundary_rope
-            assert_eq!(a[5], ArgValue::I32(6)); // n
-            assert_eq!(a[6], ArgValue::I32(2)); // num_requests = indptr.rows - 1
-            assert_eq!(a[7], ArgValue::I32(4)); // ratio
-            assert_eq!(a[8], ArgValue::Buffer(2)); // row_valid
-        }
-
-        /// The store is one threadgroup per entry over the head width; the
-        /// compressed cache pages are the mutated plane, the boundary tables
-        /// address the cell.
-        #[test]
-        fn kv_append_writes_the_compressed_pages_by_the_boundary_tables() {
-            let probe = Probe::default();
-            let pool = comp_pool();
-            kv_append(&probe, bf16(1, 3, HEAD_DIM), i32t(5, 3), i32t(6, 3), &pool, u32t(7, 3), u32t(8, 3))
-                .expect("the store enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "pool_store_entries_bfloat16");
-            assert_eq!(f.lanes, [HEAD_DIM, 3, 1]);
-            assert_eq!(f.group, [HEAD_DIM, 1, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1)); // entries
-            assert_eq!(a[1], ArgValue::BufferMut(40)); // pool.keys
-            assert_eq!(a[2], ArgValue::Buffer(5)); // boundary_pos
-            assert_eq!(a[3], ArgValue::Buffer(6)); // boundary_req
-            assert_eq!(a[4], ArgValue::Buffer(42)); // page_indices
-            assert_eq!(a[5], ArgValue::Buffer(43)); // page_indptr
-            assert_eq!(a[6], ArgValue::I32(HEAD_DIM as i32));
-            assert_eq!(a[7], ArgValue::I32(16)); // page_size
-        }
-
-        /// The compressed-entry reader is one threadgroup per `(row, head)`,
-        /// 128 threads wide; the pool is storage, `q`/`o`/`lse` the operands.
-        #[test]
-        fn attention_lse_is_a_threadgroup_per_row_head() {
-            let probe = Probe::default();
-            let pool = comp_pool();
-            attention_lse(
-                &probe, bf16(1, 2, HEADS * HEAD_DIM), i32t(2, 2), i32t(3, 2), &pool,
-                4, HEADS, HEAD_DIM, 0.5, bf16(4, 2, HEADS * HEAD_DIM),
-                Tensor::new(5, 2, HEADS, Dtype::F32),
-            )
-            .expect("the compressed reader enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "pool_lse_paged");
-            assert_eq!(f.lanes, [ATTN_BLOCK, 2, HEADS]);
-            assert_eq!(f.group, [ATTN_BLOCK, 1, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1)); // q
-            assert_eq!(a[1], ArgValue::Buffer(40)); // entries.keys
-            assert_eq!(a[2], ArgValue::BufferMut(4)); // o
-            assert_eq!(a[3], ArgValue::BufferMut(5)); // lse
-            assert_eq!(a[4], ArgValue::Buffer(2)); // positions
-            assert_eq!(a[5], ArgValue::Buffer(42)); // page_indices
-            assert_eq!(a[6], ArgValue::Buffer(43)); // page_indptr
-            assert_eq!(a[7], ArgValue::Buffer(3)); // request_of_token
-            assert_eq!(a[8], ArgValue::I32(HEADS as i32));
-            assert_eq!(a[9], ArgValue::I32(HEAD_DIM as i32));
-            assert_eq!(a[10], ArgValue::I32(4)); // ratio
-            assert_eq!(a[11], ArgValue::I32(16)); // page_size
-            assert_eq!(a[12], ArgValue::F32(0.5));
-        }
-
-        /// The SELECTED reader is the same launch shape with the selection
-        /// bound between the pool and the outputs, and the budget stated
-        /// beside the ratio the ids are compressed rows of.
-        #[test]
-        fn attention_lse_selected_binds_the_selection_and_its_budget() {
-            let probe = Probe::default();
-            let pool = comp_pool();
-            attention_lse_selected(
-                &probe, bf16(1, 2, HEADS * HEAD_DIM), i32t(2, 2), i32t(3, 2),
-                Tensor::new(6, 2, 8, Dtype::I32), &pool, 4, 8, HEADS, HEAD_DIM,
-                0.5, bf16(4, 2, HEADS * HEAD_DIM),
-                Tensor::new(5, 2, HEADS, Dtype::F32),
-            )
-            .expect("the selected reader enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.entrypoint, "pool_lse_selected_paged");
-            assert_eq!(f.lanes, [ATTN_BLOCK, 2, HEADS]);
-            assert_eq!(f.group, [ATTN_BLOCK, 1, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(1)); // q
-            assert_eq!(a[1], ArgValue::Buffer(40)); // entries.keys
-            assert_eq!(a[2], ArgValue::Buffer(6)); // selection
-            assert_eq!(a[3], ArgValue::BufferMut(4)); // o
-            assert_eq!(a[4], ArgValue::BufferMut(5)); // lse
-            assert_eq!(a[5], ArgValue::Buffer(2)); // positions
-            assert_eq!(a[6], ArgValue::Buffer(42)); // page_indices
-            assert_eq!(a[7], ArgValue::Buffer(43)); // page_indptr
-            assert_eq!(a[8], ArgValue::Buffer(3)); // request_of_token
-            assert_eq!(a[9], ArgValue::I32(HEADS as i32));
-            assert_eq!(a[10], ArgValue::I32(HEAD_DIM as i32));
-            assert_eq!(a[11], ArgValue::I32(4)); // ratio
-            assert_eq!(a[12], ArgValue::I32(8)); // top_k
-            assert_eq!(a[13], ArgValue::I32(16)); // page_size
-            assert_eq!(a[14], ArgValue::F32(0.5));
-        }
-
-        /// A selection whose width is not the budget the reader states is a
-        /// row that would be walked off its own end. Refused, not launched.
-        #[test]
-        fn attention_lse_selected_refuses_a_selection_that_is_not_its_budget() {
-            let probe = Probe::default();
-            let pool = comp_pool();
-            let why = attention_lse_selected(
-                &probe, bf16(1, 2, HEADS * HEAD_DIM), i32t(2, 2), i32t(3, 2),
-                Tensor::new(6, 2, 4, Dtype::I32), &pool, 4, 8, HEADS, HEAD_DIM,
-                0.5, bf16(4, 2, HEADS * HEAD_DIM),
-                Tensor::new(5, 2, HEADS, Dtype::F32),
-            )
-            .expect_err("a 4-wide selection is not an 8-id budget");
-            assert!(format!("{why}").contains('8'), "{why}");
-            assert!(probe.fires().is_empty());
-        }
-
-        /// **THE SELECTED WALK REDUCES TO THE DENSE ONE.**
-        /// `index_topk_paged`'s `nkeys <= topk` arm publishes the identity
-        /// `0..nkeys-1` with `-1` padding, so a row inside its budget reads
-        /// the same cells in the same order `pool_lse_paged` reads densely:
-        /// `(c+1)*ratio - 1` for every visible `c`. That equality is what
-        /// makes the fine branch safe to fire on short sequences, and it is
-        /// checked here without a device.
-        #[test]
-        fn the_identity_selection_walks_the_dense_reader_s_own_cells() {
-            let visible = 5;
-            let ratio = 4;
-            let identity = super::super::index::bisect_select(&[0.0; 5], 8);
-            assert_eq!(identity, [0, 1, 2, 3, 4, -1, -1, -1]);
-            let dense: Vec<i32> = (0..visible).map(|c| (c + 1) * ratio - 1).collect();
-            assert_eq!(selected_cells(&identity, visible, ratio), dense);
-            assert_eq!(dense, [3, 7, 11, 15, 19]);
-        }
-
-        /// The pad and the causal bound are both SKIPS and not clamps: a
-        /// `-1` reads nothing, and an id at or past the query's own visible
-        /// count reads nothing either. Order is the selection's.
-        #[test]
-        fn selected_cells_skips_the_pad_and_the_out_of_bound_id() {
-            assert_eq!(selected_cells(&[-1, 0, 9, 2, -1], 5, 4), [3, 11]);
-            assert_eq!(selected_cells(&[-1, -1, -1], 5, 4), Vec::<i32>::new());
-            // `ratio == 1` is the per-token cache: the id IS the cell.
-            assert_eq!(selected_cells(&[0, 3, 7], 8, 1), [0, 3, 7]);
-        }
-
-        /// **THE ROPE POSITIONS ARE THE REFERENCE'S `arange(0, cutoff, ratio)`.**
-        /// Five closing boundaries at ratio 4 close on `3, 7, 11, 15, 19` — the
-        /// cells above — and rope at `0, 4, 8, 12, 16`. That second row is the
-        /// claim: it is the block STARTS, which is what `cos[rows]`/`sin[rows]`
-        /// are indexed by in `compressor_prefill`.
-        #[test]
-        fn the_rope_positions_are_the_block_starts() {
-            let ratio = 4;
-            let closing: Vec<i32> = (0..5).map(|c| (c + 1) * ratio - 1).collect();
-            let roped: Vec<i32> = closing
-                .iter()
-                .map(|p| compressed_rope_pos(*p, ratio))
-                .collect();
-            assert_eq!(closing, [3, 7, 11, 15, 19]);
-            assert_eq!(roped, [0, 4, 8, 12, 16]);
-            // `arange(0, cutoff, ratio)` said the other way, for `cutoff = 20`.
-            let arange: Vec<i32> = (0..20).step_by(ratio as usize).collect();
-            assert_eq!(roped, arange);
-        }
-
-        /// **AND THEY ARE NOT THE CLOSING POSITIONS.** The reading this
-        /// replaced roped the pooled entry at the token position its window
-        /// closed on, which is exactly `ratio - 1` too far on every entry —
-        /// the delta this gate exists to score. At ratio 128 the same skew is
-        /// 127 positions.
-        #[test]
-        fn the_old_reading_is_off_by_ratio_minus_one() {
-            for ratio in [4, 128] {
-                for c in 0..6 {
-                    let closing = (c + 1) * ratio - 1;
-                    let roped = compressed_rope_pos(closing, ratio);
-                    assert_eq!(roped, c * ratio);
-                    assert_eq!(closing - roped, ratio - 1);
-                }
-            }
-            // `ratio == 1` is the degenerate compressor: one entry per token,
-            // and the two positions coincide.
-            assert_eq!(compressed_rope_pos(7, 1), 7);
-        }
-
-        /// A head wider than the flash reader's q tile is refused by name, not
-        /// launched — the one geometry the shader's threadgroup array bounds.
-        #[test]
-        fn attention_lse_refuses_a_head_past_the_tile() {
-            let probe = Probe::default();
-            let pool = comp_pool();
-            let why = attention_lse(
-                &probe, bf16(1, 1, 640), i32t(2, 1), i32t(3, 1), &pool,
-                4, 1, 640, 0.5, bf16(4, 1, 640), Tensor::new(5, 1, 1, Dtype::F32),
-            )
-            .expect_err("640 is past POOL_HEAD_MAX");
-            assert!(format!("{why}").contains("512"), "{why}");
-            assert!(probe.fires().is_empty());
-        }
-
-        /// The ratio-4 gather: `coff` is 2, so the state slabs are read at
-        /// `2 x HEAD_DIM` and the ape plane is `[4, 2 x HEAD_DIM]` f32. The
-        /// operand order is `pool.cuh`'s, with `has_ape` last — the Metal
-        /// spelling of the CUDA `ape != nullptr`.
-        #[test]
-        fn gather_binds_the_three_slabs_at_coff_two() {
-            let probe = Probe::default();
-            let pool = comp_pool();
-            let ape = Tensor::new(12, 4, 2 * HEAD_DIM, Dtype::F32);
-            gather(
-                &probe, i32t(1, 3), i32t(2, 3), &pool, HEAD_DIM, 4,
-                bf16(10, 4096, 2 * HEAD_DIM), bf16(11, 4096, 2 * HEAD_DIM), Some(ape),
-                bf16(3, 3, HEAD_DIM),
-            )
-            .expect("the gather enqueues");
-            let (f, a) = probe.only();
-            assert_eq!(f.file, "attn/pool.metal");
-            assert_eq!(f.entrypoint, "pool_gather_paged_bfloat16");
-            assert_eq!(f.lanes, [HEAD_DIM, 3, 1]);
-            assert_eq!(f.group, [HEAD_DIM, 1, 1]);
-            assert_eq!(a[0], ArgValue::Buffer(10)); // state_kv
-            assert_eq!(a[1], ArgValue::Buffer(11)); // state_score
-            assert_eq!(a[2], ArgValue::Buffer(12)); // ape
-            assert_eq!(a[3], ArgValue::Buffer(1)); // boundary_pos
-            assert_eq!(a[4], ArgValue::Buffer(2)); // boundary_req
-            assert_eq!(a[5], ArgValue::Buffer(42)); // page_indices
-            assert_eq!(a[6], ArgValue::Buffer(43)); // page_indptr
-            assert_eq!(a[7], ArgValue::BufferMut(3)); // entries
-            assert_eq!(a[8], ArgValue::I32(HEAD_DIM as i32));
-            assert_eq!(a[9], ArgValue::I32(4)); // ratio
-            assert_eq!(a[10], ArgValue::I32(2)); // coff
-            assert_eq!(a[11], ArgValue::I32(16)); // page_size
-            assert_eq!(a[12], ArgValue::I32(1)); // has_ape
-        }
-
-        /// The ratio-128 gather: `coff` is 1, the state slabs are the head
-        /// width, and an absent ape plane states `has_ape = 0` while the seat
-        /// takes `state_score`'s handle — Metal has no null buffer, and the
-        /// shader never reads the seat it is told not to.
-        #[test]
-        fn gather_at_coff_one_states_no_ape_and_reuses_the_seat() {
-            let probe = Probe::default();
-            let pool = comp_pool();
-            gather(
-                &probe, i32t(1, 3), i32t(2, 3), &pool, HEAD_DIM, 128,
-                bf16(10, 4096, HEAD_DIM), bf16(11, 4096, HEAD_DIM), None,
-                bf16(3, 3, HEAD_DIM),
-            )
-            .expect("the ratio-128 gather enqueues");
-            let (_, a) = probe.only();
-            assert_eq!(a[1], ArgValue::Buffer(11)); // state_score
-            assert_eq!(a[2], ArgValue::Buffer(11)); // the unread ape seat
-            assert_eq!(a[9], ArgValue::I32(128)); // ratio
-            assert_eq!(a[10], ArgValue::I32(1)); // coff
-            assert_eq!(a[12], ArgValue::I32(0)); // has_ape
-        }
-
-        /// A state slab laid out at the wrong pitch is a launch reading
-        /// somebody else's cells, so it is refused by name and nothing fires.
-        #[test]
-        fn gather_refuses_a_state_slab_of_the_wrong_pitch() {
-            let probe = Probe::default();
-            let pool = comp_pool();
-            let why = gather(
-                &probe, i32t(1, 3), i32t(2, 3), &pool, HEAD_DIM, 4,
-                // `coff` is 2 at ratio 4, so a head-wide slab is half a row.
-                bf16(10, 4096, HEAD_DIM), bf16(11, 4096, 2 * HEAD_DIM), None,
-                bf16(3, 3, HEAD_DIM),
-            )
-            .expect_err("a half-pitch state_kv is refused");
-            assert!(format!("{why}").contains("state_kv"), "{why}");
-            assert!(probe.fires().is_empty());
-        }
-
-        /// And an ape plane whose rows are not the ratio is the same kind of
-        /// mis-binding, caught on the plane the shader modulo-indexes.
-        #[test]
-        fn gather_refuses_an_ape_plane_that_is_not_a_block() {
-            let probe = Probe::default();
-            let pool = comp_pool();
-            let why = gather(
-                &probe, i32t(1, 3), i32t(2, 3), &pool, HEAD_DIM, 128,
-                bf16(10, 4096, HEAD_DIM), bf16(11, 4096, HEAD_DIM),
-                Some(Tensor::new(12, 4, HEAD_DIM, Dtype::F32)),
-                bf16(3, 3, HEAD_DIM),
-            )
-            .expect_err("a 4-row ape plane is not a 128 block");
-            assert!(format!("{why}").contains("ratio 128"), "{why}");
-            assert!(probe.fires().is_empty());
-        }
-
-        /// `compressor_coff` is the overlapping-window fanout: `2` at ratio 4,
-        /// `1` elsewhere — the shader's `coff`.
-        #[test]
-        fn coff_is_two_at_ratio_four_and_one_elsewhere() {
-            assert_eq!(compressor_coff(4), 2);
-            assert_eq!(compressor_coff(128), 1);
-        }
-    }
 }

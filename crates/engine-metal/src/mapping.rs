@@ -1,95 +1,18 @@
-//! **The artifact, mapped once and bound without a copy** — the warm-read
-//! plan's M-1, and the one primitive under it.
+//! The artifact, mapped once and bound without a copy: `newBufferWithBytesNoCopy`
+//! hands Metal the mapping's own pages, faulted from the file exactly once.
 //!
-//! A load that fits in memory spends its whole boot doing one thing: reading
-//! every weight byte off disk into a `Vec`, and then copying that `Vec` into
-//! a `StorageModeShared` `MTLBuffer` whose pages the GPU is about to wire
-//! anyway. On unified memory the second half of that is pure waste — the
-//! device buffer IS host memory, and the bytes were already in host memory
-//! when the pager faulted them out of the file. This module removes the
-//! copy: it maps the artifact and hands Metal the mapping's own pages
-//! through `newBufferWithBytesNoCopy:length:options:deallocator:`, so the
-//! bytes are faulted from the file exactly once, into the frames the kernel
-//! will read.
-//!
-//! # THIS PRIMITIVE WIRES EVERY PAGE IT TOUCHES, AND THAT IS THE DEAL
-//!
-//! The measurement in `.wiki/alto/streaming.md` ("mmap residency
-//! measurement, M1 Max", 2026-08-31) is the ground truth and it is blunt: on
-//! Apple silicon a `StorageModeShared` page WIRES the instant the GPU
-//! touches it, and it wires identically whether the buffer is a plain
-//! allocation or a `newBufferWithBytesNoCopy` over a mapping. Touching a
-//! mapped 4 GiB span from a kernel drove global `Pages wired down` up by
-//! **+4.03 GiB** and free memory down to **0.066 GiB**, and the pager
-//! evicted NOTHING. A GPU-touched mapped page is not reclaimable.
-//!
-//! So this type bounds no memory whatsoever, and two rules fall out of that:
-//!
-//! * **It is for a model that already fits.** Wired-equals-the-model is not
-//!   a cost this primitive adds — a full-residency load's eager buffer wires
-//!   the same bytes, measured (the control row: +4.027 GiB). What the
-//!   mapping removes is the DUPLICATE: the transient `Vec` and the `memcpy`,
-//!   and with them the peak of double the model's size during boot. That is
-//!   the whole claim, and it is a claim about the peak and the boot clock,
-//!   never about the floor.
-//! * **It must NEVER carry the streamed or oversized path.** Binding an
-//!   over-budget artifact through here converts the entire touched span into
-//!   wired memory that nothing will take back, which is precisely the
-//!   swap-death this crate's streaming tier exists to avoid.
-//!   [`crate::host_source`] is that tier's source and its module header
-//!   states the same measurement from the other side: it maps and is read by
-//!   the CPU ONLY, and binding its mapping to a buffer would undo the one
-//!   property it exists for. The two mmap doors in this crate are deliberate
-//!   opposites — this one binds because the model fits, that one refuses to
-//!   bind because it does not — and neither may be reached for the other's
-//!   job.
-//!
-//! # Alignment: the length is over-stated, not the file over-sized
-//!
-//! `newBufferWithBytesNoCopy` requires a page-aligned pointer AND a
-//! page-aligned length. The pointer is free — `mmap` returns page-aligned
-//! bases — but an artifact's byte count is whatever the writer wrote, and
-//! rounding it is a real choice with two roads:
-//!
-//! * `ftruncate` the artifact up to a page multiple, so the length on disk
-//!   is already aligned. Rejected: it mutates the operator's file, needs
-//!   write permission on a read-only serving artifact, and makes the
-//!   checkpoint's own byte count a lie.
-//! * **State a longer length to Metal than the file holds.** Taken. `mmap`
-//!   of an `L`-byte file reserves `round_up(L, page)` bytes of address
-//!   space, and POSIX guarantees the partial page at the end is zero-filled
-//!   and readable — the tail is real, mapped, faultable memory that simply
-//!   is not backed by file bytes. So the `MTLBuffer` is minted over
-//!   [`Mapping::span`] (page-rounded) while [`Mapping::len`] keeps the true
-//!   payload length, and the [`Buffer`](crate::device::Buffer) minted from
-//!   it reports the TRUE length: every `span` bounds check, every handle
-//!   minted over it, and every kernel that reads through it are held to the
-//!   file's own size. Metal is told about a tail no caller can address.
-//!
-//! # The mapping outlives the buffer BY CONSTRUCTION
-//!
-//! `newBufferWithBytesNoCopy` with a nil deallocator does not own the
-//! pages: the moment the mapping is unmapped, the `MTLBuffer` points at
-//! nothing and the next kernel that reads it faults on the device. The
-//! guard is ownership rather than discipline —
-//! [`Buffer::mapped`](crate::device::Buffer::mapped) takes an
-//! `Arc<Mapping>` and HOLDS it, beside the retained buffer and declared
-//! after it, so the `MTLBuffer` is released before the `munmap` on the same
-//! drop and a clone of the `Buffer` extends both. There is no door that
-//! binds a bare pointer, so there is no way to spell a buffer whose mapping
-//! has gone: bind-after-drop is not refused at run time, it is unsayable.
+//! A reservation wires whole on first GPU touch, so this bounds no memory
+//! and must never carry the streamed path; [`cut`] windows past
+//! `maxBufferLength` around the planes a load binds, and each buffer's
+//! `Arc<Mapping>` outlives it while named.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::{Fault, Result};
 
-/// The host's page size, which is what both of
-/// `newBufferWithBytesNoCopy`'s alignment rules are stated in.
-///
-/// Probed rather than assumed: 16 KiB on Apple silicon, 4 KiB on an Intel
-/// Mac and under Rosetta, and a constant here would be wrong on two of the
-/// three.
+/// The host's page size. Probed rather than assumed: 16 KiB on Apple
+/// silicon, 4 KiB on an Intel Mac and under Rosetta.
 #[must_use]
 pub fn page() -> usize {
     // SAFETY: `sysconf` of a defined name, reading no memory.
@@ -101,46 +24,28 @@ pub fn page() -> usize {
     }
 }
 
-/// **One artifact file, mapped read-only, whole.**
-///
-/// Held behind an [`Arc`] by every [`Buffer`](crate::device::Buffer) minted
-/// over it, which is what keeps the pages alive for as long as any device
-/// buffer names them. Read the module header before reaching for one: this
-/// is the fits-in-memory door, and it wires what the GPU touches.
+/// One artifact file, mapped read-only, whole. Held behind an [`Arc`] by
+/// every [`Buffer`](crate::device::Buffer) minted over it.
 pub struct Mapping {
-    /// The mapping's base — page-aligned, because `mmap` says so.
     at: std::ptr::NonNull<u8>,
-    /// How many bytes of address space the mapping actually spans:
-    /// `round_up(len, page())`, and the length Metal is told.
+    /// Address space spanned: `round_up(len, page())`, the length Metal is told.
     span: usize,
-    /// The artifact's true byte count — what every caller above is bounded
-    /// to, and what the file holds.
+    /// The artifact's true byte count, what every caller above is bounded to.
     len: u64,
-    /// Kept open past the `mmap` that does not need it, so a gate can
-    /// `fstat` the backing and so `{:?}` can name what this is a mapping OF.
     file: std::fs::File,
-    /// The path as the operator named it, for refusals and for `Debug`.
     path: PathBuf,
 }
 
-// SAFETY: the mapping is `MAP_PRIVATE` and `PROT_READ` — there is no way to
-// write through this type and no interior mutability in it, so every
-// reference reads bytes nothing in the process can change. That makes it
-// `Sync` as well as `Send`, which is what an `Arc<Mapping>` shared by
-// several `Buffer` clones needs.
+// SAFETY: `MAP_PRIVATE` and `PROT_READ`, with no interior mutability — every
+// reference reads bytes nothing in the process can change, which is `Sync`
+// as well as `Send`.
 unsafe impl Send for Mapping {}
 // SAFETY: as `Send` — read-only pages, no interior mutability.
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
-    /// Map `path` read-only, whole, and keep its descriptor.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Mapped`] naming the step that refused (`open`, `stat`,
-    /// `size`, `map`) and the OS's own sentence — an artifact that has moved,
-    /// that this process may not read, or an address space with no room for
-    /// it are all deployment conditions and the message has to say which.
+    /// Map `path` read-only, whole, and keep its descriptor. Errors with
+    /// [`Fault::Mapped`] naming the step that refused.
     pub fn of(path: impl AsRef<Path>) -> Result<Arc<Mapping>> {
         let path = path.as_ref();
         let file = std::fs::File::open(path).map_err(|why| Fault::Mapped {
@@ -151,16 +56,9 @@ impl Mapping {
         Mapping::of_file(file, path.to_path_buf())
     }
 
-    /// Map an already-open artifact, whole — the door the checkpoint reader
-    /// (M-2) reaches for, which has the descriptor before it has a decision.
-    ///
-    /// `named` is what refusals and `Debug` will call this; it is never
-    /// opened, so a caller holding a descriptor to an unlinked or otherwise
-    /// unnameable file may say whatever identifies it.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Mapped`] naming `stat`, `size` or `map`.
+    /// Map an already-open artifact, whole. `named` is what refusals and
+    /// `Debug` will call this; it is never opened, so a caller holding a
+    /// descriptor to an unlinked file may say whatever identifies it.
     pub fn of_file(file: std::fs::File, named: PathBuf) -> Result<Arc<Mapping>> {
         let what = || named.display().to_string();
         let len = file
@@ -171,11 +69,8 @@ impl Mapping {
                 why: why.to_string(),
             })?
             .len();
-        // An empty artifact is refused rather than answered with an empty
-        // mapping: `mmap` will not take a zero length, and a zero-byte
-        // checkpoint is a broken one, not a legal one. (The EMPTY
-        // reservation that a plan may legally hold is `Buffer::zeroed(_, 0)`
-        // and lives on the eager path; nothing maps it.)
+        // `mmap` will not take a zero length, and a zero-byte checkpoint is
+        // broken, not legal.
         if len == 0 {
             return Err(Fault::Mapped {
                 step: "size",
@@ -192,10 +87,8 @@ impl Mapping {
                 what: what(),
                 why: format!("{len} bytes does not fit this process's address space"),
             })?;
-        // SAFETY: a fresh private read-only mapping of a file this function
-        // holds open, at a span that is the file's own length rounded up to
-        // the page — the tail past `len` is the partial page POSIX
-        // guarantees is zero-filled and readable.
+        // SAFETY: a fresh mapping of a file held open, at a page-rounded
+        // span POSIX zero-fills past `len`.
         let at = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -227,32 +120,29 @@ impl Mapping {
         }))
     }
 
-    /// The artifact's TRUE byte count — the number every caller above the
-    /// bind is bounded to.
+    /// The file this is a mapping of — a seat copy `pread`s through it.
+    #[must_use]
+    pub fn file(&self) -> &std::fs::File {
+        &self.file
+    }
+
+    /// The artifact's true byte count, which every caller above is bounded to.
     #[must_use]
     pub fn len(&self) -> u64 {
         self.len
     }
 
-    /// Whether the artifact holds no bytes, which [`Mapping::of`] refuses to
-    /// make, so this is always `false` and exists for the lint that pairs it
-    /// with [`Mapping::len`].
+    /// Always `false` ([`Mapping::of`] refuses an empty artifact); exists
+    /// for the lint pairing it with [`Mapping::len`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// How many bytes of address space the mapping spans:
-    /// `round_up(len, page())`, the page-aligned length Metal is told and
-    /// the one no caller above may address. See the module header.
+    /// Address space the mapping spans, page-aligned — no caller above may address it.
     #[must_use]
     pub fn span(&self) -> usize {
         self.span
-    }
-
-    /// The mapping's page-aligned base, for the bind and for nothing else.
-    pub(crate) fn base(&self) -> std::ptr::NonNull<u8> {
-        self.at
     }
 
     /// What was mapped, as the caller named it.
@@ -261,31 +151,181 @@ impl Mapping {
         &self.path
     }
 
-    /// **What is actually behind this mapping**: the backing file's size, as
-    /// `fstat` reports it now.
-    ///
-    /// A gate's half of "this buffer is the file": a mapped artifact whose
-    /// `backing()` equals its [`len`](Mapping::len) is provably a window
-    /// onto real storage rather than onto a copy of it.
+    /// The backing file's size — equal to [`len`](Mapping::len) when this
+    /// provably windows real storage.
     #[must_use]
     pub fn backing(&self) -> Option<u64> {
         self.file.metadata().ok().map(|it| it.len())
     }
 
-    /// **How many names the backing file has**, as `fstat` reports it now.
-    ///
-    /// The other half of the pair a streamed load's source observable answers
-    /// with ([`Tier::source`](crate::experts::Tier::source)), and it reads the
-    /// opposite way from the staging file's: `0` there says "unlinked, so
-    /// nothing outside this process can reach it", and at least one HERE says
-    /// "this is the artifact the operator named, which this load opened and
-    /// did not create". A warm streamed load asserting zero links would be
-    /// asserting it had staged a copy.
+    /// How many names the backing file has — at least one, unlike a staged
+    /// (unlinked) copy, whose link count is `0`.
     #[must_use]
     pub fn links(&self) -> Option<u64> {
         use std::os::unix::fs::MetadataExt;
         self.file.metadata().ok().map(|it| it.nlink())
     }
+}
+
+/// One page-aligned window of a [`Mapping`], as one `MTLBuffer` will see it
+/// — the unit [`cut`] answers in and
+/// [`Buffer::window`](crate::device::Buffer::window) mints. Must be passed
+/// back beside the same `Arc<Mapping>` it was cut from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cut {
+    /// Where this window starts inside the mapping — page-aligned.
+    base: usize,
+    /// How many bytes Metal is told, a page multiple never above `ceiling`.
+    span: usize,
+    /// Bytes of the artifact this window addresses — `span`, except the
+    /// last chunk's zero-fill tail.
+    bytes: u64,
+}
+
+impl Cut {
+    /// The whole mapping as one window, for an artifact under the ceiling.
+    #[must_use]
+    pub fn whole(map: &Mapping) -> Cut {
+        Cut {
+            base: 0,
+            span: map.span(),
+            bytes: map.len(),
+        }
+    }
+
+    /// Where the window starts inside the mapping, page-aligned.
+    #[must_use]
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
+    /// The page-aligned length Metal is told.
+    #[must_use]
+    pub fn span(&self) -> usize {
+        self.span
+    }
+
+    /// The TRUE artifact bytes this window addresses.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Whether a blob at `offset` of `length` bytes lies wholly inside this window.
+    #[must_use]
+    pub fn holds(&self, offset: u64, length: u64) -> bool {
+        let base = self.base as u64;
+        offset >= base && offset.saturating_add(length) <= base.saturating_add(self.bytes)
+    }
+
+    /// Where a blob at `offset` sits within this window, for `Handles::bind`.
+    #[must_use]
+    pub fn view(&self, offset: u64) -> Option<u64> {
+        offset.checked_sub(self.base as u64)
+    }
+}
+
+/// How far apart two bound planes may be and still share one window — the
+/// writer's own padding (`pie model import` aligns at 2 MiB), never a band.
+const SLACK: u64 = 8 << 20;
+
+/// The device's `maxBufferLength`, clamped down by `PIE_METAL_WINDOW_CEILING`
+/// if that env var is a valid, positive, smaller byte count.
+#[must_use]
+pub fn ceiling(device: u64) -> u64 {
+    std::env::var("PIE_METAL_WINDOW_CEILING")
+        .ok()
+        .and_then(|it| it.parse::<u64>().ok())
+        .filter(|it| *it > 0)
+        .map_or(device, |it| it.min(device))
+}
+
+/// Cut a mapping into windows, none larger than `ceiling`, that cover the
+/// planes a load will bind — `bound` as `(name, offset, length)` — rather
+/// than the whole file, since a window wires whole.
+///
+/// # Errors
+///
+/// [`Fault::Mapped`] at step `cut`, naming the plane that leaves the
+/// artifact or alone exceeds the ceiling, or (nameless) for a sub-page
+/// `ceiling` or an oversized mapping with no bound plane at all.
+pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Vec<Cut>> {
+    let page = page();
+    let what = || map.path().display().to_string();
+    let refuse = |why: String| Fault::Mapped {
+        step: "cut",
+        what: what(),
+        why,
+    };
+    // Floored once, here, so no window's page-multiple length can round
+    // back above the device's own number.
+    let ceiling = usize::try_from(ceiling).unwrap_or(usize::MAX) / page * page;
+    if ceiling == 0 {
+        return Err(refuse(format!(
+            "the device reserves fewer than one {page}-byte page in a buffer"
+        )));
+    }
+    let span = map.span();
+    let len = map.len();
+    // The whole file fits one reservation; the plane list goes unread.
+    if span <= ceiling {
+        return Ok(vec![Cut::whole(map)]);
+    }
+    if bound.is_empty() {
+        return Err(refuse(format!(
+            "it holds {len} bytes against a {ceiling}-byte reservation and this load \
+             binds no plane of it, so there is nothing to cut a window around"
+        )));
+    }
+
+    let mut sorted: Vec<(&str, u64, u64)> = bound.to_vec();
+    sorted.sort_by_key(|(_, offset, length)| (*offset, *length));
+
+    let chunk = |base: usize, end: usize| Cut {
+        base,
+        span: end - base,
+        bytes: (len - base as u64).min((end - base) as u64),
+    };
+    let mut cuts: Vec<Cut> = Vec::new();
+    // The window being built: page-aligned base, and page above its last plane.
+    let mut open: Option<(usize, usize)> = None;
+    for (name, offset, length) in sorted {
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= len)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "`{name}` claims [{offset}, {}) of an artifact that holds {len} bytes",
+                    offset.saturating_add(length),
+                ))
+            })?;
+        let lo = (offset as usize) / page * page;
+        let hi = (end as usize).next_multiple_of(page).min(span);
+        if hi - lo > ceiling {
+            return Err(refuse(format!(
+                "`{name}` spans [{offset}, {end}) — {length} bytes — and a reservation on \
+                 this device holds {ceiling}, so it can be a view of no buffer this \
+                 device mints"
+            )));
+        }
+        match open {
+            // Extend when only the writer's padding lies between, and it still fits.
+            Some((base, cover))
+                if lo.saturating_sub(cover) as u64 <= SLACK && hi - base <= ceiling =>
+            {
+                open = Some((base, cover.max(hi)));
+            }
+            Some((base, cover)) => {
+                cuts.push(chunk(base, cover));
+                open = Some((lo, hi));
+            }
+            None => open = Some((lo, hi)),
+        }
+    }
+    if let Some((base, cover)) = open {
+        cuts.push(chunk(base, cover));
+    }
+    Ok(cuts)
 }
 
 impl std::ops::Deref for Mapping {
@@ -319,10 +359,8 @@ impl std::fmt::Debug for Mapping {
 
 impl Drop for Mapping {
     fn drop(&mut self) {
-        // SAFETY: unmapping this type's own mapping at its own span. Every
-        // `MTLBuffer` minted over it holds an `Arc` to this type, so the
-        // last of them was released before this ran — which is the whole
-        // reason the bind takes an `Arc` and not a pointer.
+        // SAFETY: unmapping this type's own mapping; every `MTLBuffer`
+        // minted over it holds an `Arc` to this, so the last was released first.
         unsafe {
             libc::munmap(self.at.as_ptr().cast(), self.span);
         }
@@ -334,49 +372,14 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// A temporary file of `bytes` bytes of a known pattern, unlinked by the
-    /// caller. Lives in `TMPDIR`, as the crate's hard rule says.
+    /// A temporary file of `bytes` bytes of a known pattern, unlinked by
+    /// the caller.
     fn scratch(name: &str, bytes: usize) -> PathBuf {
         let path = std::env::temp_dir().join(format!("pie-map-{}-{name}", std::process::id()));
         let mut file = std::fs::File::create(&path).expect("a scratch artifact");
         let pattern: Vec<u8> = (0..bytes).map(|at| (at % 251) as u8).collect();
         file.write_all(&pattern).expect("the pattern lands");
         path
-    }
-
-    #[test]
-    fn a_mapping_states_the_files_length_and_spans_the_page() {
-        let path = scratch("odd", 5000);
-        let map = Mapping::of(&path).expect("the artifact maps");
-        let _ = std::fs::remove_file(&path);
-
-        assert_eq!(map.len(), 5000, "the length is the file's, to the byte");
-        assert_eq!(
-            map.span(),
-            5000usize.next_multiple_of(page()),
-            "the span is that length rounded up to the page, which is what Metal is told"
-        );
-        assert!(map.span() > map.len() as usize, "and this file needs the tail");
-        assert_eq!(map.backing(), Some(5000), "the mapping is the file");
-        assert!(
-            map.iter().enumerate().all(|(at, byte)| *byte == (at % 251) as u8),
-            "every byte of the payload reads back through the deref"
-        );
-        assert_eq!(
-            (**map).len(),
-            5000,
-            "the deref is the TRUE length and never the span"
-        );
-    }
-
-    #[test]
-    fn an_exactly_paged_artifact_needs_no_tail() {
-        let bytes = page() * 3;
-        let path = scratch("even", bytes);
-        let map = Mapping::of(&path).expect("the artifact maps");
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(map.span(), bytes, "an aligned length is already the span");
-        assert_eq!(map.len() as usize, bytes);
     }
 
     #[test]
@@ -388,13 +391,86 @@ mod tests {
         assert!(said.contains("holds no bytes"), "the refusal says why: {said}");
     }
 
+    /// A sparse scratch artifact of `bytes` bytes — `ftruncate` and no
+    /// write, so it costs no disk despite exceeding `maxBufferLength`.
+    fn sparse(name: &str, bytes: u64) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("pie-cut-{}-{name}", std::process::id()));
+        let file = std::fs::File::create(&path).expect("a scratch artifact");
+        file.set_len(bytes).expect("the artifact sizes");
+        path
+    }
+
+    fn borrow(of: &[(String, u64, u64)]) -> Vec<(&str, u64, u64)> {
+        of.iter()
+            .map(|(name, offset, length)| (name.as_str(), *offset, *length))
+            .collect()
+    }
+
+    /// A plane no buffer can hold is refused by name, since a view cannot
+    /// span two reservations.
     #[test]
-    fn an_artifact_that_is_not_there_is_refused_by_name() {
-        let fault = Mapping::of("/nonesuch/pie/artifact.zt").expect_err("nothing to map");
+    fn a_blob_larger_than_one_buffer_is_refused_by_its_own_name() {
+        let page = page();
+        let path = sparse("huge-plane", 64 * page as u64);
+        let map = Mapping::of(&path).expect("the sparse artifact maps");
+        let _ = std::fs::remove_file(&path);
+
+        let held = vec![
+            ("small".to_string(), 0u64, 4 * page as u64),
+            ("the-whale".to_string(), 8 * page as u64, 10 * page as u64),
+        ];
+        let fault = cut(&map, 8 * page as u64, &borrow(&held))
+            .expect_err("a plane past the ceiling is not a view of anything");
         let said = fault.to_string();
         assert!(
-            said.contains("artifact.zt") && said.contains("open"),
-            "the refusal names the file and the step: {said}"
+            said.contains("the-whale"),
+            "the refusal names the plane that cannot be served: {said}"
+        );
+        assert!(
+            said.contains("view of no buffer"),
+            "and says what it is that cannot be done: {said}"
         );
     }
+
+    /// An oversized artifact this load binds no plane of is refused.
+    #[test]
+    fn an_oversized_artifact_with_no_bound_plane_is_refused() {
+        let page = page();
+        let path = sparse("nothing-bound", 64 * page as u64);
+        let map = Mapping::of(&path).expect("the sparse artifact maps");
+        let _ = std::fs::remove_file(&path);
+        let fault = cut(&map, 8 * page as u64, &[]).expect_err("no plane, no window");
+        assert!(
+            fault.to_string().contains("binds no plane"),
+            "the refusal says what is missing: {fault}"
+        );
+    }
+
+    /// A ceiling below one page is refused before a manifest is walked.
+    #[test]
+    fn a_ceiling_under_one_page_is_refused_before_the_manifest() {
+        let path = scratch("tiny-ceiling", 5000);
+        let map = Mapping::of(&path).expect("the artifact maps");
+        let _ = std::fs::remove_file(&path);
+        let fault = cut(&map, 8, &[]).expect_err("a sub-page ceiling binds nothing");
+        assert!(
+            fault.to_string().contains("fewer than one"),
+            "the refusal names the device's own number: {fault}"
+        );
+    }
+
+    /// A blob whose extent leaves the artifact is refused by name.
+    #[test]
+    fn a_blob_that_leaves_the_artifact_is_refused_by_name() {
+        let page = page();
+        let path = sparse("overrun", 64 * page as u64);
+        let map = Mapping::of(&path).expect("the sparse artifact maps");
+        let _ = std::fs::remove_file(&path);
+        let held = vec![("past-the-end".to_string(), 60 * page as u64, 16 * page as u64)];
+        let fault = cut(&map, 8 * page as u64, &borrow(&held))
+            .expect_err("a blob past the end does not cut");
+        let said = fault.to_string();
+        assert!(said.contains("past-the-end"), "the refusal names it: {said}");
+    }
+
 }

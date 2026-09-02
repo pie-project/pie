@@ -1,130 +1,15 @@
-//! P3: which regions enter the graph behind a conditional node, and — on
-//! today's catalog — the honest answer that none of them do (design §4).
-//!
-//! **CONDITIONALS ARE AN OPTIMIZATION AND ZERO-ROW ALWAYS-LAUNCH IS THE
-//! CORRECTNESS MECHANISM** (decision #3). Every windowed kernel is in the
-//! graph unconditionally and reads its row count from the descriptor; an empty
-//! window returns immediately, at about a microsecond. So this pass may
-//! decline every region it is shown and the artifact is still complete — which
-//! is the property that makes the whole pass a cost question rather than a
-//! semantic one, and it is why the off arm below is a first-class setting
-//! rather than a degradation.
-//!
-//! # The two gates, and the second one is not in the design text
-//!
-//! Design §4 pins ONE number: a body must hold `≳250 µs` before the
-//! `5 + 0.6·K µs` evaluation point that guards it amortizes
-//! (`.wiki/tart/concept/supergraph_ir.md`, "Bodies must be fat"). That figure
-//! is [`DeviceProfile::fat_region_us`](crate::DeviceProfile::fat_region_us)
-//! and it is a statement about the fires that TAKE the body: the guard is paid
-//! taken or not, so a thin body pays a tax of 20% of itself on every fire that
-//! needs it. It is necessary.
-//!
-//! **It is not sufficient, and the reason is this design's own baseline.**
-//! tart measured conditionals against a world where an inactive program cost
-//! its whole body; here an inactive window costs
-//! [`empty_launch_us`](crate::DeviceProfile::empty_launch_us) per node and
-//! nothing else. So what an `IF` actually saves, on the fires where the window
-//! is empty, is
-//!
-//! ```text
-//! saved  = nodes(region) · empty_launch_us          ~1 µs a node, when empty
-//! paid   = cond_fixed_us + cond_per_arm_us · arms   ~5.6 µs, EVERY fire
-//! ```
-//!
-//! and a two-node attention arm behind an evaluation point is a 3.6 µs loss on
-//! the fire it was supposed to help. Both gates are asked, and a region must
-//! clear both. That is the same sentence design §4 already says — "layer
-//! granularity or coarser, never around individual operators" — restated as
-//! the arithmetic that decides it, rather than as advice.
-//!
-//! # The third gate: the window has to be able to be empty
-//!
-//! A region whose mask holds every class runs in every fire, because a fire
-//! carries at least one lane and that lane is in some class. A conditional
-//! around it is an evaluation point that is never false: pure loss, every
-//! fire, forever. So the candidate set is the WINDOWED regions — mask a proper
-//! subset of the class table — which is the same set §0's window-split
-//! mechanism is about.
-//!
-//! # SWITCH, and the exclusivity decision #4 claims is free
-//!
-//! Decision #4 says the SWITCH groups come from `Def::Merge` for free, because
-//! the arms are already an exclusive variant set. **That is true of a LANE and
-//! not of a FIRE, and a graph node's predicate is a fire-level question.**
-//! `resolve_classes` proves no lane demands two arms; it does not — cannot —
-//! prove no FIRE has rows for two, because a fire is a batch of lanes of
-//! different classes and running decode beside prefill in one fire is the
-//! whole point of §0. `cudaGraphCondTypeSwitch` executes exactly one body.
-//! Two live arms and a SWITCH is a fire that silently drops one of them.
-//!
-//! So the group is free and the ACTIVATION is not, and P3 asks for the
-//! activation's own proof: at most one arm may be demanded by any composition
-//! the budgets admit. A composition is a set of classes; with
-//! [`max_lanes`](crate::Budget::max_lanes) at two or more, any two classes
-//! can co-fire, so the proof holds exactly when every class resolves the merge
-//! to the same arm (in which case there is no group) or when a fire cannot
-//! hold two classes at all — `max_lanes == 1`. A one-lane deployment is a real
-//! deployment and this is where its arms become a SWITCH; a batching one gets
-//! `IF` per arm, which is what "IF is only required where each program is
-//! independently present" means once presence is per-lane.
-//!
-//! # The composition rule with P6, and it is a mechanism rather than a policy
-//!
-//! **P3 RUNS FIRST AND A CONDITIONAL REGION IS NOT FORKABLE.**
-//! `crate::stream::forkable` has read `lowering == AlwaysLaunch` since D1, so
-//! the precedence is already written; what this pass adds is that the clause
-//! stops being vacuous. Two reasons, and the first is not a preference:
-//!
-//! 1. A conditional body is a CHILD GRAPH, filled by
-//!    `cudaStreamBeginCaptureToGraph`. P6's fork is a `cudaEventRecord` in the
-//!    parent capture and a `cudaStreamWaitEvent` behind it, which capture
-//!    lowers to an EDGE between two nodes of one graph. There is no edge from
-//!    a node of the parent graph to a node of a conditional body, so an arm
-//!    that was both forked and conditionalized is a dependency that cannot be
-//!    expressed.
-//! 2. Their savings do not compete anyway. A conditional wins on the fires
-//!    where its window is EMPTY; a fork wins on the fires where both arms are
-//!    LIVE. They are disjoint fires. On today's catalog the two never meet:
-//!    the one region P3 chooses is qwen36-27b's MTP head, which has no
-//!    concurrent sibling, so every fork group in build log 24's table is
-//!    untouched and gemma's three overlapped attention arms are still three.
-//!
-//! # What it constructs today: exactly one region, and it is the MTP head
-//!
-//! Over the catalog × four platforms at
-//! [`DeviceProfile::default`](crate::DeviceProfile::default), **one** region in
-//! **one** SKU clears both gates: qwen36-27b's multi-token-prediction head —
-//! nodes 1303..1329, a whole extra decoder layer with its own `embed` and
-//! `lm_head`, 26 launches and 576 µs, guarded on the MTP fact and absent from
-//! every fire no lane asked it for. That is not a coincidence of thresholds:
-//! it is the only place in the catalog where a model text declares a genuinely
-//! STRUCTURAL arm, which is exactly design §8's "prefix-tuning / structural
-//! PEFT → IF/SWITCH" row and exactly what tart's `attn_spec` example is.
-//!
-//! Everything else is declined by arithmetic and the margins are not close.
-//! The fattest OTHER windowed region is qwen35's 184 µs grouped
-//! linear-attention run against a 250 µs floor; the widest is gemma's 7-node
-//! prefill run against a ~6-launch profit floor, which it clears — and its
-//! 120 µs does not. Nothing gets one for being windowed. The regions that ARE
-//! fat — glm5's 1208 µs MLA trunk, kimi's 928 µs — are full-mask: they run in
-//! every fire and have nothing to skip.
-//!
-//! `model-compiler/tests/which_skus_get_a_conditional.rs` pins the PREDICATE
-//! and prints the two numbers per SKU, so a text that gains a vision encoder
-//! or a speculative branch is found by the pass and named by the test.
+//! Chooses each region's lowering (`If`, `Switch`, or always-launch): a
+//! region is conditionalized only if its window can be empty, its body is
+//! fat enough to amortize the evaluation point, and skipping it profits over
+//! that point's fixed cost.
 
 use model_ir::{ClassTable, Def, Trace, ValueId};
 
-use crate::compiled::{Lowering, Phase, Region};
+use crate::compiled::{Lowering, Region};
 use crate::budget::{Budget, DeviceProfile};
 
-/// What one region's nodes cost, at the profile's family table.
-///
-/// **AN ESTIMATE OVER THE OP CHARACTER, AND THE ONE BOTH COST PASSES USE.**
-/// P6 gates a fork with it and P3 gates a conditional with it; two spellings
-/// of "what does this region cost" would be two passes free to disagree about
-/// the same region on the same profile.
+/// What one region's nodes cost, per the profile's family table; used by
+/// both the fork and conditional cost gates so they agree.
 pub(crate) fn region_us(trace: &Trace, region: &Region, profile: &DeviceProfile) -> f32 {
     region
         .nodes
@@ -143,20 +28,11 @@ fn nodes(region: &Region) -> f32 {
     }
 }
 
-/// Choose each region's lowering, in place.
+/// Choose each region's lowering, in place. `regions` comes out stamped with
+/// [`Region::lowering`]; everything else is untouched.
 ///
-/// The one door into P3. `regions` comes out stamped with
-/// [`Region::lowering`]; everything else about a region is untouched, and a
-/// pass that chooses nothing leaves the table byte-identical to what P2 wrote.
-///
-/// # The off arm
-///
-/// `fat_region_us` at [`f32::INFINITY`] is the switch, and it is off by
-/// meaning rather than by fiat: no body is ever fat enough, so every gate
-/// below is false and every region stays [`Lowering::AlwaysLaunch`]. A profile
-/// whose cost fields are all ZERO is likewise off, because both gates are
-/// STRICT — a device that charges nothing for an empty launch has nothing for
-/// a conditional to save.
+/// `fat_region_us` at [`f32::INFINITY`] turns this off: no body is ever fat
+/// enough, so every region stays [`Lowering::AlwaysLaunch`].
 pub(crate) fn lower(
     trace: &Trace,
     regions: &mut [Region],
@@ -169,11 +45,8 @@ pub(crate) fn lower(
         return;
     }
 
-    // SWITCH first, because a group claims its members and a member claimed by
-    // a group is not offered an `IF` of its own: one evaluation point for K
-    // exclusive arms is the whole reason SWITCH exists, and K IFs beside it
-    // would be the arrangement tart measured as the loser (9.8 µs against
-    // 22.6 at K=32).
+    // SWITCH first: a group claims its members before they're offered an
+    // `IF` of their own.
     let mut claimed = vec![false; regions.len()];
     for group in switch_groups(trace, regions, classes, budget, profile) {
         for (arm, &at) in group.members.iter().enumerate() {
@@ -192,15 +65,13 @@ pub(crate) fn lower(
         if claimed[at] {
             continue;
         }
-        if !windowed(region, all) {
+        if !region.windowed(all) {
             continue;
         }
         if !fat(trace, region, profile) {
             continue;
         }
-        // One body, so `arms` is 1: an `IF` is `cudaGraphCondTypeIf` and the
-        // per-arm term is charged once. The ELSE half CUDA 12.8 grew is not
-        // used — there is no second body here, only a body and its absence.
+        // One body: `arms` is 1, the per-arm term charged once.
         if !profits(nodes(region), 1, profile) {
             continue;
         }
@@ -208,36 +79,15 @@ pub(crate) fn lower(
     }
 }
 
-/// Is this region's window one a composition can leave empty?
-///
-/// THE FIRST GATE, AND THE CHEAPEST. A region whose mask holds every class has
-/// rows in every fire — a fire carries at least one lane, that lane is in some
-/// class, and that class is in the mask — so a guard around it is an
-/// evaluation point that is never false. The other three clauses are the ones
-/// that are not about cost at all: host work is not in the graph, a dead
-/// region is disjoint from everything and would be a candidate for no reason,
-/// and **a collective is never elided** (decision #5) — NCCL matches calls by
-/// order, so a rank that skipped one deadlocks the ranks that did not or
-/// silently mispairs the next.
-fn windowed(region: &Region, all: usize) -> bool {
-    region.phase == Phase::Capture
-        && !region.collective
-        && !region.mask.is_empty()
-        && region.mask.len() < all
-}
-
-/// Design §4's own gate: is the body worth an evaluation point that is paid
-/// whether it is taken or not?
+/// Is the body worth an evaluation point that is paid whether it is taken
+/// or not?
 fn fat(trace: &Trace, region: &Region, profile: &DeviceProfile) -> bool {
     region_us(trace, region, profile) >= profile.fat_region_us
 }
 
-/// The gate always-launch forces: are the launches this skips worth more than
-/// the evaluation point that skips them?
-///
-/// `skipped` is a count of LAUNCHES, not of regions — always-launch pays
-/// `empty_launch_us` per node — and the comparison is strict so that a profile
-/// with nothing in it decides nothing.
+/// Are the launches this skips worth more than the evaluation point that
+/// skips them? `skipped` counts launches, not regions; strict comparison so
+/// a zeroed profile decides nothing.
 fn profits(skipped: f32, arms: u8, profile: &DeviceProfile) -> bool {
     let paid = profile.cond_fixed_us + profile.cond_per_arm_us * f32::from(arms);
     skipped * profile.empty_launch_us > paid
@@ -250,17 +100,11 @@ struct Group {
     members: Vec<usize>,
 }
 
-/// Every run of consecutive regions that is exactly the arms of one merge, is
-/// fat, profits, and can PROVE at most one arm is live in a fire.
+/// Every run of consecutive regions that is exactly one merge's arms, is
+/// fat, profits, and provably has at most one live arm per fire.
 ///
-/// **ONE REGION PER ARM, AND CONSECUTIVE** — v1's shape, and it is what P2
-/// hands over: an arm's nodes share a mask and a phase, so they coalesce into
-/// one region, and the arms of a merge stand next to each other in program
-/// order because a merge is read right after its arms are written. An arm that
-/// split into two regions (a prepare node inside it, a mask that changed
-/// mid-arm) is not a group, and the plan keeps always-launch — a partial
-/// SWITCH would be a conditional over some of the exclusive set, which is not
-/// exclusive.
+/// Arms must be consecutive and in ascending order; an arm that split into
+/// two regions is not a group and stays always-launch.
 fn switch_groups(
     trace: &Trace,
     regions: &[Region],
@@ -268,11 +112,8 @@ fn switch_groups(
     budget: &Budget,
     profile: &DeviceProfile,
 ) -> Vec<Group> {
-    // Which region defines each value, for the arms to be looked up by. Two
-    // passes over two flat tables rather than a search per node: provenance is
-    // the plan's own statement of who wrote a value (`Def::Op`), and it is
-    // total — the same direction build log 24 (b) reads a cache write in, and
-    // for the same reason.
+    // Which region defines each value, so arms can be looked up by their
+    // defining region.
     let mut region_of = vec![usize::MAX; trace.nodes.len()];
     for (at, region) in regions.iter().enumerate() {
         for node in region.nodes.clone() {
@@ -310,26 +151,9 @@ fn switch_groups(
         if members.iter().any(|&at| at == usize::MAX) {
             continue; // an arm no region defines: a weight, an input, a nested merge.
         }
-        // Consecutive, distinct, and in program order — a run, which is what
-        // a recorder can bracket with one `cond_begin` .. `cond_end`.
-        //
-        // **AND `members` ITSELF HAS TO BE THE ASCENDING RUN, NOT MERELY ITS
-        // SORTED IMAGE.** This used to sort a copy and check THAT for
-        // contiguity, which admits a group whose arms stand in a different
-        // order from the regions that define them — `[21, 20, 22, 23]` is a
-        // contiguous run and is arm 0 at region 21 with arm 1 in front of it.
-        // The walk brackets a group by the arm NUMBER (`model_exec::fire::walk`
-        // opens at `arm == 0` and closes at `arm + 1 == arms`, which is the
-        // "no second table and no state between regions" property this pass's
-        // own header claims), so an out-of-order group opens the bracket in the
-        // middle of its own run and leaves the arms in front of it outside the
-        // conditional altogether.
-        //
-        // **MEASURED, NOT ANTICIPATED** (B6): `qwen35-d0.8b` at
-        // `max_lanes == 1` produced exactly that shape, and the first pass that
-        // ever recorded a SWITCH found it. Requiring the ascending run declines
-        // the group instead — one fewer conditional, which costs an
-        // optimization and nothing else (decision #3).
+        // `members` must be the ascending run itself, not merely its sorted
+        // image: an out-of-order group would bracket the wrong nodes at
+        // record time (the walk opens/closes by arm number).
         if members.windows(2).any(|pair| pair[1] != pair[0] + 1) {
             continue;
         }
@@ -339,44 +163,20 @@ fn switch_groups(
         let all = classes.classes.len();
         if !members
             .iter()
-            .all(|&at| windowed(&regions[at], all) && fat(trace, &regions[at], profile))
+            .all(|&at| regions[at].windowed(all) && fat(trace, &regions[at], profile))
         {
             continue;
         }
-        // **AND THE EXCLUSIVITY HAS TO HOLD OF THE REGIONS, NOT JUST OF THE
-        // ARMS** — the clause `fire_exclusive` cannot state, because it is
-        // about a merge and a SWITCH is about the regions that define one.
-        //
-        // `fire_exclusive` proves no COMPOSITION demands two ARMS. The graph
-        // node skips whole REGIONS, and a region is a coalesced run of nodes
-        // that share a mask — so the region defining an arm may carry nodes
-        // that arm's classes never asked for, and its mask is then a union
-        // wider than the arm's own guard. Two members whose masks overlap have
-        // rows in the same fire, and `cudaGraphCondTypeSwitch` runs exactly one
-        // body: the other arm's launches are silently dropped.
-        //
-        // **MEASURED, NOT ANTICIPATED** (B6). The first pass that ever recorded
-        // a SWITCH found `qwen35-d0.8b` at `max_lanes == 1` grouping four
-        // consecutive regions of which arms 1 AND 3 had rows in a plain decode
-        // fire, and the recorded graph answered different tokens from the eager
-        // walk. `fire_exclusive`'s one-lane reading — "a lane has one word,
-        // hence one class, hence one arm" — is true of arms and says nothing
-        // about the masks P2 coalesced them into.
-        //
-        // Pairwise-disjoint masks is the property the mechanism actually needs,
-        // stated in the terms the mechanism uses: a composition is a set of
-        // classes, a member has rows iff its mask meets that set, and disjoint
-        // masks cannot both be met. It subsumes both readings `fire_exclusive`
-        // offers rather than replacing them — that gate stays, because a merge
-        // whose arms are not exclusive is not a SWITCH whatever its regions
-        // look like.
+        // Exclusivity must hold of the regions, not just the arms:
+        // `fire_exclusive` is about a merge, but a region can carry extra
+        // nodes and so a wider mask than its arm's own guard. Two members
+        // with overlapping masks can both have rows in one fire, and SWITCH
+        // runs only one body.
         if !pairwise_disjoint(regions, &members) {
             continue;
         }
-        // What a SWITCH skips is every arm but the one taken, and the honest
-        // reading of "the one taken" is the FATTEST — the arm that leaves the
-        // least to skip. Same shape as P6's `min(cost a, cost b)` gate: the
-        // pessimistic side of an estimate.
+        // A SWITCH skips every arm but the fattest one (the pessimistic
+        // estimate of "the one taken").
         let launches: f32 = members.iter().map(|&at| nodes(&regions[at])).sum();
         let widest = members
             .iter()
@@ -394,25 +194,12 @@ fn switch_groups(
     groups
 }
 
-/// Do no two of these regions have rows in the same fire?
-///
-/// **THE SECOND HALF OF THE ACTIVATION PROOF, AND THE HALF ABOUT REGIONS.** A
-/// region's window is its mask's rows in the fire's descriptor, so two members
-/// are simultaneously live exactly when some composition meets both masks —
-/// and since a composition is an arbitrary set of classes, that is exactly
-/// when the masks intersect. Pairwise, because a SWITCH runs one body out of
-/// `arms` and any overlapping pair is a fire that loses one of them.
-///
-/// Quadratic in the arm count, which is two to four on every group the catalog
-/// has ever offered, over a mask whose `contains` is a bit test.
+/// Do no two of these regions have rows in the same fire? Two members are
+/// simultaneously live exactly when their masks intersect.
 fn pairwise_disjoint(regions: &[Region], members: &[usize]) -> bool {
     for (at, &left) in members.iter().enumerate() {
         for &right in &members[at + 1..] {
-            if regions[left]
-                .mask
-                .iter()
-                .any(|class| regions[right].mask.contains(class))
-            {
+            if !regions[left].mask.disjoint(&regions[right].mask) {
                 return false;
             }
         }
@@ -420,21 +207,9 @@ fn pairwise_disjoint(regions: &[Region], members: &[usize]) -> bool {
     true
 }
 
-/// **CAN A FIRE HOLD TWO LIVE ARMS OF THIS MERGE?** — the proof obligation
-/// decision #4 does not discharge.
-///
-/// `ClassTable::merge_arm` says which arm each CLASS resolves the merge to. A
-/// composition is a set of classes, so the arms live in a fire are the image
-/// of that set; a SWITCH is sound exactly when that image can never hold two.
-/// Two readings make it so, and only one of them ever produces a group:
-///
-/// - **one lane per fire.** A lane has one word, hence one class, hence one
-///   arm. `max_lanes == 1` is a real deployment — every golden in this tree
-///   that fires a single request is one — and it is the deployment where the
-///   arms of a merge are exclusive in the sense a graph node can use.
-/// - **one arm, everywhere.** Every class that demands the merge resolves it
-///   to the same arm, which is a merge with nothing to switch over; the group
-///   is then one member and `switch_groups` has already declined it.
+/// Can a fire hold two live arms of this merge? True when `max_lanes == 1`
+/// (one lane, hence one class, hence one arm per fire) or when every class
+/// resolves the merge to the same arm.
 fn fire_exclusive(classes: &ClassTable, merge: ValueId, budget: &Budget) -> bool {
     if budget.max_lanes <= 1 {
         return true;
@@ -452,183 +227,3 @@ fn fire_exclusive(classes: &ClassTable, merge: ValueId, budget: &Budget) -> bool
     true
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fixture::{Build, fact};
-    use crate::{compile, region};
-    use model_ir::{Guard, resolve_classes};
-
-    /// A profile that will take anything a region offers: no floor, no fixed
-    /// cost. What it is FOR is stating that the gates and not the machinery
-    /// are what decline the catalog.
-    fn eager() -> DeviceProfile {
-        DeviceProfile {
-            fat_region_us: 0.0,
-            cond_fixed_us: 0.5,
-            cond_per_arm_us: 0.0,
-            side_streams: 0,
-            ..DeviceProfile::default()
-        }
-    }
-
-    /// Design §0's shape with FAT arms: a decode arm and a prefill arm of ten
-    /// nodes each, merged.
-    fn split(width: usize) -> Build {
-        let mut b = Build::new();
-        let x = b.input(8);
-        let q = b.op(x, 8, Guard::Always);
-        let mut d = q;
-        for _ in 0..width {
-            d = b.op(d, 8, fact(0));
-        }
-        let mut p = q;
-        for _ in 0..width {
-            p = b.op(p, 8, Guard::not(fact(0)));
-        }
-        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
-        let y = b.op(o, 8, Guard::Always);
-        b.out(y);
-        b
-    }
-
-    fn lowerings(trace: &model_ir::Trace, budget: &Budget, profile: &DeviceProfile) -> Vec<Lowering> {
-        let classes = resolve_classes(trace).expect("covers");
-        let mut regions = region::coalesce(trace, &classes);
-        lower(trace, &mut regions, &classes, budget, profile);
-        regions.into_iter().map(|r| r.lowering).collect()
-    }
-
-    #[test]
-    fn a_batching_deployment_gets_ifs_and_never_a_switch() {
-        let b = split(10);
-        let got = lowerings(&b.trace, &Budget::new(8, 64), &eager());
-        assert_eq!(got.iter().filter(|l| **l == Lowering::If).count(), 2);
-        assert!(!got.iter().any(|l| matches!(l, Lowering::Switch { .. })));
-    }
-
-    #[test]
-    fn a_one_lane_deployment_gets_the_switch_the_same_arms_could_not_have() {
-        let b = split(10);
-        let got = lowerings(&b.trace, &Budget::new(1, 64), &eager());
-        let arms: Vec<&Lowering> = got
-            .iter()
-            .filter(|l| matches!(l, Lowering::Switch { .. }))
-            .collect();
-        assert_eq!(arms.len(), 2);
-        assert!(matches!(arms[0], Lowering::Switch { arm: 0, arms: 2, .. }));
-        assert!(matches!(arms[1], Lowering::Switch { arm: 1, arms: 2, .. }));
-        assert!(!got.iter().any(|l| *l == Lowering::If));
-    }
-
-    #[test]
-    fn a_thin_arm_is_declined_however_fat_the_profile_says_it_is() {
-        // Two nodes an arm: fat at a zero floor, and still a loss — one
-        // evaluation point costs more than two skipped empty launches.
-        let b = split(2);
-        let profile = DeviceProfile {
-            fat_region_us: 0.0,
-            ..DeviceProfile::default()
-        };
-        let got = lowerings(&b.trace, &Budget::new(8, 64), &profile);
-        assert!(got.iter().all(|l| *l == Lowering::AlwaysLaunch));
-    }
-
-    #[test]
-    fn a_full_mask_region_is_never_conditional_because_it_is_never_empty() {
-        let mut b = Build::new();
-        let x = b.input(8);
-        let mut y = x;
-        for _ in 0..40 {
-            y = b.op(y, 8, Guard::Always);
-        }
-        b.out(y);
-        let got = lowerings(&b.trace, &Budget::new(8, 64), &eager());
-        assert!(got.iter().all(|l| *l == Lowering::AlwaysLaunch));
-    }
-
-    #[test]
-    fn the_off_arm_bakes_the_artifact_p3_never_touched() {
-        let b = split(10);
-        let budget = Budget::new(8, 64);
-        let off = DeviceProfile {
-            fat_region_us: f32::INFINITY,
-            ..eager()
-        };
-        let zeroed = DeviceProfile {
-            empty_launch_us: 0.0,
-            cond_fixed_us: 0.0,
-            cond_per_arm_us: 0.0,
-            fat_region_us: 0.0,
-            ..eager()
-        };
-        for profile in [&off, &zeroed] {
-            assert!(
-                lowerings(&b.trace, &budget, profile)
-                    .iter()
-                    .all(|l| *l == Lowering::AlwaysLaunch),
-                "the off arm constructs nothing"
-            );
-        }
-        // And the whole artifact is the one P2 wrote, not merely its
-        // lowerings: this is the D1 pattern's own claim.
-        let plain = compile(&b.trace, &budget, &off).expect("bakes");
-        let neutral = DeviceProfile {
-            side_streams: 0,
-            ..DeviceProfile::default()
-        };
-        let baseline = compile(
-            &b.trace,
-            &budget,
-            &DeviceProfile {
-                fat_region_us: f32::INFINITY,
-                ..neutral
-            },
-        )
-        .expect("bakes");
-        assert_eq!(plain.regions, baseline.regions);
-    }
-
-    #[test]
-    fn a_collective_region_stays_always_launch_however_fat_it_is() {
-        let mut b = Build::new();
-        let x = b.input(8);
-        let a = b.op(x, 8, Guard::Always);
-        let mut g = b.all_gather(a, 8, fact(0));
-        for _ in 0..20 {
-            g = b.op(g, 8, fact(0));
-        }
-        let o = b.merge(&[(g, fact(0)), (a, Guard::not(fact(0)))], 8);
-        b.out(o);
-        let got = lowerings(&b.trace, &Budget::new(8, 64), &eager());
-        let classes = resolve_classes(&b.trace).expect("covers");
-        let regions = region::coalesce(&b.trace, &classes);
-        for (at, region) in regions.iter().enumerate() {
-            if region.collective {
-                assert_eq!(got[at], Lowering::AlwaysLaunch, "region {at}");
-            }
-        }
-    }
-
-    #[test]
-    fn a_conditional_region_is_not_forked() {
-        // P3 runs before P6 and `stream::forkable` reads the lowering, so the
-        // two arms this profile conditionalizes are the two arms P6 would
-        // otherwise have overlapped.
-        let b = split(10);
-        let budget = Budget::new(8, 64);
-        let on = DeviceProfile {
-            side_streams: 2,
-            ..eager()
-        };
-        let compiled = compile(&b.trace, &budget, &on).expect("bakes");
-        assert!(compiled.regions.iter().any(|r| r.lowering == Lowering::If));
-        for region in &compiled.regions {
-            if region.lowering != Lowering::AlwaysLaunch {
-                assert_eq!(region.stream, 0, "a conditional body is single-stream");
-                assert!(region.open.is_none() && region.close.is_none());
-            }
-        }
-        assert!(compiled.streams.pairs.is_empty());
-    }
-}

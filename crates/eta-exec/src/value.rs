@@ -1,14 +1,9 @@
 use eta_ir::Dtype;
 use eta_ir::container::ChanDType;
 
-/// The element type a channel's cells actually hold.
-///
-/// `ChanDType::Act` is the late-bound activation type; this host plane
-/// materializes it as `F32`, which is what its reference interpreter computes
-/// in. This was `concrete_dtype(byte: u8)`, a `Dtype::from_wire` with a
-/// `PIE_CHANNEL_DTYPE_ACT` arm bolted on to cover the one tag that is not a
-/// `Dtype` — and a second `None => F32` arm to cover every byte that is
-/// neither. A `ChanDType` has only the two cases.
+/// The element type a channel's cells actually hold. `ChanDType::Act` is
+/// the late-bound activation type; this host plane materializes it as
+/// `F32`, which is what its reference interpreter computes in.
 #[must_use]
 pub fn concrete_dtype(dtype: ChanDType) -> Dtype {
     match dtype {
@@ -18,19 +13,10 @@ pub fn concrete_dtype(dtype: ChanDType) -> Dtype {
 }
 
 /// What a [`Dtype`] outside ETA's set means to this plane: nothing, and it
-/// cannot get here.
-///
-/// [`Value`]'s four variants are the four dtypes ETA computes in, which is a
-/// fact about the op set and not about `dtype::Dtype` — that enum names
-/// thirteen more, for weight planes and kv pages and checkpoint tensors, and
-/// none of them is a lane an ETA op reads. `eta_ir::types::class_of` is where
-/// the difference is decided; this is what the decision means here, written
-/// once rather than thirteen times in each match that needs it.
-///
-/// Panics rather than substituting `F32`: a plan reaching this point passed
-/// `eta_ir::infer::body_types`, which refuses an unsupported result dtype by
-/// name, so an `F32` here would be a wrong answer standing in for an
-/// impossible one.
+/// cannot get here. [`Value`]'s four variants are the four dtypes ETA
+/// computes in. Panics rather than substituting `F32`: a plan reaching this
+/// point already passed `eta_ir::infer::body_types`, which refuses an
+/// unsupported result dtype by name.
 ///
 /// # Panics
 ///
@@ -171,10 +157,7 @@ pub fn decode_wire(bytes: &[u8], dtype: Dtype, numel: usize) -> Option<Value> {
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),
-        // A dtype this plane has no lane for; see `no_lane`. `None` rather
-        // than the panic because this function already answers `None` for
-        // bytes that are not the cell it was asked for, and `wire_cell_bytes`
-        // has no width to offer for one either.
+        // a dtype this plane has no lane for; see `no_lane`.
         _ => return None,
     })
 }

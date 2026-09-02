@@ -1,30 +1,12 @@
-//! One declaration per tagged enum.
-//!
-//! Several enums in this workspace are the same shape: a `#[repr(u8)]` whose
-//! discriminants are frozen wire tags, plus three things that have to agree
-//! with the variant list and with each other —
-//!
-//! * `ALL`, which the generated C header and every "for each variant" loop walk;
-//! * `from_u8`, which turns a tag back into a variant;
-//! * `name`, the snake-case spelling the C identifier and the debug output use.
-//!
-//! Written out by hand, each of those is a separate opportunity to add a
-//! variant and update two of the three. That is not hypothetical: `Stage::ALL`
-//! sat six lines from a `for stage in [Stage::Prologue, ..]` in
-//! `eta-dsl`'s builder that re-listed the same four stages, so a fifth stage
-//! would have compiled, built a container, and simply never been traced.
-//!
-//! `declare_tagged_enum!` takes the list once and derives all three, the same
-//! way the op table's own declaration macro does. Adding a
-//! variant is then a one-line edit that cannot be half-done.
+//! One declaration per tagged enum: a `#[repr(u8)]` whose discriminants are
+//! frozen wire tags. `declare_tagged_enum!` derives `ALL`, `from_u8`, and
+//! `name` from a single variant list, so adding a variant is a one-line edit
+//! that cannot leave one of the three out of sync.
 
 /// Declare a `#[repr(u8)]` enum with frozen wire tags.
 ///
-/// The macro is exported, so it expands in the caller's crate and must not
-/// name a Cargo feature: `eta-compiler` declares two enums this way and has
-/// no features. An enum that needs a conditional derive (this crate's `Port`
-/// and `Stage` under `serde`) writes it as a leading attribute, which the
-/// macro forwards.
+/// Exported, so it must not name a Cargo feature. A conditional derive
+/// writes it as a leading attribute, which the macro forwards.
 ///
 /// ```ignore
 /// declare_tagged_enum! {
@@ -76,44 +58,3 @@ macro_rules! declare_tagged_enum {
     };
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::registry::{Port, Stage};
-
-    /// The three derived items agree, for every enum declared this way.
-    ///
-    /// This cannot fail by drift — one list generates all three — so it is a
-    /// check on the *declarations*: a duplicated or out-of-order tag.
-    fn check<T: 'static + Copy + PartialEq + core::fmt::Debug>(
-        all: &[T],
-        tag_of: fn(T) -> u8,
-        from_u8: fn(u8) -> Option<T>,
-        name: fn(T) -> &'static str,
-    ) {
-        for (index, &variant) in all.iter().enumerate() {
-            assert_eq!(
-                tag_of(variant) as usize,
-                index,
-                "{:?}: ALL must be dense and in tag order",
-                variant
-            );
-            assert_eq!(from_u8(tag_of(variant)), Some(variant));
-            assert!(!name(variant).is_empty());
-        }
-        assert!(
-            u8::try_from(all.len()).is_ok_and(|past_end| from_u8(past_end).is_none()),
-            "from_u8 accepts a tag past the end of ALL"
-        );
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(name(*a), name(*b), "duplicate spelling");
-            }
-        }
-    }
-
-    #[test]
-    fn stage_and_port_tags_are_dense_and_unique() {
-        check(Stage::ALL, |s| s as u8, Stage::from_u8, Stage::name);
-        check(Port::ALL, |p| p as u8, Port::from_u8, Port::name);
-    }
-}

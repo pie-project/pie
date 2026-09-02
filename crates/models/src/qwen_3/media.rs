@@ -1,74 +1,23 @@
-//! **QWEN3.5 / QWEN3.6 VISION PREPROCESSING — the pinned transcription, in the
-//! family's own house.**
-//!
-//! Every number and every loop order below already existed in this tree, in two
-//! places the campaign built them for the vision gates, and this module is those
-//! two places joined rather than a third derivation of them:
-//!
-//! * `runtime::inferlet::host::media::multimodal::QwenVisionConfig` —
-//!   `smart_resize`, `grid`, `layout`, `qwen_patchify_hwc`. `qwen_patchify_hwc`
-//!   is the merge-block-major statute (multimodal §8.1, §7.4, §11.4) in
-//!   executable form, and `engine-cuda`'s `a_vision_sku_loads_and_fires_an_image`
-//!   transcribed its loop order a second time to build its own streams. One
-//!   order serves the pos-embed gather, the merge and the pool.
-//! * `kernels-cuda/tests/tower_pos_embed.rs` — [`axis_taps`] / [`interp`], which
-//!   is `transformers`' `_interpolation_axis_taps_weights` plus the 2-D
-//!   separable outer product from
-//!   `get_vision_interpolation_indices_and_weights` (`vision_utils.py`,
-//!   v5.15.1). That file gates the arithmetic against a TEXTBOOK
-//!   `align_corners` bilinear resample written independently of it, so
-//!   promoting the helper carries a golden that pins the formula and not just
-//!   the kernel.
-//!
-//! It lives beside [`forward`](super::forward), [`import`](super::import) and
-//! [`template`](super::template) because it is the same kind of fact — how
-//! THIS family does a thing every family does its own way — and the one step
-//! that is not the family's own arithmetic, the resample, arrives lent
-//! ([`Resample`], the codec staying with the host per `model::media`'s rule).
-//! The bytes-in whole-pipe gate rides in `runtime`'s tests, where the codec
-//! is; the arithmetic's own goldens ride in this crate's.
-//!
-//! **THE CHECKPOINT'S OWN NUMBERS**, read off `Qwen3_5VisionConfig` and the
-//! Qwen3.5-0.8B preprocessor config (snapshot `2fc06364`):
-//!
-//! | fact | value | where it is stated |
-//! |---|---|---|
-//! | `patch_size` | 16 | `Qwen3_5VisionConfig.patch_size` |
-//! | `spatial_merge_size` | 2 | `Qwen3_5VisionConfig.spatial_merge_size` |
-//! | `temporal_patch_size` | 2 | `Qwen3_5VisionConfig.temporal_patch_size` |
-//! | `num_position_embeddings` | 2304 | `Qwen3_5VisionConfig` — so the stored grid is 48 × 48 |
-//! | interpolation | bilinear, `align_corners = True` | `Qwen3_5VisionModel.__init__` |
-//! | `min_pixels` / `max_pixels` | 65536 / 16777216 | the checkpoint's preprocessor config |
-//! | normalization | mean 0.5, std 0.5 | ditto — SigLIP's, not CLIP's |
-//!
-//! The resize FACTOR is `patch_size · spatial_merge_size = 32`: `smart_resize`
-//! rounds both sides to a multiple of it, which is what makes every image's
-//! patch grid a whole number of 2 × 2 merge blocks — the same no-edge property
-//! gemma4 gets from rounding down to `pool · patch`, reached by rounding to
-//! nearest with a floor.
+//! Qwen3.5 / Qwen3.6 vision preprocessing: resize, patchify, position taps.
 
 use crate::media::{Budget, Delimiters, EncodedSpan, Fault, Grid, Resample, Result, Rgb8,
     VisionFrontEnd};
 
 /// The `ROWS.arch` this front-end answers for.
 ///
-/// One string for both qwen SKUs: `VisionArch::from_arch_name` already maps
-/// `"qwen3_5"` here, and qwen36's tower differs from qwen35's in block count
-/// and width — facts of the model text, not of the preprocessing. The
-/// processor arithmetic is identical, which is why there is one module.
+/// Shared by both qwen3.5 and qwen3.6; their preprocessing is identical even
+/// though the towers differ in block count and width.
 pub const ARCH: &str = "qwen3_5";
 
-/// **THE PROCESSOR'S CONSTANTS**, each named where the previous table says it
-/// is stated. A field rather than a `const` so a future SKU with another
-/// `max_pixels` is a value and not a fork.
+/// The processor's constants, as a field rather than a `const` so a future
+/// SKU can vary them without forking the type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QwenVisionConfig {
     /// Pixels per patch side.
     pub patch_size: u32,
     /// `spatial_merge_size` — the merger folds `merge²` patch rows into one.
     pub merge_size: u32,
-    /// `temporal_patch_size`. A still image repeats itself across it, which is
-    /// what upstream's `expand` on the temporal axis does.
+    /// `temporal_patch_size`. A still image repeats itself across this axis.
     pub temporal_patch_size: u32,
     /// Lower bound on `h̄ · w̄`; below it `smart_resize` scales UP.
     pub min_pixels: u32,
@@ -104,33 +53,18 @@ impl QwenVisionConfig {
         3 * self.temporal_patch_size as usize * self.patch_size as usize * self.patch_size as usize
     }
 
-    /// **`smart_resize`, TRANSCRIBED** from
-    /// `transformers/models/qwen2_vl/image_processing_qwen2_vl.py` (v5.15.1),
-    /// which is the processor `qwen3_5` maps to in `image_processing_auto`.
+    /// Rounds both sides to the nearest multiple of `factor`; if the product
+    /// exceeds `max_pixels` scales down and floors to the factor, if under
+    /// `min_pixels` scales up and ceils to it.
     ///
-    /// Round both sides to the nearest multiple of `factor`; if the product
-    /// exceeds `max_pixels` scale down and FLOOR to the factor, if it falls
-    /// under `min_pixels` scale up and CEIL to it.
-    ///
-    /// **THE ROUND BRANCH TAKES NO `max(factor, ·)`, AND THAT IS LOAD-BEARING.**
-    /// An earlier reading of this transcription added one — "a sub-`factor`
-    /// image cannot answer a zero side" — on the argument that the min-pixels
-    /// branch would fire anyway. It does not, and the golden caught it: a
-    /// `2 x 400` image rounds to `0 x 416`, whose product is 0 and therefore
-    /// under `min_pixels`, so the scale-up branch rescues it to `32 x 3648`.
-    /// With the guard the product is `32 · 416 = 13312`, still under
-    /// `min_pixels`, so that case survived — but `2 x 3000` rounds to
-    /// `0 x 3008`, and the guard makes it `32 x 3008 = 96256`, ABOVE
-    /// `min_pixels`, so no branch fires and the image keeps a resolution
-    /// upstream would have scaled up. The zero is upstream's own sentinel for
-    /// "this side is too small to round"; overwriting it hides the signal.
+    /// The round branch must not clamp a side to `max(factor, ·)`: a zero
+    /// side is the signal that lets the min-pixels branch rescue the image,
+    /// and clamping it early can leave the product above `min_pixels` so
+    /// neither branch fires.
     ///
     /// # Errors
     ///
-    /// [`Fault::Empty`] for an absolute aspect ratio past 200, which is
-    /// upstream's own first statement and its own refusal. `Fault` has no
-    /// closer name for it; a 1 × 10000 strip is a span degenerate enough that
-    /// the processor declines to state a grid for it.
+    /// [`Fault::Empty`] for an absolute aspect ratio past 200.
     pub fn smart_resize(&self, h: u32, w: u32) -> Result<(u32, u32)> {
         let (hf, wf) = (f64::from(h), f64::from(w));
         let (long, short) = (hf.max(wf), hf.min(wf));
@@ -172,58 +106,32 @@ impl QwenVisionConfig {
         Ok((h_bar / self.patch_size, w_bar / self.patch_size))
     }
 
-    /// **THE PLACEHOLDER RUN'S LENGTH**: one token per merge block.
+    /// The placeholder run's length: one token per merge block.
     #[must_use]
     pub const fn token_count(&self, gh: u32, gw: u32) -> u32 {
         gh * gw / (self.merge_size * self.merge_size)
     }
 
-    /// **HOW FAR THE 1-D CURSOR ADVANCES PAST THE SPAN**, and it is not the
-    /// token count.
-    ///
-    /// `Qwen3_5Model.get_vision_position_ids` lays a still image's merged grid
-    /// out as `(t, start + h, start + w)` over `meshgrid(indexing="ij")`, so
-    /// the largest component any row of the span carries is
-    /// `start + max(llm_grid_h, llm_grid_w) - 1` and the next text token
-    /// resumes one past it. A 16 × 4 merged grid occupies 64 rows and advances
-    /// the cursor by 16.
+    /// How far the 1-D position cursor advances past the span; not the token
+    /// count, but `max(merged_h, merged_w)`.
     #[must_use]
     pub const fn position_span(&self, gh: u32, gw: u32) -> u32 {
         let (hm, wm) = (gh / self.merge_size, gw / self.merge_size);
         if hm > wm { hm } else { wm }
     }
 
-    /// **THE MERGE-BLOCK-MAJOR PATCH ORDER AND THE PER-PATCH VECTOR** —
-    /// `qwen_patchify_hwc`, promoted verbatim from
-    /// `runtime::…::media::multimodal::QwenVisionConfig`.
+    /// Patchifies into merge-block-major order: block-row, block-column, then
+    /// row and column inside the 2x2 block; lanes within a row are channel,
+    /// then temporal, then patch row, then patch column.
     ///
-    /// Two orderings live here and they are different axes of the same answer:
+    /// Normalization is `(v / 255 - 0.5) / 0.5` (SigLIP's mean/std, not
+    /// CLIP's). `rgb` is `h * w * 3` bytes, row-major HWC.
     ///
-    /// * **rows** come out block-row, block-column, then row and column INSIDE
-    ///   the 2 × 2 block. That is `Qwen2VLImageProcessor.patchify`'s
-    ///   `permute(0, 2, 5, 3, 6, 1, 4, 7)` and `get_vision_position_ids`'
-    ///   `reshape(h/m, m, w/m, m).transpose(1, 2)`, and it is the statute
-    ///   `layout.merge_rows`, `layout.pool_rows` and the pos-embed gather all
-    ///   read (multimodal §7.4, §8.1, §11.4);
-    /// * **lanes within a row** are `C`, then `T`, then patch row, then patch
-    ///   column — upstream's `unsqueeze(6).expand(…)` puts the temporal axis
-    ///   immediately after the channel, and a still image repeats itself across
-    ///   it rather than carrying a second frame.
-    ///
-    /// Normalization is `(v / 255 − 0.5) / 0.5`, the checkpoint's `image_mean`
-    /// and `image_std` of 0.5 — SigLIP's convention, not CLIP's.
-    ///
-    /// Answers the payload and, beside it, each row's `(y, x)` in the patch
-    /// grid — the coordinate the tower's rotation stream is indexed by, in the
-    /// order [`EncodedSpan::positions`] documents.
-    ///
-    /// `rgb` is `h · w · 3` bytes, row-major HWC — a decoder's own layout, and
-    /// a plain slice rather than [`Rgb8`] so a golden can feed pixels it wrote
-    /// by hand.
+    /// Also returns each row's `(y, x)` in the patch grid.
     ///
     /// # Panics
     ///
-    /// If `rgb` is shorter than `h · w · 3`.
+    /// If `rgb` is shorter than `h * w * 3`.
     #[must_use]
     pub fn patchify(&self, rgb: &[u8], h: u32, w: u32) -> (Vec<f32>, Vec<u32>) {
         let p = self.patch_size as usize;
@@ -277,17 +185,11 @@ impl QwenVisionConfig {
         (pix, pos)
     }
 
-    /// **THE LEARNED POSITION TABLE'S TAPS AND WEIGHTS**, in [`patchify`]'s own
-    /// row order.
+    /// The learned position table's taps and weights, in [`patchify`]'s own
+    /// row order. Always four taps per row; on the native grid, [`axis_taps`]
+    /// puts weight 1 on the patch's own row and 0 on the rest.
     ///
     /// [`patchify`]: QwenVisionConfig::patchify
-    ///
-    /// Four taps per row, always: `taps` is the PLAN's and not the
-    /// submission's (multimodal §11.2), and a text that must serve any grid
-    /// declares `PatchEmbedRows` at 4. The native grid is not a special case —
-    /// [`axis_taps`] puts weight 1 on the patch's own row and 0 on the other
-    /// three by arithmetic, which `the_native_grid_puts_all_the_weight_on_its_own_row`
-    /// holds down.
     #[must_use]
     pub fn pos_embed_taps(&self, gh: u32, gw: u32) -> (Vec<i32>, Vec<f32>) {
         let m = self.merge_size as usize;
@@ -313,18 +215,10 @@ impl QwenVisionConfig {
     }
 }
 
-/// **`_interpolation_axis_taps_weights`, TRANSCRIBED** — bilinear, two taps,
-/// `align_corners = True`, which is the mode and flag
-/// `Qwen3_5VisionModel.__init__` states.
-///
-/// Promoted from `kernels-cuda/tests/tower_pos_embed.rs`, where it is gated
-/// against a textbook `align_corners` bilinear resample written without
-/// reference to it — so this formula is pinned twice over, once against
-/// `transformers` and once against an independent derivation.
+/// Bilinear interpolation, two taps, `align_corners = True`.
 ///
 /// `index` is the target position on an axis of length `size`; `side` is the
-/// stored table's. The `max(1)` on the denominator is the `size == 1` guard,
-/// where `index` is 0 and `src` is 0 too.
+/// stored table's. `max(1)` on the denominator guards `size == 1`.
 #[must_use]
 pub fn axis_taps(index: usize, size: usize, side: usize) -> ([usize; 2], [f32; 2]) {
     #[allow(clippy::cast_precision_loss)]
@@ -342,9 +236,8 @@ pub fn axis_taps(index: usize, size: usize, side: usize) -> ([usize; 2], [f32; 2
     (taps, weights)
 }
 
-/// The 2-D case: the separable outer product of the two axes' taps and
-/// weights, four per patch — `indices = h_taps · side + w_taps`, exactly
-/// `get_vision_interpolation_indices_and_weights`' own last two lines.
+/// The 2-D case: separable outer product of the two axes' taps and weights,
+/// four per patch. `indices = h_taps * side + w_taps`.
 #[must_use]
 pub fn interp(
     row: usize,
@@ -369,7 +262,7 @@ pub fn interp(
     (ids, weights)
 }
 
-/// **QWEN3.5 / QWEN3.6'S VISION FRONT-END.**
+/// Qwen3.5 / Qwen3.6's vision front-end.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Qwen35Vision {
     /// The processor's constants.
@@ -389,12 +282,9 @@ impl VisionFrontEnd for Qwen35Vision {
         ARCH
     }
 
-    /// **NAMED, NEVER NUMBERED** (media-door §0). The front-end holds no
-    /// tokenizer and states no id: it names the three specials and the runtime
-    /// resolves them through the tokenizer's own `token_to_id`, which is the
-    /// door `chat_template::special` already goes through for `<|turn>`. Two
-    /// checkpoints of one architecture that renumbered their specials get two
-    /// correct answers from one front-end.
+    /// Names the three specials rather than their ids; the runtime resolves
+    /// them through the tokenizer, so a checkpoint that renumbers them still
+    /// works.
     fn delimiters(&self) -> Delimiters {
         Delimiters {
             prefix: super::tokenizer::VISION_START,
@@ -403,11 +293,8 @@ impl VisionFrontEnd for Qwen35Vision {
         }
     }
 
-    /// **`budget` IS IGNORED, AND THAT IS A FACT ABOUT QWEN.** Gemma caps a
-    /// span by soft tokens and gives a video frame a smaller cap; qwen caps it
-    /// by PIXELS, and `Processor::for_arch_video` already answered the same
-    /// `QwenVisionConfig` for a frame as for a still. A frame of a clip is the
-    /// same preprocessing at the same ceiling here.
+    /// `budget` is ignored: qwen caps a span by pixels, not soft-token count,
+    /// and a video frame uses the same ceiling as a still.
     fn encode(&self, src: &Rgb8, _budget: Budget, resample: Resample) -> Result<EncodedSpan> {
         let c = self.config;
         let (h_bar, w_bar) = c.smart_resize(src.h, src.w)?;

@@ -1,6 +1,6 @@
 [package]
 name = "controller"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "Distributed control plane for Pie"
@@ -12,9 +12,8 @@ name = "controller"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 
-# Pure library (Seam 1): no `main.rs`, no `[[bin]]`. The standalone process lives
-# in the thin `bin/controller` shell (bootstrap + this lib); single-node embeds
-# via `embed()`.
+# Pure library: no `[[bin]]`. The standalone process is the thin bin shell over
+# this lib; single-node embeds via `embed()`.
 
 [dependencies]
 # Control-plane data types + the `Control` tarpc service (unified).

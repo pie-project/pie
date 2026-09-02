@@ -1,42 +1,7 @@
-//! The executor role — a named hole where the transport was.
-//!
-//! # `palo B-remote`: this module WAS the envelope's server half
-//!
-//! What stood here was 3,371 lines of tarpc service: `ExecutorRpc` and its
-//! `ExecutorRequest`/`ExecutorResponse` dispatch, a per-client hello
-//! handshake with a `REMOTE_WIRE_VERSION` check and a scratch-grant lease, a
-//! blob-fetch budget, an inline KV push that `cudaMemcpy`'d pages out of the
-//! local pool, a NIXL registration path, and a FIFO engine actor that
-//! translated `RemoteLaunch` back into a `FrameSubmission`. Every message
-//! type it named lived in `engine::remote`, and the palo contract rewrite
-//! deleted that module whole (design §7, decision 19):
-//!
-//! > Remote is a property, not an encoding: every noun serde, trait
-//! > object-safe; wire versioning is the transport's concern, not the
-//! > contract's.
-//!
-//! Redesigning the envelope is not this wave. What is here is the surface the
-//! rest of the worker names — the role's boot path, its stats, and the dial —
-//! with every verb refusing by name. A prefill worker that boots into this
-//! role is told, at boot, that it cannot serve one.
-//!
-//! # What the future envelope has to carry
-//!
-//! * **the hello** — a wire version (on the transport, not on the contract),
-//!   the peer's [`ModelIdentity`], its
-//!   [`Capabilities`](engine::Capabilities), its
-//!   [`KvLayout`](engine::KvLayout), and the scratch grant (base page +
-//!   count) the caller may address inside the peer's pool.
-//! * **the verbs** — `register_program`, `register_channel`, `bind_instance`,
-//!   `fire`, `copy_kv`, `encode`, `close_*`. All seven take serde nouns now,
-//!   so the message set is the trait; what the envelope adds is id mapping
-//!   (the peer mints program/channel/instance ids), a frame-size ceiling, and
-//!   an asynchronous [`FireTicket`](engine::FireTicket) path.
-//! * **the transfer** — inline bytes or an RDMA handle, and a way to say
-//!   which was used.
-//!
-//! `crate::link::partner` carries the same marker on the client half, and
-//! `::runtime::offload` on the admission half.
+//! The executor role — a named hole where the transport goes. What is here is
+//! the surface the rest of the worker names: the role's boot path, its stats,
+//! and the dial, with every verb refusing by name, so a prefill worker that
+//! boots into this role is told at boot that it cannot serve one.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -45,16 +10,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::translate::ModelEngines;
+use crate::backend::ModelEngines;
 
-/// Which half of a model a load carries.
-///
-/// **WORKER VOCABULARY NOW.** It was `engine::ModelComponent`, and the
-/// contract dropped it because it says WHICH GRAPH to load by enum, and that
-/// is now which `Trace` you hand over (`engine::load`'s header: "the
-/// encoder is a traced plan like any other"). What it still means here is
-/// which of a deployment's two loads a worker is: a decode worker's full
-/// model, or an encode partner's encoder.
+/// Which half of a model a load carries: a decode worker's full model, or an
+/// encode partner's encoder.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelComponent {
@@ -66,11 +25,8 @@ pub enum ModelComponent {
     Encode,
 }
 
-/// The token two workers compare before they trade KV pages.
-///
-/// Worker vocabulary for the same reason [`ModelComponent`] is: it is a hash
-/// of what the two ENGINES loaded plus which component each is, and neither
-/// half of that is a statement an engine makes about itself.
+/// The token two workers compare before they trade KV pages: a hash of what
+/// the two engines loaded plus which component each is.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelIdentity {
     /// blake3 over the model name, the checkpoint digest, and the engine's
@@ -101,12 +57,8 @@ impl ExecutorStats {
     }
 }
 
-/// The executor role's server.
-///
-/// Every field the running server had — the accept task, the actor task, the
-/// core handle — went with the service. What is left is what its callers read
-/// while it is up, so that the shape of `boot_executor` does not have to
-/// change when the envelope returns.
+/// The executor role's server. What's left is what its callers read while it
+/// is up, so `boot_executor`'s shape need not change when the envelope returns.
 pub(crate) struct ExecutorServer {
     endpoint: String,
     stats: Arc<ExecutorStats>,
@@ -118,9 +70,7 @@ impl ExecutorServer {
     ///
     /// # Errors
     ///
-    /// Always. See the module header: there is no transport, and a server
-    /// that bound a port and answered nothing would leave a controller
-    /// dispatching prefills into silence.
+    /// Always: there is no transport.
     pub(crate) async fn bind_with_transfer(
         addr: &str,
         engines: ModelEngines,
@@ -130,10 +80,9 @@ impl ExecutorServer {
     ) -> Result<Self> {
         let _ = (engines, model, max_clients, transfer);
         Err(anyhow!(
-            "this build cannot serve the executor role at {addr}: the remote \
-             envelope `engine::remote` carried was deleted by the palo \
-             contract rewrite and its successor is palo B-remote. Boot this \
-             worker in the standalone role."
+            "this build cannot serve the executor role at {addr}: remote \
+             executors are not supported in this release. Boot this worker \
+             in the standalone role."
         ))
     }
 
@@ -161,10 +110,10 @@ impl ExecutorServer {
 ///
 /// # Errors
 ///
-/// Always, for the reason [`ExecutorServer::bind_with_transfer`] gives. The
-/// local-IP half is what the peer's blob fetches would have been routed to.
+/// Always: no transport. The local-IP half is what the peer's blob fetches
+/// would have been routed to.
 pub(crate) async fn connect_with_local_ip(addr: &str) -> Result<((), IpAddr)> {
     Err(anyhow!(
-        "cannot dial executor {addr}: the remote envelope is palo B-remote"
+        "cannot dial executor {addr}: remote executors are not supported in this release"
     ))
 }

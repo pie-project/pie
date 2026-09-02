@@ -1,19 +1,5 @@
 //! The bound device: an `MTLDevice`, the queue every fire is committed on,
 //! and the facts a shell reads once.
-//!
-//! **ONE DEVICE PER SHELL, AND NO THREAD RULE.** The CUDA sibling's
-//! `bind_thread` exists because `cudaSetDevice` is per-thread state and a
-//! context bound on the boot thread strands every later call. Metal has no
-//! such state: an `MTLDevice` and an `MTLCommandQueue` are objects, they are
-//! documented thread-safe, and moving a loaded shell onto a lane thread
-//! costs nothing and needs no call. The contract's `bind_thread` is answered
-//! `Ok(())` for that reason and not because it was forgotten.
-//!
-//! **UNIFIED MEMORY IS ASSERTED, NOT ASSUMED.** [`Buffer`](super::Buffer)
-//! writes and reads through `contents()`, which is only the device's own
-//! bytes on a machine where the CPU and the GPU share them. A device that
-//! says otherwise is refused at bind with a sentence, rather than silently
-//! reading a stale mapping every fire.
 
 use crate::error::{Fault, Result};
 
@@ -30,41 +16,21 @@ use objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLResourceOptions, MTLSize,
 };
 
-/// **EVERY DEVICE RESERVATION THIS PROCESS HAS ASKED FOR**, counted.
-///
-/// One relaxed increment at the top of each of the three doors that can hand
-/// back an `MTLBuffer` — [`Context::reserve`], [`Context::no_copy`] and
-/// [`Context::empty`] — which is the whole of how memory is minted on this
-/// plane. Nothing in the shell reads it; it exists so a gate can assert the
-/// stronger half of a refusal: not merely that the load said no, but that it
-/// said no before it took anything.
-///
-/// ATTEMPTS AND NOT SUCCESSES, deliberately. A door entered and refused by the
-/// `maxBufferLength` ceiling still counts, because what a zero-allocation gate
-/// is claiming is that the door was never reached at all — and a counter that
-/// only recorded successes would let a refusal that had already walked past
-/// the check read as zero.
-///
-/// Relaxed because it is a monotone counter nobody synchronises against: a
-/// gate reads it on the thread that called, around a call on that thread.
+/// Every device reservation this process has asked for, counted. Bumped on
+/// attempt (not success) at the top of the three doors that hand back an
+/// `MTLBuffer`, so a gate can assert a refusal happened before any
+/// allocation was taken.
 static RESERVATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// [`RESERVATIONS`] — how many device reservations this PROCESS has asked for.
-///
-/// A gate takes it before and after the call it is making a claim about and
-/// compares the two; the absolute number is meaningless, because every test in
-/// a binary shares the process.
+/// [`RESERVATIONS`]. A gate reads it before and after the call it's making a
+/// claim about; the absolute number is meaningless (shared across tests).
 #[must_use]
 pub fn reservations() -> u64 {
     RESERVATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Is there a Metal device on this machine?
-///
-/// **A BUILD THAT NAMES METAL IS NOT A MACHINE THAT HAS IT** — a headless
-/// Apple target, or a VM with no GPU exposed, answers `nil` to
-/// `MTLCreateSystemDefaultDevice`. This is the door a GPU test knocks on
-/// before it asks for anything.
+/// Is there a Metal device on this machine? A headless Apple target or a VM
+/// with no GPU exposed answers `nil` to `MTLCreateSystemDefaultDevice`.
 #[must_use]
 pub fn present() -> bool {
     #[cfg(target_vendor = "apple")]
@@ -77,20 +43,10 @@ pub fn present() -> bool {
     }
 }
 
-/// Which `MTLGPUFamilyApple<N>` this device answers to, or 0 for one that
-/// answers to none.
-///
-/// **PROBED NEWEST-FIRST, AND THE ORDER IS THE WHOLE CORRECTNESS.** The
-/// families are cumulative: an M4 answers `supportsFamily:` for Apple7 as
-/// well as for Apple9, so an oldest-first walk reports every Apple silicon GPU
-/// ever made as an Apple7 and hands all of them the M1 constants — a bug that
-/// looks exactly like the tuning table not existing.
-///
-/// The probe rather than `DeviceInfo::of_name`, and the difference is not
-/// cosmetic: a name match answers 0 for any silicon minted after that table
-/// was written, and the fallback below is what catches a family newer than
-/// this list. Both roads end at the same measured defaults when nothing
-/// answers, which is `DeviceTuning::of`'s rule.
+/// Which `MTLGPUFamilyApple<N>` this device answers to, or 0 for none.
+/// Probed newest-first since families are cumulative (a newer device answers
+/// `supportsFamily:` for Apple7 as well as Apple9). The name-match fallback
+/// catches a family newer than this list.
 #[cfg(target_vendor = "apple")]
 fn family(device: &ProtocolObject<dyn MTLDevice>) -> u32 {
     const NEWEST_FIRST: [(MTLGPUFamily, u32); 4] = [
@@ -120,30 +76,26 @@ type Queue = ();
 /// The bound device and the queue its fires are committed on.
 ///
 /// The two Metal objects are read only under `cfg(target_vendor = "apple")`;
-/// off Apple the type aliases are `()` and the struct is never constructed,
-/// which is the same `allow` the CUDA sibling carries for its runtime-less
-/// build and for the same reason.
+/// off Apple the type aliases are `()` and the struct is never constructed.
 pub struct Context {
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     device: Device,
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     queue: Queue,
     name: String,
-    /// `recommendedMaxWorkingSetSize` — what the device says it will hold
-    /// without paging. The budget check's ceiling, not a hard limit.
+    /// `recommendedMaxWorkingSetSize` — what the device holds without
+    /// paging. The budget check's ceiling, not a hard limit.
     working_set: u64,
     /// `maxBufferLength` — one reservation's ceiling.
     max_buffer: u64,
-    /// The number of GPU cores, as the shell's stand-in for the CUDA
-    /// sibling's SM count. Metal publishes no such count, so this is a
-    /// stated default rather than a probe, and it feeds only the profile's
-    /// cost model — nothing a kernel argument reads.
+    /// GPU core count, as the CUDA sibling's SM-count stand-in. Metal
+    /// publishes none, so this is a stated default feeding only the cost
+    /// model — no kernel argument reads it.
     cores: u32,
 }
 
 // SAFETY: `MTLDevice` and `MTLCommandQueue` are documented thread-safe.
-// What `Send` buys is the move from the thread that booted the shell onto
-// the lane thread that fires it; nothing here is shared BETWEEN threads.
+// `Send` only lets the boot thread hand the bound context to the lane thread.
 unsafe impl Send for Context {}
 
 impl std::fmt::Debug for Context {
@@ -185,18 +137,11 @@ impl Context {
                 why: "the device would not open a command queue".to_string(),
             })?;
             let name = device.name().to_string();
-            // **SAY WHAT MACHINE THIS IS, ONCE, HERE.** `kernels_metal::
-            // tuning` holds one process-wide cell and every crossover in that
-            // crate reads it; until something fills it, an M4 is served the
-            // M1 Max's measurements. This is the shell that binds the device,
-            // so this is where the answer exists — and it is a `OnceLock`
-            // set, so a boot document that already stated a family keeps it
-            // (`crate::boot::tuning` runs at the door, before any load).
+            // Stated once, here: `kernels_metal::tuning` holds one
+            // process-wide `OnceLock` cell read by every crossover in that crate.
             kernels_metal::tuning::describe(kernels_metal::DeviceInfo {
                 apple_family: family(&device),
-                // Metal publishes no core count; IOKit's `gpu-core-count` is
-                // the only place it lives, and nothing in `tuning` branches
-                // on it. 0 is what the probe honestly has.
+                // Metal publishes no core count; nothing in `tuning` reads this.
                 gpu_core_count: 0,
             });
             let working_set = device.recommendedMaxWorkingSetSize();
@@ -234,8 +179,7 @@ impl Context {
         self.max_buffer
     }
 
-    /// The core count the cost model is handed. Stated, not probed — see the
-    /// field.
+    /// The core count the cost model is handed. Stated, not probed — see the field.
     #[must_use]
     pub fn cores(&self) -> u32 {
         self.cores
@@ -289,26 +233,17 @@ impl Context {
         }
     }
 
-    /// **Wrap `span` bytes of memory this process already holds**, without
-    /// copying one of them — `newBufferWithBytesNoCopy:length:options:
-    /// deallocator:` over a `StorageModeShared` reservation.
-    ///
-    /// The deallocator is nil, so Metal does NOT own the pages: releasing
-    /// the returned buffer frees nothing and the caller's memory must
-    /// outlive it. That is why this is `pub(crate)` and `unsafe` and why the
-    /// only door onto it is
-    /// [`Buffer::mapped`](super::alloc::Buffer::mapped), which takes an
-    /// `Arc<Mapping>` and holds it for the reservation's whole life. See
-    /// [`crate::mapping`] for the ownership argument and for the wiring
-    /// measurement that says when this primitive may be used at all.
+    /// Wrap `span` bytes of memory this process already holds, without
+    /// copying (nil deallocator, so Metal does not own the pages). Only
+    /// reachable through [`Buffer::mapped`](super::alloc::Buffer::mapped),
+    /// which holds an `Arc<Mapping>` for the reservation's whole life.
     ///
     /// # Safety
     ///
-    /// `at` must be page-aligned and `span` must be a multiple of the page
-    /// size (both of which `newBufferWithBytesNoCopy` requires on macOS and
-    /// neither of which it checks), `[at, at + span)` must be one live
-    /// readable mapping, and the caller must keep it mapped until every
-    /// reference to the returned buffer is gone.
+    /// `at` must be page-aligned and `span` a multiple of the page size
+    /// (required by `newBufferWithBytesNoCopy` on macOS, not checked by it),
+    /// `[at, at + span)` must be one live readable mapping, and the caller
+    /// must keep it mapped until every reference to the returned buffer is gone.
     ///
     /// # Errors
     ///
@@ -347,11 +282,9 @@ impl Context {
         }
     }
 
-    /// The stand-in a zero-length reservation holds.
-    ///
-    /// Metal refuses a zero-length buffer and a plan may state an empty
-    /// pool row, so the empty reservation is one byte nobody may mint a
-    /// handle into (`Buffer::bytes` stays 0, and every `span` refuses).
+    /// The stand-in a zero-length reservation holds. Metal refuses a
+    /// zero-length buffer, so an empty pool row gets one byte nobody may
+    /// mint a handle into (`Buffer::bytes` stays 0, every `span` refuses).
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn empty(&self) -> super::alloc::Slab {
         RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -372,16 +305,11 @@ impl Context {
         &self.device
     }
 
-    /// Open one command buffer and one compute pass for a fire.
-    ///
-    /// **ONE ENCODER FOR THE WHOLE FIRE, AND THAT IS THE ORDERING
-    /// ARGUMENT.** A compute pass opened with `computeCommandEncoder` is
-    /// `MTLDispatchTypeSerial`: every dispatch in it observes the writes of
-    /// every dispatch before it, with the barriers Metal inserts. That is
-    /// exactly the semantics `model_exec::fire::walk` assumes of a stream, so
-    /// the walk needs no barrier vocabulary and the shell needs no fence
-    /// bookkeeping. A concurrent pass — Metal's answer to §6's fork/join
-    /// streams — would need the walk's `Sink` events and is not this wave's.
+    /// Open one command buffer and one compute pass for a fire. One encoder
+    /// for the whole fire: a compute pass is `MTLDispatchTypeSerial`, so
+    /// every dispatch observes the writes of every dispatch before it —
+    /// matching what `model_exec::fire::walk` assumes of a stream, so it
+    /// needs no barrier vocabulary.
     ///
     /// # Errors
     ///
@@ -411,19 +339,12 @@ impl Context {
     }
 }
 
-/// One fire's command buffer and the pass that is open on it.
-///
-/// The shell encodes into it through [`Frame::encoder`], copies the rows a
-/// reader will want through [`Frame::copy`], and closes it with either
-/// [`Frame::commit`] — which waits — or [`Frame::commit_async`], which does
-/// not and is the one the fire path takes.
-///
-/// **TWO ENCODER KINDS, ONE AT A TIME.** A command buffer holds at most one
-/// open encoder, so the compute pass and the blit pass are two `Option`s of
-/// which at most one is `Some`; opening either ends whatever was open. The
-/// ORDER that matters is the one the fire path uses — every dispatch, then
-/// the readout copy — and it is the command buffer's own, which is why the
-/// copy needs no fence.
+/// One fire's command buffer and the pass that is open on it. The shell
+/// encodes into it through [`Frame::encoder`], copies rows through
+/// [`Frame::copy`], and closes it with [`Frame::commit`] (waits) or
+/// [`Frame::commit_async`] (doesn't — the fire path's choice). A command
+/// buffer holds at most one open encoder, so compute and blit are two
+/// `Option`s of which at most one is `Some`.
 pub struct Frame {
     #[cfg(target_vendor = "apple")]
     buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
@@ -465,17 +386,11 @@ impl Frame {
         }
     }
 
-    /// Close the open pass and open another in the same command buffer.
-    ///
-    /// **THE ONE PLACE A FIRE NEEDS TWO PASSES, AND IT IS WHY.** The rebind
-    /// shader WRITES the indirect command buffer that the call after it
-    /// EXECUTES, and an `executeCommandsInBuffer:` in the same pass as the
-    /// dispatch that wrote the commands would be reading them concurrently:
-    /// a compute pass is serial between dispatches, and
-    /// `executeCommandsInBuffer:` is not a dispatch. Two passes in one
-    /// command buffer is the ordering Metal states for that — the second
-    /// encoder observes everything the first one wrote — and it costs one
-    /// encoder open rather than a second commit.
+    /// Close the open pass and open another in the same command buffer. The
+    /// one place a fire needs two passes: `executeCommandsInBuffer:` is not
+    /// a dispatch, so a compute pass's serial-between-dispatches guarantee
+    /// doesn't order it after the rebind shader's write — two passes in one
+    /// command buffer does.
     ///
     /// # Errors
     ///
@@ -492,29 +407,13 @@ impl Frame {
         Ok(self.encoder.as_deref().expect("just opened"))
     }
 
-    /// **Copy `len` bytes device-side, inside this fire's own command
-    /// buffer** — the readout's capture, and the reason it is here rather
-    /// than in a host `memcpy` after the wait.
-    ///
-    /// With one frame in flight the host could read the arena the instant
-    /// the fire was done, because nothing else was running. With two, the
-    /// frame BEHIND this one is already writing the same rectangles by the
-    /// time the host gets round to settling this one: the out seam is one
-    /// arena slot that every fire carves over. So the rows a reader will
-    /// want are copied out WHILE this fire owns them, into a seat the next
-    /// fire does not touch, and the host reads that seat instead.
-    ///
-    /// A blit pass, not a dispatch: there is no kernel here, and the copy is
-    /// ordered after every dispatch encoded before it by the command
-    /// buffer's own encoder order.
-    ///
-    /// **THE SECOND CALLER MOVES CELLS WITHIN ONE RESERVATION** — a kv graft
-    /// (`crate::store::Pools::copy_kv`) reads and writes pages of the same
-    /// pool, so `source` and `into` are the same buffer at two offsets. Metal
-    /// serves that as long as the two regions do not overlap, and the caller
-    /// is where the refusal for one that does lives
-    /// (`crate::store::Move::plan`): an overlapping blit is undefined rather
-    /// than a shift, and silently so.
+    /// Copy `len` bytes device-side, inside this fire's own command buffer.
+    /// With two frames in flight, this copies the rows a reader wants out
+    /// while this fire still owns them, into a seat the next fire won't
+    /// touch — a blit pass ordered after every prior dispatch. Also used by
+    /// kv grafts to move cells within one pool reservation; the caller
+    /// (`crate::store::Move::plan`) refuses overlapping regions, since an
+    /// overlapping blit is undefined rather than a shift.
     ///
     /// # Errors
     ///
@@ -544,12 +443,9 @@ impl Frame {
                 })?);
             }
             let blit = self.blit.as_deref().expect("just opened");
-            // SAFETY: both spans were bounds-checked by `Buffer::span` — at
-            // the handle that named them for the readout, at the pool row for
-            // a graft — and both buffers outlive the command buffer: the
-            // readout seat and the pools are owned by the shell for the life
-            // of the load, and a source resolved through a handle row is
-            // retained by it.
+            // SAFETY: both spans were bounds-checked by `Buffer::span`, and
+            // both buffers outlive the command buffer (owned by the shell
+            // for the life of the load, or retained via the handle row).
             unsafe {
                 blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                     source,
@@ -567,12 +463,10 @@ impl Frame {
         }
     }
 
-    /// Close the pass, commit the buffer, and wait for the device.
-    ///
-    /// **THE SYNCHRONOUS SPELLING, AND IT IS NOT THE FIRE PATH'S ANY MORE.**
-    /// What still takes it is the indirect plane's `executeCommandsInBuffer:`
-    /// (`crate::icb`) and the native surface's eager door, both of which have
-    /// a caller standing there for the answer.
+    /// Close the pass, commit the buffer, and wait for the device. Not the
+    /// fire path's spelling any more; still used by the indirect plane's
+    /// `executeCommandsInBuffer:` and the native surface's eager door, both
+    /// of which have a caller waiting for the answer.
     ///
     /// # Errors
     ///
@@ -599,23 +493,41 @@ impl Frame {
         }
     }
 
-    /// **Close the pass, arm the completion handler, commit — and return.**
+    /// [`Frame::commit`], answering how long the device spent on this
+    /// command buffer — `GPUEndTime - GPUStartTime`, seconds — for the
+    /// kernel profile (`crate::encode::kernel_profile`).
     ///
-    /// The fire path's commit (alto article 1). Nothing here waits: the
-    /// command buffer goes to the queue and the host walks away with a
-    /// [`Pending`] receipt, which is what lets the next frame be encoded
-    /// while this one runs.
+    /// # Errors
     ///
-    /// `on_done` runs on **Metal's own completion thread**, not this one, so
-    /// what it is handed is already a value: `None` for a command buffer that
-    /// completed and `Some(sentence)` for one the device refused. It must not
-    /// call back into the shell — the shell is the lane thread's — and the
-    /// two things it does do are one atomic bump and one call into the
-    /// runtime's sink.
-    ///
-    /// **THE HANDLER IS ARMED BEFORE `commit`, WHICH IS METAL'S RULE**, not a
-    /// preference: a handler added to an already-committed buffer is a race
-    /// against a buffer that may have finished.
+    /// As [`Frame::commit`].
+    pub fn commit_timed(mut self) -> Result<f64> {
+        #[cfg(target_vendor = "apple")]
+        {
+            self.end_pass();
+            self.buffer.commit();
+            self.buffer.waitUntilCompleted();
+            if let Some(error) = self.buffer.error() {
+                return Err(Fault::Device {
+                    call: "waitUntilCompleted",
+                    why: error.localizedDescription().to_string(),
+                });
+            }
+            Ok(self.buffer.GPUEndTime() - self.buffer.GPUStartTime())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = self.encoder.take();
+            Err(Fault::Deviceless)
+        }
+    }
+
+    /// Close the pass, arm the completion handler, commit — and return
+    /// without waiting, so the next frame can be encoded while this one runs.
+    /// `on_done` runs on Metal's own completion thread, not this one — it
+    /// must not call back into the shell (belongs to the lane thread), only
+    /// bump an atomic and call into the runtime's sink. Armed before
+    /// `commit`, per Metal's rule (arming after races a buffer that may have
+    /// finished).
     ///
     /// # Errors
     ///
@@ -663,13 +575,9 @@ impl Frame {
     }
 }
 
-/// **A frame that is dropped instead of committed still ends its pass.**
-///
-/// Metal expects every encoder it opens to be ended, and a walk that refuses
-/// mid-dispatch returns through a `?` with the compute pass still open — so
-/// the close belongs in the destructor rather than on the happy path. Both
-/// commit spellings end the pass themselves and leave nothing here to do,
-/// which is what makes this a belt and not a second policy.
+/// A frame that is dropped instead of committed still ends its pass: Metal
+/// expects every opened encoder to be ended, and a walk that refuses
+/// mid-dispatch returns through a `?` with the compute pass still open.
 impl Drop for Frame {
     fn drop(&mut self) {
         #[cfg(target_vendor = "apple")]
@@ -677,13 +585,12 @@ impl Drop for Frame {
     }
 }
 
-/// **One committed command buffer the host has not yet caught up with.**
+/// One committed command buffer the host has not yet caught up with.
 ///
-/// The receipt [`Frame::commit_async`] hands back: the work is on the queue,
-/// the completion handler is armed, and this is what the host holds until it
-/// comes for the numbers. [`Pending::landed`] asks without blocking and
-/// [`Pending::wait`] blocks — the fire path calls the first to know whether a
-/// settle is free and the second only when it has run out of seats.
+/// The receipt [`Frame::commit_async`] hands back. [`Pending::landed`] asks
+/// without blocking and [`Pending::wait`] blocks — the fire path calls the
+/// first to know whether a settle is free and the second only when it has
+/// run out of seats.
 pub struct Pending {
     #[cfg(target_vendor = "apple")]
     buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
@@ -693,8 +600,8 @@ pub struct Pending {
 }
 
 // SAFETY: what a `Pending` does to its command buffer is `status`, `error`
-// and `waitUntilCompleted`, all of which Apple documents as safe from any
-// thread; encoding — the part that is not — is over before one exists.
+// and `waitUntilCompleted`, all documented safe from any thread; encoding —
+// the part that is not — is over before one exists.
 unsafe impl Send for Pending {}
 
 impl std::fmt::Debug for Pending {
@@ -720,11 +627,9 @@ impl Pending {
         }
     }
 
-    /// Wait for the device to finish this one, and report what it said.
-    ///
-    /// **THE ONE SYNCHRONIZATION LEFT IN THE SHELL**, and it is the settle
-    /// phase's — never the enqueue phase's. A step whose completion handler
-    /// has already run returns from here without entering the kernel.
+    /// Wait for the device to finish this one, and report what it said. The
+    /// one synchronization left in the shell — the settle phase's, never
+    /// the enqueue phase's.
     ///
     /// # Errors
     ///
@@ -748,15 +653,9 @@ impl Pending {
     }
 }
 
-/// The threadgroup a `Fire` that stated none gets.
-///
-/// A [`Fire`](kernels_metal::Fire) carries `lanes` always and `group`
-/// sometimes — `Fire::apply` over a bare `[u32; 3]` sets the first and
-/// leaves the second at zero. Metal has no default: `dispatchThreads:`
-/// takes both. So the shell picks one, and picks it from the PIPELINE
-/// rather than from a constant, because the two numbers that bound it —
-/// `threadExecutionWidth` and `maxTotalThreadsPerThreadgroup` — are
-/// properties of the compiled shader and not of the device.
+/// The threadgroup a `Fire` that stated none gets. Picked from the compiled
+/// pipeline rather than a constant, since `threadExecutionWidth` and
+/// `maxTotalThreadsPerThreadgroup` are properties of the compiled shader.
 #[cfg(target_vendor = "apple")]
 pub(crate) fn threadgroup(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,

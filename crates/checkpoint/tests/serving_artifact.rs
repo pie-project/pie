@@ -1,12 +1,5 @@
-//! The `pie.serving/1` pair, against real files.
-//!
-//! `file/emit.rs` writes one and `file/serve.rs` reads it back. The unit tests
-//! in each module check one half; these check that the two agree on a file
-//! that actually exists — which is what catches an attribute that is right on
-//! paper and absent on disk, and a block table that tiles the wrong thing.
-//!
-//! Nothing here needs a device, a model on disk, or a `TMPDIR` budget: the
-//! largest fixture is a few hundred kilobytes.
+//! The `pie.serving/1` pair, against real files: `file/emit.rs` writes one
+//! and `file/serve.rs` reads it back.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,8 +11,8 @@ use checkpoint::serving::{self, BlockAlgorithm, Field, PROFILE, Stamp};
 use ztensor::DType as ZDType;
 use ztensor::format::cbor::{self, Value};
 
-/// The profile's floor, so a few kilobytes of fixture is several blocks and
-/// the tiling is exercised rather than asserted.
+/// The profile's floor: a few KB of fixture spans several blocks,
+/// exercising tiling.
 const BLOCK: u64 = serving::MIN_BLOCK_BYTES;
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -33,15 +26,11 @@ fn stamp() -> Stamp {
     Stamp {
         serving: serving::PROFILE.to_string(),
         backend: "cuda".to_string(),
-        tp_size: 1,
         sku: "qwen_3".to_string(),
-        precision: "mxfp4".to_string(),
         layout_revision: 1,
         block_bytes: BLOCK,
         block_algorithm: BlockAlgorithm::Xxh3,
         adapters_zeroed: true,
-        model_id: Some("qwen/qwen3-30b-a3b".to_string()),
-        recipe_digest: Some("xxh3:6f1c9a02b4d7e315".to_string()),
     }
 }
 
@@ -66,8 +55,7 @@ fn dense<'a>(name: &'a str, bytes: &'a [u8]) -> Object<'a> {
     }
 }
 
-/// A two-part object under the layout `file/write.rs` gives an mxfp4 plane, so
-/// "the refusal names the part" is a claim with something to name.
+/// A two-part object under the layout `file/write.rs` gives an mxfp4 plane.
 fn banked<'a>(name: &'a str, data: &'a [u8], scales: &'a [u8]) -> Object<'a> {
     Object {
         name,
@@ -91,8 +79,8 @@ fn banked<'a>(name: &'a str, data: &'a [u8], scales: &'a [u8]) -> Object<'a> {
     }
 }
 
-/// The fixture every test below writes: three planes in a hand-picked order
-/// that is not name order, one of them two parts, one of them aliased.
+/// The fixture every test below writes: three planes in hand-picked order
+/// (not name order), one two-part, one aliased.
 struct Fixture {
     dir: PathBuf,
     path: PathBuf,
@@ -118,15 +106,14 @@ impl Fixture {
         fixture
     }
 
-    /// Writes the fixture again at `align`, so a test can hold two files that
-    /// differ in placement policy and in nothing else.
+    /// Writes the fixture again at `align`, so a test can hold two files
+    /// differing only in placement policy.
     fn publish(&self, align: u64, path: &Path) {
         let objects = [
             dense("embed", &self.embed),
             banked("layer.0.expert_down_bank", &self.codes, &self.scales),
             dense("layer.0.norm", &self.norm),
-            // Aliased: `head` is `embed`'s bytes, which is the tying case §2.4
-            // blesses and M-4f's replication path.
+            // Aliased: `head` is `embed`'s bytes (a blessed tying case).
             dense("head", &self.embed),
             dense("__meta__/model/descriptor", b"{\"sku\":\"qwen_3\"}"),
         ];
@@ -148,9 +135,7 @@ fn provenance() -> BTreeMap<String, String> {
 }
 
 /// Flips one byte of a part, addressed by the manifest's own offset rather
-/// than by a hard-coded number — the mistake `ztensor_convert.rs`'s
-/// `raw[65536]` makes, which passes while corrupting a region it was not
-/// written to test.
+/// than a hard-coded number, so it corrupts only the region meant to be tested.
 fn flip(path: &Path, object: &str, part: &str, at: u64) {
     use std::io::{Seek, SeekFrom, Write};
     let manifest = ztensor::read::manifest_of(path).unwrap().unwrap();
@@ -164,16 +149,14 @@ fn flip(path: &Path, object: &str, part: &str, at: u64) {
 
 // ── the round trip ──────────────────────────────────────────────────────────
 
-/// **Every tensor's bytes come back exactly**, borrowed from the mapping, and
-/// the sequence is the order the writer was handed.
+/// Every tensor's bytes come back exactly, in the order the writer was handed.
 #[test]
 fn every_plane_reads_back_as_the_bytes_that_were_written() {
     let fixture = Fixture::write("roundtrip", emit::SERVING_ALIGN);
     let artifact = Artifact::open(&fixture.path).unwrap();
 
-    // `head` is `embed`'s bytes and therefore `embed`'s offset, so the two
-    // sit adjacent and the NAME breaks the tie — which is what §5.2 says an
-    // alias does to the sequence.
+    // `head` shares `embed`'s offset; the two sit adjacent and the name
+    // breaks the tie.
     assert_eq!(
         artifact.sequence(),
         vec!["embed", "head", "layer.0.expert_down_bank", "layer.0.norm"],
@@ -201,8 +184,8 @@ fn every_plane_reads_back_as_the_bytes_that_were_written() {
     artifact.verify_all().unwrap();
 }
 
-/// **An exact-equal alias round-trips**: two names, one span, and the tiling
-/// check waves it through instead of reading it as an overlap.
+/// An exact-equal alias round-trips: two names, one span; the tiling
+/// check waves it through rather than reading an overlap.
 #[test]
 fn a_tied_plane_is_one_span_under_two_names() {
     let fixture = Fixture::write("alias", 4096);
@@ -219,8 +202,8 @@ fn a_tied_plane_is_one_span_under_two_names() {
 
 // ── the stamp ───────────────────────────────────────────────────────────────
 
-/// **The stamp survives the write, and a deployment that differs is refused by
-/// the FIELD that differs.**
+/// The stamp survives the write; a deployment that differs is refused by
+/// the field that differs.
 #[test]
 fn the_stamp_comes_back_whole_and_a_mismatch_names_the_field() {
     let fixture = Fixture::write("stamp", 4096);
@@ -236,12 +219,11 @@ fn the_stamp_comes_back_whole_and_a_mismatch_names_the_field() {
     };
     for (field, mismatch) in [
         (Field::Backend, wants(|it| it.backend = "metal".to_string())),
-        (Field::TpSize, wants(|it| it.tp_size = 2)),
-        (Field::Precision, wants(|it| it.precision = "bf16".to_string())),
+        (Field::Sku, wants(|it| it.sku = "qwen_3-bf16".to_string())),
         (Field::LayoutRevision, wants(|it| it.layout_revision = 2)),
     ] {
         assert_eq!(mismatch.field, field);
-        let sentence = mismatch.refuse(&fixture.path.to_string_lossy(), Some("qwen/qwen3"));
+        let sentence = mismatch.refuse(&fixture.path.to_string_lossy());
         assert!(sentence.contains(field.key()), "{sentence}");
         assert!(sentence.contains(&mismatch.artifact), "{sentence}");
         assert!(sentence.contains(&mismatch.deployment), "{sentence}");
@@ -250,24 +232,16 @@ fn the_stamp_comes_back_whole_and_a_mismatch_names_the_field() {
         assert!(sentence.contains("pie model import --force"), "{sentence}");
     }
     assert!(fixture.path.exists(), "a refusal deleted the artifact");
-
-    // `pie_model_id` is believed, never checked (§4.3): a deployment that
-    // disagrees about it is not a mismatch.
-    let mut believed = stamp();
-    believed.model_id = Some("someone/else".to_string());
-    artifact.check(&believed).unwrap();
 }
 
-/// **The version is refused before any other field is believed**, and it is
-/// `Unsupported` — *re-import* — rather than "malformed".
+/// The version is refused before any other field is believed, as
+/// `Unsupported` (re-import) rather than "malformed".
 #[test]
 fn a_profile_version_this_build_does_not_implement_is_not_a_broken_file() {
     let fixture = Fixture::write("version", 4096);
     let future = fixture.dir.join("future.zt");
-    // Only the KEY moves. The block below is a byte-for-byte valid v1 block,
-    // so a reader that answered by reading members instead of by reading the
-    // key would find nothing wrong with it — which is what putting the version
-    // in the key prevents.
+    // Only the key moves; the block is otherwise a valid v1 block, which is
+    // what putting the version in the key guards against.
     restate(&fixture.path, &future, |attributes| {
         rename(attributes, PROFILE, "pie.serving/2");
     });
@@ -275,8 +249,8 @@ fn a_profile_version_this_build_does_not_implement_is_not_a_broken_file() {
     assert!(matches!(why, Error::Unsupported(_)), "{why}");
     assert!(format!("{why}").contains("re-import"), "{why}");
     assert!(format!("{why}").contains("pie.serving/2"), "{why}");
-    // Refusing well is not compatibility: the three parts are all there, and
-    // the command names THIS file.
+    // Refusing well is not compatibility: the parts are all there and the
+    // command names this file.
     let why = format!("{why}");
     assert!(why.contains("nothing here deletes it"), "{why}");
     assert!(
@@ -288,8 +262,8 @@ fn a_profile_version_this_build_does_not_implement_is_not_a_broken_file() {
     );
     assert!(future.exists(), "a refusal deleted the artifact");
 
-    // And an ordinary checkpoint — no serving key at all — is a different
-    // sentence: nothing to re-import, and nothing broken.
+    // An ordinary checkpoint (no serving key) is a different sentence:
+    // nothing to re-import, nothing broken.
     let plain = fixture.dir.join("plain.zt");
     strip_every_serving_key(&fixture.path, &plain);
     let why = Artifact::open(&plain).unwrap_err();
@@ -300,9 +274,9 @@ fn a_profile_version_this_build_does_not_implement_is_not_a_broken_file() {
 
 // ── an open is not a verification ───────────────────────────────────────────
 
-/// **THE SPLIT.** A file whose payload has rotted opens exactly as cleanly as
-/// one that has not — the stamp is read, the manifest is read, and no byte of
-/// the payload is hashed. The rot is found by asking.
+/// A file whose payload has rotted opens exactly as cleanly as one that
+/// has not — no byte of the payload is hashed at open. The rot is found
+/// by asking.
 #[test]
 fn an_open_hashes_nothing_and_a_verify_is_what_finds_the_rot() {
     let fixture = Fixture::write("split", 4096);
@@ -318,13 +292,13 @@ fn an_open_hashes_nothing_and_a_verify_is_what_finds_the_rot() {
     assert!(format!("{why}").contains("layer.0.norm"), "{why}");
 }
 
-/// **A flipped byte names the part and the block it is in**, with the block's
-/// ordinal taken in its own part rather than in the concatenated table.
+/// A flipped byte names the part and the block it's in, ordinal taken in
+/// its own part, not the concatenated table.
 #[test]
 fn a_flipped_byte_is_named_by_its_part_and_its_block() {
     let fixture = Fixture::write("flip", 4096);
-    // The second block of the SCALES part, so the refusal has to distinguish
-    // both the part from its sibling and the block from its neighbours.
+    // The second block of the scales part, so the refusal must distinguish
+    // part and block.
     flip(&fixture.path, "layer.0.expert_down_bank", "data", BLOCK + 5);
 
     let artifact = Artifact::open(&fixture.path).unwrap();
@@ -346,9 +320,8 @@ fn a_flipped_byte_is_named_by_its_part_and_its_block() {
     assert_eq!(blocks.count(), 1);
 }
 
-/// **A subset verify hashes that subset and nothing else.** The proof is a
-/// rotted plane OUTSIDE the subset: the subset passes, the whole file does
-/// not.
+/// A subset verify hashes that subset and nothing else: a rotted plane
+/// outside the subset still passes the subset and fails the whole file.
 #[test]
 fn an_entry_subset_verify_reaches_only_its_own_blocks() {
     let fixture = Fixture::write("subset", 4096);
@@ -366,16 +339,15 @@ fn an_entry_subset_verify_reaches_only_its_own_blocks() {
         .expect_err("and the whole file is not");
 }
 
-/// **A PREFIX of the sequence verifies without touching the rest** — the
-/// property the block granularity exists for. `[0, c1)` is checked; `[c1, )`
-/// is not read at all.
+/// A prefix of the sequence verifies without touching the rest — the
+/// property block granularity exists for.
 #[test]
 fn a_prefix_of_the_sequence_verifies_without_reading_the_rest() {
     let fixture = Fixture::write("prefix", 4096);
     let sequence = Artifact::open(&fixture.path).unwrap().sequence().len();
     assert_eq!(sequence, 4);
-    // The rot is in the LAST plane of the sequence, so every proper prefix is
-    // clean and the whole is not.
+    // The rot is in the last plane, so every proper prefix is clean and
+    // the whole is not.
     flip(&fixture.path, "layer.0.norm", "data", 9);
     let artifact = Artifact::open(&fixture.path).unwrap();
     assert_eq!(*artifact.sequence().last().unwrap(), "layer.0.norm");
@@ -386,21 +358,16 @@ fn a_prefix_of_the_sequence_verifies_without_reading_the_rest() {
             .unwrap_or_else(|why| panic!("prefix {upto} refused: {why}"));
     }
     artifact.verify_prefix(sequence).unwrap_err();
-    // A prefix longer than the sequence IS the sequence — it saturates rather
-    // than refusing — so it finds the same rot and not a different error.
+    // A prefix longer than the sequence is the sequence (saturates, not refuses).
     artifact.verify_prefix(sequence + 40).unwrap_err();
 }
 
 // ── alignment is the writer's policy ────────────────────────────────────────
 
-/// **Departure #1's whole point: a file written at one alignment verifies
-/// against tables computed at another.**
-///
-/// The blocks tile each part's DECODED size, so placement cannot reach them.
-/// Two files holding the same tensors at 4 KiB and at 2 MiB carry
-/// byte-identical `pie_blocks`, each reports its own alignment from its own
-/// offsets, and each verifies — which a digest over the padded span would have
-/// made impossible.
+/// A file written at one alignment verifies against tables computed at
+/// another: blocks tile each part's decoded size, so placement can't
+/// reach them, and two files at different alignments carry
+/// byte-identical `pie_blocks`.
 #[test]
 fn a_file_written_at_one_alignment_verifies_under_another() {
     let fixture = Fixture::write("align", 4096);
@@ -434,8 +401,8 @@ fn a_file_written_at_one_alignment_verifies_under_another() {
     fine.verify_all().unwrap();
     coarse.verify_all().unwrap();
 
-    // And the artifact key is the same, because §6.4's reduction is blind to
-    // offsets, lengths, alignment and padding by construction.
+    // The artifact key is the same: the reduction is blind to offsets,
+    // lengths, alignment and padding.
     assert_eq!(fine.identity().unwrap(), coarse.identity().unwrap());
 }
 
@@ -455,8 +422,8 @@ fn the_header_door_and_the_mapping_door_say_the_same_thing() {
     );
 }
 
-/// **The fill door reads straight into a caller's destination and verifies
-/// what landed there** — and reports a rot as a claim about the file.
+/// The fill door reads straight into a caller's destination, verifies
+/// what landed there, and reports a rot as a claim about the file.
 #[test]
 fn a_fill_lands_the_bytes_it_verified_in_the_destination() {
     let fixture = Fixture::write("fill", 4096);
@@ -495,97 +462,56 @@ fn a_fill_lands_the_bytes_it_verified_in_the_destination() {
     assert!(format!("{why}").contains("block 2 of \"embed\""), "{why}");
 }
 
-/// **ONE CONSTRUCTOR, SO THE TWO SIDES CANNOT DISAGREE ABOUT A POLICY.**
-///
-/// A boot compares field by field, and four of the nine required fields are
-/// not facts about the deployment at all — `layout_revision`, `block_bytes`,
-/// `block_algorithm`, `adapters_zeroed` are what THIS BUILD does. Spelled at
-/// two call sites they are four fields that can disagree with themselves: an
-/// import writing 64 MiB blocks while a boot expected 16 would refuse every
-/// artifact this build had ever written, and `Mismatch` would name a field
-/// neither side chose.
-///
-/// So `Stamp::of` takes only the five that differ and fills the rest, and this
-/// asserts the property that makes it worth having: a deployment built from an
-/// artifact's own five facts accepts that artifact, whatever the policy
-/// constants happen to be. Change `LAYOUT_REVISION` and this still passes;
-/// spell it twice and it stops.
+/// One constructor, so the two sides cannot disagree about a policy: four
+/// of the nine required fields (`layout_revision`, `block_bytes`,
+/// `block_algorithm`, `adapters_zeroed`) are build facts, not deployment
+/// facts. `Stamp::of` takes only the five that differ and fills the rest,
+/// so a deployment built from an artifact's own five facts always accepts it.
 #[test]
 fn a_deployment_built_the_same_way_accepts_the_artifact() {
-    let mine = Stamp::of("cuda", 1, "qwen_3", "mxfp4", Some("qwen/qwen3-30b-a3b".into()));
-    let deployment = Stamp::of("cuda", 1, "qwen_3", "mxfp4", None);
+    let mine = Stamp::of("cuda", "qwen_3");
+    let deployment = Stamp::of("cuda", "qwen_3");
     mine.check(&deployment)
         .expect("a deployment built from the same five facts accepts it");
-    // `model_id` differing does NOT refuse: it is believed, never compared,
-    // and `LAYOUT_REVISION` is what stands beside that belief.
-    assert_ne!(mine.model_id, deployment.model_id);
 }
 
-/// **AND THE CROSS-RECIPE ARTIFACT IS REFUSED BY NAME** (§M-4c).
-///
-/// The failure this exists to stop was measured on the other shell: a `.zt`
-/// converted for cuda and served on metal loaded in 0.1 s and answered
-/// `"一时的وات**!.energy…"`. A repack moves no value, so the two artifacts
-/// have the same object names, the same shapes, the same spans and the same
-/// part digests — `engine_cuda`'s own
-/// `a_tiled_row_and_a_row_major_one_rank_to_the_same_spans` measures that —
-/// and nothing about the bytes can tell them apart. The stamp is the only
-/// thing that can.
-///
-/// The refusal names the FIELD and the remediation, which is the whole reason
-/// `Stamp` replaced a `u64` key: "different" is not something an operator can
-/// act on, and "states backend cuda and this deployment is metal, run `pie
-/// model import --force <source>`" is.
+/// The cross-recipe artifact is refused by name: a repack moves no value,
+/// so two artifacts for different backends can share names, shapes, spans
+/// and digests — the stamp is the only thing that can tell them apart.
+/// The refusal names the field and the remediation, not just "different".
 #[test]
 fn an_artifact_for_another_shell_is_refused_naming_the_field() {
-    let artifact = Stamp::of("cuda", 1, "qwen_3", "mxfp4", Some("qwen/qwen3-30b-a3b".into()));
-    let deployment = Stamp::of("metal", 1, "qwen_3", "mxfp4", None);
+    let artifact = Stamp::of("cuda", "qwen_3");
+    let deployment = Stamp::of("metal", "qwen_3");
     let why = artifact
         .check(&deployment)
         .expect_err("a cuda artifact is not servable on metal");
     assert_eq!(why.field, serving::Field::Backend);
-    let said = why.refuse("/srv/pie/q3.zt", artifact.model_id.as_deref());
+    let said = why.refuse("/srv/pie/q3.zt");
     for wanted in ["backend", "\"cuda\"", "\"metal\"", "pie model import --force"] {
         assert!(said.contains(wanted), "the refusal does not say {wanted:?}: {said}");
     }
-    // And the DEGREE is caught the same way, which is the other half of a
-    // recipe: a tp2 deployment cannot take a tp1 artifact's planes.
-    let sharded = Stamp::of("cuda", 2, "qwen_3", "mxfp4", None);
+    // Another recipe of the same family is caught the same way.
+    let sharded = Stamp::of("cuda", "qwen_3-tp2");
     assert_eq!(
         artifact.check(&sharded).unwrap_err().field,
-        serving::Field::TpSize,
+        serving::Field::Sku,
     );
 }
 
-/// **A PLANE'S PADDED EXTENT IS REAL, READABLE, AND ZERO.**
-///
-/// `Artifact::part` answers a part's published length, which is what almost
-/// every reader wants. A tier does not: it seats each plane at `reserved` —
-/// the length rounded up to the alignment its layout tiles with — and hands a
-/// kernel a pointer it treats as that wide. Reading `reserved` out of a
-/// `length` slice is reading past it, however certain one is of the bytes.
-///
-/// `Artifact::span` is the accessor that makes the certainty checkable, and
-/// this is what it rests on: §2.4 requires every byte between blobs to be
-/// `0x00`, so the padding after a plane is not merely present but KNOWN. The
-/// assertion below is that claim held against a file this tree wrote, rather
-/// than trusted from the specification.
-///
-/// The over-ask is refused rather than answered with the next object, which
-/// is the half that matters: a reader asking for more padding than the writer
-/// left would otherwise get a neighbouring plane's bytes at exactly the
-/// length it asked for — data, not an error.
+/// A plane's padded extent is real, readable, and zero: `Artifact::part`
+/// answers a part's published length, but a tier seats each plane at
+/// `reserved` (rounded up to alignment). Padding between blobs is
+/// guaranteed `0x00`, and an over-ask is refused rather than answered
+/// with a neighbouring plane's bytes.
 #[test]
 fn a_padded_span_reads_the_file_s_own_zeros_and_refuses_past_them() {
     let fixture = Fixture::write("span", 4096);
     let artifact = Artifact::open(&fixture.path).unwrap();
 
-    // **THE PLANE IS CHOSEN AND NOT ASSUMED.** `padded_spans` measures the
-    // distance to the NEXT blob, and this fixture ties `head` to `embed`'s
-    // bytes on purpose — an aliased blob sits wherever its twin does, so a
-    // plane's neighbour in the sequence need not be its neighbour in the
-    // file, and a plane can have no room after it at all. The property is
-    // about whichever plane HAS padding, so the test finds one.
+    // The plane is chosen, not assumed: an aliased blob's neighbour in the
+    // sequence need not be its neighbour in the file, so the test finds
+    // whichever plane actually has padding.
     let spans = artifact.spans();
     let padded = serving::padded_spans(&spans);
     let (at, span) = spans
@@ -623,51 +549,15 @@ fn a_padded_span_reads_the_file_s_own_zeros_and_refuses_past_them() {
 
 // ── the owner's rule, made executable ───────────────────────────────────────
 
-/// **A tp=1 serving artifact, stripped of its serving key, is still an
-/// ordinary checkpoint of the same weights.**
+/// A tp=1 serving artifact, stripped of its serving key, is still an
+/// ordinary checkpoint of the same weights (the owner's rule: the format
+/// may not be ztensor while the content is something else). Stripping
+/// deletes one key at file level and one per object; nothing else moves.
 ///
-/// This is the owner's rule — *the format may not be ztensor while the content
-/// is something else* — and the most important assertion in the pair. It is
-/// now ONE DELETION, at file level, because the profile's whole vocabulary is
-/// a single attribute named `pie.serving/1` in a single place: the payload
-/// bytes are not moved by a byte, and a stock reader that has never heard of
-/// pie opens the result and hands back every tensor — same names, same shapes,
-/// same layouts, same bytes. It only stops being SERVABLE, which the second
-/// half asserts.
-///
-/// **It used to be one deletion plus one per served object**, and the block
-/// tables moving to the file's own key is what collapsed it. That move was
-/// forced by the writer — an object's attributes are frozen at declaration, so
-/// per-object tables cannot be written by anything that streams, and the
-/// catalog's largest single plane is 95.4 GiB — but it makes this rule
-/// strictly easier to state and to check, which is worth noticing: the two
-/// pressures pointed the same way.
-///
-/// The strip is still a deletion BY NAME rather than a walk over a list, and
-/// [`strip_every_serving_key`] still visits every object as well as the file.
-/// That half now finds nothing, and it is kept deliberately: it is what would
-/// fail if a later profile version put a key back on an object without
-/// re-scoping this rule.
-///
-/// # The scope is tp=1, and the scope is the point
-///
-/// At `pie_tp_size == 1` every weight object carries a layout zTensor itself
-/// defines — `dense`, `zt.mx/1`, `zt.quant_group/1`, `gguf.<type>/1` — so
-/// everything pie adds is purely additive attributes, and §3.1 obliges every
-/// reader to ignore keys it does not recognize. Stripping them therefore
-/// leaves a file a generic reader interprets in full.
-///
-/// **At `tp_size > 1` this degrades, and it degrades exactly where
-/// `pie.banded/1` appears.** That is the one real layout profile this file
-/// profile defines, because per-rank bands as parts is the one thing zTensor's
-/// own layouts cannot say. Strip the attributes from such an object and a
-/// generic reader meets an unknown layout — whose structure it may still
-/// expose and whose contents it MUST NOT interpret. So the strong property
-/// above is a tp=1 property, and the day tp lands, this test's assertion is
-/// the thing that has to be re-scoped rather than quietly become false. This
-/// build writes no `pie.banded/1` object at all, which is what
-/// [`every_weight_carries_a_layout_ztensor_itself_defines`] asserts as the
-/// CAUSE of the effect below.
+/// Scoped to tp=1: every weight object then carries a layout zTensor
+/// itself defines, so stripping pie's additive attributes leaves a file a
+/// generic reader interprets in full. At `tp_size > 1`, `pie.banded/1`
+/// objects would need this test re-scoped.
 #[test]
 fn a_tp1_artifact_stripped_of_its_serving_key_is_an_ordinary_checkpoint() {
     let fixture = Fixture::write("strip", 4096);
@@ -718,13 +608,12 @@ fn a_tp1_artifact_stripped_of_its_serving_key_is_an_ordinary_checkpoint() {
             assert!(serving_keys(attributes).is_empty());
         }
     }
-    // The provenance keys are NOT this profile's and are still there: they say
-    // where the weights came from, which stays true of a file that has stopped
-    // being servable.
+    // Provenance keys aren't this profile's and stay: they say where the
+    // weights came from.
     let attributes = after.attributes.as_ref().unwrap();
     assert!(attributes.get(checkpoint::file::meta::SOURCE_KEY).is_some());
-    // And the object attributes the LAYOUT needs survive untouched, which is
-    // what makes the stripped file decodable rather than merely openable.
+    // Object attributes the layout needs survive untouched, making the
+    // stripped file decodable.
     assert_eq!(
         after.objects["layer.0.expert_down_bank"]
             .attributes
@@ -733,24 +622,17 @@ fn a_tp1_artifact_stripped_of_its_serving_key_is_an_ordinary_checkpoint() {
         Some(&Value::Uint(32)),
     );
 
-    // And it has stopped being servable, which is the other half of the rule.
+    // It has stopped being servable, the other half of the rule.
     let why = Artifact::open(&stripped).unwrap_err();
     assert!(format!("{why}").contains(PROFILE), "{why}");
     assert!(format!("{why}").contains("ordinary checkpoint"), "{why}");
 }
 
-/// **The cause, asserted beside the effect**: every weight object this writer
-/// emits carries a layout from zTensor's own vocabulary and never a `pie.*`
-/// one.
-///
-/// This is what makes the strip above pass. The day a `pie.banded/1` object is
-/// written — `tp_size > 1` — this assertion is the one that fires first, which
-/// is the right place for the wave that builds tp to meet the question. Note
-/// what is NOT the hazard: the serving ATTRIBUTE is keyed `pie.serving/1` on
-/// every object and that is fine, because §3.1 obliges a reader to ignore an
-/// attribute key it does not know. A LAYOUT is the opposite — an unknown
-/// layout is one a reader must refuse to interpret — which is why the two are
-/// held to different standards here.
+/// The cause, asserted beside the effect: every weight object this writer
+/// emits carries a layout from zTensor's own vocabulary, never a `pie.*`
+/// one — what makes the strip above pass. An unknown layout must be
+/// refused by a generic reader; an unknown attribute key must be ignored,
+/// which is why the two are held to different standards here.
 #[test]
 fn every_weight_carries_a_layout_ztensor_itself_defines() {
     let fixture = Fixture::write("layouts", 4096);
@@ -775,29 +657,20 @@ fn every_weight_carries_a_layout_ztensor_itself_defines() {
 
 // ── the surgery the strip test needs ────────────────────────────────────────
 
-/// Copies `from` to `to` with the serving key deleted — **one key at file
-/// level, one key per object, and nothing else touched.**
+/// Copies `from` to `to` with the serving key deleted: one key at file
+/// level, one key per object, nothing else touched.
 ///
-/// That it is expressible in four lines is the property, not an accident of
-/// the helper: the profile's whole vocabulary is one attribute whose name
-/// states its own version, so "strip the serving facts" is a deletion by name
-/// rather than a walk over a list somebody has to keep complete.
-///
-/// Deliberately NOT a re-write: the payload region is copied byte for byte and
-/// only the manifest blob is rebuilt, so every offset, every length and every
-/// blob is the one the serving writer chose. Anything else would be testing a
-/// second writer rather than the rule.
+/// Deliberately not a re-write: the payload region is copied byte for
+/// byte and only the manifest blob is rebuilt, so every offset and length
+/// is the one the serving writer chose.
 fn strip_every_serving_key(from: &Path, to: &Path) {
     restate(from, to, |attributes| strip(attributes, PROFILE));
 }
 
-/// Copies `from` to `to`, letting `edit` rewrite the file-level attributes and
-/// deleting the serving key from every object's attributes.
-///
-/// The manifest blob is decoded as plain CBOR, edited and re-encoded, and a
-/// fresh footer is written over the new offsets. Footer layout is §2.3's:
-/// manifest offset, manifest length, XXH3-64 of the manifest bytes, the
-/// container version, four reserved bytes, and the magic.
+/// Copies `from` to `to`, letting `edit` rewrite the file-level
+/// attributes and deleting the serving key from every object's
+/// attributes. The manifest blob is decoded as CBOR, edited, re-encoded,
+/// and a fresh footer written over the new offsets.
 fn restate(from: &Path, to: &Path, edit: impl FnOnce(&mut Value)) {
     const FOOTER: usize = 40;
     let raw = std::fs::read(from).unwrap();
@@ -823,9 +696,8 @@ fn restate(from: &Path, to: &Path, edit: impl FnOnce(&mut Value)) {
                     let Value::Map(fields) = object else { continue };
                     for (field, attributes) in fields.iter_mut() {
                         if matches!(field, Value::Text(it) if it == "attributes") {
-                            // An object whose only attribute was the serving
-                            // block now has an empty map, which the format
-                            // permits and a reader ignores.
+                            // An object whose only attribute was serving now
+                            // has an empty map; permitted, ignored.
                             strip(attributes, PROFILE);
                         }
                     }

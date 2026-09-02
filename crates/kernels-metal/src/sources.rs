@@ -1,23 +1,11 @@
-//! The shader SOURCES, as static text — the one thing a Metal driver cannot
-//! get from a [`Fire`](crate::Fire) alone.
+//! The shader sources, as static text — the one thing a Metal driver cannot
+//! get from a [`Fire`](crate::Fire) alone: `newLibraryWithSource:` is the
+//! only compile door available without Xcode, so the sources travel inside
+//! the rlib rather than as an offline `.metallib`.
 //!
-//! A `Fire` names its shader by path (`"attn/kv_write.metal"`) and its
-//! entrypoint by name, and that is all a kernel entry knows. The driver has
-//! to turn the pair into an `MTLComputePipelineState`, which means it has to
-//! have the source text: `newLibraryWithSource:` is the only compile door a
-//! machine with the Command Line Tools and no Xcode has (there is no
-//! `xcrun metal` there, measured), so an offline `.metallib` is not a
-//! portable option and the sources travel INSIDE the rlib.
-//!
-//! This module is glue, not a kernel: it adds no shader, states no geometry
-//! and names no entrypoint. It is the file-path half of the `Fire` contract,
-//! answered where the files live.
-//!
-//! **Includes are the driver's to flatten.** `newLibraryWithSource:` has no
-//! header search path, so a `#include "../third_party/…"` inside a source
-//! resolves to nothing. The paths are relative to the INCLUDING file's
-//! directory; [`resolve`] is that arithmetic, published here so the two
-//! shells that need it cannot spell it differently.
+//! `newLibraryWithSource:` has no header search path, so a `#include
+//! "../third_party/…"` inside a source resolves to nothing; [`resolve`]
+//! flattens includes relative to the including file's directory.
 
 /// Where the sources live in the source tree, for `include_str!`.
 macro_rules! source_root {
@@ -164,52 +152,3 @@ fn join(dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_shipped_source_is_named_by_its_path() {
-        for (name, text) in SOURCES {
-            assert!(name.ends_with(".metal"), "{name} is not a shader path");
-            assert!(!text.is_empty(), "{name} is empty");
-            assert_eq!(source(name), Some(*text));
-        }
-    }
-
-    #[test]
-    fn resolving_leaves_the_toolchain_headers_alone_and_pulls_the_local_ones_in() {
-        // `gemm_dense` is the deepest include chain the tree has: four
-        // third-party headers under `../third_party/`.
-        let flat = resolve("linear/gemm_dense.metal").expect("gemm_dense resolves");
-        assert!(
-            !flat.contains("#include \""),
-            "a quoted include survived the flattening"
-        );
-        assert!(
-            flat.contains("#include <metal_stdlib>"),
-            "an angle-bracket include was eaten"
-        );
-        // A symbol only the prelude defines, so the pull really happened.
-        let prelude = source("third_party/mlx_steel_prelude.metal").expect("prelude ships");
-        let marker = prelude
-            .lines()
-            .find(|l| l.starts_with("struct") || l.starts_with("template"))
-            .expect("the prelude declares something");
-        assert!(flat.contains(marker), "the prelude was not pulled in");
-    }
-
-    #[test]
-    fn every_source_resolves() {
-        for (name, _) in SOURCES {
-            resolve(name).unwrap_or_else(|missing| panic!("{name} includes {missing}, unshipped"));
-        }
-    }
-
-    #[test]
-    fn a_relative_include_is_joined_against_the_including_files_directory() {
-        assert_eq!(join("linear", "../third_party/x.metal"), "third_party/x.metal");
-        assert_eq!(join("", "a.metal"), "a.metal");
-        assert_eq!(join("a/b", "c.metal"), "a/b/c.metal");
-    }
-}

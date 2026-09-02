@@ -5,12 +5,8 @@ pub use eta_compiler::plan::lane_table::{
     LaneTableHeader as Header,
 };
 
-// `FLAG_RAGGED`, `ChannelMeta`, `GroupLayout` and `RowMeta` stood here: four
-// `#[repr(C)]` mirrors of a device lane table's side structures. Nothing
-// constructs or reads one — `eta_compiler::plan::lane_table` owns the ABI
-// the shells actually bind, and these were a second spelling of part of it
-// (alto E). The three `*_BYTES` constants below are the live half: they size
-// the types re-exported above, which are that crate's.
+// The `*_BYTES` constants size the types re-exported above;
+// `eta_compiler::plan::lane_table` owns the ABI the shells bind.
 
 pub const HEADER_BYTES: u64 = size_of::<Header>() as u64;
 

@@ -1,8 +1,6 @@
 //! `Hc`: hyper-connections — residual streams expanded, mixed by learned
 //! gates, and folded back layer by layer. One entry per IR variant, all
-//! over `elemwise/hc.cuh` (the launches lived beside the norms in
-//! the old plane; the family gets its own file here because the IR gives it
-//! one).
+//! over `elemwise/hc.cuh`.
 //!
 //! The stream count `M` rides the row width — a `[N, M·H]` rectangle beside
 //! a `[N, H]` one — and the mixers hold their `M` (or `M²`) coefficients in
@@ -51,8 +49,8 @@ fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
 }
 
 /// One thread per INPUT element — these kernels' grids cover the `[N, H]`
-/// side and each thread writes its `M` outputs (the old `ElementwiseIn`
-/// rule). Refused rather than clamped past a 32-bit launch.
+/// side and each thread writes its `M` outputs. Refused rather than clamped
+/// past a 32-bit launch.
 fn elementwise_in(op: &'static str, rows: u32, width: u32) -> Result<Launch, Error> {
     nonzero(op, "rows", rows)?;
     nonzero(op, "width", width)?;
@@ -86,8 +84,8 @@ pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), 
             stated(OP, x.rows)?.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, x.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -113,8 +111,8 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
             y.arg(),
             stated(OP, nonzero(OP, "the normed row's width", y.width)?)?.arg(),
             eps.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -124,9 +122,9 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
 /// `[2M + M², M·H]` plane, all f32 — the layer's dynamic hyper plane
 /// (`{attn,ffn}_hc.fn`) fired, which is what [`gates`] below splits.
 ///
-/// **NOT `linear.matmul`**: both operands are f32 and the dense gemm points
-/// are bf16; the sinkhorn is f32 by this family's design, which a bf16 detour
-/// would undo. One block per `(row, mix column)`.
+/// Not `linear.matmul`: both operands are f32 (the dense gemm points are
+/// bf16) since the sinkhorn is f32 by design. One block per `(row, mix
+/// column)`.
 pub fn project(
     ctx: &Ctx,
     normed: Tensor,
@@ -162,13 +160,17 @@ pub fn project(
             ),
         ));
     }
-    let mix_hc = 2 * stream_count + stream_count * stream_count;
-    if mixes.width != mix_hc || hc_fn.rows != mix_hc {
+    // The mix row is as wide as the plane says: a layer's plane lands the
+    // `2M + M²` row `gates` splits, the trunk's the `M` gates `collapse`
+    // folds under.
+    let mix_hc = hc_fn.rows;
+    let layer_row = 2 * stream_count + stream_count * stream_count;
+    if mixes.width != mix_hc || (mix_hc != layer_row && mix_hc != stream_count) {
         return Err(refuse(
             OP,
             format!(
-                "a {stream_count}-stream mix row is {mix_hc} wide; the plane lands {} \
-                 rows into a {}-wide row",
+                "a {stream_count}-stream mix row is {layer_row} wide and a trunk collapse row \
+                 is {stream_count}; the plane lands {} rows into a {}-wide row",
                 hc_fn.rows, mixes.width
             ),
         ));
@@ -186,8 +188,8 @@ pub fn project(
             mixes.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, mix_hc)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -253,8 +255,8 @@ pub fn gates(
             gate_eps.arg(),
             alpha.arg(),
             stated(OP, sinkhorn)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -295,16 +297,72 @@ pub fn fold(
             stated(OP, y.rows)?.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, x.width)?.arg(),
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
+            ctx.stage(),
+        ],
+    )
+}
+
+/// **THE TRUNK COLLAPSE**: `y[n, h] = Σᵢ gᵢ · streams[n, i·H + h]` under
+/// `gᵢ = σ(mixes[n, i] · scale[0] + base[i]) + hc_eps` — `hc_head`, the `M`
+/// streams folded into the row the final norm reads. `hc_head_postprocess`
+/// waited in the device text for a producer of its `[N, M]` mix plane since
+/// review R5; `hc_project` through `hc_head.fn` is that producer.
+#[allow(clippy::too_many_arguments)]
+pub fn collapse(
+    ctx: &Ctx,
+    mixes: Tensor,
+    streams: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    stream_count: u32,
+    hc_eps: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.hc_collapse";
+    let t = dtype_dispatch!(OP, streams.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert_eq!(mixes.dtype, Dtype::F32, "`{OP}` reads an f32 mix row");
+    debug_assert_eq!(scale.dtype, Dtype::F32, "`{OP}` reads an f32 mix scale");
+    debug_assert_eq!(base.dtype, Dtype::F32, "`{OP}` reads f32 mix bases");
+    debug_assert_eq!(y.dtype, streams.dtype, "`{OP}` lands the streams' element");
+    let fan = stream_fan(OP, streams.width, y.width)?;
+    debug_assert_eq!(
+        fan, stream_count,
+        "the row's stream fan is the count the statement states"
+    );
+    if mixes.width != fan || mixes.rows != y.rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "the trunk collapse folds {fan} streams under a {}-wide mix row over {} of {} rows",
+                mixes.width, mixes.rows, y.rows
+            ),
+        ));
+    }
+    nonzero(OP, "rows", y.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::elemwise::hc_head_postprocess<{t}, 256>")),
+        )
+        .apply(Launch::per_row(y.rows, BLOCK)),
+        &[
+            mixes.arg(),
+            scale.arg(),
+            base.arg(),
+            streams.arg(),
+            y.arg(),
+            stated(OP, fan)?.arg(),
+            stated(OP, nonzero(OP, "the hidden width", y.width)?)?.arg(),
+            hc_eps.arg(),
             // The staged-geometry seat: the region's live-rows word when a
             // body replay armed one, and the null seat (`ABSENT`) otherwise.
             ctx.stage(),
         ],
     )
 }
-
-// `hc.collapse` was deleted with its IR variant (review R5): no plane could
-// fire it honestly — `elemwise::hc_head_postprocess` still waits in the device
-// text for a producer of its `[N, M]` f32 mix plane.
 
 // ---- The gated-residual flavor (qwen4) ----------------------------------
 
@@ -331,8 +389,8 @@ pub fn mix(ctx: &Ctx, gates: Tensor, normed: Tensor, streams: u32, y: &mut Tenso
             y.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, y.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -361,8 +419,8 @@ pub fn inject(ctx: &Ctx, o: Tensor, gates: Tensor, streams: u32, hyper: &mut Ten
             hyper.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, o.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -405,8 +463,8 @@ pub fn ple_gate(
             y.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, value.width)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )

@@ -1,26 +1,11 @@
 //! `ScatterLive`: the embed merge for a rectangle whose tail has no
-//! destination (`.wiki/alto/multimodal.md` §8.6).
+//! destination. A separate entry rather than a guard inside
+//! `layout::scatter_rows`, so that op's existing contract (every route names
+//! a row) is not widened underneath its consumers.
 //!
-//! **THIS FILE IS `src/layout/scatter_live.rs` AND ITS MODULE PATH IS
-//! `kernels_cuda::layout_scatter_live`**, behind the door `attn_dense` opened
-//! and [`crate::layout_fold`] uses next door. It is a separate entry rather
-//! than a guard inside `layout::scatter_rows` for two reasons and only one of
-//! them is the conflict map: `src/layout.rs` and `kernels/layout/layout.cuh`
-//! are closed to this wave, AND the existing op's contract — every route names
-//! a row, checked host-side before the launch — is one its consumers rely on
-//! and should not be widened underneath them. Two ops, two contracts, one
-//! body apart.
-//!
-//! # What the sentinel is for
-//!
-//! A compacting fold ([`crate::layout_fold::pool_rows`],
-//! [`crate::layout_fold::merge_rows`]) answers `rows / side²` rows and leaves
-//! the rest of the patch rectangle as whatever the arena held.
-//! `RuntimeInput::PatchRoutes` is `[Dim::Patches]` — one destination per row
-//! of the FULL rectangle — so those tail rows have route entries, and before
-//! this op there was no legal value to put in them: the shell refuses
-//! `route < 0` by name and `layout.scatter_rows` would take a negative index
-//! as a write below the base of the token rectangle.
+//! A compacting fold answers `rows / side²` rows and leaves the rest of the
+//! patch rectangle as whatever the arena held; those tail rows have route
+//! entries with no legal destination, hence the negative-route sentinel here.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -34,19 +19,13 @@ const WARP: u32 = 32;
 
 const MAX_BLOCK: u32 = 1024;
 
-/// **THE EMBED MERGE, WITH A DROP SENTINEL**: row `i` of `src` lands at token
-/// row `routes[i]` of `y`, and a NEGATIVE `routes[i]` places it nowhere.
+/// The embed merge, with a drop sentinel: row `i` of `src` lands at token row
+/// `routes[i]` of `y`; any negative `routes[i]` places it nowhere (`-1` is
+/// the value a submission writes, but any negative is dropped).
 ///
-/// `-1` is the value a submission writes; any negative is dropped, because a
-/// kernel that distinguished `-1` from `-2` would be inventing a second
-/// sentinel nobody declared.
-///
-/// The bound at the other end is still not this kernel's to check: an entry
-/// past `y.rows` is an out-of-bounds device write that no arena faults on, and
-/// the fire path validates the vector against the fire's token row count
-/// before the launch (`Fault::PatchRoute`) exactly as it does for the
-/// unguarded twin. What this op changes is the LOWER end of that check and
-/// nothing else.
+/// The upper bound is still not this kernel's to check: the fire path
+/// validates the vector against the token row count before the launch, as
+/// for the unguarded twin.
 ///
 /// # Errors
 ///
@@ -114,8 +93,7 @@ pub fn scatter_live_rows(
             y.arg(),
             routes.arg(),
             units.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed one, else `ABSENT`.
             ctx.stage(),
         ],
     )

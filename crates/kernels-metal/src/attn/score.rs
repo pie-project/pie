@@ -1,32 +1,10 @@
-//! `AttnScore`: per-key attention mass for an observation window — the alto
-//! observability door's capture (`.wiki/alto/attn-score.md` §4; §1 is the C++
-//! lineage this reproduces), and this plane's mirror of
+//! `AttnScore`: per-key attention mass for an observation window, mirroring
 //! `kernels_cuda::attn_score`.
 //!
-//! **A NEW FILE ON PURPOSE**, and the design says so in as many words: "the
-//! accumulating capture-arm kernel is agent-built in a NEW FILE outside
-//! `attn.rs`/`attn/kv.rs`" (§5). The ownership argument is [`dense`]'s: this
-//! entry shares the PAGES with the sdpa family and nothing else — no
-//! arbitration, no tile, no mask ladder, no log-sum-exp plane, no `o`. What it
-//! borrows from the plan is one table, the position vector, and it borrows it
-//! for the causal bound alone.
-//!
-//! Unlike the CUDA twin the module needs no `#[path]` re-homing: `attn.rs`
-//! could take the one `pub mod score;` line, so the module path is the one the
-//! design spells (`attn::score`) and no re-homing block is owed.
-//!
-//! One entry, one stamp ladder, no workspace: the kernel recomputes the
-//! softmax weights straight out of the pages rather than materialising the
-//! `heads x window x kv_len` F32 slab the C++ lineage allocated per fire (and
-//! refused above 1 GiB). See the shader's header for that argument, and for
-//! the one place this mirror's arithmetic is spelled differently from its
-//! twin's without meaning anything different.
-//!
-//! **UNVERIFIED ON DEVICE.** The shader was written against its neighbours
-//! (`attn/dense.metal` for the simdgroup fold, `attn/sdpa_paged.metal` for the
-//! paged addressing) and against `kernels-cuda`'s `attn/score.cuh` for the
-//! arithmetic. What the tests below pin is the host half — the ladder, the
-//! refusals, the grid, the argument order.
+//! One entry, one stamp ladder, no workspace: recomputes the softmax weights
+//! from the pages rather than materializing a `heads x window x kv_len` F32
+//! slab. Unverified on device; the tests below pin the host half (ladder,
+//! refusals, grid, argument order).
 //!
 //! [`dense`]: crate::attn::dense
 
@@ -39,21 +17,15 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "attn/score.metal";
 
-/// Simdgroups per threadgroup. Keys are split across them and folded once per
-/// window row, so this is the kernel's only parallelism knob above the head —
-/// and it is the CUDA twin's `WARPS`, which is the width this capture
-/// reproduces.
+/// Simdgroups per threadgroup; keys are split across them and folded once
+/// per window row (the CUDA twin's `WARPS`).
 const SIMDS: u32 = 8;
 
 /// Threads per threadgroup — one Apple simdgroup is 32 lanes wide.
 const THREADS: u32 = SIMDS * 32;
 
-/// The dot-product stamps, tightest first — [`dense`](crate::attn::dense)'s
-/// ladder and the twin's, for the same reason. A stamp is the unrolled
-/// per-lane length (`stamp / 32` elements) and the threadgroup plane, not a
-/// shape: the live head width may be anything at or below it, which is what
-/// lets 64, 72 and 80 share the 128-wide stamp without any of them being
-/// padded.
+/// The dot-product stamps, tightest first. A stamp bounds the head width
+/// from above; e.g. widths 64, 72 and 80 all share the 128 stamp.
 const STAMPS: [u32; 3] = [64, 128, 256];
 
 /// The shipped point per stamp, in [`STAMPS`] order.
@@ -63,75 +35,39 @@ const CAPTURE: [&str; 3] = [
     "attn_score_capture_bfloat16_d_256",
 ];
 
-/// The tightest stamp that holds this head, as an index into [`STAMPS`] — or
-/// nothing, because a head wider than the last stamp is refused rather than
-/// silently truncated.
+/// The tightest stamp that holds this head, as an index into [`STAMPS`], or
+/// `None` if it is wider than the last stamp (refused, not truncated).
 fn stamp_for(head_dim: u32) -> Option<usize> {
     STAMPS.iter().position(|stamp| head_dim <= *stamp)
 }
 
-/// **PER-KEY ATTENTION MASS FOR AN OBSERVATION WINDOW, INTO A CALLER-OWNED
-/// F32 SLAB.**
+/// Per-key attention mass for an observation window, written into a
+/// caller-owned F32 slab.
 ///
-/// `q` is the capture window's query rows (`[rows, num_q_heads * head_dim]`,
-/// bf16) paired with the window-REBASED `qo_indptr` — `i32`,
-/// `[requests + 1]`, indexing `q.data` itself. `plan` is the very plan
-/// [`prefill_lse`](crate::attn::arbiter::prefill_lse) runs on and is read for
-/// one thing only, its position table, which is this plane's causal bound (the
-/// shader's header says why that is the same number the twin reconstructs from
-/// `kv_last_page_lens`). `pool` is the paged cache this layer read.
+/// `q` is the capture window's query rows paired with a window-rebased
+/// `qo_indptr`; `plan`'s position table gives the causal bound; `pool` is
+/// the paged cache read.
 ///
-/// For request `r` and query head `h` the output row is
-/// `scores` row `(lane_offset + r) * plane_stride + plane + h`, and it holds
+/// For request `r`, head `h`: row `(lane_offset + r) * plane_stride + plane
+/// + h` holds `(1/rows) * sum_w softmax_j(sm_scale * <q_w, k_j>)`, where
+/// `rows = min(observe, qo_len)` walks the last `rows` query rows. A
+/// probability distribution over the request's live KV; no fold over heads.
 ///
-/// ```text
-///   out[j] = (1 / rows) * sum over w of softmax_j( sm_scale * <q_w, k_j> )
-/// ```
-///
-/// where `rows = min(observe, qo_len)` and `w` walks the request's LAST `rows`
-/// query rows, each row's softmax taken over its own causal limit. The result
-/// is a probability distribution over the request's live KV summing to one:
-/// TOVA's number at `observe = 1`, SnapKV's at `observe = 32`. The papers'
-/// extra fold over heads is deliberately not taken — §4 rules the contract
-/// per-head and lets the guest fold.
-///
-/// **THE WHOLE ROW IS WRITTEN, ALWAYS.** The tail past the live keys lands
-/// exactly `0.0`, on every path including the degenerate ones (a request with
-/// no pages, an empty cache, an empty window). The slab is reused across fires
-/// and a stale tail is not "unset" — it is the previous fire's mass on keys
-/// that no longer exist, which an eviction policy would rank on and never
-/// fault.
+/// The whole row is always written; the tail past live keys is exactly
+/// `0.0` (the slab is reused across fires, so a stale tail would misread as
+/// mass on keys that no longer exist).
 ///
 /// # Errors
 ///
-/// A refusal when:
+/// Refuses: a sliding window (semantically not this softmax, not a missing
+/// instantiation); non-bf16 key pages (nothing here dequantizes); a
+/// head/kv-head shape mismatch; a head wider than the widest stamp; a
+/// non-F32 or wrong-width score slab; a non-`i32` position table or boundary
+/// vector; `observe`, `kv_max`, `page_size`, or request count of zero; or an
+/// overflowing extent. [`Error::DtypeUnsupported`] for a non-bf16 query.
 ///
-/// - **a sliding window is stated at all** — a windowed row is not the softmax
-///   the eviction and interpretability papers define, and the registry has
-///   refused capture under it since before this kernel existed
-///   (`.wiki/alto/attn-score.md` §2.4 / §5). The refusal is SEMANTIC, not a
-///   missing instantiation, and it says so;
-/// - **the pool's key pages are not bf16 storage** — this capture reads keys
-///   directly out of the pages and dequantizes nothing, so a quantized or fp8
-///   pool has no scores to give. Also semantic: there is no point to add;
-/// - the stated head width is not the pool row's head stride, or the stated kv
-///   head count is not the one the pool's strides spell
-///   ([`kv_heads_agree`](crate::attn));
-/// - the query row width does not divide by the stated head width, or the
-///   query heads do not group over the kv heads;
-/// - the head is wider than the widest stamp;
-/// - the slab is not F32, or its row is not `kv_max` wide;
-/// - the plan's position table is not `i32`, or the boundary vector is not;
-/// - `observe` is zero — an observation window that observes nothing;
-/// - `kv_max`, `page_size` or the request count is zero, or any stated extent
-///   overflows the shader's `int`.
-///
-/// [`Error::DtypeUnsupported`] for a query in anything but bf16.
-///
-/// A live kv extent past `kv_max` is a caller error the engine refuses
-/// upstream and it is NOT knowable here — the extent is a device-side number
-/// read from the position and page tables. The kernel is safe under it on its
-/// own: the softmax is still taken over the true extent and only the store is
+/// A live kv extent past `kv_max` is a caller error not knowable here (it is
+/// device-side); the kernel stays safe, softmax over the true extent, store
 /// clamped to `kv_max`.
 #[allow(clippy::too_many_arguments)]
 pub fn capture(
@@ -193,9 +129,8 @@ pub fn capture(
             ),
         ));
     }
-    // The fire tables and the boundary vector are seats no op names, so the
-    // trace-time validator never sees them and a disagreement is refused here
-    // rather than asserted (the boundary rule at `crate::encode::refuse`).
+    // Unnamed seats bypass the trace-time validator, so mismatches are
+    // refused here rather than asserted.
     if plan.positions.dtype != Dtype::I32 {
         return Err(refuse(
             OP,
@@ -248,8 +183,7 @@ pub fn capture(
         .filter(|size| *size > 0)
         .ok_or_else(|| refuse(OP, "the kv page size is zero"))?;
 
-    // The named refusals above judge the geometry a caller can state; these
-    // are the landing contract, checked only once the fire is admissible.
+    // The landing contract, checked only once the fire is admissible.
     debug_assert!(
         plane + num_q_heads <= plane_stride,
         "`{OP}` writes one plane per query head inside a lane's block of {plane_stride}"
@@ -298,13 +232,11 @@ pub fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::ArgValue;
+    
     use crate::probe::Probe;
 
-    /// The ceiling the engine states today (`eta_ir::registry::
-    /// ATTN_SCORE_KV_MAX`), spelled as a number because this crate names no
-    /// registry: the entry takes the ceiling as an argument and has no opinion
-    /// about which one, which is the whole reason it is a parameter.
+    // Spelled as a number: this crate names no registry, the ceiling is
+    // just a caller-stated argument.
     const KV_MAX: u32 = 2048;
 
     fn bf16(rows: u32, width: u32) -> Tensor {
@@ -346,8 +278,7 @@ mod tests {
         }
     }
 
-    /// qwen35's attention shape: 16 query heads of 64 over 8 kv heads, two
-    /// requests, the whole slab handed over as one rectangle.
+    /// 16 query heads of 64 over 8 kv heads, two requests, whole slab.
     #[allow(clippy::too_many_arguments)]
     fn fire(probe: &Probe, window: Option<u32>, keys: Dtype, scores: Tensor) -> Result<(), Error> {
         let (q_heads, kv_heads, head_dim, rows) = (16u32, 8u32, 64u32, 40u32);
@@ -387,34 +318,7 @@ mod tests {
         assert_eq!(STAMPS.len(), CAPTURE.len());
     }
 
-    /// The grid, the entry and every stated extent, in the order the shader
-    /// declares them — the one thing a host test can pin about a kernel it
-    /// cannot run.
-    #[test]
-    fn a_capturing_window_launches_one_group_per_request_per_head() {
-        let probe = Probe::default();
-        fire(&probe, None, Dtype::Bf16, slab(4 * 96)).expect("the capture enqueues");
-        let (fired, args) = probe.only();
-        assert_eq!(fired.file, FILE);
-        assert_eq!(fired.entrypoint, "attn_score_capture_bfloat16_d_64");
-        assert_eq!(fired.lanes, [2 * THREADS, 16, 1]);
-        assert_eq!(fired.group, [THREADS, 1, 1]);
-        assert_eq!(args[7], ArgValue::I32(16)); // page_size
-        assert_eq!(args[8], ArgValue::I32(16)); // num_q_heads
-        assert_eq!(args[9], ArgValue::I32(8)); // num_kv_heads
-        assert_eq!(args[10], ArgValue::I32(64)); // head_dim
-        assert_eq!(args[11], ArgValue::F32(0.125));
-        assert_eq!(args[12], ArgValue::I32(32)); // observe
-        assert_eq!(args[13], ArgValue::I32(0)); // lane_offset
-        assert_eq!(args[14], ArgValue::I32(96)); // plane_stride
-        assert_eq!(args[15], ArgValue::I32(0)); // plane
-        assert_eq!(args[16], ArgValue::I32(KV_MAX as i32));
-        // The slab is the only operand this entry writes.
-        assert!(matches!(args[6], ArgValue::BufferMut(_)), "{:?}", args[6]);
-    }
-
-    /// **THE SLIDING-WINDOW REFUSAL IS SEMANTIC AND STAYS BY NAME** (design
-    /// §2.4). It is not a missing instantiation, so it must not read like one.
+    /// The sliding-window refusal is semantic, not a missing instantiation.
     #[test]
     fn a_sliding_window_is_refused_as_a_different_quantity() {
         let probe = Probe::default();

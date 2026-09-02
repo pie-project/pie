@@ -105,8 +105,8 @@ fn split_kv_a_norm(
             rope.arg(),
             src_row_stride.arg(),
             eps.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
@@ -191,17 +191,15 @@ pub fn split_q_b(
             heads.arg(),
             nope.arg(),
             rope.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Staged-geometry seat: live-rows word when a body replay armed
+            // one, ABSENT otherwise.
             ctx.stage(),
         ],
     )
 }
 
 /// Absorbs `kv_b`'s up-projection into q: per-head strided-batched GEMM,
-/// mapping nope heads into latent space. cuBLAS is the engine, as before —
-/// the old `gemm::absorb` helpers, now living with the family that fires
-/// them.
+/// mapping nope heads into latent space, via cuBLAS.
 pub fn absorb_q(
     ctx: &Ctx,
     q_nope: Tensor,
@@ -221,7 +219,7 @@ pub fn absorb_q(
     let tokens = count(OP, "rows", q_nope.rows)?;
     let handle = ctx.cublas(OP)?;
 
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     unsafe {
         absorb(
             handle,
@@ -242,7 +240,7 @@ pub fn absorb_q(
         )
         .map_err(|status| cublas_refused(OP, status))
     }
-    #[cfg(not(feature = "_cuda"))]
+    #[cfg(not(feature = "cuda"))]
     {
         let _ = (handle, kv_b, q_latent, heads, nope, v_dim, rank, tokens);
         Err(crate::jit::runtimeless(OP))
@@ -275,7 +273,7 @@ pub fn absorb_out(
         .ptr
         .wrapping_add(2 * u64::from(nope.unsigned_abs()) * u64::from(rank.unsigned_abs()));
 
-    #[cfg(feature = "_cuda")]
+    #[cfg(feature = "cuda")]
     unsafe {
         absorb(
             handle,
@@ -296,14 +294,14 @@ pub fn absorb_out(
         )
         .map_err(|status| cublas_refused(OP, status))
     }
-    #[cfg(not(feature = "_cuda"))]
+    #[cfg(not(feature = "cuda"))]
     {
         let _ = (handle, wv, o, heads, v_dim, rank, tokens);
         Err(crate::jit::runtimeless(OP))
     }
 }
 
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 fn cublas_refused(op: &'static str, status: i32) -> Error {
     refuse(
         op,
@@ -312,7 +310,7 @@ fn cublas_refused(op: &'static str, status: i32) -> Error {
 }
 
 /// The per-head strided-batched bf16 GEMM both absorbs ride.
-#[cfg(feature = "_cuda")]
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn absorb(
     handle: *mut core::ffi::c_void,
@@ -375,11 +373,9 @@ unsafe fn absorb(
 
 /// Appends latent rows (`kv_c` beside `k_pe`) into the pool's pages.
 ///
-// MENLO-SEAM: the op states its write geometry (`write_page`/
-// `write_offset`), but the latent writer (`mla_kv_append`) still re-derives
-// each token's cell from the read-side CSR and the fire indptr riding in
-// `kv_c` — the stated pair goes unread until the device text grows an
-// explicit-descriptor latent writer.
+// The op states its write geometry (`write_page`/`write_offset`), but the
+// latent writer still re-derives each token's cell from the read-side CSR
+// and the fire indptr riding in `kv_c`, so the stated pair goes unread.
 pub fn kv_append(
     ctx: &Ctx,
     kv_c: RaggedTensor,
@@ -482,9 +478,8 @@ mod naive {
     }
 
     /// Fires the naive kernel that fits: mma when the shape supports it and
-    /// no selection is stated, scalar otherwise. A shape neither can lane-
-    /// split is refused — the old plane's silent decline was a no-launch
-    /// that looked like success.
+    /// no selection is stated, scalar otherwise. A shape neither can
+    /// lane-split is refused rather than silently declined.
     pub fn fire(ctx: &Ctx, op: &'static str, ptrs: Ptrs, shape: Shape) -> Result<(), Error> {
         const MMA_THREADS: u32 = 256;
 
@@ -532,8 +527,8 @@ mod naive {
                     shape.page_size.arg(),
                     shape.sm_scale.arg(),
                     shape.causal.arg(),
-                    // The staged-geometry seat: the region's live-rows word when a
-                    // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                    // Staged-geometry seat: live-rows word when a body replay armed
+                    // one, ABSENT otherwise.
                     ctx.stage(),
                 ],
             );
@@ -598,8 +593,8 @@ mod naive {
                 shape.sm_scale.arg(),
                 shape.causal.arg(),
                 g.arg(),
-                // The staged-geometry seat: the region's live-rows word when a
-                // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                // Staged-geometry seat: live-rows word when a body replay armed
+                // one, ABSENT otherwise.
                 ctx.stage(),
             ],
         )
@@ -692,8 +687,7 @@ mod mla_fa2 {
     /// `::flashinfer::MLAParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16,
     /// int32_t>`, measured at 288 bytes / align 8. Device pointers travel as
     /// the `u64` the handles carry; the offsets are pinned by the const
-    /// asserts below — the safety payload the old `by_value!` macro bought,
-    /// without the macro.
+    /// asserts below.
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
     pub struct MlaParams {
@@ -1079,8 +1073,8 @@ pub fn attention_decode_selected(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    // MENLO-SEAM: the plan is accepted for the op's seat and goes unread —
-    // the selected paths always run the naive engine (see [`selected`]).
+    // The plan is accepted for the op's seat and goes unread — the selected
+    // paths always run the naive engine (see [`selected`]).
     let _ = plan;
     selected(
         ctx,
@@ -1110,8 +1104,8 @@ pub fn attention_prefill_selected(
     sm_scale: f32,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    // MENLO-SEAM: as `attention_decode_selected` — the plan goes unread on
-    // the selected paths (see [`selected`]).
+    // As `attention_decode_selected` — the plan goes unread on the selected
+    // paths (see [`selected`]).
     let _ = plan;
     selected(
         ctx,

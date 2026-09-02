@@ -1,20 +1,8 @@
 //! Does this plan honour its contract?
 //!
-//! Verification is deliberately not a second compiler. It takes the plan
-//! exactly as the engine sees it and asks questions that can be answered from
-//! the plan alone plus the filesystem — which is what makes it a *second
-//! opinion* rather than a restatement (`architecture.md` §8). The compiler and
-//! this module share no code: if `compile` had a bug that made it emit a plan
-//! that does not produce a declared tensor, nothing in `compile` would notice,
-//! because the same wrong belief produced both halves.
-//!
-//! There is no engine-side counterpart. `loaded_model.cpp` used to compare a
-//! covered count against a demanded one, which was `if (x != x)` twice over:
-//! first because both were assigned from `view.tensors.len`, and then, once the
-//! contract gave them separate origins, because `check_contract` below throws
-//! on the only way they could differ. Counting again on the far side of a
-//! boundary only looked like a check, and there is no far side now — that
-//! engine was deleted, and its callers call this.
+//! Verification is deliberately not a second compiler: it takes the plan
+//! exactly as the engine sees it and asks questions answerable from the plan
+//! and the filesystem alone, sharing no code with the compiler that built it.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -23,13 +11,9 @@ use crate::types::{Encoding, Visibility};
 
 /// The plan, reduced to what verification can read.
 ///
-/// A view rather than the [`LoadPlan`](crate::plan::LoadPlan) itself, because
-/// verification must be able to read a plan it did not build: `view_of` makes
-/// one from a compiled plan, and the same struct is what a stored dump or a
-/// plan that crossed a process boundary reduces to. Verifying the reduced form
-/// keeps the reduction in scope — a bug that loses a tensor on the way through
-/// is a bug this catches, which it would not be if verification re-read the
-/// full plan beside it.
+/// A view rather than the [`LoadPlan`](crate::plan::LoadPlan) itself, so
+/// verification can read a plan it did not build — `view_of` makes one from a
+/// compiled plan, and a stored dump reduces to the same struct.
 pub struct PlanView<'a> {
     pub files: Vec<FileView<'a>>,
     pub sources: Vec<SourceView<'a>>,
@@ -40,13 +24,9 @@ pub struct PlanView<'a> {
     /// kept: finalizing the same name twice is one of the things being checked.
     pub finalized: Vec<&'a str>,
     /// Every instruction that reads the checkpoint, and the bytes it reads.
-    ///
-    /// The range is carried, not just the file, because the plan's *sources*
-    /// and the plan's *reads* are different claims. A source says which bytes a
-    /// tensor occupies; a read says which bytes an instruction will hand to the
-    /// executor, and the compiler derives the second from the first through
-    /// offsets it computes. Checking only sources leaves every derivation
-    /// unchecked.
+    /// Carried separately from `sources`: a source says which bytes a tensor
+    /// occupies, a read says which bytes an instruction hands the executor,
+    /// and the compiler derives the second from the first.
     pub reads: Vec<ReadView>,
 }
 
@@ -94,40 +74,24 @@ impl<'a> TensorView<'a> {
     }
 }
 
-/// What the runtime demands, independently of how the plan proposes to deliver
-/// it: a name, a shape, and an encoding per tensor.
-///
-/// The point of passing this separately is that it is derived by different code
-/// than the plan. `arch/` decides *what* the model needs; `frontend` ->
-/// `optimizer` -> `planner` decide *how*. A compiler bug that loses a dimension
-/// somewhere in the second half cannot also corrupt the first half, so the two
-/// disagreeing is a real signal.
+/// What the runtime demands, independently of how the plan proposes to
+/// deliver it: a name, a shape, and an encoding per tensor. Derived by
+/// different code than the plan, so the two disagreeing is a real signal.
 pub struct ContractView<'a> {
     pub tensors: Vec<TensorDemand<'a>>,
 }
 
 /// One tensor the runtime demands.
 ///
-/// Every demand is read off a contract the engine authored, so the encoding is
-/// always pinned: a contract states the encoding of every tensor it defines.
-/// The shape is pinned only when the contract declared one — a contract may
-/// decline to predict a shape (`TensorContract::inferred`), and inventing one
-/// here would turn the loader's own inference into the thing being verified.
+/// The encoding is always pinned — a contract states the encoding of every
+/// tensor it defines. The shape is pinned only when the contract declared
+/// one; a sharded tensor's shape is also left unpinned, since a plan holds
+/// only this rank's band and that is checked elsewhere, against the same
+/// declaration.
 ///
-/// It is also unpinned for an expression that names an [`Expr::Shard`], and for
-/// the same reason. A declaration is the whole tensor's while a plan holds this
-/// rank's band, and what relates them is the algebra that resolved the shard —
-/// so comparing the two numbers here would report every sharded tensor in a
-/// tp > 1 plan as a violation. That claim is checked where the algebra is, by
-/// `plan::build`'s `check_declared_shape`, against the same declaration. What
-/// is left here is what a second opinion can actually hold: the tensor is
-/// present, and its encoding is what was asked for.
-///
-/// There is no `optional`. It existed for an engine that declared the tensors it
-/// would bind without authoring them, and could only guess whether a weight it
-/// named would be present; a contract does not guess, because the author read
-/// the checkpoint's tensor table before writing it. A tied-embedding checkpoint
-/// yields a contract that does not declare `lm_head.weight` at all.
+/// There is no `optional`: a contract does not guess whether a weight is
+/// present, since the author read the checkpoint's tensor table before
+/// writing it.
 ///
 /// [`Expr::Shard`]: crate::contract::Expr::Shard
 pub struct TensorDemand<'a> {
@@ -177,9 +141,7 @@ pub struct Violation {
 }
 
 impl Violation {
-    /// A violation about the plan as a whole. `pub` because the ABI crate's
-    /// marshalled-view verifier reports marshalling failures through the same
-    /// vocabulary.
+    /// A violation about the plan as a whole.
     pub fn plan(message: impl Into<String>) -> Self {
         Self {
             tensor: None,
@@ -287,17 +249,10 @@ fn check_schedule(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
     }
 }
 
-/// Every public declaration must be finalized, under its declared name, exactly
-/// once — and nothing else may be.
-///
-/// A public `TensorDecl` with no `Finalize` is a weight the engine will look up
-/// and not find. A `Finalize` with no `TensorDecl` is a name the engine was
-/// never told to expect. Both are the plan disagreeing with itself.
-///
-/// The declaration table and the bind table are not the same set, which is what
-/// [`Visibility`] says: an internal declaration is a name later expressions
-/// resolve through, and finalizing it would put in the engine's hands the very
-/// tensor the contract asked to keep.
+/// Every public declaration must be finalized, under its declared name,
+/// exactly once — and nothing else may be. An internal declaration is a name
+/// later expressions resolve through; finalizing it would hand the engine a
+/// tensor the contract asked to keep internal.
 fn check_coverage(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
     let mut finalized: HashMap<&str, usize> = HashMap::new();
     for name in &plan.finalized {
@@ -340,17 +295,10 @@ fn check_coverage(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
     }
 }
 
-/// Check the plan's file table against the filesystem.
-///
-/// This is the check that a cached plan is still about the checkpoint it was
-/// compiled from. Every offset in the plan is a byte position inside one of
-/// these files, so a file that has been replaced, truncated, or removed since
-/// the compile turns the plan's offsets into reads of unrelated bytes — which
-/// is far worse than a load failure, because it succeeds.
-///
-/// Size is a weak proxy for content, but a cheap one, and it catches the case
-/// that actually happens: a re-download or a re-quantization producing a
-/// different checkpoint under the same path.
+/// Check the plan's file table against the filesystem: is a cached plan
+/// still about the checkpoint it was compiled from? Size is a weak but cheap
+/// proxy for content, and it catches a re-download producing a different
+/// checkpoint under the same path.
 fn check_files(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
     for (index, file) in plan.files.iter().enumerate() {
         if file.id as usize != index {
@@ -419,13 +367,24 @@ fn check_files(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
     }
 }
 
-/// Check the plan against what the runtime actually demands.
-///
-/// This is `architecture.md` §8.2's coverage question in full: not "is the plan
-/// self-consistent" but "does it produce what will be asked for, in the form it
-/// will be asked for?". Shape and encoding are checked as well as presence,
-/// because a tensor that exists at the wrong shape fails later, further away,
-/// and as garbage output rather than a missing symbol.
+/// The bytes an instruction touches past `file_offset`: the strided
+/// footprint the executor reads (`read_extent`), not the logical count it
+/// produces. The two part on a broadcast source — a stride-0 dimension
+/// reads one stretch and writes it several times — and the file-bounds
+/// check is about what is read.
+fn physical_span(source: &crate::plan::SourceExtent) -> u64 {
+    let mut normalized = source.stride.clone();
+    let base = normalized.base_offset;
+    normalized.base_offset = 0;
+    match crate::executor::walk::physical_source_bytes(&normalized) {
+        Ok(len) => base.saturating_add(len),
+        Err(_) => source.span_bytes,
+    }
+}
+
+/// Check the plan against what the runtime actually demands: not "is the plan
+/// self-consistent" but "does it produce what will be asked for?". Shape and
+/// encoding are checked as well as presence.
 fn check_contract(plan: &PlanView<'_>, contract: &ContractView<'_>, found: &mut Vec<Violation>) {
     let planned: HashMap<&str, &TensorView<'_>> = plan
         .tensors
@@ -465,27 +424,14 @@ fn check_contract(plan: &PlanView<'_>, contract: &ContractView<'_>, found: &mut 
         }
     }
 
-    // The converse is not a violation by symmetry: a contract may publish views
-    // alongside the buffer they borrow — packed MoE experts republished under
-    // their original names, as `tests/storage_compiler.rs` pins for Nemotron-H —
-    // and a given engine may never bind them. Producing more than was demanded
-    // costs a name, not correctness. Producing less is the failure.
+    // The converse is not a violation: a plan may declare tensors a given
+    // engine never binds. Producing more than demanded costs a name, not
+    // correctness; producing less is the failure.
 }
 
-/// Compare two encodings over the fields a plan can actually carry.
-///
-/// A [`PlanView`] can arrive two ways: from a plan the loader still holds in
-/// typed form, or rebuilt from the POD arena the engine received. The POD
-/// `TensorDecl` carries `scheme`, `dtype`, `bits_per_element` and `group_size`
-/// and nothing else, because the rest of [`QuantSpec`] had no reader on the far
-/// side — the scale tensor's axis, dtype and granularity are stated on the
-/// `QuantAttachment`, which is where the executor looks for them.
-///
-/// So verification compares what crossed the boundary. Holding a plan to a
-/// field that cannot be expressed in it would make the check fail for a
-/// contract that is in fact satisfied, and comparing the two representations
-/// asymmetrically would make the answer depend on which side of the FFI the
-/// caller stood on.
+/// Compare two encodings over the fields a plan can actually carry: `scheme`,
+/// `dtype`, `bits_per_element`, `group_size`. Holding a plan to a field it
+/// cannot express would fail a contract that is in fact satisfied.
 fn encoding_matches(planned: &Encoding, demanded: &Encoding) -> bool {
     match (planned, demanded) {
         (Encoding::Quant(planned), Encoding::Quant(demanded)) => {
@@ -498,28 +444,7 @@ fn encoding_matches(planned: &Encoding, demanded: &Encoding) -> bool {
     }
 }
 
-// The verifier's tests live in `tests/golden_plans.rs` and `tests/groups.rs`,
-// which check the verdict on the plan itself. They used to check it through a
-// marshalled POD view instead, because that was the only form a C++ caller
-// could see; verifying the plan directly became possible when the caller left.
-
 /// The verification view of a compiled plan, read straight off it.
-///
-/// # Why this did not exist before
-///
-/// Verification used to run only on the MARSHALLED plan — the POD form a C++
-/// engine held — and model-loader-capi::view::verify_marshalled was the only
-/// way in. Its own doc explained the choice: "Verification runs *here*, on the
-/// marshalled bytes, and nowhere else. There is no path that verifies the Rust
-/// plan directly, and that is the point: a bug in the marshalling is in scope
-/// for every caller."
-///
-/// That was right while a marshalling existed. Both engines are Rust now and
-/// read [`LoadPlan`] itself, so the POD form and the bug class it guarded
-/// against are gone together — and routing verification through a C round-trip
-/// that no longer happens would be checking a translation nobody performs.
-///
-/// What is verified is unchanged: the same [`verify`] over the same views.
 #[must_use]
 pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
     use crate::plan::StorageInstr;
@@ -552,11 +477,8 @@ pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
     let mut finalized = Vec::new();
     let mut reads = Vec::new();
     for instr in &plan.instrs {
-        // Named rather than left to a wildcard, for the reason the marshalled
-        // reader gave: `verify` decides a file is unread by finding no
-        // `ReadView` for it, so an instruction that grows a source and is not
-        // added here would make the plan look like it never touched the
-        // checkpoint.
+        // Every arm named rather than a wildcard: an instruction that grows a
+        // source and is not added here would make the plan look unread.
         match instr {
             StorageInstr::Finalize { name, .. } => finalized.push(name.as_str()),
             StorageInstr::ExtentWrite { id, source, .. }
@@ -565,7 +487,7 @@ pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
                 instr: id.0,
                 file_id: source.file_id.0,
                 file_offset: source.file_offset,
-                span_bytes: source.span_bytes,
+                span_bytes: physical_span(source),
             }),
             StorageInstr::TileMap { id, source, .. } => {
                 if let Some(source) = source {
@@ -573,7 +495,7 @@ pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
                         instr: id.0,
                         file_id: source.file_id.0,
                         file_offset: source.file_offset,
-                        span_bytes: source.span_bytes,
+                        span_bytes: physical_span(source),
                     });
                 }
             }
@@ -596,16 +518,10 @@ pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
 
 /// Verify a plan AND every instance of every group it carries.
 ///
-/// The instances are the point. A group's plan is compiled at index 0, so
-/// verifying it alone checks one instance out of `arity` and leaves the other
-/// bindings — which are what the engine will actually read — unchecked.
-/// Rewriting the template's reads with each instance's binding and running the
-/// same file-bounds check over the result is the cheapest way to say "every
-/// instance stays inside its file", and it reuses the check rather than
-/// restating it.
-///
-/// Ported from the deleted ABI crate's verify_marshalled, which is where this
-/// lived while a plan had to cross a C boundary to be verified.
+/// A group's plan is compiled at index 0, so verifying it alone checks one
+/// instance out of `arity` and leaves the other bindings unchecked. Rewriting
+/// the template's reads with each instance's binding and rerunning the
+/// file-bounds check is the cheapest way to check every instance.
 ///
 /// # Errors
 ///
@@ -647,8 +563,8 @@ fn verify_group(group: &crate::plan::GroupPlan, found: &mut Vec<Violation>) {
         return;
     }
 
-    // Mutated in place, one instance at a time: every read's file and offset is
-    // overwritten on each pass, so there is nothing to restore between them.
+    // Mutated in place: every read's file and offset is overwritten on each
+    // pass, so there is nothing to restore between them.
     for (index, bindings) in group.bindings.iter().enumerate() {
         for (read, binding) in template.reads.iter_mut().zip(bindings) {
             if read.instr != binding.instr.0 {

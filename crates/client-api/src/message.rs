@@ -15,7 +15,7 @@ pub const QUERY_MODEL_STATUS: &str = "model_status";
 /// Messages from client -> server
 //
 // `Clone` so the gateway's `Request` (which carries one) is cloneable for
-// idempotent re-dispatch / retry across worker candidates (design §8).
+// idempotent re-dispatch / retry across worker candidates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {

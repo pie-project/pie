@@ -1,22 +1,16 @@
 //! FP8 weight-only gemm points: `e4m3` codes against bf16/f16 activations,
-//! dequantized inside the dot. The rows cuBLAS cannot serve — its fp8 lanes
-//! want BOTH operands narrow — so the decode-in-dot skeleton serves them.
-//! Filled by the QNF wave (wiki alto/next.md §J2, priority 2).
+//! dequantized inside the dot — for the rows cuBLAS cannot serve, since its
+//! fp8 lanes want both operands narrow.
 //!
 //! Two stored forms, four entries. `matmul`/`lm_head` read `gr_e4m3_f32_n`:
-//! one f32 scale per OUTPUT ROW, so the factor is constant over the whole
-//! contraction and lands once, after the reduce. `matmul_tile`/`lm_head_tile`
-//! read `g128x128_e4m3_f32_n` (the DeepSeek-class form): a
-//! `[ceil(n/128), ceil(k/128)]` f32 rectangle, one factor per 128-row band per
-//! 128-wide contraction tile, folded per k-tile.
+//! one f32 scale per output row. `matmul_tile`/`lm_head_tile` read
+//! `g128x128_e4m3_f32_n`: a `[ceil(n/128), ceil(k/128)]` f32 rectangle, one
+//! factor per 128-row band per 128-wide contraction tile.
 //!
-//! **THE FORM IS THE ENTRY, NOT THE RECTANGLE.** Discriminating on the scales
-//! plane's shape was the other option and it is not decidable: at `n <= 128`
-//! and `k <= 128` the tile plane is `[1, 4]` bytes and so is a one-row plane
-//! in the row form, and the two dots differ. A caller that guessed wrong would
-//! get a plausible number and no refusal — the silent-wrongness class. So the
-//! stored form is named by the entry the plan table picks, and each entry
-//! refuses a plane that is not ITS form's rectangle.
+//! The form is the entry, not the rectangle: at `n <= 128` and `k <= 128`
+//! the tile plane and the row plane are shape-identical bytes with different
+//! dots, so discriminating by shape is not decidable. Each entry refuses a
+//! plane that is not its own form's rectangle.
 
 use crate::error::Error;
 use dtype::Dtype;
@@ -84,8 +78,8 @@ pub fn lm_head_tile(
     fire(ctx, "linear.lm_head", Form::Tile, act, codes, scales, y)
 }
 
-/// Which stored form the caller declared by the entry it called — the scales
-/// plane's rectangle is then CHECKED against it, never inferred from it.
+/// Which stored form the caller declared by the entry it called; the scales
+/// plane's rectangle is checked against it, never inferred from it.
 #[derive(Clone, Copy)]
 enum Form {
     Row,
@@ -146,8 +140,7 @@ fn fire(
     );
     let n = nonzero(op, "N, the columns this projection lands", y.width)?;
     let k = nonzero(op, "K, the contraction this projection walks", act.width)?;
-    // An e4m3 code is one byte, so the code plane's row IS the contraction —
-    // there is no packing to undo and nothing else the width could mean.
+    // An e4m3 code is one byte, so the code plane's row is the contraction.
     if codes.width != k {
         return Err(refuse(
             op,
@@ -200,8 +193,7 @@ fn fire(
             y.arg(),
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // Live-rows word when a body replay armed one, else `ABSENT`.
             ctx.stage(),
         ],
     )

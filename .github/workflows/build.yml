@@ -16,7 +16,7 @@ on:
         type: string
         default: "nightly"
       desktop:
-        description: "Build the desktop GPU artifacts (Windows x86_64 native CUDA; the macOS arm64 Metal leg is quarantined until P5)"
+        description: "Build the desktop GPU artifacts (Windows x86_64 CUDA, macOS arm64 Metal)"
         type: boolean
         default: true
       cuda_manylinux:
@@ -74,10 +74,8 @@ jobs:
           fi
 
   # =========================================================================
-  # Desktop GPU artifacts. Windows x86_64 (native CUDA) is the one leg that
-  # builds today; the macOS arm64 (Metal) leg is quarantined in the matrix
-  # below, with the reason and what restoring it takes. The Linux CUDA
-  # artifacts come from the cuda-manylinux job below.
+  # Desktop GPU artifacts: Windows x86_64 (CUDA) and macOS arm64 (Metal).
+  # The Linux CUDA artifacts come from the cuda-manylinux job below.
   # =========================================================================
   desktop:
     if: inputs.desktop
@@ -87,63 +85,28 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          # ── `aarch64-macos-metal` STOOD HERE, QUARANTINED (R3) ───────────
-          #
-          # The leg built `cargo build -p pie --features engine-metal` on
-          # `macos-15` and shipped `pie-aarch64-macos-metal.tar.gz`. It cannot
-          # build: R3 put `crates/engine-metal` in the root manifest's
-          # `exclude` -- it was one of the last consumers of `model-legacy` and
-          # `model_compiler::lower`, both deleted -- and with the crate out of
-          # the workspace, `pie` no longer declares an `engine-metal` feature to
-          # forward. `--features engine-metal` is a hard cargo error, so this
-          # leg failed before it compiled a line, and `fail-fast: false` meant
-          # the Windows leg beside it went on publishing while this one went
-          # red into a log nobody reads.
-          #
-          # QUARANTINED, not deleted, and not silently: the leg is a whole
-          # release artifact, and a matrix entry that merely vanishes is
-          # indistinguishable from a platform someone decided to drop.
-          #
-          # WHAT IT COSTS WHILE IT STANDS HERE. `scripts/install.sh` maps
-          # darwin/aarch64 to exactly `pie-aarch64-macos-metal.tar.gz` and
-          # `README.md` publishes that installer as the way in. Until this leg
-          # returns, macOS installs resolve against whatever the last
-          # successful run left on the rolling release, and a `--clobber`
-          # upload never refreshes it. The installer is deliberately left
-          # alone: teaching it to refuse macOS would be this quarantine
-          # spreading, and the asset it names is the one that comes back.
-          #
-          # IT COMES BACK AT P5 with the crate, as the root `Cargo.toml`'s
-          # `exclude` and `ci.yml`'s shader-plane note both say. Restoring it
-          # is this entry, unchanged, once `pie` declares the feature again:
-          #
-          #     - label: aarch64-macos-metal
-          #       # macos-15 gets Xcode 16 with libc++ 17, which has
-          #       # `std::atomic_ref` (C++20). macos-14's Xcode 15.4 ships
-          #       # libc++ 15, which doesn't.
-          #       runner: macos-15
-          #       platform: macos
-          #       triple: aarch64-apple-darwin
-          #       archive: tar.gz
-          #       backend: metal
-          #       features: engine-metal
-          #
-          # The `platform == 'macos'` steps below (the `brew install cmake
-          # ninja libomp` one, and the `TARGET_ROOT` branch in Package) are
-          # left in place for the same reason: they are this leg's other half
-          # and they cost nothing while no leg selects them.
+          - label: aarch64-macos-metal
+            # macos-15 gets Xcode 16 with libc++ 17, which has
+            # `std::atomic_ref` (C++20). macos-14's Xcode 15.4 ships libc++
+            # 15, which doesn't.
+            runner: macos-15
+            platform: macos
+            triple: aarch64-apple-darwin
+            archive: tar.gz
+            backend: metal
+            features: metal
           - label: x86_64-windows-cuda
             runner: windows-large-x64
             platform: windows
             triple: x86_64-pc-windows-msvc
             archive: zip
             backend: cuda
-            # The toolkit step below installs 12.9.1, so this must be the 12
-            # ABI: `cudaGraphAddNode` takes five parameters in libcudart.so.12
-            # and six in .so.13, and a mismatch segfaults inside the driver
-            # rather than returning an error. This read `engine-cuda`, which
-            # resolved to `cuda-13` three manifests away.
-            features: engine-cuda-12
+            # `pie`'s only NVIDIA feature; the ABI it pins (13.x, in
+            # `engine-cuda`'s cudarc line) must agree with the toolkit
+            # installed below. `cudaGraphAddNode` takes five parameters in
+            # libcudart.so.12 and six in .so.13, and a mismatch segfaults
+            # inside the driver rather than returning an error.
+            features: cuda
             # nvcc builds one real+PTX arch; the PTX keeps the artifact
             # forward-JIT-able on newer NVIDIA GPUs.
             cuda_arch: "75"
@@ -166,7 +129,7 @@ jobs:
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '12.9.1'
+          cuda: '13.0.0'
 
       - name: Verify CUDA toolkit (windows cuda only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
@@ -230,14 +193,11 @@ jobs:
               rm -f /usr/bin/link /usr/bin/link.exe || true
             fi
           fi
-          # `release-min`: thin LTO, panic=abort, strip=symbols.
-          # Defined in workspace Cargo.toml. Smaller + faster than
-          # plain `release` (no LTO at all by default), without fat
-          # LTO's many-hour link cost. Distribution profile.
-          # the root package `pie` carries the `[[bin]] name = "pie"`; `worker`
-          # is a library. Building the worker here produced no binary at all,
-          # so the Package step below could only ever tar a file that did not
-          # exist.
+          # `release-min`: thin LTO and strip=symbols, defined in the
+          # workspace Cargo.toml. Smaller and faster than plain `release`
+          # (no LTO at all by default), without fat LTO's many-hour link
+          # cost. `-p pie` because the root package carries the
+          # `[[bin]] name = "pie"`; `worker` is a library.
           cargo build --profile release-min \
             --target ${{ matrix.target.triple }} \
             -p pie \
@@ -308,8 +268,10 @@ jobs:
         # builds ONE arch. The installer detects the GPU's compute capability
         # (nvidia-smi, or the PIE_CC override) and picks the matching asset.
         cuda:
-          - { version: "12.8.1", short: "12.8", feature: engine-cuda-12 }
-          - { version: "13.0.0", short: "13.0", feature: engine-cuda-13 }
+          # One row today (CUDA 12 was cut; the driver floor is r580), kept
+          # as a matrix axis rather than flattened, because the next CUDA
+          # major re-enters as a second row.
+          - { version: "13.0.0", short: "13.0", feature: cuda }
         target:
           # x86_64: Ampere (80/86), Ada (89), Hopper (90), Blackwell DC (100) + consumer (120).
           - { os_arch: x86_64,  cc: "80",  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
@@ -321,15 +283,6 @@ jobs:
           # aarch64: Grace-Hopper (90), Grace-Blackwell (100).
           - { os_arch: aarch64, cc: "90",  runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
           - { os_arch: aarch64, cc: "100", runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
-        exclude:
-          # Blackwell consumer (RTX 50) shipped in the CUDA-13/driver-580 era —
-          # no one pairs sm120 with a CUDA 12.8 runtime.
-          - cuda: { version: "12.8.1", short: "12.8", feature: engine-cuda-12 }
-            target: { os_arch: x86_64, cc: "120", runner: ubuntu-large-x64, triple: x86_64-unknown-linux-gnu }
-          # Grace-Blackwell (GB200) is a 2025/CUDA-13 platform — the
-          # arm64 × Blackwell × CUDA-12.8 intersection is empty.
-          - cuda: { version: "12.8.1", short: "12.8", feature: engine-cuda-12 }
-            target: { os_arch: aarch64, cc: "100", runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
     container: nvidia/cuda:${{ matrix.cuda.version }}-devel-rockylinux8
     env:
       ARTIFACT_NAME: pie-${{ matrix.target.os_arch }}-linux-cuda${{ matrix.cuda.short }}-sm${{ matrix.target.cc }}.tar.gz
@@ -399,14 +352,10 @@ jobs:
           # workspace Cargo.toml, which also records why `panic=abort` is
           # NOT among them.
           #
-          # `-p pie`, not `-p worker`. `worker` is a library with no `[[bin]]`
-          # target, so building it produced no `pie` and the Package step
-          # below could only ever tar whatever a restored cache had left in
-          # `release-min/` -- or fail. It read `-p pie-worker` until the
-          # restructure at `328a0da43` renamed the package. The desktop job
-          # above carries the same note for the same reason.
+          # `-p pie`, not `-p worker`: the root package carries the `[[bin]]`
+          # the Package step tars; `worker` is a library.
           #
-          # The CUDA ABI comes from the matrix, so the artifact's `cuda12.8`
+          # The CUDA ABI comes from the matrix, so the artifact's `cuda13.0`
           # label and the runtime it is compiled against are one value.
           cargo build --profile release-min \
             --target ${{ matrix.target.triple }} \

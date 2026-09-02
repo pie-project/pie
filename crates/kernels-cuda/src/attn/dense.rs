@@ -1,26 +1,5 @@
-//! `Dense`: bidirectional attention over the patch window — the vision
-//! towers' one real kernel (`.wiki/alto/multimodal.md` §2, ownership decided
-//! 2026-08-30).
-//!
-//! **A NEW FILE ON PURPOSE.** The paged family next door is the human's live
-//! area, and this op shares nothing with it but the word *attention*: no kv
-//! pool, no page tables, no append, no plan, no mask ladder, no log-sum-exp
-//! plane. Everything it needs is q, k, v, and the patch axis's own indptr —
-//! so it is a file of its own rather than an arm inside [`attn`](crate::attn),
-//! and the two can be read, changed and broken independently.
-//!
-//! **Where the module hangs, and why it is not `attn::dense`.** The design
-//! spells the op `attn::dense` and the FILE sits where it says
-//! (`src/attn/dense.rs`), but a child module can only be declared by its
-//! parent, and `src/attn.rs` is a file this wave may not touch. `lib.rs`
-//! re-homes the declaration with `#[path]` instead, so the module path is
-//! `kernels_cuda::attn_dense` until that seam reopens and the one line
-//! `pub mod dense;` can move into `attn.rs` where it belongs. Nothing else
-//! about the op changes when it does.
-//!
-//! One entry, one instantiation ladder, no workspace: see the unit's header
-//! for the online-softmax argument that makes the absence of scratch a
-//! property rather than an oversight.
+//! `Dense`: bidirectional attention over the patch window, the vision towers' one real kernel. Shares nothing with the paged attention family: no kv pool, page tables, append, plan, mask ladder or log-sum-exp plane — just q, k, v and the patch axis's own indptr.
+//! Module path is `kernels_cuda::attn_dense` via `#[path]` in `lib.rs`, standing in for `attn::dense` until `src/attn.rs` can declare it directly.
 
 use crate::attn::kv;
 use crate::error::Error;
@@ -58,28 +37,12 @@ fn stamp_for(head_dim: u32) -> Option<u32> {
     STAMPS.into_iter().find(|stamp| head_dim <= *stamp)
 }
 
-/// **BIDIRECTIONAL DENSE ATTENTION, BLOCK-DIAGONAL PER IMAGE.**
+/// Bidirectional dense attention, block-diagonal per image.
 ///
-/// `q`, `k` and `v` are patch rows — `[patch_rows, heads * head_dim]`, bf16 —
-/// and `o` lands one row per query row at q's own shape. `segments` is the
-/// patch axis's indptr (`i32`, `[images + 1]`): row `n` attends to the rows
-/// of the image whose span contains it, in both directions, and to nothing
-/// else. A row past the last span is a rung's padding and lands zeros.
+/// `q`, `k`, `v` are patch rows (`[patch_rows, heads * head_dim]`, bf16); `o` lands one row per query row at q's own shape. `segments` is the patch axis's indptr (`i32`, `[images + 1]`): row `n` attends both ways to the rows of the image whose span contains it; a row past the last span lands zeros.
+/// `sm_scale` is the caller's, unvalidated. Grouped heads: `k`/`v` may spell fewer heads than `q` as long as the counts divide.
 ///
-/// `sm_scale` is the caller's, as everywhere else in this plane — the towers
-/// state `1 / sqrt(head_dim)` and a checkpoint that states something else is
-/// obeyed rather than second-guessed.
-///
-/// Grouped heads are supported by reading, not expanding: `k`/`v` may spell
-/// fewer heads than `q` as long as the counts divide.
-///
-/// # Errors
-///
-/// [`Error::DtypeUnsupported`] for anything but bf16; a refusal for a row
-/// width that does not divide by the stated head width, a head wider than
-/// the widest stamp, query heads that do not divide by kv heads, a segment
-/// list that is not an `i32` indptr of at least one image, or an output
-/// rectangle that is not q's.
+/// Errs [`Error::DtypeUnsupported`] for anything but bf16, or a refusal for a mismatched row/head width, ungrouped heads, a bad segment list, or an output rectangle that isn't q's.
 pub fn bidirectional(
     ctx: &Ctx,
     q: Tensor,
@@ -116,7 +79,6 @@ pub fn bidirectional(
             ),
         ));
     }
-    // The named refusals above judge the plan-visible geometry; these two are
     // the landing contract, checked only once the plan itself is admissible.
     debug_assert!(
         o.rows == q.rows && o.width == q.width && o.dtype == q.dtype,
@@ -130,9 +92,7 @@ pub fn bidirectional(
     let images = kv::lanes_of(OP, segments)?;
     let rows = count(OP, "the patch rows this attention answers", q.rows)?;
 
-    // q's row, plus one accumulator plane and two folding words per warp.
-    // The whole workspace, and it is shared memory — the fire path allocates
-    // nothing (design Article 7).
+    // q's row, plus one accumulator plane and two folding words per warp; the whole workspace, all shared memory.
     let floats = head_width.saturating_mul(WARPS + 1).saturating_add(2 * WARPS);
     let smem = floats
         .checked_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4))

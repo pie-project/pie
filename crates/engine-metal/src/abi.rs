@@ -1,95 +1,6 @@
-//! `DescriptorAbi`, discovered rather than declared (design §2's P8 field,
-//! `.wiki/palo/icb.md` §3).
-//!
-//! Design §2 lists `descriptor: DescriptorAbi` as "the ONE mutable channel
-//! into a recorded graph" and never says what is in it, because on the CUDA
-//! plane nothing could say: `kernels-cuda` builds its argument bytes inside
-//! `ctx.fire`, so which argument is an extent is the entry's private
-//! knowledge and build log 10 keyed an exec per `(rows, lanes)` vector
-//! instead. `kernels_metal::Encode::fire` hands the shell every argument as
-//! a value and every grid axis as a number, so the table is derivable — and
-//! this module derives it.
-//!
-//! # The component language lives in [`model_exec::law`]
-//!
-//! **THE PROSE THAT WAS HERE MOVED WITH THE TYPES** (seat wave B-law). Why
-//! the language has exactly three fitted forms, why the third one is a
-//! ceiling over the window's rows and not a generalisation, and why a probe
-//! is a LADDER rather than a bump, are all facts about the law language
-//! rather than about Metal — and the CUDA plane's `device::map` names the
-//! same components and refuses with the same reasons — so they are stated
-//! once, in the neutral crate, and this module is what supplies the samples:
-//!
-//! ```text
-//! Const  v                                   encoded once, never rewritten
-//! Affine v = base + Σ slope[k] · coord[k]     the windowed cut, the extent
-//! Ceil   v = mul · ⌈(α·rows + β) / div⌉       the TILING law
-//! ```
-//!
-//! What this module does is walk the same template many times against
-//! synthetic descriptors, [record](crate::record) each walk, and hand the
-//! differences to [`model_exec::law::fit`]:
-//!
-//! ```text
-//! probe    : a base composition, and one LADDER per direction —
-//!            base + 1·e_k, base + 2·e_k, ... base + L·e_k
-//! check    : a composition no probe visited, held out of every fit
-//!
-//! for each slot, for each grid axis and each argument:
-//!   equal across every sample of the arm   → a CONSTANT, encoded once
-//!   moved, and a line fits every sample     → Affine
-//!   moved, and a scaled ceiling over the
-//!     window's rows fits every sample       → Ceil
-//!   moved, and neither                      → Fault::Unaffine { slot, at }
-//! ```
-//!
-//! **A component matching neither law is still `Unaffine` by name.** The
-//! refusal did not get weaker; it got a second thing to try first.
-//!
-//! # Arms: a slot is one ENTRY and not one PIPELINE
-//!
-//! `kernels_metal::linear::gemm::act_x_wt` picks among THREE shader points on
-//! the window's rows — `dense_gemv_t_bfloat16` below `VECTOR_MAX_ROWS = 4`,
-//! `dense_gemm_t_bfloat16_bm_8_bk_64_bn_32` below `TILE_M = 32`, and
-//! `dense_gemm_t_bfloat16_bm_32_bk_32_bn_32` at or above it. 127 of
-//! qwen35-d0.8b's 465 slots do that. Build log 30 named them and left them
-//! out of the fit; here a slot that showed TWO points is fitted ONE TABLE PER
-//! ARM, and which arm runs is [`Pick::Rows`] — a threshold on the window's
-//! rows, bracketed to the row by the ladder that crosses it. That is the form
-//! the rebind shader can evaluate, which is the whole reason it is a
-//! threshold and not a lookup.
-//!
-//! **A SLOT THAT SHOWS ALL THREE IS REPORTED AND NOT FITTED.** [`bracket`]
-//! solves a threshold between two points and says so; a third makes it a
-//! lookup, which the rebind shader has no form for. Such a slot lands in
-//! [`Survey::unaffine`] naming the points it could not separate, and
-//! `descriptor_abi` excludes it from the re-derivation the same way it
-//! excludes a two-arm one. Whether a given probe ladder sees two points or
-//! three is a property of the row counts it stood at — a sweep that never
-//! goes below four rows never sees the vector point at all.
-//!
-//! # The coordinates, and how a live fire finds them
-//!
-//! The fit is written in a basis of REACHABLE DIRECTIONS ([`Axis`]) rather
-//! than in the descriptor's own `(rows, lanes)` per class, because a decode
-//! class's word says one token per lane and no batch can move its rows
-//! without moving its lanes. That basis is what a probe harness can step
-//! along; it is not what a fire carries. So the derivation also inverts it:
-//! [`Recipe`] is one linear functional per direction over the class table's
-//! own numbers, solved exactly at load and verified at every probe, and
-//! [`DescriptorAbi::coords_of`] is what turns a live composition into the
-//! coordinates every law is written in. The rebind shader evaluates the same
-//! recipe over the same packed bytes.
-//!
-//! # What the derivation does NOT cover, stated
-//!
-//! The walk skips a zero-row region's nodes (`model_exec::fire::walk` rule 1), so
-//! a composition with an empty window produces FEWER slots than one without.
-//! Every probe point here therefore holds every class, and the derived table
-//! is the FULL composition's — which is the point rather than a limitation:
-//! design §5's "all compositions live inside it" means the artifact holds
-//! every launch and a fire turns the absent ones off. What turns one off is
-//! [`SlotAbi::rows`] evaluating to zero, and the ICB is what acts on it.
+//! `DescriptorAbi`: derives the ICB rebind table (which arguments and grid
+//! axes move, and how) by probing a compiled artifact across many
+//! compositions and fitting a law per component.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -98,24 +9,9 @@ use model_exec::law::fit;
 use crate::error::{Fault, Result};
 use crate::record::{Arg, Point, Recording, Slot};
 
-// ─────────────────────────────────────────────────────────────────────────
-// The vocabulary — [`model_exec::law`], not this module's
-//
-// **THE LANGUAGE MOVED AND THE MODULE DOC ABOVE WENT WITH IT** (seat wave
-// B-law). `Law`, the basis it is written in (`Axis`), the inverse that reads
-// a class table back into that basis (`Recipe`), the place a law lives
-// (`At`) and the two search ceilings are the vocabulary the CUDA plane
-// speaks too — its `device::map::diff` names the same components and refuses
-// with the same reasons — so they live in the neutral crate and each shell
-// supplies only its recorder. What is left in this file IS the Metal
-// recorder: a `Recording` is an ICB encode capture, and everything below
-// turns a set of them into a table `icb::rebind` can lower.
-//
-// Two places changed their spelling and are NOT re-exported under the old
-// one, because a name that means two things is what this wave exists to
-// stop: `At::Lane` is `At::Grid` and `At::Group` is `At::Block`. A CUDA node
-// carries both numbers too, and "group" only reads as the threadgroup from
-// one of the two planes.
+// The law vocabulary (`Law`, `Axis`, `Recipe`, `At`) lives in
+// `model_exec::law`. This file is the Metal recorder: a `Recording` is an
+// ICB encode capture, turned below into a table `icb::rebind` can lower.
 pub use model_exec::law::fit::{MAX_NUMERATOR_SCALE, MAX_TILE};
 pub use model_exec::law::{At, Axis, Law, Recipe};
 
@@ -135,15 +31,13 @@ pub struct Arm {
 /// How a slot picks its arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pick {
-    /// One arm, always. What 338 of qwen35-d0.8b's 465 slots are.
+    /// One arm, always — most slots.
     Only,
-    /// Arm 0 below `at` rows of the window, arm 1 at or above it.
-    ///
-    /// **THE ARM SWITCH IS A THRESHOLD AND NOT A TABLE**, which is what lets
-    /// a shader evaluate it in two instructions. The number is BRACKETED
-    /// rather than assumed: the derivation refuses unless some ladder holds
-    /// the two consecutive row counts the switch happens between, so `at` is
-    /// the row it happens at and not an interval it happens inside.
+    /// Arm 0 below `at` rows of the window, arm 1 at or above it. A
+    /// threshold, not a table, so a shader can evaluate it in two
+    /// instructions. `at` is bracketed rather than assumed: the derivation
+    /// refuses unless some ladder holds the two consecutive row counts the
+    /// switch happens between.
     Rows {
         /// The first row count that takes arm 1.
         at: u32,
@@ -159,14 +53,11 @@ pub struct SlotAbi {
     pub region: u32,
     /// Which run of that region's window.
     pub run: u32,
-    /// The window's own row count, as a law.
-    ///
-    /// **THE ONE LAW THAT IS NOT A COMPONENT OF THE DISPATCH.** It decides
-    /// three things nothing else can: whether the slot runs at all (a zero
-    /// window is `walk`'s rule 1, and the ICB's `reset`), which arm it takes
-    /// ([`Pick::Rows`]), and what a tiling law divides ([`Law::Ceil`]).
-    /// Fitted like any other component and refused like any other component —
-    /// it is `Const` or `Affine`, never `Ceil`.
+    /// The window's own row count, as a law. Not a component of the
+    /// dispatch: it decides whether the slot runs at all, which arm it
+    /// takes ([`Pick::Rows`]), and what a tiling law divides
+    /// ([`Law::Ceil`]). Fitted like any other component, but always
+    /// `Const` or `Affine`, never `Ceil`.
     pub rows: Law,
     /// Every arm this slot was seen at, in first-sighting order.
     pub arms: Vec<Arm>,
@@ -212,9 +103,8 @@ impl SlotAbi {
     }
 }
 
-/// The table `.wiki/palo/icb.md` §3 calls the binding recipe and design §2
-/// calls `DescriptorAbi`: slot → which arguments and which grid axes move,
-/// how, and which shader they move under.
+/// The binding recipe: slot -> which arguments and which grid axes move, how,
+/// and under which shader.
 #[derive(Clone, Debug)]
 pub struct DescriptorAbi {
     /// The descriptor's own directions, in the order every `slope` is written
@@ -231,9 +121,8 @@ pub struct DescriptorAbi {
     /// live class table.
     pub recipe: Vec<Recipe>,
     /// The box the probes covered, per direction — `(min, max)` coordinate.
-    /// Not a fence: a law extrapolates by construction and the gates check
-    /// that it does. It is what a reader needs to know how far the evidence
-    /// reaches.
+    /// Not a fence (a law extrapolates by construction), just how far the
+    /// evidence reaches.
     pub probed: Vec<(i128, i128)>,
 }
 
@@ -311,10 +200,8 @@ impl DescriptorAbi {
     }
 
     /// Where a live composition sits in the basis every law is written in.
-    ///
-    /// **THIS IS THE FUNCTION THE REBIND SHADER IS A TRANSLATION OF.** The
-    /// host form is here so a test can diff the two, and the device form
-    /// reads the same coefficients out of the same packed bytes.
+    /// The host form of what the rebind shader evaluates on the device; kept
+    /// here so a test can diff the two.
     #[must_use]
     pub fn coords_of(&self, classes: &[(u32, u32)]) -> Vec<i128> {
         self.recipe.iter().map(|row| row.at(classes)).collect()
@@ -328,11 +215,9 @@ impl DescriptorAbi {
 
     /// Re-derive one slot's whole argument list at a point of the
     /// descriptor's space — what `icb::rebind` computes on the device, in
-    /// host arithmetic, so a test can diff the two.
-    ///
-    /// `None` for a slot index the table does not hold. A slot whose window
-    /// is empty at these coordinates answers `None` too, because the walk
-    /// would not have dispatched it at all.
+    /// host arithmetic, so a test can diff the two. `None` for a slot
+    /// index the table does not hold, or a slot whose window is empty at
+    /// these coordinates (the walk would not have dispatched it).
     #[must_use]
     pub fn slot_at(&self, slot: usize, coords: &[i128]) -> Option<Slot> {
         let abi = self.slots.get(slot)?;
@@ -350,8 +235,7 @@ impl DescriptorAbi {
                 At::Block(axis) => built.group[axis as usize] = value as u32,
                 // The recorder enumerates exactly the grid axes, the
                 // threadgroup axes and the arguments ([`read`]), so a Metal
-                // law table holds no entry, shared-memory or shape component
-                // and there is nothing here to restate.
+                // law table holds no entry, shared-memory or shape component.
                 At::Entry | At::Shared | At::Shape => {}
                 At::Arg { at: index, .. } => {
                     let arg = &mut built.args[index as usize];
@@ -402,14 +286,9 @@ fn read(slot: &Slot) -> Vec<(At, Option<i128>)> {
 }
 
 /// One base composition and the ladders that step away from it.
-///
-/// **A LADDER, NOT A BUMP, AND THAT IS THE WHOLE OF WHAT THE THIRD LAW
-/// NEEDED.** `ladders[k]` holds the walks at `base + 1·e_k`, `base + 2·e_k`,
-/// … so a component that is a staircase in direction `k` is SEEN as a
-/// staircase rather than as a constant that jumped once. The first rung is
-/// what the affine slope is read from; the rest is what a tiling law's
-/// divisor is solved against and what brackets an arm switch to the row it
-/// happens at.
+/// `ladders[k]` holds the walks at `base + 1·e_k`, `base + 2·e_k`, ... so a
+/// component that is a staircase in direction `k` is seen as one rather
+/// than a constant that jumped once.
 #[derive(Clone, Debug)]
 pub struct Probe {
     /// This probe's origin.
@@ -418,15 +297,10 @@ pub struct Probe {
     pub ladders: Vec<Vec<Recording>>,
 }
 
-/// Everything the derivation is fitted from and the one point it is verified
-/// at.
-///
-/// **ONE PROBE PER ARM REGION.** A slot whose entry picks its arm off the
-/// window is two law tables, and each of them has to be fitted from samples
-/// that are actually IN it — a ladder that never reaches 32 rows says nothing
-/// about the tile arm. So the harness supplies a base per region of the
-/// composition space it means to serve, each with its own ladders, and the
-/// fit refuses an arm no probe steps every direction inside.
+/// Everything the derivation is fitted from and the one point it is
+/// verified at. One probe per arm region: a slot whose entry picks its arm
+/// off the window is two law tables, each needing samples actually inside
+/// it, so the fit refuses an arm no probe steps every direction inside.
 #[derive(Clone, Debug)]
 pub struct Probes {
     /// The probes. The FIRST one's base is the origin of the coordinates and
@@ -458,16 +332,9 @@ impl Probes {
     }
 }
 
-/// The whole derivation's answer: the table that fitted, and every component
-/// that did not.
-///
-/// **A REFUSAL LIST IS A DELIVERABLE**, which is why this exists beside
-/// [`derive`]. `.wiki/palo/icb.md` §7 step 2's gate is "the derived table over
-/// the whole catalog, with `Fault::Unaffine` naming anything that does not fit
-/// — the census is the deliverable even if it is a refusal list", and a
-/// fail-fast derivation can only ever name the first one. So the survey fits
-/// every component it can, keeps the ones that did not as faults, and leaves
-/// the caller to decide whether a table with a tail is a table.
+/// The whole derivation's answer: the table that fitted, and every
+/// component that did not — a census over the whole catalog, useful even
+/// as a refusal list, which a fail-fast derivation can't produce.
 #[derive(Debug)]
 pub struct Survey {
     /// The components that fitted, as a table.
@@ -601,9 +468,8 @@ pub fn survey(axes: &[Axis], probes: &Probes) -> Result<Survey> {
     }
 
     let armed = structure(&every)?;
-    // The neutral inverter verifies its answer against every probe, so it
-    // is handed the pairs and not the recordings: a `(class table, the point
-    // the harness placed that walk at)` is all the check reads.
+    // The neutral inverter verifies its answer against every probe, so it's
+    // handed the pairs, not the recordings.
     let sites: Vec<fit::Site<'_>> = every
         .iter()
         .map(|walk| (walk.classes.as_slice(), walk.coords.as_slice()))
@@ -626,7 +492,6 @@ pub fn survey(axes: &[Axis], probes: &Probes) -> Result<Survey> {
         })
         .collect();
 
-    // Every sample, as `(coords, window rows, the slot at that index)`.
     let samples: Vec<&Recording> = every.clone();
 
     let mut unaffine = Vec::new();
@@ -666,8 +531,7 @@ fn fit_slot(
     unaffine: &mut Vec<Fault>,
 ) -> (SlotAbi, Option<u32>) {
     let here = samples[0].slots[index].clone();
-    // 1. The window's rows, over EVERY sample: the one law that is not a
-    //    component of the dispatch and the one every other law leans on.
+    // 1. The window's rows, over every sample.
     let rows_points: Vec<(Vec<i128>, i128)> = samples
         .iter()
         .map(|walk| {
@@ -724,7 +588,7 @@ fn fit_slot(
         }
     };
 
-    // 4. One law table per arm, fitted from the samples that are IN it.
+    // 4. One law table per arm, fitted from the samples that are in it.
     let mut arms = Vec::with_capacity(points.len());
     for point in &points {
         let mine: Vec<&&Recording> = samples
@@ -794,11 +658,9 @@ fn fit_slot(
 }
 
 /// The row count an arm switch happens at, and the arms in threshold order.
-///
-/// **BRACKETED OR REFUSED.** The switch is a threshold on the window's rows
-/// only if the two arms' row counts do not interleave, and it is a KNOWN
-/// threshold only if some ladder holds the two consecutive counts it happens
-/// between. Anything else names the interval it could not close.
+/// Bracketed or refused: it's a threshold on the window's rows only if the
+/// two arms' row counts don't interleave, and known only if some ladder
+/// holds the two consecutive counts it happens between.
 fn bracket(
     samples: &[&Recording],
     index: usize,
@@ -841,21 +703,13 @@ fn bracket(
     Ok((high.0, ordered))
 }
 
-/// Every probe walked the same template, slot for slot.
-///
-/// This is the claim `.wiki/palo/icb.md` §6 rests on, checked before anything
-/// is fitted. Two things can go wrong and they are not the same thing:
-///
-/// - **A different NUMBER of slots, or a different argument arity or kind at
-///   one.** No single indirect command buffer serves both compositions and
-///   the exec key has not collapsed — refused.
-/// - **The same slot at a different shader POINT.** A kernel entry that picks
-///   its arm off the window (`linear::gemm`'s three-rung ladder is the live
-///   one) hands one slot several pipelines. That is survivable — a compute
-///   ICB slot's pipeline state is rebindable from the GPU, measured — so it
-///   is REPORTED rather than refused, fitted one table per arm, and picked
-///   between by a threshold on the window's rows. Two points bracket to a
-///   threshold; three do not, and are reported as unaffine instead.
+/// Every probe walked the same template, slot for slot. Checked before
+/// anything is fitted. A different number of slots (or arity/kind) means
+/// no single ICB serves both compositions — refused. The same slot at a
+/// different shader point is survivable — a compute ICB slot's pipeline
+/// state is rebindable from the GPU — so it's reported rather than
+/// refused, fitted one table per arm and picked by a threshold on the
+/// window's rows.
 fn structure(every: &[&Recording]) -> Result<Vec<Armed>> {
     let first = every[0];
     let mut armed: Vec<Armed> = Vec::new();

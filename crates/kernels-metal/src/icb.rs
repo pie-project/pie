@@ -1,44 +1,9 @@
-//! The indirect-command-buffer plane's one shader, and the layout its tables
-//! travel in.
-//!
-//! **THIS MODULE IS NOT A KERNEL ENTRY.** Every other point in this crate is
-//! called by a `Dispatch*` arm through [`Encode::fire`](crate::Encode::fire)
-//! and computes a model. `icb/rebind.metal` computes the COMMANDS: it reads a
-//! fire descriptor and a lowered `DescriptorAbi` and rewrites an
-//! `MTLIndirectCommandBuffer` in place, so a Metal fire is a descriptor write
-//! and one `executeCommandsInBuffer:` with no host walk between them
-//! (`.wiki/palo/icb.md` §2, §7 step 4). It is seated here rather than in the
-//! shell for the reason every other shader is: **the source text lives beside
-//! the crate that ships shaders**, and `engine-metal` compiles it through the
-//! same `Pipelines` door as `sdpa_paged_tiled`.
-//!
-//! # The bytes are the interface
-//!
-//! What the shell lowers and what the shader reads are one layout, and this
-//! module is the host half of it — `#[repr(C)]` rows whose field order,
-//! widths and padding are the `struct`s at the top of `icb/rebind.metal`,
-//! line for line. That is the same doctrine `driver::fire::descriptor`
-//! states for the descriptor itself and for the same reason: a layout
-//! written twice is a layout that drifts, and the drift shows up as a wrong
-//! grid rather than as a compile error.
-//!
-//! Sizes and alignments are asserted at compile time below, because "these
-//! two structs agree" is the whole claim.
-//!
-//! # What a law is
-//!
-//! Three forms, and they are `engine_metal::abi::Law`:
-//!
-//! ```text
-//! kind 0  const   v
-//! kind 1  affine  v = base + Σ slope[k]·coord[k]
-//! kind 2  ceil    v = mul · ⌈(α·rows + β) / div⌉
-//! ```
-//!
-//! `coord` is not in the descriptor; it is read out of the descriptor's class
-//! table by one solved linear functional per direction ([`KONST`] and
-//! [`COEFF`] name where those live). `rows` is the window's own row count,
-//! which is a law of the first two kinds and is evaluated first.
+//! The indirect-command-buffer plane's one shader, and the layout its
+//! tables travel in. `icb/rebind.metal` rewrites an `MTLIndirectCommandBuffer`
+//! in place from a fire descriptor, so a Metal fire is a descriptor write
+//! and one `executeCommandsInBuffer:`. The `#[repr(C)]` rows here are the
+//! host half of that layout — field order, widths and padding must match
+//! the shader's structs line for line (checked at compile time below).
 
 /// The shader file, as a [`Fire`](crate::Fire) names it.
 pub const FILE: &str = "icb/rebind.metal";
@@ -46,12 +11,8 @@ pub const FILE: &str = "icb/rebind.metal";
 /// The entrypoint.
 pub const ENTRYPOINT: &str = "icb_rebind";
 
-/// How many probe directions a lowered law table may carry.
-///
-/// Four rather than three because the live basis has three
-/// (`a decode lane | a prefill lane of 8 tokens | one more prefill token`)
-/// and a fixed array in the shader has to be stated. A basis wider than this
-/// is a named refusal in the lowering, not a silent truncation.
+/// How many probe directions a lowered law table may carry. A basis wider
+/// than this is a named refusal in the lowering, not a silent truncation.
 pub const MAX_AXES: usize = 4;
 
 /// How many distinct pipelines one artifact's arms may name.
@@ -360,10 +321,8 @@ pub fn bytes_of<T: Copy>(rows: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), std::mem::size_of_val(rows)) }
 }
 
-// **THE ONE CLAIM THIS MODULE MAKES**, asserted rather than trusted: the host
-// rows are the shader's structs. A field added on one side and not the other
-// moves a size and fails here, at compile time, instead of moving a grid and
-// failing in a token.
+// The host rows are the shader's structs: a field added on one side and not
+// the other moves a size and fails here, at compile time.
 const _: () = {
     assert!(size_of::<Plan>() == 32);
     assert!(size_of::<LawRow>() == 104);
