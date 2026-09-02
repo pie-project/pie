@@ -479,6 +479,11 @@ def build_config(args: argparse.Namespace):
         model=ModelConfig(
             name="default",
             hf_repo=resolved_model,
+            # `[model] device_weight_budget` / `host_weight_budget`: the
+            # residency lever (what stays on the device, what streams). Metal
+            # derives them from the working set when unset.
+            device_weight_budget=getattr(args, "device_weight_budget", None),
+            host_weight_budget=getattr(args, "host_weight_budget", None),
             engine=EngineConfig(
                 type=args.engine,
                 device=device,
@@ -1439,6 +1444,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--max-forward-requests", type=int,
                         default=PIE_MAX_FORWARD_REQUESTS_DEFAULT)
         sp.add_argument("--worker-threads", type=int, default=None)
+        sp.add_argument("--device-weight-budget", default=None,
+                        help="[model] device_weight_budget, e.g. 20GiB (metal residency)")
+        sp.add_argument("--host-weight-budget", default=None,
+                        help="[model] host_weight_budget, e.g. 8GiB")
         # `choices.values()` can yield the same parser under an alias, and
         # `common.py` registers some of these already; a duplicate
         # add_argument raises. Guard EACH flag by its own option string --
