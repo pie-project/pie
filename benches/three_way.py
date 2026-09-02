@@ -45,13 +45,14 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-MLX_PY = os.path.expanduser("~/.cache/pie-metal/mlxenv/bin/python")
+MLX_PY = os.environ.get("MLX_PY", os.path.expanduser("~/.cache/pie-metal/mlxenv/bin/python"))
 # `/tmp` does not survive a reboot, and on a machine whose GPU wedges often
 # enough to need one that is a weekly event. Fall back to the MLX env, which
 # is the only interpreter here guaranteed to be new enough for pie_bench's
 # `tomllib`; a missing venv should not read as "pie scored nothing".
-PIE_PY = ("/tmp/pievenv/bin/python"
-          if os.path.exists("/tmp/pievenv/bin/python") else MLX_PY)
+# `PIE_PY` / `MLX_PY` in the environment name the interpreters outright.
+PIE_PY = os.environ.get("PIE_PY", "/tmp/pievenv/bin/python"
+         if os.path.exists("/tmp/pievenv/bin/python") else MLX_PY)
 
 
 def run_json(cmd: list[str], env: dict[str, str] | None = None) -> dict | None:
@@ -115,7 +116,10 @@ def shape_args(shape: str, n: int, conc: int, max_tokens: int) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--mlx-model", required=True, help="MLX checkpoint dir (pie and mlx-lm)")
+    ap.add_argument("--mlx-model", required=True, help="MLX checkpoint dir (mlx-lm; pie too unless --pie-model)")
+    ap.add_argument("--pie-model", default=None,
+                    help="What pie serves: a stamped `.zt` artifact (the store's, "
+                         "since a v3 runtime serves artifacts) — defaults to --mlx-model.")
     ap.add_argument("--gguf", required=True, help="GGUF file (llama.cpp)")
     ap.add_argument("--label", required=True)
     ap.add_argument("--inferlet-dir", default=str(ROOT.parent / "tests/inferlets/text-completion-bench"))
@@ -130,6 +134,12 @@ def main() -> None:
     ap.add_argument("--max-model-len", type=int, default=16384,
                     help="llama.cpp splits this across its parallel slots, so it "
                          "has to cover the widest prompt times the concurrency.")
+    ap.add_argument("--pie-extra", default="",
+                    help="Space-separated flags forwarded to pie_bench only "
+                         "(`--total-pages`, `--max-forward-requests`: the Metal "
+                         "engine derives its fleet from the page pool, and the "
+                         "shared `--max-model-len` times the fleet is what it "
+                         "has to fit).")
     ap.add_argument("--out", default=None)
     ap.add_argument("--extra", default="",
                     help="Space-separated flags forwarded to all three harnesses "
@@ -141,8 +151,9 @@ def main() -> None:
 
     prompt = ["--prompt", " ".join(["the quick brown fox jumps over the lazy dog"] *
                                    max(1, args.prompt_words // 9))] if args.prompt_words else []
-    common = ["--model", args.mlx_model, "--no-ignore-eos", "--warmup", str(args.warmup)]
+    common = ["--no-ignore-eos", "--warmup", str(args.warmup)]
     common += args.extra.split() if args.extra else []
+    model_of = {"pie": args.pie_model or args.mlx_model, "mlx": args.mlx_model, "llamacpp": args.mlx_model}
     gguf_size = os.path.getsize(args.gguf) / (1 << 30)
 
     rows = []
@@ -152,15 +163,17 @@ def main() -> None:
         for engine in args.engines.split(","):
             for rep in range(args.repeats):
                 print(f"  {args.label} {spec} {engine} rep{rep}", flush=True)
+                run = base + ["--model", model_of[engine]]
                 if engine == "pie":
-                    cmd = [PIE_PY, "pie_bench.py"] + base + [
+                    cmd = [PIE_PY, "pie_bench.py"] + run + [
                         "--engine", "metal", "--inferlet-dir", args.inferlet_dir]
+                    cmd += args.pie_extra.split() if args.pie_extra else []
                     env = {"PYTHONPATH": f"{ROOT.parent}/sdk/client/python/src:"
                                          f"{ROOT.parent}/sdk/server/python/python"}
                 elif engine == "mlx":
-                    cmd, env = [MLX_PY, "mlx_bench.py"] + base, None
+                    cmd, env = [MLX_PY, "mlx_bench.py"] + run, None
                 else:
-                    cmd = [MLX_PY, "llamacpp_bench.py"] + base + [
+                    cmd = [MLX_PY, "llamacpp_bench.py"] + run + [
                         "--server-bin", shutil.which("llama-server") or "llama-server",
                         "--gguf-model", args.gguf, "--port", "8099",
                         "--max-model-len", str(args.max_model_len)]
