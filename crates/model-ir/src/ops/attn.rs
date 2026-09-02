@@ -310,6 +310,7 @@ pub enum Attention {
         heads: u32,
         head_dim: u32,
         norm_eps: f32,
+        gate_floor: f32,
         y: ValueId,
     },
     SsmKdaChunked {
@@ -322,6 +323,7 @@ pub enum Attention {
         heads: u32,
         head_dim: u32,
         norm_eps: f32,
+        gate_floor: f32,
         y: ValueId,
     },
 

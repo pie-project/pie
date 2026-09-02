@@ -337,3 +337,4 @@ fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
     );
 }
 
+impl model_exec::DispatchProbe for MockDispatch {}

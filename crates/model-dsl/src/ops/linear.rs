@@ -205,6 +205,36 @@ pub fn moe_topk_sigmoid(
     r.push(
         Linear::MoeTopkSigmoid {
             logits: logits.id(),
+            bias: None,
+            experts,
+            top_k,
+            renormalize,
+            scaling,
+            routes: routes.id(),
+            weights: weights.id(),
+        },
+        &[logits],
+    );
+    (routes, weights)
+}
+
+/// Sigmoid routing where a per-expert bias steers the choice only: the
+/// picked weights are the sigmoid scores, renormalized and scaled.
+pub fn moe_topk_sigmoid_biased(
+    logits: &Value,
+    bias: &Weight,
+    experts: u32,
+    top_k: u32,
+    renormalize: bool,
+    scaling: f32,
+) -> (Value, Value) {
+    let r = logits.rec();
+    let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
+    let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
+    r.push(
+        Linear::MoeTopkSigmoid {
+            logits: logits.id(),
+            bias: Some(r.weight(bias)),
             experts,
             top_k,
             renormalize,

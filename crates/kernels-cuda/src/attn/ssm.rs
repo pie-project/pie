@@ -766,6 +766,7 @@ impl Kda {
         dt_bias: Tensor,
         a_log: Tensor,
         norm_eps: f32,
+        gate_floor: f32,
     ) -> Result<KdaStaged, Error> {
         /// q, k, v — the prep's grid-y axis.
         const PLANES: u32 = 3;
@@ -793,6 +794,7 @@ impl Kda {
                 ArgValue::Ptr(staged.k_norm),
                 ArgValue::Ptr(staged.v),
                 stated(op, self.width)?.arg(),
+                stated(op, self.head_dim)?.arg(),
                 norm_eps.arg(),
                 // ctx.stage(): the region's live-rows word, or ABSENT.
                 ctx.stage(),
@@ -814,13 +816,29 @@ impl Kda {
                 stated(op, self.n)?.arg(),
                 stated(op, self.heads)?.arg(),
                 stated(op, self.head_dim)?.arg(),
-                0.0_f32.arg(), // the decay's lower bound, unbounded here
+                gate_floor.arg(), // the decay's lower bound; zero leaves it unbounded
                 // ctx.stage(): the region's live-rows word, or ABSENT.
                 ctx.stage(),
             ],
         )?;
         Ok(staged)
     }
+}
+
+
+/// The KDA kernels keep the recurrent state in f32; a slab declared narrower
+/// would be written past its end.
+fn f32_state(op: &'static str, state: &RecurrentPool) -> Result<(), Error> {
+    if state.slab.dtype != Dtype::F32 {
+        return Err(refuse(
+            op,
+            format!(
+                "the KDA recurrence keeps an f32 state and this cache row is declared {:?}",
+                state.slab.dtype
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -835,6 +853,7 @@ pub fn kda_step(
     heads: u32,
     head_dim: u32,
     norm_eps: f32,
+    gate_floor: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_step";
@@ -846,8 +865,9 @@ pub fn kda_step(
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
+    f32_state(OP, state)?;
     seated(OP, state, "ssm_kda_step_batched", false, false, false)?;
-    let staged = shape.stage(ctx, OP, mixed, f, b, dt_bias, a_log, norm_eps)?;
+    let staged = shape.stage(ctx, OP, mixed, f, b, dt_bias, a_log, norm_eps, gate_floor)?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::ssm_kda_step_batched").apply(
@@ -885,6 +905,7 @@ pub fn kda_chunked(
     heads: u32,
     head_dim: u32,
     norm_eps: f32,
+    gate_floor: f32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_chunked";
@@ -898,8 +919,9 @@ pub fn kda_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Kda::of(OP, mixed.data, f, b, y, heads, head_dim)?;
     let lanes = requests(OP, mixed)?;
+    f32_state(OP, state)?;
     seated(OP, state, "ssm_kda_chunked_batched", false, false, false)?;
-    let staged = shape.stage(ctx, OP, mixed.data, f, b, dt_bias, a_log, norm_eps)?;
+    let staged = shape.stage(ctx, OP, mixed.data, f, b, dt_bias, a_log, norm_eps, gate_floor)?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::ssm_kda_chunked_batched").apply(

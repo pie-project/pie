@@ -819,7 +819,7 @@ __global__ void moe_matmul_select_mxfp4(
 // `group_hits` are the streamed seat, both `nullptr` for a resident bank —
 // and the base cell's THIRD pointer is this kernel's, see `MoeGroupBases`.
 // The staged-geometry seat is the twin's too, `top_k` and all.
-template <class T, int kRowsT>
+template <class T, int kBits, int kGroup, int kRowsT>
 __global__ void moe_matmul_select_mlxu4(
     const T* __restrict__ act,
     const i32* __restrict__ routes,
@@ -836,6 +836,9 @@ __global__ void moe_matmul_select_mlxu4(
     const u32* __restrict__ win)
 {
     constexpr int kRows = kRowsT;
+    constexpr int kPerWord = 32 / kBits;
+    constexpr unsigned kMask = (1u << kBits) - 1u;
+    constexpr int kWordsPerGroup = kGroup / kPerWord;
     const int route = blockIdx.x;
     // The staged-geometry seat, in ROUTE space off a pair written in TOKEN
     // space: `moe_matmul_select_mxfp4`'s conversion above, same grid, same
@@ -852,8 +855,8 @@ __global__ void moe_matmul_select_mlxu4(
 
     moe_note_group(group_hits);
 
-    const int groups_per_row = k / 64;
-    const int words_per_row = k / 8;
+    const int groups_per_row = k / kGroup;
+    const int words_per_row = k / kPerWord;
 
     const u8* codes_at = codes;
     const u8* scales_at = scales;
@@ -866,7 +869,7 @@ __global__ void moe_matmul_select_mlxu4(
     }
 
     const unsigned* w32 = reinterpret_cast<const unsigned*>(
-        codes_at + static_cast<long long>(expert) * n * (k / 2));
+        codes_at + static_cast<long long>(expert) * n * words_per_row * 4);
     const bf16* s16 = reinterpret_cast<const bf16*>(
         scales_at + static_cast<long long>(expert) * n * groups_per_row * 2);
     const bf16* b16 = reinterpret_cast<const bf16*>(
@@ -892,26 +895,25 @@ __global__ void moe_matmul_select_mlxu4(
         float xsum = 0.f;
 
 #pragma unroll
-        for (int q = 0; q < 8; ++q) {
-            float xv[8];
+        for (int q = 0; q < kWordsPerGroup; ++q) {
+            float xv[kPerWord];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                xv[j] = Elem<T>::to_f32(x[g * 64 + q * 8 + j]);
+            for (int j = 0; j < kPerWord; ++j) {
+                xv[j] = Elem<T>::to_f32(x[g * kGroup + q * kPerWord + j]);
                 xsum += xv[j];
             }
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
                 const unsigned word =
-                    w32[static_cast<long long>(row_of[r]) * words_per_row + g * 8 + q];
+                    w32[static_cast<long long>(row_of[r]) * words_per_row
+                        + g * kWordsPerGroup + q];
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float code = static_cast<float>((word >> (4 * j)) & 0xFu);
+                for (int j = 0; j < kPerWord; ++j) {
+                    const float code = static_cast<float>((word >> (kBits * j)) & kMask);
                     part[r] = fmaf(code, xv[j], part[r]);
                 }
             }
         }
-        // xsum accumulated once per q-pass above counts every activation of
-        // the group exactly once across the eight words.
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
             const long long fx =

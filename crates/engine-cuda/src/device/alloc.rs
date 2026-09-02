@@ -805,3 +805,73 @@ pub fn free_bytes() -> Option<u64> {
         None
     }
 }
+
+/// Whether `at` names host memory (pinned or registered), as the runtime
+/// classifies it — `false` for device, managed and unknown addresses.
+#[must_use]
+pub fn is_host_pointer(at: u64) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+        // SAFETY: a zeroed attribute record the call fills; the query reads nothing else.
+        let mut attrs: rt::cudaPointerAttributes = unsafe { core::mem::zeroed() };
+        let asked = unsafe { rt::cudaPointerGetAttributes(&raw mut attrs, at as *const core::ffi::c_void) };
+        asked == rt::cudaError::cudaSuccess && attrs.type_ == rt::cudaMemoryType::cudaMemoryTypeHost
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = at;
+        false
+    }
+}
+
+/// Whether `stream` is inside a graph capture; host work is illegal there.
+#[must_use]
+pub fn is_capturing(stream: *mut core::ffi::c_void) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+        let mut status = rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
+        // SAFETY: a live stream handle and a local the query writes.
+        let asked = unsafe { rt::cudaStreamIsCapturing(stream.cast(), &raw mut status) };
+        asked == rt::cudaError::cudaSuccess && status != rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = stream;
+        false
+    }
+}
+
+/// A bare device allocation, `None` when the runtime refuses; the caller
+/// owns it and frees it with [`raw_free`].
+#[must_use]
+pub fn raw_alloc(bytes: usize) -> Option<u64> {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+        let mut fresh: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: a local the call fills.
+        let code = unsafe { rt::cudaMalloc(&raw mut fresh, bytes) };
+        (code == rt::cudaError::cudaSuccess && !fresh.is_null()).then_some(fresh as u64)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = bytes;
+        None
+    }
+}
+
+/// Frees an allocation [`raw_alloc`] made; a failure is ignored.
+pub fn raw_free(at: u64) {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+        // SAFETY: an address `raw_alloc` returned and nobody else freed.
+        let _ = unsafe { rt::cudaFree(at as *mut core::ffi::c_void) };
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = at;
+    }
+}

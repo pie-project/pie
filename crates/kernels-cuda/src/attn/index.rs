@@ -150,6 +150,7 @@ pub fn topk(
     heads: u32,
     head_dim: u32,
     top_k: u32,
+    ratio: u32,
     selection: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.index_topk";
@@ -217,6 +218,7 @@ pub fn topk(
             keys.page_size.arg(),
             max_kv.arg(),
             top_k.arg(),
+            count(OP, "the pooling ratio this ranking states", ratio.max(1))?.arg(),
             // Live-rows word when a body replay armed a stage, else ABSENT.
             ctx.stage(),
         ],

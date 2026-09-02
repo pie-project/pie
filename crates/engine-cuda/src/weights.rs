@@ -1045,6 +1045,15 @@ impl Weights {
         self.rotor.is_some()
     }
 
+    /// Whether routed experts are served off the host (T1/T2): such a fire
+    /// stages its routed experts on the eager path, which a body cannot bake.
+    #[must_use]
+    pub fn hosts_experts(&self) -> bool {
+        self.experts
+            .as_ref()
+            .is_some_and(|tier| tier.plan().host_image() > 0)
+    }
+
     /// The routed-expert tier this load opened, or `None` for a load whose
     /// banks are resident.
     #[must_use]
@@ -1228,6 +1237,8 @@ fn packed(
         Dtype::Mxfp4 => place.width,
         // Two codes to a byte; `plane_bytes` rounds the total up.
         Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => place.width.div_ceil(2),
+        // Four codes to a byte.
+        Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => place.width.div_ceil(4),
         Dtype::U8g64 => place.width,
         other => model_compiler::arena::elem_bytes(other)
             .and_then(|element| u32::try_from(element).ok())

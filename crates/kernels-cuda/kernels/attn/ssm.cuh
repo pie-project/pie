@@ -2055,53 +2055,41 @@ __global__ void ssm_kda_qkv_prep(
     float* __restrict__ q_out,
     float* __restrict__ k_out,
     float* __restrict__ v_out,
-    int width, float eps,
+    int width, int head_dim, float eps,
     const u32* __restrict__ win)
 {
+    // q and k are L2-normed PER HEAD, and q is scaled by head_dim^-1/2 (the
+    // reference recurrence's `scale`); v is widened as stored.
     const int n = blockIdx.x;
-    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
-    // was carved at a bucket retires its padded rows here, off a word the
-    // fire staged, not a parameter the recording baked.
     if (win != nullptr && n >= static_cast<int>(win[0])) return;
-    // And WHERE those rows begin: an armed seat's pointers are plane bases,
-    // so `win[1]` is the plane row this launch's first block owns. The mixed
-    // projection is one; the three planes it lands in are this fire's own
-    // scratch, which starts at its own zero.
     const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
-
     const int plane = blockIdx.y;
     const int tid = threadIdx.x;
-
     const ElemT* src =
         mixed + (long long)n_row * 3 * width + (long long)plane * width;
     float* dst =
         (plane == 0 ? q_out : (plane == 1 ? k_out : v_out)) +
         (long long)n * width;
-
     if (plane == 2) {
         for (int i = tid; i < width; i += BLOCK) {
             dst[i] = Elem<ElemT>::to_f32(src[i]);
         }
         return;
     }
-
-    float local = 0.f;
+    constexpr int kMaxHeads = 256;
+    __shared__ float sums[kMaxHeads];
+    const int heads = head_dim > 0 ? width / head_dim : 1;
+    for (int h = tid; h < heads && h < kMaxHeads; h += BLOCK) sums[h] = 0.f;
+    __syncthreads();
     for (int i = tid; i < width; i += BLOCK) {
         const float x = Elem<ElemT>::to_f32(src[i]);
-        local += x * x;
+        atomicAdd(&sums[(i / head_dim) % kMaxHeads], x * x);
     }
-
-    __shared__ float buf[BLOCK];
-    buf[tid] = local;
     __syncthreads();
-    for (int off = BLOCK / 2; off > 0; off >>= 1) {
-        if (tid < off) buf[tid] += buf[tid + off];
-        __syncthreads();
-    }
-    const float inv = rsqrtf(buf[0] + eps);
-
+    const float q_scale = (plane == 0) ? rsqrtf(static_cast<float>(head_dim)) : 1.f;
     for (int i = tid; i < width; i += BLOCK) {
-        dst[i] = Elem<ElemT>::to_f32(src[i]) * inv;
+        const float inv = rsqrtf(sums[(i / head_dim) % kMaxHeads] + eps);
+        dst[i] = Elem<ElemT>::to_f32(src[i]) * inv * q_scale;
     }
 }
 

@@ -151,6 +151,14 @@ pub const ROWS: &[Row] = &[
         vocab: 151_552,
         arch: "glm_moe_dsa",
     },
+    // GLM-5.3-Flash: 45 layers, the KDA/DSA cadence under mHC, text only
+    // (`model.visual.*` and the one `mtp` block unread).
+    Row {
+        id: "glm53-flash-u8g64-u2g64-kv-bf16",
+        layers: 45,
+        vocab: 154_880,
+        arch: "glm5_next",
+    },
     Row {
         id: "gptoss-20b-bf16-mxfp4-kv-bf16",
         layers: 24,

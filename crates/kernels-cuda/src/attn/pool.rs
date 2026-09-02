@@ -153,15 +153,16 @@ pub fn state_write(
     const OP: &str = "attention.pool_state_write";
     dtype_dispatch!(OP, kv.dtype, { Bf16 => () });
     let ratio = pooling_ratio(OP, ratio)?;
-    let coff = compressor_coff(ratio);
     let head_dim = count(OP, "the head width this compressor states", head_dim)?;
-    let width = head_dim * coff;
-    if kv.width != width.unsigned_abs() || score.width != width.unsigned_abs() {
+    // The projection's own width states the window: `head_dim` for one
+    // block per pool, `2 * head_dim` for the overlapping pair.
+    let width = count(OP, "the compressor's row width", kv.width)?;
+    if (width != head_dim && width != 2 * head_dim) || score.width != kv.width {
         return Err(refuse(
             OP,
             format!(
-                "a ratio-{ratio:?} compressor projects coff x head width = {width} \
-                 columns; the pair handed over is {} and {}",
+                "a ratio-{ratio:?} compressor projects head width {head_dim} or twice it; \
+                 the pair handed over is {} and {}",
                 kv.width, score.width
             ),
         ));
@@ -220,8 +221,23 @@ pub fn gather(
         ));
     }
     let ratio = pooling_ratio(OP, ratio)?;
-    let coff = compressor_coff(ratio);
     let head_dim = count(OP, "the head width this gather states", head_dim)?;
+    // The window's blocks: read off the `[ratio, coff * head_dim]` ape when
+    // one is stated, else the ratio's own default.
+    let coff = if ape.is_absent() {
+        compressor_coff(ratio)
+    } else {
+        match count(OP, "the ape's row width", ape.width)? {
+            w if w == head_dim => 1,
+            w if w == 2 * head_dim => 2,
+            w => {
+                return Err(refuse(
+                    OP,
+                    format!("an ape {w} wide is neither one head width ({head_dim}) nor two"),
+                ));
+            }
+        }
+    };
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::pool_gather_paged<::pie::bf16>")

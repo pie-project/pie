@@ -174,13 +174,20 @@ impl Run<'_> {
             ),
             Linear::MoeTopkSigmoid {
                 logits,
+                bias,
                 experts,
                 top_k,
                 renormalize,
                 scaling,
                 routes,
                 weights,
-            } => linear::moe::topk_sigmoid(
+            } => {
+                if bias.is_some() {
+                    return Err(kernels_metal::Error::Unsupported {
+                        op: "linear.moe_topk_sigmoid",
+                    });
+                }
+                linear::moe::topk_sigmoid(
                 self.ctx(),
                 self.tensor(*logits),
                 *experts,
@@ -189,7 +196,8 @@ impl Run<'_> {
                 *scaling,
                 self.tensor(*routes),
                 self.tensor(*weights),
-            ),
+            )
+            }
             Linear::MoePredictRoute {
                 logits,
                 bias,

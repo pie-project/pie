@@ -505,6 +505,7 @@ pub fn ssm_kda_step(
     heads: u32,
     head_dim: u32,
     norm_eps: f32,
+    gate_floor: f32,
 ) -> Value {
     let r = mixed.rec();
     let width = u64::from(heads) * u64::from(head_dim);
@@ -520,6 +521,7 @@ pub fn ssm_kda_step(
             heads,
             head_dim,
             norm_eps,
+            gate_floor,
             y: y.id(),
         },
         &[mixed, f, b],
@@ -537,6 +539,7 @@ pub fn ssm_kda_chunked(
     heads: u32,
     head_dim: u32,
     norm_eps: f32,
+    gate_floor: f32,
 ) -> Value {
     let r = mixed.rec();
     let width = u64::from(heads) * u64::from(head_dim);
@@ -552,6 +555,7 @@ pub fn ssm_kda_chunked(
             heads,
             head_dim,
             norm_eps,
+            gate_floor,
             y: y.id(),
         },
         &[mixed, f, b],

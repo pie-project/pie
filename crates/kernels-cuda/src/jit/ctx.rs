@@ -430,6 +430,17 @@ impl Ctx {
         if fire.launch.empty() {
             return Err(refuse(op, "the grid is empty"));
         }
+        if trace_fires() {
+            let now = std::time::Instant::now();
+            let gap = {
+                static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+                let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let gap = last.map_or(0, |at| now.duration_since(at).as_micros());
+                *last = Some(now);
+                gap
+            };
+            eprintln!("fire: {gap} {op} {}", fire.entrypoint);
+        }
         self.issue(op, &root, fire.entrypoint, fire.launch, args)
     }
 
@@ -548,4 +559,11 @@ mod tests {
         );
     }
 
+}
+
+/// `PIE_CUDA_TRACE_FIRES=1` prints every launch before it is issued — with
+/// `CUDA_LAUNCH_BLOCKING=1` the last line names a kernel that never returns.
+fn trace_fires() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIE_CUDA_TRACE_FIRES").is_some_and(|v| v == "1"))
 }

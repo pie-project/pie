@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod deepseek_v4;
 pub mod gemma_4;
 pub mod glm_5;
+pub mod glm_5_next;
 pub mod gpt_oss;
 pub mod kimi_k3;
 pub mod media;
@@ -116,6 +117,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         deepseek_v4::skus(),
         gemma_4::skus(),
         glm_5::skus(),
+        glm_5_next::skus(),
         gpt_oss::skus(),
         kimi_k3::skus(),
         qwen_3::skus(),

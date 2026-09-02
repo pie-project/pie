@@ -366,3 +366,5 @@ impl Sink for Recorder {
         self.events.push(Event::Join(event.0));
     }
 }
+
+impl crate::dispatch::DispatchProbe for MockDispatch<'_> {}

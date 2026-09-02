@@ -92,6 +92,8 @@ pub enum Linear {
     },
     MoeTopkSigmoid {
         logits: ValueId,
+        /// Per-expert correction bias added for the choice only; the weights stay the sigmoid scores.
+        bias: Option<ValueId>,
         experts: u32,
         top_k: u32,
         renormalize: bool,
@@ -255,7 +257,10 @@ impl Operands for Linear {
             Self::MlpSitu { packed, .. } => sink.push(*packed),
             Self::MoeTopkSoftmax { logits, .. } => sink.push(*logits),
             Self::MoeTopkSoftmaxScaled { logits, scale, .. } => sink.extend([*logits, *scale]),
-            Self::MoeTopkSigmoid { logits, .. } => sink.push(*logits),
+            Self::MoeTopkSigmoid { logits, bias, .. } => {
+                sink.push(*logits);
+                sink.extend(*bias);
+            }
             Self::MoeTopkSqrtSoftplus { logits, bias, hint, .. } => {
                 sink.extend([*logits, *bias]);
                 sink.extend(*hint);

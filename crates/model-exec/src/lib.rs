@@ -35,6 +35,6 @@ pub mod store;
 
 pub use dispatch::{
     Dispatch, DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise,
-    DispatchLayout, DispatchLinear,
+    DispatchLayout, DispatchLinear, DispatchProbe,
 };
 pub use error::{Error, KernelError, Result};

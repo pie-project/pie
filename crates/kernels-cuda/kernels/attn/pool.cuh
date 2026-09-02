@@ -361,8 +361,11 @@ __global__ void pool_state_write(
     int page_size,
     int state_pitch) {
     const int i = blockIdx.x;
-    const long long slot =
-        static_cast<long long>(w_page[i]) * page_size + w_off[i];
+    // A carved fire pads rows past the live ones with no cell to write.
+    const int page = static_cast<int>(w_page[i]);
+    const int off = static_cast<int>(w_off[i]);
+    if (page < 0 || off < 0 || off >= page_size) return;
+    const long long slot = static_cast<long long>(page) * page_size + off;
     const long long dst = slot * static_cast<long long>(state_pitch);
     const long long src = static_cast<long long>(i) * width;
     for (int d = threadIdx.x; d < width; d += blockDim.x) {

@@ -493,7 +493,12 @@ impl Run<'_> {
             } => mla::absorb_q(
                 self.ctx(),
                 self.tensor(*q_nope),
-                self.tensor(*kv_b),
+                self.dense_or_decoded(
+                    "attention.mla_absorb_q",
+                    *kv_b,
+                    heads * (nope_dim + v_head_dim),
+                    *kv_lora_rank,
+                )?,
                 *heads,
                 *kv_lora_rank,
                 *nope_dim,
@@ -511,7 +516,12 @@ impl Run<'_> {
             } => mla::absorb_out(
                 self.ctx(),
                 self.tensor(*latent),
-                self.tensor(*kv_b),
+                self.dense_or_decoded(
+                    "attention.mla_absorb_out",
+                    *kv_b,
+                    heads * (nope_dim + v_head_dim),
+                    *kv_lora_rank,
+                )?,
                 *heads,
                 *kv_lora_rank,
                 *v_head_dim,
@@ -821,6 +831,7 @@ impl Run<'_> {
                 heads,
                 head_dim,
                 norm_eps,
+                gate_floor,
                 y,
             } => attn::ssm::kda_step(
                 self.ctx(),
@@ -833,6 +844,7 @@ impl Run<'_> {
                 *heads,
                 *head_dim,
                 *norm_eps,
+                *gate_floor,
                 &mut self.tensor(*y),
             ),
             Attention::SsmKdaChunked {
@@ -845,6 +857,7 @@ impl Run<'_> {
                 heads,
                 head_dim,
                 norm_eps,
+                gate_floor,
                 y,
             } => attn::ssm::kda_chunked(
                 self.ctx(),
@@ -857,6 +870,7 @@ impl Run<'_> {
                 *heads,
                 *head_dim,
                 *norm_eps,
+                *gate_floor,
                 &mut self.tensor(*y),
             ),
             // ---- index ----
@@ -896,10 +910,8 @@ impl Run<'_> {
                 *rope_dim,
                 *theta,
             ),
-            // `index.cuh`'s `index_topk_paged` scans one key per token
-            // (`ratio == 1`); dsv4-flash's per-compressed-block ratio isn't a
-            // parameter this kernel takes, so the arm refuses rather than
-            // scoring cells nobody wrote.
+            // Pooled keys (`ratio > 1`) are read at their boundary cells and
+            // published as the pool's tokens, tail first.
             Attention::IndexTopk {
                 q,
                 weights,
@@ -909,23 +921,17 @@ impl Run<'_> {
                 top_k,
                 ratio,
                 selection,
-            } => {
-                if *ratio != 1 {
-                    return Err(kernels_cuda::Error::Unsupported {
-                        op: "attention.index_topk",
-                    });
-                }
-                index::topk(
-                    self.ctx(),
-                    self.ragged_lanes(*q),
-                    self.tensor(*weights),
-                    &self.pool(*keys),
-                    *heads,
-                    *head_dim,
-                    *top_k,
-                    &mut self.tensor(*selection),
-                )
-            }
+            } => index::topk(
+                self.ctx(),
+                self.ragged_lanes(*q),
+                self.tensor(*weights),
+                &self.pool(*keys),
+                *heads,
+                *head_dim,
+                *top_k,
+                *ratio,
+                &mut self.tensor(*selection),
+            ),
             // As `attention.mla_kv_append`.
             Attention::IndexKvAppend {
                 k,
@@ -972,10 +978,8 @@ impl Run<'_> {
                 &mut self.tensor(*boundary_req),
                 &mut self.tensor(*boundary_rope),
             ),
-            // The dsv4 compressor state has no IR seat; binds the shell's
-            // staged pooled slabs (`Run::slabs`). Known limitation: one
-            // plane per fire, not per pooled space, so two pooled layers
-            // would read the later layer's state in the earlier's gather.
+            // The dsv4 compressor state has no IR seat; binds the slabs the
+            // store staged for the gather's own space (`Run::slabs`).
             Attention::PoolGather {
                 boundary_pos,
                 boundary_req,
@@ -985,7 +989,7 @@ impl Run<'_> {
                 ratio,
                 entries,
             } => {
-                let slabs = self.slabs();
+                let slabs = self.slabs(*pages);
                 pool::gather(
                     self.ctx(),
                     self.tensor(*boundary_pos),
@@ -1008,7 +1012,7 @@ impl Run<'_> {
                 head_dim,
                 ratio,
             } => {
-                let slabs = self.slabs();
+                let slabs = self.slabs(*pages);
                 pool::state_write(
                     self.ctx(),
                     self.tensor(*kv),
@@ -1072,6 +1076,34 @@ impl Run<'_> {
             Attention::PoolLseSelected { .. } => Err(kernels_cuda::Error::Unsupported {
                 op: "attention.pool_lse_selected",
             }),
+        }
+    }
+}
+
+impl Run<'_> {
+    /// A weight an entry reads whole: the dense handle, or an affine bank
+    /// decoded to bf16 in fire scratch (`[n, k]`, resident planes only).
+    fn dense_or_decoded(
+        &self,
+        op: &'static str,
+        w: model_ir::ValueId,
+        n: u32,
+        k: u32,
+    ) -> Result<kernels_cuda::Tensor, kernels_cuda::Error> {
+        match self.maybe_planes(w) {
+            Some((codes, scales, biases, seat)) => kernels_cuda::linear::quant::decoded_plane(
+                self.ctx(),
+                op,
+                codes,
+                scales,
+                kernels_cuda::linear::quant::OffsetKind::Post,
+                biases,
+                model_ir::Dtype::Bf16,
+                n,
+                k,
+                seat,
+            ),
+            None => Ok(self.tensor(w)),
         }
     }
 }

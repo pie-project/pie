@@ -100,6 +100,20 @@ impl<'a> Builder<'a> {
 
     /// Read `w` via a stated expression. Every source it names must exist and
     /// agree on one stored representation.
+    /// One MLX affine bank stored a row at a time: `rows[i]` names the
+    /// `.weight` planes that fuse along the cut axis into row `i` of axis 0.
+    pub fn read_stack(
+        &mut self,
+        w: &Weight,
+        rows: impl IntoIterator<Item = Vec<String>>,
+    ) -> Result<(), Error> {
+        let w = &w.placed(self.platform);
+        self.whole_checkpoint(w)?;
+        let read = affine_stacked(self.src, w, rows.into_iter().collect())?;
+        self.tensors.extend(read);
+        Ok(())
+    }
+
     pub fn read_expr(&mut self, w: &Weight, expr: Expr) -> Result<(), Error> {
         let w = &w.placed(self.platform);
         self.whole_checkpoint(w)?;
@@ -461,6 +475,138 @@ fn affine_planes(
         // offsetting: the zero-point entry, names which weight it centres.
         factors(src, model_dsl::biases_name(&w.name), &biases, counted, axis)?
             .offsetting(w.name.clone()),
+    ])
+}
+
+/// [`affine_planes`] for a bank stored one row at a time: each row's parts
+/// fuse along the cut axis, and the rows stack on a new leading axis.
+fn affine_stacked(
+    src: &ztensor::Source,
+    w: &Weight,
+    rows: Vec<Vec<String>>,
+) -> Result<Vec<TensorContract>, Error> {
+    let illegible = |detail: String| Error::Illegible {
+        name: w.name.clone(),
+        detail,
+    };
+    let Encoding::Quant(QuantSpec {
+        scheme: QuantScheme::MlxAffineU4,
+        ..
+    }) = encoding(w.dtype)
+    else {
+        return Err(illegible(format!(
+            "it is {:?}, and only an MLX affine bank stacks from `.weight/.scales/.biases` rows",
+            w.dtype
+        )));
+    };
+    let declared = extents(w);
+    let pairing = scaling(w);
+    let counted = divided(&declared, pairing.channel_axis, pairing.group_size, &w.name);
+    let group = i64::from(pairing.group_size);
+    let mut codes = Vec::new();
+    let mut scales = Vec::new();
+    let mut biases = Vec::new();
+    let mut factor_stored: Option<Encoding> = None;
+    let mut row_shape: Option<Vec<i64>> = None;
+    for parts in &rows {
+        let axis = if parts.len() > 1 { pack_axis(w) } else { 0 };
+        let mut row_codes = Vec::new();
+        let mut row_scales = Vec::new();
+        let mut row_biases = Vec::new();
+        let mut shape: Option<Vec<i64>> = None;
+        for part in parts {
+            let stem = part.strip_suffix(".weight").ok_or_else(|| {
+                illegible(format!(
+                    "`{part}` holds MLX affine codes, whose scales and biases \
+                     are named beside a `.weight`, and it does not end in one"
+                ))
+            })?;
+            let mut leg = unpacked_extents(src, w, part)?;
+            leg.insert(0, 1);
+            let mut factor_shape = leg.clone();
+            let last = factor_shape.len() - 1;
+            if factor_shape[last] % group != 0 {
+                return Err(illegible(format!(
+                    "`{part}` contracts over {}, which is not a whole number of {group}-code blocks",
+                    factor_shape[last]
+                )));
+            }
+            factor_shape[last] /= group;
+            match &mut shape {
+                None => shape = Some(leg.clone()),
+                Some(joined) => {
+                    if joined.len() != leg.len() {
+                        return Err(illegible(format!(
+                            "its stored parts are rank {} and rank {}, and parts that join \
+                             into one row have one rank",
+                            joined.len(),
+                            leg.len()
+                        )));
+                    }
+                    let at = usize::from(axis);
+                    for (i, (into, part_extent)) in joined.iter_mut().zip(&leg).enumerate() {
+                        if i == at {
+                            *into += *part_extent;
+                        } else if *into != *part_extent {
+                            return Err(illegible(format!(
+                                "`{part}` differs at axis {i} ({into} against {part_extent}) \
+                                 from the part it joins on axis {at}"
+                            )));
+                        }
+                    }
+                }
+            }
+            row_codes.push(Expr::src(part.clone()).transmute(TensorType::new(leg, grouped(w))));
+            for (name, into) in [
+                (model_dsl::scales_name(stem), &mut row_scales),
+                (model_dsl::biases_name(stem), &mut row_biases),
+            ] {
+                let stored = stored_encoding(src, &name)?;
+                match &factor_stored {
+                    None => factor_stored = Some(stored.clone()),
+                    Some(first) if *first != stored => {
+                        return Err(illegible(format!(
+                            "`{name}` is stored {stored:?} and an earlier factor plane {first:?}; \
+                             one bank's factors share one representation"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+                into.push(Expr::src(name).transmute(TensorType::new(factor_shape.clone(), stored)));
+            }
+        }
+        let shape = shape.ok_or_else(|| illegible("a row is built from no checkpoint tensor".into()))?;
+        match &row_shape {
+            None => row_shape = Some(shape),
+            Some(first) if *first != shape => {
+                return Err(illegible(format!(
+                    "its rows are stored {first:?} and {shape:?}; the rows of one bank share one shape"
+                )));
+            }
+            Some(_) => {}
+        }
+        codes.push(joined(axis, row_codes));
+        scales.push(joined(axis, row_scales));
+        biases.push(joined(axis, row_biases));
+    }
+    let mut shape = row_shape.ok_or_else(|| illegible("it is built from no rows at all".into()))?;
+    shape[0] = i64::try_from(rows.len()).expect("a row count inside i64");
+    if shape != declared {
+        return Err(illegible(format!(
+            "the file stores it {shape:?} and this text declares it {declared:?}; a text reads \
+             the widths it states, so this row is not the one that reads this checkpoint"
+        )));
+    }
+    let stored = factor_stored.expect("a row names its factors");
+    let want = encoding(Dtype::Bf16);
+    let scales_name = model_dsl::scales_name(&w.name);
+    let biases_name = model_dsl::biases_name(&w.name);
+    let scales = ladder(&scales_name, joined(0, scales), &stored, &want)?;
+    let biases = ladder(&biases_name, joined(0, biases), &stored, &want)?;
+    Ok(vec![
+        TensorContract::inferred(w.name.clone(), joined(0, codes), grouped(w)),
+        TensorContract::new(scales_name, scales, counted.clone(), want.clone()).scaling(pairing),
+        TensorContract::new(biases_name, biases, counted, want).offsetting(w.name.clone()),
     ])
 }
 

@@ -380,7 +380,7 @@ impl FireCtx<'_> {
             plan_values: facts.plans.len(),
             tables: FireTables {
                 mask_indptr: handles.mask_indptr,
-                pool_state: None,
+                pool_state: self.pools.pool_slabs(),
             },
             // A seat only when somebody asked: a non-capturing fire pays nothing.
             scores: self
@@ -475,7 +475,10 @@ impl FireCtx<'_> {
             });
         }
         // A buffered fire and a rotating load are not graph-replayable: both walk.
-        let records = self.graphs.records() && !p.rs.buffered && !self.weights.rotating();
+        let records = self.graphs.records()
+            && !p.rs.buffered
+            && !self.weights.rotating()
+            && !self.weights.hosts_experts();
         let walked = if records {
             if self.arming && !p.bodied {
                 // A synthetic the gate refused: nothing to record, nothing worth running.
@@ -515,7 +518,10 @@ impl FireCtx<'_> {
             // An eager walk under a recording mode is counted.
             if self.graphs.records() {
                 self.cache
-                    .eager_walk(self.weights.rotating(), p.rs.buffered);
+                    .eager_walk(
+                        self.weights.rotating() || self.weights.hosts_experts(),
+                        p.rs.buffered,
+                    );
             }
             // The rotation rides the eager cursor.
             let mut cursor = Cursor::new(&place);

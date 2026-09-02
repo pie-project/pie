@@ -171,6 +171,7 @@ __global__ void index_topk_paged(
     float* __restrict__ scores,
     i32* __restrict__ selection,
     i32 R, i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk,
+    i32 ratio,
     const u32* __restrict__ win)
 {
     const int t = static_cast<int>(blockIdx.x);
@@ -199,18 +200,28 @@ __global__ void index_topk_paged(
     const int kv_len =
         (num_pages - 1) * page_size + static_cast<int>(kv_last_page_lens[r]);
     const int abs_q = kv_len - new_tokens + (t - qo_lo);
-    int nkeys = abs_q + 1;
-
-    if (nkeys > score_stride) nkeys = score_stride;
-    if (nkeys < 0) nkeys = 0;
+    // Pooled keys: the indexer's compressor pools one entry per `ratio`
+    // tokens and stores it at the boundary cell `(c+1)*ratio - 1`, so key `c`
+    // is read there and the published ids are that pool's tokens. The tokens
+    // after the last boundary (the incomplete tail, at most `ratio - 1` of
+    // them) are always selected first, so a token always sees itself.
+    // `ratio == 1` is one key per token, published as itself.
+    const int stride = (ratio > 0) ? ratio : 1;
+    const int total = abs_q + 1;
+    int npools = (total > 0) ? total / stride : 0;
+    int tail = (total > 0) ? total - npools * stride : 0;
+    if (tail > topk) tail = topk;
+    const int pool_budget = (topk - tail) / stride;
+    if (npools > score_stride) npools = score_stride;
 
     float* frow = scores + static_cast<long long>(t) * score_stride;
     const T* qi = idx_q + static_cast<long long>(t_row) * H * D;
     const T* wi = idx_w + static_cast<long long>(t_row) * H;
-    for (int j = tid; j < nkeys; j += kBlock) {
+    for (int j = tid; j < npools; j += kBlock) {
+        const int cell = (j + 1) * stride - 1;
         const int page =
-            static_cast<int>(kv_page_indices[pages_first + j / page_size]);
-        const int off = j % page_size;
+            static_cast<int>(kv_page_indices[pages_first + cell / page_size]);
+        const int off = cell % page_size;
         const T* kj =
             key_pages + (static_cast<long long>(page) * page_size + off) * D;
         float acc = 0.f;
@@ -224,14 +235,20 @@ __global__ void index_topk_paged(
     }
     __syncthreads();
 
-    if (nkeys <= topk) {
-        for (int n = tid; n < topk; n += kBlock) srow[n] = (n < nkeys) ? n : -1;
+    // The tail tokens lead the selection.
+    for (int i = tid; i < tail; i += kBlock) srow[i] = npools * stride + i;
+
+    if (npools <= pool_budget) {
+        for (int n = tid; n < topk - tail; n += kBlock) {
+            const int j = n / stride;
+            srow[tail + n] = (j < npools) ? j * stride + (n % stride) : -1;
+        }
         return;
     }
 
     __shared__ float red[kBlock];
     float lo_l = pos_inf(), hi_l = -pos_inf();
-    for (int j = tid; j < nkeys; j += kBlock) {
+    for (int j = tid; j < npools; j += kBlock) {
         lo_l = fminf(lo_l, frow[j]);
         hi_l = fmaxf(hi_l, frow[j]);
     }
@@ -251,19 +268,21 @@ __global__ void index_topk_paged(
         if (tid == 0) cnt_s = 0;
         __syncthreads();
         int c = 0;
-        for (int j = tid; j < nkeys; j += kBlock) if (frow[j] >= mid) c++;
+        for (int j = tid; j < npools; j += kBlock) if (frow[j] >= mid) c++;
         atomicAdd(&cnt_s, c);
         __syncthreads();
         const int cnt = cnt_s;
-        if (cnt > topk) lo = mid; else hi = mid;
+        if (cnt > pool_budget) lo = mid; else hi = mid;
         __syncthreads();
         thr = hi;
     }
 
     if (tid == 0) {
-        int n = 0;
-        for (int j = 0; j < nkeys && n < topk; ++j) {
-            if (frow[j] >= thr) srow[n++] = j;
+        int n = tail;
+        for (int j = 0; j < npools && n + stride <= topk; ++j) {
+            if (frow[j] >= thr) {
+                for (int i = 0; i < stride; ++i) srow[n++] = j * stride + i;
+            }
         }
         for (; n < topk; ++n) srow[n] = -1;
     }

@@ -4,12 +4,12 @@ pub mod kv;
 pub mod rs;
 
 use kernels_cuda::{KvPool, RecurrentPool, Tensor};
-use model_ir::{CacheRow, Dtype, Trace};
+use model_ir::{Attention, CacheRow, Def, Dtype, Operation, Trace};
 
 use crate::device::elastic::{self, Arena, Commit, PhysicalPool};
 use crate::error::{Fault, Result};
 use crate::settle::Airborne;
-use crate::run::{CachePool, CacheTable};
+use crate::run::{CachePool, CacheTable, PoolSlabs};
 use crate::store::kv::{Facts, Paging};
 
 /// Maps `model_exec::store` faults into this shell's `Fault` type.
@@ -284,6 +284,8 @@ pub struct Pools {
     /// One entry per cache row: declared planes for a kv row, one arena for a state row.
     rows: Vec<Vec<Arena>>,
     shapes: Vec<Shape>,
+    /// The dsv4 compressor state, one row per pooled cache space.
+    pooled: Vec<PoolRow>,
     paging: Paging,
     /// Whether the device is idle — the run-ahead counter. `trim` must not unmap while an unsettled step may still be reading the tail.
     airborne: Option<Airborne>,
@@ -388,10 +390,24 @@ impl Pools {
             }
             debug_assert_eq!(rows.len(), index + 1, "one arena set per cache row");
         }
+        let mut pooled = Vec::new();
+        for (space, width) in pooled_spaces(trace) {
+            let cells = paging.pages() * u64::from(paging.page_size);
+            let bytes = cells * width * u64::from(elem_size(POOL_STATE));
+            let planes = (0..2)
+                .map(|_| Arena::reserve(&pool, bytes, "bytes of a compressor state slab"))
+                .collect::<Result<Vec<Arena>>>()?;
+            pooled.push(PoolRow {
+                space,
+                width,
+                planes,
+            });
+        }
         Ok(Pools {
             pool,
             rows,
             shapes,
+            pooled,
             paging,
             airborne: None,
             committed_kv_pages: 0,
@@ -410,12 +426,45 @@ impl Pools {
         self.paging
     }
 
-    /// Every byte these pools may ever hold — the ceiling the address space was reserved at.
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
+    fn arenas(&self) -> impl Iterator<Item = &Arena> {
         self.rows
             .iter()
             .flatten()
+            .chain(self.pooled.iter().flat_map(|row| row.planes.iter()))
+    }
+
+    /// The compressor state slabs, one pair per pooled cache space, keyed by
+    /// the space `attention.pool_gather` addresses.
+    #[must_use]
+    pub fn pool_slabs(&self) -> Vec<(u32, PoolSlabs)> {
+        let cells = self.paging.pages() * u64::from(self.paging.page_size);
+        self.pooled
+            .iter()
+            .map(|row| {
+                let plane = |at: usize| {
+                    Tensor::new(
+                        row.planes.get(at).map_or(0, elastic::Arena::base),
+                        narrow(cells) as u32,
+                        narrow(row.width) as u32,
+                        POOL_STATE,
+                    )
+                };
+                (
+                    row.space,
+                    PoolSlabs {
+                        state_kv: plane(0),
+                        state_score: plane(1),
+                        ape: Tensor::ABSENT,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Every byte these pools may ever hold — the ceiling the address space was reserved at.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.arenas()
             .map(elastic::Arena::max_bytes)
             .sum()
     }
@@ -423,9 +472,7 @@ impl Pools {
     /// Bytes actually under a mapping right now.
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
-        self.rows
-            .iter()
-            .flatten()
+        self.arenas()
             .map(elastic::Arena::committed_bytes)
             .sum()
     }
@@ -433,9 +480,7 @@ impl Pools {
     /// The most that has ever been mapped, summed across arenas — the high water a trim is measured against.
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
-        self.rows
-            .iter()
-            .flatten()
+        self.arenas()
             .map(elastic::Arena::high_water_bytes)
             .sum()
     }
@@ -461,9 +506,7 @@ impl Pools {
     /// Every arena's base address, in row-then-plane order. These addresses never move once reserved.
     #[must_use]
     pub fn bases(&self) -> Vec<u64> {
-        self.rows
-            .iter()
-            .flatten()
+        self.arenas()
             .map(elastic::Arena::base)
             .collect()
     }
@@ -766,12 +809,19 @@ impl Pools {
             pool,
             rows,
             shapes,
+            pooled,
             ..
         } = self;
         let mut targets = Vec::new();
         for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
             for (at, arena) in planes.iter_mut().enumerate() {
                 let bytes = watermark_bytes(shape, at, kv_pages, state_slots, page_size);
+                targets.push(elastic::Target { arena, bytes });
+            }
+        }
+        for row in pooled.iter_mut() {
+            let bytes = row.watermark_bytes(kv_pages, page_size);
+            for arena in row.planes.iter_mut() {
                 targets.push(elastic::Target { arena, bytes });
             }
         }
@@ -790,11 +840,18 @@ impl Pools {
             pool,
             rows,
             shapes,
+            pooled,
             ..
         } = self;
         for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
             for (at, arena) in planes.iter_mut().enumerate() {
                 let bytes = watermark_bytes(shape, at, kv_pages, state_slots, page_size);
+                arena.release_tail(pool, bytes);
+            }
+        }
+        for row in pooled.iter_mut() {
+            let bytes = row.watermark_bytes(kv_pages, page_size);
+            for arena in row.planes.iter_mut() {
                 arena.release_tail(pool, bytes);
             }
         }
@@ -804,6 +861,59 @@ impl Pools {
 }
 
 /// How many bytes of one arena a pair of watermarks makes hot. A kv plane is `pages * page_size` cells of its own width; a recurrent slab is `slots` banks of its own stride.
+/// The element the compressor state is kept in.
+const POOL_STATE: Dtype = Dtype::Bf16;
+
+/// One pooled cache space's compressor state: `[cells, width]` planes for the
+/// rolling kv window and the rolling score, `width = coff * head_dim`.
+#[derive(Debug)]
+struct PoolRow {
+    space: u32,
+    width: u64,
+    planes: Vec<Arena>,
+}
+
+impl PoolRow {
+    fn watermark_bytes(&self, kv_pages: u32, page_size: u32) -> u64 {
+        u64::from(kv_pages) * u64::from(page_size) * self.width * u64::from(elem_size(POOL_STATE))
+    }
+}
+
+/// `2` for the overlapping window of the ratio-4 compressor, `1` otherwise —
+/// mirrors `kernels_cuda::attn::pool`'s `compressor_coff`.
+const fn compressor_coff(ratio: u32) -> u64 {
+    if ratio == 4 { 2 } else { 1 }
+}
+
+/// The pooled cache spaces this trace's `attention.pool_gather`s address,
+/// as `(space, width)`; width is a max within a space.
+fn pooled_spaces(trace: &Trace) -> Vec<(u32, u64)> {
+    let mut spaces: Vec<(u32, u64)> = Vec::new();
+    for node in &trace.nodes {
+        let Operation::Attention(Attention::PoolGather {
+            pages,
+            head_dim,
+            ratio,
+            ..
+        }) = &node.op
+        else {
+            continue;
+        };
+        let Some(Def::Cache(space)) = trace.values.get(pages.0 as usize).map(|v| &v.def) else {
+            continue;
+        };
+        let width = compressor_coff(*ratio) * u64::from(*head_dim);
+        if width == 0 {
+            continue;
+        }
+        match spaces.iter_mut().find(|(held, _)| *held == *space) {
+            Some((_, held)) => *held = (*held).max(width),
+            None => spaces.push((*space, width)),
+        }
+    }
+    spaces
+}
+
 fn watermark_bytes(
     shape: &Shape,
     plane: usize,

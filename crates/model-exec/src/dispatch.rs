@@ -57,6 +57,11 @@ pub trait DispatchCustomCuda {
 ///
 /// A backend-specific family on a foreign `Run` answers
 /// [`KernelError::Unsupported`] from its impl.
+/// A look at a node after it ran — a debugging seat (value probes), no-op by default.
+pub trait DispatchProbe {
+    fn probe(&mut self, _node: &Node) {}
+}
+
 pub trait Dispatch:
     DispatchAttention
     + DispatchLinear
@@ -64,19 +69,24 @@ pub trait Dispatch:
     + DispatchLayout
     + DispatchCollective
     + DispatchCustomCuda
+    + DispatchProbe
 {
     /// Enqueue one node's op. UFCS throughout — a method call would
     /// be ambiguous across the same-named supertraits. `cond` and
     /// `layer` are the engine walk's business; this reads only `op`.
     fn exec(&mut self, node: &Node) -> Result<(), KernelError> {
-        match &node.op {
+        let outcome = match &node.op {
             Operation::Attention(op) => DispatchAttention::dispatch(self, op),
             Operation::Linear(op) => DispatchLinear::dispatch(self, op),
             Operation::Elementwise(op) => DispatchElementwise::dispatch(self, op),
             Operation::Layout(op) => DispatchLayout::dispatch(self, op),
             Operation::Collective(op) => DispatchCollective::dispatch(self, op),
             Operation::CustomCuda(op) => DispatchCustomCuda::dispatch(self, op),
+        };
+        if outcome.is_ok() {
+            self.probe(node);
         }
+        outcome
     }
 }
 
@@ -87,5 +97,6 @@ impl<T> Dispatch for T where
         + DispatchLayout
         + DispatchCollective
         + DispatchCustomCuda
+        + DispatchProbe
 {
 }

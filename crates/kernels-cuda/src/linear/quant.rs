@@ -216,11 +216,13 @@ fn affine(
         8
     } else if codes.width * 2 == k {
         4
+    } else if codes.width * 4 == k {
+        2
     } else {
         return Err(refuse(
             op,
             format!(
-                "a {}-byte code row stores a {k}-wide row at neither four nor eight bits",
+                "a {}-byte code row stores a {k}-wide row at neither two, four nor eight bits",
                 codes.width
             ),
         ));
@@ -319,6 +321,82 @@ fn dense_affine(
 ///
 /// The fused arm rounds in f32 inside the dot; this arm rounds to bf16
 /// once during decode, so the two agree in value but not bit-for-bit.
+/// One affine plane decoded to a bf16 `[n, k]` rectangle in fire scratch,
+/// for an entry that reads a dense weight (the MLA absorbs). Resident planes
+/// only; the bit width and group come off the plane widths.
+#[allow(clippy::too_many_arguments)]
+pub fn decoded_plane(
+    ctx: &Ctx,
+    op: &'static str,
+    codes: Tensor,
+    scales: Tensor,
+    offset: OffsetKind,
+    biases: Option<Tensor>,
+    factor: Dtype,
+    n: u32,
+    k: u32,
+    seat: GroupSeat,
+) -> Result<Tensor, Error> {
+    let f = dtype_dispatch!(op, factor, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    if seat.streams() {
+        return Err(refuse(
+            op,
+            "a decoded plane serves resident projections only, and these planes are \
+             seated by a streaming tier",
+        ));
+    }
+    if codes.rows != n {
+        return Err(refuse(
+            op,
+            format!("the code plane holds {} rows and the entry states {n}", codes.rows),
+        ));
+    }
+    let bits: u32 = if codes.width == k {
+        8
+    } else if codes.width * 2 == k {
+        4
+    } else if codes.width * 4 == k {
+        2
+    } else {
+        return Err(refuse(
+            op,
+            format!("a {}-byte code row stores a {k}-wide row at neither two, four nor eight bits", codes.width),
+        ));
+    };
+    let groups = scales.width / 2;
+    if groups == 0 || !k.is_multiple_of(groups) {
+        return Err(refuse(
+            op,
+            format!("{groups} factors do not group a {k}-wide row into whole groups"),
+        ));
+    }
+    let group = k / groups;
+    let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
+    let tile = ctx.scratch(op, DECODED_WEIGHT, bytes)? as usize as u64;
+    let words = extent(op, u64::from(n) * u64::from(k) / u64::from(32 / bits))?;
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::dequant_affine<{f}, ::pie::i32({bits}), {}, \
+                 ::pie::i32({group})>",
+                offset.axis()
+            )),
+        )
+        .apply(Launch::flat(words, BLOCK)),
+        &[
+            codes.arg(),
+            scales.arg(),
+            biases.map_or(ArgValue::ABSENT, |b| b.arg()),
+            ArgValue::Ptr(tile),
+            stated(op, n)?.arg(),
+            stated(op, k)?.arg(),
+        ],
+    )?;
+    Ok(Tensor::new(tile, n, k, Dtype::Bf16))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_via_dense(
     ctx: &Ctx,

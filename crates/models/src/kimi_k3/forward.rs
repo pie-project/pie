@@ -259,13 +259,13 @@ fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
         {
             let mixed = ops::attn::ssm_causal_conv1d(&qkv_d, &k.conv, conv, k.conv_kernel);
             ops::attn::ssm_kda_step(
-                &mixed, &f_d, &b_d, &k.dt_bias, &k.a_log, delta, k.heads, k.head_dim, k.norm_eps,
+                &mixed, &f_d, &b_d, &k.dt_bias, &k.a_log, delta, k.heads, k.head_dim, k.norm_eps, 0.0,
             )
         },
         {
-            let mixed = ops::attn::ssm_causal_conv1d(&qkv_p, &k.conv, conv, k.conv_kernel);
+            let mixed = ops::attn::ssm_causal_conv1d_chunked(&qkv_p, &k.conv, conv, k.conv_kernel);
             ops::attn::ssm_kda_chunked(
-                &mixed, &f_p, &b_p, &k.dt_bias, &k.a_log, delta, k.heads, k.head_dim, k.norm_eps,
+                &mixed, &f_p, &b_p, &k.dt_bias, &k.a_log, delta, k.heads, k.head_dim, k.norm_eps, 0.0,
             )
         },
     ]);

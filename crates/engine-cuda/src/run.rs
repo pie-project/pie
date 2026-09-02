@@ -159,13 +159,13 @@ pub struct PoolSlabs {
 }
 
 /// The engine-bound extras the cuda entries want beside the ops' named operands. No op names these; each seat is bound from fire state by the arm that uses it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FireTables {
     /// `i32`, `[lanes + 1]`: each fire lane's byte offset into the mask slab [`CacheGeometry::mask`] holds. `None` when this fire carries no mask; a masked consumer then gets a typed refusal, not a panic.
     pub mask_indptr: Option<Tensor>,
 
     /// The dsv4 compressor slabs, bound when a pooled space exists. One fire-wide seat: a plan carries at most one pooled space today.
-    pub pool_state: Option<PoolSlabs>,
+    pub pool_state: Vec<(u32, PoolSlabs)>,
 }
 
 /// What one lane's recurrent state does with the buffer this fire. `None` is no move; addressing is `pages[token / page_tokens]`, not a contiguous range.
@@ -1595,12 +1595,24 @@ impl<'c> Run<'c> {
     }
 
     /// The dsv4 compressor slabs, for `attention.pool_gather`'s seam.
-    pub(crate) fn slabs(&self) -> PoolSlabs {
-        self.fire.tables.pool_state.unwrap_or_else(|| {
-            panic!(
-                "this fire binds no dsv4 compressor slabs, which `attention.pool_gather` reads beside the pool"
-            )
-        })
+    /// The compressor slabs staged for cache space `pages` (`Def::Cache`).
+    pub(crate) fn slabs(&self, pages: ValueId) -> PoolSlabs {
+        let at = pages.0 as usize;
+        let Some(Def::Cache(space)) = self.values.get(at).map(|v| &v.def) else {
+            panic!("value {at} is not a cache space; the pooled state is keyed by one")
+        };
+        self.fire
+            .tables
+            .pool_state
+            .iter()
+            .find(|(held, _)| held == space)
+            .map(|(_, slabs)| *slabs)
+            .unwrap_or_else(|| {
+                panic!(
+                    "this fire binds no dsv4 compressor slabs for cache space {space}, which \
+                     `attention.pool_gather` reads beside the pool"
+                )
+            })
     }
 
     /// A hash of the shape of every plan payload this fire built — every number that can reach a kernel argument, not the workspace contents. A disagreement with the graph key demotes the body rather than silently reading stale numbers; the Debug image covers every field by construction.

@@ -211,6 +211,7 @@ fn ranked_router(
 pub fn topk_sigmoid(
     ctx: &Ctx,
     logits: Tensor,
+    correction_bias: Option<Tensor>,
     experts: u32,
     top_k: u32,
     renormalize: bool,
@@ -226,7 +227,7 @@ pub fn topk_sigmoid(
         FILE,
         symbol(&format!("::pie::linear::moe_topk_sigmoid<{t}>")),
         logits,
-        None,
+        correction_bias,
         experts,
         top_k,
         renormalize,
@@ -612,8 +613,6 @@ fn matmul_select_mlxu4(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    const MLX_GROUP: u32 = 64;
-
     const ROWS_PER_WARP: u32 = 4;
 
     const DECODE_BLOCK: u32 = 128;
@@ -623,17 +622,48 @@ fn matmul_select_mlxu4(
     debug_assert_eq!(scales.dtype, Dtype::U8, "a packed bank's planes bind as bytes");
     debug_assert_eq!(biases.dtype, Dtype::U8, "a packed bank's planes bind as bytes");
     let fan = selected(op, x, routes, y)?;
-    if x.width == 0 || !x.width.is_multiple_of(MLX_GROUP) {
+    let k = stated(op, nonzero(op, "K, the bank's contracted width", x.width)?)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    // One expert's planes per row: the code row holds `n * k` codes and the
+    // scale row one bf16 per group of them, so the bit width and the group
+    // come off the row widths.
+    let elems = u64::from(x.width) * u64::from(y.width);
+    let code_bits = u64::from(codes.width) * 8;
+    let bits: u32 = match code_bits {
+        b if b == elems * 8 => 8,
+        b if b == elems * 4 => 4,
+        b if b == elems * 2 => 2,
+        _ => {
+            return Err(refuse(
+                op,
+                format!(
+                    "a {}-byte expert code row stores {elems} codes at neither two, four nor eight bits",
+                    codes.width
+                ),
+            ));
+        }
+    };
+    let factor_bytes = u64::from(scales.width);
+    let groups_per_row = if factor_bytes > 0 && factor_bytes % (2 * u64::from(y.width)) == 0 {
+        factor_bytes / (2 * u64::from(y.width))
+    } else {
+        0
+    };
+    let group = if groups_per_row > 0 && u64::from(x.width) % groups_per_row == 0 {
+        u64::from(x.width) / groups_per_row
+    } else {
+        0
+    };
+    let group = u32::try_from(group).unwrap_or(0);
+    if !matches!(group, 32 | 64 | 128) || !group.is_multiple_of(32 / bits) {
         return Err(refuse(
             op,
             format!(
-                "K is {}, not a whole number of {MLX_GROUP}-code affine groups",
+                "{groups_per_row} factors over a {}-wide row is not a 32-, 64- or 128-code affine group",
                 x.width
             ),
         ));
     }
-    let k = stated(op, x.width)?;
-    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     ctx.fire(
@@ -641,7 +671,8 @@ fn matmul_select_mlxu4(
         Fire::at(
             "linear/quant.cuh",
             symbol(&format!(
-                "::pie::linear::moe_matmul_select_mlxu4<{t}, ::pie::i32({ROWS_PER_WARP})>"
+                "::pie::linear::moe_matmul_select_mlxu4<{t}, ::pie::i32({bits}), ::pie::i32({group}), \
+                 ::pie::i32({ROWS_PER_WARP})>"
             )),
         )
         .apply(Launch::grid(

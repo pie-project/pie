@@ -11,3 +11,5 @@ impl DispatchCustomCuda for Run<'_> {
         Err(KernelError::Unsupported { op: op.name() })
     }
 }
+
+impl model_exec::DispatchProbe for Run<'_> {}

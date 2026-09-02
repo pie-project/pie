@@ -84,6 +84,16 @@ impl ThinkingDecoder {
             matched: 0,
         }
     }
+
+    /// The same decoder for a cue that already opened the block: decoding
+    /// starts inside it and ends at the first `close`.
+    #[must_use]
+    pub fn opened(tokenizer: Arc<Tokenizer>, open: Vec<u32>, close: u32) -> Self {
+        Self {
+            inside: true,
+            ..Self::new(tokenizer, open, close)
+        }
+    }
 }
 
 impl ReasoningDecoder for ThinkingDecoder {

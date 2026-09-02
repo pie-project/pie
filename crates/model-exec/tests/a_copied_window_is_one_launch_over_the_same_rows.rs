@@ -436,3 +436,4 @@ fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
     }
 }
 
+impl model_exec::DispatchProbe for MockDispatch {}

@@ -56,8 +56,9 @@ fn rope_per_head(op: &'static str, q_pe: Tensor, heads: i32) -> Result<i32, Erro
     if heads <= 0 {
         return Err(refuse(op, "the stated head count is zero"));
     }
+    // Zero is a nope-only MLA: no rotated half at all.
     let width = stated(op, q_pe.width)?;
-    if width <= 0 || width % heads != 0 {
+    if width < 0 || width % heads != 0 {
         return Err(refuse(
             op,
             format!("the {width}-wide rotated half does not divide by the {heads} stated heads"),

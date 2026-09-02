@@ -481,7 +481,11 @@ impl Shell {
     /// May a fire of this load record a body: the bodies knob, the pad it
     /// requires, a recording mode, and weights that do not rotate.
     pub(crate) fn records_bodies(&self) -> bool {
-        self.bodies && self.pad && self.graphs.records() && !self.weights.rotating()
+        self.bodies
+            && self.pad
+            && self.graphs.records()
+            && !self.weights.rotating()
+            && !self.weights.hosts_experts()
     }
 
     /// What the arming pass did, or `None` when it did not run.

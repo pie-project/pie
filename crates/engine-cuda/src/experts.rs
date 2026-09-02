@@ -202,6 +202,11 @@ pub fn count_promoted(window_ms: u64) {
 /// Can this device dereference an ordinary host mapping (HMM, `cudaDevAttrPageableMemoryAccess`)? This is the mechanism T2 stands on. Read from the current device; `false` without a runtime.
 #[must_use]
 pub fn pageable_access() -> bool {
+    // `PIE_CUDA_DEFERRED_TIER=0` forces the eager page-locked image: a seat
+    // served out of a pageable mapping page-faults on every device read.
+    if std::env::var_os("PIE_CUDA_DEFERRED_TIER").is_some_and(|v| v == "0") {
+        return false;
+    }
     #[cfg(feature = "cuda")]
     {
         use cudarc::runtime::sys as rt;

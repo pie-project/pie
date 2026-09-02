@@ -13,6 +13,7 @@ pub mod chatml;
 pub mod decode;
 pub mod deepseek;
 pub mod gemma;
+pub mod glm;
 pub mod harmony;
 pub mod kimi;
 
