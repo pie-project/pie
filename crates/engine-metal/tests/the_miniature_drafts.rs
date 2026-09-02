@@ -121,6 +121,7 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
         page_size: 16,
         context: 512,
         slots: 4,
+        pages: (4) * (512) / (16),
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
     })

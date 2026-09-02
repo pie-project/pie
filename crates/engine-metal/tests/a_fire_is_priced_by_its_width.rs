@@ -146,6 +146,7 @@ fn every_width_is_timed() {
         page_size: 16,
         context: 512,
         slots,
+        pages: slots * 512 / 16,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
     })

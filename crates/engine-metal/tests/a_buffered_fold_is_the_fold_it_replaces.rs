@@ -89,6 +89,7 @@ fn ready() -> Option<Shell> {
         page_size: PAGE,
         context: 128,
         slots: 8,
+        pages: (8) * (128) / (PAGE),
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
     })

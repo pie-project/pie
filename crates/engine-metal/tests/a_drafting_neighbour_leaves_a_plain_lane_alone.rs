@@ -65,6 +65,7 @@ fn load(artifact: &PathBuf) -> Shell {
         page_size: 16,
         context: 512,
         slots: 14,
+        pages: (14) * (512) / (16),
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
     })

@@ -444,6 +444,7 @@ fn run(what: &str, artifact: &Path, residency: Plan, prompt: &[u32]) -> Run {
         page_size: 16,
         context: 512,
         slots: 4,
+        pages: (4) * (512) / (16),
         // F1: a streamed load's segment cuts block deeper runahead, so the
         // depth the shallowest arm can reach is the depth every number here is
         // measured at.

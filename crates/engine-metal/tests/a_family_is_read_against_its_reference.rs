@@ -122,6 +122,7 @@ fn every_probe_is_dumped() {
         page_size: 16,
         context,
         slots: 4,
+        pages: 4 * context / 16,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_metal::ResidencyPlan::default(),
     })
