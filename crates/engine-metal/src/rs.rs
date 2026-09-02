@@ -53,6 +53,10 @@ pub enum Role {
     Ba,
     /// The token ids the n-gram hasher walks.
     Ids,
+    /// KDA's per-channel forget-gate projection (`f`, one plane wide).
+    KdaF,
+    /// KDA's per-head write-strength projection (`b`, one lane per head).
+    KdaB,
 }
 
 /// One buffered plane: what it holds and how wide one token's row is.
@@ -229,6 +233,34 @@ impl Layout {
                     layout.work_elems = layout
                         .work_elems
                         .max(u64::from(*v_heads) * u64::from(*v_dim) * u64::from(*k_dim));
+                }
+                Attention::SsmKdaStep {
+                    f,
+                    b,
+                    state,
+                    heads,
+                    head_dim,
+                    y,
+                    ..
+                }
+                | Attention::SsmKdaChunked {
+                    f,
+                    b,
+                    state,
+                    heads,
+                    head_dim,
+                    y,
+                    ..
+                } => {
+                    // The scan reads the conv's extended output (`mixed`, a
+                    // region above) and its own two projections, buffered.
+                    let cache = cache_of(trace, *state)?;
+                    plane(&mut layout, cache, Role::KdaF, *f)?;
+                    plane(&mut layout, cache, Role::KdaB, *b)?;
+                    region(&mut layout, cache, "scan", *y)?;
+                    layout.work_elems = layout
+                        .work_elems
+                        .max(u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim));
                 }
                 Attention::PleNgramIds {
                     ids,
@@ -515,13 +547,17 @@ impl Seat {
     pub fn scratch_bytes(layout: &Layout, rows_ext: u32, lanes: u32) -> u64 {
         let rows = u64::from(rows_ext.max(1));
         let mut at = 0u64;
+        // Each take below binds at least 4 bytes (a zero-row plane, or a
+        // layout with no delta work copy), so the sum must hold those too.
         for plane in &layout.planes {
-            at += (rows * plane.row_bytes).next_multiple_of(256);
+            at += (rows * plane.row_bytes).max(4).next_multiple_of(256);
         }
         for region in &layout.regions {
-            at += (rows * region.row_bytes).next_multiple_of(256);
+            at += (rows * region.row_bytes).max(4).next_multiple_of(256);
         }
-        at += (u64::from(lanes.max(1)) * layout.work_elems * 4).next_multiple_of(256);
+        at += (u64::from(lanes.max(1)) * layout.work_elems * 4)
+            .max(4)
+            .next_multiple_of(256);
         at.max(256)
     }
 

@@ -896,6 +896,59 @@ impl Run<'_> {
                 norm_eps,
                 gate_floor,
                 y,
+            }
+            | Attention::SsmKdaChunked {
+                mixed,
+                f,
+                b,
+                dt_bias,
+                a_log,
+                state,
+                heads,
+                head_dim,
+                norm_eps,
+                gate_floor,
+                y,
+            } if self.rs_seat().is_some() => {
+                const OP: &str = "attention.ssm_kda_committed";
+                let seat = self.rs_seat().expect("guarded");
+                // The conv's EXTENDED output, landed by its arm above in this
+                // window; the two projections extended off the buffer here.
+                let ext_mixed = self.rs_ext_of(OP, &seat, *mixed)?;
+                let ext_f = self.rs_extend(OP, &seat, *f)?;
+                let ext_b = self.rs_extend(OP, &seat, *b)?;
+                let ext_y = self.rs_out(OP, &seat, *y)?;
+                attn::ssm::kda_committed(
+                    self.ctx(),
+                    ext_mixed,
+                    self.qo_indptr(),
+                    &self.rs_committed(&seat),
+                    ext_f,
+                    ext_b,
+                    self.tensor(*dt_bias),
+                    self.tensor(*a_log),
+                    &self.recurrent(*state),
+                    seat.work,
+                    *heads,
+                    *head_dim,
+                    *norm_eps,
+                    *gate_floor,
+                    ext_y,
+                )?;
+                self.rs_land(OP, &seat, ext_y, *y)
+            }
+            Attention::SsmKdaStep {
+                mixed,
+                f,
+                b,
+                dt_bias,
+                a_log,
+                state,
+                heads,
+                head_dim,
+                norm_eps,
+                gate_floor,
+                y,
             } => attn::ssm::kda_step(
                 self.ctx(),
                 self.tensor(*mixed),

@@ -544,6 +544,59 @@ pub fn kda_chunked(
     )
 }
 
+/// [`kda_chunked`] over the extended run, on a work copy of each lane's
+/// bank, persisting the bank as of the lane's `commit`
+/// ([`gated_delta_committed`]'s twin). `work` is
+/// `[fire lanes][heads][head_dim][head_dim]` f32.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_committed(
+    ctx: &Ctx<'_>,
+    mixed: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    f: Tensor,
+    b: Tensor,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    state: &RecurrentPool,
+    work: Tensor,
+    heads: u32,
+    head_dim: u32,
+    norm_eps: f32,
+    gate_floor: f32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.ssm_kda_committed";
+    let entry = dtype_dispatch!(OP, mixed.dtype, { Bf16 => "kda_committed_bfloat16" });
+    debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
+    debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
+    debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
+    let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
+    let lanes = committed_lanes(OP, indptr)?;
+    ctx.fire(
+        Fire::at("attn/ssm_kda.metal", entry).apply(recurrence_grid(shape.heads, lanes)),
+        &[
+            mixed.arg(),
+            indptr.arg(),
+            committed.replay.arg(),
+            committed.commit.arg(),
+            committed.slots.arg(),
+            stated(OP, committed.lane0)?.arg(),
+            f.arg(),
+            b.arg(),
+            dt_bias.arg(),
+            a_log.arg(),
+            state.state.arg_mut(),
+            work.arg_mut(),
+            y.arg_mut(),
+            stated(OP, shape.heads)?.arg(),
+            stated(OP, shape.head_dim)?.arg(),
+            norm_eps.arg(),
+            gate_floor.arg(),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
