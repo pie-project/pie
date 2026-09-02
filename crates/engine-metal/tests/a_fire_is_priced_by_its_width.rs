@@ -118,6 +118,16 @@ fn every_width_is_timed() {
                 "qmv_rows_max" => over.qmv_rows_max = Some(value),
                 "qmm_min_batch" => over.qmm_min_batch = Some(value),
                 "qmm_min_batch_moe" => over.qmm_min_batch_moe = Some(value),
+                "qmm_min_batch_emulated" => over.qmm_min_batch_emulated = Some(value),
+                "qmm_bn_crossover_tg" => over.qmm_bn_crossover_tg = Some(value),
+                "moe_tile_mid_per" => over.moe_tile_mid_per = Some(value),
+                "moe_tile_wide_per" => over.moe_tile_wide_per = Some(value),
+                "moe_batch_min_per_expert" => over.moe_batch_min_per_expert = Some(value),
+                "sdpa_tile_min_rows_per_request" => over.sdpa_tile_min_rows_per_request = Some(value),
+                "gdn_scan_lanes" => over.gdn_scan_lanes = Some(value),
+                "gdn_scan_rows" => over.gdn_scan_rows = Some(value),
+                "fp16_qmm" => over.fp16_qmm = Some(value != 0),
+                "sdpa_mma" => over.sdpa_mma = Some(value != 0),
                 other => panic!("no knob named {other} here"),
             }
         }

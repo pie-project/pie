@@ -397,8 +397,16 @@ pub fn gated_delta(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let rows = nonzero(OP, "rows", qkv.rows)?;
+    // The value columns of one (head, row) split across threadgroups down
+    // z, 32 columns each (a simdgroup a column, four simdgroups a group, so
+    // eight turns), so a one-row fire still spreads a head over the device.
+    let splits = (shape.v_dim / 32).max(1);
+    let grid = Grid::of(
+        [SCAN_WIDTH, shape.v_heads, rows.saturating_mul(splits)],
+        [SCAN_WIDTH, 1, 1],
+    );
     ctx.fire(
-        Fire::at("attn/ssm_gated_delta.metal", entry).apply(recurrence_grid(shape.v_heads, rows)),
+        Fire::at("attn/ssm_gated_delta.metal", entry).apply(grid),
         &[
             qkv.arg(),
             gates.arg(),
@@ -409,6 +417,7 @@ pub fn gated_delta(
             stated(OP, shape.v_heads)?.arg(),
             stated(OP, shape.k_dim)?.arg(),
             stated(OP, shape.v_dim)?.arg(),
+            stated(OP, splits)?.arg(),
         ],
     )
 }

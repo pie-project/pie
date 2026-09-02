@@ -12,15 +12,32 @@ template <typename T, int WIDTH, int KMAX>
     const constant int& v_heads [[buffer(6)]],
     const constant int& k_dim   [[buffer(7)]],
     const constant int& v_dim   [[buffer(8)]],
-    uint3 pos [[thread_position_in_grid]],
-    uint3 lpos [[thread_position_in_threadgroup]]) {
+    const constant int& splits  [[buffer(9)]],
+    uint3 gpos [[threadgroup_position_in_grid]],
+    uint3 lpos [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]]) {
+  // ONE TOKEN THROUGH THE DELTA RULE, a simdgroup per value column.
+  //
+  // The state is `[v_dim][k_dim]` per head, `k_dim` contiguous. The
+  // previous shape gave each THREAD one column and walked its `k_dim`
+  // cells serially, twice (decay-and-read, then update-and-write): across
+  // the threadgroup that is 128 lanes striding `k_dim` floats apart —
+  // every load its own cache line — and four passes over the state. Here
+  // a SIMDGROUP takes a column: its 32 lanes hold the column's cells
+  // `PER` apart in registers (coalesced, one read and one write per cell),
+  // the two dot products the rule needs fold with `simd_sum`, and the
+  // column count is split across `splits` threadgroups down z so a
+  // one-row fire still spreads a head over the device.
+  constexpr int PER = KMAX / 32;
   threadgroup float sq[KMAX];
   threadgroup float sk[KMAX];
   threadgroup float2 fold[WIDTH];
 
   const int tid = int(lpos.x);
-  const int hv = int(pos.y);
-  const int n = int(pos.z);
+  const int hv = int(gpos.y);
+  const int n = int(gpos.z) / splits;
+  const int part = int(gpos.z) % splits;
   const int dk = k_dim;
   const int dv = v_dim;
   const int hk = hv / (v_heads / k_heads);
@@ -66,22 +83,39 @@ template <typename T, int WIDTH, int KMAX>
                    size_t(dv) * size_t(dk);
   const size_t out = (size_t(n) * size_t(v_heads) + size_t(hv)) * size_t(dv);
 
-  for (int c = tid; c < dv; c += WIDTH) {
+  // This threadgroup's columns, a simdgroup at a time.
+  const int per_part = dv / splits;
+  const int c0 = part * per_part;
+  constexpr int simdgroups = WIDTH / 32;
+  const int lane = int(simd_lane);
+  for (int c = c0 + int(simd_gid); c < c0 + per_part; c += simdgroups) {
     device float* cell = state + size_t(c) * size_t(dk);
+    float s[PER];
     float kv_mem = 0.0f;
-    for (int i = 0; i < dk; ++i) {
-      const float s = cell[i] * decay;
-      cell[i] = s;
-      kv_mem += s * sk[i];
+    for (int j = 0; j < PER; ++j) {
+      const int i = lane + 32 * j;
+      if (i < dk) {
+        s[j] = cell[i] * decay;
+        kv_mem += s[j] * sk[i];
+      } else {
+        s[j] = 0.0f;
+      }
     }
+    kv_mem = simd_sum(kv_mem);
     const float delta = (float(qkv[vbase + size_t(c)]) - kv_mem) * beta;
     float acc = 0.0f;
-    for (int i = 0; i < dk; ++i) {
-      const float s = cell[i] + sk[i] * delta;
-      cell[i] = s;
-      acc += s * sq[i];
+    for (int j = 0; j < PER; ++j) {
+      const int i = lane + 32 * j;
+      if (i < dk) {
+        const float v = s[j] + sk[i] * delta;
+        cell[i] = v;
+        acc += v * sq[i];
+      }
     }
-    y[out + size_t(c)] = acc;
+    acc = simd_sum(acc);
+    if (lane == 0) {
+      y[out + size_t(c)] = acc;
+    }
   }
 }
 
@@ -186,7 +220,7 @@ template <typename T, int WIDTH, int KMAX>
       const device itype*, const device float*, device float*,           \
       const device uint*, device float*,                                 \
       const constant int&, const constant int&, const constant int&,     \
-      const constant int&, uint3, uint3);
+      const constant int&, const constant int&, uint3, uint3, uint, uint);
 
 #define instantiate_gated_delta_chunked(name, itype, width, kmax)        \
   template [[host_name("gated_delta_chunked_" #name)]]                   \
