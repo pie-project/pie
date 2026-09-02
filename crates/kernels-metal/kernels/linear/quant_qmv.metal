@@ -494,6 +494,16 @@ gptoss_qmv_kernel(qmv_tail_bias, true, false, 2)
 
 gptoss_qmv_kernel(qmv_routed_bias, true, true, 1)
 gptoss_qmv_kernel(qmv_routed, false, true, 1)
+// The four-bit routed points at TWO packs a thread — the one-row dense
+// point's width (sixteen codes a lane, a 512-code block) — where the two-bit
+// and mxfp4 routed arms keep one. Measured on qwen3.6-35B-A3B: the routed
+// family 22.5 → 20.1 ms over an eight-row fire, the fire 54.8 → 52.6 ms, one
+// row 14.4 → 13.7. The wider block reassociates the partial sums, one bf16
+// ulp here and there, which a sharp router can turn into a different expert
+// (one teacher-forced argmax of eleven moved on the 35B; every greedy token
+// stayed) — the same floor `qmv_rows_packs` carries on the dense fold.
+gptoss_qmv_kernel(qmv_routed_bias_p2, true, true, 2)
+gptoss_qmv_kernel(qmv_routed_p2, false, true, 2)
 
 #define instantiate_gptoss_qmv(host, fn, codec, name, itype, gs, b)           \
   template [[host_name(#host "_" #name "_gs_" #gs "_b_" #b)]]                 \
@@ -507,8 +517,8 @@ gptoss_qmv_kernel(qmv_routed, false, true, 1)
 
 instantiate_gptoss_qmv(affine_qmv_tail, qmv_tail, AffineU4, bfloat16, bfloat, 64, 4)
 instantiate_gptoss_qmv(affine_qmv_tail_bias, qmv_tail_bias, AffineU4, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias, AffineU4, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias_p2, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed_p2, AffineU4, bfloat16, bfloat, 64, 4)
 
 // The 2-bit routed arms — the switch_mlp expert banks the 2-bit checkpoints
 // keep in the routed path, at all three groups the artifacts carry.
