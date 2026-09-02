@@ -123,6 +123,10 @@ pub struct Cuts<'a> {
     /// a routed segment happens once per run of the region that reads the
     /// router's seats, before that run's first dispatch.
     seen: std::cell::Cell<(u32, u32)>,
+    /// How many expert groups the region being walked in passes has (set
+    /// at its pass 0 cut): passes past them seat nothing and dispatch
+    /// nothing, and the region's tail runs in the last one that does.
+    groups: std::cell::Cell<u32>,
 }
 
 impl<'a> Cuts<'a> {
@@ -149,6 +153,7 @@ impl<'a> Cuts<'a> {
             tier,
             rows,
             seen: std::cell::Cell::new((u32::MAX, u32::MAX)),
+            groups: std::cell::Cell::new(1),
         }
     }
 }
@@ -269,6 +274,7 @@ impl<'a> Sink<'a> {
         self.across(fire, cuts, ids, "an n-gram id vector", |rect, span, _pass, arena| {
             rows.borrow_mut()
                 .segment(arena, self.handles, ids, rect, span)
+                .map(|()| 1)
         })
     }
 
@@ -283,7 +289,7 @@ impl<'a> Sink<'a> {
         cuts: &Cuts<'_>,
         vector: ValueId,
         what: &str,
-        seat: impl FnOnce(Tensor, MaskSpan, (u32, u32), &mut Buffer) -> crate::error::Result<()>,
+        seat: impl FnOnce(Tensor, MaskSpan, (u32, u32), &mut Buffer) -> crate::error::Result<u32>,
     ) -> Result<(), Error> {
         let Held::Owned(cell) = &self.frame else {
             return Ok(());
@@ -295,9 +301,12 @@ impl<'a> Sink<'a> {
             .expect("a segment is open until its cut closes it");
         let waited = std::time::Instant::now();
         frame.commit().map_err(refuse)?;
+        let waited = waited.elapsed();
         if let Some(tier) = cuts.tier {
-            tier.borrow_mut()
-                .note_wait(waited.elapsed().as_nanos() as u64);
+            tier.borrow_mut().note_wait(waited.as_nanos() as u64);
+        }
+        if std::env::var_os("PIE_CUT_TRACE").is_some() {
+            eprintln!("cut-wait: {:.1} ms", waited.as_secs_f64() * 1e3);
         }
 
         let region = cuts.place.region.get();
@@ -328,7 +337,10 @@ impl<'a> Sink<'a> {
                 pass.1
             );
         }
-        seat(rect, span, pass, &mut cuts.arena.borrow_mut()).map_err(refuse)?;
+        let groups = seat(rect, span, pass, &mut cuts.arena.borrow_mut()).map_err(refuse)?;
+        if pass.0 == 0 {
+            cuts.groups.set(groups);
+        }
 
         *cell.borrow_mut() = Some(self.device.frame().map_err(refuse)?);
         Ok(())
@@ -411,6 +423,18 @@ impl Encode for Sink<'_> {
                 if cuts.seen.get() != here {
                     cuts.seen.set(here);
                     self.cut(fire, cuts)?;
+                }
+                // Expert-major passes: a pass past the last group has no
+                // routed work, and the tail belongs to the last group's pass.
+                let window = cuts.windows.at(here.0, here.1);
+                if window.passes > 1 {
+                    let groups = cuts.groups.get().max(1);
+                    let in_tail = cuts.place.tail.get();
+                    let last = window.pass + 1 == groups;
+                    let empty = window.pass >= groups;
+                    if (in_tail && !last) || (!in_tail && empty) {
+                        return Ok(());
+                    }
                 }
             }
             let pipeline = self

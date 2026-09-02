@@ -96,7 +96,14 @@ pub fn pass_spans(spans: &mut Vec<MaskSpan>, cap: u32, max_passes: u32) -> u32 {
         return 1;
     }
     let widest = spans.iter().map(|span| span.rows).max().unwrap_or(0);
-    let passes = widest.div_ceil(cap).clamp(1, max_passes);
+    let pieces = widest.div_ceil(cap);
+    // A run the cap would not have cut stays one segment. Otherwise the
+    // tier seats HALF the slab per pass (the other half is being filled for
+    // the next pass while this one runs), so the pass count doubles.
+    if pieces <= 1 {
+        return 1;
+    }
+    let passes = (2 * pieces).clamp(1, max_passes);
     if passes <= 1 {
         return 1;
     }

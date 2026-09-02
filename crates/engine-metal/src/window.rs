@@ -620,6 +620,9 @@ pub struct At {
     pub region: Cell<u32>,
     /// Which run of that region's window: `0..r` for a region P4 couldn't seat.
     pub run: Cell<u32>,
+    /// Whether the dispatch being encoded is the region's tail under
+    /// expert-major passes (`Sink::tail`).
+    pub tail: Cell<bool>,
 }
 
 impl At {
@@ -672,6 +675,10 @@ impl Sink for Cursor<'_> {
     /// Which class-set interval every operand after this call resolves against.
     fn run(&mut self, run: u32, _runs: u32) {
         self.place.run.set(run);
+        self.place.tail.set(false);
+    }
+    fn tail(&mut self, in_tail: bool) {
+        self.place.tail.set(in_tail);
     }
     fn cond_begin(&mut self, _lowering: &Lowering) {}
     fn cond_arm(&mut self, _arm: u8) {}

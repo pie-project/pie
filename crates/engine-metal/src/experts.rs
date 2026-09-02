@@ -60,6 +60,16 @@ pub struct BandPlan {
 /// One streamed group: a router, and every expert-indexed param read
 /// against the vector it writes — the unit of residency, since one
 /// rewrite of `routes` re-indexes every band in the group at once.
+/// The experts one expert-major pass seats: half the slab, so the other
+/// half can be filled for the next pass while this one runs on the device.
+#[must_use]
+pub fn pass_group(slots: u32) -> u32 {
+    if std::env::var_os("PIE_PASS_HALF").is_some_and(|v| v == "0") {
+        return slots.max(1);
+    }
+    (slots / 2).max(1)
+}
+
 /// A run being walked in expert-major passes (`Tier::pass_at`).
 #[derive(Clone, Debug)]
 struct Passing {
@@ -922,9 +932,9 @@ impl Tier {
         hint: Option<Tensor>,
         span: MaskSpan,
         pass: (u32, u32),
-    ) -> Result<()> {
+    ) -> Result<u32> {
         let Some(&at) = self.of_routes.get(&routes.0) else {
-            return Ok(());
+            return Ok(1);
         };
         let started = std::time::Instant::now();
         let out = self.segment_at(at, arena, handles, routes, rect, hint, span, pass);
@@ -1027,13 +1037,30 @@ impl Tier {
         hint: Option<Tensor>,
         span: MaskSpan,
         pass: (u32, u32),
-    ) -> Result<()> {
+    ) -> Result<u32> {
         // ── Whatever the prefetch was still reading into the seats this
         //    segment is about to name has to have landed first.
         self.join_inflight()?;
         if pass.1 > 1 {
             return self.pass_at(at, arena, handles, routes, rect, span, pass);
         }
+        self.segment_rows(at, arena, handles, routes, rect, hint, span)?;
+        Ok(1)
+    }
+
+    /// One row-cut segment (the legacy piece): seat every expert the span
+    /// routes to and rewrite the vector to seats.
+    #[allow(clippy::too_many_arguments)]
+    fn segment_rows(
+        &mut self,
+        at: usize,
+        arena: &mut Buffer,
+        handles: &Handles,
+        routes: ValueId,
+        rect: Tensor,
+        hint: Option<Tensor>,
+        span: MaskSpan,
+    ) -> Result<()> {
         if span.rows > 0 && (hint.is_some() || self.predicted[at].is_some()) {
             self.predict(at, arena, handles, routes, rect, hint, span)?;
         }
@@ -1121,13 +1148,13 @@ impl Tier {
         rect: Tensor,
         span: MaskSpan,
         (pass, passes): (u32, u32),
-    ) -> Result<()> {
+    ) -> Result<u32> {
         for seat in &mut self.slabs[at].pinned {
             *seat = false;
         }
         self.segments += 1;
         if span.rows == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let width = u64::from(rect.width);
         let base = handles
@@ -1177,7 +1204,7 @@ impl Tier {
                     order.push(expert);
                 }
             }
-            let seats = self.slabs[at].pinned.len().max(1);
+            let seats = pass_group(self.slabs[at].slots) as usize;
             let groups = order.chunks(seats).map(<[u32]>::to_vec).collect();
             self.passing[at] = Some(Passing {
                 row_offset: span.row_offset,
@@ -1186,11 +1213,12 @@ impl Tier {
                 groups,
             });
         }
-        let (ids, group) = {
+        let (ids, group, next) = {
             let state = self.passing[at].as_ref().expect("stated just above");
             (
                 state.ids.clone(),
                 state.groups.get(pass as usize).cloned().unwrap_or_default(),
+                state.groups.get(pass as usize + 1).cloned(),
             )
         };
         let _ = passes;
@@ -1202,16 +1230,84 @@ impl Tier {
             seat_of.insert(expert, seat as i32);
         }
         let mut raw = Vec::with_capacity(count * 4);
+        let mut assigned = 0usize;
         for id in ids {
             let entry = if id < 0 {
                 -1
             } else {
                 seat_of.get(&(id as u32)).copied().unwrap_or(-1)
             };
+            if entry >= 0 {
+                assigned += 1;
+            }
             raw.extend_from_slice(&entry.to_le_bytes());
+        }
+        if std::env::var_os("PIE_CUT_TRACE").is_some() {
+            let seats: Vec<i32> = seat_of.values().copied().collect();
+            eprintln!(
+                "pass {pass} of {passes} on slab {at}: group of {} experts (seats {:?}), {assigned} of {count} entries assigned, groups {}",
+                group.len(),
+                seats,
+                self.passing[at].as_ref().map_or(0, |p| p.groups.len())
+            );
         }
         self.flush()?;
         arena.write(first, &raw)?;
+        // The NEXT pass's group starts reading now, into the half of the
+        // slab this pass does not touch, while the device runs this one.
+        if self.prefetch {
+            if let Some(next) = next {
+                self.prefetch_group(at, &next)?;
+            }
+        }
+        Ok(self.passing[at].as_ref().map_or(0, |p| p.groups.len() as u32))
+    }
+
+    /// Read `experts` of slab `at` ahead on a thread, into unpinned seats
+    /// only — the current pass's seats stay pinned and untouched. Joined at
+    /// the next cut (`join_inflight`), where the seats are then hits.
+    fn prefetch_group(&mut self, at: usize, experts: &[u32]) -> Result<()> {
+        let Some(file) = self.file.clone() else {
+            return Ok(());
+        };
+        let mut jobs: Vec<(u64, u64, u64)> = Vec::new();
+        for &expert in experts {
+            if self.slabs[at].seat_of[expert as usize].is_some() {
+                continue;
+            }
+            let Ok(seat) = self.evict(at) else {
+                break;
+            };
+            if let Some(held) = self.slabs[at].in_seat[seat as usize] {
+                self.slabs[at].seat_of[held as usize] = None;
+            }
+            let slab = &mut self.slabs[at];
+            slab.in_seat[seat as usize] = Some(expert);
+            slab.seat_of[expert as usize] = Some(seat);
+            slab.last_used[seat as usize] = self.tick;
+            self.tick += 1;
+            slab.pinned[seat as usize] = true;
+            for band in &slab.bands {
+                jobs.push((
+                    band.at + u64::from(seat) * band.stride,
+                    band.from + u64::from(expert) * band.stride,
+                    band.stride,
+                ));
+            }
+            self.prediction.prefetched += 1;
+        }
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        self.swaps += jobs.len() as u64;
+        let writers = self.store.file_writers(&jobs)?;
+        let threads = self.threads;
+        self.inflight = Some(std::thread::spawn(move || {
+            for (writer, jobs) in &writers {
+                writer.pread(&file, jobs, threads)?;
+            }
+            Ok(())
+        }));
         Ok(())
     }
 

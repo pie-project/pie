@@ -63,6 +63,12 @@ pub trait Sink {
     /// after the last arm's region, not after each one.
     fn cond_end(&mut self);
 
+    /// Whether the dispatches that follow are the region's TAIL under
+    /// expert-major passes — past the last routed matmul, so they read every
+    /// group's rows and belong to the last pass that seats one. A shell
+    /// that walks no passes ignores it.
+    fn tail(&mut self, _in_tail: bool) {}
+
     /// Record `event` on the stream this region is on, here; anything
     /// waiting on it may proceed from this point. Called at the top of a
     /// fork group's main arm (the fork, arms wait on it) and at the end

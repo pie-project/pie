@@ -1221,7 +1221,7 @@ impl Shell {
                         .find(|group| group.routes == routes)
                         .map_or(0, |group| {
                             if group.slots > 0 {
-                                group.experts.div_ceil(group.slots)
+                                group.experts.div_ceil(crate::experts::pass_group(group.slots))
                             } else {
                                 0
                             }

@@ -134,16 +134,42 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
         // its own launch — the sink cuts and seats before each. Cut after
         // the grouped/copy decisions, which read the class intervals.
         let once = grouped || copy;
+        let mut passes = 1;
         if !once {
             if let Some(&cap) = descriptor.run_caps.get(index) {
-                let passes = descriptor.run_passes.get(index).copied().unwrap_or(0);
-                if passes > 1 {
-                    super::compose::pass_spans(&mut runs, cap, passes);
+                let max_passes = descriptor.run_passes.get(index).copied().unwrap_or(0);
+                if max_passes > 1 {
+                    passes = super::compose::pass_spans(&mut runs, cap, max_passes);
                 } else {
                     super::compose::chunk_spans(&mut runs, cap);
                 }
             }
         }
+        // In expert-major passes, only the nodes up to the last routed
+        // matmul recompute per pass; the tail (the weighted sum, a shared
+        // expert, the residual) reads every group's rows and runs once, in
+        // the last pass that seats a group — the sink's call, told which
+        // dispatches are the tail.
+        let tail_start = if passes > 1 {
+            region
+                .nodes
+                .clone()
+                .filter(|&node| {
+                    trace.nodes.get(node as usize).is_some_and(|node| {
+                        matches!(
+                            node.op,
+                            Operation::Linear(
+                                model_ir::Linear::MoeMatmulSelect { .. }
+                                    | model_ir::Linear::MoeMatmulSelectQuant { .. }
+                            )
+                        )
+                    })
+                })
+                .last()
+                .map_or(region.nodes.end, |last| last + 1)
+        } else {
+            region.nodes.end
+        };
         // `max(1)` is the empty window: it turns once, at zero rows, so the
         // collective rule below still sees every node.
         let launches = if once { 1 } else { runs.len().max(1) };
@@ -157,7 +183,8 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
                 runs.get(launch).map_or(0, |span| span.rows)
             };
 
-            for node in region.nodes.clone() {
+            for node_at in region.nodes.clone() {
+                let node = node_at;
                 // Resolved before the filter, so a template naming a node the
                 // plan lacks is the same refusal in every pass.
                 let Some(node) = trace.nodes.get(node as usize) else {
@@ -169,6 +196,9 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
                 };
                 if !dispatches {
                     continue;
+                }
+                if passes > 1 {
+                    sink.tail(node_at >= tail_start);
                 }
                 let collective = matches!(node.op, Operation::Collective(_));
                 if rows == 0 && !collective {

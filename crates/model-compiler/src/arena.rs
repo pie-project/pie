@@ -773,6 +773,18 @@ fn outlive_the_region(trace: &Trace, conc: &Concurrency, spans: &mut [Option<Spa
         let slot = region_end.entry(conc.region_of(at)).or_insert(at);
         *slot = (*slot).max(at);
     }
+    // The regions a streamed load may walk in expert-major PASSES: the one
+    // after each router's. A pass recomputes the region's routed values for
+    // one group of experts and leaves the other groups' rows as earlier
+    // passes wrote them, so every value born inside such a region must hold
+    // its bytes to the region's end — a later node's output may not be
+    // seated on a dead-looking `packed` whose rows the next pass still owes.
+    let mut passed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for (at, node) in trace.nodes.iter().enumerate() {
+        if crate::region::is_router(node) {
+            passed.insert(conc.region_of(at as u32) + 1);
+        }
+    }
     for span in spans.iter_mut().flatten() {
         if span.last >= end {
             continue;
@@ -780,6 +792,10 @@ fn outlive_the_region(trace: &Trace, conc: &Concurrency, spans: &mut [Option<Spa
         let (born, read) = (conc.region_of(span.first), conc.region_of(span.last));
         if born != read {
             if let Some(&last) = region_end.get(&read) {
+                span.last = span.last.max(last);
+            }
+        } else if passed.contains(&born) {
+            if let Some(&last) = region_end.get(&born) {
                 span.last = span.last.max(last);
             }
         }

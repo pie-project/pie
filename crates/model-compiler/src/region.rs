@@ -122,7 +122,7 @@ fn routed_breaks(trace: &Trace) -> std::collections::BTreeSet<u32> {
 
 /// A node that decides a mixture: the ranked routers and the lookup one —
 /// the set `engine_metal::experts::cuts` cuts a streamed command buffer after.
-fn is_router(node: &model_ir::Node) -> bool {
+pub(crate) fn is_router(node: &model_ir::Node) -> bool {
     matches!(
         node.op,
         Operation::Linear(
