@@ -218,6 +218,8 @@ pub struct Boot<'a> {
     pub context: u32,
     /// How many sequences the pools seat at once.
     pub slots: u32,
+    /// KV pages the pool holds.
+    pub pages: u32,
     /// Which device to bind.
     pub ordinal: i32,
     /// The capture mode (`[engine] graphs`).

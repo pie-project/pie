@@ -148,7 +148,7 @@ impl Shell {
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
-        let paging = Paging::of(boot.page_size, boot.context, boot.slots)?;
+        let paging = Paging::of(boot.page_size, boot.context, boot.slots, u64::from(boot.pages))?;
         // The accounting sentence refuses ahead of every allocation.
         let accounting = crate::store::admit_the_card(
             boot.knobs.gpu_mem_utilization,

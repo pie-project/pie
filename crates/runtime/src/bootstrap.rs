@@ -290,20 +290,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .map(|cap| match rs_seat_cap {
             Some(seats) if cap > seats => {
-                let (slots, pages) = rs_pool.unwrap_or((0, 0));
+                let (slots, _) = rs_pool.unwrap_or((0, 0));
                 tracing::warn!(
                     requested = cap,
                     seated = seats,
                     seat_cost,
-                    pool_seats = slots,
-                    pool_pages = pages,
-                    pages_per_seat = pages.checked_div(slots).unwrap_or(0),
-                    "admission: more lanes than the pools can seat; capping, because each \
-                     lane holds one seat per posted frame. THE SEAT COUNT IS THE PAGE POOL \
-                     DIVIDED BY ONE FULL-CONTEXT BLOCK PER SEAT, so it falls when the KV \
-                     page pool is capped: to seat `requested * seat_cost` sequences, raise \
-                     the pool (`[model.engine.options] max_total_pages`, or leave it unset \
-                     to derive it from gpu_mem_utilization) or lower the context ceiling. \
+                    state_slots = slots,
+                    "admission: more lanes than the state pool seats; capping, because each \
+                     lane holds one recurrent-state slot per posted frame. To seat \
+                     `requested * seat_cost` sequences raise `[engine] max_state_slots`. \
                      Every batch this deployment fires is bounded by `seated`, not by the \
                      engine's max_lanes"
                 );

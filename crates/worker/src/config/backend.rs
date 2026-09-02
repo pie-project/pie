@@ -67,6 +67,9 @@ pub struct CudaNativeEngineOptions {
     /// normal case. One name for two meanings is a question a reader cannot
     /// answer from the file.
     pub max_total_pages: Option<u32>,
+    /// Recurrent-state seats (KDA/GDN and conv state), one sequence in flight
+    /// each; absent takes 256. A model with no state rows seats by pages alone.
+    pub max_state_slots: Option<u32>,
     /// HARD pin on the prefill token budget the forward step is built for.
     ///
     /// **Omit to let the memory planner choose.** Setting it collapses that
@@ -164,6 +167,7 @@ impl Default for CudaNativeEngineOptions {
             gpu_mem_utilization: 0.90,
             kv_page_size: None,
             max_total_pages: None,
+            max_state_slots: None,
             max_forward_tokens: None,
             max_forward_requests: None,
             device: String::new(),
@@ -211,6 +215,8 @@ pub struct MetalEngineOptions {
     /// build. `total_pages` is NOT that knob and never was -- the simple
     /// families derive their pool from this context and discard it.
     pub max_model_len: Option<u32>,
+    /// Recurrent-state seats, one sequence in flight each; absent takes 256.
+    pub max_state_slots: Option<u32>,
     // FIVE KEYS RETIRED FROM THIS TABLE -- `model_id`, `cpu_pages`,
     // `kv_cache_dtype`, `stream_routed_experts`, `expert_slab_bytes`. Every
     // one was parsed for a C++ Metal engine that read the raw config bytes;
@@ -265,6 +271,7 @@ impl Default for MetalEngineOptions {
             max_forward_tokens: 10240,
             max_forward_requests: 512,
             max_model_len: None,
+            max_state_slots: None,
             gpu_mem_utilization: 0.90,
             tuning: toml::Table::new(),
             device: "metal:0".to_string(),

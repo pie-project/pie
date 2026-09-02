@@ -582,6 +582,7 @@ intended for diagnostics, not serving",
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,
+            pages: budgets.pages,
             // The request's ordinal wins over the boot config's default.
             ordinal: if ordinal >= 0 {
                 ordinal
@@ -614,6 +615,12 @@ intended for diagnostics, not serving",
         // Read beside the other facts, while the shell is still here to ask.
         let weights_resident = shell.weights_resident();
         let paging = shell.paging();
+        // Only a trace with state rows seats sequences; the KV pool is shared.
+        let state_rows = shell
+            .trace()
+            .caches
+            .iter()
+            .any(|row| matches!(row, model_ir::CacheRow::State { .. }));
         let profile = profile(&shell, &budgets)?;
 
         let caps = Capabilities {
@@ -634,7 +641,7 @@ intended for diagnostics, not serving",
             pools: PoolFacts {
                 kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
                 kv_page_size: paging.page_size,
-                state_slots: paging.slots,
+                state_slots: if state_rows { paging.slots } else { 0 },
                 state_slot_bytes: 0,
                 // What the load actually seats, read off the plan: the
                 // smallest capacity any one bank declares, since an id must

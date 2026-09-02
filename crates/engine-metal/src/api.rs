@@ -506,7 +506,12 @@ impl Engine for Metal {
             let working_set = crate::device::Context::bind().map_err(fault)?.working_set();
             let util = self.boot.gpu_mem_utilization;
             let paging =
-                crate::store::kv::Paging::of(budgets.page_size, budgets.max_context, budgets.slots)
+                crate::store::kv::Paging::of(
+                    budgets.page_size,
+                    budgets.max_context,
+                    budgets.slots,
+                    u64::from(budgets.pages),
+                )
                     .map_err(|error| fault(Fault::from(error)))?;
             let kv_pool = crate::store::pool_demand(&trace, paging).map_err(fault)?;
 
@@ -573,6 +578,7 @@ impl Engine for Metal {
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,
+            pages: budgets.pages,
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             residency: residency_plan,
         })
@@ -587,6 +593,12 @@ impl Engine for Metal {
         let weights_warm = shell.weights_warm();
 
         let paging = shell.paging();
+        // Only a trace with state rows seats sequences; the KV pool is shared.
+        let state_rows = shell
+            .trace()
+            .caches
+            .iter()
+            .any(|row| matches!(row, model_ir::CacheRow::State { .. }));
         let profile = profile(&shell, &budgets)?;
 
         let caps = Capabilities {
@@ -610,7 +622,7 @@ impl Engine for Metal {
             pools: PoolFacts {
                 kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
                 kv_page_size: paging.page_size,
-                state_slots: paging.slots,
+                state_slots: if state_rows { paging.slots } else { 0 },
                 // Non-zero is what tells the runtime this model folds a recurrent
                 // state and makes its passes hybrid (`crate::rs`).
                 state_slot_bytes: shell.state_slot_bytes(),

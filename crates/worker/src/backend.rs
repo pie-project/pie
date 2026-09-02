@@ -57,9 +57,8 @@ pub use engine::Capabilities as EngineCapabilities;
 
 /// The pool ceilings a load is baked against, out of what the operator stated.
 ///
-/// `slots` is derived, not stated: an operator states a page count and a
-/// context length, and the shell's paging gives each seated sequence one
-/// block of `max_context / page_size` pages.
+/// `slots` seats recurrent state only (`max_state_slots`); the KV page pool
+/// is shared by every live sequence and seats nothing.
 #[cfg(any(feature = "cuda", test))]
 fn cuda_budgets(
     opts: &CudaNativeEngineOptions,
@@ -80,9 +79,11 @@ fn cuda_budgets(
         max_adapters: adapter_seats,
         page_size,
         max_context,
-        slots: opts
+        slots: opts.max_state_slots.unwrap_or(256).max(1),
+        pages: opts
             .max_total_pages
-            .map_or(256, |pages| (pages / pages_per_slot).max(1)),
+            .unwrap_or_else(|| pages_per_slot.saturating_mul(256))
+            .max(1),
         // Both absent: the shell derives a ladder from the loaded text.
         max_patches: patch_ceilings.0,
         max_images: patch_ceilings.1,
@@ -421,8 +422,6 @@ pub(crate) fn create_engine_backend(
             let max_context = opts
                 .max_model_len
                 .unwrap_or_else(|| engine::Budgets::default().max_context);
-            // `total_pages` is a page count, `slots` a seat count; the two must not be conflated.
-            let pages_per_slot = max_context.div_ceil(page_size).max(1);
             (
                 backend,
                 engine::Budgets {
@@ -432,7 +431,8 @@ pub(crate) fn create_engine_backend(
                     max_adapters: adapters.seats(),
                     page_size,
                     max_context,
-                    slots: (opts.total_pages / pages_per_slot).max(1),
+                    slots: opts.max_state_slots.unwrap_or(256).max(1),
+                    pages: opts.total_pages.max(1),
                     // `[model] max_patches` / `max_images` when stated; absent,
                     // the shell derives a ladder from the loaded text
                     // (`engine_metal::api::patch_ladder`: the token ceiling,
@@ -481,9 +481,9 @@ pub(crate) fn create_engine_backend(
 mod tests {
     use super::*;
 
-    /// The pool arithmetic an operator's two knobs come out as.
+    /// The seat count is `max_state_slots`, not the page pool.
     #[test]
-    fn the_pool_budget_derives_its_seat_count_from_the_page_cap() {
+    fn the_pool_budget_seats_by_state_slots_not_pages() {
         let mut opts = CudaNativeEngineOptions {
             kv_page_size: Some(16),
             max_total_pages: Some(1024),
@@ -491,16 +491,18 @@ mod tests {
         };
         let budgets = cuda_budgets(&opts, 0, (None, None));
         assert_eq!(budgets.page_size, 16);
-        // 4096 tokens of context is 256 pages a slot; 1024 pages seats four.
         assert_eq!(budgets.max_context, 4096);
-        assert_eq!(budgets.slots, 4);
-
-        // No cap stated: the contract's own default seat count.
+        // No seat count stated: the contract's own default, whatever the pool.
+        assert_eq!(budgets.slots, 256);
+        assert_eq!(budgets.pages, 1024);
         opts.max_total_pages = None;
-        assert_eq!(cuda_budgets(&opts, 0, (None, None)).slots, 256);
+        assert_eq!(cuda_budgets(&opts, 0, (None, None)).pages, 65536);
 
-        // A cap smaller than one slot's block still seats one.
-        opts.max_total_pages = Some(1);
+        opts.max_state_slots = Some(4);
+        assert_eq!(cuda_budgets(&opts, 0, (None, None)).slots, 4);
+
+        // Zero still seats one.
+        opts.max_state_slots = Some(0);
         assert_eq!(cuda_budgets(&opts, 0, (None, None)).slots, 1);
     }
 

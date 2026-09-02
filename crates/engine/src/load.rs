@@ -27,6 +27,8 @@ pub struct Budgets {
     pub max_context: u32,
     /// How many sequences the pools seat at once.
     pub slots: u32,
+    /// KV pages the pool holds, drawn on by every live sequence.
+    pub pages: u32,
     /// The most patch rows one fire may carry. `None` (default): the shell
     /// derives a ladder from the loaded text.
     #[serde(default)]
@@ -49,6 +51,7 @@ impl Default for Budgets {
             page_size: 16,
             max_context: 4096,
             slots: 256,
+            pages: 65536,
             max_patches: None,
             max_images: None,
         }

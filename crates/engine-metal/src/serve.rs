@@ -272,6 +272,8 @@ pub struct Boot<'a> {
     pub context: u32,
     /// How many sequences the pools seat at once.
     pub slots: u32,
+    /// KV pages the pool holds.
+    pub pages: u32,
     /// **How far ahead of the device this load runs** (article 1; article 9 —
     /// a shell reads no environment, so every knob is typed here).
     ///
@@ -1184,7 +1186,7 @@ impl Shell {
             }
         }
 
-        let paging = Paging::of(boot.page_size, boot.context, boot.slots)?;
+        let paging = Paging::of(boot.page_size, boot.context, boot.slots, u64::from(boot.pages))?;
         let handles = Handles::new();
         // **THE CUT TABLE IS READ BEFORE THE LANDING**, so that a plan whose
         // regions carry two mixtures each refuses a streamed load before a

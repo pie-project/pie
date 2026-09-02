@@ -153,6 +153,7 @@ activation_dtype = "bfloat16"
 gpu_mem_utilization = 0.90
 # kv_page_size    = 32      # omit: the engine derives one
 # max_total_pages = 4096    # omit: derived from gpu_mem_utilization
+# max_state_slots = 256     # recurrent-state seats (hybrid models); omit for 256
 "#;
 
 // `test` as well as the cfg pair, for the same reason the CUDA block carries
@@ -183,6 +184,7 @@ total_pages  = 1024         # derive a geometry, so these two ARE the pool
 # max_forward_requests = 512    # (max_concurrent_processes derives from this)
 # max_model_len        = 8192   # omit to keep the engine's KV-ring ceiling;
                                 # setting it only ever shrinks the ring
+# max_state_slots      = 256    # recurrent-state seats (hybrid models)
 "#;
 
 // There is no Vulkan or WGPU engine block: no build hosts those engines. A

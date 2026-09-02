@@ -180,6 +180,8 @@ pub struct Paging {
     pub pages_per_slot: u32,
     /// How many slots the pool holds.
     pub slots: u32,
+    /// KV pages the pool holds; sequences draw on it without regard to slots.
+    pub pages: u64,
 }
 
 impl Paging {
@@ -189,7 +191,7 @@ impl Paging {
     ///
     /// [`Fault::Ceiling`] for a page size of zero, which spells no geometry
     /// at all.
-    pub fn of(page_size: u32, context: u32, slots: u32) -> Result<Paging> {
+    pub fn of(page_size: u32, context: u32, slots: u32, pages: u64) -> Result<Paging> {
         if page_size == 0 {
             return Err(Fault::Ceiling {
                 what: "tokens per page",
@@ -201,13 +203,14 @@ impl Paging {
             page_size,
             pages_per_slot: context.div_ceil(page_size).max(1),
             slots,
+            pages: pages.max(1),
         })
     }
 
     /// Every page the pool holds.
     #[must_use]
     pub fn pages(&self) -> u64 {
-        u64::from(self.pages_per_slot) * u64::from(self.slots)
+        self.pages
     }
 
     /// The most tokens one slot can hold.
@@ -405,7 +408,7 @@ mod tests {
     use super::*;
 
     fn paging() -> Paging {
-        Paging::of(16, 64, 4).expect("a page size of 16 spells geometry")
+        Paging::of(16, 64, 4, 16).expect("a page size of 16 spells geometry")
     }
 
     #[test]
