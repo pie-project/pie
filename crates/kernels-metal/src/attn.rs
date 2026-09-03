@@ -1224,10 +1224,17 @@ pub mod mla {
             args.push(stated(op, selection.width)?.arg());
         }
         ctx.fire(
-            Fire::at(FILE, entry).apply(Grid::of([heads * SIMD, rows, 1], [SIMD, 1, 1])),
+            Fire::at(FILE, entry).apply(Grid::of(
+                [heads * SIMD * MLA_SPLIT, rows, 1],
+                [SIMD * MLA_SPLIT, 1, 1],
+            )),
             &args,
         )
     }
+
+    /// The shader's `kMlaSplit`: simdgroups per (head, query row), each
+    /// sweeping every eighth key and folded at the end.
+    const MLA_SPLIT: u32 = 8;
 
     /// A latent width the flash kernel can lane-split: a nonzero whole number
     /// of 32-lane strips, at most `max` (the register-array ceiling).

@@ -22,6 +22,13 @@ using namespace metal;
 // refuses any wider geometry, so these ceilings are never exceeded.
 constant constexpr int kMaxCkvPer = 16;
 constant constexpr int kMaxKpePer = 4;
+// Simdgroups that share one (head, query row)'s key sweep. Each takes every
+// `kMlaSplit`-th step of the sweep and the threadgroup folds the partial
+// softmax states at the end: a decode row's sweep is a serial chain of
+// dependent loads and `simd_sum`s, ~2 us a key on one simdgroup, and a
+// 200-key context left the other cores idle. The fold reassociates the
+// online softmax (bf16 ulps move; greedy tokens on the bench prompts do not).
+constant constexpr int kMlaSplit = 8;
 
 // ── split kv_a into the rmsnormed latent and the rope tail ──────────────────
 //
@@ -262,7 +269,11 @@ inline void mla_naive_paged_body(
     int kpe,
     float sm_scale,
     uint2 gid,
-    uint lane) {
+    uint lane,
+    uint sg,
+    threadgroup float* part_m,
+    threadgroup float* part_l,
+    threadgroup float* part_acc) {
   const int h   = int(gid.x);
   const int row = int(gid.y);
   const int per  = ckv / 32;   // <= kMaxCkvPer
@@ -288,11 +299,17 @@ inline void mla_naive_paged_body(
   float m = -3.0e38f, lsum = 0.0f;
 
   const int steps = (srow != nullptr) ? top_k : j_end;
-  for (int n = 0; n < steps; ++n) {
+  for (int n = int(sg); n < steps; n += kMlaSplit) {
     int j = n;
     if (srow != nullptr) {
       j = srow[n];
-      if (j < 0 || j >= j_end) continue;
+      // `index_topk_paged` publishes the row ascending with its `-1` padding
+      // as one tail (both of its arms), so the first `-1` ends the sweep: a
+      // 2048-slot budget over a 200-key context walked 1800 empty slots a
+      // simdgroup before this, ~1 ms a launch. Same keys, same order, same
+      // bits as the `continue` the CUDA plane keeps.
+      if (j < 0) break;
+      if (j >= j_end) continue;
     }
     const uint page = kv_page_indices[page_base + j / page_size];
     const size_t slot = size_t(page) * size_t(page_size) + size_t(j % page_size);
@@ -318,9 +335,30 @@ inline void mla_naive_paged_body(
     m = m_new;
   }
 
-  const float inv = (lsum > 0.0f) ? (1.0f / lsum) : 0.0f;
+  // Fold the `kMlaSplit` partial states: `(m, l, acc)` per simdgroup, the
+  // flash merge `exp(m_s - M)` weighting each. An empty share (no key fell
+  // to it) carries `m = -3e38, l = 0` and weighs nothing.
+  if (lane == 0) {
+    part_m[sg] = m;
+    part_l[sg] = lsum;
+  }
+  for (int i = 0; i < per; ++i) part_acc[sg * (kMaxCkvPer * 32) + lane + i * 32] = acc[i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg != 0) return;
+
+  float M = part_m[0];
+  for (int s = 1; s < kMlaSplit; ++s) M = max(M, part_m[s]);
+  float L = 0.0f;
+  float out[kMaxCkvPer];
+  for (int i = 0; i < per; ++i) out[i] = 0.0f;
+  for (int s = 0; s < kMlaSplit; ++s) {
+    const float w = fast::exp(part_m[s] - M);
+    L += part_l[s] * w;
+    for (int i = 0; i < per; ++i) out[i] += part_acc[s * (kMaxCkvPer * 32) + lane + i * 32] * w;
+  }
+  const float inv = (L > 0.0f) ? (1.0f / L) : 0.0f;
   device bfloat* orow = o + (size_t(row) * heads + h) * size_t(ckv);
-  for (int i = 0; i < per; ++i) orow[lane + i * 32] = bfloat(acc[i] * inv);
+  for (int i = 0; i < per; ++i) orow[lane + i * 32] = bfloat(out[i] * inv);
 }
 
 // The dense reader: `attention.mla_decode` and `attention.mla_prefill`.
@@ -340,11 +378,16 @@ inline void mla_naive_paged_body(
     const constant int& kpe         [[buffer(12)]],
     const constant float& sm_scale  [[buffer(13)]],
     uint2 gid   [[threadgroup_position_in_grid]],
-    uint lane   [[thread_index_in_simdgroup]]) {
+    uint lane   [[thread_index_in_simdgroup]],
+    uint sg     [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float part_m[kMlaSplit];
+  threadgroup float part_l[kMlaSplit];
+  threadgroup float part_acc[kMlaSplit * kMaxCkvPer * 32];
   mla_naive_paged_body(q_nope, q_pe, ckv_pages, kpe_pages, o, position_ids,
                        req_of_token, kv_page_indices, kv_page_indptr,
                        (const device int*)nullptr, 0, page_size, heads, ckv,
-                       kpe, sm_scale, gid, lane);
+                       kpe, sm_scale, gid, lane, sg,
+                       part_m, part_l, part_acc);
 }
 
 // The sparse reader: `attention.mla_decode_selected` and
@@ -368,8 +411,13 @@ inline void mla_naive_paged_body(
     const device int* selection     [[buffer(14)]],
     const constant int& top_k       [[buffer(15)]],
     uint2 gid   [[threadgroup_position_in_grid]],
-    uint lane   [[thread_index_in_simdgroup]]) {
+    uint lane   [[thread_index_in_simdgroup]],
+    uint sg     [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float part_m[kMlaSplit];
+  threadgroup float part_l[kMlaSplit];
+  threadgroup float part_acc[kMlaSplit * kMaxCkvPer * 32];
   mla_naive_paged_body(q_nope, q_pe, ckv_pages, kpe_pages, o, position_ids,
                        req_of_token, kv_page_indices, kv_page_indptr, selection,
-                       top_k, page_size, heads, ckv, kpe, sm_scale, gid, lane);
+                       top_k, page_size, heads, ckv, kpe, sm_scale, gid, lane, sg,
+                       part_m, part_l, part_acc);
 }
