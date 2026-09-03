@@ -480,9 +480,12 @@ constant int POOL_HEAD_MAX = 512;
 
   // Pass 1: the row max over the SELECTED keys only.
   float local_max = -INFINITY;
+  // The selection row is ascending with its `-1` padding as one tail
+  // (`index_topk_paged`), so the first `-1` a thread meets ends its share.
   for (int n = tid; n < top_k; n += POOL_ATTN_BLOCK) {
     const int c = srow[n];
-    if (c < 0 || c >= num_visible) continue;
+    if (c < 0) break;
+    if (c >= num_visible) continue;
     const size_t slot = pool_paged_slot(
         page_indices, page_indptr, req, (c + 1) * ratio - 1, page_size);
     const device bfloat* k_row = comp_kv_pages + slot * size_t(head_dim);
@@ -527,7 +530,8 @@ constant int POOL_HEAD_MAX = 512;
 
   for (int n = 0; n < top_k; ++n) {
     const int c = srow[n];
-    if (c < 0 || c >= num_visible) continue;
+    if (c < 0) break;
+    if (c >= num_visible) continue;
     const size_t slot = pool_paged_slot(
         page_indices, page_indptr, req, (c + 1) * ratio - 1, page_size);
     const device bfloat* k_row = comp_kv_pages + slot * size_t(head_dim);
