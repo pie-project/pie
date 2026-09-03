@@ -37,6 +37,7 @@ pub mod run;
 /// epilogue's `attn_score` intrinsic reads.
 pub mod scores;
 pub mod decoded;
+mod keepalive;
 mod scratch;
 pub mod serve;
 /// The settlement plane: run-ahead counters, completion seam, and the A/B

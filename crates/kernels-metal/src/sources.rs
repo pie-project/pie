@@ -18,6 +18,7 @@ macro_rules! source_root {
 /// `#include` lines resolve to.
 pub const SOURCES: &[(&str, &str)] = &[
     ("attn/attn_sink.metal", include_str!(concat!(source_root!(), "/attn/attn_sink.metal"))),
+    ("layout/keepalive.metal", include_str!(concat!(source_root!(), "/layout/keepalive.metal"))),
     ("attn/dense.metal", include_str!(concat!(source_root!(), "/attn/dense.metal"))),
     ("attn/index.metal", include_str!(concat!(source_root!(), "/attn/index.metal"))),
     ("attn/kv_write.metal", include_str!(concat!(source_root!(), "/attn/kv_write.metal"))),
