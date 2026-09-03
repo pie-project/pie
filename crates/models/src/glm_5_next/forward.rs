@@ -138,7 +138,7 @@ impl ForwardHybrid for Model {
         let mut streams = ops::elemwise::hc_expand(&narrow, hy.streams);
 
         let routes = inputs.adapter_routes();
-        for (_, w) in inputs.walk_layers(&m.layers) {
+        for (l, w) in inputs.walk_layers(&m.layers) {
             let (x, post_mix, comb_mix) = gate(&streams, &w.attn_mix, hy);
             let x = ops::elemwise::rmsnorm(&x, &w.mixer_norm, w.mixer_norm_eps);
             let o = match &w.mixer {
@@ -161,7 +161,10 @@ impl ForwardHybrid for Model {
 
             let (x, post_mix, comb_mix) = gate(&streams, &w.mlp_mix, hy);
             let x = ops::elemwise::rmsnorm(&x, &w.mlp_norm, w.mlp_norm_eps);
-            let f = mlp(&x, &w.mlp);
+            // The next layer's router run on THIS layer's pre-MoE streams: a
+            // prediction the streamed tier prefetches by (dsv4's idiom).
+            let hint = predict_next(&streams, m.layers.get(l as usize + 1), hy);
+            let f = mlp(&x, &w.mlp, hint.as_ref());
             let f = if m.tp > 1 {
                 ops::collective::all_reduce(&f)
             } else {
@@ -220,7 +223,7 @@ impl ForwardHybrid for Model {
                 };
                 let r = ops::elemwise::residual_add(&o, &fused);
                 let x = ops::elemwise::rmsnorm(&r, &mtp.mlp_norm, mtp.mlp_norm_eps);
-                let f = mlp(&x, &mtp.mlp);
+                let f = mlp(&x, &mtp.mlp, None);
                 let f = if m.tp > 1 {
                     ops::collective::all_reduce(&f)
                 } else {
@@ -245,7 +248,31 @@ impl ForwardHybrid for Model {
     }
 }
 
-fn mlp(x: &Value, mlp: &Mlp) -> Value {
+/// Experts ranked per row for the streamed tier's prefetch: the top
+/// `PREDICT_K` of the next router's scores, read at the current router's cut.
+const PREDICT_K: u32 = 16;
+
+/// The next layer's routing, predicted off this layer's streams before its
+/// own MoE: the next layer's mlp gate, norm and router applied here. `None`
+/// where there is no next routed layer.
+fn predict_next(streams: &Value, next: Option<&super::model::Layer>, hy: &Hyper) -> Option<Value> {
+    let next = next?;
+    let Mlp::Routed {
+        router,
+        bias,
+        experts,
+        ..
+    } = &next.mlp
+    else {
+        return None;
+    };
+    let (px, _, _) = gate(streams, &next.mlp_mix, hy);
+    let px = ops::elemwise::rmsnorm(&px, &next.mlp_norm, next.mlp_norm_eps);
+    let logits = ops::linear::matmul(&px, router);
+    Some(ops::linear::moe_predict_route(&logits, bias, *experts, PREDICT_K))
+}
+
+fn mlp(x: &Value, mlp: &Mlp, hint: Option<&Value>) -> Value {
     match mlp {
         Mlp::Dense {
             gate_up,
@@ -269,13 +296,14 @@ fn mlp(x: &Value, mlp: &Mlp) -> Value {
             renorm,
             scaling,
         } => {
-            let (routes, weights) = ops::linear::moe_topk_sigmoid_biased(
+            let (routes, weights) = ops::linear::moe_topk_sigmoid_biased_hinted(
                 &ops::linear::matmul(x, router),
                 bias,
                 *experts,
                 *top_k,
                 *renorm,
                 *scaling,
+                hint,
             );
             let packed = ops::linear::moe_matmul_select_quant(x, gate_up, &routes, *top_k);
             let act = ops::linear::mlp_swiglu_clamp(&packed, *inter, *limit);

@@ -100,6 +100,9 @@ pub enum Linear {
         scaling: f32,
         routes: ValueId,
         weights: ValueId,
+        /// A prediction of the next layer's routes, read by nobody but the
+        /// streamed tier at this router's cut — see `MoeTopkSqrtSoftplus`.
+        hint: Option<ValueId>,
     },
     /// Sigmoid routing with a per-expert bias; weights pass through sqrt-softplus.
     ///
@@ -257,9 +260,10 @@ impl Operands for Linear {
             Self::MlpSitu { packed, .. } => sink.push(*packed),
             Self::MoeTopkSoftmax { logits, .. } => sink.push(*logits),
             Self::MoeTopkSoftmaxScaled { logits, scale, .. } => sink.extend([*logits, *scale]),
-            Self::MoeTopkSigmoid { logits, bias, .. } => {
+            Self::MoeTopkSigmoid { logits, bias, hint, .. } => {
                 sink.push(*logits);
                 sink.extend(*bias);
+                sink.extend(*hint);
             }
             Self::MoeTopkSqrtSoftplus { logits, bias, hint, .. } => {
                 sink.extend([*logits, *bias]);

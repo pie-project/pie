@@ -181,6 +181,7 @@ impl Run<'_> {
                 scaling,
                 routes,
                 weights,
+                hint: _,
             } => match bias {
                 Some(bias) => linear::moe::topk_sigmoid_biased(
                     self.ctx(),

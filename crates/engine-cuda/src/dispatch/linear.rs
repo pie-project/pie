@@ -250,6 +250,7 @@ impl Run<'_> {
                 scaling,
                 routes,
                 weights,
+                hint: _,
             } => linear::moe::topk_sigmoid(
                 self.ctx(),
                 self.tensor(*logits),

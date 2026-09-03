@@ -212,6 +212,7 @@ pub fn moe_topk_sigmoid(
             scaling,
             routes: routes.id(),
             weights: weights.id(),
+            hint: None,
         },
         &[logits],
     );
@@ -228,9 +229,26 @@ pub fn moe_topk_sigmoid_biased(
     renormalize: bool,
     scaling: f32,
 ) -> (Value, Value) {
+    moe_topk_sigmoid_biased_hinted(logits, bias, experts, top_k, renormalize, scaling, None)
+}
+
+/// [`moe_topk_sigmoid_biased`] carrying a next-layer route prediction as
+/// `hint`, so the prediction stays live to this router's segment cut.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_topk_sigmoid_biased_hinted(
+    logits: &Value,
+    bias: &Weight,
+    experts: u32,
+    top_k: u32,
+    renormalize: bool,
+    scaling: f32,
+    hint: Option<&Value>,
+) -> (Value, Value) {
     let r = logits.rec();
     let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
     let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
+    let mut ins: Vec<&Value> = vec![logits];
+    ins.extend(hint);
     r.push(
         Linear::MoeTopkSigmoid {
             logits: logits.id(),
@@ -241,8 +259,9 @@ pub fn moe_topk_sigmoid_biased(
             scaling,
             routes: routes.id(),
             weights: weights.id(),
+            hint: hint.map(Value::id),
         },
-        &[logits],
+        &ins,
     );
     (routes, weights)
 }

@@ -311,6 +311,11 @@ fn found(
             routes,
             hint: Some(hint),
             ..
+        }
+        | Linear::MoeTopkSigmoid {
+            routes,
+            hint: Some(hint),
+            ..
         } = op
         {
             hints.insert(routes.0, *hint);
