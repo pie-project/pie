@@ -33,15 +33,17 @@ async def _timed(client, args, name, inputs):
 
 async def bench(client, args):
     spec = lambda k: {"prompt": PROMPT, "max_tokens": MAX_TOKENS, "k": k}
+    # BENCH_NAME picks the loop (the hybrid `rs-mtp-speculative-decoding` for a GDN model).
+    loop = os.environ.get("BENCH_NAME", "mtp-speculative-decoding")
     # Warm: the artifact into the page cache, the seats filled.
-    await _timed(client, args, "mtp-speculative-decoding", spec(0))
-    depth = (await _timed(client, args, "mtp-speculative-decoding", spec(1)))[2]["depth"]
+    await _timed(client, args, loop, spec(0))
+    depth = (await _timed(client, args, loop, spec(1)))[2]["depth"]
     arms = []
     # BENCH_ARMS="k=2;k=2,pad=1;k=0,pad=2": explicit arms instead of the ladder.
     if os.environ.get("BENCH_ARMS"):
         for arm in os.environ["BENCH_ARMS"].split(";"):
             kv = dict(p.split("=") for p in arm.split(","))
-            arms.append((arm, "mtp-speculative-decoding", {**spec(int(kv.get("k", 0))), "pad": int(kv.get("pad", 0))}))
+            arms.append((arm, loop, {**spec(int(kv.get("k", 0))), "pad": int(kv.get("pad", 0))}))
         rows = {label: [] for label, _, _ in arms}
         for _ in range(REPEATS):
             for label, name, inputs in arms:

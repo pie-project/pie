@@ -1151,6 +1151,14 @@ async def run(args: argparse.Namespace):
                 result.output_token_sha256 = hash_output_tokens(token_ids)
                 if args.dump_all_token_ids:
                     result.output_token_ids = token_ids
+        # Say why requests failed, a few distinct texts, so a dropped row
+        # reads from the log instead of a bare count.
+        seen: dict[str, int] = {}
+        for r in results:
+            if not r.ok:
+                seen[(r.error or "?")[:200]] = seen.get((r.error or "?")[:200], 0) + 1
+        for why, n in list(seen.items())[:4]:
+            print(f"[pie-bench] {n} failed: {why}", file=sys.stderr, flush=True)
         if args.mode == "tput" and args.defer_start:
             measured = [r.latency_s for r in results if r.ok]
             if measured:

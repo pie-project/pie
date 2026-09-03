@@ -5499,21 +5499,21 @@ impl engine::frame::Shell for Shell {
                     started.elapsed().as_secs_f64() * 1e3
                 );
             }
-            // `PIE_KERNEL_PROFILE=1` beside it: the device time of this fire
-            // by entrypoint, top ten, then the tally starts over.
-            let profile = crate::encode::kernel_profile();
-            if !profile.is_empty() {
-                let total: u64 = profile.iter().map(|(_, ns, _)| ns).sum();
-                eprintln!("kernels: fire of {} row(s), {:.1} ms on the device:", prepared.descriptor.rows, total as f64 / 1e6);
-                for (name, ns, launches) in profile.iter().take(10) {
-                    eprintln!("  {:>9.1} ms  {:>5} launch(es)  {name}", *ns as f64 / 1e6, launches);
-                }
-                crate::encode::reset_kernel_profile();
-            }
             walked
         } else {
             self.walk_once(&prepared, Mode::Encode)?
         };
+        // `PIE_KERNEL_PROFILE=1`: the device time of this fire by entrypoint,
+        // top ten, then the tally starts over — resident or streamed alike.
+        let profile = crate::encode::kernel_profile();
+        if !profile.is_empty() {
+            let total: u64 = profile.iter().map(|(_, ns, _)| ns).sum();
+            eprintln!("kernels: fire of {} row(s), {:.1} ms on the device:", prepared.descriptor.rows, total as f64 / 1e6);
+            for (name, ns, launches) in profile.iter().take(10) {
+                eprintln!("  {:>9.1} ms  {:>5} launch(es)  {name}", *ns as f64 / 1e6, launches);
+            }
+            crate::encode::reset_kernel_profile();
+        }
         let mut frame = walked
             .frame
             .expect("the encoding mode opened a frame");

@@ -68,6 +68,11 @@ def run_json(cmd: list[str], env: dict[str, str] | None = None) -> dict | None:
             text=True,
             timeout=1800,
         )
+        # `THREE_WAY_LOG=path` keeps every child's full output, so a dropped
+        # request reads from a file instead of the last four lines.
+        if os.environ.get("THREE_WAY_LOG"):
+            with open(os.environ["THREE_WAY_LOG"], "a") as log:
+                log.write(f"\n===== {' '.join(cmd)}\n{proc.stdout}\n--- stderr\n{proc.stderr}\n")
         if not os.path.getsize(path):
             sys.stderr.write(
                 f"    (no result: rc={proc.returncode})\n"
