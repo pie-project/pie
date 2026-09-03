@@ -28,6 +28,7 @@ members = [
     "trackb-snapkv",
     "repetition-penalty",
     "rs-mtp-speculative-decoding",
+    "rs-mtp-speculative-bench",
     "rs-speculative-decoding",
     "rs-window-decode",
     "dry-repetition-penalty",

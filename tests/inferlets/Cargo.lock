@@ -474,6 +474,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rs-mtp-speculative-bench"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "rs-mtp-speculative-decoding"
 version = "0.1.0"
 dependencies = [

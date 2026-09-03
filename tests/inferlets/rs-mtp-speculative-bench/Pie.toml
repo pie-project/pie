@@ -1,0 +1,13 @@
+[package]
+name = "rs-mtp-speculative-bench"
+version = "0.1.0"
+description = "Device-resident MTP speculative decoding on a HYBRID model: one lane of k+1 rows a fire, verified, committed and re-drafted in the epilogue, with the recurrent state driven through the WINDOW verb off the device's accepted count — no host in the loop"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to continue (raw encoding)"}
+max_tokens = {type = "int", optional = true, description = "Tokens to generate (default: 64)"}
+k = {type = "int", optional = true, description = "Draft tokens per round, capped at the model's mtp_depth (default: 1); 0 is the sequential control"}
