@@ -61,5 +61,22 @@ pub fn skus() -> Vec<crate::Sku> {
             &tokenizer::CONTRACT_VISION,
             |tp: u32| Model::flash_vision(Dtype::U8g64, Dtype::U2g64, Dtype::Bf16, tp),
         ),
+        // The dense tier re-encoded to 4-bit (the conversion ships it at 8):
+        // half the bytes the attention, KDA, shared-expert and tower planes
+        // read every token, and 3 GiB of resident seats handed back to the
+        // streamed experts. A second quantization, so never picked by
+        // identification; pin it with `PIE_IMPORT_SKU`.
+        (
+            "glm53-flash-mtp-vision",
+            1,
+            [Dtype::U4g64, Dtype::U2g64, Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::instruct,
+            &tokenizer::CONTRACT_VISION,
+            |tp: u32| {
+                Model::flash_mtp_vision(Dtype::U4g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16, tp)
+            },
+        ),
     ]
 }

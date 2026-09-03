@@ -923,6 +923,11 @@ fn refuse_a_decode_of_packed_codes(
     metadata: &Metadata,
 ) -> Result<()> {
     for tensor in &contract.tensors {
+        // An internal plane never lands in the artifact: a re-encode takes
+        // its stored codes through bf16 on the way to the codes it publishes.
+        if !tensor.visibility.is_public() {
+            continue;
+        }
         if decodes_a_packed_plane(&tensor.expr, metadata) {
             bail!(
                 "{sku}: `{}` decodes a plane the checkpoint stores packed, and the artifact \

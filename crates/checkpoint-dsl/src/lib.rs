@@ -457,6 +457,10 @@ fn affine_planes(
     parts: Vec<String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let axis = if parts.len() > 1 { pack_axis(w) } else { 0 };
+    let stored = stored_affine(src, w, &parts[0], axis)?;
+    if stored != w.dtype {
+        return affine_reencoded(src, w, parts, axis, stored);
+    }
     let mut codes = Vec::new();
     let mut scales = Vec::new();
     let mut biases = Vec::new();
@@ -499,6 +503,134 @@ fn affine_planes(
         // offsetting: the zero-point entry, names which weight it centres.
         factors(src, model_dsl::biases_name(&w.name), &biases, counted, axis)?
             .offsetting(w.name.clone()),
+    ])
+}
+
+/// The width the file stores an affine bank at, read off its word count: a
+/// `[N, K / codes-a-word]` u32 plane spans the declared `K`, so the codes a
+/// word holds — and the bits — are the ratio. The row's dtype names the
+/// SERVED form; where the two differ, [`affine_reencoded`] takes the bank
+/// through its values. A pack joined on the contracted axis has no one `K`
+/// a leg spans, so it is read as stored at the row's own width.
+fn stored_affine(src: &ztensor::Source, w: &Weight, part: &str, axis: u8) -> Result<Dtype, Error> {
+    let declared = extents(w);
+    let Some(&k) = declared.last() else {
+        return Ok(w.dtype);
+    };
+    if declared.len() > 1 && usize::from(axis) == declared.len() - 1 {
+        return Ok(w.dtype);
+    }
+    let Some(tensor) = src.get(part) else {
+        return Err(Error::Missing(part.to_string()));
+    };
+    let Some(&words) = tensor.shape().last() else {
+        return Ok(w.dtype);
+    };
+    let words = i64::try_from(words).expect("an extent no i64 holds");
+    if words <= 0 || k % words != 0 || 32 % (k / words) != 0 {
+        return Err(Error::Illegible {
+            name: w.name.clone(),
+            detail: format!(
+                "`{part}` packs {words} words a row over a declared width of {k}; \
+                 MLX affine codes fill a 32-bit word at 2, 4 or 8 bits"
+            ),
+        });
+    }
+    let bits = 32 / (k / words);
+    let group = match encoding(w.dtype) {
+        Encoding::Quant(spec) => spec.normalized_group_size(),
+        Encoding::Raw(_) => return Ok(w.dtype),
+    };
+    match (bits, group) {
+        (8, 64) => Ok(Dtype::U8g64),
+        (4, 64) => Ok(Dtype::U4g64),
+        (4, 32) => Ok(Dtype::U4g32),
+        (2, 32) => Ok(Dtype::U2g32),
+        (2, 64) => Ok(Dtype::U2g64),
+        (2, 128) => Ok(Dtype::U2g128),
+        _ => Err(Error::Illegible {
+            name: w.name.clone(),
+            detail: format!(
+                "`{part}` is stored at {bits} bits in groups of {group}, a width \
+                 no affine row here names"
+            ),
+        }),
+    }
+}
+
+/// [`affine_planes`] for a bank the file stores at another width than the
+/// row serves (an 8-bit conversion read by a 4-bit row): no kernel re-encodes
+/// codes in one step, so the stored triplet is read under `<name>.stored`
+/// (internal: never the engine's), taken to bf16 by its own scales and
+/// biases — the affine fragment's per-block `Scale` decodes MLX codes — and
+/// that value plane is encoded as the row's form, which publishes the new
+/// scales and biases itself. A second quantization: a row takes it on
+/// purpose (pinned), never by identification.
+fn affine_reencoded(
+    src: &ztensor::Source,
+    w: &Weight,
+    parts: Vec<String>,
+    axis: u8,
+    stored: Dtype,
+) -> Result<Vec<TensorContract>, Error> {
+    let stored_w = Weight {
+        dtype: stored,
+        ..w.clone()
+    };
+    let mut codes = Vec::new();
+    let mut scales = Vec::new();
+    let mut biases = Vec::new();
+    let mut legs = Vec::new();
+    for part in &parts {
+        let stem = part
+            .strip_suffix(".weight")
+            .ok_or_else(|| Error::Illegible {
+                name: w.name.clone(),
+                detail: format!(
+                    "`{part}` holds MLX affine codes, whose scales and biases \
+                     are named beside a `.weight`, and it does not end in one"
+                ),
+            })?;
+        let unpacked = unpacked_extents(src, &stored_w, part)?;
+        legs.push(unpacked.clone());
+        codes.push(Expr::src(part.clone()).transmute(TensorType::new(unpacked, grouped(&stored_w))));
+        scales.push(model_dsl::scales_name(stem));
+        biases.push(model_dsl::biases_name(stem));
+    }
+    holds_the_declared_rectangle(w, axis, &legs)?;
+    let pairing = scaling(&stored_w);
+    let counted = divided(
+        &extents(w),
+        pairing.channel_axis,
+        pairing.group_size,
+        &w.name,
+    );
+    let stored_name = format!("{}.stored", w.name);
+    let stored_scales = format!("{stored_name}.scales");
+    let stored_biases = format!("{stored_name}.biases");
+    let scaled = format!("{stored_name}.scaled");
+    let values = format!("{stored_name}.values");
+    let bf16 = encoding(Dtype::Bf16);
+    Ok(vec![
+        TensorContract::inferred(stored_name.clone(), joined(axis, codes), grouped(&stored_w))
+            .internal(),
+        factors(src, stored_scales.clone(), &scales, counted.clone(), axis)?.internal(),
+        factors(src, stored_biases.clone(), &biases, counted, axis)?.internal(),
+        TensorContract::new(
+            scaled.clone(),
+            Expr::out(stored_name).scale_per_block(Expr::out(stored_scales)),
+            extents(w),
+            bf16.clone(),
+        )
+        .internal(),
+        TensorContract::new(
+            values.clone(),
+            Expr::out(scaled).bias_per_block(Expr::out(stored_biases)),
+            extents(w),
+            bf16,
+        )
+        .internal(),
+        TensorContract::inferred(w.name.clone(), Expr::out(values).cast(grouped(w)), grouped(w)),
     ])
 }
 
