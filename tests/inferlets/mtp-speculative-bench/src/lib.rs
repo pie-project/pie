@@ -334,8 +334,13 @@ async fn main(input: Input) -> Result<Output> {
         let w_slot = Channel::from_iter((n..n + w).map(|p| p / page_size)).named("w_slot");
         let w_off = Channel::from_iter((n..n + w).map(|p| p % page_size)).named("w_off");
         let kv_len = Channel::from_iter((n..n + w).map(|p| p + 1)).named("kv_len");
+        // The take-side rings a full frame of margin ABOVE the advertised
+        // capacity, as `text-completion-bench` sizes its own: sized at exactly
+        // `channel_capacity()` the runtime's ticket check skips continuations
+        // that land inside its staging margin, the run-ahead collapses, and
+        // every round's host turnaround lands on the critical path.
         let out = Channel::new([w], dtype::i32)
-            .capacity(channel_capacity() as u32)
+            .capacity((channel_capacity() + 7 * live_slots()) as u32)
             .named("out");
         // The twelfth channel is either the margin or the trace: a declared
         // channel is bound whether or not a stage touches it, and the pass
@@ -347,7 +352,7 @@ async fn main(input: Input) -> Result<Output> {
         // has room for exactly this many. f32 for both — a token id is exact
         // in f32.
         let aux = Channel::new([if tracing { 2 * w } else { 1 }], dtype::f32)
-            .capacity(channel_capacity() as u32)
+            .capacity((channel_capacity() + 7 * live_slots()) as u32)
             .named("aux");
 
         let fwd = ForwardPass::new();

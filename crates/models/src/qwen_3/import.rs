@@ -300,7 +300,7 @@ impl Model {
             // head alone, `fc.*` and `layers.0.*` at its root) rides in by
             // `--aux`, which prefixes it `aux.`; a checkpoint that carries
             // the head names it by the recipe's own prefix.
-            let p: String = if src.get("aux.fc.weight").is_some() {
+            let p: String = if src.get("aux.fc.weight").is_some() || src.get("aux.fc_embed.weight").is_some() {
                 "aux".to_string()
             } else {
                 mtp.recipe.prefix().to_string()
@@ -313,10 +313,18 @@ impl Model {
 
             // `mtp.fc.weight` is `[hidden, 2*hidden]`; columns `0..hidden`
             // are the embedding half, `hidden..2*hidden` the hidden half.
-            let half = extents(&mtp.fc_embed)[1];
-            let fc = format!("{p}.fc.weight");
-            b.read_expr(&mtp.fc_embed, Expr::src(fc.clone()).slice(1, 0, half))?;
-            b.read_expr(&mtp.fc_hidden, Expr::src(fc).slice(1, half, half))?;
+            // A head restated with the halves split first
+            // (`scripts/split_mtp_fc.py`, needed when the head ships as packed
+            // codes) names them; otherwise the one bank is sliced.
+            if src.get(&format!("{p}.fc_embed.weight")).is_some() {
+                b.read(&mtp.fc_embed, format!("{p}.fc_embed.weight"))?;
+                b.read(&mtp.fc_hidden, format!("{p}.fc_hidden.weight"))?;
+            } else {
+                let half = extents(&mtp.fc_embed)[1];
+                let fc = format!("{p}.fc.weight");
+                b.read_expr(&mtp.fc_embed, Expr::src(fc.clone()).slice(1, 0, half))?;
+                b.read_expr(&mtp.fc_hidden, Expr::src(fc).slice(1, half, half))?;
+            }
 
             let a = &mtp.attn;
             b.read(&mtp.mixer_norm, n("input_layernorm.weight"))?;
