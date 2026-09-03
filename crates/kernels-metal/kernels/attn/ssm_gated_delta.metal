@@ -271,11 +271,19 @@ template <typename T, int WIDTH, int KMAX>
   // time, and a column's state stays in registers across every row of the
   // chunk — the bank is read once, and written once, as of `keep`. Only a
   // run longer than one chunk goes through `work` between chunks.
+  // SPAN rows a chunk, sized for a depth-one window and its replay (fold
+  // ≤ 2 + 2 own rows) in ONE chunk while keeping the staging under 10 KB —
+  // an 8-row chunk with a fold table a row was 24 KB, which on this device
+  // (32 KB a core) parks a single threadgroup per core and made the arm 6×
+  // the decode kernel's per-row cost. The norm fold is `gated_delta`'s
+  // WIDTH-wide tree, one row at a time through one table, so the banks it
+  // leaves are bit for bit the unbuffered fold's.
   constexpr int PER = KMAX / 32;
-  constexpr int SPAN = 8;
+  constexpr int SPAN = 4;
+  constexpr int simdgroups = WIDTH / 32;
   threadgroup float sq[SPAN][KMAX];
   threadgroup float sk[SPAN][KMAX];
-  threadgroup float2 fold[SPAN][WIDTH];
+  threadgroup float2 fold[WIDTH];
 
   const int tid = int(lpos.x);
   const int hv = int(gpos.y);
@@ -313,13 +321,12 @@ template <typename T, int WIDTH, int KMAX>
 
   const int per_part = dv / splits;
   const int c0 = part * per_part;
-  constexpr int simdgroups = WIDTH / 32;
   const int lane = int(simd_lane);
 
   for (int t0 = 0; t0 < span; t0 += SPAN) {
     const int rows = min(SPAN, span - t0);
 
-    // Stage this chunk's normalized q and k rows.
+    // Stage this chunk's normalized q and k rows, a row at a time.
     for (int t = 0; t < rows; ++t) {
       const size_t row = size_t(begin + t0 + t) * pitch;
       const size_t qbase = row + size_t(hk) * size_t(dk);
@@ -332,26 +339,22 @@ template <typename T, int WIDTH, int KMAX>
         sk[t][i] = kv;
         sums += float2(qv * qv, kv * kv);
       }
-      fold[t][tid] = sums;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int off = WIDTH / 2; off > 0; off >>= 1) {
-      if (tid < off) {
-        for (int t = 0; t < rows; ++t) {
-          fold[t][tid] += fold[t][tid + off];
-        }
-      }
+      fold[tid] = sums;
       threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    for (int t = 0; t < rows; ++t) {
-      const float qinv = metal::rsqrt(fold[t][0].x + 1e-6f) * scale;
-      const float kinv = metal::rsqrt(fold[t][0].y + 1e-6f);
+      for (int off = WIDTH / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+          fold[tid] += fold[tid + off];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      const float qinv = metal::rsqrt(fold[0].x + 1e-6f) * scale;
+      const float kinv = metal::rsqrt(fold[0].y + 1e-6f);
       for (int i = tid; i < dk; i += WIDTH) {
         sq[t][i] *= qinv;
         sk[t][i] *= kinv;
       }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Every column of this threadgroup, the chunk's rows in registers.
     for (int c = c0 + int(simd_gid); c < c0 + per_part; c += simdgroups) {
