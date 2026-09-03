@@ -248,9 +248,7 @@ impl ForwardHybrid for Model {
         let logits = ops::linear::lm_head(&x, head);
 
         // Stated after the trunk's readout, so a draft column doesn't share
-        // address space with the trunk's `lm_head` output. Row alignment:
-        // lane row `r` carries the token one position past the hidden the
-        // trunk leaves at `r`.
+        // address space with the trunk's `lm_head` output.
         if let Some(mtp) = &m.mtp {
             // Minted inside the arm and off the draft window's own inputs, so
             // a SKU with no draft head carries no plan build for it.
@@ -258,13 +256,20 @@ impl ForwardHybrid for Model {
             let plan_mtp =
                 ops::attn::plan_prefill(&input_mtp, m.q_heads, m.kv_heads, m.head_dim, None);
             let (dx, _) = x.split(&Facts::drafts());
-            let (dids, _) = ids.split(&Facts::drafts());
+            // The token the head pairs with row r's hidden is THE TRUNK'S
+            // ARGMAX there — the module is trained on `(h_t, x_{t+1}) → x_{t+2}`,
+            // and the verifier's window opens on that same argmax, so the
+            // draft is the token after the correction (as the dsv4, gemma4
+            // and qwen4 arms read it). Row r's own id pairs it one position
+            // early and the head drafts nothing the trunk accepts.
+            let (dlogits, _) = logits.split(&Facts::drafts());
+            let chosen = ops::layout::argmax(&[&dlogits]);
 
             // `[a|b]*[We|Wh]^T = a*We^T + b*Wh^T`, as two matmuls and one add
             // since the IR has no concatenation. The pre-norms are the
             // recipe's: MTP normalizes each stream first, EAGLE fuses the
             // raw pair (`None` here is a recipe with no norm, not a skip).
-            let e = ops::layout::embed(&dids, &m.embed, m.vocab);
+            let e = ops::layout::embed(&chosen, &m.embed, m.vocab);
             let (e, h) = match &mtp.pre_fc {
                 Some(pre) => (
                     ops::elemwise::rmsnorm_plus_one(&e, &pre.embedding, pre.eps),
@@ -318,6 +323,10 @@ impl ForwardHybrid for Model {
             };
             let draft = ops::linear::lm_head(&read, head);
             seam::at(seam::MTP, &[&draft]);
+            // The token plane the device-resident loop reads
+            // (`intrinsics::mtp_drafts`): depth one, the head's argmax at
+            // every drafting row — what `mtp_depth` advertises.
+            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&[&draft])]);
         }
 
         logits
