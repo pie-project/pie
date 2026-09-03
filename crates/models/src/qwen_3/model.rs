@@ -386,6 +386,14 @@ impl Model {
         Model::new(w, kv, tp, Model::a3b_dims())
     }
 
+    /// The A3B with its published MTP head (`mlx-community/Qwen3.6-35B-A3B-MTP-4bit`,
+    /// the head alone, overlaid by `--aux`): one dense block over the mixture.
+    pub fn a3b_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::a3b_dims();
+        d.draft = Some(Recipe::Mtp);
+        Model::new(w, kv, tp, d)
+    }
+
     /// The shipped A3B geometry, factored out so the miniature below can move
     /// the two numbers it moves and nothing else.
     fn a3b_dims() -> Dims {

@@ -296,7 +296,15 @@ impl Model {
         // tensor name `aux.` and this block names them by the family's own
         // block spelling.
         if let Some(mtp) = &self.mtp {
-            let p = mtp.recipe.prefix();
+            // A head published on its own (`mlx-community/*-MTP-4bit` is the
+            // head alone, `fc.*` and `layers.0.*` at its root) rides in by
+            // `--aux`, which prefixes it `aux.`; a checkpoint that carries
+            // the head names it by the recipe's own prefix.
+            let p: String = if src.get("aux.fc.weight").is_some() {
+                "aux".to_string()
+            } else {
+                mtp.recipe.prefix().to_string()
+            };
             let n = |s: &str| format!("{p}.layers.0.{s}");
             if let Some(pre) = &mtp.pre_fc {
                 b.read(&pre.embedding, format!("{p}.pre_fc_norm_embedding.weight"))?;

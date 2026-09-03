@@ -283,6 +283,12 @@ pub const ROWS: &[Row] = &[
     // From the 4-bit artifact's own text_config (num_hidden_layers: 40,
     // vocab_size: 248320) — the qwen35-a3b geometry.
     Row {
+        id: "qwen36-35b-a3b-mtp-u4g64-kv-bf16",
+        layers: 40,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
         id: "qwen36-35b-a3b-u4g64-kv-bf16",
         layers: 40,
         vocab: 248_320,
