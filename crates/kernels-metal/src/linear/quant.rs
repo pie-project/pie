@@ -62,6 +62,12 @@ const QMV_GROUP: [u32; 3] = [32, 2, 1];
 
 /// The contraction step the tiled point walks; `K % BK == 0` is required for `load_unsafe`.
 const QMM_BK: i32 = 32;
+/// The k block the pre-cast (gs=64/b=4) tile is stamped at: the widest the
+/// quantized loader admits (`BCOLS <= group_size`), so a threadgroup walks
+/// half the k steps — half the barriers and twice the bytes a thread has in
+/// flight between them — of the 32-deep block the plain stamp keeps for
+/// group-32 formats.
+const PRECAST_BK: i32 = 64;
 
 /// Row tiles the GEMM is stamped at, narrowest first ([`bm_rung`]'s walk order); floor is 8 since `BM = 4` leaves `WM` nowhere to go.
 const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
@@ -547,6 +553,7 @@ pub fn act_x_wt(
         // Rung 2: the staged input. The cast writes `padded x k` halves,
         // the GEMM reads them at buffer 12 and leaves the bf16 seat null.
         if fp16
+            && k % PRECAST_BK == 0
             && let Some(staged) = (scratch.precast)(padded.unsigned_abs(), k.unsigned_abs())
             && let Some(bn) = bn_unsplit(n, padded / bm, crossover)
         {

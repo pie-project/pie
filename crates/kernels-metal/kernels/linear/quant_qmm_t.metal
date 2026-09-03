@@ -268,9 +268,6 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = BK + 16 / sizeof(half);
 
-  using loader_w_t = QuantizedBlockLoader<
-      bfloat, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits, half>;
-
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
   const int y_col = int(tid.x) * BN;
@@ -279,6 +276,8 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
   wl += y_col * K_w;
   scales += y_col * K_g;
   biases += y_col * K_g;
+  using loader_w_t = QuantizedBlockLoader<
+      bfloat, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits, half>;
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
   qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS,
                     WM, WN>(
@@ -772,7 +771,7 @@ instantiate_qmm_t_routed_fp16(64, 64)
 #define instantiate_qmm_t_fp16_precast(bm, bn)                              \
   template [[host_name("affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_"   \
                        #bm "_bn_" #bn)]]                                     \
-  [[kernel]] void affine_qmm_t_fp16_precast<64, 4, bm, 32, bn>(             \
+  [[kernel]] void affine_qmm_t_fp16_precast<64, 4, bm, 64, bn>(             \
       const device uint32_t*, const device bfloat*, const device bfloat*,    \
       device bfloat*, const constant int&, const constant int&,              \
       const device half*, uint3, uint, uint);
@@ -815,7 +814,7 @@ instantiate_qmm_t_fp16_precast(8, 64)
 #define instantiate_qmm_t_bias_fp16_precast(bm, bn)                          \
   template [[host_name("affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4"   \
                        "_bm_" #bm "_bn_" #bn)]]                              \
-  [[kernel]] void affine_qmm_t_bias_fp16_precast<64, 4, bm, 32, bn>(         \
+  [[kernel]] void affine_qmm_t_bias_fp16_precast<64, 4, bm, 64, bn>(         \
       const device uint32_t*, const device bfloat*, const device bfloat*,    \
       device bfloat*, const constant int&, const constant int&,              \
       const device bfloat*, const device half*, uint3, uint, uint);
@@ -823,7 +822,7 @@ instantiate_qmm_t_fp16_precast(8, 64)
 #define instantiate_qmm_t_residual_fp16_precast(bm, bn)                      \
   template [[host_name("affine_qmm_t_residual_fp16_precast_bfloat16"         \
                        "_gs_64_b_4_bm_" #bm "_bn_" #bn)]]                    \
-  [[kernel]] void affine_qmm_t_residual_fp16_precast<64, 4, bm, 32, bn>(     \
+  [[kernel]] void affine_qmm_t_residual_fp16_precast<64, 4, bm, 64, bn>(     \
       const device uint32_t*, const device bfloat*, const device bfloat*,    \
       device bfloat*, const constant int&, const constant int&,              \
       const device bfloat*, const device half*, uint3, uint, uint);
