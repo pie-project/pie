@@ -20,7 +20,12 @@
 //!    leaves the banks a `Fold` of the first window leaves and answers the
 //!    second window's logits within the bf16 floor of a fire over it after a
 //!    plain fold of the first — one speculative round, as
-//!    `rs-speculative-decoding` fires it;
+//!    `rs-speculative-decoding` fires it; and the round's own buffer then
+//!    folds to the banks folding its rows ONE AT A TIME leaves — the
+//!    committed scan is the decode kernel's shape (its dot products fold
+//!    across a simdgroup), so the bits it lands are the one-row fold's,
+//!    not the chunked prefill fold's (an ulp apart in a few cells once the
+//!    state is dense);
 //! 6. a lane folding in the forward beside a lane buffering answers exactly
 //!    what it answers alone;
 //! 7. **the window verb** (`RsVerb::Window`, the device-resident round's
@@ -278,14 +283,29 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
     );
     assert!(d <= LOGIT_FLOOR, "the read path answers other logits than a plain fold of the prefix: {d}");
     //    and the round's own buffer (B, scattered at `at = k`) then folds to
-    //    what Fold(A) then Fold(B) left
+    //    what Fold(A) then Fold(B) left — B folded a row at a time, the
+    //    decode kernel's shape, which is the committed scan's own. (The
+    //    six-row fold above is the chunked prefill kernel: a sequential dot
+    //    product where the decode and committed kernels fold across a
+    //    simdgroup, one f32 ulp apart in a few cells once the state is
+    //    dense. Its logits stand within the floor above; its bank bits are
+    //    not the claim here.)
     shell
         .fire_seated(&[seated(5, &second, &fold_buffered_at(k, k, k), RsReset::Held)])
         .expect("B's buffer folds");
+    shell.open(6).expect("slot 6 reopens");
+    shell
+        .fire_seated(&[seated(6, &tokens, &fold, RsReset::Fresh)])
+        .expect("A folds plainly again");
+    for row in 0..second.len() {
+        shell
+            .fire_seated(&[seated(6, &second[row..=row], &fold, RsReset::Held)])
+            .expect("one row of B folds");
+    }
     assert_eq!(
         shell.state_bytes(5).expect("slot 5"),
         shell.state_bytes(6).expect("slot 6"),
-        "folding the round's buffer did not leave the banks Fold(A) then Fold(B) leaves"
+        "folding the round's buffer did not leave the banks Fold(A) then Fold(B), a row at a time, leaves"
     );
 
     // ── claim 6: a folding lane beside a buffering lane answers what it answers alone
