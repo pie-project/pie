@@ -118,8 +118,12 @@ async def maybe_server(args: argparse.Namespace, batch: int):
                 "or point --python at another one."
             )
         url = f"http://127.0.0.1:{args.port}"
+        # `--server-module`: `mlx_lm server` (default) or `mlx_vlm.server`
+        # (Gemma 4's MTP drafter lives there); `--server-extra`: flags handed
+        # to the server verbatim (`--draft-model … --num-draft-tokens N`).
+        module = (args.server_module or "mlx_lm server").split()
         cmd = [
-            python, "-m", "mlx_lm", "server",
+            python, "-m", *module,
             "--model", args.model,
             "--host", "127.0.0.1",
             "--port", str(args.port),
@@ -127,6 +131,7 @@ async def maybe_server(args: argparse.Namespace, batch: int):
             "--prompt-concurrency", str(args.prompt_concurrency),
             "--prompt-cache-size", str(args.prompt_cache_size),
             "--log-level", "ERROR",
+            *args.server_extra.split(),
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         deadline = time.time() + args.startup_timeout
@@ -301,6 +306,10 @@ def build_parser() -> argparse.ArgumentParser:
                  "at --url, whose flags this cannot then report.",
         )
         sp.add_argument("--port", type=int, default=8080)
+        sp.add_argument("--server-module", default=None,
+                        help="python -m target for the server: `mlx_lm server` (default) or `mlx_vlm.server`")
+        sp.add_argument("--server-extra", default="",
+                        help="Extra server flags, space-separated (draft model, draft kind, ...)")
         sp.add_argument(
             "--python",
             default=None,

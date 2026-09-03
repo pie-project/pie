@@ -34,6 +34,16 @@ pub fn skus() -> Vec<crate::Sku> {
             |tp: u32| Model::a4b(Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
+            "gemma4-31b-mtp",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::gemma4,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::b31_mtp(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
             "gemma4-31b",
             1,
             [Dtype::U4g64],

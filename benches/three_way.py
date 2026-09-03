@@ -140,6 +140,9 @@ def main() -> None:
                          "engine derives its fleet from the page pool, and the "
                          "shared `--max-model-len` times the fleet is what it "
                          "has to fit).")
+    ap.add_argument("--mlx-extra", default="", help="mlx_bench --server-extra (e.g. draft flags)")
+    ap.add_argument("--mlx-module", default=None, help="mlx_bench --server-module (e.g. mlx_vlm.server)")
+    ap.add_argument("--llama-extra", default="", help="llamacpp_bench --server-extra (e.g. --spec-type draft-mtp ...)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--extra", default="",
                     help="Space-separated flags forwarded to all three harnesses "
@@ -172,8 +175,12 @@ def main() -> None:
                                          f"{ROOT.parent}/sdk/server/python/python"}
                 elif engine == "mlx":
                     cmd, env = [MLX_PY, "mlx_bench.py"] + run, None
+                    if args.mlx_extra:
+                        cmd += ["--server-extra", args.mlx_extra]
+                    if args.mlx_module:
+                        cmd += ["--server-module", args.mlx_module]
                 else:
-                    cmd = [MLX_PY, "llamacpp_bench.py"] + run + [
+                    cmd = [MLX_PY, "llamacpp_bench.py"] + run + (["--server-extra", args.llama_extra] if args.llama_extra else []) + [
                         "--server-bin", shutil.which("llama-server") or "llama-server",
                         "--gguf-model", args.gguf, "--port", "8099",
                         "--max-model-len", str(args.max_model_len)]

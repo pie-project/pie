@@ -512,6 +512,15 @@ impl Model {
         Model::new(w, kv, tp, d)
     }
 
+    /// The 31B with Google's own drafter overlaid
+    /// (`gemma-4-31B-it-assistant`): the same four-layer head over a
+    /// 5376-wide trunk. See [`Model::a4b_mtp`].
+    pub fn b31_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::b31_dims();
+        d.assistant = true;
+        Model::new(w, kv, tp, d)
+    }
+
     pub fn b31(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::b31_dims())
     }

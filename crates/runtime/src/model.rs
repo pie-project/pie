@@ -141,6 +141,12 @@ pub const ROWS: &[Row] = &[
     },
     // mlx 4-bit: same trunk geometry as its bf16 sibling.
     Row {
+        id: "gemma4-31b-mtp-u4g64-kv-bf16",
+        layers: 60,
+        vocab: 262_144,
+        arch: "gemma4",
+    },
+    Row {
         id: "gemma4-31b-u4g64-kv-bf16",
         layers: 60,
         vocab: 262_144,
@@ -251,7 +257,19 @@ pub const ROWS: &[Row] = &[
     },
     // mlx 4-bit rows: same trunk geometry as their bf16 siblings.
     Row {
+        id: "qwen36-27b-mtp-u4g64-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
         id: "qwen36-27b-u4g64-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen38-27b-mtp-u4g64-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",

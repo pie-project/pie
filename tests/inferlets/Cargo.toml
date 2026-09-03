@@ -18,6 +18,7 @@ members = [
     "lora-probe",
     "mirostat-v2-sampling",
     "mtp-speculative-decoding",
+    "mtp-speculative-bench",
     "naive-baseline",
     "naive-masked",
     "prefix-tree-kv-cache",

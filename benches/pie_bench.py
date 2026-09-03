@@ -764,6 +764,10 @@ async def run(args: argparse.Namespace):
                 "report_timing": args.report_timing,
                 "report_arrivals": args.report_arrivals,
                 "wait_for_start": args.defer_start,
+                # `--extra-input KEY=VALUE`: fields the inferlet under
+                # `--inferlet-dir` reads that this harness does not know
+                # (`k` for a speculative loop).
+                **{k: v for k, v in (getattr(args, "extra_input", None) or {}).items()},
                 **(
                     {"system_speculation": args.system_speculation}
                     if args.system_speculation is not None
@@ -1470,6 +1474,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--max-forward-requests", type=int,
                         default=PIE_MAX_FORWARD_REQUESTS_DEFAULT)
         sp.add_argument("--worker-threads", type=int, default=None)
+        sp.add_argument("--extra-input", action="append", default=None, metavar="KEY=VALUE",
+                        help="Extra inferlet input field (typed like --engine-option); repeatable.")
         sp.add_argument("--device-weight-budget", default=None,
                         help="[model] device_weight_budget, e.g. 20GiB (metal residency)")
         sp.add_argument("--host-weight-budget", default=None,
@@ -1754,8 +1760,28 @@ def refuse_if_a_wedged_pie_is_still_dying() -> None:
             "another. Reboot the machine.")
 
 
+def _typed_pairs(raw: list[str] | None) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for item in raw or []:
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise SystemExit(f"want KEY=VALUE, got {item!r}")
+        if value in ("true", "false"):
+            out[key] = value == "true"
+        else:
+            try:
+                out[key] = int(value)
+            except ValueError:
+                try:
+                    out[key] = float(value)
+                except ValueError:
+                    out[key] = value
+    return out
+
+
 def main() -> None:
     args = build_parser().parse_args()
+    args.extra_input = _typed_pairs(getattr(args, "extra_input", None))
     refuse_if_a_wedged_pie_is_still_dying()
     if args.dp_size > 1:
         summary, results = run_data_parallel(args)

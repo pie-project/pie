@@ -11,6 +11,19 @@ use model_dsl::Dtype;
 /// Identification order: the first row whose import fits the checkpoint wins.
 pub fn skus() -> Vec<crate::Sku> {
     crate::skus![
+        // Drafted first: an `-MTP-4bit` checkpoint fits the undrafted row
+        // too (its `mtp.*` planes ignored), so the row that needs them asks
+        // first; a plain checkpoint lacks them and falls through.
+        (
+            "qwen36-27b-mtp",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::d27b(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
         (
             "qwen36-27b",
             1,
@@ -80,6 +93,16 @@ pub fn skus() -> Vec<crate::Sku> {
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
             |tp: u32| Model::d27b(Dtype::Bf16, Dtype::Bf16, tp),
+        ),
+        (
+            "qwen38-27b-mtp",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml_interleaved,
+            &tokenizer::CONTRACT_38,
+            |tp: u32| Model::d27b(Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
             "qwen38-27b",
