@@ -1047,7 +1047,7 @@ impl Tier {
         //    segment is about to name has to have landed first.
         self.join_inflight()?;
         if pass.1 > 1 {
-            return self.pass_at(at, arena, handles, routes, rect, hint, span, pass);
+            return self.pass_at(at, arena, handles, routes, rect, span, pass);
         }
         self.segment_rows(at, arena, handles, routes, rect, hint, span)?;
         Ok(1)
@@ -1151,7 +1151,6 @@ impl Tier {
         handles: &Handles,
         routes: ValueId,
         rect: Tensor,
-        hint: Option<Tensor>,
         span: MaskSpan,
         (pass, passes): (u32, u32),
     ) -> Result<u32> {
@@ -1210,11 +1209,13 @@ impl Tier {
                     order.push(expert);
                 }
             }
-            // The experts already in a seat lead, so the first group is
-            // the one the previous layer's last pass read ahead for this
-            // one (below) and pass 0 copies as little as it can. Groups
-            // are a partition the tail sums slot by slot, so their order
-            // moves no bits.
+            // The experts already in a seat lead — what the last fire left
+            // in this slab — so pass 0 copies as little as it can. (Reading
+            // the next slab's PREDICTED first group ahead on a layer's last
+            // pass was tried here and evicted more of that than it seated:
+            // copies 40.5k → 47.4k on a 182-row GLM prefill.) Groups are a
+            // partition the tail sums slot by slot, so their order moves
+            // no bits.
             let seat_of = &self.slabs[at].seat_of;
             let (mut leading, trailing): (Vec<u32>, Vec<u32>) =
                 order.into_iter().partition(|&e| seat_of[e as usize].is_some());
@@ -1272,54 +1273,11 @@ impl Tier {
         // The NEXT pass's group starts reading now, into the half of the
         // slab this pass does not touch, while the device runs this one.
         if self.prefetch {
-            match next {
-                Some(next) => self.prefetch_group(at, &next)?,
-                // The last pass has no next group of its own, so the read
-                // thread would idle through it: it reads the NEXT slab's
-                // first group instead, off the prediction this router
-                // carries — its order the same first-appearance order pass
-                // 0 there will form, seated experts leading.
-                None => self.prefetch_predicted(at, arena, handles, hint, span)?,
+            if let Some(next) = next {
+                self.prefetch_group(at, &next)?;
             }
         }
         Ok(self.passing[at].as_ref().map_or(0, |p| p.groups.len() as u32))
-    }
-
-    /// Read the next slab's first pass group ahead, from the route
-    /// prediction `hint` for these rows. Nothing of the next slab is in
-    /// flight (this cut's commit proved every earlier segment done, and its
-    /// own segment runs after this one), so its pins are stale and release.
-    fn prefetch_predicted(
-        &mut self,
-        at: usize,
-        arena: &mut Buffer,
-        handles: &Handles,
-        hint: Option<Tensor>,
-        span: MaskSpan,
-    ) -> Result<()> {
-        let Some(hint) = hint else {
-            return Ok(());
-        };
-        let next = at + 1;
-        if next >= self.slabs.len() {
-            return Ok(());
-        }
-        let rows = Self::read_rows(arena, handles, hint, span, "a route prediction")?;
-        let experts = self.slabs[next].experts;
-        let mut order: Vec<u32> = Vec::new();
-        for row in &rows {
-            for &id in row {
-                if id >= 0 && (id as u32) < experts && !order.contains(&(id as u32)) {
-                    order.push(id as u32);
-                }
-            }
-        }
-        for pin in &mut self.slabs[next].pinned {
-            *pin = false;
-        }
-        let seats = pass_group(self.slabs[next].slots) as usize;
-        let group: Vec<u32> = order.into_iter().take(seats).collect();
-        self.prefetch_group(next, &group)
     }
 
     /// Read `experts` of slab `at` ahead on a thread, into unpinned seats
