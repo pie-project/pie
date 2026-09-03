@@ -636,8 +636,12 @@ impl Model {
                 alpha: d.alpha,
                 sinkhorn: d.sinkhorn,
             },
-            embed: Weight::sym("embed", [d.vocab as u64, hidden], dense),
-            head: Weight::sym("lm_head", [d.vocab as u64, hidden], dense),
+            // The conversion ships both bf16 (1.27 GB each); the import
+            // encodes them to 4-bit on the way in — the head is read whole
+            // every token, and both tables sit in the resident tier where
+            // every byte is an expert seat forgone.
+            embed: Weight::sym("embed", [d.vocab as u64, hidden], Dtype::U4g64),
+            head: Weight::sym("lm_head", [d.vocab as u64, hidden], Dtype::U4g64),
             layers,
             final_norm: Weight::sym("final_norm", [hidden], dense),
             final_norm_eps: d.norm_eps,
