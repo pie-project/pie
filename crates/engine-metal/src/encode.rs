@@ -399,6 +399,26 @@ pub fn reset_kernel_profile() {
 }
 
 #[cfg(target_vendor = "apple")]
+/// `PIE_KERNEL_PROFILE=2`: the key carries the launch's scalar arguments
+/// (a matvec's K and N, a router's expert count…), so one entrypoint's time
+/// splits by shape.
+fn profile_key(entrypoint: &str, args: &[ArgValue]) -> String {
+    static SHAPED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let shaped = *SHAPED.get_or_init(|| std::env::var("PIE_KERNEL_PROFILE").is_ok_and(|v| v == "2"));
+    if !shaped {
+        return entrypoint.to_string();
+    }
+    let scalars: Vec<String> = args
+        .iter()
+        .filter_map(|arg| match arg {
+            ArgValue::I32(v) => Some(v.to_string()),
+            ArgValue::U32(v) => Some(v.to_string()),
+            _ => None,
+        })
+        .collect();
+    format!("{entrypoint} [{}]", scalars.join(","))
+}
+
 fn record_kernel(name: &str, seconds: f64) {
     let ns = (seconds * 1e9).max(0.0) as u64;
     let mut table = KERNEL_PROFILE
@@ -474,7 +494,7 @@ impl Encode for Sink<'_> {
                         encoder.dispatchThreads_threadsPerThreadgroup(lanes, group);
                     }
                     let seconds = own.commit_timed().map_err(refuse)?;
-                    record_kernel(fire.entrypoint, seconds);
+                    record_kernel(&profile_key(fire.entrypoint, args), seconds);
                     return Ok(());
                 }
             }
@@ -510,7 +530,7 @@ impl Encode for Sink<'_> {
                         .take()
                         .expect("a segment is open until its cut closes it");
                     let seconds = frame.commit_timed().map_err(refuse)?;
-                    record_kernel(fire.entrypoint, seconds);
+                    record_kernel(&profile_key(fire.entrypoint, args), seconds);
                     *cell.borrow_mut() = Some(self.device.frame().map_err(refuse)?);
                 }
             }

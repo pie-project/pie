@@ -5509,7 +5509,7 @@ impl engine::frame::Shell for Shell {
         if !profile.is_empty() {
             let total: u64 = profile.iter().map(|(_, ns, _)| ns).sum();
             eprintln!("kernels: fire of {} row(s), {:.1} ms on the device:", prepared.descriptor.rows, total as f64 / 1e6);
-            for (name, ns, launches) in profile.iter().take(10) {
+            for (name, ns, launches) in profile.iter().take(if std::env::var("PIE_KERNEL_PROFILE").is_ok_and(|v| v == "2") { 60 } else { 10 }) {
                 eprintln!("  {:>9.1} ms  {:>5} launch(es)  {name}", *ns as f64 / 1e6, launches);
             }
             crate::encode::reset_kernel_profile();
