@@ -28,6 +28,9 @@ using namespace metal;
 // arrays — `MAX_HC_MULT` in the CUDA twin, and a hard refusal at the host
 // entry rather than a shape check here.
 constant constexpr int HC_MAX_MULT = 8;
+// Hidden columns one `hc_gates` threadgroup collapses (`hc.rs` launches
+// `ceil(H / HC_GATES_CHUNK)` of them per token).
+constant constexpr int HC_GATES_CHUNK = 256;
 
 // ---- expand ---------------------------------------------------------------
 
@@ -213,10 +216,16 @@ template <typename T, int BLOCK>
     const constant float& hc_eps [[buffer(9)]],
     const constant float& hc_post_alpha [[buffer(10)]],
     const constant int& sinkhorn_iters  [[buffer(11)]],
-    uint gid     [[threadgroup_position_in_grid]],
-    uint lid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]) {
-  const int n = int(gid);
+    uint2 gid    [[threadgroup_position_in_grid]],
+    uint2 lid2   [[thread_position_in_threadgroup]],
+    uint2 tg2    [[threads_per_threadgroup]]) {
+  const uint lid = lid2.x;
+  const uint tg_size = tg2.x;
+  // `gid.y` is which `HC_GATES_CHUNK`-wide slice of the hidden width this
+  // threadgroup collapses; every slice recomputes the (tiny) gate matrices,
+  // and slice 0 alone publishes them. One threadgroup per token used to do
+  // the whole row and left the device 15/16ths idle at decode.
+  const int n = int(gid.x);
   const int tid = int(lid);
 
   const int mix_hc = M * 2 + M * M;
@@ -233,7 +242,7 @@ template <typename T, int BLOCK>
   if (tid < M) {
     const float logit = row[M + tid] * scale[1] + base[M + tid];
     post[tid] = 1.0f / (1.0f + precise::exp(-logit)) * hc_post_alpha;
-    post_mix[size_t(n) * size_t(M) + size_t(tid)] = post[tid];
+    if (gid.y == 0) post_mix[size_t(n) * size_t(M) + size_t(tid)] = post[tid];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -285,7 +294,7 @@ template <typename T, int BLOCK>
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  if (tid < M * M) {
+  if (tid < M * M && gid.y == 0) {
     comb_mix[size_t(n) * size_t(M) * size_t(M) + size_t(tid)] = comb[tid];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -293,7 +302,9 @@ template <typename T, int BLOCK>
   const device T* res_n = residual + size_t(n) * size_t(M) * size_t(H);
   device T* out = layer_input + size_t(n) * size_t(H);
 
-  for (uint h = lid; h < uint(H); h += tg_size) {
+  const uint h_begin = gid.y * uint(HC_GATES_CHUNK);
+  const uint h_end = min(uint(H), h_begin + uint(HC_GATES_CHUNK));
+  for (uint h = h_begin + lid; h < h_end; h += tg_size) {
     float acc = 0.0f;
     for (int i = 0; i < M; ++i) {
       acc += pre[i] * float(res_n[size_t(i) * size_t(H) + size_t(h)]);
@@ -309,7 +320,7 @@ template <typename T, int BLOCK>
       const device itype*, device float*, device float*, device itype*, \
       const constant int&, const constant int&, const constant float&, \
       const constant float&, const constant int&,                 \
-      uint, uint, uint);
+      uint2, uint2, uint2);
 
 instantiate_hc_gates(bfloat16, bfloat, 256)
 

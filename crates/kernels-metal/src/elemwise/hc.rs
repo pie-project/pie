@@ -218,8 +218,15 @@ pub fn gates(
         post_mix.width == fan && comb_mix.width == fan * fan,
         "the gate matrices are `[N, M]` and `[N, M, M]`"
     );
+    // One threadgroup per (token, 256-wide hidden chunk): the shader's
+    // `HC_GATES_CHUNK`.
+    let rows = nonzero(OP, "rows", x.rows)?;
+    let chunks = nonzero(OP, "the hidden width", x.width)?.div_ceil(256);
+    let lanes = rows
+        .checked_mul(BLOCK)
+        .ok_or_else(|| refuse(OP, format!("the grid will not launch: {rows} rows x {BLOCK}")))?;
     ctx.fire(
-        Fire::at(FILE, entry).apply(per_row(OP, x.rows)?),
+        Fire::at(FILE, entry).apply(Grid::of([lanes, chunks, 1], [BLOCK, 1, 1])),
         &[
             normed.arg(),
             scale.arg(),
