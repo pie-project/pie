@@ -742,8 +742,14 @@ pub fn gated_delta_committed(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = committed_lanes(OP, indptr)?;
+    // As `gated_delta`: a head's columns split across threadgroups down z.
+    let splits = (shape.v_dim / 32).max(1);
+    let grid = Grid::of(
+        [SCAN_WIDTH, shape.v_heads, lanes.saturating_mul(splits)],
+        [SCAN_WIDTH, 1, 1],
+    );
     ctx.fire(
-        Fire::at("attn/ssm_gated_delta.metal", entry).apply(recurrence_grid(shape.v_heads, lanes)),
+        Fire::at("attn/ssm_gated_delta.metal", entry).apply(grid),
         &[
             qkv.arg(),
             indptr.arg(),
@@ -759,6 +765,7 @@ pub fn gated_delta_committed(
             stated(OP, shape.v_heads)?.arg(),
             stated(OP, shape.k_dim)?.arg(),
             stated(OP, shape.v_dim)?.arg(),
+            stated(OP, splits)?.arg(),
         ],
     )
 }
