@@ -9,6 +9,7 @@
 //!
 //! ```text
 //! PIE_WIDTH_ARTIFACT=<stamped .zt> [PIE_WIDTH_LANES=1,2,3,4,8] [PIE_WIDTH_STEPS=24] \
+//!   [PIE_WIDTH_PATCHES=1024] [PIE_WIDTH_BUDGET=28GiB] \
 //!   cargo test -p engine-metal --release --test a_fire_is_priced_by_its_width -- --nocapture
 //! ```
 
@@ -135,20 +136,60 @@ fn every_width_is_timed() {
         eprintln!("tuning: {tuning}");
     }
 
+    // `PIE_WIDTH_PATCHES=1024`: a row whose trace declares `Dim::Patches` (a
+    // vision-capable SKU) refuses to size its ladder without one, so a
+    // width curve over such an artifact states the ceiling it would never
+    // reach — no image is fired here.
+    let patches = std::env::var("PIE_WIDTH_PATCHES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|max_patches| model_compiler::PatchLadder {
+            max_images: 1,
+            max_patches,
+            buckets: vec![max_patches],
+        });
+
+    // `PIE_WIDTH_BUDGET=28GiB`: cap the resident weight tier, for an
+    // artifact this box cannot hold whole. The wall clock then carries the
+    // streamed tier's seat copies; the per-kernel profile still prices the
+    // width alone, which is what the curve is for.
+    let residency = match std::env::var("PIE_WIDTH_BUDGET") {
+        Err(_) => engine_metal::ResidencyPlan::default(),
+        Ok(stated) => {
+            let text = stated.trim();
+            let (number, scale) = match text.strip_suffix("GiB") {
+                Some(number) => (number, 1u64 << 30),
+                None => (text.strip_suffix("MiB").unwrap_or(text), text.ends_with("MiB").then_some(1u64 << 20).unwrap_or(1)),
+            };
+            let budget: u64 = number.trim().parse::<u64>().expect("a byte count, or one with a GiB/MiB suffix") * scale;
+            let planes = engine_metal::weights::attachments(&trace, &contract, &artifact)
+                .expect("the artifact's planes read");
+            // As `crate::api`: the gathered class is planned first, so a
+            // statically-demanded dense plane (the PLE n-gram table) is
+            // excluded from the table the expert slab is sized against.
+            let gathered = engine_metal::gather::Plan::of(&trace, &planes, Some(budget), 512)
+                .expect("the gathered class fits the budget");
+            let plan = engine_metal::ResidencyPlan::beside(&trace, &planes, Some(budget), gathered)
+                .expect("the residency plan fits the budget");
+            eprintln!("budget: {stated} -> {} seats a band", plan.slots());
+            plan
+        }
+    };
+
     let booted = Instant::now();
     let mut shell = Shell::load(Boot {
         trace,
         contract: &contract,
         checkpoint: &artifact,
         budget: Budget::new(slots, 512),
-        patches: None,
+        patches,
         profile: None,
         page_size: 16,
         context: 512,
         slots,
         pages: slots * 512 / 16,
         runahead: engine::runahead::Runahead::F1,
-        residency: engine_metal::ResidencyPlan::default(),
+        residency,
     })
     .expect("the shell loads");
     eprintln!("loaded {} on {} in {:.1}s", sku.name, shell.device_name(), booted.elapsed().as_secs_f64());
