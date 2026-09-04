@@ -138,6 +138,36 @@
 // format arithmetic over the packing mlx_lm ships, and a change to them is a
 // change to the checkpoint format rather than to either kernel.
 
+// # ONE UNROLL PRAGMA IS THE FOLD'S SPEED ON THIS MACHINE (M4 Pro, 2026-09)
+//
+// The compute-side `for (int r = 0; r < R; r++)` carries
+// `#pragma clang loop unroll(full)`. Without it the backend leaves that loop
+// rolled and the thread-local arrays (`pack`, `x_thread`, `result`) in
+// memory, and a folded row costs ~4 issue slots a code where its arithmetic
+// is under 2. Measured with `a_quantized_matmul_is_priced_by_its_rows`
+// (K=5120 N=17408 4-bit, us a launch; one row = 207 at 215 GB/s):
+//
+//   rows            2     3     4     5     6
+//   before        205   340   378   604   652     three one-row launches: 297; tile at bm=8: 345
+//   r loop unrolled 208   227   286   344   413
+//
+// A three-row fire is 1.10x a one-row fire (was 1.44x, as three one-row
+// launches) and a four-row fire 1.37x (was 1.55x); from five rows the tile
+// is the arm. On this GPU matrix and vector work share one ALU budget (the
+// tile at bm=8 sits at exactly dequant + MMA), so what a fold saves is issue
+// slots, and the loads and sums a rolled row loop re-issues are the slots.
+//
+// THE PRAGMA GOES ON THAT LOOP AND NO OTHER. With it on the inner `row`
+// loops as well, `r_4_p_2` at 2-bit lands a wrong answer in every column;
+// with it on the store loops too, `r_5_p_2` at 4-bit does — deterministic,
+// per shape, and gone when the pragma is: this OS's Metal compiler
+// miscompiles those unrollings. `r_5_p_2` at 4-bit is wrong even with the
+// one pragma here, so the pack-2 points are fenced to the rungs that were
+// bit-checked before it (`QMV_ROW_RUNGS_PACK2` in `linear::quant`), and
+// `every_folded_point_answers_the_one_row_point` sweeps every point the
+// ladder can fire against the one-row point — equality at pack 2, one bf16
+// ulp of reassociation at pack 1 — so the next such shape fails a test.
+
 #include <metal_simdgroup>
 #include <metal_stdlib>
 using namespace metal;
@@ -287,6 +317,7 @@ METAL_FUNC void qmv_rows_impl(
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup][R];
   for (int row = 0; row < results_per_simdgroup; row++) {
+    #pragma clang loop unroll(full)
     for (int r = 0; r < R; r++) {
       result[row][r] = 0;
     }
@@ -306,6 +337,7 @@ METAL_FUNC void qmv_rows_impl(
   // offset is an int where a pointer is two registers.
   const device T* xb = x + simd_lid * values_per_thread;
   int roff[R];
+  #pragma clang loop unroll(full)
   for (int r = 0; r < R; r++) {
     roff[r] = min(row0 + r, row_count - 1) * in_vec_size;
   }
@@ -327,6 +359,9 @@ METAL_FUNC void qmv_rows_impl(
         s[row] = scales[row * in_vec_size_g];
         b[row] = biases[row * in_vec_size_g];
       }
+            // Unrolled, and this loop alone — the header says what that is worth
+      // and what unrolling the others does.
+#pragma clang loop unroll(full)
       for (int r = 0; r < R; r++) {
         U sum = load_vector<T, U, values_per_thread, bits>(xb + roff[r], x_thread);
         for (int row = 0; row < results_per_simdgroup; row++) {

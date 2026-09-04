@@ -69,6 +69,11 @@ const QMM_BK: i32 = 32;
 /// group-32 formats.
 const PRECAST_BK: i32 = 64;
 
+/// The narrowest row block the pre-cast tile is taken at. At `bm = 8` it loses to the plain
+/// stamp (374 vs 344 us on the 27B up-projection, M4 Pro — the extra cast pass and the wider k
+/// block buy nothing when one simdgroup holds the row block); at 16 it wins (497 vs 548).
+const PRECAST_MIN_BM: i32 = 16;
+
 /// Row tiles the GEMM is stamped at, narrowest first ([`bm_rung`]'s walk order); floor is 8 since `BM = 4` leaves `WM` nowhere to go.
 const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
 
@@ -76,7 +81,19 @@ const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
 const BN_RUNGS: [i32; 3] = [16, 32, 64];
 
 /// Row groups the vector point may fold at, narrowest first (one weight-block read serves `R` rows).
-const QMV_ROW_RUNGS: [i32; 3] = [2, 4, 8];
+/// Every count to eight at pack width 1: with the fold's loops unrolled (`quant_qmv_rows.metal`,
+/// header) a three-row group is 1.10x a one-row fire where three one-row launches are 1.44x.
+const QMV_ROW_RUNGS: [i32; 7] = [2, 3, 4, 5, 6, 7, 8];
+
+/// The rungs offered at pack width 2 — the ones that predate the unrolled fold. `r_5_p_2` lands a
+/// wrong answer under this OS's Metal compiler (kernel header), so the wider pack keeps the rungs
+/// it was measured and bit-checked at.
+const QMV_ROW_RUNGS_PACK2: [i32; 3] = [2, 4, 8];
+
+/// The rungs a pack width may fold at.
+fn qmv_rungs_at(packs: i32) -> &'static [i32] {
+    if packs >= 2 { &QMV_ROW_RUNGS_PACK2 } else { &QMV_ROW_RUNGS }
+}
 
 /// Pack widths the multi-row point is stamped at; only width 2 matches the one-row point bit for bit.
 const QMV_PACK_RUNGS: [i32; 2] = [1, 2];
@@ -89,8 +106,8 @@ pub fn composed() -> Vec<Fire> {
         for &b in &WIDTHS {
             let point = qmv_point("quant.qmv", "fast", gs, b).expect("an axis point");
             out.push(Fire::at(QMV_FILE, point.entry));
-            for &r in &QMV_ROW_RUNGS {
-                for &p in &QMV_PACK_RUNGS {
+            for &p in &QMV_PACK_RUNGS {
+                for &r in qmv_rungs_at(p) {
                     let point =
                         qmv_rows_point("quant.qmv_rows", gs, b, r, p).expect("an axis point");
                     out.push(Fire::at(QMV_ROWS_FILE, point.entry).stamp(point.stamp));
@@ -198,8 +215,8 @@ pub fn qmv_rows_point(
 ) -> Result<Point, Error> {
     check(op, &GROUPS, group, "group size")?;
     check(op, &WIDTHS, bits, "bit width")?;
-    check(op, &QMV_ROW_RUNGS, rows, "row group")?;
     check(op, &QMV_PACK_RUNGS, packs, "pack width")?;
+    check(op, qmv_rungs_at(packs), rows, "row group")?;
     let entry = symbol(&format!(
         "affine_qmv_rows_bfloat16_gs_{group}_b_{bits}_r_{rows}_p_{packs}"
     ));
@@ -214,9 +231,10 @@ pub fn qmv_rows_point(
 /// Output rows one threadgroup of either vector point lands: two simdgroups, four results each.
 const QMV_OUT_PER_GROUP: u32 = 8;
 
-/// The fold a fire of `rows` takes, or `None` for the one-row point: the widest rung dividing the batch that fills the machine.
+/// The fold a fire of `rows` takes at pack width `packs`, or `None` for the one-row point: the
+/// widest rung dividing the batch that fills the machine.
 #[must_use]
-pub fn qmv_rows_fold(rows: i32, out_width: i32, max: i32, crossover_tg: i32) -> Option<i32> {
+pub fn qmv_rows_fold(rows: i32, out_width: i32, max: i32, crossover_tg: i32, packs: i32) -> Option<i32> {
     if rows < 2 {
         return None;
     }
@@ -225,7 +243,7 @@ pub fn qmv_rows_fold(rows: i32, out_width: i32, max: i32, crossover_tg: i32) -> 
         let groups = rows.unsigned_abs() / rung.unsigned_abs();
         groups.saturating_mul(tiles) >= crossover_tg.max(0).unsigned_abs()
     };
-    QMV_ROW_RUNGS
+    qmv_rungs_at(packs)
         .iter()
         .copied()
         .rev()
@@ -545,14 +563,31 @@ pub fn act_x_wt(
     let min_batch = i32::try_from(tuned.qmm_min_batch(false, fp16)).unwrap_or(i32::MAX);
     let crossover = i32::try_from(tuned.qmm_bn_crossover_tg).unwrap_or(i32::MAX);
     let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
-    // Rung 1, not an arm itself: `None` takes the vector point below.
+    // Rung 1, not an arm itself: `None` takes the vector point below. The
+    // tile is taken when its threadgroups can fill the machine — at its
+    // narrowest column tile, `n / 16` column tiles by `padded / bm` row
+    // tiles against the crossover — or when the batch is past the fold's
+    // widest rung, so a sixteen-row fire never falls to sixteen one-row
+    // launches. Measured (M4 Pro, `a_quantized_matmul_is_priced_by_its_rows`,
+    // K=5120, us a launch, 5..8 rows): N=17408 tile 345 flat against the
+    // fold's 345/413/505/849; N=5120 tile 112 against 106/131/157/248;
+    // N=1024 — 64 threadgroups at bn=16 — tile 57 against the fold's
+    // 30/33/42/47, so the fold to eight rows there.
+    let fold_widest = *QMV_ROW_RUNGS.last().expect("a rung");
+    let tile_fills = |padded: i32, bm: i32| {
+        let tiles = u64::from(n.unsigned_abs().div_ceil(BN_RUNGS[0].unsigned_abs()))
+            * u64::from((padded / bm).unsigned_abs());
+        tiles >= u64::from(crossover.unsigned_abs())
+    };
     if m >= min_batch
         && k % QMM_BK == 0
         && let Some((bm, padded)) = mb_block(m, capacity)
+        && (m > fold_widest || tile_fills(padded, bm))
     {
         // Rung 2: the staged input. The cast writes `padded x k` halves,
         // the GEMM reads them at buffer 12 and leaves the bf16 seat null.
         if fp16
+            && bm >= PRECAST_MIN_BM
             && k % PRECAST_BK == 0
             && let Some(staged) = (scratch.precast)(padded.unsigned_abs(), k.unsigned_abs())
             && let Some(bn) = bn_unsplit(n, padded / bm, crossover)
@@ -615,7 +650,7 @@ pub fn act_x_wt(
     // one weight read; at one row there is nothing to fold.
     let rows_max = i32::try_from(tuned.qmv_rows_max).unwrap_or(1);
     let packs = i32::try_from(tuned.qmv_rows_packs).unwrap_or(QMV_PACK_RUNGS[1]);
-    if let Some(fold) = qmv_rows_fold(m, n, rows_max, crossover) {
+    if let Some(fold) = qmv_rows_fold(m, n, rows_max, crossover, packs) {
         let point = qmv_rows_point(op, group, bits, fold, packs)?;
         return ctx.fire(
             Fire::at(QMV_ROWS_FILE, point.entry)
@@ -677,7 +712,11 @@ mod tests {
             "PIE_STAMP_qmv_rows(\"affine_qmv_rows_bfloat16_gs_64_b_4_r_2_p_1\", 64, 4, 2, 1)"
         );
         // Every axis is checked against what the macro will mint.
-        assert!(qmv_rows_point("t", 64, 4, 3, 1).is_err());
+        assert!(qmv_rows_point("t", 64, 4, 3, 1).is_ok());
+        assert!(qmv_rows_point("t", 64, 4, 9, 1).is_err());
+        // Pack width 2 keeps the rungs it was bit-checked at (kernel header).
+        assert!(qmv_rows_point("t", 64, 4, 3, 2).is_err());
+        assert!(qmv_rows_point("t", 64, 4, 4, 2).is_ok());
         assert!(qmv_rows_point("t", 64, 4, 2, 4).is_err());
         assert!(qmv_rows_point("t", 48, 4, 2, 1).is_err());
     }
