@@ -57,6 +57,36 @@ pub use engine::Capabilities as EngineCapabilities;
 
 /// The pool ceilings a load is baked against, out of what the operator stated.
 ///
+/// Every `[engine]` number the Metal geometry is built from must be positive.
+///
+/// These were all clamped with `.max(1)` at the point of use, which turns a
+/// deployment typo into a server that boots, reports ready, and then refuses
+/// every request -- the worst of the three possible outcomes. The two numbers
+/// that were already refused (`max_forward_tokens = 1` against the lane count,
+/// and a page pool past the device) name the value and the knob; so does this.
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
+    for (key, value) in [
+        ("total_pages", opts.total_pages),
+        ("max_forward_tokens", opts.max_forward_tokens),
+        ("max_forward_requests", opts.max_forward_requests),
+        ("kv_page_size", opts.kv_page_size),
+    ] {
+        if value == 0 {
+            anyhow::bail!("[engine] {key} must be > 0");
+        }
+    }
+    for (key, value) in [
+        ("max_model_len", opts.max_model_len),
+        ("max_state_slots", opts.max_state_slots),
+    ] {
+        if value == Some(0) {
+            anyhow::bail!("[engine] {key} must be > 0 when stated");
+        }
+    }
+    Ok(())
+}
+
 /// `slots` seats recurrent state only (`max_state_slots`); the KV page pool
 /// is shared by every live sequence and seats nothing.
 #[cfg(any(feature = "cuda", test))]
@@ -417,6 +447,13 @@ pub(crate) fn create_engine_backend(
                     toml::Value::String(mount.display().to_string())
                 ));
             }
+            // A stated zero is a typo, not a request. Clamping it with
+            // `.max(1)` booted a server whose pool seats one page and whose
+            // every request then dies at admission -- and it did so silently,
+            // because `runtime::bootstrap::verify_config`'s own `total_pages
+            // must be > 0` check never sees the zero the clamp already ate.
+            // Refuse by name, the way a geometry that cannot bake is refused.
+            metal_geometry_is_stated(opts)?;
             let backend = runtime::engine::backend::open::metal(boot_doc.as_bytes())?;
             let page_size = opts.kv_page_size.max(1);
             let max_context = opts
