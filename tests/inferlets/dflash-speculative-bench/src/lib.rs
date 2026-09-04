@@ -30,6 +30,85 @@
 //! code      "write a function" 6.14 tok/round    28.4 tok/s   vs 15.1   1.9x
 //! ```
 //!
+//! # The verify width is worth choosing, and nothing chose it well
+//!
+//! The drafter proposes fifteen whatever the target reads — a block diffusion
+//! model is out of distribution at any other block width — but the VERIFY
+//! fire is priced by its rows, and the price is a STAIRCASE: the tile point
+//! pads a fire up to a row block, so twelve rows cost what sixteen do and
+//! twenty-four cost MORE than thirty-two. `a_fire_is_priced_by_its_width` on
+//! this box, in one-row fires: 1.00 / 1.83 / 2.79 / 5.19 / 5.00 at
+//! 1 / 8 / 16 / 24 / 32 rows. 256 tokens, wall clock:
+//!
+//! ```text
+//!                      v=4     v=6     v=8     v=12    v=16
+//! counting            9.96s   8.51s   7.14s   8.06s   6.37s
+//! code                11.26   10.87    9.83   13.77   11.18
+//! ```
+//!
+//! So the best width is a property of the WORKLOAD — sixteen where the block
+//! is nearly all kept, eight where five tokens are — and it is worth up to
+//! 20%. THREE rules to pick it per round were written and all three are a
+//! wash, which is why the parameter is still the caller's to state:
+//!
+//! - **A smoothed accepted prefix** against the stated prices RATCHETS: at
+//!   eight rows a prefix can never be observed above seven, so nothing ever
+//!   argues for going back to sixteen. Recall went 10.37s to 15.19.
+//! - **A two-armed bandit on the guest's own clock**, tokens per nanosecond
+//!   with a probe floor on each arm, picked the losing arm on two of three
+//!   workloads (code 10.67s against 9.31 fixed; recall 14.87 against 10.37).
+//!   A run that MIXES widths keeps less per round than either pure run: the
+//!   round boundaries move, so the arms do not sample one distribution.
+//! - **The drafter's own logit margin** (`--margin_width`), the signal Dspark
+//!   spends a trained confidence head on. Pooled it separates cleanly — over
+//!   sixty anchors on five prompts a position inside the accepted prefix
+//!   carries a margin of 6.86 and one outside 1.10, and the first seven
+//!   positions' mean reads 7.95 where the prefix reached eight against 2.16
+//!   where it did not. It is MISCALIBRATED exactly where the width matters:
+//!   on recall the drafter is unsure and RIGHT — a factual token has many
+//!   plausible rivals — so it sends long rounds to the narrow width. At a
+//!   threshold of 4 recall goes 10.74s to 15.38; pulled back to 2 the three
+//!   workloads come to 28.73s against a fixed sixteen's 29.15 and an oracle's
+//!   27.27.
+//!
+//! What survives is the MEASUREMENT, not a policy. The margin costs 9% of a
+//! round (3.28s against 3.01 over 64 tokens) because `top_k(logits, 2)` reads
+//! the plane ONCE and returns the runner-up beside the proposal. Two consumers
+//! of that plane cost about a second a round — 3.0s to 7.4s for a bare second
+//! reduction, 46s with a softmax on it — which is the thing to know before
+//! reaching for any other signal off a fire's logits.
+//!
+//! # A candidate tree does not pay here, and the arithmetic says so
+//!
+//! The drafter denoises every position from the SAME context in one pass, so
+//! its guess at `j + 1` does not depend on its guess at `j` — a second
+//! candidate at one position costs a parallel chain, not a second draft.
+//! Branching at `j` lays out `j + 2 * (block - j)` rows: 31 for `j = 1`.
+//!
+//! At the break, the target's token was the drafter's RUNNER-UP 14 times in
+//! 45 (31%), and `top_k` already carries it. But 31 rows are 5.00 + 0.27 =
+//! 5.27 one-row fires against the linear block's 3.09, so the tree must
+//! return 14.1 tokens a round where the block returns 8.27 — a prefix of 13.1
+//! against 7.27. Recovering a third of the breaks is worth about one token.
+//! Not close, and the reason is the width curve: on a GPU where sixteen rows
+//! cost two one-row fires rather than 2.79, the same tree would be arguable.
+//!
+//! # The recurrence is a fold, not a cell
+//!
+//! This SKU is hybrid, so a verify fire that folded its rows would fold the
+//! REJECTED ones too and no `kv_len` could take them back —
+//! `rs-speculative-decoding`'s header is the argument in full. So the verify
+//! window is BUFFERED (`fold-len` leaves it unfolded), the rejected tail is
+//! forgotten with `discard-buffered`, and the NEXT round's verify folds
+//! exactly the accepted prefix ahead of its own rows.
+//!
+//! The draft fire in between is the trap: a fire must bind one recurrent
+//! working set per request and is CHARGED ITS ROWS in the buffer, even though
+//! the trunk that owns the recurrence runs over none of a draft fire's rows.
+//! Binding a scratch working set instead corrupts the sequence's state; the
+//! fix is to fold nothing and forget the fire's own rows again, which leaves
+//! the buffer exactly as it was found.
+//!
 //! **THE KV ROLLBACK IS THE SUBTLE PART.** The verify fire writes a row's
 //! keys at `held + i` for all `block` rows, and the rows past the break
 //! carried tokens the target rejected — so the next round states
