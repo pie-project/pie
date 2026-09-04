@@ -19,6 +19,30 @@
 //! tolerance, not equality — `PIE_QMM_TOL` moves it. A new point that fails
 //! this is wrong before it is slow.
 //!
+//! # What the 16-row cost is NOT, measured
+//!
+//! On `K=5120 N=17408` at 4 bits / group 64, the tile point costs 497 us for
+//! sixteen rows against 208 us for one — 50 MB of bank read at 90 GB/s where
+//! the vector point reads it at 214, and 2.85 GFLOP at 5.7 TFLOP/s. The two
+//! halves ADD, which reads like a kernel that loads and multiplies in turn,
+//! so the obvious fix was tried and is written down here because it LOST:
+//!
+//! - **Double-buffering the K loop** (two threadgroup stages, the next tile's
+//!   loads issued under the previous tile's MMA) made it WORSE: 497 -> 522 us
+//!   at sixteen rows, 1770 -> 2254 at sixty-four. Threadgroup memory is an
+//!   OCCUPANCY resource on this GPU, and a second stage costs more residency
+//!   than the software pipeline buys — Apple hides load latency ACROSS
+//!   threadgroups, not inside one.
+//! - **`QMM_BK` at 16 and 64** moves only the eight-row point (348 -> 411 and
+//!   371). Sixteen rows and up are on the PRECAST plane and do not read it.
+//! - **`PRECAST_BK` at 32 / 64 / 128**: 496.3 / 497.2 / 505.5 us. Flat.
+//! - **Withholding the precast plane**: 548 us at sixteen rows, worse; it is
+//!   already the better arm (and at sixty-four rows only, 1733 vs 1770).
+//!
+//! So the sixteen-row cost is not a tiling-parameter choice. What is left
+//! unmeasured is the QUANTIZED WEIGHT LOADER's own read efficiency — 90 GB/s
+//! against the vector point's 214 on the same bytes is the gap to explain.
+//!
 //! ```text
 //! PIE_QMM_SHAPES=5120x5120,5120x17408 PIE_QMM_ROWS=1,2,3,4,6,8,16 \
 //!   [PIE_QMM_TUNING=qmv_rows_max=4] [PIE_QMM_STEPS=50] [PIE_QMM_BATCH=32] [PIE_QMM_WARM_MS=300] \
