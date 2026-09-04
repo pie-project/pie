@@ -140,9 +140,28 @@ const QMV_ROW_RUNGS: [i32; 7] = [2, 3, 4, 5, 6, 7, 8];
 /// it was measured and bit-checked at.
 const QMV_ROW_RUNGS_PACK2: [i32; 3] = [2, 4, 8];
 
-/// The rungs a pack width may fold at.
-fn qmv_rungs_at(packs: i32) -> &'static [i32] {
-    if packs >= 2 { &QMV_ROW_RUNGS_PACK2 } else { &QMV_ROW_RUNGS }
+/// The rungs at 2 bits and pack width 1: sixteen codes a lane, and past three rows the fold
+/// spills — r_4 287 us against two r_2 at 274, r_6 556 against three r_2 at 407, r_8 874 against
+/// four r_2 at 539 (K=5120 N=17408, M4 Pro); r_3 at 195 beats three one-row launches at 304.
+const QMV_ROW_RUNGS_2BIT: [i32; 2] = [2, 3];
+
+/// The GEMV/GEMM crossover for a dense 2-bit bank, in place of `qmm_min_batch_emulated` (12,
+/// which also serves 8-bit, whose fold is bandwidth-flat to eight rows). Measured (K=5120): the
+/// 2-bit tile is 310 us flat from four rows at N=17408 where the fold is 274 at four (two r_2) and
+/// 496 / 556 / 874 at five / six / eight; at N=5120 it is 103 against 87 / 153 / 170 / 239. No
+/// imported SKU carries a dense 2-bit weight (the 2-bit planes are routed experts), so a constant
+/// rather than a knob.
+const QMM_MIN_BATCH_2BIT: i32 = 5;
+
+/// The rungs a pack width and bit width may fold at.
+fn qmv_rungs_at(packs: i32, bits: i32) -> &'static [i32] {
+    if packs >= 2 {
+        &QMV_ROW_RUNGS_PACK2
+    } else if bits == 2 {
+        &QMV_ROW_RUNGS_2BIT
+    } else {
+        &QMV_ROW_RUNGS
+    }
 }
 
 /// Pack widths the multi-row point is stamped at; only width 2 matches the one-row point bit for bit.
@@ -157,7 +176,7 @@ pub fn composed() -> Vec<Fire> {
             let point = qmv_point("quant.qmv", "fast", gs, b).expect("an axis point");
             out.push(Fire::at(QMV_FILE, point.entry));
             for &p in &QMV_PACK_RUNGS {
-                for &r in qmv_rungs_at(p) {
+                for &r in qmv_rungs_at(p, b) {
                     let point =
                         qmv_rows_point("quant.qmv_rows", gs, b, r, p).expect("an axis point");
                     out.push(Fire::at(QMV_ROWS_FILE, point.entry).stamp(point.stamp));
@@ -266,7 +285,7 @@ pub fn qmv_rows_point(
     check(op, &GROUPS, group, "group size")?;
     check(op, &WIDTHS, bits, "bit width")?;
     check(op, &QMV_PACK_RUNGS, packs, "pack width")?;
-    check(op, qmv_rungs_at(packs), rows, "row group")?;
+    check(op, qmv_rungs_at(packs, bits), rows, "row group")?;
     let entry = symbol(&format!(
         "affine_qmv_rows_bfloat16_gs_{group}_b_{bits}_r_{rows}_p_{packs}"
     ));
@@ -284,7 +303,14 @@ const QMV_OUT_PER_GROUP: u32 = 8;
 /// The fold a fire of `rows` takes at pack width `packs`, or `None` for the one-row point: the
 /// widest rung dividing the batch that fills the machine.
 #[must_use]
-pub fn qmv_rows_fold(rows: i32, out_width: i32, max: i32, crossover_tg: i32, packs: i32) -> Option<i32> {
+pub fn qmv_rows_fold(
+    rows: i32,
+    out_width: i32,
+    max: i32,
+    crossover_tg: i32,
+    packs: i32,
+    bits: i32,
+) -> Option<i32> {
     if rows < 2 {
         return None;
     }
@@ -293,7 +319,7 @@ pub fn qmv_rows_fold(rows: i32, out_width: i32, max: i32, crossover_tg: i32, pac
         let groups = rows.unsigned_abs() / rung.unsigned_abs();
         groups.saturating_mul(tiles) >= crossover_tg.max(0).unsigned_abs()
     };
-    qmv_rungs_at(packs)
+    qmv_rungs_at(packs, bits)
         .iter()
         .copied()
         .rev()
@@ -615,7 +641,11 @@ pub fn act_x_wt(
     // The crossover is the machine's and the format's, read from `crate::tuning`.
     let tuned = crate::tuning::current();
     let fp16 = tuned.fp16_gemm_format(w.bits, w.group);
-    let min_batch = i32::try_from(tuned.qmm_min_batch(false, fp16)).unwrap_or(i32::MAX);
+    let min_batch = if bits == 2 {
+        QMM_MIN_BATCH_2BIT
+    } else {
+        i32::try_from(tuned.qmm_min_batch(false, fp16)).unwrap_or(i32::MAX)
+    };
     let crossover = i32::try_from(tuned.qmm_bn_crossover_tg).unwrap_or(i32::MAX);
     let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
     // Rung 1, not an arm itself: `None` takes the vector point below. The
@@ -759,7 +789,7 @@ pub fn act_x_wt(
     // one weight read; at one row there is nothing to fold.
     let rows_max = i32::try_from(tuned.qmv_rows_max).unwrap_or(1);
     let packs = i32::try_from(tuned.qmv_rows_packs).unwrap_or(QMV_PACK_RUNGS[1]);
-    if let Some(fold) = qmv_rows_fold(m, n, rows_max, crossover, packs) {
+    if let Some(fold) = qmv_rows_fold(m, n, rows_max, crossover, packs, bits) {
         let point = qmv_rows_point(op, group, bits, fold, packs)?;
         return ctx.fire(
             Fire::at(QMV_ROWS_FILE, point.entry)
@@ -826,6 +856,10 @@ mod tests {
         // Pack width 2 keeps the rungs it was bit-checked at (kernel header).
         assert!(qmv_rows_point("t", 64, 4, 3, 2).is_err());
         assert!(qmv_rows_point("t", 64, 4, 4, 2).is_ok());
+        // 2-bit folds to three rows and no further at pack width 1.
+        assert!(qmv_rows_point("t", 64, 2, 3, 1).is_ok());
+        assert!(qmv_rows_point("t", 64, 2, 4, 1).is_err());
+        assert!(qmv_rows_point("t", 64, 2, 4, 2).is_ok());
         assert!(qmv_rows_point("t", 64, 4, 2, 4).is_err());
         assert!(qmv_rows_point("t", 48, 4, 2, 1).is_err());
     }

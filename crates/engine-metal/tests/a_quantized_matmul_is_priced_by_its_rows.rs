@@ -22,7 +22,7 @@
 //! ```text
 //! PIE_QMM_SHAPES=5120x5120,5120x17408 PIE_QMM_ROWS=1,2,3,4,6,8,16 \
 //!   [PIE_QMM_TUNING=qmv_rows_max=4] [PIE_QMM_STEPS=50] [PIE_QMM_BATCH=32] [PIE_QMM_WARM_MS=300] \
-//!   [PIE_QMM_PRECAST=0] [PIE_QMM_SPLITK=4] [PIE_QMM_LADDER_SPLIT=0] \
+//!   [PIE_QMM_PRECAST=0] [PIE_QMM_SPLITK=4] [PIE_QMM_LADDER_SPLIT=0] [PIE_QMM_BITS=2] [PIE_QMM_GROUP=64] \
 //!   cargo test -p engine-metal --release --test a_quantized_matmul_is_priced_by_its_rows -- --nocapture
 //! ```
 
@@ -48,7 +48,8 @@ fn split_block(m: u32) -> (u32, u32) {
 }
 
 /// Codes per scale entry and bits per code — the shape every 4-bit MLX
-/// conversion in this tree ships.
+/// conversion in this tree ships; `PIE_QMM_GROUP` / `PIE_QMM_BITS` move the
+/// timed bank to the 2- and 8-bit formats (the sweep below covers them all).
 const GROUP: u32 = 64;
 const BITS: u32 = 4;
 
@@ -112,6 +113,9 @@ fn every_row_count_is_timed() {
                 "qmv_rows_packs" => over.qmv_rows_packs = Some(value),
                 "qmv_rows_max" => over.qmv_rows_max = Some(value),
                 "qmm_min_batch" => over.qmm_min_batch = Some(value),
+                "qmm_min_batch_moe" => over.qmm_min_batch_moe = Some(value),
+                "qmm_min_batch_emulated" => over.qmm_min_batch_emulated = Some(value),
+                "fp16_qmm" => over.fp16_qmm = Some(value != 0),
                 "qmm_bn_crossover_tg" => over.qmm_bn_crossover_tg = Some(value),
                 other => panic!("no knob named {other} here"),
             }
@@ -133,11 +137,13 @@ fn every_row_count_is_timed() {
     let pipelines = Pipelines::new();
     eprintln!("device: {}", device.name());
 
+    let bits: u32 = env("PIE_QMM_BITS", BITS);
+    let group: u32 = env("PIE_QMM_GROUP", GROUP);
     for (k, n) in shapes() {
-        // One bank: codes packed `BITS` apiece into u32 words, one bf16
-        // scale and zero point per `GROUP` codes.
-        let words = u64::from(n) * u64::from(k) * u64::from(BITS) / 32;
-        let factors_n = u64::from(n) * u64::from(k / GROUP);
+        // One bank: codes packed `bits` apiece into u32 words, one bf16
+        // scale and zero point per `group` codes.
+        let words = u64::from(n) * u64::from(k) * u64::from(bits) / 32;
+        let factors_n = u64::from(n) * u64::from(k / group);
         let widest = *rows.iter().max().expect("a row count");
         let mut codes_b = Buffer::zeroed(&device, words * 4).expect("codes");
         let mut scales_b = Buffer::zeroed(&device, factors_n * 2).expect("scales");
@@ -205,7 +211,10 @@ fn every_row_count_is_timed() {
         }
 
         eprintln!("\n  K={k} N={n}  ({:.2} GiB of codes)", words as f64 * 4.0 / (1u64 << 30) as f64);
-        let tol: f64 = env("PIE_QMM_TOL", 0.02f64);
+        // 5% over a 0.1 floor: the fold reassociates (one bf16 ulp) and
+        // the tile dequantizes to bf16 (a few 1e-3 absolute on a 2-bit
+        // bank); a WRONG point measures 20-200% across thousands of columns.
+        let tol: f64 = env("PIE_QMM_TOL", 0.05f64);
         let mut one = 0.0f64;
         // Row 0 of the first row count is the reference every later count
         // is read against.
@@ -213,12 +222,12 @@ fn every_row_count_is_timed() {
         for &m in &rows {
             let bank = Bank {
                 // The codes tensor is stated in CODES, not words: the point
-                // derives the packing from `bits`.
+                // derives the packing from `bits`, and reads no dtype off it.
                 codes: Tensor::new(hc, n, k, Dtype::U4g64),
-                scales: Tensor::new(hs, n, k / GROUP, Dtype::Bf16),
-                biases: Some(Tensor::new(hb, n, k / GROUP, Dtype::Bf16)),
-                group: GROUP,
-                bits: BITS,
+                scales: Tensor::new(hs, n, k / group, Dtype::Bf16),
+                biases: Some(Tensor::new(hb, n, k / group, Dtype::Bf16)),
+                group,
+                bits,
             };
             let act = Tensor::new(ha, m, k, Dtype::Bf16);
             let y = Tensor::new(ho, m, n, Dtype::Bf16);
@@ -252,7 +261,7 @@ fn every_row_count_is_timed() {
                 );
                 assert!(k_i % (split_i * 32) == 0 && (k_i / split_i) % 64 == 0,
                     "K={k} must split into {split} partitions of whole 32-blocks and 64-groups");
-                let entry = format!("affine_qmm_t_splitk_f32_bfloat16_gs_{GROUP}_b_{BITS}_bm_{bm}_bn_32");
+                let entry = format!("affine_qmm_t_splitk_f32_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_32");
                 let entry: &'static str = Box::leak(entry.into_boxed_str());
                 let grid = quant::qmm_grid("bench", n_i, 32, padded_i, bm_i, split_i).expect("a grid");
                 let stride = padded_i * n_i;
@@ -260,8 +269,8 @@ fn every_row_count_is_timed() {
                     Fire::at(QMM_FILE, entry).apply(Grid::of(grid, quant::qmm_group(bm_i))),
                     &[
                         Tensor::new(hc, n, k, Dtype::U4g64).arg(),
-                        Tensor::new(hs, n, k / GROUP, Dtype::Bf16).arg(),
-                        Tensor::new(hb, n, k / GROUP, Dtype::Bf16).arg(),
+                        Tensor::new(hs, n, k / group, Dtype::Bf16).arg(),
+                        Tensor::new(hb, n, k / group, Dtype::Bf16).arg(),
                         act.arg(),
                         sink.absent().expect("a null seat"),
                         k_i.arg(),
@@ -338,8 +347,11 @@ fn every_row_count_is_timed() {
                 Some(want) => {
                     let mut worst = 0.0f64;
                     let mut at = 0usize;
+                    // Relative, with a floor: the tile dequantizes to bf16
+                    // in threadgroup memory, so a near-zero output carries
+                    // ~1e-3 of absolute noise that is not a wrong answer.
                     for (i, (a, b)) in want.iter().zip(&got).enumerate() {
-                        let scale = f64::from(a.abs()).max(f64::from(b.abs())).max(1e-3);
+                        let scale = f64::from(a.abs()).max(f64::from(b.abs())).max(0.1);
                         let d = f64::from((a - b).abs()) / scale;
                         if d > worst {
                             worst = d;
@@ -350,7 +362,7 @@ fn every_row_count_is_timed() {
                         let off: Vec<usize> = want.iter().zip(&got).enumerate()
                             .filter(|(_, (a, b))| {
                                 let (a, b) = (**a, **b);
-                                let scale = f64::from(a.abs()).max(f64::from(b.abs())).max(1e-3);
+                                let scale = f64::from(a.abs()).max(f64::from(b.abs())).max(0.1);
                                 f64::from((a - b).abs()) / scale > tol
                             })
                             .map(|(i, _)| i).collect();
