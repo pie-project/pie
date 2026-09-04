@@ -3,7 +3,7 @@ use model_dsl::{
     Request, Value, Weight, ops, seam,
 };
 
-use super::model::{Attn, Gdn, Head, Mixer, Mlp, Model, Tower};
+use super::model::{Attn, DRAFT_DEPTH, Gdn, Head, Mixer, Mlp, Model, Tower};
 
 /// The trunk's mrope section split; both qwen SKUs share `[11, 11, 10]`,
 /// summing to half `rotary_dim`.
@@ -263,70 +263,85 @@ impl ForwardHybrid for Model {
             // and qwen4 arms read it). Row r's own id pairs it one position
             // early and the head drafts nothing the trunk accepts.
             let (dlogits, _) = logits.split(&Facts::drafts());
-            let chosen = ops::layout::argmax(&[&dlogits]);
+            let mut chosen = ops::layout::argmax(&[&dlogits]);
+            let mut hidden = dx;
+            // The chain: `DRAFT_DEPTH` passes of the one shipped block, each
+            // fed the previous pass's argmax and residual — the shape the
+            // qwen4 head runs. The checkpoint trains one step; every step
+            // past it is the head run past its training, and pays only if
+            // its acceptance clears the round's extra row (model.rs).
+            let mut chain: Vec<Value> = Vec::with_capacity(DRAFT_DEPTH as usize);
+            for step in 0..DRAFT_DEPTH {
+                // `[a|b]*[We|Wh]^T = a*We^T + b*Wh^T`, as two matmuls and one
+                // add since the IR has no concatenation. The pre-norms are the
+                // recipe's: MTP normalizes each stream first, EAGLE fuses the
+                // raw pair (`None` here is a recipe with no norm, not a skip).
+                let e = ops::layout::embed(&chosen, &m.embed, m.vocab);
+                let (e, h) = match &mtp.pre_fc {
+                    Some(pre) => (
+                        ops::elemwise::rmsnorm_plus_one(&e, &pre.embedding, pre.eps),
+                        ops::elemwise::rmsnorm_plus_one(&hidden, &pre.hidden, pre.eps),
+                    ),
+                    None => (e, hidden.clone()),
+                };
+                let mut dy = ops::elemwise::residual_add(
+                    &ops::linear::matmul(&e, &mtp.fc_embed),
+                    &ops::linear::matmul(&h, &mtp.fc_hidden),
+                );
 
-            // `[a|b]*[We|Wh]^T = a*We^T + b*Wh^T`, as two matmuls and one add
-            // since the IR has no concatenation. The pre-norms are the
-            // recipe's: MTP normalizes each stream first, EAGLE fuses the
-            // raw pair (`None` here is a recipe with no norm, not a skip).
-            let e = ops::layout::embed(&chosen, &m.embed, m.vocab);
-            let (e, h) = match &mtp.pre_fc {
-                Some(pre) => (
-                    ops::elemwise::rmsnorm_plus_one(&e, &pre.embedding, pre.eps),
-                    ops::elemwise::rmsnorm_plus_one(&dx, &pre.hidden, pre.eps),
-                ),
-                None => (e, dx.clone()),
-            };
-            let mut dy = ops::elemwise::residual_add(
-                &ops::linear::matmul(&e, &mtp.fc_embed),
-                &ops::linear::matmul(&h, &mtp.fc_hidden),
-            );
+                // One attention arm, not a decode/prefill split: the head only
+                // ever runs small speculative forwards, where a batched-prefill
+                // read is the same numbers as a decode read. A chained step
+                // reads the kv the first step appended and appends nothing.
+                let a = &mtp.attn;
+                let nx = ops::elemwise::rmsnorm_plus_one(&dy, &mtp.mixer_norm, mtp.mixer_norm_eps);
+                let o = mtp_attn(&nx, &inputs, m, &plan_mtp, a, step > 0);
+                let o = if m.tp > 1 {
+                    ops::collective::all_reduce(&o)
+                } else {
+                    o
+                };
+                dy = ops::elemwise::residual_add(&o, &dy);
 
-            // One attention arm, not a decode/prefill split: the head only
-            // ever runs small speculative forwards, where a batched-prefill
-            // read is the same numbers as a decode read.
-            let a = &mtp.attn;
-            let nx = ops::elemwise::rmsnorm_plus_one(&dy, &mtp.mixer_norm, mtp.mixer_norm_eps);
-            let o = mtp_attn(&nx, &inputs, m, &plan_mtp, a);
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
-            dy = ops::elemwise::residual_add(&o, &dy);
+                let nx = ops::elemwise::rmsnorm_plus_one(&dy, &mtp.mlp_norm, mtp.mlp_norm_eps);
+                let Mlp::Dense {
+                    gate_up,
+                    down,
+                    inter,
+                } = &mtp.mlp
+                else {
+                    panic!("a draft head is one block and routes to no experts");
+                };
+                let f = ops::linear::matmul(
+                    &ops::linear::mlp_swiglu(&ops::linear::matmul(&nx, gate_up), *inter),
+                    down,
+                );
+                let f = if m.tp > 1 {
+                    ops::collective::all_reduce(&f)
+                } else {
+                    f
+                };
+                dy = ops::elemwise::residual_add(&f, &dy);
 
-            let nx = ops::elemwise::rmsnorm_plus_one(&dy, &mtp.mlp_norm, mtp.mlp_norm_eps);
-            let Mlp::Dense {
-                gate_up,
-                down,
-                inter,
-            } = &mtp.mlp
-            else {
-                panic!("a draft head is one block and routes to no experts");
-            };
-            let f = ops::linear::matmul(
-                &ops::linear::mlp_swiglu(&ops::linear::matmul(&nx, gate_up), *inter),
-                down,
-            );
-            let f = if m.tp > 1 {
-                ops::collective::all_reduce(&f)
-            } else {
-                f
-            };
-            dy = ops::elemwise::residual_add(&f, &dy);
-
-            // Readout through the base head (no dedicated mtp.lm_head), past
-            // this recipe's own final norm when it has one; EAGLE has none.
-            let read = match &mtp.norm {
-                Some(norm) => ops::elemwise::rmsnorm_plus_one(&dy, norm, mtp.norm_eps),
-                None => dy,
-            };
-            let draft = ops::linear::lm_head(&read, head);
-            seam::at(seam::MTP, &[&draft]);
+                // Readout through the base head (no dedicated mtp.lm_head), past
+                // this recipe's own final norm when it has one; EAGLE has none.
+                let read = match &mtp.norm {
+                    Some(norm) => ops::elemwise::rmsnorm_plus_one(&dy, norm, mtp.norm_eps),
+                    None => dy.clone(),
+                };
+                let draft = ops::linear::lm_head(&read, head);
+                if step == 0 {
+                    seam::at(seam::MTP, &[&draft]);
+                }
+                chosen = ops::layout::argmax(&[&draft]);
+                hidden = dy;
+                chain.push(draft);
+            }
             // The token plane the device-resident loop reads
-            // (`intrinsics::mtp_drafts`): depth one, the head's argmax at
-            // every drafting row — what `mtp_depth` advertises.
-            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&[&draft])]);
+            // (`intrinsics::mtp_drafts`): every step's argmax side by side,
+            // `[rows, DRAFT_DEPTH]` — what `mtp_depth` advertises.
+            let steps: Vec<&Value> = chain.iter().collect();
+            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&steps)]);
         }
 
         logits
@@ -484,7 +499,9 @@ fn attn_mixer(
 /// The draft head's attention: the family's gated full-attention site, over
 /// the head's own kv row (in the trunk's page-id space), on one prefill
 /// schedule.
-fn mtp_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Attn) -> Value {
+/// `chain`: a step past the first, which reads the kv the first step wrote
+/// for this row and appends none of its own (as the qwen4 head chains).
+fn mtp_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Attn, chain: bool) -> Value {
     let pages = inputs.kv(&a.kv);
     let write_page = inputs.write_page(&a.kv);
     let write_offset = inputs.write_offset(&a.kv);
@@ -495,7 +512,9 @@ fn mtp_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Attn)
     let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
     let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
     let (q, k) = rotate(&q, &k, inputs, m, a, d);
-    ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
+    if !chain {
+        ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
+    }
     let o = ops::attn::prefill(&q, plan, pages, None, d, m.kv_heads, a.sm_scale);
     ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
 }

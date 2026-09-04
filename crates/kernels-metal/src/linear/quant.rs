@@ -135,10 +135,14 @@ pub fn splitk_point(op: &'static str, group: i32, bits: i32, bm: i32) -> Result<
 /// header) a three-row group is 1.10x a one-row fire where three one-row launches are 1.44x.
 const QMV_ROW_RUNGS: [i32; 7] = [2, 3, 4, 5, 6, 7, 8];
 
-/// The rungs offered at pack width 2 — the ones that predate the unrolled fold. `r_5_p_2` lands a
-/// wrong answer under this OS's Metal compiler (kernel header), so the wider pack keeps the rungs
-/// it was measured and bit-checked at.
-const QMV_ROW_RUNGS_PACK2: [i32; 3] = [2, 4, 8];
+/// The rungs offered at pack width 2 (4- and 8-bit): every count to eight BUT five — `r_5_p_2`
+/// lands a wrong answer under this OS's Metal compiler at every group size (kernel header), and
+/// the sweep test is what vouches for the rest. Five rows at pack 2 take the tile where it fills
+/// and five one-row launches where it does not.
+const QMV_ROW_RUNGS_PACK2: [i32; 6] = [2, 3, 4, 6, 7, 8];
+
+/// The rungs at pack width 2 and 2 bits: thirty-two codes a lane, the bit-checked three alone.
+const QMV_ROW_RUNGS_PACK2_2BIT: [i32; 3] = [2, 4, 8];
 
 /// The rungs at 2 bits and pack width 1: sixteen codes a lane, and past three rows the fold
 /// spills — r_4 287 us against two r_2 at 274, r_6 556 against three r_2 at 407, r_8 874 against
@@ -155,7 +159,9 @@ const QMM_MIN_BATCH_2BIT: i32 = 5;
 
 /// The rungs a pack width and bit width may fold at.
 fn qmv_rungs_at(packs: i32, bits: i32) -> &'static [i32] {
-    if packs >= 2 {
+    if packs >= 2 && bits == 2 {
+        &QMV_ROW_RUNGS_PACK2_2BIT
+    } else if packs >= 2 {
         &QMV_ROW_RUNGS_PACK2
     } else if bits == 2 {
         &QMV_ROW_RUNGS_2BIT
@@ -853,9 +859,12 @@ mod tests {
         // Every axis is checked against what the macro will mint.
         assert!(qmv_rows_point("t", 64, 4, 3, 1).is_ok());
         assert!(qmv_rows_point("t", 64, 4, 9, 1).is_err());
-        // Pack width 2 keeps the rungs it was bit-checked at (kernel header).
-        assert!(qmv_rows_point("t", 64, 4, 3, 2).is_err());
-        assert!(qmv_rows_point("t", 64, 4, 4, 2).is_ok());
+        // Pack width 2 offers every rung but five (kernel header); 2-bit keeps three.
+        assert!(qmv_rows_point("t", 64, 4, 3, 2).is_ok());
+        assert!(qmv_rows_point("t", 64, 4, 5, 2).is_err());
+        assert!(qmv_rows_point("t", 64, 4, 7, 2).is_ok());
+        assert!(qmv_rows_point("t", 64, 2, 3, 2).is_err());
+        assert!(qmv_rows_point("t", 64, 2, 4, 2).is_ok());
         // 2-bit folds to three rows and no further at pack width 1.
         assert!(qmv_rows_point("t", 64, 2, 3, 1).is_ok());
         assert!(qmv_rows_point("t", 64, 2, 4, 1).is_err());

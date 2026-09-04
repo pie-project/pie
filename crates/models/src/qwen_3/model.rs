@@ -36,6 +36,21 @@ pub struct Model {
     pub mtp: Option<Mtp>,
 }
 
+/// Passes of the draft head a fire chains — the `mtp_drafts` seam's width and
+/// the most a guest may ask for as `k`. The checkpoint ships one prediction
+/// layer trained for one step; a second pass is that layer fed its own argmax
+/// and residual (as the qwen4 head chains its two).
+///
+/// Measured at 2 on Qwen3.8-27B-4bit (M4 Pro, 2026-09-04, decode-only, with
+/// a three-row fire at 1.17x a one-row fire): the second step lands ~0.60 of
+/// its drafts on math and ~0.23 on prose against a break-even near 0.30, so
+/// k=2 is +18% on math (24.9 -> 29.2 tok/s) and -4% on prose (18.9 -> 18.2);
+/// and every pass costs the fire ~4 ms on the device (mostly the 389 MB
+/// `lm_head` readout), which a k=1 round pays for a draft it never reads —
+/// about -5%. A static depth is the wrong knob for a workload-shaped gain;
+/// one, until the window is chosen per request off realized acceptance.
+pub const DRAFT_DEPTH: u32 = 1;
+
 /// One MTP (multi-token-prediction / NEXTN) head: fuses a hidden state with
 /// the next token's embedding, runs one transformer block over the fused
 /// stream, and reads out through the base model's own `lm_head`.
