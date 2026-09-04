@@ -477,7 +477,7 @@ fn attn_mixer(
     let (so, lse) = ops::attn::prefill_lse(&sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
     seam::at(seam::SCORES, &[&lse]);
     let o = Value::merge(vec![
-        ops::attn::masked(&mq, plan_m, mask, pages, None, d, a.sm_scale),
+        ops::attn::masked(&mq, plan_m, mask, pages, None, d, m.kv_heads, a.sm_scale),
         so,
         ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
         ops::attn::prefill(&p, plan_p, pages, None, d, m.kv_heads, a.sm_scale),

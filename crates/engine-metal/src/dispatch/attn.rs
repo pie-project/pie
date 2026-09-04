@@ -209,6 +209,10 @@ impl Run<'_> {
                 self.tensor(*o),
             ),
             Attention::Masked {
+                // The head split is the store's to read off this op
+                // (`store::kv::probe`); the dispatch takes its geometry from
+                // the pool the store already shaped.
+                kv_heads: _,
                 q,
                 plan,
                 mask,

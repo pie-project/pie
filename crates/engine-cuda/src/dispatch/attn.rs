@@ -238,6 +238,10 @@ impl Run<'_> {
             // rides the plan (bound at build by the `PlanPrefill` arm), and
             // the entry refuses a plan no span table rides.
             Attention::Masked {
+                // The head split is the store's to read off this op
+                // (`store::kv::probe`); the dispatch takes its geometry from
+                // the pool the store already shaped.
+                kv_heads: _,
                 q,
                 plan,
                 mask,

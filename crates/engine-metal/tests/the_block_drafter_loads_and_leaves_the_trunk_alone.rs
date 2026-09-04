@@ -19,9 +19,11 @@
 //!    the residual stream, which is exactly the bug the two-stream reading
 //!    of this architecture invites.
 //!
-//! What is NOT asked here is the draft pass itself: its rows carry a
-//! bidirectional block mask, which is the guest's to state, so it belongs to
-//! the inferlet's test rather than this one.
+//! 3. **the draft pass itself computes.** A lane that states
+//!    `drafting_a_block` carries `[anchor, MASK x 15]`, the trunk is guarded
+//!    away from its rows, and the readout it gets back is the DRAFTER's —
+//!    the two arms merge before the target's one `lm_head`, so a block row's
+//!    logits row is the drafter's proposal for that position.
 //!
 //! ```text
 //! PIE_DFLASH_ARTIFACT=~/.pie/models/<hash>/<hash>.qwen36-27b-dflash-u4g64-kv-bf16.metal.zt \
@@ -33,7 +35,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use engine_metal::{Boot, Lane, Shell};
+use engine::fire::{Mask, Masking};
+use engine_metal::{Boot, Lane, Seated, Shell};
 use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
 
@@ -175,4 +178,89 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
     }
     let tokens: Vec<u32> = drafted.iter().map(|r| argmax(r)).collect();
     eprintln!("drafting run tokens {tokens:?} — identical to the plain run over {STEPS} decodes");
+}
+
+/// The mask a draft block reads under: everything visible.
+///
+/// `Mask`'s runs alternate masked-out first, so `[0, n]` is "nothing hidden,
+/// then `n` positions visible". That is what the reference states for the
+/// drafter's one full-attention layer, where `is_causal` is false and
+/// `create_causal_mask` is skipped outright: the block sees the whole cached
+/// context AND all of itself, with no causality at all.
+fn all_visible(extent: u64) -> Masking {
+    Masking::Extent(Mask::new(
+        vec![0, u32::try_from(extent).expect("an extent that fits")],
+        extent,
+    ))
+}
+
+#[test]
+fn a_draft_block_fires_and_the_drafter_answers_it() {
+    if !engine_metal::device::present() {
+        eprintln!("skipping: this machine publishes no Metal device");
+        return;
+    }
+    let Some(artifact) = artifact() else {
+        eprintln!("not asked: no dflash artifact (PIE_DFLASH_ARTIFACT, or one in ~/.pie/models)");
+        return;
+    };
+    let sku = models::sku(SKU).expect("the catalog ships the block-drafter row");
+    let trace = (sku.trace)(Platform::Metal);
+    let source = ztensor_compat::index(&artifact).expect("the artifact opens");
+    let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
+        .expect("the artifact holds every plane");
+    drop(source);
+    let mut shell = Shell::load(Boot {
+        trace,
+        contract: &contract,
+        checkpoint: &artifact,
+        budget: Budget::new(4, 512),
+        patches: None,
+        profile: None,
+        page_size: 16,
+        context: 512,
+        slots: 4,
+        pages: 4 * 512 / 16,
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_metal::ResidencyPlan::default(),
+    })
+    .expect("the block drafter's shell loads");
+
+    // Prefill with the context arm on, so the drafter's five kv rows carry
+    // this prompt before the block asks to attend over them.
+    shell.open(0).expect("the slot opens");
+    let seeded = shell
+        .fire(&[Lane {
+            slot: 0,
+            word: word(PROMPT.len() as u32, true),
+            tokens: PROMPT,
+        }])
+        .expect("the prefill fires");
+    let anchor = argmax(&seeded[0]);
+
+    // The block: the anchor, then the model's mask token in every other row.
+    let block = models::qwen_3::model::DFLASH_BLOCK as usize;
+    let mut tokens = vec![models::qwen_3::model::DFLASH_MASK_TOKEN; block];
+    tokens[0] = anchor;
+    let extent = PROMPT.len() as u64 + block as u64;
+    let masking = all_visible(extent);
+    let mut seat = Seated::of(Lane {
+        slot: 0,
+        word: models::qwen_3::forward::Facts::of(
+            &Request::new(block as u32, true).drafting_a_block(true),
+        )
+        .word(),
+        tokens: &tokens,
+    });
+    seat.mask = Some(&masking);
+    let drafted = shell
+        .fire_seated(&[seat])
+        .expect("the draft block fires");
+
+    let row = drafted.into_iter().next().expect("one readout row");
+    finite(&row, "the draft block");
+    eprintln!(
+        "anchor {anchor} -> block of {block}; the drafter's last-row proposal is {}",
+        argmax(&row)
+    );
 }

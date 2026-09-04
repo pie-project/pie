@@ -1102,10 +1102,12 @@ const DFLASH_HEAD_DIM: u32 = 128;
 const DFLASH_INTER: u32 = 17_408;
 const DFLASH_THETA: f32 = 10_000_000.0;
 const DFLASH_WINDOW: u32 = 2_048;
-const DFLASH_BLOCK: u32 = 16;
+pub const DFLASH_BLOCK: u32 = 16;
 /// `dflash_config.mask_token_id` — the id every block row but the first
-/// carries into the draft pass.
-const DFLASH_MASK_TOKEN: u32 = 248_070;
+/// carries into the draft pass. Public with [`DFLASH_BLOCK`] because a guest
+/// seeding a draft block needs both; they belong on the load's own
+/// advertisement (beside `mtp_depth`) once there is a guest asking.
+pub const DFLASH_MASK_TOKEN: u32 = 248_070;
 
 /// Adapter ceiling for every SKU of this family. Not a checkpoint fact (no
 /// pretrained artifact states it) — a deployment setting baked in at trace

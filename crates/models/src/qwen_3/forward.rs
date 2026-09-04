@@ -526,7 +526,16 @@ fn dflash_arm(
                 a.kv_heads,
                 a.sm_scale,
             ),
-            None => ops::attn::masked(&q, &plan, mask, inputs.kv(&a.kv), None, hd, a.sm_scale),
+            None => ops::attn::masked(
+                &q,
+                &plan,
+                mask,
+                inputs.kv(&a.kv),
+                None,
+                hd,
+                a.kv_heads,
+                a.sm_scale,
+            ),
         };
         h = ops::elemwise::residual_add(&ops::linear::matmul(&o, &a.o_proj), &h);
 
@@ -684,7 +693,7 @@ fn attn_mixer(
     let (so, lse) = ops::attn::prefill_lse(&sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
     seam::at(seam::SCORES, &[&lse]);
     let o = Value::merge(vec![
-        ops::attn::masked(&mq, plan_m, mask, pages, None, d, a.sm_scale),
+        ops::attn::masked(&mq, plan_m, mask, pages, None, d, m.kv_heads, a.sm_scale),
         so,
         ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
         ops::attn::prefill(&p, plan_p, pages, None, d, m.kv_heads, a.sm_scale),

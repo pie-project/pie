@@ -62,6 +62,13 @@ pub enum Attention {
         cache: ValueId,
         window: Option<u32>,
         head_dim: u32,
+        /// The cache row's head split. Stated here for the reason
+        /// [`Prefill`](Attention::Prefill) states it: a row's head width is
+        /// read off its READERS, and a row only this arm reads — a block
+        /// drafter's last layer is full attention and nothing else touches
+        /// its row — would otherwise be taken for one head of the whole
+        /// plane.
+        kv_heads: u32,
         sm_scale: f32,
         o: ValueId,
     },
