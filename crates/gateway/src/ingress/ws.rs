@@ -20,6 +20,7 @@ use futures::{SinkExt, StreamExt};
 use crate::GatewayState;
 use crate::ingress::identity;
 use crate::session::{Affinity, Identity, TokenRx, TurnInput};
+use crate::worker::{MAX_CLIENT_FRAME_BYTES, MAX_CLIENT_FRAME_RECV_BYTES};
 use client_api::ClientMessage;
 use worker_api::{Priority, Tokens};
 
@@ -34,7 +35,26 @@ pub async fn ws(
         Ok(id) => id,
         Err(e) => return (StatusCode::UNAUTHORIZED, format!("identity: {e}")).into_response(),
     };
-    upgrade.on_upgrade(move |socket| serve(socket, state, ident))
+    // Bound what the transport will accept BEFORE a frame can become a
+    // `dispatch`. axum's defaults (64 MiB message / 16 MiB frame) sit above the
+    // worker link's own cap, so an oversized turn used to reach the codec and
+    // break the link for every other session on this server.
+    upgrade
+        .max_message_size(MAX_CLIENT_FRAME_RECV_BYTES)
+        .max_frame_size(MAX_CLIENT_FRAME_RECV_BYTES)
+        .on_upgrade(move |socket| serve(socket, state, ident))
+}
+
+/// Is this frame within what a turn may carry? The check is on the RAW bytes,
+/// before any parse, because the point is to answer without ever building
+/// something that cannot be dispatched.
+fn too_large(len: usize) -> Option<String> {
+    (len > MAX_CLIENT_FRAME_BYTES).then(|| {
+        format!(
+            "request too large: {len} bytes, limit {MAX_CLIENT_FRAME_BYTES} \
+             (send large inputs as a blob reference, not inline)"
+        )
+    })
 }
 
 /// One parsed client frame: a new turn, or a cancel of the live turns.
@@ -120,8 +140,15 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
 
     // The first client frame opens the session (its `create` mints the ReqId).
     let first = match read_first_turn(&mut rx_ws).await {
-        Some(req) => req,
-        None => return, // closed / errored before any turn
+        Ok(req) => req,
+        // Refused before a session exists: say why, then close. Silence here
+        // would be a hang, which is the failure mode this guard exists to end.
+        Err(Some(why)) => {
+            let _ = tx.send(Message::Text(error_json(&why).into())).await;
+            let _ = tx.send(Message::Close(None)).await;
+            return;
+        }
+        Err(None) => return, // closed / errored before any turn
     };
     // Multi-turn: sticky affinity so every turn prefers the warm-KV worker.
     let (handle, first_rx) = match state.sessions.create(ident, first, Affinity::Sticky).await {
@@ -181,6 +208,20 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
             },
 
             incoming = rx_ws.next() => match incoming {
+                // Oversized is non-fatal and answered, like a bad frame: the
+                // session survives and the client learns its own limit.
+                Some(Ok(Message::Text(t))) if too_large(t.len()).is_some() => {
+                    let why = too_large(t.len()).expect("guard matched");
+                    if tx.send(Message::Text(error_json(&why).into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(Message::Binary(b))) if too_large(b.len()).is_some() => {
+                    let why = too_large(b.len()).expect("guard matched");
+                    if tx.send(Message::Text(error_json(&why).into())).await.is_err() {
+                        break;
+                    }
+                }
                 Some(Ok(Message::Text(t))) => match parse_incoming(t.as_str()) {
                     Ok(Incoming::Turn(req)) => match handle.turn(req).await {
                         Ok(new_rx) => live.push(new_rx),
@@ -223,20 +264,32 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
     handle.close().await;
 }
 
-/// Read frames until the first turn-bearing one. Returns `None` if the client
-/// closes (or errors) before sending any turn.
-async fn read_first_turn(rx_ws: &mut futures::stream::SplitStream<WebSocket>) -> Option<TurnInput> {
+/// Read frames until the first turn-bearing one.
+///
+/// `Err(Some(why))` is a refusal the caller must report before closing;
+/// `Err(None)` is the client closing (or erroring) before it ever sent a turn.
+async fn read_first_turn(
+    rx_ws: &mut futures::stream::SplitStream<WebSocket>,
+) -> Result<TurnInput, Option<String>> {
     loop {
         match rx_ws.next().await {
+            // Same rule as mid-session, one turn earlier. No session exists to
+            // keep alive, so this ends the connection instead of continuing it.
+            Some(Ok(Message::Text(t))) if too_large(t.len()).is_some() => {
+                return Err(too_large(t.len()));
+            }
+            Some(Ok(Message::Binary(b))) if too_large(b.len()).is_some() => {
+                return Err(too_large(b.len()));
+            }
             Some(Ok(Message::Text(t))) => match parse_incoming(t.as_str()) {
-                Ok(Incoming::Turn(req)) => return Some(req),
+                Ok(Incoming::Turn(req)) => return Ok(req),
                 _ => continue, // a cancel/bad frame before any turn is meaningless
             },
             Some(Ok(Message::Binary(b))) => match parse_incoming_bytes(&b) {
-                Ok(Incoming::Turn(req)) => return Some(req),
+                Ok(Incoming::Turn(req)) => return Ok(req),
                 _ => continue,
             },
-            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return None,
+            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Err(None),
             Some(Ok(_)) => continue,
         }
     }
