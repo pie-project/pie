@@ -86,8 +86,16 @@ inline void sdpa_paged_decode_body(
   const int r          = req_of_token[row];
   const int q_pos      = position_ids[row];
 
+  // **THE WINDOW INT CARRIES THE CAUSALITY** (`kernels-metal::attn`'s
+  // `encoded_window`). `None` is 0 and a stated extent is positive, so the
+  // negative half says something else: `-(extent + 1)` means the row's MASK
+  // is authoritative and the causal upper bound must not apply — a
+  // bidirectional read, which a block drafter's full-attention layer needs.
+  // The lower bound is the window's either way.
+  const bool wide      = window < 0;
+  const int  extent    = wide ? (-window - 1) : window;
   const int kv_start   =
-      FAST_FULL ? 0 : ((window > 0 && q_pos >= window) ? (q_pos - window + 1) : 0);
+      FAST_FULL ? 0 : ((extent > 0 && q_pos >= extent) ? (q_pos - extent + 1) : 0);
   const int page_base  = int(kv_page_indptr[r]);
 
   queries += (size_t(row) * n_q_heads + q_batch_head_idx) * D + simd_lid * qk_per_thread;
@@ -128,14 +136,21 @@ inline void sdpa_paged_decode_body(
   };
 
   const int stride = PAGE_SIZE == 0 ? page_size : PAGE_SIZE;
+  // How far the walk runs. Causally that is the row's own position; when the
+  // mask is authoritative it is every cell this request's pages hold, and the
+  // mask does the bounding — which it can, because a non-causal read always
+  // states one, and a cell past the sequence reads a zero there.
+  const int last_kp = wide
+      ? int(kv_page_indptr[r + 1] - uint(page_base)) * stride - 1
+      : q_pos;
   const int first_page = kv_start / stride;
-  const int last_page = q_pos / stride;
+  const int last_page = last_kp / stride;
 
   if (last_page - first_page + 1 >= BN) {
     for (int pix = first_page + simd_gid; pix <= last_page; pix += BN) {
       const size_t base = size_t(kv_page_indices[page_base + pix]) * stride;
       const int lo = max(kv_start, pix * stride);
-      const int hi = min(q_pos, pix * stride + stride - 1);
+      const int hi = min(last_kp, pix * stride + stride - 1);
       for (int kp = lo; kp <= hi; ++kp) {
         if (attends(kp)) absorb(base + size_t(kp - pix * stride));
       }
@@ -143,7 +158,7 @@ inline void sdpa_paged_decode_body(
   } else {
     int fast_page_ix = 0;
     int fast_page_off = simd_gid;
-    for (int kp = kv_start + simd_gid; kp <= q_pos; kp += BN) {
+    for (int kp = kv_start + simd_gid; kp <= last_kp; kp += BN) {
 
       size_t slot;
       if constexpr (PAGE_SIZE == 32 && FAST_FULL) {
@@ -406,7 +421,11 @@ inline void sdpa_paged_tiled_body(
   }
 
   const int q_pos     = live ? position_ids[row] : 0;
-  const int my_start  = (window > 0 && q_pos >= window) ? (q_pos - window + 1) : 0;
+  // The window int's negative half says the row's mask is authoritative and
+  // the causal upper bound must not apply; see the decode body above.
+  const bool wide     = window < 0;
+  const int  extent   = wide ? (-window - 1) : window;
+  const int my_start  = (extent > 0 && q_pos >= extent) ? (q_pos - extent + 1) : 0;
   const bool masked   = live && attention_mask_enabled[row] != 0;
 
   U max_score = NEG_INF;
@@ -418,14 +437,23 @@ inline void sdpa_paged_tiled_body(
     int sub_hi = sub + 1;
     while (sub_hi < QT && row_lo + sub_hi < n_rows && req_of_token[row_lo + sub_hi] == r) sub_hi++;
 
+    // The key range these rows read. Causally it ends at the last row's own
+    // position; when the mask is authoritative it runs to the end of this
+    // request's pages and the mask does the bounding (the decode body above
+    // says why that is safe).
+    const bool wide_here = window < 0;
+    const int extent_here = wide_here ? (-window - 1) : window;
     int kp_hi = 0;
     int kp_lo = 0x7fffffff;
     for (int i = sub; i < sub_hi; i++) {
       const int p = position_ids[row_lo + i];
       kp_hi = max(kp_hi, p);
-      kp_lo = min(kp_lo, (window > 0 && p >= window) ? (p - window + 1) : 0);
+      kp_lo = min(kp_lo, (extent_here > 0 && p >= extent_here) ? (p - extent_here + 1) : 0);
     }
     const int page_base = int(kv_page_indptr[r]);
+    if (wide_here) {
+      kp_hi = int(kv_page_indptr[r + 1] - uint(page_base)) * page_size - 1;
+    }
     const bool mine = live && int(simd_gid) >= sub && int(simd_gid) < sub_hi;
 
     for (int base = kp_lo; base <= kp_hi; base += KT) {
@@ -448,7 +476,7 @@ inline void sdpa_paged_tiled_body(
       const threadgroup T* vbase = vtile + simd_lid * per_lane;
 
       const auto keeps = [&](int kp) {
-        if (kp > q_pos || kp < my_start) return false;
+        if ((!wide && kp > q_pos) || kp < my_start) return false;
         return !(masked && (uint(kp) >= attention_mask_stride ||
                             attention_mask[size_t(row) * attention_mask_stride +
                                            uint(kp)] == 0));

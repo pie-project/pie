@@ -242,6 +242,7 @@ impl Run<'_> {
                 // (`store::kv::probe`); the dispatch takes its geometry from
                 // the pool the store already shaped.
                 kv_heads: _,
+                causal,
                 q,
                 plan,
                 mask,

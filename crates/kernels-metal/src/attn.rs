@@ -247,6 +247,18 @@ fn window_extent(op: &'static str, window: Option<u32>) -> Result<i32, Error> {
     }
 }
 
+/// The window int the shaders read: a stated extent, or `-(extent + 1)` when
+/// the row's mask is authoritative and the causal upper bound must not apply.
+///
+/// `window_extent` answers `0` for no window and a positive number for one,
+/// so the negative half of the int is free to say something else. Spending
+/// it here keeps the mask ABI and every other entry's argument list
+/// untouched — see `attn/sdpa_paged.metal`, which decodes it.
+fn encoded_window(op: &'static str, window: Option<u32>, causal: bool) -> Result<i32, Error> {
+    let extent = window_extent(op, window)?;
+    Ok(if causal { extent } else { -(extent + 1) })
+}
+
 /// The kv head count the pool row's strides spell, against the stated head
 /// width. Pool strides are driver facts the validator never sees, so
 /// disagreement is refused, not asserted.
@@ -330,6 +342,7 @@ impl Paged {
         q: Tensor,
         pool: &KvPool,
         window: Option<u32>,
+        causal: bool,
         head_dim: u32,
     ) -> Result<Self, Error> {
         if pool.page_size <= 0 {
@@ -350,7 +363,12 @@ impl Paged {
             q_heads,
             kv_heads,
             gqa: q_heads / kv_heads,
-            window: window_extent(op, window)?,
+            // **THE WINDOW INT CARRIES THE CAUSALITY.** `None` is 0 and a
+            // stated extent is positive, so the negative half is free: a
+            // non-causal read is `-(extent + 1)`, which the shader decodes
+            // back into an extent and a flag. That keeps the mask ABI and
+            // every other entry's arguments exactly as they were.
+            window: encoded_window(op, window, causal)?,
             rows: nonzero(op, "rows", q.rows)?,
             at: head_point(op, head_dim, &SDPA_WIDTHS)?,
         })
@@ -394,6 +412,7 @@ fn vector(
     pool: &KvPool,
     plan: &DecodePlan,
     window: Option<u32>,
+    causal: bool,
     head_dim: u32,
     sm_scale: f32,
     o: Tensor,
@@ -404,7 +423,7 @@ fn vector(
         o.rows == q.rows && o.width == q.width && o.dtype == q.dtype,
         "the attention lands one output row per query row"
     );
-    let shape = Paged::of(op, q, pool, window, head_dim)?;
+    let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
     let entry = match lse {
         None => SDPA_DECODE[shape.at],
         Some(_) => SDPA_DECODE_LSE[head_point(op, head_dim, &SDPA_LSE_WIDTHS)?],
@@ -454,6 +473,7 @@ fn tiled(
     plan: &PrefillPlan,
     mask: Tensor,
     window: Option<u32>,
+    causal: bool,
     head_dim: u32,
     sm_scale: f32,
     o: Tensor,
@@ -464,7 +484,7 @@ fn tiled(
         o.rows == q.rows && o.width == q.width && o.dtype == q.dtype,
         "the attention lands one output row per query row"
     );
-    let shape = Paged::of(op, q, pool, window, head_dim)?;
+    let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
     let entry = match lse {
         None => SDPA_TILED[shape.at],
         Some(_) => SDPA_TILED_LSE[head_point(op, head_dim, &SDPA_LSE_WIDTHS)?],
@@ -520,6 +540,7 @@ pub fn decode(
         pool,
         plan,
         window,
+        true,
         head_dim,
         sm_scale,
         o,
@@ -546,6 +567,7 @@ pub fn decode_lse(
         pool,
         plan,
         window,
+        true,
         head_dim,
         sm_scale,
         o,
@@ -570,7 +592,7 @@ pub fn prefill(
     const OP: &str = "attention.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     tiled(
-        ctx, OP, q.data, pool, plan, plan.mask, window, head_dim, sm_scale, o, None,
+        ctx, OP, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, None,
     )
 }
 
@@ -597,6 +619,7 @@ pub fn prefill_lse(
         plan,
         plan.mask,
         window,
+        true,
         head_dim,
         sm_scale,
         o,
@@ -632,6 +655,7 @@ pub fn masked(
     pool: &KvPool,
     window: Option<u32>,
     head_dim: u32,
+    causal: bool,
     sm_scale: f32,
     o: Tensor,
 ) -> Result<(), Error> {
@@ -646,7 +670,7 @@ pub fn masked(
         ));
     }
     tiled(
-        ctx, OP, q.data, pool, plan, mask, window, head_dim, sm_scale, o, None,
+        ctx, OP, q.data, pool, plan, mask, window, causal, head_dim, sm_scale, o, None,
     )
 }
 

@@ -530,6 +530,12 @@ fn dflash_arm(
                 a.kv_heads,
                 a.sm_scale,
             ),
+            // **NOT CAUSAL.** The drafter's last layer is full attention:
+            // the reference skips `create_causal_mask` outright when
+            // `is_causal` is false, so a mask row sees the whole block, its
+            // own future included. Stated here because a mask alone cannot
+            // say it — pie's masked read is causal AND mask unless the op
+            // says otherwise.
             None => ops::attn::masked(
                 &q,
                 &plan,
@@ -538,6 +544,7 @@ fn dflash_arm(
                 None,
                 hd,
                 a.kv_heads,
+                false,
                 a.sm_scale,
             ),
         };
@@ -697,7 +704,7 @@ fn attn_mixer(
     let (so, lse) = ops::attn::prefill_lse(&sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
     seam::at(seam::SCORES, &[&lse]);
     let o = Value::merge(vec![
-        ops::attn::masked(&mq, plan_m, mask, pages, None, d, m.kv_heads, a.sm_scale),
+        ops::attn::masked(&mq, plan_m, mask, pages, None, d, m.kv_heads, true, a.sm_scale),
         so,
         ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
         ops::attn::prefill(&p, plan_p, pages, None, d, m.kv_heads, a.sm_scale),

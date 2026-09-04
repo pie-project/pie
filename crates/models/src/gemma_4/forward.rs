@@ -259,6 +259,7 @@ impl ForwardHybrid for Model {
                     win,
                     d,
                     kv_heads,
+                    true,
                     at.sm_scale,
                 ),
                 ops::attn::decode(

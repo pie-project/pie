@@ -213,6 +213,7 @@ impl Run<'_> {
                 // (`store::kv::probe`); the dispatch takes its geometry from
                 // the pool the store already shaped.
                 kv_heads: _,
+                causal,
                 q,
                 plan,
                 mask,
@@ -232,6 +233,7 @@ impl Run<'_> {
                 self.cut_rows(self.tensor(*mask)),
                 self.pool(*cache),
                 *window,
+                *causal,
                 *head_dim,
                 *sm_scale,
                 self.tensor(*o),

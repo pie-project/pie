@@ -69,6 +69,15 @@ pub enum Attention {
         /// its row — would otherwise be taken for one head of the whole
         /// plane.
         kv_heads: u32,
+        /// Whether the causal upper bound still applies under the mask.
+        ///
+        /// `true` is every existing caller: a stated mask NARROWS what a
+        /// causal row already sees. `false` makes the mask authoritative, so
+        /// a row may attend a key at a LATER position — which a block
+        /// drafter's full-attention layer needs and nothing else does. A
+        /// non-causal read is bounded by the mask alone, and one is always
+        /// stated because this op names it.
+        causal: bool,
         sm_scale: f32,
         o: ValueId,
     },
