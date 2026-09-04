@@ -268,6 +268,14 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
+    // The same trunk with a DFlash BLOCK drafter overlaid by `--aux`; the
+    // drafter's own five layers are not the trunk's and are not counted.
+    Row {
+        id: "qwen36-27b-dflash-u4g64-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
     Row {
         id: "qwen36-27b-u4g64-kv-bf16",
         layers: 64,

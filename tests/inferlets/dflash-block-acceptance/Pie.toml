@@ -1,0 +1,12 @@
+[package]
+name = "dflash-block-acceptance"
+version = "0.1.0"
+description = "How much of a DFlash block the target keeps: one sixteen-wide draft pass a round, then the target's own next sixteen tokens, and the accepted prefix between them"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to continue"}
+rounds = {type = "int", optional = true, description = "Draft blocks to measure (default: 4)"}

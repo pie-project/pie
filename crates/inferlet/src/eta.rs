@@ -1142,6 +1142,19 @@ impl<W: PassWit> Pass<W> {
         self.wit.set_max_layers(max_layers)
     }
 
+    /// **These rows are a block drafter's proposal, not the sequence's own.**
+    /// A block drafter proposes many tokens in one pass over a block whose
+    /// first row is the correction the target just made and whose rest is
+    /// the model's mask token; the trunk must not run over them, and a plan
+    /// carrying such a drafter guards itself on this. Call before `program`.
+    ///
+    /// It cannot be inferred from what the pass reads, the way drafting is:
+    /// what makes a fire a draft is the anchor chosen from the accepted
+    /// prefix, which only this guest knows.
+    pub fn set_drafting_block(&self, on: bool) -> Result<(), String> {
+        self.wit.set_drafting_block(on)
+    }
+
     /// Attach a PEFT adapter at `site`: `f` receives input `x` and base
     /// output `y`, returns the corrected [`adapter`] expression. Lowers
     /// LoRA, IA3, and DoRA forms into per-layer prologue sinks. One adapter
