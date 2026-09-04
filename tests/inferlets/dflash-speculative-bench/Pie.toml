@@ -1,0 +1,13 @@
+[package]
+name = "dflash-speculative-bench"
+version = "0.1.0"
+description = "A block drafter's speculative loop: one draft fire, one verify fire, a round"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 64)"}
+baseline = {type = "bool", optional = true, description = "Decode one token a fire instead, for the ratio"}

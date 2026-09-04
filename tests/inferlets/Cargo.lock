@@ -106,6 +106,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dflash-speculative-bench"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "dry-repetition-penalty"
 version = "0.1.0"
 dependencies = [
