@@ -159,7 +159,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut kept = Vec::new();
     let mut drafts_all = Vec::new();
     let mut truth_all = Vec::new();
-    let mut hits_by_position = vec![0u32; block as usize];
+    let mut hits_by_position = vec![0u32; block as usize - 1];
 
     for round in 0..input.rounds {
         // ── the draft: ONE pass over `[anchor, MASK x block-1]`, the trunk
@@ -282,6 +282,14 @@ async fn main(input: Input) -> Result<Output> {
         }
 
         // ── what the target kept ────────────────────────────────────────
+        // **ROW 0 IS THE ANCHOR, NOT A PREDICTION.** The block is
+        // `[anchor, MASK x block-1]` and a block diffusion model DENOISES
+        // each mask into the token AT ITS OWN POSITION — so row `i` proposes
+        // position `held + i`, and the anchor's own row proposes nothing new.
+        // The drafts are rows `1..block`, which is why the checkpoint's
+        // README runs it at `num_speculative_tokens: 15` against a block of
+        // sixteen.
+        let proposals: Vec<i32> = proposals[1..].to_vec();
         let mut prefix = 0u32;
         for (at, (p, t)) in proposals.iter().zip(&truth).enumerate() {
             if p == t {

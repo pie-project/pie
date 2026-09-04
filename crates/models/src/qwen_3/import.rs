@@ -358,7 +358,15 @@ impl Model {
         // `post_attention_layernorm`, `mlp.*` — and its `q_proj` is the
         // plain one, NOT the trunk's `[2·q, hidden]` gate-packed bank.
         if let Some(dflash) = &self.dflash {
-            b.read(&dflash.hidden_norm, "aux.hidden_norm.weight".to_string())?;
+            // **THE DRAFTER'S NORMS ARE FOLDED LIKE THE TRUNK'S**, measured
+            // rather than assumed. Whether an `--aux` checkpoint carries
+            // mlx_lm's `+1` fold is a question about its publisher, not about
+            // the target, so it was A/B'd on the artifact with everything else
+            // fixed: folded, the drafter keeps 0.33 / 0.33 / 0.67 of a block on
+            // counting / code / recall; unfolded, 0.33 / 0.00 / 0.33. The
+            // chained-head arm above reads its norms raw and is left alone —
+            // its own numbers are measured and good.
+            b.read_expr(&dflash.hidden_norm, norm("aux.hidden_norm.weight".to_string()))?;
             // `fc.weight` is one `[hidden, taps·hidden]` bank; tap `i` is
             // columns `i·hidden .. (i+1)·hidden`, sliced as the MTP head's
             // two-wide bank is.
@@ -370,14 +378,14 @@ impl Model {
             for (l, block) in dflash.blocks.iter().enumerate() {
                 let n = |s: &str| format!("aux.layers.{l}.{s}");
                 let a = &block.attn;
-                b.read(&block.mixer_norm, n("input_layernorm.weight"))?;
+                b.read_expr(&block.mixer_norm, norm(n("input_layernorm.weight")))?;
                 b.read(&a.q_proj, n("self_attn.q_proj.weight"))?;
                 b.read(&a.k_proj, n("self_attn.k_proj.weight"))?;
                 b.read(&a.v_proj, n("self_attn.v_proj.weight"))?;
                 b.read(&a.o_proj, n("self_attn.o_proj.weight"))?;
-                b.read(&a.q_norm, n("self_attn.q_norm.weight"))?;
-                b.read(&a.k_norm, n("self_attn.k_norm.weight"))?;
-                b.read(&block.mlp_norm, n("post_attention_layernorm.weight"))?;
+                b.read_expr(&a.q_norm, norm(n("self_attn.q_norm.weight")))?;
+                b.read_expr(&a.k_norm, norm(n("self_attn.k_norm.weight")))?;
+                b.read_expr(&block.mlp_norm, norm(n("post_attention_layernorm.weight")))?;
                 match &block.mlp {
                     Mlp::Dense { gate_up, down, .. } => {
                         b.read_concat(
@@ -394,7 +402,7 @@ impl Model {
                     }
                 }
             }
-            b.read(&dflash.norm, "aux.norm.weight".to_string())?;
+            b.read_expr(&dflash.norm, norm("aux.norm.weight".to_string()))?;
         }
 
         Ok(b.build())
