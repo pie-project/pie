@@ -236,12 +236,20 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
         "\nthe block's LAST row agreed with the target at {agreed} of {asked} anchors \
          — the hardest position in the block; the accepted-prefix profile needs the inferlet"
     );
-    // **NO FLOOR HERE ANY MORE, AND THE REASON IS THE POINT.** A host seat
-    // hands back a lane's LAST row, so this can only ever see the block's
-    // last position — and the drafter, as ported today, is right at its
-    // FIRST position and wrong beyond it
-    // (`tests/inferlets/dflash-block-acceptance` measures every position and
-    // is where the number and its assertion now live). What this still
-    // exercises is the whole draft path on the real checkpoint: a block
-    // fired at every anchor, with the context its anchor had.
+    // **THE FLOOR IS ON THE HARDEST POSITION IN THE BLOCK**, which is all a
+    // host seat can see: it hands back a lane's LAST row, so this reads the
+    // token `block - 1` ahead and nothing nearer. A ported drafter that has
+    // lost its context — the failure this guards, and the one that actually
+    // happened: the trunk's residual stream is ONE buffer
+    // (`Elementwise::aliases`), so five tapped handles all read the LAST
+    // layer unless each is fused where it is taken — agrees at the last
+    // position essentially never. A working port agrees at a quarter of the
+    // anchors here, so a third of that is a floor with room under it and a
+    // dead drafter still below it. The accepted-prefix profile across every
+    // position is `tests/inferlets/dflash-block-acceptance`.
+    assert!(
+        agreed >= 2,
+        "the block's last row agreed at {agreed} of {asked} anchors, which is a \
+         drafter that has lost its context rather than one that is merely wrong far ahead"
+    );
 }

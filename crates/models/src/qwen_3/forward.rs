@@ -204,7 +204,14 @@ impl ForwardHybrid for Model {
 
         // The trunk hidden states the drafter was trained against, kept in
         // tap order as the loop passes them.
-        let mut taps: Vec<Value> = Vec::new();
+        // **THE TAPS ARE FUSED WHERE THEY ARE TAKEN, NOT COLLECTED.** A residual
+    // add ALIASES its output onto the stream it folds into
+    // (`Elementwise::aliases`), so the trunk's hidden state is ONE buffer and
+    // a handle held across a later layer reads that layer's value, not the
+    // tapped one. The fusion's `[hidden, taps·hidden]` bank is its column
+    // slices summed, and a slice's matmul allocates — so taking the tap's
+    // product here is both the fusion and the snapshot, at no extra cost.
+    let mut fused: Option<Value> = None;
         let routes = inputs.adapter_routes();
         for (l, w) in inputs.walk_layers(&m.layers) {
             let x = ops::elemwise::rmsnorm_plus_one(&y, &w.mixer_norm, w.mixer_norm_eps);
@@ -289,8 +296,17 @@ impl ForwardHybrid for Model {
                 f
             };
             y = ops::elemwise::residual_add(&f, &y);
-            if m.dflash.as_ref().is_some_and(|d| d.taps.contains(&l)) {
-                taps.push(y.clone());
+            if let Some(at) = m
+                .dflash
+                .as_ref()
+                .and_then(|d| d.taps.iter().position(|t| *t == l))
+            {
+                let d = m.dflash.as_ref().expect("a tap index came from it");
+                let part = ops::linear::matmul(&y, &d.fc[at]);
+                fused = Some(match fused {
+                    Some(sum) => ops::elemwise::residual_add(&part, &sum),
+                    None => part,
+                });
             }
         }
 
@@ -305,7 +321,8 @@ impl ForwardHybrid for Model {
         // is what sharing the head means. Merge order is the split's.
         let x = match (&m.dflash, h_block) {
             (Some(d), Some(block)) => {
-                let hb = dflash_arm(d, &inputs, &taps, &block, &mask);
+                let fused = fused.as_ref().expect("a block drafter tapped the trunk");
+                let hb = dflash_arm(d, &inputs, fused, &block, &mask);
                 Value::merge(vec![hb, x])
             }
             _ => x,
@@ -437,13 +454,15 @@ impl ForwardHybrid for Model {
 /// the drafter's kv rows over the TRUNK's own rows, and the draft pass reads
 /// it back out of the cache in a later fire.
 ///
-/// `taps` are the trunk's hidden states at the layers the drafter was
-/// trained against, in tap order. Returns the block rows' final hidden for
+/// `fused` is the trunk's tapped hidden states already summed through their
+/// slices of the fusion bank — taken at the tap sites, because the residual
+/// stream is one aliased buffer. Returns the block rows' final hidden for
 /// the caller to merge before the shared readout.
+
 fn dflash_arm(
     d: &DFlash,
     inputs: &Input<Facts>,
-    taps: &[Value],
+    fused: &Value,
     h_block: &Value,
     mask: &Value,
 ) -> Value {
@@ -459,16 +478,7 @@ fn dflash_arm(
     // It costs a five-way fusion and ten projections a fire, under a percent
     // of a decode.
     //
-    // The IR has no concat, so the `[hidden, taps·hidden]` fusion is its
-    // column slices summed — the trick the chained heads use on their
-    // two-wide bank.
-    let fused = taps
-        .iter()
-        .zip(&d.fc)
-        .map(|(tap, bank)| ops::linear::matmul(tap, bank))
-        .reduce(|a, b| ops::elemwise::residual_add(&a, &b))
-        .expect("a block drafter fuses at least one tap");
-    let h_ctx = ops::elemwise::rmsnorm_plus_one(&fused, &d.hidden_norm, d.hidden_norm_eps);
+    let h_ctx = ops::elemwise::rmsnorm_plus_one(fused, &d.hidden_norm, d.hidden_norm_eps);
     // Spelled the way the keys beside them are: the taps these positions go
     // with are already inside the trunk's arm.
     let (_, ctx_positions) = inputs.positions().split(&Facts::block_draft());

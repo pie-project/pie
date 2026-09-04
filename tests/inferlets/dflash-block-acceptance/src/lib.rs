@@ -60,6 +60,19 @@ struct Input {
     /// not what the rows are reading.
     #[serde(default = "no_hide")]
     hide_before: i32,
+    /// Diagnostic: bind no mask at all. A plan whose drafter states no
+    /// masked arm refuses a lane that carries one, which is what a bisect
+    /// that skips the drafter's layers runs into.
+    #[serde(default)]
+    no_mask: bool,
+    /// Diagnostic: hide the whole context, leaving the block its own rows.
+    /// The reference can be given a zero-length context, so the two are
+    /// comparable and the drafter's LAYERS are what is being compared.
+    #[serde(default)]
+    block_only: bool,
+    /// Diagnostic: read the prefill out at every row, not only the last.
+    #[serde(default)]
+    readout_all: bool,
 }
 
 fn no_hide() -> i32 {
@@ -87,6 +100,8 @@ struct Output {
     /// can be told from a drafter that is wrong everywhere.
     hits_by_position: Vec<u32>,
     /// What the target actually produced, for eyeballing.
+    first_anchor: i32,
+    prefill_plane: Vec<i32>,
     truth: Vec<u32>,
     /// What the drafter proposed, round by round.
     drafts: Vec<Vec<u32>>,
@@ -137,6 +152,7 @@ async fn main(input: Input) -> Result<Output> {
     //    context behind it, because the context arm rides every trunk fire.
     let spans = prefill_chunks(n, None);
     let mut anchor: i32 = 0;
+    let mut prefill_plane: Vec<i32> = Vec::new();
     for &(base, end) in &spans {
         let len = end - base;
         let toks = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
@@ -147,8 +163,16 @@ async fn main(input: Input) -> Result<Output> {
         let w_slot = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_p");
         let w_off = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_p");
         let kv_len = Channel::from([end]).named("kv_len_p");
-        let readout = Channel::from([len - 1]).named("readout_p");
-        let next = Channel::new([1], dtype::i32).named("next_p");
+        // Diagnostic: read out EVERY prompt row, so a bisect can line the
+        // whole plane up against a reference rather than one token.
+        let wide = input.readout_all;
+        let readout = if wide {
+            Channel::from_iter(0..len).named("readout_p")
+        } else {
+            Channel::from([len - 1]).named("readout_p")
+        };
+        let out_rows = if wide { len } else { 1 };
+        let next = Channel::new([out_rows], dtype::i32).named("next_p");
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;
@@ -175,13 +199,18 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         fwd.epilogue(move || {
-            next.put(&reshape(reduce_argmax(intrinsics::logits()), [1]));
+            next.put(&reshape(reduce_argmax(intrinsics::logits()), [out_rows]));
         });
         fwd.submit(&pipe).context("prefill submit")?;
-        anchor = next.take_host::<Vec<i32>>().await.context("prefill readback")?[0];
+        let read = next.take_host::<Vec<i32>>().await.context("prefill readback")?;
+        if wide {
+            prefill_plane = read.clone();
+        }
+        anchor = *read.last().expect("a prefill readout");
     }
 
     // ── ROUNDS ──────────────────────────────────────────────────────────
+    let first_anchor = anchor;
     let mut held = n;
     let mut kept = Vec::new();
     let mut drafts_all = Vec::new();
@@ -209,6 +238,7 @@ async fn main(input: Input) -> Result<Output> {
         let hide_from = input.hide_from;
         let hide_rows_from = input.hide_rows_from;
         let hide_before = input.hide_before;
+        let block_only = input.block_only;
         let visible: Vec<bool> = (0..block)
             .flat_map(|i| {
                 (0..pool).map(move |j| {
@@ -220,10 +250,12 @@ async fn main(input: Input) -> Result<Output> {
                         && (hide_from < 0 || (j as i32) < hide_from)
                         && (hide_rows_from < 0 || (i as i32) < hide_rows_from)
                         && (hide_before < 0 || (j as i32) >= hide_before)
+                        && (!block_only || j >= held)
                 })
             })
             .collect();
         let mask = Channel::from_shaped([block, pool], visible).named("mask_d");
+        let bound_mask = if input.no_mask { None } else { Some(&mask) };
         // **EVERY BLOCK ROW READS OUT.** The drafts plane is cut to the rows
         // the readout names, so a pass that leaves it at the default gets a
         // one-row plane and asking it for `block` values is a geometry
@@ -248,7 +280,7 @@ async fn main(input: Input) -> Result<Output> {
                     w_slot: &w_slot,
                     w_off: &w_off,
                     positions: &positions,
-                    mask: Some(&mask),
+                    mask: bound_mask,
                 },
             }),
             &rs_set,
@@ -359,6 +391,8 @@ async fn main(input: Input) -> Result<Output> {
         kept,
         mean_kept,
         hits_by_position,
+        first_anchor,
+        prefill_plane,
         truth: truth_all,
         drafts: drafts_all,
     })
