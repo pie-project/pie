@@ -342,7 +342,21 @@ impl Session {
                 self.send_response(corr_id, true, serde_json::Value::Object(stats).to_string())
                     .await;
             }
-            _ => println!("Unknown query subject: {}", subject),
+            // Every request that carries a `corr_id` MUST be answered: the
+            // client correlates on it and waits, and `pie-client`'s
+            // `_send_msg_and_wait` has no timeout — so a silent arm here hung
+            // the caller forever and leaked its pending entry.
+            _ => {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!(
+                        "unknown query subject {subject:?} (known: {})",
+                        client::message::QUERY_MODEL_STATUS
+                    ),
+                )
+                .await
+            }
         }
     }
 
