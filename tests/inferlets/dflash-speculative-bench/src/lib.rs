@@ -172,10 +172,33 @@
 //! Sizing the take-side rings the way that file and `mtp-speculative-bench`
 //! size theirs was tried and moved NOTHING (23.52 against 23.44): those
 //! loops hoist their channels out of the round and this one builds them
-//! fresh, and the ticket check is not what is binding. Closing this needs a
-//! DEVICE-RESIDENT accept and commit — what `mtp-speculative-bench` gets
-//! from `Lane::drafts` — not another knob on the guest, because the compare
-//! that decides a round is a host compare by construction.
+//! fresh, and the ticket check is not what is binding.
+//!
+//! # WHAT A DEVICE-RESIDENT ROUND WOULD NEED, AND IT IS ONE VERB
+//!
+//! `mtp-speculative-bench` is not host-in-the-loop and shows the whole
+//! pattern: its epilogue computes the accepted prefix as tensor ops
+//! (`reduce_sum(cumprod(eq(proposed, said)))`), builds the committed tokens
+//! and the NEXT window's positions, `kv_len`, `w_slot`, `w_off` and pages
+//! with `select`/`gather`, puts them into the channels the next fire reads,
+//! and `run_ahead` then keeps the runtime's window full while the host only
+//! drains text. Two fires a round is no obstacle either: `submit_frame`
+//! takes a slot per wave, so a `[draft, verify]` frame is expressible.
+//!
+//! What this loop cannot express is the OTHER half of fold-commit. The fold
+//! side is already device-driven — `RsGeometry::fold_len` takes a CHANNEL,
+//! so the accepted prefix can be written by a tensor op and never reach the
+//! host. The discard side is not: `discard-buffered: func(count: u32)`
+//! (`crates/inferlet/wit/working-set.wit`) takes a host word, and the count
+//! is `verify - 1 - kept`, which is only known after the compare. The
+//! rejected rows are the buffer's TAIL and the next fold reaches exactly the
+//! accepted prefix, so nothing else about the protocol needs to change.
+//!
+//! **So the ask is one verb taking a channel where its twin already does**,
+//! and it does not move a decision from the guest to the engine — the guest
+//! still says how many rows it is forgetting, in a tensor rather than in a
+//! host word. Until then a block-speculative round is host-in-the-loop by
+//! construction, and this file's eight-concurrent row is what that costs.
 //!
 //! So: **speculation is a single-stream lever on this box.** At one stream
 //! it is worth 1.32x-1.88x; at eight concurrent plain decode wins, and the
