@@ -448,26 +448,30 @@ fn dflash_arm(
     mask: &Value,
 ) -> Value {
     // ── THE CONTEXT, WHICH IS THE CACHE ──────────────────────────────────
-    // Guarded on `drafts`, not on `block_draft`: it is the SPECULATING
-    // lane's own rows that become the drafter's context, and those are the
-    // trunk's rows. The IR has no concat, so the `[hidden, taps·hidden]`
-    // fusion is its column slices summed — the trick the chained heads use
-    // on their two-wide bank.
+    // **ON EVERY TRUNK FIRE, NOT ONLY A DRAFTING ONE.** The taps carry the
+    // trunk's own arm and that is the whole guard this wants: a fire whose
+    // rows the trunk ran must leave the drafter's context behind, or the
+    // drafter attends over a sequence with holes in it the next time it
+    // drafts. (The chained heads guard their work on `Facts::drafts`, but
+    // that fact is INFERRED from a program reading the draft seam, and a
+    // block drafter plants that seam on its block rows alone — so a verify
+    // fire could never set it, and the context would never be written.)
+    // It costs a five-way fusion and ten projections a fire, under a percent
+    // of a decode.
+    //
+    // The IR has no concat, so the `[hidden, taps·hidden]` fusion is its
+    // column slices summed — the trick the chained heads use on their
+    // two-wide bank.
     let fused = taps
         .iter()
         .zip(&d.fc)
-        .map(|(tap, bank)| {
-            let (dt, _) = tap.split(&Facts::drafts());
-            ops::linear::matmul(&dt, bank)
-        })
+        .map(|(tap, bank)| ops::linear::matmul(tap, bank))
         .reduce(|a, b| ops::elemwise::residual_add(&a, &b))
         .expect("a block drafter fuses at least one tap");
     let h_ctx = ops::elemwise::rmsnorm_plus_one(&fused, &d.hidden_norm, d.hidden_norm_eps);
-    // Split off the trunk's arm first and the drafting lanes' out of that,
-    // so these positions are spelled the way the keys beside them are — the
-    // taps they came from are already inside the trunk's arm.
-    let (_, trunk_positions) = inputs.positions().split(&Facts::block_draft());
-    let (ctx_positions, _) = trunk_positions.split(&Facts::drafts());
+    // Spelled the way the keys beside them are: the taps these positions go
+    // with are already inside the trunk's arm.
+    let (_, ctx_positions) = inputs.positions().split(&Facts::block_draft());
     for b in &d.blocks {
         let a = &b.attn;
         let hd = a.head_dim;

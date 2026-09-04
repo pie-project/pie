@@ -12,12 +12,17 @@
 //!
 //! 1. the artifact loads — every one of the drafter's 58 planes binds, its
 //!    five kv rows are carved, and the load advertises a draft head;
-//! 2. **the trunk's logits with the drafter's context arm running are the
-//!    trunk's logits without it, bit for bit.** That arm fuses five taps and
-//!    writes ten projections into the drafter's kv rows on every drafting
-//!    fire; a trunk that moved under it would mean the fusion had reached
-//!    the residual stream, which is exactly the bug the two-stream reading
-//!    of this architecture invites.
+//! 2. **the trunk's tokens are the tokens the SAME WEIGHTS give with no
+//!    drafter over them.** The context arm fuses five taps and writes ten
+//!    projections into the drafter's kv rows on every trunk fire; a trunk
+//!    that moved under it would mean the fusion had reached the residual
+//!    stream, which is exactly the bug the two-stream reading of this
+//!    architecture invites. The comparison is against the plain
+//!    `qwen36-27b-mtp` artifact built from the same checkpoint — a
+//!    within-artifact A/B is not available, because the context arm is
+//!    guarded by the trunk's own arm and runs on every trunk fire (it has
+//!    to: a fire that skipped it would leave a hole in the sequence the
+//!    drafter attends over).
 //!
 //! 3. **the draft pass itself computes.** A lane that states
 //!    `drafting_a_block` carries `[anchor, MASK x 15]`, the trunk is guarded
@@ -41,6 +46,8 @@ use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
 
 const SKU: &str = "qwen36-27b-dflash-u4g64-kv-bf16";
+/// The same checkpoint with no drafter over it — the trunk's control.
+const PLAIN_SKU: &str = "qwen36-27b-mtp-u4g64-kv-bf16";
 const PROMPT: &[u32] = &[9707, 11, 847, 829, 374, 264, 1602, 2613, 3364];
 const STEPS: usize = 4;
 
@@ -55,6 +62,20 @@ fn artifact() -> Option<PathBuf> {
         for file in std::fs::read_dir(entry.path()).ok()?.flatten() {
             let name = file.file_name().to_string_lossy().into_owned();
             if name.contains(SKU) && name.ends_with(".zt") {
+                return Some(file.path());
+            }
+        }
+    }
+    None
+}
+
+/// The plain artifact beside the drafted one, if the store holds it.
+fn plain_artifact() -> Option<PathBuf> {
+    let store = PathBuf::from(std::env::var("HOME").ok()?).join(".pie/models");
+    for entry in std::fs::read_dir(store).ok()?.flatten() {
+        for file in std::fs::read_dir(entry.path()).ok()?.flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            if name.contains(PLAIN_SKU) && name.ends_with(".zt") {
                 return Some(file.path());
             }
         }
@@ -165,19 +186,75 @@ fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
         "the load carries a block drafter and advertises no draft head"
     );
 
-    let plain = run(&mut shell, 0, false);
     let drafted = run(&mut shell, 1, true);
-    for (step, (a, b)) in plain.iter().zip(drafted.iter()).enumerate() {
-        finite(a, &format!("plain step {step}"));
-        finite(b, &format!("drafting step {step}"));
-        assert_eq!(
-            a, b,
-            "the trunk's logits at step {step} moved when the drafter's context arm ran \
-             beside it — the fusion has reached the residual stream"
-        );
+    for (step, row) in drafted.iter().enumerate() {
+        finite(row, &format!("drafting step {step}"));
     }
     let tokens: Vec<u32> = drafted.iter().map(|r| argmax(r)).collect();
-    eprintln!("drafting run tokens {tokens:?} — identical to the plain run over {STEPS} decodes");
+
+    // ── the same weights with no drafter over them ───────────────────────
+    let Some(plain_artifact) = plain_artifact() else {
+        eprintln!(
+            "the drafted run decoded {tokens:?}; no plain artifact beside it, so the \
+             trunk is unchecked against one"
+        );
+        return;
+    };
+    let plain_sku = models::sku(PLAIN_SKU).expect("the catalog ships the plain row");
+    let plain_trace = (plain_sku.trace)(Platform::Metal);
+    let plain_source = ztensor_compat::index(&plain_artifact).expect("the artifact opens");
+    let plain_contract =
+        checkpoint_dsl::own_contract(&plain_source, &plain_trace.params, 1, Platform::Metal)
+            .expect("the plain artifact holds every plane");
+    drop(plain_source);
+    let mut plain_shell = Shell::load(Boot {
+        trace: plain_trace,
+        contract: &plain_contract,
+        checkpoint: &plain_artifact,
+        budget: Budget::new(4, 512),
+        patches: None,
+        profile: None,
+        page_size: 16,
+        context: 512,
+        slots: 4,
+        pages: 4 * 512 / 16,
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_metal::ResidencyPlan::default(),
+    })
+    .expect("the plain shell loads");
+    let plain_word = |len: u32| {
+        models::qwen_3::forward::Facts::of(&Request::new(len, false).drafting(false)).word()
+    };
+    plain_shell.open(0).expect("the slot opens");
+    let mut plain_tokens = Vec::with_capacity(STEPS + 1);
+    let got = plain_shell
+        .fire(&[Lane {
+            slot: 0,
+            word: plain_word(PROMPT.len() as u32),
+            tokens: PROMPT,
+        }])
+        .expect("the plain prefill fires");
+    let mut fed = argmax(&got[0]);
+    plain_tokens.push(fed);
+    for step in 0..STEPS {
+        let got = plain_shell
+            .fire(&[Lane {
+                slot: 0,
+                word: plain_word(1),
+                tokens: &[fed],
+            }])
+            .unwrap_or_else(|why| panic!("plain decode step {step}: {why}"));
+        fed = argmax(&got[0]);
+        plain_tokens.push(fed);
+    }
+    assert_eq!(
+        tokens, plain_tokens,
+        "the trunk decoded different tokens with a block drafter over it than the same \
+         weights decode without one — the drafter's fusion has reached the residual stream"
+    );
+    eprintln!(
+        "drafted run tokens {tokens:?} — the same tokens the plain artifact decodes over {STEPS} steps"
+    );
 }
 
 /// The mask a draft block reads under: everything visible.
