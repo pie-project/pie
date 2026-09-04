@@ -16,6 +16,8 @@ pub struct Facts {
     pub captures_scores: bool,
     pub masked: bool,
     pub media: bool,
+    /// The rows are a block drafter's proposal — see [`Facts::block_draft`].
+    pub block_draft: bool,
 }
 
 impl Facts {
@@ -62,6 +64,15 @@ impl Facts {
     pub fn media() -> Predicate {
         Predicate::fact(5)
     }
+
+    /// Lanes whose rows are a block drafter's proposal rather than the
+    /// sequence's own — `[anchor, MASK x block-1]`, which the trunk must not
+    /// run over. Declared ahead of the arm that reads it, so the fact a lane
+    /// carries and the plan that guards on it land in one place.
+    #[must_use]
+    pub fn block_draft() -> Predicate {
+        Predicate::fact(6)
+    }
 }
 
 impl Classify for Facts {
@@ -73,6 +84,7 @@ impl Classify for Facts {
             captures_scores: r.captures_scores(),
             masked: r.has_custom_mask(),
             media: r.has_media(),
+            block_draft: r.drafts_a_block(),
         }
     }
 
@@ -83,6 +95,7 @@ impl Classify for Facts {
             | (u64::from(self.captures_scores) << 3)
             | (u64::from(self.masked) << 4)
             | (u64::from(self.media) << 5)
+            | (u64::from(self.block_draft) << 6)
     }
 }
 
