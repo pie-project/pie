@@ -62,6 +62,11 @@ struct Input {
     /// rows are worth a fire is the guest's call, not the engine's.
     #[serde(default)]
     verify_rows: u32,
+    /// Let the drafter's own logit margin choose the width per round, rather
+    /// than verifying the whole block — see `wide_enough`. Off by default,
+    /// because on three workloads it is a WASH.
+    #[serde(default)]
+    margin_width: bool,
 }
 
 fn default_prompt() -> String {
@@ -105,6 +110,41 @@ struct Output {
     /// The recurrent buffer's page width, for reading the grant arithmetic.
     rs_page: u32,
 }
+
+/// **IS THIS ROUND WORTH A WIDE VERIFY? THE DRAFTER ALREADY SAID.**
+///
+/// The signal is the LOGIT MARGIN, top-1 less top-2, because that is what
+/// comes free: `top_k` reads the logits plane once and returns both, where a
+/// probability would want a softmax over the whole vocabulary and a second
+/// pass over the plane.
+///
+/// A verify fire's price is a staircase — the tile point pads a fire's rows up
+/// to a row block, so a round costs 2.10 one-row fires at eight rows and 3.09
+/// at sixteen — and the question is whether the prefix will reach eight. The
+/// drafter's own top-1 probability answers it: over sixty anchors on five
+/// prompts, a position INSIDE the accepted prefix carries 0.936 and one
+/// outside 0.383, and the first seven positions' mean reads 0.959 where the
+/// prefix reached eight against 0.553 where it did not. At this threshold
+/// that calls the wide round on 28 of 30 long anchors and on 2 of 30 short
+/// ones.
+///
+/// This is the signal Dspark spends a trained confidence head on. A block
+/// drafter that reads out through the target's own `lm_head` has it for one
+/// reduction over a plane the fire already computed.
+fn wide_enough(confidence: &[f32]) -> bool {
+    const THRESHOLD: f64 = MARGIN_THRESHOLD;
+    let head = &confidence[..confidence.len().min(NARROW as usize - 1)];
+    let mean = head.iter().map(|c| f64::from(*c)).sum::<f64>() / head.len().max(1) as f64;
+    mean >= THRESHOLD
+}
+
+/// The narrow rung, the only other width whose price differs (twelve rows
+/// cost what sixteen do).
+const NARROW: u32 = 8;
+
+/// Where the margin separates a round that will reach eight from one that
+/// will not — fitted offline, `scratchpad/dflash_ref/confidence.py`.
+const MARGIN_THRESHOLD: f64 = 2.0;
 
 /// The pages the recurrent buffer must hold for one fire: the survivors (at
 /// most a page's worth of head offset before them), plus the window.
@@ -264,8 +304,9 @@ async fn main(input: Input) -> Result<Output> {
             continue;
         }
 
-        let verify = pinned.unwrap_or(block);
-        widths.push(verify);
+        // The width is chosen AFTER the draft fire, from what the drafter
+        // itself says — see `wide_enough`. Pinned, it is stated here.
+        let mut verify = pinned.unwrap_or(block);
         // The buffer must hold the survivors and this window; the grant is
         // the guest's one allocation decision.
         let buffer_pages = buffer_pages_for(survivors, block, rs_page);
@@ -301,7 +342,11 @@ async fn main(input: Input) -> Result<Output> {
         // logits: a block drafter's rows go through the TARGET's one
         // `lm_head`, so there is no separate draft plane to read.
         let readout = Channel::from_iter(0..block).named("readout_d");
-        let out = Channel::new([block], dtype::i32).named("drafts_d");
+        let out = Channel::new([block * 2], dtype::i32).named("drafts_d");
+        // **THE DRAFTER'S OWN CONFIDENCE, OFF THE SAME LOGITS.** One more
+        // reduction over a plane the fire already computed, read back beside
+        // the proposals in the same round trip.
+        let conf = Channel::new([block * 2], dtype::f32).named("conf_d");
 
         let fwd = ForwardPass::new();
         fwd.set_drafting_block(true)
@@ -336,8 +381,18 @@ async fn main(input: Input) -> Result<Output> {
         )?;
         {
             let out = out.clone();
+            let conf = conf.clone();
             fwd.epilogue(move || {
-                out.put(&reshape(reduce_argmax(intrinsics::logits()), [block]));
+                // **ONE OP, ONE CONSUMER, BOTH ANSWERS.** A second reduction
+                // over the logits plane costs about a second a round even
+                // with the plane bound once (3.0 s to 7.4 s over a 64-token
+                // run; 46 s with a softmax on it) — two consumers take it off
+                // the device. `top_k` reads it once and returns the values
+                // beside the indices, so the proposal and the margin that
+                // says how sure of it the drafter is come out together.
+                let (value, index) = top_k(intrinsics::logits(), 2);
+                out.put(&reshape(cast(index, dtype::i32), [block * 2]));
+                conf.put(&reshape(value, [block * 2]));
             });
         }
         fwd.submit(&pipe).context("draft submit")?;
@@ -345,8 +400,18 @@ async fn main(input: Input) -> Result<Output> {
         // denoises each mask into the token AT ITS OWN POSITION, so row `i`
         // proposes position `held + i` and the anchor's row proposes nothing
         // new. The proposals are rows `1..block`.
-        let proposals = out.take_host::<Vec<i32>>().await.context("draft readback")?;
-        let proposals = &proposals[1..];
+        let top = out.take_host::<Vec<i32>>().await.context("draft readback")?;
+        let value = conf.take_host::<Vec<f32>>().await.context("margin readback")?;
+        // Row `r` occupies `[2r, 2r + 1]`: the proposal and its runner-up.
+        let proposals: Vec<i32> = (1..block as usize).map(|r| top[2 * r]).collect();
+        let margin: Vec<f32> = (1..block as usize)
+            .map(|r| value[2 * r] - value[2 * r + 1])
+            .collect();
+        let proposals = proposals.as_slice();
+        if pinned.is_none() && input.margin_width {
+            verify = if wide_enough(&margin) { block } else { NARROW };
+        }
+        widths.push(verify);
         // The buffer is back to the accepted prefix the verify is about to
         // fold — see the draft fire's geometry.
         rs_set[0]

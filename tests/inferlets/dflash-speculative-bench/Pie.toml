@@ -11,4 +11,5 @@ core = "^0.2.0"
 prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
 max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 64)"}
 verify_rows = {type = "int", optional = true, description = "Rows of the block the target verifies, the anchor included (default: all 16)"}
+margin_width = {type = "bool", optional = true, description = "Let the drafter's logit margin pick the verify width per round"}
 baseline = {type = "bool", optional = true, description = "Decode one token a fire instead, for the ratio"}
