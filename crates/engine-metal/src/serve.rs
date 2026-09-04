@@ -2719,7 +2719,9 @@ impl Shell {
         let Some(flight) = self.inflight.pop_front() else {
             return Ok(());
         };
-        if let Err(fault) = flight.pending.wait() {
+        let waited = flight.pending.wait();
+        fire_trace(|| format!("device-done seq={} rows={}", flight.seq, flight.lanes));
+        if let Err(fault) = waited {
             // The seat goes back even on a refusal: the device is done with
             // it either way, and a seat held by a step that faulted would
             // shrink the run-ahead for the rest of the load.
@@ -2771,6 +2773,7 @@ impl Shell {
                     .collect()
             })
             .collect();
+        fire_trace(|| format!("readout-done seq={} rows={}", flight.seq, flight.lanes));
         self.arms.give(flight.arm);
         self.landed.insert(flight.seq, rows);
         while self.landed.len() > SETTLED_RING {
@@ -5405,6 +5408,25 @@ pub struct Landed {
 
 /// One committed step the host has not caught up with, as the in-flight ring
 /// holds it.
+/// `PIE_FIRE_TRACE=1`: one line per fire at enqueue, at device completion
+/// and after the readout, with a monotonic microsecond clock — so a served
+/// run's host time between fires can be read off a log rather than inferred
+/// from tok/s. Prefixed `[fire ` because `benches/pie_bench.py` surfaces
+/// exactly that prefix from the server's stdout.
+fn fire_trace(line: impl FnOnce() -> String) {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static ON: OnceLock<bool> = OnceLock::new();
+    static BEGAN: OnceLock<Instant> = OnceLock::new();
+    if !*ON.get_or_init(|| {
+        std::env::var_os("PIE_FIRE_TRACE").is_some_and(|v| v != "0")
+    }) {
+        return;
+    }
+    let began = BEGAN.get_or_init(Instant::now);
+    println!("[fire t_us={} {}]", began.elapsed().as_micros(), line());
+}
+
 struct Flight {
     seq: u64,
     arm: usize,
@@ -5761,6 +5783,7 @@ impl engine::frame::Shell for Shell {
             step: _,
         } = enqueued;
         self.arms.take(arm);
+        fire_trace(|| format!("enqueue seq={seq} rows={lanes}"));
         self.inflight.push_back(Flight {
             seq,
             arm,
