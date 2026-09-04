@@ -116,6 +116,36 @@
 //! of the ladder's gap against a pinned width: prose reads 1.38x where a
 //! pinned four read 1.41x.
 //!
+//! # AT EIGHT CONCURRENT THE LOOP LOSES, AND IT IS NOT THE DRAFTER
+//!
+//! `tput --num-requests 32 --concurrency 8 --max-tokens 64`, dflash SKU:
+//!
+//! ```text
+//! text-completion-bench, mtp SKU      47.67 tok/s
+//! text-completion-bench, dflash SKU   46.27          the ctx arm costs 3%
+//! this loop, --baseline               23.52          the STRUCTURE costs 49%
+//! this loop, auto width               18.32   0.78x
+//! ```
+//!
+//! **The drafter's context arm is nearly free even at concurrency** — three
+//! percent against the plain SKU through the same plain inferlet — so the
+//! half that is missing is this loop's own shape: it awaits a host readback
+//! every round, and a wave waits on its straggler lane, so eight
+//! host-in-the-loop guests each put a turnaround on the critical path.
+//! `text-completion-bench` runs ahead instead and never lands one there.
+//!
+//! Sizing the take-side rings the way that file and `mtp-speculative-bench`
+//! size theirs was tried and moved NOTHING (23.52 against 23.44): those
+//! loops hoist their channels out of the round and this one builds them
+//! fresh, and the ticket check is not what is binding. Closing this needs a
+//! DEVICE-RESIDENT accept and commit — what `mtp-speculative-bench` gets
+//! from `Lane::drafts` — not another knob on the guest, because the compare
+//! that decides a round is a host compare by construction.
+//!
+//! So: **speculation is a single-stream lever on this box.** At one stream
+//! it is worth 1.32x-1.88x; at eight concurrent plain decode wins, and the
+//! serving path should pick per shape.
+//!
 //! # The gate, and what it costs to never lose
 //!
 //! `min_tokens_per_round` (see `Gate`) is the guest reading its OWN yield
@@ -311,6 +341,20 @@ fn default_max_tokens() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+/// **A TAKE-SIDE RING WITH A FRAME OF MARGIN ABOVE THE ADVERTISED
+/// CAPACITY**, as `text-completion-bench` and `mtp-speculative-bench` size
+/// theirs: sized at exactly `channel_capacity()` the runtime's ticket check
+/// skips continuations that land inside its staging margin and the run-ahead
+/// collapses.
+///
+/// **MEASURED NEUTRAL HERE**, and kept for the convention rather than for a
+/// gain: 23.52 against 23.44 tok/s at eight concurrent. This loop's channels
+/// are built fresh a round rather than hoisted like the mtp loop's, and its
+/// concurrency wall is elsewhere — see the header.
+fn ring() -> u32 {
+    (channel_capacity() + 7 * live_slots()) as u32
 }
 
 fn default_system() -> String {
@@ -668,7 +712,9 @@ async fn main(input: Input) -> Result<Output> {
             let w_slot = Channel::from([held / page_size]).named("w_slot_b");
             let w_off = Channel::from([held % page_size]).named("w_off_b");
             let kv_len = Channel::from([held + 1]).named("kv_len_b");
-            let next = Channel::new([1], dtype::i32).named("next_b");
+            let next = Channel::new([1], dtype::i32)
+                .capacity(ring())
+                .named("next_b");
 
             let fwd = ForwardPass::new();
             fwd.embed(&toks, &indptr)?;
@@ -757,11 +803,15 @@ async fn main(input: Input) -> Result<Output> {
         // still reads the block.
         let shown = if input.margin_width { block } else { verify };
         let readout = Channel::from_iter(0..shown).named("readout_d");
-        let out = Channel::new([shown * 2], dtype::i32).named("drafts_d");
+        let out = Channel::new([shown * 2], dtype::i32)
+            .capacity(ring())
+            .named("drafts_d");
         // **THE DRAFTER'S OWN CONFIDENCE, OFF THE SAME LOGITS.** One more
         // reduction over a plane the fire already computed, read back beside
         // the proposals in the same round trip.
-        let conf = Channel::new([shown * 2], dtype::f32).named("conf_d");
+        let conf = Channel::new([shown * 2], dtype::f32)
+            .capacity(ring())
+            .named("conf_d");
 
         let fwd = ForwardPass::new();
         fwd.set_drafting_block(true)
@@ -847,7 +897,9 @@ async fn main(input: Input) -> Result<Output> {
         let w_off = Channel::from_iter((held..held + verify).map(|p| p % page_size)).named("w_off_v");
         let kv_len = Channel::from([held + verify]).named("kv_len_v");
         let readout = Channel::from_iter(0..verify).named("readout_v");
-        let truth = Channel::new([verify], dtype::i32).named("truth_v");
+        let truth = Channel::new([verify], dtype::i32)
+            .capacity(ring())
+            .named("truth_v");
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;
