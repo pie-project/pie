@@ -665,7 +665,15 @@ impl ProcessCtx {
                         .as_ref()
                         .map(|(name, dir)| (name.as_str(), *dir));
                     if let Err(e) = c.validate_attachment(&decls[i], extern_binding) {
-                        return Ok(Err(format!("pipeline: channel {i}: {e}")));
+                        // The handle-list index alone cannot be chased: it says
+                        // WHERE in this pass the channel sits, never WHICH
+                        // channel it is. `global_id` is the object's identity,
+                        // so two passes naming the same id is visible from the
+                        // message instead of needing a debugger.
+                        return Ok(Err(format!(
+                            "pipeline: channel {i} (id {}): {e}",
+                            c.global_id
+                        )));
                     }
                     // Pre-bind staged puts must fit the declared role: a
                     // Writer drains them per fire, a seeded non-Writer holds
