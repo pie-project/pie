@@ -592,8 +592,14 @@ impl Session {
                 self.send_response(corr_id, true, "Process attached".to_string())
                     .await;
             }
-            Err(_) => {
-                self.send_response(corr_id, false, "Process not found".to_string())
+            // Say which refusal this was. Collapsing every failure into
+            // "Process not found" made the common one unreadable: a process
+            // launched with `capture_outputs` already holds its launching
+            // client, so `AttachClient` answers "already attached" — and a
+            // caller told the process does not exist has no way to learn that
+            // it does, and that it is simply spoken for.
+            Err(why) => {
+                self.send_response(corr_id, false, format!("Cannot attach: {why}"))
                     .await;
             }
         }
