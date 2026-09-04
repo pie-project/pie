@@ -174,35 +174,35 @@
 //! loops hoist their channels out of the round and this one builds them
 //! fresh, and the ticket check is not what is binding.
 //!
-//! # WHAT A DEVICE-RESIDENT ROUND WOULD NEED, AND IT IS ONE VERB
+//! # WHAT A DEVICE-RESIDENT ROUND WOULD NEED, AND IT IS ALREADY THERE
 //!
-//! `mtp-speculative-bench` is not host-in-the-loop and shows the whole
-//! pattern: its epilogue computes the accepted prefix as tensor ops
-//! (`reduce_sum(cumprod(eq(proposed, said)))`), builds the committed tokens
-//! and the NEXT window's positions, `kv_len`, `w_slot`, `w_off` and pages
-//! with `select`/`gather`, puts them into the channels the next fire reads,
-//! and `run_ahead` then keeps the runtime's window full while the host only
-//! drains text. Two fires a round is no obstacle either: `submit_frame`
-//! takes a slot per wave, so a `[draft, verify]` frame is expressible.
+//! `rs-mtp-speculative-bench` is the proof: a speculative loop on a model
+//! with a recurrence, device-resident, and it **never calls
+//! `discard_buffered` at all**. It allocates `2 * run_pages` once — "two runs
+//! of one window each: the runtime alternates them per fire" — binds
+//! `buffer: 0..run_pages`, and writes its fold length from the fire's OWN
+//! epilogue (`fold_len.put(&(&m + &one))`, where `m` is the accepted prefix
+//! computed as `reduce_sum(cumprod(eq(proposed, said)))`). The rejected rows
+//! are overwritten by the next round rather than forgotten by a host call,
+//! and the runtime carries the device length through
+//! `RS_FLAG_FOLD_LEN_DEVICE` (`store/rs/write.rs::mark_fold_len_device`).
 //!
-//! What this loop cannot express is the OTHER half of fold-commit. The fold
-//! side is already device-driven — `RsGeometry::fold_len` takes a CHANNEL,
-//! so the accepted prefix can be written by a tensor op and never reach the
-//! host. The discard side is not: `discard-buffered: func(count: u32)`
-//! (`crates/inferlet/wit/working-set.wit`) takes a host word, and the count
-//! is `verify - 1 - kept`, which is only known after the compare. The
-//! rejected rows are the buffer's TAIL and the next fold reaches exactly the
-//! accepted prefix, so nothing else about the protocol needs to change.
+//! So the rest of that round is expressible too: the committed tokens and
+//! the next window's `positions`, `kv_len`, `w_slot`, `w_off` and pages come
+//! out of `select`/`gather` into the channels the next fire reads, and
+//! `run_ahead` keeps the runtime's window full while the host drains text.
 //!
-//! **So the ask is one verb taking a channel where its twin already does**,
-//! and it does not move a decision from the guest to the engine — the guest
-//! still says how many rows it is forgetting, in a tensor rather than in a
-//! host word. Until then a block-speculative round is host-in-the-loop by
-//! construction, and this file's eight-concurrent row is what that costs.
+//! **What is left is this file's shape, not the engine's contract.** Two
+//! things: a round here is TWO fires (a masked draft over the drafter, then
+//! the trunk's verify) where the mtp loop fuses its head into one, and
+//! `run_ahead` submits ONE repeated pass — `submit_frame` takes a slot per
+//! wave, so a `[draft, verify]` frame is expressible, but driving it needs a
+//! pipelined submit loop of this file's own rather than `run_ahead`. And the
+//! draft's proposals have to reach the verify's `embed` through a channel
+//! instead of through the host. Both are guest work in this file.
 //!
-//! So: **speculation is a single-stream lever on this box.** At one stream
-//! it is worth 1.32x-1.88x; at eight concurrent plain decode wins, and the
-//! serving path should pick per shape.
+//! Until that rewrite the loop is host-in-the-loop and the eight-concurrent
+//! row above is what it costs.
 //!
 //! # The gate, and what it costs to never lose
 //!
