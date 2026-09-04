@@ -71,10 +71,6 @@ impl Guard {
         bits
     }
 
-    /// Collapse a tautology to `Always` by exhausting assignments over the
-    /// referenced bits — merges of complementary branches produce these, and
-    /// `Always` is what downstream passes test for.
-    #[must_use]
     /// Whether two guards admit exactly the same lanes — a truth table over
     /// every fact either of them names, not an algebraic argument.
     #[must_use]
@@ -138,6 +134,10 @@ impl Guard {
             .fold(Guard::Always, |a, b| Guard::and(a, b))
     }
 
+    /// Collapse a tautology to `Always` by exhausting assignments over the
+    /// referenced bits — merges of complementary branches produce these, and
+    /// `Always` is what downstream passes test for.
+    #[must_use]
     pub fn simplified(self) -> Guard {
         let bits = self.referenced_bits();
         if bits.is_empty() {
