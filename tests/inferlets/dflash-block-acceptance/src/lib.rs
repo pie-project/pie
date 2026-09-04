@@ -22,36 +22,51 @@
 //!
 //! # Which head, of the three that ship
 //!
-//! `scratchpad/dflash_ref/compare_heads.py` runs each published head against
-//! ITS OWN target, twelve anchors a prompt, and reports the accepted prefix
-//! with the round's index beside it — tokens a round over fires a round, at
-//! this box's width prices (a verify fire is 1.83 one-row fires at eight rows
-//! and 2.82 at sixteen; the draft fire adds 0.27 at sixteen):
+//! `scratchpad/dflash_ref/heads.py` runs all three through ONE runtime
+//! (`mlx_dspark`, which carries both DFlash architectures and DSpark's),
+//! each against ITS OWN target, and keeps EVERY round's accepted prefix
+//! rather than its mean. The index beside each cell is tokens a round over
+//! fires a round at the width that prices it best, against this box's fire
+//! staircase (`a_fire_is_priced_by_its_width`, one row = 66.54 ms: 1.04 /
+//! 1.16 / 1.43 / 1.77 / 1.83 / 2.78 at 2 / 3 / 4 / 6 / 8 / 16 rows, plus
+//! 0.27 for the draft fire — the same constant for every head). 192 tokens
+//! a prompt, greedy, chat template:
 //!
 //! ```text
-//!                     counting      code        recall      prose       json
-//! DFlash   b=16   13.58(4.72)  8.00(2.91)  1.25(0.73)  9.92(3.53)  3.83(1.56)
-//! DFlash2  b= 8    7.00(4.07)  6.92(4.03)  4.00(2.54)  0.83(0.93)  3.42(2.25)
+//!          block   counting        code        recall       prose        json     mean
+//! DFlash     16  4.24 w8 2.21  6.66 w8 2.82  2.95 w3 1.97  3.34 w4 1.96  6.09 w8 2.70  2.33
+//! DFlash2     8  6.62 w8 3.32  5.08 w8 2.72  3.78 w8 2.22  2.85 w3 1.90  5.19 w8 2.75  2.58
+//! DSpark     16  8.29 w16 2.94 5.18 w8 2.44  2.98 w3 1.88  2.37 w3 1.86  5.05 w8 2.36  2.29
 //! ```
 //!
-//! It is a TIE on the mean index (2.69 against 2.76) with opposite profiles:
-//! the shorter block saturates where prefixes are short and cannot pay where
-//! they are long — prose at 0.93 is a round that loses to plain decode. So
-//! DFlash2's grouped dynamic convolutions and its candidate selector are not
-//! bought by these numbers, and the head already ported stays.
+//! **THE EARLIER TABLE HERE PINNED THE WIDTH, AND THAT DECIDED IT.** It read
+//! DFlash 2.69 against DFlash2 2.76 — a tie — by pricing DFlash at sixteen
+//! rows and DFlash2 at its native eight, which hands one head the cheaper
+//! rung; and it reported DFlash2's prose as 0.93, "a round that loses to
+//! plain decode". Neither survives. `E[min(kept + 1, w)]` is not a function
+//! of `E[kept]`, so a mean cannot be re-priced at another width — the
+//! distribution has to be kept, and once it is, **no head loses on any
+//! workload**: the smallest cell above is 1.86.
 //!
-//! **A HEAD IS TIED TO THE TARGET IT WAS TRAINED ON**, which is the control
-//! that makes the table above readable: the same DFlash head against the 3.8
-//! checkpoint instead of its own 3.6 reads 3.92 / 5.33 / 2.08 / 0.67 / 1.75 —
-//! counting falls from 13.58 and prose from 9.92. Two checkpoints that a
-//! catalog row cannot tell apart are not interchangeable to a drafter.
+//! **DFlash2 leads, by 11% on the mean**, and DSpark is NOT the outlier the
+//! old note made it (it read "an index of about 1.4" from published means at
+//! width-sixteen prices; measured here it is 2.29, within 2% of DFlash).
+//! What the old note got right is the shape: DFlash2's shorter block is
+//! stronger where prefixes are short (counting 3.32, recall 2.22) and DFlash
+//! is stronger on code (2.82).
 //!
-//! Dspark (`DimInfer/Qwen3.8-27B-Dspark-v1`, block 15, a markov confidence
-//! head) ships no modeling code, only weights and GGUFs, and publishes
-//! 1.69x-2.51x on a 4090D at a mean accepted length of 2.7-4.1. That length
-//! against THIS box's width curve is an index of about 1.4, under both heads
-//! above: its speedup is a property of a GPU where sixteen rows cost two
-//! one-row fires rather than 2.82.
+//! **But the width matters more than the head.** DFlash pinned at sixteen
+//! means 1.84 and at its per-prompt best 2.33 — 27% — where the whole spread
+//! between the three heads is 2.29 to 2.58, 12%. Pinned means for the record:
+//! DFlash w4 2.06 / w8 2.29 / w16 1.84, DFlash2 w4 2.10 / w8 2.56, DSpark
+//! w4 1.99 / w8 2.19.
+//!
+//! **The confound that cannot be removed**: DFlash runs on Qwen3.6-27B and
+//! the other two on Qwen3.8-27B, because that is what each was trained
+//! against — and a head off its own target is not a control but a different
+//! measurement (the old note measured that too: DFlash on the 3.8 checkpoint
+//! loses half its counting prefix). So the 11% is a head-and-target
+//! difference, and porting DFlash2 would also mean porting to a new target.
 //!
 //! This measures; it does not go fast. Each round pays one draft pass and
 //! `block` ordinary decodes, and the host is in the loop between them — the
