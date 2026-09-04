@@ -92,6 +92,30 @@
 //! about 2.8 tokens, so twelve of those rows are bought and thrown away
 //! every round.
 //!
+//! # The waste is paid TWICE, and the draft fire pays it too
+//!
+//! A block drafter has no head of its own — its rows go through the TARGET's
+//! `lm_head`, the widest matrix in the model — so a draft fire that reads out
+//! all sixteen rows to then verify four buys twelve rows of that head and
+//! throws them away, exactly as the verify side did. The width is known
+//! BEFORE the draft whenever it comes from the ladder or from `verify_rows`
+//! (only `margin_width` picks it after, off margins the readout would not
+//! then contain), so the readout narrows with it. Measured, same shape:
+//!
+//! ```text
+//!              readout 16   readout = width
+//! prose          1.29x          1.38x
+//! code           1.80x          1.82x
+//! capitals       1.16x          1.32x
+//! counting       1.89x          1.88x
+//! ```
+//!
+//! **The gain tracks how narrow the width got** — prose and the list run at
+//! four rows and gain 7% and 14%, counting runs at sixteen and gains nothing,
+//! which is the same arithmetic read from the other end. It also closes most
+//! of the ladder's gap against a pinned width: prose reads 1.38x where a
+//! pinned four read 1.41x.
+//!
 //! # The gate, and what it costs to never lose
 //!
 //! `min_tokens_per_round` (see `Gate`) is the guest reading its OWN yield
@@ -721,15 +745,23 @@ async fn main(input: Input) -> Result<Output> {
             .flat_map(|_| (0..pool).map(move |j| j < held + block))
             .collect();
         let mask = Channel::from_shaped([block, pool], visible).named("mask_d");
-        // **EVERY BLOCK ROW READS OUT**, and the proposals are the fire's own
-        // logits: a block drafter's rows go through the TARGET's one
-        // `lm_head`, so there is no separate draft plane to read.
-        let readout = Channel::from_iter(0..block).named("readout_d");
-        let out = Channel::new([block * 2], dtype::i32).named("drafts_d");
+        // **ONLY THE ROWS THE VERIFY WILL READ.** A block drafter's rows go
+        // through the TARGET's one `lm_head`, so there is no separate draft
+        // plane — and that head is the widest matrix in the model. Reading
+        // all sixteen rows of it to then verify four is the same waste the
+        // width staircase found on the verify side, paid a second time.
+        //
+        // The width is known BEFORE this fire whenever it comes from the
+        // ladder or from `verify_rows`; only `margin_width` picks it after,
+        // off margins this readout would otherwise not contain, so that one
+        // still reads the block.
+        let shown = if input.margin_width { block } else { verify };
+        let readout = Channel::from_iter(0..shown).named("readout_d");
+        let out = Channel::new([shown * 2], dtype::i32).named("drafts_d");
         // **THE DRAFTER'S OWN CONFIDENCE, OFF THE SAME LOGITS.** One more
         // reduction over a plane the fire already computed, read back beside
         // the proposals in the same round trip.
-        let conf = Channel::new([block * 2], dtype::f32).named("conf_d");
+        let conf = Channel::new([shown * 2], dtype::f32).named("conf_d");
 
         let fwd = ForwardPass::new();
         fwd.set_drafting_block(true)
@@ -774,8 +806,8 @@ async fn main(input: Input) -> Result<Output> {
                 // beside the indices, so the proposal and the margin that
                 // says how sure of it the drafter is come out together.
                 let (value, index) = top_k(intrinsics::logits(), 2);
-                out.put(&reshape(cast(index, dtype::i32), [block * 2]));
-                conf.put(&reshape(value, [block * 2]));
+                out.put(&reshape(cast(index, dtype::i32), [shown * 2]));
+                conf.put(&reshape(value, [shown * 2]));
             });
         }
         fwd.submit(&pipe).context("draft submit")?;
@@ -786,8 +818,8 @@ async fn main(input: Input) -> Result<Output> {
         let top = out.take_host::<Vec<i32>>().await.context("draft readback")?;
         let value = conf.take_host::<Vec<f32>>().await.context("margin readback")?;
         // Row `r` occupies `[2r, 2r + 1]`: the proposal and its runner-up.
-        proposals_owned = (1..block as usize).map(|r| top[2 * r]).collect();
-        let margin: Vec<f32> = (1..block as usize)
+        proposals_owned = (1..shown as usize).map(|r| top[2 * r]).collect();
+        let margin: Vec<f32> = (1..shown as usize)
             .map(|r| value[2 * r] - value[2 * r + 1])
             .collect();
         if pinned.is_none() && input.margin_width {
