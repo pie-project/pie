@@ -98,6 +98,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dflash-block-acceptance"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "dry-repetition-penalty"
 version = "0.1.0"
 dependencies = [
