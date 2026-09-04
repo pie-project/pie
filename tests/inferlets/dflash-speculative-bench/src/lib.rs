@@ -63,6 +63,48 @@
 //! 13.44/22.39 (1.67x) and 13.41/17.62 (1.31x): the ratio is set by content,
 //! not by how long the answer runs.
 //!
+//! # The gate, and what it costs to never lose
+//!
+//! `min_tokens_per_round` (see `Gate`) is the guest reading its OWN yield
+//! and declining to draft when it is under water. A gated round is the same
+//! verify fire at ONE row, so it carries the pending fold and buffers its
+//! own row exactly as a wide one does — nothing about the fold-commit
+//! contract changes. Proven rather than argued: with the floor set high
+//! enough that the gate never opens, 128 tokens of the code prompt come back
+//! TOKEN FOR TOKEN identical to `--baseline`.
+//!
+//! Swept on this box, same four-request 256-token shape, `tok/s` against a
+//! `--baseline` arm of 14.52 (prose) / 14.58 (code) / 14.65 (capitals):
+//!
+//! ```text
+//! floor      capitals        code          prose
+//! off      12.96  0.88x   23.95  1.64x   15.39  1.06x
+//! 2.5      14.79  1.01x   22.57  1.55x
+//! 3.0      15.05  1.03x   21.32  1.46x
+//! 3.5      14.28  0.97x   20.91  1.43x   15.83  1.09x
+//! 2.5, WINDOW 8
+//!          14.74  1.01x   22.91  1.57x   15.71  1.08x
+//! ```
+//!
+//! **The last row is the setting this file ships**, and the trade it makes
+//! is stated plainly: the loss row goes to parity and prose gains a little,
+//! and the workload where drafting wins most pays 4% for it (1.64x -> 1.57x).
+//! A floor ABOVE break-even is worse on both ends — 3.5 closes on code often
+//! enough to cost 13% and still lands capitals under 1.0x, because a window
+//! that dips is not a workload that changed. Left at zero the gate never
+//! closes, which is the loop every number above this section was taken with.
+//!
+//! # One thing the loop does NOT promise
+//!
+//! Token identity with one-token-a-fire decode holds until the first
+//! near-tie, not forever. A sixteen-row verify fire folds its dot products
+//! in a different order than the one-row point, and on a list of European
+//! capitals at 256 tokens the two roads pick different capitals at index 154
+//! — the same bf16 accumulation-order floor this repo already records for
+//! whole-prefill against one-token-at-a-time. Short runs (64 and 128 tokens,
+//! code and prose) do come back identical, and that is what the gate above
+//! was verified against.
+//!
 //! # The verify width is worth choosing, and nothing chose it well
 //!
 //! The drafter proposes fifteen whatever the target reads — a block diffusion
@@ -192,6 +234,11 @@ struct Input {
     /// because on three workloads it is a WASH.
     #[serde(default)]
     margin_width: bool,
+    /// **STOP DRAFTING BELOW THIS MANY TOKENS A ROUND.** Zero (the default)
+    /// never stops, which is the loop every number in the header was taken
+    /// with. Around 3.0 is break-even on this box; see `Gate`.
+    #[serde(default)]
+    min_tokens_per_round: f64,
 }
 
 fn default_prompt() -> String {
@@ -238,6 +285,73 @@ struct Output {
     discarded: usize,
     /// The recurrent buffer's page width, for reading the grant arithmetic.
     rs_page: u32,
+    /// Fires the gate spent on one token because a draft was not worth it.
+    /// Zero unless `min_tokens_per_round` was stated.
+    plain_fires: usize,
+}
+
+/// **IS A DRAFT WORTH ITS FIRE AT ALL? THE LOOP'S OWN YIELD SAYS.**
+///
+/// A round costs about three one-row decodes on this box — a sixteen-row
+/// verify fire is 2.79 of them and the five-layer draft fire, which still
+/// goes through the target's `lm_head`, is the rest — so a workload that
+/// yields fewer than about three tokens a round is SLOWER than decoding one
+/// token a fire. Measured through `benches/pie_bench.py`, a list of European
+/// capitals yields 2.88 and runs at 0.88x; prose yields 3.21 and is a wash.
+///
+/// This reads the loop's own recent yield and stops drafting when it falls
+/// under a floor the CALLER states, then probes again after a run of plain
+/// fires. **The floor is the guest's number, not the engine's** — the engine
+/// dispatches the fires it is given and has no opinion about which rounds
+/// were worth one. Left at zero, the gate never closes and the loop is the
+/// one every measurement above was taken with.
+struct Gate {
+    /// Tokens a round below which drafting stops. Zero never closes.
+    floor: f64,
+    /// What the last rounds that DID draft emitted, newest last.
+    recent: Vec<u32>,
+    /// Plain fires since the gate closed, counted towards the next probe.
+    since: u32,
+}
+
+impl Gate {
+    /// Rounds averaged before the gate will act. Fewer reads noise as a
+    /// verdict; more spends the fires it is trying to save.
+    const WINDOW: usize = 8;
+    /// Plain fires between probes. One probe costs a round; at sixteen the
+    /// probe is under 7% of the fires it is deciding about.
+    const PROBE: u32 = 16;
+
+    fn new(floor: f64) -> Self {
+        Gate { floor, recent: Vec::new(), since: 0 }
+    }
+
+    /// Whether this round drafts. A probe is allowed through so a workload
+    /// that turns list-shaped into code-shaped is noticed.
+    fn drafts(&mut self) -> bool {
+        if self.floor <= 0.0 || self.recent.len() < Self::WINDOW {
+            return true;
+        }
+        let mean = self.recent.iter().map(|t| f64::from(*t)).sum::<f64>()
+            / self.recent.len() as f64;
+        if mean >= self.floor {
+            return true;
+        }
+        if self.since >= Self::PROBE {
+            self.since = 0;
+            return true;
+        }
+        self.since += 1;
+        false
+    }
+
+    /// What a drafting round emitted, the anchor's token included.
+    fn yielded(&mut self, tokens: u32) {
+        self.recent.push(tokens);
+        if self.recent.len() > Self::WINDOW {
+            self.recent.remove(0);
+        }
+    }
 }
 
 /// **IS THIS ROUND WORTH A WIDE VERIFY? THE DRAFTER ALREADY SAID.**
@@ -403,6 +517,8 @@ async fn main(input: Input) -> Result<Output> {
     // round replays nothing.
     let mut survivors: u32 = 0;
     let mut widths: Vec<u32> = Vec::new();
+    let mut gate = Gate::new(input.min_tokens_per_round);
+    let mut plain_fires: usize = 0;
 
     // A round commits several tokens at once, so the stop is read off the
     // committed run after the fact rather than one token at a time.
@@ -467,6 +583,17 @@ async fn main(input: Input) -> Result<Output> {
         let fold_none = Channel::from([0u32]).named("fold_none");
         let fold_len = Channel::from([survivors]).named("fold_len_v");
 
+        // ── the gate: a round the loop is losing on drafts nothing ──────
+        //    A gated round is the SAME verify fire at one row, so it carries
+        //    the pending fold and buffers its own row exactly as a wide one
+        //    does. Nothing about the fold-commit contract changes; only the
+        //    width, and whether a draft fire ran before it.
+        let drafting = gate.drafts();
+        let mut proposals_owned: Vec<i32> = Vec::new();
+        if !drafting {
+            verify = 1;
+            plain_fires += 1;
+        } else {
         // ── the draft: ONE pass over `[anchor, MASK x block-1]` ──────────
         let mut ids = vec![MASK_TOKEN; block as usize];
         ids[0] = anchor;
@@ -551,20 +678,21 @@ async fn main(input: Input) -> Result<Output> {
         let top = out.take_host::<Vec<i32>>().await.context("draft readback")?;
         let value = conf.take_host::<Vec<f32>>().await.context("margin readback")?;
         // Row `r` occupies `[2r, 2r + 1]`: the proposal and its runner-up.
-        let proposals: Vec<i32> = (1..block as usize).map(|r| top[2 * r]).collect();
+        proposals_owned = (1..block as usize).map(|r| top[2 * r]).collect();
         let margin: Vec<f32> = (1..block as usize)
             .map(|r| value[2 * r] - value[2 * r + 1])
             .collect();
-        let proposals = proposals.as_slice();
         if pinned.is_none() && input.margin_width {
             verify = if wide_enough(&margin) { block } else { NARROW };
         }
-        widths.push(verify);
         // The buffer is back to the accepted prefix the verify is about to
         // fold — see the draft fire's geometry.
         rs_set[0]
             .discard_buffered(block)
             .map_err(|why| format!("forget the draft fire's {block} row(s): {why}"))?;
+        }
+        let proposals = proposals_owned.as_slice();
+        widths.push(verify);
 
         // ── the verify: ONE trunk fire over `[anchor, proposals]` ────────
         let mut fed = vec![anchor];
@@ -624,9 +752,12 @@ async fn main(input: Input) -> Result<Output> {
             .zip(&truth)
             .take_while(|(p, t)| p == t)
             .count();
-        rounds += 1;
-        drafted += verify as usize - 1;
-        accepted += kept;
+        if drafting {
+            rounds += 1;
+            drafted += verify as usize - 1;
+            accepted += kept;
+            gate.yielded(kept as u32 + 1);
+        }
         replayed += survivors as usize;
         // The rejected tail never happened: forget it before the next fire,
         // whose fold reaches exactly the accepted prefix.
@@ -682,5 +813,6 @@ async fn main(input: Input) -> Result<Output> {
         replayed,
         discarded,
         rs_page,
+        plain_fires,
     })
 }
