@@ -48,6 +48,18 @@ struct Input {
     /// says a mask is read per key rather than all-or-nothing.
     #[serde(default = "no_hide")]
     hide_from: i32,
+    /// Diagnostic: hide every key for block ROWS from this index on. `-1`
+    /// hides nothing. `hide_from` varies the mask by KEY and is uniform
+    /// across rows; this varies it by ROW, which is what a causal triangle
+    /// needs and what a shader reading one mask row for every query would
+    /// lose.
+    #[serde(default = "no_hide")]
+    hide_rows_from: i32,
+    /// Diagnostic: hide every key BELOW this index — the context, leaving
+    /// the block's own rows. If the drafts barely move, the block's kv is
+    /// not what the rows are reading.
+    #[serde(default = "no_hide")]
+    hide_before: i32,
 }
 
 fn no_hide() -> i32 {
@@ -195,6 +207,8 @@ async fn main(input: Input) -> Result<Output> {
         let kv_len = Channel::from([held + block]).named("kv_len_d");
         let causal = input.causal_block;
         let hide_from = input.hide_from;
+        let hide_rows_from = input.hide_rows_from;
+        let hide_before = input.hide_before;
         let visible: Vec<bool> = (0..block)
             .flat_map(|i| {
                 (0..pool).map(move |j| {
@@ -204,6 +218,8 @@ async fn main(input: Input) -> Result<Output> {
                     j < held + block
                         && (!causal || j <= held + i)
                         && (hide_from < 0 || (j as i32) < hide_from)
+                        && (hide_rows_from < 0 || (i as i32) < hide_rows_from)
+                        && (hide_before < 0 || (j as i32) >= hide_before)
                 })
             })
             .collect();
