@@ -30,6 +30,39 @@
 //! code      "write a function" 6.14 tok/round    28.4 tok/s   vs 15.1   1.9x
 //! ```
 //!
+//! # THOSE ARE RAW CONTINUATIONS, AND THEY ARE NOT SERVING NUMBERS
+//!
+//! The two lines above were measured before this file took
+//! `text-completion-bench`'s envelope: no chat template, no system prompt,
+//! the prompt handed to the model as raw text to continue. A served request
+//! is templated, and the model then answers a QUESTION rather than
+//! continuing a pattern — which is a different distribution and the drafter
+//! feels it. Through `benches/pie_bench.py latency` (4 requests x 256
+//! tokens, `--ignore-eos`, the same knobs the three-way uses), one arm
+//! against the other on this box:
+//!
+//! ```text
+//!                                      base    spec    ratio   tok/round
+//! "Write a short story about a robot"  14.52   15.39   1.06x     3.21
+//! "Write a Python function that ..."   14.58   23.95   1.64x     5.80
+//! "Count from 1 to 200, ..."           14.32   21.10   1.47x     7.08
+//! "List the capitals of every ..."     14.65   12.96   0.88x     2.88
+//! ```
+//!
+//! **THE LAST ROW IS A LOSS, AND IT IS THE POINT.** A round costs roughly
+//! three one-row decodes — a sixteen-row verify fire is 2.79 of them on this
+//! box, and the five-layer draft fire through the target's `lm_head` is the
+//! rest — so the loop pays only above about THREE TOKENS A ROUND. Prose sits
+//! at 3.21 and is a wash; a list of capitals sits at 2.88 and is worse than
+//! decoding one token a fire. The block width does not fix this (see the
+//! staircase below): the fix is a drafter that accepts more, or a guest that
+//! notices its own tokens-a-round and stops speculating. **The engine must
+//! not make that call** — which rounds are worth a fire is the inferlet's.
+//!
+//! At 64 tokens a request the same pairs read 13.53/15.15 (1.12x),
+//! 13.44/22.39 (1.67x) and 13.41/17.62 (1.31x): the ratio is set by content,
+//! not by how long the answer runs.
+//!
 //! # The verify width is worth choosing, and nothing chose it well
 //!
 //! The drafter proposes fifteen whatever the target reads — a block diffusion
@@ -117,12 +150,25 @@
 //! every trunk fire), so one length rolls both streams back.
 
 use inferlet::eta::hybrid::prelude::*;
+use inferlet::{chat, session};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 struct Input {
     #[serde(default = "default_prompt")]
     prompt: String,
+    /// Pre-tokenized prompt (the harness's, template already applied); wins
+    /// over `prompt` when given.
+    #[serde(default)]
+    prompt_tokens: Option<Vec<u32>>,
+    #[serde(default = "default_system")]
+    system: String,
+    /// Drop the template's stop tokens so the loop runs to `max_tokens`.
+    #[serde(default)]
+    ignore_eos: bool,
+    /// Announce `ready` and wait for the harness's `start` before the clock.
+    #[serde(default)]
+    wait_for_start: bool,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
     /// Decode one token a fire instead — the same sequence by a different
@@ -154,6 +200,10 @@ fn default_prompt() -> String {
 
 fn default_max_tokens() -> usize {
     64
+}
+
+fn default_system() -> String {
+    "You are a helpful benchmarking assistant.".into()
 }
 
 #[derive(Serialize)]
@@ -260,9 +310,24 @@ async fn main(input: Input) -> Result<Output> {
     let pinned = (input.verify_rows != 0).then(|| input.verify_rows.clamp(2, block));
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
-    let mut prompt = model::encode(&input.prompt);
+    // The harness's tokens when it sent them; else the chat template the
+    // plain bench applies (system + user + the assistant cue). Both benches
+    // must see the same prompt or the ratio is against a different prefill.
+    let mut prompt: Vec<u32> = match &input.prompt_tokens {
+        Some(tokens) => tokens.clone(),
+        None => {
+            let mut p = chat::system_user(&input.system, &input.prompt);
+            p.extend(chat::cue());
+            p
+        }
+    };
     if prompt.is_empty() {
         prompt.push(0);
+    }
+    let stop_tokens: Vec<u32> = if input.ignore_eos { Vec::new() } else { chat::stop_tokens() };
+    if input.wait_for_start {
+        session::send("ready");
+        let _ = session::receive().await;
     }
     let n = prompt.len() as u32;
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
@@ -339,7 +404,11 @@ async fn main(input: Input) -> Result<Output> {
     let mut survivors: u32 = 0;
     let mut widths: Vec<u32> = Vec::new();
 
-    while generated.len() < input.max_tokens {
+    // A round commits several tokens at once, so the stop is read off the
+    // committed run after the fact rather than one token at a time.
+    while generated.len() < input.max_tokens
+        && !generated.iter().any(|t| stop_tokens.contains(t))
+    {
         if input.baseline {
             // One token a fire, the road the speedup is measured against.
             let toks = Channel::from([anchor]).named("toks_b");
@@ -580,6 +649,11 @@ async fn main(input: Input) -> Result<Output> {
         held += kept as u32 + 1;
     }
 
+    // A stop token ends the text; anything the last block committed past it
+    // is not the answer.
+    if let Some(at) = generated.iter().position(|t| stop_tokens.contains(t)) {
+        generated.truncate(at + 1);
+    }
     generated.truncate(input.max_tokens);
     let count = generated.len();
     Ok(Output {
