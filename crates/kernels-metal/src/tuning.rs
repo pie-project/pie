@@ -165,6 +165,28 @@ pub struct DeviceTuning {
     /// Also a numerics knob: folding reassociates the dot product, changing
     /// which 32 partial sums land where. See
     /// [`qmv_rows_packs`](DeviceTuning::qmv_rows_packs).
+    ///
+    /// # Reproducibility
+    ///
+    /// `qmv_rows_packs = 2` alone is NOT enough to make a served answer
+    /// reproducible, because it only settles the vector arm:
+    /// [`qmm_min_batch`](Self::qmm_min_batch) still crosses to the tile GEMM
+    /// once a fire carries that many rows, and a fire's row count is how many
+    /// requests were batched together — which arrival timing decides, not the
+    /// caller. Measured on an M1 Max, one greedy prompt returned four different
+    /// completions across twelve runs at stock tuning, and one completion —
+    /// identical to the single-request answer — under either of
+    ///
+    /// ```toml
+    /// [engine.tuning]
+    /// qmm_min_batch = 1000000   # never leave the vector arm
+    /// qmv_rows_packs = 2        # the fold's arithmetic is the one-row point's
+    /// ```
+    ///
+    /// or the blunter `qmm_min_batch` + `qmv_rows_max = 1`. Both cost the tile
+    /// GEMM: ~34% of decode throughput at 8 concurrent and ~45% at 32 and
+    /// above. `qmv_rows_packs = 2` on its own is close to free at width
+    /// (+1% at 8 concurrent, -5% at 32) but leaves the crossover in place.
     pub qmv_rows_max: u32,
 
     /// Weight packs one thread of the multi-row vector point reads per k
