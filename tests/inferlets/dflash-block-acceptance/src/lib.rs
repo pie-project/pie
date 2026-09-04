@@ -37,6 +37,12 @@ struct Input {
     prompt: String,
     #[serde(default = "default_rounds")]
     rounds: usize,
+    /// Diagnostic: state a CAUSAL block mask instead of the all-visible one
+    /// the drafter's full-attention layer wants. If the proposals do not
+    /// move, the stated mask is not loosening anything and the block is
+    /// causal at every layer whatever this says.
+    #[serde(default)]
+    causal_block: bool,
 }
 
 fn default_prompt() -> String {
@@ -178,8 +184,13 @@ async fn main(input: Input) -> Result<Output> {
         let w_off =
             Channel::from_iter((held..held + block).map(|p| p % page_size)).named("w_off_d");
         let kv_len = Channel::from([held + block]).named("kv_len_d");
+        let causal = input.causal_block;
         let visible: Vec<bool> = (0..block)
-            .flat_map(|_| (0..pool).map(move |j| j < held + block))
+            .flat_map(|i| {
+                (0..pool).map(move |j| {
+                    j < held + block && (!causal || j <= held + i)
+                })
+            })
             .collect();
         let mask = Channel::from_shaped([block, pool], visible).named("mask_d");
         // **EVERY BLOCK ROW READS OUT.** The drafts plane is cut to the rows
