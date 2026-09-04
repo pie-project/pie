@@ -156,6 +156,31 @@ impl ClassTable {
 /// combination: uncaught, these are a garbled token under one batch mix;
 /// caught, they are one line. Re-exported from the crate root as
 /// `ClassFault` (`check::Fault` is already taken next door).
+/// Whether `id` is written at all in the class `word` names.
+///
+/// Only a merge can be absent outright: every other def either runs under
+/// its own guard or is read through an alias, both of which the walk
+/// resolves itself. A merge with no holding arm is the one shape that has
+/// no value here at all.
+fn written_in_class(trace: &Trace, id: ValueId, word: u64) -> bool {
+    let Some(Def::Merge(arms)) = trace.values.get(id.0 as usize).map(|decl| &decl.def) else {
+        // Every other def either runs under its own guard or is read through
+        // an alias, both of which the walk resolves itself.
+        return true;
+    };
+    if arms.iter().any(|(_, cond)| cond.holds(word)) {
+        return true;
+    }
+    // No arm holds — and there are two very different reasons for that. If
+    // the arms SHARE a guard that this class fails, the region they belong
+    // to does not run here at all and the seam has nothing to hand out. If
+    // they share nothing, the gap is their own: that is the fault this check
+    // exists to report, so the value is rooted and the walk finds it.
+    let conds: Vec<Guard> = arms.iter().map(|(_, cond)| cond.clone()).collect();
+    let common = Guard::common(&conds);
+    matches!(common, Guard::Always) || common.holds(word)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
     /// No arm holds for a class that demands the merge — those rows are never
@@ -361,7 +386,19 @@ pub fn resolve_classes(trace: &Trace) -> Result<ClassTable, Vec<Fault>> {
             }
         }
         for seam in &trace.seams {
-            walk.stack.extend(seam.values.iter().copied());
+            // **A SEAM HANDS OUT NOTHING IN A CLASS THAT DOES NOT WRITE IT.**
+            // A plan may guard a whole region away from a class — a block
+            // drafter's rows skip the trunk entirely — and the seams that
+            // region plants (`attn.out` and its siblings) then have no value
+            // to offer. Rooting them anyway demands a merge whose every arm
+            // is guarded off and reports it `Uncovered`, which is a fault
+            // about the walk rather than about the plan.
+            walk.stack.extend(
+                seam.values
+                    .iter()
+                    .copied()
+                    .filter(|id| written_in_class(trace, *id, word)),
+            );
         }
 
         while let Some(id) = walk.stack.pop() {
