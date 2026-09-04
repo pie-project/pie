@@ -37,6 +37,23 @@ inline constexpr int qmm_wm() {
   return BM < 16 ? 1 : 2;
 }
 
+// **`WM = 1` AT `BM = 16` WAS TRIED AND LOSES (M4 Pro, 2026-09-04).** The
+// diagnosis it came from is real — at `WM = 2` each of the two simdgroups
+// reads every B fragment out of threadgroup memory, so one simdgroup halves
+// that traffic — but the measurement refuses it: 512.7 us against 496.6 at
+// sixteen rows, K=5120 N=17408 4-bit. One simdgroup is 64 lanes where two are
+// 128, and the parallelism lost inside the threadgroup costs more than the
+// duplicate fragment reads. Consistent with the `bn_16` result already
+// recorded upstream: this tile is not short of threadgroup memory, so buying
+// residency with lanes is buying what it already has.
+//
+// THE RULE IS STATED TWICE and both copies must move together: this function,
+// and `quant::qmm_group`'s `bm < 2 * FRAG_ROWS` on the host. Changing one
+// alone launches 128 lanes into a kernel that expects 64 — the loaders divide
+// their tile by `tgp_size` and half of it is never written, which
+// `every_row_count_is_timed` catches as a wrong answer (worst relative 1.2991)
+// rather than a slow one.
+
 // The lanes a row block's threadgroup holds. `WN = 2` throughout this file —
 // the one place a column split of four appears is a hand-written
 // instantiation at the bottom — so a block loader that carries no `WN` of its
