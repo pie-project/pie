@@ -92,6 +92,32 @@
 //! about 2.8 tokens, so twelve of those rows are bought and thrown away
 //! every round.
 //!
+//! # What the rungs cost, and the two hypotheses the numbers refused
+//!
+//! `a_quantized_matmul_is_priced_by_its_rows` on this box (K=5120 N=17408,
+//! 4-bit, one projection, us a launch — reproducible to 2% run to run):
+//!
+//! ```text
+//!   rows      1      2      3      4      5      6      8
+//!   us      208    206    227    285    348    349    349
+//!   x1row  1.00   0.99   1.09   1.37   1.67   1.68   1.68
+//!   GB/s    214    217    196    157    128    128    128
+//! ```
+//!
+//! **Two rows are FREE and five through eight cost the same**, which is why
+//! the ladder's rungs are what they are: below five the vector fold answers,
+//! from five the tile does and it is flat to eight, so a width in 5..8 should
+//! always be eight.
+//!
+//! Two things were tried against the four-row step and did not move it.
+//! **Pack width**: `qmv_rows_packs` 1 against 2 reads 285.9 against 293.3 us
+//! at four rows — inside the drift, so the 64 floats a thread holds there are
+//! not costing occupancy the way the shape suggested. **A three-row rung**:
+//! three rows cost 1.09x where four cost 1.37x, so a workload keeping under
+//! three tokens should prefer it — measured on prose, `verify_rows` 2/3/4
+//! reads 1.22x / 1.49x / **1.53x**, and four still wins. The extra token a
+//! round is worth more than the step it climbs. Neither is in the ladder.
+//!
 //! # The waste is paid TWICE, and the draft fire pays it too
 //!
 //! A block drafter has no head of its own — its rows go through the TARGET's
@@ -112,9 +138,18 @@
 //!
 //! **The gain tracks how narrow the width got** — prose and the list run at
 //! four rows and gain 7% and 14%, counting runs at sixteen and gains nothing,
-//! which is the same arithmetic read from the other end. It also closes most
-//! of the ladder's gap against a pinned width: prose reads 1.38x where a
-//! pinned four read 1.41x.
+//! which is the same arithmetic read from the other end.
+//!
+//! # What the ladder still costs against knowing the answer
+//!
+//! Back to back in one session on prose: `auto` 1.40x and 1.47x, a pinned
+//! four 1.57x. The ladder spends 88 of 93 rounds at four — so the ~9% is
+//! the OTHER five: a round at eight or sixteen costs 1.7-2.7x one at four,
+//! and 5% of rounds at 2x is 5% of the run. Tightening the climb would take
+//! it back and lose counting, which is the row where the ladder beats every
+//! fixed width (1.88x against a pinned eight's 1.83x) precisely BECAUSE it
+//! excurses. The trade is stated rather than resolved; `verify_rows` pins a
+//! width for a caller who knows its workload.
 //!
 //! # AT EIGHT CONCURRENT THE LOOP LOSES, AND IT IS NOT THE DRAFTER
 //!
