@@ -653,6 +653,10 @@ pub trait PassWit: Sized + 'static {
     /// The pass's layer truncation.
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String>;
 
+    /// Mark this pass's rows a block drafter's proposal, so the model's
+    /// trunk does not run over them. See the WIT door for what it means.
+    fn set_drafting_block(&self, on: bool) -> Result<(), String>;
+
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String>;
 
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String>;
@@ -672,6 +676,10 @@ impl PassWit for wit_attention::ForwardPass {
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
         wit_attention::ForwardPass::readout(self, indices)
     }
+    fn set_drafting_block(&self, on: bool) -> Result<(), String> {
+        wit_attention::ForwardPass::set_drafting_block(self, on).map_err(|e| e.to_string())
+    }
+
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
         wit_attention::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
     }
@@ -697,6 +705,10 @@ impl PassWit for wit_recurrent::ForwardPass {
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
         wit_recurrent::ForwardPass::readout(self, indices)
     }
+    fn set_drafting_block(&self, on: bool) -> Result<(), String> {
+        wit_recurrent::ForwardPass::set_drafting_block(self, on).map_err(|e| e.to_string())
+    }
+
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
         wit_recurrent::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
     }
@@ -722,6 +734,10 @@ impl PassWit for wit_hybrid::ForwardPass {
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
         wit_hybrid::ForwardPass::readout(self, indices)
     }
+    fn set_drafting_block(&self, on: bool) -> Result<(), String> {
+        wit_hybrid::ForwardPass::set_drafting_block(self, on).map_err(|e| e.to_string())
+    }
+
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
         wit_hybrid::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
     }

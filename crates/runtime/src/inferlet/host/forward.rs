@@ -494,6 +494,19 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
+    async fn core_set_drafting_block(
+        &mut self,
+        this: Resource<ForwardPass>,
+        on: bool,
+    ) -> Anyhow<Result<(), String>> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        pass.bindings.block_draft = on;
+        Ok(Ok(()))
+    }
+
     /// Spans are cloned by handle (`Arc`), so a decoded image submitted to two
     /// passes decodes once. Their position in the sequence is not recorded
     /// here — it's scanned out of the submitted tokens at submit time
@@ -547,6 +560,7 @@ impl ProcessCtx {
             rs_fold_len,
             rs_fold_len_rep,
             pass_max_layers,
+            pass_block_draft,
         ) = {
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
@@ -575,6 +589,7 @@ impl ProcessCtx {
                 pass.bindings.rs_fold_len.clone(),
                 pass.bindings.rs_geom.map(|geom| geom.fold_len),
                 pass.bindings.max_layers,
+                pass.bindings.block_draft,
             )
         };
         let kv_working_set: Resource<KvWorkingSet> = Resource::new_borrow(attention.kv_ws);
@@ -1031,6 +1046,7 @@ impl ProcessCtx {
                 kv_ws: ws_rep,
                 kv_declaration: crate::pipeline::instance::KvDeclaration { readable, writable },
                 max_layers: pass_max_layers,
+                block_draft: pass_block_draft,
                 rs_ws: rs_reps,
                 rs_fold_len,
                 kv_declaration_realized: false,
@@ -1256,6 +1272,14 @@ macro_rules! forward_pass_common {
             max_layers: u32,
         ) -> Anyhow<Result<(), String>> {
             self.core_set_max_layers(this, max_layers).await
+        }
+
+        async fn set_drafting_block(
+            &mut self,
+            this: Resource<ForwardPass>,
+            on: bool,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_set_drafting_block(this, on).await
         }
 
         async fn program(
