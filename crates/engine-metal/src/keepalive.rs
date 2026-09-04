@@ -76,22 +76,43 @@ impl KeepAlive {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                         continue;
                     }
-                    let Some(buffer) = carry.queue.commandBuffer() else { break };
-                    let Some(encoder) = buffer.computeCommandEncoder() else { break };
-                    encoder.setComputePipelineState(&carry.pipeline);
-                    // SAFETY: the sink buffer outlives the command buffer (it is
-                    // owned by this thread's `carry`), and `iters` is copied out
-                    // by `setBytes:` before the call returns.
-                    unsafe {
-                        encoder.setBuffer_offset_atIndex(Some(&**carry.sink.slab()), 0, 0);
-                        encoder.setBytes_length_atIndex(std::ptr::NonNull::from(&iters).cast(), size_of::<u32>(), 1);
+                    // ONE AUTORELEASE POOL PER SPIN. `commandBuffer` and
+                    // `computeCommandEncoder` hand back AUTORELEASED objects, and
+                    // a thread Rust spawned has no pool draining under it — so
+                    // every buffer this loop ever made stayed alive, holding its
+                    // driver-side backing, for as long as the process ran. At a
+                    // few hundred microseconds a spin that is thousands a second
+                    // while the GPU is warm: measured at +118 MB of
+                    // `IOAccelerator` across 1733 requests, climbing ~16 MB a
+                    // minute and never plateauing. `leaks` sees none of it,
+                    // because every one is still reachable from the pool.
+                    //
+                    // The pool returns whether to keep spinning rather than
+                    // breaking out of it: a `break` cannot cross the closure.
+                    let spun = objc2::rc::autoreleasepool(|_| {
+                        let Some(buffer) = carry.queue.commandBuffer() else { return false };
+                        let Some(encoder) = buffer.computeCommandEncoder() else { return false };
+                        encoder.setComputePipelineState(&carry.pipeline);
+                        // SAFETY: the sink buffer outlives the command buffer (it is
+                        // owned by this thread's `carry`), and `iters` is copied out
+                        // by `setBytes:` before the call returns.
+                        unsafe {
+                            encoder.setBuffer_offset_atIndex(Some(&**carry.sink.slab()), 0, 0);
+                            encoder.setBytes_length_atIndex(std::ptr::NonNull::from(&iters).cast(), size_of::<u32>(), 1);
+                        }
+                        let one = objc2_metal::MTLSize { width: 1, height: 1, depth: 1 };
+                        let tg = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
+                        encoder.dispatchThreadgroups_threadsPerThreadgroup(one, tg);
+                        encoder.endEncoding();
+                        buffer.commit();
+                        // Waited for INSIDE the pool: the drain must not run while
+                        // the device still holds this buffer.
+                        buffer.waitUntilCompleted();
+                        true
+                    });
+                    if !spun {
+                        break;
                     }
-                    let one = objc2_metal::MTLSize { width: 1, height: 1, depth: 1 };
-                    let tg = objc2_metal::MTLSize { width: 32, height: 1, depth: 1 };
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(one, tg);
-                    encoder.endEncoding();
-                    buffer.commit();
-                    buffer.waitUntilCompleted();
                 }
             })
             .map_err(|err| crate::error::Fault::Device {
