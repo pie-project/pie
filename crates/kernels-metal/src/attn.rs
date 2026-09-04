@@ -604,9 +604,21 @@ pub fn prefill_lse(
     )
 }
 
-/// Prefill against the op-named `mask` instead of the causal bound alone —
-/// the same tiled shader, with `mask` in the seat the causal entries fill
-/// from the plan.
+/// Prefill under the op-named `mask` **on top of** the causal bound, not in
+/// place of it — the same tiled shader, with `mask` in the seat the causal
+/// entries fill from the plan.
+///
+/// **A STATED MASK CAN ONLY NARROW WHAT A ROW SEES.** The shader keeps a key
+/// when `kp <= q_pos && kp >= my_start` and then asks the mask
+/// (`sdpa_paged_mma.metal`, "keep = kp <= q_pos"), so a mask may hide a key
+/// the causal bound admits and can NEVER reveal one past the row's own
+/// position. That is right for every caller here, which states a mask to
+/// restrict a causal model — and it makes a BIDIRECTIONAL window
+/// inexpressible, which a block drafter's full-attention layer needs
+/// (`models::qwen_3`'s `DFlash`). Measured: an all-visible mask and a causal
+/// one give a block drafter identical tokens, because neither loosens
+/// anything. Widening wants a stated flag on the op and a shader that skips
+/// the upper bound when it is set.
 ///
 // The op-named `mask` and `plan.mask` are one buffer wearing two names:
 // the driver resolves `RuntimeInput::Mask` onto the same fire table every
