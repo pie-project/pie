@@ -16,4 +16,5 @@ max_tokens = {type = "int", optional = true, description = "Maximum generated to
 verify_rows = {type = "int", optional = true, description = "Rows of the block the target verifies, the anchor included (default: all 16)"}
 margin_width = {type = "bool", optional = true, description = "Let the drafter's logit margin pick the verify width per round"}
 min_tokens_per_round = {type = "float", optional = true, description = "Stop drafting below this yield; 0 (default) never stops"}
+auto_width = {type = "bool", optional = true, description = "Pick the verify width from the loop's own tokens a round (default: true)"}
 baseline = {type = "bool", optional = true, description = "Decode one token a fire instead, for the ratio"}

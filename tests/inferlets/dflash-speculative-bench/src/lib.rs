@@ -63,6 +63,35 @@
 //! 13.44/22.39 (1.67x) and 13.41/17.62 (1.31x): the ratio is set by content,
 //! not by how long the answer runs.
 //!
+//! # THE FULL BLOCK IS THE WORST WIDTH THERE IS
+//!
+//! The drafter proposes fifteen and the loop verified all sixteen rows,
+//! which is what every number above was taken at. Swept through
+//! `benches/pie_bench.py latency --requests 4 --max-tokens 256`, that is
+//! the worst choice available on all four workloads:
+//!
+//! ```text
+//!              w=16     w=4      w=8      auto
+//! prose        1.06x    1.41x    1.27x    1.29x
+//! code         1.62x    1.62x    1.90x    1.80x
+//! capitals     0.93x    1.30x    1.19x    1.16x
+//! counting     1.47x    1.51x    1.83x    1.89x
+//! mean         1.27     1.46     1.55     1.54
+//! ```
+//!
+//! **And no fixed width dominates either**: four wins prose and the list,
+//! eight wins code, and on counting the ladder beats every fixed width there
+//! is (1.89x) because it climbs to sixteen once the target starts taking
+//! whole windows. `auto_width` is therefore the default — it costs about 8%
+//! against knowing the right width in advance (prose 1.29x where a pinned
+//! four reads 1.41x) and never picks the width that loses. Pin one with
+//! `verify_rows` to reproduce a row of the table.
+//!
+//! Why sixteen loses is the staircase and the censoring together: a
+//! sixteen-row fire costs 2.79 one-row decodes and prose only ever keeps
+//! about 2.8 tokens, so twelve of those rows are bought and thrown away
+//! every round.
+//!
 //! # The gate, and what it costs to never lose
 //!
 //! `min_tokens_per_round` (see `Gate`) is the guest reading its OWN yield
@@ -239,6 +268,13 @@ struct Input {
     /// with. Around 3.0 is break-even on this box; see `Gate`.
     #[serde(default)]
     min_tokens_per_round: f64,
+    /// **LET THE LOOP'S OWN YIELD PICK THE VERIFY WIDTH.** See `Gate::width`.
+    /// **ON by default**, because the full block is the WORST width on every
+    /// workload measured — see the table in the header. `verify_rows` pins a
+    /// width and wins over this; `--verify_rows 16` is the loop every number
+    /// above the width section was taken with.
+    #[serde(default = "default_true")]
+    auto_width: bool,
 }
 
 fn default_prompt() -> String {
@@ -247,6 +283,10 @@ fn default_prompt() -> String {
 
 fn default_max_tokens() -> usize {
     64
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_system() -> String {
@@ -308,10 +348,15 @@ struct Output {
 struct Gate {
     /// Tokens a round below which drafting stops. Zero never closes.
     floor: f64,
-    /// What the last rounds that DID draft emitted, newest last.
-    recent: Vec<u32>,
+    /// What the last rounds that DID draft emitted, newest last, each with
+    /// whether the target took the WHOLE window — see `Gate::width`.
+    recent: Vec<(u32, bool)>,
+    /// The width the last drafting round used, the ladder's starting rung.
+    last: u32,
     /// Plain fires since the gate closed, counted towards the next probe.
     since: u32,
+    /// Whether the verify width follows the yield. Off leaves it at `block`.
+    auto: bool,
 }
 
 impl Gate {
@@ -321,9 +366,21 @@ impl Gate {
     /// Plain fires between probes. One probe costs a round; at sixteen the
     /// probe is under 7% of the fires it is deciding about.
     const PROBE: u32 = 16;
+    /// **THE WIDTHS WORTH BUYING, AND THERE ARE ONLY THREE.** A verify fire is
+    /// priced by its rows as a STAIRCASE — the vector fold answers 1-3 rows
+    /// for about what one costs, 4 steps to 1.38, 5-8 share the tile's first
+    /// step at 1.67-1.83, and 9-16 all cost 2.79 — so a width between rungs
+    /// pays the rung above it and keeps nothing extra. Twelve rows measured
+    /// 0.81x where sixteen measured 0.88x, which is the staircase, not noise.
+    ///
+    /// **THE LADDER STARTS AT FOUR AND NEVER GOES BELOW IT.** Two rows are
+    /// nearly free but yield about 1.7 tokens a round against four rows' 2.8,
+    /// and 1.7/1.00 loses to 2.8/1.38: measured, letting prose sink to two on
+    /// a sixth of its rounds cost 1.41x -> 1.30x.
+    const RUNGS: [u32; 3] = [4, 8, 16];
 
-    fn new(floor: f64) -> Self {
-        Gate { floor, recent: Vec::new(), since: 0 }
+    fn new(floor: f64, auto: bool) -> Self {
+        Gate { floor, recent: Vec::new(), last: 0, since: 0, auto }
     }
 
     /// Whether this round drafts. A probe is allowed through so a workload
@@ -332,9 +389,7 @@ impl Gate {
         if self.floor <= 0.0 || self.recent.len() < Self::WINDOW {
             return true;
         }
-        let mean = self.recent.iter().map(|t| f64::from(*t)).sum::<f64>()
-            / self.recent.len() as f64;
-        if mean >= self.floor {
+        if self.mean() >= self.floor {
             return true;
         }
         if self.since >= Self::PROBE {
@@ -345,9 +400,62 @@ impl Gate {
         false
     }
 
-    /// What a drafting round emitted, the anchor's token included.
-    fn yielded(&mut self, tokens: u32) {
-        self.recent.push(tokens);
+    /// **VERIFY AS MANY ROWS AS THE LOOP HAS BEEN KEEPING, ROUNDED UP TO A
+    /// RUNG.** The signal is the loop's own tokens a round, which is exactly
+    /// the accepted prefix plus the anchor — no prediction, no second pass
+    /// over a logits plane, just what the last rounds actually did.
+    ///
+    /// The comparison is STRICT, so a width the yield has saturated steps up
+    /// rather than pinning the loop under its own ceiling: at width four a
+    /// mean of 4.0 asks for eight, and the loop climbs back on a workload
+    /// that turns code-shaped. Measured against the shipped sixteen on this
+    /// box, a fixed width picked this way is the per-workload optimum in all
+    /// three cases (`prose` 4, `code` 8, `capitals` 4).
+    fn width(&self, block: u32) -> u32 {
+        if !self.auto {
+            return block;
+        }
+        // **START CHEAP AND CLIMB, RATHER THAN WIDE AND FALL.** With no
+        // history the ladder has nothing to read, and eight rounds at the
+        // full block is eight fires at 2.79 where the first rung costs 1.38
+        // — on a 91-round request that alone was 9% of the rounds spent at
+        // the most expensive width the loop offers.
+        if self.recent.len() < Self::WINDOW {
+            return Self::RUNGS[0].min(block);
+        }
+        // **A WINDOW THE TARGET TOOK WHOLE SAYS NOTHING ABOUT HOW MUCH MORE
+        // IT WOULD HAVE TAKEN.** The yield is CENSORED at the width, so
+        // reading the mean alone is a ratchet: narrow once and the mean can
+        // never again exceed the width that produced it, and a request that
+        // turns code-shaped stays pinned at four rows. Measured: without
+        // this the code prompt sits at width 4 and 1.62x where width 8 is
+        // 1.86x. So a window that saturated asks for the NEXT RUNG UP
+        // instead, and the ladder climbs until the target stops taking
+        // everything.
+        let saturated = self.recent.iter().filter(|(_, whole)| *whole).count();
+        let over = f64::from(self.last);
+        // Three quarters, not half: a rung is left only on strong evidence,
+        // because the step up costs 1.5-2x and a window that merely brushed
+        // its ceiling has not earned it. At half the ladder reached sixteen
+        // on a fifth of the prose rounds and gave back most of the win.
+        let want = if saturated * 4 >= self.recent.len() * 3 { over } else { self.mean() };
+        Self::RUNGS
+            .iter()
+            .copied()
+            .find(|w| f64::from(*w) > want)
+            .unwrap_or(block)
+            .min(block)
+    }
+
+    fn mean(&self) -> f64 {
+        self.recent.iter().map(|(t, _)| f64::from(*t)).sum::<f64>() / self.recent.len() as f64
+    }
+
+    /// What a drafting round emitted, the anchor's token included, and
+    /// whether the target kept every row it was shown.
+    fn yielded(&mut self, tokens: u32, width: u32, whole: bool) {
+        self.last = width;
+        self.recent.push((tokens, whole));
         if self.recent.len() > Self::WINDOW {
             self.recent.remove(0);
         }
@@ -517,7 +625,7 @@ async fn main(input: Input) -> Result<Output> {
     // round replays nothing.
     let mut survivors: u32 = 0;
     let mut widths: Vec<u32> = Vec::new();
-    let mut gate = Gate::new(input.min_tokens_per_round);
+    let mut gate = Gate::new(input.min_tokens_per_round, input.auto_width);
     let mut plain_fires: usize = 0;
 
     // A round commits several tokens at once, so the stop is read off the
@@ -570,7 +678,7 @@ async fn main(input: Input) -> Result<Output> {
 
         // The width is chosen AFTER the draft fire, from what the drafter
         // itself says — see `wide_enough`. Pinned, it is stated here.
-        let mut verify = pinned.unwrap_or(block);
+        let mut verify = pinned.unwrap_or_else(|| gate.width(block));
         // The buffer must hold the survivors and this window; the grant is
         // the guest's one allocation decision.
         let buffer_pages = buffer_pages_for(survivors, block, rs_page);
@@ -756,7 +864,7 @@ async fn main(input: Input) -> Result<Output> {
             rounds += 1;
             drafted += verify as usize - 1;
             accepted += kept;
-            gate.yielded(kept as u32 + 1);
+            gate.yielded(kept as u32 + 1, verify, verify > 1 && kept as u32 == verify - 1);
         }
         replayed += survivors as usize;
         // The rejected tail never happened: forget it before the next fire,
