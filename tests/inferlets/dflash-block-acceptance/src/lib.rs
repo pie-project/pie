@@ -43,6 +43,15 @@ struct Input {
     /// causal at every layer whatever this says.
     #[serde(default)]
     causal_block: bool,
+    /// Diagnostic: hide every key from this index on. `-1` hides nothing.
+    /// Hiding a PREFIX of the context and watching the drafts move is what
+    /// says a mask is read per key rather than all-or-nothing.
+    #[serde(default = "no_hide")]
+    hide_from: i32,
+}
+
+fn no_hide() -> i32 {
+    -1
 }
 
 fn default_prompt() -> String {
@@ -76,9 +85,6 @@ struct Output {
 /// which is one: a block drafter plants one proposal a ROW), so it is stated
 /// in one place until the load advertises it.
 const BLOCK_ROWS: u32 = 16;
-
-/// Throwaway probe: hide every key and see whether anything moves.
-const PROBE_HIDE_ALL: bool = false;
 
 /// The drafter's own mask token, `dflash_config.mask_token_id`. Stated here
 /// for the same reason and with the same caveat.
@@ -188,13 +194,16 @@ async fn main(input: Input) -> Result<Output> {
             Channel::from_iter((held..held + block).map(|p| p % page_size)).named("w_off_d");
         let kv_len = Channel::from([held + block]).named("kv_len_d");
         let causal = input.causal_block;
+        let hide_from = input.hide_from;
         let visible: Vec<bool> = (0..block)
             .flat_map(|i| {
                 (0..pool).map(move |j| {
                     // `causal_block` doubles as the inert-mask probe: at its
                     // extreme the mask hides EVERYTHING, so drafts that do
                     // not move are drafts a mask never touched.
-                    j < held + block && (!causal || j <= held + i) && !PROBE_HIDE_ALL
+                    j < held + block
+                        && (!causal || j <= held + i)
+                        && (hide_from < 0 || (j as i32) < hide_from)
                 })
             })
             .collect();
