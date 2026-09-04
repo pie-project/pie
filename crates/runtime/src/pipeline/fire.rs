@@ -909,6 +909,7 @@ fn stamp_lane_words(
             lane.drafts,
             lane.captures_scores,
             carries_media,
+            lane.block_draft,
         );
     }
 }

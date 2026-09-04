@@ -778,11 +778,13 @@ impl Model {
     }
 
     /// The fact word a lane carries: `query_len` rows, custom mask,
-    /// adapter routing, draft head, attention mass capture, media spans.
+    /// adapter routing, draft head, attention mass capture, media spans, and
+    /// whether the rows are a block drafter's proposal rather than the
+    /// sequence's own.
     /// The engine turns this word into a class, and the class into the row
     /// window every guarded node runs over. This calls the family's
     /// `Classify::of(..).word()` through the catalog pointer and never
-    /// reads a bit itself; all six facts are stamped from one reading of
+    /// reads a bit itself; all seven facts are stamped from one reading of
     /// the lane at one instant.
     #[must_use]
     pub fn word(
@@ -793,13 +795,15 @@ impl Model {
         drafts: bool,
         captures_scores: bool,
         media: bool,
+        block_draft: bool,
     ) -> u64 {
         (self.classify)(
             &models::Request::new(query_len, custom_mask)
                 .adapted(adapter)
                 .drafting(drafts)
                 .capturing_scores(captures_scores)
-                .with_media(media),
+                .with_media(media)
+                .drafting_a_block(block_draft),
         )
     }
 

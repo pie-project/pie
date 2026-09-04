@@ -587,6 +587,7 @@ impl ReqGeometry {
                     // The ETA port vocabulary has no draft or capture port yet.
                     drafts: false,
                     captures_scores: false,
+                    block_draft: false,
                     // This runtime predicts no channel cursor, so `Fold` is
                     // the only recurrent verb served.
                     rs: ::engine::RsVerb::Fold,

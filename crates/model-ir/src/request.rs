@@ -13,6 +13,7 @@ pub struct Request {
     drafts: bool,
     captures_scores: bool,
     media: bool,
+    block_draft: bool,
 }
 
 impl Request {
@@ -25,6 +26,7 @@ impl Request {
             drafts: false,
             captures_scores: false,
             media: false,
+            block_draft: false,
         }
     }
 
@@ -39,6 +41,25 @@ impl Request {
     #[must_use]
     pub fn drafting(mut self, drafts: bool) -> Request {
         self.drafts = drafts;
+        self
+    }
+
+    /// The same request, carrying a BLOCK DRAFTER's proposal rows rather
+    /// than rows of the sequence itself.
+    ///
+    /// A block drafter (`qwen_3`'s [`Recipe::DFlash`]) proposes many tokens
+    /// in one pass over a block whose first row is the correction the target
+    /// just made and whose rest is the mask token. Those rows are not the
+    /// model's own — the trunk must not run over them — so this is what a
+    /// plan guards its trunk against, and it is the guest's to set: only the
+    /// inferlet knows the accepted prefix that anchors the block, so only it
+    /// can say which fire is a draft.
+    ///
+    /// Distinct from [`drafting`](Request::drafting), which asks a plan to
+    /// run its draft head over rows the trunk ALSO processes.
+    #[must_use]
+    pub fn drafting_a_block(mut self, block_draft: bool) -> Request {
+        self.block_draft = block_draft;
         self
     }
 
@@ -75,6 +96,11 @@ impl Request {
     #[must_use]
     pub fn drafts(&self) -> bool {
         self.drafts
+    }
+
+    #[must_use]
+    pub fn drafts_a_block(&self) -> bool {
+        self.block_draft
     }
 
     #[must_use]

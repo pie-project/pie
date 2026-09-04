@@ -189,6 +189,18 @@ pub struct Lane {
     /// Keep this lane's attention mass; puts its per-layer log-sum-exp into
     /// [`LaneReadout::scores`]. [`Lane::drafts`]'s twin in validation.
     pub captures_scores: bool,
+    /// These rows are a BLOCK DRAFTER's proposal, not the sequence's own —
+    /// the plan's trunk must not run over them, only its block-draft arm
+    /// (`qwen_3`'s `Recipe::DFlash`). Distinct from [`Lane::drafts`], which
+    /// asks for a draft head over rows the trunk ALSO processes.
+    ///
+    /// Unlike `drafts`, this cannot be inferred from the guest's program:
+    /// what makes a fire a draft is the anchor the inferlet chose from the
+    /// accepted prefix, which no intrinsic reveals. It is the guest's to
+    /// state, and until the wit door for it exists nothing sets it, so every
+    /// lane classifies exactly as it did before.
+    #[serde(default)]
+    pub block_draft: bool,
     /// The recurrent-state verb this lane asks for ([`RsVerb`]). An engine
     /// that does not serve the non-default verbs
     /// ([`Serves::rs_verbs`]) refuses them by name rather than folding.
