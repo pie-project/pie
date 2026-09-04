@@ -116,6 +116,17 @@ impl ForwardHybrid for Model {
             let a = &mtp.attn;
             c.kv(kv, a.kv.clone(), [plane, plane]);
         }
+        // The block drafter brings five layers, so five rows — in the same
+        // page-id space for the same reason, and at the same plane width,
+        // which its own geometry happens to land on (8 kv heads x 128
+        // against the trunk's 4 x 256; see `DFlash`).
+        if let Some(dflash) = &self.dflash {
+            for b in &dflash.blocks {
+                let a = &b.attn;
+                let dplane = a.kv_heads as u64 * a.head_dim as u64;
+                c.kv(kv, a.kv.clone(), [dplane, dplane]);
+            }
+        }
         c
     }
 

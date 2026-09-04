@@ -352,6 +352,51 @@ impl Model {
             }
         }
 
+        // The block drafter, always `--aux`-imported (it is published on its
+        // own), so always under `aux.`. Its layers are the standard pre-norm
+        // decoder spelling — `input_layernorm`, `self_attn.*`,
+        // `post_attention_layernorm`, `mlp.*` — and its `q_proj` is the
+        // plain one, NOT the trunk's `[2·q, hidden]` gate-packed bank.
+        if let Some(dflash) = &self.dflash {
+            b.read(&dflash.hidden_norm, "aux.hidden_norm.weight".to_string())?;
+            // `fc.weight` is one `[hidden, taps·hidden]` bank; tap `i` is
+            // columns `i·hidden .. (i+1)·hidden`, sliced as the MTP head's
+            // two-wide bank is.
+            let span = extents(&dflash.fc[0])[1];
+            for (i, bank) in dflash.fc.iter().enumerate() {
+                let at = span * i as i64;
+                b.read_expr(bank, Expr::src("aux.fc.weight".to_string()).slice(1, at, span))?;
+            }
+            for (l, block) in dflash.blocks.iter().enumerate() {
+                let n = |s: &str| format!("aux.layers.{l}.{s}");
+                let a = &block.attn;
+                b.read(&block.mixer_norm, n("input_layernorm.weight"))?;
+                b.read(&a.q_proj, n("self_attn.q_proj.weight"))?;
+                b.read(&a.k_proj, n("self_attn.k_proj.weight"))?;
+                b.read(&a.v_proj, n("self_attn.v_proj.weight"))?;
+                b.read(&a.o_proj, n("self_attn.o_proj.weight"))?;
+                b.read(&a.q_norm, n("self_attn.q_norm.weight"))?;
+                b.read(&a.k_norm, n("self_attn.k_norm.weight"))?;
+                b.read(&block.mlp_norm, n("post_attention_layernorm.weight"))?;
+                match &block.mlp {
+                    Mlp::Dense { gate_up, down, .. } => {
+                        b.read_concat(
+                            gate_up,
+                            [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
+                        )?;
+                        b.read(down, n("mlp.down_proj.weight"))?;
+                    }
+                    Mlp::Routed { .. } => {
+                        return Err(Error::Illegible {
+                            name: n("mlp"),
+                            detail: "a draft block routes to no experts".to_string(),
+                        });
+                    }
+                }
+            }
+            b.read(&dflash.norm, "aux.norm.weight".to_string())?;
+        }
+
         Ok(b.build())
     }
 
