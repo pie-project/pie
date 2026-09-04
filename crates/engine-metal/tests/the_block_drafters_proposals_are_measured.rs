@@ -18,6 +18,19 @@
 //! is a weak one — which is why it is sampled at several anchors and over
 //! prompts of different shape rather than reported as one number.
 //!
+//! **A truncated block is NOT a window onto the full one, and this was tried.**
+//! Firing the block at every length 1..=16 and reading each last row would
+//! recover the whole proposal from a seat that hands back one row — four of
+//! the drafter's five layers are causal and windowed, so their view of row
+//! `L-1` is exactly the full block's, and only the last, full-attention
+//! layer sees fewer mask rows. It does not work: over twelve anchors the
+//! agreements land at positions 11-15 and NEVER at 0-2, which is the
+//! opposite of what a drafter does. The reason is that this is a block
+//! DIFFUSION model trained at one block width, so a length-1 block is far
+//! out of its distribution while a length-15 one is nearly in it. The
+//! accepted-prefix profile therefore needs the real sixteen-wide pass, and
+//! so it needs a guest epilogue reading `mtp.drafts`.
+//!
 //! Slot 0 decodes the truth autoregressively with the context arm running,
 //! so the drafter's kv rows carry the history a real round would give them;
 //! slot 1 prefills the same prompt, walks the same tokens, and fires one
