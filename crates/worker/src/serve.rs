@@ -641,11 +641,23 @@ fn build_partner_bootstrap(
     })
 }
 
-/// Print the bootstrap banner when `server.verbose` is set.
+/// Announce readiness — always — and draw the box when `server.verbose` is set.
+///
+/// The `✓ Server ready at` line is the readiness contract every supervisor and
+/// harness waits on (`benches/pie_bench.py` greps for exactly that phrase), so
+/// it cannot ride a presentation flag: under `verbose = false`, the production
+/// setting, the server used to bind, register and serve while saying nothing,
+/// and anything waiting for it waited forever. It goes to stdout, where a
+/// reader of the process's output looks for it, and is flushed so a pipe sees
+/// it before the next thing this process does.
 fn log_serving(cfg: &config::Config, url: &str) {
+    use std::io::Write;
+
     if cfg.server.verbose {
         eprintln!("{}", StartupBanner::from_config(cfg).render(url));
     }
+    println!("{}", banner::ready_line(url));
+    let _ = std::io::stdout().flush();
 }
 
 /// Build the client-facing edge server + control plane for the resolved
