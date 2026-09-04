@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! PIE_QMM_SHAPES=5120x5120,5120x17408 PIE_QMM_ROWS=1,2,3,4,6,8,16 \
-//!   [PIE_QMM_TUNING=qmv_rows_max=4] [PIE_QMM_STEPS=50] \
+//!   [PIE_QMM_TUNING=qmv_rows_max=4] [PIE_QMM_STEPS=50] [PIE_QMM_BATCH=32] [PIE_QMM_WARM_MS=300] \
 //!   cargo test -p engine-metal --release --test a_quantized_matmul_is_priced_by_its_rows -- --nocapture
 //! ```
 
@@ -110,6 +110,13 @@ fn every_row_count_is_timed() {
 
     let rows = list("PIE_QMM_ROWS", "1,2,3,4,6,8,16");
     let steps: usize = env("PIE_QMM_STEPS", 50usize);
+    // Launches per command buffer. One launch is ~200 us of device time,
+    // and a command buffer that short is committed and waited on before the
+    // GPU has settled, so consecutive runs of the same launch read 200 us
+    // or 580 us with nothing else on the machine. A whole-model fire holds
+    // 300+ launches in one buffer and is steady to a few percent; this
+    // makes each timed buffer the same shape.
+    let batch: usize = env("PIE_QMM_BATCH", 32usize);
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     eprintln!("device: {}", device.name());
@@ -183,7 +190,6 @@ fn every_row_count_is_timed() {
             let act = Tensor::new(ha, m, k, Dtype::Bf16);
             let y = Tensor::new(ho, m, n, Dtype::Bf16);
             let none = |_: u32, _: u32| None;
-            let scratch = quant::Scratch { precast: &none };
             // `capacity_rows` is the ROW CAPACITY of the output rectangle, not
             // this launch's row count: `mb_block` pads `M` up to a `BM` rung
             // and refuses a padding the capacity cannot hold. Passing `m`
@@ -193,12 +199,28 @@ fn every_row_count_is_timed() {
             let cap = widest;
             let _ = cap;
 
-            // Warm: the first launch compiles the point.
+            // Warm: the first launch compiles the point, and the ones after
+            // it hold the GPU busy until its clock has come up. A timed run
+            // of fifty launches is ~20 ms of device time, too short for the
+            // governor to leave its idle state, so an unwarmed pass reads
+            // 2x slow and a second pass minutes later reads fast — which
+            // looks exactly like thermal noise and is not. `PIE_QMM_WARM_MS`
+            // is how long to hold it (default 300 ms).
             {
-                let frame = device.frame().expect("a frame");
-                let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                quant::matmul(&sink, act, bank, y, scratch, widest).expect("the warm launch");
-                frame.commit().expect("the warm commit");
+                let warm_ms: u64 = env("PIE_QMM_WARM_MS", 300u64);
+                let began = Instant::now();
+                loop {
+                    let frame = device.frame().expect("a frame");
+                    let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                    for _ in 0..batch {
+                        let scratch = quant::Scratch { precast: &none };
+                        quant::matmul(&sink, act, bank, y, scratch, widest).expect("the warm launch");
+                    }
+                    frame.commit().expect("the warm commit");
+                    if began.elapsed().as_millis() as u64 >= warm_ms {
+                        break;
+                    }
+                }
             }
 
             let began = Instant::now();
@@ -206,10 +228,13 @@ fn every_row_count_is_timed() {
             for _ in 0..steps {
                 let frame = device.frame().expect("a frame");
                 let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                let scratch = quant::Scratch { precast: &none };
-                quant::matmul(&sink, act, bank, y, scratch, widest).expect("the launch");
+                for _ in 0..batch {
+                    let scratch = quant::Scratch { precast: &none };
+                    quant::matmul(&sink, act, bank, y, scratch, widest).expect("the launch");
+                }
                 device_s += frame.commit_timed().expect("the commit");
             }
+            let launches = (steps * batch) as f64;
             // ── the check: row 0 is the same activation at every row
             //    count, so every point must answer it the same numbers.
             let raw = handles.read(ho, u64::from(n) * 2).expect("read row 0");
@@ -235,8 +260,8 @@ fn every_row_count_is_timed() {
                 }
             }
 
-            let wall_us = began.elapsed().as_secs_f64() * 1e6 / steps as f64;
-            let dev_us = device_s * 1e6 / steps as f64;
+            let wall_us = began.elapsed().as_secs_f64() * 1e6 / launches;
+            let dev_us = device_s * 1e6 / launches;
             if m == rows[0] {
                 one = dev_us;
             }
