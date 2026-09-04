@@ -77,6 +77,9 @@ struct Output {
 /// in one place until the load advertises it.
 const BLOCK_ROWS: u32 = 16;
 
+/// Throwaway probe: hide every key and see whether anything moves.
+const PROBE_HIDE_ALL: bool = false;
+
 /// The drafter's own mask token, `dflash_config.mask_token_id`. Stated here
 /// for the same reason and with the same caveat.
 const MASK_TOKEN: i32 = 248_070;
@@ -188,7 +191,10 @@ async fn main(input: Input) -> Result<Output> {
         let visible: Vec<bool> = (0..block)
             .flat_map(|i| {
                 (0..pool).map(move |j| {
-                    j < held + block && (!causal || j <= held + i)
+                    // `causal_block` doubles as the inert-mask probe: at its
+                    // extreme the mask hides EVERYTHING, so drafts that do
+                    // not move are drafts a mask never touched.
+                    j < held + block && (!causal || j <= held + i) && !PROBE_HIDE_ALL
                 })
             })
             .collect();
