@@ -50,6 +50,18 @@ struct Input {
     /// road, and the denominator of the speedup.
     #[serde(default)]
     baseline: bool,
+    /// **HOW MANY OF THE BLOCK'S ROWS TO VERIFY**, the anchor's included.
+    /// Zero (the default) verifies all of them.
+    ///
+    /// The drafter is trained at one block width and proposes fifteen
+    /// whatever this says — a block diffusion model is out of distribution
+    /// at any other width — but the TARGET need not read them all, and a
+    /// verify fire is priced by its rows: sixteen cost 2.82 one-row fires on
+    /// this box, eight cost 1.83. A workload whose accepted prefix rarely
+    /// reaches eight pays for ten rows it was never going to keep. Which
+    /// rows are worth a fire is the guest's call, not the engine's.
+    #[serde(default)]
+    verify_rows: u32,
 }
 
 fn default_prompt() -> String {
@@ -83,6 +95,8 @@ struct Output {
     tokens_per_round: f64,
     /// The block width this run used.
     block: u32,
+    /// The widths the rounds chose, in order.
+    verify: Vec<u32>,
     /// Rows replayed through the buffer read path, summed over the rounds —
     /// a run whose `replayed` is zero exercised none of the fold-commit path.
     replayed: usize,
@@ -124,6 +138,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err("this SKU ships no draft head".into());
     }
     let block = BLOCK_ROWS;
+    let pinned = (input.verify_rows != 0).then(|| input.verify_rows.clamp(2, block));
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
     let mut prompt = model::encode(&input.prompt);
@@ -203,6 +218,7 @@ async fn main(input: Input) -> Result<Output> {
     // everything and the anchor is the first window's own row, so the first
     // round replays nothing.
     let mut survivors: u32 = 0;
+    let mut widths: Vec<u32> = Vec::new();
 
     while generated.len() < input.max_tokens {
         if input.baseline {
@@ -248,6 +264,8 @@ async fn main(input: Input) -> Result<Output> {
             continue;
         }
 
+        let verify = pinned.unwrap_or(block);
+        widths.push(verify);
         // The buffer must hold the survivors and this window; the grant is
         // the guest's one allocation decision.
         let buffer_pages = buffer_pages_for(survivors, block, rs_page);
@@ -337,18 +355,18 @@ async fn main(input: Input) -> Result<Output> {
 
         // ── the verify: ONE trunk fire over `[anchor, proposals]` ────────
         let mut fed = vec![anchor];
-        fed.extend_from_slice(proposals);
+        fed.extend_from_slice(&proposals[..verify as usize - 1]);
         let toks = Channel::from(fed.as_slice()).named("toks_v");
-        let indptr = Channel::from([0u32, block]).named("embed_indptr_v");
-        let positions = Channel::from_iter(held..held + block).named("positions_v");
+        let indptr = Channel::from([0u32, verify]).named("embed_indptr_v");
+        let positions = Channel::from_iter(held..held + verify).named("positions_v");
         let pages = Channel::from_iter(0..max_pages).named("pages_v");
         let page_indptr =
-            Channel::from([0u32, (held + block).div_ceil(page_size)]).named("page_indptr_v");
-        let w_slot = Channel::from_iter((held..held + block).map(|p| p / page_size)).named("w_slot_v");
-        let w_off = Channel::from_iter((held..held + block).map(|p| p % page_size)).named("w_off_v");
-        let kv_len = Channel::from([held + block]).named("kv_len_v");
-        let readout = Channel::from_iter(0..block).named("readout_v");
-        let truth = Channel::new([block], dtype::i32).named("truth_v");
+            Channel::from([0u32, (held + verify).div_ceil(page_size)]).named("page_indptr_v");
+        let w_slot = Channel::from_iter((held..held + verify).map(|p| p / page_size)).named("w_slot_v");
+        let w_off = Channel::from_iter((held..held + verify).map(|p| p % page_size)).named("w_off_v");
+        let kv_len = Channel::from([held + verify]).named("kv_len_v");
+        let readout = Channel::from_iter(0..verify).named("readout_v");
+        let truth = Channel::new([verify], dtype::i32).named("truth_v");
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &indptr)?;
@@ -379,7 +397,7 @@ async fn main(input: Input) -> Result<Output> {
         {
             let truth = truth.clone();
             fwd.epilogue(move || {
-                truth.put(&reshape(reduce_argmax(intrinsics::logits()), [block]));
+                truth.put(&reshape(reduce_argmax(intrinsics::logits()), [verify]));
             });
         }
         fwd.submit(&pipe).context("verify submit")?;
@@ -388,18 +406,18 @@ async fn main(input: Input) -> Result<Output> {
         // ── what the target kept ────────────────────────────────────────
         // Row `i` of the verify predicts position `held + i + 1`, which is
         // what proposal `i` claims — so the prefix is read off one zip.
-        let kept = proposals
+        let kept = proposals[..verify as usize - 1]
             .iter()
             .zip(&truth)
             .take_while(|(p, t)| p == t)
             .count();
         rounds += 1;
-        drafted += proposals.len();
+        drafted += verify as usize - 1;
         accepted += kept;
         replayed += survivors as usize;
         // The rejected tail never happened: forget it before the next fire,
         // whose fold reaches exactly the accepted prefix.
-        let rejected = (proposals.len() - kept) as u32;
+        let rejected = (verify as usize - 1 - kept) as u32;
         if rejected > 0 {
             rs_set[0]
                 .discard_buffered(rejected)
@@ -442,6 +460,7 @@ async fn main(input: Input) -> Result<Output> {
             (accepted + rounds) as f64 / rounds as f64
         },
         block,
+        verify: widths,
         replayed,
         discarded,
         rs_page,
