@@ -363,6 +363,23 @@ impl Value {
             .skip(1)
             .fold(joined[0].1.clone(), |c, (_, a)| Guard::or(c, a.clone()))
             .simplified();
+        // **A MERGE NESTED IN AN OUTER SPLIT MUST COME BACK ON THAT SPLIT'S
+        // ARM.** `compatible` compares guards by equality, so a merge whose
+        // join is spelled `Or(And(G, p₁), .., And(G, pₙ))` reads as a
+        // different arm from a sibling still spelled `G`, and the next node
+        // over both panics as mixed arms — which is what a trunk guarded by
+        // one fact does to itself, since every attention layer merges. The
+        // arms of one split of a `G`-guarded value each carry `G`, and when
+        // their predicates cover the space their join IS `G`; recovering
+        // that spelling is what lets a guarded region contain a merge. The
+        // equivalence is checked by truth table, never assumed.
+        let arms: Vec<Guard> = joined.iter().map(|(_, c)| c.clone()).collect();
+        let shared = Guard::common(&arms);
+        let cond = if matches!(shared, Guard::Always) || !shared.equivalent(&cond) {
+            cond
+        } else {
+            shared
+        };
         let mut p = rec.inner.borrow_mut();
         p.values.push(ValueDecl {
             def: Def::Merge(joined),

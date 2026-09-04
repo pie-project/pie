@@ -116,3 +116,32 @@ fn write_a_checkpoint_of_one_stranger(path: &Path) {
         .finish()
         .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
 }
+
+/// **THE BLOCK DRAFTER'S TEXT TRACES** — the plan `qwen36-27b-dflash` builds
+/// runs the validator in `trace_hybrid`'s `finish`, which is what says the
+/// two-armed shape (a trunk guarded away from the draft rows, a drafter
+/// reading the target's own head) is a plan the compiler will take at all.
+///
+/// It is also the regression for `Guard::common`: the trunk here runs inside
+/// a split arm, and every attention layer inside it MERGES. Without a merge
+/// coming back on the arm its siblings are on, the first `lora_correct` past
+/// it panics as mixed arms, which is exactly how this plan failed before.
+#[test]
+fn the_block_drafters_plan_is_whole() {
+    use model_dsl::Platform;
+    let row = models::skus()
+        .find(|row| row.recipe.text == "qwen36-27b-dflash")
+        .expect("this build ships the block-drafter row");
+    for platform in [Platform::Metal, Platform::Cuda] {
+        let trace = (row.trace)(platform);
+        assert!(
+            !trace.nodes.is_empty(),
+            "{platform:?}: the drafter's plan is empty"
+        );
+        let seams: Vec<&str> = trace.seams.iter().map(|s| s.seam.as_str()).collect();
+        assert!(
+            seams.iter().any(|s| s.contains("mtp")),
+            "{platform:?}: the drafter plants no draft seam; seams are {seams:?}"
+        );
+    }
+}

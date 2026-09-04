@@ -24,6 +24,19 @@ pub fn skus() -> Vec<crate::Sku> {
             &tokenizer::CONTRACT,
             |tp: u32| Model::d27b(Dtype::U4g64, Dtype::Bf16, tp),
         ),
+        // The DFlash block drafter, overlaid by `--aux`. Asks before the
+        // plain row for the reason the MTP row does: an artifact carrying
+        // the drafter's planes fits the undrafted row too.
+        (
+            "qwen36-27b-dflash",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::d27b_dflash(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
         (
             "qwen36-27b",
             1,
