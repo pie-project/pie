@@ -499,6 +499,16 @@ impl Gate {
     /// pays the rung above it and keeps nothing extra. Twelve rows measured
     /// 0.81x where sixteen measured 0.88x, which is the staircase, not noise.
     ///
+    /// **DROPPING THE SIXTEEN RUNG IS A WASH, AND IT STAYS FOR A HEAD THAT
+    /// CAN REACH IT.** `heads.py` prices sixteen below eight on every prompt
+    /// for the head this SKU carries, which suggested cutting the top rung.
+    /// Measured end to end with rungs `[4, 8]`: counting 1.87x against 1.88x,
+    /// prose 1.42x against 1.38x, code 1.78x against 1.82x, capitals 1.33x
+    /// against 1.32x — the same mean to two places, because the ladder
+    /// reaches sixteen on only a handful of rounds anyway. It is kept because
+    /// it costs nothing here and another head does want it: DSpark's counting
+    /// prices BEST at sixteen (2.94).
+    ///
     /// **THE LADDER STARTS AT FOUR AND NEVER GOES BELOW IT.** Two rows are
     /// nearly free but yield about 1.7 tokens a round against four rows' 2.8,
     /// and 1.7/1.00 loses to 2.8/1.38: measured, letting prose sink to two on
