@@ -22,7 +22,7 @@
 //! ```text
 //! PIE_QMM_SHAPES=5120x5120,5120x17408 PIE_QMM_ROWS=1,2,3,4,6,8,16 \
 //!   [PIE_QMM_TUNING=qmv_rows_max=4] [PIE_QMM_STEPS=50] [PIE_QMM_BATCH=32] [PIE_QMM_WARM_MS=300] \
-//!   [PIE_QMM_PRECAST=0] [PIE_QMM_SPLITK=4] \
+//!   [PIE_QMM_PRECAST=0] [PIE_QMM_SPLITK=4] [PIE_QMM_LADDER_SPLIT=0] \
 //!   cargo test -p engine-metal --release --test a_quantized_matmul_is_priced_by_its_rows -- --nocapture
 //! ```
 
@@ -150,9 +150,11 @@ fn every_row_count_is_timed() {
         let mut act_b = Buffer::zeroed(&device, u64::from(cap) * u64::from(k) * 2).expect("act");
         let out_b = Buffer::zeroed(&device, u64::from(cap) * u64::from(n) * 2).expect("out");
         let precast_b = Buffer::zeroed(&device, u64::from(cap) * u64::from(k) * 2).expect("precast");
+        // Room for the forced arm's partials AND the ladder's own split
+        // (eight partitions of an eight-row tile).
         let partial_b = Buffer::zeroed(
             &device,
-            u64::from(split.max(1)) * u64::from(cap) * u64::from(n) * 4,
+            u64::from(split.max(8)) * u64::from(cap.max(8)) * u64::from(n) * 4,
         )
         .expect("partials");
         // Fill: arbitrary codes, small scales so the product stays in bf16's
@@ -227,10 +229,17 @@ fn every_row_count_is_timed() {
             };
             let precast: &dyn Fn(u32, u32) -> Option<Tensor> =
                 if precast_on == 0 { &none } else { &some };
+            let partial_rows = u64::from(partial_b.bytes()) / (u64::from(n) * 4);
+            let some_partials = |rows: u32, width: u32| {
+                (width == n && u64::from(rows) <= partial_rows)
+                    .then(|| Tensor::new(hq, rows, width, Dtype::F32))
+            };
+            let partials: &dyn Fn(u32, u32) -> Option<Tensor> =
+                if env("PIE_QMM_LADDER_SPLIT", 1u32) == 0 { &none } else { &some_partials };
             // One launch of this row count, whichever arm is on.
             let launch = |sink: &dyn Encode| {
                 if split == 0 {
-                    let scratch = quant::Scratch { precast };
+                    let scratch = quant::Scratch { precast, partials };
                     return quant::matmul(sink, act, bank, y, scratch, cap).expect("the launch");
                 }
                 let (bm, padded) = split_block(m);

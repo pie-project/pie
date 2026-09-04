@@ -29,6 +29,7 @@ impl Run<'_> {
                     self.tensor(*y),
                     linear::quant::Scratch {
                         precast: &|rows, contraction| self.precast(rows, contraction),
+                        partials: &|rows, width| self.partials(rows, width),
                     },
                     self.capacity(*act).min(self.capacity(*y)),
                 ),
@@ -47,6 +48,7 @@ impl Run<'_> {
                     self.tensor(*y),
                     linear::quant::Scratch {
                         precast: &|rows, contraction| self.precast(rows, contraction),
+                        partials: &|rows, width| self.partials(rows, width),
                     },
                     self.capacity(*act).min(self.capacity(*y)),
                 ),

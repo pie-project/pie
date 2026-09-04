@@ -80,6 +80,56 @@ const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
 /// Column tiles, narrowest first — the order [`bn`] walks.
 const BN_RUNGS: [i32; 3] = [16, 32, 64];
 
+/// Threadgroups (column tiles by row tiles, at [`SPLITK_BN`]) under which a `bm = 8` tile is split
+/// down K. Measured (M4 Pro, `a_quantized_matmul_is_priced_by_its_rows`, 8 rows, us): N=17408
+/// (544 threadgroups) x2 347 vs 342 unsplit — no gain, so the line sits above 544; N=5120 (160)
+/// 114 -> 108 / 107 at x4 / x8; K=17408 N=5120 (160, latency-bound on a 544-step walk) 445 -> 358 /
+/// 349; N=1024 (32) 57 -> 32 / 30, which also beats the eight-row fold's 47. At `bm >= 16` no
+/// split helped anywhere (N=5120, 16 rows: 161 -> 172), so the rule is the 8 rung's alone.
+const SPLITK_FILL_TG: u32 = 512;
+
+/// The most K partitions a split takes: past eight the reduce's traffic and the partial rows
+/// grow for a tile that was already at the machine's fill.
+const SPLITK_MAX: i32 = 8;
+
+/// The column tile the split-K points are stamped at — the only one (`instantiate_qmm_t_splitk`).
+const SPLITK_BN: i32 = 32;
+
+/// The split-K reduce, f32 partials to bf16 (stamped in source).
+const SPLITK_REDUCE: &str = "qmm_splitk_reduce_f32_bfloat16";
+
+/// The K partitions a tile of `padded` rows at `bm` over `n` columns takes: 1 for a tile that
+/// fills the machine, at a rung other than 8, at a width the split points are not stamped at
+/// (2-bit), or over a K no partition divides into whole groups and whole `BK` blocks.
+#[must_use]
+pub fn splitk(n: i32, bm: i32, padded: i32, k: i32, group: i32, bits: i32) -> i32 {
+    if bm != BM_RUNGS[0] || n <= 0 || k <= 0 || n % SPLITK_BN != 0 || !(bits == 4 || bits == 8) {
+        return 1;
+    }
+    let tiles = (n / SPLITK_BN).unsigned_abs() * (padded / bm).max(1).unsigned_abs();
+    if tiles == 0 || tiles >= SPLITK_FILL_TG {
+        return 1;
+    }
+    let mut split = i32::try_from((SPLITK_FILL_TG / tiles).next_power_of_two())
+        .unwrap_or(1)
+        .clamp(1, SPLITK_MAX);
+    let unit = group.max(QMM_BK);
+    while split > 1 && k % (split * unit) != 0 {
+        split /= 2;
+    }
+    split
+}
+
+/// The split-K tile at the plain family's axis, f32 partials — stamped in source at bn 32.
+pub fn splitk_point(op: &'static str, group: i32, bits: i32, bm: i32) -> Result<&'static str, Error> {
+    check(op, &GROUPS, group, "group size")?;
+    check(op, &[4, 8], bits, "split-K bit width")?;
+    check(op, &ROW_TILES, bm, "row tile")?;
+    Ok(symbol(&format!(
+        "affine_qmm_t_splitk_f32_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_{SPLITK_BN}"
+    )))
+}
+
 /// Row groups the vector point may fold at, narrowest first (one weight-block read serves `R` rows).
 /// Every count to eight at pack width 1: with the fold's loops unrolled (`quant_qmv_rows.metal`,
 /// header) a three-row group is 1.10x a one-row fire where three one-row launches are 1.44x.
@@ -475,6 +525,11 @@ pub struct Scratch<'a> {
     /// [`precast_point`] GEMM reads.
     pub precast: &'a dyn Fn(u32, u32) -> Option<Tensor>,
 
+    /// `rows x width` f32 — the split-K partials [`splitk_point`] writes,
+    /// `split` stacked row blocks of them, and [`SPLITK_REDUCE`] sums into
+    /// `y`. `None` declines the split: the tile then fires unsplit, or the
+    /// fold takes the fire where the tile would not fill the machine.
+    pub partials: &'a dyn Fn(u32, u32) -> Option<Tensor>,
 }
 
 /// `y = act x w^T` where `w` is a quantized bank — the quantized twin of [`gemm::matmul`](crate::linear::gemm::matmul).
@@ -579,10 +634,20 @@ pub fn act_x_wt(
             * u64::from((padded / bm).unsigned_abs());
         tiles >= u64::from(crossover.unsigned_abs())
     };
+    // A sparse tile that CAN split fills the machine by splitting: the K
+    // partitions [`splitk`] names, and the partials plane to hold them.
+    let split_plane = |padded: i32, bm: i32| -> Option<(i32, Tensor)> {
+        let split = splitk(n, bm, padded, k, group, bits);
+        if split <= 1 {
+            return None;
+        }
+        let rows = padded.checked_mul(split)?.unsigned_abs();
+        (scratch.partials)(rows, n.unsigned_abs()).map(|plane| (split, plane))
+    };
     if m >= min_batch
         && k % QMM_BK == 0
         && let Some((bm, padded)) = mb_block(m, capacity)
-        && (m > fold_widest || tile_fills(padded, bm))
+        && (m > fold_widest || tile_fills(padded, bm) || split_plane(padded, bm).is_some())
     {
         // Rung 2: the staged input. The cast writes `padded x k` halves,
         // the GEMM reads them at buffer 12 and leaves the bf16 seat null.
@@ -626,7 +691,51 @@ pub fn act_x_wt(
                 &gemm,
             );
         }
-        // Rung 3: the plain stamped point, at the column tile from
+        // Rung 3: the sparse tile split down K — `split` partial products
+        // into the partials plane, then one reduce into `y`. Only the 8 rung
+        // and only where the unsplit tile would leave the machine short of
+        // threadgroups ([`splitk`]).
+        if let Some((split, partials)) = split_plane(padded, bm) {
+            let stride = padded
+                .checked_mul(n)
+                .ok_or_else(|| refuse(op, format!("{padded} x {n} partials will not stack")))?;
+            ctx.fire(
+                Fire::at(QMM_FILE, splitk_point(op, group, bits, bm)?).apply(Grid::of(
+                    qmm_grid(op, n, SPLITK_BN, padded, bm, split)?,
+                    qmm_group(bm),
+                )),
+                &[
+                    w.codes.arg(),
+                    w.scales.arg(),
+                    biases.arg(),
+                    act.arg(),
+                    ctx.absent()?,
+                    k.arg(),
+                    n.arg(),
+                    ctx.absent()?,
+                    partials.arg_mut(),
+                    (k / split).arg(),
+                    stride.arg(),
+                ],
+            )?;
+            let mut reduce = vec![ctx.absent()?; 4];
+            reduce.push(y.arg_mut());
+            reduce.push(ctx.absent()?);
+            reduce.push(n.arg());
+            reduce.push(ctx.absent()?);
+            reduce.push(partials.arg());
+            reduce.push(ctx.absent()?);
+            reduce.push(stride.arg());
+            reduce.push(split.arg());
+            return ctx.fire(
+                Fire::at(QMM_FILE, SPLITK_REDUCE).apply(Grid::of(
+                    [n.unsigned_abs(), m.unsigned_abs(), 1],
+                    [256, 1, 1],
+                )),
+                &reduce,
+            );
+        }
+        // Rung 4: the plain stamped point, at the column tile from
         // `bn_unsplit`.
         if let Some(bn) = bn_unsplit(n, padded / bm, crossover) {
             let point = qmm_point(op, "", QMM_STAMP, group, bits, bm, bn)?;
@@ -646,7 +755,7 @@ pub fn act_x_wt(
             );
         }
     }
-    // Rung 4: the vector point, folded where a group of `R` rows can share
+    // Rung 5: the vector point, folded where a group of `R` rows can share
     // one weight read; at one row there is nothing to fold.
     let rows_max = i32::try_from(tuned.qmv_rows_max).unwrap_or(1);
     let packs = i32::try_from(tuned.qmv_rows_packs).unwrap_or(QMV_PACK_RUNGS[1]);
@@ -719,6 +828,27 @@ mod tests {
         assert!(qmv_rows_point("t", 64, 4, 4, 2).is_ok());
         assert!(qmv_rows_point("t", 64, 4, 2, 4).is_err());
         assert!(qmv_rows_point("t", 48, 4, 2, 1).is_err());
+    }
+
+    #[test]
+    fn the_split_follows_the_tile_count() {
+        // 544 column tiles fill the machine: no split. 160 do not: x4.
+        assert_eq!(splitk(17408, 8, 8, 5120, 64, 4), 1);
+        assert_eq!(splitk(5120, 8, 8, 5120, 64, 4), 4);
+        assert_eq!(splitk(5120, 8, 8, 17408, 64, 4), 4);
+        // 32 tiles ask for sixteen; the cap is eight.
+        assert_eq!(splitk(1024, 8, 8, 5120, 64, 4), 8);
+        // Only the 8 rung, only 4- and 8-bit, only a K the partitions divide.
+        assert_eq!(splitk(1024, 16, 16, 5120, 64, 4), 1);
+        assert_eq!(splitk(1024, 8, 8, 5120, 64, 2), 1);
+        assert_eq!(splitk(1024, 8, 8, 5120, 128, 4), 8); // 5120 % (8*128) == 0
+        assert_eq!(splitk(1024, 8, 8, 576, 64, 4), 1); // nine groups: no even partition
+        assert_eq!(splitk(1000, 8, 8, 5120, 64, 4), 1); // not a whole column tile
+        assert_eq!(
+            splitk_point("t", 64, 4, 8).unwrap(),
+            "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_8_bn_32"
+        );
+        assert!(splitk_point("t", 64, 2, 8).is_err());
     }
 
     #[test]
