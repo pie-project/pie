@@ -20,6 +20,39 @@
 //! kept    |longest prefix where proposal_i == truth_i|
 //! ```
 //!
+//! # Which head, of the three that ship
+//!
+//! `scratchpad/dflash_ref/compare_heads.py` runs each published head against
+//! ITS OWN target, twelve anchors a prompt, and reports the accepted prefix
+//! with the round's index beside it — tokens a round over fires a round, at
+//! this box's width prices (a verify fire is 1.83 one-row fires at eight rows
+//! and 2.82 at sixteen; the draft fire adds 0.27 at sixteen):
+//!
+//! ```text
+//!                     counting      code        recall      prose       json
+//! DFlash   b=16   13.58(4.72)  8.00(2.91)  1.25(0.73)  9.92(3.53)  3.83(1.56)
+//! DFlash2  b= 8    7.00(4.07)  6.92(4.03)  4.00(2.54)  0.83(0.93)  3.42(2.25)
+//! ```
+//!
+//! It is a TIE on the mean index (2.69 against 2.76) with opposite profiles:
+//! the shorter block saturates where prefixes are short and cannot pay where
+//! they are long — prose at 0.93 is a round that loses to plain decode. So
+//! DFlash2's grouped dynamic convolutions and its candidate selector are not
+//! bought by these numbers, and the head already ported stays.
+//!
+//! **A HEAD IS TIED TO THE TARGET IT WAS TRAINED ON**, which is the control
+//! that makes the table above readable: the same DFlash head against the 3.8
+//! checkpoint instead of its own 3.6 reads 3.92 / 5.33 / 2.08 / 0.67 / 1.75 —
+//! counting falls from 13.58 and prose from 9.92. Two checkpoints that a
+//! catalog row cannot tell apart are not interchangeable to a drafter.
+//!
+//! Dspark (`DimInfer/Qwen3.8-27B-Dspark-v1`, block 15, a markov confidence
+//! head) ships no modeling code, only weights and GGUFs, and publishes
+//! 1.69x-2.51x on a 4090D at a mean accepted length of 2.7-4.1. That length
+//! against THIS box's width curve is an index of about 1.4, under both heads
+//! above: its speedup is a property of a GPU where sixteen rows cost two
+//! one-row fires rather than 2.82.
+//!
 //! This measures; it does not go fast. Each round pays one draft pass and
 //! `block` ordinary decodes, and the host is in the loop between them — the
 //! point is the number, not the throughput. A round that turned the same
