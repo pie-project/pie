@@ -1009,17 +1009,67 @@ pub(crate) fn stamp_lane_slots(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
-) -> Result<(), String> {
-    let seats = stores
-        .seats
-        .lock()
-        .unwrap()
-        .seats(ws, req.lanes.len())
-        .map_err(|error| format!("pipeline: seating this fire's lanes: {error}"))?;
+) -> Result<(), crate::store::seat::SeatError> {
+    let seats = stores.seats.lock().unwrap().seats(ws, req.lanes.len())?;
     for (lane, &seat) in req.lanes.iter_mut().zip(&seats) {
         lane.slot = seat;
     }
     Ok(())
+}
+
+/// How long a fire waits for a peer to give seats back before its exhaustion
+/// is a refusal. Admission caps processes, not sequences, so a process that
+/// opens many (a beam, a consensus fan-out) can find the book full while every
+/// seat is legitimately held; the holders finish in decode time, not in
+/// minutes. Past this bound the seats are held by fires that are themselves
+/// waiting, and refusing one is what breaks the cycle.
+const SEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`stamp_lane_slots`], waiting for seats when the book is full. An ask
+/// wider than the whole book is refused at once — no release can seat it.
+/// An ask that fits is parked until a working set releases its seats
+/// (`Stores::seats_freed`), re-asked, and refused only past [`SEAT_WAIT`].
+///
+/// # Errors
+///
+/// The seat book's refusal, with how long the fire waited when it did.
+pub(crate) async fn seat_lane_slots(
+    req: &mut crate::engine::FireRequest,
+    stores: &crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+) -> Result<(), String> {
+    use crate::store::seat::SeatError;
+    let deadline = tokio::time::Instant::now() + SEAT_WAIT;
+    loop {
+        // Registered before the ask, so a release between the ask and the
+        // wait is not missed: `notify_waiters` wakes only futures already
+        // enabled.
+        let mut freed = Box::pin(stores.seats_freed.notified());
+        freed.as_mut().enable();
+        let refusal = match stamp_lane_slots(req, stores, ws) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let fits = match refusal {
+            SeatError::Exhausted { need, capacity, .. } => capacity != 0 && need <= capacity,
+        };
+        if !fits {
+            return Err(format!(
+                "pipeline: seating this fire's lanes: {refusal}; no release can seat it"
+            ));
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "pipeline: seating this fire's lanes: {refusal}; waited {:?} for a peer to \
+                 release seats and none did",
+                SEAT_WAIT
+            ));
+        }
+        // A timeout here is not a refusal: the loop re-asks and settles at
+        // the deadline check above.
+        let _ = tokio::time::timeout(deadline - now, freed).await;
+    }
 }
 
 /// Rewrite each lane's page list from working-set-relative indexes to pool
@@ -1464,7 +1514,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
         let ws = ctx.resources().get(&ws_res)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.engine);
-        if let Err(refusal) = stamp_lane_slots(&mut req, &stores, ws.id) {
+        if let Err(refusal) = seat_lane_slots(&mut req, &stores, ws.id).await {
             return Ok(Err(refusal));
         }
         let (readable_pages, writable_pages) =
@@ -2892,7 +2942,7 @@ async fn fire_device_geometry<C: FireContext>(
     stamp_lane_words(&mut req, fire_wide_mask, false);
     // A device-geometry fire resolves its row split on the device but its
     // seats here: a seat is which sequence each row group is.
-    if let Err(refusal) = stamp_lane_slots(&mut req, &stores, ws.id) {
+    if let Err(refusal) = seat_lane_slots(&mut req, &stores, ws.id).await {
         reclaim_pending_device_grant(ctx, &fwd);
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));

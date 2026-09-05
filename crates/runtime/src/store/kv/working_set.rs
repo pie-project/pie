@@ -78,6 +78,7 @@ impl KvLifecycle {
         // page it carries no bytes an in-flight fire could read, so it needs
         // no epoch delay.
         stores.seats.lock().unwrap().release(self.id);
+        stores.seats_freed.notify_waiters();
         // Freed pool space may unblock a parked ask.
         if let Some(planner) = crate::planner::planner() {
             planner.pages_freed();

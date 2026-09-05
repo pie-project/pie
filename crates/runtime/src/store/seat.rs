@@ -14,16 +14,23 @@ pub enum SeatError {
         need: u32,
         /// Seats the pools have left.
         have: u32,
+        /// Seats the pools hold in all. An ask that needs more than this
+        /// can never be seated; one that needs fewer is waiting on a peer.
+        capacity: u32,
     },
 }
 
 impl std::fmt::Display for SeatError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SeatError::Exhausted { need, have } => write!(
+            SeatError::Exhausted {
+                need,
+                have,
+                capacity,
+            } => write!(
                 formatter,
                 "this fire seats {need} more sequence(s) than the pools have room for \
-                 ({have} slot(s) free of the deployment's `Budgets::slots`)"
+                 ({have} slot(s) free of the deployment's {capacity} `Budgets::slots`)"
             ),
         }
     }
@@ -78,7 +85,11 @@ impl SeatBook {
                 let unissued = self.capacity.saturating_sub(self.next);
                 let room = free.saturating_add(unissued);
                 if need > room {
-                    return Err(SeatError::Exhausted { need, have: room });
+                    return Err(SeatError::Exhausted {
+                        need,
+                        have: room,
+                        capacity: self.capacity,
+                    });
                 }
             }
             let mut fresh = Vec::with_capacity(need as usize);
@@ -145,7 +156,14 @@ mod tests {
         let mut book = SeatBook::new(2);
         book.seats(a, 1).expect("the first seat");
         let refusal = book.seats(b, 3).expect_err("three seats, one left");
-        assert_eq!(refusal, SeatError::Exhausted { need: 3, have: 1 });
+        assert_eq!(
+            refusal,
+            SeatError::Exhausted {
+                need: 3,
+                have: 1,
+                capacity: 2
+            }
+        );
         assert_eq!(
             book.available(),
             Some(1),

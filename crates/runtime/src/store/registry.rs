@@ -51,6 +51,9 @@ pub struct Stores {
     pub rs: Arc<Mutex<RsStore>>,
     /// Which pool slot each working set's sequences sit in — the seat `Lane::slot` states to the shell. Sized by the same `num_slots` as `RsStore`: both are "how many sequences the pools seat at once".
     pub seats: Arc<Mutex<SeatBook>>,
+    /// Woken when a working set gives its seats back, so a fire parked on a
+    /// full seat book re-asks instead of failing (`fire::seat_lane_slots`).
+    pub seats_freed: Arc<tokio::sync::Notify>,
     /// Tokens per KV page for this model/engine.
     pub kv_page_size: u32,
     /// The most KV pages one sequence may hold — `max_context` rounded up
@@ -105,6 +108,7 @@ pub fn register_model_with_swap(
                 kv,
                 rs: Arc::new(Mutex::new(RsStore::new(slots))),
                 seats: Arc::new(Mutex::new(SeatBook::new(slots))),
+                seats_freed: Arc::new(tokio::sync::Notify::new()),
                 kv_page_size,
                 context_pages: context_pages(max_context, kv_page_size),
             })
@@ -151,6 +155,7 @@ pub fn register_engine_with_swap(
         kv,
         rs: Arc::new(Mutex::new(RsStore::new(num_slots as u32))),
         seats: Arc::new(Mutex::new(SeatBook::new(num_slots as u32))),
+        seats_freed: Arc::new(tokio::sync::Notify::new()),
         kv_page_size,
         context_pages: context_pages(max_context, kv_page_size),
     });
