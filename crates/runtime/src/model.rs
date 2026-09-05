@@ -134,6 +134,13 @@ pub const ROWS: &[Row] = &[
         vocab: 262_144,
         arch: "gemma4",
     },
+    // And with z-lab's DFlash block drafter overlaid.
+    Row {
+        id: "gemma4-26b-a4b-dflash-u4g64-kv-bf16",
+        layers: 30,
+        vocab: 262_144,
+        arch: "gemma4",
+    },
     // Same trunk as its already-listed twin; neither quant nor the vision
     // tower moves layers, vocab or arch.
     Row {
@@ -230,6 +237,13 @@ pub const ROWS: &[Row] = &[
         vocab: 201_088,
         arch: "gptoss",
     },
+    // And with z-lab's DFlash block drafter overlaid.
+    Row {
+        id: "gptoss-20b-dflash-u4g64-mxfp4-kv-bf16",
+        layers: 24,
+        vocab: 201_088,
+        arch: "gptoss",
+    },
     Row {
         id: "gptoss-120b-bf16-mxfp4-kv-bf16",
         layers: 36,
@@ -277,8 +291,29 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
+    // The same trunk with a DFlash BLOCK drafter overlaid by `--aux`; the
+    // drafter's own five layers are not the trunk's and are not counted.
+    Row {
+        id: "qwen36-27b-dflash-u4g64-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
     Row {
         id: "qwen36-27b-u4g64-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    // The same trunk with the DFlash2 block drafter overlaid by `--aux`.
+    Row {
+        id: "qwen38-27b-dflash2-u4g64-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen38-27b-dspark-u4g64-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
@@ -299,6 +334,13 @@ pub const ROWS: &[Row] = &[
     // vocab_size: 248320) — the qwen35-a3b geometry.
     Row {
         id: "qwen36-35b-a3b-mtp-u4g64-kv-bf16",
+        layers: 40,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    // The same mixture with z-lab's DFlash block drafter overlaid.
+    Row {
+        id: "qwen36-35b-a3b-dflash-u4g64-kv-bf16",
         layers: 40,
         vocab: 248_320,
         arch: "qwen3_5",
@@ -684,6 +726,13 @@ pub struct EtaCaps {
     pub has_mtp_logits: bool,
     /// The draft head's chain depth; zero without one (`mtp-depth`).
     pub mtp_depth: u32,
+    /// The block drafter's facts (`block-drafter`): rows a draft pass
+    /// carries (zero without one), the mask id, whether the block is
+    /// bidirectional.
+    pub draft_block: u32,
+    pub draft_mask_token: u32,
+    pub draft_bidirectional: bool,
+    pub draft_proposals_from: u32,
     pub has_value_head: bool,
     /// Backend can execute the `envelope_dot` second-party kernel (Quest).
     pub has_kv_envelopes: bool,
@@ -795,11 +844,12 @@ impl Model {
 
     /// The fact word a lane carries: `query_len` rows, custom mask,
     /// adapter routing, draft head, attention mass capture, media spans,
-    /// denoise reading. The engine turns this word into a class, and the
-    /// class into the row window every guarded node runs over. This calls
-    /// the family's `Classify::of(..).word()` through the catalog pointer
-    /// and never reads a bit itself; all seven facts are stamped from one
-    /// reading of the lane at one instant.
+    /// whether the rows are a block drafter's proposal rather than the
+    /// sequence's own, and the denoise reading. The engine turns this word
+    /// into a class, and the class into the row window every guarded node
+    /// runs over. This calls the family's `Classify::of(..).word()` through
+    /// the catalog pointer and never reads a bit itself; all eight facts are
+    /// stamped from one reading of the lane at one instant.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn word(
@@ -810,6 +860,7 @@ impl Model {
         drafts: bool,
         captures_scores: bool,
         media: bool,
+        block_draft: bool,
         denoise: bool,
     ) -> u64 {
         (self.classify)(
@@ -818,6 +869,7 @@ impl Model {
                 .drafting(drafts)
                 .capturing_scores(captures_scores)
                 .with_media(media)
+                .drafting_a_block(block_draft)
                 .denoising(denoise),
         )
     }

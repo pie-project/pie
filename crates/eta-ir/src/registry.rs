@@ -405,6 +405,21 @@ pub struct ModelProfile {
     /// row. Zero for a model with no draft head (the intrinsic is then
     /// unavailable).
     pub mtp_depth: u32,
+    /// The block drafter the loaded text carries, as the three facts a guest
+    /// needs to seed its block: rows a draft pass carries (zero for a text
+    /// with no block drafter), the id every row but the first carries in, and
+    /// whether the block sees itself (so the guest must state a mask). Facts
+    /// the head was trained at, not policy — which rows to verify stays the
+    /// guest's.
+    pub draft_block: u32,
+    /// The id every draft-block row but the first carries in; meaningless
+    /// when `draft_block` is zero.
+    pub draft_mask_token: u32,
+    /// Whether the draft block sees itself, so a guest must state a mask.
+    pub draft_bidirectional: bool,
+    /// The first draft-block row whose readout is a proposal (1: the anchor
+    /// row proposes nothing; 0: every row proposes).
+    pub draft_proposals_from: u32,
     /// A scalar value-head intrinsic is available.
     pub has_value_head: bool,
     /// `[layers * heads, kv_max]` F32 per-key attention mass
@@ -449,6 +464,10 @@ impl ModelProfile {
             activation: Dtype::F32,
             has_mtp_logits: true,
             mtp_depth: 1,
+            draft_block: 0,
+            draft_mask_token: 0,
+            draft_bidirectional: false,
+            draft_proposals_from: 1,
             has_value_head: true,
             has_attn_score: true,
             has_attn_page_mask: true,

@@ -1,3 +1,4 @@
+use crate::drafter::dflash::{self, DFlash};
 use model_dsl::{Dtype, Weight};
 
 
@@ -34,7 +35,29 @@ pub struct Model {
     /// the checkpoint's own `mtp.*` head from an EAGLE overlay imported from
     /// a second checkpoint; both share this same declaration.
     pub mtp: Option<Mtp>,
+
+    /// The block drafter, when this SKU's recipe is [`Recipe::DFlash`] or
+    /// [`Recipe::DFlash2`] — declared in [`crate::drafter::dflash`], since it
+    /// brings its own architecture and nothing of this trunk's.
+    /// Exclusive with [`mtp`](Model::mtp): a plan carries one draft head or
+    /// none, and the two shapes share no declaration.
+    pub dflash: Option<DFlash>,
 }
+
+/// Passes of the draft head a fire chains — the `mtp_drafts` seam's width and
+/// the most a guest may ask for as `k`. The checkpoint ships one prediction
+/// layer trained for one step; a second pass is that layer fed its own argmax
+/// and residual (as the qwen4 head chains its two).
+///
+/// Measured at 2 on Qwen3.8-27B-4bit (M4 Pro, 2026-09-04, decode-only, with
+/// a three-row fire at 1.17x a one-row fire): the second step lands ~0.60 of
+/// its drafts on math and ~0.23 on prose against a break-even near 0.30, so
+/// k=2 is +18% on math (24.9 -> 29.2 tok/s) and -4% on prose (18.9 -> 18.2);
+/// and every pass costs the fire ~4 ms on the device (mostly the 389 MB
+/// `lm_head` readout), which a k=1 round pays for a draft it never reads —
+/// about -5%. A static depth is the wrong knob for a workload-shaped gain;
+/// one, until the window is chosen per request off realized acceptance.
+pub const DRAFT_DEPTH: u32 = 1;
 
 /// One MTP (multi-token-prediction / NEXTN) head: fuses a hidden state with
 /// the next token's embedding, runs one transformer block over the fused
@@ -99,6 +122,22 @@ pub enum Recipe {
     /// `pie model import --aux` under an `aux.` prefix (can't collide with
     /// base checkpoint names). No pre-fusion norms, no final norm.
     Eagle,
+    /// A DFlash block drafter, also `--aux`-imported under `aux.`: five
+    /// decoder layers of its OWN geometry fed by a fusion of five tapped
+    /// trunk hidden states, run bidirectionally over a masked block so one
+    /// pass proposes [`DFlash::block`] tokens. Declared as [`DFlash`], not
+    /// [`Mtp`] — it shares neither the fusion shape nor the attention shape.
+    DFlash,
+    /// DFlash2 (`z-lab/Qwen3.8-27B-DFlash2`): the same fusion and the same
+    /// five blocks, at a block of eight, every layer sliding and causal
+    /// inside the block, with a two-tap dynamic convolution around each
+    /// sublayer ([`DynConv`]). The candidate selector the head also ships is
+    /// not declared yet — the readout is the per-slot argmax, as v1's.
+    DFlash2,
+    /// DSpark (`DimInfer/Qwen3.8-27B-Dspark-v1`): the v1 backbone, all
+    /// layers full, a block of fifteen whose every row proposes, a markov
+    /// bigram readout. See [`crate::drafter::dflash::QWEN38_27B_DSPARK`].
+    DSpark,
 }
 
 impl Recipe {
@@ -107,8 +146,15 @@ impl Recipe {
     pub fn prefix(self) -> &'static str {
         match self {
             Recipe::Mtp => "mtp",
-            Recipe::Eagle => "aux",
+            Recipe::Eagle | Recipe::DFlash | Recipe::DFlash2 | Recipe::DSpark => "aux",
         }
+    }
+
+    /// Whether this recipe is a block drafter ([`DFlash`]) rather than a
+    /// chained head ([`Mtp`]).
+    #[must_use]
+    pub fn drafts_a_block(self) -> bool {
+        matches!(self, Recipe::DFlash | Recipe::DFlash2 | Recipe::DSpark)
     }
 }
 
@@ -379,6 +425,9 @@ struct Dims {
     /// layer count: every shipped draft head (either recipe) is exactly one
     /// decoder layer.
     draft: Option<Recipe>,
+    /// The published block drafter a block-drafting recipe reads — its own
+    /// numbers, one descriptor a checkpoint (`drafter::dflash`).
+    dflash_head: Option<&'static dflash::Head>,
 }
 
 impl Model {
@@ -391,6 +440,15 @@ impl Model {
     pub fn a3b_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a3b_dims();
         d.draft = Some(Recipe::Mtp);
+        Model::new(w, kv, tp, d)
+    }
+
+    /// The A3B with z-lab's block drafter (`Qwen3.6-35B-A3B-DFlash`)
+    /// overlaid: the same four hooks the 27B spells, a second mixture.
+    pub fn a3b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::a3b_dims();
+        d.draft = Some(Recipe::DFlash);
+        d.dflash_head = Some(&dflash::QWEN36_35B_A3B_DFLASH);
         Model::new(w, kv, tp, d)
     }
 
@@ -422,6 +480,7 @@ impl Model {
             norm_eps: 1e-6,
             tower: None,
             draft: None,
+            dflash_head: None,
         }
     }
 
@@ -490,6 +549,7 @@ impl Model {
                 norm_eps: 1e-6,
                 tower: None,
                 draft: None,
+                dflash_head: None,
             },
         )
     }
@@ -552,6 +612,7 @@ impl Model {
             norm_eps: 1e-6,
             tower,
             draft,
+            dflash_head: None,
         }
     }
 
@@ -580,6 +641,7 @@ impl Model {
                 norm_eps: 1e-6,
                 tower: None,
                 draft: None,
+                dflash_head: None,
             },
         )
     }
@@ -592,6 +654,27 @@ impl Model {
     /// 27-block tower and interleaved mrope, neither declared here.
     pub fn d27b(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::Mtp)))
+    }
+
+    /// The 27B with a DFlash block drafter overlaid by `--aux`
+    /// (`z-lab/Qwen3.6-27B-DFlash`, the drafter alone: `fc.*`, `layers.0..4.*`,
+    /// `hidden_norm`, `norm` at its root). The trunk is `d27b_undrafted`'s —
+    /// the drafter brings its own layers rather than sharing one.
+    pub fn d27b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DFlash)))
+    }
+
+    /// The 27B with the DFlash2 drafter overlaid by `--aux`
+    /// (`z-lab/Qwen3.8-27B-DFlash2`): the same trunk, [`Recipe::DFlash2`]'s
+    /// head. The Qwen3.8-27B trunk reads with `d27b`'s dims.
+    pub fn d27b_dflash2(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DFlash2)))
+    }
+
+    /// The 27B with the DSpark drafter overlaid by `--aux`
+    /// (`DimInfer/Qwen3.8-27B-Dspark-v1`).
+    pub fn d27b_dspark(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DSpark)))
     }
 
     /// Same 64 layers without the draft head. Used for 4-bit conversions:
@@ -644,6 +727,14 @@ impl Model {
             norm_eps: 1e-6,
             tower,
             draft,
+            // The 27B heads: which one is the recipe's, since three are
+            // published for this trunk.
+            dflash_head: draft.and_then(|r| match r {
+                Recipe::DFlash => Some(&dflash::QWEN36_27B_DFLASH),
+                Recipe::DFlash2 => Some(&dflash::QWEN38_27B_DFLASH2),
+                Recipe::DSpark => Some(&dflash::QWEN38_27B_DSPARK),
+                Recipe::Mtp | Recipe::Eagle => None,
+            }),
         }
     }
 
@@ -857,7 +948,7 @@ impl Model {
         // kv row stays `kv.mtp` under either recipe — a fact about this
         // plan's page-id space, not about which checkpoint the bytes came
         // from.
-        let mtp = d.draft.map(|recipe| {
+        let mtp = d.draft.filter(|r| !r.drafts_a_block()).map(|recipe| {
             let inter = match &d.mlp {
                 MlpDims::Dense { inter } => *inter,
                 MlpDims::Routed(m) => m.inter,
@@ -887,6 +978,24 @@ impl Model {
             }
         });
 
+        // The block drafter's geometry is its OWN (`drafter::dflash`), so it
+        // reads nothing off `Dims` but the trunk's widths and element types.
+        let dflash = d.draft.filter(|r| r.drafts_a_block()).map(|recipe| {
+            let head = d.dflash_head.expect("a block-drafting recipe names its published head");
+            DFlash::declare(
+                head,
+                recipe.prefix(),
+                &dflash::Trunk {
+                    hidden,
+                    vocab: d.vocab as u64,
+                    norm_eps: d.norm_eps,
+                    weights: w,
+                    dense,
+                    tp,
+                },
+            )
+        });
+
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
@@ -907,6 +1016,7 @@ impl Model {
             final_norm_eps: d.norm_eps,
             tower,
             mtp,
+            dflash,
         }
     }
 }

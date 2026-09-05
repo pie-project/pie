@@ -371,6 +371,15 @@ impl Model {
             }
         }
 
+        // The block drafter, `--aux`-imported (it is published on its own);
+        // its planes and their spelling are the drafter's (`drafter::dflash`).
+        // Its norms are a Qwen3-style stack's, not gemma's `1 + w`, and the
+        // drafter's text reads them through the `+1` op, so the stored weight
+        // is read down by one — the fold the qwen families measured.
+        if let Some(dflash) = &self.dflash {
+            dflash.bind_aux(&mut b, src, &|from| Expr::src(from).bias(-1.0))?;
+        }
+
         Ok(b.build())
     }
 

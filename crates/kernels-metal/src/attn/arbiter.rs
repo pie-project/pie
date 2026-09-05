@@ -101,7 +101,7 @@ fn mma(
     o: Tensor,
     lse: Option<Tensor>,
 ) -> Result<(), Error> {
-    let shape = Paged::of(op, q, pool, window, head_dim)?;
+    let shape = Paged::of(op, q, pool, window, true, head_dim)?;
     let lanes = shape.q_heads.checked_mul(MMA_THREADS).ok_or_else(|| {
         refuse(
             op,
@@ -158,6 +158,7 @@ fn arbitrate(
     plan: &PrefillPlan,
     mask: Tensor,
     window: Option<u32>,
+    causal: bool,
     head_dim: u32,
     sm_scale: f32,
     o: Tensor,
@@ -173,19 +174,25 @@ fn arbitrate(
             pool,
             &as_decode(plan, mask),
             window,
+            causal,
             head_dim,
             sm_scale,
             o,
             lse,
         );
     }
-    if should_mma(head_dim, lse.is_some(), tuning) {
+    // **A NON-CAUSAL READ DOES NOT TAKE THE MMA POINT.** Widening past the
+    // row's own position is spelled in `attn/sdpa_paged.metal`, which both
+    // arms below reach; the mma point walks its keys under a bound of its
+    // own and would silently stay causal. Sending a stated non-causal read
+    // to the point that honours it is the arbitration, not a refusal.
+    if causal && should_mma(head_dim, lse.is_some(), tuning) {
         return mma(
             ctx, op, q, pool, plan, mask, window, head_dim, sm_scale, o, lse,
         );
     }
     tiled(
-        ctx, op, q, pool, plan, mask, window, head_dim, sm_scale, o, lse,
+        ctx, op, q, pool, plan, mask, window, causal, head_dim, sm_scale, o, lse,
     )
 }
 
@@ -208,7 +215,7 @@ pub fn prefill(
     const OP: &str = "attention.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     arbitrate(
-        ctx, OP, q.data, pool, plan, plan.mask, window, head_dim, sm_scale, o, None, requests,
+        ctx, OP, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, None, requests,
         tuning,
     )
 }
@@ -241,6 +248,7 @@ pub fn prefill_lse(
         plan,
         plan.mask,
         window,
+        true,
         head_dim,
         sm_scale,
         o,
@@ -260,6 +268,7 @@ pub fn masked(
     mask: Tensor,
     pool: &KvPool,
     window: Option<u32>,
+    causal: bool,
     head_dim: u32,
     sm_scale: f32,
     o: Tensor,
@@ -277,7 +286,7 @@ pub fn masked(
         ));
     }
     arbitrate(
-        ctx, OP, q.data, pool, plan, mask, window, head_dim, sm_scale, o, None, requests, tuning,
+        ctx, OP, q.data, pool, plan, mask, window, causal, head_dim, sm_scale, o, None, requests, tuning,
     )
 }
 

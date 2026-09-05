@@ -446,28 +446,8 @@ fn patch_fold(trace: &Trace) -> u32 {
 /// must move a lane into the same word or a control plane's submission would
 /// mean two different things on two backends.
 fn adapter_fact(classes: &model_ir::ClassTable, corrected: &model_ir::ClassSet) -> Option<u32> {
-    if corrected.is_empty() {
-        return None;
-    }
-    let mut found = None;
-    for bit in 0..u64::BITS {
-        if classes.mask & (1u64 << bit) == 0 {
-            continue;
-        }
-        let decides = classes.classes.iter().enumerate().all(|(at, class)| {
-            let runs = corrected.contains(at);
-            class.words.iter().all(|word| ((word >> bit) & 1 == 1) == runs)
-        });
-        if decides {
-            if found.is_some() {
-                // Two facts that no class tells apart. Answering either would
-                // be answering by coin toss, so this answers neither.
-                return None;
-            }
-            found = Some(bit);
-        }
-    }
-    found
+    // One derivation for every shell: `model_ir::ClassTable::adapter_fact`.
+    classes.adapter_fact(corrected)
 }
 
 fn place_routes(
@@ -1071,6 +1051,18 @@ impl Shell {
     /// residency, [`Fault::Unbound`] for a plan naming a seat this shell does
     /// not bind.
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        // **THE PEEPHOLES RUN HERE, ON THE TRACE THE SHELL KEEPS.** Every
+        // node index this shell holds (`gather`, `experts`, the readout map)
+        // is taken off `boot.trace` below, and the compile is too, so fusing
+        // first keeps them one numbering; a value's id survives fusion, and
+        // values are all the runtime ever names across the boundary. A
+        // pre-norm block's residual fold and the norm that reads it become
+        // one launch (`residual_add_rms_single_row`): 128 fewer a token on a
+        // 64-layer trunk, at the two launches' bits.
+        let boot = Boot {
+            trace: model_ir::fuse::residual_norm(boot.trace),
+            ..boot
+        };
         let device = Context::bind()?;
         let keepalive = if crate::keepalive::KeepAlive::wanted() {
             Some(crate::keepalive::KeepAlive::start(&device)?)
@@ -1720,6 +1712,39 @@ impl Shell {
         Ok(())
     }
 
+    /// Copy whole recurrent slots between seats of this load's pools —
+    /// the device half of a recurrent fork — enqueued and not synchronized.
+    /// `moves` is `(src, dst)` seat pairs in this shell's own slot numbers.
+    ///
+    /// Everything [`Shell::copy_kv`] says about ordering holds here without
+    /// change: the blit goes into its own command buffer on the fire queue,
+    /// behind every step already committed (the fires that folded the source
+    /// seat) and ahead of every step committed after this returns (the first
+    /// fire that reads the destination). It takes no arm, and its receipt
+    /// lands in `grafted` so [`Shell::drain`] — which the fire path runs
+    /// before a host-side `Pools::clear`, and `state_bytes` runs before a
+    /// readback — waits for it.
+    ///
+    /// An attention-only plan has no banks and answers `Ok` with nothing on
+    /// the queue.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`] for a seat past the pool, [`Fault::Device`] when
+    /// the queue or the blit pass would not open, [`Fault::Deviceless`] off
+    /// Apple.
+    pub fn copy_state(&mut self, moves: &[(u32, u32)]) -> Result<()> {
+        if moves.is_empty() || !self.pools.has_state() {
+            return Ok(());
+        }
+        // As in `copy_kv`: a frame dropped before `commit_async` puts nothing
+        // on the device, so a plan the pools refuse leaves the queue as it was.
+        let mut frame = self.device.frame()?;
+        self.pools.copy_state(&mut frame, moves)?;
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
+    }
+
     /// How many kv tokens a slot holds.
     #[must_use]
     pub fn held(&self, slot: u32) -> u32 {
@@ -2357,13 +2382,9 @@ impl Shell {
     /// wrong answer this axis must never give.
     #[must_use]
     pub fn adapted_word(&self, word: u64) -> Option<u64> {
+        // One rule for every shell: `model_ir::ClassTable::adapted_word`.
         let bit = self.adapter_fact?;
-        let adapted = word | (1u64 << bit);
-        let class = self
-            .compiled
-            .classes
-            .class_of(adapted & self.compiled.classes.mask)?;
-        self.corrected.contains(class).then_some(adapted)
+        self.compiled.classes.adapted_word(&self.corrected, bit, word)
     }
 
     /// **Does this load hold its whole weight table on the device?**
@@ -2730,7 +2751,9 @@ impl Shell {
         let Some(flight) = self.inflight.pop_front() else {
             return Ok(());
         };
-        if let Err(fault) = flight.pending.wait() {
+        let waited = flight.pending.wait();
+        fire_trace(|| format!("device-done seq={} rows={}", flight.seq, flight.lanes));
+        if let Err(fault) = waited {
             // The seat goes back even on a refusal: the device is done with
             // it either way, and a seat held by a step that faulted would
             // shrink the run-ahead for the rest of the load.
@@ -2782,6 +2805,7 @@ impl Shell {
                     .collect()
             })
             .collect();
+        fire_trace(|| format!("readout-done seq={} rows={}", flight.seq, flight.lanes));
         self.arms.give(flight.arm);
         self.landed.insert(flight.seq, rows);
         while self.landed.len() > SETTLED_RING {
@@ -4139,7 +4163,13 @@ impl Shell {
                 // nowhere for a correction to run, whatever the word says.
                 return Err(Fault::Adapterless { lane: row.source });
             }
-            if seated.adapter.is_some() != runs_correction {
+            // A block drafter's draft fire carries an adapted lane's id and no
+            // trunk row: the correction cannot reach its class, so nothing is
+            // owed and nothing is refused (`ClassTable::correction_reaches`).
+            let unreachable = seated.adapter.is_some()
+                && !runs_correction
+                && !self.compiled.classes.correction_reaches(&self.corrected, lane.word);
+            if seated.adapter.is_some() != runs_correction && !unreachable {
                 return Err(Fault::AdapterWord {
                     lane: row.source,
                     word: lane.word,
@@ -5416,6 +5446,25 @@ pub struct Landed {
 
 /// One committed step the host has not caught up with, as the in-flight ring
 /// holds it.
+/// `PIE_FIRE_TRACE=1`: one line per fire at enqueue, at device completion
+/// and after the readout, with a monotonic microsecond clock — so a served
+/// run's host time between fires can be read off a log rather than inferred
+/// from tok/s. Prefixed `[fire ` because `benches/pie_bench.py` surfaces
+/// exactly that prefix from the server's stdout.
+fn fire_trace(line: impl FnOnce() -> String) {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static ON: OnceLock<bool> = OnceLock::new();
+    static BEGAN: OnceLock<Instant> = OnceLock::new();
+    if !*ON.get_or_init(|| {
+        std::env::var_os("PIE_FIRE_TRACE").is_some_and(|v| v != "0")
+    }) {
+        return;
+    }
+    let began = BEGAN.get_or_init(Instant::now);
+    println!("[fire t_us={} {}]", began.elapsed().as_micros(), line());
+}
+
 struct Flight {
     seq: u64,
     arm: usize,
@@ -5772,6 +5821,7 @@ impl engine::frame::Shell for Shell {
             step: _,
         } = enqueued;
         self.arms.take(arm);
+        fire_trace(|| format!("enqueue seq={seq} rows={lanes}"));
         self.inflight.push_back(Flight {
             seq,
             arm,

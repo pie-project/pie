@@ -25,6 +25,16 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(model::model().eta_caps().mtp_depth)
     }
 
+    async fn draft_block(&mut self) -> Result<Option<pie::inferlet::model::BlockDrafter>> {
+        let caps = model::model().eta_caps();
+        Ok((caps.draft_block > 0).then(|| pie::inferlet::model::BlockDrafter {
+            rows: caps.draft_block,
+            mask_token: caps.draft_mask_token,
+            bidirectional: caps.draft_bidirectional,
+            proposals_from: caps.draft_proposals_from,
+        }))
+    }
+
     /// Which forward-pass interface the bound model requires, keyed on state
     /// semantics: recurrent state is present iff the engine handshake
     /// reports a non-zero folded-state size; paged KV is present iff the
@@ -85,6 +95,11 @@ impl pie::inferlet::model::Host for ProcessCtx {
     /// `scheduler::channel_capacity`.
     async fn channel_capacity(&mut self) -> Result<u32> {
         Ok(crate::scheduler::channel_capacity() as u32)
+    }
+
+    /// The run-ahead window in fires; see `scheduler::run_ahead_window`.
+    async fn run_ahead_window(&mut self) -> Result<u32> {
+        Ok(crate::scheduler::run_ahead_window() as u32)
     }
 
     /// Max embed tokens in a single pass (C) — the guest-side prefill chunk

@@ -5,7 +5,7 @@
 //! before Gumbel-max sampling.
 
 use inferlet::chat;
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use serde::Deserialize;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -74,6 +74,22 @@ async fn main(input: Input) -> Result<String> {
 
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
+    // One recurrent working set for this one sequence on a hybrid model (the
+    // engine requires one per request row); none on a pure-attention one. It
+    // is bound to every pass of the sequence — the prefill and the decode.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "this program has no recurrent-only path (no registered model reports that kind)"
+                    .into(),
+            );
+        }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
+    };
     let page_size = kv_page_size();
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
@@ -103,17 +119,24 @@ async fn main(input: Input) -> Result<String> {
     prefill.embed(&prompt_tokens, &prefill_indptr)?;
     let prefill_kv_len = Channel::from([n]).named("prefill_kv_len");
     prefill.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &prefill_kv_len,
-            pages: &prefill_pages,
-            page_indptr: &prefill_page_indptr,
-            w_slot: &prefill_w_slot,
-            w_off: &prefill_w_off,
-            positions: &prefill_positions,
-            mask: None,
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &prefill_kv_len,
+                pages: &prefill_pages,
+                page_indptr: &prefill_page_indptr,
+                w_slot: &prefill_w_slot,
+                w_off: &prefill_w_off,
+                positions: &prefill_positions,
+                mask: None,
+            },
+        }),
+        &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     prefill.epilogue(move || {
@@ -157,17 +180,24 @@ async fn main(input: Input) -> Result<String> {
         decode.embed(&token_in, &embed_indptr)?;
         let kv_len = Channel::from([n + 1]).named("kv_len");
         decode.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / page_size)..,
-                kv_len: &kv_len,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: (n / page_size)..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
             },
         )?;
         decode.epilogue(move || {

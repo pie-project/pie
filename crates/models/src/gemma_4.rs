@@ -14,6 +14,16 @@ pub fn skus() -> Vec<crate::Sku> {
         // Before the plain mixture: the head is extra tensors a plain row
         // would ignore, so the row that needs them must be asked first.
         (
+            "gemma4-26b-a4b-dflash",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::gemma4,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::a4b_dflash(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
             "gemma4-26b-a4b-mtp",
             1,
             [Dtype::U4g64],

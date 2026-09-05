@@ -29,10 +29,9 @@
 //! channel rings belong to the INSTANCE and not to the channel — see the input
 //! field.
 
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use inferlet::{chat, session};
 use serde::{Deserialize, Serialize};
-use std::ops::RangeBounds;
 
 #[derive(Deserialize)]
 struct Input {
@@ -223,402 +222,365 @@ struct RunResult {
     hook_fold_final: Option<u32>,
 }
 
-/// `run_one`, generated once per forward-pass kind.
+/// `run_one`, once, over both forward-pass kinds.
 ///
-/// `pie:inferlet` now exposes three forward interfaces, so `ForwardPass` is
-/// three unrelated types and this benchmark -- which drives BOTH a
-/// pure-attention model and a hybrid GDN model -- can no longer be one
-/// function. The runtime `pass_kind()` branch that used to decide whether to
-/// bind recurrent state has moved UP to a `model::pass_kind()` branch over two
-/// monomorphisations. The body is written once here and expanded twice, so the
-/// two versions cannot drift.
-/// The state binding this benchmark needs, over the two forward interfaces it
-/// runs on. `pie:inferlet` gives them separate `attention` signatures so that
-/// an attention-only algorithm cannot name a folded recurrent state; saying
-/// what the two have IN COMMON for THIS algorithm is the guest's job.
-trait BindState {
-    fn bind_state<R, W>(
-        &self,
-        ws: &WorkingSet,
-        geom: KvGeometry<'_, R, W>,
-        rs: &[RsWorkingSet],
-    ) -> ::std::result::Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>;
-}
-
-impl BindState for inferlet::eta::attention::ForwardPass {
-    fn bind_state<R, W>(
-        &self,
-        ws: &WorkingSet,
-        geom: KvGeometry<'_, R, W>,
-        rs: &[RsWorkingSet],
-    ) -> ::std::result::Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>,
-    {
-        // A pure-attention model has no recurrent state, and the type system
-        // now proves this set can only be empty.
-        debug_assert!(rs.is_empty());
-        self.attention(ws, geom)
+/// This benchmark drives BOTH a pure-attention model and a hybrid GDN model,
+/// and it is ONE function. Every pass is built through the hybrid interface
+/// (`pie:inferlet/forward-hybrid`), whose `attention` takes the recurrent
+/// working sets as a VALUE rather than as a type: a pure-attention model binds
+/// an EMPTY recurrent binding, which the host accepts on a model that folds
+/// nothing and refuses on one that folds. So `model::pass_kind()` decides only
+/// what goes into `rs_ws` below, and nothing about the shape of the code --
+/// there is no per-kind monomorphisation left to drift.
+async fn run_one(
+    input: &Input,
+    prompt: &str,
+    prompt_tokens: Option<&[u32]>,
+    stop_tokens: &[u32],
+    honor_wait_for_start: bool,
+    rng_seed: u32,
+    main_pre_us: Option<u64>,
+) -> Result<RunResult> {
+    let mut prologue_us: Vec<u64> = Vec::new();
+    if input.report_timing {
+        prologue_us.push(main_pre_us.unwrap_or(0)); // [0] main_pre
     }
-}
+    let mut step_clock = std::time::Instant::now();
+    let mut step = |v: &mut Vec<u64>, on: bool| {
+        if on {
+            v.push(step_clock.elapsed().as_micros() as u64);
+        }
+        step_clock = std::time::Instant::now();
+    };
+    // Prompt: explicit pre-tokenized tokens (the batch path) or chat-template
+    // system+user+cue.
+    let prompt_vec: Vec<u32> = if let Some(tokens) = prompt_tokens {
+        tokens.to_vec()
+    } else {
+        let mut p = chat::system_user(&input.system, prompt);
+        p.extend(chat::cue());
+        p
+    };
+    step(&mut prologue_us, input.report_timing); // [1] tokenize
+    let num_prompt_tokens = prompt_vec.len();
+    if prompt_vec.is_empty() {
+        return Err("empty prompt".into());
+    }
 
-impl BindState for inferlet::eta::hybrid::ForwardPass {
-    fn bind_state<R, W>(
-        &self,
-        ws: &WorkingSet,
-        geom: KvGeometry<'_, R, W>,
-        rs: &[RsWorkingSet],
-    ) -> ::std::result::Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>,
-    {
-        // The benchmark never buffers: every fire folds straight into the
-        // recurrence.
-        self.attention(
+    if honor_wait_for_start && input.wait_for_start {
+        session::send("ready");
+        let _ = session::receive().await;
+    }
+    // Timing origin: after the optional start handshake, mirroring the
+    // harness's client-side clock reset on `start`.
+    let run_start = std::time::Instant::now();
+
+    let vocab = model::output_vocab_size();
+    let sampled_rng =
+        (input.temperature > 0.0).then(|| Channel::from([rng_seed, 0u32]).named("rng"));
+    let prefill_rng = (input.temperature > 0.0)
+        .then(|| Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]).named("rng_p"));
+    let temperature = input.temperature;
+    let top_p = input.top_p;
+
+    let ws = WorkingSet::new();
+    let page_size = kv_page_size();
+    let n = prompt_vec.len() as u32;
+    let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size);
+    let reserve_to_tokens = |tokens: u32| -> std::result::Result<(), String> {
+        let target = tokens.div_ceil(page_size).saturating_add(1).min(max_pages);
+        let current = ws.page_len();
+        if current < target {
+            ws.reserve(target - current)?;
+        }
+        Ok(())
+    };
+    step(&mut prologue_us, input.report_timing); // [2] setup (vocab/rng/ws)
+    reserve_to_tokens(n.max(1)).context("ws.reserve prompt")?;
+    step(&mut prologue_us, input.report_timing); // [3] reserve
+
+    // ── ONE PIPELINE, ONE STREAM (R4-4): prefill then decode, in order.
+    // The prefill epilogue seeds the decode's loop-carried `tok_in`
+    // on-device and mirrors the token to the host via `out`, so the decode
+    // fires ride the queue immediately behind the prefill — the host drain
+    // runs in parallel off the critical path.
+    let prompt_i32: Vec<i32> = prompt_vec.iter().map(|&t| t as i32).collect();
+
+    // Prefill is chunked against the engine's per-launch token capacity
+    // `max_embed_length()` (C). A single pass over the whole prompt is
+    // rejected outright once L > C —
+    //     "forward request has 1047 forward tokens, exceeding engine limit 1024"
+    // — and C is derived from the memory plan, so on a model whose weights
+    // leave a small workspace (Qwen3.6-35B-A3B: 71.9 GB on an 80 GB card)
+    // C stays at 1024 and no `--gpu-mem-util` / `--memory-profile` setting
+    // raises it. Chunking is guest-side by design (see model.wit
+    // `max-embed-length`), and `prefill_chunks` is the same SDK splitter
+    // naive-baseline and the trackb/quest/tova inferlets use, so chunk
+    // boundaries match theirs.
+    //
+    // Only the LAST chunk carries the sampling epilogue that seeds the
+    // decode's loop-carried `tok_in`; earlier chunks just extend the KV
+    // and are submitted straight to the pipeline. When the prompt fits in
+    // one chunk the loop body runs zero times and the pass built below is
+    // byte-for-byte what this inferlet built before.
+    let spans = prefill_chunks(n, None);
+    let (last_base, last_end) = *spans.last().expect("prefill_chunks is non-empty");
+
+    let toks_p = Channel::from(&prompt_i32[last_base as usize..last_end as usize]).named("toks_p");
+    let embed_indptr_p = Channel::from([0u32, last_end - last_base]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(last_base..last_end).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p =
+        Channel::from_iter((last_base..last_end).map(|p| p / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((last_base..last_end).map(|p| p % page_size)).named("w_off_p");
+    // Decode fires: the prefill sample already spends one of the
+    // `max_tokens` sampler activations.
+    let budget = input.max_tokens - 1;
+    // Device-carried handoff: unseeded, DEVICE-ONLY, attached to both
+    // passes — the prefill's epilogue put is what fills it (full/empty bits
+    // order the first decode read behind it). A host-visible channel cannot
+    // attach to two passes, so the host copies ride separate per-pass
+    // channels: `g0` (prefill) and `out` (decode). No annotation (F8): the
+    // decode pass is CONSTRUCTED before the prefill submits, so its eager
+    // embed claim on `tok_in` is visible to the prefill's build and the
+    // channel derives device-only naturally.
+    //
+    // **UNLESS `host_first_token` SAYS OTHERWISE**, in which case the
+    // channel is not built here at all: it is seeded from `g0` below,
+    // after the drain, and attaches to the decode pass alone. See the
+    // input field for the engine that needs that and why.
+    let k = frame_size();
+    let device_handoff = !input.host_first_token;
+    let tok_in = device_handoff.then(|| Channel::new([1], dtype::i32).named("tok_in"));
+    let g0_ch = Channel::new([1], dtype::i32).named("g0");
+    // Live slots per frame. Always k now: an RS mapping publishes at prepare,
+    // in slot order, so a linear model fills a frame exactly like a dense one.
+    let live_slots = frame_size();
+
+    // Run-ahead window in FIRES and the take-side ring that has to hold it.
+    //
+    // The runtime owns this sizing: `channel-capacity()` is the ring size in
+    // cells with the staging margin already baked in, so the window is
+    // exactly one less. The window is a whole number of frames, and the
+    // top-up below adds a whole frame at a time starting from below the
+    // window, so `submitted - taken` peaks at exactly `window_fires` — one
+    // cell short of the ring even when every outstanding fire settles
+    // before the host takes. Undersizing the ring does not merely throttle,
+    // it POISONS the channel ("work item completion published Failed
+    // terminal outcome") once a publish finds no free cell.
+    //
+    // `run_ahead_frames` overrides the depth for sweeps only; it is stated
+    // in frames, and the ring grows with it.
+    //
+    // The ring is sized a full frame of margin ABOVE the advertised
+    // capacity (`7 * live_slots` covers every frame size this bench
+    // runs). `channel-capacity()` bakes in a staging margin, but the
+    // runtime's ticket check is more conservative still, and a
+    // continuation that lands inside that margin is silently skipped at
+    // the reader-cell validation rather than refused. Sized at exactly
+    // `cap`, the measured continuation engaged on 12% of frames — the
+    // run-ahead the whole pipeline depends on, lost with no error
+    // anywhere. Chaining collapses and every frame's guest turnaround
+    // lands on the critical path: c256 23,478 -> 19,321 tok/s, S 30,277
+    // -> 21,506, X 5,429 -> 4,039 (analysis.md 10.30).
+    let (window_fires, out_capacity) = match input.run_ahead_frames {
+        Some(r) => {
+            let w = r.max(1) * live_slots;
+            (w, w + 1 + 7 * live_slots)
+        }
+        None => {
+            let cap = channel_capacity();
+            (cap - 1, cap + 7 * live_slots)
+        }
+    };
+    let out = Channel::new([1], dtype::i32)
+        .capacity(out_capacity as u32)
+        .named("out");
+    // The tap's running count lives in a stage-only ring (`acc` —
+    // SPSC forbids a host take on a stage-taken channel), so the
+    // epilogue mirrors it into a host-Reader channel drained once
+    // per fire alongside `out`.
+    let hook_fold_chans = input.hook_fold.then(|| {
+        (
+            Channel::from([0u32]).named("hook_fold_acc"),
+            Channel::new([1], dtype::u32)
+                .capacity(out_capacity as u32)
+                .named("hook_fold_out"),
+        )
+    });
+
+    // Hybrid/recurrent architectures (Qwen3.6's GDN layers, Mamba2) carry a
+    // folded recurrent state per request alongside the KV pages, and the
+    // engine rejects a forward whose rs-working-set count doesn't match its
+    // request rows. One row per fire here, so one set — reused by BOTH passes
+    // so the decode continues the prefill's state rather than starting cold.
+    // `rs_state_size() == 0` on pure-attention models, which bind none.
+    // `pass_kind()` is the class predicate: the folding kinds are exactly the
+    // ones for which the engine requires one rs-working-set per request row,
+    // and an attention model takes the empty binding instead.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "this benchmark has no recurrent-only path (no registered model reports that kind)"
+                    .into(),
+            );
+        }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
+    };
+
+    // One pipeline for the whole prefill+decode program, created here so
+    // the leading prefill chunks (below) and the first frame share it and
+    // stay ordered.
+    let pipe = Pipeline::new();
+
+    // Leading prefill chunks: everything except the last span. They only
+    // need to extend the KV, but a pass with no epilogue is rejected at
+    // registration (`pie_cuda_register_program failed with status -1`), so
+    // each one samples into a throwaway channel that is drained right
+    // after — the same shape naive-baseline / quest / tova use. Only the
+    // last span's token continues the prompt; these are discarded. The
+    // loop body runs zero times whenever the prompt fits in one chunk.
+    for &(base, end) in &spans[..spans.len() - 1] {
+        let toks_c = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
+        let embed_indptr_c = Channel::from([0u32, end - base]).named("embed_indptr_p");
+        let positions_c = Channel::from_iter(base..end).named("positions_p");
+        let pages_c = Channel::from_iter(0..max_pages).named("pages_p");
+        let page_indptr_c = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_p");
+        let w_slot_c = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_p");
+        let w_off_c = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_p");
+        let kv_len_c = Channel::from([end]).named("kv_len_p");
+        let fwd_c = ForwardPass::new();
+        fwd_c.embed(&toks_c, &embed_indptr_c)?;
+        fwd_c
+            .attention(
+                Some(KvBinding {
+                    working_set: &ws,
+                    geometry: KvGeometry {
+                        readable_pages: ..,
+                        writable_pages: ..,
+                        kv_len: &kv_len_c,
+                        pages: &pages_c,
+                        page_indptr: &page_indptr_c,
+                        w_slot: &w_slot_c,
+                        w_off: &w_off_c,
+                        positions: &positions_c,
+                        mask: None,
+                    },
+                }),
+                &rs_ws,
+                RsGeometry {
+                    fold_len: None,
+                    buffer: 0..0,
+                },
+            )
+            .with_context(|| format!("bind prefill chunk @{base}"))?;
+        let drop_tok_c = Channel::new([1], dtype::i32).named("drop_tok_c");
+        let drop_sink = drop_tok_c.clone();
+        // ITS OWN RNG, NOT `prefill_rng`. A `Channel::from` is seeded
+        // and host-visible, and such a channel may attach to exactly
+        // one pass (`pipeline/channel.rs`, the attach-once rule); the
+        // first chunk's fire also consumes the seed. Sharing the
+        // final pass's `prefill_rng` across every chunk is what made a
+        // prompt one token past `max_embed_length()` fail — "a
+        // host-visible or seeded channel may attach to only one pass"
+        // at the second chunk, or "seeded but no seed was put" at the
+        // final one. Every other channel here is already per chunk;
+        // this one is too, the way trackb-snapkv's `rng_c` is.
+        let rng_c = prefill_rng
+            .map(|_| Channel::from([rng_seed ^ 0x9e37_79b9 ^ base, 0u32]).named("rng_c"));
+        fwd_c.epilogue(move || {
+            let t = reshape(
+                sample(intrinsics::logits(), vocab, temperature, top_p, rng_c),
+                [1],
+            );
+            drop_sink.put(&t);
+        });
+        fwd_c
+            .submit(&pipe)
+            .with_context(|| format!("prefill chunk submit @{base}"))?;
+        // Must be drained: an epilogue put that is never taken fills the
+        // channel and stalls the lane.
+        drop_tok_c
+            .take_host::<i32>()
+            .await
+            .with_context(|| format!("drain prefill chunk @{base}"))?;
+    }
+
+    let fwd_p = ForwardPass::new();
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
+    fwd_p
+        .attention(
             Some(KvBinding {
-                working_set: ws,
-                geometry: geom,
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &kv_len_p,
+                    pages: &pages_p,
+                    page_indptr: &page_indptr_p,
+                    w_slot: &w_slot_p,
+                    w_off: &w_off_p,
+                    positions: &positions_p,
+                    mask: None,
+                },
             }),
-            rs,
+            &rs_ws,
             RsGeometry {
                 fold_len: None,
                 buffer: 0..0,
             },
         )
-    }
-}
+        .context("bind prefill state")?;
+    fwd_p.epilogue(move || {
+        let t = reshape(
+            sample(intrinsics::logits(), vocab, temperature, top_p, prefill_rng),
+            [1],
+        );
+        if let Some(tok_in) = tok_in {
+            tok_in.put(&t);
+        }
+        g0_ch.put(&t);
+    });
 
-macro_rules! define_run_one {
-    ($name:ident, $kind:ident) => {
-        async fn $name(
-            input: &Input,
-            prompt: &str,
-            prompt_tokens: Option<&[u32]>,
-            stop_tokens: &[u32],
-            honor_wait_for_start: bool,
-            rng_seed: u32,
-            main_pre_us: Option<u64>,
-        ) -> Result<RunResult> {
-            use inferlet::eta::$kind::{ForwardPass, submit_frame};
-
-            let mut prologue_us: Vec<u64> = Vec::new();
-            if input.report_timing {
-                prologue_us.push(main_pre_us.unwrap_or(0)); // [0] main_pre
-            }
-            let mut step_clock = std::time::Instant::now();
-            let mut step = |v: &mut Vec<u64>, on: bool| {
-                if on {
-                    v.push(step_clock.elapsed().as_micros() as u64);
-                }
-                step_clock = std::time::Instant::now();
-            };
-            // Prompt: explicit pre-tokenized tokens (the batch path) or chat-template
-            // system+user+cue.
-            let prompt_vec: Vec<u32> = if let Some(tokens) = prompt_tokens {
-                tokens.to_vec()
-            } else {
-                let mut p = chat::system_user(&input.system, prompt);
-                p.extend(chat::cue());
-                p
-            };
-            step(&mut prologue_us, input.report_timing); // [1] tokenize
-            let num_prompt_tokens = prompt_vec.len();
-            if prompt_vec.is_empty() {
-                return Err("empty prompt".into());
-            }
-
-            if honor_wait_for_start && input.wait_for_start {
-                session::send("ready");
-                let _ = session::receive().await;
-            }
-            // Timing origin: after the optional start handshake, mirroring the
-            // harness's client-side clock reset on `start`.
-            let run_start = std::time::Instant::now();
-
-            let vocab = model::output_vocab_size();
-            let sampled_rng =
-                (input.temperature > 0.0).then(|| Channel::from([rng_seed, 0u32]).named("rng"));
-            let prefill_rng = (input.temperature > 0.0)
-                .then(|| Channel::from([rng_seed ^ 0x9e37_79b9, 0u32]).named("rng_p"));
-            let temperature = input.temperature;
-            let top_p = input.top_p;
-
-            let ws = WorkingSet::new();
-            let page_size = kv_page_size();
-            let n = prompt_vec.len() as u32;
-            let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size);
-            let reserve_to_tokens = |tokens: u32| -> std::result::Result<(), String> {
-                let target = tokens.div_ceil(page_size).saturating_add(1).min(max_pages);
-                let current = ws.page_len();
-                if current < target {
-                    ws.reserve(target - current)?;
-                }
-                Ok(())
-            };
-            step(&mut prologue_us, input.report_timing); // [2] setup (vocab/rng/ws)
-            reserve_to_tokens(n.max(1)).context("ws.reserve prompt")?;
-            step(&mut prologue_us, input.report_timing); // [3] reserve
-
-            // ── ONE PIPELINE, ONE STREAM (R4-4): prefill then decode, in order.
-            // The prefill epilogue seeds the decode's loop-carried `tok_in`
-            // on-device and mirrors the token to the host via `out`, so the decode
-            // fires ride the queue immediately behind the prefill — the host drain
-            // runs in parallel off the critical path.
-            let prompt_i32: Vec<i32> = prompt_vec.iter().map(|&t| t as i32).collect();
-
-            // Prefill is chunked against the engine's per-launch token capacity
-            // `max_embed_length()` (C). A single pass over the whole prompt is
-            // rejected outright once L > C —
-            //     "forward request has 1047 forward tokens, exceeding engine limit 1024"
-            // — and C is derived from the memory plan, so on a model whose weights
-            // leave a small workspace (Qwen3.6-35B-A3B: 71.9 GB on an 80 GB card)
-            // C stays at 1024 and no `--gpu-mem-util` / `--memory-profile` setting
-            // raises it. Chunking is guest-side by design (see model.wit
-            // `max-embed-length`), and `prefill_chunks` is the same SDK splitter
-            // naive-baseline and the trackb/quest/tova inferlets use, so chunk
-            // boundaries match theirs.
-            //
-            // Only the LAST chunk carries the sampling epilogue that seeds the
-            // decode's loop-carried `tok_in`; earlier chunks just extend the KV
-            // and are submitted straight to the pipeline. When the prompt fits in
-            // one chunk the loop body runs zero times and the pass built below is
-            // byte-for-byte what this inferlet built before.
-            let spans = prefill_chunks(n, None);
-            let (last_base, last_end) = *spans.last().expect("prefill_chunks is non-empty");
-
-            let toks_p = Channel::from(&prompt_i32[last_base as usize..last_end as usize])
-                .named("toks_p");
-            let embed_indptr_p = Channel::from([0u32, last_end - last_base]).named("embed_indptr_p");
-            let positions_p = Channel::from_iter(last_base..last_end).named("positions_p");
-            let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
-            let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-            let w_slot_p =
-                Channel::from_iter((last_base..last_end).map(|p| p / page_size)).named("w_slot_p");
-            let w_off_p =
-                Channel::from_iter((last_base..last_end).map(|p| p % page_size)).named("w_off_p");
-            // Decode fires: the prefill sample already spends one of the
-            // `max_tokens` sampler activations.
-            let budget = input.max_tokens - 1;
-            // Device-carried handoff: unseeded, DEVICE-ONLY, attached to both
-            // passes — the prefill's epilogue put is what fills it (full/empty bits
-            // order the first decode read behind it). A host-visible channel cannot
-            // attach to two passes, so the host copies ride separate per-pass
-            // channels: `g0` (prefill) and `out` (decode). No annotation (F8): the
-            // decode pass is CONSTRUCTED before the prefill submits, so its eager
-            // embed claim on `tok_in` is visible to the prefill's build and the
-            // channel derives device-only naturally.
-            //
-            // **UNLESS `host_first_token` SAYS OTHERWISE**, in which case the
-            // channel is not built here at all: it is seeded from `g0` below,
-            // after the drain, and attaches to the decode pass alone. See the
-            // input field for the engine that needs that and why.
-            let k = frame_size();
-            let device_handoff = !input.host_first_token;
-            let tok_in = device_handoff.then(|| Channel::new([1], dtype::i32).named("tok_in"));
-            let g0_ch = Channel::new([1], dtype::i32).named("g0");
-            // Live slots per frame. Always k now: an RS mapping publishes at prepare,
-            // in slot order, so a linear model fills a frame exactly like a dense one.
-            let live_slots = live_slots();
-
-            // Run-ahead window in FIRES and the take-side ring that has to hold it.
-            //
-            // The runtime owns this sizing: `channel-capacity()` is the ring size in
-            // cells with the staging margin already baked in, so the window is
-            // exactly one less. The window is a whole number of frames, and the
-            // top-up below adds a whole frame at a time starting from below the
-            // window, so `submitted - taken` peaks at exactly `window_fires` — one
-            // cell short of the ring even when every outstanding fire settles
-            // before the host takes. Undersizing the ring does not merely throttle,
-            // it POISONS the channel ("work item completion published Failed
-            // terminal outcome") once a publish finds no free cell.
-            //
-            // `run_ahead_frames` overrides the depth for sweeps only; it is stated
-            // in frames, and the ring grows with it.
-            //
-            // The ring is sized a full frame of margin ABOVE the advertised
-            // capacity (`7 * live_slots` covers every frame size this bench
-            // runs). `channel-capacity()` bakes in a staging margin, but the
-            // runtime's ticket check is more conservative still, and a
-            // continuation that lands inside that margin is silently skipped at
-            // the reader-cell validation rather than refused. Sized at exactly
-            // `cap`, the measured continuation engaged on 12% of frames — the
-            // run-ahead the whole pipeline depends on, lost with no error
-            // anywhere. Chaining collapses and every frame's guest turnaround
-            // lands on the critical path: c256 23,478 -> 19,321 tok/s, S 30,277
-            // -> 21,506, X 5,429 -> 4,039 (analysis.md 10.30).
-            let (window_fires, out_capacity) = match input.run_ahead_frames {
-                Some(r) => {
-                    let w = r.max(1) * live_slots;
-                    (w, w + 1 + 7 * live_slots)
-                }
-                None => {
-                    let cap = channel_capacity();
-                    (cap - 1, cap + 7 * live_slots)
-                }
-            };
-            let out = Channel::new([1], dtype::i32)
-                .capacity(out_capacity as u32)
-                .named("out");
-            // The tap's running count lives in a stage-only ring (`acc` —
-            // SPSC forbids a host take on a stage-taken channel), so the
-            // epilogue mirrors it into a host-Reader channel drained once
-            // per fire alongside `out`.
-            let hook_fold_chans = input.hook_fold.then(|| {
-                (
-                    Channel::from([0u32]).named("hook_fold_acc"),
-                    Channel::new([1], dtype::u32)
-                        .capacity(out_capacity as u32)
-                        .named("hook_fold_out"),
-                )
-            });
-
-            // Hybrid/recurrent architectures (Qwen3.6's GDN layers, Mamba2) carry a
-            // folded recurrent state per request alongside the KV pages, and the
-            // engine rejects a forward whose rs-working-set count doesn't match its
-            // request rows. One row per fire here, so one set — reused by BOTH passes
-            // so the decode continues the prefill's state rather than starting cold.
-            // `rs_state_size() == 0` on pure-attention models, which bind none.
-            // `pass_kind() != Attention` is the class predicate: true iff the model
-            // folds a recurrent state, which is exactly when the engine requires one
-            // rs-working-set per request row.
-            let rs_ws: Vec<RsWorkingSet> = if model::pass_kind() != model::ForwardKind::Attention {
-                vec![RsWorkingSet::new()]
-            } else {
-                Vec::new()
-            };
-
-            // One pipeline for the whole prefill+decode program, created here so
-            // the leading prefill chunks (below) and the first frame share it and
-            // stay ordered.
-            let pipe = Pipeline::new();
-
-            // Leading prefill chunks: everything except the last span. They only
-            // need to extend the KV, but a pass with no epilogue is rejected at
-            // registration (`pie_cuda_register_program failed with status -1`), so
-            // each one samples into a throwaway channel that is drained right
-            // after — the same shape naive-baseline / quest / tova use. Only the
-            // last span's token continues the prompt; these are discarded. The
-            // loop body runs zero times whenever the prompt fits in one chunk.
-            for &(base, end) in &spans[..spans.len() - 1] {
-                let toks_c =
-                    Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
-                let embed_indptr_c = Channel::from([0u32, end - base]).named("embed_indptr_p");
-                let positions_c = Channel::from_iter(base..end).named("positions_p");
-                let pages_c = Channel::from_iter(0..max_pages).named("pages_p");
-                let page_indptr_c =
-                    Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_p");
-                let w_slot_c =
-                    Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_p");
-                let w_off_c =
-                    Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_p");
-                let kv_len_c = Channel::from([end]).named("kv_len_p");
-                let fwd_c = ForwardPass::new();
-                fwd_c.embed(&toks_c, &embed_indptr_c)?;
-                fwd_c
-                    .bind_state(
-                        &ws,
-                        KvGeometry {
-                            readable_pages: ..,
-                            writable_pages: ..,
-                            kv_len: &kv_len_c,
-                            pages: &pages_c,
-                            page_indptr: &page_indptr_c,
-                            w_slot: &w_slot_c,
-                            w_off: &w_off_c,
-                            positions: &positions_c,
-                            mask: None,
-                        },
-                        &rs_ws,
-                    )
-                    .with_context(|| format!("bind prefill chunk @{base}"))?;
-                let drop_tok_c = Channel::new([1], dtype::i32).named("drop_tok_c");
-                let drop_sink = drop_tok_c.clone();
-                fwd_c.epilogue(move || {
-                    let t = reshape(
-                        sample(intrinsics::logits(), vocab, temperature, top_p, prefill_rng),
-                        [1],
-                    );
-                    drop_sink.put(&t);
-                });
-                fwd_c
-                    .submit(&pipe)
-                    .with_context(|| format!("prefill chunk submit @{base}"))?;
-                // Must be drained: an epilogue put that is never taken fills the
-                // channel and stalls the lane.
-                drop_tok_c
-                    .take_host::<i32>()
-                    .await
-                    .with_context(|| format!("drain prefill chunk @{base}"))?;
-            }
-
-            let fwd_p = ForwardPass::new();
-            fwd_p.embed(&toks_p, &embed_indptr_p)?;
-            let kv_len_p = Channel::from([n]).named("kv_len_p");
-            fwd_p
-                .bind_state(
-                    &ws,
-                    KvGeometry {
-                        readable_pages: ..,
-                        writable_pages: ..,
-                        kv_len: &kv_len_p,
-                        pages: &pages_p,
-                        page_indptr: &page_indptr_p,
-                        w_slot: &w_slot_p,
-                        w_off: &w_off_p,
-                        positions: &positions_p,
-                        mask: None,
-                    },
-                    &rs_ws,
-                )
-                .context("bind prefill state")?;
-            fwd_p.epilogue(move || {
-                let t = reshape(
-                    sample(intrinsics::logits(), vocab, temperature, top_p, prefill_rng),
-                    [1],
-                );
-                if let Some(tok_in) = tok_in {
-                    tok_in.put(&t);
-                }
-                g0_ch.put(&t);
-            });
-
-            // Decode pass (1-wide, device loop-carried), built BEFORE the prefill
-            // submits (its eager `tok_in` claim must precede the prefill's build)
-            // and submitted run-ahead before the prefill has executed — its
-            // geometry needs only the author-carried KvLen (from n+1, +1/fire), not
-            // the prefill's token value, which flows through `tok_in`.
-            //
-            // **A BUILDER RATHER THAN A BLOCK, BECAUSE THE OTHER ARM BUILDS IT
-            // LATER.** Under `host_first_token` the channel it embeds is seeded
-            // with the token the prefill produced, so the pass cannot exist
-            // until that token has been drained. Everything it moves — `out`,
-            // `sampled_rng`, the fold channels — is moved ONCE, which is what
-            // makes this `FnOnce` and what makes calling it in exactly one of
-            // the two places below a fact the compiler checks.
-            // `ws` and `rs_ws` are the PREFILL's too, so the `move` below takes
-            // references to them and not the values.
-            let ws_ref = &ws;
-            let rs_ws_ref = &rs_ws;
-            let build_decode = move |tok_in: Channel| -> std::result::Result<Option<ForwardPass>, String> {
-            Ok(if budget > 0 {
-                let fwd = ForwardPass::new();
-                let embed_indptr = Channel::from([0u32, 1u32]).named("embed_indptr");
-                let positions = Channel::from([n]).named("positions");
-                let pages = Channel::from_iter(0..max_pages).named("pages");
-                let page_indptr =
-                    Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-                let w_slot = Channel::from([n / page_size]).named("w_slot");
-                let w_off = Channel::from([n % page_size]).named("w_off");
-                fwd.embed(&tok_in, &embed_indptr)?;
-                let kv_len = Channel::from([n + 1]).named("kv_len");
-                fwd.bind_state(
-                    ws_ref,
-                    KvGeometry {
+    // Decode pass (1-wide, device loop-carried), built BEFORE the prefill
+    // submits (its eager `tok_in` claim must precede the prefill's build)
+    // and submitted run-ahead before the prefill has executed — its
+    // geometry needs only the author-carried KvLen (from n+1, +1/fire), not
+    // the prefill's token value, which flows through `tok_in`.
+    //
+    // **A BUILDER RATHER THAN A BLOCK, BECAUSE THE OTHER ARM BUILDS IT
+    // LATER.** Under `host_first_token` the channel it embeds is seeded
+    // with the token the prefill produced, so the pass cannot exist
+    // until that token has been drained. Everything it moves — `out`,
+    // `sampled_rng`, the fold channels — is moved ONCE, which is what
+    // makes this `FnOnce` and what makes calling it in exactly one of
+    // the two places below a fact the compiler checks.
+    // `ws` and `rs_ws` are the PREFILL's too, so the `move` below takes
+    // references to them and not the values.
+    let ws_ref = &ws;
+    let rs_ws_ref = &rs_ws;
+    let build_decode = move |tok_in: Channel| -> std::result::Result<Option<ForwardPass>, String> {
+        Ok(if budget > 0 {
+            let fwd = ForwardPass::new();
+            let embed_indptr = Channel::from([0u32, 1u32]).named("embed_indptr");
+            let positions = Channel::from([n]).named("positions");
+            let pages = Channel::from_iter(0..max_pages).named("pages");
+            let page_indptr =
+                Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+            let w_slot = Channel::from([n / page_size]).named("w_slot");
+            let w_off = Channel::from([n % page_size]).named("w_off");
+            fwd.embed(&tok_in, &embed_indptr)?;
+            let kv_len = Channel::from([n + 1]).named("kv_len");
+            fwd.attention(
+                Some(KvBinding {
+                    working_set: ws_ref,
+                    geometry: KvGeometry {
                         readable_pages: ..,
                         writable_pages: (n / page_size)..,
                         kv_len: &kv_len,
@@ -629,314 +591,265 @@ macro_rules! define_run_one {
                         positions: &positions,
                         mask: None,
                     },
-                    rs_ws_ref,
-                )
-                .context("bind decode state")?;
-                if let Some((acc, _)) = hook_fold_chans {
-                    // Take/put per attention layer: the fold keeps the stage
-                    // classifiable (a publish-only body reads as Unknown) and
-                    // the running count is the evidence the stage EXECUTED —
-                    // attention layers x fires.
-                    fwd.on_attn(move || {
-                        let prev = acc.take();
-                        acc.put(&prev + 1u32);
-                    });
-                }
-                fwd.epilogue(move || {
-                    let length = kv_len.take();
-                    let t = reshape(
-                        sample(intrinsics::logits(), vocab, temperature, top_p, sampled_rng),
-                        [1],
-                    );
-                    let next_length = &length + 1u32;
-                    let page_count = next_length.div_ceil(page_size);
-                    tok_in.put(&t);
-                    kv_len.put(&next_length);
-                    positions.put(&length);
-                    w_slot.put(&length / page_size);
-                    w_off.put(&length % page_size);
-                    page_indptr.put(indptr(1, &page_count));
-                    out.put(&t);
-                    if let Some((acc, fold_out)) = hook_fold_chans {
-                        let count = acc.take();
-                        acc.put(&count);
-                        fold_out.put(&count);
-                    }
+                }),
+                rs_ws_ref,
+                RsGeometry {
+                    fold_len: None,
+                    buffer: 0..0,
+                },
+            )
+            .context("bind decode state")?;
+            if let Some((acc, _)) = hook_fold_chans {
+                // Take/put per attention layer: the fold keeps the stage
+                // classifiable (a publish-only body reads as Unknown) and
+                // the running count is the evidence the stage EXECUTED —
+                // attention layers x fires.
+                fwd.on_attn(move || {
+                    let prev = acc.take();
+                    acc.put(&prev + 1u32);
                 });
-                Some(fwd)
-            } else {
-                None
-            })
-            };
-
-            // (`pipe` was created before the leading prefill chunks so they and
-            // this frame share one pipeline and stay ordered.)
-
-            let mut build_decode = Some(build_decode);
-            let mut fwd_d: Option<ForwardPass> = match tok_in {
-                Some(tok_in) => build_decode
-                    .take()
-                    .expect("the decode builder is called once")(tok_in)?,
-                None => None,
-            };
-
-            // First frame: the prefill chunk in slot 0, then up to live_slots-1
-            // decode slots. At live_slots = 1 this is a bare prefill submit
-            // (`submit` IS a single-slot frame); trailing slots pad to no-ops.
-            // Under `host_first_token` there is no decode pass yet, so the
-            // frame is one slot wide — the same shape live_slots = 1 already
-            // submits.
-            let first_decodes = if fwd_d.is_some() {
-                budget.min(live_slots - 1)
-            } else {
-                0
-            };
-            reserve_to_tokens(n + first_decodes as u32 + 1).context("reserve first frame")?;
-            let mut first_slots: Vec<Option<&ForwardPass>> = Vec::with_capacity(k);
-            first_slots.push(Some(&fwd_p));
-            for _ in 0..first_decodes {
-                first_slots.push(Some(fwd_d.as_ref().expect("decode pass exists")));
             }
-            submit_frame(&pipe, &first_slots).context("first frame submit")?;
-            let mut submitted = first_decodes;
-
-            // Unified run-ahead discipline (ONE rule for every k): submit frames of
-            // min(live_slots, remaining) decode slots until the window (submitted
-            // minus drained) is full or the budget is spent, returning the new
-            // submitted count. Decode geometry is device-carried (`tok_in`), so a
-            // successor never waits on a sampled token.
-            //
-            // `window_fires` comes from the runtime (see the `channel_capacity()`
-            // computation above). What it has to buy is COVER: the frame seal is
-            // wait-for-ALL, so it holds until every awaited lane's oldest queued
-            // frame is arrival-complete and the binding term is the SLOWEST of
-            // `concurrency` lanes' resubmit. Cover (`window_fires - live_slots`) is
-            // what gives that straggler time, and it is counted in WAVES, not
-            // frames — a 2-frame window gives only k waves, so k = 1 got a single
-            // ~7 ms wave and a cohort that fell behind never caught back up
-            // (see §20.10). That is why the runtime's `HOST_TURNAROUND_WAVES` is
-            // k-independent and the frame count is derived from it.
-            //
-            // Measured, Qwen3-0.6B / L40S / conc 256, median of 6-8 trials:
-            //   k=1 cover 1 (old 2*k rule)  multimodal 18.8k / 22k / 28.5k
-            //   k=1 cover 2                 7/8 at 28.6-29.5k, 1/8 still collapsed
-            //   k=1 cover 3                 6/6 at 28.7-29.5k, median 29044
-            //   k=2 cover 2 (old rule)      median 28497   <- already saturated
-            //   k=2 cover 3                 median 28654   <- within noise of it
-            // **THE PASS IS AN ARGUMENT AND NOT A CAPTURE**, because under
-            // `host_first_token` it is assigned after this closure is defined.
-            let submit_ahead = |fwd: &ForwardPass,
-                                mut submitted: usize,
-                                drained: usize|
-             -> std::result::Result<usize, String> {
-                    // Top up only while a WHOLE frame still fits inside the window.
-                    // Testing `submitted - drained < window_fires` instead would let
-                    // a frame start from `window_fires - 1` and overshoot to
-                    // `window_fires + live_slots - 1`, which is past the ring and is
-                    // rejected outright at k >= 3 ("frame would need 8 reader cells,
-                    // capacity 7"). This is the same discipline `eta::run_ahead`
-                    // uses, and it is what makes `channel_capacity()`'s single spare
-                    // cell the correct margin.
-                    while submitted < budget {
-                        let s = (budget - submitted).min(live_slots);
-                        if submitted - drained + s > window_fires {
-                            break;
-                        }
-                        reserve_to_tokens(n + (submitted + s) as u32 + 1)
-                            .context("reserve decode frame")?;
-                        let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
-                        submit_frame(&pipe, &slots).context("decode frame submit")?;
-                        submitted += s;
-                    }
-                    Ok(submitted)
-                };
-
-            // Stage the window before the prefill token even arrives — the decode
-            // successors ride the queue behind the prefill, off the g0 critical path.
-            // The other arm has no pass to stage yet and does it after the drain.
-            if let Some(fwd) = fwd_d.as_ref() {
-                submitted = submit_ahead(fwd, submitted, 0)?;
-            }
-            step(&mut prologue_us, input.report_timing); // [4] build_submit (both passes)
-
-            // ── HOST DRAIN (off the critical path — the decode burst is already in
-            // the runtime while this first take waits on the prefill).
-            let g0 = g0_ch.take_host::<i32>().await?;
-
-            let ttft_us = input
-                .report_timing
-                .then(|| run_start.elapsed().as_micros() as u64);
-            if input.report_timing && honor_wait_for_start {
-                session::send("t0");
-            }
-
-            // **THE HOST ARM'S HANDOFF, AND THE WHOLE OF IT.** The token is
-            // here; the decode pass can be built on it now, `tok_in` SEEDED
-            // rather than device-filled, and the run-ahead window staged
-            // behind this drain instead of in front of it. The measurement it
-            // reads after this point is the same one the other arm reads —
-            // every later token is device loop-carried either way.
-            if let Some(build_decode) = build_decode.take() {
-                fwd_d = build_decode(Channel::from([g0]).named("tok_in"))?;
-                if let Some(fwd) = fwd_d.as_ref() {
-                    submitted = submit_ahead(fwd, submitted, 0)?;
+            fwd.epilogue(move || {
+                let length = kv_len.take();
+                let t = reshape(
+                    sample(intrinsics::logits(), vocab, temperature, top_p, sampled_rng),
+                    [1],
+                );
+                let next_length = &length + 1u32;
+                let page_count = next_length.div_ceil(page_size);
+                tok_in.put(&t);
+                kv_len.put(&next_length);
+                positions.put(&length);
+                w_slot.put(&length / page_size);
+                w_off.put(&length % page_size);
+                page_indptr.put(indptr(1, &page_count));
+                out.put(&t);
+                if let Some((acc, fold_out)) = hook_fold_chans {
+                    let count = acc.take();
+                    acc.put(&count);
+                    fold_out.put(&count);
                 }
+            });
+            Some(fwd)
+        } else {
+            None
+        })
+    };
+
+    // (`pipe` was created before the leading prefill chunks so they and
+    // this frame share one pipeline and stay ordered.)
+
+    let mut build_decode = Some(build_decode);
+    let mut fwd_d: Option<ForwardPass> = match tok_in {
+        Some(tok_in) => build_decode
+            .take()
+            .expect("the decode builder is called once")(tok_in)?,
+        None => None,
+    };
+
+    // First frame: the prefill chunk in slot 0, then up to live_slots-1
+    // decode slots. At live_slots = 1 this is a bare prefill submit
+    // (`submit` IS a single-slot frame); trailing slots pad to no-ops.
+    // Under `host_first_token` there is no decode pass yet, so the
+    // frame is one slot wide — the same shape live_slots = 1 already
+    // submits.
+    let first_decodes = if fwd_d.is_some() {
+        budget.min(live_slots - 1)
+    } else {
+        0
+    };
+    reserve_to_tokens(n + first_decodes as u32 + 1).context("reserve first frame")?;
+    let mut first_slots: Vec<Option<&ForwardPass>> = Vec::with_capacity(k);
+    first_slots.push(Some(&fwd_p));
+    for _ in 0..first_decodes {
+        first_slots.push(Some(fwd_d.as_ref().expect("decode pass exists")));
+    }
+    submit_frame(&pipe, &first_slots).context("first frame submit")?;
+    let mut submitted = first_decodes;
+
+    // Unified run-ahead discipline (ONE rule for every k): submit frames of
+    // min(live_slots, remaining) decode slots until the window (submitted
+    // minus drained) is full or the budget is spent, returning the new
+    // submitted count. Decode geometry is device-carried (`tok_in`), so a
+    // successor never waits on a sampled token.
+    //
+    // `window_fires` comes from the runtime (see the `channel_capacity()`
+    // computation above). What it has to buy is COVER: the frame seal is
+    // wait-for-ALL, so it holds until every awaited lane's oldest queued
+    // frame is arrival-complete and the binding term is the SLOWEST of
+    // `concurrency` lanes' resubmit. Cover (`window_fires - live_slots`) is
+    // what gives that straggler time, and it is counted in WAVES, not
+    // frames — a 2-frame window gives only k waves, so k = 1 got a single
+    // ~7 ms wave and a cohort that fell behind never caught back up
+    // (see §20.10). That is why the runtime's `HOST_TURNAROUND_WAVES` is
+    // k-independent and the frame count is derived from it.
+    //
+    // Measured, Qwen3-0.6B / L40S / conc 256, median of 6-8 trials:
+    //   k=1 cover 1 (old 2*k rule)  multimodal 18.8k / 22k / 28.5k
+    //   k=1 cover 2                 7/8 at 28.6-29.5k, 1/8 still collapsed
+    //   k=1 cover 3                 6/6 at 28.7-29.5k, median 29044
+    //   k=2 cover 2 (old rule)      median 28497   <- already saturated
+    //   k=2 cover 3                 median 28654   <- within noise of it
+    // **THE PASS IS AN ARGUMENT AND NOT A CAPTURE**, because under
+    // `host_first_token` it is assigned after this closure is defined.
+    let submit_ahead = |fwd: &ForwardPass,
+                        mut submitted: usize,
+                        drained: usize|
+     -> std::result::Result<usize, String> {
+        // Top up only while a WHOLE frame still fits inside the window.
+        // Testing `submitted - drained < window_fires` instead would let
+        // a frame start from `window_fires - 1` and overshoot to
+        // `window_fires + live_slots - 1`, which is past the ring and is
+        // rejected outright at k >= 3 ("frame would need 8 reader cells,
+        // capacity 7"). This is the same discipline `eta::run_ahead`
+        // uses, and it is what makes `channel_capacity()`'s single spare
+        // cell the correct margin.
+        while submitted < budget {
+            let s = (budget - submitted).min(live_slots);
+            if submitted - drained + s > window_fires {
+                break;
             }
-            let mut intertoken_us: Vec<u32> = Vec::new();
-            let mut last_tick = run_start.elapsed();
-            let mut token_monotonic_ns: Vec<u64> = Vec::new();
-            let first_token_monotonic_ns = input.report_arrivals.then(inferlet::monotonic_now_ns);
+            reserve_to_tokens(n + (submitted + s) as u32 + 1).context("reserve decode frame")?;
+            let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
+            submit_frame(&pipe, &slots).context("decode frame submit")?;
+            submitted += s;
+        }
+        Ok(submitted)
+    };
 
-            let wasm_delay = std::time::Duration::from_micros(input.wasm_delay_us);
-            let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
-            let mut emitted = 0usize; // sampler emissions counted (stop excluded)
+    // Stage the window before the prefill token even arrives — the decode
+    // successors ride the queue behind the prefill, off the g0 critical path.
+    // The other arm has no pass to stage yet and does it after the drain.
+    if let Some(fwd) = fwd_d.as_ref() {
+        submitted = submit_ahead(fwd, submitted, 0)?;
+    }
+    step(&mut prologue_us, input.report_timing); // [4] build_submit (both passes)
 
-            let mut stopped = stop_tokens.contains(&(g0 as u32));
-            if !stopped {
-                emitted += 1;
-                generated.push(g0 as u32);
-                if let Some(now_ns) = first_token_monotonic_ns {
-                    token_monotonic_ns.push(now_ns);
-                }
-            }
+    // ── HOST DRAIN (off the critical path — the decode burst is already in
+    // the runtime while this first take waits on the prefill).
+    let g0 = g0_ch.take_host::<i32>().await?;
 
-            // Leaving the wait-set is an END-OF-STREAM statement, not a
-            // teardown step: from the moment this lane will not submit again,
-            // every other lane in the fleet is holding its frame seal for a
-            // guest that has nothing left to contribute. The runtime cannot
-            // infer this -- an empty queue looks identical between a guest
-            // that is finished and one that is mid-decode -- so the guest,
-            // which does know, has to say it. Closing here rather than after
-            // the drain is what makes that statement on time; the remaining
-            // takes below are unaffected (close never waits for an unsettled
-            // fire). `closed` is not redundant with the runtime's `first_close`
-            // latch -- that latch only suppresses the wait-set notify, while
-            // each `close()` still crosses into the host and drains settled
-            // entries -- so the trailing call stays correct but is worth
-            // skipping.
-            let mut closed = false;
-            if submitted >= budget {
+    let ttft_us = input
+        .report_timing
+        .then(|| run_start.elapsed().as_micros() as u64);
+    if input.report_timing && honor_wait_for_start {
+        session::send("t0");
+    }
+
+    // **THE HOST ARM'S HANDOFF, AND THE WHOLE OF IT.** The token is
+    // here; the decode pass can be built on it now, `tok_in` SEEDED
+    // rather than device-filled, and the run-ahead window staged
+    // behind this drain instead of in front of it. The measurement it
+    // reads after this point is the same one the other arm reads —
+    // every later token is device loop-carried either way.
+    if let Some(build_decode) = build_decode.take() {
+        fwd_d = build_decode(Channel::from([g0]).named("tok_in"))?;
+        if let Some(fwd) = fwd_d.as_ref() {
+            submitted = submit_ahead(fwd, submitted, 0)?;
+        }
+    }
+    let mut intertoken_us: Vec<u32> = Vec::new();
+    let mut last_tick = run_start.elapsed();
+    let mut token_monotonic_ns: Vec<u64> = Vec::new();
+    let first_token_monotonic_ns = input.report_arrivals.then(inferlet::monotonic_now_ns);
+
+    let wasm_delay = std::time::Duration::from_micros(input.wasm_delay_us);
+    let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
+    let mut emitted = 0usize; // sampler emissions counted (stop excluded)
+
+    let mut stopped = stop_tokens.contains(&(g0 as u32));
+    if !stopped {
+        emitted += 1;
+        generated.push(g0 as u32);
+        if let Some(now_ns) = first_token_monotonic_ns {
+            token_monotonic_ns.push(now_ns);
+        }
+    }
+
+    // Leaving the wait-set is an END-OF-STREAM statement, not a
+    // teardown step: from the moment this lane will not submit again,
+    // every other lane in the fleet is holding its frame seal for a
+    // guest that has nothing left to contribute. The runtime cannot
+    // infer this -- an empty queue looks identical between a guest
+    // that is finished and one that is mid-decode -- so the guest,
+    // which does know, has to say it. Closing here rather than after
+    // the drain is what makes that statement on time; the remaining
+    // takes below are unaffected (close never waits for an unsettled
+    // fire). `closed` is not redundant with the runtime's `first_close`
+    // latch -- that latch only suppresses the wait-set notify, while
+    // each `close()` still crosses into the host and drains settled
+    // entries -- so the trailing call stays correct but is worth
+    // skipping.
+    let mut closed = false;
+    if submitted >= budget {
+        pipe.close();
+        closed = true;
+    }
+    let mut taken = 0usize;
+    let mut hook_fold_final: Option<u32> = None;
+    while taken < submitted {
+        let t = out.take_host::<Vec<i32>>().await?;
+        if let Some((_, fold_out)) = hook_fold_chans {
+            hook_fold_final = Some(fold_out.take_host::<u32>().await.context("fold drain")?);
+        }
+        taken += 1;
+        let Some(&t0) = t.first() else {
+            return Err("out.take: empty tensor".into());
+        };
+        if stopped {
+            continue; // a fire that settled before the close landed
+        }
+        if stop_tokens.contains(&(t0 as u32)) {
+            stopped = true;
+            if !closed {
                 pipe.close();
                 closed = true;
             }
-            let mut taken = 0usize;
-            let mut hook_fold_final: Option<u32> = None;
-            while taken < submitted {
-                let t = out.take_host::<Vec<i32>>().await?;
-                if let Some((_, fold_out)) = hook_fold_chans {
-                    hook_fold_final =
-                        Some(fold_out.take_host::<u32>().await.context("fold drain")?);
-                }
-                taken += 1;
-                let Some(&t0) = t.first() else {
-                    return Err("out.take: empty tensor".into());
-                };
-                if stopped {
-                    continue; // a fire that settled before the close landed
-                }
-                if stop_tokens.contains(&(t0 as u32)) {
-                    stopped = true;
-                    if !closed {
-                        pipe.close();
-                        closed = true;
-                    }
-                    continue;
-                }
-                emitted += 1;
-                generated.push(t0 as u32);
-                if input.report_arrivals {
-                    let now_ns = inferlet::monotonic_now_ns();
-                    let previous_ns = *token_monotonic_ns
-                        .last()
-                        .expect("first accepted token has a monotonic stamp");
-                    intertoken_us.push(((now_ns - previous_ns) / 1_000) as u32);
-                    token_monotonic_ns.push(now_ns);
-                } else if input.report_timing {
-                    let now = run_start.elapsed();
-                    intertoken_us.push((now - last_tick).as_micros() as u32);
-                    last_tick = now;
-                }
-                if input.wasm_delay_us > 0 {
-                    std::thread::sleep(wasm_delay);
-                }
-                // Refill the window after draining an accepted token. A stopped lane
-                // `continue`s above and never reaches here, so it never submits more.
-                submitted = submit_ahead(
-                    fwd_d.as_ref().expect("decode pass exists while budget > 0"),
-                    submitted,
-                    taken,
-                )?;
-                if !closed && submitted >= budget {
-                    pipe.close();
-                    closed = true;
-                }
-            }
-            if !closed {
-                pipe.close();
-            }
-
-            Ok(RunResult {
-                num_prompt_tokens,
-                num_output_tokens: emitted,
-                tokens: generated,
-                ttft_us,
-                intertoken_us,
-                token_monotonic_ns,
-                prologue_us,
-                hook_fold_final,
-            })
+            continue;
         }
-    };
-}
-
-define_run_one!(run_one_attention, attention);
-define_run_one!(run_one_hybrid, hybrid);
-
-async fn run_one(
-    input: &Input,
-    prompt: &str,
-    prompt_tokens: Option<&[u32]>,
-    stop_tokens: &[u32],
-    honor_wait_for_start: bool,
-    rng_seed: u32,
-    main_pre_us: Option<u64>,
-) -> Result<RunResult> {
-    match model::pass_kind() {
-        model::ForwardKind::Attention => {
-            run_one_attention(
-                input,
-                prompt,
-                prompt_tokens,
-                stop_tokens,
-                honor_wait_for_start,
-                rng_seed,
-                main_pre_us,
-            )
-            .await
+        emitted += 1;
+        generated.push(t0 as u32);
+        if input.report_arrivals {
+            let now_ns = inferlet::monotonic_now_ns();
+            let previous_ns = *token_monotonic_ns
+                .last()
+                .expect("first accepted token has a monotonic stamp");
+            intertoken_us.push(((now_ns - previous_ns) / 1_000) as u32);
+            token_monotonic_ns.push(now_ns);
+        } else if input.report_timing {
+            let now = run_start.elapsed();
+            intertoken_us.push((now - last_tick).as_micros() as u32);
+            last_tick = now;
         }
-        model::ForwardKind::Hybrid => {
-            run_one_hybrid(
-                input,
-                prompt,
-                prompt_tokens,
-                stop_tokens,
-                honor_wait_for_start,
-                rng_seed,
-                main_pre_us,
-            )
-            .await
+        if input.wasm_delay_us > 0 {
+            std::thread::sleep(wasm_delay);
         }
-        model::ForwardKind::Recurrent => Err(
-            "this benchmark has no recurrent-only path (no registered model reports that kind)"
-                .to_string()
-                .into(),
-        ),
-        model::ForwardKind::Diffusion => Err(
-            "this benchmark decodes a token at a time; a diffusion model wants a canvas loop"
-                .to_string()
-                .into(),
-        ),
+        // Refill the window after draining an accepted token. A stopped lane
+        // `continue`s above and never reaches here, so it never submits more.
+        submitted = submit_ahead(
+            fwd_d.as_ref().expect("decode pass exists while budget > 0"),
+            submitted,
+            taken,
+        )?;
+        if !closed && submitted >= budget {
+            pipe.close();
+            closed = true;
+        }
     }
+    if !closed {
+        pipe.close();
+    }
+
+    Ok(RunResult {
+        num_prompt_tokens,
+        num_output_tokens: emitted,
+        tokens: generated,
+        ttft_us,
+        intertoken_us,
+        token_monotonic_ns,
+        prologue_us,
+        hook_fold_final,
+    })
 }
 
 #[inferlet::main]

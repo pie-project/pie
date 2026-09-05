@@ -24,6 +24,19 @@ pub fn skus() -> Vec<crate::Sku> {
             &tokenizer::CONTRACT,
             |tp: u32| Model::d27b(Dtype::U4g64, Dtype::Bf16, tp),
         ),
+        // The DFlash block drafter, overlaid by `--aux`. Asks before the
+        // plain row for the reason the MTP row does: an artifact carrying
+        // the drafter's planes fits the undrafted row too.
+        (
+            "qwen36-27b-dflash",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::d27b_dflash(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
         (
             "qwen36-27b",
             1,
@@ -43,6 +56,16 @@ pub fn skus() -> Vec<crate::Sku> {
             template::chatml,
             &tokenizer::CONTRACT,
             |tp: u32| Model::d0_8b(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
+            "qwen36-35b-a3b-dflash",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::a3b_dflash(Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
             "qwen36-35b-a3b-mtp",
@@ -103,6 +126,28 @@ pub fn skus() -> Vec<crate::Sku> {
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
             |tp: u32| Model::d27b(Dtype::Bf16, Dtype::Bf16, tp),
+        ),
+        // The DFlash2 block drafter overlaid by `--aux`; asks before the
+        // plain rows for the reason the v1 row does.
+        (
+            "qwen38-27b-dflash2",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml_interleaved,
+            &tokenizer::CONTRACT_38,
+            |tp: u32| Model::d27b_dflash2(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
+            "qwen38-27b-dspark",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml_interleaved,
+            &tokenizer::CONTRACT_38,
+            |tp: u32| Model::d27b_dspark(Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
             "qwen38-27b-mtp",

@@ -113,6 +113,7 @@ mod tests {
             values: Vec::new(),
             nodes,
             seams: Vec::new(),
+            drafter: None,
         }
     }
 

@@ -352,6 +352,13 @@ impl Model {
             }
         }
 
+        // The block drafter, always `--aux`-imported (it is published on its
+        // own); its planes and their spelling are the drafter's
+        // (`drafter::dflash`), and the norm fold is this layout's.
+        if let Some(dflash) = &self.dflash {
+            dflash.bind_aux(&mut b, src, &norm)?;
+        }
+
         Ok(b.build())
     }
 

@@ -182,6 +182,13 @@ impl Run<'_> {
             ),
             // One launch per operand: each writes its own column of the i32
             // plane, so the plane is whole once the last has run.
+            Layout::TopK { x, k, values, indices } => layout::topk(
+                self.ctx(),
+                self.tensor(*x),
+                *k,
+                self.tensor(*values),
+                self.tensor(*indices),
+            ),
             Layout::Argmax { xs, y } => {
                 for (column, x) in xs.iter().enumerate() {
                     layout::argmax(

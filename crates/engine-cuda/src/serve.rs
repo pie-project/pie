@@ -273,13 +273,9 @@ impl Shell {
     /// `word` with the correction window's bit set, or `None` when this bake cannot carry the lane.
     #[must_use]
     pub fn adapted_word(&self, word: u64) -> Option<u64> {
+        // One rule for every shell: `model_ir::ClassTable::adapted_word`.
         let bit = self.adapter_fact?;
-        let adapted = word | (1u64 << bit);
-        let class = self
-            .compiled
-            .classes
-            .class_of(adapted & self.compiled.classes.mask)?;
-        self.corrected.contains(class).then_some(adapted)
+        self.compiled.classes.adapted_word(&self.corrected, bit, word)
     }
 
     /// The shared-adapter store.

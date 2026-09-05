@@ -3,12 +3,17 @@
 //! The prompt is prefilled once with normal causal attention. During decoding,
 //! each query attends to the first `sink_size` positions and the most recent
 //! `window_size` positions. Masked KV pages remain allocated in this example.
+//!
+//! Runs on both pass kinds. On a hybrid model the sink/window mask is a mask
+//! over the ATTENTION layers only — that is what `kv-geometry.mask` means on
+//! `pie:inferlet/forward-hybrid`, and the recurrent layers fold every token as
+//! usual. There is nothing to emulate there: a recurrence has no key it can
+//! decline to read.
 
 use inferlet::chat;
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use serde::Deserialize;
 
-const PAGE_T: u32 = 16;
 
 #[derive(Deserialize)]
 struct Input {
@@ -52,6 +57,15 @@ async fn main(input: Input) -> Result<String> {
 
     let sink = input.sink_size;
     let window = input.window_size.max(1);
+    // **THE PAGE SIZE IS THE ENGINE'S, NOT A LITERAL.** This file carried
+    // `const page_t: u32 = 16` and every `w_slot`/`w_off` it derived was
+    // wrong on a model whose pages are any other width: the writes land in
+    // the wrong page at the wrong offset, the reads pull cells nothing wrote,
+    // and the pass answers fluent-looking garbage rather than failing — which
+    // is exactly what `_attends_prompt` in the curated suite exists to catch.
+    // `sliding-window-attention`, structurally this file's twin, reads it and
+    // passes.
+    let page_t = model::kv_page_size();
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     prompt.extend(chat::cue());
@@ -60,10 +74,26 @@ async fn main(input: Input) -> Result<String> {
     }
     let n = prompt.len() as u32;
     let stop_tokens = chat::stop_tokens();
-    let pool_pages = (n + input.max_tokens as u32 + 2).div_ceil(PAGE_T);
-    let pool_len = pool_pages * PAGE_T;
+    let pool_pages = (n + input.max_tokens as u32 + 2).div_ceil(page_t);
+    let pool_len = pool_pages * page_t;
 
     let ws = WorkingSet::new();
+    // One recurrent working set for this one sequence on a hybrid model (the
+    // engine requires one per request row); none on a pure-attention one. It
+    // is bound by EVERY pass of the sequence — prefill and decode alike.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "this program has no recurrent-only path (an attention sink needs attention)"
+                    .into(),
+            );
+        }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
+    };
     let slots = ws
         .reserve(pool_pages)
         .context("reserve attention-sink KV")?;
@@ -73,15 +103,15 @@ async fn main(input: Input) -> Result<String> {
     let prefill_embed_indptr = Channel::from([0u32, n]).named("prefill_embed_indptr");
     let prefill_positions = Channel::from_iter(0..n).named("prefill_positions");
     let prefill_slots =
-        Channel::from_iter((0..n).map(|position| pool_ids[(position / PAGE_T) as usize]));
-    let prefill_offsets = Channel::from_iter((0..n).map(|position| position % PAGE_T));
+        Channel::from_iter((0..n).map(|position| pool_ids[(position / page_t) as usize]));
+    let prefill_offsets = Channel::from_iter((0..n).map(|position| position % page_t));
     let prefill_klen = Channel::from([n]);
     let prefill_pages = Channel::from(pool_ids.clone());
     // The page CSR is the wire's source of truth for kv_len: the engine derives
-    // `kv_len = (page_count-1)*PAGE_T + last_page_len`. A pool-wide constant page
+    // `kv_len = (page_count-1)*page_t + last_page_len`. A pool-wide constant page
     // count claims a kv length the pass does not have and silently corrupts
     // attention, so the count must track `kv_len` exactly.
-    let prefill_indptr = Channel::from([0u32, n.div_ceil(PAGE_T)]);
+    let prefill_indptr = Channel::from([0u32, n.div_ceil(page_t)]);
     let causal = Channel::from_shaped(
         [n, pool_len],
         (0..n)
@@ -93,17 +123,24 @@ async fn main(input: Input) -> Result<String> {
     let prefill = ForwardPass::new();
     prefill.embed(&prompt_tokens, &prefill_embed_indptr)?;
     prefill.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &prefill_klen,
-            pages: &prefill_pages,
-            page_indptr: &prefill_indptr,
-            w_slot: &prefill_slots,
-            w_off: &prefill_offsets,
-            positions: &prefill_positions,
-            mask: Some(&causal),
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &prefill_klen,
+                pages: &prefill_pages,
+                page_indptr: &prefill_indptr,
+                w_slot: &prefill_slots,
+                w_off: &prefill_offsets,
+                positions: &prefill_positions,
+                mask: Some(&causal),
+            },
+        }),
+        &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     prefill.epilogue(move || {
@@ -134,14 +171,14 @@ async fn main(input: Input) -> Result<String> {
     let position = Channel::from([n]).named("position");
     let fill = Channel::from([n + 1]).named("fill");
     let klen = Channel::from([n + 1]).named("klen");
-    let write_slot = Channel::from([pool_ids[(n / PAGE_T) as usize]]);
-    let write_offset = Channel::from([n % PAGE_T]);
+    let write_slot = Channel::from([pool_ids[(n / page_t) as usize]]);
+    let write_offset = Channel::from([n % page_t]);
     let mask = Channel::from_shaped(
         [1, pool_len],
         host_sink_window_mask(pool_len, n, sink, window),
     );
     let pages = Channel::from(pool_ids.clone());
-    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]);
+    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_t)]);
     let pool_ids_input = Channel::from(pool_ids.clone()).named("pool_ids");
     let token_out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
@@ -151,17 +188,24 @@ async fn main(input: Input) -> Result<String> {
     let decode_indptr = Channel::from([0u32, 1]).named("decode_indptr");
     decode.embed(&token_in, &decode_indptr)?;
     decode.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &klen,
-            pages: &pages,
-            page_indptr: &page_indptr,
-            w_slot: &write_slot,
-            w_off: &write_offset,
-            positions: &position,
-            mask: Some(&mask),
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &write_slot,
+                w_off: &write_offset,
+                positions: &position,
+                mask: Some(&mask),
+            },
+        }),
+        &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     decode.epilogue(move || {
@@ -172,7 +216,7 @@ async fn main(input: Input) -> Result<String> {
             sink_window_mask(&base, pool_len, sink, window),
             [1, pool_len],
         );
-        let logical_slot = &base / PAGE_T;
+        let logical_slot = &base / page_t;
         let next = &base + 1u32;
 
         // Device-resolved geometry is loop-carried: the host never drains
@@ -183,10 +227,10 @@ async fn main(input: Input) -> Result<String> {
         fill.put(&next);
         klen.put(&next);
         write_slot.put(gather(&ids, &logical_slot));
-        write_offset.put(&base % PAGE_T);
+        write_offset.put(&base % page_t);
         mask.put(&next_mask);
         pages.put(reshape(&ids, [pool_pages]));
-        let page_count = next.div_ceil(PAGE_T);
+        let page_count = next.div_ceil(page_t);
         page_indptr.put(indptr(1, &page_count));
         pool_ids_input.put(&ids);
     });

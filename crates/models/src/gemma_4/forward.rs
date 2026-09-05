@@ -11,6 +11,12 @@ pub struct Facts {
     pub has_adapter: bool,
     pub media: bool,
     pub drafts: bool,
+    /// Lanes that want their attention's per-query LSE kept — see
+    /// [`Facts::captures_scores`].
+    pub captures_scores: bool,
+    /// The rows are a block drafter's proposal — see [`Facts::block_draft`].
+    pub block_draft: bool,
+    /// The rows are a block-diffusion denoiser's canvas — see [`Facts::denoise`].
     pub denoise: bool,
 }
 
@@ -41,12 +47,28 @@ impl Facts {
         Predicate::fact(4)
     }
 
+    /// Lanes that want their attention's per-query LSE kept (the H2O / TOVA /
+    /// SnapKV observation the `attn_score` intrinsic reads). Bit 5 of the
+    /// fact word. Ordered before `qo_one` in the split so a capturing lane
+    /// takes the capture arm regardless of row count; only `masked` outranks
+    /// it — the same order `qwen_3` fixes.
+    pub fn captures_scores() -> Predicate {
+        Predicate::fact(5)
+    }
+
+    /// Lanes whose rows are a block drafter's proposal rather than the
+    /// sequence's own — `[anchor, MASK x block-1]`, which the trunk must not
+    /// run over. Bit 6 of the fact word; the same hook `qwen_3` spells.
+    pub fn block_draft() -> Predicate {
+        Predicate::fact(6)
+    }
+
     /// Rows read as a block-diffusion denoiser's canvas: their embedding
     /// is the denoiser's input (`Model::self_cond`), not the encoder's. Bit
-    /// 5 of the fact word; split on only by a text that declares the block,
+    /// 7 of the fact word; split on only by a text that declares the block,
     /// so an autoregressive Gemma 4 never carves a class for it.
     pub fn denoise() -> Predicate {
-        Predicate::fact(5)
+        Predicate::fact(7)
     }
 }
 
@@ -58,6 +80,8 @@ impl Classify for Facts {
             has_adapter: r.has_adapter(),
             media: r.has_media(),
             drafts: r.drafts(),
+            captures_scores: r.captures_scores(),
+            block_draft: r.drafts_a_block(),
             denoise: r.denoise(),
         }
     }
@@ -68,7 +92,9 @@ impl Classify for Facts {
             | (u64::from(self.has_adapter) << 2)
             | (u64::from(self.media) << 3)
             | (u64::from(self.drafts) << 4)
-            | (u64::from(self.denoise) << 5)
+            | (u64::from(self.captures_scores) << 5)
+            | (u64::from(self.block_draft) << 6)
+            | (u64::from(self.denoise) << 7)
     }
 }
 
@@ -95,21 +121,41 @@ impl ForwardHybrid for Model {
             let plane = self.global.kv_heads as u64 * self.global.head_dim as u64;
             c.kv(kv, a.attn.kv.clone(), [plane, plane]);
         }
+        if let Some(d) = &self.dflash {
+            d.declare_caches(&mut c, kv);
+        }
         c
     }
 
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
 
-        let positions = inputs.positions();
         let qo_one = Facts::qo_one();
         let fused = qo_one.clone() & !Facts::masked();
 
         // Sliding/global readings need separate plans (head width, kv chunk
         // size, window differ); classes need separate plans too, or sharing
         // one would straddle rebased boundaries (`Fault::Straddled`).
-        let classes = [Facts::masked(), qo_one.clone(), Predicate::rest()];
-        let [input_m, input_d, input_p] = inputs.split(classes.clone());
+        // Masked is ordered before captures: a lane asking for both gets the
+        // masked arm with no scores.
+        let classes = [
+            Facts::masked(),
+            Facts::captures_scores(),
+            qo_one.clone(),
+            Predicate::rest(),
+        ];
+        // The drafter's rows leave before the classes are cut, so a plan and
+        // the query it is consumed by say the same guard (see `qwen_3`).
+        let (_, trunk_inputs) = match &m.dflash {
+            Some(_) => inputs.split(&Facts::block_draft()),
+            None => (inputs.clone(), inputs.clone()),
+        };
+        let [input_m, input_s, input_d, input_p] = trunk_inputs.split(classes.clone());
+        // The trunk's positions carry the trunk rows' guard, so a value cut
+        // from them meets a value cut from the residual stream (the CUDA
+        // fused qkv splits both by `fused`); the drafter takes its own off
+        // `inputs` inside `arm`.
+        let positions = trunk_inputs.positions();
         let plan_m = [
             ops::attn::plan_prefill(
                 &input_m,
@@ -152,6 +198,24 @@ impl ForwardHybrid for Model {
             ),
             ops::attn::plan_prefill(
                 &input_p,
+                m.q_heads,
+                m.global.kv_heads,
+                m.global.head_dim,
+                None,
+            ),
+        ];
+        // The score-capturing arm's plans: a prefill schedule per reading, as
+        // `plan_p`, over the capturing lanes alone.
+        let plan_s = [
+            ops::attn::plan_prefill(
+                &input_s,
+                m.q_heads,
+                m.sliding.kv_heads,
+                m.sliding.head_dim,
+                Some(m.sliding.window),
+            ),
+            ops::attn::plan_prefill(
+                &input_s,
                 m.q_heads,
                 m.global.kv_heads,
                 m.global.head_dim,
@@ -207,6 +271,18 @@ impl ForwardHybrid for Model {
             );
             y = Value::merge(vec![den, enc]);
         }
+        // **THE BLOCK DRAFTER'S ROWS LEAVE HERE**, before the first layer,
+        // and are the drafter's input as they are: the reference feeds it
+        // the target's `embed_tokens`, which for gemma carries the √hidden
+        // scale already applied above. See `qwen_3` for the rest of the hook.
+        let (h_block, mut y) = match &m.dflash {
+            Some(_) => {
+                let (block, rest) = y.split(&Facts::block_draft());
+                (Some(block), rest)
+            }
+            None => (None, y),
+        };
+        let mut tapped: Option<Value> = None;
 
         let relay = m.ple.as_ref().map(|ple| {
             let proj = ops::linear::matmul(&y, &ple.model_proj) * (m.hidden as f32).sqrt().recip();
@@ -294,7 +370,43 @@ impl ForwardHybrid for Model {
 
             seam::at(seam::ATTN_Q, &[&q]);
 
-            let [mq, dq, p] = q.split(classes.clone());
+            // Four arms of one merge: masked, score-capturing, decode,
+            // prefill. The split order here must match the class order above.
+            //
+            // **ONLY THE GLOBAL READING EXPORTS A SCORE PLANE.** A sliding
+            // layer's row is a softmax over its window, not over the request's
+            // keys — every key outside the window would read as unattended
+            // rather than as excluded — and the capture kernel refuses a
+            // window for exactly that reason (`attention.score_capture`). So
+            // the capturing class runs the plain prefill on a sliding layer
+            // and the LSE-keeping one on a global layer, and the load exports
+            // one plane per global layer (five of thirty on the 26B), which
+            // is what a program's `attn_score(planes)` counts.
+            let [mq, sq, dq, p] = q.split(classes.clone());
+            let so = match at.reading {
+                Reading::Sliding => ops::attn::prefill(
+                    &sq,
+                    &plan_s[at.reading as usize],
+                    pages,
+                    win,
+                    d,
+                    kv_heads,
+                    at.sm_scale,
+                ),
+                Reading::Global => {
+                    let (so, lse) = ops::attn::prefill_lse(
+                        &sq,
+                        &plan_s[at.reading as usize],
+                        pages,
+                        win,
+                        d,
+                        kv_heads,
+                        at.sm_scale,
+                    );
+                    seam::at(seam::SCORES, &[&lse]);
+                    so
+                }
+            };
             let a = Value::merge(vec![
                 ops::attn::masked(
                     &mq,
@@ -303,8 +415,11 @@ impl ForwardHybrid for Model {
                     pages,
                     win,
                     d,
+                    kv_heads,
+                    true,
                     at.sm_scale,
                 ),
+                so,
                 ops::attn::decode(
                     &dq,
                     &plan_d[at.reading as usize],
@@ -440,15 +555,32 @@ impl ForwardHybrid for Model {
             if let Some(scalar) = &w.scalar {
                 y = ops::elemwise::scale(scalar, &y);
             }
+            if let Some(d) = &m.dflash {
+                d.tap(l, &y, &mut tapped);
+            }
         }
 
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
+        // The drafter reads out through the TARGET's head — softcap included,
+        // which is monotone and so leaves its argmax the head's own — so its
+        // rows join the trunk's before the one `lm_head`.
+        let (x, hb) = match (&m.dflash, h_block) {
+            (Some(d), Some(block)) => {
+                let tapped = tapped.as_ref().expect("a block drafter tapped the trunk");
+                let hb = d.arm(&inputs, tapped, &block, &mask, &Facts::block_draft());
+                (Value::merge(vec![hb.clone(), x]), Some(hb))
+            }
+            _ => (x, None),
+        };
         let logits = ops::linear::lm_head(&x, &m.embed);
         let logits = if let Some(cap) = m.softcap {
             ops::attn::logit_softcap(&logits, cap)
         } else {
             logits
         };
+        if let Some(d) = &m.dflash {
+            d.plant_readout(&logits, &inputs, hb.as_ref(), &Facts::block_draft());
+        }
 
         // Stated after the trunk's own readout: the export arena gives the
         // delivery tail to the last-stated node, so an earlier draft column

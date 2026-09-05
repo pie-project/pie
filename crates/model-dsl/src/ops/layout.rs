@@ -193,6 +193,25 @@ pub fn argmax(xs: &[&Value]) -> Value {
     y
 }
 
+/// The `k` largest entries of every row, sorted descending — `(values
+/// [rows, k] f32, indices [rows, k] i32)`. Ties to the lower column, a NaN
+/// never chosen: the argmax rule, so the first column IS [`argmax`].
+pub fn topk(x: &Value, k: u32) -> (Value, Value) {
+    let r = x.rec();
+    let values = r.fresh(tensor(x.rows(), u64::from(k), Dtype::F32));
+    let indices = r.fresh(tensor(x.rows(), u64::from(k), Dtype::I32));
+    r.push(
+        Layout::TopK {
+            x: x.id(),
+            k,
+            values: values.id(),
+            indices: indices.id(),
+        },
+        &[x],
+    );
+    (values, indices)
+}
+
 /// [`scatter_rows`] plus a negative `routes` entry meaning "this row has no
 /// destination" — what a compacting fold ([`pool_rows`], [`merge_rows`])
 /// owes the scatter, since `routes` has one entry per row of the full

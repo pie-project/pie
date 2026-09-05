@@ -135,29 +135,6 @@ pub struct Channel {
 /// embeds nothing, appends no KV, and advances no position.
 pub const TOKEN_PAD: i32 = -1;
 
-/// Pad a token window to `envelope` slots with [`TOKEN_PAD`]; panics if too long.
-pub fn pad_tokens(tokens: &[u32], envelope: usize) -> Vec<i32> {
-    assert!(
-        tokens.len() <= envelope,
-        "window of {} tokens exceeds its envelope of {envelope}",
-        tokens.len(),
-    );
-    tokens
-        .iter()
-        .map(|&token| token as i32)
-        .chain(std::iter::repeat(TOKEN_PAD))
-        .take(envelope)
-        .collect()
-}
-
-/// Recover the live tokens from a device envelope, dropping every [`TOKEN_PAD`] slot.
-pub fn unpad_tokens(window: &[i32]) -> Vec<u32> {
-    window
-        .iter()
-        .filter(|&&token| token != TOKEN_PAD)
-        .map(|&token| token as u32)
-        .collect()
-}
 
 impl Channel {
     /// `Channel::new([shape], dtype)` at capacity 1.
@@ -654,6 +631,10 @@ pub trait PassWit: Sized + 'static {
     /// The pass's layer truncation.
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String>;
 
+    /// Mark this pass's rows a block drafter's proposal, so the model's
+    /// trunk does not run over them. See the WIT door for what it means.
+    fn set_drafting_block(&self, on: bool) -> Result<(), String>;
+
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String>;
 
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String>;
@@ -673,6 +654,10 @@ impl PassWit for wit_attention::ForwardPass {
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
         wit_attention::ForwardPass::readout(self, indices)
     }
+    fn set_drafting_block(&self, on: bool) -> Result<(), String> {
+        wit_attention::ForwardPass::set_drafting_block(self, on).map_err(|e| e.to_string())
+    }
+
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
         wit_attention::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
     }
@@ -701,6 +686,9 @@ impl PassWit for wit_diffusion::ForwardPass {
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
         wit_diffusion::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
     }
+    fn set_drafting_block(&self, on: bool) -> Result<(), String> {
+        wit_diffusion::ForwardPass::set_drafting_block(self, on).map_err(|e| e.to_string())
+    }
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
         wit_diffusion::ForwardPass::program(self, bytes, channels)
     }
@@ -723,6 +711,10 @@ impl PassWit for wit_recurrent::ForwardPass {
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
         wit_recurrent::ForwardPass::readout(self, indices)
     }
+    fn set_drafting_block(&self, on: bool) -> Result<(), String> {
+        wit_recurrent::ForwardPass::set_drafting_block(self, on).map_err(|e| e.to_string())
+    }
+
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
         wit_recurrent::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
     }
@@ -748,6 +740,10 @@ impl PassWit for wit_hybrid::ForwardPass {
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
         wit_hybrid::ForwardPass::readout(self, indices)
     }
+    fn set_drafting_block(&self, on: bool) -> Result<(), String> {
+        wit_hybrid::ForwardPass::set_drafting_block(self, on).map_err(|e| e.to_string())
+    }
+
     fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
         wit_hybrid::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
     }
@@ -964,9 +960,9 @@ mod page_declaration_tests {
 }
 
 impl<W: PassWit> Pass<W> {
-    /// Does this pass bind a dense `AttnMask` channel? Kept here (not
-    /// [`live_slots`]) since that call site has no pass in hand.
-    pub fn binds_device_mask(&self) -> bool {
+    /// Does this pass bind a dense `AttnMask` channel? [`run_ahead`] gives
+    /// such a pass one slot per frame.
+    fn binds_device_mask(&self) -> bool {
         self.inner
             .borrow()
             .ports
@@ -1102,11 +1098,9 @@ impl<W: PassWit> Pass<W> {
     where
         B: RangeBounds<u32>,
     {
-        if working_sets.is_empty() {
-            return Err(
-                "forward pass needs one recurrent-state working set per request".to_string(),
-            );
-        }
+        // No count check here: the host owns that verdict. An empty set is
+        // the attention case of a hybrid pass, accepted on an attention model
+        // and refused by name on a folding one (`validate_count`).
         let buffer = PageDeclaration::from_range(geom.buffer)?;
         let staged = match geom.fold_len {
             Some(fold_len) => {
@@ -1150,6 +1144,19 @@ impl<W: PassWit> Pass<W> {
     /// class). Call before `program`.
     pub fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
         self.wit.set_max_layers(max_layers)
+    }
+
+    /// **These rows are a block drafter's proposal, not the sequence's own.**
+    /// A block drafter proposes many tokens in one pass over a block whose
+    /// first row is the correction the target just made and whose rest is
+    /// the model's mask token; the trunk must not run over them, and a plan
+    /// carrying such a drafter guards itself on this. Call before `program`.
+    ///
+    /// It cannot be inferred from what the pass reads, the way drafting is:
+    /// what makes a fire a draft is the anchor chosen from the accepted
+    /// prefix, which only this guest knows.
+    pub fn set_drafting_block(&self, on: bool) -> Result<(), String> {
+        self.wit.set_drafting_block(on)
     }
 
     /// Attach a PEFT adapter at `site`: `f` receives input `x` and base
@@ -1339,25 +1346,6 @@ pub fn channel_capacity() -> usize {
     (crate::model::channel_capacity() as usize).max(2)
 }
 
-/// Live slots per frame for the bound model: k for dense, 1 for recurrent
-/// (linear/hybrid) — conservative, not a hard constraint.
-pub fn live_slots() -> usize {
-    thread_local! {
-        static LIVE: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
-    }
-    LIVE.with(|live| {
-        *live.get_or_init(|| {
-            if matches!(
-                crate::model::pass_kind(),
-                crate::model::ForwardKind::Recurrent | crate::model::ForwardKind::Hybrid
-            ) {
-                1
-            } else {
-                frame_size()
-            }
-        })
-    })
-}
 
 /// Tokens per KV page (cached); prefer [`WorkingSet::page_size`] when a
 /// working set is in hand.
@@ -1441,14 +1429,13 @@ pub async fn run_ahead<W: PassWit>(
     }
     // A pass that binds a dense device mask takes one slot per frame — see
     // `Pass::binds_device_mask`.
-    let r = if pass.binds_device_mask() {
-        1
-    } else {
-        live_slots()
-    };
-    // `channel_capacity()` carries the staging margin; the window is what
-    // remains, in frames of `r` live slots.
-    let window_frames = ((channel_capacity() - 1) / r.max(1)).max(1);
+    let r = if pass.binds_device_mask() { 1 } else { frame_size() };
+    // THE WINDOW IS THE RUNTIME'S NUMBER, NOT RECOVERED FROM THE RING. The
+    // runtime derives the ring size and the window from one source and
+    // publishes both; a guest that re-derived one from the other believed a
+    // number the runtime never stated. In frames of `r` live slots.
+    let window_fires = crate::model::run_ahead_window() as usize;
+    let window_frames = (window_fires / r.max(1)).max(1);
 
     let mut submitted = 0usize;
     let mut consumed = 0usize;
@@ -1550,8 +1537,7 @@ impl Default for Pipeline {
 pub mod shared_prelude {
     pub use super::{
         Channel, KvBinding, KvGeometry, PageGrant, Pipeline, RsGeometry, RsWorkingSet, TOKEN_PAD,
-        WorkingSet, channel_capacity, frame_size, kv_page_size, live_slots, max_embed_length,
-        pad_tokens, prefill_chunks, unpad_tokens,
+        WorkingSet, channel_capacity, frame_size, kv_page_size, max_embed_length, prefill_chunks,
     };
     /// Every inferlet returns `inferlet::Result` and uses `model`, so both ride the prelude.
     pub use crate::{Context, Result, model};

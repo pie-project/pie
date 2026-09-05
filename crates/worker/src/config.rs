@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use controller_api::Role;
 // Run-ahead depths come from the engine contract's own module.
 pub use engine::runahead::Runahead;
@@ -83,7 +83,7 @@ impl Config {
         })?;
         let reshaped = crate::config::layout::reshape(file)?;
         let s = &toml::to_string(&reshaped).map_err(|e| anyhow::anyhow!("reshape config: {e}"))?;
-        let cfg: Config = toml::from_str(s).map_err(|e| {
+        let mut cfg: Config = toml::from_str(s).map_err(|e| {
             if s.contains("[[model]]") {
                 anyhow::anyhow!(
                     "parse config: {e}\n\
@@ -94,6 +94,7 @@ impl Config {
                 anyhow::anyhow!("parse config: {e}")
             }
         })?;
+        cfg.model.resolve_drafter()?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -465,6 +466,16 @@ pub struct ModelConfig {
     /// one — the cheapest row whose contract and plan fit the checkpoint.
     #[serde(default)]
     pub sku: Option<String>,
+    /// Which published draft head to serve `model` with, by its short name
+    /// (`dflash`, `dflash2`): `sku` looked up in the catalog's table of
+    /// published heads (`models::drafter::PUBLISHED`) for the target `model`
+    /// names, so a deployment says which drafter it wants rather than which
+    /// row spells it. The artifact must already carry the head — `pie model
+    /// import <target> --drafter <name>` is what puts it there. Refused when
+    /// `model` is a path (the table keys on repository ids) or names a target
+    /// the table lacks; `sku` beside it must agree.
+    #[serde(default)]
+    pub drafter: Option<String>,
     /// Which backend runs the model, on what devices.
     pub engine: EngineConfig,
     /// Where this model's materialized-weight artifacts are kept between runs.
@@ -617,6 +628,47 @@ impl ModelConfig {
     #[must_use]
     pub fn patch_ceilings(&self) -> (Option<u32>, Option<u32>) {
         (self.max_patches, self.max_images)
+    }
+
+    /// Resolve `[model] drafter` into `[model] sku` through the published
+    /// heads table. Called once at load, before validation.
+    ///
+    /// # Errors
+    ///
+    /// A `model` the table cannot key (a path), a name it does not know for
+    /// this target, or a `sku` that names another row.
+    pub fn resolve_drafter(&mut self) -> Result<()> {
+        let Some(drafter) = self.drafter.as_deref() else {
+            return Ok(());
+        };
+        let target = self.model.trim();
+        ensure!(
+            !target.contains('/') || !target.ends_with(".zt"),
+            "model.drafter = {drafter:?} needs model.model to name the target repository \
+             (as `pie model list` prints it), not an artifact path {target:?}; name the row \
+             with model.sku instead"
+        );
+        let Some(published) = models::drafter::published(target, drafter) else {
+            let known: Vec<&str> = models::drafter::published_for(target).map(|p| p.drafter).collect();
+            bail!(
+                "model.drafter = {drafter:?}: no published head of that name for {target:?} in this \
+                 build{}",
+                if known.is_empty() {
+                    "; it knows none for that target — name the row with model.sku".to_string()
+                } else {
+                    format!("; it knows {known:?}")
+                }
+            );
+        };
+        match &self.sku {
+            Some(sku) if sku != published.sku => bail!(
+                "model.sku = {sku:?} and model.drafter = {drafter:?} name different rows (the \
+                 drafter's is {:?}); state one of them",
+                published.sku
+            ),
+            _ => self.sku = Some(published.sku.to_string()),
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {

@@ -134,6 +134,8 @@ pub fn masked(
     pages: ValueId,
     window: Option<u32>,
     head_dim: u32,
+    kv_heads: u32,
+    causal: bool,
     sm_scale: f32,
 ) -> Value {
     let r = q.rec();
@@ -146,6 +148,8 @@ pub fn masked(
             cache: pages,
             window,
             head_dim,
+            kv_heads,
+            causal,
             sm_scale,
             o: o.id(),
         },
@@ -360,6 +364,69 @@ pub fn ssm_causal_conv1d_chunked_dilated(
         &[x],
     );
     y
+}
+
+/// DFlash2's two-tap grouped dynamic convolution along each request's rows
+/// (`Attention::BlockDynConv`): `side` 0 convolves a sublayer's input, 1 its
+/// output, both with the coefficients `coeff` projected from that input;
+/// `base` is the learned `[2·taps, channels]` kernel the projection corrects.
+pub fn block_dyn_conv(
+    x: &Value,
+    coeff: &Value,
+    base: &Weight,
+    side: u32,
+    taps: u32,
+    group: u32,
+) -> Value {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Attention::BlockDynConv {
+            x: x.id(),
+            coeff: coeff.id(),
+            base: r.weight(base),
+            side,
+            taps,
+            group,
+            y: y.id(),
+        },
+        &[x, coeff],
+    );
+    y
+}
+
+/// DFlash2's candidate selector, walked from each request's anchor
+/// (`Attention::SelectorWalk`): the picked id at every slot row, `[rows, 1]`
+/// i32 — a draft readout, planted where [`layout::argmax`](super::layout::argmax)'s
+/// would be.
+pub fn selector_walk(
+    cand: &Value,
+    unary: &Value,
+    hp: Option<&Value>,
+    tokens: &Value,
+    pred: &Weight,
+    succ: &Weight,
+    first: u32,
+) -> Value {
+    let r = cand.rec();
+    let picks = r.fresh(tensor(cand.rows(), 1u64, Dtype::I32));
+    let mut deps: Vec<&Value> = vec![cand, unary];
+    deps.extend(hp);
+    deps.push(tokens);
+    r.push(
+        Attention::SelectorWalk {
+            cand: cand.id(),
+            unary: unary.id(),
+            hp: hp.map(Value::id),
+            tokens: tokens.id(),
+            pred: r.weight(pred),
+            succ: r.weight(succ),
+            first,
+            picks: picks.id(),
+        },
+        &deps,
+    );
+    picks
 }
 
 /// PLE n-gram hasher: `state` is the lane's trailing-token-id window; `mults`,

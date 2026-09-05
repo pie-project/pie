@@ -6,6 +6,7 @@
 use kernels_metal::Tensor;
 use kernels_metal::attn::ple;
 use kernels_metal::linear::moe::{self, RoutedScratch};
+use kernels_metal::linear::quant;
 use model_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use model_exec::store::arena::rect;
 use model_ir::{Attention, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
@@ -19,6 +20,11 @@ use crate::run::{PoolSlabs, WeightRow, WeightTable};
 /// The alignment every role and every sub-rectangle starts on — `inputs`'
 /// number, for `inputs`' reason.
 const ALIGN: u64 = 256;
+
+/// Rows the split-K tile may carry: the 8 rung's, since the split is that rung's alone.
+const SPLITK_ROWS: u64 = 8;
+/// The most K partitions the split takes (`linear::quant::splitk`'s cap).
+const SPLITK_MAX: u64 = 8;
 
 /// One working rectangle inside the plane: where it starts, and the shape a
 /// [`Tensor`] states for it.
@@ -114,6 +120,11 @@ pub struct Scratch {
     plane: Buffer,
 
     precast: Option<Room>,
+    /// Split-K partials for the sparse `bm = 8` tile: `SPLITK_ROWS x SPLITK_MAX`
+    /// f32 rows at the widest dense N `linear::quant::splitk` would split.
+    /// `None` when no dense projection is narrow enough to split. Aliased
+    /// with the roles beside it — consumed by the reduce in the same chain.
+    partials: Option<Room>,
     routed: Option<Routed>,
     /// The NSA indexer's per-row score slab: `rows x max_kv` floats, `None`
     /// for an artifact with no `attention.index_topk` node. Aliased with the
@@ -241,6 +252,23 @@ impl Scratch {
             let mut at = 0u64;
             Room::lay(&mut at, act_rows, act_k, Dtype::F16)
         });
+        // The split is the 8 rung's alone, so the plane is eight rows by the
+        // widest split, at the widest N that splits. Group 32 is the least
+        // restrictive divisibility, so the width is a ceiling.
+        let partials = dense
+            .iter()
+            .filter(|&&(n, k)| {
+                let (Ok(n), Ok(k)) = (i32::try_from(n), i32::try_from(k)) else {
+                    return false;
+                };
+                quant::splitk(n, 8, 8, k, 32, 4) > 1
+            })
+            .map(|&(n, _)| u64::from(n))
+            .max()
+            .map(|n| {
+                let mut at = 0u64;
+                Room::lay(&mut at, SPLITK_ROWS * SPLITK_MAX, n, Dtype::F32)
+            });
         let routed = (sorted > 0).then(|| {
             let mut at = 0u64;
             Routed {
@@ -278,6 +306,7 @@ impl Scratch {
 
         let union = precast
             .map_or(0, |r| r.at + r.bytes())
+            .max(partials.map_or(0, |r| r.at + r.bytes()))
             .max(routed.map_or(0, |r| r.y.at + r.y.bytes()))
             .max(index.map_or(0, |r| r.at + r.bytes()));
         // Added, not unioned: starts where the three aliased roles end, so
@@ -341,6 +370,7 @@ impl Scratch {
         Ok(Scratch {
             plane,
             precast,
+            partials,
             routed,
             index,
             copy,
@@ -392,6 +422,21 @@ impl Scratch {
             ..room
         }
         .bind(handles, &self.plane))
+    }
+
+    /// The split-K partials plane, cut to `rows x width` f32. `None` when
+    /// this artifact reserved none or the rectangle exceeds it.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`](crate::error::Fault::Ceiling) for a handle table
+    /// already full.
+    pub fn partials(&self, handles: &Handles, rows: u32, width: u32) -> Option<Result<Tensor>> {
+        let room = self.partials?;
+        if u64::from(rows) * u64::from(width) > room.bytes() / 4 {
+            return None;
+        }
+        Some(Room { rows, width, ..room }.bind(handles, &self.plane))
     }
 
     /// One rectangle of the copy role's slab, at `offset` bytes into it. The

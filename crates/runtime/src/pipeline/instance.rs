@@ -150,6 +150,10 @@ pub struct ForwardBindings {
     /// Run layers [0, k) and take the head at k for this pass's fires;
     /// `None` = full model.
     pub max_layers: Option<u32>,
+    /// This pass's rows are a block drafter's proposal (WIT
+    /// `set-drafting-block`), so every lane of every fire it submits carries
+    /// the fact a plan guards its trunk on.
+    pub block_draft: bool,
     /// The spans this pass's tokens carry, in the order `forward-pass.media`
     /// attached them. Empty on every text-only pass. `Arc` so a decoded
     /// image submitted to two passes is decoded once.
@@ -319,6 +323,9 @@ pub struct BoundForwardPass {
     /// [`ForwardBindings::max_layers`] at bind; stamped onto every fire's
     /// [`crate::engine::LaunchPlan`].
     pub max_layers: Option<u32>,
+    /// Copied from [`ForwardBindings::block_draft`] at bind; stamped onto
+    /// every lane of every fire this pass submits.
+    pub block_draft: bool,
     /// Guest-owned recurrent-state working sets (hybrid/linear-attention
     /// models), in resolved forward-request order; empty for pure attention.
     pub rs_ws: Vec<u32>,

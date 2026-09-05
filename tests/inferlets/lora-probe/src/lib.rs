@@ -44,7 +44,7 @@
 //! parameter that reaches the channel shape expresses.
 
 use inferlet::eta::adapter::{Site, mm};
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
@@ -219,6 +219,10 @@ impl Weights {
 }
 
 /// State the adapter on one pass, through whichever surface was asked for.
+///
+/// An adapter is a per-layer prologue sink, and nothing about it knows whether
+/// the layer it corrects sits in an attention trunk or a hybrid one — which is
+/// exactly why the one pass type serves both.
 fn attach(fwd: &ForwardPass, w: &Weights, surface: &str, form: &str) -> Result<()> {
     if form == "scale" {
         let l = w.scale_channel();
@@ -259,6 +263,24 @@ async fn main(input: Input) -> Result<Output> {
     let surface = input.surface.clone();
     let form = input.form.clone();
     let ws = WorkingSet::new();
+    // One recurrent working set for this one sequence on a hybrid model (the
+    // engine requires one per request row); none on a pure-attention one. It
+    // is bound by EVERY pass this program builds — each prefill chunk and the
+    // decode — so the recurrence sees the whole sequence in order.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "this program has no recurrent-only path (the adapter site it probes is \
+                        an attention trunk's mixer output)"
+                    .into(),
+            );
+        }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
+    };
     let page_size = kv_page_size();
 
     let report = |text: String, count: usize| Output {
@@ -275,7 +297,14 @@ async fn main(input: Input) -> Result<Output> {
         return Ok(report(String::new(), 0));
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    // The model's opening (`<bos>` where it has one) before the raw text —
+    // the SAME opening `naive-baseline` puts there. This probe's whole claim
+    // is "naive-baseline plus one adapter and nothing else different", and
+    // on gemma the two openings answer different text at a zero adapter
+    // (" much like the…" against " of of of of"), which the A-1 gate then
+    // reads as the adapter path writing where it must not.
+    let mut prompt = inferlet::chat::prefix();
+    prompt.extend(wit_model::encode(&input.prompt));
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -316,17 +345,24 @@ async fn main(input: Input) -> Result<Output> {
         attach(&fwd_p, &weights, &surface, &form)?;
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len_p,
-                pages: &pages_p,
-                page_indptr: &page_indptr_p,
-                w_slot: &w_slot_p,
-                w_off: &w_off_p,
-                positions: &positions_p,
-                mask: None,
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &kv_len_p,
+                    pages: &pages_p,
+                    page_indptr: &page_indptr_p,
+                    w_slot: &w_slot_p,
+                    w_off: &w_off_p,
+                    positions: &positions_p,
+                    mask: None,
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
             },
         )?;
         fwd_p.epilogue(move || {
@@ -371,17 +407,24 @@ async fn main(input: Input) -> Result<Output> {
         attach(&fwd, &weights, &surface, &form)?;
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / page_size)..,
-                kv_len: &kv_len,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: (n / page_size)..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
             },
         )?;
         fwd.epilogue(move || {

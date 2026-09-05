@@ -61,9 +61,9 @@
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::chat;
+use inferlet::eta::hybrid::prelude::*;
 use inferlet::grammar::{Grammar, Matcher};
 use inferlet::mask::unpack_mask;
-use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -240,6 +240,21 @@ async fn main(input: Input) -> Result<Output> {
         // WorkingSet permanently claims the first pipeline it fires on, so all
         // rounds share this inferlet's single pipeline.
         let ws = WorkingSet::new();
+        // The recurrent half of that fresh state: one working set per round,
+        // because each round is a fresh sequence (the engine wants one per
+        // request row). Empty on a pure-attention model.
+        let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+            model::ForwardKind::Attention => Vec::new(),
+            model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+            model::ForwardKind::Recurrent => {
+                return Err(
+                    "ASAp needs a KV cache; this model's forward pass is recurrent-only".into(),
+                );
+            }
+            model::ForwardKind::Diffusion => {
+                return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+            }
+        };
         let page_size = kv_page_size();
         let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
         ws.reserve(max_pages).context("reserve KV")?;
@@ -264,17 +279,24 @@ async fn main(input: Input) -> Result<Output> {
         let prefill = ForwardPass::new();
         prefill.embed(&prompt_tokens, &pre_indptr)?;
         prefill.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &pre_kv_len,
-                pages: &pre_pages,
-                page_indptr: &pre_page_indptr,
-                w_slot: &pre_w_slot,
-                w_off: &pre_w_off,
-                positions: &pre_positions,
-                mask: None,
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &pre_kv_len,
+                    pages: &pre_pages,
+                    page_indptr: &pre_page_indptr,
+                    w_slot: &pre_w_slot,
+                    w_off: &pre_w_off,
+                    positions: &pre_positions,
+                    mask: None,
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
             },
         )?;
         prefill.epilogue(move || {
@@ -334,17 +356,24 @@ async fn main(input: Input) -> Result<Output> {
             let decode = ForwardPass::new();
             decode.embed(&token_in, &embed_indptr)?;
             decode.attention(
-                &ws,
-                KvGeometry {
-                    readable_pages: ..,
-                    writable_pages: (n / page_size)..,
-                    kv_len: &kv_len,
-                    pages: &pages,
-                    page_indptr: &page_indptr,
-                    w_slot: &w_slot,
-                    w_off: &w_off,
-                    positions: &positions,
-                    mask: None,
+                Some(KvBinding {
+                    working_set: &ws,
+                    geometry: KvGeometry {
+                        readable_pages: ..,
+                        writable_pages: (n / page_size)..,
+                        kv_len: &kv_len,
+                        pages: &pages,
+                        page_indptr: &page_indptr,
+                        w_slot: &w_slot,
+                        w_off: &w_off,
+                        positions: &positions,
+                        mask: None,
+                    },
+                }),
+                &rs_ws,
+                RsGeometry {
+                    fold_len: None,
+                    buffer: 0..0,
                 },
             )?;
             decode.epilogue(move || {

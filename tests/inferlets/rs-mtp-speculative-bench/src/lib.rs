@@ -288,7 +288,7 @@ async fn main(input: Input) -> Result<Output> {
         // the first window replays nothing; every epilogue puts the next.
         let fold_len = Channel::from([0u32]).named("fold_len");
         let out = Channel::new([w], dtype::i32)
-            .capacity((channel_capacity() + 7 * live_slots()) as u32)
+            .capacity((channel_capacity() + 7 * frame_size()) as u32)
             .named("out");
 
         let fwd = ForwardPass::new();

@@ -103,5 +103,6 @@ fn tower_and_trunk() -> Trace {
             values: vec![chain],
             layer: None,
         }],
+        drafter: None,
     }
 }

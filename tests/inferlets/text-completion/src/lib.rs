@@ -29,9 +29,7 @@
 //! Greedy (`reduce_argmax`) rather than sampled, because the point of the gate
 //! is that the same prompt produces the same continuation on every run.
 
-use std::ops::RangeBounds;
-
-use inferlet::eta::shared_prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -72,91 +70,25 @@ fn greedy(logits: Tensor) -> Tensor {
     reshape(reduce_argmax(&logits), [1])
 }
 
-/// What this program needs of a forward pass: bind the KV geometry, and —
-/// on a hybrid model — the recurrent working set beside it, folding every
-/// token straight into the recurrence. `text-completion-bench` states the same
-/// trait for the same reason: the two `pie:inferlet` pass interfaces have
-/// different `attention` signatures on purpose, and what they share for THIS
-/// program is the guest's to say.
-trait BindState {
-    fn bind_state<R, W>(
-        &self,
-        ws: &WorkingSet,
-        geom: KvGeometry<'_, R, W>,
-        rs: &[RsWorkingSet],
-    ) -> ::std::result::Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>;
-}
-
-impl BindState for inferlet::eta::attention::ForwardPass {
-    fn bind_state<R, W>(
-        &self,
-        ws: &WorkingSet,
-        geom: KvGeometry<'_, R, W>,
-        rs: &[RsWorkingSet],
-    ) -> ::std::result::Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>,
-    {
-        debug_assert!(rs.is_empty());
-        self.attention(ws, geom)
-    }
-}
-
-impl BindState for inferlet::eta::hybrid::ForwardPass {
-    fn bind_state<R, W>(
-        &self,
-        ws: &WorkingSet,
-        geom: KvGeometry<'_, R, W>,
-        rs: &[RsWorkingSet],
-    ) -> ::std::result::Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>,
-    {
-        self.attention(
-            Some(KvBinding {
-                working_set: ws,
-                geometry: geom,
-            }),
-            rs,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
-            },
-        )
-    }
-}
-
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    match model::pass_kind() {
-        model::ForwardKind::Attention => run_attention(input).await,
-        model::ForwardKind::Hybrid => run_hybrid(input).await,
-        model::ForwardKind::Recurrent => Err(
-            "this program has no recurrent-only path (no registered model reports that kind)".into(),
-        ),
-        model::ForwardKind::Diffusion => Err(
-            "this program decodes a token at a time; a diffusion model wants a canvas loop".into(),
-        ),
-    }
-}
-
-macro_rules! define_run {
-    ($name:ident, $kind:ident) => {
-async fn $name(input: Input) -> Result<Output> {
-    use inferlet::eta::$kind::ForwardPass;
     let max_tokens = input.max_tokens;
     let ws = WorkingSet::new();
-    // One recurrent working set for the whole generation on a hybrid model
-    // (the engine requires one per request row); none on a pure-attention one.
-    let rs_ws: Vec<RsWorkingSet> = if model::pass_kind() != model::ForwardKind::Attention {
-        vec![RsWorkingSet::new()]
-    } else {
-        Vec::new()
+    // The recurrent state, on a model that folds one: a row per sequence,
+    // and this program is one sequence. On a pure-attention model there is
+    // none, and an empty binding IS the attention pass (the hybrid interface
+    // with `rs = []`; the host accepts that on an attention model and
+    // refuses it on a folding one). Fold policy below: everything, every
+    // fire — this program never buffers.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err("this program has no recurrent-only path (it needs a KV cache)".into());
+        }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
     };
     let page_size = kv_page_size();
 
@@ -201,20 +133,26 @@ async fn $name(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &embed_indptr)?;
-        fwd.bind_state(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
-            },
+        fwd.attention(
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
+            }),
             &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
+            },
         )?;
         fwd.epilogue(move || {
             tok_out.put(&greedy(intrinsics::logits()));
@@ -264,20 +202,26 @@ async fn $name(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &embed_indptr)?;
-        fwd.bind_state(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
-            },
+        fwd.attention(
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
+            }),
             &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
+            },
         )?;
         fwd.epilogue(move || {
             // `length` is the readable extent this fire runs at, so it is
@@ -311,8 +255,3 @@ async fn $name(input: Input) -> Result<Output> {
         tokens: generated,
     })
 }
-    };
-}
-
-define_run!(run_attention, attention);
-define_run!(run_hybrid, hybrid);

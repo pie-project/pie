@@ -196,21 +196,15 @@ impl Run<'_> {
                 plus_one,
                 eps,
                 out,
-            } => {
-                elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))?;
-                let norm = if *plus_one {
-                    elemwise::norm::rmsnorm_plus_one
-                } else {
-                    elemwise::norm::rmsnorm
-                };
-                norm(
-                    self.ctx(),
-                    self.tensor(*y),
-                    self.tensor(*weight),
-                    *eps,
-                    self.tensor(*out),
-                )
-            }
+            } => elemwise::norm::residual_add_rmsnorm(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                self.tensor(*weight),
+                *plus_one,
+                *eps,
+                self.tensor(*out),
+            ),
             Elementwise::AddBias {
                 bias,
                 out,

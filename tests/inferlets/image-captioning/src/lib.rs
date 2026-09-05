@@ -34,69 +34,10 @@
 
 mod png;
 
-use std::ops::RangeBounds;
-
 use inferlet::chat;
-use inferlet::eta::shared_prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use inferlet::media;
 use serde::{Deserialize, Serialize};
-
-/// What this program needs of a forward pass: bind the KV geometry and — on a
-/// hybrid model — the recurrent working set beside it, folding every token
-/// into the recurrence (`text-completion` states the same trait). The media
-/// door is the same verb on both pass kinds.
-trait BindState {
-    fn bind_state<R, W>(
-        &self,
-        ws: &WorkingSet,
-        geom: KvGeometry<'_, R, W>,
-        rs: &[RsWorkingSet],
-    ) -> ::std::result::Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>;
-}
-
-impl BindState for inferlet::eta::attention::ForwardPass {
-    fn bind_state<R, W>(
-        &self,
-        ws: &WorkingSet,
-        geom: KvGeometry<'_, R, W>,
-        rs: &[RsWorkingSet],
-    ) -> ::std::result::Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>,
-    {
-        debug_assert!(rs.is_empty());
-        self.attention(ws, geom)
-    }
-}
-
-impl BindState for inferlet::eta::hybrid::ForwardPass {
-    fn bind_state<R, W>(
-        &self,
-        ws: &WorkingSet,
-        geom: KvGeometry<'_, R, W>,
-        rs: &[RsWorkingSet],
-    ) -> ::std::result::Result<(), String>
-    where
-        R: RangeBounds<u32>,
-        W: RangeBounds<u32>,
-    {
-        self.attention(
-            Some(KvBinding {
-                working_set: ws,
-                geometry: geom,
-            }),
-            rs,
-            RsGeometry {
-                fold_len: None,
-                buffer: 0..0,
-            },
-        )
-    }
-}
 
 #[derive(Deserialize)]
 struct Input {
@@ -199,30 +140,26 @@ fn sample_token() -> Tensor {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    match model::pass_kind() {
-        model::ForwardKind::Attention => run_attention(input).await,
-        model::ForwardKind::Hybrid => run_hybrid(input).await,
-        model::ForwardKind::Recurrent => {
-            Err("this program has no recurrent-only path (no registered model reports that kind)".into())
-        }
-        model::ForwardKind::Diffusion => {
-            Err("this program captions through an autoregressive decode; a diffusion model needs its own canvas loop".into())
-        }
-    }
-}
-
-macro_rules! define_run {
-    ($name:ident, $kind:ident) => {
-async fn $name(input: Input) -> Result<Output> {
-    use inferlet::eta::$kind::{ForwardPass, run_ahead};
     // One recurrent working set for the whole generation on a hybrid model
     // (the engine requires one per request row); none on a pure-attention one.
-    let rs_ws: Vec<RsWorkingSet> = if model::pass_kind() != model::ForwardKind::Attention {
-        vec![RsWorkingSet::new()]
-    } else {
-        Vec::new()
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "this program has no recurrent-only path (no registered model reports that kind)"
+                    .into(),
+            );
+        }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
     };
-    let rgb = if input.image_b64.is_some() { [0, 0, 0] } else { fill(&input.color)? };
+    let rgb = if input.image_b64.is_some() {
+        [0, 0, 0]
+    } else {
+        fill(&input.color)?
+    };
     if input.side == 0 {
         return Err("side must be at least one pixel".into());
     }
@@ -317,7 +254,9 @@ async fn $name(input: Input) -> Result<Output> {
         let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
         let embed_indptr_p = Channel::from([0u32, len]).named("embed_indptr_p");
         let positions_p = Channel::from_iter(base..end).named("positions_p");
-        let w_slot_pv: Vec<u32> = (base..end).map(|c| pool_ids[(c / page_t) as usize]).collect();
+        let w_slot_pv: Vec<u32> = (base..end)
+            .map(|c| pool_ids[(c / page_t) as usize])
+            .collect();
         let w_off_pv: Vec<u32> = (base..end).map(|c| c % page_t).collect();
         let w_slot_p = Channel::from(w_slot_pv).named("w_slot_p");
         let w_off_p = Channel::from(w_off_pv).named("w_off_p");
@@ -334,20 +273,26 @@ async fn $name(input: Input) -> Result<Output> {
             // correspondence by ordering alone and can state nothing else.
             fwd_p.media(&[media::Span::Image(&images[at])])?;
         }
-        fwd_p.bind_state(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &klen_p,
-                pages: &pages_p,
-                page_indptr: &page_indptr_p,
-                w_slot: &w_slot_p,
-                w_off: &w_off_p,
-                positions: &positions_p,
-                mask: None,
-            },
+        fwd_p.attention(
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &klen_p,
+                    pages: &pages_p,
+                    page_indptr: &page_indptr_p,
+                    w_slot: &w_slot_p,
+                    w_off: &w_off_p,
+                    positions: &positions_p,
+                    mask: None,
+                },
+            }),
             &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
+            },
         )?;
         fwd_p.epilogue(move || {
             g0_ch.put(&sample_token());
@@ -393,20 +338,26 @@ async fn $name(input: Input) -> Result<Output> {
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
-    fwd.bind_state(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: (n / page_t)..,
-            kv_len: &klen,
-            pages: &pages,
-            page_indptr: &page_indptr,
-            w_slot: &w_slot,
-            w_off: &w_off,
-            positions: &pos,
-            mask: None,
-        },
+    fwd.attention(
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_t)..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &pos,
+                mask: None,
+            },
+        }),
         &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
+        },
     )?;
     fwd.epilogue(move || {
         let base = fill_ch.take();
@@ -434,7 +385,11 @@ async fn $name(input: Input) -> Result<Output> {
         pool_ids_ch.put(&pids);
     });
 
-    let budget = if done { 0 } else { max_tokens.saturating_sub(1) };
+    let budget = if done {
+        0
+    } else {
+        max_tokens.saturating_sub(1)
+    };
     run_ahead(&pipe, &fwd, budget, async || {
         let t = out.take_host::<Vec<i32>>().await?;
         let token = *t.first().unwrap_or(&0) as u32;
@@ -465,8 +420,3 @@ async fn $name(input: Input) -> Result<Output> {
         rope_delta,
     })
 }
-    };
-}
-
-define_run!(run_attention, attention);
-define_run!(run_hybrid, hybrid);

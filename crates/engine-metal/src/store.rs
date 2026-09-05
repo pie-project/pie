@@ -491,6 +491,11 @@ impl Pools {
     /// [`Fault::Ceiling`] for a slot past the pool or a span past a slab,
     /// [`Fault::Deviceless`] for a non-Apple build.
     pub fn clear(&mut self, slot: u32) -> Result<()> {
+        // Nothing to zero on an attention-only plan, and no bank the seat
+        // could be past — the ceiling below is the banks' own.
+        if !self.has_state() {
+            return Ok(());
+        }
         if slot >= self.paging.slots {
             return Err(Fault::Ceiling {
                 what: "recurrent slots",
@@ -604,6 +609,77 @@ impl Pools {
         }
         Ok(())
     }
+
+    /// Copy whole recurrent slots between seats of these pools, into
+    /// `frame`'s command buffer — the device half of a recurrent fork. Each
+    /// `(src, dst)` pair moves every state row's span for `src` onto `dst`; a
+    /// recurrent bank is a folded summary of a prefix, not per-token entries,
+    /// so there is no narrower unit to move. Buffered activations
+    /// (`crate::rs`) are not touched: a fork's buffer is the runtime's to
+    /// re-derive or abandon.
+    ///
+    /// Encoded as a blit for the reason [`Pools::copy_kv`] gives: a host
+    /// `Buffer::write` is not ordered against a command buffer already on
+    /// the queue, and a blit inherits queue order without a drain.
+    ///
+    /// Two passes, like `copy_kv`: the first refuses a seat past the pool and
+    /// commits the frame's demand; the second encodes. A refused plan leaves
+    /// an empty, uncommitted command buffer. An attention-only plan has no
+    /// bank to move and answers `Ok` without encoding — and without a
+    /// ceiling, since the slot ceiling belongs to the banks alone (see
+    /// [`Supply::commit`](engine::frame::Supply::commit)).
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`] for a slot past the pool, [`Fault::Device`] when
+    /// the command buffer would not open a blit pass, [`Fault::Deviceless`]
+    /// off Apple.
+    pub fn copy_state(&mut self, frame: &mut Frame, moves: &[(u32, u32)]) -> Result<()> {
+        if moves.is_empty() || !self.has_state() {
+            return Ok(());
+        }
+        let mut highest = 0u32;
+        for &(src, dst) in moves {
+            for slot in [src, dst] {
+                if slot >= self.paging.slots {
+                    return Err(Fault::Ceiling {
+                        what: "recurrent slots",
+                        need: u64::from(slot) + 1,
+                        have: u64::from(self.paging.slots),
+                    });
+                }
+                highest = highest.max(slot.saturating_add(1));
+            }
+        }
+        // Both ends have to be admitted; a fork names its destination seat
+        // before any frame's demand has covered it.
+        engine::frame::Supply::commit(
+            self,
+            engine::frame::Demand {
+                kv_pages: 0,
+                state_slots: highest,
+                workspace: 0,
+            },
+        )?;
+        for (slab, shape) in self.slabs.iter().zip(&self.shapes) {
+            let Shape::State { stride, dtype } = *shape else {
+                continue;
+            };
+            let bytes = stride * u64::from(elem_size(dtype));
+            for &(src, dst) in moves {
+                if src == dst {
+                    continue;
+                }
+                let (from, to) = (u64::from(src) * bytes, u64::from(dst) * bytes);
+                // The blit itself has no bounds check; a copy past a
+                // reservation is a device fault.
+                slab.span(from, bytes)?;
+                slab.span(to, bytes)?;
+                frame.copy(slab.slab(), from, slab.slab(), to, bytes)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The engine's half of memory, on a plane whose reservation is fixed.
@@ -613,7 +689,15 @@ impl engine::frame::Supply for Pools {
     type Error = Fault;
 
     fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
-        if demand.state_slots > self.paging.slots {
+        // THE SLOT CEILING BELONGS TO THE RECURRENT BANKS, AND ONLY TO THEM.
+        // `demand.state_slots` is the fire's highest seat plus one, and a seat
+        // is a bank row — on a plan that folds no state there is no bank for
+        // it to be past. `slots` reserves nothing there either (`pool_demand`
+        // charges bytes per slot for `CacheRow::State` alone), so enforcing it
+        // refuses a fire over a resource this load never held: an
+        // attention-only deployment would seat `max_state_slots` sequences and
+        // kill the next one with a recurrent-slot refusal it cannot act on.
+        if self.has_state() && demand.state_slots > self.paging.slots {
             return Err(Fault::Ceiling {
                 what: "recurrent slots",
                 need: u64::from(demand.state_slots),
@@ -735,4 +819,106 @@ fn elem_size(dtype: Dtype) -> u32 {
 
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A state slab of `slots` seats at `stride` f32 each, and nothing else.
+    fn state_pools(device: &Context, slots: u32, stride: u64) -> Pools {
+        let bytes = stride * u64::from(slots) * u64::from(elem_size(STATE_DTYPE));
+        Pools {
+            slabs: vec![Buffer::zeroed(device, bytes).expect("a state slab")],
+            shapes: vec![Shape::State {
+                stride,
+                dtype: STATE_DTYPE,
+            }],
+            paging: paging(slots),
+            watermark: engine::frame::Demand::ZERO,
+        }
+    }
+
+    fn paging(slots: u32) -> Paging {
+        Paging {
+            page_size: 16,
+            pages_per_slot: 1,
+            slots,
+            pages: u64::from(slots),
+        }
+    }
+
+    fn device() -> Option<Context> {
+        if !crate::device::present() {
+            eprintln!("no Metal device on this machine; skipping");
+            return None;
+        }
+        Some(Context::bind().expect("the system device"))
+    }
+
+    /// After `copy_state`, the destination reads back as the source did,
+    /// and a seat the plan did not name is left as it was.
+    #[test]
+    fn a_copied_slot_reads_back_as_its_source() {
+        let Some(device) = device() else { return };
+        const STRIDE: u64 = 8;
+        let mut pools = state_pools(&device, 4, STRIDE);
+        let bytes = STRIDE * u64::from(elem_size(STATE_DTYPE));
+        let src: Vec<u8> = (0..bytes).map(|at| (at as u8).wrapping_mul(7).wrapping_add(1)).collect();
+        pools.slabs[0].write(bytes, &src).expect("seat 1 written");
+        let bystander: Vec<u8> = vec![0xAB; bytes as usize];
+        pools.slabs[0].write(2 * bytes, &bystander).expect("seat 2 written");
+
+        let mut frame = device.frame().expect("a frame");
+        pools
+            .copy_state(&mut frame, &[(1, 3), (0, 0)])
+            .expect("a whole-slot copy");
+        frame.commit().expect("the blit lands");
+
+        assert_eq!(pools.read_slot(3).expect("seat 3"), src);
+        assert_eq!(pools.read_slot(1).expect("seat 1"), src);
+        assert_eq!(pools.read_slot(2).expect("seat 2"), bystander);
+        assert_eq!(pools.read_slot(0).expect("seat 0"), vec![0u8; bytes as usize]);
+        assert_eq!(pools.watermark().state_slots, 4);
+    }
+
+    /// A seat past the pool is a ceiling, on either end.
+    #[test]
+    fn a_slot_past_the_pool_is_a_ceiling() {
+        let Some(device) = device() else { return };
+        let mut pools = state_pools(&device, 2, 4);
+        for moves in [&[(0u32, 2u32)][..], &[(5, 1)][..]] {
+            let mut frame = device.frame().expect("a frame");
+            let refused = pools.copy_state(&mut frame, moves).expect_err("past the pool");
+            assert!(
+                matches!(
+                    refused,
+                    Fault::Ceiling {
+                        what: "recurrent slots",
+                        have: 2,
+                        ..
+                    }
+                ),
+                "{refused:?}"
+            );
+        }
+    }
+
+    /// An attention-only plan has no bank to move and no ceiling to be past:
+    /// the copy is a no-op, never a refusal.
+    #[test]
+    fn an_attention_only_plan_answers_ok() {
+        let Some(device) = device() else { return };
+        let mut pools = Pools {
+            slabs: Vec::new(),
+            shapes: Vec::new(),
+            paging: paging(2),
+            watermark: engine::frame::Demand::ZERO,
+        };
+        let mut frame = device.frame().expect("a frame");
+        pools
+            .copy_state(&mut frame, &[(0, 1), (7, 9)])
+            .expect("nothing to move, nothing to refuse");
+        assert_eq!(pools.watermark().state_slots, 0);
+    }
 }

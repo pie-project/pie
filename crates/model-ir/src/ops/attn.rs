@@ -62,6 +62,22 @@ pub enum Attention {
         cache: ValueId,
         window: Option<u32>,
         head_dim: u32,
+        /// The cache row's head split. Stated here for the reason
+        /// [`Prefill`](Attention::Prefill) states it: a row's head width is
+        /// read off its READERS, and a row only this arm reads — a block
+        /// drafter's last layer is full attention and nothing else touches
+        /// its row — would otherwise be taken for one head of the whole
+        /// plane.
+        kv_heads: u32,
+        /// Whether the causal upper bound still applies under the mask.
+        ///
+        /// `true` is every existing caller: a stated mask NARROWS what a
+        /// causal row already sees. `false` makes the mask authoritative, so
+        /// a row may attend a key at a LATER position — which a block
+        /// drafter's full-attention layer needs and nothing else does. A
+        /// non-causal read is bounded by the mask alone, and one is always
+        /// stated because this op names it.
+        causal: bool,
         sm_scale: f32,
         o: ValueId,
     },
@@ -270,6 +286,53 @@ pub enum Attention {
         conv_width: u32,
         dilation: u32,
         y: ValueId,
+    },
+    /// **A two-tap grouped dynamic convolution along the fire's request
+    /// rows** (DFlash2's `attention_conv` / `mlp_conv`). Within each request's
+    /// span, `y[i] = Σ_t (base[side, t, :] + δ[i, side, t, g]) ⊙ x[i − t]`,
+    /// `x` before the span's first row being zero: row `i`'s own coefficients
+    /// mix it with its predecessor in the block. `coeff` is the coefficient
+    /// projection's output, `[rows, 2·taps·groups]` laid `(side, tap, group)`
+    /// — both sides come from one projection of the sublayer's input, and
+    /// `side` says which half this application reads (0 convolves the input
+    /// before the sublayer, 1 its output after). `base` is `[2·taps,
+    /// channels]`, row `side·taps + tap`. `group` channels share one δ.
+    BlockDynConv {
+        x: ValueId,
+        coeff: ValueId,
+        base: ValueId,
+        side: u32,
+        taps: u32,
+        group: u32,
+        y: ValueId,
+    },
+    /// **DFlash2's candidate selector, walked** — the head's readout. Within
+    /// each request's span the first row is the anchor and every row after it
+    /// a mask slot with `k` candidates (`cand`, `[rows, k]` i32, and their
+    /// logits `unary`, `[rows, k]` f32, both from `layout.topk`). From the
+    /// anchor, slot by slot, the pick is
+    /// `argmax_c unary[c] + ⟨pred[prev] ⊙ hp[row], succ[cand[c]]⟩` with `prev`
+    /// the anchor's id at the first slot and the previous slot's pick after —
+    /// the reference's `walk_greedy` over its `lattice`. `hp` is the slot's
+    /// hidden projected to the codebooks' rank, `pred`/`succ` the two
+    /// `[vocab, rank]` codebooks, `tokens` the fire's ids (the anchor is the
+    /// span's first). `picks` is `[rows, 1]` i32: the walked id at every slot
+    /// row, the first candidate at the anchor row.
+    SelectorWalk {
+        cand: ValueId,
+        unary: ValueId,
+        /// The slot's hidden projected to the codebooks' rank, or `None` for
+        /// a plain bigram lattice (DSpark's markov head: `⟨pred[prev],
+        /// succ[cand]⟩` with no hidden term).
+        hp: Option<ValueId>,
+        tokens: ValueId,
+        pred: ValueId,
+        succ: ValueId,
+        /// The first row of each span that is a slot: 1 when the anchor row
+        /// proposes nothing (its pick is its first candidate), 0 when every
+        /// row proposes (the anchor row's predecessor is its own token).
+        first: u32,
+        picks: ValueId,
     },
     /// Folds `ba` with dt bias and A-log into per-head decay gates.
     SsmGdnPrep {
@@ -548,6 +611,12 @@ impl Operands for Attention {
             Self::SsmCausalConv1dChunked { x, weight, state, .. } => {
                 sink.extend([*x, *weight, *state]);
             }
+            Self::BlockDynConv { x, coeff, base, .. } => sink.extend([*x, *coeff, *base]),
+            Self::SelectorWalk { cand, unary, hp, tokens, pred, succ, .. } => {
+                sink.extend([*cand, *unary]);
+                sink.extend(hp.iter().copied());
+                sink.extend([*tokens, *pred, *succ]);
+            }
             Self::SsmGdnPrep { ba, dt_bias, a_log, .. } => sink.extend([*ba, *dt_bias, *a_log]),
             Self::SsmGatedDelta { qkv, z, gates, state, .. } => {
                 sink.extend([*qkv, *z, *gates, *state]);
@@ -644,6 +713,8 @@ impl Operands for Attention {
             Self::MlaPrefillSelected { o, .. } => sink.push(*o),
             Self::SsmCausalConv1d { y, .. } => sink.push(*y),
             Self::SsmCausalConv1dChunked { y, .. } => sink.push(*y),
+            Self::BlockDynConv { y, .. } => sink.push(*y),
+            Self::SelectorWalk { picks, .. } => sink.push(*picks),
             Self::SsmGdnPrep { gates, .. } => sink.push(*gates),
             Self::SsmGatedDelta { y, .. } => sink.push(*y),
             Self::SsmGatedDeltaChunked { y, .. } => sink.push(*y),
@@ -706,6 +777,8 @@ impl Operands for Attention {
             Self::MlaPrefillSelected { .. } => {}
             Self::SsmCausalConv1d { .. } => {}
             Self::SsmCausalConv1dChunked { .. } => {}
+            Self::BlockDynConv { .. } => {}
+            Self::SelectorWalk { .. } => {}
             Self::SsmGdnPrep { .. } => {}
             Self::SsmGatedDelta { .. } => {}
             Self::SsmGatedDeltaChunked { .. } => {}
@@ -754,6 +827,8 @@ impl Operands for Attention {
             Self::MlaPrefillSelected { .. } => "attention.mla_prefill_selected",
             Self::SsmCausalConv1d { .. } => "attention.ssm_causal_conv1d",
             Self::SsmCausalConv1dChunked { .. } => "attention.ssm_causal_conv1d_chunked",
+            Self::BlockDynConv { .. } => "attention.block_dyn_conv",
+            Self::SelectorWalk { .. } => "attention.selector_walk",
             Self::SsmGdnPrep { .. } => "attention.ssm_gdn_prep",
             Self::SsmGatedDelta { .. } => "attention.ssm_gated_delta",
             Self::SsmGatedDeltaChunked { .. } => "attention.ssm_gated_delta_chunked",

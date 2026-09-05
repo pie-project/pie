@@ -162,6 +162,7 @@ fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
             delete_source: false,
             consume_source: false,
             keep_source: false,
+            drafter: None,
         },
         &global,
     );

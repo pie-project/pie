@@ -26,13 +26,14 @@ const THREADS: u32 = SIMDS * 32;
 
 /// The dot-product stamps, tightest first. A stamp bounds the head width
 /// from above; e.g. widths 64, 72 and 80 all share the 128 stamp.
-const STAMPS: [u32; 3] = [64, 128, 256];
+const STAMPS: [u32; 4] = [64, 128, 256, 512];
 
 /// The shipped point per stamp, in [`STAMPS`] order.
-const CAPTURE: [&str; 3] = [
+const CAPTURE: [&str; 4] = [
     "attn_score_capture_bfloat16_d_64",
     "attn_score_capture_bfloat16_d_128",
     "attn_score_capture_bfloat16_d_256",
+    "attn_score_capture_bfloat16_d_512",
 ];
 
 /// The tightest stamp that holds this head, as an index into [`STAMPS`], or
@@ -313,8 +314,10 @@ mod tests {
         assert_eq!(stamp_for(128), Some(1));
         assert_eq!(stamp_for(129), Some(2));
         assert_eq!(stamp_for(256), Some(2));
+        // gemma-4's global reading.
+        assert_eq!(stamp_for(512), Some(3));
         // Past the last stamp is not a wider point, it is no point.
-        assert_eq!(stamp_for(257), None);
+        assert_eq!(stamp_for(513), None);
         assert_eq!(STAMPS.len(), CAPTURE.len());
     }
 
@@ -389,13 +392,13 @@ mod tests {
         let why = capture(
             &probe,
             RaggedTensor {
-                data: bf16(40, 2 * 512),
+                data: bf16(40, 2 * 1024),
                 indptr: i32s(3),
             },
             &plan(40),
-            &pool(2, 512, Dtype::Bf16),
+            &pool(2, 1024, Dtype::Bf16),
             None,
-            512,
+            1024,
             2,
             0.125,
             32,
@@ -406,7 +409,7 @@ mod tests {
             2,
             slab(4 * 96),
         )
-        .expect_err("a 512-wide head is past the ladder");
+        .expect_err("a 1024-wide head is past the ladder");
         assert!(format!("{why}").contains("stamped for"), "{why}");
     }
 

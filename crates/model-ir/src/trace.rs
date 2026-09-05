@@ -163,4 +163,36 @@ pub struct Trace {
     pub values: Vec<ValueDecl>,
     pub nodes: Vec<Node>,
     pub seams: Vec<Seam>,
+    /// The block drafter this text carries, if any — facts a guest seeding a
+    /// draft block needs and cannot read off the plan's shapes (the block is a
+    /// split of the token axis, symbolic in the plan). Stated by the text
+    /// that plants the `mtp.drafts` seam; advertised by the load.
+    #[serde(default)]
+    pub drafter: Option<BlockDrafter>,
+}
+
+/// **WHAT A GUEST NEEDS TO SEED A DRAFT BLOCK**, stated by the model text.
+/// Not policy: the head was trained at these numbers, and a guest that shows
+/// it another block is out of distribution. Which rows to verify, and whether
+/// to draft at all, stay the guest's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockDrafter {
+    /// Rows one draft pass carries: the anchor and `rows - 1` mask slots.
+    pub rows: u32,
+    /// The id every block row but the first carries in.
+    pub mask_token: u32,
+    /// Whether the block sees itself (a full-attention layer over the block),
+    /// in which case the guest must state the mask that says so; a head whose
+    /// layers are all causal inside the block wants none.
+    pub bidirectional: bool,
+    /// The first block row whose readout is a proposal: 1 for a head whose
+    /// row `i` predicts position `i` (DFlash: the anchor row proposes
+    /// nothing), 0 for a head whose row `i` predicts position `i + 1`
+    /// (DSpark: the anchor row proposes the next token too).
+    #[serde(default = "one")]
+    pub proposals_from: u32,
+}
+
+fn one() -> u32 {
+    1
 }

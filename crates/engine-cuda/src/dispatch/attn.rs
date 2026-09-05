@@ -238,6 +238,11 @@ impl Run<'_> {
             // rides the plan (bound at build by the `PlanPrefill` arm), and
             // the entry refuses a plan no span table rides.
             Attention::Masked {
+                // The head split is the store's to read off this op
+                // (`store::kv::probe`); the dispatch takes its geometry from
+                // the pool the store already shaped.
+                kv_heads: _,
+                causal,
                 q,
                 plan,
                 mask,
@@ -1075,6 +1080,14 @@ impl Run<'_> {
             // ones) under this op's name, so the arm refuses by name.
             Attention::PoolLseSelected { .. } => Err(kernels_cuda::Error::Unsupported {
                 op: "attention.pool_lse_selected",
+            }),
+            // DFlash2's dynamic block convolution has a Metal kernel and no
+            // CUDA one yet; refused by name rather than approximated.
+            Attention::BlockDynConv { .. } => Err(kernels_cuda::Error::Unsupported {
+                op: "attention.block_dyn_conv",
+            }),
+            Attention::SelectorWalk { .. } => Err(kernels_cuda::Error::Unsupported {
+                op: "attention.selector_walk",
             }),
         }
     }

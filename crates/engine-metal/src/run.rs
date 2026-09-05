@@ -805,6 +805,18 @@ impl<'c> Run<'c> {
         )
     }
 
+    /// The split-K partials plane at `rows x width` f32, for the sparse `bm = 8` tile. `None`
+    /// if the load-time reservation doesn't hold that shape.
+    pub(crate) fn partials(&self, rows: u32, width: u32) -> Option<Tensor> {
+        Some(
+            self.scratch
+                .partials(self.handles, rows, width)?
+                .unwrap_or_else(|fault| {
+                    panic!("the partials plane this load reserved does not mint: {fault}")
+                }),
+        )
+    }
+
     /// The `StructKind` a plan op's output value declares, checked by the plan-building arms
     /// against the trace.
     pub(crate) fn declared(&self, id: ValueId) -> StructKind {

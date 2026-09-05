@@ -150,6 +150,13 @@ impl Model {
                 }
             }
         }
+        // The block drafter, `--aux`-imported (published on its own); its
+        // planes are the drafter's (`drafter::dflash`) and its norms a
+        // Qwen3-style stack's, read down by one for the `+1` op as the other
+        // families read theirs.
+        if let Some(dflash) = &self.dflash {
+            dflash.bind_aux(&mut b, src, &|from| Expr::src(from).bias(-1.0))?;
+        }
         Ok(b.build())
     }
 }

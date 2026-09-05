@@ -127,6 +127,16 @@ pub enum Layout {
     /// same rule the epilogue's `reduce_argmax` states, so a draft the head
     /// chained on is the token the verifier would have read.
     Argmax { xs: Vec<ValueId>, y: ValueId },
+    /// The `k` largest entries of every row of `x`, sorted descending, ties
+    /// to the LOWER column and a NaN never chosen (the argmax rule): `values`
+    /// is `[rows, k]` f32 and `indices` `[rows, k]` i32. What a candidate
+    /// selector reads off a draft's logits (DFlash2's sixteen a slot).
+    TopK {
+        x: ValueId,
+        k: u32,
+        values: ValueId,
+        indices: ValueId,
+    },
 }
 
 impl Operands for Layout {
@@ -146,6 +156,7 @@ impl Operands for Layout {
             Self::ScatterLiveRows { src, routes, y, .. } => sink.extend([*src, *routes, *y]),
             Self::EmbedConcat { ids, table, .. } => sink.extend([*ids, *table]),
             Self::Argmax { xs, .. } => sink.extend(xs.iter().copied()),
+            Self::TopK { x, .. } => sink.push(*x),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -162,6 +173,7 @@ impl Operands for Layout {
             Self::ScatterLiveRows { y_out, .. } => sink.push(*y_out),
             Self::EmbedConcat { y, .. } => sink.push(*y),
             Self::Argmax { y, .. } => sink.push(*y),
+            Self::TopK { values, indices, .. } => sink.extend([*values, *indices]),
         }
     }
     /// The one aliasing row this family has, and it is the scatter's: every
@@ -180,7 +192,8 @@ impl Operands for Layout {
             | Self::PoolRows { .. }
             | Self::MergeRows { .. }
             | Self::EmbedConcat { .. }
-            | Self::Argmax { .. } => {}
+            | Self::Argmax { .. }
+            | Self::TopK { .. } => {}
             Self::ScatterRows { y_out, y, .. }
             | Self::ScatterLiveRows { y_out, y, .. } => sink.push((*y_out, *y)),
         }
@@ -199,6 +212,7 @@ impl Operands for Layout {
             Self::ScatterLiveRows { .. } => "layout.scatter_live_rows",
             Self::EmbedConcat { .. } => "layout.embed_concat",
             Self::Argmax { .. } => "layout.argmax",
+            Self::TopK { .. } => "layout.topk",
         }
     }
 }

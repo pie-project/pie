@@ -37,6 +37,7 @@ profile-fire = ["runtime/profile-fire"]
 
 [dependencies]
 runtime = { path = "../runtime" }
+models = { path = "../models" }
 # Shared tarpc control-plane contract.
 controller-api = { path = "../controller-api" }
 # Gateway data-plane RPC contract: the worker dials INTO the gateway and serves

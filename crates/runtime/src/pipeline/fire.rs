@@ -618,6 +618,24 @@ fn prepare_host_kv_reserved(
     declaration_realized: bool,
     grant: &mut crate::planner::AllocationGrant,
 ) -> Result<PreparedHostKv, ReservedError> {
+    // THE CONTEXT CEILING IS ENFORCED HERE, AND ONLY HERE. The engine's own
+    // `max_context` check runs for a fire that supplies no page table, and
+    // this runtime always supplies one, so without this a sequence grows
+    // until the pool runs dry. A host-geometry fire's writable span ends at
+    // the last page its sequence holds, which is the sequence's length in
+    // pages; refusing it here answers the guest before any GPU is spent.
+    if stores.context_pages != 0 && writable.end > stores.context_pages {
+        let page = u64::from(stores.kv_page_size);
+        return Err(ReservedError::Fatal(format!(
+            "pipeline: this fire would grow its sequence to {} KV page(s) (up to {} tokens), \
+             past the model's max_context of {} tokens ({} page(s)); the sequence is at \
+             its ceiling and cannot take another token",
+            writable.end,
+            writable.end.saturating_mul(page),
+            stores.context_pages.saturating_mul(page),
+            stores.context_pages,
+        )));
+    }
     crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
         let required = host_kv_demand_locked(store, ws, writable.clone(), declaration_realized)
             .map_err(|error| ReservedError::Fatal(format!("pipeline: KV demand: {error}")))?;
@@ -970,6 +988,7 @@ fn stamp_lane_words(
             lane.drafts,
             lane.captures_scores,
             carries_media,
+            lane.block_draft,
             // The denoise reading and the bidirectional lane are one fact
             // stated twice: the model's class and the engine's mask bits.
             lane.bidirectional,
@@ -1356,6 +1375,15 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if p_reads_mtp_logits {
             for lane in &mut req.lanes {
                 lane.drafts = true;
+            }
+        }
+        // A pass the guest marked `set-drafting-block` carries a block
+        // drafter's proposal rows, which a plan guards its trunk against.
+        // Stated, not inferred: what makes a fire a draft is the anchor the
+        // guest chose from the accepted prefix, and no intrinsic shows it.
+        if ctx.resources().get(&fwd)?.block_draft {
+            for lane in &mut req.lanes {
+                lane.block_draft = true;
             }
         }
         // A class, not a bool: `fire_device_geometry` stamps the third class

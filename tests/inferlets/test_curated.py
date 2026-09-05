@@ -160,9 +160,18 @@ async def test_cacheback_speculative_decoding(client, args):
             client, args, "cacheback-speculative-decoding", {**base, "draft_length": 4}
         )
 
-        # With no draft, every generated token costs exactly one forward pass.
+        # With no draft, every generated token costs exactly one forward pass —
+        # plus one for the stop token when the model ends the run itself, since
+        # that token is produced by a pass and then left out of `count`. A run
+        # truncated by `max_tokens` never pays it, so a bare
+        # `verification_steps == count` holds only where the budget runs out
+        # first, which is a property of the model and the prompt rather than of
+        # the loop. gemma-4-26B-A4B answers the repetitive prompt in 14 tokens
+        # and stops, and read the bare way that is 15 != 14.
         assert sequential["drafted"] == 0, (label, sequential)
-        assert sequential["verification_steps"] == sequential["count"], (label, sequential)
+        assert sequential["verification_steps"] == sequential["count"] + int(
+            sequential["stopped"]
+        ), (label, sequential)
 
         # The comparison is only meaningful if speculation fired *and* was
         # rejected at least once.
@@ -198,10 +207,33 @@ async def test_constrained_speculative_decoding(client, args):
     beforehand reports. That check reaching a nonzero count here is the
     end-to-end evidence that the matcher's fork/rollback ABI works through wasm.
     """
-    # The inferlet's default prompt and schema are used verbatim: how far the
-    # model runs before closing the document is prompt-sensitive, and the test
-    # needs both arms to reach termination rather than the token cap.
-    base = {"max_tokens": 256, "max_ngram": 4}
+    # **THE SCHEMA IS STATED HERE, NOT TAKEN FROM THE INFERLET'S DEFAULT.**
+    # How far a model runs before closing the document is a property of the
+    # model and the schema, and the inferlet's default (a profile with a name,
+    # an age and a skills array) is rich enough that gemma-4-26B-A4B never
+    # closes it: it writes two good fields and then degenerates into
+    # "abilityon abilityon ..." past 384 tokens. Its non-speculative sibling
+    # `json-schema-constrained-decoding` fails the same way on the same
+    # schema, so that is the model, not this loop — and that sibling's own
+    # case passes only because it states a SMALL schema here too.
+    #
+    # A small schema proves everything this case is for: the sequential and
+    # speculative arms come back token-identical, and speculation still fires,
+    # is rejected, and saves passes (measured: accepted 2 of 4 drafted,
+    # 19 verification steps against 21).
+    base = {
+        "prompt": (
+            "Return an object with an integer field named value and a string "
+            "field named name."
+        ),
+        "schema": (
+            '{"type":"object","properties":'
+            '{"value":{"type":"integer"},"name":{"type":"string"}},'
+            '"required":["value","name"],"additionalProperties":false}'
+        ),
+        "max_tokens": 128,
+        "max_ngram": 4,
+    }
     sequential = await _report(
         client, args, "constrained-speculative-decoding", {**base, "draft_length": 0}
     )
@@ -578,10 +610,58 @@ _TOVA_PROMPT = (
 )
 
 
+def _repo_id(model: str) -> str:
+    """The HF repository id behind `--model`, which may name a repository
+    (`mlx-community/gemma-4-26b-a4b-it-4bit`), a store directory
+    (`~/.pie/models/mlx-community--gemma-4-26b-a4b-it-4bit`) or one stamped
+    artifact inside it (`<store-dir>/<id>.<sku>.metal.zt` — the id is the
+    file name up to its first dot). A store directory holding two artifacts of
+    one model must be named by its artifact, and the geometry helpers below
+    still want the snapshot's `config.json`; without this they read nothing
+    and the probes fall back to another SKU's numbers (24 layers, hidden 1024)."""
+    from pathlib import Path
+
+    if "/" in model and not Path(model).exists():
+        return model
+    path = Path(model)
+    stem = path.name.split(".")[0] if path.is_file() else path.name
+    return stem.replace("--", "/") if "--" in stem else model
+
+
+def _score_geometry(model: str) -> dict:
+    """`{"layers", "heads"}` for the score-reading inferlets: the attention
+    layers the served model EXPORTS a score plane for, and its query heads.
+    Read off the HF snapshot's `config.json`; a model with `layer_types`
+    exports its full-attention layers alone (a sliding layer's row is a softmax
+    over its window, which the capture refuses), one without exports every
+    layer. Empty when no snapshot is cached, so the inferlets' defaults stand."""
+    import glob
+    from pathlib import Path
+
+    hub = Path.home() / ".cache" / "huggingface" / "hub"
+    pattern = str(hub / f"models--{_repo_id(model).replace('/', '--')}" / "snapshots" / "*" / "config.json")
+    for path in sorted(glob.glob(pattern)):
+        try:
+            config = json.loads(Path(path).read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        text = config.get("text_config", config)
+        heads = text.get("num_attention_heads")
+        kinds = text.get("layer_types")
+        layers = (
+            sum(1 for k in kinds if k == "full_attention")
+            if isinstance(kinds, list)
+            else text.get("num_hidden_layers")
+        )
+        if isinstance(layers, int) and isinstance(heads, int) and layers > 0:
+            return {"layers": layers, "heads": heads}
+    return {}
+
+
 async def test_tova_attention(client, args):
     report = await _report(
         client, args, "tova-attention",
-        {"prompt": _TOVA_PROMPT, "max_tokens": 8, "cache_size": 16},
+        {"prompt": _TOVA_PROMPT, "max_tokens": 8, "cache_size": 16, **_score_geometry(args.model)},
     )
     # The tap has to fire once per layer, on every layer.
     assert report["layers_observed"] > 0, report
@@ -640,7 +720,7 @@ async def test_h2o_attention(client, args):
     CUMULATIVE ranking that is H2O's entire difference from TOVA.
     """
     common = {"prompt": _EVICT_PROMPT, "max_tokens": 12,
-              "temperature": _COHERENCE_TAU, "seed": 4242}
+              "temperature": _COHERENCE_TAU, "seed": 4242, **_score_geometry(args.model)}
     report = await _report(
         client, args, "trackb-h2o", {**common, "page_budget": 4096})
     # The split is real: both halves ran, and together they are the generation.
@@ -675,13 +755,25 @@ async def test_h2o_attention(client, args):
     # checked the same way on its own single-step row.
     page_mass = [float(m) for m in report["page_mass"]]
     assert len(page_mass) > 8, report
-    tail = len(page_mass) - 3
-    # The recency window is the heaviest thing in the row...
-    assert page_mass.index(max(page_mass)) >= tail, report
+    # The recency window is a few dozen TOKENS (StreamingLLM keeps 32 beside
+    # its sinks), not a page count: the engine's page is 16 tokens on one
+    # backend and 32 on another, and "the last three pages" was 48 tokens on
+    # the first and 96 on the second -- where a page 40 tokens back is
+    # legitimately middle. `tail` is the first page that touches the last 32.
+    tail = max(report["kv_len"] - 32, 0) // report["page_size"]
+    assert 2 < tail < len(page_mass), report
+    # The two heaviest pages are the sink and a recent one -- in EITHER order:
+    # which of the two outweighs the other is the model's (gemma's `<bos>`
+    # sink carries half the row on its own; qwen's recency window did)...
+    ranked = sorted(range(len(page_mass)), key=lambda i: page_mass[i], reverse=True)
+    assert 0 in ranked[:2], report
+    assert any(i >= tail for i in ranked[:2]), report
     # ...the sink is the heaviest thing that is NOT recent...
     assert page_mass[0] == max(page_mass[:tail]), report
-    # ...and it stands clear of the middle it is being distinguished from.
-    assert page_mass[0] > 2 * sorted(page_mass)[len(page_mass) // 2], report
+    # ...and both stand clear of the middle they are being distinguished from.
+    middle = sorted(page_mass)[len(page_mass) // 2]
+    assert page_mass[0] > 2 * middle, report
+    assert max(page_mass[tail:]) > 2 * middle, report
     # The page H2O drops first is in the middle, where the Λ is thin -- not the
     # sink and not the recency window, or it is not this policy.
     assert 2 < report["evicted_first"] < tail, report
@@ -712,7 +804,7 @@ async def test_h2o_attention(client, args):
 
 async def test_snapkv_attention(client, args):
     common = {"prompt": _EVICT_PROMPT, "max_tokens": 12,
-              "temperature": _COHERENCE_TAU, "seed": 4242}
+              "temperature": _COHERENCE_TAU, "seed": 4242, **_score_geometry(args.model)}
     report = await _report(
         client, args, "trackb-snapkv", {**common, "page_budget": 4096})
     # SnapKV reads a DIFFERENT TAP from every other policy here: the prefill
@@ -745,8 +837,12 @@ async def test_snapkv_attention(client, args):
     # that the observation window's own pages outweigh the middle of the prompt,
     # with the attention sink held out of both sides.
     page_mass = [float(m) for m in report["page_mass"]]
-    win_lo = max(report["prompt_len"] - 32, 0) // report["page_size"]
-    mid, win = page_mass[1:win_lo], page_mass[win_lo:]
+    # Pages WHOLLY inside the last 32 rows are the window, pages wholly before
+    # them are the middle; a page the boundary cuts belongs to neither (on a
+    # 32-token page it is mostly outside the window and would drag it down).
+    lo = max(report["prompt_len"] - 32, 0)
+    mid = page_mass[1 : lo // report["page_size"]]
+    win = page_mass[-(-lo // report["page_size"]) :]
     assert win and mid, report
     assert min(win) > max(mid), (
         f"the observation window {win} does not separate from the middle of "
@@ -780,6 +876,27 @@ async def test_snapkv_attention(client, args):
 async def test_naive_baseline(client, args):
     report = await _report(client, args, "naive-baseline", {"max_tokens": 4})
     assert report["sampler"] == "naive-baseline", report
+
+
+def _adapter_geometry(model: str) -> dict:
+    """`{"layers", "hidden"}` of the served checkpoint, read off its HF snapshot's
+    `config.json` (the text stanza when the config nests one); empty when no
+    snapshot is cached under that id, so the inferlet's defaults stand."""
+    import glob
+    from pathlib import Path
+
+    hub = Path.home() / ".cache" / "huggingface" / "hub"
+    pattern = str(hub / f"models--{_repo_id(model).replace('/', '--')}" / "snapshots" / "*" / "config.json")
+    for path in sorted(glob.glob(pattern)):
+        try:
+            config = json.loads(Path(path).read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        text = config.get("text_config", config)
+        layers, hidden = text.get("num_hidden_layers"), text.get("hidden_size")
+        if isinstance(layers, int) and isinstance(hidden, int):
+            return {"layers": layers, "hidden": hidden}
+    return {}
 
 
 async def test_lora_probe(client, args):
@@ -816,6 +933,14 @@ async def test_lora_probe(client, args):
         "seed": 7,
     }
     base = await _report(client, args, "naive-baseline", dict(fixed))
+    # The probe seeds its A and B planes at the served model's geometry, and
+    # its defaults are qwen35-d0.8b's (24 layers, hidden 1024): on any other
+    # SKU the engine refuses the bank by size. The guest cannot read those two
+    # numbers off the engine, so this fixture reads them off the checkpoint's
+    # `config.json` and passes them, as the inferlet's header says a different
+    # SKU must. The rank stays the model text's own (`Adapters { rank: 16 }`
+    # in every family here), which is trace-known and not the fixture's to move.
+    fixed = {**fixed, **_adapter_geometry(args.model)}
     zero = await _report(client, args, "lora-probe", {**fixed, "adapter_scale": 0.0})
     assert zero["text"] == base["text"], (
         "a zero-B adapter changed the answer -- the correction term is exactly "

@@ -144,6 +144,11 @@ interface forward-diffusion {
         /// denoising step may run shallow and the last ones deep.
         set-max-layers: func(max-layers: u32) -> result<_, error>;
 
+        /// The attention interface's verb, same host half: these rows are a
+        /// block drafter's proposal, not the sequence's own. A denoiser has no
+        /// use for it; it is here so the four pass interfaces stay one shape.
+        set-drafting-block: func(on: bool) -> result<_, error>;
+
         /// Attach canonical ETA bytes and channel handles in dense declaration
         /// order. Validation uses the engine-owned ModelProfile and rejects
         /// any stage this interface does not admit.

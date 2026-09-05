@@ -85,10 +85,10 @@ pub mod chat;
 /// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
     pub use crate::pie::inferlet::model::{
-        CanvasShape, ForwardKind, architecture, arena_block_size, canvas, channel_capacity,
-        default_system_speculation, frame_size, kv_page_size, max_embed_length, mtp_depth, name,
-        output_vocab_size, pass_kind, rs_buffer_page_size, rs_fold_granularity, rs_state_size,
-        submit_deadline_us,
+        BlockDrafter, CanvasShape, ForwardKind, architecture, arena_block_size, canvas,
+        channel_capacity, default_system_speculation, draft_block, frame_size, kv_page_size,
+        max_embed_length, mtp_depth, name, output_vocab_size, pass_kind, rs_buffer_page_size,
+        rs_fold_granularity, rs_state_size, run_ahead_window, submit_deadline_us,
     };
     // Tokenizer functions live in the `tokenizer` interface; re-exported here
     // so `model::encode`/`model::decode`/… read off `model` in inferlet source.

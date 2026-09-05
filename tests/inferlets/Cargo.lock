@@ -98,6 +98,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dflash-block-acceptance"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "dflash-speculative-bench"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "diffusion-baseline"
 version = "0.1.0"
 dependencies = [

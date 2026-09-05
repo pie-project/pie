@@ -12,8 +12,14 @@
 //! inferlet carries for its self-verification metrics, without adding any
 //! algorithm compute. Running with and without it separates the cost of the
 //! extra host round-trip channels from the cost of the algorithm itself.
+//!
+//! The body runs on BOTH forward interfaces. `pie:inferlet`'s hybrid pass takes
+//! the recurrent state as a VALUE — an empty `rs` set IS the attention pass, and
+//! the host accepts it on an attention-only model — so the control is written
+//! once and named for neither kind; otherwise the baseline a hybrid model's
+//! algorithm inferlets are read against would not exist.
 
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -80,6 +86,23 @@ async fn main(input: Input) -> Result<Output> {
     let temperature = input.temperature;
     let want_stats = input.stats;
     let ws = WorkingSet::new();
+    // One recurrent working set for this one sequence on a hybrid model (the
+    // engine requires one per request row); none on a pure-attention one. It
+    // is passed to EVERY pass of the sequence — each prefill chunk and the
+    // decode fire — so the recurrence carries across them.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "this program has no recurrent-only path (no registered model reports that kind)"
+                    .into(),
+            );
+        }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
+    };
     let page_size = kv_page_size();
 
     if max_tokens == 0 {
@@ -144,17 +167,24 @@ async fn main(input: Input) -> Result<Output> {
         }
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len_p,
-                pages: &pages_p,
-                page_indptr: &page_indptr_p,
-                w_slot: &w_slot_p,
-                w_off: &w_off_p,
-                positions: &positions_p,
-                mask: None,
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &kv_len_p,
+                    pages: &pages_p,
+                    page_indptr: &page_indptr_p,
+                    w_slot: &w_slot_p,
+                    w_off: &w_off_p,
+                    positions: &positions_p,
+                    mask: None,
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
             },
         )?;
         fwd_p.epilogue(move || {
@@ -222,17 +252,24 @@ async fn main(input: Input) -> Result<Output> {
         }
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / page_size)..,
-                kv_len: &kv_len,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: (n / page_size)..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
             },
         )?;
         fwd.epilogue(move || {

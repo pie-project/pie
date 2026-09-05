@@ -9,7 +9,7 @@
 //! Independent Gumbel noise drives top-p sampling in each lane.
 
 use inferlet::chat;
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use serde::Deserialize;
 use std::time::Instant;
 
@@ -103,6 +103,29 @@ async fn main(input: Input) -> Result<String> {
         let pool_pages = (n + b * max_tokens as u32 + 2).div_ceil(PAGE_T);
         let pool = pool_pages * PAGE_T;
         let ws = WorkingSet::new();
+        // Recurrent state on a hybrid model: the shared-prefix prefill is ONE
+        // request row, so it folds into one working set. The B decode lanes
+        // each need their own row (the engine wants one per request, never
+        // aliased), and every one of them must START from the folded prefix —
+        // the KV half of the prefix is shared through the page pool below,
+        // but a fold is not a page and cannot be shared by masking. So lanes
+        // 1..B are FORKED from lane 0 after the prefill submit (ordered on
+        // the same pipeline, so the fork sees the prefix folded). None at all
+        // on a pure-attention model.
+        let mut rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+            model::ForwardKind::Attention => Vec::new(),
+            model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+            model::ForwardKind::Recurrent => {
+                return Err(
+                    "this program has no recurrent-only path (no registered model reports that kind)"
+                        .into(),
+                );
+            }
+            model::ForwardKind::Diffusion => {
+                return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+            }
+        };
+        let rs_prefix = &rs_ws[..rs_ws.len().min(1)];
         let slots = ws.reserve(pool_pages).context("ws.reserve")?;
         let pool_ids = slots.ids().to_vec();
 
@@ -140,17 +163,24 @@ async fn main(input: Input) -> Result<String> {
         let fwd_p = ForwardPass::new();
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &klen_p,
-                pages: &pages_p,
-                page_indptr: &page_indptr_p,
-                w_slot: &w_slot_p,
-                w_off: &w_off_p,
-                positions: &positions_p,
-                mask: Some(&mask_p),
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &klen_p,
+                    pages: &pages_p,
+                    page_indptr: &page_indptr_p,
+                    w_slot: &w_slot_p,
+                    w_off: &w_off_p,
+                    positions: &positions_p,
+                    mask: Some(&mask_p),
+                },
+            }),
+            rs_prefix,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
             },
         )?;
         fwd_p.epilogue(move || {
@@ -186,6 +216,11 @@ async fn main(input: Input) -> Result<String> {
         // finish() lands right after its submit (F7).
         let pipe = Pipeline::new();
         fwd_p.submit(&pipe).context("prefill submit")?;
+        // Lanes 1..B: copy-on-write children of the folded prefix (see above).
+        while !rs_ws.is_empty() && rs_ws.len() < num_candidates {
+            let child = rs_ws[0].fork(&pipe).context("fork recurrent prefix")?;
+            rs_ws.push(child);
+        }
         let g0s: Vec<i32> = g0s_ch.take_host::<Vec<i32>>().await?;
         // All B candidates share the prefill's token; they diverge in the decode
         // loop, where each lane draws its own Gumbel noise.
@@ -240,17 +275,24 @@ async fn main(input: Input) -> Result<String> {
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lanes)?;
         fwd.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / kv_page_size())..,
-                kv_len: &klen,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &pos,
-                mask: Some(&mask),
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: (n / kv_page_size())..,
+                    kv_len: &klen,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &pos,
+                    mask: Some(&mask),
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
             },
         )?;
         fwd.epilogue(move || {

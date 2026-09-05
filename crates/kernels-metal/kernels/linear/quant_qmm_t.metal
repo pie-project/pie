@@ -37,6 +37,23 @@ inline constexpr int qmm_wm() {
   return BM < 16 ? 1 : 2;
 }
 
+// **`WM = 1` AT `BM = 16` WAS TRIED AND LOSES (M4 Pro, 2026-09-04).** The
+// diagnosis it came from is real — at `WM = 2` each of the two simdgroups
+// reads every B fragment out of threadgroup memory, so one simdgroup halves
+// that traffic — but the measurement refuses it: 512.7 us against 496.6 at
+// sixteen rows, K=5120 N=17408 4-bit. One simdgroup is 64 lanes where two are
+// 128, and the parallelism lost inside the threadgroup costs more than the
+// duplicate fragment reads. Consistent with the `bn_16` result already
+// recorded upstream: this tile is not short of threadgroup memory, so buying
+// residency with lanes is buying what it already has.
+//
+// THE RULE IS STATED TWICE and both copies must move together: this function,
+// and `quant::qmm_group`'s `bm < 2 * FRAG_ROWS` on the host. Changing one
+// alone launches 128 lanes into a kernel that expects 64 — the loaders divide
+// their tile by `tgp_size` and half of it is never written, which
+// `every_row_count_is_timed` catches as a wrong answer (worst relative 1.2991)
+// rather than a slow one.
+
 // The lanes a row block's threadgroup holds. `WN = 2` throughout this file —
 // the one place a column split of four appears is a hand-written
 // instantiation at the bottom — so a block loader that carries no `WN` of its
@@ -52,6 +69,131 @@ inline constexpr int qmm_tgp() {
 #include "../third_party/mlx_steel_mma.metal"
 #include "../third_party/mlx_steel_loader.metal"
 #include "../third_party/mlx_quantized_block.metal"
+
+// ── the affine 4-bit tile loader, in vectors ──────────────────────────────
+//
+// The vendored `QuantizedBlockLoader` reads a thread's `n_reads` packed bytes
+// one `uint8_t` at a time and writes each dequantized pair as two two-byte
+// threadgroup stores — the same shape the MXFP4 loader above had, for the
+// same reason: `src` is a `uint8_t*`, so the compiler can prove no alignment
+// and merges nothing. At the 8-row rung that is the tile's whole margin: the
+// MMA per K step is eight fragment products a simdgroup, and the dequantized
+// staging that feeds them — eight byte loads, sixteen stores, a barrier — is
+// what the 345 us at K=5120 N=17408 is mostly made of (the same shape reads
+// 497 at sixteen rows for twice the FLOPs; the fixed part is ~200 us).
+//
+// Measured (M4 Pro, 2026-09-05, `a_quantized_matmul_is_priced_by_its_rows`):
+// K=5120 N=17408 345 -> 335 us at eight rows and 497 -> 485 at sixteen;
+// N=5120 161 -> 157 at sixteen. Three percent, bit-identical — the loader was
+// not the 8-row rung's margin either (see the split-K note below for where
+// it LOSES and is not used), and what that rung is made of is barriers.
+//
+// This reads the run as one `vec<uint8_t, VEC>` and stores each pair of
+// bytes as one `vec<D, 4>`, with the SAME arithmetic as the vendored
+// `dequantize<D, 2, 4>` — `s0 * (w & 0x0f) + bias`, `s1 * (w & 0xf0) + bias`
+// with `s1 = scale / 16` — in the same order, so the bits it lands are the
+// vendored loader's and `every_folded_point_answers_the_one_row_point`
+// vouches for it. Group stepping is the vendored loader's for
+// `reduction_dim == 1`, the only orientation this file launches.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short tgp_size,
+    short group_size,
+    typename D = T>
+struct AffineVec4Loader {
+  static_assert(BCOLS <= group_size, "The group size should be larger than the columns");
+  static_assert(group_size % BCOLS == 0, "The group size should be divisible by the columns");
+  MLX_MTL_CONST short pack_factor = 2;
+  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  MLX_MTL_CONST short n_reads =
+      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
+  MLX_MTL_CONST short VEC = (n_reads % 4 == 0) ? 4 : n_reads;
+  static_assert(VEC == 2 || VEC == 4, "a thread reads two or four bytes");
+  MLX_MTL_CONST short group_steps = group_size / BCOLS;
+
+  const int src_ld;
+  const int tile_stride;
+  short group_step_cnt;
+  const short thread_idx;
+  const short bi;
+  const short bj;
+  threadgroup D* dst;
+  const device uint8_t* src;
+  const device T* scales;
+  const device T* biases;
+
+  AffineVec4Loader(
+      const device uint8_t* src_,
+      const device T* scales_,
+      const device T* biases_,
+      const int src_ld_,
+      threadgroup D* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : src_ld(src_ld_),
+        tile_stride(BCOLS_PACKED),
+        group_step_cnt(0),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(n_reads * thread_idx / BCOLS_PACKED),
+        bj((n_reads * thread_idx) % BCOLS_PACKED),
+        dst(dst_ + bi * dst_ld + bj * pack_factor),
+        src(src_ + bi * src_ld / pack_factor + bj),
+        scales(scales_ + bi * src_ld / group_size),
+        biases(biases_ + bi * src_ld / group_size) {}
+
+  void load_unsafe() const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    const D scale = static_cast<D>(*scales);
+    const D bias = static_cast<D>(*biases);
+    const D s0 = scale;
+    const D s1 = scale / static_cast<D>(16.0f);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < n_reads; i += VEC) {
+      const vec<uint8_t, VEC> run = *((const device vec<uint8_t, VEC>*)(src + i));
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < VEC; j += 2) {
+        const uint8_t lo = run[j];
+        const uint8_t hi = run[j + 1];
+        *((threadgroup vec<D, 4>*)(dst + 2 * (i + j))) = vec<D, 4>(
+            s0 * (lo & 0x0f) + bias, s1 * (lo & 0xf0) + bias,
+            s0 * (hi & 0x0f) + bias, s1 * (hi & 0xf0) + bias);
+      }
+    }
+  }
+
+  void next() {
+    src += tile_stride;
+    if (group_steps > 1) {
+      group_step_cnt++;
+      if (group_step_cnt == group_steps) {
+        group_step_cnt = 0;
+        scales++;
+        biases++;
+      }
+    } else {
+      scales++;
+      biases++;
+    }
+  }
+};
+
+// Which weight loader an affine tile takes: the vectorized one at 4 bits, the
+// vendored one at every other width.
+template <typename T, short BROWS, short BCOLS, short dst_ld, short tgp_size,
+          short group_size, int bits, typename D>
+struct AffineLoaderFor {
+  using type = QuantizedBlockLoader<T, BROWS, BCOLS, dst_ld, 1, tgp_size, group_size, bits, D>;
+};
+template <typename T, short BROWS, short BCOLS, short dst_ld, short tgp_size,
+          short group_size, typename D>
+struct AffineLoaderFor<T, BROWS, BCOLS, dst_ld, tgp_size, group_size, 4, D> {
+  using type = AffineVec4Loader<T, BROWS, BCOLS, dst_ld, tgp_size, group_size, D>;
+};
 
 template <typename T, typename P, typename LoaderW, int BM, int BK, int BN,
           bool WITH_RESIDUAL, bool WITH_BIAS, int WM = qmm_wm<BM>(),
@@ -190,8 +332,8 @@ METAL_FUNC void qmm_t_aligned_half_impl(
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = BK + 16 / sizeof(half);
-  using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits, half>;
+  using loader_w_t = typename AffineLoaderFor<
+      T, BN, BK, BK_padded, WM * WN * SIMD_SIZE, group_size, bits, half>::type;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -229,8 +371,8 @@ METAL_FUNC void qmm_t_aligned_impl(
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
-  using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+  using loader_w_t = typename AffineLoaderFor<
+      T, BN, BK, BK_padded, WM * WN * SIMD_SIZE, group_size, bits, T>::type;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -276,8 +418,8 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
   wl += y_col * K_w;
   scales += y_col * K_g;
   biases += y_col * K_g;
-  using loader_w_t = QuantizedBlockLoader<
-      bfloat, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits, half>;
+  using loader_w_t = typename AffineLoaderFor<
+      bfloat, BN, BK, BK_padded, WM * WN * SIMD_SIZE, group_size, bits, half>::type;
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
   qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS,
                     WM, WN>(
@@ -467,8 +609,8 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = BK + 16 / sizeof(half);
-  using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, qmm_tgp<BM>(), group_size, bits, half>;
+  using loader_w_t = typename AffineLoaderFor<
+      T, BN, BK, BK_padded, qmm_tgp<BM>(), group_size, bits, half>::type;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -874,8 +1016,8 @@ METAL_FUNC void qmm_t_strided_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, qmm_tgp<BM>(), group_size, bits>;
+  using loader_w_t = typename AffineLoaderFor<
+      T, BN, BK, BK_padded, qmm_tgp<BM>(), group_size, bits, T>::type;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -965,8 +1107,8 @@ METAL_FUNC void qmm_t_strided_fp16_precast_impl(
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  using loader_w_t = QuantizedBlockLoader<
-      bfloat, BN, BK, BK_padded, 1, qmm_tgp<BM>(), group_size, bits, half>;
+  using loader_w_t = typename AffineLoaderFor<
+      bfloat, BN, BK, BK_padded, qmm_tgp<BM>(), group_size, bits, half>::type;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -1153,6 +1295,11 @@ METAL_FUNC void qmm_t_splitk_impl(
 
   using loader_w_t = QuantizedBlockLoader<
       T, BN, BK, BK_padded, 1, qmm_tgp<BM>(), group_size, bits>;
+  // The vendored loader, on purpose: the vectorized one (`AffineVec4Loader`)
+  // measured 107 -> 172 us at eight rows on K=5120 N=5120 and 29.5 -> 44.4
+  // at N=1024 through this split-K path, where it gains 3% on the unsplit
+  // tile. A split partition's k-run is short and this kernel's threadgroups
+  // are many; whatever the vector store costs there, it is not amortized.
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;

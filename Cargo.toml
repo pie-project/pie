@@ -172,6 +172,7 @@ controller = { path = "crates/controller" }
 gateway = { path = "crates/gateway" }
 worker = { path = "crates/worker", default-features = false }
 runtime = { path = "crates/runtime" }  # program/manifest types for `pie inferlet`
+models = { path = "crates/models" }    # the published-heads table `pie model import --drafter` resolves through
 # `pie model import`: load-plan executor, checkpoint writer, and the tokenizer
 # compiler whose result is serialized into the artifact (`pie.tokenizer/1`).
 checkpoint = { path = "crates/checkpoint" }

@@ -65,19 +65,30 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             head_dim,
             ..
         }
-        | Attention::Masked {
+        => Some(Reader {
+            q: *q,
+            plan: *plan,
+            cache: *cache,
+            head_dim: *head_dim,
+            kv_heads: None,
+            window: *window,
+        }),
+        // Stated, unlike the decode arms: a row nothing but a masked arm
+        // reads has no other reader to spell its head split.
+        Attention::Masked {
             q,
             plan,
             cache,
             window,
             head_dim,
+            kv_heads,
             ..
         } => Some(Reader {
             q: *q,
             plan: *plan,
             cache: *cache,
             head_dim: *head_dim,
-            kv_heads: None,
+            kv_heads: Some(*kv_heads),
             window: *window,
         }),
         Attention::Prefill {

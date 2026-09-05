@@ -173,6 +173,13 @@ impl Run<'_> {
                 // Whole, for `scatter_live_rows`' reason one arm up.
                 &mut self.fire_wide(*y),
             ),
+            Layout::TopK { .. } => {
+                return Err(kernels_cuda::Error::Backend {
+                    op: "layout.topk",
+                    detail: "the per-row top-k a candidate selector reads is not yet read on the CUDA arm"
+                        .to_string(),
+                });
+            }
             Layout::Argmax { .. } => {
                 return Err(kernels_cuda::Error::Backend {
                     op: "layout.argmax",

@@ -275,3 +275,5 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
 instantiate_attn_score_capture(bfloat16, bfloat, 64)
 instantiate_attn_score_capture(bfloat16, bfloat, 128)
 instantiate_attn_score_capture(bfloat16, bfloat, 256)
+// gemma-4's global reading is 512 wide; sixteen elements a lane, 2 KB of staging.
+instantiate_attn_score_capture(bfloat16, bfloat, 512)

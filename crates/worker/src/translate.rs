@@ -108,6 +108,10 @@ fn build_model(
                 rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
                 has_mtp_logits: g.caps.profile.has_mtp_logits,
                 mtp_depth: g.caps.profile.mtp_depth,
+                draft_block: g.caps.profile.draft_block,
+                draft_mask_token: g.caps.profile.draft_mask_token,
+                draft_bidirectional: g.caps.profile.draft_bidirectional,
+                draft_proposals_from: g.caps.profile.draft_proposals_from,
                 has_value_head: g.caps.profile.has_value_head,
                 // `has_kv_envelopes` has no successor: it advertised a
                 // model-gated ETA intrinsic the profile does not carry, and
@@ -121,6 +125,7 @@ fn build_model(
                     max_forward_requests: g.caps.limits.max_lanes as usize,
                     max_forward_tokens: g.caps.limits.max_tokens as usize,
                     max_page_refs: g.caps.limits.max_page_refs as usize,
+                    max_context: g.caps.limits.max_context as usize,
                 },
                 engine_backend: g.backend,
             }

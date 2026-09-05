@@ -19,9 +19,63 @@
 //! tolerance, not equality — `PIE_QMM_TOL` moves it. A new point that fails
 //! this is wrong before it is slow.
 //!
+//! # What the 16-row cost is NOT, measured
+//!
+//! On `K=5120 N=17408` at 4 bits / group 64, the tile point costs 497 us for
+//! sixteen rows against 208 us for one — 50 MB of bank read at 90 GB/s where
+//! the vector point reads it at 214, and 2.85 GFLOP at 5.7 TFLOP/s. The two
+//! halves ADD, which reads like a kernel that loads and multiplies in turn,
+//! so the obvious fix was tried and is written down here because it LOST:
+//!
+//! - **Double-buffering the K loop** (two threadgroup stages, the next tile's
+//!   loads issued under the previous tile's MMA) made it WORSE: 497 -> 522 us
+//!   at sixteen rows, 1770 -> 2254 at sixty-four. Threadgroup memory is an
+//!   OCCUPANCY resource on this GPU, and a second stage costs more residency
+//!   than the software pipeline buys — Apple hides load latency ACROSS
+//!   threadgroups, not inside one.
+//! - **`QMM_BK` at 16 and 64** moves only the eight-row point (348 -> 411 and
+//!   371). Sixteen rows and up are on the PRECAST plane and do not read it.
+//! - **`PRECAST_BK` at 32 / 64 / 128**: 496.3 / 497.2 / 505.5 us. Flat.
+//! - **Withholding the precast plane**: 548 us at sixteen rows, worse; it is
+//!   already the better arm (and at sixty-four rows only, 1733 vs 1770).
+//! - **`BN = 64`** (2026-09-04, on the reuse hypothesis: at sixteen rows the
+//!   544 column tiles each re-read the whole 160 KB activation block, 89 MB
+//!   against the bank's 45, so halving the tile count should halve that):
+//!   497 -> 539 us at sixteen rows, 874 -> 925 at thirty-two, 346 -> 451 at
+//!   eight; N=5120 and N=1024 the same way. Reuse is not what the tile is
+//!   short of.
+//! - **`BN = 16`** (the converse, twice the threadgroups, forced through
+//!   `PIE_QMM_TUNING=qmm_bn_crossover_tg=1000000`): 496 -> 528 us at sixteen
+//!   rows, 879 -> 940 at thirty-two. So BN = 32 is the optimum from BOTH
+//!   sides, and the tile is not threadgroup-count-bound in any simple way
+//!   either — what is left is the per-threadgroup loader, which no host-side
+//!   knob reaches and which wants a GPU capture.
+//!
+//! So the sixteen-row cost is not a tiling-parameter choice. The header
+//! that stood here next said the gap to explain was the QUANTIZED LOADER's
+//! read efficiency — "90 GB/s against the vector point's 214". **It was not
+//! (2026-09-05). The tile is COMPUTE-bound from sixteen rows up**, and the
+//! "90 GB/s" is the shadow of that ceiling, measured three ways:
+//!
+//! - The same shape at 8 BITS (twice the bytes, the same FLOPs): 600 vs 497
+//!   us at sixteen rows, 937 vs 874 at thirty-two, **1745 vs 1771 at
+//!   sixty-four** — twice the bytes cost nothing once the rows are many.
+//! - The tile's achieved rate as rows grow: 5.74 / 6.53 / 6.46 / 6.64 /
+//!   6.72 TFLOP/s at 16 / 32 / 64 / 128 / 256 rows. Flat.
+//! - A plain bf16 GEMM (`a_dense_gemm_sets_the_mma_ceiling`, no
+//!   dequantization) on the same shape: 7.05 / 7.33 / 7.37 TFLOP/s at 64 /
+//!   256 / 1024 rows — this GPU's MMA ceiling for this kernel family.
+//!
+//! So at sixteen rows the quantized tile runs at 78% of the dense ceiling
+//! and at thirty-two and up at ~90%; the eight-row rung (345 us, 4.1
+//! TFLOP/s) has more headroom but pays a dequantization the rows do not
+//! amortize. What is left on this GPU is the last fifth of the MMA rate, not
+//! a factor of two — the factor of two is an M5-class matrix unit.
+//!
 //! ```text
 //! PIE_QMM_SHAPES=5120x5120,5120x17408 PIE_QMM_ROWS=1,2,3,4,6,8,16 \
-//!   [PIE_QMM_TUNING=qmv_rows_max=4] [PIE_QMM_STEPS=50] \
+//!   [PIE_QMM_TUNING=qmv_rows_max=4] [PIE_QMM_STEPS=50] [PIE_QMM_BATCH=32] [PIE_QMM_WARM_MS=300] \
+//!   [PIE_QMM_PRECAST=0] [PIE_QMM_SPLITK=4] [PIE_QMM_LADDER_SPLIT=0] [PIE_QMM_BITS=2] [PIE_QMM_GROUP=64] \
 //!   cargo test -p engine-metal --release --test a_quantized_matmul_is_priced_by_its_rows -- --nocapture
 //! ```
 
@@ -31,12 +85,24 @@ use std::time::Instant;
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
+use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::linear::quant;
 use kernels_metal::{Bank, Tensor};
 use model_ir::Dtype;
 
+/// The tiled family's file, for the split-K arm this bench fires by hand.
+const QMM_FILE: &str = "linear/quant_qmm_t.metal";
+
+/// The row block a hand-fired split-K launch takes for `m` rows, and the
+/// padded row count — the engine's own rung (`bm_rung`) and padding.
+fn split_block(m: u32) -> (u32, u32) {
+    let bm = quant::bm_rung(i32::try_from(m).expect("rows fit")).unsigned_abs();
+    (bm, m.div_ceil(bm) * bm)
+}
+
 /// Codes per scale entry and bits per code — the shape every 4-bit MLX
-/// conversion in this tree ships.
+/// conversion in this tree ships; `PIE_QMM_GROUP` / `PIE_QMM_BITS` move the
+/// timed bank to the 2- and 8-bit formats (the sweep below covers them all).
 const GROUP: u32 = 64;
 const BITS: u32 = 4;
 
@@ -100,6 +166,9 @@ fn every_row_count_is_timed() {
                 "qmv_rows_packs" => over.qmv_rows_packs = Some(value),
                 "qmv_rows_max" => over.qmv_rows_max = Some(value),
                 "qmm_min_batch" => over.qmm_min_batch = Some(value),
+                "qmm_min_batch_moe" => over.qmm_min_batch_moe = Some(value),
+                "qmm_min_batch_emulated" => over.qmm_min_batch_emulated = Some(value),
+                "fp16_qmm" => over.fp16_qmm = Some(value != 0),
                 "qmm_bn_crossover_tg" => over.qmm_bn_crossover_tg = Some(value),
                 other => panic!("no knob named {other} here"),
             }
@@ -110,21 +179,43 @@ fn every_row_count_is_timed() {
 
     let rows = list("PIE_QMM_ROWS", "1,2,3,4,6,8,16");
     let steps: usize = env("PIE_QMM_STEPS", 50usize);
+    // Launches per command buffer. One launch is ~200 us of device time,
+    // and a command buffer that short is committed and waited on before the
+    // GPU has settled, so consecutive runs of the same launch read 200 us
+    // or 580 us with nothing else on the machine. A whole-model fire holds
+    // 300+ launches in one buffer and is steady to a few percent; this
+    // makes each timed buffer the same shape.
+    let batch: usize = env("PIE_QMM_BATCH", 32usize);
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     eprintln!("device: {}", device.name());
 
+    let bits: u32 = env("PIE_QMM_BITS", BITS);
+    let group: u32 = env("PIE_QMM_GROUP", GROUP);
     for (k, n) in shapes() {
-        // One bank: codes packed `BITS` apiece into u32 words, one bf16
-        // scale and zero point per `GROUP` codes.
-        let words = u64::from(n) * u64::from(k) * u64::from(BITS) / 32;
-        let factors_n = u64::from(n) * u64::from(k / GROUP);
+        // One bank: codes packed `bits` apiece into u32 words, one bf16
+        // scale and zero point per `group` codes.
+        let words = u64::from(n) * u64::from(k) * u64::from(bits) / 32;
+        let factors_n = u64::from(n) * u64::from(k / group);
         let widest = *rows.iter().max().expect("a row count");
         let mut codes_b = Buffer::zeroed(&device, words * 4).expect("codes");
         let mut scales_b = Buffer::zeroed(&device, factors_n * 2).expect("scales");
         let mut biases_b = Buffer::zeroed(&device, factors_n * 2).expect("biases");
-        let mut act_b = Buffer::zeroed(&device, u64::from(widest) * u64::from(k) * 2).expect("act");
-        let out_b = Buffer::zeroed(&device, u64::from(widest) * u64::from(n) * 2).expect("out");
+        // Row capacity: the widest padded block any arm launches, so a
+        // split-K fire at three rows has its eight-row tile to write.
+        let cap = rows.iter().map(|&m| split_block(m).1).max().expect("a row count").max(widest);
+        let split: u32 = env("PIE_QMM_SPLITK", 0u32);
+        let precast_on: u32 = env("PIE_QMM_PRECAST", 1u32);
+        let mut act_b = Buffer::zeroed(&device, u64::from(cap) * u64::from(k) * 2).expect("act");
+        let out_b = Buffer::zeroed(&device, u64::from(cap) * u64::from(n) * 2).expect("out");
+        let precast_b = Buffer::zeroed(&device, u64::from(cap) * u64::from(k) * 2).expect("precast");
+        // Room for the forced arm's partials AND the ladder's own split
+        // (eight partitions of an eight-row tile).
+        let partial_b = Buffer::zeroed(
+            &device,
+            u64::from(split.max(8)) * u64::from(cap.max(8)) * u64::from(n) * 4,
+        )
+        .expect("partials");
         // Fill: arbitrary codes, small scales so the product stays in bf16's
         // range, zero points at zero, and one activation row repeated so
         // every row count computes the SAME row 0.
@@ -145,7 +236,7 @@ fn every_row_count_is_timed() {
                 pair.copy_from_slice(&bf16(-0.05 + 0.01 * f32::from(noise(at as u64 ^ 0x55) % 8)));
             }
             biases_b.write(0, &zeros).expect("write biases");
-            let mut act = vec![0u8; usize::try_from(u64::from(widest) * u64::from(k) * 2).expect("act fits")];
+            let mut act = vec![0u8; usize::try_from(u64::from(cap) * u64::from(k) * 2).expect("act fits")];
             for (row, chunk) in act.chunks_exact_mut(usize::try_from(k).expect("k fits") * 2).enumerate() {
                 for (at, pair) in chunk.chunks_exact_mut(2).enumerate() {
                     // Row 0's values are the ones every launch shares; the
@@ -163,9 +254,20 @@ fn every_row_count_is_timed() {
         let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("a handle");
         let (hc, hs, hb, ha, ho) =
             (bind(&codes_b), bind(&scales_b), bind(&biases_b), bind(&act_b), bind(&out_b));
+        let (hp, hq) = (bind(&precast_b), bind(&partial_b));
+        if split > 0 {
+            eprintln!("arm: split-K x{split}, f32 partials, at the engine's row rung");
+        } else if precast_on == 0 {
+            eprintln!("arm: the ladder, precast plane withheld");
+        } else {
+            eprintln!("arm: the ladder, with a precast plane (the engine's rung for gs=64/b=4)");
+        }
 
         eprintln!("\n  K={k} N={n}  ({:.2} GiB of codes)", words as f64 * 4.0 / (1u64 << 30) as f64);
-        let tol: f64 = env("PIE_QMM_TOL", 0.02f64);
+        // 5% over a 0.1 floor: the fold reassociates (one bf16 ulp) and
+        // the tile dequantizes to bf16 (a few 1e-3 absolute on a 2-bit
+        // bank); a WRONG point measures 20-200% across thousands of columns.
+        let tol: f64 = env("PIE_QMM_TOL", 0.05f64);
         let mut one = 0.0f64;
         // Row 0 of the first row count is the reference every later count
         // is read against.
@@ -173,32 +275,109 @@ fn every_row_count_is_timed() {
         for &m in &rows {
             let bank = Bank {
                 // The codes tensor is stated in CODES, not words: the point
-                // derives the packing from `bits`.
+                // derives the packing from `bits`, and reads no dtype off it.
                 codes: Tensor::new(hc, n, k, Dtype::U4g64),
-                scales: Tensor::new(hs, n, k / GROUP, Dtype::Bf16),
-                biases: Some(Tensor::new(hb, n, k / GROUP, Dtype::Bf16)),
-                group: GROUP,
-                bits: BITS,
+                scales: Tensor::new(hs, n, k / group, Dtype::Bf16),
+                biases: Some(Tensor::new(hb, n, k / group, Dtype::Bf16)),
+                group,
+                bits,
             };
             let act = Tensor::new(ha, m, k, Dtype::Bf16);
             let y = Tensor::new(ho, m, n, Dtype::Bf16);
             let none = |_: u32, _: u32| None;
-            let scratch = quant::Scratch { precast: &none };
+            let some = |rows: u32, contraction: u32| {
+                (u64::from(rows) * u64::from(contraction) <= u64::from(cap) * u64::from(k))
+                    .then(|| Tensor::new(hp, rows, contraction, Dtype::F16))
+            };
+            let precast: &dyn Fn(u32, u32) -> Option<Tensor> =
+                if precast_on == 0 { &none } else { &some };
+            let partial_rows = u64::from(partial_b.bytes()) / (u64::from(n) * 4);
+            let some_partials = |rows: u32, width: u32| {
+                (width == n && u64::from(rows) <= partial_rows)
+                    .then(|| Tensor::new(hq, rows, width, Dtype::F32))
+            };
+            let partials: &dyn Fn(u32, u32) -> Option<Tensor> =
+                if env("PIE_QMM_LADDER_SPLIT", 1u32) == 0 { &none } else { &some_partials };
+            // One launch of this row count, whichever arm is on.
+            let launch = |sink: &dyn Encode| {
+                if split == 0 {
+                    let scratch = quant::Scratch { precast, partials };
+                    return quant::matmul(sink, act, bank, y, scratch, cap).expect("the launch");
+                }
+                let (bm, padded) = split_block(m);
+                let (bm_i, padded_i, n_i, k_i, split_i) = (
+                    i32::try_from(bm).expect("bm"),
+                    i32::try_from(padded).expect("padded"),
+                    i32::try_from(n).expect("n"),
+                    i32::try_from(k).expect("k"),
+                    i32::try_from(split).expect("split"),
+                );
+                assert!(k_i % (split_i * 32) == 0 && (k_i / split_i) % 64 == 0,
+                    "K={k} must split into {split} partitions of whole 32-blocks and 64-groups");
+                let entry = format!("affine_qmm_t_splitk_f32_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_32");
+                let entry: &'static str = Box::leak(entry.into_boxed_str());
+                let grid = quant::qmm_grid("bench", n_i, 32, padded_i, bm_i, split_i).expect("a grid");
+                let stride = padded_i * n_i;
+                sink.fire(
+                    Fire::at(QMM_FILE, entry).apply(Grid::of(grid, quant::qmm_group(bm_i))),
+                    &[
+                        Tensor::new(hc, n, k, Dtype::U4g64).arg(),
+                        Tensor::new(hs, n, k / group, Dtype::Bf16).arg(),
+                        Tensor::new(hb, n, k / group, Dtype::Bf16).arg(),
+                        act.arg(),
+                        sink.absent().expect("a null seat"),
+                        k_i.arg(),
+                        n_i.arg(),
+                        sink.absent().expect("a null seat"),
+                        Tensor::new(hq, padded * split, n, Dtype::F32).arg_mut(),
+                        (k_i / split_i).arg(),
+                        stride.arg(),
+                    ],
+                )
+                .expect("the split-K launch");
+                let mut reduce = vec![sink.absent().expect("a null seat"); 4];
+                reduce.push(y.arg_mut());
+                reduce.push(sink.absent().expect("a null seat"));
+                reduce.push(n_i.arg());
+                reduce.push(sink.absent().expect("a null seat"));
+                reduce.push(Tensor::new(hq, padded * split, n, Dtype::F32).arg());
+                reduce.push(sink.absent().expect("a null seat"));
+                reduce.push(stride.arg());
+                reduce.push(split_i.arg());
+                sink.fire(
+                    Fire::at(QMM_FILE, "qmm_splitk_reduce_f32_bfloat16")
+                        .apply(Grid::of([n, m, 1], [256, 1, 1])),
+                    &reduce,
+                )
+                .expect("the reduce");
+            };
             // `capacity_rows` is the ROW CAPACITY of the output rectangle, not
             // this launch's row count: `mb_block` pads `M` up to a `BM` rung
             // and refuses a padding the capacity cannot hold. Passing `m`
-            // here would deny the tile point every row count it must pad
-            // (M = 6 would fall to three folds of two), which is not what a
-            // fire with a wider rectangle does.
-            let cap = widest;
-            let _ = cap;
-
-            // Warm: the first launch compiles the point.
+            // would deny the tile point every row count it must pad (M = 6
+            // would fall to three folds of two), which is not what a fire
+            // with a wider rectangle does; `cap` is the buffers' capacity.
+            // Warm: the first launch compiles the point, and the ones after
+            // it hold the GPU busy until its clock has come up. A timed run
+            // of fifty launches is ~20 ms of device time, too short for the
+            // governor to leave its idle state, so an unwarmed pass reads
+            // 2x slow and a second pass minutes later reads fast — which
+            // looks exactly like thermal noise and is not. `PIE_QMM_WARM_MS`
+            // is how long to hold it (default 300 ms).
             {
-                let frame = device.frame().expect("a frame");
-                let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                quant::matmul(&sink, act, bank, y, scratch, widest).expect("the warm launch");
-                frame.commit().expect("the warm commit");
+                let warm_ms: u64 = env("PIE_QMM_WARM_MS", 300u64);
+                let began = Instant::now();
+                loop {
+                    let frame = device.frame().expect("a frame");
+                    let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                    for _ in 0..batch {
+                        launch(&sink);
+                    }
+                    frame.commit().expect("the warm commit");
+                    if began.elapsed().as_millis() as u64 >= warm_ms {
+                        break;
+                    }
+                }
             }
 
             let began = Instant::now();
@@ -206,10 +385,12 @@ fn every_row_count_is_timed() {
             for _ in 0..steps {
                 let frame = device.frame().expect("a frame");
                 let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                let scratch = quant::Scratch { precast: &none };
-                quant::matmul(&sink, act, bank, y, scratch, widest).expect("the launch");
+                for _ in 0..batch {
+                    launch(&sink);
+                }
                 device_s += frame.commit_timed().expect("the commit");
             }
+            let launches = (steps * batch) as f64;
             // ── the check: row 0 is the same activation at every row
             //    count, so every point must answer it the same numbers.
             let raw = handles.read(ho, u64::from(n) * 2).expect("read row 0");
@@ -219,13 +400,27 @@ fn every_row_count_is_timed() {
                 Some(want) => {
                     let mut worst = 0.0f64;
                     let mut at = 0usize;
+                    // Relative, with a floor: the tile dequantizes to bf16
+                    // in threadgroup memory, so a near-zero output carries
+                    // ~1e-3 of absolute noise that is not a wrong answer.
                     for (i, (a, b)) in want.iter().zip(&got).enumerate() {
-                        let scale = f64::from(a.abs()).max(f64::from(b.abs())).max(1e-3);
+                        let scale = f64::from(a.abs()).max(f64::from(b.abs())).max(0.1);
                         let d = f64::from((a - b).abs()) / scale;
                         if d > worst {
                             worst = d;
                             at = i;
                         }
+                    }
+                    if worst > tol && std::env::var_os("PIE_QMM_DEBUG").is_some() {
+                        let off: Vec<usize> = want.iter().zip(&got).enumerate()
+                            .filter(|(_, (a, b))| {
+                                let (a, b) = (**a, **b);
+                                let scale = f64::from(a.abs()).max(f64::from(b.abs())).max(0.1);
+                                f64::from((a - b).abs()) / scale > tol
+                            })
+                            .map(|(i, _)| i).collect();
+                        eprintln!("    {} of {} columns off; first 24: {:?}", off.len(), want.len(), &off[..off.len().min(24)]);
+                        eprintln!("    col%8 histogram: {:?}", (0..8).map(|k| off.iter().filter(|&&i| i % 8 == k).count()).collect::<Vec<_>>());
                     }
                     assert!(
                         worst <= tol,
@@ -235,8 +430,8 @@ fn every_row_count_is_timed() {
                 }
             }
 
-            let wall_us = began.elapsed().as_secs_f64() * 1e6 / steps as f64;
-            let dev_us = device_s * 1e6 / steps as f64;
+            let wall_us = began.elapsed().as_secs_f64() * 1e6 / launches;
+            let dev_us = device_s * 1e6 / launches;
             if m == rows[0] {
                 one = dev_us;
             }
@@ -252,4 +447,135 @@ fn every_row_count_is_timed() {
             );
         }
     }
+}
+
+/// **EVERY FOLDED POINT ANSWERS THE ONE-ROW POINT** — the whole
+/// `(group, bits) x rung x pack` axis the ladder can fire, each folded
+/// launch checked row for row against `affine_qmv_fast` on the same rows.
+///
+/// This exists because of a shape that was WRONG: with the fold's loops
+/// unrolled (`quant_qmv_rows.metal`, header) the `r_5_p_2` point at gs 64 /
+/// 4-bit landed a different number in every column while `r_3_p_2` and
+/// every pack-1 rung were right — a miscompile, deterministic per shape. A
+/// dispatcher that mints points by name cannot see that, so this sweep
+/// does, over the rungs each pack width is offered at.
+///
+/// At pack width 2 the fold deals K out to the lanes exactly as the one-row
+/// point does and the check is EQUALITY; at pack width 1 it reassociates
+/// (one bf16 ulp in about one element in eight thousand) and the check is
+/// a relative tolerance.
+#[test]
+fn every_folded_point_answers_the_one_row_point() {
+    let Ok(device) = Context::bind() else {
+        eprintln!("not asked: no Metal device");
+        return;
+    };
+    let handles = Handles::new();
+    let pipelines = Pipelines::new();
+    // Small enough to be quick, wide enough that every block size the axis
+    // stamps (up to 1024 codes at 2-bit x 2 packs) divides K a few times.
+    let (k, n): (u32, u32) = (2048, 256);
+    let rows_max = 8u32;
+    let codes_bytes = u64::from(n) * u64::from(k); // 8-bit is the widest
+    let factors_max = u64::from(n) * u64::from(k / 32);
+    let mut codes_b = Buffer::zeroed(&device, codes_bytes).expect("codes");
+    let mut scales_b = Buffer::zeroed(&device, factors_max * 2).expect("scales");
+    let mut biases_b = Buffer::zeroed(&device, factors_max * 2).expect("biases");
+    let mut act_b = Buffer::zeroed(&device, u64::from(rows_max) * u64::from(k) * 2).expect("act");
+    let fold_b = Buffer::zeroed(&device, u64::from(rows_max) * u64::from(n) * 2).expect("fold out");
+    let one_b = Buffer::zeroed(&device, u64::from(rows_max) * u64::from(n) * 2).expect("one out");
+    {
+        let mut codes = vec![0u8; usize::try_from(codes_bytes).expect("fits")];
+        for (at, byte) in codes.iter_mut().enumerate() {
+            *byte = noise(at as u64);
+        }
+        codes_b.write(0, &codes).expect("write codes");
+        let mut factors = vec![0u8; usize::try_from(factors_max * 2).expect("fits")];
+        for (at, pair) in factors.chunks_exact_mut(2).enumerate() {
+            pair.copy_from_slice(&bf16(0.01 + 0.001 * f32::from(noise(at as u64 ^ 0xAA) % 8)));
+        }
+        scales_b.write(0, &factors).expect("write scales");
+        for (at, pair) in factors.chunks_exact_mut(2).enumerate() {
+            pair.copy_from_slice(&bf16(-0.05 + 0.01 * f32::from(noise(at as u64 ^ 0x55) % 8)));
+        }
+        biases_b.write(0, &factors).expect("write biases");
+        let mut act = vec![0u8; usize::try_from(u64::from(rows_max) * u64::from(k) * 2).expect("fits")];
+        for (at, pair) in act.chunks_exact_mut(2).enumerate() {
+            pair.copy_from_slice(&bf16(0.02 * (f32::from(noise(at as u64) % 16) - 8.0)));
+        }
+        act_b.write(0, &act).expect("write act");
+    }
+    let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("a handle");
+    let (hc, hs, hb, ha, hf, ho) = (
+        bind(&codes_b), bind(&scales_b), bind(&biases_b), bind(&act_b), bind(&fold_b), bind(&one_b),
+    );
+    let read = |h: u32, rows: u32| -> Vec<f32> {
+        handles
+            .read(h, u64::from(rows) * u64::from(n) * 2)
+            .expect("read")
+            .chunks_exact(2)
+            .map(|p| to_f32(p[0], p[1]))
+            .collect()
+    };
+
+    let mut swept = 0usize;
+    let mut wrong = Vec::new();
+    for &gs in &[32i32, 64, 128] {
+        for &bits in &[2i32, 4, 8] {
+            for &packs in &[1i32, 2] {
+                for rung in 2..=8i32 {
+                    let Ok(point) = quant::qmv_rows_point("sweep", gs, bits, rung, packs) else {
+                        continue; // not a rung this pack width is offered at
+                    };
+                    let m = rung.unsigned_abs();
+                    let (ki, ni, mi) = (i32::try_from(k).unwrap(), i32::try_from(n).unwrap(), rung);
+                    let frame = device.frame().expect("a frame");
+                    let sink = Sink::new(&device, &frame, &pipelines, &handles);
+                    let w = [
+                        Tensor::new(hc, n, k, Dtype::U4g64).arg(),
+                        Tensor::new(hs, n, 1, Dtype::Bf16).arg(),
+                        Tensor::new(hb, n, 1, Dtype::Bf16).arg(),
+                        Tensor::new(ha, m, k, Dtype::Bf16).arg(),
+                    ];
+                    let mut fold = w.to_vec();
+                    fold.extend([Tensor::new(hf, m, n, Dtype::Bf16).arg_mut(), ki.arg(), ni.arg(), mi.arg()]);
+                    sink.fire(
+                        Fire::at("linear/quant_qmv_rows.metal", point.entry)
+                            .stamp(point.stamp)
+                            .apply(Grid::of(quant::qmv_rows_grid("sweep", mi, rung, ni).expect("grid"), [32, 2, 1])),
+                        &fold,
+                    )
+                    .expect("the fold");
+                    let one = quant::qmv_point("sweep", "fast", gs, bits).expect("the one-row point");
+                    let mut single = w.to_vec();
+                    single.extend([Tensor::new(ho, m, n, Dtype::Bf16).arg_mut(), ki.arg(), ni.arg()]);
+                    sink.fire(
+                        Fire::at("linear/quant_qmv.metal", one.entry)
+                            .apply(Grid::of(quant::qmv_grid("sweep", mi, ni).expect("grid"), [32, 2, 1])),
+                        &single,
+                    )
+                    .expect("the one-row point");
+                    frame.commit().expect("commit");
+                    let (got, want) = (read(hf, m), read(ho, m));
+                    let mut worst = 0.0f64;
+                    for (a, b) in want.iter().zip(&got) {
+                        let scale = f64::from(a.abs()).max(f64::from(b.abs())).max(1e-3);
+                        worst = worst.max(f64::from((a - b).abs()) / scale);
+                    }
+                    let tol = if packs == 2 { 0.0 } else { 0.02 };
+                    swept += 1;
+                    if worst > tol {
+                        wrong.push(format!("{} (worst relative {worst:.4})", point.entry));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("swept {swept} folded points against the one-row point");
+    assert!(
+        wrong.is_empty(),
+        "{} folded points answer differently from the one-row point:\n  {}",
+        wrong.len(),
+        wrong.join("\n  ")
+    );
 }

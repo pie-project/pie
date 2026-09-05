@@ -166,6 +166,15 @@ pub struct DeviceTuning {
     /// which 32 partial sums land where. See
     /// [`qmv_rows_packs`](DeviceTuning::qmv_rows_packs).
     ///
+    /// 8 since 2026-09 (M4 Pro, `a_quantized_matmul_is_priced_by_its_rows`,
+    /// K=5120 4-bit): with the fold's row loop unrolled a three-row group is
+    /// 227 us and a four-row group 286 against a one-row fire's 207 at
+    /// N=17408, where three one-row launches are 297 and two two-row folds
+    /// 319; and at N=1024, where the tile cannot fill the machine, the fold
+    /// to eight rows (47 us) beats four two-row folds (54) and the tile (56).
+    /// Where the tile does fill the machine `linear::quant::act_x_wt` takes it
+    /// from `qmm_min_batch` rows and this cap is not reached.
+    ///
     /// # Reproducibility
     ///
     /// `qmv_rows_packs = 2` alone is NOT enough to make a served answer
@@ -227,7 +236,7 @@ impl Default for DeviceTuning {
             gdn_scan_lanes: 32,
             gdn_scan_rows: 4,
             moe_batch_min_per_expert: 2,
-            qmv_rows_max: 2,
+            qmv_rows_max: 8,
             qmv_rows_packs: 1,
             stream_rows_per_cut: 0,
         }
@@ -241,12 +250,16 @@ impl DeviceTuning {
     pub fn of(info: DeviceInfo) -> Self {
         let mut t = Self::default();
         match info.apple_family {
-            // Apple9: dense crossover named rather than inherited, since the
-            // widths measured here (gemma-4-E4B @ +3.7%) say nothing about
-            // the default's. Tile crossover moves down: fewer cores (20 vs
-            // 32) fill sooner, so the bracket is (64, 96].
+            // Apple9: tile crossover moves down: fewer cores (20 vs 32) fill
+            // sooner, so the bracket is (64, 96]. The dense GEMV/GEMM
+            // crossover was 8 (gemma-4-E4B @ +3.7%) until 2026-09, when the
+            // M4 Pro row bench (`a_quantized_matmul_is_priced_by_its_rows`,
+            // K=5120 N=17408 4-bit, us a launch) priced the arms at five to
+            // seven rows: the tile at bm=8 is a flat 348 where five one-row
+            // launches are 491, three two-row folds 437 and seven one-row
+            // launches 684 — and the fold's own rungs there (344 / 413 / 506)
+            // tie or lose to it. So the tile from five, as the default row.
             9 => {
-                t.qmm_min_batch = 8;
                 t.qmm_bn_crossover_tg = 96;
             }
             // Apple8: dense crossover is 8 from this machine's own sweep

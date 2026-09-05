@@ -26,7 +26,7 @@ pub use forward::*;
 /// for the class sweep every merge must survive), and removed when nothing
 /// does.
 pub use model_ir::{
-    Attention, CacheRow, Def, Dtype, GateActivation, Layout, Linear, MropeForm, Operands, Operation,
+    Attention, BlockDrafter, CacheRow, Def, Dtype, GateActivation, Layout, Linear, MropeForm, Operands, Operation,
     Param, ParamSource, Trace, Platform, Shard, ValueId, resolve_classes,
 };
 pub use record::{Recorder, Refine, SplitSpec, Value};

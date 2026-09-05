@@ -156,6 +156,31 @@ impl ClassTable {
 /// combination: uncaught, these are a garbled token under one batch mix;
 /// caught, they are one line. Re-exported from the crate root as
 /// `ClassFault` (`check::Fault` is already taken next door).
+/// Whether `id` is written at all in the class `word` names.
+///
+/// Only a merge can be absent outright: every other def either runs under
+/// its own guard or is read through an alias, both of which the walk
+/// resolves itself. A merge with no holding arm is the one shape that has
+/// no value here at all.
+fn written_in_class(trace: &Trace, id: ValueId, word: u64) -> bool {
+    let Some(Def::Merge(arms)) = trace.values.get(id.0 as usize).map(|decl| &decl.def) else {
+        // Every other def either runs under its own guard or is read through
+        // an alias, both of which the walk resolves itself.
+        return true;
+    };
+    if arms.iter().any(|(_, cond)| cond.holds(word)) {
+        return true;
+    }
+    // No arm holds — and there are two very different reasons for that. If
+    // the arms SHARE a guard that this class fails, the region they belong
+    // to does not run here at all and the seam has nothing to hand out. If
+    // they share nothing, the gap is their own: that is the fault this check
+    // exists to report, so the value is rooted and the walk finds it.
+    let conds: Vec<Guard> = arms.iter().map(|(_, cond)| cond.clone()).collect();
+    let common = Guard::common(&conds);
+    matches!(common, Guard::Always) || common.holds(word)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
     /// No arm holds for a class that demands the merge — those rows are never
@@ -361,7 +386,19 @@ pub fn resolve_classes(trace: &Trace) -> Result<ClassTable, Vec<Fault>> {
             }
         }
         for seam in &trace.seams {
-            walk.stack.extend(seam.values.iter().copied());
+            // **A SEAM HANDS OUT NOTHING IN A CLASS THAT DOES NOT WRITE IT.**
+            // A plan may guard a whole region away from a class — a block
+            // drafter's rows skip the trunk entirely — and the seams that
+            // region plants (`attn.out` and its siblings) then have no value
+            // to offer. Rooting them anyway demands a merge whose every arm
+            // is guarded off and reports it `Uncovered`, which is a fault
+            // about the walk rather than about the plan.
+            walk.stack.extend(
+                seam.values
+                    .iter()
+                    .copied()
+                    .filter(|id| written_in_class(trace, *id, word)),
+            );
         }
 
         while let Some(id) = walk.stack.pop() {
@@ -558,6 +595,8 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::MlaDecodeSelected { .. }
             | Attention::MlaPrefillSelected { .. }
             | Attention::SsmGdnPrep { .. }
+            | Attention::BlockDynConv { .. }
+            | Attention::SelectorWalk { .. }
             | Attention::IndexLayernormRope { .. }
             | Attention::IndexRope { .. }
             | Attention::IndexTopk { .. }
@@ -617,6 +656,7 @@ mod tests {
                     values: Vec::new(),
                     nodes: Vec::new(),
                     seams: Vec::new(),
+                    drafter: None,
                 },
                 inputs: 0,
             }
@@ -772,5 +812,99 @@ mod tests {
         assert!(classes.node_mask[append].contains(0));
         assert!(classes.node_mask[0].contains(0));
         assert_eq!(classes.dead, vec![2]);
+    }
+}
+
+impl ClassTable {
+    /// **WHICH FACT IS THE ADAPTER WINDOW.** The model text writes it
+    /// (`qwen_3`: `Predicate::fact(1)`, called `has_adapter`) and nothing
+    /// crosses into a shell that names the bit. What does cross is this table
+    /// (every fact word, grouped by behaviour) and `corrected` — the classes
+    /// that run a `linear.lora_correct` arm. Between them the bit is a fact
+    /// rather than a guess: it is the one whose value agrees with membership
+    /// of the correction window on every word of every class **the window
+    /// can reach**.
+    ///
+    /// A class is out of the window's reach when every one of its words
+    /// carries a fact no corrected class ever carries: a block drafter's rows
+    /// (`block_draft`) run no trunk layer and so no correction, whatever else
+    /// they say, and they must not veto the bit that decides the rest. The
+    /// bits a corrected class ever sets are the window's domain; a class
+    /// wholly outside it does not vote. (Without this, the first family that
+    /// carried both an adapter and a block drafter refused every adapted lane:
+    /// "no corrected class for its fact word".)
+    ///
+    /// `None` when no bit qualifies (the window is not a single fact of this
+    /// bake), when two do (two facts never observed apart — picking one would
+    /// be picking at random), or when nothing is corrected at all. Every shell
+    /// derives the bit here, so a control plane's submission means one thing
+    /// on every backend.
+    #[must_use]
+    pub fn adapter_fact(&self, corrected: &ClassSet) -> Option<u32> {
+        if corrected.is_empty() {
+            return None;
+        }
+        let domain = self.correction_domain(corrected);
+        let reachable = |class: &Class| class.words.iter().any(|word| word & !domain == 0);
+        let mut found = None;
+        for bit in 0..u64::BITS {
+            if self.mask & (1u64 << bit) == 0 {
+                continue;
+            }
+            let decides = self.classes.iter().enumerate().all(|(at, class)| {
+                if !reachable(class) {
+                    return true;
+                }
+                let runs = corrected.contains(at);
+                class.words.iter().all(|word| ((word >> bit) & 1 == 1) == runs)
+            });
+            if decides {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(bit);
+            }
+        }
+        found
+    }
+
+    /// The facts a corrected class ever carries, as a word: the correction's
+    /// domain. A word with a bit outside it names rows the correction cannot
+    /// reach — a block drafter's, which run no trunk layer.
+    #[must_use]
+    pub fn correction_domain(&self, corrected: &ClassSet) -> u64 {
+        self.classes
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| corrected.contains(*at))
+            .flat_map(|(_, class)| class.words.iter().copied())
+            .fold(0u64, |acc, word| acc | word)
+    }
+
+    /// Whether the correction can reach rows of this word at all: `false` when
+    /// the word carries a fact no corrected class ever carries (a block
+    /// drafter's rows, which run no trunk layer). A lane that binds an adapter
+    /// and fires such rows gets no correction and is owed none; the fire path
+    /// refuses an adapted lane outside the window only when the window could
+    /// have held it.
+    #[must_use]
+    pub fn correction_reaches(&self, corrected: &ClassSet, word: u64) -> bool {
+        word & self.mask & !self.correction_domain(corrected) == 0
+    }
+
+    /// **THE WORD AN ADAPTED LANE FIRES UNDER.** `bit` is
+    /// [`adapter_fact`](Self::adapter_fact)'s answer. A lane whose word names
+    /// rows the correction cannot reach (a block drafter's draft fire: no trunk
+    /// row, nothing to correct) fires as it is; every other lane is moved into
+    /// the correction window, and `None` — the refusal — is a lane that asked
+    /// for a correction and would have got the base model.
+    #[must_use]
+    pub fn adapted_word(&self, corrected: &ClassSet, bit: u32, word: u64) -> Option<u64> {
+        if !self.correction_reaches(corrected, word) {
+            return Some(word);
+        }
+        let adapted = word | (1u64 << bit);
+        let class = self.class_of(adapted & self.mask)?;
+        corrected.contains(class).then_some(adapted)
     }
 }
