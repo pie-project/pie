@@ -247,6 +247,50 @@ def _build_guests():
     print(f"Guests: {built} Python/JS twin(s) built with bakery" + (f", {len(failed)} failed" if failed else ""))
 
 
+def find_artifact(name: str) -> tuple[Path, Path]:
+    """The `.wasm` and `Pie.toml` of the curated inferlet `name` -- the
+    NEWEST artifact among the places a build leaves one.
+
+    Rust workspace artifacts live under this directory's target/ (release or
+    debug); the member paths are fallbacks for inferlets built outside the
+    curated workspace; JS (bakery build) / Python (componentize-py) leave a
+    flat `<dir>/target/<name>.wasm`.
+
+    Newest wins, not first: `_build_guests` builds DEBUG -- no `--release` --
+    so a release artifact built once, by hand or by an older harness, would
+    otherwise shadow every rebuild this harness does afterwards, silently and
+    for good. That failure mode is a source edit that appears to have no
+    effect, which is indistinguishable from a correct program, and it is how
+    a mutation test once came back "the mutation survived" against a guest
+    that had never been rebuilt.
+    """
+    wasm_name = name.replace("-", "_")
+    inferlet_dir = INFERLETS_DIR / name
+    candidates = [
+        INFERLETS_DIR / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
+        INFERLETS_DIR / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / f"{wasm_name}.wasm",
+    ]
+    present = [p for p in candidates if p.exists()]
+    wasm_path = max(present, key=lambda p: p.stat().st_mtime, default=None)
+    manifest_path = inferlet_dir / "Pie.toml"
+    if wasm_path is None:
+        raise FileNotFoundError(
+            f"No WASM binary for {name} (tried: {', '.join(str(p) for p in candidates)})"
+        )
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"No Pie.toml at {manifest_path}")
+    return wasm_path, manifest_path
+
+
+def inferlet_id(manifest_path: Path) -> str:
+    """`name@version` from a `Pie.toml`, the id `launch_process` takes."""
+    manifest = tomllib.loads(manifest_path.read_text())
+    return f"{manifest['package']['name']}@{manifest['package']['version']}"
+
+
 async def run_inferlet(
     client,
     name: str,
@@ -262,51 +306,9 @@ async def run_inferlet(
     """
     if extra_args is None:
         extra_args = []
-    wasm_name = name.replace("-", "_")
-    # Rust workspace artifacts live under this directory's target/. Keep the member
-    # paths as fallbacks for inferlets built outside the curated workspace.
-    # JS (bakery build) / Python (componentize-py): flat target/<name>.wasm
-    inferlet_dir = INFERLETS_DIR / name
-    candidates = [
-        INFERLETS_DIR / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
-        INFERLETS_DIR / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
-        inferlet_dir / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
-        inferlet_dir / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
-        inferlet_dir / "target" / f"{wasm_name}.wasm",
-    ]
-    # The NEWEST of the ones that exist, not the first.
-    #
-    # The list is a preference order and was read as one, which is wrong here
-    # for a reason that cost real time: `_build_guests` above builds DEBUG --
-    # no `--release` -- while this list prefers release. So a release artifact
-    # built once, by hand or by an older harness, shadows every rebuild this
-    # harness does afterwards, silently and for good. The failure mode is a
-    # source edit that appears to have no effect, which is indistinguishable
-    # from a correct program, and it is how a mutation test came back "the
-    # mutation survived" against a guest that had never been rebuilt.
-    #
-    # Newest-wins keeps every path working -- a vendored or cross-built guest
-    # is still found, and a deliberate release build is still preferred right
-    # after it is made -- while making the thing just built the thing that
-    # runs.
-    present = [p for p in candidates if p.exists()]
-    wasm_path = max(present, key=lambda p: p.stat().st_mtime, default=None)
-    manifest_path = inferlet_dir / "Pie.toml"
-
-    if wasm_path is None:
-        raise FileNotFoundError(
-            f"No WASM binary for {name} (tried: {', '.join(str(p) for p in candidates)})"
-        )
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"No Pie.toml at {manifest_path}")
-
-    manifest = tomllib.loads(manifest_path.read_text())
-    pkg_name = manifest["package"]["name"]
-    version = manifest["package"]["version"]
-    inferlet_id = f"{pkg_name}@{version}"
-
+    wasm_path, manifest_path = find_artifact(name)
     await client.install_program(wasm_path, manifest_path, force_overwrite=True)
-    process = await client.launch_process(inferlet_id, input=extra_args)
+    process = await client.launch_process(inferlet_id(manifest_path), input=extra_args)
 
     output_parts: list[str] = []
     start = time.time()
