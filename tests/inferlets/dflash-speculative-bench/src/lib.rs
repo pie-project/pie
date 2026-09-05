@@ -235,6 +235,41 @@
 //! that dips is not a workload that changed. Left at zero the gate never
 //! closes, which is the loop every number above this section was taken with.
 //!
+//! # The prices are measured, and the gate reads them
+//!
+//! Every constant above — the staircase, the three rungs, break-even near
+//! three tokens a round — is ONE trunk's on ONE box, and the first mixture
+//! this loop was pointed at broke all of them: gemma-4-26B-A4B prices a
+//! verify fire by the EXPERTS its rows touch, so 4 / 8 / 16 rows cost 1.7 /
+//! 2.5 / 4.6 one-row fires (28 / 41 / 69 ms against 14) and the draft fire
+//! alone costs 0.65 of a decode (9 ms). The stated ladder ran prose at 0.76x
+//! of plain decode. So `priced` (ON by default) times every fire on the
+//! guest's clock — submit to readback, what the guest waits — keeps a median
+//! a shape (`Prices`), estimates the yield at each rung from the recent
+//! rounds' per-position hit rates (`Gate::expect`, which reads a censored
+//! round as censored), and buys the rung with the best tokens per price, or
+//! a plain fire when none beats one token a fire (`Gate::plan`). Measured,
+//! one request, 384 tokens on gemma and 256 on qwen38, wall clock against
+//! the stated ladder (`--priced false`) and plain decode:
+//!
+//! ```text
+//!                       priced   ladder   plain      prices (ms): draft / 1 / 4 / 8 / 16
+//! gemma prose            7.2s    8.9s     7.1s       8.4 / 14.1 / 28 / 41 / -
+//! gemma code             5.6     5.4      7.2        9.0 / 14.4 / 28 / 42 / 69
+//! gemma counting         3.9     3.9      7.2        9.0 / 13.6 / 28 / 41 / 70
+//! qwen38 dflash2 prose  12.1    12.7     18.9       13 / 66 / 95 / 111 / -
+//! qwen38 dflash2 code   10.2    11.3      -         14 / 67 / 98 / 120 / -
+//! qwen38 dspark prose   16.4    17.3     18.8       19 / 67 / 99 / 116 / 159 (15)
+//! ```
+//!
+//! Prose on gemma goes from a 20% loss to parity (the gate closes; 14 of 365
+//! fires draft), the two dense heads gain 5% on prose and code, and the
+//! workloads the stated ladder already had right pay up to 4% for the
+//! warm-up, the two plain fires that price the road and the probes. The
+//! one-row fire is priced only in the baseline's own geometry (nothing
+//! buffered behind it), because a plain fire right after a round folds the
+//! round's survivors and reads 67 ms where the road costs 42 on a hybrid.
+//!
 //! # One thing the loop does NOT promise
 //!
 //! Token identity with one-token-a-fire decode holds until the first
@@ -337,7 +372,7 @@
 //! every trunk fire), so one length rolls both streams back.
 
 use inferlet::eta::hybrid::prelude::*;
-use inferlet::{chat, session};
+use inferlet::{chat, monotonic_now_ns, session};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -391,8 +426,10 @@ struct Input {
     #[serde(default)]
     margin_width: bool,
     /// **STOP DRAFTING BELOW THIS MANY TOKENS A ROUND.** Zero (the default)
-    /// never stops, which is the loop every number in the header was taken
-    /// with. Around 3.0 is break-even on this box; see `Gate`.
+    /// states no floor: the prices decide (`priced`), or with those off the
+    /// loop never stops, which is the loop every number in the header's
+    /// first tables was taken with. Around 3.0 is break-even on a dense 27B
+    /// on this box; see `Gate`.
     #[serde(default)]
     min_tokens_per_round: f64,
     /// **LET THE LOOP'S OWN YIELD PICK THE VERIFY WIDTH.** See `Gate::width`.
@@ -402,6 +439,20 @@ struct Input {
     /// above the width section was taken with.
     #[serde(default = "default_true")]
     auto_width: bool,
+    /// **PRICE THE FIRES ON THE GUEST'S OWN CLOCK, AND LET THE PRICES PICK.**
+    /// ON by default. Every fire's wall time is kept by its shape — the
+    /// one-row fire, the draft fire, each verify width — and a round is
+    /// bought at the rung whose recent yield per price is best, or not at
+    /// all when one token a fire beats every rung (`Prices`, `Gate::plan`).
+    /// The constants the header's tables were taken with are a DENSE trunk's
+    /// staircase; a mixture prices a wide fire by the experts its rows touch
+    /// (gemma-4-26B-A4B: 1.7 / 2.5 / 4.6 one-row fires at 4 / 8 / 16 rows,
+    /// and the draft fire 1.1 — where a 27B dense reads 1.38 / 1.83 / 2.79)
+    /// and no stated floor fits both. `min_tokens_per_round` still closes
+    /// the gate on top; `verify_rows` still pins the rung, and the gate then
+    /// closes when that rung loses. Off, the loop is the header's.
+    #[serde(default = "default_true")]
+    priced: bool,
 }
 
 fn default_prompt() -> String {
@@ -467,8 +518,103 @@ struct Output {
     /// The recurrent buffer's page width, for reading the grant arithmetic.
     rs_page: u32,
     /// Fires the gate spent on one token because a draft was not worth it.
-    /// Zero unless `min_tokens_per_round` was stated.
+    /// Zero unless `min_tokens_per_round` was stated or the prices closed
+    /// the gate.
     plain_fires: usize,
+    /// The fires' measured prices, milliseconds by width — `0` the draft
+    /// fire, `1` the plain fire, then each verify width fired.
+    prices_ms: Vec<(u32, f64)>,
+}
+
+/// **WHAT A FIRE COSTS HERE, MEASURED, BY ITS SHAPE.** A price is the median
+/// of the last few wall-clock samples of a fire — submit to readback, what
+/// the guest WAITS, which is what it is buying with — kept for the draft
+/// fire, the one-row fire and each verify width that has been fired. The
+/// header's staircase (1.38 / 1.83 / 2.79) was one box's and one trunk's;
+/// this is the trunk under this loop, on this box, under this load, and it
+/// is what `Gate::plan` prices a round against.
+struct Prices {
+    draft: Vec<u64>,
+    /// Indexed by width; `[1]` is the plain fire.
+    verify: Vec<Vec<u64>>,
+}
+
+impl Prices {
+    /// Samples kept a shape. A median over five forgets a stall and follows
+    /// a load that changes within a request.
+    const KEEP: usize = 5;
+
+    fn new(block: u32) -> Self {
+        Prices { draft: Vec::new(), verify: vec![Vec::new(); block as usize + 1] }
+    }
+
+    /// **A SHAPE'S FIRST FIRE IS NOT ITS PRICE.** The first fire of a shape
+    /// compiles its plan, and a one-row fire measured 67 ms on its first two
+    /// fires against 34 ms after — so the first sample a bucket sees is
+    /// dropped, and a shape has a price from its second fire on.
+    fn keep(bucket: &mut Vec<u64>, ns: u64) {
+        if bucket.is_empty() && ns != 0 {
+            bucket.push(0);
+            return;
+        }
+        if bucket.first() == Some(&0) {
+            bucket.remove(0);
+        }
+        bucket.push(ns);
+        if bucket.len() > Self::KEEP {
+            bucket.remove(0);
+        }
+    }
+
+    fn median(bucket: &[u64]) -> Option<f64> {
+        if bucket.is_empty() || bucket == [0] {
+            return None;
+        }
+        let mut sorted = bucket.to_vec();
+        sorted.sort_unstable();
+        Some(sorted[sorted.len() / 2] as f64)
+    }
+
+    fn drafted(&mut self, ns: u64) {
+        Self::keep(&mut self.draft, ns);
+    }
+
+    fn verified(&mut self, width: u32, ns: u64) {
+        if let Some(bucket) = self.verify.get_mut(width as usize) {
+            Self::keep(bucket, ns);
+        }
+    }
+
+    fn plain(&self) -> Option<f64> {
+        Self::median(&self.verify[1])
+    }
+
+    /// What a round at `width` costs: the draft fire and the verify at that
+    /// width — or, for a width not fired yet, at the nearest fired width
+    /// below it. A fire is never cheaper wider, so that is a LOWER bound:
+    /// optimistic for an unexplored rung, which is what lets the ladder try
+    /// a rung once and then know its price rather than never try it.
+    fn round(&self, width: u32) -> Option<f64> {
+        let draft = Self::median(&self.draft)?;
+        let verify = (1..=width as usize)
+            .rev()
+            .find_map(|w| Self::median(&self.verify[w]))?;
+        Some(draft + verify)
+    }
+
+    fn report(&self) -> Vec<(u32, f64)> {
+        let ms = |ns: f64| ns / 1e6;
+        Self::median(&self.draft)
+            .map(|d| (0, ms(d)))
+            .into_iter()
+            .chain(
+                self.verify
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(w, b)| Self::median(b).map(|p| (w as u32, ms(p)))),
+            )
+            .collect()
+    }
 }
 
 /// **IS A DRAFT WORTH ITS FIRE AT ALL? THE LOOP'S OWN YIELD SAYS.**
@@ -490,12 +636,18 @@ struct Gate {
     /// Tokens a round below which drafting stops. Zero never closes.
     floor: f64,
     /// What the last rounds that DID draft emitted, newest last, each with
-    /// whether the target took the WHOLE window — see `Gate::width`.
-    recent: Vec<(u32, bool)>,
+    /// the width it was verified at — a round that emitted its whole width
+    /// is CENSORED there; see `Gate::width` and `Gate::expect`.
+    recent: Vec<(u32, u32)>,
     /// The width the last drafting round used, the ladder's starting rung.
     last: u32,
     /// Plain fires since the gate closed, counted towards the next probe.
     since: u32,
+    /// Plain fires the next probe waits for. `PROBE` when the gate closes;
+    /// doubled each time a probe confirms the closure, up to `PROBE_MAX`, so
+    /// a request the drafter cannot help stops paying a round in sixteen for
+    /// the news, and back to `PROBE` the moment one opens it.
+    probe_after: u32,
     /// Whether the verify width follows the yield. Off leaves it at `block`.
     auto: bool,
 }
@@ -507,6 +659,14 @@ impl Gate {
     /// Plain fires between probes. One probe costs a round; at sixteen the
     /// probe is under 7% of the fires it is deciding about.
     const PROBE: u32 = 16;
+    /// Where the priced gate's probe interval stops doubling: a request that
+    /// turns list-shaped is still noticed within this many tokens.
+    const PROBE_MAX: u32 = 128;
+    /// A round has to beat one token a fire by this much before the priced
+    /// gate opens, and fall this far under before it closes — a window of
+    /// eight reads a bad streak as a verdict otherwise, and the fires spent
+    /// crossing back and forth are the ones the gate is meant to save.
+    const HYSTERESIS: f64 = 0.9;
     /// **THE WIDTHS WORTH BUYING, AND THERE ARE ONLY THREE.** A verify fire is
     /// priced by its rows as a STAIRCASE — the vector fold answers 1-3 rows
     /// for about what one costs, 4 steps to 1.38, 5-8 share the tile's first
@@ -534,7 +694,7 @@ impl Gate {
     const WARM_TOP: u32 = 8;
 
     fn new(floor: f64, auto: bool) -> Self {
-        Gate { floor, recent: Vec::new(), last: 0, since: 0, auto }
+        Gate { floor, recent: Vec::new(), last: 0, since: 0, probe_after: Self::PROBE, auto }
     }
 
     /// Whether this round drafts. A probe is allowed through so a workload
@@ -596,7 +756,7 @@ impl Gate {
         // 1.86x. So a window that saturated asks for the NEXT RUNG UP
         // instead, and the ladder climbs until the target stops taking
         // everything.
-        let saturated = self.recent.iter().filter(|(_, whole)| *whole).count();
+        let saturated = self.recent.iter().filter(|(t, w)| *w > 1 && t == w).count();
         let over = f64::from(self.last);
         // Three quarters, not half: a rung is left only on strong evidence,
         // because the step up costs 1.5-2x and a window that merely brushed
@@ -615,14 +775,107 @@ impl Gate {
         self.recent.iter().map(|(t, _)| f64::from(*t)).sum::<f64>() / self.recent.len() as f64
     }
 
-    /// What a drafting round emitted, the anchor's token included, and
-    /// whether the target kept every row it was shown.
-    fn yielded(&mut self, tokens: u32, width: u32, whole: bool) {
+    /// What a drafting round emitted, the anchor's token included, and the
+    /// width it was verified at.
+    fn yielded(&mut self, tokens: u32, width: u32) {
         self.last = width;
-        self.recent.push((tokens, whole));
+        self.recent.push((tokens, width));
         if self.recent.len() > Self::WINDOW {
             self.recent.remove(0);
         }
+    }
+
+    /// **THE TOKENS A ROUND AT `width` WOULD EMIT, READ OFF THE RECENT
+    /// ROUNDS POSITION BY POSITION.** A round that kept `k` of its `w - 1`
+    /// proposals tried positions `0..=k` and hit the first `k`; positions
+    /// past its width it never tried — which is what a mean of the rounds'
+    /// yields gets wrong, since a window taken WHOLE at four says nothing
+    /// about the fifth position and reading it as sixteen (or as four) is a
+    /// guess either way. So this keeps a hit rate a POSITION, and the yield
+    /// at `width` is one plus the chain of them: `Σ_i Π_{j<=i} a_j` over the
+    /// positions the width shows. A position no recent round reached takes
+    /// the window's pooled rate — neither the ceiling that climbed to
+    /// sixteen on three saturated fours nor the floor that never leaves them.
+    fn expect(&self, width: u32) -> f64 {
+        let slots = width.saturating_sub(1) as usize;
+        let mut hits = vec![0u32; slots];
+        let mut tries = vec![0u32; slots];
+        for &(tokens, w) in &self.recent {
+            let kept = tokens.saturating_sub(1) as usize;
+            for i in 0..kept.min(slots) {
+                hits[i] += 1;
+                tries[i] += 1;
+            }
+            if kept + 1 < w as usize && kept < slots {
+                tries[kept] += 1;
+            }
+        }
+        // A position tried twice in eight rounds reads 0 or 1 or a half, and
+        // a tail rate of 1 extrapolated over eight untried positions is what
+        // sent the code prompt to sixteen rows for nothing. Every position's
+        // rate is shrunk towards the window's pooled rate by `PRIOR`
+        // pseudo-tries, and the pooled rate is what the untried tail takes.
+        const PRIOR: f64 = 2.0;
+        let pooled = {
+            let (h, t) = (hits.iter().sum::<u32>(), tries.iter().sum::<u32>());
+            if t == 0 { 1.0 } else { f64::from(h) / f64::from(t) }
+        };
+        let mut chain = 1.0;
+        let mut total = 1.0;
+        for i in 0..slots {
+            let rate = (f64::from(hits[i]) + PRIOR * pooled) / (f64::from(tries[i]) + PRIOR);
+            chain *= rate;
+            total += chain;
+        }
+        total
+    }
+
+    /// **WHICH ROUND TO BUY, IF ANY: THE RUNG WHOSE TOKENS PER PRICE IS
+    /// BEST, AGAINST ONE TOKEN A FIRE.** `None` is a plain fire. Until the
+    /// one-row fire, the draft fire and the window are all measured, this is
+    /// the stated gate and ladder above; with them it is one comparison per
+    /// rung — `expect(w) / round_price(w)` against `1 / plain_price` — with
+    /// the stated floor still able to close it and a probe still let through
+    /// after `PROBE` plain fires, so a request that turns list-shaped is
+    /// noticed. `pinned` narrows the rungs to one.
+    fn plan(&mut self, block: u32, prices: &Prices, pinned: Option<u32>) -> Option<u32> {
+        let plain = prices.plain();
+        let measured = plain.is_some() && prices.round(1).is_some() && self.recent.len() >= Self::WINDOW;
+        if !self.drafts() {
+            return None;
+        }
+        if !measured {
+            return Some(pinned.unwrap_or_else(|| self.width(block)));
+        }
+        let plain = plain.expect("measured");
+        let rungs: Vec<u32> = match pinned {
+            Some(w) => vec![w.min(block)],
+            None => Self::RUNGS.iter().copied().filter(|w| *w < block).chain([block]).collect(),
+        };
+        let narrowest = rungs[0];
+        let best = rungs
+            .into_iter()
+            .filter_map(|w| prices.round(w).map(|price| (w, self.expect(w) / price)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+        let (width, rate) = best;
+        // Open while a round beats the plain fire; closing takes a clear
+        // loss, and a closed gate probes at the NARROWEST rung — the probe's
+        // job is to sample the yield, and the cheap rung samples the first
+        // positions, which is where a workload that changed shows first.
+        let closed = self.since > 0 || self.probe_after > Self::PROBE;
+        let open = if closed { rate * plain >= 1.0 } else { rate * plain >= Self::HYSTERESIS };
+        if open {
+            self.since = 0;
+            self.probe_after = Self::PROBE;
+            return Some(width);
+        }
+        if self.since >= self.probe_after {
+            self.since = 0;
+            self.probe_after = (self.probe_after * 2).min(Self::PROBE_MAX);
+            return Some(narrowest);
+        }
+        self.since += 1;
+        None
     }
 }
 
@@ -810,7 +1063,22 @@ async fn main(input: Input) -> Result<Output> {
     let mut survivors: u32 = 0;
     let mut widths: Vec<u32> = Vec::new();
     let mut gate = Gate::new(input.min_tokens_per_round, input.auto_width);
+    let mut prices = Prices::new(block);
     let mut plain_fires: usize = 0;
+    // Drafting rounds since the plain fire was last priced, and plain fires
+    // still owed to the current re-pricing; see `REPRICE`.
+    let mut since_priced: u32 = 0;
+    let mut owed_plain: u32 = 0;
+    /// **THE PLAIN ROAD IS RE-PRICED EVERY THIS MANY ROUNDS**, with TWO
+    /// one-row fires: the first folds the last round's survivors through the
+    /// buffer, which is not the baseline's fire (67 ms against 42 on a
+    /// hybrid trunk), the second binds the baseline's own geometry and is
+    /// the one priced (`Prices::verified` is only fed a fire with nothing
+    /// behind it). So the price every rung is compared against follows the
+    /// load — the first fires' is the cold one, and at eight concurrent a
+    /// fire costs what the batch costs. Two fires in thirty-two rounds is
+    /// under a percent of the tokens.
+    const REPRICE: u32 = 32;
 
     // A round commits several tokens at once, so the stop is read off the
     // committed run after the fact rather than one token at a time.
@@ -855,8 +1123,12 @@ async fn main(input: Input) -> Result<Output> {
             fwd.epilogue(move || {
                 next.put(&reshape(reduce_argmax(intrinsics::logits()), [1]));
             });
+            let fired_at = monotonic_now_ns();
             fwd.submit(&pipe).context("baseline submit")?;
             anchor = next.take_host::<Vec<i32>>().await.context("baseline readback")?[0];
+            // Priced like the loop's own plain fire, so the two roads' one-row
+            // fires can be read against each other in `prices_ms`.
+            prices.verified(1, monotonic_now_ns().saturating_sub(fired_at));
             held += 1;
             generated.push(anchor as u32);
             continue;
@@ -864,7 +1136,27 @@ async fn main(input: Input) -> Result<Output> {
 
         // The width is chosen AFTER the draft fire, from what the drafter
         // itself says — see `wide_enough`. Pinned, it is stated here.
-        let mut verify = pinned.unwrap_or_else(|| gate.width(block));
+        // **THE FIRST TWO FIRES ARE PLAIN**, when the prices are asked for:
+        // they price the one-row road every rung is compared against (the
+        // first compiles and is dropped, `Prices::keep`), and cost the two
+        // tokens they emit. Then the rung — or no round — is the prices'
+        // choice; without prices, the stated gate's and ladder's.
+        let planned = if input.priced {
+            if since_priced >= REPRICE {
+                since_priced = 0;
+                owed_plain = 2;
+            }
+            if prices.plain().is_none() || owed_plain > 0 {
+                owed_plain = owed_plain.saturating_sub(1);
+                None
+            } else {
+                since_priced += 1;
+                gate.plan(block, &prices, pinned)
+            }
+        } else {
+            gate.drafts().then(|| pinned.unwrap_or_else(|| gate.width(block)))
+        };
+        let mut verify = planned.unwrap_or(1);
         // The buffer must hold the survivors and this window; the grant is
         // the guest's one allocation decision.
         let buffer_pages = buffer_pages_for(survivors, block, rs_page);
@@ -890,7 +1182,7 @@ async fn main(input: Input) -> Result<Output> {
         //    gated fire binds the baseline's own geometry (no fold, no
         //    buffer) and IS the baseline's fire; the next drafting round
         //    starts from zero survivors, which the contract allows.
-        let drafting = gate.drafts();
+        let drafting = planned.is_some();
         let fold_all = survivors + 1;
         let fold_len =
             Channel::from([if drafting { survivors } else { fold_all }]).named("fold_len_v");
@@ -995,12 +1287,14 @@ async fn main(input: Input) -> Result<Output> {
                 }
             });
         }
+        let drafted_at = monotonic_now_ns();
         fwd.submit(&pipe).context("draft submit")?;
         // **ROW 0 IS THE ANCHOR, NOT A PREDICTION.** A block diffusion model
         // denoises each mask into the token AT ITS OWN POSITION, so row `i`
         // proposes position `held + i` and the anchor's row proposes nothing
         // new. The proposals are rows `1..block`.
         let picks = out.take_host::<Vec<i32>>().await.context("draft readback")?;
+        prices.drafted(monotonic_now_ns().saturating_sub(drafted_at));
         proposals_owned = picks[from..shown as usize].to_vec();
         if want_margin {
             let value = conf.take_host::<Vec<f32>>().await.context("margin readback")?;
@@ -1079,8 +1373,14 @@ async fn main(input: Input) -> Result<Output> {
                 truth.put(&reshape(reduce_argmax(intrinsics::logits()), [verify]));
             });
         }
+        let verified_at = monotonic_now_ns();
         fwd.submit(&pipe).context("verify submit")?;
         let truth = truth.take_host::<Vec<i32>>().await.context("verify readback")?;
+        // A one-row fire is priced only in the baseline's own geometry — with
+        // nothing buffered behind it — because that is the road it stands for.
+        if drafting || survivors == 0 {
+            prices.verified(verify, monotonic_now_ns().saturating_sub(verified_at));
+        }
 
         // ── what the target kept ────────────────────────────────────────
         // Row `i` of the verify predicts position `held + i + 1`, which is
@@ -1094,7 +1394,7 @@ async fn main(input: Input) -> Result<Output> {
             rounds += 1;
             drafted += verify as usize - 1;
             accepted += kept;
-            gate.yielded(kept as u32 + 1, verify, verify > 1 && kept as u32 == verify - 1);
+            gate.yielded(kept as u32 + 1, verify);
         }
         replayed += survivors as usize;
         // The rejected tail never happened: forget it before the next fire,
@@ -1155,5 +1455,6 @@ async fn main(input: Input) -> Result<Output> {
         discarded,
         rs_page,
         plain_fires,
+        prices_ms: prices.report(),
     })
 }
