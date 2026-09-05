@@ -32,15 +32,11 @@ from .trace import (
     SinkCall,
     StageResult,
     TraceError,
-    channel_state_by_gid,
     intern_channel,
     is_tracing,
     next_gid,
     record_channel_put,
     record_channel_read,
-    register_channel_state,
-    release_channel_state,
-    registered_channel_count,
     trace_stage,
     with_constants,
     with_session,
@@ -69,7 +65,6 @@ class DslChannel:
             seeded=seeded or seed is not None,
             has_seed=seed is not None,
         )
-        register_channel_state(state)
         return DslChannel(state)
 
     @staticmethod
@@ -83,19 +78,6 @@ class DslChannel:
     @staticmethod
     def seeded(shape, dtype) -> "DslChannel":
         return DslChannel._build(shape, dtype, 1, None, True)
-
-    @staticmethod
-    def by_gid(gid: int) -> "DslChannel | None":
-        st = channel_state_by_gid(gid)
-        return DslChannel(st) if st is not None else None
-
-    @staticmethod
-    def release(gid: int) -> bool:
-        return release_channel_state(gid)
-
-    @staticmethod
-    def registered_count() -> int:
-        return registered_channel_count()
 
     # -- declaration ------------------------------------------------------
 
@@ -180,11 +162,10 @@ class DslChannel:
 @dataclass
 class Traced:
     """A traced, linted forward pass: the canonical container plus the
-    dense-order channel identities (gids) and names."""
+    channels it references, in container (dense) order."""
 
     container: TraceContainer
-    channel_order: list[int]
-    channel_names: list[str]
+    channels: list[ChannelState]
 
     def encode(self) -> bytes:
         return self.container.encode()
@@ -204,11 +185,6 @@ class Builder:
         """Bind a descriptor port to a channel, recording the port's endpoint
         claim per its consumption discipline."""
         source.note_desc_claim(port.consumes)
-        self.ports.append((port, source))
-
-    def bind_port_recorded(self, port: Port, source: DslChannel) -> None:
-        """Like `bind_port` without the claim — for callers that already
-        claimed eagerly at pass construction."""
         self.ports.append((port, source))
 
     def stage(self, stage: Stage, body: Callable[[], None]) -> None:
@@ -312,11 +288,7 @@ class Builder:
 
         _lint(channels, sinks)
 
-        return Traced(
-            container=container,
-            channel_order=[st.gid for st in channels],
-            channel_names=[st.name for st in channels],
-        )
+        return Traced(container=container, channels=channels)
 
 
 def _lint(channels: list[ChannelState], sinks: list[tuple[Stage, SinkCall]]) -> None:

@@ -26,7 +26,7 @@ from wit_world.imports import working_set as _wit_ws
 from ..media import Audio, Image
 from .builder import Builder, DslChannel
 from .ir import Dtype, Port, Shape, Stage, numel, shape_of
-from .trace import TraceError
+from .trace import ChannelState, TraceError
 from .value import ConstData, Tensor, const_data, unpack_elems
 
 ForwardKind = _wit_model.ForwardKind
@@ -55,11 +55,8 @@ async def _wit_async(coro: Awaitable, what: str = ""):
 
 
 # ---------------------------------------------------------------------------
-# gid -> WIT channel registry
+# Host handles
 # ---------------------------------------------------------------------------
-
-_WIT_CHANNELS: dict[int, Any] = {}
-_DECLARED: dict[int, tuple[list[int], Any, int]] = {}
 
 _WIT_DTYPE = {
     Dtype.F32: _wit_types.Dtype.F32,
@@ -69,31 +66,13 @@ _WIT_DTYPE = {
 }
 
 
-def _declare_channel(gid: int, dims: Shape, dt: Dtype, capacity: int) -> None:
-    _DECLARED[gid] = (list(dims), _WIT_DTYPE[dt], capacity)
-
-
-def _channel_exists(gid: int) -> bool:
-    return gid in _WIT_CHANNELS
-
-
-def _set_declared_capacity(gid: int, capacity: int) -> None:
-    spec = _DECLARED.get(gid)
-    if spec is not None:
-        _DECLARED[gid] = (spec[0], spec[1], capacity)
-
-
-def _lookup_channel(gid: int):
-    """The WIT handle for `gid`, creating it from the declaration on first ask."""
-    wit = _WIT_CHANNELS.get(gid)
-    if wit is not None:
-        return wit
-    spec = _DECLARED.get(gid)
-    if spec is None:
-        raise TraceError(f"channel gid {gid} was never declared")
-    wit = _wit_channel.Channel(spec[0], spec[1], spec[2])
-    _WIT_CHANNELS[gid] = wit
-    return wit
+def _host_channel(state: ChannelState):
+    """The WIT `channel` resource behind a trace channel, created from its
+    declaration on first host use (which is what lets `capacity()` still
+    widen a channel nobody has touched)."""
+    if state.host is None:
+        state.host = _wit_channel.Channel(list(state.shape), _WIT_DTYPE[state.dtype], state.capacity)
+    return state.host
 
 
 # ---------------------------------------------------------------------------
@@ -125,46 +104,29 @@ class Channel:
     reads one back.
     """
 
-    __slots__ = ("gid", "_shape", "_dtype")
+    __slots__ = ("_dsl",)
 
-    def __init__(self, shape=None, dtype: Dtype | None = None, *, _gid: int | None = None):
-        if _gid is not None:
-            self.gid = _gid
-            self._shape, self._dtype = self._dsl().shape, self._dsl().dtype
-            return
-        if shape is None or dtype is None:
-            raise TypeError("Channel(shape, dtype)")
-        ch = Channel._build(shape_of(shape), dtype, False)
-        self.gid, self._shape, self._dtype = ch.gid, ch._shape, ch._dtype
+    def __init__(self, shape, dtype: Dtype) -> None:
+        self._dsl = DslChannel.new(shape_of(shape), dtype)
 
-    @staticmethod
-    def _build(shape: Shape, dt: Dtype, seeded: bool, seed: ConstData | None = None) -> "Channel":
-        if seed is not None:
-            dsl = DslChannel.from_const(seed)
-        elif seeded:
-            dsl = DslChannel.seeded(shape, dt)
-        else:
-            dsl = DslChannel.new(shape, dt)
-        _declare_channel(dsl.gid, shape, dt, 1)
-        ch = object.__new__(Channel)
-        ch.gid, ch._shape, ch._dtype = dsl.gid, shape, dt
+    @classmethod
+    def _wrap(cls, dsl: DslChannel) -> "Channel":
+        ch = cls.__new__(cls)
+        ch._dsl = dsl
         return ch
 
     @staticmethod
     def writer(shape, dtype: Dtype) -> "Channel":
         """An initially empty channel whose producer is the host."""
-        ch = Channel._build(shape_of(shape), dtype, False)
-        ch._dsl().note_host_put()
+        ch = Channel(shape, dtype)
+        ch._dsl.note_host_put()
         return ch
 
     @staticmethod
     def from_(v, dtype: Dtype | None = None) -> "Channel":
         """A channel seeded full with the per-instance value `v` (rides as a
         pre-submit `put`, never the container)."""
-        data = const_data(v, dtype)
-        ch = Channel._build(data.shape, data.dtype, True, data)
-        _wit(ch._wit().put, data.data, what="stage seed on a fresh channel")
-        return ch
+        return Channel._seeded_with(const_data(v, dtype))
 
     @staticmethod
     def from_shaped(shape, v, dtype: Dtype | None = None) -> "Channel":
@@ -173,69 +135,70 @@ class Channel:
         shape = shape_of(shape)
         if numel(shape) != numel(data.shape):
             raise ValueError("from_shaped: element count mismatch")
-        data = ConstData(shape, data.dtype, data.data)
-        ch = Channel._build(shape, data.dtype, True, data)
+        return Channel._seeded_with(ConstData(shape, data.dtype, data.data))
+
+    @staticmethod
+    def _seeded_with(data: ConstData) -> "Channel":
+        ch = Channel._wrap(DslChannel.from_const(data))
         _wit(ch._wit().put, data.data, what="stage seed on a fresh channel")
         return ch
 
     @staticmethod
     def seeded(shape, dtype: Dtype) -> "Channel":
         """A seeded channel whose seed value is supplied at instantiation."""
-        return Channel._build(shape_of(shape), dtype, True)
-
-    def _dsl(self) -> DslChannel:
-        dsl = DslChannel.by_gid(self.gid)
-        if dsl is None:
-            raise TraceError(f"channel gid {self.gid} is not registered")
-        return dsl
+        return Channel._wrap(DslChannel.seeded(shape_of(shape), dtype))
 
     def _wit(self):
-        return _lookup_channel(self.gid)
+        return _host_channel(self._dsl.state)
 
     def capacity(self, n: int) -> "Channel":
         """Widen the ring to `n` cells (deeper run-ahead). Must precede first use."""
-        if _channel_exists(self.gid):
+        if self._dsl.state.host is not None:
             raise TraceError("capacity must be set before the channel is used")
-        self._dsl().capacity(n)
-        _set_declared_capacity(self.gid, n)
+        self._dsl.capacity(n)
         return self
 
     def named(self, name: str) -> "Channel":
-        self._dsl().named(name)
+        self._dsl.named(name)
         return self
 
     @property
+    def gid(self) -> int:
+        """Declaration order — the container keys channels by it."""
+        return self._dsl.gid
+
+    @property
     def name(self) -> str:
-        return self._dsl().name
+        return self._dsl.name
 
     @property
     def dtype(self) -> Dtype:
-        return self._dtype
+        return self._dsl.dtype
 
     @property
     def shape(self) -> Shape:
-        return self._shape
+        return self._dsl.shape
 
     # -- in-program ------------------------------------------------------------
 
     def take(self) -> Tensor:
         """Consume a cell inside a stage body — records a `ChanTake`."""
-        return self._dsl().take()
+        return self._dsl.take()
 
     def read(self) -> Tensor:
         """Peek a cell inside a stage body — records a `ChanRead`."""
-        return self._dsl().read()
+        return self._dsl.read()
 
     def put(self, v, dtype: Dtype | None = None) -> None:
         """Inside a stage body with a `Tensor`: record a device `ChanPut`. On
         the host with data: stage the next cell for the following submit."""
         if isinstance(v, Tensor):
-            self._dsl().put_tensor(v)
+            self._dsl.put_tensor(v)
             return
-        data = const_data(v, dtype if dtype is not None else self._dtype)
-        if data.dtype is not self._dtype:
-            raise TypeError(f"channel {self.name} holds {self._dtype.wire_name}, put {data.dtype.wire_name}")
-        self._dsl().note_host_put()
+        data = const_data(v, dtype if dtype is not None else self.dtype)
+        if data.dtype is not self.dtype:
+            raise TypeError(f"channel {self.name} holds {self.dtype.wire_name}, put {data.dtype.wire_name}")
+        self._dsl.note_host_put()
         try:
             self._wit().put(data.data)
         except _WitErr:
@@ -244,7 +207,7 @@ class Channel:
 
     def set(self, v, dtype: Dtype | None = None) -> None:
         """Atomically replace the committed front cell (a host operation)."""
-        data = const_data(v, dtype if dtype is not None else self._dtype)
+        data = const_data(v, dtype if dtype is not None else self.dtype)
         _wit(self._wit().set, data.data, what=f"{self.name} set")
 
     # -- host readback ---------------------------------------------------------
@@ -253,15 +216,15 @@ class Channel:
         """Consume a cell on the host, decoded to a list of Python numbers
         (bools for a bool channel). Awaits in-flight fires; a poisoned
         channel raises `InferletError`."""
-        self._dsl().note_host_take()
+        self._dsl.note_host_take()
         raw = await _wit_async(self._wit().take(), what=f"{self.name} take")
-        return unpack_elems(bytes(raw), self._dtype)
+        return unpack_elems(bytes(raw), self.dtype)
 
     async def read_host(self) -> list:
         """Peek a cell on the host (leaves it full)."""
-        self._dsl().note_host_read()
+        self._dsl.note_host_read()
         raw = await _wit_async(self._wit().read(), what=f"{self.name} read")
-        return unpack_elems(bytes(raw), self._dtype)
+        return unpack_elems(bytes(raw), self.dtype)
 
     async def take_scalar(self):
         """`take_host()` for a one-element cell."""
@@ -567,7 +530,7 @@ class ForwardPass:
         else:
             raise ValueError(f"unknown forward kind {kind!r}")
         self.wit = self._mod.ForwardPass()
-        self._ports: list[tuple[Port, DslChannel]] = []
+        self._ports: list[tuple[Port, Channel]] = []
         self._stages: list[tuple[Stage, Callable[[], None]]] = []
         self._vocab = _wit_model.output_vocab_size()
         self._page_size = kv_page_size()
@@ -585,11 +548,6 @@ class ForwardPass:
             if p in bound:
                 raise InferletError(f"forward pass port {p.wire_name} is already bound")
 
-    def _claim(self, port: Port, ch: Channel) -> tuple[Port, DslChannel]:
-        dsl = ch._dsl()
-        dsl.note_desc_claim(port.consumes)
-        return port, dsl
-
     def binds_device_mask(self) -> bool:
         return any(p == Port.ATTN_MASK for p, _ in self._ports)
 
@@ -597,13 +555,12 @@ class ForwardPass:
         """Bind token ids and CSR row indptr (both channels)."""
         self._ensure_ports_available([Port.EMBED_TOKENS, Port.EMBED_INDPTR])
         _wit(self.wit.embed, tokens._wit(), indptr._wit(), what="embed")
-        self._ports.append(self._claim(Port.EMBED_TOKENS, tokens))
-        self._ports.append(self._claim(Port.EMBED_INDPTR, indptr))
+        self._ports += [(Port.EMBED_TOKENS, tokens), (Port.EMBED_INDPTR, indptr)]
 
     def readout(self, indices: Channel) -> None:
         self._ensure_ports_available([Port.READOUT])
         _wit(self.wit.readout, indices._wit(), what="readout")
-        self._ports.append(self._claim(Port.READOUT, indices))
+        self._ports.append((Port.READOUT, indices))
 
     def set_max_layers(self, max_layers: int) -> None:
         _wit(self.wit.set_max_layers, max_layers, what="set_max_layers")
@@ -646,18 +603,16 @@ class ForwardPass:
             "mask": geom.mask._wit() if geom.mask is not None else None,
         }
         if not rebind:
-            self._ports.extend(
-                [
-                    self._claim(Port.KV_LEN, geom.kv_len),
-                    self._claim(Port.PAGES, geom.pages),
-                    self._claim(Port.PAGE_INDPTR, geom.page_indptr),
-                    self._claim(Port.W_SLOT, geom.w_slot),
-                    self._claim(Port.W_OFF, geom.w_off),
-                    self._claim(Port.POSITIONS, geom.positions),
-                ]
-            )
+            self._ports += [
+                (Port.KV_LEN, geom.kv_len),
+                (Port.PAGES, geom.pages),
+                (Port.PAGE_INDPTR, geom.page_indptr),
+                (Port.W_SLOT, geom.w_slot),
+                (Port.W_OFF, geom.w_off),
+                (Port.POSITIONS, geom.positions),
+            ]
             if geom.mask is not None:
-                self._ports.append(self._claim(Port.ATTN_MASK, geom.mask))
+                self._ports.append((Port.ATTN_MASK, geom.mask))
         return staged
 
     def _kv_geometry_wit(self, staged: dict):
@@ -680,7 +635,7 @@ class ForwardPass:
         if geom.fold_len is not None:
             if not self._program_attached:
                 self._ensure_ports_available([Port.RS_FOLD_LEN])
-                self._ports.append(self._claim(Port.RS_FOLD_LEN, geom.fold_len))
+                self._ports.append((Port.RS_FOLD_LEN, geom.fold_len))
             fold_len = geom.fold_len._wit()
         else:
             fold_len = _fold_all()._wit()
@@ -828,11 +783,11 @@ class ForwardPass:
             return
         builder = Builder(self._vocab, self._page_size)
         for port, ch in self._ports:
-            builder.bind_port_recorded(port, ch)
+            builder.bind_port(port, ch._dsl)
         for stage, body in self._stages:
             builder.stage(stage, body)
         traced = builder.build()
-        handles = [_lookup_channel(gid) for gid in traced.channel_order]
+        handles = [_host_channel(st) for st in traced.channels]
         _wit(self.wit.program, traced.encode(), handles, what="program")
         self._program_attached = True
 

@@ -24,15 +24,11 @@ import {
   SinkCall,
   StageResult,
   TraceError,
-  channelStateByGid,
   internChannel,
   isTracing,
   nextGid,
   recordChannelPut,
   recordChannelRead,
-  registerChannelState,
-  registeredChannelCount,
-  releaseChannelState,
   traceStage,
   withConstants,
   withSession,
@@ -61,8 +57,8 @@ export class DslChannel {
       hostReads: 0,
       descTakes: 0,
       descReads: 0,
+      host: null,
     };
-    registerChannelState(state);
     return new DslChannel(state);
   }
 
@@ -74,16 +70,6 @@ export class DslChannel {
   }
   static seeded(shape: readonly number[], dtype: Dtype): DslChannel {
     return DslChannel.build(shape, dtype, 1, null, true);
-  }
-  static byGid(gid: number): DslChannel | undefined {
-    const st = channelStateByGid(gid);
-    return st ? new DslChannel(st) : undefined;
-  }
-  static release(gid: number): boolean {
-    return releaseChannelState(gid);
-  }
-  static registeredCount(): number {
-    return registeredChannelCount();
   }
 
   capacity(n: number): this {
@@ -143,12 +129,11 @@ export class DslChannel {
 }
 
 /** A traced, linted forward pass: the canonical container plus the
- * dense-order channel identities (gids) and names. */
+ * channels it references, in container (dense) order. */
 export class Traced {
   constructor(
     readonly container: TraceContainer,
-    readonly channelOrder: number[],
-    readonly channelNames: string[],
+    readonly channels: ChannelState[],
   ) {}
 
   encode(): Uint8Array {
@@ -170,10 +155,6 @@ export class Builder {
 
   bindPort(port: Port, source: DslChannel): void {
     source.noteDescClaim(portConsumes(port));
-    this.ports.push([port, source]);
-  }
-
-  bindPortRecorded(port: Port, source: DslChannel): void {
     this.ports.push([port, source]);
   }
 
@@ -256,11 +237,7 @@ export class Builder {
 
     lint(channels, sinks);
 
-    return new Traced(
-      container,
-      channels.map((st) => st.gid),
-      channels.map((st) => st.name),
-    );
+    return new Traced(container, channels);
   }
 }
 

@@ -1,14 +1,15 @@
 """
 The trace-recording context — port of `eta-dsl/src/context.rs`.
 
-A module-level session holds the stage currently being traced plus the
-channel registry. Single-threaded by construction (wasm inferlets).
+A module-level session holds the stage currently being traced. Channels are
+plain objects the author holds; a trace interns the ones it touches.
+Single-threaded by construction (wasm inferlets).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 from .ir import Dtype, Op, Shape, SinkScope, Stage
 
@@ -45,6 +46,9 @@ class ChannelState:
     host_reads: int = 0
     desc_takes: int = 0
     desc_reads: int = 0
+    # The bridge's host-side handle for this channel (the WIT resource),
+    # created on first host use. Opaque to the trace.
+    host: Any = None
 
     def elem_ty(self) -> ValueType:
         return ValueType(self.shape, self.dtype)
@@ -103,7 +107,6 @@ class Session:
 
 
 _session: Session | None = None
-_channels_by_gid: dict[int, ChannelState] = {}
 _next_gid = 1
 
 # Trace-known model constants (`eta-dsl/src/model.rs`), installed by the
@@ -117,22 +120,6 @@ def next_gid() -> int:
     gid = _next_gid
     _next_gid += 1
     return gid
-
-
-def register_channel_state(state: ChannelState) -> None:
-    _channels_by_gid[state.gid] = state
-
-
-def channel_state_by_gid(gid: int) -> ChannelState | None:
-    return _channels_by_gid.get(gid)
-
-
-def release_channel_state(gid: int) -> bool:
-    return _channels_by_gid.pop(gid, None) is not None
-
-
-def registered_channel_count() -> int:
-    return len(_channels_by_gid)
 
 
 def is_tracing() -> bool:

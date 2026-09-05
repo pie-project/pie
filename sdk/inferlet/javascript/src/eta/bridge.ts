@@ -21,8 +21,8 @@ import * as witWs from 'pie:inferlet/working-set@0.3.0';
 import { Audio, Image } from '../media.js';
 import { Builder, DslChannel } from './builder.js';
 import { kernel } from './intrinsics.js';
-import { Dtype, Port, Shape, Stage, numel, portConsumes, portName, shapeOf } from './ir.js';
-import { TraceError } from './trace.js';
+import { Dtype, Port, Shape, Stage, numel, portName, shapeOf } from './ir.js';
+import { ChannelState, TraceError } from './trace.js';
 import { ConstData, ConstLike, Tensor, constData, unpackElems } from './value.js';
 
 export type ForwardKind = witModel.ForwardKind;
@@ -46,11 +46,8 @@ function wit<T>(what: string, f: () => T): T {
 }
 
 // ---------------------------------------------------------------------------
-// gid -> WIT channel registry
+// Host handles
 // ---------------------------------------------------------------------------
-
-const WIT_CHANNELS = new Map<number, witChannel.Channel>();
-const DECLARED = new Map<number, { dims: number[]; dtype: witChannel.Dtype; capacity: number }>();
 
 const WIT_DTYPE: Record<Dtype, witChannel.Dtype> = {
   [Dtype.F32]: 'f32',
@@ -59,18 +56,14 @@ const WIT_DTYPE: Record<Dtype, witChannel.Dtype> = {
   [Dtype.BOOL]: 'bool',
 };
 
-function declareChannel(gid: number, dims: Shape, dt: Dtype, capacity: number) {
-  DECLARED.set(gid, { dims: [...dims], dtype: WIT_DTYPE[dt], capacity });
-}
-
-function lookupChannel(gid: number): witChannel.Channel {
-  const existing = WIT_CHANNELS.get(gid);
-  if (existing) return existing;
-  const spec = DECLARED.get(gid);
-  if (!spec) throw new TraceError(`channel gid ${gid} was never declared`);
-  const ch = new witChannel.Channel(new Uint32Array(spec.dims), spec.dtype, spec.capacity);
-  WIT_CHANNELS.set(gid, ch);
-  return ch;
+/** The WIT `channel` resource behind a trace channel, created from its
+ * declaration on first host use (which is what lets `capacity()` still widen
+ * a channel nobody has touched). */
+function hostChannel(state: ChannelState): witChannel.Channel {
+  if (state.host === null) {
+    state.host = new witChannel.Channel(new Uint32Array(state.shape), WIT_DTYPE[state.dtype], state.capacity);
+  }
+  return state.host as witChannel.Channel;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,47 +91,31 @@ export function unpadTokens(window: ArrayLike<number>): number[] {
  * `put(data)` stages a cell and `takeHost()` reads one back (blocking).
  */
 export class Channel {
-  readonly gid: number;
-  private readonly shape_: Shape;
-  private readonly dtype_: Dtype;
+  /** @internal The trace-side half. */
+  readonly dsl: DslChannel;
 
   constructor(shape: readonly number[], dtype: Dtype);
-  constructor(gid: number);
-  constructor(shapeOrGid: readonly number[] | number, dtype?: Dtype) {
-    if (typeof shapeOrGid === 'number') {
-      this.gid = shapeOrGid;
-      const d = this.dsl();
-      this.shape_ = d.shape;
-      this.dtype_ = d.dtype;
+  /** @internal */
+  constructor(dsl: DslChannel);
+  constructor(shapeOrDsl: readonly number[] | DslChannel, dtype?: Dtype) {
+    if (shapeOrDsl instanceof DslChannel) {
+      this.dsl = shapeOrDsl;
       return;
     }
     if (dtype === undefined) throw new TypeError('new Channel(shape, dtype)');
-    const dsl = DslChannel.new(shapeOf(shapeOrGid), dtype);
-    declareChannel(dsl.gid, dsl.shape, dtype, 1);
-    this.gid = dsl.gid;
-    this.shape_ = dsl.shape;
-    this.dtype_ = dtype;
-  }
-
-  private static build(shape: Shape, dt: Dtype, seeded: boolean, seed: ConstData | null = null): Channel {
-    const dsl = seed ? DslChannel.fromConst(seed) : seeded ? DslChannel.seeded(shape, dt) : DslChannel.new(shape, dt);
-    declareChannel(dsl.gid, shape, dt, 1);
-    return new Channel(dsl.gid);
+    this.dsl = DslChannel.new(shapeOf(shapeOrDsl), dtype);
   }
 
   /** An initially empty channel whose producer is the host. */
   static writer(shape: readonly number[], dtype: Dtype): Channel {
-    const ch = Channel.build(shapeOf(shape), dtype, false);
-    ch.dsl().noteHostPut();
+    const ch = new Channel(shape, dtype);
+    ch.dsl.noteHostPut();
     return ch;
   }
 
   /** A channel seeded full with the per-instance value `v`. */
   static from(v: ConstLike, dtype?: Dtype): Channel {
-    const data = constData(v, dtype);
-    const ch = Channel.build(data.shape, data.dtype, true, data);
-    wit('stage seed on a fresh channel', () => ch.wit().put(data.data));
-    return ch;
+    return Channel.seededWith(constData(v, dtype));
   }
 
   /** Like `from`, but reinterprets the flat seed under `shape`. */
@@ -146,73 +123,71 @@ export class Channel {
     const d0 = constData(v, dtype);
     const s = shapeOf(shape);
     if (numel(s) !== numel(d0.shape)) throw new Error('fromShaped: element count mismatch');
-    const data = new ConstData(s, d0.dtype, d0.data);
-    const ch = Channel.build(s, data.dtype, true, data);
+    return Channel.seededWith(new ConstData(s, d0.dtype, d0.data));
+  }
+
+  private static seededWith(data: ConstData): Channel {
+    const ch = new Channel(DslChannel.fromConst(data));
     wit('stage seed on a fresh channel', () => ch.wit().put(data.data));
     return ch;
   }
 
   /** A seeded channel whose seed value is supplied at instantiation. */
   static seeded(shape: readonly number[], dtype: Dtype): Channel {
-    return Channel.build(shapeOf(shape), dtype, true);
-  }
-
-  /** @internal */
-  dsl(): DslChannel {
-    const d = DslChannel.byGid(this.gid);
-    if (!d) throw new TraceError(`channel gid ${this.gid} is not registered`);
-    return d;
+    return new Channel(DslChannel.seeded(shapeOf(shape), dtype));
   }
 
   /** @internal */
   wit(): witChannel.Channel {
-    return lookupChannel(this.gid);
+    return hostChannel(this.dsl.state);
   }
 
   /** Widen the ring to `n` cells (deeper run-ahead). Must precede first use. */
   capacity(n: number): this {
-    if (WIT_CHANNELS.has(this.gid)) throw new TraceError('capacity must be set before the channel is used');
-    this.dsl().capacity(n);
-    const spec = DECLARED.get(this.gid);
-    if (spec) spec.capacity = n;
+    if (this.dsl.state.host !== null) throw new TraceError('capacity must be set before the channel is used');
+    this.dsl.capacity(n);
     return this;
   }
 
   named(name: string): this {
-    this.dsl().named(name);
+    this.dsl.named(name);
     return this;
   }
 
+  /** Declaration order — the container keys channels by it. */
+  get gid(): number {
+    return this.dsl.gid;
+  }
   get name(): string {
-    return this.dsl().name;
+    return this.dsl.name;
   }
   get dtype(): Dtype {
-    return this.dtype_;
+    return this.dsl.dtype;
   }
   get shape(): Shape {
-    return this.shape_;
+    return this.dsl.shape;
   }
 
   /** Consume a cell inside a stage body — records a `ChanTake`. */
   take(): Tensor {
-    return this.dsl().take();
+    return this.dsl.take();
   }
 
   /** Peek a cell inside a stage body — records a `ChanRead`. */
   read(): Tensor {
-    return this.dsl().read();
+    return this.dsl.read();
   }
 
   /** In a stage body with a `Tensor`: a device `ChanPut`. On the host with
    * data: stage the next cell for the following submit. */
   put(v: Tensor | ConstLike, dtype?: Dtype): void {
     if (v instanceof Tensor) {
-      this.dsl().putTensor(v);
+      this.dsl.putTensor(v);
       return;
     }
-    const data = constData(v, dtype ?? this.dtype_);
-    if (data.dtype !== this.dtype_) throw new TypeError(`channel ${this.name} holds dtype ${this.dtype_}, put ${data.dtype}`);
-    this.dsl().noteHostPut();
+    const data = constData(v, dtype ?? this.dtype);
+    if (data.dtype !== this.dtype) throw new TypeError(`channel ${this.name} holds dtype ${this.dtype}, put ${data.dtype}`);
+    this.dsl.noteHostPut();
     try {
       this.wit().put(data.data);
     } catch {
@@ -222,7 +197,7 @@ export class Channel {
 
   /** Atomically replace the committed front cell (a host operation). */
   set(v: ConstLike, dtype?: Dtype): void {
-    const data = constData(v, dtype ?? this.dtype_);
+    const data = constData(v, dtype ?? this.dtype);
     wit(`${this.name} set`, () => this.wit().set(data.data));
   }
 
@@ -230,16 +205,16 @@ export class Channel {
    * channel). Blocks until an in-flight fire fills it; a poisoned channel
    * throws `InferletError`. */
   takeHost(): number[] | boolean[] {
-    this.dsl().noteHostTake();
+    this.dsl.noteHostTake();
     const raw = wit(`${this.name} take`, () => this.wit().takeBlocking());
-    return unpackElems(raw, this.dtype_);
+    return unpackElems(raw, this.dtype);
   }
 
   /** Peek a cell on the host (leaves it full). */
   readHost(): number[] | boolean[] {
-    this.dsl().noteHostRead();
+    this.dsl.noteHostRead();
     const raw = wit(`${this.name} read`, () => this.wit().readBlocking());
-    return unpackElems(raw, this.dtype_);
+    return unpackElems(raw, this.dtype);
   }
 
   /** `takeHost()` for a one-element cell. */
@@ -513,7 +488,7 @@ export class ForwardPass {
   readonly kind: ForwardKind;
   readonly wit: AnyPass;
   private readonly mod: AttentionMod | HybridMod | RecurrentMod;
-  private ports: [Port, DslChannel][] = [];
+  private ports: [Port, Channel][] = [];
   private stages: [Stage, () => void][] = [];
   private readonly vocab: number;
   private readonly pageSize: number;
@@ -538,12 +513,6 @@ export class ForwardPass {
     for (const p of ports) if (bound.has(p)) throw new InferletError(`forward pass port ${portName(p)} is already bound`);
   }
 
-  private claim(port: Port, ch: Channel): [Port, DslChannel] {
-    const dsl = ch.dsl();
-    dsl.noteDescClaim(portConsumes(port));
-    return [port, dsl];
-  }
-
   bindsDeviceMask(): boolean {
     return this.ports.some(([p]) => p === Port.ATTN_MASK);
   }
@@ -552,13 +521,13 @@ export class ForwardPass {
   embed(tokens: Channel, indptr: Channel): void {
     this.ensurePortsAvailable([Port.EMBED_TOKENS, Port.EMBED_INDPTR]);
     wit('embed', () => this.wit.embed(tokens.wit(), indptr.wit()));
-    this.ports.push(this.claim(Port.EMBED_TOKENS, tokens), this.claim(Port.EMBED_INDPTR, indptr));
+    this.ports.push([Port.EMBED_TOKENS, tokens], [Port.EMBED_INDPTR, indptr]);
   }
 
   readout(indices: Channel): void {
     this.ensurePortsAvailable([Port.READOUT]);
     wit('readout', () => this.wit.readout(indices.wit()));
-    this.ports.push(this.claim(Port.READOUT, indices));
+    this.ports.push([Port.READOUT, indices]);
   }
 
   setMaxLayers(maxLayers: number): void {
@@ -602,14 +571,14 @@ export class ForwardPass {
     };
     if (!rebind) {
       this.ports.push(
-        this.claim(Port.KV_LEN, geom.kvLen),
-        this.claim(Port.PAGES, geom.pages),
-        this.claim(Port.PAGE_INDPTR, geom.pageIndptr),
-        this.claim(Port.W_SLOT, geom.wSlot),
-        this.claim(Port.W_OFF, geom.wOff),
-        this.claim(Port.POSITIONS, geom.positions),
+        [Port.KV_LEN, geom.kvLen],
+        [Port.PAGES, geom.pages],
+        [Port.PAGE_INDPTR, geom.pageIndptr],
+        [Port.W_SLOT, geom.wSlot],
+        [Port.W_OFF, geom.wOff],
+        [Port.POSITIONS, geom.positions],
       );
-      if (geom.mask) this.ports.push(this.claim(Port.ATTN_MASK, geom.mask));
+      if (geom.mask) this.ports.push([Port.ATTN_MASK, geom.mask]);
     }
     return staged;
   }
@@ -636,7 +605,7 @@ export class ForwardPass {
     if (geom.foldLen) {
       if (!this.programAttached) {
         this.ensurePortsAvailable([Port.RS_FOLD_LEN]);
-        this.ports.push(this.claim(Port.RS_FOLD_LEN, geom.foldLen));
+        this.ports.push([Port.RS_FOLD_LEN, geom.foldLen]);
       }
       foldLen = geom.foldLen.wit();
     } else {
@@ -749,10 +718,10 @@ export class ForwardPass {
   attachProgram(): void {
     if (this.programAttached) return;
     const builder = new Builder(this.vocab, this.pageSize);
-    for (const [port, ch] of this.ports) builder.bindPortRecorded(port, ch);
+    for (const [port, ch] of this.ports) builder.bindPort(port, ch.dsl);
     for (const [stage, body] of this.stages) builder.stage(stage, body);
     const traced = builder.build();
-    const handles = traced.channelOrder.map((gid) => lookupChannel(gid));
+    const handles = traced.channels.map(hostChannel);
     wit('program', () => this.wit.program(traced.encode(), handles));
     this.programAttached = true;
   }

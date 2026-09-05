@@ -1,7 +1,8 @@
 // The trace-recording context — port of `eta-dsl/src/context.rs`.
 //
-// A module-level session holds the stage currently being traced plus the
-// channel registry. Single-threaded by construction (wasm inferlets).
+// A module-level session holds the stage currently being traced. Channels
+// are plain objects the author holds; a trace interns the ones it touches.
+// Single-threaded by construction (wasm inferlets).
 
 import { Dtype, Op, Shape, SinkScope, Stage } from './ir.js';
 
@@ -38,6 +39,9 @@ export interface ChannelState {
   hostReads: number;
   descTakes: number;
   descReads: number;
+  /** The bridge's host-side handle (the WIT resource), created on first
+   * host use. Opaque to the trace. */
+  host: unknown;
 }
 
 export function elemTy(st: ChannelState): ValueType {
@@ -94,7 +98,6 @@ class Session {
 }
 
 let session: Session | null = null;
-const channelsByGid = new Map<number, ChannelState>();
 let nextGidCounter = 1;
 
 let modelVocab = 32_000;
@@ -102,22 +105,6 @@ let modelPageSize = 16;
 
 export function nextGid(): number {
   return nextGidCounter++;
-}
-
-export function registerChannelState(state: ChannelState): void {
-  channelsByGid.set(state.gid, state);
-}
-
-export function channelStateByGid(gid: number): ChannelState | undefined {
-  return channelsByGid.get(gid);
-}
-
-export function releaseChannelState(gid: number): boolean {
-  return channelsByGid.delete(gid);
-}
-
-export function registeredChannelCount(): number {
-  return channelsByGid.size;
 }
 
 export function isTracing(): boolean {
