@@ -1046,13 +1046,9 @@ impl Shell {
 
     #[must_use]
     pub fn adapted_word(&self, word: u64) -> Option<u64> {
+        // One rule for every shell: `model_ir::ClassTable::adapted_word`.
         let bit = self.adapter_fact?;
-        let adapted = word | (1u64 << bit);
-        let class = self
-            .compiled
-            .classes
-            .class_of(adapted & self.compiled.classes.mask)?;
-        self.corrected.contains(class).then_some(adapted)
+        self.compiled.classes.adapted_word(&self.corrected, bit, word)
     }
 
     #[must_use]
@@ -1438,7 +1434,13 @@ impl Shell {
             if seated.adapter.is_some() && self.corrected.is_empty() {
                 return Err(Fault::Adapterless { lane: row.source });
             }
-            if seated.adapter.is_some() != runs_correction {
+            // A block drafter's draft fire carries an adapted lane's id and no
+            // trunk row: the correction cannot reach its class, so nothing is
+            // owed and nothing is refused (`ClassTable::correction_reaches`).
+            let unreachable = seated.adapter.is_some()
+                && !runs_correction
+                && !self.compiled.classes.correction_reaches(&self.corrected, lane.word);
+            if seated.adapter.is_some() != runs_correction && !unreachable {
                 return Err(Fault::AdapterWord {
                     lane: row.source,
                     word: lane.word,

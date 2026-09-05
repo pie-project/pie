@@ -666,7 +666,13 @@ impl FrameShell for Shell {
             if seated.adapter.is_some() && self.corrected.is_empty() {
                 return Err(Fault::Adapterless { lane: row.source });
             }
-            if seated.adapter.is_some() != runs_correction {
+            // A block drafter's draft fire carries an adapted lane's id and no
+            // trunk row: the correction cannot reach its class, so nothing is
+            // owed and nothing is refused (`ClassTable::correction_reaches`).
+            let unreachable = seated.adapter.is_some()
+                && !runs_correction
+                && !self.compiled.classes.correction_reaches(&self.corrected, lane.word);
+            if seated.adapter.is_some() != runs_correction && !unreachable {
                 return Err(Fault::AdapterWord {
                     lane: row.source,
                     word: lane.word,

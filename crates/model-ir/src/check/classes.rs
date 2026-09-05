@@ -844,13 +844,7 @@ impl ClassTable {
         if corrected.is_empty() {
             return None;
         }
-        let domain = self
-            .classes
-            .iter()
-            .enumerate()
-            .filter(|(at, _)| corrected.contains(*at))
-            .flat_map(|(_, class)| class.words.iter().copied())
-            .fold(0u64, |acc, word| acc | word);
+        let domain = self.correction_domain(corrected);
         let reachable = |class: &Class| class.words.iter().any(|word| word & !domain == 0);
         let mut found = None;
         for bit in 0..u64::BITS {
@@ -872,5 +866,45 @@ impl ClassTable {
             }
         }
         found
+    }
+
+    /// The facts a corrected class ever carries, as a word: the correction's
+    /// domain. A word with a bit outside it names rows the correction cannot
+    /// reach — a block drafter's, which run no trunk layer.
+    #[must_use]
+    pub fn correction_domain(&self, corrected: &ClassSet) -> u64 {
+        self.classes
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| corrected.contains(*at))
+            .flat_map(|(_, class)| class.words.iter().copied())
+            .fold(0u64, |acc, word| acc | word)
+    }
+
+    /// Whether the correction can reach rows of this word at all: `false` when
+    /// the word carries a fact no corrected class ever carries (a block
+    /// drafter's rows, which run no trunk layer). A lane that binds an adapter
+    /// and fires such rows gets no correction and is owed none; the fire path
+    /// refuses an adapted lane outside the window only when the window could
+    /// have held it.
+    #[must_use]
+    pub fn correction_reaches(&self, corrected: &ClassSet, word: u64) -> bool {
+        word & self.mask & !self.correction_domain(corrected) == 0
+    }
+
+    /// **THE WORD AN ADAPTED LANE FIRES UNDER.** `bit` is
+    /// [`adapter_fact`](Self::adapter_fact)'s answer. A lane whose word names
+    /// rows the correction cannot reach (a block drafter's draft fire: no trunk
+    /// row, nothing to correct) fires as it is; every other lane is moved into
+    /// the correction window, and `None` — the refusal — is a lane that asked
+    /// for a correction and would have got the base model.
+    #[must_use]
+    pub fn adapted_word(&self, corrected: &ClassSet, bit: u32, word: u64) -> Option<u64> {
+        if !self.correction_reaches(corrected, word) {
+            return Some(word);
+        }
+        let adapted = word | (1u64 << bit);
+        let class = self.class_of(adapted & self.mask)?;
+        corrected.contains(class).then_some(adapted)
     }
 }
