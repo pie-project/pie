@@ -692,7 +692,19 @@ async fn main(input: Input) -> Result<Output> {
     if model::mtp_depth() == 0 {
         return Err("this SKU ships no draft head".into());
     }
-    let block = input.block.unwrap_or(BLOCK_ROWS).max(2);
+    // **THE HEAD'S FACTS COME OFF THE LOAD.** The block the head was trained
+    // at, its mask token and whether its block sees itself are advertised by
+    // the model text that plants the draft seam (`model::draft_block`); the
+    // inputs override for a diagnostic, and the constants below are the last
+    // resort for a load that advertises nothing.
+    let advertised = model::draft_block();
+    let block = input
+        .block
+        .or(advertised.map(|d| d.rows))
+        .unwrap_or(BLOCK_ROWS)
+        .max(2);
+    let mask_token = advertised.map_or(MASK_TOKEN, |d| d.mask_token as i32);
+    let bind_mask = !input.no_mask && advertised.is_none_or(|d| d.bidirectional);
     let pinned = (input.verify_rows != 0).then(|| input.verify_rows.clamp(2, block));
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
@@ -869,7 +881,7 @@ async fn main(input: Input) -> Result<Output> {
             plain_fires += 1;
         } else {
         // ── the draft: ONE pass over `[anchor, MASK x block-1]` ──────────
-        let mut ids = vec![MASK_TOKEN; block as usize];
+        let mut ids = vec![mask_token; block as usize];
         ids[0] = anchor;
         let toks = Channel::from(ids.as_slice()).named("toks_d");
         let indptr = Channel::from([0u32, block]).named("embed_indptr_d");
@@ -932,7 +944,7 @@ async fn main(input: Input) -> Result<Output> {
                     w_slot: &w_slot,
                     w_off: &w_off,
                     positions: &positions,
-                    mask: if input.no_mask { None } else { Some(&mask) },
+                    mask: if bind_mask { Some(&mask) } else { None },
                 },
             }),
             &rs_set,

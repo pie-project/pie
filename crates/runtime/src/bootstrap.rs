@@ -145,6 +145,9 @@ pub struct EngineConfig {
     pub rs_cache_slot_bytes: u64,
     pub has_mtp_logits: bool,
     pub mtp_depth: u32,
+    pub draft_block: u32,
+    pub draft_mask_token: u32,
+    pub draft_bidirectional: bool,
     pub has_value_head: bool,
     pub has_kv_envelopes: bool,
     pub has_attn_score: bool,
@@ -329,6 +332,14 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             Some(depth) if engine_configs.iter().all(|d| d.mtp_depth == depth) => depth,
             _ => 0,
         },
+        // Likewise one block drafter for the deployment, or none.
+        draft_block: match engine_configs.first().map(|d| d.draft_block) {
+            Some(rows) if engine_configs.iter().all(|d| d.draft_block == rows) => rows,
+            _ => 0,
+        },
+        draft_mask_token: engine_configs.first().map_or(0, |d| d.draft_mask_token),
+        draft_bidirectional: !engine_configs.is_empty()
+            && engine_configs.iter().all(|d| d.draft_bidirectional),
         has_value_head: !engine_configs.is_empty()
             && engine_configs.iter().all(|d| d.has_value_head),
         has_kv_envelopes: !engine_configs.is_empty()

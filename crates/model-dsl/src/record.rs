@@ -38,6 +38,7 @@ impl Recorder {
                 caches,
                 values: Vec::new(),
                 nodes: Vec::new(),
+                drafter: None,
                 seams: Vec::new(),
             })),
             at: Rc::new(Cell::new(None)),
@@ -179,6 +180,19 @@ impl Recorder {
             id,
             over: None,
             ty,
+        }
+    }
+
+    /// State the block drafter this text carries — see
+    /// [`model_ir::BlockDrafter`]. Once per trace; a second statement must
+    /// agree with the first.
+    pub fn block_drafter(&self, facts: model_ir::BlockDrafter) {
+        let mut inner = self.inner.borrow_mut();
+        match inner.drafter {
+            Some(prior) if prior != facts => panic!(
+                "the text states two block drafters: {prior:?} and then {facts:?}"
+            ),
+            _ => inner.drafter = Some(facts),
         }
     }
 

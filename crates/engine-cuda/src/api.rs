@@ -421,6 +421,9 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // `MtpDrafts` is `[k]` i32 token ids, an argmax the guest can take
         // for itself off `MtpLogits`; no device path here produces it.
         mtp_depth: 0,
+        draft_block: 0,
+        draft_mask_token: 0,
+        draft_bidirectional: false,
         has_value_head: false,
         // Does this load export a capture column, and did the slab that
         // observes it get carved.
@@ -1508,6 +1511,7 @@ mod tests {
             }],
             nodes: Vec::new(),
             seams: Vec::new(),
+            drafter: None,
         }
     }
 

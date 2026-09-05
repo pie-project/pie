@@ -180,7 +180,16 @@ async fn main(input: Input) -> Result<Output> {
     if model::mtp_depth() == 0 {
         return Err("this SKU ships no draft head".into());
     }
-    let block = input.block.unwrap_or(BLOCK_ROWS).max(2);
+    // The head's facts off the load (`model::draft_block`); the inputs
+    // override for a diagnostic, the constants are the last resort.
+    let advertised = model::draft_block();
+    let block = input
+        .block
+        .or(advertised.map(|d| d.rows))
+        .unwrap_or(BLOCK_ROWS)
+        .max(2);
+    let mask_token = advertised.map_or(MASK_TOKEN, |d| d.mask_token as i32);
+    let no_mask = input.no_mask || advertised.is_some_and(|d| !d.bidirectional);
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
     let mut prompt = model::encode(&input.prompt);
@@ -276,7 +285,7 @@ async fn main(input: Input) -> Result<Output> {
         // ── the draft: ONE pass over `[anchor, MASK x block-1]`, the trunk
         //    guarded away from its rows, the whole extent visible (the
         //    drafter's last layer is full attention with no causality).
-        let mut ids = vec![MASK_TOKEN; block as usize];
+        let mut ids = vec![mask_token; block as usize];
         ids[0] = anchor;
         let toks = Channel::from(ids.as_slice()).named("toks_d");
         let indptr = Channel::from([0u32, block]).named("embed_indptr_d");
@@ -310,7 +319,7 @@ async fn main(input: Input) -> Result<Output> {
             })
             .collect();
         let mask = Channel::from_shaped([block, pool], visible).named("mask_d");
-        let bound_mask = if input.no_mask { None } else { Some(&mask) };
+        let bound_mask = if no_mask { None } else { Some(&mask) };
         // **EVERY BLOCK ROW READS OUT.** The drafts plane is cut to the rows
         // the readout names, so a pass that leaves it at the default gets a
         // one-row plane and asking it for `block` values is a geometry

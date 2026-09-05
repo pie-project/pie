@@ -25,6 +25,15 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(model::model().eta_caps().mtp_depth)
     }
 
+    async fn draft_block(&mut self) -> Result<Option<pie::inferlet::model::BlockDrafter>> {
+        let caps = model::model().eta_caps();
+        Ok((caps.draft_block > 0).then(|| pie::inferlet::model::BlockDrafter {
+            rows: caps.draft_block,
+            mask_token: caps.draft_mask_token,
+            bidirectional: caps.draft_bidirectional,
+        }))
+    }
+
     /// Which forward-pass interface the bound model requires, keyed on state
     /// semantics: recurrent state is present iff the engine handshake
     /// reports a non-zero folded-state size; paged KV is present iff the

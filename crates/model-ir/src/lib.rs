@@ -26,7 +26,7 @@ pub use ops::{
     Attention, Collective, CustomCuda, Elementwise, GateActivation, Layout, Linear, MropeForm,
     Operation,
 };
-pub use trace::{CacheRow, Node, Param, ParamSource, Platform, Seam, Shard, Trace};
+pub use trace::{BlockDrafter, CacheRow, Node, Param, ParamSource, Platform, Seam, Shard, Trace};
 pub use value::{
     BIASES, Def, Dim, Dtype, GeomKind, PerAxis, RowAxis, RuntimeInput, SCALES, StructKind,
     TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,

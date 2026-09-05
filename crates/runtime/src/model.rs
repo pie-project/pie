@@ -683,6 +683,12 @@ pub struct EtaCaps {
     pub has_mtp_logits: bool,
     /// The draft head's chain depth; zero without one (`mtp-depth`).
     pub mtp_depth: u32,
+    /// The block drafter's facts (`block-drafter`): rows a draft pass
+    /// carries (zero without one), the mask id, whether the block is
+    /// bidirectional.
+    pub draft_block: u32,
+    pub draft_mask_token: u32,
+    pub draft_bidirectional: bool,
     pub has_value_head: bool,
     /// Backend can execute the `envelope_dot` second-party kernel (Quest).
     pub has_kv_envelopes: bool,

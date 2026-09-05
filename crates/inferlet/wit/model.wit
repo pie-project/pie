@@ -21,6 +21,20 @@ interface model {
     // `mtp_logits` are unavailable. Static, like `frame-size`.
     mtp-depth: func() -> u32;
 
+    // What a guest needs to seed a BLOCK drafter's draft pass: the rows one
+    // pass carries (the anchor and `rows - 1` mask slots), the id every row
+    // but the first carries in, and whether the block sees itself — in which
+    // case the guest states the mask that says so. Facts the head was trained
+    // at, not policy: which rows to verify, and whether to draft at all, stay
+    // the guest's. `none` for a model with no block drafter (a chained head
+    // is `mtp-depth`). Static, like `mtp-depth`.
+    record block-drafter {
+        rows: u32,
+        mask-token: u32,
+        bidirectional: bool,
+    }
+    draft-block: func() -> option<block-drafter>;
+
     // Which forward-pass kind the bound model requires. A guest may only
     // construct the `forward-pass` of the matching interface; the other
     // interfaces' constructors error immediately.

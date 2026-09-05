@@ -177,5 +177,27 @@ fn the_dflash2_plan_is_whole_and_convolves() {
         assert_eq!((topks, walks), (1, 1), "{platform:?}: the selector reads the block out once");
         let seams: Vec<&str> = trace.seams.iter().map(|s| s.seam.as_str()).collect();
         assert!(seams.iter().any(|s| s.contains("mtp")), "{platform:?}: no draft seam; {seams:?}");
+        // The facts a guest seeds the block from ride on the trace.
+        let facts = trace.drafter.expect("the v2 text states its block drafter");
+        assert_eq!((facts.rows, facts.mask_token, facts.bidirectional), (8, 248_070, false));
     }
 }
+
+/// **THE V1 TEXT STATES ITS BLOCK TOO**, and says it is bidirectional — its
+/// last layer is full attention over the block, so a guest must bind a mask.
+#[test]
+fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
+    use model_dsl::Platform;
+    let row = models::skus()
+        .find(|row| row.recipe.text == "qwen36-27b-dflash")
+        .expect("this build ships the block-drafter row");
+    let trace = (row.trace)(Platform::Metal);
+    let facts = trace.drafter.expect("the v1 text states its block drafter");
+    assert_eq!((facts.rows, facts.mask_token, facts.bidirectional), (16, 248_070, true));
+    // And an undrafted text states none.
+    let plain = models::skus()
+        .find(|row| row.recipe.text == "qwen38-27b" && row.recipe.weights.contains(&model_dsl::Dtype::U4g64))
+        .expect("the plain row");
+    assert!((plain.trace)(Platform::Metal).drafter.is_none());
+}
+

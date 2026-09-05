@@ -4,7 +4,9 @@
 
 use checkpoint::contract::{Expr, TensorType};
 use checkpoint_dsl::{Builder, Error, extents};
-use model_dsl::{Dtype, HybridSpec, Input, KvSpace, Predicate, Value, Weight, ops, seam};
+use model_dsl::{
+    BlockDrafter, Dtype, HybridSpec, Input, KvSpace, Predicate, Value, Weight, ops, seam,
+};
 
 /// Which published head this is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -513,6 +515,14 @@ impl DFlash {
         hb: Option<&Value>,
         block_draft: &Predicate,
     ) {
+        // The facts a guest needs to seed this head's block, on the trace for
+        // the load to advertise: v1 is bidirectional over the block (its full
+        // layer), v2 is causal inside it.
+        logits.rec().block_drafter(BlockDrafter {
+            rows: self.block,
+            mask_token: self.mask_token,
+            bidirectional: self.blocks.iter().any(|b| b.window.is_none()),
+        });
         let (dlogits, _) = logits.split(block_draft);
         seam::at(seam::MTP, &[&dlogits]);
         let picks = match (&self.selector, hb) {

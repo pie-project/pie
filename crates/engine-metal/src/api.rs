@@ -361,6 +361,10 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         activation: Dtype::F32,
         has_mtp_logits: shell.drafts(),
         mtp_depth: shell.mtp_depth(),
+        // The block drafter's facts, stated by the text on its trace.
+        draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
+        draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
+        draft_bidirectional: shell.trace().drafter.is_some_and(|d| d.bidirectional),
         has_value_head: false,
         has_attn_score: shell.observes_scores(),
         has_attn_page_mask: false,
