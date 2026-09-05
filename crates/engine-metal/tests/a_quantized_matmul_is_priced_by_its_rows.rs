@@ -38,6 +38,12 @@
 //! - **`PRECAST_BK` at 32 / 64 / 128**: 496.3 / 497.2 / 505.5 us. Flat.
 //! - **Withholding the precast plane**: 548 us at sixteen rows, worse; it is
 //!   already the better arm (and at sixty-four rows only, 1733 vs 1770).
+//! - **`BN = 64`** (2026-09-04, on the reuse hypothesis: at sixteen rows the
+//!   544 column tiles each re-read the whole 160 KB activation block, 89 MB
+//!   against the bank's 45, so halving the tile count should halve that):
+//!   497 -> 539 us at sixteen rows, 874 -> 925 at thirty-two, 346 -> 451 at
+//!   eight; N=5120 and N=1024 the same way. Reuse is not what the tile is
+//!   short of — threadgroups are, and a wider tile has fewer of them.
 //!
 //! So the sixteen-row cost is not a tiling-parameter choice. What is left
 //! unmeasured is the QUANTIZED WEIGHT LOADER's own read efficiency — 90 GB/s
