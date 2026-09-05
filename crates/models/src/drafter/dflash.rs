@@ -1,31 +1,13 @@
-//! **DFlash and DFlash2** — the block drafters `z-lab` publishes for the Qwen
-//! 27B targets, as model text any family can carry. See the module doc for
-//! the four hooks a family spells; this file is everything behind them.
+//! **DFlash, DFlash2 and DSpark** — the published block drafters, as model
+//! text any family can carry. A head's own numbers are a [`Head`] descriptor
+//! (one constant per published checkpoint); the family names one and spells
+//! the four hooks the module doc lists. This file is everything behind them.
 
 use checkpoint::contract::{Expr, TensorType};
 use checkpoint_dsl::{Builder, Error, extents};
 use model_dsl::{
     BlockDrafter, Dtype, HybridSpec, Input, KvSpace, Predicate, Value, Weight, ops, seam,
 };
-
-/// Which published head this is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Version {
-    /// `z-lab/Qwen3.6-27B-DFlash`: block sixteen, four sliding layers then
-    /// one full, bidirectional over the block, argmax readout.
-    One,
-    /// `z-lab/Qwen3.8-27B-DFlash2`: block eight, five sliding layers causal
-    /// inside the block, a dynamic convolution around every sublayer, a
-    /// candidate selector for the readout.
-    Two,
-    /// `DimInfer/Qwen3.8-27B-Dspark-v1`: the v1 backbone (its taps, five
-    /// plain layers) with every layer full attention and the block
-    /// bidirectional, a block of fifteen whose EVERY row proposes (row `i`
-    /// predicts position `i + 1`, the anchor's row included), and a markov
-    /// bigram head for the readout — a [`Selector`] with no hidden term. Its
-    /// confidence head is not read yet.
-    DSpark,
-}
 
 /// What the drafter reads off the trunk it is declared beside: the numbers
 /// its banks are shaped by, and nothing about the trunk's own architecture.
@@ -53,7 +35,7 @@ pub struct Trunk {
 /// tokens:
 ///
 /// ```text
-/// h  = rms(Σᵢ tapᵢ · fcᵢ)                       the five taps, fused
+/// h  = rms(Σᵢ tapᵢ · fcᵢ)                       the taps, fused
 /// for each block:  h += attn(rms(h));  h += mlp(rms(h))
 /// draft = lm_head(rms(h))                       through the TARGET's head
 /// ```
@@ -61,9 +43,9 @@ pub struct Trunk {
 /// Three things differ from a chained head, and each is why this is its own
 /// declaration rather than a flag on one:
 ///
-/// * **The fusion is five-wide.** The stored `fc.weight` is one
-///   `[hidden, 5·hidden]` bank; the IR has no concat, so it is sliced into
-///   five `[hidden, hidden]` banks summed with `residual_add`, the same way a
+/// * **The fusion is taps-wide.** The stored `fc.weight` is one
+///   `[hidden, taps·hidden]` bank; the IR has no concat, so it is sliced into
+///   `[hidden, hidden]` banks summed with `residual_add`, the same way a
 ///   chained head splits its two-wide bank.
 /// * **The attention is NOT the family's site.** Its `q_proj` is
 ///   `[q_heads·head_dim, hidden]` with no gate to split off, and its
@@ -98,7 +80,8 @@ pub struct DFlash {
     /// The first block row whose readout is a proposal — 1 for both DFlash
     /// heads (the anchor row proposes nothing), 0 for DSpark.
     pub proposals_from: u32,
-    pub version: Version,
+    /// The published head this was declared from.
+    pub head: &'static Head,
 }
 
 /// **DFlash2's candidate selector** — the head's readout. Each mask slot
@@ -194,50 +177,142 @@ pub struct DraftAttn {
     pub kv: String,
 }
 
-/// **The v1 head's own numbers** (`z-lab/Qwen3.6-27B-DFlash`'s
-/// `config.json`), which are the head's and not the trunk's. Constants
-/// rather than fields because every number below is a fact about that
-/// published checkpoint, not a knob.
-const TAPS: [u32; 5] = [1, 16, 31, 46, 61];
-const LAYERS: u32 = 5;
-const Q_HEADS: u32 = 32;
-const KV_HEADS: u32 = 8;
-const HEAD_DIM: u32 = 128;
-const INTER: u32 = 17_408;
-const THETA: f32 = 10_000_000.0;
-const WINDOW: u32 = 2_048;
-/// Rows one v1 draft block carries.
-pub const BLOCK: u32 = 16;
-/// `dflash_config.mask_token_id` — the id every block row but the first
-/// carries into the draft pass. Public with [`BLOCK`] because a guest seeding
-/// a draft block needs both; they belong on the load's own advertisement
-/// (beside `mtp_depth`) once there is a guest asking.
-pub const MASK_TOKEN: u32 = 248_070;
+/// **A PUBLISHED HEAD'S OWN NUMBERS** — its `config.json`. Every field is a
+/// fact about one published checkpoint and not a knob, so the heads this
+/// build knows are constants ([`QWEN36_27B_DFLASH`] and the rest below) and
+/// a family names one when it declares the drafter. Nothing here is about
+/// the trunk: a head's taps index the trunk's layers, and its `hidden` is
+/// the trunk's, read off [`Trunk`].
+#[derive(Debug, PartialEq)]
+pub struct Head {
+    /// The trunk layers whose hidden states feed the fusion, in the order
+    /// their banks are sliced out of `fc` (`dflash_config.target_layer_ids`).
+    pub taps: &'static [u32],
+    /// One entry a layer (`layer_types`): the window a sliding layer attends
+    /// the context through, or `None` for full attention — which is
+    /// BIDIRECTIONAL over the block, since the reference skips the causal
+    /// mask outright for such a head.
+    pub windows: &'static [Option<u32>],
+    pub q_heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub inter: u32,
+    pub theta: f32,
+    /// Rows one draft pass proposes (`block_size`) — the width of the
+    /// `mtp.drafts` seam.
+    pub block: u32,
+    /// `dflash_config.mask_token_id`: the id every block row but the first
+    /// carries into the draft pass.
+    pub mask_token: u32,
+    /// The first block row whose readout is a proposal: 1 when the anchor
+    /// row proposes nothing, 0 when every row does (DSpark's `logits_start`).
+    pub proposals_from: u32,
+    /// The dynamic convolution around every sublayer, where the head has one
+    /// (`conv_kernel_size` / `conv_group_size`).
+    pub conv: Option<Conv>,
+    pub readout: Readout,
+}
 
-/// **The DFlash2 head's own numbers** (`z-lab/Qwen3.8-27B-DFlash2`'s
-/// `config.json`); heads, widths, window, theta and the mask token are v1's.
-const TAPS2: [u32; 5] = [5, 19, 33, 47, 61];
-/// Rows one v2 draft block carries.
-pub const BLOCK2: u32 = 8;
-/// `dflash_config.conv_kernel_size`: taps of the dynamic convolution.
-const CONV_TAPS: u32 = 2;
-/// `dflash_config.conv_group_size`: channels sharing one correction.
-const CONV_GROUP: u32 = 16;
-/// `dflash_config.selector_rank` / `selector_top_k`.
-const SELECTOR_RANK: u32 = 256;
-const SELECTOR_TOP_K: u32 = 16;
+/// A [`DynConv`]'s two numbers: taps of the convolution and channels
+/// sharing one correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Conv {
+    pub taps: u32,
+    pub group: u32,
+}
 
-/// **The DSpark head's own numbers** (`DimInfer/Qwen3.8-27B-Dspark-v1`'s
-/// `config.json`): v1's taps and geometry, `block_size` 15, `logits_start`
-/// 0, its own mask id, `markov_rank` 256. The markov head biases the WHOLE
-/// vocabulary in the reference; here it biases the slot's top-`K` — the
-/// same approximation DFlash2's selector was trained with, taken so one
-/// kernel serves both, and paid for in acceptance only (the verify is what
-/// makes a round lossless).
-pub const BLOCK_DSPARK: u32 = 15;
-const MASK_TOKEN_DSPARK: u32 = 248_200;
-const MARKOV_RANK: u32 = 256;
-const MARKOV_TOP_K: u32 = 16;
+/// How a head reads its proposals off the shared `lm_head`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readout {
+    /// The per-slot argmax.
+    Argmax,
+    /// DFlash2's candidate selector (`selector_rank` / `selector_top_k`):
+    /// `unary + ⟨pred[prev] ⊙ proj(h), succ[c]⟩` over the slot's `top_k`.
+    Selector { rank: u32, top_k: u32 },
+    /// DSpark's markov bigram head (`markov_rank`): the same lattice with no
+    /// hidden term. It biases the WHOLE vocabulary in the reference; here it
+    /// biases the slot's top-`K` — the approximation DFlash2's selector was
+    /// trained with, taken so one kernel serves both, and paid for in
+    /// acceptance only (the verify is what makes a round lossless).
+    Markov { rank: u32, top_k: u32 },
+}
+
+const SLIDING: Option<u32> = Some(2_048);
+
+/// `z-lab/Qwen3.6-27B-DFlash`: block sixteen, four sliding layers then one
+/// full, bidirectional over the block, argmax readout.
+pub const QWEN36_27B_DFLASH: Head = Head {
+    taps: &[1, 16, 31, 46, 61],
+    windows: &[SLIDING, SLIDING, SLIDING, SLIDING, None],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 17_408,
+    theta: 10_000_000.0,
+    block: 16,
+    mask_token: 248_070,
+    proposals_from: 1,
+    conv: None,
+    readout: Readout::Argmax,
+};
+
+/// `z-lab/Qwen3.8-27B-DFlash2`: block eight, five sliding layers causal
+/// inside the block, a dynamic convolution around every sublayer, a
+/// candidate selector for the readout. Heads, widths, window, theta and the
+/// mask token are v1's.
+pub const QWEN38_27B_DFLASH2: Head = Head {
+    taps: &[5, 19, 33, 47, 61],
+    windows: &[SLIDING; 5],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 17_408,
+    theta: 10_000_000.0,
+    block: 8,
+    mask_token: 248_070,
+    proposals_from: 1,
+    conv: Some(Conv { taps: 2, group: 16 }),
+    readout: Readout::Selector { rank: 256, top_k: 16 },
+};
+
+/// `DimInfer/Qwen3.8-27B-Dspark-v1`: the v1 backbone (its taps, five plain
+/// layers) with every layer full attention and the block bidirectional, a
+/// block of fifteen whose EVERY row proposes (row `i` predicts position
+/// `i + 1`, the anchor's row included), its own mask id, and a markov bigram
+/// head for the readout. Its confidence head is not read yet.
+pub const QWEN38_27B_DSPARK: Head = Head {
+    taps: &[1, 16, 31, 46, 61],
+    windows: &[None; 5],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 17_408,
+    theta: 10_000_000.0,
+    block: 15,
+    mask_token: 248_200,
+    proposals_from: 0,
+    conv: None,
+    readout: Readout::Markov { rank: 256, top_k: 16 },
+};
+
+/// `z-lab/gemma-4-26B-A4B-it-DFlash`: the v1 shape against a 30-layer
+/// trunk — six taps, a narrower MLP, theta 1e6, and the mask id 4 — read
+/// out through gemma's softcapped head (monotone, so the argmax is the
+/// head's own). The head is a Qwen3-style stack whatever the target.
+pub const GEMMA4_26B_A4B_DFLASH: Head = Head {
+    taps: &[1, 6, 11, 17, 22, 27],
+    windows: &[SLIDING, SLIDING, SLIDING, SLIDING, None],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 5_632,
+    theta: 1_000_000.0,
+    block: 16,
+    mask_token: 4,
+    proposals_from: 1,
+    conv: None,
+    readout: Readout::Argmax,
+};
 
 impl DFlash {
     /// Declare the head's planes under `prefix` (`aux` for an `--aux`
@@ -254,46 +329,49 @@ impl DFlash {
     /// noise over eight. What a block drafter accepts is a property of the
     /// HEAD, not of the precision it is carried at.
     #[must_use]
-    pub fn declare(version: Version, prefix: &str, trunk: &Trunk) -> DFlash {
+    pub fn declare(head: &'static Head, prefix: &str, trunk: &Trunk) -> DFlash {
         let (hidden, w, dense, tp) = (trunk.hidden, trunk.weights, trunk.dense, trunk.tp);
         let n = |s: &str| format!("{prefix}.{s}");
-        // v1 and v2 differ in the taps, the block, the window rule, the
-        // convolution and the readout; everything else below is one text.
-        let v2 = version == Version::Two;
-        let dspark = version == Version::DSpark;
-        let taps: &[u32] = if v2 { &TAPS2 } else { &TAPS };
-        let groups = hidden / u64::from(CONV_GROUP);
+        // Heads differ in their taps, their layers' windows, the block, the
+        // convolution and the readout — the descriptor's fields; everything
+        // else below is one text.
         let conv = |l: u32, which: &str| {
-            v2.then(|| DynConv {
+            head.conv.map(|c| DynConv {
                 base: Weight::sym(
                     format!("{prefix}.layers.{l}.{which}.base_kernel"),
-                    [2 * u64::from(CONV_TAPS), hidden],
+                    [2 * u64::from(c.taps), hidden],
                     dense,
                 ),
                 proj: Weight::sym(
                     format!("{prefix}.layers.{l}.{which}.kernel_projection"),
-                    [2 * u64::from(CONV_TAPS) * groups, hidden],
+                    [2 * u64::from(c.taps) * (hidden / u64::from(c.group)), hidden],
                     w,
                 )
                 .columns(),
-                taps: CONV_TAPS,
-                group: CONV_GROUP,
+                taps: c.taps,
+                group: c.group,
             })
         };
-        let (dq, dkv, dhd) = (Q_HEADS / tp, KV_HEADS / tp, HEAD_DIM);
+        let (dq, dkv, dhd) = (head.q_heads / tp, head.kv_heads / tp, head.head_dim);
         let hd = u64::from(dhd);
-        let inter = INTER / tp;
+        let inter = head.inter / tp;
+        // Read seven times sixteen rows a fire: carried dense, where
+        // precision costs nothing and the gather is exact.
+        let codebook = |s: &str, rank: u32| Weight::sym(n(s), [trunk.vocab, u64::from(rank)], dense);
         DFlash {
-            taps: taps.to_vec(),
-            // One column slice of the stored `[hidden, 5·hidden]` bank per
+            taps: head.taps.to_vec(),
+            // One column slice of the stored `[hidden, taps·hidden]` bank per
             // tap; replicated, since a trunk hidden state is.
-            fc: (0..taps.len())
+            fc: (0..head.taps.len())
                 .map(|i| Weight::sym(n(&format!("fc_tap{i}")), [hidden, hidden], w))
                 .collect(),
             hidden_norm: Weight::sym(n("hidden_norm"), [hidden], dense),
             hidden_norm_eps: trunk.norm_eps,
-            blocks: (0..LAYERS)
-                .map(|l| {
+            blocks: head
+                .windows
+                .iter()
+                .zip(0u32..)
+                .map(|(&window, l)| {
                     let b = |s: &str| format!("{prefix}.layers.{l}.{s}");
                     DFlashBlock {
                         mixer_norm: Weight::sym(b("mixer_norm"), [hidden], dense),
@@ -303,7 +381,7 @@ impl DFlash {
                             kv_heads: dkv,
                             head_dim: dhd,
                             rotary_dim: dhd,
-                            theta: THETA,
+                            theta: head.theta,
                             sm_scale: (dhd as f32).sqrt().recip(),
                             q_proj: Weight::sym(b("q_proj"), [u64::from(dq) * hd, hidden], w).columns(),
                             k_proj: Weight::sym(b("k_proj"), [u64::from(dkv) * hd, hidden], w).columns(),
@@ -323,10 +401,7 @@ impl DFlash {
                             down: Weight::sym(b("down"), [hidden, u64::from(inter)], w).rows(),
                             inter,
                         },
-                        // The v1 head is four sliding layers then one full;
-                        // v2 is five sliding; DSpark is five full
-                        // (`layer_types` in the three configs).
-                        window: (!dspark && (v2 || l + 1 < LAYERS)).then_some(WINDOW),
+                        window,
                         attn_conv: conv(l, "attention_conv"),
                         mlp_conv: conv(l, "mlp_conv"),
                     }
@@ -334,46 +409,32 @@ impl DFlash {
                 .collect(),
             norm: Weight::sym(n("norm"), [hidden], dense),
             norm_eps: trunk.norm_eps,
-            block: match version {
-                Version::One => BLOCK,
-                Version::Two => BLOCK2,
-                Version::DSpark => BLOCK_DSPARK,
-            },
-            mask_token: if dspark { MASK_TOKEN_DSPARK } else { MASK_TOKEN },
-            proposals_from: u32::from(!dspark),
-            selector: match version {
-                Version::One => None,
-                Version::Two => Some(Selector {
+            block: head.block,
+            mask_token: head.mask_token,
+            proposals_from: head.proposals_from,
+            selector: match head.readout {
+                Readout::Argmax => None,
+                Readout::Selector { rank, top_k } => Some(Selector {
                     hidden_projection: Some(
                         Weight::sym(
                             n("candidate_selector.hidden_projection"),
-                            [u64::from(SELECTOR_RANK), hidden],
+                            [u64::from(rank), hidden],
                             w,
                         )
                         .columns(),
                     ),
-                    // Read seven times sixteen rows a fire: carried dense,
-                    // where precision costs nothing and the gather is exact.
-                    pred: Weight::sym(
-                        n("candidate_selector.predecessor_codebook"),
-                        [trunk.vocab, u64::from(SELECTOR_RANK)],
-                        dense,
-                    ),
-                    succ: Weight::sym(
-                        n("candidate_selector.successor_codebook"),
-                        [trunk.vocab, u64::from(SELECTOR_RANK)],
-                        dense,
-                    ),
-                    top_k: SELECTOR_TOP_K,
+                    pred: codebook("candidate_selector.predecessor_codebook", rank),
+                    succ: codebook("candidate_selector.successor_codebook", rank),
+                    top_k,
                 }),
-                Version::DSpark => Some(Selector {
+                Readout::Markov { rank, top_k } => Some(Selector {
                     hidden_projection: None,
-                    pred: Weight::sym(n("markov_w1"), [trunk.vocab, u64::from(MARKOV_RANK)], dense),
-                    succ: Weight::sym(n("markov_w2"), [trunk.vocab, u64::from(MARKOV_RANK)], dense),
-                    top_k: MARKOV_TOP_K,
+                    pred: codebook("markov_w1", rank),
+                    succ: codebook("markov_w2", rank),
+                    top_k,
                 }),
             },
-            version,
+            head,
         }
     }
 
@@ -655,8 +716,8 @@ impl DFlash {
         b.read_expr(&self.norm, norm("aux.norm.weight".to_string()))?;
         // DFlash2's selector: a projection bank and two codebooks, the
         // codebooks stored as plain arrays (no `.weight`).
-        match (&self.selector, self.version) {
-            (Some(sel), Version::Two) => {
+        match (&self.selector, self.head.readout) {
+            (Some(sel), Readout::Selector { .. }) => {
                 if let Some(proj) = &sel.hidden_projection {
                     b.read(proj, "aux.candidate_selector.hidden_projection.weight".to_string())?;
                 }
@@ -667,7 +728,7 @@ impl DFlash {
             // id, `w2` a linear whose weight is `[vocab, rank]` — the same
             // shape, read as the successor codebook. Its confidence head
             // (`confidence_head.proj.*`) is left out until a guest reads it.
-            (Some(sel), Version::DSpark) => {
+            (Some(sel), Readout::Markov { .. }) => {
                 b.read(&sel.pred, "aux.markov_head.markov_w1.weight".to_string())?;
                 b.read(&sel.succ, "aux.markov_head.markov_w2.weight".to_string())?;
             }

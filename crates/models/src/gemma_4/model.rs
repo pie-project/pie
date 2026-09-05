@@ -1,5 +1,7 @@
 use model_dsl::{Dtype, Weight};
 
+use crate::drafter::dflash::{self, DFlash};
+
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
@@ -43,6 +45,11 @@ pub struct Model {
     /// (`google/gemma-4-*-it-assistant`), when an overlay carries one. See
     /// [`Assistant`].
     pub assistant: Option<Assistant>,
+
+    /// z-lab's block drafter (`gemma-4-26B-A4B-it-DFlash`), when an overlay
+    /// carries one — the same text every family carries it as
+    /// (`crate::drafter::dflash`), tapping this trunk's layers.
+    pub dflash: Option<DFlash>,
 }
 
 /// **GEMMA 4'S OWN DRAFTER**: a four-layer text stack that reads the trunk's
@@ -418,6 +425,8 @@ struct Dims {
     draft: bool,
     /// Whether it carries Google's assistant instead (see [`Assistant`]).
     assistant: bool,
+    /// The published block drafter it carries instead, if any.
+    dflash: Option<&'static dflash::Head>,
     hidden: u32,
     layers: u32,
     full_every: u32,
@@ -472,6 +481,7 @@ impl Model {
                 tower: None,
                 draft: false,
                 assistant: false,
+                dflash: None,
                 hidden: 2560,
                 layers: 42,
                 full_every: 6,
@@ -540,6 +550,7 @@ impl Model {
                 tower: None,
                 draft: false,
                 assistant: false,
+                dflash: None,
                 hidden: 5376,
                 layers: 60,
                 full_every: 6,
@@ -582,6 +593,14 @@ impl Model {
         Model::new(w, kv, tp, d)
     }
 
+    /// The mixture with z-lab's block drafter overlaid
+    /// (`gemma-4-26B-A4B-it-DFlash`). A separate row for the same reason.
+    pub fn a4b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::a4b_dims();
+        d.dflash = Some(&dflash::GEMMA4_26B_A4B_DFLASH);
+        Model::new(w, kv, tp, d)
+    }
+
     /// The mixture reading the same wide tower as [`Model::b31_vision`],
     /// landing in 2816 instead of 5376.
     pub fn a4b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
@@ -595,6 +614,7 @@ impl Model {
                 tower: None,
                 draft: false,
                 assistant: false,
+                dflash: None,
                 hidden: 2816,
                 layers: 30,
                 full_every: 6,
@@ -990,6 +1010,22 @@ impl Model {
             final_norm_eps: d.norm_eps,
             draft,
             assistant,
+            // The block drafter's geometry is its OWN (`drafter::dflash`); it
+            // reads nothing off `Dims` but the trunk's widths and element types.
+            dflash: d.dflash.map(|head| {
+                DFlash::declare(
+                    head,
+                    "aux",
+                    &dflash::Trunk {
+                        hidden,
+                        vocab: d.vocab as u64,
+                        norm_eps: d.norm_eps,
+                        weights: w,
+                        dense,
+                        tp,
+                    },
+                )
+            }),
         }
     }
 }

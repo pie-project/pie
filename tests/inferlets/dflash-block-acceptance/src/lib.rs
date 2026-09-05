@@ -174,9 +174,6 @@ const MASK_TOKEN: i32 = 248_070;
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Hybrid {
-        return Err("this inferlet drives a hybrid model's recurrent state".into());
-    }
     if model::mtp_depth() == 0 {
         return Err("this SKU ships no draft head".into());
     }
@@ -207,10 +204,20 @@ async fn main(input: Input) -> Result<Output> {
     let max_pages = max_extent.div_ceil(page_size);
     ws.reserve(max_pages).context("reserve KV")?;
     let pool = max_pages * page_size;
-    let rs = RsWorkingSet::new();
-    rs.alloc_buffer(2 * block.div_ceil(rs_page).max(1))
-        .map_err(|why| format!("alloc rs runs: {why}"))?;
-    let rs_set = vec![rs];
+    // A hybrid text (qwen's GDN layers) needs its recurrent state bound; an
+    // attention-only one (gemma) binds none — the drafter is the same either way.
+    let rs_set = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Recurrent => {
+            return Err("a block drafter reads attention kv; a recurrent-only text has none".into());
+        }
+        model::ForwardKind::Hybrid => {
+            let rs = RsWorkingSet::new();
+            rs.alloc_buffer(2 * block.div_ceil(rs_page).max(1))
+                .map_err(|why| format!("alloc rs runs: {why}"))?;
+            vec![rs]
+        }
+    };
     let pipe = Pipeline::new();
 
     // ── PREFILL: the prompt, chunked. Every chunk leaves the drafter's

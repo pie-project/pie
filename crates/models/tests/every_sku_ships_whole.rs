@@ -231,3 +231,37 @@ fn the_dspark_plan_is_whole_and_walks_a_bigram() {
     );
 }
 
+
+/// **THE SAME FOUR HOOKS IN A SECOND FAMILY.** gemma's text carries z-lab's
+/// head for its mixture: six taps (six `fc` slices into the fusion), the v1
+/// shape's one bidirectional layer (one non-causal masked read), a block of
+/// sixteen whose mask id is 4, and no trunk plan guarded on anything but the
+/// trunk's own rows.
+#[test]
+fn gemma_carries_the_block_drafter_too() {
+    use model_dsl::Platform;
+    let row = models::skus()
+        .find(|row| row.recipe.text == "gemma4-26b-a4b-dflash")
+        .expect("this build ships gemma's DFlash row");
+    let trace = (row.trace)(Platform::Metal);
+    let facts = trace.drafter.expect("gemma's text states its block drafter");
+    assert_eq!(
+        (facts.rows, facts.mask_token, facts.bidirectional, facts.proposals_from),
+        (16, 4, true, 1)
+    );
+    let bidirectional = trace
+        .nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                &n.op,
+                model_dsl::Operation::Attention(model_dsl::Attention::Masked { causal: false, .. })
+            )
+        })
+        .count();
+    assert_eq!(bidirectional, 1, "the head's full layer is the one non-causal read");
+    let plain = models::skus()
+        .find(|row| row.recipe.text == "gemma4-26b-a4b")
+        .expect("the plain row");
+    assert!((plain.trace)(Platform::Metal).drafter.is_none());
+}

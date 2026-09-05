@@ -136,7 +136,7 @@ pub enum Recipe {
     DFlash2,
     /// DSpark (`DimInfer/Qwen3.8-27B-Dspark-v1`): the v1 backbone, all
     /// layers full, a block of fifteen whose every row proposes, a markov
-    /// bigram readout. See [`crate::drafter::dflash::Version::DSpark`].
+    /// bigram readout. See [`crate::drafter::dflash::QWEN38_27B_DSPARK`].
     DSpark,
 }
 
@@ -957,13 +957,13 @@ impl Model {
         // The block drafter's geometry is its OWN (`drafter::dflash`), so it
         // reads nothing off `Dims` but the trunk's widths and element types.
         let dflash = d.draft.filter(|r| r.drafts_a_block()).map(|recipe| {
-            let version = match recipe {
-                Recipe::DFlash2 => dflash::Version::Two,
-                Recipe::DSpark => dflash::Version::DSpark,
-                _ => dflash::Version::One,
+            let head = match recipe {
+                Recipe::DFlash2 => &dflash::QWEN38_27B_DFLASH2,
+                Recipe::DSpark => &dflash::QWEN38_27B_DSPARK,
+                _ => &dflash::QWEN36_27B_DFLASH,
             };
             DFlash::declare(
-                version,
+                head,
                 recipe.prefix(),
                 &dflash::Trunk {
                     hidden,

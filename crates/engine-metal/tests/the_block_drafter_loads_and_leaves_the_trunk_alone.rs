@@ -316,8 +316,8 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
     let anchor = argmax(&seeded[0]);
 
     // The block: the anchor, then the model's mask token in every other row.
-    let block = models::drafter::dflash::BLOCK as usize;
-    let mut tokens = vec![models::drafter::dflash::MASK_TOKEN; block];
+    let block = models::drafter::dflash::QWEN36_27B_DFLASH.block as usize;
+    let mut tokens = vec![models::drafter::dflash::QWEN36_27B_DFLASH.mask_token; block];
     tokens[0] = anchor;
     let extent = PROMPT.len() as u64 + block as u64;
     let masking = all_visible(extent);

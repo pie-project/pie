@@ -686,9 +686,6 @@ const MASK_TOKEN: i32 = 248_070;
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Hybrid {
-        return Err("this inferlet drives a hybrid model's recurrent state".into());
-    }
     if model::mtp_depth() == 0 {
         return Err("this SKU ships no draft head".into());
     }
@@ -740,8 +737,16 @@ async fn main(input: Input) -> Result<Output> {
     let max_pages = max_extent.div_ceil(page_size);
     ws.reserve(max_pages).context("reserve KV")?;
     let pool = max_pages * page_size;
-    let rs = RsWorkingSet::new();
-    let rs_set = vec![rs];
+    // A hybrid text (qwen's GDN layers) needs its recurrent state bound and
+    // folded round by round; an attention-only one (gemma) binds none, and
+    // the fold-commit below has nothing to size — the drafter is the same.
+    let rs_set: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err("a block drafter reads attention kv; a recurrent-only text has none".into());
+        }
+    };
 
     let pipe = Pipeline::new();
 
@@ -863,11 +868,12 @@ async fn main(input: Input) -> Result<Output> {
         // The buffer must hold the survivors and this window; the grant is
         // the guest's one allocation decision.
         let buffer_pages = buffer_pages_for(survivors, block, rs_page);
-        let have = rs_set[0].buffer_size();
-        if have < buffer_pages {
-            rs_set[0]
-                .alloc_buffer(buffer_pages - have)
-                .map_err(|why| format!("alloc {} rs buffer page(s): {why}", buffer_pages - have))?;
+        if let Some(rs) = rs_set.first() {
+            let have = rs.buffer_size();
+            if have < buffer_pages {
+                rs.alloc_buffer(buffer_pages - have)
+                    .map_err(|why| format!("alloc {} rs buffer page(s): {why}", buffer_pages - have))?;
+            }
         }
         let fold_none = Channel::from([0u32]).named("fold_none");
 
@@ -1008,9 +1014,10 @@ async fn main(input: Input) -> Result<Output> {
         }
         // The buffer is back to the accepted prefix the verify is about to
         // fold — see the draft fire's geometry.
-        rs_set[0]
-            .discard_buffered(block)
-            .map_err(|why| format!("forget the draft fire's {block} row(s): {why}"))?;
+        if let Some(rs) = rs_set.first() {
+            rs.discard_buffered(block)
+                .map_err(|why| format!("forget the draft fire's {block} row(s): {why}"))?;
+        }
         }
         let proposals = proposals_owned.as_slice();
         widths.push(verify);
@@ -1094,9 +1101,10 @@ async fn main(input: Input) -> Result<Output> {
         // whose fold reaches exactly the accepted prefix.
         let rejected = (verify as usize - 1 - kept) as u32;
         if rejected > 0 {
-            rs_set[0]
-                .discard_buffered(rejected)
-                .map_err(|why| format!("discard {rejected} rejected row(s): {why}"))?;
+            if let Some(rs) = rs_set.first() {
+                rs.discard_buffered(rejected)
+                    .map_err(|why| format!("discard {rejected} rejected row(s): {why}"))?;
+            }
             discarded += rejected as usize;
         }
         // A drafting round leaves its accepted prefix buffered for the next

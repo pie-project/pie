@@ -14,6 +14,8 @@ pub struct Facts {
     /// Lanes that want their attention's per-query LSE kept — see
     /// [`Facts::captures_scores`].
     pub captures_scores: bool,
+    /// The rows are a block drafter's proposal — see [`Facts::block_draft`].
+    pub block_draft: bool,
 }
 
 impl Facts {
@@ -51,6 +53,13 @@ impl Facts {
     pub fn captures_scores() -> Predicate {
         Predicate::fact(5)
     }
+
+    /// Lanes whose rows are a block drafter's proposal rather than the
+    /// sequence's own — `[anchor, MASK x block-1]`, which the trunk must not
+    /// run over. Bit 6 of the fact word; the same hook `qwen_3` spells.
+    pub fn block_draft() -> Predicate {
+        Predicate::fact(6)
+    }
 }
 
 impl Classify for Facts {
@@ -62,6 +71,7 @@ impl Classify for Facts {
             media: r.has_media(),
             drafts: r.drafts(),
             captures_scores: r.captures_scores(),
+            block_draft: r.drafts_a_block(),
         }
     }
 
@@ -72,6 +82,7 @@ impl Classify for Facts {
             | (u64::from(self.media) << 3)
             | (u64::from(self.drafts) << 4)
             | (u64::from(self.captures_scores) << 5)
+            | (u64::from(self.block_draft) << 6)
     }
 }
 
@@ -98,6 +109,9 @@ impl ForwardHybrid for Model {
             let plane = self.global.kv_heads as u64 * self.global.head_dim as u64;
             c.kv(kv, a.attn.kv.clone(), [plane, plane]);
         }
+        if let Some(d) = &self.dflash {
+            d.declare_caches(&mut c, kv);
+        }
         c
     }
 
@@ -119,7 +133,13 @@ impl ForwardHybrid for Model {
             qo_one.clone(),
             Predicate::rest(),
         ];
-        let [input_m, input_s, input_d, input_p] = inputs.split(classes.clone());
+        // The drafter's rows leave before the classes are cut, so a plan and
+        // the query it is consumed by say the same guard (see `qwen_3`).
+        let (_, trunk_inputs) = match &m.dflash {
+            Some(_) => inputs.split(&Facts::block_draft()),
+            None => (inputs.clone(), inputs.clone()),
+        };
+        let [input_m, input_s, input_d, input_p] = trunk_inputs.split(classes.clone());
         let plan_m = [
             ops::attn::plan_prefill(
                 &input_m,
@@ -201,6 +221,19 @@ impl ForwardHybrid for Model {
             let (imaged, _) = y.split(&Facts::media());
             y = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
         }
+
+        // **THE BLOCK DRAFTER'S ROWS LEAVE HERE**, before the first layer,
+        // and are the drafter's input as they are: the reference feeds it
+        // the target's `embed_tokens`, which for gemma carries the √hidden
+        // scale already applied above. See `qwen_3` for the rest of the hook.
+        let (h_block, mut y) = match &m.dflash {
+            Some(_) => {
+                let (block, rest) = y.split(&Facts::block_draft());
+                (Some(block), rest)
+            }
+            None => (None, y),
+        };
+        let mut tapped: Option<Value> = None;
 
         let relay = m.ple.as_ref().map(|ple| {
             let proj = ops::linear::matmul(&y, &ple.model_proj) * (m.hidden as f32).sqrt().recip();
@@ -473,15 +506,32 @@ impl ForwardHybrid for Model {
             if let Some(scalar) = &w.scalar {
                 y = ops::elemwise::scale(scalar, &y);
             }
+            if let Some(d) = &m.dflash {
+                d.tap(l, &y, &mut tapped);
+            }
         }
 
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
+        // The drafter reads out through the TARGET's head — softcap included,
+        // which is monotone and so leaves its argmax the head's own — so its
+        // rows join the trunk's before the one `lm_head`.
+        let (x, hb) = match (&m.dflash, h_block) {
+            (Some(d), Some(block)) => {
+                let tapped = tapped.as_ref().expect("a block drafter tapped the trunk");
+                let hb = d.arm(&inputs, tapped, &block, &mask, &Facts::block_draft());
+                (Value::merge(vec![hb.clone(), x]), Some(hb))
+            }
+            _ => (x, None),
+        };
         let logits = ops::linear::lm_head(&x, &m.embed);
         let logits = if let Some(cap) = m.softcap {
             ops::attn::logit_softcap(&logits, cap)
         } else {
             logits
         };
+        if let Some(d) = &m.dflash {
+            d.plant_readout(&logits, &inputs, hb.as_ref(), &Facts::block_draft());
+        }
 
         // Stated after the trunk's own readout: the export arena gives the
         // delivery tail to the last-stated node, so an earlier draft column

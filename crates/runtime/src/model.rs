@@ -125,6 +125,13 @@ pub const ROWS: &[Row] = &[
         vocab: 262_144,
         arch: "gemma4",
     },
+    // And with z-lab's DFlash block drafter overlaid.
+    Row {
+        id: "gemma4-26b-a4b-dflash-u4g64-kv-bf16",
+        layers: 30,
+        vocab: 262_144,
+        arch: "gemma4",
+    },
     // Same trunk as its already-listed twin; neither quant nor the vision
     // tower moves layers, vocab or arch.
     Row {

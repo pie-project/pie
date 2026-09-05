@@ -127,8 +127,8 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
     })
     .expect("the block drafter's shell loads");
 
-    let block = models::drafter::dflash::BLOCK as usize;
-    let mask_token = models::drafter::dflash::MASK_TOKEN;
+    let block = models::drafter::dflash::QWEN36_27B_DFLASH.block as usize;
+    let mask_token = models::drafter::dflash::QWEN36_27B_DFLASH.mask_token;
     let drafting = |len: u32| {
         models::qwen_3::forward::Facts::of(&Request::new(len, false).drafting(true)).word()
     };
