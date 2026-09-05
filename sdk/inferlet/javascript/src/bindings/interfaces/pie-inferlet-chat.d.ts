@@ -1,5 +1,11 @@
 /** @module Interface pie:inferlet/chat@0.3.0 **/
 /**
+ * The tokens a conversation or a raw completion prompt starts with —
+ * `<bos>` where the model needs one, empty otherwise. The role fillers
+ * below include it; a raw prompt is `prefix() ++ encode(text)`.
+ */
+export function prefix(): Uint32Array;
+/**
  * Fill roles for history replay
  */
 export function system(message: string): Uint32Array;
@@ -19,10 +25,6 @@ export function seal(): Uint32Array;
  * Returns the stop token IDs for the model
  */
 export function stopTokens(): Uint32Array;
-/**
- * Create a decoder to classify generated tokens
- */
-export function createDecoder(): Decoder;
 export type Error = import('./pie-inferlet-types.js').Error;
 export type Event = EventDelta | EventInterrupt | EventDone;
 /**
@@ -48,10 +50,7 @@ export interface EventDone {
 }
 
 export class Decoder {
-  /**
-   * This type does not have a public constructor.
-   */
-  private constructor();
+  constructor()
   feed(tokens: Uint32Array): Event;
   reset(): void;
 }

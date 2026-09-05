@@ -215,3 +215,6 @@ pie-tart
 # Staged by kernels-metal/build.rs from eta-compiler; generated, not a source.
 /.recovered/
 /.orig_gemm.cpp
+
+# Derived JavaScript-facing WIT world (npm run derive-wit / generate-bindings)
+sdk/inferlet/javascript/wit/

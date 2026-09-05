@@ -2,6 +2,13 @@
 export type Error = import('./pie-inferlet-types.js').Error;
 export type Pipeline = import('./pie-inferlet-pipeline.js').Pipeline;
 /**
+ * A working set exposes only what is TRUE OF ITSELF: its extent, its
+ * shape, its lineage. Engine constants that merely happen to be reachable
+ * through it -- KV page size, folded-state byte size, buffered RS page
+ * size -- live on `model` instead. The engine serves exactly one model, so
+ * a per-resource copy could never disagree with the global; it would just
+ * be a second name for one fact, and callers would have to know that the
+ * two agree.
  * A contiguous, half-open span [start, start + len) of WorkingSet-relative
  * page indexes. The ONLY references that ever cross this API are these
  * relative indexes — never physical page ids.
@@ -26,10 +33,6 @@ export interface PageSpan {
 
 export class KvWorkingSet {
   constructor()
-  /**
-  * Tokens per KV page for this working set's model/engine.
-  */
-  pageSize(): number;
   /**
   * Current logical extent in pages, including reserved space whose
   * pages have not been written yet.
@@ -94,17 +97,9 @@ export class KvWorkingSet {
 export class RsWorkingSet {
   constructor()
   /**
-  * Size in bytes of one folded recurrent-state object for this model.
-  */
-  stateSize(): bigint;
-  /**
   * Current number of buffered page slots.
   */
   bufferSize(): number;
-  /**
-  * Tokens per buffered RS page for this working set's model/engine.
-  */
-  bufferPageSize(): number;
   /**
   * Append `n` fresh buffered page slots; returns the contiguous range.
   * Slots are materialized lazily on their first write.

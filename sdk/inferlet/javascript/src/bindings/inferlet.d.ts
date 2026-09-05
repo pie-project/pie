@@ -16,11 +16,4 @@ export type * as PieInferletTokenizer030 from './interfaces/pie-inferlet-tokeniz
 export type * as PieInferletTools030 from './interfaces/pie-inferlet-tools.js'; // import pie:inferlet/tools@0.3.0
 export type * as PieInferletTypes030 from './interfaces/pie-inferlet-types.js'; // import pie:inferlet/types@0.3.0
 export type * as PieInferletWorkingSet030 from './interfaces/pie-inferlet-working-set.js'; // import pie:inferlet/working-set@0.3.0
-export type * as WasiClocksMonotonicClock030 from './interfaces/wasi-clocks-monotonic-clock.js'; // import wasi:clocks/monotonic-clock@0.3.0
-export type * as WasiClocksSystemClock030 from './interfaces/wasi-clocks-system-clock.js'; // import wasi:clocks/system-clock@0.3.0
-export type * as WasiClocksTypes030 from './interfaces/wasi-clocks-types.js'; // import wasi:clocks/types@0.3.0
-export type * as WasiFilesystemPreopens030 from './interfaces/wasi-filesystem-preopens.js'; // import wasi:filesystem/preopens@0.3.0
-export type * as WasiFilesystemTypes030 from './interfaces/wasi-filesystem-types.js'; // import wasi:filesystem/types@0.3.0
-export type * as WasiHttpClient030 from './interfaces/wasi-http-client.js'; // import wasi:http/client@0.3.0
-export type * as WasiHttpTypes030 from './interfaces/wasi-http-types.js'; // import wasi:http/types@0.3.0
 export * as run from './interfaces/pie-inferlet-run.js'; // export pie:inferlet/run@0.3.0

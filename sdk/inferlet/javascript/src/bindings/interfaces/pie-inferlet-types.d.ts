@@ -12,19 +12,20 @@ export type Blob = Uint8Array;
  * buffers are not represented.
  */
 export type Shape = Uint32Array;
-export type Dtype = DtypeF32 | DtypeI32 | DtypeU32 | DtypeBool;
-export interface DtypeF32 {
-  tag: 'f32',
-}
-export interface DtypeI32 {
-  tag: 'i32',
-}
-export interface DtypeU32 {
-  tag: 'u32',
-}
-export interface DtypeBool {
-  tag: 'bool',
-}
+/**
+ * Element type of a tensor payload. Closed set, no payloads — an `enum`,
+ * like `model.forward-kind`.
+ * # Variants
+ * 
+ * ## `"f32"`
+ * 
+ * ## `"i32"`
+ * 
+ * ## `"u32"`
+ * 
+ * ## `"bool"`
+ */
+export type Dtype = 'f32' | 'i32' | 'u32' | 'bool';
 /**
  * Packed little-endian tensor payload. The runtime validates byte length
  * against the tensor shape/dtype.

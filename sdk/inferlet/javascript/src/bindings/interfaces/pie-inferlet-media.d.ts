@@ -1,5 +1,13 @@
 /** @module Interface pie:inferlet/media@0.3.0 **/
 export type Error = import('./pie-inferlet-types.js').Error;
+/**
+ * A visual span's extent in merged-token units.
+ */
+export interface MergedGrid {
+  t: number,
+  h: number,
+  w: number,
+}
 
 export class Audio {
   /**
@@ -14,7 +22,22 @@ export class Audio {
   */
   static fromBytes(bytes: Uint8Array): Audio;
   /**
+  * THE SPAN, AS THE SEQUENCE CARRIES IT — `image.tokens()`'s contract,
+  * with this model's audio delimiters and pad. One ledger for both
+  * modalities is why `forward.media` takes a variant rather than two
+  * verbs: audio joined the door without changing it.
+  */
+  tokens(): Uint32Array;
+  /**
+  * A stable content hash of the PREPROCESSED clip — log-mel features,
+  * not source bytes. The cache statute in this interface's header binds
+  * audio runs exactly as it binds visual ones. 32 bytes.
+  */
+  digest(): Uint8Array;
+  /**
   * Hidden-state rows / KV slots this clip occupies == audio soft tokens.
+  * 
+  * Introspection: `tokens()` already places exactly this many.
   */
   tokenCount(): number;
   /**
@@ -23,8 +46,9 @@ export class Audio {
   */
   positionSpan(): number;
   /**
-  * Model-specific delimiter tokens placed before / after the span (e.g.
+  * The delimiter tokens `tokens()` already placed around the run (e.g.
   * Gemma `<|audio>` / `<audio|>`); empty for models that need none.
+  * Introspection, like `image`'s — see the note there.
   */
   prefixTokens(): Uint32Array;
   suffixTokens(): Uint32Array;
@@ -43,7 +67,36 @@ export class Image {
   */
   static fromBytes(bytes: Uint8Array): Image;
   /**
+  * THE SPAN, AS THE SEQUENCE CARRIES IT: prefix + placeholder run
+  * (exactly `token-count` long) + suffix, in the bound model's own ids.
+  * 
+  * This is the one ledger (media-door.md §0). A span enters the context
+  * as `toks.extend(img.tokens())` and as nothing else — no anchor list,
+  * no guest-side splicing of `prefix-tokens` around a run the guest
+  * built itself, no second bookkeeping structure beside the tokens. The
+  * handle then crosses again beside them, through
+  * `forward.forward-pass.media`, carrying only the payload.
+  * 
+  * The ids are the host's answer, never the guest's spelling: the guest
+  * hardcodes nothing and stays model-agnostic. See the cache statute in
+  * this interface's header before keying anything on the result.
+  */
+  tokens(): Uint32Array;
+  /**
+  * A stable content hash of the PREPROCESSED span — patches, not source
+  * bytes, so two encodings of one image collide correctly and two
+  * images do not. 32 bytes.
+  * 
+  * Exists for the cache statute above: `tokens()` cannot tell two
+  * images apart and this can, cheaply, so a guest that caches across a
+  * media run has no excuse for keying on the run alone.
+  */
+  digest(): Uint8Array;
+  /**
   * Hidden-state rows / KV slots this visual span occupies.
+  * 
+  * Introspection: `tokens()` already places exactly this many
+  * placeholders, so nothing on the happy path needs to ask.
   */
   tokenCount(): number;
   /**
@@ -53,14 +106,19 @@ export class Image {
   */
   positionSpan(): number;
   /**
-  * (t, h, w) in merged-token units.
+  * Extent in merged-token units.
   */
-  grid(): [number, number, number];
+  grid(): MergedGrid;
   /**
-  * Model-specific delimiter tokens the context must place immediately
-  * before / after this span (e.g. Qwen `<|vision_start|>` /
-  * `<|vision_end|>`); empty for models that need none. The SDK's
-  * `append-image` applies these so the inferlet stays model-agnostic.
+  * The delimiter tokens `tokens()` already placed around the run (e.g.
+  * Qwen `<|vision_start|>` / `<|vision_end|>`); empty for models that
+  * need none.
+  * 
+  * INTROSPECTION, NOT A STEP (media-door.md §1). These were the guest's
+  * splicing instructions back when the guest assembled the run; they
+  * stay because a caller inspecting what a span will cost is a real
+  * question, and because a WIT verb is cheap to keep and expensive to
+  * re-add. Nothing on the happy path calls them.
   */
   prefixTokens(): Uint32Array;
   suffixTokens(): Uint32Array;

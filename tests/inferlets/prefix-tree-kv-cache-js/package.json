@@ -1,0 +1,7 @@
+{
+  "name": "prefix-tree-kv-cache-js",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js"
+}

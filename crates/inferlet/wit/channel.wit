@@ -49,5 +49,18 @@ interface channel {
         /// Copy a committed value to the host, leaving the cell full. Same
         /// await/poison discipline as `take`.
         read: async func() -> result<data, error>;
+
+        /// `take` for a guest whose toolchain cannot lower an `async func`
+        /// (componentize-js / StarlingMonkey today: "imported functions can
+        /// only be synchronous pending component-model-level async
+        /// support"). Same contract and same host path as `take`, but the
+        /// guest's task BLOCKS in the call instead of yielding — nothing else
+        /// in that instance runs while it waits, which is exactly what a
+        /// single-pipeline decode loop wants and what a guest juggling two
+        /// pipelines from one task must not use.
+        take-blocking: func() -> result<data, error>;
+
+        /// `read` for the same guests; see `take-blocking`.
+        read-blocking: func() -> result<data, error>;
     }
 }

@@ -332,6 +332,48 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
+  # Python / JavaScript inferlet SDKs — the `eta` ports of eta-dsl/eta-ir and
+  # the hand-written wrappers. Their unit suites run against stub WIT
+  # bindings; what ties them to the real world is (a) the container goldens
+  # (`crates/eta-dsl/tests/goldens/sdk_containers.txt`), which both suites
+  # rebuild byte for byte, and (b) `scripts/check-sdk-interfaces.sh`, which
+  # fails if either SDK names an interface the WIT no longer defines or stops
+  # binding the forward-pass surface. Neither needs componentize-py or a GPU;
+  # `jco types` regenerates the JS bindings from the derived (sync) world so a
+  # host interface that moved is a `tsc` error here rather than a wizer error
+  # in `bakery build`.
+  sdk-inferlet:
+    name: inferlet SDKs (python + javascript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: SDK interface gate
+        run: bash scripts/check-sdk-interfaces.sh
+
+      - name: Goldens are one file
+        run: cmp crates/eta-dsl/tests/goldens/sdk_containers.txt sdk/inferlet/python/tests/goldens/eta_containers.txt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python SDK tests
+        run: python -m pip install pytest && PYTHONPATH=src python -m pytest -q tests
+        working-directory: sdk/inferlet/python
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: JavaScript SDK bindings, type-check, tests
+        run: |
+          npm ci --ignore-scripts
+          npm run generate-bindings
+          npx tsc --noEmit
+          npm test
+        working-directory: sdk/inferlet/javascript
+
   # WIT drift — the canonical inferlet interface (crates/inferlet/wit) is
   # vendored into ONE remaining copy, bakery's
   # (sdk/inferlet/tools/bakery/src/bakery/wit), which is a Python package and

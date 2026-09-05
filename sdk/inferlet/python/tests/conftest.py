@@ -48,7 +48,8 @@ def _make_model() -> types.ModuleType:
     m.name = lambda: "mock-model"
     m.architecture = lambda: "qwen3_5"
     m.default_system_speculation = lambda: False
-    m.is_linear = lambda: True
+    m.mtp_depth = lambda: 0
+    m.submit_deadline_us = lambda: 50_000
     m.pass_kind = lambda: ForwardKind.HYBRID
     m.output_vocab_size = lambda: 151936
     m.kv_page_size = lambda: 16
@@ -67,15 +68,24 @@ def _make_model() -> types.ModuleType:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _Token:
+    id: int
+    bytes: bytes
+
+
 def _make_tokenizer() -> types.ModuleType:
     m = types.ModuleType("wit_world.imports.tokenizer")
     # Byte-identity codec: keeps assertions readable while still exercising
     # the list()/str marshalling the wrapper does.
     m.encode = lambda text: [ord(c) for c in text]
     m.decode = lambda tokens: "".join(chr(t) for t in tokens)
-    m.vocabs = lambda: ([0, 1], [b"a", b"b"])
+    m.Token = _Token
+    m.vocabs = lambda: [_Token(0, b"a"), _Token(1, b"b")]
     m.split_regex = lambda: r"\w+"
-    m.special_tokens = lambda: ([2], [b"<eos>"])
+    m.special_tokens = lambda: [_Token(2, b"<eos>")]
+    m.token_bytes = lambda tokens: [bytes([t]) for t in tokens]
+    m.tokens_with_prefix = lambda prefix: list(prefix)
     return m
 
 
@@ -187,7 +197,10 @@ def _make_chat() -> types.ModuleType:
     m.Event_Interrupt = ChatInterrupt
     m.Event_Done = ChatDone
     m.Decoder = ChatDecoderStub
+    m.prefix = lambda: [0]
     m.system = lambda message: [1, *(ord(c) for c in message)]
+    m.first_user = lambda message: [2, *(ord(c) for c in message)]
+    m.system_user = lambda system, user: [4, *(ord(c) for c in system), *(ord(c) for c in user)]
     m.first_user = lambda message: [2, *(ord(c) for c in message)]
     m.user = lambda message: [3, *(ord(c) for c in message)]
     m.system_user = lambda system, user: [4]
@@ -228,6 +241,371 @@ def _make_reasoning() -> types.ModuleType:
     return m
 
 
+
+
+# ---------------------------------------------------------------------------
+# The forward-pass surface: pie:inferlet/{types, channel, pipeline,
+# working-set, forward, forward-recurrent, forward-hybrid} + the
+# componentize-py `Err` type. Enough for `inferlet.eta.bridge` to import and
+# for its host-side plumbing to be exercised without a device: a `Channel`
+# remembers what was put; `take()` hands it back.
+# ---------------------------------------------------------------------------
+
+
+class Dtype(Enum):
+    F32 = 0
+    I32 = 1
+    U32 = 2
+    BOOL = 3
+
+
+class WitErr(Exception):
+    def __init__(self, value) -> None:
+        super().__init__(value)
+        self.value = value
+
+
+def _make_componentize_py_types() -> types.ModuleType:
+    m = types.ModuleType("componentize_py_types")
+    m.Err = WitErr
+    m.Ok = type("Ok", (), {"__init__": lambda self, value: setattr(self, "value", value)})
+    m.Result = object
+    m.Some = type("Some", (), {"__init__": lambda self, value: setattr(self, "value", value)})
+    return m
+
+
+def _make_types() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.pie_inferlet_types")
+    m.Dtype = Dtype
+    return m
+
+
+class ChannelStub:
+    created: list["ChannelStub"] = []
+
+    def __init__(self, shape, dtype, capacity) -> None:
+        self.shape, self.dtype, self.capacity = list(shape), dtype, capacity
+        self.cells: list[bytes] = []
+        ChannelStub.created.append(self)
+
+    def put(self, value: bytes) -> None:
+        self.cells.append(bytes(value))
+
+    def set(self, value: bytes) -> None:
+        if not self.cells:
+            raise WitErr("set on an empty channel")
+        self.cells[0] = bytes(value)
+
+    async def take(self) -> bytes:
+        if not self.cells:
+            raise WitErr("take on an empty channel (stub)")
+        return self.cells.pop(0)
+
+    async def read(self) -> bytes:
+        if not self.cells:
+            raise WitErr("read on an empty channel (stub)")
+        return self.cells[0]
+
+
+def _make_channel() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.channel")
+    m.Channel = ChannelStub
+    return m
+
+
+class PipelineStub:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _make_pipeline() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.pipeline")
+    m.Pipeline = PipelineStub
+    return m
+
+
+@dataclass
+class PageRange:
+    start: int
+    len: int
+
+
+@dataclass
+class PageSpan:
+    start: int
+    end: int | None
+
+
+class KvWorkingSetStub:
+    def __init__(self) -> None:
+        self.pages = 0
+
+    def page_len(self) -> int:
+        return self.pages
+
+    def reserve(self, pages: int) -> PageRange:
+        r = PageRange(self.pages, pages)
+        self.pages += pages
+        return r
+
+    def fork(self, on):
+        return KvWorkingSetStub()
+
+
+class RsWorkingSetStub:
+    def __init__(self) -> None:
+        pass
+
+    def buffer_size(self) -> int:
+        return 0
+
+
+def _make_working_set() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.working_set")
+    m.PageRange = PageRange
+    m.PageSpan = PageSpan
+    m.KvWorkingSet = KvWorkingSetStub
+    m.RsWorkingSet = RsWorkingSetStub
+    return m
+
+
+@dataclass
+class KvGeometry:
+    readable_pages: PageSpan
+    writable_pages: PageSpan
+    kv_len: object
+    pages: object
+    page_indptr: object
+    w_slot: object
+    w_off: object
+    positions: object
+    mask: object
+
+
+@dataclass
+class RsGeometry:
+    fold_len: object
+    buffer: PageSpan
+
+
+@dataclass
+class KvBinding:
+    working_set: object
+    geometry: KvGeometry
+
+
+class ForwardPassStub:
+    """Records what a pass was given; `program` keeps the container bytes."""
+
+    submitted: list[tuple[object, list]] = []
+
+    def __init__(self) -> None:
+        self.embedded = None
+        self.attention_args = None
+        self.program_bytes: bytes | None = None
+        self.program_channels: list | None = None
+
+    def embed(self, tokens, indptr) -> None:
+        self.embedded = (tokens, indptr)
+
+    def readout(self, indices) -> None:
+        self.readout_ch = indices
+
+    def attention(self, *args) -> None:
+        self.attention_args = args
+
+    def set_max_layers(self, n: int) -> None:
+        self.max_layers = n
+
+    def set_drafting_block(self, on: bool) -> None:
+        self.drafting = on
+
+    def media(self, spans) -> None:
+        self.spans = spans
+
+    def program(self, container_bytes: bytes, channels) -> None:
+        self.program_bytes = bytes(container_bytes)
+        self.program_channels = list(channels)
+
+
+def _make_forward(name: str) -> types.ModuleType:
+    m = types.ModuleType(f"wit_world.imports.{name}")
+    m.ForwardPass = ForwardPassStub
+    m.KvGeometry = KvGeometry
+    m.RsGeometry = RsGeometry
+    m.KvBinding = KvBinding
+    m.MediaSpan_Image = lambda v: ("image", v)
+    m.MediaSpan_Audio = lambda v: ("audio", v)
+
+    def submit(on, slots) -> None:
+        ForwardPassStub.submitted.append((on, list(slots)))
+
+    m.submit = submit
+    m.park = lambda on: None
+    return m
+
+
+# ---------------------------------------------------------------------------
+# pie:inferlet/grammar, tools, media — enough for the wrappers to import and
+# marshal; a grammar "matches" everything and terminates after 3 tokens.
+# ---------------------------------------------------------------------------
+
+
+class GrammarStub:
+    def __init__(self, source: str) -> None:
+        self.source = source
+
+    @classmethod
+    def from_json_schema(cls, schema: str):
+        if schema == "bad":
+            raise WitErr("not a schema")
+        return cls(schema)
+
+    @classmethod
+    def json(cls):
+        return cls("json")
+
+    @classmethod
+    def from_regex(cls, pattern: str):
+        return cls(pattern)
+
+    @classmethod
+    def from_ebnf(cls, ebnf: str):
+        return cls(ebnf)
+
+    def to_string(self) -> str:
+        return self.source
+
+
+class MatcherStub:
+    def __init__(self, grammar) -> None:
+        self.grammar = grammar
+        self.accepted: list[int] = []
+
+    def accept_tokens(self, ids) -> None:
+        if 999 in ids:
+            raise WitErr("token 999 is not allowed")
+        self.accepted.extend(ids)
+
+    def mask(self):
+        return [0b101]
+
+    def is_terminated(self) -> bool:
+        return len(self.accepted) >= 3
+
+    def reset(self) -> None:
+        self.accepted.clear()
+
+    def fork(self):
+        m = MatcherStub(self.grammar)
+        m.accepted = list(self.accepted)
+        return m
+
+    def rollback(self, n: int) -> None:
+        del self.accepted[len(self.accepted) - n :]
+
+    def rollback_capacity(self) -> int:
+        return len(self.accepted)
+
+
+def _make_grammar() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.grammar")
+    m.Grammar = GrammarStub
+    m.Matcher = MatcherStub
+    return m
+
+
+@dataclass
+class ToolCallStub:
+    name: str
+    arguments_json: str
+
+
+@dataclass
+class ToolsEventStart:
+    pass
+
+
+@dataclass
+class ToolsEventCall:
+    value: ToolCallStub
+
+
+class ToolsDecoderStub:
+    def __init__(self) -> None:
+        self.n = 0
+
+    def feed(self, tokens):
+        self.n += 1
+        if self.n == 1:
+            return ToolsEventStart()
+        return ToolsEventCall(ToolCallStub("lookup", '{"q": 1}'))
+
+    def reset(self) -> None:
+        self.n = 0
+
+
+def _make_tools() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.tools")
+    m.Event_Start = ToolsEventStart
+    m.Event_Call = ToolsEventCall
+    m.ToolCall = ToolCallStub
+    m.Decoder = ToolsDecoderStub
+    m.equip = lambda tools: [10, len(tools)]
+    m.answer = lambda name, value: [11, len(name), len(value)]
+    m.format = lambda tools: GrammarStub("tools") if tools else None
+    m.create_matcher = lambda tools: MatcherStub(GrammarStub("tools"))
+    return m
+
+
+@dataclass
+class MergedGridStub:
+    t: int
+    h: int
+    w: int
+
+
+class ImageStub:
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        if not data:
+            raise WitErr("empty image")
+        return cls()
+
+    def tokens(self):
+        return [5, 6, 7]
+
+    def digest(self):
+        return b"\x01\x02"
+
+    def token_count(self):
+        return 3
+
+    def position_span(self):
+        return 1
+
+    def grid(self):
+        return MergedGridStub(1, 2, 3)
+
+    def prefix_tokens(self):
+        return [5]
+
+    def suffix_tokens(self):
+        return [7]
+
+
+def _make_media() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.media")
+    m.MergedGrid = MergedGridStub
+    m.Image = ImageStub
+    m.Audio = ImageStub
+    m.Video = ImageStub
+    return m
+
+
 # ---------------------------------------------------------------------------
 # Installation
 # ---------------------------------------------------------------------------
@@ -253,7 +631,18 @@ def install() -> None:
         "session": _make_session(SESSION_SPY),
         "chat": _make_chat(),
         "reasoning": _make_reasoning(),
+        "pie_inferlet_types": _make_types(),
+        "channel": _make_channel(),
+        "pipeline": _make_pipeline(),
+        "working_set": _make_working_set(),
+        "forward": _make_forward("forward"),
+        "forward_recurrent": _make_forward("forward_recurrent"),
+        "forward_hybrid": _make_forward("forward_hybrid"),
+        "grammar": _make_grammar(),
+        "tools": _make_tools(),
+        "media": _make_media(),
     }
+    sys.modules.setdefault("componentize_py_types", _make_componentize_py_types())
 
     sys.modules["wit_world"] = wit_world
     sys.modules["wit_world.imports"] = imports

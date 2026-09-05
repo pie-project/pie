@@ -134,6 +134,14 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
                         help="If set, write each test's captured inferlet output to "
                              "<dir>/<test-name>.txt (one file per test, multiple "
                              "run_inferlet calls concatenated with separators).")
+    # Attach to a `pie serve` that is already up instead of booting the
+    # embedded engine: the model is then whatever that server was started
+    # with, and every other option about the engine is ignored. What it buys
+    # is iteration speed -- a boot is minutes, a test is seconds -- and a
+    # harness that needs no `pie-server` wheel.
+    parser.add_argument("--attach", default=None, metavar="URI",
+                        help="Run against a live `pie serve` at URI (e.g. ws://127.0.0.1:8080) "
+                             "instead of booting the embedded engine")
     return parser
 
 
@@ -298,6 +306,17 @@ TestFn = Callable[..., Coroutine]
 
 
 async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
+    # Attached: no embedded engine, no `pie-server` wheel needed.
+    if args.attach:
+        from pie_client import PieClient
+
+        _build_guests()
+        print(f"Server: {args.attach} (attached; its model is whatever it was started with)")
+        print()
+        async with PieClient(args.attach) as client:
+            await client.authenticate("default")
+            return await _run_tests_on(client, tests, args)
+
     from pie.server import Server
     from pie.config import (
         Config, ModelConfig, ServerConfig, TelemetryConfig,
@@ -368,55 +387,59 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
             ),
         ),
     )
+    async with Server(cfg) as server:
+        client = await server.connect()
+        return await _run_tests_on(client, tests, args)
+
+
+async def _run_tests_on(client, tests: list[TestFn], args: argparse.Namespace) -> int:
+    """Run `tests` against a connected client; the per-test loop and summary."""
     out_dir = Path(args.output_dir) if args.output_dir else None
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
+    results: list[tuple[str, str, str]] = []
 
-    async with Server(cfg) as server:
-        client = await server.connect()
-        results: list[tuple[str, str, str]] = []
+    for test_fn in tests:
+        name = test_fn.__name__.removeprefix("test_").replace("_", "-")
+        print(f"🔄 {name:30s} ", end="", flush=True)
+        start = time.time()
+        _captured.clear()
 
-        for test_fn in tests:
-            name = test_fn.__name__.removeprefix("test_").replace("_", "-")
-            print(f"🔄 {name:30s} ", end="", flush=True)
-            start = time.time()
-            _captured.clear()
+        try:
+            await test_fn(client, args)
+            elapsed = time.time() - start
+            print(f"✅ ({elapsed:.1f}s)")
+            results.append((name, "PASS", ""))
+        except FileNotFoundError as e:
+            elapsed = time.time() - start
+            print(f"⏭️  ({elapsed:.1f}s) SKIPPED")
+            results.append((name, "SKIP", str(e)))
+        except Exception as e:
+            elapsed = time.time() - start
+            detail = str(e)[:300]
+            print(f"❌ ({elapsed:.1f}s)")
+            print(f"   {detail}")
+            if args.verbose and hasattr(e, "output"):
+                for line in e.output.splitlines()[:20]:
+                    print(f"   | {line}")
+            results.append((name, "FAIL", detail))
 
-            try:
-                await test_fn(client, args)
-                elapsed = time.time() - start
-                print(f"✅ ({elapsed:.1f}s)")
-                results.append((name, "PASS", ""))
-            except FileNotFoundError as e:
-                elapsed = time.time() - start
-                print(f"⏭️  ({elapsed:.1f}s) SKIPPED")
-                results.append((name, "SKIP", str(e)))
-            except Exception as e:
-                elapsed = time.time() - start
-                detail = str(e)[:300]
-                print(f"❌ ({elapsed:.1f}s)")
-                print(f"   {detail}")
-                if args.verbose and hasattr(e, "output"):
-                    for line in e.output.splitlines()[:20]:
-                        print(f"   | {line}")
-                results.append((name, "FAIL", detail))
+        if out_dir is not None and _captured:
+            _dump_captured(out_dir / f"{name}.txt", _captured)
 
-            if out_dir is not None and _captured:
-                _dump_captured(out_dir / f"{name}.txt", _captured)
+    # Summary
+    print(f"\n{'─' * 70}")
+    print(f"{'Inferlet':30s} {'Status':10s} {'Detail'}")
+    print(f"{'─' * 70}")
+    for name, status, detail in results:
+        icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}.get(status, "?")
+        print(f"{name:30s} {icon} {status:6s}  {detail[:50]}")
+    print(f"{'─' * 70}")
 
-        # Summary
-        print(f"\n{'─' * 70}")
-        print(f"{'Inferlet':30s} {'Status':10s} {'Detail'}")
-        print(f"{'─' * 70}")
-        for name, status, detail in results:
-            icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}.get(status, "?")
-            print(f"{name:30s} {icon} {status:6s}  {detail[:50]}")
-        print(f"{'─' * 70}")
-
-        passed = sum(1 for _, s, _ in results if s == "PASS")
-        total = sum(1 for _, s, _ in results if s != "SKIP")
-        print(f"\n{passed}/{total} passed")
-        return 0 if passed >= total else 1
+    passed = sum(1 for _, s, _ in results if s == "PASS")
+    total = sum(1 for _, s, _ in results if s != "SKIP")
+    print(f"\n{passed}/{total} passed")
+    return 0 if passed >= total else 1
 
 
 #: Engine capabilities that NO engine in this repository advertises.

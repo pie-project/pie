@@ -111,6 +111,18 @@ interface forward {
         /// banded depth when the deployment supports it.
         set-max-layers: func(max-layers: u32) -> result<_, error>;
 
+        /// **THESE ROWS ARE A BLOCK DRAFTER'S PROPOSAL, NOT THE SEQUENCE'S.**
+        /// A block drafter proposes many tokens in one pass over a block
+        /// whose first row is the correction the target just made and whose
+        /// rest is the model's mask token; the trunk must not run over them,
+        /// and a plan that carries such a drafter guards itself on this.
+        ///
+        /// It cannot be inferred from what the pass reads, the way drafting
+        /// is: what makes a fire a draft is the anchor chosen from the
+        /// accepted prefix, which only the guest knows. Unset = an ordinary
+        /// pass.
+        set-drafting-block: func(on: bool) -> result<_, error>;
+
         /// **THE PAYLOAD BESIDE THE LEDGER** (media-door.md §0/§3): the spans
         /// this pass's tokens carry, in the order their placeholder runs
         /// appear.

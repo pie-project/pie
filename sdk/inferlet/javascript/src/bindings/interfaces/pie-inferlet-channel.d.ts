@@ -22,17 +22,18 @@ export class Channel {
   */
   set(value: Data): void;
   /**
-  * Move a committed value out to the host (host-reader channels). Full
-  * -> value + empty the cell. Empty -> BLOCKS by awaiting the pass's
-  * in-flight fires (submit order) until the cell fills; errors when no
-  * in-flight fire remains (nothing will ever fill it) or the channel
-  * is poisoned — a fire that feeds it failed, and the error carries
-  * that fire's failure (under run-ahead, poison IS the error channel).
+  * `take` for a guest whose toolchain cannot lower an `async func`
+  * (componentize-js / StarlingMonkey today: "imported functions can
+  * only be synchronous pending component-model-level async
+  * support"). Same contract and same host path as `take`, but the
+  * guest's task BLOCKS in the call instead of yielding — nothing else
+  * in that instance runs while it waits, which is exactly what a
+  * single-pipeline decode loop wants and what a guest juggling two
+  * pipelines from one task must not use.
   */
-  take(): Promise<Data>;
+  takeBlocking(): Data;
   /**
-  * Copy a committed value to the host, leaving the cell full. Same
-  * await/poison discipline as `take`.
+  * `read` for the same guests; see `take-blocking`.
   */
-  read(): Promise<Data>;
+  readBlocking(): Data;
 }

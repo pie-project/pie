@@ -35,6 +35,12 @@ from wit_world.imports.chat import (
 # =============================================================================
 
 
+def prefix() -> list[int]:
+    """The model's opening tokens (`<bos>` where it has one) — what goes
+    before raw text in a non-chat prompt."""
+    return list(_chat.prefix())
+
+
 def system(message: str) -> list[int]:
     """Token sequence for a system-role message."""
     return list(_chat.system(message))
@@ -43,6 +49,18 @@ def system(message: str) -> list[int]:
 def user(message: str) -> list[int]:
     """Token sequence for a user-role message."""
     return list(_chat.user(message))
+
+
+def first_user(message: str) -> list[int]:
+    """Token sequence for the FIRST user turn (templates that fold the
+    system slot into it)."""
+    return list(_chat.first_user(message))
+
+
+def system_user(system: str, user: str) -> list[int]:
+    """Token sequence for a system message followed by the first user turn,
+    the way the model's template spells that pair."""
+    return list(_chat.system_user(system, user))
 
 
 def assistant(message: str) -> list[int]:

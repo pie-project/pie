@@ -14,11 +14,17 @@
 // Both halves wrap the host's `pie:inferlet/chat` interface — chat
 // template knowledge lives in the Pie runtime, not in the SDK.
 
-import * as _chat from 'pie:inferlet/chat';
+import * as _chat from 'pie:inferlet/chat@0.3.0';
 
 // =============================================================================
 // Template fillers
 // =============================================================================
+
+/** The model's opening tokens (`<bos>` where it has one) — what goes before
+ *  raw text in a non-chat prompt. */
+export function prefix(): Uint32Array {
+  return _chat.prefix();
+}
 
 /** Token sequence for a system-role message. */
 export function system(message: string): Uint32Array {
@@ -28,6 +34,18 @@ export function system(message: string): Uint32Array {
 /** Token sequence for a user-role message. */
 export function user(message: string): Uint32Array {
   return _chat.user(message);
+}
+
+/** Token sequence for the FIRST user turn (templates that fold the system
+ *  slot into it). */
+export function firstUser(message: string): Uint32Array {
+  return _chat.firstUser(message);
+}
+
+/** A system message followed by the first user turn, as the model's
+ *  template spells that pair. */
+export function systemUser(system: string, user: string): Uint32Array {
+  return _chat.systemUser(system, user);
 }
 
 /** Token sequence for an assistant-role message (history replay). */
@@ -108,10 +126,10 @@ export interface EventInterrupt {
 // ─── Constructors ─────────────────────────────────────────────────────────
 
 export const Event = {
-  Idle:      ():                       EventIdle      => ({ type: 'idle' }),
-  Delta:     (text: string):           EventDelta     => ({ type: 'delta', text }),
-  Done:      (text: string):           EventDone      => ({ type: 'done', text }),
-  Interrupt: (token: number):          EventInterrupt => ({ type: 'interrupt', token }),
+  Idle: (): EventIdle => ({ type: 'idle' }),
+  Delta: (text: string): EventDelta => ({ type: 'delta', text }),
+  Done: (text: string): EventDone => ({ type: 'done', text }),
+  Interrupt: (token: number): EventInterrupt => ({ type: 'interrupt', token }),
 } as const;
 
 // =============================================================================
@@ -124,15 +142,15 @@ export class Decoder {
   readonly #inner: _chat.Decoder;
 
   constructor() {
-    this.#inner = _chat.createDecoder();
+    this.#inner = new _chat.Decoder();
   }
 
   /** Feed a token batch and get back the event that fired (one per call).
    *  Returns `Event.Idle()` when nothing semantically happened — e.g. the
    *  batch landed on a token whose visible text is empty, or inside a
    *  region this decoder doesn't report on. */
-  feed(tokens: Uint32Array): Event {
-    const ev = this.#inner.feed(tokens);
+  feed(tokens: ArrayLike<number>): Event {
+    const ev = this.#inner.feed(Uint32Array.from(tokens));
     switch (ev.tag) {
       case 'delta':
         // Empty delta means tokens consumed produced no visible character —

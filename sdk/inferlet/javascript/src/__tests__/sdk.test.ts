@@ -1,16 +1,9 @@
-// Unit tests for the inferlet SDK's hand-written layer.
+// Unit tests for the inferlet SDK's hand-written layer, against the stubs in
+// `./stubs.ts` (vitest aliases every `pie:inferlet/*` specifier to them).
 //
-// SCOPE NOTE: these cover the non-forward interfaces only. That is not an
-// omission -- it is the SDK's entire surface right now. The forward-pass
-// interfaces (`forward` / `forward-recurrent` / `forward-hybrid` plus
-// `channel`, `working-set`, `pipeline`) have no JavaScript counterpart,
-// because the guest now ships ETA container bytes and the encoder that
-// produces them exists only in Rust. `scripts/check-sdk-interfaces.sh` fails
-// on exactly that, deliberately, and blocks publishing until it is fixed.
-//
-// This file did not exist before: `package.json` ran `vitest run src/__tests__`
-// against a directory that was never created, so `npm test` passed by testing
-// nothing while the SDK imported a deleted interface.
+// The non-forward interfaces are covered here; the forward-pass surface —
+// the `eta` port of the tracing eDSL and container encoder — is covered by
+// `eta_goldens.test.ts`, which pins its bytes to the Rust encoder's.
 
 import { beforeEach, describe, expect, it } from 'vitest';
 
@@ -26,10 +19,15 @@ describe('package surface', () => {
   it('exports only the live modules', () => {
     expect(Object.keys(sdk).sort()).toEqual([
       'chat',
+      'eta',
+      'grammar',
+      'mask',
+      'media',
       'model',
       'reasoning',
       'session',
       'tokenizer',
+      'tools',
     ]);
   });
 
@@ -62,11 +60,11 @@ describe('model', () => {
     expect(model.frameSize()).toBe(1);
     expect(model.channelCapacity()).toBe(8);
     expect(model.maxEmbedLength()).toBe(2048);
-    expect(model.arenaBlockSize()).toBe(8192n);
+    expect(model.arenaBlockSize()).toBe(8192);
   });
 
   it('exposes recurrent capabilities', () => {
-    expect(model.rsStateSize()).toBe(4096n);
+    expect(model.rsStateSize()).toBe(4096);
     expect(model.rsBufferPageSize()).toBe(64);
     expect(model.rsFoldGranularity()).toBe(1);
   });
@@ -78,11 +76,11 @@ describe('model', () => {
     expect(model.outputVocabSize()).toBeGreaterThan(ids.length);
   });
 
-  it('no longer carries the tokenizer surface', () => {
-    // It lives in `tokenizer` now; an alias on `model` would hide the
-    // interface split from anyone reading the SDK.
-    for (const gone of ['encode', 'decode', 'vocabs', 'splitRegex', 'specialTokens']) {
-      expect(model).not.toHaveProperty(gone);
+  it('re-exports the tokenizer surface', () => {
+    // It lives in `tokenizer`, and `model` re-exports it so inferlet source
+    // reads `model.encode` the way the Rust SDK's does.
+    for (const name of ['encode', 'decode', 'vocabs', 'splitRegex', 'specialTokens'] as const) {
+      expect(model[name]).toBe(tokenizer[name]);
     }
   });
 });
@@ -90,6 +88,7 @@ describe('model', () => {
 describe('tokenizer', () => {
   it('round-trips encode/decode', () => {
     expect(Array.from(tokenizer.encode('Hi'))).toEqual([72, 105]);
+    expect(tokenizer.decode([72, 105])).toBe('Hi');
     expect(tokenizer.decode(Uint32Array.from([72, 105]))).toBe('Hi');
   });
 
@@ -122,24 +121,24 @@ describe('session', () => {
     expect(JSON.parse(sessionSpy.sent[1]!)).toEqual([1, 2, 3]);
   });
 
-  it('receives text', async () => {
+  it('receives text (synchronously, through the blocking twin)', () => {
     sessionSpy.toReceive.push('hello');
-    await expect(session.receive()).resolves.toBe('hello');
+    expect(session.receive()).toBe('hello');
   });
 
-  it('resolves to undefined once the client has closed', async () => {
+  it('returns undefined once the client has closed', () => {
     // Unlike the Python SDK, which raises, this surface reports end-of-stream
     // as a value. Pinned because the two SDKs differ here on purpose.
-    await expect(session.receive()).resolves.toBeUndefined();
-    await expect(session.receiveFile()).resolves.toBeUndefined();
+    expect(session.receive()).toBeUndefined();
+    expect(session.receiveFile()).toBeUndefined();
   });
 
-  it('round-trips files', async () => {
+  it('round-trips files', () => {
     session.sendFile(new Uint8Array([0, 1]));
     expect(Array.from(sessionSpy.sentFiles[0]!)).toEqual([0, 1]);
 
     sessionSpy.filesToReceive.push(new Uint8Array([2]));
-    const got = await session.receiveFile();
+    const got = session.receiveFile();
     expect(Array.from(got!)).toEqual([2]);
   });
 });

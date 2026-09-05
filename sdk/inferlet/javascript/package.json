@@ -15,12 +15,18 @@
     "build": "tsc",
     "test": "vitest run src/__tests__",
     "test:watch": "vitest",
-    "generate-bindings": "node -e \"require('node:fs').rmSync('src/bindings',{recursive:true,force:true})\" && jco types ../../interface/inferlet -o src/bindings --world-name inferlet && node scripts/gen-tsconfig-paths.mjs"
+    "generate-bindings": "node scripts/derive-js-wit.mjs && node -e \"require('node:fs').rmSync('src/bindings',{recursive:true,force:true})\" && jco types wit -o src/bindings --world-name inferlet && node scripts/gen-tsconfig-paths.mjs",
+    "derive-wit": "node scripts/derive-js-wit.mjs"
   },
   "devDependencies": {
     "@bytecodealliance/jco": "^1.23.0",
     "esbuild": "^0.28.0",
     "typescript": "^6.0.3",
     "vitest": "^4.0.16"
-  }
+  },
+  "files": [
+    "dist",
+    "wit",
+    "scripts"
+  ]
 }

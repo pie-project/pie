@@ -1,58 +1,51 @@
 """
 Pie Inferlet SDK — Python bindings for the Pie runtime.
 
-STATUS: the forward-pass surface is NOT available from Python yet.
-
-The runtime's guest-facing forward-pass surface was replaced: the old
-`pie:core/inference` interface, which exposed a fixed host-side sampler
-(`Sampler.argmax()`, probes, `Generator`), is gone. In its place the guest
-traces a program and ships canonical ETA container bytes through one of
-`pie:inferlet/forward`, `forward-recurrent`, or `forward-hybrid`.
-
-Nothing in this package can produce those bytes. The Rust SDK does it with
-`compiler/dsl` (the tracing eDSL) and `compiler/ir` (the container encoder);
-neither has a Python counterpart, and the encoder has to agree with the Rust
-one byte for byte. Porting it is its own project — see `forward_refactor.md`
-section 10.4 and the tracking note in `scripts/check-sdk-interfaces.sh`.
-
-So the modules that were built on the removed interface — `context`,
-`forward`, `generation`, `sample`, `grammar`, `tools`, `adapter`, `runtime`,
-`zo`, `spec` — have been deleted rather than left importing a surface that no
-longer exists. They were not usable; they only looked usable.
-
-What is here is the part of the SDK that survives the move unchanged: the
-non-forward interfaces, whose WIT definitions came through the split intact.
+An inferlet is a small program that runs next to the model. The forward-pass
+surface (`pie:inferlet/forward*`) takes a traced ETA program; this package
+traces it from ordinary Python and encodes the canonical container bytes —
+the same bytes the Rust SDK's `eta-dsl` emits for the same program, so a
+Python inferlet and a Rust inferlet share the host's program cache.
 
     from inferlet import model, session, chat, reasoning
+    from inferlet.eta import *          # Channel, ForwardPass, Pipeline, ops…
 
-`grammar` and `tools` DO exist as interfaces in the new world, but under
-different shapes (`pie:inferlet/grammar`, `pie:inferlet/tools`) than the
-deleted modules of those names targeted. They come back with the port, not
-before.
+    async def main(input):
+        ws = WorkingSet()
+        ws.reserve(max_pages)
+        fwd = ForwardPass()
+        fwd.embed(tokens, indptr)
+        fwd.bind_state(ws, KvGeometry(...))
 
-The generated `bindings/` tree is current: it is regenerated from
-`interface/inferlet/` with
+        @fwd.epilogue
+        def _():
+            tok_out.put(reshape(reduce_argmax(intrinsics.logits()), [1]))
 
-    componentize-py -d interface/inferlet -w inferlet bindings <out>
+        fwd.submit(pipe)
+        token = await tok_out.take_scalar()
 
-and every interface in the world above is present there. Only the
-hand-written layer is missing.
+`bakery build` (or `pie build`) componentizes a Python inferlet with
+`componentize-py`; the generated `bindings/` tree is regenerated from
+`crates/inferlet/wit` with
+
+    componentize-py -d crates/inferlet/wit -w inferlet bindings <out>
 """
 
 from __future__ import annotations
 
-from . import chat
-from . import model
-from . import reasoning
-from . import session
-from . import tokenizer
+from . import chat, eta, grammar, mask, media, model, reasoning, session, tokenizer, tools
 
 __all__ = [
     "chat",
+    "eta",
+    "grammar",
+    "mask",
+    "media",
     "model",
     "reasoning",
     "session",
     "tokenizer",
+    "tools",
 ]
 
 

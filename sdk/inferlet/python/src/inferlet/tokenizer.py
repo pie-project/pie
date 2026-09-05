@@ -26,9 +26,23 @@ def decode(tokens: list[int]) -> str:
     return _tokenizer.decode(tokens)
 
 
+def _split(tokens) -> tuple[list[int], list[bytes]]:
+    return [t.id for t in tokens], [bytes(t.bytes) for t in tokens]
+
+
 def vocabs() -> tuple[list[int], list[bytes]]:
     """Returns ``(token_ids, token_bytes)`` for the full vocabulary."""
-    return _tokenizer.vocabs()
+    return _split(_tokenizer.vocabs())
+
+
+def token_bytes(tokens: list[int]) -> list[bytes]:
+    """The byte sequence of each token id."""
+    return [bytes(b) for b in _tokenizer.token_bytes(list(tokens))]
+
+
+def tokens_with_prefix(prefix: bytes) -> list[int]:
+    """Every token id whose bytes start with ``prefix``."""
+    return list(_tokenizer.tokens_with_prefix(bytes(prefix)))
 
 
 def split_regex() -> str:
@@ -38,4 +52,4 @@ def split_regex() -> str:
 
 def special_tokens() -> tuple[list[int], list[bytes]]:
     """Returns ``(token_ids, token_bytes)`` for special tokens."""
-    return _tokenizer.special_tokens()
+    return _split(_tokenizer.special_tokens())

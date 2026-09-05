@@ -16,8 +16,7 @@ dependencies = [
     "httpx>=0.27.0",
     "esprima>=4.0.1",
     "rich>=13.0.0",
-    "factored-componentize-py>=0.20.7",
-    "inferlet>=0.3.0,<0.4.0",
+    "componentize-py>=0.25",
 ]
 
 [project.scripts]

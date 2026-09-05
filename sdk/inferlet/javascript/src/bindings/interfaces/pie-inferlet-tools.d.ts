@@ -8,10 +8,6 @@ export function equip(tools: Array<string>): Uint32Array;
  */
 export function answer(name: string, value: string): Uint32Array;
 /**
- * Create a decoder to detect tool calls in generated tokens
- */
-export function createDecoder(): Decoder;
-/**
  * Returns the grammar that constrains well-formed tool-call output for
  * this model and toolset, or none if the model has no enforceable format.
  */
@@ -23,6 +19,13 @@ export function createMatcher(tools: Array<string>): Matcher;
 export type Grammar = import('./pie-inferlet-grammar.js').Grammar;
 export type Matcher = import('./pie-inferlet-grammar.js').Matcher;
 export type Error = import('./pie-inferlet-types.js').Error;
+/**
+ * A complete tool call parsed out of the model's output.
+ */
+export interface ToolCall {
+  name: string,
+  argumentsJson: string,
+}
 export type Event = EventStart | EventCall;
 /**
  * Tool call detected
@@ -31,18 +34,15 @@ export interface EventStart {
   tag: 'start',
 }
 /**
- * Complete tool call: (name, arguments-json)
+ * Complete tool call
  */
 export interface EventCall {
   tag: 'call',
-  val: [string, string],
+  val: ToolCall,
 }
 
 export class Decoder {
-  /**
-   * This type does not have a public constructor.
-   */
-  private constructor();
+  constructor()
   feed(tokens: Uint32Array): Event;
   reset(): void;
 }
