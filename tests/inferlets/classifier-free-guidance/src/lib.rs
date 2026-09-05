@@ -27,7 +27,7 @@
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::chat;
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;
@@ -75,6 +75,22 @@ fn guided_pick(uncond_logits: &Tensor, gamma: f32) -> (Tensor, Tensor, Tensor) {
     )
 }
 
+/// One recurrent working set PER SEQUENCE on a hybrid model (the engine
+/// requires one per request row, and guidance runs two rows: the conditional
+/// stream and the unconditional one); none on a pure-attention model, where an
+/// empty binding IS the attention pass. Guidance never buffers: every fire
+/// folds straight into the recurrence, so the fold boundary is the fire's own
+/// extent.
+fn rs_for_sequence() -> Result<Vec<RsWorkingSet>> {
+    match model::pass_kind() {
+        model::ForwardKind::Attention => Ok(Vec::new()),
+        model::ForwardKind::Hybrid => Ok(vec![RsWorkingSet::new()]),
+        model::ForwardKind::Recurrent => Err(
+            "classifier-free guidance has no recurrent-only path: it reads two KV streams".into(),
+        ),
+    }
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     if !input.guidance.is_finite() || input.guidance < 0.0 {
@@ -112,6 +128,7 @@ async fn main(input: Input) -> Result<String> {
 
     // ---- unconditional stream -------------------------------------------
     let uncond_ws = WorkingSet::new();
+    let uncond_rs: Vec<RsWorkingSet> = rs_for_sequence()?;
     uncond_ws
         .reserve(uncond_pages)
         .context("reserve unconditional KV")?;
@@ -133,17 +150,24 @@ async fn main(input: Input) -> Result<String> {
     let uncond_prefill = ForwardPass::new();
     uncond_prefill.embed(&u_prompt_ch, &u_pre_indptr)?;
     uncond_prefill.attention(
-        &uncond_ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &u_pre_klen,
-            pages: &u_pre_pages,
-            page_indptr: &u_pre_page_indptr,
-            w_slot: &u_pre_slot,
-            w_off: &u_pre_off,
-            positions: &u_pre_pos,
-            mask: None,
+        Some(KvBinding {
+            working_set: &uncond_ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &u_pre_klen,
+                pages: &u_pre_pages,
+                page_indptr: &u_pre_page_indptr,
+                w_slot: &u_pre_slot,
+                w_off: &u_pre_off,
+                positions: &u_pre_pos,
+                mask: None,
+            },
+        }),
+        &uncond_rs,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     uncond_prefill.epilogue(move || {
@@ -159,6 +183,7 @@ async fn main(input: Input) -> Result<String> {
 
     // ---- conditional stream ---------------------------------------------
     let cond_ws = WorkingSet::new();
+    let cond_rs: Vec<RsWorkingSet> = rs_for_sequence()?;
     cond_ws
         .reserve(cond_pages)
         .context("reserve conditional KV")?;
@@ -183,17 +208,24 @@ async fn main(input: Input) -> Result<String> {
     let cond_prefill = ForwardPass::new();
     cond_prefill.embed(&c_prompt_ch, &c_pre_indptr)?;
     cond_prefill.attention(
-        &cond_ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &c_pre_klen,
-            pages: &c_pre_pages,
-            page_indptr: &c_pre_page_indptr,
-            w_slot: &c_pre_slot,
-            w_off: &c_pre_off,
-            positions: &c_pre_pos,
-            mask: None,
+        Some(KvBinding {
+            working_set: &cond_ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &c_pre_klen,
+                pages: &c_pre_pages,
+                page_indptr: &c_pre_page_indptr,
+                w_slot: &c_pre_slot,
+                w_off: &c_pre_off,
+                positions: &c_pre_pos,
+                mask: None,
+            },
+        }),
+        &cond_rs,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     cond_prefill.epilogue(move || {
@@ -236,17 +268,24 @@ async fn main(input: Input) -> Result<String> {
     let uncond_decode = ForwardPass::new();
     uncond_decode.embed(&u_token, &u_embed_indptr)?;
     uncond_decode.attention(
-        &uncond_ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: (nu / kv_page_size())..,
-            kv_len: &u_klen,
-            pages: &u_pages,
-            page_indptr: &u_page_indptr,
-            w_slot: &u_slot,
-            w_off: &u_off,
-            positions: &u_pos,
-            mask: None,
+        Some(KvBinding {
+            working_set: &uncond_ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: (nu / kv_page_size())..,
+                kv_len: &u_klen,
+                pages: &u_pages,
+                page_indptr: &u_page_indptr,
+                w_slot: &u_slot,
+                w_off: &u_off,
+                positions: &u_pos,
+                mask: None,
+            },
+        }),
+        &uncond_rs,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     uncond_decode.epilogue(move || {
@@ -284,17 +323,24 @@ async fn main(input: Input) -> Result<String> {
     let cond_decode = ForwardPass::new();
     cond_decode.embed(&c_token, &c_embed_indptr)?;
     cond_decode.attention(
-        &cond_ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: (nc / kv_page_size())..,
-            kv_len: &c_klen,
-            pages: &c_pages,
-            page_indptr: &c_page_indptr,
-            w_slot: &c_slot,
-            w_off: &c_off,
-            positions: &c_pos,
-            mask: None,
+        Some(KvBinding {
+            working_set: &cond_ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: (nc / kv_page_size())..,
+                kv_len: &c_klen,
+                pages: &c_pages,
+                page_indptr: &c_page_indptr,
+                w_slot: &c_slot,
+                w_off: &c_off,
+                positions: &c_pos,
+                mask: None,
+            },
+        }),
+        &cond_rs,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     cond_decode.epilogue(move || {

@@ -282,7 +282,8 @@ async fn main(input: Input) -> Result<Output> {
     }
     if model::pass_kind() == model::ForwardKind::Attention {
         return Err("this model folds no recurrent state; use mtp-speculative-decoding or \
-                    cacheback-speculative-decoding, which bind no rs-working-set"
+                    cacheback-speculative-decoding, which rebuild the sequence per window \
+                    instead of folding drafts"
             .into());
     }
     let mtp = input.draft == "mtp";

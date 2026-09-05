@@ -3,9 +3,14 @@
 //! The prompt is prefilled once with normal causal attention. During decoding,
 //! each query can attend only to the most recent `window_size` positions. The
 //! example masks old KV cells but does not evict their backing pages.
+//!
+//! On a hybrid model (attention layers + recurrent layers in one forward) the
+//! device mask is what `kv-geometry.mask` on `forward-hybrid` means: it applies
+//! to the ATTENTION layers only. The recurrent layers fold every token, and
+//! nothing here tries to emulate a window for them.
 
 use inferlet::chat;
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -32,6 +37,20 @@ fn default_window_size() -> u32 {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
+    // One recurrent working set for this one sequence on a hybrid model (the
+    // engine requires one per request row); none on a pure-attention one, and
+    // an empty binding IS the attention pass.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "sliding-window-attention needs attention layers to mask; a recurrent-only model has none"
+                    .into(),
+            );
+        }
+    };
+
     if input.max_tokens == 0 {
         return Ok(String::new());
     }
@@ -78,18 +97,26 @@ async fn main(input: Input) -> Result<String> {
 
     let prefill = ForwardPass::new();
     prefill.embed(&prompt_tokens, &prefill_embed_indptr)?;
+    // Never buffered: every fire folds straight into the recurrence.
     prefill.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &prefill_klen,
-            pages: &prefill_pages,
-            page_indptr: &prefill_indptr,
-            w_slot: &prefill_slots,
-            w_off: &prefill_offsets,
-            positions: &prefill_positions,
-            mask: Some(&causal),
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &prefill_klen,
+                pages: &prefill_pages,
+                page_indptr: &prefill_indptr,
+                w_slot: &prefill_slots,
+                w_off: &prefill_offsets,
+                positions: &prefill_positions,
+                mask: Some(&causal),
+            },
+        }),
+        &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     prefill.epilogue(move || {
@@ -141,17 +168,24 @@ async fn main(input: Input) -> Result<String> {
     let decode = ForwardPass::new();
     decode.embed(&token_in, &decode_embed_indptr)?;
     decode.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &klen,
-            pages: &pages,
-            page_indptr: &page_indptr,
-            w_slot: &write_slot,
-            w_off: &write_offset,
-            positions: &position,
-            mask: Some(&mask),
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &write_slot,
+                w_off: &write_offset,
+                positions: &position,
+                mask: Some(&mask),
+            },
+        }),
+        &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     decode.epilogue(move || {

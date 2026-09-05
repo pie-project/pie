@@ -10,8 +10,17 @@
 //! pass without the AttnMask binding, so the A/B differs ONLY in
 //! the mask binding plus the mask-evolution epilogue ops (iota/le/put) —
 //! the attention-path swap is the measured object.
+//!
+//! Runs on both forward-pass kinds through the one hybrid interface: the
+//! recurrent working set is a VALUE (empty on an attention model, one per
+//! sequence on a hybrid one), so the body is written once. On a hybrid model
+//! the bound mask applies to the ATTENTION layers only — that is what
+//! `kv-geometry.mask` means on `forward-hybrid`, and it is exactly the object
+//! this instrument measures. The recurrent layers of a hybrid model fold
+//! every token unconditionally; the instrument does not try to emulate a mask
+//! for them.
 
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
@@ -102,15 +111,11 @@ async fn main(input: Input) -> Result<Output> {
     let mut lg: Vec<f32> = Vec::new();
     if !matches!(
         mask_mode.as_str(),
-        "none" | "dense" | "structured" | "dense-prefill" | "dense-prefill-hole"
-            | "doc-isolation"
+        "none" | "dense" | "structured" | "dense-prefill" | "dense-prefill-hole" | "doc-isolation"
     ) {
         return Err(format!("unknown mask_mode: {mask_mode}"));
     }
-    let masked = matches!(
-        mask_mode.as_str(),
-        "dense" | "structured" | "doc-isolation"
-    );
+    let masked = matches!(mask_mode.as_str(), "dense" | "structured" | "doc-isolation");
 
     let structured = mask_mode == "structured";
     let masked_prefill = matches!(mask_mode.as_str(), "dense-prefill" | "dense-prefill-hole");
@@ -119,6 +124,18 @@ async fn main(input: Input) -> Result<Output> {
     // composed batch is forced through the wire-mask ASSEMBLY branch.
     let holed = mask_mode == "dense-prefill-hole";
     let ws = WorkingSet::new();
+    // One recurrent working set for this one sequence on a hybrid model (the
+    // engine requires one per request row); none on a pure-attention one.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "this program has no recurrent-only path (it measures the attention mask path)"
+                    .into(),
+            );
+        }
+    };
     let page_size = kv_page_size();
 
     if max_tokens == 0 {
@@ -140,7 +157,11 @@ async fn main(input: Input) -> Result<Output> {
     // isolation — the prompt's first half is a "retrieved document" the
     // decode queries must NOT attend to; the second half plus everything
     // generated stays visible.
-    let doc_start: u32 = if mask_mode == "doc-isolation" { n / 2 } else { 0 };
+    let doc_start: u32 = if mask_mode == "doc-isolation" {
+        n / 2
+    } else {
+        0
+    };
     let pool_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
     let pool_len = pool_pages * page_size;
     let slots = ws
@@ -183,9 +204,7 @@ async fn main(input: Input) -> Result<Output> {
         // the dense-mask compose admits into shared batches.
         let mask_p = masked_prefill.then(|| {
             let rows: Vec<bool> = (base..end)
-                .flat_map(|p| {
-                    (0..pool_len).map(move |j| j <= p && !(holed && j == 1 && p >= 2))
-                })
+                .flat_map(|p| (0..pool_len).map(move |j| j <= p && !(holed && j == 1 && p >= 2)))
                 .collect();
             Channel::from_shaped([len, pool_len], rows).named("mask_p")
         });
@@ -196,17 +215,24 @@ async fn main(input: Input) -> Result<Output> {
         }
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &kv_len_p,
-                pages: &pages_p,
-                page_indptr: &page_indptr_p,
-                w_slot: &w_slot_p,
-                w_off: &w_off_p,
-                positions: &positions_p,
-                mask: mask_p.as_ref(),
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &kv_len_p,
+                    pages: &pages_p,
+                    page_indptr: &page_indptr_p,
+                    w_slot: &w_slot_p,
+                    w_off: &w_off_p,
+                    positions: &positions_p,
+                    mask: mask_p.as_ref(),
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
             },
         )?;
         fwd_p.epilogue(move || {
@@ -240,8 +266,7 @@ async fn main(input: Input) -> Result<Output> {
         let w_off = Channel::from(vec![n % page_size; 1]).named("w_off");
         // Causal row for the fire-0 query at position n: attend all j <= n
         // (doc-isolation additionally blocks j < doc_start).
-        let seed_mask: Vec<bool> =
-            (0..pool_len).map(|j| j >= doc_start && j <= n).collect();
+        let seed_mask: Vec<bool> = (0..pool_len).map(|j| j >= doc_start && j <= n).collect();
         let mask = Channel::from_shaped([1, pool_len], seed_mask).named("mask");
         let doc_row = Channel::from_shaped(
             [pool_len],
@@ -252,9 +277,7 @@ async fn main(input: Input) -> Result<Output> {
         let page_indptr =
             Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
         let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
-        let lg_out = Channel::new([1], dtype::f32)
-            .capacity(8)
-            .named("lg_out");
+        let lg_out = Channel::new([1], dtype::f32).capacity(8).named("lg_out");
         let tok_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("tok_out");
@@ -267,17 +290,24 @@ async fn main(input: Input) -> Result<Output> {
         }
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / page_size)..,
-                kv_len: &klen,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &pos,
-                mask: if masked { Some(&mask) } else { None },
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: (n / page_size)..,
+                    kv_len: &klen,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &pos,
+                    mask: if masked { Some(&mask) } else { None },
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
             },
         )?;
         fwd.epilogue(move || {

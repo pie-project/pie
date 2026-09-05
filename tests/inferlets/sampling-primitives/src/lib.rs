@@ -14,7 +14,7 @@
 //! (interp.rs `Predicate::CummassLe`) without depending on float summation
 //! order.
 
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use serde::Deserialize;
 
 const TOP_P: f32 = 0.9;
@@ -35,6 +35,19 @@ fn argmax(values: &[f32]) -> usize {
 async fn main(_input: Input) -> Result<String> {
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
+    // One recurrent working set for this one sequence on a hybrid model (the
+    // engine requires one per request row); none on a pure-attention one.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "this program has no recurrent-only path (it measures the sampling epilogue of a \
+                 KV-paged fire)"
+                    .into(),
+            );
+        }
+    };
     let page_size = kv_page_size();
 
     let mut prompt = model::encode("The capital of France is");
@@ -63,17 +76,24 @@ async fn main(_input: Input) -> Result<String> {
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;
     fwd.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &kv_len,
-            pages: &pages,
-            page_indptr: &page_indptr,
-            w_slot: &w_slot,
-            w_off: &w_off,
-            positions: &positions,
-            mask: None,
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
+        }),
+        &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     fwd.epilogue(move || {
