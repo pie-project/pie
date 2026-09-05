@@ -3,7 +3,7 @@ use model_dsl::{
     Request, Value, Weight, ops, seam,
 };
 
-use super::model::{Attn, DFlash, DRAFT_DEPTH, Gdn, Head, Mixer, Mlp, Model, Tower};
+use super::model::{Attn, DFlash, DRAFT_DEPTH, DynConv, Gdn, Head, Mixer, Mlp, Model, Tower};
 
 /// The trunk's mrope section split; both qwen SKUs share `[11, 11, 10]`,
 /// summing to half `rotary_dim`.
@@ -509,6 +509,9 @@ fn dflash_arm(
         let hd = a.head_dim;
         let plan = ops::attn::plan_prefill(&input_block, a.q_heads, a.kv_heads, hd, None);
         let x = ops::elemwise::rmsnorm_plus_one(&h, &b.mixer_norm, b.mixer_norm_eps);
+        // DFlash2: the dynamic convolution's two sides, both from this one
+        // input (`DynConv`); a v1 head has none and `x` passes through.
+        let (x, attn_coeff) = conv_prepare(&x, b.attn_conv.as_ref());
         let q = ops::linear::matmul(&x, &a.q_proj);
         let k = ops::linear::matmul(&x, &a.k_proj);
         let v = ops::linear::matmul(&x, &a.v_proj);
@@ -558,9 +561,11 @@ fn dflash_arm(
                 a.sm_scale,
             ),
         };
-        h = ops::elemwise::residual_add(&ops::linear::matmul(&o, &a.o_proj), &h);
+        let o = conv_finish(&ops::linear::matmul(&o, &a.o_proj), b.attn_conv.as_ref(), attn_coeff.as_ref());
+        h = ops::elemwise::residual_add(&o, &h);
 
         let x = ops::elemwise::rmsnorm_plus_one(&h, &b.mlp_norm, b.mlp_norm_eps);
+        let (x, mlp_coeff) = conv_prepare(&x, b.mlp_conv.as_ref());
         let Mlp::Dense {
             gate_up,
             down,
@@ -573,9 +578,33 @@ fn dflash_arm(
             &ops::linear::mlp_swiglu(&ops::linear::matmul(&x, gate_up), *inter),
             down,
         );
+        let f = conv_finish(&f, b.mlp_conv.as_ref(), mlp_coeff.as_ref());
         h = ops::elemwise::residual_add(&f, &h);
     }
     ops::elemwise::rmsnorm_plus_one(&h, &d.norm, d.norm_eps)
+}
+
+/// The input side of a [`DynConv`]: project the coefficients off the normed
+/// input and convolve it with side 0; the coefficients come back for the
+/// output side. A block without one passes `x` through.
+fn conv_prepare(x: &Value, conv: Option<&DynConv>) -> (Value, Option<Value>) {
+    match conv {
+        Some(c) => {
+            let coeff = ops::linear::matmul(x, &c.proj);
+            let x = ops::attn::block_dyn_conv(x, &coeff, &c.base, 0, c.taps, c.group);
+            (x, Some(coeff))
+        }
+        None => (x.clone(), None),
+    }
+}
+
+/// The output side of a [`DynConv`], with the coefficients its input side
+/// projected.
+fn conv_finish(y: &Value, conv: Option<&DynConv>, coeff: Option<&Value>) -> Value {
+    match (conv, coeff) {
+        (Some(c), Some(coeff)) => ops::attn::block_dyn_conv(y, coeff, &c.base, 1, c.taps, c.group),
+        _ => y.clone(),
+    }
 }
 
 fn rotate(

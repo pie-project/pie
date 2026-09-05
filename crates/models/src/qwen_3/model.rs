@@ -156,8 +156,38 @@ pub struct DFlashBlock {
     pub mlp_norm_eps: f32,
     pub mlp: Mlp,
     /// Keys older than this many positions are not attended; `None` on the
-    /// one full-attention layer the shipped head ends with.
+    /// one full-attention layer the shipped v1 head ends with (v2 has none).
     pub window: Option<u32>,
+    /// DFlash2's dynamic convolution around the attention sublayer; `None`
+    /// on a v1 head.
+    pub attn_conv: Option<DynConv>,
+    /// The same around the MLP sublayer.
+    pub mlp_conv: Option<DynConv>,
+}
+
+/// **DFlash2's two-tap grouped dynamic convolution** around one sublayer
+/// (`attention_conv` / `mlp_conv`). One projection of the sublayer's normed
+/// input yields the coefficients for BOTH sides — the input convolved before
+/// the sublayer and its output convolved after — as a learned per-channel
+/// base plus a per-group correction:
+///
+/// ```text
+/// coeff  = proj(x)                        [rows, 2·taps·groups], (side, tap, group)
+/// x'     = Σ_t (base[0, t] + δ[i, 0, t, g]) ⊙ x[i − t]      before the sublayer
+/// y'     = Σ_t (base[1, t] + δ[i, 1, t, g]) ⊙ y[i − t]      after it
+/// ```
+///
+/// along the block axis, `x[−1] = 0`. It runs `attention.block_dyn_conv`
+/// twice a sublayer; the reference is `DFlashGroupedConv` in `mlx_dspark`.
+pub struct DynConv {
+    /// `[2·taps, hidden]`, row `side·taps + tap`: the stored
+    /// `base_kernel [2, taps, hidden]` read flat.
+    pub base: Weight,
+    /// `[2·taps·groups, hidden]`: `kernel_projection.weight`.
+    pub proj: Weight,
+    pub taps: u32,
+    /// Channels sharing one correction.
+    pub group: u32,
 }
 
 /// A [`DFlash`] layer's attention site. [`Attn`]'s twin without the q-gate
@@ -211,6 +241,12 @@ pub enum Recipe {
     /// pass proposes [`DFlash::block`] tokens. Declared as [`DFlash`], not
     /// [`Mtp`] — it shares neither the fusion shape nor the attention shape.
     DFlash,
+    /// DFlash2 (`z-lab/Qwen3.8-27B-DFlash2`): the same fusion and the same
+    /// five blocks, at a block of eight, every layer sliding and causal
+    /// inside the block, with a two-tap dynamic convolution around each
+    /// sublayer ([`DynConv`]). The candidate selector the head also ships is
+    /// not declared yet — the readout is the per-slot argmax, as v1's.
+    DFlash2,
 }
 
 impl Recipe {
@@ -219,8 +255,15 @@ impl Recipe {
     pub fn prefix(self) -> &'static str {
         match self {
             Recipe::Mtp => "mtp",
-            Recipe::Eagle | Recipe::DFlash => "aux",
+            Recipe::Eagle | Recipe::DFlash | Recipe::DFlash2 => "aux",
         }
+    }
+
+    /// Whether this recipe is a block drafter ([`DFlash`]) rather than a
+    /// chained head ([`Mtp`]).
+    #[must_use]
+    pub fn drafts_a_block(self) -> bool {
+        matches!(self, Recipe::DFlash | Recipe::DFlash2)
     }
 }
 
@@ -714,6 +757,13 @@ impl Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DFlash)))
     }
 
+    /// The 27B with the DFlash2 drafter overlaid by `--aux`
+    /// (`z-lab/Qwen3.8-27B-DFlash2`): the same trunk, [`Recipe::DFlash2`]'s
+    /// head. The Qwen3.8-27B trunk reads with `d27b`'s dims.
+    pub fn d27b_dflash2(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DFlash2)))
+    }
+
     /// Same 64 layers without the draft head. Used for 4-bit conversions:
     /// `mlx_lm` implements no MTP arm for this family, so those artifacts
     /// carry none of the `mtp.*` planes.
@@ -977,7 +1027,7 @@ impl Model {
         // kv row stays `kv.mtp` under either recipe — a fact about this
         // plan's page-id space, not about which checkpoint the bytes came
         // from.
-        let mtp = d.draft.filter(|r| !matches!(r, Recipe::DFlash)).map(|recipe| {
+        let mtp = d.draft.filter(|r| !r.drafts_a_block()).map(|recipe| {
             let inter = match &d.mlp {
                 MlpDims::Dense { inter } => *inter,
                 MlpDims::Routed(m) => m.inter,
@@ -1010,9 +1060,31 @@ impl Model {
         // The block drafter's geometry is its OWN (see `DFlash`), so nothing
         // here is read off `Dims` but the trunk's hidden width and the
         // element types.
-        let dflash = d.draft.filter(|r| matches!(r, Recipe::DFlash)).map(|recipe| {
+        let dflash = d.draft.filter(|r| r.drafts_a_block()).map(|recipe| {
             let p = recipe.prefix();
             let n = |s: &str| format!("{p}.{s}");
+            // v1 and v2 differ in the taps, the block, the window rule and
+            // the convolution; everything else below is one text.
+            let v2 = matches!(recipe, Recipe::DFlash2);
+            let taps: &[u32] = if v2 { &DFLASH2_TAPS } else { &DFLASH_TAPS };
+            let groups = u64::from(hidden) / u64::from(DFLASH2_CONV_GROUP);
+            let conv = |l: u32, which: &str| {
+                v2.then(|| DynConv {
+                    base: Weight::sym(
+                        format!("{p}.layers.{l}.{which}.base_kernel"),
+                        [2 * u64::from(DFLASH2_CONV_TAPS), hidden],
+                        dense,
+                    ),
+                    proj: Weight::sym(
+                        format!("{p}.layers.{l}.{which}.kernel_projection"),
+                        [2 * u64::from(DFLASH2_CONV_TAPS) * groups, hidden],
+                        w,
+                    )
+                    .columns(),
+                    taps: DFLASH2_CONV_TAPS,
+                    group: DFLASH2_CONV_GROUP,
+                })
+            };
             // **THE DRAFTER IS QUANTIZED LIKE THE TRUNK, AND IT COSTS
             // NOTHING TO BE.** The shipped head is bf16 and only 1.75 G
             // parameters against the trunk's 27, so carrying it unquantized is
@@ -1028,10 +1100,10 @@ impl Model {
             let hd = dhd as u64;
             let inter = DFLASH_INTER / tp;
             DFlash {
-                taps: DFLASH_TAPS.to_vec(),
+                taps: taps.to_vec(),
                 // One column slice of the stored `[hidden, 5·hidden]` bank
                 // per tap; replicated, since a trunk hidden state is.
-                fc: (0..DFLASH_TAPS.len())
+                fc: (0..taps.len())
                     .map(|i| Weight::sym(n(&format!("fc_tap{i}")), [hidden, hidden], w))
                     .collect(),
                 hidden_norm: Weight::sym(n("hidden_norm"), [hidden], dense),
@@ -1062,15 +1134,18 @@ impl Model {
                             mlp_norm: Weight::sym(b("mlp_norm"), [hidden], dense),
                             mlp_norm_eps: d.norm_eps,
                             mlp: dense_mlp(w, hidden, inter, &format!("{p}.layers.{l}")),
-                            // The shipped head is four sliding layers then
-                            // one full; `layer_types` in its config.
-                            window: (l + 1 < DFLASH_LAYERS).then_some(DFLASH_WINDOW),
+                            // The v1 head is four sliding layers then one
+                            // full; v2 is five sliding (`layer_types` in the
+                            // two configs).
+                            window: (v2 || l + 1 < DFLASH_LAYERS).then_some(DFLASH_WINDOW),
+                            attn_conv: conv(l, "attention_conv"),
+                            mlp_conv: conv(l, "mlp_conv"),
                         }
                     })
                     .collect(),
                 norm: Weight::sym(n("norm"), [hidden], dense),
                 norm_eps: d.norm_eps,
-                block: DFLASH_BLOCK,
+                block: if v2 { DFLASH2_BLOCK } else { DFLASH_BLOCK },
                 mask_token: DFLASH_MASK_TOKEN,
             }
         });
@@ -1119,6 +1194,15 @@ pub const DFLASH_BLOCK: u32 = 16;
 /// seeding a draft block needs both; they belong on the load's own
 /// advertisement (beside `mtp_depth`) once there is a guest asking.
 pub const DFLASH_MASK_TOKEN: u32 = 248_070;
+
+/// **The DFlash2 head's own numbers** (`z-lab/Qwen3.8-27B-DFlash2`'s
+/// `config.json`); heads, widths, window, theta and the mask token are v1's.
+const DFLASH2_TAPS: [u32; 5] = [5, 19, 33, 47, 61];
+pub const DFLASH2_BLOCK: u32 = 8;
+/// `dflash_config.conv_kernel_size`: taps of the dynamic convolution.
+const DFLASH2_CONV_TAPS: u32 = 2;
+/// `dflash_config.conv_group_size`: channels sharing one correction.
+const DFLASH2_CONV_GROUP: u32 = 16;
 
 /// Adapter ceiling for every SKU of this family. Not a checkpoint fact (no
 /// pretrained artifact states it) — a deployment setting baked in at trace

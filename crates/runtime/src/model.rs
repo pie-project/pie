@@ -282,6 +282,13 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
+    // The same trunk with the DFlash2 block drafter overlaid by `--aux`.
+    Row {
+        id: "qwen38-27b-dflash2-u4g64-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
     Row {
         id: "qwen38-27b-mtp-u4g64-kv-bf16",
         layers: 64,

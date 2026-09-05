@@ -386,6 +386,16 @@ impl Model {
                 b.read_expr(&a.q_norm, norm(n("self_attn.q_norm.weight")))?;
                 b.read_expr(&a.k_norm, norm(n("self_attn.k_norm.weight")))?;
                 b.read_expr(&block.mlp_norm, norm(n("post_attention_layernorm.weight")))?;
+                // DFlash2's dynamic convolutions: the stored `[2, taps,
+                // hidden]` base read flat as `[2·taps, hidden]`, and the
+                // coefficient projection as any other bank.
+                for (conv, which) in [(&block.attn_conv, "attention_conv"), (&block.mlp_conv, "mlp_conv")] {
+                    if let Some(c) = conv {
+                        let want: Vec<i64> = extents(&c.base);
+                        b.read_expr(&c.base, flattened(src, n(&format!("{which}.base_kernel")), want)?)?;
+                        b.read(&c.proj, n(&format!("{which}.kernel_projection.weight")))?;
+                    }
+                }
                 match &block.mlp {
                     Mlp::Dense { gate_up, down, .. } => {
                         b.read_concat(

@@ -145,3 +145,26 @@ fn the_block_drafters_plan_is_whole() {
         );
     }
 }
+
+/// **THE DFLASH2 TEXT TRACES, AND CONVOLVES.** The v2 row builds the same
+/// two-armed plan with the dynamic convolution around every sublayer of the
+/// drafter — four `attention.block_dyn_conv` nodes a block, twenty in all —
+/// and no masked read: every v2 layer is sliding and causal inside the block.
+#[test]
+fn the_dflash2_plan_is_whole_and_convolves() {
+    use model_dsl::Platform;
+    let row = models::skus()
+        .find(|row| row.recipe.text == "qwen38-27b-dflash2")
+        .expect("this build ships the DFlash2 row");
+    for platform in [Platform::Metal, Platform::Cuda] {
+        let trace = (row.trace)(platform);
+        let convs = trace
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op, model_dsl::Operation::Attention(model_dsl::Attention::BlockDynConv { .. })))
+            .count();
+        assert_eq!(convs, 20, "{platform:?}: five blocks x two sublayers x two sides");
+        let seams: Vec<&str> = trace.seams.iter().map(|s| s.seam.as_str()).collect();
+        assert!(seams.iter().any(|s| s.contains("mtp")), "{platform:?}: no draft seam; {seams:?}");
+    }
+}
