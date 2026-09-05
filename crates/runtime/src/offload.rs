@@ -286,6 +286,7 @@ pub fn register_remote_store(
         num_kv_pages,
         0,
         0,
+        0,
     )
 }
 

@@ -3,9 +3,15 @@
 //! The prompt is prefilled once with normal causal attention. During decoding,
 //! each query attends to the first `sink_size` positions and the most recent
 //! `window_size` positions. Masked KV pages remain allocated in this example.
+//!
+//! Runs on both pass kinds. On a hybrid model the sink/window mask is a mask
+//! over the ATTENTION layers only — that is what `kv-geometry.mask` means on
+//! `pie:inferlet/forward-hybrid`, and the recurrent layers fold every token as
+//! usual. There is nothing to emulate there: a recurrence has no key it can
+//! decline to read.
 
 use inferlet::chat;
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use serde::Deserialize;
 
 
@@ -72,6 +78,19 @@ async fn main(input: Input) -> Result<String> {
     let pool_len = pool_pages * page_t;
 
     let ws = WorkingSet::new();
+    // One recurrent working set for this one sequence on a hybrid model (the
+    // engine requires one per request row); none on a pure-attention one. It
+    // is bound by EVERY pass of the sequence — prefill and decode alike.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "this program has no recurrent-only path (an attention sink needs attention)"
+                    .into(),
+            );
+        }
+    };
     let slots = ws
         .reserve(pool_pages)
         .context("reserve attention-sink KV")?;
@@ -101,17 +120,24 @@ async fn main(input: Input) -> Result<String> {
     let prefill = ForwardPass::new();
     prefill.embed(&prompt_tokens, &prefill_embed_indptr)?;
     prefill.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &prefill_klen,
-            pages: &prefill_pages,
-            page_indptr: &prefill_indptr,
-            w_slot: &prefill_slots,
-            w_off: &prefill_offsets,
-            positions: &prefill_positions,
-            mask: Some(&causal),
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &prefill_klen,
+                pages: &prefill_pages,
+                page_indptr: &prefill_indptr,
+                w_slot: &prefill_slots,
+                w_off: &prefill_offsets,
+                positions: &prefill_positions,
+                mask: Some(&causal),
+            },
+        }),
+        &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     prefill.epilogue(move || {
@@ -159,17 +185,24 @@ async fn main(input: Input) -> Result<String> {
     let decode_indptr = Channel::from([0u32, 1]).named("decode_indptr");
     decode.embed(&token_in, &decode_indptr)?;
     decode.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &klen,
-            pages: &pages,
-            page_indptr: &page_indptr,
-            w_slot: &write_slot,
-            w_off: &write_offset,
-            positions: &position,
-            mask: Some(&mask),
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &write_slot,
+                w_off: &write_offset,
+                positions: &position,
+                mask: Some(&mask),
+            },
+        }),
+        &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     decode.epilogue(move || {

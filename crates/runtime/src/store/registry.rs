@@ -53,6 +53,14 @@ pub struct Stores {
     pub seats: Arc<Mutex<SeatBook>>,
     /// Tokens per KV page for this model/engine.
     pub kv_page_size: u32,
+    /// The most KV pages one sequence may hold — `max_context` rounded up
+    /// to whole pages. Zero states no ceiling.
+    pub context_pages: u64,
+}
+
+/// `max_context` tokens as whole KV pages; zero (no ceiling) stays zero.
+fn context_pages(max_context: usize, kv_page_size: u32) -> u64 {
+    (max_context as u64).div_ceil(u64::from(kv_page_size.max(1)))
 }
 
 static REGISTRY: LazyLock<boxcar::Vec<RwLock<Vec<Option<Stores>>>>> =
@@ -67,17 +75,22 @@ pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[us
         num_kv_pages,
         &vec![0; num_kv_pages.len()],
         num_slots,
+        &vec![0; num_kv_pages.len()],
     )
 }
 
 /// Register a model's per-engine stores at bootstrap. Capacities come from the engine-preallocated static pools. Returns the assigned model index.
 ///
 /// `num_slots` (the engine's `PoolFacts::state_slots`) sizes both the recurrent-state pool and the [`SeatBook`], since a sequence's recurrent bank row and its seat are the same seat.
+///
+/// `max_context` (the engine's `FireLimits::max_context`, in tokens) is the
+/// ceiling one sequence may grow to; zero states none.
 pub fn register_model_with_swap(
     kv_page_size: u32,
     num_kv_pages: &[usize],
     num_host_pages: &[usize],
     num_slots: &[usize],
+    max_context: &[usize],
 ) -> usize {
     let stores: Vec<Option<Stores>> = (0..num_kv_pages.len())
         .map(|d| {
@@ -87,11 +100,13 @@ pub fn register_model_with_swap(
                 rand::random::<[u8; 32]>(),
             )));
             let slots = num_slots.get(d).copied().unwrap_or(0) as u32;
+            let max_context = max_context.get(d).copied().unwrap_or(0);
             Some(Stores {
                 kv,
                 rs: Arc::new(Mutex::new(RsStore::new(slots))),
                 seats: Arc::new(Mutex::new(SeatBook::new(slots))),
                 kv_page_size,
+                context_pages: context_pages(max_context, kv_page_size),
             })
         })
         .collect();
@@ -106,6 +121,7 @@ pub fn register_engine_with_swap(
     num_kv_pages: usize,
     num_host_pages: usize,
     num_slots: usize,
+    max_context: usize,
 ) -> anyhow::Result<()> {
     let model = REGISTRY
         .get(model_idx)
@@ -136,6 +152,7 @@ pub fn register_engine_with_swap(
         rs: Arc::new(Mutex::new(RsStore::new(num_slots as u32))),
         seats: Arc::new(Mutex::new(SeatBook::new(num_slots as u32))),
         kv_page_size,
+        context_pages: context_pages(max_context, kv_page_size),
     });
     Ok(())
 }
@@ -187,18 +204,18 @@ mod tests {
     #[test]
     fn dynamic_store_slots_unregister_without_reusing_engine_ids() {
         let model = register_model(16, &[8], &[0]);
-        register_engine_with_swap(model, 1, 16, 10, 4, 0, 0).unwrap();
+        register_engine_with_swap(model, 1, 16, 10, 4, 0, 0, 0).unwrap();
         assert!(try_get(model, 1).is_some());
         unregister_engine(model, 1).unwrap();
         assert!(try_get(model, 1).is_none());
-        register_engine_with_swap(model, 2, 16, 20, 4, 0, 0).unwrap();
+        register_engine_with_swap(model, 2, 16, 20, 4, 0, 0, 0).unwrap();
         assert!(try_get(model, 2).is_some());
     }
 
     #[test]
     fn dynamic_store_slots_allow_global_engine_id_gaps() {
         let model = register_model(16, &[8], &[0]);
-        register_engine_with_swap(model, 4, 16, 40, 4, 0, 0).unwrap();
+        register_engine_with_swap(model, 4, 16, 40, 4, 0, 0, 0).unwrap();
         assert!(try_get(model, 1).is_none());
         assert!(try_get(model, 3).is_none());
         assert!(try_get(model, 4).is_some());

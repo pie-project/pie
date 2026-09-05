@@ -80,6 +80,11 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(crate::scheduler::channel_capacity() as u32)
     }
 
+    /// The run-ahead window in fires; see `scheduler::run_ahead_window`.
+    async fn run_ahead_window(&mut self) -> Result<u32> {
+        Ok(crate::scheduler::run_ahead_window() as u32)
+    }
+
     /// Max embed tokens in a single pass (C) — the guest-side prefill chunk
     /// budget, sourced from the bound engine's structural per-launch token
     /// capacity.

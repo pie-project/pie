@@ -1709,6 +1709,39 @@ impl Shell {
         Ok(())
     }
 
+    /// Copy whole recurrent slots between seats of this load's pools —
+    /// the device half of a recurrent fork — enqueued and not synchronized.
+    /// `moves` is `(src, dst)` seat pairs in this shell's own slot numbers.
+    ///
+    /// Everything [`Shell::copy_kv`] says about ordering holds here without
+    /// change: the blit goes into its own command buffer on the fire queue,
+    /// behind every step already committed (the fires that folded the source
+    /// seat) and ahead of every step committed after this returns (the first
+    /// fire that reads the destination). It takes no arm, and its receipt
+    /// lands in `grafted` so [`Shell::drain`] — which the fire path runs
+    /// before a host-side `Pools::clear`, and `state_bytes` runs before a
+    /// readback — waits for it.
+    ///
+    /// An attention-only plan has no banks and answers `Ok` with nothing on
+    /// the queue.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`] for a seat past the pool, [`Fault::Device`] when
+    /// the queue or the blit pass would not open, [`Fault::Deviceless`] off
+    /// Apple.
+    pub fn copy_state(&mut self, moves: &[(u32, u32)]) -> Result<()> {
+        if moves.is_empty() || !self.pools.has_state() {
+            return Ok(());
+        }
+        // As in `copy_kv`: a frame dropped before `commit_async` puts nothing
+        // on the device, so a plan the pools refuse leaves the queue as it was.
+        let mut frame = self.device.frame()?;
+        self.pools.copy_state(&mut frame, moves)?;
+        self.grafted = Some(frame.commit_async(None)?);
+        Ok(())
+    }
+
     /// How many kv tokens a slot holds.
     #[must_use]
     pub fn held(&self, slot: u32) -> u32 {

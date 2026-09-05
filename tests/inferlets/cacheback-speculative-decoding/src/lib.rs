@@ -3,8 +3,9 @@
 //! The drafter searches the committed token history for the longest matching
 //! suffix and reuses the tokens that followed its previous occurrence. One
 //! target-model forward verifies the whole draft and supplies a correction or
-//! bonus token. This reference implementation rebuilds the target KV for each
-//! verification window so rejected draft state can never leak into later steps.
+//! bonus token. This reference implementation rebuilds the target state for
+//! each verification window so rejected draft state can never leak into later
+//! steps.
 //!
 //! ## The correctness property, and how to test it
 //!
@@ -18,11 +19,27 @@
 //! one-row readout, and the loop degenerates to sequential greedy decoding —
 //! through the same prompt, the same stop tokens and the same `verify()`.
 //! Setting it to 0 versus 4 is therefore a controlled A/B in which the token
-//! sequence must come out **identical**. If the per-window KV rebuild ever
+//! sequence must come out **identical**. If the per-window rebuild ever
 //! stopped isolating rejected drafts, the two would diverge.
+//!
+//! ## Why this runs on a hybrid model
+//!
+//! A recurrence is a fold, not an addressed cell: once a rejected draft token
+//! has been folded into a persisted state there is nothing to discard
+//! (`rs-speculative-decoding` is the buffer-then-fold shape that avoids it).
+//! This program never persists anything. Every window fires into a working
+//! set built for that window alone — a KV working set on every model, and on
+//! a hybrid model a fresh `RsWorkingSet` beside it — and drops both on
+//! return. The rejected tail is folded into a state that dies with the call,
+//! and the next window refolds the committed prefix from scratch. Each fire
+//! folds only its own new tokens over an empty buffer, so no replay is
+//! involved and the logits at every readout row are the full backbone's
+//! (`forward-hybrid.wit`, `rs-geometry.fold-len`). It is the O(n)-per-window
+//! price the header above already admits to, and it buys the same isolation
+//! on both kinds of state.
 
 use inferlet::chat;
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -108,6 +125,24 @@ fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Ve
     Vec::new()
 }
 
+/// The recurrent working set for ONE verification window on a hybrid model
+/// (the engine requires one per request row); none on a pure-attention one,
+/// where an empty binding IS the attention pass. Fresh every window: the fold
+/// reaches the rejected tail too, and this is the state it is confined to.
+fn window_rs() -> Result<Vec<RsWorkingSet>> {
+    match model::pass_kind() {
+        model::ForwardKind::Attention => Ok(Vec::new()),
+        model::ForwardKind::Hybrid => Ok(vec![RsWorkingSet::new()]),
+        model::ForwardKind::Recurrent => Err(
+            "this program has no recurrent-only path (no registered model reports that kind)"
+                .into(),
+        ),
+    }
+}
+
+/// One verification window: the target's greedy pick at the last committed
+/// position and at every draft position, from state built for this window
+/// alone and dropped on return.
 async fn verify(committed: &[u32], draft: &[u32], page_size: u32) -> Result<Vec<u32>> {
     if committed.is_empty() {
         return Err("cannot verify from an empty committed sequence".into());
@@ -121,6 +156,7 @@ async fn verify(committed: &[u32], draft: &[u32], page_size: u32) -> Result<Vec<
     let readout = (readout_start..readout_start + rows).collect::<Vec<_>>();
 
     let ws = WorkingSet::new();
+    let rs_ws = window_rs()?;
     let max_pages = total.div_ceil(page_size);
     ws.reserve(max_pages).context("reserve verification KV")?;
     let tokens = Channel::from_iter(input.iter().map(|&token| token as i32));
@@ -138,17 +174,24 @@ async fn verify(committed: &[u32], draft: &[u32], page_size: u32) -> Result<Vec<
     fwd.embed(&tokens, &embed_indptr)?;
     fwd.readout(&readout)?;
     fwd.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &kv_len,
-            pages: &pages,
-            page_indptr: &page_indptr,
-            w_slot: &w_slot,
-            w_off: &w_off,
-            positions: &positions,
-            mask: None,
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
+        }),
+        &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     fwd.epilogue(move || {

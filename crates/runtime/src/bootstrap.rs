@@ -364,6 +364,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_rs_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_cache_slots).collect();
+    let arena_max_context: Vec<usize> =
+        engine_configs.iter().map(|d| d.limits.max_context).collect();
     // Whether engine 0 can physically move KV bytes to/from host swap —
     // arms the suspend rung.
     let kv_swap_capable = engine_configs
@@ -395,6 +397,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &arena_kv_pages,
         &arena_cpu_pages,
         &arena_rs_slots,
+        &arena_max_context,
     );
 
     // Residency planner: always installed. KV pool exhaustion is FCFS

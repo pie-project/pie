@@ -341,6 +341,7 @@ mod tests {
             max_forward_requests: 8,
             max_forward_tokens: 64,
             max_page_refs: 64,
+            max_context: 0,
         }
     }
 

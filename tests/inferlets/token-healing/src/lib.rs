@@ -35,7 +35,7 @@
 //! Faithfulness: **Exact**. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::eta::attention::prelude::*;
+use inferlet::eta::hybrid::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -96,6 +96,22 @@ async fn main(input: Input) -> Result<Output> {
 
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
+    // One recurrent working set for the whole generation on a hybrid model (the
+    // engine requires one per request row, and this program runs one row);
+    // none on a pure-attention one. The SAME set is passed to the prefill and
+    // to the decode, so the decode continues the prefill's fold rather than
+    // starting cold.
+    // Fold policy below: everything, every fire — healing never buffers.
+    let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => {
+            return Err(
+                "this program has no recurrent-only path (no registered model reports that kind)"
+                    .into(),
+            );
+        }
+    };
     let page_size = kv_page_size();
 
     let full = model::encode(&input.prompt);
@@ -172,17 +188,24 @@ async fn main(input: Input) -> Result<Output> {
     let prefill = ForwardPass::new();
     prefill.embed(&prompt_tokens, &prefill_indptr)?;
     prefill.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &prefill_kv_len,
-            pages: &prefill_pages,
-            page_indptr: &prefill_page_indptr,
-            w_slot: &prefill_w_slot,
-            w_off: &prefill_w_off,
-            positions: &prefill_positions,
-            mask: None,
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &prefill_kv_len,
+                pages: &prefill_pages,
+                page_indptr: &prefill_page_indptr,
+                w_slot: &prefill_w_slot,
+                w_off: &prefill_w_off,
+                positions: &prefill_positions,
+                mask: None,
+            },
+        }),
+        &rs_ws,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
         },
     )?;
     prefill.epilogue(move || {
@@ -213,17 +236,24 @@ async fn main(input: Input) -> Result<Output> {
         let decode = ForwardPass::new();
         decode.embed(&token_in, &embed_indptr)?;
         decode.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: (n / page_size)..,
-                kv_len: &kv_len,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &positions,
-                mask: None,
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: (n / page_size)..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
             },
         )?;
         decode.epilogue(move || {
@@ -253,9 +283,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // One more host query at the size of the question: the bytes of the one
     // token the model chose, to check the prompt survived the healing.
-    let healed_bytes = model::token_bytes(&[first])
-        .pop()
-        .unwrap_or_default();
+    let healed_bytes = model::token_bytes(&[first]).pop().unwrap_or_default();
     // The whole point of the mask: whatever the model chose, the caller's
     // prompt must still be reproduced byte for byte.
     let prompt_preserved = !input.heal || healed_bytes.starts_with(&fragment);

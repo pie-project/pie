@@ -69,7 +69,11 @@ pub fn textured(side: u32) -> Vec<u8> {
             (255.0 * (0.5 - (t - 0.5).abs()) * 2.0) as u8,
             (255.0 * t) as u8,
         ];
-        if checker { base } else { [base[0] / 2, base[1] / 2, base[2] / 2] }
+        if checker {
+            base
+        } else {
+            [base[0] / 2, base[1] / 2, base[2] / 2]
+        }
     })
 }
 

@@ -427,7 +427,7 @@ fn default_true() -> bool {
 /// are built fresh a round rather than hoisted like the mtp loop's, and its
 /// concurrency wall is elsewhere — see the header.
 fn ring() -> u32 {
-    (channel_capacity() + 7 * live_slots()) as u32
+    (channel_capacity() + 7 * frame_size()) as u32
 }
 
 fn default_system() -> String {

@@ -51,6 +51,50 @@ fn page_span(
     Ok(crate::pipeline::instance::KvPageSpan { start, end })
 }
 
+/// The first field by which `next` departs from `existing`, named as the guest
+/// sees it in `kv-geometry` (`kv-working-set` for the working set itself), or
+/// `None` when a rebind re-states the attention binding exactly. Reps are
+/// compared, not values: a bound program's ports are tied to these channels.
+fn attention_rebind_diff(
+    existing: &AttentionBinding,
+    next: &AttentionBinding,
+) -> Option<&'static str> {
+    if existing.kv_ws != next.kv_ws {
+        return Some("kv-working-set");
+    }
+    if existing.readable != next.readable {
+        return Some("readable-pages");
+    }
+    if existing.writable != next.writable {
+        return Some("writable-pages");
+    }
+    if existing.kv_len != next.kv_len {
+        return Some("kv-len");
+    }
+    if existing.pages != next.pages {
+        return Some("pages");
+    }
+    if existing.page_indptr != next.page_indptr {
+        return Some("page-indptr");
+    }
+    if existing.w_slot != next.w_slot {
+        return Some("w-slot");
+    }
+    if existing.w_off != next.w_off {
+        return Some("w-off");
+    }
+    if existing.positions != next.positions {
+        return Some("positions");
+    }
+    if existing.mask.is_some() != next.mask.is_some() {
+        return Some("mask (present on one binding, absent on the other)");
+    }
+    if existing.mask != next.mask {
+        return Some("mask");
+    }
+    None
+}
+
 fn validate_descriptor_bindings(
     container: &TraceContainer,
     channel_reps: &[u32],
@@ -365,6 +409,20 @@ impl ProcessCtx {
     fn core_gate(&mut self, this: &Resource<ForwardPass>) -> Anyhow<Result<(), String>> {
         let kind = self.ctx().table.get(this)?.kind;
         let actual = model_pass_kind();
+        // A HYBRID PASS WITH NO RECURRENT STATE IS AN ATTENTION PASS. The
+        // hybrid interface already makes one half of its state optional
+        // (`kv: none` for a recurrent-only fire); this is the other half. A
+        // program that only reads logits binds `rs = []` and runs on every
+        // KV-carrying model, and its fold policy is a value it states rather
+        // than a type it picks. The gate stays for the attention interface on
+        // a folding model: that interface carries the KV-editing verbs
+        // (`discard`, `fork`, `slice`) which are wrong on a fold, and the
+        // hybrid interface has none of them. `validate_count` refuses a
+        // non-empty `rs` on an attention model, so the leniency ends where
+        // the state does.
+        if kind == PassKind::Hybrid && actual == PassKind::Attention {
+            return Ok(Ok(()));
+        }
         if kind != actual {
             return Ok(Err(format!(
                 "this model's forward pass is `{}`, but the pass was built through the `{}` \
@@ -435,16 +493,7 @@ impl ProcessCtx {
         if let Some(mask) = mask.as_ref() {
             let _ = self.ctx().table.get(mask)?;
         }
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            return Ok(Err("forward pass program is already attached".to_string()));
-        }
-        if pass.bindings.attention.is_some() {
-            return Ok(Err(
-                "forward pass attention binding is already attached".to_string()
-            ));
-        }
-        pass.bindings.attention = Some(AttentionBinding {
+        let binding = AttentionBinding {
             kv_ws: kv_working_set.rep(),
             readable,
             writable,
@@ -455,7 +504,35 @@ impl ProcessCtx {
             w_off: w_off.rep(),
             positions: positions.rep(),
             mask: mask.map(|resource| resource.rep()),
-        });
+        };
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            // A rebind. The hybrid `attention` verb states both halves of the
+            // state in one call, and a guest that only wants new recurrent
+            // working sets (a beam fork) re-states the KV half with it; the
+            // SDK already treats a post-attach `attention` as a rebind and
+            // claims no ports. The compiled program's ports are tied to these
+            // channels, so the KV half may be re-stated but never changed:
+            // an identical statement is a no-op, a differing one is refused
+            // by the field that differs.
+            let Some(existing) = pass.bindings.attention else {
+                return Ok(Err("forward pass program is already attached".to_string()));
+            };
+            return Ok(match attention_rebind_diff(&existing, &binding) {
+                None => Ok(()),
+                Some(field) => Err(format!(
+                    "forward pass attention binding cannot change after the program is \
+                     attached (`{field}` differs); rebind with the same KV geometry, or build \
+                     a new pass"
+                )),
+            });
+        }
+        if pass.bindings.attention.is_some() {
+            return Ok(Err(
+                "forward pass attention binding is already attached".to_string()
+            ));
+        }
+        pass.bindings.attention = Some(binding);
         Ok(Ok(()))
     }
 
@@ -1081,6 +1158,12 @@ impl ProcessCtx {
             return Ok(Err(error));
         }
         if rs_working_sets.is_empty() {
+            // The attention case of a hybrid pass (see `core_gate`): nothing to
+            // bind, and `RsGeometry` is a policy over a state this model does
+            // not fold. A folding model still needs one set per request row.
+            if model_pass_kind() == PassKind::Attention {
+                return Ok(Ok(()));
+            }
             return Ok(Err(
                 "forward pass recurrent-state binding needs one working set per request"
                     .to_string(),
@@ -1482,3 +1565,56 @@ impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::attention_rebind_diff;
+    use crate::pipeline::instance::{AttentionBinding, KvPageSpan};
+
+    fn binding() -> AttentionBinding {
+        AttentionBinding {
+            kv_ws: 1,
+            readable: KvPageSpan { start: 0, end: None },
+            writable: KvPageSpan { start: 0, end: None },
+            kv_len: 2,
+            pages: 3,
+            page_indptr: 4,
+            w_slot: 5,
+            w_off: 6,
+            positions: 7,
+            mask: Some(8),
+        }
+    }
+
+    #[test]
+    fn identical_rebind_is_a_no_op() {
+        assert_eq!(attention_rebind_diff(&binding(), &binding()), None);
+    }
+
+    #[test]
+    fn differing_rebind_names_the_field() {
+        let mut next = binding();
+        next.kv_ws = 9;
+        assert_eq!(
+            attention_rebind_diff(&binding(), &next),
+            Some("kv-working-set")
+        );
+        let mut next = binding();
+        next.writable = KvPageSpan { start: 0, end: Some(4) };
+        assert_eq!(
+            attention_rebind_diff(&binding(), &next),
+            Some("writable-pages")
+        );
+        let mut next = binding();
+        next.positions = 9;
+        assert_eq!(attention_rebind_diff(&binding(), &next), Some("positions"));
+        let mut next = binding();
+        next.mask = None;
+        assert_eq!(
+            attention_rebind_diff(&binding(), &next),
+            Some("mask (present on one binding, absent on the other)")
+        );
+        let mut next = binding();
+        next.mask = Some(9);
+        assert_eq!(attention_rebind_diff(&binding(), &next), Some("mask"));
+    }
+}

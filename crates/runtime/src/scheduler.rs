@@ -285,6 +285,19 @@ pub fn channel_capacity() -> usize {
     .channel_capacity(configured_frame_size())
 }
 
+/// The run-ahead window in fires — what a guest reads as
+/// `model.run-ahead-window()`: `submit_depth * k`, the peak occupancy
+/// [`channel_capacity`] adds its visibility margin to. Published so a guest
+/// keeps this many fires in flight without recovering the number from the
+/// ring size.
+pub fn run_ahead_window() -> usize {
+    ::engine::runahead::Runahead::of(
+        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
+    )
+    .submit_depth()
+        * configured_frame_size()
+}
+
 // =============================================================================
 // Public API: spawn/get_stats/shutdown plain scheduler surfaces (no actor)
 // =============================================================================

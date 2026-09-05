@@ -146,6 +146,15 @@ interface model {
     // don't cache it across a run.
     channel-capacity: func() -> u32;
 
+    // Fires one lane may have submitted and not yet taken -- the run-ahead
+    // window, in fires. A host-reader ring of `channel-capacity` cells holds
+    // exactly this many plus the visibility margin, so a guest that keeps
+    // this many fires in flight never serialises and never overruns. The
+    // runtime derives both numbers from one source (`engine::runahead`);
+    // guests read this rather than recovering it from `channel-capacity`.
+    // Not static, for the same reason `channel-capacity` is not.
+    run-ahead-window: func() -> u32;
+
     // Max embed tokens in a single pass (C) — the prefill chunk budget.
     // Guests split a prompt of L tokens into ceil(L / C) chunk passes;
     // chunking is guest-side, against this static constant.
