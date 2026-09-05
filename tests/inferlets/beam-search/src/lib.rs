@@ -9,6 +9,12 @@
 //!
 //! This compact example uses a fixed pool and therefore bounds generation
 //! instead of compacting dead cells.
+//!
+//! **IT DOES NOT READ `prompt`.** Every beam is seeded with `BOS` at pool
+//! position 0 and decodes from there, so its output is the same whatever the
+//! caller asks — that is the mechanism under test, not a defect, and it is
+//! why the curated cases gate on beam-against-greedy rather than on the
+//! answer attending a prompt.
 
 use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
@@ -141,24 +147,16 @@ macro_rules! define_beam_search {
             use inferlet::eta::$kind::{ForwardPass, run_ahead};
 
         // **THE PAGE SIZE IS THE ENGINE'S, NOT A LITERAL.** This file carried
-        // `const PAGE_T: u32 = 16`; every `wpos / page_t` and `wpos % page_t`
-        // it derived named the wrong page at the wrong offset on a model whose
-        // pages are any other width (32 on the qwen and gemma rows here), so
-        // the writes and the reads never met and the beams decoded noise. It
-        // passed the curated suite anyway, because those cases compare beam
-        // against greedy and BOTH roads were corrupted the same way —
-        // `attention-sink`, the same bug, was caught only because its case
-        // gates on attending the prompt.
+        // `const PAGE_T: u32 = 16` where the engine's pages are 32 wide on the
+        // rows served here, so the guest addressed eight pages at a 16-token
+        // stride while the engine derives `last_page_len = ((kv_len-1) %
+        // page_t) + 1` at 32 — the two sides disagreed about where a flat
+        // position lives. This example never reaches far enough into the pool
+        // for that to show (its scores are identical either way), so it is
+        // corrected because it is wrong, not because it was failing.
+        // `attention-sink` carried the same literal and DID fail on it.
         let page_t = model::kv_page_size();
         let pool_len = POOL_PAGES * page_t;
-        // **AND IT DOES NOT FIX THIS FILE.** With the constant corrected the
-        // pool really is 32-wide here (`page_t=32 pool_len=256` against the
-        // 16/128 it claimed), and the beams still decode noise with the SAME
-        // score to four places. A geometry that doubles without moving the
-        // answer is not being read: the suspect is the mask, which starts as
-        // `p == 0` for every beam and is rebuilt each step — if that update
-        // is wrong every step attends position 0 alone, which is exactly a
-        // result independent of the pool. Not chased further here.
         let max_steps = input.max_tokens;
         let b = input.beams;
         if b == 0 {
