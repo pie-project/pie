@@ -35,8 +35,9 @@ const fn recurrence_grid(heads: u32, rows: u32) -> Grid {
 }
 
 /// Every (VROWS, PER) point the register scan is stamped at, as literal
-/// entry names and stamps. `PER` is `k_dim / 32` (head widths 64/128/256);
-/// `VROWS` is [`crate::tuning::DeviceTuning::gdn_scan_rows`].
+/// entry names and stamps, for the plain scan and for its committed twin.
+/// `PER` is `k_dim / 32` (head widths 64/128/256); `VROWS` is
+/// [`crate::tuning::DeviceTuning::gdn_scan_rows`].
 macro_rules! gdn_scan_points {
     ($(($v:literal, $p:literal)),+ $(,)?) => {
         fn gdn_scan_point(vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
@@ -45,6 +46,32 @@ macro_rules! gdn_scan_points {
                     concat!("gated_delta_scan_bfloat16_l_32_v_", $v, "_p_", $p),
                     concat!(
                         "PIE_STAMP_gdn_scan(\"gated_delta_scan_bfloat16_l_32_v_",
+                        $v, "_p_", $p, "\", 32, ", $v, ", ", $p, ")"
+                    ),
+                )),)+
+                _ => None,
+            }
+        }
+
+        fn gdn_scan_step_point(vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
+            match (vrows, per) {
+                $(($v, $p) => Some((
+                    concat!("gated_delta_scan_step_bfloat16_l_32_v_", $v, "_p_", $p),
+                    concat!(
+                        "PIE_STAMP_gdn_scan_step(\"gated_delta_scan_step_bfloat16_l_32_v_",
+                        $v, "_p_", $p, "\", 32, ", $v, ", ", $p, ")"
+                    ),
+                )),)+
+                _ => None,
+            }
+        }
+
+        fn gdn_scan_committed_point(vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
+            match (vrows, per) {
+                $(($v, $p) => Some((
+                    concat!("gated_delta_scan_committed_bfloat16_l_32_v_", $v, "_p_", $p),
+                    concat!(
+                        "PIE_STAMP_gdn_scan_committed(\"gated_delta_scan_committed_bfloat16_l_32_v_",
                         $v, "_p_", $p, "\", 32, ", $v, ", ", $p, ")"
                     ),
                 )),)+
@@ -79,20 +106,45 @@ fn gdn_scan_launch(shape: &Delta, requests: u32) -> Option<(&'static str, &'stat
     if tuned.gdn_scan_lanes != GDN_SCAN_LANES {
         return None;
     }
-    gdn_scan_launch_at(shape, requests, tuned.gdn_scan_rows)
+    gdn_scan_launch_at(shape, requests, tuned.gdn_scan_rows, gdn_scan_point)
+}
+
+/// The one-token step's point and geometry — [`gdn_scan_launch`]'s over
+/// `rows` independent tokens, one bank apiece.
+fn gdn_scan_step_launch(shape: &Delta, rows: u32) -> Option<(&'static str, &'static str, Grid)> {
+    let tuned = crate::tuning::current();
+    if tuned.gdn_scan_lanes != GDN_SCAN_LANES {
+        return None;
+    }
+    gdn_scan_launch_at(shape, rows, tuned.gdn_scan_rows, gdn_scan_step_point)
+}
+
+/// The committed scan's point and geometry — [`gdn_scan_launch`]'s, with
+/// the run's rows walked from the committed tables rather than the CSR alone.
+fn gdn_scan_committed_launch(
+    shape: &Delta,
+    lanes: u32,
+) -> Option<(&'static str, &'static str, Grid)> {
+    let tuned = crate::tuning::current();
+    if tuned.gdn_scan_lanes != GDN_SCAN_LANES {
+        return None;
+    }
+    gdn_scan_launch_at(shape, lanes, tuned.gdn_scan_rows, gdn_scan_committed_point)
 }
 
 /// [`gdn_scan_launch`] with the fold stated rather than read, so a test can
-/// reach a fold this machine's table does not name.
+/// reach a fold this machine's table does not name; `point` names the stamp
+/// family (the plain scan or its committed twin).
 fn gdn_scan_launch_at(
     shape: &Delta,
     requests: u32,
     vrows: u32,
+    point: fn(u32, u32) -> Option<(&'static str, &'static str)>,
 ) -> Option<(&'static str, &'static str, Grid)> {
     if vrows == 0 || shape.v_dim % vrows != 0 || shape.k_dim % GDN_SCAN_LANES != 0 {
         return None;
     }
-    let (entry, stamp) = gdn_scan_point(vrows, shape.k_dim / GDN_SCAN_LANES)?;
+    let (entry, stamp) = point(vrows, shape.k_dim / GDN_SCAN_LANES)?;
     let row_groups = shape.v_dim / vrows;
     // Threadgroup row extent must divide row_groups: this scan is a
     // read-modify-write, so a spare lane group sharing a row is wrong, not wasteful.
@@ -397,6 +449,25 @@ pub fn gated_delta(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let rows = nonzero(OP, "rows", qkv.rows)?;
+    // The register scan's one-token step for stamped shapes: the same body
+    // the prefill scan and the committed scan run, so a plain decode lands
+    // the bits a speculative window's verify lands (`ssm_gdn_scan.metal`).
+    if let Some((point, stamp, grid)) = gdn_scan_step_launch(&shape, rows) {
+        return ctx.fire(
+            Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
+            &[
+                qkv.arg(),
+                gates.arg(),
+                state.state.arg_mut(),
+                state.slots.arg(),
+                y.arg_mut(),
+                stated(OP, shape.k_heads)?.arg(),
+                stated(OP, shape.v_heads)?.arg(),
+                stated(OP, shape.k_dim)?.arg(),
+                stated(OP, shape.v_dim)?.arg(),
+            ],
+        );
+    }
     // The value columns of one (head, row) split across threadgroups down
     // z, 32 columns each (a simdgroup a column, four simdgroups a group, so
     // eight turns), so a one-row fire still spreads a head over the device.
@@ -619,6 +690,22 @@ mod tests {
     };
 
     #[test]
+    fn the_three_scans_share_one_geometry() {
+        // qwen3.6-27B at the tuned fold of four rows: PER = 128 / 32 = 4,
+        // 32 row groups a head, one (lane, head) pair down z.
+        let plain = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_point).expect("stamped");
+        let step = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_step_point).expect("stamped");
+        let committed = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_committed_point).expect("stamped");
+        assert_eq!(plain.0, "gated_delta_scan_bfloat16_l_32_v_4_p_4");
+        assert_eq!(step.0, "gated_delta_scan_step_bfloat16_l_32_v_4_p_4");
+        assert_eq!(committed.0, "gated_delta_scan_committed_bfloat16_l_32_v_4_p_4");
+        assert!(committed.1.starts_with("PIE_STAMP_gdn_scan_committed("));
+        assert_eq!(plain.2, step.2);
+        assert_eq!(plain.2, committed.2);
+        assert_eq!(plain.2, Grid::of([32, 32, 3 * 48], [32, 4, 1]));
+    }
+
+    #[test]
     fn a_shape_the_stamp_does_not_name_falls_back() {
         // k_dim not divisible by 32 lanes.
         let odd = Delta {
@@ -742,6 +829,30 @@ pub fn gated_delta_committed(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = committed_lanes(OP, indptr)?;
+    // The register scan for stamped shapes (`ssm_gdn_scan.metal`, the
+    // committed twin): the state stays in registers for the whole run, so
+    // there is no `work` carry to hand it. Over a sixteen-row window on the
+    // 27B this is the difference between 590 and ~40 us a layer.
+    if let Some((point, stamp, grid)) = gdn_scan_committed_launch(&shape, lanes) {
+        return ctx.fire(
+            Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
+            &[
+                qkv.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                committed.commit.arg(),
+                committed.slots.arg(),
+                stated(OP, committed.lane0)?.arg(),
+                gates.arg(),
+                state.state.arg_mut(),
+                y.arg_mut(),
+                stated(OP, shape.k_heads)?.arg(),
+                stated(OP, shape.v_heads)?.arg(),
+                stated(OP, shape.k_dim)?.arg(),
+                stated(OP, shape.v_dim)?.arg(),
+            ],
+        );
+    }
     // As `gated_delta`: a head's columns split across threadgroups down z.
     let splits = (shape.v_dim / 32).max(1);
     let grid = Grid::of(
