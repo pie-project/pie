@@ -268,6 +268,83 @@ pub fn emit_fused_region(
     let _ = write!(source, "{LANE_TABLE_ABI_VERSION}");
     source.push_str(PREAMBLE);
 
+    // A row-parallel region: the engine launches one block per row of the
+    // witness value, and this block owns row `lane_row`. It sees every
+    // multi-row value of the geometry (kind 1) as its own row, every per-row
+    // vector (kind 2: what a row reduction writes one element of) as its
+    // element, and everything else whole — through a block-local descriptor
+    // table and a per-value byte shift, so the helpers below run unchanged.
+    let row_geometry = region
+        .row_value
+        .and_then(|witness| stage.normalized.value_types.get(witness as usize))
+        .and_then(|ty| crate::plan::value_rows(&ty.dims))
+        .filter(|&(fixed, extent)| !(fixed == 1 && extent == u32::MAX));
+    let row_parallel = row_geometry.is_some();
+    if let Some((fixed, extent)) = row_geometry {
+        let kinds: Vec<String> = stage
+            .normalized
+            .value_types
+            .iter()
+            .map(|ty| {
+                let alias = region.row_alias;
+                if ty.dims.len() >= 2
+                    && crate::plan::value_rows(&ty.dims)
+                        .is_some_and(|shape| crate::plan::same_rows(shape, (fixed, extent), alias))
+                {
+                    "1u"
+                } else if crate::plan::is_row_vector(&ty.dims, fixed, extent, alias) {
+                    "2u"
+                } else {
+                    "0u"
+                }
+                .to_string()
+            })
+            .collect();
+        let count = kinds.len().max(1);
+        let _ = writeln!(source, "  const m1_u8 ptir_rowkind[{count}u] = {{{}}};", kinds.join(", "));
+        let _ = writeln!(source, "  __shared__ M1ValueDesc ptir_rowdesc[{count}u];");
+        let _ = writeln!(source, "  __shared__ m1_u64 ptir_rowshift[{count}u];");
+        let _ = writeln!(
+            source,
+            "  for (m1_u32 v = threadIdx.x; v < value_count && v < {count}u; v += blockDim.x) {{"
+        );
+        source.push_str("    M1ValueDesc d = descriptors[v];
+");
+        source.push_str("    m1_u64 shift = 0u;
+");
+        source.push_str("    const m1_u64 elem = d.dtype == 3u ? 1u : 4u;
+");
+        source.push_str("    if (ptir_rowkind[v] == 1u) {
+");
+        source.push_str("      shift = (m1_u64)lane_row * (m1_u64)d.last * elem;
+");
+        source.push_str("      d.len = d.last; d.rows = 1u; d.rank = 1u; d.dims[0] = d.last;
+");
+        let _ = writeln!(
+            source,
+            "      for (m1_u32 k = 1u; k < {}u; ++k) d.dims[k] = 0u;",
+            eta_ir::types::MAX_RANK
+        );
+        source.push_str("    } else if (ptir_rowkind[v] == 2u) {
+");
+        source.push_str("      shift = (m1_u64)lane_row * elem;
+");
+        source.push_str("      d.len = 1u; d.rows = 1u; d.last = 1u; d.dims[0] = 1u;
+");
+        source.push_str("    }
+");
+        source.push_str("    ptir_rowdesc[v] = d;
+");
+        source.push_str("    ptir_rowshift[v] = shift;
+");
+        source.push_str("  }
+");
+        source.push_str("  __syncthreads();
+");
+        source.push_str("  descriptors = ptir_rowdesc;
+");
+    }
+
     for &node in &region.nodes {
         let node = node.index();
         let op = &ops[node];
@@ -292,12 +369,23 @@ pub fn emit_fused_region(
 
         // Reshape aliases are resolved before indexing the offsets table.
         let mut slots = Slots::of(op, base, |value| {
-            format!("scratch + offsets[{}]", aliases.resolve(value))
+            let value = aliases.resolve(value);
+            if row_parallel {
+                format!("scratch + offsets[{value}] + ptir_rowshift[{value}]")
+            } else {
+                format!("scratch + offsets[{value}]")
+            }
         });
 
         source.push_str("  {\n");
         let _ = writeln!(source, "    M1OpParams p = params[{node}u];");
         source.push_str("    p.rng_seed = 0u;\n");
+        if matches!(op.tag, tags::RNG | tags::RNG_KEYED) {
+            // The element base (`fused_block0.cuh`): a row block keys its
+            // noise by position in the whole value. Zero for a whole-value
+            // block.
+            source.push_str("    p.imm3 = lane_row * descriptors[p.o0].len;\n");
+        }
 
         if matches!(op.tag, tags::CHAN_TAKE | tags::CHAN_READ | tags::CHAN_PUT) {
             let _ = writeln!(
@@ -322,6 +410,9 @@ pub fn emit_fused_region(
             source.push_str("    p.imm = intrinsic_widths[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_stride = intrinsic_strides[intrinsic_index];\n");
             source.push_str("    p.intrinsic_row_offset = intrinsic_offsets[intrinsic_index];\n");
+            // A row block reads its row of the intrinsic (a whole-value
+            // block's `lane_row` is 0).
+            source.push_str("    p.intrinsic_row_offset += lane_row;\n");
             slots.a0 =
                 "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
         }
@@ -435,7 +526,7 @@ fn emit_body(
             source.push_str("        descriptors[p.a0],\n");
             source.push_str("        intrinsic_modes[direct_intrinsic_index],\n");
             source.push_str("        intrinsic_strides[direct_intrinsic_index],\n");
-            source.push_str("        intrinsic_offsets[direct_intrinsic_index]);\n");
+            source.push_str("        intrinsic_offsets[direct_intrinsic_index] + lane_row);\n");
         } else {
             let _ = writeln!(
                 source,

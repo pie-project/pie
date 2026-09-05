@@ -5,8 +5,8 @@ use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
     Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader,
-    LaneRecord, LaneShape, NO_TICKET, OpParams, OpRuntime, SCRATCH_ALIGN, ValueDesc, describe,
-    layout,
+    LaneRecord, LaneShape, Layout, Lifetime, NO_TICKET, OpParams, OpRuntime, SCRATCH_ALIGN,
+    ValueDesc, describe, layout, layout_reusing,
 };
 use eta_ir::Dtype;
 use eta_ir::container::HostRole;
@@ -26,7 +26,13 @@ use super::endpoint::Endpoint;
 /// The sixteen arguments a generated fused region takes, matching
 /// `fused_block1.cuh`'s signature. CUDA does not validate this: a mismatched
 /// count reads garbage rather than erroring.
-const FUSED_ARITY: usize = 16;
+const FUSED_ARITY: usize = 18;
+
+/// How many blocks per lane a `top_k`/`sort_desc` region gets: each sorts
+/// every `ORDER_ROW_BLOCKS`-th row of the lane on its own slice of the
+/// temporary arena (two `u32` order arrays over one row). A block per row
+/// would want that arena per row — a gigabyte for 256 rows of 262 144.
+pub const ORDER_ROW_BLOCKS: u32 = 32;
 
 /// How many intrinsic slots the five side tables carry per lane. Tables are
 /// indexed `lane * INTRINSIC_SLOTS + intrinsic`; a mismatch with the
@@ -637,6 +643,10 @@ pub struct Prepared {
     value_count: u32,
     scratch_stride: u32,
     temporary_offset: u32,
+    /// The temporary arena's bytes, shared by a region's blocks per lane.
+    temporary_bytes: u32,
+    /// Blocks per lane for each region, by region index.
+    region_rows: Vec<u32>,
     /// How many lanes every buffer above is cut for: a high-water mark that
     /// only grows, since a grow reallocates and is only safe before a
     /// boundary has staged anything.
@@ -775,6 +785,311 @@ pub fn describe_values(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<V
         .collect()
 }
 
+/// Every value's life on the launch clock. A generated region is one block
+/// per lane running its nodes in emission order with a `__syncthreads()`
+/// after each, so each of its nodes is a step of its own; a library region
+/// is one kernel whose internal order is its own, so it is a single step.
+/// Regions launch in index order on one stream. A value is defined at its
+/// producing node's step and last read at the last step whose node names it
+/// as an operand (a `pivot_threshold`'s predicate included), or whose region
+/// names it as an input, output or sink. A reshape's consumers may read its
+/// SOURCE (`cuda::fused` elides the copy), so a read of a reshape result also
+/// extends the source's life. Only a result its op always writes in full may
+/// take a vacated slot; a `pivot_threshold` (predicated) or a channel
+/// materialisation (may be described empty) keeps a fresh, per-fire-zeroed
+/// one. `None` when some op sits in no region, since then there is no launch
+/// order to reason from.
+fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>> {
+    // node -> its step and region; region -> its first and last step.
+    let mut step_of = vec![u32::MAX; plan.ops.len()];
+    let mut region_of = vec![u32::MAX; plan.ops.len()];
+    let mut region_first = Vec::with_capacity(plan.fused.len());
+    let mut region_last = Vec::with_capacity(plan.fused.len());
+    let mut step = 0u32;
+    for (index, region) in plan.fused.iter().enumerate() {
+        let per_node = region.kind == RegionKind::Generated;
+        region_first.push(step);
+        for &node in &region.nodes {
+            *step_of.get_mut(node as usize)? = step;
+            *region_of.get_mut(node as usize)? = u32::try_from(index).ok()?;
+            if per_node {
+                step = step.checked_add(1)?;
+            }
+        }
+        if !per_node {
+            step = step.checked_add(1)?;
+        }
+        region_last.push(step.saturating_sub(1));
+    }
+    if step_of.contains(&u32::MAX) {
+        return None;
+    }
+    let region_of_step = |step: u32| -> u32 {
+        region_first
+            .partition_point(|&first| first <= step)
+            .saturating_sub(1) as u32
+    };
+    // How a launch's blocks touch a value: see `Lifetime::class_def`. A
+    // many-block launch slices a value of its row geometry by row (class
+    // 1 + the row's bytes), a per-row vector by element (class 2 + the
+    // element's bytes), and reads anything else whole (class 0). The
+    // kinds are the emitter's (`cuda::fused`, `Region::row_value` /
+    // `row_alias`), computed here from the same symbolic dims.
+    let class_of = |region: u32, value: u32| -> u64 {
+        let Some(fused) = plan.fused.get(region as usize) else {
+            return Lifetime::SEQUENTIAL;
+        };
+        if rows.get(region as usize).copied().unwrap_or(1) <= 1 {
+            return Lifetime::SEQUENTIAL;
+        }
+        let geometry = fused
+            .row_value
+            .and_then(|witness| plan.value_types.get(witness as usize))
+            .and_then(|ty| eta_compiler::plan::value_rows(&ty.axes));
+        let Some(geometry) = geometry else {
+            return 0;
+        };
+        let Some(ty) = plan.value_types.get(value as usize) else {
+            return 0;
+        };
+        let elem: u64 = if ty.dtype == Dtype::Bool { 1 } else { 4 };
+        let alias = fused.row_alias;
+        if ty.axes.len() >= 2
+            && eta_compiler::plan::value_rows(&ty.axes)
+                .is_some_and(|shape| eta_compiler::plan::same_rows(shape, geometry, alias))
+        {
+            let width = match ty.axes.last() {
+                Some(eta_compiler::plan::Dimension::Static(width)) => u64::from(*width),
+                _ => return 0,
+            };
+            (1u64 << 40) | (width * elem)
+        } else if eta_compiler::plan::is_row_vector(&ty.axes, geometry.0, geometry.1, alias) {
+            (2u64 << 40) | elem
+        } else {
+            0
+        }
+    };
+    let values = plan.value_types.len();
+    let mut lifetimes = vec![
+        Lifetime {
+            def: 0,
+            last: 0,
+            reusable: false,
+            launch_def: 0,
+            launch_last: 0,
+            class_def: Lifetime::SEQUENTIAL,
+            class_last: Lifetime::SEQUENTIAL,
+        };
+        values
+    ];
+    let mut alias_of = vec![u32::MAX; values];
+    let bump = |lifetimes: &mut Vec<Lifetime>, alias_of: &[u32], mut value: u32, step: u32| {
+        // The value, then the source chain a reshape of it may read instead.
+        for _ in 0..=alias_of.len() {
+            let Some(life) = lifetimes.get_mut(value as usize) else {
+                return;
+            };
+            life.last = life.last.max(step);
+            match alias_of.get(value as usize).copied() {
+                Some(source) if source != u32::MAX => value = source,
+                _ => return,
+            }
+        }
+    };
+    let mut result_base = 0u32;
+    for (node, op) in plan.ops.iter().enumerate() {
+        let step = step_of[node];
+        let written_in_full = !matches!(
+            op.tag,
+            tags::PIVOT_THRESHOLD | tags::CHAN_READ | tags::CHAN_TAKE
+        );
+        for result in 0..u32::from(op.result_count) {
+            if let Some(life) = lifetimes.get_mut((result_base + result) as usize) {
+                life.def = step;
+                life.last = life.last.max(step);
+                life.reusable = written_in_full;
+                life.launch_def = region_of[node];
+            }
+        }
+        if op.tag == tags::RESHAPE
+            && let Some(&source) = op.args.first()
+            && let Some(slot) = alias_of.get_mut(result_base as usize)
+        {
+            *slot = source;
+        }
+        result_base += u32::from(op.result_count);
+        let predicate = (op.tag == tags::PIVOT_THRESHOLD).then_some(op.pred_payload);
+        for value in op.args.iter().copied().chain(predicate) {
+            bump(&mut lifetimes, &alias_of, value, step);
+        }
+    }
+    for (region, fused) in plan.fused.iter().enumerate() {
+        let step = region_last[region];
+        let named = fused
+            .inputs
+            .iter()
+            .chain(fused.outputs.iter())
+            .copied()
+            .chain(fused.sinks.iter().map(|sink| sink.value));
+        for value in named {
+            bump(&mut lifetimes, &alias_of, value, step);
+        }
+    }
+    // Launches and classes; a value a many-block launch reads whole stays
+    // until that launch has finished, since any of its blocks may still be
+    // reading it.
+    for (value, life) in lifetimes.iter_mut().enumerate() {
+        let value = value as u32;
+        life.launch_last = region_of_step(life.last);
+        life.class_def = class_of(life.launch_def, value);
+        life.class_last = class_of(life.launch_last, value);
+        if life.class_last == 0 {
+            life.last = life.last.max(region_last[life.launch_last as usize]);
+        }
+    }
+    Some(lifetimes)
+}
+
+/// Blocks per lane for each of `plan.fused`'s regions at these descriptors:
+/// the witness value's rows for a row-parallel generated region, at most
+/// [`ORDER_ROW_BLOCKS`] for a `top_k`/`sort_desc` region, one otherwise.
+fn region_rows(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
+    plan.fused
+        .iter()
+        .map(|region| {
+            let rows = region
+                .row_value
+                .and_then(|value| descriptors.get(value as usize))
+                .map_or(1, |descriptor| descriptor.rows.max(1));
+            match region.kind {
+                RegionKind::Generated => rows,
+                RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
+                RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => rows.min(ORDER_ROW_BLOCKS),
+                RegionKind::Library(_) => 1,
+            }
+        })
+        .collect()
+}
+
+/// Whether a `top_k` region is emitted as the selection kernel (no
+/// temporary arena, a block per row) — the emitter's rule, read off the
+/// op's width: `eta_compiler::codegen::cuda::order`.
+fn selects(plan: &LaunchStagePlan, region: &LaunchRegion) -> bool {
+    region
+        .nodes
+        .first()
+        .and_then(|&node| plan.ops.get(node as usize))
+        .is_some_and(|op| {
+            op.tag == tags::TOP_K
+                && (1..=eta_compiler::codegen::cuda::order::TOP_K_SELECT_MAX).contains(&op.imm)
+        })
+}
+
+/// The least the temporary arena may be, so that every block of every
+/// region has its slice (`temporary_bytes / blocks`): a row block of a
+/// generated region needs the parallel reduction's two work arrays over
+/// one row (`ptir_parallel_reduce_f32`: `ceil(last / 32)` floats each);
+/// an order block needs two `u32` arrays over one row.
+fn temporary_floor(plan: &LaunchStagePlan, descriptors: &[ValueDesc], rows: &[u32]) -> u64 {
+    let align = |bytes: u64| bytes.next_multiple_of(u64::from(SCRATCH_ALIGN));
+    let widest = descriptors.iter().map(|d| u64::from(d.last)).max().unwrap_or(1).max(1);
+    plan.fused
+        .iter()
+        .zip(rows)
+        .map(|(region, &blocks)| {
+            // A one-block launch is covered by `layout`'s own arena (four
+            // words an element of the widest row); only many blocks sharing
+            // it need the floor.
+            if blocks <= 1 {
+                return 0;
+            }
+            let per_block = match region.kind {
+                RegionKind::Generated => align(2 * widest.div_ceil(32) * 4 + 4096),
+                RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => 0,
+                RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => align(8 * widest + 256),
+                RegionKind::Library(_) => 0,
+            };
+            per_block * u64::from(blocks)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// One lane's scratch layout for `plan`'s `descriptors`: slots reused by
+/// liveness when the plan's regions give a launch order, one per value
+/// otherwise; the temporary arena floored for the blocks that share it.
+fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> {
+    let rows = region_rows(plan, descriptors);
+    let lifetimes = value_lifetimes(plan, &rows);
+    let floor = temporary_floor(plan, descriptors, &rows);
+    if std::env::var_os("PIE_ETA_REGIONS").is_some() {
+        // A reading aid, not a contract: the stage's regions as this shell
+        // launches them, with the bytes each one's values name.
+        eprintln!(
+            "[eta-regions] ops={} values={} regions={} temporary_floor={}",
+            plan.ops.len(),
+            plan.value_types.len(),
+            plan.fused.len(),
+            floor
+        );
+        for (index, (region, &blocks)) in plan.fused.iter().zip(&rows).enumerate() {
+            let tags: Vec<String> = region
+                .nodes
+                .iter()
+                .filter_map(|&n| plan.ops.get(n as usize).map(|op| format!("{:02x}", op.tag)))
+                .collect();
+            let named: u64 = region
+                .nodes
+                .iter()
+                .filter_map(|&n| plan.ops.get(n as usize))
+                .flat_map(|op| op.args.iter().copied().chain((0..u32::from(op.result_count)).map(move |r| op.result_id + r)))
+                .collect::<std::collections::BTreeSet<u32>>()
+                .into_iter()
+                .filter_map(|v| descriptors.get(v as usize))
+                .map(ValueDesc::device_bytes)
+                .sum();
+            eprintln!(
+                "[eta-regions]  r{index} {:?} blocks/lane={blocks} nodes={} named={}MB tags=[{}]",
+                region.kind,
+                region.nodes.len(),
+                named >> 20,
+                tags.join(" ")
+            );
+            if blocks == 1 && named >> 20 > 0 {
+                // A one-block region naming megabytes: say what its ops see.
+                for &n in &region.nodes {
+                    let Some(op) = plan.ops.get(n as usize) else { continue };
+                    let axes = |v: u32| {
+                        plan.value_types
+                            .get(v as usize)
+                            .map(|t| format!("v{v}:{:?}", t.axes))
+                            .unwrap_or_default()
+                    };
+                    let args: Vec<String> = op.args.iter().map(|&v| axes(v)).collect();
+                    let results: Vec<String> =
+                        (0..u32::from(op.result_count)).map(|r| axes(op.result_id + r)).collect();
+                    eprintln!(
+                        "[eta-regions]    n{n} {:02x} args=[{}] results=[{}]",
+                        op.tag,
+                        args.join(", "),
+                        results.join(", ")
+                    );
+                }
+            }
+        }
+    }
+    match lifetimes {
+        Some(lifetimes) => layout_reusing(descriptors, &lifetimes, floor),
+        None => layout(descriptors),
+    }
+    .map_err(|why| {
+        Fault::program(
+            "program::launch",
+            format!("this fire's scratch does not fit: {why:?}"),
+        )
+    })
+}
+
 /// What one lane's scratch costs for `plan` at `extents` — the stride
 /// [`Prepared::build`] cuts and [`Prepared::commit_lanes`] re-zeroes.
 ///
@@ -784,14 +1099,7 @@ pub fn describe_values(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<V
 /// exceeds what [`eta_exec::layout`] permits.
 pub fn scratch_bytes(plan: &LaunchStagePlan, extents: Extents) -> Result<u64> {
     let descriptors = describe_values(plan, extents)?;
-    layout(&descriptors)
-        .map(|layout| layout.total)
-        .map_err(|why| {
-            Fault::program(
-                "program::launch",
-                format!("this fire's scratch does not fit: {why:?}"),
-            )
-        })
+    lay_out(plan, &descriptors).map(|layout| layout.total)
 }
 
 impl Prepared {
@@ -815,16 +1123,14 @@ impl Prepared {
 
         // ── The value descriptors, and the scratch they size. ──
         let descriptors = describe_values(plan, extents)?;
-        let scratch_layout = layout(&descriptors).map_err(|why| {
-            Fault::program(
-                "program::launch",
-                format!("this fire's scratch does not fit: {why:?}"),
-            )
-        })?;
+        let scratch_layout = lay_out(plan, &descriptors)?;
         let scratch_stride = u32::try_from(scratch_layout.total)
             .map_err(|_| Fault::program("program::launch", "a scratch stride past a u32"))?;
         let temporary_offset = u32::try_from(scratch_layout.temporary)
             .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
+        let temporary_bytes = u32::try_from(scratch_layout.temporary_bytes)
+            .map_err(|_| Fault::program("program::launch", "a temporary arena past a u32"))?;
+        let region_rows = region_rows(plan, &descriptors);
 
         // ── Op params, widened to CUDA's 88-byte record. ──
         let mut records = Vec::with_capacity(plan.ops.len());
@@ -903,6 +1209,8 @@ impl Prepared {
             value_count,
             scratch_stride,
             temporary_offset,
+            temporary_bytes,
+            region_rows,
             lanes: 0,
             filled: 0,
             bindings: plan.channel_bindings.clone(),
@@ -1207,8 +1515,9 @@ impl Prepared {
         Ok(())
     }
 
-    /// Launch one generated region over every lane this boundary staged.
-    /// One CTA per lane: the kernel reads `blockIdx.x` as its lane.
+    /// Launch one generated region over every lane this boundary staged:
+    /// one CTA per lane, or per row of a row-parallel region (the kernel
+    /// reads `blockIdx.x / rows_per_lane` as its lane).
     ///
     /// # Errors
     ///
@@ -1235,9 +1544,19 @@ impl Prepared {
             .ptr(self.intrinsic_widths.ptr())
             .ptr(self.intrinsic_strides.ptr())
             .ptr(self.intrinsic_offsets.ptr());
+        // A row-parallel region launches `rows` blocks per lane, each on its
+        // own slice of the temporary arena.
+        let rows = self
+            .region_rows
+            .get(region.region_index as usize)
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+        let stride = (self.temporary_bytes / rows) & !(SCRATCH_ALIGN as u32 - 1);
+        args.u32(rows).u32(stride);
         launch(
             &region.module,
-            self.filled,
+            self.filled.saturating_mul(rows),
             region.module.block_threads(),
             &mut args,
             FUSED_ARITY,

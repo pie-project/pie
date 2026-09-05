@@ -64,7 +64,10 @@ pub use registry::{
     Channel, ChannelSpec, Direction, EmittedKernel, Endpoint, Geometry, HostRole, Instance,
     Program, Registry,
 };
-pub use scratch::{ALIGN as SCRATCH_ALIGN, Layout, MAX_BYTES as SCRATCH_MAX_BYTES, layout};
+pub use scratch::{
+    ALIGN as SCRATCH_ALIGN, Layout, Lifetime, MAX_BYTES as SCRATCH_MAX_BYTES, layout,
+    layout_reusing,
+};
 pub use stage_cache::{Lookup, Stages};
 pub use status::{
     Fault, FaultClass, Outcome as StatusOutcome, STATUS_BYTES, Site, State, Status, describe_fault,

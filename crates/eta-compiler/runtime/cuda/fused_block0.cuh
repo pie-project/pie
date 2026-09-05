@@ -316,7 +316,10 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
             d0.len > 1u ? m1_load_u(a0, 1u, d0.dtype) : 0u;
         seed = ptir_rng_keyed_seed(key, counter);
       }
-      const float uniform = ptir_rng_hash_uniform(seed, i);
+      // `imm3` is the element base: a row block of a row-parallel region
+      // keys its elements by their position in the whole value, so the
+      // noise is the one block per lane would have drawn.
+      const float uniform = ptir_rng_hash_uniform(seed, i + p.imm3);
       m1_store_f(
           o0,
           i,

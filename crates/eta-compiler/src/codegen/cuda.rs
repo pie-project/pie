@@ -27,7 +27,7 @@ use alloc::string::String;
 /// the engine's compile cache keys on it. Also keys the negative tier
 /// (cached `Deterministic` compile failures), so a bump is how a stale
 /// refusal is forgotten.
-pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 26;
+pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 28;
 
 /// The kernel this backend compiles for one region of a stage: the single
 /// place that decides which emitter a region goes through.

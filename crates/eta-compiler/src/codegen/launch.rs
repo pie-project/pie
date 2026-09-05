@@ -272,6 +272,16 @@ pub struct LaunchRegion {
     pub outputs: Vec<u32>,
     /// The puts it commits.
     pub sinks: Vec<LaunchPut>,
+    /// A multi-row value naming the region's row geometry — the plan's
+    /// `Region::row_value`. A backend that launches one block per row
+    /// resolves the row count from this value's descriptor; `None` is one
+    /// block per lane.
+    #[serde(default)]
+    pub row_value: Option<u32>,
+    /// The plan's `Region::row_alias`: the static row count standing for
+    /// the geometry's symbolic rows, if any.
+    #[serde(default)]
+    pub row_alias: Option<u64>,
 }
 
 /// One value's type in a stage plan: an element type and a list of axes, as
@@ -781,6 +791,8 @@ fn lower_region(region: &Region) -> LaunchRegion {
         nodes: region.nodes.iter().copied().map(NodeIndex::get).collect(),
         inputs: region.inputs.clone(),
         outputs: region.outputs.clone(),
+        row_value: region.row_value,
+        row_alias: region.row_alias,
         sinks: region
             .sinks
             .iter()

@@ -8,7 +8,7 @@
 # change to it shows up as a diff instead of passing unnoticed.
 #
 # A mismatch here is a question, not a verdict: decide whether the new output is
-# right, then re-pin with `PTIR_REGEN=1 cargo test -p pie-compiler-tests`.
+# right, then re-pin with `PTIR_REGEN=1 cargo test -p eta-compiler`.
 #
 # Where a kernel is digested, `bytes` and the hash cover what the *compiler*
 # generated: the hand-written device text under `crates/eta-compiler/runtime/` is
@@ -40,8 +40,10 @@ fused#2: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 === extended_gather_scatter#0
 stage_tag: 0x03
 signature: 47cd877f69b3db71
-plan: lines=18 fnv1a64=0x2a710713791a668a
-fused#0: library=0 library_op=0 schedule=1 nodes=7 inputs=0 outputs=0 sinks=2
+plan: lines=20 fnv1a64=0xeefd1b703c76290d
+fused#0: library=0 library_op=0 schedule=0 nodes=3 inputs=0 outputs=3 sinks=0
+fused#1: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+fused#2: library=0 library_op=0 schedule=1 nodes=3 inputs=3 outputs=0 sinks=2
 === extended_rng_stream#0
 stage_tag: 0x03
 signature: c5334e7e4cff1020

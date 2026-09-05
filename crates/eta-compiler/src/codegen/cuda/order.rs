@@ -65,6 +65,16 @@ const ORDER_WORKER_CAP: u32 = 256;
 /// collide with a legitimate `top_k` width, since `top_k` refuses `k < 1`.
 const ORDER_FULL_ROW: u32 = 0;
 
+/// A `top_k` up to this width takes the SELECTION kernel ([`BODY_SELECT`])
+/// rather than the full sort: a radix select of the k-th key in four
+/// 8-bit passes over the row, one coalesced pass compacting the winners
+/// (keys below the k-th, then the first of the keys equal to it in index
+/// order), and a bitonic sort of those in shared memory. It needs no
+/// temporary arena, so the engine gives it one block per ROW
+/// (`engine-cuda::program::launch::region_rows`). Wider `top_k`, and
+/// `sort_desc`, walk the radix sort with its two order arrays.
+pub const TOP_K_SELECT_MAX: u32 = 1024;
+
 /// The kernel body, after the six `constexpr`s the emitter writes (worker
 /// cap, input value id, two result value ids, result width, full-row
 /// sentinel). Every `__syncthreads()` is reached by the whole block: loop
@@ -121,7 +131,9 @@ const BODY: &str = r#"
           : 0u;
 
   if (order_len != 0u) {
-    for (m1_u32 order_row = 0u; order_row < order_rows; ++order_row) {
+    // The lane's blocks share its rows: block `lane_row` takes every
+    // `lane_blocks`-th row, on its own slice of the temporary arena.
+    for (m1_u32 order_row = lane_row; order_row < order_rows; order_row += lane_blocks) {
       const m1_u32 order_base = order_row * order_len;
       for (m1_u32 i = threadIdx.x; i < order_len; i += blockDim.x)
         order_a[i] = i;
@@ -199,6 +211,150 @@ const BODY: &str = r#"
       // onto it.
       for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
         const m1_u32 index = order_in[at];
+        m1_store_f(
+            order_values,
+            order_row * order_width + at,
+            m1_load_f(order_input, order_base + index, order_input_desc.dtype));
+        m1_store_u(order_indices, order_row * order_width + at, index);
+      }
+      __syncthreads();
+    }
+  }
+"#;
+
+/// The selection kernel's body, after the emitter's `constexpr`s (the same
+/// six as [`BODY`] plus `kSelectCap`, the power of two at or above
+/// `kWidth`). Ordering is [`BODY`]'s exactly — keys ascend on
+/// `m1_desc_key`, ties by ascending index — so a `top_k` answers the same
+/// rows either way. Every `__syncthreads()` is reached by the whole block:
+/// the row loop and the window loop have uniform bounds.
+const BODY_SELECT: &str = r#"
+  (void)channels;
+  (void)params;
+  (void)pending_flags;
+  (void)intrinsic_bases;
+  (void)intrinsic_modes;
+  (void)intrinsic_widths;
+  (void)intrinsic_strides;
+  (void)intrinsic_offsets;
+  (void)temporary;
+  (void)kOrderWorkerCap;
+  (void)kOrderFullRow;
+  const M1ValueDesc order_input_desc = descriptors[kInput];
+  const m1_u8* order_input = scratch + offsets[kInput];
+  m1_u8* order_values = scratch + offsets[kValues];
+  m1_u8* order_indices = scratch + offsets[kIndices];
+  const m1_u32 order_len = order_input_desc.last;
+  const m1_u32 order_rows = order_input_desc.rows;
+  const m1_u32 order_width = kWidth;
+  const m1_u32 order_count = order_width < order_len ? order_width : order_len;
+  __shared__ m1_u32 sel_hist[256];
+  __shared__ m1_u32 sel_warp[32];
+  __shared__ m1_u64 sel_cand[kSelectCap];
+  __shared__ m1_u32 sel_fill;
+  __shared__ m1_u32 sel_digit;
+  __shared__ m1_u32 sel_below;
+  __shared__ m1_u32 sel_equal_seen;
+  const m1_u32 sel_lane = threadIdx.x & 31u;
+  const m1_u32 sel_warp_id = threadIdx.x >> 5u;
+  const m1_u32 sel_warps = (blockDim.x + 31u) >> 5u;
+  if (order_count != 0u) {
+    for (m1_u32 order_row = lane_row; order_row < order_rows; order_row += lane_blocks) {
+      const m1_u32 order_base = order_row * order_len;
+      // 1. The `order_count`-th smallest key, one 8-bit digit per pass.
+      m1_u32 prefix = 0u;
+      m1_u32 want = order_count;
+      for (m1_u32 pass = 0u; pass < 4u; ++pass) {
+        const m1_u32 shift = 24u - pass * 8u;
+        const m1_u32 fixed = pass == 0u ? 0u : (0xFFFFFFFFu << (shift + 8u));
+        for (m1_u32 b = threadIdx.x; b < 256u; b += blockDim.x) sel_hist[b] = 0u;
+        __syncthreads();
+        for (m1_u32 i = threadIdx.x; i < order_len; i += blockDim.x) {
+          const m1_u32 key = m1_desc_key(m1_load_f(
+              order_input, order_base + i, order_input_desc.dtype));
+          if ((key & fixed) == prefix) atomicAdd(&sel_hist[(key >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+          m1_u32 below = 0u;
+          m1_u32 digit = 0u;
+          for (; digit < 255u; ++digit) {
+            const m1_u32 c = sel_hist[digit];
+            if (below + c >= want) break;
+            below += c;
+          }
+          sel_digit = digit;
+          sel_below = below;
+        }
+        __syncthreads();
+        prefix |= sel_digit << shift;
+        want -= sel_below;
+        __syncthreads();
+      }
+      const m1_u32 threshold = prefix;
+      const m1_u32 less_count = order_count - want;
+      const m1_u32 equal_take = want;
+      // 2. Compaction, one coalesced window of the row per step: keys below
+      // the threshold in any order, keys equal to it by ascending index.
+      if (threadIdx.x == 0u) {
+        sel_fill = 0u;
+        sel_equal_seen = 0u;
+      }
+      __syncthreads();
+      for (m1_u32 window = 0u; window < order_len; window += blockDim.x) {
+        const m1_u32 i = window + threadIdx.x;
+        const bool valid = i < order_len;
+        const m1_u32 key = valid
+            ? m1_desc_key(m1_load_f(order_input, order_base + i, order_input_desc.dtype))
+            : 0xFFFFFFFFu;
+        if (valid && key < threshold) {
+          const m1_u32 at = atomicAdd(&sel_fill, 1u);
+          if (at < kSelectCap) sel_cand[at] = ((m1_u64)key << 32) | (m1_u64)i;
+        }
+        const bool equal = valid && key == threshold;
+        const unsigned ballot = __ballot_sync(0xffffffffu, equal);
+        if (sel_lane == 0u) sel_warp[sel_warp_id] = __popc(ballot);
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+          m1_u32 run = sel_equal_seen;
+          for (m1_u32 w = 0u; w < sel_warps; ++w) {
+            const m1_u32 c = sel_warp[w];
+            sel_warp[w] = run;
+            run += c;
+          }
+          sel_equal_seen = run;
+        }
+        __syncthreads();
+        if (equal) {
+          const m1_u32 rank = sel_warp[sel_warp_id] + __popc(ballot & ((1u << sel_lane) - 1u));
+          if (rank < equal_take) sel_cand[less_count + rank] = ((m1_u64)key << 32) | (m1_u64)i;
+        }
+        __syncthreads();
+      }
+      for (m1_u32 at = order_count + threadIdx.x; at < kSelectCap; at += blockDim.x)
+        sel_cand[at] = 0xFFFFFFFFFFFFFFFFull;
+      __syncthreads();
+      // 3. Bitonic sort of the winners, ascending on (key, index).
+      for (m1_u32 size = 2u; size <= kSelectCap; size <<= 1u) {
+        for (m1_u32 stride = size >> 1u; stride > 0u; stride >>= 1u) {
+          for (m1_u32 i = threadIdx.x; i < kSelectCap; i += blockDim.x) {
+            const m1_u32 partner = i ^ stride;
+            if (partner > i) {
+              const m1_u64 a = sel_cand[i];
+              const m1_u64 b = sel_cand[partner];
+              const bool ascending = (i & size) == 0u;
+              if ((a > b) == ascending) {
+                sel_cand[i] = b;
+                sel_cand[partner] = a;
+              }
+            }
+          }
+          __syncthreads();
+        }
+      }
+      // 4. The result rows are `order_width` wide (see `BODY`).
+      for (m1_u32 at = threadIdx.x; at < order_count; at += blockDim.x) {
+        const m1_u32 index = (m1_u32)(sel_cand[at] & 0xFFFFFFFFull);
         m1_store_f(
             order_values,
             order_row * order_width + at,
@@ -289,7 +445,13 @@ pub fn emit_order_region(
         bases[node] + 1
     );
     let _ = writeln!(source, "  constexpr m1_u32 kWidth = {width}u;");
-    source.push_str(BODY);
+    if order.tag == tags::TOP_K && (1..=TOP_K_SELECT_MAX).contains(&width) {
+        let cap = width.next_power_of_two().max(2);
+        let _ = writeln!(source, "  constexpr m1_u32 kSelectCap = {cap}u;");
+        source.push_str(BODY_SELECT);
+    } else {
+        source.push_str(BODY);
+    }
     source.push_str("}\n");
     Ok(source)
 }

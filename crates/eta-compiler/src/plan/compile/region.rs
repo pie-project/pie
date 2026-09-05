@@ -99,6 +99,17 @@ pub struct Region {
     pub outputs: Vec<ValueId>,
     /// Channel writes ([`Op::ChanPut`]) performed inside the region.
     pub sinks: Vec<ChannelSink>,
+    /// A multi-row value naming the region's row geometry, when every op
+    /// in it works row by row (see [`node_geometry`]): a backend may then
+    /// launch one block per row, each block seeing only its row of every
+    /// multi-row value. For a `top_k`/`sort_desc` library region it names
+    /// the sorted input, for the same purpose. `None`: one block per lane.
+    pub row_value: Option<ValueId>,
+    /// When the geometry's rows are symbolic, the STATIC row count the
+    /// program's own arithmetic equates with it (`add([rows, v],
+    /// [256, v])`): a value with that many static rows is of the geometry
+    /// too. See [`row_alias`].
+    pub row_alias: Option<u64>,
 }
 
 /// Which of a stage's two partitions a [`RegionPartition`] is.
@@ -155,11 +166,49 @@ pub(crate) fn fused_partition(
             )
         })
         .collect();
+    // Row geometries some arithmetic op works in. A multi-row value only an
+    // intrinsic copy or a constant touches (the one-row sampler's
+    // `[rows, vocab]` logits, reshaped to a vector at once) is not one:
+    // its ops stay in the one-block run with their consumers, where the
+    // direct-argmax path finds them.
+    let alias = row_alias(stage, index);
+    let geometries: Vec<(Geometry, Option<ValueId>)> = (0..stage.ops.len() as u32)
+        .map(NodeIndex)
+        .map(|node| node_geometry(stage, index, node, alias))
+        .collect();
+    let arithmetic: BTreeSet<(u64, u32)> = geometries
+        .iter()
+        .zip(&stage.ops)
+        .filter_map(|((geometry, witness), op)| match geometry {
+            Geometry::Rows { fixed, extent }
+                if witness.is_some()
+                    && !matches!(op.tag(), eta_ir::op::tags::INTRINSIC_VAL | eta_ir::op::tags::CONST) =>
+            {
+                Some((*fixed, *extent))
+            }
+            _ => None,
+        })
+        .collect();
+    let class = |node: NodeIndex| -> (Geometry, Option<ValueId>) {
+        match geometries[node.index()] {
+            (Geometry::Rows { fixed, extent }, witness) if arithmetic.contains(&(fixed, extent)) => {
+                (Geometry::Rows { fixed, extent }, witness)
+            }
+            // One block per lane, fused with its neighbours as always.
+            _ => (Geometry::Single, None),
+        }
+    };
+    // A scalar constant joins whatever run it sits in: every block of a row
+    // run writes the same word.
+    let joins_any = |node: NodeIndex| stage.ops[node.index()].tag() == eta_ir::op::tags::CONST
+        && geometries[node.index()].0 == Geometry::Single;
+
     let mut regions = Vec::new();
     let mut generated = Vec::new();
+    let mut run: Option<(Geometry, Option<ValueId>)> = None;
     for node in (0..stage.ops.len() as u32).map(NodeIndex) {
         if matched_nodes.contains(&node) {
-            flush_generated_region(stage, index, &mut regions, &mut generated);
+            flush_generated_run(stage, index, &mut regions, &mut generated, &mut run, alias);
             if let Some(candidate) = matches_by_end.get(&node) {
                 regions.push(build_library_match_region(stage, index, candidate));
             }
@@ -168,20 +217,68 @@ pub(crate) fn fused_partition(
 
         let kind = region_kind_for_node(stage, node);
         if matches!(kind, RegionKind::Library(_)) {
-            flush_generated_region(stage, index, &mut regions, &mut generated);
-            regions.push(build_region(stage, index, vec![node], kind));
+            flush_generated_run(stage, index, &mut regions, &mut generated, &mut run, alias);
+            let mut region = build_region(stage, index, vec![node], kind);
+            if matches!(kind, RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort)) {
+                region.row_value = stage.ops[node.index()].operands().first().copied();
+            }
+            regions.push(region);
             continue;
+        }
+
+        // Generated ops fuse while they share a class: one row geometry the
+        // launch splits by rows, or the one-block run.
+        if joins_any(node) && run.is_some() {
+            generated.push(node);
+            continue;
+        }
+        let (geometry, witness) = class(node);
+        if run.is_some_and(|(seen, _)| seen != geometry) {
+            flush_generated_run(stage, index, &mut regions, &mut generated, &mut run, alias);
+        }
+        match run {
+            None => run = Some((geometry, witness)),
+            // A run opened by vector-only ops learns its witness from the
+            // first multi-row op.
+            Some((seen, None)) if witness.is_some() => run = Some((seen, witness)),
+            _ => {}
         }
 
         // The only ops worth refusing to fuse are all `library_op_for_tag`
         // ops, already routed above, so nothing else can break the run here.
         generated.push(node);
     }
-    flush_generated_region(stage, index, &mut regions, &mut generated);
+    flush_generated_run(stage, index, &mut regions, &mut generated, &mut run, alias);
     RegionPartition {
         kind: PartitionKind::Fused,
         regions,
         whole_stage_fallback: false,
+    }
+}
+
+/// [`flush_generated_region`], stamping the run's row geometry witness.
+fn flush_generated_run(
+    stage: &NormalizedStage,
+    index: &StageIndex,
+    regions: &mut Vec<Region>,
+    nodes: &mut Vec<NodeIndex>,
+    run: &mut Option<(Geometry, Option<ValueId>)>,
+    alias: Option<(u32, u64)>,
+) {
+    let (witness, row_alias) = match run.take() {
+        Some((Geometry::Rows { fixed, extent }, witness)) => (
+            witness,
+            alias.filter(|&(role, _)| fixed == 1 && role == extent).map(|(_, n)| n),
+        ),
+        _ => (None, None),
+    };
+    let before = regions.len();
+    flush_generated_region(stage, index, regions, nodes);
+    if regions.len() > before
+        && let Some(region) = regions.last_mut()
+    {
+        region.row_value = witness;
+        region.row_alias = row_alias;
     }
 }
 
@@ -372,5 +469,266 @@ pub(crate) fn build_region(
         inputs: inputs.into_iter().collect(),
         outputs: outputs.into_iter().collect(),
         sinks,
+        row_value: None,
+        row_alias: None,
     }
+}
+
+/// The row geometry of one node, for the row-parallel launch of a generated
+/// region: the `(fixed rows, symbolic row extent)` every multi-row tensor
+/// it touches shares (`Rows`), no multi-row tensor at all (`Single` — the
+/// one-row sampler's every op, fused as before), or a node that touches a
+/// multi-row tensor and may not be split by rows (`Mixed`): one that mixes
+/// geometries, cannot say its row width, or reaches across rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Geometry {
+    Single,
+    Rows { fixed: u64, extent: u32 },
+    Mixed,
+}
+
+/// The rows of a value: the product of its leading dims, one of which may
+/// be symbolic. Rank 0 and rank 1 are one row. `None` when a rank-2+ value
+/// has a symbolic trailing dim (its row width is unknown) or two symbolic
+/// leading dims.
+pub fn value_rows(dims: &[Dimension]) -> Option<(u64, u32)> {
+    let Some((last, leading)) = dims.split_last() else {
+        return Some((1, u32::MAX));
+    };
+    if leading.is_empty() {
+        return Some((1, u32::MAX));
+    }
+    if !matches!(last, Dimension::Static(width) if *width > 0) {
+        return None;
+    }
+    let mut fixed = 1u64;
+    let mut extent = u32::MAX;
+    for dimension in leading {
+        match dimension {
+            Dimension::Symbolic(role) => {
+                if extent != u32::MAX {
+                    return None;
+                }
+                extent = *role as u32;
+            }
+            Dimension::Static(value) => {
+                if *value == 0 {
+                    return None;
+                }
+                fixed = fixed.checked_mul(*value as u64)?;
+            }
+        }
+    }
+    Some((fixed, extent))
+}
+
+/// Whether `dims` is the rank-1 vector of a geometry's rows — the shape a
+/// row reduction writes one element of per row. `alias` is the static row
+/// count that stands for a symbolic geometry ([`row_alias`]).
+pub fn is_row_vector(dims: &[Dimension], fixed: u64, extent: u32, alias: Option<u64>) -> bool {
+    match dims {
+        [Dimension::Static(n)] => {
+            (extent == u32::MAX && *n as u64 == fixed) || (fixed == 1 && alias == Some(*n as u64))
+        }
+        [Dimension::Symbolic(role)] => fixed == 1 && *role as u32 == extent,
+        _ => false,
+    }
+}
+
+/// Whether a multi-row `shape` (from [`value_rows`]) is `geometry`, given
+/// `alias` — the static row count standing for the geometry's symbolic rows.
+pub fn same_rows(shape: (u64, u32), geometry: (u64, u32), alias: Option<u64>) -> bool {
+    shape == geometry || (geometry.0 == 1 && alias.is_some_and(|n| shape == (n, u32::MAX)))
+}
+
+/// The one static row count a stage's arithmetic equates with a symbolic
+/// row extent: an op whose multi-row tensors are exactly `[role, w]` and
+/// `[n, w]` (the trace's own shape check let it through, so `role` was `n`
+/// when the trace ran) says `(role, n)`. `None` when no op does, or two
+/// disagree.
+pub(crate) fn row_alias(stage: &NormalizedStage, index: &StageIndex) -> Option<(u32, u64)> {
+    let mut found: Option<(u32, u64)> = None;
+    for node in (0..stage.ops.len() as u32).map(NodeIndex) {
+        let op = &stage.ops[node.index()];
+        let base = index.base(node).unwrap_or_default();
+        let mut symbolic: Option<u32> = None;
+        let mut fixed: Option<u64> = None;
+        let values = op
+            .operands()
+            .into_iter()
+            .chain((0..op.result_count()).map(|result| base + result));
+        for value in values {
+            let Some(ty) = stage.value_types.get(value as usize) else { continue };
+            match value_rows(&ty.dims) {
+                Some((1, u32::MAX)) | None => {}
+                Some((1, role)) => symbolic = Some(role),
+                Some((n, u32::MAX)) => fixed = Some(n),
+                Some(_) => {}
+            }
+        }
+        if let (Some(role), Some(n)) = (symbolic, fixed) {
+            match found {
+                None => found = Some((role, n)),
+                Some(seen) if seen == (role, n) => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    found
+}
+
+/// The ops a row-parallel block may run on its row alone: elementwise maps
+/// (an operand of one element broadcasts), row reductions, broadcasts,
+/// constants, the intrinsic copy, the keyed RNG (its key is the element's
+/// position, which the backend offsets by the row) and `gather_row`. Not:
+/// `iota` and the masks (they generate by absolute position), reshape
+/// (it re-rows), gathers/scatters/transposes/pivots (they reach across
+/// rows), and channel traffic (a copy of the whole cell).
+fn row_parallel_tag(tag: u8) -> bool {
+    use eta_ir::op::tags;
+    matches!(
+        tag,
+        tags::EXP
+            | tags::LOG
+            | tags::NEG
+            | tags::RECIP
+            | tags::ABS
+            | tags::SIGN
+            | tags::CAST
+            | tags::ADD
+            | tags::SUB
+            | tags::MUL
+            | tags::DIV
+            | tags::MAX_ELEM
+            | tags::MIN_ELEM
+            | tags::GT
+            | tags::GE
+            | tags::EQ
+            | tags::NE
+            | tags::LT
+            | tags::LE
+            | tags::AND
+            | tags::OR
+            | tags::NOT
+            | tags::REM
+            | tags::SELECT
+            | tags::RNG
+            | tags::RNG_KEYED
+            | tags::REDUCE_SUM
+            | tags::REDUCE_MAX
+            | tags::REDUCE_MIN
+            | tags::REDUCE_ARGMAX
+            | tags::BROADCAST
+            | tags::CONST
+            | tags::INTRINSIC_VAL
+            | tags::GATHER_ROW
+    )
+}
+
+/// [`Geometry`] of `node`, with a multi-row value witnessing it.
+pub(crate) fn node_geometry(
+    stage: &NormalizedStage,
+    index: &StageIndex,
+    node: NodeIndex,
+    alias: Option<(u32, u64)>,
+) -> (Geometry, Option<ValueId>) {
+    use eta_ir::op::tags;
+    let op = &stage.ops[node.index()];
+    let base = index.base(node).unwrap_or_default();
+    // A static row count the stage equates with a symbolic one reads as
+    // the symbolic geometry.
+    let canonical = |shape: (u64, u32)| match (shape, alias) {
+        ((n, u32::MAX), Some((role, m))) if n == m => (1, role),
+        _ => shape,
+    };
+    let static_rows = alias.map(|(_, n)| n);
+    let operands = op.operands();
+    let values = operands
+        .iter()
+        .copied()
+        .chain((0..op.result_count()).map(|result| base + result));
+    let mut rows: Option<(u64, u32)> = None;
+    let mut witness = None;
+    let mut vectors: Vec<ValueId> = Vec::new();
+    for value in values {
+        let Some(ty) = stage.value_types.get(value as usize) else {
+            return (Geometry::Mixed, None);
+        };
+        let Some(shape) = value_rows(&ty.dims) else {
+            return (Geometry::Mixed, None);
+        };
+        let shape = canonical(shape);
+        if shape == (1, u32::MAX) {
+            if ty.dims.len() == 1 {
+                vectors.push(value);
+            }
+            continue;
+        }
+        match rows {
+            None => {
+                rows = Some(shape);
+                witness = Some(value);
+            }
+            Some(seen) if seen == shape => {}
+            Some(_) => return (Geometry::Mixed, None),
+        }
+    }
+    let whitelisted = row_parallel_tag(op.tag());
+    let Some((fixed, extent)) = rows else {
+        // No multi-row tensor. A row block can still own one element of a
+        // per-row VECTOR (what a row reduction writes) in an elementwise
+        // map or a keyed draw — that is what keeps `-h`, `select(accept,
+        // ..)` and the like inside the row run. The geometry is only known
+        // once some multi-row op names it, so this is a candidate that
+        // `fused_partition` confirms against the arithmetic geometries; a
+        // reduction of a vector reads across the rows and stays one block.
+        // Everything else is one row's work, fused as it always was.
+        if whitelisted
+            && !matches!(
+                op.tag(),
+                tags::REDUCE_SUM
+                    | tags::REDUCE_MAX
+                    | tags::REDUCE_MIN
+                    | tags::REDUCE_ARGMAX
+                    | tags::GATHER_ROW
+                    | tags::INTRINSIC_VAL
+                    | tags::CONST
+            )
+            && !vectors.is_empty()
+            && let Some(&first) = vectors.first()
+            && let Some(ty) = stage.value_types.get(first as usize)
+            && let [dim] = ty.dims.as_slice()
+            && vectors
+                .iter()
+                .all(|&v| stage.value_types.get(v as usize).map(|t| t.dims.as_slice()) == Some(&[*dim]))
+        {
+            return match dim {
+                Dimension::Static(n) => {
+                    let (fixed, extent) = canonical((*n as u64, u32::MAX));
+                    (Geometry::Rows { fixed, extent }, None)
+                }
+                Dimension::Symbolic(role) => (Geometry::Rows { fixed: 1, extent: *role as u32 }, None),
+            };
+        }
+        return (Geometry::Single, None);
+    };
+    if !whitelisted {
+        return (Geometry::Mixed, None);
+    }
+    // A reduction's per-row result is a vector of the rows; any other rank-1
+    // operand or result must be that vector too (the broadcast source, the
+    // `gather_row` index), or the op reads across rows — except a one-element
+    // vector, and a draw's `[key, counter]` state, which every block reads
+    // whole.
+    let state = matches!(op.tag(), tags::RNG | tags::RNG_KEYED);
+    if vectors.iter().any(|&v| {
+        stage.value_types.get(v as usize).is_none_or(|t| {
+            !is_row_vector(&t.dims, fixed, extent, static_rows)
+                && !matches!(t.dims.as_slice(), [Dimension::Static(1)])
+                && !(state && operands.contains(&v))
+        })
+    }) {
+        return (Geometry::Mixed, None);
+    }
+    (Geometry::Rows { fixed, extent }, witness)
 }

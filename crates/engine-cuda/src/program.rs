@@ -677,6 +677,22 @@ impl Plane {
         // Seats go back; a shared ring's `Arc` is also held by the engine's
         // channel table, so it survives this drop.
         release_seats(&bound.endpoints);
+        // The program's last instance takes its stage scratch with it. The
+        // program itself stays (its modules are the compile cache, and a
+        // re-run binds warm), but its per-extents batches are per-lane
+        // scratch a canvas program measures in hundreds of megabytes, and a
+        // handful of distinct guest programs left resident would exhaust
+        // the device. Nothing recorded holds these addresses — bodies are
+        // keyed by the model's composition, not by a guest program — and a
+        // `Buffer` frees through `cudaFree`, which waits for any launch
+        // still reading it. The next bind cuts the batch again.
+        let orphaned = !self
+            .instances
+            .values()
+            .any(|other| other.program_id == bound.program_id);
+        if orphaned && let Some(program) = self.programs.get_mut(&bound.program_id) {
+            program.batches.clear();
+        }
         Ok(())
     }
 

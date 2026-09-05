@@ -15,4 +15,6 @@ u) {
       all_descriptors + (m1_u64)dispatch_lane * value_count;
   m1_u8* scratch =
       all_scratch + (m1_u64)dispatch_lane * scratch_stride;
-  m1_u8* temporary = scratch + temporary_offset;
+  // Each of a lane's blocks owns `temporary_stride` bytes of the arena.
+  m1_u8* temporary = scratch + temporary_offset + (m1_u64)lane_row * temporary_stride;
+  (void)temporary;

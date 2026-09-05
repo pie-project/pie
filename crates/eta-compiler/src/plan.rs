@@ -5,6 +5,7 @@
 //! already settled arity, SSA dominance, value-id range and stage ordering.
 
 mod compile;
+pub use compile::{is_row_vector, same_rows, value_rows};
 pub mod lane_table;
 
 // Spelled out rather than `pub use compile::*`, which made every `pub` item
