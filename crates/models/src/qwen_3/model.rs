@@ -134,6 +134,10 @@ pub enum Recipe {
     /// sublayer ([`DynConv`]). The candidate selector the head also ships is
     /// not declared yet — the readout is the per-slot argmax, as v1's.
     DFlash2,
+    /// DSpark (`DimInfer/Qwen3.8-27B-Dspark-v1`): the v1 backbone, all
+    /// layers full, a block of fifteen whose every row proposes, a markov
+    /// bigram readout. See [`crate::drafter::dflash::Version::DSpark`].
+    DSpark,
 }
 
 impl Recipe {
@@ -142,7 +146,7 @@ impl Recipe {
     pub fn prefix(self) -> &'static str {
         match self {
             Recipe::Mtp => "mtp",
-            Recipe::Eagle | Recipe::DFlash | Recipe::DFlash2 => "aux",
+            Recipe::Eagle | Recipe::DFlash | Recipe::DFlash2 | Recipe::DSpark => "aux",
         }
     }
 
@@ -150,7 +154,7 @@ impl Recipe {
     /// chained head ([`Mtp`]).
     #[must_use]
     pub fn drafts_a_block(self) -> bool {
-        matches!(self, Recipe::DFlash | Recipe::DFlash2)
+        matches!(self, Recipe::DFlash | Recipe::DFlash2 | Recipe::DSpark)
     }
 }
 
@@ -651,6 +655,12 @@ impl Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DFlash2)))
     }
 
+    /// The 27B with the DSpark drafter overlaid by `--aux`
+    /// (`DimInfer/Qwen3.8-27B-Dspark-v1`).
+    pub fn d27b_dspark(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DSpark)))
+    }
+
     /// Same 64 layers without the draft head. Used for 4-bit conversions:
     /// `mlx_lm` implements no MTP arm for this family, so those artifacts
     /// carry none of the `mtp.*` planes.
@@ -949,6 +959,7 @@ impl Model {
         let dflash = d.draft.filter(|r| r.drafts_a_block()).map(|recipe| {
             let version = match recipe {
                 Recipe::DFlash2 => dflash::Version::Two,
+                Recipe::DSpark => dflash::Version::DSpark,
                 _ => dflash::Version::One,
             };
             DFlash::declare(

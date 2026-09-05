@@ -18,6 +18,13 @@ pub enum Version {
     /// inside the block, a dynamic convolution around every sublayer, a
     /// candidate selector for the readout.
     Two,
+    /// `DimInfer/Qwen3.8-27B-Dspark-v1`: the v1 backbone (its taps, five
+    /// plain layers) with every layer full attention and the block
+    /// bidirectional, a block of fifteen whose EVERY row proposes (row `i`
+    /// predicts position `i + 1`, the anchor's row included), and a markov
+    /// bigram head for the readout — a [`Selector`] with no hidden term. Its
+    /// confidence head is not read yet.
+    DSpark,
 }
 
 /// What the drafter reads off the trunk it is declared beside: the numbers
@@ -88,6 +95,10 @@ pub struct DFlash {
     /// DFlash2's candidate selector; `None` on a v1 head, whose readout is
     /// the per-slot argmax.
     pub selector: Option<Selector>,
+    /// The first block row whose readout is a proposal — 1 for both DFlash
+    /// heads (the anchor row proposes nothing), 0 for DSpark.
+    pub proposals_from: u32,
+    pub version: Version,
 }
 
 /// **DFlash2's candidate selector** — the head's readout. Each mask slot
@@ -99,8 +110,9 @@ pub struct DFlash {
 /// `attention.selector_walk`, planted at the `mtp.drafts` seam where v1
 /// plants its argmax.
 pub struct Selector {
-    /// `[rank, hidden]`.
-    pub hidden_projection: Weight,
+    /// `[rank, hidden]`; `None` for a plain bigram lattice (DSpark), whose
+    /// score is `unary + ⟨pred[prev], succ[c]⟩` with no hidden term.
+    pub hidden_projection: Option<Weight>,
     /// `[vocab, rank]`, indexed by the predecessor's id.
     pub pred: Weight,
     /// `[vocab, rank]`, indexed by the candidate's id.
@@ -215,6 +227,18 @@ const CONV_GROUP: u32 = 16;
 const SELECTOR_RANK: u32 = 256;
 const SELECTOR_TOP_K: u32 = 16;
 
+/// **The DSpark head's own numbers** (`DimInfer/Qwen3.8-27B-Dspark-v1`'s
+/// `config.json`): v1's taps and geometry, `block_size` 15, `logits_start`
+/// 0, its own mask id, `markov_rank` 256. The markov head biases the WHOLE
+/// vocabulary in the reference; here it biases the slot's top-`K` — the
+/// same approximation DFlash2's selector was trained with, taken so one
+/// kernel serves both, and paid for in acceptance only (the verify is what
+/// makes a round lossless).
+pub const BLOCK_DSPARK: u32 = 15;
+const MASK_TOKEN_DSPARK: u32 = 248_200;
+const MARKOV_RANK: u32 = 256;
+const MARKOV_TOP_K: u32 = 16;
+
 impl DFlash {
     /// Declare the head's planes under `prefix` (`aux` for an `--aux`
     /// overlay), shaped by the trunk's hidden width and element types.
@@ -236,6 +260,7 @@ impl DFlash {
         // v1 and v2 differ in the taps, the block, the window rule, the
         // convolution and the readout; everything else below is one text.
         let v2 = version == Version::Two;
+        let dspark = version == Version::DSpark;
         let taps: &[u32] = if v2 { &TAPS2 } else { &TAPS };
         let groups = hidden / u64::from(CONV_GROUP);
         let conv = |l: u32, which: &str| {
@@ -299,8 +324,9 @@ impl DFlash {
                             inter,
                         },
                         // The v1 head is four sliding layers then one full;
-                        // v2 is five sliding (`layer_types` in the two configs).
-                        window: (v2 || l + 1 < LAYERS).then_some(WINDOW),
+                        // v2 is five sliding; DSpark is five full
+                        // (`layer_types` in the three configs).
+                        window: (!dspark && (v2 || l + 1 < LAYERS)).then_some(WINDOW),
                         attn_conv: conv(l, "attention_conv"),
                         mlp_conv: conv(l, "mlp_conv"),
                     }
@@ -308,29 +334,46 @@ impl DFlash {
                 .collect(),
             norm: Weight::sym(n("norm"), [hidden], dense),
             norm_eps: trunk.norm_eps,
-            block: if v2 { BLOCK2 } else { BLOCK },
-            mask_token: MASK_TOKEN,
-            selector: v2.then(|| Selector {
-                hidden_projection: Weight::sym(
-                    n("candidate_selector.hidden_projection"),
-                    [u64::from(SELECTOR_RANK), hidden],
-                    w,
-                )
-                .columns(),
-                // Read seven times sixteen rows a fire: carried dense, where
-                // precision costs nothing and the gather is exact.
-                pred: Weight::sym(
-                    n("candidate_selector.predecessor_codebook"),
-                    [trunk.vocab, u64::from(SELECTOR_RANK)],
-                    dense,
-                ),
-                succ: Weight::sym(
-                    n("candidate_selector.successor_codebook"),
-                    [trunk.vocab, u64::from(SELECTOR_RANK)],
-                    dense,
-                ),
-                top_k: SELECTOR_TOP_K,
-            }),
+            block: match version {
+                Version::One => BLOCK,
+                Version::Two => BLOCK2,
+                Version::DSpark => BLOCK_DSPARK,
+            },
+            mask_token: if dspark { MASK_TOKEN_DSPARK } else { MASK_TOKEN },
+            proposals_from: u32::from(!dspark),
+            selector: match version {
+                Version::One => None,
+                Version::Two => Some(Selector {
+                    hidden_projection: Some(
+                        Weight::sym(
+                            n("candidate_selector.hidden_projection"),
+                            [u64::from(SELECTOR_RANK), hidden],
+                            w,
+                        )
+                        .columns(),
+                    ),
+                    // Read seven times sixteen rows a fire: carried dense,
+                    // where precision costs nothing and the gather is exact.
+                    pred: Weight::sym(
+                        n("candidate_selector.predecessor_codebook"),
+                        [trunk.vocab, u64::from(SELECTOR_RANK)],
+                        dense,
+                    ),
+                    succ: Weight::sym(
+                        n("candidate_selector.successor_codebook"),
+                        [trunk.vocab, u64::from(SELECTOR_RANK)],
+                        dense,
+                    ),
+                    top_k: SELECTOR_TOP_K,
+                }),
+                Version::DSpark => Some(Selector {
+                    hidden_projection: None,
+                    pred: Weight::sym(n("markov_w1"), [trunk.vocab, u64::from(MARKOV_RANK)], dense),
+                    succ: Weight::sym(n("markov_w2"), [trunk.vocab, u64::from(MARKOV_RANK)], dense),
+                    top_k: MARKOV_TOP_K,
+                }),
+            },
+            version,
         }
     }
 
@@ -522,15 +565,27 @@ impl DFlash {
             rows: self.block,
             mask_token: self.mask_token,
             bidirectional: self.blocks.iter().any(|b| b.window.is_none()),
+            proposals_from: self.proposals_from,
         });
         let (dlogits, _) = logits.split(block_draft);
         seam::at(seam::MTP, &[&dlogits]);
         let picks = match (&self.selector, hb) {
             (Some(sel), Some(hb)) => {
                 let (unary, cand) = ops::layout::topk(&dlogits, sel.top_k);
-                let hp = ops::linear::matmul(hb, &sel.hidden_projection);
+                let hp = sel
+                    .hidden_projection
+                    .as_ref()
+                    .map(|proj| ops::linear::matmul(hb, proj));
                 let (toks, _) = inputs.tokens().split(block_draft);
-                ops::attn::selector_walk(&cand, &unary, &hp, &toks, &sel.pred, &sel.succ)
+                ops::attn::selector_walk(
+                    &cand,
+                    &unary,
+                    hp.as_ref(),
+                    &toks,
+                    &sel.pred,
+                    &sel.succ,
+                    self.proposals_from,
+                )
             }
             _ => ops::layout::argmax(&[&dlogits]),
         };
@@ -600,10 +655,23 @@ impl DFlash {
         b.read_expr(&self.norm, norm("aux.norm.weight".to_string()))?;
         // DFlash2's selector: a projection bank and two codebooks, the
         // codebooks stored as plain arrays (no `.weight`).
-        if let Some(sel) = &self.selector {
-            b.read(&sel.hidden_projection, "aux.candidate_selector.hidden_projection.weight".to_string())?;
-            b.read(&sel.pred, "aux.candidate_selector.predecessor_codebook".to_string())?;
-            b.read(&sel.succ, "aux.candidate_selector.successor_codebook".to_string())?;
+        match (&self.selector, self.version) {
+            (Some(sel), Version::Two) => {
+                if let Some(proj) = &sel.hidden_projection {
+                    b.read(proj, "aux.candidate_selector.hidden_projection.weight".to_string())?;
+                }
+                b.read(&sel.pred, "aux.candidate_selector.predecessor_codebook".to_string())?;
+                b.read(&sel.succ, "aux.candidate_selector.successor_codebook".to_string())?;
+            }
+            // DSpark's markov head: `w1` an embedding indexed by the previous
+            // id, `w2` a linear whose weight is `[vocab, rank]` — the same
+            // shape, read as the successor codebook. Its confidence head
+            // (`confidence_head.proj.*`) is left out until a guest reads it.
+            (Some(sel), Version::DSpark) => {
+                b.read(&sel.pred, "aux.markov_head.markov_w1.weight".to_string())?;
+                b.read(&sel.succ, "aux.markov_head.markov_w2.weight".to_string())?;
+            }
+            _ => {}
         }
         Ok(())
     }

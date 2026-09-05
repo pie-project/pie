@@ -201,3 +201,33 @@ fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
     assert!((plain.trace)(Platform::Metal).drafter.is_none());
 }
 
+/// **THE DSPARK TEXT**: v1's backbone with no convolution, a top-k and a
+/// bigram walk for its readout, and a block of fifteen whose every row
+/// proposes — the anchor row included.
+#[test]
+fn the_dspark_plan_is_whole_and_walks_a_bigram() {
+    use model_dsl::Platform;
+    let row = models::skus()
+        .find(|row| row.recipe.text == "qwen38-27b-dspark")
+        .expect("this build ships the DSpark row");
+    let trace = (row.trace)(Platform::Metal);
+    let count = |pred: &dyn Fn(&model_dsl::Operation) -> bool| trace.nodes.iter().filter(|n| pred(&n.op)).count();
+    assert_eq!(count(&|op| matches!(op, model_dsl::Operation::Attention(model_dsl::Attention::BlockDynConv { .. }))), 0);
+    assert_eq!(count(&|op| matches!(op, model_dsl::Operation::Layout(model_dsl::Layout::TopK { .. }))), 1);
+    let walks: Vec<_> = trace
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            model_dsl::Operation::Attention(model_dsl::Attention::SelectorWalk { hp, first, .. }) => Some((*hp, *first)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(walks.len(), 1);
+    assert_eq!(walks[0], (None, 0), "a bigram lattice walked from the anchor row");
+    let facts = trace.drafter.expect("the DSpark text states its block drafter");
+    assert_eq!(
+        (facts.rows, facts.mask_token, facts.bidirectional, facts.proposals_from),
+        (15, 248_200, true, 0)
+    );
+}
+

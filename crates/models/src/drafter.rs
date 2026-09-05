@@ -66,6 +66,12 @@ pub const PUBLISHED: &[Published] = &[
         drafter: "dflash2",
         sku: "qwen38-27b-dflash2-u4g64-kv-bf16",
     },
+    Published {
+        target: "mlx-community/Qwen3.8-27B-4bit",
+        head: "DimInfer/Qwen3.8-27B-Dspark-v1",
+        drafter: "dspark",
+        sku: "qwen38-27b-dspark-u4g64-kv-bf16",
+    },
 ];
 
 /// The published head named `drafter` for `target`, if this build knows one.
