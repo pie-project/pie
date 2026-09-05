@@ -46,6 +46,14 @@ pub struct ImportArgs {
     /// under the `aux.` prefix.
     #[arg(long, value_name = "SOURCE")]
     pub aux: Option<String>,
+    /// Overlay the published draft head of this name for this checkpoint:
+    /// `--aux` and `--sku` filled in from the catalog's table of published
+    /// heads (`models::drafter::PUBLISHED`), so `pie model import
+    /// mlx-community/Qwen3.8-27B-4bit --drafter dflash2` is the whole recipe.
+    /// A name or a target the table does not know is refused with what it
+    /// does know.
+    #[arg(long, value_name = "NAME", conflicts_with = "aux")]
+    pub drafter: Option<String>,
     /// Import as this catalog row, rather than as the first row whose
     /// contract fits the source. Several rows can only be reached this way —
     /// a family's text row reads every snapshot its vision row does and is
@@ -113,7 +121,31 @@ fn consuming_marker(source: &Path) -> PathBuf {
     }
 }
 
-pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
+pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
+    // `--drafter <name>` is `--aux <head> --sku <row>` looked up for the
+    // source, and it is resolved before anything is fetched: a name the table
+    // lacks must not cost a download to find out about.
+    if let Some(name) = args.drafter.take() {
+        let Some(published) = models::drafter::published(&args.source, &name) else {
+            let known: Vec<String> = models::drafter::published_for(&args.source)
+                .map(|p| format!("`{}` ({})", p.drafter, p.head))
+                .collect();
+            bail!(
+                "--drafter {name}: no published head of that name for {} in this build; {}",
+                args.source,
+                if known.is_empty() {
+                    "this build knows no head for that target — pass the head with `--aux` and \
+                     the row with `--sku`".to_string()
+                } else {
+                    format!("it knows {}", known.join(", "))
+                }
+            );
+        };
+        args.aux = Some(published.head.to_string());
+        if args.sku.is_none() {
+            args.sku = Some(published.sku.to_string());
+        }
+    }
     // The name is checked against the catalog FIRST, before the source is
     // resolved: a misspelled row must not cost a fourteen-gigabyte download
     // to find out about, and `--sku '?'` is how an operator asks what the rows
