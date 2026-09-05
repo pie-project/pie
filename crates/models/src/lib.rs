@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod deepseek_v4;
+pub mod drafter;
 pub mod gemma_4;
 pub mod glm_5;
 pub mod glm_5_next;

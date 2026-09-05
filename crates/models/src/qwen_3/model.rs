@@ -1,3 +1,4 @@
+use crate::drafter::dflash::{self, DFlash};
 use model_dsl::{Dtype, Weight};
 
 
@@ -35,7 +36,9 @@ pub struct Model {
     /// a second checkpoint; both share this same declaration.
     pub mtp: Option<Mtp>,
 
-    /// The block drafter, when this SKU's recipe is [`Recipe::DFlash`].
+    /// The block drafter, when this SKU's recipe is [`Recipe::DFlash`] or
+    /// [`Recipe::DFlash2`] — declared in [`crate::drafter::dflash`], since it
+    /// brings its own architecture and nothing of this trunk's.
     /// Exclusive with [`mtp`](Model::mtp): a plan carries one draft head or
     /// none, and the two shapes share no declaration.
     pub dflash: Option<DFlash>,
@@ -95,143 +98,6 @@ pub struct Mtp {
     /// out of the block directly.
     pub norm: Option<Weight>,
     pub norm_eps: f32,
-}
-
-/// **A DFlash block drafter** — the shape `z-lab/Qwen3.6-27B-DFlash` ships.
-///
-/// Where [`Mtp`] fuses one hidden state with one token embedding and runs a
-/// single block chained a token at a time, this fuses [`taps`](DFlash::taps)
-/// TRUNK HIDDEN STATES and runs [`blocks`](DFlash::blocks) layers ONCE over a
-/// whole block of rows whose tail is the mask token, so a single pass
-/// proposes [`block`](DFlash::block) tokens:
-///
-/// ```text
-/// h  = rms(Σᵢ tapᵢ · fcᵢ)                       the five taps, fused
-/// for each block:  h += attn(rms(h));  h += mlp(rms(h))
-/// draft = lm_head(rms(h))                       through the TARGET's head
-/// ```
-///
-/// Three things differ from every other head this family carries, and each
-/// is why this is its own declaration rather than a flag on [`Mtp`]:
-///
-/// * **The fusion is five-wide.** The stored `fc.weight` is one
-///   `[hidden, 5·hidden]` bank; the IR has no concat, so it is sliced into
-///   five `[hidden, hidden]` banks summed with `residual_add`, the same way
-///   [`Mtp`] splits its two-wide bank.
-/// * **The attention is NOT the family's gated site.** Its `q_proj` is
-///   `[q_heads·head_dim, hidden]`, not the trunk's `2·q_heads·head_dim` — no
-///   gate to split off — and its geometry is its own (32 q heads, 8 kv, head
-///   dim 128 against the trunk's 24/4/256). Only the plane width coincides
-///   (8·128 = 4·256 = 1024), which is what lets its kv rows share the
-///   trunk's page-id space.
-/// * **The pass is bidirectional over the block.** Four of five layers are
-///   sliding-window; the mask that makes the block see itself is the
-///   guest's (`inputs.mask()`), not the model's.
-pub struct DFlash {
-    /// Which trunk layers feed the fusion, in the order their banks are
-    /// sliced out of `fc` — `[1, 16, 31, 46, 61]` for the shipped head.
-    pub taps: Vec<u32>,
-    /// One `[hidden, hidden]` column slice of the stored `fc.weight` per tap.
-    pub fc: Vec<Weight>,
-    /// Scales the fused stream before the first block.
-    pub hidden_norm: Weight,
-    pub hidden_norm_eps: f32,
-    pub blocks: Vec<DFlashBlock>,
-    /// The final norm before the readout through the target's `lm_head`.
-    pub norm: Weight,
-    pub norm_eps: f32,
-    /// Rows one draft pass proposes — the width of the `mtp.drafts` seam.
-    pub block: u32,
-    /// The token every block row but the first carries on the way in.
-    pub mask_token: u32,
-    /// DFlash2's candidate selector; `None` on a v1 head, whose readout is
-    /// the per-slot argmax.
-    pub selector: Option<Selector>,
-}
-
-/// **DFlash2's candidate selector** — the head's readout. Each mask slot
-/// keeps its `top_k` candidates off the target's head, and a path through
-/// them is walked from the anchor: slot `s` picks
-/// `argmax_c unary[c] + ⟨pred[prev] ⊙ hidden_projection(h_s), succ[c]⟩`,
-/// `prev` the previous slot's pick (the anchor's id first). Two `[vocab,
-/// rank]` codebooks and one projection; the walk is
-/// `attention.selector_walk`, planted at the `mtp.drafts` seam where v1
-/// plants its argmax.
-pub struct Selector {
-    /// `[rank, hidden]`.
-    pub hidden_projection: Weight,
-    /// `[vocab, rank]`, indexed by the predecessor's id.
-    pub pred: Weight,
-    /// `[vocab, rank]`, indexed by the candidate's id.
-    pub succ: Weight,
-    pub top_k: u32,
-}
-
-/// One layer of a [`DFlash`] drafter: the standard pre-norm decoder block,
-/// with its own ungated attention and a sliding window on all but the last.
-pub struct DFlashBlock {
-    pub mixer_norm: Weight,
-    pub mixer_norm_eps: f32,
-    pub attn: DraftAttn,
-    pub mlp_norm: Weight,
-    pub mlp_norm_eps: f32,
-    pub mlp: Mlp,
-    /// Keys older than this many positions are not attended; `None` on the
-    /// one full-attention layer the shipped v1 head ends with (v2 has none).
-    pub window: Option<u32>,
-    /// DFlash2's dynamic convolution around the attention sublayer; `None`
-    /// on a v1 head.
-    pub attn_conv: Option<DynConv>,
-    /// The same around the MLP sublayer.
-    pub mlp_conv: Option<DynConv>,
-}
-
-/// **DFlash2's two-tap grouped dynamic convolution** around one sublayer
-/// (`attention_conv` / `mlp_conv`). One projection of the sublayer's normed
-/// input yields the coefficients for BOTH sides — the input convolved before
-/// the sublayer and its output convolved after — as a learned per-channel
-/// base plus a per-group correction:
-///
-/// ```text
-/// coeff  = proj(x)                        [rows, 2·taps·groups], (side, tap, group)
-/// x'     = Σ_t (base[0, t] + δ[i, 0, t, g]) ⊙ x[i − t]      before the sublayer
-/// y'     = Σ_t (base[1, t] + δ[i, 1, t, g]) ⊙ y[i − t]      after it
-/// ```
-///
-/// along the block axis, `x[−1] = 0`. It runs `attention.block_dyn_conv`
-/// twice a sublayer; the reference is `DFlashGroupedConv` in `mlx_dspark`.
-pub struct DynConv {
-    /// `[2·taps, hidden]`, row `side·taps + tap`: the stored
-    /// `base_kernel [2, taps, hidden]` read flat.
-    pub base: Weight,
-    /// `[2·taps·groups, hidden]`: `kernel_projection.weight`.
-    pub proj: Weight,
-    pub taps: u32,
-    /// Channels sharing one correction.
-    pub group: u32,
-}
-
-/// A [`DFlash`] layer's attention site. [`Attn`]'s twin without the q-gate
-/// and with its own head geometry; the two cannot share a struct because
-/// `Attn::qg_proj` is declared at twice the q width and every reader of it
-/// splits a gate off.
-pub struct DraftAttn {
-    pub q_heads: u32,
-    pub kv_heads: u32,
-    pub head_dim: u32,
-    pub rotary_dim: u32,
-    pub theta: f32,
-    pub sm_scale: f32,
-    pub q_proj: Weight,
-    pub k_proj: Weight,
-    pub v_proj: Weight,
-    pub o_proj: Weight,
-    pub q_norm: Weight,
-    pub q_norm_eps: f32,
-    pub k_norm: Weight,
-    pub k_norm_eps: f32,
-    /// This layer's kv row, in the trunk's page-id space.
-    pub kv: String,
 }
 
 /// The two pre-fusion norms, when the recipe has them. One shared epsilon,
@@ -1078,118 +944,25 @@ impl Model {
             }
         });
 
-        // The block drafter's geometry is its OWN (see `DFlash`), so nothing
-        // here is read off `Dims` but the trunk's hidden width and the
-        // element types.
+        // The block drafter's geometry is its OWN (`drafter::dflash`), so it
+        // reads nothing off `Dims` but the trunk's widths and element types.
         let dflash = d.draft.filter(|r| r.drafts_a_block()).map(|recipe| {
-            let p = recipe.prefix();
-            let n = |s: &str| format!("{p}.{s}");
-            // v1 and v2 differ in the taps, the block, the window rule and
-            // the convolution; everything else below is one text.
-            let v2 = matches!(recipe, Recipe::DFlash2);
-            let taps: &[u32] = if v2 { &DFLASH2_TAPS } else { &DFLASH_TAPS };
-            let groups = hidden / u64::from(DFLASH2_CONV_GROUP);
-            let conv = |l: u32, which: &str| {
-                v2.then(|| DynConv {
-                    base: Weight::sym(
-                        format!("{p}.layers.{l}.{which}.base_kernel"),
-                        [2 * u64::from(DFLASH2_CONV_TAPS), hidden],
-                        dense,
-                    ),
-                    proj: Weight::sym(
-                        format!("{p}.layers.{l}.{which}.kernel_projection"),
-                        [2 * u64::from(DFLASH2_CONV_TAPS) * groups, hidden],
-                        w,
-                    )
-                    .columns(),
-                    taps: DFLASH2_CONV_TAPS,
-                    group: DFLASH2_CONV_GROUP,
-                })
+            let version = match recipe {
+                Recipe::DFlash2 => dflash::Version::Two,
+                _ => dflash::Version::One,
             };
-            // **THE DRAFTER IS QUANTIZED LIKE THE TRUNK, AND IT COSTS
-            // NOTHING TO BE.** The shipped head is bf16 and only 1.75 G
-            // parameters against the trunk's 27, so carrying it unquantized is
-            // affordable — the obvious place to look for acceptance. It was
-            // tried, on this text with the projections at `dense`: the
-            // artifact went 15.0 -> 17.3 GiB, a draft fire went 17.8 -> 27.8
-            // ms, and the accepted prefix DID NOT MOVE — 13.500 / 10.000 /
-            // 4.375 of fifteen on counting / code / recall against 13.500 /
-            // 10.125 / 5.250 at four bits, the one differing round being noise
-            // over eight. What a block drafter accepts is a property of the
-            // HEAD, not of the precision it is carried at.
-            let (dq, dkv, dhd) = (DFLASH_Q_HEADS / tp, DFLASH_KV_HEADS / tp, DFLASH_HEAD_DIM);
-            let hd = dhd as u64;
-            let inter = DFLASH_INTER / tp;
-            DFlash {
-                taps: taps.to_vec(),
-                // One column slice of the stored `[hidden, 5·hidden]` bank
-                // per tap; replicated, since a trunk hidden state is.
-                fc: (0..taps.len())
-                    .map(|i| Weight::sym(n(&format!("fc_tap{i}")), [hidden, hidden], w))
-                    .collect(),
-                hidden_norm: Weight::sym(n("hidden_norm"), [hidden], dense),
-                hidden_norm_eps: d.norm_eps,
-                blocks: (0..DFLASH_LAYERS)
-                    .map(|l| {
-                        let b = |s: &str| format!("{p}.layers.{l}.{s}");
-                        DFlashBlock {
-                            mixer_norm: Weight::sym(b("mixer_norm"), [hidden], dense),
-                            mixer_norm_eps: d.norm_eps,
-                            attn: DraftAttn {
-                                q_heads: dq,
-                                kv_heads: dkv,
-                                head_dim: dhd,
-                                rotary_dim: dhd,
-                                theta: DFLASH_THETA,
-                                sm_scale: (dhd as f32).sqrt().recip(),
-                                q_proj: Weight::sym(b("q_proj"), [dq as u64 * hd, hidden], w).columns(),
-                                k_proj: Weight::sym(b("k_proj"), [dkv as u64 * hd, hidden], w).columns(),
-                                v_proj: Weight::sym(b("v_proj"), [dkv as u64 * hd, hidden], w).columns(),
-                                o_proj: Weight::sym(b("o_proj"), [hidden, dq as u64 * hd], w).rows(),
-                                q_norm: Weight::sym(b("q_norm"), [hd], dense),
-                                q_norm_eps: d.norm_eps,
-                                k_norm: Weight::sym(b("k_norm"), [hd], dense),
-                                k_norm_eps: d.norm_eps,
-                                kv: format!("kv.dflash.{l}"),
-                            },
-                            mlp_norm: Weight::sym(b("mlp_norm"), [hidden], dense),
-                            mlp_norm_eps: d.norm_eps,
-                            mlp: dense_mlp(w, hidden, inter, &format!("{p}.layers.{l}")),
-                            // The v1 head is four sliding layers then one
-                            // full; v2 is five sliding (`layer_types` in the
-                            // two configs).
-                            window: (v2 || l + 1 < DFLASH_LAYERS).then_some(DFLASH_WINDOW),
-                            attn_conv: conv(l, "attention_conv"),
-                            mlp_conv: conv(l, "mlp_conv"),
-                        }
-                    })
-                    .collect(),
-                norm: Weight::sym(n("norm"), [hidden], dense),
-                norm_eps: d.norm_eps,
-                block: if v2 { DFLASH2_BLOCK } else { DFLASH_BLOCK },
-                mask_token: DFLASH_MASK_TOKEN,
-                selector: v2.then(|| Selector {
-                    hidden_projection: Weight::sym(
-                        n("candidate_selector.hidden_projection"),
-                        [u64::from(DFLASH2_SELECTOR_RANK), hidden],
-                        w,
-                    )
-                    .columns(),
-                    // Read seven times sixteen rows a fire: carried dense,
-                    // where precision costs nothing and the gather is exact.
-                    pred: Weight::sym(
-                        n("candidate_selector.predecessor_codebook"),
-                        [d.vocab as u64, u64::from(DFLASH2_SELECTOR_RANK)],
-                        dense,
-                    ),
-                    succ: Weight::sym(
-                        n("candidate_selector.successor_codebook"),
-                        [d.vocab as u64, u64::from(DFLASH2_SELECTOR_RANK)],
-                        dense,
-                    ),
-                    top_k: DFLASH2_SELECTOR_TOP_K,
-                }),
-            }
+            DFlash::declare(
+                version,
+                recipe.prefix(),
+                &dflash::Trunk {
+                    hidden,
+                    vocab: d.vocab as u64,
+                    norm_eps: d.norm_eps,
+                    weights: w,
+                    dense,
+                    tp,
+                },
+            )
         });
 
         Model {
@@ -1216,38 +989,6 @@ impl Model {
         }
     }
 }
-
-/// **The shipped DFlash drafter's geometry** (`z-lab/Qwen3.6-27B-DFlash`'s
-/// `config.json`), which is the head's own and not the trunk's — see
-/// [`DFlash`]. Constants rather than [`Dims`] fields because exactly one SKU
-/// carries this head and every number below is a fact about that published
-/// checkpoint, not a knob.
-const DFLASH_TAPS: [u32; 5] = [1, 16, 31, 46, 61];
-const DFLASH_LAYERS: u32 = 5;
-const DFLASH_Q_HEADS: u32 = 32;
-const DFLASH_KV_HEADS: u32 = 8;
-const DFLASH_HEAD_DIM: u32 = 128;
-const DFLASH_INTER: u32 = 17_408;
-const DFLASH_THETA: f32 = 10_000_000.0;
-const DFLASH_WINDOW: u32 = 2_048;
-pub const DFLASH_BLOCK: u32 = 16;
-/// `dflash_config.mask_token_id` — the id every block row but the first
-/// carries into the draft pass. Public with [`DFLASH_BLOCK`] because a guest
-/// seeding a draft block needs both; they belong on the load's own
-/// advertisement (beside `mtp_depth`) once there is a guest asking.
-pub const DFLASH_MASK_TOKEN: u32 = 248_070;
-
-/// **The DFlash2 head's own numbers** (`z-lab/Qwen3.8-27B-DFlash2`'s
-/// `config.json`); heads, widths, window, theta and the mask token are v1's.
-const DFLASH2_TAPS: [u32; 5] = [5, 19, 33, 47, 61];
-pub const DFLASH2_BLOCK: u32 = 8;
-/// `dflash_config.conv_kernel_size`: taps of the dynamic convolution.
-const DFLASH2_CONV_TAPS: u32 = 2;
-/// `dflash_config.conv_group_size`: channels sharing one correction.
-const DFLASH2_CONV_GROUP: u32 = 16;
-/// `dflash_config.selector_rank` / `selector_top_k`.
-const DFLASH2_SELECTOR_RANK: u32 = 256;
-const DFLASH2_SELECTOR_TOP_K: u32 = 16;
 
 /// Adapter ceiling for every SKU of this family. Not a checkpoint fact (no
 /// pretrained artifact states it) — a deployment setting baked in at trace

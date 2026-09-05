@@ -353,73 +353,10 @@ impl Model {
         }
 
         // The block drafter, always `--aux`-imported (it is published on its
-        // own), so always under `aux.`. Its layers are the standard pre-norm
-        // decoder spelling — `input_layernorm`, `self_attn.*`,
-        // `post_attention_layernorm`, `mlp.*` — and its `q_proj` is the
-        // plain one, NOT the trunk's `[2·q, hidden]` gate-packed bank.
+        // own); its planes and their spelling are the drafter's
+        // (`drafter::dflash`), and the norm fold is this layout's.
         if let Some(dflash) = &self.dflash {
-            // **THE DRAFTER'S NORMS ARE FOLDED LIKE THE TRUNK'S**, measured
-            // rather than assumed. Whether an `--aux` checkpoint carries
-            // mlx_lm's `+1` fold is a question about its publisher, not about
-            // the target, so it was A/B'd on the artifact with everything else
-            // fixed: folded, the drafter keeps 0.33 / 0.33 / 0.67 of a block on
-            // counting / code / recall; unfolded, 0.33 / 0.00 / 0.33. The
-            // chained-head arm above reads its norms raw and is left alone —
-            // its own numbers are measured and good.
-            b.read_expr(&dflash.hidden_norm, norm("aux.hidden_norm.weight".to_string()))?;
-            // `fc.weight` is one `[hidden, taps·hidden]` bank; tap `i` is
-            // columns `i·hidden .. (i+1)·hidden`, sliced as the MTP head's
-            // two-wide bank is.
-            let span = extents(&dflash.fc[0])[1];
-            for (i, bank) in dflash.fc.iter().enumerate() {
-                let at = span * i as i64;
-                b.read_expr(bank, Expr::src("aux.fc.weight".to_string()).slice(1, at, span))?;
-            }
-            for (l, block) in dflash.blocks.iter().enumerate() {
-                let n = |s: &str| format!("aux.layers.{l}.{s}");
-                let a = &block.attn;
-                b.read_expr(&block.mixer_norm, norm(n("input_layernorm.weight")))?;
-                b.read(&a.q_proj, n("self_attn.q_proj.weight"))?;
-                b.read(&a.k_proj, n("self_attn.k_proj.weight"))?;
-                b.read(&a.v_proj, n("self_attn.v_proj.weight"))?;
-                b.read(&a.o_proj, n("self_attn.o_proj.weight"))?;
-                b.read_expr(&a.q_norm, norm(n("self_attn.q_norm.weight")))?;
-                b.read_expr(&a.k_norm, norm(n("self_attn.k_norm.weight")))?;
-                b.read_expr(&block.mlp_norm, norm(n("post_attention_layernorm.weight")))?;
-                // DFlash2's dynamic convolutions: the stored `[2, taps,
-                // hidden]` base read flat as `[2·taps, hidden]`, and the
-                // coefficient projection as any other bank.
-                for (conv, which) in [(&block.attn_conv, "attention_conv"), (&block.mlp_conv, "mlp_conv")] {
-                    if let Some(c) = conv {
-                        let want: Vec<i64> = extents(&c.base);
-                        b.read_expr(&c.base, flattened(src, n(&format!("{which}.base_kernel")), want)?)?;
-                        b.read(&c.proj, n(&format!("{which}.kernel_projection.weight")))?;
-                    }
-                }
-                match &block.mlp {
-                    Mlp::Dense { gate_up, down, .. } => {
-                        b.read_concat(
-                            gate_up,
-                            [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
-                        )?;
-                        b.read(down, n("mlp.down_proj.weight"))?;
-                    }
-                    Mlp::Routed { .. } => {
-                        return Err(Error::Illegible {
-                            name: n("mlp"),
-                            detail: "a draft block routes to no experts".to_string(),
-                        });
-                    }
-                }
-            }
-            b.read_expr(&dflash.norm, norm("aux.norm.weight".to_string()))?;
-            // DFlash2's selector: a projection bank and two codebooks, the
-            // codebooks stored as plain arrays (no `.weight`).
-            if let Some(sel) = &dflash.selector {
-                b.read(&sel.hidden_projection, "aux.candidate_selector.hidden_projection.weight".to_string())?;
-                b.read(&sel.pred, "aux.candidate_selector.predecessor_codebook".to_string())?;
-                b.read(&sel.succ, "aux.candidate_selector.successor_codebook".to_string())?;
-            }
+            dflash.bind_aux(&mut b, src, &norm)?;
         }
 
         Ok(b.build())
