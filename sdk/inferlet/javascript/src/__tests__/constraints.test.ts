@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import * as grammar from '../grammar.js';
 import * as mask from '../mask.js';
 import * as media from '../media.js';
-import { ForwardPass } from '../eta/bridge.js';
+import { ForwardPass, InferletError } from '../eta/bridge.js';
 import * as tools from '../tools.js';
 
 describe('mask', () => {
@@ -94,5 +94,15 @@ describe('media', () => {
       { tag: 'audio', val: aud.handle },
     ]);
     expect(() => fwd.media([new Uint8Array() as unknown as media.Image])).toThrow(TypeError);
+  });
+});
+
+describe('ForwardPass per-kind binders', () => {
+  it('refuse the wrong pass kind before touching any state', () => {
+    const hybrid = new ForwardPass('hybrid');
+    expect(() => hybrid.attention(undefined as never, undefined as never)).toThrow(InferletError);
+    expect(() => hybrid.bindRecurrent([], {})).toThrow(/bindRecurrent binds/);
+    const attention = new ForwardPass('attention');
+    expect(() => attention.bindHybrid(undefined, [], {})).toThrow(/bindHybrid binds/);
   });
 });

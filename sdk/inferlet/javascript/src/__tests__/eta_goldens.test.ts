@@ -372,3 +372,27 @@ describe('eta goldens', () => {
     expect(() => b.build()).toThrow(/never produced/);
   });
 });
+
+describe('comparison methods', () => {
+  const epilogueBytes = (body: (l: Tensor) => Tensor) => {
+    const vocab = 32_000;
+    const tok = chNew([1], dtype.i32, 'tok');
+    const ind = chFrom([0, 1], dtype.u32, 'indptr');
+    const out = chNew([vocab], dtype.bool, 'out');
+    hostPut(tok, [1], dtype.i32);
+    const b = new Builder(vocab, 16);
+    b.bindPort(Port.EMBED_TOKENS, tok);
+    b.bindPort(Port.EMBED_INDPTR, ind);
+    b.stage(Stage.EPILOGUE, () => out.putTensor(body(intrinsics.logits())));
+    return Buffer.from(b.build().encode()).toString('hex');
+  };
+
+  it('emit exactly what the free functions emit', () => {
+    expect(epilogueBytes((l) => l.lt(0.5))).toBe(epilogueBytes((l) => lt(l, 0.5)));
+    expect(epilogueBytes((l) => l.ge(0.5))).toBe(epilogueBytes((l) => ge(l, 0.5)));
+    expect(epilogueBytes((l) => l.eq(0.5))).toBe(epilogueBytes((l) => eq(l, 0.5)));
+    expect(epilogueBytes((l) => l.ne(0.5))).toBe(epilogueBytes((l) => ne(l, 0.5)));
+    expect(epilogueBytes((l) => l.gt(0.5))).toBe(epilogueBytes((l) => gt(l, 0.5)));
+    expect(epilogueBytes((l) => l.le(0.5))).toBe(epilogueBytes((l) => le(l, 0.5)));
+  });
+});

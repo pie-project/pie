@@ -7,9 +7,11 @@ expansions so the emitted op stream is identical to the Rust SDK's.
 Operators: `+ - * // %` and unary `-` on a `Tensor` are the arithmetic ops.
 ETA has one `div` per dtype (truncating for integers), so `/` and `//` emit
 the same op; write `//` on integer tensors so the source reads the way the
-op behaves. Comparisons are the free functions `lt`, `gt`, … since they must
-yield a tensor, not a `bool`. A Python scalar operand (`int` / `float` /
-`bool`) takes the dtype of the tensor it is combined with.
+op behaves. `< <= > >=` are the ordering comparisons (a `bool` tensor);
+`==`/`!=` stay ordinary Python identity so tensors can sit in sets and
+dicts — spell elementwise equality `eq(a, b)` / `ne(a, b)`. A Python scalar
+operand (`int` / `float` / `bool`) takes the dtype of the tensor it is
+combined with.
 """
 
 from __future__ import annotations
@@ -317,6 +319,20 @@ class Tensor:
     def __neg__(self):
         return neg(self)
 
+    # Ordering comparisons yield a bool tensor. Python reflects `3 < t` into
+    # `t.__gt__(3)`, so the four forward methods cover both operand orders.
+    def __lt__(self, o):
+        return lt(self, o)
+
+    def __le__(self, o):
+        return le(self, o)
+
+    def __gt__(self, o):
+        return gt(self, o)
+
+    def __ge__(self, o):
+        return ge(self, o)
+
     def __and__(self, o):
         return and_(self, o)
 
@@ -328,6 +344,8 @@ class Tensor:
 
     def __bool__(self):
         raise TypeError("a traced Tensor has no Python truth value; use select()/and_()/or_()")
+
+    __hash__ = object.__hash__
 
     def div_ceil(self, rhs) -> "Tensor":
         """Ceiling division, spelled like `u32::div_ceil`. A trace-known

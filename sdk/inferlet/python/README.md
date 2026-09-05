@@ -50,7 +50,8 @@ Spelling differences from Rust: `Channel.from_([...], dtype.u32)` needs a
 dtype for an integer sequence (the way a Rust literal needs a suffix);
 scalars in arithmetic take the partner tensor's dtype; integer division is
 `x // y` (ETA `div` truncates — `/` emits the same op, but `//` says so);
-comparisons are `lt(a, b)`, `gt(a, b)`, ….
+`<`/`<=`/`>`/`>=` compare elementwise, while `==` stays Python identity —
+elementwise equality is `eq(a, b)`.
 
 
 ## Building

@@ -9,7 +9,9 @@ and parse the calls back out::
     prompt = chat.system(...) + tools.equip([spec_json, ...]) + chat.user(...)
     matcher = tools.create_matcher([spec_json, ...])   # a grammar.Matcher
     ...
-    for event in tools.Decoder().feed(tokens): ...
+    match tools.Decoder().feed(tokens):
+        case tools.Event.Call(call=c): ...
+        case tools.Event.Start(): ...
 """
 
 from __future__ import annotations
@@ -29,19 +31,24 @@ class ToolCall:
     arguments_json: str
 
 
-@dataclass(frozen=True)
-class Start:
-    """A tool-call block opened."""
+class Event:
+    """Discriminated union of tool-decoder events, spelled like
+    :class:`chat.Event` (match with ``match`` / ``case``)."""
+
+    __slots__ = ()
+
+    @dataclass(frozen=True, slots=True)
+    class Start:
+        """A tool-call block opened."""
+
+    @dataclass(frozen=True, slots=True)
+    class Call:
+        """A complete tool call was parsed."""
+
+        call: ToolCall
 
 
-@dataclass(frozen=True)
-class Call:
-    """A complete tool call was parsed."""
-
-    call: ToolCall
-
-
-Event = Union[Start, Call]
+AnyEvent = Union[Event.Start, Event.Call]
 
 
 def equip(tools: Sequence[str]) -> list[int]:
@@ -66,7 +73,7 @@ def format(tools: Sequence[str]) -> Grammar | None:  # noqa: A001 — the WIT na
 
 def create_matcher(tools: Sequence[str]) -> Matcher:
     """A matcher over :func:`format`'s grammar."""
-    return Matcher(_inner=_tools.create_matcher(list(tools)))
+    return Matcher._wrap(_tools.create_matcher(list(tools)))
 
 
 class Decoder:
@@ -75,14 +82,14 @@ class Decoder:
     def __init__(self) -> None:
         self._inner = _tools.Decoder()
 
-    def feed(self, tokens: Sequence[int]) -> Event:
+    def feed(self, tokens: Sequence[int]) -> AnyEvent:
         try:
             ev = self._inner.feed([int(t) for t in tokens])
         except _WitErr as e:
             raise GrammarError(f"tools decoder: {e.value}") from None
         if isinstance(ev, _tools.Event_Call):
-            return Call(ToolCall(ev.value.name, ev.value.arguments_json))
-        return Start()
+            return Event.Call(ToolCall(ev.value.name, ev.value.arguments_json))
+        return Event.Start()
 
     def reset(self) -> None:
         self._inner.reset()

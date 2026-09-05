@@ -5,7 +5,8 @@
 //
 // JavaScript has no operator overloading, so arithmetic is spelled as
 // methods: `a.add(b)`, `a.sub(1)`, `a.div(pageSize)`, `a.rem(pageSize)`,
-// `a.neg()`, `a.divCeil(pageSize)`. A JS `number` operand takes the dtype of
+// `a.neg()`, `a.divCeil(pageSize)`, and comparisons as `a.lt(b)`, `a.ge(0.5)`,
+// `a.eq(b)`, … (each a bool tensor). A JS `number` operand takes the dtype of
 // the tensor it is combined with (an integer-valued number defaults to i32,
 // a fractional one to f32 when there is no partner).
 
@@ -227,6 +228,25 @@ export class Tensor {
   }
   neg(): Tensor {
     return neg(this);
+  }
+
+  lt(o: Operand): Tensor {
+    return lt(this, o);
+  }
+  le(o: Operand): Tensor {
+    return le(this, o);
+  }
+  gt(o: Operand): Tensor {
+    return gt(this, o);
+  }
+  ge(o: Operand): Tensor {
+    return ge(this, o);
+  }
+  eq(o: Operand): Tensor {
+    return eq(this, o);
+  }
+  ne(o: Operand): Tensor {
+    return ne(this, o);
   }
 
   /** Ceiling division, spelled like `u32::div_ceil`. */

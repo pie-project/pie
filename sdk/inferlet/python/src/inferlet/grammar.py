@@ -70,13 +70,14 @@ class Matcher:
 
     __slots__ = ("_inner",)
 
-    def __init__(self, grammar: Grammar | None = None, *, _inner=None) -> None:
-        if _inner is not None:
-            self._inner = _inner
-        elif grammar is not None:
-            self._inner = _grammar.Matcher(grammar._inner)
-        else:
-            raise TypeError("Matcher(grammar)")
+    def __init__(self, grammar: Grammar) -> None:
+        self._inner = _grammar.Matcher(grammar._inner)
+
+    @classmethod
+    def _wrap(cls, inner) -> "Matcher":
+        m = cls.__new__(cls)
+        m._inner = inner
+        return m
 
     def accept_tokens(self, token_ids: Sequence[int]) -> None:
         """Advance the match by ``token_ids``; a token the grammar forbids
@@ -96,7 +97,7 @@ class Matcher:
 
     def fork(self) -> "Matcher":
         """An independent copy at the current position (branching)."""
-        return Matcher(_inner=self._inner.fork())
+        return Matcher._wrap(self._inner.fork())
 
     def rollback(self, num_tokens: int) -> None:
         self._inner.rollback(num_tokens)

@@ -351,3 +351,17 @@ class TestReasoningDecoder:
 
         dec = self._decoder([ReasoningComplete("done")])
         assert dec.feed([1]) == reasoning.Event.End("done")
+
+
+class TestForwardPassKinds:
+    def test_per_kind_binders_refuse_the_wrong_pass(self):
+        from inferlet.eta import ForwardKind, ForwardPass, InferletError
+
+        hybrid = ForwardPass(ForwardKind.HYBRID)
+        with pytest.raises(InferletError, match="attention binds"):
+            hybrid.attention(None, None)  # type: ignore[arg-type]
+        with pytest.raises(InferletError, match="bind_recurrent binds"):
+            hybrid.bind_recurrent([], None)  # type: ignore[arg-type]
+        attention = ForwardPass(ForwardKind.ATTENTION)
+        with pytest.raises(InferletError, match="bind_hybrid binds"):
+            attention.bind_hybrid(None, [], None)  # type: ignore[arg-type]

@@ -404,3 +404,28 @@ def test_readiness_lint():
     out.note_host_take()
     with pytest.raises(TraceError, match="never produced"):
         b.build()
+
+
+def _epilogue_bytes(body) -> bytes:
+    vocab = 32_000
+    tok = ch_new([1], dtype.i32, "tok")
+    indptr_ch = ch_from([0, 1], dtype.u32, "indptr")
+    out = ch_new([vocab], dtype.bool, "out")
+    host_put(tok, [1], dtype.i32)
+    b = Builder(vocab, 16)
+    b.bind_port(Port.EMBED_TOKENS, tok)
+    b.bind_port(Port.EMBED_INDPTR, indptr_ch)
+    b.stage(Stage.EPILOGUE, lambda: out.put_tensor(body(intrinsics.logits())))
+    return b.build().encode()
+
+
+def test_comparison_operators_are_the_free_functions():
+    """`t < x` etc. emit exactly what `lt(t, x)` emits, in both operand
+    orders (Python reflects `x < t` into `t.__gt__(x)`)."""
+    assert _epilogue_bytes(lambda l: l < 0.5) == _epilogue_bytes(lambda l: lt(l, 0.5))
+    assert _epilogue_bytes(lambda l: l >= 0.5) == _epilogue_bytes(lambda l: ge(l, 0.5))
+    assert _epilogue_bytes(lambda l: 0.5 < l) == _epilogue_bytes(lambda l: gt(l, 0.5))
+    assert _epilogue_bytes(lambda l: 0.5 >= l) == _epilogue_bytes(lambda l: le(l, 0.5))
+    # `==` stays identity, so a Tensor can key a dict / sit in a set.
+    t = Tensor.constant(1)
+    assert {t: "x"}[t] == "x" and t != Tensor.constant(1)

@@ -9,9 +9,10 @@ neutral `Builder`, lowering author stage closures to the ETA container. A
 
 from __future__ import annotations
 
+import functools
 import inspect
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Sequence, TypeAlias
+from typing import Awaitable, Callable, Sequence, TypeAlias
 
 from componentize_py_types import Err as _WitErr
 from wit_world.imports import channel as _wit_channel
@@ -269,8 +270,16 @@ class WorkingSet:
     """The attention working set — a logical page address space over the KV
     mapping trie. Every page reference is working-set-relative."""
 
-    def __init__(self, _kv=None) -> None:
-        self.kv = _kv if _kv is not None else _wit_ws.KvWorkingSet()
+    __slots__ = ("kv",)
+
+    def __init__(self) -> None:
+        self.kv = _wit_ws.KvWorkingSet()
+
+    @classmethod
+    def _wrap(cls, kv) -> "WorkingSet":
+        ws = cls.__new__(cls)
+        ws.kv = kv
+        return ws
 
     def page_len(self) -> int:
         return self.kv.page_len()
@@ -285,7 +294,7 @@ class WorkingSet:
     @staticmethod
     def from_index(key: bytes) -> "WorkingSet | None":
         kv = _wit(_wit_ws.KvWorkingSet.from_index, bytes(key), what="from_index")
-        return WorkingSet(kv) if kv is not None else None
+        return WorkingSet._wrap(kv) if kv is not None else None
 
     @staticmethod
     def remove_index(key: bytes) -> bool:
@@ -295,10 +304,10 @@ class WorkingSet:
         _wit(self.kv.discard, on.wit, [r._wit() for r in ranges], what="discard")
 
     def fork(self, on: "Pipeline") -> "WorkingSet":
-        return WorkingSet(_wit(self.kv.fork, on.wit, what="fork"))
+        return WorkingSet._wrap(_wit(self.kv.fork, on.wit, what="fork"))
 
     def slice(self, on: "Pipeline", start: int, length: int) -> "WorkingSet":
-        return WorkingSet(_wit(self.kv.slice, on.wit, _wit_ws.PageRange(start, length), what="slice"))
+        return WorkingSet._wrap(_wit(self.kv.slice, on.wit, _wit_ws.PageRange(start, length), what="slice"))
 
     def copy_into(self, on: "Pipeline", dst_page_ids, dst_tok_idx, src_page_ids, src_tok_idx) -> None:
         _wit(
@@ -315,8 +324,16 @@ class WorkingSet:
 class RsWorkingSet:
     """Runtime recurrent-state slots for hybrid / linear-attention models."""
 
-    def __init__(self, _rs=None) -> None:
-        self.rs = _rs if _rs is not None else _wit_ws.RsWorkingSet()
+    __slots__ = ("rs",)
+
+    def __init__(self) -> None:
+        self.rs = _wit_ws.RsWorkingSet()
+
+    @classmethod
+    def _wrap(cls, rs) -> "RsWorkingSet":
+        ws = cls.__new__(cls)
+        ws.rs = rs
+        return ws
 
     def state_size(self) -> int:
         return _wit_model.rs_state_size()
@@ -341,7 +358,7 @@ class RsWorkingSet:
         _wit(self.rs.reorder_buffer, list(perm), what="reorder_buffer")
 
     def fork(self, on: "Pipeline") -> "RsWorkingSet":
-        return RsWorkingSet(_wit(self.rs.fork, on.wit, what="fork"))
+        return RsWorkingSet._wrap(_wit(self.rs.fork, on.wit, what="fork"))
 
 
 # ---------------------------------------------------------------------------
@@ -421,61 +438,41 @@ class KvBinding:
     geometry: KvGeometry
 
 
-_FOLD_ALL: Channel | None = None
-
-
-def _fold_all() -> Channel:
-    global _FOLD_ALL
-    if _FOLD_ALL is None:
-        _FOLD_ALL = Channel.from_([0xFFFF_FFFF], Dtype.U32)
-    return _FOLD_ALL
-
-
 # ---------------------------------------------------------------------------
 # Model constants (cached where the Rust SDK caches)
 # ---------------------------------------------------------------------------
 
-_cache: dict[str, Any] = {}
-
-
+@functools.cache
 def frame_size() -> int:
     """Waves per frame (k) for this deployment (cached)."""
-    if "frame_size" not in _cache:
-        _cache["frame_size"] = max(_wit_model.frame_size(), 1)
-    return _cache["frame_size"]
+    return max(_wit_model.frame_size(), 1)
 
 
+@functools.cache
 def submit_deadline_us() -> int:
-    if "submit_deadline_us" not in _cache:
-        _cache["submit_deadline_us"] = _wit_model.submit_deadline_us()
-    return _cache["submit_deadline_us"]
+    return _wit_model.submit_deadline_us()
 
 
 def channel_capacity() -> int:
-    """Host-reader channel capacity that sustains run-ahead (not cached)."""
+    """Host-reader channel capacity that sustains run-ahead (not cached: the
+    host does not promise it static)."""
     return max(_wit_model.channel_capacity(), 2)
 
 
+@functools.cache
 def live_slots() -> int:
     """Live slots per frame: k for dense, 1 for recurrent (linear/hybrid)."""
-    if "live_slots" not in _cache:
-        if _wit_model.pass_kind() != ForwardKind.ATTENTION:
-            _cache["live_slots"] = 1
-        else:
-            _cache["live_slots"] = frame_size()
-    return _cache["live_slots"]
+    return 1 if _wit_model.pass_kind() != ForwardKind.ATTENTION else frame_size()
 
 
+@functools.cache
 def kv_page_size() -> int:
-    if "kv_page_size" not in _cache:
-        _cache["kv_page_size"] = _wit_model.kv_page_size()
-    return _cache["kv_page_size"]
+    return _wit_model.kv_page_size()
 
 
+@functools.cache
 def max_embed_length() -> int:
-    if "max_embed_length" not in _cache:
-        _cache["max_embed_length"] = max(_wit_model.max_embed_length(), 1)
-    return _cache["max_embed_length"]
+    return max(_wit_model.max_embed_length(), 1)
 
 
 def even_spans(n: int, cap: int) -> list[tuple[int, int]]:
@@ -512,9 +509,9 @@ class ForwardPass:
     selected by `kind` (default: `model.pass_kind()`).
 
     Attach stage bodies with `epilogue(fn)` (also usable as a decorator),
-    bind the working set + geometry with `attention(...)` (or the
-    kind-independent `bind_state(...)`), and `submit(pipe)`. The first submit
-    traces the stage bodies once into the ETA container.
+    bind state with `bind_state(...)` (kind-independent; or the per-kind
+    `attention` / `bind_hybrid` / `bind_recurrent`), and `submit(pipe)`. The
+    first submit traces the stage bodies once into the ETA container.
     """
 
     def __init__(self, kind: ForwardKind | None = None) -> None:
@@ -537,6 +534,7 @@ class ForwardPass:
         self._program_attached = False
         self._adapter_lowrank_sites = 0
         self._adapter_scale_sites = 0
+        self._fold_all: Channel | None = None
 
     # -- ports ----------------------------------------------------------------
 
@@ -638,45 +636,52 @@ class ForwardPass:
                 self._ports.append((Port.RS_FOLD_LEN, geom.fold_len))
             fold_len = geom.fold_len._wit()
         else:
-            fold_len = _fold_all()._wit()
+            if self._fold_all is None:
+                self._fold_all = Channel.from_([0xFFFF_FFFF], Dtype.U32)
+            fold_len = self._fold_all._wit()
         return {"working_sets": [rs.rs for rs in working_sets], "fold_len": fold_len, "buffer": buffer}
 
-    def attention(self, *args, **kwargs) -> None:
-        """Bind the state. Attention kind: `attention(ws, geom)`. Hybrid:
-        `attention(kv: KvBinding | None, rs: [RsWorkingSet], rs_geom)`.
-        Recurrent: `attention(rs: [RsWorkingSet], geom: RsGeometry)`."""
-        if self.kind == ForwardKind.ATTENTION:
-            ws, geom = args if args else (kwargs["ws"], kwargs["geom"])
-            kv = self._stage_kv(ws, geom)
-            _wit(self.wit.attention, kv["ws"], self._kv_geometry_wit(kv), what="attention")
-        elif self.kind == ForwardKind.HYBRID:
-            if args:
-                kvb, rs, rs_geom = args
-            else:
-                kvb, rs, rs_geom = kwargs.get("kv"), kwargs["rs"], kwargs["rs_geom"]
-            kv = self._stage_kv(kvb.working_set, kvb.geometry) if kvb is not None else None
-            staged_rs = self._stage_rs(rs, rs_geom)
-            binding = (
-                _wit_hybrid.KvBinding(working_set=kv["ws"], geometry=self._kv_geometry_wit(kv))
-                if kv is not None
-                else None
-            )
-            _wit(
-                self.wit.attention,
-                binding,
-                staged_rs["working_sets"],
-                _wit_hybrid.RsGeometry(fold_len=staged_rs["fold_len"], buffer=_page_span(staged_rs["buffer"])),
-                what="attention",
-            )
-        else:
-            rs, geom = args if args else (kwargs["rs"], kwargs["geom"])
-            staged_rs = self._stage_rs(rs, geom)
-            _wit(
-                self.wit.attention,
-                staged_rs["working_sets"],
-                _wit_recurrent.RsGeometry(fold_len=staged_rs["fold_len"], buffer=_page_span(staged_rs["buffer"])),
-                what="attention",
-            )
+    def _require_kind(self, kind: ForwardKind, what: str) -> None:
+        if self.kind != kind:
+            raise InferletError(f"{what} binds a {kind.name.lower()} pass; this pass is {self.kind.name.lower()}")
+
+    def attention(self, ws: WorkingSet, geom: KvGeometry) -> None:
+        """Bind the KV working set + geometry of an attention-only pass."""
+        self._require_kind(ForwardKind.ATTENTION, "attention")
+        kv = self._stage_kv(ws, geom)
+        _wit(self.wit.attention, kv["ws"], self._kv_geometry_wit(kv), what="attention")
+
+    def bind_hybrid(self, kv: KvBinding | None, rs: Sequence[RsWorkingSet], rs_geom: RsGeometry) -> None:
+        """Bind a hybrid pass: the KV binding (None for a fire that touches
+        no attention layer) plus the recurrent working set(s) and where
+        their folded boundary lands."""
+        self._require_kind(ForwardKind.HYBRID, "bind_hybrid")
+        staged_kv = self._stage_kv(kv.working_set, kv.geometry) if kv is not None else None
+        staged_rs = self._stage_rs(rs, rs_geom)
+        binding = (
+            _wit_hybrid.KvBinding(working_set=staged_kv["ws"], geometry=self._kv_geometry_wit(staged_kv))
+            if staged_kv is not None
+            else None
+        )
+        _wit(
+            self.wit.attention,
+            binding,
+            staged_rs["working_sets"],
+            _wit_hybrid.RsGeometry(fold_len=staged_rs["fold_len"], buffer=_page_span(staged_rs["buffer"])),
+            what="bind_hybrid",
+        )
+
+    def bind_recurrent(self, rs: Sequence[RsWorkingSet], geom: RsGeometry) -> None:
+        """Bind a recurrent-only pass: the recurrent working set(s) and where
+        their folded boundary lands."""
+        self._require_kind(ForwardKind.RECURRENT, "bind_recurrent")
+        staged_rs = self._stage_rs(rs, geom)
+        _wit(
+            self.wit.attention,
+            staged_rs["working_sets"],
+            _wit_recurrent.RsGeometry(fold_len=staged_rs["fold_len"], buffer=_page_span(staged_rs["buffer"])),
+            what="bind_recurrent",
+        )
 
     def bind_state(self, ws: WorkingSet, geom: KvGeometry, rs: Sequence[RsWorkingSet] = ()) -> None:
         """Kind-independent binding for the common text program: the KV
@@ -685,7 +690,7 @@ class ForwardPass:
         if self.kind == ForwardKind.ATTENTION:
             self.attention(ws, geom)
         elif self.kind == ForwardKind.HYBRID:
-            self.attention(KvBinding(ws, geom), list(rs), RsGeometry(fold_len=None, buffer=(0, 0)))
+            self.bind_hybrid(KvBinding(ws, geom), list(rs), RsGeometry(fold_len=None, buffer=(0, 0)))
         else:
             raise InferletError("bind_state: a recurrent-only model has no KV geometry to bind")
 
@@ -836,7 +841,7 @@ def submit_frame(on: Pipeline, slots: Sequence[ForwardPass | None]) -> None:
 
 async def run_ahead(
     on: Pipeline,
-    pass_: ForwardPass,
+    fwd: ForwardPass,
     budget: int,
     on_token: Callable[[], Awaitable[bool]],
 ) -> int:
@@ -845,7 +850,7 @@ async def run_ahead(
     Returns the run count."""
     if budget == 0:
         return 0
-    r = 1 if pass_.binds_device_mask() else live_slots()
+    r = 1 if fwd.binds_device_mask() else live_slots()
     window_frames = max((channel_capacity() - 1) // max(r, 1), 1)
     submitted = 0
     consumed = 0
@@ -855,7 +860,7 @@ async def run_ahead(
         live = min(r, budget - submitted)
         if live == 0:
             return
-        submit_frame(on, [pass_] * live)
+        submit_frame(on, [fwd] * live)
         submitted += live
 
     for _ in range(window_frames):

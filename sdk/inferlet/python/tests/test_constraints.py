@@ -66,9 +66,9 @@ class TestTools:
 
     def test_decoder_events(self):
         d = tools.Decoder()
-        assert isinstance(d.feed([1]), tools.Start)
+        assert isinstance(d.feed([1]), tools.Event.Start)
         ev = d.feed([2])
-        assert isinstance(ev, tools.Call) and ev.call == tools.ToolCall("lookup", '{"q": 1}')
+        assert isinstance(ev, tools.Event.Call) and ev.call == tools.ToolCall("lookup", '{"q": 1}')
 
 
 class TestMedia:

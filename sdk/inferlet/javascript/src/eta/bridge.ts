@@ -402,12 +402,6 @@ export interface KvBinding {
   geometry: KvGeometry;
 }
 
-let FOLD_ALL: Channel | undefined;
-function foldAll(): Channel {
-  if (!FOLD_ALL) FOLD_ALL = Channel.from([0xffff_ffff], Dtype.U32);
-  return FOLD_ALL;
-}
-
 // ---------------------------------------------------------------------------
 // Model constants (cached where the Rust SDK caches)
 // ---------------------------------------------------------------------------
@@ -481,8 +475,9 @@ const SITE_BITS: Record<string, number> = { q: 1, k: 2, v: 4, o: 8, gate_up: 16,
 /**
  * The forward-pass builder over one `pie:inferlet/forward*` interface,
  * selected by `kind` (default: `model.passKind()`). Attach stage bodies with
- * `epilogue(fn)`, bind state with `attention(...)` / `bindState(...)`, and
- * `submit(pipe)`. The first submit traces the stage bodies once.
+ * `epilogue(fn)`, bind state with `bindState(...)` (kind-independent; or the
+ * per-kind `attention` / `bindHybrid` / `bindRecurrent`), and `submit(pipe)`.
+ * The first submit traces the stage bodies once.
  */
 export class ForwardPass {
   readonly kind: ForwardKind;
@@ -495,6 +490,7 @@ export class ForwardPass {
   private programAttached = false;
   private adapterLowrankSites = 0;
   private adapterScaleSites = 0;
+  private foldAll: Channel | undefined;
 
   constructor(kind?: ForwardKind) {
     this.kind = kind ?? witModel.passKind();
@@ -609,33 +605,44 @@ export class ForwardPass {
       }
       foldLen = geom.foldLen.wit();
     } else {
-      foldLen = foldAll().wit();
+      this.foldAll ??= Channel.from([0xffff_ffff], Dtype.U32);
+      foldLen = this.foldAll.wit();
     }
     return { workingSets: workingSets.map((r) => r.rs), foldLen, buffer };
   }
 
-  /** Attention kind: `attention(ws, geom)`. */
-  attention(ws: WorkingSet, geom: KvGeometry): void;
-  /** Hybrid kind: `attention(kv | undefined, rs, rsGeom)`. */
-  attention(kv: KvBinding | undefined, rs: RsWorkingSet[], rsGeom: RsGeometry): void;
-  /** Recurrent kind: `attention(rs, geom)`. */
-  attention(rs: RsWorkingSet[], geom: RsGeometry): void;
-  attention(a: unknown, b: unknown, c?: unknown): void {
-    if (this.kind === 'attention') {
-      const kv = this.stageKv(a as WorkingSet, b as KvGeometry);
-      wit('attention', () => (this.wit as witAttention.ForwardPass).attention(kv.ws, this.kvGeometryWit(kv)));
-    } else if (this.kind === 'hybrid') {
-      const kvb = a as KvBinding | undefined;
-      const kv = kvb ? this.stageKv(kvb.workingSet, kvb.geometry) : undefined;
-      const rs = this.stageRs(b as RsWorkingSet[], c as RsGeometry);
-      const binding = kv ? { workingSet: kv.ws, geometry: this.kvGeometryWit(kv) } : undefined;
-      wit('attention', () =>
-        (this.wit as witHybrid.ForwardPass).attention(binding, rs.workingSets, { foldLen: rs.foldLen, buffer: pageSpan(rs.buffer) }),
-      );
-    } else {
-      const rs = this.stageRs(a as RsWorkingSet[], b as RsGeometry);
-      wit('attention', () => (this.wit as witRecurrent.ForwardPass).attention(rs.workingSets, { foldLen: rs.foldLen, buffer: pageSpan(rs.buffer) }));
-    }
+  private requireKind(kind: ForwardKind, what: string): void {
+    if (this.kind !== kind) throw new InferletError(`${what} binds a ${kind} pass; this pass is ${this.kind}`);
+  }
+
+  /** Bind the KV working set + geometry of an attention-only pass. */
+  attention(ws: WorkingSet, geom: KvGeometry): void {
+    this.requireKind('attention', 'attention');
+    const kv = this.stageKv(ws, geom);
+    wit('attention', () => (this.wit as witAttention.ForwardPass).attention(kv.ws, this.kvGeometryWit(kv)));
+  }
+
+  /** Bind a hybrid pass: the KV binding (`undefined` for a fire that touches
+   * no attention layer) plus the recurrent working set(s) and where their
+   * folded boundary lands. */
+  bindHybrid(kv: KvBinding | undefined, rs: RsWorkingSet[], rsGeom: RsGeometry): void {
+    this.requireKind('hybrid', 'bindHybrid');
+    const stagedKv = kv ? this.stageKv(kv.workingSet, kv.geometry) : undefined;
+    const stagedRs = this.stageRs(rs, rsGeom);
+    const binding = stagedKv ? { workingSet: stagedKv.ws, geometry: this.kvGeometryWit(stagedKv) } : undefined;
+    wit('bindHybrid', () =>
+      (this.wit as witHybrid.ForwardPass).attention(binding, stagedRs.workingSets, { foldLen: stagedRs.foldLen, buffer: pageSpan(stagedRs.buffer) }),
+    );
+  }
+
+  /** Bind a recurrent-only pass: the recurrent working set(s) and where
+   * their folded boundary lands. */
+  bindRecurrent(rs: RsWorkingSet[], geom: RsGeometry): void {
+    this.requireKind('recurrent', 'bindRecurrent');
+    const stagedRs = this.stageRs(rs, geom);
+    wit('bindRecurrent', () =>
+      (this.wit as witRecurrent.ForwardPass).attention(stagedRs.workingSets, { foldLen: stagedRs.foldLen, buffer: pageSpan(stagedRs.buffer) }),
+    );
   }
 
   /** Kind-independent binding for the common text program: the KV geometry,
@@ -643,7 +650,7 @@ export class ForwardPass {
    * token straight into the recurrence. */
   bindState(ws: WorkingSet, geom: KvGeometry, rs: RsWorkingSet[] = []): void {
     if (this.kind === 'attention') this.attention(ws, geom);
-    else if (this.kind === 'hybrid') this.attention({ workingSet: ws, geometry: geom }, rs, { buffer: [0, 0] });
+    else if (this.kind === 'hybrid') this.bindHybrid({ workingSet: ws, geometry: geom }, rs, { buffer: [0, 0] });
     else throw new InferletError('bindState: a recurrent-only model has no KV geometry to bind');
   }
 
@@ -777,16 +784,16 @@ export function submitFrame(on: Pipeline, slots: (ForwardPass | undefined)[]): v
  * until `budget` fires submit or `onToken` returns `false`. Returns the run
  * count. `onToken` is synchronous here (host reads block).
  */
-export function runAhead(on: Pipeline, pass: ForwardPass, budget: number, onToken: () => boolean | void): number {
+export function runAhead(on: Pipeline, fwd: ForwardPass, budget: number, onToken: () => boolean | void): number {
   if (budget === 0) return 0;
-  const r = pass.bindsDeviceMask() ? 1 : liveSlots();
+  const r = fwd.bindsDeviceMask() ? 1 : liveSlots();
   const windowFrames = Math.max(Math.floor((channelCapacity() - 1) / Math.max(r, 1)), 1);
   let submitted = 0;
   let consumed = 0;
   const submitOneFrame = () => {
     const live = Math.min(r, budget - submitted);
     if (live === 0) return;
-    submitFrame(on, new Array(live).fill(pass));
+    submitFrame(on, new Array(live).fill(fwd));
     submitted += live;
   };
   for (let i = 0; i < windowFrames; i++) {
