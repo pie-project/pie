@@ -228,6 +228,13 @@ pub const ROWS: &[Row] = &[
         vocab: 201_088,
         arch: "gptoss",
     },
+    // And with z-lab's DFlash block drafter overlaid.
+    Row {
+        id: "gptoss-20b-dflash-u4g64-mxfp4-kv-bf16",
+        layers: 24,
+        vocab: 201_088,
+        arch: "gptoss",
+    },
     Row {
         id: "gptoss-120b-bf16-mxfp4-kv-bf16",
         layers: 36,

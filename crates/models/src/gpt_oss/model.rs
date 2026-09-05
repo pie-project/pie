@@ -1,5 +1,7 @@
 use model_dsl::{Dtype, Weight};
 
+use crate::drafter::dflash::{self, DFlash};
+
 pub struct Model {
     pub hidden: u32,
     pub vocab: u32,
@@ -20,6 +22,10 @@ pub struct Model {
     pub layers: Vec<Layer>,
     pub final_norm: Weight,
     pub final_norm_eps: f32,
+
+    /// z-lab's block drafter (`gpt-oss-20b-DFlash`), when an overlay carries
+    /// one — the same text every family carries it as (`crate::drafter::dflash`).
+    pub dflash: Option<DFlash>,
 }
 
 pub use crate::adapter::Adapters;
@@ -104,6 +110,25 @@ struct Dims {
 }
 
 impl Model {
+    /// The 20B with z-lab's block drafter overlaid (`gpt-oss-20b-DFlash`).
+    pub fn b20_dflash(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut m = Model::b20(w, experts, kv, tp);
+        let dense = crate::dense(w);
+        m.dflash = Some(DFlash::declare(
+            &dflash::GPTOSS_20B_DFLASH,
+            "aux",
+            &dflash::Trunk {
+                hidden: u64::from(m.hidden),
+                vocab: u64::from(m.vocab),
+                norm_eps: m.final_norm_eps,
+                weights: w,
+                dense,
+                tp,
+            },
+        ));
+        m
+    }
+
     pub fn b20(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -277,6 +302,7 @@ impl Model {
             layers,
             final_norm: Weight::sym("final_norm", [hidden], dense),
             final_norm_eps: d.norm_eps,
+            dflash: None,
         }
     }
 }

@@ -280,6 +280,14 @@
 //! coin on a 30% prose); and it judges from two rounds, not eight (eight
 //! warm-up rounds at eight rows on a prose that closes at once cost 5%).
 //!
+//! At eight concurrent (`benches/pie_bench.py latency --requests 8`, gemma,
+//! aggregate tok/s) the gate is CONSERVATIVE: prose 65.3 priced / 49.8 ladder
+//! / 68.4 plain, counting 145.9 / 144.1 / 68.3, code 83.9 / 90.9 / 68.4. A
+//! lane's clock prices a fire as what the lane waited, and under load that is
+//! the batch it landed in, so a small draft fire is priced as a whole batch
+//! and rounds look dearer than they are. The exact price is the fire's own
+//! device time, which the engine has and the guest cannot see yet.
+//!
 //! **A priced loop is not a deterministic function of its prompt.** The
 //! prices come off a clock, the widths follow the prices, and on a trunk
 //! whose bf16 bits depend on the fire's width (§ below) two runs of one

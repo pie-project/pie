@@ -173,6 +173,11 @@ pub struct DraftAttn {
     pub q_norm_eps: f32,
     pub k_norm: Weight,
     pub k_norm_eps: f32,
+    /// The projections' biases, where the head has them ([`Head::attn_bias`]).
+    pub q_bias: Option<Weight>,
+    pub k_bias: Option<Weight>,
+    pub v_bias: Option<Weight>,
+    pub o_bias: Option<Weight>,
     /// This layer's kv row, in the trunk's page-id space.
     pub kv: String,
 }
@@ -211,6 +216,9 @@ pub struct Head {
     /// (`conv_kernel_size` / `conv_group_size`).
     pub conv: Option<Conv>,
     pub readout: Readout,
+    /// Whether the head's attention projections carry biases
+    /// (`attention_bias`): the gpt-oss head does, as its trunk does.
+    pub attn_bias: bool,
 }
 
 /// A [`DynConv`]'s two numbers: taps of the convolution and channels
@@ -254,6 +262,7 @@ pub const QWEN36_27B_DFLASH: Head = Head {
     proposals_from: 1,
     conv: None,
     readout: Readout::Argmax,
+    attn_bias: false,
 };
 
 /// `z-lab/Qwen3.8-27B-DFlash2`: block eight, five sliding layers causal
@@ -273,6 +282,7 @@ pub const QWEN38_27B_DFLASH2: Head = Head {
     proposals_from: 1,
     conv: Some(Conv { taps: 2, group: 16 }),
     readout: Readout::Selector { rank: 256, top_k: 16 },
+    attn_bias: false,
 };
 
 /// `DimInfer/Qwen3.8-27B-Dspark-v1`: the v1 backbone (its taps, five plain
@@ -293,6 +303,7 @@ pub const QWEN38_27B_DSPARK: Head = Head {
     proposals_from: 0,
     conv: None,
     readout: Readout::Markov { rank: 256, top_k: 16 },
+    attn_bias: false,
 };
 
 /// `z-lab/Qwen3.6-35B-A3B-DFlash`: the v1 shape against the 40-layer
@@ -311,6 +322,7 @@ pub const QWEN36_35B_A3B_DFLASH: Head = Head {
     proposals_from: 1,
     conv: None,
     readout: Readout::Argmax,
+    attn_bias: false,
 };
 
 /// `z-lab/gemma-4-26B-A4B-it-DFlash`: the v1 shape against a 30-layer
@@ -330,6 +342,27 @@ pub const GEMMA4_26B_A4B_DFLASH: Head = Head {
     proposals_from: 1,
     conv: None,
     readout: Readout::Argmax,
+    attn_bias: false,
+};
+
+/// `z-lab/gpt-oss-20b-DFlash`: block eight, EIGHT layers all full attention
+/// (bidirectional over the block), the trunk's own 64 × 64 query geometry
+/// over 8 kv heads — the first head whose attention is not 32 / 8 / 128 —
+/// biased projections, theta 150000, mask id 200000.
+pub const GPTOSS_20B_DFLASH: Head = Head {
+    taps: &[1, 6, 11, 16, 21],
+    windows: &[None; 8],
+    q_heads: 64,
+    kv_heads: 8,
+    head_dim: 64,
+    inter: 7_680,
+    theta: 150_000.0,
+    block: 8,
+    mask_token: 200_000,
+    proposals_from: 1,
+    conv: None,
+    readout: Readout::Argmax,
+    attn_bias: true,
 };
 
 impl DFlash {
@@ -409,6 +442,10 @@ impl DFlash {
                             q_norm_eps: trunk.norm_eps,
                             k_norm: Weight::sym(b("k_norm"), [hd], dense),
                             k_norm_eps: trunk.norm_eps,
+                            q_bias: head.attn_bias.then(|| Weight::sym(b("q_bias"), [u64::from(dq) * hd], dense)),
+                            k_bias: head.attn_bias.then(|| Weight::sym(b("k_bias"), [u64::from(dkv) * hd], dense)),
+                            v_bias: head.attn_bias.then(|| Weight::sym(b("v_bias"), [u64::from(dkv) * hd], dense)),
+                            o_bias: head.attn_bias.then(|| Weight::sym(b("o_bias"), [hidden], dense)),
                             kv: format!("kv.dflash.{l}"),
                         },
                         mlp_norm: Weight::sym(b("mlp_norm"), [hidden], dense),
@@ -532,8 +569,8 @@ impl DFlash {
         for b in &d.blocks {
             let a = &b.attn;
             let hd = a.head_dim;
-            let k = ops::linear::matmul(&h_ctx, &a.k_proj);
-            let v = ops::linear::matmul(&h_ctx, &a.v_proj);
+            let k = biased(ops::linear::matmul(&h_ctx, &a.k_proj), a.k_bias.as_ref());
+            let v = biased(ops::linear::matmul(&h_ctx, &a.v_proj), a.v_bias.as_ref());
             let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, hd, a.k_norm_eps);
             // One tensor, not a q/k pair: there is no query here, only the
             // context's keys on their way into the row.
@@ -559,9 +596,9 @@ impl DFlash {
             // DFlash2: the dynamic convolution's two sides, both from this
             // one input (`DynConv`); a v1 head has none and `x` passes through.
             let (x, attn_coeff) = conv_prepare(&x, b.attn_conv.as_ref());
-            let q = ops::linear::matmul(&x, &a.q_proj);
-            let k = ops::linear::matmul(&x, &a.k_proj);
-            let v = ops::linear::matmul(&x, &a.v_proj);
+            let q = biased(ops::linear::matmul(&x, &a.q_proj), a.q_bias.as_ref());
+            let k = biased(ops::linear::matmul(&x, &a.k_proj), a.k_bias.as_ref());
+            let v = biased(ops::linear::matmul(&x, &a.v_proj), a.v_bias.as_ref());
             let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, hd, a.q_norm_eps);
             let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, hd, a.k_norm_eps);
             let (q, k) =
@@ -607,7 +644,8 @@ impl DFlash {
                     a.sm_scale,
                 ),
             };
-            let o = conv_finish(&ops::linear::matmul(&o, &a.o_proj), b.attn_conv.as_ref(), attn_coeff.as_ref());
+            let o = biased(ops::linear::matmul(&o, &a.o_proj), a.o_bias.as_ref());
+            let o = conv_finish(&o, b.attn_conv.as_ref(), attn_coeff.as_ref());
             h = ops::elemwise::residual_add(&o, &h);
 
             let x = ops::elemwise::rmsnorm_plus_one(&h, &b.mlp_norm, b.mlp_norm_eps);
@@ -712,6 +750,16 @@ impl DFlash {
             b.read(&a.k_proj, n("self_attn.k_proj.weight"))?;
             b.read(&a.v_proj, n("self_attn.v_proj.weight"))?;
             b.read(&a.o_proj, n("self_attn.o_proj.weight"))?;
+            for (bias, leaf) in [
+                (&a.q_bias, "q_proj"),
+                (&a.k_bias, "k_proj"),
+                (&a.v_bias, "v_proj"),
+                (&a.o_bias, "o_proj"),
+            ] {
+                if let Some(bias) = bias {
+                    b.read(bias, n(&format!("self_attn.{leaf}.bias")))?;
+                }
+            }
             b.read_expr(&a.q_norm, norm(n("self_attn.q_norm.weight")))?;
             b.read_expr(&a.k_norm, norm(n("self_attn.k_norm.weight")))?;
             b.read_expr(&block.mlp_norm, norm(n("post_attention_layernorm.weight")))?;
@@ -760,6 +808,15 @@ impl DraftAttn {
     /// The kv row's name, owned, for a cache declaration.
     fn attn_kv(&self) -> String {
         self.kv.clone()
+    }
+}
+
+/// A projection's bias, where the head has one; the value passes through
+/// where it does not.
+fn biased(x: Value, bias: Option<&Weight>) -> Value {
+    match bias {
+        Some(b) => ops::elemwise::add_bias(b, &x),
+        None => x,
     }
 }
 

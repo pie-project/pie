@@ -271,3 +271,31 @@ fn gemma_carries_the_block_drafter_too() {
         .expect("the plain row");
     assert!((plain.trace)(Platform::Metal).drafter.is_none());
 }
+
+/// **A THIRD FAMILY, AND THE FIRST HEAD OF ANOTHER GEOMETRY.** gpt-oss carries
+/// z-lab's head: eight layers all full attention (eight non-causal reads over
+/// a block of eight), 64 query heads at head dim 64 with biased projections.
+#[test]
+fn gpt_oss_carries_the_block_drafter_too() {
+    use model_dsl::Platform;
+    let row = models::skus()
+        .find(|row| row.recipe.text == "gptoss-20b-dflash")
+        .expect("this build ships gpt-oss's DFlash row");
+    let trace = (row.trace)(Platform::Metal);
+    let facts = trace.drafter.expect("gpt-oss's text states its block drafter");
+    assert_eq!(
+        (facts.rows, facts.mask_token, facts.bidirectional, facts.proposals_from),
+        (8, 200_000, true, 1)
+    );
+    let bidirectional = trace
+        .nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                &n.op,
+                model_dsl::Operation::Attention(model_dsl::Attention::Masked { causal: false, .. })
+            )
+        })
+        .count();
+    assert_eq!(bidirectional, 8, "every layer of this head is full attention over the block");
+}
