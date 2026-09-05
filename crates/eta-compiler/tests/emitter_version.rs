@@ -17,7 +17,7 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 /// `the_pinned_versions_are_the_compiled_ones` until someone updates it here.
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 26, 0xa9ff_c409_891c_d517),
-    ("metal", 43, 0xf408_d19f_6f20_2e5a),
+    ("metal", 44, 0x5a78_239e_f020_709a),
 ];
 
 /// Everything an engine receives for both corpora, hashed. Includes the

@@ -20,6 +20,9 @@ pub mod ssm;
 /// DFlash2's two-tap grouped dynamic convolution along a request's block rows.
 pub mod dynconv;
 
+/// DFlash2's candidate selector, walked from each request's anchor.
+pub mod selector;
+
 use crate::error::Error;
 use dtype::Dtype;
 

@@ -144,6 +144,27 @@ pub struct DFlash {
     pub block: u32,
     /// The token every block row but the first carries on the way in.
     pub mask_token: u32,
+    /// DFlash2's candidate selector; `None` on a v1 head, whose readout is
+    /// the per-slot argmax.
+    pub selector: Option<Selector>,
+}
+
+/// **DFlash2's candidate selector** — the head's readout. Each mask slot
+/// keeps its `top_k` candidates off the target's head, and a path through
+/// them is walked from the anchor: slot `s` picks
+/// `argmax_c unary[c] + ⟨pred[prev] ⊙ hidden_projection(h_s), succ[c]⟩`,
+/// `prev` the previous slot's pick (the anchor's id first). Two `[vocab,
+/// rank]` codebooks and one projection; the walk is
+/// `attention.selector_walk`, planted at the `mtp.drafts` seam where v1
+/// plants its argmax.
+pub struct Selector {
+    /// `[rank, hidden]`.
+    pub hidden_projection: Weight,
+    /// `[vocab, rank]`, indexed by the predecessor's id.
+    pub pred: Weight,
+    /// `[vocab, rank]`, indexed by the candidate's id.
+    pub succ: Weight,
+    pub top_k: u32,
 }
 
 /// One layer of a [`DFlash`] drafter: the standard pre-norm decoder block,
@@ -1147,6 +1168,27 @@ impl Model {
                 norm_eps: d.norm_eps,
                 block: if v2 { DFLASH2_BLOCK } else { DFLASH_BLOCK },
                 mask_token: DFLASH_MASK_TOKEN,
+                selector: v2.then(|| Selector {
+                    hidden_projection: Weight::sym(
+                        n("candidate_selector.hidden_projection"),
+                        [u64::from(DFLASH2_SELECTOR_RANK), hidden],
+                        w,
+                    )
+                    .columns(),
+                    // Read seven times sixteen rows a fire: carried dense,
+                    // where precision costs nothing and the gather is exact.
+                    pred: Weight::sym(
+                        n("candidate_selector.predecessor_codebook"),
+                        [d.vocab as u64, u64::from(DFLASH2_SELECTOR_RANK)],
+                        dense,
+                    ),
+                    succ: Weight::sym(
+                        n("candidate_selector.successor_codebook"),
+                        [d.vocab as u64, u64::from(DFLASH2_SELECTOR_RANK)],
+                        dense,
+                    ),
+                    top_k: DFLASH2_SELECTOR_TOP_K,
+                }),
             }
         });
 
@@ -1203,6 +1245,9 @@ pub const DFLASH2_BLOCK: u32 = 8;
 const DFLASH2_CONV_TAPS: u32 = 2;
 /// `dflash_config.conv_group_size`: channels sharing one correction.
 const DFLASH2_CONV_GROUP: u32 = 16;
+/// `dflash_config.selector_rank` / `selector_top_k`.
+const DFLASH2_SELECTOR_RANK: u32 = 256;
+const DFLASH2_SELECTOR_TOP_K: u32 = 16;
 
 /// Adapter ceiling for every SKU of this family. Not a checkpoint fact (no
 /// pretrained artifact states it) — a deployment setting baked in at trace

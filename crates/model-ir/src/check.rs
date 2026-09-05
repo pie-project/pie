@@ -389,6 +389,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 &[(In(2), CACHE)]
             }
             Attention::BlockDynConv { .. } => &[],
+            Attention::SelectorWalk { .. } => &[(In(0), I32), (In(1), F32), (In(3), I32), (Out(0), I32)],
             Attention::SsmGdnPrep { .. } => &[(Out(0), F32)],
             Attention::SsmGatedDelta { .. } | Attention::SsmGatedDeltaChunked { .. } => {
                 &[(In(3), CACHE)]
@@ -551,6 +552,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // The argmax pins nothing: its operands are the readout's own
             // dtype and its i32 answer is stated by the value it writes.
             | Layout::Argmax { .. } => &[],
+            Layout::TopK { .. } => &[(Out(0), F32), (Out(1), I32)],
         },
         Operation::CustomCuda(op) => match op {
             CustomCuda::QkvFusedQknormRopeVnormWrite { .. } => {

@@ -306,6 +306,27 @@ pub enum Attention {
         group: u32,
         y: ValueId,
     },
+    /// **DFlash2's candidate selector, walked** — the head's readout. Within
+    /// each request's span the first row is the anchor and every row after it
+    /// a mask slot with `k` candidates (`cand`, `[rows, k]` i32, and their
+    /// logits `unary`, `[rows, k]` f32, both from `layout.topk`). From the
+    /// anchor, slot by slot, the pick is
+    /// `argmax_c unary[c] + ⟨pred[prev] ⊙ hp[row], succ[cand[c]]⟩` with `prev`
+    /// the anchor's id at the first slot and the previous slot's pick after —
+    /// the reference's `walk_greedy` over its `lattice`. `hp` is the slot's
+    /// hidden projected to the codebooks' rank, `pred`/`succ` the two
+    /// `[vocab, rank]` codebooks, `tokens` the fire's ids (the anchor is the
+    /// span's first). `picks` is `[rows, 1]` i32: the walked id at every slot
+    /// row, the first candidate at the anchor row.
+    SelectorWalk {
+        cand: ValueId,
+        unary: ValueId,
+        hp: ValueId,
+        tokens: ValueId,
+        pred: ValueId,
+        succ: ValueId,
+        picks: ValueId,
+    },
     /// Folds `ba` with dt bias and A-log into per-head decay gates.
     SsmGdnPrep {
         ba: ValueId,
@@ -584,6 +605,9 @@ impl Operands for Attention {
                 sink.extend([*x, *weight, *state]);
             }
             Self::BlockDynConv { x, coeff, base, .. } => sink.extend([*x, *coeff, *base]),
+            Self::SelectorWalk { cand, unary, hp, tokens, pred, succ, .. } => {
+                sink.extend([*cand, *unary, *hp, *tokens, *pred, *succ]);
+            }
             Self::SsmGdnPrep { ba, dt_bias, a_log, .. } => sink.extend([*ba, *dt_bias, *a_log]),
             Self::SsmGatedDelta { qkv, z, gates, state, .. } => {
                 sink.extend([*qkv, *z, *gates, *state]);
@@ -681,6 +705,7 @@ impl Operands for Attention {
             Self::SsmCausalConv1d { y, .. } => sink.push(*y),
             Self::SsmCausalConv1dChunked { y, .. } => sink.push(*y),
             Self::BlockDynConv { y, .. } => sink.push(*y),
+            Self::SelectorWalk { picks, .. } => sink.push(*picks),
             Self::SsmGdnPrep { gates, .. } => sink.push(*gates),
             Self::SsmGatedDelta { y, .. } => sink.push(*y),
             Self::SsmGatedDeltaChunked { y, .. } => sink.push(*y),
@@ -744,6 +769,7 @@ impl Operands for Attention {
             Self::SsmCausalConv1d { .. } => {}
             Self::SsmCausalConv1dChunked { .. } => {}
             Self::BlockDynConv { .. } => {}
+            Self::SelectorWalk { .. } => {}
             Self::SsmGdnPrep { .. } => {}
             Self::SsmGatedDelta { .. } => {}
             Self::SsmGatedDeltaChunked { .. } => {}
@@ -793,6 +819,7 @@ impl Operands for Attention {
             Self::SsmCausalConv1d { .. } => "attention.ssm_causal_conv1d",
             Self::SsmCausalConv1dChunked { .. } => "attention.ssm_causal_conv1d_chunked",
             Self::BlockDynConv { .. } => "attention.block_dyn_conv",
+            Self::SelectorWalk { .. } => "attention.selector_walk",
             Self::SsmGdnPrep { .. } => "attention.ssm_gdn_prep",
             Self::SsmGatedDelta { .. } => "attention.ssm_gated_delta",
             Self::SsmGatedDeltaChunked { .. } => "attention.ssm_gated_delta_chunked",

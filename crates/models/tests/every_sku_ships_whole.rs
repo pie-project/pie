@@ -164,6 +164,17 @@ fn the_dflash2_plan_is_whole_and_convolves() {
             .filter(|n| matches!(&n.op, model_dsl::Operation::Attention(model_dsl::Attention::BlockDynConv { .. })))
             .count();
         assert_eq!(convs, 20, "{platform:?}: five blocks x two sublayers x two sides");
+        let walks = trace
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op, model_dsl::Operation::Attention(model_dsl::Attention::SelectorWalk { .. })))
+            .count();
+        let topks = trace
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op, model_dsl::Operation::Layout(model_dsl::Layout::TopK { .. })))
+            .count();
+        assert_eq!((topks, walks), (1, 1), "{platform:?}: the selector reads the block out once");
         let seams: Vec<&str> = trace.seams.iter().map(|s| s.seam.as_str()).collect();
         assert!(seams.iter().any(|s| s.contains("mtp")), "{platform:?}: no draft seam; {seams:?}");
     }

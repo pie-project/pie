@@ -774,9 +774,16 @@ impl Prepared {
                 .iter()
                 .any(|op| op.intrinsic.is_some_and(|id| id as usize == wanted as usize))
         };
+        // A stage that reads the draft plane without reading `logits` (a
+        // block drafter's guest asks the head what it proposes and nothing
+        // else) still spans its readout rows: `drafts_len` ids at depth one
+        // are that many rows, which is what the plane's guard
+        // (`emit_mtp_drafts`) multiplies the depth by. A chained head's
+        // guest also reads `logits`, so this never widens what it declared.
         let trunk_rows = declared[IntrinsicId::Logits as usize]
             .map_or(0, |it| it.rows)
-            .max(u32::from(reads(IntrinsicId::Logits)));
+            .max(u32::from(reads(IntrinsicId::Logits)))
+            .max(plan.drafts_len);
         let draft_rows = declared[IntrinsicId::MtpLogits as usize]
             .map_or(0, |it| it.rows)
             .max(plan.mtp_rows)

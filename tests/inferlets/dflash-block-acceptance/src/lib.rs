@@ -75,7 +75,6 @@
 //! decoding it, which is the loop `rs-mtp-speculative-decoding` runs for the
 //! chained heads.
 
-use inferlet::chat;
 use inferlet::eta::hybrid::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -343,15 +342,11 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         fwd.epilogue(move || {
-            // **THE PROPOSALS ARE THE LOGITS, NOT THE DRAFTS SEAM.** A
-            // chained head's draft logits are a plane of their own, which is
-            // what `mtp.drafts` is for; a BLOCK drafter's rows go through
-            // the target's one `lm_head` beside the trunk's, so the fire's
-            // own readout over the block rows already IS the drafter's. The
-            // seam is bound one row wide at the readout row
-            // (`serve.rs::bind_intrinsic`), so asking it for `block` values
-            // is a geometry mismatch — which is how this was found.
-            out.put(&reshape(reduce_argmax(intrinsics::logits()), [block]));
+            // **THE PROPOSALS ARE THE HEAD'S READOUT, OFF THE `mtp.drafts`
+            // SEAM**, one id per readout row: a v1 head plants its per-slot
+            // argmax there and DFlash2 its selector's walk, so this measures
+            // whichever head the load carries without re-deriving either.
+            out.put(&reshape(intrinsics::mtp_drafts(block), [block]));
         });
         fwd.submit(&pipe)
             .with_context(|| format!("draft submit @round {round}"))?;

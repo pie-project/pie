@@ -1086,6 +1086,9 @@ impl Run<'_> {
             Attention::BlockDynConv { .. } => Err(kernels_cuda::Error::Unsupported {
                 op: "attention.block_dyn_conv",
             }),
+            Attention::SelectorWalk { .. } => Err(kernels_cuda::Error::Unsupported {
+                op: "attention.selector_walk",
+            }),
         }
     }
 }

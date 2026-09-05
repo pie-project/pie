@@ -886,15 +886,21 @@ async fn main(input: Input) -> Result<Output> {
         // still reads the block.
         let shown = if input.margin_width { block } else { verify };
         let readout = Channel::from_iter(0..shown).named("readout_d");
-        let out = Channel::new([shown * 2], dtype::i32)
+        // **THE PROPOSALS ARE THE HEAD'S READOUT, OFF THE `mtp.drafts`
+        // SEAM.** A v1 head plants its per-slot argmax there; DFlash2 plants
+        // its selector's walk. Reading the seam rather than the logits is
+        // what lets one loop drive both — the guest asks the head what it
+        // proposes and does not re-derive it.
+        let out = Channel::new([shown], dtype::i32)
             .capacity(ring())
             .named("drafts_d");
-        // **THE DRAFTER'S OWN CONFIDENCE, OFF THE SAME LOGITS.** One more
-        // reduction over a plane the fire already computed, read back beside
-        // the proposals in the same round trip.
+        // **THE DRAFTER'S OWN CONFIDENCE, OFF THE LOGITS**, only when a
+        // policy reads it (`margin_width`): a top-two over the whole plane
+        // costs a reduction the plain loop does not need.
         let conf = Channel::new([shown * 2], dtype::f32)
             .capacity(ring())
             .named("conf_d");
+        let want_margin = input.margin_width;
 
         let fwd = ForwardPass::new();
         fwd.set_drafting_block(true)
@@ -938,9 +944,11 @@ async fn main(input: Input) -> Result<Output> {
                 // the device. `top_k` reads it once and returns the values
                 // beside the indices, so the proposal and the margin that
                 // says how sure of it the drafter is come out together.
-                let (value, index) = top_k(intrinsics::logits(), 2);
-                out.put(&reshape(cast(index, dtype::i32), [shown * 2]));
-                conf.put(&reshape(value, [shown * 2]));
+                out.put(&reshape(intrinsics::mtp_drafts(shown), [shown]));
+                if want_margin {
+                    let (value, _) = top_k(intrinsics::logits(), 2);
+                    conf.put(&reshape(value, [shown * 2]));
+                }
             });
         }
         fwd.submit(&pipe).context("draft submit")?;
@@ -948,15 +956,17 @@ async fn main(input: Input) -> Result<Output> {
         // denoises each mask into the token AT ITS OWN POSITION, so row `i`
         // proposes position `held + i` and the anchor's row proposes nothing
         // new. The proposals are rows `1..block`.
-        let top = out.take_host::<Vec<i32>>().await.context("draft readback")?;
-        let value = conf.take_host::<Vec<f32>>().await.context("margin readback")?;
-        // Row `r` occupies `[2r, 2r + 1]`: the proposal and its runner-up.
-        proposals_owned = (1..shown as usize).map(|r| top[2 * r]).collect();
-        let margin: Vec<f32> = (1..shown as usize)
-            .map(|r| value[2 * r] - value[2 * r + 1])
-            .collect();
-        if pinned.is_none() && input.margin_width {
-            verify = if wide_enough(&margin) { block } else { NARROW };
+        let picks = out.take_host::<Vec<i32>>().await.context("draft readback")?;
+        proposals_owned = picks[1..shown as usize].to_vec();
+        if want_margin {
+            let value = conf.take_host::<Vec<f32>>().await.context("margin readback")?;
+            // Row `r` occupies `[2r, 2r + 1]`: the best and its runner-up.
+            let margin: Vec<f32> = (1..shown as usize)
+                .map(|r| value[2 * r] - value[2 * r + 1])
+                .collect();
+            if pinned.is_none() {
+                verify = if wide_enough(&margin) { block } else { NARROW };
+            }
         }
         // The buffer is back to the accepted prefix the verify is about to
         // fold — see the draft fire's geometry.

@@ -413,6 +413,13 @@ impl Model {
                 }
             }
             b.read_expr(&dflash.norm, norm("aux.norm.weight".to_string()))?;
+            // DFlash2's selector: a projection bank and two codebooks, the
+            // codebooks stored as plain arrays (no `.weight`).
+            if let Some(sel) = &dflash.selector {
+                b.read(&sel.hidden_projection, "aux.candidate_selector.hidden_projection.weight".to_string())?;
+                b.read(&sel.pred, "aux.candidate_selector.predecessor_codebook".to_string())?;
+                b.read(&sel.succ, "aux.candidate_selector.successor_codebook".to_string())?;
+            }
         }
 
         Ok(b.build())

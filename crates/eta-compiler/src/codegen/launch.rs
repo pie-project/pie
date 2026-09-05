@@ -339,6 +339,11 @@ pub struct LaunchStagePlan {
     pub needs: StageNeeds,
     /// How many MTP draft rows it reads.
     pub mtp_rows: u32,
+    /// How many ids its `mtp_drafts` readers declare (the longest), so a
+    /// stage that reads the draft plane WITHOUT reading `logits` still says
+    /// how many readout rows it spans. Zero when none does.
+    #[serde(default)]
+    pub drafts_len: u32,
     /// Its normalized ops, in stage-local numbering.
     pub ops: Vec<LaunchOp>,
     /// For each normalized op, which source ops it came from.
@@ -637,6 +642,7 @@ fn lower_plan(stage: &CompiledStage) -> LaunchStagePlan {
         identity: stage_identity(stage),
         needs: grouped.needs,
         mtp_rows: grouped.mtp_rows,
+        drafts_len: grouped.drafts_len,
         ops: ops.iter().map(lower_plan_op).collect(),
         source_ops: normalized.source_ops.clone(),
         value_types: normalized
@@ -740,6 +746,9 @@ fn lower_region(region: &Region) -> LaunchRegion {
 struct GroupedPlan {
     needs: StageNeeds,
     mtp_rows: u32,
+    /// The longest `mtp_drafts` declaration in the stage; see
+    /// [`LaunchStagePlan::drafts_len`].
+    drafts_len: u32,
     used_extents: Vec<SymbolicExtent>,
     channel_rules: Vec<LaunchChannelRule>,
     error: String,
@@ -824,7 +833,15 @@ impl GroupedPlan {
                         plan.needs.mtp_rows = true;
                         plan.mtp_rows = rows;
                     }
-                    intrinsic_tags::MTP_DRAFTS => plan.needs.mtp_drafts = true,
+                    intrinsic_tags::MTP_DRAFTS => {
+                        plan.needs.mtp_drafts = true;
+                        let value = value_bases[node] as usize;
+                        if let Some([Dimension::Static(len)]) =
+                            value_types.get(value).map(|ty| ty.dims.as_slice())
+                        {
+                            plan.drafts_len = plan.drafts_len.max(*len);
+                        }
+                    }
                     intrinsic_tags::LOGITS => {}
                     _ => return plan.invalid("stage uses an unsupported intrinsic"),
                 }

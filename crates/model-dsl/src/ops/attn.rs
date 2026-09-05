@@ -395,6 +395,35 @@ pub fn block_dyn_conv(
     y
 }
 
+/// DFlash2's candidate selector, walked from each request's anchor
+/// (`Attention::SelectorWalk`): the picked id at every slot row, `[rows, 1]`
+/// i32 — a draft readout, planted where [`layout::argmax`](super::layout::argmax)'s
+/// would be.
+pub fn selector_walk(
+    cand: &Value,
+    unary: &Value,
+    hp: &Value,
+    tokens: &Value,
+    pred: &Weight,
+    succ: &Weight,
+) -> Value {
+    let r = cand.rec();
+    let picks = r.fresh(tensor(cand.rows(), 1u64, Dtype::I32));
+    r.push(
+        Attention::SelectorWalk {
+            cand: cand.id(),
+            unary: unary.id(),
+            hp: hp.id(),
+            tokens: tokens.id(),
+            pred: r.weight(pred),
+            succ: r.weight(succ),
+            picks: picks.id(),
+        },
+        &[cand, unary, hp, tokens],
+    );
+    picks
+}
+
 /// PLE n-gram hasher: `state` is the lane's trailing-token-id window; `mults`,
 /// `primes`, `offsets` are seed-derived hash constants. Answer is `[rows, primes.len()]` `i32`.
 pub fn ple_ngram_ids(

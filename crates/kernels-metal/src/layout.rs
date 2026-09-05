@@ -849,3 +849,47 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
         &[src.arg(), dst.arg_mut(), stated(OP, words)?.arg()],
     )
 }
+
+/// Rows the top-k kernel walks at once — one threadgroup a row.
+const TOPK_THREADS: u32 = 128;
+
+/// The `k` largest entries of every row of `x`, sorted descending with ties
+/// to the lower column and a NaN never chosen: `values` `[rows, k]` f32,
+/// `indices` `[rows, k]` i32.
+///
+/// # Errors
+///
+/// Refuses a dtype or a `k` the kernel is not stamped for (8 and 16), and
+/// outputs of the wrong shape.
+pub fn topk(ctx: &Ctx<'_>, x: Tensor, k: u32, values: Tensor, indices: Tensor) -> Result<(), Error> {
+    const OP: &str = "layout.topk";
+    let entry = match (x.dtype, k) {
+        (Dtype::Bf16, 8) => "topk_rows_bfloat16_k_8",
+        (Dtype::Bf16, 16) => "topk_rows_bfloat16_k_16",
+        (Dtype::F32, 8) => "topk_rows_float32_k_8",
+        (Dtype::F32, 16) => "topk_rows_float32_k_16",
+        (dtype, k) => {
+            return Err(refuse(
+                OP,
+                format!("no point is stamped for {dtype:?} rows at k = {k}; the plane stamps bf16 and f32 at 8 and 16"),
+            ));
+        }
+    };
+    let rows = nonzero(OP, "rows", x.rows)?;
+    nonzero(OP, "width", x.width)?;
+    if values.rows != rows || values.width != k || values.dtype != Dtype::F32 {
+        return Err(refuse(OP, format!("the values plane is not [{rows}, {k}] f32")));
+    }
+    if indices.rows != rows || indices.width != k || indices.dtype != Dtype::I32 {
+        return Err(refuse(OP, format!("the indices plane is not [{rows}, {k}] i32")));
+    }
+    ctx.fire(
+        Fire::at("layout/topk.metal", entry).apply(Grid::of([TOPK_THREADS, rows, 1], [TOPK_THREADS, 1, 1])),
+        &[
+            x.arg(),
+            values.arg_mut(),
+            indices.arg_mut(),
+            stated(OP, x.width)?.arg(),
+        ],
+    )
+}

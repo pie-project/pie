@@ -319,23 +319,35 @@ impl ForwardHybrid for Model {
         // The drafter reads out through the TARGET's head, so its rows join
         // the trunk's before the one `lm_head` rather than after it — which
         // is what sharing the head means. Merge order is the split's.
-        let x = match (&m.dflash, h_block) {
+        let (x, hb) = match (&m.dflash, h_block) {
             (Some(d), Some(block)) => {
                 let fused = fused.as_ref().expect("a block drafter tapped the trunk");
                 let hb = dflash_arm(d, &inputs, fused, &block, &mask);
-                Value::merge(vec![hb, x])
+                (Value::merge(vec![hb.clone(), x]), Some(hb))
             }
-            _ => x,
+            _ => (x, None),
         };
 
         let logits = ops::linear::lm_head(&x, head);
 
         // The block's proposals: one draft a block row, the same
         // `[rows, depth]` seam shape the chained heads plant at depth one.
-        if m.dflash.is_some() {
+        // A v1 head's proposal is the slot's argmax; DFlash2's is its
+        // selector's walk over the slot's top candidates (`Selector`) — the
+        // head's own readout either way, and the guest reads one seam.
+        if let Some(d) = &m.dflash {
             let (dlogits, _) = logits.split(&Facts::block_draft());
             seam::at(seam::MTP, &[&dlogits]);
-            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&[&dlogits])]);
+            let picks = match (&d.selector, &hb) {
+                (Some(sel), Some(hb)) => {
+                    let (unary, cand) = ops::layout::topk(&dlogits, sel.top_k);
+                    let hp = ops::linear::matmul(hb, &sel.hidden_projection);
+                    let (toks, _) = inputs.tokens().split(&Facts::block_draft());
+                    ops::attn::selector_walk(&cand, &unary, &hp, &toks, &sel.pred, &sel.succ)
+                }
+                _ => ops::layout::argmax(&[&dlogits]),
+            };
+            seam::at(seam::MTP_DRAFTS, &[&picks]);
         }
 
         // Stated after the trunk's readout, so a draft column doesn't share
