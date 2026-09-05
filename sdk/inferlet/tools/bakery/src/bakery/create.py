@@ -14,7 +14,7 @@ from rich.panel import Panel
 from .console import console
 import typer
 
-INFERLET_VERSION = "0.4.0"
+INFERLET_VERSION = "0.5.0"
 
 
 def get_template(name: str) -> Template:
@@ -100,23 +100,17 @@ def generate_rust_lib(project_dir: Path, name: str) -> None:
 
 def generate_rust_cargo_toml(project_dir: Path, name: str) -> None:
     """Generate the Cargo.toml file for Rust inferlet."""
-    # Use crates.io path if not in dev mode
-    if pie_sdk := os.environ.get("PIE_SDK"):
-        inferlet_dep = f'{{ path = "{pie_sdk}/rust/inferlet" }}'
+    # A checkout of pie (or `PIE_SDK=<checkout>`) supplies the crate by path;
+    # anywhere else, the published one.
+    pie_sdk = os.environ.get("PIE_SDK")
+    roots = [Path(pie_sdk)] if pie_sdk else [Path.cwd(), *Path.cwd().parents]
+    for root in roots:
+        crate = root / "crates" / "inferlet"
+        if (crate / "Cargo.toml").exists():
+            inferlet_dep = f'{{ path = "{os.path.relpath(crate.resolve(), project_dir.resolve())}" }}'
+            break
     else:
-        # Try to find relative paths
-        current_dir = Path.cwd()
-        for parent in [current_dir] + list(current_dir.parents):
-            if (parent / "sdk" / "rust" / "inferlet").exists():
-                rel_path = (
-                    parent.relative_to(project_dir.parent)
-                    if project_dir.parent != parent
-                    else Path("..")
-                )
-                inferlet_dep = f'{{ path = "{rel_path}/sdk/rust/inferlet" }}'
-                break
-        else:
-            inferlet_dep = f'"{INFERLET_VERSION}"'
+        inferlet_dep = f'"{INFERLET_VERSION}"'
 
     template = get_template("rust/Cargo.toml.template")
     content = template.substitute(name=name, inferlet_dep=inferlet_dep)

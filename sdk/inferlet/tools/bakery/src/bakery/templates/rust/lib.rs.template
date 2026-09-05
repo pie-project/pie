@@ -1,205 +1,164 @@
-//! $name — chat text completion on the `pie:inferlet/forward` (attention) pass.
+//! $name — Rust inferlet: greedy text completion.
 //!
-//! The guest does not call a host sampler. It TRACES a program — embed,
-//! attention, then an epilogue that samples in-graph — and ships it to the
-//! device. The decode pass carries its own geometry: the epilogue writes the
-//! sampled token straight back into the pass's own `tok_in` channel and
-//! advances `kv_len` / `positions` / `w_slot` / `w_off` / `page_indptr`
-//! on-device, so resubmitting the pass in a loop needs no host round trip for
-//! anything but the token you want to print.
-//!
-//! For a hybrid (attention + recurrent) model see
-//! `tests/inferlets/mtp-native-verify` in the pie repo, which builds a
-//! `pie:inferlet/forward-hybrid` pass over the same idiom.
+//! The forward pass is TRACED from the `epilogue` closure below into an ETA
+//! program the first time it is submitted; `take_host` brings each sampled
+//! token back to the host, which sends it down again as the next embed.
+//! Everything else the decode fire reads (position, write slot/offset, page
+//! CSR) is derived from the KV length on the device by the epilogue itself.
+//! See tests/inferlets/text-completion in the pie repo for the same program
+//! with chunked prefill, and naive-baseline for a device-carried, run-ahead
+//! decode loop.
 
-use inferlet::eta::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
-use serde::Deserialize;
+use inferlet::eta::hybrid::prelude::*;
+use inferlet::{chat, session};
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 struct Input {
-    /// The user prompt to complete.
+    #[serde(default = "default_prompt")]
     prompt: String,
-
-    /// Maximum number of tokens to generate.
-    #[serde(default = "default_max_tokens")]
-    max_tokens: usize,
-
-    /// System message for the assistant.
     #[serde(default = "default_system")]
     system: String,
-
-    /// Sampling temperature. `0.0` selects greedy (argmax) decoding.
-    #[serde(default = "default_temperature")]
-    temperature: f32,
-
-    /// Nucleus sampling mass.
-    #[serde(default = "default_top_p")]
-    top_p: f32,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
 }
 
-fn default_max_tokens() -> usize { 256 }
-fn default_system() -> String { "You are a helpful, respectful and honest assistant.".into() }
-fn default_temperature() -> f32 { 0.6 }
-fn default_top_p() -> f32 { 0.95 }
+fn default_prompt() -> String {
+    "What is the capital of France?".into()
+}
+fn default_system() -> String {
+    "You are a helpful, respectful and honest assistant.".into()
+}
+fn default_max_tokens() -> usize {
+    64
+}
 
-/// Sampling, expressed as device ops so it runs inside the forward graph.
-///
-/// `rng` is a device loop-carried counter: the epilogue reads it, derives a
-/// Gumbel perturbation from it, and writes the advanced value back, so the
-/// stream never needs a host-supplied seed per step.
-fn sample(logits: Tensor, vocab: u32, temperature: f32, top_p: f32, rng: Option<Channel>) -> Tensor {
-    match rng {
-        None => reduce_argmax(logits),
-        Some(rng) => {
-            let scaled = div(logits, temperature);
-            let probs = softmax(&scaled);
-            let keep = pivot_threshold(probs, cummass_le(top_p));
-            let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
-            let masked = select(&keep, &scaled, &neg_inf);
-            let r = rng.take();
-            let g = gumbel(&r, [vocab]);
-            let r_next = add(&r, iota(2));
-            rng.put(&r_next);
-            reduce_argmax(add(masked, g))
-        }
-    }
+#[derive(Serialize)]
+struct Output {
+    text: String,
+    tokens: Vec<u32>,
+}
+
+/// The greedy pick over a logits row, as a one-lane `[1]` i32 cell.
+fn greedy(logits: Tensor) -> Tensor {
+    reshape(reduce_argmax(&logits), [1])
 }
 
 #[inferlet::main]
-async fn main(input: Input) -> Result<String> {
-    if wit_model::pass_kind() != wit_model::ForwardKind::Attention {
-        return Err(format!(
-            "this inferlet builds a `pie:inferlet/forward` pass, but {} needs {:?}.",
-            wit_model::name(),
-            wit_model::pass_kind(),
-        ));
-    }
-
-    let mut prompt_tokens = chat::system(&input.system);
-    prompt_tokens.extend(chat::user(&input.prompt));
-    prompt_tokens.extend(chat::cue());
-    let stop_tokens = chat::stop_tokens();
-
-    let n = prompt_tokens.len() as u32;
-    // The PADDED logits width, not the tokenizer's vocab size: every op below
-    // is shaped against what the model actually emits.
-    let vocab = wit_model::output_vocab_size();
-
+async fn main(input: Input) -> Result<Output> {
+    let kind = model::pass_kind();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
-    let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size);
-
-    let reserve_to_tokens = |tokens: u32| -> std::result::Result<(), String> {
-        let target = tokens.div_ceil(page_size).saturating_add(1).min(max_pages);
-        let current = ws.page_len();
-        if current < target {
-            ws.reserve(target - current)?;
-        }
-        Ok(())
+    // On a hybrid model the recurrent state rides beside the KV cache; on a
+    // pure-attention model the binding is empty and IS the attention pass.
+    let rs_ws: Vec<RsWorkingSet> = match kind {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Recurrent => return Err("this program needs a KV cache".into()),
+        model::ForwardKind::Diffusion => return Err("this program decodes a token at a time".into()),
     };
-    reserve_to_tokens(n.max(1)).map_err(|e| format!("reserve prompt pages: {e}"))?;
+    let page_size = kv_page_size();
+    let stop: Vec<u32> = chat::stop_tokens();
 
-    let sampling = input.temperature > 0.0;
-    let mk_rng = |seed: i32| -> Option<Channel> {
-        sampling.then(|| Channel::from(vec![seed, seed + 1]))
-    };
+    let mut tokens = chat::system(&input.system);
+    tokens.extend(chat::user(&input.prompt));
+    tokens.extend(chat::cue());
+    let n = tokens.len() as u32;
+    let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
+    ws.reserve(max_pages).context("reserve KV")?;
+    let pipe = Pipeline::new();
 
-    let tok_in = Channel::from(vec![0i32; 1]).named("tok_in");
-    let g0_ch = Channel::new([1], dtype::i32).named("g0");
-
-    let toks_p = Channel::from(prompt_tokens.iter().map(|&t| t as i32).collect::<Vec<_>>()).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p = Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-
-    let fwd_p = ForwardPass::new();
-    fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.attention(&ws, .., .., &kv_len_p, &pages_p, &page_indptr_p, &w_slot_p, &w_off_p, &positions_p, None)?;
+    // Prefill: the whole prompt in one fire; its epilogue samples the first token.
+    let tokens_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+    let toks_p = Channel::from(&tokens_i32[..]);
+    let embed_indptr_p = Channel::from([0u32, n]);
+    let kv_len_p = Channel::from([n]);
+    let pages_p = Channel::from_iter(0..max_pages);
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]);
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size));
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size));
+    let positions_p = Channel::from_iter(0..n);
+    let tok_out_p = Channel::new([1], dtype::i32);
+    let prefill = ForwardPass::new();
+    prefill.embed(&toks_p, &embed_indptr_p)?;
+    prefill.attention(
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: None,
+            },
+        }),
+        &rs_ws,
+        RsGeometry { fold_len: None, buffer: 0..0 },
+    )?;
     {
-        let rng = mk_rng(1);
-        let (temperature, top_p) = (input.temperature, input.top_p);
-        fwd_p.epilogue(move || {
-            let t = reshape(sample(intrinsics::logits(), vocab, temperature, top_p, rng), [1]);
-            tok_in.put(&t);
-            g0_ch.put(&t);
-        });
+        let tok_out_p = tok_out_p.clone();
+        prefill.epilogue(move || tok_out_p.put(&greedy(intrinsics::logits())));
     }
+    prefill.submit(&pipe).context("prefill submit")?;
+    let mut generated: Vec<u32> = vec![tok_out_p.take_host::<i32>().await.context("prefill drain")? as u32];
 
-    let out = Channel::new([1], dtype::i32).named("out");
-    let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-    let positions = Channel::from(vec![n]).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-    let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-    let w_off = Channel::from(vec![n % page_size]).named("w_off");
-    let kv_len = Channel::from(vec![n + 1]).named("kv_len");
-
-    let fwd = ForwardPass::new();
-    fwd.embed(&tok_in, &lane1)?;
-    fwd.attention(&ws, .., (n / page_size).., &kv_len, &pages, &page_indptr, &w_slot, &w_off, &positions, None)?;
+    // Decode: one token per fire; the geometry advances on the device.
+    let tok_in = Channel::from([generated[0] as i32]);
+    let embed_indptr = Channel::from([0u32, 1]);
+    let kv_len = Channel::from([n + 1]);
+    let positions = Channel::from([n]);
+    let pages = Channel::from_iter(0..max_pages);
+    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]);
+    let w_slot = Channel::from([n / page_size]);
+    let w_off = Channel::from([n % page_size]);
+    let tok_out = Channel::new([1], dtype::i32);
+    let decode = ForwardPass::new();
+    decode.embed(&tok_in, &embed_indptr)?;
+    decode.attention(
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
+        }),
+        &rs_ws,
+        RsGeometry { fold_len: None, buffer: 0..0 },
+    )?;
     {
-        let rng = mk_rng(7);
-        let (temperature, top_p) = (input.temperature, input.top_p);
-        fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
-            let t = reshape(sample(intrinsics::logits(), vocab, temperature, top_p, rng), [1]);
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
-            let next_page_indptr = mul(iota(2), broadcast(&page_count, [2]));
-            tok_in.put(&t);
+        let (kv_len, positions, page_indptr, w_slot, w_off, tok_out) =
+            (kv_len.clone(), positions.clone(), page_indptr.clone(), w_slot.clone(), w_off.clone(), tok_out.clone());
+        decode.epilogue(move || {
+            let length = kv_len.take();
+            let next_length = &length + 1u32;
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
-            page_indptr.take();
-            page_indptr.put(&next_page_indptr);
-            out.put(&t);
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
+            page_indptr.put(indptr(1, &next_length.div_ceil(page_size)));
+            tok_out.put(&greedy(intrinsics::logits()));
         });
     }
 
-    // The decode pass is BUILT above, before the prefill SUBMITS below: its
-    // eager claim on `tok_in` has to be registered before the prefill's
-    // epilogue writes into that channel. Both passes share one pipeline.
-    let pipe = Pipeline::new();
-    fwd_p.submit(&pipe).map_err(|e| format!("prefill submit: {e}"))?;
-
-    let mut decoder = chat::Decoder::new();
-    let mut text = String::new();
-    let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
-
-    let first = g0_ch.take().get::<i32>().await.map_err(|e| format!("first token: {e}"))?;
-    let Some(&first) = first.first() else {
-        return Err("first token: empty tensor".into());
-    };
-    generated.push(first as u32);
-
-    for step in 1..input.max_tokens {
-        if stop_tokens.contains(generated.last().unwrap()) {
-            break;
-        }
-        reserve_to_tokens(n + step as u32).map_err(|e| format!("reserve @{step}: {e}"))?;
-        fwd.submit(&pipe).map_err(|e| format!("decode submit @{step}: {e}"))?;
-        let t = out.take().get::<i32>().await.map_err(|e| format!("decode take @{step}: {e}"))?;
-        let Some(&t0) = t.first() else {
-            return Err(format!("decode take @{step}: empty tensor"));
-        };
-        generated.push(t0 as u32);
-
-        match decoder.feed(&[t0 as u32])? {
-            chat::Event::Delta(s) => text.push_str(&s),
-            chat::Event::Done(s) => { text = s; break; }
-            _ => {}
-        }
+    while generated.len() < input.max_tokens && !stop.contains(generated.last().unwrap()) {
+        decode.submit(&pipe).context("decode submit")?;
+        let token = tok_out.take_host::<i32>().await.context("decode drain")? as u32;
+        generated.push(token);
+        tok_in.put([token as i32]);
+        session::send(&model::decode(&[token])?); // stream to the client
     }
     pipe.close();
 
-    if text.is_empty() {
-        text = wit_model::decode(&generated).map_err(|e| format!("detokenize: {e}"))?;
-    }
-    Ok(text)
+    let kept: Vec<u32> = generated.iter().copied().filter(|t| !stop.contains(t)).collect();
+    Ok(Output { text: model::decode(&kept)?, tokens: kept })
 }
