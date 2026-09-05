@@ -5,14 +5,18 @@
 export function send(message: string): void;
 /**
  * Receives an incoming message from the remote user client
- */
-export function receive(): Promise<string | undefined>;
-/**
  * Sends a file to the remote user client
  */
 export function sendFile(data: Blob): void;
 /**
  * Receives an incoming file from the remote user client
+ * `receive` for a guest that cannot lower an `async func` (see
+ * `channel.take-blocking`): the guest's task blocks until a message
+ * arrives.
  */
-export function receiveFile(): Promise<Blob | undefined>;
+export function receiveBlocking(): string | undefined;
+/**
+ * `receive-file` for the same guests.
+ */
+export function receiveFileBlocking(): Blob | undefined;
 export type Blob = import('./pie-inferlet-types.js').Blob;

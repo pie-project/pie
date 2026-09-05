@@ -291,6 +291,57 @@ async fn materialize_channel(
     }
 }
 
+/// `take-blocking` / `read-blocking`: the same polling loop as
+/// [`materialize_channel`], driven from a plain `async fn(&mut self)` host
+/// import rather than an `Accessor`. Holding the store across the awaits is
+/// what "blocking" means here: the guest's task is suspended inside the
+/// call, nothing else in the instance runs, and every await below is on
+/// engine-side progress (fire settlement, the reader wait slot) that never
+/// needs the store to advance.
+async fn materialize_channel_blocking(
+    ctx: &mut ProcessCtx,
+    this: Resource<Channel>,
+    mode: ChannelReadMode,
+) -> Anyhow<Result<Vec<u8>, String>> {
+    let mut settle_ready_take = true;
+    loop {
+        let state = poll_channel(ctx, &this, mode, false, settle_ready_take)?;
+        let state = match state {
+            ChannelPoll::Pending {
+                fires: Some(fires), ..
+            } => {
+                let _finalize_guard = fires.finalize_guard().await;
+                let state = poll_channel(ctx, &this, mode, true, settle_ready_take)?;
+                match state {
+                    ChannelPoll::Finalize(op) => {
+                        let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
+                        crate::pipeline::fire::complete_finalize(ctx, finalized);
+                        settle_ready_take = false;
+                        continue;
+                    }
+                    state => state,
+                }
+            }
+            state => state,
+        };
+
+        match state {
+            ChannelPoll::Ready(value) => {
+                return Ok(value);
+            }
+            ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
+            ChannelPoll::Pending { cell, fires, .. } => {
+                settle_ready_take = true;
+                if let Err(error) =
+                    crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
+                {
+                    return Ok(Err(error));
+                }
+            }
+        }
+    }
+}
+
 // `add_to_linker` requires the interface-level `Host` bound even though
 // `channel` declares no free functions, so this impl is empty by construction.
 impl pie::inferlet::channel::Host for ProcessCtx {}
@@ -368,6 +419,16 @@ impl pie::inferlet::channel::HostChannel for ProcessCtx {
             .set(value)
             .map_err(|error| error.to_string());
         Ok(result)
+    }
+
+    /// The sync-lowerable `take`; see the WIT door for who needs it.
+    async fn take_blocking(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
+        materialize_channel_blocking(self, this, ChannelReadMode::Take).await
+    }
+
+    /// The sync-lowerable `read`.
+    async fn read_blocking(&mut self, this: Resource<Channel>) -> Anyhow<Result<Vec<u8>, String>> {
+        materialize_channel_blocking(self, this, ChannelReadMode::Read).await
     }
 
     async fn drop(&mut self, this: Resource<Channel>) -> Anyhow<()> {

@@ -21,8 +21,10 @@
 # exists. Deleting the modules built on the removed interface makes check 1
 # green while leaving both SDKs unable to run a forward pass -- a green gate
 # over an unpublishable package. Check 2 is what keeps that honest: it fails
-# until the hand-written layer actually binds the forward-pass interfaces, and
-# it goes green on its own the moment that lands. It is EXPECTED TO FAIL today.
+# until the hand-written layer actually binds the forward-pass interfaces.
+# Both SDKs bind them through their `eta` module (the tracing eDSL + container
+# encoder ported from `eta-dsl`/`eta-ir`, pinned byte-for-byte to the Rust
+# encoder by `crates/eta-dsl/tests/sdk_goldens.rs`), so this gate is green.
 #
 # Neither check needs componentize-py, jco, or a toolchain -- just the names.
 # A full build is the real gate; this is the cheap one that would have caught
@@ -110,6 +112,9 @@ check_defined() {
   for ref in $refs; do
     # WIT interface files are kebab-case; Python identifiers are snake_case.
     local wit="${ref//_/-}"
+    # componentize-py names the `types` interface `pie_inferlet_types`, since
+    # a bare `types` would shadow the stdlib module.
+    [ "$wit" = "pie-inferlet-types" ] && wit="types"
     if ! grep -qx -- "$wit" <<<"$known"; then
       note "$lang references interface '$wit', which crates/inferlet/wit/ does not define"
       fail=1
@@ -160,18 +165,11 @@ check_forward javascript "$js_refs" || fail=1
 
 if [ "$fail" -ne 0 ]; then
   note ""
-  note "This is the KNOWN, EXPECTED state -- not a regression to bisect."
-  note ""
   note "The guest forward-pass surface is no longer a fixed host-side sampler."
   note "The guest traces a program and ships canonical ETA container bytes."
-  note "The Rust SDK produces them with crates/eta-dsl (the tracing eDSL) and"
-  note "crates/eta-ir (the container encoder). Neither has a Python or JavaScript"
-  note "counterpart, and any port has to agree with the Rust encoder byte for"
-  note "byte, so it is its own project -- see forward_refactor.md 10.4."
-  note ""
-  note "Until then these SDKs expose the non-forward interfaces only and cannot"
-  note "run a model, so they must not be published. This gate goes green by"
-  note "itself once the hand-written layer binds the interfaces above."
+  note "Each SDK's \`eta\` module (a port of crates/eta-dsl + crates/eta-ir) must"
+  note "bind the interfaces above; an SDK that does not cannot run a model and"
+  note "must not be published."
   exit 1
 fi
 

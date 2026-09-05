@@ -8,6 +8,7 @@ Usage::
 """
 from conftest import run_tests
 from test_curated import tests
+from test_twins import tests as twin_tests
 
 if __name__ == "__main__":
-    run_tests(tests(), description="Curated Inferlet E2E Tests")
+    run_tests(tests() + twin_tests(), description="Curated Inferlet E2E Tests")

@@ -384,6 +384,13 @@ impl Shell {
         Ok(self.programs.instance_mut(instance_id))
     }
 
+    /// Every bound instance's predicted channel cursors, for the ranks of a
+    /// tensor-parallel group to compare.
+    #[must_use]
+    pub fn channel_predictions(&self) -> Vec<(u64, Vec<crate::program::Cursor>)> {
+        self.programs.predictions()
+    }
+
     /// Tear down one bound instance and free its rings, reaped first.
     ///
     /// # Errors

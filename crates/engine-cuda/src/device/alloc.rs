@@ -398,7 +398,13 @@ impl Pinned {
             unsafe {
                 crate::device::ctx::check(
                     "cudaHostAlloc",
-                    rt::cudaHostAlloc(&raw mut host, bytes, rt::cudaHostAllocMapped),
+                    rt::cudaHostAlloc(
+                        &raw mut host,
+                        bytes,
+                        // Portable: a tensor-parallel follower's device reads
+                        // rank 0's channel rings through this mapping.
+                        rt::cudaHostAllocMapped | rt::cudaHostAllocPortable,
+                    ),
                 )?;
                 if zeroed {
                     core::ptr::write_bytes(host.cast::<u8>(), 0, bytes);

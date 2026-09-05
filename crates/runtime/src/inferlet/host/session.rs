@@ -38,6 +38,36 @@ impl pie::inferlet::session::Host for ProcessCtx {
         }
         Ok(())
     }
+
+    /// `receive` for a guest that cannot lower an `async func` (see
+    /// `channel.take-blocking`): the guest's task is suspended in the call.
+    async fn receive_blocking(&mut self) -> Result<Option<String>> {
+        let process_id = self.id();
+        crate::server::inbox::receive(process_id.to_string())
+            .await
+            .with_context(|| format!("session.receive-blocking failed for process {process_id}"))
+            .map(Some)
+    }
+
+    /// `receive-file` for the same guests.
+    async fn receive_file_blocking(&mut self) -> Result<Option<Vec<u8>>> {
+        let process_id = self.id();
+        let Some(client_id) = process::get_client_id(process_id).await.ok().flatten() else {
+            return Ok(None);
+        };
+        match crate::server::receive_file(client_id, process_id).await {
+            Ok(data) => Ok(Some(data.to_vec())),
+            Err(error) => {
+                tracing::warn!(
+                    client_id,
+                    process_id = %process_id,
+                    %error,
+                    "session.receive_file_blocking delivery failed"
+                );
+                Ok(None)
+            }
+        }
+    }
 }
 
 impl pie::inferlet::session::HostWithStore<ProcessCtx> for HasSelf<ProcessCtx> {

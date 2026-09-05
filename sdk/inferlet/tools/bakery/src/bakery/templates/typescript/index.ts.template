@@ -1,50 +1,92 @@
-// $name — TypeScript inferlet.
+// $name — TypeScript inferlet: greedy text completion.
 //
-// HEADS UP: this scaffold does not generate text, because the JavaScript SDK
-// cannot yet. The guest forward-pass surface now ships ETA container bytes,
-// and the encoder that produces them exists only in the Rust SDK, so
-// `@pie-project/inferlet` currently exposes the non-forward interfaces only.
-// `scripts/check-sdk-interfaces.sh` in the pie repo fails on exactly that and
-// blocks publishing until it is ported.
-//
-// Until then, use the Rust template for anything that runs a model:
-//
-//     bakery new $name --rust
-//
-// What this scaffold does show is the part that works today: reading the bound
-// model's capabilities, tokenizing, building a chat prompt with the host's
-// template, and talking to the client.
+// The forward pass is traced from the `epilogue` closure below into an ETA
+// program the first time it is submitted; `takeScalar()` brings each sampled
+// token back to the host, which sends it down again as the next embed.
+// See tests/inferlets/text-completion-js in the pie repo for the same program
+// with chunked prefill, and naive-baseline-js for a device-carried,
+// run-ahead decode loop.
 
-import { chat, model, session, tokenizer } from '@pie-project/inferlet';
+import { chat, eta, model, session } from '@pie-project/inferlet';
+
+const { Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, dtype, indptr, intrinsics, kvPageSize, reduceArgmax, reshape } = eta;
 
 interface Input {
     prompt?: string;
     system?: string;
+    max_tokens?: number;
 }
 
-export async function main(input: Input) {
+const range = (a: number, b: number) => Array.from({ length: b - a }, (_, i) => a + i);
+const divCeil = (a: number, b: number) => Math.floor((a + b - 1) / b);
+
+export function main(input: Input) {
     const prompt = input.prompt ?? 'What is the capital of France?';
     const system = input.system ?? 'You are a helpful, respectful and honest assistant.';
+    const maxTokens = Number(input.max_tokens ?? 64);
 
-    // Build the prompt with the host's chat template. These are the exact
-    // token sequences a forward pass would embed.
-    const tokens = [
-        ...chat.system(system),
-        ...chat.user(prompt),
-        ...chat.cue(),
-    ];
+    const kind = model.passKind();
+    const ws = new WorkingSet();
+    const rsWs = kind !== 'attention' ? [new RsWorkingSet()] : [];
+    const pageSize = kvPageSize();
+    const stop = new Set(chat.stopTokens());
 
-    // `passKind()` is what selects the forward-pass interface a port would
-    // bind: 'attention', 'recurrent', or 'hybrid'. Never derive it by parsing
-    // `architecture()` — that is an open set.
-    const report = {
-        model: model.name(),
-        architecture: model.architecture(),
-        passKind: model.passKind(),
-        promptTokens: tokens.length,
-        roundTrip: tokenizer.decode(Uint32Array.from(tokens)),
-    };
+    const tokens = [...chat.system(system), ...chat.user(prompt), ...chat.cue()];
+    const n = tokens.length;
+    const maxPages = Math.max(divCeil(n + maxTokens + 1, pageSize), 1);
+    ws.reserve(maxPages);
+    const pipe = new Pipeline();
 
-    session.send(report);
-    return JSON.stringify(report);
+    // Prefill: the whole prompt in one fire; its epilogue samples the first token.
+    const toks = Channel.from(tokens, dtype.i32);
+    const tokOutP = new Channel([1], dtype.i32);
+    const prefill = new ForwardPass(kind);
+    prefill.embed(toks, Channel.from([0, n], dtype.u32));
+    prefill.bindState(ws, {
+        kvLen: Channel.from([n], dtype.u32),
+        pages: Channel.from(range(0, maxPages), dtype.u32),
+        pageIndptr: Channel.from([0, divCeil(n, pageSize)], dtype.u32),
+        wSlot: Channel.from(range(0, n).map((p) => Math.floor(p / pageSize)), dtype.u32),
+        wOff: Channel.from(range(0, n).map((p) => p % pageSize), dtype.u32),
+        positions: Channel.from(range(0, n), dtype.u32),
+    }, rsWs);
+    prefill.epilogue(() => {
+        tokOutP.put(reshape(reduceArgmax(intrinsics.logits()), [1]));
+    });
+    prefill.submit(pipe);
+    const generated = [tokOutP.takeScalar()];
+
+    // Decode: one token per fire; the geometry advances on the device.
+    const tokIn = Channel.from([generated[0]], dtype.i32);
+    const kvLen = Channel.from([n + 1], dtype.u32);
+    const positions = Channel.from([n], dtype.u32);
+    const pageIndptr = Channel.from([0, divCeil(n + 1, pageSize)], dtype.u32);
+    const wSlot = Channel.from([Math.floor(n / pageSize)], dtype.u32);
+    const wOff = Channel.from([n % pageSize], dtype.u32);
+    const tokOut = new Channel([1], dtype.i32);
+    const decode = new ForwardPass(kind);
+    decode.embed(tokIn, Channel.from([0, 1], dtype.u32));
+    decode.bindState(ws, { kvLen, pages: Channel.from(range(0, maxPages), dtype.u32), pageIndptr, wSlot, wOff, positions }, rsWs);
+    decode.epilogue(() => {
+        const length = kvLen.take();
+        const next = length.add(1);
+        kvLen.put(next);
+        positions.put(length);
+        wSlot.put(length.div(pageSize));
+        wOff.put(length.rem(pageSize));
+        pageIndptr.put(indptr(1, next.divCeil(pageSize)));
+        tokOut.put(reshape(reduceArgmax(intrinsics.logits()), [1]));
+    });
+
+    while (generated.length < maxTokens && !stop.has(generated[generated.length - 1])) {
+        decode.submit(pipe);
+        const token = tokOut.takeScalar();
+        generated.push(token);
+        tokIn.put([token]);
+        session.send(model.decode([token]));   // stream to the client
+    }
+    pipe.close();
+
+    const kept = generated.filter((t) => !stop.has(t));
+    return { text: model.decode(kept), tokens: kept };
 }

@@ -1,0 +1,15 @@
+[package]
+name = "rs-fork-probe-py"
+version = "0.1.0"
+description = "Minimal repro: greedy decode from forked working sets, repeated, to check the engine reproduces itself"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+num_tokens = {type = "int", optional = true, description = "Tokens per leaf (default: 6)"}
+align = {type = "bool", optional = true, description = "Pad the root prompt to a KV page boundary so forks write fresh pages (default: false)"}
+depth = {type = "int", optional = true, description = "Fork levels (default: 1; 2 = the prefix-tree shape)"}
+leaves = {type = "int", optional = true, description = "Forks of the root (default: 2)"}
+repeats = {type = "int", optional = true, description = "Whole-tree repetitions compared for stability (default: 2)"}

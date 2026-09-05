@@ -95,6 +95,11 @@ impl Ticket {
     /// A committed fire moves this endpoint's tail to `expected_tail + 1`,
     /// the mirror of [`Ticket::ADVANCE_HEAD`].
     pub const ADVANCE_TAIL: u32 = 1 << 7;
+    /// A follower rank's ticket under tensor parallelism: the ring's words
+    /// and mirror are rank 0's to vote on, advance and publish into. The
+    /// vote is taken as held, the host writer's cell is still pulled at the
+    /// predicted ring position, and nothing durable is written.
+    pub const SHADOW: u32 = 1 << 8;
 }
 
 const _: () = assert!(

@@ -93,13 +93,17 @@ def create(
         bool,
         typer.Option("--ts", "-t", help="Create a TypeScript project instead of Rust."),
     ] = False,
+    python: Annotated[
+        bool,
+        typer.Option("--python", "-p", help="Create a Python project instead of Rust."),
+    ] = False,
     output: Annotated[
         Optional[Path], typer.Option("-o", "--output", help="Output directory.")
     ] = None,
 ) -> None:
-    """Create a new inferlet project (Rust by default, or TypeScript with --ts)."""
+    """Create a new inferlet project (Rust by default, TypeScript with --ts, Python with --python)."""
     try:
-        create_cmd.handle_create_command(name=name, rust=not ts, output=output)
+        create_cmd.handle_create_command(name=name, rust=not (ts or python), output=output, python=python)
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)

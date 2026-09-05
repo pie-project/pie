@@ -19,13 +19,12 @@ const mock = (name: string) =>
 
 export default defineConfig({
   resolve: {
-    alias: {
-      'pie:inferlet/model': mock('model'),
-      'pie:inferlet/tokenizer': mock('tokenizer'),
-      'pie:inferlet/session': mock('session'),
-      'pie:inferlet/chat': mock('chat'),
-      'pie:inferlet/reasoning': mock('reasoning'),
-    },
+    alias: Object.fromEntries(
+      ['model', 'tokenizer', 'session', 'chat', 'reasoning', 'types', 'channel', 'pipeline', 'working-set', 'forward', 'forward-hybrid', 'forward-recurrent', 'grammar', 'tools', 'media'].flatMap((name) => [
+        [`pie:inferlet/${name}@0.3.0`, mock(name)],
+        [`pie:inferlet/${name}`, mock(name)],
+      ]),
+    ),
   },
   test: {
     include: ['src/__tests__/**/*.test.ts'],

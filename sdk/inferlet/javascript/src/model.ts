@@ -6,7 +6,12 @@
 // split-regex) moved to the sibling `tokenizer` module when the WIT split
 // separated the two interfaces.
 
-import * as _model from 'pie:inferlet/model';
+import * as _model from 'pie:inferlet/model@0.3.0';
+
+// The tokenizer surface lives in the sibling `tokenizer` module and is
+// re-exported here, so `model.encode`/`model.decode` read off `model` the way
+// they do in the Rust SDK.
+export { decode, encode, specialTokens, splitRegex, tokenBytes, tokensWithPrefix, vocabs } from './tokenizer.js';
 
 /** Name of the bound model. */
 export function name(): string {
@@ -23,9 +28,20 @@ export function defaultSystemSpeculation(): boolean {
   return _model.defaultSystemSpeculation();
 }
 
-/** Whether the bound model carries irreversibly-folded recurrent state. */
+/** The draft head's chain depth; 0 for a model with no draft head. */
+export function mtpDepth(): number {
+  return _model.mtpDepth();
+}
+
+/** How long a pipeline may hold a frame's wait-set, in microseconds. */
+export function submitDeadlineUs(): number {
+  return Number(_model.submitDeadlineUs());
+}
+
+/** Whether the bound model carries irreversibly-folded recurrent state —
+ *  `passKind() !== 'attention'`, the WIT's documented invariant. */
 export function isLinear(): boolean {
-  return _model.isLinear();
+  return _model.passKind() !== 'attention';
 }
 
 /**
@@ -65,8 +81,8 @@ export function maxEmbedLength(): number {
 }
 
 /** Bytes in one folded recurrent-state object. 0 for pure attention. */
-export function rsStateSize(): bigint {
-  return _model.rsStateSize();
+export function rsStateSize(): number {
+  return Number(_model.rsStateSize());
 }
 
 /** Tokens per buffered RS page. 0 if the model has no recurrent state. */
@@ -80,8 +96,8 @@ export function rsFoldGranularity(): number {
 }
 
 /** Bytes in one unified-arena accounting block. */
-export function arenaBlockSize(): bigint {
-  return _model.arenaBlockSize();
+export function arenaBlockSize(): number {
+  return Number(_model.arenaBlockSize());
 }
 
-export type { ForwardKind } from 'pie:inferlet/model';
+export type { ForwardKind } from 'pie:inferlet/model@0.3.0';

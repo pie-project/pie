@@ -83,6 +83,18 @@ pub fn skus() -> Vec<crate::Sku> {
             &tokenizer::CONTRACT,
             |tp: u32| Model::e4b(Dtype::Bf16, Dtype::Bf16, tp),
         ),
+        // The same checkpoint two ranks wide (`gemma4-e4b-bf16-kv-bf16-tp2`):
+        // an artifact imported at tp=1 serves it, each rank reading its band.
+        (
+            "gemma4-e4b",
+            2,
+            [Dtype::Bf16],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::gemma4,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::e4b(Dtype::Bf16, Dtype::Bf16, tp),
+        ),
         (
             "gemma4-31b",
             1,

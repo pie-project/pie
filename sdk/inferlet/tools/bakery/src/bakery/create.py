@@ -123,6 +123,12 @@ def generate_rust_cargo_toml(project_dir: Path, name: str) -> None:
     (project_dir / "Cargo.toml").write_text(content)
 
 
+def generate_py_main(project_dir: Path, name: str) -> None:
+    """Generate main.py for a Python project."""
+    template = get_template("python/main.py.template")
+    (project_dir / "main.py").write_text(template.substitute(name=name))
+
+
 def generate_pie_toml(project_dir: Path, name: str, language: str) -> None:
     """Generate the Pie.toml manifest file."""
     template = get_template("Pie.toml.template")
@@ -139,6 +145,7 @@ def handle_create_command(
     name: str,
     rust: bool = False,
     output: Optional[Path] = None,
+    python: bool = False,
 ) -> None:
     """Handle the `bakery create` command.
 
@@ -170,7 +177,23 @@ def handle_create_command(
     # Create project directory
     project_dir.mkdir(parents=True)
 
-    language = "rust" if rust else "typescript"
+    language = "rust" if rust else "python" if python else "typescript"
+
+    if python:
+        generate_py_main(project_dir, project_name)
+        generate_pie_toml(project_dir, project_name, language)
+        console.print(
+            Panel(
+                f"Created Python inferlet project: [bold]{project_name}[/bold]\n\n"
+                f"[blue]{project_dir}/main.py[/blue]\n"
+                f"[blue]{project_dir}/Pie.toml[/blue]",
+                title="[green]✅ Project Created[/green]",
+                border_style="green",
+            )
+        )
+        console.print("\n[bold]Next steps:[/bold]")
+        console.print(f"   bakery build {project_dir} -o {project_name.replace('-', '_')}.wasm")
+        return
 
     if rust:
         # Generate Rust project
@@ -212,18 +235,4 @@ def handle_create_command(
         )
 
         console.print("\n[bold]Next steps:[/bold]")
-        console.print(f"   cd {project_dir}")
-        console.print("   npm install")
-        console.print(f"   bakery build . -o {project_name}.wasm")
-
-        # Say plainly that this scaffold cannot run a model, rather than
-        # letting the user find out when they go looking for a `generate`.
-        console.print(
-            "\n[yellow]Note:[/yellow] the JavaScript SDK does not expose the "
-            "forward-pass surface yet, so this scaffold reads model info and "
-            "builds a prompt but does not generate text."
-        )
-        console.print(
-            "   For anything that runs a model, drop [bold]--ts[/bold] and "
-            "scaffold in Rust."
-        )
+        console.print(f"   bakery build {project_dir} -o {project_name.replace('-', '_')}.wasm")

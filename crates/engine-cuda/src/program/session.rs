@@ -76,6 +76,11 @@ pub struct Session {
     /// The one fire this session may have airborne. At most one, since a
     /// second mint would predict against unreconciled cursors.
     pending: Option<Minted>,
+    /// A tensor-parallel follower's session: its host-ended rings are rank
+    /// 0's endpoints, shared. The predictions here advance in step with
+    /// rank 0's, the tickets are [`Ticket::SHADOW`] (pull, never vote,
+    /// never write), and no seed or host verb touches the shared words.
+    shadow: bool,
 }
 
 /// What one fire's mint decided, kept until settlement reads it.
@@ -106,6 +111,7 @@ impl Session {
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         endpoints: Vec<Option<Arc<Endpoint>>>,
+        shadow: bool,
     ) -> Result<Session> {
         stages_and_plans_agree(compiled)?;
         if plan.package.channels.is_empty() {
@@ -135,8 +141,21 @@ impl Session {
             fires: 0,
             commit,
             pending: None,
+            shadow,
         };
         for (channel, wire) in seeds {
+            // A follower's host-ended ring was seeded by rank 0, whose bind
+            // came first: the cell and the guest-owned word are already
+            // there. Only the engine-owned prediction moves here.
+            if shadow
+                && let Some(endpoint) = session.rings.endpoint(*channel as usize)
+                && endpoint.role() != HostRole::None
+            {
+                if endpoint.engine_owns_tail() {
+                    session.cursors[*channel as usize].tail += 1;
+                }
+                continue;
+            }
             // A shared ring is seeded once, by whichever attachment binds first.
             let shared = session
                 .rings
@@ -181,6 +200,13 @@ impl Session {
         let channel = channel as usize;
         let prediction = self.cursors.get(channel).copied()?;
         Some(self.merge(channel, prediction))
+    }
+
+    /// Every channel's two counters, as the host predicts them right now.
+    /// Under tensor parallelism every rank's answer must be the same.
+    #[must_use]
+    pub fn predictions(&self) -> Vec<Cursor> {
+        self.cursors_now()
     }
 
     /// Every channel's two counters, from whichever owner keeps each.
@@ -554,6 +580,22 @@ impl Session {
                 .endpoint(channel)
                 .is_some_and(|endpoint| endpoint.role() == HostRole::None);
 
+            // A tensor-parallel FOLLOWER's session ignores host-facing channels
+            // entirely: they are rank 0's to publish/consume and the runtime
+            // pumps only rank 0's rings. The follower advances neither their
+            // prediction nor their device word (mismatching the two is the
+            // "cursors advanced between the two" refusal). Device-only channels
+            // (e.g. the decode `tok_in` handoff) are NOT host-facing and run
+            // normally, which is the whole reason the follower runs the guest.
+            if self.shadow
+                && self
+                    .rings
+                    .endpoint(channel)
+                    .is_some_and(|endpoint| endpoint.role() != HostRole::None)
+            {
+                continue;
+            }
+
             let mut used = cursor.tail - cursor.head;
             let mut moved_head = false;
             let mut moved_tail = false;
@@ -590,6 +632,9 @@ impl Session {
                 continue;
             }
             let mut flags = 0u32;
+            if self.shadow && endpoint.role() != HostRole::None {
+                flags |= Ticket::SHADOW;
+            }
             if addresses_head {
                 flags |= Ticket::CONSUME;
                 if endpoint.role() == HostRole::Writer {
@@ -620,6 +665,14 @@ impl Session {
                 && endpoint.role() != HostRole::None
             {
                 flags |= Ticket::PACKED_BOOL;
+            }
+            if flags & Ticket::SHADOW != 0 {
+                // Rank 0 votes on, advances and publishes into the shared
+                // ring; a follower's ticket only locates cells.
+                flags &= !(Ticket::REQUIRE_INPUT
+                    | Ticket::HOST_READER
+                    | Ticket::ADVANCE_HEAD
+                    | Ticket::ADVANCE_TAIL);
             }
             let cells = self
                 .rings
@@ -740,6 +793,10 @@ impl Session {
     /// The first ticket whose claim the live pinned words do not bear out.
     fn stale_ticket(&self, tickets: &[Ticket]) -> Option<u32> {
         for ticket in tickets {
+            // A shadow ticket never voted, so the words prove nothing about it.
+            if ticket.flags & Ticket::SHADOW != 0 {
+                continue;
+            }
             let endpoint = self.rings.endpoint(ticket.slot as usize)?;
             let (head, tail) = (endpoint.head(), endpoint.tail());
             if ticket.flags & Ticket::CONSUME != 0 && head != ticket.expected_head {

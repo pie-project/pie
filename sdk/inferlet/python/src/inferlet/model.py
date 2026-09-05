@@ -9,13 +9,24 @@ over that single bound model (no ``model`` resource handle)::
     print(model.name())
 
 The tokenizer surface (encode/decode/vocabs/special_tokens/split_regex)
-moved to the sibling :mod:`inferlet.tokenizer` module when the WIT split
-separated the two interfaces.
+lives in the sibling :mod:`inferlet.tokenizer` module and is re-exported
+here, so ``model.encode``/``model.decode`` read off ``model`` in inferlet
+source the way they do in the Rust SDK.
 """
 
 from __future__ import annotations
 
 from wit_world.imports import model as _model
+
+from .tokenizer import (  # noqa: F401 — re-exported, as the Rust `model` module does
+    encode,
+    decode,
+    vocabs,
+    split_regex,
+    special_tokens,
+    token_bytes,
+    tokens_with_prefix,
+)
 
 
 def name() -> str:
@@ -33,9 +44,20 @@ def default_system_speculation() -> bool:
     return _model.default_system_speculation()
 
 
+def mtp_depth() -> int:
+    """The draft head's chain depth; 0 for a model with no draft head."""
+    return _model.mtp_depth()
+
+
+def submit_deadline_us() -> int:
+    """How long a pipeline may hold a frame's wait-set, in microseconds."""
+    return _model.submit_deadline_us()
+
+
 def is_linear() -> bool:
-    """Whether the bound model carries irreversibly-folded recurrent state."""
-    return _model.is_linear()
+    """Whether the bound model carries irreversibly-folded recurrent state —
+    ``pass_kind() != ATTENTION``, the WIT's documented invariant."""
+    return _model.pass_kind() != _model.ForwardKind.ATTENTION
 
 
 def pass_kind() -> _model.ForwardKind:

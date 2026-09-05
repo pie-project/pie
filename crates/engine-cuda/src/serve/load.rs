@@ -22,7 +22,7 @@ use super::{Boot, FireCost, Golden, Graphs, Shell};
 /// The cold prefix both doors run: bind the device, settle the compiler's
 /// inputs, bake the artifact. `boot` is widened in place (its lattice).
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
-    let device = Context::bind(boot.ordinal)?;
+    let device = Context::bind(boot.ordinal, boot.comm)?;
 
     // One-shot: whichever load arrives first states the kernel cache root.
     kernels_cuda::disk::install(boot.cache_dir);
@@ -167,6 +167,11 @@ impl Shell {
             boot.checkpoint,
             boot.residency.clone(),
             device.stream(),
+            checkpoint::plan::StorageTarget::for_backend(
+                checkpoint::types::BackendKind::Cuda,
+                boot.world.rank,
+                boot.world.size,
+            ),
         )?;
         weights.rotate(&boot.trace, &compiled)?;
         let arena = Arena::reserve(&compiled.arena)?;

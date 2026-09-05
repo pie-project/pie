@@ -280,7 +280,20 @@
 //! coin on a 30% prose); and it judges from two rounds, not eight (eight
 //! warm-up rounds at eight rows on a prose that closes at once cost 5%).
 //!
-//! **UNDER CONCURRENT LOAD THE PRICES LIE, SO `priced` IS OFF BY DEFAULT.**
+//! **THE DEFAULTS FOLLOW THE CROWD** (`batch_concurrency`, which
+//! `benches/pie_bench.py` passes): alone, the prices gate and no floor; in a
+//! crowd, no prices and a floor of five with four narrow probes to reopen and
+//! a probe cadence that backs off per probe. Measured at four lanes under
+//! strict sealing on qwen38 (aggregate tok/s, plain 40 on every prompt):
+//! counting 68, code 39, prose 28 — and prose is the honest number: with the
+//! floor at 2.5 it read 31, with probes every sixteen fires 24-28, with the
+//! cadence backing off 37 once and 28 the next time. Four lanes of a
+//! low-yield prompt lose 25-30% to the warm-up rounds and the probes falling
+//! out of the batch, whatever this gate does, and the plain loop is the
+//! right one for them; the crowd default keeps the counting gain (1.6x) and
+//! pays that. `min_tokens_per_round = 1000` closes the gate for good.
+//!
+//! **UNDER CONCURRENT LOAD THE PRICES LIE, SO `priced` IS OFF IN A CROWD.**
 //! Eight lanes held open (`pie_bench.py tput --num-requests 8 --concurrency
 //! 8`, aggregate tok/s, plain / open loop / floor 2.5 / priced): gemma prose
 //! 107 / 56 / 87 / 92, gemma counting 110 / 174 / 181 / 149, qwen38 code 27
@@ -465,13 +478,19 @@ struct Input {
     /// because on three workloads it is a WASH.
     #[serde(default)]
     margin_width: bool,
-    /// **STOP DRAFTING BELOW THIS MANY TOKENS A ROUND.** 2.5 by default (the
-    /// header's shipped row); zero states no floor, which is the loop the
-    /// header's first tables were taken with. Around 3.0 is break-even on a
-    /// dense 27B on this box, and at eight concurrent a round costs about two
-    /// batch waits whatever the trunk; see `Gate`.
-    #[serde(default = "default_floor")]
-    min_tokens_per_round: f64,
+    /// **STOP DRAFTING BELOW THIS MANY TOKENS A ROUND.** Absent, the crowd
+    /// decides (`default_floor`): none alone, where the prices gate, five in
+    /// a crowd. Zero states no floor, which is the loop the header's first
+    /// tables were taken with; 2.5 is the header's shipped row. Around 3.0 is
+    /// break-even for a dense 27B alone on this box, and in a crowd a round
+    /// costs about two batch waits whatever the trunk; see `Gate`.
+    #[serde(default)]
+    min_tokens_per_round: Option<f64>,
+    /// How many requests the caller is holding open beside this one
+    /// (`benches/pie_bench.py` passes its `--concurrency`). Absent, one. Read
+    /// for the floor's default alone — see `default_floor`.
+    #[serde(default = "default_concurrency")]
+    batch_concurrency: u32,
     /// **LET THE LOOP'S OWN YIELD PICK THE VERIFY WIDTH.** See `Gate::width`.
     /// **ON by default**, because the full block is the WORST width on every
     /// workload measured — see the table in the header. `verify_rows` pins a
@@ -480,9 +499,10 @@ struct Input {
     #[serde(default = "default_true")]
     auto_width: bool,
     /// **PRICE THE FIRES ON THE GUEST'S OWN CLOCK, AND LET THE PRICES PICK.**
-    /// OFF by default: it wins alone on the box (see the header) and LOSES
-    /// under concurrent load, where a lane's clock prices a fire as the batch
-    /// it waited for. Every fire's wall time is kept by its shape — the
+    /// Absent, ON when the caller holds one request and OFF in a crowd
+    /// (`batch_concurrency`): it wins alone on the box (see the header) and
+    /// LOSES under concurrent load, where a lane's clock prices a fire as the
+    /// batch it waited for. Every fire's wall time is kept by its shape — the
     /// one-row fire, the draft fire, each verify width — and a round is
     /// bought at the rung whose recent yield per price is best, or not at
     /// all when one token a fire beats every rung (`Prices`, `Gate::plan`).
@@ -494,14 +514,26 @@ struct Input {
     /// the gate on top; `verify_rows` still pins the rung, and the gate then
     /// closes when that rung loses. Off, the loop is the header's.
     #[serde(default)]
-    priced: bool,
+    priced: Option<bool>,
 }
 
-/// The floor this file ships — the header's "2.5, WINDOW 8" row, and at eight
-/// concurrent the row that keeps a mixture's prose near plain decode where
-/// the open loop loses 38-48% of it. Zero states no floor.
-fn default_floor() -> f64 {
-    2.5
+/// The floor this file ships when none is stated. **Alone, none**: the
+/// prices gate the lone lane (`priced`), and a yield floor beside them
+/// closes what the prices would keep open — measured, qwen38 code alone
+/// with both read 15.9 s against the prices' 10.4. **In a crowd, five**:
+/// under strict sealing a round is two batch waits whatever the trunk, and a
+/// lane that drafts falls out of step with its neighbours and narrows their
+/// batches — measured at four lanes on qwen38 with the floor at 2.5,
+/// counting 1.60x but code 0.87x and prose 0.77x (gemma: 1.40x and 0.73x),
+/// where the break-even yield sits near four or five tokens a round rather
+/// than the one-lane three. The crowd is what the caller says it is; the
+/// guest has no other way to know it is one of several.
+fn default_floor(concurrency: u32) -> f64 {
+    if concurrency > 1 { 5.0 } else { 0.0 }
+}
+
+fn default_concurrency() -> u32 {
+    1
 }
 
 fn default_prompt() -> String {
@@ -700,6 +732,18 @@ struct Gate {
     /// Whether the priced gate is closed: the window then holds only the
     /// probes fired since it closed, and one probe that pays reopens it.
     closed: bool,
+    /// Probes a closed gate judges on before it may reopen: `REOPEN_ALONE`
+    /// or `REOPEN_CROWDED` — see those.
+    reopen: usize,
+    /// Whether the caller holds other requests open. A crowded gate backs its
+    /// probe cadence off PER PROBE (16, 32, 64, 128 plain fires): every probe
+    /// is a lane stepping out of the batch its neighbours are in, and four
+    /// lanes probing every sixteen fires kept the batch two lanes wide (four
+    /// lanes of qwen38 prose read 24-28 tok/s against 37 with the cadence
+    /// backing off and 40 plain). Alone there is no batch to fall out of, so
+    /// the cadence backs off only when a judgement rejects — a lone lane
+    /// closed on one bad streak reopens within two probes.
+    crowded: bool,
     /// Whether the verify width follows the yield. Off leaves it at `block`.
     auto: bool,
 }
@@ -720,11 +764,18 @@ impl Gate {
     /// warm-up rounds at eight rows on a prose that closes at once cost 5%
     /// of a 384-token run (7.5 s against 7.1 plain).
     const WARM: usize = 2;
-    /// Probes a closed gate judges on before it may reopen. One is a coin: on
-    /// a 30%-acceptance prose a four-row probe comes back whole about one
-    /// time in eight, reopened the gate, and eight losing rounds followed
-    /// (7.2 s -> 7.6 s over 384 tokens). Two pooled probes have to pay.
-    const REOPEN: usize = 2;
+    /// Probes a closed gate judges on before it may reopen, all at the
+    /// narrowest rung. One is a coin: on a 30%-acceptance prose a four-row
+    /// probe comes back whole about one time in eight, reopened the gate,
+    /// and eight losing rounds followed (7.2 s -> 7.6 s over 384 tokens);
+    /// two still churned in a crowd (four lanes of prose read 28 tok/s
+    /// against a never-reopening loop's 39). Four pooled probes have to pay.
+    const REOPEN_ALONE: usize = 2;
+    /// In a crowd, four: two still churned there (four lanes of prose read
+    /// 28 tok/s against a never-reopening loop's 39), and four cost the
+    /// lone lane a fifth of its code and prose gains (qwen38 code 10.4 ->
+    /// 12.9 s, prose 12.1 -> 16.1), so the count follows the crowd.
+    const REOPEN_CROWDED: usize = 4;
     /// A round has to beat one token a fire by this much before the priced
     /// gate opens, and fall this far under before it closes — a window of
     /// eight reads a bad streak as a verdict otherwise, and the fires spent
@@ -756,8 +807,18 @@ impl Gate {
     /// eight, where the fire's premium over four is 28% — see `width`.
     const WARM_TOP: u32 = 8;
 
-    fn new(floor: f64, auto: bool) -> Self {
-        Gate { floor, recent: Vec::new(), last: 0, since: 0, probe_after: Self::PROBE, closed: false, auto }
+    fn new(floor: f64, auto: bool, crowded: bool) -> Self {
+        Gate {
+            floor,
+            recent: Vec::new(),
+            last: 0,
+            since: 0,
+            probe_after: Self::PROBE,
+            closed: false,
+            reopen: if crowded { Self::REOPEN_CROWDED } else { Self::REOPEN_ALONE },
+            crowded,
+            auto,
+        }
     }
 
     /// Whether this round drafts. A probe is allowed through so a workload
@@ -768,12 +829,21 @@ impl Gate {
         }
         if self.closed {
             // Judged on the probes fired since closing — see `plan` for why
-            // the window is emptied at closure.
-            if self.recent.len() >= Self::REOPEN && self.mean() >= self.floor {
-                self.closed = false;
-                self.since = 0;
-                self.probe_after = Self::PROBE;
-                return true;
+            // the window is emptied at closure. A rejected judgement empties
+            // the window again and backs the probe cadence off; the cadence
+            // does NOT back off per probe, or four probes would take 240
+            // plain fires to gather and a gate closed on one bad streak
+            // would stay closed for the request (measured: qwen38 code alone
+            // read 23.8 s against 10.4).
+            if self.recent.len() >= self.reopen {
+                if self.mean() >= self.floor {
+                    self.closed = false;
+                    self.since = 0;
+                    self.probe_after = Self::PROBE;
+                    return true;
+                }
+                self.recent.clear();
+                self.probe_after = (self.probe_after * 2).min(Self::PROBE_MAX);
             }
             return self.probe(0).is_some();
         }
@@ -917,7 +987,7 @@ impl Gate {
         // and the gate never reopens (measured: closed at round 33 of a
         // 384-token run and closed at the end, probing into the same seven
         // losses).
-        let enough = self.recent.len() >= if self.closed { Self::REOPEN } else { Self::WARM };
+        let enough = self.recent.len() >= if self.closed { self.reopen } else { Self::WARM };
         let measured = plain.is_some() && prices.round(1).is_some() && enough;
         if !self.drafts() {
             return None;
@@ -952,17 +1022,24 @@ impl Gate {
         }
         if !self.closed {
             self.closed = true;
-            self.recent.clear();
+        } else {
+            // A judgement (REOPEN probes gathered) that kept the gate closed
+            // backs the cadence off.
+            self.probe_after = (self.probe_after * 2).min(Self::PROBE_MAX);
         }
+        self.recent.clear();
         self.probe(narrowest)
     }
 
-    /// A closed gate's turn: a plain fire, or — every `probe_after` of them,
-    /// doubling while the probes keep losing — one round at `width`.
+    /// A closed gate's turn: a plain fire, or — every `probe_after` of them —
+    /// one round at `width`. Alone, the cadence backs off where the judgement
+    /// is rejected (`drafts`, `plan`); in a crowd, per probe (see `crowded`).
     fn probe(&mut self, width: u32) -> Option<u32> {
         if self.since >= self.probe_after {
             self.since = 0;
-            self.probe_after = (self.probe_after * 2).min(Self::PROBE_MAX);
+            if self.crowded {
+                self.probe_after = (self.probe_after * 2).min(Self::PROBE_MAX);
+            }
             return Some(width);
         }
         self.since += 1;
@@ -1156,7 +1233,11 @@ async fn main(input: Input) -> Result<Output> {
     // round replays nothing.
     let mut survivors: u32 = 0;
     let mut widths: Vec<u32> = Vec::new();
-    let mut gate = Gate::new(input.min_tokens_per_round, input.auto_width);
+    let crowded = input.batch_concurrency > 1;
+    let floor = input.min_tokens_per_round.unwrap_or_else(|| default_floor(input.batch_concurrency));
+    // Alone, the prices; in a crowd, the yield floor — see `priced`.
+    let priced = input.priced.unwrap_or(!crowded);
+    let mut gate = Gate::new(floor, input.auto_width, crowded);
     let mut prices = Prices::new(block);
     let mut plain_fires: usize = 0;
     // Drafting rounds since the plain fire was last priced, and plain fires
@@ -1235,7 +1316,7 @@ async fn main(input: Input) -> Result<Output> {
         // first compiles and is dropped, `Prices::keep`), and cost the two
         // tokens they emit. Then the rung — or no round — is the prices'
         // choice; without prices, the stated gate's and ladder's.
-        let planned = if input.priced {
+        let planned = if priced {
             if since_priced >= REPRICE {
                 since_priced = 0;
                 owed_plain = 2;
@@ -1248,7 +1329,16 @@ async fn main(input: Input) -> Result<Output> {
                 gate.plan(block, &prices, pinned)
             }
         } else {
-            gate.drafts().then(|| pinned.unwrap_or_else(|| gate.width(block)))
+            gate.drafts().then(|| {
+                // A closed gate's probe fires at the narrowest rung: cheap,
+                // and its yield is the first positions', which is where a
+                // workload that changed shows first (`Gate::plan` does the same).
+                if gate.closed {
+                    pinned.unwrap_or(Gate::RUNGS[0]).min(block)
+                } else {
+                    pinned.unwrap_or_else(|| gate.width(block))
+                }
+            })
         };
         let mut verify = planned.unwrap_or(1);
         // The buffer must hold the survivors and this window; the grant is

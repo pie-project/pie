@@ -10,7 +10,7 @@
 // suppression). The chat decoder handles its own filtering so visible
 // text and reasoning text don't overlap.
 
-import * as _reasoning from 'pie:inferlet/reasoning';
+import * as _reasoning from 'pie:inferlet/reasoning@0.3.0';
 
 // =============================================================================
 // Events
@@ -66,15 +66,15 @@ export class Decoder {
   readonly #inner: _reasoning.Decoder;
 
   constructor() {
-    this.#inner = _reasoning.createDecoder();
+    this.#inner = new _reasoning.Decoder();
   }
 
   /** Feed a token batch and get back the event that fired. Returns
    *  `Event.Idle()` when the batch landed outside any reasoning block,
    *  or inside one but on tokens that produced no visible reasoning
    *  text. */
-  feed(tokens: Uint32Array): Event {
-    const ev = this.#inner.feed(tokens);
+  feed(tokens: ArrayLike<number>): Event {
+    const ev = this.#inner.feed(Uint32Array.from(tokens));
     switch (ev.tag) {
       case 'start':    return Event.Start();
       case 'delta':    return ev.val ? Event.Delta(ev.val) : Event.Idle();

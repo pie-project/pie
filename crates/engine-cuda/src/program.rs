@@ -121,6 +121,9 @@ pub struct Plane {
     /// [`wave`]. Long-lived so its device arena is a high-water mark rather
     /// than per-boundary; empty between batches.
     wave: Wave,
+    /// A tensor-parallel follower's plane: sessions bind as shadows of
+    /// rank 0's (see [`Session`]).
+    shadow: bool,
 }
 
 impl Default for Plane {
@@ -144,7 +147,25 @@ impl Plane {
             next_instance: 1,
             staged: Vec::new(),
             wave: Wave::default(),
+            shadow: false,
         }
+    }
+
+    /// Makes every session bound from now on a tensor-parallel follower's:
+    /// its host-ended rings are rank 0's endpoints, read and never written.
+    pub fn set_shadow(&mut self, shadow: bool) {
+        self.shadow = shadow;
+    }
+
+    /// Every instance's predicted cursors, in instance order. The ranks of a
+    /// tensor-parallel group compare these after a frame: a difference is a
+    /// gate that decided differently on one rank.
+    #[must_use]
+    pub fn predictions(&self) -> Vec<(u64, Vec<Cursor>)> {
+        self.instances
+            .iter()
+            .map(|(id, bound)| (*id, bound.session.predictions()))
+            .collect()
     }
 
     /// What the compile tiers have been doing.
@@ -239,6 +260,7 @@ impl Plane {
             seeds,
             extents,
             endpoints,
+            self.shadow,
         ) {
             Ok(session) => session,
             Err(why) => {

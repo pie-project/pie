@@ -1,8 +1,4 @@
 /** @module Interface pie:inferlet/reasoning@0.3.0 **/
-/**
- * Create a decoder to detect reasoning blocks in generated tokens
- */
-export function createDecoder(): Decoder;
 export type Error = import('./pie-inferlet-types.js').Error;
 export type Event = EventStart | EventDelta | EventComplete;
 /**
@@ -27,10 +23,7 @@ export interface EventComplete {
 }
 
 export class Decoder {
-  /**
-   * This type does not have a public constructor.
-   */
-  private constructor();
+  constructor()
   feed(tokens: Uint32Array): Event;
   reset(): void;
 }

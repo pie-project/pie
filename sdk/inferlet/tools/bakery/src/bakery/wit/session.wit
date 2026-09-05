@@ -14,4 +14,12 @@ interface session {
     // Receives an incoming file from the remote user client
     receive-file: async func() -> option<blob>;
 
+    /// `receive` for a guest that cannot lower an `async func` (see
+    /// `channel.take-blocking`): the guest's task blocks until a message
+    /// arrives.
+    receive-blocking: func() -> option<string>;
+
+    /// `receive-file` for the same guests.
+    receive-file-blocking: func() -> option<blob>;
+
 }

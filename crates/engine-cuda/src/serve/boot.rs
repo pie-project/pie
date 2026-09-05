@@ -232,4 +232,8 @@ pub struct Boot<'a> {
     pub runahead: engine::runahead::Runahead,
     /// How much of the weight table this load may hold on the device.
     pub residency: crate::experts::Plan,
+    /// Which rank of how wide a group this shell is (rank 0 of 1 alone).
+    pub world: crate::api::World,
+    /// The rank's `ncclComm_t`, or null on a single device.
+    pub comm: *mut core::ffi::c_void,
 }
