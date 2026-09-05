@@ -562,6 +562,7 @@ impl FrameShell for Shell {
                 mask: masking,
                 have,
                 rows: row.rows,
+                bidirectional: seated.bidirectional,
             });
             slot_ids.push(lane.slot as i32);
             // Fold length resolved here: a `FoldLen::Device` row's count
@@ -771,6 +772,48 @@ impl FrameShell for Shell {
             }
             triples
         };
+        // The denoiser's self-conditioning taps, `[rows, taps]` twice. Every
+        // fire of a plan that declares them stages them — zeros for a lane
+        // that carries none (an encode lane, an arming synthetic) — so the
+        // input is bound whichever class runs.
+        let taps = self.self_cond_taps as usize;
+        let (mut self_cond_rows, mut self_cond_weights) = if taps == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            let mut ids: Vec<i32> = Vec::with_capacity(positions.len() * taps);
+            let mut ws: Vec<f32> = Vec::with_capacity(positions.len() * taps);
+            for row in composition.lanes() {
+                let seated = &lanes[row.source as usize];
+                let cells = row.rows as usize * taps;
+                match seated.self_cond {
+                    Some(sc) => {
+                        if sc.taps as usize != taps
+                            || sc.rows.len() != cells
+                            || sc.weight_bits.len() != cells
+                        {
+                            return Err(Fault::program(
+                                "serve::prepare",
+                                format!(
+                                    "lane {} states self-conditioning taps of width {} over {} \
+                                     ids, and this plan reads {taps} taps over the lane's {} rows",
+                                    row.source,
+                                    sc.taps,
+                                    sc.rows.len(),
+                                    row.rows
+                                ),
+                            ));
+                        }
+                        ids.extend(sc.rows.iter().map(|&id| i32::try_from(id).unwrap_or(0)));
+                        ws.extend(sc.weights());
+                    }
+                    None => {
+                        ids.extend(std::iter::repeat_n(0, cells));
+                        ws.extend(std::iter::repeat_n(0.0, cells));
+                    }
+                }
+            }
+            (ids, ws)
+        };
 
         // 2b. Admission: the union demand of this step, committed atomically
         // before any of it runs. A demand is a watermark (highest addressed
@@ -961,6 +1004,10 @@ impl FrameShell for Shell {
             if !mrope_positions.is_empty() {
                 mrope_positions.resize(carve_rows as usize * MROPE_COORDS, 0);
             }
+            if taps > 0 {
+                self_cond_rows.resize(carve_rows as usize * taps, 0);
+                self_cond_weights.resize(carve_rows as usize * taps, 0.0);
+            }
             if any_adapter {
                 adapter_routes.resize(carve_rows as usize, -1);
             }
@@ -1050,6 +1097,8 @@ impl FrameShell for Shell {
             patch_embed_rows,
             patch_embed_weights,
             mrope_positions,
+            self_cond_rows,
+            self_cond_weights,
             windows,
             seats,
             tables,

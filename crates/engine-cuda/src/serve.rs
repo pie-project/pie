@@ -79,6 +79,9 @@ pub struct Shell {
     patch_seat: Option<crate::inputs::PatchSeat>,
     /// Whether the plan declares `RuntimeInput::MropePositions`.
     mrope_seat: bool,
+    /// Taps per row of `RuntimeInput::SelfCondRows`, or zero for a plan that
+    /// declares none.
+    self_cond_taps: u32,
     /// Whether the plan declares `layout.scatter_live_rows`.
     drops_patch_rows: bool,
     /// Whether the artifact states a patch axis at all.
@@ -559,6 +562,10 @@ pub struct Prepared<'a> {
     patch_embed_weights: Vec<f32>,
     /// The trunk's rotation stream; empty unless the plan declares it.
     mrope_positions: Vec<i32>,
+    /// The denoiser's self-conditioning taps, `[rows, taps]` each; empty
+    /// unless the plan declares them.
+    self_cond_rows: Vec<i32>,
+    self_cond_weights: Vec<f32>,
     /// Every region's rows and lanes, bound to a device address only in `enqueue`.
     windows: Windows,
     /// One per lane, in fire (seriated) order.

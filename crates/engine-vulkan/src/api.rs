@@ -454,6 +454,7 @@ impl Engine for Vulkan {
             media_encode: false,
             device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
+            bidirectional_attention: false,
         };
 
         self.shell = Some(shell);
@@ -480,6 +481,7 @@ impl Engine for Vulkan {
         frame.validate_for(engine::fire::Serves {
             device_channel_commit: false,
             rs_verbs: self.caps.as_ref().is_some_and(|caps| caps.rs_verbs),
+            bidirectional: false,
         })?;
         let id = self.next_frame;
         self.next_frame = self.next_frame.wrapping_add(1);

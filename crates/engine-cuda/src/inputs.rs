@@ -327,6 +327,11 @@ pub struct Inputs {
     mrope: Option<u64>,
     /// Bytes [`Inputs::mrope`] holds — the row ceiling tripled, or zero.
     mrope_bytes: u64,
+    /// The self-conditioning taps' seat: ids then weights, each
+    /// [`Inputs::self_cond_bytes`] long; `None` for a plan that reads none.
+    self_cond: Option<u64>,
+    self_cond_taps: u64,
+    self_cond_bytes: u64,
     spaces: Vec<SpaceAt>,
     /// Lane ceiling every per-lane table was carved at (`Budget::max_lanes`).
     max_lanes: u32,
@@ -358,6 +363,7 @@ impl Inputs {
         runahead: engine::runahead::Runahead,
         patch: Option<PatchSeat>,
         mrope: bool,
+        self_cond_taps: u64,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
@@ -422,6 +428,8 @@ impl Inputs {
         });
         // Trunk's triple-wide token stream, below the line like patch, reserved only when the plan names it. `[max_tokens, 3]` i32, not paid at all by a scalar-rotate text.
         let mrope = mrope.then(|| take(rows * AXES * 4));
+        // The denoiser's taps: `[max_tokens, taps]` i32 ids and f32 weights, reserved only when the plan reads them.
+        let self_cond = (self_cond_taps > 0).then(|| take(rows * self_cond_taps * 4 * 2));
         // One grant per plan value: the float side is the requirement of the builder that will actually run, or the flat floor, whichever is larger — computed, not guessed, since a short grant declines to capture instead of failing.
         let runs = runs.max(1);
         let grants: Vec<Option<Grant>> = facts
@@ -491,6 +499,9 @@ impl Inputs {
             patch,
             mrope,
             mrope_bytes: if mrope.is_some() { rows * AXES * 4 } else { 0 },
+            self_cond,
+            self_cond_taps,
+            self_cond_bytes: if self_cond.is_some() { rows * self_cond_taps * 4 } else { 0 },
             spaces,
             max_lanes: budget.max_lanes,
             max_rows: budget.max_tokens,
@@ -860,6 +871,41 @@ impl Inputs {
             (positions.len() / AXES as usize) as u32,
             AXES as u32,
             Dtype::I32,
+        ))
+    }
+
+    /// Stage a fire's self-conditioning taps: `rows` ids and `weights`, each
+    /// `[token rows, taps]` row major, into the seat the load reserved.
+    pub fn stage_self_cond(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        rows: &[i32],
+        weights: &[f32],
+    ) -> Result<(Tensor, Tensor)> {
+        let Some(at) = self.self_cond else {
+            return Err(crate::error::Fault::Ceiling {
+                what: "the self-conditioning taps, which this load reserved no seat for",
+                need: rows.len() as u64 * 4,
+                have: 0,
+            });
+        };
+        let need = rows.len() as u64 * 4;
+        if need > self.self_cond_bytes || weights.len() != rows.len() {
+            return Err(crate::error::Fault::Ceiling {
+                what: "bytes of self-conditioning taps this load reserved",
+                need,
+                have: self.self_cond_bytes,
+            });
+        }
+        let base = self.store.ptr();
+        let weights_at = at + self.self_cond_bytes;
+        self.store.stage(stream, at, bytes_of(rows))?;
+        self.store.stage(stream, weights_at, f32_bytes_of(weights))?;
+        let taps = self.self_cond_taps as u32;
+        let token_rows = (rows.len() as u64 / self.self_cond_taps.max(1)) as u32;
+        Ok((
+            Tensor::new(base + at, token_rows, taps, Dtype::I32),
+            Tensor::new(base + weights_at, token_rows, taps, Dtype::F32),
         ))
     }
 

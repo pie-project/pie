@@ -72,6 +72,7 @@ wasmtime::component::bindgen!({
         // pass can't reach an attention-only call.
         "pie:inferlet/forward-recurrent.forward-pass": forward::ForwardPass,
         "pie:inferlet/forward-hybrid.forward-pass": forward::ForwardPass,
+        "pie:inferlet/forward-diffusion.forward-pass": forward::ForwardPass,
         // pie:inferlet/pipeline — the ordering domain (hoisted out of forward
         // so working-set mutators can take borrow<pipeline> without a cycle).
         "pie:inferlet/pipeline.pipeline": pipeline::Pipeline,
@@ -108,6 +109,7 @@ pub fn add_to_linker(
     pie::inferlet::forward::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::forward_recurrent::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::forward_hybrid::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::forward_diffusion::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::session::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::media::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::speech::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;

@@ -189,6 +189,22 @@ pub struct Lane {
     /// Keep this lane's attention mass; puts its per-layer log-sum-exp into
     /// [`LaneReadout::scores`]. [`Lane::drafts`]'s twin in validation.
     pub captures_scores: bool,
+    /// Every row attends every key of the lane's readable extent, the keys
+    /// this fire writes after the row included — a denoiser's reading of a
+    /// canvas. `false` is the causal reading. Lifted on the custom-mask arm,
+    /// which is why a bidirectional lane must carry a [`Lane::mask`] (an
+    /// all-keeping one when it has nothing else to say); served only by an
+    /// engine declaring
+    /// [`bidirectional_attention`](crate::Capabilities::bidirectional_attention),
+    /// refused by name elsewhere rather than silently read causally.
+    #[serde(default)]
+    pub bidirectional: bool,
+    /// A denoiser's self-conditioning taps for this lane's rows
+    /// (`RuntimeInput::SelfCondRows/Weights`); `None` for a lane with no
+    /// signal, which an engine stages as zero weights when the plan reads
+    /// the input at all. Only meaningful beside [`Lane::bidirectional`].
+    #[serde(default)]
+    pub self_cond: Option<SelfCondInput>,
     /// The recurrent-state verb this lane asks for ([`RsVerb`]). An engine
     /// that does not serve the non-default verbs
     /// ([`Serves::rs_verbs`]) refuses them by name rather than folding.
@@ -281,6 +297,30 @@ impl Lane {
         if !self.channels.is_empty() && !serves.device_channel_commit {
             return Err(Error::unsupported("engine", F3_CHANNEL_TICKETS));
         }
+        if self.bidirectional && self.mask.is_none() {
+            return Err(Error::Invalid(format!(
+                "lane in slot {} attends bidirectionally and states no mask; the custom-mask \
+                 arm is where the causal bound is lifted, so the lane must carry one",
+                self.slot
+            )));
+        }
+        if self.bidirectional && !serves.bidirectional {
+            return Err(Error::unsupported("engine", BIDIRECTIONAL_WITHOUT_ARM));
+        }
+        if let Some(sc) = &self.self_cond {
+            let cells = self.rows() as usize * sc.taps as usize;
+            if sc.taps == 0 || sc.rows.len() != cells || sc.weight_bits.len() != cells {
+                return Err(Error::Invalid(format!(
+                    "lane in slot {} states a self-conditioning input of {} taps as {} ids and \
+                     {} weights for its {} rows",
+                    self.slot,
+                    sc.taps,
+                    sc.rows.len(),
+                    sc.weight_bits.len(),
+                    self.rows()
+                )));
+            }
+        }
         if !matches!(self.rs, RsVerb::Fold) && !serves.rs_verbs {
             return Err(Error::unsupported("engine", RS_VERBS_WITHOUT_DEVICE_HALF));
         }
@@ -318,6 +358,8 @@ const F3_CHANNEL_TICKETS: &str =
 
 /// The verb spelling for the recurrent verbs an engine has no device half for.
 const RS_VERBS_WITHOUT_DEVICE_HALF: &str = "Lane::rs beyond RsVerb::Fold: this engine has no device half for it";
+const BIDIRECTIONAL_WITHOUT_ARM: &str =
+    "Lane::bidirectional: this engine's attention applies its own causal bound and cannot lift it";
 
 /// What an engine states it will actually honour, carried into
 /// [`Lane::validate_for`].
@@ -329,14 +371,48 @@ pub struct Serves {
     /// This engine serves [`RsVerb::Buffer`] and [`RsVerb::FoldBuffered`]
     /// ([`Capabilities::rs_verbs`](crate::Capabilities::rs_verbs)).
     pub rs_verbs: bool,
+    /// This engine serves [`Lane::bidirectional`]
+    /// ([`Capabilities::bidirectional_attention`](crate::Capabilities::bidirectional_attention)).
+    pub bidirectional: bool,
 }
 
 impl Serves {
-    /// Neither prediction honoured.
+    /// Nothing honoured.
     pub const NONE: Serves = Serves {
         device_channel_commit: false,
         rs_verbs: false,
+        bidirectional: false,
     };
+}
+
+/// A denoiser lane's self-conditioning taps: per row, `taps` token ids and
+/// their weights, row major. The weights ride as their `f32` bit patterns
+/// so the lane stays `Eq` (a fire is compared and hashed whole).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfCondInput {
+    /// Taps per row; the plan's own count.
+    pub taps: u32,
+    /// `rows() * taps` token ids.
+    pub rows: Vec<u32>,
+    /// `rows() * taps` weights, as `f32::to_bits`.
+    pub weight_bits: Vec<u32>,
+}
+
+impl SelfCondInput {
+    /// The taps from ids and weights, row major.
+    #[must_use]
+    pub fn new(taps: u32, rows: Vec<u32>, weights: &[f32]) -> SelfCondInput {
+        SelfCondInput {
+            taps,
+            rows,
+            weight_bits: weights.iter().map(|w| w.to_bits()).collect(),
+        }
+    }
+
+    /// The weights, as numbers.
+    pub fn weights(&self) -> impl Iterator<Item = f32> + '_ {
+        self.weight_bits.iter().map(|&bits| f32::from_bits(bits))
+    }
 }
 
 /// Whether a lane's recurrent slot begins here. Opening a sequence in a slot

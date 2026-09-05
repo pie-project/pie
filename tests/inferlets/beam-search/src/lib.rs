@@ -445,5 +445,10 @@ async fn main(input: Input) -> Result<String> {
                 .to_string()
                 .into(),
         ),
+        model::ForwardKind::Diffusion => Err(
+            "beam-search branches per token; a diffusion model branches per canvas and needs its own loop"
+                .to_string()
+                .into(),
+        ),
     }
 }

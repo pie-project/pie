@@ -205,6 +205,9 @@ async fn main(input: Input) -> Result<Output> {
         model::ForwardKind::Recurrent => {
             Err("this program has no recurrent-only path (no registered model reports that kind)".into())
         }
+        model::ForwardKind::Diffusion => {
+            Err("this program captions through an autoregressive decode; a diffusion model needs its own canvas loop".into())
+        }
     }
 }
 

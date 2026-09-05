@@ -101,6 +101,7 @@ pub enum PassKind {
     Attention,
     Recurrent,
     Hybrid,
+    Diffusion,
 }
 
 impl PassKind {
@@ -109,6 +110,7 @@ impl PassKind {
             PassKind::Attention => "attention",
             PassKind::Recurrent => "recurrent",
             PassKind::Hybrid => "hybrid",
+            PassKind::Diffusion => "diffusion",
         }
     }
 
@@ -118,8 +120,20 @@ impl PassKind {
             PassKind::Attention => "pie:inferlet/forward",
             PassKind::Recurrent => "pie:inferlet/forward-recurrent",
             PassKind::Hybrid => "pie:inferlet/forward-hybrid",
+            PassKind::Diffusion => "pie:inferlet/forward-diffusion",
         }
     }
+}
+
+/// Which reading a diffusion pass runs — host mirror of WIT
+/// `forward-diffusion.mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasMode {
+    /// Causal; its KV writes are the sequence (prefill, commit).
+    Encode,
+    /// Bidirectional over `[prefix | canvas]`; its KV writes are the
+    /// canvas's scratch.
+    Denoise,
 }
 
 #[derive(Default)]
@@ -140,6 +154,26 @@ pub struct ForwardBindings {
     /// attached them. Empty on every text-only pass. `Arc` so a decoded
     /// image submitted to two passes is decoded once.
     pub media: Vec<std::sync::Arc<models::media::EncodedSpan>>,
+    /// `forward-diffusion`'s `canvas(mode)`; `None` on every other kind, and
+    /// on a diffusion pass that has not stated its reading yet (which
+    /// `program` refuses). `Denoise` makes every lane attend bidirectionally
+    /// over `[prefix | its rows]`, through the masked arm with an all-keeping
+    /// mask when the guest bound none; the KV it writes is the canvas's
+    /// scratch, overwritten by the encode pass that commits the block.
+    pub canvas: Option<CanvasMode>,
+    /// `forward-diffusion.self-conditioning`: the taps staged for this
+    /// pass's NEXT submit, taken by it. `None` between submits and on every
+    /// encode pass.
+    pub self_cond: Option<SelfCondPayload>,
+}
+
+/// One staged self-conditioning payload: `canvas * taps` ids and weights,
+/// row major, validated against the model's canvas at the verb.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelfCondPayload {
+    pub taps: u32,
+    pub rows: Vec<u32>,
+    pub weights: Vec<f32>,
 }
 
 /// Where a fire's folded boundary lands — host mirror of WIT

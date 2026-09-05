@@ -1,6 +1,6 @@
 //! What one fire submits: lanes, their seats, guest attachments and images.
 
-use engine::fire::{Boundary, Masking, RsReset, RsVerb};
+use engine::fire::{Boundary, Masking, RsReset, RsVerb, SelfCondInput};
 
 /// One request inside a fire.
 #[derive(Debug, Clone, Copy)]
@@ -32,6 +32,11 @@ pub struct Seated<'a> {
     pub drafts: bool,
     /// Keep this lane's per-query attention mass.
     pub captures_scores: bool,
+    /// Lift the causal bound from this lane's mask bits: every row attends
+    /// every key of the extent.
+    pub bidirectional: bool,
+    /// This lane's self-conditioning taps, or `None` for zero weights.
+    pub self_cond: Option<&'a SelfCondInput>,
     /// What this lane's pass does to its recurrent state.
     pub rs: RsVerb,
     /// Whether this lane's recurrent slot arrives fresh.
@@ -54,6 +59,8 @@ impl<'a> Seated<'a> {
             adapter: None,
             drafts: false,
             captures_scores: false,
+            bidirectional: false,
+            self_cond: None,
             rs: RsVerb::Fold,
             rs_reset: RsReset::Inferred,
             readout: None,

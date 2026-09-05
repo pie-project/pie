@@ -122,6 +122,13 @@ pub struct Capabilities {
     /// others are refused by name, not silently folded.
     #[serde(default)]
     pub rs_verbs: bool,
+
+    /// True: a lane may attend bidirectionally over its readable extent
+    /// ([`Lane::bidirectional`](crate::fire::Lane::bidirectional)) — the
+    /// custom-mask arm lifts the causal bound. False: the attention applies
+    /// its own causal bound and the lane is refused by name.
+    #[serde(default)]
+    pub bidirectional_attention: bool,
 }
 
 impl Capabilities {

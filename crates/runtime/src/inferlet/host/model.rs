@@ -32,6 +32,12 @@ impl pie::inferlet::model::Host for ProcessCtx {
     async fn pass_kind(&mut self) -> Result<pie::inferlet::model::ForwardKind> {
         use pie::inferlet::model::ForwardKind;
         let model = model::model();
+        // A diffusion row states its canvas on the catalog; the kind is
+        // that statement, not a reading of its page sizes (which are an
+        // attention model's).
+        if model.diffusion().is_some() {
+            return Ok(ForwardKind::Diffusion);
+        }
         let has_rs = model.rs_caps().state_size > 0;
         let has_kv = model.kv_page_size() > 0;
         Ok(match (has_kv, has_rs) {
@@ -39,6 +45,17 @@ impl pie::inferlet::model::Host for ProcessCtx {
             (true, true) => ForwardKind::Hybrid,
             (false, true) => ForwardKind::Recurrent,
         })
+    }
+
+    /// The canvas a diffusion row denoises; `None` for every other kind.
+    async fn canvas(&mut self) -> Result<Option<pie::inferlet::model::CanvasShape>> {
+        Ok(model::model()
+            .diffusion()
+            .map(|d| pie::inferlet::model::CanvasShape {
+                length: d.canvas,
+                hidden: d.hidden,
+                self_cond_taps: d.self_cond_taps,
+            }))
     }
 
     /// LM-head output dimension (`hf_config.vocab_size`), not the tokenizer

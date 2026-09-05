@@ -297,6 +297,10 @@ pub struct FireBindings {
     pub patch_embed_weights: Option<Tensor>,
     /// The trunk's rotation stream: `[token rows, 3]`. On the first row axis, not the second, since the trunk is one region over the whole token rectangle. `None` for a plan that does not declare it.
     pub mrope_positions: Option<Tensor>,
+    /// `RuntimeInput::SelfCondRows`: `i32`, `[token rows, taps]` — the denoiser's self-conditioning taps, staged on every fire of a plan that declares them (zeros for lanes carrying none). `None` for a plan that does not.
+    pub self_cond_rows: Option<Tensor>,
+    /// `RuntimeInput::SelfCondWeights`: `f32`, `[token rows, taps]`, beside the rows.
+    pub self_cond_weights: Option<Tensor>,
 
     /// Per cache space, aligned with `Trace::caches`.
     pub geometry: Vec<CacheGeometry>,
@@ -1076,6 +1080,22 @@ impl<'c> Run<'c> {
                     panic!(
                         "value {at} reads which position-table rows this fire's patches gather, \
                          and no lane of it submitted an image"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::SelfCondRows) => {
+                self.fire.self_cond_rows.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's self-conditioning taps, which this load \
+                         reserved no seat for"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::SelfCondWeights) => {
+                self.fire.self_cond_weights.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's self-conditioning weights, which this \
+                         load reserved no seat for"
                     )
                 })
             }

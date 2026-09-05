@@ -664,6 +664,9 @@ impl Engine for Metal {
             // scans that persist the bank only as far as the verb says, and the read path
             // that replays a buffered prefix ahead of a fire's rows.
             rs_verbs: shell.serves_rs_verbs(),
+            // The sdpa shaders apply their own causal bound beside the
+            // staged mask plane, so a bidirectional lane is refused by name.
+            bidirectional_attention: false,
         };
 
         self.shell = Some(shell);
@@ -713,6 +716,7 @@ impl Engine for Metal {
         frame.validate_for(engine::fire::Serves {
             device_channel_commit: false,
             rs_verbs: self.caps.as_ref().is_some_and(|caps| caps.rs_verbs),
+            bidirectional: false,
         })?;
         let id = self.next_frame;
         self.next_frame = self.next_frame.wrapping_add(1);

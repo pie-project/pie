@@ -701,6 +701,10 @@ intended for diagnostics, not serving",
             // This shell allocates the buffered-activation pool at load and
             // serves `RsVerb::Buffer` and `RsVerb::FoldBuffered` against it.
             rs_verbs: true,
+            // The custom-mask arm applies no causal bound of its own
+            // (`mask::stage` folds it into the bits), so lifting it is a
+            // staging decision this shell makes per lane.
+            bidirectional_attention: true,
         };
 
         self.shell = Some(shell);
@@ -755,6 +759,10 @@ intended for diagnostics, not serving",
                 .as_ref()
                 .is_some_and(|caps| caps.device_channel_commit),
             rs_verbs: self.caps.as_ref().is_some_and(|caps| caps.rs_verbs),
+            bidirectional: self
+                .caps
+                .as_ref()
+                .is_some_and(|caps| caps.bidirectional_attention),
         })?;
         let id = self.next_frame;
         self.next_frame = self.next_frame.wrapping_add(1);
@@ -1244,6 +1252,8 @@ impl Cuda {
                     adapter: lane_adapters[at].or(lane.adapter),
                     drafts: lane.drafts,
                     captures_scores: lane.captures_scores,
+                    bidirectional: lane.bidirectional,
+                    self_cond: lane.self_cond.as_ref(),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
                     // The row list crosses to the device half too, for a

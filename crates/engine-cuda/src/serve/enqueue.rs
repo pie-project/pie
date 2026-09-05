@@ -129,6 +129,7 @@ struct Staged {
     handles: Handles,
     patches: Option<PatchHandles>,
     mrope: Option<kernels_cuda::Tensor>,
+    self_cond: Option<(kernels_cuda::Tensor, kernels_cuda::Tensor)>,
     slots: SlotTable,
     caches: CacheTable,
     paging: Paging,
@@ -242,6 +243,15 @@ impl FireCtx<'_> {
                     .stage_mrope_positions(self.device.stream(), &p.mrope_positions)?,
             )
         };
+        let self_cond = if p.self_cond_rows.is_empty() {
+            None
+        } else {
+            Some(self.inputs.stage_self_cond(
+                self.device.stream(),
+                &p.self_cond_rows,
+                &p.self_cond_weights,
+            )?)
+        };
 
         // A bodied fire carves both columns at the key's bucket, so a replay's
         // grids never outrun the rectangle its baked pointers address.
@@ -294,6 +304,7 @@ impl FireCtx<'_> {
             handles,
             patches,
             mrope,
+            self_cond,
             slots,
             caches,
             paging,
@@ -375,6 +386,8 @@ impl FireCtx<'_> {
                 .as_ref()
                 .and_then(|seats| seats.embed_weights),
             mrope_positions: staged.mrope,
+            self_cond_rows: staged.self_cond.map(|(rows, _)| rows),
+            self_cond_weights: staged.self_cond.map(|(_, weights)| weights),
             geometry,
             schedules,
             plan_values: facts.plans.len(),

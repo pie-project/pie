@@ -377,6 +377,37 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
+    /// The denoiser's self-conditioning taps: `[Dim::Tokens, taps]` `i32`
+    /// token ids, one row of `taps` per token row, paired with
+    /// [`self_cond_weights`](Input::self_cond_weights) in a weighted gather
+    /// over the embedding table.
+    #[must_use]
+    pub fn self_cond_rows(&self, taps: u32) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::SelfCondRows,
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens, Dim::Const(u64::from(taps))],
+                    dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// How much of each self-conditioning tap: `[Dim::Tokens, taps]` `f32`.
+    #[must_use]
+    pub fn self_cond_weights(&self, taps: u32) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::SelfCondWeights,
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens, Dim::Const(u64::from(taps))],
+                    dtype: Dtype::F32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
     /// Where each lane's run of page indices starts, `lanes + 1` long.
     #[must_use]
     pub fn kv_indptr(&self) -> Value {

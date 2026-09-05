@@ -77,7 +77,9 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
     // The families whose texts state `attention.masked`, by SKU prefix. The
     // qwen38 row joined with the qwen4 campaign: its hybrid keeps full
     // attention rows, and those rows carry the mask predicate qwen35 does.
-    const DECLARE: [&str; 4] = ["gemma4-", "qwen35-", "qwen36-", "qwen38-"];
+    // DiffusionGemma is the gemma4 26B-A4B trunk under a second reading;
+    // its attention rows carry the same mask predicate.
+    const DECLARE: [&str; 5] = ["gemma4-", "diffusiongemma-", "qwen35-", "qwen36-", "qwen38-"];
     // And the four with a written kernel gap, which must stay maskless.
     const GAPPED: [&str; 4] = ["dsv4-", "glm5-", "gptoss-", "kimik3-"];
 

@@ -46,8 +46,24 @@ interface model {
         recurrent,
         // Both attention and recurrent layers        -> `forward-hybrid`
         hybrid,
+        // Paged KV plus a canvas the model denoises in place, one trunk
+        // read causally or bidirectionally per pass -> `forward-diffusion`
+        diffusion,
     }
     pass-kind: func() -> forward-kind;
+
+    // The canvas a diffusion model denoises: how many tokens one block is,
+    // and the trunk's hidden width (the row width of a self-conditioning
+    // signal). `none` for every other kind — the same fact as
+    // `pass-kind() == diffusion`, stated once with its numbers.
+    record canvas-shape {
+        length: u32,
+        hidden: u32,
+        // How many `(id, weight)` taps per canvas row
+        // `forward-diffusion.self-conditioning` takes.
+        self-cond-taps: u32,
+    }
+    canvas: func() -> option<canvas-shape>;
 
     // Logits/output dimension (= hf_config.vocab_size). May EXCEED the
     // tokenizer's vocabs() token count due to padding. Use THIS for

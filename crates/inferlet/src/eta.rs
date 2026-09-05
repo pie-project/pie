@@ -18,6 +18,7 @@ use eta_dsl::{Channel as DslChannel, IntoConst, IntoPut, IntoShape, Port, Shape,
 
 use crate::pie::inferlet::channel as wit_channel;
 use crate::pie::inferlet::forward as wit_attention;
+use crate::pie::inferlet::forward_diffusion as wit_diffusion;
 use crate::pie::inferlet::forward_hybrid as wit_hybrid;
 use crate::pie::inferlet::forward_recurrent as wit_recurrent;
 use crate::pie::inferlet::pipeline as wit_pipeline;
@@ -638,7 +639,7 @@ impl Default for RsWorkingSet {
 type StageClosure = Box<dyn Fn()>;
 
 /// The forward-pass resource of one `pie:inferlet` forward interface: one of
-/// `forward`, `forward-recurrent`, `forward-hybrid`.
+/// `forward`, `forward-recurrent`, `forward-hybrid`, `forward-diffusion`.
 pub trait PassWit: Sized + 'static {
     fn new() -> Self;
 
@@ -680,6 +681,31 @@ impl PassWit for wit_attention::ForwardPass {
     }
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
         wit_attention::submit(on, slots)
+    }
+}
+
+impl PassWit for wit_diffusion::ForwardPass {
+    fn new() -> Self {
+        wit_diffusion::ForwardPass::new()
+    }
+    fn embed(
+        &self,
+        tokens: &wit_channel::Channel,
+        indptr: &wit_channel::Channel,
+    ) -> Result<(), String> {
+        wit_diffusion::ForwardPass::embed(self, tokens, indptr)
+    }
+    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
+        wit_diffusion::ForwardPass::readout(self, indices)
+    }
+    fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
+        wit_diffusion::ForwardPass::set_max_layers(self, max_layers).map_err(|e| e.to_string())
+    }
+    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
+        wit_diffusion::ForwardPass::program(self, bytes, channels)
+    }
+    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
+        wit_diffusion::submit(on, slots)
     }
 }
 
@@ -1321,7 +1347,10 @@ pub fn live_slots() -> usize {
     }
     LIVE.with(|live| {
         *live.get_or_init(|| {
-            if crate::model::pass_kind() != crate::model::ForwardKind::Attention {
+            if matches!(
+                crate::model::pass_kind(),
+                crate::model::ForwardKind::Recurrent | crate::model::ForwardKind::Hybrid
+            ) {
                 1
             } else {
                 frame_size()
@@ -1652,6 +1681,63 @@ impl Pass<wit_hybrid::ForwardPass> {
     }
 }
 
+/// The diffusion pass: the attention pass's surface plus the reading.
+impl Pass<wit_diffusion::ForwardPass> {
+    /// Attach the `on_attn_proj` stage (per layer, before attention).
+    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttnProj, body);
+    }
+    /// Attach the `on_attn` stage (per layer, after attention).
+    pub fn on_attn(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttn, body);
+    }
+
+    /// `pie:inferlet/forward-diffusion.attention` — bind the KV working set
+    /// and its geometry. On a denoise pass the geometry is the canvas's. REQUIRED.
+    pub fn attention<R, W>(&self, ws: &WorkingSet, geom: KvGeometry<'_, R, W>) -> Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        let kv = self.stage_kv(ws, geom)?;
+        wit_diffusion::ForwardPass::attention(
+            &self.wit,
+            kv.ws.as_ref(),
+            &wit_diffusion::KvGeometry {
+                readable_pages: kv.readable.wit(),
+                writable_pages: kv.writable.wit(),
+                kv_len: kv.kv_len.as_ref(),
+                pages: kv.pages.as_ref(),
+                page_indptr: kv.page_indptr.as_ref(),
+                w_slot: kv.w_slot.as_ref(),
+                w_off: kv.w_off.as_ref(),
+                positions: kv.positions.as_ref(),
+                mask: kv.mask.as_deref(),
+            },
+        )
+    }
+
+    /// `pie:inferlet/forward-diffusion.canvas` — which reading this pass
+    /// runs. REQUIRED, once, before the first submit.
+    pub fn canvas(&self, mode: wit_diffusion::Mode) -> Result<(), String> {
+        wit_diffusion::ForwardPass::canvas(&self.wit, mode)
+    }
+
+    /// `pie:inferlet/forward-diffusion.self-conditioning` — the previous
+    /// step's distribution as taps, `model::canvas().self_cond_taps` per
+    /// canvas row (`top_k` of the temperature-scaled softmax is the
+    /// reference's reading), staged for this pass's next submit. Row major:
+    /// `rows.len() == weights.len() == length * taps`.
+    pub fn self_conditioning(&self, rows: &[u32], weights: &[f32]) -> Result<(), String> {
+        wit_diffusion::ForwardPass::self_conditioning(&self.wit, rows, weights)
+    }
+
+    /// `pie:inferlet/forward-diffusion.media` — the attention pass's `media`.
+    pub fn media(&self, spans: &[wit_attention::MediaSpan<'_>]) -> Result<(), String> {
+        wit_diffusion::ForwardPass::media(&self.wit, spans)
+    }
+}
+
 impl Pass<wit_recurrent::ForwardPass> {
     /// `pie:inferlet/forward-recurrent.attention` — bind the recurrent state:
     /// one working set per request, plus where its folded boundary lands.
@@ -1674,7 +1760,7 @@ impl Pass<wit_recurrent::ForwardPass> {
 }
 
 // ---------------------------------------------------------------------------
-// The three author-facing pass aliases
+// The four author-facing pass aliases
 // ---------------------------------------------------------------------------
 // One alias per `pie:inferlet` forward interface; distinct types sharing no impl.
 
@@ -1689,6 +1775,72 @@ pub mod attention {
     pub mod prelude {
         pub use super::{ForwardPass, run_ahead, submit_frame};
         pub use crate::eta::shared_prelude::*;
+    }
+}
+
+/// `pie:inferlet/forward-diffusion` — paged KV plus a canvas the model
+/// denoises in place. Valid when `model.pass_kind()` is `ForwardKind::Diffusion`.
+pub mod diffusion {
+    /// A diffusion forward pass; `canvas(Mode)` states its reading.
+    pub type ForwardPass = super::Pass<super::wit_diffusion::ForwardPass>;
+    /// `encode` (causal, writes the sequence) or `denoise` (bidirectional
+    /// over the canvas, scratch KV).
+    pub use super::wit_diffusion::Mode;
+    pub use super::{run_ahead, submit_frame};
+
+    /// Glob-import surface for diffusion inferlet authors.
+    pub mod prelude {
+        pub use super::{
+            ForwardPass, Mode, entropy_bound_accept, linear_temperature, run_ahead,
+            stable_and_confident, submit_frame,
+        };
+        pub use crate::eta::shared_prelude::*;
+    }
+
+    use super::{Tensor, and, cast, cumsum, dtype, eq, iota, le, lt, reduce_sum, scatter_set, sort_desc};
+
+    /// The reference schedule: `t_min + (t_max - t_min) * remaining / max`,
+    /// with `remaining` counting DOWN from `max` on the first step to 1 on
+    /// the last. Host arithmetic; the value reaches the program through a
+    /// control channel the host `set`s before each submit.
+    pub fn linear_temperature(remaining: u32, max_steps: u32, t_max: f32, t_min: f32) -> f32 {
+        t_min + (t_max - t_min) * (remaining as f32 / max_steps.max(1) as f32)
+    }
+
+    /// The entropy-bound acceptance rule over one canvas: accept the
+    /// lowest-entropy positions while `sum(H) - max(H) <= bound` over the
+    /// accepted set (Ben-Hamu et al., 2505.24857). `entropy` is `[n]` f32,
+    /// one row per canvas position; the answer is `[n]` bool.
+    ///
+    /// Spelled with a descending sort of the negated entropies because the
+    /// DSL sorts one way; in ascending order the running maximum is the
+    /// element itself, which is what makes the bound a prefix test.
+    pub fn entropy_bound_accept(entropy: &Tensor, bound: f32) -> Tensor {
+        let n = entropy.shape().dims()[0];
+        let (neg_sorted, order) = sort_desc(-entropy);
+        let sorted = -&neg_sorted;
+        let below = le(&(&cumsum(&sorted) - &sorted), bound);
+        // Back to canvas order: a false base, the sorted verdicts scattered
+        // through the sort's own permutation.
+        let none = lt(iota(n), 0u32);
+        scatter_set(&none, &order, &below)
+    }
+
+    /// The reference stopping rule for one canvas: the argmax canvas did not
+    /// move since the previous step AND the mean per-position entropy is
+    /// under `threshold`. `argmax`/`previous` are `[n]` i32, `entropy` `[n]`
+    /// f32; the answer is a bool scalar.
+    pub fn stable_and_confident(
+        argmax: &Tensor,
+        previous: &Tensor,
+        entropy: &Tensor,
+        threshold: f32,
+    ) -> Tensor {
+        let n = argmax.shape().dims()[0];
+        let unchanged = reduce_sum(cast(eq(argmax, previous), dtype::i32));
+        let stable = eq(&unchanged, n as i32);
+        let mean = &reduce_sum(entropy) / (n as f32);
+        and(&stable, &lt(&mean, threshold))
     }
 }
 

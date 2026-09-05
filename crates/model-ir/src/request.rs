@@ -13,6 +13,7 @@ pub struct Request {
     drafts: bool,
     captures_scores: bool,
     media: bool,
+    denoise: bool,
 }
 
 impl Request {
@@ -25,7 +26,18 @@ impl Request {
             drafts: false,
             captures_scores: false,
             media: false,
+            denoise: false,
         }
+    }
+
+    /// The same request, read as a block-diffusion denoiser's canvas: its
+    /// rows attend bidirectionally and its input is the denoiser's (the
+    /// self-conditioned, post-normed embedding), not the encoder's. A fact
+    /// only a diffusion text declares a bit for.
+    #[must_use]
+    pub fn denoising(mut self, denoise: bool) -> Request {
+        self.denoise = denoise;
+        self
     }
 
     /// The same request, routing to an adapter bank.
@@ -65,6 +77,11 @@ impl Request {
     #[must_use]
     pub fn has_custom_mask(&self) -> bool {
         self.custom_mask
+    }
+
+    #[must_use]
+    pub fn denoise(&self) -> bool {
+        self.denoise
     }
 
     #[must_use]

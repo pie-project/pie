@@ -1,4 +1,4 @@
-//! Expands a lane's run-length [`Masking`] (per-extent or per-row) into the packed bit slab `attention.masked`'s custom-mask kernel reads: one bit per (query row, key) at `qo_idx * kv_len + kv_idx`, LSB-first, each lane starting on a byte boundary, ANDed with the causal bound the kernel does not otherwise apply. A mask longer than the lane's extent is clipped; shorter is `Fault::Mask`.
+//! Expands a lane's run-length [`Masking`] (per-extent or per-row) into the packed bit slab `attention.masked`'s custom-mask kernel reads: one bit per (query row, key) at `qo_idx * kv_len + kv_idx`, LSB-first, each lane starting on a byte boundary, ANDed with the causal bound the kernel does not otherwise apply — unless the lane is [`LaneMask::bidirectional`], the denoiser's reading, where every row keeps every key its runs keep. A mask longer than the lane's extent is clipped; shorter is `Fault::Mask`.
 
 use engine::fire::{Mask, Masking};
 
@@ -45,6 +45,8 @@ pub struct LaneMask<'a> {
     pub have: u32,
     /// How many token rows this fire feeds it.
     pub rows: u32,
+    /// Lift the causal bound: a row keeps a key past its own position too.
+    pub bidirectional: bool,
 }
 
 /// A fire's mask bits and their per-lane span table, ready to stage.
@@ -105,8 +107,12 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                         let end = at_position.saturating_add(u64::from(run)).min(kv);
                         if index % 2 == 1 {
                             for key in at_position..end {
-                                // query row q stands at absolute position have + q; a key past it is unwritten.
-                                let first = key.saturating_sub(u64::from(lane.have));
+                                // query row q stands at absolute position have + q; a key past it is unwritten — unless the lane reads bidirectionally, when every row of the fire's own keys is written before any row attends.
+                                let first = if lane.bidirectional {
+                                    0
+                                } else {
+                                    key.saturating_sub(u64::from(lane.have))
+                                };
                                 for q in first..u64::from(lane.rows) {
                                     set(q * kv + key);
                                 }
@@ -124,7 +130,11 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                 Masking::Rows(rows) => {
                     for (q, mask) in rows.iter().enumerate() {
                         let q = q as u64;
-                        let bound = u64::from(lane.have) + q;
+                        let bound = if lane.bidirectional {
+                            kv
+                        } else {
+                            u64::from(lane.have) + q
+                        };
                         let mut at_position = 0u64;
                         for (index, &run) in mask.runs.iter().enumerate() {
                             let end = at_position.saturating_add(u64::from(run)).min(kv);
@@ -167,6 +177,7 @@ mod tests {
             mask: Some(&mask),
             have: 2,
             rows: 3,
+            bidirectional: false,
         }])
         .expect("the mask covers the lane's extent")
         .expect("a masked fire stages bits");
@@ -194,6 +205,7 @@ mod tests {
             mask: Some(&mask),
             have: 0,
             rows: N as u32,
+            bidirectional: false,
         }])
         .expect("every row covers the lane's extent")
         .expect("a masked fire stages bits");
@@ -216,6 +228,7 @@ mod tests {
             mask: Some(&mask),
             have: 7,
             rows: 1,
+            bidirectional: false,
         }]);
         assert!(
             matches!(

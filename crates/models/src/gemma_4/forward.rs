@@ -11,6 +11,7 @@ pub struct Facts {
     pub has_adapter: bool,
     pub media: bool,
     pub drafts: bool,
+    pub denoise: bool,
 }
 
 impl Facts {
@@ -39,6 +40,14 @@ impl Facts {
     pub fn drafts() -> Predicate {
         Predicate::fact(4)
     }
+
+    /// Rows read as a block-diffusion denoiser's canvas: their embedding
+    /// is the denoiser's input (`Model::self_cond`), not the encoder's. Bit
+    /// 5 of the fact word; split on only by a text that declares the block,
+    /// so an autoregressive Gemma 4 never carves a class for it.
+    pub fn denoise() -> Predicate {
+        Predicate::fact(5)
+    }
 }
 
 impl Classify for Facts {
@@ -49,6 +58,7 @@ impl Classify for Facts {
             has_adapter: r.has_adapter(),
             media: r.has_media(),
             drafts: r.drafts(),
+            denoise: r.denoise(),
         }
     }
 
@@ -58,6 +68,7 @@ impl Classify for Facts {
             | (u64::from(self.has_adapter) << 2)
             | (u64::from(self.media) << 3)
             | (u64::from(self.drafts) << 4)
+            | (u64::from(self.denoise) << 5)
     }
 }
 
@@ -161,6 +172,40 @@ impl ForwardHybrid for Model {
         if let Some(t) = &towered {
             let (imaged, _) = y.split(&Facts::media());
             y = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
+        }
+
+        // The denoiser's input (see `model::SelfCond`): the self-conditioning
+        // MLP over the previous step's soft embedding, added to the token
+        // embedding, then a scale-free norm over the sum. The soft embedding
+        // is a weighted gather of the guest's taps; zero weights make the
+        // MLP exactly zero and leave only the norm, which is the
+        // reference's own first step. Encode rows pass through untouched.
+        if let Some(sc) = &m.self_cond {
+            let (den, enc) = y.split(&Facts::denoise());
+            let (input_den, _) = inputs.split(&Facts::denoise());
+            let soft = ops::layout::embed_weighted(
+                &input_den.self_cond_rows(sc.taps),
+                &input_den.self_cond_weights(sc.taps),
+                &m.embed,
+                m.vocab,
+            ) * (m.hidden as f32).sqrt();
+            let normed = ops::elemwise::rmsnorm(&soft, &sc.pre_norm, sc.norm_eps);
+            let act = ops::linear::mlp_geglu_tanh_packed(
+                &ops::linear::matmul(&normed, &sc.gate_up),
+                sc.inter,
+            );
+            let signal = ops::linear::matmul(&act, &sc.down);
+            let signal = if m.tp > 1 {
+                ops::collective::all_reduce(&signal)
+            } else {
+                signal
+            };
+            let den = ops::elemwise::rmsnorm_no_scale(
+                &ops::elemwise::residual_add(&den, &signal),
+                m.hidden,
+                sc.norm_eps,
+            );
+            y = Value::merge(vec![den, enc]);
         }
 
         let relay = m.ple.as_ref().map(|ple| {

@@ -13,11 +13,15 @@ use checkpoint_dsl::{Builder, Error, extents};
 /// Unlike gemma 3, gemma 4's RMSNorm has no `+1` offset — checkpoint norm
 /// weights are plain multiplicative scales.
 #[derive(Clone, Copy)]
-enum Layout {
+pub(crate) enum Layout {
     /// `model.language_model.*` — transformers.
     Transformers,
     /// `language_model.model.*` — `mlx_lm`.
     Mlx,
+    /// `model.decoder.*` — DiffusionGemma, whose encoder and decoder are
+    /// one trunk stored once under the decoder's name (the encoder side
+    /// holds only its `layer_scalar` copies, identical to the decoder's).
+    Diffusion,
 }
 
 impl Layout {
@@ -26,6 +30,7 @@ impl Layout {
         match self {
             Self::Transformers => "model.language_model.",
             Self::Mlx => "language_model.model.",
+            Self::Diffusion => "model.decoder.",
         }
     }
 
@@ -47,6 +52,7 @@ impl Layout {
         match self {
             Self::Transformers => format!("model.vision_tower.{leaf}"),
             Self::Mlx => format!("vision_tower.{leaf}"),
+            Self::Diffusion => format!("model.encoder.vision_tower.{leaf}"),
         }
     }
 
@@ -56,6 +62,7 @@ impl Layout {
         match self {
             Self::Transformers => "model.embed_vision.embedding_projection.weight",
             Self::Mlx => "embed_vision.embedding_projection.weight",
+            Self::Diffusion => "model.encoder.embed_vision.embedding_projection.weight",
         }
     }
 }
@@ -101,7 +108,16 @@ impl Model {
         self.import_from_safetensors(src, platform, Layout::Transformers)
     }
 
-    fn import_from_safetensors(
+    /// The trunk as a DiffusionGemma checkpoint stores it. The
+    /// self-conditioning block beside it is the diffusion family's to read.
+    pub fn import_from_diffusion(
+        &self,
+        src: &ztensor::Source, platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        self.import_from_safetensors(src, platform, Layout::Diffusion)
+    }
+
+    pub(crate) fn import_from_safetensors(
         &self,
         src: &ztensor::Source, platform: Platform,
         layout: Layout,
@@ -139,9 +155,7 @@ impl Model {
 
             // The routed branch, where the checkpoint ships one. The router
             // norm's gain is the stored `router.scale * hidden**-0.5`, folded
-            // into the plane rather than the forward. Expert gate/up banks
-            // are stored split (`switch_glu.gate_proj` / `.up_proj`), not
-            // fused, and `read_concat` joins them.
+            // into the plane rather than the forward.
             if let Some(x) = &w.moe {
                 let root = (self.hidden as f32).powf(-0.5);
                 b.read_expr(
@@ -153,14 +167,24 @@ impl Model {
                 b.read(&x.pre_ffw_norm_2, n("pre_feedforward_layernorm_2.weight"))?;
                 b.read(&x.post_ffw_norm_1, n("post_feedforward_layernorm_1.weight"))?;
                 b.read(&x.post_ffw_norm_2, n("post_feedforward_layernorm_2.weight"))?;
-                b.read_concat(
-                    &x.gate_up,
-                    [
-                        n("experts.switch_glu.gate_proj.weight"),
-                        n("experts.switch_glu.up_proj.weight"),
-                    ],
-                )?;
-                b.read(&x.down, n("experts.switch_glu.down_proj.weight"))?;
+                // Two spellings of the expert banks: transformers 5 stores
+                // them fused (`experts.gate_up_proj`, `[experts, 2 * inter,
+                // hidden]`, gate first — the declared layout exactly);
+                // older exports split them under `switch_glu`.
+                let fused = n("experts.gate_up_proj");
+                if src.get(&fused).is_some() {
+                    b.read(&x.gate_up, fused)?;
+                    b.read(&x.down, n("experts.down_proj"))?;
+                } else {
+                    b.read_concat(
+                        &x.gate_up,
+                        [
+                            n("experts.switch_glu.gate_proj.weight"),
+                            n("experts.switch_glu.up_proj.weight"),
+                        ],
+                    )?;
+                    b.read(&x.down, n("experts.switch_glu.down_proj.weight"))?;
+                }
             }
 
             // A layer without PLE still owns its own `layer_scalar`; a PLE
@@ -260,6 +284,20 @@ impl Model {
             }
         }
 
+        // The denoiser's self-conditioning block, beside the trunk under
+        // the same prefix (`model.decoder.self_conditioning.*`).
+        if let Some(sc) = &self.self_cond {
+            b.read(&sc.pre_norm, layout.at("self_conditioning.pre_norm.weight"))?;
+            b.read_concat(
+                &sc.gate_up,
+                [
+                    layout.at("self_conditioning.gate_proj.weight"),
+                    layout.at("self_conditioning.up_proj.weight"),
+                ],
+            )?;
+            b.read(&sc.down, layout.at("self_conditioning.down_proj.weight"))?;
+        }
+
         // The aux draft head: `pie model import --aux` prefixes a second
         // checkpoint's names with `aux.`.
         if let Some(a) = &self.draft {
@@ -337,6 +375,15 @@ impl Model {
     }
 
     pub fn import_from_gguf(&self, src: &ztensor::Source, platform: Platform) -> Result<ModelContract, Error> {
+        if self.self_cond.is_some() {
+            return Err(Error::Illegible {
+                name: "self_conditioning".to_string(),
+                detail: "this SKU is a block-diffusion text and no GGUF spelling of \
+                         its self-conditioning block is settled; import it from the \
+                         safetensors checkpoint"
+                    .to_string(),
+            });
+        }
         if self.draft.is_some() || self.assistant.is_some() {
             return Err(Error::Illegible {
                 name: "aux".to_string(),

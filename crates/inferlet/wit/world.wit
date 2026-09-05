@@ -10,6 +10,7 @@ world inferlet {
     import forward;             // attention-only
     import forward-recurrent;
     import forward-hybrid;
+    import forward-diffusion;   // paged KV plus a denoised canvas
     import grammar;
     import chat;
     import tools;

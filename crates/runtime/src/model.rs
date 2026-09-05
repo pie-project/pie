@@ -112,6 +112,15 @@ pub const ROWS: &[Row] = &[
         vocab: 262_144,
         arch: "gemma4",
     },
+    // Gemma 4's 26B-A4B trunk under the diffusion checkpoint's spelling;
+    // its own arch label, since the front-ends and the pass kind will
+    // diverge from gemma4's.
+    Row {
+        id: "diffusiongemma-26b-a4b-u4g64-kv-bf16",
+        layers: 30,
+        vocab: 262_144,
+        arch: "diffusion_gemma",
+    },
     Row {
         id: "gemma4-26b-a4b-u4g64-kv-bf16",
         layers: 30,
@@ -564,13 +573,15 @@ pub fn register(
 
     // Classify column, off the same row: no fallback, since word 0 is the
     // all-false class and would silently fire every decode lane as prefill.
-    let classify = models::sku(row.id).map(|sku| sku.classify).ok_or_else(|| {
+    let catalog_row = models::sku(row.id).ok_or_else(|| {
         anyhow!(
             "this build serves {:?} but its model catalog states no classifier \
              for it; a lane's fact word cannot be computed",
             row.id
         )
     })?;
+    let classify = catalog_row.classify;
+    let diffusion = catalog_row.diffusion;
 
     let model = Arc::new(Model {
         name,
@@ -584,6 +595,7 @@ pub fn register(
         vocab: OnceLock::new(),
         vocab_size,
         num_layers,
+        diffusion,
     });
     MODEL.set(model).map_err(|_| {
         anyhow!("a model is already registered; the runtime serves exactly one model")
@@ -646,6 +658,10 @@ pub struct Model {
     vocab_size: u32,
     /// Transformer layer count from the model snapshot's config.json.
     num_layers: u32,
+    /// The canvas a block-diffusion row denoises; `None` for an
+    /// autoregressive row. Read off the catalog row at registration; what
+    /// `pass-kind() == diffusion` and `canvas()` answer from.
+    diffusion: Option<models::Diffusion>,
 }
 
 /// RS (recurrent-state) working-set capabilities surfaced to inferlets via
@@ -778,13 +794,14 @@ impl Model {
     }
 
     /// The fact word a lane carries: `query_len` rows, custom mask,
-    /// adapter routing, draft head, attention mass capture, media spans.
-    /// The engine turns this word into a class, and the class into the row
-    /// window every guarded node runs over. This calls the family's
-    /// `Classify::of(..).word()` through the catalog pointer and never
-    /// reads a bit itself; all six facts are stamped from one reading of
-    /// the lane at one instant.
+    /// adapter routing, draft head, attention mass capture, media spans,
+    /// denoise reading. The engine turns this word into a class, and the
+    /// class into the row window every guarded node runs over. This calls
+    /// the family's `Classify::of(..).word()` through the catalog pointer
+    /// and never reads a bit itself; all seven facts are stamped from one
+    /// reading of the lane at one instant.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn word(
         &self,
         query_len: u32,
@@ -793,17 +810,25 @@ impl Model {
         drafts: bool,
         captures_scores: bool,
         media: bool,
+        denoise: bool,
     ) -> u64 {
         (self.classify)(
             &models::Request::new(query_len, custom_mask)
                 .adapted(adapter)
                 .drafting(drafts)
                 .capturing_scores(captures_scores)
-                .with_media(media),
+                .with_media(media)
+                .denoising(denoise),
         )
     }
 
     /// Gets the KV page size.
+    /// The canvas a block-diffusion row denoises, or `None` for an
+    /// autoregressive one.
+    pub fn diffusion(&self) -> Option<models::Diffusion> {
+        self.diffusion
+    }
+
     pub fn kv_page_size(&self) -> u32 {
         self.kv_page_size
     }

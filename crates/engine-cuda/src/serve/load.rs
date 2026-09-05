@@ -217,6 +217,12 @@ impl Shell {
                 })
             })
         });
+        // The self-conditioning gather's width, when the plan reads one.
+        let self_cond_taps = u32::try_from(declared_width(
+            &boot.trace,
+            model_ir::RuntimeInput::SelfCondRows,
+        ))
+        .unwrap_or(u32::MAX);
         let mrope_seat = boot.trace.values.iter().any(|decl| {
             matches!(
                 decl.def,
@@ -243,6 +249,7 @@ impl Shell {
             boot.runahead,
             patch_seat,
             mrope_seat,
+            u64::from(self_cond_taps),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
@@ -287,6 +294,7 @@ impl Shell {
             budgets,
             patch_seat,
             mrope_seat,
+            self_cond_taps,
             drops_patch_rows,
             towered: compiled_towered,
             patch_fold,

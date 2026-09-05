@@ -634,6 +634,11 @@ impl Shell {
                 adapter: lane.adapter,
                 drafts: lane.drafts,
                 captures_scores: lane.captures,
+                // The arming pass reads its synthetic mask causally; the
+                // masked arm's body is the same either way. Its
+                // self-conditioning taps are the zeros every fire stages.
+                bidirectional: false,
+                self_cond: None,
                 // The arming pass computes nobody's numbers, so there is no
                 // row list to read back.
                 readout: None,

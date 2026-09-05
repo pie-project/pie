@@ -604,6 +604,12 @@ impl<'c> Run<'c> {
                     )
                 })
             }
+            Def::Input(RuntimeInput::SelfCondRows | RuntimeInput::SelfCondWeights) => {
+                panic!(
+                    "value {at} reads a self-conditioning input, which this shell stages none \
+                     of; the load refuses such a plan"
+                )
+            }
             Def::Input(RuntimeInput::PatchEmbedWeights) => {
                 self.fire.patch_embed_weights.unwrap_or_else(|| {
                     panic!(

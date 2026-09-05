@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod deepseek_v4;
 pub mod gemma_4;
+pub mod gemma_4_diffusion;
 pub mod glm_5;
 pub mod glm_5_next;
 pub mod gpt_oss;
@@ -63,6 +64,23 @@ pub struct Sku {
     pub import: ImportFn,
     pub template: fn(std::sync::Arc<::tokenizer::Tokenizer>) -> std::sync::Arc<dyn template::Instruct>,
     pub tokenizer: &'static tokenizer::Contract,
+    /// The canvas a block-diffusion text denoises; `None` for every
+    /// autoregressive row. What `model.pass-kind()` reads `diffusion` off,
+    /// stated by the family beside its rows rather than derived from a
+    /// name.
+    pub diffusion: Option<Diffusion>,
+}
+
+/// A block-diffusion row's canvas: how many tokens one block is, and the
+/// trunk's hidden width (the row width of a self-conditioning signal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Diffusion {
+    pub canvas: u32,
+    pub hidden: u32,
+    /// How many `(id, weight)` taps per canvas row the self-conditioning
+    /// input takes — the width of the two vectors a guest hands
+    /// `forward-diffusion.self-conditioning`.
+    pub self_cond_taps: u32,
 }
 
 impl Sku {
@@ -107,6 +125,7 @@ macro_rules! skus {
                 },
                 template: $template,
                 tokenizer: $tokenizer,
+                diffusion: None,
             }
         } ),+ ]
     };
@@ -116,6 +135,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
     [
         deepseek_v4::skus(),
         gemma_4::skus(),
+        gemma_4_diffusion::skus(),
         glm_5::skus(),
         glm_5_next::skus(),
         gpt_oss::skus(),

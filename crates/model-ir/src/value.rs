@@ -251,6 +251,16 @@ pub enum RuntimeInput {
     /// `layout.embed_weighted`. `f32` because this is geometry, not the
     /// activation element. A text on the native grid never declares this.
     PatchEmbedWeights,
+    /// A block-diffusion denoiser's self-conditioning signal, as the taps of
+    /// a weighted gather over the embedding table: `[Dim::Tokens, taps]`
+    /// `i32` token ids (the previous step's top-`taps` predictions per
+    /// canvas row) beside [`SelfCondWeights`](RuntimeInput::SelfCondWeights).
+    /// Read by `layout.embed_weighted`; zero weights are "no signal".
+    SelfCondRows,
+    /// How much of each tap: `[Dim::Tokens, taps]` `f32`, the previous
+    /// step's probabilities of those ids. `f32` because it is a weight, not
+    /// the activation element.
+    SelfCondWeights,
 }
 
 /// Raggedness is not a `Ty` — a leading symbolic `Dim` means the value is

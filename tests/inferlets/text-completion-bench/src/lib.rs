@@ -931,6 +931,11 @@ async fn run_one(
                 .to_string()
                 .into(),
         ),
+        model::ForwardKind::Diffusion => Err(
+            "this benchmark decodes a token at a time; a diffusion model wants a canvas loop"
+                .to_string()
+                .into(),
+        ),
     }
 }
 

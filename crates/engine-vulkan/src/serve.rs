@@ -500,6 +500,17 @@ impl Shell {
         });
 
         let states_mrope = declared_width(&boot.trace, RuntimeInput::MropePositions) > 0;
+        // A block-diffusion text's denoiser input: this shell stages no seat
+        // for it (and lifts no causal bound), so the plan is refused here
+        // rather than at its first denoise fire.
+        if declared_width(&boot.trace, RuntimeInput::SelfCondRows) > 0 {
+            return Err(Fault::Program {
+                at: "serve::load",
+                why: "this plan reads a self-conditioning input (a block-diffusion text), \
+                      which this shell stages no seat for"
+                    .to_string(),
+            });
+        }
 
         let patch_fold = patch_fold(&boot.trace);
 

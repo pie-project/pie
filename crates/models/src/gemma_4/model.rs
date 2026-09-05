@@ -43,6 +43,44 @@ pub struct Model {
     /// (`google/gemma-4-*-it-assistant`), when an overlay carries one. See
     /// [`Assistant`].
     pub assistant: Option<Assistant>,
+
+    /// DiffusionGemma's denoiser input: the self-conditioning block and the
+    /// scale-free post-norm every denoise row's embedding passes through.
+    /// `None` on every autoregressive Gemma 4. See [`SelfCond`].
+    pub self_cond: Option<SelfCond>,
+}
+
+/// **THE DENOISER'S INPUT** (DiffusionGemma's `self_conditioning`): a Gemma
+/// gated MLP over the previous denoising step's soft embedding
+/// (`softmax(logits/T) · E · sqrt(hidden)`), added to the canvas embedding,
+/// then a scale-free RMSNorm over the sum:
+///
+/// ```text
+/// n     = pre_norm(soft)
+/// x_in  = post_norm( embed(ids)·sqrt(H) + down( gelu_tanh(gate(n)) * up(n) ) )
+/// ```
+///
+/// The post-norm applies even when there is no signal yet (the first step,
+/// or a program that feeds none): `soft = 0` makes the MLP exactly zero, and
+/// the input is still `post_norm(embed)`. That is why the block is an
+/// optional PART of the text and not a second model: the encoder reading of
+/// the same rows skips all of it.
+pub struct SelfCond {
+    /// How many of the previous step's predictions per canvas row the
+    /// signal is built from: `soft ≈ Σₜ p[r, t] · E[id[r, t]]`, a weighted
+    /// gather over the top-`taps` of `softmax(logits / T)` instead of the
+    /// reference's full `probs · E`. The guest computes the taps (its
+    /// temperature, its truncation); the text only states their count,
+    /// which is what shapes the two runtime inputs.
+    pub taps: u32,
+    /// `self_conditioning.pre_norm`, `[hidden]`, with scale.
+    pub pre_norm: Weight,
+    pub norm_eps: f32,
+    /// `[2 * inter, hidden]`, gate first — the dense MLP's shape.
+    pub gate_up: Weight,
+    pub inter: u32,
+    /// `[hidden, inter]`.
+    pub down: Weight,
 }
 
 /// **GEMMA 4'S OWN DRAFTER**: a four-layer text stack that reads the trunk's
@@ -90,6 +128,13 @@ pub struct AssistantLayer {
     pub down: Weight,
     pub scalar: Weight,
 }
+
+/// The self-conditioning gather's width. 64 of 262 144: at the reference's
+/// temperatures (0.8 down to 0.4) the softmax over a softcapped row is
+/// peaked enough that the tail past the top 64 carries little mass; the
+/// deviation from the exact `probs · E` is a measurement against the
+/// transformers golden, and this constant is where it is tuned.
+pub const SELF_COND_TAPS: u32 = 64;
 
 /// The assistant's shape, the same for every published size: the trunk's
 /// width differs, the drafter's does not.
@@ -414,6 +459,9 @@ impl TowerDims {
 
 struct Dims {
     tower: Option<TowerDims>,
+    /// Whether this text is DiffusionGemma's: the self-conditioning block
+    /// beside the trunk, and a denoise reading of its rows.
+    self_cond: bool,
     /// Whether this SKU's artifact carries an `aux.*` overlay head.
     draft: bool,
     /// Whether it carries Google's assistant instead (see [`Assistant`]).
@@ -470,6 +518,7 @@ impl Model {
     fn e4b_dims() -> Dims {
         Dims {
                 tower: None,
+                self_cond: false,
                 draft: false,
                 assistant: false,
                 hidden: 2560,
@@ -538,6 +587,7 @@ impl Model {
     fn b31_dims() -> Dims {
             Dims {
                 tower: None,
+                self_cond: false,
                 draft: false,
                 assistant: false,
                 hidden: 5376,
@@ -573,6 +623,15 @@ impl Model {
         Model::new(w, kv, tp, Model::a4b_dims())
     }
 
+    /// `google/diffusiongemma-26B-A4B-it`: the mixture's trunk with the
+    /// self-conditioning block beside it, read as a block-diffusion text
+    /// (`crate::gemma_4_diffusion`).
+    pub fn a4b_diffusion(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::a4b_dims();
+        d.self_cond = true;
+        Model::new(w, kv, tp, d)
+    }
+
     /// The mixture with Google's own drafter overlaid
     /// (`gemma-4-26B-A4B-it-assistant`). A separate row: whether a head
     /// exists is a fact about the artifact.
@@ -593,6 +652,7 @@ impl Model {
     fn a4b_dims() -> Dims {
             Dims {
                 tower: None,
+                self_cond: false,
                 draft: false,
                 assistant: false,
                 hidden: 2816,
@@ -961,7 +1021,15 @@ impl Model {
             tower,
             kv,
             softcap: d.softcap,
-            embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
+            // A diffusion text keeps its table dense: the self-conditioning
+            // gather (`layout.embed_weighted`) reads bf16/f16 tables only,
+            // and the tied head pays the wider read. Revisit when the gather
+            // learns a quantized table.
+            embed: Weight::sym(
+                "embed",
+                [d.vocab as u64, hidden],
+                if d.self_cond { dense } else { w },
+            ),
             ple: d.ple_dim.map(|dim| {
                 let ple = dim as u64;
                 Ple {
@@ -990,6 +1058,18 @@ impl Model {
             final_norm_eps: d.norm_eps,
             draft,
             assistant,
+            // The dense MLP's shape and cut, under its own names.
+            self_cond: d.self_cond.then(|| {
+                let iw = intermediate as u64;
+                SelfCond {
+                    taps: SELF_COND_TAPS,
+                    pre_norm: Weight::sym("self_cond.pre_norm", [hidden], dense),
+                    norm_eps: d.norm_eps,
+                    gate_up: Weight::sym("self_cond.gate_up", [2 * iw, hidden], w).packed([iw, iw]),
+                    inter: intermediate,
+                    down: Weight::sym("self_cond.down", [hidden, iw], w).rows(),
+                }
+            }),
         }
     }
 }

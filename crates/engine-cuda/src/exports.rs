@@ -254,12 +254,13 @@ pub(crate) fn landing_requests(
     classes: &model_ir::ClassTable,
 ) -> Vec<Vec<model_ir::Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
-    for bits in 0..64u32 {
+    for bits in 0..128u32 {
         let request = model_ir::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
             .adapted(bits & 4 != 0)
             .drafting(bits & 8 != 0)
             .capturing_scores(bits & 16 != 0)
-            .with_media(bits & 32 != 0);
+            .with_media(bits & 32 != 0)
+            .denoising(bits & 64 != 0);
         let word = classify(&request) & classes.mask;
         if let Some(class) = classes.class_of(word) {
             landing[class].push(request);
@@ -278,6 +279,7 @@ fn request_flags(request: &model_ir::Request) -> u32 {
         + u32::from(request.drafts())
         + u32::from(request.captures_scores())
         + u32::from(request.has_media())
+        + u32::from(request.denoise())
 }
 
 /// The DECODE classes: every request that lands in one carries a single
