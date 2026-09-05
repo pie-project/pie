@@ -17,7 +17,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain};
+use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
 use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
 use model_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
@@ -1009,8 +1009,45 @@ impl Engine for Metal {
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
     }
 
-    // `copy_state`, `resize_pool` and `encode` use the trait's default (refusing) bodies:
-    // no recurrent-slot mover, no virtual pools, no multimodal encoder here.
+    /// Move recurrent state between slots — the device half of a recurrent fork.
+    ///
+    /// `StateMove`'s slot ids are read as this shell's own seat ids, with no translation.
+    /// Whole slots only: a recurrent bank is a folded summary of a prefix, not per-token
+    /// entries, so a move with a token offset is refused rather than rounded off, and
+    /// `token_count` is not read. Buffered activations are not copied; a fork's buffer is
+    /// the runtime's to re-derive or abandon. An attention-only load has no banks and
+    /// answers `Ok`.
+    ///
+    /// # Ordering
+    ///
+    /// As [`Engine::copy_kv`] on this engine: one command buffer on the fire queue,
+    /// unsynchronized — behind every step already committed, ahead of every step committed
+    /// after this returns.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a partial move, [`Error::Impossible`] for a slot past the
+    /// pool, [`Error::Device`] when the queue would not take the copy.
+    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
+        for (at, move_) in copy.moves.iter().enumerate() {
+            if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
+                return Err(Error::Invalid(format!(
+                    "state move {at} names a token offset, and a recurrent bank is a folded \
+                     summary of a prefix rather than an array of per-token entries — this \
+                     engine moves whole slots"
+                )));
+            }
+        }
+        let moves: Vec<(u32, u32)> = copy
+            .moves
+            .iter()
+            .map(|move_| (move_.src_slot_id, move_.dst_slot_id))
+            .collect();
+        self.loaded_mut()?.copy_state(&moves).map_err(fault)
+    }
+
+    // `resize_pool` and `encode` use the trait's default (refusing) bodies: no virtual
+    // pools, no multimodal encoder here.
 }
 
 impl Metal {
