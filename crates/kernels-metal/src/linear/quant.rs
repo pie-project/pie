@@ -385,6 +385,8 @@ pub fn bm_rung(rows: i32) -> i32 {
 
 /// The row block a fire of `rows` launches its GEMM at, and the padded row
 /// count — or `None` if no rung fits `capacity` (the kernel takes no `M`).
+/// The rung is the widest the batch COVERS; [`widen_rung`] then takes the
+/// same padded rows as one wider tile where that is cheaper.
 #[must_use]
 pub fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
     let rows = rows.max(1);
@@ -404,6 +406,36 @@ pub fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
         .filter(|rung| rows >= *rung)
         .find_map(fits)
         .or_else(|| fits(BM_RUNGS[0]))
+}
+
+/// The widest rung a widened tile is taken at. Two 32-row tiles beat one
+/// 64-row tile on the same padded rows (1687 vs 1772 us at N=17408, 522 vs
+/// 546 at N=5120), so a batch between 33 and 63 keeps its pair; the 64 rung
+/// is taken only when the batch itself reaches it.
+const WIDEN_TO: i32 = 32;
+
+/// **A BATCH BETWEEN TWO RUNGS PAYS THE WIDER RUNG'S PADDING EITHER WAY**,
+/// so it should get the wider rung's tile. [`mb_block`] pads nine to
+/// fifteen rows to sixteen and launches TWO eight-row tiles over them, where
+/// ONE sixteen-row tile over the same sixteen rows is 18% cheaper (604 vs
+/// 496 us, K=5120 N=17408, M4 Pro); seventeen to thirty-one pads to
+/// thirty-two as two sixteen-row tiles where one thirty-two-row tile is 7%
+/// cheaper (943 vs 874). Returns the rung `padded` is exactly one tile of,
+/// up to [`WIDEN_TO`], or `bm` unchanged.
+///
+/// `fills` says whether a tile at the candidate rung still fills the
+/// machine; a narrow projection (N=1024, 64 column tiles) does better as
+/// two eight-row tiles that split down K than as one sixteen-row tile that
+/// cannot (48 vs 53 us), so the wider tile is taken only where its
+/// threadgroups cover the GPU on their own.
+#[must_use]
+pub fn widen_rung(bm: i32, padded: i32, fills: impl Fn(i32) -> bool) -> i32 {
+    BM_RUNGS
+        .iter()
+        .copied()
+        .filter(|rung| *rung > bm && *rung <= WIDEN_TO && *rung == padded)
+        .find(|rung| fills(*rung))
+        .unwrap_or(bm)
 }
 
 /// The column tile for a tiled fire: narrow until there's enough work to fill the machine, then 32 — never 64.
@@ -685,6 +717,9 @@ pub fn act_x_wt(
         && let Some((bm, padded)) = mb_block(m, capacity)
         && (m > fold_widest || tile_fills(padded, bm) || split_plane(padded, bm).is_some())
     {
+        // The same padded rows as one wider tile, where that fills the
+        // machine on its own (`widen_rung`).
+        let bm = widen_rung(bm, padded, |rung| tile_fills(padded, rung));
         // Rung 2: the staged input. The cast writes `padded x k` halves,
         // the GEMM reads them at buffer 12 and leaves the bf16 seat null.
         if fp16
@@ -871,6 +906,25 @@ mod tests {
         assert!(qmv_rows_point("t", 64, 2, 4, 2).is_ok());
         assert!(qmv_rows_point("t", 64, 4, 2, 4).is_err());
         assert!(qmv_rows_point("t", 48, 4, 2, 1).is_err());
+    }
+
+    #[test]
+    fn a_batch_between_rungs_takes_the_wider_tile() {
+        let fills = |_: i32| true;
+        // Nine to fifteen pad to sixteen either way: one sixteen-row tile.
+        assert_eq!(mb_block(12, 64), Some((8, 16)));
+        assert_eq!(widen_rung(8, 16, fills), 16);
+        // Seventeen to thirty-one: one thirty-two-row tile.
+        assert_eq!(mb_block(24, 64), Some((16, 32)));
+        assert_eq!(widen_rung(16, 32, fills), 32);
+        // Thirty-three to sixty-three keep two thirty-two-row tiles.
+        assert_eq!(mb_block(48, 64), Some((32, 64)));
+        assert_eq!(widen_rung(32, 64, fills), 32);
+        // A batch ON a rung is already one tile of it.
+        assert_eq!(widen_rung(16, 16, fills), 16);
+        assert_eq!(widen_rung(8, 8, fills), 8);
+        // Where the wider tile would not fill the machine, the narrow pair stays.
+        assert_eq!(widen_rung(8, 16, |_| false), 8);
     }
 
     #[test]

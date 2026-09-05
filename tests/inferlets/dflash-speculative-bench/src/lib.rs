@@ -251,10 +251,14 @@
 //! The drafter proposes fifteen whatever the target reads — a block diffusion
 //! model is out of distribution at any other block width — but the VERIFY
 //! fire is priced by its rows, and the price is a STAIRCASE: the tile point
-//! pads a fire up to a row block, so twelve rows cost what sixteen do and
-//! twenty-four cost MORE than thirty-two. `a_fire_is_priced_by_its_width` on
-//! this box, in one-row fires: 1.00 / 1.83 / 2.79 / 5.19 / 5.00 at
-//! 1 / 8 / 16 / 24 / 32 rows. 256 tokens, wall clock:
+//! pads a fire up to a row block. `a_fire_is_priced_by_its_width` on this
+//! box, in one-row fires: 1.00 / 1.83 / 2.79 / 5.19 / 5.00 at 1 / 8 / 16 /
+//! 24 / 32 rows when the table below was taken — twelve then cost MORE than
+//! sixteen (3.13) because the tile launched two eight-row blocks over the
+//! padded sixteen; `quant::widen_rung` now takes the one sixteen-row tile
+//! and twelve reads 2.61, under sixteen. The table stands as measured, and
+//! the ladder's rungs stand too: re-priced on the acceptance distributions,
+//! a twelve rung never beats eight. 256 tokens, wall clock:
 //!
 //! ```text
 //!                      v=4     v=6     v=8     v=12    v=16
@@ -625,8 +629,8 @@ fn wide_enough(confidence: &[f32]) -> bool {
     mean >= THRESHOLD
 }
 
-/// The narrow rung, the only other width whose price differs (twelve rows
-/// cost what sixteen do).
+/// The narrow rung: the tile is flat from five to eight rows, so eight is
+/// the widest width that costs what five does.
 const NARROW: u32 = 8;
 
 /// Where the margin separates a round that will reach eight from one that
