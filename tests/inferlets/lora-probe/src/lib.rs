@@ -275,7 +275,14 @@ async fn main(input: Input) -> Result<Output> {
         return Ok(report(String::new(), 0));
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    // The model's opening (`<bos>` where it has one) before the raw text —
+    // the SAME opening `naive-baseline` puts there. This probe's whole claim
+    // is "naive-baseline plus one adapter and nothing else different", and
+    // on gemma the two openings answer different text at a zero adapter
+    // (" much like the…" against " of of of of"), which the A-1 gate then
+    // reads as the adapter path writing where it must not.
+    let mut prompt = inferlet::chat::prefix();
+    prompt.extend(wit_model::encode(&input.prompt));
     if prompt.is_empty() {
         prompt.push(0);
     }

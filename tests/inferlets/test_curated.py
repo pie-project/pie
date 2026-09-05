@@ -814,6 +814,27 @@ async def test_naive_baseline(client, args):
     assert report["sampler"] == "naive-baseline", report
 
 
+def _adapter_geometry(model: str) -> dict:
+    """`{"layers", "hidden"}` of the served checkpoint, read off its HF snapshot's
+    `config.json` (the text stanza when the config nests one); empty when no
+    snapshot is cached under that id, so the inferlet's defaults stand."""
+    import glob
+    from pathlib import Path
+
+    hub = Path.home() / ".cache" / "huggingface" / "hub"
+    pattern = str(hub / f"models--{model.replace('/', '--')}" / "snapshots" / "*" / "config.json")
+    for path in sorted(glob.glob(pattern)):
+        try:
+            config = json.loads(Path(path).read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        text = config.get("text_config", config)
+        layers, hidden = text.get("num_hidden_layers"), text.get("hidden_size")
+        if isinstance(layers, int) and isinstance(hidden, int):
+            return {"layers": layers, "hidden": hidden}
+    return {}
+
+
 async def test_lora_probe(client, args):
     """A-1: a zero-B adapter is the base model, bit for bit; a live one moves.
 
@@ -848,6 +869,14 @@ async def test_lora_probe(client, args):
         "seed": 7,
     }
     base = await _report(client, args, "naive-baseline", dict(fixed))
+    # The probe seeds its A and B planes at the served model's geometry, and
+    # its defaults are qwen35-d0.8b's (24 layers, hidden 1024): on any other
+    # SKU the engine refuses the bank by size. The guest cannot read those two
+    # numbers off the engine, so this fixture reads them off the checkpoint's
+    # `config.json` and passes them, as the inferlet's header says a different
+    # SKU must. The rank stays the model text's own (`Adapters { rank: 16 }`
+    # in every family here), which is trace-known and not the fixture's to move.
+    fixed = {**fixed, **_adapter_geometry(args.model)}
     zero = await _report(client, args, "lora-probe", {**fixed, "adapter_scale": 0.0})
     assert zero["text"] == base["text"], (
         "a zero-B adapter changed the answer -- the correction term is exactly "
