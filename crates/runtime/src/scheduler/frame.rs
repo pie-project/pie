@@ -76,6 +76,37 @@ pub(crate) fn set_seal_default_ready(ready: bool) {
     SEAL_DEFAULT_READY.store(ready, Ordering::Relaxed);
 }
 
+/// **HOW LONG A READY-MODE BOUNDARY WAITS FOR THE REST BEFORE IT OPENS
+/// WITH WHO IS THERE.** Ready mode opens the boundary from the
+/// arrival-complete lanes after ONE quiet poll (`GATHER_POLL_US`); on a Metal
+/// box with eight lanes whose readbacks return a fraction of a millisecond
+/// apart that opened it with two or three of them every time (2.2 lanes a
+/// batch of eight offered), and strict sealing read 1.7-2.3x. A window says:
+/// once a candidate exists, keep gathering until the boundary has been open
+/// this long OR every awaited lane arrived — so lanes that land within the
+/// window batch as strict would, and a lane that stalls holds the others for
+/// the window, not the 50 ms leash. Zero is ready mode as it was.
+/// `PIE_SEAL_COALESCE_US` overrides the platform's default
+/// (`set_seal_coalesce_default`).
+static SEAL_COALESCE_DEFAULT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn set_seal_coalesce_default(window: Duration) {
+    SEAL_COALESCE_DEFAULT_US.store(window.as_micros() as u64, Ordering::Relaxed);
+}
+
+fn seal_coalesce() -> Duration {
+    static CONFIGURED: OnceLock<Duration> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_SEAL_COALESCE_US")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .map_or_else(
+                || Duration::from_micros(SEAL_COALESCE_DEFAULT_US.load(Ordering::Relaxed)),
+                Duration::from_micros,
+            )
+    })
+}
+
 fn seal_mode_ready() -> bool {
     static CONFIGURED: OnceLock<bool> = OnceLock::new();
     *CONFIGURED.get_or_init(|| match std::env::var("PIE_SEAL_MODE") {
@@ -358,6 +389,13 @@ pub(super) struct FramePolicy {
     /// [`seal_mode_ready`], read once, for the same reason. `false` is the
     /// strict wait-all rule.
     seal_mode_ready: bool,
+    /// [`seal_coalesce`]: how long a ready-mode boundary with a candidate
+    /// keeps gathering before it opens with who is there.
+    seal_coalesce: Duration,
+    /// When the current ready-mode hold began — the first evaluation that
+    /// found a candidate and a missing lane with the device idle. Cleared
+    /// with `quiesce_mark`.
+    coalesce_since: Option<Instant>,
     /// Probe sink (`profile-fire` wave counters); `None` in unit tests.
     stats: Option<Arc<SchedulerStats>>,
 }
@@ -378,6 +416,13 @@ impl FramePolicy {
     #[cfg(test)]
     fn with_seal_mode_ready(mut self, on: bool) -> Self {
         self.seal_mode_ready = on;
+        self
+    }
+
+    /// Pin the coalescing window for one policy. Tests only.
+    #[cfg(test)]
+    fn with_seal_coalesce(mut self, window: Duration) -> Self {
+        self.seal_coalesce = window;
         self
     }
 
@@ -414,6 +459,8 @@ impl FramePolicy {
             silence_timeout: crate::scheduler::configured_silence_timeout(),
             gate_contributed: gate_contributed(),
             seal_mode_ready: seal_mode_ready(),
+            seal_coalesce: seal_coalesce(),
+            coalesce_since: None,
             stats,
         }
     }
@@ -1346,15 +1393,25 @@ ready_age_newest={}us",
                     // gather continues. Drop the quiescence mark; this exit
                     // isn't a hold cycle.
                     self.quiesce_mark = None;
+                    self.coalesce_since = None;
                     return FramePlan::Park;
                 }
+                // The ready-mode hold's remaining window, `None` outside one.
+                let mut window_left: Option<Duration> = None;
                 if self.seal_mode_ready && self.have_seal_candidate() {
                     // Ready mode: open the boundary from the
                     // arrival-complete subset only after one full hold
                     // cycle with no new arrival, so missing lanes are
-                    // genuinely slow, not mid-burst.
-                    if self.quiesce_mark == Some(self.gather_seq) {
+                    // genuinely slow, not mid-burst — and only once the
+                    // boundary has been open for the coalescing window, so
+                    // lanes a fraction of a millisecond apart share it
+                    // (`seal_coalesce`).
+                    let since = *self.coalesce_since.get_or_insert(now);
+                    let open_for = now.saturating_duration_since(since);
+                    let quiesced = self.quiesce_mark == Some(self.gather_seq);
+                    if quiesced && open_for >= self.seal_coalesce {
                         self.quiesce_mark = None;
+                        self.coalesce_since = None;
                         self.strict_watchdog_deadline = None;
                         self.idle_dumped = false;
                         match self.seal() {
@@ -1366,7 +1423,10 @@ ready_age_newest={}us",
                             None => {}
                         }
                     } else {
-                        self.quiesce_mark = Some(self.gather_seq);
+                        if !quiesced {
+                            self.quiesce_mark = Some(self.gather_seq);
+                        }
+                        window_left = Some(self.seal_coalesce.saturating_sub(open_for));
                     }
                 }
                 let deadline = self
@@ -1375,18 +1435,25 @@ ready_age_newest={}us",
                 if now >= *deadline {
                     *deadline = now + Duration::from_micros(STRICT_WATCHDOG_US);
                 }
-                let plan = FramePlan::Hold(
-                    deadline
-                        .saturating_duration_since(now)
-                        .min(Duration::from_micros(GATHER_POLL_US)),
-                );
-                return plan;
+                let mut hold = deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_micros(GATHER_POLL_US));
+                // Inside a window, re-look when it closes if that is sooner
+                // than the poll (never sooner than the quiescence check
+                // needs: a zero window is one poll, as before).
+                if let Some(left) = window_left
+                    && left > Duration::ZERO
+                {
+                    hold = hold.min(left);
+                }
+                return FramePlan::Hold(hold);
             }
             self.strict_watchdog_deadline = None;
             self.idle_dumped = false;
             // Nothing is missing, so this evaluation is not a hold cycle
             // either: retire the mark.
             self.quiesce_mark = None;
+            self.coalesce_since = None;
             // Early seal: the gate held, so seal now — normally while the
             // previous frame still executes.
             match self.seal() {
