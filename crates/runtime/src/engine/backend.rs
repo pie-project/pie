@@ -81,6 +81,11 @@ pub struct SchedulerLimits {
     pub max_forward_requests: usize,
     pub max_forward_tokens: usize,
     pub max_page_refs: usize,
+    /// The most tokens one sequence may hold (`FireLimits::max_context`).
+    /// Zero states no ceiling. Enforced on the host-geometry fire path
+    /// (`pipeline::fire`): the engine's own check runs only for a fire that
+    /// supplies no page table, and this runtime always supplies one.
+    pub max_context: usize,
 }
 
 #[derive(Debug, Clone)]

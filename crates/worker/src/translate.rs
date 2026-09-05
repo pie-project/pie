@@ -124,6 +124,7 @@ fn build_model(
                     max_forward_requests: g.caps.limits.max_lanes as usize,
                     max_forward_tokens: g.caps.limits.max_tokens as usize,
                     max_page_refs: g.caps.limits.max_page_refs as usize,
+                    max_context: g.caps.limits.max_context as usize,
                 },
                 engine_backend: g.backend,
             }
