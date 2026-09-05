@@ -134,29 +134,6 @@ pub struct Channel {
 /// embeds nothing, appends no KV, and advances no position.
 pub const TOKEN_PAD: i32 = -1;
 
-/// Pad a token window to `envelope` slots with [`TOKEN_PAD`]; panics if too long.
-pub fn pad_tokens(tokens: &[u32], envelope: usize) -> Vec<i32> {
-    assert!(
-        tokens.len() <= envelope,
-        "window of {} tokens exceeds its envelope of {envelope}",
-        tokens.len(),
-    );
-    tokens
-        .iter()
-        .map(|&token| token as i32)
-        .chain(std::iter::repeat(TOKEN_PAD))
-        .take(envelope)
-        .collect()
-}
-
-/// Recover the live tokens from a device envelope, dropping every [`TOKEN_PAD`] slot.
-pub fn unpad_tokens(window: &[i32]) -> Vec<u32> {
-    window
-        .iter()
-        .filter(|&&token| token != TOKEN_PAD)
-        .map(|&token| token as u32)
-        .collect()
-}
 
 impl Channel {
     /// `Channel::new([shape], dtype)` at capacity 1.
@@ -954,9 +931,9 @@ mod page_declaration_tests {
 }
 
 impl<W: PassWit> Pass<W> {
-    /// Does this pass bind a dense `AttnMask` channel? Kept here (not
-    /// [`live_slots`]) since that call site has no pass in hand.
-    pub fn binds_device_mask(&self) -> bool {
+    /// Does this pass bind a dense `AttnMask` channel? [`run_ahead`] gives
+    /// such a pass one slot per frame.
+    fn binds_device_mask(&self) -> bool {
         self.inner
             .borrow()
             .ports
@@ -1342,22 +1319,6 @@ pub fn channel_capacity() -> usize {
     (crate::model::channel_capacity() as usize).max(2)
 }
 
-/// Live slots per frame for the bound model: k for dense, 1 for recurrent
-/// (linear/hybrid) — conservative, not a hard constraint.
-pub fn live_slots() -> usize {
-    thread_local! {
-        static LIVE: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
-    }
-    LIVE.with(|live| {
-        *live.get_or_init(|| {
-            if crate::model::pass_kind() != crate::model::ForwardKind::Attention {
-                1
-            } else {
-                frame_size()
-            }
-        })
-    })
-}
 
 /// Tokens per KV page (cached); prefer [`WorkingSet::page_size`] when a
 /// working set is in hand.
@@ -1441,14 +1402,13 @@ pub async fn run_ahead<W: PassWit>(
     }
     // A pass that binds a dense device mask takes one slot per frame — see
     // `Pass::binds_device_mask`.
-    let r = if pass.binds_device_mask() {
-        1
-    } else {
-        live_slots()
-    };
-    // `channel_capacity()` carries the staging margin; the window is what
-    // remains, in frames of `r` live slots.
-    let window_frames = ((channel_capacity() - 1) / r.max(1)).max(1);
+    let r = if pass.binds_device_mask() { 1 } else { frame_size() };
+    // THE WINDOW IS THE RUNTIME'S NUMBER, NOT RECOVERED FROM THE RING. The
+    // runtime derives the ring size and the window from one source and
+    // publishes both; a guest that re-derived one from the other believed a
+    // number the runtime never stated. In frames of `r` live slots.
+    let window_fires = crate::model::run_ahead_window() as usize;
+    let window_frames = (window_fires / r.max(1)).max(1);
 
     let mut submitted = 0usize;
     let mut consumed = 0usize;
@@ -1550,8 +1510,7 @@ impl Default for Pipeline {
 pub mod shared_prelude {
     pub use super::{
         Channel, KvBinding, KvGeometry, PageGrant, Pipeline, RsGeometry, RsWorkingSet, TOKEN_PAD,
-        WorkingSet, channel_capacity, frame_size, kv_page_size, live_slots, max_embed_length,
-        pad_tokens, prefill_chunks, unpad_tokens,
+        WorkingSet, channel_capacity, frame_size, kv_page_size, max_embed_length, prefill_chunks,
     };
     /// Every inferlet returns `inferlet::Result` and uses `model`, so both ride the prelude.
     pub use crate::{Context, Result, model};
