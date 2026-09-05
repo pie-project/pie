@@ -238,7 +238,12 @@ async fn main(input: Input) -> Result<Output> {
         return Err("max_tokens must be at least 1".into());
     }
 
-    let mut prompt = model::encode(&input.prompt);
+    // The model's opening (`<bos>` where it has one) before the raw text —
+    // the opening `naive-baseline` puts there, which is what makes this
+    // program's all-keep arm comparable to it, and what puts the attention
+    // sink these policies rank at position 0.
+    let mut prompt = inferlet::chat::prefix();
+    prompt.extend(model::encode(&input.prompt));
     if prompt.is_empty() {
         prompt.push(0);
     }
