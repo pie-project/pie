@@ -485,11 +485,21 @@ def even_spans(n: int, cap: int) -> list[tuple[int, int]]:
     return out
 
 
+def prefill_chunk_hint() -> int:
+    """The prefill chunk the scheduler would like right now, in tokens
+    (`model.prefill-chunk-hint`): the forward token budget shared among the
+    live processes, in whole KV pages. Read per call — it moves as processes
+    come and go. A hint: the runtime never splits a fire."""
+    return min(max(_wit_model.prefill_chunk_hint(), 1), max_embed_length())
+
+
 def prefill_chunks(n: int, cap: int | None = None) -> list[tuple[int, int]]:
     """The `[start, end)` spans a prompt of `n` tokens must be prefilled in,
-    respecting `max_embed_length()`."""
-    c = min(cap if cap is not None else 0xFFFF_FFFF, max(max_embed_length(), 1))
-    return even_spans(n, c)
+    respecting `max_embed_length()`. `cap` overrides the limit; `None` takes
+    `prefill_chunk_hint()`, so a prompt prefilled beside other live processes
+    is cut into chunks that leave the step room for their decodes."""
+    c = min(cap if cap is not None else prefill_chunk_hint(), max(max_embed_length(), 1))
+    return even_spans(n, max(c, 1))
 
 
 # ---------------------------------------------------------------------------

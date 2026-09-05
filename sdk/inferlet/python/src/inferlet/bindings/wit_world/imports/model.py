@@ -116,6 +116,15 @@ def max_embed_length() -> int:
     chunking is guest-side, against this static constant.
     """
     raise NotImplementedError
+def prefill_chunk_hint() -> int:
+    """
+    The prefill chunk the scheduler would like to see right now, in
+    tokens: the per-forward token budget shared evenly among the live
+    processes, rounded down to whole KV pages, never below one page and
+    never above `max-embed-length`. A hint, not a limit: the runtime never
+    splits a fire. Not static: it moves with the number of live processes.
+    """
+    raise NotImplementedError
 def rs_state_size() -> int:
     """
     ── Working-set / arena capabilities (global, over the bound model) ──

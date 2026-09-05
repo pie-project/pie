@@ -109,6 +109,17 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(crate::engine::get_spec(0)?.limits.max_forward_tokens as u32)
     }
 
+    /// The prefill chunk the scheduler would like right now: the forward
+    /// token budget shared evenly among live processes, in whole KV pages.
+    /// See `model.wit`.
+    async fn prefill_chunk_hint(&mut self) -> Result<u32> {
+        let budget = crate::engine::get_spec(0)?.limits.max_forward_tokens;
+        let live = crate::inferlet::process::live_count().max(1);
+        let page = (model::model().kv_page_size() as usize).max(1);
+        let share = (budget / live) / page * page;
+        Ok(share.clamp(page.min(budget.max(1)), budget.max(1)) as u32)
+    }
+
     // working-set / arena capabilities, global over the bound model.
 
     /// Bytes of one folded recurrent-state object (0 if the model has no RS).

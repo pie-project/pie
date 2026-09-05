@@ -135,6 +135,13 @@ def max_embed_length() -> int:
     return _model.max_embed_length()
 
 
+def prefill_chunk_hint() -> int:
+    """The prefill chunk the scheduler would like right now: the forward
+    token budget shared among live processes, in whole KV pages. A hint,
+    read per call — it moves as processes come and go."""
+    return _model.prefill_chunk_hint()
+
+
 def rs_state_size() -> int:
     """Bytes in one folded recurrent-state object. 0 for pure attention."""
     return _model.rs_state_size()

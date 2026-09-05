@@ -441,10 +441,21 @@ export function evenSpans(n: number, cap: number): [number, number][] {
   return out;
 }
 
-/** The `[start, end)` spans a prompt of `n` tokens must be prefilled in. */
+/** The prefill chunk the scheduler would like right now, in tokens
+ * (`model.prefill-chunk-hint`): the forward token budget shared among the
+ * live processes, in whole KV pages. Read per call — it moves as processes
+ * come and go. A hint: the runtime never splits a fire. */
+export function prefillChunkHint(): number {
+  return Math.min(Math.max(witModel.prefillChunkHint(), 1), maxEmbedLength());
+}
+
+/** The `[start, end)` spans a prompt of `n` tokens must be prefilled in.
+ * `cap` overrides the limit; omitted, it takes `prefillChunkHint()`, so a
+ * prompt prefilled beside other live processes is cut into chunks that
+ * leave the step room for their decodes. */
 export function prefillChunks(n: number, cap?: number): [number, number][] {
-  const c = Math.min(cap ?? 0xffff_ffff, Math.max(maxEmbedLength(), 1));
-  return evenSpans(n, c);
+  const c = Math.min(cap ?? prefillChunkHint(), Math.max(maxEmbedLength(), 1));
+  return evenSpans(n, Math.max(c, 1));
 }
 
 // ---------------------------------------------------------------------------

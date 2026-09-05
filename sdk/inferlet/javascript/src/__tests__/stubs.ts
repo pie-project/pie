@@ -31,6 +31,7 @@ export const modelStub = {
   frameSize: () => 1,
   channelCapacity: () => 8,
   maxEmbedLength: () => 2048,
+  prefillChunkHint: () => 2048,
   rsStateSize: () => 4096n,
   rsBufferPageSize: () => 64,
   rsFoldGranularity: () => 1,

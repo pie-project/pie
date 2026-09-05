@@ -97,6 +97,13 @@ export function maxEmbedLength(): number {
   return _model.maxEmbedLength();
 }
 
+/** The prefill chunk the scheduler would like right now: the forward token
+ * budget shared among live processes, in whole KV pages. A hint, read per
+ * call — it moves as processes come and go. */
+export function prefillChunkHint(): number {
+  return _model.prefillChunkHint();
+}
+
 /** Bytes in one folded recurrent-state object. 0 for pure attention. */
 export function rsStateSize(): number {
   return Number(_model.rsStateSize());

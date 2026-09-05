@@ -127,6 +127,14 @@ export function runAheadWindow(): number;
  */
 export function maxEmbedLength(): number;
 /**
+ * The prefill chunk the scheduler would like to see right now, in
+ * tokens: the per-forward token budget shared evenly among the live
+ * processes, rounded down to whole KV pages, never below one page and
+ * never above `max-embed-length`. A hint, not a limit: the runtime never
+ * splits a fire. Not static: it moves with the number of live processes.
+ */
+export function prefillChunkHint(): number;
+/**
  * ── Working-set / arena capabilities (global, over the bound model) ──
  * Memory-shaping parameters of the bound model's engine, so an inferlet
  * can size working sets and validate fold lengths before allocating.

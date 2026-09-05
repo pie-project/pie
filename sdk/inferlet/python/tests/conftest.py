@@ -62,6 +62,7 @@ def _make_model() -> types.ModuleType:
     m.frame_size = lambda: 1
     m.channel_capacity = lambda: 8
     m.max_embed_length = lambda: 2048
+    m.prefill_chunk_hint = lambda: 2048
     m.rs_state_size = lambda: 4096
     m.rs_buffer_page_size = lambda: 64
     m.rs_fold_granularity = lambda: 1

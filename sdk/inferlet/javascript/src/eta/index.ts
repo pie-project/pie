@@ -33,6 +33,7 @@ export {
   maxEmbedLength,
   mm,
   padTokens,
+  prefillChunkHint,
   prefillChunks,
   runAhead,
   scale,
