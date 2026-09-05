@@ -149,6 +149,8 @@ impl Run<'_> {
                 self.uncut(*y),
             ),
 
+            // The per-row top-k a candidate selector reads has no wgpu kernel yet.
+            Layout::TopK { .. } => Err(kernels_wgpu::Error::Unsupported { op: "layout.topk" }),
             Layout::Argmax { xs, y } => {
                 for (column, x) in xs.iter().enumerate() {
                     layout::argmax(

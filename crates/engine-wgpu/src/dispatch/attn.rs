@@ -191,6 +191,13 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
+            // This plane's masked read is causal AND mask; a bidirectional
+            // block (a v1 block drafter's full layer) is not served here, and
+            // the two block-drafter ops have no wgpu kernel yet — refused by
+            // name rather than approximated.
+            Attention::Masked { causal: false, .. }
+            | Attention::BlockDynConv { .. }
+            | Attention::SelectorWalk { .. } => Err(kernels_wgpu::Error::Unsupported { op: op.name() }),
             Attention::Masked {
                 q,
                 plan,
@@ -198,6 +205,8 @@ impl Run<'_> {
                 cache,
                 window,
                 head_dim,
+                kv_heads: _,
+                causal: _,
                 sm_scale,
                 o,
             } => attn::arbiter::masked(
