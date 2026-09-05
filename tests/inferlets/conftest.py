@@ -190,10 +190,18 @@ def _build_guests():
     the run kept failing with `pipeline is closed` and the blame went to the
     engine for two sessions.
 
+    The Python and JavaScript twins (`<name>-py`, `<name>-js`) are not in the
+    cargo workspace; they are componentized with `bakery build` into the flat
+    `<dir>/target/<name>.wasm` the artifact search below knows. Same rule:
+    a twin whose SDK was fixed must not be tested in its old shape -- which
+    is exactly what happened once the SDK ports landed, when two rounds of
+    "E2E after the refactor" ran against wasm built that morning.
+
     Skipped when `PIE_INFERLETS_NO_BUILD` is set, for runs against artifacts
     that were built elsewhere (a cross-compiled or vendored guest).
     """
     import os
+    import shutil
     import subprocess
 
     if os.environ.get("PIE_INFERLETS_NO_BUILD"):
@@ -210,8 +218,33 @@ def _build_guests():
         # have usable artifacts, and a stale run says more than no run.
         print("Guests: BUILD FAILED -- testing whatever artifacts exist")
         print(result.stderr.strip()[-2000:])
+    else:
+        print("Guests: built from source")
+
+    twins = sorted(
+        d
+        for d in INFERLETS_DIR.iterdir()
+        if d.is_dir() and d.name.endswith(("-py", "-js")) and (d / "Pie.toml").exists()
+    )
+    if not twins:
         return
-    print("Guests: built from source")
+    # `bakery` on PATH, else the module the harness's own interpreter can see
+    # (`uv run` / a venv with the bakery package installed).
+    bakery = [shutil.which("bakery")] if shutil.which("bakery") else [sys.executable, "-m", "bakery"]
+    probe = subprocess.run([*bakery, "--help"], capture_output=True, text=True)
+    if probe.returncode != 0:
+        print(f"Guests: bakery not available -- {len(twins)} Python/JS twin(s) tested as previously built")
+        return
+    failed = []
+    for d in twins:
+        out = d / "target" / f"{d.name.replace('-', '_')}.wasm"
+        r = subprocess.run([*bakery, "build", str(d), "-o", str(out)], capture_output=True, text=True)
+        if r.returncode != 0:
+            failed.append(d.name)
+            print(f"Guests: {d.name} BUILD FAILED -- testing whatever artifact exists")
+            print((r.stderr or r.stdout).strip()[-1500:])
+    built = len(twins) - len(failed)
+    print(f"Guests: {built} Python/JS twin(s) built with bakery" + (f", {len(failed)} failed" if failed else ""))
 
 
 async def run_inferlet(
