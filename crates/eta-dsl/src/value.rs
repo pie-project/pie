@@ -1317,10 +1317,19 @@ pub fn gumbel_max(logits: impl AsTensor, state: impl AsTensor) -> Tensor {
 }
 
 /// Shannon entropy `-sum(p * log(p))`.
+///
+/// A softmax tail underflows to exactly 0 in f32, and `0 · log 0` is `0 · -inf
+/// = NaN`, so the log sees the probabilities floored at the smallest normal:
+/// a zero term contributes 0, as the reference's log-softmax form gives.
 pub fn entropy(probabilities: impl AsTensor) -> Tensor {
     let (probabilities, probability_type) = probabilities.to_arg().materialize();
     let result_type = ValueType::new(reduce_shape(probability_type.shape), Dtype::F32);
-    let log_probabilities = push(Op::Log(probabilities), &[probability_type]);
+    let floored = max_elem(
+        Tensor::node(probabilities, probability_type),
+        f32::MIN_POSITIVE,
+    );
+    let (floored, _) = floored.to_arg().materialize();
+    let log_probabilities = push(Op::Log(floored), &[probability_type]);
     let terms = push(
         Op::Mul(probabilities, log_probabilities),
         &[probability_type],

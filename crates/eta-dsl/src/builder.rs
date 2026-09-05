@@ -205,10 +205,13 @@ impl<'a> Builder<'a> {
                     && !has_host_put
                     && !st.seeded
                     && st.seed.is_none();
-                // A seeded descriptor-only channel is replaceable through
-                // host `set`, so it needs a Writer endpoint too.
-                let seeded_descriptor_writer = st.seeded && has_desc_use && !has_prog_put;
-                let host_role = if (has_host_put || seeded_descriptor_writer) && !has_prog_put {
+                // A seeded channel the pass only reads (a descriptor, or a
+                // program `read` such as a control word) is a latest-value
+                // cell replaceable through host `set`, so it needs a Writer
+                // endpoint too.
+                let seeded_latest_value_writer =
+                    st.seeded && (has_desc_use || !st.prog_reads.is_empty()) && !has_prog_put;
+                let host_role = if (has_host_put || seeded_latest_value_writer) && !has_prog_put {
                     HostRole::Writer
                 } else if host_consumes && (!st.prog_takes.is_empty() || has_prog_put) {
                     // A host-consumed, pass-produced/loop-carried channel.
