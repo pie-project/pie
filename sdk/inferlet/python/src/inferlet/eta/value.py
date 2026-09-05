@@ -930,10 +930,17 @@ def gumbel_max(logits, state) -> Tensor:
     return Tensor.node(result, result_type)
 
 
+F32_MIN_POSITIVE = 2.0**-126  # `f32::MIN_POSITIVE`, the smallest normal
+
+
 def entropy(probabilities) -> Tensor:
+    """Shannon entropy `-sum(p * log(p))`. A softmax tail underflows to
+    exactly 0 in f32 and `0 * log 0` is NaN, so the log sees the
+    probabilities floored at the smallest normal: a zero term contributes 0."""
     pid, pty = _materialize(_to_arg(probabilities))
     result_type = ValueType(drop_last(pty.shape), Dtype.F32)
-    lp = emit(Op.unary(tags.LOG, pid), (pty,))
+    fid, _ = _materialize(max_elem(Tensor.node(pid, pty), F32_MIN_POSITIVE))
+    lp = emit(Op.unary(tags.LOG, fid), (pty,))
     terms = emit(Op.binary(tags.MUL, pid, lp), (pty,))
     s = emit(Op.unary(tags.REDUCE_SUM, terms), (result_type,))
     result = emit(Op.unary(tags.NEG, s), (result_type,))

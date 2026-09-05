@@ -270,8 +270,11 @@ class Builder:
                 and not st.seeded
                 and not st.has_seed
             )
-            seeded_descriptor_writer = st.seeded and has_desc_use and not has_prog_put
-            if (has_host_put or seeded_descriptor_writer) and not has_prog_put:
+            # A seeded channel the pass only reads (a descriptor, or a program
+            # `read` such as a control word) is a latest-value cell replaceable
+            # through host `set`, so it needs a Writer endpoint too.
+            seeded_latest_value_writer = st.seeded and (has_desc_use or bool(st.prog_reads)) and not has_prog_put
+            if (has_host_put or seeded_latest_value_writer) and not has_prog_put:
                 host_role = HostRole.WRITER
             elif host_consumes and (bool(st.prog_takes) or has_prog_put):
                 host_role = HostRole.READER
