@@ -31,9 +31,12 @@
 //! fire cannot overwrite a live one), that region threaded through
 //! `FireBindings` into `Run`, a cursor with a flush-when-full rule, and the
 //! batching itself in `crate::dispatch::rs` — real correctness surface for
-//! half a percent. The dominant cost in that fire is `gated_delta_committed`
-//! at ~2.8x the plain scan (+4.8 ms), which is inherent: fold-commit runs
-//! the scan over replay+own rows, which is what fold-commit IS.
+//! half a percent. The dominant cost in that fire WAS `gated_delta_committed`
+//! at ~2.8x the plain scan (+4.8 ms); this file first called that inherent to
+//! fold-commit, and it was not — it was the kernel's shape (a simdgroup per
+//! column, a threadgroup tree per token), and the committed window now runs
+//! the register scan's body (`ssm_gdn_scan.metal`, 28 -> 5.5 ms on a
+//! sixteen-row verify). The copies' verdict stands on its own numbers.
 //!
 //! ```text
 //! PIE_COPY_LAUNCHES=54,108,432,864,3456 PIE_COPY_BYTES=512 PIE_COPY_STEPS=20 \
