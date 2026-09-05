@@ -666,6 +666,80 @@ fn matmul_select_mlxu4(
     }
     let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
+
+    // The routes sorted by expert, so consecutive blocks share an expert's
+    // bank and a wide fire reads it out of L2 rather than once per route
+    // (`moe_route_order`). One block sorts; the order lives in a named
+    // scratch slab sized by the route run, so a capture holds one address.
+    const ROUTE_ORDER: &str = "moe_route_order";
+    const ORDER_BLOCK: u32 = 1024;
+    const EXPERT_CAP: u32 = 4096;
+    /// From this many routes on, the grouped kernel (one block per expert
+    /// × 128 rows, the bank decoded once per expert) beats the per-route
+    /// GEMV; below it a decode step's handful of routes is the GEMV's.
+    const GROUPED_FROM: u32 = 256;
+    const GROUPED_TILE_N: u32 = 128;
+    const GROUPED_BLOCK: u32 = 256;
+    let experts = codes.rows.clamp(1, EXPERT_CAP);
+    // The order slab: `route_count` route ids, then `experts + 2` offsets.
+    let order_words = fan.route_count as usize;
+    let offsets_at = order_words.next_multiple_of(64);
+    let order = ctx.scratch(
+        op,
+        ROUTE_ORDER,
+        (offsets_at + experts as usize + 2) * core::mem::size_of::<i32>(),
+    )? as usize as u64;
+    let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
+    ctx.fire(
+        op,
+        Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
+            .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
+        &[
+            routes.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            fan.top_k.arg(),
+            stated(op, fan.route_count)?.arg(),
+            stated(op, experts)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    if fan.route_count >= GROUPED_FROM {
+        // bf16 activations take the tensor-core form; f16 the fp32 one.
+        let entry = if x.dtype == Dtype::Bf16 {
+            format!(
+                "::pie::linear::moe_matmul_select_mlxu4_wmma<::pie::i32({bits}), ::pie::i32({group})>"
+            )
+        } else {
+            format!(
+                "::pie::linear::moe_matmul_select_mlxu4_grouped<{t}, ::pie::i32({bits}), \
+                 ::pie::i32({group})>"
+            )
+        };
+        return ctx.fire(
+            op,
+            Fire::at("linear/quant.cuh", symbol(&entry))
+            .apply(Launch::grid(
+                [experts, y.width.div_ceil(GROUPED_TILE_N), 1],
+                [GROUPED_BLOCK, 1, 1],
+            )),
+            &[
+                x.arg(),
+                ArgValue::Ptr(order),
+                ArgValue::Ptr(offsets),
+                codes.arg(),
+                scales.arg(),
+                biases.arg(),
+                y.arg(),
+                act_div.arg(),
+                n.arg(),
+                k.arg(),
+                stated(op, experts)?.arg(),
+                ArgValue::Ptr(seat.cell),
+                ArgValue::Ptr(seat.hits),
+            ],
+        );
+    }
     ctx.fire(
         op,
         Fire::at(
@@ -682,6 +756,7 @@ fn matmul_select_mlxu4(
         &[
             x.arg(),
             routes.arg(),
+            ArgValue::Ptr(order),
             codes.arg(),
             scales.arg(),
             biases.arg(),

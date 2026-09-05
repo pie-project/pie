@@ -5,9 +5,12 @@
 #ifdef __CUDACC_RTC__
 #include "prelude/half2.cuh"
 #include "prelude/fp8.cuh"
+#include "prelude/mma.cuh"
 #else
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cuda_bf16.h>
+#include <mma.h>
 #endif
 
 namespace pie::linear {
@@ -712,9 +715,11 @@ __global__ void moe_matmul_select_mxfp4(
     // route ordinal that is the PLANE's and not the launch's — which is what
     // `engine_cuda::SHIFTED` promises for a name on its list.
     if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
-    const int plane_route = win != nullptr
-        ? route + static_cast<int>(win[1]) * top_k
-        : route;
+    // `order` (see `moe_route_order`) hands this block its plane route with
+    // the window offset folded in; without it the position is the route.
+    const int plane_route = order != nullptr
+        ? order[route]
+        : (win != nullptr ? route + static_cast<int>(win[1]) * top_k : route);
     const int warp_in_block = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
     const int row0 = (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;
@@ -809,6 +814,466 @@ __global__ void moe_matmul_select_mxfp4(
     }
 }
 
+// **ROUTES BY EXPERT** — the order the affine select walks its routes in.
+// The select reads one expert's whole bank per route; in token order,
+// consecutive blocks read different experts, and a wide fire streams the
+// bank once per route (256 tokens × 8 routes × 2 MB, far past L2). Sorted
+// by expert, consecutive blocks share an expert and the bank comes out of
+// L2. One block counting-sorts the window's live routes: `order[pos]` is
+// the PLANE route (window offset folded in) the select's block `pos`
+// serves; positions past the live count are left alone (the select returns
+// before reading them). Ties land in no particular order — each route's dot
+// is its own, so the result does not depend on it. An out-of-range expert
+// sorts last.
+__global__ void moe_route_order(
+    const i32* __restrict__ routes,
+    i32* __restrict__ order,
+    i32* __restrict__ offsets,
+    int top_k,
+    int route_count,
+    int num_experts,
+    const u32* __restrict__ win)
+{
+    extern __shared__ i32 order_smem[];
+    i32* counts = order_smem;
+    i32* fill = counts + num_experts + 1;
+    const int live = win != nullptr
+        ? min(static_cast<int>(win[0]) * top_k, route_count)
+        : route_count;
+    const int base = win != nullptr ? static_cast<int>(win[1]) * top_k : 0;
+    for (int e = threadIdx.x; e <= num_experts; e += blockDim.x) {
+        counts[e] = 0;
+        fill[e] = 0;
+    }
+    __syncthreads();
+    for (int r = threadIdx.x; r < live; r += blockDim.x) {
+        int e = routes[base + r];
+        if (e < 0 || e >= num_experts) e = num_experts;
+        atomicAdd(counts + e, 1);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int running = 0;
+        for (int e = 0; e <= num_experts; ++e) {
+            const int c = counts[e];
+            counts[e] = running;
+            running += c;
+        }
+    }
+    __syncthreads();
+    // `offsets[e]..offsets[e + 1]` is expert `e`'s run of `order`; the
+    // out-of-range bucket lies past `offsets[num_experts]`.
+    for (int e = threadIdx.x; e <= num_experts; e += blockDim.x) offsets[e] = counts[e];
+    for (int r = threadIdx.x; r < live; r += blockDim.x) {
+        int e = routes[base + r];
+        if (e < 0 || e >= num_experts) e = num_experts;
+        const int pos = counts[e] + atomicAdd(fill + e, 1);
+        order[pos] = base + r;
+    }
+}
+
+// **THE GROUPED AFFINE SELECT** — the same bank and the same answer as
+// `moe_matmul_select_mlxu4` below, for a wide fire. That kernel is one
+// block per route, decoding one expert's bank for one activation: on a
+// 256-token canvas that is 2048 decodes of a 2 MB bank per call, and the
+// decode (not the bytes — sorting the routes by expert bought nothing)
+// is what the 4 ms went on. Here a block is one expert × 64 bank rows: it
+// decodes each 64 × 128 chunk of the expert's weights into shared memory
+// ONCE and applies it to every route of that expert (`order`/`offsets`
+// from `moe_route_order`), sixteen at a time, so the decode is paid per
+// expert and the arithmetic is fp32 FMA out of shared memory. Writes land
+// at the original route index, as the per-route kernel's do.
+template <class T, int kBits, int kGroup>
+__global__ void moe_matmul_select_mlxu4_grouped(
+    const T* __restrict__ act,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const u8* __restrict__ biases,
+    T* __restrict__ out,
+    int act_div,
+    int n,
+    int k,
+    int num_experts,
+    const MoeGroupBases* __restrict__ bases,
+    unsigned int* __restrict__ group_hits)
+{
+    // 128 bank rows × 16 routes per block step; a thread owns two rows × four
+    // routes (eight accumulators), so each shared-memory step loads two
+    // weights and four activations for eight FMAs.
+    constexpr int kTileN = 128;
+    constexpr int kTileK = 128;
+    constexpr int kBatch = 16;
+    constexpr int kSlots = 4;
+    constexpr int kRowsPerThread = 2;
+    constexpr int kRoutesPerThread = kBatch / kSlots;
+    constexpr int kPerWord = 32 / kBits;
+    constexpr unsigned kMask = (1u << kBits) - 1u;
+    constexpr int kWordsPerTileK = kTileK / kPerWord;
+    static_assert(kTileK % kGroup == 0 || kGroup % kTileK == 0, "tile and group align");
+    static_assert(kTileN / kRowsPerThread * kSlots == 256, "one thread per (row pair, slot)");
+    const int expert = blockIdx.x;
+    if (expert >= num_experts) return;
+    const int row0 = blockIdx.y * kTileN;
+    if (row0 >= n) return;
+    const int begin = offsets[expert];
+    const int end = offsets[expert + 1];
+    if (begin >= end) return;
+    // The streamed seat counts routed rows: this expert's, once.
+    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
+        atomicAdd(group_hits, static_cast<unsigned>(end - begin));
+
+    const int groups_per_row = k / kGroup;
+    const int words_per_row = k / kPerWord;
+    const u8* codes_at = codes;
+    const u8* scales_at = scales;
+    const u8* biases_at = biases;
+    if (bases != nullptr) {
+        const MoeGroupBases seat = *bases;
+        codes_at = seat.codes;
+        scales_at = seat.scales;
+        biases_at = seat.biases;
+    }
+    const unsigned* w32 = reinterpret_cast<const unsigned*>(
+        codes_at + static_cast<long long>(expert) * n * words_per_row * 4);
+    const bf16* s16 = reinterpret_cast<const bf16*>(
+        scales_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+    const bf16* b16 = reinterpret_cast<const bf16*>(
+        biases_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+
+    __shared__ float w_tile[kTileN][kTileK + 1];
+    __shared__ float x_tile[kBatch][kTileK];
+    const int tid = threadIdx.x;
+    const int pair = tid % (kTileN / kRowsPerThread);
+    const int slot = tid / (kTileN / kRowsPerThread);
+    const int row_a = pair * kRowsPerThread;
+    const int row_b = row_a + 1;
+
+    for (int b0 = begin; b0 < end; b0 += kBatch) {
+        const int batch = min(kBatch, end - b0);
+        float acc[kRowsPerThread][kRoutesPerThread];
+#pragma unroll
+        for (int i = 0; i < kRowsPerThread; ++i)
+#pragma unroll
+            for (int j = 0; j < kRoutesPerThread; ++j) acc[i][j] = 0.f;
+        for (int k0 = 0; k0 < k; k0 += kTileK) {
+            // The chunk's weights, decoded: `code * scale + zero`.
+            for (int idx = tid; idx < kTileN * kWordsPerTileK; idx += blockDim.x) {
+                const int r = idx / kWordsPerTileK;
+                const int wq = idx % kWordsPerTileK;
+                const int kk = k0 + wq * kPerWord;
+                if (kk < k) {
+                    const int rr = min(row0 + r, n - 1);
+                    const int g = kk / kGroup;
+                    const long long fx = static_cast<long long>(rr) * groups_per_row + g;
+                    const float sv = Elem<bf16>::to_f32(s16[fx]);
+                    const float bv = Elem<bf16>::to_f32(b16[fx]);
+                    const unsigned word =
+                        w32[static_cast<long long>(rr) * words_per_row + kk / kPerWord];
+#pragma unroll
+                    for (int j = 0; j < kPerWord; ++j) {
+                        const float code = static_cast<float>((word >> (kBits * j)) & kMask);
+                        w_tile[r][wq * kPerWord + j] = fmaf(code, sv, bv);
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < kPerWord; ++j) w_tile[r][wq * kPerWord + j] = 0.f;
+                }
+            }
+            // The batch's activations for this chunk.
+            for (int idx = tid; idx < batch * kTileK; idx += blockDim.x) {
+                const int t = idx / kTileK;
+                const int kk = idx % kTileK;
+                const int plane_route = order[b0 + t];
+                const T* x = act + static_cast<long long>(plane_route / act_div) * k;
+                x_tile[t][kk] = k0 + kk < k ? Elem<T>::to_f32(x[k0 + kk]) : 0.f;
+            }
+            __syncthreads();
+            // Routes past `batch` read a stale activation row and are never
+            // written back, so the inner loop stays branch-free.
+#pragma unroll 4
+            for (int kk = 0; kk < kTileK; ++kk) {
+                const float wa = w_tile[row_a][kk];
+                const float wb = w_tile[row_b][kk];
+#pragma unroll
+                for (int j = 0; j < kRoutesPerThread; ++j) {
+                    const float xv = x_tile[slot + kSlots * j][kk];
+                    acc[0][j] = fmaf(wa, xv, acc[0][j]);
+                    acc[1][j] = fmaf(wb, xv, acc[1][j]);
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int j = 0; j < kRoutesPerThread; ++j) {
+            const int t = slot + kSlots * j;
+            if (t < batch) {
+                const int plane_route = order[b0 + t];
+                T* o = out + static_cast<long long>(plane_route) * n + row0;
+                if (row0 + row_a < n) o[row_a] = Elem<T>::from_f32(acc[0][j]);
+                if (row0 + row_b < n) o[row_b] = Elem<T>::from_f32(acc[1][j]);
+            }
+        }
+    }
+}
+
+// **THE GROUPED AFFINE SELECT ON TENSOR CORES** — the grouped kernel
+// above with the arithmetic on `mma.sync` (bf16 × bf16 → fp32) through the
+// plane's own wmma shim (`prelude/mma.cuh`, the one `moe.cuh`'s bf16
+// selects use). The block is one expert × 128 bank rows, eight warps each
+// owning sixteen rows; it takes the expert's routes thirty-two at a time
+// (two 16-route mma batches, two accumulators a warp), and per 128-wide K
+// chunk decodes the weights to bf16 in shared memory ONCE — the
+// dequantized weight transformers itself holds — stages the thirty-two
+// activation rows beside them, and walks the chunk in 16×16×16 steps with
+// each weight fragment applied to both batches. (Sixty-four rows × four
+// batches was tried: the smaller blocks and the activation staging cost
+// more than the decode they saved — 1.9 ms a call against 1.4.) Routes
+// past the group and rows past N see zeros and are not written. Only for
+// a bf16 activation; f16 takes the fp32 kernel.
+template <int kBits, int kGroup>
+__global__ void moe_matmul_select_mlxu4_wmma(
+    const bf16* __restrict__ act,
+    const i32* __restrict__ order,
+    const i32* __restrict__ offsets,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const u8* __restrict__ biases,
+    bf16* __restrict__ out,
+    int act_div,
+    int n,
+    int k,
+    int num_experts,
+    const MoeGroupBases* __restrict__ bases,
+    unsigned int* __restrict__ group_hits)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    namespace wmma = ::nvcuda::wmma;
+    constexpr int kTileN = 128;
+    constexpr int kTileK = 128;
+    constexpr int kBatch = 16;
+    constexpr int kBatches = 2;
+    constexpr int kRoutes = kBatch * kBatches;
+    constexpr int kLd = kTileK + 8;
+    constexpr int kWarps = kTileN / 16;
+    constexpr int kPerWord = 32 / kBits;
+    constexpr unsigned kMask = (1u << kBits) - 1u;
+    static_assert(kRoutes * kLd * 2 >= kWarps * 16 * 16 * 4, "the C tiles fit where the activations were");
+    const int expert = blockIdx.x;
+    if (expert >= num_experts) return;
+    const int row0 = blockIdx.y * kTileN;
+    if (row0 >= n) return;
+    const int begin = offsets[expert];
+    const int end = offsets[expert + 1];
+    if (begin >= end) return;
+    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0)
+        atomicAdd(group_hits, static_cast<unsigned>(end - begin));
+
+    const int groups_per_row = k / kGroup;
+    const int words_per_row = k / kPerWord;
+    const u8* codes_at = codes;
+    const u8* scales_at = scales;
+    const u8* biases_at = biases;
+    if (bases != nullptr) {
+        const MoeGroupBases seat = *bases;
+        codes_at = seat.codes;
+        scales_at = seat.scales;
+        biases_at = seat.biases;
+    }
+    const unsigned* w32 = reinterpret_cast<const unsigned*>(
+        codes_at + static_cast<long long>(expert) * n * words_per_row * 4);
+    const bf16* s16 = reinterpret_cast<const bf16*>(
+        scales_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+    const bf16* b16 = reinterpret_cast<const bf16*>(
+        biases_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+
+    __shared__ __align__(32) bf16 w_tile[kTileN][kLd];
+    __shared__ __align__(32) bf16 x_tile[kRoutes][kLd];
+    float* c_tile = reinterpret_cast<float*>(&x_tile[0][0]);
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const bf16 zero = f32_to_bf16(0.f);
+
+    // Per thread and chunk: two weight quads (16 bytes of codes each, with
+    // their scale and zero point) and two activation vectors (eight bf16
+    // each), fetched for the NEXT chunk while this chunk's mma runs, so
+    // the loads' latency hides behind the arithmetic — two blocks fit an
+    // SM at this shared footprint, too few warps to hide it otherwise.
+    constexpr int kQuadWords = 4;
+    constexpr int kQuadCodes = kQuadWords * kPerWord;
+    constexpr int kQuadsPerTileK = kTileK / kQuadCodes;
+    constexpr int kQuadsPerThread = kTileN * kQuadsPerTileK / 256;
+    constexpr int kVec = 8;
+    constexpr int kVecsPerTileK = kTileK / kVec;
+    constexpr int kVecsPerThread = kRoutes * kVecsPerTileK / 256;
+    static_assert(kGroup % kQuadCodes == 0, "a quad lies within one group");
+    static_assert(kTileN * kQuadsPerTileK % 256 == 0 && kRoutes * kVecsPerTileK % 256 == 0, "even split");
+    struct Staged {
+        uint4 quad[kQuadsPerThread];
+        float scale[kQuadsPerThread];
+        float zero[kQuadsPerThread];
+        bool quad_live[kQuadsPerThread];
+        uint4 vec[kVecsPerThread];
+    };
+
+    for (int g0 = begin; g0 < end; g0 += kRoutes) {
+        const int group = min(kRoutes, end - g0);
+        const int batches = (group + kBatch - 1) / kBatch;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[kBatches];
+#pragma unroll
+        for (int b = 0; b < kBatches; ++b) wmma::fill_fragment(acc[b], 0.0f);
+
+        // Fetch chunk `k0`'s share of this thread into `st`. Only whole
+        // quads and vectors inside K and N are fetched; the rest is zeroed
+        // at store time (the ragged tail of K is at most a chunk and is
+        // decoded word by word there).
+        auto fetch = [&](int k0, Staged& st) {
+#pragma unroll
+            for (int i = 0; i < kQuadsPerThread; ++i) {
+                const int idx = tid + i * 256;
+                const int r = idx / kQuadsPerTileK;
+                const int q = idx % kQuadsPerTileK;
+                const int kk = k0 + q * kQuadCodes;
+                const int rr = row0 + r;
+                st.quad_live[i] = kk + kQuadCodes <= k && rr < n;
+                if (st.quad_live[i]) {
+                    const long long fx = static_cast<long long>(rr) * groups_per_row + kk / kGroup;
+                    st.scale[i] = Elem<bf16>::to_f32(s16[fx]);
+                    st.zero[i] = Elem<bf16>::to_f32(b16[fx]);
+                    st.quad[i] = *reinterpret_cast<const uint4*>(
+                        w32 + static_cast<long long>(rr) * words_per_row + kk / kPerWord);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < kVecsPerThread; ++i) {
+                const int idx = tid + i * 256;
+                const int t = idx / kVecsPerTileK;
+                const int v = idx % kVecsPerTileK;
+                const int kk = k0 + v * kVec;
+                st.vec[i] = make_uint4(0u, 0u, 0u, 0u);
+                if (t < group && kk + kVec <= k) {
+                    const int plane_route = order[g0 + t];
+                    st.vec[i] = *reinterpret_cast<const uint4*>(
+                        act + static_cast<long long>(plane_route / act_div) * k + kk);
+                }
+            }
+        };
+        // Decode and store chunk `k0` from `st` into the tiles.
+        auto store = [&](int k0, const Staged& st) {
+#pragma unroll
+            for (int i = 0; i < kQuadsPerThread; ++i) {
+                const int idx = tid + i * 256;
+                const int r = idx / kQuadsPerTileK;
+                const int q = idx % kQuadsPerTileK;
+                unsigned* dst = reinterpret_cast<unsigned*>(&w_tile[r][q * kQuadCodes]);
+                if (st.quad_live[i]) {
+                    const unsigned words[kQuadWords] = {st.quad[i].x, st.quad[i].y, st.quad[i].z, st.quad[i].w};
+#pragma unroll
+                    for (int w = 0; w < kQuadWords; ++w) {
+#pragma unroll
+                        for (int j = 0; j < kPerWord; j += 2) {
+                            const float c0 = static_cast<float>((words[w] >> (kBits * j)) & kMask);
+                            const float c1 = static_cast<float>((words[w] >> (kBits * (j + 1))) & kMask);
+                            dst[(w * kPerWord + j) / 2] = pack_bf16x2(
+                                fmaf(c0, st.scale[i], st.zero[i]), fmaf(c1, st.scale[i], st.zero[i]));
+                        }
+                    }
+                } else {
+                    // The ragged tail of K, word by word; zeros past K or N.
+                    const int kk = k0 + q * kQuadCodes;
+                    const int rr = row0 + r;
+#pragma unroll
+                    for (int w = 0; w < kQuadWords; ++w) {
+                        const int kw = kk + w * kPerWord;
+                        if (kw < k && rr < n) {
+                            const long long fx = static_cast<long long>(rr) * groups_per_row + kw / kGroup;
+                            const float sv = Elem<bf16>::to_f32(s16[fx]);
+                            const float bv = Elem<bf16>::to_f32(b16[fx]);
+                            const unsigned word =
+                                w32[static_cast<long long>(rr) * words_per_row + kw / kPerWord];
+#pragma unroll
+                            for (int j = 0; j < kPerWord; ++j) {
+                                const float code = static_cast<float>((word >> (kBits * j)) & kMask);
+                                w_tile[r][q * kQuadCodes + w * kPerWord + j] = f32_to_bf16(fmaf(code, sv, bv));
+                            }
+                        } else {
+#pragma unroll
+                            for (int j = 0; j < kPerWord; ++j)
+                                w_tile[r][q * kQuadCodes + w * kPerWord + j] = zero;
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < kVecsPerThread; ++i) {
+                const int idx = tid + i * 256;
+                const int t = idx / kVecsPerTileK;
+                const int v = idx % kVecsPerTileK;
+                *reinterpret_cast<uint4*>(&x_tile[t][v * kVec]) = st.vec[i];
+            }
+            // A K tail narrower than a vector, element by element.
+            const int tail = k - k0;
+            if (tail < kTileK && (tail % kVec) != 0) {
+                const int from = (tail / kVec) * kVec;
+                for (int idx = tid; idx < kRoutes * (kTileK - from); idx += blockDim.x) {
+                    const int t = idx / (kTileK - from);
+                    const int kk = from + idx % (kTileK - from);
+                    bf16 vv = zero;
+                    if (t < group && k0 + kk < k) {
+                        const int plane_route = order[g0 + t];
+                        vv = act[static_cast<long long>(plane_route / act_div) * k + k0 + kk];
+                    }
+                    x_tile[t][kk] = vv;
+                }
+            }
+        };
+
+        Staged staged;
+        fetch(0, staged);
+        for (int k0 = 0; k0 < k; k0 += kTileK) {
+            store(k0, staged);
+            __syncthreads();
+            if (k0 + kTileK < k) fetch(k0 + kTileK, staged);
+#pragma unroll
+            for (int kk = 0; kk < kTileK; kk += 16) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+                wmma::load_matrix_sync(
+                    b, reinterpret_cast<const __nv_bfloat16*>(&w_tile[warp * 16][kk]), kLd);
+#pragma unroll
+                for (int bt = 0; bt < kBatches; ++bt) {
+                    if (bt < batches) {
+                        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+                        wmma::load_matrix_sync(
+                            a, reinterpret_cast<const __nv_bfloat16*>(&x_tile[bt * kBatch][kk]), kLd);
+                        wmma::mma_sync(acc[bt], a, b, acc[bt]);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        // The activations are spent; their tile holds the C tiles now.
+        for (int bt = 0; bt < batches; ++bt) {
+            wmma::store_matrix_sync(c_tile + warp * 16 * 16, acc[bt], 16, wmma::mem_row_major);
+            __syncthreads();
+            for (int idx = lane; idx < 16 * 16; idx += 32) {
+                const int m = idx / 16;
+                const int nn = idx % 16;
+                const int t = bt * kBatch + m;
+                const int row = row0 + warp * 16 + nn;
+                if (t < group && row < n) {
+                    const int plane_route = order[g0 + t];
+                    out[static_cast<long long>(plane_route) * n + row] =
+                        f32_to_bf16(c_tile[warp * 16 * 16 + idx]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+#endif
+}
+
 // **THE AFFINE TWIN** — MLX's 4-bit codes, eight to a `u32` word, sixty-four
 // under one bf16 scale and one bf16 zero point (`code * scale + bias`). The
 // zero point folds through the group's activation sum, so each activation is
@@ -823,6 +1288,7 @@ template <class T, int kBits, int kGroup, int kRowsT>
 __global__ void moe_matmul_select_mlxu4(
     const T* __restrict__ act,
     const i32* __restrict__ routes,
+    const i32* __restrict__ order,
     const u8* __restrict__ codes,
     const u8* __restrict__ scales,
     const u8* __restrict__ biases,
@@ -1208,16 +1674,23 @@ __global__ void dequant_affine(
 
     const unsigned word = reinterpret_cast<const unsigned*>(codes)[at];
     bf16* dst = out + static_cast<long long>(row) * k + word_in_row * kPerWord;
+    // Pairs of codes, one packed bf16x2 store each: a word's codes are an
+    // even count and the row is a whole number of words, so `dst` is
+    // 4-byte aligned.
+    unsigned int* dst2 = reinterpret_cast<unsigned int*>(dst);
 #pragma unroll
-    for (int j = 0; j < kPerWord; ++j) {
-        const float code = static_cast<float>((word >> (kBits * j)) & kMask);
-        float v;
-        if constexpr (kOffset == kOffPost) {
-            v = fmaf(code, sv, off);
-        } else {
-            v = sv * (code - off);
+    for (int j = 0; j < kPerWord; j += 2) {
+        float v[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const float code = static_cast<float>((word >> (kBits * (j + h))) & kMask);
+            if constexpr (kOffset == kOffPost) {
+                v[h] = fmaf(code, sv, off);
+            } else {
+                v[h] = sv * (code - off);
+            }
         }
-        dst[j] = f32_to_bf16(v);
+        dst2[j / 2] = pack_bf16x2(v[0], v[1]);
     }
 }
 
