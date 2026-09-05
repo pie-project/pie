@@ -1088,7 +1088,7 @@ impl Model {
             // the convolution; everything else below is one text.
             let v2 = matches!(recipe, Recipe::DFlash2);
             let taps: &[u32] = if v2 { &DFLASH2_TAPS } else { &DFLASH_TAPS };
-            let groups = u64::from(hidden) / u64::from(DFLASH2_CONV_GROUP);
+            let groups = hidden / u64::from(DFLASH2_CONV_GROUP);
             let conv = |l: u32, which: &str| {
                 v2.then(|| DynConv {
                     base: Weight::sym(
