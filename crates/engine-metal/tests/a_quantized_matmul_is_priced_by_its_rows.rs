@@ -43,7 +43,13 @@
 //!   against the bank's 45, so halving the tile count should halve that):
 //!   497 -> 539 us at sixteen rows, 874 -> 925 at thirty-two, 346 -> 451 at
 //!   eight; N=5120 and N=1024 the same way. Reuse is not what the tile is
-//!   short of — threadgroups are, and a wider tile has fewer of them.
+//!   short of.
+//! - **`BN = 16`** (the converse, twice the threadgroups, forced through
+//!   `PIE_QMM_TUNING=qmm_bn_crossover_tg=1000000`): 496 -> 528 us at sixteen
+//!   rows, 879 -> 940 at thirty-two. So BN = 32 is the optimum from BOTH
+//!   sides, and the tile is not threadgroup-count-bound in any simple way
+//!   either — what is left is the per-threadgroup loader, which no host-side
+//!   knob reaches and which wants a GPU capture.
 //!
 //! So the sixteen-row cost is not a tiling-parameter choice. What is left
 //! unmeasured is the QUANTIZED WEIGHT LOADER's own read efficiency — 90 GB/s
