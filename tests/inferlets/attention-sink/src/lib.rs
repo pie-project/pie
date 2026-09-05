@@ -8,7 +8,6 @@ use inferlet::chat;
 use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 
-const PAGE_T: u32 = 16;
 
 #[derive(Deserialize)]
 struct Input {
@@ -52,6 +51,15 @@ async fn main(input: Input) -> Result<String> {
 
     let sink = input.sink_size;
     let window = input.window_size.max(1);
+    // **THE PAGE SIZE IS THE ENGINE'S, NOT A LITERAL.** This file carried
+    // `const page_t: u32 = 16` and every `w_slot`/`w_off` it derived was
+    // wrong on a model whose pages are any other width: the writes land in
+    // the wrong page at the wrong offset, the reads pull cells nothing wrote,
+    // and the pass answers fluent-looking garbage rather than failing — which
+    // is exactly what `_attends_prompt` in the curated suite exists to catch.
+    // `sliding-window-attention`, structurally this file's twin, reads it and
+    // passes.
+    let page_t = model::kv_page_size();
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     prompt.extend(chat::cue());
@@ -60,8 +68,8 @@ async fn main(input: Input) -> Result<String> {
     }
     let n = prompt.len() as u32;
     let stop_tokens = chat::stop_tokens();
-    let pool_pages = (n + input.max_tokens as u32 + 2).div_ceil(PAGE_T);
-    let pool_len = pool_pages * PAGE_T;
+    let pool_pages = (n + input.max_tokens as u32 + 2).div_ceil(page_t);
+    let pool_len = pool_pages * page_t;
 
     let ws = WorkingSet::new();
     let slots = ws
@@ -73,15 +81,15 @@ async fn main(input: Input) -> Result<String> {
     let prefill_embed_indptr = Channel::from([0u32, n]).named("prefill_embed_indptr");
     let prefill_positions = Channel::from_iter(0..n).named("prefill_positions");
     let prefill_slots =
-        Channel::from_iter((0..n).map(|position| pool_ids[(position / PAGE_T) as usize]));
-    let prefill_offsets = Channel::from_iter((0..n).map(|position| position % PAGE_T));
+        Channel::from_iter((0..n).map(|position| pool_ids[(position / page_t) as usize]));
+    let prefill_offsets = Channel::from_iter((0..n).map(|position| position % page_t));
     let prefill_klen = Channel::from([n]);
     let prefill_pages = Channel::from(pool_ids.clone());
     // The page CSR is the wire's source of truth for kv_len: the engine derives
-    // `kv_len = (page_count-1)*PAGE_T + last_page_len`. A pool-wide constant page
+    // `kv_len = (page_count-1)*page_t + last_page_len`. A pool-wide constant page
     // count claims a kv length the pass does not have and silently corrupts
     // attention, so the count must track `kv_len` exactly.
-    let prefill_indptr = Channel::from([0u32, n.div_ceil(PAGE_T)]);
+    let prefill_indptr = Channel::from([0u32, n.div_ceil(page_t)]);
     let causal = Channel::from_shaped(
         [n, pool_len],
         (0..n)
@@ -134,14 +142,14 @@ async fn main(input: Input) -> Result<String> {
     let position = Channel::from([n]).named("position");
     let fill = Channel::from([n + 1]).named("fill");
     let klen = Channel::from([n + 1]).named("klen");
-    let write_slot = Channel::from([pool_ids[(n / PAGE_T) as usize]]);
-    let write_offset = Channel::from([n % PAGE_T]);
+    let write_slot = Channel::from([pool_ids[(n / page_t) as usize]]);
+    let write_offset = Channel::from([n % page_t]);
     let mask = Channel::from_shaped(
         [1, pool_len],
         host_sink_window_mask(pool_len, n, sink, window),
     );
     let pages = Channel::from(pool_ids.clone());
-    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]);
+    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_t)]);
     let pool_ids_input = Channel::from(pool_ids.clone()).named("pool_ids");
     let token_out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
@@ -172,7 +180,7 @@ async fn main(input: Input) -> Result<String> {
             sink_window_mask(&base, pool_len, sink, window),
             [1, pool_len],
         );
-        let logical_slot = &base / PAGE_T;
+        let logical_slot = &base / page_t;
         let next = &base + 1u32;
 
         // Device-resolved geometry is loop-carried: the host never drains
@@ -183,10 +191,10 @@ async fn main(input: Input) -> Result<String> {
         fill.put(&next);
         klen.put(&next);
         write_slot.put(gather(&ids, &logical_slot));
-        write_offset.put(&base % PAGE_T);
+        write_offset.put(&base % page_t);
         mask.put(&next_mask);
         pages.put(reshape(&ids, [pool_pages]));
-        let page_count = next.div_ceil(PAGE_T);
+        let page_count = next.div_ceil(page_t);
         page_indptr.put(indptr(1, &page_count));
         pool_ids_input.put(&ids);
     });

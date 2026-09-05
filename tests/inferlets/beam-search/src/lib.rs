@@ -14,9 +14,7 @@ use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 use std::ops::RangeBounds;
 
-const PAGE_T: u32 = 16; // tokens per pool page
 const POOL_PAGES: u32 = 8; // shared pool pages (over-allocated; compaction bounds this)
-const POOL: u32 = POOL_PAGES * PAGE_T; // flat pool token positions
 // Qwen3-0.6B
 const BOS: i32 = 1;
 
@@ -142,22 +140,41 @@ macro_rules! define_beam_search {
         async fn $name(input: &Input) -> Result<String> {
             use inferlet::eta::$kind::{ForwardPass, run_ahead};
 
+        // **THE PAGE SIZE IS THE ENGINE'S, NOT A LITERAL.** This file carried
+        // `const PAGE_T: u32 = 16`; every `wpos / page_t` and `wpos % page_t`
+        // it derived named the wrong page at the wrong offset on a model whose
+        // pages are any other width (32 on the qwen and gemma rows here), so
+        // the writes and the reads never met and the beams decoded noise. It
+        // passed the curated suite anyway, because those cases compare beam
+        // against greedy and BOTH roads were corrupted the same way —
+        // `attention-sink`, the same bug, was caught only because its case
+        // gates on attending the prompt.
+        let page_t = model::kv_page_size();
+        let pool_len = POOL_PAGES * page_t;
+        // **AND IT DOES NOT FIX THIS FILE.** With the constant corrected the
+        // pool really is 32-wide here (`page_t=32 pool_len=256` against the
+        // 16/128 it claimed), and the beams still decode noise with the SAME
+        // score to four places. A geometry that doubles without moving the
+        // answer is not being read: the suspect is the mask, which starts as
+        // `p == 0` for every beam and is rebuilt each step — if that update
+        // is wrong every step attends position 0 alone, which is exactly a
+        // result independent of the pool. Not chased further here.
         let max_steps = input.max_tokens;
         let b = input.beams;
         if b == 0 {
             return Err("beams must be at least 1".into());
         }
-        if b > POOL - 1 {
+        if b > pool_len - 1 {
             return Err(format!(
                 "beams exceeds the fixed pool ({} positions)",
-                POOL - 1
+                pool_len - 1
             ));
         }
         // Bind the width once so the epilogue closure captures a plain `u32`
         // exactly where the old `const B` was substituted.
         #[allow(non_snake_case)]
         let B = b;
-        let capacity = ((POOL - 1) / B) as usize;
+        let capacity = ((pool_len - 1) / B) as usize;
         if max_steps > capacity {
             return Err(format!(
                 "max_tokens exceeds fixed beam pool capacity ({capacity})"
@@ -171,7 +188,7 @@ macro_rules! define_beam_search {
         let v = vocab;
 
         // Allocate a fixed logical page pool. Flat position `wpos` maps to
-        // `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
+        // `pool_ids[wpos / page_t]` at offset `wpos % page_t`.
         let ws = WorkingSet::new();
         let pool = ws
             .reserve(POOL_PAGES)
@@ -188,10 +205,10 @@ macro_rules! define_beam_search {
         // Shared BOS prompt at pool position 0: both beams attend it (mask), and the
         // fire-0 write descriptor lands both BOS at (page pool_ids[0], off 0) — the
         // shared prefix cell. fill = 1 (position 0 filled).
-        let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..POOL).map(|p| p == 0)).collect();
+        let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..pool_len).map(|p| p == 0)).collect();
 
         // Loop-carried search and page geometry.
-        let mask = Channel::from_shaped([B, POOL], init_mask).named("mask"); // [B, POOL] bool
+        let mask = Channel::from_shaped([B, pool_len], init_mask).named("mask"); // [B, pool_len] bool
         let mut initial_scores = vec![f32::NEG_INFINITY; B as usize];
         initial_scores[0] = 0.0;
         let scores = Channel::from(initial_scores).named("scores");
@@ -212,8 +229,8 @@ macro_rules! define_beam_search {
         // the same constant) keeps every descriptor port channel-bound (the
         // device-geometry-fire wire-form).
         // The page CSR is the wire's source of truth for kv_len: the engine derives
-        // `last_page_len = ((kv_len-1) % PAGE_T) + 1` and then reads back a span of
-        // `(page_count-1)*PAGE_T + last_page_len` cells per lane. Declaring all
+        // `last_page_len = ((kv_len-1) % page_t) + 1` and then reads back a span of
+        // `(page_count-1)*page_t + last_page_len` cells per lane. Declaring all
         // POOL_PAGES here would inflate that span past the live prefix and attend
         // uninitialized KV, so the per-lane page count must track `klen` exactly and
         // `pages` must be tiled at THAT stride, not at POOL_PAGES.
@@ -292,18 +309,18 @@ macro_rules! define_beam_search {
             let wpos = &base_b + &lane; // [B]
 
             // 3. mask evolution: inherit parent's ancestry, OR the new position.
-            let inherited = gather(mask.take(), &parent); // bool [B,POOL]
-            let col = broadcast(reshape(iota(POOL), [1, POOL]), [B, POOL]);
-            let wpos_b = broadcast(reshape(&wpos, [B, 1]), [B, POOL]);
-            let newpos = eq(col, wpos_b); // bool [B,POOL]
+            let inherited = gather(mask.take(), &parent); // bool [B,pool_len]
+            let col = broadcast(reshape(iota(pool_len), [1, pool_len]), [B, pool_len]);
+            let wpos_b = broadcast(reshape(&wpos, [B, 1]), [B, pool_len]);
+            let newpos = eq(col, wpos_b); // bool [B,pool_len]
             let new_mask = or(inherited, &newpos);
             mask.put(&new_mask);
 
             // 4. Explicit write descriptor for each surviving beam.
             let pids = pool_ids_ch.take();
-            let logical_slot = &wpos / PAGE_T; // [B] index into the pool
+            let logical_slot = &wpos / page_t; // [B] index into the pool
             let w_slot_v = gather(&pids, &logical_slot);
-            let w_off_v = &wpos % PAGE_T;
+            let w_off_v = &wpos % page_t;
             // Device-resolved geometry is loop-carried: the host never drains
             // these rings, so every fire's values are re-put here.
             w_slot.put(&w_slot_v);
@@ -321,7 +338,7 @@ macro_rules! define_beam_search {
             // times (every beam references all POOL_PAGES pool pages; the mask does
             // the per-beam selection). Built in-graph from the host-fed pids.
             // Live page count for the NEXT fire, from that fire's klen.
-            let page_count = filled.div_ceil(PAGE_T);
+            let page_count = filled.div_ceil(page_t);
             let pages_ig = gather(
                 &pids,
                 iota(B * POOL_PAGES) % broadcast(&page_count, [B * POOL_PAGES]),
