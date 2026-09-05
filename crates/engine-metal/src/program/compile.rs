@@ -31,6 +31,71 @@ const KERNEL_FUSED: KernelKind = KernelKind::Fused;
 /// is 30), and vocabulary-width gathers split across a threadgroup.
 const KERNEL_GROUPED: KernelKind = KernelKind::Grouped;
 
+/// A region holding a value this wide goes to the grouped form even without
+/// an intrinsic gather: the runtime partitions every element-independent op
+/// and both fixed-tree reductions across the lane's threadgroup
+/// (`ptir_m1_execute_part`), so a vocabulary-wide softmax, mask or sum no
+/// longer walks its row on one thread. Below this width the single-lane form
+/// is as fast and skips the lane table.
+const WIDE_REGION_ELEMENTS: u32 = 256;
+
+/// How many elements an op's result holds; a scalar is one.
+fn op_width(op: &eta_compiler::codegen::launch::LaunchOp) -> u32 {
+    op.shape
+        .iter()
+        .try_fold(1u32, |acc, &dim| acc.checked_mul(dim))
+        .unwrap_or(u32::MAX)
+}
+
+/// How many ops a fused region holds.
+fn region_ops(plan: &LaunchStagePlan, region_index: u32) -> usize {
+    plan.fused
+        .get(region_index as usize)
+        .map_or(0, |region| region.nodes.len())
+}
+
+/// The op tags of a fused region, in order, as the wire spells them.
+fn region_tags(plan: &LaunchStagePlan, region_index: u32) -> String {
+    plan.fused
+        .get(region_index as usize)
+        .map(|region| {
+            region
+                .nodes
+                .iter()
+                .filter_map(|&node| plan.ops.get(node as usize))
+                .map(|op| match op.intrinsic {
+                    Some(id) => format!("{:#04x}[{id:?}]", op.tag),
+                    None => format!("{:#04x}", op.tag),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+/// The widest value a fused region computes, in elements.
+fn region_widest(plan: &LaunchStagePlan, region_index: u32) -> u32 {
+    plan.fused
+        .get(region_index as usize)
+        .map_or(0, |region| {
+            region
+                .nodes
+                .iter()
+                .filter_map(|&node| plan.ops.get(node as usize))
+                .map(op_width)
+                .max()
+                .unwrap_or(0)
+        })
+}
+
+/// `PIE_REGION_TRACE=1`: one line per compiled region naming the form it
+/// took, and why the grouped one was declined when it was. The decline reason
+/// otherwise reaches nobody: the shell falls back to the single-lane kernel
+/// and nothing says so.
+fn region_trace() -> bool {
+    std::env::var_os("PIE_REGION_TRACE").is_some_and(|v| v != "0")
+}
+
 /// Which emitted form a compiled region is; fixed at compile time, since the
 /// pipeline was built for one of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -457,11 +522,30 @@ impl Cache {
             let grouped_declined =
                 match self.grouped_region(context, stage_index, region_index, plan, index)? {
                     GroupedAnswer::Served(region) => {
+                        if region_trace() {
+                            eprintln!(
+                                "region: stage {stage_index} region {region_index} takes the \
+                                 {:?} form ({} op(s), widest value {} element(s)): {}",
+                                region.form,
+                                region_ops(plan, region_index),
+                                region_widest(plan, region_index),
+                                region_tags(plan, region_index),
+                            );
+                        }
                         regions.push(region);
                         continue;
                     }
                     GroupedAnswer::Declined(why) => why,
                 };
+            if region_trace() {
+                eprintln!(
+                    "region: stage {stage_index} region {region_index} falls back to the \
+                     single-lane form ({} op(s), widest value {} element(s)): {}: {grouped_declined}",
+                    region_ops(plan, region_index),
+                    region_widest(plan, region_index),
+                    region_tags(plan, region_index),
+                );
+            }
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
                 Slot::Kernel { source, entry } => (source, entry),
                 // A declined region has no fallback path; skipping it would
@@ -553,13 +637,20 @@ impl Cache {
                     .is_some_and(|op| op.intrinsic.is_some())
             })
         });
-        if !(library || refused || gathers) {
-            return Ok(GroupedAnswer::Declined(
+        let wide = region.is_some_and(|region| {
+            region.nodes.iter().any(|&node| {
+                plan.ops
+                    .get(node as usize)
+                    .is_some_and(|op| op_width(op) >= WIDE_REGION_ELEMENTS)
+            })
+        });
+        if !(library || refused || gathers || wide) {
+            return Ok(GroupedAnswer::Declined(format!(
                 "this shell keeps a region on the single-lane form unless the grouped \
-                 one buys something: a library sampler, a refusal to route around, or \
-                 an intrinsic gather. This region is none of the three"
-                    .to_string(),
-            ));
+                 one buys something: a library sampler, a refusal to route around, an \
+                 intrinsic gather, or a value of at least {WIDE_REGION_ELEMENTS} elements \
+                 to split across the threadgroup. This region is none of the four"
+            )));
         }
         // The grouped table names a fused region at `singleton.len() + i`.
         let slot = match u32::try_from(plan.singleton.len())
