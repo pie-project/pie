@@ -1022,62 +1022,6 @@ fn lay_out(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Result<Layout> 
     let rows = region_rows(plan, descriptors);
     let lifetimes = value_lifetimes(plan, &rows);
     let floor = temporary_floor(plan, descriptors, &rows);
-    if std::env::var_os("PIE_ETA_REGIONS").is_some() {
-        // A reading aid, not a contract: the stage's regions as this shell
-        // launches them, with the bytes each one's values name.
-        eprintln!(
-            "[eta-regions] ops={} values={} regions={} temporary_floor={}",
-            plan.ops.len(),
-            plan.value_types.len(),
-            plan.fused.len(),
-            floor
-        );
-        for (index, (region, &blocks)) in plan.fused.iter().zip(&rows).enumerate() {
-            let tags: Vec<String> = region
-                .nodes
-                .iter()
-                .filter_map(|&n| plan.ops.get(n as usize).map(|op| format!("{:02x}", op.tag)))
-                .collect();
-            let named: u64 = region
-                .nodes
-                .iter()
-                .filter_map(|&n| plan.ops.get(n as usize))
-                .flat_map(|op| op.args.iter().copied().chain((0..u32::from(op.result_count)).map(move |r| op.result_id + r)))
-                .collect::<std::collections::BTreeSet<u32>>()
-                .into_iter()
-                .filter_map(|v| descriptors.get(v as usize))
-                .map(ValueDesc::device_bytes)
-                .sum();
-            eprintln!(
-                "[eta-regions]  r{index} {:?} blocks/lane={blocks} nodes={} named={}MB tags=[{}]",
-                region.kind,
-                region.nodes.len(),
-                named >> 20,
-                tags.join(" ")
-            );
-            if blocks == 1 && named >> 20 > 0 {
-                // A one-block region naming megabytes: say what its ops see.
-                for &n in &region.nodes {
-                    let Some(op) = plan.ops.get(n as usize) else { continue };
-                    let axes = |v: u32| {
-                        plan.value_types
-                            .get(v as usize)
-                            .map(|t| format!("v{v}:{:?}", t.axes))
-                            .unwrap_or_default()
-                    };
-                    let args: Vec<String> = op.args.iter().map(|&v| axes(v)).collect();
-                    let results: Vec<String> =
-                        (0..u32::from(op.result_count)).map(|r| axes(op.result_id + r)).collect();
-                    eprintln!(
-                        "[eta-regions]    n{n} {:02x} args=[{}] results=[{}]",
-                        op.tag,
-                        args.join(", "),
-                        results.join(", ")
-                    );
-                }
-            }
-        }
-    }
     match lifetimes {
         Some(lifetimes) => layout_reusing(descriptors, &lifetimes, floor),
         None => layout(descriptors),
