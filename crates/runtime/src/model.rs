@@ -290,6 +290,12 @@ pub const ROWS: &[Row] = &[
         arch: "qwen3_5",
     },
     Row {
+        id: "qwen38-27b-dspark-u4g64-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
         id: "qwen38-27b-mtp-u4g64-kv-bf16",
         layers: 64,
         vocab: 248_320,
@@ -689,6 +695,7 @@ pub struct EtaCaps {
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_bidirectional: bool,
+    pub draft_proposals_from: u32,
     pub has_value_head: bool,
     /// Backend can execute the `envelope_dot` second-party kernel (Quest).
     pub has_kv_envelopes: bool,

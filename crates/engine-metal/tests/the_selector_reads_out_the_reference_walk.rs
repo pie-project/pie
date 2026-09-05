@@ -187,20 +187,24 @@ fn the_walk_picks_what_the_reference_picks() {
         data: Tensor::new(hc, rows, K, Dtype::I32),
         indptr: Tensor::new(hp_indptr, indptr.len() as u32, 1, Dtype::I32),
     };
-    dev.run(&|sink| {
-        selector::walk(
-            sink,
-            candt,
-            Tensor::new(hu, rows, K, Dtype::F32),
-            Tensor::new(hh, rows, RANK, Dtype::Bf16),
-            Tensor::new(ht, rows, 1, Dtype::I32),
-            Tensor::new(ha, VOCAB, RANK, Dtype::Bf16),
-            Tensor::new(hbk, VOCAB, RANK, Dtype::Bf16),
-            Tensor::new(ho, rows, 1, Dtype::I32),
-        )
-        .expect("the walk");
-    });
-    let picks = i32s(&dev.read(ho, u64::from(rows) * 4));
+    let walk = |dev: &Dev, hp: Option<Tensor>, first: u32| {
+        dev.run(&|sink| {
+            selector::walk(
+                sink,
+                candt,
+                Tensor::new(hu, rows, K, Dtype::F32),
+                hp,
+                Tensor::new(ht, rows, 1, Dtype::I32),
+                Tensor::new(ha, VOCAB, RANK, Dtype::Bf16),
+                Tensor::new(hbk, VOCAB, RANK, Dtype::Bf16),
+                first,
+                Tensor::new(ho, rows, 1, Dtype::I32),
+            )
+            .expect("the walk");
+        });
+        i32s(&dev.read(ho, u64::from(rows) * 4))
+    };
+    let picks = walk(&dev, Some(Tensor::new(hh, rows, RANK, Dtype::Bf16)), 1);
 
     // The reference walk, and the unary-only walk it must differ from.
     let mut want = vec![0i32; rows as usize];
@@ -244,4 +248,33 @@ fn the_walk_picks_what_the_reference_picks() {
     assert_eq!(picks, want, "the walk parts from the reference");
     assert_ne!(picks, unary_only, "the walk is the unary argmax");
     eprintln!("walk: {} rows over two requests agree with the reference; the bilinear decided at least one slot", rows);
+
+    // The bigram form (DSpark's markov head): no hidden term, and every row a
+    // slot — the anchor row's predecessor is its own token.
+    let picks = walk(&dev, None, 0);
+    let mut want = vec![0i32; rows as usize];
+    for (r, &span) in SPANS.iter().enumerate() {
+        let begin = indptr[r] as usize;
+        let mut prev = tokens[begin] as usize;
+        for row in begin..begin + span as usize {
+            let mut best = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for c in 0..k {
+                let cid = cand[row * k + c] as usize;
+                let mut dot = 0.0f32;
+                for d in 0..rank {
+                    dot += pred[prev * rank + d] * succ[cid * rank + d];
+                }
+                let s = unary[row * k + c] + dot;
+                if s > best_v {
+                    best_v = s;
+                    best = c;
+                }
+            }
+            want[row] = cand[row * k + best];
+            prev = want[row] as usize;
+        }
+    }
+    assert_eq!(picks, want, "the bigram walk parts from the reference");
+    eprintln!("bigram walk: {} rows agree, the anchor row proposing too", rows);
 }

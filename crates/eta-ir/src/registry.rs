@@ -417,6 +417,9 @@ pub struct ModelProfile {
     pub draft_mask_token: u32,
     /// Whether the draft block sees itself, so a guest must state a mask.
     pub draft_bidirectional: bool,
+    /// The first draft-block row whose readout is a proposal (1: the anchor
+    /// row proposes nothing; 0: every row proposes).
+    pub draft_proposals_from: u32,
     /// A scalar value-head intrinsic is available.
     pub has_value_head: bool,
     /// `[layers * heads, kv_max]` F32 per-key attention mass
@@ -464,6 +467,7 @@ impl ModelProfile {
             draft_block: 0,
             draft_mask_token: 0,
             draft_bidirectional: false,
+            draft_proposals_from: 1,
             has_value_head: true,
             has_attn_score: true,
             has_attn_page_mask: true,

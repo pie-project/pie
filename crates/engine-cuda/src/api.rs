@@ -424,6 +424,7 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         draft_block: 0,
         draft_mask_token: 0,
         draft_bidirectional: false,
+        draft_proposals_from: 1,
         has_value_head: false,
         // Does this load export a capture column, and did the slab that
         // observes it get carved.

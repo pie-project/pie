@@ -148,6 +148,7 @@ pub struct EngineConfig {
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_bidirectional: bool,
+    pub draft_proposals_from: u32,
     pub has_value_head: bool,
     pub has_kv_envelopes: bool,
     pub has_attn_score: bool,
@@ -340,6 +341,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         draft_mask_token: engine_configs.first().map_or(0, |d| d.draft_mask_token),
         draft_bidirectional: !engine_configs.is_empty()
             && engine_configs.iter().all(|d| d.draft_bidirectional),
+        draft_proposals_from: engine_configs.first().map_or(1, |d| d.draft_proposals_from),
         has_value_head: !engine_configs.is_empty()
             && engine_configs.iter().all(|d| d.has_value_head),
         has_kv_envelopes: !engine_configs.is_empty()

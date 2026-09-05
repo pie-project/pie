@@ -279,6 +279,7 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
         draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
         draft_bidirectional: shell.trace().drafter.is_some_and(|d| d.bidirectional),
+        draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
         has_value_head: false,
         has_attn_score: false,
         has_attn_page_mask: false,

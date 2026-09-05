@@ -859,15 +859,17 @@ impl Run<'_> {
                 tokens,
                 pred,
                 succ,
+                first,
                 picks,
             } => attn::selector::walk(
                 self.ctx(),
                 self.ragged(*cand),
                 self.tensor(*unary),
-                self.tensor(*hp),
+                hp.map(|hp| self.tensor(hp)),
                 self.tensor(*tokens),
                 self.tensor(*pred),
                 self.tensor(*succ),
+                *first,
                 self.tensor(*picks),
             ),
             Attention::SsmGdnPrep {

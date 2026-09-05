@@ -31,6 +31,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
             rows: caps.draft_block,
             mask_token: caps.draft_mask_token,
             bidirectional: caps.draft_bidirectional,
+            proposals_from: caps.draft_proposals_from,
         }))
     }
 

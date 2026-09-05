@@ -321,10 +321,17 @@ pub enum Attention {
     SelectorWalk {
         cand: ValueId,
         unary: ValueId,
-        hp: ValueId,
+        /// The slot's hidden projected to the codebooks' rank, or `None` for
+        /// a plain bigram lattice (DSpark's markov head: `⟨pred[prev],
+        /// succ[cand]⟩` with no hidden term).
+        hp: Option<ValueId>,
         tokens: ValueId,
         pred: ValueId,
         succ: ValueId,
+        /// The first row of each span that is a slot: 1 when the anchor row
+        /// proposes nothing (its pick is its first candidate), 0 when every
+        /// row proposes (the anchor row's predecessor is its own token).
+        first: u32,
         picks: ValueId,
     },
     /// Folds `ba` with dt bias and A-log into per-head decay gates.
@@ -606,7 +613,9 @@ impl Operands for Attention {
             }
             Self::BlockDynConv { x, coeff, base, .. } => sink.extend([*x, *coeff, *base]),
             Self::SelectorWalk { cand, unary, hp, tokens, pred, succ, .. } => {
-                sink.extend([*cand, *unary, *hp, *tokens, *pred, *succ]);
+                sink.extend([*cand, *unary]);
+                sink.extend(hp.iter().copied());
+                sink.extend([*tokens, *pred, *succ]);
             }
             Self::SsmGdnPrep { ba, dt_bias, a_log, .. } => sink.extend([*ba, *dt_bias, *a_log]),
             Self::SsmGatedDelta { qkv, z, gates, state, .. } => {

@@ -402,24 +402,29 @@ pub fn block_dyn_conv(
 pub fn selector_walk(
     cand: &Value,
     unary: &Value,
-    hp: &Value,
+    hp: Option<&Value>,
     tokens: &Value,
     pred: &Weight,
     succ: &Weight,
+    first: u32,
 ) -> Value {
     let r = cand.rec();
     let picks = r.fresh(tensor(cand.rows(), 1u64, Dtype::I32));
+    let mut deps: Vec<&Value> = vec![cand, unary];
+    deps.extend(hp);
+    deps.push(tokens);
     r.push(
         Attention::SelectorWalk {
             cand: cand.id(),
             unary: unary.id(),
-            hp: hp.id(),
+            hp: hp.map(Value::id),
             tokens: tokens.id(),
             pred: r.weight(pred),
             succ: r.weight(succ),
+            first,
             picks: picks.id(),
         },
-        &[cand, unary, hp, tokens],
+        &deps,
     );
     picks
 }

@@ -34,22 +34,26 @@ pub fn walk(
     ctx: &Ctx<'_>,
     cand: RaggedTensor,
     unary: Tensor,
-    hp: Tensor,
+    hp: Option<Tensor>,
     tokens: Tensor,
     pred: Tensor,
     succ: Tensor,
+    first: u32,
     picks: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.selector_walk";
-    let entry = dtype_dispatch!(OP, hp.dtype, { Bf16 => "selector_walk_bfloat16" });
-    if pred.dtype != hp.dtype || succ.dtype != hp.dtype {
+    let entry = dtype_dispatch!(OP, pred.dtype, { Bf16 => "selector_walk_bfloat16" });
+    if succ.dtype != pred.dtype || hp.is_some_and(|h| h.dtype != pred.dtype) {
         return Err(refuse(
             OP,
             format!(
-                "the projected hidden is {:?} but the codebooks are {:?} / {:?}; the kernel reads one element type",
-                hp.dtype, pred.dtype, succ.dtype
+                "the codebooks are {:?} / {:?} and the projected hidden {:?}; the kernel reads one element type",
+                pred.dtype, succ.dtype, hp.map(|h| h.dtype)
             ),
         ));
+    }
+    if first > 1 {
+        return Err(refuse(OP, format!("the first slot row is {first}; a span's anchor is row 0 and its first mask row 1")));
     }
     if cand.data.dtype != Dtype::I32 || cand.indptr.dtype != Dtype::I32 || tokens.dtype != Dtype::I32 {
         return Err(refuse(OP, "the candidates, the CSR and the tokens are i32"));
@@ -65,11 +69,14 @@ pub fn walk(
     if k > MAX_K {
         return Err(refuse(OP, format!("{k} candidates a slot; the walk lanes out at {MAX_K}")));
     }
-    let rank = nonzero(OP, "the codebooks' rank", hp.width)?;
-    if pred.width != rank || succ.width != rank {
+    let rank = nonzero(OP, "the codebooks' rank", pred.width)?;
+    if succ.width != rank || hp.is_some_and(|h| h.width != rank) {
         return Err(refuse(
             OP,
-            format!("the codebooks are {} / {} wide and the projected hidden {rank}", pred.width, succ.width),
+            format!(
+                "the codebooks are {} / {} wide and the projected hidden {:?}",
+                pred.width, succ.width, hp.map(|h| h.width)
+            ),
         ));
     }
     if pred.rows != succ.rows {
@@ -82,16 +89,22 @@ pub fn walk(
     if unary.rows != cand.data.rows || unary.width != k {
         return Err(refuse(OP, "the unary logits are not one row of `k` per candidate row"));
     }
-    if picks.rows != cand.data.rows || hp.rows != cand.data.rows || tokens.rows != cand.data.rows {
+    if picks.rows != cand.data.rows
+        || tokens.rows != cand.data.rows
+        || hp.is_some_and(|h| h.rows != cand.data.rows)
+    {
         return Err(refuse(OP, "hp, tokens and picks carry one row per candidate row"));
     }
+    // With no hidden term the seat is bound to the codebook (never read: the
+    // kernel branches on `has_hp`), so the binding is never nil.
+    let hp_arg = hp.map_or_else(|| pred.arg(), |h| h.arg());
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of([THREADS, lanes, 1], [THREADS, 1, 1])),
         &[
             cand.data.arg(),
             cand.indptr.arg(),
             unary.arg(),
-            hp.arg(),
+            hp_arg,
             tokens.arg(),
             pred.arg(),
             succ.arg(),
@@ -99,6 +112,8 @@ pub fn walk(
             stated(OP, k)?.arg(),
             stated(OP, rank)?.arg(),
             stated(OP, vocab)?.arg(),
+            stated(OP, u32::from(hp.is_some()))?.arg(),
+            stated(OP, first)?.arg(),
         ],
     )
 }

@@ -32,6 +32,10 @@ interface model {
         rows: u32,
         mask-token: u32,
         bidirectional: bool,
+        // The first row whose readout is a proposal: 1 when the anchor row
+        // proposes nothing, 0 when every row does (the anchor's row then
+        // predicts the token after it).
+        proposals-from: u32,
     }
     draft-block: func() -> option<block-drafter>;
 

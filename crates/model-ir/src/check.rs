@@ -389,7 +389,8 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 &[(In(2), CACHE)]
             }
             Attention::BlockDynConv { .. } => &[],
-            Attention::SelectorWalk { .. } => &[(In(0), I32), (In(1), F32), (In(3), I32), (Out(0), I32)],
+            // `hp` is optional, so the input positions past it are not fixed.
+            Attention::SelectorWalk { .. } => &[(In(0), I32), (In(1), F32), (Out(0), I32)],
             Attention::SsmGdnPrep { .. } => &[(Out(0), F32)],
             Attention::SsmGatedDelta { .. } | Attention::SsmGatedDeltaChunked { .. } => {
                 &[(In(3), CACHE)]

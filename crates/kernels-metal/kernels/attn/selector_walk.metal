@@ -38,6 +38,8 @@ template <typename T>
     const constant int& k         [[buffer(8)]],
     const constant int& rank      [[buffer(9)]],
     const constant int& vocab     [[buffer(10)]],
+    const constant int& has_hp    [[buffer(11)]],   // 0: a plain bigram lattice
+    const constant int& first     [[buffer(12)]],   // the span's first slot row
     uint2 pos                     [[thread_position_in_grid]],
     uint2 lpos                    [[thread_position_in_threadgroup]]) {
   const int r = int(pos.y);
@@ -53,13 +55,17 @@ template <typename T>
   threadgroup float score[kWalkMaxK];
   threadgroup int prev_id;
   if (tid == 0) {
-    // The anchor row proposes nothing; its pick is its own first candidate.
-    picks[begin] = cand[size_t(begin) * size_t(k)];
+    // The predecessor of the first slot is the anchor's own token. When the
+    // anchor row is not a slot (`first == 1`) it proposes nothing, and its
+    // pick is its own first candidate.
+    if (first > 0) {
+      picks[begin] = cand[size_t(begin) * size_t(k)];
+    }
     prev_id = tokens[begin];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  for (int row = begin + 1; row < end; ++row) {
+  for (int row = begin + first; row < end; ++row) {
     const int my_prev = prev_id;
     float partial = 0.0f;
     if (int(c) < k) {
@@ -68,9 +74,15 @@ template <typename T>
       if (live) {
         const device T* a = pred + size_t(my_prev) * size_t(rank);
         const device T* b = succ + size_t(cid) * size_t(rank);
-        const device T* h = hp + size_t(row) * size_t(rank);
-        for (int d = int(lane); d < rank; d += int(kWalkLanes)) {
-          partial += float(a[d]) * float(h[d]) * float(b[d]);
+        if (has_hp) {
+          const device T* h = hp + size_t(row) * size_t(rank);
+          for (int d = int(lane); d < rank; d += int(kWalkLanes)) {
+            partial += float(a[d]) * float(h[d]) * float(b[d]);
+          }
+        } else {
+          for (int d = int(lane); d < rank; d += int(kWalkLanes)) {
+            partial += float(a[d]) * float(b[d]);
+          }
         }
       }
     }
@@ -108,6 +120,7 @@ template <typename T>
       const device int*, const device int*, const device float*,              \
       const device itype*, const device int*, const device itype*,            \
       const device itype*, device int*, const constant int&,                  \
-      const constant int&, const constant int&, uint2, uint2);
+      const constant int&, const constant int&, const constant int&,          \
+      const constant int&, uint2, uint2);
 
 instantiate_selector_walk(bfloat16, bfloat)

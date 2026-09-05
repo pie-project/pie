@@ -190,6 +190,7 @@ async fn main(input: Input) -> Result<Output> {
         .max(2);
     let mask_token = advertised.map_or(MASK_TOKEN, |d| d.mask_token as i32);
     let no_mask = input.no_mask || advertised.is_some_and(|d| !d.bidirectional);
+    let from = advertised.map_or(1, |d| d.proposals_from) as usize;
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
     let mut prompt = model::encode(&input.prompt);
@@ -279,7 +280,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut kept = Vec::new();
     let mut drafts_all = Vec::new();
     let mut truth_all = Vec::new();
-    let mut hits_by_position = vec![0u32; block as usize - 1];
+    let mut hits_by_position = vec![0u32; block as usize - from];
 
     for round in 0..input.rounds {
         // ── the draft: ONE pass over `[anchor, MASK x block-1]`, the trunk
@@ -423,7 +424,9 @@ async fn main(input: Input) -> Result<Output> {
         // The drafts are rows `1..block`, which is why the checkpoint's
         // README runs it at `num_speculative_tokens: 15` against a block of
         // sixteen.
-        let proposals: Vec<i32> = proposals[1..].to_vec();
+        // DSpark's rows all propose (row `i` predicts `held + i + 1`), which
+        // the load says with `proposals_from == 0`.
+        let proposals: Vec<i32> = proposals[from..].to_vec();
         let mut prefix = 0u32;
         for (at, (p, t)) in proposals.iter().zip(&truth).enumerate() {
             if p == t {

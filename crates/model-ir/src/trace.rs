@@ -185,4 +185,14 @@ pub struct BlockDrafter {
     /// in which case the guest must state the mask that says so; a head whose
     /// layers are all causal inside the block wants none.
     pub bidirectional: bool,
+    /// The first block row whose readout is a proposal: 1 for a head whose
+    /// row `i` predicts position `i` (DFlash: the anchor row proposes
+    /// nothing), 0 for a head whose row `i` predicts position `i + 1`
+    /// (DSpark: the anchor row proposes the next token too).
+    #[serde(default = "one")]
+    pub proposals_from: u32,
+}
+
+fn one() -> u32 {
+    1
 }

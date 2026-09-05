@@ -705,6 +705,9 @@ async fn main(input: Input) -> Result<Output> {
         .max(2);
     let mask_token = advertised.map_or(MASK_TOKEN, |d| d.mask_token as i32);
     let bind_mask = !input.no_mask && advertised.is_none_or(|d| d.bidirectional);
+    // The first block row whose pick is a proposal: 1 when the anchor row
+    // proposes nothing (DFlash), 0 when it proposes the next token (DSpark).
+    let from = advertised.map_or(1, |d| d.proposals_from) as usize;
     let pinned = (input.verify_rows != 0).then(|| input.verify_rows.clamp(2, block));
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
@@ -982,11 +985,11 @@ async fn main(input: Input) -> Result<Output> {
         // proposes position `held + i` and the anchor's row proposes nothing
         // new. The proposals are rows `1..block`.
         let picks = out.take_host::<Vec<i32>>().await.context("draft readback")?;
-        proposals_owned = picks[1..shown as usize].to_vec();
+        proposals_owned = picks[from..shown as usize].to_vec();
         if want_margin {
             let value = conf.take_host::<Vec<f32>>().await.context("margin readback")?;
             // Row `r` occupies `[2r, 2r + 1]`: the best and its runner-up.
-            let margin: Vec<f32> = (1..shown as usize)
+            let margin: Vec<f32> = (from..shown as usize)
                 .map(|r| value[2 * r] - value[2 * r + 1])
                 .collect();
             if pinned.is_none() {
