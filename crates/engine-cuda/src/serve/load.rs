@@ -55,6 +55,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         tokens: boot.budget.clone(),
         patches: boot.patches.clone(),
     };
+    // The peepholes (`model_ir::fuse`) run on the trace this load keeps, so
+    // the compile and every node index taken off `boot.trace` below share
+    // one numbering; see the Metal shell's `load` for the argument.
+    boot.trace = model_ir::fuse::residual_norm(boot.trace.clone());
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
     Ok(Baked {
         device,

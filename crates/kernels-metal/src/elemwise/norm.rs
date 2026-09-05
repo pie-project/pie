@@ -97,6 +97,40 @@ fn rms_row(
     )
 }
 
+/// `y += x`, then `out = rmsnorm(y)` — one launch for the fused node
+/// `model_ir::fuse` writes; the two-launch answer bit for bit (see the kernel).
+pub fn residual_add_rmsnorm(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    y: Tensor,
+    weight: Tensor,
+    plus_one: bool,
+    eps: f32,
+    out: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.residual_add_rmsnorm";
+    let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "residual_add_rms_single_row_bfloat16" });
+    debug_assert!(
+        x.rows == y.rows && x.width == y.width && out.rows == y.rows && out.width == y.width,
+        "`{OP}` folds and norms one rectangle"
+    );
+    let grid = rms_grid(OP, y.width, y.width, y.rows)?;
+    ctx.fire(
+        Fire::at("elemwise/norm_rms.metal", entry).apply(grid),
+        &[
+            x.arg(),
+            y.arg_mut(),
+            weight.arg(),
+            out.arg_mut(),
+            eps.arg(),
+            stated(OP, y.width)?.arg(),
+            DENSE_BANK.arg(),
+            u32::from(plus_one).arg(),
+            UNIT_GAIN.arg(),
+        ],
+    )
+}
+
 pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
     rms_row(
         ctx,

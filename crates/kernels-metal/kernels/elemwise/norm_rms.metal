@@ -93,6 +93,75 @@ template <typename T, int N_READS>
       inv_rms, partials, lid, simd_lane, simd_group, tg_size);
 }
 
+/// **THE RESIDUAL FOLD AND THE NORM THAT READS IT, ONE LAUNCH** —
+/// `Elementwise::ResidualAddRmsnorm`, which `model_ir::fuse` writes for every
+/// `residual_add` whose result the next `rmsnorm` reads (a pre-norm block's
+/// tail and the next block's head). CUDA has had the kernel; Metal paid two
+/// launches for the fused node until this one. Bit for bit the two launches'
+/// answer: `y` is folded and STORED as bf16 first, the moments are taken over
+/// the stored value, and the second pass is `rms_row_body`'s epilogue over
+/// `y` as it lies — so nothing is computed from an unrounded intermediate the
+/// separate norm never saw.
+template <typename T, int N_READS>
+[[kernel]] void residual_add_rms_single_row(
+    const device T* x          [[buffer(0)]],
+    device T* y                [[buffer(1)]],
+    const device T* w          [[buffer(2)]],
+    device T* out              [[buffer(3)]],
+    const constant float& eps  [[buffer(4)]],
+    const constant uint& axis_size [[buffer(5)]],
+    const constant uint& w_stride  [[buffer(6)]],
+    const constant uint& plus_one  [[buffer(7)]],
+    const constant float& gain     [[buffer(8)]],
+    uint gid                   [[threadgroup_position_in_grid]],
+    uint lid                   [[thread_position_in_threadgroup]],
+    uint simd_lane             [[thread_index_in_simdgroup]],
+    uint simd_group            [[simdgroup_index_in_threadgroup]],
+    uint tg_size               [[threads_per_threadgroup]]) {
+  threadgroup float inv_rms[1], partials[32];
+  const size_t row_base = size_t(gid) * axis_size;
+  const uint span = tg_size * uint(N_READS);
+  const device T* xr = x + row_base;
+  device T* yr = y + row_base;
+  float acc = 0.0f;
+  for (uint start = lid * uint(N_READS); start < axis_size; start += span) {
+    for (int i = 0; i < N_READS; i++) {
+      const uint at = start + uint(i);
+      if (at < axis_size) {
+        const T folded = T(float(xr[at]) + float(yr[at]));
+        yr[at] = folded;
+        const float f = float(folded);
+        acc += f * f;
+      }
+    }
+  }
+  const float inv = rms_inv_from_lane_sum(
+      acc, axis_size, eps, inv_rms, partials, simd_lane, simd_group);
+  device T* outr = out + row_base;
+  for (uint start = lid * uint(N_READS); start < axis_size; start += span) {
+    const device T* ys = yr + start;
+    const device T* ws = w + w_stride * start;
+    device T* os = outr + start;
+    for (int i = 0; i < N_READS; i++) {
+      if (start + uint(i) < axis_size) {
+        T wv = T(gain * (plus_one ? (1.0f + float(ws[w_stride * i]))
+                                  : float(ws[w_stride * i])));
+        os[i] = wv * static_cast<T>(ys[i] * inv);
+      }
+    }
+  }
+}
+
+#define instantiate_residual_add_rms_single_row(name, itype, n_reads)  \
+  template [[host_name("residual_add_rms_single_row_" #name)]]          \
+  [[kernel]] void residual_add_rms_single_row<itype, n_reads>(          \
+      const device itype*, device itype*, const device itype*,          \
+      device itype*, const constant float&, const constant uint&,       \
+      const constant uint&, const constant uint&, const constant float&, \
+      uint, uint, uint, uint, uint);
+
+instantiate_residual_add_rms_single_row(bfloat16, bfloat, 4)
+
 template <typename T, int N_READS>
 [[kernel]] void rms_strided_row(
     const device T* x          [[buffer(0)]],

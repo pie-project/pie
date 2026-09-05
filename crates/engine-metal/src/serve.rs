@@ -1051,6 +1051,18 @@ impl Shell {
     /// residency, [`Fault::Unbound`] for a plan naming a seat this shell does
     /// not bind.
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        // **THE PEEPHOLES RUN HERE, ON THE TRACE THE SHELL KEEPS.** Every
+        // node index this shell holds (`gather`, `experts`, the readout map)
+        // is taken off `boot.trace` below, and the compile is too, so fusing
+        // first keeps them one numbering; a value's id survives fusion, and
+        // values are all the runtime ever names across the boundary. A
+        // pre-norm block's residual fold and the norm that reads it become
+        // one launch (`residual_add_rms_single_row`): 128 fewer a token on a
+        // 64-layer trunk, at the two launches' bits.
+        let boot = Boot {
+            trace: model_ir::fuse::residual_norm(boot.trace),
+            ..boot
+        };
         let device = Context::bind()?;
         let keepalive = if crate::keepalive::KeepAlive::wanted() {
             Some(crate::keepalive::KeepAlive::start(&device)?)
