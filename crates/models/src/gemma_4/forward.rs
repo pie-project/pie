@@ -118,7 +118,6 @@ impl ForwardHybrid for Model {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
 
-        let positions = inputs.positions();
         let qo_one = Facts::qo_one();
         let fused = qo_one.clone() & !Facts::masked();
 
@@ -140,6 +139,11 @@ impl ForwardHybrid for Model {
             None => (inputs.clone(), inputs.clone()),
         };
         let [input_m, input_s, input_d, input_p] = trunk_inputs.split(classes.clone());
+        // The trunk's positions carry the trunk rows' guard, so a value cut
+        // from them meets a value cut from the residual stream (the CUDA
+        // fused qkv splits both by `fused`); the drafter takes its own off
+        // `inputs` inside `arm`.
+        let positions = trunk_inputs.positions();
         let plan_m = [
             ops::attn::plan_prefill(
                 &input_m,

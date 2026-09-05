@@ -61,14 +61,15 @@ impl ForwardHybrid for Model {
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let m = self;
 
-        let positions = inputs.positions();
         let mask = inputs.mask();
         // The drafter's rows leave before the classes are cut, so a plan and
-        // the query it is consumed by say the same guard (see `qwen_3`).
+        // the query it is consumed by say the same guard (see `qwen_3`); the
+        // trunk's positions come off the same arm for the same reason.
         let (_, trunk_inputs) = match &m.dflash {
             Some(_) => inputs.split(&Facts::block_draft()),
             None => (inputs.clone(), inputs.clone()),
         };
+        let positions = trunk_inputs.positions();
         // gpt-oss layers alternate sliding-window and full attention; each
         // reading gets its own plan (window vs None), indexed by Reading.
         let (input_d, input_p) = trunk_inputs.split(&Facts::qo_one());
