@@ -374,6 +374,17 @@ struct Input {
     /// rows are worth a fire is the guest's call, not the engine's.
     #[serde(default)]
     verify_rows: u32,
+    /// The block the head was trained at: sixteen for the v1 head
+    /// (`qwen36-27b-dflash`), eight for DFlash2 (`qwen38-27b-dflash2`). The
+    /// load does not advertise it yet, so the caller states it; absent, v1's.
+    #[serde(default)]
+    block: Option<u32>,
+    /// Bind no mask to the draft fire. DFlash2's layers are all sliding and
+    /// causal inside the block, so its plan states no masked arm for the
+    /// draft rows and refuses a lane that carries one; v1's last layer is
+    /// bidirectional and needs the mask this loop builds.
+    #[serde(default)]
+    no_mask: bool,
     /// Let the drafter's own logit margin choose the width per round, rather
     /// than verifying the whole block — see `wide_enough`. Off by default,
     /// because on three workloads it is a WASH.
@@ -668,7 +679,7 @@ async fn main(input: Input) -> Result<Output> {
     if model::mtp_depth() == 0 {
         return Err("this SKU ships no draft head".into());
     }
-    let block = BLOCK_ROWS;
+    let block = input.block.unwrap_or(BLOCK_ROWS).max(2);
     let pinned = (input.verify_rows != 0).then(|| input.verify_rows.clamp(2, block));
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
@@ -902,7 +913,7 @@ async fn main(input: Input) -> Result<Output> {
                     w_slot: &w_slot,
                     w_off: &w_off,
                     positions: &positions,
-                    mask: Some(&mask),
+                    mask: if input.no_mask { None } else { Some(&mask) },
                 },
             }),
             &rs_set,

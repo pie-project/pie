@@ -121,6 +121,11 @@ struct Input {
     /// Diagnostic: read the prefill out at every row, not only the last.
     #[serde(default)]
     readout_all: bool,
+    /// The block the head was trained at: sixteen for the v1 head
+    /// (`qwen36-27b-dflash`), eight for DFlash2 (`qwen38-27b-dflash2`). The
+    /// load does not advertise it yet, so the caller states it; absent, v1's.
+    #[serde(default)]
+    block: Option<u32>,
 }
 
 fn no_hide() -> i32 {
@@ -173,7 +178,7 @@ async fn main(input: Input) -> Result<Output> {
     if model::mtp_depth() == 0 {
         return Err("this SKU ships no draft head".into());
     }
-    let block = BLOCK_ROWS;
+    let block = input.block.unwrap_or(BLOCK_ROWS).max(2);
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
     let mut prompt = model::encode(&input.prompt);
