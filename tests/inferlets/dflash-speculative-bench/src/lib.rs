@@ -529,6 +529,9 @@ impl Gate {
     /// and 1.7/1.00 loses to 2.8/1.38: measured, letting prose sink to two on
     /// a sixth of its rounds cost 1.41x -> 1.30x.
     const RUNGS: [u32; 3] = [4, 8, 16];
+    /// The widest rung the warm-up rounds pay for before the window fills:
+    /// eight, where the fire's premium over four is 28% — see `width`.
+    const WARM_TOP: u32 = 8;
 
     fn new(floor: f64, auto: bool) -> Self {
         Gate { floor, recent: Vec::new(), last: 0, since: 0, auto }
@@ -566,13 +569,23 @@ impl Gate {
         if !self.auto {
             return block;
         }
-        // **START CHEAP AND CLIMB, RATHER THAN WIDE AND FALL.** With no
-        // history the ladder has nothing to read, and eight rounds at the
-        // full block is eight fires at 2.79 where the first rung costs 1.38
-        // — on a 91-round request that alone was 9% of the rounds spent at
-        // the most expensive width the loop offers.
+        // **START CHEAP AND CLIMB, RATHER THAN WIDE AND FALL — BUT "CHEAP"
+        // REACHES EIGHT.** With no history the ladder has nothing to read,
+        // and eight rounds at a sixteen-row block is eight fires at 2.79
+        // where the first rung costs 1.38 — on a 91-round request that alone
+        // was 9% of the rounds spent at the most expensive width the loop
+        // offers. Eight rows are another matter: 1.83 against four's 1.43,
+        // a 28% premium for the warm-up rounds where sixteen's is 94%, and
+        // a block-eight head (DFlash2) that starts at four spends its first
+        // window censored under its own block. Measured on `qwen38-27b-dflash2`
+        // (4 x 256, ladder): starting at four read 42.8 / 31.5 / 21.9 / 28.4
+        // tok/s on counting / code / prose / capitals where a width PINNED
+        // at eight read 49.0 / 33.5 / 19.9 / 30.7 — the ladder lost 6-15%
+        // on three of four for the warm-up it spent narrow, and won only
+        // prose, which the mean rule below still steps down to four once
+        // the window fills.
         if self.recent.len() < Self::WINDOW {
-            return Self::RUNGS[0].min(block);
+            return Self::WARM_TOP.min(block);
         }
         // **A WINDOW THE TARGET TOOK WHOLE SAYS NOTHING ABOUT HOW MUCH MORE
         // IT WOULD HAVE TAKEN.** The yield is CENSORED at the width, so
