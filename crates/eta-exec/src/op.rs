@@ -14,10 +14,53 @@ pub fn canonical_rows(dims: &[u32]) -> usize {
 }
 
 pub fn canonical_reduce<T: Copy>(row: &[T], identity: T, combine: impl Fn(T, T) -> T) -> T {
-    if row.is_empty() {
+    canonical_reduce_by(row.len(), identity, |j| row[j], combine)
+}
+
+/// [`canonical_reduce`] over a sequence read by index rather than held in a
+/// slice, folding in the same 32-wide order and so to the same bits.
+///
+/// The order is the point of "canonical": it is the one a 32-lane subgroup
+/// reduces in, so the host answers what the device answers. What the index
+/// buys is the FIRST level. A caller whose elements are a function of the row
+/// — `argmax` pairing each value with its position — otherwise materialises
+/// the whole sequence to hand it over, and `canonical_reduce` then copies it
+/// again; over a 262144-wide vocabulary that is ~6 MB allocated and walked per
+/// call, which dwarfs the reduction. Levels after the first are 1/32 the size
+/// and stay ordinary vectors.
+pub fn canonical_reduce_by<T: Copy>(
+    len: usize,
+    identity: T,
+    at: impl Fn(usize) -> T,
+    combine: impl Fn(T, T) -> T,
+) -> T {
+    if len == 0 {
         return identity;
     }
-    let mut level = row.to_vec();
+    // `canonical_reduce`'s loop is `while level.len() > 1`, so a single
+    // element is returned untouched rather than combined with the identity.
+    if len == 1 {
+        return at(0);
+    }
+    let fold = |lanes: &mut [T; 32]| {
+        for offset in [16usize, 8, 4, 2, 1] {
+            for lane in 0..offset {
+                lanes[lane] = combine(lanes[lane], lanes[lane + offset]);
+            }
+        }
+    };
+    let mut level: Vec<T> = Vec::with_capacity(len.div_ceil(32));
+    let mut base = 0;
+    while base < len {
+        let mut lanes = [identity; 32];
+        let count = 32.min(len - base);
+        for (lane, slot) in lanes[..count].iter_mut().enumerate() {
+            *slot = at(base + lane);
+        }
+        fold(&mut lanes);
+        level.push(lanes[0]);
+        base += 32;
+    }
     while level.len() > 1 {
         let mut next = Vec::with_capacity(level.len().div_ceil(32));
         let mut base = 0;
@@ -25,11 +68,7 @@ pub fn canonical_reduce<T: Copy>(row: &[T], identity: T, combine: impl Fn(T, T) 
             let mut lanes = [identity; 32];
             let count = 32.min(level.len() - base);
             lanes[..count].copy_from_slice(&level[base..base + count]);
-            for offset in [16usize, 8, 4, 2, 1] {
-                for lane in 0..offset {
-                    lanes[lane] = combine(lanes[lane], lanes[lane + offset]);
-                }
-            }
+            fold(&mut lanes);
             next.push(lanes[0]);
             base += 32;
         }
@@ -78,25 +117,6 @@ pub fn canonical_min(left: f32, right: f32) -> f32 {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ArgmaxCandidate {
-    pub value: f32,
-
-    pub index: u32,
-
-    pub have: bool,
-}
-
-impl Default for ArgmaxCandidate {
-    fn default() -> Self {
-        ArgmaxCandidate {
-            value: f32::NEG_INFINITY,
-            index: 0,
-            have: false,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IntArgmaxCandidate {
     pub value: i64,
@@ -104,20 +124,6 @@ pub struct IntArgmaxCandidate {
     pub index: u32,
 
     pub have: bool,
-}
-
-#[must_use]
-pub fn combine_argmax(left: ArgmaxCandidate, right: ArgmaxCandidate) -> ArgmaxCandidate {
-    if !right.have {
-        return left;
-    }
-    if !left.have
-        || right.value > left.value
-        || (right.value == left.value && right.index < left.index)
-    {
-        return right;
-    }
-    left
 }
 
 #[must_use]
@@ -139,32 +145,47 @@ pub fn combine_int_argmax(
 
 #[must_use]
 pub fn argmax_row(row: &[f32]) -> i32 {
-    let candidates: Vec<ArgmaxCandidate> = row
-        .iter()
-        .enumerate()
-        .map(|(j, &value)| ArgmaxCandidate {
-            value,
-            index: j as u32,
-            have: !value.is_nan(),
-        })
-        .collect();
-    canonical_reduce(&candidates, ArgmaxCandidate::default(), combine_argmax).index as i32
+    // A SCAN, NOT THE 32-WIDE TREE, AND IT ANSWERS THE SAME INDEX.
+    //
+    // `canonical_reduce`'s order is load-bearing for an ACCUMULATION — a sum
+    // in another order is a different float. `combine_argmax` accumulates
+    // nothing: it selects the element greatest in (have, value, -index)
+    // lexicographically, which is a total order, so the element it picks is
+    // the same whichever way the folds are bracketed. NaNs carry `have =
+    // false` and so are never selected; an all-NaN row answers the identity's
+    // index, zero, either way. `the_scan_answers_what_the_canonical_tree_does`
+    // holds the two against each other over ties, NaNs and signed zeroes.
+    //
+    // The tree costs about a combine per element over a 12-byte struct held
+    // in a 32-lane stack array; over a 262144-wide vocabulary, once per token
+    // per lane, that was ~4.5 ms of every decode step on a backend whose
+    // sampler runs here rather than on the device.
+    let mut best = f32::NEG_INFINITY;
+    let mut at = 0u32;
+    let mut have = false;
+    for (j, &value) in row.iter().enumerate() {
+        if value.is_nan() {
+            continue;
+        }
+        if !have || value > best {
+            best = value;
+            at = j as u32;
+            have = true;
+        }
+    }
+    at as i32
 }
 
 #[must_use]
 pub fn argmax_row_i64(row: &[i64]) -> i32 {
-    let candidates: Vec<IntArgmaxCandidate> = row
-        .iter()
-        .enumerate()
-        .map(|(index, &value)| IntArgmaxCandidate {
-            value,
-            index: index as u32,
-            have: true,
-        })
-        .collect();
-    canonical_reduce(
-        &candidates,
+    canonical_reduce_by(
+        row.len(),
         IntArgmaxCandidate::default(),
+        |j| IntArgmaxCandidate {
+            value: row[j],
+            index: j as u32,
+            have: true,
+        },
         combine_int_argmax,
     )
     .index as i32
@@ -195,14 +216,154 @@ pub fn sort_desc_order(row: &[f32]) -> Vec<u32> {
     idx
 }
 
+/// The nucleus, without ordering the tail.
+///
+/// `pivot_threshold`'s top-`p` arm walks the row in descending order and keeps
+/// an element while the sum of everything ahead of it is below `p`. Sorting
+/// 262144 logits to read the first few hundred is most of the op's cost, and
+/// the tail's order never reaches the answer — but only because the walk's
+/// accumulator is **monotone**, which holds exactly when no lane is negative.
+/// A negative lane can carry `excl` back under `p` after it has passed, so a
+/// later element is kept and the prefix is no longer the answer; a `NaN`
+/// poisons the accumulator and orders after every number besides. Either one
+/// sends the caller to the full order.
+///
+/// Otherwise the top `k` are selected, ordered among themselves by
+/// [`sort_desc_order`]'s own comparator — a total order, so they are the full
+/// order's prefix — and `k` doubles until the walk passes `p`. `excl` sums the
+/// same lanes in the same order, so it is the same float.
+///
+/// Returns whether it answered; `keep` is written only then.
+fn nucleus_prefix(row: &[f32], p: f32, keep: &mut [u8]) -> bool {
+    if p.is_nan() {
+        return false;
+    }
+    // `excl` starts at zero, so nothing is kept unless zero is under `p`.
+    if 0.0 >= p {
+        return true;
+    }
+    // One pass, holding the best `WIDE` in comparator order. A lane that loses
+    // to the worst held costs a single compare, which on a served model's row
+    // is nearly every lane: gemma-4 at p=0.95 keeps ONE. Building an index
+    // array and partitioning it instead costs a megabyte of writes and a
+    // cache-hostile walk, which measured slower than the sort it replaces.
+    const WIDE: usize = 64;
+    // A row whose nucleus is wider than the cut sends the insert path
+    // quadratic, so it is abandoned rather than widened: past this many
+    // insertions the nucleus is wide enough that ordering the row outright is
+    // the cheaper answer, and the scan spent so far is one bounded prefix.
+    //
+    // Scanning `n` lanes in no particular order displaces the worst of `WIDE`
+    // about `WIDE * ln(n / WIDE)` times — ~530 here — so the bound has to
+    // clear that by a margin or an ordinary row is abandoned. A row whose
+    // nucleus is genuinely wide displaces it a factor of `n` times, so the two
+    // are nowhere near each other and the exact bound is not delicate.
+    const GIVE_UP: usize = 32 * WIDE;
+    if WIDE >= row.len() {
+        return false;
+    }
+    let mut best: Vec<u32> = Vec::with_capacity(WIDE + 1);
+    let mut inserts = 0usize;
+    for (i, &v) in row.iter().enumerate() {
+        // A negative lane can carry `excl` back under `p` after it has passed,
+        // so the kept set is no longer a prefix; a `NaN` poisons the
+        // accumulator and orders after every number besides. Either sends the
+        // caller to the full order, which handles both.
+        if v.is_nan() || v < 0.0 {
+            return false;
+        }
+        let i = i as u32;
+        if best.len() == WIDE && desc_by_value(row, i, best[WIDE - 1]) != std::cmp::Ordering::Less {
+            continue;
+        }
+        let at = best.partition_point(|&b| desc_by_value(row, b, i) == std::cmp::Ordering::Less);
+        best.insert(at, i);
+        best.truncate(WIDE);
+        inserts += 1;
+        if inserts > GIVE_UP {
+            return false;
+        }
+    }
+    // `best` is the full order's prefix — the comparator is a total order, so
+    // the top `WIDE` set and its order are both unique — and `excl` sums the
+    // same lanes in the same order, so it is the same float.
+    let mut excl = 0.0f32;
+    for &i in &best {
+        if excl >= p {
+            return true;
+        }
+        keep[i as usize] = 1;
+        excl += row[i as usize];
+    }
+    if excl >= p {
+        return true;
+    }
+    // The nucleus reaches past the cut; the fallback sums the same lanes in
+    // the same order, so hand back a clean `keep`.
+    for &i in &best {
+        keep[i as usize] = 0;
+    }
+    false
+}
+
+/// [`sort_desc_order`]'s comparator, over two indices of `row`.
+fn desc_by_value(row: &[f32], a: u32, b: u32) -> std::cmp::Ordering {
+    let (x, y) = (row[a as usize], row[b as usize]);
+    match (x.is_nan(), y.is_nan()) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (true, true) => a.cmp(&b),
+        (false, false) => {
+            if x == y {
+                a.cmp(&b)
+            } else {
+                y.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+    }
+}
+
 #[must_use]
 pub fn rng_lanes(seed_eff: u64, n: usize, gumbel: bool) -> Vec<f32> {
-    (0..n)
-        .map(|j| {
-            let u = rng::hash_uniform(seed_eff, j as u32);
-            if gumbel { -(-u.ln()).ln() } else { u }
-        })
-        .collect()
+    // **A LANE IS A PURE FUNCTION OF ITS INDEX, SO THE RANGE SPLITS.**
+    //
+    // `hash_uniform(seed, j)` reads no state and carries nothing between
+    // lanes, so a thread filling `[a, b)` writes exactly the bytes the serial
+    // loop would. Which matters: the values must agree with the device's, and
+    // a Gumbel lane is two `ln` calls that no rearrangement can make cheaper
+    // without changing the token that gets sampled.
+    //
+    // Worth splitting only where the arithmetic dwarfs the threads: a
+    // vocabulary-wide draw is ~260k lanes and milliseconds, while the small
+    // draws a sampler also makes are microseconds and stay serial.
+    const SPLIT_ABOVE: usize = 1 << 15;
+    let lane = |j: usize| {
+        let u = rng::hash_uniform(seed_eff, j as u32);
+        if gumbel { -(-u.ln()).ln() } else { u }
+    };
+    if n <= SPLIT_ABOVE {
+        return (0..n).map(lane).collect();
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, 8);
+    if threads == 1 {
+        return (0..n).map(lane).collect();
+    }
+    let mut out = vec![0.0f32; n];
+    let chunk = n.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (c, slice) in out.chunks_mut(chunk).enumerate() {
+            let lane = &lane;
+            scope.spawn(move || {
+                let base = c * chunk;
+                for (k, slot) in slice.iter_mut().enumerate() {
+                    *slot = lane(base + k);
+                }
+            });
+        }
+    });
+    out
 }
 
 #[must_use]
@@ -219,21 +380,37 @@ pub fn gather_flat(v: &Value, idx: &[Option<usize>]) -> Value {
 pub fn broadcast_value(v: &Value, src: &[u32], target: &[u32]) -> Value {
     let r = target.len();
     let sdim = |i: usize| -> u64 { if i < src.len() { u64::from(src[i]) } else { 1 } };
+    let n = shape_numel(target) as usize;
+
+    // **THE SAMPLER'S BROADCAST IS A SCALAR OVER A VOCABULARY.** Every source
+    // extent is one, so every lane reads element zero and the coordinate walk
+    // below computes nothing: it is `n` repeats of one value, which is what
+    // the general path would produce a megabyte of indices to say.
+    if src.iter().all(|&d| d == 1) {
+        return match v {
+            Value::I32(s) => Value::I32(vec![s.first().copied().unwrap_or(0); n]),
+            Value::U32(s) => Value::U32(vec![s.first().copied().unwrap_or(0); n]),
+            Value::Bool(s) => Value::Bool(vec![s.first().copied().unwrap_or(0); n]),
+            Value::F32(s) => Value::F32(vec![s.first().copied().unwrap_or(0.0); n]),
+        };
+    }
+
     let mut sstride = vec![1u64; r.max(1)];
     for i in (0..r.saturating_sub(1)).rev() {
         sstride[i] = sstride[i + 1] * sdim(i + 1);
     }
-    let n = shape_numel(target) as usize;
+    // The target's strides are a property of the shape, not of the lane; the
+    // walk recomputed them per lane, which made it quadratic in the rank.
+    let mut tstride = vec![1u64; r.max(1)];
+    for i in (0..r.saturating_sub(1)).rev() {
+        tstride[i] = tstride[i + 1] * u64::from(target[i + 1]);
+    }
     let mut idx = Vec::with_capacity(n);
     for lin in 0..n as u64 {
         let mut rem = lin;
         let mut sidx = 0u64;
         for i in 0..r {
-            let mut stride = 1u64;
-            for &d in &target[i + 1..r] {
-                stride *= u64::from(d);
-            }
-            let stride = stride.max(1);
+            let stride = tstride[i].max(1);
             let coord = rem / stride;
             rem %= stride;
             if sdim(i) != 1 {
@@ -603,10 +780,19 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
             let data = &vals[a0];
             let len = data.len().checked_div(rows).unwrap_or(0);
             let o: Vec<i32> = if dtype == Dtype::F32 {
-                let x = data.lanes_f32();
-                (0..rows)
-                    .map(|r| argmax_row(&x[r * len..r * len + len]))
-                    .collect()
+                // Borrowed when the value already is `F32`: `lanes_f32`
+                // clones, and this row is the whole vocabulary.
+                match data {
+                    Value::F32(x) => (0..rows)
+                        .map(|r| argmax_row(&x[r * len..r * len + len]))
+                        .collect(),
+                    _ => {
+                        let x = data.lanes_f32();
+                        (0..rows)
+                            .map(|r| argmax_row(&x[r * len..r * len + len]))
+                            .collect()
+                    }
+                }
             } else {
                 let x = data.lanes_i64();
                 (0..rows)
@@ -737,11 +923,13 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
                     1 => {
                         let pv = vals[payload].lanes_f32();
                         let p = pv[pick(pv.len(), r)];
-                        let order = sort_desc_order(row);
-                        let mut excl = 0.0f32;
-                        for i in order {
-                            k[i as usize] = u8::from(excl < p);
-                            excl += row[i as usize];
+                        if !nucleus_prefix(row, p, k) {
+                            let order = sort_desc_order(row);
+                            let mut excl = 0.0f32;
+                            for i in order {
+                                k[i as usize] = u8::from(excl < p);
+                                excl += row[i as usize];
+                            }
                         }
                     }
 
@@ -938,5 +1126,375 @@ pub fn eval_op(op: &LaunchOp, package: &LaunchPackage, vals: &mut [Value]) -> Re
                 eta_ir::op::spec(code).map_or("?", |row| row.name)
             ),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{argmax_row, canonical_reduce_by};
+
+    // The f32 candidate and its combine, which `argmax_row` no longer
+    // needs, kept here as the oracle they now are. The device's own copy
+    // is `m1_argmax_combine` in
+    // `crates/eta-compiler/runtime/cuda/ptir_m1_runtime_prologue.cuh`.
+    #[derive(Clone, Copy, Debug)]
+    struct ArgmaxCandidate {
+        value: f32,
+
+        index: u32,
+
+        have: bool,
+    }
+
+    impl Default for ArgmaxCandidate {
+        fn default() -> Self {
+            ArgmaxCandidate {
+                value: f32::NEG_INFINITY,
+                index: 0,
+                have: false,
+            }
+        }
+    }
+
+    #[must_use]
+    fn combine_argmax(left: ArgmaxCandidate, right: ArgmaxCandidate) -> ArgmaxCandidate {
+        if !right.have {
+            return left;
+        }
+        if !left.have
+            || right.value > left.value
+            || (right.value == left.value && right.index < left.index)
+        {
+            return right;
+        }
+        left
+    }
+
+    /// The tree `argmax_row` used to run, kept verbatim so the scan that
+    /// replaced it can be held against it rather than against a description
+    /// of it.
+    fn argmax_row_tree(row: &[f32]) -> i32 {
+        canonical_reduce_by(
+            row.len(),
+            ArgmaxCandidate::default(),
+            |j| ArgmaxCandidate {
+                value: row[j],
+                index: j as u32,
+                have: !row[j].is_nan(),
+            },
+            combine_argmax,
+        )
+        .index as i32
+    }
+
+    /// **A SELECTION IS ORDER-FREE, WHICH IS WHY THE SCAN IS ALLOWED.**
+    ///
+    /// `canonical_reduce`'s 32-wide bracketing is what makes a host sum equal
+    /// the device's; `combine_argmax` sums nothing, so any bracketing picks
+    /// the same element and a scan may replace the tree. The rows below are
+    /// the cases where that could fail if the tie-break were not a total
+    /// order: repeated maxima (lowest index wins), NaNs (never selected),
+    /// all-NaN (identity index), signed zeroes (equal, so lowest index), and
+    /// a length past the 32-lane first level so more than one level folds.
+    #[test]
+    fn the_scan_answers_what_the_canonical_tree_does() {
+        let mut rows: Vec<Vec<f32>> = vec![
+            vec![],
+            vec![1.0],
+            vec![f32::NAN],
+            vec![f32::NAN, f32::NAN, f32::NAN],
+            vec![1.0, 3.0, 3.0, 2.0],
+            vec![-0.0, 0.0, -0.0],
+            vec![f32::NAN, 5.0, f32::NAN, 5.0],
+            vec![f32::NEG_INFINITY, f32::NEG_INFINITY],
+            vec![f32::INFINITY, f32::INFINITY, 1.0],
+        ];
+        // Lengths either side of the 32-lane level, so the deep tree runs too.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in [31usize, 32, 33, 64, 1000] {
+            for _ in 0..12 {
+                rows.push(
+                    (0..len)
+                        .map(|_| match next() % 8 {
+                            0 => f32::NAN,
+                            1 => 0.0,
+                            2 => -0.0,
+                            3 => 7.5,
+                            _ => (next() % 64) as f32 - 32.0,
+                        })
+                        .collect(),
+                );
+            }
+        }
+        for row in &rows {
+            assert_eq!(
+                argmax_row(row),
+                argmax_row_tree(row),
+                "argmax disagreed on {row:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod rng_tests {
+    use super::rng_lanes;
+
+    /// **THE SPLIT WRITES THE BYTES THE SERIAL LOOP WOULD.**
+    ///
+    /// `rng_lanes` fans a vocabulary-wide draw across threads because a lane
+    /// is a pure function of its index. That is only true while nothing is
+    /// carried between lanes, so this holds a split draw against a serial one
+    /// bit for bit, either side of the threshold and at a length the chunking
+    /// does not divide.
+    #[test]
+    fn a_split_draw_is_the_serial_draw() {
+        let serial = |seed: u64, n: usize, gumbel: bool| -> Vec<f32> {
+            (0..n)
+                .map(|j| {
+                    let u = eta_ir::rng::hash_uniform(seed, j as u32);
+                    if gumbel { -(-u.ln()).ln() } else { u }
+                })
+                .collect()
+        };
+        for &n in &[1usize, 1 << 15, (1 << 15) + 1, 100_003, 262_144] {
+            for gumbel in [false, true] {
+                let want = serial(0x9E37_79B9_7F4A_7C15, n, gumbel);
+                let got = rng_lanes(0x9E37_79B9_7F4A_7C15, n, gumbel);
+                assert_eq!(got.len(), want.len(), "length at n={n}");
+                for (j, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "lane {j} of {n} (gumbel={gumbel})"
+                    );
+                }
+            }
+        }
+    }
+    /// The nucleus the partial selection keeps is the one the full order
+    /// keeps — over ties, zeroes, a `p` past the total, and the rows that
+    /// send it to the fallback.
+    #[test]
+    fn a_partial_nucleus_is_the_ordered_nucleus() {
+        fn ordered(row: &[f32], p: f32) -> Vec<u8> {
+            let mut k = vec![0u8; row.len()];
+            let mut excl = 0.0f32;
+            for i in super::sort_desc_order(row) {
+                k[i as usize] = u8::from(excl < p);
+                excl += row[i as usize];
+            }
+            k
+        }
+        fn partial(row: &[f32], p: f32) -> Vec<u8> {
+            let mut k = vec![0u8; row.len()];
+            if super::nucleus_prefix(row, p, &mut k) {
+                k
+            } else {
+                ordered(row, p)
+            }
+        }
+
+        // A softmax-shaped row wider than the first cut, so the selection runs.
+        let mut row: Vec<f32> = (0..5000)
+            .map(|i| 1.0f32 / ((i + 1) as f32 * (i + 1) as f32))
+            .collect();
+        let total: f32 = row.iter().sum();
+        for v in &mut row {
+            *v /= total;
+        }
+        for p in [0.0, 1e-9, 0.5, 0.9, 0.95, 0.999, 1.0, 2.0] {
+            assert_eq!(partial(&row, p), ordered(&row, p), "softmax row at p={p}");
+        }
+
+        // Every lane the same, so the comparator falls to the index and the
+        // nucleus is a prefix of the identity order.
+        let flat = vec![0.001f32; 4096];
+        for p in [0.0, 0.25, 1.0, 5.0] {
+            assert_eq!(partial(&flat, p), ordered(&flat, p), "flat row at p={p}");
+        }
+
+        // Zeroes past the nucleus: `excl` stops moving, so `excl < p` stays
+        // true and every one of them is kept.
+        let mut sparse = vec![0.0f32; 3000];
+        sparse[7] = 0.4;
+        sparse[1500] = 0.6;
+        for p in [0.3, 0.5, 0.95, 1.0] {
+            assert_eq!(partial(&sparse, p), ordered(&sparse, p), "sparse at p={p}");
+        }
+
+        // The two rows that must fall back rather than answer: a negative lane
+        // (the accumulator is no longer monotone) and a `NaN` (it poisons it).
+        let mut negative = row.clone();
+        negative[9] = -0.5;
+        let mut nan = row.clone();
+        nan[11] = f32::NAN;
+        for bad in [&negative, &nan] {
+            let mut k = vec![0u8; bad.len()];
+            assert!(!super::nucleus_prefix(bad, 0.9, &mut k), "must fall back");
+            assert!(k.iter().all(|&b| b == 0), "the fallback's `keep` is clean");
+            assert_eq!(partial(bad, 0.9), ordered(bad, 0.9));
+        }
+        let mut k = vec![0u8; row.len()];
+        assert!(!super::nucleus_prefix(&row, f32::NAN, &mut k));
+    }
+
+    /// What the partial selection saves, both arms in one process over the
+    /// same rows so a busy machine moves them together.
+    /// `cargo test -p eta-exec --release a_nucleus_costs -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a measurement, not a gate"]
+    // It reports rather than asserts, so its answer has to reach a reader.
+    #[allow(clippy::print_stdout)]
+    fn a_nucleus_costs_less_than_an_order() {
+        let vocab = 262_144usize;
+        // Three regimes. The first is what a served model produces — on
+        // gemma-4 at p=0.95 the nucleus measured ONE lane. The last is the
+        // worst case, where the cut is abandoned for the full order.
+        let build = |peak: f32, spread: f32| -> Vec<f32> {
+            let raw: Vec<f32> = (0..vocab)
+                .map(|i| {
+                    let x = ((i * 2_654_435_761usize) % 100_003) as f32 / 100_003.0;
+                    (x * spread - spread).exp()
+                })
+                .collect();
+            let tail: f32 = raw.iter().sum();
+            let mut row: Vec<f32> = raw.into_iter().map(|v| v / tail * (1.0 - peak)).collect();
+            row[12345] += peak;
+            row
+        };
+        let named: Vec<(&str, Vec<f32>)> = vec![
+            ("one lane", build(0.97, 20.0)),
+            ("a hundred", build(0.30, 20.0)),
+            ("heavy tail", build(0.0, 12.0)),
+        ];
+        for (what, row) in &named {
+            let mut k = vec![0u8; vocab];
+            let mut excl = 0.0f32;
+            for i in super::sort_desc_order(row) {
+                k[i as usize] = u8::from(excl < 0.95);
+                excl += row[i as usize];
+            }
+            let mut k2 = vec![0u8; vocab];
+            let answered = super::nucleus_prefix(row, 0.95, &mut k2);
+            if answered {
+                assert_eq!(k, k2, "{what}");
+            }
+            println!(
+                "{what}: nucleus {} of {vocab}, partial {}",
+                k.iter().filter(|&&b| b == 1).count(),
+                if answered { "answers" } else { "defers" }
+            );
+        }
+        let rows: Vec<Vec<f32>> = named.into_iter().map(|(_, r)| r).collect();
+        let p = 0.95f32;
+        for (at, row) in rows.iter().enumerate() {
+            let (mut ord_ns, mut part_ns) = (0u128, 0u128);
+            for _ in 0..3 {
+                let mut k = vec![0u8; vocab];
+                let t = std::time::Instant::now();
+                let mut excl = 0.0f32;
+                for i in super::sort_desc_order(row) {
+                    k[i as usize] = u8::from(excl < p);
+                    excl += row[i as usize];
+                }
+                ord_ns += t.elapsed().as_nanos();
+
+                let mut k2 = vec![0u8; vocab];
+                let t = std::time::Instant::now();
+                let answered = super::nucleus_prefix(row, p, &mut k2);
+                part_ns += t.elapsed().as_nanos();
+                if answered {
+                    assert_eq!(k, k2);
+                }
+            }
+            // A deferring row pays the bounded scan AND the order, so its
+            // honest cost is the sum; an answering one pays only the scan.
+            let answers = {
+                let mut k = vec![0u8; vocab];
+                super::nucleus_prefix(row, p, &mut k)
+            };
+            let paid = if answers {
+                part_ns as f64 / 3e6
+            } else {
+                (part_ns + ord_ns) as f64 / 3e6
+            };
+            println!(
+                "row {at} ({}): ordered {:.2} ms, now {:.2} ms, {:.2}x",
+                if answers { "answers" } else { "defers" },
+                ord_ns as f64 / 3e6,
+                paid,
+                ord_ns as f64 / 3e6 / paid
+            );
+        }
+    }
+    /// Broadcast answers what a coordinate walk answers, on the shapes the
+    /// fast path takes and the shapes it does not.
+    #[test]
+    fn a_broadcast_is_its_coordinate_walk() {
+        use crate::value::Value;
+        fn walked(v: &Value, src: &[u32], target: &[u32]) -> Value {
+            let r = target.len();
+            let sdim = |i: usize| -> u64 { if i < src.len() { u64::from(src[i]) } else { 1 } };
+            let mut sstride = vec![1u64; r.max(1)];
+            for i in (0..r.saturating_sub(1)).rev() {
+                sstride[i] = sstride[i + 1] * sdim(i + 1);
+            }
+            let n: usize = target.iter().map(|&d| d as usize).product::<usize>().max(1);
+            let mut idx = Vec::with_capacity(n);
+            for lin in 0..n as u64 {
+                let mut rem = lin;
+                let mut sidx = 0u64;
+                for i in 0..r {
+                    let mut stride = 1u64;
+                    for &d in &target[i + 1..r] {
+                        stride *= u64::from(d);
+                    }
+                    let stride = stride.max(1);
+                    let coord = rem / stride;
+                    rem %= stride;
+                    if sdim(i) != 1 {
+                        sidx += coord * sstride[i];
+                    }
+                }
+                idx.push(Some(sidx as usize));
+            }
+            super::gather_flat(v, &idx)
+        }
+
+        let cases: Vec<(Vec<f32>, Vec<u32>, Vec<u32>)> = vec![
+            // The sampler's own: one scalar over a vocabulary row.
+            (vec![0.25], vec![1], vec![1, 64]),
+            (vec![0.25], vec![1, 1], vec![3, 64]),
+            // A row over rows, which the fast path declines.
+            ((0..8).map(|i| i as f32).collect(), vec![1, 8], vec![5, 8]),
+            // A column over columns.
+            ((0..5).map(|i| i as f32).collect(), vec![5, 1], vec![5, 8]),
+            // Rank three, where the hoisted strides had to be right.
+            (
+                (0..6).map(|i| i as f32).collect(),
+                vec![1, 3, 2],
+                vec![4, 3, 2],
+            ),
+            (
+                (0..4).map(|i| i as f32).collect(),
+                vec![4, 1, 1],
+                vec![4, 3, 2],
+            ),
+        ];
+        for (data, src, target) in cases {
+            let v = Value::F32(data);
+            assert_eq!(
+                super::broadcast_value(&v, &src, &target),
+                walked(&v, &src, &target),
+                "src {src:?} -> {target:?}"
+            );
+        }
     }
 }

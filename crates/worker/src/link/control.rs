@@ -23,6 +23,10 @@ use super::partner::PartnerLinkManager;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 /// Coarse-load report cadence; the controller coalesces these per epoch.
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the dial-in links are checked for death when the roster is quiet.
+/// Cheap (a `JoinHandle::is_finished` per link) and only ever leads to work
+/// when a link has actually ended, so this can be brisk.
+const LINK_HEAL_INTERVAL: Duration = Duration::from_secs(2);
 /// `watch_worker` long-poll client deadline; must exceed the controller's
 /// `T_HANG` keepalive so its same-epoch return always lands before we time out.
 const WATCH_DEADLINE: Duration = Duration::from_secs(300);
@@ -206,21 +210,38 @@ pub fn spawn_control_tasks<C: ControlLink>(
 
     let watch_task = tokio::spawn(async move {
         let mut rx = ctrl.neighbors_watch(worker_id);
+        let mut last = rx.borrow_and_update().clone();
         loop {
-            let neighbors = rx.borrow_and_update().clone();
             tracing::debug!(
                 worker = %worker_id,
-                peers = neighbors.peers.len(),
-                gateways = neighbors.gateways.len(),
-                epoch = neighbors.epoch,
+                peers = last.peers.len(),
+                gateways = last.gateways.len(),
+                epoch = last.epoch,
                 "neighbor view updated"
             );
-            gateways.reconcile(&neighbors.gateways).await;
+            gateways.reconcile(&last.gateways).await;
             if let Some(partners) = partners.as_ref() {
-                partners.lock().await.reconcile(&neighbors.peers).await;
+                partners.lock().await.reconcile(&last.peers).await;
             }
-            if rx.changed().await.is_err() {
-                break; // controller gone → shutdown
+            // A roster change is not the only reason a link needs attention:
+            // one can simply die. Waiting only on `changed()` meant a worker
+            // whose gateway link broke stayed dead forever in any deployment
+            // where the roster is static — which is every standalone one.
+            loop {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            return; // controller gone → shutdown
+                        }
+                        last = rx.borrow_and_update().clone();
+                        break;
+                    }
+                    _ = tokio::time::sleep(LINK_HEAL_INTERVAL) => {
+                        if !gateways.reap_dead().is_empty() {
+                            break; // re-dial on the next pass through
+                        }
+                    }
+                }
             }
         }
     });

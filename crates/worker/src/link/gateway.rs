@@ -181,6 +181,35 @@ impl GatewayLinkManager {
         }
     }
 
+    /// Drop links whose serve task has ended, so the next [`reconcile`] dials
+    /// them again. Returns the addresses reaped.
+    ///
+    /// A link dies when its transport does — a codec error on an oversized
+    /// frame, a gateway restart, a dropped connection. Nothing used to remove
+    /// it: the entry stayed in `links`, `reconcile`'s dial step skips every
+    /// address already there, and the worker sat holding a dead handle while
+    /// every dispatch timed out. In a standalone deployment, where the roster
+    /// never changes and `reconcile` is never called again, that was permanent.
+    ///
+    /// [`reconcile`]: Self::reconcile
+    pub fn reap_dead(&mut self) -> Vec<String> {
+        let dead: Vec<String> = self
+            .links
+            .iter()
+            .filter(|(_, link)| link.serve_task.is_finished())
+            .map(|(addr, _)| addr.clone())
+            .collect();
+        for addr in &dead {
+            self.links.remove(addr);
+            tracing::warn!(
+                worker = %self.worker_id,
+                gateway = %addr,
+                "gateway link died; dropping it so it can be re-dialed"
+            );
+        }
+        dead
+    }
+
     /// The addresses currently linked — the advertised URL / boot banner.
     pub fn addrs(&self) -> Vec<String> {
         let mut addrs: Vec<String> = self.links.keys().cloned().collect();
@@ -742,4 +771,3 @@ fn upload_chunk_info(m: &ClientMessage) -> Option<(usize, usize)> {
         _ => None,
     }
 }
-

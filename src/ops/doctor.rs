@@ -259,7 +259,18 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Vec<(String, String, 
     // artifact store is on this disk, not in the file. `weights::resolve` is
     // the same call the worker makes, so a pass here means the worker's will
     // pass too.
-    match worker::weights::resolve(&worker.model.model) {
+    //
+    // With the flavor this binary hosts, because that is what the worker
+    // resolves with: a model imported for two shells is two files in one
+    // directory, and "can pie find it" is only answerable for one engine at
+    // a time. A config naming an engine this build lacks has no flavor, and
+    // the lookup then reports the ambiguity rather than a pick.
+    let flavor = worker::backend::flavor::resolve(worker.model.engine.kind, &worker.model.name);
+    let want = worker::weights::Want {
+        backend: flavor.as_ref().ok().map(|flavor| flavor.as_str()),
+        sku: worker.model.sku.as_deref(),
+    };
+    match worker::weights::resolve(&worker.model.model, want) {
         Ok(resolved) => out.push((
             "weights".into(),
             match resolved {
@@ -309,7 +320,7 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Vec<(String, String, 
 /// Not `flavor::compiled_summary()`, which lists what this binary HAS: the
 /// point of naming an unknown type is to say which spellings exist at all,
 /// and on a binary with no feature on that summary is empty.
-const KNOWN_ENGINES: &str = "cuda, metal";
+const KNOWN_ENGINES: &str = "cuda, metal, vulkan, wgpu";
 
 /// Why an engine flavor this binary does not have is missing.
 ///
@@ -328,6 +339,12 @@ fn absent_because(name: &str) -> String {
             "not compiled — build with `--features metal`".to_string()
         }
         "metal" => "metal engines run on Apple hardware only".to_string(),
+        // One answer, not Metal's two: the Vulkan shell has no target half,
+        // so leaving the feature off is the only way to be without it.
+        "vulkan" => "not compiled — build with `--features vulkan`".to_string(),
+        // One answer here too: wgpu picks its backend at run time, so there is
+        // no target half and the feature is the whole of it.
+        "wgpu" => "not compiled — build with `--features wgpu`".to_string(),
         other => format!("unknown engine type `{other}`; this build knows: {KNOWN_ENGINES}"),
     }
 }

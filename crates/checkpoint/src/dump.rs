@@ -31,6 +31,7 @@ fn tile_map_name(kind: TileMapKind) -> &'static str {
         TileMapKind::Repack => "Repack",
         TileMapKind::Scale => "Scale",
         TileMapKind::Bias => "Bias",
+        TileMapKind::Unary => "Unary",
     }
 }
 

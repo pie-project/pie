@@ -15,7 +15,13 @@
 ///  * rounding is half away from zero, not half to even; `eps` floors the
 ///    scale so a constant group divides by `1e-7` instead of by zero.
 pub fn mlx_affine_group_params(values: &[f64]) -> (f32, f32) {
-    const N_BINS: f32 = 15.0;
+    mlx_affine_group_params_bits(values, 4)
+}
+
+/// The same rule at any code width: `2^bits - 1` bins.
+pub fn mlx_affine_group_params_bits(values: &[f64], bits: u32) -> (f32, f32) {
+    #[allow(clippy::cast_precision_loss)]
+    let n_bins = ((1u32 << bits) - 1) as f32;
     const EPS: f32 = 1e-7;
     let mut w_min = f32::INFINITY;
     let mut w_max = 0.0f32;
@@ -25,7 +31,7 @@ pub fn mlx_affine_group_params(values: &[f64]) -> (f32, f32) {
         w_max = w_max.max(value);
     }
     let mask = w_min.abs() > w_max.abs();
-    let mut scale = ((w_max - w_min) / N_BINS).max(EPS);
+    let mut scale = ((w_max - w_min) / n_bins).max(EPS);
     if !mask {
         scale = -scale;
     }

@@ -266,5 +266,4 @@ mod tests {
         // reason there is no --all.
         assert!(chosen.iter().all(|e| e.name != "models"));
     }
-
 }

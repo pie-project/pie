@@ -74,9 +74,15 @@ impl StartupBanner {
                 content_width = content_width
             ));
         }
-        out.push_str(&format!("╰{}╯\n\n", "─".repeat(inner_width)));
-        out.push_str(&format!("✓ Server ready at {url}"));
+        out.push_str(&format!("╰{}╯", "─".repeat(inner_width)));
         out
     }
+}
+
+/// The one line a supervisor waits for. Not part of [`StartupBanner::render`]
+/// because the box is presentation and this is a readiness contract: the box
+/// may be suppressed, this may not.
+pub(super) fn ready_line(url: &str) -> String {
+    format!("✓ Server ready at {url}")
 }
 

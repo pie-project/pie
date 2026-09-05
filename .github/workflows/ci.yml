@@ -95,8 +95,8 @@ jobs:
             -p model-exec -p eta-exec \
             -p runtime -p gateway -p grammar -p inferlet \
             -p inferlet-macros -p pie -p tokenizer -p worker \
-            -p kernels-metal -p kernels-cuda \
-            -p engine-metal \
+            -p kernels-metal -p kernels-cuda -p kernels-vulkan -p kernels-wgpu \
+            -p engine-metal -p engine-vulkan -p engine-wgpu \
             -p model-dsl -p model-ir \
             -- -D warnings
 
@@ -121,9 +121,9 @@ jobs:
             -p bootstrap -p client -p controller -p engine \
             -p model-exec -p eta-exec \
             -p gateway -p grammar -p inferlet \
-            -p inferlet-macros -p kernels-metal \
+            -p inferlet-macros -p kernels-metal -p kernels-vulkan -p kernels-wgpu \
             -p pie -p pie-server-py -p tokenizer \
-            -p engine-metal \
+            -p engine-metal -p engine-vulkan -p engine-wgpu \
             -p model-dsl -p model-ir
 
   # Full-workspace verification — the guardrail + anti-bitrot net. The

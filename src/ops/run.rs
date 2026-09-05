@@ -304,6 +304,7 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: RunArgs) -> Result<crate:
         &args.arguments,
     )
     .await;
+    fire_probes().await;
     pie.shutdown().await;
     // Quiet, because the inferlet's own output already went to stdout as it
     // was produced -- there is nothing left to render. The status is the
@@ -311,6 +312,58 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: RunArgs) -> Result<crate:
     // that failed.
     Ok(crate::ui::Answer::quiet().with_code(outcome?))
 }
+
+/// Print the scheduler's per-fire probes, which `--features profile-fire`
+/// collects and nothing on this path could previously read: the stats query
+/// that surfaces them is a client message the serving door answers, and
+/// `pie run` boots the engine, drives one program and exits.
+///
+/// Compiled away without the feature, because every probe reads zero then and
+/// a table of zeroes is worse than no table.
+#[cfg(feature = "profile-fire")]
+async fn fire_probes() {
+    let s = runtime::scheduler::get_stats().await;
+    let fires = s.total_batches.max(1);
+    let per = |sum: u64| sum as f64 / fires as f64 / 1000.0;
+    println!();
+    println!("fires {fires}  tokens {}", s.total_tokens_processed);
+    println!(
+        "  inter-fire        {:7.3} ms   = execute {:.3} + post-dispatch-to-fire {:.3}",
+        per(s.fire.inter_fire_us_sum),
+        per(s.fire.execute.total_us_sum),
+        per(s.fire.post_dispatch_to_fire_us_sum),
+    );
+    println!(
+        "    execute         {:7.3} ms   batch-build {:.3}  engine-fire {:.3}",
+        per(s.fire.execute.total_us_sum),
+        per(s.fire.execute.batch_build_us_sum),
+        per(s.fire.execute.engine_fire_us_sum),
+    );
+    println!(
+        "    accumulate      {:7.3} ms   fire-prepare {:.3}  recv-block {:.3}",
+        per(s.fire.accumulate.accum_loop_us_sum),
+        per(s.fire.pre_dispatch.fire_prepare_us_sum),
+        per(s.fire.recv_block_wait_us_sum),
+    );
+    let submits = s.host_submit.submits.max(1);
+    let sub = |sum: u64| sum as f64 / submits as f64 / 1000.0;
+    println!(
+        "  guest submit      {:7.3} ms   over {submits} submits",
+        sub(s.host_submit.total_us),
+    );
+    println!(
+        "    drain-settled {:.3}  geometry {:.3}  kv-prepare {:.3}  scheduler-submit {:.3}  shadow {:.3}  validate {:.3}",
+        sub(s.host_submit.drain_settled_us),
+        sub(s.host_submit.geometry_us),
+        sub(s.host_submit.kv_prepare_us),
+        sub(s.host_submit.scheduler_submit_us),
+        sub(s.host_submit.shadow_advance_us),
+        sub(s.host_submit.validate_frame_us),
+    );
+}
+
+#[cfg(not(feature = "profile-fire"))]
+async fn fire_probes() {}
 
 /// Connect, upload if local, launch, and mirror everything the process says.
 async fn drive(
@@ -432,5 +485,4 @@ mod tests {
             serde_json::json!({"prompt": "The capital of France is"})
         );
     }
-
 }

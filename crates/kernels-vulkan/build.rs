@@ -1,0 +1,283 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Tier {
+    Baseline,
+    Fp16,
+    Coopmat,
+}
+
+impl Tier {
+    fn from_tag(tag: &str) -> Option<Tier> {
+        match tag {
+            "baseline" => Some(Tier::Baseline),
+            "fp16" => Some(Tier::Fp16),
+            "coopmat" => Some(Tier::Coopmat),
+            _ => None,
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Tier::Baseline => "baseline",
+            Tier::Fp16 => "fp16",
+            Tier::Coopmat => "coopmat",
+        }
+    }
+}
+
+struct Variant {
+    file: PathBuf,
+    tier: Tier,
+    defines: Vec<(String, String)>,
+}
+
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=kernels");
+    println!("cargo:rerun-if-env-changed=PIE_SLANGC");
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let kernels = root.join("kernels");
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+
+    let variants = collect(&kernels);
+    assert!(
+        !variants.is_empty(),
+        "no `// pie:instantiate` line under {} — the directive is how a \
+         variant is declared, so an empty tree ships an empty census",
+        kernels.display()
+    );
+    emit_census(&out, &variants);
+
+    if std::env::var_os("CARGO_FEATURE_NATIVE").is_none() {
+        emit_modules(&out, &[]);
+        return;
+    }
+
+    let spv = out.join("spv");
+    std::fs::create_dir_all(&spv).expect("create the SPIR-V output directory");
+    let slangc =
+        std::env::var_os("PIE_SLANGC").map_or_else(|| PathBuf::from("slangc"), PathBuf::from);
+
+    let jobs: Vec<(&String, &Variant)> = variants
+        .iter()
+        .map(|((name, _), variant)| (name, variant))
+        .collect();
+    compile_all(&slangc, &kernels, &spv, &jobs);
+    let rows: Vec<(String, &'static str, PathBuf)> = jobs
+        .iter()
+        .map(|(name, variant)| {
+            (
+                (*name).clone(),
+                variant.tier.tag(),
+                spv.join(format!("{name}.spv")),
+            )
+        })
+        .collect();
+    emit_modules(&out, &rows);
+}
+
+fn compile_all(slangc: &Path, kernels: &Path, spv: &Path, jobs: &[(&String, &Variant)]) {
+    let width = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failures = std::sync::Mutex::new(Vec::<String>::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..width.min(jobs.len().max(1)) {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((entrypoint, variant)) = jobs.get(i) else {
+                        return;
+                    };
+                    if let Err(why) = compile(slangc, kernels, spv, entrypoint, variant) {
+                        failures.lock().expect("no panicking worker").push(why);
+                    }
+                }
+            });
+        }
+    });
+
+    let failures = failures.into_inner().expect("no panicking worker");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+fn compile(
+    slangc: &Path,
+    kernels: &Path,
+    spv: &Path,
+    entrypoint: &str,
+    variant: &Variant,
+) -> Result<(), String> {
+    let src = kernels.join(&variant.file);
+    let dst = spv.join(format!("{entrypoint}.spv"));
+
+    let mut cmd = Command::new(slangc);
+    cmd.arg("-target")
+        .arg("spirv")
+        .arg("-stage")
+        .arg("compute")
+        .arg("-entry")
+        .arg("main")
+        .arg("-fvk-use-entrypoint-name")
+        .arg("-emit-spirv-directly")
+        .arg("-allow-glsl")
+        .arg("-I")
+        .arg(kernels)
+        .arg(format!("-DPIE_ENTRYPOINT={entrypoint}"))
+        .arg("-O2");
+    for (key, value) in &variant.defines {
+        cmd.arg(format!("-D{key}={value}"));
+    }
+    cmd.arg("-o").arg(&dst).arg(&src);
+
+    let output = cmd.output().map_err(|e| {
+        format!(
+            "cannot run `{}` for `{entrypoint}` ({}): {e}. Put slangc on PATH \
+             or set PIE_SLANGC.",
+            slangc.display(),
+            variant.file.display()
+        )
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "slangc refused `{entrypoint}` ({}, tier {}): {}\n{}",
+        variant.file.display(),
+        variant.tier.tag(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+fn emit_census(out: &Path, variants: &BTreeMap<(String, Tier), Variant>) {
+    let mut names: Vec<&str> = variants.keys().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+
+    let mut text = String::from(
+        "// Generated by build.rs from the tree's `// pie:instantiate` lines.\n\
+         pub static CENSUS: &[&str] = &[\n",
+    );
+    for name in names {
+        text.push_str(&format!("    {name:?},\n"));
+    }
+    text.push_str("];\n");
+    std::fs::write(out.join("census.rs"), text).expect("OUT_DIR is writable");
+}
+
+fn emit_modules(out: &Path, rows: &[(String, &'static str, PathBuf)]) {
+    let mut rows = rows.to_vec();
+    rows.sort();
+    let mut text = String::from(
+        "// Generated by build.rs. Every compiled SPIR-V module: entrypoint, tier, words.\n\
+         pub static MODULES: &[(&str, &str, &[u8])] = &[\n",
+    );
+    for (name, tier, path) in &rows {
+        let path = path.to_string_lossy().replace('\\', "/");
+        text.push_str(&format!(
+            "    ({name:?}, {tier:?}, include_bytes!({path:?})),\n"
+        ));
+    }
+    text.push_str("];\n");
+    std::fs::write(out.join("modules.rs"), text).expect("OUT_DIR is writable");
+}
+
+fn collect(kernels: &Path) -> BTreeMap<(String, Tier), Variant> {
+    let mut out: BTreeMap<(String, Tier), Variant> = BTreeMap::new();
+    let mut files = Vec::new();
+    walk(kernels, &mut files);
+    files.sort();
+
+    for path in files {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let rel = path
+            .strip_prefix(kernels)
+            .expect("walk yields paths under kernels/")
+            .to_path_buf();
+
+        for (lineno, line) in text.lines().enumerate() {
+            let Some(rest) = directive(line) else {
+                continue;
+            };
+            let at = format!("{}:{}", rel.display(), lineno + 1);
+            let mut words = rest.split_whitespace().peekable();
+            let entrypoint = words
+                .next()
+                .unwrap_or_else(|| panic!("{at}: a `pie:instantiate` names an entrypoint first"))
+                .to_string();
+
+            let tier = match words.peek().and_then(|w| w.strip_prefix('@')) {
+                Some(tag) => {
+                    let tier = Tier::from_tag(tag).unwrap_or_else(|| {
+                        panic!("{at}: `@{tag}` is not a tier (baseline, fp16, coopmat)")
+                    });
+                    words.next();
+                    tier
+                }
+                None => Tier::Baseline,
+            };
+
+            let defines = words
+                .map(|w| {
+                    let (k, v) = w
+                        .split_once('=')
+                        .unwrap_or_else(|| panic!("{at}: `{w}` is not a `KEY=VALUE` define"));
+                    (k.to_string(), v.to_string())
+                })
+                .collect();
+
+            if let Some(prior) = out.insert(
+                (entrypoint.clone(), tier),
+                Variant {
+                    file: rel.clone(),
+                    tier,
+                    defines,
+                },
+            ) {
+                panic!(
+                    "`{entrypoint}` is instantiated twice at tier `{}`: {} and {}",
+                    tier.tag(),
+                    prior.file.display(),
+                    rel.display()
+                );
+            }
+        }
+    }
+
+    let mut seen: BTreeMap<&str, Tier> = BTreeMap::new();
+    for (entrypoint, tier) in out.keys() {
+        if let Some(prior) = seen.insert(entrypoint.as_str(), *tier) {
+            panic!(
+                "`{entrypoint}` is instantiated at tiers `{}` and `{}`; a tiered variant \
+                 takes its own name, since the table is keyed by name",
+                prior.tag(),
+                tier.tag()
+            );
+        }
+    }
+    out
+}
+
+fn directive(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("//")?.trim_start();
+    rest.strip_prefix("pie:instantiate").map(str::trim)
+}
+
+fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("cannot read the directory {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("a readable directory entry").path();
+        if path.is_dir() {
+            walk(&path, out);
+        } else if path.extension().is_some_and(|e| e == "slang") {
+            out.push(path);
+        }
+    }
+}

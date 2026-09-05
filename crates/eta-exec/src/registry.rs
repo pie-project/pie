@@ -217,8 +217,8 @@ impl Registry {
         let numel = crate::shape_numel(&shape);
 
         let lanes = usize::try_from(numel).unwrap_or(usize::MAX);
-        let bytes = u64::try_from(wire_cell_bytes(concrete_dtype(dtype), lanes))
-            .unwrap_or(u64::MAX);
+        let bytes =
+            u64::try_from(wire_cell_bytes(concrete_dtype(dtype), lanes)).unwrap_or(u64::MAX);
         if bytes == 0 || bytes > u64::from(u32::MAX) {
             return Err(Error {
                 message: format!(
@@ -261,12 +261,9 @@ impl Registry {
         channel_ids: &[u64],
         seeds: &[(u64, Vec<u8>)],
     ) -> Result<u64> {
-        let program = self
-            .programs
-            .get(&program_id)
-            .ok_or_else(|| Error {
-                message: format!("no program {program_id}"),
-            })?;
+        let program = self.programs.get(&program_id).ok_or_else(|| Error {
+            message: format!("no program {program_id}"),
+        })?;
         let instance_id = requested_id.unwrap_or(self.next_instance);
         if self.instances.contains_key(&instance_id) {
             return Err(Error {
@@ -291,12 +288,9 @@ impl Registry {
         }
 
         for (slot, &channel_id) in channel_ids.iter().enumerate() {
-            let endpoint = self
-                .channels
-                .get(&channel_id)
-                .ok_or_else(|| Error {
-                    message: format!("channel {channel_id} is not registered"),
-                })?;
+            let endpoint = self.channels.get(&channel_id).ok_or_else(|| Error {
+                message: format!("channel {channel_id} is not registered"),
+            })?;
             check_slot(slot, endpoint, &program.channels[slot])?;
         }
 
@@ -336,10 +330,8 @@ impl Registry {
                 });
             }
             let value =
-                decode_wire(bytes, concrete_dtype(endpoint.dtype), lanes).ok_or_else(|| {
-                    Error {
-                        message: format!("the seed for channel {channel_id} does not decode"),
-                    }
+                decode_wire(bytes, concrete_dtype(endpoint.dtype), lanes).ok_or_else(|| Error {
+                    message: format!("the seed for channel {channel_id} does not decode"),
                 })?;
             if !endpoint.state.is_empty() {
                 return Err(Error {

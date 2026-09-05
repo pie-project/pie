@@ -25,7 +25,33 @@ use crate::session::Sessions;
 
 /// Max frame on the worker link. Token chunks are small; large blobs ride
 /// out-of-band HTTP, so 8 MiB is ample headroom.
-const WORKER_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+///
+/// **This is a hard edge, not a soft one.** A `dispatch` that exceeds it fails
+/// at the codec and takes the tarpc connection with it, so nothing a client can
+/// send may be allowed to reach this size — see [`MAX_CLIENT_FRAME_BYTES`],
+/// which the ingress enforces against exactly this number.
+pub(crate) const WORKER_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most one client frame may carry, enforced at the ingress.
+///
+/// One MiB under the worker frame, which is orders of magnitude more than the
+/// envelope the gateway wraps a turn in (a `ReqId`, a session, a tenant, a
+/// priority) — so a frame this size always dispatches, while the limit stays as
+/// close as it safely can to what the transport already carried. Cutting it
+/// harder would refuse traffic that works today: before this existed everything
+/// under `WORKER_MAX_FRAME_BYTES` was served, and only what crossed it broke the
+/// worker link permanently and answered `no worker available`, a cluster-outage
+/// message for a client-side error.
+pub const MAX_CLIENT_FRAME_BYTES: usize = WORKER_MAX_FRAME_BYTES - (1024 * 1024);
+
+/// What the WebSocket transport will still *receive* before closing the socket.
+///
+/// Deliberately above [`MAX_CLIENT_FRAME_BYTES`]: a frame in the gap is read in
+/// full so the client can be told its request is too large and keep its session,
+/// which a transport-level close cannot do. Beyond this the socket closes, which
+/// is rude but bounded — and 256 KiB still stands between it and the worker's
+/// frame cap, the one edge that must never be reached.
+pub const MAX_CLIENT_FRAME_RECV_BYTES: usize = WORKER_MAX_FRAME_BYTES - (256 * 1024);
 
 /// Why a [`WorkerRegistry::dispatch`] could not reach the worker — distinct
 /// from the worker's own [`Accepted`] answer. Both mean "advance to the next

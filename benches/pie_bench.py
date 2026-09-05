@@ -334,9 +334,18 @@ def build_config(args: argparse.Namespace):
         # one lane. Size `--total-pages` to `fleet * max_model_len / 16`.
         engine_options["max_model_len"] = args.max_model_len
         # A recurrent model's state pool is sized by `max_state_slots` (default
-        # 256 seats: ~30 GiB of delta state for a qwen3.8-class trunk); one seat
-        # per lane is what a bench needs.
-        engine_options["max_state_slots"] = max(1, args.max_forward_requests)
+        # 256 seats: ~30 GiB of delta state for a qwen3.8-class trunk).
+        #
+        # TWO seats a lane, not one. A lane holds one recurrent-state slot per
+        # POSTED FRAME, so on a hybrid trunk `seat_cost` is 2 and a pool sized
+        # one-per-lane seats half the lanes asked for -- the engine says so at
+        # every boot ("requested=32 seated=16 seat_cost=2") and then fires
+        # batches bounded by `seated`, not by `max_forward_requests`. Measured on
+        # an M1 Max over three interleaved passes, doubling it is worth +25% at
+        # 32 concurrent and +23% at 64, with the ranges disjoint; going wider
+        # again buys nothing, which is what fixes the multiplier at the seat
+        # cost rather than higher.
+        engine_options["max_state_slots"] = max(1, args.max_forward_requests) * 2
         for raw in getattr(args, "engine_option", []) or []:
             key, sep, value = raw.partition("=")
             if not sep:

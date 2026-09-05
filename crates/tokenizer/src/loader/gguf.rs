@@ -125,6 +125,15 @@ fn pipeline_named(pre: Option<&str>) -> Result<Pipeline> {
             r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
             true,
         ),
+        // Not `qwen2` with a new name: the letter classes take combining
+        // marks too (`[\p{L}\p{M}]` for `\p{L}`, and `\p{M}` joins the
+        // negated set), so a decomposed grapheme splits where `qwen2` would
+        // cut it. Copied from the model's own `tokenizer.json`, whose
+        // normalizer is NFC.
+        "qwen35" => (
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            true,
+        ),
         "" => bail!(
             "this GGUF names no tokenizer.ggml.pre, so its pre-tokenizer is \
              not recoverable -- llama.cpp writes the name of a hard-coded \

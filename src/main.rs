@@ -198,9 +198,11 @@ async fn serve(global: bootstrap::GlobalArgs) -> anyhow::Result<ExitCode> {
     // makes no network call. Best-effort: a present runtime is a no-op; a
     // failure is logged, not fatal here.
     let want_python = worker.sandbox.python_runtime;
-    tokio::task::spawn_blocking(move || local::py_runtime::ensure_installed_best_effort(want_python))
-        .await
-        .ok();
+    tokio::task::spawn_blocking(move || {
+        local::py_runtime::ensure_installed_best_effort(want_python)
+    })
+    .await
+    .ok();
     let handle = compose::run_standalone(controller, gateway, worker).await?;
     tracing::info!(
         listen = %handle.listen_addr,

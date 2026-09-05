@@ -345,8 +345,19 @@ fn load_model_engines(
 
         let mut embedded_base_opts = crate::backend::build_options(m, flavor)?;
         apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
-        let resolved_model = weights::resolve(&m.model)
-            .with_context(|| format!("resolving the model for {:?}", m.name))?;
+        // The flavor resolved above, handed to the store lookup: a model
+        // directory holds one artifact per shell, and this binary hosts
+        // exactly one of them. Without it a `[model] model` naming a model
+        // imported for two backends would be ambiguous on every box that
+        // has both.
+        let resolved_model = weights::resolve(
+            &m.model,
+            weights::Want {
+                backend: Some(flavor.as_str()),
+                sku: m.sku.as_deref(),
+            },
+        )
+        .with_context(|| format!("resolving the model for {:?}", m.name))?;
         // Lifted once, here, in one open; the runtime gets the whole of it
         // through `ModelMetadata`. Nobody downstream re-opens the artifact
         // or re-parses `config.json`.
@@ -641,11 +652,23 @@ fn build_partner_bootstrap(
     })
 }
 
-/// Print the bootstrap banner when `server.verbose` is set.
+/// Announce readiness — always — and draw the box when `server.verbose` is set.
+///
+/// The `✓ Server ready at` line is the readiness contract every supervisor and
+/// harness waits on (`benches/pie_bench.py` greps for exactly that phrase), so
+/// it cannot ride a presentation flag: under `verbose = false`, the production
+/// setting, the server used to bind, register and serve while saying nothing,
+/// and anything waiting for it waited forever. It goes to stdout, where a
+/// reader of the process's output looks for it, and is flushed so a pipe sees
+/// it before the next thing this process does.
 fn log_serving(cfg: &config::Config, url: &str) {
+    use std::io::Write;
+
     if cfg.server.verbose {
         eprintln!("{}", StartupBanner::from_config(cfg).render(url));
     }
+    println!("{}", banner::ready_line(url));
+    let _ = std::io::stdout().flush();
 }
 
 /// Build the client-facing edge server + control plane for the resolved

@@ -40,14 +40,20 @@ pub fn classify(sku: &str) -> Result<models::ClassifyFn> {
         .ok_or_else(|| anyhow!("{}", no_such_sku(sku)))
 }
 
-/// The one refusal both doors above raise: an unknown SKU, with the ones this build ships.
+/// The one refusal these doors raise: an unknown SKU, with the ones this
+/// build ships.
+///
+/// One name per line rather than one comma-joined paragraph: this is also
+/// what `pie model import --sku <a name that is not a row>` prints, and the
+/// catalog is sixty-odd rows long — a list an operator has to READ, to pick
+/// the row they meant.
 fn no_such_sku(sku: &str) -> String {
     format!(
-        "this build ships no SKU named {sku:?}; it ships {}",
+        "this build ships no SKU named {sku:?}; it ships:\n  {}",
         models::skus()
             .map(|sku| sku.name.as_str())
             .collect::<Vec<_>>()
-            .join(", ")
+            .join("\n  ")
     )
 }
 
@@ -138,7 +144,14 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<&'static str> {
 
 /// The setup this binary serves, for the commands that convert rather than
 /// serve (a converter has no shell to ask, so it names the box it runs on).
-/// CUDA wins when both shells are linked; `None` when neither engine links.
+/// `None` when no engine links.
+///
+/// **THE ORDER IS THE POLICY**, and it is vendor-specific first: CUDA wins
+/// over everything, Metal over the two portable shells on a Mac, then Vulkan,
+/// then wgpu. Each is a shell that runs on the same card the one above it
+/// does — wgpu reaches its device THROUGH Vulkan on a Linux box — so a build
+/// carrying several would convert for the thinnest of them if this order were
+/// the other way round.
 #[must_use]
 pub fn this_box() -> Option<Platform> {
     #[cfg(feature = "cuda")]
@@ -148,6 +161,23 @@ pub fn this_box() -> Option<Platform> {
     #[cfg(all(not(feature = "cuda"), feature = "metal", target_vendor = "apple"))]
     {
         return Some(Platform::Metal);
+    }
+    #[cfg(all(
+        not(feature = "cuda"),
+        not(all(feature = "metal", target_vendor = "apple")),
+        feature = "vulkan"
+    ))]
+    {
+        return Some(Platform::Vulkan);
+    }
+    #[cfg(all(
+        not(feature = "cuda"),
+        not(all(feature = "metal", target_vendor = "apple")),
+        not(feature = "vulkan"),
+        feature = "wgpu"
+    ))]
+    {
+        return Some(Platform::Wgpu);
     }
     #[allow(unreachable_code)]
     None
@@ -174,7 +204,11 @@ pub fn verify_artifact(artifact: &Path, platform: Platform) -> Result<&'static s
 fn backend_of(platform: Platform) -> checkpoint::types::BackendKind {
     match platform {
         Platform::Metal => checkpoint::types::BackendKind::Metal,
-        Platform::Vulkan | Platform::Wgpu => checkpoint::types::BackendKind::Vulkan,
+        Platform::Vulkan => checkpoint::types::BackendKind::Vulkan,
+        // Its OWN kind, no longer folded onto Vulkan's: a `.wgpu.zt` is its
+        // own artifact, so the plan a wgpu box compiles is the plan its
+        // stamp names.
+        Platform::Wgpu => checkpoint::types::BackendKind::Wgpu,
         Platform::Cuda => checkpoint::types::BackendKind::Cuda,
     }
 }
@@ -188,15 +222,14 @@ pub fn conversion_contract(
     metadata: &Metadata,
     platform: Platform,
 ) -> Option<(&'static str, ModelContract)> {
-    let target = checkpoint::plan::StorageTarget {
-        tile_map_mask: checkpoint::plan::CONVERT_TILE_MAP_MASK,
-        ..checkpoint::plan::StorageTarget::default()
-    };
+    let target = convert_target();
     // `PIE_IMPORT_TRACE=1` says why each row that did not fit did not.
     let trace = std::env::var_os("PIE_IMPORT_TRACE").is_some_and(|v| v != "0");
     // `PIE_IMPORT_SKU=<name>` converts for that row alone — how a parity
     // miniature (a row identification never picks, since every real row
-    // fits first) becomes an artifact.
+    // fits first) becomes an artifact. `pie model import --sku <NAME>` is the
+    // same choice made out loud ([`conversion_contract_named`]): it refuses
+    // by name where this one silently falls through to "no row claims it".
     let pinned = std::env::var("PIE_IMPORT_SKU").ok();
     for (sku, read) in models::fits(source, platform) {
         if pinned.as_deref().is_some_and(|name| name != sku.name) {
@@ -221,6 +254,68 @@ pub fn conversion_contract(
         }
     }
     None
+}
+
+/// What an import compiles against: file bytes on this host, not a device.
+/// Named once so [`conversion_contract`] and [`conversion_contract_named`]
+/// cannot ask the same checkpoint two different questions.
+fn convert_target() -> checkpoint::plan::StorageTarget {
+    checkpoint::plan::StorageTarget {
+        tile_map_mask: checkpoint::plan::CONVERT_TILE_MAP_MASK,
+        ..checkpoint::plan::StorageTarget::default()
+    }
+}
+
+/// The catalog row `name` names, or the refusal that names it and lists what
+/// this build ships.
+///
+/// The name half of [`conversion_contract_named`], reachable on its own so a
+/// command can refuse a misspelling BEFORE it fetches ninety gigabytes of
+/// checkpoint to hold it against.
+pub fn row_named(name: &str) -> Result<&'static str> {
+    Ok(&catalog_row(name)?.name)
+}
+
+/// [`row_named`], as the catalog row itself.
+fn catalog_row(name: &str) -> Result<&'static models::Sku> {
+    models::sku(name).ok_or_else(|| anyhow!("{}", no_such_sku(name)))
+}
+
+/// The contract of ONE NAMED ROW against this checkpoint — `pie model import
+/// --sku <NAME>`.
+///
+/// [`conversion_contract`] answers with the first row that fits, and first
+/// fits wins is why several rows cannot be reached at all: the text row of a
+/// family reads every snapshot its vision row does and is asked first, and a
+/// checkpoint that carries an MTP head identifies as the drafting row whether
+/// or not the operator wants one. This door takes the row from the operator
+/// instead.
+///
+/// **IT NEVER FALLS BACK.** A name this build does not ship is refused with
+/// the catalog, and a row that does not read this checkpoint is refused with
+/// the contract's own account of what it wanted — an import that quietly
+/// converted for a different row than the one asked for would put a SKU in
+/// the stamp and in the filename that the operator did not choose.
+pub fn conversion_contract_named(
+    source: &ztensor::Source,
+    metadata: &Metadata,
+    platform: Platform,
+    name: &str,
+) -> Result<(&'static str, ModelContract)> {
+    let sku = catalog_row(name)?;
+    // The row's own reading, at the row's own width. A sharded row (`-tp2`)
+    // refuses here on its own terms: its import table will not read a WHOLE
+    // checkpoint.
+    let contract = sku
+        .contract(source, platform)
+        .map_err(|why| anyhow!("`{}` does not read this checkpoint: {why}", sku.name))?;
+    checkpoint::plan::compile(metadata, &contract, convert_target()).map_err(|why| {
+        anyhow!(
+            "`{}` reads this checkpoint but does not land on it: {why}",
+            sku.name
+        )
+    })?;
+    Ok((&sku.name, contract))
 }
 
 /// The checkpoint's own tensor table — a snapshot directory or one container.
@@ -346,3 +441,106 @@ pub fn sequence(_trace: &Trace) -> Option<Vec<String>> {
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A checkpoint holding one tensor no row in the catalog reads, so every
+    /// row refuses it — and the refusal is the row's own.
+    fn a_checkpoint_no_row_reads(path: &Path) {
+        let mut writer = ztensor::Writer::create(path).expect("create the checkpoint");
+        writer
+            .add(
+                "a.tensor.no.model.in.this.catalog.reads",
+                vec![1u64],
+                ztensor::Leaf::U8,
+                &[0u8],
+            )
+            .expect("write the stranger");
+        writer.finish().expect("finish the checkpoint");
+    }
+
+    /// `--sku <a name this build does not ship>` refuses BY NAME and prints
+    /// the catalog, because a misspelling is the common case and the operator
+    /// cannot otherwise find out what the rows are called.
+    #[test]
+    fn an_unknown_row_name_is_refused_with_the_catalog() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("stranger.zt");
+        a_checkpoint_no_row_reads(&path);
+        let source = ztensor::Source::open(&path).expect("open the checkpoint");
+        let metadata = checkpoint_metadata(&path).expect("read the checkpoint");
+
+        let why = conversion_contract_named(&source, &metadata, Platform::Cuda, "gemma4-vision")
+            .expect_err("a name no row carries cannot resolve to a row")
+            .to_string();
+        assert!(
+            why.contains("gemma4-vision"),
+            "the refusal names what was asked for: {why}"
+        );
+        let ships = models::skus()
+            .next()
+            .expect("a catalog of at least one row");
+        assert!(
+            why.contains(ships.name.as_str()),
+            "and lists the rows this build ships: {why}"
+        );
+    }
+
+    /// A row that does not read this checkpoint refuses with the CONTRACT'S
+    /// own account, and never falls back to the row that would have fitted.
+    #[test]
+    fn a_row_that_does_not_read_the_checkpoint_refuses_by_name() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("stranger.zt");
+        a_checkpoint_no_row_reads(&path);
+        let source = ztensor::Source::open(&path).expect("open the checkpoint");
+        let metadata = checkpoint_metadata(&path).expect("read the checkpoint");
+
+        let row = models::skus()
+            .find(|sku| sku.recipe.tp == 1)
+            .expect("a one-rank row");
+        let why = conversion_contract_named(&source, &metadata, Platform::Cuda, &row.name)
+            .expect_err("no row reads a checkpoint of one stranger")
+            .to_string();
+        assert!(
+            why.contains(row.name.as_str()),
+            "the refusal names the row that was asked for: {why}"
+        );
+        assert!(
+            why.contains("does not read this checkpoint") || why.contains("does not land on it"),
+            "and says which half of the reading failed: {why}"
+        );
+    }
+
+    /// The default door is unchanged: a checkpoint no row reads is still
+    /// `None` rather than an error, which is what an import turns into its
+    /// own refusal.
+    #[test]
+    fn the_unnamed_door_still_answers_nothing_for_a_checkpoint_no_row_reads() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("stranger.zt");
+        a_checkpoint_no_row_reads(&path);
+        let source = ztensor::Source::open(&path).expect("open the checkpoint");
+        let metadata = checkpoint_metadata(&path).expect("read the checkpoint");
+
+        assert!(conversion_contract(&source, &metadata, Platform::Cuda).is_none());
+    }
+
+    /// Every row an operator can name is a row the catalog can hand back, so
+    /// the vision and MTP rows the identification order hides are reachable
+    /// through the name and not only through the order.
+    #[test]
+    fn the_rows_first_fits_wins_hides_are_reachable_by_name() {
+        for name in [
+            "gemma4-e4b-vision-bf16-kv-bf16",
+            "glm53-flash-u8g64-u2g64-kv-bf16",
+        ] {
+            assert!(
+                models::sku(name).is_some(),
+                "`{name}` is the row this override exists to reach, and the \
+                 catalog no longer ships it under that name"
+            );
+        }
+    }
+}

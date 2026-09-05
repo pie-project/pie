@@ -8,7 +8,7 @@ fn stored_contract(name: &str) -> ModelContract {
     serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: parsing: {err}"))
 }
 use checkpoint::file::{File, Metadata, RawTensor};
-use checkpoint::contract::{Expr, ModelContract, Scales, TensorContract, TensorType};
+use checkpoint::contract::{Expr, ModelContract, Scales, TensorContract, TensorType, UnaryOp};
 use checkpoint::plan::compile as compile_load_plan;
 use checkpoint::plan::{LoadPlan, StorageInstr, StorageTarget, TileMapKind};
 use checkpoint::types::{
@@ -428,6 +428,7 @@ fn a_serving_target_refuses_the_encode_a_conversion_target_runs() {
         BackendKind::Cuda,
         BackendKind::Metal,
         BackendKind::Vulkan,
+        BackendKind::Wgpu,
         BackendKind::Unknown,
     ] {
         let refused = compile_load_plan(
@@ -2402,4 +2403,336 @@ fn the_same_pair_with_the_cast_written_down_encodes() {
     let names: Vec<&str> = plan.tensors.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"runtime.w"), "{names:?}");
     assert!(names.contains(&"runtime.w_scale_inv"), "{names:?}");
+}
+
+/// The one f32 plane a `Unary` test needs, written to a temporary snapshot.
+fn negative_plane(dir: &std::path::Path, values: &[f32]) -> Metadata {
+    let mut bytes = Vec::new();
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("model.safetensors"), &bytes).unwrap();
+    Metadata {
+        files: vec![File {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: bytes.len() as u64,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![RawTensor {
+            id: TensorId(0),
+            name: "ssm_a".to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: bytes.len() as u64,
+            shape: vec![values.len() as i64],
+            encoding: Encoding::Raw(DType::F32),
+        }],
+    }
+}
+
+fn neg_ln_contract() -> ModelContract {
+    ModelContract {
+        groups: Vec::new(),
+        alignment: 1,
+        tensors: vec![TensorContract::new(
+            "a_log",
+            Expr::src("ssm_a").unary(UnaryOp::NegLn),
+            vec![4],
+            Encoding::Raw(DType::F32),
+        )],
+    }
+}
+
+/// `ln(-x)` over the plane, run by the host executor. The values are the
+/// first four of a `Qwen3.5-0.8B-Q4_K_M`'s `blk.0.ssm_a`, and the answers
+/// are that model's safetensors `A_log` — so this pins the arithmetic
+/// against a real pair rather than against itself.
+#[test]
+fn a_unary_takes_the_logarithm_of_a_negated_plane() {
+    let dir = std::env::temp_dir().join(format!("pie_unary_{}", std::process::id()));
+    let stored = [-1.294_096_f32, -0.131_171, -0.119_433, -0.567_561];
+    let metadata = negative_plane(&dir, &stored);
+
+    let plan = compile_load_plan(&metadata, &neg_ln_contract(), StorageTarget::default()).unwrap();
+    let storage = checkpoint::executor::Execution::new(&plan, &dir)
+        .run()
+        .expect("the unary plan executes");
+    let got = storage.tensors.get("a_log").expect("materialized");
+
+    let read: Vec<f32> = got
+        .chunks_exact(4)
+        .map(|word| f32::from_le_bytes(word.try_into().unwrap()))
+        .collect();
+    for (at, (&raw, &want)) in stored
+        .iter()
+        .zip([0.257_812_f32, -2.031_253, -2.125, -0.566_407].iter())
+        .enumerate()
+    {
+        assert!(
+            (read[at] - want).abs() < 1e-4,
+            "element {at}: ln(-{raw}) read as {} not {want}",
+            read[at]
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A value outside the function's domain is a wrong checkpoint, not a
+/// wrong number: `ln(-x)` of a positive element would be `NaN`, which
+/// reaches the weights as fluent nonsense rather than as a failure.
+#[test]
+fn a_unary_refuses_an_element_outside_its_domain() {
+    let dir = std::env::temp_dir().join(format!("pie_unary_bad_{}", std::process::id()));
+    let metadata = negative_plane(&dir, &[-1.0, -2.0, 0.5, -4.0]);
+
+    let plan = compile_load_plan(&metadata, &neg_ln_contract(), StorageTarget::default()).unwrap();
+    let err = checkpoint::executor::Execution::new(&plan, &dir)
+        .run()
+        .expect_err("a positive element is refused")
+        .to_string();
+    assert!(err.contains("strictly negative"), "{err}");
+    assert!(err.contains("element 2"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The transform is import-time only: no device mask carries its bit, so a
+/// serving plan naming one is refused at compile time rather than failing
+/// at boot. That is what keeps the answer in the artifact.
+#[test]
+fn a_serving_target_refuses_the_unary_a_conversion_target_runs() {
+    let dir = std::env::temp_dir().join(format!("pie_unary_mask_{}", std::process::id()));
+    let metadata = negative_plane(&dir, &[-1.0, -2.0, -3.0, -4.0]);
+    let contract = neg_ln_contract();
+
+    for (backend, mask) in [
+        (BackendKind::Cuda, checkpoint::plan::CUDA_TILE_MAP_MASK),
+        (BackendKind::Metal, checkpoint::plan::METAL_TILE_MAP_MASK),
+        (BackendKind::Vulkan, checkpoint::plan::VULKAN_TILE_MAP_MASK),
+        (BackendKind::Wgpu, checkpoint::plan::WGPU_TILE_MAP_MASK),
+    ] {
+        let err = compile_load_plan(
+            &metadata,
+            &contract,
+            StorageTarget {
+                backend,
+                tile_map_mask: mask,
+                ..StorageTarget::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("would apply Some(NegLn) on the way in"), "{backend:?}: {err}");
+    }
+
+    // And the conversion mask, which is where it belongs, does run it.
+    compile_load_plan(
+        &metadata,
+        &contract,
+        StorageTarget {
+            tile_map_mask: checkpoint::plan::CONVERT_TILE_MAP_MASK,
+            ..StorageTarget::default()
+        },
+    )
+    .expect("a conversion target compiles the unary");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The tiled affine repack, at the shapes a shipped row actually has
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The projection rectangles `qwen35-d0.8b-u4g64-kv-bf16` declares
+/// `U4g64tiled`, read off its own artifact.
+///
+/// **`in_ba` is the one that matters.** Thirty-two rows is two whole bands
+/// and narrower than the column tile the kernel carves, and every other
+/// statement of this layout in the tree is exercised at 512 rows or more —
+/// so a map that folded the row axis into the tile would pass everywhere
+/// else and fail here.
+const TILED_ROWS: [(usize, usize); 4] = [
+    (32, 1024),   // in_ba
+    (1024, 2048), // out_proj
+    (7168, 1024), // gate_up
+    (1024, 3584), // down
+];
+
+/// One `[rows, k]` plane of pseudo-random four-bit codes, two to a byte.
+fn tiled_codes(dir: &std::path::Path, rows: usize, k: usize) -> Metadata {
+    let mut bytes = vec![0u8; rows * k / 2];
+    let mut state = 0x2545_f491_4f6c_dd1d_u64 ^ (rows as u64) << 32 ^ k as u64;
+    for byte in &mut bytes {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = (state >> 24) as u8;
+    }
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("model.safetensors"), &bytes).unwrap();
+    Metadata {
+        files: vec![File {
+            id: FileId(0),
+            path: "model.safetensors".to_string(),
+            size_bytes: bytes.len() as u64,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors: vec![RawTensor {
+            id: TensorId(0),
+            name: "proj".to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: bytes.len() as u64,
+            shape: vec![rows as i64, k as i64],
+            encoding: tiled_u4(),
+        }],
+    }
+}
+
+fn tiled_u4() -> Encoding {
+    Encoding::Quant(
+        QuantSpec {
+            scheme: QuantScheme::MlxAffineU4,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 4,
+            group_size: 64,
+            channel_axis: Some(Axis(1)),
+        }
+        .normalized(),
+    )
+}
+
+/// **THE PRODUCTION REPACK IS EXACTLY THE FRAGMENT MAP, AND LOSES NOTHING.**
+///
+/// The layout is written down in four places — `executor::walk`'s
+/// `repack_bytes`, `kernels_cuda`'s `linear/tiled.cuh`, that kernel's own
+/// host repack, and a transcription in `engine-cuda`'s tiled test — and
+/// until this test nothing compared any two of them over the executor. The
+/// gap was not theoretical: a road that published canonical bytes under a
+/// `U4g64tiled` declaration shipped, and every existing test passed, because
+/// each checked a copy of the map against itself rather than against what
+/// the executor writes.
+///
+/// So this reads the map the OTHER way. It runs the real `Expr::Repack`
+/// through `Execution`, then walks the output word by word and scatters each
+/// nibble back to the `(n, k)` the kernel's comment says it came from —
+/// `k = 16*kt + 2*(lane%4) + 8*(s&1) + h`, `n = 16*band + lane/4 + 8*(s>=2)`,
+/// nibble `4*(s + 4*h)`, word order `[band][k quad][lane][4]`. Recovering
+/// the source exactly, with every code written exactly once, is a statement
+/// no self-comparison can make: a permutation that dropped, duplicated or
+/// displaced a nibble fails, and so does one that reads a shape wrong.
+#[test]
+fn the_tiled_repack_is_the_documented_permutation_at_every_shipped_shape() {
+    const BAND: usize = 16;
+    const STEP: usize = 64;
+    for (rows, k) in TILED_ROWS {
+        let dir = std::env::temp_dir().join(format!("pie_tiled_{}_{rows}x{k}", std::process::id()));
+        let metadata = tiled_codes(&dir, rows, k);
+        let banded = rows.div_ceil(BAND) * BAND;
+        let contract = ModelContract {
+            groups: Vec::new(),
+            alignment: 1,
+            tensors: vec![TensorContract::new(
+                "proj.tiled",
+                Expr::src("proj").repack(
+                    RepackLayout::TiledAffineU4Weight,
+                    TensorType::new(vec![banded as i64, k as i64], tiled_u4()),
+                ),
+                vec![banded as i64, k as i64],
+                tiled_u4(),
+            )],
+        };
+
+        let plan = compile_load_plan(
+            &metadata,
+            &contract,
+            StorageTarget {
+                tile_map_mask: checkpoint::plan::CONVERT_TILE_MAP_MASK,
+                ..StorageTarget::default()
+            },
+        )
+        .unwrap_or_else(|err| panic!("{rows}x{k}: the repack plan compiles: {err}"));
+        let storage = checkpoint::executor::Execution::new(&plan, &dir)
+            .run()
+            .unwrap_or_else(|err| panic!("{rows}x{k}: the repack executes: {err}"));
+        let got = storage
+            .tensors
+            .get("proj.tiled")
+            .unwrap_or_else(|| panic!("{rows}x{k}: materialized"));
+
+        let source = std::fs::read(dir.join("model.safetensors")).unwrap();
+        let row_bytes = k / 2;
+        assert_eq!(
+            got.len(),
+            banded * row_bytes,
+            "{rows}x{k}: the placed plane is the banded rectangle"
+        );
+        // The bug this test exists for: a road that published canonical
+        // bytes under a placed declaration. The map moves every one of
+        // these shapes, so landing the source unchanged is that bug.
+        assert_ne!(
+            &got[..source.len()],
+            &source[..],
+            "{rows}x{k}: the placed plane is the source verbatim -- no repack ran"
+        );
+
+        // Scatter every nibble back to where the kernel says it came from.
+        let mut seen = vec![0u8; rows * k];
+        let mut back = vec![0u8; rows * k];
+        let quad = STEP / BAND;
+        let quads = (k / BAND) / quad;
+        let mut at = 0usize;
+        for b in 0..banded / BAND {
+            for kq in 0..quads {
+                for lane in 0..32usize {
+                    for word in 0..quad {
+                        let kt = kq * quad + word;
+                        let k_base = kt * BAND + 2 * (lane % 4);
+                        let res = u32::from_le_bytes(
+                            got[at * 4..at * 4 + 4].try_into().expect("four bytes"),
+                        );
+                        at += 1;
+                        for s in 0..4usize {
+                            let col = b * BAND + lane / 4 + usize::from(s >= 2) * 8;
+                            for h in 0..2usize {
+                                if col >= rows {
+                                    continue;
+                                }
+                                let kk = k_base + usize::from(s % 2 == 1) * 8 + h;
+                                let flat = col * k + kk;
+                                back[flat] = ((res >> (4 * (s + 4 * h))) & 0xF) as u8;
+                                seen[flat] += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            at * 4,
+            got.len(),
+            "{rows}x{k}: the word walk covers the placed plane exactly"
+        );
+        if let Some(flat) = seen.iter().position(|&n| n != 1) {
+            panic!(
+                "{rows}x{k}: code at (n {}, k {}) is written {} times, not once",
+                flat / k,
+                flat % k,
+                seen[flat]
+            );
+        }
+        for flat in 0..rows * k {
+            let byte = source[flat / 2];
+            let want = if flat % 2 == 0 { byte & 0xF } else { byte >> 4 };
+            assert_eq!(
+                back[flat],
+                want,
+                "{rows}x{k}: code at (n {}, k {}) came back as {} not {want}",
+                flat / k,
+                flat % k,
+                back[flat]
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

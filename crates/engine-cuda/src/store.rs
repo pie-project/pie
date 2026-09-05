@@ -497,6 +497,18 @@ impl Pools {
         self.pool.hard_pages()
     }
 
+    /// Bytes one recurrent slot occupies across every state row — what the contract publishes as `PoolFacts::state_slot_bytes`, and what tells the runtime this model folds a recurrent state at all. Zero for a plan with no state row.
+    #[must_use]
+    pub fn state_slot_bytes(&self) -> u64 {
+        self.shapes
+            .iter()
+            .map(|shape| match *shape {
+                Shape::State { stride, dtype } => stride * u64::from(elem_size(dtype)),
+                Shape::Kv { .. } => 0,
+            })
+            .sum()
+    }
+
     /// The kv-page and state-slot watermarks the last admitted frame committed to.
     #[must_use]
     pub fn committed_watermarks(&self) -> (u32, u32) {

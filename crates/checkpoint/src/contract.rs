@@ -102,6 +102,50 @@ pub enum Expr {
     /// Not a second field on `Scale`, to avoid ambiguous double-identity
     /// states. Per-block form is the zero-point half of an affine decode.
     Bias { src: Box<Expr>, by: BiasBy },
+    /// Escape hatch: an elementwise function of one operand that `Scale` and
+    /// `Bias` cannot express, because they are affine and it is not. Shape
+    /// and dtype preserved. Import-time only: no device mask carries the
+    /// transform, so a serving plan may not name one — what a converted
+    /// artifact holds is the answer, not the recipe.
+    Unary { src: Box<Expr>, op: UnaryOp },
+}
+
+/// Which elementwise function [`Expr::Unary`] applies. One variant per
+/// function actually needed; each states the arithmetic and its domain,
+/// because a value outside the domain is a wrong checkpoint rather than a
+/// wrong number and must be refused as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnaryOp {
+    /// `out = ln(-x)`, defined for `x < 0`. The inverse of `x -> -exp(x)`,
+    /// which is how a decay rate is stored by a converter that keeps the
+    /// rate itself where the model reads its logarithm.
+    NegLn,
+}
+
+impl UnaryOp {
+    /// The function, over one element.
+    #[must_use]
+    pub fn apply(self, x: f64) -> f64 {
+        match self {
+            Self::NegLn => (-x).ln(),
+        }
+    }
+
+    /// Whether `x` is in this function's domain.
+    #[must_use]
+    pub fn defined_at(self, x: f64) -> bool {
+        match self {
+            Self::NegLn => x < 0.0,
+        }
+    }
+
+    /// What the domain is, for a refusal that says why.
+    #[must_use]
+    pub const fn domain(self) -> &'static str {
+        match self {
+            Self::NegLn => "strictly negative",
+        }
+    }
 }
 
 /// What [`Expr::Bias`] adds; same shape as [`ScaleFactor`] (uniform or
@@ -422,6 +466,7 @@ impl Expr {
             Expr::Cast { .. } => "Cast",
             Expr::Scale { .. } => "Scale",
             Expr::Bias { .. } => "Bias",
+            Expr::Unary { .. } => "Unary",
             Expr::SrcIndexed(_) => "SrcIndexed",
             Expr::Select { .. } => "Select",
         }
@@ -441,6 +486,7 @@ impl Expr {
             | Expr::Select { src, .. }
             | Expr::Transmute { src, .. }
             | Expr::Repack { src, .. }
+            | Expr::Unary { src, .. }
             | Expr::Cast { src, .. } => src.is_sharded(),
             Expr::Bias { src, by } => {
                 src.is_sharded()
@@ -565,6 +611,14 @@ impl Expr {
         }
     }
 
+    /// Apply `op` to every element. See [`Expr::Unary`].
+    pub fn unary(self, op: UnaryOp) -> Self {
+        Expr::Unary {
+            src: Box::new(self),
+            op,
+        }
+    }
+
     /// Add `by` to every element.
     pub fn bias(self, by: f32) -> Self {
         Expr::Bias {
@@ -612,9 +666,11 @@ impl Expr {
             | Expr::Transmute { src, .. } => src.is_affine(),
             Expr::Concat { parts, .. } => parts.iter().all(Expr::is_affine),
             Expr::Shard { src, .. } | Expr::Select { src, .. } => src.is_affine(),
-            Expr::Repack { .. } | Expr::Cast { .. } | Expr::Scale { .. } | Expr::Bias { .. } => {
-                false
-            }
+            Expr::Repack { .. }
+            | Expr::Cast { .. }
+            | Expr::Scale { .. }
+            | Expr::Bias { .. }
+            | Expr::Unary { .. } => false,
         }
     }
 
@@ -659,6 +715,7 @@ impl Expr {
             | Expr::Repack { src, .. }
             | Expr::Shard { src, .. }
             | Expr::Select { src, .. }
+            | Expr::Unary { src, .. }
             | Expr::Cast { src, .. } => src.visit(seen),
             Expr::Bias { src, by } => {
                 src.visit(seen);
@@ -737,6 +794,10 @@ impl Expr {
                 src: boxed(src)?,
                 layout,
                 to,
+            },
+            Expr::Unary { src, op } => Expr::Unary {
+                src: boxed(src)?,
+                op,
             },
             Expr::Cast { src, to } => Expr::Cast {
                 src: boxed(src)?,

@@ -151,13 +151,32 @@ GEMMA = {
     "head_dim": 512,
     "inter": 10240,
     "donor": 23,
+    #: Two spellings ship for the same weights and the donor is read from
+    #: whichever one the snapshot published: mlx-community writes
+    #: `language_model.model.layers`, google writes `model.language_model.layers`.
     "prefix": "language_model.model.layers.{l}",
+    "prefixes": (
+        "language_model.model.layers.{l}",
+        "model.language_model.layers.{l}",
+    ),
 }
 
 
 def gemma_head(table) -> dict[str, np.ndarray]:
     """The same construction as qwen's, in gemma's four-norm block spelling."""
-    layer = GEMMA["prefix"].format(l=GEMMA["donor"])
+    layer = next(
+        (
+            spelling.format(l=GEMMA["donor"])
+            for spelling in GEMMA["prefixes"]
+            if f"{spelling.format(l=GEMMA['donor'])}.input_layernorm.weight" in table
+        ),
+        None,
+    )
+    if layer is None:
+        raise SystemExit(
+            "the base checkpoint publishes layer "
+            f"{GEMMA['donor']} under none of {GEMMA['prefixes']}"
+        )
     h = GEMMA["hidden"]
 
     def donor(suffix: str, want: tuple) -> np.ndarray:

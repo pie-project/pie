@@ -773,7 +773,16 @@ enum FireKv {
 pub struct PendingFire {
     completion: crate::engine::WorkItemCompletion,
     kv: FireKv,
-    rstxn: Option<rs::RsTxn>,
+    /// The published RS write, still holding the store's retirement pin.
+    ///
+    /// A GUARD, not a bare txn: a fire that is never finalized — its process
+    /// torn down, its completion cancelled — must still release the pin. An
+    /// unsettled sequence stays in `RsStore::outstanding` forever, and
+    /// `retire_idle` retires only through `oldest_outstanding - 1`, so ONE
+    /// leaked fire stops every recycled state slot in the pool from ever being
+    /// handed out again. That is a permanent, whole-server outage, so the
+    /// release cannot depend on reaching any particular line.
+    rstxn: RsTxnsGuard,
     ws_guard: KvFireLease,
     model: usize,
     engine: usize,
@@ -1595,7 +1604,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             .push_back(PendingOp::Fire(PendingFire {
                 completion,
                 kv: FireKv::Host(kvtxn.into_inner()),
-                rstxn: rstxns.into_inner(),
+                rstxn: rstxns,
                 ws_guard,
                 model,
                 engine,
@@ -2241,11 +2250,16 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         // await below so process cancellation cannot leak their slots.
         // Settlement doesn't depend on `success` — the mapping is already
         // published.
-        let rs_failure: Option<String> = if rstxn.is_some() {
-            let mut rs_store = stores.rs.lock().unwrap();
-            rs::settle(&mut rs_store, rstxn);
-            None
-        } else {
+        let rs_failure: Option<String> = {
+            // `into_inner` disarms the guard, so its Drop below is a no-op and
+            // cannot re-enter the lock this scope holds. Had `completion.await`
+            // above been cancelled instead, the guard would have settled on the
+            // way out — which is the whole reason it is carried this far.
+            let txn = rstxn.into_inner();
+            if txn.is_some() {
+                let mut rs_store = stores.rs.lock().unwrap();
+                rs::settle(&mut rs_store, txn);
+            }
             None
         };
         let kvtxn = match kv {
@@ -2867,7 +2881,7 @@ async fn fire_device_geometry<C: FireContext>(
                     .into_inner()
                     .expect("device-geometry fire always holds a KV transaction"),
             },
-            rstxn: rstxns.into_inner(),
+            rstxn: rstxns,
             ws_guard,
             model: ws.model,
             engine: ws.engine,

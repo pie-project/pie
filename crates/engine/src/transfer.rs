@@ -22,8 +22,9 @@ pub enum MemoryDomain {
     MetalPrivate,
     /// Vulkan device-local memory on this ordinal.
     VulkanDevice(u32),
-    /// WebGPU device memory on this ordinal.
-    WebGpuDevice(u32),
+    /// wgpu device memory on this ordinal. Spelled the way the shell,
+    /// the platform and the artifact word are (`wgpu`), not `WebGpu`.
+    WgpuDevice(u32),
 }
 
 impl MemoryDomain {
@@ -34,7 +35,7 @@ impl MemoryDomain {
             MemoryDomain::CudaDevice(ordinal)
             | MemoryDomain::RocmDevice(ordinal)
             | MemoryDomain::VulkanDevice(ordinal)
-            | MemoryDomain::WebGpuDevice(ordinal) => Some(ordinal),
+            | MemoryDomain::WgpuDevice(ordinal) => Some(ordinal),
             MemoryDomain::HostPinned | MemoryDomain::MetalShared | MemoryDomain::MetalPrivate => {
                 None
             }

@@ -24,6 +24,12 @@ cuda = ["runtime/cuda"]
 # Apple-only at the crate level, so the flag alone is not a build that links:
 # `runtime`'s seam pairs it with `target_vendor = "apple"`.
 metal = ["runtime/metal"]
+# The portable Vulkan shell. No target half: unlike `metal`, this flag alone
+# IS a build that links a device, wherever a loader is found at run time.
+vulkan = ["runtime/vulkan"]
+# The portable wgpu shell. No target half either: wgpu picks its backend
+# (Vulkan, Metal, DX12) at run time, so this flag alone IS a build that links.
+wgpu = ["runtime/wgpu"]
 nixl = ["dep:transport", "transport/nixl"]
 
 # Probe passthrough to `runtime`; see `crates/runtime/src/scheduler/probe.rs`.

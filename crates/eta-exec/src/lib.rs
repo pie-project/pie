@@ -54,8 +54,11 @@ pub use lane::{
     Record as LaneRecord, SLOT_BYTES as LANE_SLOT_BYTES, Shape as LaneShape,
 };
 pub use meta::{Malformed, channel_effects};
+/// The op evaluator itself, so a backend can diff its device form against the
+/// oracle op by op rather than only through a whole `step`.
+pub use op::eval_op;
 pub use params::{OpParams, Runtime as OpRuntime};
-pub use plan::{Boundaries, ExecPlan, adopt_launch_package, adopt_launch_package_with};
+pub use plan::{Boundaries, ExecPlan, StagePlan, adopt_launch_package, adopt_launch_package_with};
 pub use readiness::{NO_TICKET, Readiness, Ticket, Words, check};
 pub use registry::{
     Channel, ChannelSpec, Direction, EmittedKernel, Endpoint, Geometry, HostRole, Instance,
@@ -67,7 +70,7 @@ pub use status::{
     Fault, FaultClass, Outcome as StatusOutcome, STATUS_BYTES, Site, State, Status, describe_fault,
     report as report_status,
 };
-pub use step::{PassInputs, StepOutcome, step};
+pub use step::{Interpreted, PassInputs, StageRunner, StepOutcome, step, step_with};
 pub use value::{Value, concrete_dtype, encode_wire, value_matches, wire_cell_bytes};
 
 pub(crate) fn shape_numel(dims: &[u32]) -> u64 {

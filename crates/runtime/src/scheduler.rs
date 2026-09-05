@@ -614,6 +614,7 @@ mod tests {
         assert_eq!(domain, ::engine::MemoryDomain::HostPinned);
         assert_ne!(domain, ::engine::MemoryDomain::CudaDevice(0));
         assert_ne!(domain, ::engine::MemoryDomain::VulkanDevice(0));
+        assert_ne!(domain, ::engine::MemoryDomain::WgpuDevice(0));
         assert_ne!(domain, ::engine::MemoryDomain::MetalPrivate);
     }
 }

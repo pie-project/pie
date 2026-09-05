@@ -9,7 +9,7 @@ use crate::plan::index::PlanIndex;
 use crate::plan::{
     LoadPlan, SourceExtent, StorageInstr, StorageTarget, TILE_MAP_BIAS, TILE_MAP_CAST,
     TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_REPACK, TILE_MAP_SCALE,
-    TileMapKind,
+    TILE_MAP_UNARY, TileMapKind,
 };
 use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme};
 
@@ -45,11 +45,19 @@ pub const METAL_TILE_MAP_MASK: u32 =
 /// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
 pub const VULKAN_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_SCALE | TILE_MAP_DECODE;
 
+/// The transforms a wgpu plan may carry. Equal to Vulkan's, written out
+/// rather than aliased for the reason that one is: the portable shell may
+/// grow a device transform the Vulkan one has not, and a shared constant
+/// would move both masks at once.
+///
+/// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
+pub const WGPU_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_SCALE | TILE_MAP_DECODE;
+
 /// The transforms `host_executor` implements. Not a device capability: it is
 /// what a plan compiled for no device may carry, which is the reference the
 /// device answers are checked against.
 pub const HOST_TILE_MAP_MASK: u32 =
-    TILE_MAP_CAST | TILE_MAP_REBLOCK | TILE_MAP_SCALE | TILE_MAP_BIAS;
+    TILE_MAP_CAST | TILE_MAP_REBLOCK | TILE_MAP_SCALE | TILE_MAP_BIAS | TILE_MAP_UNARY;
 
 /// The mask offline conversion compiles against: everything `replay` runs
 /// plus `Encode`, `Decode` and `Repack`. Separate from
@@ -71,6 +79,7 @@ pub fn compilable_tile_maps(backend: BackendKind) -> u32 {
         BackendKind::Cuda => CUDA_TILE_MAP_MASK,
         BackendKind::Metal => METAL_TILE_MAP_MASK,
         BackendKind::Vulkan => VULKAN_TILE_MAP_MASK,
+        BackendKind::Wgpu => WGPU_TILE_MAP_MASK,
         BackendKind::Unknown => HOST_TILE_MAP_MASK,
     }
 }
@@ -169,9 +178,11 @@ fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering 
         BackendKind::Cuda => TileLowering {
             kernel: kernel(cuda_kernel(facts)),
         },
-        // Neither Metal nor Vulkan runs a transform: the host executor
+        // None of Metal, Vulkan or wgpu runs a transform: the host executor
         // derives its own tiling from `max_tile_bytes` at run time.
-        BackendKind::Metal | BackendKind::Vulkan | BackendKind::Unknown => TileLowering::default(),
+        BackendKind::Metal | BackendKind::Vulkan | BackendKind::Wgpu | BackendKind::Unknown => {
+            TileLowering::default()
+        }
     }
 }
 
@@ -224,6 +235,7 @@ fn cuda_kernel(facts: &TileMapFacts) -> Option<&'static str> {
         | TileMapKind::Decode
         | TileMapKind::Transcode
         | TileMapKind::Reblock
+        | TileMapKind::Unary
         | TileMapKind::Repack => None,
     }
 }

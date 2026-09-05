@@ -350,6 +350,11 @@ pub struct LaunchStagePlan {
     pub source_ops: Vec<Vec<u32>>,
     /// Its value table's types.
     pub value_types: Vec<LaunchPlanValue>,
+    /// **This stage's ORIGINAL value id -> its normalized one**, `u32::MAX`
+    /// where normalization removed the value. Its length is the stage's
+    /// original value count, which is also the width of the stage's block in
+    /// the package's global numbering.
+    pub value_map: Vec<u32>,
     /// Which channel each bound value binds through.
     pub channel_bindings: Vec<u32>,
     /// The names its `kernel_call`s and `sink_call`s index.
@@ -389,6 +394,60 @@ pub struct LaunchPackage {
     /// code's meaning is decided by the emitter that compiled the kernel
     /// that raised it.
     pub fault_classes: Vec<FaultClass>,
+}
+
+impl LaunchPackage {
+    /// **WHERE STAGE `at`'S BLOCK STARTS IN THE GLOBAL VALUE NUMBERING.**
+    ///
+    /// [`lower_values`] walks the stages in order and numbers each stage's
+    /// ORIGINAL values `base..base + n`, so a stage's block is as wide as its
+    /// original value table — which is [`LaunchStagePlan::value_map`]'s
+    /// length, not its `value_types`' length. The two differ whenever
+    /// normalization folded anything, which is nearly always.
+    ///
+    /// `None` when `at` is past the package's plans.
+    #[must_use]
+    pub fn stage_base(&self, at: usize) -> Option<u32> {
+        if at >= self.plans.len() {
+            return None;
+        }
+        Some(
+            self.plans[..at]
+                .iter()
+                .map(|plan| plan.value_map.len() as u32)
+                .sum(),
+        )
+    }
+
+    /// **A GLOBAL VALUE ID AS THE PLAN'S OWN NUMBERING SPELLS IT**: the stage
+    /// it belongs to, and its id in that stage's normalized value table — the
+    /// table the emitted kernel's descriptors and scratch offsets are indexed
+    /// by.
+    ///
+    /// Two hops, and neither is arithmetic on its own. The first takes the
+    /// global id to the stage's original id by subtracting the block base; the
+    /// second takes that through [`LaunchStagePlan::value_map`], because
+    /// normalization renumbers densely after folding CSE, aliases and dead
+    /// values away.
+    ///
+    /// `None` when no stage's block holds it, and `Some((stage, None))` when
+    /// the stage holds it but normalization removed it — a value the device
+    /// never allocates, which a caller staging roots must skip rather than
+    /// treat as an error.
+    #[must_use]
+    pub fn plan_local(&self, global: u32) -> Option<(usize, Option<u32>)> {
+        let mut base = 0u32;
+        for (at, plan) in self.plans.iter().enumerate() {
+            let width = plan.value_map.len() as u32;
+            if global < base + width {
+                let original = (global - base) as usize;
+                let mapped = plan.value_map[original];
+                return Some((at, (mapped != u32::MAX).then_some(mapped)));
+            }
+            base += width;
+        }
+        None
+    }
 }
 
 /// Build the launch package for a bound trace and its compiled stages.
@@ -645,6 +704,7 @@ fn lower_plan(stage: &CompiledStage) -> LaunchStagePlan {
         drafts_len: grouped.drafts_len,
         ops: ops.iter().map(lower_plan_op).collect(),
         source_ops: normalized.source_ops.clone(),
+        value_map: normalized.value_map.clone(),
         value_types: normalized
             .value_types
             .iter()
@@ -882,4 +942,3 @@ impl GroupedPlan {
 fn grouped_supported_tag(tag: u8) -> bool {
     eta_ir::op::spec(tag).is_some()
 }
-

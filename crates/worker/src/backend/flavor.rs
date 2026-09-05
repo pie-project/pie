@@ -13,9 +13,15 @@ pub enum Flavor {
     Cuda,
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     Metal,
-    // No `Vulkan` or `Wgpu`: no build hosts those engines. `EngineKind` still
-    // NAMES both, so a deployment that asks for one is refused by name instead
-    // of being told its config is malformed.
+    // NO TARGET PAIR on this one, unlike `Metal` above: the Vulkan shell binds
+    // a loader rather than a platform, so the feature alone decides.
+    #[cfg(feature = "vulkan")]
+    Vulkan,
+    // No target pair here either: wgpu picks its own backend (Vulkan, Metal,
+    // DX12) at run time, so there is no platform this shell cannot be built
+    // for and the feature alone decides.
+    #[cfg(feature = "wgpu")]
+    Wgpu,
 }
 
 impl Flavor {
@@ -26,6 +32,10 @@ impl Flavor {
             Flavor::Cuda => "cuda",
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             Flavor::Metal => "metal",
+            #[cfg(feature = "vulkan")]
+            Flavor::Vulkan => "vulkan",
+            #[cfg(feature = "wgpu")]
+            Flavor::Wgpu => "wgpu",
         }
     }
 
@@ -50,8 +60,8 @@ impl Flavor {
                 // Apple-only at the crate level, so a Linux build with the
                 // feature ON still hosts nothing — and telling that operator
                 // to enable a flag they already enabled is advice that cannot
-                // work, which is the failure `retired_msg` exists to avoid one
-                // case over.
+                // work. It is the one kind with a third answer: every other
+                // shell is one feature flag away on every target.
                 #[cfg(all(feature = "metal", target_vendor = "apple"))]
                 {
                     Ok(Flavor::Metal)
@@ -65,34 +75,45 @@ impl Flavor {
                     Err(missing_feature_msg("metal", "metal"))
                 }
             }
-            EngineKind::Vulkan => Err(retired_msg("vulkan")),
-            EngineKind::Wgpu => Err(retired_msg("wgpu")),
+            EngineKind::Vulkan => {
+                // TWO ANSWERS, not Metal's three: there is no target this
+                // shell cannot be built for, so the only way to lack it is to
+                // have left the feature off.
+                #[cfg(feature = "vulkan")]
+                {
+                    Ok(Flavor::Vulkan)
+                }
+                #[cfg(not(feature = "vulkan"))]
+                {
+                    Err(missing_feature_msg("vulkan", "vulkan"))
+                }
+            }
+            EngineKind::Wgpu => {
+                // Two answers, like Vulkan's: this shell has no target half
+                // either, so leaving the feature off is the only way to lack
+                // it. NO `retired_msg` ARM IS LEFT ANYWHERE — every kind
+                // `EngineKind` names is a `--features` flag away, so the
+                // "no build hosts this" answer has no kind to be about and
+                // the function it lived in is gone.
+                #[cfg(feature = "wgpu")]
+                {
+                    Ok(Flavor::Wgpu)
+                }
+                #[cfg(not(feature = "wgpu"))]
+                {
+                    Err(missing_feature_msg("wgpu", "wgpu"))
+                }
+            }
         }
     }
-}
-
-/// A shader flavor that no build can host, whatever it was built with.
-///
-/// Distinct from [`missing_feature_msg`] on purpose: "rebuild with a feature"
-/// is advice that would not work, because the crate the feature would name is
-/// not in the workspace.
-///
-/// `vulkan` and `wgpu` are the two kinds this covers; `metal` is hosted and
-/// takes the ordinary [`missing_feature_msg`] instead.
-fn retired_msg(toml_type: &str) -> String {
-    format!(
-        "engine type {toml_type:?} is not hosted by any build of pie. \
-         Compiled flavors: {compiled}.",
-        compiled = compiled_summary(),
-    )
 }
 
 /// The feature is on and the target cannot host it.
 ///
 /// Not [`missing_feature_msg`], whose advice is "rebuild with a feature" — it
-/// is already on. Not [`retired_msg`] either: the crate is right there and
-/// builds, it is the DEVICE half that has no implementation off Apple, which
-/// `engine-metal`'s own `compile_error!` says in as many words.
+/// is already on. The crate is right there and builds; it is the DEVICE half
+/// that has no implementation off Apple, which `engine-metal`'s own
+/// `compile_error!` says in as many words.
 #[cfg(all(feature = "metal", not(target_vendor = "apple")))]
 fn non_apple_msg() -> String {
     format!(
@@ -104,7 +125,12 @@ fn non_apple_msg() -> String {
     )
 }
 
-#[cfg(not(all(feature = "cuda", feature = "metal")))]
+#[cfg(not(all(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "wgpu"
+)))]
 fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
     format!(
         "engine type {toml_type:?} is not built into this binary. \
@@ -125,6 +151,8 @@ pub fn compiled_summary() -> String {
     #[cfg_attr(
         not(any(
             feature = "cuda",
+            feature = "vulkan",
+            feature = "wgpu",
             all(feature = "metal", target_vendor = "apple")
         )),
         allow(unused_mut, reason = "the pushes below are feature-gated")
@@ -134,6 +162,10 @@ pub fn compiled_summary() -> String {
     out.push("cuda");
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     out.push("metal");
+    #[cfg(feature = "vulkan")]
+    out.push("vulkan");
+    #[cfg(feature = "wgpu")]
+    out.push("wgpu");
     out.join(", ")
 }
 
@@ -144,13 +176,15 @@ pub fn compiled_summary() -> String {
 /// EVERY flavor is listed whether or not it was compiled, which is what makes
 /// this the answer to "why can this binary not serve my config": a table of
 /// only the compiled ones cannot say that the one you asked for is missing.
-pub fn compiled_embedded() -> [(&'static str, bool); 2] {
+pub fn compiled_embedded() -> [(&'static str, bool); 4] {
     [
         ("cuda_native", cfg!(feature = "cuda")),
         (
             "metal",
             cfg!(all(feature = "metal", target_vendor = "apple")),
         ),
+        ("vulkan", cfg!(feature = "vulkan")),
+        ("wgpu", cfg!(feature = "wgpu")),
     ]
 }
 
@@ -167,6 +201,10 @@ pub fn default_flavor() -> Option<Flavor> {
         runtime::engine::load::Platform::Cuda => Some(Flavor::Cuda),
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         runtime::engine::load::Platform::Metal => Some(Flavor::Metal),
+        #[cfg(feature = "vulkan")]
+        runtime::engine::load::Platform::Vulkan => Some(Flavor::Vulkan),
+        #[cfg(feature = "wgpu")]
+        runtime::engine::load::Platform::Wgpu => Some(Flavor::Wgpu),
         // A platform this build did not link a flavor for. `this_box` answers
         // for the CONVERTER and this for the HOST, and the two sets are the
         // same today — the arm exists so that the day they are not, the

@@ -75,7 +75,6 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("linear/quant_qmv_rows.metal", include_str!(concat!(source_root!(), "/linear/quant_qmv_rows.metal"))),
     ("linear/quant_transcode.metal", include_str!(concat!(source_root!(), "/linear/quant_transcode.metal"))),
     ("ptir/logits_copy.metal", include_str!(concat!(source_root!(), "/ptir/logits_copy.metal"))),
-    ("ptir/ptir_rng.generated.metal", include_str!(concat!(source_root!(), "/ptir/ptir_rng.generated.metal"))),
     ("sample/argmax.metal", include_str!(concat!(source_root!(), "/sample/argmax.metal"))),
     ("third_party/mlx_quantized_block.metal", include_str!(concat!(source_root!(), "/third_party/mlx_quantized_block.metal"))),
     ("third_party/mlx_steel_loader.metal", include_str!(concat!(source_root!(), "/third_party/mlx_steel_loader.metal"))),

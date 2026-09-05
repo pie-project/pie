@@ -8,6 +8,21 @@
 //! models/<name>/runtime/<key>.zt    a build output, one per target
 //! ```
 //!
+//! A directory holds ONE archive and as many SERVING artifacts as have been
+//! imported into it, each named `<slug>.<sku>.<backend>.zt`:
+//!
+//! ```text
+//! models/<name>/<name>.<sku>.cuda.zt
+//! models/<name>/<name>.<sku>.vulkan.zt
+//! ```
+//!
+//! That is the case the naming exists for — one model, two shells or two
+//! rows — so it is one *entry* per artifact and not one per directory, and
+//! the name that reaches each of them is its whole filename
+//! ([`Entry::address`]). A bare model name still reaches the artifact under
+//! it when there is only one, which is every config written before a second
+//! import.
+//!
 //! The **archive** is general form: whatever the source said, expressed in
 //! pie's own vocabulary, and servable on its own. It is the narrow waist, and
 //! there is exactly one of it per model.
@@ -90,8 +105,28 @@ pub struct Runtime {
 /// One artifact: its root, the files it is made of, and what it says about
 /// itself.
 pub struct Entry {
-    /// The store name, without `.zt`.
+    /// The store name, without `.zt`: the model directory for a two-layer
+    /// entry, the file stem for a flat one. **NOT UNIQUE** — a model
+    /// imported for two shells is two entries under one name, which is what
+    /// [`qualified`](Entry::qualified) and [`address`](Entry::address) are
+    /// for.
     pub name: String,
+    /// `<slug>.<sku>.<backend>` — the whole of a specialized artifact's
+    /// filename, which is the one string that names it and no other. `None`
+    /// for `archive.zt` and for a flat file, which their `name` already
+    /// names alone.
+    pub qualified: Option<String>,
+    /// How many artifacts this entry's model directory holds, itself
+    /// included. More than one is the ordinary case for a model imported for
+    /// two backends, and the reason [`address`](Entry::address) exists.
+    pub siblings: usize,
+    /// The catalog row this artifact was compiled for, from its own serving
+    /// stamp. `None` for a `.zt` carrying none, which is a checkpoint rather
+    /// than a serving artifact.
+    pub sku: Option<String>,
+    /// The engine whose kernels its bytes are landed for, from the same
+    /// stamp. This is what a `--features vulkan` build matches on.
+    pub backend: Option<String>,
     /// The model directory, for an entry in the two-layer layout. `None` for a
     /// flat `<name>.zt` written by an older pie.
     pub dir: Option<PathBuf>,
@@ -112,6 +147,20 @@ pub struct Entry {
 impl Entry {
     pub fn shards(&self) -> usize {
         self.files.len().saturating_sub(1)
+    }
+
+    /// The name to type at this artifact: its `name` when that names it
+    /// alone, and its whole `<slug>.<sku>.<backend>` when the model
+    /// directory holds siblings.
+    ///
+    /// What a listing prints, and what [`find`] resolves — a listing that
+    /// printed three rows all called `google--gemma-4-E4B-it` would name
+    /// nothing an operator could act on.
+    pub fn address(&self) -> &str {
+        match &self.qualified {
+            Some(qualified) if self.siblings > 1 => qualified,
+            _ => &self.name,
+        }
     }
 
     /// Bytes of the archive and every runtime built from it.
@@ -147,20 +196,37 @@ fn entries_in(dir: &Path) -> Result<Vec<Entry>> {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        // `archive.zt` when that is the name, and otherwise the specialized
-        // one the import states a servable artifact's SKU and target in.
+        // **EVERY** artifact in the directory, not the one it holds when it
+        // holds one. `archive.zt` when that is the name, and otherwise all
+        // of the specialized ones the import states a servable artifact's
+        // SKU and target in — a model imported for cuda and for vulkan is
+        // two files here, and asking for a single root found neither of
+        // them and showed an empty shelf over 200 GB of artifacts.
+        //
         // Asked through the checkpoint reader's own discovery rather than
-        // spelled again here — see `discover_zt_file`, and the note below about
-        // the worker and this scan not being allowed to disagree.
-        let Some(root) = checkpoint::file::read::discover_zt_file(child) else {
-            continue;
-        };
-        let Some(mut entry) = read_entry(&root, name) else {
-            continue;
-        };
-        entry.dir = Some(child.clone());
-        entry.runtimes = read_runtimes(&child.join(RUNTIME_DIR));
-        found.push(entry);
+        // spelled again here — see `discover_zt_files`, and the note below
+        // about the worker and this scan not being allowed to disagree.
+        let roots = checkpoint::file::read::discover_zt_files(child);
+        // Through the same shard folding the flat scan uses: a specialized
+        // artifact shards exactly the way an archive does.
+        let mut in_dir = entries_from(roots);
+        let siblings = in_dir.len();
+        for entry in &mut in_dir {
+            entry.qualified = qualified_name(&entry.root);
+            entry.name = name.clone();
+            entry.siblings = siblings;
+            entry.dir = Some(child.clone());
+            // Only when the directory holds one artifact. A build under
+            // `<name>/runtime/` is derived from *the* archive, and the
+            // layout has no way to say which of several it came from —
+            // hanging the same set off each would report its bytes N times
+            // and let `pie model remove` of one artifact delete builds of
+            // another.
+            if siblings == 1 {
+                entry.runtimes = read_runtimes(&child.join(RUNTIME_DIR));
+            }
+        }
+        found.extend(in_dir);
     }
 
     // Flat `.zt` at the top level are the older layout. Read but never
@@ -187,6 +253,18 @@ fn entries_in(dir: &Path) -> Result<Vec<Entry>> {
     Ok(found)
 }
 
+/// `<slug>.<sku>.<backend>`, when that is what the file is called.
+///
+/// Read off the name rather than rebuilt from the stamp: this is the string
+/// an operator types and a directory listing shows, so it has to be the one
+/// on disk. `checkpoint::serving::Name` is the same parser the import names
+/// with, so a name it refuses is not one pie wrote.
+fn qualified_name(root: &Path) -> Option<String> {
+    let file_name = root.file_name()?.to_str()?;
+    checkpoint::serving::Name::parse(file_name).ok()?;
+    Some(file_name.strip_suffix(".zt")?.to_string())
+}
+
 /// Reads one artifact root into an entry, or nothing if it cannot be opened.
 fn read_entry(root: &Path, name: String) -> Option<Entry> {
     let metadata = parse_metadata(root).ok()?;
@@ -196,8 +274,16 @@ fn read_entry(root: &Path, name: String) -> Option<Entry> {
         .map(|file| PathBuf::from(&file.path))
         .collect();
     let attributes = checkpoint::file::zt::read_attributes(root).unwrap_or_default();
+    // What the artifact says it is for. From the stamp, not from the name:
+    // the name is how it is addressed, this is what it holds. A `.zt` with
+    // no stamp is an ordinary checkpoint and answers neither.
+    let stamp = checkpoint::file::serve::stamp_of(root).ok().flatten();
     Some(Entry {
         name,
+        qualified: qualified_name(root),
+        siblings: 1,
+        sku: stamp.as_ref().map(|stamp| stamp.sku.clone()),
+        backend: stamp.as_ref().map(|stamp| stamp.backend.clone()),
         dir: None,
         bytes: files
             .iter()
@@ -269,9 +355,66 @@ fn entries_from(candidates: Vec<PathBuf>) -> Vec<Entry> {
     parsed
 }
 
-/// The artifact stored under `name`, if there is one.
-pub fn find(name: &str) -> Result<Option<Entry>> {
-    Ok(entries()?.into_iter().find(|entry| entry.name == name))
+/// What the store holds under a name.
+///
+/// Three answers and not two, because a model directory holds as many
+/// artifacts as were imported into it and a bare model name is then a
+/// question with several answers. Guessing one would serve, or delete, a
+/// file the operator did not name.
+pub enum Resolved {
+    /// Nothing in the store answers to this name.
+    Missing,
+    One(Box<Entry>),
+    /// Several artifacts share the name; each one's [`Entry::address`], in
+    /// listing order, so the refusal can name what to type instead.
+    Ambiguous(Vec<String>),
+}
+
+/// The artifact stored under `name`.
+///
+/// Two spellings resolve, and this is the whole of the rule:
+///
+/// * `<slug>.<sku>.<backend>` — a specialized artifact's own filename —
+///   names exactly one file, always, whatever else shares its directory.
+/// * a model name (the directory, or a flat file's stem) names the artifact
+///   under it when there is one, and is ambiguous when there are several.
+///
+/// The same order the worker resolves `[model] model` in
+/// (`crates/worker/src/weights.rs`), so a name that serves is a name this
+/// command answers about — with the one difference that a running worker can
+/// break a tie its own engine flavor settles, and a listing has no engine.
+pub fn find(name: &str) -> Result<Resolved> {
+    Ok(resolve_in(entries()?, name))
+}
+
+/// [`find`]'s rule, over an explicit listing: the scan is the slow half and
+/// the rule is the half worth testing.
+fn resolve_in(entries: Vec<Entry>, name: &str) -> Resolved {
+    if let Some(exact) = entries
+        .iter()
+        .position(|entry| entry.qualified.as_deref() == Some(name))
+    {
+        return Resolved::One(Box::new(
+            entries
+                .into_iter()
+                .nth(exact)
+                .expect("the position just found is in the vector it was found in"),
+        ));
+    }
+    let mut named: Vec<Entry> = entries
+        .into_iter()
+        .filter(|entry| entry.name == name)
+        .collect();
+    match named.len() {
+        0 => Resolved::Missing,
+        1 => Resolved::One(Box::new(named.remove(0))),
+        _ => Resolved::Ambiguous(
+            named
+                .iter()
+                .map(|entry| entry.address().to_string())
+                .collect(),
+        ),
+    }
 }
 
 /// Deletes an artifact: the root last, so an interrupted removal leaves a
@@ -534,8 +677,7 @@ mod tests {
     fn an_artifact_named_for_its_specialization_is_listed() {
         let root = tempfile::tempdir().unwrap();
         let model = root.path().join("deepseek");
-        let specialized =
-            model.join("deepseek.dsv4-flash-full-u4g64-u2g64-kv-bf16.metal.zt");
+        let specialized = model.join("deepseek.dsv4-flash-full-u4g64-u2g64-kv-bf16.metal.zt");
         let mut writer = Writer::create(&specialized, &Default::default()).unwrap();
         writer.add_tensor(&decl("w"), &vec![7u8; 32_000]).unwrap();
         writer.finish().unwrap();
@@ -550,4 +692,132 @@ mod tests {
         assert_eq!(found[0].tensors, 1);
     }
 
+    /// Writes a servable artifact under the name a stamped import gives it.
+    fn serving(dir: &Path, slug: &str, sku: &str, backend: &str) -> std::path::PathBuf {
+        let stamp = checkpoint::serving::Stamp::of(backend, sku);
+        let path = dir.join(checkpoint::serving::Name::of(&stamp, slug).render());
+        let mut writer = Writer::create_serving(&path, &Default::default(), stamp).unwrap();
+        writer.add_tensor(&decl("w"), &vec![7u8; 32_000]).unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    /// **ONE DIRECTORY, THREE ARTIFACTS, THREE ENTRIES.**
+    ///
+    /// The bug this file's whole naming scheme existed to make impossible and
+    /// the scan brought back anyway: `<slug>.<sku>.<backend>.zt` is spelled
+    /// out so a model imported for three shells can live in one directory,
+    /// and the scan asked for the directory's *single* artifact — which a
+    /// directory with three of them does not have. `pie model list` printed
+    /// "(none)" over 200 GB of artifacts, and `pie model info <slug>` said
+    /// there was no such artifact.
+    #[test]
+    fn a_directory_of_three_backends_is_three_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("gemma");
+        let sku = "gemma4-e4b-bf16-kv-bf16";
+        for backend in ["cuda", "vulkan", "wgpu"] {
+            serving(&model, "gemma", sku, backend);
+        }
+
+        let found = entries_in(root.path()).unwrap();
+        assert_eq!(found.len(), 3, "three artifacts, three entries");
+        for entry in &found {
+            assert_eq!(entry.name, "gemma", "every one is an artifact of gemma");
+            assert_eq!(entry.siblings, 3);
+            assert_eq!(entry.sku.as_deref(), Some(sku), "read off the stamp");
+            assert_eq!(entry.tensors, 1);
+        }
+        // And each addresses itself, because a listing of three identical
+        // names names nothing.
+        let addresses: Vec<&str> = found.iter().map(Entry::address).collect();
+        assert_eq!(
+            addresses,
+            [
+                "gemma.gemma4-e4b-bf16-kv-bf16.cuda",
+                "gemma.gemma4-e4b-bf16-kv-bf16.vulkan",
+                "gemma.gemma4-e4b-bf16-kv-bf16.wgpu",
+            ]
+        );
+        let backends: Vec<&str> = found
+            .iter()
+            .filter_map(|entry| entry.backend.as_deref())
+            .collect();
+        assert_eq!(backends, ["cuda", "vulkan", "wgpu"]);
+    }
+
+    /// A lone artifact keeps addressing itself by its model name.
+    ///
+    /// The common case, and the one every config on every box already
+    /// states: `[model] model = "<name>"`. The long name is what siblings
+    /// cost, not what an import costs.
+    #[test]
+    fn a_lone_artifact_is_still_addressed_by_its_model_name() {
+        let root = tempfile::tempdir().unwrap();
+        serving(
+            &root.path().join("gemma"),
+            "gemma",
+            "gemma4-e4b-bf16-kv-bf16",
+            "cuda",
+        );
+        let found = entries_in(root.path()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].address(), "gemma");
+        assert_eq!(
+            found[0].qualified.as_deref(),
+            Some("gemma.gemma4-e4b-bf16-kv-bf16.cuda"),
+            "the file still names itself, whether or not anything needs it to"
+        );
+    }
+
+    /// The resolution rule, in the three answers it has.
+    ///
+    /// `find` is what `pie model info` and `pie model remove` ask, and
+    /// removing the wrong one of three artifacts is not a mistake an operator
+    /// can undo without a re-import — so an ambiguous name is answered with
+    /// the candidates and nothing else.
+    #[test]
+    fn a_name_resolves_exactly_or_names_what_it_could_not_choose_between() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("gemma");
+        let sku = "gemma4-e4b-bf16-kv-bf16";
+        for backend in ["cuda", "vulkan"] {
+            serving(&model, "gemma", sku, backend);
+        }
+        serving(
+            &root.path().join("qwen"),
+            "qwen",
+            "qwen3-0-6b-bf16-kv-bf16",
+            "cuda",
+        );
+
+        // The real rule, over the real scan.
+        let resolve = |name: &str| resolve_in(entries_in(root.path()).unwrap(), name);
+
+        // A model name with one artifact under it resolves.
+        let Resolved::One(qwen) = resolve("qwen") else {
+            panic!("one artifact, one answer");
+        };
+        assert_eq!(qwen.backend.as_deref(), Some("cuda"));
+
+        // A model name with two under it names both rather than picking.
+        let Resolved::Ambiguous(candidates) = resolve("gemma") else {
+            panic!("two artifacts of one model is not a pick");
+        };
+        assert_eq!(
+            candidates,
+            [
+                "gemma.gemma4-e4b-bf16-kv-bf16.cuda",
+                "gemma.gemma4-e4b-bf16-kv-bf16.vulkan"
+            ]
+        );
+
+        // And either candidate, typed back in full, resolves to itself.
+        let Resolved::One(vulkan) = resolve("gemma.gemma4-e4b-bf16-kv-bf16.vulkan") else {
+            panic!("a fully specified name names one file");
+        };
+        assert_eq!(vulkan.backend.as_deref(), Some("vulkan"));
+
+        assert!(matches!(resolve("llama"), Resolved::Missing));
+    }
 }

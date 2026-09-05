@@ -57,4 +57,3 @@ pub fn runtime_snapshot_allow_patterns() -> Vec<String> {
     .map(str::to_string)
     .collect()
 }
-

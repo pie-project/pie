@@ -128,4 +128,3 @@ fn an_incomplete_tokenizer_is_refused_by_name() {
         ),
     }
 }
-

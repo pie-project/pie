@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::contract::UnaryOp;
 use crate::error::Result;
 use crate::types::{
     BackendKind, BufferId, CheckpointFormat, DType, Encoding, FileId, InstrId, QuantGranularity,
@@ -21,6 +22,7 @@ pub mod passes;
 pub use crate::extent::{Dim, Extent};
 pub use passes::tile::{
     CONVERT_TILE_MAP_MASK, CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, METAL_TILE_MAP_MASK,
+    VULKAN_TILE_MAP_MASK, WGPU_TILE_MAP_MASK,
 };
 
 /// Which tile-map transforms a target's kernels implement.
@@ -34,6 +36,10 @@ pub const TILE_MAP_REBLOCK: u32 = 1 << 4;
 pub const TILE_MAP_REPACK: u32 = 1 << 6;
 pub const TILE_MAP_SCALE: u32 = 1 << 7;
 pub const TILE_MAP_BIAS: u32 = 1 << 8;
+/// An elementwise function of one operand that `Scale` and `Bias` cannot
+/// state, because they are affine and it is not. Import-time only: no device
+/// mask carries it.
+pub const TILE_MAP_UNARY: u32 = 1 << 9;
 
 /// Compile a contract into the plan that satisfies it: rewrite the
 /// contract, build the instructions, run the passes, decide tiling.
@@ -251,6 +257,7 @@ pub enum TileMapKind {
     Repack,
     Scale,
     Bias,
+    Unary,
 }
 
 impl TileMapKind {
@@ -264,6 +271,7 @@ impl TileMapKind {
             Self::Repack => TILE_MAP_REPACK,
             Self::Scale => TILE_MAP_SCALE,
             Self::Bias => TILE_MAP_BIAS,
+            Self::Unary => TILE_MAP_UNARY,
         }
     }
 }
@@ -295,6 +303,11 @@ pub struct TransformSpec {
     /// DeepSeek-style FP8 is `[128, 128]`, row-wise is `[1, 32]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scale_blocks: Vec<i64>,
+    /// Which function a [`TileMapKind::Unary`] applies; `None` on every
+    /// other kind. Skipped when absent, so plans written before `Unary`
+    /// existed still serialize byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unary: Option<UnaryOp>,
     /// The backend entry point this transform runs as. Filled in by
     /// [`passes::tile::lower`](crate::plan::passes::tile::lower); `None`
     /// means it runs on the host.

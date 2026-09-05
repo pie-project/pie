@@ -455,4 +455,3 @@ fn parameter_type_name(param_type: &runtime::inferlet::program::ParameterType) -
         runtime::inferlet::program::ParameterType::Bool => "bool",
     }
 }
-

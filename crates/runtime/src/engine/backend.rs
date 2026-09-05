@@ -147,6 +147,8 @@ pub mod open {
     // the import has no user and `-D warnings` refuses the crate.
     #[cfg(any(
         feature = "cuda",
+        feature = "vulkan",
+        feature = "wgpu",
         all(feature = "metal", target_vendor = "apple")
     ))]
     use super::{EngineBox, Result};
@@ -227,6 +229,48 @@ pub mod open {
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     pub fn metal(config_bytes: &[u8]) -> Result<EngineBox> {
         engine_metal::open(config_bytes, crate::engine::load::contract_for)
+            .map(|engine| Box::new(engine) as EngineBox)
+            .map_err(::anyhow::Error::msg)
+    }
+
+    /// Open a Vulkan device.
+    ///
+    /// **FEATURE-GATED AND NOTHING ELSE**, where the Metal door above is also
+    /// target-gated: a Vulkan loader is a thing a machine either has or has
+    /// not, on every platform pie builds for, so there is no target whose
+    /// answer is known in advance. Which device is `[vulkan] device_index` in
+    /// the boot document, so this door — like Metal's — takes bytes rather
+    /// than a typed boot, and the shell reads what it is about.
+    ///
+    /// # Errors
+    ///
+    /// A boot document that is not TOML, or one whose `[vulkan]` table states
+    /// a knob the shell refuses. Binding the device happens at
+    /// [`Engine::load`](engine::Engine::load), not here.
+    #[cfg(feature = "vulkan")]
+    pub fn vulkan(config_bytes: &[u8]) -> Result<EngineBox> {
+        engine_vulkan::open(config_bytes, crate::engine::load::contract_for)
+            .map(|engine| Box::new(engine) as EngineBox)
+            .map_err(::anyhow::Error::msg)
+    }
+
+    /// Open a wgpu device.
+    ///
+    /// **FEATURE-GATED AND NOTHING ELSE**, like the Vulkan door above: wgpu
+    /// picks its own backend (Vulkan, Metal, DX12) at run time, so there is
+    /// no target whose answer is known in advance and no target half to pair
+    /// the feature with. Which adapter is `[wgpu] adapter_index` in the boot
+    /// document, so this door takes bytes rather than a typed boot, and the
+    /// shell reads what it is about.
+    ///
+    /// # Errors
+    ///
+    /// A boot document that is not TOML, or one whose `[wgpu]` table states a
+    /// knob the shell refuses. Requesting the adapter happens at
+    /// [`Engine::load`](engine::Engine::load), not here.
+    #[cfg(feature = "wgpu")]
+    pub fn wgpu(config_bytes: &[u8]) -> Result<EngineBox> {
+        engine_wgpu::open(config_bytes, crate::engine::load::contract_for)
             .map(|engine| Box::new(engine) as EngineBox)
             .map_err(::anyhow::Error::msg)
     }

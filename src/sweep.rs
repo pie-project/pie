@@ -457,5 +457,4 @@ mod tests {
         assert!(!broken.beats(&good, Metric::Throughput));
         assert!(!good.beats(&broken, Metric::Throughput));
     }
-
 }
