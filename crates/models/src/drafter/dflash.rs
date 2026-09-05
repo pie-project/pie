@@ -295,6 +295,24 @@ pub const QWEN38_27B_DSPARK: Head = Head {
     readout: Readout::Markov { rank: 256, top_k: 16 },
 };
 
+/// `z-lab/Qwen3.6-35B-A3B-DFlash`: the v1 shape against the 40-layer
+/// mixture — eight taps, six layers (five sliding at 4096, then one full),
+/// hidden 2048, MLP 6144, its own mask id.
+pub const QWEN36_35B_A3B_DFLASH: Head = Head {
+    taps: &[1, 6, 11, 16, 22, 27, 32, 37],
+    windows: &[Some(4_096), Some(4_096), Some(4_096), Some(4_096), Some(4_096), None],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 6_144,
+    theta: 10_000_000.0,
+    block: 16,
+    mask_token: 248_077,
+    proposals_from: 1,
+    conv: None,
+    readout: Readout::Argmax,
+};
+
 /// `z-lab/gemma-4-26B-A4B-it-DFlash`: the v1 shape against a 30-layer
 /// trunk — six taps, a narrower MLP, theta 1e6, and the mask id 4 — read
 /// out through gemma's softcapped head (monotone, so the argmax is the

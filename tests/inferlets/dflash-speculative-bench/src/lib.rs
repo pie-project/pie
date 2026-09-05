@@ -253,22 +253,42 @@
 //! the stated ladder (`--priced false`) and plain decode:
 //!
 //! ```text
-//!                       priced   ladder   plain      prices (ms): draft / 1 / 4 / 8 / 16
-//! gemma prose            7.2s    8.9s     7.1s       8.4 / 14.1 / 28 / 41 / -
-//! gemma code             5.6     5.4      7.2        9.0 / 14.4 / 28 / 42 / 69
-//! gemma counting         3.9     3.9      7.2        9.0 / 13.6 / 28 / 41 / 70
-//! qwen38 dflash2 prose  12.1    12.7     18.9       13 / 66 / 95 / 111 / -
-//! qwen38 dflash2 code   10.2    11.3      -         14 / 67 / 98 / 120 / -
-//! qwen38 dspark prose   16.4    17.3     18.8       19 / 67 / 99 / 116 / 159 (15)
+//!                         priced   ladder   plain      prices (ms): draft / 1 / 4 / 8 / 16
+//! gemma prose (384)        7.3s     8.9s     7.1s      8.4 / 14.1 / 28 / 43 / 69
+//! gemma code               5.6      5.4      7.2       9.1 / 14.0 / 28 / 41 / 70
+//! gemma counting           4.0      3.9      7.2       9.2 / 13.7 / 28 / 41 / 69
+//! qwen36-a3b counting      4.5      5.3      6.5       7.6 / 12.1 / 23 / 32 / 55   (thinking prose, see below)
+//! qwen36-a3b code          5.3      5.7      6.5       7.6 / 11.9 / 24 / 32 / 54
+//! qwen36-a3b prose         6.5      7.0      6.4       7.5 / 11.9 / 23 / 31 / 56
+//! qwen38 dflash2 prose    13.2-13.7 13.7    19.0      13 / 66 / 96 / 113 / -      (256 tokens)
+//! qwen38 dflash2 code     10.4     11.3      -        14 / 66 / 96 / 119 / -
+//! qwen38 dspark prose     16.4     17.3     18.8      19 / 67 / 99 / 116 / 159 (15)
 //! ```
 //!
-//! Prose on gemma goes from a 20% loss to parity (the gate closes; 14 of 365
-//! fires draft), the two dense heads gain 5% on prose and code, and the
-//! workloads the stated ladder already had right pay up to 4% for the
-//! warm-up, the two plain fires that price the road and the probes. The
-//! one-row fire is priced only in the baseline's own geometry (nothing
-//! buffered behind it), because a plain fire right after a round folds the
-//! round's survivors and reads 67 ms where the road costs 42 on a hybrid.
+//! Prose on gemma goes from a 20% loss to within 3% of plain (the gate closes;
+//! 20 of 355 fires draft); the A3B mixture gains 7-15% on the two workloads
+//! its head helps and holds parity on the one it does not; the dense head
+//! gains 8% on code and holds prose; the workloads the stated ladder already
+//! had right pay up to 4% for the two plain fires that price the road and the
+//! probes. The one-row fire is priced only in the baseline's own geometry
+//! (nothing buffered behind it), because a plain fire right after a round
+//! folds the round's survivors and is not the road's fire. Three things the
+//! gate had to learn on the way, each measured before it was written down:
+//! a closed gate judges on the probes fired SINCE it closed (a full window of
+//! stale losses outvoted every probe and a run closed at round 33 stayed
+//! closed to the end); two probes have to pay before it reopens (one is a
+//! coin on a 30% prose); and it judges from two rounds, not eight (eight
+//! warm-up rounds at eight rows on a prose that closes at once cost 5%).
+//!
+//! **A priced loop is not a deterministic function of its prompt.** The
+//! prices come off a clock, the widths follow the prices, and on a trunk
+//! whose bf16 bits depend on the fire's width (§ below) two runs of one
+//! prompt can part at a near-tie — measured: two priced prose runs on
+//! qwen38 came back 256 tokens each, same speed, different at one token.
+//! `--priced false` or `--verify_rows` restores a deterministic loop. The
+//! Qwen3.6-35B-A3B rows above are thinking prose: that head's chat template
+//! opens `<think>` whatever the system prompt says, and `/no_think` did not
+//! close it.
 //!
 //! # One thing the loop does NOT promise
 //!
@@ -648,6 +668,9 @@ struct Gate {
     /// a request the drafter cannot help stops paying a round in sixteen for
     /// the news, and back to `PROBE` the moment one opens it.
     probe_after: u32,
+    /// Whether the priced gate is closed: the window then holds only the
+    /// probes fired since it closed, and one probe that pays reopens it.
+    closed: bool,
     /// Whether the verify width follows the yield. Off leaves it at `block`.
     auto: bool,
 }
@@ -662,6 +685,17 @@ impl Gate {
     /// Where the priced gate's probe interval stops doubling: a request that
     /// turns list-shaped is still noticed within this many tokens.
     const PROBE_MAX: u32 = 128;
+    /// Rounds the priced gate waits for before it judges — not the eight the
+    /// stated ladder averages over: the per-position estimate is shrunk
+    /// towards its pooled rate and corrects itself a round later, and eight
+    /// warm-up rounds at eight rows on a prose that closes at once cost 5%
+    /// of a 384-token run (7.5 s against 7.1 plain).
+    const WARM: usize = 2;
+    /// Probes a closed gate judges on before it may reopen. One is a coin: on
+    /// a 30%-acceptance prose a four-row probe comes back whole about one
+    /// time in eight, reopened the gate, and eight losing rounds followed
+    /// (7.2 s -> 7.6 s over 384 tokens). Two pooled probes have to pay.
+    const REOPEN: usize = 2;
     /// A round has to beat one token a fire by this much before the priced
     /// gate opens, and fall this far under before it closes — a window of
     /// eight reads a bad streak as a verdict otherwise, and the fires spent
@@ -694,7 +728,7 @@ impl Gate {
     const WARM_TOP: u32 = 8;
 
     fn new(floor: f64, auto: bool) -> Self {
-        Gate { floor, recent: Vec::new(), last: 0, since: 0, probe_after: Self::PROBE, auto }
+        Gate { floor, recent: Vec::new(), last: 0, since: 0, probe_after: Self::PROBE, closed: false, auto }
     }
 
     /// Whether this round drafts. A probe is allowed through so a workload
@@ -840,11 +874,21 @@ impl Gate {
     /// noticed. `pinned` narrows the rungs to one.
     fn plan(&mut self, block: u32, prices: &Prices, pinned: Option<u32>) -> Option<u32> {
         let plain = prices.plain();
-        let measured = plain.is_some() && prices.round(1).is_some() && self.recent.len() >= Self::WINDOW;
+        // A closed gate judges on the probes it has fired since closing — the
+        // window was emptied when it closed, so `REOPEN` probes that pay are
+        // what reopen it. Left full, seven stale rounds outvote every probe
+        // and the gate never reopens (measured: closed at round 33 of a
+        // 384-token run and closed at the end, probing into the same seven
+        // losses).
+        let enough = self.recent.len() >= if self.closed { Self::REOPEN } else { Self::WARM };
+        let measured = plain.is_some() && prices.round(1).is_some() && enough;
         if !self.drafts() {
             return None;
         }
         if !measured {
+            if self.closed {
+                return self.probe(pinned.unwrap_or(Self::RUNGS[0]).min(block));
+            }
             return Some(pinned.unwrap_or_else(|| self.width(block)));
         }
         let plain = plain.expect("measured");
@@ -862,17 +906,27 @@ impl Gate {
         // loss, and a closed gate probes at the NARROWEST rung — the probe's
         // job is to sample the yield, and the cheap rung samples the first
         // positions, which is where a workload that changed shows first.
-        let closed = self.since > 0 || self.probe_after > Self::PROBE;
-        let open = if closed { rate * plain >= 1.0 } else { rate * plain >= Self::HYSTERESIS };
+        let open = if self.closed { rate * plain >= 1.0 } else { rate * plain >= Self::HYSTERESIS };
         if open {
+            self.closed = false;
             self.since = 0;
             self.probe_after = Self::PROBE;
             return Some(width);
         }
+        if !self.closed {
+            self.closed = true;
+            self.recent.clear();
+        }
+        self.probe(narrowest)
+    }
+
+    /// A closed gate's turn: a plain fire, or — every `probe_after` of them,
+    /// doubling while the probes keep losing — one round at `width`.
+    fn probe(&mut self, width: u32) -> Option<u32> {
         if self.since >= self.probe_after {
             self.since = 0;
             self.probe_after = (self.probe_after * 2).min(Self::PROBE_MAX);
-            return Some(narrowest);
+            return Some(width);
         }
         self.since += 1;
         None

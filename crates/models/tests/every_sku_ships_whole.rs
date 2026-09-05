@@ -194,6 +194,12 @@ fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
     let trace = (row.trace)(Platform::Metal);
     let facts = trace.drafter.expect("the v1 text states its block drafter");
     assert_eq!((facts.rows, facts.mask_token, facts.bidirectional), (16, 248_070, true));
+    // The A3B mixture carries the same shape with eight taps and its own mask id.
+    let a3b = models::skus()
+        .find(|row| row.recipe.text == "qwen36-35b-a3b-dflash")
+        .expect("this build ships the A3B block-drafter row");
+    let facts = (a3b.trace)(Platform::Metal).drafter.expect("the A3B text states its block drafter");
+    assert_eq!((facts.rows, facts.mask_token, facts.bidirectional, facts.proposals_from), (16, 248_077, true, 1));
     // And an undrafted text states none.
     let plain = models::skus()
         .find(|row| row.recipe.text == "qwen38-27b" && row.recipe.weights.contains(&model_dsl::Dtype::U4g64))

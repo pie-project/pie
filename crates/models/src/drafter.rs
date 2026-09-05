@@ -73,6 +73,12 @@ pub const PUBLISHED: &[Published] = &[
         sku: "qwen38-27b-dspark-u4g64-kv-bf16",
     },
     Published {
+        target: "mlx-community/Qwen3.6-35B-A3B-4bit",
+        head: "z-lab/Qwen3.6-35B-A3B-DFlash",
+        drafter: "dflash",
+        sku: "qwen36-35b-a3b-dflash-u4g64-kv-bf16",
+    },
+    Published {
         target: "mlx-community/gemma-4-26b-a4b-it-4bit",
         head: "z-lab/gemma-4-26B-A4B-it-DFlash",
         drafter: "dflash",

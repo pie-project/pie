@@ -425,6 +425,9 @@ struct Dims {
     /// layer count: every shipped draft head (either recipe) is exactly one
     /// decoder layer.
     draft: Option<Recipe>,
+    /// The published block drafter a block-drafting recipe reads — its own
+    /// numbers, one descriptor a checkpoint (`drafter::dflash`).
+    dflash_head: Option<&'static dflash::Head>,
 }
 
 impl Model {
@@ -437,6 +440,15 @@ impl Model {
     pub fn a3b_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a3b_dims();
         d.draft = Some(Recipe::Mtp);
+        Model::new(w, kv, tp, d)
+    }
+
+    /// The A3B with z-lab's block drafter (`Qwen3.6-35B-A3B-DFlash`)
+    /// overlaid: the same four hooks the 27B spells, a second mixture.
+    pub fn a3b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::a3b_dims();
+        d.draft = Some(Recipe::DFlash);
+        d.dflash_head = Some(&dflash::QWEN36_35B_A3B_DFLASH);
         Model::new(w, kv, tp, d)
     }
 
@@ -468,6 +480,7 @@ impl Model {
             norm_eps: 1e-6,
             tower: None,
             draft: None,
+            dflash_head: None,
         }
     }
 
@@ -536,6 +549,7 @@ impl Model {
                 norm_eps: 1e-6,
                 tower: None,
                 draft: None,
+                dflash_head: None,
             },
         )
     }
@@ -598,6 +612,7 @@ impl Model {
             norm_eps: 1e-6,
             tower,
             draft,
+            dflash_head: None,
         }
     }
 
@@ -626,6 +641,7 @@ impl Model {
                 norm_eps: 1e-6,
                 tower: None,
                 draft: None,
+                dflash_head: None,
             },
         )
     }
@@ -711,6 +727,14 @@ impl Model {
             norm_eps: 1e-6,
             tower,
             draft,
+            // The 27B heads: which one is the recipe's, since three are
+            // published for this trunk.
+            dflash_head: draft.and_then(|r| match r {
+                Recipe::DFlash => Some(&dflash::QWEN36_27B_DFLASH),
+                Recipe::DFlash2 => Some(&dflash::QWEN38_27B_DFLASH2),
+                Recipe::DSpark => Some(&dflash::QWEN38_27B_DSPARK),
+                Recipe::Mtp | Recipe::Eagle => None,
+            }),
         }
     }
 
@@ -957,11 +981,7 @@ impl Model {
         // The block drafter's geometry is its OWN (`drafter::dflash`), so it
         // reads nothing off `Dims` but the trunk's widths and element types.
         let dflash = d.draft.filter(|r| r.drafts_a_block()).map(|recipe| {
-            let head = match recipe {
-                Recipe::DFlash2 => &dflash::QWEN38_27B_DFLASH2,
-                Recipe::DSpark => &dflash::QWEN38_27B_DSPARK,
-                _ => &dflash::QWEN36_27B_DFLASH,
-            };
+            let head = d.dflash_head.expect("a block-drafting recipe names its published head");
             DFlash::declare(
                 head,
                 recipe.prefix(),

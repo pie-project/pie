@@ -322,6 +322,13 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
+    // The same mixture with z-lab's DFlash block drafter overlaid.
+    Row {
+        id: "qwen36-35b-a3b-dflash-u4g64-kv-bf16",
+        layers: 40,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
     Row {
         id: "qwen36-35b-a3b-u4g64-kv-bf16",
         layers: 40,
