@@ -51,9 +51,26 @@
 //!   either — what is left is the per-threadgroup loader, which no host-side
 //!   knob reaches and which wants a GPU capture.
 //!
-//! So the sixteen-row cost is not a tiling-parameter choice. What is left
-//! unmeasured is the QUANTIZED WEIGHT LOADER's own read efficiency — 90 GB/s
-//! against the vector point's 214 on the same bytes is the gap to explain.
+//! So the sixteen-row cost is not a tiling-parameter choice. The header
+//! that stood here next said the gap to explain was the QUANTIZED LOADER's
+//! read efficiency — "90 GB/s against the vector point's 214". **It was not
+//! (2026-09-05). The tile is COMPUTE-bound from sixteen rows up**, and the
+//! "90 GB/s" is the shadow of that ceiling, measured three ways:
+//!
+//! - The same shape at 8 BITS (twice the bytes, the same FLOPs): 600 vs 497
+//!   us at sixteen rows, 937 vs 874 at thirty-two, **1745 vs 1771 at
+//!   sixty-four** — twice the bytes cost nothing once the rows are many.
+//! - The tile's achieved rate as rows grow: 5.74 / 6.53 / 6.46 / 6.64 /
+//!   6.72 TFLOP/s at 16 / 32 / 64 / 128 / 256 rows. Flat.
+//! - A plain bf16 GEMM (`a_dense_gemm_sets_the_mma_ceiling`, no
+//!   dequantization) on the same shape: 7.05 / 7.33 / 7.37 TFLOP/s at 64 /
+//!   256 / 1024 rows — this GPU's MMA ceiling for this kernel family.
+//!
+//! So at sixteen rows the quantized tile runs at 78% of the dense ceiling
+//! and at thirty-two and up at ~90%; the eight-row rung (345 us, 4.1
+//! TFLOP/s) has more headroom but pays a dequantization the rows do not
+//! amortize. What is left on this GPU is the last fifth of the MMA rate, not
+//! a factor of two — the factor of two is an M5-class matrix unit.
 //!
 //! ```text
 //! PIE_QMM_SHAPES=5120x5120,5120x17408 PIE_QMM_ROWS=1,2,3,4,6,8,16 \
