@@ -151,7 +151,10 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    // The model's opening (`<bos>` where it has one) before the raw text: a
+    // gemma without it answers noise.
+    let mut prompt = inferlet::chat::prefix();
+    prompt.extend(wit_model::encode(&input.prompt));
     if prompt.is_empty() {
         prompt.push(0);
     }

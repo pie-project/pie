@@ -319,7 +319,10 @@ async fn main(input: Input) -> Result<Output> {
 
     // The raw encoding, so the identity gate compares one context with the
     // sequential control and not two conversations.
-    let mut prompt = model::encode(&input.prompt);
+    // The model's opening (`<bos>` where it has one) before the raw text: a
+    // gemma without it answers noise.
+    let mut prompt = inferlet::chat::prefix();
+    prompt.extend(model::encode(&input.prompt));
     if prompt.is_empty() {
         prompt.push(0);
     }

@@ -134,7 +134,10 @@ async fn main(input: Input) -> Result<Output> {
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
 
-    let mut prompt = model::encode(&input.prompt);
+    // The model's opening (`<bos>` where it has one) before the raw text: a
+    // gemma without it answers noise.
+    let mut prompt = inferlet::chat::prefix();
+    prompt.extend(model::encode(&input.prompt));
     if prompt.is_empty() {
         prompt.push(0);
     }
