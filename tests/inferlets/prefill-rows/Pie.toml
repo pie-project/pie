@@ -1,0 +1,11 @@
+[package]
+name = "prefill-rows"
+version = "0.1.0"
+description = "Teacher-forced prefill over stated token ids, every row read out (argmax, entropy, top-8) — the trunk-only half of a parity"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+ids = {type = "string", description = "The prompt token ids, as a JSON array"}

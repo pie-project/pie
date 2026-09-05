@@ -1,0 +1,18 @@
+[package]
+name = "diffusion-baseline"
+version = "0.1.0"
+description = "DiffusionGemma's reference sampler as a guest program: block-autoregressive canvases, entropy-bound acceptance, full renoise, stable-and-confident stopping"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "User turn to answer"}
+max_tokens = {type = "int", optional = true, description = "Generation budget in tokens, rounded up to whole canvases (default: one canvas)"}
+max_steps = {type = "int", optional = true, description = "Denoising steps per canvas at most (default: 48)"}
+t_max = {type = "float", optional = true, description = "Temperature at the first step (default: 0.8)"}
+t_min = {type = "float", optional = true, description = "Temperature at the last step (default: 0.4)"}
+entropy_bound = {type = "float", optional = true, description = "Entropy-bound sampler budget (default: 0.1)"}
+confidence = {type = "float", optional = true, description = "Mean-entropy threshold of the stopping rule (default: 0.005)"}
+seed = {type = "int", optional = true, description = "Seed of the device rng and the host's canvas noise"}

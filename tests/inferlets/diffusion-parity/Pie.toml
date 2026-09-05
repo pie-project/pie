@@ -1,0 +1,22 @@
+[package]
+name = "diffusion-parity"
+version = "0.1.0"
+description = "One prefill and two denoise steps over a stated canvas, read out per row, for the transformers golden (scripts/diffusiongemma_parity_ref.py)"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+case = {type = "string", optional = true, description = "The case JSON the reference script wrote (case.json), as one string"}
+case_file = {type = "string", optional = true, description = "Its file name under the sandbox scratch dir instead (allow_fs = true)"}
+case_0 = {type = "string", optional = true, description = "Piece 0 of the case JSON, concatenated with the others"}
+case_1 = {type = "string", optional = true, description = "Piece 1 of the case JSON, concatenated with the others"}
+case_2 = {type = "string", optional = true, description = "Piece 2 of the case JSON, concatenated with the others"}
+case_3 = {type = "string", optional = true, description = "Piece 3 of the case JSON, concatenated with the others"}
+case_4 = {type = "string", optional = true, description = "Piece 4 of the case JSON, concatenated with the others"}
+case_5 = {type = "string", optional = true, description = "Piece 5 of the case JSON, concatenated with the others"}
+case_6 = {type = "string", optional = true, description = "Piece 6 of the case JSON, concatenated with the others"}
+case_7 = {type = "string", optional = true, description = "Piece 7 of the case JSON, concatenated with the others"}
+only_prefill = {type = "bool", optional = true, description = "Stop after the prefill rows"}
+max_layers = {type = "int", optional = true, description = "Logit lens: run only the first N layers"}
