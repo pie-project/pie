@@ -1069,11 +1069,9 @@ impl<W: PassWit> Pass<W> {
     where
         B: RangeBounds<u32>,
     {
-        if working_sets.is_empty() {
-            return Err(
-                "forward pass needs one recurrent-state working set per request".to_string(),
-            );
-        }
+        // No count check here: the host owns that verdict. An empty set is
+        // the attention case of a hybrid pass, accepted on an attention model
+        // and refused by name on a folding one (`validate_count`).
         let buffer = PageDeclaration::from_range(geom.buffer)?;
         let staged = match geom.fold_len {
             Some(fold_len) => {

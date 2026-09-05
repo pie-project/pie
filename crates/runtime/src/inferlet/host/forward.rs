@@ -365,6 +365,20 @@ impl ProcessCtx {
     fn core_gate(&mut self, this: &Resource<ForwardPass>) -> Anyhow<Result<(), String>> {
         let kind = self.ctx().table.get(this)?.kind;
         let actual = model_pass_kind();
+        // A HYBRID PASS WITH NO RECURRENT STATE IS AN ATTENTION PASS. The
+        // hybrid interface already makes one half of its state optional
+        // (`kv: none` for a recurrent-only fire); this is the other half. A
+        // program that only reads logits binds `rs = []` and runs on every
+        // KV-carrying model, and its fold policy is a value it states rather
+        // than a type it picks. The gate stays for the attention interface on
+        // a folding model: that interface carries the KV-editing verbs
+        // (`discard`, `fork`, `slice`) which are wrong on a fold, and the
+        // hybrid interface has none of them. `validate_count` refuses a
+        // non-empty `rs` on an attention model, so the leniency ends where
+        // the state does.
+        if kind == PassKind::Hybrid && actual == PassKind::Attention {
+            return Ok(Ok(()));
+        }
         if kind != actual {
             return Ok(Err(format!(
                 "this model's forward pass is `{}`, but the pass was built through the `{}` \
@@ -1081,6 +1095,12 @@ impl ProcessCtx {
             return Ok(Err(error));
         }
         if rs_working_sets.is_empty() {
+            // The attention case of a hybrid pass (see `core_gate`): nothing to
+            // bind, and `RsGeometry` is a policy over a state this model does
+            // not fold. A folding model still needs one set per request row.
+            if model_pass_kind() == PassKind::Attention {
+                return Ok(Ok(()));
+            }
             return Ok(Err(
                 "forward pass recurrent-state binding needs one working set per request"
                     .to_string(),
