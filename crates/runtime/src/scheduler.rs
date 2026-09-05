@@ -225,6 +225,12 @@ pub fn configured_submit_depth() -> usize {
 }
 
 /// Install the configured dispatch depth at bootstrap.
+/// Install the platform's default seal mode before the scheduler is spawned;
+/// see `frame::set_seal_default_ready`. `PIE_SEAL_MODE` overrides it.
+pub fn set_seal_default_ready(ready: bool) {
+    frame::set_seal_default_ready(ready);
+}
+
 pub fn set_dispatch_depth(depth: usize) {
     frame::set_dispatch_depth(depth);
 }

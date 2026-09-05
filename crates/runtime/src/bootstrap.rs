@@ -274,6 +274,13 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // seat count the pool cannot physically seat is a request failure with
     // extra steps.
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
+    // Metal holds the seal for every lane; CUDA opens it from the
+    // arrival-complete subset. Measured, not assumed — see
+    // `scheduler::frame::set_seal_default_ready`. Read here, before the
+    // configs are consumed below.
+    let metal = engine_configs
+        .iter()
+        .any(|d| d.backend_kind.eq_ignore_ascii_case("metal"));
     let seat_cost = crate::scheduler::configured_dispatch_depth().max(1);
     // Kept with its page pool so the warning below can report both numbers
     // that produced the seat count.
@@ -501,6 +508,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         });
     }
 
+    crate::scheduler::set_seal_default_ready(!metal);
     crate::scheduler::set_submit_deadline(std::time::Duration::from_micros(
         scheduler.submit_deadline_us,
     ));

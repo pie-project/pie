@@ -59,6 +59,23 @@ pub(super) fn idle_dump_threshold_us() -> u64 {
     })
 }
 
+/// **THE SEAL MODE'S DEFAULT IS THE PLATFORM'S.** Ready-mode sealing was
+/// measured on CUDA at ~240 lanes, where it opens the boundary earlier
+/// without narrowing the batch (+1-2%). On Metal at eight lanes it does the
+/// opposite: a fire is 12-66 ms and a lane's host round trip is a visible
+/// fraction of that, so the "arrival-complete subset" is one or two lanes —
+/// 2048 fires landed in ~920 batches of 2.2 lanes, and holding the seal for
+/// every lane (`strict`) read 26.7 -> 60.7 tok/s on Qwen3.8-27B, 107 -> 180
+/// on gemma-4-26B-A4B, 129 -> 221 on Qwen3.6-35B-A3B at eight lanes, 17.4 ->
+/// 32.2 at four (with per-request latency halved), and the same at one; a
+/// prefill-heavy mix read within 2%. Bootstrap installs the default for the
+/// engine it boots (`set_seal_default_ready`); `PIE_SEAL_MODE` still wins.
+static SEAL_DEFAULT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_seal_default_ready(ready: bool) {
+    SEAL_DEFAULT_READY.store(ready, Ordering::Relaxed);
+}
+
 fn seal_mode_ready() -> bool {
     static CONFIGURED: OnceLock<bool> = OnceLock::new();
     *CONFIGURED.get_or_init(|| match std::env::var("PIE_SEAL_MODE") {
@@ -75,7 +92,7 @@ fn seal_mode_ready() -> bool {
                 true
             }
         },
-        Err(_) => true,
+        Err(_) => SEAL_DEFAULT_READY.load(Ordering::Relaxed),
     })
 }
 
