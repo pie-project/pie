@@ -277,6 +277,83 @@ inline U qdot_staged(
   return scale * accum + sum * bias;
 }
 
+/// **A FOUR-BIT PACK, UNPACKED ONCE AND SPENT R TIMES** — the K-block body
+/// the four-row fold takes at pack width 1 (`qmv_rows_impl` chooses it by
+/// template, so a staged instantiation carries none of this code).
+///
+/// `qdot_staged` masks and converts every code for every row it is spent on
+/// — a mask, a convert and an FMA a code, plus the `/ 16^j` pre-scale
+/// `load_vector` puts on the activation — and the header says the vector
+/// point is bound by that arithmetic, not by the read. Here the pack is
+/// unpacked to the codes themselves once (32 floats for four output rows)
+/// and each row costs one FMA a code: `(x / 16^j) * (q & mask)` and
+/// `x * ((q >> 4j) & 0xf)` are one product rounded once (the pre-scale is a
+/// power of two), the terms are grouped four a word as before, the group
+/// sums land in `accum` in word order and the activation sum is grouped
+/// four a word as `load_vector` groups it, so `scale * accum + xsum * bias`
+/// is the same arithmetic — up to fast-math FMA contraction, which is why
+/// this road is offered only where the fold already reassociates (pack
+/// width 1; see the header) and never where the fold is held to the
+/// one-row point's bits (pack width 2).
+///
+/// **Where it pays, measured on the M4 Pro** (`a_quantized_matmul_is_priced_
+/// by_its_rows`): the four-row fold, K=5120 N=17408, 285 -> 258 us; K=2816
+/// N=11264, 108 -> 97. Two rows amortise the unpack over too few rows (4-6%
+/// slower on the small bank); two chunks (pack width 2) give the gain back
+/// in bookkeeping (211 -> 228 at two rows); six and eight rows put the live
+/// set past the register file and the identity gate caught them. So: four
+/// bits, one chunk, four rows.
+template <typename T, typename U, int R, int values_per_thread, int words_per_thread>
+METAL_FUNC void qmv_rows_block_unpacked(
+    const thread uint16_t (&pack)[4][words_per_thread],
+    const thread U (&s)[4],
+    const thread U (&b)[4],
+    const device T* xb,
+    const thread int (&roff)[R],
+    thread U (&result)[4][R]) {
+  // Instantiated (dead) for every codec so the caller compiles; the body is
+  // the four-bit one and is gated to the four-bit word count.
+  if (words_per_thread * 4 != values_per_thread) {
+    return;
+  }
+  thread U wq[4][values_per_thread];
+  #pragma clang loop unroll(full)
+  for (int row = 0; row < 4; row++) {
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < words_per_thread; i++) {
+      const uint16_t q = pack[row][i];
+      wq[row][4 * i] = U(q & 0x000f);
+      wq[row][4 * i + 1] = U((q >> 4) & 0x000f);
+      wq[row][4 * i + 2] = U((q >> 8) & 0x000f);
+      wq[row][4 * i + 3] = U((q >> 12) & 0x000f);
+    }
+  }
+  #pragma clang loop unroll(full)
+  for (int r = 0; r < R; r++) {
+    const device T* xr = xb + roff[r];
+    thread U xc[values_per_thread];
+    U xsum = 0;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < values_per_thread; i += 4) {
+      xsum += xr[i] + xr[i + 1] + xr[i + 2] + xr[i + 3];
+      xc[i] = xr[i];
+      xc[i + 1] = xr[i + 1];
+      xc[i + 2] = xr[i + 2];
+      xc[i + 3] = xr[i + 3];
+    }
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < 4; row++) {
+      U accum = 0;
+      #pragma clang loop unroll(full)
+      for (int i = 0; i < values_per_thread; i += 4) {
+        accum += (xc[i] * wq[row][i] + xc[i + 1] * wq[row][i + 1] +
+                  xc[i + 2] * wq[row][i + 2] + xc[i + 3] * wq[row][i + 3]);
+      }
+      result[row][r] += s[row] * accum + xsum * b[row];
+    }
+  }
+}
+
 /// R rows of `y = x W^T` against an affine bank, one weight fetch.
 ///
 /// `rows_per_group` is the fold and `packs_per_thread_` is the pack width.
@@ -328,6 +405,10 @@ METAL_FUNC void qmv_rows_impl(
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
   const int row0 = int(tid.x) * R;
+  // See `qmv_rows_block_unpacked`: four bits, one chunk (pack width 1), four
+  // rows. A constant, so the other instantiations compile the staged body
+  // alone.
+  constexpr bool UNPACKED_ROAD = bits == 4 && packs_per_thread == 1 && R == 4;
 
   ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
@@ -359,7 +440,11 @@ METAL_FUNC void qmv_rows_impl(
         s[row] = scales[row * in_vec_size_g];
         b[row] = biases[row * in_vec_size_g];
       }
-            // Unrolled, and this loop alone — the header says what that is worth
+      if (UNPACKED_ROAD) {
+        qmv_rows_block_unpacked<T, U, R, values_per_thread, words_per_thread>(
+            pack, s, b, xb, roff, result);
+      } else {
+      // Unrolled, and this loop alone — the header says what that is worth
       // and what unrolling the others does.
 #pragma clang loop unroll(full)
       for (int r = 0; r < R; r++) {
@@ -368,6 +453,7 @@ METAL_FUNC void qmv_rows_impl(
           result[row][r] += qdot_staged<U, values_per_thread, bits, packs_per_thread>(
               pack[row], x_thread, s[row], b[row], sum);
         }
+      }
       }
     }
     ws += block_size * bytes_per_pack / pack_factor;
