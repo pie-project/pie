@@ -14,6 +14,7 @@ import { describe, expect, it } from 'vitest';
 
 import { Builder, DslChannel, Traced } from '../eta/builder.js';
 import * as intrinsics from '../eta/intrinsics.js';
+import { entropyBoundAccept, stableAndConfident } from '../eta/diffusion.js';
 import { Dtype, Port, Stage, dtype, fnv1a64 } from '../eta/ir.js';
 import { TraceError } from '../eta/trace.js';
 import {
@@ -394,5 +395,73 @@ describe('comparison methods', () => {
     expect(epilogueBytes((l) => l.ne(0.5))).toBe(epilogueBytes((l) => ne(l, 0.5)));
     expect(epilogueBytes((l) => l.gt(0.5))).toBe(epilogueBytes((l) => gt(l, 0.5)));
     expect(epilogueBytes((l) => l.le(0.5))).toBe(epilogueBytes((l) => le(l, 0.5)));
+  });
+});
+
+describe('diffusion golden', () => {
+  it('diffusion_step matches sdk_goldens.rs', () => {
+    const length = 8;
+    const taps = 4;
+    const base = 5;
+    const end = base + length;
+    const pageSize = PAGE;
+    const maxPages = 2;
+    const bound = 0.5;
+    const confidence = 0.1;
+    const toks = chFrom(range(length).map((i) => (i * 7919) % 1000), dtype.i32, 'canvas');
+    const embedIndptr = chFrom([0, length], dtype.u32, 'embed_indptr');
+    const positions = chFrom(range(base, end), dtype.u32, 'positions');
+    const pages = chFrom(range(maxPages), dtype.u32, 'pages');
+    const pageIndptr = chFrom([0, divCeil(end, pageSize)], dtype.u32, 'page_indptr');
+    const wSlot = chFrom(range(base, end).map((p) => Math.floor(p / pageSize)), dtype.u32, 'w_slot');
+    const wOff = chFrom(range(base, end).map((p) => p % pageSize), dtype.u32, 'w_off');
+    const kvLen = chFrom([end], dtype.u32, 'kv_len');
+    const readout = chFrom(range(length), dtype.u32, 'readout');
+    const temp = chFrom([1.0], dtype.f32, 'temperature');
+    const rngState = chFrom([7, 0], dtype.u32, 'rng');
+    const history = chFrom(new Array(length).fill(-1), dtype.i32, 'argmax_history');
+    const canvasOut = chNew([length], dtype.i32, 'canvas_out');
+    const argmaxOut = chNew([length], dtype.i32, 'argmax_out');
+    const stop = chNew([1], dtype.bool, 'stop');
+    const meanOut = chNew([1], dtype.f32, 'mean_entropy');
+    const tapIdsOut = chNew([length, taps], dtype.u32, 'tap_ids');
+    const tapWeightsOut = chNew([length, taps], dtype.f32, 'tap_weights');
+
+    const b = new Builder(VOCAB, PAGE);
+    bindGeometry(b, [
+      [Port.EMBED_TOKENS, toks], [Port.EMBED_INDPTR, embedIndptr], [Port.KV_LEN, kvLen],
+      [Port.PAGES, pages], [Port.PAGE_INDPTR, pageIndptr], [Port.W_SLOT, wSlot],
+      [Port.W_OFF, wOff], [Port.POSITIONS, positions], [Port.READOUT, readout],
+    ]);
+    b.stage(Stage.EPILOGUE, () => {
+      positions.putTensor(positions.take());
+      wSlot.putTensor(wSlot.take());
+      wOff.putTensor(wOff.take());
+      const r = rngState.take();
+      const t = reshape(temp.read(), []);
+      const logits = intrinsics.logits();
+      const scaled = logits.div(t);
+      const probs = softmax(scaled);
+      const h = entropy(probs);
+      const sampled = gumbelMax(scaled, r);
+      const argmax = reduceArgmax(scaled);
+      const accept = entropyBoundAccept(h, bound);
+      const rNoise = r.add(iota(2));
+      const noise = cast(rng(rNoise, [length]).mul(VOCAB), dtype.i32);
+      const next = select(accept, sampled, noise);
+      const previous = history.take();
+      history.putTensor(argmax);
+      const done = stableAndConfident(argmax, previous, h, confidence);
+      const [tapWeights, tapIds] = topK(probs, taps);
+      tapIdsOut.putTensor(tapIds);
+      tapWeightsOut.putTensor(tapWeights);
+      canvasOut.putTensor(next);
+      argmaxOut.putTensor(argmax);
+      stop.putTensor(reshape(done, [1]));
+      meanOut.putTensor(reshape(reduceSum(h).div(length), [1]));
+      rngState.putTensor(rNoise.add(iota(2)));
+    });
+    for (const c of [canvasOut, argmaxOut, stop, meanOut, tapIdsOut, tapWeightsOut]) c.noteHostTake();
+    check('diffusion_step', b.build());
   });
 });

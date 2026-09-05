@@ -11,7 +11,7 @@
 # Why this exists: neither SDK is in `scripts/sync-wit.sh`'s vendored set and
 # neither appears in ci.yml -- the only workflows that touch them are the
 # manually triggered release publishes. When `pie:core/inference` was replaced
-# by `forward` / `forward-recurrent` / `forward-hybrid`, both SDKs kept
+# by `forward` / `forward-recurrent` / `forward-hybrid` / `forward-diffusion`, both SDKs kept
 # importing the interface that had been deleted, and nothing said so.
 # `release-pypi.yml`'s own smoke test comments that it CANNOT verify
 # `import inferlet`, because `wit_world` only exists inside a componentize-py
@@ -52,7 +52,7 @@ known=$(
 # satisfies the requirement; the supporting resources are all mandatory,
 # because a pass cannot be built without a channel to bind, a working set to
 # bind it against, or a pipeline to submit on.
-forward_any="forward forward-recurrent forward-hybrid"
+forward_any="forward forward-recurrent forward-hybrid forward-diffusion"
 forward_all="channel working-set pipeline"
 
 fail=0

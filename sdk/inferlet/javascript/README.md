@@ -40,7 +40,9 @@ export function main(input) {
 crates and `inferlet::eta`): `Tensor` with `.add/.sub/.mul/.div/.rem/.neg/
 .divCeil`, the op set (`reduceArgmax`, `gumbelMax`, `nucleusSample`,
 `softmax`, `topK`, …), `Channel`, `WorkingSet`, `RsWorkingSet`,
-`ForwardPass`, `Pipeline`, `runAhead`, `prefillChunks`. The container bytes
+`ForwardPass`, `Pipeline`, `runAhead`, `prefillChunks`, and `eta.diffusion`
+(the diffusion pass's `Mode` plus `entropyBoundAccept` / `stableAndConfident` /
+`linearTemperature`). The container bytes
 it emits are **byte-identical** to the Rust SDK's for the same program
 (`src/__tests__/eta_goldens.test.ts` pins them). `grammar`/`mask`, `chat`,
 `reasoning`, `tools`, `media`, `session`, `model`/`tokenizer` wrap the other

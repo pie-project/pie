@@ -18,7 +18,7 @@
 
 // ── pie:inferlet/model ──────────────────────────────────────────────────────
 
-export type ForwardKind = 'attention' | 'recurrent' | 'hybrid';
+export type ForwardKind = 'attention' | 'recurrent' | 'hybrid' | 'diffusion';
 
 export const modelStub = {
   name: () => 'mock-model',
@@ -37,6 +37,9 @@ export const modelStub = {
   arenaBlockSize: () => 8192n,
   mtpDepth: () => 0,
   submitDeadlineUs: () => 50_000n,
+  runAheadWindow: () => 4,
+  draftBlock: () => undefined,
+  canvas: () => ({ length: 32, hidden: 2560, selfCondTaps: 4 }),
 };
 
 // ── pie:inferlet/tokenizer ──────────────────────────────────────────────────
@@ -166,6 +169,14 @@ export class ForwardPassStub {
   setDraftingBlock() {}
   media(spans: unknown[]) {
     this.spans = [...spans];
+  }
+  mode: string | null = null;
+  selfCond: [number[], number[]] | null = null;
+  canvas(mode: string) {
+    this.mode = mode;
+  }
+  selfConditioning(rows: Uint32Array, weights: Float32Array) {
+    this.selfCond = [Array.from(rows), Array.from(weights)];
   }
   program(bytes: Uint8Array, channels: unknown[]) {
     this.programBytes = new Uint8Array(bytes);

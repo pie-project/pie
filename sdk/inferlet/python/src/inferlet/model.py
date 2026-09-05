@@ -16,7 +16,11 @@ source the way they do in the Rust SDK.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from wit_world.imports import model as _model
+
+ForwardKind = _model.ForwardKind
 
 from .tokenizer import (  # noqa: F401 — re-exported, as the Rust `model` module does
     encode,
@@ -55,9 +59,47 @@ def submit_deadline_us() -> int:
 
 
 def is_linear() -> bool:
-    """Whether the bound model carries irreversibly-folded recurrent state —
-    ``pass_kind() != ATTENTION``, the WIT's documented invariant."""
-    return _model.pass_kind() != _model.ForwardKind.ATTENTION
+    """Whether the bound model carries irreversibly-folded recurrent state
+    (a ``RECURRENT`` or ``HYBRID`` pass kind)."""
+    return _model.pass_kind() in (ForwardKind.RECURRENT, ForwardKind.HYBRID)
+
+
+@dataclass(frozen=True)
+class BlockDrafter:
+    """What a guest needs to seed a BLOCK drafter's draft pass."""
+
+    rows: int
+    mask_token: int
+    bidirectional: bool
+    proposals_from: int
+
+
+def draft_block() -> BlockDrafter | None:
+    """The bound model's block drafter, if it carries one."""
+    d = _model.draft_block()
+    return BlockDrafter(d.rows, d.mask_token, d.bidirectional, d.proposals_from) if d is not None else None
+
+
+@dataclass(frozen=True)
+class CanvasShape:
+    """The canvas a diffusion model denoises: tokens per block, the trunk's
+    hidden width, and how many ``(id, weight)`` self-conditioning taps a
+    canvas row takes."""
+
+    length: int
+    hidden: int
+    self_cond_taps: int
+
+
+def canvas() -> CanvasShape | None:
+    """The diffusion canvas; ``None`` for every other pass kind."""
+    c = _model.canvas()
+    return CanvasShape(c.length, c.hidden, c.self_cond_taps) if c is not None else None
+
+
+def run_ahead_window() -> int:
+    """Fires one lane may have submitted and not yet taken."""
+    return _model.run_ahead_window()
 
 
 def pass_kind() -> _model.ForwardKind:

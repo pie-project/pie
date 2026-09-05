@@ -16,6 +16,7 @@
 // program, so a JS inferlet and a Rust inferlet share the host's program
 // cache.
 
+export * as diffusion from './diffusion.js';
 export * as intrinsics from './intrinsics.js';
 export {
   TOKEN_PAD,
@@ -29,7 +30,6 @@ export {
   channelCapacity,
   frameSize,
   kvPageSize,
-  liveSlots,
   maxEmbedLength,
   mm,
   padTokens,

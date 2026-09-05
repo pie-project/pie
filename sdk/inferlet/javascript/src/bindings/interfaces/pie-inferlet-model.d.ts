@@ -23,7 +23,9 @@ export function defaultSystemSpeculation(): boolean;
  * `mtp_logits` are unavailable. Static, like `frame-size`.
  */
 export function mtpDepth(): number;
+export function draftBlock(): BlockDrafter | undefined;
 export function passKind(): ForwardKind;
+export function canvas(): CanvasShape | undefined;
 /**
  * Logits/output dimension (= hf_config.vocab_size). May EXCEED the
  * tokenizer's vocabs() token count due to padding. Use THIS for
@@ -109,6 +111,16 @@ export function submitDeadlineUs(): bigint;
  */
 export function channelCapacity(): number;
 /**
+ * Fires one lane may have submitted and not yet taken -- the run-ahead
+ * window, in fires. A host-reader ring of `channel-capacity` cells holds
+ * exactly this many plus the visibility margin, so a guest that keeps
+ * this many fires in flight never serialises and never overruns. The
+ * runtime derives both numbers from one source (`engine::runahead`);
+ * guests read this rather than recovering it from `channel-capacity`.
+ * Not static, for the same reason `channel-capacity` is not.
+ */
+export function runAheadWindow(): number;
+/**
  * Max embed tokens in a single pass (C) — the prefill chunk budget.
  * Guests split a prompt of L tokens into ceil(L / C) chunk passes;
  * chunking is guest-side, against this static constant.
@@ -140,6 +152,26 @@ export function rsFoldGranularity(): number;
  */
 export function arenaBlockSize(): bigint;
 /**
+ * What a guest needs to seed a BLOCK drafter's draft pass: the rows one
+ * pass carries (the anchor and `rows - 1` mask slots), the id every row
+ * but the first carries in, and whether the block sees itself — in which
+ * case the guest states the mask that says so. Facts the head was trained
+ * at, not policy: which rows to verify, and whether to draft at all, stay
+ * the guest's. `none` for a model with no block drafter (a chained head
+ * is `mtp-depth`). Static, like `mtp-depth`.
+ */
+export interface BlockDrafter {
+  rows: number,
+  maskToken: number,
+  bidirectional: boolean,
+  /**
+   * The first row whose readout is a proposal: 1 when the anchor row
+   * proposes nothing, 0 when every row does (the anchor's row then
+   * predicts the token after it).
+   */
+  proposalsFrom: number,
+}
+/**
  * Which forward-pass kind the bound model requires. A guest may only
  * construct the `forward-pass` of the matching interface; the other
  * interfaces' constructors error immediately.
@@ -169,5 +201,24 @@ export function arenaBlockSize(): bigint;
  * ## `"hybrid"`
  * 
  * Both attention and recurrent layers        -> `forward-hybrid`
+ * ## `"diffusion"`
+ * 
+ * Paged KV plus a canvas the model denoises in place, one trunk
+ * read causally or bidirectionally per pass -> `forward-diffusion`
  */
-export type ForwardKind = 'attention' | 'recurrent' | 'hybrid';
+export type ForwardKind = 'attention' | 'recurrent' | 'hybrid' | 'diffusion';
+/**
+ * The canvas a diffusion model denoises: how many tokens one block is,
+ * and the trunk's hidden width (the row width of a self-conditioning
+ * signal). `none` for every other kind — the same fact as
+ * `pass-kind() == diffusion`, stated once with its numbers.
+ */
+export interface CanvasShape {
+  length: number,
+  hidden: number,
+  /**
+   * How many `(id, weight)` taps per canvas row
+   * `forward-diffusion.self-conditioning` takes.
+   */
+  selfCondTaps: number,
+}

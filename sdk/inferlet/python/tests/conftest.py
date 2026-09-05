@@ -40,6 +40,12 @@ class ForwardKind(Enum):
     ATTENTION = 0
     RECURRENT = 1
     HYBRID = 2
+    DIFFUSION = 3
+
+
+class DiffusionMode(Enum):
+    ENCODE = 0
+    DENOISE = 1
 
 
 def _make_model() -> types.ModuleType:
@@ -60,7 +66,27 @@ def _make_model() -> types.ModuleType:
     m.rs_buffer_page_size = lambda: 64
     m.rs_fold_granularity = lambda: 1
     m.arena_block_size = lambda: 8192
+    m.run_ahead_window = lambda: 4
+    m.BlockDrafter = BlockDrafterStub
+    m.CanvasShape = CanvasShapeStub
+    m.draft_block = lambda: None
+    m.canvas = lambda: CanvasShapeStub(32, 2560, 4)
     return m
+
+
+@dataclass
+class BlockDrafterStub:
+    rows: int
+    mask_token: int
+    bidirectional: bool
+    proposals_from: int
+
+
+@dataclass
+class CanvasShapeStub:
+    length: int
+    hidden: int
+    self_cond_taps: int
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +452,12 @@ class ForwardPassStub:
     def media(self, spans) -> None:
         self.spans = spans
 
+    def canvas(self, mode) -> None:
+        self.mode = mode
+
+    def self_conditioning(self, rows, weights) -> None:
+        self.self_cond = (list(rows), list(weights))
+
     def program(self, container_bytes: bytes, channels) -> None:
         self.program_bytes = bytes(container_bytes)
         self.program_channels = list(channels)
@@ -439,6 +471,7 @@ def _make_forward(name: str) -> types.ModuleType:
     m.KvBinding = KvBinding
     m.MediaSpan_Image = lambda v: ("image", v)
     m.MediaSpan_Audio = lambda v: ("audio", v)
+    m.Mode = DiffusionMode
 
     def submit(on, slots) -> None:
         ForwardPassStub.submitted.append((on, list(slots)))
@@ -638,6 +671,7 @@ def install() -> None:
         "forward": _make_forward("forward"),
         "forward_recurrent": _make_forward("forward_recurrent"),
         "forward_hybrid": _make_forward("forward_hybrid"),
+        "forward_diffusion": _make_forward("forward_diffusion"),
         "grammar": _make_grammar(),
         "tools": _make_tools(),
         "media": _make_media(),

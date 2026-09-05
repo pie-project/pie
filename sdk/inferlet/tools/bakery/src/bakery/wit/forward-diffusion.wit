@@ -1,0 +1,172 @@
+// The forward-pass guest<->host surface (submits ETA container bytes). The WIT
+// surface family is named `forward*`; ETA remains the name of the container
+// byte format it ships.
+//
+// FOUR INTERFACES, ONE PER STATE SEMANTICS (forward_refactor.md D1):
+//
+//   `forward`            paged, per-token, reversibly discardable KV only
+//   `forward-recurrent`  irreversibly folded recurrent state only
+//   `forward-hybrid`     both, in the same forward
+//   `forward-diffusion`  paged KV plus a canvas the model denoises in place
+//
+// THIS FILE: a block-diffusion text (DiffusionGemma). One trunk, two
+// attention modes, and the guest chooses per pass which one a fire runs:
+//
+//   `encode`   the causal reading. Its rows attend causally over the prefix
+//              and themselves and its KV writes ARE the sequence — a prompt
+//              prefill, or the pass that commits a finished canvas.
+//   `denoise`  the bidirectional reading. Its rows are one canvas; every row
+//              attends every key of `[prefix | canvas]`, the keys after it
+//              included. The KV it writes is the canvas's scratch, rewritten
+//              on every step and finally overwritten by the encode pass that
+//              commits the block; the prefix is read and never written.
+//
+// Why a fourth interface and not a verb on `forward`: `forward` promises
+// per-token, reversibly discardable KV whose every fire is causal, and the
+// attention-only algorithms written against it (H2O, SnapKV, TOVA, Quest)
+// assume exactly that. A canvas fire breaks the assumption — its KV is
+// scratch and its rows see the future — so it takes a type of its own, and
+// those algorithms cannot name it by accident. The taxonomy stays closed over
+// STATE SEMANTICS, not model family; `model.pass-kind()` selects it.
+//
+// THE CANVAS IS THE GUEST'S. The host owns the two attention modes and the
+// KV; what the canvas holds (its token ids, the argmax history a stopping
+// rule watches, the self-conditioning signal the next step reads) is channel
+// state the guest declares, feeds and reads. The sampler — which positions
+// to accept, how to renoise the rest, when to stop — is an ETA epilogue
+// program over `[canvas-length, vocab]` logits, not a host policy. Nothing
+// in this interface names an acceptance rule, a temperature schedule or a
+// stopping criterion.
+//
+// Legal stages: prologue, on_attn_proj, on_attn, epilogue — the attention
+// interface's. Valid only when `model.pass-kind()` == diffusion.
+//
+// All four interfaces deliberately DUPLICATE `embed` / `readout` / `program`
+// / `submit` and their geometry records rather than sharing a `pass-body`
+// (D3): the host keeps one private `PassCore`, and full separation makes
+// cross-kind states unrepresentable instead of runtime-guarded.
+
+interface forward-diffusion {
+    use types.{error, data};
+    use channel.{channel};
+    use working-set.{kv-working-set, page-span};
+    use pipeline.{pipeline};
+    /// The one media-span type, `forward`'s (see `forward-hybrid`).
+    use forward.{media-span};
+
+    /// Attention geometry, field for field `forward`'s. Declared separately
+    /// per interface ON PURPOSE (D8/D3).
+    ///
+    /// On a `denoise` pass the geometry describes the canvas: `positions`
+    /// are the canvas's (the prefix length onward), `w-slot`/`w-off` land
+    /// its rows in the canvas pages, and `kv-len` is prefix plus canvas — the
+    /// same numbers on every step, which is what lets one pass be
+    /// resubmitted for the whole denoising loop. `mask`, when bound, narrows
+    /// the bidirectional reading; it never has to widen anything.
+    record kv-geometry {
+        readable-pages: page-span,
+        writable-pages: page-span,
+        kv-len:      borrow<channel>,
+        pages:       borrow<channel>,
+        page-indptr: borrow<channel>,
+        w-slot:      borrow<channel>,
+        w-off:       borrow<channel>,
+        positions:   borrow<channel>,
+        mask:        option<borrow<channel>>,
+    }
+
+    /// Which of the model's two readings a pass runs. See the file note.
+    enum mode {
+        encode,
+        denoise,
+    }
+
+    resource forward-pass {
+        constructor();
+
+        /// State binding. REQUIRED — `forward.attention`, unchanged.
+        attention: func(
+            kv:   borrow<kv-working-set>,
+            geom: kv-geometry,
+        ) -> result<_, error>;
+
+        /// The reading. REQUIRED: a diffusion pass with no mode is not
+        /// submittable, because neither reading is a default the host may
+        /// pick for the guest. Set before `program`; a pass keeps one mode
+        /// for its life, so a loop holds one encode pass and one denoise
+        /// pass rather than flipping either.
+        ///
+        /// A `denoise` pass on an engine whose attention cannot lift its
+        /// causal bound is refused by name at submit, never read causally.
+        canvas: func(mode: mode) -> result<_, error>;
+
+        /// **THE SELF-CONDITIONING SIGNAL, AS THE GUEST'S TAPS.** The
+        /// reference denoiser feeds each step the previous step's
+        /// distribution, as `softmax(logits / T) · E`. Whose distribution
+        /// that is — which temperature, how much of the tail — is the
+        /// sampler's business, so the guest hands the model the
+        /// distribution's TAPS: per canvas row, `self-cond-taps` token ids
+        /// and their probabilities (`model.canvas().self-cond-taps`, row
+        /// major, `rows.len() == weights.len() == length * taps`). The
+        /// model gathers those rows of its embedding table with those
+        /// weights and runs its self-conditioning block over the sum. Zero
+        /// weights are "no signal" — the reference's first step.
+        ///
+        /// A payload beside the ledger, like `media`: staged for the NEXT
+        /// submit of this pass and consumed by it, one at a time. A denoise
+        /// pass submitted with nothing staged runs with no signal. Staging
+        /// twice without a submit between is refused (the first payload
+        /// would be silently lost); so is staging on an `encode` pass.
+        self-conditioning: func(
+            rows: list<u32>,
+            weights: list<f32>,
+        ) -> result<_, error>;
+
+        /// Bind embedding token ids and CSR row indptr. Both are channels.
+        /// On a `denoise` pass the tokens are the canvas — random ids on the
+        /// first step, whatever the guest's sampler wrote after.
+        embed: func(
+            tokens: borrow<channel>,
+            indptr: borrow<channel>,
+        ) -> result<_, error>;
+
+        /// Bind an optional readout-index channel separately from embedding.
+        /// A denoiser reads every canvas row.
+        readout: func(indices: borrow<channel>) -> result<_, error>;
+
+        /// The media payload beside the ledger, exactly as `forward.media`
+        /// states it — an `encode` pass's concern, since a prompt is what
+        /// carries images.
+        media: func(spans: list<media-span>) -> result<_, error>;
+
+        /// tart: run only the first `max-layers` layers and take the head
+        /// there. Zero rejected; unset = full model. Per pass, so an early
+        /// denoising step may run shallow and the last ones deep.
+        set-max-layers: func(max-layers: u32) -> result<_, error>;
+
+        /// The attention interface's verb, same host half: these rows are a
+        /// block drafter's proposal, not the sequence's own. A denoiser has no
+        /// use for it; it is here so the four pass interfaces stay one shape.
+        set-drafting-block: func(on: bool) -> result<_, error>;
+
+        /// Attach canonical ETA bytes and channel handles in dense declaration
+        /// order. Validation uses the engine-owned ModelProfile and rejects
+        /// any stage this interface does not admit.
+        program: func(
+            container-bytes: data,
+            channels: list<borrow<channel>>,
+        ) -> result<_, error>;
+    }
+
+    /// Submit ONE FRAME on `on`: exactly `model.frame-size()` ordered slots.
+    /// `forward.submit`'s contract, unchanged; an encode pass and a denoise
+    /// pass may share a frame.
+    submit: func(
+        on: borrow<pipeline>,
+        slots: list<option<borrow<forward-pass>>>,
+    ) -> result<_, error>;
+
+    /// Leave the frame's wait-set on `on` until this pipeline submits again.
+    /// `forward.park`'s contract, unchanged.
+    park: func(on: borrow<pipeline>);
+}

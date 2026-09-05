@@ -65,6 +65,9 @@ describe('model', () => {
 
   it('exposes recurrent capabilities', () => {
     expect(model.rsStateSize()).toBe(4096);
+    expect(model.canvas()).toEqual({ length: 32, hidden: 2560, selfCondTaps: 4 });
+    expect(model.draftBlock()).toBeUndefined();
+    expect(model.runAheadWindow()).toBe(4);
     expect(model.rsBufferPageSize()).toBe(64);
     expect(model.rsFoldGranularity()).toBe(1);
   });

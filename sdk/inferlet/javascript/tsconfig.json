@@ -31,6 +31,12 @@
       "pie:inferlet/forward": [
         "./src/bindings/interfaces/pie-inferlet-forward.js"
       ],
+      "pie:inferlet/forward-diffusion": [
+        "./src/bindings/interfaces/pie-inferlet-forward-diffusion.js"
+      ],
+      "pie:inferlet/forward-diffusion@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-forward-diffusion.js"
+      ],
       "pie:inferlet/forward-hybrid": [
         "./src/bindings/interfaces/pie-inferlet-forward-hybrid.js"
       ],

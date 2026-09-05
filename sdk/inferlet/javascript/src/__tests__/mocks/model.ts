@@ -5,5 +5,5 @@ export const {
   name, architecture, defaultSystemSpeculation, passKind,
   outputVocabSize, kvPageSize, frameSize, channelCapacity, maxEmbedLength,
   rsStateSize, rsBufferPageSize, rsFoldGranularity, arenaBlockSize,
-  mtpDepth, submitDeadlineUs,
+  mtpDepth, submitDeadlineUs, runAheadWindow, draftBlock, canvas,
 } = modelStub;

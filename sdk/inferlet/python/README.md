@@ -39,7 +39,7 @@ async def main(input: dict) -> dict:
 
 | Module | Interface | Notes |
 |---|---|---|
-| `inferlet.eta` | `forward*`, `channel`, `working-set`, `pipeline` | The ETA authoring surface: `Tensor` + the op set, `Channel`, `WorkingSet`, `RsWorkingSet`, `ForwardPass`, `Pipeline`, `run_ahead`, `prefill_chunks`. A port of the Rust `eta-dsl`/`eta-ir` crates and `inferlet::eta`; the container bytes it emits are **byte-identical** to the Rust SDK's for the same program (`tests/test_eta_goldens.py` pins them), so a Python and a Rust inferlet share the host's program cache. |
+| `inferlet.eta` | `forward*`, `channel`, `working-set`, `pipeline` | The ETA authoring surface: `Tensor` + the op set, `Channel`, `WorkingSet`, `RsWorkingSet`, `ForwardPass`, `Pipeline`, `run_ahead`, `prefill_chunks`, and `eta.diffusion` (the diffusion pass's `Mode` plus `entropy_bound_accept` / `stable_and_confident` / `linear_temperature`). A port of the Rust `eta-dsl`/`eta-ir` crates and `inferlet::eta`; the container bytes it emits are **byte-identical** to the Rust SDK's for the same program (`tests/test_eta_goldens.py` pins them), so a Python and a Rust inferlet share the host's program cache. |
 | `inferlet.model` / `inferlet.tokenizer` | `model`, `tokenizer` | The bound model's facts; `model` re-exports the tokenizer functions. |
 | `inferlet.grammar` / `inferlet.mask` | `grammar` | JSON-Schema / regex / EBNF constraints and the packed-bitmask helpers a `masked_argmax` epilogue reads. |
 | `inferlet.chat` / `inferlet.reasoning` / `inferlet.tools` | `chat`, `reasoning`, `tools` | The host's chat template, thinking-block and tool-call decoders. |

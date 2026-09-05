@@ -12,6 +12,7 @@
 
 import * as witChannel from 'pie:inferlet/channel@0.3.0';
 import * as witAttention from 'pie:inferlet/forward@0.3.0';
+import * as witDiffusion from 'pie:inferlet/forward-diffusion@0.3.0';
 import * as witHybrid from 'pie:inferlet/forward-hybrid@0.3.0';
 import * as witRecurrent from 'pie:inferlet/forward-recurrent@0.3.0';
 import * as witModel from 'pie:inferlet/model@0.3.0';
@@ -421,8 +422,6 @@ export const frameSize = () => cached('frameSize', () => Math.max(witModel.frame
 export const submitDeadlineUs = () => cached('submitDeadlineUs', () => Number(witModel.submitDeadlineUs()));
 /** Host-reader channel capacity that sustains run-ahead (not cached). */
 export const channelCapacity = () => Math.max(witModel.channelCapacity(), 2);
-/** Live slots per frame: k for dense, 1 for recurrent (linear/hybrid). */
-export const liveSlots = () => cached('liveSlots', () => (witModel.passKind() !== 'attention' ? 1 : frameSize()));
 export const kvPageSize = () => cached('kvPageSize', () => witModel.kvPageSize());
 export const maxEmbedLength = () => cached('maxEmbedLength', () => Math.max(witModel.maxEmbedLength(), 1));
 
@@ -453,9 +452,10 @@ export function prefillChunks(n: number, cap?: number): [number, number][] {
 // ---------------------------------------------------------------------------
 
 type AttentionMod = typeof witAttention;
+type DiffusionMod = typeof witDiffusion;
 type HybridMod = typeof witHybrid;
 type RecurrentMod = typeof witRecurrent;
-type AnyPass = witAttention.ForwardPass | witHybrid.ForwardPass | witRecurrent.ForwardPass;
+type AnyPass = witAttention.ForwardPass | witDiffusion.ForwardPass | witHybrid.ForwardPass | witRecurrent.ForwardPass;
 
 interface StagedKv {
   ws: witWs.KvWorkingSet;
@@ -482,7 +482,7 @@ const SITE_BITS: Record<string, number> = { q: 1, k: 2, v: 4, o: 8, gate_up: 16,
 export class ForwardPass {
   readonly kind: ForwardKind;
   readonly wit: AnyPass;
-  private readonly mod: AttentionMod | HybridMod | RecurrentMod;
+  private readonly mod: AttentionMod | DiffusionMod | HybridMod | RecurrentMod;
   private ports: [Port, Channel][] = [];
   private stages: [Stage, () => void][] = [];
   private readonly vocab: number;
@@ -497,6 +497,7 @@ export class ForwardPass {
     if (this.kind === 'attention') this.mod = witAttention;
     else if (this.kind === 'hybrid') this.mod = witHybrid;
     else if (this.kind === 'recurrent') this.mod = witRecurrent;
+    else if (this.kind === 'diffusion') this.mod = witDiffusion;
     else throw new Error(`unknown forward kind ${String(this.kind)}`);
     this.wit = new this.mod.ForwardPass();
     this.vocab = witModel.outputVocabSize();
@@ -611,22 +612,38 @@ export class ForwardPass {
     return { workingSets: workingSets.map((r) => r.rs), foldLen, buffer };
   }
 
-  private requireKind(kind: ForwardKind, what: string): void {
-    if (this.kind !== kind) throw new InferletError(`${what} binds a ${kind} pass; this pass is ${this.kind}`);
+  private requireKind(kinds: ForwardKind[], what: string): void {
+    if (!kinds.includes(this.kind)) throw new InferletError(`${what} binds a ${kinds.join(' / ')} pass; this pass is ${this.kind}`);
   }
 
-  /** Bind the KV working set + geometry of an attention-only pass. */
+  /** Bind the KV working set + geometry of an attention or diffusion pass
+   * (on a denoise pass the geometry is the canvas's). */
   attention(ws: WorkingSet, geom: KvGeometry): void {
-    this.requireKind('attention', 'attention');
+    this.requireKind(['attention', 'diffusion'], 'attention');
     const kv = this.stageKv(ws, geom);
     wit('attention', () => (this.wit as witAttention.ForwardPass).attention(kv.ws, this.kvGeometryWit(kv)));
+  }
+
+  /** Which reading this diffusion pass runs (`'encode'` or `'denoise'`).
+   * REQUIRED, once, before the first submit. */
+  canvas(mode: witDiffusion.Mode): void {
+    this.requireKind(['diffusion'], 'canvas');
+    wit('canvas', () => (this.wit as witDiffusion.ForwardPass).canvas(mode));
+  }
+
+  /** The previous step's distribution as taps — `model.canvas().selfCondTaps`
+   * `(id, weight)` pairs per canvas row, row major — staged for this pass's
+   * next submit. */
+  selfConditioning(rows: ArrayLike<number>, weights: ArrayLike<number>): void {
+    this.requireKind(['diffusion'], 'selfConditioning');
+    wit('selfConditioning', () => (this.wit as witDiffusion.ForwardPass).selfConditioning(Uint32Array.from(rows), Float32Array.from(weights)));
   }
 
   /** Bind a hybrid pass: the KV binding (`undefined` for a fire that touches
    * no attention layer) plus the recurrent working set(s) and where their
    * folded boundary lands. */
   bindHybrid(kv: KvBinding | undefined, rs: RsWorkingSet[], rsGeom: RsGeometry): void {
-    this.requireKind('hybrid', 'bindHybrid');
+    this.requireKind(['hybrid'], 'bindHybrid');
     const stagedKv = kv ? this.stageKv(kv.workingSet, kv.geometry) : undefined;
     const stagedRs = this.stageRs(rs, rsGeom);
     const binding = stagedKv ? { workingSet: stagedKv.ws, geometry: this.kvGeometryWit(stagedKv) } : undefined;
@@ -638,7 +655,7 @@ export class ForwardPass {
   /** Bind a recurrent-only pass: the recurrent working set(s) and where
    * their folded boundary lands. */
   bindRecurrent(rs: RsWorkingSet[], geom: RsGeometry): void {
-    this.requireKind('recurrent', 'bindRecurrent');
+    this.requireKind(['recurrent'], 'bindRecurrent');
     const stagedRs = this.stageRs(rs, geom);
     wit('bindRecurrent', () =>
       (this.wit as witRecurrent.ForwardPass).attention(stagedRs.workingSets, { foldLen: stagedRs.foldLen, buffer: pageSpan(stagedRs.buffer) }),
@@ -649,7 +666,7 @@ export class ForwardPass {
    * plus — on a hybrid model — the recurrent working set(s), folding every
    * token straight into the recurrence. */
   bindState(ws: WorkingSet, geom: KvGeometry, rs: RsWorkingSet[] = []): void {
-    if (this.kind === 'attention') this.attention(ws, geom);
+    if (this.kind === 'attention' || this.kind === 'diffusion') this.attention(ws, geom);
     else if (this.kind === 'hybrid') this.bindHybrid({ workingSet: ws, geometry: geom }, rs, { buffer: [0, 0] });
     else throw new InferletError('bindState: a recurrent-only model has no KV geometry to bind');
   }
@@ -786,7 +803,7 @@ export function submitFrame(on: Pipeline, slots: (ForwardPass | undefined)[]): v
  */
 export function runAhead(on: Pipeline, fwd: ForwardPass, budget: number, onToken: () => boolean | void): number {
   if (budget === 0) return 0;
-  const r = fwd.bindsDeviceMask() ? 1 : liveSlots();
+  const r = fwd.bindsDeviceMask() ? 1 : frameSize();
   const windowFrames = Math.max(Math.floor((channelCapacity() - 1) / Math.max(r, 1)), 1);
   let submitted = 0;
   let consumed = 0;

@@ -1,6 +1,7 @@
 // world pie:inferlet/inferlet@0.3.0
 export type * as PieInferletChannel030 from './interfaces/pie-inferlet-channel.js'; // import pie:inferlet/channel@0.3.0
 export type * as PieInferletChat030 from './interfaces/pie-inferlet-chat.js'; // import pie:inferlet/chat@0.3.0
+export type * as PieInferletForwardDiffusion030 from './interfaces/pie-inferlet-forward-diffusion.js'; // import pie:inferlet/forward-diffusion@0.3.0
 export type * as PieInferletForwardHybrid030 from './interfaces/pie-inferlet-forward-hybrid.js'; // import pie:inferlet/forward-hybrid@0.3.0
 export type * as PieInferletForwardRecurrent030 from './interfaces/pie-inferlet-forward-recurrent.js'; // import pie:inferlet/forward-recurrent@0.3.0
 export type * as PieInferletForward030 from './interfaces/pie-inferlet-forward.js'; // import pie:inferlet/forward@0.3.0

@@ -106,3 +106,15 @@ describe('ForwardPass per-kind binders', () => {
     expect(() => attention.bindHybrid(undefined, [], {})).toThrow(/bindHybrid binds/);
   });
 });
+
+describe('diffusion pass surface', () => {
+  it('binds the canvas reading and stages self-conditioning taps', () => {
+    const fwd = new ForwardPass('diffusion');
+    fwd.canvas('denoise');
+    fwd.selfConditioning([1, 2, 3, 4], [0.5, 0.25, 0.125, 0.125]);
+    const w = fwd.wit as unknown as { mode: string; selfCond: [number[], number[]] };
+    expect(w.mode).toBe('denoise');
+    expect(w.selfCond).toEqual([[1, 2, 3, 4], [0.5, 0.25, 0.125, 0.125]]);
+    expect(() => new ForwardPass('attention').canvas('encode')).toThrow(/canvas binds/);
+  });
+});

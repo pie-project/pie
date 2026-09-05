@@ -17,6 +17,7 @@ from typing import Awaitable, Callable, Sequence, TypeAlias
 from componentize_py_types import Err as _WitErr
 from wit_world.imports import channel as _wit_channel
 from wit_world.imports import forward as _wit_attention
+from wit_world.imports import forward_diffusion as _wit_diffusion
 from wit_world.imports import forward_hybrid as _wit_hybrid
 from wit_world.imports import forward_recurrent as _wit_recurrent
 from wit_world.imports import model as _wit_model
@@ -460,12 +461,6 @@ def channel_capacity() -> int:
 
 
 @functools.cache
-def live_slots() -> int:
-    """Live slots per frame: k for dense, 1 for recurrent (linear/hybrid)."""
-    return 1 if _wit_model.pass_kind() != ForwardKind.ATTENTION else frame_size()
-
-
-@functools.cache
 def kv_page_size() -> int:
     return _wit_model.kv_page_size()
 
@@ -524,6 +519,8 @@ class ForwardPass:
             self._mod = _wit_hybrid
         elif kind == ForwardKind.RECURRENT:
             self._mod = _wit_recurrent
+        elif kind == ForwardKind.DIFFUSION:
+            self._mod = _wit_diffusion
         else:
             raise ValueError(f"unknown forward kind {kind!r}")
         self.wit = self._mod.ForwardPass()
@@ -641,13 +638,15 @@ class ForwardPass:
             fold_len = self._fold_all._wit()
         return {"working_sets": [rs.rs for rs in working_sets], "fold_len": fold_len, "buffer": buffer}
 
-    def _require_kind(self, kind: ForwardKind, what: str) -> None:
-        if self.kind != kind:
-            raise InferletError(f"{what} binds a {kind.name.lower()} pass; this pass is {self.kind.name.lower()}")
+    def _require_kind(self, kinds: tuple[ForwardKind, ...], what: str) -> None:
+        if self.kind not in kinds:
+            names = " / ".join(k.name.lower() for k in kinds)
+            raise InferletError(f"{what} binds a {names} pass; this pass is {self.kind.name.lower()}")
 
     def attention(self, ws: WorkingSet, geom: KvGeometry) -> None:
-        """Bind the KV working set + geometry of an attention-only pass."""
-        self._require_kind(ForwardKind.ATTENTION, "attention")
+        """Bind the KV working set + geometry of an attention or diffusion
+        pass (on a denoise pass the geometry is the canvas's)."""
+        self._require_kind((ForwardKind.ATTENTION, ForwardKind.DIFFUSION), "attention")
         kv = self._stage_kv(ws, geom)
         _wit(self.wit.attention, kv["ws"], self._kv_geometry_wit(kv), what="attention")
 
@@ -655,7 +654,7 @@ class ForwardPass:
         """Bind a hybrid pass: the KV binding (None for a fire that touches
         no attention layer) plus the recurrent working set(s) and where
         their folded boundary lands."""
-        self._require_kind(ForwardKind.HYBRID, "bind_hybrid")
+        self._require_kind((ForwardKind.HYBRID,), "bind_hybrid")
         staged_kv = self._stage_kv(kv.working_set, kv.geometry) if kv is not None else None
         staged_rs = self._stage_rs(rs, rs_geom)
         binding = (
@@ -674,7 +673,7 @@ class ForwardPass:
     def bind_recurrent(self, rs: Sequence[RsWorkingSet], geom: RsGeometry) -> None:
         """Bind a recurrent-only pass: the recurrent working set(s) and where
         their folded boundary lands."""
-        self._require_kind(ForwardKind.RECURRENT, "bind_recurrent")
+        self._require_kind((ForwardKind.RECURRENT,), "bind_recurrent")
         staged_rs = self._stage_rs(rs, geom)
         _wit(
             self.wit.attention,
@@ -687,12 +686,27 @@ class ForwardPass:
         """Kind-independent binding for the common text program: the KV
         geometry, plus — on a hybrid model — the recurrent working set(s),
         folding every token straight into the recurrence."""
-        if self.kind == ForwardKind.ATTENTION:
+        if self.kind in (ForwardKind.ATTENTION, ForwardKind.DIFFUSION):
             self.attention(ws, geom)
         elif self.kind == ForwardKind.HYBRID:
             self.bind_hybrid(KvBinding(ws, geom), list(rs), RsGeometry(fold_len=None, buffer=(0, 0)))
         else:
             raise InferletError("bind_state: a recurrent-only model has no KV geometry to bind")
+
+    # -- diffusion --------------------------------------------------------------
+
+    def canvas(self, mode: "_wit_diffusion.Mode") -> None:
+        """Which reading this diffusion pass runs (`diffusion.Mode.ENCODE` or
+        `DENOISE`). REQUIRED, once, before the first submit."""
+        self._require_kind((ForwardKind.DIFFUSION,), "canvas")
+        _wit(self.wit.canvas, mode, what="canvas")
+
+    def self_conditioning(self, rows: Sequence[int], weights: Sequence[float]) -> None:
+        """The previous step's distribution as taps — `model.canvas().self_cond_taps`
+        `(id, weight)` pairs per canvas row, row major — staged for this
+        pass's next submit."""
+        self._require_kind((ForwardKind.DIFFUSION,), "self_conditioning")
+        _wit(self.wit.self_conditioning, [int(r) for r in rows], [float(w) for w in weights], what="self_conditioning")
 
     # -- adapters ------------------------------------------------------------
 
@@ -850,7 +864,7 @@ async def run_ahead(
     Returns the run count."""
     if budget == 0:
         return 0
-    r = 1 if fwd.binds_device_mask() else live_slots()
+    r = 1 if fwd.binds_device_mask() else frame_size()
     window_frames = max((channel_capacity() - 1) // max(r, 1), 1)
     submitted = 0
     consumed = 0

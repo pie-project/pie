@@ -429,3 +429,74 @@ def test_comparison_operators_are_the_free_functions():
     # `==` stays identity, so a Tensor can key a dict / sit in a set.
     t = Tensor.constant(1)
     assert {t: "x"}[t] == "x" and t != Tensor.constant(1)
+
+
+def test_diffusion_step_matches_rust():
+    """`sdk_goldens.rs::diffusion_step` — the diffusion-baseline denoise
+    epilogue through `eta.diffusion.{entropy_bound_accept, stable_and_confident}`."""
+    from inferlet.eta.diffusion import entropy_bound_accept, stable_and_confident
+
+    length, taps, base = 8, 4, 5
+    end = base + length
+    page_size = PAGE
+    max_pages = 2
+    bound, confidence = 0.5, 0.1
+    toks = ch_from([(i * 7919) % 1000 for i in range(length)], dtype.i32, "canvas")
+    embed_indptr = ch_from([0, length], dtype.u32, "embed_indptr")
+    positions = ch_from(range(base, end), dtype.u32, "positions")
+    pages = ch_from(range(max_pages), dtype.u32, "pages")
+    page_indptr = ch_from([0, -(-end // page_size)], dtype.u32, "page_indptr")
+    w_slot = ch_from([p // page_size for p in range(base, end)], dtype.u32, "w_slot")
+    w_off = ch_from([p % page_size for p in range(base, end)], dtype.u32, "w_off")
+    kv_len = ch_from([end], dtype.u32, "kv_len")
+    readout = ch_from(range(length), dtype.u32, "readout")
+    temp = ch_from([1.0], dtype.f32, "temperature")
+    rng_state = ch_from([7, 0], dtype.u32, "rng")
+    history = ch_from([-1] * length, dtype.i32, "argmax_history")
+    canvas_out = ch_new([length], dtype.i32, "canvas_out")
+    argmax_out = ch_new([length], dtype.i32, "argmax_out")
+    stop = ch_new([1], dtype.bool, "stop")
+    mean_out = ch_new([1], dtype.f32, "mean_entropy")
+    tap_ids_out = ch_new([length, taps], dtype.u32, "tap_ids")
+    tap_weights_out = ch_new([length, taps], dtype.f32, "tap_weights")
+
+    b = Builder(VOCAB, PAGE)
+    for port, c in [
+        (Port.EMBED_TOKENS, toks), (Port.EMBED_INDPTR, embed_indptr), (Port.KV_LEN, kv_len),
+        (Port.PAGES, pages), (Port.PAGE_INDPTR, page_indptr), (Port.W_SLOT, w_slot),
+        (Port.W_OFF, w_off), (Port.POSITIONS, positions), (Port.READOUT, readout),
+    ]:
+        b.bind_port(port, c)
+
+    def epilogue():
+        positions.put_tensor(positions.take())
+        w_slot.put_tensor(w_slot.take())
+        w_off.put_tensor(w_off.take())
+        r = rng_state.take()
+        t = reshape(temp.read(), [])
+        logits = intrinsics.logits()
+        scaled = logits / t
+        probs = softmax(scaled)
+        h = entropy(probs)
+        sampled = gumbel_max(scaled, r)
+        argmax = reduce_argmax(scaled)
+        accept = entropy_bound_accept(h, bound)
+        r_noise = r + iota(2)
+        noise = cast(rng(r_noise, [length]) * float(VOCAB), dtype.i32)
+        nxt = select(accept, sampled, noise)
+        previous = history.take()
+        history.put_tensor(argmax)
+        done = stable_and_confident(argmax, previous, h, confidence)
+        tap_weights, tap_ids = top_k(probs, taps)
+        tap_ids_out.put_tensor(tap_ids)
+        tap_weights_out.put_tensor(tap_weights)
+        canvas_out.put_tensor(nxt)
+        argmax_out.put_tensor(argmax)
+        stop.put_tensor(reshape(done, [1]))
+        mean_out.put_tensor(reshape(reduce_sum(h) / float(length), [1]))
+        rng_state.put_tensor(r_noise + iota(2))
+
+    b.stage(Stage.EPILOGUE, epilogue)
+    for c in (canvas_out, argmax_out, stop, mean_out, tap_ids_out, tap_weights_out):
+        c.note_host_take()
+    check("diffusion_step", b.build())

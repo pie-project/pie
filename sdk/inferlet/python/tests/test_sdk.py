@@ -365,3 +365,30 @@ class TestForwardPassKinds:
         attention = ForwardPass(ForwardKind.ATTENTION)
         with pytest.raises(InferletError, match="bind_hybrid binds"):
             attention.bind_hybrid(None, [], None)  # type: ignore[arg-type]
+
+
+class TestDiffusionSurface:
+    def test_model_facts(self):
+        from inferlet import model
+
+        assert model.canvas() == model.CanvasShape(32, 2560, 4)
+        assert model.draft_block() is None
+        assert model.run_ahead_window() == 4
+        assert model.is_linear()  # the stub is a hybrid model
+
+    def test_diffusion_pass_binds_canvas_and_taps(self):
+        from inferlet.eta import ForwardKind, ForwardPass, InferletError, diffusion
+
+        fwd = ForwardPass(ForwardKind.DIFFUSION)
+        fwd.canvas(diffusion.Mode.DENOISE)
+        fwd.self_conditioning([1, 2, 3, 4], [0.4, 0.3, 0.2, 0.1])
+        assert fwd.wit.mode is diffusion.Mode.DENOISE
+        assert fwd.wit.self_cond == ([1, 2, 3, 4], [0.4, 0.3, 0.2, 0.1])
+        with pytest.raises(InferletError, match="canvas binds"):
+            ForwardPass(ForwardKind.ATTENTION).canvas(diffusion.Mode.ENCODE)
+
+    def test_linear_temperature_is_the_reference_schedule(self):
+        from inferlet.eta.diffusion import linear_temperature
+
+        assert linear_temperature(4, 4, 1.0, 0.2) == pytest.approx(1.0)
+        assert linear_temperature(1, 4, 1.0, 0.2) == pytest.approx(0.4)
