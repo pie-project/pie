@@ -491,6 +491,11 @@ impl Pools {
     /// [`Fault::Ceiling`] for a slot past the pool or a span past a slab,
     /// [`Fault::Deviceless`] for a non-Apple build.
     pub fn clear(&mut self, slot: u32) -> Result<()> {
+        // Nothing to zero on an attention-only plan, and no bank the seat
+        // could be past — the ceiling below is the banks' own.
+        if !self.has_state() {
+            return Ok(());
+        }
         if slot >= self.paging.slots {
             return Err(Fault::Ceiling {
                 what: "recurrent slots",
@@ -613,7 +618,15 @@ impl engine::frame::Supply for Pools {
     type Error = Fault;
 
     fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
-        if demand.state_slots > self.paging.slots {
+        // THE SLOT CEILING BELONGS TO THE RECURRENT BANKS, AND ONLY TO THEM.
+        // `demand.state_slots` is the fire's highest seat plus one, and a seat
+        // is a bank row — on a plan that folds no state there is no bank for
+        // it to be past. `slots` reserves nothing there either (`pool_demand`
+        // charges bytes per slot for `CacheRow::State` alone), so enforcing it
+        // refuses a fire over a resource this load never held: an
+        // attention-only deployment would seat `max_state_slots` sequences and
+        // kill the next one with a recurrent-slot refusal it cannot act on.
+        if self.has_state() && demand.state_slots > self.paging.slots {
             return Err(Fault::Ceiling {
                 what: "recurrent slots",
                 need: u64::from(demand.state_slots),
