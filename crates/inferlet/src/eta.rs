@@ -1440,10 +1440,21 @@ pub async fn run_ahead<W: PassWit>(
     if budget == 0 {
         return Ok(0);
     }
-    // A pass that binds a dense device mask takes one slot per frame — see
-    // `Pass::binds_device_mask`.
-    let r = if pass.binds_device_mask() { 1 } else { frame_size() };
-
+    // Live slots per frame. A pass that binds a dense device mask takes one
+    // (see `Pass::binds_device_mask`). So does a pass on a recurrent or
+    // hybrid model: the frame's waves then carry the same sequence's state
+    // one into the next, and a frame of one live slot measured faster than a
+    // full one on Qwen3.5-0.8B at 16 lanes (627 vs 598 tok/s, the two shapes
+    // alternated over five passes on one binary) — the same fires stay in
+    // flight, spread over twice the frames. A dense attention pass fills the
+    // frame.
+    let r = if pass.binds_device_mask()
+        || crate::model::pass_kind() != crate::model::ForwardKind::Attention
+    {
+        1
+    } else {
+        frame_size()
+    };
     // THE WINDOW IS THE RUNTIME'S NUMBER, NOT RECOVERED FROM THE RING. The
     // runtime derives the ring size and the window from one source and
     // publishes both; a guest that re-derived one from the other believed a
