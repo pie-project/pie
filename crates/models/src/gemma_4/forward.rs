@@ -11,6 +11,9 @@ pub struct Facts {
     pub has_adapter: bool,
     pub media: bool,
     pub drafts: bool,
+    /// Lanes that want their attention's per-query LSE kept — see
+    /// [`Facts::captures_scores`].
+    pub captures_scores: bool,
 }
 
 impl Facts {
@@ -39,6 +42,15 @@ impl Facts {
     pub fn drafts() -> Predicate {
         Predicate::fact(4)
     }
+
+    /// Lanes that want their attention's per-query LSE kept (the H2O / TOVA /
+    /// SnapKV observation the `attn_score` intrinsic reads). Bit 5 of the
+    /// fact word. Ordered before `qo_one` in the split so a capturing lane
+    /// takes the capture arm regardless of row count; only `masked` outranks
+    /// it — the same order `qwen_3` fixes.
+    pub fn captures_scores() -> Predicate {
+        Predicate::fact(5)
+    }
 }
 
 impl Classify for Facts {
@@ -49,6 +61,7 @@ impl Classify for Facts {
             has_adapter: r.has_adapter(),
             media: r.has_media(),
             drafts: r.drafts(),
+            captures_scores: r.captures_scores(),
         }
     }
 
@@ -58,6 +71,7 @@ impl Classify for Facts {
             | (u64::from(self.has_adapter) << 2)
             | (u64::from(self.media) << 3)
             | (u64::from(self.drafts) << 4)
+            | (u64::from(self.captures_scores) << 5)
     }
 }
 
@@ -97,8 +111,15 @@ impl ForwardHybrid for Model {
         // Sliding/global readings need separate plans (head width, kv chunk
         // size, window differ); classes need separate plans too, or sharing
         // one would straddle rebased boundaries (`Fault::Straddled`).
-        let classes = [Facts::masked(), qo_one.clone(), Predicate::rest()];
-        let [input_m, input_d, input_p] = inputs.split(classes.clone());
+        // Masked is ordered before captures: a lane asking for both gets the
+        // masked arm with no scores.
+        let classes = [
+            Facts::masked(),
+            Facts::captures_scores(),
+            qo_one.clone(),
+            Predicate::rest(),
+        ];
+        let [input_m, input_s, input_d, input_p] = inputs.split(classes.clone());
         let plan_m = [
             ops::attn::plan_prefill(
                 &input_m,
@@ -141,6 +162,24 @@ impl ForwardHybrid for Model {
             ),
             ops::attn::plan_prefill(
                 &input_p,
+                m.q_heads,
+                m.global.kv_heads,
+                m.global.head_dim,
+                None,
+            ),
+        ];
+        // The score-capturing arm's plans: a prefill schedule per reading, as
+        // `plan_p`, over the capturing lanes alone.
+        let plan_s = [
+            ops::attn::plan_prefill(
+                &input_s,
+                m.q_heads,
+                m.sliding.kv_heads,
+                m.sliding.head_dim,
+                Some(m.sliding.window),
+            ),
+            ops::attn::plan_prefill(
+                &input_s,
                 m.q_heads,
                 m.global.kv_heads,
                 m.global.head_dim,
@@ -249,7 +288,43 @@ impl ForwardHybrid for Model {
 
             seam::at(seam::ATTN_Q, &[&q]);
 
-            let [mq, dq, p] = q.split(classes.clone());
+            // Four arms of one merge: masked, score-capturing, decode,
+            // prefill. The split order here must match the class order above.
+            //
+            // **ONLY THE GLOBAL READING EXPORTS A SCORE PLANE.** A sliding
+            // layer's row is a softmax over its window, not over the request's
+            // keys — every key outside the window would read as unattended
+            // rather than as excluded — and the capture kernel refuses a
+            // window for exactly that reason (`attention.score_capture`). So
+            // the capturing class runs the plain prefill on a sliding layer
+            // and the LSE-keeping one on a global layer, and the load exports
+            // one plane per global layer (five of thirty on the 26B), which
+            // is what a program's `attn_score(planes)` counts.
+            let [mq, sq, dq, p] = q.split(classes.clone());
+            let so = match at.reading {
+                Reading::Sliding => ops::attn::prefill(
+                    &sq,
+                    &plan_s[at.reading as usize],
+                    pages,
+                    win,
+                    d,
+                    kv_heads,
+                    at.sm_scale,
+                ),
+                Reading::Global => {
+                    let (so, lse) = ops::attn::prefill_lse(
+                        &sq,
+                        &plan_s[at.reading as usize],
+                        pages,
+                        win,
+                        d,
+                        kv_heads,
+                        at.sm_scale,
+                    );
+                    seam::at(seam::SCORES, &[&lse]);
+                    so
+                }
+            };
             let a = Value::merge(vec![
                 ops::attn::masked(
                     &mq,
@@ -262,6 +337,7 @@ impl ForwardHybrid for Model {
                     true,
                     at.sm_scale,
                 ),
+                so,
                 ops::attn::decode(
                     &dq,
                     &plan_d[at.reading as usize],
