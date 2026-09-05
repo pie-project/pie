@@ -610,6 +610,24 @@ _TOVA_PROMPT = (
 )
 
 
+def _repo_id(model: str) -> str:
+    """The HF repository id behind `--model`, which may name a repository
+    (`mlx-community/gemma-4-26b-a4b-it-4bit`), a store directory
+    (`~/.pie/models/mlx-community--gemma-4-26b-a4b-it-4bit`) or one stamped
+    artifact inside it (`<store-dir>/<id>.<sku>.metal.zt` — the id is the
+    file name up to its first dot). A store directory holding two artifacts of
+    one model must be named by its artifact, and the geometry helpers below
+    still want the snapshot's `config.json`; without this they read nothing
+    and the probes fall back to another SKU's numbers (24 layers, hidden 1024)."""
+    from pathlib import Path
+
+    if "/" in model and not Path(model).exists():
+        return model
+    path = Path(model)
+    stem = path.name.split(".")[0] if path.is_file() else path.name
+    return stem.replace("--", "/") if "--" in stem else model
+
+
 def _score_geometry(model: str) -> dict:
     """`{"layers", "heads"}` for the score-reading inferlets: the attention
     layers the served model EXPORTS a score plane for, and its query heads.
@@ -621,7 +639,7 @@ def _score_geometry(model: str) -> dict:
     from pathlib import Path
 
     hub = Path.home() / ".cache" / "huggingface" / "hub"
-    pattern = str(hub / f"models--{model.replace('/', '--')}" / "snapshots" / "*" / "config.json")
+    pattern = str(hub / f"models--{_repo_id(model).replace('/', '--')}" / "snapshots" / "*" / "config.json")
     for path in sorted(glob.glob(pattern)):
         try:
             config = json.loads(Path(path).read_text())
@@ -868,7 +886,7 @@ def _adapter_geometry(model: str) -> dict:
     from pathlib import Path
 
     hub = Path.home() / ".cache" / "huggingface" / "hub"
-    pattern = str(hub / f"models--{model.replace('/', '--')}" / "snapshots" / "*" / "config.json")
+    pattern = str(hub / f"models--{_repo_id(model).replace('/', '--')}" / "snapshots" / "*" / "config.json")
     for path in sorted(glob.glob(pattern)):
         try:
             config = json.loads(Path(path).read_text())

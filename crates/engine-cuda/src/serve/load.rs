@@ -428,29 +428,8 @@ fn patch_fold(trace: &model_ir::Trace) -> u32 {
 /// Which bit of a fact word decides the correction window, or `None` when no
 /// single bit does (none qualifies, or two do).
 fn adapter_fact(classes: &model_ir::ClassTable, corrected: &model_ir::ClassSet) -> Option<u32> {
-    if corrected.is_empty() {
-        return None;
-    }
-    let mut found = None;
-    for bit in 0..u64::BITS {
-        if classes.mask & (1u64 << bit) == 0 {
-            continue;
-        }
-        let decides = classes.classes.iter().enumerate().all(|(at, class)| {
-            let runs = corrected.contains(at);
-            class
-                .words
-                .iter()
-                .all(|word| ((word >> bit) & 1 == 1) == runs)
-        });
-        if decides {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(bit);
-        }
-    }
-    found
+    // One derivation for every shell: `model_ir::ClassTable::adapter_fact`.
+    classes.adapter_fact(corrected)
 }
 
 /// What [`bake`] answers.

@@ -814,3 +814,63 @@ mod tests {
         assert_eq!(classes.dead, vec![2]);
     }
 }
+
+impl ClassTable {
+    /// **WHICH FACT IS THE ADAPTER WINDOW.** The model text writes it
+    /// (`qwen_3`: `Predicate::fact(1)`, called `has_adapter`) and nothing
+    /// crosses into a shell that names the bit. What does cross is this table
+    /// (every fact word, grouped by behaviour) and `corrected` — the classes
+    /// that run a `linear.lora_correct` arm. Between them the bit is a fact
+    /// rather than a guess: it is the one whose value agrees with membership
+    /// of the correction window on every word of every class **the window
+    /// can reach**.
+    ///
+    /// A class is out of the window's reach when every one of its words
+    /// carries a fact no corrected class ever carries: a block drafter's rows
+    /// (`block_draft`) run no trunk layer and so no correction, whatever else
+    /// they say, and they must not veto the bit that decides the rest. The
+    /// bits a corrected class ever sets are the window's domain; a class
+    /// wholly outside it does not vote. (Without this, the first family that
+    /// carried both an adapter and a block drafter refused every adapted lane:
+    /// "no corrected class for its fact word".)
+    ///
+    /// `None` when no bit qualifies (the window is not a single fact of this
+    /// bake), when two do (two facts never observed apart — picking one would
+    /// be picking at random), or when nothing is corrected at all. Every shell
+    /// derives the bit here, so a control plane's submission means one thing
+    /// on every backend.
+    #[must_use]
+    pub fn adapter_fact(&self, corrected: &ClassSet) -> Option<u32> {
+        if corrected.is_empty() {
+            return None;
+        }
+        let domain = self
+            .classes
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| corrected.contains(*at))
+            .flat_map(|(_, class)| class.words.iter().copied())
+            .fold(0u64, |acc, word| acc | word);
+        let reachable = |class: &Class| class.words.iter().any(|word| word & !domain == 0);
+        let mut found = None;
+        for bit in 0..u64::BITS {
+            if self.mask & (1u64 << bit) == 0 {
+                continue;
+            }
+            let decides = self.classes.iter().enumerate().all(|(at, class)| {
+                if !reachable(class) {
+                    return true;
+                }
+                let runs = corrected.contains(at);
+                class.words.iter().all(|word| ((word >> bit) & 1 == 1) == runs)
+            });
+            if decides {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(bit);
+            }
+        }
+        found
+    }
+}
