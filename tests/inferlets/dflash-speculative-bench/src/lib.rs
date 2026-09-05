@@ -280,13 +280,18 @@
 //! coin on a 30% prose); and it judges from two rounds, not eight (eight
 //! warm-up rounds at eight rows on a prose that closes at once cost 5%).
 //!
-//! At eight concurrent (`benches/pie_bench.py latency --requests 8`, gemma,
-//! aggregate tok/s) the gate is CONSERVATIVE: prose 65.3 priced / 49.8 ladder
-//! / 68.4 plain, counting 145.9 / 144.1 / 68.3, code 83.9 / 90.9 / 68.4. A
-//! lane's clock prices a fire as what the lane waited, and under load that is
-//! the batch it landed in, so a small draft fire is priced as a whole batch
-//! and rounds look dearer than they are. The exact price is the fire's own
-//! device time, which the engine has and the guest cannot see yet.
+//! **UNDER CONCURRENT LOAD THE PRICES LIE, SO `priced` IS OFF BY DEFAULT.**
+//! Eight lanes held open (`pie_bench.py tput --num-requests 8 --concurrency
+//! 8`, aggregate tok/s, plain / open loop / floor 2.5 / priced): gemma prose
+//! 107 / 56 / 87 / 92, gemma counting 110 / 174 / 181 / 149, qwen38 code 27
+//! / 34 / 29 / 33, qwen38 prose 27 / 27 / - / 22. A lane's clock prices a
+//! fire as the batch it waited for, the plain fire it is compared against is
+//! that same batch, and rows that would have ridden a batch nearly free are
+//! priced as a second wait — so the gate closes lanes it should not. What
+//! ships is the yield floor (2.5, the row above) with the closed gate judging
+//! on its probes; the yield is load-blind, which under load is the virtue.
+//! (`latency --requests 8` admits one process at a time and measures nothing
+//! about concurrency — its numbers are one lane's, eight times.)
 //!
 //! **A priced loop is not a deterministic function of its prompt.** The
 //! prices come off a clock, the widths follow the prices, and on a trunk
@@ -453,12 +458,12 @@ struct Input {
     /// because on three workloads it is a WASH.
     #[serde(default)]
     margin_width: bool,
-    /// **STOP DRAFTING BELOW THIS MANY TOKENS A ROUND.** Zero (the default)
-    /// states no floor: the prices decide (`priced`), or with those off the
-    /// loop never stops, which is the loop every number in the header's
-    /// first tables was taken with. Around 3.0 is break-even on a dense 27B
-    /// on this box; see `Gate`.
-    #[serde(default)]
+    /// **STOP DRAFTING BELOW THIS MANY TOKENS A ROUND.** 2.5 by default (the
+    /// header's shipped row); zero states no floor, which is the loop the
+    /// header's first tables were taken with. Around 3.0 is break-even on a
+    /// dense 27B on this box, and at eight concurrent a round costs about two
+    /// batch waits whatever the trunk; see `Gate`.
+    #[serde(default = "default_floor")]
     min_tokens_per_round: f64,
     /// **LET THE LOOP'S OWN YIELD PICK THE VERIFY WIDTH.** See `Gate::width`.
     /// **ON by default**, because the full block is the WORST width on every
@@ -468,7 +473,9 @@ struct Input {
     #[serde(default = "default_true")]
     auto_width: bool,
     /// **PRICE THE FIRES ON THE GUEST'S OWN CLOCK, AND LET THE PRICES PICK.**
-    /// ON by default. Every fire's wall time is kept by its shape — the
+    /// OFF by default: it wins alone on the box (see the header) and LOSES
+    /// under concurrent load, where a lane's clock prices a fire as the batch
+    /// it waited for. Every fire's wall time is kept by its shape — the
     /// one-row fire, the draft fire, each verify width — and a round is
     /// bought at the rung whose recent yield per price is best, or not at
     /// all when one token a fire beats every rung (`Prices`, `Gate::plan`).
@@ -479,8 +486,15 @@ struct Input {
     /// and no stated floor fits both. `min_tokens_per_round` still closes
     /// the gate on top; `verify_rows` still pins the rung, and the gate then
     /// closes when that rung loses. Off, the loop is the header's.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     priced: bool,
+}
+
+/// The floor this file ships — the header's "2.5, WINDOW 8" row, and at eight
+/// concurrent the row that keeps a mixture's prose near plain decode where
+/// the open loop loses 38-48% of it. Zero states no floor.
+fn default_floor() -> f64 {
+    2.5
 }
 
 fn default_prompt() -> String {
@@ -742,18 +756,26 @@ impl Gate {
     /// Whether this round drafts. A probe is allowed through so a workload
     /// that turns list-shaped into code-shaped is noticed.
     fn drafts(&mut self) -> bool {
-        if self.floor <= 0.0 || self.recent.len() < Self::WINDOW {
+        if self.floor <= 0.0 {
             return true;
         }
-        if self.mean() >= self.floor {
+        if self.closed {
+            // Judged on the probes fired since closing — see `plan` for why
+            // the window is emptied at closure.
+            if self.recent.len() >= Self::REOPEN && self.mean() >= self.floor {
+                self.closed = false;
+                self.since = 0;
+                self.probe_after = Self::PROBE;
+                return true;
+            }
+            return self.probe(0).is_some();
+        }
+        if self.recent.len() < Self::WINDOW || self.mean() >= self.floor {
             return true;
         }
-        if self.since >= Self::PROBE {
-            self.since = 0;
-            return true;
-        }
-        self.since += 1;
-        false
+        self.closed = true;
+        self.recent.clear();
+        self.probe(0).is_some()
     }
 
     /// **VERIFY AS MANY ROWS AS THE LOOP HAS BEEN KEEPING, ROUNDED UP TO A
