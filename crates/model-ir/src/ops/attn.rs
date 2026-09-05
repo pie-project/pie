@@ -287,6 +287,25 @@ pub enum Attention {
         dilation: u32,
         y: ValueId,
     },
+    /// **A two-tap grouped dynamic convolution along the fire's request
+    /// rows** (DFlash2's `attention_conv` / `mlp_conv`). Within each request's
+    /// span, `y[i] = Σ_t (base[side, t, :] + δ[i, side, t, g]) ⊙ x[i − t]`,
+    /// `x` before the span's first row being zero: row `i`'s own coefficients
+    /// mix it with its predecessor in the block. `coeff` is the coefficient
+    /// projection's output, `[rows, 2·taps·groups]` laid `(side, tap, group)`
+    /// — both sides come from one projection of the sublayer's input, and
+    /// `side` says which half this application reads (0 convolves the input
+    /// before the sublayer, 1 its output after). `base` is `[2·taps,
+    /// channels]`, row `side·taps + tap`. `group` channels share one δ.
+    BlockDynConv {
+        x: ValueId,
+        coeff: ValueId,
+        base: ValueId,
+        side: u32,
+        taps: u32,
+        group: u32,
+        y: ValueId,
+    },
     /// Folds `ba` with dt bias and A-log into per-head decay gates.
     SsmGdnPrep {
         ba: ValueId,
@@ -564,6 +583,7 @@ impl Operands for Attention {
             Self::SsmCausalConv1dChunked { x, weight, state, .. } => {
                 sink.extend([*x, *weight, *state]);
             }
+            Self::BlockDynConv { x, coeff, base, .. } => sink.extend([*x, *coeff, *base]),
             Self::SsmGdnPrep { ba, dt_bias, a_log, .. } => sink.extend([*ba, *dt_bias, *a_log]),
             Self::SsmGatedDelta { qkv, z, gates, state, .. } => {
                 sink.extend([*qkv, *z, *gates, *state]);
@@ -660,6 +680,7 @@ impl Operands for Attention {
             Self::MlaPrefillSelected { o, .. } => sink.push(*o),
             Self::SsmCausalConv1d { y, .. } => sink.push(*y),
             Self::SsmCausalConv1dChunked { y, .. } => sink.push(*y),
+            Self::BlockDynConv { y, .. } => sink.push(*y),
             Self::SsmGdnPrep { gates, .. } => sink.push(*gates),
             Self::SsmGatedDelta { y, .. } => sink.push(*y),
             Self::SsmGatedDeltaChunked { y, .. } => sink.push(*y),
@@ -722,6 +743,7 @@ impl Operands for Attention {
             Self::MlaPrefillSelected { .. } => {}
             Self::SsmCausalConv1d { .. } => {}
             Self::SsmCausalConv1dChunked { .. } => {}
+            Self::BlockDynConv { .. } => {}
             Self::SsmGdnPrep { .. } => {}
             Self::SsmGatedDelta { .. } => {}
             Self::SsmGatedDeltaChunked { .. } => {}
@@ -770,6 +792,7 @@ impl Operands for Attention {
             Self::MlaPrefillSelected { .. } => "attention.mla_prefill_selected",
             Self::SsmCausalConv1d { .. } => "attention.ssm_causal_conv1d",
             Self::SsmCausalConv1dChunked { .. } => "attention.ssm_causal_conv1d_chunked",
+            Self::BlockDynConv { .. } => "attention.block_dyn_conv",
             Self::SsmGdnPrep { .. } => "attention.ssm_gdn_prep",
             Self::SsmGatedDelta { .. } => "attention.ssm_gated_delta",
             Self::SsmGatedDeltaChunked { .. } => "attention.ssm_gated_delta_chunked",

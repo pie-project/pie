@@ -17,6 +17,9 @@ pub mod score;
 
 pub mod ssm;
 
+/// DFlash2's two-tap grouped dynamic convolution along a request's block rows.
+pub mod dynconv;
+
 use crate::error::Error;
 use dtype::Dtype;
 

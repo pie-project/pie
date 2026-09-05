@@ -33,6 +33,7 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("attn/sdpa_sliding.metal", include_str!(concat!(source_root!(), "/attn/sdpa_sliding.metal"))),
     ("attn/sdpa_vector.metal", include_str!(concat!(source_root!(), "/attn/sdpa_vector.metal"))),
     ("attn/split_qkv.metal", include_str!(concat!(source_root!(), "/attn/split_qkv.metal"))),
+    ("attn/block_dyn_conv.metal", include_str!(concat!(source_root!(), "/attn/block_dyn_conv.metal"))),
     ("attn/ssm_causal_conv1d.metal", include_str!(concat!(source_root!(), "/attn/ssm_causal_conv1d.metal"))),
     ("attn/ssm_gated_delta.metal", include_str!(concat!(source_root!(), "/attn/ssm_gated_delta.metal"))),
     ("attn/ssm_gdn_core.metal", include_str!(concat!(source_root!(), "/attn/ssm_gdn_core.metal"))),

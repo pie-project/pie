@@ -366,6 +366,35 @@ pub fn ssm_causal_conv1d_chunked_dilated(
     y
 }
 
+/// DFlash2's two-tap grouped dynamic convolution along each request's rows
+/// (`Attention::BlockDynConv`): `side` 0 convolves a sublayer's input, 1 its
+/// output, both with the coefficients `coeff` projected from that input;
+/// `base` is the learned `[2·taps, channels]` kernel the projection corrects.
+pub fn block_dyn_conv(
+    x: &Value,
+    coeff: &Value,
+    base: &Weight,
+    side: u32,
+    taps: u32,
+    group: u32,
+) -> Value {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Attention::BlockDynConv {
+            x: x.id(),
+            coeff: coeff.id(),
+            base: r.weight(base),
+            side,
+            taps,
+            group,
+            y: y.id(),
+        },
+        &[x, coeff],
+    );
+    y
+}
+
 /// PLE n-gram hasher: `state` is the lane's trailing-token-id window; `mults`,
 /// `primes`, `offsets` are seed-derived hash constants. Answer is `[rows, primes.len()]` `i32`.
 pub fn ple_ngram_ids(

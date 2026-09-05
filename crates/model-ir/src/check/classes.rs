@@ -595,6 +595,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::MlaDecodeSelected { .. }
             | Attention::MlaPrefillSelected { .. }
             | Attention::SsmGdnPrep { .. }
+            | Attention::BlockDynConv { .. }
             | Attention::IndexLayernormRope { .. }
             | Attention::IndexRope { .. }
             | Attention::IndexTopk { .. }

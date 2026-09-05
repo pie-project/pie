@@ -388,6 +388,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::SsmCausalConv1d { .. } | Attention::SsmCausalConv1dChunked { .. } => {
                 &[(In(2), CACHE)]
             }
+            Attention::BlockDynConv { .. } => &[],
             Attention::SsmGdnPrep { .. } => &[(Out(0), F32)],
             Attention::SsmGatedDelta { .. } | Attention::SsmGatedDeltaChunked { .. } => {
                 &[(In(3), CACHE)]

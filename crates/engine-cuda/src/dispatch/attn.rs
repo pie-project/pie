@@ -1081,6 +1081,11 @@ impl Run<'_> {
             Attention::PoolLseSelected { .. } => Err(kernels_cuda::Error::Unsupported {
                 op: "attention.pool_lse_selected",
             }),
+            // DFlash2's dynamic block convolution has a Metal kernel and no
+            // CUDA one yet; refused by name rather than approximated.
+            Attention::BlockDynConv { .. } => Err(kernels_cuda::Error::Unsupported {
+                op: "attention.block_dyn_conv",
+            }),
         }
     }
 }
