@@ -128,7 +128,11 @@ fn bind_intrinsic(
         Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts)
     );
     let own = drafts_column && inputs.mtp_logits.is_some();
-    let Some(logits) = (if own { inputs.mtp_logits } else { inputs.logits }) else {
+    let Some(logits) = (if own {
+        inputs.mtp_logits
+    } else {
+        inputs.logits
+    }) else {
         return Err(Error {
             message: "logits intrinsic unbound (forward did not run before step)".to_owned(),
         });
@@ -179,6 +183,75 @@ fn bind_intrinsic(
     }
 }
 
+/// **WHAT RUNS ONE STAGE'S ARITHMETIC, AND NOTHING ELSE.**
+///
+/// The host's implementation is the interpreter; a backend's is its device
+/// form. Everything AROUND a stage stays in [`step`]: the readiness check, the
+/// order the stages run in, the port takes between prologue and epilogue, and
+/// the commit that advances the rings. A backend that restated any of that
+/// would be a second spelling of a sequence, free to drift from this one
+/// silently — so it supplies arithmetic and never sequencing.
+///
+/// The roots are resolved before this is called and are already in `vals`,
+/// because resolving them means reading a ring or binding an intrinsic, and
+/// neither is a thing a device does.
+pub trait StageRunner {
+    /// Run stage `sp`, whose roots are `roots` (global ids, already in
+    /// `vals`). Every value in `wanted` must be in `vals` when this returns;
+    /// so must anything a later op of this same stage reads.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the stage's arithmetic refused, in words.
+    fn run(
+        &mut self,
+        plan: &ExecPlan,
+        sp: &StagePlan,
+        roots: &[u32],
+        wanted: &[u32],
+        vals: &mut [Value],
+    ) -> Result<()>;
+
+    /// **WHETHER THIS RUNNER BINDS `id` ITSELF, FROM WHERE IT ALREADY LIVES.**
+    ///
+    /// The default is no, and the host binds it: `bind_intrinsic` slices the
+    /// fire's readout into a `Value` and the runner reads that. A device
+    /// runner answers yes for the logits, because the readout is already in
+    /// device memory and a device-to-device copy into the guest heap is the
+    /// whole reason to run there — binding it here would first drag a
+    /// vocabulary-wide row back to the host, which is the cost the exercise
+    /// exists to remove.
+    ///
+    /// Saying yes makes the runner responsible for the value: it is left
+    /// empty in `vals`, so anything that reads it on the host reads nothing.
+    fn binds(&self, _id: Option<IntrinsicId>) -> bool {
+        false
+    }
+}
+
+/// The oracle: `eval_op` over the stage's ops, in the plan's own order.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Interpreted;
+
+impl StageRunner for Interpreted {
+    fn run(
+        &mut self,
+        plan: &ExecPlan,
+        sp: &StagePlan,
+        _roots: &[u32],
+        _wanted: &[u32],
+        vals: &mut [Value],
+    ) -> Result<()> {
+        let stage = &plan.package.stages[sp.stage_index];
+        for &id in &sp.value_ids {
+            if let Some(&op_idx) = sp.op_by_result.get(&id) {
+                eval_op(&stage.ops[op_idx], &plan.package, vals)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn exec_stage(
     inst: &InterpInstance,
     plan: &ExecPlan,
@@ -186,11 +259,15 @@ fn exec_stage(
     inputs: &PassInputs,
     overlay: &mut Overlay,
     vals: &mut [Value],
+    runner: &mut dyn StageRunner,
 ) -> Result<()> {
     let stage = &plan.package.stages[sp.stage_index];
+    // ── The roots first: every value that crosses the host line, in the
+    //    stage's own order, because a take CONSUMES and two takes of one
+    //    channel are not the same as one.
+    let mut roots = Vec::new();
     for &id in &sp.value_ids {
-        if let Some(&op_idx) = sp.op_by_result.get(&id) {
-            eval_op(&stage.ops[op_idx], &plan.package, vals)?;
+        if sp.op_by_result.contains_key(&id) {
             continue;
         }
         let root = &plan.package.values[id as usize];
@@ -198,6 +275,10 @@ fn exec_stage(
             ValueOrigin::Const => const_root_value(root),
             ValueOrigin::ChannelTake => overlay.take(inst, root.channel),
             ValueOrigin::ChannelRead => overlay.resolve(inst, root.channel),
+            // A root the runner binds itself is left empty here: it never
+            // reaches the host, and filling it would be the copy this exists
+            // to avoid.
+            ValueOrigin::Intrinsic if runner.binds(root.intrinsic) => Value::F32(Vec::new()),
             ValueOrigin::Intrinsic => {
                 bind_intrinsic(root.intrinsic, shape_numel(&root.shape), inputs)?
             }
@@ -209,7 +290,11 @@ fn exec_stage(
             }
         };
         vals[id as usize] = cell;
+        roots.push(id);
     }
+    // ── Then the arithmetic, wherever it runs.
+    let wanted: Vec<u32> = stage.puts.iter().map(|put| put.value).collect();
+    runner.run(plan, sp, &roots, &wanted, vals)?;
     for put in &stage.puts {
         overlay
             .pending
@@ -229,18 +314,31 @@ fn const_root_value(root: &eta_compiler::codegen::launch::LaunchValue) -> Value 
     }
 }
 
+/// One pass, interpreted on the host — the oracle every backend is diffed
+/// against.
 #[must_use]
 pub fn step(inst: &mut InterpInstance, plan: &ExecPlan, inputs: &PassInputs) -> StepOutcome {
+    step_with(inst, plan, inputs, &mut Interpreted)
+}
+
+/// One pass, with `runner` doing each stage's arithmetic.
+///
+/// This is [`step`] with the one seam a backend needs: the sequence below —
+/// readiness, prologue, port takes, epilogue, commit — is the same sequence
+/// for every backend, and is spelled here once.
+#[must_use]
+pub fn step_with(
+    inst: &mut InterpInstance,
+    plan: &ExecPlan,
+    inputs: &PassInputs,
+    runner: &mut dyn StageRunner,
+) -> StepOutcome {
     if inst.poisoned {
         return StepOutcome::Faulted("instance is poisoned".to_string());
     }
 
     for (channel, ring) in inst.channels.iter().enumerate() {
-        let readiness = plan
-            .package
-            .channels
-            .get(channel)
-            .and_then(|c| c.readiness);
+        let readiness = plan.package.channels.get(channel).and_then(|c| c.readiness);
         let ready = match readiness {
             Some(Direction::NeedsFull) => !ring.is_empty(),
             Some(Direction::NeedsEmpty) => !ring.is_full(),
@@ -254,7 +352,15 @@ pub fn step(inst: &mut InterpInstance, plan: &ExecPlan, inputs: &PassInputs) -> 
     let mut overlay = Overlay::new(inst.channels.len());
     let mut vals = vec![Value::F32(vec![]); plan.package.values.len()];
 
-    if let Err(reason) = run_kind(inst, plan, Stage::Prologue, inputs, &mut overlay, &mut vals) {
+    if let Err(reason) = run_kind(
+        inst,
+        plan,
+        Stage::Prologue,
+        inputs,
+        &mut overlay,
+        &mut vals,
+        runner,
+    ) {
         inst.poisoned = true;
         return StepOutcome::Faulted(reason.to_string());
     }
@@ -268,7 +374,15 @@ pub fn step(inst: &mut InterpInstance, plan: &ExecPlan, inputs: &PassInputs) -> 
         }
     }
 
-    if let Err(reason) = run_kind(inst, plan, Stage::Epilogue, inputs, &mut overlay, &mut vals) {
+    if let Err(reason) = run_kind(
+        inst,
+        plan,
+        Stage::Epilogue,
+        inputs,
+        &mut overlay,
+        &mut vals,
+        runner,
+    ) {
         inst.poisoned = true;
         return StepOutcome::Faulted(reason.to_string());
     }
@@ -283,12 +397,13 @@ fn run_kind(
     inputs: &PassInputs,
     overlay: &mut Overlay,
     vals: &mut [Value],
+    runner: &mut dyn StageRunner,
 ) -> Result<()> {
     for sp in &plan.stages {
         if plan.package.stages[sp.stage_index].stage != kind {
             continue;
         }
-        exec_stage(inst, plan, sp, inputs, overlay, vals)?;
+        exec_stage(inst, plan, sp, inputs, overlay, vals, runner)?;
     }
     Ok(())
 }

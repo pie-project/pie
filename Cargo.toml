@@ -60,6 +60,10 @@ members = [
     "crates/kernels-metal",
     "crates/engine-cuda",
     "crates/engine-metal",
+    "crates/kernels-vulkan",
+    "crates/engine-vulkan",
+    "crates/kernels-wgpu",
+    "crates/engine-wgpu",
 
     # Rust outside crates/: the python SDK's backend sits beside the package
     # maturin builds.
@@ -96,6 +100,10 @@ default-members = [
     "crates/ztensor-compat",
     "crates/kernels-cuda",
     "crates/kernels-metal",
+    "crates/kernels-vulkan",
+    "crates/engine-vulkan",
+    "crates/kernels-wgpu",
+    "crates/engine-wgpu",
     "crates/eta-ir",
     "crates/eta-dsl",
     "crates/eta-compiler",
@@ -149,6 +157,12 @@ cuda = ["worker/cuda"]
 # Apple-only; the seam that reads it uses a target cfg, so a non-Apple build
 # with the feature on has no metal seam rather than a link error.
 metal = ["worker/metal"]
+# The portable Vulkan shell; no target half, so this flag alone links a device
+# wherever a loader is found at run time.
+vulkan = ["worker/vulkan"]
+# The portable wgpu shell; no target half either, so this flag alone links a
+# device through whichever backend wgpu finds at run time.
+wgpu = ["worker/wgpu"]
 # Probe passthrough to the embedded worker (→ runtime).
 profile-fire = ["worker/profile-fire"]
 

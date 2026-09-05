@@ -28,6 +28,16 @@ serde = { version = "1.0", default-features = false, features = [
     "derive",
 ] }
 
+# `naga` is the compiler both portable shells put the emitted WGSL through —
+# `engine-wgpu` to run it and `engine-vulkan` to reach SPIR-V — so the emitter's
+# own gate is that its output survives the same front end and back end. A dev
+# dependency only: nothing in the library reaches a shader compiler.
+[dev-dependencies]
+naga = { version = "30", default-features = false, features = [
+    "wgsl-in",
+    "spv-out",
+] }
+
 # The toolchain's three crates are the ones CI gates with `-D warnings`.
 [lints]
 workspace = true

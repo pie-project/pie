@@ -128,12 +128,15 @@ fn parse_structs() -> BTreeMap<String, Vec<Parsed>> {
 }
 
 /// The option struct an engine kind parses `[model.engine.options]` into, or
-/// `None` for a kind no build hosts. A key is listed only when a seam reads it.
+/// `None` for a kind with no typed table. Every kind has one today; the
+/// `Option` stays for the next kind that lands before its options do. A key is
+/// listed only when a seam reads it.
 fn options_struct(engine: EngineKind) -> Option<&'static str> {
     match engine {
         EngineKind::CudaNative => Some("CudaNativeEngineOptions"),
         EngineKind::Metal => Some("MetalEngineOptions"),
-        EngineKind::Vulkan | EngineKind::Wgpu => None,
+        EngineKind::Vulkan => Some("VulkanEngineOptions"),
+        EngineKind::Wgpu => Some("WgpuEngineOptions"),
     }
 }
 
@@ -189,7 +192,7 @@ fn walk(
         // value, so it is the one place the walk consults the engine kind.
         let nested = if field.ty == "toml::Table" {
             // No struct, no keys, and the untyped table itself is not one
-            // either: a kind no build hosts parses nothing out of
+            // either: a kind with no typed options parses nothing out of
             // `[model.engine.options]`, so nothing under it is settable.
             let Some(inner) = options_struct(engine) else {
                 continue;
@@ -253,7 +256,8 @@ fn default_values(engine: EngineKind) -> toml::Value {
     let options = match engine {
         EngineKind::CudaNative => defaults_of::<crate::config::CudaNativeEngineOptions>(&empty),
         EngineKind::Metal => defaults_of::<crate::config::MetalEngineOptions>(&empty),
-        EngineKind::Vulkan | EngineKind::Wgpu => None,
+        EngineKind::Vulkan => defaults_of::<crate::config::VulkanEngineOptions>(&empty),
+        EngineKind::Wgpu => defaults_of::<crate::config::WgpuEngineOptions>(&empty),
     };
     if let (Some(options), Some(engine_table)) = (
         options,

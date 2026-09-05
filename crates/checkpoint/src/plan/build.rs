@@ -255,7 +255,12 @@ impl Builder<'_> {
             shape: ty.shape.clone(),
             encoding: ty.encoding.clone(),
             alignment: self.alignment,
-            visibility: Visibility::Public,
+            // The contract's own, not `Public`: an encode publishes companion
+            // planes named after this declaration, and an internal encode's
+            // companions must be internal too or the artifact grows tensors
+            // no row asked for. `realize` below is still told the visibility
+            // separately, so nothing else reads this field.
+            visibility: contract.visibility,
         };
 
         let (value, decl) = match &expr {
@@ -327,6 +332,19 @@ impl Builder<'_> {
                     }
                 };
                 let value = self.transform_with(payload, &decl, TileMapKind::Bias, extra, spec)?;
+                (value, decl)
+            }
+            // A unary is a bias with a function instead of an addend: same
+            // one operand, same shape and dtype out, so it lowers the same
+            // way with the function in the spec instead of a constant.
+            Expr::Unary { src, op } => {
+                let (payload, _) = self.operand_bytes(src, &decl)?;
+                let spec = TransformSpec {
+                    unary: Some(*op),
+                    ..TransformSpec::default()
+                };
+                let value =
+                    self.transform_with(payload, &decl, TileMapKind::Unary, Vec::new(), spec)?;
                 (value, decl)
             }
             // A cast needs a kernel; the staging declaration wears the
@@ -810,7 +828,21 @@ impl Builder<'_> {
             transform,
         );
         for (decl, buffer) in metadata.iter().zip(outputs.iter().skip(1)) {
-            self.finalize(*buffer, &decl.name)?;
+            // Nameable, so a later contract can state a transform over one of
+            // them -- a placed declaration repacks the codes an encode wrote
+            // and has to reach their scales and biases to relay them too.
+            self.resolver.publish(
+                &decl.name,
+                TensorType {
+                    shape: decl.shape.clone(),
+                    encoding: decl.encoding.clone(),
+                },
+            );
+            self.values
+                .insert(decl.name.clone(), Value::Buffer(*buffer));
+            if decl.visibility == Visibility::Public {
+                self.finalize(*buffer, &decl.name)?;
+            }
         }
         Ok(Value::Buffer(out))
     }
@@ -1022,7 +1054,8 @@ impl Builder<'_> {
             shape: layout.shape.clone(),
             encoding: layout.encoding.clone(),
             alignment: self.alignment,
-            visibility: Visibility::Public,
+            // The weight's own: a companion of an internal bank is internal.
+            visibility: weight.visibility,
         })
     }
 

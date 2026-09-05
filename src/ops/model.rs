@@ -193,6 +193,14 @@ struct DeadWeight {
 #[derive(serde::Serialize)]
 struct Artifact {
     name: String,
+    /// What to type at this artifact: `name` when the model directory holds
+    /// only it, and the whole `<slug>.<sku>.<backend>` when it has siblings.
+    /// A listing whose rows cannot be typed back at `pie model info` is a
+    /// listing of names that resolve to nothing.
+    address: String,
+    /// The catalog row and the shell, from the artifact's serving stamp.
+    sku: Option<String>,
+    backend: Option<String>,
     root: std::path::PathBuf,
     shards: usize,
     bytes: u64,
@@ -241,11 +249,31 @@ impl crate::ui::Report for ModelList {
         // the last column is ever cut, so only the least load-bearing fact --
         // where it came from, which `pie model info` prints in full -- is at
         // risk.
-        let mut table = Table::new([Align::Left, Align::Right, Align::Right, Align::Left], 1);
+        let mut table = Table::new(
+            [
+                Align::Left,
+                Align::Right,
+                Align::Right,
+                Align::Left,
+                Align::Left,
+            ],
+            1,
+        );
         for artifact in &self.artifacts {
             let shards = match artifact.shards {
                 0 => String::new(),
                 n => format!(" +{n}"),
+            };
+            // **WHAT IT IS FOR**, which is the column that tells two rows of
+            // one model apart: a store holding the same model landed for
+            // cuda and for vulkan shows both, and the difference between
+            // them is here rather than only in the filename.
+            let landing = match (&artifact.sku, &artifact.backend) {
+                (Some(sku), Some(backend)) => format!("{sku} · {backend}"),
+                (Some(sku), None) => sku.clone(),
+                // A `.zt` carrying no serving stamp is a checkpoint, which
+                // is a thing to know rather than a blank.
+                _ => "unstamped".to_string(),
             };
             let from = artifact
                 .source
@@ -262,9 +290,10 @@ impl crate::ui::Report for ModelList {
                 // vocabulary, three spellings of what `Mark` already names.
                 Mark::Plain,
                 [
-                    artifact.name.clone(),
+                    artifact.address.clone(),
                     crate::ui::bytes(artifact.bytes),
                     format!("{} tensors{shards}", artifact.tensors),
+                    landing,
                     format!("{from}{by}"),
                 ],
             ));
@@ -282,6 +311,7 @@ impl crate::ui::Report for ModelList {
                     [
                         format!("  runtime/{}", runtime.key),
                         crate::ui::bytes(runtime.bytes),
+                        String::new(),
                         String::new(),
                         format!("built{quant}"),
                     ],
@@ -318,6 +348,22 @@ impl crate::ui::Report for ModelList {
             ));
         }
         table.print(palette);
+        // **THE ROW IN THAT LAST COLUMN IS A CHOICE, NOT A PROPERTY.** It is
+        // the first row whose contract fits, and a snapshot commonly fits
+        // several — a family's text row is asked before its vision row, and
+        // both read the same files. So the cell is what an import picks by
+        // itself, and this line is where an operator finds out that another
+        // row can be asked for and how to see the names.
+        if self.snapshots.iter().any(|snapshot| snapshot.servable) {
+            println!(
+                "  {}",
+                palette.dim(
+                    "The row shown is the one an import picks by itself; `pie model import \
+                     <repo> --sku <NAME>` imports as another (`--sku '?'` lists every row this \
+                     build ships)."
+                )
+            );
+        }
 
         // **AND WHAT NOTHING WILL READ AGAIN.** Last, because it is not a
         // thing to act on so much as a thing to know: the command names the
@@ -392,6 +438,7 @@ fn list() -> Result<Answer> {
         artifacts: artifacts
             .into_iter()
             .map(|e| Artifact {
+                address: e.address().to_string(),
                 shards: e.shards(),
                 runtimes: e
                     .runtimes
@@ -403,6 +450,8 @@ fn list() -> Result<Answer> {
                     })
                     .collect(),
                 name: e.name,
+                sku: e.sku,
+                backend: e.backend,
                 root: e.root,
                 bytes: e.bytes,
                 tensors: e.tensors,
@@ -413,7 +462,7 @@ fn list() -> Result<Answer> {
         snapshots_dir: hub,
         snapshot_bytes: snapshots.iter().map(|s| s.bytes).sum(),
         snapshots,
-            dead: dead_weight(),
+        dead: dead_weight(),
     }))
 }
 
@@ -424,11 +473,44 @@ fn list() -> Result<Answer> {
 /// architecture, which stopped being the right question when the artifact
 /// became the thing pie serves: a repo is one way an artifact got here, and
 /// `source` below is where that is recorded.
+/// The one artifact `name` names, or a refusal that says why it names none.
+///
+/// **AN AMBIGUOUS NAME IS ANSWERED WITH THE CANDIDATES, NOT WITH A PICK.**
+/// A model directory holds one artifact per shell and per row, so a bare
+/// model name can name three files; showing an operator the three names and
+/// letting them say which is the only answer that cannot be the wrong one —
+/// `pie model remove` runs through here too.
+fn one(name: &str) -> Result<crate::local::store::Entry> {
+    match crate::local::store::find(name)? {
+        crate::local::store::Resolved::One(entry) => Ok(*entry),
+        crate::local::store::Resolved::Missing => bail!(
+            "no artifact {name:?} in {}; `pie model list` shows what is there",
+            crate::local::store::dir().display()
+        ),
+        crate::local::store::Resolved::Ambiguous(candidates) => bail!(
+            "{name:?} names {} artifacts of one model, not one: {}. Name the \
+             one you mean — that is what the rest of the filename is for, and \
+             `pie model list` prints each in full.",
+            candidates.len(),
+            candidates
+                .iter()
+                .map(|candidate| format!("`{candidate}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    }
+}
+
 fn info(name: String) -> Result<Answer> {
-    let Some(entry) = crate::local::store::find(&name)? else {
-        bail!("no artifact {name:?} in the store; `pie model list` shows what is there");
-    };
+    let entry = one(&name)?;
     Ok(Answer::report(ModelInfo {
+        // The row this artifact was imported as, from its own serving stamp
+        // — the same string `pie model import --sku <NAME>` takes, and the
+        // one in the middle of the filename. `None` for a `.zt` that carries
+        // no stamp, which is a checkpoint rather than an artifact.
+        sku: entry.sku.clone(),
+        backend: entry.backend.clone(),
+        address: entry.address().to_string(),
         shards: entry.shards(),
         runtimes: entry
             .runtimes
@@ -453,6 +535,13 @@ fn info(name: String) -> Result<Answer> {
 #[derive(serde::Serialize)]
 pub struct ModelInfo {
     name: String,
+    /// The name that resolves to this artifact and no other — the same one
+    /// `pie model list` prints, and what `[model] model` should say.
+    address: String,
+    /// The catalog row the artifact's serving stamp names.
+    sku: Option<String>,
+    /// The shell its bytes are landed for, from the same stamp.
+    backend: Option<String>,
     root: std::path::PathBuf,
     files: Vec<std::path::PathBuf>,
     shards: usize,
@@ -465,9 +554,21 @@ pub struct ModelInfo {
 
 impl crate::ui::Report for ModelInfo {
     fn render(&self, palette: &Palette) {
-        println!("{}", palette.bold(&self.name));
+        println!("{}", palette.bold(&self.address));
         let mut table = Table::new([Align::Left, Align::Left], 1);
         let mut row = |k: &str, v: String| table.push(Row::new(Mark::Plain, [k.to_string(), v]));
+        // The model this is an artifact of, when the address above is the
+        // longer name: the two differ exactly when the directory holds
+        // siblings, and that is the case where saying so is worth a line.
+        if self.address != self.name {
+            row("model", self.name.clone());
+        }
+        if let Some(sku) = &self.sku {
+            row("sku", sku.clone());
+        }
+        if let Some(backend) = &self.backend {
+            row("backend", backend.clone());
+        }
         row("size", crate::ui::bytes(self.bytes));
         row("tensors", self.tensors.to_string());
         row(
@@ -503,9 +604,26 @@ impl crate::ui::Report for ModelInfo {
             );
         }
         table.print(palette);
+        // The `sku` row above is a name the import takes back: a snapshot
+        // that fits several rows was converted for one of them, and this is
+        // the string that asks for a different one.
+        if let Some(sku) = &self.sku {
+            println!(
+                "  {}",
+                palette.dim(format!(
+                    "imported as `{sku}`; `pie model import <source> --sku <NAME>` imports \
+                     the same source as another row (`--sku '?'` lists every row this build \
+                     ships)."
+                ))
+            );
+        }
         println!(
             "\n{}",
-            palette.dim(format!("[model]\nmodel = \"{}\"", self.name))
+            // The ADDRESS, not the model name: this block is meant to be
+            // pasted into a config, and a name that names three artifacts
+            // would make that config refuse to boot on the box holding all
+            // three.
+            palette.dim(format!("[model]\nmodel = \"{}\"", self.address))
         );
     }
 }
@@ -706,12 +824,10 @@ impl ProgressBar {
 /// what it got back. A command that removes a model has no business deciding
 /// what else its origin is worth keeping.
 fn remove(name: String, skip_confirm: bool) -> Result<Answer> {
-    let Some(entry) = crate::local::store::find(&name)? else {
-        bail!(
-            "no artifact named {name:?} in {}",
-            crate::local::store::dir().display()
-        );
-    };
+    // Through the same resolution `pie model info` uses, so that a name
+    // naming three artifacts is refused with their names rather than
+    // deleting whichever the scan reached first.
+    let entry = one(&name)?;
 
     // The archive AND the builds derived from it, because that is what the
     // removal takes. Reporting the archive alone understated a three-artifact
@@ -739,4 +855,3 @@ fn remove(name: String, skip_confirm: bool) -> Result<Answer> {
     crate::local::store::remove(&entry)?;
     Ok(Answer::did(format!("removed {what}")))
 }
-

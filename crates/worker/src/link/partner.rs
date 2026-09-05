@@ -46,7 +46,10 @@ struct PartnerLink {
 
 pub(crate) struct PartnerLinkManager {
     /// This worker's own id; the handshake's client nonce.
-    #[allow(dead_code, reason = "read by the dial handshake once remote executors are supported")]
+    #[allow(
+        dead_code,
+        reason = "read by the dial handshake once remote executors are supported"
+    )]
     worker_id: WorkerId,
     config: PartnerBootstrap,
     links: HashMap<WorkerId, PartnerLink>,

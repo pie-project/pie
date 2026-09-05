@@ -845,12 +845,14 @@ impl Builder<'_> {
             // Each of these needs a kernel; lowering them is `plan::build`'s
             // job, and reaching here means one was nested where only the
             // affine fragment fits.
-            Expr::Repack { .. } | Expr::Cast { .. } | Expr::Scale { .. } | Expr::Bias { .. } => {
-                Err(Error::Contract(format!(
-                    "{} needs a kernel and cannot be lowered to byte runs",
-                    expr.node_name()
-                )))
-            }
+            Expr::Repack { .. }
+            | Expr::Cast { .. }
+            | Expr::Scale { .. }
+            | Expr::Bias { .. }
+            | Expr::Unary { .. } => Err(Error::Contract(format!(
+                "{} needs a kernel and cannot be lowered to byte runs",
+                expr.node_name()
+            ))),
             Expr::Shard { .. } => Err(Error::Internal(
                 "Shard reached lowering; Resolver::specialize rewrites it into \
                  this rank's Slice, and byte offsets cannot be symbolic"

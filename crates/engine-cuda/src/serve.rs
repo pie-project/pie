@@ -182,6 +182,12 @@ impl Shell {
         self.pools.copy_kv(self.device.stream(), moves)
     }
 
+    /// Bytes one recurrent slot occupies across the plan's state rows — zero for a plan with none (`PoolFacts::state_slot_bytes`).
+    #[must_use]
+    pub fn state_slot_bytes(&self) -> u64 {
+        self.pools.state_slot_bytes()
+    }
+
     /// One slot's recurrent banks, read back.
     ///
     /// # Errors

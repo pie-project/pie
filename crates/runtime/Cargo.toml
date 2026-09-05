@@ -121,6 +121,17 @@ smallvec = "1"
 lru = "0.18.1"
 ipnet = "2"
 
+# The Vulkan shell. NO TARGET GATE, unlike `engine-metal` below: a Vulkan
+# loader is a choice a machine makes rather than a platform, so the axis is a
+# cargo feature all the way down and every `#[cfg(feature = "vulkan")]` in this
+# crate stands alone.
+engine-vulkan = { path = "../engine-vulkan", optional = true }
+
+# The wgpu shell, on the same axis as the Vulkan one above and for the same
+# reason: wgpu picks a backend at run time on every platform pie builds for,
+# so there is no target whose answer is known in advance.
+engine-wgpu = { path = "../engine-wgpu", optional = true }
+
 # The Apple half of the `metal` feature; cargo unifies this with the portable
 # entry above on Apple targets and applies only that one elsewhere.
 [target.'cfg(target_vendor = "apple")'.dependencies]
@@ -137,6 +148,14 @@ cuda = ["dep:engine-cuda", "engine-cuda/cuda"]
 # this flag alone is not a build that links a device: every `#[cfg]` reading it
 # pairs it with `target_vendor = "apple"`.
 metal = ["dep:engine-metal"]
+# The Vulkan shell. `engine-vulkan/vulkan` rides along for the reason the CUDA
+# line states: the shell builds with no loader selected and answers
+# `Fault::Deviceless`, so naming the dep alone links a shell that cannot bind.
+vulkan = ["dep:engine-vulkan", "engine-vulkan/vulkan"]
+# The wgpu shell. `engine-wgpu/wgpu` rides along for the reason the two lines
+# above state: the shell builds with no adapter selected and answers
+# `Fault::Deviceless`, so naming the dep alone links a shell that cannot bind.
+wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu"]
 # Host-side performance probes, one flag per domain so you pay only for what
 # you ask for; `probe_<domain>!` in `src/scheduler/probe.rs` expands to nothing
 # when its feature is off.

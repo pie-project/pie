@@ -811,4 +811,3 @@ pub fn clip(text: &str, limit: usize) -> String {
         _ => format!("{head}…"),
     }
 }
-

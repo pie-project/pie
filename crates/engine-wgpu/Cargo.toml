@@ -1,0 +1,43 @@
+[package]
+name = "engine-wgpu"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The WebGPU engine's dispatch layer: a Run that resolves plan ids to device handles and answers every Dispatch* trait by calling kernels-wgpu entries through dyn Encode."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "engine_wgpu"
+path = "src/lib.rs"
+
+[dependencies]
+toml = "1.1"
+model-ir = { path = "../model-ir" }
+kernels-wgpu = { path = "../kernels-wgpu" }
+engine = { path = "../engine" }
+model-exec = { path = "../model-exec" }
+model-compiler = { path = "../model-compiler" }
+eta-ir = { path = "../eta-ir" }
+eta-exec = { path = "../eta-exec" }
+
+eta-compiler = { path = "../eta-compiler" }
+checkpoint = { path = "../checkpoint" }
+libc = "0.2"
+tracing = "0.1"
+
+wgpu = { version = "30", default-features = false, features = [
+    "wgsl",
+    "vulkan",
+    "metal",
+    "dx12",
+], optional = true }
+pollster = { version = "0.4", optional = true }
+
+naga = { version = "30", default-features = false, features = ["wgsl-in"], optional = true }
+
+ash = { version = "0.38", default-features = false, optional = true }
+
+[features]
+default = []
+wgpu = ["dep:wgpu", "dep:pollster", "dep:naga", "dep:ash"]

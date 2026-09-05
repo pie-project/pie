@@ -36,6 +36,18 @@ impl Platform {
     /// `Metal`/`Wgpu`/`Vulkan` have no fragment-order point for it. The
     /// match is per placed variant, and the tail `debug_assert` below fires
     /// if a new placed variant is added without a row here.
+    ///
+    /// **`Vulkan` stays out even though it now has a matrix-unit tier**, and
+    /// that is a property of the API rather than a gap. CUDA can pre-arrange
+    /// a plane because `mma.sync`'s m16n8k16 fragment layout is architected:
+    /// a host repack knows which lane will hold which element.
+    /// `VK_KHR_cooperative_matrix` deliberately does not say — a load states
+    /// only `RowMajor`/`ColumnMajor` and a stride, and the implementation
+    /// chooses the lane mapping — so a plane written in fragment order would
+    /// be read as if it were row-major, which is not a slower answer but a
+    /// wrong one. `kernels-vulkan`'s coopmat tier also loads its fragments
+    /// out of a shared tile it dequantized into, not out of the stored
+    /// plane, so a repack would not reach the matrix load at all.
     #[must_use]
     pub fn reads_placement(self, dtype: Dtype) -> bool {
         match dtype {
@@ -107,10 +119,19 @@ pub enum CacheRow {
     /// shared as both, `[kv_lora_rank, rope_dim]` a latent page. `dtype` is
     /// declared by the model, not chosen by the engine. `space` is the
     /// geometry group this cache's rows belong to.
-    Kv { name: String, planes: Vec<u64>, dtype: Dtype, space: u32 },
+    Kv {
+        name: String,
+        planes: Vec<u64>,
+        dtype: Dtype,
+        space: u32,
+    },
     /// Recurrent state: per-lane slab shape. `dtype` is declared by the
     /// model since some state (e.g. qwen4's PLE token ids) can't fit bf16.
-    State { name: String, slab: Vec<u64>, dtype: Dtype },
+    State {
+        name: String,
+        slab: Vec<u64>,
+        dtype: Dtype,
+    },
 }
 
 /// A named seam a declaration states, carried through for the tools that read

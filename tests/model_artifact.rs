@@ -19,7 +19,6 @@
 
 use std::path::Path;
 
-
 /// A dense llama-shaped snapshot: `config.json` plus one real safetensors
 /// file of zeroed `dtype` weights.
 fn write_snapshot(dir: &Path, dtype: &str) {
@@ -154,6 +153,9 @@ fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
         pie::ops::model::import::ImportArgs {
             source: staging.path().to_string_lossy().into_owned(),
             aux: None,
+            // No `--sku`: this is the first-fits-wins path, and the point of
+            // the test is that nothing fits.
+            sku: None,
             out: Some(artifact.clone()),
             dry_run: false,
             force: false,
@@ -184,4 +186,3 @@ fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
         "the refusal has to come before the write, not after it"
     );
 }
-

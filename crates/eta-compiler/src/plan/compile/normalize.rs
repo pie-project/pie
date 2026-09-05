@@ -100,6 +100,16 @@ pub struct NormalizedStage {
     pub value_domains: Vec<ValueDomain>,
     /// Original ETA op positions represented by each normalized op.
     pub source_ops: Vec<Vec<u32>>,
+    /// **Original stage-local value id -> normalized value id**, `u32::MAX`
+    /// where normalization removed the value.
+    ///
+    /// The renumbering is many-to-one and lossy: CSE folds two originals onto
+    /// one normalized value, `simplify_alias` and the redundant-broadcast rule
+    /// alias one away, and a dead op's results are never assigned. So the two
+    /// numberings cannot be related by arithmetic, and a backend that indexes
+    /// the normalized value table — its descriptors, its scratch offsets —
+    /// while holding an original id needs this map to cross between them.
+    pub value_map: Vec<u32>,
     /// Local channel slot -> program-global dense channel index.
     pub channel_bindings: Vec<u32>,
     /// Local name slot -> canonical second-party name.
@@ -209,6 +219,7 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
         value_types: normalized_types,
         value_domains: normalized_domains,
         source_ops,
+        value_map,
         channel_bindings: Vec::new(),
         names: Vec::new(),
     }
@@ -376,7 +387,6 @@ pub(crate) fn local_name(global_names: &[String], names: &mut Vec<String>, globa
 mod value_domain_tests {
     use super::*;
     use crate::plan::compile::signature::stage_signature;
-    
 
     // Pins that the signature still hashes value_domains, since that hash is
     // the emitted kernel's entry-point name and the engine's cache key.
@@ -392,6 +402,7 @@ mod value_domain_tests {
             }],
             value_domains: alloc::vec![ValueDomain::GeneratedIndex],
             source_ops: alloc::vec![alloc::vec![0]],
+            value_map: alloc::vec![0],
             channel_bindings: alloc::vec![],
             names: alloc::vec![],
         };

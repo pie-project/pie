@@ -79,9 +79,8 @@ interpreter's `eval_op` so there is no second evaluator to drift.
 ## Rust-first
 
 This crate contains **no hand-written C++**. The only non-Rust files are
-codegen's inputs and outputs: device runtime templates (`.cuh` / `.metal`) under
-`runtime/` that Rust assembles, and the one generated shader preamble checked in
-under `include/` with a drift test. Backend code generation is a pure
+codegen's inputs: device runtime templates (`.cuh` / `.metal`) under `runtime/`
+that Rust assembles. Backend code generation is a pure
 `Plan -> String` function with no device-architecture input, which is what lets
 it live outside the engine and be golden-tested without a GPU. Compilation
 itself (NVRTC, `MTLLibrary`), module caching, and launch stay in the engines —
@@ -89,17 +88,15 @@ those need a live device.
 
 ## Generated artifacts
 
-`include/ptir_rng.generated.metal` is checked in and verified by
-`tests/rng_contract.rs`. Never edit it by hand; change `eta-ir`'s
-`RNG_FORMULA` and regenerate with
-`PTIR_REGEN=1 cargo test -p eta-compiler --test rng_contract`.
+The RNG contract reaches both devices from one place: `codegen::rng` prints
+`eta-ir`'s `RNG_FORMULA` as CUDA (`cuda_device_functions`, spliced into the
+emitted preamble) or as MSL (`generate_msl_preamble`). The MSL projection is the
+one `runtime/metal/ptir_m1_runtime.metal` names with `#include
+"ptir_rng.generated.metal"`; `engine-metal` expands that line at library-build
+time, since `newLibraryWithSource:` has no header search path. Nothing is
+checked in, so nothing can drift.
 
-It is a file rather than a Rust `const` because Metal's runtime shader compiler
-resolves `#include "..."` against the including file's directory and nothing
-else, so `runtime/metal/ptir_m1_runtime.metal` can only reach the preamble if a
-copy sits beside it — `kernels-metal/build.rs` stages one on a `native` build.
-
-Two C headers stood beside it, `ptir_abi.h` (op tags, dtype/stage/port enums,
+Two C headers once stood here, `ptir_abi.h` (op tags, dtype/stage/port enums,
 the arity table) and `rng_contract.generated.h` (the RNG contract in C). Both
 existed for the C++ drivers to `#include`. Those drivers were deleted, every
 backend is Rust and reads `eta-ir` directly, and NVRTC is called with zero

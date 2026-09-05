@@ -603,5 +603,4 @@ mod tests {
         assert!(!matches("pytorch_model.bin"));
         assert!(!matches("model.gguf"));
     }
-
 }

@@ -76,15 +76,23 @@ pie run --path ./target/wasm32-wasip2/debug/text_completion.wasm \
 
 ### Backends
 
-Two engines serve today, each a compile-time feature:
+Four engines serve today, each a compile-time feature:
 
 ```bash
 cargo build --release -p pie --bin pie --features cuda    # NVIDIA, Linux/Windows
 cargo build --release -p pie --bin pie --features metal   # Apple silicon, macOS
+cargo build --release -p pie --bin pie --features vulkan  # any Vulkan 1.2 device
+cargo build --release -p pie --bin pie --features wgpu    # WebGPU: Vulkan, Metal or D3D12
 ```
 
 `metal` is Apple-only at the crate level: a non-Apple build with the flag on
-links no Metal device half, and a config naming that engine is told so.
+links no Metal device half, and a config naming that engine is told so. The
+other three are runtime choices: the shell compiles without its driver and
+refuses by name when the machine publishes none.
+
+`vulkan` compiles its Slang shaders to SPIR-V at build time, so it wants
+`slangc` on `PATH` (or `PIE_SLANGC` naming it); `wgpu` carries WGSL and needs
+no shader toolchain at all.
 
 A binary built with no engine feature has nothing true to put in `[engine]`,
 so `pie config init` says so instead of writing a config that will not parse.
@@ -99,7 +107,8 @@ so `pie config init` says so instead of writing a config that will not parse.
 | `crates/model*/` | What a model is: the catalog, the authoring eDSL and its traced IR, the forward compiler, the checkpoint loader |
 | `crates/controller/` | Cluster-coordination control plane (pairing · roles · health) |
 | `crates/transport/` | Worker↔worker P2P KV-tensor data plane |
-| `crates/engine*/` | Backend engines: the CUDA and Metal engines + the shared execution-shell substrate |
+| `crates/engine*/` | Backend engines: the CUDA, Metal, Vulkan and wgpu engines + the shared execution-shell substrate |
+| `crates/kernels-*/` | The kernel libraries each engine dispatches through: CUDA C, Metal Shading Language, Slang→SPIR-V, WGSL |
 | `crates/*-api` | Boundary contracts (`client` · `controller` · `worker` · `engine`) — the dependency floor |
 | `tests/inferlets/` | Curated inferlet E2E fixtures |
 | `sdk/inferlet/` | SDKs for programs that run ON pie (Python · JavaScript · tools) |

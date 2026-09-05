@@ -20,7 +20,7 @@ use checkpoint::file::meta::{SOURCE_ENCODING_KEY, SOURCE_KEY, VERSION_KEY, meta_
 use checkpoint::file::read::{parse_attributes, parse_metadata};
 use checkpoint::file::write::Writer;
 use checkpoint::file::{Attributes, Metadata, RawTensor};
-use checkpoint::plan::{CONVERT_TILE_MAP_MASK, LoadPlan, StorageTarget};
+use checkpoint::plan::{CONVERT_TILE_MAP_MASK, LoadPlan, StorageInstr, StorageTarget};
 use checkpoint::types::{CheckpointFormat, Encoding, FileId, TensorDecl, TensorId, Visibility};
 use checkpoint::verify::ContractView;
 use runtime::engine::load::Platform;
@@ -46,6 +46,17 @@ pub struct ImportArgs {
     /// under the `aux.` prefix.
     #[arg(long, value_name = "SOURCE")]
     pub aux: Option<String>,
+    /// Import as this catalog row, rather than as the first row whose
+    /// contract fits the source. Several rows can only be reached this way —
+    /// a family's text row reads every snapshot its vision row does and is
+    /// asked first, and a checkpoint carrying a draft head identifies as the
+    /// drafting row whether or not one is wanted. The row names are the ones
+    /// `pie model list` prints beside each snapshot and `pie model info`
+    /// beside each artifact; a name this build does not ship is refused with
+    /// the whole catalog, so `--sku '?'` lists them. The named row must read
+    /// this checkpoint: nothing here falls back to another.
+    #[arg(long, value_name = "NAME")]
+    pub sku: Option<String>,
     /// Write the artifact here instead of the model store. A path ending in
     /// `.zt` is the artifact; a directory receives `<name>.zt`.
     #[arg(long)]
@@ -95,13 +106,21 @@ fn consuming_marker(source: &Path) -> PathBuf {
     if source.is_dir() {
         source.join(CONSUMING_MARKER)
     } else {
-        source
-            .parent()
-            .map_or_else(|| PathBuf::from(CONSUMING_MARKER), |dir| dir.join(CONSUMING_MARKER))
+        source.parent().map_or_else(
+            || PathBuf::from(CONSUMING_MARKER),
+            |dir| dir.join(CONSUMING_MARKER),
+        )
     }
 }
 
 pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
+    // The name is checked against the catalog FIRST, before the source is
+    // resolved: a misspelled row must not cost a fourteen-gigabyte download
+    // to find out about, and `--sku '?'` is how an operator asks what the rows
+    // are called.
+    if let Some(name) = args.sku.as_deref() {
+        runtime::engine::load::row_named(name).map_err(|why| anyhow!("--sku {name}: {why:#}"))?;
+    }
     let mut source = resolve_source(&args.source)?;
     if consuming_marker(&source.path).is_file() {
         bail!(
@@ -183,8 +202,12 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
     // arrangement of bytes only that box's kernels read.
     let platform = engine_or_refuse()?;
     if out_file.exists() && !args.force {
-        if let Some(reason) = staleness(&out_file, platform, &source.origin) {
-            println!("{}: rebuilding {} ({reason})", source.name, out_file.display());
+        if let Some(reason) = staleness(&out_file, platform, &source.origin, args.sku.as_deref()) {
+            println!(
+                "{}: rebuilding {} ({reason})",
+                source.name,
+                out_file.display()
+            );
         } else {
             let up_to_date = format!(
                 "{} is up to date at {}",
@@ -213,11 +236,13 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
         merge_metadata(&mut metadata, overlay.metadata.clone());
     }
     let metadata = metadata;
-    let Some((sku, contract)) =
-        runtime::engine::load::conversion_contract(&opened, &metadata, platform)
-    else {
-        return Err(refuse_a_source_no_sku_in_this_build_claims(&source.path));
-    };
+    let (sku, contract) = choose_row(
+        args.sku.as_deref(),
+        &opened,
+        &metadata,
+        platform,
+        &source.path,
+    )?;
     drop(opened);
     refuse_a_decode_of_packed_codes(sku, &contract, &metadata)?;
     let attributes = gguf_attributes(&source, &metadata);
@@ -239,9 +264,20 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
     println!(
         "convert: {sku} lands {} plane(s): {} copied through, {} transformed here; \
          {unread} source tensor(s) no plane reads are left out",
-        split.copies.len() + split.decode.tensors.iter().filter(|t| t.visibility.is_public()).count(),
+        split.copies.len()
+            + split
+                .decode
+                .tensors
+                .iter()
+                .filter(|t| t.visibility.is_public())
+                .count(),
         split.copies.len(),
-        split.decode.tensors.iter().filter(|t| t.visibility.is_public()).count(),
+        split
+            .decode
+            .tensors
+            .iter()
+            .filter(|t| t.visibility.is_public())
+            .count(),
     );
 
     // Metadata compiles before any bytes are written: an artifact whose
@@ -324,7 +360,13 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
     // has its scales and biases attached in the landing alone, and the writer
     // groups every object's planes with its codes, copied or decoded.
     let groups = groups_of(&landing, &trace)?;
-    let entries = merge_order(plan.as_ref(), &split.copies, &meta, ranked.as_deref(), &groups);
+    let entries = merge_order(
+        plan.as_ref(),
+        &split.copies,
+        &meta,
+        ranked.as_deref(),
+        &groups,
+    );
     // The decode streams straight into the merge when it produces planes in
     // the order the merge asks for them; otherwise it runs first into a spool.
     let ordered = plan.as_ref().is_none_or(|plan| {
@@ -333,13 +375,7 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
             .filter(|(_, from)| matches!(from, From::Decoded(_)))
             .map(|(name, _)| *name)
             .collect();
-        let produced: Vec<&str> = plan
-            .tensors
-            .iter()
-            .filter(|decl| decl.visibility.is_public())
-            .map(|decl| decl.name.as_str())
-            .collect();
-        asked == produced
+        asked == publish_order(plan)
     });
 
     // One ledger for every read site, so neither the decode nor the copies
@@ -351,7 +387,11 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
             None => SourceLedger::default(),
         };
         for copy in &split.copies {
-            ledger.also_read(Path::new(copy.path), copy.raw.file_offset, copy.raw.span_bytes);
+            ledger.also_read(
+                Path::new(copy.path),
+                copy.raw.file_offset,
+                copy.raw.span_bytes,
+            );
         }
         ledger.sort();
         ledger
@@ -382,9 +422,17 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
                 consume,
             )
         );
+        // The name the artifact would be given, not the staging name it is
+        // written under: the row is in that filename, and the row is what a
+        // dry run behind `--sku` is being asked to confirm.
         return Ok(crate::ui::Answer::noop(format!(
-            "dry run: would write {}",
-            crate::ui::short_path(&out_file)
+            "dry run: would write {} as `{sku}`",
+            crate::ui::short_path(&specialized_path(
+                &out_file,
+                &source.name,
+                &stamp,
+                args.out.as_deref()
+            ))
         )));
     }
 
@@ -421,7 +469,11 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
     for group in &groups {
         writer
-            .group(group.object.clone(), group.planes.iter().cloned(), group.tiled)
+            .group(
+                group.object.clone(),
+                group.planes.iter().cloned(),
+                group.tiled,
+            )
             .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
     }
     if consume {
@@ -458,8 +510,7 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
         spool.remove();
     }
     drop(overlay);
-    let out_file =
-        name_the_specialization(out_file, &source.name, &stamp, args.out.as_deref())?;
+    let out_file = name_the_specialization(out_file, &source.name, &stamp, args.out.as_deref())?;
     if let Err(why) = runtime::engine::load::verify_artifact(&out_file, platform) {
         let removed = std::fs::remove_file(&out_file).is_ok();
         bail!(
@@ -547,11 +598,13 @@ fn overlay_onto_artifact(
         .with_context(|| "merge the overlay into the artifact's name space")?;
     merge_metadata(&mut metadata, overlay.metadata.clone());
     let metadata = metadata;
-    let Some((sku, contract)) =
-        runtime::engine::load::conversion_contract(&opened, &metadata, platform)
-    else {
-        return Err(refuse_a_source_no_sku_in_this_build_claims(&base_file));
-    };
+    let (sku, contract) = choose_row(
+        args.sku.as_deref(),
+        &opened,
+        &metadata,
+        platform,
+        &base_file,
+    )?;
     drop(opened);
     if sku == before.sku {
         bail!(
@@ -587,7 +640,12 @@ fn overlay_onto_artifact(
             .collect(),
         groups: Vec::new(),
     };
-    let head_planes = copies.len() + decode.tensors.iter().filter(|t| t.visibility.is_public()).count();
+    let head_planes = copies.len()
+        + decode
+            .tensors
+            .iter()
+            .filter(|t| t.visibility.is_public())
+            .count();
     let trunk_planes = contract
         .tensors
         .iter()
@@ -598,7 +656,11 @@ fn overlay_onto_artifact(
          transformed here); {trunk_planes} trunk plane(s) stay where they are",
         crate::ui::short_path(&base_file),
         copies.len(),
-        decode.tensors.iter().filter(|t| t.visibility.is_public()).count(),
+        decode
+            .tensors
+            .iter()
+            .filter(|t| t.visibility.is_public())
+            .count(),
     );
     if head_planes == 0 {
         bail!("the overlay contributes no plane the row `{sku}` reads");
@@ -635,13 +697,7 @@ fn overlay_onto_artifact(
             .filter(|(_, from)| matches!(from, From::Decoded(_)))
             .map(|(name, _)| *name)
             .collect();
-        let produced: Vec<&str> = plan
-            .tensors
-            .iter()
-            .filter(|decl| decl.visibility.is_public())
-            .map(|decl| decl.name.as_str())
-            .collect();
-        asked == produced
+        asked == publish_order(plan)
     });
     if args.dry_run {
         return Ok(crate::ui::Answer::noop(format!(
@@ -705,7 +761,11 @@ fn overlay_onto_artifact(
             .map_err(|err| anyhow!("cannot append to the artifact: {err}"))?;
         for group in &groups {
             writer
-                .group(group.object.clone(), group.planes.iter().cloned(), group.tiled)
+                .group(
+                    group.object.clone(),
+                    group.planes.iter().cloned(),
+                    group.tiled,
+                )
                 .map_err(|err| anyhow!("cannot append to the artifact: {err}"))?;
         }
         let written = write_artifact(
@@ -880,7 +940,8 @@ fn split_contract<'a>(
     for tensor in &contract.tensors {
         let leg = match &tensor.expr {
             Expr::Src(leg)
-                if tensor.visibility.is_public() && !produced_for.contains(tensor.name.as_str()) =>
+                if tensor.visibility.is_public()
+                    && !produced_for.contains(tensor.name.as_str()) =>
             {
                 leg.as_str()
             }
@@ -928,7 +989,7 @@ fn refuse_a_decode_of_packed_codes(
         if !tensor.visibility.is_public() {
             continue;
         }
-        if decodes_a_packed_plane(&tensor.expr, metadata) {
+        if decodes_a_packed_plane(&tensor.expr, metadata, contract) {
             bail!(
                 "{sku}: `{}` decodes a plane the checkpoint stores packed, and the artifact \
                  keeps a packed plane as stored",
@@ -1557,6 +1618,28 @@ fn backend_word(platform: Platform) -> String {
     format!("{platform:?}").to_lowercase()
 }
 
+/// What [`name_the_specialization`] would name this artifact — the same
+/// judgement without the rename, so `--dry-run` can print the filename the
+/// import would produce (the row is IN that filename) rather than the
+/// staging name it writes under.
+fn specialized_path(
+    written: &Path,
+    slug: &str,
+    stamp: &checkpoint::serving::Stamp,
+    out: Option<&Path>,
+) -> PathBuf {
+    if out.is_some_and(|out| {
+        out.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zt"))
+    }) {
+        return written.to_path_buf();
+    }
+    match written.parent() {
+        Some(directory) => directory.join(checkpoint::serving::Name::of(stamp, slug).render()),
+        None => written.to_path_buf(),
+    }
+}
+
 /// `<slug>.<sku>.<backend>.zt`, so one model at two recipes or for two
 /// shells can share a directory. An `--out` that names a file keeps the
 /// operator's name.
@@ -1566,26 +1649,45 @@ fn name_the_specialization(
     stamp: &checkpoint::serving::Stamp,
     out: Option<&Path>,
 ) -> Result<PathBuf> {
-    if out.is_some_and(|out| {
-        out.extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("zt"))
-    }) {
-        return Ok(written);
-    }
-    let Some(directory) = written.parent() else {
-        return Ok(written);
-    };
-    let renamed = directory.join(checkpoint::serving::Name::of(stamp, slug).render());
+    let renamed = specialized_path(&written, slug, stamp, out);
     if renamed == written {
         return Ok(written);
     }
-    std::fs::rename(&written, &renamed).map_err(|why| {
-        anyhow!(
-            "cannot name the artifact {}: {why}",
-            renamed.display()
-        )
-    })?;
+    std::fs::rename(&written, &renamed)
+        .map_err(|why| anyhow!("cannot name the artifact {}: {why}", renamed.display()))?;
     Ok(renamed)
+}
+
+/// **WHICH ROW THIS IMPORT CONVERTS FOR**: the one `--sku` named, or the
+/// first whose contract fits.
+///
+/// Without the flag this is what it has always been — the identification
+/// order, first fits wins. With it the name decides, and a name that does not
+/// fit is a refusal rather than a fallback: the row is stamped into the
+/// artifact and printed in its filename, so an import that silently converted
+/// for a neighbouring row would hand back a file the operator did not ask
+/// for and would have no reason to re-read.
+fn choose_row(
+    named: Option<&str>,
+    opened: &ztensor::Source,
+    metadata: &Metadata,
+    platform: Platform,
+    checkpoint: &Path,
+) -> Result<(&'static str, ModelContract)> {
+    let Some(name) = named else {
+        return runtime::engine::load::conversion_contract(opened, metadata, platform)
+            .ok_or_else(|| refuse_a_source_no_sku_in_this_build_claims(checkpoint));
+    };
+    runtime::engine::load::conversion_contract_named(opened, metadata, platform, name).map_err(
+        |why| {
+            anyhow!(
+                "--sku {name}: {why:#}\n\
+                 This import converts for the row named and for no other; drop `--sku` to \
+                 convert {} for the first row whose contract fits it.",
+                crate::ui::short_path(checkpoint),
+            )
+        },
+    )
 }
 
 fn refuse_a_source_no_sku_in_this_build_claims(checkpoint: &Path) -> anyhow::Error {
@@ -1615,16 +1717,28 @@ fn engine_or_refuse() -> Result<Platform> {
 /// Asked of the operand's encoding, which the node does not carry: a
 /// `Cast { to: Raw }` over bf16 is a narrowing and over mxfp4 a decode.
 /// Untypeable answers as a decode.
-fn decodes_a_packed_plane(expr: &Expr, checkpoint: &Metadata) -> bool {
+fn decodes_a_packed_plane(expr: &Expr, checkpoint: &Metadata, contract: &ModelContract) -> bool {
     let mut decodes = false;
     expr.visit(&mut |node| {
         let operand = match node {
-            Expr::Cast { src, to: Encoding::Raw(_) } => src,
-            Expr::Scale { src, factor: ScaleFactor::PerBlock { .. } } => src,
-            Expr::Bias { src, by: BiasBy::PerBlock { .. } } => src,
+            Expr::Cast {
+                src,
+                to: Encoding::Raw(_),
+            } => src,
+            Expr::Scale {
+                src,
+                factor: ScaleFactor::PerBlock { .. },
+            } => src,
+            Expr::Bias {
+                src,
+                by: BiasBy::PerBlock { .. },
+            } => src,
             _ => return,
         };
-        if !matches!(yields(operand, checkpoint), Some(Encoding::Raw(_))) {
+        if !matches!(
+            yields(operand, checkpoint, contract),
+            Some(Encoding::Raw(_))
+        ) {
             decodes = true;
         }
     });
@@ -1633,9 +1747,22 @@ fn decodes_a_packed_plane(expr: &Expr, checkpoint: &Metadata) -> bool {
 
 /// The representation an expression's value is in, or `None` where the
 /// chain does not say.
-fn yields<'a>(expr: &'a Expr, checkpoint: &'a Metadata) -> Option<&'a Encoding> {
+fn yields<'a>(
+    expr: &'a Expr,
+    checkpoint: &'a Metadata,
+    contract: &'a ModelContract,
+) -> Option<&'a Encoding> {
     match expr {
         Expr::Src(name) => checkpoint.tensor_by_name(name).map(|held| &held.encoding),
+        // A name declared earlier in the same contract says its own
+        // encoding. Reading it is what keeps a two-step chain — apply a
+        // transform at the stored width, then adapt — from looking like a
+        // decode of packed codes when the plane was never packed.
+        Expr::Out(name) => contract
+            .tensors
+            .iter()
+            .find(|declared| declared.name == *name)
+            .map(|declared| &declared.encoding),
         Expr::Fill { ty, .. } => Some(&ty.encoding),
         Expr::Cast { to, .. } => Some(to),
         Expr::Transmute { to, .. } | Expr::Repack { to, .. } => Some(&to.encoding),
@@ -1645,9 +1772,12 @@ fn yields<'a>(expr: &'a Expr, checkpoint: &'a Metadata) -> Option<&'a Encoding> 
         | Expr::Shard { src, .. }
         | Expr::Select { src, .. }
         | Expr::Scale { src, .. }
-        | Expr::Bias { src, .. } => yields(src, checkpoint),
-        Expr::Concat { parts, .. } => parts.first().and_then(|leg| yields(leg, checkpoint)),
-        Expr::Out(_) | Expr::SrcIndexed(_) => None,
+        | Expr::Unary { src, .. }
+        | Expr::Bias { src, .. } => yields(src, checkpoint, contract),
+        Expr::Concat { parts, .. } => parts
+            .first()
+            .and_then(|leg| yields(leg, checkpoint, contract)),
+        Expr::SrcIndexed(_) => None,
     }
 }
 
@@ -1740,12 +1870,28 @@ fn gguf_tokenizer(
 /// Why an existing artifact needs rebuilding, or `None` if it is current:
 /// the same stamp a load checks it against (backend, SKU, layout revision),
 /// and the source it was written from.
-fn staleness(artifact: &Path, platform: Platform, source: &str) -> Option<String> {
+///
+/// `asked` is `--sku`, and an artifact serving another row is stale however
+/// current it is for its own: the operator named a row, and "up to date" for
+/// a different one would leave them with the file they were trying to
+/// replace.
+fn staleness(
+    artifact: &Path,
+    platform: Platform,
+    source: &str,
+    asked: Option<&str>,
+) -> Option<String> {
     let stamp = match checkpoint::file::serve::stamp_of(artifact) {
         Ok(Some(stamp)) => stamp,
         Ok(None) => return Some("it carries no serving stamp".to_string()),
         Err(err) => return Some(format!("its serving stamp does not read back: {err}")),
     };
+    if let Some(asked) = asked.filter(|asked| *asked != stamp.sku) {
+        return Some(format!(
+            "it serves `{}` and `--sku {asked}` was asked for",
+            stamp.sku
+        ));
+    }
     if runtime::engine::load::trace(&stamp.sku, platform).is_err() {
         return Some(format!("this build ships no SKU named `{}`", stamp.sku));
     }
@@ -1792,7 +1938,12 @@ fn groups_of(plan: &LoadPlan, trace: &runtime::engine::load::Trace) -> Result<Ve
             .filter(|decl| decl.id == id)
             .or_else(|| plan.tensors.iter().find(|decl| decl.id == id))
             .map(|decl| decl.name.clone())
-            .ok_or_else(|| anyhow!("the plan attaches tensor {} and declares no such tensor", id.0))
+            .ok_or_else(|| {
+                anyhow!(
+                    "the plan attaches tensor {} and declares no such tensor",
+                    id.0
+                )
+            })
     };
     let mut groups = Vec::with_capacity(plan.attachments.len());
     for attachment in &plan.attachments {
@@ -1813,6 +1964,30 @@ fn groups_of(plan: &LoadPlan, trace: &runtime::engine::load::Trace) -> Result<Ve
     Ok(groups)
 }
 
+/// The order the executor hands planes to the sink: the plan's SCHEDULE, not
+/// its declarations.
+///
+/// [`Walk`] publishes at each `Finalize`, and a plan's `Finalize` order is not
+/// its `tensors` order: a quantized bank's companions are finalized where the
+/// encode makes them, so a bank lands as `w.scales`, `w.biases`, then `w`,
+/// while the declarations read `w`, `w.scales`, `w.biases`. Reading the
+/// declarations instead is what let a decode that does not produce in the
+/// artifact's order be handed to [`Decoded::Streamed`], which then refuses at
+/// the first bank.
+///
+/// [`Walk`]: checkpoint::executor
+fn publish_order(plan: &LoadPlan) -> Vec<&str> {
+    plan.schedule
+        .iter()
+        // Ids are dense by construction; the guard means a plan where they
+        // are not falls to the spool rather than to a wrong order.
+        .filter_map(|id| match plan.instrs.get(id.0 as usize) {
+            Some(StorageInstr::Finalize { id: at, name, .. }) if at == id => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The order the artifact's objects are written in: the shell's ranking when
 /// there is one (hottest planes first, one forward walk), names otherwise.
 /// A group's planes follow its codes in canonical order whatever the
@@ -1826,7 +2001,11 @@ fn merge_order<'a>(
 ) -> Vec<(&'a str, From<'a>)> {
     let mut entries: Vec<(&'a str, From<'a>)> = Vec::new();
     if let Some(plan) = plan {
-        for decl in plan.tensors.iter().filter(|decl| decl.visibility.is_public()) {
+        for decl in plan
+            .tensors
+            .iter()
+            .filter(|decl| decl.visibility.is_public())
+        {
             entries.push((&decl.name, From::Decoded(decl)));
         }
     }
@@ -2185,9 +2364,60 @@ impl TensorSink for Handoff<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
-    
+
+    /// **THE STREAMING DECODE IS GATED ON THE SCHEDULE, NOT THE DECLARATIONS.**
+    ///
+    /// A plan finalizes a quantized bank's companions where the encode makes
+    /// them, so the sink sees `w.scales`, `w.biases`, `w` while the plan's
+    /// `tensors` read `w`, `w.scales`, `w.biases` — the order the artifact
+    /// wants. Reading the declarations made the two look equal, and the merge
+    /// took the streaming path only to refuse at the first bank. What the
+    /// merge has to compare against is what the executor publishes.
+    #[test]
+    fn a_banks_planes_publish_in_schedule_order_not_declaration_order() {
+        use checkpoint::types::{BufferId, DType, InstrId};
+
+        let decl = |at: u32, name: &str| TensorDecl {
+            id: TensorId(at),
+            name: name.to_string(),
+            shape: vec![4, 4],
+            encoding: Encoding::Raw(DType::Bf16),
+            alignment: 64,
+            visibility: Visibility::Public,
+        };
+        let finalize = |at: u32, name: &str| StorageInstr::Finalize {
+            id: InstrId(at),
+            tensor: BufferId(at),
+            name: name.to_string(),
+        };
+        // The declarations are the artifact's order; the schedule is the
+        // encode's.
+        let plan = LoadPlan {
+            target: decode_target(),
+            passes: Vec::new(),
+            files: Vec::new(),
+            sources: Vec::new(),
+            tensors: vec![decl(0, "w"), decl(1, "w.scales"), decl(2, "w.biases")],
+            buffers: Vec::new(),
+            instrs: vec![
+                finalize(0, "w.scales"),
+                finalize(1, "w.biases"),
+                finalize(2, "w"),
+            ],
+            schedule: vec![InstrId(0), InstrId(1), InstrId(2)],
+            memory: checkpoint::plan::MemoryPlan::default(),
+            attachments: Vec::new(),
+            groups: Vec::new(),
+        };
+
+        assert_eq!(publish_order(&plan), ["w.scales", "w.biases", "w"]);
+        let declared: Vec<&str> = plan.tensors.iter().map(|d| d.name.as_str()).collect();
+        assert_ne!(
+            publish_order(&plan),
+            declared,
+            "the declarations are exactly what this gate must NOT be read off"
+        );
+    }
 
     /// **THE ARITHMETIC THE DRY RUN EXISTS TO STATE**, on the checkpoint it was
     /// measured against: `mlx-community/DeepSeek-V4-Flash-2bit-DQ`, 89.9 GiB
@@ -2226,7 +2456,10 @@ mod tests {
         // max rather than naming one of them.
         let after = peak_disk(source, decode, copy, true);
         assert_eq!(after, decode + copy);
-        assert!(after > source, "the artifact is the larger copy on this one");
+        assert!(
+            after > source,
+            "the artifact is the larger copy on this one"
+        );
         assert_eq!(crate::ui::bytes(after), "89.9GiB");
         assert!(
             before > 2 * after - (1 << 30),
@@ -2304,4 +2537,130 @@ mod tests {
         assert!(!same_file(&dir.path().join("nowhere.zt"), &real));
     }
 
+    /// **THE ROW IS THE OPERATOR'S TO NAME.** `--sku` parses as an optional
+    /// name and is absent by default, which is what keeps an import with no
+    /// flag exactly the import it was: `choose_row(None, ..)` is the
+    /// identification order, first fits wins.
+    #[test]
+    fn the_row_override_parses_as_a_name_and_is_absent_by_default() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Just {
+            #[command(flatten)]
+            args: ImportArgs,
+        }
+
+        let plain = Just::parse_from(["pie", "google/gemma-4-E4B-it"]).args;
+        assert_eq!(plain.sku, None, "no flag is no override");
+
+        let named = Just::parse_from([
+            "pie",
+            "google/gemma-4-E4B-it",
+            "--sku",
+            "gemma4-e4b-vision-bf16-kv-bf16",
+        ])
+        .args;
+        assert_eq!(named.sku.as_deref(), Some("gemma4-e4b-vision-bf16-kv-bf16"));
+
+        // The name is a value, not a flag: `--sku` with nothing after it is a
+        // usage error rather than a silent `None`.
+        assert!(Just::try_parse_from(["pie", "google/gemma-4-E4B-it", "--sku"]).is_err());
+    }
+
+    /// A name this build does not ship is refused BY NAME, with the catalog,
+    /// and refused early — the check runs before the source is resolved, so a
+    /// misspelling costs nothing.
+    #[test]
+    fn an_unknown_row_name_is_refused_with_the_catalog() {
+        let why = runtime::engine::load::row_named("gemma4-vision")
+            .expect_err("no row carries that name")
+            .to_string();
+        assert!(why.contains("gemma4-vision"), "{why}");
+        assert!(
+            why.contains("gemma4-e4b-vision-bf16-kv-bf16"),
+            "the refusal lists the rows this build ships, which is how an \
+             operator finds the one they meant: {why}"
+        );
+        // And `--sku '?'` is that same refusal, which is why the flag's help
+        // offers it as the way to see the names.
+        let listed = runtime::engine::load::row_named("?")
+            .expect_err("`?` is not a row")
+            .to_string();
+        assert!(
+            listed.contains("gemma4-e4b-vision-bf16-kv-bf16"),
+            "{listed}"
+        );
+    }
+
+    /// A row that does not read the checkpoint refuses with the contract's
+    /// own account and never falls back to the row that would have fitted.
+    #[test]
+    fn a_row_that_does_not_read_the_checkpoint_refuses_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stranger.zt");
+        let mut writer = ztensor::Writer::create(&path).unwrap();
+        writer
+            .add(
+                "a.tensor.no.model.in.this.catalog.reads",
+                vec![1u64],
+                ztensor::Leaf::U8,
+                &[0u8],
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let source = ztensor::Source::open(&path).unwrap();
+        let metadata = runtime::engine::load::checkpoint_metadata(&path).unwrap();
+        let asked = "gemma4-e4b-vision-bf16-kv-bf16";
+
+        // Without the flag: nothing claims it, and the import says so.
+        assert!(
+            choose_row(None, &source, &metadata, Platform::Vulkan, &path).is_err(),
+            "a checkpoint of one stranger is claimed by no row"
+        );
+
+        let why = format!(
+            "{:#}",
+            choose_row(Some(asked), &source, &metadata, Platform::Vulkan, &path)
+                .expect_err("the named row does not read this checkpoint")
+        );
+        assert!(
+            why.contains(asked) && why.contains("--sku"),
+            "the refusal names the row that was asked for, and the flag that \
+             asked for it: {why}"
+        );
+        assert!(
+            why.contains("for no other"),
+            "and says plainly that nothing fell back: {why}"
+        );
+    }
+
+    /// The chosen row reaches the artifact's NAME, not just its stamp: the
+    /// dry run prints this path, and a store holding one snapshot at two rows
+    /// keeps them apart by it.
+    #[test]
+    fn the_chosen_row_is_in_the_filename_the_dry_run_reports() {
+        let stamp = checkpoint::serving::Stamp::of("vulkan", "gemma4-e4b-vision-bf16-kv-bf16");
+        let written = Path::new("/home/u/.pie/models/google--gemma-4-E4B-it/archive.zt");
+        assert_eq!(
+            specialized_path(written, "google--gemma-4-E4B-it", &stamp, None),
+            Path::new(
+                // The slug is lowercased by `serving::slugify`; the row and
+                // the backend are the two fields that matter here.
+                "/home/u/.pie/models/google--gemma-4-E4B-it/\
+                 google--gemma-4-e4b-it.gemma4-e4b-vision-bf16-kv-bf16.vulkan.zt"
+            ),
+        );
+        // The text row of the same snapshot is a different file, which is the
+        // whole point of naming the specialization.
+        let text = checkpoint::serving::Stamp::of("vulkan", "gemma4-e4b-bf16-kv-bf16");
+        assert_ne!(
+            specialized_path(written, "google--gemma-4-E4B-it", &stamp, None),
+            specialized_path(written, "google--gemma-4-E4B-it", &text, None),
+        );
+        // An `--out` that names a `.zt` is the operator's own name and keeps it.
+        let out = Path::new("/tmp/mine.zt");
+        assert_eq!(specialized_path(out, "whatever", &stamp, Some(out)), out);
+    }
 }

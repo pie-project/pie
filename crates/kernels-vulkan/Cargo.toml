@@ -1,0 +1,23 @@
+[package]
+name = "kernels-vulkan"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Pure Vulkan kernel definitions: SPIR-V entrypoint names, argument marshalling, and dispatch geometry. Mirrors kernels-metal's surface; an engine Run resolves plan ids to handles and calls these entry functions."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+links = "pie_kernels_vulkan"
+build = "build.rs"
+
+[lib]
+name = "kernels_vulkan"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+native = []
+
+[dependencies]
+
+dtype = { path = "../dtype" }

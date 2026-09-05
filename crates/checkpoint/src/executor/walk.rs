@@ -17,7 +17,7 @@ use crate::codec::cast::{cast_elements, decode_values, encode_values};
 use crate::codec::fp8::{decode_fp8_e4m3_elements, f32_to_fp8_e4m3};
 use crate::codec::int4::decode_int4b8_elements;
 use crate::codec::mlx::decode_mlx_affine_codes;
-use crate::codec::mlx::mlx_affine_group_params;
+use crate::codec::mlx::mlx_affine_group_params_bits;
 use crate::codec::mxfp4::{decode_mxfp4_elements, encode_mxfp4_group};
 use crate::codec::rows::{EncodeOperand, encode_rows};
 use crate::error::Error;
@@ -1073,6 +1073,7 @@ impl Walk<'_, '_> {
             TileMapKind::Bias => {
                 self.bias_bytes(source, inputs, outputs.first().copied(), &input, &transform)?
             }
+            TileMapKind::Unary => self.unary_bytes(source, inputs, &input, &transform)?,
             TileMapKind::Decode => {
                 self.decode_bytes(outputs.first().copied(), &input, &transform)?
             }
@@ -1407,6 +1408,42 @@ impl Walk<'_, '_> {
         encode_values(&values, dtype)
     }
 
+    /// `Unary` applies one elementwise function, in `f64` and rounded
+    /// through `f32` the way `Bias` is. A value outside the function's
+    /// domain is refused rather than answered with a `NaN`: it means the
+    /// checkpoint does not hold what the contract said it holds, and a
+    /// silent `NaN` reaches the weights as fluent nonsense.
+    fn unary_bytes(
+        &self,
+        source: Option<&SourceExtent>,
+        inputs: &[BufferId],
+        bytes: &[u8],
+        transform: &TransformSpec,
+    ) -> Result<Vec<u8>, Error> {
+        let dtype = if let Some(source) = source {
+            self.source_dtype(source.tensor_id)?
+        } else if let Some(input) = inputs.first() {
+            self.buffer_dtype(*input)?
+        } else {
+            return Err(invalid("host Unary requires a source or input buffer"));
+        };
+        let op = transform
+            .unary
+            .ok_or_else(|| invalid("a Unary transform names no function"))?;
+        let mut values = decode_values(bytes, dtype)?;
+        for (at, value) in values.iter_mut().enumerate() {
+            if !op.defined_at(*value) {
+                return Err(invalid(format!(
+                    "{op:?} is defined for {} elements and element {at} is {value}; \
+                     the checkpoint does not hold what this contract reads",
+                    op.domain()
+                )));
+            }
+            *value = f64::from(op.apply(*value) as f32);
+        }
+        encode_values(&values, dtype)
+    }
+
     /// `Scale` multiplies by a per-tensor constant, or by per-group factors
     /// from a second operand (which also decodes quantized codes). The
     /// multiply happens in `f32` to match the CUDA kernel bit-for-bit.
@@ -1507,7 +1544,21 @@ impl Walk<'_, '_> {
                  {shape:?}"
             )));
         };
-        let group = i64::from(scheme.default_group_size());
+        // The destination's own width and group: `MlxAffineU4` names the
+        // codec, and the buffer's spec says whether it is 2, 4 or 8 bits wide.
+        let (bits, group) = match &self.plan.buffer(*weight)?.ty.encoding {
+            Encoding::Quant(spec) => (u32::from(spec.bits_per_element), spec.group_size),
+            Encoding::Raw(_) => (4, scheme.default_group_size()),
+        };
+        if !matches!(bits, 2 | 4 | 8) {
+            return Err(invalid(format!(
+                "encoding to {scheme:?} at {bits} bits: the codec packs 2, 4 or 8"
+            )));
+        }
+        let codes_per_word = (32 / bits) as usize;
+        #[allow(clippy::cast_precision_loss)]
+        let top = ((1u32 << bits) - 1) as f32;
+        let group = i64::from(group);
         if group <= 0 || cols % group != 0 {
             return Err(invalid(format!(
                 "encoding to {scheme:?} groups {group} columns, which does not \
@@ -1532,16 +1583,16 @@ impl Walk<'_, '_> {
         }
 
         let n_groups = (rows * cols / group) as usize;
-        let mut packed = Vec::with_capacity(values.len() / 8 * 4);
+        let mut packed = Vec::with_capacity(values.len() / codes_per_word * 4);
         let mut scale_values = Vec::with_capacity(n_groups);
         let mut bias_values = Vec::with_capacity(n_groups);
         for chunk in values.chunks(group as usize) {
-            let (scale, bias) = mlx_affine_group_params(chunk);
-            for word in chunk.chunks(8) {
+            let (scale, bias) = mlx_affine_group_params_bits(chunk, bits);
+            for word in chunk.chunks(codes_per_word) {
                 let mut out: u32 = 0;
                 for (k, &value) in word.iter().enumerate() {
-                    let code = (((value as f32) - bias) / scale).round().clamp(0.0, 15.0) as u32;
-                    out |= code << (k * 4);
+                    let code = (((value as f32) - bias) / scale).round().clamp(0.0, top) as u32;
+                    out |= code << (k as u32 * bits);
                 }
                 packed.extend_from_slice(&out.to_le_bytes());
             }

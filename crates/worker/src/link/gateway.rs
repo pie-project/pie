@@ -771,4 +771,3 @@ fn upload_chunk_info(m: &ClientMessage) -> Option<(usize, usize)> {
         _ => None,
     }
 }
-

@@ -184,14 +184,22 @@ def features_declared(manifest: dict) -> set[str]:
 # descended into them and produced the paths: the files were skipped and
 # the walk was still paid for. Pruning is where that belongs, and none of
 # the three can hold a manifest this audit is about.
-PRUNE = {".claude", ".git", "target"}
+# A build directory is never source. `target` is cargo's default; a sweep
+# run with `--target-dir target-vk` (or any other name) writes generated
+# crates there too, and those carry `cfg`s for features they never see.
+PRUNE = {".claude", ".git"}
+PRUNE_PREFIX = "target"
 
 
 def manifests() -> list[Path]:
     """Every `Cargo.toml` in the tree, without descending into `PRUNE`."""
     found = []
     for parent, directories, files in os.walk(ROOT):
-        directories[:] = [d for d in directories if d not in PRUNE]
+        directories[:] = [
+            d
+            for d in directories
+            if d not in PRUNE and not d.startswith(PRUNE_PREFIX)
+        ]
         if "Cargo.toml" in files:
             found.append(Path(parent) / "Cargo.toml")
     return sorted(found)
@@ -234,7 +242,10 @@ def main() -> int:
             # root package's directory IS the repo root, so an unpruned rglob
             # reads every agent worktree under `.claude` and reports another
             # checkout's crate as this one's dead cfg.
-            if PRUNE.intersection(source.relative_to(directory).parts):
+            parts = source.relative_to(directory).parts
+            if PRUNE.intersection(parts) or any(
+                part.startswith(PRUNE_PREFIX) for part in parts
+            ):
                 continue
             if any(source.is_relative_to(other) for other in nested):
                 continue

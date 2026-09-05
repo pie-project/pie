@@ -618,5 +618,4 @@ mod tests {
         .to_string();
         assert!(error.contains("frame"), "got: {error}");
     }
-
 }

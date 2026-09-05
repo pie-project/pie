@@ -197,5 +197,4 @@ mod tests {
         assert_eq!(to_file_path("model.name"), "model.name");
         assert_eq!(to_file_path("server.host"), "server.host");
     }
-
 }

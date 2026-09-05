@@ -20,3 +20,5 @@ pub mod rng;
 mod runtime_scan;
 pub mod slots;
 pub mod wellformed;
+pub mod wgsl;
+pub mod wgsl_analysis;

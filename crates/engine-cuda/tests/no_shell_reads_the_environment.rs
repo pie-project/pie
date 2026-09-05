@@ -1,11 +1,17 @@
-//! Grep gate: no shell (`engine-cuda` or `engine-metal`) may call
+//! Grep gate: no shell (`engine-cuda`, `engine-metal`, `engine-vulkan`,
+//! `engine-wgpu`) may call
 //! `env::var` — every knob must be typed in `Boot`/`Budget`/`Profile`.
 
 use std::path::{Path, PathBuf};
 
-/// Both shells: the constitution's count is over shells, not one, so this
-/// also polices `engine-metal`.
-const SHELLS: [&str; 2] = ["../engine-cuda/src", "../engine-metal/src"];
+/// Every shell: the constitution's count is over shells, not one, so this
+/// also polices `engine-metal`, `engine-vulkan` and `engine-wgpu`.
+const SHELLS: [&str; 4] = [
+    "../engine-cuda/src",
+    "../engine-metal/src",
+    "../engine-vulkan/src",
+    "../engine-wgpu/src",
+];
 
 /// Matches `var`, `var_os`, and any future `var_*` — the spelling doesn't
 /// matter, the provenance does.
@@ -20,7 +26,7 @@ fn no_shell_reads_the_environment() {
         let directory = root.join(shell);
         assert!(
             directory.is_dir(),
-            "{directory:?} is not a directory; this gate reads both shells' \
+            "{directory:?} is not a directory; this gate reads every shell's \
              sources and cannot answer for one it cannot find"
         );
         for file in rust_files(&directory) {

@@ -48,9 +48,6 @@ pub enum Form {
 /// The include line every emitted kernel carries.
 const RNG_INCLUDE: &str = "#include \"ptir_rng.generated.metal\"";
 
-/// Where the rng source lives in `kernels-metal`'s shipped table.
-const RNG_SOURCE: &str = "ptir/ptir_rng.generated.metal";
-
 /// Device identity for the cache key: MSL compiles per-device, so no
 /// separate architecture/toolkit version is needed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,24 +201,14 @@ fn classify(entry: &str, error: &objc2_foundation::NSError) -> Failure {
     }
 }
 
-/// The emitted source with its one unresolved include spliced in.
-///
-/// # Errors
-///
-/// [`Failure::Deterministic`] when `kernels-metal` does not ship the named
-/// rng source.
-fn expand(source: &str) -> std::result::Result<String, Failure> {
+/// The emitted source with its one unresolved include spliced in:
+/// `newLibraryWithSource:` has no header search path, so the include cannot be
+/// left for the compiler.
+fn expand(source: &str) -> String {
     if !source.contains(RNG_INCLUDE) {
-        return Ok(source.to_string());
+        return source.to_string();
     }
-    let rng = kernels_metal::source(RNG_SOURCE).ok_or_else(|| Failure::Deterministic {
-        reason: format!(
-            "the emitted runtime includes `{RNG_SOURCE}` and `kernels-metal` ships no \
-             such source; `newLibraryWithSource:` has no header search path, so the \
-             include cannot be left for the compiler"
-        ),
-    })?;
-    Ok(source.replace(RNG_INCLUDE, rng))
+    source.replace(RNG_INCLUDE, &eta_compiler::codegen::rng::generate_msl_preamble())
 }
 
 /// One compiled region: the module that holds it, and which region it is.
@@ -639,7 +626,7 @@ impl Cache {
         entry: &str,
         source: &str,
     ) -> std::result::Result<Arc<Module>, Failure> {
-        let expanded = expand(source)?;
+        let expanded = expand(source);
         #[cfg(target_vendor = "apple")]
         {
             let module = Module::build(context.device(), &expanded, entry)?;
@@ -661,18 +648,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_rng_include_the_emitter_leaves_is_one_this_tree_ships() {
-        assert!(
-            kernels_metal::source(RNG_SOURCE).is_some(),
-            "`{RNG_SOURCE}` is what every emitted runtime includes, and \
-             `newLibraryWithSource:` has no search path to find it with"
-        );
-    }
-
-    #[test]
     fn expansion_replaces_the_include_and_leaves_everything_else() {
         let source = format!("// head\n{RNG_INCLUDE}\n// tail\n");
-        let expanded = expand(&source).expect("the rng source ships");
+        let expanded = expand(&source);
         assert!(
             !expanded.contains(RNG_INCLUDE),
             "the include survived the expansion"
@@ -687,7 +665,7 @@ mod tests {
     #[test]
     fn a_source_with_no_include_is_handed_over_unchanged() {
         let source = "kernel void nothing() {}\n";
-        assert_eq!(expand(source).expect("no include"), source);
+        assert_eq!(expand(source), source);
     }
 
     /// The identity separates the two backends and the two emitters, which

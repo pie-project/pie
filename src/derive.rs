@@ -55,4 +55,3 @@ pub fn derive_standalone(
     let gateway = gateway::Config::parse("").context("gateway defaults")?;
     Ok((controller, gateway, worker))
 }
-

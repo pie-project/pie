@@ -1,7 +1,8 @@
 //! The operator's TOML schema — every key `pie serve` reads.
 //!
-//! Engine kinds with no build host ([`EngineKind::Vulkan`] / [`EngineKind::Wgpu`])
-//! stay named so a config asking for one is refused by name, not as malformed.
+//! Every [`EngineKind`] now has a build that hosts it — the two portable
+//! shells landed — so a config asking for one is refused by a missing feature
+//! flag rather than by the name being unhostable.
 //!
 //! [`Config`] is the user-facing TOML schema; conversion to the runtime's own
 //! config happens in [`crate::translate`].
@@ -23,7 +24,9 @@ pub mod schema;
 /// The unit-carrying value types (`"50ms"`, `"4GiB"`): [`Duration`], [`ByteSize`].
 pub mod units;
 
-pub use backend::{CudaNativeEngineOptions, MetalEngineOptions};
+pub use backend::{
+    CudaNativeEngineOptions, MetalEngineOptions, VulkanEngineOptions, WgpuEngineOptions,
+};
 pub use units::{ByteSize, Duration};
 
 // -----------------------------------------------------------------------------
@@ -368,9 +371,10 @@ pub struct SandboxConfig {
     /// setting -- it is the only one that also stops `wasi:http`.
     #[serde(default = "default_true")]
     pub allow_network: bool,
-    /// Hosts an inferlet may reach, `["*"]` for any. Filters `wasi:sockets`
-    /// only; `wasi:http` bypasses it, so use `allow_network = false` instead
-    /// when that matters.
+    /// Hosts an inferlet may reach, `["*"]` for any.
+    ///
+    /// Filters `wasi:sockets` only; `wasi:http` bypasses it, so use
+    /// `allow_network = false` instead when that matters.
     #[serde(default = "default_network_allowed_hosts")]
     pub network_allowed_hosts: Vec<String>,
     /// Instances the wasmtime pooling allocator may hold. A ceiling on
@@ -858,9 +862,34 @@ impl EngineConfig {
                     );
                 }
             }
-            // Nothing to check: these kinds are refused by name at
-            // `flavor::Flavor::from_kind`.
-            EngineKind::Vulkan | EngineKind::Wgpu => {}
+            // Typed, like the CUDA arm and unlike Metal's: this table is
+            // parsed with `deny_unknown_fields`, so a key the shell never
+            // reads is refused here rather than ignored at boot.
+            EngineKind::Vulkan => {
+                let opts: VulkanEngineOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [engine] options for engine type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
+                opts.validate()?;
+            }
+            // Typed too, and for the same reason: `deny_unknown_fields`
+            // makes a key the shell never reads a refusal here rather than a
+            // line quietly ignored at boot.
+            EngineKind::Wgpu => {
+                let opts: WgpuEngineOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid [engine] options for engine type {:?}: {e}",
+                        self.kind,
+                    )
+                })?;
+                opts.validate()?;
+            }
         }
         Ok(())
     }
@@ -868,9 +897,8 @@ impl EngineConfig {
 
 /// Which engine a `[model.engine] type` names.
 ///
-/// `Vulkan` and `Wgpu` are named, not offered: no build of pie hosts them.
-/// The names stay so a deployment asking for one is refused by name rather
-/// than told its config is malformed.
+/// Every name here is now offered: `Vulkan` and `Wgpu` were named-not-hosted
+/// until their shells landed, and each is one `--features` flag away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineKind {
@@ -1121,5 +1149,4 @@ device = ["cpu"]
     // -------------------------------------------------------------------------
     // [model] device_weight_budget / host_weight_budget
     // -------------------------------------------------------------------------
-
 }

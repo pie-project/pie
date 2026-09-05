@@ -1,0 +1,22 @@
+[package]
+name = "kernels-wgpu"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Pure WebGPU kernel definitions: WGSL variant names, argument marshalling, and dispatch geometry. Mirrors kernels-vulkan's surface; an engine Run resolves plan ids to handles and calls these entry functions."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+links = "pie_kernels_wgpu"
+build = "build.rs"
+
+[lib]
+name = "kernels_wgpu"
+path = "src/lib.rs"
+
+[features]
+
+default = []
+
+[dependencies]
+
+dtype = { path = "../dtype" }

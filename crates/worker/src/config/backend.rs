@@ -7,8 +7,12 @@
 //! scrapes doc comments out of this file too — its `SOURCE` concatenation
 //! names it — so a field's description keeps living on the field.
 
+use std::path::PathBuf;
+
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+
+use super::units::ByteSize;
 
 /// `[model.engine.options]` for `type = "cuda_native"`.
 /// Mirrors `pie/src/pie_driver_cuda_native/config.py::CudaNativeDriverConfig`.
@@ -277,6 +281,223 @@ impl Default for MetalEngineOptions {
             device: "metal:0".to_string(),
             verbose: false,
         }
+    }
+}
+
+/// `[model.engine.options]` for `type = "vulkan"` — the portable shell, on
+/// whatever Vulkan device the machine exposes.
+///
+/// **THE DEVICE IS A NUMBER HERE**, not a `"vulkan:0"` string like the two
+/// engines above: Vulkan enumerates its physical devices and the boot document
+/// carries the index straight through as `[vulkan] device_index`, so there is
+/// no selector to parse and no prefix to strip.
+///
+/// The pool half mirrors [`MetalEngineOptions`] knob for knob (the forward
+/// limits, the seat/page split) because both shells size their pools from what
+/// the operator states rather than from a planner. It differs in one place:
+/// `max_total_pages` is CUDA's `Option<u32>` ceiling rather than Metal's
+/// `total_pages`, since this shell derives its pool from
+/// `gpu_mem_utilization` and only caps the result.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VulkanEngineOptions {
+    /// Which physical device to bind, in `vkEnumeratePhysicalDevices` order.
+    /// `0` is the first, and a machine with one GPU never states this.
+    pub device_index: u32,
+    /// **Fraction of the device-local heap pie may hold resident** — weights,
+    /// kv pool and scratch. The Vulkan twin of the CUDA engine's
+    /// `gpu_mem_utilization`, 0.90 by default exactly as that one is.
+    pub gpu_mem_utilization: f64,
+    /// HARD cap on the runtime KV page count. **Omit to derive it from
+    /// `gpu_mem_utilization`.** Named for the same quantity CUDA's
+    /// `max_total_pages` is — a ceiling over a derived number, usually absent
+    /// — and not for Metal's `total_pages`, which IS the pool.
+    pub max_total_pages: Option<u32>,
+    /// Tokens one forward pass may carry, across all requests in the batch.
+    pub max_forward_tokens: u32,
+    /// Requests one forward pass may carry. Also what
+    /// `max_concurrent_processes` derives from when the operator leaves it
+    /// unset.
+    pub max_forward_requests: u32,
+    /// Recurrent-state seats (KDA/GDN and conv state), one sequence in flight
+    /// each; absent takes 256. A model with no state rows seats by pages alone.
+    pub max_state_slots: Option<u32>,
+    /// Load `VK_LAYER_KHRONOS_validation` when the loader can find it.
+    /// Diagnostic only, and off by default: the layer costs a large multiple
+    /// of the dispatch time it validates.
+    pub validation: bool,
+    /// Where to persist the `VkPipelineCache` between runs. **Omit for an
+    /// in-memory cache**, which is correct and pays the pipeline compiles
+    /// again on every boot.
+    pub pipeline_cache: Option<PathBuf>,
+}
+
+impl Default for VulkanEngineOptions {
+    fn default() -> Self {
+        Self {
+            device_index: 0,
+            gpu_mem_utilization: 0.90,
+            max_total_pages: None,
+            max_forward_tokens: 10240,
+            max_forward_requests: 512,
+            max_state_slots: None,
+            validation: false,
+            pipeline_cache: None,
+        }
+    }
+}
+
+impl VulkanEngineOptions {
+    pub(super) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.gpu_mem_utilization.is_finite()
+                && self.gpu_mem_utilization > 0.0
+                && self.gpu_mem_utilization <= 1.0,
+            "engine.gpu_mem_utilization must be finite and in (0.0, 1.0]"
+        );
+        // Present means the operator chose a size, so a present zero is a
+        // contradiction rather than a way to say "derive".
+        if let Some(pages) = self.max_total_pages {
+            ensure!(
+                pages > 0,
+                "engine.max_total_pages must be > 0; \
+                 omit it to derive from gpu_mem_utilization"
+            );
+        }
+        ensure!(
+            self.max_forward_tokens > 0,
+            "engine.max_forward_tokens must be > 0"
+        );
+        ensure!(
+            self.max_forward_requests > 0,
+            "engine.max_forward_requests must be > 0"
+        );
+        Ok(())
+    }
+}
+
+/// `[model.engine.options]` for `type = "wgpu"` — the portable shell that
+/// reaches a device through whichever backend wgpu finds (Vulkan on Linux,
+/// Metal on a Mac, DX12 on Windows).
+///
+/// **THE DEVICE IS A NUMBER HERE**, as it is for [`VulkanEngineOptions`] and
+/// unlike the `"cuda:0"`/`"metal:0"` selector strings: wgpu enumerates its
+/// adapters and the boot document carries the index straight through as
+/// `[wgpu] adapter_index`, so there is no selector to parse.
+///
+/// The pool half is [`VulkanEngineOptions`] knob for knob. The two knobs that
+/// differ are the ones wgpu has and Vulkan does not: `backends` narrows which
+/// backends the instance may enumerate at all, and `power_preference` ranks
+/// the adapters inside that set.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WgpuEngineOptions {
+    /// Which adapter to bind, in enumeration order among those the instance
+    /// reaches. `0` is the first, and a machine with one GPU never states it.
+    pub adapter_index: u32,
+    /// Which wgpu backends the instance may enumerate, as the comma-separated
+    /// list wgpu itself spells (`"vulkan"`, `"vulkan,metal,dx12"`). **Omit for
+    /// every backend this build carries** — narrowing it is how an operator
+    /// pins a machine that exposes two.
+    pub backends: Option<String>,
+    /// How adapters are ranked inside that set: `"high-performance"`,
+    /// `"low-power"`, or `"none"`. A preference ranks; it never reaches a
+    /// software adapter.
+    pub power_preference: String,
+    /// **Fraction of the adapter's device-local heap pie may hold resident** —
+    /// weights, kv pool and scratch. 0.90 by default, exactly as the CUDA and
+    /// Vulkan engines are.
+    pub gpu_mem_utilization: f64,
+    /// HARD cap on the runtime KV page count. **Omit to derive it from
+    /// `gpu_mem_utilization`.** A ceiling over a derived number, like CUDA's
+    /// and Vulkan's `max_total_pages` and unlike Metal's `total_pages`, which
+    /// IS the pool.
+    pub max_total_pages: Option<u32>,
+    /// Tokens one forward pass may carry, across all requests in the batch.
+    pub max_forward_tokens: u32,
+    /// Requests one forward pass may carry. Also what
+    /// `max_concurrent_processes` derives from when the operator leaves it
+    /// unset.
+    pub max_forward_requests: u32,
+    /// Recurrent-state seats (KDA/GDN and conv state), one sequence in flight
+    /// each; absent takes 256. A model with no state rows seats by pages alone.
+    pub max_state_slots: Option<u32>,
+    /// Where to persist the pipeline cache between runs. **Omit for an
+    /// in-process cache**, which is correct and pays the pipeline compiles
+    /// again on every boot.
+    pub pipeline_cache: Option<PathBuf>,
+    /// How much device memory the adapter has (`"16GiB"`), for a backend that
+    /// publishes none. **Omit on Vulkan**, where the shell reads the
+    /// device-local heap itself; a backend that reports nothing otherwise
+    /// assumes 8GiB, which is what this key is for overriding.
+    pub device_memory: Option<ByteSize>,
+}
+
+impl Default for WgpuEngineOptions {
+    fn default() -> Self {
+        Self {
+            adapter_index: 0,
+            backends: None,
+            power_preference: "high-performance".to_string(),
+            gpu_mem_utilization: 0.90,
+            max_total_pages: None,
+            max_forward_tokens: 10240,
+            max_forward_requests: 512,
+            max_state_slots: None,
+            pipeline_cache: None,
+            device_memory: None,
+        }
+    }
+}
+
+impl WgpuEngineOptions {
+    pub(super) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.gpu_mem_utilization.is_finite()
+                && self.gpu_mem_utilization > 0.0
+                && self.gpu_mem_utilization <= 1.0,
+            "engine.gpu_mem_utilization must be finite and in (0.0, 1.0]"
+        );
+        // The three wgpu spells. Checked here rather than at boot so a typo is
+        // a config refusal naming the alternatives, not an adapter request
+        // that quietly ranked nothing.
+        ensure!(
+            matches!(
+                self.power_preference.as_str(),
+                "high-performance" | "low-power" | "none"
+            ),
+            "engine.power_preference must be one of \"high-performance\", \
+             \"low-power\", \"none\"; got {:?}",
+            self.power_preference
+        );
+        // Present means the operator chose a size, so a present zero is a
+        // contradiction rather than a way to say "derive".
+        if let Some(pages) = self.max_total_pages {
+            ensure!(
+                pages > 0,
+                "engine.max_total_pages must be > 0; \
+                 omit it to derive from gpu_mem_utilization"
+            );
+        }
+        ensure!(
+            self.max_forward_tokens > 0,
+            "engine.max_forward_tokens must be > 0"
+        );
+        ensure!(
+            self.max_forward_requests > 0,
+            "engine.max_forward_requests must be > 0"
+        );
+        // Stated means the operator is correcting a backend that reports
+        // nothing, so a stated zero is a contradiction, not a way to say
+        // "ask the backend".
+        if let Some(memory) = self.device_memory {
+            ensure!(
+                memory.as_bytes() > 0,
+                "engine.device_memory must be > 0; \
+                 omit it to read the adapter's own answer"
+            );
+        }
+        Ok(())
     }
 }
 

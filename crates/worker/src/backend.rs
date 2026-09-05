@@ -16,12 +16,16 @@ use anyhow::{Context, Result, anyhow};
 #[cfg(feature = "cuda")]
 use runtime::engine::backend::{DeviceBoot, Graphs, Knobs, Recording, ordinal_of};
 
+use crate::backend::flavor::Flavor;
 use crate::config;
 #[cfg(any(feature = "cuda", test))]
 use crate::config::CudaNativeEngineOptions;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 use crate::config::MetalEngineOptions;
-use crate::backend::flavor::Flavor;
+#[cfg(feature = "vulkan")]
+use crate::config::VulkanEngineOptions;
+#[cfg(feature = "wgpu")]
+use crate::config::WgpuEngineOptions;
 
 /// Per-flavor engine options, passed to native-engine creation helpers. `Clone`
 /// exists so `serve.rs` can rebuild a per-group variant.
@@ -31,6 +35,10 @@ pub enum EngineOptions {
     CudaNative(CudaNativeEngineOptions),
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     Metal(MetalEngineOptions),
+    #[cfg(feature = "vulkan")]
+    Vulkan(VulkanEngineOptions),
+    #[cfg(feature = "wgpu")]
+    Wgpu(WgpuEngineOptions),
 }
 
 impl EngineOptions {
@@ -41,8 +49,14 @@ impl EngineOptions {
             EngineOptions::CudaNative(_) => Flavor::Cuda,
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             EngineOptions::Metal(_) => Flavor::Metal,
+            #[cfg(feature = "vulkan")]
+            EngineOptions::Vulkan(_) => Flavor::Vulkan,
+            #[cfg(feature = "wgpu")]
+            EngineOptions::Wgpu(_) => Flavor::Wgpu,
             #[cfg(not(any(
                 feature = "cuda",
+                feature = "vulkan",
+                feature = "wgpu",
                 all(feature = "metal", target_vendor = "apple")
             )))]
             _ => unreachable!("`EngineOptions` has no variants in this build"),
@@ -210,6 +224,10 @@ fn dump_device_boot(boot: &DeviceBoot, group_id: usize, rank: Option<usize>) {
 /// ceilings, and land the checkpoint. Reaching the tracer through
 /// `runtime::engine::load` keeps `model` out of this crate's dependency
 /// graph.
+// The eight are the load's own inputs — the engine, where the checkpoint is,
+// the ceilings, and the four facts a landing states. Grouping them into a
+// struct would move the same list one level out.
+#[allow(clippy::too_many_arguments)]
 fn land(
     backend: &mut runtime::engine::EngineBox,
     snapshot_dir: &Path,
@@ -384,6 +402,9 @@ pub(crate) fn create_engine_backend_group(
                   every path that takes one diverges"
     )
 )]
+// One per engine knob a boot states, and they are not a set that composes:
+// each is read by a different arm below.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_engine_backend(
     options: &EngineOptions,
     snapshot_dir: &Path,
@@ -412,6 +433,8 @@ pub(crate) fn create_engine_backend(
     ) = match options {
         #[cfg(not(any(
             feature = "cuda",
+            feature = "vulkan",
+            feature = "wgpu",
             all(feature = "metal", target_vendor = "apple")
         )))]
         _ => unreachable!("`EngineOptions` has no variants in this build"),
@@ -481,6 +504,100 @@ pub(crate) fn create_engine_backend(
                     max_images: patch_ceilings.1,
                 },
                 model_ir::Platform::Metal,
+            )
+        }
+        // Same shape as the Metal arm: an in-memory `[vulkan]` document is the
+        // whole boot. The device is a number rather than a selector string,
+        // because Vulkan enumerates its physical devices.
+        #[cfg(feature = "vulkan")]
+        EngineOptions::Vulkan(opts) => {
+            // `{:?}` keeps the decimal point; `{}` on `1.0` reads as an integer in TOML.
+            let mut boot_doc = format!(
+                "[vulkan]\ndevice_index = {}\ngpu_mem_utilization = {:?}\nvalidation = {}\n",
+                opts.device_index, opts.gpu_mem_utilization, opts.validation
+            );
+            // Quoted through `toml::Value` so an unusual path cannot break the document.
+            if let Some(cache) = &opts.pipeline_cache {
+                boot_doc.push_str(&format!(
+                    "pipeline_cache = {}\n",
+                    toml::Value::String(cache.display().to_string())
+                ));
+            }
+            let backend = runtime::engine::backend::open::vulkan(boot_doc.as_bytes())?;
+            // No page-geometry knob on this table: the shell has no planner to
+            // derive one and the contract's default is the geometry every
+            // deployment has run.
+            let defaults = engine::Budgets::default();
+            (
+                backend,
+                engine::Budgets {
+                    max_lanes: opts.max_forward_requests.max(1),
+                    max_tokens: opts.max_forward_tokens.max(1),
+                    buckets: Vec::new(),
+                    max_adapters: adapters.seats(),
+                    page_size: defaults.page_size,
+                    max_context: defaults.max_context,
+                    // Seats are state slots, not pool pages: a stateless model
+                    // admits by pages alone and this number never seats it.
+                    slots: opts.max_state_slots.unwrap_or(256).max(1),
+                    pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
+                    max_patches: patch_ceilings.0,
+                    max_images: patch_ceilings.1,
+                },
+                model_ir::Platform::Vulkan,
+            )
+        }
+        // Same shape again, over the `[wgpu]` table. Two keys the Vulkan arm
+        // has no analogue for ride along: `backends` narrows which backends
+        // the instance may enumerate, and `power_preference` ranks the
+        // adapters inside that set.
+        #[cfg(feature = "wgpu")]
+        EngineOptions::Wgpu(opts) => {
+            // `{:?}` keeps the decimal point; `{}` on `1.0` reads as an integer in TOML.
+            // Strings go through `toml::Value` so an odd one cannot break the document.
+            let mut boot_doc = format!(
+                "[wgpu]\nadapter_index = {}\ngpu_mem_utilization = {:?}\npower_preference = {}\n",
+                opts.adapter_index,
+                opts.gpu_mem_utilization,
+                toml::Value::String(opts.power_preference.clone()),
+            );
+            if let Some(backends) = &opts.backends {
+                boot_doc.push_str(&format!(
+                    "backends = {}\n",
+                    toml::Value::String(backends.clone())
+                ));
+            }
+            if let Some(cache) = &opts.pipeline_cache {
+                boot_doc.push_str(&format!(
+                    "pipeline_cache = {}\n",
+                    toml::Value::String(cache.display().to_string())
+                ));
+            }
+            // Absent means "ask the adapter"; the shell's own default stands
+            // in when the backend publishes nothing.
+            if let Some(memory) = opts.device_memory {
+                boot_doc.push_str(&format!("device_memory = {}\n", memory.as_bytes()));
+            }
+            let backend = runtime::engine::backend::open::wgpu(boot_doc.as_bytes())?;
+            // No page-geometry knob on this table either; see the arm above.
+            let defaults = engine::Budgets::default();
+            (
+                backend,
+                engine::Budgets {
+                    max_lanes: opts.max_forward_requests.max(1),
+                    max_tokens: opts.max_forward_tokens.max(1),
+                    buckets: Vec::new(),
+                    max_adapters: adapters.seats(),
+                    page_size: defaults.page_size,
+                    max_context: defaults.max_context,
+                    // Seats are state slots, not pool pages: a stateless model
+                    // admits by pages alone and this number never seats it.
+                    slots: opts.max_state_slots.unwrap_or(256).max(1),
+                    pages: opts.max_total_pages.unwrap_or(defaults.pages).max(1),
+                    max_patches: patch_ceilings.0,
+                    max_images: patch_ceilings.1,
+                },
+                model_ir::Platform::Wgpu,
             )
         }
     };
@@ -657,6 +774,30 @@ pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<E
                 .try_into()
                 .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
             Ok(EngineOptions::Metal(p))
+        }
+        // No device selector either: which physical device to bind is
+        // `[engine] device_index`, an option key, not the `device` list.
+        #[cfg(feature = "vulkan")]
+        Flavor::Vulkan => {
+            let v: VulkanEngineOptions = m
+                .engine
+                .options
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
+            Ok(EngineOptions::Vulkan(v))
+        }
+        // No device selector either: which adapter to bind is
+        // `[engine] adapter_index`, an option key, not the `device` list.
+        #[cfg(feature = "wgpu")]
+        Flavor::Wgpu => {
+            let w: WgpuEngineOptions = m
+                .engine
+                .options
+                .clone()
+                .try_into()
+                .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
+            Ok(EngineOptions::Wgpu(w))
         }
     }
 }

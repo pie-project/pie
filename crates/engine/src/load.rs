@@ -167,7 +167,8 @@ impl Residency {
                         "weight residency: `{field}` is {budget} bytes and this load demands \
                          {demand} bytes on the {tier} tier. That demand is what the engine \
                          has already reduced to as far as its tiers allow — routed expert \
-                         banks stream, dense planes do not — so the budget \
+                         banks stream and dense planes rotate through a ring, and what is \
+                         left is what must stay resident — so the budget \
                          cannot be met by holding less of it. Raise the budget, or state \
                          `None` for uncapped."
                     )));

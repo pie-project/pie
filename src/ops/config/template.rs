@@ -1,8 +1,8 @@
 //! Default `config.toml` emitted by `pie config init`.
 //!
 //! The compiled flavor picks the `[engine]` block, so the generated file
-//! works without a follow-up edit. There are TWO candidates — CUDA and, on
-//! Apple hardware, Metal — and a binary carrying neither has no block to
+//! works without a follow-up edit. There are FOUR candidates — CUDA, Vulkan,
+//! wgpu, and on Apple hardware Metal — and a binary carrying none has no block to
 //! write and says so, rather than writing a file it knows will not parse.
 //!
 //! Five live sections, plus a commented `[cluster]` for distributed
@@ -30,6 +30,10 @@ pub fn default_config_content() -> Result<String> {
         // cannot disagree about which builds have it.
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         Some(flavor::Flavor::Metal) => Some(METAL_ENGINE_BLOCK),
+        #[cfg(feature = "vulkan")]
+        Some(flavor::Flavor::Vulkan) => Some(VULKAN_ENGINE_BLOCK),
+        #[cfg(feature = "wgpu")]
+        Some(flavor::Flavor::Wgpu) => Some(WGPU_ENGINE_BLOCK),
         // `default_flavor` answers `None` when this binary carries no engine,
         // and `worker` may compile a flavor while this crate's matching arm is
         // cfg'd off (workspace feature-unification can desync the two). Both
@@ -42,7 +46,8 @@ pub fn default_config_content() -> Result<String> {
         bail!(
             "this pie binary carries no engine, so there is no `[engine]` \
              section to write and the config would not parse. Rebuild with \
-             `--features cuda` or, on Apple hardware, `--features metal`."
+             `--features cuda`, `--features vulkan`, `--features wgpu`, or, \
+             on Apple hardware, `--features metal`."
         );
     };
     // ONE MODEL BLOCK for both flavors: the catalog SKU below loads on either,
@@ -187,9 +192,62 @@ total_pages  = 1024         # derive a geometry, so these two ARE the pool
 # max_state_slots      = 256    # recurrent-state seats (hybrid models)
 "#;
 
-// There is no Vulkan or WGPU engine block: no build hosts those engines. A
-// `[engine] type = "vulkan"` config still PARSES — `EngineKind` keeps both
-// names — and is refused at boot by `flavor::retired_msg`.
+// `test` as well as the feature, for the reason the CUDA block carries it.
+//
+// EVERY KEY BELOW IS ONE `VulkanEngineOptions` DECLARES
+// (`worker::config::backend`), with that struct's own default as its value.
+// Unlike Metal's, this table IS deserialized with `deny_unknown_fields` by
+// `EngineConfig::validate`, so a stray key here would be refused rather than
+// ignored — which the template/flavor agreement test would catch.
+#[cfg(any(feature = "vulkan", test))]
+const VULKAN_ENGINE_BLOCK: &str = r#"
+[engine]
+# Which keys are valid here depends on `type`: the common ones below, plus
+# whatever the named engine accepts. `tensor_parallel_size` is not among them
+# for this engine — the Vulkan shell serves one device.
+type = "vulkan"
+device = ["vulkan:0"]
+activation_dtype = "bfloat16"
+device_index = 0            # vkEnumeratePhysicalDevices order; 0 is the first
+gpu_mem_utilization = 0.90  # of the device-local heap: weights, kv pool, scratch
+# max_total_pages      = 4096   # omit: derived from gpu_mem_utilization
+# max_forward_tokens   = 10240  # omit for the engine's own defaults
+# max_forward_requests = 512    # (max_concurrent_processes derives from this)
+# max_state_slots      = 256    # recurrent-state seats (hybrid models)
+# validation           = false  # VK_LAYER_KHRONOS_validation; diagnostic only
+# pipeline_cache       = "/path/to/pipeline.bin"  # omit for in-memory only
+"#;
+
+// `test` as well as the feature, for the reason the CUDA block carries it.
+//
+// EVERY KEY BELOW IS ONE `WgpuEngineOptions` DECLARES
+// (`worker::config::backend`), with that struct's own default as its value.
+// Like Vulkan's and unlike Metal's, this table IS deserialized with
+// `deny_unknown_fields` by `EngineConfig::validate`, so a stray key here would
+// be refused rather than ignored — which the agreement test below would catch.
+#[cfg(any(feature = "wgpu", test))]
+const WGPU_ENGINE_BLOCK: &str = r#"
+[engine]
+# Which keys are valid here depends on `type`: the common ones below, plus
+# whatever the named engine accepts. `tensor_parallel_size` is not among them
+# for this engine — the wgpu shell serves one adapter.
+type = "wgpu"
+device = ["wgpu:0"]
+activation_dtype = "bfloat16"
+adapter_index = 0           # enumeration order among the reachable adapters
+# backends = "vulkan"           # omit for every backend this build carries
+gpu_mem_utilization = 0.90  # of the device-local heap: weights, kv pool, scratch
+# power_preference     = "high-performance"  # or "low-power", "none"
+# max_total_pages      = 4096   # omit: derived from gpu_mem_utilization
+# max_forward_tokens   = 10240  # omit for the engine's own defaults
+# max_forward_requests = 512    # (max_concurrent_processes derives from this)
+# max_state_slots      = 256    # recurrent-state seats (hybrid models)
+# device_memory        = "16GiB"  # omit unless the backend reports none
+# pipeline_cache       = "/path/to/pipeline.bin"  # omit for in-process only
+"#;
+
+// EVERY engine `EngineKind` names now has a block: the "named but hosted by no
+// build" note that stood here is gone with the flavor it was about.
 
 #[cfg(test)]
 mod tests {
@@ -201,6 +259,32 @@ mod tests {
         // not parse is the worst possible first impression.
         let content = config_content_with_any_engine();
         worker::Config::parse(&content).expect("generated config must parse");
+    }
+
+    /// The Vulkan block's keys are `VulkanEngineOptions`' keys.
+    ///
+    /// Rendered whatever this test run compiled, like the CUDA block above —
+    /// and it is the block that most needs the check, because the Vulkan arm
+    /// of `EngineConfig::validate` deserializes the options table with
+    /// `deny_unknown_fields`: a key this template invents is a REFUSAL on the
+    /// operator's first `pie serve`, not a line quietly ignored.
+    #[test]
+    fn the_vulkan_block_states_only_keys_the_engine_declares() {
+        let content = format!("{HEADER}{DEFAULT_MODEL_BLOCK}{VULKAN_ENGINE_BLOCK}{TAIL}");
+        worker::Config::parse(&content).expect("the vulkan template must parse");
+    }
+
+    /// The wgpu block's keys are `WgpuEngineOptions`' keys.
+    ///
+    /// Rendered whatever this test run compiled, like the two blocks above,
+    /// and for the Vulkan block's reason: the wgpu arm of
+    /// `EngineConfig::validate` deserializes the options table with
+    /// `deny_unknown_fields`, so a key this template invents is a REFUSAL on
+    /// the operator's first `pie serve`, not a line quietly ignored.
+    #[test]
+    fn the_wgpu_block_states_only_keys_the_engine_declares() {
+        let content = format!("{HEADER}{DEFAULT_MODEL_BLOCK}{WGPU_ENGINE_BLOCK}{TAIL}");
+        worker::Config::parse(&content).expect("the wgpu template must parse");
     }
 
     #[test]
@@ -229,6 +313,10 @@ mod tests {
             Some(flavor::Flavor::Cuda) => Some("cuda_native"),
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
             Some(flavor::Flavor::Metal) => Some("metal"),
+            #[cfg(feature = "vulkan")]
+            Some(flavor::Flavor::Vulkan) => Some("vulkan"),
+            #[cfg(feature = "wgpu")]
+            Some(flavor::Flavor::Wgpu) => Some("wgpu"),
             // No flavor, no claim to check -- the refusal is pinned by
             // `a_binary_without_an_engine_refuses_instead_of_writing_one`.
             #[allow(unreachable_patterns)]
@@ -241,5 +329,4 @@ mod tests {
             "template does not select the compiled flavor {expected:?}"
         );
     }
-
 }

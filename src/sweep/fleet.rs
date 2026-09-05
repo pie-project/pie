@@ -156,4 +156,3 @@ pub async fn run(addr: &str, program: &str, inputs: &[String]) -> FleetRun {
         failures,
     }
 }
-

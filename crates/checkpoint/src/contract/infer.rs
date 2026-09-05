@@ -6,7 +6,9 @@ use crate::error::{Error, OrOverflow};
 use crate::types::{Axis, DType, Encoding, RepackLayout, RepackSpec, TILED_BAND, TILED_STEP};
 
 use super::compile;
-use super::{BiasBy, Expr, Partition, ScaleFactor, TensorType, local_range, resolve_extents};
+use super::{
+    BiasBy, Expr, Partition, ScaleFactor, TensorType, UnaryOp, local_range, resolve_extents,
+};
 
 /// Resolves [`Expr::Src`] names against a checkpoint.
 pub trait CheckpointTypes {
@@ -248,6 +250,10 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
         Expr::Cast { src, to } => {
             let ty = infer(src, scope)?;
             infer_cast(&ty, to)
+        }
+        Expr::Unary { src, op } => {
+            let ty = infer(src, scope)?;
+            infer_unary(ty, *op)
         }
         Expr::Bias { src, by } => {
             let ty = infer(src, scope)?;
@@ -998,6 +1004,30 @@ fn infer_scale(ty: TensorType, factor_bits: u32) -> Result<TensorType, Error> {
 /// A `Bias` yields its operand's type, admitting the same operands
 /// `infer_scale` does and for the same reasons. Zero is refused (same
 /// unset-field hazard); unlike `Scale`, 1.0 is a real bias and stays legal.
+/// A `Unary` keeps shape and dtype: it is a function of one element, so
+/// there is nothing for it to change but the value. Quantized operands are
+/// refused for the reason `Bias` refuses them — a code word is not a number
+/// until its scales are named.
+fn infer_unary(ty: TensorType, op: UnaryOp) -> Result<TensorType, Error> {
+    let dtype = match ty.encoding {
+        Encoding::Raw(dtype) => dtype,
+        Encoding::Quant(_) => {
+            return Err(Error::Contract(format!(
+                "{op:?} of a quantized tensor ({:?}) is not supported; a code \
+                 word means nothing to apply a function to until its scales \
+                 are named",
+                ty.encoding
+            )));
+        }
+    };
+    if !matches!(dtype, DType::F32 | DType::F16 | DType::Bf16) {
+        return Err(Error::Contract(format!(
+            "{op:?} requires F32, F16 or BF16 elements, got {dtype:?}"
+        )));
+    }
+    Ok(ty)
+}
+
 fn infer_bias(ty: TensorType, by_bits: u32) -> Result<TensorType, Error> {
     let dtype = match ty.encoding {
         Encoding::Raw(dtype) => dtype,

@@ -149,39 +149,57 @@ fn split_shard_name(path: &Path) -> Option<(String, u32, u32)> {
 /// the hand-made name is the more specific statement.
 const ZT_NAMES: [&str; 2] = ["model.zt", "archive.zt"];
 
-/// Which `.zt` in this directory is the artifact — fixed names first,
-/// then the specialization import named for what it is.
+/// **EVERY** artifact this directory holds, in sorted order — fixed names
+/// first, then the specializations the import named for what they are.
 ///
-/// Public because the store asks the same question
-/// (`src/local/store.rs`, `crates/worker/src/weights.rs`); two
-/// implementations of "which of these files is a root" is one too many.
-pub fn discover_zt_file(snapshot_dir: &Path) -> Option<PathBuf> {
+/// One directory, N artifacts, is the case the naming exists to serve:
+/// `pie model import` writes `<slug>.<sku>.<backend>.zt` precisely so that
+/// one model at two quantizations, or for two shells, can share a
+/// directory. So the plural question is the one this answers, and the
+/// callers that need a single file
+/// ([`discover_zt_file`], `crates/worker/src/weights.rs`) narrow this
+/// result rather than asking a second, differently-shaped question of the
+/// filesystem — the store scan and the worker's resolution are not allowed
+/// to disagree about what is in a directory.
+///
+/// [`ZT_NAMES`] keep their precedence and remain singular: a directory
+/// with an `archive.zt` in it holds one artifact by that name, whatever
+/// else is beside it.
+pub fn discover_zt_files(snapshot_dir: &Path) -> Vec<PathBuf> {
     if snapshot_dir.is_file()
         && snapshot_dir
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("zt"))
     {
-        return Some(snapshot_dir.to_path_buf());
+        return vec![snapshot_dir.to_path_buf()];
     }
     if let Some(named) = ZT_NAMES
         .iter()
         .map(|name| snapshot_dir.join(name))
         .find(|named| named.is_file())
     {
-        return Some(named);
+        return vec![named];
     }
-    // Then the specialized names: `pie model import` names a servable
-    // artifact `<slug>.<sku>.<backend>.zt`, since one
-    // model at two quantizations or shells needs two files in one
-    // directory. Exactly one match, or none — coexistence is the point,
-    // so ambiguity is refused rather than guessed at.
-    let mut found = specialized_zt_files(snapshot_dir);
+    specialized_zt_files(snapshot_dir)
+}
+
+/// Which `.zt` in this directory is *the* artifact, when the directory
+/// holds exactly one.
+///
+/// The narrowing of [`discover_zt_files`] for a caller that was handed a
+/// directory and no way to say which of several artifacts it meant —
+/// loading through [`parse_metadata`], mostly. Ambiguity stays a refusal
+/// here: a load that picked one of three would serve a backend the caller
+/// never named. A caller that *can* say which one it wants (the store's
+/// listing, the worker's engine flavor) asks the plural question instead.
+pub fn discover_zt_file(snapshot_dir: &Path) -> Option<PathBuf> {
+    let mut found = discover_zt_files(snapshot_dir);
     (found.len() == 1).then(|| found.remove(0))
 }
 
 /// Every `*.zt` in `snapshot_dir` that is not one of [`ZT_NAMES`], sorted.
 ///
-/// Split out from [`discover_zt_file`] so the ambiguous case (two
+/// Split out from [`discover_zt_files`] so the ambiguous case (two
 /// specializations present) can be named rather than fallen through to a
 /// misleading "no model.safetensors".
 fn specialized_zt_files(snapshot_dir: &Path) -> Vec<PathBuf> {
@@ -402,3 +420,85 @@ pub fn verify_declared_files(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch(path: &Path) {
+        std::fs::write(path, b"stand-in for an artifact").unwrap();
+    }
+
+    /// **A DIRECTORY HOLDS AS MANY ARTIFACTS AS IT HOLDS.**
+    ///
+    /// The regression this plural sibling exists for: the singular
+    /// discovery answered `None` for a directory with two specializations
+    /// in it, which is the case `<slug>.<sku>.<backend>.zt` was invented to
+    /// allow — so a store holding one model for two shells listed neither
+    /// of them and served neither by name.
+    #[test]
+    fn a_directory_of_specializations_discovers_all_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cuda = dir.path().join("glm.glm53-flash-u8g64-kv-bf16.cuda.zt");
+        let vulkan = dir.path().join("glm.glm53-flash-u8g64-kv-bf16.vulkan.zt");
+        touch(&cuda);
+        touch(&vulkan);
+
+        assert_eq!(discover_zt_files(dir.path()), vec![cuda, vulkan]);
+        assert_eq!(
+            discover_zt_file(dir.path()),
+            None,
+            "a caller that cannot say which one it means still gets a refusal"
+        );
+    }
+
+    /// One specialization is one artifact, to both questions.
+    #[test]
+    fn a_lone_specialization_is_the_answer_to_both_questions() {
+        let dir = tempfile::tempdir().unwrap();
+        let only = dir.path().join("glm.glm53-flash-u8g64-kv-bf16.cuda.zt");
+        touch(&only);
+
+        assert_eq!(discover_zt_files(dir.path()), vec![only.clone()]);
+        assert_eq!(discover_zt_file(dir.path()), Some(only));
+    }
+
+    /// `ZT_NAMES` keep their precedence, and stay singular.
+    ///
+    /// A directory with an `archive.zt` holds one artifact by that name
+    /// whatever is beside it — the fixed name is the more specific
+    /// statement, and the plural discovery does not turn a leftover
+    /// sibling into a second entry.
+    #[test]
+    fn a_fixed_name_wins_over_everything_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.zt");
+        touch(&archive);
+        touch(&dir.path().join("glm.glm53-flash-u8g64-kv-bf16.cuda.zt"));
+        assert_eq!(discover_zt_files(dir.path()), vec![archive.clone()]);
+
+        // And `model.zt` ahead of `archive.zt`, as before.
+        let model = dir.path().join("model.zt");
+        touch(&model);
+        assert_eq!(discover_zt_files(dir.path()), vec![model]);
+    }
+
+    /// A `.zt` path names itself, however it is asked.
+    #[test]
+    fn a_file_names_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("solo.zt");
+        touch(&file);
+        assert_eq!(discover_zt_files(&file), vec![file.clone()]);
+        assert_eq!(discover_zt_file(&file), Some(file));
+    }
+
+    /// A directory with no `.zt` in it discovers nothing, rather than
+    /// erroring: "which files are here" is a question with an empty answer.
+    #[test]
+    fn a_directory_without_artifacts_discovers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("model.safetensors"));
+        assert!(discover_zt_files(dir.path()).is_empty());
+        assert_eq!(discover_zt_file(dir.path()), None);
+    }
+}

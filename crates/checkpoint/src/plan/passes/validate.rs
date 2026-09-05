@@ -56,8 +56,9 @@ pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
 
         // Writes that name their destination.
         let named: &[BufferId] = match instr {
-            StorageInstr::ExtentWrite { dest, .. }
-            | StorageInstr::GatherWrite { dest, .. } => std::slice::from_ref(&dest.buffer),
+            StorageInstr::ExtentWrite { dest, .. } | StorageInstr::GatherWrite { dest, .. } => {
+                std::slice::from_ref(&dest.buffer)
+            }
             StorageInstr::TileMap { outputs, .. } => outputs.as_slice(),
             _ => &[],
         };
@@ -127,7 +128,11 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
         let supported = advertised
             && (matches!(
                 kind,
-                TileMapKind::Cast | TileMapKind::Reblock | TileMapKind::Scale | TileMapKind::Bias
+                TileMapKind::Cast
+                    | TileMapKind::Reblock
+                    | TileMapKind::Scale
+                    | TileMapKind::Bias
+                    | TileMapKind::Unary
             ) || (*kind == TileMapKind::Encode
                 && matches!(
                     transform.to,
@@ -174,6 +179,18 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                      `pie model import` on the source checkpoint — the encode runs there, \
                      once, and the artifact it writes holds the codes this load wants.",
                     transform.from, transform.to
+                )));
+            }
+            // And for a unary: it is a function of the stored values, so
+            // the artifact holds its answer and a serving load reads that.
+            if *kind == TileMapKind::Unary {
+                return Err(Error::Unsupported(format!(
+                    "this load would apply {:?} on the way in, and a serving plan does \
+                     not: the function is of the checkpoint's values, so it is paid once \
+                     per weight rather than once per boot. Run `pie model import` on the \
+                     source checkpoint — the function runs there, and the artifact it \
+                     writes holds the values this load reads.",
+                    transform.unary
                 )));
             }
             // Same reasoning for a repack: paid once per weight, not once
@@ -238,12 +255,17 @@ pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> 
 /// the exception [`validate_bound_encodings`] carries.
 fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
     match backend {
-        // The five ggml K-quants: `kernels_cuda::linear::kquant` reads the
-        // super-block row as one byte plane, decoding inside the dot. Not
-        // the 32-element blocks (q4_0/q4_1/q5_0/q5_1/q8_0, gguf mxfp4),
-        // whose CUDA point reads a leaf-per-plane operand instead, and not
-        // the IQ lattices, which have no CUDA signature at all.
-        BackendKind::Cuda => matches!(
+        // The five ggml K-quants: `kernels_cuda::linear::kquant`,
+        // `kernels_vulkan::linear::kquant` and `kernels_wgpu::linear::kquant`
+        // all read the super-block row as one byte plane, decoding inside
+        // the dot. Not the 32-element blocks (q4_0/q4_1/q5_0/q5_1/q8_0,
+        // gguf mxfp4), whose CUDA point reads a leaf-per-plane operand
+        // instead, and not the IQ lattices, which no backend signs.
+        //
+        // Reading them as stored is what keeps a GGUF the size it was: the
+        // alternative is decoding to the activation dtype at import, which
+        // inflates a K-quant checkpoint four- to eightfold.
+        BackendKind::Cuda | BackendKind::Vulkan | BackendKind::Wgpu => matches!(
             scheme,
             QuantScheme::GgufQ2K
                 | QuantScheme::GgufQ3K
@@ -251,10 +273,10 @@ fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
                 | QuantScheme::GgufQ5K
                 | QuantScheme::GgufQ6K
         ),
-        // Metal has no stored-block point, and Vulkan is out of the
-        // workspace. `Unknown` never reaches here (the host arm above
-        // returns first).
-        BackendKind::Metal | BackendKind::Vulkan | BackendKind::Unknown => false,
+        // Metal has no stored-block point and decodes to the activation
+        // dtype before the dot. `Unknown` never reaches here (the host arm
+        // above returns first).
+        BackendKind::Metal | BackendKind::Unknown => false,
     }
 }
 
@@ -431,4 +453,62 @@ pub(super) fn validate_persistent_layout(program: &mut LoadPlan) -> Result<usize
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::binds_block;
+    use crate::types::{BackendKind, QuantScheme};
+
+    /// The five K-quants carry their scales inside the payload, so a backend
+    /// either has a stored-block point or the plan must decode them. Three do.
+    #[test]
+    fn the_k_quants_bind_on_every_backend_with_a_stored_block_point() {
+        let k_quants = [
+            QuantScheme::GgufQ2K,
+            QuantScheme::GgufQ3K,
+            QuantScheme::GgufQ4K,
+            QuantScheme::GgufQ5K,
+            QuantScheme::GgufQ6K,
+        ];
+        for scheme in k_quants {
+            for backend in [BackendKind::Cuda, BackendKind::Vulkan, BackendKind::Wgpu] {
+                assert!(
+                    binds_block(backend, scheme),
+                    "{backend:?} has a {scheme:?} point and should bind it as stored"
+                );
+            }
+            assert!(
+                !binds_block(BackendKind::Metal, scheme),
+                "Metal has no stored-block point and must decode {scheme:?}"
+            );
+        }
+    }
+
+    /// The 32-element blocks and the IQ lattices are NOT the K family: no
+    /// backend here reads them as stored, so a plan must decode them.
+    #[test]
+    fn the_small_blocks_and_the_lattices_bind_nowhere() {
+        for scheme in [
+            QuantScheme::GgufQ4_0,
+            QuantScheme::GgufQ4_1,
+            QuantScheme::GgufQ5_0,
+            QuantScheme::GgufQ5_1,
+            QuantScheme::GgufQ8_0,
+            QuantScheme::GgufIq4Nl,
+            QuantScheme::GgufIq4Xs,
+        ] {
+            for backend in [
+                BackendKind::Cuda,
+                BackendKind::Vulkan,
+                BackendKind::Wgpu,
+                BackendKind::Metal,
+            ] {
+                assert!(
+                    !binds_block(backend, scheme),
+                    "{backend:?} reads no {scheme:?} block as stored"
+                );
+            }
+        }
+    }
 }

@@ -55,6 +55,11 @@ pub enum BackendKind {
     Cuda,
     Metal,
     Vulkan,
+    /// The portable wgpu shell. Its own kind rather than a fold onto
+    /// `Vulkan`, because a `.wgpu.zt` is its own artifact: the two shells
+    /// may pick different tile-map masks and a stamp that said `vulkan`
+    /// would name a plan this backend never compiled.
+    Wgpu,
     Unknown,
 }
 

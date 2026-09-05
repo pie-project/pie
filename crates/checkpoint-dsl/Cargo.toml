@@ -21,3 +21,8 @@ model-dsl = { path = "../model-dsl" }
 # The container a checkpoint is: a `Builder` reads the file's own stored facts
 # before choosing between an identity read, a cast, and a refusal.
 ztensor = { workspace = true }
+
+[dev-dependencies]
+# The tests below write a one-tensor `.zt` and read it back; nothing here
+# needs a fixture that outlives the test that made it.
+tempfile = "3"
