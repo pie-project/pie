@@ -870,14 +870,24 @@ async fn main(input: Input) -> Result<Output> {
                 .map_err(|why| format!("alloc {} rs buffer page(s): {why}", buffer_pages - have))?;
         }
         let fold_none = Channel::from([0u32]).named("fold_none");
-        let fold_len = Channel::from([survivors]).named("fold_len_v");
 
         // ── the gate: a round the loop is losing on drafts nothing ──────
-        //    A gated round is the SAME verify fire at one row, so it carries
-        //    the pending fold and buffers its own row exactly as a wide one
-        //    does. Nothing about the fold-commit contract changes; only the
-        //    width, and whether a draft fire ran before it.
+        //    A gated round is a one-row fire, and it FOLDS EVERYTHING: the
+        //    pending survivors and its own row, so nothing stays buffered
+        //    behind it. The first version left one row buffered and replayed
+        //    it every fire, which put every gated fire on the committed
+        //    path — a two-row scan, the conv's replay and a run of buffer
+        //    copies a lane — where the baseline's fire folds directly.
+        //    Measured at eight concurrent on prose (128 tokens, floor 3.5):
+        //    the gate closed on 71 of 86 fires and the loop still read 17.8
+        //    tok/s against the baseline's 25.9. Once the buffer is empty a
+        //    gated fire binds the baseline's own geometry (no fold, no
+        //    buffer) and IS the baseline's fire; the next drafting round
+        //    starts from zero survivors, which the contract allows.
         let drafting = gate.drafts();
+        let fold_all = survivors + 1;
+        let fold_len =
+            Channel::from([if drafting { survivors } else { fold_all }]).named("fold_len_v");
         let mut proposals_owned: Vec<i32> = Vec::new();
         if !drafting {
             verify = 1;
@@ -1043,9 +1053,17 @@ async fn main(input: Input) -> Result<Output> {
                 },
             }),
             &rs_set,
-            RsGeometry {
-                fold_len: Some(&fold_len),
-                buffer: 0..buffer_pages,
+            // A gated fire with nothing buffered behind it is the baseline's
+            // fire: direct fold, no buffer. Anything else folds through the
+            // buffer — the survivors, or on a gated fire the survivors and
+            // its own row.
+            if !drafting && survivors == 0 {
+                RsGeometry { fold_len: None, buffer: 0..0 }
+            } else {
+                RsGeometry {
+                    fold_len: Some(&fold_len),
+                    buffer: 0..buffer_pages,
+                }
             },
         )?;
         {
@@ -1081,7 +1099,9 @@ async fn main(input: Input) -> Result<Output> {
                 .map_err(|why| format!("discard {rejected} rejected row(s): {why}"))?;
             discarded += rejected as usize;
         }
-        survivors = kept as u32 + 1;
+        // A drafting round leaves its accepted prefix buffered for the next
+        // fire to fold; a gated one folded its own row already.
+        survivors = if drafting { kept as u32 + 1 } else { 0 };
         for tok in proposals[..kept].iter() {
             generated.push(*tok as u32);
         }
