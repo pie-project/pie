@@ -57,6 +57,9 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
     "driver",
     "runtime",
     "nvrtc",
+    # The tensor-parallel group opens its communicators here (`comm.rs`);
+    # the collectives themselves are `kernels-cuda`'s.
+    "nccl",
     "fallback-dynamic-loading",
 ] }
 

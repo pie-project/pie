@@ -15,11 +15,13 @@ pub mod boot;
 /// Routed-expert residency: pinned host copy of every expert, a device slab
 /// for some of them, and the indirection table a captured graph reads through.
 pub mod checkpoint_serving;
+pub mod comm;
 pub mod device;
 mod dispatch;
 mod error;
 pub mod experts;
 pub mod exports;
+pub mod group;
 pub mod inputs;
 pub mod mask;
 pub mod program;
@@ -70,7 +72,8 @@ pub fn lane_shifted(op: &str) -> bool {
 }
 
 
-pub use api::{ClassifyFor, ContractFor, Cuda, DeviceBoot};
+pub use api::{ClassifyFor, ContractFor, Cuda, DeviceBoot, World};
+pub use group::{Group, open_group};
 pub use kernels_cuda::{EntryInfo, Reads};
 pub use boot::{open, ordinal_of};
 pub use error::{Fault, Result};

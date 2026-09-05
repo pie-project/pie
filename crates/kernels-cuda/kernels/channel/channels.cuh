@@ -106,6 +106,14 @@ constexpr u32 TICKET_HOST_READER = 1u << 5;
 // word the guest owns simply has no flag naming it.
 constexpr u32 TICKET_ADVANCE_HEAD = 1u << 6;
 constexpr u32 TICKET_ADVANCE_TAIL = 1u << 7;
+// **A FOLLOWER RANK'S TICKET.** Under tensor parallelism every rank runs the
+// same pass over the same guest ring, but the ring's words and mirror belong
+// to rank 0's device: it alone votes on them, advances them and publishes
+// into them. A shadow ticket takes its vote as held (the host gate on the
+// same words already admitted the lane, and rank 0's `settle` may have moved
+// the word since), still pulls the host writer's cell at the host's predicted
+// ring position, and writes NOTHING durable — no word, no mirror.
+constexpr u32 TICKET_SHADOW = 1u << 8;
 
 // One host-visible channel endpoint as this fire predicted it
 // (channels.hpp:216-227 `DeviceHostChannelTicket`).
@@ -287,6 +295,11 @@ constexpr u32 PULL_CHUNK_WORDS = PULL_CHUNK / 32;
 // rather than a loop body walked by thread 0 (see the kernel below).
 __device__ __forceinline__ bool ticket_holds(const Ticket& ticket, u64& head, u64& tail)
 {
+    if ((ticket.flags & TICKET_SHADOW) != 0) {
+        head = 0;
+        tail = 0;
+        return true;
+    }
     head = load_system_acquire(ticket.words + 0);
     tail = load_system_acquire(ticket.words + 1);
     bool ok = true;
@@ -573,6 +586,7 @@ __global__ void scatter_publish(
         const Ticket ticket = tickets[lane.ticket_offset + index];
         const u32 outward = TICKET_PUBLISH | TICKET_HOST_READER;
         if ((ticket.flags & outward) != outward) continue;
+        if ((ticket.flags & TICKET_SHADOW) != 0) continue;
         if (ticket.mirror == nullptr || ticket.cells == nullptr) continue;
         const u32 ring = static_cast<u32>(ticket.expected_tail % ticket.cap1);
         const u8* source = ticket.cells + static_cast<usize>(ring) * ticket.native_bytes;
@@ -647,6 +661,7 @@ __global__ void settle(
     for (u32 index = threadIdx.x; index < lane.ticket_count; index += blockDim.x) {
         const Ticket ticket = tickets[lane.ticket_offset + index];
         if (ticket.words == nullptr) continue;
+        if ((ticket.flags & TICKET_SHADOW) != 0) continue;
         if ((ticket.flags & TICKET_ADVANCE_HEAD) != 0) {
             store_system_relaxed(ticket.words + 0, ticket.expected_head + 1);
         }

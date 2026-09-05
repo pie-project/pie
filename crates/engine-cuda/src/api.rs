@@ -47,10 +47,30 @@ pub type ClassifyFor = fn(&str) -> Option<model_ir::ClassifyFn>;
 /// [`LoadRequest::budgets`].
 // `Eq` left with [`Knobs`]'s: the knobs carry an `f64`, and total equality
 // over a float is a claim neither struct should make.
+/// Which rank of how wide a tensor-parallel group this shell is. A single
+/// device is rank 0 of 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct World {
+    pub rank: u32,
+    pub size: u32,
+}
+
+impl Default for World {
+    fn default() -> World {
+        World { rank: 0, size: 1 }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceBoot {
     /// Which device to bind.
     pub ordinal: i32,
+    /// This shell's rank and the group's width: the band of every cut weight
+    /// it lands, and whether the plan's collectives have peers.
+    pub world: World,
+    /// The group's communicator for this rank, opened by
+    /// [`open_group`](crate::open_group); `None` on a single device.
+    pub comm: Option<Arc<crate::comm::Comm>>,
     /// How much of a fire to record, from `[engine] graphs`.
     pub graphs: Graphs,
     /// The shell's own words, from the boot document's `[engine]` table.
@@ -71,6 +91,8 @@ impl Default for DeviceBoot {
     fn default() -> DeviceBoot {
         DeviceBoot {
             ordinal: 0,
+            world: World::default(),
+            comm: None,
             graphs: Graphs::default(),
             knobs: Knobs::default(),
             cache_dir: None,
@@ -173,6 +195,54 @@ impl Cuda {
     ///
     /// [`Error::Load`] before a load, [`Error::Closed`] for an instance
     /// this plane does not carry.
+    /// This shell's rank in its tensor-parallel group (0 when alone).
+    #[must_use]
+    pub fn rank(&self) -> u32 {
+        self.boot.world.rank
+    }
+
+        /// Rank 0's endpoint for channel `id`, for a follower to adopt.
+    #[must_use]
+    pub fn endpoint(&self, id: ChannelId) -> Option<Arc<crate::program::Endpoint>> {
+        self.channels.get(&id).cloned()
+    }
+
+    /// A tensor-parallel follower's `register_channel`: the host end is rank
+    /// 0's, shared. This rank's passes pull the guest's cells out of it and
+    /// never write a word or a cell of it (their sessions bind as shadows).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Program`] for an id already registered here.
+    pub fn adopt_channel(
+        &mut self,
+        id: ChannelId,
+        endpoint: Arc<crate::program::Endpoint>,
+    ) -> EngineResult<RegisteredChannel> {
+        if self.channels.contains_key(&id) {
+            return Err(Error::Program(format!(
+                "channel {id} is already registered on this engine"
+            )));
+        }
+        self.channels.insert(id, endpoint);
+        Ok(RegisteredChannel {
+            id,
+            reader_wait_id: 0,
+            writer_wait_id: 0,
+            // The mirror is published by rank 0's answer.
+            mirror: None,
+        })
+    }
+
+    /// Every bound instance's predicted channel cursors, in instance order.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Program`] before a load.
+    pub fn channel_predictions(&mut self) -> EngineResult<Vec<(u64, Vec<crate::program::Cursor>)>> {
+        Ok(self.loaded_mut()?.channel_predictions())
+    }
+
     fn instance(&mut self, id: InstanceId) -> EngineResult<&mut ProgramSession> {
         self.loaded_mut()?
             .program_instance(id)
@@ -209,7 +279,8 @@ impl Cuda {
         // every streamed bank) is the real question. A packed bank neither
         // budget holds is planned onto the mapped artifact instead of
         // refusing the load, if that artifact exists.
-        let prospect = crate::weights::prospect(trace, &contract, path).map_err(fault)?;
+        let prospect =
+            crate::weights::prospect(trace, &contract, path, self.target()).map_err(fault)?;
         let plan = crate::experts::Plan::cut(
             &prospect.ranking,
             crate::experts::Budgets {
@@ -234,6 +305,16 @@ impl Cuda {
             sourced,
         })?;
         Ok((contract, plan))
+    }
+
+    /// The band of the checkpoint this rank lands: rank `world.rank` of
+    /// `world.size` (every `Shard::Cut` segment whole on a single device).
+    fn target(&self) -> checkpoint::plan::StorageTarget {
+        checkpoint::plan::StorageTarget::for_backend(
+            checkpoint::types::BackendKind::Cuda,
+            self.boot.world.rank,
+            self.boot.world.size,
+        )
     }
 
     fn loaded_mut(&mut self) -> EngineResult<&mut Shell> {
@@ -563,7 +644,11 @@ intended for diagnostics, not serving",
         // Before the settle, before a plan, before any buffer: an artifact
         // written for another shell or another degree is refused by the
         // field that disagrees, not discovered by the tokens it produces.
-        refuse_an_artifact_for_another_deployment(&path, trace.platform.backend(), &trace.name)?;
+        refuse_an_artifact_for_another_deployment(
+            &path,
+            trace.platform.backend(),
+            width_free(&trace.name),
+        )?;
         let (contract, plan) = self.settle(&trace, &path, &residency)?;
 
         // Derived BEFORE the trace moves into the boot — the ladder is a
@@ -601,6 +686,12 @@ intended for diagnostics, not serving",
             // Carried whole rather than re-derived, so it cannot disagree
             // with the numbers `admit` was asked about.
             residency: plan,
+            world: self.boot.world,
+            comm: self
+                .boot
+                .comm
+                .as_ref()
+                .map_or(core::ptr::null_mut(), |comm| comm.raw()),
         })
         .map_err(fault)?;
 
@@ -1581,6 +1672,18 @@ mod tests {
 /// is not an error (an ordinary checkpoint); a broken stamp is refused.
 /// Runs on the path's name (`serve::read_head`, positioned reads only), so
 /// no device buffer or host mapping has happened when it refuses.
+/// A SKU name without its `-tp<n>` width: a serving artifact holds whole
+/// tensors and each rank reads its band, so the artifact stamped for the
+/// one-rank row serves every width of the same text.
+fn width_free(sku: &str) -> &str {
+    match sku.rsplit_once("-tp") {
+        Some((base, width)) if !width.is_empty() && width.bytes().all(|b| b.is_ascii_digit()) => {
+            base
+        }
+        _ => sku,
+    }
+}
+
 fn refuse_an_artifact_for_another_deployment(
     path: &std::path::Path,
     backend: &str,

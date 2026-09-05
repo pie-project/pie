@@ -175,45 +175,27 @@ pub mod open {
 
     /// Open one CUDA device per rank, as one engine.
     ///
-    /// **ONE RANK, AND IT REFUSES THE REST BY NAME.** A rank is not a load
-    /// ([`LoadRequest`](engine::LoadRequest) is one plan, `Shard::Cut` is in
-    /// the plan), the shell states tp=1 in `weights.rs` —
-    /// `StorageTarget::for_backend(Cuda, 0, 1)` — and no collective fires. A
-    /// multi-rank launch is refused here rather than opened and served wrong.
-    ///
-    /// What a tensor-parallel group would need: a rank index and a width
-    /// reaching `StorageTarget`, an `Engine` that owns N shells and drives
-    /// their streams in lockstep, and NCCL ordering — collectives never
-    /// elided, descriptor rank-replicated.
-    ///
-    /// **THE REFUSAL IS THIS CRATE'S**, because what it refuses is not a
-    /// device fact. `engine_cuda::
-    /// open` takes ONE boot and answers ONE `Cuda`; it is never handed a
-    /// list and has no way to learn that a launcher held three. The fan-out
-    /// being refused is a shape of this crate's registry — N boots
-    /// collapsing into one `EngineId` — so the arity policy belongs to the
-    /// party that owns the registry. The shell's half of the same claim is
-    /// already stated, and stated better, by `open`'s signature: it takes
-    /// one `DeviceBoot`, singular.
-    ///
-    /// It is also why another shell does not owe the workspace a `*_group`.
-    /// This exists because `worker`'s CUDA launch path fans a list of rank
-    /// boots, not because opening a device needs it.
+    /// One boot opens through [`cuda`]; two or more open as a
+    /// tensor-parallel group (`engine_cuda::open_group`): rank `i` is
+    /// `boots[i]`, the communicators are opened together, and the group
+    /// answers every verb as one engine, rank 0 speaking. The load that
+    /// follows must name a SKU of the group's width (`…-tp<n>`), which is
+    /// how each rank's plan comes to read its own band and carry the
+    /// collectives.
     ///
     /// # Errors
     ///
-    /// An empty rank list, more than one rank, or a device that failed to
-    /// open.
+    /// An empty rank list, a device or communicator that failed to open.
     #[cfg(feature = "cuda")]
     pub fn cuda_group(mut boots: Vec<engine_cuda::DeviceBoot>) -> Result<(EngineBox, usize)> {
         match boots.len() {
             0 => Err(super::anyhow!("a cuda group requires at least one rank")),
             1 => Ok((cuda(boots.remove(0))?, 1)),
-            ranks => Err(super::anyhow!(
-                "this build serves one cuda rank and was asked for {ranks}: \
-                 tensor parallelism is not supported in this release, and a \
-                 group opened as a single rank would load every shard onto one device"
-            )),
+            ranks => engine_cuda::open_group(boots, crate::engine::load::contract_for, |name| {
+                models::sku(name).map(|sku| sku.classify)
+            })
+            .map(|group| (Box::new(group) as EngineBox, ranks))
+            .map_err(::anyhow::Error::msg),
         }
     }
 
@@ -288,7 +270,7 @@ pub mod open {
 /// ordinal does `cuda:1` name" is a CUDA naming fact no other crate should
 /// re-derive.
 #[cfg(feature = "cuda")]
-pub use engine_cuda::{DeviceBoot, Graphs, Knobs, ordinal_of, Recording};
+pub use engine_cuda::{DeviceBoot, Graphs, Knobs, ordinal_of, Recording, World};
 
 // `open::metal` is TARGET-gated as well as feature-gated, for the plainest
 // reason there is: there is a shell behind that door and it binds an

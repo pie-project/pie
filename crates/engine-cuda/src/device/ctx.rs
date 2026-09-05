@@ -86,7 +86,7 @@ impl Context {
     ///
     /// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`]
     /// for a runtime that refused.
-    pub fn bind(ordinal: i32) -> Result<Context> {
+    pub fn bind(ordinal: i32, comm: *mut c_void) -> Result<Context> {
         #[cfg(feature = "cuda")]
         {
             use cudarc::cublas::sys as blas;
@@ -142,6 +142,9 @@ impl Context {
                 // nothing extra.
                 slabs.attach(stream);
                 let ctx = Ctx::on(stream).with_cublas(cublas).with_slabs(slabs);
+                // SAFETY: `comm` is the rank's live communicator (or null),
+                // owned by the boot for as long as this shell fires on it.
+                let ctx = if comm.is_null() { ctx } else { ctx.with_comm(comm) };
                 // a failed probe isn't a failed load: builders take the fallback as data.
                 let device = Device::probe(&ctx).unwrap_or(Device::L40S);
                 Ok(Context {
@@ -162,7 +165,7 @@ impl Context {
         }
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = ordinal;
+            let _ = (ordinal, comm);
             Err(Fault::Runtimeless)
         }
     }

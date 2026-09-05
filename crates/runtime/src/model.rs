@@ -101,6 +101,12 @@ pub const ROWS: &[Row] = &[
         arch: "gemma4",
     },
     Row {
+        id: "gemma4-e4b-bf16-kv-bf16-tp2",
+        layers: 42,
+        vocab: 262_144,
+        arch: "gemma4",
+    },
+    Row {
         id: "gemma4-e4b-eagle-bf16-kv-bf16",
         layers: 42,
         vocab: 262_144,

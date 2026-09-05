@@ -19,7 +19,7 @@ use checkpoint::contract::ModelContract;
 use checkpoint::error::Error as LoadError;
 use checkpoint::executor::{Execution, sink::TensorSink};
 use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
-use checkpoint::types::{BackendKind, ScaleForm, TensorId};
+use checkpoint::types::{ScaleForm, TensorId};
 use kernels_cuda::Tensor;
 use kernels_cuda::linear::moe::GroupSeat;
 use model_ir::{Dtype, ParamSource, Trace};
@@ -202,17 +202,18 @@ pub struct Prospect {
 /// # Errors
 /// [`Fault::Load`] for a checkpoint the contract does not fit,
 /// [`Fault::Param`] for an attachment this plan cannot resolve.
-pub fn prospect(trace: &Trace, contract: &ModelContract, path: &Path) -> Result<Prospect> {
+pub fn prospect(
+    trace: &Trace,
+    contract: &ModelContract,
+    path: &Path,
+    target: StorageTarget,
+) -> Result<Prospect> {
     let metadata = if path.is_dir() {
         parse_metadata(path)?
     } else {
         zt::parse(path)?
     };
-    let landing = compile(
-        &metadata,
-        contract,
-        StorageTarget::for_backend(BackendKind::Cuda, 0, 1),
-    )?;
+    let landing = compile(&metadata, contract, target)?;
     let index: BTreeMap<&str, usize> = trace
         .params
         .iter()
@@ -753,6 +754,7 @@ impl Weights {
         path: &Path,
         plan: crate::experts::Plan,
         stream: *mut core::ffi::c_void,
+        target: StorageTarget,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -760,8 +762,8 @@ impl Weights {
             (zt::parse(path)?, path.parent().unwrap_or(Path::new(".")))
         };
 
-        // tp=1: a rank of one takes all of `Shard::Cut`'s segments.
-        let target = StorageTarget::for_backend(BackendKind::Cuda, 0, 1);
+        // `target` names this rank's band; a rank of one takes all of
+        // `Shard::Cut`'s segments.
         let landing = compile(&metadata, contract, target.clone())?;
 
         // Name -> row map, shared by the landing sink and the table build.
@@ -780,9 +782,13 @@ impl Weights {
         // T2 source: this deployment's own artifact, else a resident load's.
         let deferred = defer_tiers(serving.as_ref(), &plan);
         // Whether the checkpoint could fill the image, asked before it exists.
-        let restorable = serving
-            .as_ref()
-            .is_some_and(|serving| serving.covers(&plan.host_layout()).is_ok());
+        // The artifact's images are whole tensors landed for one rank; a
+        // rank of a wider group wants its band of each, which only the
+        // compiled plan below cuts. So a group lands the cold way.
+        let restorable = target.tp_size == 1
+            && serving
+                .as_ref()
+                .is_some_and(|serving| serving.covers(&plan.host_layout()).is_ok());
         let source = match plan.spill_demand() > 0 {
             true => serving.clone().map(crate::experts::Spill::Serving),
             false => None,

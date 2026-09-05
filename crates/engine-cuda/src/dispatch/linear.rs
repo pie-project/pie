@@ -66,23 +66,23 @@ impl Run<'_> {
                 None => self.row_major_matmul(act, w, y),
             },
             Linear::LmHead { act, w, y } => match self.maybe_tiled_planes(*w) {
-                Some((codes, scales, biases, seat)) => {
-                    let act = self.tensor(*act);
-                    let entry = if act.rows >= PREFILL_ROWS {
-                        linear::tiled::lm_head
-                    } else {
-                        linear::tiled::lm_head_gemv
-                    };
-                    entry(
-                        self.ctx(),
-                        act,
-                        codes,
-                        scales,
-                        biases,
-                        &mut self.tensor(*y),
-                        seat,
-                    )
-                }
+                    Some((codes, scales, biases, seat)) => {
+                        let act = self.tensor(*act);
+                        let entry = if act.rows >= PREFILL_ROWS {
+                            linear::tiled::lm_head
+                        } else {
+                            linear::tiled::lm_head_gemv
+                        };
+                        entry(
+                            self.ctx(),
+                            act,
+                            codes,
+                            scales,
+                            biases,
+                            &mut self.tensor(*y),
+                            seat,
+                        )
+                    }
                 None => self.row_major_lm_head(act, w, y),
             },
             // ---- mlp ----

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 
 #[cfg(feature = "cuda")]
-use runtime::engine::backend::{DeviceBoot, Graphs, Knobs, Recording, ordinal_of};
+use runtime::engine::backend::{DeviceBoot, Graphs, Knobs, Recording, World, ordinal_of};
 
 use crate::backend::flavor::Flavor;
 use crate::config;
@@ -196,6 +196,9 @@ fn device_boot(
     }
     Ok(DeviceBoot {
         ordinal: ordinal_of(&opts.device),
+        // Rank and communicator are the group opener's to assign.
+        world: World::default(),
+        comm: None,
         graphs,
         knobs,
         cache_dir: Some(cache_dir.to_path_buf()),
@@ -364,6 +367,28 @@ pub(crate) fn create_engine_backend_group(
             "cuda group opened {opened} ranks for {ranks} rank configs"
         ));
     }
+    // A group serves the identified checkpoint at its own width: the SKU row
+    // is the one-rank name plus `-tp<ranks>`, which the catalog must ship.
+    let widened;
+    let sku = match sku {
+        Some(named) => Some(named),
+        None if ranks > 1 => {
+            let base =
+                runtime::engine::load::identify(snapshot_dir, model_ir::Platform::Cuda)?;
+            widened = format!("{base}-tp{ranks}");
+            runtime::engine::load::trace(&widened, model_ir::Platform::Cuda).with_context(
+                || {
+                    format!(
+                        "{snapshot_dir:?} is `{base}`, and this build ships no {ranks}-rank \
+                         row for it (`{widened}`); add one to the catalog or serve it on \
+                         one device"
+                    )
+                },
+            )?;
+            Some(widened.as_str())
+        }
+        None => None,
+    };
     // One load, not one per rank: a rank is not a load.
     #[allow(
         irrefutable_let_patterns,

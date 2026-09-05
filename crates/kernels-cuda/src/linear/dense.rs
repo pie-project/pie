@@ -487,22 +487,34 @@ struct Device {
 }
 
 fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
-    static DEVICES: OnceLock<Mutex<HashMap<i32, Device>>> = OnceLock::new();
-    let mut map = DEVICES
-        .get_or_init(|| Mutex::new(HashMap::new()))
+    // One lock per device, not one over the table: the tuner's bench
+    // synchronizes the caller's stream while holding its device, and under
+    // tensor parallelism that stream can be waiting on a collective from a
+    // rank that is itself waiting for this table. The table lock is held
+    // only long enough to find the device's own.
+    static DEVICES: OnceLock<Mutex<HashMap<i32, Arc<Mutex<Device>>>>> = OnceLock::new();
+    let device = {
+        let mut map = DEVICES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(map.entry(current_device()).or_insert_with(|| {
+            Arc::new(Mutex::new(Device {
+                lt: LtCtx {
+                    handle: std::ptr::null_mut(),
+                    workspace_bytes: 64 * 1024 * 1024,
+                },
+                plans: HashMap::new(),
+                chosen: HashMap::new(),
+                seen: HashMap::new(),
+                disk: DiskCache::new(),
+            }))
+        }))
+    };
+    let mut device = device
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let device = map.entry(current_device()).or_insert_with(|| Device {
-        lt: LtCtx {
-            handle: std::ptr::null_mut(),
-            workspace_bytes: 64 * 1024 * 1024,
-        },
-        plans: HashMap::new(),
-        chosen: HashMap::new(),
-        seen: HashMap::new(),
-        disk: DiskCache::new(),
-    });
-    f(device)
+    f(&mut device)
 }
 
 impl Device {

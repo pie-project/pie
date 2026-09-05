@@ -46,8 +46,18 @@ pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resol
         code: -1,
     })?;
     let key = root.key(instantiation, arch);
-
-    slot(&key)
+    // A loaded module belongs to the context it was loaded into, so the
+    // in-process slot is per device (the ranks of a tensor-parallel group
+    // share this process); the cubin on disk is per arch and shared.
+    let mut ordinal: i32 = 0;
+    let code = unsafe { rt::cudaGetDevice(&raw mut ordinal) };
+    if code != rt::cudaError::cudaSuccess {
+        return Err(Fault::Device {
+            call: "cudaGetDevice",
+            code: code as i32,
+        });
+    }
+    slot(&format!("cuda:{ordinal}|{key}"))
         .get_or_init(|| load(root, instantiation, &key, arch))
         .as_ref()
         .map_err(Clone::clone)
