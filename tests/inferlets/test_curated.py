@@ -160,9 +160,18 @@ async def test_cacheback_speculative_decoding(client, args):
             client, args, "cacheback-speculative-decoding", {**base, "draft_length": 4}
         )
 
-        # With no draft, every generated token costs exactly one forward pass.
+        # With no draft, every generated token costs exactly one forward pass —
+        # plus one for the stop token when the model ends the run itself, since
+        # that token is produced by a pass and then left out of `count`. A run
+        # truncated by `max_tokens` never pays it, so a bare
+        # `verification_steps == count` holds only where the budget runs out
+        # first, which is a property of the model and the prompt rather than of
+        # the loop. gemma-4-26B-A4B answers the repetitive prompt in 14 tokens
+        # and stops, and read the bare way that is 15 != 14.
         assert sequential["drafted"] == 0, (label, sequential)
-        assert sequential["verification_steps"] == sequential["count"], (label, sequential)
+        assert sequential["verification_steps"] == sequential["count"] + int(
+            sequential["stopped"]
+        ), (label, sequential)
 
         # The comparison is only meaningful if speculation fired *and* was
         # rejected at least once.
@@ -198,10 +207,33 @@ async def test_constrained_speculative_decoding(client, args):
     beforehand reports. That check reaching a nonzero count here is the
     end-to-end evidence that the matcher's fork/rollback ABI works through wasm.
     """
-    # The inferlet's default prompt and schema are used verbatim: how far the
-    # model runs before closing the document is prompt-sensitive, and the test
-    # needs both arms to reach termination rather than the token cap.
-    base = {"max_tokens": 256, "max_ngram": 4}
+    # **THE SCHEMA IS STATED HERE, NOT TAKEN FROM THE INFERLET'S DEFAULT.**
+    # How far a model runs before closing the document is a property of the
+    # model and the schema, and the inferlet's default (a profile with a name,
+    # an age and a skills array) is rich enough that gemma-4-26B-A4B never
+    # closes it: it writes two good fields and then degenerates into
+    # "abilityon abilityon ..." past 384 tokens. Its non-speculative sibling
+    # `json-schema-constrained-decoding` fails the same way on the same
+    # schema, so that is the model, not this loop — and that sibling's own
+    # case passes only because it states a SMALL schema here too.
+    #
+    # A small schema proves everything this case is for: the sequential and
+    # speculative arms come back token-identical, and speculation still fires,
+    # is rejected, and saves passes (measured: accepted 2 of 4 drafted,
+    # 19 verification steps against 21).
+    base = {
+        "prompt": (
+            "Return an object with an integer field named value and a string "
+            "field named name."
+        ),
+        "schema": (
+            '{"type":"object","properties":'
+            '{"value":{"type":"integer"},"name":{"type":"string"}},'
+            '"required":["value","name"],"additionalProperties":false}'
+        ),
+        "max_tokens": 128,
+        "max_ngram": 4,
+    }
     sequential = await _report(
         client, args, "constrained-speculative-decoding", {**base, "draft_length": 0}
     )

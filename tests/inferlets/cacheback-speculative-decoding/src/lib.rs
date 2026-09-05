@@ -65,10 +65,22 @@ struct Output {
     count: usize,
     draft_length: usize,
     /// Target-model forward passes actually run. At `draft_length = 0` this
-    /// equals `count`, which is precisely what makes that setting a sequential
-    /// greedy control: same prompt, same stop tokens, same `verify()`, no
-    /// speculation. Below `count` means speculation is paying off.
+    /// is `count + stopped as usize`, which is precisely what makes that
+    /// setting a sequential greedy control: same prompt, same stop tokens,
+    /// same `verify()`, no speculation. Below `count` means speculation is
+    /// paying off.
+    ///
+    /// **THE `+ stopped` IS THE STOP TOKEN'S OWN PASS.** A run the model ends
+    /// itself spends one forward pass producing the stop token, and that token
+    /// is not part of the answer so it is not in `count`. A run truncated by
+    /// `max_tokens` never pays it. Reading the invariant as a bare
+    /// `verification_steps == count` therefore holds only on prompts long
+    /// enough to run out the budget — which is a property of the model and the
+    /// prompt, not of this loop.
     verification_steps: usize,
+    /// Whether the model ended the run with a stop token rather than the
+    /// caller's `max_tokens` doing it.
+    stopped: bool,
     drafted: usize,
     accepted: usize,
     acceptance_rate: f64,
@@ -166,6 +178,7 @@ async fn main(input: Input) -> Result<Output> {
             count: 0,
             draft_length: input.draft_length,
             verification_steps: 0,
+            stopped: false,
             drafted: 0,
             accepted: 0,
             acceptance_rate: 0.0,
@@ -242,6 +255,7 @@ async fn main(input: Input) -> Result<Output> {
         count: generated.len(),
         draft_length: input.draft_length,
         verification_steps,
+        stopped,
         drafted: total_drafted,
         accepted: total_accepted,
         acceptance_rate,
