@@ -20,5 +20,5 @@ path = "src/lib.rs"
 pie-server = { path = "../../server", default-features = false, features = ["driver-cuda", "driver-portable", "driver-dummy"] }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 tokio = { version = "1.38", features = ["rt-multi-thread"] }
-toml = "0.9"
+toml = "1.1"
 anyhow = "1.0"
