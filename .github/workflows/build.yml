@@ -142,7 +142,7 @@ jobs:
     env:
       ARTIFACT_NAME: pie-${{ matrix.target.label }}.${{ matrix.target.archive }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -342,7 +342,7 @@ jobs:
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Bootstrap container
         shell: bash
