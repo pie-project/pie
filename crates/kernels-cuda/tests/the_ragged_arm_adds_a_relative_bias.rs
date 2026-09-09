@@ -157,6 +157,7 @@ fn check(q_heads: u32, kv_heads: u32, seed: u64) {
     );
 }
 
+#[test]
 fn the_ragged_arm_adds_a_relative_bias_every_case() {
     the_relative_bias_lands_the_host_reference_at_four_heads();
     the_relative_bias_lands_the_host_reference_at_sixty_four_heads();
@@ -164,7 +165,6 @@ fn the_ragged_arm_adds_a_relative_bias_every_case() {
     a_misshapen_table_is_refused();
 }
 
-#[test]
 fn the_relative_bias_lands_the_host_reference_at_four_heads() {
     check(4, 2, 0x5b1a);
 }

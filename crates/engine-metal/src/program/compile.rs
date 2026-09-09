@@ -711,13 +711,13 @@ impl Cache {
 mod tests {
     use super::*;
 
+    #[test]
     fn compile_every_case() {
         expansion_replaces_the_include_and_leaves_everything_else();
         a_source_with_no_include_is_handed_over_unchanged();
         the_two_emitters_never_share_a_cache_identity();
     }
 
-    #[test]
     fn expansion_replaces_the_include_and_leaves_everything_else() {
         let source = format!("// head\n{RNG_INCLUDE}\n// tail\n");
         let expanded = expand(&source);

@@ -43,6 +43,7 @@ fn object_of(path: &PathBuf, name: &str) -> ztensor::Object {
         .clone()
 }
 
+#[test]
 fn sharding_every_case() {
     lora_overlay();
     positional_shards();
@@ -63,7 +64,6 @@ fn sharding_every_case() {
     an_external_range_may_be_empty_but_not_backwards();
 }
 
-#[test]
 fn lora_overlay() {
     let base_path = tmp("overlay-base.zt");
     let base_data: Vec<u8> = (0..1024u32)

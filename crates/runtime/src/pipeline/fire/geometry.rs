@@ -1078,6 +1078,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn geometry_every_case() {
         section3_single_seq_decode_geometry();
         decode_envelope_accepts_shape_equivalent_variants();
@@ -1089,7 +1090,6 @@ mod tests {
         unfilled_device_ports_are_rejected();
     }
 
-    #[test]
     fn section3_single_seq_decode_geometry() {
         let mut c = section3_container();
         add_explicit_geometry(&mut c, 1, 1);

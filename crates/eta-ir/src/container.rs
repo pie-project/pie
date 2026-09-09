@@ -633,6 +633,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn container_every_case() {
         round_trip_every_op();
         no_byte_of_an_op_encoding_is_ignored_by_its_decoder();
@@ -641,7 +642,6 @@ mod tests {
         rejects_wire_counts_before_allocating_from_them();
     }
 
-    #[test]
     fn round_trip_every_op() {
         let mut ops = alloc::vec![
             Op::Const(Literal::I32(-1)),

@@ -23,6 +23,7 @@ fn canonical_file(name: &str) -> PathBuf {
     path
 }
 
+#[test]
 fn capabilities_every_case() {
     canonical_placement_reaches_every_capability();
     floor_alignment_still_pages_on_small_pages();
@@ -33,7 +34,6 @@ fn capabilities_every_case() {
     verifying_a_tensor_covers_every_plane();
 }
 
-#[test]
 fn canonical_placement_reaches_every_capability() {
     let src = Source::open(canonical_file("caps.zt")).unwrap();
     for name in ["a.weight", "b.weight"] {

@@ -27,13 +27,13 @@ pub fn clear_bitmask(bitmask: &mut [u32]) {
 mod tests {
     use super::*;
 
+    #[test]
     fn bitmask_every_case() {
         test_bitmask_size();
         test_set_get_clear_bit();
         test_clear_bitmask();
     }
 
-    #[test]
     fn test_bitmask_size() {
         assert_eq!(bitmask_size(0), 0);
         assert_eq!(bitmask_size(1), 1);

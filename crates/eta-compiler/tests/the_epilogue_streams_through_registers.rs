@@ -99,13 +99,13 @@ fn profile() -> ModelProfile {
     profile
 }
 
+#[test]
 fn the_epilogue_streams_through_registers_every_case() {
     the_row_parallel_epilogue_fuses_into_streams();
     a_reshaped_row_vector_broadcasts_through_the_stream();
     a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing();
 }
 
-#[test]
 fn the_row_parallel_epilogue_fuses_into_streams() {
     let bound = bind(subject(), profile()).expect("the subject binds");
     let stages = compile_bound(&bound);

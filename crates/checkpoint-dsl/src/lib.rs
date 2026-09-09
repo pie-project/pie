@@ -877,7 +877,7 @@ fn affine_decoded(src: &ztensor::Source, w: &Weight, from: String) -> Result<Vec
     };
     let stem = stem.as_str();
     let unpacked = unpacked_extents(src, &stored_w, &from)?;
-    holds_the_declared_rectangle(w, 0, &[unpacked.clone()])?;
+    holds_the_declared_rectangle(w, 0, std::slice::from_ref(&unpacked))?;
     let codes = Expr::src(from.clone()).transmute(TensorType::new(unpacked, grouped(&stored_w)));
     let pairing = scaling(&stored_w);
     let counted = divided(
@@ -1682,6 +1682,7 @@ mod tests {
         ztensor::Source::open(&path).expect("it reads back")
     }
 
+    #[test]
     fn lib_every_case() {
         a_placed_row_lands_the_placement_over_the_codes_an_encode_wrote();
         an_uncovered_placement_still_refuses_by_name();
@@ -1690,7 +1691,6 @@ mod tests {
         a_dense_row_is_untouched_by_the_guard();
     }
 
-    #[test]
     fn a_placed_row_lands_the_placement_over_the_codes_an_encode_wrote() {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let src = raw_source(dir.path());

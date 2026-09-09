@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "engine-metal"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "block2",
  "checkpoint",
@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "engine-vulkan"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "ash",
  "checkpoint",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "engine-wgpu"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "ash",
  "checkpoint",

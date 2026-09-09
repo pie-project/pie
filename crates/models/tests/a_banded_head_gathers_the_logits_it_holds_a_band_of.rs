@@ -10,12 +10,12 @@ fn banded(trace: &Trace, w: ValueId) -> bool {
     }
 }
 
+#[test]
 fn a_banded_head_gathers_the_logits_it_holds_a_band_of_every_case() {
     a_banded_head_gathers_the_logits_it_holds_a_band_of();
     a_single_rank_bands_nothing_and_gathers_nothing();
 }
 
-#[test]
 fn a_banded_head_gathers_the_logits_it_holds_a_band_of() {
     let mut faults = Vec::new();
 

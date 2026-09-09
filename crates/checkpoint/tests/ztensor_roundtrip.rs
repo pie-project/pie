@@ -39,6 +39,7 @@ fn write_zt(path: &Path, tensors: &[(&str, Vec<u64>, ztensor::Leaf, Vec<u8>)]) {
     writer.finish().unwrap();
 }
 
+#[test]
 fn ztensor_roundtrip_every_case() {
     zt_offsets_address_the_right_bytes();
     safetensors_and_zt_agree_on_the_model();
@@ -47,7 +48,6 @@ fn ztensor_roundtrip_every_case() {
     a_zt_checkpoint_says_it_is_zt();
 }
 
-#[test]
 fn zt_offsets_address_the_right_bytes() {
     let dir = tmpdir("offsets");
     let path = dir.join("model.zt");

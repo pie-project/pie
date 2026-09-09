@@ -2046,6 +2046,7 @@ impl TensorSink for Handoff<'_> {
 mod tests {
     use super::*;
 
+    #[test]
     fn import_every_case() {
         a_banks_planes_publish_in_schedule_order_not_declaration_order();
         the_dry_run_states_one_checkpoint_of_peak_when_the_decode_releases();
@@ -2057,7 +2058,6 @@ mod tests {
         the_chosen_row_is_in_the_filename_the_dry_run_reports();
     }
 
-    #[test]
     fn a_banks_planes_publish_in_schedule_order_not_declaration_order() {
         use checkpoint::types::{BufferId, DType, InstrId};
 

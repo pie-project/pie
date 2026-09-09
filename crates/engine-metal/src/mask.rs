@@ -169,6 +169,7 @@ fn keep(bytes: &mut [u8], stride: u32, row: u64, key: u64) {
 mod tests {
     use super::*;
 
+    #[test]
     fn mask_every_case() {
         a_bidirectional_lane_keeps_the_keys_after_the_row();
         a_per_row_mask_of_the_wrong_height_is_refused();
@@ -177,7 +178,6 @@ mod tests {
         a_mask_short_of_its_lanes_extent_is_refused();
     }
 
-    #[test]
     fn a_bidirectional_lane_keeps_the_keys_after_the_row() {
         let all = Masking::Extent(Mask::new(vec![0, 3], 3));
         let causal = stage(&[LaneMask {

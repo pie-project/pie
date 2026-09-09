@@ -1528,12 +1528,12 @@ mod tests {
 
     const PORT: eta_ir::registry::Port = eta_ir::registry::Port::RsFoldLen;
 
+    #[test]
     fn prepare_every_case() {
         a_device_fold_length_is_clamped_to_the_bound_it_was_promised();
         a_fold_length_that_resolves_to_zero_is_refused_by_name();
     }
 
-    #[test]
     fn a_device_fold_length_is_clamped_to_the_bound_it_was_promised() {
         let cells = [3u32, 9, 5];
         let port = Some(&cells[..]);

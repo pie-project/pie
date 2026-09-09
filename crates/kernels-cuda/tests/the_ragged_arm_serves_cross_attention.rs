@@ -138,6 +138,7 @@ fn check(hd: u32, q_heads: u32, kv_heads: u32, q_sizes: &[u32], kv_sizes: &[u32]
     );
 }
 
+#[test]
 fn the_ragged_arm_serves_cross_attention_every_case() {
     the_ragged_arm_serves_cross_attention_at_head_width_64();
     the_ragged_arm_serves_cross_attention_at_head_width_128();
@@ -145,7 +146,6 @@ fn the_ragged_arm_serves_cross_attention_every_case() {
     the_ragged_arm_refuses_tables_of_two_lengths();
 }
 
-#[test]
 fn the_ragged_arm_serves_cross_attention_at_head_width_64() {
     check(64, 4, 2, &[7, 0, 200, 300, 3], &[300, 40, 0, 500, 1], 0x64);
 }

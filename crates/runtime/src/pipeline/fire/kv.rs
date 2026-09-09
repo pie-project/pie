@@ -737,6 +737,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn kv_every_case() {
         canonical_shape_accepts_the_plain_decode();
         canonical_shape_rejects_kv_perturbing_passes();
@@ -748,7 +749,6 @@ mod tests {
         translation_overlays_prepared_targets_on_the_committed_mapping();
     }
 
-    #[test]
     fn canonical_shape_accepts_the_plain_decode() {
         assert!(canonical_kv_shape(&plain_decode_container()));
     }

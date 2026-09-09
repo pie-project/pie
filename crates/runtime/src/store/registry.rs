@@ -179,12 +179,12 @@ pub fn all_for_model(model_idx: usize) -> Vec<Stores> {
 mod tests {
     use super::*;
 
+    #[test]
     fn registry_every_case() {
         dynamic_store_slots_unregister_without_reusing_engine_ids();
         dynamic_store_slots_allow_global_engine_id_gaps();
     }
 
-    #[test]
     fn dynamic_store_slots_unregister_without_reusing_engine_ids() {
         let model = register_model(16, &[8], &[0]);
         register_engine_with_swap(model, 1, 16, 10, 4, 0, 0, 0).unwrap();

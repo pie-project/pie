@@ -132,13 +132,13 @@ fn axis_of(compiled: &CompiledModel, region: usize) -> RowAxis {
     compiled.units[compiled.unit_of(region) as usize]
 }
 
+#[test]
 fn a_tower_region_reads_the_patch_window_every_case() {
     each_region_is_cut_at_its_own_axis_s_window();
     a_fire_with_no_image_gets_the_token_windows_it_always_had();
     the_table_a_device_reads_carries_both_seriations();
 }
 
-#[test]
 fn each_region_is_cut_at_its_own_axis_s_window() {
     let (trace, compiled) = baked();
     let budgets = budgets();

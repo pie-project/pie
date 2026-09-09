@@ -87,13 +87,13 @@ fn emitted(container: TraceContainer) -> String {
     source[entry..].to_string()
 }
 
+#[test]
 fn gumbel_argmax_scans_the_logits_once_every_case() {
     a_scaled_gumbel_max_becomes_one_scan_of_the_intrinsic();
     an_unscaled_gumbel_max_folds_too_with_no_divisor();
     a_uniform_draw_is_not_a_gumbel_max_and_stays_as_traced();
 }
 
-#[test]
 fn a_scaled_gumbel_max_becomes_one_scan_of_the_intrinsic() {
     let source = emitted(subject(true, RngKind::Gumbel));
     assert!(

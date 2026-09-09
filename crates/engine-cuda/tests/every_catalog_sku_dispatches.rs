@@ -102,6 +102,7 @@ fn stopped() -> BTreeMap<String, BTreeSet<String>> {
     stopped
 }
 
+#[test]
 fn every_catalog_sku_dispatches_every_case() {
     every_catalog_sku_dispatches();
     no_exemption_outlives_its_reason();
@@ -109,7 +110,6 @@ fn every_catalog_sku_dispatches_every_case() {
     every_catalog_sku_traces();
 }
 
-#[test]
 fn every_catalog_sku_dispatches() {
     let refused = refused();
     let exempt: BTreeMap<&str, &[&str]> = CANNOT_SERVE.iter().copied().collect();

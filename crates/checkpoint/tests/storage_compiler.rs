@@ -15,6 +15,7 @@ use checkpoint::types::{
     QuantSpec, RepackLayout, ScaleForm, TensorId,
 };
 
+#[test]
 fn storage_compiler_every_case() {
     metal_qwen35_schema_emits_canonical_affine_u4_arena();
     buffer_join_tile_maps_carry_destination_offsets();
@@ -74,7 +75,6 @@ fn storage_compiler_every_case() {
     the_tiled_repack_is_the_documented_permutation_at_every_shipped_shape();
 }
 
-#[test]
 fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
     let specs = [
         ("lm_head.weight", vec![2, 8], DType::U32),

@@ -1159,12 +1159,12 @@ mod tests {
 
     use super::*;
 
+    #[test]
     fn weights_every_case() {
         the_residue_is_a_leaf_and_a_chain_is_not();
         the_store_is_laid_out_aligned_disjoint_and_in_plan_order();
     }
 
-    #[test]
     fn the_residue_is_a_leaf_and_a_chain_is_not() {
         let entry = |name: &str, expr: Expr| TensorContract {
             name: name.to_string(),

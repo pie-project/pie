@@ -108,13 +108,13 @@ mod tests {
         f32_to_bf16(v).to_le_bytes()
     }
 
+    #[test]
     fn decoded_every_case() {
         eight_bit_codes_are_bytes();
         sub_byte_codes_unpack_least_significant_first();
         bf16_round_trips();
     }
 
-    #[test]
     fn eight_bit_codes_are_bytes() {
         let codes = [1u8, 2, 3, 4];
         let scales = bf(0.5);

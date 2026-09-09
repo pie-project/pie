@@ -132,6 +132,7 @@ fn withdrawn(compiled: &CompiledModel) -> Vec<(u32, ClassSet)> {
     out
 }
 
+#[test]
 fn a_copied_window_is_one_encode_over_the_same_rows_every_case() {
     the_bake_writes_a_copy_row_below_the_crossover();
     a_withdrawn_window_splits_when_the_shell_does_not_copy();
@@ -146,7 +147,6 @@ fn a_copied_window_is_one_encode_over_the_same_rows_every_case() {
     the_packed_blob_and_the_bind_walk_it_in_one_order();
 }
 
-#[test]
 fn the_bake_writes_a_copy_row_below_the_crossover() {
     let (_, compiled) = baked();
     let owed = withdrawn(&compiled);

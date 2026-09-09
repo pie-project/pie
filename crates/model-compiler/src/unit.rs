@@ -134,6 +134,7 @@ mod tests {
         })
     }
 
+    #[test]
     fn unit_every_case() {
         a_patch_row_against_no_patch_ceiling_is_refused_by_name();
         a_unit_that_resumes_after_another_is_refused_rather_than_recorded_twice();
@@ -141,7 +142,6 @@ mod tests {
         a_patch_column_is_reserved_at_the_patch_ceiling();
     }
 
-    #[test]
     fn a_patch_row_against_no_patch_ceiling_is_refused_by_name() {
         let mut b = Build::new();
         let pixels = b.input(8);

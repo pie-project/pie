@@ -52,6 +52,7 @@ fn assert_exact(json: &serde_json::Value, texts: &[&str]) {
     }
 }
 
+#[test]
 fn profiles_every_case() {
     qwen3_profile_is_exact();
     qwen36_string_merges_are_exact();
@@ -64,7 +65,6 @@ fn profiles_every_case() {
     a_bpe_tokenizer_writes_no_score_plane();
 }
 
-#[test]
 fn qwen3_profile_is_exact() {
     let tokenizer = byte_level_json(
         json!({"type": "NFC"}),

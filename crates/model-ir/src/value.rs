@@ -237,12 +237,12 @@ pub struct ValueDecl {
 mod tests {
     use super::{Dim, Guard, PerAxis, RowAxis, Selection};
 
+    #[test]
     fn value_every_case() {
         a_selection_is_a_split_arms_guard_as_two_words();
         a_per_axis_reads_back_what_each_axis_was_filled_with();
     }
 
-    #[test]
     fn a_selection_is_a_split_arms_guard_as_two_words() {
         let arm = Guard::and(Guard::Fact(3), Guard::not(Guard::Fact(5)));
         let select = Selection::of(&arm).expect("a conjunction of literals");

@@ -329,6 +329,7 @@ mod tests {
         std::fs::write(path, b"stand-in for an artifact").unwrap();
     }
 
+    #[test]
     fn read_every_case() {
         a_directory_of_specializations_discovers_all_of_them();
         a_lone_specialization_is_the_answer_to_both_questions();
@@ -337,7 +338,6 @@ mod tests {
         a_directory_without_artifacts_discovers_nothing();
     }
 
-    #[test]
     fn a_directory_of_specializations_discovers_all_of_them() {
         let dir = tempfile::tempdir().unwrap();
         let cuda = dir.path().join("glm.glm53-flash-u8g64-kv-bf16.cuda.zt");

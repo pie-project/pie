@@ -691,6 +691,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn fuse_every_case() {
         the_add_and_the_norm_that_reads_it_become_one_node();
         a_value_defined_past_the_pair_still_names_its_node();
@@ -710,7 +711,6 @@ mod tests {
         a_gate_per_lane_under_a_modulate_per_token_stays_apart();
     }
 
-    #[test]
     fn the_add_and_the_norm_that_reads_it_become_one_node() {
         let fused = residual_norm(trace_of(vec![node(add(3), Some(0)), node(norm(3), Some(0))]));
         assert_eq!(fused.nodes.len(), 1);

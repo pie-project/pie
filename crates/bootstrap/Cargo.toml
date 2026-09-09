@@ -11,26 +11,15 @@ repository = "https://github.com/pie-project/pie"
 name = "bootstrap"
 path = "src/lib.rs"
 
-# Reuses the very same resolution path the daemons take
-# (`config::resolve_path`), so it can never disagree with them.
 [[bin]]
 name = "pie-env"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-# The shared global flags as a `GlobalArgs` the bins `#[command(flatten)]` into
-# their own `Parser`, so there is one `--help`.
 clap = { version = "4.6", features = ["derive"] }
-# Path/dir resolution (home dir for the `$PIE_HOME` fallback).
 dirs = "6.0"
-# TLS: not used here, selected here. Every HTTP client in the process is built
-# on `rustls-no-provider`, which refuses to pick a backend on its own, so boot
-# installs one. `ring` rather than aws-lc: it is already in the graph, and the
-# aws-lc build script is the most expensive unit in a cold build.
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-# Signals and the hand-rolled /metrics listener. Not a runtime — the bin owns
-# that; the skeleton only `spawn`s onto the ambient one.
 tokio = { version = "1", features = ["rt", "macros", "net", "signal", "io-util"] }

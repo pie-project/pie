@@ -533,6 +533,7 @@ fn as_u32(port: Port, value: &Value) -> Result<Vec<u32>> {
 mod tests {
     use super::Envelope;
 
+    #[test]
     fn ports_every_case() {
         an_extent_that_disagrees_with_the_seat_is_refused_by_both_numbers();
         an_agreeing_extent_and_an_unbound_one_both_pass();
@@ -541,7 +542,6 @@ mod tests {
         a_page_csr_that_runs_past_its_flat_run_is_refused_by_both_numbers();
     }
 
-    #[test]
     fn an_extent_that_disagrees_with_the_seat_is_refused_by_both_numbers() {
         let envelope = Envelope {
             kv_len: Some(vec![9]),

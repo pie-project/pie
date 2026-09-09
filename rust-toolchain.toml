@@ -1,19 +1,4 @@
-# Pins the toolchain so `edition = "2024"`, the lint set the CI clippy gate
-# enforces, and rustfmt's output are the same on every machine. Without this
-# file the workspace silently tracks whatever `stable` happens to be, which
-# means a clippy release can turn a green CI red on an unchanged tree — and
-# the gated crates' `-D warnings` step makes that failure blocking.
-#
-# Bumping: change `channel`, run the `cargo clippy` and `cargo fmt` steps of
-# `.github/workflows/ci.yml`'s `workspace-check` job, and fix whatever the new
-# release found in the same commit.
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
-# `crates/inferlet` and the guest fixtures under `tests/inferlets` are built
-# with `--target wasm32-wasip2`. Those invocations run inside the repo, so
-# rustup resolves them through THIS file rather than through whatever the CI
-# action installed — declaring the target here is what makes them work. CI's
-# `targets: wasm32-wasip2` input installs it for the action's own toolchain,
-# which is not the one that ends up compiling anything.
 targets = ["wasm32-wasip2"]

@@ -151,13 +151,13 @@ mod tests {
         topology.peers[&id].iter().map(|peer| peer.id).collect()
     }
 
+    #[test]
     fn topology_every_case() {
         pairings_filter_same_roles_and_cross_model_workers();
         fan_in_is_balanced_deterministically();
         roster_projects_into_every_neighbors();
     }
 
-    #[test]
     fn pairings_filter_same_roles_and_cross_model_workers() {
         let mut cluster = Cluster::new();
         let decode_a0 = add_worker(&mut cluster, Role::Decode, "model-a");

@@ -271,6 +271,7 @@ mod tests {
         })
     }
 
+    #[test]
     fn media_every_case() {
         a_matching_submission_scans_to_its_runs();
         two_spans_match_two_runs_in_order();
@@ -282,7 +283,6 @@ mod tests {
         a_run_in_the_second_lane_is_found_and_stays_lane_relative();
     }
 
-    #[test]
     fn a_matching_submission_scans_to_its_runs() {
         let s = span(3);
         let toks: Vec<u32> = [&[10, 11][..], &s.tokens(), &[12][..]].concat();

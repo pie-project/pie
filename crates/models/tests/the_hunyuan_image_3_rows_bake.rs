@@ -44,6 +44,7 @@ fn ranks(sku: &str) -> u32 {
     row(sku).recipe.tp
 }
 
+#[test]
 fn the_hunyuan_image_3_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_seams_it_states();
     the_ports_the_trace_reads_are_the_ports_the_facts_declare();
@@ -55,7 +56,6 @@ fn the_hunyuan_image_3_rows_bake_every_case() {
     every_row_bakes_on_every_platform_at_its_own_rank();
 }
 
-#[test]
 fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
     for sku in ROWS {
         for platform in PLATFORMS {

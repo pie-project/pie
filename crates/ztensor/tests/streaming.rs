@@ -19,6 +19,7 @@ fn payload(seed: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
+#[test]
 fn streaming_every_case() {
     a_streamed_object_matches_a_slice_written_one();
     a_group_type_streams_as_its_canonical_blob();
@@ -33,7 +34,6 @@ fn streaming_every_case() {
     closing_onto_the_wrong_writer_is_refused();
 }
 
-#[test]
 fn a_streamed_object_matches_a_slice_written_one() {
     let a = payload(1, 300_000);
     let b = payload(2, 64);

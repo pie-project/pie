@@ -325,6 +325,7 @@ impl Operands for Spatial {
 mod tests {
     use super::{GridRule, VoxelSegment};
 
+    #[test]
     fn spatial_every_case() {
         a_grid_rule_maps_boxes_the_way_torch_does();
         a_trimmed_shuffle_drops_its_anchor_frames_from_the_box();
@@ -332,7 +333,6 @@ mod tests {
         a_voxel_segment_reads_its_block_off_the_clips_box();
     }
 
-    #[test]
     fn a_grid_rule_maps_boxes_the_way_torch_does() {
         let conv = GridRule::Conv {
             k: [3, 3, 3],

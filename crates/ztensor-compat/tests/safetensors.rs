@@ -45,6 +45,7 @@ fn f32s(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+#[test]
 fn safetensors_every_case() {
     open_and_read();
     dtype_projections();
@@ -53,7 +54,6 @@ fn safetensors_every_case() {
     convert_to_canonical_zt();
 }
 
-#[test]
 fn open_and_read() {
     let a = f32s(&[1.0, 2.0, 3.0, 4.0]);
     let b = vec![7u8; 8];

@@ -65,6 +65,7 @@ fn check(epilogue: Epilogue, m: usize, n: usize, k: usize) {
     assert_eq!(&got[m * n..], &y_raw[m * n..], "{epilogue:?} m={m} n={n} k={k}: the row past m moved");
 }
 
+#[test]
 fn the_skinny_gemm_lands_the_dot_and_its_epilogue_every_case() {
     the_plain_projection_answers_the_dot_at_one_ragged_and_full_rows();
     the_softcap_epilogue_lands_the_capped_logit();
@@ -72,7 +73,6 @@ fn the_skinny_gemm_lands_the_dot_and_its_epilogue_every_case() {
     a_shape_the_block_does_not_divide_is_refused_without_firing();
 }
 
-#[test]
 fn the_plain_projection_answers_the_dot_at_one_ragged_and_full_rows() {
     for m in [1usize, 5, ROWS as usize] {
         check(Epilogue::Store, m, 192, 128);

@@ -26,13 +26,13 @@ mod hdf5 {
         b
     }
 
+    #[test]
     fn hostile_every_case() {
         heap_address_wraparound();
         btree_address_wraparound();
         heap_data_offset_out_of_range();
     }
 
-    #[test]
     fn heap_address_wraparound() {
         let path = tmp("c1.h5");
         fs::write(&path, superblock(96, u64::MAX, 96)).unwrap();
@@ -77,12 +77,12 @@ mod gguf {
         out.extend(s.as_bytes());
     }
 
+    #[test]
     fn hostile_1_every_case() {
         data_section_past_eof();
         lying_counts_do_not_allocate();
     }
 
-    #[test]
     fn data_section_past_eof() {
         let mut b = Vec::new();
         b.extend(b"GGUF");
@@ -151,13 +151,13 @@ mod npz {
         path
     }
 
+    #[test]
     fn hostile_2_every_case() {
         reversed_shape_parens();
         huge_declared_shape_rejected();
         duplicate_names_are_unambiguous();
     }
 
-    #[test]
     fn reversed_shape_parens() {
         let path = write_npz("c9.npz", &[("t", npy("<f4", ")junk(", &[]), false)]);
         assert!(ztensor_compat::open(&path).is_err());
@@ -227,12 +227,12 @@ mod pt {
         path
     }
 
+    #[test]
     fn hostile_3_every_case() {
         memo_self_doubling_is_bounded();
         markless_pop_is_linear();
     }
 
-    #[test]
     fn memo_self_doubling_is_bounded() {
         let mut p = vec![0x80, 0x02];
         p.extend([0x8c, 0x01, b'x']); // SHORT_BINUNICODE "x"

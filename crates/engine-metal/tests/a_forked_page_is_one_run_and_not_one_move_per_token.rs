@@ -24,6 +24,7 @@ fn tail(src_page: u32, dst_page: u32, from: u32, tokens: u32) -> Vec<KvMove> {
         .collect()
 }
 
+#[test]
 fn a_forked_page_is_one_run_and_not_one_move_per_token_every_case() {
     a_page_pair_is_one_move_over_the_whole_page();
     a_forked_tail_is_one_run_and_not_one_move_per_token();
@@ -37,7 +38,6 @@ fn a_forked_page_is_one_run_and_not_one_move_per_token_every_case() {
     the_two_spellings_are_one_list_of_runs();
 }
 
-#[test]
 fn a_page_pair_is_one_move_over_the_whole_page() {
     let plan = Move::plan(&copy(&[3, 4], &[9, 10], Vec::new()), PAGE).expect("the plan");
     assert_eq!(

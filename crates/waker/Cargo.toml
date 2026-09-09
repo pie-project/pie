@@ -10,17 +10,11 @@ license = "Apache-2.0"
 name = "waker"
 path = "src/lib.rs"
 
-# `--cfg loom` is set via RUSTFLAGS by the loom model-check run; declare it so
-# rustc's check-cfg lint does not flag every gate.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
-# Loom model checking: real dependency under `--cfg loom` only (the sync shim
-# swaps to loom types); invisible to normal builds.
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
-# tokio is only used by the non-loom async tests; gate it away from the loom
-# build (tokio itself does not compile under a global `--cfg loom`).
 [target.'cfg(not(loom))'.dev-dependencies]
 tokio = { version = "1", features = ["rt", "time", "macros"] }

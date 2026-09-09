@@ -299,6 +299,7 @@ fn rank(kind: wgpu::DeviceType, preference: wgpu::PowerPreference) -> u8 {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>, Option<u32>) {
     use ash::vk;
     let Some(hal) = (unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }) else {
@@ -347,6 +348,11 @@ fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>, Option<u3
         cores.filter(|&n| n > 0),
         Some(subgroup.subgroup_size).filter(|&n| n > 0),
     )
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn vulkan_facts(_adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>, Option<u32>) {
+    (None, None, None)
 }
 
 impl Context {

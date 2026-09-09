@@ -14,6 +14,7 @@ fn file(name: &str, tensor: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
+#[test]
 fn merge_every_case() {
     tensors_are_one_name_space_that_remembers_its_files();
     offsets_stay_relative_to_their_own_file();
@@ -23,7 +24,6 @@ fn merge_every_case() {
     an_absent_tensor_is_not_found();
 }
 
-#[test]
 fn tensors_are_one_name_space_that_remembers_its_files() {
     let a = vec![1u8; 64];
     let b = vec![2u8; 32];

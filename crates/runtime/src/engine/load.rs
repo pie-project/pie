@@ -368,6 +368,7 @@ mod tests {
         writer.finish().expect("finish the checkpoint");
     }
 
+    #[test]
     fn load_every_case() {
         an_unknown_row_name_is_refused_with_the_catalog();
         a_row_that_does_not_read_the_checkpoint_refuses_by_name();
@@ -375,7 +376,6 @@ mod tests {
         the_rows_first_fits_wins_hides_are_reachable_by_name();
     }
 
-    #[test]
     fn an_unknown_row_name_is_refused_with_the_catalog() {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = dir.path().join("stranger.zt");

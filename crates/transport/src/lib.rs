@@ -79,6 +79,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn lib_every_case() {
         local_recv_acknowledges_colocated_peer();
         local_mapped_send_copies_distinct_pages_across_all_regions();
@@ -87,7 +88,6 @@ mod tests {
         local_backend_has_no_connect_metadata();
     }
 
-    #[test]
     fn local_recv_acknowledges_colocated_peer() {
         let reg = Registry::local_only(Box::<FakeCopier>::default());
         let decode = reg

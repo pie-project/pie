@@ -804,6 +804,7 @@ type = "metal"
 device = ["cpu"]
 "#;
 
+    #[test]
     fn config_every_case() {
         rejects_the_legacy_unit_suffixed_names();
         a_silence_timeout_under_the_submit_deadline_is_refused();
@@ -817,7 +818,6 @@ device = ["cpu"]
         rejects_a_cache_section();
     }
 
-    #[test]
     fn rejects_the_legacy_unit_suffixed_names() {
         for (section, legacy) in [
             ("sandbox", "wasm_max_memory_mb = 4096"),

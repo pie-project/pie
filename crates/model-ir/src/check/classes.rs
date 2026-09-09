@@ -584,6 +584,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn classes_every_case() {
         a_split_and_its_merge_resolve_to_one_arm_per_class();
         a_gap_in_the_arms_is_uncovered_and_names_the_word();
@@ -591,7 +592,6 @@ mod tests {
         a_cache_write_is_its_own_root_and_an_unread_op_is_dead();
     }
 
-    #[test]
     fn a_split_and_its_merge_resolve_to_one_arm_per_class() {
         let mut b = Build::new();
         let q = b.input();

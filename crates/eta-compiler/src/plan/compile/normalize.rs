@@ -386,12 +386,12 @@ mod value_domain_tests {
     use super::*;
     use crate::plan::compile::signature::stage_signature;
 
+    #[test]
     fn normalize_every_case() {
         the_signature_still_depends_on_value_domains();
         reductions_are_per_row_by_falling_through();
     }
 
-    #[test]
     fn the_signature_still_depends_on_value_domains() {
         let mut stage = NormalizedStage {
             stage: Stage::Epilogue,

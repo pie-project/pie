@@ -715,6 +715,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn layout_every_case() {
         a_banked_table_of_no_rows_is_refused_by_name();
         a_row_map_that_is_not_an_i32_vector_is_refused_by_name();
@@ -726,7 +727,6 @@ mod tests {
         a_destination_too_short_for_the_blocks_is_refused_by_name();
     }
 
-    #[test]
     fn a_banked_table_of_no_rows_is_refused_by_name() {
         let probe = Probe::default();
         let why = embed_gather_mb_4bit(

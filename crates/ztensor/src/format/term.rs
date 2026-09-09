@@ -52,7 +52,7 @@ impl Leaf {
 
     pub fn width(self) -> Option<u64> {
         let bits = self.bits();
-        (bits % 8 == 0).then_some(bits / 8)
+        bits.is_multiple_of(8).then_some(bits / 8)
     }
 
     pub fn parse(s: &str) -> Option<Leaf> {
@@ -461,6 +461,7 @@ impl std::str::FromStr for Term {
 mod tests {
     use super::*;
 
+    #[test]
     fn term_every_case() {
         round_trips_and_is_canonical();
         planes_of_u4g64();
@@ -468,7 +469,6 @@ mod tests {
         content_rules();
     }
 
-    #[test]
     fn round_trips_and_is_canonical() {
         for s in [
             "bf16",

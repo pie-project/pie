@@ -3833,12 +3833,12 @@ mod tests {
         }
     }
 
+    #[test]
     fn worker_every_case() {
         a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
         a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
     }
 
-    #[test]
     fn a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight() {
         let (reply_tx, reply_rx) = crossbeam::channel::unbounded();
         let mut lane = EngineLoop::spawn(

@@ -100,12 +100,12 @@ fn run(shell: &mut Shell, slot: u32, drafts: bool) -> Vec<Vec<f32>> {
     rows
 }
 
+#[test]
 fn the_block_drafter_loads_and_leaves_the_trunk_alone_every_case() {
     the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit();
     a_draft_block_fires_and_the_drafter_answers_it();
 }
 
-#[test]
 fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
     if !engine_metal::device::present() {
         eprintln!("skipping: this machine publishes no Metal device");

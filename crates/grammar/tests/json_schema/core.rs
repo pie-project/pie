@@ -1,13 +1,13 @@
 use crate::common::grammar_accepts as is_grammar_accept_string_g;
 use ::grammar::json_schema::{JsonSchemaOptions, builtin_json_grammar, json_schema_to_grammar};
 
+#[test]
 fn core_every_case() {
     test_builtin_json_accepts_basic_types();
     test_object_min_gt_max_properties_error();
     test_object_required_exceeds_max_properties_error();
 }
 
-#[test]
 fn test_builtin_json_accepts_basic_types() {
     let g = builtin_json_grammar().unwrap();
 

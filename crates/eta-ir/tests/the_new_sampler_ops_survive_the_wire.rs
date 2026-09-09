@@ -24,13 +24,13 @@ fn container(ops: Vec<Op>) -> TraceContainer {
     }
 }
 
+#[test]
 fn the_new_sampler_ops_survive_the_wire_every_case() {
     the_appended_tags_are_the_numbers_the_wire_froze();
     a_sampler_epilogue_of_new_ops_round_trips();
     an_unknown_rng_kind_is_refused_rather_than_read_as_uniform();
 }
 
-#[test]
 fn the_appended_tags_are_the_numbers_the_wire_froze() {
     for (tag, name) in [
         (tags::EXP, "exp"),

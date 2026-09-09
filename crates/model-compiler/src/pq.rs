@@ -598,13 +598,13 @@ mod tests {
         }
     }
 
+    #[test]
     fn pq_every_case() {
         a_q_node_whose_fulls_are_not_at_an_end_is_the_failure();
         runs_counts_the_launches_a_split_would_take();
         admits_refuses_anything_that_is_not_a_permutation_of_the_leaves();
     }
 
-    #[test]
     fn a_q_node_whose_fulls_are_not_at_an_end_is_the_failure() {
         let mut tree = PqTree::universe(3);
         assert!(tree.reduce(&[0, 1]));

@@ -58,12 +58,12 @@ fn shapes() -> Vec<(u32, u32)> {
         .collect()
 }
 
+#[test]
 fn a_quantized_matmul_is_priced_by_its_rows_every_case() {
     every_row_count_is_timed();
     every_folded_point_answers_the_one_row_point();
 }
 
-#[test]
 fn every_row_count_is_timed() {
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");

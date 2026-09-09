@@ -376,12 +376,12 @@ mod tests {
     use super::binds_block;
     use crate::types::{BackendKind, QuantScheme};
 
+    #[test]
     fn validate_every_case() {
         the_k_quants_bind_on_every_backend_with_a_stored_block_point();
         the_small_blocks_and_the_lattices_bind_nowhere();
     }
 
-    #[test]
     fn the_k_quants_bind_on_every_backend_with_a_stored_block_point() {
         let k_quants = [
             QuantScheme::GgufQ2K,

@@ -162,13 +162,13 @@ mod tests {
         listen: Option<String>,
     }
 
+    #[test]
     fn lib_every_case() {
         per_role_identities();
         global_args_flatten_with_role_flag();
         config_source_reads_explicit_and_errors_on_missing();
     }
 
-    #[test]
     fn per_role_identities() {
         assert_eq!(BootSpec::worker().name, "worker");
         assert_eq!(BootSpec::worker().default_config_filename, "worker.toml");

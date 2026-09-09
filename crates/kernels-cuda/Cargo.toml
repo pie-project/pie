@@ -8,49 +8,28 @@ license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 publish = false
 
-# `build.rs` regenerates the carried-header table into OUT_DIR: a checked-in
-# list still compiles when stale, and a stale list is a first-fire failure.
 
 [lib]
 name = "kernels_cuda"
 path = "src/lib.rs"
 
 [features]
-# Nothing by default: the handle vocabulary and every entry function compile
-# with no toolkit present, and a fire without a runtime answers with a typed
-# refusal — which keeps a plain workspace build green everywhere.
 default = []
 
-# Turns the runtime on. The ABI pin below is the one place the CUDA version is
-# spelled; if a second ABI returns, this becomes `cuda-13` beside its sibling
-# rather than an alias for either.
 cuda = ["dep:cudarc", "cudarc/cuda-13000"]
 
 [dependencies]
-# `Dtype`, and that is the whole edge: a kernel crate must not carry the IR's
-# op enums and validator in reach.
 dtype = { path = "../dtype" }
 
-# Dynamically loaded (`fallback-dynamic-loading`), so nothing links a toolkit
-# and a build on a CUDA-less box still produces a binary that runs on one with
-# a driver. `nvrtc` is required, not an optimisation: a kernel here exists only
-# as text, so a process that cannot open `libnvrtc.so` cannot fire one.
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
     "std",
     "driver",
     "runtime",
     "nvrtc",
-    # `linear::dense`'s `cublasLtMatmul` autotuner and plan cache. Bindings
-    # only — symbols still resolve by `dlopen` on first use.
     "cublas",
     "cublaslt",
-    # `collective`'s entries, bindings only as above: a box with no NCCL builds
-    # and serves, since single-rank contexts carry no communicator and
-    # `collective::` answers them with a typed refusal.
     "nccl",
     "fallback-dynamic-loading",
 ] }
 
-# A refusal on the launch path is reported once per symbol rather than once per
-# layer per token.
 tracing = "0.1"

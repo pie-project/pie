@@ -65,12 +65,12 @@ mod tests {
             .collect()
     }
 
+    #[test]
     fn arena_every_case() {
         every_op_output_resolves_and_nothing_else_does();
         the_carve_fits_the_allocation_it_asks_for();
     }
 
-    #[test]
     fn every_op_output_resolves_and_nothing_else_does() {
         let (trace, compiled) = compiled();
         let slots = rects(&compiled.arena, 13, 2);

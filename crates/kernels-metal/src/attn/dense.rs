@@ -136,6 +136,7 @@ mod tests {
         Tensor::new(2, images + 1, 1, Dtype::I32)
     }
 
+    #[test]
     fn dense_every_case() {
         the_head_lands_on_the_tightest_stamp_that_holds_it();
         a_head_past_the_last_stamp_is_refused_by_name();
@@ -145,7 +146,6 @@ mod tests {
         an_element_this_plane_has_no_point_for_is_refused_by_dtype();
     }
 
-    #[test]
     fn the_head_lands_on_the_tightest_stamp_that_holds_it() {
         assert_eq!(stamp_for(40), Some(0));
         assert_eq!(stamp_for(64), Some(0));

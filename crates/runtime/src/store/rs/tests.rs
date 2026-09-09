@@ -29,6 +29,7 @@ fn write_state(store: &mut RsStore, ws: RsWorkingSetId) {
     settled(store, prepared);
 }
 
+#[test]
 fn tests_every_case() {
     run_ahead_successor_never_resets_twice();
     run_ahead_successor_after_fork_cows_exactly_once();
@@ -36,7 +37,6 @@ fn tests_every_case() {
     a_bound_driven_to_zero_is_exact_again();
 }
 
-#[test]
 fn run_ahead_successor_never_resets_twice() {
     let mut s = store();
     let ws = s.create_working_set(geom());

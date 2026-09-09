@@ -122,6 +122,7 @@ impl UnigramScores {
 mod tests {
     use super::*;
 
+    #[test]
     fn unigram_every_case() {
         the_walk_is_exact_and_not_greedy();
         the_walk_takes_the_long_piece_when_it_scores_better();
@@ -130,7 +131,6 @@ mod tests {
         an_unk_outside_the_vocabulary_is_refused_at_build();
     }
 
-    #[test]
     fn the_walk_is_exact_and_not_greedy() {
         let pieces = vec![
             ("<unk>".to_string(), -100.0),

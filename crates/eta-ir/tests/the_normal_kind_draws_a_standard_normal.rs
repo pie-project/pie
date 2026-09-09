@@ -7,13 +7,13 @@ fn draws(key: u32, counter: u32) -> Vec<f32> {
     (0..N as u32).map(|i| hash_normal(seed, i)).collect()
 }
 
+#[test]
 fn the_normal_kind_draws_a_standard_normal_every_case() {
     a_million_draws_have_the_moments_of_a_standard_normal();
     the_draw_is_the_pair_transform_the_contract_states();
     two_counters_of_one_key_draw_independent_noise();
 }
 
-#[test]
 fn a_million_draws_have_the_moments_of_a_standard_normal() {
     let z = draws(0x7ce1, 0);
 

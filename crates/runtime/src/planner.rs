@@ -2730,6 +2730,7 @@ mod service_order_tests {
         );
     }
 
+    #[test]
     fn planner_every_case() {
         a_restore_yields_the_head_to_a_younger_allocation();
         a_restore_takes_the_head_once_the_fleet_has_stalled();
@@ -2738,7 +2739,6 @@ mod service_order_tests {
         returning_host_room_resumes_the_yield();
     }
 
-    #[test]
     fn a_restore_yields_the_head_to_a_younger_allocation() {
         let (mut inner, pids) = fleet(&[
             (1, Residency::Evicted, true),

@@ -2016,6 +2016,7 @@ fn records_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
     fn launch_every_case() {
         a_channel_this_instance_does_not_carry_is_refused_by_number();
         the_shared_op_record_is_the_emitted_one();
@@ -2024,7 +2025,6 @@ mod tests {
         the_grouped_samplers_take_the_bindings_this_file_writes();
     }
 
-    #[test]
     fn a_channel_this_instance_does_not_carry_is_refused_by_number() {
         let rings = Rings {
             slabs: Vec::new(),

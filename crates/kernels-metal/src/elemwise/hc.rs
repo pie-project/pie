@@ -579,13 +579,13 @@ mod tests {
         Tensor::new(buf, rows, width, Dtype::F32)
     }
 
+    #[test]
     fn hc_every_case() {
         a_fan_past_the_unrolled_maximum_is_refused_by_name();
         a_row_that_is_not_whole_streams_is_refused_by_name();
         an_unstamped_dtype_is_refused_by_name();
     }
 
-    #[test]
     fn a_fan_past_the_unrolled_maximum_is_refused_by_name() {
         let probe = Probe::default();
         let err = expand(&probe, bf16(1, ROWS, H), 9, bf16(2, ROWS, 9 * H))

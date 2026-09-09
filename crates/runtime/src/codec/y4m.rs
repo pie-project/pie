@@ -45,12 +45,12 @@ pub fn encode(
 mod tests {
     use super::*;
 
+    #[test]
     fn y4m_every_case() {
         the_stream_is_a_header_and_then_one_frame_each();
         odd_dimensions_are_refused_by_name();
     }
 
-    #[test]
     fn the_stream_is_a_header_and_then_one_frame_each() {
         let rgb = vec![0u8; 4 * 2 * 3 * 3];
         let out = encode(&rgb, 4, 2, 3, 25.0).expect("encode");

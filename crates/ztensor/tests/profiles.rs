@@ -72,6 +72,7 @@ fn shape(dims: &[u64]) -> (Value, Value) {
     )
 }
 
+#[test]
 fn profiles_every_case() {
     a_group_type_round_trips_plane_by_plane();
     planes_and_padded_bytes_are_the_same_object();
@@ -94,13 +95,12 @@ fn profiles_every_case() {
     a_registered_layout_rejects_a_file_that_violates_it();
 }
 
-#[test]
 fn a_group_type_round_trips_plane_by_plane() {
     let path = tmp("planes.zt");
     let term = Term::parse("g32_u4_bf16_b_bf16").unwrap();
     let codes: Vec<u8> = (0..64).collect();
-    let scales = vec![0x3fu8; 8];
-    let biases = vec![0x40u8; 8];
+    let scales = [0x3fu8; 8];
+    let biases = [0x40u8; 8];
 
     let mut w = Writer::create(&path).unwrap();
     w.object("q", |o| {
@@ -732,6 +732,7 @@ mod zstd_seekable {
             .unwrap()
     }
 
+    #[test]
     fn profiles_1_every_case() {
         encoded_dense_roundtrip();
         encoded_empty_blob();
@@ -740,7 +741,6 @@ mod zstd_seekable {
         corrupt_stream_rejected_not_zero_filled();
     }
 
-    #[test]
     fn encoded_dense_roundtrip() {
         let path = tmp("zstd.zt");
         let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();

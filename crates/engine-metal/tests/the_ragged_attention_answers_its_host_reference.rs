@@ -297,12 +297,12 @@ fn run_case(rig: &Rig, head_dim: usize, mask_kind: &str) {
     }
 }
 
+#[test]
 fn the_ragged_attention_answers_its_host_reference_every_case() {
     both_arms_answer_the_reference_under_every_mask();
     a_head_width_the_matrix_unit_cannot_tile_still_answers();
 }
 
-#[test]
 fn both_arms_answer_the_reference_under_every_mask() {
     let Some(rig) = Rig::open() else {
         eprintln!("not asked: no Metal device");

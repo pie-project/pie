@@ -296,6 +296,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn fire_plan_every_case() {
         truncated_members_seriate_deepest_first();
         full_depth_hook_sorts_before_truncated_members();
@@ -307,7 +308,6 @@ mod tests {
         device_geometry_members_are_forced_last();
     }
 
-    #[test]
     fn truncated_members_seriate_deepest_first() {
         let band = |k: u32, arrival: usize| {
             let mut m = member(false, false, false, arrival);

@@ -476,6 +476,7 @@ mod tests {
             .collect()
     }
 
+    #[test]
     fn mp4_every_case() {
         nal_units_ignore_start_code_length();
         parameter_sets_leave_the_sample_and_land_in_avcc();
@@ -485,7 +486,6 @@ mod tests {
         a_truncated_box_length_is_caught_rather_than_walked_past();
     }
 
-    #[test]
     fn nal_units_ignore_start_code_length() {
         let s = [0u8, 0, 0, 1, 0xaa, 0xbb, 0, 0, 1, 0xcc];
         let n = nal_units(&s);

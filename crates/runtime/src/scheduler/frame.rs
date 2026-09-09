@@ -1424,6 +1424,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn frame_every_case() {
         seals_complete_lanes_and_orders_waves_by_slot();
         a_grouped_lanes_first_frame_waits_for_its_cohort();
@@ -1442,7 +1443,6 @@ mod tests {
         consumed_release_leaves_no_phantom_hold_for_bystander();
     }
 
-    #[test]
     fn seals_complete_lanes_and_orders_waves_by_slot() {
         let mut policy = FramePolicy::new(4, 64, 4096, None);
         let (a, b) = (pid(), pid());

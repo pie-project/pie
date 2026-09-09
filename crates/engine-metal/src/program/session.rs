@@ -684,6 +684,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn session_every_case() {
         an_adapter_prologue_and_a_sampling_epilogue_are_one_fire();
         two_launching_stages_each_get_their_own_plan();
@@ -692,7 +693,6 @@ mod tests {
         a_fault_outranks_a_decline_in_either_order();
     }
 
-    #[test]
     fn an_adapter_prologue_and_a_sampling_epilogue_are_one_fire() {
         super::stage_plans_are_parallel(&[(0xa11, false), (0xb22, true)], &[0xa11, 0xb22])
             .expect("the plans are parallel and the launching stage is its own");

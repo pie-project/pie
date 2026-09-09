@@ -610,6 +610,7 @@ mod tests {
         Tensor::new(buf, rows, width, Dtype::Bf16)
     }
 
+    #[test]
     fn norm_every_case() {
         a_plane_that_is_not_one_scalar_per_column_is_refused_by_name();
         a_plane_in_another_element_is_refused_by_name();
@@ -618,7 +619,6 @@ mod tests {
         a_degenerate_centred_norm_is_refused_by_name();
     }
 
-    #[test]
     fn a_plane_that_is_not_one_scalar_per_column_is_refused_by_name() {
         let probe = Probe::default();
         let out = bf16(1, 5, WIDTH);

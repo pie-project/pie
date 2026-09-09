@@ -354,13 +354,13 @@ mod tests {
         Tensor::new(12, 1, (MULTS.len() + 2 * PRIMES.len()) as u32, Dtype::U64)
     }
 
+    #[test]
     fn ple_every_case() {
         the_constants_plane_is_multipliers_then_primes_then_offsets();
         a_hash_plane_the_shape_does_not_describe_is_refused();
         a_head_count_the_orders_do_not_cover_is_refused();
     }
 
-    #[test]
     fn the_constants_plane_is_multipliers_then_primes_then_offsets() {
         let plane = hash_constants(&MULTS, &PRIMES, &OFFSETS);
         assert_eq!(plane.len(), 3 + 4 + 4);

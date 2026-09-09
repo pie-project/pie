@@ -1405,6 +1405,7 @@ pub fn emit_streamed_region(
 mod tests {
     use super::*;
 
+    #[test]
     fn streamed_every_case() {
         the_tree_has_the_levels_the_runtime_walks();
         a_step_round_trips();
@@ -1412,7 +1413,6 @@ mod tests {
         a_register_reads_as_a_memory_load_would();
     }
 
-    #[test]
     fn the_tree_has_the_levels_the_runtime_walks() {
         assert_eq!(reduce_levels(0), 1);
         assert_eq!(reduce_levels(1), 1);

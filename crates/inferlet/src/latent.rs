@@ -520,6 +520,7 @@ pub async fn encode_ids_rows(ids: &[u32], reading: &str) -> Result<(Vec<f32>, u3
 mod tests {
     use super::*;
 
+    #[test]
     fn latent_every_case() {
         a_flow_schedule_ends_at_zero_and_steps_downhill();
         a_shift_bends_the_sigmas_up();
@@ -532,7 +533,6 @@ mod tests {
         a_grid_only_convention_leaves_the_time_axis_at_zero();
     }
 
-    #[test]
     fn a_flow_schedule_ends_at_zero_and_steps_downhill() {
         let fact = ScheduleFact {
             kind: ScheduleKind::Flow,

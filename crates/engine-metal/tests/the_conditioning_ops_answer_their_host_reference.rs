@@ -164,6 +164,7 @@ const LANES: u32 = 3;
 
 const LANE_OF_ROW: [i32; ROWS as usize] = [0, 0, 1, 2, 1, 2, 2];
 
+#[test]
 fn the_conditioning_ops_answer_their_host_reference_every_case() {
     the_pointwise_arms_answer_the_reference_at_both_elements();
     a_modulation_reads_its_vector_per_lane_and_per_token();
@@ -177,7 +178,6 @@ fn the_conditioning_ops_answer_their_host_reference_every_case() {
     the_residual_blend_scores_normalized_and_blends_raw();
 }
 
-#[test]
 fn the_pointwise_arms_answer_the_reference_at_both_elements() {
     let Some(rig) = Rig::open() else {
         eprintln!("not asked: no Metal device");

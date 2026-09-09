@@ -386,13 +386,13 @@ mod tests {
         unsafe { Ctx::on(core::ptr::null_mut()) }
     }
 
+    #[test]
     fn ctx_every_case() {
         an_unarmed_context_quantizes_nothing();
         the_full_fires_extent_rounds_up_to_the_bucket();
         disarming_puts_the_extent_back_the_way_the_fire_found_it();
     }
 
-    #[test]
     fn an_unarmed_context_quantizes_nothing() {
         let ctx = bare();
         for rows in [0, 1, 3, 9, 4096] {

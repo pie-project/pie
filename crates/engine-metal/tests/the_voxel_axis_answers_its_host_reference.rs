@@ -136,6 +136,7 @@ fn voxels(extents: &[[i32; 3]]) -> usize {
     extents.iter().map(|e| (e[0] * e[1] * e[2]) as usize).sum()
 }
 
+#[test]
 fn the_voxel_axis_answers_its_host_reference_every_case() {
     every_grid_rule_maps_the_box_its_host_twin_maps();
     the_convolution_answers_the_tap_walk();
@@ -145,7 +146,6 @@ fn the_voxel_axis_answers_its_host_reference_every_case() {
     the_frame_cache_stores_the_frames_its_next_chunk_pads_with();
 }
 
-#[test]
 fn every_grid_rule_maps_the_box_its_host_twin_maps() {
     let Some(rig) = Rig::open() else {
         eprintln!("not asked: no Metal device");

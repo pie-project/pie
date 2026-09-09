@@ -104,13 +104,13 @@ mod tests {
     use super::*;
     use crate::store::registry;
 
+    #[test]
     fn seat_every_case() {
         two_working_sets_never_share_a_seat();
         a_fire_wider_than_the_pools_is_refused_by_name();
         releasing_a_working_set_returns_its_seats();
     }
 
-    #[test]
     fn two_working_sets_never_share_a_seat() {
         let model = registry::register_model(16, &[8], &[4]);
         let stores = registry::get(model, 0);

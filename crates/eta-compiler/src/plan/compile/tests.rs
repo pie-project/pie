@@ -178,12 +178,12 @@ fn top_k_program(global_channel_offset: usize) -> BoundTrace {
     .unwrap()
 }
 
+#[test]
 fn tests_every_case() {
     identical_epilogues_share_signature_across_programs();
     top_k_has_one_canonical_signature_and_library_kind();
 }
 
-#[test]
 fn identical_epilogues_share_signature_across_programs() {
     let first = program(1, 1);
     let second = program(2, 2);

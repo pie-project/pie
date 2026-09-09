@@ -538,13 +538,13 @@ mod tests {
     
     use crate::grammar::Grammar;
 
+    #[test]
     fn matcher_every_case() {
         test_star_quantifier();
         test_plus_quantifier();
         test_question_quantifier();
     }
 
-    #[test]
     fn test_star_quantifier() {
         let ebnf = r#"root ::= "a"*"#;
         let grammar = Arc::new(Grammar::from_ebnf(ebnf, "root").unwrap());

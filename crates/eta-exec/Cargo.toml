@@ -12,19 +12,10 @@ publish = false
 name = "eta_exec"
 path = "src/lib.rs"
 
-# Affordable here and not in the shells: `unsafe_code = "forbid"` holds because
-# this layer is arithmetic over `#[repr(C)]` records and `Vec`s, which is also
-# the mechanical proof that the ETA plane needs no device.
 [lints]
 workspace = true
 
 [dependencies]
-# The op table, dtypes, intrinsic ids, the port registry and the canonical RNG
-# contract — `eval_op`'s numerics are a contract, written down here.
 eta-ir = { path = "../eta-ir" }
 
-# For the artifact vocabulary both ends must agree on — `plan`'s lane-table ABI
-# and version numbers, `codegen::launch`'s `LaunchPackage` — not the emitter:
-# nothing here plans, emits or compiles. Importing them replaces five copies
-# that were only safe while a drift test watched them.
 eta-compiler = { path = "../eta-compiler" }

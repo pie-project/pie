@@ -501,6 +501,7 @@ mod tests {
         ws
     }
 
+    #[test]
     fn rs_every_case() {
         first_fire_resets_then_continues_in_place();
         every_plan_shape_lowers_to_its_lane_verb();
@@ -512,7 +513,6 @@ mod tests {
         demand_counts_buffered_materialization();
     }
 
-    #[test]
     fn first_fire_resets_then_continues_in_place() {
         let mut store = RsStore::new(4);
         let ws = store.create_working_set(geom());

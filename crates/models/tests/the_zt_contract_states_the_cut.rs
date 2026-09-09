@@ -199,6 +199,7 @@ fn by_load(row: &models::Sku) -> bool {
     row.recipe.weights.iter().all(|w| matches!(w, Dtype::Bf16 | Dtype::Mxfp4))
 }
 
+#[test]
 fn the_zt_contract_states_the_cut_every_case() {
     one_entry_per_plan_param_under_the_plans_own_names();
     a_cut_param_carries_a_shard_per_leg();
@@ -208,7 +209,6 @@ fn the_zt_contract_states_the_cut_every_case() {
     a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in();
 }
 
-#[test]
 fn one_entry_per_plan_param_under_the_plans_own_names() {
     let mut faults = Vec::new();
 

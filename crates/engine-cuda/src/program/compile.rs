@@ -795,13 +795,13 @@ fn fnv1a64_with(bytes: &[u8], tails: &[&[u8]]) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
     fn compile_every_case() {
         editing_the_source_changes_the_disk_key_with_no_version_bump();
         a_corrupt_entry_is_a_miss_and_is_deleted();
         a_disabled_cache_is_a_miss_and_not_a_failure();
     }
 
-    #[test]
     fn editing_the_source_changes_the_disk_key_with_no_version_bump() {
         let identity = "0100000000000000000300000000000000000000-v0003000400000003 00000015";
         let before = disk_key(identity, "__global__ void k() { a(); }");

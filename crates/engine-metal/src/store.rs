@@ -641,13 +641,13 @@ mod tests {
         Some(Context::bind().expect("the system device"))
     }
 
+    #[test]
     fn store_every_case() {
         a_copied_slot_reads_back_as_its_source();
         a_slot_past_the_pool_is_a_ceiling();
         an_attention_only_plan_answers_ok();
     }
 
-    #[test]
     fn a_copied_slot_reads_back_as_its_source() {
         let Some(device) = device() else { return };
         const STRIDE: u64 = 8;

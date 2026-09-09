@@ -32,6 +32,7 @@ fn deflated_npz(name: &str, tensors: &[(&str, u8, usize)]) -> PathBuf {
     path
 }
 
+#[test]
 fn threads_every_case() {
     threads_contending_on_an_opaque_reader_all_get_the_right_bytes();
     one_hot_tensor_read_by_everyone_at_once();
@@ -39,7 +40,6 @@ fn threads_every_case() {
     a_source_can_be_moved_to_another_thread();
 }
 
-#[test]
 fn threads_contending_on_an_opaque_reader_all_get_the_right_bytes() {
     let tensors: Vec<(&str, u8, usize)> = vec![
         ("a", 0xA1, 4096),

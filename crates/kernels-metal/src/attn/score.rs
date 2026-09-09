@@ -252,6 +252,7 @@ mod tests {
         )
     }
 
+    #[test]
     fn score_every_case() {
         the_head_lands_on_the_tightest_stamp_that_holds_it();
         a_sliding_window_is_refused_as_a_different_quantity();
@@ -262,7 +263,6 @@ mod tests {
         an_element_this_plane_has_no_point_for_is_refused_by_dtype();
     }
 
-    #[test]
     fn the_head_lands_on_the_tightest_stamp_that_holds_it() {
         assert_eq!(stamp_for(40), Some(0));
         assert_eq!(stamp_for(64), Some(0));

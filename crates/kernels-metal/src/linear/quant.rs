@@ -733,6 +733,7 @@ fn extent(op: &'static str, act: Tensor, y: Tensor) -> Result<(u32, u32, u32), E
 mod tests {
     use super::*;
 
+    #[test]
     fn quant_every_case() {
         the_folded_points_are_stamped_on_five_axes();
         a_batch_between_rungs_takes_the_wider_tile();
@@ -740,7 +741,6 @@ mod tests {
         the_precast_points_are_stamped_at_g64_b4_alone();
     }
 
-    #[test]
     fn the_folded_points_are_stamped_on_five_axes() {
         let point = qmv_rows_point("t", 64, 4, 2, 1).unwrap();
         assert_eq!(point.entry, "affine_qmv_rows_bfloat16_gs_64_b_4_r_2_p_1");

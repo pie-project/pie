@@ -83,6 +83,7 @@ fn write_grouped(path: &Path, object: &str, planes: &[(TensorDecl, Vec<u8>)]) ->
     write_zt_grouped(path, &BTreeMap::new(), &tensors, &[(object.to_string(), names)])
 }
 
+#[test]
 fn ztensor_convert_every_case() {
     a_converted_artifact_reads_back_byte_for_byte();
     a_corrupt_artifact_is_caught_by_its_digest();
@@ -93,7 +94,6 @@ fn ztensor_convert_every_case() {
     a_plain_tensor_carries_its_own_leaf();
 }
 
-#[test]
 fn a_converted_artifact_reads_back_byte_for_byte() {
     let dir = tmpdir("artifact");
     let path = dir.join("model.zt");

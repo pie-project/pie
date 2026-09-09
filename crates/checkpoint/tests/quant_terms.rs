@@ -59,6 +59,7 @@ fn row(scheme: QuantScheme) -> Fmt<'static> {
         .unwrap_or_else(|| panic!("{scheme:?} is listed as having a term and answered None"))
 }
 
+#[test]
 fn quant_terms_every_case() {
     every_scheme_spells_the_row_the_table_says();
     the_schemes_with_no_term_say_so_rather_than_guessing();
@@ -72,7 +73,6 @@ fn quant_terms_every_case() {
     the_structural_answers_come_off_the_term_not_the_name();
 }
 
-#[test]
 fn every_scheme_spells_the_row_the_table_says() {
     for (scheme, spelling) in ROWS {
         assert_eq!(

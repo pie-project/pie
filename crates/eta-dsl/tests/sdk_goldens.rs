@@ -567,13 +567,13 @@ fn programs() -> Vec<(&'static str, Traced)> {
 
 const GOLDENS: &str = "tests/goldens/sdk_containers.txt";
 
+#[test]
 fn sdk_goldens_every_case() {
     sdk_port_goldens_are_pinned();
     the_latent_step_binds_against_a_denoising_model();
     the_vae_readback_binds_against_a_model_that_lands_pixels();
 }
 
-#[test]
 fn sdk_port_goldens_are_pinned() {
     let rendered: String = programs()
         .iter()

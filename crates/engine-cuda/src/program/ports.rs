@@ -497,12 +497,12 @@ mod tests {
     use super::Envelope;
     use eta_ir::registry::Port;
 
+    #[test]
     fn ports_every_case() {
         one_instances_flat_vectors_cut_into_its_lanes_by_the_token_csr();
         a_decode_envelope_resolves_its_three_ports_and_not_the_page_family();
     }
 
-    #[test]
     fn one_instances_flat_vectors_cut_into_its_lanes_by_the_token_csr() {
         let envelope = Envelope {
             qo_indptr: Some(vec![0, 1, 2, 3]),

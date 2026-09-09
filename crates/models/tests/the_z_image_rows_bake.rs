@@ -64,6 +64,7 @@ fn word(reading: u8, stream: Stream) -> u64 {
     Facts::of(&request).word()
 }
 
+#[test]
 fn the_z_image_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states();
     the_ports_the_trace_reads_are_the_ports_the_facts_declare();
@@ -75,7 +76,6 @@ fn the_z_image_rows_bake_every_case() {
     the_generative_facts_state_the_readings_the_schedule_and_the_latent_space();
 }
 
-#[test]
 fn every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states() {
     for sku in ROWS {
         for platform in PLATFORMS {

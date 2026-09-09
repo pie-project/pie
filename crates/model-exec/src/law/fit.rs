@@ -330,13 +330,13 @@ mod tests {
         ]
     }
 
+    #[test]
     fn fit_every_case() {
         a_div_ceil_grid_axis_fits_the_tiling_law_and_names_the_tile();
         an_affine_law_extrapolates_off_the_probed_box();
         a_slot_law_reads_the_descriptor_and_not_the_coordinates();
     }
 
-    #[test]
     fn a_div_ceil_grid_axis_fits_the_tiling_law_and_names_the_tile() {
         let observed: Vec<(Vec<i128>, i128, i128)> = (16..80)
             .map(|rows: i128| {

@@ -126,6 +126,7 @@ fn flip(path: &Path, object: &str, at: u64) {
     file.sync_all().unwrap();
 }
 
+#[test]
 fn serving_artifact_every_case() {
     every_plane_reads_back_as_the_bytes_that_were_written();
     a_tied_plane_is_one_span_under_two_names();
@@ -143,7 +144,6 @@ fn serving_artifact_every_case() {
     every_weight_carries_a_layout_ztensor_itself_defines();
 }
 
-#[test]
 fn every_plane_reads_back_as_the_bytes_that_were_written() {
     let fixture = Fixture::write("roundtrip", emit::SERVING_ALIGN);
     let artifact = Artifact::open(&fixture.path).unwrap();

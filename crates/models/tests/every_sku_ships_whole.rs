@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use checkpoint_dsl::Error;
 
+#[test]
 fn every_sku_ships_whole_every_case() {
     a_sku_name_states_the_world_its_row_ships();
     every_import_row_reads_the_checkpoint_it_is_handed();
@@ -14,7 +15,6 @@ fn every_sku_ships_whole_every_case() {
     gpt_oss_carries_the_block_drafter_too();
 }
 
-#[test]
 fn a_sku_name_states_the_world_its_row_ships() {
     let mut faults = Vec::new();
 

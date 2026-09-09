@@ -114,12 +114,12 @@ fn budgets() -> Budgets {
     })
 }
 
+#[test]
 fn the_patch_axis_seriates_its_own_lanes_every_case() {
     a_class_with_rows_and_no_images_has_a_token_window_and_no_patch_window();
     a_fire_past_the_patch_ceilings_is_refused_by_name();
 }
 
-#[test]
 fn a_class_with_rows_and_no_images_has_a_token_window_and_no_patch_window() {
     let trace = tower_and_trunk();
     let budgets = budgets();

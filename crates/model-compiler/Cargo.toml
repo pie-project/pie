@@ -12,17 +12,9 @@ name = "model_compiler"
 path = "src/lib.rs"
 
 [dependencies]
-# The only dependency, and the architecture is in that fact: baking reads an IR
-# and writes offsets, masks and byte counts. `resolve_classes` stays in
-# `model-ir` because the model test suite calls the same walk at authoring
-# time, and a second implementation here would be a second answer.
 model-ir = { path = "../model-ir" }
 thiserror = "2.0"
 
 [dev-dependencies]
-# The real catalog, and nothing smaller: `tests/every_sku_carves_an_arena.rs`
-# bakes the shipping rows, which a fixture plan cannot check.
-# A dev edge only, and it does not cycle: nothing in `[dependencies]` names
-# `models` or `model-dsl`.
 models = { path = "../models" }
 model-dsl = { path = "../model-dsl" }

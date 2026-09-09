@@ -60,6 +60,7 @@ fn within(got: &[f32], want: &[f32], tolerance: f32, what: &str) {
     }
 }
 
+#[test]
 fn the_sinusoid_embedding_matches_the_diffusers_formula_every_case() {
     the_rows_are_the_ones_the_reference_prints();
     an_odd_width_pads_its_last_column_with_zero();
@@ -67,7 +68,6 @@ fn the_sinusoid_embedding_matches_the_diffusers_formula_every_case() {
     a_whole_rectangle_answers_the_host_reference();
 }
 
-#[test]
 fn the_rows_are_the_ones_the_reference_prints() {
     let got = run(&[1.0, 500.0], 8, 10_000.0, false, 1.0);
     agrees(

@@ -108,6 +108,7 @@ mod tests {
         Err("this door never loads".to_string())
     }
 
+    #[test]
     fn boot_every_case() {
         a_boot_document_that_says_nothing_about_this_engine_still_opens();
         a_boot_document_that_is_not_toml_is_refused_at_the_door();
@@ -117,7 +118,6 @@ mod tests {
         a_tuning_table_is_advisory_and_never_a_refusal();
     }
 
-    #[test]
     fn a_boot_document_that_says_nothing_about_this_engine_still_opens() {
         assert!(open(b"", nothing).is_ok());
         assert!(open(b"[model]\nid = \"qwen35-d0.8b\"\n", nothing).is_ok());

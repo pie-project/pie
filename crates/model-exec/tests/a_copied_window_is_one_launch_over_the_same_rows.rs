@@ -193,12 +193,12 @@ fn fire(trace: &Trace, compiled: &CompiledModel, lanes: &[Lane], copies: bool) -
     (runs, dispatch)
 }
 
+#[test]
 fn a_copied_window_is_one_launch_over_the_same_rows_every_case() {
     a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs();
     the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it();
 }
 
-#[test]
 fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
     let (trace, compiled) = sku();
     let lanes = fragmenting(&compiled);

@@ -18,13 +18,13 @@ fn trace(sku: &str) -> Trace {
     (row(sku).trace)(Platform::Cuda)
 }
 
+#[test]
 fn the_ltx_2_vae_bakes_every_case() {
     the_flagship_declares_the_decode_reading_and_the_miniature_does_not();
     the_shapes_are_the_ltx_decoders();
     the_import_reads_every_decoder_tensor_of_the_real_snapshot_once();
 }
 
-#[test]
 fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
     let facts = row(FLAGSHIP).generative.as_ref().expect("facts");
     let decode = facts

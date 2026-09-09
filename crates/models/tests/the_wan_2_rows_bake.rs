@@ -58,6 +58,7 @@ fn word(reading: u8, stream: Stream) -> u64 {
     Facts::of(&request).word()
 }
 
+#[test]
 fn the_wan_2_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_seams_it_states();
     the_ports_the_trace_reads_are_the_ports_the_facts_declare();
@@ -69,7 +70,6 @@ fn the_wan_2_rows_bake_every_case() {
     the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk();
 }
 
-#[test]
 fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
     for sku in ROWS {
         for platform in PLATFORMS {

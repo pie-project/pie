@@ -196,12 +196,12 @@ impl Drop for HostSource {
 mod tests {
     use super::*;
 
+    #[test]
     fn host_source_every_case() {
         a_staging_larger_than_the_volume_is_refused_by_the_numbers();
         a_source_that_streams_nothing_maps_nothing();
     }
 
-    #[test]
     fn a_staging_larger_than_the_volume_is_refused_by_the_numbers() {
         let Some(free) = free_bytes(&std::env::temp_dir()) else {
             eprintln!("skipping: this filesystem does not answer statvfs");

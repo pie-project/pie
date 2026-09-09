@@ -381,6 +381,7 @@ fn check_mini(src: &ztensor::Source, index: &BTreeSet<String>) {
     type_checks(&contract, src);
 }
 
+#[test]
 fn the_z_image_import_reads_the_diffusers_pipeline_every_case() {
     the_flagship_reads_a_synthetic_pipeline_shaped_like_the_snapshot();
     the_miniature_reads_its_bare_state_dict_and_the_same_names_prefixed();
@@ -389,7 +390,6 @@ fn the_z_image_import_reads_the_diffusers_pipeline_every_case() {
     the_derived_planes_are_stated_through_internal_steps();
 }
 
-#[test]
 fn the_flagship_reads_a_synthetic_pipeline_shaped_like_the_snapshot() {
     let dir = scratch();
     let mut tensors = prefixed("dit.", transformer(&Dims::turbo(), Leaf::F32));

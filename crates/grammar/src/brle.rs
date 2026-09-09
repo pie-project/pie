@@ -687,13 +687,13 @@ impl FusedIterator for RunIterator<'_> {}
 mod tests {
     use super::*;
 
+    #[test]
     fn brle_every_case() {
         roundtrip_complex_pattern();
         from_slice_leading_true_run();
         iter_runs_skips_zero_length_prefix();
     }
 
-    #[test]
     fn roundtrip_complex_pattern() {
         let pattern = vec![
             false, false, true, true, true, false, true, false, false, false,

@@ -83,6 +83,7 @@ fn family(readings: Vec<ReadingFact>) -> Generative {
     }
 }
 
+#[test]
 fn a_reading_states_what_its_pass_binds_every_case() {
     a_well_formed_family_is_accepted_and_states_its_velocity();
     a_reading_resolves_its_ports_by_name_to_kind_relative_indices();
@@ -94,7 +95,6 @@ fn a_reading_states_what_its_pass_binds_every_case() {
     a_position_convention_must_fit_its_positions_port();
 }
 
-#[test]
 fn a_well_formed_family_is_accepted_and_states_its_velocity() {
     let both = family(vec![text(), denoise()]);
     assert_eq!(validate_generative(&both), Ok(()));

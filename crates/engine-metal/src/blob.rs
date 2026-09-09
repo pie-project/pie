@@ -546,6 +546,7 @@ mod tests {
         (mount, store)
     }
 
+    #[test]
     fn blob_every_case() {
         a_manifest_says_its_rank_its_planes_and_their_orientation();
         the_mount_resolves_a_name_and_refuses_everything_else();
@@ -556,7 +557,6 @@ mod tests {
         the_resolver_refuses_by_name();
     }
 
-    #[test]
     fn a_manifest_says_its_rank_its_planes_and_their_orientation() {
         let mount = scratch("manifest");
         let dir = write_adapter(&mount, "alice", 4, (Layout::RankMajor, Layout::OutMajor));

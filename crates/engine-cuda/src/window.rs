@@ -1211,13 +1211,13 @@ mod tests {
         }
     }
 
+    #[test]
     fn window_every_case() {
         a_recording_cursor_with_nowhere_to_put_a_conditional_still_refuses_it();
         the_live_seat_is_every_windows_own_rows_and_offset_at_a_fixed_stride();
         two_masks_share_a_slot_in_every_fire_of_a_key_or_in_none_of_them();
     }
 
-    #[test]
     fn a_recording_cursor_with_nowhere_to_put_a_conditional_still_refuses_it() {
         let cell = At::new();
         let mut eager = Cursor::new(&cell);

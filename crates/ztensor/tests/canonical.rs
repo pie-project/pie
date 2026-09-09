@@ -12,6 +12,7 @@ fn f32s(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+#[test]
 fn canonical_every_case() {
     what_the_writer_produces_is_canonical();
     garbage_between_planes_is_refused();
@@ -24,7 +25,6 @@ fn canonical_every_case() {
     the_checker_disagrees_with_itself_on_different_files();
 }
 
-#[test]
 fn what_the_writer_produces_is_canonical() {
     let path = tmp("canon-yes.zt");
     let mut w = Writer::create(&path).unwrap();

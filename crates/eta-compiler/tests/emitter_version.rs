@@ -38,12 +38,12 @@ fn backend_of(name: &str) -> Backend {
     }
 }
 
+#[test]
 fn emitter_version_every_case() {
     the_pinned_versions_are_the_compiled_ones();
     each_emitter_version_still_describes_its_output();
 }
 
-#[test]
 fn the_pinned_versions_are_the_compiled_ones() {
     for (name, version, _) in PINNED {
         let constant = match backend_of(name) {

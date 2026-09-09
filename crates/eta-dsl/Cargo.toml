@@ -10,15 +10,10 @@ repository = "https://github.com/pie-project/pie"
 keywords = ["pie", "eta", "tracing", "inferlet"]
 categories = ["api-bindings"]
 
-# A host workspace member that also builds for `wasm32-wasip2`: it has no
-# wasm-only dependencies, and being a member is what puts its tests in CI.
 [lib]
 name = "eta_dsl"
 path = "src/lib.rs"
 
-# `std` enables the thread-local trace context and the `std::error::Error`
-# impls. The crate still traces inside a `wasm32-wasip2` inferlet as-is (wasip2
-# provides std `thread_local!`); `no_std` is only for other no_std targets.
 [features]
 default = ["std"]
 std = ["eta-ir/std"]
@@ -26,11 +21,8 @@ std = ["eta-ir/std"]
 [dependencies]
 eta-ir = { path = "../eta-ir", default-features = false }
 
-# Host-only: the CPU reference interpreter for tier-0 parity tests. Dev-deps
-# are excluded from the wasm build, so this never reaches the SDK.
 [dev-dependencies]
 eta-compiler = { path = "../eta-compiler" }
 
-# The toolchain's three crates are the ones CI gates with `-D warnings`.
 [lints]
 workspace = true

@@ -71,6 +71,7 @@ fn two_node_ws(table: &mut KvPageTable) -> WorkingSetId {
     ws
 }
 
+#[test]
 fn tests_every_case() {
     publish_lookup_flatten_roundtrip();
     fork_shares_prefix_and_diverges_into_children();
@@ -82,7 +83,6 @@ fn tests_every_case() {
     standing_translation_publishes_immutable_mapping_snapshots();
 }
 
-#[test]
 fn publish_lookup_flatten_roundtrip() {
     let mut t = KvPageTable::new();
     let ws = t.create_working_set();

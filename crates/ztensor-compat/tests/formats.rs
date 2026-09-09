@@ -51,13 +51,13 @@ mod gguf {
         b
     }
 
+    #[test]
     fn formats_every_case() {
         open_and_read();
         unknown_type_id_refused();
         ingest_quant_preserves_layout();
     }
 
-    #[test]
     fn open_and_read() {
         let path = tmp("basic.gguf");
         fs::write(&path, gguf_bytes()).unwrap();
@@ -172,13 +172,13 @@ mod npz {
         path
     }
 
+    #[test]
     fn formats_1_every_case() {
         stored_and_deflated();
         refusals();
         bool_is_a_leaf();
     }
 
-    #[test]
     fn stored_and_deflated() {
         let a = f32s(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let b = vec![9u8; 4];
@@ -321,12 +321,12 @@ mod hdf5 {
         b
     }
 
+    #[test]
     fn formats_2_every_case() {
         contiguous_dataset();
         size_lie_rejected();
     }
 
-    #[test]
     fn contiguous_dataset() {
         let vals = [1.5f32, 2.5, 3.5, 4.5];
         let path = tmp("basic.h5");
@@ -368,13 +368,13 @@ mod onnx {
         out
     }
 
+    #[test]
     fn formats_3_every_case() {
         raw_data_initializer();
         f16_in_int32_data();
         external_data_refused();
     }
 
-    #[test]
     fn raw_data_initializer() {
         let data = f32s(&[1.0, 2.0, 3.0, 4.0]);
         let mut tensor = vec![0x08, 2, 0x08, 2, 0x10, 1];
@@ -536,13 +536,13 @@ mod pt {
         path
     }
 
+    #[test]
     fn formats_4_every_case() {
         state_dict_roundtrip();
         non_contiguous_refused_loudly();
         ingest_to_canonical();
     }
 
-    #[test]
     fn state_dict_roundtrip() {
         let data = f32s(&[1.0, 2.0, 3.0, 4.0]);
         let path = write_pt(

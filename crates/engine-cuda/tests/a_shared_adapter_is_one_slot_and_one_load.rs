@@ -103,6 +103,7 @@ impl Landings {
     }
 }
 
+#[test]
 fn a_shared_adapter_is_one_slot_and_one_load_every_case() {
     two_instances_of_one_blob_share_one_slot_and_one_landing();
     a_byte_seeded_instance_gets_a_slot_of_its_own();
@@ -115,7 +116,6 @@ fn a_shared_adapter_is_one_slot_and_one_load_every_case() {
     a_load_with_no_banks_seats_nothing_and_says_so();
 }
 
-#[test]
 fn two_instances_of_one_blob_share_one_slot_and_one_landing() {
     let (_mount, mut adapters) = mounted("shared");
     let seats = seats();

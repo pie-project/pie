@@ -12,24 +12,14 @@ publish = false
 name = "model_exec"
 path = "src/lib.rs"
 
-# Affordable here and not in the shells: `unsafe_code = "forbid"` holds because
-# this layer is arithmetic over `#[repr(C)]` records and `Vec`s, which is also
-# the mechanical proof that the model forward path needs no device.
 [lints]
 workspace = true
 
 [dependencies]
-# The artifact the fire walks. The arrow points this way on purpose: `compile`
-# is pure and knows no engine, and `fire::walk` iterates what it produced.
 model-compiler = { path = "../model-compiler" }
 
-# The vocabulary both ends of that walk are written in: `Plan`, `Node`,
-# `ClassSet`, `Operation` — named directly rather than one re-export deep.
 model-ir = { path = "../model-ir" }
 
 [dev-dependencies]
-# Six model texts somebody else wrote, four platforms, sixty layers of nested
-# split and merge — what the hand-built fixtures in `src/fire/` cannot supply.
-# A dev edge only, and it does not cycle: nothing under `models` names this crate.
 models = { path = "../models" }
 model-dsl = { path = "../model-dsl" }

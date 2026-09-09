@@ -249,13 +249,13 @@ mod tests {
         move || it.next().unwrap_or(0)
     }
 
+    #[test]
     fn route_every_case() {
         filters_unhealthy_disconnected_and_model();
         filters_executor_roles();
         empty_when_nothing_eligible();
     }
 
-    #[test]
     fn filters_unhealthy_disconnected_and_model() {
         let t = table(vec![
             worker(1, "m", Health::Unreachable, 0, 0), // unhealthy

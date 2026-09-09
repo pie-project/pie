@@ -358,6 +358,7 @@ mod tests {
         b
     }
 
+    #[test]
     fn lib_every_case() {
         an_uncovered_merge_refuses_the_load_and_says_which();
         a_budget_that_describes_no_fire_is_refused_before_anything_is_swept();
@@ -365,7 +366,6 @@ mod tests {
         the_fact_ceiling_is_a_refusal_and_not_a_panic();
     }
 
-    #[test]
     fn an_uncovered_merge_refuses_the_load_and_says_which() {
         let mut b = Build::new();
         let x = b.input(8);

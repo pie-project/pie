@@ -38,6 +38,7 @@ fn counter_trace() -> TraceContainer {
     }
 }
 
+#[test]
 fn tests_every_case() {
     ping_pong_commits_and_back_pressures();
     poison_makes_host_ops_error();
@@ -49,7 +50,6 @@ fn tests_every_case() {
     numeric_contract_argmax_and_topk();
 }
 
-#[test]
 fn ping_pong_commits_and_back_pressures() {
     let b = bind(counter_trace(), ModelProfile::dummy()).unwrap();
     let mut inst = Instance::new(&b, &[(0, Value::U32(vec![10]))]).unwrap();

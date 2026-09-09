@@ -514,13 +514,13 @@ mod tests {
         }
     }
 
+    #[test]
     fn pareval_every_case() {
         unknown_tokens_block_derived_ports_only();
         keyed_rng_is_only_as_tainted_as_its_state();
         seeded_prefill_is_host_derivable();
     }
 
-    #[test]
     fn unknown_tokens_block_derived_ports_only() {
         let bound = bind(sdk_geometry_trace(), ModelProfile::dummy()).unwrap();
         let seeds: Vec<(u32, Value)> = seeds()

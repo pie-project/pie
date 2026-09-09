@@ -23,7 +23,6 @@ members = [
     "naive-baseline",
     "naive-masked",
     "prefix-tree-kv-cache",
-    "quest-attention",
     "tova-attention",
     "trackb-h2o",
     "trackb-snapkv",

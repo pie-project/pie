@@ -2751,6 +2751,7 @@ mod static_admission_tests {
         }
     }
 
+    #[test]
     fn fire_every_case() {
         a_device_ring_frame_that_overflows_is_refused_by_name();
         a_seeded_descriptor_ring_is_not_walked();
@@ -2760,7 +2761,6 @@ mod static_admission_tests {
         a_slot_that_consumes_what_an_earlier_slot_published_is_admitted();
     }
 
-    #[test]
     fn a_device_ring_frame_that_overflows_is_refused_by_name() {
         let ring = channel(HostRole::None, 1, false);
         let slots = [

@@ -340,13 +340,13 @@ mod tests {
         Paging::of(16, 64, 4, 16).expect("a page size of 16 spells geometry")
     }
 
+    #[test]
     fn kv_every_case() {
         a_prefill_writes_its_own_prompt_and_then_attends_it();
         a_decode_step_appends_one_row_past_what_the_slot_holds();
         a_sequence_past_its_slots_pages_is_refused_rather_than_wrapped();
     }
 
-    #[test]
     fn a_prefill_writes_its_own_prompt_and_then_attends_it() {
         let g = geometry(
             &paging(),

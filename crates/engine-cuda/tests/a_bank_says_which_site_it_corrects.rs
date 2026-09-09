@@ -76,13 +76,13 @@ fn mounted(what: &str) -> (PathBuf, Adapters) {
     (mount, adapters)
 }
 
+#[test]
 fn a_bank_says_which_site_it_corrects_every_case() {
     both_spellings_of_a_bank_name_parse();
     a_manifest_that_states_a_site_lands_into_that_sites_banks();
     a_site_the_shell_cannot_serve_is_refused_by_name();
 }
 
-#[test]
 fn both_spellings_of_a_bank_name_parse() {
     assert_eq!(role_of("layer.7.lora_a"), "lora_a");
     assert_eq!(layer_of("layer.7.lora_a"), 7);

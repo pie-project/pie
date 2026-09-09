@@ -319,6 +319,7 @@ mod tests {
         path
     }
 
+    #[test]
     fn mapping_every_case() {
         an_empty_artifact_is_refused_by_name();
         a_blob_larger_than_one_buffer_is_refused_by_its_own_name();
@@ -327,7 +328,6 @@ mod tests {
         a_blob_that_leaves_the_artifact_is_refused_by_name();
     }
 
-    #[test]
     fn an_empty_artifact_is_refused_by_name() {
         let path = scratch("empty", 0);
         let fault = Mapping::of(&path).expect_err("a zero-byte artifact does not map");

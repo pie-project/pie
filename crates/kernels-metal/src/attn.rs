@@ -1321,6 +1321,7 @@ pub mod mla {
             }
         }
 
+        #[test]
         fn attn_every_case() {
             a_rank_the_strips_cannot_hold_is_refused();
             a_zero_value_width_is_refused_rather_than_launched();
@@ -1328,7 +1329,6 @@ pub mod mla {
             the_selected_point_refuses_the_geometries_the_dense_one_does();
         }
 
-        #[test]
         fn a_rank_the_strips_cannot_hold_is_refused() {
             let probe = Probe::default();
             let pool = latent_pool();
@@ -1677,6 +1677,7 @@ pub mod index {
             }
         }
 
+        #[test]
         fn attn_1_every_case() {
             kv_append_refuses_a_pool_that_is_not_one_row_per_token();
             topk_refuses_a_zero_key_stride();
@@ -1684,7 +1685,6 @@ pub mod index {
             topk_refuses_a_score_slab_shorter_than_the_launch();
         }
 
-        #[test]
         fn kv_append_refuses_a_pool_that_is_not_one_row_per_token() {
             let probe = Probe::default();
             let pool = KvPool { seq_stride: u64::from(DIM) * 2, ..index_pool() };

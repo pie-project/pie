@@ -576,13 +576,13 @@ pub(crate) fn create_engine_backend(
 mod tests {
     use super::*;
 
+    #[test]
     fn backend_every_case() {
         the_voxel_ceilings_a_deployment_states_reach_the_budget();
         the_pool_budget_seats_by_state_slots_not_pages();
         an_engine_takes_an_artifact_or_a_snapshot_and_nothing_else();
     }
 
-    #[test]
     fn the_voxel_ceilings_a_deployment_states_reach_the_budget() {
         let opts = CudaNativeEngineOptions::default();
         let derived = cuda_budgets(&opts, 0, (None, None), (None, None));
@@ -745,13 +745,13 @@ pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<E
 mod topology_tests {
     use super::*;
 
+    #[test]
     fn backend_1_every_case() {
         topology_rejects_dp_two();
         topology_rejects_indivisible();
         topology_rejects_zero_tp();
     }
 
-    #[test]
     fn topology_rejects_dp_two() {
         let err = calculate_topology(2, 1).unwrap_err().to_string();
         assert!(err.contains("run 2 workers"), "got: {err}");

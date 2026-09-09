@@ -249,13 +249,13 @@ mod tests {
         span
     }
 
+    #[test]
     fn media_every_case() {
         tokens_are_prefix_then_the_run_then_suffix();
         degenerate_pixels_are_refused_by_name();
         the_two_vision_archs_spell_their_runs_differently();
     }
 
-    #[test]
     fn tokens_are_prefix_then_the_run_then_suffix() {
         let span = spelled(4, 99);
         assert_eq!(span.tokens(), vec![7, 99, 99, 99, 99, 8]);

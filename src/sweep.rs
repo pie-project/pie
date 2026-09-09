@@ -262,12 +262,12 @@ pub fn candidates() -> Vec<Knobs> {
 mod tests {
     use super::*;
 
+    #[test]
     fn sweep_every_case() {
         every_candidate_is_one_the_runtime_admits();
         a_failed_round_never_beats_anything();
     }
 
-    #[test]
     fn every_candidate_is_one_the_runtime_admits() {
         let candidates = candidates();
         assert!(!candidates.is_empty());

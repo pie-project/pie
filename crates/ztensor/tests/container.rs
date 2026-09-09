@@ -16,6 +16,7 @@ fn f32_bytes(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+#[test]
 fn container_every_case() {
     roundtrip_dense();
     an_indexed_source_locates_without_mapping();
@@ -40,7 +41,6 @@ fn container_every_case() {
     only_an_external_blob_takes_a_digest();
 }
 
-#[test]
 fn roundtrip_dense() {
     let path = tmp("roundtrip.zt");
     let a = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);

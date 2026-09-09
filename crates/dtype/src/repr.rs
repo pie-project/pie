@@ -585,12 +585,12 @@ const _: () = assert!(spells(&GT_T3_F16_N, "gt_t3_f16_n"));
 mod tests {
     use super::*;
 
+    #[test]
     fn repr_every_case() {
         display_and_the_walker_agree_over_a_sweep();
         bpw_matches_the_published_tables();
     }
 
-    #[test]
     fn display_and_the_walker_agree_over_a_sweep() {
         const GAINS: &[Fmt<'static>] = &[
             Fmt::Elem(Elem::F16),

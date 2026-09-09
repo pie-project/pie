@@ -85,12 +85,12 @@ impl Dev {
     }
 }
 
+#[test]
 fn the_selector_reads_out_the_reference_walk_every_case() {
     topk_answers_the_host_sort_with_ties_low_and_nans_never();
     the_walk_picks_what_the_reference_picks();
 }
 
-#[test]
 fn topk_answers_the_host_sort_with_ties_low_and_nans_never() {
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");

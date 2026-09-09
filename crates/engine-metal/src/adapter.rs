@@ -513,6 +513,7 @@ mod tests {
             .collect()
     }
 
+    #[test]
     fn adapter_every_case() {
         a_layered_cell_becomes_one_plane_per_layer_bank();
         the_correction_is_b_times_a_times_x_at_the_landed_orientation();
@@ -524,7 +525,6 @@ mod tests {
         an_abandoned_acquire_leaves_the_slot_free();
     }
 
-    #[test]
     fn a_layered_cell_becomes_one_plane_per_layer_bank() {
         let cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
         let planes = planes_of(Role::A, None, &cell, &a_seats()).expect("a full-rank A");

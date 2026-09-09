@@ -100,6 +100,7 @@ fn onechan(host_role: HostRole) -> ChannelDecl {
     }
 }
 
+#[test]
 fn eta_golden_every_case() {
     golden_neg_spsc_second_producer();
     golden_neg_sink_at_epilogue();
@@ -111,7 +112,6 @@ fn eta_golden_every_case() {
     extern_direction_violations_rejected();
 }
 
-#[test]
 fn golden_neg_spsc_second_producer() {
     let c = TraceContainer {
         names: vec![],

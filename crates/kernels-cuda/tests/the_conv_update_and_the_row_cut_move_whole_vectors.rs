@@ -8,13 +8,13 @@ use kernels_cuda::attn::ssm;
 use kernels_cuda::layout;
 use kernels_cuda::tensor::{RecurrentPool, Tensor};
 
+#[test]
 fn the_conv_update_and_the_row_cut_move_whole_vectors_every_case() {
     the_conv_update_convolves_the_window_and_shifts_it();
     the_row_cut_lands_both_halves();
     the_row_cut_lands_both_halves_past_the_grid_y_ceiling();
 }
 
-#[test]
 fn the_conv_update_convolves_the_window_and_shifts_it() {
     let (rows, channels, k) = (3u32, 64usize, 4u32);
     let slot_of: [i32; 3] = [1, 3, 0];

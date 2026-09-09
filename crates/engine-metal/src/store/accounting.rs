@@ -113,13 +113,13 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
+    #[test]
     fn accounting_every_case() {
         the_arena_scratch_counts_against_the_ceiling();
         a_load_under_the_ceiling_is_admitted_and_one_over_it_refuses();
         a_non_finite_fraction_is_read_as_the_whole_working_set();
     }
 
-    #[test]
     fn the_arena_scratch_counts_against_the_ceiling() {
         let ws = 21_800 * (GIB / 1000);
         let util = DEFAULT_GPU_MEM_UTILIZATION;

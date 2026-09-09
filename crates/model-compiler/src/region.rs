@@ -179,12 +179,12 @@ mod tests {
         coalesce(&b.trace, &classes).expect("the fixture coalesces")
     }
 
+    #[test]
     fn region_every_case() {
         a_plan_build_over_an_activation_is_refused_rather_than_hoisted();
         a_plan_build_reading_a_merge_of_activations_is_refused_through_the_phi();
     }
 
-    #[test]
     fn a_plan_build_over_an_activation_is_refused_rather_than_hoisted() {
         let mut b = Build::new();
         let x = b.input(4);

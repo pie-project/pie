@@ -2492,6 +2492,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn forward_every_case() {
         a_port_channel_is_validated_against_its_fact();
         a_pass_s_row_ports_agree_on_their_rows();
@@ -2499,7 +2500,6 @@ mod tests {
         differing_rebind_names_the_field();
     }
 
-    #[test]
     fn a_port_channel_is_validated_against_its_fact() {
         let latents = port("latents", models::PortKind::Latents, 64);
         assert_eq!(

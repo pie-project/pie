@@ -2,12 +2,12 @@ mod common;
 
 use ::grammar::grammar::Grammar;
 
+#[test]
 fn known_gaps_every_case() {
     ebnf_lookahead_is_rejected_explicitly();
     ebnf_rejects_repetition_bounds_above_u32();
 }
 
-#[test]
 fn ebnf_lookahead_is_rejected_explicitly() {
     assert!(Grammar::from_ebnf(r#"root ::= "a" (="b")"#, "root").is_err());
 }

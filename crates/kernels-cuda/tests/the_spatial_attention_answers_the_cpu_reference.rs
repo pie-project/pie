@@ -100,12 +100,12 @@ fn check(c: usize) {
     eprintln!("C {c}: {rows} rows, max |err| {worst:.5}");
 }
 
+#[test]
 fn the_spatial_attention_answers_the_cpu_reference_every_case() {
     the_attention_answers_the_reference_at_256_512_and_1024_channels();
     the_attention_answers_the_reference_at_the_scalar_640_width();
 }
 
-#[test]
 fn the_attention_answers_the_reference_at_256_512_and_1024_channels() {
     check(256);
     check(512);

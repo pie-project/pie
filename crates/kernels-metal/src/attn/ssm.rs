@@ -637,12 +637,12 @@ mod tests {
         v_dim: 128,
     };
 
+    #[test]
     fn ssm_every_case() {
         the_three_scans_share_one_geometry();
         a_shape_the_stamp_does_not_name_falls_back();
     }
 
-    #[test]
     fn the_three_scans_share_one_geometry() {
         let plain = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_point).expect("stamped");
         let step = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_step_point).expect("stamped");

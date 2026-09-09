@@ -12,7 +12,4 @@ name = "kernels_metal"
 path = "src/lib.rs"
 
 [dependencies]
-# The whole floor: one enum, serde and nothing under it. Not `model-ir` — a
-# crate that knows no IR must not carry its op enums, validator and `Trace` in
-# reach for the sake of one `Dtype`.
 dtype = { path = "../dtype" }

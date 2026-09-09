@@ -14,30 +14,18 @@ name = "eta_compiler"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# Host-only by construction: `eval`'s extern channels are `std::sync` and
-# `codegen` writes files. The guest imports `eta-ir` and `eta-dsl`, which keep
-# their `no_std` modes.
 [dependencies]
-# `serde` is on, and `eta-ir` is taken with its `serde` feature, because this
-# crate declares the launch package an engine executes and every noun in it
-# serializes. `default-features = false` + `alloc` on serde because a `std`
-# serde in the graph is a `std` serde for everyone Cargo unifies with.
 eta-ir = { path = "../eta-ir", features = ["serde"] }
 serde = { version = "1.0", default-features = false, features = [
     "alloc",
     "derive",
 ] }
 
-# `naga` is the compiler both portable shells put the emitted WGSL through —
-# `engine-wgpu` to run it and `engine-vulkan` to reach SPIR-V — so the emitter's
-# own gate is that its output survives the same front end and back end. A dev
-# dependency only: nothing in the library reaches a shader compiler.
 [dev-dependencies]
 naga = { version = "30", default-features = false, features = [
     "wgsl-in",
     "spv-out",
 ] }
 
-# The toolchain's three crates are the ones CI gates with `-D warnings`.
 [lints]
 workspace = true

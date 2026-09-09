@@ -95,6 +95,7 @@ mod qwen {
     use super::*;
     use models::qwen_3::media::Qwen35Vision;
 
+    #[test]
     fn media_pipe_is_the_pinned_preprocessing_every_case() {
         a_real_png_goes_through_the_whole_pipe();
         the_span_spells_itself_out_of_the_tokenizers_own_ids();
@@ -103,7 +104,6 @@ mod qwen {
         a_video_frame_is_the_same_preprocessing_as_a_still();
     }
 
-    #[test]
     fn a_real_png_goes_through_the_whole_pipe() {
         let fe = Qwen35Vision::new();
         let c = fe.config;
@@ -239,6 +239,7 @@ mod gemma {
     use super::*;
     use models::gemma_4::media::Gemma4Vision;
 
+    #[test]
     fn media_pipe_is_the_pinned_preprocessing_1_every_case() {
         a_real_png_goes_through_the_whole_pipe();
         a_video_frame_gets_the_frame_budget();
@@ -247,7 +248,6 @@ mod gemma {
         the_refusals_fire_by_name();
     }
 
-    #[test]
     fn a_real_png_goes_through_the_whole_pipe() {
         let fe = Gemma4Vision::new();
         let c = fe.config;

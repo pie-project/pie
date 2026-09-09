@@ -474,12 +474,12 @@ fn link_into_snapshot(snapshot_dir: &Path, blobs_dir: &Path, entry: &Entry) -> R
 mod tests {
     use super::*;
 
+    #[test]
     fn download_every_case() {
         weight_shards_match_and_alternates_do_not();
         a_pipelines_components_are_fetched_and_its_bundle_is_not();
     }
 
-    #[test]
     fn weight_shards_match_and_alternates_do_not() {
         let allow = super::super::runtime_snapshot_allow_patterns();
         let matches = |path: &str| allow.iter().any(|p| glob_match(p, path));

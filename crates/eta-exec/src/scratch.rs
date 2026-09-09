@@ -272,6 +272,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn scratch_every_case() {
         a_value_dead_before_the_next_region_hands_its_slot_on();
         a_value_last_read_where_another_is_defined_does_not_share();
@@ -284,7 +285,6 @@ mod tests {
         a_dead_value_takes_no_slot();
     }
 
-    #[test]
     fn a_value_dead_before_the_next_region_hands_its_slot_on() {
         let descriptors = [desc(1024), desc(1024), desc(1024)];
         let lifetimes = [life(0, 1), life(1, 2), life(2, 2)];

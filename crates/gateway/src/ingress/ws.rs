@@ -294,13 +294,13 @@ fn refusal(corr_id: Option<u32>, why: &str) -> Message {
 mod refusal_tests {
     use super::*;
 
+    #[test]
     fn ws_every_case() {
         a_correlated_call_is_refused_under_its_own_id();
         an_uncorrelated_frame_gets_the_bare_error();
         every_call_that_expects_a_response_carries_its_id();
     }
 
-    #[test]
     fn a_correlated_call_is_refused_under_its_own_id() {
         let frame = refusal(Some(7), "cluster saturated");
         let Message::Binary(bytes) = frame else {

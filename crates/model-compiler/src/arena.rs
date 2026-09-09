@@ -970,13 +970,13 @@ mod tests {
         Budgets::of(crate::Budget::new(4, 16))
     }
 
+    #[test]
     fn arena_every_case() {
         the_row_algebra_sizes_every_dim_at_its_ceiling();
         a_symbolic_width_is_refused_and_names_the_value();
         a_merge_of_two_sizes_is_refused_rather_than_carved();
     }
 
-    #[test]
     fn the_row_algebra_sizes_every_dim_at_its_ceiling() {
         let b = Budgets::of(crate::Budget::new(4, 16));
         assert_eq!(RowExpr::of(Dim::Tokens).max(&b), 16);

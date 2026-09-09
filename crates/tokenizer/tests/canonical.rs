@@ -51,6 +51,7 @@ fn assert_round_trips(original: &Tokenizer, what: &str) -> CanonicalTokenizer {
     canonical
 }
 
+#[test]
 fn canonical_every_case() {
     a_byte_level_bpe_profile_round_trips();
     splitter_order_survives();
@@ -61,7 +62,6 @@ fn canonical_every_case() {
     objects_are_offered_in_ascending_name_order();
 }
 
-#[test]
 fn a_byte_level_bpe_profile_round_trips() {
     let tokenizer = load(&byte_level_json(
         json!({"type": "NFC"}),
