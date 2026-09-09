@@ -27,8 +27,8 @@ onnx = []
 ztensor = { workspace = true }
 memmap2 = "0.9"
 serde_json = { version = "1", optional = true }
-zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
+zip = { version = "7", optional = true, default-features = false, features = ["deflate"] }
 flate2 = { version = "1", optional = true }
 
 [dev-dependencies]
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "7", default-features = false, features = ["deflate"] }
