@@ -390,8 +390,7 @@ fn prepare_many_impl(
                     if in_forward.get(index).copied().unwrap_or(false) {
                         engine::fire::RsVerb::Fold
                     } else {
-                        let at =
-                            head.saturating_add(start_tokens.get(index).copied().unwrap_or(0));
+                        let at = head.saturating_add(start_tokens.get(index).copied().unwrap_or(0));
                         engine::fire::RsVerb::Buffer {
                             pages: run_through(
                                 at.saturating_add(row_tokens.get(index).copied().unwrap_or(0)),
@@ -404,11 +403,7 @@ fn prepare_many_impl(
                         }
                     }
                 }
-                RsPlan::Window {
-                    pages,
-                    phase,
-                    ..
-                } => {
+                RsPlan::Window { pages, phase, .. } => {
                     let n = pages.get(index).copied().unwrap_or(0) as usize;
                     let writes = phase.get(index).copied().unwrap_or(false);
                     let run = |which: bool| -> Vec<u32> {
@@ -436,9 +431,7 @@ fn prepare_many_impl(
                         at: head,
                         bound,
                         len: if *fold_len_is_device {
-                            engine::fire::FoldLen::Device(
-                                eta_ir::registry::Port::RsFoldLen,
-                            )
+                            engine::fire::FoldLen::Device(eta_ir::registry::Port::RsFoldLen)
                         } else {
                             engine::fire::FoldLen::Host(bound)
                         },
@@ -501,6 +494,7 @@ mod tests {
         ws
     }
 
+    #[test]
     fn rs_every_case() {
         first_fire_resets_then_continues_in_place();
         every_plan_shape_lowers_to_its_lane_verb();
@@ -512,7 +506,6 @@ mod tests {
         demand_counts_buffered_materialization();
     }
 
-    #[test]
     fn first_fire_resets_then_continues_in_place() {
         let mut store = RsStore::new(4);
         let ws = store.create_working_set(geom());
@@ -544,9 +537,7 @@ mod tests {
     fn request(rows: usize) -> crate::engine::FireRequest {
         crate::engine::FireRequest {
             lanes: (0..rows)
-                .map(|row| {
-                    crate::engine::fire::lane_of(row as u32, vec![7], 0, vec![row as u32])
-                })
+                .map(|row| crate::engine::fire::lane_of(row as u32, vec![7], 0, vec![row as u32]))
                 .collect(),
             ..crate::engine::FireRequest::default()
         }
@@ -610,7 +601,10 @@ mod tests {
             panic!("an append is a scatter");
         };
         assert_eq!(at, 6, "the fire's first row lands on the row's occupancy");
-        assert_eq!(replay, 6, "the six tokens below `at` are replayed ahead of the new rows");
+        assert_eq!(
+            replay, 6,
+            "the six tokens below `at` are replayed ahead of the new rows"
+        );
         assert_eq!(fold, FoldLen::Host(0), "a pure append folds nothing");
         assert_eq!(pages, slabs, "the same two pages, from the same origin");
         settle(&mut store, append.txn);
@@ -839,5 +833,4 @@ mod tests {
             "after a fork every touched slab copies on write"
         );
     }
-
 }

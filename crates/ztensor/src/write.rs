@@ -577,7 +577,7 @@ enum Payload<'d> {
     Encoded(Vec<u8>),
     Length(u64),
     External { shard: String, at: Range<u64> },
-    Linked(Object),
+    Linked(Box<Object>),
     Missing,
 }
 
@@ -637,7 +637,8 @@ impl<'d> ObjectBuilder<'d> {
     }
 
     pub fn attr(mut self, key: impl Into<String>, value: impl Into<cbor::Value>) -> Self {
-        self.pairs.push((cbor::Value::Text(key.into()), value.into()));
+        self.pairs
+            .push((cbor::Value::Text(key.into()), value.into()));
         self
     }
 
@@ -676,7 +677,7 @@ impl<'d> ObjectBuilder<'d> {
     }
 
     fn linked(self, object: Object) -> Self {
-        self.payload(Payload::Linked(object))
+        self.payload(Payload::Linked(Box::new(object)))
     }
 
     fn payload(mut self, payload: Payload<'d>) -> Self {
@@ -693,7 +694,11 @@ impl<'d> ObjectBuilder<'d> {
     }
 }
 
-fn build<'d>(writer: &Writer, name: &str, builder: ObjectBuilder<'d>) -> Result<(Object, Payload<'d>)> {
+fn build<'d>(
+    writer: &Writer,
+    name: &str,
+    builder: ObjectBuilder<'d>,
+) -> Result<(Object, Payload<'d>)> {
     let ObjectBuilder {
         shape,
         term,
@@ -713,7 +718,7 @@ fn build<'d>(writer: &Writer, name: &str, builder: ObjectBuilder<'d>) -> Result<
         writer.check_new_object(name, &object.shape)?;
         validate_external(&writer.manifest, &object.blob)?;
         validate_object(writer, name, &object)?;
-        return Ok((object, Payload::Missing));
+        return Ok((*object, Payload::Missing));
     }
     writer.check_new_object(name, &shape)?;
     let attributes = match attributes {
@@ -731,7 +736,9 @@ fn build<'d>(writer: &Writer, name: &str, builder: ObjectBuilder<'d>) -> Result<
         ));
     }
     if encoding.is_some() && writer.canonical {
-        return Err(bad("canonical form forbids encoded blobs; add .canonical(false)".into()));
+        return Err(bad(
+            "canonical form forbids encoded blobs; add .canonical(false)".into(),
+        ));
     }
 
     let (blob, payload) = match payload {
@@ -746,7 +753,10 @@ fn build<'d>(writer: &Writer, name: &str, builder: ObjectBuilder<'d>) -> Result<
                 ));
             }
             let Some(length) = at.end.checked_sub(at.start) else {
-                return Err(bad(format!("range {}..{} ends before it starts", at.start, at.end)));
+                return Err(bad(format!(
+                    "range {}..{} ends before it starts",
+                    at.start, at.end
+                )));
             };
             let blob = Blob {
                 shard: Some(shard),
@@ -762,13 +772,17 @@ fn build<'d>(writer: &Writer, name: &str, builder: ObjectBuilder<'d>) -> Result<
         }
         Payload::Length(length) => {
             if encoding.is_some() {
-                return Err(bad("a streamed blob is written raw; encode bytes in hand".into()));
+                return Err(bad(
+                    "a streamed blob is written raw; encode bytes in hand".into()
+                ));
             }
             (Blob::local(0, length), Payload::Length(length))
         }
         Payload::Planes(planes) => {
             if layout.is_some() {
-                return Err(bad("planes are laid out canonically; a named layout takes bytes".into()));
+                return Err(bad(
+                    "planes are laid out canonically; a named layout takes bytes".into(),
+                ));
             }
             if encoding.is_some() {
                 return Err(bad("planes are written raw; encode bytes in hand".into()));
@@ -866,9 +880,10 @@ fn validate_external(manifest: &Manifest, blob: &Blob) -> Result<()> {
             "an external blob names no shard".into(),
         ));
     };
-    let shard = manifest.shards.get(sname).ok_or_else(|| {
-        Error::InvalidInput(format!("unregistered shard {sname:?}"))
-    })?;
+    let shard = manifest
+        .shards
+        .get(sname)
+        .ok_or_else(|| Error::InvalidInput(format!("unregistered shard {sname:?}")))?;
     if !blob.offset.is_multiple_of(ALIGN_FLOOR) || blob.offset < ALIGN_FLOOR {
         return Err(Error::InvalidInput(format!(
             "offset {} violates the {ALIGN_FLOOR} floor",

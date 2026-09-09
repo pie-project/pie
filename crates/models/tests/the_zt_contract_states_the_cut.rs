@@ -36,7 +36,11 @@ fn write_checkpoint(path: &Path, params: &[Param]) {
         .collect();
     let mut planes: Vec<&Param> = params
         .iter()
-        .filter(|p| !p.name.strip_suffix(".scales").is_some_and(|stem| banks.contains(stem)))
+        .filter(|p| {
+            !p.name
+                .strip_suffix(".scales")
+                .is_some_and(|stem| banks.contains(stem))
+        })
         .collect();
     planes.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -75,8 +79,7 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         | Dtype::U2g128 => panic!(
             "`{}` is declared {:?}, which this fixture does not state; the \
              affine rows are exercised through `Model::import`, not `load`",
-            param.name,
-            param.dtype
+            param.name, param.dtype
         ),
         Dtype::I64 => raw(writer, param, ztensor::Leaf::I64, 8),
         Dtype::E5m2 | Dtype::I16 | Dtype::U64 | Dtype::U16 | Dtype::Bool => {
@@ -157,12 +160,14 @@ fn state_every_sku() -> Vec<Stated> {
         let src = ztensor::Source::open(&path).unwrap_or_else(|why| {
             panic!("`{name}`: the checkpoint just written does not open again: {why}")
         });
-        let contract = checkpoint_dsl::own_contract(&src, &trace.params, tp, model_dsl::Platform::Cuda).unwrap_or_else(|why| {
-            panic!(
-                "`{name}` refuses a checkpoint that states its own plan, plane for \
+        let contract =
+            checkpoint_dsl::own_contract(&src, &trace.params, tp, model_dsl::Platform::Cuda)
+                .unwrap_or_else(|why| {
+                    panic!(
+                        "`{name}` refuses a checkpoint that states its own plan, plane for \
                  plane, in the dtypes it asked for: {why}"
-            )
-        });
+                    )
+                });
         drop(src);
         out.push(Stated {
             name,
@@ -196,9 +201,13 @@ fn nodes(expr: &Expr, wanted: &dyn Fn(&Expr) -> bool) -> usize {
 }
 
 fn by_load(row: &models::Sku) -> bool {
-    row.recipe.weights.iter().all(|w| matches!(w, Dtype::Bf16 | Dtype::Mxfp4))
+    row.recipe
+        .weights
+        .iter()
+        .all(|w| matches!(w, Dtype::Bf16 | Dtype::Mxfp4))
 }
 
+#[test]
 fn the_zt_contract_states_the_cut_every_case() {
     one_entry_per_plan_param_under_the_plans_own_names();
     a_cut_param_carries_a_shard_per_leg();
@@ -208,7 +217,6 @@ fn the_zt_contract_states_the_cut_every_case() {
     a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in();
 }
 
-#[test]
 fn one_entry_per_plan_param_under_the_plans_own_names() {
     let mut faults = Vec::new();
 
@@ -364,7 +372,6 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
     let mut faults = Vec::new();
 
     for row in models::skus() {
-
         let (name, tp, trace) = (row.name.as_str(), row.recipe.tp, row.trace);
         if !name.starts_with("kimik3") {
             continue;
@@ -375,12 +382,14 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
 
         let src = ztensor::Source::open(&path)
             .unwrap_or_else(|why| panic!("`{name}`: {} does not open: {why}", path.display()));
-        let contract = checkpoint_dsl::own_contract(&src, &trace.params, tp, model_dsl::Platform::Cuda).unwrap_or_else(|why| {
-            panic!(
-                "`{name}` refuses a checkpoint that ships its banks unquantized, \
+        let contract =
+            checkpoint_dsl::own_contract(&src, &trace.params, tp, model_dsl::Platform::Cuda)
+                .unwrap_or_else(|why| {
+                    panic!(
+                        "`{name}` refuses a checkpoint that ships its banks unquantized, \
                  which is the file a runtime-quantizing SKU exists to read: {why}"
-            )
-        });
+                    )
+                });
         drop(src);
 
         let supply = published(&contract);
@@ -450,7 +459,12 @@ fn write_unquantized_checkpoint(path: &Path, params: &[Param]) {
             Dtype::Mxfp4 => {
                 let logical = param.shape.len().saturating_sub(1);
                 writer
-                    .add(param.name.as_str(), vec![1u64; logical], ztensor::Leaf::BF16, &[0u8, 0u8])
+                    .add(
+                        param.name.as_str(),
+                        vec![1u64; logical],
+                        ztensor::Leaf::BF16,
+                        &[0u8, 0u8],
+                    )
                     .unwrap_or_else(|why| panic!("`{}`: {why}", param.name));
             }
             _ => state(&mut writer, param),

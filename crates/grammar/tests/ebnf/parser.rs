@@ -4,6 +4,7 @@ fn parse_and_display(input: &str) -> String {
     Grammar::from_ebnf(input, "root").unwrap().to_string()
 }
 
+#[test]
 fn parser_every_case() {
     test_output_simple_literal();
     test_output_empty_string();
@@ -15,7 +16,6 @@ fn parser_every_case() {
     test_output_repetition_exact();
 }
 
-#[test]
 fn test_output_simple_literal() {
     let g = parse_and_display(r#"root ::= "abc""#);
     assert!(g.starts_with("root ::= "));

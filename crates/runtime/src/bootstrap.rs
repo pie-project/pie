@@ -297,8 +297,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_rs_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_cache_slots).collect();
-    let arena_max_context: Vec<usize> =
-        engine_configs.iter().map(|d| d.limits.max_context).collect();
+    let arena_max_context: Vec<usize> = engine_configs
+        .iter()
+        .map(|d| d.limits.max_context)
+        .collect();
     let kv_swap_capable = engine_configs
         .first()
         .is_some_and(|d| d.kv_copy.device_to_host && d.kv_copy.host_to_device);

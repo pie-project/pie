@@ -292,13 +292,13 @@ pub fn mask_from_commit(
 mod tests {
     use super::*;
 
+    #[test]
     fn channel_every_case() {
         a_slots_full_bytes_are_max_ring_apart_whatever_its_capacity();
         the_ticket_flags_keep_devs_numbering();
         a_bump_lane_carries_the_registrys_own_four_arrays();
     }
 
-    #[test]
     fn a_slots_full_bytes_are_max_ring_apart_whatever_its_capacity() {
         assert_eq!(Rings::full_at(0, 0), 0);
         assert_eq!(Rings::full_at(0, 63), 63);

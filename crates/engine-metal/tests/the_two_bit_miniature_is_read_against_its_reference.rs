@@ -21,9 +21,7 @@ fn snapshot() -> Option<PathBuf> {
         return path.is_dir().then_some(path);
     }
     let usable = |path: &Path| path.join("tokenizer.json").exists() && container(path).is_some();
-    let homes = [
-        std::env::var("HOME").unwrap_or_default(),
-    ];
+    let homes = [std::env::var("HOME").unwrap_or_default()];
     homes.iter().find_map(|home| {
         let snapshots = Path::new(home)
             .join(".cache/huggingface/hub")
@@ -67,7 +65,9 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 fn load(checkpoint: &Path, context: u32) -> Shell {
-    let trace = (models::sku(SKU).expect("the catalog ships the 2-bit SKU").trace)(Platform::Metal);
+    let trace = (models::sku(SKU)
+        .expect("the catalog ships the 2-bit SKU")
+        .trace)(Platform::Metal);
     let container = container(checkpoint).expect("the snapshot holds a tensor container");
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
     let contract = models::sku(SKU)
@@ -154,7 +154,9 @@ fn every_probe_answers_the_reference_to_the_bf16_floor() {
     if let Some(dir) = &dump {
         std::fs::create_dir_all(dir).expect("the dump directory exists");
     }
-    let steps = fixture["steps"].as_u64().expect("the fixture states its steps") as usize;
+    let steps = fixture["steps"]
+        .as_u64()
+        .expect("the fixture states its steps") as usize;
     let probes = fixture["probes"].as_array().expect("`probes` is a list");
 
     let mut shell = load(&checkpoint, 512);
@@ -182,9 +184,15 @@ fn every_probe_answers_the_reference_to_the_bf16_floor() {
              reference does not model",
             ids.len()
         );
-        let tf_top = probe["tf_top"].as_array().expect("teacher-forced top-k rows");
+        let tf_top = probe["tf_top"]
+            .as_array()
+            .expect("teacher-forced top-k rows");
         let gen_top = probe["gen_top"].as_array().expect("greedy top-k rows");
-        assert_eq!(tf_top.len(), ids.len(), "{name}: one reference row per prompt token");
+        assert_eq!(
+            tf_top.len(),
+            ids.len(),
+            "{name}: one reference row per prompt token"
+        );
         let started = Instant::now();
 
         let tf_slot = next_slot();

@@ -7,94 +7,57 @@ description = "Standalone Pie server (no Python). Embeds a native engine in-proc
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
-# The runtime boot path (serve::start_runtime, config types, the supervisors).
-# Consumed by the `pie` CLI and by the `pie-server` wheel under `sdk/server/python/`.
 [lib]
 name = "worker"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [features]
-# No embedded backend by default: without one this crate builds but serves
-# nothing locally.
 default = []
-# Each flavor turns on a dependency rather than a branch in this crate; both
-# engines are Rust, so all it needs is that they be in the graph.
 cuda = ["runtime/cuda"]
-# Apple-only at the crate level, so the flag alone is not a build that links:
-# `runtime`'s seam pairs it with `target_vendor = "apple"`.
 metal = ["runtime/metal"]
-# The portable Vulkan shell. No target half: unlike `metal`, this flag alone
-# IS a build that links a device, wherever a loader is found at run time.
 vulkan = ["runtime/vulkan"]
-# The portable wgpu shell. No target half either: wgpu picks its backend
-# (Vulkan, Metal, DX12) at run time, so this flag alone IS a build that links.
 wgpu = ["runtime/wgpu"]
 nixl = ["dep:transport", "transport/nixl"]
 
-# Probe passthrough to `runtime`; see `crates/runtime/src/scheduler/probe.rs`.
 profile-fire = ["runtime/profile-fire"]
 
 [dependencies]
 runtime = { path = "../runtime" }
 models = { path = "../models" }
-# Shared tarpc control-plane contract.
 controller-api = { path = "../controller-api" }
-# Gateway data-plane RPC contract: the worker dials INTO the gateway and serves
-# WorkerControl over the split connection.
 worker-api = { path = "../worker-api" }
 
-# The runtime↔engine vocabulary this crate names.
 engine = { path = "../engine" }
-# `Platform`, to say which shell a boot is for.
 model-ir = { path = "../model-ir" }
 transport = { path = "../transport", optional = true }
-# Shared id atoms and the client wire vocabulary the gateway data plane carries.
 ids = { path = "../ids" }
 client-api = { path = "../client-api" }
 anyhow = "1.0"
-# `$PIE_HOME` resolution (`bootstrap::paths::pie_home`); `bootstrap` is a leaf
-# crate and depends on no role library.
 bootstrap = { path = "../bootstrap" }
 rmp-serde = "1.3"
-# Verify content-addressed blob fetches: blake3(body) == BlobRef.hash.
 blake3 = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
 tokio = { version = "1.53", features = ["full"] }
-# `serde-transport-bincode` is the control-plane codec. The data-plane codec is
-# single-sourced in `worker-api` (MessagePack), so no `serde-transport-json`.
 tarpc = { version = "0.37", features = [
 	"serde-transport",
 	"serde-transport-bincode",
 	"tcp",
 	"unix",
 ] }
-# The WebSocket the standalone client server terminates.
 tokio-tungstenite = "0.30.0"
 futures = "0.3.33"
-# `local_dynamic_tls`: the pyo3 wheel is dlopen()ed, and mimalloc's default
-# initial-exec TLS model cannot be satisfied by a late-loaded library.
 mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 tracing = "0.1"
-# Data-plane blob fetch for multimodal inputs. No `blocking`: the fetch is
-# async, and provisioning downloads live in the `pie` binary.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 
-# `default-features = false` drops the loader's testkit (oracle, contract
-# fixture builder, CPU executor); nothing here reaches them.
 checkpoint = { path = "../checkpoint", default-features = false }
-# The artifact's compiled metadata: `tokenizer` names the objects that make up
-# a `pie.tokenizer/1`, which the worker lifts and hands to the runtime whole.
 tokenizer = { path = "../tokenizer" }
 
-# Used by `pie run` to drive an inferlet against the engine subprocess we boot.
 client = { path = "../client" }
 
 [dev-dependencies]
 tempfile = "3"
-# So `RUST_LOG=error` reaches the CUDA harness: `kernels-cuda` reports why a
-# device instantiation would not fire through `tracing::error!`, and the
-# returned `KernelError` cannot carry it.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

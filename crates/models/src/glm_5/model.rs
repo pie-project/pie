@@ -287,7 +287,11 @@ impl Model {
             embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
             head: {
                 let banded = tp > 1 && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
-                let rows = if banded { u64::from(d.vocab / tp) } else { u64::from(d.vocab) };
+                let rows = if banded {
+                    u64::from(d.vocab / tp)
+                } else {
+                    u64::from(d.vocab)
+                };
                 let bank = Weight::sym("lm_head", [rows, hidden], w);
                 if banded { bank.packed([rows]) } else { bank }
             },

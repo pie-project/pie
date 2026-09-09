@@ -7,11 +7,7 @@ use crate::error::{Fault, Result};
 pub fn page() -> usize {
     // SAFETY: `sysconf` of a defined name, reading no memory.
     let said = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if said > 0 {
-        said as usize
-    } else {
-        4096
-    }
+    if said > 0 { said as usize } else { 4096 }
 }
 
 pub struct Mapping {
@@ -306,6 +302,62 @@ impl Drop for Mapping {
     }
 }
 
+fn prefault(map: &Mapping, planes: &[(&str, u64, u64)]) {
+    let page = page() as u64;
+    let base = map.base().as_ptr() as usize as u64;
+    let len = map.len();
+    let started = std::time::Instant::now();
+    let mut ranges: Vec<(u64, u64)> = planes
+        .iter()
+        .map(|&(_, offset, length)| {
+            let lo = offset / page * page;
+            let hi = (offset + length).min(len).div_ceil(page) * page;
+            (lo, hi.min(map.span() as u64))
+        })
+        .filter(|(lo, hi)| hi > lo)
+        .collect();
+    ranges.sort_unstable();
+    let total: u64 = ranges.iter().map(|(lo, hi)| hi - lo).sum();
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8);
+    let shares: Vec<Vec<(u64, u64)>> = (0..threads)
+        .map(|t| ranges.iter().copied().skip(t).step_by(threads).collect())
+        .collect();
+    std::thread::scope(|scope| {
+        for share in &shares {
+            scope.spawn(move || {
+                let mut sink = 0u64;
+                for &(lo, hi) in share {
+                    // SAFETY: `[lo, hi)` lies inside the live PROT_READ mapping.
+                    unsafe {
+                        libc::madvise(
+                            (base + lo) as *mut libc::c_void,
+                            (hi - lo) as usize,
+                            libc::MADV_WILLNEED,
+                        );
+                        let mut at = lo;
+                        while at < hi {
+                            sink = sink.wrapping_add(u64::from(std::ptr::read_volatile(
+                                (base + at) as *const u8,
+                            )));
+                            at += page;
+                        }
+                    }
+                }
+                std::hint::black_box(sink);
+            });
+        }
+    });
+    if crate::diag::on().tier_trace {
+        eprintln!(
+            "load: prefaulted {:.2} GiB of resident planes in {:.2} s",
+            total as f64 / (1u64 << 30) as f64,
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +371,7 @@ mod tests {
         path
     }
 
+    #[test]
     fn mapping_every_case() {
         an_empty_artifact_is_refused_by_name();
         a_blob_larger_than_one_buffer_is_refused_by_its_own_name();
@@ -327,13 +380,15 @@ mod tests {
         a_blob_that_leaves_the_artifact_is_refused_by_name();
     }
 
-    #[test]
     fn an_empty_artifact_is_refused_by_name() {
         let path = scratch("empty", 0);
         let fault = Mapping::of(&path).expect_err("a zero-byte artifact does not map");
         let _ = std::fs::remove_file(&path);
         let said = fault.to_string();
-        assert!(said.contains("holds no bytes"), "the refusal says why: {said}");
+        assert!(
+            said.contains("holds no bytes"),
+            "the refusal says why: {said}"
+        );
     }
 
     fn sparse(name: &str, bytes: u64) -> PathBuf {
@@ -400,65 +455,17 @@ mod tests {
         let path = sparse("overrun", 64 * page as u64);
         let map = Mapping::of(&path).expect("the sparse artifact maps");
         let _ = std::fs::remove_file(&path);
-        let held = vec![("past-the-end".to_string(), 60 * page as u64, 16 * page as u64)];
+        let held = vec![(
+            "past-the-end".to_string(),
+            60 * page as u64,
+            16 * page as u64,
+        )];
         let fault = cut(&map, 8 * page as u64, &borrow(&held))
             .expect_err("a blob past the end does not cut");
         let said = fault.to_string();
-        assert!(said.contains("past-the-end"), "the refusal names it: {said}");
-    }
-
-}
-
-fn prefault(map: &Mapping, planes: &[(&str, u64, u64)]) {
-    let page = page() as u64;
-    let base = map.base().as_ptr() as usize as u64;
-    let len = map.len();
-    let started = std::time::Instant::now();
-    let mut ranges: Vec<(u64, u64)> = planes
-        .iter()
-        .map(|&(_, offset, length)| {
-            let lo = offset / page * page;
-            let hi = (offset + length).min(len).div_ceil(page) * page;
-            (lo, hi.min(map.span() as u64))
-        })
-        .filter(|(lo, hi)| hi > lo)
-        .collect();
-    ranges.sort_unstable();
-    let total: u64 = ranges.iter().map(|(lo, hi)| hi - lo).sum();
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
-    let shares: Vec<Vec<(u64, u64)>> = (0..threads)
-        .map(|t| ranges.iter().copied().skip(t).step_by(threads).collect())
-        .collect();
-    std::thread::scope(|scope| {
-        for share in &shares {
-            scope.spawn(move || {
-                let mut sink = 0u64;
-                for &(lo, hi) in share {
-                    // SAFETY: `[lo, hi)` lies inside the live PROT_READ mapping.
-                    unsafe {
-                        libc::madvise(
-                            (base + lo) as *mut libc::c_void,
-                            (hi - lo) as usize,
-                            libc::MADV_WILLNEED,
-                        );
-                        let mut at = lo;
-                        while at < hi {
-                            sink = sink.wrapping_add(u64::from(std::ptr::read_volatile(
-                                (base + at) as *const u8,
-                            )));
-                            at += page;
-                        }
-                    }
-                }
-                std::hint::black_box(sink);
-            });
-        }
-    });
-    if crate::diag::on().tier_trace {
-        eprintln!(
-            "load: prefaulted {:.2} GiB of resident planes in {:.2} s",
-            total as f64 / (1u64 << 30) as f64,
-            started.elapsed().as_secs_f64()
+        assert!(
+            said.contains("past-the-end"),
+            "the refusal names it: {said}"
         );
     }
 }

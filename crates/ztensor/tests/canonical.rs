@@ -12,6 +12,7 @@ fn f32s(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+#[test]
 fn canonical_every_case() {
     what_the_writer_produces_is_canonical();
     garbage_between_planes_is_refused();
@@ -24,12 +25,13 @@ fn canonical_every_case() {
     the_checker_disagrees_with_itself_on_different_files();
 }
 
-#[test]
 fn what_the_writer_produces_is_canonical() {
     let path = tmp("canon-yes.zt");
     let mut w = Writer::create(&path).unwrap();
-    w.add("a.bias", [4u64], Leaf::F32, &f32s(&[1.0; 4])).unwrap();
-    w.add("a.weight", [2u64, 4], Leaf::BF16, &[2u8; 16]).unwrap();
+    w.add("a.bias", [4u64], Leaf::F32, &f32s(&[1.0; 4]))
+        .unwrap();
+    w.add("a.weight", [2u64, 4], Leaf::BF16, &[2u8; 16])
+        .unwrap();
     let (codes, scales) = ([0x11u8; 32], [0x7fu8; 2]);
     w.object("q", |o| {
         o.shape([64u64])
@@ -100,7 +102,10 @@ fn block_digests_break_rule_4() {
 
     let found = violations_of(&path);
     assert!(found.contains("rule 4"), "{found}");
-    assert!(!found.contains("rule 2"), "placement was canonical: {found}");
+    assert!(
+        !found.contains("rule 2"),
+        "placement was canonical: {found}"
+    );
 }
 
 fn a_shard_table_breaks_rule_6() {

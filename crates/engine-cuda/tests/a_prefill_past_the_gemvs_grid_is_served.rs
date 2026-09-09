@@ -230,13 +230,13 @@ fn fire_at_ungrouped(
     answer
 }
 
+#[test]
 fn a_prefill_past_the_gemvs_grid_is_served_every_case() {
     a_prefill_past_the_gemvs_grid_is_served();
     the_two_legs_answer_the_same_model();
     a_bank_past_the_cache_is_where_grouping_pays();
 }
 
-#[test]
 fn a_prefill_past_the_gemvs_grid_is_served() {
     let _one = serialized();
     if !engine_cuda::device::present() {

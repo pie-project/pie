@@ -2,12 +2,12 @@ use crate::common::grammar_accepts;
 use ::grammar::grammar::Grammar;
 use ::grammar::regex::regex_to_grammar;
 
+#[test]
 fn regex_every_case() {
     unicode_literals_quantifiers_and_classes();
     exact_zero_repetition_matches_empty_string();
 }
 
-#[test]
 fn unicode_literals_quantifiers_and_classes() {
     let grammar = regex_to_grammar("é").unwrap();
     assert!(grammar_accepts(grammar.clone(), "é"));

@@ -20,6 +20,7 @@ fn no_contract() -> engine_cuda::ContractFor {
     |_, _| Err("this gate opens a boot and never loads a model".to_string())
 }
 
+#[test]
 fn the_operators_fraction_sizes_the_pool_every_case() {
     the_boot_carries_the_fraction_and_absence_is_the_configs_default();
     an_out_of_range_fraction_refuses_at_boot_by_the_knobs_name();
@@ -28,7 +29,6 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     the_card_does_not_hold_a_deployment_whose_weights_leave_no_context();
 }
 
-#[test]
 fn the_boot_carries_the_fraction_and_absence_is_the_configs_default() {
     engine_cuda::open(boot_with(0.75), no_contract(), |name| models::sku(name).map(|sku| sku.classify)).expect("a fraction in range opens");
 

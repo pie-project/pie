@@ -76,16 +76,13 @@ impl NfaGraph {
         for state_edges in &self.edges {
             state_offsets.push(all_edges.len() as u32);
             let mut sorted = state_edges.clone();
-            sorted.sort_by(|a, b| {
-                match (a, b) {
-                    (
-                        FsmEdge::CharRange { min: a_min, .. },
-                        FsmEdge::CharRange { min: b_min, .. },
-                    ) => a_min.cmp(b_min),
-                    (FsmEdge::CharRange { .. }, _) => std::cmp::Ordering::Less,
-                    (_, FsmEdge::CharRange { .. }) => std::cmp::Ordering::Greater,
-                    _ => std::cmp::Ordering::Equal,
+            sorted.sort_by(|a, b| match (a, b) {
+                (FsmEdge::CharRange { min: a_min, .. }, FsmEdge::CharRange { min: b_min, .. }) => {
+                    a_min.cmp(b_min)
                 }
+                (FsmEdge::CharRange { .. }, _) => std::cmp::Ordering::Less,
+                (_, FsmEdge::CharRange { .. }) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
             });
             all_edges.extend(sorted);
         }
@@ -152,7 +149,6 @@ impl DfaTable {
             None
         }
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -335,8 +331,7 @@ impl Automaton<NfaGraph> {
     }
 }
 
-impl Automaton<DfaTable> {
-}
+impl Automaton<DfaTable> {}
 
 fn build_char_class_nfa(
     fsm: &mut NfaGraph,

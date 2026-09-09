@@ -324,8 +324,7 @@ pub(crate) fn create_engine_backend_group(
     let sku = match sku {
         Some(named) => Some(named),
         None if ranks > 1 => {
-            let base =
-                runtime::engine::load::identify(snapshot_dir, model_ir::Platform::Cuda)?;
+            let base = runtime::engine::load::identify(snapshot_dir, model_ir::Platform::Cuda)?;
             widened = format!("{base}-tp{ranks}");
             runtime::engine::load::trace(&widened, model_ir::Platform::Cuda).with_context(
                 || {
@@ -576,13 +575,13 @@ pub(crate) fn create_engine_backend(
 mod tests {
     use super::*;
 
+    #[test]
     fn backend_every_case() {
         the_voxel_ceilings_a_deployment_states_reach_the_budget();
         the_pool_budget_seats_by_state_slots_not_pages();
         an_engine_takes_an_artifact_or_a_snapshot_and_nothing_else();
     }
 
-    #[test]
     fn the_voxel_ceilings_a_deployment_states_reach_the_budget() {
         let opts = CudaNativeEngineOptions::default();
         let derived = cuda_budgets(&opts, 0, (None, None), (None, None));
@@ -610,7 +609,10 @@ mod tests {
         assert_eq!(budgets.slots, 256);
         assert_eq!(budgets.pages, 1024);
         opts.max_total_pages = None;
-        assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).pages, 65536);
+        assert_eq!(
+            cuda_budgets(&opts, 0, (None, None), (None, None)).pages,
+            65536
+        );
 
         opts.max_state_slots = Some(4);
         assert_eq!(cuda_budgets(&opts, 0, (None, None), (None, None)).slots, 4);
@@ -640,7 +642,6 @@ mod tests {
             .to_string();
         assert!(error.contains("neither a .zt artifact"), "{error}");
     }
-
 }
 
 pub struct GroupEngine {
@@ -745,13 +746,13 @@ pub(crate) fn build_options(m: &config::ModelConfig, flavor: Flavor) -> Result<E
 mod topology_tests {
     use super::*;
 
+    #[test]
     fn backend_1_every_case() {
         topology_rejects_dp_two();
         topology_rejects_indivisible();
         topology_rejects_zero_tp();
     }
 
-    #[test]
     fn topology_rejects_dp_two() {
         let err = calculate_topology(2, 1).unwrap_err().to_string();
         assert!(err.contains("run 2 workers"), "got: {err}");

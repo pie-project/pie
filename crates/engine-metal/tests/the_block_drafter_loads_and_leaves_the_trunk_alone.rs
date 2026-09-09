@@ -72,7 +72,10 @@ fn finite(logits: &[f32], what: &str) {
     );
     let spread = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max)
         - logits.iter().copied().fold(f32::INFINITY, f32::min);
-    assert!(spread > 1e-3, "{what} logits span {spread}, which nothing wrote");
+    assert!(
+        spread > 1e-3,
+        "{what} logits span {spread}, which nothing wrote"
+    );
 }
 
 fn run(shell: &mut Shell, slot: u32, drafts: bool) -> Vec<Vec<f32>> {
@@ -100,12 +103,12 @@ fn run(shell: &mut Shell, slot: u32, drafts: bool) -> Vec<Vec<f32>> {
     rows
 }
 
+#[test]
 fn the_block_drafter_loads_and_leaves_the_trunk_alone_every_case() {
     the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit();
     a_draft_block_fires_and_the_drafter_answers_it();
 }
 
-#[test]
 fn the_drafters_planes_bind_and_its_context_arm_moves_no_trunk_logit() {
     if !engine_metal::device::present() {
         eprintln!("skipping: this machine publishes no Metal device");
@@ -284,9 +287,7 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
         tokens: &tokens,
     });
     seat.mask = Some(&masking);
-    let drafted = shell
-        .fire_seated(&[seat])
-        .expect("the draft block fires");
+    let drafted = shell.fire_seated(&[seat]).expect("the draft block fires");
 
     let row = drafted.into_iter().next().expect("one readout row");
     finite(&row, "the draft block");

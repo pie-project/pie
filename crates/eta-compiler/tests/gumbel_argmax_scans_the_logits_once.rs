@@ -87,13 +87,13 @@ fn emitted(container: TraceContainer) -> String {
     source[entry..].to_string()
 }
 
+#[test]
 fn gumbel_argmax_scans_the_logits_once_every_case() {
     a_scaled_gumbel_max_becomes_one_scan_of_the_intrinsic();
     an_unscaled_gumbel_max_folds_too_with_no_divisor();
     a_uniform_draw_is_not_a_gumbel_max_and_stays_as_traced();
 }
 
-#[test]
 fn a_scaled_gumbel_max_becomes_one_scan_of_the_intrinsic() {
     let source = emitted(subject(true, RngKind::Gumbel));
     assert!(
@@ -106,18 +106,29 @@ fn a_scaled_gumbel_max_becomes_one_scan_of_the_intrinsic() {
     );
     let head = source.find("ptir_fast_gumbel_argmax_intrinsic(").unwrap();
     let call = &source[head..head + 700];
-    assert!(call.contains("descriptors[p.a0]"), "the operand shape sizes the scan");
+    assert!(
+        call.contains("descriptors[p.a0]"),
+        "the operand shape sizes the scan"
+    );
     assert!(!call.contains("nullptr"), "the divisor rides along");
 }
 
 fn an_unscaled_gumbel_max_folds_too_with_no_divisor() {
     let source = emitted(subject(false, RngKind::Gumbel));
-    let head = source.find("ptir_fast_gumbel_argmax_intrinsic(").expect("the head folds");
-    assert!(source[head..head + 700].contains("nullptr"), "nothing to divide by");
+    let head = source
+        .find("ptir_fast_gumbel_argmax_intrinsic(")
+        .expect("the head folds");
+    assert!(
+        source[head..head + 700].contains("nullptr"),
+        "nothing to divide by"
+    );
 }
 
 fn a_uniform_draw_is_not_a_gumbel_max_and_stays_as_traced() {
     let source = emitted(subject(true, RngKind::Uniform));
     assert!(!source.contains("ptir_fast_gumbel_argmax_intrinsic("));
-    assert!(source.contains("ptir_fast_argmax("), "the traced argmax runs over scratch");
+    assert!(
+        source.contains("ptir_fast_argmax("),
+        "the traced argmax runs over scratch"
+    );
 }

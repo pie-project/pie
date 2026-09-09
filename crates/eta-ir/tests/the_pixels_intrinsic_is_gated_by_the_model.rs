@@ -41,13 +41,13 @@ fn epilogue_reading(shape: Shape, dtype: Dtype) -> TraceContainer {
     }
 }
 
+#[test]
 fn the_pixels_intrinsic_is_gated_by_the_model_every_case() {
     a_model_with_a_vae_serves_the_pixels_and_one_without_refuses_them();
     the_declared_width_is_the_models_when_it_states_one();
     the_pixels_are_an_epilogue_value_only();
 }
 
-#[test]
 fn a_model_with_a_vae_serves_the_pixels_and_one_without_refuses_them() {
     let plane = Shape::matrix(ROWS, RGB);
     bind(epilogue_reading(plane, Dtype::F32), profile(RGB))
@@ -85,8 +85,11 @@ fn the_declared_width_is_the_models_when_it_states_one() {
         "refused for the wrong reason: {refusal:?}"
     );
     for width in [RGB, 16] {
-        bind(epilogue_reading(Shape::matrix(ROWS, width), Dtype::F32), profile(0))
-            .unwrap_or_else(|why| panic!("a {width}-wide plane against an unstated width: {why:?}"));
+        bind(
+            epilogue_reading(Shape::matrix(ROWS, width), Dtype::F32),
+            profile(0),
+        )
+        .unwrap_or_else(|why| panic!("a {width}-wide plane against an unstated width: {why:?}"));
     }
     for (shape, dtype) in [
         (Shape::vector(RGB), Dtype::F32),

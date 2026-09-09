@@ -86,6 +86,7 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
     activation(ctx, OP, entry, x, o)
 }
 
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.clamp";
     let entry = dtype_dispatch!(OP, x.dtype, {

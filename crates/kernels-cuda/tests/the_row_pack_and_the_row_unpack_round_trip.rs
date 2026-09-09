@@ -46,13 +46,13 @@ fn check(width: usize, dtype: Dtype, elem: usize) {
     assert_eq!(got_back, want, "the round trip did not land the rectangle");
 }
 
+#[test]
 fn the_row_pack_and_the_row_unpack_round_trip_every_case() {
     the_pair_round_trips_a_wide_bf16_rectangle();
     the_pair_round_trips_an_f32_rectangle();
     the_pair_round_trips_a_row_no_wide_unit_covers();
 }
 
-#[test]
 fn the_pair_round_trips_a_wide_bf16_rectangle() {
     check(64, Dtype::Bf16, 2);
 }

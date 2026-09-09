@@ -509,17 +509,45 @@ pub enum RaggedMask {
 impl Operands for Attention {
     fn inputs(&self, sink: &mut Vec<ValueId>) {
         match self {
-            Self::PlanDecode { kv_indptr, kv_indices, last_page_len, kv_len, .. } => {
+            Self::PlanDecode {
+                kv_indptr,
+                kv_indices,
+                last_page_len,
+                kv_len,
+                ..
+            } => {
                 sink.extend([*kv_indptr, *kv_indices, *last_page_len, *kv_len]);
             }
-            Self::PlanPrefill { kv_indptr, kv_indices, last_page_len, kv_len, .. } => {
+            Self::PlanPrefill {
+                kv_indptr,
+                kv_indices,
+                last_page_len,
+                kv_len,
+                ..
+            } => {
                 sink.extend([*kv_indptr, *kv_indices, *last_page_len, *kv_len]);
             }
             Self::Decode { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             Self::Prefill { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
-            Self::Masked { q, plan, mask, cache, .. } => sink.extend([*q, *plan, *mask, *cache]),
-            Self::Dense { q, k, v, segments, .. } => sink.extend([*q, *k, *v, *segments]),
-            Self::Ragged { q, k, v, q_indptr, kv_indptr, mask, .. } => {
+            Self::Masked {
+                q,
+                plan,
+                mask,
+                cache,
+                ..
+            } => sink.extend([*q, *plan, *mask, *cache]),
+            Self::Dense {
+                q, k, v, segments, ..
+            } => sink.extend([*q, *k, *v, *segments]),
+            Self::Ragged {
+                q,
+                k,
+                v,
+                q_indptr,
+                kv_indptr,
+                mask,
+                ..
+            } => {
                 sink.extend([*q, *k, *v, *q_indptr, *kv_indptr]);
                 match mask {
                     RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
@@ -531,89 +559,242 @@ impl Operands for Attention {
             }
             Self::DecodeLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             Self::PrefillLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
-            Self::DecodeRel { q, plan, cache, bias, .. } => {
+            Self::DecodeRel {
+                q,
+                plan,
+                cache,
+                bias,
+                ..
+            } => {
                 sink.extend([*q, *plan, *cache, *bias]);
             }
-            Self::PrefillRel { q, plan, cache, bias, .. } => {
+            Self::PrefillRel {
+                q,
+                plan,
+                cache,
+                bias,
+                ..
+            } => {
                 sink.extend([*q, *plan, *cache, *bias]);
             }
-            Self::Sink { o, lse, sink: sink_id, .. } => sink.extend([*o, *lse, *sink_id]),
-            Self::MergeLse { o1, lse1, o2, lse2, .. } => sink.extend([*o1, *lse1, *o2, *lse2]),
+            Self::Sink {
+                o,
+                lse,
+                sink: sink_id,
+                ..
+            } => sink.extend([*o, *lse, *sink_id]),
+            Self::MergeLse {
+                o1, lse1, o2, lse2, ..
+            } => sink.extend([*o1, *lse1, *o2, *lse2]),
             Self::LogitSoftcap { x, .. } => sink.push(*x),
-            Self::KvAppend { k, v, cache, write_page, write_offset } => {
+            Self::KvAppend {
+                k,
+                v,
+                cache,
+                write_page,
+                write_offset,
+            } => {
                 sink.extend([*k, *v, *cache, *write_page, *write_offset]);
             }
-            Self::KvAppendShared { plane, cache, write_page, write_offset } => {
+            Self::KvAppendShared {
+                plane,
+                cache,
+                write_page,
+                write_offset,
+            } => {
                 sink.extend([*plane, *cache, *write_page, *write_offset]);
             }
-            Self::MlaPlan { kv_indptr, kv_indices, last_page_len, kv_len, .. } => {
+            Self::MlaPlan {
+                kv_indptr,
+                kv_indices,
+                last_page_len,
+                kv_len,
+                ..
+            } => {
                 sink.extend([*kv_indptr, *kv_indices, *last_page_len, *kv_len]);
             }
             Self::MlaLatents { kv_a, weight, .. } => sink.extend([*kv_a, *weight]),
-            Self::MlaLatentsRope { kv_a, positions, weight, .. } => {
+            Self::MlaLatentsRope {
+                kv_a,
+                positions,
+                weight,
+                ..
+            } => {
                 sink.extend([*kv_a, *positions, *weight]);
             }
             Self::MlaSplitQB { q_b, .. } => sink.push(*q_b),
             Self::MlaAbsorbQ { q_nope, kv_b, .. } => sink.extend([*q_nope, *kv_b]),
             Self::MlaAbsorbOut { latent, kv_b, .. } => sink.extend([*latent, *kv_b]),
-            Self::MlaKvAppend { kv_c, k_pe, cache, write_page, write_offset } => {
+            Self::MlaKvAppend {
+                kv_c,
+                k_pe,
+                cache,
+                write_page,
+                write_offset,
+            } => {
                 sink.extend([*kv_c, *k_pe, *cache, *write_page, *write_offset]);
             }
-            Self::MlaDecode { q, plan, q_pe, cache, .. } => {
+            Self::MlaDecode {
+                q,
+                plan,
+                q_pe,
+                cache,
+                ..
+            } => {
                 sink.extend([*q, *plan, *q_pe, *cache]);
             }
-            Self::MlaPrefill { q, plan, q_pe, cache, .. } => {
+            Self::MlaPrefill {
+                q,
+                plan,
+                q_pe,
+                cache,
+                ..
+            } => {
                 sink.extend([*q, *plan, *q_pe, *cache]);
             }
-            Self::MlaDecodeSelected { q, plan, q_pe, selection, cache, .. } => {
+            Self::MlaDecodeSelected {
+                q,
+                plan,
+                q_pe,
+                selection,
+                cache,
+                ..
+            } => {
                 sink.extend([*q, *plan, *q_pe, *selection, *cache]);
             }
-            Self::MlaPrefillSelected { q, plan, q_pe, selection, cache, .. } => {
+            Self::MlaPrefillSelected {
+                q,
+                plan,
+                q_pe,
+                selection,
+                cache,
+                ..
+            } => {
                 sink.extend([*q, *plan, *q_pe, *selection, *cache]);
             }
-            Self::SsmCausalConv1d { x, weight, state, .. } => sink.extend([*x, *weight, *state]),
-            Self::ShortConv { x, weight, state, .. } => sink.extend([*x, *weight, *state]),
-            Self::ShortConvChunked { x, weight, state, .. } => sink.extend([*x, *weight, *state]),
-            Self::SsmCausalConv1dChunked { x, weight, state, .. } => {
+            Self::SsmCausalConv1d {
+                x, weight, state, ..
+            } => sink.extend([*x, *weight, *state]),
+            Self::ShortConv {
+                x, weight, state, ..
+            } => sink.extend([*x, *weight, *state]),
+            Self::ShortConvChunked {
+                x, weight, state, ..
+            } => sink.extend([*x, *weight, *state]),
+            Self::SsmCausalConv1dChunked {
+                x, weight, state, ..
+            } => {
                 sink.extend([*x, *weight, *state]);
             }
             Self::BlockDynConv { x, coeff, base, .. } => sink.extend([*x, *coeff, *base]),
-            Self::SelectorWalk { cand, unary, hp, tokens, pred, succ, .. } => {
+            Self::SelectorWalk {
+                cand,
+                unary,
+                hp,
+                tokens,
+                pred,
+                succ,
+                ..
+            } => {
                 sink.extend([*cand, *unary]);
                 sink.extend(hp.iter().copied());
                 sink.extend([*tokens, *pred, *succ]);
             }
-            Self::SsmGdnPrep { ba, dt_bias, a_log, .. } => sink.extend([*ba, *dt_bias, *a_log]),
-            Self::SsmGatedDelta { qkv, z, gates, state, .. } => {
+            Self::SsmGdnPrep {
+                ba, dt_bias, a_log, ..
+            } => sink.extend([*ba, *dt_bias, *a_log]),
+            Self::SsmGatedDelta {
+                qkv,
+                z,
+                gates,
+                state,
+                ..
+            } => {
                 sink.extend([*qkv, *z, *gates, *state]);
             }
-            Self::SsmGatedDeltaChunked { qkv, z, gates, state, .. } => {
+            Self::SsmGatedDeltaChunked {
+                qkv,
+                z,
+                gates,
+                state,
+                ..
+            } => {
                 sink.extend([*qkv, *z, *gates, *state]);
             }
-            Self::SsmKdaStep { mixed, f, b, dt_bias, a_log, state, .. } => {
+            Self::SsmKdaStep {
+                mixed,
+                f,
+                b,
+                dt_bias,
+                a_log,
+                state,
+                ..
+            } => {
                 sink.extend([*mixed, *f, *b, *dt_bias, *a_log, *state]);
             }
-            Self::SsmKdaChunked { mixed, f, b, dt_bias, a_log, state, .. } => {
+            Self::SsmKdaChunked {
+                mixed,
+                f,
+                b,
+                dt_bias,
+                a_log,
+                state,
+                ..
+            } => {
                 sink.extend([*mixed, *f, *b, *dt_bias, *a_log, *state]);
             }
-            Self::IndexLayernormRope { k, positions, weight, bias, .. } => {
+            Self::IndexLayernormRope {
+                k,
+                positions,
+                weight,
+                bias,
+                ..
+            } => {
                 sink.extend([*k, *positions, *weight, *bias]);
             }
             Self::IndexRope { q, positions, .. } => sink.extend([*q, *positions]),
-            Self::IndexTopk { q, weights, keys, .. } => sink.extend([*q, *weights, *keys]),
-            Self::IndexKvAppend { k, keys, write_page, write_offset } => {
+            Self::IndexTopk {
+                q, weights, keys, ..
+            } => sink.extend([*q, *weights, *keys]),
+            Self::IndexKvAppend {
+                k,
+                keys,
+                write_page,
+                write_offset,
+            } => {
                 sink.extend([*k, *keys, *write_page, *write_offset]);
             }
-            Self::PoolBoundaryDecode { positions, row_valid, .. } => {
+            Self::PoolBoundaryDecode {
+                positions,
+                row_valid,
+                ..
+            } => {
                 sink.extend([*positions, *row_valid]);
             }
-            Self::PoolBoundaryPrefill { positions, row_valid, .. } => {
+            Self::PoolBoundaryPrefill {
+                positions,
+                row_valid,
+                ..
+            } => {
                 sink.extend([*positions, *row_valid]);
             }
-            Self::PoolStateWrite { kv, score, pages, write_page, write_offset, .. } => {
+            Self::PoolStateWrite {
+                kv,
+                score,
+                pages,
+                write_page,
+                write_offset,
+                ..
+            } => {
                 sink.extend([*kv, *score, *pages, *write_page, *write_offset]);
             }
-            Self::PoolGather { boundary_pos, boundary_req, pages, ape, .. } => {
+            Self::PoolGather {
+                boundary_pos,
+                boundary_req,
+                pages,
+                ape,
+                ..
+            } => {
                 sink.extend([*boundary_pos, *boundary_req, *pages]);
                 sink.extend(ape.iter().copied());
             }
@@ -634,7 +815,13 @@ impl Operands for Attention {
                     *write_offset,
                 ]);
             }
-            Self::PoolLse { q, positions, request_of_token, entries, .. } => {
+            Self::PoolLse {
+                q,
+                positions,
+                request_of_token,
+                entries,
+                ..
+            } => {
                 sink.extend([*q, *positions, *request_of_token, *entries]);
             }
             Self::PoolLseSelected {

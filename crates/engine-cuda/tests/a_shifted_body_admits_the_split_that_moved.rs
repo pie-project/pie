@@ -161,13 +161,13 @@ fn split(compiled: &CompiledModel, hot: u32, cold: u32) -> Composition {
         .expect("the two-class fire composes")
 }
 
+#[test]
 fn a_shifted_body_admits_the_split_that_moved_every_case() {
     every_region_of_the_subject_addresses_off_the_seat();
     the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits();
     two_splits_of_one_key_move_a_launch_the_total_does_not();
 }
 
-#[test]
 fn every_region_of_the_subject_addresses_off_the_seat() {
     let (trace, compiled) = baked();
     let shifted = shifting(&trace, &compiled);

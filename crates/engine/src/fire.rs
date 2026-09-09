@@ -479,13 +479,13 @@ impl StepVoxels {
                 self.lane
             )));
         }
-        if self.clips.iter().any(|b| b.iter().any(|&n| n == 0)) {
+        if self.clips.iter().any(|b| b.contains(&0)) {
             return Err(Error::Invalid(format!(
                 "lane {} submits a clip with a zero side",
                 self.lane
             )));
         }
-        if !self.payload.is_empty() && self.payload.len() as u64 % self.voxels() != 0 {
+        if !self.payload.is_empty() && !(self.payload.len() as u64).is_multiple_of(self.voxels()) {
             return Err(Error::Invalid(format!(
                 "lane {} submits {} values for {} voxels, which is not a whole row per voxel",
                 self.lane,

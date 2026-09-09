@@ -7,7 +7,10 @@ use super::fp8::fp8_e4m3_to_f32;
 use super::mxfp4::avx2;
 
 pub enum EncodeOperand<'a> {
-    Widened { bytes: &'a [u8], dtype: DType },
+    Widened {
+        bytes: &'a [u8],
+        dtype: DType,
+    },
     BlockScaledFp8 {
         bytes: &'a [u8],
         factors: Vec<f32>,
@@ -31,22 +34,20 @@ impl EncodeOperand<'_> {
                             unsafe { avx2::decode_bf16_row(row_bytes, buf) };
                             return;
                         }
-                        for (le, out) in row_bytes.chunks_exact(2).zip(buf.iter_mut()) {
-                            let bits = u16::from_le_bytes(le.try_into().unwrap());
+                        for (le, out) in row_bytes.as_chunks::<2>().0.iter().zip(buf.iter_mut()) {
+                            let bits = u16::from_le_bytes(*le);
                             *out = f32::from_bits(u32::from(bits) << 16);
                         }
                     }
                     DType::F16 => {
-                        for (le, out) in row_bytes.chunks_exact(2).zip(buf.iter_mut()) {
-                            let wide =
-                                f16::from_bits(u16::from_le_bytes(le.try_into().unwrap())).to_f32();
+                        for (le, out) in row_bytes.as_chunks::<2>().0.iter().zip(buf.iter_mut()) {
+                            let wide = f16::from_bits(u16::from_le_bytes(*le)).to_f32();
                             *out = bf16::from_f32(wide).to_f32();
                         }
                     }
                     DType::F32 => {
-                        for (le, out) in row_bytes.chunks_exact(4).zip(buf.iter_mut()) {
-                            *out =
-                                bf16::from_f32(f32::from_le_bytes(le.try_into().unwrap())).to_f32();
+                        for (le, out) in row_bytes.as_chunks::<4>().0.iter().zip(buf.iter_mut()) {
+                            *out = bf16::from_f32(f32::from_le_bytes(*le)).to_f32();
                         }
                     }
                     _ => unreachable!("EncodeOperand::Widened holds a vetted dtype"),

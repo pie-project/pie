@@ -413,20 +413,31 @@ pub fn emit_order_region(
     if order.tag == tags::TOP_K && (1..=TOP_K_SELECT_MAX).contains(&width) {
         let cap = width.next_power_of_two().max(2);
         let _ = writeln!(source, "  constexpr m1_u32 kSelectCap = {cap}u;");
-        let _ = writeln!(source, "  constexpr m1_u32 kSelectPool = {TOP_K_SELECT_POOL}u;");
+        let _ = writeln!(
+            source,
+            "  constexpr m1_u32 kSelectPool = {TOP_K_SELECT_POOL}u;"
+        );
         let direct = super::fused::analyze_direct_topk(stage)[node];
         let _ = writeln!(
             source,
             "  constexpr m1_u32 kDirectIntrinsic = {}u;",
             direct.map_or(u32::MAX, |d| u32::from(d.intrinsic))
         );
-        let _ = writeln!(source, "  constexpr m1_u32 kDirectNode = {}u;", direct.map_or(0, |d| d.node));
+        let _ = writeln!(
+            source,
+            "  constexpr m1_u32 kDirectNode = {}u;",
+            direct.map_or(0, |d| d.node)
+        );
         let _ = writeln!(
             source,
             "  constexpr m1_u32 kDirectDivisor = {}u;",
             direct.and_then(|d| d.divisor).unwrap_or(u32::MAX)
         );
-        let _ = writeln!(source, "  constexpr m1_u32 kIntrinsicSlots = {}u;", super::fused::PTIR_INTRINSIC_SLOTS);
+        let _ = writeln!(
+            source,
+            "  constexpr m1_u32 kIntrinsicSlots = {}u;",
+            super::fused::PTIR_INTRINSIC_SLOTS
+        );
         source.push_str(BODY_SELECT);
     } else {
         source.push_str(BODY);

@@ -77,7 +77,10 @@ pub enum Layout {
         vocab: u32,
         y: ValueId,
     },
-    Argmax { xs: Vec<ValueId>, y: ValueId },
+    Argmax {
+        xs: Vec<ValueId>,
+        y: ValueId,
+    },
     TopK {
         x: ValueId,
         k: u32,
@@ -100,7 +103,12 @@ impl Operands for Layout {
     fn inputs(&self, sink: &mut Vec<ValueId>) {
         match self {
             Self::Embed { ids, table, .. } => sink.extend([*ids, *table]),
-            Self::EmbedWeighted { ids, weights, table, .. } => {
+            Self::EmbedWeighted {
+                ids,
+                weights,
+                table,
+                ..
+            } => {
                 sink.extend([*ids, *weights, *table]);
             }
             Self::SplitQkv { packed, .. } => sink.push(*packed),
@@ -134,7 +142,9 @@ impl Operands for Layout {
             Self::ScatterLiveRows { y_out, .. } => sink.push(*y_out),
             Self::EmbedConcat { y, .. } => sink.push(*y),
             Self::Argmax { y, .. } => sink.push(*y),
-            Self::TopK { values, indices, .. } => sink.extend([*values, *indices]),
+            Self::TopK {
+                values, indices, ..
+            } => sink.extend([*values, *indices]),
             Self::PackRows { y, .. } => sink.push(*y),
             Self::UnpackRows { y, .. } => sink.push(*y),
         }
@@ -155,8 +165,9 @@ impl Operands for Layout {
             | Self::TopK { .. }
             | Self::PackRows { .. }
             | Self::UnpackRows { .. } => {}
-            Self::ScatterRows { y_out, y, .. }
-            | Self::ScatterLiveRows { y_out, y, .. } => sink.push((*y_out, *y)),
+            Self::ScatterRows { y_out, y, .. } | Self::ScatterLiveRows { y_out, y, .. } => {
+                sink.push((*y_out, *y))
+            }
         }
     }
     fn name(&self) -> &'static str {

@@ -58,17 +58,15 @@ fn region_tags(plan: &LaunchStagePlan, region_index: u32) -> String {
 }
 
 fn region_widest(plan: &LaunchStagePlan, region_index: u32) -> u32 {
-    plan.fused
-        .get(region_index as usize)
-        .map_or(0, |region| {
-            region
-                .nodes
-                .iter()
-                .filter_map(|&node| plan.ops.get(node as usize))
-                .map(op_width)
-                .max()
-                .unwrap_or(0)
-        })
+    plan.fused.get(region_index as usize).map_or(0, |region| {
+        region
+            .nodes
+            .iter()
+            .filter_map(|&node| plan.ops.get(node as usize))
+            .map(op_width)
+            .max()
+            .unwrap_or(0)
+    })
 }
 
 fn region_trace() -> bool {
@@ -130,7 +128,9 @@ unsafe impl Sync for Module {}
 
 impl std::fmt::Debug for Module {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Module").field("entry", &self.entry).finish()
+        f.debug_struct("Module")
+            .field("entry", &self.entry)
+            .finish()
     }
 }
 
@@ -174,14 +174,15 @@ impl Module {
             .newLibraryWithSource_options_error(&text, Some(&options))
             .map_err(|error| classify(entry, &error))?;
         let name = crate::device::ctx::nsstring(entry);
-        let function = library
-            .newFunctionWithName(&name)
-            .ok_or_else(|| Failure::Deterministic {
-                reason: format!(
-                    "the library compiled and holds no `{entry}`; the emitter and the \
+        let function =
+            library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| Failure::Deterministic {
+                    reason: format!(
+                        "the library compiled and holds no `{entry}`; the emitter and the \
                      engine disagree about this region's entry name"
-                ),
-            })?;
+                    ),
+                })?;
         let pipeline = device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|error| classify(entry, &error))?;
@@ -204,8 +205,7 @@ fn set_safe_math(options: &objc2_metal::MTLCompileOptions) {
         options.setFastMathEnabled(false);
     }
     if options.respondsToSelector(objc2::sel!(setMathFloatingPointFunctions:)) {
-        options
-            .setMathFloatingPointFunctions(objc2_metal::MTLMathFloatingPointFunctions::Precise);
+        options.setMathFloatingPointFunctions(objc2_metal::MTLMathFloatingPointFunctions::Precise);
     }
 }
 
@@ -230,7 +230,10 @@ fn expand(source: &str) -> String {
     if !source.contains(RNG_INCLUDE) {
         return source.to_string();
     }
-    source.replace(RNG_INCLUDE, &eta_compiler::codegen::rng::generate_msl_preamble())
+    source.replace(
+        RNG_INCLUDE,
+        &eta_compiler::codegen::rng::generate_msl_preamble(),
+    )
 }
 
 #[derive(Debug)]
@@ -426,9 +429,11 @@ impl Cache {
             let region_index = u32::try_from(region_index).map_err(|_| Failure::Deterministic {
                 reason: "a stage with more than four billion regions is not a stage".into(),
             })?;
-            if plan.fused.get(region_index as usize).is_some_and(|region| {
-                region.kind == RegionKind::Library(LibraryOp::SecondParty)
-            }) {
+            if plan
+                .fused
+                .get(region_index as usize)
+                .is_some_and(|region| region.kind == RegionKind::Library(LibraryOp::SecondParty))
+            {
                 continue;
             }
             if let Some(region) =
@@ -542,7 +547,9 @@ impl Cache {
         let region = plan.fused.get(region_index as usize);
         let library = matches!(
             region.map(|region| region.kind),
-            Some(RegionKind::Library(LibraryOp::NucleusSample | LibraryOp::TopK))
+            Some(RegionKind::Library(
+                LibraryOp::NucleusSample | LibraryOp::TopK
+            ))
         );
         let refused = matches!(
             index.get(KERNEL_FUSED, stage_index, region_index),
@@ -711,13 +718,13 @@ impl Cache {
 mod tests {
     use super::*;
 
+    #[test]
     fn compile_every_case() {
         expansion_replaces_the_include_and_leaves_everything_else();
         a_source_with_no_include_is_handed_over_unchanged();
         the_two_emitters_never_share_a_cache_identity();
     }
 
-    #[test]
     fn expansion_replaces_the_include_and_leaves_everything_else() {
         let source = format!("// head\n{RNG_INCLUDE}\n// tail\n");
         let expanded = expand(&source);
@@ -760,5 +767,4 @@ mod tests {
             ),
         );
     }
-
 }

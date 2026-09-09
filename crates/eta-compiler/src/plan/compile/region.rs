@@ -30,8 +30,9 @@ eta_ir::declare_tagged_enum! {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum RegionKind {
     #[default]
     Generated,
@@ -111,7 +112,10 @@ pub(crate) fn fused_partition(
         .filter_map(|((geometry, witness), op)| match geometry {
             Geometry::Rows { fixed, extent }
                 if witness.is_some()
-                    && !matches!(op.tag(), eta_ir::op::tags::INTRINSIC_VAL | eta_ir::op::tags::CONST) =>
+                    && !matches!(
+                        op.tag(),
+                        eta_ir::op::tags::INTRINSIC_VAL | eta_ir::op::tags::CONST
+                    ) =>
             {
                 Some((*fixed, *extent))
             }
@@ -120,14 +124,18 @@ pub(crate) fn fused_partition(
         .collect();
     let class = |node: NodeIndex| -> (Geometry, Option<ValueId>) {
         match geometries[node.index()] {
-            (Geometry::Rows { fixed, extent }, witness) if arithmetic.contains(&(fixed, extent)) => {
+            (Geometry::Rows { fixed, extent }, witness)
+                if arithmetic.contains(&(fixed, extent)) =>
+            {
                 (Geometry::Rows { fixed, extent }, witness)
             }
             _ => (Geometry::Single, None),
         }
     };
-    let joins_any = |node: NodeIndex| stage.ops[node.index()].tag() == eta_ir::op::tags::CONST
-        && geometries[node.index()].0 == Geometry::Single;
+    let joins_any = |node: NodeIndex| {
+        stage.ops[node.index()].tag() == eta_ir::op::tags::CONST
+            && geometries[node.index()].0 == Geometry::Single
+    };
 
     let mut regions = Vec::new();
     let mut generated = Vec::new();
@@ -187,7 +195,9 @@ fn flush_generated_run(
     let (witness, row_alias) = match run.take() {
         Some((Geometry::Rows { fixed, extent }, witness)) => (
             witness,
-            alias.filter(|&(role, _)| fixed == 1 && role == extent).map(|(_, n)| n),
+            alias
+                .filter(|&(role, _)| fixed == 1 && role == extent)
+                .map(|(_, n)| n),
         ),
         _ => (None, None),
     };
@@ -305,7 +315,10 @@ pub(crate) fn build_region(
     let mut sinks = Vec::new();
     for (other, _) in stage.ops.iter().enumerate() {
         let other = NodeIndex(other as u32);
-        let Some(DirectTopK { divisor: Some(divisor), .. }) = direct_topk(stage, index, other)
+        let Some(DirectTopK {
+            divisor: Some(divisor),
+            ..
+        }) = direct_topk(stage, index, other)
         else {
             continue;
         };
@@ -419,20 +432,20 @@ pub(crate) fn direct_topk(
         value
     };
     let one_element = |value: ValueId| -> bool {
-        stage
-            .value_types
-            .get(value as usize)
-            .is_some_and(|ty| ty.dims.iter().all(|dim| matches!(dim, Dimension::Static(1))))
+        stage.value_types.get(value as usize).is_some_and(|ty| {
+            ty.dims
+                .iter()
+                .all(|dim| matches!(dim, Dimension::Static(1)))
+        })
     };
     let mut value = through_reshapes(input);
     let mut divisor = None;
-    if let Some(producer) = index.producer(value) {
-        if let Op::Div(numerator, element) = stage.ops[producer.index()] {
-            if one_element(element) {
-                divisor = Some(element);
-                value = through_reshapes(numerator);
-            }
-        }
+    if let Some(producer) = index.producer(value)
+        && let Op::Div(numerator, element) = stage.ops[producer.index()]
+        && one_element(element)
+    {
+        divisor = Some(element);
+        value = through_reshapes(numerator);
     }
     let intrinsic = index.producer(value)?;
     let Op::IntrinsicVal { intr, .. } = stage.ops[intrinsic.index()] else {
@@ -504,7 +517,9 @@ pub(crate) fn row_alias(stage: &NormalizedStage, index: &StageIndex) -> Option<(
             .into_iter()
             .chain((0..op.result_count()).map(|result| base + result));
         for value in values {
-            let Some(ty) = stage.value_types.get(value as usize) else { continue };
+            let Some(ty) = stage.value_types.get(value as usize) else {
+                continue;
+            };
             match value_rows(&ty.dims) {
                 Some((1, u32::MAX)) | None => {}
                 Some((1, role)) => symbolic = Some(role),
@@ -630,16 +645,22 @@ pub(crate) fn node_geometry(
             && let Some(&first) = vectors.first()
             && let Some(ty) = stage.value_types.get(first as usize)
             && let [dim] = ty.dims.as_slice()
-            && vectors
-                .iter()
-                .all(|&v| stage.value_types.get(v as usize).map(|t| t.dims.as_slice()) == Some(&[*dim]))
+            && vectors.iter().all(|&v| {
+                stage.value_types.get(v as usize).map(|t| t.dims.as_slice()) == Some(&[*dim])
+            })
         {
             return match dim {
                 Dimension::Static(n) => {
                     let (fixed, extent) = canonical((*n as u64, u32::MAX));
                     (Geometry::Rows { fixed, extent }, None)
                 }
-                Dimension::Symbolic(role) => (Geometry::Rows { fixed: 1, extent: *role as u32 }, None),
+                Dimension::Symbolic(role) => (
+                    Geometry::Rows {
+                        fixed: 1,
+                        extent: *role as u32,
+                    },
+                    None,
+                ),
             };
         }
         return (Geometry::Single, None);

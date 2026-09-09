@@ -127,7 +127,12 @@ inline ulong ptir_rng_splitmix64(ulong x) {\n",
     let _ = writeln!(
         out,
         "inline float ptir_rng_hash_normal(ulong seed_eff, uint index) {{\n{}}}",
-        normal_body("metal::sqrt", "metal::precise::log", "metal::precise::cos", "uint")
+        normal_body(
+            "metal::sqrt",
+            "metal::precise::log",
+            "metal::precise::cos",
+            "uint"
+        )
     );
     out.push_str("#endif\n");
     out

@@ -94,7 +94,9 @@ impl Scores {
         let mut raw = vec![0u8; floats * SLOT as usize];
         self.store.read(self.lane_base(lane), &mut raw)?;
         Ok(raw
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
             .collect())
     }
@@ -105,7 +107,12 @@ impl Scores {
             .saturating_mul(u64::from(KV_MAX))
             .saturating_mul(SLOT);
         Ok(ScoreSeat {
-            slab: Tensor::new(handles.bind(&self.store, 0, bytes)?, rows, KV_MAX, Dtype::F32),
+            slab: Tensor::new(
+                handles.bind(&self.store, 0, bytes)?,
+                rows,
+                KV_MAX,
+                Dtype::F32,
+            ),
             plane_stride: self.planes,
             observe: OBSERVE,
             planes_of: self.planes_of.clone(),

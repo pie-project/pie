@@ -14,6 +14,7 @@ fn flag_waker() -> (Arc<Flag>, Waker) {
     (f.clone(), f.into())
 }
 
+#[test]
 fn tests_every_case() {
     alloc_register_wake_roundtrip();
     epoch_filter_wakes_only_when_index_passes();
@@ -24,7 +25,6 @@ fn tests_every_case() {
     sweep_on_abort_resolves_blocked_take_to_err_b12();
 }
 
-#[test]
 fn alloc_register_wake_roundtrip() {
     let t = WakerTable::new();
     let id = t.alloc();

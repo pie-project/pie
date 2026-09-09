@@ -1,5 +1,5 @@
-use checkpoint::file::{File, Metadata, RawTensor};
 use checkpoint::contract::{Expr, GroupContract, ModelContract, TensorContract};
+use checkpoint::file::{File, Metadata, RawTensor};
 use checkpoint::plan::{StorageInstr, StorageTarget, compile};
 use checkpoint::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 
@@ -97,6 +97,7 @@ fn contract(group: GroupContract) -> ModelContract {
     }
 }
 
+#[test]
 fn groups_every_case() {
     a_selected_band_of_a_fused_bank_is_one_plan_and_a_table_of_offsets();
     an_indexed_source_name_resolves_once_per_instance();
@@ -114,7 +115,6 @@ fn groups_every_case() {
     a_group_composes_with_a_shard();
 }
 
-#[test]
 fn a_selected_band_of_a_fused_bank_is_one_plan_and_a_table_of_offsets() {
     let expr = Expr::src("experts.bank").select(0, 1, 1);
     let plan = compile(&fused_checkpoint(), &contract(banded(expr)), target()).unwrap();
@@ -438,13 +438,13 @@ mod streamability {
         out
     }
 
+    #[test]
     fn groups_1_every_case() {
         a_fused_bank_cannot_be_paged_by_instance();
         separately_named_instances_are_each_pageable();
         a_contract_without_groups_offers_nothing_to_stream();
     }
 
-    #[test]
     fn a_fused_bank_cannot_be_paged_by_instance() {
         let expr = Expr::src("experts.bank").select(0, 1, 1);
         let metadata = fused_checkpoint();

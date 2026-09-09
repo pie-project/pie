@@ -12,6 +12,4 @@ name = "model_dsl"
 path = "src/lib.rs"
 
 [dependencies]
-# The plan this surface records onto, and the only substantive dependency: an
-# authoring surface reaches the IR and nothing else.
 model-ir = { path = "../model-ir" }

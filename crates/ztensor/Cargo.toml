@@ -1,5 +1,3 @@
-# Vendored from github.com/pie-project/ztensor (branch v3, bf72630) until 3.0.0
-# is published; edit upstream first and copy back, so the two do not drift.
 [package]
 name = "ztensor"
 version = "3.0.0"
@@ -17,15 +15,10 @@ categories = ["encoding", "data-structures", "science"]
 all-features = true
 
 [features]
-# zt.zstd-seekable/1 encoding profile
 zstd = ["dep:zstd"]
 
 [dependencies]
 memmap2 = "0.9"
-# §6.4 makes a cryptographic shard digest the thing that lets one signature
-# over a root cover every shard byte. A build that could produce those digests
-# but not check them would be worse than one that could do neither, so this is
-# not optional.
 sha2 = "0.10"
 unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

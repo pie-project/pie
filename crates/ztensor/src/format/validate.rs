@@ -100,7 +100,9 @@ fn frame_ranges(mut ranges: Vec<(u64, u64)>, file_len: u64) -> Vec<(u64, u64)> {
 
 pub fn image(buf: &[u8], vocab: &Vocabulary) -> Result<Option<Manifest>> {
     let file_len = buf.len() as u64;
-    let footer = check_frame(file_len, |at, n| Ok(buf[at as usize..(at + n) as usize].to_vec()))?;
+    let footer = check_frame(file_len, |at, n| {
+        Ok(buf[at as usize..(at + n) as usize].to_vec())
+    })?;
     let Some(footer) = parse_footer(&footer)? else {
         return Ok(None);
     };
@@ -323,9 +325,7 @@ pub(crate) fn validate_manifest(
 
         match &obj.layout {
             None => {
-                let expected = obj
-                    .canonical_size()
-                    .map_err(|e| e.at(name))?;
+                let expected = obj.canonical_size().map_err(|e| e.at(name))?;
                 if b.decoded_size() != expected {
                     return Err(Error::reject(
                         Rule::Size,

@@ -44,8 +44,7 @@ pub fn patch_ladder_for(budget: &Budget) -> PatchLadder {
 
     let max_patches = budget
         .max_tokens
-        .min(DERIVED_PATCH_CEILING)
-        .max(PATCH_LATTICE_FLOOR);
+        .clamp(PATCH_LATTICE_FLOOR, DERIVED_PATCH_CEILING);
     let mut buckets = Vec::new();
     let mut rung = PATCH_LATTICE_FLOOR;
     while rung < max_patches {

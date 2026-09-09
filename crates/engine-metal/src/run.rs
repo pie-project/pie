@@ -189,7 +189,8 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn window(&self) -> &'c Window {
-        self.windows.at(self.place.region.get(), self.place.run.get())
+        self.windows
+            .at(self.place.region.get(), self.place.run.get())
     }
 
     fn struct_at(&self, id: ValueId) -> usize {
@@ -248,9 +249,7 @@ impl<'c> Run<'c> {
 
     fn voxel_seat(&self, at: usize) -> crate::inputs::VoxelHandles {
         self.fire.voxels.unwrap_or_else(|| {
-            panic!(
-                "value {at} reads the voxel axis, and no lane of this fire submitted a clip"
-            )
+            panic!("value {at} reads the voxel axis, and no lane of this fire submitted a clip")
         })
     }
 
@@ -341,7 +340,11 @@ impl<'c> Run<'c> {
         let rows = keep.min(handle.rows.saturating_sub(skip));
         let cut = self
             .handles
-            .cut(handle.buf, u64::from(skip) * stride, u64::from(rows) * stride)
+            .cut(
+                handle.buf,
+                u64::from(skip) * stride,
+                u64::from(rows) * stride,
+            )
             .unwrap_or_else(|fault| {
                 panic!(
                     "the window's cut of handle {} at row {skip} for {rows} rows does \
@@ -566,9 +569,7 @@ impl<'c> Run<'c> {
                 kind: GeomKind::GroupOfLane,
                 ..
             }) => self.fire.group_of_lane.unwrap_or_else(|| {
-                panic!(
-                    "value {at} reads the group-of-lane table, which this load carved none of"
-                )
+                panic!("value {at} reads the group-of-lane table, which this load carved none of")
             }),
             Def::Input(RuntimeInput::Geometry {
                 kind: GeomKind::GroupIndptr { select },
@@ -628,15 +629,11 @@ impl<'c> Run<'c> {
                     None => panic!("value {at} is weight {row}, which the shell has not bound"),
                 }
             }
-            Def::Op(_) | Def::Merge(_) => self
-                .arena
-                .0
-                .get(at)
-                .copied()
-                .flatten()
-                .unwrap_or_else(|| {
+            Def::Op(_) | Def::Merge(_) => {
+                self.arena.0.get(at).copied().flatten().unwrap_or_else(|| {
                     panic!("value {at} has no arena slot, which the compiler should have cut")
-                }),
+                })
+            }
             Def::Cache(_) => panic!(
                 "value {at} is a cache space; it resolves to a pool through `Run::pool`, \
                  never to a tensor"
@@ -679,13 +676,9 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn routed_scratch(&self) -> Option<RoutedScratch> {
-        Some(
-            self.scratch
-                .routed(self.handles)?
-                .unwrap_or_else(|fault| {
-                    panic!("the routed scratch this load reserved does not mint: {fault}")
-                }),
-        )
+        Some(self.scratch.routed(self.handles)?.unwrap_or_else(|fault| {
+            panic!("the routed scratch this load reserved does not mint: {fault}")
+        }))
     }
 
     pub(crate) fn index_scores(&self) -> Option<Tensor> {

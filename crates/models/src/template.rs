@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use tokenizer::Tokenizer;
 
+type TemplateFn = fn(Arc<Tokenizer>) -> Arc<dyn Instruct>;
+
 pub use chat_template::{
     ChatDecoder, ChatEvent, GenericChatDecoder, Instruct, NoopReasoningDecoder, NoopToolDecoder,
     ReasoningDecoder, ReasoningEvent, ThinkingDecoder, ToolDecoder, ToolEvent, ToolGrammar,
@@ -18,6 +20,6 @@ pub fn templates() -> Vec<TemplateRow> {
 }
 
 #[must_use]
-pub fn template_of(name: &str) -> Option<fn(Arc<Tokenizer>) -> Arc<dyn Instruct>> {
+pub fn template_of(name: &str) -> Option<TemplateFn> {
     crate::sku(name).map(|sku| sku.template)
 }

@@ -87,9 +87,12 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::Clamp { x, lo, hi, x_out: _ } => {
-                elemwise::pointwise::clamp(self.ctx(), *lo, *hi, self.tensor(*x))
-            }
+            Elementwise::Clamp {
+                x,
+                lo,
+                hi,
+                x_out: _,
+            } => elemwise::pointwise::clamp(self.ctx(), *lo, *hi, self.tensor(*x)),
             Elementwise::Modulate {
                 x,
                 m,
@@ -227,21 +230,24 @@ impl Run<'_> {
                 *scale,
                 self.tensor(*x),
             ),
-            Elementwise::ClampLearned { x, lo, hi, x_out: _ } => {
-                elemwise::pointwise::clamp_learned(
-                    self.ctx(),
-                    self.tensor(*lo),
-                    self.tensor(*hi),
-                    self.tensor(*x),
-                )
-            }
+            Elementwise::ClampLearned {
+                x,
+                lo,
+                hi,
+                x_out: _,
+            } => elemwise::pointwise::clamp_learned(
+                self.ctx(),
+                self.tensor(*lo),
+                self.tensor(*hi),
+                self.tensor(*x),
+            ),
             Elementwise::RmsnormResidualAdd { .. }
             | Elementwise::EmbedScaleAdd { .. }
             | Elementwise::NormModulate { .. }
-            | Elementwise::GatedResidualNormModulate { .. }
-            => Err(kernels_metal::Error::Unsupported { op: op.name() }),
-            | Elementwise::EmbedScaleAddSelect { .. }
-            | Elementwise::RmsnormRopePartialQ { .. } => {
+            | Elementwise::GatedResidualNormModulate { .. } => {
+                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
+            Elementwise::EmbedScaleAddSelect { .. } | Elementwise::RmsnormRopePartialQ { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
             Elementwise::RmsnormGroupedPlusOne {
@@ -410,9 +416,9 @@ impl Run<'_> {
                 }
                 let stacked = Tensor::new(
                     first.buf,
-                    first.rows.saturating_mul(
-                        u32::try_from(planes.len()).unwrap_or(u32::MAX),
-                    ),
+                    first
+                        .rows
+                        .saturating_mul(u32::try_from(planes.len()).unwrap_or(u32::MAX)),
                     first.width,
                     first.dtype,
                 );

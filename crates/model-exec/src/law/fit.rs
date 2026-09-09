@@ -276,11 +276,7 @@ fn try_pivots(
                 konst -= *weight * i128::from(l);
             }
         }
-        recipe.push(Recipe {
-            konst,
-            rows,
-            lanes,
-        });
+        recipe.push(Recipe { konst, rows, lanes });
     }
     Some(recipe)
 }
@@ -330,13 +326,13 @@ mod tests {
         ]
     }
 
+    #[test]
     fn fit_every_case() {
         a_div_ceil_grid_axis_fits_the_tiling_law_and_names_the_tile();
         an_affine_law_extrapolates_off_the_probed_box();
         a_slot_law_reads_the_descriptor_and_not_the_coordinates();
     }
 
-    #[test]
     fn a_div_ceil_grid_axis_fits_the_tiling_law_and_names_the_tile() {
         let observed: Vec<(Vec<i128>, i128, i128)> = (16..80)
             .map(|rows: i128| {
@@ -379,7 +375,11 @@ mod tests {
                 slope: vec![7, 12288, 1]
             }
         );
-        assert_eq!(law.at(&[-2, 0, 0], 0), Some(86), "a law evaluates outside the box");
+        assert_eq!(
+            law.at(&[-2, 0, 0], 0),
+            Some(86),
+            "a law evaluates outside the box"
+        );
         assert_eq!(law.reads(), vec![0, 1, 2]);
     }
 

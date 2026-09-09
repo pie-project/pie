@@ -192,28 +192,29 @@ impl Plane {
                 format!("float-port feed of unbound instance {instance}"),
             )
         })?;
-        let dense = bound.ids.iter().position(|&held| held == id).ok_or_else(|| {
-            Fault::program(
-                "program::plane",
-                format!(
-                    "float-port feed names channel {id}, which instance {instance} does \
-                     not carry"
-                ),
-            )
-        })?;
-        bound
-            .session
-            .feed_cell(dense as u32)?
+        let dense = bound
+            .ids
+            .iter()
+            .position(|&held| held == id)
             .ok_or_else(|| {
                 Fault::program(
                     "program::plane",
                     format!(
-                        "float-port feed channel {id} of instance {instance} holds no \
-                         committed cell; a port is fed from the cell the instance's own \
-                         `take` would read this fire, so publish one before submitting"
+                        "float-port feed names channel {id}, which instance {instance} does \
+                     not carry"
                     ),
                 )
-            })
+            })?;
+        bound.session.feed_cell(dense as u32)?.ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!(
+                    "float-port feed channel {id} of instance {instance} holds no \
+                         committed cell; a port is fed from the cell the instance's own \
+                         `take` would read this fire, so publish one before submitting"
+                ),
+            )
+        })
     }
 
     #[must_use]
@@ -231,20 +232,19 @@ impl Plane {
             if instances.contains(id) {
                 continue;
             }
-            if bound.shared.iter().flatten().any(|mine| {
-                held.iter().any(|theirs| Arc::ptr_eq(mine, theirs))
-            }) {
+            if bound
+                .shared
+                .iter()
+                .flatten()
+                .any(|mine| held.iter().any(|theirs| Arc::ptr_eq(mine, theirs)))
+            {
                 cohort.push(*id);
             }
         }
         cohort
     }
 
-    fn seats_for(
-        &self,
-        plan: &ExecPlan,
-        channels: &[u64],
-    ) -> Result<Vec<Option<Arc<SharedRing>>>> {
+    fn seats_for(&self, plan: &ExecPlan, channels: &[u64]) -> Result<Vec<Option<Arc<SharedRing>>>> {
         let mut adopted: Vec<Option<Arc<SharedRing>>> =
             Vec::with_capacity(plan.package.channels.len());
         for dense in 0..plan.package.channels.len() {
@@ -457,11 +457,8 @@ impl Plane {
                         .get(&slot)
                         .is_none_or(|batch| batch.lanes() < needed);
                     if rebuild {
-                        let batch = launch::Batch::build(
-                            device,
-                            group[0],
-                            needed.next_power_of_two(),
-                        )?;
+                        let batch =
+                            launch::Batch::build(device, group[0], needed.next_power_of_two())?;
                         self.batches.insert(slot, batch);
                     }
                     let batch = self
@@ -513,7 +510,10 @@ impl Plane {
         let program = self.programs.get(&bound.program_id).ok_or_else(|| {
             Fault::program(
                 "program::plane",
-                format!("instance {id} names program {}, which is gone", bound.program_id),
+                format!(
+                    "instance {id} names program {}, which is gone",
+                    bound.program_id
+                ),
             )
         })?;
         Ok(program.plan.needs_pixels)
@@ -533,7 +533,9 @@ impl Plane {
                 ),
             )
         })?;
-        Ok(program.plan.reads_intrinsic(eta_ir::op::IntrinsicId::Logits))
+        Ok(program
+            .plan
+            .reads_intrinsic(eta_ir::op::IntrinsicId::Logits))
     }
 
     pub fn needs_mtp_logits(&self, id: u64) -> Result<bool> {

@@ -369,7 +369,10 @@ impl<'c> Run<'c> {
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
             Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
-                panic!("value {} lives on the voxel axis, which this shell does not seat", id.0)
+                panic!(
+                    "value {} lives on the voxel axis, which this shell does not seat",
+                    id.0
+                )
             }
         };
         self.slice(handle, skip, keep)
@@ -678,7 +681,7 @@ impl<'c> Run<'c> {
             let mut unique: Vec<i32> = Vec::new();
             let mut seat_of: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
             let mut seated = Vec::with_capacity(raw.len() / 4);
-            for word in raw.chunks_exact(4) {
+            for word in raw.as_chunks::<4>().0 {
                 let e = i32::from_le_bytes([word[0], word[1], word[2], word[3]]);
                 if e < 0 {
                     seated.push(-1);

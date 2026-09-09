@@ -27,6 +27,7 @@ fn read_t(path: &Path) -> Vec<u8> {
         .into_owned()
 }
 
+#[test]
 fn publish_every_case() {
     nothing_is_at_the_path_until_finish();
     dropping_an_unfinished_publisher_leaves_nothing();
@@ -35,7 +36,6 @@ fn publish_every_case() {
     create_writes_in_place();
 }
 
-#[test]
 fn nothing_is_at_the_path_until_finish() {
     let path = tmp("published.zt");
     let _ = std::fs::remove_file(&path);

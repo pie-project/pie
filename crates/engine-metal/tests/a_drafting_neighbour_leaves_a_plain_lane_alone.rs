@@ -62,8 +62,16 @@ fn plain_beside(shell: &mut Shell, slot_a: u32, slot_b: u32, b_drafts: bool) -> 
     shell.open(slot_b).expect("slot b opens");
     let got = shell
         .fire(&[
-            Lane { slot: slot_a, word: word(PROMPT_A.len() as u32, false), tokens: PROMPT_A },
-            Lane { slot: slot_b, word: word(PROMPT_B.len() as u32, b_drafts), tokens: PROMPT_B },
+            Lane {
+                slot: slot_a,
+                word: word(PROMPT_A.len() as u32, false),
+                tokens: PROMPT_A,
+            },
+            Lane {
+                slot: slot_b,
+                word: word(PROMPT_B.len() as u32, b_drafts),
+                tokens: PROMPT_B,
+            },
         ])
         .expect("the prefill fires");
     let mut rows_a = vec![got[0].clone()];
@@ -73,8 +81,16 @@ fn plain_beside(shell: &mut Shell, slot_a: u32, slot_b: u32, b_drafts: bool) -> 
         let fed_b = [argmax(&last_b)];
         let got = shell
             .fire(&[
-                Lane { slot: slot_a, word: word(1, false), tokens: &fed_a },
-                Lane { slot: slot_b, word: word(1, b_drafts), tokens: &fed_b },
+                Lane {
+                    slot: slot_a,
+                    word: word(1, false),
+                    tokens: &fed_a,
+                },
+                Lane {
+                    slot: slot_b,
+                    word: word(1, b_drafts),
+                    tokens: &fed_b,
+                },
             ])
             .unwrap_or_else(|why| panic!("decode step {step} (b drafts={b_drafts}) fires: {why}"));
         rows_a.push(got[0].clone());
@@ -98,12 +114,20 @@ fn a_plain_lane_reads_the_same_logits_beside_a_drafting_one() {
 
     let beside_plain = plain_beside(&mut shell, 0, 1, false);
     let beside_drafting = plain_beside(&mut shell, 2, 3, true);
-    compare("one drafting lane (against one plain lane)", &beside_plain, &beside_drafting);
+    compare(
+        "one drafting lane (against one plain lane)",
+        &beside_plain,
+        &beside_drafting,
+    );
     let beside_crowd = plain_beside_window(&mut shell, 4, &[5, 6, 7, 8], false);
     let beside_window = plain_beside_window(&mut shell, 9, &[10, 11, 12, 13], true);
     let floor = widest_gap(&beside_plain, &beside_crowd);
     eprintln!("the width floor, four plain lanes beside one against one beside one: {floor:.4}");
-    compare("a four-lane drafting window (against four plain lanes)", &beside_crowd, &beside_window);
+    compare(
+        "a four-lane drafting window (against four plain lanes)",
+        &beside_crowd,
+        &beside_window,
+    );
 }
 
 fn widest_gap(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
@@ -113,22 +137,43 @@ fn widest_gap(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
         .fold(0f32, f32::max)
 }
 
-fn plain_beside_window(shell: &mut Shell, slot_a: u32, slots: &[u32], drafting: bool) -> Vec<Vec<f32>> {
+fn plain_beside_window(
+    shell: &mut Shell,
+    slot_a: u32,
+    slots: &[u32],
+    drafting: bool,
+) -> Vec<Vec<f32>> {
     shell.open(slot_a).expect("slot a opens");
     for &slot in slots {
         shell.open(slot).expect("a window slot opens");
     }
-    let mut lanes = vec![Lane { slot: slot_a, word: word(PROMPT_A.len() as u32, false), tokens: PROMPT_A }];
+    let mut lanes = vec![Lane {
+        slot: slot_a,
+        word: word(PROMPT_A.len() as u32, false),
+        tokens: PROMPT_A,
+    }];
     for &slot in slots {
-        lanes.push(Lane { slot, word: word(PROMPT_B.len() as u32, drafting), tokens: PROMPT_B });
+        lanes.push(Lane {
+            slot,
+            word: word(PROMPT_B.len() as u32, drafting),
+            tokens: PROMPT_B,
+        });
     }
     let got = shell.fire(&lanes).expect("the prefill fires");
     let mut rows_a = vec![got[0].clone()];
     let mut fed: Vec<[u32; 1]> = got.iter().map(|row| [argmax(row)]).collect();
     for step in 0..STEPS {
-        let mut lanes = vec![Lane { slot: slot_a, word: word(1, false), tokens: &fed[0] }];
+        let mut lanes = vec![Lane {
+            slot: slot_a,
+            word: word(1, false),
+            tokens: &fed[0],
+        }];
         for (at, &slot) in slots.iter().enumerate() {
-            lanes.push(Lane { slot, word: word(1, drafting), tokens: &fed[at + 1] });
+            lanes.push(Lane {
+                slot,
+                word: word(1, drafting),
+                tokens: &fed[at + 1],
+            });
         }
         let got = shell
             .fire(&lanes)

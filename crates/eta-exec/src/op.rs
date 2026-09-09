@@ -1136,13 +1136,13 @@ mod rng_tests {
     use super::rng_lanes;
     use eta_ir::RngKind;
 
+    #[test]
     fn op_every_case() {
         a_split_draw_is_the_serial_draw();
         a_partial_nucleus_is_the_ordered_nucleus();
         a_broadcast_is_its_coordinate_walk();
     }
 
-    #[test]
     fn a_split_draw_is_the_serial_draw() {
         let serial = |seed: u64, n: usize, kind: RngKind| -> Vec<f32> {
             (0..n)

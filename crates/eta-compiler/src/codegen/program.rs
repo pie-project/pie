@@ -9,8 +9,7 @@ use crate::plan::{CompiledStage, LibraryOp, Region, RegionKind};
 use eta_ir::op::tags;
 use eta_ir::validate::BoundTrace;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u32)]
 pub enum KernelKind {
     #[default]
@@ -22,8 +21,7 @@ pub enum KernelKind {
     Streamed = 5,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmittedKernel {
     pub kind: KernelKind,
     pub stage_index: u32,

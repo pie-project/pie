@@ -1,10 +1,7 @@
-use model_compiler::{
-    Budget, Budgets, DeviceProfile, PatchLadder, RowAxis, compile, compile_axes,
-};
+use model_compiler::{Budget, Budgets, DeviceProfile, PatchLadder, RowAxis, compile, compile_axes};
 mod common;
 use model_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Operation, Param, Seam, Trace, Ty,
-    ValueDecl, ValueId,
+    CacheRow, Def, Dim, Dtype, Guard, Node, Operation, Param, Seam, Trace, Ty, ValueDecl, ValueId,
 };
 
 #[test]
@@ -54,7 +51,10 @@ fn tower_and_trunk() -> Trace {
         patch(8),
     );
     let mut chain = pixels;
-    for (at, ty) in [patch(8), patch(8), token(8), token(8)].into_iter().enumerate() {
+    for (at, ty) in [patch(8), patch(8), token(8), token(8)]
+        .into_iter()
+        .enumerate()
+    {
         let y = push(&mut values, Def::Op(at as u32), ty);
         nodes.push(Node {
             op: Operation::Elementwise(model_ir::Elementwise::RmsnormNoScale {

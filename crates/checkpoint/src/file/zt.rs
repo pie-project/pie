@@ -6,7 +6,7 @@ use ztensor::{Plane, Source, Tensor, Term};
 use crate::error::Error;
 use crate::file::{Attribute, Attributes, File, Metadata, RawTensor, TokenizerTables};
 use crate::term::{
-    dtype_of_leaf, gguf_scheme, gguf_type_of, plane_name, spec_of_canonical, MMA_TILED,
+    MMA_TILED, dtype_of_leaf, gguf_scheme, gguf_type_of, plane_name, spec_of_canonical,
 };
 use crate::types::{Axis, CheckpointFormat, DType, Encoding, FileId, QuantSpec, TensorId};
 
@@ -229,8 +229,9 @@ fn planes_of(tensor: &Tensor<'_>) -> Result<Vec<PlaneRead>, Error> {
         shape
             .iter()
             .map(|&d| {
-                i64::try_from(d)
-                    .map_err(|_| Error::Checkpoint(format!("{name}: dimension {d} does not fit an i64")))
+                i64::try_from(d).map_err(|_| {
+                    Error::Checkpoint(format!("{name}: dimension {d} does not fit an i64"))
+                })
             })
             .collect()
     };

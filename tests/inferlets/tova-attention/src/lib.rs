@@ -8,8 +8,8 @@
 //! (that is H2O), no observation window (that is SnapKV) — just the attention
 //! distribution of the most recent token.
 //!
-//! This inferlet is the **observability half** of that policy, in the same
-//! sense as `quest-attention`: it runs TOVA's exact decision quantity on real
+//! This inferlet is the **observability half** of that policy: it runs
+//! TOVA's exact decision quantity on real
 //! hardware, against the live KV cache, and drains the resulting scores back to
 //! the host so the keep-set can be checked against a reference. It does not yet
 //! mask the evicted positions out of the attention kernel, so it produces
@@ -56,8 +56,7 @@
 //!    consumer. The rectangle is per-head because observability wants it that
 //!    way (§4: "per-head is the better answer"), so this program takes the mean
 //!    over its own heads — the union-friendly collapse: a position that any
-//!    head needs keeps a non-trivial share of the mass. `quest-attention`
-//!    documents the identical collapse for the identical reason.
+//!    head needs keeps a non-trivial share of the mass.
 //!
 //! 2. **Layers are folded by the program.** TOVA maintains a separate cache per
 //!    layer. One page list per request means one keep-set per request, so this

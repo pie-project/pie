@@ -86,6 +86,7 @@ fn check(
     }
 }
 
+#[test]
 fn the_relative_bucket_bias_table_reads_the_bucket_torch_lands_every_case() {
     the_t5_table_reads_the_bucket_at_every_distance_from_a_bf16_embedding();
     the_t5_table_reads_the_bucket_at_every_distance_from_an_f32_embedding();
@@ -93,7 +94,6 @@ fn the_relative_bucket_bias_table_reads_the_bucket_torch_lands_every_case() {
     a_max_distance_inside_the_exact_band_is_refused();
 }
 
-#[test]
 fn the_t5_table_reads_the_bucket_at_every_distance_from_a_bf16_embedding() {
     check(4, 512, 32, 128.0, true, Dtype::Bf16);
 }

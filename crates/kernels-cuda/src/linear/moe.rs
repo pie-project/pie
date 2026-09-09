@@ -680,7 +680,7 @@ pub(crate) fn select_gemv(
             ),
         ));
     }
-    if x.width == 0 || x.width % VEC_WIDTH != 0 {
+    if x.width == 0 || !x.width.is_multiple_of(VEC_WIDTH) {
         return Err(refuse(
             op,
             format!(
@@ -746,7 +746,7 @@ fn matmul_select_mxfp4(
         "the expert bias rides the activation's dtype"
     );
     let fan = selected(op, x, routes, y)?;
-    if x.width == 0 || x.width % MXFP4_BLOCK != 0 {
+    if x.width == 0 || !x.width.is_multiple_of(MXFP4_BLOCK) {
         return Err(refuse(
             op,
             format!(
@@ -878,6 +878,7 @@ pub fn matmul_select_bias(
     matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y, seat)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn matmul_select_quant(
     ctx: &Ctx,
     x: Tensor,
@@ -1073,7 +1074,7 @@ pub fn weighted_sum(
     let t = dtype_dispatch!(OP, routed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
     nonzero(OP, "the token rows this fold lands on", y.rows)?;
-    if routed.rows % y.rows != 0 {
+    if !routed.rows.is_multiple_of(y.rows) {
         return Err(refuse(
             OP,
             format!(

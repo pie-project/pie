@@ -300,6 +300,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn store_every_case() {
         shards_are_not_entries_of_their_own();
         a_model_directory_is_one_entry_with_its_builds_beneath_it();
@@ -310,7 +311,6 @@ mod tests {
         a_name_resolves_exactly_or_names_what_it_could_not_choose_between();
     }
 
-    #[test]
     fn shards_are_not_entries_of_their_own() {
         let dir = tempfile::tempdir().unwrap();
         let payload = vec![7u8; 32_000];

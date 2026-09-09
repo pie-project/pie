@@ -23,7 +23,7 @@ fn packed_halves(
     fan: u32,
     y: &Tensor,
 ) -> Result<(Launch, i32), Error> {
-    if fan == 0 || y.rows % fan != 0 {
+    if fan == 0 || !y.rows.is_multiple_of(fan) {
         return Err(refuse(
             op,
             format!(

@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
-use crate::error::KernelError;
 use crate::dispatch::{
     DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
     DispatchLinear, DispatchSpatial,
 };
+use crate::error::KernelError;
 use model_compiler::{Lowering, Region};
 use model_ir::ops::{Attention, Collective, Elementwise};
 use model_ir::{
-    CacheRow, Guard, CustomCuda, Def, Dim, Dtype, Layout, Linear, Node, Operands, Operation, Trace,
-    Platform, RuntimeInput, Seam, StructKind, Ty, ValueDecl, ValueId, Spatial,
+    CacheRow, CustomCuda, Def, Dim, Dtype, Guard, Layout, Linear, Node, Operands, Operation,
+    Platform, RuntimeInput, Seam, Spatial, StructKind, Trace, Ty, ValueDecl, ValueId,
 };
 
 use crate::fire::sink::{EventId, Sink};

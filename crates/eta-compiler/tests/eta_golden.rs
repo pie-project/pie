@@ -1,12 +1,10 @@
-use std::fmt::Write as _;
-use eta_ir::container::{
-    ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer, encode,
-};
+use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer, encode};
 use eta_ir::container_hash;
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{ModelProfile, Stage};
 use eta_ir::types::{Dtype, Literal, Shape};
 use eta_ir::validate::{BoundTrace, bind};
+use std::fmt::Write as _;
 
 #[path = "common/traces.rs"]
 mod traces;
@@ -100,6 +98,7 @@ fn onechan(host_role: HostRole) -> ChannelDecl {
     }
 }
 
+#[test]
 fn eta_golden_every_case() {
     golden_neg_spsc_second_producer();
     golden_neg_sink_at_epilogue();
@@ -111,7 +110,6 @@ fn eta_golden_every_case() {
     extern_direction_violations_rejected();
 }
 
-#[test]
 fn golden_neg_spsc_second_producer() {
     let c = TraceContainer {
         names: vec![],

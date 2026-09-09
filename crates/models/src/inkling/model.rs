@@ -65,6 +65,7 @@ pub struct Layer {
     pub lora_b: Weight,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Mlp {
     Dense {
         gate_up: Weight,
@@ -185,9 +186,8 @@ impl Model {
                     (Reading::Local, d.local_kv_heads / tp, d.window)
                 };
                 let kv_w = u64::from(kv_heads) * hd;
-                let conv = |s: &str, channels: u64| {
-                    Weight::sym(n(s), [channels, kw], dense).columns()
-                };
+                let conv =
+                    |s: &str, channels: u64| Weight::sym(n(s), [channels, kw], dense).columns();
                 let mlp = if l < d.dense_layers {
                     let iw = u64::from(d.dense_inter / tp);
                     Mlp::Dense {

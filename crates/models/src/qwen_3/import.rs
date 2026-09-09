@@ -159,12 +159,7 @@ impl Model {
                         ],
                     )?;
 
-                    b.read_expr(
-                        &g.conv,
-                        (|| -> Result<Expr, Error> {
-                            squeezed(src, n("linear_attn.conv1d.weight"))
-                        })()?,
-                    )?;
+                    b.read_expr(&g.conv, squeezed(src, n("linear_attn.conv1d.weight"))?)?;
 
                     b.read(&g.dt_bias, n("linear_attn.dt_bias"))?;
                     b.read(&g.a_log, n("linear_attn.A_log"))?;

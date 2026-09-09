@@ -10,8 +10,8 @@ use ::engine::program::BindExtents;
 use ::engine::{ChannelRegistration, KvCopy, ProgramRegistration, StateCopy};
 
 use crate::engine::{
-    BoundInstance, ChannelEndpoint, ChannelValue, EngineId, InstanceBindingPlan,
-    InstanceId, ProgramId, SubmissionCompletion,
+    BoundInstance, ChannelEndpoint, ChannelValue, EngineId, InstanceBindingPlan, InstanceId,
+    ProgramId, SubmissionCompletion,
 };
 
 use super::{ProcessId, scheduler_handle};

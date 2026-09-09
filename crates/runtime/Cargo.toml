@@ -17,12 +17,7 @@ engine = { path = "../engine" }
 eta-ir = { path = "../eta-ir" }
 model-ir = { path = "../model-ir" }
 eta-compiler = { path = "../eta-compiler" }
-# `default-features = false` drops the shell's `probe` feature: gate-only hooks
-# that make the engine disagree with itself on purpose. Not for a serving binary.
 engine-cuda = { path = "../engine-cuda", optional = true, default-features = false }
-# Declared twice — here portably, and again in the Apple target table below,
-# which is where the device half (`metal-4`) can be turned on. Naming `metal-4`
-# here would make `--features metal` a build error off Apple.
 engine-metal = { path = "../engine-metal", optional = true }
 
 client = { path = "../client" }
@@ -39,17 +34,12 @@ tracing-appender = "0.2"
 tracing-opentelemetry = "0.33"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-# default-features off: the default set drags in the HTTP transports (and a
-# second reqwest client); `telemetry.rs` only ever calls `.with_tonic()`.
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "grpc-tonic",
     "trace",
     "metrics",
 ] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
-# default-features off: wasmtime's default set is the tooling build (text/WIT
-# parsing, on-disk cache, coredump, profiling, GC). Inferlets arrive as binary
-# components, so everything the runtime reaches is listed explicitly.
 wasmtime = { version = "47.0.1", default-features = false, features = [
     "runtime",
     "std",
@@ -64,18 +54,12 @@ wasmtime = { version = "47.0.1", default-features = false, features = [
     "addr2line",
     "demangle",
 ] }
-# p1 off (a default): nothing links preview1, and it drags in wiggle → witx →
-# a second, ancient `wast`.
 wasmtime-wasi = { version = "47.0.1", default-features = false, features = ["p2", "p3"] }
-# `default-send-request` stays on: it supplies the blanket
-# `WasiHttpHooks::send_request`, and its rustls is the ring build, not aws-lc.
 wasmtime-wasi-http = { version = "47.0.1", default-features = false, features = [
     "p2",
     "p3",
     "default-send-request",
 ] }
-# `http::uri::Scheme` for the wasi:http@0.3 network-policy hook; shares
-# wasmtime-wasi-http's http 1.x.
 http = "1"
 bytes = "1.12.1"
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
@@ -86,21 +70,11 @@ futures = "0.3.33"
 waker = { path = "../waker" }
 tokenizer = { path = "../tokenizer" }
 grammar = { path = "../grammar" }
-# The model catalog: chat templates keyed by SKU, and the decoders that read
-# generated tokens back as chat, reasoning and tool events.
 models = { path = "../models" }
-# `checkpoint` names `ModelContract`, which this crate installs into the engine
-# shell through a function pointer (`engine::load`) so the checkpoint plane
-# stays out of every `KvHandle` reader's graph. `ztensor`/`ztensor-compat` open
-# the checkpoint it is checked against.
-# `default-features = false` drops the loader testkit (oracle, fixtures, CPU executor).
 checkpoint = { path = "../checkpoint", default-features = false }
 checkpoint-dsl = { path = "../checkpoint-dsl" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
-# Host-side media decode and encode: only the container formats the host
-# accepts (in) or writes (out). `webp` is here for `frames.encode(webp)`; it
-# pulls the pure-Rust `image-webp`, whose encoder is lossless-only.
 image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
@@ -114,20 +88,12 @@ wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }
 wasmparser = "0.254.0"
 wasm-metadata = "0.254.0"
 libc = "0.2"
-# The CUDA driver, for `codec::nvenc`'s encode session only: the engine owns
-# every other device call. Pinned to `engine-cuda`'s version (see the `cuda`
-# feature) because cargo unifies features across the graph.
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
     "std",
     "driver",
     "fallback-dynamic-loading",
 ] }
-# `dlopen` for `libnvidia-encode.so.1`. Same major as the one cudarc already
-# links, so this adds a dependency edge and not a crate.
 libloading = { version = "0.9", optional = true }
-# default-features off so `default-tls` (native-tls → openssl) is never pulled
-# in: it dynamically links libssl.so.1.1, which breaks the manylinux_2_28
-# release binary on OpenSSL-3 distros. rustls links statically.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 rustc-hash = "2.1"
@@ -135,54 +101,21 @@ smallvec = "1"
 lru = "0.18.1"
 ipnet = "2"
 
-# The Vulkan shell. NO TARGET GATE, unlike `engine-metal` below: a Vulkan
-# loader is a choice a machine makes rather than a platform, so the axis is a
-# cargo feature all the way down and every `#[cfg(feature = "vulkan")]` in this
-# crate stands alone.
 engine-vulkan = { path = "../engine-vulkan", optional = true }
 
-# The wgpu shell, on the same axis as the Vulkan one above and for the same
-# reason: wgpu picks a backend at run time on every platform pie builds for,
-# so there is no target whose answer is known in advance.
 engine-wgpu = { path = "../engine-wgpu", optional = true }
 
-# The Apple half of the `metal` feature; cargo unifies this with the portable
-# entry above on Apple targets and applies only that one elsewhere.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 engine-metal = { path = "../engine-metal", optional = true }
 
 [features]
 default = []
-# The CUDA shell. `engine-cuda/cuda` must ride along: the shell builds with no
-# runtime selected (every device call answers `Fault::Runtimeless`), so naming
-# the dep alone links a shell that cannot bind a device. If a second CUDA ABI
-# ever returns, the version returns to the feature name — never a bare alias.
-# `dep:cudarc` and `dep:libloading` ride along for `codec::nvenc`: opening an
-# NVENC session needs a CUDA context (cudarc's, so the encoder shares the
-# engine's primary context rather than opening a second one), and
-# `libnvidia-encode.so.1` is reached by `dlopen` exactly the way cudarc reaches
-# every CUDA library. The `cudarc` version and feature set must match
-# `engine-cuda`'s, since cargo unifies them into one build.
 cuda = ["dep:engine-cuda", "engine-cuda/cuda", "dep:cudarc", "dep:libloading", "cudarc/cuda-13000"]
-# The Metal shell. `engine-metal` is target-gated rather than feature-gated, so
-# this flag alone is not a build that links a device: every `#[cfg]` reading it
-# pairs it with `target_vendor = "apple"`.
 metal = ["dep:engine-metal"]
-# The Vulkan shell. `engine-vulkan/vulkan` rides along for the reason the CUDA
-# line states: the shell builds with no loader selected and answers
-# `Fault::Deviceless`, so naming the dep alone links a shell that cannot bind.
 vulkan = ["dep:engine-vulkan", "engine-vulkan/vulkan"]
-# The wgpu shell. `engine-wgpu/wgpu` rides along for the reason the two lines
-# above state: the shell builds with no adapter selected and answers
-# `Fault::Deviceless`, so naming the dep alone links a shell that cannot bind.
 wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu"]
-# Host-side performance probes, one flag per domain so you pay only for what
-# you ask for; `probe_<domain>!` in `src/scheduler/probe.rs` expands to nothing
-# when its feature is off.
-profile-fire = []          # per-fire scheduler lifecycle (90×/sec at conc=256)
+profile-fire = []
 
 [dev-dependencies]
 tempfile = "3"
-# `wat` for tests only: the linker tests build `(module ...)` fixtures from
-# text. The runtime itself never compiles text.
 wasmtime = { version = "47", default-features = false, features = ["wat"] }

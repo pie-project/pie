@@ -10,13 +10,8 @@ repository = "https://github.com/pie-project/pie"
 [features]
 profile-fire = ["worker/profile-fire"]
 
-# Which backends the embedded engine can host. The CUDA default is spelled out
-# so it is greppable; a packager overrides with `--no-default-features`.
 default = ["cuda"]
 cuda = ["worker/cuda"]
-# Apple-only at the crate level, so this flag alone is not a build that links:
-# `runtime`'s seam pairs it with `target_vendor = "apple"`. Build it with
-# `--no-default-features --features metal` — the CUDA default wants `libnccl`.
 metal = ["worker/metal"]
 
 [lib]
@@ -25,17 +20,9 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-# TLS backend selection, not TLS use: the HTTPS clients are built on reqwest's
-# `rustls-no-provider`, so something in the process must name a provider. The
-# CLI has `bootstrap` for that; the wheel has this.
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
-# The wheel links the same `serve::start_runtime` the CLI does, so the two
-# cannot drift in boot behavior. Which engines is the `[features]` table's
-# choice above, not a pin here.
 worker = { path = "../../../crates/worker", default-features = false }
 pyo3 = { version = "0.29", features = ["extension-module"] }
 tokio = { version = "1.53", features = ["rt-multi-thread"] }
 toml = "1.1"
-# Without a subscriber installed the wheel is mute: engine-side events are
-# discarded silently and `RUST_LOG` appears to do nothing.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

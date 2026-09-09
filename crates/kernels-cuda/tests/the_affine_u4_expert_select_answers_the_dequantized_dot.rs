@@ -131,6 +131,7 @@ fn check_with(experts: usize, n: usize, k: usize, tokens: usize, top_k: usize, b
     eprintln!("ok: worst relative error {worst:.5}");
 }
 
+#[test]
 fn the_affine_u4_expert_select_answers_the_dequantized_dot_every_case() {
     the_up_leg_read_by_token();
     the_up_leg_read_by_token_at_one_token_takes_the_gemv();
@@ -141,7 +142,6 @@ fn the_affine_u4_expert_select_answers_the_dequantized_dot_every_case() {
     a_wide_fire_takes_the_grouped_kernel_on_the_down_leg_with_ragged_tiles();
 }
 
-#[test]
 fn the_up_leg_read_by_token() {
     check(16, 1408, 2816, 3, 8, true, 0x51);
 }

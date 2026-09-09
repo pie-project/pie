@@ -16,13 +16,13 @@ fn cond_of(p: &Predicate) -> Guard {
     }
 }
 
+#[test]
 fn a_ragged_attention_joins_two_arms_every_case() {
     queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both();
     every_other_op_still_refuses_two_arms();
     a_lanes_stream_is_its_fact_word();
 }
 
-#[test]
 fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both() {
     let trace = trace_hybrid("cross", &CrossAttention, Platform::Cuda);
     assert!(trace.caches.is_empty(), "a denoiser declares no kv space");

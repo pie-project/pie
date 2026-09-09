@@ -16,7 +16,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-# `pie-client` provides `PieClient` — `Server.connect()` returns one.
 dependencies = [
     "pie-client",
 ]
@@ -24,7 +23,6 @@ dependencies = [
 [tool.maturin]
 python-source = "python"
 python-packages = ["pie"]
-# `_engine.so` lands at `python/pie/_engine.so` → importable as `pie._engine`.
 module-name = "pie._engine"
 manifest-path = "Cargo.toml"
 
@@ -36,9 +34,6 @@ cache-keys = [
     { file = "pyproject.toml" },
     { file = "Cargo.toml" },
     { file = "src/**/*.rs" },
-    # The embedded engine compiles the whole runtime + engine + WIT surface;
-    # without these keys a source edit there serves a stale cached wheel. Every
-    # crate lives under `crates/` now, so this is one glob instead of eleven.
     { file = "../../../crates/**/Cargo.toml" },
     { file = "../../../crates/**/*.rs" },
     { file = "../../../crates/**/*.wit" },

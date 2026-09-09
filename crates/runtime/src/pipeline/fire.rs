@@ -365,7 +365,11 @@ fn rs_plan_for(
                      count, twice the pages one window needs); it holds {slots} slot(s)"
                 ));
             }
-            let page = store.geometry(*id).map_err(|e| e.to_string())?.buffer_page_tokens.max(1);
+            let page = store
+                .geometry(*id)
+                .map_err(|e| e.to_string())?
+                .buffer_page_tokens
+                .max(1);
             let run = slots / 2;
             if row_tokens[row] > run * page {
                 return Err(format!(
@@ -670,9 +674,7 @@ pub(crate) fn test_pending_op_stub() -> PendingOp {
 
 enum FireKv {
     Host(Option<kv::KvTxn>),
-    DeviceGeom {
-        kvtxn: kv::KvTxn,
-    },
+    DeviceGeom { kvtxn: kv::KvTxn },
 }
 
 pub struct PendingFire {
@@ -1229,16 +1231,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let media_spans = ctx.resources().get(&fwd)?.bindings.media.clone();
         let carries_media = !media_spans.is_empty();
         let matched = {
-            let lane_tokens: Vec<&[u32]> =
-                req.lanes.iter().map(|lane| lane.tokens.as_slice()).collect();
+            let lane_tokens: Vec<&[u32]> = req
+                .lanes
+                .iter()
+                .map(|lane| lane.tokens.as_slice())
+                .collect();
             let scanned = if carries_media {
                 crate::pipeline::media::scan(&lane_tokens, &media_spans)
             } else {
-                crate::pipeline::media::refuse_orphan_runs(
-                    &lane_tokens,
-                    crate::model::media_pad(),
-                )
-                .map(|()| Vec::new())
+                crate::pipeline::media::refuse_orphan_runs(&lane_tokens, crate::model::media_pad())
+                    .map(|()| Vec::new())
             };
             match scanned {
                 Ok(matched) => matched,
@@ -1252,7 +1254,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
         {
             let pass = ctx.resources().get_mut(&fwd)?;
             if pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise) {
-                let payload = if pass.bindings.self_cond.as_ref().is_some_and(|p| p.channels.is_some()) {
+                let payload = if pass
+                    .bindings
+                    .self_cond
+                    .as_ref()
+                    .is_some_and(|p| p.channels.is_some())
+                {
                     pass.bindings.self_cond.clone()
                 } else {
                     pass.bindings.self_cond.take()
@@ -1683,14 +1690,13 @@ fn prove_frame_admissible(k: usize, slots: &[SlotAccess]) -> Result<(), String> 
                             cell.global_id, entry.consumes
                         ));
                     }
-                } else if entry.publishes == 0 && entry.consumes == 0 {
-                    if !cell.has_committed_front() {
-                        return Err(format!(
-                            "pipeline: channel {}: latest-value control word has \
-                             no committed cell at frame submit",
-                            cell.global_id
-                        ));
-                    }
+                } else if entry.publishes == 0 && entry.consumes == 0 && !cell.has_committed_front()
+                {
+                    return Err(format!(
+                        "pipeline: channel {}: latest-value control word has \
+                         no committed cell at frame submit",
+                        cell.global_id
+                    ));
                 }
             }
             Some(HostRole::Reader) if entry.publishes > 0 => {
@@ -1709,8 +1715,7 @@ fn prove_frame_admissible(k: usize, slots: &[SlotAccess]) -> Result<(), String> 
                     ));
                 }
             }
-            _ => {
-            }
+            _ => {}
         }
     }
     Ok(())
@@ -1796,13 +1801,11 @@ pub async fn copy_into_inner<C: FireContext>(
         .zip(dst_tok_idx)
         .zip(kv_move_src_pages.into_iter().zip(src_tok_idx))
         .map(
-            |((dst_page_id, dst_token_offset), (src_page_id, src_token_offset))| {
-                ::engine::KvMove {
-                    dst_page_id,
-                    dst_token_offset,
-                    src_page_id,
-                    src_token_offset,
-                }
+            |((dst_page_id, dst_token_offset), (src_page_id, src_token_offset))| ::engine::KvMove {
+                dst_page_id,
+                dst_token_offset,
+                src_page_id,
+                src_token_offset,
             },
         )
         .collect::<Vec<_>>();
@@ -2166,10 +2169,17 @@ async fn fire_device_geometry<C: FireContext>(
 
     let (ws_rep, rs_reps, rs_fold_len) = {
         let pass = ctx.resources().get(&fwd)?;
-        let device_fold_len = pass.instance.program.bound.container.ports.iter().any(|binding| {
-            binding.port == eta_ir::registry::Port::RsFoldLen
-                && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
-        });
+        let device_fold_len = pass
+            .instance
+            .program
+            .bound
+            .container
+            .ports
+            .iter()
+            .any(|binding| {
+                binding.port == eta_ir::registry::Port::RsFoldLen
+                    && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
+            });
         let rs_fold_len = if device_fold_len {
             None
         } else {
@@ -2258,7 +2268,13 @@ async fn fire_device_geometry<C: FireContext>(
         };
         write_indexes.sort_unstable();
         write_indexes.dedup();
-        (grant_slots, write_indexes, fresh_dense, devgeo_b, devgeo_split)
+        (
+            grant_slots,
+            write_indexes,
+            fresh_dense,
+            devgeo_b,
+            devgeo_split,
+        )
     };
 
     let wide = devgeo_split
@@ -2268,7 +2284,9 @@ async fn fire_device_geometry<C: FireContext>(
         Some(split) if wide => split.clone(),
         _ => vec![0; devgeo_b + 1],
     };
-    let rs_qo_indptr = devgeo_split.clone().unwrap_or_else(|| resolved_qo_indptr.clone());
+    let rs_qo_indptr = devgeo_split
+        .clone()
+        .unwrap_or_else(|| resolved_qo_indptr.clone());
     let rs_ws_ids = match bound_rs_working_set_ids(ctx, ws.model, ws.engine, &rs_reps)? {
         Ok(ids) => ids,
         Err(error) => {
@@ -2497,7 +2515,12 @@ async fn fire_device_geometry<C: FireContext>(
     {
         let pass = ctx.resources().get_mut(&fwd)?;
         if pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise) {
-            let payload = if pass.bindings.self_cond.as_ref().is_some_and(|p| p.channels.is_some()) {
+            let payload = if pass
+                .bindings
+                .self_cond
+                .as_ref()
+                .is_some_and(|p| p.channels.is_some())
+            {
                 pass.bindings.self_cond.clone()
             } else {
                 pass.bindings.self_cond.take()
@@ -2751,6 +2774,7 @@ mod static_admission_tests {
         }
     }
 
+    #[test]
     fn fire_every_case() {
         a_device_ring_frame_that_overflows_is_refused_by_name();
         a_seeded_descriptor_ring_is_not_walked();
@@ -2760,7 +2784,6 @@ mod static_admission_tests {
         a_slot_that_consumes_what_an_earlier_slot_published_is_admitted();
     }
 
-    #[test]
     fn a_device_ring_frame_that_overflows_is_refused_by_name() {
         let ring = channel(HostRole::None, 1, false);
         let slots = [
@@ -2768,7 +2791,10 @@ mod static_admission_tests {
             slot(std::slice::from_ref(&ring), &[(false, true)]),
         ];
         let refusal = prove_frame_admissible(2, &slots).expect_err("two publishes, capacity one");
-        assert!(refusal.contains("device-ring occupancy past capacity 1"), "{refusal}");
+        assert!(
+            refusal.contains("device-ring occupancy past capacity 1"),
+            "{refusal}"
+        );
         assert!(refusal.contains("frame slot 1"), "{refusal}");
     }
 
@@ -2796,7 +2822,10 @@ mod static_admission_tests {
             slot(std::slice::from_ref(&writer), &[(true, false)]),
         ];
         let refusal = prove_frame_admissible(2, &two).expect_err("two consumes, one staged");
-        assert!(refusal.contains("consumes 2 host-writer cell(s)"), "{refusal}");
+        assert!(
+            refusal.contains("consumes 2 host-writer cell(s)"),
+            "{refusal}"
+        );
         assert!(refusal.contains("only 1 are staged"), "{refusal}");
     }
 
@@ -2823,7 +2852,10 @@ mod static_admission_tests {
             slot(std::slice::from_ref(&reader), &[(false, true)]),
         ];
         let refusal = prove_frame_admissible(2, &slots).expect_err("two writes, capacity one");
-        assert!(refusal.contains("frame would need 2 reader cell(s)"), "{refusal}");
+        assert!(
+            refusal.contains("frame would need 2 reader cell(s)"),
+            "{refusal}"
+        );
         assert!(refusal.contains("2k-1 = 3"), "{refusal}");
 
         let roomy = channel(HostRole::Reader, 3, false);

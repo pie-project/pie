@@ -229,6 +229,7 @@ fn check_mini(src: &ztensor::Source, prefix: &str) {
     type_checks(&contract, src);
 }
 
+#[test]
 fn the_flux_2_import_reads_the_klein_snapshot_every_case() {
     the_miniature_reads_a_synthetic_state_dict_bare_and_prefixed();
     neither_row_serves_the_other_rows_checkpoint();
@@ -236,7 +237,6 @@ fn the_flux_2_import_reads_the_klein_snapshot_every_case() {
     the_miniature_reads_the_golden_fixture();
 }
 
-#[test]
 fn the_miniature_reads_a_synthetic_state_dict_bare_and_prefixed() {
     for prefix in ["", "dit."] {
         let dir = scratch();

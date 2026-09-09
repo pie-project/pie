@@ -85,7 +85,9 @@ enum Pages {
         token_hashes: Vec<Vec<Option<Hash256>>>,
         page_hashes: Vec<Option<Hash256>>,
     },
-    ParentSelection { runs: Runs },
+    ParentSelection {
+        runs: Runs,
+    },
 }
 
 struct KvTrieNode {

@@ -6,12 +6,12 @@ use std::collections::HashMap;
 use kernels_metal::{ArgValue, Encode, Error, Fire};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSRange;
 use objc2_metal::{
     MTLComputeCommandEncoder, MTLDevice, MTLIndirectCommandBuffer,
     MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand,
     MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize,
 };
-use objc2_foundation::NSRange;
 
 use crate::device::alloc::{Buffer, Slab, slab_id};
 use crate::device::library::Pipeline;
@@ -269,7 +269,14 @@ impl Icb {
         }
         for (at, arg) in wanted.args.iter().enumerate() {
             match (self.built[index].args[at].clone(), *arg) {
-                (Bound::Buf { slab, offset }, Arg::Buffer { slab: want, offset: to, .. }) => {
+                (
+                    Bound::Buf { slab, offset },
+                    Arg::Buffer {
+                        slab: want,
+                        offset: to,
+                        ..
+                    },
+                ) => {
                     if !rearmed && offset == to && slab_id(&slab) == want {
                         continue;
                     }
@@ -362,10 +369,8 @@ impl Icb {
             let encoder = frame.encoder();
             for slab in &self.residents {
                 let resource: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**slab);
-                encoder.useResource_usage(
-                    resource,
-                    MTLResourceUsage::Read | MTLResourceUsage::Write,
-                );
+                encoder
+                    .useResource_usage(resource, MTLResourceUsage::Read | MTLResourceUsage::Write);
             }
             let constants: &ProtocolObject<dyn MTLResource> =
                 ProtocolObject::from_ref(&**self.constants.slab());
@@ -407,8 +412,7 @@ impl std::fmt::Display for Rebound {
 impl Rebound {
     #[must_use]
     pub fn total(self) -> usize {
-        self.offsets + self.scalars + self.grids + self.pipelines + self.turned_off
-            + self.turned_on
+        self.offsets + self.scalars + self.grids + self.pipelines + self.turned_off + self.turned_on
     }
 }
 
@@ -451,7 +455,7 @@ impl<'a> Builder<'a> {
                 )
         }
         .ok_or(Fault::Device {
-                call: "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:",
+            call: "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:",
             why: format!("the device would not reserve {slots} indirect commands"),
         })?;
         Ok(Builder {

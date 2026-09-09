@@ -108,12 +108,12 @@ fn check(hidden: usize, window: Option<(u32, u32, u32)>) {
     }
 }
 
+#[test]
 fn the_fused_chain_lands_the_four_launches_every_case() {
     the_eight_wide_chain_lands_the_four_launches();
     the_scalar_chain_lands_the_four_launches();
 }
 
-#[test]
 fn the_eight_wide_chain_lands_the_four_launches() {
     check(2560, None);
     check(2560, Some((8, 5, 2)));

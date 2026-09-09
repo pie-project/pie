@@ -98,6 +98,7 @@ jobs:
             -p kernels-metal -p kernels-cuda -p kernels-vulkan -p kernels-wgpu \
             -p engine-metal -p engine-vulkan -p engine-wgpu \
             -p model-dsl -p model-ir \
+            -p chat-template -p checkpoint-dsl -p dtype -p ztensor -p ztensor-compat \
             -- -D warnings
 
       # `models` runs as its own command, which is also how
@@ -123,6 +124,7 @@ jobs:
             -p gateway -p grammar -p inferlet \
             -p inferlet-macros -p kernels-metal -p kernels-vulkan -p kernels-wgpu \
             -p pie -p pie-server-py -p tokenizer \
+            -p chat-template -p checkpoint-dsl -p dtype -p ztensor -p ztensor-compat \
             -p engine-metal -p engine-vulkan -p engine-wgpu \
             -p model-dsl -p model-ir
 

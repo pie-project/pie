@@ -13,5 +13,5 @@ mod link;
 
 pub use config::Config;
 pub use controller_api::Role;
-pub use serve::{WorkerHandle, run, run_with};
 pub use link::control::ControlLink;
+pub use serve::{WorkerHandle, run, run_with};

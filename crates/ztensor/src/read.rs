@@ -78,9 +78,11 @@ pub fn cas(store: impl AsRef<Path>) -> impl ShardResolver + 'static {
     }
 }
 
+type DigestCache = std::sync::Mutex<HashMap<(u64, DigestAlgorithm), BTreeMap<Vec<u8>, PathBuf>>>;
+
 pub struct DirectoryResolver {
     by_size: BTreeMap<u64, Vec<PathBuf>>,
-    digests: std::sync::Mutex<HashMap<(u64, DigestAlgorithm), BTreeMap<Vec<u8>, PathBuf>>>,
+    digests: DigestCache,
 }
 
 impl DirectoryResolver {

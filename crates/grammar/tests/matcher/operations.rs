@@ -1,12 +1,12 @@
 use crate::common::matcher_from_ebnf as make_matcher;
 
+#[test]
 fn operations_every_case() {
     test_char_class_excludes_control_chars();
     test_token_acceptance_sequence();
     test_token_rejection();
 }
 
-#[test]
 fn test_char_class_excludes_control_chars() {
     let ebnf = r#"root ::= [^"\x00-\x1f\\]"#;
     let vocab = &["\n", "\t", "x", " ", "\"", "\\", "a"];

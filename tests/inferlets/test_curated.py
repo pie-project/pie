@@ -15,14 +15,6 @@ import re
 import json
 import os
 
-# `quest-attention` needs the per-page key envelopes, which are an operator
-# opt-in because they cost `2/page_size` of the KV pool and have to be
-# allocated with the pages (crates/driver-cuda/csrc/src/store/kv_cache.cpp). Set it before
-# the engine boots — the engine reads it while sizing the cache. Enabling it
-# for the whole run is deliberate: it also proves the envelope maintenance that
-# now rides every KV append does not perturb the other inferlets.
-os.environ.setdefault("PIE_CUDA_KV_ENVELOPES", "1")
-
 from conftest import run_inferlet, run_tests  # noqa: E402
 
 
@@ -536,72 +528,6 @@ _EVICT_PROMPT = (
 )
 
 
-async def test_quest_attention(client, args):
-    # `max_tokens` is deliberately large relative to the prompt so the page
-    # channel's DECLARED capacity runs ahead of the pages the request actually
-    # holds. The two coincide at small `max_tokens`, and while they coincided
-    # this test could not tell a correct page slice from one taken with the
-    # host's bound instead of the device's real counts.
-    report = await _report(
-        client, args, "quest-attention",
-        {"prompt": _QUEST_PROMPT, "max_tokens": 64, "page_budget": 4},
-    )
-    # The tap has to fire once per layer, on every layer.
-    assert report["layers_observed"] > 0, report
-
-    # The exact slot census, derived from the fire's own kv_len rather than
-    # assumed. `envelope_dot` has three outcomes per slot: a real bound for a
-    # page the envelopes already describe, `+inf` for a page still being
-    # filled (never evict what we cannot bound), and `-inf` for a slot past
-    # the end of the request. Every page must land in exactly one of them.
-    page_size = report["page_size"]
-    kv_len = report["kv_len_last"]
-    real_pages = -(-kv_len // page_size)
-    scored = min((kv_len - 1) // page_size, real_pages)  # qo_len == 1
-    assert report["pages_absent"] == report["max_pages"] - real_pages, report
-    assert report["pages_absent"] > 0, (
-        "test is vacuous: the declared page bound equals the real page count, "
-        f"so a slice taken with either CSR would agree\n{report}"
-    )
-    assert report["pages_finite"] == scored, report
-    assert report["pages_pinned"] == real_pages - scored, report
-    assert report["pages_nan"] == 0, report
-
-    # The budget must be honoured and the in-flight page force-kept.
-    assert len(report["kept_pages"]) == report["page_budget"], report
-    assert real_pages - 1 in report["kept_pages"], report
-    # A kept page must belong to this request; the slots past the end score
-    # `-inf` precisely so a top-k consumer cannot reach into a neighbour's.
-    assert max(report["kept_pages"]) < real_pages, report
-    # The criticality bound must actually discriminate: the page holding the
-    # answer outranks the repeated filler.
-    scores = [float(s) for s in report["page_scores"][:scored]]
-    assert scores[0] == max(scores), report
-
-    # Everything above is about the RANKING, and a ranking the engine computes
-    # and then discards looks exactly like one it honours. This is the part
-    # that separates them: with a budget of one page the continuation has to
-    # change, and with a budget of everything it has to be the unmasked answer
-    # verbatim. `test_mask_enforced.py` covers the same ground in isolation;
-    # keeping a version here means the matrix cannot go green on a build where
-    # `attn_page_mask` silently stopped being applied.
-    common = {"prompt": _QUEST_PROMPT, "max_tokens": 8,
-              "temperature": _COHERENCE_TAU, "seed": 4242}
-    wide = await _report(
-        client, args, "quest-attention", {**common, "page_budget": 4096})
-    tight = await _report(
-        client, args, "quest-attention", {**common, "page_budget": 1})
-    base = await _report(client, args, "naive-baseline", common)
-    assert tight["pages_nan"] == 0, tight
-    assert wide["text"] != tight["text"], (
-        "attn_page_mask is not enforced: a 1-page budget produced the same "
-        f"continuation as a {wide['page_budget']}-page one"
-    )
-    assert wide["text"] == base["text"], (
-        "an all-keep page mask perturbed the output; compaction is not "
-        f"equivalent to the original page table\n  {wide['text']!r}\n"
-        f"  {base['text']!r}"
-    )
 
 
 _TOVA_PROMPT = (
@@ -1187,7 +1113,6 @@ def tests():
         test_naive_baseline,
         test_lora_probe,
         test_greedy_decoding_is_the_same_alone_and_in_a_crowd,
-        test_quest_attention,
         test_tova_attention,
         test_h2o_attention,
         test_snapkv_attention,

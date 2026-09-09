@@ -1080,8 +1080,7 @@ impl Run<'_> {
                     });
                 };
                 let fire = self.bindings();
-                let (positions, request_of_token) =
-                    (fire.positions, fire.tables.request_of_token);
+                let (positions, request_of_token) = (fire.positions, fire.tables.request_of_token);
                 attn::index::topk(
                     self.ctx(),
                     self.tensor(*q),

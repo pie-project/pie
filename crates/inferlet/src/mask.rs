@@ -55,13 +55,13 @@ pub fn apply_mask_argmax(logits: &[f32], mask: &[u32]) -> u32 {
 mod tests {
     use super::*;
 
+    #[test]
     fn mask_every_case() {
         bit_allowed_indexes_word_and_bit();
         bit_allowed_refuses_tokens_past_the_mask();
         pack_allowed_round_trips_bits();
     }
 
-    #[test]
     fn bit_allowed_indexes_word_and_bit() {
         let mask = [0b101u32];
         assert!(bit_allowed(&mask, 0));
@@ -93,5 +93,4 @@ mod tests {
         let m2 = pack_allowed(8, &[3, 99]);
         assert!(bit_allowed(&m2, 3));
     }
-
 }

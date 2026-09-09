@@ -470,6 +470,7 @@ mod tests {
         assert_eq!(decode(&bytes).unwrap(), v);
     }
 
+    #[test]
     fn cbor_every_case() {
         scalars();
         maps_sorted_and_deduped();
@@ -481,7 +482,6 @@ mod tests {
         fuzz_regression_nan_map_keys();
     }
 
-    #[test]
     fn scalars() {
         roundtrip(Value::Uint(0));
         roundtrip(Value::Uint(23));

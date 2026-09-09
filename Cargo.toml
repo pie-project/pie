@@ -1,10 +1,6 @@
-# One workspace, one lockfile: every Rust crate in the repo is a member.
 [workspace]
-# Resolver 3 is MSRV-aware: it will not pick a dependency version that needs a
-# newer rustc than the `rust-version` below.
 resolver = "3"
 members = [
-    # serving roles and their leaf crates
     "crates/bootstrap",
     "crates/runtime",
     "crates/controller",
@@ -18,38 +14,25 @@ members = [
     "crates/ids",
     "crates/dtype",
 
-    # boundary contracts (`-api` = wire/message contract), extracted so that
-    # two roles naming each other's types do not cycle
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
     "crates/engine",
 
-    # deviceless execution substrates, shared by both engine shells
     "crates/model-exec",
     "crates/eta-exec",
 
-    # checkpoints -> verified memory layouts a device can be pointed at
     "crates/checkpoint",
-    # the checkpoint container format and its foreign-format projections,
-    # vendored (see `crates/ztensor/Cargo.toml`)
     "crates/ztensor",
     "crates/ztensor-compat",
 
-    # the guest-program toolchain: eDSL -> ETA -> planning -> CUDA/Metal codegen
     "crates/eta-ir",
     "crates/eta-dsl",
     "crates/eta-compiler",
 
-    # guest-target crates (wasm32-wasip2); members for the shared lockfile, but
-    # kept out of `default-members` because they have no host target.
-    # `inferlet` owns the `pie:inferlet` WIT package and is the bindgen site
-    # over it, because `generate!` resolves `wit/` on the filesystem.
     "crates/inferlet",
     "crates/inferlet-macros",
 
-    # the typed-IR model stack: leaf IR, authoring surface, plan baking,
-    # catalog, kernel libraries, engine shells
     "crates/model-ir",
     "crates/model-dsl",
     "crates/model-compiler",
@@ -65,12 +48,8 @@ members = [
     "crates/kernels-wgpu",
     "crates/engine-wgpu",
 
-    # Rust outside crates/: the python SDK's backend sits beside the package
-    # maturin builds.
     "sdk/server/python",
 ]
-# Host sweeps run this set: every member except the wasm32-wasip2 guest crates,
-# which have no host target.
 default-members = [
     "crates/bootstrap",
     "crates/runtime",
@@ -111,15 +90,10 @@ default-members = [
     "sdk/server/python",
 ]
 exclude = [
-    # Fixtures of the published guest contract; they carry their own lockfiles.
     "tests/inferlets",
-    # Keeps cargo from capturing worktree checkouts when it walks up from an
-    # excluded package under `.claude/worktrees/`.
     ".claude",
 ]
 
-# The root is a package as well as the workspace: `cargo run` boots the
-# standalone, and the three role daemons ride it as `src/bin/*`.
 [package]
 name = "pie"
 version.workspace = true
@@ -150,20 +124,11 @@ name = "pie-worker"
 path = "src/bin/pie-worker.rs"
 
 [features]
-# Backend selection, forwarded to the embedded worker. No default backend:
-# `pie config init` refuses rather than writing a config with no engine.
 default = []
 cuda = ["worker/cuda"]
-# Apple-only; the seam that reads it uses a target cfg, so a non-Apple build
-# with the feature on has no metal seam rather than a link error.
 metal = ["worker/metal"]
-# The portable Vulkan shell; no target half, so this flag alone links a device
-# wherever a loader is found at run time.
 vulkan = ["worker/vulkan"]
-# The portable wgpu shell; no target half either, so this flag alone links a
-# device through whichever backend wgpu finds at run time.
 wgpu = ["worker/wgpu"]
-# Probe passthrough to the embedded worker (→ runtime).
 profile-fire = ["worker/profile-fire"]
 
 [dependencies]
@@ -171,16 +136,12 @@ bootstrap = { path = "crates/bootstrap" }
 controller = { path = "crates/controller" }
 gateway = { path = "crates/gateway" }
 worker = { path = "crates/worker", default-features = false }
-runtime = { path = "crates/runtime" }  # program/manifest types for `pie inferlet`
-models = { path = "crates/models" }    # the published-heads table `pie model import --drafter` resolves through
-# `pie model import`: load-plan executor, checkpoint writer, and the tokenizer
-# compiler whose result is serialized into the artifact (`pie.tokenizer/1`).
+runtime = { path = "crates/runtime" }
+models = { path = "crates/models" }
 checkpoint = { path = "crates/checkpoint" }
 checkpoint-dsl = { path = "crates/checkpoint-dsl" }
 ztensor = { workspace = true }
 tokenizer = { path = "crates/tokenizer" }
-# `pie config tune` drives load through the same websocket path a deployment
-# is reached by, rather than an in-process shortcut.
 client = { path = "crates/client" }
 ids = { path = "crates/ids" }
 controller-api = { path = "crates/controller-api" }
@@ -193,12 +154,6 @@ tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Provisioning downloaders live only here. `blocking` because `runtime install`
-# is synchronous; `stream` for the async HF snapshot fetch.
-#
-# `rustls-no-provider`, not `rustls`: the latter hard-selects the aws-lc backend,
-# a second crypto backend beside the `ring` this tree already links.
-# `bootstrap::install_crypto_provider` picks ring at process boot.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking", "stream"] }
 tar = "0.4"
 xz2 = "0.1"
@@ -207,34 +162,20 @@ toml_edit = "0.25.13"
 [dev-dependencies]
 tempfile = "3"
 
-# SIGPIPE disposition — see `die_quietly_on_closed_pipe` in main.rs.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [workspace.package]
-# One product version for every package; each member says `version.workspace = true`.
 version = "0.5.0"
 
-# Measured, not assumed: `cargo +1.91.1 check --all-targets` builds all six
-# compiler crates. `rust-toolchain.toml` pins a newer toolchain for CI's
-# `-D warnings` gate, which is a different claim.
 rust-version = "1.91"
 
 [workspace.dependencies]
-# The routine registry: `#[routine]` rows land in a link section the linker
-# bounds, so nothing has to enumerate them. No life-before-main cost.
 linkme = "0.3"
-# The same registry on wasm, where the object format has no link sections and
-# `linkme` refuses the target. `#[routine]` emits one row per target, never two.
 inventory = "0.3"
-# Vendored under `crates/` (see `crates/ztensor/Cargo.toml`): `ztensor` is the
-# container format, `ztensor-compat` the foreign-format projections.
 ztensor = { path = "crates/ztensor" }
 ztensor-compat = { path = "crates/ztensor-compat" }
 
-# Opt in per crate with `[lints] workspace = true`. Today only the compiler
-# crates do: they are the only ones at zero warnings, so the only ones CI can
-# gate with `-D warnings`. Wire a crate in once it is clean.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "allow"
@@ -244,21 +185,9 @@ todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
 mem_forget = "deny"
-# A compiler crate writing to a stream is either leftover scaffolding or a
-# diagnostic that belongs behind an annotated `allow`.
 print_stdout = "deny"
 print_stderr = "deny"
 
-# Distribution profile for `worker`:
-# `cargo build --profile release-min -p pie-worker`.
-#
-# Thin LTO, not fat: fat doubled CI build time on the cuda matrix for no
-# measurable gain, and thin parallelizes across the default 16 codegen units.
-#
-# Do NOT add `panic = "abort"`. Three `catch_unwind` barriers turn a panic into
-# an answer instead of a dead process — the engine lane in
-# `runtime::scheduler::worker` and the C ABI seams in `engine_cuda::serve::guard`
-# and `pie_wake`. Each fails the build under `cfg(panic = "abort")`.
 [profile.release-min]
 inherits = "release"
 lto = "thin"

@@ -130,7 +130,9 @@ pub(crate) fn copyable(trace: &Trace, region: &Region) -> bool {
                     Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
                     Some(Dim::Readouts) => false,
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
-                    Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => false,
+                    Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
+                        false
+                    }
                 },
             },
         }
@@ -268,6 +270,7 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
 }
 
 impl Windows {
+    #[allow(clippy::too_many_arguments)]
     pub fn of(
         trace: &Trace,
         compiled: &CompiledModel,
@@ -340,7 +343,10 @@ impl Windows {
             let cap = run_caps.get(at).copied().unwrap_or(0);
             let max_passes = run_passes.get(at).copied().unwrap_or(0);
             let (capped, passes) = if cap > 0 && max_passes > 1 {
-                (false, model_exec::fire::pass_spans(&mut spans, cap, max_passes))
+                (
+                    false,
+                    model_exec::fire::pass_spans(&mut spans, cap, max_passes),
+                )
             } else {
                 let capped = cap > 0 && spans.iter().any(|span| span.rows > cap);
                 if capped {
@@ -548,7 +554,7 @@ impl Sink for Cursor<'_> {
 mod tests {
     use super::*;
     use model_exec::fire::ClassWindow;
-    
+
     use model_ir::ClassSet;
 
     fn table() -> WindowTable {
@@ -579,5 +585,4 @@ mod tests {
         assert_eq!(span.lane_offset, 0);
         assert_eq!(span.lanes, 5);
     }
-
 }

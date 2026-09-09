@@ -6,9 +6,7 @@ pub enum Error {
         "the plan guards on {facts} fact bits; the class sweep is 2^F \
          and stops being a sweep past 20"
     )]
-    TooManyFacts {
-        facts: usize,
-    },
+    TooManyFacts { facts: usize },
     #[error("the plan's guards realize {classes} classes and a class order names at most {max}", max = crate::MAX_CLASSES)]
     TooManyClasses { classes: usize },
     #[error("node {node} writes outputs on two row axes, and a region counts rows on one")]
@@ -18,25 +16,15 @@ pub enum Error {
     #[error("v{} is written in place through v{}, which is not an arena rectangle", .shares.0, .holds.0)]
     AliasOutside { holds: ValueId, shares: ValueId },
     #[error("the budgets {what}")]
-    Budget {
-        what: &'static str,
-    },
+    Budget { what: &'static str },
     #[error("{}", adapter_capacity(*.asked, *.seated))]
-    AdapterCapacity {
-        asked: u32,
-        seated: u64,
-    },
+    AdapterCapacity { asked: u32, seated: u64 },
     #[error("the device profile {what}")]
-    Profile {
-        what: &'static str,
-    },
+    Profile { what: &'static str },
     #[error("{}", class_faults(.0))]
     Classes(Vec<ClassFault>),
     #[error("v{} has no arena rectangle: {}", .value.0, unrectangled(.why))]
-    Unrectangled {
-        value: ValueId,
-        why: Unrectangled,
-    },
+    Unrectangled { value: ValueId, why: Unrectangled },
     #[error(
         "v{} must share v{}'s column — {} — and the two are \
          declared at different sizes",
@@ -83,9 +71,7 @@ pub enum Error {
         .axis.name(),
         .axis.name()
     )]
-    Unsized {
-        axis: model_ir::RowAxis,
-    },
+    Unsized { axis: model_ir::RowAxis },
     #[error(
         "the {} capture unit (unit {unit}) resumes at nodes {}..{} after another unit has run. A \
          unit is one exec and an exec is one contiguous stretch of the script; the model text \

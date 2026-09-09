@@ -13,7 +13,10 @@ pub mod rewrite;
 pub enum Expr {
     Src(String),
     Out(String),
-    Fill { value: u32, ty: TensorType },
+    Fill {
+        value: u32,
+        ty: TensorType,
+    },
     Slice {
         src: Box<Expr>,
         axis: Axis,
@@ -32,9 +35,18 @@ pub enum Expr {
         axis: Axis,
         indices: Vec<i64>,
     },
-    Concat { axis: Axis, parts: Vec<Expr> },
-    Transmute { src: Box<Expr>, to: TensorType },
-    Shard { src: Box<Expr>, axis: Axis },
+    Concat {
+        axis: Axis,
+        parts: Vec<Expr>,
+    },
+    Transmute {
+        src: Box<Expr>,
+        to: TensorType,
+    },
+    Shard {
+        src: Box<Expr>,
+        axis: Axis,
+    },
     SrcIndexed(String),
     Select {
         src: Box<Expr>,
@@ -47,10 +59,22 @@ pub enum Expr {
         layout: RepackLayout,
         to: TensorType,
     },
-    Cast { src: Box<Expr>, to: Encoding },
-    Scale { src: Box<Expr>, factor: ScaleFactor },
-    Bias { src: Box<Expr>, by: BiasBy },
-    Unary { src: Box<Expr>, op: UnaryOp },
+    Cast {
+        src: Box<Expr>,
+        to: Encoding,
+    },
+    Scale {
+        src: Box<Expr>,
+        factor: ScaleFactor,
+    },
+    Bias {
+        src: Box<Expr>,
+        by: BiasBy,
+    },
+    Unary {
+        src: Box<Expr>,
+        op: UnaryOp,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

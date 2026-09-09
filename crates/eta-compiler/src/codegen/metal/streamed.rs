@@ -11,8 +11,7 @@ use crate::plan::{CompiledStage, Dimension, Region, SymbolicType};
 
 use super::fused::{
     METAL_M3_REGION_THREADS, emit_logits_argmax, emit_logits_gather, emit_mtp_drafts,
-    emit_pixels_gather,
-    emit_score_gather,
+    emit_pixels_gather, emit_score_gather,
 };
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
 use super::validate::{grouped_intrinsics_bindable, library_region_valid, used_channel_slots};
@@ -262,7 +261,11 @@ fn direct_wide(
                 (_, tags::SIGN) => "(x != 0 ? 1u : 0u)",
                 (_, _) => "x",
             };
-            let _ = writeln!(compute, "{{ const {} x = {x}; {v} = {expr}; }}", msl_type(d0));
+            let _ = writeln!(
+                compute,
+                "{{ const {} x = {x}; {v} = {expr}; }}",
+                msl_type(d0)
+            );
         }
         tags::CAST => {
             let d0 = d0?;
@@ -343,7 +346,11 @@ fn direct_wide(
             let _ = writeln!(
                 compute,
                 "{{ const bool x = {x}; const bool y = {y}; {v} = {}; }}",
-                if op.tag == tags::AND { "x && y" } else { "x || y" }
+                if op.tag == tags::AND {
+                    "x && y"
+                } else {
+                    "x || y"
+                }
             );
         }
         tags::NOT => {
@@ -389,8 +396,14 @@ fn direct_wide(
                     pre,
                     "    const uint {mode} = descriptors[{src}].len == 1u ? 0u : 2u;"
                 );
-                let _ = writeln!(pre, "    const M1ValueDesc bd0_{node} = descriptors[{src}];");
-                let _ = writeln!(pre, "    const M1ValueDesc bo0_{node} = descriptors[{base}];");
+                let _ = writeln!(
+                    pre,
+                    "    const M1ValueDesc bd0_{node} = descriptors[{src}];"
+                );
+                let _ = writeln!(
+                    pre,
+                    "    const M1ValueDesc bo0_{node} = descriptors[{base}];"
+                );
                 let _ = writeln!(compute, "uint x = {mode} == 0u ? 0u : i;");
                 let _ = writeln!(
                     compute,
@@ -402,7 +415,10 @@ fn direct_wide(
         tags::GATHER => {
             let (d0, d1) = (d0?, d1?);
             let src = arg(0)?;
-            if value_types.get(src as usize).is_none_or(|ty| ty.dims.len() > 1) {
+            if value_types
+                .get(src as usize)
+                .is_none_or(|ty| ty.dims.len() > 1)
+            {
                 return None;
             }
             let s1 = stride(1, &mut pre);
@@ -439,7 +455,8 @@ fn direct_wide(
     })
 }
 
-pub const STEP_STRUCT: &str = "struct M4Step {\n  uint index;\n  uint level;\n  uint groups;\n  uint reserved;\n};\n";
+pub const STEP_STRUCT: &str =
+    "struct M4Step {\n  uint index;\n  uint level;\n  uint groups;\n  uint reserved;\n};\n";
 
 const BROADCAST_INDEX: &str = r"
 inline uint m4_broadcast_index(const M1ValueDesc bd0, const M1ValueDesc bo0, uint i) {
@@ -514,7 +531,10 @@ enum Plan {
         split: bool,
         two_level: String,
     },
-    Argmax { text: String, input: u32 },
+    Argmax {
+        text: String,
+        input: u32,
+    },
 }
 
 struct PendingFinal {
@@ -644,7 +664,11 @@ impl Scheduler<'_> {
         }
         let _ = writeln!(text, "      if (m4_gtid == 0u) {} }}", code.store);
         let r = format!("r_{base}");
-        let _ = writeln!(text, "    const uint {r} = {};", bits_of(dout, &format!("v_{node}")));
+        let _ = writeln!(
+            text,
+            "    const uint {r} = {};",
+            bits_of(dout, &format!("v_{node}"))
+        );
         self.regs.insert(base, r);
         text
     }
@@ -835,7 +859,10 @@ pub fn emit_streamed_region(
     let has_select = ops.iter().zip(0u32..).any(|(op, node)| {
         region.nodes.iter().any(|n| n.index() as u32 == node)
             && op.tag == tags::PIVOT_THRESHOLD
-            && matches!(op.pred_tag, predicate_tags::RANK_LE | predicate_tags::CUMMASS_LE)
+            && matches!(
+                op.pred_tag,
+                predicate_tags::RANK_LE | predicate_tags::CUMMASS_LE
+            )
     });
     let extra = if has_select {
         "  threadgroup atomic_uint m4_sel_tg_hist[256];\n  threadgroup uint m4_sel_key[1024];\n  threadgroup uint m4_sel_idx[1024];\n  threadgroup uint m4_sel_scan[1024];\n"
@@ -1012,7 +1039,10 @@ pub fn emit_streamed_region(
         let plan = match kind {
             StepKind::Single
                 if op.tag == tags::PIVOT_THRESHOLD
-                    && matches!(op.pred_tag, predicate_tags::RANK_LE | predicate_tags::CUMMASS_LE) =>
+                    && matches!(
+                        op.pred_tag,
+                        predicate_tags::RANK_LE | predicate_tags::CUMMASS_LE
+                    ) =>
             {
                 Plan::Select {
                     node: node_u32,
@@ -1330,17 +1360,23 @@ pub fn emit_streamed_region(
                     sched.steps.push(streamed_step(*input, kind));
                 };
                 case(
-                    format!("    m4_sel_init({base}, {o0}, {d0}, {d1}, {a1}, {mode}u, m4_gtid, m4_gthreads);\n"),
+                    format!(
+                        "    m4_sel_init({base}, {o0}, {d0}, {d1}, {a1}, {mode}u, m4_gtid, m4_gthreads);\n"
+                    ),
                     StepKind::Wide,
                 );
                 for _ in 0..SELECT_ROUNDS {
                     for pass in 0..4u32 {
                         case(
-                            format!("    m4_sel_hist_pass({base}, {a0}, {d0}, {pass}u, m4_gtid, m4_gthreads, m3_tid, m3_threads, m4_sel_tg_hist);\n"),
+                            format!(
+                                "    m4_sel_hist_pass({base}, {a0}, {d0}, {pass}u, m4_gtid, m4_gthreads, m3_tid, m3_threads, m4_sel_tg_hist);\n"
+                            ),
                             StepKind::Wide,
                         );
                         case(
-                            format!("    if (m4_group.x != 0) return;\n    m4_sel_pick({base}, {pass}u, m3_tid, m3_threads);\n"),
+                            format!(
+                                "    if (m4_group.x != 0) return;\n    m4_sel_pick({base}, {pass}u, m3_tid, m3_threads);\n"
+                            ),
                             StepKind::Single,
                         );
                     }
@@ -1349,12 +1385,16 @@ pub fn emit_streamed_region(
                         StepKind::Wide,
                     );
                     case(
-                        format!("    if (m4_group.x != 0) return;\n    m4_sel_finish({base}, {a0}, {a1}, {o0}, {d0}, {d1}, {mode}u, m3_tid, m3_threads, m4_sel_key, m4_sel_idx, m4_sel_scan);\n"),
+                        format!(
+                            "    if (m4_group.x != 0) return;\n    m4_sel_finish({base}, {a0}, {a1}, {o0}, {d0}, {d1}, {mode}u, m3_tid, m3_threads, m4_sel_key, m4_sel_idx, m4_sel_scan);\n"
+                        ),
                         StepKind::Single,
                     );
                 }
                 case(
-                    format!("    if (m4_group.x != 0) return;\n    m4_sel_fallback({base}, {a0}, {a1}, {o0}, {d0}, {d1}, {mode}u, m3_tid, m3_threads, m3_tgbuf);\n"),
+                    format!(
+                        "    if (m4_group.x != 0) return;\n    m4_sel_fallback({base}, {a0}, {a1}, {o0}, {d0}, {d1}, {mode}u, m3_tid, m3_threads, m3_tgbuf);\n"
+                    ),
                     StepKind::Single,
                 );
             }
@@ -1405,6 +1445,7 @@ pub fn emit_streamed_region(
 mod tests {
     use super::*;
 
+    #[test]
     fn streamed_every_case() {
         the_tree_has_the_levels_the_runtime_walks();
         a_step_round_trips();
@@ -1412,7 +1453,6 @@ mod tests {
         a_register_reads_as_a_memory_load_would();
     }
 
-    #[test]
     fn the_tree_has_the_levels_the_runtime_walks() {
         assert_eq!(reduce_levels(0), 1);
         assert_eq!(reduce_levels(1), 1);
@@ -1447,7 +1487,10 @@ mod tests {
         );
         assert_eq!(op_step_kind(tags::REDUCE_SUM, 0, false), StepKind::Reduce);
         assert_eq!(op_step_kind(tags::REDUCE_ARGMAX, 0, true), StepKind::Argmax);
-        assert_eq!(op_step_kind(tags::REDUCE_ARGMAX, 0, false), StepKind::Single);
+        assert_eq!(
+            op_step_kind(tags::REDUCE_ARGMAX, 0, false),
+            StepKind::Single
+        );
     }
 
     fn a_register_reads_as_a_memory_load_would() {

@@ -113,13 +113,13 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
+    #[test]
     fn accounting_every_case() {
         the_arena_scratch_counts_against_the_ceiling();
         a_load_under_the_ceiling_is_admitted_and_one_over_it_refuses();
         a_non_finite_fraction_is_read_as_the_whole_working_set();
     }
 
-    #[test]
     fn the_arena_scratch_counts_against_the_ceiling() {
         let ws = 21_800 * (GIB / 1000);
         let util = DEFAULT_GPU_MEM_UTILIZATION;
@@ -130,7 +130,10 @@ mod tests {
             .admit(Some(11 * GIB), util)
             .expect_err("11 + 6 + 4 GiB is over ~19.6");
         let said = format!("{why}");
-        assert!(said.contains("max_forward_tokens"), "the refusal names the scratch's knob: {said}");
+        assert!(
+            said.contains("max_forward_tokens"),
+            "the refusal names the scratch's knob: {said}"
+        );
         assert_eq!(with.pool, without.pool - 6 * GIB);
     }
 
@@ -138,13 +141,21 @@ mod tests {
         let ws = 21_800 * (GIB / 1000);
         let util = DEFAULT_GPU_MEM_UTILIZATION;
         let ok = Accounting::of(ws, util, 11 * GIB, 4 * GIB);
-        assert!(ok.admit(Some(11 * GIB), util).is_ok(), "11 + 4 GiB fits under ~19.6");
+        assert!(
+            ok.admit(Some(11 * GIB), util).is_ok(),
+            "11 + 4 GiB fits under ~19.6"
+        );
         let over = Accounting::of(ws, util, 18 * GIB, 4 * GIB);
         let why = over
             .admit(Some(18 * GIB), util)
             .expect_err("18 + 4 GiB over the ceiling");
         let said = format!("{why}");
-        for needle in ["recommendedMaxWorkingSetSize", "gpu_mem_utilization", "WIRED", "device_weight_budget"] {
+        for needle in [
+            "recommendedMaxWorkingSetSize",
+            "gpu_mem_utilization",
+            "WIRED",
+            "device_weight_budget",
+        ] {
             assert!(said.contains(needle), "the refusal names {needle}: {said}");
         }
     }

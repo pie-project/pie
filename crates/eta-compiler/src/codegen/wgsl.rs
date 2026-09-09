@@ -22,10 +22,7 @@ pub const WGSL_EMITTER_VERSION: u16 = 3;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
     EntryName(String),
-    Op {
-        tag: u8,
-        name: &'static str,
-    },
+    Op { tag: u8, name: &'static str },
     NodeOutOfRange(u32),
 }
 
@@ -377,6 +374,7 @@ mod tests {
     use alloc::vec::Vec;
     use eta_ir::op::{OP_TABLE, tags};
 
+    #[test]
     fn wgsl_every_case() {
         the_runtime_and_the_emitter_agree_on_the_ladders_height();
         the_runtime_grew_no_sequencing_the_emitter_cannot_spell();
@@ -393,7 +391,6 @@ mod tests {
         a_refusal_names_the_op();
     }
 
-    #[test]
     fn the_runtime_and_the_emitter_agree_on_the_ladders_height() {
         let declared = RUNTIME
             .lines()
@@ -612,6 +609,7 @@ mod stepwise_tests {
             .collect()
     }
 
+    #[test]
     fn wgsl_1_every_case() {
         the_two_shapes_sequence_the_same_calls();
         a_ladder_is_many_steps_of_one_node();
@@ -621,7 +619,6 @@ mod stepwise_tests {
         a_stepwise_prefix_must_be_an_identifier();
     }
 
-    #[test]
     fn the_two_shapes_sequence_the_same_calls() {
         let stage = plan(
             vec![
@@ -787,6 +784,7 @@ mod sort_bound_tests {
         }
     }
 
+    #[test]
     fn wgsl_2_every_case() {
         the_bound_always_covers_the_row_and_keeps_the_parity();
         a_vocabulary_row_costs_sixteen_rounds_not_twenty_eight();
@@ -794,7 +792,6 @@ mod sort_bound_tests {
         a_sort_with_no_operand_keeps_the_full_ladder();
     }
 
-    #[test]
     fn the_bound_always_covers_the_row_and_keeps_the_parity() {
         for len in [0u32, 1, 2, 3, 4, 63, 64, 65, 1024, 32_000, 32_768, 262_144] {
             let rounds = sort_rounds(&sort_of(vec![Dimension::Static(len)]), 1);

@@ -10,7 +10,7 @@ const BLOCK: u32 = 256;
 
 #[must_use]
 pub fn cache_rows(grid: &[i32], frames: u32) -> u64 {
-    grid.chunks_exact(4)
+    grid.as_chunks::<4>().0.iter()
         .map(|clip| u64::from(frames) * clip[1].max(0) as u64 * clip[2].max(0) as u64)
         .sum()
 }

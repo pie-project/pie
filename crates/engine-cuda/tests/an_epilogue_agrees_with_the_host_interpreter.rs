@@ -197,13 +197,13 @@ fn bools(value: &Value) -> Vec<bool> {
     }
 }
 
+#[test]
 fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     the_device_answers_what_the_interpreter_answers();
     the_acceptance_rule_agrees_with_the_interpreter();
     the_gaussian_draw_and_the_transcendentals_agree_with_the_interpreter();
 }
 
-#[test]
 fn the_device_answers_what_the_interpreter_answers() {
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");

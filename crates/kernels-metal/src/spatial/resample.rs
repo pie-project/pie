@@ -165,7 +165,7 @@ pub fn avg_down(
     let clips = super::clip_pair(OP, grid, o_grid)?;
     let block = factor[0] * factor[1] * factor[2];
     let group = nonzero(OP, "the averaged run", group)?;
-    if block == 0 || block % group != 0 || y.width != x.width * block / group {
+    if block == 0 || !block.is_multiple_of(group) || y.width != x.width * block / group {
         return Err(refuse(
             OP,
             format!(

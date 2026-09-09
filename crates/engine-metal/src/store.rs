@@ -54,7 +54,10 @@ enum Shape {
         values_width: u64,
         values_bytes: u64,
     },
-    State { stride: u64, dtype: Dtype },
+    State {
+        stride: u64,
+        dtype: Dtype,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,8 +96,7 @@ impl Move {
                 copy.dst_page_ids.len()
             ));
         }
-        let mut moves: Vec<Move> =
-            Vec::with_capacity(copy.src_page_ids.len() + copy.moves.len());
+        let mut moves: Vec<Move> = Vec::with_capacity(copy.src_page_ids.len() + copy.moves.len());
         for (src, dst) in copy.src_page_ids.iter().zip(&copy.dst_page_ids) {
             moves.push(Move {
                 src_page: *src,
@@ -220,7 +222,11 @@ impl Pools {
                         plane_bytes: plane,
                         values_at: if own_values { plane } else { 0 },
                         values_width: planes.values,
-                        values_bytes: if planes.values == 0 { plane } else { values_bytes },
+                        values_bytes: if planes.values == 0 {
+                            plane
+                        } else {
+                            values_bytes
+                        },
                     });
                 }
                 CacheRow::State { name, slab, dtype } => {
@@ -309,16 +315,15 @@ impl Pools {
                     values_width,
                     values_bytes,
                 } => {
-                    let seat =
-                        seats
-                            .spaces
-                            .get(space as usize)
-                            .ok_or_else(|| Fault::Unbound {
-                                what: format!(
-                                    "cache space {space}, for which this fire wrote no \
+                    let seat = seats
+                        .spaces
+                        .get(space as usize)
+                        .ok_or_else(|| Fault::Unbound {
+                            what: format!(
+                                "cache space {space}, for which this fire wrote no \
                                      geometry"
-                                ),
-                            })?;
+                            ),
+                        })?;
                     let cells = self.paging.pages() * u64::from(self.paging.page_size);
                     let plane = |at: u64, bytes: u64, width: u64| -> Result<Tensor> {
                         Ok(Tensor::new(
@@ -339,8 +344,7 @@ impl Pools {
                     })
                 }
                 Shape::State { stride, dtype } => {
-                    let bytes =
-                        stride * u64::from(self.paging.slots) * u64::from(elem_size(dtype));
+                    let bytes = stride * u64::from(self.paging.slots) * u64::from(elem_size(dtype));
                     let bank = Tensor::new(
                         handles.bind(slab, 0, bytes)?,
                         self.paging.slots,
@@ -425,7 +429,11 @@ impl Pools {
             let element = u64::from(elem_size(dtype));
             let keys_cell = u64::from(kv_heads) * u64::from(head_dim) * element;
             let bases = [(0, keys_cell), (values_at, values_width * element)];
-            let bases = if values_at == 0 { &bases[..1] } else { &bases[..] };
+            let bases = if values_at == 0 {
+                &bases[..1]
+            } else {
+                &bases[..]
+            };
             for &(plane, cell) in bases {
                 for span in moves {
                     if span.tokens == 0 {
@@ -547,7 +555,11 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
                 let planes = split(name, planes)?;
                 let element = elem_bytes(name, *dtype)?;
                 let cells = paging.pages() * u64::from(paging.page_size);
-                let width = if planes.shared { planes.keys } else { planes.keys + planes.values };
+                let width = if planes.shared {
+                    planes.keys
+                } else {
+                    planes.keys + planes.values
+                };
                 bytes = bytes.saturating_add(cells * width * element);
             }
             CacheRow::State { name, slab, dtype } => {
@@ -641,22 +653,26 @@ mod tests {
         Some(Context::bind().expect("the system device"))
     }
 
+    #[test]
     fn store_every_case() {
         a_copied_slot_reads_back_as_its_source();
         a_slot_past_the_pool_is_a_ceiling();
         an_attention_only_plan_answers_ok();
     }
 
-    #[test]
     fn a_copied_slot_reads_back_as_its_source() {
         let Some(device) = device() else { return };
         const STRIDE: u64 = 8;
         let mut pools = state_pools(&device, 4, STRIDE);
         let bytes = STRIDE * u64::from(elem_size(STATE_DTYPE));
-        let src: Vec<u8> = (0..bytes).map(|at| (at as u8).wrapping_mul(7).wrapping_add(1)).collect();
+        let src: Vec<u8> = (0..bytes)
+            .map(|at| (at as u8).wrapping_mul(7).wrapping_add(1))
+            .collect();
         pools.slabs[0].write(bytes, &src).expect("seat 1 written");
         let bystander: Vec<u8> = vec![0xAB; bytes as usize];
-        pools.slabs[0].write(2 * bytes, &bystander).expect("seat 2 written");
+        pools.slabs[0]
+            .write(2 * bytes, &bystander)
+            .expect("seat 2 written");
 
         let mut frame = device.frame().expect("a frame");
         pools
@@ -667,7 +683,10 @@ mod tests {
         assert_eq!(pools.read_slot(3).expect("seat 3"), src);
         assert_eq!(pools.read_slot(1).expect("seat 1"), src);
         assert_eq!(pools.read_slot(2).expect("seat 2"), bystander);
-        assert_eq!(pools.read_slot(0).expect("seat 0"), vec![0u8; bytes as usize]);
+        assert_eq!(
+            pools.read_slot(0).expect("seat 0"),
+            vec![0u8; bytes as usize]
+        );
         assert_eq!(pools.watermark().state_slots, 4);
     }
 
@@ -676,7 +695,9 @@ mod tests {
         let mut pools = state_pools(&device, 2, 4);
         for moves in [&[(0u32, 2u32)][..], &[(5, 1)][..]] {
             let mut frame = device.frame().expect("a frame");
-            let refused = pools.copy_state(&mut frame, moves).expect_err("past the pool");
+            let refused = pools
+                .copy_state(&mut frame, moves)
+                .expect_err("past the pool");
             assert!(
                 matches!(
                     refused,

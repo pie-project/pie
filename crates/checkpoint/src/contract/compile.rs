@@ -722,8 +722,7 @@ impl Builder<'_> {
         };
         let node = &self.nodes[root];
         let block = node.strides[axis];
-        let dst_row = node
-            .shape[axis]
+        let dst_row = node.shape[axis]
             .checked_mul(block)
             .or_overflow("gather destination row overflows i64")?;
         if dst_row <= 0 {

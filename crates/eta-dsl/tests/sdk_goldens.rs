@@ -332,7 +332,7 @@ fn diffusion_step() -> Traced {
             let unchanged = reduce_sum(cast(eq(&argmax, &previous), dtype::i32));
             let stable = eq(&unchanged, n as i32);
             let mean = div(reduce_sum(&h), n as f32);
-            and(&stable, &lt(&mean, confidence))
+            and(&stable, lt(&mean, confidence))
         };
 
         let (tap_weights, tap_ids) = top_k(&probs, taps);
@@ -454,7 +454,7 @@ fn beam_step() -> Traced {
         out.put(&tok_i);
         out_par.put(&parent);
         out_scr.put(&s);
-        out_greedy.put(&reshape(reduce_argmax(&logits), [B]));
+        out_greedy.put(reshape(reduce_argmax(&logits), [B]));
         pool_ids_ch.put(&pids);
     });
     b.build().unwrap()
@@ -567,13 +567,13 @@ fn programs() -> Vec<(&'static str, Traced)> {
 
 const GOLDENS: &str = "tests/goldens/sdk_containers.txt";
 
+#[test]
 fn sdk_goldens_every_case() {
     sdk_port_goldens_are_pinned();
     the_latent_step_binds_against_a_denoising_model();
     the_vae_readback_binds_against_a_model_that_lands_pixels();
 }
 
-#[test]
 fn sdk_port_goldens_are_pinned() {
     let rendered: String = programs()
         .iter()

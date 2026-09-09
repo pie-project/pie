@@ -66,12 +66,12 @@ mod tests {
     use super::*;
     use crate::codegen::metal::METAL_M1_MAX_CHANNELS;
 
+    #[test]
     fn fault_every_case() {
         the_classes_do_not_overlap();
         the_tightest_gap_bounds_the_channel_count();
     }
 
-    #[test]
     fn the_classes_do_not_overlap() {
         let highest_channel = (METAL_M1_MAX_CHANNELS - 1) as u32;
         let table = classes();
@@ -114,5 +114,4 @@ mod tests {
              fault-class gap ({tightest:#x}); respace the bases in this module first"
         );
     }
-
 }

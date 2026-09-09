@@ -49,13 +49,13 @@ fn tied_rows(lcg: &mut Lcg, rows: usize, width: usize) -> (Vec<u16>, Vec<f32>) {
     (raw, f)
 }
 
+#[test]
 fn the_dspark_readout_points_answer_their_host_reference_every_case() {
     the_argmax_lands_the_lowest_tied_column_and_skips_a_nan();
     the_topk_is_sorted_with_ties_to_the_lower_column();
     the_selector_walk_follows_the_best_successor_from_the_anchor();
 }
 
-#[test]
 fn the_argmax_lands_the_lowest_tied_column_and_skips_a_nan() {
     let (rows, width, depth) = (5usize, 3000usize, 3usize);
     let mut lcg = Lcg::seeded(0x51);

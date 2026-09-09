@@ -1,6 +1,4 @@
-use model_compiler::{
-    Budget, PATCH_LATTICE_FLOOR,
-};
+use model_compiler::{Budget, PATCH_LATTICE_FLOOR};
 
 mod common;
 use common::patch_ladder_for;
@@ -11,8 +9,11 @@ fn the_ladder_this_file_derives_is_the_one_the_rule_describes() {
         let budget = Budget::new(256, max_tokens);
         let ladder = patch_ladder_for(&budget);
 
-        let want = max_tokens.min(4096).max(PATCH_LATTICE_FLOOR);
-        assert_eq!(ladder.max_patches, want, "the ceiling at {max_tokens} tokens");
+        let want = max_tokens.clamp(PATCH_LATTICE_FLOOR, 4096);
+        assert_eq!(
+            ladder.max_patches, want,
+            "the ceiling at {max_tokens} tokens"
+        );
 
         assert_eq!(
             ladder.buckets.first().copied(),

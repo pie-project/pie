@@ -82,7 +82,12 @@ pub fn splitk(n: i32, bm: i32, padded: i32, k: i32, group: i32, bits: i32) -> i3
     split
 }
 
-pub fn splitk_point(op: &'static str, group: i32, bits: i32, bm: i32) -> Result<&'static str, Error> {
+pub fn splitk_point(
+    op: &'static str,
+    group: i32,
+    bits: i32,
+    bm: i32,
+) -> Result<&'static str, Error> {
     check(op, &GROUPS, group, "group size")?;
     check(op, &[4, 8], bits, "split-K bit width")?;
     check(op, &ROW_TILES, bm, "row tile")?;
@@ -291,12 +296,7 @@ pub fn qmv_rows_grid(
     Ok([x, out_vec_size.unsigned_abs().div_ceil(4), 1])
 }
 
-fn check(
-    op: &'static str,
-    points: &[i32],
-    v: i32,
-    what: &'static str,
-) -> Result<(), Error> {
+fn check(op: &'static str, points: &[i32], v: i32, what: &'static str) -> Result<(), Error> {
     points
         .contains(&v)
         .then_some(())
@@ -356,7 +356,12 @@ pub fn bn_unsplit(out_width: i32, row_tiles: i32, crossover_tg: i32) -> Option<i
     Some(BN_RUNGS[0])
 }
 
-pub fn precast_point(op: &'static str, form: &str, bm: i32, bn: i32) -> Result<&'static str, Error> {
+pub fn precast_point(
+    op: &'static str,
+    form: &str,
+    bm: i32,
+    bn: i32,
+) -> Result<&'static str, Error> {
     check(op, &ROW_TILES, bm, "row tile")?;
     check(op, &TILES, bn, "column tile")?;
     Ok(symbol(&format!(
@@ -448,7 +453,11 @@ pub fn qmm_grid(
             group[0],
             "the column tiles",
         )?,
-        lanes(m.unsigned_abs() / bm.unsigned_abs(), group[1], "the row tiles")?,
+        lanes(
+            m.unsigned_abs() / bm.unsigned_abs(),
+            group[1],
+            "the row tiles",
+        )?,
         lanes(split_k.unsigned_abs(), group[2], "the k splits")?,
     ])
 }
@@ -733,6 +742,7 @@ fn extent(op: &'static str, act: Tensor, y: Tensor) -> Result<(u32, u32, u32), E
 mod tests {
     use super::*;
 
+    #[test]
     fn quant_every_case() {
         the_folded_points_are_stamped_on_five_axes();
         a_batch_between_rungs_takes_the_wider_tile();
@@ -740,7 +750,6 @@ mod tests {
         the_precast_points_are_stamped_at_g64_b4_alone();
     }
 
-    #[test]
     fn the_folded_points_are_stamped_on_five_axes() {
         let point = qmv_rows_point("t", 64, 4, 2, 1).unwrap();
         assert_eq!(point.entry, "affine_qmv_rows_bfloat16_gs_64_b_4_r_2_p_1");

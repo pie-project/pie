@@ -410,7 +410,10 @@ pub fn resolves(class: GeometryClass, port: Port) -> bool {
     }
     (matches!(port, Port::EmbedIndptr | Port::AttnMask) && class == GeometryClass::DeviceGeometry)
         || (port == Port::RsFoldLen
-            && matches!(class, GeometryClass::DeviceGeometry | GeometryClass::DecodeEnvelope))
+            && matches!(
+                class,
+                GeometryClass::DeviceGeometry | GeometryClass::DecodeEnvelope
+            ))
 }
 
 fn read_cell(
@@ -434,7 +437,9 @@ fn read_cell(
     }
     let cell = rings.read_cell(channel as usize, cursor.head)?;
     Ok(cell
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
         .collect())
 }
@@ -533,6 +538,7 @@ fn as_u32(port: Port, value: &Value) -> Result<Vec<u32>> {
 mod tests {
     use super::Envelope;
 
+    #[test]
     fn ports_every_case() {
         an_extent_that_disagrees_with_the_seat_is_refused_by_both_numbers();
         an_agreeing_extent_and_an_unbound_one_both_pass();
@@ -541,7 +547,6 @@ mod tests {
         a_page_csr_that_runs_past_its_flat_run_is_refused_by_both_numbers();
     }
 
-    #[test]
     fn an_extent_that_disagrees_with_the_seat_is_refused_by_both_numbers() {
         let envelope = Envelope {
             kv_len: Some(vec![9]),
@@ -628,5 +633,4 @@ mod tests {
         let text = format!("{refusal}");
         assert!(text.contains("0..5") && text.contains('2'), "{text}");
     }
-
 }

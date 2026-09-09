@@ -226,38 +226,82 @@ impl Operands for Linear {
             Self::MlpSitu { packed, .. } => sink.push(*packed),
             Self::MoeTopkSoftmax { logits, .. } => sink.push(*logits),
             Self::MoeTopkSoftmaxScaled { logits, scale, .. } => sink.extend([*logits, *scale]),
-            Self::MoeTopkSigmoid { logits, bias, hint, .. } => {
+            Self::MoeTopkSigmoid {
+                logits, bias, hint, ..
+            } => {
                 sink.push(*logits);
                 sink.extend(*bias);
                 sink.extend(*hint);
             }
-            Self::MoeTopkSqrtSoftplus { logits, bias, hint, .. } => {
+            Self::MoeTopkSqrtSoftplus {
+                logits, bias, hint, ..
+            } => {
                 sink.extend([*logits, *bias]);
                 sink.extend(*hint);
             }
-            Self::MoeTopkSigmoidSink { logits, bias, scale, .. } => {
+            Self::MoeTopkSigmoidSink {
+                logits,
+                bias,
+                scale,
+                ..
+            } => {
                 sink.push(*logits);
                 sink.extend(*bias);
                 sink.extend(*scale);
             }
             Self::RelBias { x, w, .. } => sink.extend([*x, *w]),
             Self::MoePredictRoute { logits, bias, .. } => sink.extend([*logits, *bias]),
-            Self::MoeHashRoute { ids, tid2eid, logits, .. } => sink.extend([*ids, *tid2eid, *logits]),
+            Self::MoeHashRoute {
+                ids,
+                tid2eid,
+                logits,
+                ..
+            } => sink.extend([*ids, *tid2eid, *logits]),
             Self::GroupRoutes { .. } => {}
             Self::MatmulGrouped { x, w, routes, .. } => sink.extend([*x, *w, *routes]),
-            Self::MoeMatmulSelect { x, bank, routes, .. } => sink.extend([*x, *bank, *routes]),
-            Self::MoeMatmulSelectBias { x, bank, bias, routes, .. } => {
+            Self::MoeMatmulSelect {
+                x, bank, routes, ..
+            } => sink.extend([*x, *bank, *routes]),
+            Self::MoeMatmulSelectBias {
+                x,
+                bank,
+                bias,
+                routes,
+                ..
+            } => {
                 sink.extend([*x, *bank, *bias, *routes]);
             }
-            Self::MoeMatmulSelectQuant { x, bank, routes, .. } => sink.extend([*x, *bank, *routes]),
-            Self::MoeWeightedSum { routed, weights, .. } => sink.extend([*routed, *weights]),
-            Self::MoeBiasSum { x, bias, routes, weights, .. } => {
+            Self::MoeMatmulSelectQuant {
+                x, bank, routes, ..
+            } => sink.extend([*x, *bank, *routes]),
+            Self::MoeWeightedSum {
+                routed, weights, ..
+            } => sink.extend([*routed, *weights]),
+            Self::MoeBiasSum {
+                x,
+                bias,
+                routes,
+                weights,
+                ..
+            } => {
                 sink.extend([*x, *bias, *routes, *weights]);
             }
-            Self::MoeSigmoidGateAdd { routed, shared, gate, .. } => {
+            Self::MoeSigmoidGateAdd {
+                routed,
+                shared,
+                gate,
+                ..
+            } => {
                 sink.extend([*routed, *shared, *gate]);
             }
-            Self::LoraCorrect { x, bank_a, bank_b, routes, y, .. } => {
+            Self::LoraCorrect {
+                x,
+                bank_a,
+                bank_b,
+                routes,
+                y,
+                ..
+            } => {
                 sink.extend([*x, *bank_a, *bank_b, *routes, *y]);
             }
         }
@@ -276,14 +320,28 @@ impl Operands for Linear {
             Self::MatmulGeglu { packed, y, .. } => sink.extend([*packed, *y]),
             Self::LmHeadSoftcap { y, y_out, .. } => sink.extend([*y, *y_out]),
             Self::MlpSitu { y, .. } => sink.push(*y),
-            Self::MoeTopkSoftmax { routes, weights, .. } => sink.extend([*routes, *weights]),
-            Self::MoeTopkSoftmaxScaled { routes, weights, .. } => sink.extend([*routes, *weights]),
-            Self::MoeTopkSigmoid { routes, weights, .. } => sink.extend([*routes, *weights]),
-            Self::MoeTopkSqrtSoftplus { routes, weights, .. } => sink.extend([*routes, *weights]),
-            Self::MoeTopkSigmoidSink { routes, weights, .. } => sink.extend([*routes, *weights]),
+            Self::MoeTopkSoftmax {
+                routes, weights, ..
+            } => sink.extend([*routes, *weights]),
+            Self::MoeTopkSoftmaxScaled {
+                routes, weights, ..
+            } => sink.extend([*routes, *weights]),
+            Self::MoeTopkSigmoid {
+                routes, weights, ..
+            } => sink.extend([*routes, *weights]),
+            Self::MoeTopkSqrtSoftplus {
+                routes, weights, ..
+            } => sink.extend([*routes, *weights]),
+            Self::MoeTopkSigmoidSink {
+                routes, weights, ..
+            } => sink.extend([*routes, *weights]),
             Self::RelBias { y, .. } => sink.push(*y),
-            Self::MoePredictRoute { routes, weights, .. } => sink.extend([*routes, *weights]),
-            Self::MoeHashRoute { routes, weights, .. } => sink.extend([*routes, *weights]),
+            Self::MoePredictRoute {
+                routes, weights, ..
+            } => sink.extend([*routes, *weights]),
+            Self::MoeHashRoute {
+                routes, weights, ..
+            } => sink.extend([*routes, *weights]),
             Self::GroupRoutes { routes, .. } => sink.push(*routes),
             Self::MatmulGrouped { y, .. } => sink.push(*y),
             Self::MoeMatmulSelect { y, .. } => sink.push(*y),

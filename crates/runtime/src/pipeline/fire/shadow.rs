@@ -310,12 +310,12 @@ mod tests {
         ])
     }
 
+    #[test]
     fn shadow_every_case() {
         seeded_mask_becomes_device_derived_after_epilogue_put();
         a_host_derivable_put_is_still_folded();
     }
 
-    #[test]
     fn seeded_mask_becomes_device_derived_after_epilogue_put() {
         let bound = device_put_trace();
         let seeds = vec![

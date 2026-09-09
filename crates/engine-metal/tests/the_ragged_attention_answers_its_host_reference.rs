@@ -32,7 +32,9 @@ fn bf16_bytes(v: &[f32]) -> Vec<u8> {
 
 fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
         .collect()
 }
@@ -97,7 +99,12 @@ impl Rig {
     }
 
     fn read_bf16(&self, handle: u32, elements: usize) -> Vec<f32> {
-        bf16_floats(&self.handles.read(handle, (elements * 2) as u64).expect("read"))
+        bf16_floats(
+            &self
+                .handles
+                .read(handle, (elements * 2) as u64)
+                .expect("read"),
+        )
     }
 
     fn fire(&self, f: impl FnOnce(&Sink<'_>)) {
@@ -139,8 +146,8 @@ fn reference(
                     }
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
-                        dot += q[(row * qh + head) * head_dim + d]
-                            * k[(j * kh + kvh) * head_dim + d];
+                        dot +=
+                            q[(row * qh + head) * head_dim + d] * k[(j * kh + kvh) * head_dim + d];
                     }
                     scores.push(dot * sm_scale + bias(s, row, j, head));
                 }
@@ -230,7 +237,9 @@ fn run_case(rig: &Rig, head_dim: usize, mask_kind: &str) {
     let kv_tags: Vec<i32> = (0..kv_rows)
         .map(|r| if r % 4 == 0 { (r % 3) as i32 } else { -1 })
         .collect();
-    let table: Vec<f32> = (0..(qh * span) as u64).map(|at| 0.5 * unit(at ^ 0xB1A5)).collect();
+    let table: Vec<f32> = (0..(qh * span) as u64)
+        .map(|at| 0.5 * unit(at ^ 0xB1A5))
+        .collect();
 
     let (_qtb, hqt) = rig.i32s(&q_tags);
     let (_ktb, hkt) = rig.i32s(&kv_tags);
@@ -297,12 +306,12 @@ fn run_case(rig: &Rig, head_dim: usize, mask_kind: &str) {
     }
 }
 
+#[test]
 fn the_ragged_attention_answers_its_host_reference_every_case() {
     both_arms_answer_the_reference_under_every_mask();
     a_head_width_the_matrix_unit_cannot_tile_still_answers();
 }
 
-#[test]
 fn both_arms_answer_the_reference_under_every_mask() {
     let Some(rig) = Rig::open() else {
         eprintln!("not asked: no Metal device");

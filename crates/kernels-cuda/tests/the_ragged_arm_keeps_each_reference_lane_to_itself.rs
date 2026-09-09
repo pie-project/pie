@@ -159,6 +159,7 @@ fn check(hd: u32, q_heads: u32, kv_heads: u32, seed: u64) {
     eprintln!("head width {hd}: worst |diff| {worst:.2e}");
 }
 
+#[test]
 fn the_ragged_arm_keeps_each_reference_lane_to_itself_every_case() {
     each_reference_lane_attends_itself_alone_at_head_width_64();
     each_reference_lane_attends_itself_alone_at_head_width_128();
@@ -166,7 +167,6 @@ fn the_ragged_arm_keeps_each_reference_lane_to_itself_every_case() {
     a_short_tag_table_is_refused();
 }
 
-#[test]
 fn each_reference_lane_attends_itself_alone_at_head_width_64() {
     check(64, 4, 2, 0x71);
 }

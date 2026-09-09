@@ -39,9 +39,7 @@ impl Inkling {
         let stop_ids = specials(&tokenizer, STOP_TOKENS);
         let content_text = special(&tokenizer, "<|content_text|>");
         let end_message = special(&tokenizer, "<|end_message|>");
-        let header = |role: &str| -> Vec<u32> {
-            vec![special(&tokenizer, role), content_text]
-        };
+        let header = |role: &str| -> Vec<u32> { vec![special(&tokenizer, role), content_text] };
         let system_prefix = header("<|message_system|>");
         let mut effort = system_prefix.clone();
         effort.extend(tokenizer.encode(&format!("Thinking effort level: {THINKING_EFFORT}")));

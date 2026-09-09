@@ -316,13 +316,13 @@ mod tests {
         bf16_bits(value).to_le_bytes()
     }
 
+    #[test]
     fn adapter_every_case() {
         a_layered_cell_becomes_one_plane_per_layer_bank();
         the_sink_answers_its_two_channels_in_role_order();
         a_site_the_banks_do_not_declare_is_refused_by_name();
     }
 
-    #[test]
     fn a_layered_cell_becomes_one_plane_per_layer_bank() {
         let cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
         let planes = planes_of(Role::A, None, &cell, &a_seats()).expect("a full-rank A");

@@ -569,7 +569,13 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
     if bytes.len() != eta_exec::wire_cell_bytes(dtype, numel) {
         return None;
     }
-    let words = || bytes.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]);
+    let words = || {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| [c[0], c[1], c[2], c[3]])
+    };
     Some(match dtype {
         Dtype::Bool => Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1).collect()),
         Dtype::I32 => Value::I32(words().map(i32::from_le_bytes).collect()),

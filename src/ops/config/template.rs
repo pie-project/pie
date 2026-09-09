@@ -181,6 +181,7 @@ gpu_mem_utilization = 0.90  # of the device-local heap: weights, kv pool, scratc
 mod tests {
     use super::*;
 
+    #[test]
     fn template_every_case() {
         default_config_is_parseable();
         the_vulkan_block_states_only_keys_the_engine_declares();
@@ -189,7 +190,6 @@ mod tests {
         it_names_the_engine_this_binary_actually_has();
     }
 
-    #[test]
     fn default_config_is_parseable() {
         let content = config_content_with_any_engine();
         worker::Config::parse(&content).expect("generated config must parse");

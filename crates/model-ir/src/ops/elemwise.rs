@@ -481,11 +481,17 @@ impl Operands for Elementwise {
             Self::RmsnormGroupedPlusOne { x, weight, .. } => sink.extend([*x, *weight]),
             Self::RmsnormNoScale { x, .. } => sink.push(*x),
             Self::LayernormNoScale { x, .. } => sink.push(*x),
-            Self::Layernorm { x, weight, bias, .. } => sink.extend([*x, *weight, *bias]),
+            Self::Layernorm {
+                x, weight, bias, ..
+            } => sink.extend([*x, *weight, *bias]),
             Self::Clamp { x, .. } => sink.push(*x),
             Self::ClampLearned { x, lo, hi, .. } => sink.extend([*x, *lo, *hi]),
-            Self::RmsnormGated { x, gate, weight, .. } => sink.extend([*x, *gate, *weight]),
-            Self::RmsnormGatedBy { x, gate, weight, .. } => sink.extend([*x, *gate, *weight]),
+            Self::RmsnormGated {
+                x, gate, weight, ..
+            } => sink.extend([*x, *gate, *weight]),
+            Self::RmsnormGatedBy {
+                x, gate, weight, ..
+            } => sink.extend([*x, *gate, *weight]),
             Self::ResidualAdd { x, y, .. } => sink.extend([*x, *y]),
             Self::ResidualAddRmsnorm { x, y, weight, .. } => sink.extend([*x, *y, *weight]),
             Self::RmsnormResidualAdd {
@@ -516,15 +522,27 @@ impl Operands for Elementwise {
             Self::MulScalar { x, .. } => sink.push(*x),
             Self::SiluScaled { x, .. } => sink.push(*x),
             Self::Scale { s, x, .. } => sink.extend([*s, *x]),
-            Self::ResBlend { prefix, blocks, weight, proj, .. } => {
+            Self::ResBlend {
+                prefix,
+                blocks,
+                weight,
+                proj,
+                ..
+            } => {
                 sink.push(*prefix);
                 sink.extend_from_slice(blocks);
                 sink.push(*weight);
                 sink.push(*proj);
             }
-            Self::RopeFull { q, k, positions, .. } => sink.extend([*q, *k, *positions]),
-            Self::RopePartial { q, k, positions, .. } => sink.extend([*q, *k, *positions]),
-            Self::RopeMrope { q, k, positions, .. } => sink.extend([*q, *k, *positions]),
+            Self::RopeFull {
+                q, k, positions, ..
+            } => sink.extend([*q, *k, *positions]),
+            Self::RopePartial {
+                q, k, positions, ..
+            } => sink.extend([*q, *k, *positions]),
+            Self::RopeMrope {
+                q, k, positions, ..
+            } => sink.extend([*q, *k, *positions]),
             Self::RopePartialQ { q, positions, .. } => sink.extend([*q, *positions]),
             Self::RmsnormRopePartialQ {
                 x,
@@ -533,37 +551,78 @@ impl Operands for Elementwise {
                 ..
             } => sink.extend([*x, *weight, *positions]),
             Self::RopePartialLast { q, positions, .. } => sink.extend([*q, *positions]),
-            Self::RopeYarn { q, k, positions, .. } => sink.extend([*q, *k, *positions]),
+            Self::RopeYarn {
+                q, k, positions, ..
+            } => sink.extend([*q, *k, *positions]),
             Self::GateSigmoidMul { x, gate, .. } => sink.extend([*x, *gate]),
             Self::GateSigmoidMulHeads { x, gate, .. } => sink.extend([*x, *gate]),
             Self::HcExpand { x, .. } => sink.push(*x),
             Self::HcRmsnormF32 { streams, .. } => sink.push(*streams),
             Self::HcProject { normed, weight, .. } => sink.extend([*normed, *weight]),
-            Self::HcGates { normed, streams, scale, base, .. } => {
+            Self::HcGates {
+                normed,
+                streams,
+                scale,
+                base,
+                ..
+            } => {
                 sink.extend([*normed, *streams, *scale, *base]);
             }
-            Self::HcFold { x, streams, post_mix, comb_mix, .. } => {
+            Self::HcFold {
+                x,
+                streams,
+                post_mix,
+                comb_mix,
+                ..
+            } => {
                 sink.extend([*x, *streams, *post_mix, *comb_mix]);
             }
-            Self::HcCollapse { mixes, streams, scale, base, .. } => {
+            Self::HcCollapse {
+                mixes,
+                streams,
+                scale,
+                base,
+                ..
+            } => {
                 sink.extend([*mixes, *streams, *scale, *base]);
             }
             Self::HcMix { gates, normed, .. } => sink.extend([*gates, *normed]),
-            Self::HcInject { o, gates, hyper, .. } => sink.extend([*o, *gates, *hyper]),
-            Self::PleGate { key, query, value, .. } => sink.extend([*key, *query, *value]),
-            Self::Modulate { x, m, lane_of_row, .. } => {
+            Self::HcInject {
+                o, gates, hyper, ..
+            } => sink.extend([*o, *gates, *hyper]),
+            Self::PleGate {
+                key, query, value, ..
+            } => sink.extend([*key, *query, *value]),
+            Self::Modulate {
+                x, m, lane_of_row, ..
+            } => {
                 sink.extend([*x, *m]);
                 sink.extend(*lane_of_row);
             }
-            Self::GatedResidualAdd { r, g, y, lane_of_row, .. } => {
+            Self::GatedResidualAdd {
+                r,
+                g,
+                y,
+                lane_of_row,
+                ..
+            } => {
                 sink.extend([*r, *g, *y]);
                 sink.extend(*lane_of_row);
             }
-            Self::NormModulate { x, m, lane_of_row, .. } => {
+            Self::NormModulate {
+                x, m, lane_of_row, ..
+            } => {
                 sink.extend([*x, *m]);
                 sink.extend(*lane_of_row);
             }
-            Self::GatedResidualNormModulate { r, g, y, m, lane_of_row, .. } => {
+            Self::GatedResidualNormModulate {
+                r,
+                g,
+                y,
+                m,
+                lane_of_row,
+                ..
+            } => {
                 sink.extend([*r, *g, *y, *m]);
                 sink.extend(*lane_of_row);
             }
@@ -640,7 +699,12 @@ impl Operands for Elementwise {
             Self::HcExpand { y, .. } => sink.push(*y),
             Self::HcRmsnormF32 { y, .. } => sink.push(*y),
             Self::HcProject { mixes, .. } => sink.push(*mixes),
-            Self::HcGates { x, post_mix, comb_mix, .. } => sink.extend([*x, *post_mix, *comb_mix]),
+            Self::HcGates {
+                x,
+                post_mix,
+                comb_mix,
+                ..
+            } => sink.extend([*x, *post_mix, *comb_mix]),
             Self::HcFold { y, .. } => sink.push(*y),
             Self::HcCollapse { y, .. } => sink.push(*y),
             Self::HcMix { y, .. } => sink.push(*y),
@@ -649,7 +713,9 @@ impl Operands for Elementwise {
             Self::Modulate { y, .. } => sink.push(*y),
             Self::GatedResidualAdd { r_out, .. } => sink.push(*r_out),
             Self::NormModulate { normed, y, .. } => sink.extend([*normed, *y]),
-            Self::GatedResidualNormModulate { r_out, normed, out, .. } => {
+            Self::GatedResidualNormModulate {
+                r_out, normed, out, ..
+            } => {
                 sink.extend([*r_out, *normed, *out]);
             }
             Self::Sinusoid { y, .. } => sink.push(*y),
@@ -687,17 +753,25 @@ impl Operands for Elementwise {
             Self::SiluScaled { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::Scale { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::ResBlend { .. } => {}
-            Self::RopeFull { q_out, q, k_out, k, .. } => sink.extend([(*q_out, *q), (*k_out, *k)]),
-            Self::RopePartial { q_out, q, k_out, k, .. } => {
+            Self::RopeFull {
+                q_out, q, k_out, k, ..
+            } => sink.extend([(*q_out, *q), (*k_out, *k)]),
+            Self::RopePartial {
+                q_out, q, k_out, k, ..
+            } => {
                 sink.extend([(*q_out, *q), (*k_out, *k)]);
             }
-            Self::RopeMrope { q_out, q, k_out, k, .. } => {
+            Self::RopeMrope {
+                q_out, q, k_out, k, ..
+            } => {
                 sink.extend([(*q_out, *q), (*k_out, *k)]);
             }
             Self::RopePartialQ { q_out, q, .. } => sink.push((*q_out, *q)),
             Self::RmsnormRopePartialQ { q_out, y, .. } => sink.push((*q_out, *y)),
             Self::RopePartialLast { q_out, q, .. } => sink.push((*q_out, *q)),
-            Self::RopeYarn { q_out, q, k_out, k, .. } => sink.extend([(*q_out, *q), (*k_out, *k)]),
+            Self::RopeYarn {
+                q_out, q, k_out, k, ..
+            } => sink.extend([(*q_out, *q), (*k_out, *k)]),
             Self::GateSigmoidMul { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::GateSigmoidMulHeads { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::HcExpand { .. } => {}
@@ -707,7 +781,9 @@ impl Operands for Elementwise {
             Self::HcFold { .. } => {}
             Self::HcCollapse { .. } => {}
             Self::HcMix { .. } => {}
-            Self::HcInject { hyper_out, hyper, .. } => sink.push((*hyper_out, *hyper)),
+            Self::HcInject {
+                hyper_out, hyper, ..
+            } => sink.push((*hyper_out, *hyper)),
             Self::PleGate { .. } => {}
             Self::Modulate { .. } => {}
             Self::GatedResidualAdd { r_out, r, .. } => sink.push((*r_out, *r)),

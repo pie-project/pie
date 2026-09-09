@@ -866,9 +866,7 @@ impl Model {
             }
         });
 
-        let banded = tp > 1
-            && !d.self_cond
-            && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
+        let banded = tp > 1 && !d.self_cond && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
         let vocab_rows = if banded {
             (d.vocab / tp) as u64
         } else {
@@ -892,7 +890,11 @@ impl Model {
                     [vocab_rows, hidden],
                     if d.self_cond { dense } else { w },
                 );
-                if banded { table.packed([vocab_rows]) } else { table }
+                if banded {
+                    table.packed([vocab_rows])
+                } else {
+                    table
+                }
             },
             ple: d.ple_dim.map(|dim| {
                 let ple = dim as u64;

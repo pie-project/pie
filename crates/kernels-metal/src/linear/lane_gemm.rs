@@ -57,7 +57,10 @@ pub fn act_x_wt(
     }
     let columns = n.div_ceil(SIMDS);
     let lanes = columns.checked_mul(THREADS).ok_or_else(|| {
-        refuse(op, format!("the grid will not launch: {n} columns x {} rows", y.rows))
+        refuse(
+            op,
+            format!("the grid will not launch: {n} columns x {} rows", y.rows),
+        )
     })?;
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of([lanes, y.rows, 1], [THREADS, 1, 1])),

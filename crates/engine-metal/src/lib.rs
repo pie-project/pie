@@ -8,26 +8,26 @@ pub mod device;
 pub mod diag;
 mod dispatch;
 pub mod encode;
-pub mod weight_store;
 mod error;
 pub mod experts;
+pub mod weight_store;
 
+pub mod decoded;
 pub(crate) mod feeds;
 pub mod gather;
 pub mod host_source;
 #[cfg(target_vendor = "apple")]
 pub mod icb;
-pub mod rebind;
 pub mod inputs;
+mod keepalive;
 pub mod mapping;
 pub mod mask;
 pub mod program;
+pub mod rebind;
 pub mod record;
 pub mod rs;
 pub mod run;
 pub mod scores;
-pub mod decoded;
-mod keepalive;
 mod scratch;
 pub mod serve;
 pub mod settle;
@@ -36,9 +36,14 @@ pub mod weights;
 pub mod window;
 
 pub use abi::{Armed, At as AbiAt, Axis, DescriptorAbi, Law, SlotAbi, Survey};
+pub use adapter::{
+    Binding as AdapterBinding, Key as AdapterKey, Role as AdapterRole, Site,
+    Source as AdapterSource,
+};
 pub use api::{ContractFor, DeviceBoot, Metal};
-pub use boot::open;
 pub use arena::Arena;
+pub use blob::{Layout as AdapterLayout, Manifest as AdapterManifest, Stamp as AdapterStamp};
+pub use boot::open;
 pub use device::{Buffer, Context, Handles, Pipelines};
 pub use diag::Diagnostics;
 pub use encode::{Sink, kernel_profile, reset_kernel_profile};
@@ -60,9 +65,5 @@ pub use serve::{
 };
 pub use settle::{Airborne, Arms, Done};
 pub use store::Pools;
-pub use adapter::{
-    Binding as AdapterBinding, Key as AdapterKey, Role as AdapterRole, Site, Source as AdapterSource,
-};
-pub use blob::{Layout as AdapterLayout, Manifest as AdapterManifest, Stamp as AdapterStamp};
 pub use weights::{AdapterPlane, BankSeat, Weights};
 pub use window::{Copies, Cursor, Gathered, GatheredSpace, Window, Windows};

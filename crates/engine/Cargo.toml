@@ -13,32 +13,17 @@ name = "engine"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# No features: a contract with no optional surface means the same thing to
-# every reader.
 
 [dependencies]
-# The load request carries a `model_ir::Plan` verbatim — the runtime traces and
-# the shell does its own `compile` — and `model_ir::Dtype` is the one dtype of a
-# model-plane value.
 model-ir = { path = "../model-ir" }
 
-# The guest-program half of the contract is ETA's own vocabulary, not a private
-# re-encoding: the `serde` feature is what lets a contract type embed `Port`,
-# `Stage`, `IntrinsicId` and friends instead of flattening them to `u8` tags.
 eta-ir = { path = "../eta-ir", features = ["serde"] }
 
-# The producer owns its output type: `ProgramRegistration` names
-# `eta_compiler::codegen::launch::LaunchPackage`, and `eta-compiler` names
-# nothing here. Its resolved closure is `{eta-ir, serde}`, already carried.
 eta-compiler = { path = "../eta-compiler" }
 
-# Every noun is serde: a remote engine is a `dyn Engine` whose body happens to
-# be a socket, and envelope/framing/wire version are the transport's business.
 serde = { version = "1.0", features = ["derive"] }
 
 thiserror = "2.0"
 
 [dev-dependencies]
-# The serde round trip needs a concrete format; JSON, because a human reads the
-# failure.
 serde_json = "1.0"

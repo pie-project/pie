@@ -424,6 +424,7 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
     ops::elemwise::add_bias(&m.fc2_bias, &ops::linear::matmul(&a, &m.fc2))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attn_mixer(
     x: &Value,
     inputs: &Input<Facts>,

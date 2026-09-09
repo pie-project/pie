@@ -29,10 +29,7 @@ impl ChanDType {
         if t == DT_ACT {
             return Some(ChanDType::Act);
         }
-        match from_wire(t) {
-            Some(d) => Some(ChanDType::Concrete(d)),
-            None => None,
-        }
+        from_wire(t).map(ChanDType::Concrete)
     }
     pub fn program_dtype(self) -> Dtype {
         match self {
@@ -150,14 +147,7 @@ pub fn encode(c: &TraceContainer) -> Vec<u8> {
     let mut w = Vec::new();
     w.extend_from_slice(&ETA_MAGIC);
     let v2 = !c.externs.is_empty();
-    put_u16(
-        &mut w,
-        if v2 {
-            ETA_VERSION_EXTERN
-        } else {
-            ETA_VERSION
-        },
-    );
+    put_u16(&mut w, if v2 { ETA_VERSION_EXTERN } else { ETA_VERSION });
     put_u16(&mut w, 0);
     put_u32(&mut w, wire_len(c.names.len(), "name"));
     put_u32(&mut w, wire_len(c.channels.len(), "channel"));
@@ -285,10 +275,7 @@ pub enum ContainerDecodeError {
     UnsupportedVersion(u16),
     UnexpectedEof,
     UnknownOpcode(u8),
-    UnknownTag {
-        what: &'static str,
-        tag: u8,
-    },
+    UnknownTag { what: &'static str, tag: u8 },
     RankTooLarge(u8),
     ZeroDimension,
     BadUtf8,
@@ -633,6 +620,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn container_every_case() {
         round_trip_every_op();
         no_byte_of_an_op_encoding_is_ignored_by_its_decoder();
@@ -641,7 +629,6 @@ mod tests {
         rejects_wire_counts_before_allocating_from_them();
     }
 
-    #[test]
     fn round_trip_every_op() {
         let mut ops = alloc::vec![
             Op::Const(Literal::I32(-1)),

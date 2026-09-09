@@ -255,8 +255,7 @@ impl Inputs {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
         let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
-        let per_gathered =
-            3 * rows + spaces as u64 * (2 * lanes + (lanes + 1) + pages);
+        let per_gathered = 3 * rows + spaces as u64 * (2 * lanes + (lanes + 1) + pages);
         let window_ints =
             (classes * (classes + 1) / 2 + 1) as u64 * (lanes + 1) + gathered as u64 * per_gathered;
 
@@ -402,11 +401,7 @@ impl Inputs {
         self.store.bytes()
     }
 
-    pub fn write(
-        &mut self,
-        handles: &crate::device::Handles,
-        fire: &Fire<'_>,
-    ) -> Result<Handles> {
+    pub fn write(&mut self, handles: &crate::device::Handles, fire: &Fire<'_>) -> Result<Handles> {
         let rows = fire.tokens.len() as u32;
         let lanes = fire.slot_ids.len() as u32;
 
@@ -471,8 +466,7 @@ impl Inputs {
         }
         match fire.mask {
             None => {
-                self.store
-                    .zero_span(self.mask_enabled, u64::from(rows))?;
+                self.store.zero_span(self.mask_enabled, u64::from(rows))?;
             }
             Some(staged) => {
                 if staged.bytes.len() as u64 > self.mask_plane_bytes {
@@ -502,19 +496,43 @@ impl Inputs {
                     .checked_div(seat.row_bytes)
                     .unwrap_or(0);
                 for (what, have, ceiling) in [
-                    ("patch payload bytes", staged.payload.len() as u64, seat.rows * seat.row_bytes),
-                    ("patch segments", staged.segments.len() as u64, seat.images + 1),
+                    (
+                        "patch payload bytes",
+                        staged.payload.len() as u64,
+                        seat.rows * seat.row_bytes,
+                    ),
+                    (
+                        "patch segments",
+                        staged.segments.len() as u64,
+                        seat.images + 1,
+                    ),
                     ("patch routes", staged.routes.len() as u64, seat.rows),
-                    ("patch positions", staged.positions.len() as u64, seat.rows * AXES),
-                    ("patch table rows", staged.embed_rows.len() as u64, seat.rows * seat.embed_taps),
+                    (
+                        "patch positions",
+                        staged.positions.len() as u64,
+                        seat.rows * AXES,
+                    ),
+                    (
+                        "patch table rows",
+                        staged.embed_rows.len() as u64,
+                        seat.rows * seat.embed_taps,
+                    ),
                     (
                         "patch table weights",
                         staged.embed_weights.len() as u64,
-                        if seat.embed_weights { seat.rows * seat.embed_taps } else { 0 },
+                        if seat.embed_weights {
+                            seat.rows * seat.embed_taps
+                        } else {
+                            0
+                        },
                     ),
                 ] {
                     if have > ceiling {
-                        return Err(Fault::Ceiling { what, need: have, have: ceiling });
+                        return Err(Fault::Ceiling {
+                            what,
+                            need: have,
+                            have: ceiling,
+                        });
                     }
                 }
                 self.store.write(at.payload, staged.payload)?;
@@ -522,7 +540,8 @@ impl Inputs {
                 self.store.write(at.routes, bytes_of(staged.routes))?;
                 self.store.write(at.positions, bytes_of(staged.positions))?;
                 if !staged.embed_rows.is_empty() {
-                    self.store.write(at.embed_rows, bytes_of(staged.embed_rows))?;
+                    self.store
+                        .write(at.embed_rows, bytes_of(staged.embed_rows))?;
                 }
                 if !staged.embed_weights.is_empty() {
                     self.store
@@ -666,13 +685,33 @@ impl Inputs {
         let mut scratch: Vec<i32> = Vec::new();
         for (at, staged) in self.packings.iter().zip(fire.packings) {
             for (what, have, ceiling) in [
-                ("group indptr entries", staged.group_indptr.len() as u64, u64::from(lanes) + 1),
-                ("lane indptr entries", staged.lane_indptr.len() as u64, u64::from(lanes) + 1),
-                ("reference tags", staged.reference_tag.len() as u64, u64::from(rows)),
-                ("packed row permutation", staged.permutation.len() as u64, u64::from(rows)),
+                (
+                    "group indptr entries",
+                    staged.group_indptr.len() as u64,
+                    u64::from(lanes) + 1,
+                ),
+                (
+                    "lane indptr entries",
+                    staged.lane_indptr.len() as u64,
+                    u64::from(lanes) + 1,
+                ),
+                (
+                    "reference tags",
+                    staged.reference_tag.len() as u64,
+                    u64::from(rows),
+                ),
+                (
+                    "packed row permutation",
+                    staged.permutation.len() as u64,
+                    u64::from(rows),
+                ),
             ] {
                 if have > ceiling {
-                    return Err(Fault::Ceiling { what, need: have, have: ceiling });
+                    return Err(Fault::Ceiling {
+                        what,
+                        need: have,
+                        have: ceiling,
+                    });
                 }
             }
             csr(&mut scratch, staged.group_indptr, lanes + 1);
@@ -718,18 +757,31 @@ impl Inputs {
                 let clips = (staged.grid.len() / 4) as u64;
                 for (what, have, ceiling) in [
                     ("voxel clips", clips, seat.clips),
-                    ("voxel payload bytes", staged.payload.len() as u64, seat.rows * seat.channels * element),
-                    ("voxel token grid", (staged.token_grid.len() / 4) as u64, if seat.token_grid { seat.clips } else { 0 }),
+                    (
+                        "voxel payload bytes",
+                        staged.payload.len() as u64,
+                        seat.rows * seat.channels * element,
+                    ),
+                    (
+                        "voxel token grid",
+                        (staged.token_grid.len() / 4) as u64,
+                        if seat.token_grid { seat.clips } else { 0 },
+                    ),
                     ("voxel clip slots", staged.slots.len() as u64, seat.clips),
                 ] {
                     if have > ceiling {
-                        return Err(Fault::Ceiling { what, need: have, have: ceiling });
+                        return Err(Fault::Ceiling {
+                            what,
+                            need: have,
+                            have: ceiling,
+                        });
                     }
                 }
                 self.store.write(at.grid, bytes_of(staged.grid))?;
                 self.store.write(at.slots, bytes_of(staged.slots))?;
                 if !staged.token_grid.is_empty() {
-                    self.store.write(at.token_grid, bytes_of(staged.token_grid))?;
+                    self.store
+                        .write(at.token_grid, bytes_of(staged.token_grid))?;
                 }
                 if !staged.payload.is_empty() {
                     self.store.write(at.payload, staged.payload)?;
@@ -739,7 +791,11 @@ impl Inputs {
                 let voxel_rows = u32::try_from(seat.rows).unwrap_or(u32::MAX);
                 Some(VoxelHandles {
                     payload: Tensor::new(
-                        handles.bind(&self.store, at.payload, seat.rows * seat.channels * element)?,
+                        handles.bind(
+                            &self.store,
+                            at.payload,
+                            seat.rows * seat.channels * element,
+                        )?,
                         voxel_rows,
                         width,
                         seat.dtype,
@@ -794,11 +850,7 @@ impl Inputs {
         Ok(Handles {
             tokens: i32s(handles, &self.store, self.tokens, rows)?,
             positions: i32s(handles, &self.store, self.positions, rows)?,
-            windows: handles.bind(
-                &self.store,
-                self.windows,
-                fire.windows.len() as u64 * 4,
-            )?,
+            windows: handles.bind(&self.store, self.windows, fire.windows.len() as u64 * 4)?,
             spaces,
             slot_ids: i32s(handles, &self.store, self.slot_ids, lanes)?,
             slot_of_row: i32s(handles, &self.store, self.slot_of_row, rows)?,
@@ -899,22 +951,12 @@ fn rows_table(into: &mut Vec<i32>, staged: &[i32], rows: u32) {
     into.resize(rows as usize, -1);
 }
 
-fn i32s(
-    handles: &crate::device::Handles,
-    store: &Buffer,
-    at: u64,
-    rows: u32,
-) -> Result<Tensor> {
+fn i32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) -> Result<Tensor> {
     let buf = handles.bind(store, at, u64::from(rows) * 4)?;
     Ok(Tensor::new(buf, rows, 1, Dtype::I32))
 }
 
-fn u32s(
-    handles: &crate::device::Handles,
-    store: &Buffer,
-    at: u64,
-    rows: u32,
-) -> Result<Tensor> {
+fn u32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) -> Result<Tensor> {
     let buf = handles.bind(store, at, u64::from(rows) * 4)?;
     Ok(Tensor::new(buf, rows, 1, Dtype::U32))
 }

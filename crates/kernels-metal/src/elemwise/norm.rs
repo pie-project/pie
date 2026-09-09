@@ -218,10 +218,13 @@ pub fn rmsnorm_grouped_plus_one(
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
     let axis = nonzero(OP, "the group width", group)?;
-    if x.width % axis != 0 {
+    if !x.width.is_multiple_of(axis) {
         return Err(refuse(
             OP,
-            format!("the {}-wide row is not a whole number of {axis}-wide groups", x.width),
+            format!(
+                "the {}-wide row is not a whole number of {axis}-wide groups",
+                x.width
+            ),
         ));
     }
     let groups = x.width / axis;
@@ -229,7 +232,10 @@ pub fn rmsnorm_grouped_plus_one(
     if bank != x.width {
         return Err(refuse(
             OP,
-            format!("the weight bank is {bank} wide and the {groups} groups of {axis} it gains span {}", x.width),
+            format!(
+                "the weight bank is {bank} wide and the {groups} groups of {axis} it gains span {}",
+                x.width
+            ),
         ));
     }
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "rms_grouped_row_bfloat16" });
@@ -262,15 +268,11 @@ pub fn rmsnorm_no_scale(
     let grid = rms_grid(OP, x.width, head_dim, x.rows)?;
     ctx.fire(
         Fire::at("elemwise/norm_vector.metal", entry).apply(grid),
-        &[
-            x.arg(),
-            y.arg_mut(),
-            eps.arg(),
-            stated(OP, head_dim)?.arg(),
-        ],
+        &[x.arg(), y.arg_mut(), eps.arg(), stated(OP, head_dim)?.arg()],
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_gated(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -290,7 +292,7 @@ pub fn rmsnorm_gated(
         dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_f32_bfloat16" })
     };
     let vd = head_width(OP, head_dim)?;
-    if x.width == 0 || x.width % vd != 0 {
+    if x.width == 0 || !x.width.is_multiple_of(vd) {
         return Err(refuse(
             OP,
             format!(
@@ -327,7 +329,7 @@ pub fn rmsnorm_gated_by(
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_sigmoid_f32_bfloat16" });
     nonzero(OP, "the stated head count", heads)?;
-    if x.width == 0 || x.width % heads != 0 {
+    if x.width == 0 || !x.width.is_multiple_of(heads) {
         return Err(refuse(
             OP,
             format!(
@@ -381,11 +383,7 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
     ctx.fire(
         Fire::at("elemwise/norm_add_bias.metal", entry)
             .apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
-        &[
-            out.arg_mut(),
-            bias.arg(),
-            stated(OP, out.width)?.arg(),
-        ],
+        &[out.arg_mut(), bias.arg(), stated(OP, out.width)?.arg()],
     )
 }
 
@@ -507,6 +505,7 @@ pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn res_blend(
     ctx: &Ctx<'_>,
     prefix: Tensor,
@@ -535,7 +534,11 @@ pub fn res_blend(
             ),
         ));
     }
-    for (what, plane) in [("prefix", prefix), ("norm weight", weight), ("projection", proj)] {
+    for (what, plane) in [
+        ("prefix", prefix),
+        ("norm weight", weight),
+        ("projection", proj),
+    ] {
         if plane.dtype != y.dtype {
             return Err(refuse(
                 OP,
@@ -601,7 +604,7 @@ pub fn res_blend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use crate::probe::Probe;
 
     const WIDTH: u32 = 1152;
@@ -610,6 +613,7 @@ mod tests {
         Tensor::new(buf, rows, width, Dtype::Bf16)
     }
 
+    #[test]
     fn norm_every_case() {
         a_plane_that_is_not_one_scalar_per_column_is_refused_by_name();
         a_plane_in_another_element_is_refused_by_name();
@@ -618,7 +622,6 @@ mod tests {
         a_degenerate_centred_norm_is_refused_by_name();
     }
 
-    #[test]
     fn a_plane_that_is_not_one_scalar_per_column_is_refused_by_name() {
         let probe = Probe::default();
         let out = bf16(1, 5, WIDTH);
@@ -634,7 +637,10 @@ mod tests {
             "{long_scale}"
         );
 
-        assert!(probe.fires().is_empty(), "a refused standardization launched");
+        assert!(
+            probe.fires().is_empty(),
+            "a refused standardization launched"
+        );
     }
 
     fn a_plane_in_another_element_is_refused_by_name() {
@@ -648,10 +654,7 @@ mod tests {
             out,
         )
         .expect_err("a plane in another element is refused");
-        assert!(
-            format!("{why}").contains("activation's element"),
-            "{why}"
-        );
+        assert!(format!("{why}").contains("activation's element"), "{why}");
         assert!(probe.fires().is_empty());
     }
 
@@ -669,8 +672,13 @@ mod tests {
 
     fn an_empty_rectangle_is_refused_by_name() {
         let probe = Probe::default();
-        let why = standardize(&probe, bf16(2, 1, WIDTH), bf16(3, 1, WIDTH), bf16(1, 0, WIDTH))
-            .expect_err("a rectangle with no rows is refused");
+        let why = standardize(
+            &probe,
+            bf16(2, 1, WIDTH),
+            bf16(3, 1, WIDTH),
+            bf16(1, 0, WIDTH),
+        )
+        .expect_err("a rectangle with no rows is refused");
         assert!(format!("{why}").contains("rows"), "{why}");
     }
 

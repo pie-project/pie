@@ -124,13 +124,13 @@ pub trait Control {
 mod tests {
     use super::*;
 
+    #[test]
     fn lib_every_case() {
         role_parses_cli_spelling();
         routing_table_serde_round_trip();
         node_id_routes_either_kind();
     }
 
-    #[test]
     fn role_parses_cli_spelling() {
         assert_eq!("decode".parse::<Role>().unwrap(), Role::Decode);
         assert_eq!("PREFILL".parse::<Role>().unwrap(), Role::Prefill);

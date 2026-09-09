@@ -1,5 +1,5 @@
-use crate::ops::elemwise::{NormKind, PostNorm};
 use crate::operands::Operands;
+use crate::ops::elemwise::{NormKind, PostNorm};
 use crate::ops::{Attention, Elementwise, Layout, Linear, Operation};
 use crate::trace::{Node, Trace};
 use crate::value::{Def, ValueDecl, ValueId};
@@ -110,7 +110,13 @@ fn norm_chain(rest: &[Node], values: &[crate::value::ValueDecl]) -> Option<(Node
     let [first, second, ..] = rest else {
         return None;
     };
-    let Operation::Elementwise(Elementwise::Rmsnorm { x, weight, eps, y: t }) = &first.op else {
+    let Operation::Elementwise(Elementwise::Rmsnorm {
+        x,
+        weight,
+        eps,
+        y: t,
+    }) = &first.op
+    else {
         return None;
     };
     if first.guard != second.guard {
@@ -158,16 +164,22 @@ fn norm_chain(rest: &[Node], values: &[crate::value::ValueDecl]) -> Option<(Node
             },
             2,
         )),
-        Operation::Elementwise(Elementwise::ResidualAdd { x: folded, y, y_out }) if *folded == t => {
+        Operation::Elementwise(Elementwise::ResidualAdd {
+            x: folded,
+            y,
+            y_out,
+        }) if *folded == t => {
             let (y, y_out) = (*y, *y_out);
             let mut took = 2;
             let mut layer = second.layer;
             let mut row = y_out;
             let scale = match rest.get(took) {
                 Some(node) if node.guard == second.guard => match &node.op {
-                    Operation::Elementwise(Elementwise::Scale { s, x: scaled_x, x_out })
-                        if *scaled_x == row =>
-                    {
+                    Operation::Elementwise(Elementwise::Scale {
+                        s,
+                        x: scaled_x,
+                        x_out,
+                    }) if *scaled_x == row => {
                         took += 1;
                         layer = node.layer;
                         row = *x_out;
@@ -179,9 +191,12 @@ fn norm_chain(rest: &[Node], values: &[crate::value::ValueDecl]) -> Option<(Node
             };
             let post = match rest.get(took) {
                 Some(node) if node.guard == second.guard => match &node.op {
-                    Operation::Elementwise(Elementwise::Rmsnorm { x: normed, weight, eps, y })
-                        if *normed == row =>
-                    {
+                    Operation::Elementwise(Elementwise::Rmsnorm {
+                        x: normed,
+                        weight,
+                        eps,
+                        y,
+                    }) if *normed == row => {
                         took += 1;
                         layer = node.layer;
                         Some(PostNorm {
@@ -242,7 +257,13 @@ fn embed_chain(rest: &[Node]) -> Option<(Node, Option<Node>, usize)> {
         [embed, scale_e, fold, scale_y, ..] => (embed, scale_e, fold, scale_y, None),
         _ => return None,
     };
-    let Operation::Layout(Layout::Embed { ids, table, vocab, y: e }) = &embed.op else {
+    let Operation::Layout(Layout::Embed {
+        ids,
+        table,
+        vocab,
+        y: e,
+    }) = &embed.op
+    else {
         return None;
     };
     let Operation::Elementwise(Elementwise::MulScalar {
@@ -691,6 +712,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn fuse_every_case() {
         the_add_and_the_norm_that_reads_it_become_one_node();
         a_value_defined_past_the_pair_still_names_its_node();
@@ -710,9 +732,11 @@ mod tests {
         a_gate_per_lane_under_a_modulate_per_token_stays_apart();
     }
 
-    #[test]
     fn the_add_and_the_norm_that_reads_it_become_one_node() {
-        let fused = residual_norm(trace_of(vec![node(add(3), Some(0)), node(norm(3), Some(0))]));
+        let fused = residual_norm(trace_of(vec![
+            node(add(3), Some(0)),
+            node(norm(3), Some(0)),
+        ]));
         assert_eq!(fused.nodes.len(), 1);
         assert!(matches!(
             fused.nodes[0].op,
@@ -727,8 +751,11 @@ mod tests {
 
     fn a_value_defined_past_the_pair_still_names_its_node() {
         use crate::value::{Ty, ValueDecl};
-        let mut trace =
-            trace_of(vec![node(add(3), Some(0)), node(norm(3), Some(0)), node(add(7), Some(1))]);
+        let mut trace = trace_of(vec![
+            node(add(3), Some(0)),
+            node(norm(3), Some(0)),
+            node(add(7), Some(1)),
+        ]);
         let decl = |node: u32| ValueDecl {
             def: Def::Op(node),
             ty: Ty::Tensor {
@@ -804,7 +831,11 @@ mod tests {
         trace.values = rows(21, 2560);
         let fused = residual_chains(trace);
         assert_eq!(fused.nodes.len(), 1);
-        assert_eq!(fused.nodes[0].layer, Some(4), "the last weight read names the layer");
+        assert_eq!(
+            fused.nodes[0].layer,
+            Some(4),
+            "the last weight read names the layer"
+        );
         let Operation::Elementwise(Elementwise::RmsnormResidualAdd {
             t,
             y_out,
@@ -817,11 +848,17 @@ mod tests {
         };
         assert_eq!((*t, *y_out), (ValueId(11), ValueId(13)));
         assert_eq!(*scale, Some((ValueId(20), ValueId(14))));
-        assert_eq!(post.as_ref().map(|p| (p.out, p.plus_one)), Some((ValueId(15), false)));
+        assert_eq!(
+            post.as_ref().map(|p| (p.out, p.plus_one)),
+            Some((ValueId(15), false))
+        );
         use crate::operands::Operands;
         let mut outs = Vec::new();
         fused.nodes[0].op.outputs(&mut outs);
-        assert_eq!(outs, vec![ValueId(11), ValueId(13), ValueId(14), ValueId(15)]);
+        assert_eq!(
+            outs,
+            vec![ValueId(11), ValueId(13), ValueId(14), ValueId(15)]
+        );
     }
 
     fn a_norm_before_the_pair_residual_norm_wrote_joins_it() {
@@ -839,7 +876,11 @@ mod tests {
             Operation::Elementwise(Elementwise::RmsnormResidualAdd {
                 t: ValueId(1),
                 scale: None,
-                post: Some(PostNorm { plus_one: true, out: ValueId(5), .. }),
+                post: Some(PostNorm {
+                    plus_one: true,
+                    out: ValueId(5),
+                    ..
+                }),
                 ..
             })
         ));
@@ -958,20 +999,43 @@ mod tests {
                 dtype: dtype::Dtype::Bf16,
             },
         };
-        trace.values = vec![decl(0), decl(0), decl(0), decl(1), decl(2), decl(3), decl(4)];
+        trace.values = vec![
+            decl(0),
+            decl(0),
+            decl(0),
+            decl(1),
+            decl(2),
+            decl(3),
+            decl(4),
+        ];
         let fused = residual_chains(trace);
         assert_eq!(fused.nodes.len(), 2);
-        assert!(matches!(fused.nodes[0].op, Operation::Layout(Layout::Select { .. })));
-        assert!(matches!(fused.nodes[1].op, Operation::Elementwise(Elementwise::EmbedScaleAdd { .. })));
-        assert!(matches!(fused.values[4].def, Def::Op(0)), "the select's value still names it");
+        assert!(matches!(
+            fused.nodes[0].op,
+            Operation::Layout(Layout::Select { .. })
+        ));
+        assert!(matches!(
+            fused.nodes[1].op,
+            Operation::Elementwise(Elementwise::EmbedScaleAdd { .. })
+        ));
+        assert!(
+            matches!(fused.values[4].def, Def::Op(0)),
+            "the select's value still names it"
+        );
         assert!(matches!(fused.values[6].def, Def::Op(1)));
         assert!(matches!(fused.values[2].def, Def::Op(1)));
     }
 
     fn a_norm_of_something_else_stays_apart_and_a_layer_boundary_does_not() {
-        let other = residual_norm(trace_of(vec![node(add(3), Some(0)), node(norm(9), Some(0))]));
+        let other = residual_norm(trace_of(vec![
+            node(add(3), Some(0)),
+            node(norm(9), Some(0)),
+        ]));
         assert_eq!(other.nodes.len(), 2);
-        let layer = residual_norm(trace_of(vec![node(add(3), Some(0)), node(norm(3), Some(1))]));
+        let layer = residual_norm(trace_of(vec![
+            node(add(3), Some(0)),
+            node(norm(3), Some(1)),
+        ]));
         assert_eq!(layer.nodes.len(), 1);
         assert_eq!(layer.nodes[0].layer, Some(1));
     }
@@ -1260,7 +1324,11 @@ mod tests {
             trace.values[value as usize].def = Def::Op(at);
         }
         let fused = modulation(trace);
-        assert_eq!(fused.nodes.len(), 2, "three nodes became one, the fourth stood");
+        assert_eq!(
+            fused.nodes.len(),
+            2,
+            "three nodes became one, the fourth stood"
+        );
         assert!(matches!(
             fused.nodes[0].op,
             Operation::Elementwise(Elementwise::GatedResidualNormModulate {
@@ -1280,7 +1348,11 @@ mod tests {
         assert_eq!(outs, vec![ValueId(5), ValueId(6), ValueId(8)]);
         let mut pairs = Vec::new();
         fused.nodes[0].op.aliases(&mut pairs);
-        assert_eq!(pairs, vec![(ValueId(5), ValueId(1))], "only the fold is in place");
+        assert_eq!(
+            pairs,
+            vec![(ValueId(5), ValueId(1))],
+            "only the fold is in place"
+        );
         for value in [5usize, 6, 8] {
             assert!(matches!(fused.values[value].def, Def::Op(0)));
         }

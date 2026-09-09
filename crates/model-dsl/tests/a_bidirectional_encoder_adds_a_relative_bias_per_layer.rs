@@ -88,12 +88,12 @@ impl ForwardHybrid for Encoder {
     }
 }
 
+#[test]
 fn a_bidirectional_encoder_adds_a_relative_bias_per_layer_every_case() {
     two_layers_trace_with_one_table_each_and_the_attention_names_it();
     a_table_that_disagrees_with_its_max_len_or_is_not_f32_is_refused();
 }
 
-#[test]
 fn two_layers_trace_with_one_table_each_and_the_attention_names_it() {
     let trace = trace_hybrid("encoder", &Encoder, Platform::Cuda);
     assert!(trace.caches.is_empty(), "an encoder declares no kv space");

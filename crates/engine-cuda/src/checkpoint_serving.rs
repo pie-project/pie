@@ -376,6 +376,7 @@ mod tests {
             .collect()
     }
 
+    #[test]
     fn checkpoint_serving_every_case() {
         a_plane_is_found_by_its_name_and_not_by_where_it_sits();
         a_reservation_wider_than_the_plane_is_answered_inside_the_mapping();
@@ -383,7 +384,6 @@ mod tests {
         an_ordinary_checkpoint_is_not_a_serving_artifact();
     }
 
-    #[test]
     fn a_plane_is_found_by_its_name_and_not_by_where_it_sits() {
         let dir = tmp("byname");
         let path = dir.join("m.zt");

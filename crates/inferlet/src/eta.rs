@@ -298,7 +298,9 @@ pub trait HostElem: Copy {
 impl HostElem for i32 {
     const DTYPE: Dtype = Dtype::I32;
     fn decode(raw: &[u8]) -> Vec<i32> {
-        raw.chunks_exact(4)
+        raw.as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
@@ -306,7 +308,9 @@ impl HostElem for i32 {
 impl HostElem for u32 {
     const DTYPE: Dtype = Dtype::U32;
     fn decode(raw: &[u8]) -> Vec<u32> {
-        raw.chunks_exact(4)
+        raw.as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
@@ -314,7 +318,9 @@ impl HostElem for u32 {
 impl HostElem for f32 {
     const DTYPE: Dtype = Dtype::F32;
     fn decode(raw: &[u8]) -> Vec<f32> {
-        raw.chunks_exact(4)
+        raw.as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
@@ -559,11 +565,9 @@ pub trait PassWit: Sized + 'static {
         )
     }
     fn peer(&self, _ordinal: u32) -> Result<(), String> {
-        Err(
-            "this pass interface carries no peers; `peer` is a \
+        Err("this pass interface carries no peers; `peer` is a \
              `forward-diffusion` verb, and a peer is a velocity to guide with"
-                .to_string(),
-        )
+            .to_string())
     }
 }
 
@@ -1715,7 +1719,7 @@ pub mod diffusion {
         let unchanged = reduce_sum(cast(eq(argmax, previous), dtype::i32));
         let stable = eq(&unchanged, n as i32);
         let mean = &reduce_sum(entropy) / (n as f32);
-        and(&stable, &lt(&mean, threshold))
+        and(&stable, lt(&mean, threshold))
     }
 }
 

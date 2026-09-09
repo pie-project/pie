@@ -1,17 +1,18 @@
 use std::collections::HashMap;
 
+use model_compiler::{
+    Budget, CompiledModel, DeviceProfile, FamilyCosts, Lowering, Region, compile,
+};
+use model_dsl::Platform;
 use model_exec::KernelError;
 use model_exec::dispatch::{
     DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
     DispatchLinear, DispatchSpatial,
 };
-use model_compiler::{
-    CompiledModel, Budget, DeviceProfile, FamilyCosts, Lowering, Region, compile,
-};
-use model_dsl::Platform;
 use model_exec::fire::{EventId, Filter, FireDescriptor, Lane, Sink, compose, walk};
 use model_ir::{
-    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation, Trace, Spatial,
+    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation, Spatial,
+    Trace,
 };
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -30,7 +31,9 @@ fn budget() -> Budget {
 }
 
 fn trace() -> Trace {
-    let trace = models::sku(SKU).unwrap_or_else(|| panic!("`{SKU}` is in the catalog")).trace;
+    let trace = models::sku(SKU)
+        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
+        .trace;
     trace(Platform::Cuda)
 }
 
@@ -57,7 +60,8 @@ fn grouped_arm() -> DeviceProfile {
 }
 
 fn corrections(trace: &Trace) -> Vec<u32> {
-    trace.nodes
+    trace
+        .nodes
         .iter()
         .enumerate()
         .filter(|(_, node)| node.op.name() == CORRECTION)
@@ -198,7 +202,11 @@ impl Sink for Runs {
     fn join(&mut self, _event: EventId) {}
 }
 
-fn walked(trace: &Trace, compiled: &CompiledModel, lanes: &[Lane]) -> (HashMap<u32, usize>, Vec<u32>) {
+fn walked(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    lanes: &[Lane],
+) -> (HashMap<u32, usize>, Vec<u32>) {
     let descriptor = fire(compiled, lanes);
     let mut dispatch = MockDispatch::new(trace);
     let mut runs = Runs::default();
@@ -278,7 +286,11 @@ fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
             "node {node} costs a different number of launches under the grouped bake",
         );
     }
-    assert_eq!(split_runs.len(), grouped_runs.len(), "one template, two bakes");
+    assert_eq!(
+        split_runs.len(),
+        grouped_runs.len(),
+        "one template, two bakes"
+    );
     assert!(
         compared > 0,
         "the plan has nodes besides its corrections — `{SKU}`, twelve classes in one fire: \

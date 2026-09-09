@@ -67,7 +67,7 @@ pub fn tile_cols(out_width: u32) -> Option<u32> {
         .iter()
         .rev()
         .copied()
-        .find(|tile| out_width % tile == 0)
+        .find(|tile| out_width.is_multiple_of(*tile))
 }
 
 fn router_lanes(op: &'static str, experts: u32) -> Result<u32, Error> {
@@ -354,11 +354,7 @@ pub fn hash_route(
         logits.rows, routes.rows,
         "the router logits are one row per token row"
     );
-    debug_assert_eq!(
-        tid2eid.dtype,
-        Dtype::I64,
-        "`{OP}` reads the i64 hash table"
-    );
+    debug_assert_eq!(tid2eid.dtype, Dtype::I64, "`{OP}` reads the i64 hash table");
     debug_assert_eq!(
         tid2eid.width, top_k,
         "the hash table names `top_k` experts per token id"
@@ -372,10 +368,8 @@ pub fn hash_route(
     nonzero(OP, "the vocabulary this table spans", vocab)?;
     let experts = nonzero(OP, "the expert count the logits span", logits.width)?;
     ctx.fire(
-        Fire::at(ROUTE_FILE, "hash_route_gather").apply(Grid::of(
-            [routes.rows, 1, 1],
-            [routes.rows.min(256), 1, 1],
-        )),
+        Fire::at(ROUTE_FILE, "hash_route_gather")
+            .apply(Grid::of([routes.rows, 1, 1], [routes.rows.min(256), 1, 1])),
         &[
             ids.arg(),
             tid2eid.arg(),
@@ -426,10 +420,12 @@ pub fn matmul_grouped(
             ),
         ));
     }
-    let rows = x
-        .rows
-        .checked_mul(groups_nz)
-        .ok_or_else(|| refuse(OP, format!("{} rows x {groups} groups will not stride", x.rows)))?;
+    let rows = x.rows.checked_mul(groups_nz).ok_or_else(|| {
+        refuse(
+            OP,
+            format!("{} rows x {groups} groups will not stride", x.rows),
+        )
+    })?;
     let x = Tensor::new(x.buf, rows, x.width / groups_nz, x.dtype);
     let y = Tensor::new(y.buf, rows, y.width / groups_nz, y.dtype);
     match plane {
@@ -454,12 +450,7 @@ struct Selected {
     x_slot_stride: u32,
 }
 
-fn selected(
-    op: &'static str,
-    x: Tensor,
-    routes: Tensor,
-    y: Tensor,
-) -> Result<Selected, Error> {
+fn selected(op: &'static str, x: Tensor, routes: Tensor, y: Tensor) -> Result<Selected, Error> {
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{op}` walks i32 routes");
     nonzero(op, "the routed fan-out", routes.width)?;
     nonzero(op, "K, the activation's width", x.width)?;
@@ -592,7 +583,7 @@ fn routed_bank(op: &'static str, x: Tensor, bank: Bank) -> Result<(), Error> {
             "an mxfp4 bank's scales are e8m0 exponent bytes"
         );
     }
-    if x.width % bank.group != 0 {
+    if !x.width.is_multiple_of(bank.group) {
         return Err(refuse(
             op,
             format!(
@@ -615,7 +606,10 @@ pub fn matmul_select_bias(
     const OP: &str = "linear.moe_matmul_select_bias";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let entry = routed_point(OP, bank, true)?;
-    debug_assert_eq!(bias.dtype, x.dtype, "the expert bias rides the activation's dtype");
+    debug_assert_eq!(
+        bias.dtype, x.dtype,
+        "the expert bias rides the activation's dtype"
+    );
     let fan = selected(OP, x, routes, y)?;
     routed_bank(OP, x, bank)?;
     ctx.fire(
@@ -751,7 +745,7 @@ pub fn matmul_select_batched(
     let Some(bn) = tile_cols(y.width) else {
         return Ok(false);
     };
-    if x.width % QMM_BK != 0 {
+    if !x.width.is_multiple_of(QMM_BK) {
         return Ok(false);
     }
     let fp16 = tuning.fp16_gemm_format(bank.bits, bank.group);
@@ -872,7 +866,7 @@ pub fn weighted_sum(
     let entry = dtype_dispatch!(OP, routed.dtype, { Bf16 => "expert_combine" });
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
     nonzero(OP, "the token rows this fold lands on", y.rows)?;
-    if routed.rows % y.rows != 0 {
+    if !routed.rows.is_multiple_of(y.rows) {
         return Err(refuse(
             OP,
             format!(
@@ -989,7 +983,7 @@ pub fn sigmoid_gate_add(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn an_mxfp4_bank_reaches_a_tiled_point_with_or_without_a_bias() {
         let bank = Bank {
@@ -1008,5 +1002,4 @@ mod tests {
             .expect("and it is stamped too — this is the whole fix");
         assert_eq!(plain.entry, "mxfp4_qmm_t_routed_bfloat16_bm_32_bn_64");
     }
-
 }

@@ -6,13 +6,13 @@ use ::grammar::grammar::Grammar;
 use ::grammar::matcher::GrammarMatcher;
 use tokenizer::Tokenizer;
 
+#[test]
 fn matcher_every_case() {
     more_than_eight_nullable_rules_complete_at_one_position();
     shared_compiled_grammar_keeps_stop_tokens_matcher_local();
     stop_token_rollback_is_one_history_step();
 }
 
-#[test]
 fn more_than_eight_nullable_rules_complete_at_one_position() {
     let grammar = Grammar::from_ebnf(
         r#"

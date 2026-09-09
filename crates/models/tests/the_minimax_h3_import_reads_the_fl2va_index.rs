@@ -315,6 +315,7 @@ fn type_checks(contract: &ModelContract, src: &ztensor::Source) {
     assert!(!plan.instrs.is_empty());
 }
 
+#[test]
 fn the_minimax_h3_import_reads_the_fl2va_index_every_case() {
     the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply();
     the_flagship_refuses_a_bare_transformer();
@@ -322,7 +323,6 @@ fn the_minimax_h3_import_reads_the_fl2va_index_every_case() {
     the_miniature_reads_its_golden_fixture();
 }
 
-#[test]
 fn the_flagship_reads_a_synthetic_partition_at_the_counts_its_cuts_imply() {
     let dir = scratch();
     let d = Dims::h3(1);

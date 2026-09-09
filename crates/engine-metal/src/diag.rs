@@ -279,6 +279,7 @@ pub fn on() -> &'static Diagnostics {
 mod tests {
     use super::*;
 
+    #[test]
     fn diag_every_case() {
         an_empty_list_turns_nothing_on();
         a_word_list_names_each_knob();
@@ -287,7 +288,6 @@ mod tests {
         the_streamed_kind_takes_one_of_five_words();
     }
 
-    #[test]
     fn an_empty_list_turns_nothing_on() {
         let diag: Diagnostics = "".parse().expect("silence parses");
         assert_eq!(diag, Diagnostics::default());

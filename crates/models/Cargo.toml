@@ -11,29 +11,18 @@ repository = "https://github.com/pie-project/pie"
 name = "models"
 path = "src/lib.rs"
 
-# No [features]: every dependency below is needed by every consumer.
 
 [dependencies]
-# Chat template surface and the table of which SKU speaks which format.
 chat-template = { path = "../chat-template" }
-# Forward-pass authoring DSL: Recorder/Value, kernel wrappers, Weight decl.
 model-dsl = { path = "../model-dsl" }
-# The IR enums a family states its convolutions with (`TimePad`).
 model-ir = { path = "../model-ir" }
-# Load-contract algebra (`contract::Expr`, `ModelContract`).
 checkpoint = { path = "../checkpoint" }
-# Vocabulary for stating a checkpoint's provenance in an import.
 checkpoint-dsl = { path = "../checkpoint-dsl" }
 serde_json = "1"
 tokenizer = { path = "../tokenizer" }
-# Checkpoint tensor container; read for stored tensor/dtype facts at load.
 ztensor = { workspace = true }
 
 [dev-dependencies]
-# Dev-only: compiles a model's plan to check it still compiles and its fire
-# behavior is unchanged. Dev edge, so it does not cycle with this crate.
 model-compiler = { path = "../model-compiler" }
-# Dev-only: the VAE bake test reads the spatial ops back by their IR names.
 model-ir = { path = "../model-ir" }
-# Opens real shipped safetensors headers for the qwen4 4-bit import test.
 ztensor-compat = { workspace = true }

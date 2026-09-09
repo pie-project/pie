@@ -49,6 +49,7 @@ fn seams(plan: &Trace) -> BTreeMap<&str, usize> {
     })
 }
 
+#[test]
 fn the_minimax_h3_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_encoder_it_declares();
     the_seams_are_the_two_float_readouts_and_never_logits();
@@ -64,7 +65,6 @@ fn the_minimax_h3_rows_bake_every_case() {
     the_gather_merges_four_lane_shaped_arms_back_onto_the_reading();
 }
 
-#[test]
 fn every_row_traces_on_every_platform_with_the_encoder_it_declares() {
     for platform in PLATFORMS {
         for sku in ROWS {

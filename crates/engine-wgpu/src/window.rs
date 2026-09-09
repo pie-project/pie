@@ -159,7 +159,9 @@ pub(crate) fn copyable(trace: &Trace, region: &Region) -> bool {
                     Some(Dim::Readouts) => false,
 
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
-                    Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => false,
+                    Some(Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_)) => {
+                        false
+                    }
                 },
             },
         }

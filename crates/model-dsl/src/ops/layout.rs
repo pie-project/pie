@@ -226,7 +226,11 @@ pub fn scatter_rows(src: &Value, routes: &Value, y: &Value) -> Value {
 
 pub fn pack_rows(x: &Value, perm: &Value) -> Value {
     let r = x.rec();
-    assert_eq!(x.rows(), perm.rows(), "a permutation is over the rows it packs");
+    assert_eq!(
+        x.rows(),
+        perm.rows(),
+        "a permutation is over the rows it packs"
+    );
     let y = r.fresh(x.ty().clone());
     r.push(
         Layout::PackRows {
@@ -241,7 +245,11 @@ pub fn pack_rows(x: &Value, perm: &Value) -> Value {
 
 pub fn unpack_rows(x: &Value, perm: &Value) -> Value {
     let r = x.rec();
-    assert_eq!(x.rows(), perm.rows(), "a permutation is over the rows it unpacks");
+    assert_eq!(
+        x.rows(),
+        perm.rows(),
+        "a permutation is over the rows it unpacks"
+    );
     let y = r.fresh(x.ty().clone());
     r.push(
         Layout::UnpackRows {

@@ -84,12 +84,12 @@ fn check(window: Option<(u32, u32, u32)>) {
     }
 }
 
+#[test]
 fn the_select_folded_embed_lands_the_pair_every_case() {
     the_folded_launch_lands_the_pair();
     the_folded_launch_lands_the_pair_under_a_window();
 }
 
-#[test]
 fn the_folded_launch_lands_the_pair() {
     check(None);
 }

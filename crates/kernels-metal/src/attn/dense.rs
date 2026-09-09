@@ -23,7 +23,7 @@ fn stamp_for(head_dim: u32) -> Option<usize> {
 }
 
 fn row_heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
-    if width == 0 || width % head_dim != 0 {
+    if width == 0 || !width.is_multiple_of(head_dim) {
         return Err(refuse(
             op,
             format!("the {width}-wide {what} row does not divide by the head width {head_dim}"),
@@ -45,7 +45,10 @@ fn images_of(op: &'static str, segments: Tensor) -> Result<i32, Error> {
     }
     let images = segments.rows.saturating_sub(1);
     if images == 0 {
-        return Err(refuse(op, "the patch window's segment list spells no images"));
+        return Err(refuse(
+            op,
+            "the patch window's segment list spells no images",
+        ));
     }
     stated(op, images)
 }
@@ -125,7 +128,7 @@ pub fn bidirectional(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use crate::probe::Probe;
 
     fn bf16(rows: u32, width: u32) -> Tensor {
@@ -136,6 +139,7 @@ mod tests {
         Tensor::new(2, images + 1, 1, Dtype::I32)
     }
 
+    #[test]
     fn dense_every_case() {
         the_head_lands_on_the_tightest_stamp_that_holds_it();
         a_head_past_the_last_stamp_is_refused_by_name();
@@ -145,7 +149,6 @@ mod tests {
         an_element_this_plane_has_no_point_for_is_refused_by_dtype();
     }
 
-    #[test]
     fn the_head_lands_on_the_tightest_stamp_that_holds_it() {
         assert_eq!(stamp_for(40), Some(0));
         assert_eq!(stamp_for(64), Some(0));

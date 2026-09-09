@@ -100,7 +100,7 @@ impl Model {
             theta: 500_000.0,
             qk_scale: 3.87,
             softcap: 20.0,
-            output_multiplier: 0.196_116_135_138_184_04,
+            output_multiplier: 0.196_116_13,
             norm_eps: 1e-5,
             post_norm_eps: 1e-8,
         }
@@ -179,7 +179,11 @@ impl Model {
             embed: Weight::sym("embed", [u64::from(d.vocab), hidden], w),
             lm_head: {
                 let banded = tp > 1 && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
-                let rows = if banded { u64::from(d.vocab / tp) } else { u64::from(d.vocab) };
+                let rows = if banded {
+                    u64::from(d.vocab / tp)
+                } else {
+                    u64::from(d.vocab)
+                };
                 let bank = Weight::sym("lm_head", [rows, hidden], proj);
                 if banded { bank.packed([rows]) } else { bank }
             },

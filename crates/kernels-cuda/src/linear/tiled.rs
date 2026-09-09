@@ -88,7 +88,7 @@ fn tiled(
             ),
         ));
     }
-    if scales.width == 0 || scales.width % 2 != 0 {
+    if scales.width == 0 || !scales.width.is_multiple_of(2) {
         return Err(refuse(
             op,
             format!(
@@ -275,6 +275,7 @@ pub const THIN_ROWS: u32 = 8;
 pub const fn carve_for(n: u32, rows: u32) -> Carve {
     let bands = n.div_ceil(BAND);
     let deepest = if rows <= THIN_ROWS { THIN_SPLIT } else { WIDE_SPLIT };
+    #[allow(clippy::manual_checked_ops)]
     let want = if bands == 0 {
         deepest
     } else {

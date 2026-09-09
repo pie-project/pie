@@ -21,7 +21,10 @@ pub(crate) fn lane_axis_weights(trace: &Trace) -> BTreeSet<usize> {
     let f32_rows = |value: model_ir::ValueId| {
         matches!(
             trace.values.get(value.0 as usize).map(|v| &v.ty),
-            Some(model_ir::Ty::Tensor { dtype: model_ir::Dtype::F32, .. })
+            Some(model_ir::Ty::Tensor {
+                dtype: model_ir::Dtype::F32,
+                ..
+            })
         )
     };
     let mut rows = BTreeSet::new();
@@ -64,20 +67,30 @@ pub(crate) fn decode_affine(
     if !matches!(bits, 2 | 4 | 8) {
         return Err(format!("{bits}-bit codes: this decoder unpacks 2, 4 and 8"));
     }
-    if group == 0 || k % group != 0 {
-        return Err(format!("a {k}-wide row is not a whole number of {group}-code groups"));
+    if group == 0 || !k.is_multiple_of(group) {
+        return Err(format!(
+            "a {k}-wide row is not a whole number of {group}-code groups"
+        ));
     }
     let per_byte = 8 / bits;
-    if k % per_byte != 0 {
-        return Err(format!("a {k}-wide row does not pack into whole bytes at {bits} bits"));
+    if !k.is_multiple_of(per_byte) {
+        return Err(format!(
+            "a {k}-wide row does not pack into whole bytes at {bits} bits"
+        ));
     }
     let row_bytes = k / per_byte;
     let groups = k / group;
     if codes.len() < n * row_bytes {
-        return Err(format!("codes plane holds {} bytes, {} needed", codes.len(), n * row_bytes));
+        return Err(format!(
+            "codes plane holds {} bytes, {} needed",
+            codes.len(),
+            n * row_bytes
+        ));
     }
     if scales.len() < n * groups * 2 || biases.is_some_and(|b| b.len() < n * groups * 2) {
-        return Err(format!("scale/bias planes shorter than {n} x {groups} bf16"));
+        return Err(format!(
+            "scale/bias planes shorter than {n} x {groups} bf16"
+        ));
     }
     let mask = ((1u16 << bits) - 1) as u8;
     let mut out = vec![0u8; n * k * 2];
@@ -108,13 +121,13 @@ mod tests {
         f32_to_bf16(v).to_le_bytes()
     }
 
+    #[test]
     fn decoded_every_case() {
         eight_bit_codes_are_bytes();
         sub_byte_codes_unpack_least_significant_first();
         bf16_round_trips();
     }
 
-    #[test]
     fn eight_bit_codes_are_bytes() {
         let codes = [1u8, 2, 3, 4];
         let scales = bf(0.5);

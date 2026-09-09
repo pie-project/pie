@@ -25,6 +25,7 @@ fn trace(platform: Platform) -> Trace {
     (row.trace)(platform)
 }
 
+#[test]
 fn the_mini_dit_row_bakes_every_case() {
     the_row_traces_on_every_platform_with_no_cache_and_a_velocity_readout();
     the_row_reads_exactly_the_five_ports_it_declares();
@@ -36,7 +37,6 @@ fn the_mini_dit_row_bakes_every_case() {
     the_generative_facts_are_the_ports_the_trace_reads();
 }
 
-#[test]
 fn the_row_traces_on_every_platform_with_no_cache_and_a_velocity_readout() {
     for platform in PLATFORMS {
         let plan = trace(platform);

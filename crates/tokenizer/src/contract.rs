@@ -8,7 +8,9 @@ pub struct Contract {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fault {
-    Missing { marker: &'static str },
+    Missing {
+        marker: &'static str,
+    },
     Displaced {
         marker: &'static str,
         want: u32,

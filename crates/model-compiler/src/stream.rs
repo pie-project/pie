@@ -1,7 +1,7 @@
 use model_ir::{Def, Operands, Operation, Trace, ValueId};
 
-use crate::compiled::{EventId, Lowering, Region};
 use crate::budget::DeviceProfile;
+use crate::compiled::{EventId, Lowering, Region};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamPlan {
@@ -102,11 +102,7 @@ fn seat(
     }
 }
 
-fn group_at(
-    regions: &[Region],
-    ordered: &Ordered,
-    at: usize,
-) -> Option<core::ops::Range<usize>> {
+fn group_at(regions: &[Region], ordered: &Ordered, at: usize) -> Option<core::ops::Range<usize>> {
     if !forkable(&regions[at]) {
         return None;
     }

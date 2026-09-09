@@ -169,7 +169,11 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
         .iter()
         .find(|op| {
             op.tag == tags::SINK_CALL
-                && package.names.get(op.name_index as usize).map(String::as_str) == Some(LORA)
+                && package
+                    .names
+                    .get(op.name_index as usize)
+                    .map(String::as_str)
+                    == Some(LORA)
         })
         .ok_or_else(|| {
             refuse(format!(
@@ -320,7 +324,9 @@ pub fn planes_of(
     let hidden = seat.rows.max(seat.cols);
     let layers = banks.len() as u64;
     let elems = wire.len() as u64 / 4;
-    if wire.len() as u64 % 4 != 0 || elems % (layers.saturating_mul(hidden)).max(1) != 0 {
+    if !(wire.len() as u64).is_multiple_of(4)
+        || !elems.is_multiple_of((layers.saturating_mul(hidden)).max(1))
+    {
         return Err(refuse(format!(
             "was seeded {} bytes, which is not {layers} layers x rank x {hidden} f32 \
              elements; a plane is a whole `[layers, rank, hidden]` cell",
@@ -508,11 +514,14 @@ mod tests {
 
     fn as_f32(plane: &[u8]) -> Vec<f32> {
         plane
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|two| f32::from_bits(u32::from(u16::from_le_bytes([two[0], two[1]])) << 16))
             .collect()
     }
 
+    #[test]
     fn adapter_every_case() {
         a_layered_cell_becomes_one_plane_per_layer_bank();
         the_correction_is_b_times_a_times_x_at_the_landed_orientation();
@@ -524,9 +533,10 @@ mod tests {
         an_abandoned_acquire_leaves_the_slot_free();
     }
 
-    #[test]
     fn a_layered_cell_becomes_one_plane_per_layer_bank() {
-        let cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let cell = wire(&[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ]);
         let planes = planes_of(Role::A, None, &cell, &a_seats()).expect("a full-rank A");
         assert_eq!(planes.len(), 2, "one plane per layer bank");
         assert_eq!(planes[0].0, "layer.0.lora_a");
@@ -541,8 +551,18 @@ mod tests {
         let seats_b = vec![seat("layer.0.lora_b", 3, 2)];
         let a_cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let b_cell = wire(&[1.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
-        let a = as_f32(&planes_of(Role::A, None, &a_cell, &seats_a).expect("A").remove(0).1);
-        let b = as_f32(&planes_of(Role::B, None, &b_cell, &seats_b).expect("B").remove(0).1);
+        let a = as_f32(
+            &planes_of(Role::A, None, &a_cell, &seats_a)
+                .expect("A")
+                .remove(0)
+                .1,
+        );
+        let b = as_f32(
+            &planes_of(Role::B, None, &b_cell, &seats_b)
+                .expect("B")
+                .remove(0)
+                .1,
+        );
         let x = [1.0f32, 1.0, 1.0];
         let waist: Vec<f32> = (0..2)
             .map(|r| (0..3).map(|h| a[r * 3 + h] * x[h]).sum::<f32>())
@@ -644,7 +664,9 @@ mod tests {
         assert!(first.fresh);
         let second = slots.acquire(Key::Instance(2)).expect("the other one");
         assert_ne!(first.slot, second.slot, "two instances are two slots");
-        let why = slots.acquire(Key::Instance(3)).expect_err("both are pinned");
+        let why = slots
+            .acquire(Key::Instance(3))
+            .expect_err("both are pinned");
         assert!(why.to_string().contains('2'), "names the capacity: {why}");
         let again = slots.acquire(Key::Instance(1)).expect("its own slot");
         assert_eq!(again.slot, first.slot);
@@ -706,5 +728,4 @@ mod tests {
         let after = slots.acquire(Key::Instance(8)).expect("it is free again");
         assert_eq!(after.slot, grant.slot);
     }
-
 }

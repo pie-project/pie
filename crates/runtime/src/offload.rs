@@ -379,11 +379,7 @@ pub(crate) async fn try_encode(request: &mut crate::engine::FireRequest) -> bool
         COUNTERS.no_partner.fetch_add(1, Ordering::Relaxed);
         return false;
     };
-    if let Err(error) = guard
-        .partner()
-        .encode(engine::MediaEncode::default())
-        .await
-    {
+    if let Err(error) = guard.partner().encode(engine::MediaEncode::default()).await {
         tracing::warn!(%error, "encode offload declined");
     }
     false

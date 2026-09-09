@@ -1880,12 +1880,12 @@ mod tests {
             .collect()
     }
 
+    #[test]
     fn experts_every_case() {
         a_packed_bank_the_plan_pairs_no_scales_with_is_refused_by_name();
         a_budget_under_the_planes_that_cannot_move_is_refused_by_name();
     }
 
-    #[test]
     fn a_packed_bank_the_plan_pairs_no_scales_with_is_refused_by_name() {
         let trace = gpt_oss();
         let full = Plan::of(&trace, &scales_of(&trace), Budgets::uncapped())

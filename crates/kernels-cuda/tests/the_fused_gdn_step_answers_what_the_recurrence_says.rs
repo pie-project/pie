@@ -141,6 +141,7 @@ fn check(geo: Geometry, window: Option<Window>) {
     }
 }
 
+#[test]
 fn the_fused_gdn_step_answers_what_the_recurrence_says_every_case() {
     the_fused_step_answers_at_a_128_wide_head_with_a_gqa_fan();
     the_fused_step_retires_a_buckets_padded_rows_and_reads_the_planes_where_the_window_says();
@@ -148,7 +149,6 @@ fn the_fused_gdn_step_answers_what_the_recurrence_says_every_case() {
     the_fused_step_answers_at_an_uneven_head();
 }
 
-#[test]
 fn the_fused_step_answers_at_a_128_wide_head_with_a_gqa_fan() {
     check(
         Geometry {

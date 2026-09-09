@@ -335,7 +335,9 @@ impl Tokenizer {
             flat.len()
         );
         let merges: Vec<(u32, u32, u32, u32)> = flat
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|quad| (quad[0], quad[1], quad[2], quad[3]))
             .collect();
 
@@ -390,12 +392,12 @@ fn rebuild_pipeline(
             );
             let pieces: Vec<(String, f32)> = vocab
                 .iter()
-                .zip(raw.chunks_exact(4))
+                .zip(raw.as_chunks::<4>().0)
                 .map(|(piece, word)| {
                     let piece = std::str::from_utf8(piece)
                         .context("a Unigram piece is not UTF-8")?
                         .to_string();
-                    let score = f32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                    let score = f32::from_le_bytes(*word);
                     Ok((piece, score))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -458,7 +460,9 @@ fn read_u32s(bytes: &[u8], what: &str) -> Result<Vec<u32>> {
         bail!("{what} is {} bytes, not a whole number of u32", bytes.len());
     }
     Ok(bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
         .collect())
 }

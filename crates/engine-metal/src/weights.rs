@@ -2,14 +2,14 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use checkpoint::file::read::parse_metadata;
-use checkpoint::file::Metadata;
-use checkpoint::file::serve;
-use checkpoint::file::zt;
 use checkpoint::contract::{ModelContract, TensorContract};
 use checkpoint::error::Error as LoadError;
 use checkpoint::executor::{Execution, sink::TensorSink};
+use checkpoint::file::Metadata;
+use checkpoint::file::read::parse_metadata;
+use checkpoint::file::serve;
 use checkpoint::file::serve::Artifact;
+use checkpoint::file::zt;
 use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::serving::{self, Stamp};
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
@@ -21,9 +21,9 @@ use crate::error::{Fault, Result};
 use crate::experts::{Attachments, Plan, Source, Tier};
 use crate::gather;
 use crate::host_source::HostSource;
-use crate::weight_store::Store;
 use crate::mapping::{self, Mapping};
 use crate::run::{WeightRow, WeightTable};
+use crate::weight_store::Store;
 
 pub(crate) const ALIGN: u64 = 256;
 
@@ -65,12 +65,9 @@ pub struct BankSeat {
     pub elem: u64,
 }
 
-fn banks(
-    trace: &Trace,
-    places: &[Place],
-    seat: impl Fn(usize) -> u64,
-) -> BTreeMap<String, Bank> {
-    trace.params
+fn banks(trace: &Trace, places: &[Place], seat: impl Fn(usize) -> u64) -> BTreeMap<String, Bank> {
+    trace
+        .params
         .iter()
         .zip(places)
         .enumerate()
@@ -230,13 +227,20 @@ impl Weights {
         let offsets: Vec<u64> = places.iter().map(|place| place.offset).collect();
         let tier = plan
             .streams()
-            .then(|| Tier::open(plan, &store, Source::landed(plan, host), &offsets).map(RefCell::new))
+            .then(|| {
+                Tier::open(plan, &store, Source::landed(plan, host), &offsets).map(RefCell::new)
+            })
             .transpose()?;
         let rows = gather
             .gathers()
             .then(|| {
-                gather::Slab::open(gather, &store, Source::from_host(table, gather.host_bands()), &offsets)
-                    .map(RefCell::new)
+                gather::Slab::open(
+                    gather,
+                    &store,
+                    Source::from_host(table, gather.host_bands()),
+                    &offsets,
+                )
+                .map(RefCell::new)
             })
             .transpose()?;
         Ok(Weights {
@@ -634,9 +638,9 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, sku: &str) -> R
         Err(why) => return Err(Fault::Recipe(format!("checkpoint: {why}"))),
     };
     let deployment = Stamp::of(backend, sku);
-    artifact.check(&deployment).map_err(|mismatch| {
-        Fault::Recipe(mismatch.refuse(&path.display().to_string()))
-    })
+    artifact
+        .check(&deployment)
+        .map_err(|mismatch| Fault::Recipe(mismatch.refuse(&path.display().to_string())))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -725,9 +729,7 @@ fn warm(
         .tensors
         .iter()
         .filter_map(|tensor| match &tensor.expr {
-            checkpoint::contract::Expr::Src(from) => {
-                Some((tensor.name.as_str(), from.as_str()))
-            }
+            checkpoint::contract::Expr::Src(from) => Some((tensor.name.as_str(), from.as_str())),
             _ => None,
         })
         .collect();
@@ -763,7 +765,11 @@ fn warm(
                     "its {} `{}` is a plane this load holds CPU-side and the artifact \
                      carries in no form — its seat is a slab and cannot be landed whole \
                      into that seat",
-                    if place.gathered { "gathered table" } else { "routed band" },
+                    if place.gathered {
+                        "gathered table"
+                    } else {
+                        "routed band"
+                    },
                     param.name,
                 )));
             }
@@ -840,16 +846,17 @@ fn warm(
                 map.len(),
             ))
         })?;
-        let published = artifact
-            .plane(objects[index])
-            .map_err(|why| {
-                Some(format!(
-                    "its plane `{}` has no zero-copy view ({why})",
-                    param.name
-                ))
-            })?;
+        let published = artifact.plane(objects[index]).map_err(|why| {
+            Some(format!(
+                "its plane `{}` has no zero-copy view ({why})",
+                param.name
+            ))
+        })?;
         let ends = |bytes: &[u8]| {
-            let head = bytes.get(..PROBE.min(bytes.len())).unwrap_or_default().to_vec();
+            let head = bytes
+                .get(..PROBE.min(bytes.len()))
+                .unwrap_or_default()
+                .to_vec();
             let tail = bytes
                 .get(bytes.len().saturating_sub(PROBE)..)
                 .unwrap_or_default()
@@ -875,12 +882,14 @@ fn warm(
         })
         .collect();
     debug_assert_eq!(
-        spans.last().map_or(0, |&(offset, reserved)| offset + reserved),
+        spans
+            .last()
+            .map_or(0, |&(offset, reserved)| offset + reserved),
         store_bytes,
         "the store's spans pack to the bytes the arm counted"
     );
-    let mut store = Store::zeroed(device, &spans, device.max_buffer())
-        .map_err(|why| Some(why.to_string()))?;
+    let mut store =
+        Store::zeroed(device, &spans, device.max_buffer()).map_err(|why| Some(why.to_string()))?;
     if !landed.is_empty() {
         let into: BTreeMap<&str, (u64, u64)> = trace
             .params
@@ -915,7 +924,11 @@ fn warm(
             .arena(&mut backing)
             .sink(&mut sink)
             .run()
-            .map_err(|why| Some(format!("the plane(s) it does not store do not land ({why})")))?;
+            .map_err(|why| {
+                Some(format!(
+                    "the plane(s) it does not store do not land ({why})"
+                ))
+            })?;
         if sink.landed != only.tensors.len() {
             return Err(Some(format!(
                 "the residue landing published {} of {} plane(s)",
@@ -950,13 +963,21 @@ fn warm(
                         ))
                     })?;
                 let view = cuts[at].view(offset).ok_or_else(|| {
-                    Some(format!("`{}` does not seat in its window", trace.params[index].name))
+                    Some(format!(
+                        "`{}` does not seat in its window",
+                        trace.params[index].name
+                    ))
                 })?;
                 handles.bind(&files[at], view, place.bytes)
             }
             Seat::Store(offset) => store.bind(handles, offset, place.bytes),
         }
-        .map_err(|why| Some(format!("`{}` does not bind ({why})", trace.params[index].name)))?;
+        .map_err(|why| {
+            Some(format!(
+                "`{}` does not bind ({why})",
+                trace.params[index].name
+            ))
+        })?;
         Ok(Tensor::new(handle, place.rows, place.width, place.dtype))
     };
     let mut table = Vec::with_capacity(places.len());
@@ -1128,18 +1149,20 @@ impl TensorSink for Landing<'_> {
                     &mut *self.table,
                 )
             } else {
-                ("streamed band", self.plan.host_at(at).unwrap_or(0), &mut *self.host)
+                (
+                    "streamed band",
+                    self.plan.host_at(at).unwrap_or(0),
+                    &mut *self.host,
+                )
             };
             let from = usize::try_from(at_host).unwrap_or(usize::MAX);
-            let into = into
-                .get_mut(from..from + bytes.len())
-                .ok_or_else(|| {
-                    LoadError::Internal(format!(
-                        "`{name}` is a {what} whose {} bytes leave its host source at \
+            let into = into.get_mut(from..from + bytes.len()).ok_or_else(|| {
+                LoadError::Internal(format!(
+                    "`{name}` is a {what} whose {} bytes leave its host source at \
                          offset {from}",
-                        bytes.len()
-                    ))
-                })?;
+                    bytes.len()
+                ))
+            })?;
             into.copy_from_slice(bytes);
         } else {
             self.store
@@ -1159,12 +1182,12 @@ mod tests {
 
     use super::*;
 
+    #[test]
     fn weights_every_case() {
         the_residue_is_a_leaf_and_a_chain_is_not();
         the_store_is_laid_out_aligned_disjoint_and_in_plan_order();
     }
 
-    #[test]
     fn the_residue_is_a_leaf_and_a_chain_is_not() {
         let entry = |name: &str, expr: Expr| TensorContract {
             name: name.to_string(),
@@ -1212,8 +1235,9 @@ mod tests {
     }
 
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
-        let trace =
-            models::sku("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships the SKU").trace;
+        let trace = models::sku("qwen35-d0.8b-bf16-kv-bf16")
+            .expect("the catalog ships the SKU")
+            .trace;
         let trace = trace(Platform::Metal);
         let places = places(&trace, &Plan::default(), &gather::Plan::default())
             .expect("every param of a bf16 SKU has an element size");

@@ -51,6 +51,7 @@ fn assert_round_trips(original: &Tokenizer, what: &str) -> CanonicalTokenizer {
     canonical
 }
 
+#[test]
 fn canonical_every_case() {
     a_byte_level_bpe_profile_round_trips();
     splitter_order_survives();
@@ -61,7 +62,6 @@ fn canonical_every_case() {
     objects_are_offered_in_ascending_name_order();
 }
 
-#[test]
 fn a_byte_level_bpe_profile_round_trips() {
     let tokenizer = load(&byte_level_json(
         json!({"type": "NFC"}),
@@ -125,7 +125,9 @@ fn a_byte_fallback_profile_round_trips() {
 
     let entries: Vec<u32> = canonical
         .byte_fallback
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         .collect();
     assert_eq!(entries.len(), 256);
@@ -146,7 +148,9 @@ fn an_absent_byte_fallback_table_stays_absent() {
     let canonical = tokenizer.to_canonical().unwrap();
     let entries: Vec<u32> = canonical
         .byte_fallback
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         .collect();
     assert!(entries.iter().all(|&id| id == u32::MAX));

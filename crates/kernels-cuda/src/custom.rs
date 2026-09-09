@@ -41,7 +41,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
              norms, so serving this would normalise k at q's epsilon",
         ));
     }
-    if rotary_dim == 0 || rotary_dim > head_dim || rotary_dim % 2 != 0 {
+    if rotary_dim == 0 || rotary_dim > head_dim || !rotary_dim.is_multiple_of(2) {
         return Err(refuse(
             OP,
             format!(

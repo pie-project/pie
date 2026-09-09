@@ -19,6 +19,7 @@ fn digest_of(path: &PathBuf) -> Digest {
         .unwrap()
 }
 
+#[test]
 fn content_digest_every_case() {
     placement_does_not_change_the_content_digest();
     block_digests_do_not_change_the_content_digest();
@@ -28,7 +29,6 @@ fn content_digest_every_case() {
     an_object_without_a_digest_has_no_content_digest();
 }
 
-#[test]
 fn placement_does_not_change_the_content_digest() {
     let a = f32s(&[1.0, 2.0, 3.0, 4.0]);
     let b = vec![9u8; 300];

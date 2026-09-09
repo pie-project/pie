@@ -30,10 +30,10 @@ fn wired() -> Option<u64> {
     let mut page = 4096u64;
     let mut pages = None;
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("Mach Virtual Memory Statistics: (page size of ") {
-            if let Some(n) = rest.split_whitespace().next() {
-                page = n.parse().unwrap_or(page);
-            }
+        if let Some(rest) = line.strip_prefix("Mach Virtual Memory Statistics: (page size of ")
+            && let Some(n) = rest.split_whitespace().next()
+        {
+            page = n.parse().unwrap_or(page);
         }
         if let Some(rest) = line.strip_prefix("Pages wired down:") {
             pages = rest.trim().trim_end_matches('.').parse::<u64>().ok();
@@ -115,9 +115,7 @@ fn tokenizer_file() -> Option<PathBuf> {
         let path = PathBuf::from(stated).join("tokenizer.json");
         return path.is_file().then_some(path);
     }
-    let homes = [
-        std::env::var("HOME").unwrap_or_default(),
-    ];
+    let homes = [std::env::var("HOME").unwrap_or_default()];
     homes.iter().find_map(|home| {
         let snapshots = Path::new(home)
             .join(".cache/huggingface/hub")
@@ -135,7 +133,9 @@ fn tokenizer_file() -> Option<PathBuf> {
                 path.parent()
                     .and_then(Path::file_name)
                     .and_then(|it| it.to_str())
-                    .is_some_and(|name| name.len() == 40 && name.chars().all(|c| c.is_ascii_hexdigit()))
+                    .is_some_and(|name| {
+                        name.len() == 40 && name.chars().all(|c| c.is_ascii_hexdigit())
+                    })
             })
             .or_else(|| found.first())
             .cloned()
@@ -149,7 +149,9 @@ struct Read {
 }
 
 fn read(artifact: &Path) -> Read {
-    let trace = (models::sku(SKU).expect("the catalog ships the full 2-bit row").trace)(Platform::Metal);
+    let trace = (models::sku(SKU)
+        .expect("the catalog ships the full 2-bit row")
+        .trace)(Platform::Metal);
     let source = ztensor_compat::index(artifact).expect("the artifact opens");
     let contract = checkpoint_dsl::own_contract(&source, &trace.params, 1, Platform::Metal)
         .unwrap_or_else(|why| panic!("the artifact holds every plane of {SKU}: {why}"));
@@ -179,8 +181,14 @@ fn seating(read: &Read, want: u32) -> Plan {
     let plan = plan_at(lo).unwrap_or_else(|why| {
         panic!("no budget under {full} seats {want} of this artifact's experts: {why}")
     });
-    assert!(plan.slots() >= want, "the bisected budget seats what was asked");
-    assert!(plan.streams(), "a plan that holds nothing back is not a slab");
+    assert!(
+        plan.slots() >= want,
+        "the bisected budget seats what was asked"
+    );
+    assert!(
+        plan.streams(),
+        "a plan that holds nothing back is not a slab"
+    );
     plan
 }
 
@@ -255,8 +263,7 @@ fn run(what: &str, artifact: &Path, residency: Plan, prompt: &[u32]) -> Option<R
         pages: (4) * (512) / (16),
         runahead: engine::runahead::Runahead::F1,
         residency,
-    })
-    ;
+    });
     let mut shell = match shell {
         Ok(shell) => shell,
         Err(engine_metal::Fault::Residency(said)) => {
@@ -341,16 +348,15 @@ fn the_full_dsv4_artifact_loads_warm_streams_its_experts_and_answers_twice_the_s
         "artifact {artifact:?} ({:.1} GiB)\ntokenizer {vocabulary:?}",
         bytes as f64 / (1u64 << 30) as f64
     );
-    eprintln!(
-        "idle: wired {} swap {}",
-        gib(wired()),
-        gib(swap())
-    );
+    eprintln!("idle: wired {} swap {}", gib(wired()), gib(swap()));
 
     let tokenizer =
         tokenizer::Tokenizer::from_file(&vocabulary).expect("the checkpoint's tokenizer loads");
     let prompt = tokenizer.encode(PROMPT);
-    assert!(!prompt.is_empty(), "the prompt encodes to at least one token");
+    assert!(
+        !prompt.is_empty(),
+        "the prompt encodes to at least one token"
+    );
 
     let sized = read(&artifact);
     for want in [16u32, 24, 32, 40, 48, 64] {

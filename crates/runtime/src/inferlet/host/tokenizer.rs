@@ -40,10 +40,7 @@ impl pie::inferlet::tokenizer::Host for ProcessCtx {
     }
 
     async fn tokens_with_prefix(&mut self, prefix: Vec<u8>) -> Result<Vec<u32>> {
-        Ok(
-            tokio::task::spawn_blocking(move || model::model().tokens_with_prefix(&prefix))
-                .await?,
-        )
+        Ok(tokio::task::spawn_blocking(move || model::model().tokens_with_prefix(&prefix)).await?)
     }
 
     async fn split_regex(&mut self) -> Result<String> {

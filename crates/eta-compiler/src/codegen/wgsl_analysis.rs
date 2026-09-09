@@ -250,6 +250,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn wgsl_analysis_every_case() {
         a_plain_reshape_is_elided();
         a_reshape_that_does_not_cover_or_that_escapes_is_not_elided();
@@ -259,7 +260,6 @@ mod tests {
         a_reshape_read_twice_breaks_the_chain();
     }
 
-    #[test]
     fn a_plain_reshape_is_elided() {
         let stage = plan(
             vec![

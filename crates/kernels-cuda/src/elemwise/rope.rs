@@ -68,7 +68,7 @@ pub fn ramp_bounds(
 
 fn heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
     nonzero(op, "the head width this rotation states", head_dim)?;
-    if width % head_dim != 0 {
+    if !width.is_multiple_of(head_dim) {
         return Err(refuse(
             op,
             format!("the {width}-wide row is not a whole number of {head_dim}-wide heads"),
@@ -197,10 +197,10 @@ pub fn rmsnorm_rope_partial_q(
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     positions_stream(OP, positions, &x);
     if head_dim == 0
-        || head_dim % 2 != 0
-        || y.width % head_dim != 0
+        || !head_dim.is_multiple_of(2)
+        || !y.width.is_multiple_of(head_dim)
         || rotary_dim > head_dim
-        || rotary_dim % 2 != 0
+        || !rotary_dim.is_multiple_of(2)
     {
         return Err(refuse(
             OP,

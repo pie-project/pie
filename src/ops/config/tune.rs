@@ -424,12 +424,12 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
 mod tests {
     use super::*;
 
+    #[test]
     fn tune_every_case() {
         the_winner_is_written_through_the_schema();
         a_combination_the_engine_would_refuse_is_never_written();
     }
 
-    #[test]
     fn the_winner_is_written_through_the_schema() {
         let content = crate::ops::config::default_config_for_test();
         let updated = apply(

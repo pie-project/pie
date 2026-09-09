@@ -129,7 +129,7 @@
 //! 2. **Heads are folded by the PROGRAM.** SnapKV selects per head; one page
 //!    list per request means a per-head keep-set has no representable consumer.
 //!    The rectangle is per-head because observability wants it that way (§4),
-//!    so this program takes the mean itself, in-graph. `quest-attention`,
+//!    so this program takes the mean itself, in-graph.
 //!    `tova-attention` and `trackb-h2o` document the identical collapse.
 //! 3. **Layers are folded by the program.** Same reason. Summing layers is
 //!    monotone-equivalent to averaging, so the ranking does not depend on how

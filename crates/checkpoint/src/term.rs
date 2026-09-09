@@ -224,12 +224,16 @@ pub fn gguf_type_of(layout: &str) -> Option<&str> {
 
 #[must_use]
 pub fn gguf_scheme(name: &str) -> Option<QuantScheme> {
-    GGUF.iter().find(|(_, it)| *it == name).map(|&(scheme, _)| scheme)
+    GGUF.iter()
+        .find(|(_, it)| *it == name)
+        .map(|&(scheme, _)| scheme)
 }
 
 #[must_use]
 pub fn gguf_name(scheme: QuantScheme) -> Option<&'static str> {
-    GGUF.iter().find(|(it, _)| *it == scheme).map(|&(_, name)| name)
+    GGUF.iter()
+        .find(|(it, _)| *it == scheme)
+        .map(|&(_, name)| name)
 }
 
 #[must_use]
@@ -279,10 +283,11 @@ pub fn spec_of_canonical(term: &Term) -> Option<QuantSpec> {
 #[must_use]
 pub fn term_of(encoding: &crate::types::Encoding) -> Option<Term> {
     match encoding {
-        crate::types::Encoding::Raw(dtype) => Term::parse(&dtype.term().to_string()).ok(),
+        crate::types::Encoding::Raw(dtype) => Term::parse(dtype.term()).ok(),
         crate::types::Encoding::Quant(spec) => {
             let term = Term::parse(spec.term()?.mangle().as_str()).ok()?;
-            let read_back = || spec_of_canonical(&term).is_some_and(|read| read.scheme == spec.scheme);
+            let read_back =
+                || spec_of_canonical(&term).is_some_and(|read| read.scheme == spec.scheme);
             (spec.scheme.is_self_contained() || read_back()).then_some(term)
         }
     }

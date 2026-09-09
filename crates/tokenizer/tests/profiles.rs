@@ -52,6 +52,7 @@ fn assert_exact(json: &serde_json::Value, texts: &[&str]) {
     }
 }
 
+#[test]
 fn profiles_every_case() {
     qwen3_profile_is_exact();
     qwen36_string_merges_are_exact();
@@ -64,7 +65,6 @@ fn profiles_every_case() {
     a_bpe_tokenizer_writes_no_score_plane();
 }
 
-#[test]
 fn qwen3_profile_is_exact() {
     let tokenizer = byte_level_json(
         json!({"type": "NFC"}),
@@ -183,13 +183,20 @@ fn a_unigram_survives_being_baked_and_read_back() {
     let names: Vec<&str> = baked.objects().iter().map(|(name, _)| *name).collect();
     let mut sorted = names.clone();
     sorted.sort_unstable();
-    assert_eq!(names, sorted, "canonical `.zt` form requires ascending names");
+    assert_eq!(
+        names, sorted,
+        "canonical `.zt` form requires ascending names"
+    );
 
     let back = Tokenizer::from_canonical(&baked).expect("and reads back");
     for text in ["ab", "a red", "red", "a  b", "", "aQb", "abab", "d"] {
         assert_eq!(back.encode(text), pie.encode(text), "encoding {text:?}");
         let ids = pie.encode(text);
-        assert_eq!(back.decode(&ids, true), pie.decode(&ids, true), "decoding {text:?}");
+        assert_eq!(
+            back.decode(&ids, true),
+            pie.decode(&ids, true),
+            "decoding {text:?}"
+        );
     }
 }
 

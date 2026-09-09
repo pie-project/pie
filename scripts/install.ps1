@@ -113,8 +113,11 @@ function Get-AssetName($Flavor) {
         "cuda" {
             return "pie-x86_64-windows-cuda.zip"
         }
+        "vulkan" {
+            return "pie-x86_64-windows-vulkan.zip"
+        }
         default {
-            Stop-WithError "no '$Flavor' build for windows/x86_64. The only published Windows build is 'cuda' (native CUDA; requires an NVIDIA GPU)."
+            Stop-WithError "no '$Flavor' build for windows/x86_64. Published Windows builds are 'cuda' (native CUDA; requires an NVIDIA GPU) and 'vulkan' (any Vulkan 1.2 device)."
         }
     }
 }

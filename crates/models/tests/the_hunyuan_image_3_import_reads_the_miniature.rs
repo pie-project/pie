@@ -13,12 +13,12 @@ fn golden() -> PathBuf {
     PathBuf::from(root).join("hy3").join("hy3_mini.safetensors")
 }
 
+#[test]
 fn the_hunyuan_image_3_import_reads_the_miniature_every_case() {
     the_miniature_reads_the_golden_and_rearranges_where_the_study_says();
     the_rotary_channel_permutation_is_one();
 }
 
-#[test]
 fn the_miniature_reads_the_golden_and_rearranges_where_the_study_says() {
     let path = golden();
     if !path.exists() {

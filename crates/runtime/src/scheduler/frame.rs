@@ -41,13 +41,15 @@ pub(super) fn idle_dump_threshold_us() -> u64 {
     })
 }
 
-static SEAL_DEFAULT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SEAL_DEFAULT_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn set_seal_default_ready(ready: bool) {
     SEAL_DEFAULT_READY.store(ready, Ordering::Relaxed);
 }
 
-static SEAL_COALESCE_DEFAULT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEAL_COALESCE_DEFAULT_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn set_seal_coalesce_default(window: Duration) {
     SEAL_COALESCE_DEFAULT_US.store(window.as_micros() as u64, Ordering::Relaxed);
@@ -321,12 +323,6 @@ impl FramePolicy {
     #[cfg(test)]
     fn with_seal_mode_ready(mut self, on: bool) -> Self {
         self.seal_mode_ready = on;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_seal_coalesce(mut self, window: Duration) -> Self {
-        self.seal_coalesce = window;
         self
     }
 
@@ -1424,6 +1420,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn frame_every_case() {
         seals_complete_lanes_and_orders_waves_by_slot();
         a_grouped_lanes_first_frame_waits_for_its_cohort();
@@ -1442,7 +1439,6 @@ mod tests {
         consumed_release_leaves_no_phantom_hold_for_bystander();
     }
 
-    #[test]
     fn seals_complete_lanes_and_orders_waves_by_slot() {
         let mut policy = FramePolicy::new(4, 64, 4096, None);
         let (a, b) = (pid(), pid());
@@ -1488,13 +1484,20 @@ mod tests {
         let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
         let mut sealed = fires(&plan(&mut policy, &queued, now));
         sealed.sort_unstable();
-        assert_eq!(sealed, vec![1, 2, 3], "the whole cohort seals into one frame");
+        assert_eq!(
+            sealed,
+            vec![1, 2, 3],
+            "the whole cohort seals into one frame"
+        );
         assert!(policy.cohorts.is_empty(), "a complete cohort is forgotten");
 
         policy.on_fire_enqueued(stamp(caption, 1, 0, 1), Some(owner), 4, 8, 1, Some((7, 3)));
         policy.on_fire_enqueued(stamp(image, 1, 0, 1), Some(owner), 5, 64, 1, Some((7, 3)));
         let queued: QueuedFireIds = [4, 5].into_iter().collect();
-        assert!(matches!(plan(&mut policy, &queued, now), FramePlan::Hold(_)));
+        assert!(matches!(
+            plan(&mut policy, &queued, now),
+            FramePlan::Hold(_)
+        ));
         policy.on_fire_enqueued(stamp(context, 1, 0, 1), Some(owner), 6, 16, 1, Some((7, 3)));
         assert!(policy.cohorts.is_empty(), "a complete cohort is forgotten");
         let queued: QueuedFireIds = [4, 5, 6].into_iter().collect();
@@ -1878,5 +1881,4 @@ mod tests {
             "a drained release must not hold for a staged bystander"
         );
     }
-
 }

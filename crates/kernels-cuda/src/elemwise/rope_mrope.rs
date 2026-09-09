@@ -9,6 +9,7 @@ const FILE: &str = "elemwise/rope_mrope.cuh";
 
 pub const AXES: u32 = 3;
 
+#[allow(clippy::too_many_arguments)]
 pub fn interleaved(
     ctx: &Ctx,
     q: &mut Tensor,
@@ -32,6 +33,7 @@ pub fn interleaved(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn blocked(
     ctx: &Ctx,
     q: &mut Tensor,
@@ -72,7 +74,7 @@ fn fire(
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
 
     nonzero(OP, "the head width this rotation states", head_dim)?;
-    if head_dim % 2 != 0 {
+    if !head_dim.is_multiple_of(2) {
         return Err(refuse(
             OP,
             format!("a {head_dim}-wide head has no whole number of rotation pairs"),
@@ -144,7 +146,7 @@ fn fire(
 }
 
 fn heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
-    if width % head_dim != 0 {
+    if !width.is_multiple_of(head_dim) {
         return Err(refuse(
             op,
             format!("the {width}-wide {what} row is not a whole number of {head_dim}-wide heads"),

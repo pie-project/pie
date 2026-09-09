@@ -44,7 +44,11 @@ fn shape(
             ),
         ));
     }
-    nonzero(op, "the heads per n-gram this statement states", heads_per_ngram)?;
+    nonzero(
+        op,
+        "the heads per n-gram this statement states",
+        heads_per_ngram,
+    )?;
     let expected = (mults.len() - 1) * heads_per_ngram as usize;
     if primes.len() != expected {
         return Err(refuse(
@@ -68,7 +72,10 @@ fn hash_plane(op: &'static str, hash: Tensor, shape: &Shape) -> Result<(), Error
     if hash.dtype != Dtype::U64 {
         return Err(refuse(
             op,
-            format!("the hash constants arrive as {:?} and this plane reads u64", hash.dtype),
+            format!(
+                "the hash constants arrive as {:?} and this plane reads u64",
+                hash.dtype
+            ),
         ));
     }
     let want = u64::from(shape.ngram) + 2 * u64::from(shape.heads);
@@ -321,11 +328,68 @@ pub mod reference {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn ngram_ids_committed(
+    ctx: &Ctx<'_>,
+    ids: Tensor,
+    indptr: Tensor,
+    committed: &crate::attn::ssm::Committed,
+    state: &RecurrentPool,
+    hash: Tensor,
+    eos: u32,
+    mults: &[u64],
+    primes: &[u64],
+    offsets: &[u64],
+    heads_per_ngram: u32,
+    ngram_ids: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.ple_ngram_ids_committed";
+    if ids.dtype != Dtype::I32 || ngram_ids.dtype != Dtype::I32 || indptr.dtype != Dtype::I32 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the hasher reads i32 ids over an i32 CSR and lands i32 rows, not {:?}/{:?}/{:?}",
+                ids.dtype, indptr.dtype, ngram_ids.dtype
+            ),
+        ));
+    }
+    let shape = shape(OP, eos, mults, primes, offsets, heads_per_ngram)?;
+    hash_plane(OP, hash, &shape)?;
+    nonzero(OP, "extended rows", ids.rows)?;
+    let lanes = match indptr.rows.checked_sub(1) {
+        Some(lanes) if lanes > 0 => lanes,
+        _ => {
+            return Err(refuse(
+                OP,
+                "the window CSR this fire names spans no request",
+            ));
+        }
+    };
+    ctx.fire(
+        Fire::at(FILE, "ple_ngram_ids_committed").apply([lanes, 1, 1]),
+        &[
+            ids.arg(),
+            indptr.arg(),
+            committed.replay.arg(),
+            committed.commit.arg(),
+            committed.slots.arg(),
+            stated(OP, committed.lane0)?.arg(),
+            state.state.arg_mut(),
+            hash.arg(),
+            ngram_ids.arg_mut(),
+            stated(OP, shape.ngram)?.arg(),
+            stated(OP, shape.heads)?.arg(),
+            stated(OP, shape.heads_per_ngram)?.arg(),
+            stated(OP, shape.eos)?.arg(),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    
+
     use super::*;
-    
+
     use crate::probe::Probe;
 
     const MULTS: [u64; 3] = [23_703_573_157_769, 20_109_073_645_365, 8_052_911_324_071];
@@ -354,13 +418,13 @@ mod tests {
         Tensor::new(12, 1, (MULTS.len() + 2 * PRIMES.len()) as u32, Dtype::U64)
     }
 
+    #[test]
     fn ple_every_case() {
         the_constants_plane_is_multipliers_then_primes_then_offsets();
         a_hash_plane_the_shape_does_not_describe_is_refused();
         a_head_count_the_orders_do_not_cover_is_refused();
     }
 
-    #[test]
     fn the_constants_plane_is_multipliers_then_primes_then_offsets() {
         let plane = hash_constants(&MULTS, &PRIMES, &OFFSETS);
         assert_eq!(plane.len(), 3 + 4 + 4);
@@ -406,56 +470,4 @@ mod tests {
         .expect_err("four heads are not three per order");
         assert!(why.to_string().contains("4 heads against 2"), "{why}");
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn ngram_ids_committed(
-    ctx: &Ctx<'_>,
-    ids: Tensor,
-    indptr: Tensor,
-    committed: &crate::attn::ssm::Committed,
-    state: &RecurrentPool,
-    hash: Tensor,
-    eos: u32,
-    mults: &[u64],
-    primes: &[u64],
-    offsets: &[u64],
-    heads_per_ngram: u32,
-    ngram_ids: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.ple_ngram_ids_committed";
-    if ids.dtype != Dtype::I32 || ngram_ids.dtype != Dtype::I32 || indptr.dtype != Dtype::I32 {
-        return Err(refuse(
-            OP,
-            format!(
-                "the hasher reads i32 ids over an i32 CSR and lands i32 rows, not {:?}/{:?}/{:?}",
-                ids.dtype, indptr.dtype, ngram_ids.dtype
-            ),
-        ));
-    }
-    let shape = shape(OP, eos, mults, primes, offsets, heads_per_ngram)?;
-    hash_plane(OP, hash, &shape)?;
-    nonzero(OP, "extended rows", ids.rows)?;
-    let lanes = match indptr.rows.checked_sub(1) {
-        Some(lanes) if lanes > 0 => lanes,
-        _ => return Err(refuse(OP, "the window CSR this fire names spans no request")),
-    };
-    ctx.fire(
-        Fire::at(FILE, "ple_ngram_ids_committed").apply([lanes, 1, 1]),
-        &[
-            ids.arg(),
-            indptr.arg(),
-            committed.replay.arg(),
-            committed.commit.arg(),
-            committed.slots.arg(),
-            stated(OP, committed.lane0)?.arg(),
-            state.state.arg_mut(),
-            hash.arg(),
-            ngram_ids.arg_mut(),
-            stated(OP, shape.ngram)?.arg(),
-            stated(OP, shape.heads)?.arg(),
-            stated(OP, shape.heads_per_ngram)?.arg(),
-            stated(OP, shape.eos)?.arg(),
-        ],
-    )
 }

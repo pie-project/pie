@@ -4,14 +4,19 @@ pub type PhysicalPageId = BlockId;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PrepareError {
-    StaleGeneration { captured: u32, current: u32 },
+    StaleGeneration {
+        captured: u32,
+        current: u32,
+    },
     InvalidValidLen {
         index: u32,
         valid_len: u32,
         page_size: u32,
     },
     DuplicateOutputIndex(u32),
-    NonContiguousActiveRun { gap_at: u32 },
+    NonContiguousActiveRun {
+        gap_at: u32,
+    },
     EmptyForward,
     NoInputTokens,
 }

@@ -62,25 +62,13 @@ impl BindExtents {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InstanceBinding {
     pub program: ProgramId,
     pub channels: Vec<crate::channel::ChannelId>,
     pub seeds: Vec<ChannelSeed>,
     pub geometry: GeometryClass,
     pub extents: BindExtents,
-}
-
-impl Default for InstanceBinding {
-    fn default() -> InstanceBinding {
-        InstanceBinding {
-            program: 0,
-            channels: Vec::new(),
-            seeds: Vec::new(),
-            geometry: GeometryClass::default(),
-            extents: BindExtents::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

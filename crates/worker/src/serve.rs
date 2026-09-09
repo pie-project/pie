@@ -61,7 +61,9 @@ enum ClusterControl {
         _client: ControlClient,
         worker_id: WorkerId,
     },
-    Embedded { worker_id: WorkerId },
+    Embedded {
+        worker_id: WorkerId,
+    },
 }
 
 impl ClusterControl {

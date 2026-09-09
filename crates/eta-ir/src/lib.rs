@@ -74,12 +74,11 @@ pub fn container_hash(container_bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod fnv_tests {
-    
+
     #[test]
     fn the_hash_is_fnv_1a_64() {
         assert_eq!(super::fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(super::fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(super::fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
     }
-
 }

@@ -2,9 +2,7 @@ use crate::table::{WakerSlotId, WakerTable};
 
 pub enum Readiness<T> {
     Ready(T),
-    Pending {
-        observed_epoch: u64,
-    },
+    Pending { observed_epoch: u64 },
 }
 
 pub struct WaitFuture<'t, F> {

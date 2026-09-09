@@ -3,8 +3,8 @@ use std::ops::Range;
 
 use model_ir::{ClassTable, Trace};
 
-use crate::compiled::{Fallback, FallbackRow, FallbackTable, ClassOrder, Phase, Region};
 use crate::budget::DeviceProfile;
+use crate::compiled::{ClassOrder, Fallback, FallbackRow, FallbackTable, Phase, Region};
 
 use crate::pq::{Leaf, PqTree};
 
@@ -38,7 +38,12 @@ pub(crate) fn seriate(
 
     let groupable: BTreeMap<&Vec<Leaf>, bool> = matrix
         .iter()
-        .map(|(mask, stated_by)| (mask, composed_of(trace, regions, stated_by, &profile.grouped)))
+        .map(|(mask, stated_by)| {
+            (
+                mask,
+                composed_of(trace, regions, stated_by, &profile.grouped),
+            )
+        })
         .collect();
 
     let (tree, withdrawn) = choose(trace, regions, &matrix, &groupable, count, profile);
@@ -94,11 +99,13 @@ fn withdrawal_cost(
     profile: &DeviceProfile,
 ) -> f32 {
     let discount = if groupable { GROUPED_DISCOUNT } else { 1.0 };
-    discount * rows.iter()
-        .flat_map(|&r| regions[r].nodes.clone())
-        .filter_map(|node| trace.nodes.get(node as usize))
-        .map(|node| profile.family_us.of(&node.op))
-        .sum::<f32>()
+    discount
+        * rows
+            .iter()
+            .flat_map(|&r| regions[r].nodes.clone())
+            .filter_map(|node| trace.nodes.get(node as usize))
+            .map(|node| profile.family_us.of(&node.op))
+            .sum::<f32>()
 }
 
 const GROUPED_DISCOUNT: f32 = 0.05;
@@ -221,5 +228,4 @@ mod tests {
             "{refused:?}"
         );
     }
-
 }

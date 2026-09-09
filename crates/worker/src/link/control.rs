@@ -190,7 +190,9 @@ pub fn spawn_control_tasks<C: ControlLink>(
                     "[report] kv_bucket={} inflight={} queue=[{}]",
                     status.kv_pressure_bucket,
                     status.inflight,
-                    runtime::planner::planner().map(|p| p.debug_queue()).unwrap_or_default()
+                    runtime::planner::planner()
+                        .map(|p| p.debug_queue())
+                        .unwrap_or_default()
                 );
             }
             if let Err(e) = report_ctrl.report_worker(worker_id, status).await {

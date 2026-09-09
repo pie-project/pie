@@ -28,9 +28,11 @@ fn a_routed_bank_is_the_rectangle_the_grouped_leg_reads() {
             let Operation::Linear(Linear::MoeMatmulSelect { x, bank, y, .. }) = &node.op else {
                 continue;
             };
-            let (Some(bank_shape), Some(k), Some(n)) =
-                (declared(&trace, *bank), width(&trace, *x), width(&trace, *y))
-            else {
+            let (Some(bank_shape), Some(k), Some(n)) = (
+                declared(&trace, *bank),
+                width(&trace, *x),
+                width(&trace, *y),
+            ) else {
                 faults.push(format!(
                     "`{}`: a routed select whose bank is not a declared weight, or whose \
                      activation and result are not constant-width rectangles — the grouped \

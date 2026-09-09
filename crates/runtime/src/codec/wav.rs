@@ -34,12 +34,12 @@ pub fn raw_f32(samples: &[f32]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
     fn wav_every_case() {
         the_header_describes_the_data_that_follows();
         raw_f32_is_the_samples_and_nothing_else();
     }
 
-    #[test]
     fn the_header_describes_the_data_that_follows() {
         let pcm = [0.0f32, 1.0, -1.0, 0.5];
         let out = encode(&pcm, 24_000, 2);

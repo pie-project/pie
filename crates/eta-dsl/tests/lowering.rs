@@ -46,12 +46,12 @@ fn build_s3() -> Traced {
         .expect("greedy-decode must build to a validated container")
 }
 
+#[test]
 fn lowering_every_case() {
     s3_identity_hash_is_stable();
     lint_double_endpoint_host_both_ends();
 }
 
-#[test]
 fn s3_identity_hash_is_stable() {
     let a = build_s3().identity_hash();
     let b = build_s3().identity_hash();

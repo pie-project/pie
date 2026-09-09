@@ -156,12 +156,12 @@ pub fn reads(op: &str) -> Reads {
 mod tests {
     use super::*;
 
+    #[test]
     fn seat_every_case() {
         names_are_unique();
         lookup_reads_the_table();
     }
 
-    #[test]
     fn names_are_unique() {
         for (i, a) in ENTRIES.iter().enumerate() {
             assert!(

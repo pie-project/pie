@@ -818,11 +818,17 @@ fn stored_mlx_codes(src: &ztensor::Source, name: &str) -> Result<bool, Error> {
     let Some(stem) = name.strip_suffix(".weight") else {
         return Ok(false);
     };
-    Ok(matches!(stored_encoding(src, name)?, Encoding::Raw(DType::U32))
-        && src.get(&model_dsl::scales_name(stem)).is_some())
+    Ok(
+        matches!(stored_encoding(src, name)?, Encoding::Raw(DType::U32))
+            && src.get(&model_dsl::scales_name(stem)).is_some(),
+    )
 }
 
-fn affine_decoded(src: &ztensor::Source, w: &Weight, from: String) -> Result<Vec<TensorContract>, Error> {
+fn affine_decoded(
+    src: &ztensor::Source,
+    w: &Weight,
+    from: String,
+) -> Result<Vec<TensorContract>, Error> {
     let illegible = |detail: String| Error::Illegible {
         name: w.name.clone(),
         detail,
@@ -837,19 +843,30 @@ fn affine_decoded(src: &ztensor::Source, w: &Weight, from: String) -> Result<Vec
         })?
         .to_string();
     let last = |name: &str| -> Result<i64, Error> {
-        let tensor = src.get(name).ok_or_else(|| Error::Missing(name.to_string()))?;
-        let extent = *tensor
-            .shape()
-            .last()
-            .ok_or_else(|| illegible(format!("`{name}` is a scalar and a bank has a contracted axis")))?;
+        let tensor = src
+            .get(name)
+            .ok_or_else(|| Error::Missing(name.to_string()))?;
+        let extent = *tensor.shape().last().ok_or_else(|| {
+            illegible(format!(
+                "`{name}` is a scalar and a bank has a contracted axis"
+            ))
+        })?;
         Ok(i64::try_from(extent).expect("an extent no i64 holds"))
     };
-    let k = *extents(w)
-        .last()
-        .ok_or_else(|| illegible(format!("`{}` is a scalar and a bank has a contracted axis", w.name)))?;
+    let k = *extents(w).last().ok_or_else(|| {
+        illegible(format!(
+            "`{}` is a scalar and a bank has a contracted axis",
+            w.name
+        ))
+    })?;
     let words = last(&from)?;
     let scale_groups = last(&model_dsl::scales_name(&stem))?;
-    if words <= 0 || k % words != 0 || 32 % (k / words) != 0 || scale_groups <= 0 || k % scale_groups != 0 {
+    if words <= 0
+        || k % words != 0
+        || 32 % (k / words) != 0
+        || scale_groups <= 0
+        || k % scale_groups != 0
+    {
         return Err(illegible(format!(
             "`{from}` packs {words} words and {scale_groups} scale groups a row over a \
              declared width of {k}; MLX affine codes fill a 32-bit word at 2, 4 or 8 bits"
@@ -877,7 +894,7 @@ fn affine_decoded(src: &ztensor::Source, w: &Weight, from: String) -> Result<Vec
     };
     let stem = stem.as_str();
     let unpacked = unpacked_extents(src, &stored_w, &from)?;
-    holds_the_declared_rectangle(w, 0, &[unpacked.clone()])?;
+    holds_the_declared_rectangle(w, 0, std::slice::from_ref(&unpacked))?;
     let codes = Expr::src(from.clone()).transmute(TensorType::new(unpacked, grouped(&stored_w)));
     let pairing = scaling(&stored_w);
     let counted = divided(
@@ -1682,6 +1699,7 @@ mod tests {
         ztensor::Source::open(&path).expect("it reads back")
     }
 
+    #[test]
     fn lib_every_case() {
         a_placed_row_lands_the_placement_over_the_codes_an_encode_wrote();
         an_uncovered_placement_still_refuses_by_name();
@@ -1690,7 +1708,6 @@ mod tests {
         a_dense_row_is_untouched_by_the_guard();
     }
 
-    #[test]
     fn a_placed_row_lands_the_placement_over_the_codes_an_encode_wrote() {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let src = raw_source(dir.path());

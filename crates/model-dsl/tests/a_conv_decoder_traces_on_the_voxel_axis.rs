@@ -83,12 +83,12 @@ impl ForwardHybrid for Decoder {
     }
 }
 
+#[test]
 fn a_conv_decoder_traces_on_the_voxel_axis_every_case() {
     the_decoder_traces_and_its_grids_are_values();
     the_patchify_pair_crosses_the_axis_and_back();
 }
 
-#[test]
 fn the_decoder_traces_and_its_grids_are_values() {
     let trace = trace_hybrid("conv-decoder", &Decoder::new(), Platform::Cuda);
     model_ir::check(&trace).expect("the validator accepts the decoder");

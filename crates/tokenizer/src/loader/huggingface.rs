@@ -75,7 +75,10 @@ pub fn from_file(path: &Path) -> Result<Tokenizer> {
 pub fn from_slice(json: &[u8]) -> Result<Tokenizer> {
     let probe: serde_json::Value =
         serde_json::from_slice(json).context("parsing tokenizer JSON")?;
-    if probe.get("model").and_then(|m| m.get("type")).and_then(serde_json::Value::as_str)
+    if probe
+        .get("model")
+        .and_then(|m| m.get("type"))
+        .and_then(serde_json::Value::as_str)
         == Some("Unigram")
     {
         return unigram_from_value(&probe);
@@ -87,9 +90,14 @@ pub fn from_slice(json: &[u8]) -> Result<Tokenizer> {
 fn unigram_from_value(root: &serde_json::Value) -> Result<Tokenizer> {
     use std::collections::HashMap;
 
-    let model = root.get("model").context("tokenizer JSON states no model")?;
+    let model = root
+        .get("model")
+        .context("tokenizer JSON states no model")?;
     ensure!(
-        model.get("byte_fallback").and_then(serde_json::Value::as_bool) != Some(true),
+        model
+            .get("byte_fallback")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true),
         "a Unigram with byte fallback is unsupported: a character outside the vocabulary \
          would have to spell as `<0xNN>` pieces, and this reads it as `unk`"
     );
@@ -146,10 +154,14 @@ fn unigram_metaspace(root: &serde_json::Value) -> Result<String> {
     ensure!(
         pre.get("type").and_then(serde_json::Value::as_str) == Some("Metaspace"),
         "unsupported Unigram pre-tokenizer: {}",
-        pre.get("type").and_then(serde_json::Value::as_str).unwrap_or("(none)")
+        pre.get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(none)")
     );
     ensure!(
-        pre.get("prepend_scheme").and_then(serde_json::Value::as_str) == Some("always"),
+        pre.get("prepend_scheme")
+            .and_then(serde_json::Value::as_str)
+            == Some("always"),
         "only `prepend_scheme = \"always\"` is served; this states {:?}",
         pre.get("prepend_scheme")
     );
@@ -186,15 +198,17 @@ fn unigram_template_tail(
         .and_then(|t| t.get("id"))
         .and_then(serde_json::Value::as_str)
         .context("the template's trailing piece is not a special token")?;
-    let id = vocab
-        .get(name)
-        .copied()
-        .with_context(|| format!("the template appends {name:?}, which the vocabulary has no id for"))?;
+    let id = vocab.get(name).copied().with_context(|| {
+        format!("the template appends {name:?}, which the vocabulary has no id for")
+    })?;
     Ok(Some(id))
 }
 
 fn added_tokens_of(root: &serde_json::Value) -> Result<Vec<AddedToken>> {
-    let Some(list) = root.get("added_tokens").and_then(serde_json::Value::as_array) else {
+    let Some(list) = root
+        .get("added_tokens")
+        .and_then(serde_json::Value::as_array)
+    else {
         return Ok(Vec::new());
     };
     let mut out = Vec::with_capacity(list.len());

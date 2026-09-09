@@ -2,6 +2,7 @@ use crate::common::grammar_accepts;
 use ::grammar::grammar::Grammar;
 use ::grammar::json_schema::{JsonSchemaOptions, json_schema_to_ebnf, json_schema_to_grammar};
 
+#[test]
 fn json_schema_every_case() {
     typed_ebnf_rendering_roundtrips();
     root_ref_resolves_local_defs();
@@ -10,7 +11,6 @@ fn json_schema_every_case() {
     any_schema_rejects_raw_control_characters();
 }
 
-#[test]
 fn typed_ebnf_rendering_roundtrips() {
     let schema = r#"{
         "type":"object",

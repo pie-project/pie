@@ -12,22 +12,13 @@ name = "worker_api"
 path = "src/lib.rs"
 
 [dependencies]
-# Shared id atoms (WorkerId / ReqId / SessionId / TenantId).
 ids = { path = "../ids" }
-# The foreign non-atom types this crate embeds but does not define:
-# `ClientMessage`/`ServerMessage` and `WorkerStatus`.
 client-api = { path = "../client-api" }
 controller-api = { path = "../controller-api" }
-# `serde1` derives on the macro-generated request/response types; `tokio1`
-# enables `NewClient::spawn`. Transport and codec features stay with the
-# binaries, so this contract crate carries no transport.
 tarpc = { version = "0.37", features = ["serde1", "tokio1"] }
 serde = { version = "1.0", features = ["derive"] }
 futures = "0.3"
 tokio = { version = "1", features = ["rt"] }
 thiserror = "2"
 tracing = "0.1"
-# The single-sourced data-plane codec. MessagePack because the plane carries
-# internally-tagged messages bincode cannot decode, and because it matches the
-# client WS wire. Codec only, not a transport.
 tokio-serde = { version = "0.9", features = ["messagepack"] }

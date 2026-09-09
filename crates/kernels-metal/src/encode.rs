@@ -144,8 +144,12 @@ pub fn elementwise(op: &'static str, width: u32, rows: u32) -> Result<[u32; 3], 
     nonzero(op, "width", width)?;
     nonzero(op, "rows", rows)?;
     let n = u64::from(width) * u64::from(rows);
-    let n = u32::try_from(n)
-        .map_err(|_| refuse(op, format!("the grid will not launch: {width} x {rows} lanes")))?;
+    let n = u32::try_from(n).map_err(|_| {
+        refuse(
+            op,
+            format!("the grid will not launch: {width} x {rows} lanes"),
+        )
+    })?;
     Ok([n, 1, 1])
 }
 

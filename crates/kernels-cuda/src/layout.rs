@@ -29,7 +29,7 @@ fn route_rows(rows: u32, width: u32) -> Launch {
 }
 
 fn vectorisable(hidden: u32, table: u64, y: u64) -> bool {
-    hidden % VEC_WIDTH == 0 && aligned16(table) && aligned16(y)
+    hidden.is_multiple_of(VEC_WIDTH) && aligned16(table) && aligned16(y)
 }
 
 pub fn embed(
@@ -331,7 +331,7 @@ pub fn split_q_gate(
     const OP: &str = "layout.split_q_gate";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     nonzero(OP, "the head width this cut walks", head_dim)?;
-    if q.width == 0 || q.width % head_dim != 0 {
+    if q.width == 0 || !q.width.is_multiple_of(head_dim) {
         return Err(refuse(
             OP,
             format!(
@@ -379,8 +379,8 @@ pub fn split_rows(
     let left_dim = stated(OP, nonzero(OP, "the left half of this cut", left.width)?)?;
     let right_dim = stated(OP, nonzero(OP, "the right half of this cut", right.width)?)?;
     let vectors = x.dtype == Dtype::Bf16
-        && left.width % VEC_WIDTH == 0
-        && right.width % VEC_WIDTH == 0
+        && left.width.is_multiple_of(VEC_WIDTH)
+        && right.width.is_multiple_of(VEC_WIDTH)
         && aligned16(x.ptr)
         && aligned16(left.ptr)
         && aligned16(right.ptr);

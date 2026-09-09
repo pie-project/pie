@@ -11,12 +11,12 @@ const ROWS: usize = 7;
 const WIDTH: usize = 5;
 const SCALE: f32 = 1000.0 / 3.0;
 
+#[test]
 fn the_scalar_multiply_lands_the_f32_product_every_case() {
     an_f32_plane_scales_exactly();
     a_bf16_plane_scales_to_the_rounded_product();
 }
 
-#[test]
 fn an_f32_plane_scales_exactly() {
     let mut rng = Lcg::seeded(41);
     let x: Vec<f32> = (0..ROWS * WIDTH).map(|_| rng.unit()).collect();

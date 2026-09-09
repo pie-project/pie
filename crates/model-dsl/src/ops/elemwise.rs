@@ -399,7 +399,16 @@ pub fn rope_partial_last(
     theta: f32,
     interleaved: bool,
 ) -> Value {
-    rope_partial_last_yarn(q, positions, rotary_dim, head_dim, theta, interleaved, false, None)
+    rope_partial_last_yarn(
+        q,
+        positions,
+        rotary_dim,
+        head_dim,
+        theta,
+        interleaved,
+        false,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -747,9 +756,17 @@ pub fn modulate(x: &Value, m: &Value, lane_of_row: Option<&Value>, form: Modulat
     match lane_of_row {
         Some(lanes) => {
             assert_eq!(m.rows(), Dim::Lanes, "a lane-broadcast vector is per lane");
-            assert_eq!(lanes.rows(), x.rows(), "the lane map is over the rows it maps");
+            assert_eq!(
+                lanes.rows(),
+                x.rows(),
+                "the lane map is over the rows it maps"
+            );
         }
-        None => assert_eq!(m.rows(), x.rows(), "a per-row vector shares the rows it modulates"),
+        None => assert_eq!(
+            m.rows(),
+            x.rows(),
+            "a per-row vector shares the rows it modulates"
+        ),
     }
     let y = r.fresh(x.ty().clone());
     let mut ins = vec![x, m];
@@ -767,16 +784,33 @@ pub fn modulate(x: &Value, m: &Value, lane_of_row: Option<&Value>, form: Modulat
     y
 }
 
-pub fn gated_residual_add(r_in: &Value, g: &Value, y: &Value, lane_of_row: Option<&Value>) -> Value {
+pub fn gated_residual_add(
+    r_in: &Value,
+    g: &Value,
+    y: &Value,
+    lane_of_row: Option<&Value>,
+) -> Value {
     let r = r_in.rec();
-    assert_eq!(r_in.ty(), y.ty(), "the stream and what joins it share a type");
+    assert_eq!(
+        r_in.ty(),
+        y.ty(),
+        "the stream and what joins it share a type"
+    );
     assert_eq!(g.width(), r_in.width(), "one gate per column");
     match lane_of_row {
         Some(lanes) => {
             assert_eq!(g.rows(), Dim::Lanes, "a lane-broadcast gate is per lane");
-            assert_eq!(lanes.rows(), r_in.rows(), "the lane map is over the rows it maps");
+            assert_eq!(
+                lanes.rows(),
+                r_in.rows(),
+                "the lane map is over the rows it maps"
+            );
         }
-        None => assert_eq!(g.rows(), r_in.rows(), "a per-row gate shares the rows it gates"),
+        None => assert_eq!(
+            g.rows(),
+            r_in.rows(),
+            "a per-row gate shares the rows it gates"
+        ),
     }
     let r_out = r.fresh(r_in.ty().clone());
     let mut ins = vec![r_in, g, y];
@@ -798,7 +832,10 @@ pub fn sinusoid(t: &Value, dim: u32, max_period: f32, flip_sin_cos: bool, scale:
     let r = t.rec();
     assert_eq!(t.width(), 1, "a timestep is one scalar per row");
     assert_eq!(t.dtype(), Dtype::F32, "timesteps are fp32");
-    assert!(dim > 0 && dim.is_multiple_of(2), "a sinusoid of {dim} has no equal halves");
+    assert!(
+        dim > 0 && dim.is_multiple_of(2),
+        "a sinusoid of {dim} has no equal halves"
+    );
     let y = r.fresh(tensor(t.rows(), dim, Dtype::F32));
     r.push(
         Elementwise::Sinusoid {
@@ -848,10 +885,7 @@ pub fn relative_bucket_bias(
     assert!(max_len > 0, "a table over no positions has no width");
     let heads = embedding.shape[1];
     let y = r.fresh(Ty::Tensor {
-        shape: vec![
-            Dim::Const(heads),
-            Dim::Const(2 * u64::from(max_len) - 1),
-        ],
+        shape: vec![Dim::Const(heads), Dim::Const(2 * u64::from(max_len) - 1)],
         dtype: Dtype::F32,
     });
     r.push(
@@ -960,10 +994,16 @@ pub fn rope_axes(
         "{axes} axes of dims want {axes} position columns, not {}",
         positions.width()
     );
-    assert_eq!(positions.rows(), x.rows(), "positions are over the rows they turn");
+    assert_eq!(
+        positions.rows(),
+        x.rows(),
+        "positions are over the rows they turn"
+    );
     assert_eq!(positions.dtype(), Dtype::F32, "axis positions are fp32");
     assert!(
-        rotary_dim <= head_dim && rotary_dim.is_multiple_of(2) && dims.iter().all(|d| d.is_multiple_of(2)),
+        rotary_dim <= head_dim
+            && rotary_dim.is_multiple_of(2)
+            && dims.iter().all(|d| d.is_multiple_of(2)),
         "rotary_dim {rotary_dim} within head_dim {head_dim}, every axis an even count"
     );
     assert!(

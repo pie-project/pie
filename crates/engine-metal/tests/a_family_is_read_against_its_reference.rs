@@ -35,17 +35,30 @@ fn every_probe_is_dumped() {
         eprintln!("skipping: this machine publishes no Metal device");
         return;
     }
-    let (Ok(probes), Ok(out)) = (std::env::var("PIE_PARITY_PROBES"), std::env::var("PIE_PARITY_OUT"))
-    else {
-        eprintln!("not asked: set PIE_PARITY_PROBES and PIE_PARITY_OUT, and PIE_PARITY_ARTIFACT or PIE_PARITY_SNAPSHOT + PIE_PARITY_SKU");
+    let (Ok(probes), Ok(out)) = (
+        std::env::var("PIE_PARITY_PROBES"),
+        std::env::var("PIE_PARITY_OUT"),
+    ) else {
+        eprintln!(
+            "not asked: set PIE_PARITY_PROBES and PIE_PARITY_OUT, and PIE_PARITY_ARTIFACT or PIE_PARITY_SNAPSHOT + PIE_PARITY_SKU"
+        );
         return;
     };
     let out = PathBuf::from(out);
     std::fs::create_dir_all(&out).expect("the dump directory exists");
-    let steps: usize = std::env::var("PIE_PARITY_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
-    let context: u32 = std::env::var("PIE_PARITY_CONTEXT").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
+    let steps: usize = std::env::var("PIE_PARITY_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    let context: u32 = std::env::var("PIE_PARITY_CONTEXT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
 
-    let (artifact, sku, contract) = match (std::env::var("PIE_PARITY_ARTIFACT"), std::env::var("PIE_PARITY_SNAPSHOT")) {
+    let (artifact, sku, contract) = match (
+        std::env::var("PIE_PARITY_ARTIFACT"),
+        std::env::var("PIE_PARITY_SNAPSHOT"),
+    ) {
         (Ok(artifact), _) => {
             let artifact = PathBuf::from(artifact);
             let stamp = checkpoint::file::serve::stamp_of(&artifact)
@@ -54,13 +67,19 @@ fn every_probe_is_dumped() {
             let sku = models::sku(&stamp.sku).unwrap_or_else(|| panic!("no SKU {}", stamp.sku));
             let trace = (sku.trace)(Platform::Metal);
             let source = ztensor_compat::index(&artifact).expect("the artifact opens");
-            let contract = checkpoint_dsl::own_contract(&source, &trace.params, sku.recipe.tp, Platform::Metal)
-                .unwrap_or_else(|why| panic!("the artifact holds every plane of {}: {why}", sku.name));
+            let contract = checkpoint_dsl::own_contract(
+                &source,
+                &trace.params,
+                sku.recipe.tp,
+                Platform::Metal,
+            )
+            .unwrap_or_else(|why| panic!("the artifact holds every plane of {}: {why}", sku.name));
             (artifact, sku, contract)
         }
         (_, Ok(snapshot)) => {
             let snapshot = PathBuf::from(snapshot);
-            let name = std::env::var("PIE_PARITY_SKU").expect("PIE_PARITY_SKU names the row that reads the snapshot");
+            let name = std::env::var("PIE_PARITY_SKU")
+                .expect("PIE_PARITY_SKU names the row that reads the snapshot");
             let sku = models::sku(&name).unwrap_or_else(|| panic!("no SKU {name}"));
             let mut shards: Vec<PathBuf> = if snapshot.is_dir() {
                 std::fs::read_dir(&snapshot)
@@ -106,7 +125,12 @@ fn every_probe_is_dumped() {
         residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the shell loads");
-    eprintln!("loaded {} on {} in {:.1}s", sku.name, shell.device_name(), booted.elapsed().as_secs_f64());
+    eprintln!(
+        "loaded {} on {} in {:.1}s",
+        sku.name,
+        shell.device_name(),
+        booted.elapsed().as_secs_f64()
+    );
 
     let battery: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&probes).expect("the probes read")).expect("json");
@@ -128,7 +152,11 @@ fn every_probe_is_dumped() {
         for id in &ids {
             let fed = [*id];
             let got = shell
-                .fire(&[Lane { slot: tf_slot, word: word(1), tokens: &fed }])
+                .fire(&[Lane {
+                    slot: tf_slot,
+                    word: word(1),
+                    tokens: &fed,
+                }])
                 .expect("a teacher-forced fire returns");
             tf_rows.push(got.into_iter().next().expect("one row"));
         }
@@ -137,7 +165,11 @@ fn every_probe_is_dumped() {
         slot += 1;
         shell.open(gen_slot).expect("the slot opens");
         let got = shell
-            .fire(&[Lane { slot: gen_slot, word: word(ids.len() as u32), tokens: &ids }])
+            .fire(&[Lane {
+                slot: gen_slot,
+                word: word(ids.len() as u32),
+                tokens: &ids,
+            }])
             .expect("the prefill fires");
         let mut gen_rows: Vec<Vec<f32>> = vec![got.into_iter().next().expect("one row")];
         let mut produced: Vec<u32> = Vec::with_capacity(steps);
@@ -146,7 +178,11 @@ fn every_probe_is_dumped() {
             produced.push(nxt);
             let fed = [nxt];
             let got = shell
-                .fire(&[Lane { slot: gen_slot, word: word(1), tokens: &fed }])
+                .fire(&[Lane {
+                    slot: gen_slot,
+                    word: word(1),
+                    tokens: &fed,
+                }])
                 .expect("a decode fires");
             gen_rows.push(got.into_iter().next().expect("one row"));
         }
@@ -162,6 +198,11 @@ fn every_probe_is_dumped() {
             .expect("json"),
         )
         .expect("the summary is written");
-        eprintln!("  {name}: {} tokens, gen={:?}  ({:.1}s)", ids.len(), &produced[..produced.len().min(12)], started.elapsed().as_secs_f64());
+        eprintln!(
+            "  {name}: {} tokens, gen={:?}  ({:.1}s)",
+            ids.len(),
+            &produced[..produced.len().min(12)],
+            started.elapsed().as_secs_f64()
+        );
     }
 }

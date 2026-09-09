@@ -29,7 +29,11 @@ impl Guard {
             return inner;
         }
         let joined = Guard::and(outer, inner.clone());
-        if joined.equivalent(&inner) { inner } else { joined }
+        if joined.equivalent(&inner) {
+            inner
+        } else {
+            joined
+        }
     }
 
     #[must_use]
@@ -124,10 +128,7 @@ impl Guard {
             arm.conjuncts(&mut theirs);
             shared.retain(|c| theirs.iter().any(|t| t == c));
         }
-        shared
-            .into_iter()
-            .cloned()
-            .fold(Guard::Always, |a, b| Guard::and(a, b))
+        shared.into_iter().cloned().fold(Guard::Always, Guard::and)
     }
 
     #[must_use]

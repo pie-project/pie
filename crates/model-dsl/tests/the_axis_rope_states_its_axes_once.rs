@@ -57,13 +57,13 @@ fn refusal(rope: OneRope) -> String {
     }
 }
 
+#[test]
 fn the_axis_rope_states_its_axes_once_every_case() {
     three_axes_over_a_whole_head_trace_in_place();
     a_partial_rotation_leaves_the_tail_of_the_head_alone();
     a_rope_whose_numbers_disagree_is_refused_by_name();
 }
 
-#[test]
 fn three_axes_over_a_whole_head_trace_in_place() {
     let trace = trace_hybrid(
         "flux",

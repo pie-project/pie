@@ -348,6 +348,7 @@ fn check_mini(sku: &str, d: &Dims, src: &ztensor::Source, prefix: &str) {
     type_checks(&contract, src);
 }
 
+#[test]
 fn the_wan_2_import_reads_the_ti2v_snapshot_every_case() {
     each_miniature_reads_a_synthetic_state_dict_bare_and_prefixed();
     the_flagship_refuses_a_bare_miniature();
@@ -355,7 +356,6 @@ fn the_wan_2_import_reads_the_ti2v_snapshot_every_case() {
     each_miniature_reads_its_golden_fixture();
 }
 
-#[test]
 fn each_miniature_reads_a_synthetic_state_dict_bare_and_prefixed() {
     for (sku, d) in [(D128, Dims::mini_d128()), (NANO, Dims::mini_nano())] {
         for prefix in ["", "dit."] {

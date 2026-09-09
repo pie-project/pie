@@ -125,7 +125,7 @@
 //!    per request means a per-head keep-set has no representable consumer. The
 //!    rectangle is per-head because observability wants it that way (§4), so
 //!    this program takes the mean over heads itself, in-graph at the epilogue.
-//!    `quest-attention` and `tova-attention` document the identical collapse.
+//!    `tova-attention` documents the identical collapse.
 //! 2. **Layers are folded by the program.** Same reason: one page list per
 //!    request is one keep-set per request. Summing layers is monotone-
 //!    equivalent to averaging them, so the ranking does not depend on how many

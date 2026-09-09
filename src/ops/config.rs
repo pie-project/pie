@@ -263,7 +263,10 @@ pub enum ConfigShow {
         #[serde(skip)]
         redirected: bool,
     },
-    Value { key: String, value: toml::Value },
+    Value {
+        key: String,
+        value: toml::Value,
+    },
 }
 
 impl crate::ui::Report for ConfigShow {
@@ -652,6 +655,7 @@ fn edit_item(value: &toml::Value) -> Result<toml_edit::Item> {
 mod tests {
     use super::*;
 
+    #[test]
     fn config_every_case() {
         show_and_list_agree_about_an_unset_key_with_a_default();
         effective_distinguishes_set_from_default_from_derived_from_required();
@@ -662,7 +666,6 @@ mod tests {
         setting_a_value_keeps_the_comments_around_it();
     }
 
-    #[test]
     fn show_and_list_agree_about_an_unset_key_with_a_default() {
         let file: toml::Value = toml::from_str("[model]\nname = \"a\"\n").unwrap();
         let field = schema_field(&file, "server.port").unwrap();

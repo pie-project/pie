@@ -133,10 +133,8 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.mlp_gelu_tanh";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "mlp_gelu_tanh_bfloat16" });
     ctx.fire(
-        Fire::at("linear/mlp_gated.metal", entry).apply(Grid::of(
-            elementwise(OP, x.width, x.rows)?,
-            [GROUP, 1, 1],
-        )),
+        Fire::at("linear/mlp_gated.metal", entry)
+            .apply(Grid::of(elementwise(OP, x.width, x.rows)?, [GROUP, 1, 1])),
         &[x.arg(), y.arg_mut()],
     )
 }

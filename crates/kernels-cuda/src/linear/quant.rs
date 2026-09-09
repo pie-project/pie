@@ -163,7 +163,7 @@ fn affine(
     );
     let n = nonzero(op, "N, the columns this projection lands", y.width)?;
     let k = nonzero(op, "K, the contraction this projection walks", act.width)?;
-    if scales.width == 0 || scales.width % 2 != 0 {
+    if scales.width == 0 || !scales.width.is_multiple_of(2) {
         return Err(refuse(
             op,
             format!(

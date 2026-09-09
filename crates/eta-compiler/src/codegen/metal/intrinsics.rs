@@ -7,9 +7,9 @@ pub const M2_INTRINSIC_TOP_BUFFER: usize = 30;
 #[must_use]
 pub fn m2_intrinsic_buffer(intr: u16) -> Option<usize> {
     match intr {
-        intrinsic_tags::LOGITS
-        | intrinsic_tags::VELOCITY
-        | intrinsic_tags::HIDDEN => Some(M2_LOGITS_BUFFER),
+        intrinsic_tags::LOGITS | intrinsic_tags::VELOCITY | intrinsic_tags::HIDDEN => {
+            Some(M2_LOGITS_BUFFER)
+        }
         intrinsic_tags::MTP_LOGITS => Some(M2_INTRINSIC_TOP_BUFFER),
         intrinsic_tags::MTP_DRAFTS => Some(M2_INTRINSIC_TOP_BUFFER - 1),
         intrinsic_tags::ATTN_SCORE => Some(M2_INTRINSIC_TOP_BUFFER - 2),
@@ -47,7 +47,7 @@ pub fn fused_channel_ceiling(used: &[u16]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use eta_ir::op::IntrinsicId;
 
     #[test]

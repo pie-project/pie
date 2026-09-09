@@ -701,7 +701,11 @@ pub(crate) fn repack_spec(
         return Err(Error::Contract(format!(
             "Repack declares {:?}; a {layout:?} repack produces {}",
             to.shape,
-            if to_rank == 3 { "[batch, rows, cols]" } else { "[rows, cols]" }
+            if to_rank == 3 {
+                "[batch, rows, cols]"
+            } else {
+                "[rows, cols]"
+            }
         )));
     }
     let (batch, rows) = if to_rank == 3 {
@@ -719,7 +723,9 @@ pub(crate) fn repack_spec(
     if to_rank == 2 {
         let banded = rows
             .checked_add(i64::from(TILED_BAND) - 1)
-            .map_or(rows, |up| up / i64::from(TILED_BAND) * i64::from(TILED_BAND));
+            .map_or(rows, |up| {
+                up / i64::from(TILED_BAND) * i64::from(TILED_BAND)
+            });
         if to_rows != banded {
             return Err(Error::Contract(format!(
                 "{layout:?} Repack of {rows} rows lands {banded} -- the next whole \

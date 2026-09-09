@@ -134,6 +134,7 @@ fn check(hd: u32, q_heads: u32, kv_heads: u32, sizes: &[u32], ref_start: &[i32],
 const SIZES: [u32; 6] = [64, 300, 200, 50, 40, 5];
 const REF_START: [i32; 6] = [20, 100, 200, -1, 0, 3];
 
+#[test]
 fn the_ragged_arm_keeps_reference_rows_to_themselves_every_case() {
     reference_rows_see_only_reference_keys_at_head_width_64();
     reference_rows_see_only_reference_keys_at_head_width_128();
@@ -141,7 +142,6 @@ fn the_ragged_arm_keeps_reference_rows_to_themselves_every_case() {
     a_short_reference_table_is_refused();
 }
 
-#[test]
 fn reference_rows_see_only_reference_keys_at_head_width_64() {
     check(64, 4, 2, &SIZES, &REF_START, 0x64);
 }

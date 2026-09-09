@@ -429,7 +429,6 @@ mod tests {
                 connected_rx: rx,
             })
         }
-
     }
 
     #[async_trait::async_trait]
@@ -531,5 +530,4 @@ mod tests {
         let res = sessions.create(ident(), input(), Affinity::Sticky).await;
         assert!(matches!(res, Err(SessionError::NoWorker)));
     }
-
 }

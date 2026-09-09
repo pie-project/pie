@@ -362,12 +362,12 @@ fn classify(_: &model_ir::Request) -> u64 {
     0
 }
 
+#[test]
 fn a_conv_decoder_fires_over_a_voxel_port_every_case() {
     the_decoder_answers_the_reference_for_two_clips_of_different_boxes();
     a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot();
 }
 
-#[test]
 fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
     if !engine_cuda::device::present() {
         eprintln!("skipping the conv decoder gate: no CUDA device");

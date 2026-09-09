@@ -115,7 +115,10 @@ pub fn probe(trace: &Trace) -> Result<Facts> {
             .plans
             .get_mut(read.plan.0 as usize)
             .ok_or_else(|| Fault::Unbound {
-                what: format!("plan value {}, which this plan does not declare", read.plan.0),
+                what: format!(
+                    "plan value {}, which this plan does not declare",
+                    read.plan.0
+                ),
             })?;
         match seat {
             None => *seat = Some(stated),

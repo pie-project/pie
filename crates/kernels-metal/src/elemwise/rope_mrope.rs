@@ -9,7 +9,7 @@ const FILE: &str = "elemwise/rope_mrope.metal";
 pub const AXES: u32 = 3;
 
 fn heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
-    if width % head_dim != 0 {
+    if !width.is_multiple_of(head_dim) {
         return Err(refuse(
             op,
             format!("the {width}-wide {what} row is not a whole number of {head_dim}-wide heads"),
@@ -68,7 +68,7 @@ fn validate(
     debug_assert_eq!(k.dtype, q.dtype, "`{op}` rotates q and k in one element");
 
     nonzero(op, "the head width this rotation states", head_dim)?;
-    if head_dim % 2 != 0 {
+    if !head_dim.is_multiple_of(2) {
         return Err(refuse(
             op,
             format!("a {head_dim}-wide head has no whole number of rotation pairs"),
@@ -83,7 +83,7 @@ fn validate(
             ),
         ));
     }
-    if rotary_dim % 2 != 0 {
+    if !rotary_dim.is_multiple_of(2) {
         return Err(refuse(
             op,
             format!("the rotated prefix {rotary_dim} is not a whole number of pairs"),

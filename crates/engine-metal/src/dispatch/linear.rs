@@ -14,8 +14,7 @@ impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         match op {
             Linear::Matmul { act, w, y }
-                if self.tensor(*act).dtype == model_ir::Dtype::F32
-                    && self.banked(*w).is_none() =>
+                if self.tensor(*act).dtype == model_ir::Dtype::F32 && self.banked(*w).is_none() =>
             {
                 linear::lane_gemm::act_x_wt(
                     self.ctx(),
@@ -100,26 +99,22 @@ impl Run<'_> {
                 *alpha,
                 self.tensor(*y),
             ),
-            Linear::MlpSwigluClampSplit { gate, up, limit, y } => {
-                linear::mlp::swiglu_clamp_split(
-                    self.ctx(),
-                    self.tensor(*gate),
-                    self.tensor(*up),
-                    *limit,
-                    self.tensor(*y),
-                )
-            }
+            Linear::MlpSwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
+                self.ctx(),
+                self.tensor(*gate),
+                self.tensor(*up),
+                *limit,
+                self.tensor(*y),
+            ),
             Linear::MlpGegluTanh { gate, up, y } => linear::mlp::geglu_tanh(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 self.tensor(*y),
             ),
-            Linear::MlpGeluTanh { x, y } => linear::mlp::gelu_tanh(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*y),
-            ),
+            Linear::MlpGeluTanh { x, y } => {
+                linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*y))
+            }
             Linear::MatmulGeglu { .. }
             | Linear::LmHeadSoftcap { .. }
             | Linear::RelBias { .. }

@@ -97,12 +97,15 @@ fn take(free: &mut Vec<Vacant>, span: u64, launch: u32, class: u64) -> Option<u6
         .iter()
         .enumerate()
         .filter(|(_, block)| {
-            block.span >= span
-                && (block.launch < launch || (class != 0 && block.class == class))
+            block.span >= span && (block.launch < launch || (class != 0 && block.class == class))
         })
         .min_by_key(|(_, block)| block.span)
         .map(|(index, _)| index)?;
-    let Vacant { offset, span: width, .. } = free[best];
+    let Vacant {
+        offset,
+        span: width,
+        ..
+    } = free[best];
     if width == span {
         free.remove(best);
     } else {
@@ -272,6 +275,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn scratch_every_case() {
         a_value_dead_before_the_next_region_hands_its_slot_on();
         a_value_last_read_where_another_is_defined_does_not_share();
@@ -284,7 +288,6 @@ mod tests {
         a_dead_value_takes_no_slot();
     }
 
-    #[test]
     fn a_value_dead_before_the_next_region_hands_its_slot_on() {
         let descriptors = [desc(1024), desc(1024), desc(1024)];
         let lifetimes = [life(0, 1), life(1, 2), life(2, 2)];
@@ -312,11 +315,20 @@ mod tests {
             rowed(4, 4, 1, 0),
         ];
         let reused = layout_reusing(&descriptors, &lifetimes, 0).unwrap();
-        assert_eq!(reused.values[1], reused.values[0], "same class, same launch");
+        assert_eq!(
+            reused.values[1], reused.values[0],
+            "same class, same launch"
+        );
         assert_ne!(reused.values[2], reused.values[0], "another class");
         assert_ne!(reused.values[2], reused.values[1]);
-        assert_ne!(reused.values[3], reused.values[0], "a whole value shares with nothing");
-        assert_eq!(reused.values[4], reused.values[0], "the next launch may take it");
+        assert_ne!(
+            reused.values[3], reused.values[0],
+            "a whole value shares with nothing"
+        );
+        assert_eq!(
+            reused.values[4], reused.values[0],
+            "the next launch may take it"
+        );
     }
 
     fn a_result_that_may_go_unwritten_keeps_a_fresh_slot() {
@@ -375,12 +387,18 @@ mod tests {
         let with = layout_reusing(&descriptors, &lifetimes, 0).expect("fits");
         lifetimes[1].dead = true;
         let without = layout_reusing(&descriptors, &lifetimes, 0).expect("fits");
-        assert_eq!(without.values[1], 0, "a dead value's offset is the dummy region's");
+        assert_eq!(
+            without.values[1], 0,
+            "a dead value's offset is the dummy region's"
+        );
         assert_eq!(
             without.total + align_up(4096).unwrap(),
             with.total,
             "the dead value's slot is the whole difference"
         );
-        assert_eq!(without.values[2], without.values[0] + align_up(4096).unwrap());
+        assert_eq!(
+            without.values[2],
+            without.values[0] + align_up(4096).unwrap()
+        );
     }
 }

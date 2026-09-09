@@ -147,6 +147,7 @@ fn check_held(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
     );
 }
 
+#[test]
 fn the_grouped_mxfp4_select_answers_the_per_route_one_every_case() {
     the_token_read_leg_with_a_bias_agrees();
     the_route_read_leg_agrees();
@@ -158,7 +159,6 @@ fn the_grouped_mxfp4_select_answers_the_per_route_one_every_case() {
     the_fp32_form_agrees_on_a_ragged_rectangle();
 }
 
-#[test]
 fn the_token_read_leg_with_a_bias_agrees() {
     check(64, 256, 256, true, true);
 }

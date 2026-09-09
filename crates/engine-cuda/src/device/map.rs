@@ -590,13 +590,13 @@ mod tests {
         }
     }
 
+    #[test]
     fn map_every_case() {
         two_readings_of_one_graph_fingerprint_the_same();
         one_scalar_that_moved_is_the_only_component_the_patch_names();
         a_node_whose_block_was_never_read_refuses_to_be_rewritten();
     }
 
-    #[test]
     fn two_readings_of_one_graph_fingerprint_the_same() {
         let a = chain(vec![
             node(0, 0, "load", 1, &[0xdead_0000]),

@@ -126,7 +126,10 @@ fn find_shape(header: &str) -> Result<Vec<u64>> {
 }
 
 enum Where {
-    Stored { offset: u64, length: u64 },
+    Stored {
+        offset: u64,
+        length: u64,
+    },
     Deflated {
         zip_index: usize,
         data_offset: usize,

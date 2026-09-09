@@ -5,16 +5,17 @@ use model_ir::ValueId;
 use crate::rs::Seat;
 use crate::run::Run;
 
-fn extended_origin(indptr: &[i32], lanes: &[crate::rs::LanePlan], lane0: u32, r: usize) -> (u32, u32) {
+fn extended_origin(
+    indptr: &[i32],
+    lanes: &[crate::rs::LanePlan],
+    lane0: u32,
+    r: usize,
+) -> (u32, u32) {
     let mut begin = indptr[r].max(0) as u32;
     for j in 0..r {
-        begin += lanes
-            .get(lane0 as usize + j)
-            .map_or(0, |plan| plan.replay);
+        begin += lanes.get(lane0 as usize + j).map_or(0, |plan| plan.replay);
     }
-    let replay = lanes
-        .get(lane0 as usize + r)
-        .map_or(0, |plan| plan.replay);
+    let replay = lanes.get(lane0 as usize + r).map_or(0, |plan| plan.replay);
     (begin, replay)
 }
 
@@ -139,17 +140,34 @@ impl Run<'_> {
         Ok(ext)
     }
 
-    pub(crate) fn rs_out(&self, op: &'static str, seat: &Seat, value: ValueId) -> Result<Tensor, Error> {
-        let region = *seat.layout.out_of.get(&value.0).ok_or_else(|| Error::Backend {
-            op,
-            detail: format!("value {} is no recurrence output this load extends", value.0),
-        })?;
+    pub(crate) fn rs_out(
+        &self,
+        op: &'static str,
+        seat: &Seat,
+        value: ValueId,
+    ) -> Result<Tensor, Error> {
+        let region = *seat
+            .layout
+            .out_of
+            .get(&value.0)
+            .ok_or_else(|| Error::Backend {
+                op,
+                detail: format!(
+                    "value {} is no recurrence output this load extends",
+                    value.0
+                ),
+            })?;
         let ext = seat.ext_out[region];
         seat.ext.borrow_mut().insert(value.0, ext);
         Ok(ext)
     }
 
-    pub(crate) fn rs_ext_of(&self, op: &'static str, seat: &Seat, value: ValueId) -> Result<Tensor, Error> {
+    pub(crate) fn rs_ext_of(
+        &self,
+        op: &'static str,
+        seat: &Seat,
+        value: ValueId,
+    ) -> Result<Tensor, Error> {
         seat.ext
             .borrow()
             .get(&value.0)
@@ -163,12 +181,25 @@ impl Run<'_> {
             })
     }
 
-    pub(crate) fn rs_land(&self, op: &'static str, seat: &Seat, ext: Tensor, dest: ValueId) -> Result<(), Error> {
+    pub(crate) fn rs_land(
+        &self,
+        op: &'static str,
+        seat: &Seat,
+        ext: Tensor,
+        dest: ValueId,
+    ) -> Result<(), Error> {
         let target = self.tensor(dest);
         if crate::diag::on().rs_trace {
             eprintln!(
                 "rs_land {op}: ext buf {} rows {} width {} {:?} -> target buf {} rows {} width {} {:?}; window {:?}",
-                ext.buf, ext.rows, ext.width, ext.dtype, target.buf, target.rows, target.width, target.dtype,
+                ext.buf,
+                ext.rows,
+                ext.width,
+                ext.dtype,
+                target.buf,
+                target.rows,
+                target.width,
+                target.dtype,
                 self.qo_indptr_host()
             );
         }

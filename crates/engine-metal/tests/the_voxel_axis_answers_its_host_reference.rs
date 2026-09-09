@@ -6,6 +6,12 @@ use kernels_metal::Tensor;
 use kernels_metal::spatial::{attn, conv, norm, resample, rule};
 use model_ir::Dtype;
 
+type Case = (
+    rule::GridRule,
+    Box<dyn Fn([i32; 3]) -> [i32; 3]>,
+    &'static str,
+);
+
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
     x ^= x >> 33;
@@ -32,7 +38,9 @@ fn bf16_bytes(v: &[f32]) -> Vec<u8> {
 
 fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
         .collect()
 }
@@ -57,11 +65,21 @@ impl Rig {
     }
 
     fn f32s(&self, data: &[f32]) -> (Buffer, u32) {
-        self.raw(&data.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<_>>())
+        self.raw(
+            &data
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn i32s(&self, data: &[i32]) -> (Buffer, u32) {
-        self.raw(&data.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<_>>())
+        self.raw(
+            &data
+                .iter()
+                .flat_map(|i| i.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn raw(&self, bytes: &[u8]) -> (Buffer, u32) {
@@ -78,14 +96,21 @@ impl Rig {
     }
 
     fn read_bf16(&self, handle: u32, elements: usize) -> Vec<f32> {
-        bf16_floats(&self.handles.read(handle, (elements * 2) as u64).expect("read"))
+        bf16_floats(
+            &self
+                .handles
+                .read(handle, (elements * 2) as u64)
+                .expect("read"),
+        )
     }
 
     fn read_i32(&self, handle: u32, elements: usize) -> Vec<i32> {
         self.handles
             .read(handle, (elements * 4) as u64)
             .expect("read")
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
@@ -136,6 +161,7 @@ fn voxels(extents: &[[i32; 3]]) -> usize {
     extents.iter().map(|e| (e[0] * e[1] * e[2]) as usize).sum()
 }
 
+#[test]
 fn the_voxel_axis_answers_its_host_reference_every_case() {
     every_grid_rule_maps_the_box_its_host_twin_maps();
     the_convolution_answers_the_tap_walk();
@@ -145,7 +171,6 @@ fn the_voxel_axis_answers_its_host_reference_every_case() {
     the_frame_cache_stores_the_frames_its_next_chunk_pads_with();
 }
 
-#[test]
 fn every_grid_rule_maps_the_box_its_host_twin_maps() {
     let Some(rig) = Rig::open() else {
         eprintln!("not asked: no Metal device");
@@ -158,7 +183,7 @@ fn every_grid_rule_maps_the_box_its_host_twin_maps() {
     let gt = Tensor::new(hg, 2, 4, Dtype::I32);
     let ot = Tensor::new(ho, 2, 4, Dtype::I32);
 
-    let cases: Vec<(rule::GridRule, Box<dyn Fn([i32; 3]) -> [i32; 3]>, &str)> = vec![
+    let cases: Vec<Case> = vec![
         (
             rule::GridRule::Conv {
                 k: [1, 3, 3],
@@ -221,7 +246,7 @@ fn every_grid_rule_maps_the_box_its_host_twin_maps() {
         rig.fire(|s| rule::derive_grid(s, gt, r, ot).expect("the rule"));
         let got = rig.read_i32(ho, 8);
         let mut off = 0;
-        for (clip, chunk) in grid.chunks_exact(4).enumerate() {
+        for (clip, chunk) in grid.as_chunks::<4>().0.iter().enumerate() {
             let want = twin([chunk[0], chunk[1], chunk[2]]);
             let have = [got[clip * 4], got[clip * 4 + 1], got[clip * 4 + 2]];
             assert_eq!(want, have, "{name}: clip {clip}'s box");
@@ -245,7 +270,9 @@ fn the_convolution_answers_the_tap_walk() {
     let o_grid = grid.clone();
     let rows = voxels(&CLIPS);
 
-    let x: Vec<f32> = (0..(rows * C_IN) as u64).map(|at| bf16_round(unit(at))).collect();
+    let x: Vec<f32> = (0..(rows * C_IN) as u64)
+        .map(|at| bf16_round(unit(at)))
+        .collect();
     let w: Vec<f32> = (0..(C_OUT * taps * C_IN) as u64)
         .map(|at| bf16_round(0.2 * unit(at ^ 0x51)))
         .collect();
@@ -325,7 +352,9 @@ fn the_group_norm_answers_the_two_pass_reference() {
     let x: Vec<f32> = (0..(rows * C) as u64)
         .map(|at| bf16_round(20.0 + 3.0 * unit(at ^ 0x2222)))
         .collect();
-    let weight: Vec<f32> = (0..C as u64).map(|at| 1.0 + 0.2 * unit(at ^ 0x33)).collect();
+    let weight: Vec<f32> = (0..C as u64)
+        .map(|at| 1.0 + 0.2 * unit(at ^ 0x33))
+        .collect();
     let bias: Vec<f32> = (0..C as u64).map(|at| 0.1 * unit(at ^ 0x44)).collect();
 
     let (_xb, hx) = rig.bf16(&x);
@@ -371,8 +400,8 @@ fn the_group_norm_answers_the_two_pass_reference() {
                 }
             }
             let mean = values.iter().sum::<f32>() / values.len() as f32;
-            let var = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>()
-                / values.len() as f32;
+            let var =
+                values.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / values.len() as f32;
             let rstd = 1.0 / (var + 1e-5).sqrt();
             for v in 0..n {
                 for c in g * cg..(g + 1) * cg {
@@ -393,9 +422,15 @@ fn the_mid_block_attention_answers_the_plain_softmax() {
     const C: usize = 256;
     let grid = boxes(&CLIPS);
     let rows = voxels(&CLIPS);
-    let q: Vec<f32> = (0..(rows * C) as u64).map(|at| bf16_round(unit(at))).collect();
-    let k: Vec<f32> = (0..(rows * C) as u64).map(|at| bf16_round(unit(at ^ 0xA1))).collect();
-    let v: Vec<f32> = (0..(rows * C) as u64).map(|at| bf16_round(unit(at ^ 0xB2))).collect();
+    let q: Vec<f32> = (0..(rows * C) as u64)
+        .map(|at| bf16_round(unit(at)))
+        .collect();
+    let k: Vec<f32> = (0..(rows * C) as u64)
+        .map(|at| bf16_round(unit(at ^ 0xA1)))
+        .collect();
+    let v: Vec<f32> = (0..(rows * C) as u64)
+        .map(|at| bf16_round(unit(at ^ 0xB2)))
+        .collect();
     let scale = (C as f32).sqrt().recip();
 
     let (_qb, hq) = rig.bf16(&q);
@@ -405,7 +440,10 @@ fn the_mid_block_attention_answers_the_plain_softmax() {
     let (_yb, hy) = rig.empty((rows * C) as u64 * 2);
     let plane = |h: u32| Tensor::new(h, rows as u32, C as u32, Dtype::Bf16);
 
-    for (segment, name) in [(attn::Segment::Clip, "clip"), (attn::Segment::Frames(1), "frames1")] {
+    for (segment, name) in [
+        (attn::Segment::Clip, "clip"),
+        (attn::Segment::Frames(1), "frames1"),
+    ] {
         rig.fire(|s| {
             attn::attention(
                 s,
@@ -436,9 +474,7 @@ fn the_mid_block_attention_answers_the_plain_softmax() {
                     }
                 };
                 let scores: Vec<f32> = (begin..end)
-                    .map(|j| {
-                        (0..C).map(|c| q[row * C + c] * k[j * C + c]).sum::<f32>() * scale
-                    })
+                    .map(|j| (0..C).map(|c| q[row * C + c] * k[j * C + c]).sum::<f32>() * scale)
                     .collect();
                 let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let weights: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
@@ -472,7 +508,9 @@ fn the_reshapes_land_the_reference_ordering() {
     const C: usize = 8;
     let grid = boxes(&CLIPS);
     let rows = voxels(&CLIPS);
-    let x: Vec<f32> = (0..(rows * C * 8) as u64).map(|at| bf16_round(unit(at))).collect();
+    let x: Vec<f32> = (0..(rows * C * 8) as u64)
+        .map(|at| bf16_round(unit(at)))
+        .collect();
     let (_xb, hx) = rig.bf16(&x);
     let (_gb, hg) = rig.i32s(&grid);
     let gt = Tensor::new(hg, 2, 4, Dtype::I32);
@@ -513,13 +551,18 @@ fn the_reshapes_land_the_reference_ordering() {
     }
     within_a_bf16_ulp("upsample_nearest", &want, &rig.read_bf16(hy, up_rows * C));
 
-    let small: Vec<[i32; 3]> = CLIPS.iter().map(|e| [e[0], e[1] / 2 * 2, e[2] / 2 * 2]).collect();
+    let small: Vec<[i32; 3]> = CLIPS
+        .iter()
+        .map(|e| [e[0], e[1] / 2 * 2, e[2] / 2 * 2])
+        .collect();
     let downed: Vec<[i32; 3]> = small.iter().map(|e| [e[0], e[1] / 2, e[2] / 2]).collect();
     let small_grid = boxes(&small);
     let down_grid = boxes(&downed);
     let small_rows = voxels(&small);
     let down_rows = voxels(&downed);
-    let src: Vec<f32> = (0..(small_rows * C) as u64).map(|at| bf16_round(unit(at ^ 0x99))).collect();
+    let src: Vec<f32> = (0..(small_rows * C) as u64)
+        .map(|at| bf16_round(unit(at ^ 0x99)))
+        .collect();
     let (_sb, hs) = rig.bf16(&src);
     let (_sgb, hsg) = rig.i32s(&small_grid);
     let (_dgb, hdg) = rig.i32s(&down_grid);
@@ -565,18 +608,18 @@ fn the_frame_cache_stores_the_frames_its_next_chunk_pads_with() {
     let grid = boxes(&CLIPS);
     let rows = voxels(&CLIPS);
 
-    let cache_rows: usize = CLIPS
-        .iter()
-        .map(|e| (FRAMES * e[1] * e[2]) as usize)
-        .sum();
+    let cache_rows: usize = CLIPS.iter().map(|e| (FRAMES * e[1] * e[2]) as usize).sum();
     let stride: usize = CLIPS
         .iter()
         .map(|e| (FRAMES * e[1] * e[2]) as usize)
         .max()
         .expect("a clip");
 
-    let x: Vec<f32> =
-        bf16_floats(&bf16_bytes(&(0..rows * C).map(|i| unit(i as u64) * 4.0).collect::<Vec<_>>()));
+    let x: Vec<f32> = bf16_floats(&bf16_bytes(
+        &(0..rows * C)
+            .map(|i| unit(i as u64) * 4.0)
+            .collect::<Vec<_>>(),
+    ));
     let old: Vec<f32> = bf16_floats(&bf16_bytes(
         &(0..cache_rows * C)
             .map(|i| unit(i as u64 + 7717) * 4.0)
@@ -624,7 +667,10 @@ fn the_frame_cache_stores_the_frames_its_next_chunk_pads_with() {
         cache_at += FRAMES as usize * plane;
     }
     let got = rig.read_bf16(hslab, slots.len() * stride * C);
-    assert_eq!(want, got, "a frame-cache store moves its rows and rounds nothing");
+    assert_eq!(
+        want, got,
+        "a frame-cache store moves its rows and rounds nothing"
+    );
     eprintln!("cache store: bit-exact over {} slabbed elements", got.len());
 
     let (_rb, hround) = rig.empty((cache_rows * C) as u64 * 2);
@@ -649,6 +695,12 @@ fn the_frame_cache_stores_the_frames_its_next_chunk_pads_with() {
         at += rows;
     }
     let round = rig.read_bf16(hround, cache_rows * C);
-    assert_eq!(back, round, "a gather is the store's inverse, slot for slot");
-    eprintln!("cache gather: bit-exact over {} cached elements", round.len());
+    assert_eq!(
+        back, round,
+        "a gather is the store's inverse, slot for slot"
+    );
+    eprintln!(
+        "cache gather: bit-exact over {} cached elements",
+        round.len()
+    );
 }

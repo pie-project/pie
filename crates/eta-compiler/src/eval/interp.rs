@@ -53,19 +53,25 @@ impl Value {
             Dtype::F32 | Dtype::I32 | Dtype::U32 if !bytes.len().is_multiple_of(4) => None,
             Dtype::F32 => Some(Value::F32(
                 bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
             )),
             Dtype::I32 => Some(Value::I32(
                 bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
             )),
             Dtype::U32 => Some(Value::U32(
                 bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
             )),
@@ -144,10 +150,7 @@ pub enum HostError {
 #[non_exhaustive]
 pub enum StepError {
     Poisoned,
-    KernelFault {
-        name: String,
-        message: String,
-    },
+    KernelFault { name: String, message: String },
     MissingIntrinsic(IntrinsicId),
     Fault(String),
 }
@@ -562,19 +565,25 @@ pub(crate) fn const_value(dtype: Dtype, shape: Shape, data: &[u8]) -> Value {
     match dtype {
         Dtype::Bool => Value::Bool(data.iter().take(n).map(|&b| b != 0).collect()),
         Dtype::F32 => Value::F32(
-            data.chunks_exact(4)
+            data.as_chunks::<4>()
+                .0
+                .iter()
                 .take(n)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),
         Dtype::I32 => Value::I32(
-            data.chunks_exact(4)
+            data.as_chunks::<4>()
+                .0
+                .iter()
                 .take(n)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),
         Dtype::U32 => Value::U32(
-            data.chunks_exact(4)
+            data.as_chunks::<4>()
+                .0
+                .iter()
                 .take(n)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),

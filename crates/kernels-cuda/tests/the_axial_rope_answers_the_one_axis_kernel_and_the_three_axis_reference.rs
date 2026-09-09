@@ -61,12 +61,12 @@ fn reference(
     o
 }
 
+#[test]
 fn the_axial_rope_answers_the_one_axis_kernel_and_the_three_axis_reference_every_case() {
     one_axis_is_the_scalar_kernels_own_rotation();
     three_axes_answer_the_reference_in_every_form();
 }
 
-#[test]
 fn one_axis_is_the_scalar_kernels_own_rotation() {
     let mut lcg = Lcg::seeded(0xa1e5);
     let (x_raw, _) = lcg.row(ROWS * WIDTH);

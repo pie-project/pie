@@ -157,10 +157,8 @@ const DEFAULT_FRAME_SIZE: usize = 2;
 static FRAME_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn configured_submit_depth() -> usize {
-    ::engine::runahead::Runahead::of(
-        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
-    )
-    .submit_depth()
+    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
+        .submit_depth()
 }
 
 pub fn set_seal_default_ready(ready: bool) {
@@ -209,17 +207,13 @@ pub fn reconfigure(frame_size: usize, dispatch_depth: usize) -> Result<(), Recon
 }
 
 pub fn channel_capacity() -> usize {
-    ::engine::runahead::Runahead::of(
-        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
-    )
-    .channel_capacity(configured_frame_size())
+    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
+        .channel_capacity(configured_frame_size())
 }
 
 pub fn run_ahead_window() -> usize {
-    ::engine::runahead::Runahead::of(
-        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
-    )
-    .submit_depth()
+    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
+        .submit_depth()
         * configured_frame_size()
 }
 
@@ -337,9 +331,8 @@ pub fn submit_async(
 }
 
 pub(crate) fn device_domain(engine_idx: usize) -> ::engine::MemoryDomain {
-    crate::engine::get_spec(engine_idx).map_or(::engine::MemoryDomain::HostPinned, |s| {
-        s.device_domain
-    })
+    crate::engine::get_spec(engine_idx)
+        .map_or(::engine::MemoryDomain::HostPinned, |s| s.device_domain)
 }
 
 pub(crate) fn nudge(engine_idx: usize) {

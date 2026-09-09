@@ -71,7 +71,8 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
     let (result_bases, producer) = result_layout(&stage_program.ops);
     let mut keep = live_ops(stage_program, &result_bases, &producer);
     let redundant = redundant_select_broadcasts(stage_program, original_types, &result_bases);
-    let folded_broadcasts = row_vector_broadcasts(stage_program, original_types, &producer, &mut keep);
+    let folded_broadcasts =
+        row_vector_broadcasts(stage_program, original_types, &producer, &mut keep);
 
     let mut value_map = vec![u32::MAX; original_types.len()];
     let mut normalized_ops: Vec<Op> = Vec::new();
@@ -386,12 +387,12 @@ mod value_domain_tests {
     use super::*;
     use crate::plan::compile::signature::stage_signature;
 
+    #[test]
     fn normalize_every_case() {
         the_signature_still_depends_on_value_domains();
         reductions_are_per_row_by_falling_through();
     }
 
-    #[test]
     fn the_signature_still_depends_on_value_domains() {
         let mut stage = NormalizedStage {
             stage: Stage::Epilogue,

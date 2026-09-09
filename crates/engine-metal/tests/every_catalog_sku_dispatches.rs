@@ -77,8 +77,14 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
         "kimik3-bf16-mxfp4-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
     ),
-    ("hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4", &["collective.all_reduce"]),
-    ("hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4", &["collective.all_reduce"]),
+    (
+        "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4",
+        &["collective.all_reduce"],
+    ),
+    (
+        "hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4",
+        &["collective.all_reduce"],
+    ),
     ("mini-dit-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
     ("mini-dit-bf16-kv-bf16-tp4", &["collective.all_reduce"]),
 ];
@@ -111,6 +117,7 @@ fn stopped() -> BTreeMap<String, BTreeSet<String>> {
     stopped
 }
 
+#[test]
 fn every_catalog_sku_dispatches_every_case() {
     every_catalog_sku_dispatches();
     no_exemption_outlives_its_reason();
@@ -118,7 +125,6 @@ fn every_catalog_sku_dispatches_every_case() {
     every_catalog_sku_traces();
 }
 
-#[test]
 fn every_catalog_sku_dispatches() {
     let refused = refused();
     let exempt: BTreeMap<&str, &[&str]> = CANNOT_SERVE.iter().copied().collect();

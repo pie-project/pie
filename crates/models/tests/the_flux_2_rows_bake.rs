@@ -33,6 +33,7 @@ fn seams(plan: &Trace) -> BTreeSet<&str> {
     plan.seams.iter().map(|s| s.seam.as_str()).collect()
 }
 
+#[test]
 fn the_flux_2_rows_bake_every_case() {
     both_rows_trace_on_every_platform_with_the_seams_and_caches_they_declare();
     the_denoise_ports_are_the_ones_the_facts_declare();
@@ -44,7 +45,6 @@ fn the_flux_2_rows_bake_every_case() {
     the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk();
 }
 
-#[test]
 fn both_rows_trace_on_every_platform_with_the_seams_and_caches_they_declare() {
     for platform in PLATFORMS {
         let klein = trace(KLEIN, platform);

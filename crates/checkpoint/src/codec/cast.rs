@@ -220,8 +220,10 @@ fn map_elements<const IN: usize, const OUT: usize>(
     if !src.len().is_multiple_of(IN) || src.len() / IN * OUT != dst.len() {
         return Err(invalid("cast chunk widths do not match its buffers"));
     }
-    for (input, output) in src.chunks_exact(IN).zip(dst.chunks_exact_mut(OUT)) {
-        output.copy_from_slice(&convert(input.try_into().unwrap()));
+    let (inputs, _) = src.as_chunks::<IN>();
+    let (outputs, _) = dst.as_chunks_mut::<OUT>();
+    for (input, output) in inputs.iter().zip(outputs.iter_mut()) {
+        *output = convert(*input);
     }
     Ok(())
 }

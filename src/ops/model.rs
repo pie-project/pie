@@ -515,18 +515,17 @@ impl crate::ui::Report for ModelInfo {
                 .unwrap_or(0);
             for reading in &generative.readings {
                 println!(
-                    "  {}  {}  {}  -> {} {}",
+                    "  {}  {}  {:<binds_width$}  -> {} {}",
                     palette.accent(format!("{:<name_width$}", reading.name)),
                     palette.dim(format!("#{}", reading.index)),
-                    format!("{:<binds_width$}", binds_of(reading)),
+                    binds_of(reading),
                     reading.readout,
                     reading.readout_width,
                 );
                 if !reading.ports.is_empty() {
                     println!(
-                        "  {}  {}  {}  {}",
+                        "  {}      {}  {}",
                         " ".repeat(name_width),
-                        "  ",
                         " ".repeat(binds_width),
                         palette.dim(format!("<- {}", reading.ports.join(", "))),
                     );

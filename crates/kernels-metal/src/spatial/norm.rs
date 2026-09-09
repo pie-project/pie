@@ -87,10 +87,8 @@ pub fn group_norm(
         ],
     )?;
     ctx.fire(
-        Fire::at(FILE, "spatial_group_norm_finalize").apply(Grid::of(
-            [groups * 32, clips, 1],
-            [32, 1, 1],
-        )),
+        Fire::at(FILE, "spatial_group_norm_finalize")
+            .apply(Grid::of([groups * 32, clips, 1], [32, 1, 1])),
         &[
             partials.arg(),
             stats.arg_mut(),

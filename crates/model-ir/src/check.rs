@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
 use crate::ops::{Attention, CustomCuda, Elementwise, Layout, Linear, RaggedMask, Spatial};
-use crate::{Def, Dim, Dtype, Operands, Operation, Trace, StructKind, Ty, ValueId};
+use crate::{Def, Dim, Dtype, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Site {
@@ -41,27 +41,128 @@ pub enum Expect {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fault {
-    OutOfRange { site: Site, id: ValueId, len: usize },
-    ForeignOutput { node: usize, op: &'static str, id: ValueId, declared: DefKind },
-    DoubleOutput { id: ValueId, first: usize, first_op: &'static str, second: usize, second_op: &'static str },
-    PhantomDef { id: ValueId, node: usize, op: &'static str },
-    DefNodeOutOfRange { id: ValueId, node: usize, len: usize },
-    UseBeforeDef { node: usize, op: &'static str, input: ValueId, arm: Option<ValueId>, def_node: usize },
-    WeightOutOfRange { id: ValueId, index: u32, len: usize },
-    CacheOutOfRange { id: ValueId, index: u32, len: usize },
-    SymbolicWeight { id: ValueId, axis: usize, dim: Dim },
-    SymbolicAxis { id: ValueId, axis: usize, dim: Dim },
-    AliasOutUnknown { node: usize, op: &'static str, out: ValueId },
-    AliasInUnknown { node: usize, op: &'static str, input: ValueId },
-    AliasTyMismatch { node: usize, op: &'static str, out: ValueId, input: ValueId, out_ty: Ty, in_ty: Ty },
-    FoldThenRead { fold: usize, fold_op: &'static str, input: ValueId, node: usize, op: &'static str, arm: Option<ValueId> },
-    StructDef { id: ValueId, kind: StructKind, def: DefKind },
-    StructArm { merge: ValueId, arm: ValueId },
-    MergeTooFew { id: ValueId, arms: usize },
-    MergeArmTy { merge: ValueId, arm: ValueId, merge_ty: Ty, arm_ty: Ty },
-    PortMissing { node: usize, op: &'static str, port: Port },
-    PortKind { node: usize, op: &'static str, port: Port, id: ValueId, want: Expect, ty: Ty, def: DefKind },
-    PortDtype { node: usize, op: &'static str, port: Port, id: ValueId, want: Dtype, ty: Ty },
+    OutOfRange {
+        site: Site,
+        id: ValueId,
+        len: usize,
+    },
+    ForeignOutput {
+        node: usize,
+        op: &'static str,
+        id: ValueId,
+        declared: DefKind,
+    },
+    DoubleOutput {
+        id: ValueId,
+        first: usize,
+        first_op: &'static str,
+        second: usize,
+        second_op: &'static str,
+    },
+    PhantomDef {
+        id: ValueId,
+        node: usize,
+        op: &'static str,
+    },
+    DefNodeOutOfRange {
+        id: ValueId,
+        node: usize,
+        len: usize,
+    },
+    UseBeforeDef {
+        node: usize,
+        op: &'static str,
+        input: ValueId,
+        arm: Option<ValueId>,
+        def_node: usize,
+    },
+    WeightOutOfRange {
+        id: ValueId,
+        index: u32,
+        len: usize,
+    },
+    CacheOutOfRange {
+        id: ValueId,
+        index: u32,
+        len: usize,
+    },
+    SymbolicWeight {
+        id: ValueId,
+        axis: usize,
+        dim: Dim,
+    },
+    SymbolicAxis {
+        id: ValueId,
+        axis: usize,
+        dim: Dim,
+    },
+    AliasOutUnknown {
+        node: usize,
+        op: &'static str,
+        out: ValueId,
+    },
+    AliasInUnknown {
+        node: usize,
+        op: &'static str,
+        input: ValueId,
+    },
+    AliasTyMismatch {
+        node: usize,
+        op: &'static str,
+        out: ValueId,
+        input: ValueId,
+        out_ty: Ty,
+        in_ty: Ty,
+    },
+    FoldThenRead {
+        fold: usize,
+        fold_op: &'static str,
+        input: ValueId,
+        node: usize,
+        op: &'static str,
+        arm: Option<ValueId>,
+    },
+    StructDef {
+        id: ValueId,
+        kind: StructKind,
+        def: DefKind,
+    },
+    StructArm {
+        merge: ValueId,
+        arm: ValueId,
+    },
+    MergeTooFew {
+        id: ValueId,
+        arms: usize,
+    },
+    MergeArmTy {
+        merge: ValueId,
+        arm: ValueId,
+        merge_ty: Ty,
+        arm_ty: Ty,
+    },
+    PortMissing {
+        node: usize,
+        op: &'static str,
+        port: Port,
+    },
+    PortKind {
+        node: usize,
+        op: &'static str,
+        port: Port,
+        id: ValueId,
+        want: Expect,
+        ty: Ty,
+        def: DefKind,
+    },
+    PortDtype {
+        node: usize,
+        op: &'static str,
+        port: Port,
+        id: ValueId,
+        want: Dtype,
+        ty: Ty,
+    },
 }
 
 pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
@@ -86,24 +187,41 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
 
         for &id in &outs {
             if !in_range(id) {
-                faults.push(Fault::OutOfRange { site: Site::Output { node: j, op }, id, len });
+                faults.push(Fault::OutOfRange {
+                    site: Site::Output { node: j, op },
+                    id,
+                    len,
+                });
                 continue;
             }
             match owner[id.0 as usize] {
                 Some(first) => faults.push(Fault::DoubleOutput {
-                    id, first, first_op: trace.nodes[first].op.name(), second: j, second_op: op,
+                    id,
+                    first,
+                    first_op: trace.nodes[first].op.name(),
+                    second: j,
+                    second_op: op,
                 }),
                 None => owner[id.0 as usize] = Some(j),
             }
             match &trace.values[id.0 as usize].def {
                 Def::Op(i) if *i as usize == j => matched[id.0 as usize] = true,
-                other => faults.push(Fault::ForeignOutput { node: j, op, id, declared: DefKind::of(other) }),
+                other => faults.push(Fault::ForeignOutput {
+                    node: j,
+                    op,
+                    id,
+                    declared: DefKind::of(other),
+                }),
             }
         }
 
         for &id in &ins {
             if !in_range(id) {
-                faults.push(Fault::OutOfRange { site: Site::Input { node: j, op }, id, len });
+                faults.push(Fault::OutOfRange {
+                    site: Site::Input { node: j, op },
+                    id,
+                    len,
+                });
                 continue;
             }
             seen.clear();
@@ -111,9 +229,16 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
         }
 
         for &(out, input) in &pairs {
-            for (id, side) in [(out, Site::Alias { node: j, op }), (input, Site::Alias { node: j, op })] {
+            for (id, side) in [
+                (out, Site::Alias { node: j, op }),
+                (input, Site::Alias { node: j, op }),
+            ] {
                 if !in_range(id) {
-                    faults.push(Fault::OutOfRange { site: side, id, len });
+                    faults.push(Fault::OutOfRange {
+                        site: side,
+                        id,
+                        len,
+                    });
                 }
             }
             if in_range(out) && !outs.contains(&out) {
@@ -123,10 +248,18 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                 faults.push(Fault::AliasInUnknown { node: j, op, input });
             }
             if in_range(out) && in_range(input) {
-                let (out_ty, in_ty) = (&trace.values[out.0 as usize].ty, &trace.values[input.0 as usize].ty);
+                let (out_ty, in_ty) = (
+                    &trace.values[out.0 as usize].ty,
+                    &trace.values[input.0 as usize].ty,
+                );
                 if out_ty != in_ty {
                     faults.push(Fault::AliasTyMismatch {
-                        node: j, op, out, input, out_ty: out_ty.clone(), in_ty: in_ty.clone(),
+                        node: j,
+                        op,
+                        out,
+                        input,
+                        out_ty: out_ty.clone(),
+                        in_ty: in_ty.clone(),
                     });
                 }
                 folded[input.0 as usize].get_or_insert((j, op));
@@ -152,7 +285,12 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                 Expect::Tensor(dtype) => {
                     if !matches!(&decl.ty, Ty::Tensor { dtype: d, .. } if *d == dtype) {
                         faults.push(Fault::PortDtype {
-                            node: j, op, port, id, want: dtype, ty: decl.ty.clone(),
+                            node: j,
+                            op,
+                            port,
+                            id,
+                            want: dtype,
+                            ty: decl.ty.clone(),
                         });
                     }
                     false
@@ -160,8 +298,13 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             };
             if wrong_kind {
                 faults.push(Fault::PortKind {
-                    node: j, op, port, id, want,
-                    ty: decl.ty.clone(), def: DefKind::of(&decl.def),
+                    node: j,
+                    op,
+                    port,
+                    id,
+                    want,
+                    ty: decl.ty.clone(),
+                    def: DefKind::of(&decl.def),
                 });
             }
         }
@@ -188,13 +331,21 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             Ty::Tensor { .. } => None,
         };
         if let (Some(kind), false) = (struct_kind, matches!(decl.def, Def::Op(_))) {
-            faults.push(Fault::StructDef { id, kind, def: DefKind::of(&decl.def) });
+            faults.push(Fault::StructDef {
+                id,
+                kind,
+                def: DefKind::of(&decl.def),
+            });
         }
         match &decl.def {
             Def::Input(_) => {}
             Def::Weight(k) => {
                 if *k as usize >= trace.params.len() {
-                    faults.push(Fault::WeightOutOfRange { id, index: *k, len: trace.params.len() });
+                    faults.push(Fault::WeightOutOfRange {
+                        id,
+                        index: *k,
+                        len: trace.params.len(),
+                    });
                 }
                 if let Ty::Tensor { shape, .. } = &decl.ty {
                     for (axis, &dim) in shape.iter().enumerate() {
@@ -206,23 +357,42 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             }
             Def::Cache(k) => {
                 if *k as usize >= trace.caches.len() {
-                    faults.push(Fault::CacheOutOfRange { id, index: *k, len: trace.caches.len() });
+                    faults.push(Fault::CacheOutOfRange {
+                        id,
+                        index: *k,
+                        len: trace.caches.len(),
+                    });
                 }
             }
             Def::Op(i) => {
                 if *i as usize >= trace.nodes.len() {
-                    faults.push(Fault::DefNodeOutOfRange { id, node: *i as usize, len: trace.nodes.len() });
+                    faults.push(Fault::DefNodeOutOfRange {
+                        id,
+                        node: *i as usize,
+                        len: trace.nodes.len(),
+                    });
                 } else if !matched[idx] {
-                    faults.push(Fault::PhantomDef { id, node: *i as usize, op: trace.nodes[*i as usize].op.name() });
+                    faults.push(Fault::PhantomDef {
+                        id,
+                        node: *i as usize,
+                        op: trace.nodes[*i as usize].op.name(),
+                    });
                 }
             }
             Def::Merge(arms) => {
                 if arms.len() < 2 {
-                    faults.push(Fault::MergeTooFew { id, arms: arms.len() });
+                    faults.push(Fault::MergeTooFew {
+                        id,
+                        arms: arms.len(),
+                    });
                 }
                 for &(arm, _) in arms {
                     if !in_range(arm) {
-                        faults.push(Fault::OutOfRange { site: Site::MergeArm { merge: id }, id: arm, len });
+                        faults.push(Fault::OutOfRange {
+                            site: Site::MergeArm { merge: id },
+                            id: arm,
+                            len,
+                        });
                         continue;
                     }
                     let arm_ty = &trace.values[arm.0 as usize].ty;
@@ -231,18 +401,21 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                     }
                     if arm_ty != &decl.ty {
                         faults.push(Fault::MergeArmTy {
-                            merge: id, arm, merge_ty: decl.ty.clone(), arm_ty: arm_ty.clone(),
+                            merge: id,
+                            arm,
+                            merge_ty: decl.ty.clone(),
+                            arm_ty: arm_ty.clone(),
                         });
                     }
                 }
             }
         }
-        if !matches!(decl.def, Def::Weight(_)) {
-            if let Ty::Tensor { shape, .. } = &decl.ty {
-                for (axis, &dim) in shape.iter().enumerate().skip(1) {
-                    if !matches!(dim, Dim::Const(_)) {
-                        faults.push(Fault::SymbolicAxis { id, axis, dim });
-                    }
+        if !matches!(decl.def, Def::Weight(_))
+            && let Ty::Tensor { shape, .. } = &decl.ty
+        {
+            for (axis, &dim) in shape.iter().enumerate().skip(1) {
+                if !matches!(dim, Dim::Const(_)) {
+                    faults.push(Fault::SymbolicAxis { id, axis, dim });
                 }
             }
         }
@@ -251,12 +424,22 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
     for seam in &trace.seams {
         for &id in &seam.values {
             if !in_range(id) {
-                faults.push(Fault::OutOfRange { site: Site::Seam { seam: seam.seam.clone() }, id, len });
+                faults.push(Fault::OutOfRange {
+                    site: Site::Seam {
+                        seam: seam.seam.clone(),
+                    },
+                    id,
+                    len,
+                });
             }
         }
     }
 
-    if faults.is_empty() { Ok(()) } else { Err(faults) }
+    if faults.is_empty() {
+        Ok(())
+    } else {
+        Err(faults)
+    }
 }
 
 pub fn checked(trace: Trace) -> Result<Trace, Vec<Fault>> {
@@ -265,13 +448,22 @@ pub fn checked(trace: Trace) -> Result<Trace, Vec<Fault>> {
 }
 
 fn available(
-    trace: &Trace, root: ValueId, id: ValueId, node: usize, op: &'static str,
-    seen: &mut HashSet<u32>, faults: &mut Vec<Fault>,
+    trace: &Trace,
+    root: ValueId,
+    id: ValueId,
+    node: usize,
+    op: &'static str,
+    seen: &mut HashSet<u32>,
+    faults: &mut Vec<Fault>,
 ) {
     match &trace.values[id.0 as usize].def {
         Def::Op(i) if (*i as usize) < trace.nodes.len() && *i as usize >= node => {
             faults.push(Fault::UseBeforeDef {
-                node, op, input: root, arm: (id != root).then_some(id), def_node: *i as usize,
+                node,
+                op,
+                input: root,
+                arm: (id != root).then_some(id),
+                def_node: *i as usize,
             });
         }
         Def::Merge(arms) => {
@@ -286,8 +478,13 @@ fn available(
 }
 
 fn intact(
-    trace: &Trace, folded: &[Option<(usize, &'static str)>], root: ValueId, id: ValueId,
-    at: usize, seen: &mut HashSet<u32>, faults: &mut Vec<Fault>,
+    trace: &Trace,
+    folded: &[Option<(usize, &'static str)>],
+    root: ValueId,
+    id: ValueId,
+    at: usize,
+    seen: &mut HashSet<u32>,
+    faults: &mut Vec<Fault>,
 ) {
     let by = &trace.nodes[at];
     if let Some((fold, fold_op)) = folded[id.0 as usize]
@@ -295,8 +492,11 @@ fn intact(
         && by.guard.implies(&trace.nodes[fold].guard)
     {
         faults.push(Fault::FoldThenRead {
-            fold, fold_op, input: id,
-            node: at, op: by.op.name(),
+            fold,
+            fold_op,
+            input: id,
+            node: at,
+            op: by.op.name(),
             arm: (id != root).then_some(root),
         });
     }
@@ -330,12 +530,14 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::Prefill { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE)],
             Attention::Masked { .. } => &[(In(1), PREFILL_PLAN), (In(3), CACHE)],
             Attention::Dense { .. } => &[(In(3), I32)],
-            Attention::Ragged { mask: RaggedMask::ReferenceSelfOnly { .. }, .. } => {
-                &[(In(3), I32), (In(4), I32), (In(5), I32), (In(6), I32)]
-            }
-            Attention::Ragged { mask: RaggedMask::RelativeBias { .. }, .. } => {
-                &[(In(3), I32), (In(4), I32), (In(5), F32)]
-            }
+            Attention::Ragged {
+                mask: RaggedMask::ReferenceSelfOnly { .. },
+                ..
+            } => &[(In(3), I32), (In(4), I32), (In(5), I32), (In(6), I32)],
+            Attention::Ragged {
+                mask: RaggedMask::RelativeBias { .. },
+                ..
+            } => &[(In(3), I32), (In(4), I32), (In(5), F32)],
             Attention::Ragged { .. } => &[(In(3), I32), (In(4), I32)],
             Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
@@ -362,9 +564,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::SsmCausalConv1d { .. }
             | Attention::SsmCausalConv1dChunked { .. }
             | Attention::ShortConv { .. }
-            | Attention::ShortConvChunked { .. } => {
-                &[(In(2), CACHE)]
-            }
+            | Attention::ShortConvChunked { .. } => &[(In(2), CACHE)],
             Attention::BlockDynConv { .. } => &[],
             Attention::SelectorWalk { .. } => &[(In(0), I32), (In(1), F32), (Out(0), I32)],
             Attention::SsmGdnPrep { .. } => &[(Out(0), F32)],
@@ -375,15 +575,13 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::IndexLayernormRope { .. } | Attention::IndexRope { .. } => &[(In(1), I32)],
             Attention::IndexTopk { .. } => &[(In(2), CACHE), (Out(0), I32)],
             Attention::IndexKvAppend { .. } => &[(In(1), CACHE), (In(2), I32), (In(3), I32)],
-            Attention::PoolBoundaryDecode { .. } | Attention::PoolBoundaryPrefill { .. } => {
-                &[
-                    (In(0), I32),
-                    (In(1), U8),
-                    (Out(0), I32),
-                    (Out(1), I32),
-                    (Out(2), I32),
-                ]
-            }
+            Attention::PoolBoundaryDecode { .. } | Attention::PoolBoundaryPrefill { .. } => &[
+                (In(0), I32),
+                (In(1), U8),
+                (Out(0), I32),
+                (Out(1), I32),
+                (Out(2), I32),
+            ],
             Attention::PoolStateWrite { .. } => &[(In(2), CACHE), (In(3), I32), (In(4), I32)],
             Attention::PoolGather { ape: None, .. } => {
                 &[(In(0), I32), (In(1), I32), (In(2), CACHE)]
@@ -391,15 +589,23 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::PoolGather { ape: Some(_), .. } => {
                 &[(In(0), I32), (In(1), I32), (In(2), CACHE), (In(3), F32)]
             }
-            Attention::PoolKvAppend { .. } => {
-                &[(In(1), I32), (In(2), I32), (In(3), CACHE), (In(4), I32), (In(5), I32)]
-            }
+            Attention::PoolKvAppend { .. } => &[
+                (In(1), I32),
+                (In(2), I32),
+                (In(3), CACHE),
+                (In(4), I32),
+                (In(5), I32),
+            ],
             Attention::PoolLse { .. } => {
                 &[(In(1), I32), (In(2), I32), (In(3), CACHE), (Out(1), F32)]
             }
-            Attention::PoolLseSelected { .. } => {
-                &[(In(1), I32), (In(2), I32), (In(3), I32), (In(4), CACHE), (Out(1), F32)]
-            }
+            Attention::PoolLseSelected { .. } => &[
+                (In(1), I32),
+                (In(2), I32),
+                (In(3), I32),
+                (In(4), CACHE),
+                (Out(1), F32),
+            ],
             Attention::PleNgramIds { .. } | Attention::PleNgramIdsChunked { .. } => {
                 &[(In(0), I32), (In(1), CACHE), (Out(0), I32)]
             }
@@ -444,12 +650,22 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 &[(In(1), I32)]
             }
             Elementwise::RopeAxes { .. } => &[(In(1), F32)],
-            Elementwise::Modulate { lane_of_row: Some(_), .. }
-            | Elementwise::NormModulate { lane_of_row: Some(_), .. } => &[(In(2), I32)],
-            Elementwise::GatedResidualAdd { lane_of_row: Some(_), .. } => &[(In(3), I32)],
-            Elementwise::GatedResidualNormModulate { lane_of_row: Some(_), .. } => {
-                &[(In(4), I32)]
+            Elementwise::Modulate {
+                lane_of_row: Some(_),
+                ..
             }
+            | Elementwise::NormModulate {
+                lane_of_row: Some(_),
+                ..
+            } => &[(In(2), I32)],
+            Elementwise::GatedResidualAdd {
+                lane_of_row: Some(_),
+                ..
+            } => &[(In(3), I32)],
+            Elementwise::GatedResidualNormModulate {
+                lane_of_row: Some(_),
+                ..
+            } => &[(In(4), I32)],
             Elementwise::Sinusoid { .. } => &[(In(0), F32), (Out(0), F32)],
             Elementwise::RelativeBucketBias { .. } => &[(Out(0), F32)],
             Elementwise::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
@@ -488,10 +704,18 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::HcMix { .. }
             | Elementwise::HcInject { .. }
             | Elementwise::PleGate { .. }
-            | Elementwise::Modulate { lane_of_row: None, .. }
-            | Elementwise::NormModulate { lane_of_row: None, .. }
-            | Elementwise::GatedResidualAdd { lane_of_row: None, .. }
-            | Elementwise::GatedResidualNormModulate { lane_of_row: None, .. }
+            | Elementwise::Modulate {
+                lane_of_row: None, ..
+            }
+            | Elementwise::NormModulate {
+                lane_of_row: None, ..
+            }
+            | Elementwise::GatedResidualAdd {
+                lane_of_row: None, ..
+            }
+            | Elementwise::GatedResidualNormModulate {
+                lane_of_row: None, ..
+            }
             | Elementwise::Silu { .. }
             | Elementwise::Gelu { .. }
             | Elementwise::Tanh { .. }
@@ -571,7 +795,9 @@ impl Display for T<'_> {
             Ty::Tensor { shape, dtype } => {
                 write!(f, "{}[", N(*dtype))?;
                 for (i, dim) in shape.iter().enumerate() {
-                    if i > 0 { f.write_str(", ")?; }
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
                     write!(f, "{}", D(*dim))?;
                 }
                 f.write_str("]")
@@ -640,26 +866,78 @@ impl Display for Fault {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Fault::OutOfRange { site, id, len } => {
-                write!(f, "{site} {} is out of range — the plan declares {len} values", V(*id))
+                write!(
+                    f,
+                    "{site} {} is out of range — the plan declares {len} values",
+                    V(*id)
+                )
             }
-            Fault::ForeignOutput { node, op, id, declared } => {
-                write!(f, "node {node} ({op}): output {} is declared as {declared}, not as this node's output", V(*id))
+            Fault::ForeignOutput {
+                node,
+                op,
+                id,
+                declared,
+            } => {
+                write!(
+                    f,
+                    "node {node} ({op}): output {} is declared as {declared}, not as this node's output",
+                    V(*id)
+                )
             }
-            Fault::DoubleOutput { id, first, first_op, second, second_op: _ } if first == second => {
-                write!(f, "node {first} ({first_op}): {} appears twice among its outputs — one id, one definition", V(*id))
+            Fault::DoubleOutput {
+                id,
+                first,
+                first_op,
+                second,
+                second_op: _,
+            } if first == second => {
+                write!(
+                    f,
+                    "node {first} ({first_op}): {} appears twice among its outputs — one id, one definition",
+                    V(*id)
+                )
             }
-            Fault::DoubleOutput { id, first, first_op, second, second_op } => {
-                write!(f, "{} is output by both node {first} ({first_op}) and node {second} ({second_op}) — a value has exactly one definition", V(*id))
+            Fault::DoubleOutput {
+                id,
+                first,
+                first_op,
+                second,
+                second_op,
+            } => {
+                write!(
+                    f,
+                    "{} is output by both node {first} ({first_op}) and node {second} ({second_op}) — a value has exactly one definition",
+                    V(*id)
+                )
             }
             Fault::PhantomDef { id, node, op } => {
-                write!(f, "{} is declared as the output of node {node} ({op}), but that node does not produce it — was `Out` forgotten?", V(*id))
+                write!(
+                    f,
+                    "{} is declared as the output of node {node} ({op}), but that node does not produce it — was `Out` forgotten?",
+                    V(*id)
+                )
             }
             Fault::DefNodeOutOfRange { id, node, len } => {
-                write!(f, "{} is declared as the output of node {node}, but the plan has {len} nodes", V(*id))
+                write!(
+                    f,
+                    "{} is declared as the output of node {node}, but the plan has {len} nodes",
+                    V(*id)
+                )
             }
-            Fault::UseBeforeDef { node, op, input, arm, def_node } => {
+            Fault::UseBeforeDef {
+                node,
+                op,
+                input,
+                arm,
+                def_node,
+            } => {
                 match arm {
-                    Some(a) => write!(f, "node {node} ({op}): input {} reaches merge arm {}, defined by ", V(*input), V(*a))?,
+                    Some(a) => write!(
+                        f,
+                        "node {node} ({op}): input {} reaches merge arm {}, defined by ",
+                        V(*input),
+                        V(*a)
+                    )?,
                     None => write!(f, "node {node} ({op}): input {} is defined by ", V(*input))?,
                 }
                 if def_node == node {
@@ -669,55 +947,144 @@ impl Display for Fault {
                 }
             }
             Fault::WeightOutOfRange { id, index, len } => {
-                write!(f, "{} names weight {index}, but the plan declares {len} params", V(*id))
+                write!(
+                    f,
+                    "{} names weight {index}, but the plan declares {len} params",
+                    V(*id)
+                )
             }
             Fault::CacheOutOfRange { id, index, len } => {
-                write!(f, "{} names cache {index}, but the plan declares {len} caches", V(*id))
+                write!(
+                    f,
+                    "{} names cache {index}, but the plan declares {len} caches",
+                    V(*id)
+                )
             }
             Fault::SymbolicWeight { id, axis, dim } => {
-                write!(f, "weight {}: axis {axis} is {} — a weight's shape is all-const", V(*id), D(*dim))
+                write!(
+                    f,
+                    "weight {}: axis {axis} is {} — a weight's shape is all-const",
+                    V(*id),
+                    D(*dim)
+                )
             }
             Fault::SymbolicAxis { id, axis, dim } => {
-                write!(f, "{}: axis {axis} is {} — symbolic dims live only at axis 0", V(*id), D(*dim))
+                write!(
+                    f,
+                    "{}: axis {axis} is {} — symbolic dims live only at axis 0",
+                    V(*id),
+                    D(*dim)
+                )
             }
             Fault::AliasOutUnknown { node, op, out } => {
-                write!(f, "node {node} ({op}): alias names {} as an output, but the node does not produce it", V(*out))
+                write!(
+                    f,
+                    "node {node} ({op}): alias names {} as an output, but the node does not produce it",
+                    V(*out)
+                )
             }
             Fault::AliasInUnknown { node, op, input } => {
-                write!(f, "node {node} ({op}): alias names {} as an input, but the node does not consume it", V(*input))
+                write!(
+                    f,
+                    "node {node} ({op}): alias names {} as an input, but the node does not consume it",
+                    V(*input)
+                )
             }
-            Fault::AliasTyMismatch { node, op, out, input, out_ty, in_ty } => {
-                write!(f, "node {node} ({op}): {} overwrites {} in place, but {} is not {}", V(*out), V(*input), T(out_ty), T(in_ty))
+            Fault::AliasTyMismatch {
+                node,
+                op,
+                out,
+                input,
+                out_ty,
+                in_ty,
+            } => {
+                write!(
+                    f,
+                    "node {node} ({op}): {} overwrites {} in place, but {} is not {}",
+                    V(*out),
+                    V(*input),
+                    T(out_ty),
+                    T(in_ty)
+                )
             }
-            Fault::FoldThenRead { fold, fold_op, input, node, op, arm } => {
-                write!(f, "node {fold} ({fold_op}) overwrites {} in place, and node {node} ({op}) reads it afterwards", V(*input))?;
+            Fault::FoldThenRead {
+                fold,
+                fold_op,
+                input,
+                node,
+                op,
+                arm,
+            } => {
+                write!(
+                    f,
+                    "node {fold} ({fold_op}) overwrites {} in place, and node {node} ({op}) reads it afterwards",
+                    V(*input)
+                )?;
                 if let Some(a) = arm {
                     write!(f, " through merge {}", V(*a))?;
                 }
                 f.write_str(" — an in-place fold is the last read of its operand; fold onto a copy")
             }
             Fault::StructDef { id, kind, def } => {
-                write!(f, "{} is a struct ({kind:?}) defined as {def} — struct values come only from plan-building ops", V(*id))
+                write!(
+                    f,
+                    "{} is a struct ({kind:?}) defined as {def} — struct values come only from plan-building ops",
+                    V(*id)
+                )
             }
             Fault::StructArm { merge, arm } => {
-                write!(f, "merge {}: arm {} is struct-typed — a struct value never passes through a merge", V(*merge), V(*arm))
+                write!(
+                    f,
+                    "merge {}: arm {} is struct-typed — a struct value never passes through a merge",
+                    V(*merge),
+                    V(*arm)
+                )
             }
             Fault::MergeTooFew { id, arms } => {
-                write!(f, "merge {} has {arms} arm(s); a merge needs at least two", V(*id))
+                write!(
+                    f,
+                    "merge {} has {arms} arm(s); a merge needs at least two",
+                    V(*id)
+                )
             }
-            Fault::MergeArmTy { merge, arm, merge_ty, arm_ty } => {
-                write!(f, "merge {}: arm {} is {}, but the merge is {}", V(*merge), V(*arm), T(arm_ty), T(merge_ty))
+            Fault::MergeArmTy {
+                merge,
+                arm,
+                merge_ty,
+                arm_ty,
+            } => {
+                write!(
+                    f,
+                    "merge {}: arm {} is {}, but the merge is {}",
+                    V(*merge),
+                    V(*arm),
+                    T(arm_ty),
+                    T(merge_ty)
+                )
             }
             Fault::PortMissing { node, op, port } => {
-                write!(f, "node {node} ({op}): the port table expects {port}, but the op's Operands impl does not produce it — the hand-written impl and the table have drifted")
+                write!(
+                    f,
+                    "node {node} ({op}): the port table expects {port}, but the op's Operands impl does not produce it — the hand-written impl and the table have drifted"
+                )
             }
-            Fault::PortKind { node, op, port, id, want, ty, def } => {
+            Fault::PortKind {
+                node,
+                op,
+                port,
+                id,
+                want,
+                ty,
+                def,
+            } => {
                 write!(f, "node {node} ({op}): {port} {} ", V(*id))?;
                 match want {
                     Expect::Struct(kinds) => {
                         f.write_str("must be a ")?;
                         for (i, kind) in kinds.iter().enumerate() {
-                            if i > 0 { f.write_str(" or ")?; }
+                            if i > 0 {
+                                f.write_str(" or ")?;
+                            }
                             write!(f, "struct {kind:?}")?;
                         }
                         write!(f, ", but it is {}", T(ty))
@@ -728,8 +1095,21 @@ impl Display for Fault {
                     }
                 }
             }
-            Fault::PortDtype { node, op, port, id, want, ty } => {
-                write!(f, "node {node} ({op}): {port} {} is pinned to {}, but it is {}", V(*id), N(*want), T(ty))
+            Fault::PortDtype {
+                node,
+                op,
+                port,
+                id,
+                want,
+                ty,
+            } => {
+                write!(
+                    f,
+                    "node {node} ({op}): {port} {} is pinned to {}, but it is {}",
+                    V(*id),
+                    N(*want),
+                    T(ty)
+                )
             }
         }
     }

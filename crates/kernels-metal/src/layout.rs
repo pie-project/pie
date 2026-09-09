@@ -2,8 +2,8 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::encode::{
-    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, head_grid, head_group, nonzero,
-    refuse, stated,
+    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, head_grid, head_group, nonzero, refuse,
+    stated,
 };
 use crate::tensor::{Bank, Tensor};
 
@@ -49,7 +49,10 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
     if column >= y.width {
         return Err(refuse(
             OP,
-            format!("column {column} is outside the {}-wide plane it writes", y.width),
+            format!(
+                "column {column} is outside the {}-wide plane it writes",
+                y.width
+            ),
         ));
     }
     debug_assert_eq!(x.rows, y.rows, "an argmax lands one entry per row");
@@ -67,7 +70,7 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
 
 fn concat_slices(op: &'static str, ids: Tensor, y: Tensor) -> Result<(u32, u32), Error> {
     let heads = nonzero(op, "the ids per row", ids.width)?;
-    if y.width == 0 || y.width % heads != 0 {
+    if y.width == 0 || !y.width.is_multiple_of(heads) {
         return Err(refuse(
             op,
             format!(
@@ -102,10 +105,8 @@ pub fn embed_concat(
     nonzero(OP, "the row count this embedding table states", vocab)?;
     let (slices, width) = concat_slices(OP, ids, y)?;
     ctx.fire(
-        Fire::at("layout/embed.metal", entry).apply(Grid::of(
-            elementwise_rows(OP, width, slices)?,
-            [256, 1, 1],
-        )),
+        Fire::at("layout/embed.metal", entry)
+            .apply(Grid::of(elementwise_rows(OP, width, slices)?, [256, 1, 1])),
         &[
             ids.arg(),
             table.arg(),
@@ -166,7 +167,7 @@ pub fn split_q_gate(
     const OP: &str = "layout.split_q_gate";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "q_gate_split_bfloat16" });
     nonzero(OP, "the head width this cut walks", head_dim)?;
-    if q.width == 0 || q.width % head_dim != 0 {
+    if q.width == 0 || !q.width.is_multiple_of(head_dim) {
         return Err(refuse(
             OP,
             format!(
@@ -203,7 +204,10 @@ pub fn split_rows(
     });
     nonzero(OP, "the left half of this cut", left.width)?;
     nonzero(OP, "the right half of this cut", right.width)?;
-    debug_assert_eq!(left.width, width, "the left half is the width this cut states");
+    debug_assert_eq!(
+        left.width, width,
+        "the left half is the width this cut states"
+    );
     debug_assert_eq!(
         left.width + right.width,
         x.width,
@@ -308,6 +312,7 @@ pub fn embed_gather_mb_4bit(
     gather_mb_4bit(ctx, OP, ids, table, vocab, y, y.rows, y.width)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gather_mb_4bit(
     ctx: &Ctx<'_>,
     op: &'static str,
@@ -345,10 +350,8 @@ fn gather_mb_4bit(
     )?;
     let _ = y;
     ctx.fire(
-        Fire::at("layout/embed_gather.metal", ENTRIES[point]).apply(Grid::of(
-            elementwise_rows(op, width, slices)?,
-            [256, 1, 1],
-        )),
+        Fire::at("layout/embed_gather.metal", ENTRIES[point])
+            .apply(Grid::of(elementwise_rows(op, width, slices)?, [256, 1, 1])),
         &[
             table.codes.arg(),
             table.scales.arg(),
@@ -410,12 +413,7 @@ fn move_rows(
     )
 }
 
-pub fn gather_rows(
-    ctx: &Ctx<'_>,
-    wide: Tensor,
-    index: Tensor,
-    tight: Tensor,
-) -> Result<(), Error> {
+pub fn gather_rows(ctx: &Ctx<'_>, wide: Tensor, index: Tensor, tight: Tensor) -> Result<(), Error> {
     const OP: &str = "layout.gather_rows";
     let entry = dtype_dispatch!(OP, tight.dtype, {
         Bf16 => "row_gather_bfloat16",
@@ -438,6 +436,7 @@ pub fn scatter_rows(
     move_rows(ctx, OP, entry, wide, tight, index, [tight, wide])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn permute_rows(
     ctx: &Ctx<'_>,
     op: &'static str,
@@ -633,7 +632,10 @@ pub fn embed_weighted(
 ) -> Result<(), Error> {
     const OP: &str = "layout.embed_weighted";
     let entry = dtype_dispatch!(OP, table.dtype, { Bf16 => "embed_weighted_bfloat16" });
-    debug_assert_eq!(y.dtype, table.dtype, "`{OP}` gathers into the table's element");
+    debug_assert_eq!(
+        y.dtype, table.dtype,
+        "`{OP}` gathers into the table's element"
+    );
 
     if ids.dtype != Dtype::I32 {
         return Err(refuse(
@@ -691,10 +693,84 @@ pub fn embed_weighted(
     )
 }
 
+pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result<(), Error> {
+    const OP: &str = "layout.rs_copy";
+    if bytes == 0 {
+        return Ok(());
+    }
+    if !bytes.is_multiple_of(4) {
+        return Err(refuse(
+            OP,
+            format!("{bytes} bytes is not a whole number of 32-bit words"),
+        ));
+    }
+    let words = u32::try_from(bytes / 4).map_err(|_| {
+        refuse(
+            OP,
+            format!("{bytes} bytes is more than one launch addresses"),
+        )
+    })?;
+    ctx.fire(
+        Fire::at("layout/blit.metal", "rs_copy_words")
+            .apply(Grid::of([words, 1, 1], [words.min(256), 1, 1])),
+        &[src.arg(), dst.arg_mut(), stated(OP, words)?.arg()],
+    )
+}
+
+const TOPK_THREADS: u32 = 128;
+
+pub fn topk(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    k: u32,
+    values: Tensor,
+    indices: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "layout.topk";
+    let entry = match (x.dtype, k) {
+        (Dtype::Bf16, 8) => "topk_rows_bfloat16_k_8",
+        (Dtype::Bf16, 16) => "topk_rows_bfloat16_k_16",
+        (Dtype::F32, 8) => "topk_rows_float32_k_8",
+        (Dtype::F32, 16) => "topk_rows_float32_k_16",
+        (dtype, k) => {
+            return Err(refuse(
+                OP,
+                format!(
+                    "no point is stamped for {dtype:?} rows at k = {k}; the plane stamps bf16 and f32 at 8 and 16"
+                ),
+            ));
+        }
+    };
+    let rows = nonzero(OP, "rows", x.rows)?;
+    nonzero(OP, "width", x.width)?;
+    if values.rows != rows || values.width != k || values.dtype != Dtype::F32 {
+        return Err(refuse(
+            OP,
+            format!("the values plane is not [{rows}, {k}] f32"),
+        ));
+    }
+    if indices.rows != rows || indices.width != k || indices.dtype != Dtype::I32 {
+        return Err(refuse(
+            OP,
+            format!("the indices plane is not [{rows}, {k}] i32"),
+        ));
+    }
+    ctx.fire(
+        Fire::at("layout/topk.metal", entry)
+            .apply(Grid::of([TOPK_THREADS, rows, 1], [TOPK_THREADS, 1, 1])),
+        &[
+            x.arg(),
+            values.arg_mut(),
+            indices.arg_mut(),
+            stated(OP, x.width)?.arg(),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use crate::probe::Probe;
 
     fn bf16(buf: u32, rows: u32, width: u32) -> Tensor {
@@ -715,6 +791,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn layout_every_case() {
         a_banked_table_of_no_rows_is_refused_by_name();
         a_row_map_that_is_not_an_i32_vector_is_refused_by_name();
@@ -726,7 +803,6 @@ mod tests {
         a_destination_too_short_for_the_blocks_is_refused_by_name();
     }
 
-    #[test]
     fn a_banked_table_of_no_rows_is_refused_by_name() {
         let probe = Probe::default();
         let why = embed_gather_mb_4bit(
@@ -737,7 +813,10 @@ mod tests {
             bf16(2, 8, 64),
         )
         .expect_err("a table of no rows");
-        assert!(format!("{why}").contains("row count this embedding table states"), "{why}");
+        assert!(
+            format!("{why}").contains("row count this embedding table states"),
+            "{why}"
+        );
         assert!(probe.fires().is_empty());
     }
 
@@ -784,11 +863,17 @@ mod tests {
         let probe = Probe::default();
         let why = pool_rows(&probe, bf16(1, 8, 64), 3, bf16(2, 8, 64))
             .expect_err("eight rows do not fill one 3x3 fold");
-        assert!(format!("{why}").contains("do not fill one 3x3 fold"), "{why}");
+        assert!(
+            format!("{why}").contains("do not fill one 3x3 fold"),
+            "{why}"
+        );
 
         let merged = merge_rows(&probe, bf16(1, 3, 64), 2, bf16(2, 8, 256))
             .expect_err("three rows do not fill one 2x2 fold");
-        assert!(format!("{merged}").contains("do not fill one 2x2 fold"), "{merged}");
+        assert!(
+            format!("{merged}").contains("do not fill one 2x2 fold"),
+            "{merged}"
+        );
         assert!(probe.fires().is_empty());
     }
 
@@ -800,65 +885,19 @@ mod tests {
 
         let merged = merge_rows(&probe, bf16(1, 36, 64), 3, bf16(2, 4, 64))
             .expect_err("a merge does widen a row, by exactly side²");
-        assert!(format!("{merged}").contains("concatenate into 576"), "{merged}");
+        assert!(
+            format!("{merged}").contains("concatenate into 576"),
+            "{merged}"
+        );
     }
 
     fn a_destination_too_short_for_the_blocks_is_refused_by_name() {
         let probe = Probe::default();
         let why = pool_rows(&probe, bf16(1, 90, 64), 3, bf16(2, 4, 64))
             .expect_err("ten pooled rows do not fit four");
-        assert!(format!("{why}").contains("the destination holds 4"), "{why}");
+        assert!(
+            format!("{why}").contains("the destination holds 4"),
+            "{why}"
+        );
     }
-
-}
-
-pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result<(), Error> {
-    const OP: &str = "layout.rs_copy";
-    if bytes == 0 {
-        return Ok(());
-    }
-    if bytes % 4 != 0 {
-        return Err(refuse(OP, format!("{bytes} bytes is not a whole number of 32-bit words")));
-    }
-    let words = u32::try_from(bytes / 4)
-        .map_err(|_| refuse(OP, format!("{bytes} bytes is more than one launch addresses")))?;
-    ctx.fire(
-        Fire::at("layout/blit.metal", "rs_copy_words").apply(Grid::of([words, 1, 1], [words.min(256), 1, 1])),
-        &[src.arg(), dst.arg_mut(), stated(OP, words)?.arg()],
-    )
-}
-
-const TOPK_THREADS: u32 = 128;
-
-pub fn topk(ctx: &Ctx<'_>, x: Tensor, k: u32, values: Tensor, indices: Tensor) -> Result<(), Error> {
-    const OP: &str = "layout.topk";
-    let entry = match (x.dtype, k) {
-        (Dtype::Bf16, 8) => "topk_rows_bfloat16_k_8",
-        (Dtype::Bf16, 16) => "topk_rows_bfloat16_k_16",
-        (Dtype::F32, 8) => "topk_rows_float32_k_8",
-        (Dtype::F32, 16) => "topk_rows_float32_k_16",
-        (dtype, k) => {
-            return Err(refuse(
-                OP,
-                format!("no point is stamped for {dtype:?} rows at k = {k}; the plane stamps bf16 and f32 at 8 and 16"),
-            ));
-        }
-    };
-    let rows = nonzero(OP, "rows", x.rows)?;
-    nonzero(OP, "width", x.width)?;
-    if values.rows != rows || values.width != k || values.dtype != Dtype::F32 {
-        return Err(refuse(OP, format!("the values plane is not [{rows}, {k}] f32")));
-    }
-    if indices.rows != rows || indices.width != k || indices.dtype != Dtype::I32 {
-        return Err(refuse(OP, format!("the indices plane is not [{rows}, {k}] i32")));
-    }
-    ctx.fire(
-        Fire::at("layout/topk.metal", entry).apply(Grid::of([TOPK_THREADS, rows, 1], [TOPK_THREADS, 1, 1])),
-        &[
-            x.arg(),
-            values.arg_mut(),
-            indices.arg_mut(),
-            stated(OP, x.width)?.arg(),
-        ],
-    )
 }

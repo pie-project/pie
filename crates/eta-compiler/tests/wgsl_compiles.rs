@@ -30,6 +30,7 @@ fn body(calls: &str) -> String {
     )
 }
 
+#[test]
 fn wgsl_compiles_every_case() {
     the_runtime_compiles();
     a_body_of_ordinary_ops_compiles();
@@ -43,7 +44,6 @@ fn wgsl_compiles_every_case() {
     the_monotone_guard_is_the_no_negative_lane_predicate();
 }
 
-#[test]
 fn the_runtime_compiles() {
     let words = compile(&body(""));
     assert_eq!(words[0], 0x0723_0203, "the first word is the SPIR-V magic");

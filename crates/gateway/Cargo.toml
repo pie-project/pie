@@ -12,28 +12,15 @@ name = "gateway"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 
-# The standalone binary is auto-detected from `src/main.rs` and named after the
-# package; no explicit `[[bin]]` needed.
 
 [dependencies]
-# Id atoms (WorkerId/GatewayId/NodeId/ReqId/SessionId/TenantId).
 ids = { path = "../ids" }
-# Control plane: the gateway registers, heartbeats and long-polls the routing
-# table, then selects a worker locally per session (no per-request RPC).
 controller-api = { path = "../controller-api" }
-# Data plane: the gateway serves `GatewayInbound` and is a client of
-# `WorkerControl` over one worker-dialed-in connection, split with `spawn_twoway`.
 worker-api = { path = "../worker-api" }
-# Client-facing edge payloads (`ClientMessage`/`ServerMessage`).
 client-api = { path = "../client-api" }
 serde = { version = "1.0", features = ["derive"] }
-# Pure TOML config parsing (`Config::parse`); `bootstrap` sources the config
-# string, this crate only parses it.
 toml = "1.1"
-# Dyn-safe async traits for the `TurnRouter` and `BlobStore` seams.
 async-trait = "0.1"
-# `serde-transport-bincode` is the control-plane codec. The data-plane codec is
-# single-sourced in `worker-api` (MessagePack), so no `serde-transport-json`.
 tarpc = { version = "0.37", features = [
     "serde-transport",
     "serde-transport-bincode",
@@ -42,21 +29,14 @@ tarpc = { version = "0.37", features = [
     "tokio1",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
-# Ingress and blob routes merge onto the one `axum::serve` this crate owns;
-# `ws` for the multi-turn WebSocket adapter.
 axum = { version = "0.8", features = ["ws"] }
-# JSON wire for the REST/SSE ingress adapters.
 serde_json = "1"
-# MessagePack wire for the multi-turn WS ingress: the client reads binary frames
-# only, so a JSON/Text adapter would be silently dropped.
 rmp-serde = "1.3.1"
 futures = "0.3.33"
-# Content-addressed blob store: blake3 addressing over axum byte bodies.
 bytes = "1"
 blake3 = "1"
 anyhow = "1"
 tracing = "0.1"
 
 [dev-dependencies]
-# Blob route `oneshot` tests.
 tower = { version = "0.5", features = ["util"] }

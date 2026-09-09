@@ -8,6 +8,8 @@ use models::hunyuan_image_3::forward::{DENOISE, ENCODE, Facts, IMAGE_IN, IMAGE_O
 use models::hunyuan_image_3::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
 
+type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
+
 const TP1: &str = "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16";
 const TP4: &str = "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4";
 const TP4_U4: &str = "hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4";
@@ -44,6 +46,7 @@ fn ranks(sku: &str) -> u32 {
     row(sku).recipe.tp
 }
 
+#[test]
 fn the_hunyuan_image_3_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_seams_it_states();
     the_ports_the_trace_reads_are_the_ports_the_facts_declare();
@@ -55,7 +58,6 @@ fn the_hunyuan_image_3_rows_bake_every_case() {
     every_row_bakes_on_every_platform_at_its_own_rank();
 }
 
-#[test]
 fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
     for sku in ROWS {
         for platform in PLATFORMS {
@@ -241,7 +243,7 @@ fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
         let d = dims(sku);
-        let ropes: Vec<([u32; 4], [f32; 4], RopeForm, u32, u32)> = plan
+        let ropes: Vec<RopeRow> = plan
             .nodes
             .iter()
             .filter_map(|node| match &node.op {

@@ -472,13 +472,19 @@ enum Message {
         response: oneshot::Sender<Result<()>>,
     },
     DetachClient,
-    Terminate { result: Result<String, String> },
+    Terminate {
+        result: Result<String, String>,
+    },
 
-    Stdout { content: String },
+    Stdout {
+        content: String,
+    },
     GetUsername {
         response: oneshot::Sender<Result<String>>,
     },
-    Stderr { content: String },
+    Stderr {
+        content: String,
+    },
     GetClientId {
         response: oneshot::Sender<Result<Option<ClientId>>>,
     },

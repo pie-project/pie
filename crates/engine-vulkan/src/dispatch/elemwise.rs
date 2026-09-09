@@ -117,10 +117,10 @@ impl Run<'_> {
             | Elementwise::Mul { .. }
             | Elementwise::Add { .. }
             | Elementwise::RopeAxes { .. }
-            | Elementwise::GateSigmoidMulHeads { .. }
-            => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
-            | Elementwise::EmbedScaleAddSelect { .. }
-            | Elementwise::RmsnormRopePartialQ { .. } => {
+            | Elementwise::GateSigmoidMulHeads { .. } => {
+                Err(kernels_vulkan::Error::Unsupported { op: op.name() })
+            }
+            Elementwise::EmbedScaleAddSelect { .. } | Elementwise::RmsnormRopePartialQ { .. } => {
                 Err(kernels_vulkan::Error::Unsupported { op: op.name() })
             }
 

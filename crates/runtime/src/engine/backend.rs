@@ -40,9 +40,11 @@ pub mod open {
 
     #[cfg(feature = "cuda")]
     pub fn cuda(boot: engine_cuda::DeviceBoot) -> Result<EngineBox> {
-        engine_cuda::open(boot, crate::engine::load::contract_for, |name| models::sku(name).map(|sku| sku.classify))
-            .map(|engine| Box::new(engine) as EngineBox)
-            .map_err(::anyhow::Error::msg)
+        engine_cuda::open(boot, crate::engine::load::contract_for, |name| {
+            models::sku(name).map(|sku| sku.classify)
+        })
+        .map(|engine| Box::new(engine) as EngineBox)
+        .map_err(::anyhow::Error::msg)
     }
 
     #[cfg(feature = "cuda")]
@@ -83,7 +85,7 @@ pub mod open {
 #[cfg(feature = "cuda")]
 pub use engine_cuda::comm::Transport;
 #[cfg(feature = "cuda")]
-pub use engine_cuda::{DeviceBoot, Diagnostics, Graphs, Knobs, ordinal_of, Recording, World};
+pub use engine_cuda::{DeviceBoot, Diagnostics, Graphs, Knobs, Recording, World, ordinal_of};
 
 mod remote;
 

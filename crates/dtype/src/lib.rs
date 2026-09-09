@@ -295,12 +295,9 @@ impl Dtype {
 
     #[must_use]
     pub fn of_fmt(f: &Fmt<'_>) -> Option<Self> {
-        for d in Self::ALL {
-            if !d.placed() && *d.repr() == *f {
-                return Some(d);
-            }
-        }
-        None
+        Self::ALL
+            .into_iter()
+            .find(|&d| !d.placed() && *d.repr() == *f)
     }
 
     #[must_use]
@@ -405,15 +402,15 @@ impl<'de> serde::Deserialize<'de> for Dtype {
 #[cfg(test)]
 mod tests {
     use super::Dtype;
-    
+
     use std::vec::Vec;
 
+    #[test]
     fn lib_every_case() {
         repr_is_injective_and_of_fmt_inverts_it();
         canonical_is_total_and_lands_on_an_unplaced_sibling();
     }
 
-    #[test]
     fn repr_is_injective_and_of_fmt_inverts_it() {
         let plain: Vec<_> = Dtype::ALL.iter().filter(|d| !d.placed()).collect();
         for (i, a) in plain.iter().enumerate() {
@@ -458,5 +455,4 @@ mod tests {
         let bad: Result<Dtype, _> = serde_json::from_str("\"q4_k\"");
         assert!(bad.is_err(), "a vendor name is not a wire spelling");
     }
-
 }

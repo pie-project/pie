@@ -29,6 +29,7 @@ pub fn covers(m: i32, n: i32, k: i32, epilogue: Epilogue) -> bool {
     m >= 1 && m <= ROWS as i32 && n > 0 && n % cols == 0 && k > 0 && k % STEP as i32 == 0
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn skinny_bf16(
     ctx: &Ctx,
     weight: u64,

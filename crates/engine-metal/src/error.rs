@@ -243,22 +243,14 @@ impl fmt::Display for Fault {
                 f,
                 "lane {lane} carries a mask and this artifact bakes no masked class"
             ),
-            Self::MaskRows {
-                lane,
-                stated,
-                rows,
-            } => write!(
+            Self::MaskRows { lane, stated, rows } => write!(
                 f,
                 "lane {lane} states a per-row attention mask (`Masking::Rows`) of \
                  {stated} rows and feeds {rows}; the form is parallel to the lane's \
                  tokens, and serving a short one as row zero's mask on every row is \
                  the substitution the form exists to end"
             ),
-            Self::Positions {
-                lane,
-                stated,
-                rows,
-            } => write!(
+            Self::Positions { lane, stated, rows } => write!(
                 f,
                 "lane {lane} states {stated} token positions and feeds {rows} tokens; a \
                  stated run is parallel to the lane's tokens or it is not stated at all"

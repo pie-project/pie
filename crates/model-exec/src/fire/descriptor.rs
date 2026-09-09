@@ -397,6 +397,7 @@ mod tests {
         FireDescriptor::of(&compose(&compiled, &budget(), &lanes).expect("composes"))
     }
 
+    #[test]
     fn descriptor_every_case() {
         a_descriptor_survives_the_round_trip_whole();
         the_header_says_fire_and_which_layout_it_is();
@@ -404,7 +405,6 @@ mod tests {
         an_older_descriptor_is_refused_by_name_and_not_regenerated();
     }
 
-    #[test]
     fn a_descriptor_survives_the_round_trip_whole() {
         let before = descriptor();
         let bytes = before.pack();
@@ -487,7 +487,10 @@ mod tests {
                 }),
             );
             let said = refusal.to_string();
-            assert!(said.contains(&older.to_string()) && said.contains('3'), "{said}");
+            assert!(
+                said.contains(&older.to_string()) && said.contains('3'),
+                "{said}"
+            );
             assert!(said.contains("never negotiated"), "{said}");
         }
     }

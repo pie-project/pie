@@ -53,9 +53,16 @@ pub enum GridRule {
         factor: [u32; 3],
         keep_first_frame: bool,
     },
-    Shuffle { r: [u32; 3], trim_t: u32 },
-    Unshuffle { r: [u32; 3] },
-    AvgDown { factor: [u32; 3] },
+    Shuffle {
+        r: [u32; 3],
+        trim_t: u32,
+    },
+    Unshuffle {
+        r: [u32; 3],
+    },
+    AvgDown {
+        factor: [u32; 3],
+    },
 }
 
 impl GridRule {
@@ -97,13 +104,13 @@ impl GridRule {
                 Some([t_out, h * r[1], w * r[2]])
             }
             GridRule::Unshuffle { r } => {
-                if r.iter().any(|&x| x == 0) || t % r[0] != 0 || h % r[1] != 0 || w % r[2] != 0 {
+                if r.contains(&0) || t % r[0] != 0 || h % r[1] != 0 || w % r[2] != 0 {
                     return None;
                 }
                 Some([t / r[0], h / r[1], w / r[2]])
             }
             GridRule::AvgDown { factor } => {
-                if factor.iter().any(|&x| x == 0) || h % factor[1] != 0 || w % factor[2] != 0 {
+                if factor.contains(&0) || h % factor[1] != 0 || w % factor[2] != 0 {
                     return None;
                 }
                 Some([t.div_ceil(factor[0]), h / factor[1], w / factor[2]])
@@ -114,9 +121,7 @@ impl GridRule {
     #[must_use]
     pub fn growth(self) -> u32 {
         match self {
-            GridRule::Conv { .. }
-            | GridRule::Unshuffle { .. }
-            | GridRule::AvgDown { .. } => 1,
+            GridRule::Conv { .. } | GridRule::Unshuffle { .. } | GridRule::AvgDown { .. } => 1,
             GridRule::Upsample { factor, .. } => factor[0] * factor[1] * factor[2],
             GridRule::Shuffle { r, .. } => r[0] * r[1] * r[2],
         }
@@ -126,7 +131,7 @@ impl GridRule {
     pub fn apply(self, grid: &[i32]) -> Option<Vec<i32>> {
         let mut out = Vec::with_capacity(grid.len());
         let mut off: i64 = 0;
-        for clip in grid.chunks_exact(4) {
+        for clip in grid.as_chunks::<4>().0 {
             let boxed = [clip[0], clip[1], clip[2]].map(|n| u32::try_from(n).ok());
             let [t, h, w] = self.out_extent([boxed[0]?, boxed[1]?, boxed[2]?])?;
             out.extend_from_slice(&[t as i32, h as i32, w as i32, i32::try_from(off).ok()?]);
@@ -325,6 +330,7 @@ impl Operands for Spatial {
 mod tests {
     use super::{GridRule, VoxelSegment};
 
+    #[test]
     fn spatial_every_case() {
         a_grid_rule_maps_boxes_the_way_torch_does();
         a_trimmed_shuffle_drops_its_anchor_frames_from_the_box();
@@ -332,7 +338,6 @@ mod tests {
         a_voxel_segment_reads_its_block_off_the_clips_box();
     }
 
-    #[test]
     fn a_grid_rule_maps_boxes_the_way_torch_does() {
         let conv = GridRule::Conv {
             k: [3, 3, 3],
@@ -403,7 +408,10 @@ mod tests {
         let two = GridRule::AvgDown { factor: [2, 2, 2] };
         assert_eq!(two.out_extent([4, 8, 12]), Some([2, 4, 6]));
         assert_eq!(two.out_extent([1, 8, 12]), Some([1, 4, 6]));
-        assert_eq!(GridRule::Unshuffle { r: [2, 2, 2] }.out_extent([1, 8, 12]), None);
+        assert_eq!(
+            GridRule::Unshuffle { r: [2, 2, 2] }.out_extent([1, 8, 12]),
+            None
+        );
         assert_eq!(two.out_extent([3, 8, 12]), Some([2, 4, 6]));
         assert_eq!(two.out_extent([2, 7, 12]), None);
         assert_eq!(
@@ -415,7 +423,10 @@ mod tests {
             Some([5, 8, 12])
         );
         assert_eq!(two.growth(), 1);
-        assert_eq!(two.apply(&[1, 2, 2, 0, 4, 2, 2, 1]), Some(vec![1, 1, 1, 0, 2, 1, 1, 1]));
+        assert_eq!(
+            two.apply(&[1, 2, 2, 0, 4, 2, 2, 1]),
+            Some(vec![1, 1, 1, 0, 2, 1, 1, 1])
+        );
     }
 
     fn a_voxel_segment_reads_its_block_off_the_clips_box() {

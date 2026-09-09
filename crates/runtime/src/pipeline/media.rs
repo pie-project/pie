@@ -3,14 +3,21 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    RunCount { runs: usize, spans: usize },
+    RunCount {
+        runs: usize,
+        spans: usize,
+    },
     RunLength {
         index: usize,
         run_rows: u32,
         span_rows: u32,
     },
-    OrphanSpans { spans: usize },
-    OrphanRuns { runs: usize },
+    OrphanSpans {
+        spans: usize,
+    },
+    OrphanRuns {
+        runs: usize,
+    },
 }
 
 impl Refusal {
@@ -121,9 +128,7 @@ pub fn scan(lanes: &[&[u32]], spans: &[Arc<EncodedSpan>]) -> Result<Vec<MatchedR
     }
 
     if found.is_empty() {
-        return Err(Refusal::OrphanSpans {
-            spans: spans.len(),
-        });
+        return Err(Refusal::OrphanSpans { spans: spans.len() });
     }
     if found.len() != spans.len() {
         return Err(Refusal::RunCount {
@@ -179,7 +184,7 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32], lane_base: &[u32]) 
         }
         let owed = 2 * span.rows as usize;
         if span.positions.len() == owed {
-            for yx in span.positions.chunks_exact(2) {
+            for yx in span.positions.as_chunks::<2>().0 {
                 m.positions.push(0);
                 m.positions.push(i32::try_from(yx[0]).unwrap_or(i32::MAX));
                 m.positions.push(i32::try_from(yx[1]).unwrap_or(i32::MAX));
@@ -205,8 +210,7 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32], lane_base: &[u32]) 
             continue;
         }
         let rows = lane_rows.get(m.lane as usize).copied().unwrap_or(0);
-        let mut runs: Vec<&MatchedRun> =
-            matched.iter().filter(|r| r.lane == m.lane).collect();
+        let mut runs: Vec<&MatchedRun> = matched.iter().filter(|r| r.lane == m.lane).collect();
         runs.sort_by_key(|r| r.anchor);
 
         m.token_positions = Vec::with_capacity(3 * rows as usize);
@@ -225,8 +229,7 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32], lane_base: &[u32]) 
                         let rem = k % hw;
                         for axis in [t, rem / gw, rem % gw] {
                             m.token_positions.push(
-                                i32::try_from(start.saturating_add(axis))
-                                    .unwrap_or(i32::MAX),
+                                i32::try_from(start.saturating_add(axis)).unwrap_or(i32::MAX),
                             );
                         }
                     }
@@ -271,6 +274,7 @@ mod tests {
         })
     }
 
+    #[test]
     fn media_every_case() {
         a_matching_submission_scans_to_its_runs();
         two_spans_match_two_runs_in_order();
@@ -282,7 +286,6 @@ mod tests {
         a_run_in_the_second_lane_is_found_and_stays_lane_relative();
     }
 
-    #[test]
     fn a_matching_submission_scans_to_its_runs() {
         let s = span(3);
         let toks: Vec<u32> = [&[10, 11][..], &s.tokens(), &[12][..]].concat();
@@ -363,5 +366,4 @@ mod tests {
         assert_eq!(matched[0].lane, 1);
         assert_eq!(matched[0].anchor, 1, "an anchor is its own lane's offset");
     }
-
 }

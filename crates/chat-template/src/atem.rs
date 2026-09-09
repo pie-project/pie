@@ -111,10 +111,9 @@ impl Instruct for Atem {
         let mut tokens = vec![self.generation_prefix[0]];
         tokens.extend(self.tokenizer.encode(&format!("tool {name}")));
         tokens.push(self.reasoning_open[self.reasoning_open.len() - 1]);
-        tokens.extend(
-            self.tokenizer
-                .encode(&format!("<tool_output name=\"{name}\">\n{value}\n</tool_output>")),
-        );
+        tokens.extend(self.tokenizer.encode(&format!(
+            "<tool_output name=\"{name}\">\n{value}\n</tool_output>"
+        )));
         tokens.push(self.eot);
         tokens
     }

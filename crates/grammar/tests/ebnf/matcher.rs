@@ -19,13 +19,13 @@ exponent ::= [eE] [+-]? [0-9]+
 ws ::= [ \t\n\r]*
 "#;
 
+#[test]
 fn matcher_every_case() {
     test_json_complex();
     test_nullable_grammar();
     test_predict_complete_complex();
 }
 
-#[test]
 fn test_json_complex() {
     let complex_json = r#"{
     "web-app": {

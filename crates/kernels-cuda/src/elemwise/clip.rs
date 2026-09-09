@@ -10,6 +10,7 @@ const BLOCK: u32 = 256;
 pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.clamp";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(lo <= hi) {
         return Err(refuse(
             OP,

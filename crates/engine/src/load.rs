@@ -114,18 +114,18 @@ impl Residency {
                 "host_weight_budget",
             ),
         ] {
-            if let Some(budget) = budget {
-                if demand > budget {
-                    return Err(crate::Error::Impossible(format!(
-                        "weight residency: `{field}` is {budget} bytes and this load demands \
+            if let Some(budget) = budget
+                && demand > budget
+            {
+                return Err(crate::Error::Impossible(format!(
+                    "weight residency: `{field}` is {budget} bytes and this load demands \
                          {demand} bytes on the {tier} tier. That demand is what the engine \
                          has already reduced to as far as its tiers allow — routed expert \
                          banks stream and dense planes rotate through a ring, and what is \
                          left is what must stay resident — so the budget \
                          cannot be met by holding less of it. Raise the budget, or state \
                          `None` for uncapped."
-                    )));
-                }
+                )));
             }
         }
         if tiers.spilled > 0 && !tiers.sourced {

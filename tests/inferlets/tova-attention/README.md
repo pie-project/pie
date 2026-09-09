@@ -9,8 +9,8 @@ attended to most, and drop the rest. No accumulated history (that is H2O), no
 observation window (that is SnapKV) — just the attention distribution of the
 most recent token.
 
-This inferlet is the **observability half**, in the same sense as
-`quest-attention`: it runs TOVA's exact decision quantity on real hardware,
+This inferlet is the **observability half**: it runs TOVA's exact decision
+quantity on real hardware,
 against the live KV cache, and drains the scores to the host so the keep-set can
 be checked. It does not yet mask the evicted positions out of the attention
 kernel, so it produces **bit-identical output to `naive-baseline`** — which is
@@ -97,7 +97,6 @@ checked per fire rather than once at the end.
    carries one page list per request, so a per-head keep-set has no
    representable consumer. The rectangle is per-head — observability wants it
    that way — so the program takes the mean itself, in-graph.
-   `quest-attention` documents the same collapse.
 2. **Layers are folded by the program.** TOVA keeps a cache per layer; this sums
    the per-layer rows and ranks the sum — the layer-uniform variant the paper
    itself evaluates, and monotone-equivalent to the mean.

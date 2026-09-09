@@ -151,7 +151,7 @@ impl Counters {
 #[cfg(test)]
 mod tests {
     use super::{Counters, MAX_ATTACHMENTS};
-    
+
     fn ring() -> Counters {
         Counters::default()
     }
@@ -172,5 +172,4 @@ mod tests {
             MAX_ATTACHMENTS
         );
     }
-
 }

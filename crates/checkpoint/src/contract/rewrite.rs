@@ -1,6 +1,6 @@
-use crate::file::{Metadata, RawTensor};
 use crate::contract::{Expr, ModelContract, TensorContract, local_range};
 use crate::error::{Error, OrOverflow};
+use crate::file::{Metadata, RawTensor};
 use crate::plan::StorageTarget;
 use crate::types::{Axis, Encoding};
 

@@ -8,7 +8,6 @@ pub(crate) struct Feeds {
     pub(crate) selections: Vec<Selection>,
     pub(crate) merged: Vec<MergedPort>,
     pub(crate) unlanded: Vec<ValueId>,
-
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,7 +145,6 @@ impl Feeds {
         }
         feeds
     }
-
 }
 
 pub(crate) fn writer_classes(

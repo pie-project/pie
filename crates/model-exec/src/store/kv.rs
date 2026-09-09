@@ -49,8 +49,7 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             window,
             head_dim,
             ..
-        }
-        => Some(Reader {
+        } => Some(Reader {
             q: *q,
             plan: *plan,
             cache: *cache,
@@ -143,7 +142,10 @@ pub fn width_of(trace: &Trace, value: ValueId) -> Result<u64> {
         })?;
     let Ty::Tensor { shape, .. } = &decl.ty else {
         return Err(Fault::Unbound {
-            what: format!("value {}, which declares a host struct, as a rectangle", value.0),
+            what: format!(
+                "value {}, which declares a host struct, as a rectangle",
+                value.0
+            ),
         });
     };
     let mut width = 1u64;
@@ -224,7 +226,8 @@ pub struct Geometry {
 impl Geometry {
     pub fn pad_to(&mut self, lanes: usize) {
         pad_indptr(&mut self.indptr, lanes);
-        self.last_page_len.resize(self.last_page_len.len().max(lanes), 0);
+        self.last_page_len
+            .resize(self.last_page_len.len().max(lanes), 0);
         self.kv_len.resize(self.kv_len.len().max(lanes), 0);
     }
 }
@@ -278,8 +281,10 @@ pub fn geometry_with(paging: &Paging, seats: &[Seat], tables: &[&[u32]]) -> Resu
             }
             for token in 0..u64::from(seat.rows) {
                 let at = u64::from(seat.have) + token;
-                out.write_page
-                    .push(narrow(base + at / u64::from(paging.page_size), "page indices")?);
+                out.write_page.push(narrow(
+                    base + at / u64::from(paging.page_size),
+                    "page indices",
+                )?);
                 out.write_offset
                     .push(narrow(at % u64::from(paging.page_size), "write offsets")?);
             }
@@ -297,21 +302,24 @@ pub fn geometry_with(paging: &Paging, seats: &[Seat], tables: &[&[u32]]) -> Resu
             for token in 0..u64::from(seat.rows) {
                 let at = u64::from(seat.have) + token;
                 let page = table[(at / u64::from(paging.page_size)) as usize];
-                out.write_page.push(narrow(u64::from(page), "page indices")?);
+                out.write_page
+                    .push(narrow(u64::from(page), "page indices")?);
                 out.write_offset
                     .push(narrow(at % u64::from(paging.page_size), "write offsets")?);
             }
         }
 
-        out.indptr.push(narrow(out.indices.len() as u64, "kv indptr")?);
-        out.last_page_len
-            .push(narrow(after - (pages - 1) * u64::from(paging.page_size), "last page length")?);
+        out.indptr
+            .push(narrow(out.indices.len() as u64, "kv indptr")?);
+        out.last_page_len.push(narrow(
+            after - (pages - 1) * u64::from(paging.page_size),
+            "last page length",
+        )?);
         out.kv_len.push(narrow(after, "kv length")?);
     }
     Ok(out)
 }
 
-#[must_use]
 pub fn indptr(seats: &[Seat]) -> Result<Vec<i32>> {
     let mut out = Vec::with_capacity(seats.len() + 1);
     let mut at = 0u64;
@@ -340,13 +348,13 @@ mod tests {
         Paging::of(16, 64, 4, 16).expect("a page size of 16 spells geometry")
     }
 
+    #[test]
     fn kv_every_case() {
         a_prefill_writes_its_own_prompt_and_then_attends_it();
         a_decode_step_appends_one_row_past_what_the_slot_holds();
         a_sequence_past_its_slots_pages_is_refused_rather_than_wrapped();
     }
 
-    #[test]
     fn a_prefill_writes_its_own_prompt_and_then_attends_it() {
         let g = geometry(
             &paging(),
@@ -363,7 +371,10 @@ mod tests {
         assert_eq!(g.kv_len, vec![20], "the length is AFTER the append");
         assert_eq!(g.last_page_len, vec![4]);
         assert_eq!(g.write_page.len(), 20);
-        assert_eq!(&g.write_page[..17], &[4; 16].iter().chain(&[5]).copied().collect::<Vec<_>>()[..]);
+        assert_eq!(
+            &g.write_page[..17],
+            &[4; 16].iter().chain(&[5]).copied().collect::<Vec<_>>()[..]
+        );
         assert_eq!(g.write_offset[0], 0);
         assert_eq!(g.write_offset[15], 15);
         assert_eq!(g.write_offset[16], 0, "row 16 opens the second page");
@@ -383,19 +394,33 @@ mod tests {
         assert_eq!(g.kv_len, vec![21]);
         assert_eq!(g.indptr, vec![0, 2]);
         assert_eq!(g.last_page_len, vec![5]);
-        assert_eq!(g.write_page, vec![1], "token 20 is page 1 of slot 0's block");
+        assert_eq!(
+            g.write_page,
+            vec![1],
+            "token 20 is page 1 of slot 0's block"
+        );
         assert_eq!(g.write_offset, vec![4]);
     }
 
     fn a_sequence_past_its_slots_pages_is_refused_rather_than_wrapped() {
         let refusal = geometry(
             &paging(),
-            &[Seat { slot: 0, have: 60, rows: 8 }],
+            &[Seat {
+                slot: 0,
+                have: 60,
+                rows: 8,
+            }],
         );
         assert!(
-            matches!(refusal, Err(Fault::Ceiling { need: 68, have: 64, .. })),
+            matches!(
+                refusal,
+                Err(Fault::Ceiling {
+                    need: 68,
+                    have: 64,
+                    ..
+                })
+            ),
             "a slot that overruns its block must name the numbers: {refusal:?}"
         );
     }
-
 }

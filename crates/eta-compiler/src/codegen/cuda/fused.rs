@@ -122,7 +122,8 @@ pub(crate) struct GumbelChain {
     pub(crate) noise: u32,
 }
 
-pub static GUMBEL_DIRECT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+pub static GUMBEL_DIRECT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
 
 fn gumbel_direct_enabled() -> bool {
     GUMBEL_DIRECT.load(core::sync::atomic::Ordering::Relaxed)
@@ -164,7 +165,9 @@ pub(crate) fn analyze_direct_argmax(
             .value_types
             .get(value as usize)
             .is_some_and(|ty| {
-                ty.dims.iter().all(|dim| matches!(dim, Dimension::Static(1)))
+                ty.dims
+                    .iter()
+                    .all(|dim| matches!(dim, Dimension::Static(1)))
             })
     };
 
@@ -300,7 +303,11 @@ pub(crate) fn analyze_direct_topk(stage: &CompiledStage) -> Vec<Option<TopKDirec
     let index = crate::plan::StageIndex::of(&stage.normalized);
     (0..ops.len())
         .map(|node| {
-            let direct = crate::plan::direct_topk(&stage.normalized, &index, crate::plan::NodeIndex(node as u32))?;
+            let direct = crate::plan::direct_topk(
+                &stage.normalized,
+                &index,
+                crate::plan::NodeIndex(node as u32),
+            )?;
             let producer = direct.intrinsic.index();
             Some(TopKDirect {
                 intrinsic: ops[producer].intr,
@@ -373,58 +380,102 @@ pub fn emit_fused_region(
 
     let row_geometry = row_geometry(stage, region);
     let row_parallel = row_geometry.is_some();
-    let row_kinds: Vec<u8> = row_geometry.map_or_else(Vec::new, |geometry| row_kinds(stage, region, geometry));
+    let row_kinds: Vec<u8> =
+        row_geometry.map_or_else(Vec::new, |geometry| row_kinds(stage, region, geometry));
     if row_geometry.is_some() {
         let kinds: Vec<String> = row_kinds.iter().map(|k| format!("{k}u")).collect();
         let count = kinds.len().max(1);
-        let _ = writeln!(source, "  const m1_u8 ptir_rowkind[{count}u] = {{{}}};", kinds.join(", "));
+        let _ = writeln!(
+            source,
+            "  const m1_u8 ptir_rowkind[{count}u] = {{{}}};",
+            kinds.join(", ")
+        );
         let _ = writeln!(source, "  __shared__ M1ValueDesc ptir_rowdesc[{count}u];");
         let _ = writeln!(source, "  __shared__ m1_u64 ptir_rowshift[{count}u];");
         let _ = writeln!(
             source,
             "  for (m1_u32 v = threadIdx.x; v < value_count && v < {count}u; v += blockDim.x) {{"
         );
-        source.push_str("    M1ValueDesc d = descriptors[v];
-");
-        source.push_str("    m1_u64 shift = 0u;
-");
-        source.push_str("    const m1_u64 elem = d.dtype == 3u ? 1u : 4u;
-");
-        source.push_str("    if (ptir_rowkind[v] == 1u) {
-");
-        source.push_str("      shift = (m1_u64)lane_row * (m1_u64)d.last * elem;
-");
-        source.push_str("      d.len = d.last; d.rows = 1u; d.rank = 1u; d.dims[0] = d.last;
-");
+        source.push_str(
+            "    M1ValueDesc d = descriptors[v];
+",
+        );
+        source.push_str(
+            "    m1_u64 shift = 0u;
+",
+        );
+        source.push_str(
+            "    const m1_u64 elem = d.dtype == 3u ? 1u : 4u;
+",
+        );
+        source.push_str(
+            "    if (ptir_rowkind[v] == 1u) {
+",
+        );
+        source.push_str(
+            "      shift = (m1_u64)lane_row * (m1_u64)d.last * elem;
+",
+        );
+        source.push_str(
+            "      d.len = d.last; d.rows = 1u; d.rank = 1u; d.dims[0] = d.last;
+",
+        );
         let _ = writeln!(
             source,
             "      for (m1_u32 k = 1u; k < {}u; ++k) d.dims[k] = 0u;",
             eta_ir::types::MAX_RANK
         );
-        source.push_str("    } else if (ptir_rowkind[v] == 2u) {
-");
-        source.push_str("      shift = (m1_u64)lane_row * elem;
-");
-        source.push_str("      d.len = 1u; d.rows = 1u; d.last = 1u; d.dims[0] = 1u;
-");
-        source.push_str("    }
-");
-        source.push_str("    ptir_rowdesc[v] = d;
-");
-        source.push_str("    ptir_rowshift[v] = shift;
-");
-        source.push_str("  }
-");
-        source.push_str("  __syncthreads();
-");
-        source.push_str("  descriptors = ptir_rowdesc;
-");
+        source.push_str(
+            "    } else if (ptir_rowkind[v] == 2u) {
+",
+        );
+        source.push_str(
+            "      shift = (m1_u64)lane_row * elem;
+",
+        );
+        source.push_str(
+            "      d.len = 1u; d.rows = 1u; d.last = 1u; d.dims[0] = 1u;
+",
+        );
+        source.push_str(
+            "    }
+",
+        );
+        source.push_str(
+            "    ptir_rowdesc[v] = d;
+",
+        );
+        source.push_str(
+            "    ptir_rowshift[v] = shift;
+",
+        );
+        source.push_str(
+            "  }
+",
+        );
+        source.push_str(
+            "  __syncthreads();
+",
+        );
+        source.push_str(
+            "  descriptors = ptir_rowdesc;
+",
+        );
     }
 
     const TAIL: &str = "    __syncthreads();\n    if (status.state != 1u) {\n      if (threadIdx.x == 0u) *commit = 0u;\n      return;\n    }\n";
     let direct_topk = analyze_direct_topk(stage);
     let streams = row_parallel.then(|| {
-        super::stream::Streams::new(stage, region, &ops, &bases, &row_kinds, &direct.intrinsic, &skipped, &direct_topk)
+        super::stream::Streams::new(
+            stage,
+            region,
+            &ops,
+            &bases,
+            &row_kinds,
+            &direct.intrinsic,
+            &skipped,
+            &direct_topk,
+        )
     });
 
     let order: Vec<usize> = match &streams {
@@ -445,7 +496,9 @@ pub fn emit_fused_region(
                 let value = aliases.resolve(value);
                 format!("scratch + offsets[{value}] + ptir_rowshift[{value}]")
             };
-            if let Some(covered) = super::stream::emit_stream(&mut source, streams, at - 1, &mut pointer, TAIL) {
+            if let Some(covered) =
+                super::stream::emit_stream(&mut source, streams, at - 1, &mut pointer, TAIL)
+            {
                 at += covered - 1;
                 continue;
             }
@@ -512,7 +565,15 @@ pub fn emit_fused_region(
                 "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
         }
 
-        emit_body(&mut source, stage, op, node, &direct.intrinsic, &slots, gumbel.as_ref());
+        emit_body(
+            &mut source,
+            stage,
+            op,
+            node,
+            &direct.intrinsic,
+            &slots,
+            gumbel.as_ref(),
+        );
 
         source.push_str(TAIL);
         if op.tag == tags::CHAN_PUT {
@@ -618,21 +679,31 @@ fn emit_body(
                 "    const m1_u32 gumbel_intrinsic_index = dispatch_lane * {PTIR_INTRINSIC_SLOTS}u + {}u;",
                 chain.intrinsic
             );
-            source.push_str("    ptir_fast_gumbel_argmax_intrinsic(
-");
+            source.push_str(
+                "    ptir_fast_gumbel_argmax_intrinsic(
+",
+            );
             source.push_str(
                 "        reinterpret_cast<const m1_u8*>(intrinsic_bases[gumbel_intrinsic_index]),
 ",
             );
             let _ = writeln!(source, "        {o0},");
-            source.push_str("        descriptors[p.a0],
-");
-            source.push_str("        intrinsic_modes[gumbel_intrinsic_index],
-");
-            source.push_str("        intrinsic_strides[gumbel_intrinsic_index],
-");
-            source.push_str("        intrinsic_offsets[gumbel_intrinsic_index] + lane_row,
-");
+            source.push_str(
+                "        descriptors[p.a0],
+",
+            );
+            source.push_str(
+                "        intrinsic_modes[gumbel_intrinsic_index],
+",
+            );
+            source.push_str(
+                "        intrinsic_strides[gumbel_intrinsic_index],
+",
+            );
+            source.push_str(
+                "        intrinsic_offsets[gumbel_intrinsic_index] + lane_row,
+",
+            );
             let _ = writeln!(source, "        {},", chain.state);
             let _ = writeln!(source, "        descriptors[{}u],", chain.state_desc);
             match (&chain.divisor, chain.divisor_desc) {
@@ -641,10 +712,14 @@ fn emit_body(
                     let _ = writeln!(source, "        descriptors[{desc}u],");
                 }
                 _ => {
-                    source.push_str("        nullptr,
-");
-                    source.push_str("        descriptors[p.a0],
-");
+                    source.push_str(
+                        "        nullptr,
+",
+                    );
+                    source.push_str(
+                        "        descriptors[p.a0],
+",
+                    );
                 }
             }
             let _ = writeln!(
@@ -775,7 +850,7 @@ fn emit_chan_put(source: &mut String, op: &OpView, a0: &str, o0: &str) {
 mod tests {
     use super::*;
     use crate::codegen::layout::{HOST_SHARED, LANE_CHANNEL_SLOT, LANE_RECORD, LANE_TABLE_HEADER};
-    
+
     #[test]
     fn cuda_runtime_lane_table_matches_layout() {
         for declared in HOST_SHARED {
@@ -798,5 +873,4 @@ mod tests {
             );
         }
     }
-
 }

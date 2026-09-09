@@ -234,7 +234,7 @@ pub async fn sweep_all(
 
 pub fn candidates() -> Vec<Knobs> {
     let mut groups: Vec<Vec<Knobs>> = Vec::new();
-    debug_assert!(4 <= Knobs::MAX_FRAME_SIZE && 4 <= Knobs::MAX_DISPATCH_DEPTH);
+    const _: () = assert!(4 <= Knobs::MAX_FRAME_SIZE && 4 <= Knobs::MAX_DISPATCH_DEPTH);
     for frame_size in [1usize, 2, 3, 4] {
         let mut group = Vec::new();
         for dispatch_depth in 1usize..=4 {
@@ -262,12 +262,12 @@ pub fn candidates() -> Vec<Knobs> {
 mod tests {
     use super::*;
 
+    #[test]
     fn sweep_every_case() {
         every_candidate_is_one_the_runtime_admits();
         a_failed_round_never_beats_anything();
     }
 
-    #[test]
     fn every_candidate_is_one_the_runtime_admits() {
         let candidates = candidates();
         assert!(!candidates.is_empty());

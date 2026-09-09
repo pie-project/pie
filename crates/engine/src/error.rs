@@ -13,10 +13,7 @@ pub enum Error {
     Invalid(String),
 
     #[error("{what} {id} is closed")]
-    Closed {
-        what: &'static str,
-        id: u64,
-    },
+    Closed { what: &'static str, id: u64 },
 
     #[error("{resource} exhausted: wanted {wanted}, {available} available")]
     Exhausted {

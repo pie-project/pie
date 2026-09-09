@@ -111,8 +111,12 @@ impl Buffer {
             if crate::diag::on().copy_resident {
                 let started = std::time::Instant::now();
                 let mut owned = Buffer::zeroed(device, cut.span() as u64)?;
-                let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
-                let chunk = (cut.span() / threads).next_multiple_of(1 << 20).max(1 << 20);
+                let threads = std::thread::available_parallelism()
+                    .map_or(4, |n| n.get())
+                    .min(8);
+                let chunk = (cut.span() / threads)
+                    .next_multiple_of(1 << 20)
+                    .max(1 << 20);
                 let dst = owned.slab.contents().as_ptr().cast::<u8>() as usize;
                 let src = at.as_ptr() as usize;
                 std::thread::scope(|scope| {
@@ -201,8 +205,7 @@ impl Buffer {
             Some(map) => Err(Fault::Mapped {
                 step,
                 what: map.path().display().to_string(),
-                why: "a reservation served from an artifact's own mapped pages is read-only"
-                    .into(),
+                why: "a reservation served from an artifact's own mapped pages is read-only".into(),
             }),
         }
     }
@@ -248,7 +251,12 @@ pub struct FileWriter {
 unsafe impl Send for FileWriter {}
 
 impl FileWriter {
-    pub fn pread(&self, file: &std::fs::File, jobs: &[(u64, u64, u64)], threads: usize) -> Result<()> {
+    pub fn pread(
+        &self,
+        file: &std::fs::File,
+        jobs: &[(u64, u64, u64)],
+        threads: usize,
+    ) -> Result<()> {
         if jobs.is_empty() {
             return Ok(());
         }
@@ -267,17 +275,23 @@ impl FileWriter {
                         for &(into, from, len) in chunk {
                             // SAFETY: destinations are disjoint and inside the
                             // live mapping, per `file_writer`.
-                            let dst = (base + usize::try_from(into).expect("an offset inside a live mapping")) as *mut u8;
+                            let dst = (base
+                                + usize::try_from(into).expect("an offset inside a live mapping"))
+                                as *mut u8;
                             if let Err(why) = unsafe { pread_all(fd, dst, from, len) } {
-                                *failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(why);
+                                *failed
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
                                 return;
                             }
                         }
                     });
                 }
             });
-            match failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+            match failed
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
                 Some(why) => Err(why),
                 None => Ok(()),
             }
@@ -288,7 +302,6 @@ impl FileWriter {
             Err(Fault::Deviceless)
         }
     }
-
 }
 
 impl Buffer {
@@ -385,9 +398,14 @@ impl Buffer {
 unsafe fn pread_all(fd: std::os::fd::RawFd, dst: *mut u8, from: u64, len: u64) -> Result<()> {
     let mut done: u64 = 0;
     while done < len {
-        let want = usize::try_from(len - done).unwrap_or(usize::MAX).min(1 << 30);
+        let want = usize::try_from(len - done)
+            .unwrap_or(usize::MAX)
+            .min(1 << 30);
         let at = i64::try_from(from + done).map_err(|_| {
-            Fault::Residency(format!("a seat source offset {} does not fit `off_t`", from + done))
+            Fault::Residency(format!(
+                "a seat source offset {} does not fit `off_t`",
+                from + done
+            ))
         })?;
         // SAFETY: the caller's contract on `dst`; `want` bytes from `dst +
         // done` stay inside it.

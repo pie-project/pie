@@ -28,14 +28,18 @@ fn stage(fixture: &Path) -> PathBuf {
 
 fn bf16(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16))
         .collect()
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|quad| f32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]))
         .collect()
 }

@@ -718,12 +718,12 @@ fn allocation_granularity(device: i32) -> Result<u64> {
 mod tests {
     use super::{LOGICAL_PAGE_BYTES, PhysicalPool, pages_for_bytes};
 
+    #[test]
     fn elastic_every_case() {
         a_promise_charges_the_budget_before_it_is_a_mapping();
         a_partial_page_is_a_whole_page();
     }
 
-    #[test]
     fn a_promise_charges_the_budget_before_it_is_a_mapping() {
         let mut pool = PhysicalPool::stated(10 * LOGICAL_PAGE_BYTES);
         assert_eq!(pool.budget_pages(), 10);

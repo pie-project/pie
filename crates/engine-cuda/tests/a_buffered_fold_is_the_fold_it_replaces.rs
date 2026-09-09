@@ -162,6 +162,7 @@ fn seated<'a>(slot: u32, tokens: &'a [u32], rs: RsVerb, reset: RsReset) -> Seate
     }
 }
 
+#[test]
 fn a_buffered_fold_is_the_fold_it_replaces_every_case() {
     a_deployments_first_fire_is_its_every_fire();
     a_buffered_fold_is_the_fold_it_replaces();
@@ -169,7 +170,6 @@ fn a_buffered_fold_is_the_fold_it_replaces_every_case() {
     the_read_path_replays_the_buffer_it_folds();
 }
 
-#[test]
 fn a_deployments_first_fire_is_its_every_fire() {
     let Some(mut shell) = ready("first-fire determinism") else {
         return;

@@ -143,13 +143,13 @@ mod tests {
         (staged.bits[base + (cell / 8) as usize] >> (cell % 8)) & 1 == 1
     }
 
+    #[test]
     fn mask_every_case() {
         the_runs_and_the_causal_bound_intersect();
         a_windowed_prefill_expands_row_by_row();
         a_mask_short_of_its_lanes_extent_is_refused();
     }
 
-    #[test]
     fn the_runs_and_the_causal_bound_intersect() {
         let mask = Masking::Extent(Mask::new(vec![1, 3, 1], 5));
         let staged = stage(&[LaneMask {

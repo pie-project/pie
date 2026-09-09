@@ -95,6 +95,7 @@ mod qwen {
     use super::*;
     use models::qwen_3::media::Qwen35Vision;
 
+    #[test]
     fn media_pipe_is_the_pinned_preprocessing_every_case() {
         a_real_png_goes_through_the_whole_pipe();
         the_span_spells_itself_out_of_the_tokenizers_own_ids();
@@ -103,13 +104,11 @@ mod qwen {
         a_video_frame_is_the_same_preprocessing_as_a_still();
     }
 
-    #[test]
     fn a_real_png_goes_through_the_whole_pipe() {
         let fe = Qwen35Vision::new();
         let c = fe.config;
         let bytes = png::png_rgb(200, 120, png::ramp);
-        let span = encode_png(&fe, &bytes, Budget::Still)
-            .expect("a well-formed PNG encodes");
+        let span = encode_png(&fe, &bytes, Budget::Still).expect("a well-formed PNG encodes");
 
         let (gh, gw) = c.patch_grid(120, 200).expect("servable");
         assert_eq!(
@@ -177,24 +176,27 @@ mod qwen {
 
     fn the_digest_is_stable_and_separates_two_images_one_run_cannot() {
         let fe = Qwen35Vision::new();
-        let one = encode_png(&fe, &png::png_rgb(96, 96, png::ramp), Budget::Still)
-            .expect("one");
-        let again = encode_png(&fe, &png::png_rgb(96, 96, png::ramp), Budget::Still)
-            .expect("again");
+        let one = encode_png(&fe, &png::png_rgb(96, 96, png::ramp), Budget::Still).expect("one");
+        let again =
+            encode_png(&fe, &png::png_rgb(96, 96, png::ramp), Budget::Still).expect("again");
         let other = encode_png(
             &fe,
-                &png::png_rgb(96, 96, |x, y| {
-                    let mut p = png::ramp(x, y);
-                    if x == 5 && y == 7 {
-                        p[1] = p[1].wrapping_add(1);
-                    }
-                    p
-                }),
-                Budget::Still,
-            )
-            .expect("other");
+            &png::png_rgb(96, 96, |x, y| {
+                let mut p = png::ramp(x, y);
+                if x == 5 && y == 7 {
+                    p[1] = p[1].wrapping_add(1);
+                }
+                p
+            }),
+            Budget::Still,
+        )
+        .expect("other");
 
-        assert_eq!(span_digest(&one).len(), 32, "blake3, the workspace's own hash");
+        assert_eq!(
+            span_digest(&one).len(),
+            32,
+            "blake3, the workspace's own hash"
+        );
         assert_eq!(
             span_digest(&one),
             span_digest(&again),
@@ -210,17 +212,24 @@ mod qwen {
             b.tokens(),
             "the ledger cannot tell two images apart"
         );
-        assert_ne!(span_digest(&a), span_digest(&b), "and the statute's key must");
+        assert_ne!(
+            span_digest(&a),
+            span_digest(&b),
+            "and the statute's key must"
+        );
     }
 
     fn the_refusals_fire_by_name() {
         let fe = Qwen35Vision::new();
-        let empty = encode_png(&fe, &[], Budget::Still)
-            .expect_err("zero bytes are refused");
+        let empty = encode_png(&fe, &[], Budget::Still).expect_err("zero bytes are refused");
         assert_eq!(empty.name(), "Decode", "{empty}");
 
-        let garbage = encode_png(&fe, b"this is not a picture, it is a sentence", Budget::Still)
-            .expect_err("prose is refused");
+        let garbage = encode_png(
+            &fe,
+            b"this is not a picture, it is a sentence",
+            Budget::Still,
+        )
+        .expect_err("prose is refused");
         assert_eq!(garbage.name(), "Decode", "{garbage}");
         assert!(matches!(garbage, Fault::Decode(_)));
     }
@@ -229,8 +238,7 @@ mod qwen {
         let fe = Qwen35Vision::new();
         let bytes = png::png_rgb(80, 60, png::ramp);
         let still: EncodedSpan = encode_png(&fe, &bytes, Budget::Still).expect("still");
-        let frame: EncodedSpan = encode_png(&fe, &bytes, Budget::VideoFrame)
-            .expect("a frame");
+        let frame: EncodedSpan = encode_png(&fe, &bytes, Budget::VideoFrame).expect("a frame");
         assert_eq!(still, frame);
     }
 }
@@ -239,6 +247,7 @@ mod gemma {
     use super::*;
     use models::gemma_4::media::Gemma4Vision;
 
+    #[test]
     fn media_pipe_is_the_pinned_preprocessing_1_every_case() {
         a_real_png_goes_through_the_whole_pipe();
         a_video_frame_gets_the_frame_budget();
@@ -247,13 +256,11 @@ mod gemma {
         the_refusals_fire_by_name();
     }
 
-    #[test]
     fn a_real_png_goes_through_the_whole_pipe() {
         let fe = Gemma4Vision::new();
         let c = fe.config;
         let bytes = png::png_rgb(200, 120, png::ramp);
-        let span = encode_png(&fe, &bytes, Budget::Still)
-            .expect("a well-formed PNG encodes");
+        let span = encode_png(&fe, &bytes, Budget::Still).expect("a well-formed PNG encodes");
 
         let (th, tw) = c
             .aspect_ratio_preserving_size(120, 200, Budget::Still)
@@ -262,7 +269,11 @@ mod gemma {
         assert_eq!((th, tw), (576, 1008));
         assert_eq!((gh, gw), (36, 63));
 
-        assert_eq!(span.rows, gh * gw, "one payload row per patch, and no padding");
+        assert_eq!(
+            span.rows,
+            gh * gw,
+            "one payload row per patch, and no padding"
+        );
         assert_eq!(span.patch_grid, Grid::still(gh, gw));
         assert_eq!(span.token_count, gh * gw / 9);
         assert_eq!(
@@ -291,8 +302,7 @@ mod gemma {
         let fe = Gemma4Vision::new();
         let bytes = png::png_rgb(200, 120, png::ramp);
         let still = encode_png(&fe, &bytes, Budget::Still).expect("still");
-        let frame = encode_png(&fe, &bytes, Budget::VideoFrame)
-            .expect("a frame");
+        let frame = encode_png(&fe, &bytes, Budget::VideoFrame).expect("a frame");
         assert!(
             frame.token_count < still.token_count,
             "a frame occupied {} rows and a still {}",
@@ -331,25 +341,28 @@ mod gemma {
 
     fn the_digest_is_stable_and_separates_two_images_one_run_cannot() {
         let fe = Gemma4Vision::new();
-        let one = encode_png(&fe, &png::png_rgb(96, 96, png::ramp), Budget::Still)
-            .expect("one");
-        let again = encode_png(&fe, &png::png_rgb(96, 96, png::ramp), Budget::Still)
-            .expect("again");
+        let one = encode_png(&fe, &png::png_rgb(96, 96, png::ramp), Budget::Still).expect("one");
+        let again =
+            encode_png(&fe, &png::png_rgb(96, 96, png::ramp), Budget::Still).expect("again");
         let other = encode_png(
             &fe,
-                &png::png_rgb(96, 96, |x, y| {
-                    let mut p = png::ramp(x, y);
-                    if x == 11 && y == 3 {
-                        p[2] = p[2].wrapping_add(1);
-                    }
-                    p
-                }),
-                Budget::Still,
-            )
-            .expect("other");
+            &png::png_rgb(96, 96, |x, y| {
+                let mut p = png::ramp(x, y);
+                if x == 11 && y == 3 {
+                    p[2] = p[2].wrapping_add(1);
+                }
+                p
+            }),
+            Budget::Still,
+        )
+        .expect("other");
 
         assert_eq!(span_digest(&one), span_digest(&again));
-        assert_eq!(span_digest(&one), span_digest(&one), "and stable across two readings");
+        assert_eq!(
+            span_digest(&one),
+            span_digest(&one),
+            "and stable across two readings"
+        );
         assert_eq!(one.token_count, other.token_count);
         assert_ne!(span_digest(&one), span_digest(&other));
     }

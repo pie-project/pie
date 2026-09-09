@@ -24,7 +24,6 @@ import time
 import tomllib
 from pathlib import Path
 
-os.environ.setdefault("PIE_CUDA_KV_ENVELOPES", "1")
 
 from pie_client import Event  # noqa: E402
 
