@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use checkpoint::contract::ModelContract;
 use checkpoint::file::Metadata;
 use checkpoint::file::read::parse_metadata;
 use checkpoint::file::serve::stamp_of;
 use checkpoint::file::zt;
-use checkpoint::contract::ModelContract;
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 
 pub use model_ir::{Platform, Trace};
@@ -137,16 +137,25 @@ pub fn this_box() -> Option<Platform> {
 }
 
 pub fn verify_artifact(artifact: &Path, platform: Platform) -> Result<&'static str> {
-    let stamp = stamp_of(artifact)?
-        .ok_or_else(|| anyhow!("{artifact:?} carries no serving stamp"))?;
+    let stamp =
+        stamp_of(artifact)?.ok_or_else(|| anyhow!("{artifact:?} carries no serving stamp"))?;
     let sku = models::sku(&stamp.sku).ok_or_else(|| {
-        anyhow!("{artifact:?} was imported for `{}`; {}", stamp.sku, no_such_sku(&stamp.sku))
+        anyhow!(
+            "{artifact:?} was imported for `{}`; {}",
+            stamp.sku,
+            no_such_sku(&stamp.sku)
+        )
     })?;
     let trace = (sku.trace)(platform);
     let source = open_source(artifact)?;
     let metadata = checkpoint_metadata(artifact)?;
     let contract = checkpoint_dsl::own_contract(&source, &trace.params, sku.recipe.tp, platform)
-        .map_err(|why| anyhow!("{artifact:?} does not hold every plane of `{}`: {why}", sku.name))?;
+        .map_err(|why| {
+            anyhow!(
+                "{artifact:?} does not hold every plane of `{}`: {why}",
+                sku.name
+            )
+        })?;
     let target = checkpoint::plan::StorageTarget::for_backend(backend_of(platform), 0, 1);
     checkpoint::plan::compile(&metadata, &contract, target)
         .map_err(|why| anyhow!("{artifact:?} does not land as `{}`: {why}", sku.name))?;
@@ -199,7 +208,10 @@ pub fn conversion_contract(
             Ok(_) => return Some((&sku.name, contract)),
             Err(why) => {
                 if trace {
-                    eprintln!("identify: {} reads it but does not compile: {why}", sku.name);
+                    eprintln!(
+                        "identify: {} reads it but does not compile: {why}",
+                        sku.name
+                    );
                 }
             }
         }
@@ -249,9 +261,14 @@ pub fn checkpoint_metadata(checkpoint: &Path) -> Result<Metadata> {
     }
 }
 
-pub fn contract_for(trace: &Trace, checkpoint: &Path) -> std::result::Result<ModelContract, String> {
+pub fn contract_for(
+    trace: &Trace,
+    checkpoint: &Path,
+) -> std::result::Result<ModelContract, String> {
     let source = open_source(checkpoint).map_err(|error| format!("{error:#}"))?;
-    let stamped = stamp_of(checkpoint).map_err(|error| format!("{error:#}"))?.is_some();
+    let stamped = stamp_of(checkpoint)
+        .map_err(|error| format!("{error:#}"))?
+        .is_some();
     let sku = models::sku(&trace.name).ok_or_else(|| {
         format!(
             "this build ships no SKU named {:?}, so a checkpoint's tensors cannot be \
@@ -261,7 +278,12 @@ pub fn contract_for(trace: &Trace, checkpoint: &Path) -> std::result::Result<Mod
     })?;
     if stamped {
         return checkpoint_dsl::own_contract(&source, &trace.params, sku.recipe.tp, trace.platform)
-            .map_err(|error| format!("{checkpoint:?} does not hold every plane of {:?}: {error}", trace.name));
+            .map_err(|error| {
+                format!(
+                    "{checkpoint:?} does not hold every plane of {:?}: {error}",
+                    trace.name
+                )
+            });
     }
     sku.contract(&source, trace.platform).map_err(|error| {
         format!(
@@ -279,7 +301,15 @@ pub fn request(
     ordinal: i32,
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
-    request_of(None, checkpoint, platform, budgets, residency, ordinal, frames_in_flight)
+    request_of(
+        None,
+        checkpoint,
+        platform,
+        budgets,
+        residency,
+        ordinal,
+        frames_in_flight,
+    )
 }
 
 pub fn request_of(
@@ -368,6 +398,7 @@ mod tests {
         writer.finish().expect("finish the checkpoint");
     }
 
+    #[test]
     fn load_every_case() {
         an_unknown_row_name_is_refused_with_the_catalog();
         a_row_that_does_not_read_the_checkpoint_refuses_by_name();
@@ -375,7 +406,6 @@ mod tests {
         the_rows_first_fits_wins_hides_are_reachable_by_name();
     }
 
-    #[test]
     fn an_unknown_row_name_is_refused_with_the_catalog() {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = dir.path().join("stranger.zt");

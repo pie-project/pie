@@ -19,7 +19,7 @@ use crate::codegen::error::EmitError;
 use crate::plan::{CompiledStage, Region};
 use alloc::string::String;
 
-pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 39;
+pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 40;
 
 pub fn emit_region(
     entry_name: &str,

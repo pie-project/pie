@@ -200,10 +200,12 @@ pub fn plan_prefill(
 }
 
 fn head_point(op: &'static str, head_dim: u32, points: &[u32]) -> Result<usize, Error> {
-    points
-        .iter()
-        .position(|&p| p == head_dim)
-        .ok_or_else(|| refuse(op, format!("no sdpa shader is stamped at head width {head_dim}")))
+    points.iter().position(|&p| p == head_dim).ok_or_else(|| {
+        refuse(
+            op,
+            format!("no sdpa shader is stamped at head width {head_dim}"),
+        )
+    })
 }
 
 fn window_extent(op: &'static str, window: Option<u32>) -> Result<i32, Error> {
@@ -270,10 +272,12 @@ fn kv_heads_agree(
 
 fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
     nonzero(op, "the head width this attention states", head_dim)?;
-    if width == 0 || width % head_dim != 0 {
+    if width == 0 || !width.is_multiple_of(head_dim) {
         return Err(refuse(
             op,
-            format!("the {width}-wide query row does not divide by the stated head width {head_dim}"),
+            format!(
+                "the {width}-wide query row does not divide by the stated head width {head_dim}"
+            ),
         ));
     }
     Ok(width / head_dim)
@@ -328,7 +332,11 @@ impl Paged {
 }
 
 fn lse_plane(op: &'static str, lse: Tensor, shape: &Paged) {
-    debug_assert_eq!(lse.dtype, Dtype::F32, "`{op}` lands an f32 log-sum-exp plane");
+    debug_assert_eq!(
+        lse.dtype,
+        Dtype::F32,
+        "`{op}` lands an f32 log-sum-exp plane"
+    );
     debug_assert!(
         lse.rows == shape.rows && lse.width == shape.q_heads,
         "`{op}`'s log-sum-exp plane is one f32 per head per row"
@@ -609,7 +617,11 @@ pub fn sink(
 ) -> Result<(), Error> {
     const OP: &str = "attention.sink";
     let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "attn_sink_rescale_bfloat16" });
-    debug_assert_eq!(lse.dtype, Dtype::F32, "`{OP}` reads an f32 log-sum-exp plane");
+    debug_assert_eq!(
+        lse.dtype,
+        Dtype::F32,
+        "`{OP}` reads an f32 log-sum-exp plane"
+    );
     let heads = row_heads(OP, o.width, head_dim)?;
     debug_assert!(
         lse.rows == o.rows && lse.width == heads,
@@ -654,13 +666,18 @@ fn head_split(op: &'static str, pool: &KvPool, row: u32) -> Result<(u32, u32), E
         .ok_or_else(|| {
             refuse(
                 op,
-                format!("the pool row's head stride {} spells no head width", pool.head_stride),
+                format!(
+                    "the pool row's head stride {} spells no head width",
+                    pool.head_stride
+                ),
             )
         })?;
-    if row == 0 || row % head_dim != 0 {
+    if row == 0 || !row.is_multiple_of(head_dim) {
         return Err(refuse(
             op,
-            format!("the {row}-wide appended row does not divide by the pool's head stride {head_dim}"),
+            format!(
+                "the {row}-wide appended row does not divide by the pool's head stride {head_dim}"
+            ),
         ));
     }
     let heads = row / head_dim;
@@ -763,8 +780,8 @@ pub fn kv_append_shared(
 pub mod mla {
     use dtype::Dtype;
 
-    use crate::error::Error;
     use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
+    use crate::error::Error;
     use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
     const FILE: &str = "attn/mla.metal";
@@ -799,7 +816,16 @@ pub mod mla {
         kv_c: Tensor,
         k_pe: Tensor,
     ) -> Result<(), Error> {
-        split_kv_a_norm(ctx, "attention.mla_latents", kv_a, weight, eps, kv_lora_rank, kv_c, k_pe)
+        split_kv_a_norm(
+            ctx,
+            "attention.mla_latents",
+            kv_a,
+            weight,
+            eps,
+            kv_lora_rank,
+            kv_c,
+            k_pe,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -863,7 +889,8 @@ pub mod mla {
         }
         let rows = crate::encode::nonzero(op, "rows", kv_a.rows)?;
         ctx.fire(
-            Fire::at(FILE, entry).apply(Grid::of([PREP_THREADS * rows, 1, 1], [PREP_THREADS, 1, 1])),
+            Fire::at(FILE, entry)
+                .apply(Grid::of([PREP_THREADS * rows, 1, 1], [PREP_THREADS, 1, 1])),
             &[
                 kv_a.arg(),
                 weight.arg(),
@@ -894,13 +921,18 @@ pub mod mla {
         let rope = stated(OP, rope_dim)?;
         let per = i64::from(nope) + i64::from(rope);
         let total = i64::from(q_b.rows) * i64::from(heads) * per;
-        let total = i32::try_from(total)
-            .map_err(|_| refuse(OP, format!("{total} split elements do not fit the shader's int")))?;
-        let lanes = u32::try_from(total)
-            .map_err(|_| refuse(OP, "the split grid will not launch"))?;
+        let total = i32::try_from(total).map_err(|_| {
+            refuse(
+                OP,
+                format!("{total} split elements do not fit the shader's int"),
+            )
+        })?;
+        let lanes =
+            u32::try_from(total).map_err(|_| refuse(OP, "the split grid will not launch"))?;
         debug_assert!(
             q_nope.width == u32::try_from(i64::from(heads) * i64::from(nope)).unwrap_or(u32::MAX)
-                && q_pe.width == u32::try_from(i64::from(heads) * i64::from(rope)).unwrap_or(u32::MAX),
+                && q_pe.width
+                    == u32::try_from(i64::from(heads) * i64::from(rope)).unwrap_or(u32::MAX),
             "the nope and rope planes are the per-head cut of q_b's row"
         );
         ctx.fire(
@@ -940,7 +972,10 @@ pub mod mla {
             "the absorbed q is `heads · rank` wide, one row per token"
         );
         ctx.fire(
-            Fire::at(FILE, entry).apply(Grid::of([kv_lora_rank, heads, rows], [SIMD.min(kv_lora_rank), 1, 1])),
+            Fire::at(FILE, entry).apply(Grid::of(
+                [kv_lora_rank, heads, rows],
+                [SIMD.min(kv_lora_rank), 1, 1],
+            )),
             &[
                 q_nope.arg(),
                 kv_b.arg(),
@@ -968,7 +1003,10 @@ pub mod mla {
         let entry = dtype_dispatch!(OP, latent.dtype, { Bf16 => "mla_absorb_out_bfloat16" });
         let heads_i = stated(OP, heads)?;
         let rank = stated(OP, kv_lora_rank)?;
-        let v_dim = stated(OP, crate::encode::nonzero(OP, "the value head dim", v_head_dim)?)?;
+        let v_dim = stated(
+            OP,
+            crate::encode::nonzero(OP, "the value head dim", v_head_dim)?,
+        )?;
         let nope = stated(OP, nope_dim)?;
         let rows = crate::encode::nonzero(OP, "rows", latent.rows)?;
         debug_assert!(
@@ -980,8 +1018,10 @@ pub mod mla {
             "the value-space output is `heads · v_dim` wide, one row per token"
         );
         ctx.fire(
-            Fire::at(FILE, entry)
-                .apply(Grid::of([v_head_dim, heads, rows], [SIMD.min(v_head_dim), 1, 1])),
+            Fire::at(FILE, entry).apply(Grid::of(
+                [v_head_dim, heads, rows],
+                [SIMD.min(v_head_dim), 1, 1],
+            )),
             &[
                 latent.arg(),
                 kv_b.arg(),
@@ -1061,10 +1101,13 @@ pub mod mla {
         let heads = crate::encode::nonzero(op, "the head count this attention states", heads)?;
         let rows = crate::encode::nonzero(op, "rows", q.rows)?;
         let ckv = latent_strip(op, "latent rank", kv_lora_rank, MAX_CKV)?;
-        if q_pe.width % heads != 0 {
+        if !q_pe.width.is_multiple_of(heads) {
             return Err(refuse(
                 op,
-                format!("the {}-wide rotated q plane does not divide by the {heads} heads", q_pe.width),
+                format!(
+                    "the {}-wide rotated q plane does not divide by the {heads} heads",
+                    q_pe.width
+                ),
             ));
         }
         let kpe = if q_pe.width == 0 {
@@ -1122,7 +1165,7 @@ pub mod mla {
     const MLA_SPLIT: u32 = 8;
 
     fn latent_strip(op: &'static str, what: &str, width: u32, max: u32) -> Result<i32, Error> {
-        if width == 0 || width % SIMD != 0 || width > max {
+        if width == 0 || !width.is_multiple_of(SIMD) || width > max {
             return Err(refuse(
                 op,
                 format!(
@@ -1289,7 +1332,7 @@ pub mod mla {
     #[cfg(test)]
     mod tests {
         use super::*;
-        
+
         use crate::probe::Probe;
 
         const RANK: u32 = 512;
@@ -1321,6 +1364,7 @@ pub mod mla {
             }
         }
 
+        #[test]
         fn attn_every_case() {
             a_rank_the_strips_cannot_hold_is_refused();
             a_zero_value_width_is_refused_rather_than_launched();
@@ -1328,13 +1372,20 @@ pub mod mla {
             the_selected_point_refuses_the_geometries_the_dense_one_does();
         }
 
-        #[test]
         fn a_rank_the_strips_cannot_hold_is_refused() {
             let probe = Probe::default();
             let pool = latent_pool();
             let why = attention_decode(
-                &probe, bf16(1, 1, HEADS * 500), bf16(2, 1, HEADS * ROPE), &pool,
-                i32t(7, 1), i32t(8, 1), HEADS, 500, 0.5, bf16(3, 1, HEADS * 500),
+                &probe,
+                bf16(1, 1, HEADS * 500),
+                bf16(2, 1, HEADS * ROPE),
+                &pool,
+                i32t(7, 1),
+                i32t(8, 1),
+                HEADS,
+                500,
+                0.5,
+                bf16(3, 1, HEADS * 500),
             )
             .expect_err("500 is not a multiple of 32");
             assert!(format!("{why}").contains("lane-split"), "{why}");
@@ -1343,8 +1394,17 @@ pub mod mla {
 
         fn a_zero_value_width_is_refused_rather_than_launched() {
             let probe = Probe::default();
-            let why = absorb_out(&probe, bf16(1, 1, HEADS * RANK), bf16(2, HEADS * NOPE, RANK), HEADS, RANK, 0, NOPE, bf16(3, 1, 1))
-                .expect_err("a zero value head dim");
+            let why = absorb_out(
+                &probe,
+                bf16(1, 1, HEADS * RANK),
+                bf16(2, HEADS * NOPE, RANK),
+                HEADS,
+                RANK,
+                0,
+                NOPE,
+                bf16(3, 1, 1),
+            )
+            .expect_err("a zero value head dim");
             assert!(format!("{why}").contains("value head dim"), "{why}");
             assert!(probe.fires().is_empty());
         }
@@ -1357,8 +1417,17 @@ pub mod mla {
             let probe = Probe::default();
             let pool = latent_pool();
             let why = attention_decode_selected(
-                &probe, bf16(1, 2, HEADS * RANK), bf16(2, 2, HEADS * ROPE), sel(4, 1, 128),
-                &pool, i32t(7, 2), i32t(8, 2), HEADS, RANK, 0.5, bf16(3, 2, HEADS * RANK),
+                &probe,
+                bf16(1, 2, HEADS * RANK),
+                bf16(2, 2, HEADS * ROPE),
+                sel(4, 1, 128),
+                &pool,
+                i32t(7, 2),
+                i32t(8, 2),
+                HEADS,
+                RANK,
+                0.5,
+                bf16(3, 2, HEADS * RANK),
             )
             .expect_err("one selection row does not serve two query rows");
             assert!(format!("{why}").contains("one row per query row"), "{why}");
@@ -1369,14 +1438,22 @@ pub mod mla {
             let probe = Probe::default();
             let pool = latent_pool();
             let why = attention_decode_selected(
-                &probe, bf16(1, 1, HEADS * 500), bf16(2, 1, HEADS * ROPE), sel(4, 1, 8),
-                &pool, i32t(7, 1), i32t(8, 1), HEADS, 500, 0.5, bf16(3, 1, HEADS * 500),
+                &probe,
+                bf16(1, 1, HEADS * 500),
+                bf16(2, 1, HEADS * ROPE),
+                sel(4, 1, 8),
+                &pool,
+                i32t(7, 1),
+                i32t(8, 1),
+                HEADS,
+                500,
+                0.5,
+                bf16(3, 1, HEADS * 500),
             )
             .expect_err("500 is not a multiple of 32");
             assert!(format!("{why}").contains("lane-split"), "{why}");
             assert!(probe.fires().is_empty());
         }
-
     }
 }
 
@@ -1399,7 +1476,7 @@ pub mod index {
     }
 
     fn rotated(op: &'static str, rope_dim: u32, head_dim: u32) -> Result<i32, Error> {
-        if rope_dim % 2 != 0 {
+        if !rope_dim.is_multiple_of(2) {
             return Err(refuse(
                 op,
                 format!("the rotated prefix {rope_dim} is odd, and this rotation turns pairs"),
@@ -1535,7 +1612,11 @@ pub mod index {
     ) -> Result<(), Error> {
         const OP: &str = "attention.index_topk";
         let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "index_topk_paged_bfloat16" });
-        debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 cached positions");
+        debug_assert_eq!(
+            selection.dtype,
+            Dtype::I32,
+            "`{OP}` writes i32 cached positions"
+        );
         debug_assert_eq!(scores.dtype, Dtype::F32, "`{OP}` bisects an f32 score slab");
         debug_assert!(
             positions.dtype == Dtype::I32 && request_of_token.dtype == Dtype::I32,
@@ -1645,7 +1726,7 @@ pub mod index {
     #[cfg(test)]
     mod tests {
         use super::*;
-        
+
         use crate::probe::Probe;
 
         const HEADS: u32 = 64;
@@ -1677,6 +1758,7 @@ pub mod index {
             }
         }
 
+        #[test]
         fn attn_1_every_case() {
             kv_append_refuses_a_pool_that_is_not_one_row_per_token();
             topk_refuses_a_zero_key_stride();
@@ -1684,10 +1766,12 @@ pub mod index {
             topk_refuses_a_score_slab_shorter_than_the_launch();
         }
 
-        #[test]
         fn kv_append_refuses_a_pool_that_is_not_one_row_per_token() {
             let probe = Probe::default();
-            let pool = KvPool { seq_stride: u64::from(DIM) * 2, ..index_pool() };
+            let pool = KvPool {
+                seq_stride: u64::from(DIM) * 2,
+                ..index_pool()
+            };
             let why = kv_append(&probe, bf16(1, 4, DIM), &pool, u32t(7, 4), u32t(8, 4))
                 .expect_err("a doubled pitch is not this row");
             assert!(format!("{why}").contains("token pitch"), "{why}");
@@ -1698,9 +1782,18 @@ pub mod index {
             let probe = Probe::default();
             let pool = index_pool();
             let why = topk(
-                &probe, bf16(1, 1, HEADS * DIM), bf16(2, 1, HEADS), &pool,
-                i32t(9, 1, 1), i32t(10, 1, 1), f32t(11, 1, 8192),
-                HEADS, DIM, TOPK, 0, i32t(12, 1, TOPK),
+                &probe,
+                bf16(1, 1, HEADS * DIM),
+                bf16(2, 1, HEADS),
+                &pool,
+                i32t(9, 1, 1),
+                i32t(10, 1, 1),
+                f32t(11, 1, 8192),
+                HEADS,
+                DIM,
+                TOPK,
+                0,
+                i32t(12, 1, TOPK),
             )
             .expect_err("zero is not a key stride");
             assert!(format!("{why}").contains("key stride"), "{why}");
@@ -1711,28 +1804,61 @@ pub mod index {
             let probe = Probe::default();
             let pool = index_pool();
             let bad_q = topk(
-                &probe, bf16(1, 1, HEADS * DIM + 8), bf16(2, 1, HEADS), &pool,
-                i32t(9, 1, 1), i32t(10, 1, 1), f32t(11, 1, 8192),
-                HEADS, DIM, TOPK, 1, i32t(12, 1, TOPK),
+                &probe,
+                bf16(1, 1, HEADS * DIM + 8),
+                bf16(2, 1, HEADS),
+                &pool,
+                i32t(9, 1, 1),
+                i32t(10, 1, 1),
+                f32t(11, 1, 8192),
+                HEADS,
+                DIM,
+                TOPK,
+                1,
+                i32t(12, 1, TOPK),
             )
             .expect_err("the query does not divide");
             assert!(format!("{bad_q}").contains("does not divide"), "{bad_q}");
 
             let bad_w = topk(
-                &probe, bf16(1, 1, HEADS * DIM), bf16(2, 1, HEADS - 1), &pool,
-                i32t(9, 1, 1), i32t(10, 1, 1), f32t(11, 1, 8192),
-                HEADS, DIM, TOPK, 1, i32t(12, 1, TOPK),
+                &probe,
+                bf16(1, 1, HEADS * DIM),
+                bf16(2, 1, HEADS - 1),
+                &pool,
+                i32t(9, 1, 1),
+                i32t(10, 1, 1),
+                f32t(11, 1, 8192),
+                HEADS,
+                DIM,
+                TOPK,
+                1,
+                i32t(12, 1, TOPK),
             )
             .expect_err("the weights are not one per head");
-            assert!(format!("{bad_w}").contains("one per stated head"), "{bad_w}");
+            assert!(
+                format!("{bad_w}").contains("one per stated head"),
+                "{bad_w}"
+            );
 
             let bad_sel = topk(
-                &probe, bf16(1, 1, HEADS * DIM), bf16(2, 1, HEADS), &pool,
-                i32t(9, 1, 1), i32t(10, 1, 1), f32t(11, 1, 8192),
-                HEADS, DIM, TOPK, 1, i32t(12, 1, TOPK - 1),
+                &probe,
+                bf16(1, 1, HEADS * DIM),
+                bf16(2, 1, HEADS),
+                &pool,
+                i32t(9, 1, 1),
+                i32t(10, 1, 1),
+                f32t(11, 1, 8192),
+                HEADS,
+                DIM,
+                TOPK,
+                1,
+                i32t(12, 1, TOPK - 1),
             )
             .expect_err("the selection is not the budget");
-            assert!(format!("{bad_sel}").contains("budget it stated"), "{bad_sel}");
+            assert!(
+                format!("{bad_sel}").contains("budget it stated"),
+                "{bad_sel}"
+            );
 
             assert!(probe.fires().is_empty());
         }
@@ -1741,15 +1867,23 @@ pub mod index {
             let probe = Probe::default();
             let pool = index_pool();
             let why = topk(
-                &probe, bf16(1, 8, HEADS * DIM), bf16(2, 8, HEADS), &pool,
-                i32t(9, 8, 1), i32t(10, 8, 1), f32t(11, 4, 8192),
-                HEADS, DIM, TOPK, 1, i32t(12, 8, TOPK),
+                &probe,
+                bf16(1, 8, HEADS * DIM),
+                bf16(2, 8, HEADS),
+                &pool,
+                i32t(9, 8, 1),
+                i32t(10, 8, 1),
+                f32t(11, 4, 8192),
+                HEADS,
+                DIM,
+                TOPK,
+                1,
+                i32t(12, 8, TOPK),
             )
             .expect_err("four slab rows do not seat eight query rows");
             assert!(format!("{why}").contains("seats 4 rows"), "{why}");
             assert!(probe.fires().is_empty());
         }
-
     }
 }
 
@@ -1773,8 +1907,16 @@ pub mod pool {
     }
 
     fn boundary_tables(op: &'static str, boundary_pos: &Tensor, boundary_req: &Tensor) {
-        debug_assert_eq!(boundary_pos.dtype, Dtype::I32, "`{op}` reads i32 boundary positions");
-        debug_assert_eq!(boundary_req.dtype, Dtype::I32, "`{op}` reads i32 boundary requests");
+        debug_assert_eq!(
+            boundary_pos.dtype,
+            Dtype::I32,
+            "`{op}` reads i32 boundary positions"
+        );
+        debug_assert_eq!(
+            boundary_req.dtype,
+            Dtype::I32,
+            "`{op}` reads i32 boundary requests"
+        );
         debug_assert_eq!(
             boundary_pos.rows, boundary_req.rows,
             "`{op}`'s boundary tables are one entry per token row"
@@ -2083,7 +2225,9 @@ pub mod pool {
         if head_dim > POOL_HEAD_MAX {
             return Err(refuse(
                 OP,
-                format!("the pooled entry width {head_dim} is above the {POOL_HEAD_MAX} this store launches as one threadgroup"),
+                format!(
+                    "the pooled entry width {head_dim} is above the {POOL_HEAD_MAX} this store launches as one threadgroup"
+                ),
             ));
         }
         let rows = nonzero(OP, "rows", entries.rows)?;
@@ -2118,9 +2262,14 @@ pub mod pool {
     ) -> Result<(), Error> {
         const OP: &str = "attention.pool_lse";
         dtype_dispatch!(OP, q.dtype, { Bf16 => () });
-        debug_assert_eq!(lse.dtype, Dtype::F32, "`{OP}` lands an f32 log-sum-exp plane");
         debug_assert_eq!(
-            request_of_token.dtype, Dtype::I32,
+            lse.dtype,
+            Dtype::F32,
+            "`{OP}` lands an f32 log-sum-exp plane"
+        );
+        debug_assert_eq!(
+            request_of_token.dtype,
+            Dtype::I32,
             "`{OP}` reads an i32 owning request per token"
         );
         if entries.page_size <= 0 {
@@ -2131,14 +2280,18 @@ pub mod pool {
         if head_dim > POOL_HEAD_MAX {
             return Err(refuse(
                 OP,
-                format!("the head width {head_dim} is above the {POOL_HEAD_MAX} this flash reader tiles in threadgroup memory"),
+                format!(
+                    "the head width {head_dim} is above the {POOL_HEAD_MAX} this flash reader tiles in threadgroup memory"
+                ),
             ));
         }
         let rows = nonzero(OP, "rows", o.rows)?;
         let ratio = stated(OP, nonzero(OP, "the pooling ratio", ratio)?)?;
         ctx.fire(
-            Fire::at(FILE, "pool_lse_paged")
-                .apply(Grid::of([ATTN_BLOCK, rows, num_q_heads], [ATTN_BLOCK, 1, 1])),
+            Fire::at(FILE, "pool_lse_paged").apply(Grid::of(
+                [ATTN_BLOCK, rows, num_q_heads],
+                [ATTN_BLOCK, 1, 1],
+            )),
             &[
                 q.arg(),
                 entries.keys.arg(),
@@ -2175,14 +2328,19 @@ pub mod pool {
     ) -> Result<(), Error> {
         const OP: &str = "attention.pool_lse_selected";
         dtype_dispatch!(OP, q.dtype, { Bf16 => () });
-        debug_assert_eq!(lse.dtype, Dtype::F32, "`{OP}` lands an f32 log-sum-exp plane");
+        debug_assert_eq!(
+            lse.dtype,
+            Dtype::F32,
+            "`{OP}` lands an f32 log-sum-exp plane"
+        );
         debug_assert_eq!(
             selection.dtype,
             Dtype::I32,
             "`{OP}` walks the i32 compressed-row ids `attention.index_topk` published"
         );
         debug_assert_eq!(
-            request_of_token.dtype, Dtype::I32,
+            request_of_token.dtype,
+            Dtype::I32,
             "`{OP}` reads an i32 owning request per token"
         );
         if entries.page_size <= 0 {
@@ -2193,7 +2351,9 @@ pub mod pool {
         if head_dim > POOL_HEAD_MAX {
             return Err(refuse(
                 OP,
-                format!("the head width {head_dim} is above the {POOL_HEAD_MAX} this flash reader tiles in threadgroup memory"),
+                format!(
+                    "the head width {head_dim} is above the {POOL_HEAD_MAX} this flash reader tiles in threadgroup memory"
+                ),
             ));
         }
         let rows = nonzero(OP, "rows", o.rows)?;
@@ -2218,8 +2378,10 @@ pub mod pool {
             ));
         }
         ctx.fire(
-            Fire::at(FILE, "pool_lse_selected_paged")
-                .apply(Grid::of([ATTN_BLOCK, rows, num_q_heads], [ATTN_BLOCK, 1, 1])),
+            Fire::at(FILE, "pool_lse_selected_paged").apply(Grid::of(
+                [ATTN_BLOCK, rows, num_q_heads],
+                [ATTN_BLOCK, 1, 1],
+            )),
             &[
                 q.arg(),
                 entries.keys.arg(),
@@ -2253,5 +2415,4 @@ pub mod pool {
     pub fn compressed_rope_pos(closing_pos: i32, ratio: i32) -> i32 {
         (closing_pos / ratio) * ratio
     }
-
 }

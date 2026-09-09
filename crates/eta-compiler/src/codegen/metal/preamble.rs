@@ -70,7 +70,7 @@ struct M3RowMeta {
 
 #[cfg(test)]
 mod tests {
-    
+
     use super::*;
 
     #[test]

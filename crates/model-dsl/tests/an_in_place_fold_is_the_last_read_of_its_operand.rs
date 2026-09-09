@@ -88,13 +88,13 @@ fn refusal(m: &(impl ForwardHybrid + std::panic::RefUnwindSafe)) -> String {
     }
 }
 
+#[test]
 fn an_in_place_fold_is_the_last_read_of_its_operand_every_case() {
     a_table_folded_onto_the_vector_the_stack_shares_is_refused();
     the_same_stack_folding_onto_a_copy_traces();
     two_arms_of_one_split_fold_one_rectangle_on_disjoint_rows();
 }
 
-#[test]
 fn a_table_folded_onto_the_vector_the_stack_shares_is_refused() {
     let message = refusal(&Stack { copy: false });
     assert!(

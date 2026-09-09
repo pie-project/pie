@@ -32,6 +32,7 @@ fn deflated_npz(name: &str, tensors: &[(&str, u8, usize)]) -> PathBuf {
     path
 }
 
+#[test]
 fn threads_every_case() {
     threads_contending_on_an_opaque_reader_all_get_the_right_bytes();
     one_hot_tensor_read_by_everyone_at_once();
@@ -39,7 +40,6 @@ fn threads_every_case() {
     a_source_can_be_moved_to_another_thread();
 }
 
-#[test]
 fn threads_contending_on_an_opaque_reader_all_get_the_right_bytes() {
     let tensors: Vec<(&str, u8, usize)> = vec![
         ("a", 0xA1, 4096),
@@ -135,11 +135,7 @@ fn mapped_and_opaque_tensors_are_read_side_by_side() {
                     let mapped = src.tensor("plain").unwrap().map().unwrap();
                     assert!(mapped.iter().all(|&b| b == 0x11));
                 } else {
-                    let bytes = src
-                        .tensor("packed")
-                        .unwrap()
-                        .bytes()
-                        .unwrap();
+                    let bytes = src.tensor("packed").unwrap().bytes().unwrap();
                     assert!(bytes.iter().all(|&b| b == 0x22));
                 }
             }
@@ -154,12 +150,7 @@ fn a_source_can_be_moved_to_another_thread() {
     let path = deflated_npz("threads-moved.zt", &[("w", 0x77, 4096)]);
     let src = ztensor_compat::open(&path).unwrap();
     let read = std::thread::spawn(move || {
-        let bytes = src
-            .tensor("w")
-            .unwrap()
-            .bytes()
-            .unwrap()
-            .into_owned();
+        let bytes = src.tensor("w").unwrap().bytes().unwrap().into_owned();
         (bytes.len(), bytes.iter().all(|&b| b == 0x77))
     })
     .join()

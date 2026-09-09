@@ -110,7 +110,12 @@ impl CsrPlan {
         term: Option<&Term>,
         attributes: Option<&Value>,
     ) -> Result<CsrPlan> {
-        let fail = |detail: String| Err(Error::reject(Rule::LayoutRule, format!("{name:?}: {detail}")));
+        let fail = |detail: String| {
+            Err(Error::reject(
+                Rule::LayoutRule,
+                format!("{name:?}: {detail}"),
+            ))
+        };
         let [rows, cols] = shape[..] else {
             return fail("sparse_csr requires rank-2 shape".into());
         };
@@ -247,7 +252,8 @@ pub mod gguf {
         }
 
         pub fn term(&self) -> Option<Term> {
-            self.term.map(|t| Term::parse(t).expect("the table spells terms correctly"))
+            self.term
+                .map(|t| Term::parse(t).expect("the table spells terms correctly"))
         }
     }
 
@@ -275,7 +281,10 @@ pub mod gguf {
         fn validate(&self, name: &str, obj: &Object) -> Result<()> {
             let row = self.row;
             let fail = |detail: String| {
-                Err(Error::reject(Rule::LayoutRule, format!("{name:?}: {detail}")))
+                Err(Error::reject(
+                    Rule::LayoutRule,
+                    format!("{name:?}: {detail}"),
+                ))
             };
             match (&obj.term, &self.term) {
                 (None, None) => {}
@@ -284,9 +293,14 @@ pub mod gguf {
                     return fail(format!("{} holds {want}, not {got}", row.layout_id()))
                 }
                 (Some(_), None) => {
-                    return fail(format!("{} is a codebook format and takes no type", row.layout_id()))
+                    return fail(format!(
+                        "{} is a codebook format and takes no type",
+                        row.layout_id()
+                    ))
                 }
-                (None, Some(want)) => return fail(format!("{} requires type {want}", row.layout_id())),
+                (None, Some(want)) => {
+                    return fail(format!("{} requires type {want}", row.layout_id()))
+                }
             }
             let attributes = obj.attributes.as_ref();
             if attr_u64(attributes, "elems_per_block") != Some(row.elems_per_block)
@@ -307,9 +321,9 @@ pub mod gguf {
                 ));
             }
             let blocks = obj.num_elements()? / row.elems_per_block;
-            let expected = blocks
-                .checked_mul(row.block_bytes)
-                .ok_or_else(|| Error::reject(Rule::Shape, format!("{name:?}: size overflows u64")))?;
+            let expected = blocks.checked_mul(row.block_bytes).ok_or_else(|| {
+                Error::reject(Rule::Shape, format!("{name:?}: size overflows u64"))
+            })?;
             if obj.blob.decoded_size() != expected {
                 return Err(Error::reject(
                     Rule::Size,

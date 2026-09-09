@@ -195,11 +195,7 @@ pub struct BoundInstance {
 
 impl BoundInstance {
     #[must_use]
-    pub fn new(
-        engine_id: usize,
-        bound: &engine::BoundInstance,
-        pacing_wait_id: u64,
-    ) -> Self {
+    pub fn new(engine_id: usize, bound: &engine::BoundInstance, pacing_wait_id: u64) -> Self {
         Self {
             engine_id,
             program_id: bound.program,

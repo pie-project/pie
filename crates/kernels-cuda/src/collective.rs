@@ -40,7 +40,7 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     let comm = ctx.comm(OP)?;
     debug_assert_eq!(x.dtype, y.dtype, "a gather does not change the dtype");
     debug_assert!(
-        x.elements() > 0 && y.elements() % x.elements() == 0,
+        x.elements() > 0 && y.elements().is_multiple_of(x.elements()),
         "the gathered rectangle is a whole number of shards"
     );
 
@@ -103,7 +103,7 @@ pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error>
     }
     debug_assert_eq!(x.dtype, y.dtype, "a reduction does not change the dtype");
     debug_assert!(
-        y.elements() > 0 && x.elements() % y.elements() == 0,
+        y.elements() > 0 && x.elements().is_multiple_of(y.elements()),
         "the reduced rectangle is a whole number of shards"
     );
 

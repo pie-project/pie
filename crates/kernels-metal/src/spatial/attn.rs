@@ -31,6 +31,7 @@ fn stamp(channels: u32) -> Result<&'static str, Error> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &Ctx<'_>,
     q: Tensor,

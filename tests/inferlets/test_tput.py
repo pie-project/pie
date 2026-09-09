@@ -25,7 +25,6 @@ import os
 import statistics
 import time
 
-os.environ.setdefault("PIE_CUDA_KV_ENVELOPES", "1")
 
 from conftest import run_tests  # noqa: E402
 from test_polymorph import (  # noqa: E402

@@ -177,6 +177,7 @@ pub fn split_q_b(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn absorb_q(
     ctx: &Ctx,
     q_nope: Tensor,
@@ -224,6 +225,7 @@ pub fn absorb_q(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn absorb_out(
     ctx: &Ctx,
     latent: Tensor,

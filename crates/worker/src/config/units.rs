@@ -145,12 +145,12 @@ impl Serialize for ByteSize {
 mod tests {
     use super::*;
 
+    #[test]
     fn units_every_case() {
         a_bare_number_is_refused_rather_than_assumed();
         decimal_units_are_refused_for_sizes();
     }
 
-    #[test]
     fn a_bare_number_is_refused_rather_than_assumed() {
         let err = parse_duration("120").unwrap_err();
         assert!(err.contains("has no unit"), "got: {err}");

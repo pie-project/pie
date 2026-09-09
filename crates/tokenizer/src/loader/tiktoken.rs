@@ -284,5 +284,4 @@ mod tests {
             "h<|tool|>"
         );
     }
-
 }

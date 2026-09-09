@@ -1,6 +1,5 @@
 use model_ir::{
-    BIASES, Dtype, Param, ParamLayout, ParamSource, Platform, SCALES, Shard, TILED_BAND,
-    TILED_STEP,
+    BIASES, Dtype, Param, ParamLayout, ParamSource, Platform, SCALES, Shard, TILED_BAND, TILED_STEP,
 };
 
 #[derive(Clone, Debug)]
@@ -250,11 +249,7 @@ impl Weight {
                 shape: self.shape.clone(),
                 dtype: self.dtype,
             }],
-            Dtype::U2g16k
-            | Dtype::I3g16k
-            | Dtype::U4g32k
-            | Dtype::U5g32k
-            | Dtype::I6g16k => {
+            Dtype::U2g16k | Dtype::I3g16k | Dtype::U4g32k | Dtype::U5g32k | Dtype::I6g16k => {
                 let (&k, lead) = self
                     .shape
                     .split_last()
@@ -309,7 +304,11 @@ impl Weight {
                 let [lead @ .., groups, sixteen] = &p.shape[..] else {
                     panic!("`{}` is an mxfp4 codes plane stored {:?}", p.name, p.shape)
                 };
-                assert_eq!(*sixteen, 16, "`{}` is an mxfp4 codes plane stored {:?}", p.name, p.shape);
+                assert_eq!(
+                    *sixteen, 16,
+                    "`{}` is an mxfp4 codes plane stored {:?}",
+                    p.name, p.shape
+                );
                 lead.iter().copied().chain([groups * 32]).collect()
             }
             _ => p.shape.clone(),

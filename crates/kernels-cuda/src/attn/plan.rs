@@ -63,6 +63,7 @@ pub struct Shape {
 impl Shape {
     #[must_use]
     pub const fn group_size(&self) -> u32 {
+        #[allow(clippy::manual_checked_ops)]
         if self.num_kv_heads > 0 {
             self.num_q_heads / self.num_kv_heads
         } else {
@@ -168,8 +169,8 @@ impl PrefillPlan {
         window: Option<u32>,
     ) -> Result<(), Error> {
         planned_head_dim(op, self.shape.head_dim, head_dim)?;
-        if let Some(kv_heads) = kv_heads {
-            if self.shape.num_kv_heads != kv_heads {
+        if let Some(kv_heads) = kv_heads
+            && self.shape.num_kv_heads != kv_heads {
                 return Err(refuse(
                     op,
                     format!(
@@ -179,7 +180,6 @@ impl PrefillPlan {
                     ),
                 ));
             }
-        }
         if self.window != window {
             return Err(refuse(
                 op,

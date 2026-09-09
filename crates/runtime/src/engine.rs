@@ -7,12 +7,12 @@ pub mod load;
 
 pub use waker;
 
-pub use backend::{
-    EngineBox, EngineSpec, RemoteDisconnectHandle, RemoteEngine, SchedulerLimits, get_spec,
-    open, register_engine_backend, take_engine_backend, unregister_engine,
-};
 #[cfg(feature = "cuda")]
 pub use backend::envelopes_resolved;
+pub use backend::{
+    EngineBox, EngineSpec, RemoteDisconnectHandle, RemoteEngine, SchedulerLimits, get_spec, open,
+    register_engine_backend, take_engine_backend, unregister_engine,
+};
 pub use channel::{
     ChannelBinding, ChannelCloser, ChannelEndpoint, ChannelJoin, ChannelValue, RegisteredChannel,
 };
@@ -23,9 +23,7 @@ pub use completion::{
 };
 pub use instance::{BoundInstance, BoundWaitSlots, InstanceBindingPlan, InstanceId, ProgramId};
 
-pub use fire::{
-    FireRequest, FrameFire, MaskWords, StepFire, bitmask_words,
-};
+pub use fire::{FireRequest, FrameFire, MaskWords, StepFire, bitmask_words};
 
 pub mod rs_flag {
     pub const RESET: u8 = 1 << 0;
@@ -92,10 +90,8 @@ pub mod verbs {
             .map(|&dim| dim as usize)
             .product::<usize>()
             .max(1);
-        let cell_bytes = super::channel::HostRing::wire_cell_bytes(
-            registration.dtype.program_dtype(),
-            cells,
-        );
+        let cell_bytes =
+            super::channel::HostRing::wire_cell_bytes(registration.dtype.program_dtype(), cells);
         let cell_bytes = u32::try_from(cell_bytes).unwrap_or(u32::MAX);
         match answered.and_then(|answer| answer.mirror) {
             Some(published) => {

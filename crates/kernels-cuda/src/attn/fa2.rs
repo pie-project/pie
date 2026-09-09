@@ -508,6 +508,7 @@ pub fn decode_max_grid_size(
     if !crate::attn::plan::head_dim_instantiated(head_dim) {
         return floor;
     }
+    #[allow(clippy::manual_checked_ops)]
     let group = if num_kv_heads > 0 {
         (num_q_heads / num_kv_heads).max(1)
     } else {

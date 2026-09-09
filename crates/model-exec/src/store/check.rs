@@ -46,7 +46,6 @@ pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel
     Ok(())
 }
 
-#[must_use]
 pub fn rebase(indptr: &[i32], span: MaskSpan) -> Result<Vec<i32>> {
     let first = span.lane_offset as usize;
     let last = first + span.lanes as usize;

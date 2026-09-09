@@ -75,13 +75,13 @@ fn tensor(rows: Dim, width: u64, dtype: Dtype) -> Ty {
     }
 }
 
+#[test]
 fn a_modulate_over_lanes_broadcasts_by_request_of_token_every_case() {
     a_lane_vector_is_embedded_per_lane_and_broadcast_per_row();
     a_per_token_vector_names_no_lane_map();
     a_vector_of_the_wrong_width_is_refused_by_width();
 }
 
-#[test]
 fn a_lane_vector_is_embedded_per_lane_and_broadcast_per_row() {
     let trace = trace_hybrid("adaln", &AdaLn(By::Lane), Platform::Cuda);
     assert!(

@@ -46,8 +46,8 @@ pub mod working_set {
     pub use crate::pie::inferlet::working_set::*;
 }
 
-pub mod mask;
 pub mod eta;
+pub mod mask;
 
 pub mod chat;
 
@@ -57,19 +57,18 @@ pub mod model {
     pub use crate::pie::inferlet::model::{
         AxisRole, BlockDrafter, CanvasShape, ForwardKind, LaneStream, LatentSpace, PortFact,
         PortKind, PositionConvention, ReadingFact, ReadoutKind, ScheduleFact, ScheduleKind,
-        architecture, arena_block_size,
-        canvas, channel_capacity, default_system_speculation, draft_block, frame_size,
-        kv_page_size, latent, max_embed_length, max_latent_rows, mtp_depth, name,
-        output_vocab_size, pass_kind, prefill_chunk_hint, readings, rs_buffer_page_size,
-        rs_fold_granularity, rs_state_size, run_ahead_window, schedule, submit_deadline_us,
+        architecture, arena_block_size, canvas, channel_capacity, default_system_speculation,
+        draft_block, frame_size, kv_page_size, latent, max_embed_length, max_latent_rows,
+        mtp_depth, name, output_vocab_size, pass_kind, prefill_chunk_hint, readings,
+        rs_buffer_page_size, rs_fold_granularity, rs_state_size, run_ahead_window, schedule,
+        submit_deadline_us,
     };
 
     pub fn reading(name: &str) -> Option<ReadingFact> {
         readings().into_iter().find(|reading| reading.name == name)
     }
     pub use crate::pie::inferlet::tokenizer::{
-        Token, decode, encode, special_tokens, split_regex, token_bytes, tokens_with_prefix,
-        vocabs,
+        Token, decode, encode, special_tokens, split_regex, token_bytes, tokens_with_prefix, vocabs,
     };
 }
 
@@ -99,6 +98,6 @@ pub mod grammar {
 }
 
 pub mod media {
-    pub use crate::pie::inferlet::media::{Audio, Image, Video};
     pub use crate::pie::inferlet::forward::MediaSpan as Span;
+    pub use crate::pie::inferlet::media::{Audio, Image, Video};
 }

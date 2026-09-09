@@ -14,6 +14,7 @@ fn gradient(w: u32, h: u32, count: u32) -> Vec<u8> {
     v
 }
 
+#[test]
 fn every_frames_format_says_what_it_encoded_every_case() {
     a_still_round_trips_through_png_and_raw_and_reads_back_identical();
     a_clip_encodes_as_y4m_and_refuses_the_still_formats_by_name();
@@ -21,7 +22,6 @@ fn every_frames_format_says_what_it_encoded_every_case() {
     pcm_carries_its_own_rate_and_channels_into_the_wav_header();
 }
 
-#[test]
 fn a_still_round_trips_through_png_and_raw_and_reads_back_identical() {
     let (w, h) = (16, 8);
     let src = gradient(w, h, 1);

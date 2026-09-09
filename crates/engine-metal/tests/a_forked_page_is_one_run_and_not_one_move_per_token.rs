@@ -24,6 +24,7 @@ fn tail(src_page: u32, dst_page: u32, from: u32, tokens: u32) -> Vec<KvMove> {
         .collect()
 }
 
+#[test]
 fn a_forked_page_is_one_run_and_not_one_move_per_token_every_case() {
     a_page_pair_is_one_move_over_the_whole_page();
     a_forked_tail_is_one_run_and_not_one_move_per_token();
@@ -37,14 +38,25 @@ fn a_forked_page_is_one_run_and_not_one_move_per_token_every_case() {
     the_two_spellings_are_one_list_of_runs();
 }
 
-#[test]
 fn a_page_pair_is_one_move_over_the_whole_page() {
     let plan = Move::plan(&copy(&[3, 4], &[9, 10], Vec::new()), PAGE).expect("the plan");
     assert_eq!(
         plan,
         vec![
-            Move { src_page: 3, src_token: 0, dst_page: 9, dst_token: 0, tokens: PAGE },
-            Move { src_page: 4, src_token: 0, dst_page: 10, dst_token: 0, tokens: PAGE },
+            Move {
+                src_page: 3,
+                src_token: 0,
+                dst_page: 9,
+                dst_token: 0,
+                tokens: PAGE
+            },
+            Move {
+                src_page: 4,
+                src_token: 0,
+                dst_page: 10,
+                dst_token: 0,
+                tokens: PAGE
+            },
         ]
     );
 }
@@ -53,22 +65,55 @@ fn a_forked_tail_is_one_run_and_not_one_move_per_token() {
     let plan = Move::plan(&copy(&[], &[], tail(2, 9, 0, 5)), PAGE).expect("the plan");
     assert_eq!(
         plan,
-        vec![Move { src_page: 2, src_token: 0, dst_page: 9, dst_token: 0, tokens: 5 }]
+        vec![Move {
+            src_page: 2,
+            src_token: 0,
+            dst_page: 9,
+            dst_token: 0,
+            tokens: 5
+        }]
     );
 }
 
 fn a_gap_in_the_cells_cuts_the_run() {
     let cells = vec![
-        KvMove { src_page_id: 2, src_token_offset: 0, dst_page_id: 9, dst_token_offset: 0 },
-        KvMove { src_page_id: 2, src_token_offset: 1, dst_page_id: 9, dst_token_offset: 1 },
-        KvMove { src_page_id: 2, src_token_offset: 3, dst_page_id: 9, dst_token_offset: 3 },
+        KvMove {
+            src_page_id: 2,
+            src_token_offset: 0,
+            dst_page_id: 9,
+            dst_token_offset: 0,
+        },
+        KvMove {
+            src_page_id: 2,
+            src_token_offset: 1,
+            dst_page_id: 9,
+            dst_token_offset: 1,
+        },
+        KvMove {
+            src_page_id: 2,
+            src_token_offset: 3,
+            dst_page_id: 9,
+            dst_token_offset: 3,
+        },
     ];
     let plan = Move::plan(&copy(&[], &[], cells), PAGE).expect("the plan");
     assert_eq!(
         plan,
         vec![
-            Move { src_page: 2, src_token: 0, dst_page: 9, dst_token: 0, tokens: 2 },
-            Move { src_page: 2, src_token: 3, dst_page: 9, dst_token: 3, tokens: 1 },
+            Move {
+                src_page: 2,
+                src_token: 0,
+                dst_page: 9,
+                dst_token: 0,
+                tokens: 2
+            },
+            Move {
+                src_page: 2,
+                src_token: 3,
+                dst_page: 9,
+                dst_token: 3,
+                tokens: 1
+            },
         ]
     );
 }
@@ -80,21 +125,49 @@ fn a_run_never_walks_off_the_end_of_its_page() {
     assert_eq!(
         plan,
         vec![
-            Move { src_page: 2, src_token: PAGE - 2, dst_page: 9, dst_token: PAGE - 2, tokens: 2 },
-            Move { src_page: 3, src_token: 0, dst_page: 10, dst_token: 0, tokens: 2 },
+            Move {
+                src_page: 2,
+                src_token: PAGE - 2,
+                dst_page: 9,
+                dst_token: PAGE - 2,
+                tokens: 2
+            },
+            Move {
+                src_page: 3,
+                src_token: 0,
+                dst_page: 10,
+                dst_token: 0,
+                tokens: 2
+            },
         ]
     );
 }
 
 fn a_cell_that_moves_nowhere_is_dropped() {
     let cells = vec![
-        KvMove { src_page_id: 2, src_token_offset: 0, dst_page_id: 2, dst_token_offset: 0 },
-        KvMove { src_page_id: 2, src_token_offset: 1, dst_page_id: 9, dst_token_offset: 1 },
+        KvMove {
+            src_page_id: 2,
+            src_token_offset: 0,
+            dst_page_id: 2,
+            dst_token_offset: 0,
+        },
+        KvMove {
+            src_page_id: 2,
+            src_token_offset: 1,
+            dst_page_id: 9,
+            dst_token_offset: 1,
+        },
     ];
     let plan = Move::plan(&copy(&[], &[], cells), PAGE).expect("the plan");
     assert_eq!(
         plan,
-        vec![Move { src_page: 2, src_token: 1, dst_page: 9, dst_token: 1, tokens: 1 }]
+        vec![Move {
+            src_page: 2,
+            src_token: 1,
+            dst_page: 9,
+            dst_token: 1,
+            tokens: 1
+        }]
     );
 }
 
@@ -111,10 +184,20 @@ fn an_offset_past_the_page_is_refused_by_name() {
 }
 
 fn a_move_whose_ends_overlap_is_refused_by_name() {
-    let why = Move::plan(&copy(&[], &[], tail(2, 2, 0, 3).into_iter().map(|cell| KvMove {
-        dst_token_offset: cell.src_token_offset + 1,
-        ..cell
-    }).collect()), PAGE)
+    let why = Move::plan(
+        &copy(
+            &[],
+            &[],
+            tail(2, 2, 0, 3)
+                .into_iter()
+                .map(|cell| KvMove {
+                    dst_token_offset: cell.src_token_offset + 1,
+                    ..cell
+                })
+                .collect(),
+        ),
+        PAGE,
+    )
     .expect_err("overlapping ends");
     assert!(why.contains("overlap"), "{why}");
 }
@@ -131,7 +214,13 @@ fn one_page_is_not_by_itself_an_overlap() {
     let plan = Move::plan(&copy(&[], &[], cells), PAGE).expect("the plan");
     assert_eq!(
         plan,
-        vec![Move { src_page: 2, src_token: 0, dst_page: 2, dst_token: PAGE - 3, tokens: 3 }]
+        vec![Move {
+            src_page: 2,
+            src_token: 0,
+            dst_page: 2,
+            dst_token: PAGE - 3,
+            tokens: 3
+        }]
     );
 }
 
@@ -145,9 +234,27 @@ fn the_two_spellings_are_one_list_of_runs() {
     assert_eq!(
         plan,
         vec![
-            Move { src_page: 0, src_token: 0, dst_page: 7, dst_token: 0, tokens: PAGE },
-            Move { src_page: 1, src_token: 0, dst_page: 8, dst_token: 0, tokens: PAGE },
-            Move { src_page: 2, src_token: 0, dst_page: 9, dst_token: 0, tokens: 5 },
+            Move {
+                src_page: 0,
+                src_token: 0,
+                dst_page: 7,
+                dst_token: 0,
+                tokens: PAGE
+            },
+            Move {
+                src_page: 1,
+                src_token: 0,
+                dst_page: 8,
+                dst_token: 0,
+                tokens: PAGE
+            },
+            Move {
+                src_page: 2,
+                src_token: 0,
+                dst_page: 9,
+                dst_token: 0,
+                tokens: 5
+            },
         ]
     );
 }

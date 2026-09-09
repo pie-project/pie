@@ -2084,8 +2084,10 @@ impl ProcessCtx {
             )));
         }
         let mut lens: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
         if lens.len() == 1 && rows > 1 {
             lens = vec![lens[0]; rows];
@@ -2492,6 +2494,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn forward_every_case() {
         a_port_channel_is_validated_against_its_fact();
         a_pass_s_row_ports_agree_on_their_rows();
@@ -2499,7 +2502,6 @@ mod tests {
         differing_rebind_names_the_field();
     }
 
-    #[test]
     fn a_port_channel_is_validated_against_its_fact() {
         let latents = port("latents", models::PortKind::Latents, 64);
         assert_eq!(

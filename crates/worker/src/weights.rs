@@ -339,6 +339,7 @@ mod tests {
     use checkpoint::file::write::Writer;
     use checkpoint::types::{DType, Encoding, TensorDecl, TensorId};
 
+    #[test]
     fn weights_every_case() {
         an_artifact_path_resolves_to_itself();
         a_store_name_finds_the_name_a_stamped_import_wrote();
@@ -349,7 +350,6 @@ mod tests {
         a_snapshot_without_a_config_says_so();
     }
 
-    #[test]
     fn an_artifact_path_resolves_to_itself() {
         let dir = tempfile::tempdir().unwrap();
         let artifact = dir.path().join("model.zt");

@@ -22,6 +22,7 @@ exponent ::= [eE] [+-]? [0-9]+
 ws ::= [ \t\n\r]*
 "#;
 
+#[test]
 fn real_world_every_case() {
     test_json_all_escape_types();
     test_json_negative_cases();
@@ -30,7 +31,6 @@ fn real_world_every_case() {
     test_json_number_edge_cases();
 }
 
-#[test]
 fn test_json_all_escape_types() {
     let input = r#""quote\" backslash\\ slash\/ backspace\b formfeed\f newline\n return\r tab\t unicode\u0041""#;
     assert!(is_grammar_accept_string(JSON_GRAMMAR, input));

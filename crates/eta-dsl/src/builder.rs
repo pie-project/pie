@@ -178,9 +178,9 @@ impl<'a> Builder<'a> {
                     st.seeded && (has_desc_use || !st.prog_reads.is_empty()) && !has_prog_put;
                 let host_role = if (has_host_put || seeded_latest_value_writer) && !has_prog_put {
                     HostRole::Writer
-                } else if host_consumes && (!st.prog_takes.is_empty() || has_prog_put) {
-                    HostRole::Reader
-                } else if is_terminal_output {
+                } else if (host_consumes && (!st.prog_takes.is_empty() || has_prog_put))
+                    || is_terminal_output
+                {
                     HostRole::Reader
                 } else {
                     HostRole::None

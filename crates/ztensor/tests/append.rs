@@ -16,6 +16,7 @@ fn offset_of(src: &Source, name: &str) -> u64 {
     src.tensor(name).unwrap().locate().unwrap().offset
 }
 
+#[test]
 fn append_every_case() {
     the_original_file_is_a_prefix_of_the_appended_one();
     a_half_finished_append_is_undone_by_truncating();
@@ -28,7 +29,6 @@ fn append_every_case() {
     a_data_shard_has_nothing_to_append_to();
 }
 
-#[test]
 fn the_original_file_is_a_prefix_of_the_appended_one() {
     let path = tmp("append-basic.zt");
     let a = f32s(&[1.0, 2.0, 3.0, 4.0]);
@@ -170,7 +170,8 @@ fn a_shard_can_be_added_to_a_finished_file() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let shard = dir.join("append-shard-data.zt");
     let mut w = Writer::create(&shard).unwrap();
-    w.add("borrowed", [4u64], Leaf::F32, &f32s(&[7.0; 4])).unwrap();
+    w.add("borrowed", [4u64], Leaf::F32, &f32s(&[7.0; 4]))
+        .unwrap();
     w.finish().unwrap();
     let id = shard_identity(&shard, DigestAlgorithm::Xxh3).unwrap();
     let object = ztensor::read::manifest_of(&shard)

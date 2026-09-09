@@ -1,8 +1,6 @@
 use dtype::Dtype;
 
-use crate::encode::{
-    Arg, ArgValue, Ctx, Fire, Grid, elementwise_rows, nonzero, refuse,
-};
+use crate::encode::{Arg, ArgValue, Ctx, Fire, Grid, elementwise_rows, nonzero, refuse};
 use crate::error::Error;
 use crate::tensor::Tensor;
 

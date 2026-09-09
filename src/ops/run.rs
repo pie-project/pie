@@ -507,6 +507,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn run_every_case() {
         a_curated_name_resolves_to_the_build_beside_its_manifest();
         an_unbuilt_curated_directory_is_found_without_a_wasm();
@@ -515,7 +516,6 @@ mod tests {
         the_documented_invocation_produces_the_documented_input();
     }
 
-    #[test]
     fn a_curated_name_resolves_to_the_build_beside_its_manifest() {
         let dir = tempfile::tempdir().unwrap();
         tree(dir.path(), "text-to-image", Some("release"));

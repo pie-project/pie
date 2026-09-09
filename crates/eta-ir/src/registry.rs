@@ -102,11 +102,8 @@ pub struct PortMask(u32);
 impl PortMask {
     pub const NONE: PortMask = PortMask(0);
 
-    pub const DECODE_ENVELOPE: PortMask = PortMask::of(&[
-        Port::EmbedTokens,
-        Port::Positions,
-        Port::KvLen,
-    ]);
+    pub const DECODE_ENVELOPE: PortMask =
+        PortMask::of(&[Port::EmbedTokens, Port::Positions, Port::KvLen]);
 
     pub const DEVICE_GEOMETRY: PortMask = PortMask::of(&[
         Port::EmbedTokens,

@@ -107,21 +107,19 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
 
         let once = grouped || copy;
         let mut passes = 1;
-        if !once {
-            if let Some(&cap) = descriptor.run_caps.get(index) {
-                let max_passes = descriptor.run_passes.get(index).copied().unwrap_or(0);
-                if max_passes > 1 {
-                    passes = super::compose::pass_spans(&mut runs, cap, max_passes);
-                } else {
-                    super::compose::chunk_spans(&mut runs, cap);
-                }
+        if !once && let Some(&cap) = descriptor.run_caps.get(index) {
+            let max_passes = descriptor.run_passes.get(index).copied().unwrap_or(0);
+            if max_passes > 1 {
+                passes = super::compose::pass_spans(&mut runs, cap, max_passes);
+            } else {
+                super::compose::chunk_spans(&mut runs, cap);
             }
         }
         let tail_start = if passes > 1 {
             region
                 .nodes
                 .clone()
-                .filter(|&node| {
+                .rfind(|&node| {
                     trace.nodes.get(node as usize).is_some_and(|node| {
                         matches!(
                             node.op,
@@ -132,7 +130,6 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
                         )
                     })
                 })
-                .last()
                 .map_or(region.nodes.end, |last| last + 1)
         } else {
             region.nodes.end

@@ -113,13 +113,13 @@ impl Default for GrammarBuilder {
 mod tests {
     use super::*;
 
+    #[test]
     fn builder_every_case() {
         test_build_simple_grammar();
         test_build_missing_root();
         test_build_missing_body();
     }
 
-    #[test]
     fn test_build_simple_grammar() {
         let mut b = GrammarBuilder::new();
         let root = b.add_rule("root");
@@ -153,5 +153,4 @@ mod tests {
         let result = b.build("root");
         assert!(result.is_err());
     }
-
 }

@@ -28,12 +28,12 @@ fn reference(act: &[f32], w: &[f32]) -> Vec<f32> {
     y
 }
 
+#[test]
 fn the_lane_projection_lands_the_f32_product_every_case() {
     the_f32_activation_lands_the_f32_product();
     a_bf16_activation_lands_a_bf16_product();
 }
 
-#[test]
 fn the_f32_activation_lands_the_f32_product() {
     let mut rng = Lcg::seeded(11);
     let act: Vec<f32> = (0..ROWS * K).map(|_| rng.unit()).collect();

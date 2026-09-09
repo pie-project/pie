@@ -350,7 +350,6 @@ fn check_contract(plan: &PlanView<'_>, contract: &ContractView<'_>, found: &mut 
             ));
         }
     }
-
 }
 
 fn encoding_matches(planned: &Encoding, demanded: &Encoding) -> bool {

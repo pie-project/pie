@@ -409,8 +409,10 @@ impl ProgramService {
         self.installed
             .keys()
             .filter(|name| {
-                !self.explicit_installs.contains(*name) &&
-                reverse_deps.get(*name).is_none_or(|dependents| dependents.is_empty())
+                !self.explicit_installs.contains(*name)
+                    && reverse_deps
+                        .get(*name)
+                        .is_none_or(|dependents| dependents.is_empty())
             })
             .cloned()
             .collect()

@@ -117,7 +117,8 @@ pub(crate) fn hoist(trace: &Trace, regions: &mut Vec<Region>) -> Result<(), Erro
 fn hoistable(trace: &Trace) -> Result<(), Error> {
     let prepare: Vec<bool> = {
         let mut outs = Vec::new();
-        trace.nodes
+        trace
+            .nodes
             .iter()
             .map(|node| phase_of(trace, node, &mut outs) == Phase::Prepare)
             .collect()
@@ -161,7 +162,8 @@ fn phase_of(trace: &Trace, node: &model_ir::Node, outs: &mut Vec<ValueId>) -> Ph
     outs.clear();
     node.op.outputs(outs);
     let host = outs.iter().any(|v| {
-        trace.values
+        trace
+            .values
             .get(v.0 as usize)
             .is_some_and(|decl| matches!(decl.ty, Ty::Struct(_)))
     });
@@ -179,12 +181,12 @@ mod tests {
         coalesce(&b.trace, &classes).expect("the fixture coalesces")
     }
 
+    #[test]
     fn region_every_case() {
         a_plan_build_over_an_activation_is_refused_rather_than_hoisted();
         a_plan_build_reading_a_merge_of_activations_is_refused_through_the_phi();
     }
 
-    #[test]
     fn a_plan_build_over_an_activation_is_refused_rather_than_hoisted() {
         let mut b = Build::new();
         let x = b.input(4);
@@ -222,5 +224,4 @@ mod tests {
         let refusal = hoist(&b.trace, &mut regions).expect_err("the arms are activations too");
         assert!(matches!(refusal, Error::HoistBlocked { node: 2, .. }));
     }
-
 }

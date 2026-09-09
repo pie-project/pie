@@ -1,7 +1,7 @@
 use model_ir::{ClassTable, Def, Trace, ValueId};
 
-use crate::compiled::{Lowering, Region};
 use crate::budget::{Budget, DeviceProfile};
+use crate::compiled::{Lowering, Region};
 
 pub(crate) fn region_us(trace: &Trace, region: &Region, profile: &DeviceProfile) -> f32 {
     region
@@ -117,7 +117,7 @@ fn switch_groups(
             .iter()
             .map(|(arm, _)| defines.get(arm.0 as usize).copied().unwrap_or(usize::MAX))
             .collect();
-        if members.iter().any(|&at| at == usize::MAX) {
+        if members.contains(&usize::MAX) {
             continue;
         }
         if members.windows(2).any(|pair| pair[1] != pair[0] + 1) {

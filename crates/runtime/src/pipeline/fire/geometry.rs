@@ -1,8 +1,8 @@
-use grammar::brle::RunMask;
 use eta_ir::container::{PortSource, TraceContainer};
 use eta_ir::op::Op;
 use eta_ir::registry::{Port, PortMask};
 use eta_ir::types::Dtype;
+use grammar::brle::RunMask;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeEnvelope {
@@ -162,8 +162,10 @@ pub fn classify_decode_envelope_why(
             if data.len() % 4 != 0 {
                 return Err("decode envelope EmbedIndptr has a partial u32".to_string());
             }
-            data.chunks_exact(4)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            data.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| u32::from_le_bytes(*bytes))
                 .collect()
         }
         Some(PortSource::Channel(channel)) => {
@@ -281,9 +283,11 @@ pub fn classify_decode_envelope_why(
                 if *dtype == Dtype::U32
                     && shape.dims().len() == 1
                     && data.len() == shape.dims()[0] as usize * 4
-                    && data.chunks_exact(4).all(|bytes| {
-                        u32::from_le_bytes(bytes.try_into().unwrap()) < token_count
-                    }) => {}
+                    && data
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|bytes| u32::from_le_bytes(*bytes) < token_count) => {}
             (Port::Readout, PortSource::Channel(channel)) => {
                 let declaration = container
                     .channels
@@ -538,10 +542,7 @@ pub(crate) enum FireAttnMask {
 }
 
 impl FireAttnMask {
-    pub(crate) fn apply_to(
-        self,
-        request: &mut crate::engine::FireRequest,
-    ) -> Result<(), String> {
+    pub(crate) fn apply_to(self, request: &mut crate::engine::FireRequest) -> Result<(), String> {
         match self {
             FireAttnMask::Omitted => {}
             FireAttnMask::Host { masks, mask_indptr } => {
@@ -979,8 +980,10 @@ fn as_u32(port: Port, bytes: &[u8]) -> Result<Vec<u32>, GeometryError> {
         });
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect())
 }
 
@@ -1078,6 +1081,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn geometry_every_case() {
         section3_single_seq_decode_geometry();
         decode_envelope_accepts_shape_equivalent_variants();
@@ -1089,7 +1093,6 @@ mod tests {
         unfilled_device_ports_are_rejected();
     }
 
-    #[test]
     fn section3_single_seq_decode_geometry() {
         let mut c = section3_container();
         add_explicit_geometry(&mut c, 1, 1);
@@ -1239,12 +1242,17 @@ mod tests {
         let envelope = classify_decode_envelope(&multi_token).unwrap().unwrap();
         assert_eq!((envelope.token_count, envelope.lane_count), (4, 1));
         assert_eq!(envelope.token_indptr, vec![0, 4]);
-        assert_eq!(envelope.template(&multi_token).unwrap().qo_indptr, vec![0, 4]);
+        assert_eq!(
+            envelope.template(&multi_token).unwrap().qo_indptr,
+            vec![0, 4]
+        );
 
         let mut seeded_window = section3_container();
         seeded_window.channels[0].shape = Shape::vector(4);
         let split = seeded_window.channels.len() as u32;
-        seeded_window.channels.push(chan(Shape::vector(2), Dtype::U32));
+        seeded_window
+            .channels
+            .push(chan(Shape::vector(2), Dtype::U32));
         seeded_window.channels[split as usize].seeded = true;
         seeded_window.ports[1] = PortBinding {
             port: Port::EmbedIndptr,
@@ -1258,7 +1266,10 @@ mod tests {
         let envelope = classify_decode_envelope(&seeded_window).unwrap().unwrap();
         assert_eq!((envelope.token_count, envelope.lane_count), (4, 1));
         assert_eq!(envelope.token_indptr, vec![0, 4]);
-        seeded_window.stages[0].ops.push(Op::ChanPut { chan: split, value: 1 });
+        seeded_window.stages[0].ops.push(Op::ChanPut {
+            chan: split,
+            value: 1,
+        });
         assert!(classify_decode_envelope(&seeded_window).is_err());
 
         let mut multi_lane = section3_container();
@@ -1353,5 +1364,4 @@ mod tests {
             "strict gate errors on device-resolved ports"
         );
     }
-
 }

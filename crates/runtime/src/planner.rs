@@ -189,8 +189,15 @@ impl StarveCause {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlannerError {
-    Impossible { need: u32, total: u32 },
-    Hog { need: u32, held: u32, total: u32 },
+    Impossible {
+        need: u32,
+        total: u32,
+    },
+    Hog {
+        need: u32,
+        held: u32,
+        total: u32,
+    },
     Starved {
         need: u32,
         free: u32,
@@ -221,10 +228,22 @@ impl std::fmt::Display for PlannerError {
                 f,
                 "{} pool starved: {need} {} asked, {free} free of {total}, {}, and no \
                  fire in flight anywhere to complete and free {}",
-                if matches!(cause, StarveCause::NoRsSlots) { "state" } else { "KV" },
-                if matches!(cause, StarveCause::NoRsSlots) { "slots" } else { "pages" },
+                if matches!(cause, StarveCause::NoRsSlots) {
+                    "state"
+                } else {
+                    "KV"
+                },
+                if matches!(cause, StarveCause::NoRsSlots) {
+                    "slots"
+                } else {
+                    "pages"
+                },
                 cause.describe(),
-                if matches!(cause, StarveCause::NoRsSlots) { "slots" } else { "pages" },
+                if matches!(cause, StarveCause::NoRsSlots) {
+                    "slots"
+                } else {
+                    "pages"
+                },
             ),
             PlannerError::Cancelled => f.write_str("planner request cancelled"),
         }
@@ -428,7 +447,9 @@ enum WaitKind {
         outcome: Option<Result<AllocationGrant, PlannerError>>,
         yielded: bool,
     },
-    Restore { demand: u32 },
+    Restore {
+        demand: u32,
+    },
 }
 
 struct Waiter {
@@ -639,21 +660,10 @@ impl Inner {
 }
 
 enum Step {
-    Absorb {
-        count: u32,
-        fund_by_eviction: bool,
-    },
-    ServeAllocation {
-        key: EntryKey,
-        demand: Demand,
-    },
-    ServeAllocationBurst {
-        extra: u32,
-    },
-    ServeRestore {
-        key: EntryKey,
-        pid: ProcessId,
-    },
+    Absorb { count: u32, fund_by_eviction: bool },
+    ServeAllocation { key: EntryKey, demand: Demand },
+    ServeAllocationBurst { extra: u32 },
+    ServeRestore { key: EntryKey, pid: ProcessId },
     Release(DevicePageReservation),
     Done,
 }
@@ -1032,9 +1042,7 @@ impl ResidencyPlanner {
         });
         match parked {
             Parked::Gone => Err(PlannerError::Cancelled),
-            Parked::NotResident => {
-                Ok(Acquired::Yield)
-            }
+            Parked::NotResident => Ok(Acquired::Yield),
             Parked::Entry(key, notify) => {
                 self.stats.parks.fetch_add(1, Ordering::Relaxed);
                 ptrace!("park key={:?} pid={} kv={}", key, pid, demand.kv_pages);
@@ -2532,7 +2540,12 @@ impl ResidencyPlanner {
                 .iter()
                 .map(|(key, waiter)| {
                     let kind = match &waiter.kind {
-                        WaitKind::Allocation { demand, outcome, yielded, .. } => format!(
+                        WaitKind::Allocation {
+                            demand,
+                            outcome,
+                            yielded,
+                            ..
+                        } => format!(
                             "alloc kv={} rs={} outcome={} yielded={yielded}",
                             demand.kv_pages,
                             demand.rs_slots,
@@ -2730,6 +2743,7 @@ mod service_order_tests {
         );
     }
 
+    #[test]
     fn planner_every_case() {
         a_restore_yields_the_head_to_a_younger_allocation();
         a_restore_takes_the_head_once_the_fleet_has_stalled();
@@ -2738,7 +2752,6 @@ mod service_order_tests {
         returning_host_room_resumes_the_yield();
     }
 
-    #[test]
     fn a_restore_yields_the_head_to_a_younger_allocation() {
         let (mut inner, pids) = fleet(&[
             (1, Residency::Evicted, true),
@@ -3153,5 +3166,4 @@ mod starvation_race_tests {
 
         parked.abort();
     }
-
 }

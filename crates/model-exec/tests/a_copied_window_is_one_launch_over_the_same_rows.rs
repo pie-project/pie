@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 
+use model_compiler::{Budget, CompiledModel, DeviceProfile, Lowering, Region, compile};
+use model_dsl::Platform;
 use model_exec::KernelError;
 use model_exec::dispatch::{
     DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
     DispatchLinear, DispatchSpatial,
 };
-use model_compiler::{CompiledModel, Budget, DeviceProfile, Lowering, Region, compile};
-use model_dsl::Platform;
-use model_exec::fire::{EventId, Filter, FireDescriptor, Lane, Serve, Sink, compose, fallback, walk};
+use model_exec::fire::{
+    EventId, Filter, FireDescriptor, Lane, Serve, Sink, compose, fallback, walk,
+};
 use model_ir::{
-    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation,
-    Trace, Spatial,
+    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation, Spatial,
+    Trace,
 };
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -162,7 +164,9 @@ impl Sink for Runs {
 }
 
 fn sku() -> (Trace, CompiledModel) {
-    let trace = models::sku(SKU).map(|row| row.trace).unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
+    let trace = models::sku(SKU)
+        .map(|row| row.trace)
+        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
     let trace = trace(Platform::Cuda);
     let compiled = compile(&trace, &budget(), &DeviceProfile::default())
         .unwrap_or_else(|refusal| panic!("`{SKU}` bakes: {refusal:?}"));
@@ -176,7 +180,12 @@ fn fragmenting(compiled: &CompiledModel) -> Vec<Lane> {
         .collect()
 }
 
-fn fire(trace: &Trace, compiled: &CompiledModel, lanes: &[Lane], copies: bool) -> (Runs, MockDispatch) {
+fn fire(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    lanes: &[Lane],
+    copies: bool,
+) -> (Runs, MockDispatch) {
     let composition = compose(compiled, &budget(), lanes).expect("the fire composes");
     let descriptor = FireDescriptor::of(&composition);
     let mut dispatch = MockDispatch::new(trace, copies);
@@ -193,12 +202,12 @@ fn fire(trace: &Trace, compiled: &CompiledModel, lanes: &[Lane], copies: bool) -
     (runs, dispatch)
 }
 
+#[test]
 fn a_copied_window_is_one_launch_over_the_same_rows_every_case() {
     a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs();
     the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it();
 }
 
-#[test]
 fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
     let (trace, compiled) = sku();
     let lanes = fragmenting(&compiled);
@@ -230,12 +239,14 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
     let copied: Vec<usize> = fragmented
         .iter()
         .copied()
-        .filter(|&at| fallback::copies(
+        .filter(|&at| {
+            fallback::copies(
                 &compiled,
                 model_ir::RowAxis::Tokens,
                 &compiled.template()[at].mask,
                 bucket,
-            ))
+            )
+        })
         .collect();
     assert_eq!(
         copied, fragmented,

@@ -32,7 +32,7 @@ pub fn encode_mxfp4_group_scalar(group: &[f32], out: &mut [u8]) -> u8 {
     for (v, code) in group.iter().zip(codes.iter_mut()) {
         *code = encode_fp4_e2m1(v * inv_s);
     }
-    for (k, pair) in codes.chunks_exact(2).enumerate() {
+    for (k, pair) in codes.as_chunks::<2>().0.iter().enumerate() {
         out[k] = (pair[1] << 4) | pair[0];
     }
     sb
@@ -56,6 +56,10 @@ pub fn encode_fp4_e2m1(x: f32) -> u8 {
 pub mod avx2 {
     use std::arch::x86_64::*;
 
+    /// # Safety
+    ///
+    /// The caller must have verified AVX2 support, and `row` must hold
+    /// exactly `out.len() * 2` bytes.
     #[target_feature(enable = "avx2")]
     pub unsafe fn decode_bf16_row(row: &[u8], out: &mut [f32]) {
         debug_assert!(row.len() == out.len() * 2);
@@ -76,6 +80,10 @@ pub mod avx2 {
         }
     }
 
+    /// # Safety
+    ///
+    /// The caller must have verified AVX2 support; `group` must hold 32
+    /// floats and `out` 16 bytes.
     #[target_feature(enable = "avx2")]
     pub unsafe fn encode_mxfp4_group(group: &[f32], out: &mut [u8]) -> u8 {
         debug_assert!(group.len() == 32 && out.len() == 16);
@@ -119,7 +127,7 @@ pub mod avx2 {
                 let code = _mm256_and_si256(_mm256_or_si256(mag, sign), nonzero);
                 _mm256_storeu_si256(codes.as_mut_ptr().add(i * 8).cast(), code);
             }
-            for (k, pair) in codes.chunks_exact(2).enumerate() {
+            for (k, pair) in codes.as_chunks::<2>().0.iter().enumerate() {
                 out[k] = ((pair[1] as u8) << 4) | pair[0] as u8;
             }
             sb

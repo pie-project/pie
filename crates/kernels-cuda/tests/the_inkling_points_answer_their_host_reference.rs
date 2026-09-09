@@ -8,13 +8,13 @@ use kernels_cuda::attn::ssm;
 use kernels_cuda::linear::{moe, rel_bias};
 use kernels_cuda::tensor::{RecurrentPool, Tensor};
 
+#[test]
 fn the_inkling_points_answer_their_host_reference_every_case() {
     the_short_conv_adds_the_input_back_and_shifts_the_window();
     the_relative_profile_is_the_features_through_the_bank();
     the_sink_router_normalizes_the_picks_with_the_sinks();
 }
 
-#[test]
 fn the_short_conv_adds_the_input_back_and_shifts_the_window() {
     let (rows, channels, k) = (3u32, 64usize, 4u32);
     let slot_of: [i32; 3] = [1, 3, 0];

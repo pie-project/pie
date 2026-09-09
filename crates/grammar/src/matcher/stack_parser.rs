@@ -421,10 +421,11 @@ impl StackParser {
                     }
                 }
 
-                if !self.expand_rule(RuleId(rule_id as u32), current_level, queue, visited) {
-                    if completed_at_level.contains(&rule_id) && visited.insert(parent_after) {
-                        queue.push(parent_after);
-                    }
+                if !self.expand_rule(RuleId(rule_id as u32), current_level, queue, visited)
+                    && completed_at_level.contains(&rule_id)
+                    && visited.insert(parent_after)
+                {
+                    queue.push(parent_after);
                 }
             }
 
@@ -589,10 +590,8 @@ impl StackParser {
 
         for i in rstart..rend {
             let (expected, parent) = self.return_arena[i];
-            if expected == chain_rule_id {
-                if visited.insert(parent) {
-                    queue.push(parent);
-                }
+            if expected == chain_rule_id && visited.insert(parent) {
+                queue.push(parent);
             }
         }
     }

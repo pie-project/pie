@@ -1,8 +1,8 @@
 mod bpe;
-mod unigram;
 pub mod canonical;
 pub mod contract;
 pub mod loader;
+mod unigram;
 
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
@@ -256,7 +256,10 @@ impl Tokenizer {
     }
 
     fn append_template_tail(&self, ids: &mut Vec<u32>) {
-        if let Pipeline::Unigram { eos_id: Some(id), .. } = &self.pipeline {
+        if let Pipeline::Unigram {
+            eos_id: Some(id), ..
+        } = &self.pipeline
+        {
             ids.push(*id);
         }
     }

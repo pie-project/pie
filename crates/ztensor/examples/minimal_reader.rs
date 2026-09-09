@@ -54,7 +54,10 @@ fn main() {
                 let term = Term::parse(ty.expect("an object without a layout has a type"))
                     .expect("well-formed type");
                 for p in term.planes(&shape).expect("shape fits the type") {
-                    println!("  {} {} {:?} at +{} ({} bytes)", p.path, p.leaf, p.shape, p.offset, p.len);
+                    println!(
+                        "  {} {} {:?} at +{} ({} bytes)",
+                        p.path, p.leaf, p.shape, p.offset, p.len
+                    );
                 }
             }
         }

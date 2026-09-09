@@ -27,12 +27,12 @@ fn close(got: f32, want: f32, what: &str, at: usize) {
     );
 }
 
+#[test]
 fn the_bare_binary_and_activation_ops_answer_the_reference_every_case() {
     the_bare_ops_answer_the_reference();
     each_may_write_the_rectangle_it_read();
 }
 
-#[test]
 fn the_bare_ops_answer_the_reference() {
     let mut lcg = Lcg::seeded(0xba4e);
     let (x_raw, x) = lcg.row(N);

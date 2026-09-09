@@ -83,12 +83,12 @@ fn check(head_dim: usize, heads: usize, rotary_dim: usize, window: Option<(u32, 
     }
 }
 
+#[test]
 fn the_fused_q_norm_rope_lands_the_pair_every_case() {
     a_full_rotary_head_lands_the_pair();
     a_partial_rotary_head_lands_the_pair_and_leaves_the_rest_normed();
 }
 
-#[test]
 fn a_full_rotary_head_lands_the_pair() {
     check(256, 4, 256, None);
 }

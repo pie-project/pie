@@ -271,12 +271,12 @@ fn read_json(path: &Path) -> Result<Option<Vec<u8>>, Error> {
 mod tests {
     use super::*;
 
+    #[test]
     fn diffusers_every_case() {
         every_known_component_takes_its_role_as_a_prefix();
         a_null_pair_is_not_a_component();
     }
 
-    #[test]
     fn every_known_component_takes_its_role_as_a_prefix() {
         assert_eq!(prefix_of("transformer"), "dit.");
         assert_eq!(prefix_of("transformer_2"), "dit2.");

@@ -23,7 +23,10 @@ pub enum Command {
         node: NodeId,
         reply: oneshot::Sender<Ack>,
     },
-    ReportWorker { id: WorkerId, status: WorkerStatus },
+    ReportWorker {
+        id: WorkerId,
+        status: WorkerStatus,
+    },
     Tick,
 }
 

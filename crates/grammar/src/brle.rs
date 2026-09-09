@@ -72,7 +72,7 @@ impl RunMask {
         let full_u32s = total_size / 32;
         let batch_u32s = full_u32s & !15;
 
-        for (batch_nr, chunk) in words[..batch_u32s].chunks_exact(16).enumerate() {
+        for (batch_nr, chunk) in words[..batch_u32s].as_chunks::<16>().0.iter().enumerate() {
             let w0 = fuse(chunk[0], chunk[1]);
             let w1 = fuse(chunk[2], chunk[3]);
             let w2 = fuse(chunk[4], chunk[5]);
@@ -121,7 +121,7 @@ impl RunMask {
 
         let remaining_pairs = &words[batch_u32s..full_u32s];
         let rem_base_bits = (batch_u32s as u32) * 32;
-        for (p, pair) in remaining_pairs.chunks_exact(2).enumerate() {
+        for (p, pair) in remaining_pairs.as_chunks::<2>().0.iter().enumerate() {
             let w64 = fuse(pair[0], pair[1]);
             let shifted = (w64 << 1) | prev_msb;
             let mut tr = w64 ^ shifted;
@@ -687,13 +687,13 @@ impl FusedIterator for RunIterator<'_> {}
 mod tests {
     use super::*;
 
+    #[test]
     fn brle_every_case() {
         roundtrip_complex_pattern();
         from_slice_leading_true_run();
         iter_runs_skips_zero_length_prefix();
     }
 
-    #[test]
     fn roundtrip_complex_pattern() {
         let pattern = vec![
             false, false, true, true, true, false, true, false, false, false,
@@ -715,5 +715,4 @@ mod tests {
         let runs: Vec<_> = b.iter_runs().collect();
         assert_eq!(runs, vec![(true, 0, 3)]);
     }
-
 }

@@ -43,6 +43,7 @@ fn object_of(path: &PathBuf, name: &str) -> ztensor::Object {
         .clone()
 }
 
+#[test]
 fn sharding_every_case() {
     lora_overlay();
     positional_shards();
@@ -63,7 +64,6 @@ fn sharding_every_case() {
     an_external_range_may_be_empty_but_not_backwards();
 }
 
-#[test]
 fn lora_overlay() {
     let base_path = tmp("overlay-base.zt");
     let base_data: Vec<u8> = (0..1024u32)
@@ -102,7 +102,11 @@ fn lora_overlay() {
     );
 
     let base_at = model.tensor("base.weight").unwrap().locate().unwrap();
-    let lora_at = model.tensor("base.weight.lora_a").unwrap().locate().unwrap();
+    let lora_at = model
+        .tensor("base.weight.lora_a")
+        .unwrap()
+        .locate()
+        .unwrap();
     assert_ne!(base_at.store, lora_at.store);
     assert_eq!(model.store(base_at.store).path(), base_path);
     assert_eq!(model.store(lora_at.store).path(), lora_path);
@@ -353,7 +357,10 @@ fn a_sha256_shard_identity_round_trips() {
     let from_writer = ztensor::read::shard_identity(&shard_path, DigestAlgorithm::Sha256).unwrap();
 
     assert_eq!(from_writer.digest.algorithm, "sha256");
-    assert_eq!(from_writer.digest.algorithm().unwrap(), DigestAlgorithm::Sha256);
+    assert_eq!(
+        from_writer.digest.algorithm().unwrap(),
+        DigestAlgorithm::Sha256
+    );
     assert_eq!(from_writer.digest.value.len(), 32);
     assert!(from_writer.digest.to_string().starts_with("sha256:"));
     assert_eq!(from_writer.digest.to_string().len(), "sha256:".len() + 64);
@@ -372,8 +379,10 @@ fn a_sha256_shard_identity_round_trips() {
         .unwrap();
     w.add_shard("data", &from_writer).unwrap();
     let at = offset..offset + payload.len() as u64;
-    w.object("t", |o| o.shape([4096u64]).term(Leaf::U8).external("data", at))
-        .unwrap();
+    w.object("t", |o| {
+        o.shape([4096u64]).term(Leaf::U8).external("data", at)
+    })
+    .unwrap();
     w.finish().unwrap();
 
     let model = open_with_shard_at(&root_path, shard_path.clone()).unwrap();
@@ -439,13 +448,19 @@ fn a_sha256_object_digest_is_verified() {
 
     let good = build("sha-obj-ok.zt", DigestAlgorithm::Sha256.digest(&data));
     let src = Source::open(&good).unwrap();
-    assert_eq!(src.tensor("t").unwrap().digest().unwrap().algorithm, "sha256");
+    assert_eq!(
+        src.tensor("t").unwrap().digest().unwrap().algorithm,
+        "sha256"
+    );
     assert!(
         src.tensor("t").unwrap().verify().unwrap().is_checked(),
         "a sha256 digest must be checked, not skipped"
     );
 
-    let bad = build("sha-obj-bad.zt", DigestAlgorithm::Sha256.digest(&[0u8; 256]));
+    let bad = build(
+        "sha-obj-bad.zt",
+        DigestAlgorithm::Sha256.digest(&[0u8; 256]),
+    );
     let err = Source::open(&bad)
         .unwrap()
         .tensor("t")
@@ -552,8 +567,14 @@ fn equal_sized_shards_are_resolved_by_content() {
         .resolver(ztensor::read::DirectoryResolver::scan(&dir).unwrap())
         .open(&root_path)
         .unwrap();
-    assert_eq!(&*model.tensor("t0").unwrap().bytes().unwrap(), &[1u8; 64][..]);
-    assert_eq!(&*model.tensor("t1").unwrap().bytes().unwrap(), &[2u8; 64][..]);
+    assert_eq!(
+        &*model.tensor("t0").unwrap().bytes().unwrap(),
+        &[1u8; 64][..]
+    );
+    assert_eq!(
+        &*model.tensor("t1").unwrap().bytes().unwrap(),
+        &[2u8; 64][..]
+    );
     model.verify_shards().unwrap();
 }
 
@@ -586,8 +607,10 @@ fn an_external_range_may_be_empty_but_not_backwards() {
 
     #[allow(clippy::reversed_empty_ranges)]
     let empty = 4096..4096;
-    w.object("empty", |o| o.shape([0u64]).term(Leaf::U8).external("s", empty))
-        .unwrap();
+    w.object("empty", |o| {
+        o.shape([0u64]).term(Leaf::U8).external("s", empty)
+    })
+    .unwrap();
 
     #[allow(clippy::reversed_empty_ranges)]
     let backwards = 8192..4096;

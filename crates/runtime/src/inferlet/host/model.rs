@@ -102,7 +102,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
     async fn draft_block(&mut self) -> Result<Option<pie::inferlet::model::BlockDrafter>> {
         let caps = model::model().eta_caps();
         Ok(
-            (caps.draft_block > 0).then(|| pie::inferlet::model::BlockDrafter {
+            (caps.draft_block > 0).then_some(pie::inferlet::model::BlockDrafter {
                 rows: caps.draft_block,
                 mask_token: caps.draft_mask_token,
                 bidirectional: caps.draft_bidirectional,

@@ -73,13 +73,13 @@ fn run(c_in: usize, c_out: usize, boxes: &[Box3], conv: Conv3d) {
     );
 }
 
+#[test]
 fn the_tensor_core_conv_lands_what_the_direct_kernel_lands_every_case() {
     the_two_kernels_agree_over_a_causal_cached_block();
     the_two_kernels_agree_off_the_tile_boundaries();
     the_unnamed_entry_takes_the_tensor_cores_on_a_vectorisable_shape();
 }
 
-#[test]
 fn the_two_kernels_agree_over_a_causal_cached_block() {
     run(
         64,

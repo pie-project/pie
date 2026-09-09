@@ -102,18 +102,12 @@ impl Run<'_> {
                 self.tensor(*left),
                 self.tensor(*right),
             ),
-            Layout::PoolRows { x, side, y } => layout::pool_rows(
-                self.ctx(),
-                self.tensor(*x),
-                *side,
-                self.tensor(*y),
-            ),
-            Layout::MergeRows { x, side, y } => layout::merge_rows(
-                self.ctx(),
-                self.tensor(*x),
-                *side,
-                self.tensor(*y),
-            ),
+            Layout::PoolRows { x, side, y } => {
+                layout::pool_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
+            }
+            Layout::MergeRows { x, side, y } => {
+                layout::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
+            }
             Layout::ScatterLiveRows {
                 src,
                 routes,
@@ -162,7 +156,12 @@ impl Run<'_> {
                 self.tensor(*perm),
                 self.uncut(*y),
             ),
-            Layout::TopK { x, k, values, indices } => layout::topk(
+            Layout::TopK {
+                x,
+                k,
+                values,
+                indices,
+            } => layout::topk(
                 self.ctx(),
                 self.tensor(*x),
                 *k,

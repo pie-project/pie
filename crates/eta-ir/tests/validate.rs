@@ -122,6 +122,7 @@ fn section3() -> TraceContainer {
     }
 }
 
+#[test]
 fn validate_every_case() {
     embed_tokens_requires_kv_len();
     spsc_second_producer_rejected();
@@ -130,7 +131,6 @@ fn validate_every_case() {
     name_table_must_be_strictly_sorted_and_unique();
 }
 
-#[test]
 fn embed_tokens_requires_kv_len() {
     let mut c = section3();
     c.ports.retain(|binding| binding.port != Port::KvLen);

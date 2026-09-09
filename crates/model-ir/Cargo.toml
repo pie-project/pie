@@ -12,7 +12,5 @@ name = "model_ir"
 path = "src/lib.rs"
 
 [dependencies]
-# `Dtype`, re-exported from `value.rs` at the path this crate spells it. A leaf
-# beneath a leaf: the checkpoint loader names the same element type.
 dtype = { path = "../dtype" }
 serde = { version = "1.0", features = ["derive"] }

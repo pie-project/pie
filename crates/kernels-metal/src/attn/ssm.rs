@@ -115,12 +115,15 @@ fn gdn_scan_launch_at(
     vrows: u32,
     point: fn(u32, u32) -> Option<(&'static str, &'static str)>,
 ) -> Option<(&'static str, &'static str, Grid)> {
-    if vrows == 0 || shape.v_dim % vrows != 0 || shape.k_dim % GDN_SCAN_LANES != 0 {
+    if vrows == 0
+        || !shape.v_dim.is_multiple_of(vrows)
+        || !shape.k_dim.is_multiple_of(GDN_SCAN_LANES)
+    {
         return None;
     }
     let (entry, stamp) = point(vrows, shape.k_dim / GDN_SCAN_LANES)?;
     let row_groups = shape.v_dim / vrows;
-    let tg_rows = if row_groups % GDN_SCAN_TG_ROWS == 0 {
+    let tg_rows = if row_groups.is_multiple_of(GDN_SCAN_TG_ROWS) {
         GDN_SCAN_TG_ROWS
     } else {
         1
@@ -173,6 +176,7 @@ struct Delta {
 }
 
 impl Delta {
+    #[allow(clippy::too_many_arguments)]
     fn of(
         op: &'static str,
         qkv: Tensor,
@@ -187,10 +191,12 @@ impl Delta {
         nonzero(op, "the value heads this statement states", v_heads)?;
         nonzero(op, "the key head width this statement states", k_dim)?;
         nonzero(op, "the value head width this statement states", v_dim)?;
-        if v_heads % k_heads != 0 {
+        if !v_heads.is_multiple_of(k_heads) {
             return Err(refuse(
                 op,
-                format!("the {v_heads} value heads are not a whole number of the {k_heads} key heads"),
+                format!(
+                    "the {v_heads} value heads are not a whole number of the {k_heads} key heads"
+                ),
             ));
         }
         head_width(op, k_dim, "the key head width")?;
@@ -266,7 +272,9 @@ fn conv_history(op: &'static str, conv_width: u32, dilation: u32) -> Result<u32,
         .ok_or_else(|| {
             refuse(
                 op,
-                format!("a width of {conv_width} at dilation {dilation} keeps no countable history"),
+                format!(
+                    "a width of {conv_width} at dilation {dilation} keeps no countable history"
+                ),
             )
         })
 }
@@ -288,7 +296,10 @@ pub fn causal_conv1d(
         y.rows == x.rows && y.width == x.width,
         "the conv lands the row it convolves"
     );
-    let taps = stated(OP, nonzero(OP, "the conv width this statement states", conv_width)?)?;
+    let taps = stated(
+        OP,
+        nonzero(OP, "the conv width this statement states", conv_width)?,
+    )?;
     let hist = conv_history(OP, conv_width, dilation)?;
     debug_assert_eq!(
         u64::from(state.conv_state.width),
@@ -328,7 +339,10 @@ pub fn causal_conv1d_chunked(
         y.rows == x.data.rows && y.width == x.data.width,
         "the conv lands the row it convolves"
     );
-    let taps = stated(OP, nonzero(OP, "the conv width this statement states", conv_width)?)?;
+    let taps = stated(
+        OP,
+        nonzero(OP, "the conv width this statement states", conv_width)?,
+    )?;
     let hist = conv_history(OP, conv_width, dilation)?;
     debug_assert_eq!(
         u64::from(state.conv_state.width),
@@ -364,7 +378,7 @@ pub fn gdn_prep(
     let entry = dtype_dispatch!(OP, ba.dtype, { Bf16 => "qwen_gdn_ba_gates_bfloat16" });
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` lands an f32 decay row");
-    if ba.width == 0 || ba.width % 2 != 0 {
+    if ba.width == 0 || !ba.width.is_multiple_of(2) {
         return Err(refuse(
             OP,
             format!(
@@ -637,19 +651,22 @@ mod tests {
         v_dim: 128,
     };
 
+    #[test]
     fn ssm_every_case() {
         the_three_scans_share_one_geometry();
         a_shape_the_stamp_does_not_name_falls_back();
     }
 
-    #[test]
     fn the_three_scans_share_one_geometry() {
         let plain = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_point).expect("stamped");
         let step = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_step_point).expect("stamped");
         let committed = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_committed_point).expect("stamped");
         assert_eq!(plain.0, "gated_delta_scan_bfloat16_l_32_v_4_p_4");
         assert_eq!(step.0, "gated_delta_scan_step_bfloat16_l_32_v_4_p_4");
-        assert_eq!(committed.0, "gated_delta_scan_committed_bfloat16_l_32_v_4_p_4");
+        assert_eq!(
+            committed.0,
+            "gated_delta_scan_committed_bfloat16_l_32_v_4_p_4"
+        );
         assert!(committed.1.starts_with("PIE_STAMP_gdn_scan_committed("));
         assert_eq!(plain.2, step.2);
         assert_eq!(plain.2, committed.2);
@@ -657,20 +674,13 @@ mod tests {
     }
 
     fn a_shape_the_stamp_does_not_name_falls_back() {
-        let odd = Delta {
-            k_dim: 100,
-            ..D27B
-        };
+        let odd = Delta { k_dim: 100, ..D27B };
         assert!(gdn_scan_launch(&odd, 1).is_none());
-        let deep = Delta {
-            k_dim: 512,
-            ..D27B
-        };
+        let deep = Delta { k_dim: 512, ..D27B };
         assert!(gdn_scan_launch(&deep, 1).is_none());
         let ragged = Delta { v_dim: 66, ..D27B };
         assert!(gdn_scan_launch(&ragged, 1).is_none());
     }
-
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -685,12 +695,18 @@ fn committed_lanes(op: &'static str, indptr: Tensor) -> Result<u32, Error> {
     if indptr.dtype != Dtype::I32 {
         return Err(refuse(
             op,
-            format!("the window CSR's boundaries are {:?}, and this arm walks an i32 indptr", indptr.dtype),
+            format!(
+                "the window CSR's boundaries are {:?}, and this arm walks an i32 indptr",
+                indptr.dtype
+            ),
         ));
     }
     match indptr.rows.checked_sub(1) {
         Some(lanes) if lanes > 0 => Ok(lanes),
-        _ => Err(refuse(op, "the window CSR this fire names spans no request")),
+        _ => Err(refuse(
+            op,
+            "the window CSR this fire names spans no request",
+        )),
     }
 }
 
@@ -710,10 +726,16 @@ pub fn causal_conv1d_committed(
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "causal_conv1d_committed_bfloat16" });
     let channels = nonzero(OP, "the conv's channel count", x.width)?;
     nonzero(OP, "extended rows", x.rows)?;
-    let taps = stated(OP, nonzero(OP, "the conv width this statement states", conv_width)?)?;
+    let taps = stated(
+        OP,
+        nonzero(OP, "the conv width this statement states", conv_width)?,
+    )?;
     let hist = conv_history(OP, conv_width, dilation)?;
     if hist > 64 {
-        return Err(refuse(OP, format!("a history of {hist} rows is past the 64 this arm stages")));
+        return Err(refuse(
+            OP,
+            format!("a history of {hist} rows is past the 64 this arm stages"),
+        ));
     }
     let lanes = committed_lanes(OP, indptr)?;
     ctx.fire(

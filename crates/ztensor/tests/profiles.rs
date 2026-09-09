@@ -72,6 +72,7 @@ fn shape(dims: &[u64]) -> (Value, Value) {
     )
 }
 
+#[test]
 fn profiles_every_case() {
     a_group_type_round_trips_plane_by_plane();
     planes_and_padded_bytes_are_the_same_object();
@@ -94,13 +95,12 @@ fn profiles_every_case() {
     a_registered_layout_rejects_a_file_that_violates_it();
 }
 
-#[test]
 fn a_group_type_round_trips_plane_by_plane() {
     let path = tmp("planes.zt");
     let term = Term::parse("g32_u4_bf16_b_bf16").unwrap();
     let codes: Vec<u8> = (0..64).collect();
-    let scales = vec![0x3fu8; 8];
-    let biases = vec![0x40u8; 8];
+    let scales = [0x3fu8; 8];
+    let biases = [0x40u8; 8];
 
     let mut w = Writer::create(&path).unwrap();
     w.object("q", |o| {
@@ -138,8 +138,10 @@ fn planes_and_padded_bytes_are_the_same_object() {
     assert_eq!(whole.len() as u64, term.canonical_size(&[3, 16]).unwrap());
 
     let mut w = Writer::create(&path).unwrap();
-    w.object("by_bytes", |o| o.shape([3u64, 16]).term(term.clone()).bytes(&whole))
-        .unwrap();
+    w.object("by_bytes", |o| {
+        o.shape([3u64, 16]).term(term.clone()).bytes(&whole)
+    })
+    .unwrap();
     w.object("by_planes", |o| {
         o.shape([3u64, 16])
             .term(term.clone())
@@ -164,7 +166,9 @@ fn the_writer_checks_planes_against_the_type() {
     let (codes, scales) = ([0u8; 32], [0u8; 2]);
 
     let err = w
-        .object("q", |o| o.shape([64u64]).term(term.clone()).planes([&codes[..]]))
+        .object("q", |o| {
+            o.shape([64u64]).term(term.clone()).planes([&codes[..]])
+        })
         .unwrap_err();
     assert!(err.to_string().contains("2 planes"), "{err}");
 
@@ -202,7 +206,11 @@ fn a_malformed_type_is_rejected() {
     let path = tmp("bad-type.zt");
     assemble(
         &path,
-        vec![shape(&[64]), (text("type"), text("g64_u4_bf16")), blob(4096, 64)],
+        vec![
+            shape(&[64]),
+            (text("type"), text("g64_u4_bf16")),
+            blob(4096, 64),
+        ],
     );
     let err = Source::open(&path).unwrap_err();
     assert_eq!(err.rule(), Some(Rule::Type), "{err}");
@@ -210,7 +218,11 @@ fn a_malformed_type_is_rejected() {
     let path = tmp("bad-type-shape.zt");
     assemble(
         &path,
-        vec![shape(&[100]), (text("type"), text("g32_u4_bf16_n")), blob(4096, 64)],
+        vec![
+            shape(&[100]),
+            (text("type"), text("g32_u4_bf16_n")),
+            blob(4096, 64),
+        ],
     );
     let err = Source::open(&path).unwrap_err();
     assert_eq!(err.rule(), Some(Rule::Type), "{err}");
@@ -220,7 +232,11 @@ fn a_blob_of_the_wrong_size_is_rejected() {
     let path = tmp("bad-size.zt");
     assemble(
         &path,
-        vec![shape(&[64]), (text("type"), text("g32_e2m1_e8m0_n")), blob(4096, 34)],
+        vec![
+            shape(&[64]),
+            (text("type"), text("g32_e2m1_e8m0_n")),
+            blob(4096, 34),
+        ],
     );
     let err = Source::open(&path).unwrap_err();
     assert_eq!(err.rule(), Some(Rule::Size), "{err}");
@@ -228,7 +244,11 @@ fn a_blob_of_the_wrong_size_is_rejected() {
     let path = tmp("good-size.zt");
     assemble(
         &path,
-        vec![shape(&[64]), (text("type"), text("g32_e2m1_e8m0_n")), blob(4096, 258)],
+        vec![
+            shape(&[64]),
+            (text("type"), text("g32_e2m1_e8m0_n")),
+            blob(4096, 258),
+        ],
     );
     Source::open(&path).unwrap();
 }
@@ -294,7 +314,10 @@ fn block_digests_verify_one_window_at_a_time() {
     }
     assert!(t.verify_block(3, &[]).is_err(), "no fourth block");
     assert!(
-        matches!(t.verify_block(0, &bytes[..999]), Err(Error::InvalidInput(_))),
+        matches!(
+            t.verify_block(0, &bytes[..999]),
+            Err(Error::InvalidInput(_))
+        ),
         "a window of the wrong length is a caller error"
     );
     let mut wrong = bytes[2000..].to_vec();
@@ -391,7 +414,10 @@ fn csr_round_trips_through_its_plan() {
         object.attributes.as_ref(),
     )
     .unwrap();
-    assert_eq!((plan.rows, plan.cols, plan.nnz, plan.index), (2, 3, 2, Leaf::U32));
+    assert_eq!(
+        (plan.rows, plan.cols, plan.nnz, plan.index),
+        (2, 3, 2, Leaf::U32)
+    );
     assert_eq!(plan.indptr.offset, 0);
     assert_eq!(plan.indices.offset, 256);
     assert_eq!(plan.values[0].offset, 512);
@@ -732,6 +758,7 @@ mod zstd_seekable {
             .unwrap()
     }
 
+    #[test]
     fn profiles_1_every_case() {
         encoded_dense_roundtrip();
         encoded_empty_blob();
@@ -740,7 +767,6 @@ mod zstd_seekable {
         corrupt_stream_rejected_not_zero_filled();
     }
 
-    #[test]
     fn encoded_dense_roundtrip() {
         let path = tmp("zstd.zt");
         let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
@@ -776,8 +802,10 @@ mod zstd_seekable {
     fn encoded_empty_blob() {
         let path = tmp("zstd-empty.zt");
         let mut w = writer(&path);
-        w.object("e", |o| o.shape([0u64]).term(Leaf::U8).encoding(ENC).bytes(&[]))
-            .unwrap();
+        w.object("e", |o| {
+            o.shape([0u64]).term(Leaf::U8).encoding(ENC).bytes(&[])
+        })
+        .unwrap();
         w.finish().unwrap();
         let src = Source::open(&path).unwrap();
         assert_eq!(&*src.tensor("e").unwrap().bytes().unwrap(), &[] as &[u8]);
@@ -818,7 +846,10 @@ mod zstd_seekable {
         let data = vec![9u8; 100_000];
         let mut w = writer(&path);
         w.object("t", |o| {
-            o.shape([100_000u64]).term(Leaf::U8).encoding(ENC).bytes(&data)
+            o.shape([100_000u64])
+                .term(Leaf::U8)
+                .encoding(ENC)
+                .bytes(&data)
         })
         .unwrap();
         w.finish().unwrap();

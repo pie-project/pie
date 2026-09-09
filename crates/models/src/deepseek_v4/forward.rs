@@ -248,7 +248,7 @@ fn layer(
 
     let (o, lse) = ops::attn::prefill_lse(
         &q,
-        &plan_p,
+        plan_p,
         pages,
         Some(m.window),
         m.head_dim,

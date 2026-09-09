@@ -54,7 +54,7 @@ jobs:
     if: needs.setup.outputs.build_backend == 'python'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -192,7 +192,7 @@ jobs:
     if: needs.setup.outputs.build_backend == 'maturin'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -213,7 +213,7 @@ jobs:
     if: needs.setup.outputs.build_backend == 'maturin'
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -234,7 +234,7 @@ jobs:
     if: needs.setup.outputs.build_backend == 'maturin'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -254,7 +254,7 @@ jobs:
     if: needs.setup.outputs.build_backend == 'maturin'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -273,7 +273,7 @@ jobs:
     if: needs.setup.outputs.build_backend == 'maturin'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:

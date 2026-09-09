@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+type OwnedRing = (Box<[u8]>, Box<[AtomicU64]>);
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChannelValue {
     pub channel: u64,
@@ -10,7 +12,7 @@ pub struct ChannelValue {
 
 #[derive(Debug)]
 pub struct HostRing {
-    owned: Option<(Box<[u8]>, Box<[AtomicU64]>)>,
+    owned: Option<OwnedRing>,
     mirror_base: u64,
     word_base: u64,
     mirror_bytes: u64,
@@ -43,6 +45,10 @@ impl HostRing {
         }
     }
 
+    /// # Safety
+    ///
+    /// `mirror` and `words` must point at a live mapping of at least
+    /// `capacity + 1` cells of `cell_bytes` that outlives the returned ring.
     #[must_use]
     pub unsafe fn adopt(mirror: u64, words: u64, cell_bytes: u32, capacity: u32) -> HostRing {
         let slots = u64::from(capacity).saturating_add(1);
@@ -238,11 +244,7 @@ impl ChannelJoin {
         self.instances.remove(&instance);
     }
 
-    pub fn pump_in(
-        &self,
-        engine: &mut dyn engine::Engine,
-        instance: u64,
-    ) -> engine::Result<()> {
+    pub fn pump_in(&self, engine: &mut dyn engine::Engine, instance: u64) -> engine::Result<()> {
         let Some(channels) = self.instances.get(&instance) else {
             return Ok(());
         };
@@ -289,11 +291,7 @@ impl ChannelJoin {
         Ok(())
     }
 
-    pub fn pump_out(
-        &self,
-        engine: &mut dyn engine::Engine,
-        instance: u64,
-    ) -> engine::Result<()> {
+    pub fn pump_out(&self, engine: &mut dyn engine::Engine, instance: u64) -> engine::Result<()> {
         self.pump_out_with(engine, instance, None)
     }
 

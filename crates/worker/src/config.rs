@@ -5,9 +5,13 @@ use controller_api::Role;
 pub use engine::runahead::Runahead;
 use serde::{Deserialize, Serialize};
 
+/// Backend-specific option structs (typed views over `EngineConfig::options`).
 pub mod backend;
+/// Where a key LIVES in the operator's file (section list, moved-key map).
 pub mod layout;
+/// The dotted-path schema `pie config set`/`get` walk.
 pub mod schema;
+/// The unit-carrying value types (`"50ms"`, `"4GiB"`): [`Duration`], [`ByteSize`].
 pub mod units;
 
 pub use backend::{
@@ -18,6 +22,15 @@ pub use units::{ByteSize, Duration};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Client-facing listener, plus what pie fetches inferlets from.
+    /// OpenTelemetry export. Off by default.
+    /// Batching and timeout policy. Every field has a measured default; the
+    /// frame knobs are part of the guest contract.
+    /// The box an inferlet runs in: what it may reach, and how big it may get.
+    /// Distributed-cluster topology (controller + role + gateways). Absent, or
+    /// `controller` unset ⇒ single-node (gateway-free local inference).
+    /// Limits on remote clients leasing this worker's KV space.
+    /// Disaggregated serving: moving prefill and KV to partner workers.
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -32,10 +45,16 @@ pub struct Config {
     pub executor: ExecutorConfig,
     #[serde(default)]
     pub offload: OffloadConfig,
+    /// The single `[model]` table. Pie serves exactly one model.
     pub model: ModelConfig,
 }
 
 impl Config {
+    /// Parse the operator's file into a validated [`Config`].
+    ///
+    /// Pure: no file IO, no env, no clap. The file's sections are reshaped
+    /// first — see [`crate::config::layout`] — so the rest of this parse
+    /// still sees the shape the file was written against.
     pub fn parse(s: &str) -> Result<Self> {
         let file: toml::Table = toml::from_str(s).map_err(|e| {
             if s.contains("[[model]]") {
@@ -66,6 +85,18 @@ impl Config {
         Ok(cfg)
     }
 
+    /// State a diagnostics word list into `[model.engine.options] diagnostics`
+    /// — what `pie serve --diag …` / `pie run --diag …` does to the config it
+    /// just read, so a person debugging never edits a file to turn a trace on.
+    ///
+    /// The words themselves are the shell's vocabulary and are parsed there
+    /// (`engine_cuda::Diagnostics`, `engine_metal::Diagnostics`), at boot,
+    /// where an unknown one refuses by name.
+    ///
+    /// # Errors
+    ///
+    /// An engine flavor with no diagnostics record. A flag that quietly did
+    /// nothing would be the same silence the typed record exists to end.
     pub fn state_diagnostics(&mut self, words: &str) -> Result<()> {
         match self.model.engine.kind {
             EngineKind::CudaNative | EngineKind::Metal => {
@@ -98,6 +129,8 @@ impl Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
+    /// Remote clients that may hold a scratch lease at once; the KV pool is
+    /// divided evenly across this many slots.
     #[serde(default = "default_executor_max_clients")]
     pub max_clients: usize,
 }
@@ -127,12 +160,19 @@ fn default_executor_max_clients() -> usize {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OffloadConfig {
+    /// Serve prefill and KV from partner workers rather than only locally.
+    /// Off by default; enabling it also publishes an artifact digest.
+    /// Shortest suffix worth offloading a prefill for; `0` derives one from
+    /// the transport (512 tokens over NIXL, 2048 inline).
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub prefill_min_suffix_tokens: usize,
+    /// Transfers in flight to any one partner before the next waits.
     #[serde(default = "default_offload_max_outstanding")]
     pub max_outstanding_per_partner: u32,
+    /// How KV pages cross between workers — see [`OffloadTransfer`]. No
+    /// shipped build hosts NIXL, so `nixl` refuses the boot.
     #[serde(default)]
     pub transfer: OffloadTransfer,
 }
@@ -162,6 +202,11 @@ fn default_offload_max_outstanding() -> u32 {
     4
 }
 
+/// How KV pages cross between workers.
+///
+/// No shipped build hosts `Nixl`: it parses but fails the boot at
+/// `link::partner::PartnerLinkManager::new` with a missing-feature error.
+/// `Auto` takes NIXL where available, which today is nowhere.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OffloadTransfer {
@@ -171,9 +216,15 @@ pub enum OffloadTransfer {
     Auto,
 }
 
+/// Distributed-cluster topology. Absent, or `controller` unset ⇒ single-node
+/// (the worker terminates clients directly; no controller/gateway).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
+    /// Controller endpoint (`tcp://host:port`, a bare `host:port`, or
+    /// `unix:/path`); set ⇒ this worker joins a distributed cluster.
+    /// This worker's role (required when `controller` is set).
+    /// Gateway endpoint(s) this worker dials into (distributed).
     #[serde(default)]
     pub controller: Option<String>,
     #[serde(default)]
@@ -203,16 +254,25 @@ impl ClusterConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Address the client edge binds. Loopback by default -- a reachable port
+    /// should be something an operator asks for.
     #[serde(default = "default_host")]
     pub host: String,
+    /// Port the client edge binds.
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Verbose server logging, and passed down to the embedded engine.
+    /// Independent of `--log-level`, which sets the tracing filter.
     #[serde(default)]
     pub verbose: bool,
+    /// Where `pie inferlet` downloads from, and where the engine fetches a
+    /// program it is asked to run but does not have.
     #[serde(default = "default_registry")]
     pub registry: String,
+    /// Tokio worker threads. Derived from the visible CPUs, capped at 64.
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
+    /// Largest blob a client may upload in one request.
     #[serde(default = "default_max_upload")]
     pub max_upload: ByteSize,
 }
@@ -265,10 +325,13 @@ fn default_max_upload() -> ByteSize {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
+    /// Export traces over OTLP.
     #[serde(default)]
     pub enabled: bool,
+    /// OTLP collector to export to.
     #[serde(default = "default_otlp_endpoint")]
     pub endpoint: String,
+    /// `service.name` on exported spans.
     #[serde(default = "default_service_name")]
     pub service_name: String,
 }
@@ -290,25 +353,49 @@ fn default_service_name() -> String {
     "pie".to_string()
 }
 
+/// The box an inferlet runs in: its walls and its size.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
+    /// Give each inferlet a private `/scratch` with read-write access.
+    /// Off by default: nothing else in the sandbox reaches a filesystem.
     #[serde(default)]
     pub allow_fs: bool,
+    /// Where the per-process `/scratch` directories are made. Ignored unless
+    /// `allow_fs` is set.
     #[serde(default = "default_fs_scratch_dir")]
     pub fs_scratch_dir: PathBuf,
+    /// Allow outbound network from inferlets at all. `false` is the tight
+    /// setting -- it is the only one that also stops `wasi:http`.
     #[serde(default = "default_true")]
     pub allow_network: bool,
+    /// Hosts an inferlet may reach, `["*"]` for any.
+    ///
+    /// Filters `wasi:sockets` only; `wasi:http` bypasses it, so use
+    /// `allow_network = false` instead when that matters.
     #[serde(default = "default_network_allowed_hosts")]
     pub network_allowed_hosts: Vec<String>,
+    /// Instances the wasmtime pooling allocator may hold. A ceiling on
+    /// concurrent inferlets, reserved up front.
     #[serde(default = "default_max_instances")]
     pub max_instances: u32,
+    /// Linear memory one instance may address.
     #[serde(default = "default_max_memory")]
     pub max_memory: ByteSize,
+    /// Linear memory kept resident when an instance is returned to the pool,
+    /// rather than decommitted. Trades RSS for a cheaper next start; `0B`
+    /// keeps none.
     #[serde(default)]
     pub warm_memory: ByteSize,
+    /// Unused pool slots kept warm rather than torn down.
     #[serde(default = "default_warm_slots")]
     pub warm_slots: u32,
+    /// Apply the host-side snapshot optimization to Python components.
+    ///
+    /// On by default. It only affects bootstrap cost, so turning it off is a
+    /// debugging step -- it changes which wasmtime linker variant is built.
+    /// Fetch the Python WASM runtime at boot when it is missing. Python
+    /// inferlets need it; Rust inferlets do not.
     #[serde(default = "default_true")]
     pub python_snapshot: bool,
     #[serde(default = "default_true")]
@@ -362,25 +449,85 @@ fn default_network_allowed_hosts() -> Vec<String> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
+    /// What clients ask for this model by. Required, and free-form: it names
+    /// the deployment, not the checkpoint.
     pub name: String,
+    /// What to serve: a store name (`Qwen--Qwen3-0.6B`, as `pie model list`
+    /// prints it) or a path to a `.zt` artifact. See `weights::resolve`.
     pub model: String,
+    /// Which SKU of that checkpoint to serve, or omit to let the load identify
+    /// one — the cheapest row whose contract and plan fit the checkpoint.
+    /// Which published draft head to serve `model` with, by its short name
+    /// (`dflash`, `dflash2`): `sku` looked up in the catalog's table of
+    /// published heads (`models::published::PUBLISHED`) for the target `model`
+    /// names, so a deployment says which drafter it wants rather than which
+    /// row spells it. The artifact must already carry the head — `pie model
+    /// import <target> --drafter <name>` is what puts it there. Refused when
+    /// `model` is a path (the table keys on repository ids) or names a target
+    /// the table lacks; `sku` beside it must agree.
     #[serde(default)]
     pub sku: Option<String>,
     #[serde(default)]
     pub drafter: Option<String>,
+    /// Which backend runs the model, on what devices.
     pub engine: EngineConfig,
+    /// Where this model's materialized-weight artifacts are kept between runs.
+    /// Empty derives `$PIE_HOME/cache/weights` (distinct from the `.zt`
+    /// artifact store at `$PIE_HOME/models`).
+    /// Where this deployment's shared adapters live, or empty to mount none.
+    /// A read-only directory with one subdirectory per adapter, each holding
+    /// an `adapter.toml` and the plane files it names.
     #[serde(default)]
     pub weight_cache_dir: String,
     #[serde(default)]
     pub adapter_dir: String,
+    /// Dtype weights are materialized in. Separate from `activation_dtype`
+    /// (in `[engine]`, the dtype compute happens in) — narrower weights and
+    /// wider compute is a normal combination.
     #[serde(default = "default_weight_dtype")]
     pub weight_dtype: String,
+    /// How many weight bytes this load may keep on the device (tier T0),
+    /// written with its unit (`"18GiB"`). Omit for uncapped. Distinct from
+    /// `[engine] gpu_mem_utilization`, which budgets KV pages and scratch,
+    /// not the weight table.
+    /// How many weight bytes this load may keep in the pinned host cache
+    /// (tier T1), written with its unit (`"64GiB"`). Omit for uncapped.
     #[serde(default)]
     pub device_weight_budget: Option<ByteSize>,
     #[serde(default)]
     pub host_weight_budget: Option<ByteSize>,
+    /// **MAY A WARM BOOT DEFER THE PINNED TIER?** On (the default) T1's
+    /// planes are verified where they lie in the artifact and served from
+    /// there while a background thread builds the page-locked copy, so the
+    /// load answers sooner and the first fires take page faults until the
+    /// fill lands. `false` is the eager arm: the page-locked image is built
+    /// before the load answers.
+    ///
+    /// Needs a device that reports `pageableMemoryAccess` (CUDA 12.2+ HMM);
+    /// where it does not, the eager path is what happens whatever this says.
+    /// This key was `PIE_CUDA_DEFERRED_TIER=0` before it was a key.
     #[serde(default = "default_deferred_tier")]
     pub deferred_tier: bool,
+    /// The most patch rows one fire may carry, over every image of every lane
+    /// in it. Omit it: a vision SKU derives a ceiling from the checkpoint's
+    /// own shapes, and a text-only SKU wants no ladder at all.
+    /// The patch axis's lane ceiling: the most images one fire may carry.
+    /// Omit it, as above; the default is derived from `max_patches`.
+    /// The most PORT voxel rows one fire may carry on the third row axis
+    /// (design D8): the pixels a `vae.encode` reading takes in, the latents
+    /// a `vae.decode` reading takes in. Omit it and the shell derives a
+    /// ceiling from the loaded text — 65 536, which is the 256x256 picture
+    /// an encoder can swallow and no more, so a deployment that encodes a
+    /// 1024^2 picture (1 048 576 pixel voxels) or decodes a long clip has
+    /// to say so.
+    ///
+    /// It is a PORT count, not an output count: a decode of a 64x64 latent
+    /// lands a million pixels and is bounded by its 4 096 rows in, which is
+    /// why decoding at 1024^2 needs nothing stated and encoding does.
+    /// The most clips one fire may carry, over every lane. Omit it and one
+    /// is derived from the lane ceiling.
+    /// How many adapter seats this deployment intends to use, and which
+    /// adapters to write into them at boot. Absent means zero seats.
     #[serde(default)]
     pub max_patches: Option<u32>,
     #[serde(default)]
@@ -397,28 +544,49 @@ fn default_weight_dtype() -> String {
     "bfloat16".to_string()
 }
 
+/// `[model] deferred_tier` when nobody wrote it: the warm boot defers.
 fn default_deferred_tier() -> bool {
     true
 }
 
+/// What an operator states about LoRA adapters: a capacity and a roster.
+///
+/// The capacity is an intent, not a pool size: `seats` states how many the
+/// deployment intends to register, and a load whose intent exceeds what the
+/// model text seats is refused at compile.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterConfig {
+    /// How many adapter rows this deployment intends to use. Omit to derive
+    /// it from [`registered`](AdapterConfig::registered); state it to reserve
+    /// room for adapters that arrive later.
+    /// The adapters to write into those seats at boot, in the order given.
     #[serde(default)]
     pub seats: Option<u32>,
     #[serde(default)]
     pub registered: Vec<RegisteredAdapter>,
 }
 
+/// One adapter, as an operator names it.
+///
+/// The planes are raw bytes and the padding is the caller's: a file here is
+/// one bank's slot, exactly, in the bank's declared dtype and layout. A file
+/// of the wrong length is refused by the engine, by name, with both numbers.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RegisteredAdapter {
+    /// Which row of every named bank this fills — the id a lane routes to.
     pub id: u32,
+    /// Bank name (the plan's own `Param` spelling) to the file holding one
+    /// slot of it. A bank this map omits keeps what it held.
     #[serde(default)]
     pub planes: std::collections::BTreeMap<String, String>,
 }
 
 impl AdapterConfig {
+    /// The capacity to bake against: what the operator stated, else what the
+    /// roster needs (a roster whose highest id is `n` needs `n + 1` seats).
+    /// Nothing to seat and nothing to register.
     #[must_use]
     pub fn seats(&self) -> u32 {
         self.seats.unwrap_or_else(|| {
@@ -435,6 +603,8 @@ impl AdapterConfig {
         self.seats() == 0 && self.registered.is_empty()
     }
 
+    /// Checks what this layer can answer without a device: whether the
+    /// roster fits the stated capacity, and every plane path is absolute.
     fn validate(&self) -> Result<()> {
         let seats = self.seats();
         for adapter in &self.registered {
@@ -458,10 +628,22 @@ impl AdapterConfig {
 }
 
 impl ModelConfig {
+    /// The shared-adapter mount as the boot seam spells it: `Some(path)` when
+    /// the operator stated one, `None` (the feature off) for the empty
+    /// default.
     pub fn adapter_mount(&self) -> Option<std::path::PathBuf> {
         (!self.adapter_dir.is_empty()).then(|| std::path::PathBuf::from(&self.adapter_dir))
     }
 
+    /// The two weight budgets and the tier arm, in the form the engine's load
+    /// contract states them. Both budgets absent and the arm on is
+    /// [`engine::Residency::uncapped`].
+    /// The second row axis's two ceilings, in the form the engine's load
+    /// contract states them. Both absent derives a ladder from the loaded
+    /// text when the plan states a patch axis.
+    /// The THIRD row axis's two ceilings, in the same form. Both absent
+    /// derives a ladder from the loaded text when the plan states a voxel
+    /// axis.
     #[must_use]
     pub fn residency(&self) -> engine::Residency {
         engine::Residency {
@@ -481,6 +663,13 @@ impl ModelConfig {
         (self.max_voxels, self.max_clips)
     }
 
+    /// Resolve `[model] drafter` into `[model] sku` through the published
+    /// heads table. Called once at load, before validation.
+    ///
+    /// # Errors
+    ///
+    /// A `model` the table cannot key (a path), a name it does not know for
+    /// this target, or a `sku` that names another row.
     pub fn resolve_drafter(&mut self) -> Result<()> {
         let Some(drafter) = self.drafter.as_deref() else {
             return Ok(());
@@ -493,7 +682,9 @@ impl ModelConfig {
              with model.sku instead"
         );
         let Some(published) = models::published::lookup(target, drafter) else {
-            let known: Vec<&str> = models::published::for_target(target).map(|p| p.drafter).collect();
+            let known: Vec<&str> = models::published::for_target(target)
+                .map(|p| p.drafter)
+                .collect();
             bail!(
                 "model.drafter = {drafter:?}: no published head of that name for {target:?} in this \
                  build{}",
@@ -568,16 +759,36 @@ impl ModelConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
+    /// How long a client request may run before the runtime gives up on it.
+    /// The outermost of the three clocks here — bounds the answer a caller
+    /// is waiting for, distinct from `submit_deadline` and `silence_timeout`.
     #[serde(default = "default_request_timeout")]
     pub request_timeout: Duration,
+    /// How long a pipeline hard-blocking a frame's seal may go without
+    /// submitting before the runtime stops waiting for it, in microseconds.
+    /// Does not fail the pipeline — the lane is dropped from the wait-set
+    /// (an involuntary `forward.park()`) so the boundary seals at once.
+    /// Exposed to guests verbatim as `model.submit-deadline-us()`.
     #[serde(default = "default_submit_deadline")]
     pub submit_deadline: Duration,
+    /// How long a lane may stay silent in total — through the leash above and
+    /// on past it — before the runtime terminates its process, in seconds.
+    /// A verdict, so it is generous: a lane that calls `forward.park()` is
+    /// never killed however long it stays away.
     #[serde(default = "default_silence_timeout")]
     pub silence_timeout: Duration,
+    /// Waves per frame (*k*): how many token steps the wait-all quorum admits
+    /// before it runs. A deployment constant, fixed at runtime start like the
+    /// KV page size. Bounded above by the CUDA engine — see [`Self::validate`].
     #[serde(default = "default_frame_size")]
     pub frame_size: u32,
+    /// Frames the runtime keeps posted to the engine but not yet retired: the
+    /// dispatch loop's enqueue horizon, keeping the GPU from idling between
+    /// frames. Bounded jointly with `frame_size` — see [`Self::validate`].
     #[serde(default = "default_frame_dispatch_depth")]
     pub frame_dispatch_depth: u32,
+    /// Hard cap on inferlets admitted at once. Omit to derive it from the
+    /// engine's `max_forward_requests`, which is what fills a batch.
     #[serde(default)]
     pub max_concurrent_processes: Option<usize>,
 }
@@ -668,14 +879,23 @@ fn default_frame_dispatch_depth() -> u32 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineConfig {
+    /// Which engine hosts this model. Every spelling parses; a flavor this
+    /// build does not host is refused by name at boot.
     #[serde(rename = "type")]
     pub kind: EngineKind,
+    /// Single string or list of strings — both accepted on input.
     #[serde(deserialize_with = "deserialize_string_or_list")]
     pub device: Vec<String>,
+    /// Ranks the model is sharded across. Must divide the device list.
     #[serde(default = "default_tp_size")]
     pub tensor_parallel_size: u32,
+    /// Compute dtype for activations, e.g. `"bfloat16"`. Separate from
+    /// `weight_dtype`: a deployment can store weights narrower than it
+    /// computes.
     #[serde(default = "default_activation_dtype")]
     pub activation_dtype: String,
+    /// Engine-specific knobs. Embedded engines parse this into typed
+    /// option structs.
     #[serde(default)]
     pub options: toml::Table,
 }
@@ -734,12 +954,23 @@ impl EngineConfig {
     }
 }
 
+/// Which engine a `[model.engine] type` names.
+///
+/// Every name here is now offered: `Vulkan` and `Wgpu` were named-not-hosted
+/// until their shells landed, and each is one `--features` flag away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineKind {
+    /// Native CUDA engine — embedded as a static lib in `worker`
+    /// (requires `--features cuda`).
     CudaNative,
+    /// Native MLX + Metal engine for Apple Silicon.
     Metal,
+    /// Pure-Rust Vulkan engine: portable rather than vendor-specific, on
+    /// whatever Vulkan 1.3 device the machine exposes.
     Vulkan,
+    /// The WebGPU shell — one binary over Vulkan, Metal, D3D12 or WebGPU,
+    /// whichever the machine has.
     Wgpu,
 }
 
@@ -760,6 +991,8 @@ fn default_tp_size() -> u32 {
 fn default_activation_dtype() -> String {
     "bfloat16".to_string()
 }
+/// Accept either a single string or a list of strings, matching
+/// `pie/config.py::_parse_driver`'s `device` handling.
 fn deserialize_string_or_list<'de, D>(d: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -804,6 +1037,19 @@ type = "metal"
 device = ["cpu"]
 "#;
 
+    /// `--diag` writes `[engine] diagnostics`, and a flavor with no
+    /// diagnostics record says so instead of swallowing the flag.
+    /// The word list is the shell's, so this side keeps it whole rather than
+    /// parsing it — a config that states one is the string it stated.
+    /// Every engine kind's `as_str` is the word a config file spells it with;
+    /// `as_str` is a hand-written match and nothing ties it to serde's
+    /// `rename_all` if they drift.
+    /// `[model.adapters]` absent is the shape hard-coded before it existed:
+    /// zero seats, no roster, and the correction op never launches.
+    /// The capacity is stated once: either the operator says it, or the
+    /// roster does — one number, one owner.
+    /// The two refusals this layer can make without a device.
+    #[test]
     fn config_every_case() {
         rejects_the_legacy_unit_suffixed_names();
         a_silence_timeout_under_the_submit_deadline_is_refused();
@@ -817,7 +1063,6 @@ device = ["cpu"]
         rejects_a_cache_section();
     }
 
-    #[test]
     fn rejects_the_legacy_unit_suffixed_names() {
         for (section, legacy) in [
             ("sandbox", "wasm_max_memory_mb = 4096"),
@@ -996,5 +1241,4 @@ device = ["cpu"]
         let toml = format!("{MINIMAL_METAL}\n[cache]\nptir_dir = \"/tmp/x\"\n");
         assert!(toml::from_str::<Config>(&toml).is_err());
     }
-
 }

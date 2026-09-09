@@ -52,12 +52,12 @@ fn fire_and_compare(graphs: Graphs) {
     }
 }
 
+#[test]
 fn a_bidirectional_attention_adds_its_relative_bias_through_the_engine_every_case() {
     three_lanes_of_unequal_length_land_the_host_reference();
     the_same_fire_lands_the_host_reference_from_an_armed_body();
 }
 
-#[test]
 fn three_lanes_of_unequal_length_land_the_host_reference() {
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");

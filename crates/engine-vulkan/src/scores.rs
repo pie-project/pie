@@ -89,7 +89,9 @@ impl Scores {
         let mut raw = vec![0u8; floats * SLOT as usize];
         self.store.read(self.lane_base(lane), &mut raw)?;
         Ok(raw
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
             .collect())
     }

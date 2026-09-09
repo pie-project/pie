@@ -69,7 +69,7 @@ const fn per_head_elementwise(rows: u32, heads: u32, head_dim: u32) -> Launch {
 
 fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
     nonzero(op, "the head width this attention states", head_dim)?;
-    if width == 0 || width % head_dim != 0 {
+    if width == 0 || !width.is_multiple_of(head_dim) {
         return Err(refuse(
             op,
             format!("the {width}-wide row does not divide by the stated head width {head_dim}"),

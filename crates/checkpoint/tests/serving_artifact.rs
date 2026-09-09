@@ -92,9 +92,16 @@ impl Fixture {
             leaf("head", &self.embed),
             leaf("__meta__/model/descriptor", b"{\"sku\":\"qwen_3\"}"),
         ];
-        emit::write(path, &stamp(), &provenance(), align, &objects, |object, plane, _| {
-            panic!("{object}/{plane} asked to be filled and this fixture hands its bytes in")
-        })
+        emit::write(
+            path,
+            &stamp(),
+            &provenance(),
+            align,
+            &objects,
+            |object, plane, _| {
+                panic!("{object}/{plane} asked to be filled and this fixture hands its bytes in")
+            },
+        )
         .unwrap();
     }
 }
@@ -107,7 +114,10 @@ impl Drop for Fixture {
 
 fn provenance() -> BTreeMap<String, String> {
     BTreeMap::from([
-        (checkpoint::file::meta::VERSION_KEY.to_string(), "0.4.0".to_string()),
+        (
+            checkpoint::file::meta::VERSION_KEY.to_string(),
+            "0.4.0".to_string(),
+        ),
         (
             checkpoint::file::meta::SOURCE_KEY.to_string(),
             "qwen/qwen3-30b-a3b".to_string(),
@@ -126,6 +136,7 @@ fn flip(path: &Path, object: &str, at: u64) {
     file.sync_all().unwrap();
 }
 
+#[test]
 fn serving_artifact_every_case() {
     every_plane_reads_back_as_the_bytes_that_were_written();
     a_tied_plane_is_one_span_under_two_names();
@@ -143,7 +154,6 @@ fn serving_artifact_every_case() {
     every_weight_carries_a_layout_ztensor_itself_defines();
 }
 
-#[test]
 fn every_plane_reads_back_as_the_bytes_that_were_written() {
     let fixture = Fixture::write("roundtrip", emit::SERVING_ALIGN);
     let artifact = Artifact::open(&fixture.path).unwrap();
@@ -242,7 +252,10 @@ fn a_profile_version_this_build_does_not_implement_is_not_a_broken_file() {
     let why = Artifact::open(&plain).unwrap_err();
     assert!(matches!(why, Error::Checkpoint(_)), "{why}");
     assert!(format!("{why}").contains("ordinary checkpoint"), "{why}");
-    assert!(format!("{why}").contains("nothing here deletes it"), "{why}");
+    assert!(
+        format!("{why}").contains("nothing here deletes it"),
+        "{why}"
+    );
 }
 
 fn an_open_hashes_nothing_and_a_verify_is_what_finds_the_rot() {
@@ -277,7 +290,10 @@ fn a_flipped_byte_is_named_by_its_object_and_its_block() {
     );
     assert!(why.contains("layer.0.expert_down_bank"), "{why}");
     assert!(why.contains("block 1 "), "{why}");
-    assert!(why.contains(&format!("{}..{}", second.start, second.end)), "{why}");
+    assert!(
+        why.contains(&format!("{}..{}", second.start, second.end)),
+        "{why}"
+    );
     assert!(why.contains("xxh3"), "{why}");
 
     artifact.verify(&["layer.0.norm", "embed"]).unwrap();
@@ -371,8 +387,16 @@ fn an_artifact_for_another_shell_is_refused_naming_the_field() {
         .expect_err("a cuda artifact is not servable on metal");
     assert_eq!(why.field, serving::Field::Backend);
     let said = why.refuse("/srv/pie/q3.zt");
-    for wanted in ["backend", "\"cuda\"", "\"metal\"", "pie model import --force"] {
-        assert!(said.contains(wanted), "the refusal does not say {wanted:?}: {said}");
+    for wanted in [
+        "backend",
+        "\"cuda\"",
+        "\"metal\"",
+        "pie model import --force",
+    ] {
+        assert!(
+            said.contains(wanted),
+            "the refusal does not say {wanted:?}: {said}"
+        );
     }
     let sharded = Stamp::of("cuda", "qwen_3-tp2");
     assert_eq!(
@@ -416,8 +440,7 @@ fn a_tp1_artifact_stripped_of_its_serving_key_is_an_ordinary_checkpoint() {
     }
     drop(servable);
     assert!(
-        after.attributes.is_none()
-            || serving_keys(after.attributes.as_ref().unwrap()).is_empty(),
+        after.attributes.is_none() || serving_keys(after.attributes.as_ref().unwrap()).is_empty(),
     );
     let attributes = after.attributes.as_ref().unwrap();
     assert!(attributes.get(checkpoint::file::meta::SOURCE_KEY).is_some());
@@ -470,10 +493,10 @@ fn restate(from: &Path, to: &Path, edit: impl FnOnce(&mut Value)) {
     };
     let mut edit = Some(edit);
     for (key, value) in entries.iter_mut() {
-        if matches!(key, Value::Text(key) if key == "attributes") {
-            if let Some(edit) = edit.take() {
-                edit(value);
-            }
+        if matches!(key, Value::Text(key) if key == "attributes")
+            && let Some(edit) = edit.take()
+        {
+            edit(value);
         }
     }
 

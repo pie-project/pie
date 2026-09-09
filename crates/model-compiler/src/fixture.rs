@@ -1,6 +1,6 @@
 use model_ir::ops::{Attention, Elementwise};
 use model_ir::{
-    CacheRow, Guard, Def, Dim, Dtype, Node, Trace, Platform, RuntimeInput, Seam, StructKind, Ty,
+    CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, StructKind, Trace, Ty,
     ValueDecl, ValueId,
 };
 

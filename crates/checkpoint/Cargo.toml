@@ -12,33 +12,17 @@ name = "checkpoint"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# The compiler alone: engines link the rlib and pass Rust types, and a device's
-# arena crosses as an `ArenaBacking` the consumer supplies. Nothing here knows
-# a model family — `tests/standalone.rs` pins that as four properties.
 
 [features]
 default = ["testkit"]
 
-# The parts that exist to check the loader rather than to be it: the
-# differential oracle plans are replayed against. On by default so `cargo test`
-# works unasked; `worker` turns it off, which is also the check — a load path
-# that grows a route into the oracle stops compiling there.
 testkit = []
 
-# No configuration of this crate names `kernels-cuda`, `cudarc` or `model-ir`,
-# so none wants a CUDA toolkit: a plan for a CUDA target is a claim about what
-# a device will do, and making the claim must not require the device. What
-# stays is the vocabulary — `executor::arena` and `plan::passes::tile`'s four
-# `CUDA_*` kernel words; running the transform is the device crate's sentence.
 
 [dependencies]
-# `DType`: the checkpoint's element vocabulary and the IR's are one enum.
 dtype = { path = "../dtype" }
 half = "2"
-# `statvfs`, for `file/emit.rs`'s free-space refusal; std has no answer for it.
 libc = "0.2"
-# The checkpoint readers, vendored (see the workspace manifest). No `zstd`:
-# this crate addresses bytes where they lie, and an encoded blob has no address.
 ztensor = { workspace = true }
 sha2 = "0.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -54,7 +38,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
-# `consume::release` is tested against a real file on a real filesystem
-# (`st_blocks` before and after), which needs a temporary directory.
 tempfile = "3"

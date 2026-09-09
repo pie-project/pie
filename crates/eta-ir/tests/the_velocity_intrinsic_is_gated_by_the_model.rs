@@ -41,13 +41,13 @@ fn epilogue_reading(shape: Shape, dtype: Dtype) -> TraceContainer {
     }
 }
 
+#[test]
 fn the_velocity_intrinsic_is_gated_by_the_model_every_case() {
     a_denoising_model_serves_the_velocity_and_a_text_model_refuses_it();
     the_declared_width_must_be_the_models_own();
     the_velocity_is_an_epilogue_value_only();
 }
 
-#[test]
 fn a_denoising_model_serves_the_velocity_and_a_text_model_refuses_it() {
     let plane = Shape::matrix(ROWS, CHANNELS);
     bind(epilogue_reading(plane, Dtype::F32), profile())

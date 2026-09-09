@@ -79,6 +79,7 @@ fn bf16(plane: u64, shift: u32, rows: u32, width: usize) -> Tensor {
     view(plane, shift, rows, width, Dtype::Bf16, 2)
 }
 
+#[test]
 fn every_dit_seat_entry_retires_the_staged_windows_padded_rows_every_case() {
     the_modulations_retire_their_padded_rows();
     the_deferred_residual_pair_retires_its_padded_rows_on_both_outputs();
@@ -88,7 +89,6 @@ fn every_dit_seat_entry_retires_the_staged_windows_padded_rows_every_case() {
     the_bare_pointwise_ops_retire_their_padded_rows();
 }
 
-#[test]
 fn the_modulations_retire_their_padded_rows() {
     let mut lcg = Lcg::seeded(0x5ea7);
     let (x_raw, _) = lcg.row(PLANES * WIDTH);

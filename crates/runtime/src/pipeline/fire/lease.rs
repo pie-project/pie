@@ -151,8 +151,7 @@ pub fn detect_pooled_device_geometry(
     match channel_of(Port::EmbedIndptr) {
         Some(split) if !republished(split) => {
             let declaration = container.channels.get(split)?;
-            if !declaration.seeded
-                || !matches!(declaration.dtype, ChanDType::Concrete(Dtype::U32))
+            if !declaration.seeded || !matches!(declaration.dtype, ChanDType::Concrete(Dtype::U32))
             {
                 return None;
             }
@@ -218,6 +217,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn lease_every_case() {
         grant_mints_b_pages_and_tracks_in_flight();
         reclaim_returns_only_continued_lanes();
@@ -226,7 +226,6 @@ mod tests {
         detect_device_geometry_rejects_single_page_width();
     }
 
-    #[test]
     fn grant_mints_b_pages_and_tracks_in_flight() {
         let mut lease = PageLease::new(2);
         let mut alloc = allocator();
@@ -392,6 +391,7 @@ mod pooled_tests {
         container
     }
 
+    #[test]
     fn lease_1_every_case() {
         masked_loop_carried_decode_is_pooled_device_geometry();
         a_mask_free_decode_that_republishes_every_port_is_pooled_too();
@@ -399,7 +399,6 @@ mod pooled_tests {
         a_host_driven_descriptor_is_not_pooled_device_geometry();
     }
 
-    #[test]
     fn masked_loop_carried_decode_is_pooled_device_geometry() {
         assert_eq!(
             detect_pooled_device_geometry(&masked_decode(1, 128)),
@@ -419,7 +418,10 @@ mod pooled_tests {
             .position(|binding| binding.port == Port::AttnMask)
             .expect("mask port");
         container.ports.remove(mask);
-        assert_eq!(detect_pooled_device_geometry(&container), Some(vec![0, 1, 2]));
+        assert_eq!(
+            detect_pooled_device_geometry(&container),
+            Some(vec![0, 1, 2])
+        );
     }
 
     fn a_decode_whose_pages_are_a_constant_keeps_the_envelope_path() {

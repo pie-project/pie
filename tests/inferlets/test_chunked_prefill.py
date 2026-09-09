@@ -51,7 +51,6 @@ can put mass there; a tap on any earlier chunk reports zero for it.
 
 Run from the repo root with PYTHONPATH=sdk/server/python/python:
 
-    PIE_CUDA_KV_ENVELOPES=1 python tests/inferlets/test_chunked_prefill.py \
         --engine cuda_native --model <path>
 """
 
@@ -60,7 +59,6 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-os.environ.setdefault("PIE_CUDA_KV_ENVELOPES", "1")
 
 from conftest import run_inferlet, run_tests  # noqa: E402
 
@@ -87,82 +85,12 @@ def _parse(out):
     return json.loads(out.strip().splitlines()[-1])
 
 
-async def _quest(client, **params):
-    base = {
-        "max_tokens": 24,
-        "temperature": 0.0001,
-        "page_budget": 1 << 20,
-        "report": True,
-    }
-    out = await run_inferlet(client, "quest-attention", {**base, **params})
-    return _parse(out)
 
 
-async def test_chunking_is_exact(client, args):
-    """The multi-chunk path must reproduce the one-shot path."""
-    prompt = _prompt_for(1024, decisive=True)
-    one = await _quest(client, prompt=prompt, seed=4242, max_tokens=32)
-    kv = one["kv_len_last"]
-    assert kv > 1000, f"prompt too short to be interesting: kv_len={kv}"
-    assert one["text"].strip(), "one-shot produced nothing to compare against"
-
-    for width in _WIDTHS:
-        many = await _quest(
-            client, prompt=prompt, seed=4242, max_tokens=32, prefill_chunk=width
-        )
-        assert many["kv_len_last"] == kv, (
-            f"chunk={width}: kv_len {many['kv_len_last']} != one-shot {kv} -- "
-            "the chunks did not write the prompt they were given"
-        )
-        assert many["text"] == one["text"], (
-            f"chunk={width}: chunked prefill changed the output.\n"
-            f"  one-shot: {one['text']!r}\n"
-            f"  chunked : {many['text']!r}"
-        )
-    widths = "/".join(str(w) for w in _WIDTHS)
-    print(f"    kv_len={kv}: 32 tokens identical at chunk widths {widths} vs one-shot")
 
 
-async def test_above_the_one_shot_ceiling(client, args):
-    """A prompt longer than `max_embed_length()` must run, and read coherently."""
-    r = await _quest(
-        client,
-        prompt=_prompt_for(_LONG_TARGET_TOKENS, decisive=True),
-        seed=7,
-        max_tokens=16,
-    )
-    kv = r["kv_len_last"]
-    assert kv > 8192, (
-        f"prompt did not exceed the 8192-token one-shot ceiling (kv_len={kv}); "
-        "the test is not testing what it claims to"
-    )
-    text = r["text"]
-    assert text.strip(), f"empty generation at kv_len={kv}"
-    # A KV cache stitched together wrongly across 2+ chunks does not answer the
-    # question at the end of the prompt; it produces text unrelated to it.
-    assert "Paris" in text, f"incoherent continuation at kv_len={kv}: {text!r}"
-    print(f"    kv_len={kv} (> 8192 one-shot ceiling), answers: {text[:48]!r}")
 
 
-async def test_quest_still_evicts_at_long_context(client, args):
-    """The whole point: Quest must still enforce its budget past the ceiling."""
-    common = {
-        "prompt": _prompt_for(_LONG_TARGET_TOKENS, decisive=True),
-        "seed": 11,
-        "max_tokens": 16,
-    }
-    full = await _quest(client, **common, page_budget=1 << 20)
-    tight = await _quest(client, **common, page_budget=1)
-    kv = full["kv_len_last"]
-    assert tight["kv_len_last"] == kv, "endpoints disagree on context"
-    assert full["text"] != tight["text"], (
-        f"a 1-page budget produced the same text as an unlimited one at "
-        f"kv_len={kv} -- the mask is being computed and ignored"
-    )
-    print(
-        f"    kv_len={kv}: budget=1 diverges from budget=inf, "
-        "so the mask is still enforced past the ceiling"
-    )
 
 
 async def _policy(client, name, **params):
@@ -324,7 +252,7 @@ async def test_policies_agree_with_the_baseline_past_the_ceiling(client, args):
         f"would prove nothing: {base['text']!r}"
     )
 
-    for name in ("quest-attention", "trackb-h2o", "trackb-snapkv", "tova-attention"):
+    for name in ("trackb-h2o", "trackb-snapkv", "tova-attention"):
         r = await _policy(client, name, prompt=prompt, **common)
         assert r["text"] == base["text"], (
             f"{name} disagrees with the baseline past the ceiling, with nothing "
@@ -332,19 +260,16 @@ async def test_policies_agree_with_the_baseline_past_the_ceiling(client, args):
             f"  baseline: {base['text']!r}\n"
             f"  {name}: {r['text']!r}"
         )
-    print("    4 policies reproduce the baseline exactly on a >8192-token prompt")
+    print("    3 policies reproduce the baseline exactly on a >8192-token prompt")
 
 
 run_tests(
     [
-        test_chunking_is_exact,
-        test_above_the_one_shot_ceiling,
-        test_quest_still_evicts_at_long_context,
         test_trackb_chunking_is_exact,
         test_snapkv_observes_the_final_chunk,
         test_trackb_above_the_one_shot_ceiling,
         test_policies_agree_with_the_baseline_past_the_ceiling,
     ],
     description="Chunked prefill (Track A + Track B)",
-    requires=("envelope_dot", "attn_score"),
+    requires=("attn_score",),
 )

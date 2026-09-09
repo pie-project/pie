@@ -52,7 +52,7 @@ impl Leaf {
 
     pub fn width(self) -> Option<u64> {
         let bits = self.bits();
-        (bits % 8 == 0).then_some(bits / 8)
+        bits.is_multiple_of(8).then_some(bits / 8)
     }
 
     pub fn parse(s: &str) -> Option<Leaf> {
@@ -461,6 +461,7 @@ impl std::str::FromStr for Term {
 mod tests {
     use super::*;
 
+    #[test]
     fn term_every_case() {
         round_trips_and_is_canonical();
         planes_of_u4g64();
@@ -468,7 +469,6 @@ mod tests {
         content_rules();
     }
 
-    #[test]
     fn round_trips_and_is_canonical() {
         for s in [
             "bf16",
@@ -484,8 +484,18 @@ mod tests {
             assert_eq!(Term::parse(s).unwrap().to_string(), s);
         }
         for s in [
-            "", "_", "g0_u4_bf16_n", "g1x64_u4_bf16_n", "g064_u4_bf16_n", "u0", "u65",
-            "g64_u4_bf16", "g64_u4_bf16_b", "bf16_n", "g64_g8_u4_bf16_n", "G64_u4_bf16_n",
+            "",
+            "_",
+            "g0_u4_bf16_n",
+            "g1x64_u4_bf16_n",
+            "g064_u4_bf16_n",
+            "u0",
+            "u65",
+            "g64_u4_bf16",
+            "g64_u4_bf16_b",
+            "bf16_n",
+            "g64_g8_u4_bf16_n",
+            "G64_u4_bf16_n",
         ] {
             assert!(Term::parse(s).is_err(), "{s:?} parsed");
         }
@@ -520,7 +530,13 @@ mod tests {
             .collect();
         assert_eq!(
             paths,
-            ["code", "gain.code", "gain.gain", "offset.code", "offset.gain"]
+            [
+                "code",
+                "gain.code",
+                "gain.gain",
+                "offset.code",
+                "offset.gain"
+            ]
         );
         let t = Term::parse("g16_e2m1_gt_e4m3_f32_n_n").unwrap();
         let planes = t.planes(&[3, 16]).unwrap();

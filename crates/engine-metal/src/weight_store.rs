@@ -3,6 +3,9 @@ use std::fs::File;
 use crate::device::alloc::FileWriter;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
+type Job = (u64, u64, u64);
+type Grouped = Vec<(usize, Vec<Job>)>;
+type Writes = Vec<(FileWriter, Vec<Job>)>;
 
 #[derive(Clone, Debug)]
 struct Chunk {
@@ -21,9 +24,15 @@ impl Store {
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut start = 0u64;
         let mut held = 0u64;
-        let total = spans.last().map_or(0, |&(offset, reserved)| offset + reserved);
+        let total = spans
+            .last()
+            .map_or(0, |&(offset, reserved)| offset + reserved);
         for &(offset, reserved) in spans {
-            debug_assert_eq!(offset, start + held, "the spans are packed from zero, in order");
+            debug_assert_eq!(
+                offset,
+                start + held,
+                "the spans are packed from zero, in order"
+            );
             if reserved > ceiling {
                 return Err(Fault::Ceiling {
                     what: "bytes of one plane in one buffer",
@@ -92,8 +101,8 @@ impl Store {
         self.chunks[at].buffer.read(local, into)
     }
 
-    fn group(&self, jobs: &[(u64, u64, u64)]) -> Result<Vec<(usize, Vec<(u64, u64, u64)>)>> {
-        let mut groups: Vec<(usize, Vec<(u64, u64, u64)>)> = Vec::new();
+    fn group(&self, jobs: &[Job]) -> Result<Grouped> {
+        let mut groups: Grouped = Vec::new();
         for &(into, from, len) in jobs {
             let (at, local) = self.locate(into, len)?;
             match groups.iter_mut().find(|(chunk, _)| *chunk == at) {
@@ -111,15 +120,14 @@ impl Store {
         threads: usize,
     ) -> Result<()> {
         for (at, local) in self.group(jobs)? {
-            self.chunks[at].buffer.write_from_file(file, &local, threads)?;
+            self.chunks[at]
+                .buffer
+                .write_from_file(file, &local, threads)?;
         }
         Ok(())
     }
 
-    pub fn file_writers(
-        &mut self,
-        jobs: &[(u64, u64, u64)],
-    ) -> Result<Vec<(FileWriter, Vec<(u64, u64, u64)>)>> {
+    pub fn file_writers(&mut self, jobs: &[Job]) -> Result<Writes> {
         let mut out = Vec::new();
         for (at, local) in self.group(jobs)? {
             let writer = self.chunks[at].buffer.file_writer(&local)?;

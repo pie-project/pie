@@ -114,16 +114,17 @@ fn budgets() -> Budgets {
     })
 }
 
+#[test]
 fn the_patch_axis_seriates_its_own_lanes_every_case() {
     a_class_with_rows_and_no_images_has_a_token_window_and_no_patch_window();
     a_fire_past_the_patch_ceilings_is_refused_by_name();
 }
 
-#[test]
 fn a_class_with_rows_and_no_images_has_a_token_window_and_no_patch_window() {
     let trace = tower_and_trunk();
     let budgets = budgets();
-    let compiled = compile_axes(&trace, &budgets, &DeviceProfile::default()).expect("the tower bakes");
+    let compiled =
+        compile_axes(&trace, &budgets, &DeviceProfile::default()).expect("the tower bakes");
 
     let lanes = [
         Lane::with_images(1, 5, 2, 128),
@@ -155,7 +156,9 @@ fn a_class_with_rows_and_no_images_has_a_token_window_and_no_patch_window() {
     assert_eq!(patches.class(text_class).rows, 0);
     assert_eq!(patches.class(text_class).lanes, 0);
     assert_eq!(
-        fire.patch_classes().present_in_order().collect::<Vec<u32>>(),
+        fire.patch_classes()
+            .present_in_order()
+            .collect::<Vec<u32>>(),
         vec![with_images as u32],
         "only the class with images is present on the patch axis",
     );
@@ -184,15 +187,15 @@ fn a_fire_past_the_patch_ceilings_is_refused_by_name() {
         }
         .into(),
     );
-    assert!(rows.to_string().contains("every tower column was cut at 256"));
+    assert!(
+        rows.to_string()
+            .contains("every tower column was cut at 256")
+    );
 
     let images = compose_axes(
         &compiled,
         &budgets,
-        &[
-            Lane::with_images(1, 1, 3, 3),
-            Lane::with_images(1, 1, 3, 3),
-        ],
+        &[Lane::with_images(1, 1, 3, 3), Lane::with_images(1, 1, 3, 3)],
     )
     .expect_err("six images past a ceiling of four");
     assert_eq!(images, Fault::TooManyImages { images: 6, max: 4 }.into());

@@ -52,10 +52,13 @@ pub fn rope_axes(
     }
     let rows = nonzero(OP, "rows", o.rows)?;
     let head_dim = nonzero(OP, "the head width", head_dim)?;
-    if o.width % head_dim != 0 {
+    if !o.width.is_multiple_of(head_dim) {
         return Err(refuse(
             OP,
-            format!("a {}-wide row is not a whole number of {head_dim}-wide heads", o.width),
+            format!(
+                "a {}-wide row is not a whole number of {head_dim}-wide heads",
+                o.width
+            ),
         ));
     }
     let heads = o.width / head_dim;
@@ -75,13 +78,11 @@ pub fn rope_axes(
         if rotary_dim == 0 || rotary_dim > head_dim {
             return Err(refuse(
                 OP,
-                format!(
-                    "the ladder turns a {rotary_dim}-wide prefix of a {head_dim}-wide head"
-                ),
+                format!("the ladder turns a {rotary_dim}-wide prefix of a {head_dim}-wide head"),
             ));
         }
         let row = heads.saturating_mul(rotary_dim);
-        if span == 0 || span > row || (row - span) % 2 != 0 {
+        if span == 0 || span > row || !(row - span).is_multiple_of(2) {
             return Err(refuse(
                 OP,
                 format!(
@@ -116,10 +117,17 @@ pub fn rope_axes(
         ));
     }
     let angles = rotary_dim / 2;
-    let tail = if x.buf == o.buf { 0 } else { head_dim - rotary_dim };
-    let lanes = heads
-        .checked_mul(angles + tail)
-        .ok_or_else(|| refuse(OP, format!("{heads} heads x {angles} angles will not launch")))?;
+    let tail = if x.buf == o.buf {
+        0
+    } else {
+        head_dim - rotary_dim
+    };
+    let lanes = heads.checked_mul(angles + tail).ok_or_else(|| {
+        refuse(
+            OP,
+            format!("{heads} heads x {angles} angles will not launch"),
+        )
+    })?;
     ctx.fire(
         Fire::at("elemwise/rope_axes.metal", entry).apply(Grid::of([lanes, rows, 1], [256, 1, 1])),
         &[

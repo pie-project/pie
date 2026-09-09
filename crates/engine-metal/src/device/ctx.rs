@@ -249,8 +249,7 @@ impl Context {
                 .expect("one byte of shared storage")
         }
         #[cfg(not(target_vendor = "apple"))]
-        {
-        }
+        {}
     }
 
     #[cfg(target_vendor = "apple")]

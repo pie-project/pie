@@ -289,8 +289,7 @@ impl DFlash {
         for b in &d.blocks {
             let a = &b.attn;
             let hd = a.head_dim;
-            let plan =
-                ops::attn::plan_prefill(&input_block, a.q_heads, a.kv_heads, hd, b.window);
+            let plan = ops::attn::plan_prefill(&input_block, a.q_heads, a.kv_heads, hd, b.window);
             let x = ops::elemwise::rmsnorm_plus_one(&h, &b.mixer_norm, b.mixer_norm_eps);
             let (x, attn_coeff) = conv_prepare(&x, b.attn_conv.as_ref());
             let q = biased(ops::linear::matmul(&x, &a.q_proj), a.q_bias.as_ref());

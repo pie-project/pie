@@ -24,13 +24,13 @@ fn csr_blob(indptr: &[u8], indices: &[u8], values: &[u8]) -> Vec<u8> {
     blob
 }
 
+#[test]
 fn csr_every_case() {
     csr_roundtrip();
     index_past_cols_is_rejected();
     a_foreign_layout_is_not_assembled_as_csr();
 }
 
-#[test]
 fn csr_roundtrip() {
     let path = tmp("csr.zt");
     let values = f32s(&[1.0, 2.0, 3.0]);
@@ -83,7 +83,13 @@ fn index_past_cols_is_rejected() {
     let src = Source::open(&path).unwrap();
     let err = csr::read(&src.tensor("m").unwrap()).unwrap_err();
     assert!(
-        matches!(err, Error::Reject { rule: ztensor::Rule::LayoutData, .. }),
+        matches!(
+            err,
+            Error::Reject {
+                rule: ztensor::Rule::LayoutData,
+                ..
+            }
+        ),
         "{err:?}"
     );
 }

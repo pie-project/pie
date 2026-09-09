@@ -14,34 +14,19 @@ name = "eta_ir"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# `std` adds only the `std::error::Error` impls on the decode/validate error
-# types; the wasm SDK takes this crate with `default-features = false` to keep
-# the IR core `no_std` (+ `alloc`).
 [features]
 default = ["std"]
 std = []
 
-# Off by default: the guest half of this crate is `no_std` wasm reached through
-# `eta-dsl` and has no business carrying a serialization framework. It exists
-# for `engine`, whose contract nouns are spelled in this crate's vocabulary
-# rather than in a second, serializable copy of it.
 serde = ["dep:serde", "dtype/serde"]
 
 [dependencies]
-# The element type, one enum for the whole tree; ETA gates the four it computes
-# in via `types::class_of`. `default-features = false` because this crate is
-# what a wasm guest imports — the leaf's serde is forwarded only when this
-# crate's own `serde` feature is on, and the wire numbering never is (see
-# `types::to_wire`).
 dtype = { path = "../dtype", default-features = false }
 
-# `default-features = false` + `alloc` keeps the `no_std` promise in the lib.rs
-# header true even when the feature is on.
 serde = { version = "1.0", default-features = false, features = [
     "alloc",
     "derive",
 ], optional = true }
 
-# The toolchain's three crates are the ones CI gates with `-D warnings`.
 [lints]
 workspace = true

@@ -81,7 +81,8 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
                 args.source,
                 if known.is_empty() {
                     "this build knows no head for that target — pass the head with `--aux` and \
-                     the row with `--sku`".to_string()
+                     the row with `--sku`"
+                        .to_string()
                 } else {
                     format!("it knows {}", known.join(", "))
                 }
@@ -1469,7 +1470,8 @@ pub(crate) fn carry_config(source: &Source) -> Result<Option<Vec<u8>>> {
         if !path.exists() {
             continue;
         }
-        let raw = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        let raw =
+            std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
         serde_json::from_slice::<serde_json::Value>(&raw)
             .map_err(|err| anyhow!("cannot parse {}: {err}", path.display()))?;
         return Ok(Some(raw));
@@ -2046,6 +2048,7 @@ impl TensorSink for Handoff<'_> {
 mod tests {
     use super::*;
 
+    #[test]
     fn import_every_case() {
         a_banks_planes_publish_in_schedule_order_not_declaration_order();
         the_dry_run_states_one_checkpoint_of_peak_when_the_decode_releases();
@@ -2057,7 +2060,6 @@ mod tests {
         the_chosen_row_is_in_the_filename_the_dry_run_reports();
     }
 
-    #[test]
     fn a_banks_planes_publish_in_schedule_order_not_declaration_order() {
         use checkpoint::types::{BufferId, DType, InstrId};
 

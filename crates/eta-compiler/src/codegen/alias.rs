@@ -90,7 +90,7 @@ fn footprint(value_types: &[SymbolicType], value: u32) -> Option<(u8, u64, Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn a_chain_resolves_whichever_order_it_was_recorded_in() {
         let mut forward = AliasTable::new();
@@ -104,5 +104,4 @@ mod tests {
         assert_eq!(forward.resolve(3), 1);
         assert_eq!(backward.resolve(3), 1);
     }
-
 }

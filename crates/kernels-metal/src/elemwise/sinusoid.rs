@@ -34,7 +34,10 @@ pub fn sinusoid(
     if y.width != dim {
         return Err(refuse(
             OP,
-            format!("the embedding plane is {} wide and this call writes {dim}", y.width),
+            format!(
+                "the embedding plane is {} wide and this call writes {dim}",
+                y.width
+            ),
         ));
     }
     if t.rows < rows {

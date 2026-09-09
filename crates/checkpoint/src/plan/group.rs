@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use crate::file::Metadata;
 use crate::contract::{GroupContract, ModelContract};
 use crate::error::{Error, Result};
+use crate::file::Metadata;
 use crate::plan::{GroupPlan, LoadPlan, SourceBinding, StorageInstr, StorageTarget};
 
 pub(crate) fn compile_all(

@@ -1,6 +1,5 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ptr::NonNull;
 
 use checkpoint::plan::{LoadPlan, StorageInstr};
 use engine::load::{Residency, Tiers};
@@ -18,65 +17,43 @@ const MAX_ROUTES: u64 = 1 << 18;
 const COPY_THREADS: usize = 16;
 
 pub struct Mapping {
-    at: NonNull<u8>,
-    len: usize,
+    map: memmap2::Mmap,
 }
-
-unsafe impl Send for Mapping {}
-unsafe impl Sync for Mapping {}
 
 impl std::fmt::Debug for Mapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Mapping").field("len", &self.len).finish()
+        f.debug_struct("Mapping")
+            .field("len", &self.map.len())
+            .finish()
     }
 }
 
 impl Mapping {
     pub fn open(path: &std::path::Path) -> Result<Mapping> {
-        use std::os::unix::io::AsRawFd;
         let file = std::fs::File::open(path).map_err(|e| Fault::Device {
             call: "open",
             why: format!("{}: {e}", path.display()),
         })?;
-        let len = usize::try_from(
-            file.metadata()
-                .map_err(|e| Fault::Device {
-                    call: "fstat",
-                    why: e.to_string(),
-                })?
-                .len(),
-        )
-        .map_err(|_| Fault::Device {
-            call: "mmap",
-            why: "the artifact is longer than the address space".into(),
-        })?;
+        let len = file
+            .metadata()
+            .map_err(|e| Fault::Device {
+                call: "fstat",
+                why: e.to_string(),
+            })?
+            .len();
         if len == 0 {
             return Err(Fault::Device {
                 call: "mmap",
                 why: format!("{} is empty", path.display()),
             });
         }
-
-        let at = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if at == libc::MAP_FAILED {
-            return Err(Fault::Device {
-                call: "mmap",
-                why: std::io::Error::last_os_error().to_string(),
-            });
-        }
-        Ok(Mapping {
-            at: NonNull::new(at.cast::<u8>()).expect("mmap returned a non-null address"),
-            len,
-        })
+        // SAFETY: the artifact is opened read-only and must not be written by
+        // another process for as long as this mapping lives.
+        let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| Fault::Device {
+            call: "mmap",
+            why: e.to_string(),
+        })?;
+        Ok(Mapping { map })
     }
 
     #[must_use]
@@ -84,24 +61,17 @@ impl Mapping {
         let offset = usize::try_from(offset).ok()?;
         let len = usize::try_from(len).ok()?;
         let end = offset.checked_add(len)?;
-        (end <= self.len)
-            .then(|| unsafe { std::slice::from_raw_parts(self.at.as_ptr().add(offset), len) })
+        (end <= self.map.len()).then(|| &self.map[offset..end])
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.len
+        self.map.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        unsafe { libc::munmap(self.at.as_ptr().cast(), self.len) };
+        self.map.is_empty()
     }
 }
 
@@ -1043,7 +1013,7 @@ impl Gathered {
             let mut unique: Vec<i32> = Vec::new();
             let mut seat_of: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
             let mut seated = Vec::with_capacity(raw.len() / 4);
-            for word in raw.chunks_exact(4) {
+            for word in raw.as_chunks::<4>().0 {
                 let row = i32::from_le_bytes([word[0], word[1], word[2], word[3]]);
 
                 if row < 0 {

@@ -129,19 +129,25 @@ pub fn decode_wire(bytes: &[u8], dtype: Dtype, numel: usize) -> Option<Value> {
         }
         Dtype::I32 => Value::I32(
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),
         Dtype::U32 => Value::U32(
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),
         Dtype::F32 => Value::F32(
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),

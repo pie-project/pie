@@ -68,13 +68,7 @@ pub fn lower(plan: &mut LoadPlan) -> usize {
 
     let mut named = 0;
     for (instr, facts) in plan.instrs.iter_mut().zip(facts) {
-        let (
-            Some(facts),
-            StorageInstr::TileMap {
-                transform, ..
-            },
-        ) = (facts, instr)
-        else {
+        let (Some(facts), StorageInstr::TileMap { transform, .. }) = (facts, instr) else {
             continue;
         };
         let lowering = lower_tile_map(&facts, &target);

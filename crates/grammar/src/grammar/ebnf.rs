@@ -955,13 +955,13 @@ mod tests {
         Grammar::from_ebnf(input, "root").unwrap().to_string()
     }
 
+    #[test]
     fn ebnf_every_case() {
         test_unicode_string();
         test_complex_character_class();
         test_escape_sequences_in_string();
     }
 
-    #[test]
     fn test_unicode_string() {
         let g = Grammar::from_ebnf(r#"root ::= "\u0041\u0042""#, "root").unwrap();
         match g.get_expr(g.root().body) {
@@ -994,5 +994,4 @@ mod tests {
             other => panic!("expected Choices, got {:?}", other),
         }
     }
-
 }

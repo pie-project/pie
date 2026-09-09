@@ -38,9 +38,7 @@ fn baked() -> (Trace, CompiledModel) {
 
 fn every_class_once(compiled: &CompiledModel) -> WindowTable {
     let classes = compiled.classes.classes.len();
-    let order = compiled
-        .order
-        .class_order(&ClassSet::of(0..classes));
+    let order = compiled.order.class_order(&ClassSet::of(0..classes));
     let mut table = vec![ClassWindow::default(); classes];
     for (at, &class) in order.iter().enumerate() {
         table[class as usize] = ClassWindow {
@@ -92,10 +90,7 @@ fn ambient(rows: usize) -> (Vec<i32>, Vec<i32>) {
 
 fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
     let classes = every_class_once(compiled);
-    let no_patches = WindowTable::new(vec![
-        ClassWindow::default();
-        compiled.classes.classes.len()
-    ]);
+    let no_patches = WindowTable::new(vec![ClassWindow::default(); compiled.classes.classes.len()]);
     let lanes = compiled.classes.classes.len();
     let (positions, request_of_token) = ambient(lanes);
     let spaces = [geometry(lanes)];
@@ -114,7 +109,7 @@ fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
             request_of_token: &request_of_token,
         },
         &[],
-    &[],
+        &[],
     )
     .expect("a fire over every class is a fire the artifact promised")
 }
@@ -122,9 +117,11 @@ fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
 fn withdrawn(compiled: &CompiledModel) -> Vec<(u32, ClassSet)> {
     let mut out: Vec<(u32, ClassSet)> = Vec::new();
     for (at, region) in compiled.template().iter().enumerate() {
-        let owed = compiled.fallback.rows.iter().any(|row| {
-            region.nodes.contains(&row.node) && row.fallback == Fallback::Copy
-        });
+        let owed = compiled
+            .fallback
+            .rows
+            .iter()
+            .any(|row| region.nodes.contains(&row.node) && row.fallback == Fallback::Copy);
         if owed {
             out.push((at as u32, region.mask.clone()));
         }
@@ -132,6 +129,7 @@ fn withdrawn(compiled: &CompiledModel) -> Vec<(u32, ClassSet)> {
     out
 }
 
+#[test]
 fn a_copied_window_is_one_encode_over_the_same_rows_every_case() {
     the_bake_writes_a_copy_row_below_the_crossover();
     a_withdrawn_window_splits_when_the_shell_does_not_copy();
@@ -146,7 +144,6 @@ fn a_copied_window_is_one_encode_over_the_same_rows_every_case() {
     the_packed_blob_and_the_bind_walk_it_in_one_order();
 }
 
-#[test]
 fn the_bake_writes_a_copy_row_below_the_crossover() {
     let (_, compiled) = baked();
     let owed = withdrawn(&compiled);
@@ -353,7 +350,10 @@ fn the_page_tables_are_re_cut_lane_by_lane_and_not_sliced() {
         lanes_of.len() + 1,
         "one bound per gathered lane, plus the terminator"
     );
-    assert_eq!(space.page_indptr_host[0], 0, "a fresh prefix sum starts at 0");
+    assert_eq!(
+        space.page_indptr_host[0], 0,
+        "a fresh prefix sum starts at 0"
+    );
 
     let mut expected: Vec<i32> = Vec::new();
     for &lane in &lanes_of {
@@ -428,7 +428,11 @@ fn only_a_withdrawn_mask_is_ever_in_pieces() {
     for (at, region) in compiled.template().iter().enumerate() {
         let at = at as u32;
         if split.runs(at) == 1 {
-            assert_eq!(copy.runs(at), 1, "region {at} was seated and gathered anyway");
+            assert_eq!(
+                copy.runs(at),
+                1,
+                "region {at} was seated and gathered anyway"
+            );
             assert!(
                 copy.at(at, 0).gathered.is_none(),
                 "region {at} was seated and carries a row map"

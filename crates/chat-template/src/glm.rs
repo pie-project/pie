@@ -31,7 +31,11 @@ impl Glm {
         prefix.extend(tokenizer.encode(EFFORT));
         let think_open = tokenizer.encode(THINK_OPEN);
         let think_close = tokenizer.encode(THINK_CLOSE);
-        assert_eq!(think_close.len(), 1, "`</think>` is one token in GLM's vocabulary");
+        assert_eq!(
+            think_close.len(),
+            1,
+            "`</think>` is one token in GLM's vocabulary"
+        );
         Self {
             prefix,
             system_marker,

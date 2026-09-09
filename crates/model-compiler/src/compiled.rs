@@ -92,11 +92,7 @@ pub enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lowering {
     AlwaysLaunch,
-    Switch {
-        merge: ValueId,
-        arm: u8,
-        arms: u8,
-    },
+    Switch { merge: ValueId, arm: u8, arms: u8 },
     If,
 }
 
@@ -159,9 +155,7 @@ pub struct FallbackRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fallback {
     View,
-    Split {
-        r: u32,
-    },
+    Split { r: u32 },
     Grouped,
     Copy,
 }

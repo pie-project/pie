@@ -10,7 +10,6 @@ use std::collections::HashSet;
 
 use super::iq_grid;
 use super::{Progress, Residency};
-use crate::consume::SourceLedger;
 use crate::codec::cast::{cast_elements, decode_values, encode_values};
 use crate::codec::fp8::{decode_fp8_e4m3_elements, f32_to_fp8_e4m3};
 use crate::codec::int4::decode_int4b8_elements;
@@ -18,6 +17,7 @@ use crate::codec::mlx::decode_mlx_affine_codes;
 use crate::codec::mlx::mlx_affine_group_params_bits;
 use crate::codec::mxfp4::{decode_mxfp4_elements, encode_mxfp4_group};
 use crate::codec::rows::{EncodeOperand, encode_rows};
+use crate::consume::SourceLedger;
 use crate::error::Error;
 use crate::executor::arena::{ArenaBacking, ArenaSpan, TileMapOp};
 use crate::executor::sink::TensorSink;
@@ -140,8 +140,9 @@ fn last_uses(plan: &LoadPlan) -> Result<HashMap<BufferId, usize>, Error> {
             StorageInstr::Allocate { buffer, .. } | StorageInstr::Fill { buffer, .. } => {
                 touch(*buffer);
             }
-            StorageInstr::ExtentWrite { dest, .. }
-            | StorageInstr::GatherWrite { dest, .. } => touch(dest.buffer),
+            StorageInstr::ExtentWrite { dest, .. } | StorageInstr::GatherWrite { dest, .. } => {
+                touch(dest.buffer)
+            }
             StorageInstr::BulkExtentWrite { .. } => {}
             StorageInstr::TileMap {
                 inputs,
@@ -1160,7 +1161,7 @@ impl Walk<'_, '_> {
                                         }
                                         let kk = k_base + k_off + h;
                                         let byte = bytes[col * row_bytes + kk / 2];
-                                        let code = if kk % 2 == 0 {
+                                        let code = if kk.is_multiple_of(2) {
                                             u32::from(byte & 0xF)
                                         } else {
                                             u32::from(byte >> 4)
@@ -1193,7 +1194,7 @@ impl Walk<'_, '_> {
                 }
                 let band = TILED_BAND as usize;
                 let mut out = vec![0u8; target_rows * cols * FACTOR];
-                for (at, slot) in out.chunks_exact_mut(FACTOR).enumerate() {
+                for (at, slot) in out.as_chunks_mut::<FACTOR>().0.iter_mut().enumerate() {
                     let j = at % band;
                     let rest = at / band;
                     let g = rest % cols;
@@ -1574,7 +1575,8 @@ impl Walk<'_, '_> {
                         .zip(chunk.chunks_exact_mut(out_bytes))
                     {
                         decode_gguf_block_into(scheme, block, &mut values);
-                        for (value, le) in values.iter().zip(out.chunks_exact_mut(2)) {
+                        for (value, le) in values.iter().zip(out.as_chunks_mut::<2>().0.iter_mut())
+                        {
                             le.copy_from_slice(&bf16::from_f32(*value).to_bits().to_le_bytes());
                         }
                     }
@@ -1824,8 +1826,10 @@ impl Walk<'_, '_> {
             dtype: DType::F32,
         })?;
         let factors: Vec<f32> = factor_bytes
-            .chunks_exact(4)
-            .map(|le| f32::from_le_bytes(le.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|le| f32::from_le_bytes(*le))
             .collect();
         let last_index = (scale_row_offset + (rows.saturating_sub(1)) / group) * scale_cols
             + scale_col_offset

@@ -36,7 +36,10 @@ fn to_f32(lo: u8, hi: u8) -> f32 {
 }
 
 fn env<T: std::str::FromStr>(name: &str, fallback: T) -> T {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(fallback)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(fallback)
 }
 
 fn list(name: &str, fallback: &str) -> Vec<u32> {
@@ -58,12 +61,12 @@ fn shapes() -> Vec<(u32, u32)> {
         .collect()
 }
 
+#[test]
 fn a_quantized_matmul_is_priced_by_its_rows_every_case() {
     every_row_count_is_timed();
     every_folded_point_answers_the_one_row_point();
 }
 
-#[test]
 fn every_row_count_is_timed() {
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
@@ -85,7 +88,10 @@ fn every_row_count_is_timed() {
                 other => panic!("no knob named {other} here"),
             }
         }
-        assert!(kernels_metal::tuning::override_with(over), "the tuning is laid once");
+        assert!(
+            kernels_metal::tuning::override_with(over),
+            "the tuning is laid once"
+        );
         eprintln!("tuning: {tuning}");
     }
 
@@ -105,12 +111,18 @@ fn every_row_count_is_timed() {
         let mut codes_b = Buffer::zeroed(&device, words * 4).expect("codes");
         let mut scales_b = Buffer::zeroed(&device, factors_n * 2).expect("scales");
         let mut biases_b = Buffer::zeroed(&device, factors_n * 2).expect("biases");
-        let cap = rows.iter().map(|&m| split_block(m).1).max().expect("a row count").max(widest);
+        let cap = rows
+            .iter()
+            .map(|&m| split_block(m).1)
+            .max()
+            .expect("a row count")
+            .max(widest);
         let split: u32 = env("PIE_QMM_SPLITK", 0u32);
         let precast_on: u32 = env("PIE_QMM_PRECAST", 1u32);
         let mut act_b = Buffer::zeroed(&device, u64::from(cap) * u64::from(k) * 2).expect("act");
         let out_b = Buffer::zeroed(&device, u64::from(cap) * u64::from(n) * 2).expect("out");
-        let precast_b = Buffer::zeroed(&device, u64::from(cap) * u64::from(k) * 2).expect("precast");
+        let precast_b =
+            Buffer::zeroed(&device, u64::from(cap) * u64::from(k) * 2).expect("precast");
         let partial_b = Buffer::zeroed(
             &device,
             u64::from(split.max(8)) * u64::from(cap.max(8)) * u64::from(n) * 4,
@@ -123,19 +135,23 @@ fn every_row_count_is_timed() {
             }
             codes_b.write(0, &codes).expect("write codes");
             let mut factors = vec![0u8; usize::try_from(factors_n * 2).expect("factors fit")];
-            for (at, pair) in factors.chunks_exact_mut(2).enumerate() {
+            for (at, pair) in factors.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                 let v = 0.01 + 0.001 * f32::from(noise(at as u64 ^ 0xAA) % 8);
                 pair.copy_from_slice(&bf16(v));
             }
             scales_b.write(0, &factors).expect("write scales");
             let mut zeros = vec![0u8; usize::try_from(factors_n * 2).expect("factors fit")];
-            for (at, pair) in zeros.chunks_exact_mut(2).enumerate() {
+            for (at, pair) in zeros.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                 pair.copy_from_slice(&bf16(-0.05 + 0.01 * f32::from(noise(at as u64 ^ 0x55) % 8)));
             }
             biases_b.write(0, &zeros).expect("write biases");
-            let mut act = vec![0u8; usize::try_from(u64::from(cap) * u64::from(k) * 2).expect("act fits")];
-            for (row, chunk) in act.chunks_exact_mut(usize::try_from(k).expect("k fits") * 2).enumerate() {
-                for (at, pair) in chunk.chunks_exact_mut(2).enumerate() {
+            let mut act =
+                vec![0u8; usize::try_from(u64::from(cap) * u64::from(k) * 2).expect("act fits")];
+            for (row, chunk) in act
+                .chunks_exact_mut(usize::try_from(k).expect("k fits") * 2)
+                .enumerate()
+            {
+                for (at, pair) in chunk.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                     let v = if row == 0 {
                         0.02 * (f32::from(noise(at as u64) % 16) - 8.0)
                     } else {
@@ -147,8 +163,13 @@ fn every_row_count_is_timed() {
             act_b.write(0, &act).expect("write act");
         }
         let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("a handle");
-        let (hc, hs, hb, ha, ho) =
-            (bind(&codes_b), bind(&scales_b), bind(&biases_b), bind(&act_b), bind(&out_b));
+        let (hc, hs, hb, ha, ho) = (
+            bind(&codes_b),
+            bind(&scales_b),
+            bind(&biases_b),
+            bind(&act_b),
+            bind(&out_b),
+        );
         let (hp, hq) = (bind(&precast_b), bind(&partial_b));
         if split > 0 {
             eprintln!("arm: split-K x{split}, f32 partials, at the engine's row rung");
@@ -158,7 +179,10 @@ fn every_row_count_is_timed() {
             eprintln!("arm: the ladder, with a precast plane (the engine's rung for gs=64/b=4)");
         }
 
-        eprintln!("\n  K={k} N={n}  ({:.2} GiB of codes)", words as f64 * 4.0 / (1u64 << 30) as f64);
+        eprintln!(
+            "\n  K={k} N={n}  ({:.2} GiB of codes)",
+            words as f64 * 4.0 / (1u64 << 30) as f64
+        );
         let tol: f64 = env("PIE_QMM_TOL", 0.05f64);
         let mut one = 0.0f64;
         let mut reference: Option<Vec<f32>> = None;
@@ -179,13 +203,17 @@ fn every_row_count_is_timed() {
             };
             let precast: &dyn Fn(u32, u32) -> Option<Tensor> =
                 if precast_on == 0 { &none } else { &some };
-            let partial_rows = u64::from(partial_b.bytes()) / (u64::from(n) * 4);
+            let partial_rows = partial_b.bytes() / (u64::from(n) * 4);
             let some_partials = |rows: u32, width: u32| {
                 (width == n && u64::from(rows) <= partial_rows)
                     .then(|| Tensor::new(hq, rows, width, Dtype::F32))
             };
             let partials: &dyn Fn(u32, u32) -> Option<Tensor> =
-                if env("PIE_QMM_LADDER_SPLIT", 1u32) == 0 { &none } else { &some_partials };
+                if env("PIE_QMM_LADDER_SPLIT", 1u32) == 0 {
+                    &none
+                } else {
+                    &some_partials
+                };
             let launch = |sink: &dyn Encode| {
                 if split == 0 {
                     let scratch = quant::Scratch { precast, partials };
@@ -199,11 +227,15 @@ fn every_row_count_is_timed() {
                     i32::try_from(k).expect("k"),
                     i32::try_from(split).expect("split"),
                 );
-                assert!(k_i % (split_i * 32) == 0 && (k_i / split_i) % 64 == 0,
-                    "K={k} must split into {split} partitions of whole 32-blocks and 64-groups");
-                let entry = format!("affine_qmm_t_splitk_f32_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_32");
+                assert!(
+                    k_i % (split_i * 32) == 0 && (k_i / split_i) % 64 == 0,
+                    "K={k} must split into {split} partitions of whole 32-blocks and 64-groups"
+                );
+                let entry =
+                    format!("affine_qmm_t_splitk_f32_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_32");
                 let entry: &'static str = Box::leak(entry.into_boxed_str());
-                let grid = quant::qmm_grid("bench", n_i, 32, padded_i, bm_i, split_i).expect("a grid");
+                let grid =
+                    quant::qmm_grid("bench", n_i, 32, padded_i, bm_i, split_i).expect("a grid");
                 let stride = padded_i * n_i;
                 sink.fire(
                     Fire::at(QMM_FILE, entry).apply(Grid::of(grid, quant::qmm_group(bm_i))),
@@ -266,7 +298,12 @@ fn every_row_count_is_timed() {
             }
             let launches = (steps * batch) as f64;
             let raw = handles.read(ho, u64::from(n) * 2).expect("read row 0");
-            let got: Vec<f32> = raw.chunks_exact(2).map(|p| to_f32(p[0], p[1])).collect();
+            let got: Vec<f32> = raw
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| to_f32(p[0], p[1]))
+                .collect();
             match &reference {
                 None => reference = Some(got),
                 Some(want) => {
@@ -281,20 +318,36 @@ fn every_row_count_is_timed() {
                         }
                     }
                     if worst > tol && std::env::var_os("PIE_QMM_DEBUG").is_some() {
-                        let off: Vec<usize> = want.iter().zip(&got).enumerate()
+                        let off: Vec<usize> = want
+                            .iter()
+                            .zip(&got)
+                            .enumerate()
                             .filter(|(_, (a, b))| {
                                 let (a, b) = (**a, **b);
                                 let scale = f64::from(a.abs()).max(f64::from(b.abs())).max(0.1);
                                 f64::from((a - b).abs()) / scale > tol
                             })
-                            .map(|(i, _)| i).collect();
-                        eprintln!("    {} of {} columns off; first 24: {:?}", off.len(), want.len(), &off[..off.len().min(24)]);
-                        eprintln!("    col%8 histogram: {:?}", (0..8).map(|k| off.iter().filter(|&&i| i % 8 == k).count()).collect::<Vec<_>>());
+                            .map(|(i, _)| i)
+                            .collect();
+                        eprintln!(
+                            "    {} of {} columns off; first 24: {:?}",
+                            off.len(),
+                            want.len(),
+                            &off[..off.len().min(24)]
+                        );
+                        eprintln!(
+                            "    col%8 histogram: {:?}",
+                            (0..8)
+                                .map(|k| off.iter().filter(|&&i| i % 8 == k).count())
+                                .collect::<Vec<_>>()
+                        );
                     }
                     assert!(
                         worst <= tol,
                         "rows {m} answers row 0 differently from rows {}: worst relative {worst:.4} at column {at} ({} vs {}); a point that disagrees here is wrong before it is slow",
-                        rows[0], want[at], got[at]
+                        rows[0],
+                        want[at],
+                        got[at]
                     );
                 }
             }
@@ -339,29 +392,37 @@ fn every_folded_point_answers_the_one_row_point() {
         }
         codes_b.write(0, &codes).expect("write codes");
         let mut factors = vec![0u8; usize::try_from(factors_max * 2).expect("fits")];
-        for (at, pair) in factors.chunks_exact_mut(2).enumerate() {
+        for (at, pair) in factors.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             pair.copy_from_slice(&bf16(0.01 + 0.001 * f32::from(noise(at as u64 ^ 0xAA) % 8)));
         }
         scales_b.write(0, &factors).expect("write scales");
-        for (at, pair) in factors.chunks_exact_mut(2).enumerate() {
+        for (at, pair) in factors.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             pair.copy_from_slice(&bf16(-0.05 + 0.01 * f32::from(noise(at as u64 ^ 0x55) % 8)));
         }
         biases_b.write(0, &factors).expect("write biases");
-        let mut act = vec![0u8; usize::try_from(u64::from(rows_max) * u64::from(k) * 2).expect("fits")];
-        for (at, pair) in act.chunks_exact_mut(2).enumerate() {
+        let mut act =
+            vec![0u8; usize::try_from(u64::from(rows_max) * u64::from(k) * 2).expect("fits")];
+        for (at, pair) in act.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             pair.copy_from_slice(&bf16(0.02 * (f32::from(noise(at as u64) % 16) - 8.0)));
         }
         act_b.write(0, &act).expect("write act");
     }
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("a handle");
     let (hc, hs, hb, ha, hf, ho) = (
-        bind(&codes_b), bind(&scales_b), bind(&biases_b), bind(&act_b), bind(&fold_b), bind(&one_b),
+        bind(&codes_b),
+        bind(&scales_b),
+        bind(&biases_b),
+        bind(&act_b),
+        bind(&fold_b),
+        bind(&one_b),
     );
     let read = |h: u32, rows: u32| -> Vec<f32> {
         handles
             .read(h, u64::from(rows) * u64::from(n) * 2)
             .expect("read")
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| to_f32(p[0], p[1]))
             .collect()
     };
@@ -386,20 +447,35 @@ fn every_folded_point_answers_the_one_row_point() {
                         Tensor::new(ha, m, k, Dtype::Bf16).arg(),
                     ];
                     let mut fold = w.to_vec();
-                    fold.extend([Tensor::new(hf, m, n, Dtype::Bf16).arg_mut(), ki.arg(), ni.arg(), mi.arg()]);
+                    fold.extend([
+                        Tensor::new(hf, m, n, Dtype::Bf16).arg_mut(),
+                        ki.arg(),
+                        ni.arg(),
+                        mi.arg(),
+                    ]);
                     sink.fire(
                         Fire::at("linear/quant_qmv_rows.metal", point.entry)
                             .stamp(point.stamp)
-                            .apply(Grid::of(quant::qmv_rows_grid("sweep", mi, rung, ni).expect("grid"), [32, 2, 1])),
+                            .apply(Grid::of(
+                                quant::qmv_rows_grid("sweep", mi, rung, ni).expect("grid"),
+                                [32, 2, 1],
+                            )),
                         &fold,
                     )
                     .expect("the fold");
-                    let one = quant::qmv_point("sweep", "fast", gs, bits).expect("the one-row point");
+                    let one =
+                        quant::qmv_point("sweep", "fast", gs, bits).expect("the one-row point");
                     let mut single = w.to_vec();
-                    single.extend([Tensor::new(ho, m, n, Dtype::Bf16).arg_mut(), ki.arg(), ni.arg()]);
+                    single.extend([
+                        Tensor::new(ho, m, n, Dtype::Bf16).arg_mut(),
+                        ki.arg(),
+                        ni.arg(),
+                    ]);
                     sink.fire(
-                        Fire::at("linear/quant_qmv.metal", one.entry)
-                            .apply(Grid::of(quant::qmv_grid("sweep", mi, ni).expect("grid"), [32, 2, 1])),
+                        Fire::at("linear/quant_qmv.metal", one.entry).apply(Grid::of(
+                            quant::qmv_grid("sweep", mi, ni).expect("grid"),
+                            [32, 2, 1],
+                        )),
                         &single,
                     )
                     .expect("the one-row point");

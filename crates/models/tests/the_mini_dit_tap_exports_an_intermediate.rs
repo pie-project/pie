@@ -43,6 +43,7 @@ fn ports(plan: &Trace) -> BTreeSet<String> {
         .collect()
 }
 
+#[test]
 fn the_mini_dit_tap_exports_an_intermediate_every_case() {
     a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width();
     a_tap_is_still_one_float_readout_and_no_logits();
@@ -50,7 +51,6 @@ fn the_mini_dit_tap_exports_an_intermediate_every_case() {
     an_unknown_key_taps_nothing();
 }
 
-#[test]
 fn a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width() {
     assert_eq!(
         velocity_width(&traced(None)),

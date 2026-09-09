@@ -588,14 +588,12 @@ pub(crate) fn eval_op(
             stream,
             shape,
             kind,
-        } => {
-            One(Value::F32(rng_ambient(
-                0,
-                stream,
-                kind,
-                shape.numel() as usize,
-            )))
-        }
+        } => One(Value::F32(rng_ambient(
+            0,
+            stream,
+            kind,
+            shape.numel() as usize,
+        ))),
         Op::RngKeyed { state, shape, kind } => {
             let st = lanes_i64(v(state));
             let (key, ctr) = (st[0] as u64 & 0xFFFF_FFFF, st[1] as u64 & 0xFFFF_FFFF);

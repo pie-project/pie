@@ -6,7 +6,7 @@ use ztensor::{Leaf, Plane, Term};
 
 use crate::error::Error;
 use crate::serving::{self, Stamp};
-use crate::term::{blob_planes, gguf_name, term_of, MMA_TILED};
+use crate::term::{MMA_TILED, blob_planes, gguf_name, term_of};
 use crate::types::{Encoding, TensorDecl};
 
 pub struct WriteTensor<'a> {
@@ -26,9 +26,8 @@ pub(crate) fn object_of(decl: &TensorDecl, tiled: bool) -> Result<Described, Err
     if let Encoding::Quant(spec) = &decl.encoding
         && let Some(kind) = gguf_name(spec.scheme)
     {
-        let row = ztensor::vocab::gguf::row_of(kind).ok_or_else(|| {
-            Error::Internal(format!("gguf type {kind:?} has no registry row"))
-        })?;
+        let row = ztensor::vocab::gguf::row_of(kind)
+            .ok_or_else(|| Error::Internal(format!("gguf type {kind:?} has no registry row")))?;
         return Ok(Described {
             term: row.term(),
             layout: Some(row.layout_id()),
@@ -101,7 +100,11 @@ struct Sharding {
 
 fn write_meta_object(writer: &mut ztensor::Writer, name: &str, bytes: &[u8]) -> Result<(), Error> {
     writer
-        .object(name, |o| o.shape(vec![bytes.len() as u64]).term(Leaf::U8).bytes(bytes))
+        .object(name, |o| {
+            o.shape(vec![bytes.len() as u64])
+                .term(Leaf::U8)
+                .bytes(bytes)
+        })
         .map_err(Error::from)
 }
 

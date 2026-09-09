@@ -248,8 +248,8 @@ pub mod audio {
         let mut samples: Vec<f32> = Vec::new();
         match (fmt_tag, bits) {
             (1, 16) => {
-                for c in data.chunks_exact(2) {
-                    samples.push(i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0);
+                for c in data.as_chunks::<2>().0 {
+                    samples.push(i16::from_le_bytes(*c) as f32 / 32768.0);
                 }
             }
             (1, 8) => {
@@ -258,26 +258,26 @@ pub mod audio {
                 }
             }
             (1, 24) => {
-                for c in data.chunks_exact(3) {
+                for c in data.as_chunks::<3>().0 {
                     let v = (c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16);
                     let v = (v << 8) >> 8;
                     samples.push(v as f32 / 8_388_608.0);
                 }
             }
             (1, 32) => {
-                for c in data.chunks_exact(4) {
-                    let v = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                for c in data.as_chunks::<4>().0 {
+                    let v = i32::from_le_bytes(*c);
                     samples.push(v as f32 / 2_147_483_648.0);
                 }
             }
             (3, 32) => {
-                for c in data.chunks_exact(4) {
-                    samples.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                for c in data.as_chunks::<4>().0 {
+                    samples.push(f32::from_le_bytes(*c));
                 }
             }
             (3, 64) => {
-                for c in data.chunks_exact(8) {
-                    let v = f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+                for c in data.as_chunks::<8>().0 {
+                    let v = f64::from_le_bytes(*c);
                     samples.push(v as f32);
                 }
             }

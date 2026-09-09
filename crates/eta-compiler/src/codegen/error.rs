@@ -29,23 +29,14 @@ impl EmitterKind {
 #[non_exhaustive]
 pub enum EmitError {
     EntryNameNotCIdentifier(EmitterKind),
-    UnsupportedSingletonOpcode {
-        tag: u8,
-    },
+    UnsupportedSingletonOpcode { tag: u8 },
 
-    ChannelLimitExceeded {
-        emitter: EmitterKind,
-        limit: usize,
-    },
+    ChannelLimitExceeded { emitter: EmitterKind, limit: usize },
     UnsupportedKernelBoundary,
-    UnbindableIntrinsic {
-        intrinsic: u16,
-    },
+    UnbindableIntrinsic { intrinsic: u16 },
     UnsupportedSinkBoundary,
     FusedRequiresGeneratedRegion,
-    GeneratedRegionHasBoundary {
-        library_op: &'static str,
-    },
+    GeneratedRegionHasBoundary { library_op: &'static str },
 
     RegionNodeOutOfRange(RegionForm),
     RegionNodesUnordered(RegionForm),

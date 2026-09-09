@@ -329,7 +329,6 @@ impl Composition {
     pub fn voxel_bucket(&self) -> u32 {
         self.axes[RowAxis::Voxels].bucket
     }
-
 }
 
 pub fn compose(compiled: &CompiledModel, budget: &Budget, lanes: &[Lane]) -> Result<Composition> {
@@ -676,12 +675,12 @@ mod tests {
         fire.classes().rows_of(&region.mask)
     }
 
+    #[test]
     fn compose_every_case() {
         the_thirteen_row_diagram_windows_the_way_the_design_draws_it();
         a_fire_rounds_up_to_a_bucket_and_one_above_them_all_is_refused();
     }
 
-    #[test]
     fn the_thirteen_row_diagram_windows_the_way_the_design_draws_it() {
         let (b, _) = diagram();
         let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
@@ -738,5 +737,4 @@ mod tests {
         let fire = compose(&compiled, &open, &[Lane::new(0, 5)]).expect("composes");
         assert_eq!(fire.bucket(), 5);
     }
-
 }

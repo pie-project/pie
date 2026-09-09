@@ -16,6 +16,7 @@ fn f32_bytes(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+#[test]
 fn container_every_case() {
     roundtrip_dense();
     an_indexed_source_locates_without_mapping();
@@ -40,7 +41,6 @@ fn container_every_case() {
     only_an_external_blob_takes_a_digest();
 }
 
-#[test]
 fn roundtrip_dense() {
     let path = tmp("roundtrip.zt");
     let a = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -213,8 +213,10 @@ fn alignment_is_not_the_canonical_switch() {
 fn a_non_canonical_writer_still_places_at_64_kib() {
     let path = tmp("noncanon-align.zt");
     let mut w = Writer::options().canonical(false).create(&path).unwrap();
-    w.add("t", [4u64], Leaf::F32, &f32_bytes(&[1.0; 4])).unwrap();
-    w.add("u", [4u64], Leaf::F32, &f32_bytes(&[2.0; 4])).unwrap();
+    w.add("t", [4u64], Leaf::F32, &f32_bytes(&[1.0; 4]))
+        .unwrap();
+    w.add("u", [4u64], Leaf::F32, &f32_bytes(&[2.0; 4]))
+        .unwrap();
     w.finish().unwrap();
 
     let src = Source::open(&path).unwrap();
@@ -234,7 +236,8 @@ fn a_non_canonical_writer_still_places_at_64_kib() {
         .align(4096)
         .create(&floor)
         .unwrap();
-    w.add("t", [4u64], Leaf::F32, &f32_bytes(&[1.0; 4])).unwrap();
+    w.add("t", [4u64], Leaf::F32, &f32_bytes(&[1.0; 4]))
+        .unwrap();
     w.finish().unwrap();
     assert_eq!(
         Source::open(&floor)
@@ -425,7 +428,9 @@ fn an_object_takes_one_payload() {
     let data = [7u8; 4];
 
     let err = w
-        .object("t", |o| o.shape([4u64]).term(Leaf::U8).bytes(&data).length(4))
+        .object("t", |o| {
+            o.shape([4u64]).term(Leaf::U8).bytes(&data).length(4)
+        })
         .unwrap_err();
     let message = err.to_string();
     assert!(
@@ -434,7 +439,9 @@ fn an_object_takes_one_payload() {
     );
 
     let err = w
-        .object("t", |o| o.shape([4u64]).term(Leaf::U8).length(4).bytes(&data))
+        .object("t", |o| {
+            o.shape([4u64]).term(Leaf::U8).length(4).bytes(&data)
+        })
         .unwrap_err();
     assert!(
         err.to_string().contains("`length`, then `bytes`"),
@@ -450,12 +457,16 @@ fn only_an_external_blob_takes_a_digest() {
         .object("t", |o| {
             o.shape([4u64])
                 .term(Leaf::U8)
-                .digest(ztensor::Digest::new(ztensor::DigestAlgorithm::Xxh3, vec![0; 8]))
+                .digest(ztensor::Digest::new(
+                    ztensor::DigestAlgorithm::Xxh3,
+                    vec![0; 8],
+                ))
                 .bytes(&[0u8; 4])
         })
         .unwrap_err();
     assert!(
-        err.to_string().contains("only an external blob takes a digest"),
+        err.to_string()
+            .contains("only an external blob takes a digest"),
         "got: {err}"
     );
     w.abandon();

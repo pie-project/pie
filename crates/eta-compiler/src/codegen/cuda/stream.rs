@@ -47,6 +47,7 @@ pub(super) struct Streams<'a> {
 }
 
 impl<'a> Streams<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         stage: &'a CompiledStage,
         region: &'a Region,
@@ -118,7 +119,9 @@ impl<'a> Streams<'a> {
             return matches!(self.role(node, &mut None), Some(Role::Intrinsic));
         }
         match self.role(node, &mut None) {
-            Some(Role::Map | Role::Broadcast) => op.args.iter().all(|&a| self.remat_depth(a, depth + 1)),
+            Some(Role::Map | Role::Broadcast) => {
+                op.args.iter().all(|&a| self.remat_depth(a, depth + 1))
+            }
             _ => false,
         }
     }
@@ -144,7 +147,7 @@ impl<'a> Streams<'a> {
             1 => ty
                 .dims
                 .last()
-                .map(|d| RowClass::Full(d.clone()))
+                .map(|d| RowClass::Full(*d))
                 .unwrap_or(RowClass::Other),
             2 => RowClass::Scalar,
             _ => {
@@ -164,7 +167,10 @@ impl<'a> Streams<'a> {
         let op = &self.ops[node];
         let out = self.bases[node];
         let out_dtype = self.dtype(out);
-        if !matches!(out_dtype, Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool) {
+        if !matches!(
+            out_dtype,
+            Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool
+        ) {
             return None;
         }
         let full = |value: u32, width: &mut Option<Dimension>| -> bool {
@@ -183,9 +189,12 @@ impl<'a> Streams<'a> {
             matches!(self.class(value), RowClass::Scalar) || full(value, width)
         };
         let scalar_dtypes = |values: &[u32]| {
-            values
-                .iter()
-                .all(|&v| matches!(self.dtype(v), Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool))
+            values.iter().all(|&v| {
+                matches!(
+                    self.dtype(v),
+                    Dtype::F32 | Dtype::I32 | Dtype::U32 | Dtype::Bool
+                )
+            })
         };
         let tag = op.tag;
         match tag {
@@ -204,7 +213,7 @@ impl<'a> Streams<'a> {
                 if tag == tags::NOT && self.dtype(op.args[0]) != Dtype::Bool {
                     return None;
                 }
-                let mut w = width.clone();
+                let mut w = *width;
                 if !full(out, &mut w) || !indexed(op.args[0], &mut w) {
                     return None;
                 }
@@ -212,10 +221,13 @@ impl<'a> Streams<'a> {
                 Some(Role::Map)
             }
             tags::NEG | tags::ABS | tags::SIGN => {
-                if op.args.len() != 1 || self.dtype(op.args[0]) == Dtype::Bool || !scalar_dtypes(&op.args) {
+                if op.args.len() != 1
+                    || self.dtype(op.args[0]) == Dtype::Bool
+                    || !scalar_dtypes(&op.args)
+                {
                     return None;
                 }
-                let mut w = width.clone();
+                let mut w = *width;
                 if !full(out, &mut w) || !indexed(op.args[0], &mut w) {
                     return None;
                 }
@@ -248,18 +260,24 @@ impl<'a> Streams<'a> {
                 if !logic && left == Dtype::Bool {
                     return None;
                 }
-                let mut w = width.clone();
-                if !full(out, &mut w) || !indexed(op.args[0], &mut w) || !indexed(op.args[1], &mut w) {
+                let mut w = *width;
+                if !full(out, &mut w)
+                    || !indexed(op.args[0], &mut w)
+                    || !indexed(op.args[1], &mut w)
+                {
                     return None;
                 }
                 *width = w;
                 Some(Role::Map)
             }
             tags::SELECT => {
-                if op.args.len() != 3 || !scalar_dtypes(&op.args) || self.dtype(op.args[0]) != Dtype::Bool {
+                if op.args.len() != 3
+                    || !scalar_dtypes(&op.args)
+                    || self.dtype(op.args[0]) != Dtype::Bool
+                {
                     return None;
                 }
-                let mut w = width.clone();
+                let mut w = *width;
                 if !full(out, &mut w) || !op.args.iter().all(|&a| indexed(a, &mut w)) {
                     return None;
                 }
@@ -267,10 +285,13 @@ impl<'a> Streams<'a> {
                 Some(Role::Map)
             }
             tags::BROADCAST => {
-                if op.args.len() != 1 || !scalar_dtypes(&op.args) || self.class(op.args[0]) != RowClass::Scalar {
+                if op.args.len() != 1
+                    || !scalar_dtypes(&op.args)
+                    || self.class(op.args[0]) != RowClass::Scalar
+                {
                     return None;
                 }
-                let mut w = width.clone();
+                let mut w = *width;
                 if !full(out, &mut w) {
                     return None;
                 }
@@ -281,10 +302,12 @@ impl<'a> Streams<'a> {
                 if out_dtype != Dtype::F32 {
                     return None;
                 }
-                if tag == tags::RNG_KEYED && (op.args.len() != 1 || self.dtype(op.args[0]) != Dtype::U32) {
+                if tag == tags::RNG_KEYED
+                    && (op.args.len() != 1 || self.dtype(op.args[0]) != Dtype::U32)
+                {
                     return None;
                 }
-                let mut w = width.clone();
+                let mut w = *width;
                 if !full(out, &mut w) {
                     return None;
                 }
@@ -298,7 +321,7 @@ impl<'a> Streams<'a> {
                 if out_dtype != Dtype::F32 {
                     return None;
                 }
-                let mut w = width.clone();
+                let mut w = *width;
                 if !full(out, &mut w) {
                     return None;
                 }
@@ -315,12 +338,16 @@ impl<'a> Streams<'a> {
                 if self.class(out) != RowClass::Scalar {
                     return None;
                 }
-                let mut w = width.clone();
+                let mut w = *width;
                 if !full(op.args[0], &mut w) {
                     return None;
                 }
                 *width = w;
-                Some(if tag == tags::REDUCE_ARGMAX { Role::Argmax } else { Role::Reduce })
+                Some(if tag == tags::REDUCE_ARGMAX {
+                    Role::Argmax
+                } else {
+                    Role::Reduce
+                })
             }
             _ => None,
         }
@@ -343,7 +370,11 @@ impl<'a> Streams<'a> {
             }
             members.push(Member { node, role });
         }
-        if members.is_empty() { None } else { Some(members) }
+        if members.is_empty() {
+            None
+        } else {
+            Some(members)
+        }
     }
 
     fn escapes(&self, value: u32, members: &[Member]) -> bool {
@@ -358,7 +389,9 @@ impl<'a> Streams<'a> {
             })
             .unwrap_or_default();
         let remat = self.rematerializable(value);
-        let served = |node: &usize| (remat && self.stream_reader(*node)) || self.topk_reads_direct(*node, value);
+        let served = |node: &usize| {
+            (remat && self.stream_reader(*node)) || self.topk_reads_direct(*node, value)
+        };
         if outside.iter().any(|node| !served(node)) {
             return true;
         }
@@ -497,9 +530,21 @@ impl Bodies {
 
     fn load(&mut self, name: &str, want: Dtype, ptr: &str, from: u32) {
         let l = letter(want);
-        let _ = writeln!(self.s, "      const {} {name} = m1_load_{l}({ptr}, i, {from}u);", c_type(want));
-        let _ = writeln!(self.pre, "        const {} q_{name} = m1_load4_{l}({ptr}, i4 >> 2u, {from}u);", vec_type(want));
-        let _ = writeln!(self.v, "      const {} {name} = m1_pick4_{l}(q_{name}, j);", c_type(want));
+        let _ = writeln!(
+            self.s,
+            "      const {} {name} = m1_load_{l}({ptr}, i, {from}u);",
+            c_type(want)
+        );
+        let _ = writeln!(
+            self.pre,
+            "        const {} q_{name} = m1_load4_{l}({ptr}, i4 >> 2u, {from}u);",
+            vec_type(want)
+        );
+        let _ = writeln!(
+            self.v,
+            "      const {} {name} = m1_pick4_{l}(q_{name}, j);",
+            c_type(want)
+        );
         self.touch(ptr);
     }
 
@@ -508,7 +553,10 @@ impl Bodies {
         let _ = writeln!(self.s, "      m1_store_{l}({ptr}, i, {reg});");
         let _ = writeln!(self.pre, "        {} w_{reg};", vec_type(dtype));
         let _ = writeln!(self.v, "      m1_set4_{l}(w_{reg}, j, {reg});");
-        let _ = writeln!(self.post, "        m1_store4_{l}({ptr}, i4 >> 2u, w_{reg});");
+        let _ = writeln!(
+            self.post,
+            "        m1_store4_{l}({ptr}, i4 >> 2u, w_{reg});"
+        );
         self.touch(ptr);
     }
 }
@@ -578,7 +626,10 @@ fn rematerialize(streams: &Streams<'_>, value: u32, pass: &mut Pass<'_>) -> Stri
     } else {
         let out_dtype = streams.dtype(out);
         let expr = map_expr(streams, node, out_dtype, pass);
-        pass.body.both(&format!("      const {} r{out} = {expr};", c_type(out_dtype)));
+        pass.body.both(&format!(
+            "      const {} r{out} = {expr};",
+            c_type(out_dtype)
+        ));
         pass.registers.push((out, out_dtype));
     }
     format!("r{out}")
@@ -592,22 +643,46 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
         let p = &mut pass.prologue;
         let _ = writeln!(p, "    M1OpParams p{node} = params[{node}u];");
         let _ = writeln!(p, "    p{node}.rng_seed = 0u;");
-        let _ = writeln!(p, "    const m1_u32 intrinsic_index{node} = dispatch_lane * {slots}u + p{node}.intr;");
-        let _ = writeln!(p, "    p{node}.intrinsic_dtype = intrinsic_modes[intrinsic_index{node}];");
-        let _ = writeln!(p, "    p{node}.imm = intrinsic_widths[intrinsic_index{node}];");
-        let _ = writeln!(p, "    p{node}.intrinsic_row_stride = intrinsic_strides[intrinsic_index{node}];");
-        let _ = writeln!(p, "    p{node}.intrinsic_row_offset = intrinsic_offsets[intrinsic_index{node}] + lane_row;");
+        let _ = writeln!(
+            p,
+            "    const m1_u32 intrinsic_index{node} = dispatch_lane * {slots}u + p{node}.intr;"
+        );
+        let _ = writeln!(
+            p,
+            "    p{node}.intrinsic_dtype = intrinsic_modes[intrinsic_index{node}];"
+        );
+        let _ = writeln!(
+            p,
+            "    p{node}.imm = intrinsic_widths[intrinsic_index{node}];"
+        );
+        let _ = writeln!(
+            p,
+            "    p{node}.intrinsic_row_stride = intrinsic_strides[intrinsic_index{node}];"
+        );
+        let _ = writeln!(
+            p,
+            "    p{node}.intrinsic_row_offset = intrinsic_offsets[intrinsic_index{node}] + lane_row;"
+        );
         let _ = writeln!(
             p,
             "    const m1_u8* ibase{node} = reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index{node}]);"
         );
-        let _ = writeln!(p, "    const M1ValueDesc idesc{node} = descriptors[{out}u];");
-        let _ = writeln!(p, "    const m1_u32 iwidth{node} = idesc{node}.last == 0u ? p{node}.imm : idesc{node}.last;");
+        let _ = writeln!(
+            p,
+            "    const M1ValueDesc idesc{node} = descriptors[{out}u];"
+        );
+        let _ = writeln!(
+            p,
+            "    const m1_u32 iwidth{node} = idesc{node}.last == 0u ? p{node}.imm : idesc{node}.last;"
+        );
         let _ = writeln!(
             p,
             "    const m1_u32 istride{node} = p{node}.intrinsic_row_stride == 0u ? iwidth{node} : p{node}.intrinsic_row_stride;"
         );
-        let _ = writeln!(p, "    const m1_u64 ifirst{node} = (m1_u64)p{node}.intrinsic_row_offset + (m1_u64)p{node}.imm2;");
+        let _ = writeln!(
+            p,
+            "    const m1_u64 ifirst{node} = (m1_u64)p{node}.intrinsic_row_offset + (m1_u64)p{node}.imm2;"
+        );
         pass.body.conds.push(format!(
             "(iwidth{node} & 3u) == 0u && stream_width <= iwidth{node} && m1_intrinsic_row_vectorable(ibase{node}, ifirst{node}, istride{node}, p{node}.intrinsic_dtype)"
         ));
@@ -620,7 +695,10 @@ fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<
         pass.body.pre,
         "        const float4 q_r{out} = m1_intrinsic_row_load4(ibase{node}, ifirst{node} + i4 / iwidth{node}, i4 % iwidth{node}, istride{node}, p{node}.intrinsic_dtype);"
     );
-    let _ = writeln!(pass.body.v, "      const float r{out} = m1_pick4_f(q_r{out}, j);");
+    let _ = writeln!(
+        pass.body.v,
+        "      const float r{out} = m1_pick4_f(q_r{out}, j);"
+    );
     pass.registers.push((out, Dtype::F32));
 }
 
@@ -674,7 +752,11 @@ fn map_expr(streams: &Streams<'_>, node: usize, out_dtype: Dtype, pass: &mut Pas
     } else if matches!(tag, tags::AND | tags::OR) {
         let a = read(streams, op.args[0], Dtype::Bool, pass);
         let b = read(streams, op.args[1], Dtype::Bool, pass);
-        if tag == tags::AND { format!("({a} && {b})") } else { format!("({a} || {b})") }
+        if tag == tags::AND {
+            format!("({a} && {b})")
+        } else {
+            format!("({a} || {b})")
+        }
     } else {
         let path = streams.dtype(op.args[0]);
         let a = read(streams, op.args[0], path, pass);
@@ -730,7 +812,10 @@ pub(super) fn emit_stream(
             if matches!(streams.class(out), RowClass::Full(_)) {
                 Some(out)
             } else {
-                op.args.iter().copied().find(|&a| matches!(streams.class(a), RowClass::Full(_)))
+                op.args
+                    .iter()
+                    .copied()
+                    .find(|&a| matches!(streams.class(a), RowClass::Full(_)))
             }
         })
         .expect("a stream has a full value");
@@ -741,7 +826,10 @@ pub(super) fn emit_stream(
     s.push_str("    const m1_u32 stream_warp = threadIdx.x >> 5u;\n");
     s.push_str("    const m1_u32 stream_warps = blockDim.x >> 5u;\n");
     s.push_str("    float* stream_work = reinterpret_cast<float*>(temporary);\n");
-    let _ = writeln!(s, "    const m1_u32 stream_width = descriptors[{witness}u].len;");
+    let _ = writeln!(
+        s,
+        "    const m1_u32 stream_width = descriptors[{witness}u].len;"
+    );
 
     let mut pass = Pass {
         registers: Vec::new(),
@@ -765,7 +853,10 @@ pub(super) fn emit_stream(
         match member.role {
             Role::Map | Role::Broadcast => {
                 let expr = map_expr(streams, node, out_dtype, &mut pass);
-                pass.body.both(&format!("      const {} r{out} = {expr};", c_type(out_dtype)));
+                pass.body.both(&format!(
+                    "      const {} r{out} = {expr};",
+                    c_type(out_dtype)
+                ));
                 pass.registers.push((out, out_dtype));
                 if streams.escapes(out, &members) {
                     let ptr = (pass.pointer)(out);
@@ -782,7 +873,10 @@ pub(super) fn emit_stream(
             Role::Rng => {
                 let _ = writeln!(pass.prologue, "    M1OpParams p{node} = params[{node}u];");
                 let _ = writeln!(pass.prologue, "    p{node}.rng_seed = 0u;");
-                let _ = writeln!(pass.prologue, "    p{node}.imm3 = lane_row * descriptors[p{node}.o0].len;");
+                let _ = writeln!(
+                    pass.prologue,
+                    "    p{node}.imm3 = lane_row * descriptors[p{node}.o0].len;"
+                );
                 if tag == tags::RNG {
                     let _ = writeln!(
                         pass.prologue,
@@ -812,17 +906,28 @@ pub(super) fn emit_stream(
                 let x = read(streams, op.args[0], Dtype::F32, &mut pass);
                 let (identity, combine): (&str, fn(&str, &str) -> String) = match tag {
                     tags::REDUCE_SUM => ("0.0f", |a, b| format!("({a} + {b})")),
-                    tags::REDUCE_MAX => ("m1_neg_inf()", |a, b| format!("m1_canonical_max({a}, {b})")),
+                    tags::REDUCE_MAX => {
+                        ("m1_neg_inf()", |a, b| format!("m1_canonical_max({a}, {b})"))
+                    }
                     _ => ("m1_pos_inf()", |a, b| format!("m1_canonical_min({a}, {b})")),
                 };
                 let slot = float_reductions;
                 float_reductions += 1;
                 let _ = writeln!(pass.prologue, "    float acc{node} = {identity};");
-                pass.body.both(&format!("      acc{node} = {};", combine(&format!("acc{node}"), &x)));
+                pass.body.both(&format!(
+                    "      acc{node} = {};",
+                    combine(&format!("acc{node}"), &x)
+                ));
                 let _ = writeln!(epilogue, "    {{");
                 let _ = writeln!(epilogue, "      float v = acc{node};");
-                let _ = writeln!(epilogue, "      for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {{");
-                let _ = writeln!(epilogue, "        const float other = __shfl_down_sync(0xffffffffu, v, offset);");
+                let _ = writeln!(
+                    epilogue,
+                    "      for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {{"
+                );
+                let _ = writeln!(
+                    epilogue,
+                    "        const float other = __shfl_down_sync(0xffffffffu, v, offset);"
+                );
                 let _ = writeln!(epilogue, "        v = {};", combine("v", "other"));
                 let _ = writeln!(epilogue, "      }}");
                 let _ = writeln!(
@@ -845,21 +950,36 @@ pub(super) fn emit_stream(
             Role::Argmax => {
                 let x = read(streams, op.args[0], Dtype::F32, &mut pass);
                 argmaxes += 1;
-                let _ = writeln!(pass.prologue, "    M1ArgmaxCandidate cand{node}{{m1_neg_inf(), 0u, 0u, 0u}};");
+                let _ = writeln!(
+                    pass.prologue,
+                    "    M1ArgmaxCandidate cand{node}{{m1_neg_inf(), 0u, 0u, 0u}};"
+                );
                 pass.body.both(&format!(
                     "      cand{node} = m1_argmax_combine(cand{node}, M1ArgmaxCandidate{{{x}, i, m1_isnan({x}) ? 0u : 1u, 0u}});"
                 ));
-                let _ = writeln!(epilogue, "    cand{node} = m1_argmax_warp_reduce(cand{node}, stream_lane);");
-                let _ = writeln!(epilogue, "    if (stream_lane == 0u) stream_candidates[stream_warp] = cand{node};");
+                let _ = writeln!(
+                    epilogue,
+                    "    cand{node} = m1_argmax_warp_reduce(cand{node}, stream_lane);"
+                );
+                let _ = writeln!(
+                    epilogue,
+                    "    if (stream_lane == 0u) stream_candidates[stream_warp] = cand{node};"
+                );
                 let _ = writeln!(epilogue, "    __syncthreads();");
                 let _ = writeln!(epilogue, "    if (stream_warp == 0u) {{");
                 let _ = writeln!(
                     epilogue,
                     "      cand{node} = stream_lane < stream_warps ? stream_candidates[stream_lane] : M1ArgmaxCandidate{{m1_neg_inf(), 0u, 0u, 0u}};"
                 );
-                let _ = writeln!(epilogue, "      cand{node} = m1_argmax_warp_reduce(cand{node}, stream_lane);");
+                let _ = writeln!(
+                    epilogue,
+                    "      cand{node} = m1_argmax_warp_reduce(cand{node}, stream_lane);"
+                );
                 let ptr = (pass.pointer)(out);
-                let _ = writeln!(epilogue, "      if (stream_lane == 0u) m1_store_i({ptr}, 0u, (int)cand{node}.index);");
+                let _ = writeln!(
+                    epilogue,
+                    "      if (stream_lane == 0u) m1_store_i({ptr}, 0u, (int)cand{node}.index);"
+                );
                 let _ = writeln!(epilogue, "    }}");
             }
         }
@@ -878,7 +998,9 @@ pub(super) fn emit_stream(
     conds.extend(body.conds.iter().cloned());
     let _ = writeln!(s, "    const bool stream_vec = {};", conds.join(" && "));
     s.push_str("    if (stream_vec) {\n");
-    s.push_str("      for (m1_u32 i4 = threadIdx.x * 4u; i4 < stream_width; i4 += blockDim.x * 4u) {\n");
+    s.push_str(
+        "      for (m1_u32 i4 = threadIdx.x * 4u; i4 < stream_width; i4 += blockDim.x * 4u) {\n",
+    );
     s.push_str(&body.pre);
     s.push_str("#pragma unroll\n");
     s.push_str("        for (m1_u32 j = 0u; j < 4u; ++j) {\n");
@@ -915,7 +1037,16 @@ pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
     let kinds = super::fused::row_kinds(stage, region, geometry);
     let direct = super::fused::analyze_direct_argmax(stage, region, &bases);
     let direct_topk = super::fused::analyze_direct_topk(stage);
-    let streams = Streams::new(stage, region, &ops, &bases, &kinds, &direct.intrinsic, &direct.skipped, &direct_topk);
+    let streams = Streams::new(
+        stage,
+        region,
+        &ops,
+        &bases,
+        &kinds,
+        &direct.intrinsic,
+        &direct.skipped,
+        &direct_topk,
+    );
     let mut spent = Vec::new();
     let mut at = 0usize;
     while at < streams.order.len() {
@@ -928,7 +1059,10 @@ pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
             continue;
         };
         for member in &members {
-            if matches!(member.role, Role::Map | Role::Broadcast | Role::Rng | Role::Intrinsic) {
+            if matches!(
+                member.role,
+                Role::Map | Role::Broadcast | Role::Rng | Role::Intrinsic
+            ) {
                 let value = bases[member.node];
                 if !streams.escapes(value, &members) {
                     spent.push(value);

@@ -123,6 +123,7 @@ fn check(
     );
 }
 
+#[test]
 fn the_grouped_expert_select_answers_the_routed_dot_every_case() {
     the_token_read_leg_answers_the_dot();
     the_route_read_leg_answers_the_dot();
@@ -132,7 +133,6 @@ fn the_grouped_expert_select_answers_the_routed_dot_every_case() {
     a_ragged_expert_count_still_lands();
 }
 
-#[test]
 fn the_token_read_leg_answers_the_dot() {
     check(8, 48, 2, 64, 96, true, Spread::Mixed);
 }

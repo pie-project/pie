@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use model_dsl::{
-    Attention, CacheRow, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Guard, Operands,
-    Operation, Platform, RaggedMask, Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty,
-    ValueId, seam,
+    Attention, CacheRow, Classify, Def, Dim, Dtype, Elementwise, GeomKind, Operands, Operation,
+    Platform, RaggedMask, Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId,
+    seam,
 };
 use models::wan_2::forward::Facts;
 use models::wan_2::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
+
+type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
 const TI2V: &str = "wan22-ti2v-5b-bf16-kv-bf16";
 const D128: &str = "wan22-mini-d128-bf16-kv-bf16";
@@ -58,6 +60,7 @@ fn word(reading: u8, stream: Stream) -> u64 {
     Facts::of(&request).word()
 }
 
+#[test]
 fn the_wan_2_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_seams_it_states();
     the_ports_the_trace_reads_are_the_ports_the_facts_declare();
@@ -69,7 +72,6 @@ fn the_wan_2_rows_bake_every_case() {
     the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk();
 }
 
-#[test]
 fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
     for sku in ROWS {
         for platform in PLATFORMS {
@@ -367,7 +369,7 @@ fn every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
         let d = dims(sku);
-        let ropes: Vec<([u32; 4], [f32; 4], RopeForm, u32, u32)> = plan
+        let ropes: Vec<RopeRow> = plan
             .nodes
             .iter()
             .filter_map(|node| match &node.op {

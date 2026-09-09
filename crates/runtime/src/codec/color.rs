@@ -71,12 +71,12 @@ pub fn rgb8_to_nv12_pitched(rgb: &[u8], width: usize, height: usize, pitch: usiz
 mod tests {
     use super::*;
 
+    #[test]
     fn color_every_case() {
         grey_is_grey_in_both_layouts();
         primaries_land_where_bt601_puts_them();
     }
 
-    #[test]
     fn grey_is_grey_in_both_layouts() {
         let rgb = vec![128u8; 4 * 4 * 3];
         let mut i420 = Vec::new();
@@ -95,7 +95,7 @@ mod tests {
     }
 
     fn primaries_land_where_bt601_puts_them() {
-        let rgb = vec![255u8, 0, 0].repeat(4);
+        let rgb = [255u8, 0, 0].repeat(4);
         let mut out = Vec::new();
         rgb8_to_i420(&rgb, 2, 2, &mut out);
         assert_eq!(out[0], 82);

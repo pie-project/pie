@@ -187,6 +187,7 @@ mod tests {
     const IMAGE: u64 = 2;
     const REFERENCE: u64 = 32;
 
+    #[test]
     fn packing_every_case() {
         a_joint_selection_packs_by_group_then_stream();
         a_class_selection_packs_at_its_own_window();
@@ -194,7 +195,6 @@ mod tests {
         a_scattered_selection_is_refused();
     }
 
-    #[test]
     fn a_joint_selection_packs_by_group_then_stream() {
         let lanes = [
             row(0, TEXT, 0, 3),

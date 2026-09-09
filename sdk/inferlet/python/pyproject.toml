@@ -20,12 +20,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "jinja2>=3.0",  # For chat template formatting
+    "jinja2>=3.0",
 ]
 
 [project.optional-dependencies]
 build = [
-    "componentize-py>=0.19",  # WASM component compiler
+    "componentize-py>=0.19",
 ]
 dev = [
     "componentize-py>=0.19",

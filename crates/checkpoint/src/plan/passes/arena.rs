@@ -224,8 +224,9 @@ fn live_ranges(
             StorageInstr::Allocate { buffer, .. } | StorageInstr::Fill { buffer, .. } => {
                 touched.push(*buffer);
             }
-            StorageInstr::ExtentWrite { dest, .. }
-            | StorageInstr::GatherWrite { dest, .. } => touched.push(dest.buffer),
+            StorageInstr::ExtentWrite { dest, .. } | StorageInstr::GatherWrite { dest, .. } => {
+                touched.push(dest.buffer)
+            }
             StorageInstr::BulkExtentWrite { .. } => {}
             StorageInstr::TileMap {
                 dest,

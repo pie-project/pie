@@ -73,6 +73,7 @@ struct Shape {
     segments: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn shape(
     q: Tensor,
     k: Tensor,
@@ -124,7 +125,7 @@ fn shape(
         ));
     }
     let q_heads = q.width / head_dim;
-    if q_heads % kv_heads != 0 {
+    if !q_heads.is_multiple_of(kv_heads) {
         return Err(refuse(
             OP,
             format!("{q_heads} query heads do not group over {kv_heads} kv heads"),
@@ -134,17 +135,18 @@ fn shape(
         if t.dtype != Dtype::I32 {
             return Err(refuse(
                 OP,
-                format!("the {what} CSR is {:?}, and a segment table is i32", t.dtype),
+                format!(
+                    "the {what} CSR is {:?}, and a segment table is i32",
+                    t.dtype
+                ),
             ));
         }
     }
     let entries = (q_indptr.rows * q_indptr.width).min(kv_indptr.rows * kv_indptr.width);
-    let segments = entries.checked_sub(1).filter(|s| *s > 0).ok_or_else(|| {
-        refuse(
-            OP,
-            format!("a CSR of {entries} entries names no segment"),
-        )
-    })?;
+    let segments = entries
+        .checked_sub(1)
+        .filter(|s| *s > 0)
+        .ok_or_else(|| refuse(OP, format!("a CSR of {entries} entries names no segment")))?;
     Ok(Shape {
         rows,
         q_heads,
@@ -173,11 +175,13 @@ fn mask_args(ctx: &Ctx<'_>, mask: &RaggedMask, q_heads: u32) -> Result<[ArgValue
             if table.dtype != Dtype::F32 {
                 return Err(refuse(
                     OP,
-                    format!("the bias table is {:?}, and a logit bias is f32", table.dtype),
+                    format!(
+                        "the bias table is {:?}, and a logit bias is f32",
+                        table.dtype
+                    ),
                 ));
             }
-            if u64::from(table.rows) * u64::from(table.width)
-                < u64::from(q_heads) * u64::from(span)
+            if u64::from(table.rows) * u64::from(table.width) < u64::from(q_heads) * u64::from(span)
             {
                 return Err(refuse(
                     OP,
@@ -278,7 +282,10 @@ pub fn fire(
             )
         }
         Arm::Scalar => {
-            let entry = leaked(format!("ragged_scalar_bfloat16_d_{width}_{}", mask.suffix()));
+            let entry = leaked(format!(
+                "ragged_scalar_bfloat16_d_{width}_{}",
+                mask.suffix()
+            ));
             let lanes = s.q_heads.checked_mul(SCALAR_THREADS).ok_or_else(|| {
                 refuse(
                     OP,
@@ -288,8 +295,7 @@ pub fn fire(
             let q_heads = i32::try_from(s.q_heads).expect("a checked head count");
             let head_dim = i32::try_from(head_dim).expect("a checked head width");
             ctx.fire(
-                Fire::at(FILE, entry)
-                    .apply(Grid::of([lanes, s.rows, 1], [SCALAR_THREADS, 1, 1])),
+                Fire::at(FILE, entry).apply(Grid::of([lanes, s.rows, 1], [SCALAR_THREADS, 1, 1])),
                 &[
                     q.arg(),
                     k.arg(),

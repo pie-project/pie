@@ -6,8 +6,8 @@ fn stored_contract(name: &str) -> ModelContract {
         .unwrap_or_else(|err| panic!("{name}: cannot read {}: {err}", path.display()));
     serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: parsing: {err}"))
 }
-use checkpoint::file::{File, Metadata, RawTensor};
 use checkpoint::contract::{Expr, ModelContract, Scales, TensorContract, TensorType, UnaryOp};
+use checkpoint::file::{File, Metadata, RawTensor};
 use checkpoint::plan::compile as compile_load_plan;
 use checkpoint::plan::{LoadPlan, StorageInstr, StorageTarget, TileMapKind};
 use checkpoint::types::{
@@ -15,6 +15,7 @@ use checkpoint::types::{
     QuantSpec, RepackLayout, ScaleForm, TensorId,
 };
 
+#[test]
 fn storage_compiler_every_case() {
     metal_qwen35_schema_emits_canonical_affine_u4_arena();
     buffer_join_tile_maps_carry_destination_offsets();
@@ -74,7 +75,6 @@ fn storage_compiler_every_case() {
     the_tiled_repack_is_the_documented_permutation_at_every_shipped_shape();
 }
 
-#[test]
 fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
     let specs = [
         ("lm_head.weight", vec![2, 8], DType::U32),
@@ -684,8 +684,7 @@ fn gpt_oss_native_mxfp4_tp_resolves_the_rank_from_the_target() {
     let plan_at = |rank: u32| {
         let target = StorageTarget {
             backend: BackendKind::Cuda,
-            tile_map_mask: checkpoint::plan::CUDA_TILE_MAP_MASK
-                | checkpoint::plan::TILE_MAP_REPACK,
+            tile_map_mask: checkpoint::plan::CUDA_TILE_MAP_MASK | checkpoint::plan::TILE_MAP_REPACK,
             tp_rank: rank,
             tp_size: 2,
             native_mxfp4_moe: true,
@@ -1511,9 +1510,9 @@ fn quant(scheme: QuantScheme, dtype: DType) -> QuantSpec {
 }
 
 fn tensor_bytes(shape: &[i64], dtype: DType) -> u64 {
-    shape
-        .iter()
-        .fold(dtype.bytes_ceil(), |acc, dim| acc * u64::try_from(*dim).unwrap())
+    shape.iter().fold(dtype.bytes_ceil(), |acc, dim| {
+        acc * u64::try_from(*dim).unwrap()
+    })
 }
 
 fn mla_q_kv_a_fusion_produces_joined_tensor() {
@@ -2332,8 +2331,10 @@ fn a_unary_takes_the_logarithm_of_a_negated_plane() {
     let got = storage.tensors.get("a_log").expect("materialized");
 
     let read: Vec<f32> = got
-        .chunks_exact(4)
-        .map(|word| f32::from_le_bytes(word.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_le_bytes(*word))
         .collect();
     for (at, (&raw, &want)) in stored
         .iter()
@@ -2385,7 +2386,10 @@ fn a_serving_target_refuses_the_unary_a_conversion_target_runs() {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("would apply Some(NegLn) on the way in"), "{backend:?}: {err}");
+        assert!(
+            err.contains("would apply Some(NegLn) on the way in"),
+            "{backend:?}: {err}"
+        );
     }
 
     compile_load_plan(
@@ -2400,12 +2404,7 @@ fn a_serving_target_refuses_the_unary_a_conversion_target_runs() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-const TILED_ROWS: [(usize, usize); 4] = [
-    (32, 1024),
-    (1024, 2048),
-    (7168, 1024),
-    (1024, 3584),
-];
+const TILED_ROWS: [(usize, usize); 4] = [(32, 1024), (1024, 2048), (7168, 1024), (1024, 3584)];
 
 fn tiled_codes(dir: &std::path::Path, rows: usize, k: usize) -> Metadata {
     let mut bytes = vec![0u8; rows * k / 2];

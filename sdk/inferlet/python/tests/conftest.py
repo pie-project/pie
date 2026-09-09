@@ -48,9 +48,51 @@ class DiffusionMode(Enum):
     DENOISE = 1
 
 
+class AxisRole(Enum):
+    TIME = 0
+    HEIGHT = 1
+    WIDTH = 2
+    INDEX = 3
+
+
+class LaneStream(Enum):
+    TEXT = 0
+    IMAGE = 1
+    VIDEO = 2
+    AUDIO = 3
+    CONTEXT = 4
+    REFERENCE = 5
+
+
+class PortKind(Enum):
+    LATENTS = 0
+    LANE_VECTOR = 1
+    CONTEXT = 2
+    AXIS_POSITIONS = 3
+    VOXELS = 4
+
+
+class ReadoutKind(Enum):
+    LOGITS = 0
+    VELOCITY = 1
+    HIDDEN = 2
+    PIXELS = 3
+
+
+class ScheduleKind(Enum):
+    FLOW = 0
+    EPSILON = 1
+    V = 2
+
+
 def _make_model() -> types.ModuleType:
     m = types.ModuleType("wit_world.imports.model")
     m.ForwardKind = ForwardKind
+    m.AxisRole = AxisRole
+    m.LaneStream = LaneStream
+    m.PortKind = PortKind
+    m.ReadoutKind = ReadoutKind
+    m.ScheduleKind = ScheduleKind
     m.name = lambda: "mock-model"
     m.architecture = lambda: "qwen3_5"
     m.default_system_speculation = lambda: False

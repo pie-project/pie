@@ -87,13 +87,13 @@ fn leading(ty: &Ty) -> Dim {
     }
 }
 
+#[test]
 fn a_gather_lands_on_its_ids_axis_every_case() {
     the_plain_gather_follows_its_ids_onto_either_axis();
     the_interpolating_gather_follows_its_ids_too();
     the_axis_is_not_how_a_text_picks_the_op();
 }
 
-#[test]
 fn the_plain_gather_follows_its_ids_onto_either_axis() {
     let tokens = gathered(Axis::Tokens, Gather::Plain);
     assert_eq!(

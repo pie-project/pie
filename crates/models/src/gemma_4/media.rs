@@ -149,7 +149,7 @@ impl GemmaVisionConfig {
         let plane = self.position_embedding_size;
         let rows = positions.len() / 2;
         let mut ids = Vec::with_capacity(rows * 2);
-        for row in positions.chunks_exact(2) {
+        for row in positions.as_chunks::<2>().0 {
             let (x, y) = (row[0], row[1]);
             #[allow(clippy::cast_possible_wrap)]
             {

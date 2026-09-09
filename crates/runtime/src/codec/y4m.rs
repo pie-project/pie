@@ -15,7 +15,7 @@ pub fn encode(
     count: u32,
     fps: f32,
 ) -> Result<Vec<u8>, String> {
-    if width % 2 != 0 || height % 2 != 0 {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(format!(
             "y4m is 4:2:0 and needs even dimensions; this handle is {width}x{height}"
         ));
@@ -45,12 +45,12 @@ pub fn encode(
 mod tests {
     use super::*;
 
+    #[test]
     fn y4m_every_case() {
         the_stream_is_a_header_and_then_one_frame_each();
         odd_dimensions_are_refused_by_name();
     }
 
-    #[test]
     fn the_stream_is_a_header_and_then_one_frame_each() {
         let rgb = vec![0u8; 4 * 2 * 3 * 3];
         let out = encode(&rgb, 4, 2, 3, 25.0).expect("encode");
@@ -61,7 +61,7 @@ mod tests {
     }
 
     fn odd_dimensions_are_refused_by_name() {
-        let err = encode(&vec![0u8; 3 * 3 * 3], 3, 3, 1, 1.0).unwrap_err();
+        let err = encode(&[0u8; 3 * 3 * 3], 3, 3, 1, 1.0).unwrap_err();
         assert!(err.contains("3x3"), "{err}");
     }
 }

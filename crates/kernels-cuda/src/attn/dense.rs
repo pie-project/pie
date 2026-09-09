@@ -12,7 +12,7 @@ const BLOCK: u32 = WARPS * 32;
 const STAMPS: [u32; 3] = [64, 128, 256];
 
 fn row_heads(op: &'static str, what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
-    if width == 0 || width % head_dim != 0 {
+    if width == 0 || !width.is_multiple_of(head_dim) {
         return Err(refuse(
             op,
             format!("the {width}-wide {what} row does not divide by the head width {head_dim}"),
@@ -25,6 +25,7 @@ fn stamp_for(head_dim: u32) -> Option<u32> {
     STAMPS.into_iter().find(|stamp| head_dim <= *stamp)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn bidirectional(
     ctx: &Ctx,
     q: Tensor,

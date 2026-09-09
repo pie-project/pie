@@ -3,12 +3,12 @@ use runtime::scheduler::{
     configured_submit_depth, reconfigure,
 };
 
+#[test]
 fn scheduler_reconfigure_every_case() {
     the_knobs_are_no_longer_write_once();
     a_refusal_names_what_is_still_running();
 }
 
-#[test]
 fn the_knobs_are_no_longer_write_once() {
     assert_eq!(configured_frame_size(), 2, "default k");
     assert_eq!(configured_dispatch_depth(), 2, "default horizon");

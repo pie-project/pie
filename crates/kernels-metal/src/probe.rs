@@ -14,7 +14,6 @@ impl Probe {
     pub(crate) fn fires(&self) -> Vec<Recorded> {
         self.fires.borrow().clone()
     }
-
 }
 
 impl Encode for Probe {

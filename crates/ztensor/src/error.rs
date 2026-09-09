@@ -35,10 +35,7 @@ pub enum Rule {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    Reject {
-        rule: Rule,
-        detail: String,
-    },
+    Reject { rule: Rule, detail: String },
     NotFound(String),
     Unsupported(String),
     InvalidInput(String),

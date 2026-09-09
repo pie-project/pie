@@ -138,6 +138,7 @@ fn against_dense(sizes: &[u32], hd: u32, q_heads: u32, kv_heads: u32, seed: u64)
     );
 }
 
+#[test]
 fn the_ragged_arm_answers_the_naive_dense_kernel_every_case() {
     the_ragged_arm_answers_the_dense_kernel_at_head_width_64();
     the_ragged_arm_answers_the_dense_kernel_at_head_width_128();
@@ -146,7 +147,6 @@ fn the_ragged_arm_answers_the_naive_dense_kernel_every_case() {
     the_ragged_arm_serves_every_group_the_table_names_under_an_armed_seat();
 }
 
-#[test]
 fn the_ragged_arm_answers_the_dense_kernel_at_head_width_64() {
     against_dense(&[37, 512, 4096], 64, 4, 2, 0x64);
 }

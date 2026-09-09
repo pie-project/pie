@@ -14,8 +14,8 @@ use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
 
 use super::compile::{Form, Region, StreamedStep};
-use eta_compiler::codegen::metal::{StepKind, reduce_dispatch_levels};
 use super::shared::SharedRing;
+use eta_compiler::codegen::metal::{StepKind, reduce_dispatch_levels};
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const FIRST_CHANNEL_BUFFER: usize = 7;
@@ -26,8 +26,7 @@ const INTRINSIC_ELEMENT_BYTES: u64 = 2;
 pub(super) const LIBRARY_SAMPLER_THREADS: usize = 256;
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-pub(super) const REGION_THREADS: u32 =
-    eta_compiler::codegen::metal::fused::METAL_M3_REGION_THREADS;
+pub(super) const REGION_THREADS: u32 = eta_compiler::codegen::metal::fused::METAL_M3_REGION_THREADS;
 
 fn address_of(buffer: &Buffer, offset: u64) -> Result<u64> {
     buffer.address_at(offset).ok_or_else(|| {
@@ -73,7 +72,9 @@ impl ChannelShape {
 
     #[must_use]
     pub fn cell_stride(&self) -> usize {
-        self.cell_bytes().next_multiple_of(CELL_ALIGN).max(CELL_ALIGN)
+        self.cell_bytes()
+            .next_multiple_of(CELL_ALIGN)
+            .max(CELL_ALIGN)
     }
 }
 
@@ -118,7 +119,9 @@ impl Rings {
             let cells = u64::from(shape.capacity) + 1;
             let bytes = cells
                 .checked_mul(shape.cell_stride() as u64)
-                .ok_or_else(|| Fault::program("program::launch", "a ring past what a u64 counts"))?;
+                .ok_or_else(|| {
+                    Fault::program("program::launch", "a ring past what a u64 counts")
+                })?;
             slabs.push(Buffer::zeroed(device, bytes.max(1))?);
             shared.push(None);
         }
@@ -171,9 +174,7 @@ impl Rings {
 
     pub fn write_cell(&mut self, channel: usize, sequence: u64, bytes: &[u8]) -> Result<()> {
         let at = self.cell_offset(channel, sequence)?;
-        let width = self
-            .shape(channel)
-            .map_or(0, |shape| shape.cell_bytes());
+        let width = self.shape(channel).map_or(0, |shape| shape.cell_bytes());
         if bytes.len() != width {
             return Err(Fault::program(
                 "program::launch",
@@ -188,9 +189,7 @@ impl Rings {
 
     pub fn read_cell(&self, channel: usize, sequence: u64) -> Result<Vec<u8>> {
         let at = self.cell_offset(channel, sequence)?;
-        let width = self
-            .shape(channel)
-            .map_or(0, |shape| shape.cell_bytes());
+        let width = self.shape(channel).map_or(0, |shape| shape.cell_bytes());
         let mut cell = vec![0u8; width];
         self.slabs[channel].read(at, &mut cell)?;
         Ok(cell)
@@ -276,6 +275,7 @@ const GROUPED_LANES: u32 = 1;
 const THE_LANE: u32 = 0;
 
 impl Grouped {
+    #[allow(clippy::too_many_arguments)]
     fn build(
         device: &Context,
         plan: &LaunchStagePlan,
@@ -330,9 +330,8 @@ impl Grouped {
         })?;
         table.write(at, &record_bytes(&record))?;
 
-        let stride = u32::try_from(plan.channel_bindings.len()).map_err(|_| {
-            Fault::program("program::launch", "more channels than a u32 can count")
-        })?;
+        let stride = u32::try_from(plan.channel_bindings.len())
+            .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
         let binding_bytes: Vec<u8> = (0..GROUPED_LANES)
             .flat_map(|_| plan.channel_bindings.iter().copied())
             .flat_map(u32::to_le_bytes)
@@ -347,10 +346,8 @@ impl Grouped {
         let mut lane_indices = Buffer::zeroed(device, index_bytes.len() as u64)?;
         lane_indices.write(0, &index_bytes)?;
 
-        let row_meta = Buffer::zeroed(
-            device,
-            (GROUPED_LANES as u64) * size_of::<RowMeta>() as u64,
-        )?;
+        let row_meta =
+            Buffer::zeroed(device, (GROUPED_LANES as u64) * size_of::<RowMeta>() as u64)?;
         let rows = u64::from(trunk_rows) + u64::from(draft_rows);
         let row_indices = Buffer::zeroed(device, rows.max(1) * size_of::<u32>() as u64)?;
 
@@ -613,7 +610,10 @@ fn streamed_dispatches(
                 }
             }
             StepKind::Reduce => {
-                let desc = descriptors.get(step.input as usize).copied().unwrap_or_default();
+                let desc = descriptors
+                    .get(step.input as usize)
+                    .copied()
+                    .unwrap_or_default();
                 let mut count = desc.last;
                 let mut at = 0u32;
                 for level in reduce_dispatch_levels(desc.last) {
@@ -624,18 +624,15 @@ fn streamed_dispatches(
                     let chunks = count.div_ceil(32).max(1);
                     let groups = chunks.div_ceil(32 * REDUCE_CHUNKS_PER_GROUP).max(1);
                     for _ in 0..repeats(StepKind::Reduce) {
-                        out.push((
-                            StepWord {
-                                level,
-                                ..word
-                            },
-                            groups,
-                        ));
+                        out.push((StepWord { level, ..word }, groups));
                     }
                 }
             }
             StepKind::Argmax => {
-                let desc = descriptors.get(step.input as usize).copied().unwrap_or_default();
+                let desc = descriptors
+                    .get(step.input as usize)
+                    .copied()
+                    .unwrap_or_default();
                 let candidate_bytes = 16u64;
                 let fit = (temporary_bytes / candidate_bytes / u64::from(desc.rows.max(1)))
                     .clamp(1, u64::from(STREAMED_MAX_GROUPS)) as u32;
@@ -811,8 +808,7 @@ impl Prepared {
         params.write(0, &param_bytes)?;
 
         let descriptor_bytes: Vec<u8> = descriptors.iter().flat_map(record_bytes).collect();
-        let mut descriptor_buffer =
-            Buffer::zeroed(device, descriptor_bytes.len().max(1) as u64)?;
+        let mut descriptor_buffer = Buffer::zeroed(device, descriptor_bytes.len().max(1) as u64)?;
         descriptor_buffer.write(0, &descriptor_bytes)?;
 
         let offset_bytes: Vec<u8> = scratch_layout
@@ -821,8 +817,7 @@ impl Prepared {
             .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
             .flat_map(u32::to_le_bytes)
             .collect();
-        let mut offsets =
-            Buffer::zeroed(device, offset_bytes.len().max(size_of::<u32>()) as u64)?;
+        let mut offsets = Buffer::zeroed(device, offset_bytes.len().max(size_of::<u32>()) as u64)?;
         offsets.write(0, &offset_bytes)?;
 
         let scratch_bytes = u64::from(scratch_stride).max(SCRATCH_ALIGN);
@@ -836,9 +831,10 @@ impl Prepared {
             })?,
         );
         let reads = |wanted: IntrinsicId| {
-            plan.ops
-                .iter()
-                .any(|op| op.intrinsic.is_some_and(|id| id as usize == wanted as usize))
+            plan.ops.iter().any(|op| {
+                op.intrinsic
+                    .is_some_and(|id| id as usize == wanted as usize)
+            })
         };
         let trunk_rows = READOUT_INTRINSICS
             .iter()
@@ -1000,17 +996,12 @@ impl Prepared {
                 ),
             ));
         }
-        let declared = *self
-            .declared
-            .get(intrinsic as usize)
-            .ok_or_else(|| {
-                Fault::program(
-                    "program::launch",
-                    format!(
-                        "{intrinsic:?} is past the pitch the slot table is indexed with"
-                    ),
-                )
-            })?;
+        let declared = *self.declared.get(intrinsic as usize).ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                format!("{intrinsic:?} is past the pitch the slot table is indexed with"),
+            )
+        })?;
         let element = eta_compiler::codegen::metal::m2_intrinsic_element_bytes(intrinsic as u16)
             .map(u64::from)
             .ok_or_else(|| {
@@ -1228,16 +1219,14 @@ impl Prepared {
                 MTLResourceUsage::Read | MTLResourceUsage::Write,
             );
             for cell in &self.bound {
-                resident(
-                    &cell.slab,
-                    MTLResourceUsage::Read | MTLResourceUsage::Write,
-                );
+                resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
             }
             for held in self.intrinsics.iter().flatten() {
                 resident(&held.base, MTLResourceUsage::Read);
             }
             let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
-            let temporary_bytes = u64::from(self.scratch_stride.saturating_sub(self.temporary_offset));
+            let temporary_bytes =
+                u64::from(self.scratch_stride.saturating_sub(self.temporary_offset));
             dispatch_streamed(
                 encoder,
                 &streamed_dispatches(
@@ -1402,10 +1391,7 @@ impl Prepared {
                 MTLResourceUsage::Read | MTLResourceUsage::Write,
             );
             for cell in &self.bound {
-                resident(
-                    &cell.slab,
-                    MTLResourceUsage::Read | MTLResourceUsage::Write,
-                );
+                resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
             }
             for held in self.intrinsics.iter().flatten() {
                 resident(&held.base, MTLResourceUsage::Read);
@@ -1712,8 +1698,10 @@ impl Batch {
                 mtp_offset: grouped.trunk_rows,
                 reserved: 0,
             };
-            self.row_meta
-                .write(u64::from(lane) * size_of::<RowMeta>() as u64, &record_bytes(&meta))?;
+            self.row_meta.write(
+                u64::from(lane) * size_of::<RowMeta>() as u64,
+                &record_bytes(&meta),
+            )?;
             let rows: Vec<u8> = (0..grouped.trunk_rows)
                 .chain((0..grouped.draft_rows).map(|row| grouped.draft_base.saturating_add(row)))
                 .flat_map(u32::to_le_bytes)
@@ -1766,7 +1754,10 @@ impl Batch {
                 .ok_or_else(|| {
                     Fault::program(
                         "program::launch",
-                        format!("region {} has no group layout in this batch", region.region_index),
+                        format!(
+                            "region {} has no group layout in this batch",
+                            region.region_index
+                        ),
                     )
                 })?;
             let encoder = frame.encoder();
@@ -1796,10 +1787,7 @@ impl Batch {
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
                 for cell in &member.bound {
-                    resident(
-                        &cell.slab,
-                        MTLResourceUsage::Read | MTLResourceUsage::Write,
-                    );
+                    resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
                 }
                 for held in member.intrinsics.iter().flatten() {
                     resident(&held.base, MTLResourceUsage::Read);
@@ -1809,8 +1797,11 @@ impl Batch {
                 .first()
                 .ok_or_else(|| Fault::program("program::launch", "a batch with no members"))?;
             let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
-            let temporary_bytes =
-                u64::from(self.key.scratch_stride.saturating_sub(self.key.temporary_offset));
+            let temporary_bytes = u64::from(
+                self.key
+                    .scratch_stride
+                    .saturating_sub(self.key.temporary_offset),
+            );
             self.dump_streamed_tables(region, template)?;
             dispatch_streamed(
                 encoder,
@@ -1889,7 +1880,10 @@ impl Batch {
                 .ok_or_else(|| {
                     Fault::program(
                         "program::launch",
-                        format!("region {} has no group layout in this batch", region.region_index),
+                        format!(
+                            "region {} has no group layout in this batch",
+                            region.region_index
+                        ),
                     )
                 })?;
             let encoder = frame.encoder();
@@ -1922,10 +1916,7 @@ impl Batch {
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
                 for cell in &member.bound {
-                    resident(
-                        &cell.slab,
-                        MTLResourceUsage::Read | MTLResourceUsage::Write,
-                    );
+                    resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
                 }
                 for held in member.intrinsics.iter().flatten() {
                     resident(&held.base, MTLResourceUsage::Read);
@@ -2016,6 +2007,7 @@ fn records_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
     fn launch_every_case() {
         a_channel_this_instance_does_not_carry_is_refused_by_number();
         the_shared_op_record_is_the_emitted_one();
@@ -2024,14 +2016,16 @@ mod tests {
         the_grouped_samplers_take_the_bindings_this_file_writes();
     }
 
-    #[test]
     fn a_channel_this_instance_does_not_carry_is_refused_by_number() {
         let rings = Rings {
             slabs: Vec::new(),
             shapes: Vec::new(),
             shared: Vec::new(),
         };
-        let said = rings.cell_offset(2, 0).expect_err("no such channel").to_string();
+        let said = rings
+            .cell_offset(2, 0)
+            .expect_err("no such channel")
+            .to_string();
         assert!(said.contains('2'), "the refusal names the channel: {said}");
     }
 
@@ -2075,10 +2069,15 @@ mod tests {
             "`GroupLayout` in this file is the host half of the emitted \
              `M3GroupLayout`, and the two have parted"
         );
-        assert_eq!(size_of::<GroupLayout>(), 8 * size_of::<u32>());
+        assert_eq!(size_of::<GroupLayout>(), (u32::BITS as usize));
         assert_eq!(
             fields("M3RowMeta"),
-            ["uint offset", "uint count", "uint mtp_offset", "uint reserved"],
+            [
+                "uint offset",
+                "uint count",
+                "uint mtp_offset",
+                "uint reserved"
+            ],
             "`RowMeta` in this file is the host half of the emitted `M3RowMeta`, \
              and the two have parted"
         );

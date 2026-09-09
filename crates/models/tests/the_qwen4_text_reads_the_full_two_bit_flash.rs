@@ -4,7 +4,9 @@ const SKU: &str = "qwen38-flash-next-full-u4g64-u2g128-kv-bf16";
 fn the_full_row_emits_the_gather_the_planner_keys_on() {
     use model_dsl::{Attention, Def, Layout, Operation, Platform};
 
-    let trace = (models::sku(SKU).expect("this build ships the full 2-bit row").trace)(Platform::Metal);
+    let trace = (models::sku(SKU)
+        .expect("this build ships the full 2-bit row")
+        .trace)(Platform::Metal);
 
     let mut heads: Vec<usize> = Vec::new();
     let mut tables: Vec<(String, Vec<u64>)> = Vec::new();
@@ -33,7 +35,11 @@ fn the_full_row_emits_the_gather_the_planner_keys_on() {
          `Plan::of` reads the head count off `primes.len()` and seats that many \
          rows per fired token"
     );
-    assert_eq!(tables.len(), 1, "exactly one concatenating gather in the plan");
+    assert_eq!(
+        tables.len(),
+        1,
+        "exactly one concatenating gather in the plan"
+    );
     let (name, shape) = &tables[0];
     assert_eq!(name, "ple.table");
     assert_eq!(

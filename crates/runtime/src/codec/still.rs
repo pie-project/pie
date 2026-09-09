@@ -41,6 +41,7 @@ pub fn webp(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    #[test]
     fn still_every_case() {
         a_png_decodes_back_to_the_pixels_it_encoded();
         bytes_that_are_no_picture_are_refused_by_name();
@@ -48,7 +49,6 @@ mod tests {
         jpeg_and_webp_carry_the_same_picture();
     }
 
-    #[test]
     fn a_png_decodes_back_to_the_pixels_it_encoded() {
         let (w, h) = (7u32, 5u32);
         let rgb = gradient(w, h);

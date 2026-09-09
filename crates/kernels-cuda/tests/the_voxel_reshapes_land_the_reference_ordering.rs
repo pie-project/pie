@@ -12,6 +12,7 @@ use kernels_cuda::spatial::{
 };
 use kernels_cuda::tensor::Tensor;
 
+#[test]
 fn the_voxel_reshapes_land_the_reference_ordering_every_case() {
     pixel_shuffle_lands_torchs_ordering_on_the_hand_computed_example();
     pixel_unshuffle_inverts_pixel_shuffle_and_both_match_the_reference();
@@ -22,7 +23,6 @@ fn the_voxel_reshapes_land_the_reference_ordering_every_case() {
     avg_down_pads_a_short_chunks_time_axis_in_front();
 }
 
-#[test]
 fn pixel_shuffle_lands_torchs_ordering_on_the_hand_computed_example() {
     let x: Vec<u16> = [0.0, 2.0, 4.0, 6.0, 1.0, 3.0, 5.0, 7.0]
         .map(to_bf16)

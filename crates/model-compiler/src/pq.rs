@@ -158,7 +158,11 @@ impl PqTree {
 
     fn reduce_at(&mut self, n: usize, root: bool, full: &[usize], total: &[usize]) -> Option<Mark> {
         match self.nodes[n].clone() {
-            Node::Leaf(_) => Some(if full[n] == 1 { Mark::Full } else { Mark::Empty }),
+            Node::Leaf(_) => Some(if full[n] == 1 {
+                Mark::Full
+            } else {
+                Mark::Empty
+            }),
             Node::P(kids) => self.reduce_p(n, &kids, root, full, total),
             Node::Q(kids) => self.reduce_q(n, kids, root, full, total),
         }
@@ -415,9 +419,11 @@ impl PqTree {
     fn least(&self, n: usize) -> Leaf {
         match &self.nodes[n] {
             Node::Leaf(l) => *l,
-            Node::P(kids) | Node::Q(kids) => {
-                kids.iter().map(|&c| self.least(c)).min().unwrap_or(Leaf::MAX)
-            }
+            Node::P(kids) | Node::Q(kids) => kids
+                .iter()
+                .map(|&c| self.least(c))
+                .min()
+                .unwrap_or(Leaf::MAX),
         }
     }
 
@@ -598,13 +604,13 @@ mod tests {
         }
     }
 
+    #[test]
     fn pq_every_case() {
         a_q_node_whose_fulls_are_not_at_an_end_is_the_failure();
         runs_counts_the_launches_a_split_would_take();
         admits_refuses_anything_that_is_not_a_permutation_of_the_leaves();
     }
 
-    #[test]
     fn a_q_node_whose_fulls_are_not_at_an_end_is_the_failure() {
         let mut tree = PqTree::universe(3);
         assert!(tree.reduce(&[0, 1]));
@@ -634,5 +640,4 @@ mod tests {
         assert!(!tree.admits(&[0, 1, 1]));
         assert!(!tree.admits(&[0, 1, 2, 3]));
     }
-
 }

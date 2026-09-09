@@ -46,12 +46,18 @@ pub struct Layout {
 }
 
 fn row_of(trace: &Trace, id: ValueId) -> Result<(u32, Dtype, u64)> {
-    let decl = trace.values.get(id.0 as usize).ok_or_else(|| Fault::Unbound {
-        what: format!("value {}, which the trace does not declare", id.0),
-    })?;
+    let decl = trace
+        .values
+        .get(id.0 as usize)
+        .ok_or_else(|| Fault::Unbound {
+            what: format!("value {}, which the trace does not declare", id.0),
+        })?;
     let Ty::Tensor { shape, dtype } = &decl.ty else {
         return Err(Fault::Unbound {
-            what: format!("value {}, a struct where the recurrence reads token rows", id.0),
+            what: format!(
+                "value {}, a struct where the recurrence reads token rows",
+                id.0
+            ),
         });
     };
     let width: u64 = shape
@@ -76,7 +82,10 @@ fn cache_of(trace: &Trace, state: ValueId) -> Result<u32> {
     match trace.values.get(state.0 as usize).map(|decl| &decl.def) {
         Some(Def::Cache(row)) => Ok(*row),
         _ => Err(Fault::Unbound {
-            what: format!("value {}, read as a recurrent state and declared as no cache", state.0),
+            what: format!(
+                "value {}, read as a recurrent state and declared as no cache",
+                state.0
+            ),
         }),
     }
 }
@@ -88,7 +97,11 @@ impl Layout {
         let mut region_keys: HashMap<(u32, &'static str), usize> = HashMap::new();
         let mut gates_cache: HashMap<u32, u32> = HashMap::new();
 
-        let mut plane = |layout: &mut Layout, cache: u32, role: Role, value: ValueId| -> Result<()> {
+        let mut plane = |layout: &mut Layout,
+                         cache: u32,
+                         role: Role,
+                         value: ValueId|
+         -> Result<()> {
             let (width, dtype, row_bytes) = row_of(trace, value)?;
             let at = match plane_keys.get(&(cache, role)) {
                 Some(&at) => {
@@ -119,23 +132,24 @@ impl Layout {
             layout.in_of.insert(value.0, at);
             Ok(())
         };
-        let mut region = |layout: &mut Layout, cache: u32, what: &'static str, value: ValueId| -> Result<()> {
-            let (width, dtype, row_bytes) = row_of(trace, value)?;
-            let at = match region_keys.get(&(cache, what)) {
-                Some(&at) => at,
-                None => {
-                    layout.regions.push(Region {
-                        width,
-                        dtype,
-                        row_bytes,
-                    });
-                    region_keys.insert((cache, what), layout.regions.len() - 1);
-                    layout.regions.len() - 1
-                }
+        let mut region =
+            |layout: &mut Layout, cache: u32, what: &'static str, value: ValueId| -> Result<()> {
+                let (width, dtype, row_bytes) = row_of(trace, value)?;
+                let at = match region_keys.get(&(cache, what)) {
+                    Some(&at) => at,
+                    None => {
+                        layout.regions.push(Region {
+                            width,
+                            dtype,
+                            row_bytes,
+                        });
+                        region_keys.insert((cache, what), layout.regions.len() - 1);
+                        layout.regions.len() - 1
+                    }
+                };
+                layout.out_of.insert(value.0, at);
+                Ok(())
             };
-            layout.out_of.insert(value.0, at);
-            Ok(())
-        };
 
         for node in &trace.nodes {
             let Operation::Attention(op) = &node.op else {
@@ -544,7 +558,9 @@ impl Seat {
         }
         let row_bytes = self.layout.planes[plane].row_bytes;
         Ok((
-            u64::from(slot) * self.page_bytes + self.plane_at[plane] + u64::from(in_page) * row_bytes,
+            u64::from(slot) * self.page_bytes
+                + self.plane_at[plane]
+                + u64::from(in_page) * row_bytes,
             self.page_tokens - in_page,
         ))
     }

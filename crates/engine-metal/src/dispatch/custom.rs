@@ -47,9 +47,7 @@ impl Run<'_> {
                     model_ir::GridRule::Shuffle { r, trim_t } => {
                         spatial::rule::GridRule::Shuffle { r, trim_t }
                     }
-                    model_ir::GridRule::Unshuffle { r } => {
-                        spatial::rule::GridRule::Unshuffle { r }
-                    }
+                    model_ir::GridRule::Unshuffle { r } => spatial::rule::GridRule::Unshuffle { r },
                     model_ir::GridRule::AvgDown { factor } => {
                         spatial::rule::GridRule::AvgDown { factor }
                     }
@@ -77,25 +75,25 @@ impl Run<'_> {
                     });
                 }
                 spatial::conv::conv3d(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
-                self.tensor(*w),
-                bias.map(|bias| self.tensor(bias)),
-                None,
-                spatial::conv::Conv3d {
-                    k: *k,
-                    stride: *stride,
-                    pad: *pad,
-                    pad_back: *pad_back,
-                    causal_t: *causal_t,
-                    time_pad: match time_pad {
-                        model_ir::TimePad::Zero => spatial::conv::TimePad::Zero,
-                        model_ir::TimePad::Replicate => spatial::conv::TimePad::Replicate,
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*grid),
+                    self.tensor(*w),
+                    bias.map(|bias| self.tensor(bias)),
+                    None,
+                    spatial::conv::Conv3d {
+                        k: *k,
+                        stride: *stride,
+                        pad: *pad,
+                        pad_back: *pad_back,
+                        causal_t: *causal_t,
+                        time_pad: match time_pad {
+                            model_ir::TimePad::Zero => spatial::conv::TimePad::Zero,
+                            model_ir::TimePad::Replicate => spatial::conv::TimePad::Replicate,
+                        },
                     },
-                },
-                self.tensor(*y_grid),
-                self.tensor(*y),
+                    self.tensor(*y_grid),
+                    self.tensor(*y),
                 )
             }
             Spatial::GroupNorm {
@@ -231,15 +229,7 @@ impl Run<'_> {
                              lane of it staged"
                         .to_string(),
                 })?;
-                spatial::resample::cache_store(
-                    self.ctx(),
-                    x,
-                    x,
-                    slots,
-                    grid,
-                    *frames,
-                    pool.state,
-                )
+                spatial::resample::cache_store(self.ctx(), x, x, slots, grid, *frames, pool.state)
             }
             Spatial::Patchify { .. } | Spatial::Unpatchify { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })

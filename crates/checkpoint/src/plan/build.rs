@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::file::{Metadata, RawTensor, Sources};
 use crate::contract::compile::{CopyList, GatherList, Leaf, Lowering, compile};
 use crate::contract::infer::{Resolver, repack_spec};
 use crate::contract::{
@@ -8,6 +7,7 @@ use crate::contract::{
 };
 use crate::error::{Error, OrOverflow, Result};
 use crate::extent::Extent;
+use crate::file::{Metadata, RawTensor, Sources};
 use crate::plan::geometry::{
     full_dest_extent, repack_stage_bytes, storage_extent_for_shape, strided_physical_source_bytes,
 };
@@ -486,7 +486,8 @@ impl Builder<'_> {
                     self.program.schedule.push(instr);
                 }
                 Value::Buffer(buffer) => {
-                    let (shape, encoding) = self.leaf_type(lowering.leaves.as_slice(), rect.leaf)?;
+                    let (shape, encoding) =
+                        self.leaf_type(lowering.leaves.as_slice(), rect.leaf)?;
                     let input_bytes = encoding_nbytes(&shape, &encoding);
                     if !rect.is_byte_run()
                         || rect.src_offset != 0
@@ -580,10 +581,7 @@ impl Builder<'_> {
             encoding: ty.encoding.clone(),
             ..decl.clone()
         };
-        Ok((
-            self.emit(&lowering, &operand, Role::Operand)?,
-            ty.encoding,
-        ))
+        Ok((self.emit(&lowering, &operand, Role::Operand)?, ty.encoding))
     }
 
     fn scale_factors(&mut self, by: &Expr, what: &str) -> Result<BufferId> {

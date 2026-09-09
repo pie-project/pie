@@ -99,7 +99,10 @@ impl Engine for RemoteEngine {
         Err(self.refuse("register_program"))
     }
 
-    fn register_channel(&mut self, registration: &ChannelRegistration) -> Result<RegisteredChannel> {
+    fn register_channel(
+        &mut self,
+        registration: &ChannelRegistration,
+    ) -> Result<RegisteredChannel> {
         let _ = registration;
         Err(self.refuse("register_channel"))
     }

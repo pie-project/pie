@@ -1266,13 +1266,13 @@ mod tests {
         )
     }
 
+    #[test]
     fn record_every_case() {
         a_rung_is_the_keys_own_ceiling_and_arming_computes_the_same_one();
         what_a_load_has_spent_is_what_its_resident_bodies_weigh();
         the_map_never_inserts_a_body_whose_script_is_empty();
     }
 
-    #[test]
     fn a_rung_is_the_keys_own_ceiling_and_arming_computes_the_same_one() {
         let decoding = model_ir::ClassSet::of([0usize]);
         let fired = BodyKey::of(&table(&[(3, 3)]), 8, &decoding, LANES);

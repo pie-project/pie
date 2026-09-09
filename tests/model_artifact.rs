@@ -17,10 +17,22 @@
 //! scratch — real safetensors bytes on disk, no fixtures — so it covers the
 //! plan, the executor and the writer as one path.
 
+#[cfg(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "wgpu"
+))]
 use std::path::Path;
 
 /// A dense llama-shaped snapshot: `config.json` plus one real safetensors
 /// file of zeroed `dtype` weights.
+#[cfg(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "wgpu"
+))]
 fn write_snapshot(dir: &Path, dtype: &str) {
     let (hidden, heads, kv_heads, head_dim, intermediate, vocab) =
         (64i64, 4i64, 2i64, 16i64, 96i64, 128i64);
@@ -142,7 +154,12 @@ fn write_snapshot(dir: &Path, dtype: &str) {
 // the build it needs rather than asserting one sentence against a binary
 // that can only produce the other.
 #[test]
-#[cfg(any(feature = "cuda", feature = "metal", feature = "vulkan", feature = "wgpu"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "wgpu"
+))]
 fn an_import_that_will_prepare_refuses_a_source_no_sku_claims() {
     let staging = tempfile::tempdir().expect("staging");
     write_snapshot(staging.path(), "F32");

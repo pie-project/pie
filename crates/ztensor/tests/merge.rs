@@ -9,11 +9,13 @@ fn tmp(name: &str) -> PathBuf {
 fn file(name: &str, tensor: &str, bytes: &[u8]) -> PathBuf {
     let path = tmp(name);
     let mut w = Writer::create(&path).unwrap();
-    w.add(tensor, [bytes.len() as u64], Leaf::U8, bytes).unwrap();
+    w.add(tensor, [bytes.len() as u64], Leaf::U8, bytes)
+        .unwrap();
     w.finish().unwrap();
     path
 }
 
+#[test]
 fn merge_every_case() {
     tensors_are_one_name_space_that_remembers_its_files();
     offsets_stay_relative_to_their_own_file();
@@ -23,7 +25,6 @@ fn merge_every_case() {
     an_absent_tensor_is_not_found();
 }
 
-#[test]
 fn tensors_are_one_name_space_that_remembers_its_files() {
     let a = vec![1u8; 64];
     let b = vec![2u8; 32];

@@ -1,6 +1,6 @@
 [package]
 name = "engine-vulkan"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
 description = "The Vulkan engine's dispatch layer: a Run that resolves plan ids to device handles and answers every Dispatch* trait by calling kernels-vulkan entries through dyn Encode."
@@ -12,6 +12,7 @@ name = "engine_vulkan"
 path = "src/lib.rs"
 
 [dependencies]
+memmap2 = "0.9"
 
 toml = "1.1"
 

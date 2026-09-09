@@ -12,7 +12,7 @@ const MAX_HC_MULT: u32 = 8;
 
 fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
     nonzero(op, "the hidden width", hidden)?;
-    if wide == 0 || wide % hidden != 0 {
+    if wide == 0 || !wide.is_multiple_of(hidden) {
         return Err(refuse(
             op,
             format!(

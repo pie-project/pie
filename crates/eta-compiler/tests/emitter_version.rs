@@ -1,14 +1,14 @@
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 
-use msl_corpus::{corpus_bound, corpus_stages, extended_stages};
 use eta_compiler::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION;
 use eta_compiler::codegen::metal::METAL_M1_EMITTER_VERSION;
 use eta_compiler::codegen::program::{Backend, emit_program};
+use msl_corpus::{corpus_bound, corpus_stages, extended_stages};
 
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 39, 0xf839_541b_764d_fe20),
-    ("metal", 53, 0x7c99_b2e2_a75d_33a3),
+    ("cuda", 40, 0xa92f_4d4b_c783_4735),
+    ("metal", 54, 0x8ee1_2aad_36d1_edd4),
 ];
 
 fn fingerprint(backend: Backend) -> u64 {
@@ -38,12 +38,12 @@ fn backend_of(name: &str) -> Backend {
     }
 }
 
+#[test]
 fn emitter_version_every_case() {
     the_pinned_versions_are_the_compiled_ones();
     each_emitter_version_still_describes_its_output();
 }
 
-#[test]
 fn the_pinned_versions_are_the_compiled_ones() {
     for (name, version, _) in PINNED {
         let constant = match backend_of(name) {

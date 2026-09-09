@@ -393,6 +393,7 @@ pub fn seed_or_step(
     rng.put(&state + &Tensor::constant([0u32, 1u32]));
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn resume_or_step(
     k: &Tensor,
     x: &Channel,
@@ -520,6 +521,7 @@ pub async fn encode_ids_rows(ids: &[u32], reading: &str) -> Result<(Vec<f32>, u3
 mod tests {
     use super::*;
 
+    #[test]
     fn latent_every_case() {
         a_flow_schedule_ends_at_zero_and_steps_downhill();
         a_shift_bends_the_sigmas_up();
@@ -532,7 +534,6 @@ mod tests {
         a_grid_only_convention_leaves_the_time_axis_at_zero();
     }
 
-    #[test]
     fn a_flow_schedule_ends_at_zero_and_steps_downhill() {
         let fact = ScheduleFact {
             kind: ScheduleKind::Flow,
@@ -616,10 +617,7 @@ mod tests {
         assert_eq!(
             positions_for(&flux, LaneRows::Grid { h: 2, w: 2 }, 2),
             vec![
-                0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 1.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0,
             ]
         );
     }
@@ -665,10 +663,7 @@ mod tests {
                 },
                 7
             ),
-            vec![
-                10.0, 0.0, 0.0, 0.0,
-                10.0, 0.0, 1.0, 0.0,
-            ]
+            vec![10.0, 0.0, 0.0, 0.0, 10.0, 0.0, 1.0, 0.0,]
         );
         assert_eq!(
             positions_for(
@@ -680,10 +675,7 @@ mod tests {
                 },
                 7
             ),
-            vec![
-                20.0, 0.0, 0.0, 0.0,
-                20.0, 0.0, 1.0, 0.0,
-            ]
+            vec![20.0, 0.0, 0.0, 0.0, 20.0, 0.0, 1.0, 0.0,]
         );
         let silent = PositionConvention {
             reference_stride: None,

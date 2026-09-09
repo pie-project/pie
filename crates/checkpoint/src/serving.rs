@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Range;
 
-use ztensor::format::cbor::Value;
 pub use ztensor::DigestAlgorithm;
+use ztensor::format::cbor::Value;
 use ztensor::{Manifest, Object};
 
 use crate::error::Error;
 use crate::file::meta::META_PREFIX;
-pub use crate::term::{plane_name, MMA_TILED};
+pub use crate::term::{MMA_TILED, plane_name};
 
 pub const PROFILE: &str = "pie.serving/1";
 
@@ -329,7 +329,9 @@ impl Digesting {
     pub fn new(algorithm: DigestAlgorithm) -> Digesting {
         match algorithm {
             DigestAlgorithm::Xxh3 => Digesting::Xxh3(Box::default()),
-            DigestAlgorithm::Sha256 => Digesting::Sha256(Box::new(<sha2::Sha256 as sha2::Digest>::new())),
+            DigestAlgorithm::Sha256 => {
+                Digesting::Sha256(Box::new(<sha2::Sha256 as sha2::Digest>::new()))
+            }
         }
     }
 
@@ -371,7 +373,10 @@ pub fn is_serving(name: &str) -> bool {
 
 #[must_use]
 pub fn sequence(manifest: &Manifest) -> Vec<&str> {
-    spans(manifest).into_iter().map(|span| span.object).collect()
+    spans(manifest)
+        .into_iter()
+        .map(|span| span.object)
+        .collect()
 }
 
 #[must_use]
@@ -514,11 +519,15 @@ impl Name {
 
     pub fn parse(name: &str) -> Result<Name, Error> {
         let bad = |why: &str| Error::Checkpoint(format!("serving artifact name {name:?} {why}"));
-        let (rest, extension) = name.rsplit_once('.').ok_or_else(|| bad("has no extension"))?;
+        let (rest, extension) = name
+            .rsplit_once('.')
+            .ok_or_else(|| bad("has no extension"))?;
         if extension != "zt" {
             return Err(bad("does not end in `.zt`"));
         }
-        let (rest, backend) = rest.rsplit_once('.').ok_or_else(|| bad("names no backend"))?;
+        let (rest, backend) = rest
+            .rsplit_once('.')
+            .ok_or_else(|| bad("names no backend"))?;
         let (slug, sku) = rest.rsplit_once('.').ok_or_else(|| bad("names no sku"))?;
         for field in [slug, sku, backend] {
             if !is_field(field) {
@@ -598,9 +607,7 @@ fn missing(field: Field) -> Error {
 }
 
 fn malformed(field: Field, why: &str) -> Error {
-    Error::Checkpoint(format!(
-        "the serving artifact's `{PROFILE}` {field} {why}"
-    ))
+    Error::Checkpoint(format!("the serving artifact's `{PROFILE}` {field} {why}"))
 }
 
 fn required_text(attributes: &Value, field: Field) -> Result<&str, Error> {

@@ -1292,12 +1292,12 @@ mod tests {
         }
     }
 
+    #[test]
     fn api_every_case() {
         a_tower_plan_derives_a_ladder_from_nothing_but_its_own_declaration();
         a_stated_ceiling_wins_and_still_gets_its_rungs();
     }
 
-    #[test]
     fn a_tower_plan_derives_a_ladder_from_nothing_but_its_own_declaration() {
         let ladder = patch_ladder(
             &trace_with(vec![Dim::Patches, Dim::Const(768)]),

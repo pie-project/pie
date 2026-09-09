@@ -158,8 +158,8 @@ pub fn prefill(
     const OP: &str = "attention.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     arbitrate(
-        ctx, OP, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, None, requests,
-        tuning,
+        ctx, OP, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, None,
+        requests, tuning,
     )
 }
 
@@ -224,13 +224,14 @@ pub fn masked(
         ));
     }
     arbitrate(
-        ctx, OP, q.data, pool, plan, mask, window, causal, head_dim, sm_scale, o, None, requests, tuning,
+        ctx, OP, q.data, pool, plan, mask, window, causal, head_dim, sm_scale, o, None, requests,
+        tuning,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    
+
     #[test]
     fn the_fragment_map_gives_each_row_four_lanes_and_one_writer() {
         let map = |lid: u32| -> (u32, u32) {
@@ -258,5 +259,4 @@ mod tests {
             assert_eq!(cols, (0..8).collect::<Vec<_>>(), "row {fm} is not covered");
         }
     }
-
 }

@@ -322,9 +322,7 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
         }
         let leaf = map_dtype(info.data_type)?;
         let elems = crate::safe::product("onnx shape", &info.dims)?;
-        let expected = leaf
-            .size(elems)
-            .ok_or_else(|| bad("size not computable"))?;
+        let expected = leaf.size(elems).ok_or_else(|| bad("size not computable"))?;
         let actual = match &info.data {
             TensorData::Raw { length, .. } => *length,
             TensorData::Owned(v) => v.len() as u64,

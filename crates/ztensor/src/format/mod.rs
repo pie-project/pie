@@ -174,7 +174,10 @@ impl Blocks {
 
     fn check(&self, digest: &Digest, decoded: u64) -> Result<()> {
         if self.size == 0 {
-            return Err(Error::reject(Rule::Schema, "blocks.size must be at least 1"));
+            return Err(Error::reject(
+                Rule::Schema,
+                "blocks.size must be at least 1",
+            ));
         }
         let expected = Self::count(self.size, decoded);
         if self.digests.len() as u64 != expected {
@@ -221,7 +224,9 @@ impl Blocks {
                             .iter()
                             .map(|d| match d {
                                 Value::Bytes(b) => Ok(b.clone()),
-                                _ => Err(Error::reject(Rule::Schema, "block digests must be bytes")),
+                                _ => {
+                                    Err(Error::reject(Rule::Schema, "block digests must be bytes"))
+                                }
                             })
                             .collect::<Result<Vec<_>>>()?,
                     )
@@ -258,7 +263,9 @@ impl Hasher {
 
     pub(crate) fn finish(self) -> Digest {
         match self {
-            Hasher::Xxh3(h) => Digest::new(DigestAlgorithm::Xxh3, h.digest().to_be_bytes().to_vec()),
+            Hasher::Xxh3(h) => {
+                Digest::new(DigestAlgorithm::Xxh3, h.digest().to_be_bytes().to_vec())
+            }
             Hasher::Sha256(h) => {
                 Digest::new(DigestAlgorithm::Sha256, sha2::Digest::finalize(h).to_vec())
             }
@@ -354,9 +361,7 @@ impl Blob {
                     blob.shard = Some(name.to_string());
                 }
                 Some("encoding") => blob.encoding = Some(val.text_or("encoding")?.to_string()),
-                Some("decoded_length") => {
-                    blob.decoded_length = Some(val.u64_or("decoded_length")?)
-                }
+                Some("decoded_length") => blob.decoded_length = Some(val.u64_or("decoded_length")?),
                 Some("digest") => blob.digest = Some(Digest::from_value(val)?),
                 Some("blocks") => blob.blocks = Some(Blocks::from_value(val)?),
                 _ => {}

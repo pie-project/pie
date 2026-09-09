@@ -289,11 +289,7 @@ impl Scratch {
 
         let mut plane = Buffer::zeroed(device, at)?;
         for hashing in &ple {
-            let bytes: Vec<u8> = hashing
-                .key
-                .iter()
-                .flat_map(|v| v.to_ne_bytes())
-                .collect();
+            let bytes: Vec<u8> = hashing.key.iter().flat_map(|v| v.to_ne_bytes()).collect();
             plane.write(hashing.room.at, &bytes)?;
         }
 
@@ -327,17 +323,24 @@ impl Scratch {
         self.routers.get(routes.0 as usize).copied().unwrap_or(0)
     }
 
-    pub fn precast(&self, handles: &Handles, rows: u32, contraction: u32) -> Option<Result<Tensor>> {
+    pub fn precast(
+        &self,
+        handles: &Handles,
+        rows: u32,
+        contraction: u32,
+    ) -> Option<Result<Tensor>> {
         let room = self.precast?;
         if u64::from(rows) * u64::from(contraction) > room.bytes() / 2 {
             return None;
         }
-        Some(Room {
-            rows,
-            width: contraction,
-            ..room
-        }
-        .bind(handles, &self.plane))
+        Some(
+            Room {
+                rows,
+                width: contraction,
+                ..room
+            }
+            .bind(handles, &self.plane),
+        )
     }
 
     pub fn spatial_moments(
@@ -378,7 +381,14 @@ impl Scratch {
         if u64::from(rows) * u64::from(width) > room.bytes() / 4 {
             return None;
         }
-        Some(Room { rows, width, ..room }.bind(handles, &self.plane))
+        Some(
+            Room {
+                rows,
+                width,
+                ..room
+            }
+            .bind(handles, &self.plane),
+        )
     }
 
     pub fn copy(&self, handles: &Handles, offset: u64, bytes: u64) -> Option<Result<u32>> {
@@ -509,8 +519,11 @@ fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Opt
             ) {
                 continue;
             }
-            let Some(rect) = rect(&compiled.arena, *id, FireRows::text_only(u64::from(rows), lanes))
-            else {
+            let Some(rect) = rect(
+                &compiled.arena,
+                *id,
+                FireRows::text_only(u64::from(rows), lanes),
+            ) else {
                 continue;
             };
             if seen.contains(&rect.offset) {

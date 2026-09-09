@@ -498,7 +498,10 @@ impl<F> Input<F> {
 
     #[must_use]
     pub fn axis_positions(&self, port: u8, axes: u8) -> Value {
-        assert!((1..=4).contains(&axes), "a rope has one to four axes, not {axes}");
+        assert!(
+            (1..=4).contains(&axes),
+            "a rope has one to four axes, not {axes}"
+        );
         self.rec
             .input(
                 RuntimeInput::AxisPositions { port, axes },

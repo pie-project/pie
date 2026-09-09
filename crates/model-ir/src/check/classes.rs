@@ -3,7 +3,7 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::check::V;
 use crate::ops::{Attention, CustomCuda, Layout, Spatial};
-use crate::{Guard, Def, Operands, Operation, Trace, ValueId};
+use crate::{Def, Guard, Operands, Operation, Trace, ValueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Class {
@@ -109,7 +109,10 @@ fn written_in_class(trace: &Trace, id: ValueId, word: u64) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fault {
-    Uncovered { merge: ValueId, word: u64 },
+    Uncovered {
+        merge: ValueId,
+        word: u64,
+    },
     Ambiguous {
         merge: ValueId,
         word: u64,
@@ -472,6 +475,65 @@ fn writes_cache(op: &Operation) -> bool {
     }
 }
 
+impl ClassTable {
+    #[must_use]
+    pub fn adapter_fact(&self, corrected: &ClassSet) -> Option<u32> {
+        if corrected.is_empty() {
+            return None;
+        }
+        let domain = self.correction_domain(corrected);
+        let reachable = |class: &Class| class.words.iter().any(|word| word & !domain == 0);
+        let mut found = None;
+        for bit in 0..u64::BITS {
+            if self.mask & (1u64 << bit) == 0 {
+                continue;
+            }
+            let decides = self.classes.iter().enumerate().all(|(at, class)| {
+                if !reachable(class) {
+                    return true;
+                }
+                let runs = corrected.contains(at);
+                class
+                    .words
+                    .iter()
+                    .all(|word| ((word >> bit) & 1 == 1) == runs)
+            });
+            if decides {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(bit);
+            }
+        }
+        found
+    }
+
+    #[must_use]
+    pub fn correction_domain(&self, corrected: &ClassSet) -> u64 {
+        self.classes
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| corrected.contains(*at))
+            .flat_map(|(_, class)| class.words.iter().copied())
+            .fold(0u64, |acc, word| acc | word)
+    }
+
+    #[must_use]
+    pub fn correction_reaches(&self, corrected: &ClassSet, word: u64) -> bool {
+        word & self.mask & !self.correction_domain(corrected) == 0
+    }
+
+    #[must_use]
+    pub fn adapted_word(&self, corrected: &ClassSet, bit: u32, word: u64) -> Option<u64> {
+        if !self.correction_reaches(corrected, word) {
+            return Some(word);
+        }
+        let adapted = word | (1u64 << bit);
+        let class = self.class_of(adapted & self.mask)?;
+        corrected.contains(class).then_some(adapted)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +646,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn classes_every_case() {
         a_split_and_its_merge_resolve_to_one_arm_per_class();
         a_gap_in_the_arms_is_uncovered_and_names_the_word();
@@ -591,7 +654,6 @@ mod tests {
         a_cache_write_is_its_own_root_and_an_unread_op_is_dead();
     }
 
-    #[test]
     fn a_split_and_its_merge_resolve_to_one_arm_per_class() {
         let mut b = Build::new();
         let q = b.input();
@@ -660,61 +722,5 @@ mod tests {
         assert!(classes.node_mask[append].contains(0));
         assert!(classes.node_mask[0].contains(0));
         assert_eq!(classes.dead, vec![2]);
-    }
-}
-
-impl ClassTable {
-    #[must_use]
-    pub fn adapter_fact(&self, corrected: &ClassSet) -> Option<u32> {
-        if corrected.is_empty() {
-            return None;
-        }
-        let domain = self.correction_domain(corrected);
-        let reachable = |class: &Class| class.words.iter().any(|word| word & !domain == 0);
-        let mut found = None;
-        for bit in 0..u64::BITS {
-            if self.mask & (1u64 << bit) == 0 {
-                continue;
-            }
-            let decides = self.classes.iter().enumerate().all(|(at, class)| {
-                if !reachable(class) {
-                    return true;
-                }
-                let runs = corrected.contains(at);
-                class.words.iter().all(|word| ((word >> bit) & 1 == 1) == runs)
-            });
-            if decides {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(bit);
-            }
-        }
-        found
-    }
-
-    #[must_use]
-    pub fn correction_domain(&self, corrected: &ClassSet) -> u64 {
-        self.classes
-            .iter()
-            .enumerate()
-            .filter(|(at, _)| corrected.contains(*at))
-            .flat_map(|(_, class)| class.words.iter().copied())
-            .fold(0u64, |acc, word| acc | word)
-    }
-
-    #[must_use]
-    pub fn correction_reaches(&self, corrected: &ClassSet, word: u64) -> bool {
-        word & self.mask & !self.correction_domain(corrected) == 0
-    }
-
-    #[must_use]
-    pub fn adapted_word(&self, corrected: &ClassSet, bit: u32, word: u64) -> Option<u64> {
-        if !self.correction_reaches(corrected, word) {
-            return Some(word);
-        }
-        let adapted = word | (1u64 << bit);
-        let class = self.class_of(adapted & self.mask)?;
-        corrected.contains(class).then_some(adapted)
     }
 }

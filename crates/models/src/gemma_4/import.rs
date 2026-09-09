@@ -202,13 +202,11 @@ impl Model {
             b.read(&t.patch_embed, v("patch_embedder.input_proj.weight"))?;
             b.read_expr(
                 &t.pos_embed,
-                (|| -> Result<Expr, Error> {
-                    flattened(
-                        src,
-                        v("patch_embedder.position_embedding_table"),
-                        extents(&t.pos_embed),
-                    )
-                })()?,
+                flattened(
+                    src,
+                    v("patch_embedder.position_embedding_table"),
+                    extents(&t.pos_embed),
+                )?,
             )?;
             b.read(&t.projection, layout.embed_vision())?;
             if let Some(std) = &t.std {
@@ -246,9 +244,7 @@ impl Model {
                         ] {
                             b.read_expr(
                                 weight,
-                                (|| -> Result<Expr, Error> {
-                                    flattened(src, format!("{stem}.{suffix}"), extents(weight))
-                                })()?,
+                                flattened(src, format!("{stem}.{suffix}"), extents(weight))?,
                             )?;
                         }
                     }

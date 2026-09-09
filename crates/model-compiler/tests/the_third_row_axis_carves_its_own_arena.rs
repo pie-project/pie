@@ -105,13 +105,13 @@ fn unit_axes(trace: &Trace, compiled: &model_compiler::CompiledModel) -> Vec<(St
         .collect()
 }
 
+#[test]
 fn the_third_row_axis_carves_its_own_arena_every_case() {
     an_encoder_runs_its_voxel_unit_first_and_the_patchify_opens_the_token_one();
     a_decoder_carves_its_pixels_at_sixteen_voxel_ceilings_and_shares_no_column();
     a_voxel_plan_against_no_voxel_ceiling_is_refused_by_name();
 }
 
-#[test]
 fn an_encoder_runs_its_voxel_unit_first_and_the_patchify_opens_the_token_one() {
     let trace = trace_hybrid("encoder", &Encoder, Platform::Cuda);
     let compiled = compile_axes(&trace, &budgets(), &DeviceProfile::default()).expect("bakes");

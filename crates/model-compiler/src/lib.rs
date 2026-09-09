@@ -1,11 +1,11 @@
 pub mod arena;
-pub mod compiled;
 pub mod budget;
+pub mod compiled;
+pub mod error;
 pub mod layout;
 pub mod lowering;
-pub mod prefetch;
-pub mod error;
 mod pq;
+pub mod prefetch;
 mod region;
 pub mod stream;
 pub mod unit;
@@ -16,27 +16,31 @@ mod fixture;
 use model_ir::{ClassTable, Def, Operands, Operation, Trace, Ty, resolve_classes};
 
 pub use arena::{
-    ArenaMap, Concurrency, EXPORT_SEAMS, Extent, FLOAT_READOUT_SEAMS, FireRows, Placement,
-    RowExpr, Span,
-};
-pub use compiled::{
-    AxisPlan, CompiledModel, EventId, Fallback, FallbackRow, FallbackTable, ClassOrder, Lowering,
-    Phase, Region,
+    ArenaMap, Concurrency, EXPORT_SEAMS, Extent, FLOAT_READOUT_SEAMS, FireRows, Placement, RowExpr,
+    Span,
 };
 pub use budget::{
     Budget, Budgets, DeviceProfile, FamilyCosts, Ladder, PATCH_LATTICE_FLOOR, PatchLadder,
     VoxelLadder,
 };
+pub use compiled::{
+    AxisPlan, ClassOrder, CompiledModel, EventId, Fallback, FallbackRow, FallbackTable, Lowering,
+    Phase, Region,
+};
+pub use error::{Error, Share, Unrectangled};
 pub use model_ir::RowAxis;
 pub use pq::PqTree;
 pub use stream::StreamPlan;
-pub use error::{Error, Share, Unrectangled};
 
 const MAX_FACTS: usize = 20;
 
 pub const MAX_CLASSES: usize = u8::MAX as usize + 1;
 
-pub fn compile(trace: &Trace, budget: &Budget, profile: &DeviceProfile) -> Result<CompiledModel, Error> {
+pub fn compile(
+    trace: &Trace,
+    budget: &Budget,
+    profile: &DeviceProfile,
+) -> Result<CompiledModel, Error> {
     compile_axes(trace, &Budgets::of(budget.clone()), profile)
 }
 
@@ -226,10 +230,14 @@ fn accept(trace: &Trace, budgets: &Budgets, profile: &DeviceProfile) -> Result<(
 fn accept_ladder(ladder: &Ladder<'_>, axis: RowAxis) -> Result<(), Error> {
     let words = LADDER_WORDS[axis];
     if ladder.max_lanes == 0 {
-        return Err(Error::Budget { what: words.no_lanes });
+        return Err(Error::Budget {
+            what: words.no_lanes,
+        });
     }
     if ladder.max_rows == 0 {
-        return Err(Error::Budget { what: words.no_rows });
+        return Err(Error::Budget {
+            what: words.no_rows,
+        });
     }
     if ladder.max_lanes > ladder.max_rows {
         return Err(Error::Budget {
@@ -323,7 +331,8 @@ fn struct_readers_share_one_window(trace: &Trace, classes: &ClassTable) -> Resul
 
 #[must_use]
 pub fn collectives(trace: &Trace) -> Vec<u32> {
-    trace.nodes
+    trace
+        .nodes
         .iter()
         .enumerate()
         .filter(|(_, node)| matches!(node.op, Operation::Collective(_)))
@@ -358,6 +367,7 @@ mod tests {
         b
     }
 
+    #[test]
     fn lib_every_case() {
         an_uncovered_merge_refuses_the_load_and_says_which();
         a_budget_that_describes_no_fire_is_refused_before_anything_is_swept();
@@ -365,7 +375,6 @@ mod tests {
         the_fact_ceiling_is_a_refusal_and_not_a_panic();
     }
 
-    #[test]
     fn an_uncovered_merge_refuses_the_load_and_says_which() {
         let mut b = Build::new();
         let x = b.input(8);
@@ -437,5 +446,4 @@ mod tests {
             Err(Error::TooManyFacts { facts: 21 }),
         );
     }
-
 }

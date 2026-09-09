@@ -8,6 +8,8 @@ use models::z_image::forward::Facts;
 use models::z_image::model::{self, Dims};
 use models::{PortKind, ReadoutKind, ScheduleKind};
 
+type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
+
 const TURBO: &str = "z-image-turbo-bf16-kv-bf16";
 const MINI: &str = "z-image-mini-bf16-kv-bf16";
 const ROWS: [&str; 2] = [TURBO, MINI];
@@ -64,6 +66,7 @@ fn word(reading: u8, stream: Stream) -> u64 {
     Facts::of(&request).word()
 }
 
+#[test]
 fn the_z_image_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states();
     the_ports_the_trace_reads_are_the_ports_the_facts_declare();
@@ -75,7 +78,6 @@ fn the_z_image_rows_bake_every_case() {
     the_generative_facts_state_the_readings_the_schedule_and_the_latent_space();
 }
 
-#[test]
 fn every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states() {
     for sku in ROWS {
         for platform in PLATFORMS {
@@ -393,7 +395,7 @@ fn the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head() {
     for sku in ROWS {
         let plan = trace(sku, Platform::Cuda);
         let d = dims(sku);
-        let axis_ropes: Vec<([u32; 4], [f32; 4], RopeForm, u32, u32)> = plan
+        let axis_ropes: Vec<RopeRow> = plan
             .nodes
             .iter()
             .filter_map(|node| match &node.op {

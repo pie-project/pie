@@ -28,7 +28,9 @@ pub fn rect(map: &ArenaMap, value: ValueId, rows: model_compiler::FireRows) -> O
     let element = model_compiler::arena::elem_bytes(*dtype);
     Some(Rect {
         offset: *offset,
-        bytes: element.map_or(*bytes, |element| rows.saturating_mul(*width).saturating_mul(element)),
+        bytes: element.map_or(*bytes, |element| {
+            rows.saturating_mul(*width).saturating_mul(element)
+        }),
         rows: u32::try_from(rows).unwrap_or(u32::MAX),
         width: u32::try_from(*width).unwrap_or(u32::MAX),
         dtype: *dtype,
@@ -46,7 +48,9 @@ mod tests {
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
     fn compiled() -> (model_ir::Trace, model_compiler::CompiledModel) {
-        let trace = models::sku(SKU).expect("the catalog ships the smoke's SKU").trace;
+        let trace = models::sku(SKU)
+            .expect("the catalog ships the smoke's SKU")
+            .trace;
         let trace = trace(Platform::Cuda);
         let compiled = compile(&trace, &Budget::new(4, 64), &DeviceProfile::default())
             .expect("the smoke's SKU bakes");
@@ -65,12 +69,12 @@ mod tests {
             .collect()
     }
 
+    #[test]
     fn arena_every_case() {
         every_op_output_resolves_and_nothing_else_does();
         the_carve_fits_the_allocation_it_asks_for();
     }
 
-    #[test]
     fn every_op_output_resolves_and_nothing_else_does() {
         let (trace, compiled) = compiled();
         let slots = rects(&compiled.arena, 13, 2);
@@ -82,7 +86,8 @@ mod tests {
                 Def::Op(_) | Def::Merge(_) => {
                     let host = matches!(decl.ty, Ty::Struct(_));
                     assert_eq!(
-                        bound, !host,
+                        bound,
+                        !host,
                         "value {at} defines {:?} and the table {} it",
                         decl.ty,
                         if bound { "binds" } else { "leaves" }

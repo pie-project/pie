@@ -760,6 +760,7 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
     ops::linear::matmul(&pooled, &t.projection)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn qkv_unfused(
     x: &Value,
     pos: &Value,

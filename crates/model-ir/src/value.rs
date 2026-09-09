@@ -237,22 +237,31 @@ pub struct ValueDecl {
 mod tests {
     use super::{Dim, Guard, PerAxis, RowAxis, Selection};
 
+    #[test]
     fn value_every_case() {
         a_selection_is_a_split_arms_guard_as_two_words();
         a_per_axis_reads_back_what_each_axis_was_filled_with();
     }
 
-    #[test]
     fn a_selection_is_a_split_arms_guard_as_two_words() {
         let arm = Guard::and(Guard::Fact(3), Guard::not(Guard::Fact(5)));
         let select = Selection::of(&arm).expect("a conjunction of literals");
-        assert_eq!(select, Selection { mask: 0b101000, value: 0b001000 });
+        assert_eq!(
+            select,
+            Selection {
+                mask: 0b101000,
+                value: 0b001000
+            }
+        );
         for word in 0..64u64 {
             assert_eq!(select.holds(word), arm.holds(word), "word {word:#b}");
         }
         assert_eq!(Selection::of(&Guard::Always), Some(Selection::ALL));
         assert!(Selection::ALL.holds(u64::MAX));
-        assert_eq!(Selection::of(&Guard::or(Guard::Fact(0), Guard::Fact(1))), None);
+        assert_eq!(
+            Selection::of(&Guard::or(Guard::Fact(0), Guard::Fact(1))),
+            None
+        );
         assert_eq!(
             Selection::of(&Guard::and(Guard::Fact(0), Guard::not(Guard::Fact(0)))),
             None,
@@ -272,7 +281,11 @@ mod tests {
 
         table[RowAxis::Patches] = "second";
         assert_eq!(table[RowAxis::Patches], "second");
-        assert_eq!(table[RowAxis::Tokens], "tokens", "the other axis stood still");
+        assert_eq!(
+            table[RowAxis::Tokens],
+            "tokens",
+            "the other axis stood still"
+        );
 
         let named = PerAxis::from_fn(RowAxis::name);
         assert_eq!(named[RowAxis::Tokens], "tokens");
@@ -293,8 +306,15 @@ mod tests {
             (Dim::Clips, 30),
             (Dim::ClipsPlus(1), 30),
         ] {
-            assert_eq!(cut[dim.axis().expect("a symbolic dim names a row space")], want);
+            assert_eq!(
+                cut[dim.axis().expect("a symbolic dim names a row space")],
+                want
+            );
         }
-        assert_eq!(Dim::Const(8).axis(), None, "a fixed block belongs to no axis");
+        assert_eq!(
+            Dim::Const(8).axis(),
+            None,
+            "a fixed block belongs to no axis"
+        );
     }
 }

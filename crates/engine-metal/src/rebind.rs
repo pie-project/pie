@@ -4,11 +4,11 @@ use std::collections::HashMap;
 
 use kernels_metal::icb as layout;
 use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSRange;
 use objc2_metal::{
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLIndirectCommandBuffer, MTLResource,
     MTLResourceID, MTLResourceUsage, MTLSize,
 };
-use objc2_foundation::NSRange;
 
 use crate::abi::{Arm, At, DescriptorAbi, Law, Pick};
 use crate::device::alloc::{Buffer, Slab, slab_address};
@@ -77,7 +77,9 @@ unsafe impl Send for Rebinder {}
 
 impl std::fmt::Debug for Rebinder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Rebinder").field("census", &self.census).finish()
+        f.debug_struct("Rebinder")
+            .field("census", &self.census)
+            .finish()
     }
 }
 
@@ -263,9 +265,8 @@ pub(crate) fn lower(
                     }
                     scalar => {
                         let at = cell_bytes.len() as u64;
-                        cell_bytes.extend_from_slice(
-                            &scalar_bytes(scalar).expect("a scalar has bytes"),
-                        );
+                        cell_bytes
+                            .extend_from_slice(&scalar_bytes(scalar).expect("a scalar has bytes"));
                         debug_assert_eq!(cell_of(scalar), Some(8));
                         cells_of_arg.push(Some(at));
                         bind_rows.push(layout::BindRow::new(
@@ -341,7 +342,10 @@ pub(crate) fn lower(
     handle.write(0, &resource_id(icb.gpuResourceID()).to_ne_bytes())?;
     let mut pipes = Buffer::zeroed(device, (layout::MAX_PIPELINES * 8) as u64)?;
     for (at, pipeline) in retained.iter().enumerate() {
-        pipes.write(at as u64 * 8, &resource_id(pipeline.gpuResourceID()).to_ne_bytes())?;
+        pipes.write(
+            at as u64 * 8,
+            &resource_id(pipeline.gpuResourceID()).to_ne_bytes(),
+        )?;
     }
     let cells = Buffer::zeroed(device, (cell_bytes.len() as u64).max(16))?;
     let mut cells = cells;
@@ -395,7 +399,12 @@ pub(crate) fn lower(
     Ok(rebinder)
 }
 
-fn law_row(law: &Law, at_kind: u32, at_index: u32, place: Option<(u32, u32, u32)>) -> layout::LawRow {
+fn law_row(
+    law: &Law,
+    at_kind: u32,
+    at_index: u32,
+    place: Option<(u32, u32, u32)>,
+) -> layout::LawRow {
     let mut row = match law {
         Law::Const(v) => {
             let mut row = layout::LawRow::at(layout::LAW_CONST, at_kind, at_index);
@@ -441,11 +450,7 @@ fn argument_place(
 ) -> (u32, u32, u32) {
     match arm.skeleton.args[index] {
         Arg::Buffer { slab, .. } => (layout::ARG_OFFSET, slab_index[&slab], 0),
-        Arg::Usize(_) => (
-            layout::ARG_WIDE,
-            0,
-            cells[index].unwrap_or(0) as u32,
-        ),
+        Arg::Usize(_) => (layout::ARG_WIDE, 0, cells[index].unwrap_or(0) as u32),
         _ => (layout::ARG_WORD, 0, cells[index].unwrap_or(0) as u32),
     }
 }
@@ -456,7 +461,9 @@ fn narrow(v: i128) -> i64 {
 
 fn words(values: &[i64]) -> &[u8] {
     // SAFETY: `i64` is plain data; `u8` has no alignment requirement.
-    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
 }
 
 fn stored(device: &Context, bytes: &[u8]) -> Result<Buffer> {
@@ -544,8 +551,7 @@ pub(crate) fn fire(
         0 => Ok(()),
         layout::STATUS_MAGIC => Err(Fault::Unstructured {
             slot: 0,
-            why: "the rebind shader read no FIRE magic in the descriptor it was handed"
-                .to_string(),
+            why: "the rebind shader read no FIRE magic in the descriptor it was handed".to_string(),
         }),
         layout::STATUS_VERSION => Err(Fault::Unstructured {
             slot: 0,

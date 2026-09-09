@@ -115,8 +115,7 @@ impl OutputStream for LogStream {
 
 #[async_trait]
 impl Pollable for LogStream {
-    async fn ready(&mut self) {
-    }
+    async fn ready(&mut self) {}
 }
 
 impl AsyncWrite for LogStream {

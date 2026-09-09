@@ -37,7 +37,9 @@ impl Granularity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Lowering {
     Uniform,
-    Prefix { fast_rows: u32 },
+    Prefix {
+        fast_rows: u32,
+    },
     PerLane,
     #[allow(dead_code)]
     Conditional,
@@ -296,6 +298,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn fire_plan_every_case() {
         truncated_members_seriate_deepest_first();
         full_depth_hook_sorts_before_truncated_members();
@@ -307,7 +310,6 @@ mod tests {
         device_geometry_members_are_forced_last();
     }
 
-    #[test]
     fn truncated_members_seriate_deepest_first() {
         let band = |k: u32, arrival: usize| {
             let mut m = member(false, false, false, arrival);
@@ -449,5 +451,4 @@ mod tests {
             Lowering::Prefix { fast_rows: 1 }
         );
     }
-
 }

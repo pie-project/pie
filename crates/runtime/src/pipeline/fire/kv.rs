@@ -8,10 +8,7 @@ use crate::store::kv::{KvStore, KvStoreError};
 
 #[derive(Debug)]
 pub enum KvError {
-    OutOfPages {
-        requested: usize,
-        available: usize,
-    },
+    OutOfPages { requested: usize, available: usize },
     Fatal(String),
 }
 
@@ -666,12 +663,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(at, &token)| {
-                    crate::engine::fire::lane_of(
-                        0,
-                        vec![token],
-                        held + at as u32,
-                        Vec::new(),
-                    )
+                    crate::engine::fire::lane_of(0, vec![token], held + at as u32, Vec::new())
                 })
                 .collect(),
             ..crate::engine::FireRequest::default()
@@ -737,6 +729,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn kv_every_case() {
         canonical_shape_accepts_the_plain_decode();
         canonical_shape_rejects_kv_perturbing_passes();
@@ -748,7 +741,6 @@ mod tests {
         translation_overlays_prepared_targets_on_the_committed_mapping();
     }
 
-    #[test]
     fn canonical_shape_accepts_the_plain_decode() {
         assert!(canonical_kv_shape(&plain_decode_container()));
     }
@@ -964,5 +956,4 @@ mod tests {
         finalize(&mut store, txn, true).unwrap();
         assert_eq!(store.lookup(forked, 1).unwrap().0, tr[1]);
     }
-
 }

@@ -45,7 +45,10 @@ impl Model {
             b.read(&w.gate, n("self_attn.gate_proj.weight"))?;
             b.read(&w.o_proj, n("self_attn.o_proj.weight"))?;
 
-            b.read_concat(&w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+            b.read_concat(
+                &w.gate_up,
+                [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
+            )?;
             b.read(&w.down, n("mlp.down_proj.weight"))?;
         }
 

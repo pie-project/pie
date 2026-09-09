@@ -33,7 +33,9 @@ fn bf16_bytes(v: &[f32]) -> Vec<u8> {
 
 fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
         .collect()
 }
@@ -44,7 +46,9 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
 
 fn f32_floats(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -102,8 +106,18 @@ impl Rig {
 
     fn read(&self, handle: u32, elements: usize, dtype: Dtype) -> Vec<f32> {
         match dtype {
-            Dtype::Bf16 => bf16_floats(&self.handles.read(handle, (elements * 2) as u64).expect("read")),
-            Dtype::F32 => f32_floats(&self.handles.read(handle, (elements * 4) as u64).expect("read")),
+            Dtype::Bf16 => bf16_floats(
+                &self
+                    .handles
+                    .read(handle, (elements * 2) as u64)
+                    .expect("read"),
+            ),
+            Dtype::F32 => f32_floats(
+                &self
+                    .handles
+                    .read(handle, (elements * 4) as u64)
+                    .expect("read"),
+            ),
             other => panic!("no test plane for {other:?}"),
         }
     }
@@ -164,6 +178,7 @@ const LANES: u32 = 3;
 
 const LANE_OF_ROW: [i32; ROWS as usize] = [0, 0, 1, 2, 1, 2, 2];
 
+#[test]
 fn the_conditioning_ops_answer_their_host_reference_every_case() {
     the_pointwise_arms_answer_the_reference_at_both_elements();
     a_modulation_reads_its_vector_per_lane_and_per_token();
@@ -177,7 +192,6 @@ fn the_conditioning_ops_answer_their_host_reference_every_case() {
     the_residual_blend_scores_normalized_and_blends_raw();
 }
 
-#[test]
 fn the_pointwise_arms_answer_the_reference_at_both_elements() {
     let Some(rig) = Rig::open() else {
         eprintln!("not asked: no Metal device");
@@ -187,9 +201,17 @@ fn the_pointwise_arms_answer_the_reference_at_both_elements() {
 
     for dtype in [Dtype::Bf16, Dtype::F32] {
         let n = (ROWS * WIDTH) as usize;
-        let round = |v: f32| if dtype == Dtype::Bf16 { bf16_round(v) } else { v };
+        let round = |v: f32| {
+            if dtype == Dtype::Bf16 {
+                bf16_round(v)
+            } else {
+                v
+            }
+        };
         let x: Vec<f32> = (0..n as u64).map(|at| round(2.0 * unit(at))).collect();
-        let y: Vec<f32> = (0..n as u64).map(|at| round(2.0 * unit(at ^ 0x77))).collect();
+        let y: Vec<f32> = (0..n as u64)
+            .map(|at| round(2.0 * unit(at ^ 0x77)))
+            .collect();
 
         let (_xb, hx) = rig.plane(&x, dtype);
         let (_yb, hy) = rig.plane(&y, dtype);
@@ -200,35 +222,65 @@ fn the_pointwise_arms_answer_the_reference_at_both_elements() {
 
         rig.fire(|s| pointwise::add(s, xt, yt, zt).expect("add"));
         let want: Vec<f32> = x.iter().zip(&y).map(|(a, b)| round(a + b)).collect();
-        check(&format!("add {dtype:?}"), &want, &rig.read(hz, n, dtype), dtype);
+        check(
+            &format!("add {dtype:?}"),
+            &want,
+            &rig.read(hz, n, dtype),
+            dtype,
+        );
 
         rig.fire(|s| pointwise::mul(s, xt, yt, zt).expect("mul"));
         let want: Vec<f32> = x.iter().zip(&y).map(|(a, b)| round(a * b)).collect();
-        check(&format!("mul {dtype:?}"), &want, &rig.read(hz, n, dtype), dtype);
+        check(
+            &format!("mul {dtype:?}"),
+            &want,
+            &rig.read(hz, n, dtype),
+            dtype,
+        );
 
         rig.fire(|s| pointwise::silu(s, xt, zt).expect("silu"));
         let want: Vec<f32> = x.iter().map(|v| round(v / (1.0 + (-v).exp()))).collect();
-        check(&format!("silu {dtype:?}"), &want, &rig.read(hz, n, dtype), dtype);
+        check(
+            &format!("silu {dtype:?}"),
+            &want,
+            &rig.read(hz, n, dtype),
+            dtype,
+        );
 
         rig.fire(|s| pointwise::tanh(s, xt, zt).expect("tanh"));
         let want: Vec<f32> = x.iter().map(|v| round(v.tanh())).collect();
-        check(&format!("tanh {dtype:?}"), &want, &rig.read(hz, n, dtype), dtype);
+        check(
+            &format!("tanh {dtype:?}"),
+            &want,
+            &rig.read(hz, n, dtype),
+            dtype,
+        );
 
         rig.fire(|s| pointwise::gelu_tanh(s, xt, zt).expect("gelu"));
         let want: Vec<f32> = x
             .iter()
             .map(|v| {
-                const K: f32 = 0.797_884_56;
+                const K: f32 = 0.797_884_6;
                 round(0.5 * v * (1.0 + (K * (v + 0.044_715 * v * v * v)).tanh()))
             })
             .collect();
-        check(&format!("gelu {dtype:?}"), &want, &rig.read(hz, n, dtype), dtype);
+        check(
+            &format!("gelu {dtype:?}"),
+            &want,
+            &rig.read(hz, n, dtype),
+            dtype,
+        );
 
         let (_cb, hc) = rig.plane(&x, dtype);
         let ct = Tensor::new(hc, ROWS, WIDTH, dtype);
         rig.fire(|s| pointwise::clamp(s, -0.5, 0.75, ct).expect("clamp"));
         let want: Vec<f32> = x.iter().map(|v| round(v.clamp(-0.5, 0.75))).collect();
-        check(&format!("clamp {dtype:?}"), &want, &rig.read(hc, n, dtype), dtype);
+        check(
+            &format!("clamp {dtype:?}"),
+            &want,
+            &rig.read(hc, n, dtype),
+            dtype,
+        );
 
         let bounds = [round(-0.5), round(0.75)];
         let (_lb, hlo) = rig.plane(&bounds[..1], dtype);
@@ -289,7 +341,11 @@ fn a_modulation_reads_its_vector_per_lane_and_per_token() {
             let m: Vec<f32> = (0..(m_rows * m_width) as u64)
                 .map(|at| {
                     let v = 0.5 * unit(at ^ 0xBEEF);
-                    if m_dtype == Dtype::Bf16 { bf16_round(v) } else { v }
+                    if m_dtype == Dtype::Bf16 {
+                        bf16_round(v)
+                    } else {
+                        v
+                    }
                 })
                 .collect();
             let (_mb, hm) = rig.plane(&m, m_dtype);
@@ -297,9 +353,7 @@ fn a_modulation_reads_its_vector_per_lane_and_per_token() {
             rig.fire(|s| {
                 modulate::modulate(s, form, xt, mt, Some(lanes), ot).expect("modulate per lane")
             });
-            let want = modulation_reference(&x, &m, form, m_width, |row| {
-                LANE_OF_ROW[row] as usize
-            });
+            let want = modulation_reference(&x, &m, form, m_width, |row| LANE_OF_ROW[row] as usize);
             within_a_bf16_ulp(
                 &format!("modulate {name} per lane, m {m_dtype:?}"),
                 &want,
@@ -309,12 +363,18 @@ fn a_modulation_reads_its_vector_per_lane_and_per_token() {
             let m: Vec<f32> = (0..(ROWS * m_width) as u64)
                 .map(|at| {
                     let v = 0.5 * unit(at ^ 0xF00D);
-                    if m_dtype == Dtype::Bf16 { bf16_round(v) } else { v }
+                    if m_dtype == Dtype::Bf16 {
+                        bf16_round(v)
+                    } else {
+                        v
+                    }
                 })
                 .collect();
             let (_mb, hm) = rig.plane(&m, m_dtype);
             let mt = Tensor::new(hm, ROWS, m_width, m_dtype);
-            rig.fire(|s| modulate::modulate(s, form, xt, mt, None, ot).expect("modulate per token"));
+            rig.fire(|s| {
+                modulate::modulate(s, form, xt, mt, None, ot).expect("modulate per token")
+            });
             let want = modulation_reference(&x, &m, form, m_width, |row| row);
             within_a_bf16_ulp(
                 &format!("modulate {name} per token, m {m_dtype:?}"),
@@ -356,7 +416,9 @@ fn the_gated_residual_folds_what_the_reference_folds() {
     };
     let n = (ROWS * WIDTH) as usize;
     let r: Vec<f32> = (0..n as u64).map(|at| bf16_round(unit(at))).collect();
-    let y: Vec<f32> = (0..n as u64).map(|at| bf16_round(unit(at ^ 0x99))).collect();
+    let y: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(unit(at ^ 0x99)))
+        .collect();
     let g: Vec<f32> = (0..(LANES * WIDTH) as u64)
         .map(|at| bf16_round(0.3 * unit(at ^ 0x1357)))
         .collect();
@@ -379,7 +441,9 @@ fn the_gated_residual_folds_what_the_reference_folds() {
     for row in 0..ROWS as usize {
         let lane = LANE_OF_ROW[row] as usize;
         for i in 0..w {
-            want.push(bf16_round(g[lane * w + i].mul_add(y[row * w + i], r[row * w + i])));
+            want.push(bf16_round(
+                g[lane * w + i].mul_add(y[row * w + i], r[row * w + i]),
+            ));
         }
     }
     within_a_bf16_ulp("gated_residual_add", &want, &rig.read(hr, n, Dtype::Bf16));
@@ -392,7 +456,9 @@ fn the_timestep_embedding_matches_the_diffusers_formula() {
     };
     for dim in [64u32, 65, 256] {
         for flip in [false, true] {
-            let t: Vec<f32> = (0..LANES as u64).map(|at| 1000.0 * (0.1 + 0.3 * unit(at))).collect();
+            let t: Vec<f32> = (0..LANES as u64)
+                .map(|at| 1000.0 * (0.1 + 0.3 * unit(at)))
+                .collect();
             let (_tb, ht) = rig.plane(&t, Dtype::F32);
             let (_yb, hy) = rig.empty((LANES * dim) as usize, Dtype::F32);
             let tt = Tensor::new(ht, LANES, 1, Dtype::F32);
@@ -440,7 +506,9 @@ fn the_centring_answers_the_two_pass_reference() {
     };
     let n = (ROWS * WIDTH) as usize;
     let w = WIDTH as usize;
-    let x: Vec<f32> = (0..n as u64).map(|at| bf16_round(50.0 + 4.0 * unit(at))).collect();
+    let x: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(50.0 + 4.0 * unit(at)))
+        .collect();
     let (_xb, hx) = rig.plane(&x, Dtype::Bf16);
     let (_yb, hy) = rig.empty(n, Dtype::Bf16);
     let xt = Tensor::new(hx, ROWS, WIDTH, Dtype::Bf16);
@@ -457,7 +525,9 @@ fn the_centring_answers_the_two_pass_reference() {
     }
     within_a_bf16_ulp("layernorm_no_scale", &want, &rig.read(hy, n, Dtype::Bf16));
 
-    let x: Vec<f32> = (0..n as u64).map(|at| 5000.0 + 4.0 * unit(at ^ 0x321)).collect();
+    let x: Vec<f32> = (0..n as u64)
+        .map(|at| 5000.0 + 4.0 * unit(at ^ 0x321))
+        .collect();
     let (_xb, hx) = rig.plane(&x, Dtype::F32);
     let (_yb, hy) = rig.empty(n, Dtype::F32);
     let xt = Tensor::new(hx, ROWS, WIDTH, Dtype::F32);
@@ -472,9 +542,16 @@ fn the_centring_answers_the_two_pass_reference() {
         want.extend(r.iter().map(|v| (v - mean) * inv));
     }
     let got = rig.read(hy, n, Dtype::F32);
-    let worst = want.iter().zip(&got).map(|(w, g)| (w - g).abs()).fold(0.0f32, f32::max);
+    let worst = want
+        .iter()
+        .zip(&got)
+        .map(|(w, g)| (w - g).abs())
+        .fold(0.0f32, f32::max);
     eprintln!("layernorm_no_scale f32: worst absolute {worst:.3e}");
-    assert!(worst < 1e-3, "layernorm_no_scale f32: worst absolute {worst:.3e}");
+    assert!(
+        worst < 1e-3,
+        "layernorm_no_scale f32: worst absolute {worst:.3e}"
+    );
 }
 
 const HEADS: u32 = 3;
@@ -504,7 +581,9 @@ fn every_rope_pairing_turns_the_channels_its_form_names() {
         (rope_axes::RopeForm::Split, "split"),
         (rope_axes::RopeForm::SplitLadder, "split_ladder"),
     ] {
-        let x: Vec<f32> = (0..n as u64).map(|at| bf16_round(unit(at ^ 0x2468))).collect();
+        let x: Vec<f32> = (0..n as u64)
+            .map(|at| bf16_round(unit(at ^ 0x2468)))
+            .collect();
         let (_xb, hx) = rig.plane(&x, Dtype::Bf16);
         let (_ob, ho) = rig.empty(n, Dtype::Bf16);
         let xt = Tensor::new(hx, ROWS, width, Dtype::Bf16);
@@ -515,7 +594,11 @@ fn every_rope_pairing_turns_the_channels_its_form_names() {
         });
 
         let want = rope_reference(&x, &positions, dims, thetas, form, rotary, axes);
-        within_a_bf16_ulp(&format!("rope_axes {name}"), &want, &rig.read(ho, n, Dtype::Bf16));
+        within_a_bf16_ulp(
+            &format!("rope_axes {name}"),
+            &want,
+            &rig.read(ho, n, Dtype::Bf16),
+        );
     }
 }
 
@@ -546,7 +629,11 @@ fn rope_reference(
                         let axis = slot % axes;
                         let f = slot / axes;
                         let ladder = (dims[axis] / 2) as usize;
-                        let e = if ladder > 1 { f as f32 / (ladder - 1) as f32 } else { 0.0 };
+                        let e = if ladder > 1 {
+                            f as f32 / (ladder - 1) as f32
+                        } else {
+                            0.0
+                        };
                         let a = pos[axis] * thetas[axis].powf(e);
                         (a.cos(), a.sin())
                     } else {
@@ -664,7 +751,9 @@ fn the_head_gate_scales_by_one_logit_a_head() {
     let width = HEADS * HEAD_DIM;
     let n = (ROWS * width) as usize;
     let scale = 0.75f32;
-    let x: Vec<f32> = (0..n as u64).map(|at| bf16_round(unit(at ^ 0x6161))).collect();
+    let x: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(unit(at ^ 0x6161)))
+        .collect();
     let g: Vec<f32> = (0..(ROWS * HEADS) as u64)
         .map(|at| bf16_round(2.0 * unit(at ^ 0x2727)))
         .collect();
@@ -688,7 +777,11 @@ fn the_head_gate_scales_by_one_logit_a_head() {
             want.push(bf16_round(x[row * width as usize + col] * s));
         }
     }
-    within_a_bf16_ulp("gate_sigmoid_mul_heads", &want, &rig.read(hx, n, Dtype::Bf16));
+    within_a_bf16_ulp(
+        "gate_sigmoid_mul_heads",
+        &want,
+        &rig.read(hx, n, Dtype::Bf16),
+    );
 }
 
 fn a_pack_and_its_unpack_round_trip_the_rectangle() {
@@ -699,7 +792,9 @@ fn a_pack_and_its_unpack_round_trip_the_rectangle() {
     const PACKED: u32 = 4;
     let perm: [i32; ROWS as usize] = [5, 1, 6, 2, -1, -1, -1];
     let n = (ROWS * WIDTH) as usize;
-    let x: Vec<f32> = (0..n as u64).map(|at| bf16_round(unit(at ^ 0xDEAD))).collect();
+    let x: Vec<f32> = (0..n as u64)
+        .map(|at| bf16_round(unit(at ^ 0xDEAD)))
+        .collect();
 
     let (_xb, hx) = rig.plane(&x, Dtype::Bf16);
     let (_pb, hp) = rig.i32_plane(&perm);
@@ -726,9 +821,16 @@ fn a_pack_and_its_unpack_round_trip_the_rectangle() {
     rig.fire(|s| layout::unpack_rows(s, tight, pt, wide).expect("unpack"));
     let back = rig.read(hu, n, Dtype::Bf16);
     for row in 0..ROWS as usize {
-        let named = perm.iter().take(PACKED as usize).any(|p| *p as usize == row);
+        let named = perm
+            .iter()
+            .take(PACKED as usize)
+            .any(|p| *p as usize == row);
         if named {
-            assert_eq!(&back[row * w..(row + 1) * w], &x[row * w..(row + 1) * w], "row {row} came back");
+            assert_eq!(
+                &back[row * w..(row + 1) * w],
+                &x[row * w..(row + 1) * w],
+                "row {row} came back"
+            );
         } else {
             assert!(
                 back[row * w..(row + 1) * w].iter().all(|v| *v == 7.5),
@@ -750,13 +852,23 @@ fn the_residual_blend_scores_normalized_and_blends_raw() {
     let n = (ROWS * H) as usize;
 
     for dtype in [Dtype::Bf16, Dtype::F32] {
-        let round = |v: f32| if dtype == Dtype::Bf16 { bf16_round(v) } else { v };
+        let round = |v: f32| {
+            if dtype == Dtype::Bf16 {
+                bf16_round(v)
+            } else {
+                v
+            }
+        };
         let blocks: Vec<f32> = (0..B * n)
             .map(|i| round(unit(i as u64) * (1.0 + (i / n) as f32)))
             .collect();
         let prefix: Vec<f32> = (0..n).map(|i| round(unit(i as u64 + 4242))).collect();
-        let wn: Vec<f32> = (0..H as usize).map(|i| round(unit(i as u64 + 11) * 0.5)).collect();
-        let wp: Vec<f32> = (0..H as usize).map(|i| round(unit(i as u64 + 97) * 0.5)).collect();
+        let wn: Vec<f32> = (0..H as usize)
+            .map(|i| round(unit(i as u64 + 11) * 0.5))
+            .collect();
+        let wp: Vec<f32> = (0..H as usize)
+            .map(|i| round(unit(i as u64 + 97) * 0.5))
+            .collect();
 
         let (_pb, hp) = rig.plane(&prefix, dtype);
         let (_bb, hb) = rig.plane(&blocks, dtype);

@@ -989,6 +989,7 @@ mod tests {
         let _ = instance_id;
     }
 
+    #[test]
     fn channel_every_case() {
         prebind_put_stages_and_seed_pops();
         set_empty_and_errors_without_changing_staging();
@@ -997,7 +998,6 @@ mod tests {
         packed_bool_mirror_decodes_to_native_bytes();
     }
 
-    #[test]
     fn prebind_put_stages_and_seed_pops() {
         let mut c = ChannelCell::new(vec![1], Dtype::I32, 1);
         c.put(7i32.to_le_bytes().to_vec()).unwrap();
@@ -1114,5 +1114,4 @@ mod tests {
         publish_wire(&cell, 88, &pack_bool(&native));
         assert_eq!(cell.lock().unwrap().take().unwrap(), native);
     }
-
 }

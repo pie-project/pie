@@ -1,10 +1,10 @@
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 
-use msl_corpus::{GOLDEN_NAMES, golden_container, golden_profile, synthetic_traces};
 use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::plan::compile_bound;
 use eta_ir::validate::bind;
+use msl_corpus::{GOLDEN_NAMES, golden_container, golden_profile, synthetic_traces};
 
 fn bound_and_refused() -> (Vec<(String, Vec<LaunchStagePlan>)>, Vec<String>) {
     let mut out = Vec::new();

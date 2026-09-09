@@ -88,13 +88,13 @@ fn check(lane_of_row: Option<Vec<i32>>) {
     }
 }
 
+#[test]
 fn the_modulate_forms_answer_the_broadcast_and_the_per_token_reference_every_case() {
     the_forms_answer_the_reference_with_m_read_per_lane();
     the_forms_answer_the_reference_with_m_read_per_token();
     a_modulation_may_write_the_rectangle_it_read();
 }
 
-#[test]
 fn the_forms_answer_the_reference_with_m_read_per_lane() {
     let map: Vec<i32> = (0..ROWS).map(|r| (r % LANES) as i32).collect();
     check(Some(map));

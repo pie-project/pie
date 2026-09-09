@@ -195,10 +195,12 @@ impl Run<'_> {
             | Attention::BlockDynConv { .. }
             | Attention::SelectorWalk { .. }
             | Attention::Ragged { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
-            | Attention::DecodeRel { .. }
+            Attention::DecodeRel { .. }
             | Attention::PrefillRel { .. }
             | Attention::ShortConv { .. }
-            | Attention::ShortConvChunked { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
+            | Attention::ShortConvChunked { .. } => {
+                Err(kernels_vulkan::Error::Unsupported { op: op.name() })
+            }
             Attention::Masked {
                 q,
                 plan,

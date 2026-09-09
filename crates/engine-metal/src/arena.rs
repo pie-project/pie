@@ -29,12 +29,7 @@ impl Arena {
         self.store.bytes()
     }
 
-    pub fn slots(
-        &self,
-        handles: &Handles,
-        map: &ArenaMap,
-        rows: FireRows,
-    ) -> Result<SlotTable> {
+    pub fn slots(&self, handles: &Handles, map: &ArenaMap, rows: FireRows) -> Result<SlotTable> {
         carve(handles, &self.store, map, rows)
     }
 

@@ -221,7 +221,7 @@ pub fn group_norm(
     expect_voxels("`spatial::group_norm`'s input", x);
     expect_grid("`spatial::group_norm`'s grid", grid);
     assert!(
-        groups > 0 && x.width() % u64::from(groups) == 0,
+        groups > 0 && x.width().is_multiple_of(u64::from(groups)),
         "{} channels do not split into {groups} groups",
         x.width()
     );
@@ -347,7 +347,7 @@ pub fn pixel_shuffle_trimming(x: &Value, grid: &Value, r: [u32; 3], trim_t: u32)
     expect_grid("`spatial::pixel_shuffle`'s grid", grid);
     let vol = volume(r);
     assert!(
-        vol > 0 && x.width() % u64::from(vol) == 0,
+        vol > 0 && x.width().is_multiple_of(u64::from(vol)),
         "{} channels do not unpack by a {r:?} block",
         x.width()
     );
@@ -408,7 +408,7 @@ pub fn avg_down(x: &Value, grid: &Value, factor: [u32; 3], group: u32) -> (Value
     assert!(vol > 0, "an avg-down block of {factor:?} is empty");
     let widened = x.width() * u64::from(vol);
     assert!(
-        group > 0 && widened % u64::from(group) == 0,
+        group > 0 && widened.is_multiple_of(u64::from(group)),
         "{widened} widened channels do not fold into groups of {group}"
     );
     let rule = GridRule::AvgDown { factor };
@@ -482,7 +482,7 @@ pub fn unpatchify(x: &Value, tgrid: &Value, p: [u32; 3], grid: &Value) -> Value 
     expect_grid("`spatial::unpatchify`'s grid", grid);
     let vol = volume(p);
     assert!(
-        vol > 0 && x.width() % u64::from(vol) == 0,
+        vol > 0 && x.width().is_multiple_of(u64::from(vol)),
         "{} channels do not unpack by a {p:?} patch",
         x.width()
     );

@@ -39,7 +39,9 @@ fn bf16_bytes(v: &[f32]) -> Vec<u8> {
 
 fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
         .collect()
 }
@@ -63,7 +65,9 @@ fn the_convolution_matches_the_reference_on_both_sides() {
         v
     };
     let coeff_width = 2 * TAPS * GROUPS;
-    let x: Vec<f32> = (0..(rows * CHANNELS) as u64).map(|at| bf16_round(unit(at))).collect();
+    let x: Vec<f32> = (0..(rows * CHANNELS) as u64)
+        .map(|at| bf16_round(unit(at)))
+        .collect();
     let coeff: Vec<f32> = (0..(rows * coeff_width) as u64)
         .map(|at| bf16_round(0.25 * unit(at ^ 0x5151)))
         .collect();
@@ -82,11 +86,25 @@ fn the_convolution_matches_the_reference_on_both_sides() {
     let mut base_b = Buffer::zeroed(&device, u64::from(2 * TAPS * CHANNELS) * 2).expect("base");
     base_b.write(0, &bf16_bytes(&base)).expect("write base");
     let mut indptr_b = Buffer::zeroed(&device, indptr.len() as u64 * 4).expect("indptr");
-    indptr_b.write(0, &indptr.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<_>>()).expect("write indptr");
+    indptr_b
+        .write(
+            0,
+            &indptr
+                .iter()
+                .flat_map(|i| i.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .expect("write indptr");
     let y_b = Buffer::zeroed(&device, u64::from(rows * CHANNELS) * 2).expect("y");
 
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("a handle");
-    let (hx, hc, hb, hi, hy) = (bind(&x_b), bind(&coeff_b), bind(&base_b), bind(&indptr_b), bind(&y_b));
+    let (hx, hc, hb, hi, hy) = (
+        bind(&x_b),
+        bind(&coeff_b),
+        bind(&base_b),
+        bind(&indptr_b),
+        bind(&y_b),
+    );
     let xt = RaggedTensor {
         data: Tensor::new(hx, rows, CHANNELS, Dtype::Bf16),
         indptr: Tensor::new(hi, indptr.len() as u32, 1, Dtype::I32),
@@ -102,7 +120,11 @@ fn the_convolution_matches_the_reference_on_both_sides() {
             dynconv::block_dyn_conv(&sink, xt, ct, bt, side, TAPS, GROUP, yt).expect("the launch");
             frame.commit().expect("the commit");
         }
-        let got = bf16_floats(&handles.read(hy, u64::from(rows * CHANNELS) * 2).expect("read y"));
+        let got = bf16_floats(
+            &handles
+                .read(hy, u64::from(rows * CHANNELS) * 2)
+                .expect("read y"),
+        );
 
         let mut worst = 0.0f32;
         let mut worst_at = (0usize, 0usize);
@@ -133,11 +155,21 @@ fn the_convolution_matches_the_reference_on_both_sides() {
                 }
             }
         }
-        eprintln!("side {side}: worst {worst:.3} ulp at (row {}, channel {})", worst_at.0, worst_at.1);
-        assert!(worst <= 1.0, "side {side}: the kernel parts from the reference by {worst:.2} bf16 ulp at {worst_at:?}");
+        eprintln!(
+            "side {side}: worst {worst:.3} ulp at (row {}, channel {})",
+            worst_at.0, worst_at.1
+        );
+        assert!(
+            worst <= 1.0,
+            "side {side}: the kernel parts from the reference by {worst:.2} bf16 ulp at {worst_at:?}"
+        );
     }
 
-    let before = bf16_floats(&handles.read(hy, u64::from(rows * CHANNELS) * 2).expect("read y"));
+    let before = bf16_floats(
+        &handles
+            .read(hy, u64::from(rows * CHANNELS) * 2)
+            .expect("read y"),
+    );
     let mut flipped = x.clone();
     let last_of_first = (indptr[1] as usize - 1) * CHANNELS as usize;
     for v in &mut flipped[last_of_first..last_of_first + CHANNELS as usize] {
@@ -150,10 +182,22 @@ fn the_convolution_matches_the_reference_on_both_sides() {
         dynconv::block_dyn_conv(&sink, xt, ct, bt, 1, TAPS, GROUP, yt).expect("the launch");
         frame.commit().expect("the commit");
     }
-    let after = bf16_floats(&handles.read(hy, u64::from(rows * CHANNELS) * 2).expect("read y"));
+    let after = bf16_floats(
+        &handles
+            .read(hy, u64::from(rows * CHANNELS) * 2)
+            .expect("read y"),
+    );
     let second = indptr[1] as usize * CHANNELS as usize..rows as usize * CHANNELS as usize;
-    assert_eq!(&before[second.clone()], &after[second], "the second request read across the boundary");
+    assert_eq!(
+        &before[second.clone()],
+        &after[second],
+        "the second request read across the boundary"
+    );
     let last = last_of_first..last_of_first + CHANNELS as usize;
-    assert_ne!(&before[last.clone()], &after[last], "flipping a row changed nothing, so the check proves nothing");
+    assert_ne!(
+        &before[last.clone()],
+        &after[last],
+        "flipping a row changed nothing, so the check proves nothing"
+    );
     eprintln!("boundary: the second request's rows are unchanged by the first's last row");
 }

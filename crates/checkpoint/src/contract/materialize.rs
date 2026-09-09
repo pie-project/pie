@@ -1,6 +1,6 @@
-use crate::file::Metadata;
 use crate::contract::{Expr, ModelContract, TensorContract};
 use crate::error::Result;
+use crate::file::Metadata;
 use crate::types::{DType, Encoding};
 
 pub struct Materialization {

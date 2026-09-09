@@ -1,6 +1,4 @@
-use model_dsl::{
-    Classify, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam,
-};
+use model_dsl::{Classify, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam};
 
 use super::model::{Model, Reading};
 
@@ -124,15 +122,9 @@ impl ForwardHybrid for Model {
 
             let [mq, sq, dq, p] = q.split(classes.clone());
             let so = match w.reading {
-                Reading::Sliding => ops::attn::prefill(
-                    &sq,
-                    &plan_s[reading],
-                    pages,
-                    win,
-                    d,
-                    m.kv_heads,
-                    m.sm_scale,
-                ),
+                Reading::Sliding => {
+                    ops::attn::prefill(&sq, &plan_s[reading], pages, win, d, m.kv_heads, m.sm_scale)
+                }
                 Reading::Full => {
                     let (so, lse) = ops::attn::prefill_lse(
                         &sq,

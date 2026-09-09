@@ -18,8 +18,14 @@ pub enum RsBufferIntent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RsBufferTarget {
-    Fresh { index: u32, dst: RsSlotId },
-    InPlace { index: u32, dst: RsSlotId },
+    Fresh {
+        index: u32,
+        dst: RsSlotId,
+    },
+    InPlace {
+        index: u32,
+        dst: RsSlotId,
+    },
     Cow {
         index: u32,
         src: RsSlotId,

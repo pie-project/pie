@@ -277,7 +277,11 @@ pub fn emit_streamed_topk(
     let mut source = kernel_head(function_name, used_channel_slots(&ops), "");
     let _ = writeln!(source, "  constexpr uint kInput = {input}u;");
     let _ = writeln!(source, "  constexpr uint kValues = {}u;", bases[topk_node]);
-    let _ = writeln!(source, "  constexpr uint kIndices = {}u;", bases[topk_node] + 1);
+    let _ = writeln!(
+        source,
+        "  constexpr uint kIndices = {}u;",
+        bases[topk_node] + 1
+    );
     let _ = writeln!(source, "  constexpr uint kK = {}u;", topk.imm);
     let _ = writeln!(source, "  constexpr uint kCap = {SELECT_MAX_K}u;");
     source.push_str(BODY);

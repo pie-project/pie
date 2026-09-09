@@ -109,7 +109,14 @@ impl<'a> Execution<'a> {
             match sink {
                 Some(sink) => walk::run(plan, snapshot_dir, residency, sink, progress, consume)?,
                 None => {
-                    walk::run(plan, snapshot_dir, residency, &mut owned_sink, progress, consume)?;
+                    walk::run(
+                        plan,
+                        snapshot_dir,
+                        residency,
+                        &mut owned_sink,
+                        progress,
+                        consume,
+                    )?;
                 }
             }
         }

@@ -52,7 +52,13 @@ fn vae(b: &mut Builder, src: &ztensor::Source, v: &Vae) -> Result<(), Error> {
     }
     for (i, up) in v.up.iter().enumerate() {
         let stem = at(&format!("decoder.up_blocks.{i}"));
-        vae_conv(b, src, &up.upsampler, &format!("{stem}.upsamplers.0.conv"), None)?;
+        vae_conv(
+            b,
+            src,
+            &up.upsampler,
+            &format!("{stem}.upsamplers.0.conv"),
+            None,
+        )?;
         for (r, res) in up.resnets.iter().enumerate() {
             vae_resnet(b, src, res, &format!("{stem}.resnets.{r}"))?;
         }

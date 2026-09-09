@@ -16,7 +16,7 @@ on:
         type: string
         default: "nightly"
       desktop:
-        description: "Build the desktop GPU artifacts (Windows x86_64 CUDA, macOS arm64 Metal)"
+        description: "Build the desktop GPU artifacts (macOS arm64 Metal + wgpu, Windows x86_64 CUDA + Vulkan, Linux x86_64 Vulkan + wgpu)"
         type: boolean
         default: true
       cuda_manylinux:
@@ -110,20 +110,72 @@ jobs:
             # nvcc builds one real+PTX arch; the PTX keeps the artifact
             # forward-JIT-able on newer NVIDIA GPUs.
             cuda_arch: "75"
+          - label: x86_64-linux-vulkan
+            runner: ubuntu-latest
+            platform: linux
+            triple: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            backend: vulkan
+            features: vulkan
+          - label: x86_64-windows-vulkan
+            runner: windows-latest
+            platform: windows
+            triple: x86_64-pc-windows-msvc
+            archive: zip
+            backend: vulkan
+            features: vulkan
+          - label: x86_64-linux-wgpu
+            runner: ubuntu-latest
+            platform: linux
+            triple: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            backend: wgpu
+            features: wgpu
+          - label: aarch64-macos-wgpu
+            runner: macos-15
+            platform: macos
+            triple: aarch64-apple-darwin
+            archive: tar.gz
+            backend: wgpu
+            features: wgpu
     runs-on: ${{ matrix.target.runner }}
     env:
       ARTIFACT_NAME: pie-${{ matrix.target.label }}.${{ matrix.target.archive }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target.triple }}
 
-      - name: Install build deps (macOS Metal only)
+      - name: Install build deps (macOS only)
         if: matrix.target.platform == 'macos'
         run: brew install cmake ninja libomp
+
+      - name: Install Slang (vulkan only)
+        if: matrix.target.backend == 'vulkan'
+        shell: bash
+        env:
+          SLANG_VERSION: '2026.17'
+        run: |
+          set -euxo pipefail
+          if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
+            asset="slang-${SLANG_VERSION}-windows-x86_64.zip"
+          else
+            asset="slang-${SLANG_VERSION}-linux-x86_64.tar.gz"
+          fi
+          url="https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/${asset}"
+          mkdir -p "${RUNNER_TEMP}/slang"
+          curl -fsSL -o "${RUNNER_TEMP}/${asset}" "$url"
+          if [[ "${asset}" == *.zip ]]; then
+            7z x -o"${RUNNER_TEMP}/slang" "${RUNNER_TEMP}/${asset}"
+            echo "PIE_SLANGC=${RUNNER_TEMP}/slang/bin/slangc.exe" >> "$GITHUB_ENV"
+          else
+            tar xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}/slang"
+            echo "PIE_SLANGC=${RUNNER_TEMP}/slang/bin/slangc" >> "$GITHUB_ENV"
+          fi
+          "${RUNNER_TEMP}/slang/bin/slangc" -v || true
 
       - name: Install CUDA toolkit (windows cuda only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
@@ -290,7 +342,7 @@ jobs:
       CMAKE_CUDA_RUNTIME_LIBRARY: Shared
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Bootstrap container
         shell: bash
@@ -373,8 +425,13 @@ jobs:
 
       - name: Upload to release
         uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ inputs.tag }}
+          # An empty `tag_name` makes the action fall back to `github.ref`,
+          # which is a branch and has no release: the run then fails with
+          # "Resource not accessible by integration" against `refs/heads/main`.
+          tag_name: ${{ inputs.tag || 'nightly' }}
           files: dist/${{ env.ARTIFACT_NAME }}
           fail_on_unmatched_files: true
           make_latest: false

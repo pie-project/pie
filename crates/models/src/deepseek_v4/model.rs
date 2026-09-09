@@ -146,6 +146,7 @@ pub enum GateUp {
     Split { gate: Weight, up: Weight },
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Mlp {
     Dense {
         gate_up: Weight,

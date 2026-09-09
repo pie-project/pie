@@ -201,10 +201,7 @@ fn demand_set(
             Op::ChanTake(chan) | Op::ChanRead(chan) => {
                 let is_blocked = match pending.get(chan) {
                     Some(&pending_blocked) => pending_blocked,
-                    None => cache
-                        .entry(*chan)
-                        .or_insert_with(|| known(*chan))
-                        .is_none(),
+                    None => cache.entry(*chan).or_insert_with(|| known(*chan)).is_none(),
                 };
                 blocked.push(is_blocked);
             }
@@ -365,7 +362,7 @@ mod tests {
     use eta_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, StageProgram, TraceContainer,
     };
-    
+
     use eta_ir::registry::ModelProfile;
     use eta_ir::types::{Dtype, Literal, RngKind, Shape};
     use eta_ir::validate::bind;
@@ -514,13 +511,13 @@ mod tests {
         }
     }
 
+    #[test]
     fn pareval_every_case() {
         unknown_tokens_block_derived_ports_only();
         keyed_rng_is_only_as_tainted_as_its_state();
         seeded_prefill_is_host_derivable();
     }
 
-    #[test]
     fn unknown_tokens_block_derived_ports_only() {
         let bound = bind(sdk_geometry_trace(), ModelProfile::dummy()).unwrap();
         let seeds: Vec<(u32, Value)> = seeds()
@@ -576,5 +573,4 @@ mod tests {
         assert!(taint.device_decided.is_empty());
         assert!(taint.host_derivable());
     }
-
 }

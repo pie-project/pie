@@ -21,7 +21,12 @@ impl Projection {
         self
     }
 
-    #[cfg(any(feature = "npz", feature = "pickle", feature = "hdf5", feature = "onnx"))]
+    #[cfg(any(
+        feature = "npz",
+        feature = "pickle",
+        feature = "hdf5",
+        feature = "onnx"
+    ))]
     pub fn with_decoder(mut self, decoder: Box<dyn Decode>) -> Self {
         self.decoder = Some(decoder);
         self

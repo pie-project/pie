@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use ztensor::format::cbor::Value;
 use ztensor::Term;
+use ztensor::format::cbor::Value;
 
 use crate::error::Error;
 use crate::serving::{self, Stamp};
@@ -25,6 +25,11 @@ impl Payload<'_> {
             Payload::Streamed(length) => *length,
         }
     }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 pub struct Object<'a> {
@@ -38,7 +43,12 @@ pub struct Object<'a> {
 
 impl<'a> Object<'a> {
     #[must_use]
-    pub fn leaf(name: &'a str, shape: Vec<u64>, leaf: ztensor::Leaf, bytes: &'a [u8]) -> Object<'a> {
+    pub fn leaf(
+        name: &'a str,
+        shape: Vec<u64>,
+        leaf: ztensor::Leaf,
+        bytes: &'a [u8],
+    ) -> Object<'a> {
         Object {
             name,
             shape,
@@ -139,7 +149,8 @@ impl Chunks<'_> {
 }
 
 fn laid(object: &Object<'_>) -> Result<Vec<(u64, u64)>, Error> {
-    let bad = |detail: String| Error::Checkpoint(format!("serving object {:?} {detail}", object.name));
+    let bad =
+        |detail: String| Error::Checkpoint(format!("serving object {:?} {detail}", object.name));
     if object.planes.is_empty() {
         return Err(bad("has no planes, so it has nothing to serve".into()));
     }
@@ -190,7 +201,10 @@ fn add(
             object.name,
         )));
     }
-    fn describe<'d>(object: &Object<'_>, mut o: ztensor::ObjectBuilder<'d>) -> ztensor::ObjectBuilder<'d> {
+    fn describe<'d>(
+        object: &Object<'_>,
+        mut o: ztensor::ObjectBuilder<'d>,
+    ) -> ztensor::ObjectBuilder<'d> {
         o = o.shape(object.shape.clone());
         if let Some(term) = &object.term {
             o = o.term(term.clone());
@@ -225,9 +239,12 @@ fn add(
                     .map_err(Error::from);
             }
             (Some(_), _) => {
-                let mut blob = vec![0u8; usize::try_from(total).map_err(|_| {
-                    Error::Checkpoint(format!("{:?} does not fit in memory", object.name))
-                })?];
+                let mut blob = vec![
+                    0u8;
+                    usize::try_from(total).map_err(|_| {
+                        Error::Checkpoint(format!("{:?} does not fit in memory", object.name))
+                    })?
+                ];
                 for ((at, _), bytes) in planes.iter().zip(&whole) {
                     let at = *at as usize;
                     blob[at..at + bytes.len()].copy_from_slice(bytes);
@@ -295,6 +312,7 @@ fn refuse_for_space(directory: &Path, path: &Path, objects: &[Object<'_>]) -> Re
     Ok(())
 }
 
+#[cfg(unix)]
 fn available_bytes(directory: &Path) -> Result<u64, Error> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -318,14 +336,37 @@ fn available_bytes(directory: &Path) -> Result<u64, Error> {
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
+#[cfg(windows)]
+fn available_bytes(directory: &Path) -> Result<u64, Error> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut wide: Vec<u16> = directory.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut free: u64 = 0;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call, and
+    // `free` is a plain out-parameter the call fills on success.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &raw mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(Error::Checkpoint(format!(
+            "{}: cannot read the filesystem's free space",
+            directory.display()
+        )));
+    }
+    Ok(free)
+}
+
 fn check_tiling(temp: &Path, path: &Path) -> Result<(), Error> {
     let manifest = ztensor::read::manifest_of(temp)
         .map_err(Error::from)?
         .ok_or_else(|| {
-            Error::Internal(format!(
-                "{} was written without a manifest",
-                path.display()
-            ))
+            Error::Internal(format!("{} was written without a manifest", path.display()))
         })?;
     let spans = serving::spans(&manifest);
     if let Some(fault) = serving::tiling_fault(&spans, serving::alignment(&spans)) {

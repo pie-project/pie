@@ -15,10 +15,13 @@ pub fn sigmoid_mul_heads(
     const OP: &str = "elementwise.gate_sigmoid_mul_heads";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "gate_sigmoid_mul_heads_bfloat16" });
     let head_dim = nonzero(OP, "the head width", head_dim)?;
-    if x.width % head_dim != 0 {
+    if !x.width.is_multiple_of(head_dim) {
         return Err(refuse(
             OP,
-            format!("a {}-wide row is not a whole number of {head_dim}-wide heads", x.width),
+            format!(
+                "a {}-wide row is not a whole number of {head_dim}-wide heads",
+                x.width
+            ),
         ));
     }
     let heads = x.width / head_dim;

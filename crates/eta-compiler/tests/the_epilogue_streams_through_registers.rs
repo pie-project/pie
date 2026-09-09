@@ -2,8 +2,8 @@ use eta_compiler::codegen::cuda::fused::emit_fused_region;
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::types::RngKind;
 use eta_ir::registry::{ModelProfile, Stage};
+use eta_ir::types::RngKind;
 use eta_ir::types::{Dtype, Literal, Shape};
 use eta_ir::validate::bind;
 
@@ -99,13 +99,13 @@ fn profile() -> ModelProfile {
     profile
 }
 
+#[test]
 fn the_epilogue_streams_through_registers_every_case() {
     the_row_parallel_epilogue_fuses_into_streams();
     a_reshaped_row_vector_broadcasts_through_the_stream();
     a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing();
 }
 
-#[test]
 fn the_row_parallel_epilogue_fuses_into_streams() {
     let bound = bind(subject(), profile()).expect("the subject binds");
     let stages = compile_bound(&bound);
@@ -117,9 +117,6 @@ fn the_row_parallel_epilogue_fuses_into_streams() {
         }
         let name = format!("k{index}");
         let emitted = emit_fused_region(&name, stage, region).expect("cuda emits");
-        if std::env::var_os("PTIR_SHOW").is_some() {
-            eprintln!("{emitted}");
-        }
         let body = emitted
             .split("descriptors = ptir_rowdesc;")
             .nth(1)
@@ -198,7 +195,11 @@ fn a_reshaped_row_vector_broadcasts_through_the_stream() {
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     assert!(
-        !stage.normalized.ops.iter().any(|op| matches!(op, Op::Reshape { shape, .. } if shape.rank() == 2)),
+        !stage
+            .normalized
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Reshape { shape, .. } if shape.rank() == 2)),
         "the [rows, 1] reshape survived normalization: {:?}",
         stage.normalized.ops
     );
@@ -208,7 +209,12 @@ fn a_reshaped_row_vector_broadcasts_through_the_stream() {
             continue;
         }
         let emitted = emit_fused_region(&format!("k{index}"), stage, region).expect("cuda emits");
-        source.push_str(emitted.split("descriptors = ptir_rowdesc;").nth(1).unwrap_or(""));
+        source.push_str(
+            emitted
+                .split("descriptors = ptir_rowdesc;")
+                .nth(1)
+                .unwrap_or(""),
+        );
     }
     assert!(
         !source.contains("ptir_parallel_broadcast("),
@@ -270,10 +276,18 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
     for (index, region) in stage.fused.regions.iter().enumerate() {
         let name = format!("k{index}");
         if eta_compiler::codegen::cuda::order::is_order_region(stage, region) {
-            order.push_str(&eta_compiler::codegen::cuda::order::emit_order_region(&name, stage, region).expect("order emits"));
+            order.push_str(
+                &eta_compiler::codegen::cuda::order::emit_order_region(&name, stage, region)
+                    .expect("order emits"),
+            );
         } else if region.row_value.is_some() {
             let emitted = emit_fused_region(&name, stage, region).expect("cuda emits");
-            generated.push_str(emitted.split("descriptors = ptir_rowdesc;").nth(1).unwrap_or(""));
+            generated.push_str(
+                emitted
+                    .split("descriptors = ptir_rowdesc;")
+                    .nth(1)
+                    .unwrap_or(""),
+            );
         }
     }
     assert!(
@@ -283,7 +297,11 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
     assert!(
         order.contains("kDirectIntrinsic = 0u") || order.contains("kDirectIntrinsic = 1u"),
         "the top_k does not rank the intrinsic plane directly:\n{}",
-        order.lines().filter(|l| l.contains("kDirect")).collect::<Vec<_>>().join("\n")
+        order
+            .lines()
+            .filter(|l| l.contains("kDirect"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     assert!(
         order.contains("kDirectDivisor = 1u"),
@@ -310,7 +328,12 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
         .inputs
         .iter()
         .find(|value| one_element(value))
-        .unwrap_or_else(|| panic!("the top_k region names no one-element input: {:?}", ranks.inputs));
+        .unwrap_or_else(|| {
+            panic!(
+                "the top_k region names no one-element input: {:?}",
+                ranks.inputs
+            )
+        });
     assert!(
         stage
             .fused

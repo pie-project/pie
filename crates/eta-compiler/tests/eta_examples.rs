@@ -7,12 +7,12 @@ use eta_ir::validate::bind;
 mod traces;
 use traces::*;
 
+#[test]
 fn eta_examples_every_case() {
     section3_serializes_validates_hashes_stably();
     beam_epilogue_serializes_validates_hashes_stably();
 }
 
-#[test]
 fn section3_serializes_validates_hashes_stably() {
     let c = section3_trace();
     let bytes = encode(&c);

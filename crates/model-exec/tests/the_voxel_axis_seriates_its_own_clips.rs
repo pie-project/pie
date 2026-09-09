@@ -108,13 +108,13 @@ fn budgets() -> Budgets {
     })
 }
 
+#[test]
 fn the_voxel_axis_seriates_its_own_clips_every_case() {
     a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window();
     a_fire_past_the_voxel_ceilings_is_refused_by_name();
     abi_three_packs_a_voxel_trailer_exactly_when_the_fire_carries_clips();
 }
 
-#[test]
 fn a_class_with_rows_and_no_clips_has_a_token_window_and_no_voxel_window() {
     let trace = trunk_and_decoder();
     let budgets = budgets();

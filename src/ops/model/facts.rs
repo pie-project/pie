@@ -171,12 +171,12 @@ mod tests {
 
     const FLUX2_KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 
+    #[test]
     fn facts_every_case() {
         a_generative_row_reports_what_it_can_be_asked_to_draw();
         a_text_row_reports_nothing_here();
     }
 
-    #[test]
     fn a_generative_row_reports_what_it_can_be_asked_to_draw() {
         let facts = of(Some(FLUX2_KLEIN)).expect("flux2-klein-4b is a generative row");
         assert!(

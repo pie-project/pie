@@ -40,7 +40,10 @@ fn finite(logits: &[f32], what: &str) {
     );
     let spread = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max)
         - logits.iter().copied().fold(f32::INFINITY, f32::min);
-    assert!(spread > 1e-3, "{what} logits span {spread}, which nothing wrote");
+    assert!(
+        spread > 1e-3,
+        "{what} logits span {spread}, which nothing wrote"
+    );
 }
 
 fn run(shell: &mut Shell, slot: u32, drafts: bool) -> Vec<Vec<f32>> {
@@ -75,7 +78,9 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
         return;
     }
     let Some(artifact) = artifact() else {
-        eprintln!("not asked: no dsv4 mtp artifact (PIE_DSV4_MTP_ARTIFACT, or /tmp/warmstream/dsv4-mini-mtp.zt)");
+        eprintln!(
+            "not asked: no dsv4 mtp artifact (PIE_DSV4_MTP_ARTIFACT, or /tmp/warmstream/dsv4-mini-mtp.zt)"
+        );
         return;
     };
     let sku = models::sku(SKU).expect("the catalog ships the drafting mini row");
@@ -107,7 +112,10 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
         booted.elapsed().as_secs_f64(),
         shell.drafts()
     );
-    assert!(shell.drafts(), "the load declares a draft head and advertises none");
+    assert!(
+        shell.drafts(),
+        "the load declares a draft head and advertises none"
+    );
     assert_eq!(
         shell.mtp_depth(),
         models::deepseek_v4::model::DRAFT_DEPTH,

@@ -5,6 +5,8 @@ use super::model::{Gate, GateUp, Layer, Mlp, Model};
 use checkpoint_dsl::{Builder, Error, encoding};
 use model_dsl::Platform;
 
+type ImportArm<S> = fn(&S, &ztensor::Source, Platform) -> Result<ModelContract, Error>;
+
 impl Model {
     pub fn import(
         &self,
@@ -12,10 +14,7 @@ impl Model {
         platform: Platform,
     ) -> Result<ModelContract, Error> {
         let mut refusals: Vec<String> = Vec::new();
-        let arms: [(
-            &str,
-            fn(&Self, &ztensor::Source, Platform) -> Result<ModelContract, Error>,
-        ); 4] = [
+        let arms: [(&str, ImportArm<Self>); 4] = [
             (
                 "an artifact with an `--aux` overlay",
                 Self::import_from_own_with_aux,
@@ -369,13 +368,13 @@ fn layer_reads<'w>(w: &'w Layer, n: &dyn Fn(&str) -> String, reads: &mut Vec<Rea
     reads.push(Read::One(&at.o_down, n("attn.wo_a.weight")));
     reads.push(Read::One(&at.o_up, n("attn.wo_b.weight")));
     reads.push(Read::One(&at.sink, n("attn.attn_sink")));
-    if let Some(pool) = &at.pool {
-        if let Some(c) = &pool.compressor {
-            reads.push(Read::One(&c.wkv, n("attn.compressor.wkv.weight")));
-            reads.push(Read::One(&c.wgate, n("attn.compressor.wgate.weight")));
-            reads.push(Read::One(&c.ape, n("attn.compressor.ape")));
-            reads.push(Read::One(&c.norm, n("attn.compressor.norm.weight")));
-        }
+    if let Some(pool) = &at.pool
+        && let Some(c) = &pool.compressor
+    {
+        reads.push(Read::One(&c.wkv, n("attn.compressor.wkv.weight")));
+        reads.push(Read::One(&c.wgate, n("attn.compressor.wgate.weight")));
+        reads.push(Read::One(&c.ape, n("attn.compressor.ape")));
+        reads.push(Read::One(&c.norm, n("attn.compressor.norm.weight")));
     }
     if let Some(ix) = &at.indexer {
         reads.push(Read::One(&ix.wq_b, n("attn.indexer.wq_b.weight")));

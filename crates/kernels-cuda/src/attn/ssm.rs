@@ -335,7 +335,7 @@ pub fn gdn_prep(
     dtype_dispatch!(OP, ba.dtype, { Bf16 => () });
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` lands an f32 decay row");
-    if ba.width == 0 || ba.width % 2 != 0 {
+    if ba.width == 0 || !ba.width.is_multiple_of(2) {
         return Err(refuse(
             OP,
             format!(
@@ -388,6 +388,7 @@ struct DeltaStaged {
 }
 
 impl Delta {
+    #[allow(clippy::too_many_arguments)]
     fn of(
         op: &'static str,
         qkv: Tensor,
@@ -402,7 +403,7 @@ impl Delta {
         nonzero(op, "the value heads this statement states", v_heads)?;
         nonzero(op, "the key head width this statement states", k_dim)?;
         nonzero(op, "the value head width this statement states", v_dim)?;
-        if v_heads % k_heads != 0 {
+        if !v_heads.is_multiple_of(k_heads) {
             return Err(refuse(
                 op,
                 format!(
@@ -569,10 +570,10 @@ const FUSED_BV: u32 = 16;
 
 fn fused_fits(shape: &Delta, state: &RecurrentPool) -> bool {
     const VEC: u32 = 8;
-    shape.conv_dim % VEC == 0
-        && (shape.k_heads * shape.k_dim) % VEC == 0
-        && shape.v_dim % FUSED_BV == 0
-        && (shape.k_dim * shape.v_dim) % VEC == 0
+    shape.conv_dim.is_multiple_of(VEC)
+        && (shape.k_heads * shape.k_dim).is_multiple_of(VEC)
+        && shape.v_dim.is_multiple_of(FUSED_BV)
+        && (shape.k_dim * shape.v_dim).is_multiple_of(VEC)
         && state.slot_stride_elems % i64::from(VEC) == 0
         && shape.k_dim <= FUSED_BLOCK * VEC / FUSED_BV
 }
@@ -645,7 +646,7 @@ pub fn gated_delta_chunked(
     let lanes = requests(OP, qkv)?;
     let staged = shape.stage(ctx, OP, qkv.data, gates)?;
 
-    if k_dim <= BK_MAX_FLA && v_dim % BV_FLA == 0 {
+    if k_dim <= BK_MAX_FLA && v_dim.is_multiple_of(BV_FLA) {
         seated(OP, state, "ssm_gated_delta_chunked_batched_fla", true, true, true)?;
         return ctx.fire(
             OP,
@@ -835,6 +836,7 @@ impl Kda {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stage(
         self,
         ctx: &Ctx,

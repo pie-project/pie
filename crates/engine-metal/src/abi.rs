@@ -18,9 +18,7 @@ pub struct Arm {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pick {
     Only,
-    Rows {
-        at: u32,
-    },
+    Rows { at: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -56,7 +54,11 @@ impl SlotAbi {
 
     #[must_use]
     pub fn rewrites(&self) -> usize {
-        self.arms.iter().map(|arm| arm.laws.len()).max().unwrap_or(0)
+        self.arms
+            .iter()
+            .map(|arm| arm.laws.len())
+            .max()
+            .unwrap_or(0)
     }
 
     #[must_use]
@@ -480,13 +482,9 @@ fn fit_slot(
                 .iter()
                 .filter_map(|walk| {
                     let slot = &walk.slots[index];
-                    read(slot)[component].1.map(|v| {
-                        (
-                            walk.coords.clone(),
-                            i128::from(slot.window_rows),
-                            v,
-                        )
-                    })
+                    read(slot)[component]
+                        .1
+                        .map(|v| (walk.coords.clone(), i128::from(slot.window_rows), v))
                 })
                 .collect();
             if observed.len() != mine.len() {

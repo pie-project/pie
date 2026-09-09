@@ -1089,7 +1089,9 @@ impl Shell {
     #[must_use]
     pub fn adapted_word(&self, word: u64) -> Option<u64> {
         let bit = self.adapter_fact?;
-        self.compiled.classes.adapted_word(&self.corrected, bit, word)
+        self.compiled
+            .classes
+            .adapted_word(&self.corrected, bit, word)
     }
 
     #[must_use]
@@ -1206,7 +1208,9 @@ impl Shell {
             .map(|&(start, n)| {
                 let from = start as usize * width * 2;
                 raw[from..from + n as usize * width * 2]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]])))
                     .collect()
             })
@@ -1223,7 +1227,9 @@ impl Shell {
                     .map(|&(start, n)| {
                         let from = start as usize * width * 2;
                         raw[from..from + n as usize * width * 2]
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]])))
                             .collect()
                     })
@@ -1476,7 +1482,10 @@ impl Shell {
             }
             let unreachable = seated.adapter.is_some()
                 && !runs_correction
-                && !self.compiled.classes.correction_reaches(&self.corrected, lane.word);
+                && !self
+                    .compiled
+                    .classes
+                    .correction_reaches(&self.corrected, lane.word);
             if seated.adapter.is_some() != runs_correction && !unreachable {
                 return Err(Fault::AdapterWord {
                     lane: row.source,

@@ -3,7 +3,6 @@ use model_ir::{Operands, RowAxis, Trace, Ty, ValueId};
 use crate::compiled::{Phase, Region};
 use crate::error::Error;
 
-#[must_use]
 pub(crate) fn node_axis(
     trace: &Trace,
     at: u32,
@@ -40,10 +39,10 @@ pub(crate) fn axes_stated(trace: &Trace) -> Vec<RowAxis> {
             continue;
         };
         for dim in shape {
-            if let Some(axis) = dim.axis() {
-                if !axes.contains(&axis) {
-                    axes.push(axis);
-                }
+            if let Some(axis) = dim.axis()
+                && !axes.contains(&axis)
+            {
+                axes.push(axis);
             }
         }
     }
@@ -117,7 +116,7 @@ pub(crate) fn fold_refused(units: &[RowAxis]) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::budget::{Budget, Budgets, DeviceProfile, PatchLadder};
-    
+
     use crate::fixture::{Build, patch};
     use crate::{Error, compile, compile_axes};
     use model_ir::{Guard, RowAxis};
@@ -134,6 +133,7 @@ mod tests {
         })
     }
 
+    #[test]
     fn unit_every_case() {
         a_patch_row_against_no_patch_ceiling_is_refused_by_name();
         a_unit_that_resumes_after_another_is_refused_rather_than_recorded_twice();
@@ -141,7 +141,6 @@ mod tests {
         a_patch_column_is_reserved_at_the_patch_ceiling();
     }
 
-    #[test]
     fn a_patch_row_against_no_patch_ceiling_is_refused_by_name() {
         let mut b = Build::new();
         let pixels = b.input(8);

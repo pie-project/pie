@@ -214,7 +214,11 @@ pub fn moe_topk_sigmoid(
 
 pub fn rel_bias(x: &Value, w: &Weight, heads: u32, d_rel: u32, extent: u32) -> Value {
     let r = x.rec();
-    let y = r.fresh(tensor(x.rows(), u64::from(heads) * u64::from(extent), Dtype::F32));
+    let y = r.fresh(tensor(
+        x.rows(),
+        u64::from(heads) * u64::from(extent),
+        Dtype::F32,
+    ));
     r.push(
         Linear::RelBias {
             x: x.id(),
@@ -537,7 +541,13 @@ pub fn moe_sigmoid_gate_add(routed: &Value, shared: &Value, gate: &Value) -> Val
     y
 }
 
-pub fn lora_correct(x: &Value, bank_a: &Weight, bank_b: &Weight, routes: &Value, y: &Value) -> Value {
+pub fn lora_correct(
+    x: &Value,
+    bank_a: &Weight,
+    bank_b: &Weight,
+    routes: &Value,
+    y: &Value,
+) -> Value {
     let r = x.rec();
     let y_out = r.fresh(y.ty().clone());
     r.push(

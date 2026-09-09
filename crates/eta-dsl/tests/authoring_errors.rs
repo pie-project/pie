@@ -18,12 +18,12 @@ fn detail(error: &TraceError) -> &str {
     }
 }
 
+#[test]
 fn authoring_errors_every_case() {
     a_dtype_mismatch_is_reported_with_a_span();
     every_mistake_in_one_trace_is_reported_together();
 }
 
-#[test]
 fn a_dtype_mismatch_is_reported_with_a_span() {
     let rows = Channel::seeded([2, 3], dtype::u32);
     let keys = Channel::seeded([4], dtype::f32);

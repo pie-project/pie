@@ -26,13 +26,13 @@ fn rope_grid(
     nonzero(op, "the rotated width", rotary)?;
     nonzero(op, "the head width this rotation states", head_dim)?;
     nonzero(op, "rows", rows)?;
-    if rotary % 2 != 0 {
+    if !rotary.is_multiple_of(2) {
         return Err(refuse(
             op,
             format!("the rotated width {rotary} is not a whole number of pairs"),
         ));
     }
-    if width == 0 || width % head_dim != 0 {
+    if width == 0 || !width.is_multiple_of(head_dim) {
         return Err(refuse(
             op,
             format!("the {width}-wide row is not a whole number of {head_dim}-wide heads"),
@@ -42,7 +42,11 @@ fn rope_grid(
 }
 
 fn positions_stream(op: &'static str, positions: Tensor, x: Tensor) {
-    debug_assert_eq!(positions.dtype, Dtype::I32, "`{op}` reads an i32 position stream");
+    debug_assert_eq!(
+        positions.dtype,
+        Dtype::I32,
+        "`{op}` reads an i32 position stream"
+    );
     debug_assert_eq!(
         positions.rows, x.rows,
         "the position stream is one entry per rotated row"
@@ -125,8 +129,13 @@ fn rotate_tail(
                 y.original_max_position,
             )?;
             let rotated = stated(op, rotary)?;
-            let (low, high) =
-                ramp_bounds(rotated, theta, y.beta_fast, y.beta_slow, stated(op, max_position)?);
+            let (low, high) = ramp_bounds(
+                rotated,
+                theta,
+                y.beta_fast,
+                y.beta_slow,
+                stated(op, max_position)?,
+            );
             (y.factor, low, high)
         }
         None => (1.0, 0.0, 0.0),
@@ -328,7 +337,10 @@ pub fn yarn(
             original_max_position,
         )?,
     )?;
-    let width = stated(OP, nonzero(OP, "the head width this rotation states", head_dim)?)?;
+    let width = stated(
+        OP,
+        nonzero(OP, "the head width this rotation states", head_dim)?,
+    )?;
     let (low_dim, high_dim) = ramp_bounds(width, theta, beta_fast, beta_slow, max_position);
     let ramp = Ramp {
         factor,

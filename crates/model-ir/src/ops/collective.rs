@@ -5,18 +5,9 @@ use crate::value::ValueId;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Collective {
-    AllReduce {
-        buf: ValueId,
-        buf_out: ValueId,
-    },
-    AllGather {
-        x: ValueId,
-        y: ValueId,
-    },
-    ReduceScatter {
-        x: ValueId,
-        y: ValueId,
-    },
+    AllReduce { buf: ValueId, buf_out: ValueId },
+    AllGather { x: ValueId, y: ValueId },
+    ReduceScatter { x: ValueId, y: ValueId },
 }
 
 impl Operands for Collective {

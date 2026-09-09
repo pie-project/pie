@@ -4,10 +4,7 @@ use core::fmt;
 pub enum Elem {
     U(u8),
     I(u8),
-    E {
-        e: u8,
-        m: u8,
-    },
+    E { e: u8, m: u8 },
     F32,
     F16,
     Bf16,
@@ -23,7 +20,11 @@ impl Elem {
         match self {
             Self::U(b) | Self::I(b) => Some((b as u32, 1)),
             Self::E { e, m } => Some((
-                if m == 0 { e as u32 } else { 1 + e as u32 + m as u32 },
+                if m == 0 {
+                    e as u32
+                } else {
+                    1 + e as u32 + m as u32
+                },
                 1,
             )),
             Self::F32 => Some((32, 1)),
@@ -295,8 +296,12 @@ const fn elem_at(e: Elem, b: &[u8], i: usize) -> Option<usize> {
         Elem::Bool => is(b, i, j, b"bool"),
         Elem::Nf4 => is(b, i, j, b"nf4"),
         Elem::T3 => is(b, i, j, b"t3"),
-        Elem::U(w) => i < j && b[i] == b'u' && matches!(digits(b, i + 1, j), Some(n) if n == w as u64),
-        Elem::I(w) => i < j && b[i] == b'i' && matches!(digits(b, i + 1, j), Some(n) if n == w as u64),
+        Elem::U(w) => {
+            i < j && b[i] == b'u' && matches!(digits(b, i + 1, j), Some(n) if n == w as u64)
+        }
+        Elem::I(w) => {
+            i < j && b[i] == b'i' && matches!(digits(b, i + 1, j), Some(n) if n == w as u64)
+        }
         Elem::E { e, m } => 'e_token: {
             if i >= j || b[i] != b'e' {
                 break 'e_token false;
@@ -585,12 +590,12 @@ const _: () = assert!(spells(&GT_T3_F16_N, "gt_t3_f16_n"));
 mod tests {
     use super::*;
 
+    #[test]
     fn repr_every_case() {
         display_and_the_walker_agree_over_a_sweep();
         bpw_matches_the_published_tables();
     }
 
-    #[test]
     fn display_and_the_walker_agree_over_a_sweep() {
         const GAINS: &[Fmt<'static>] = &[
             Fmt::Elem(Elem::F16),

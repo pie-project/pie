@@ -43,7 +43,6 @@ impl TerminalCell {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CompletionTarget {
-
     pub wait_id: u64,
 
     pub target_epoch: u64,
@@ -361,7 +360,6 @@ impl CompletionBroker {
             let _ = self.inner.table.publish(wait_id, epoch);
         }
     }
-
 }
 
 #[derive(Clone)]
@@ -541,7 +539,6 @@ impl std::future::Future for SubmissionCompletion {
                 Poll::Ready(Err(anyhow!(message.clone())))
             }
             SubmissionCompletionKind::All(parts) => {
-
                 let mut first_error = None;
                 let mut pending = false;
                 for part in parts.iter() {
@@ -580,7 +577,6 @@ impl Drop for SubmissionCompletion {
         if !pending.state.closed.load(Ordering::Acquire) {
             pending.broker.table.free(pending.state.slot);
         }
-
     }
 }
 

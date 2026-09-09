@@ -18,15 +18,17 @@ fn snapshot(repo: &str, revision: &str) -> Option<Arc<Tokenizer>> {
         eprintln!("skipping: no tokenizer at {}", path.display());
         return None;
     }
-    Some(Arc::new(Tokenizer::from_file(&path).expect("the tokenizer loads")))
+    Some(Arc::new(
+        Tokenizer::from_file(&path).expect("the tokenizer loads"),
+    ))
 }
 
+#[test]
 fn the_new_templates_write_what_the_reference_renders_every_case() {
     inkling_writes_the_effort_line_the_user_turn_and_the_cue();
     atem_writes_the_user_turn_and_the_cue_after_the_opening();
 }
 
-#[test]
 fn inkling_writes_the_effort_line_the_user_turn_and_the_cue() {
     let Some(tokenizer) = snapshot("thinkingmachines/Inkling", "mini-l7-e8") else {
         return;
@@ -35,8 +37,8 @@ fn inkling_writes_the_effort_line_the_user_turn_and_the_cue() {
     let mut got = template.first_user(MESSAGE);
     got.extend(template.cue());
     let want: Vec<u32> = vec![
-        200002, 200004, 133850, 6942, 3211, 25, 220, 15, 13, 24, 200010, 200000, 200004, 4827,
-        382, 220, 1422, 4238, 220, 1860, 30, 200010, 200001,
+        200002, 200004, 133850, 6942, 3211, 25, 220, 15, 13, 24, 200010, 200000, 200004, 4827, 382,
+        220, 1422, 4238, 220, 1860, 30, 200010, 200001,
     ];
     assert_eq!(got, want);
     assert_eq!(template.seal(), vec![200006, 199999]);

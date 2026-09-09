@@ -58,10 +58,7 @@ pub enum At {
     Grid(u8),
     Block(u8),
     Shared,
-    Arg {
-        at: u16,
-        word: u16,
-    },
+    Arg { at: u16, word: u16 },
     Shape,
 }
 

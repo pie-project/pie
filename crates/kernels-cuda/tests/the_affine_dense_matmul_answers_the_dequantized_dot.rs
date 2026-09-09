@@ -88,12 +88,12 @@ fn check(bits: u32, n: usize, k: usize, rows: usize, seed: u64) {
     assert_eq!(bad, 0, "{bits}-bit: {bad} of {} outputs differ (worst relative error {worst:.4})", rows * n);
 }
 
+#[test]
 fn the_affine_dense_matmul_answers_the_dequantized_dot_every_case() {
     the_router_shape_at_eight_bits();
     a_projection_at_four_bits();
 }
 
-#[test]
 fn the_router_shape_at_eight_bits() {
     check(8, 128, 2816, 26, 0x61);
 }

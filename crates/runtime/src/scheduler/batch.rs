@@ -333,6 +333,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn batch_every_case() {
         every_member_owns_a_span_of_the_steps_lanes();
         a_multi_lane_member_arrives_lane_for_lane();
@@ -343,7 +344,6 @@ mod tests {
         a_frames_cells_are_one_per_member_and_never_shared();
     }
 
-    #[test]
     fn every_member_owns_a_span_of_the_steps_lanes() {
         let placeholder = FireRequest::default();
         let requests = vec![

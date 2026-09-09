@@ -105,6 +105,10 @@ impl Slabs {
         Slabs(NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
     }
 
+    /// # Safety
+    ///
+    /// `stream` must be a live CUDA stream that outlives every launch
+    /// this context is used for.
     pub unsafe fn attach(self, stream: *mut c_void) {
         #[cfg(feature = "cuda")]
         {
@@ -145,6 +149,9 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// # Safety
+    ///
+    /// `stream` must be a live CUDA stream that outlives this context.
     #[must_use]
     pub const unsafe fn on(stream: *mut c_void) -> Self {
         Self {
@@ -167,12 +174,18 @@ impl Ctx {
         self
     }
 
+    /// # Safety
+    ///
+    /// `handle` must be a live cuBLAS handle bound to this context's stream.
     #[must_use]
     pub const unsafe fn with_cublas(mut self, handle: *mut c_void) -> Self {
         self.cublas = handle;
         self
     }
 
+    /// # Safety
+    ///
+    /// `comm` must be a live communicator that outlives this context.
     #[must_use]
     pub const unsafe fn with_comm(mut self, comm: *mut c_void) -> Self {
         self.comm = comm;
@@ -376,6 +389,11 @@ fn said(root: &str, instantiation: &str, why: crate::jit::Fault) -> crate::jit::
     why
 }
 
+fn trace_fires() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PIE_CUDA_TRACE_FIRES").is_some_and(|v| v == "1"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,13 +404,13 @@ mod tests {
         unsafe { Ctx::on(core::ptr::null_mut()) }
     }
 
+    #[test]
     fn ctx_every_case() {
         an_unarmed_context_quantizes_nothing();
         the_full_fires_extent_rounds_up_to_the_bucket();
         disarming_puts_the_extent_back_the_way_the_fire_found_it();
     }
 
-    #[test]
     fn an_unarmed_context_quantizes_nothing() {
         let ctx = bare();
         for rows in [0, 1, 3, 9, 4096] {
@@ -433,7 +451,3 @@ mod tests {
 
 }
 
-fn trace_fires() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_CUDA_TRACE_FIRES").is_some_and(|v| v == "1"))
-}

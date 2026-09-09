@@ -82,7 +82,6 @@ mod dtype_tests {
         assert_eq!(to_wire(Dtype::Bool), Some(3));
         assert_eq!(WIRE_ORDER.len(), 4);
     }
-
 }
 
 pub const fn from_wire(byte: u8) -> Option<Dtype> {

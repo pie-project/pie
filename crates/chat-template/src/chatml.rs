@@ -167,10 +167,7 @@ impl Instruct for ChatMLInstruct {
     }
 
     fn assistant(&self, msg: &str) -> Vec<u32> {
-        self.turn(
-            &self.assistant_prefix,
-            Self::replay_body(&self.config, msg),
-        )
+        self.turn(&self.assistant_prefix, Self::replay_body(&self.config, msg))
     }
 
     fn cue(&self) -> Vec<u32> {
@@ -307,13 +304,13 @@ mod tests {
         }
     }
 
+    #[test]
     fn chatml_every_case() {
         a_stripping_model_replays_the_answer_without_its_reasoning();
         a_preserving_model_replays_the_turn_whole();
         a_non_thinking_model_replays_verbatim();
     }
 
-    #[test]
     fn a_stripping_model_replays_the_answer_without_its_reasoning() {
         assert_eq!(
             ChatMLInstruct::replay_body(&config(true, false), TURN),
@@ -326,7 +323,9 @@ mod tests {
     }
 
     fn a_non_thinking_model_replays_verbatim() {
-        assert_eq!(ChatMLInstruct::replay_body(&config(false, false), TURN), TURN);
+        assert_eq!(
+            ChatMLInstruct::replay_body(&config(false, false), TURN),
+            TURN
+        );
     }
-
 }

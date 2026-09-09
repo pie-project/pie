@@ -102,7 +102,9 @@ impl Handles {
             unsafe {
                 let base = binding.slab().contents().as_ptr().cast::<u8>();
                 std::ptr::copy_nonoverlapping(
-                    base.add(usize::try_from(binding.offset()).expect("an offset inside a live mapping")),
+                    base.add(
+                        usize::try_from(binding.offset()).expect("an offset inside a live mapping"),
+                    ),
                     out.as_mut_ptr(),
                     out.len(),
                 );

@@ -226,7 +226,7 @@ impl Pcm {
                  {rate} Hz x{channels}"
             ));
         }
-        if samples.len() % channels as usize != 0 {
+        if !samples.len().is_multiple_of(channels as usize) {
             return Err(format!(
                 "pcm.from-f32: {} samples do not divide into {channels} channels",
                 samples.len()
@@ -308,8 +308,10 @@ impl pie::inferlet::frames::HostFrames for ProcessCtx {
             )));
         }
         let values: Vec<f32> = cell
-            .chunks_exact(4)
-            .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
             .collect();
         match Frames::from_pixels(&values, width, height, count, fps) {
             Ok(f) => Ok(Ok(self.ctx().table.push(f)?)),

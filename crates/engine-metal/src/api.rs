@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use checkpoint::contract::ModelContract;
 use engine::Engine;
@@ -157,26 +157,20 @@ fn fault(fault: Fault) -> Error {
             "this fire wants {need} {what} and the load reserved {have}"
         )),
         Fault::Fragmented { .. } => Error::Device(fault.to_string()),
-        Fault::Unaffine { .. } | Fault::Unstructured { .. } => {
-            Error::Load(fault.to_string())
-        }
+        Fault::Unaffine { .. } | Fault::Unstructured { .. } => Error::Load(fault.to_string()),
         Fault::Straddled { .. } => Error::Load(fault.to_string()),
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
         | Fault::MaskWord { .. }
         | Fault::Positions { .. } => Error::Invalid(fault.to_string()),
-        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => {
-            Error::Invalid(fault.to_string())
-        }
+        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
             wanted: 1,
             available: 0,
         },
-        Fault::Scoreless { .. } | Fault::ScoreWord { .. } => {
-            Error::Invalid(fault.to_string())
-        }
+        Fault::Scoreless { .. } | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
@@ -242,10 +236,7 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
 }
 
 #[must_use]
-pub fn voxel_ladder(
-    trace: &Trace,
-    budgets: &LoadBudgets,
-) -> Option<model_compiler::VoxelLadder> {
+pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<model_compiler::VoxelLadder> {
     const DERIVED_VOXEL_CEILING: u32 = 65_536;
 
     let declares_voxels = trace.values.iter().any(|decl| {
@@ -276,8 +267,10 @@ fn patch_bytes(
             .flat_map(|&v| bf16_bits(v).to_le_bytes())
             .collect()),
         model_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
-        _ => Err("a media submission against a plan whose activation element is neither \
-                  `bf16` nor `f32`, which is the pair every tower in this catalog computes in"),
+        _ => Err(
+            "a media submission against a plan whose activation element is neither \
+                  `bf16` nor `f32`, which is the pair every tower in this catalog computes in",
+        ),
     }
 }
 
@@ -291,8 +284,10 @@ fn voxel_bytes(
             .flat_map(|&v| bf16_bits(v).to_le_bytes())
             .collect()),
         model_ir::Dtype::F32 => Ok(payload.iter().flat_map(|&v| v.to_le_bytes()).collect()),
-        _ => Err("a voxel submission against a plan whose voxel element is neither `bf16` \
-                  nor `f32`, which is the pair every VAE in this catalog computes in"),
+        _ => Err(
+            "a voxel submission against a plan whose voxel element is neither `bf16` \
+                  nor `f32`, which is the pair every VAE in this catalog computes in",
+        ),
     }
 }
 
@@ -429,7 +424,6 @@ impl Engine for Metal {
                     .into(),
             ));
         };
-        let path = PathBuf::from(path);
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
         let planes = crate::weights::attachments(&trace, &contract, &path).map_err(fault)?;
@@ -447,14 +441,13 @@ impl Engine for Metal {
         {
             let working_set = crate::device::Context::bind().map_err(fault)?.working_set();
             let util = self.boot.gpu_mem_utilization;
-            let paging =
-                crate::store::kv::Paging::of(
-                    budgets.page_size,
-                    budgets.max_context,
-                    budgets.slots,
-                    u64::from(budgets.pages),
-                )
-                    .map_err(|error| fault(Fault::from(error)))?;
+            let paging = crate::store::kv::Paging::of(
+                budgets.page_size,
+                budgets.max_context,
+                budgets.slots,
+                u64::from(budgets.pages),
+            )
+            .map_err(|error| fault(Fault::from(error)))?;
             let kv_pool = crate::store::pool_demand(&trace, paging).map_err(fault)?;
 
             let acct = crate::store::accounting::Accounting::of(
@@ -566,7 +559,9 @@ impl Engine for Metal {
                 max_context: paging.context(),
             },
             profile,
-            ports: PortMask::DEVICE_GEOMETRY.with(Port::AttnMask).with(Port::RsFoldLen),
+            ports: PortMask::DEVICE_GEOMETRY
+                .with(Port::AttnMask)
+                .with(Port::RsFoldLen),
             geometry: GeometryClass::DeviceGeometry,
             kv_copy: KvCopyDomains {
                 device_to_device: true,
@@ -849,8 +844,7 @@ impl Engine for Metal {
             });
         }
         let page_size = self.loaded_mut()?.paging().page_size;
-        let moves =
-            crate::store::Move::plan(copy, page_size).map_err(Error::Invalid)?;
+        let moves = crate::store::Move::plan(copy, page_size).map_err(Error::Invalid)?;
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
     }
 
@@ -871,7 +865,6 @@ impl Engine for Metal {
             .collect();
         self.loaded_mut()?.copy_state(&moves).map_err(fault)
     }
-
 }
 
 impl Metal {
@@ -901,12 +894,12 @@ impl Metal {
             };
             staged.reserve(submission.media.len());
             for row in &submission.media {
-                staged.push(
-                    patch_bytes(&row.patches, element).map_err(|why| Error::Unsupported {
+                staged.push(patch_bytes(&row.patches, element).map_err(|why| {
+                    Error::Unsupported {
                         verb: why,
                         engine: "metal",
-                    })?,
-                );
+                    }
+                })?);
             }
         }
         let mut voxel_payloads: Vec<Vec<u8>> = Vec::with_capacity(submission.voxels.len());
@@ -922,12 +915,12 @@ impl Metal {
             .voxel_element()
             .unwrap_or(model_ir::Dtype::Bf16);
         for row in &submission.voxels {
-            voxel_payloads.push(
-                voxel_bytes(&row.payload, voxel_element).map_err(|why| Error::Unsupported {
+            voxel_payloads.push(voxel_bytes(&row.payload, voxel_element).map_err(|why| {
+                Error::Unsupported {
                     verb: why,
                     engine: "metal",
-                })?,
-            );
+                }
+            })?);
         }
         let clips: Vec<crate::serve::Clips<'_>> = submission
             .voxels

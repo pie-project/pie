@@ -129,6 +129,7 @@ fn axis_of(compiled: &CompiledModel, region: usize) -> RowAxis {
     compiled.units[compiled.unit_of(region) as usize]
 }
 
+#[test]
 fn a_tower_region_reads_the_patch_window_every_case() {
     each_region_is_cut_at_its_own_axis_s_window();
     a_fire_with_no_image_gets_the_token_windows_it_always_had();
@@ -136,7 +137,6 @@ fn a_tower_region_reads_the_patch_window_every_case() {
     the_table_a_device_reads_carries_both_seriations();
 }
 
-#[test]
 fn each_region_is_cut_at_its_own_axis_s_window() {
     let (trace, compiled) = baked();
     let budgets = budgets();
@@ -261,7 +261,10 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
             assert_eq!(a.span, b.span, "region {at}'s token window moved");
             assert_eq!(a.indptr_host, b.indptr_host);
         }
-        assert_eq!(a.patch.rows, 0, "region {at} found patch rows in a text fire");
+        assert_eq!(
+            a.patch.rows, 0,
+            "region {at} found patch rows in a text fire"
+        );
     }
     assert_eq!(plain.patch_rows(), 0);
     assert_eq!(mixed.patch_rows(), 128);

@@ -5,6 +5,7 @@ use crate::error::{Fault, Result};
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[must_use]
+#[allow(clippy::unnecessary_fallible_conversions, clippy::useless_conversion)]
 pub fn free_bytes(at: &std::path::Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(at.as_os_str().as_bytes()).ok()?;
@@ -66,10 +67,7 @@ impl HostSource {
             });
         }
         let at = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "pie-experts-{}-{at}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("pie-experts-{}-{at}", std::process::id()));
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -196,12 +194,12 @@ impl Drop for HostSource {
 mod tests {
     use super::*;
 
+    #[test]
     fn host_source_every_case() {
         a_staging_larger_than_the_volume_is_refused_by_the_numbers();
         a_source_that_streams_nothing_maps_nothing();
     }
 
-    #[test]
     fn a_staging_larger_than_the_volume_is_refused_by_the_numbers() {
         let Some(free) = free_bytes(&std::env::temp_dir()) else {
             eprintln!("skipping: this filesystem does not answer statvfs");

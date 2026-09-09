@@ -20,7 +20,10 @@ pub fn nan_check(
         F16 => "nan_check_float16",
     });
     if flags.dtype != Dtype::U32 {
-        return Err(refuse(OP, format!("the flag plane is {:?}, not u32", flags.dtype)));
+        return Err(refuse(
+            OP,
+            format!("the flag plane is {:?}, not u32", flags.dtype),
+        ));
     }
     if slot >= flags.rows.max(flags.rows.saturating_mul(flags.width)) {
         return Err(refuse(

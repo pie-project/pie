@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use checkpoint::contract::materialize::materialize_contract;
 use checkpoint::file::read::parse_metadata;
-use checkpoint::file::write::{write_zt, write_zt_grouped, WriteTensor};
+use checkpoint::file::write::{WriteTensor, write_zt, write_zt_grouped};
 use checkpoint::file::zt;
 use checkpoint::serving::plane_name;
 
@@ -48,8 +48,8 @@ fn planes(codes: &TensorDecl, seed: u8) -> (Vec<String>, Vec<(TensorDecl, Vec<u8
     let Encoding::Quant(spec) = &codes.encoding else {
         panic!("{} is not quantized", codes.name);
     };
-    let term = ztensor::Term::parse(spec.term().expect("a scheme with a term").mangle().as_str())
-        .unwrap();
+    let term =
+        ztensor::Term::parse(spec.term().expect("a scheme with a term").mangle().as_str()).unwrap();
     let shape: Vec<u64> = codes.shape.iter().map(|&d| d as u64).collect();
     let mut out = Vec::new();
     for (at, plane) in term.planes(&shape).unwrap().into_iter().enumerate() {
@@ -68,21 +68,34 @@ fn planes(codes: &TensorDecl, seed: u8) -> (Vec<String>, Vec<(TensorDecl, Vec<u8
                 decl(&name, shape, Encoding::Raw(leaf))
             }
         };
-        out.push((decl, pattern(plane.len as usize, seed.wrapping_add(at as u8))));
+        out.push((
+            decl,
+            pattern(plane.len as usize, seed.wrapping_add(at as u8)),
+        ));
     }
     let names = out.iter().map(|(decl, _)| decl.name.clone()).collect();
     (names, out)
 }
 
-fn write_grouped(path: &Path, object: &str, planes: &[(TensorDecl, Vec<u8>)]) -> Result<(), checkpoint::error::Error> {
+fn write_grouped(
+    path: &Path,
+    object: &str,
+    planes: &[(TensorDecl, Vec<u8>)],
+) -> Result<(), checkpoint::error::Error> {
     let tensors: Vec<WriteTensor<'_>> = planes
         .iter()
         .map(|(decl, bytes)| WriteTensor { decl, bytes })
         .collect();
     let names = planes.iter().map(|(decl, _)| decl.name.clone()).collect();
-    write_zt_grouped(path, &BTreeMap::new(), &tensors, &[(object.to_string(), names)])
+    write_zt_grouped(
+        path,
+        &BTreeMap::new(),
+        &tensors,
+        &[(object.to_string(), names)],
+    )
 }
 
+#[test]
 fn ztensor_convert_every_case() {
     a_converted_artifact_reads_back_byte_for_byte();
     a_corrupt_artifact_is_caught_by_its_digest();
@@ -93,7 +106,6 @@ fn ztensor_convert_every_case() {
     a_plain_tensor_carries_its_own_leaf();
 }
 
-#[test]
 fn a_converted_artifact_reads_back_byte_for_byte() {
     let dir = tmpdir("artifact");
     let path = dir.join("model.zt");
@@ -199,9 +211,24 @@ fn each_affine_group_scheme_round_trips_as_itself() {
     for (scheme, group, bits, back) in [
         (QuantScheme::AwqInt4, 128u32, 4u8, Back::NoType),
         (QuantScheme::GptqInt4, 128, 4, Back::NoType),
-        (QuantScheme::MlxAffineU4, 64, 4, Back::Scheme(QuantScheme::MlxAffineU4)),
-        (QuantScheme::Int4B8, 32, 4, Back::Scheme(QuantScheme::Int4B8)),
-        (QuantScheme::Int8Symmetric, 0, 8, Back::Scheme(QuantScheme::Int8Symmetric)),
+        (
+            QuantScheme::MlxAffineU4,
+            64,
+            4,
+            Back::Scheme(QuantScheme::MlxAffineU4),
+        ),
+        (
+            QuantScheme::Int4B8,
+            32,
+            4,
+            Back::Scheme(QuantScheme::Int4B8),
+        ),
+        (
+            QuantScheme::Int8Symmetric,
+            0,
+            8,
+            Back::Scheme(QuantScheme::Int8Symmetric),
+        ),
         (QuantScheme::Int8Asymmetric, 0, 8, Back::NoType),
     ] {
         let path = dir.join(format!("{scheme:?}.zt"));
@@ -231,7 +258,11 @@ fn each_affine_group_scheme_round_trips_as_itself() {
             .unwrap_or_else(|err| panic!("{scheme:?} could not be written: {err}"));
         let manifest = ztensor::read::manifest_of(&path).unwrap().unwrap();
         assert_eq!(
-            manifest.objects["w"].term.as_ref().map(ToString::to_string).as_deref(),
+            manifest.objects["w"]
+                .term
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
             Some(spec.term().unwrap().mangle().as_str()),
             "{scheme:?}: the file states another type"
         );
@@ -252,7 +283,12 @@ fn each_affine_group_scheme_round_trips_as_itself() {
             other => panic!("{scheme:?} read back as {other:?}"),
         }
         for (decl, bytes) in &planes {
-            assert_eq!(&bytes_at(&metadata, &decl.name), bytes, "{scheme:?}: {}", decl.name);
+            assert_eq!(
+                &bytes_at(&metadata, &decl.name),
+                bytes,
+                "{scheme:?}: {}",
+                decl.name
+            );
         }
     }
     std::fs::remove_dir_all(&dir).ok();
@@ -275,11 +311,21 @@ fn the_artifact_names_parameters_not_schemes() {
     let manifest = ztensor::read::manifest_of(&path).unwrap().unwrap();
     let object = &manifest.objects["w"];
     assert_eq!(object.layout, None, "the planes lie canonically");
-    assert_eq!(object.attributes, None, "nothing beside the type describes them");
-    let stated = object.term.as_ref().expect("the type is recorded").to_string();
+    assert_eq!(
+        object.attributes, None,
+        "nothing beside the type describes them"
+    );
+    let stated = object
+        .term
+        .as_ref()
+        .expect("the type is recorded")
+        .to_string();
     assert_eq!(stated, spec.term().unwrap().mangle().as_str());
     for parameter in ["g128", "u4", "bf16"] {
-        assert!(stated.contains(parameter), "{stated} does not state {parameter}");
+        assert!(
+            stated.contains(parameter),
+            "{stated} does not state {parameter}"
+        );
     }
     let rendered = format!("{manifest:?}").to_ascii_lowercase();
     assert!(
@@ -344,15 +390,19 @@ fn convert(source_dir: &std::path::Path, metadata: &checkpoint::file::Metadata, 
             tile_map_mask: CONVERT_TILE_MAP_MASK,
             ..StorageTarget::default()
         };
-        let plan =
-            checkpoint::plan::compile(metadata, &materialization.contract, target).unwrap();
+        let plan = checkpoint::plan::compile(metadata, &materialization.contract, target).unwrap();
         let storage = checkpoint::executor::Execution::new(&plan, source_dir)
             .run()
             .unwrap();
         plan.tensors
             .iter()
             .filter(|decl| decl.visibility.is_public())
-            .map(|decl| (decl.name.clone(), (decl.clone(), storage.tensors[&decl.name].clone())))
+            .map(|decl| {
+                (
+                    decl.name.clone(),
+                    (decl.clone(), storage.tensors[&decl.name].clone()),
+                )
+            })
             .collect::<BTreeMap<_, _>>()
     };
 
@@ -464,19 +514,22 @@ fn a_gguf_block_reaches_the_artifact_as_stored_and_says_what_it_means() {
     .term()
     .expect("Q4_K has a term");
     assert_eq!(q4_k.mangle().as_str(), "g32_u4_g8_u6_f16_n_b_g8_u6_f16_n");
-    assert_eq!(type_of(&reader, "block.q4_k").as_deref(), Some(q4_k.mangle().as_str()));
+    assert_eq!(
+        type_of(&reader, "block.q4_k").as_deref(),
+        Some(q4_k.mangle().as_str())
+    );
 
     assert_eq!(type_of(&reader, "plain.bf16").as_deref(), Some("bf16"));
     assert_eq!(type_of(&reader, "plain.f32").as_deref(), Some("bf16"));
 
     assert_eq!(
         QuantSpec {
-                scheme: QuantScheme::GgufIq2Xxs,
-                logical_dtype: DType::Bf16,
-                bits_per_element: 0,
-                group_size: 0,
-                channel_axis: None,
-            }
+            scheme: QuantScheme::GgufIq2Xxs,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 0,
+            group_size: 0,
+            channel_axis: None,
+        }
         .term(),
         None,
         "the bridge would have to name a lattice to stamp one"
@@ -570,7 +623,8 @@ fn every_scheme_the_bridge_names_is_stamped_and_every_one_it_refuses_is_not() {
             expected,
             "{scheme:?}: the file disagrees with the bridge"
         );
-        zt::parse(&path).unwrap_or_else(|err| panic!("{scheme:?} was typed into unreadability: {err}"));
+        zt::parse(&path)
+            .unwrap_or_else(|err| panic!("{scheme:?} was typed into unreadability: {err}"));
     }
     std::fs::remove_dir_all(&dir).ok();
 }

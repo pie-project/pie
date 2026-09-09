@@ -33,18 +33,29 @@ pub fn block_dyn_conv(
     if x.indptr.dtype != Dtype::I32 {
         return Err(refuse(
             OP,
-            format!("the request CSR's boundaries are {:?}, and this walk reads an i32 indptr", x.indptr.dtype),
+            format!(
+                "the request CSR's boundaries are {:?}, and this walk reads an i32 indptr",
+                x.indptr.dtype
+            ),
         ));
     }
     let lanes = match x.indptr.rows.checked_sub(1) {
         Some(lanes) if lanes > 0 => lanes,
-        _ => return Err(refuse(OP, "the request CSR this fire names spans no request")),
+        _ => {
+            return Err(refuse(
+                OP,
+                "the request CSR this fire names spans no request",
+            ));
+        }
     };
     let channels = nonzero(OP, "the convolution's channel count", x.data.width)?;
     let taps_n = nonzero(OP, "the tap count this statement states", taps)?;
     let group_n = nonzero(OP, "the channels sharing one correction", group)?;
     if side > 1 {
-        return Err(refuse(OP, format!("side {side} is stated, and the projection carries two")));
+        return Err(refuse(
+            OP,
+            format!("side {side} is stated, and the projection carries two"),
+        ));
     }
     if channels % group_n != 0 {
         return Err(refuse(
@@ -70,7 +81,9 @@ pub fn block_dyn_conv(
             format!(
                 "the base kernel is [{}, {}], and two sides of {taps_n} taps over {channels} channels \
                  are [{}, {channels}]",
-                base.rows, base.width, 2 * taps_n
+                base.rows,
+                base.width,
+                2 * taps_n
             ),
         ));
     }
@@ -79,10 +92,7 @@ pub fn block_dyn_conv(
         "the convolution lands the rows it convolves"
     );
     ctx.fire(
-        Fire::at(FILE, entry).apply(Grid::of(
-            [channels, lanes, 1],
-            [channels.min(GROUP), 1, 1],
-        )),
+        Fire::at(FILE, entry).apply(Grid::of([channels, lanes, 1], [channels.min(GROUP), 1, 1])),
         &[
             x.data.arg(),
             x.indptr.arg(),

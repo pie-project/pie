@@ -267,12 +267,12 @@ pub async fn run(config: Config) -> Result<ControllerHandle> {
 mod tests {
     use super::*;
 
+    #[test]
     fn lib_every_case() {
         parse_empty_is_default();
         parse_overrides_fields();
     }
 
-    #[test]
     fn parse_empty_is_default() {
         let cfg = Config::parse("").expect("empty config parses to defaults");
         let d = Config::default();
@@ -297,5 +297,4 @@ mod tests {
         assert_eq!(cfg.tick_interval, Duration::from_secs(3));
         assert_eq!(cfg.command_buffer, 64);
     }
-
 }

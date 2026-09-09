@@ -335,7 +335,6 @@ impl WakerTable {
             swept: self.metrics.swept.load(Ordering::Relaxed),
         }
     }
-
 }
 
 impl Default for WakerTable {

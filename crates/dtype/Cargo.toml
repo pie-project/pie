@@ -13,15 +13,11 @@ name = "dtype"
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
-# A feature for one consumer: `eta-ir`, which a wasm guest imports and which
-# takes this crate with `default-features = false`. On by default for everyone else.
 [features]
 default = ["serde"]
 serde = ["dep:serde"]
 
 [dependencies]
-# `default-features = false` + `alloc` keeps the `no_std` promise in the lib.rs
-# header true even when the feature is on.
 serde = { version = "1.0", default-features = false, features = [
     "alloc",
 ], optional = true }

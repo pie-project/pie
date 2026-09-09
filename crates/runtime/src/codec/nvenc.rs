@@ -815,13 +815,13 @@ pub fn encode_h264(
 mod tests {
     use super::*;
 
+    #[test]
     fn nvenc_every_case() {
         the_struct_layouts_match_the_header();
         the_version_words_are_the_headers_macros();
         reordering_is_off_after_configuring();
     }
 
-    #[test]
     fn the_struct_layouts_match_the_header() {
         assert_eq!(size_of::<Guid>(), 16);
         assert_eq!(size_of::<RcParams>(), 128);

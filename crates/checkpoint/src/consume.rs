@@ -128,11 +128,7 @@ impl SourceLedger {
             let Some(metadata_source) = transform.metadata_source else {
                 continue;
             };
-            let Some(decl) = plan
-                .sources
-                .iter()
-                .find(|decl| decl.id == metadata_source)
-            else {
+            let Some(decl) = plan.sources.iter().find(|decl| decl.id == metadata_source) else {
                 continue;
             };
             let Some(path) = paths.get(&decl.file_id.0) else {

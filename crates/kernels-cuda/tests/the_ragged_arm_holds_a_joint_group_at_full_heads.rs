@@ -79,13 +79,13 @@ fn against_dense(rows: u32, hd: u32, heads: u32, seed: u64) {
     );
 }
 
+#[test]
 fn the_ragged_arm_holds_a_joint_group_at_full_heads_every_case() {
     a_512_plus_4096_row_group_at_24_full_heads();
     a_512_plus_1024_row_group_at_24_full_heads();
     a_512_plus_2500_row_group_at_24_full_heads();
 }
 
-#[test]
 fn a_512_plus_4096_row_group_at_24_full_heads() {
     against_dense(512 + 4096, 128, 24, 0x4608);
 }

@@ -76,29 +76,30 @@ pub fn conv3d(
             ),
         ));
     }
-    if let Some(bias) = bias {
-        if bias.dtype != Dtype::F32 || u64::from(bias.rows) * u64::from(bias.width) < u64::from(c_out) {
-            return Err(refuse(
-                OP,
-                format!(
-                    "the bias is {} x {} {:?}, and this convolution adds one f32 per \
+    if let Some(bias) = bias
+        && (bias.dtype != Dtype::F32
+            || u64::from(bias.rows) * u64::from(bias.width) < u64::from(c_out))
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the bias is {} x {} {:?}, and this convolution adds one f32 per \
                      output channel of {c_out}",
-                    bias.rows, bias.width, bias.dtype
-                ),
-            ));
-        }
+                bias.rows, bias.width, bias.dtype
+            ),
+        ));
     }
-    if let Some(cache) = cache {
-        if cache.dtype != Dtype::Bf16 || cache.width != c_in {
-            return Err(refuse(
-                OP,
-                format!(
-                    "the frame cache is {} x {} {:?}, and this convolution reads {c_in} \
+    if let Some(cache) = cache
+        && (cache.dtype != Dtype::Bf16 || cache.width != c_in)
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the frame cache is {} x {} {:?}, and this convolution reads {c_in} \
                      bf16 channels a row",
-                    cache.rows, cache.width, cache.dtype
-                ),
-            ));
-        }
+                cache.rows, cache.width, cache.dtype
+            ),
+        ));
     }
     let rows_out = y.rows;
     if rows_out == 0 {
@@ -106,7 +107,10 @@ pub fn conv3d(
     }
     let columns = c_out.div_ceil(SIMDS);
     let lanes = columns.checked_mul(THREADS).ok_or_else(|| {
-        refuse(OP, format!("the grid will not launch: {c_out} output channels"))
+        refuse(
+            OP,
+            format!("the grid will not launch: {c_out} output channels"),
+        )
     })?;
     let entry = "spatial_conv3d_bfloat16";
     ctx.fire(

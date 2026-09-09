@@ -184,7 +184,7 @@ pub fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use crate::probe::Probe;
 
     const KV_MAX: u32 = 2048;
@@ -252,6 +252,7 @@ mod tests {
         )
     }
 
+    #[test]
     fn score_every_case() {
         the_head_lands_on_the_tightest_stamp_that_holds_it();
         a_sliding_window_is_refused_as_a_different_quantity();
@@ -262,7 +263,6 @@ mod tests {
         an_element_this_plane_has_no_point_for_is_refused_by_dtype();
     }
 
-    #[test]
     fn the_head_lands_on_the_tightest_stamp_that_holds_it() {
         assert_eq!(stamp_for(40), Some(0));
         assert_eq!(stamp_for(64), Some(0));
@@ -283,7 +283,10 @@ mod tests {
         let said = format!("{why}");
         assert!(said.contains("sliding window"), "{said}");
         assert!(said.contains("distribution over the window"), "{said}");
-        assert!(probe.fires().is_empty(), "a refused capture launched anyway");
+        assert!(
+            probe.fires().is_empty(),
+            "a refused capture launched anyway"
+        );
     }
 
     fn a_quantized_key_plane_is_refused_by_name() {
@@ -292,14 +295,16 @@ mod tests {
             .expect_err("a quantized pool has no scores to give");
         let said = format!("{why}");
         assert!(said.contains("dequantizes nothing"), "{said}");
-        assert!(probe.fires().is_empty(), "a refused capture launched anyway");
+        assert!(
+            probe.fires().is_empty(),
+            "a refused capture launched anyway"
+        );
     }
 
     fn a_slab_that_is_not_the_ceiling_is_refused_by_name() {
         let probe = Probe::default();
         let narrow = Tensor::new(4, 4 * 96, KV_MAX / 2, Dtype::F32);
-        let why = fire(&probe, None, Dtype::Bf16, narrow)
-            .expect_err("the row IS the ceiling");
+        let why = fire(&probe, None, Dtype::Bf16, narrow).expect_err("the row IS the ceiling");
         assert!(format!("{why}").contains("the row IS the ceiling"), "{why}");
 
         let bf16_slab = Tensor::new(4, 4 * 96, KV_MAX, Dtype::Bf16);

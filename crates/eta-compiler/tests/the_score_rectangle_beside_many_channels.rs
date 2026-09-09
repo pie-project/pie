@@ -1,7 +1,5 @@
 use eta_compiler::codegen::error::{EmitError, EmitterKind};
-use eta_compiler::codegen::metal::{
-    METAL_M2_MAX_FUSED_CHANNELS, emit_fused_region,
-};
+use eta_compiler::codegen::metal::{METAL_M2_MAX_FUSED_CHANNELS, emit_fused_region};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};

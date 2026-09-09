@@ -80,7 +80,7 @@ impl Staging {
         let len = values.len() * 4;
         self.check(offset + len, len, what)?;
         for (slot, value) in self.bytes[offset..offset + len]
-            .chunks_exact_mut(4)
+            .as_chunks_mut::<4>().0.iter_mut()
             .zip(values)
         {
             slot.copy_from_slice(&value.to_le_bytes());

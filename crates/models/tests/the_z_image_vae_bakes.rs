@@ -28,6 +28,7 @@ fn reading<'a>(facts: &'a models::Generative, name: &str) -> &'a models::Reading
         .unwrap_or_else(|| panic!("no reading `{name}`"))
 }
 
+#[test]
 fn the_z_image_vae_bakes_every_case() {
     the_flagship_declares_the_two_vae_readings_and_the_miniature_neither();
     the_trace_reads_two_voxel_ports_and_plants_pixels_twice();
@@ -37,7 +38,6 @@ fn the_z_image_vae_bakes_every_case() {
     the_import_reads_every_vae_tensor_of_the_real_snapshot_once();
 }
 
-#[test]
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     let facts = row(TURBO).generative.as_ref().expect("facts");
     let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
@@ -234,10 +234,11 @@ fn the_shapes_are_the_flux_vaes() {
                     silu_off += 1;
                 }
             }
-            Spatial::Grid { rule, .. } => {
-                if let GridRule::Conv { pad, pad_back, .. } = rule {
-                    assert!(pad == pad_back || *pad_back == [0, 1, 1]);
-                }
+            Spatial::Grid {
+                rule: GridRule::Conv { pad, pad_back, .. },
+                ..
+            } => {
+                assert!(pad == pad_back || *pad_back == [0, 1, 1]);
             }
             _ => {}
         }

@@ -18,7 +18,6 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-os.environ.setdefault("PIE_CUDA_KV_ENVELOPES", "1")
 
 import test_curated as tc  # noqa: E402
 from conftest import run_inferlet  # noqa: E402

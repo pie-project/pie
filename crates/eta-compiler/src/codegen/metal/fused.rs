@@ -493,7 +493,13 @@ pub(super) fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o
     source.push_str("  }\n");
 }
 
-pub(super) fn emit_pixels_gather(source: &mut String, base: u32, o0: &str, begin: &str, step: &str) {
+pub(super) fn emit_pixels_gather(
+    source: &mut String,
+    base: u32,
+    o0: &str,
+    begin: &str,
+    step: &str,
+) {
     source.push_str("  {\n");
     let _ = writeln!(source, "    const uint pixel_begin = {begin};");
     let _ = writeln!(source, "    const uint pixel_step = {step};");

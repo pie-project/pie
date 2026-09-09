@@ -976,12 +976,12 @@ fn copy_chunk(
 mod tests {
     use super::*;
 
+    #[test]
     fn hdf5_every_case() {
         datatype_parsing();
         unshuffle_roundtrip();
     }
 
-    #[test]
     fn datatype_parsing() {
         let f32_msg = [0x11, 0x20, 0, 0, 4, 0, 0, 0];
         assert_eq!(parse_datatype(&f32_msg, 0).unwrap(), Some(Leaf::F32));

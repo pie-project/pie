@@ -63,7 +63,10 @@ impl Model {
                         gate_up,
                         Expr::concat(
                             0,
-                            vec![w13.clone().stride(0, 0, inter, 2), w13.stride(0, 1, inter, 2)],
+                            vec![
+                                w13.clone().stride(0, 0, inter, 2),
+                                w13.stride(0, 1, inter, 2),
+                            ],
                         ),
                     )?;
                     b.read(down, n("mlp.w2_md.weight"))?;
@@ -86,7 +89,10 @@ impl Model {
                         let w13 = Expr::src(name);
                         Expr::concat(
                             1,
-                            vec![w13.clone().stride(1, 0, inter, 2), w13.stride(1, 1, inter, 2)],
+                            vec![
+                                w13.clone().stride(1, 0, inter, 2),
+                                w13.stride(1, 1, inter, 2),
+                            ],
                         )
                     };
                     b.read_expr(

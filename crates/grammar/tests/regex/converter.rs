@@ -9,6 +9,7 @@ fn ebnf_body(pattern: &str) -> String {
         .to_string()
 }
 
+#[test]
 fn converter_every_case() {
     test_basic_literal();
     test_anchors_stripped();
@@ -20,7 +21,6 @@ fn converter_every_case() {
     test_repetition_unbounded_conversion();
 }
 
-#[test]
 fn test_basic_literal() {
     let body = ebnf_body("123");
     assert!(body.contains("\"1\"") || body.contains("\"123\""));

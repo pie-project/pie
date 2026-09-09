@@ -116,8 +116,10 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
 
     let tokens: Vec<u32> = match embed_ids {
         Some(Some(bytes)) => bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
             .collect(),
         Some(None) => {
             return Ok(Err(

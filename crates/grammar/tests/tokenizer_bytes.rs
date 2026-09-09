@@ -9,12 +9,12 @@ use ::grammar::matcher::GrammarMatcher;
 use tokenizer::Tokenizer;
 use tokenizer_fixtures::{MergeFormat, byte_level_json};
 
+#[test]
 fn tokenizer_bytes_every_case() {
     matcher_consumes_raw_utf8_across_token_boundaries();
     grammar_mask_excludes_special_token_ids();
 }
 
-#[test]
 fn matcher_consumes_raw_utf8_across_token_boundaries() {
     let json = byte_level_json(
         serde_json::Value::Null,

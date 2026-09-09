@@ -65,12 +65,12 @@ fn check(window: Option<(u32, u32, u32)>) {
     }
 }
 
+#[test]
 fn the_fused_residual_norm_lands_what_the_two_launches_land_every_case() {
     the_pair_lands_the_two_launches_bits();
     the_pair_retires_a_buckets_padded_rows_off_the_staged_window();
 }
 
-#[test]
 fn the_pair_lands_the_two_launches_bits() {
     check(None);
 }

@@ -12,84 +12,44 @@ name = "engine_cuda"
 path = "src/lib.rs"
 
 [dependencies]
-# For `blob.rs`'s `adapter.toml` manifest — the one document this crate reads.
 toml = "1.1"
-# `statvfs`: the weight artifact cache declines a write it has no room for,
-# and the standard library cannot answer how much room is left.
 libc = "0.2"
-# The weight artifact cache hashes the whole `LoadPlan`, so the key cannot go
-# stale when a plan grows a field.
 serde_json = "1"
 model-ir = { path = "../model-ir" }
-# No `cuda-12`/`cuda-13` feature is named here on purpose: the runtime version
-# is the binary's decision, and this crate builds and tests everywhere — a fire
-# with no runtime answers with a typed refusal.
 kernels-cuda = { path = "../kernels-cuda" }
 
-# The runtime↔engine contract. This shell implements it; nothing is re-exported.
 engine = { path = "../engine" }
 
-# The shared fire substrate: `compose`, `FireDescriptor`, `walk`, `EagerSink`.
 model-exec = { path = "../model-exec" }
 
-# The ETA host half: launch-package adoption, the channel ring, the reference pass.
 eta-exec = { path = "../eta-exec" }
 
 eta-ir = { path = "../eta-ir" }
 eta-compiler = { path = "../eta-compiler" }
-# `CompiledModel`: the region template, the class table, the arena's offsets.
 model-compiler = { path = "../model-compiler" }
-# The residency half: `ModelContract`, `plan::compile`, and the `Execution` that
-# runs it against the checkpoint. No model family name crosses this edge.
-# The dependency points this way only: `checkpoint` says what transform a plan
-# calls for on a machine with no CUDA, and this crate cashes the claim.
 checkpoint = { path = "../checkpoint" }
 
-# The CUDA runtime, for the bytes this crate owns that no kernel entry
-# allocates: the arena, the weight store, the pool pages, the resident fire
-# inputs, and their stream.
-#
-# Cargo unifies features across the graph, so the `cudarc` version must be
-# selected identically here and in `kernels-cuda` or the two silently become
-# one build with duplicate cublas declarations.
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
     "std",
     "driver",
     "runtime",
     "nvrtc",
-    # The tensor-parallel group opens its communicators here (`comm.rs`);
-    # the collectives themselves are `kernels-cuda`'s.
     "nccl",
     "fallback-dynamic-loading",
 ] }
 
 [features]
-# Every item compiles with no runtime selected, and every device call then
-# answers `Fault::Runtimeless` — which is what lets a plain workspace check
-# carry this crate's host tests on a machine with no GPU.
 default = ["probe"]
 
-# Gate-only hooks, on by default so this crate's gates build under a plain
-# `cargo test` and dropped by a serving binary with `default-features = false`.
-# It carries `Session::skew_prediction` ("state a prediction the device will
-# refuse"), which a correct engine never does on its own.
 probe = []
 
-# Turns the runtime on, pinned to the same `cudarc` version as `kernels-cuda`
-# so the two cannot disagree.
 cuda = ["dep:cudarc", "kernels-cuda/cuda", "cudarc/cuda-13000"]
 
 [dev-dependencies]
-# Dev-only on purpose: the runtime hands this shell a `Plan` and a
-# `ModelContract`, so the shell itself must not know a model family or how a
-# contract is written.
 models = { path = "../models" }
 model-dsl = { path = "../model-dsl" }
 tokenizer = { path = "../tokenizer" }
-# The checkpoint container the import contract is checked against, plus the
-# projection that lets a stock safetensors snapshot be one.
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 checkpoint-dsl = { path = "../checkpoint-dsl" }
-# A scratch directory for the artifact a hand-written miniature loads from.
 tempfile = "3"

@@ -19,9 +19,16 @@ pub enum GridRule {
         factor: [u32; 3],
         keep_first_frame: bool,
     },
-    Shuffle { r: [u32; 3], trim_t: u32 },
-    Unshuffle { r: [u32; 3] },
-    AvgDown { factor: [u32; 3] },
+    Shuffle {
+        r: [u32; 3],
+        trim_t: u32,
+    },
+    Unshuffle {
+        r: [u32; 3],
+    },
+    AvgDown {
+        factor: [u32; 3],
+    },
 }
 
 #[repr(C)]

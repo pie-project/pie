@@ -7,10 +7,10 @@ use model_exec::fire::MaskSpan;
 use model_ir::{Def, Linear, Operands, Operation, Trace, ValueId};
 
 use crate::device::{Buffer, Handles};
-use crate::weight_store::Store;
 use crate::error::{Fault, Result};
 use crate::host_source::HostSource;
 use crate::mapping::Mapping;
+use crate::weight_store::Store;
 
 pub type Attachments = BTreeMap<usize, Vec<usize>>;
 
@@ -351,15 +351,15 @@ fn found(
         }
         let mut of_this = Vec::with_capacity(params.len());
         for at in params {
-            if let Some(other) = owner.insert(at, routes) {
-                if other != routes {
-                    return Err(Fault::Param {
-                        name: trace.params[at].name.clone(),
-                        why: "is expert-indexed by two different routing vectors; a seat \
+            if let Some(other) = owner.insert(at, routes)
+                && other != routes
+            {
+                return Err(Fault::Param {
+                    name: trace.params[at].name.clone(),
+                    why: "is expert-indexed by two different routing vectors; a seat \
                               number means one group's seat, and a band shared between two \
                               groups would be re-indexed twice",
-                    });
-                }
+                });
             }
             let param = &trace.params[at];
             let leading = u32::try_from(param.shape.first().copied().unwrap_or(0)).unwrap_or(0);
@@ -372,7 +372,7 @@ fn found(
                 });
             }
             let plane = bytes[at];
-            if plane == 0 || plane % u64::from(experts) != 0 {
+            if plane == 0 || !plane.is_multiple_of(u64::from(experts)) {
                 return Err(Fault::Param {
                     name: param.name.clone(),
                     why: "is a routed expert band whose bytes do not divide by its expert \
@@ -404,15 +404,21 @@ fn found(
 #[must_use]
 pub fn fan_out(trace: &Trace, routes: ValueId) -> Option<u32> {
     trace.nodes.iter().find_map(|node| match &node.op {
-        Operation::Linear(Linear::MoeTopkSoftmax { routes: r, top_k, .. })
-        | Operation::Linear(Linear::MoeTopkSoftmaxScaled { routes: r, top_k, .. })
-        | Operation::Linear(Linear::MoeTopkSigmoid { routes: r, top_k, .. })
-        | Operation::Linear(Linear::MoeTopkSqrtSoftplus { routes: r, top_k, .. })
-        | Operation::Linear(Linear::MoeHashRoute { routes: r, top_k, .. })
-            if *r == routes =>
-        {
-            Some(*top_k)
-        }
+        Operation::Linear(Linear::MoeTopkSoftmax {
+            routes: r, top_k, ..
+        })
+        | Operation::Linear(Linear::MoeTopkSoftmaxScaled {
+            routes: r, top_k, ..
+        })
+        | Operation::Linear(Linear::MoeTopkSigmoid {
+            routes: r, top_k, ..
+        })
+        | Operation::Linear(Linear::MoeTopkSqrtSoftplus {
+            routes: r, top_k, ..
+        })
+        | Operation::Linear(Linear::MoeHashRoute {
+            routes: r, top_k, ..
+        }) if *r == routes => Some(*top_k),
         _ => None,
     })
 }
@@ -428,11 +434,7 @@ fn weight_of(trace: &Trace, id: ValueId) -> Result<usize> {
     }
 }
 
-pub fn cuts(
-    trace: &Trace,
-    compiled: &CompiledModel,
-    plan: &Plan,
-) -> Result<Vec<Option<ValueId>>> {
+pub fn cuts(trace: &Trace, compiled: &CompiledModel, plan: &Plan) -> Result<Vec<Option<ValueId>>> {
     let streams = plan.streams();
     let streamed: BTreeSet<u32> = plan.groups.iter().map(|group| group.routes.0).collect();
     let mut out = Vec::with_capacity(compiled.template().len());
@@ -719,6 +721,7 @@ impl Tier {
         Ok(tier)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn segment(
         &mut self,
         arena: &mut Buffer,
@@ -752,7 +755,10 @@ impl Tier {
     ) -> Result<Vec<Vec<i32>>> {
         let width = usize::try_from(rect.width).unwrap_or(usize::MAX);
         let row = handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
-            what: format!("handle {}, {what}, which this fire minted no row for", rect.buf),
+            what: format!(
+                "handle {}, {what}, which this fire minted no row for",
+                rect.buf
+            ),
         })?;
         let first = row.offset() + u64::from(span.row_offset) * rect.width as u64 * 4;
         let mut raw = vec![0u8; span.rows as usize * width * 4];
@@ -760,7 +766,9 @@ impl Tier {
         Ok(raw
             .chunks_exact(width * 4)
             .map(|row| {
-                row.chunks_exact(4)
+                row.as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|e| i32::from_le_bytes([e[0], e[1], e[2], e[3]]))
                     .collect()
             })
@@ -810,7 +818,12 @@ impl Tier {
             let rows = Self::read_rows(arena, handles, hint, span, "a route prediction")?;
             self.predicted[at + 1] = Some(
                 rows.into_iter()
-                    .map(|row| row.into_iter().filter(|&id| id >= 0).map(|id| id as u32).collect())
+                    .map(|row| {
+                        row.into_iter()
+                            .filter(|&id| id >= 0)
+                            .map(|id| id as u32)
+                            .collect()
+                    })
                     .collect(),
             );
         }
@@ -851,9 +864,7 @@ impl Tier {
         if span.rows > 0 && (hint.is_some() || self.predicted[at].is_some()) {
             self.predict(at, arena, handles, routes, rect, hint, span)?;
         }
-        for seat in &mut self.slabs[at].pinned {
-            *seat = false;
-        }
+        self.slabs[at].pinned.fill(false);
         self.segments += 1;
         if span.rows == 0 {
             return Ok(());
@@ -877,13 +888,15 @@ impl Tier {
             use std::io::Write;
             for row in raw.chunks_exact(width as usize * 4) {
                 let ids: Vec<String> = row
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|e| i32::from_le_bytes([e[0], e[1], e[2], e[3]]).to_string())
                     .collect();
                 let _ = writeln!(dump, "{at}\t{}", ids.join(" "));
             }
         }
-        for entry in raw.chunks_exact_mut(4) {
+        for entry in raw.as_chunks_mut::<4>().0 {
             let id = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             if id < 0 {
                 continue;
@@ -903,10 +916,10 @@ impl Tier {
         }
         self.flush()?;
         arena.write(first, &raw)?;
-        if self.prefetch {
-            if let Some(rows) = self.predicted.get(at + 1).cloned().flatten() {
-                self.prefetch(at + 1, &rows)?;
-            }
+        if self.prefetch
+            && let Some(rows) = self.predicted.get(at + 1).cloned().flatten()
+        {
+            self.prefetch(at + 1, &rows)?;
         }
         Ok(())
     }
@@ -922,9 +935,7 @@ impl Tier {
         span: MaskSpan,
         (pass, passes): (u32, u32),
     ) -> Result<u32> {
-        for seat in &mut self.slabs[at].pinned {
-            *seat = false;
-        }
+        self.slabs[at].pinned.fill(false);
         self.segments += 1;
         if span.rows == 0 {
             return Ok(0);
@@ -950,7 +961,9 @@ impl Tier {
             let mut raw = vec![0u8; count * 4];
             arena.read(first, &mut raw)?;
             let ids: Vec<i32> = raw
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|e| i32::from_le_bytes([e[0], e[1], e[2], e[3]]))
                 .collect();
             if let Some(dump) = &mut self.dump {
@@ -978,8 +991,9 @@ impl Tier {
                 }
             }
             let seat_of = &self.slabs[at].seat_of;
-            let (mut leading, trailing): (Vec<u32>, Vec<u32>) =
-                order.into_iter().partition(|&e| seat_of[e as usize].is_some());
+            let (mut leading, trailing): (Vec<u32>, Vec<u32>) = order
+                .into_iter()
+                .partition(|&e| seat_of[e as usize].is_some());
             leading.extend(trailing);
             let order = leading;
             let seats = pass_group(self.slabs[at].slots) as usize;
@@ -1029,12 +1043,14 @@ impl Tier {
         }
         self.flush()?;
         arena.write(first, &raw)?;
-        if self.prefetch {
-            if let Some(next) = next {
-                self.prefetch_group(at, &next)?;
-            }
+        if self.prefetch
+            && let Some(next) = next
+        {
+            self.prefetch_group(at, &next)?;
         }
-        Ok(self.passing[at].as_ref().map_or(0, |p| p.groups.len() as u32))
+        Ok(self.passing[at]
+            .as_ref()
+            .map_or(0, |p| p.groups.len() as u32))
     }
 
     fn prefetch_group(&mut self, at: usize, experts: &[u32]) -> Result<()> {
@@ -1097,9 +1113,7 @@ impl Tier {
         let Some(file) = self.file.clone() else {
             return Ok(());
         };
-        for pin in &mut self.slabs[at].pinned {
-            *pin = false;
-        }
+        self.slabs[at].pinned.fill(false);
         let mut wanted: Vec<u32> = Vec::new();
         for row in rows {
             for &expert in row.iter().take(self.prefetch_k) {

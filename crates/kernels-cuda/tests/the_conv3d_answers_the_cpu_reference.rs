@@ -233,13 +233,13 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+#[test]
 fn the_conv3d_answers_the_cpu_reference_every_case() {
     the_direct_kernel_answers_the_reference();
     the_tensor_core_kernel_answers_the_reference();
     the_tensor_core_kernel_refuses_a_channel_count_it_cannot_vectorise();
 }
 
-#[test]
 fn the_direct_kernel_answers_the_reference() {
     for case in cases() {
         check(&case, ConvPath::Direct);

@@ -185,9 +185,7 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 fn segments_match(pattern: &[&str], path: &[&str]) -> bool {
     match pattern.first() {
         None => path.is_empty(),
-        Some(&"**") => {
-            (0..=path.len()).any(|skip| segments_match(&pattern[1..], &path[skip..]))
-        }
+        Some(&"**") => (0..=path.len()).any(|skip| segments_match(&pattern[1..], &path[skip..])),
         Some(head) => match path.first() {
             Some(segment) if segment_match(head, segment) => {
                 segments_match(&pattern[1..], &path[1..])
@@ -474,12 +472,12 @@ fn link_into_snapshot(snapshot_dir: &Path, blobs_dir: &Path, entry: &Entry) -> R
 mod tests {
     use super::*;
 
+    #[test]
     fn download_every_case() {
         weight_shards_match_and_alternates_do_not();
         a_pipelines_components_are_fetched_and_its_bundle_is_not();
     }
 
-    #[test]
     fn weight_shards_match_and_alternates_do_not() {
         let allow = super::super::runtime_snapshot_allow_patterns();
         let matches = |path: &str| allow.iter().any(|p| glob_match(p, path));

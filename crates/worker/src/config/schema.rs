@@ -226,13 +226,13 @@ mod tests {
         fields(engine).into_iter().map(|f| f.key).collect()
     }
 
+    #[test]
     fn schema_every_case() {
         schema_covers_exactly_the_settable_keys();
         the_summary_stops_at_the_blank_doc_line();
         a_derived_field_has_no_default_to_print();
     }
 
-    #[test]
     fn schema_covers_exactly_the_settable_keys() {
         let listed: std::collections::BTreeSet<String> =
             keys(EngineKind::CudaNative).into_iter().collect();

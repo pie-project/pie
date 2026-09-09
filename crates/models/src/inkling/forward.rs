@@ -1,6 +1,5 @@
 use model_dsl::{
-    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, Weight, ops,
-    seam,
+    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, Weight, ops, seam,
 };
 
 use super::model::{Layer, Mlp, Model, Reading};
@@ -59,8 +58,20 @@ impl ForwardHybrid for Model {
 
         let (input_d, input_p) = inputs.split(&one);
         let geometry = [
-            (m.layers.iter().find(|w| w.reading as usize == 0).map_or(0, |w| w.kv_heads), Some(m.window)),
-            (m.layers.iter().find(|w| w.reading as usize == 1).map_or(0, |w| w.kv_heads), None),
+            (
+                m.layers
+                    .iter()
+                    .find(|w| w.reading as usize == 0)
+                    .map_or(0, |w| w.kv_heads),
+                Some(m.window),
+            ),
+            (
+                m.layers
+                    .iter()
+                    .find(|w| w.reading as usize == 1)
+                    .map_or(0, |w| w.kv_heads),
+                None,
+            ),
         ];
         let plan_d = geometry.map(|(kv_heads, win)| {
             (kv_heads > 0).then(|| ops::attn::plan_decode(&input_d, m.heads, kv_heads, d, win))
@@ -84,8 +95,20 @@ impl ForwardHybrid for Model {
             let pages = inputs.kv(&w.kv);
 
             let q = ops::linear::matmul(&x, &w.q_proj);
-            let k = conv(&ops::linear::matmul(&x, &w.k_proj), &w.k_conv, &w.k_state, &inputs, m);
-            let v = conv(&ops::linear::matmul(&x, &w.v_proj), &w.v_conv, &w.v_state, &inputs, m);
+            let k = conv(
+                &ops::linear::matmul(&x, &w.k_proj),
+                &w.k_conv,
+                &w.k_state,
+                &inputs,
+                m,
+            );
+            let v = conv(
+                &ops::linear::matmul(&x, &w.v_proj),
+                &w.v_conv,
+                &w.v_state,
+                &inputs,
+                m,
+            );
             let r = ops::linear::matmul(&x, &w.r_proj);
             let q = ops::elemwise::rmsnorm_per_head(&q, &w.q_norm, d, m.norm_eps);
             let k = ops::elemwise::rmsnorm_per_head(&k, &w.k_norm, d, m.norm_eps);
@@ -101,18 +124,39 @@ impl ForwardHybrid for Model {
             let bias = ops::linear::rel_bias(&r, &w.rel_proj, m.heads, m.d_rel, w.extent);
             let (dq, pq) = q.split(&one);
             let (db, pb) = bias.split(&one);
-            let plan_d = plan_d[reading].as_ref().expect("a layer of this reading built its plan");
-            let plan_p = plan_p[reading].as_ref().expect("a layer of this reading built its plan");
+            let plan_d = plan_d[reading]
+                .as_ref()
+                .expect("a layer of this reading built its plan");
+            let plan_p = plan_p[reading]
+                .as_ref()
+                .expect("a layer of this reading built its plan");
             let log_scaling = match w.reading {
                 Reading::Local => None,
                 Reading::Global => Some(m.log_scaling),
             };
             let a = Value::merge(vec![
                 ops::attn::decode_rel(
-                    &dq, plan_d, pages, &db, win, d, w.extent, m.sm_scale, log_scaling,
+                    &dq,
+                    plan_d,
+                    pages,
+                    &db,
+                    win,
+                    d,
+                    w.extent,
+                    m.sm_scale,
+                    log_scaling,
                 ),
                 ops::attn::prefill_rel(
-                    &pq, plan_p, pages, &pb, win, d, w.kv_heads, w.extent, m.sm_scale, log_scaling,
+                    &pq,
+                    plan_p,
+                    pages,
+                    &pb,
+                    win,
+                    d,
+                    w.kv_heads,
+                    w.extent,
+                    m.sm_scale,
+                    log_scaling,
                 ),
             ]);
             seam::at(seam::ATTN_OUT, &[&a]);

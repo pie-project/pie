@@ -45,13 +45,13 @@ fn quest_tap() -> Traced {
     b.build().expect("the quest tap traces")
 }
 
+#[test]
 fn kernel_call_every_case() {
     repeated_kernel_names_intern_once();
     the_tap_is_refused_without_the_kernel_in_the_profile();
     the_name_table_is_sorted_and_indices_are_remapped();
 }
 
-#[test]
 fn repeated_kernel_names_intern_once() {
     let sink = Channel::new([PAGES], eta_dsl::dtype::f32).named("sink");
     let mut b = Builder::new(V, PAGE_T);

@@ -1,6 +1,8 @@
 use crate::error::Error;
 
-use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, nonzero, refuse, stated};
+use crate::encode::{
+    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, nonzero, refuse, stated,
+};
 use crate::tensor::Tensor;
 
 const FILE: &str = "elemwise/hc.metal";
@@ -11,7 +13,7 @@ const MAX_HC_MULT: u32 = 8;
 
 fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
     nonzero(op, "the hidden width", hidden)?;
-    if wide == 0 || wide % hidden != 0 {
+    if wide == 0 || !wide.is_multiple_of(hidden) {
         return Err(refuse(
             op,
             format!(
@@ -35,9 +37,12 @@ fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
 
 fn per_row(op: &'static str, rows: u32) -> Result<Grid, Error> {
     let rows = nonzero(op, "rows", rows)?;
-    let lanes = rows
-        .checked_mul(BLOCK)
-        .ok_or_else(|| refuse(op, format!("the grid will not launch: {rows} rows x {BLOCK}")))?;
+    let lanes = rows.checked_mul(BLOCK).ok_or_else(|| {
+        refuse(
+            op,
+            format!("the grid will not launch: {rows} rows x {BLOCK}"),
+        )
+    })?;
     Ok(Grid::of([lanes, 1, 1], [BLOCK, 1, 1]))
 }
 
@@ -172,8 +177,16 @@ pub fn gates(
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_gates";
     let entry = dtype_dispatch!(OP, streams.dtype, { Bf16 => "hc_gates_bfloat16" });
-    debug_assert_eq!(normed.dtype, dtype::Dtype::F32, "`{OP}` reads an f32 mix row");
-    debug_assert_eq!(scale.dtype, dtype::Dtype::F32, "`{OP}` reads f32 mix scales");
+    debug_assert_eq!(
+        normed.dtype,
+        dtype::Dtype::F32,
+        "`{OP}` reads an f32 mix row"
+    );
+    debug_assert_eq!(
+        scale.dtype,
+        dtype::Dtype::F32,
+        "`{OP}` reads f32 mix scales"
+    );
     debug_assert_eq!(base.dtype, dtype::Dtype::F32, "`{OP}` reads f32 mix bases");
     debug_assert!(
         post_mix.dtype == dtype::Dtype::F32 && comb_mix.dtype == dtype::Dtype::F32,
@@ -190,9 +203,12 @@ pub fn gates(
     );
     let rows = nonzero(OP, "rows", x.rows)?;
     let chunks = nonzero(OP, "the hidden width", x.width)?.div_ceil(256);
-    let lanes = rows
-        .checked_mul(BLOCK)
-        .ok_or_else(|| refuse(OP, format!("the grid will not launch: {rows} rows x {BLOCK}")))?;
+    let lanes = rows.checked_mul(BLOCK).ok_or_else(|| {
+        refuse(
+            OP,
+            format!("the grid will not launch: {rows} rows x {BLOCK}"),
+        )
+    })?;
     ctx.fire(
         Fire::at(FILE, entry).apply(Grid::of([lanes, chunks, 1], [BLOCK, 1, 1])),
         &[
@@ -262,8 +278,16 @@ pub fn collapse(
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_collapse";
     let entry = dtype_dispatch!(OP, streams.dtype, { Bf16 => "hc_collapse_bfloat16" });
-    debug_assert_eq!(mixes.dtype, dtype::Dtype::F32, "`{OP}` reads an f32 mix row");
-    debug_assert_eq!(scale.dtype, dtype::Dtype::F32, "`{OP}` reads an f32 mix scale");
+    debug_assert_eq!(
+        mixes.dtype,
+        dtype::Dtype::F32,
+        "`{OP}` reads an f32 mix row"
+    );
+    debug_assert_eq!(
+        scale.dtype,
+        dtype::Dtype::F32,
+        "`{OP}` reads an f32 mix scale"
+    );
     debug_assert_eq!(base.dtype, dtype::Dtype::F32, "`{OP}` reads f32 mix bases");
     debug_assert_eq!(y.dtype, streams.dtype, "`{OP}` lands the streams' element");
     let fan = stream_fan(OP, streams.width, y.width)?;
@@ -464,7 +488,14 @@ pub mod reference {
     }
 
     #[must_use]
-    pub fn fold(x: &[f32], streams: &[f32], post: &[f32], comb: &[f32], m: usize, h: usize) -> Vec<f32> {
+    pub fn fold(
+        x: &[f32],
+        streams: &[f32],
+        post: &[f32],
+        comb: &[f32],
+        m: usize,
+        h: usize,
+    ) -> Vec<f32> {
         let mut out = vec![0.0f32; m * h];
         for j in 0..m {
             for k in 0..h {
@@ -517,7 +548,9 @@ pub mod reference {
     pub fn ple_gate(key: &[f32], query: &[f32], value: &[f32], m: usize, h: usize) -> Vec<f32> {
         let mut out = vec![0.0; m * h];
         for s in 0..m {
-            let dot: f32 = (0..h).map(|i| key[s * h + i] * query[s * h + i]).sum::<f32>()
+            let dot: f32 = (0..h)
+                .map(|i| key[s * h + i] * query[s * h + i])
+                .sum::<f32>()
                 / (h as f32).sqrt();
             let magnitude = dot.abs().max(1e-6).sqrt();
             let damped = if dot > 0.0 {
@@ -536,7 +569,12 @@ pub mod reference {
     }
 
     #[must_use]
-    pub fn rmsnorm_grouped_plus_one(row: &[f32], weight: &[f32], group: usize, eps: f32) -> Vec<f32> {
+    pub fn rmsnorm_grouped_plus_one(
+        row: &[f32],
+        weight: &[f32],
+        group: usize,
+        eps: f32,
+    ) -> Vec<f32> {
         let mut out = vec![0.0; row.len()];
         for (g, slice) in row.chunks_exact(group).enumerate() {
             let mean: f32 = slice.iter().map(|v| v * v).sum::<f32>() / group as f32;
@@ -561,9 +599,9 @@ pub mod reference {
 
 #[cfg(test)]
 mod tests {
-    
+
     use super::*;
-    
+
     use crate::probe::Probe;
     use dtype::Dtype;
 
@@ -579,13 +617,13 @@ mod tests {
         Tensor::new(buf, rows, width, Dtype::F32)
     }
 
+    #[test]
     fn hc_every_case() {
         a_fan_past_the_unrolled_maximum_is_refused_by_name();
         a_row_that_is_not_whole_streams_is_refused_by_name();
         an_unstamped_dtype_is_refused_by_name();
     }
 
-    #[test]
     fn a_fan_past_the_unrolled_maximum_is_refused_by_name() {
         let probe = Probe::default();
         let err = expand(&probe, bf16(1, ROWS, H), 9, bf16(2, ROWS, 9 * H))
@@ -628,5 +666,4 @@ mod tests {
             Error::DtypeUnsupported { op, dtype } if op == "elementwise.hc_expand" && dtype == Dtype::F16
         ));
     }
-
 }

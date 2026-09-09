@@ -83,6 +83,10 @@ impl Store {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn format(&self) -> &'static str {
         self.format
     }
@@ -245,12 +249,12 @@ mod tests {
             .with_occupied(ranges.to_vec())
     }
 
+    #[test]
     fn store_every_case() {
         the_portable_read_path_reads_the_same_bytes();
         page_exclusivity();
     }
 
-    #[test]
     fn the_portable_read_path_reads_the_same_bytes() {
         let path = std::env::temp_dir().join("ztensor-portable-read-probe");
         let content: Vec<u8> = (0..=255u8).cycle().take(4096).collect();

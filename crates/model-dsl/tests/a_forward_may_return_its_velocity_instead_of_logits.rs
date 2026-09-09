@@ -65,6 +65,7 @@ fn count(seams: &[(String, usize, Option<u32>)], name: &str) -> usize {
     seams.iter().filter(|(seam, _, _)| seam == name).count()
 }
 
+#[test]
 fn a_forward_may_return_its_velocity_instead_of_logits_every_case() {
     velocity_on_the_returned_value_stands_in_for_out();
     hidden_on_the_returned_value_stands_in_for_out();
@@ -72,7 +73,6 @@ fn a_forward_may_return_its_velocity_instead_of_logits_every_case() {
     hidden_beside_logits_keeps_both_and_names_its_layer();
 }
 
-#[test]
 fn velocity_on_the_returned_value_stands_in_for_out() {
     let seams = seams(Plants::Velocity);
     assert_eq!(count(&seams, seam::OUT.name), 0, "{seams:?}");

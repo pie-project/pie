@@ -7,6 +7,7 @@ use std::time::UNIX_EPOCH;
 use crate::adapter::{Site, layer_of, role_of, site_of};
 use crate::error::{Fault, Result};
 use crate::weights::BankSeat;
+type Planes = (Vec<(String, Vec<u8>)>, u64);
 
 pub const MANIFEST: &str = "adapter.toml";
 
@@ -356,7 +357,7 @@ impl Store {
         })
     }
 
-    pub fn planes(&self, name: &str, seats: &[BankSeat]) -> Result<(Vec<(String, Vec<u8>)>, u64)> {
+    pub fn planes(&self, name: &str, seats: &[BankSeat]) -> Result<Planes> {
         let dir = self.vfs.resolve(name)?;
         let manifest = Manifest::read(&dir, name)?;
         let refuse = |why: String| Fault::Blob {
@@ -546,6 +547,7 @@ mod tests {
         (mount, store)
     }
 
+    #[test]
     fn blob_every_case() {
         a_manifest_says_its_rank_its_planes_and_their_orientation();
         the_mount_resolves_a_name_and_refuses_everything_else();
@@ -556,7 +558,6 @@ mod tests {
         the_resolver_refuses_by_name();
     }
 
-    #[test]
     fn a_manifest_says_its_rank_its_planes_and_their_orientation() {
         let mount = scratch("manifest");
         let dir = write_adapter(&mount, "alice", 4, (Layout::RankMajor, Layout::OutMajor));
@@ -597,7 +598,10 @@ mod tests {
     fn the_mount_resolves_a_name_and_refuses_everything_else() {
         let (mount, store) = mounted("vfs");
         assert_eq!(
-            store.vfs().resolve("alice-v2").expect("a name in the mount"),
+            store
+                .vfs()
+                .resolve("alice-v2")
+                .expect("a name in the mount"),
             mount.join("alice-v2")
         );
         assert_eq!(
@@ -625,8 +629,14 @@ mod tests {
         assert!(said.contains("nobody"), "names the adapter: {said}");
 
         let bare = Store::new();
-        let said = bare.stamp("alice-v2").expect_err("nothing mounted").to_string();
-        assert!(said.contains("no shared adapter directory mounted"), "{said}");
+        let said = bare
+            .stamp("alice-v2")
+            .expect_err("nothing mounted")
+            .to_string();
+        assert!(
+            said.contains("no shared adapter directory mounted"),
+            "{said}"
+        );
         let _ = std::fs::remove_dir_all(&mount);
     }
 
@@ -781,7 +791,10 @@ mod tests {
             .expect_err("no bank carries that role")
             .to_string();
         assert!(said.contains("mystery"), "names the role: {said}");
-        assert!(said.contains("layer.0.lora_a"), "and the banks there are: {said}");
+        assert!(
+            said.contains("layer.0.lora_a"),
+            "and the banks there are: {said}"
+        );
 
         write_adapter(&mount, "short", 4, (Layout::RankMajor, Layout::OutMajor));
         std::fs::write(mount.join("short").join("a.bin"), vec![0u8; 16]).expect("a short plane");

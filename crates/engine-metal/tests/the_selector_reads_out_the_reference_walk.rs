@@ -47,11 +47,19 @@ fn i32_bytes(v: &[i32]) -> Vec<u8> {
 }
 
 fn f32s(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn i32s(b: &[u8]) -> Vec<i32> {
-    b.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 struct Dev {
@@ -85,20 +93,26 @@ impl Dev {
     }
 }
 
+#[test]
 fn the_selector_reads_out_the_reference_walk_every_case() {
     topk_answers_the_host_sort_with_ties_low_and_nans_never();
     the_walk_picks_what_the_reference_picks();
 }
 
-#[test]
 fn topk_answers_the_host_sort_with_ties_low_and_nans_never() {
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;
     };
-    let dev = Dev { device, handles: Handles::new(), pipelines: Pipelines::new() };
+    let dev = Dev {
+        device,
+        handles: Handles::new(),
+        pipelines: Pipelines::new(),
+    };
     let rows = 3u32;
-    let mut x: Vec<f32> = (0..(rows * WIDE) as u64).map(|at| bf16_round(4.0 * unit(at))).collect();
+    let mut x: Vec<f32> = (0..(rows * WIDE) as u64)
+        .map(|at| bf16_round(4.0 * unit(at)))
+        .collect();
     let w = WIDE as usize;
     x[w + 100_000] = 8.0;
     x[w + 777] = 8.0;
@@ -119,13 +133,27 @@ fn topk_answers_the_host_sort_with_ties_low_and_nans_never() {
         order.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
         let want: Vec<i32> = order[..K as usize].iter().map(|&c| c as i32).collect();
         let got = &indices[r * K as usize..(r + 1) * K as usize];
-        assert_eq!(got, &want[..], "row {r}: the indices are not the host sort's");
+        assert_eq!(
+            got,
+            &want[..],
+            "row {r}: the indices are not the host sort's"
+        );
         for j in 0..K as usize {
-            assert_eq!(values[r * K as usize + j], row[got[j] as usize], "row {r} slot {j}: value");
+            assert_eq!(
+                values[r * K as usize + j],
+                row[got[j] as usize],
+                "row {r} slot {j}: value"
+            );
         }
     }
-    assert_eq!(indices[K as usize], 777, "the tie went to the higher column");
-    assert!(!indices[2 * K as usize..].contains(&5), "the NaN was chosen");
+    assert_eq!(
+        indices[K as usize], 777,
+        "the tie went to the higher column"
+    );
+    assert!(
+        !indices[2 * K as usize..].contains(&5),
+        "the NaN was chosen"
+    );
     eprintln!("topk: three rows of {WIDE} agree with the host sort; tie low, NaN never");
 }
 
@@ -134,7 +162,11 @@ fn the_walk_picks_what_the_reference_picks() {
         eprintln!("not asked: no Metal device");
         return;
     };
-    let dev = Dev { device, handles: Handles::new(), pipelines: Pipelines::new() };
+    let dev = Dev {
+        device,
+        handles: Handles::new(),
+        pipelines: Pipelines::new(),
+    };
     let rows: u32 = SPANS.iter().sum();
     let indptr: Vec<i32> = {
         let mut v = vec![0i32];
@@ -148,11 +180,21 @@ fn the_walk_picks_what_the_reference_picks() {
     let cand: Vec<i32> = (0..rows as usize)
         .flat_map(|r| (0..k).map(move |c| (noise((r * k + c) as u64) % VOCAB) as i32))
         .collect();
-    let unary: Vec<f32> = (0..(rows as usize * k) as u64).map(|at| 0.05 * unit(at ^ 0x77)).collect();
-    let hp: Vec<f32> = (0..(rows as usize * rank) as u64).map(|at| bf16_round(unit(at ^ 0x99))).collect();
-    let pred: Vec<f32> = (0..(VOCAB as usize * rank) as u64).map(|at| bf16_round(0.2 * unit(at ^ 0xAB))).collect();
-    let succ: Vec<f32> = (0..(VOCAB as usize * rank) as u64).map(|at| bf16_round(0.2 * unit(at ^ 0xCD))).collect();
-    let tokens: Vec<i32> = (0..rows).map(|r| (noise(u64::from(r) ^ 0xEF) % VOCAB) as i32).collect();
+    let unary: Vec<f32> = (0..(rows as usize * k) as u64)
+        .map(|at| 0.05 * unit(at ^ 0x77))
+        .collect();
+    let hp: Vec<f32> = (0..(rows as usize * rank) as u64)
+        .map(|at| bf16_round(unit(at ^ 0x99)))
+        .collect();
+    let pred: Vec<f32> = (0..(VOCAB as usize * rank) as u64)
+        .map(|at| bf16_round(0.2 * unit(at ^ 0xAB)))
+        .collect();
+    let succ: Vec<f32> = (0..(VOCAB as usize * rank) as u64)
+        .map(|at| bf16_round(0.2 * unit(at ^ 0xCD)))
+        .collect();
+    let tokens: Vec<i32> = (0..rows)
+        .map(|r| (noise(u64::from(r) ^ 0xEF) % VOCAB) as i32)
+        .collect();
 
     let (_cb, hc) = dev.buffer(&i32_bytes(&cand));
     let (_pb, hp_indptr) = dev.buffer(&i32_bytes(&indptr));
@@ -222,10 +264,16 @@ fn the_walk_picks_what_the_reference_picks() {
             prev = want[row] as usize;
         }
     }
-    assert!(bilinear_mattered, "the fixture's bilinear never changed a pick, so the check proves nothing");
+    assert!(
+        bilinear_mattered,
+        "the fixture's bilinear never changed a pick, so the check proves nothing"
+    );
     assert_eq!(picks, want, "the walk parts from the reference");
     assert_ne!(picks, unary_only, "the walk is the unary argmax");
-    eprintln!("walk: {} rows over two requests agree with the reference; the bilinear decided at least one slot", rows);
+    eprintln!(
+        "walk: {} rows over two requests agree with the reference; the bilinear decided at least one slot",
+        rows
+    );
 
     let picks = walk(&dev, None, 0);
     let mut want = vec![0i32; rows as usize];
@@ -252,5 +300,8 @@ fn the_walk_picks_what_the_reference_picks() {
         }
     }
     assert_eq!(picks, want, "the bigram walk parts from the reference");
-    eprintln!("bigram walk: {} rows agree, the anchor row proposing too", rows);
+    eprintln!(
+        "bigram walk: {} rows agree, the anchor row proposing too",
+        rows
+    );
 }

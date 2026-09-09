@@ -79,6 +79,7 @@ fn adapter_scratch(layers: u32, rank: u32, hidden: u32) -> u64 {
     scratch_bytes(adapter_stage(&package), Extents::default()).expect("the stage's scratch")
 }
 
+#[test]
 fn an_adapter_is_not_a_lanes_scratch_every_case() {
     the_sinks_scratch_does_not_scale_with_layers_rank_hidden();
     the_naive_budget_is_the_one_that_scales();
@@ -87,7 +88,6 @@ fn an_adapter_is_not_a_lanes_scratch_every_case() {
     a_plane_a_launched_op_also_reads_is_still_carried();
 }
 
-#[test]
 fn the_sinks_scratch_does_not_scale_with_layers_rank_hidden() {
     let served = adapter_scratch(LAYERS, RANK, HIDDEN);
     let wider = adapter_scratch(LAYERS, RANK * 4, HIDDEN);

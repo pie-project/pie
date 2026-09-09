@@ -5,11 +5,11 @@ use model_exec::fire::MaskSpan;
 use model_ir::ops::{Attention, Layout};
 use model_ir::{Def, Operation, Trace, ValueId};
 
-use crate::weight_store::Store;
+use crate::device::Handles;
 use crate::device::alloc::Buffer;
 use crate::error::{Fault, Result};
 use crate::experts::{Attachments, Source};
-use crate::device::Handles;
+use crate::weight_store::Store;
 use kernels_metal::Tensor;
 
 #[derive(Debug, Clone, Default)]
@@ -132,8 +132,8 @@ impl Plan {
             for (at, &param) in params.iter().enumerate() {
                 host_of.insert(param, host_bytes);
                 host_bytes += bytes[param];
-                device_bytes += (u64::from(seats) * strides[at])
-                    .next_multiple_of(crate::weights::ALIGN);
+                device_bytes +=
+                    (u64::from(seats) * strides[at]).next_multiple_of(crate::weights::ALIGN);
             }
             found = Some(Table {
                 name: trace.params[codes].name.clone(),
@@ -164,11 +164,7 @@ impl Plan {
                  {} bytes, and the budget does not hold even that. The slab is sized by the \
                  fire's row ceiling and not by the table's {} rows, so this number does not \
                  shrink: raise the budget past it, or lower `max_tokens`.",
-                table.name,
-                bytes[table.params[0]],
-                table.seats,
-                table.device_bytes,
-                table.rows,
+                table.name, bytes[table.params[0]], table.seats, table.device_bytes, table.rows,
             )));
         }
         let _ = rest;
@@ -348,9 +344,7 @@ impl Slab {
 
     pub fn fire(&mut self) {
         self.seat_of.clear();
-        for seat in &mut self.in_seat {
-            *seat = -1;
-        }
+        self.in_seat.fill(-1);
         self.next = 0;
         self.fires += 1;
     }
@@ -381,7 +375,7 @@ impl Slab {
         let count = usize::try_from(u64::from(span.rows) * width).unwrap_or(usize::MAX);
         let mut raw = vec![0u8; count * 4];
         arena.read(first, &mut raw)?;
-        for entry in raw.chunks_exact_mut(4) {
+        for entry in raw.as_chunks_mut::<4>().0 {
             let id = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             if id < 0 {
                 continue;

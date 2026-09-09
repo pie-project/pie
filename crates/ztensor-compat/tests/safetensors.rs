@@ -45,6 +45,7 @@ fn f32s(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+#[test]
 fn safetensors_every_case() {
     open_and_read();
     dtype_projections();
@@ -53,7 +54,6 @@ fn safetensors_every_case() {
     convert_to_canonical_zt();
 }
 
-#[test]
 fn open_and_read() {
     let a = f32s(&[1.0, 2.0, 3.0, 4.0]);
     let b = vec![7u8; 8];
@@ -74,20 +74,10 @@ fn open_and_read() {
     assert!(st.attributes().is_some());
 
     assert_eq!(
-        st.tensor("a.weight")
-            .unwrap()
-            .bytes()
-            .unwrap()
-            .into_owned(),
+        st.tensor("a.weight").unwrap().bytes().unwrap().into_owned(),
         a
     );
-    assert_eq!(
-        st.tensor("b.weight")
-            .unwrap()
-            .map()
-            .unwrap(),
-        &b[..]
-    );
+    assert_eq!(st.tensor("b.weight").unwrap().map().unwrap(), &b[..]);
 
     let caps = st.tensor("a.weight").unwrap().caps();
     assert!(caps.map);
@@ -170,19 +160,11 @@ fn convert_to_canonical_zt() {
 
     let r = ztensor::Source::open(&zt1).unwrap();
     assert_eq!(
-        r.tensor("a.weight")
-            .unwrap()
-            .bytes()
-            .unwrap()
-            .into_owned(),
+        r.tensor("a.weight").unwrap().bytes().unwrap().into_owned(),
         a
     );
     assert_eq!(
-        r.tensor("b.weight")
-            .unwrap()
-            .bytes()
-            .unwrap()
-            .into_owned(),
+        r.tensor("b.weight").unwrap().bytes().unwrap().into_owned(),
         b
     );
     assert!(r.tensor("a.weight").unwrap().verify().unwrap().is_checked()); // digests added

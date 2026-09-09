@@ -23,7 +23,7 @@ fn rows_per_head(op: &'static str, rows: u32, width: u32, head_dim: u32) -> Resu
     if head_dim == 0 {
         return Ok(Launch::per_row(rows, BLOCK));
     }
-    if width == 0 || width % head_dim != 0 {
+    if width == 0 || !width.is_multiple_of(head_dim) {
         return Err(refuse(
             op,
             format!("the {width}-wide row is not a whole number of {head_dim}-wide heads"),
@@ -42,6 +42,7 @@ fn rows_per_head(op: &'static str, rows: u32, width: u32, head_dim: u32) -> Resu
 }
 
 const fn per_head_split(width: u32, head_dim: u32) -> u32 {
+    #[allow(clippy::manual_checked_ops)]
     if head_dim == 0 { 1 } else { width / head_dim }
 }
 
@@ -70,6 +71,7 @@ fn route_rows(rows: u32, width: u32) -> Launch {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rms_row(
     ctx: &Ctx,
     op: &'static str,
@@ -231,6 +233,7 @@ pub fn rmsnorm_no_scale(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_gated(
     ctx: &Ctx,
     x: Tensor,
@@ -287,7 +290,7 @@ pub fn rmsnorm_grouped_plus_one(
     const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let group = nonzero(OP, "the group width", group)?;
-    if y.width == 0 || y.width % group != 0 {
+    if y.width == 0 || !y.width.is_multiple_of(group) {
         return Err(refuse(
             OP,
             format!("the {}-wide row is not a whole number of {group}-wide groups", y.width),
@@ -339,7 +342,7 @@ pub fn rmsnorm_gated_by(
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "the stated head count", heads)?;
     nonzero(OP, "rows", y.rows)?;
-    if x.width == 0 || x.width % heads != 0 {
+    if x.width == 0 || !x.width.is_multiple_of(heads) {
         return Err(refuse(
             OP,
             format!(
@@ -408,7 +411,7 @@ pub fn residual_add_rmsnorm(
     let rows = nonzero(OP, "rows", y.rows)?;
     let plus = if plus_one { "true" } else { "false" };
     let vectors = y.dtype == Dtype::Bf16
-        && y.width % VEC_WIDTH == 0
+        && y.width.is_multiple_of(VEC_WIDTH)
         && [x.ptr, y.ptr, weight.ptr, out.ptr].iter().all(|&at| aligned16(at));
     let (entrypoint, block) = if vectors {
         let block = (y.width / VEC_WIDTH).clamp(WARP, BLOCK).next_power_of_two();
@@ -500,7 +503,7 @@ pub fn rmsnorm_residual_add(
         aligned.extend([post.weight.ptr, post.out.ptr]);
     }
     let vectors = y.dtype == Dtype::Bf16
-        && y.width % VEC_WIDTH == 0
+        && y.width.is_multiple_of(VEC_WIDTH)
         && aligned.iter().all(|&at| aligned16(at));
     let (entrypoint, block) = if vectors {
         let nvec = y.width / VEC_WIDTH;

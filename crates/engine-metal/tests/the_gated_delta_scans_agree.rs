@@ -2,10 +2,10 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
+use kernels_metal::Tensor;
 use kernels_metal::attn::ssm::{self, Committed};
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
-use kernels_metal::Tensor;
 use model_ir::Dtype;
 
 const K_HEADS: u32 = 16;
@@ -48,7 +48,9 @@ fn bf16(v: f32) -> [u8; 2] {
 
 fn floats(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -93,7 +95,8 @@ fn the_scans_agree() {
         }
         qkv_b.write(0, &bytes).expect("write qkv");
     }
-    let mut gates_b = Buffer::zeroed(&device, u64::from(T) * u64::from(2 * V_HEADS) * 4).expect("gates");
+    let mut gates_b =
+        Buffer::zeroed(&device, u64::from(T) * u64::from(2 * V_HEADS) * 4).expect("gates");
     {
         let mut g = Vec::with_capacity((T * 2 * V_HEADS) as usize);
         for t in 0..T {
@@ -111,7 +114,9 @@ fn the_scans_agree() {
         let bank: Vec<f32> = (0..BANK_FLOATS).map(|at| 0.1 * unit(at ^ 0xC3C3)).collect();
         let bytes = as_bytes(&bank);
         for s in 0..u64::from(SLOTS) {
-            state_b.write(s * BANK_FLOATS * 4, &bytes).expect("write bank");
+            state_b
+                .write(s * BANK_FLOATS * 4, &bytes)
+                .expect("write bank");
         }
     }
     let work_b = Buffer::zeroed(&device, BANK_FLOATS * 4).expect("work");
@@ -119,13 +124,19 @@ fn the_scans_agree() {
         .map(|_| Buffer::zeroed(&device, u64::from(T) * u64::from(Y_WIDTH) * 4).expect("y"))
         .collect();
     let mut indptr_b = Buffer::zeroed(&device, 8).expect("indptr");
-    indptr_b.write(0, &ints(&[0, T as i32])).expect("write indptr");
+    indptr_b
+        .write(0, &ints(&[0, T as i32]))
+        .expect("write indptr");
     let mut replay_b = Buffer::zeroed(&device, 4).expect("replay");
     replay_b.write(0, &ints(&[0])).expect("write replay");
     let mut commit_t_b = Buffer::zeroed(&device, 4).expect("commit");
-    commit_t_b.write(0, &ints(&[T as i32])).expect("write commit");
+    commit_t_b
+        .write(0, &ints(&[T as i32]))
+        .expect("write commit");
     let mut commit_j_b = Buffer::zeroed(&device, 4).expect("commit j");
-    commit_j_b.write(0, &ints(&[J as i32])).expect("write commit j");
+    commit_j_b
+        .write(0, &ints(&[J as i32]))
+        .expect("write commit j");
     let slot_tables: Vec<Buffer> = (0..SLOTS)
         .map(|s| {
             let mut b = Buffer::zeroed(&device, 4).expect("slot");
@@ -147,7 +158,9 @@ fn the_scans_agree() {
     let h_y: Vec<u32> = y_b.iter().map(bind).collect();
     let row = |b: &Buffer, t: u32, width: u32, elem: u64| {
         let stride = u64::from(width) * elem;
-        handles.bind(b, u64::from(t) * stride, stride).expect("a row handle")
+        handles
+            .bind(b, u64::from(t) * stride, stride)
+            .expect("a row handle")
     };
 
     let qkv = Tensor::new(h_qkv, T, QKV_WIDTH, Dtype::Bf16);
@@ -204,7 +217,10 @@ fn the_scans_agree() {
         .expect("the old committed kernel");
     });
 
-    for (slot, commit) in [(SLOT_NEW_COMMITTED, h_commit_t), (SLOT_NEW_COMMITTED_J, h_commit_j)] {
+    for (slot, commit) in [
+        (SLOT_NEW_COMMITTED, h_commit_t),
+        (SLOT_NEW_COMMITTED_J, h_commit_j),
+    ] {
         run(&|sink| {
             ssm::gated_delta_committed(
                 sink,
@@ -228,10 +244,26 @@ fn the_scans_agree() {
         for t in 0..steps {
             let q = Tensor::new(row(&qkv_b, t, QKV_WIDTH, 2), 1, QKV_WIDTH, Dtype::Bf16);
             let g = Tensor::new(row(&gates_b, t, 2 * V_HEADS, 4), 1, 2 * V_HEADS, Dtype::F32);
-            let y = Tensor::new(row(&y_b[slot as usize], t, Y_WIDTH, 4), 1, Y_WIDTH, Dtype::F32);
+            let y = Tensor::new(
+                row(&y_b[slot as usize], t, Y_WIDTH, 4),
+                1,
+                Y_WIDTH,
+                Dtype::F32,
+            );
             run(&|sink| {
-                ssm::gated_delta(sink, q, q, g, &pool(slot), K_HEADS, V_HEADS, K_DIM, V_DIM, y)
-                    .expect("the step");
+                ssm::gated_delta(
+                    sink,
+                    q,
+                    q,
+                    g,
+                    &pool(slot),
+                    K_HEADS,
+                    V_HEADS,
+                    K_DIM,
+                    V_DIM,
+                    y,
+                )
+                .expect("the step");
             });
         }
     }
@@ -255,7 +287,12 @@ fn the_scans_agree() {
     for t in 0..T {
         let q = Tensor::new(row(&qkv_b, t, QKV_WIDTH, 2), 1, QKV_WIDTH, Dtype::Bf16);
         let g = Tensor::new(row(&gates_b, t, 2 * V_HEADS, 4), 1, 2 * V_HEADS, Dtype::F32);
-        let y = Tensor::new(row(&y_b[SLOT_OLD_STEPS as usize], t, Y_WIDTH, 4), 1, Y_WIDTH, Dtype::F32);
+        let y = Tensor::new(
+            row(&y_b[SLOT_OLD_STEPS as usize], t, Y_WIDTH, 4),
+            1,
+            Y_WIDTH,
+            Dtype::F32,
+        );
         run(&|sink| {
             sink.fire(
                 Fire::at(OLD_FILE, "gated_delta_bfloat16")
@@ -279,24 +316,65 @@ fn the_scans_agree() {
 
     let bank = |s: u32| {
         let raw = handles
-            .read(handles.bind(&state_b, u64::from(s) * BANK_FLOATS * 4, BANK_FLOATS * 4).expect("a bank handle"), BANK_FLOATS * 4)
+            .read(
+                handles
+                    .bind(&state_b, u64::from(s) * BANK_FLOATS * 4, BANK_FLOATS * 4)
+                    .expect("a bank handle"),
+                BANK_FLOATS * 4,
+            )
             .expect("read bank");
         floats(&raw)
     };
-    let out = |s: u32| floats(&handles.read(h_y[s as usize], u64::from(T) * u64::from(Y_WIDTH) * 4).expect("read y"));
+    let out = |s: u32| {
+        floats(
+            &handles
+                .read(h_y[s as usize], u64::from(T) * u64::from(Y_WIDTH) * 4)
+                .expect("read y"),
+        )
+    };
     let rows = |v: &[f32], n: u32| v[..(n * Y_WIDTH) as usize].to_vec();
 
     let steps_bank = bank(SLOT_NEW_STEPS);
     let steps_y = out(SLOT_NEW_STEPS);
-    assert_eq!(bank(SLOT_NEW_COMMITTED), steps_bank, "committed(T) left other bank bits than T steps");
-    assert_eq!(out(SLOT_NEW_COMMITTED), steps_y, "committed(T) answered other bits than T steps");
-    assert_eq!(bank(SLOT_NEW_SCAN), steps_bank, "the scan left other bank bits than T steps");
-    assert_eq!(out(SLOT_NEW_SCAN), steps_y, "the scan answered other bits than T steps");
-    assert_eq!(bank(SLOT_NEW_COMMITTED_J), bank(SLOT_NEW_STEPS_J), "committed(J) left other bank bits than J steps");
-    assert_ne!(bank(SLOT_NEW_COMMITTED_J), steps_bank, "J and T steps leave the same bank, so the commit claim can't tell them apart");
-    assert_eq!(out(SLOT_NEW_COMMITTED_J), steps_y, "committed(J) answered the rows past J other bits than the steps");
+    assert_eq!(
+        bank(SLOT_NEW_COMMITTED),
+        steps_bank,
+        "committed(T) left other bank bits than T steps"
+    );
+    assert_eq!(
+        out(SLOT_NEW_COMMITTED),
+        steps_y,
+        "committed(T) answered other bits than T steps"
+    );
+    assert_eq!(
+        bank(SLOT_NEW_SCAN),
+        steps_bank,
+        "the scan left other bank bits than T steps"
+    );
+    assert_eq!(
+        out(SLOT_NEW_SCAN),
+        steps_y,
+        "the scan answered other bits than T steps"
+    );
+    assert_eq!(
+        bank(SLOT_NEW_COMMITTED_J),
+        bank(SLOT_NEW_STEPS_J),
+        "committed(J) left other bank bits than J steps"
+    );
+    assert_ne!(
+        bank(SLOT_NEW_COMMITTED_J),
+        steps_bank,
+        "J and T steps leave the same bank, so the commit claim can't tell them apart"
+    );
+    assert_eq!(
+        out(SLOT_NEW_COMMITTED_J),
+        steps_y,
+        "committed(J) answered the rows past J other bits than the steps"
+    );
     assert_eq!(rows(&out(SLOT_NEW_STEPS_J), J), rows(&steps_y, J));
-    eprintln!("one arithmetic: {T} steps == committed({T}) == scan; committed({J}) bank == {J} steps  (byte for byte)");
+    eprintln!(
+        "one arithmetic: {T} steps == committed({T}) == scan; committed({J}) bank == {J} steps  (byte for byte)"
+    );
 
     let floor = 1e-5f64;
     for (name, old_slot, new_slot) in [
@@ -308,8 +386,14 @@ fn the_scans_agree() {
         eprintln!(
             "{name:9} old vs new: bank rel rms {bank_rms:.2e} (worst {bank_worst:.2e}), y rel rms {y_rms:.2e} (worst {y_worst:.2e})"
         );
-        assert!(bank_rms <= floor, "{name}: the new kernel's bank parts from the old by {bank_rms:.2e} rms");
-        assert!(y_rms <= floor, "{name}: the new kernel's output parts from the old by {y_rms:.2e} rms");
+        assert!(
+            bank_rms <= floor,
+            "{name}: the new kernel's bank parts from the old by {bank_rms:.2e} rms"
+        );
+        assert!(
+            y_rms <= floor,
+            "{name}: the new kernel's output parts from the old by {y_rms:.2e} rms"
+        );
     }
     let (rms, _) = compare(&bank(SLOT_OLD_COMMITTED), &bank(SLOT_OLD_STEPS));
     eprintln!("old committed vs old steps: bank rel rms {rms:.2e}");

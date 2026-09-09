@@ -35,7 +35,7 @@ pub fn correct(
     let rows = nonzero(OP, "rows", x.rows)?;
     let in_width = nonzero(OP, "the correction's input width", x.width)?;
     let out_width = nonzero(OP, "the correction's output width", y.width)?;
-    if bank_a.width % in_width != 0 {
+    if !bank_a.width.is_multiple_of(in_width) {
         return Err(refuse(
             OP,
             format!(

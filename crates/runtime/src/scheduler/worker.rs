@@ -6,9 +6,8 @@ use std::time::{Duration, Instant};
 use ::engine::{ChannelRegistration, ProgramRegistration, StateCopy};
 
 use crate::engine::{
-    BoundInstance, ChannelJoin, EngineBox, EngineId, InstanceBindingPlan,
-    RegisteredChannel, SchedulerLimits, SubmissionCompletion, WorkItemAttemptOutcome,
-    WorkItemCompletion,
+    BoundInstance, ChannelJoin, EngineBox, EngineId, InstanceBindingPlan, RegisteredChannel,
+    SchedulerLimits, SubmissionCompletion, WorkItemAttemptOutcome, WorkItemCompletion,
 };
 use crate::scheduler::ProcessId;
 use anyhow::{Result, anyhow};
@@ -244,7 +243,10 @@ pub(crate) fn wave_trace_emit(line: String) {
 
 pub(crate) fn wave_trace_us() -> u128 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_micros()
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros()
 }
 
 fn has_wire_masks(request: &crate::engine::FireRequest) -> bool {
@@ -427,7 +429,10 @@ enum LaneRequest {
         submission: LaneLaunch,
         prefill: bool,
     },
-    Control { token: u64, item: Box<QueuedItem> },
+    Control {
+        token: u64,
+        item: Box<QueuedItem>,
+    },
     Shutdown {
         response: crossbeam::channel::Sender<(Option<EngineBox>, ChannelJoin)>,
     },
@@ -451,8 +456,12 @@ enum LaneCommit {
         bound: BoundInstance,
         respond: BindRespond,
     },
-    BindFinished { pipeline_id: Option<ProcessId> },
-    CloseInstance { id: u64 },
+    BindFinished {
+        pipeline_id: Option<ProcessId>,
+    },
+    CloseInstance {
+        id: u64,
+    },
     AsyncControl {
         result: std::result::Result<SubmissionCompletion, String>,
     },
@@ -694,55 +703,54 @@ impl EngineLoop {
                  which requires unwinding; under `panic = \"abort\"` a panic \
                  in one lane takes down every session the runtime is serving"
             );
-            let handled =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    match request {
-                        LaneRequest::Launch {
-                            token, submission, ..
-                        } => {
-                            let LaneLaunch(mut frame) = submission;
-                            let result = match engine.as_mut() {
-                                Some(engine) => {
-                                    crate::probe_fire!(stats.fire.execute.engine_fire_us, {
-                                        Self::fire_frame(
-                                            engine,
-                                            &channels,
-                                            &mut frame,
-                                            &launch_rx,
-                                            &mut stash,
-                                            &broker,
-                                            &settlements,
-                                        )
-                                    })
-                                }
-                                None => Err("engine has no backend installed".to_string()),
-                            };
-                            if let Err(reason) = &result {
-                                let _ = reason;
-                                let cells: Vec<_> = frame.terminal_cells().collect();
-                                crate::engine::completion::settle(
-                                    &cells,
-                                    crate::engine::completion::TERMINAL_OUTCOME_FAILED,
-                                );
+            let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match request {
+                    LaneRequest::Launch {
+                        token, submission, ..
+                    } => {
+                        let LaneLaunch(mut frame) = submission;
+                        let result = match engine.as_mut() {
+                            Some(engine) => {
+                                crate::probe_fire!(stats.fire.execute.engine_fire_us, {
+                                    Self::fire_frame(
+                                        engine,
+                                        &channels,
+                                        &mut frame,
+                                        &launch_rx,
+                                        &mut stash,
+                                        &broker,
+                                        &settlements,
+                                    )
+                                })
                             }
-                            let _ = reply_tx
-                                .send(SchedulerItem::Lane(LaneReply::LaunchDone { token, result }));
+                            None => Err("engine has no backend installed".to_string()),
+                        };
+                        if let Err(reason) = &result {
+                            let _ = reason;
+                            let cells: Vec<_> = frame.terminal_cells().collect();
+                            crate::engine::completion::settle(
+                                &cells,
+                                crate::engine::completion::TERMINAL_OUTCOME_FAILED,
+                            );
                         }
-                        LaneRequest::Control { token, item } => {
-                            let commit =
-                                Self::execute_control(engine_idx, &mut engine, &mut channels, *item);
-                            let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::ControlDone {
-                                token,
-                                commit,
-                            }));
-                        }
-                        LaneRequest::Shutdown { response } => {
-                            let _ = response.send((engine.take(), std::mem::take(&mut channels)));
-                            return true;
-                        }
+                        let _ = reply_tx
+                            .send(SchedulerItem::Lane(LaneReply::LaunchDone { token, result }));
                     }
-                    false
-                }));
+                    LaneRequest::Control { token, item } => {
+                        let commit =
+                            Self::execute_control(engine_idx, &mut engine, &mut channels, *item);
+                        let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::ControlDone {
+                            token,
+                            commit,
+                        }));
+                    }
+                    LaneRequest::Shutdown { response } => {
+                        let _ = response.send((engine.take(), std::mem::take(&mut channels)));
+                        return true;
+                    }
+                }
+                false
+            }));
             match handled {
                 Ok(true) => return,
                 Ok(false) => {}
@@ -754,7 +762,8 @@ impl EngineLoop {
                     settlements.close_all(&broker);
                     owed.answer(&reply_tx, "the engine lane panicked serving this request");
                     if let Some(stashed) = stash.take() {
-                        Owed::of(&stashed).answer(&reply_tx, "the engine lane is down after a panic");
+                        Owed::of(&stashed)
+                            .answer(&reply_tx, "the engine lane is down after a panic");
                     }
                     Self::drain_poisoned(&launch_rx, &control_rx, &reply_tx, engine, channels);
                     return;
@@ -835,7 +844,7 @@ impl EngineLoop {
         let mut wakes: Vec<u64> = Vec::new();
         for step in &submitted.steps {
             for attachment in &step.attachments {
-                let deferred = asynchronous.then(|| &mut wakes);
+                let deferred = asynchronous.then_some(&mut wakes);
                 if let Err(error) =
                     channels.pump_out_with(engine.as_mut(), attachment.instance, deferred)
                 {
@@ -969,12 +978,12 @@ impl EngineLoop {
                     Err(anyhow!("channel {} is already registered", plan.id))
                 } else {
                     match engine.as_mut() {
-                        Some(engine) => crate::engine::verbs::register_channel(
-                            engine, engine_idx, &plan,
-                        )
-                        .inspect(|channel| {
-                            channels.insert(channel.clone(), plan.host_role);
-                        }),
+                        Some(engine) => {
+                            crate::engine::verbs::register_channel(engine, engine_idx, &plan)
+                                .inspect(|channel| {
+                                    channels.insert(channel.clone(), plan.host_role);
+                                })
+                        }
                         None => Err(anyhow!("engine has no backend installed")),
                     }
                 };
@@ -1013,7 +1022,9 @@ impl EngineLoop {
                     return LaneCommit::None;
                 }
                 let result = match engine.as_mut() {
-                    Some(engine) => Self::register_channel_set(engine, engine_idx, channels, &plans),
+                    Some(engine) => {
+                        Self::register_channel_set(engine, engine_idx, channels, &plans)
+                    }
                     None => Err(anyhow!("engine has no backend installed")),
                 };
                 match result {
@@ -1054,7 +1065,17 @@ impl EngineLoop {
                     return LaneCommit::BindFinished { pipeline_id };
                 }
                 match engine.as_mut() {
-                    Some(engine) => match engine.bind_instance(&plan.binding).map(|bound| crate::engine::BoundInstance::new(plan.engine_id, &bound, plan.pacing_wait_id)).map_err(anyhow::Error::from) {
+                    Some(engine) => match engine
+                        .bind_instance(&plan.binding)
+                        .map(|bound| {
+                            crate::engine::BoundInstance::new(
+                                plan.engine_id,
+                                &bound,
+                                plan.pacing_wait_id,
+                            )
+                        })
+                        .map_err(anyhow::Error::from)
+                    {
                         Ok(bound) => {
                             channels.bind(bound.instance_id, plan.binding.channels.clone());
                             LaneCommit::BindInstance {
@@ -1108,16 +1129,17 @@ impl EngineLoop {
                     }
                     return LaneCommit::BindFinished { pipeline_id };
                 };
-                let registered = match Self::register_channel_set(engine, engine_idx, channels, &plans) {
-                    Ok(registered) => registered,
-                    Err(error) => {
-                        if response.send(Err(error)).is_err() {
-                            Self::release_channel_plan_wait_slots(&plans);
-                            Self::release_wait_slots([bind.pacing_wait_id]);
+                let registered =
+                    match Self::register_channel_set(engine, engine_idx, channels, &plans) {
+                        Ok(registered) => registered,
+                        Err(error) => {
+                            if response.send(Err(error)).is_err() {
+                                Self::release_channel_plan_wait_slots(&plans);
+                                Self::release_wait_slots([bind.pacing_wait_id]);
+                            }
+                            return LaneCommit::BindFinished { pipeline_id };
                         }
-                        return LaneCommit::BindFinished { pipeline_id };
-                    }
-                };
+                    };
                 if response.is_closed() {
                     Self::rollback_channel_set(
                         engine,
@@ -1175,7 +1197,17 @@ impl EngineLoop {
                     }
                     return LaneCommit::BindFinished { pipeline_id };
                 }
-                match engine.bind_instance(&bind.binding).map(|bound| crate::engine::BoundInstance::new(bind.engine_id, &bound, bind.pacing_wait_id)).map_err(anyhow::Error::from) {
+                match engine
+                    .bind_instance(&bind.binding)
+                    .map(|bound| {
+                        crate::engine::BoundInstance::new(
+                            bind.engine_id,
+                            &bound,
+                            bind.pacing_wait_id,
+                        )
+                    })
+                    .map_err(anyhow::Error::from)
+                {
                     Ok(bound) => {
                         channels.bind(bound.instance_id, bind.binding.channels.clone());
                         LaneCommit::BindInstance {
@@ -1974,10 +2006,7 @@ impl SchedulerHandle {
             .await?
     }
 
-    pub(crate) fn copy_kv_tracked(
-        &self,
-        plan: ::engine::KvCopy,
-    ) -> Result<ControlCompletion> {
+    pub(crate) fn copy_kv_tracked(&self, plan: ::engine::KvCopy) -> Result<ControlCompletion> {
         let completion = ControlCompletion::new();
         self.send(SchedulerItem::CopyKvTracked {
             plan,
@@ -2260,7 +2289,9 @@ impl BatchScheduler {
                     static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
                     let mut last = LAST.lock().unwrap();
                     let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(3));
-                    let owed = frame_policy.has_queued_frames() || !pending.is_empty() || !in_flight_launches.is_empty();
+                    let owed = frame_policy.has_queued_frames()
+                        || !pending.is_empty()
+                        || !in_flight_launches.is_empty();
                     if due && owed {
                         *last = Some(Instant::now());
                         println!(
@@ -3252,7 +3283,10 @@ impl BatchScheduler {
             } else if let Some(untracked) = scan.untracked {
                 rider_batch = true;
                 if wave_trace() {
-                    wave_trace_emit(format!("[wave-trace] t={}us rider fire={untracked}", wave_trace_us()));
+                    wave_trace_emit(format!(
+                        "[wave-trace] t={}us rider fire={untracked}",
+                        wave_trace_us()
+                    ));
                 }
                 vec![vec![untracked]]
             } else {
@@ -3818,10 +3852,7 @@ mod tests {
             "panicking"
         }
 
-        fn load(
-            &mut self,
-            _request: engine::LoadRequest,
-        ) -> engine::Result<engine::Loaded> {
+        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
             Err(engine::Error::Load("no model".into()))
         }
 
@@ -3833,12 +3864,12 @@ mod tests {
         }
     }
 
+    #[test]
     fn worker_every_case() {
         a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
         a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
     }
 
-    #[test]
     fn a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight() {
         let (reply_tx, reply_rx) = crossbeam::channel::unbounded();
         let mut lane = EngineLoop::spawn(
@@ -3900,10 +3931,7 @@ mod tests {
             "exhausted"
         }
 
-        fn load(
-            &mut self,
-            _request: engine::LoadRequest,
-        ) -> engine::Result<engine::Loaded> {
+        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
             Err(engine::Error::Load("no model".into()))
         }
 
@@ -3975,5 +4003,4 @@ mod tests {
 
         let (_engine, _channels) = lane.shutdown();
     }
-
 }
