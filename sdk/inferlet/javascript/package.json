@@ -22,7 +22,7 @@
     "@bytecodealliance/jco": "^1.23.0",
     "esbuild": "^0.28.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.0.16"
+    "vitest": "^5.0.0"
   },
   "files": [
     "dist",
