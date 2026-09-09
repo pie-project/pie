@@ -40,7 +40,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "metrics",
 ] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
-wasmtime = { version = "47.0.1", default-features = false, features = [
+wasmtime = { version = "48.0.1", default-features = false, features = [
     "runtime",
     "std",
     "anyhow",
@@ -118,4 +118,4 @@ profile-fire = []
 
 [dev-dependencies]
 tempfile = "3"
-wasmtime = { version = "47", default-features = false, features = ["wat"] }
+wasmtime = { version = "48", default-features = false, features = ["wat"] }
