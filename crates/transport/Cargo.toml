@@ -19,4 +19,4 @@ ids = { path = "../ids" }
 nixl = ["dep:bindgen"]
 
 [build-dependencies]
-bindgen = { version = "0.72", optional = true }
+bindgen = { version = "0.73", optional = true }
