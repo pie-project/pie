@@ -21,6 +21,12 @@ wgpu = ["runtime/wgpu"]
 nixl = ["dep:transport", "transport/nixl"]
 
 profile-fire = ["runtime/profile-fire"]
+session-lifetime-diagnostic = ["runtime/session-lifetime-diagnostic"]
+
+[[test]]
+name = "session_lifetime_diagnostic"
+path = "tests/session_lifetime_diagnostic.rs"
+required-features = ["session-lifetime-diagnostic"]
 
 [dependencies]
 runtime = { path = "../runtime" }
@@ -60,6 +66,8 @@ client = { path = "../client" }
 
 [dev-dependencies]
 tempfile = "3"
+gateway = { path = "../gateway" }
+tokio = { version = "1.53", features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [lints]

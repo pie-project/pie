@@ -505,7 +505,8 @@ impl Session {
         ) {
             Ok(process_id) => {
                 if capture_outputs {
-                    self.attached_processes.push(process_id);
+                    // Client mapping was pre-registered by process::spawn
+                    self.captured_launches.push(process_id);
                     self.send_response(corr_id, true, process_id.to_string())
                         .await;
                 } else {
@@ -567,7 +568,7 @@ impl Session {
             return;
         };
 
-        if !self.attached_processes.contains(&process_id) {
+        if !self.owns_process(process_id) {
             tracing::warn!(
                 "SignalProcess: process {} not owned by client",
                 process_id_str
@@ -610,6 +611,7 @@ impl Session {
         }
 
         process::terminate(process_id, Err("Signal".to_string()));
+        self.forget_process(process_id);
         self.send_response(corr_id, true, "Process terminated".to_string())
             .await;
     }
@@ -632,7 +634,7 @@ impl Session {
             }
         };
 
-        if !self.attached_processes.contains(&process_id) {
+        if !self.owns_process(process_id) {
             tracing::error!(
                 "TransferFile: process {} not owned by client",
                 process_id_str
