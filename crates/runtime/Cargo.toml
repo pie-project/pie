@@ -107,12 +107,11 @@ engine-wgpu = { path = "../engine-wgpu", optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 engine-metal = { path = "../engine-metal", optional = true }
-objc2 = { version = "0.6", optional = true }
 
 [features]
 default = []
 cuda = ["dep:engine-cuda", "engine-cuda/cuda", "dep:cudarc", "dep:libloading", "cudarc/cuda-13000"]
-metal = ["dep:engine-metal", "dep:objc2"]
+metal = ["dep:engine-metal"]
 vulkan = ["dep:engine-vulkan", "engine-vulkan/vulkan"]
 wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu"]
 profile-fire = []
