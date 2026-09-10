@@ -315,6 +315,7 @@ impl Windows {
                 }
             };
             if spans.len() > 1 {
+                // Keep this refusal before the cut: input reservation bounds cut spans by it.
                 let bound = fallback::bound(compiled, axis, &region.mask);
                 if fallback::promised(compiled, axis, region) || spans.len() > bound as usize {
                     return Err(Fault::Fragmented {

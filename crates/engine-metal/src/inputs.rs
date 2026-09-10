@@ -236,6 +236,49 @@ pub struct Inputs {
     rs_commit: u64,
 }
 
+/// The ints one fire's packed window boundaries can fill, at the ceiling.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn window_ints(
+    budget: &Budget,
+    paging: Paging,
+    spaces: usize,
+    classes: usize,
+    max_runs: u32,
+    gathered: usize,
+    run_caps: &[u32],
+    run_passes: &[u32],
+) -> u64 {
+    let rows = u64::from(budget.max_tokens);
+    let lanes = u64::from(budget.max_lanes);
+    let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
+    let intervals = (classes * (classes + 1) / 2) as u64;
+    let per_gathered = 3 * rows + spaces as u64 * (2 * lanes + (lanes + 1) + pages);
+    let runs = u64::from(max_runs);
+
+    let mut cut = 0u64;
+    let mut chunked: Vec<(u32, u64)> = Vec::new();
+    for (at, &cap) in run_caps.iter().enumerate() {
+        if cap == 0 {
+            continue;
+        }
+        let passes = run_passes.get(at).copied().unwrap_or(0);
+        if passes > 1 {
+            cut += intervals.min(runs) * u64::from(passes) * (lanes + 1);
+        } else {
+            match chunked.iter().position(|(held, _)| *held == cap) {
+                Some(group) => chunked[group].1 += 1,
+                None => chunked.push((cap, 1)),
+            }
+        }
+    }
+    for (cap, regions) in chunked {
+        cut += intervals.min(regions * runs) * rows.div_ceil(u64::from(cap)) * (lanes + 1);
+    }
+
+    (intervals + 1 + gathered as u64) * (lanes + 1) + cut + gathered as u64 * per_gathered
+}
+
 impl Inputs {
     #[allow(clippy::too_many_arguments)]
     pub fn reserve(
@@ -244,6 +287,7 @@ impl Inputs {
         paging: Paging,
         spaces: usize,
         classes: usize,
+        max_runs: u32,
         gathered: usize,
         patch: Option<PatchSeat>,
         voxel: Option<VoxelSeat>,
@@ -251,13 +295,15 @@ impl Inputs {
         self_cond_taps: u32,
         ports: &[PortSeat],
         selections: usize,
+        run_caps: &[u32],
+        run_passes: &[u32],
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
         let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
-        let per_gathered = 3 * rows + spaces as u64 * (2 * lanes + (lanes + 1) + pages);
-        let window_ints =
-            (classes * (classes + 1) / 2 + 1) as u64 * (lanes + 1) + gathered as u64 * per_gathered;
+        let window_ints = window_ints(
+            budget, paging, spaces, classes, max_runs, gathered, run_caps, run_passes,
+        );
 
         let mut at = 0u64;
         let mut take = |bytes: u64| {

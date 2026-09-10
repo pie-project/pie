@@ -669,6 +669,7 @@ impl Shell {
                     paging,
                     spaces,
                     compiled.classes.classes.len(),
+                    model_exec::fire::max_runs(&compiled),
                     gathers,
                     patch_seat,
                     voxel_seat,
@@ -676,6 +677,8 @@ impl Shell {
                     self_cond_taps,
                     &port_seats,
                     selections,
+                    &run_caps,
+                    &run_passes,
                 )
             })
             .collect::<Result<Vec<_>>>()?;

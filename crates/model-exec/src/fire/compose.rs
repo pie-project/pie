@@ -737,4 +737,79 @@ mod tests {
         let fire = compose(&compiled, &open, &[Lane::new(0, 5)]).expect("composes");
         assert_eq!(fire.bucket(), 5);
     }
+
+    /// The window reservation is carved at load from `ceil(rows / cap)`; a
+    /// cut that yielded more pieces than that would overrun a store nobody
+    /// can grow by then.
+    #[test]
+    fn a_cut_span_comes_back_in_at_most_ceil_rows_over_cap_pieces() {
+        for cap in [0u32, 1, 3, 7, 64] {
+            for rows in [1u32, 7, 8, 100] {
+                let span = MaskSpan {
+                    row_offset: 5,
+                    rows,
+                    lane_offset: 2,
+                    lanes: 3,
+                };
+                let mut spans = vec![span, span];
+                chunk_spans(&mut spans, cap);
+                if cap == 0 {
+                    assert_eq!(spans.len(), 2, "a cap of 0 cuts nothing");
+                    assert!(
+                        spans.iter().all(|piece| piece.rows == rows),
+                        "and leaves every span the width it came in at"
+                    );
+                } else {
+                    assert!(
+                        spans.len() as u32 <= 2 * rows.div_ceil(cap),
+                        "{rows} rows cut at {cap} came back in {} pieces, and \
+                         the reservation pays for {}",
+                        spans.len(),
+                        2 * rows.div_ceil(cap)
+                    );
+                    assert!(
+                        spans.iter().all(|piece| piece.rows <= cap),
+                        "a piece is at most one cap wide"
+                    );
+                }
+                assert_eq!(
+                    spans.iter().map(|piece| piece.rows).sum::<u32>(),
+                    2 * rows,
+                    "a cut moves no row"
+                );
+            }
+        }
+    }
+
+    /// The reservation pays one window group per pass, counted off the
+    /// ceiling it was handed; the walk must stay under that ceiling and
+    /// replicate by exactly what it reports. A cap of 0 walks once, which is
+    /// the uncapped reservation the load already carved.
+    #[test]
+    fn a_replicated_span_is_walked_exactly_the_passes_it_reports() {
+        for max_passes in [1u32, 2, 6, 64] {
+            for cap in [0u32, 1, 4, 1_000] {
+                let span = MaskSpan {
+                    row_offset: 0,
+                    rows: 100,
+                    lane_offset: 0,
+                    lanes: 2,
+                };
+                let mut spans = vec![span, span, span];
+                let passes = pass_spans(&mut spans, cap, max_passes);
+                assert!(
+                    passes <= max_passes.max(1),
+                    "a cap of {cap} under a ceiling of {max_passes} walked \
+                     {passes} passes; the reservation was carved for the \
+                     ceiling"
+                );
+                assert_eq!(
+                    spans.len() as u32,
+                    3 * passes,
+                    "three spans walked {passes} times each is what the \
+                     reservation counts windows for"
+                );
+            }
+        }
+    }
 }
