@@ -107,16 +107,17 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
         }
         Err(None) => return,
     };
+    let corr = first.message.corr_id();
     let (handle, first_rx) = match state.sessions.create(ident, first, Affinity::Sticky).await {
         Ok(pair) => pair,
         Err(e) => {
             // A session refused on its first turn is closed, and the reason
-            // rides on the close frame as well as the error frame ahead of
-            // it: a client that reads only its response frames still sees
-            // why its socket went, and so does the server log.
+            // rides on the close frame as well as on the refusal ahead of it,
+            // answered under the turn's request id: a client waiting on its
+            // response sees why its socket went, and so does the server log.
             let why = e.to_string();
             tracing::warn!("session refused on its first turn: {why}");
-            let _ = tx.send(Message::Text(error_json(&why).into())).await;
+            let _ = tx.send(refusal(corr, &why)).await;
             let _ = tx
                 .send(Message::Close(Some(CloseFrame {
                     code: close_code::POLICY,
