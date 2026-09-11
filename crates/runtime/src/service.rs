@@ -171,6 +171,11 @@ where
         self.map.iter().map(|r| r.key().clone()).collect()
     }
 
+    #[cfg(feature = "session-lifetime-diagnostic")]
+    pub fn handle_keys(&self) -> Vec<K> {
+        self.handles.iter().map(|r| r.key().clone()).collect()
+    }
+
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()

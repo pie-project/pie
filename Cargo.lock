@@ -6969,6 +6969,7 @@ dependencies = [
  "controller-api",
  "engine",
  "futures",
+ "gateway",
  "ids",
  "mimalloc",
  "model-ir",

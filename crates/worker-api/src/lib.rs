@@ -1,5 +1,5 @@
 use controller_api::WorkerStatus;
-use ids::{ReqId, WorkerId};
+use ids::{ReqId, SessionId, WorkerId};
 
 mod data;
 mod link;
@@ -26,6 +26,8 @@ pub trait WorkerControl {
     async fn dispatch(req: Request) -> Accepted;
 
     async fn cancel(req_id: ReqId);
+
+    async fn close_session(session: SessionId);
 
     async fn set_priority(req_id: ReqId, p: Priority);
 

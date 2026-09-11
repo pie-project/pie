@@ -110,6 +110,7 @@ engine-metal = { path = "../engine-metal", optional = true }
 
 [features]
 default = []
+session-lifetime-diagnostic = []
 cuda = ["dep:engine-cuda", "engine-cuda/cuda", "dep:cudarc", "dep:libloading", "cudarc/cuda-13000"]
 metal = ["dep:engine-metal"]
 vulkan = ["dep:engine-vulkan", "engine-vulkan/vulkan"]

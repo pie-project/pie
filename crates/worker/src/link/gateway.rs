@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "session-lifetime-diagnostic")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -24,8 +26,88 @@ const PUSH_DEADLINE: Duration = Duration::from_secs(300);
 
 const TURN_QUEUE_DEPTH: usize = 64;
 
+const TURN_DRAIN_LIMIT: Duration = Duration::from_secs(5);
+
 pub struct GatewayLink {
     serve_task: tokio::task::JoinHandle<()>,
+    #[cfg(feature = "session-lifetime-diagnostic")]
+    sessions: Weak<SessionRegistry>,
+}
+
+#[cfg(feature = "session-lifetime-diagnostic")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOwnerKeys {
+    pub sessions: Vec<(SessionId, ClientId)>,
+    pub active: Vec<(ReqId, SessionId)>,
+    pub runtime: runtime::server::SessionOwnerKeys,
+}
+
+#[cfg(feature = "session-lifetime-diagnostic")]
+#[derive(Clone)]
+pub struct SessionObserver {
+    sessions: Weak<SessionRegistry>,
+}
+
+#[cfg(feature = "session-lifetime-diagnostic")]
+impl SessionObserver {
+    /// Reads exact real registry keys sequentially at a quiescent checkpoint.
+    pub async fn session_owner_keys(&self) -> Option<SessionOwnerKeys> {
+        let registry = self.sessions.upgrade()?;
+        let mut sessions: Vec<_> = registry
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .map(|(session, handle)| (*session, handle.client_id))
+            .collect();
+        let mut active: Vec<_> = registry
+            .active
+            .lock()
+            .await
+            .iter()
+            .map(|(request, (session, _))| (*request, *session))
+            .collect();
+        sessions.sort_unstable();
+        active.sort_unstable();
+        Some(SessionOwnerKeys {
+            sessions,
+            active,
+            runtime: runtime::server::session_owner_keys(),
+        })
+    }
+
+    /// Hold the next terminal reply after its response push completes but before
+    /// Eos, leaving a real active turn for frontend-close cancellation.
+    pub fn hold_next_terminal(&self) -> bool {
+        self.sessions
+            .upgrade()
+            .is_some_and(|registry| !registry.diagnostic_hold.armed.swap(true, Ordering::AcqRel))
+    }
+
+    pub async fn close_session(&self, session: SessionId) {
+        if let Some(registry) = self.sessions.upgrade() {
+            registry.close_session(session).await;
+        }
+    }
+
+    pub async fn held_terminal(&self) -> Option<ReqId> {
+        let registry = self.sessions.upgrade()?;
+        loop {
+            if let Some(req_id) = *registry.diagnostic_hold.held.lock().await {
+                return Some(req_id);
+            }
+            registry.diagnostic_hold.reached.notified().await;
+        }
+    }
+}
+
+#[cfg(feature = "session-lifetime-diagnostic")]
+impl GatewayLink {
+    pub fn session_observer(&self) -> SessionObserver {
+        SessionObserver {
+            sessions: self.sessions.clone(),
+        }
+    }
 }
 
 impl Drop for GatewayLink {
@@ -72,10 +154,11 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
         .with_context(|| format!("registering worker with gateway at {addr}"))?;
     tracing::info!(%worker_id, gateway = %addr, "worker registered with gateway (dial-in)");
 
+    let sessions = Arc::new(SessionRegistry::default());
     let server = WorkerControlServer {
         worker_id,
         gateway,
-        sessions: Arc::new(SessionRegistry::default()),
+        sessions: sessions.clone(),
     };
     let serve_task = tokio::spawn(
         BaseChannel::with_defaults(server_half)
@@ -85,7 +168,11 @@ pub async fn connect_gateway(addr: &str, worker_id: WorkerId) -> Result<GatewayL
             }),
     );
 
-    Ok(GatewayLink { serve_task })
+    Ok(GatewayLink {
+        serve_task,
+        #[cfg(feature = "session-lifetime-diagnostic")]
+        sessions: Arc::downgrade(&sessions),
+    })
 }
 
 pub struct GatewayLinkManager {
@@ -203,10 +290,30 @@ struct WorkerControlServer {
 #[derive(Default)]
 struct SessionRegistry {
     sessions: Mutex<HashMap<SessionId, SessionHandle>>,
-    active: Mutex<HashMap<ReqId, SessionId>>,
+    active: Mutex<HashMap<ReqId, (SessionId, ClientId)>>,
+    #[cfg(feature = "session-lifetime-diagnostic")]
+    diagnostic_hold: DiagnosticHold,
+}
+
+#[cfg(feature = "session-lifetime-diagnostic")]
+#[derive(Default)]
+struct DiagnosticHold {
+    armed: AtomicBool,
+    held: Mutex<Option<ReqId>>,
+    reached: Notify,
+}
+
+impl SessionRegistry {
+    async fn close_session(&self, session: SessionId) {
+        if self.sessions.lock().await.remove(&session).is_some() {
+            tracing::debug!(%session, "frontend session ended; releasing worker session");
+        }
+    }
 }
 
 struct SessionHandle {
+    #[cfg(feature = "session-lifetime-diagnostic")]
+    client_id: ClientId,
     turns: mpsc::Sender<Request>,
     cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>>,
 }
@@ -225,8 +332,8 @@ impl WorkerControl for WorkerControlServer {
     }
 
     async fn cancel(self, _: tarpc::context::Context, req_id: ReqId) {
-        let session = self.sessions.active.lock().await.get(&req_id).copied();
-        if let Some(session) = session
+        let owner = self.sessions.active.lock().await.get(&req_id).copied();
+        if let Some((session, _)) = owner
             && let Some(handle) = self.sessions.sessions.lock().await.get(&session)
         {
             let notify = handle.cancels.lock().await.get(&req_id).cloned();
@@ -243,6 +350,10 @@ impl WorkerControl for WorkerControlServer {
 
     async fn drain(self, _: tarpc::context::Context) {
         tracing::info!("drain: no runtime hook (best-effort no-op)");
+    }
+
+    async fn close_session(self, _: tarpc::context::Context, session: SessionId) {
+        self.sessions.close_session(session).await;
     }
 }
 
@@ -287,6 +398,8 @@ impl WorkerControlServer {
         map.insert(
             session,
             SessionHandle {
+                #[cfg(feature = "session-lifetime-diagnostic")]
+                client_id,
                 turns: turns_tx.clone(),
                 cancels,
             },
@@ -396,7 +509,7 @@ async fn session_driver(
         let cancel = Arc::new(Notify::new());
         cancels.lock().await.insert(req_id, cancel.clone());
         if let Some(reg) = registry.upgrade() {
-            reg.active.lock().await.insert(req_id, session);
+            reg.active.lock().await.insert(req_id, (session, client_id));
         }
 
         let fed = feed_turn(client_id, req_id, req.message);
@@ -408,13 +521,35 @@ async fn session_driver(
         let link_gone_tx = link_gone_tx.clone();
         running.spawn(async move {
             let outcome = run_turn(
-                client_id, &gateway, &cancel, req_id, fed, corr, binding, inbox,
+                client_id,
+                &gateway,
+                &cancel,
+                req_id,
+                fed,
+                corr,
+                binding,
+                inbox,
+                #[cfg(feature = "session-lifetime-diagnostic")]
+                registry.clone(),
             )
             .await;
             routes.lock().await.close(req_id);
             cancels.lock().await.remove(&req_id);
             if let Some(reg) = registry.upgrade() {
-                reg.active.lock().await.remove(&req_id);
+                let mut active = reg.active.lock().await;
+                if active
+                    .get(&req_id)
+                    .is_some_and(|(_, owner)| *owner == client_id)
+                {
+                    active.remove(&req_id);
+                }
+                #[cfg(feature = "session-lifetime-diagnostic")]
+                {
+                    let mut held = reg.diagnostic_hold.held.lock().await;
+                    if *held == Some(req_id) {
+                        *held = None;
+                    }
+                }
             }
             if let TurnEnd::LinkGone = outcome {
                 let _ = link_gone_tx.send(());
@@ -424,11 +559,44 @@ async fn session_driver(
         while running.try_join_next().is_some() {}
     }
 
-    router.abort();
+    // Stop taking turns before the teardown below, so a dispatch racing a
+    // close gets a fresh session instead of queueing onto a driver that has
+    // already stopped reading.
+    drop(turns);
+
+    // The prompt path, not the guarantee. A cancelled turn terminates the
+    // process it owns on its way out, which frees it sooner than session
+    // cleanup would; but the worker cannot promise that for every turn — a
+    // cancel arriving before a launch reply has no pid to terminate, and a
+    // turn blocked in `push_tokens` never reaches its `select!`. What holds
+    // regardless is `runtime::server::close_session` below: the session's
+    // `Drop` terminates the launches it owns. So this wait expiring is a
+    // slower release, not a leaked process.
+    for notify in cancels.lock().await.values() {
+        notify.notify_one();
+    }
+    let drained = tokio::time::timeout(TURN_DRAIN_LIMIT, async {
+        while running.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(%session, "turns outlived the drain limit; aborting them");
+    }
     running.shutdown().await;
+    router.abort();
     runtime::server::close_session(client_id);
     if let Some(reg) = registry.upgrade() {
-        reg.sessions.lock().await.remove(&session);
+        reg.active
+            .lock()
+            .await
+            .retain(|_, (_, owner)| *owner != client_id);
+        // A dispatch racing the close may already have put a fresh driver's
+        // handle under this `SessionId`; only this driver's own entry, whose
+        // sender the `drop` above closed, is ours to retire.
+        let mut sessions = reg.sessions.lock().await;
+        if sessions.get(&session).is_some_and(|h| h.turns.is_closed()) {
+            sessions.remove(&session);
+        }
     }
     tracing::debug!(%session, "session driver exited");
 }
@@ -494,6 +662,7 @@ async fn run_turn(
     corr: Option<u32>,
     binding: ProcBinding,
     mut inbox: mpsc::Receiver<ServerMessage>,
+    #[cfg(feature = "session-lifetime-diagnostic")] registry: Weak<SessionRegistry>,
 ) -> TurnEnd {
     let proc_launch = binding.is_process();
     let mut process_id: Option<String> = match binding {
@@ -534,6 +703,14 @@ async fn run_turn(
                     }
                 }
                 if terminal {
+                    #[cfg(feature = "session-lifetime-diagnostic")]
+                    if let Some(registry) = registry.upgrade()
+                        && registry.diagnostic_hold.armed.swap(false, Ordering::AcqRel)
+                    {
+                        *registry.diagnostic_hold.held.lock().await = Some(req_id);
+                        registry.diagnostic_hold.reached.notify_one();
+                        continue;
+                    }
                     return push_eos(gateway, req_id).await;
                 }
             }
