@@ -287,3 +287,35 @@ fn past_the_seat(have: u64, asked: u64, seat_pages: u64, page_size: u32) -> Opti
         tokens(seat_pages),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::past_the_seat;
+
+    /// The seat is a ceiling on the whole working set, not on one claim: a
+    /// drain's later chunk asks for little and still crosses.
+    #[test]
+    fn a_small_claim_on_a_full_working_set_is_refused() {
+        let refusal = past_the_seat(511, 2, 512, 32).expect("511 + 2 is past a 512-page seat");
+        assert!(refusal.contains("513 pages (16416 tokens)"), "{refusal}");
+        assert!(refusal.contains("512 pages (16384 tokens)"), "{refusal}");
+    }
+
+    /// The incident's request: 32,700 tokens against a 16,384-token seat,
+    /// refused on its first claim rather than at a later chunk.
+    #[test]
+    fn the_first_claim_of_an_unservable_request_is_refused() {
+        assert!(past_the_seat(0, 1022, 512, 32).is_some());
+    }
+
+    #[test]
+    fn a_claim_that_exactly_fills_the_seat_is_served() {
+        assert_eq!(past_the_seat(500, 12, 512, 32), None);
+    }
+
+    /// A seat of zero is an engine that declared no ceiling: nothing to exceed.
+    #[test]
+    fn no_declared_seat_refuses_nothing() {
+        assert_eq!(past_the_seat(1_000_000, 1_000_000, 0, 32), None);
+    }
+}
