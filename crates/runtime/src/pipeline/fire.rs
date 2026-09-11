@@ -69,6 +69,20 @@ impl PendingFireQueue {
         Arc::clone(&self.finalizer).lock_owned().await
     }
 
+    /// Keep the transaction in the shared FIFO while waiting, so an aborted
+    /// guest leaves teardown its owner. Caller holds the finalizer guard;
+    /// errors are read by finalization too, rather than skipping cleanup.
+    pub(crate) async fn await_front_completion(&self) {
+        let completion = self
+            .lock()
+            .unwrap()
+            .front()
+            .map(PendingOp::completion_signal);
+        if let Some(completion) = completion {
+            completion.await;
+        }
+    }
+
     pub(crate) fn try_finalize_guard(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         Arc::clone(&self.finalizer).try_lock_owned().ok()
     }
@@ -1930,6 +1944,7 @@ pub(crate) async fn finalize_all<C: FireContext>(
 ) -> Anyhow<()> {
     let _finalize_guard = fires.finalize_guard().await;
     loop {
+        fires.await_front_completion().await;
         let op = fires.lock().unwrap().pop_front();
         let Some(op) = op else {
             return Ok(());
@@ -2687,7 +2702,7 @@ fn reclaim_device_geometry_grants<C: FireContext>(ctx: &mut C, fwd_rep: u32, ins
 }
 
 #[cfg(test)]
-mod lifecycle_tests {
+pub(crate) mod lifecycle_tests {
     use super::*;
     use wasmtime::component::ResourceTable;
 
@@ -2704,6 +2719,109 @@ mod lifecycle_tests {
         fn process_id(&self) -> uuid::Uuid {
             self.id
         }
+    }
+
+    pub(crate) fn pending_fire_fixture(
+        cells: BoundCells,
+    ) -> (
+        PendingFires,
+        crate::engine::WorkItemCompletion,
+        KvWorkingSet,
+        crate::store::registry::Stores,
+        PipelineFailure,
+    ) {
+        let model = crate::store::registry::register_model(32, &[1], &[1]);
+        let stores = crate::store::registry::get(model, 0);
+        let (id, txn) = {
+            let mut store = stores.kv.lock();
+            let id = store.create_working_set();
+            store.reserve(id, 1).expect("reserve the test sequence");
+            let mut granted = store
+                .reserve_device_pages(1)
+                .expect("one free physical page");
+            let (_, _, _, txn) = kv::prepare_explicit_reserved(&mut store, id, &[0], &mut granted)
+                .expect("publish a real pending KV transaction");
+            (id, txn)
+        };
+        let ws = KvWorkingSet::new(model, 0, id, 32);
+        let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
+        let failure = Arc::new(Mutex::new(None));
+        let fires = Arc::new(PendingFireQueue::new());
+        fires
+            .lock()
+            .expect("test FIFO")
+            .push_back(PendingOp::Fire(PendingFire {
+                completion: completion.clone(),
+                kv: FireKv::Host(Some(txn)),
+                rstxn: RsTxnsGuard::new(model, 0, None),
+                ws_guard: ws.fire_lease().expect("lease the submitted working set"),
+                model,
+                engine: 0,
+                fwd_rep: u32::MAX,
+                instance_id: 0,
+                cells,
+                failure: failure.clone(),
+            }));
+        (fires, completion, ws, stores, failure)
+    }
+
+    pub(crate) fn resolve_test_completion(
+        completion: &crate::engine::WorkItemCompletion,
+        failed: bool,
+    ) {
+        completion.mark_native_retired();
+        if failed {
+            completion.reject("test callback failure");
+        } else {
+            // The completion owns this terminal cell for the entire write.
+            unsafe {
+                (*completion.terminal_cell_ptr())
+                    .publish(crate::engine::completion::TERMINAL_OUTCOME_SUCCESS);
+            }
+            completion
+                .resolve_from_terminal()
+                .expect("publish successful completion");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_full_drain_keeps_pending_kv_for_teardown() -> anyhow::Result<()> {
+        use std::future::Future;
+        for failed in [false, true] {
+            let (fires, completion, ws, stores, failure) = pending_fire_fixture(Vec::new());
+            let mut context = TestContext {
+                id: uuid::Uuid::new_v4(),
+                resources: ResourceTable::new(),
+            };
+            context.resources.push(ws)?;
+            {
+                let mut drain = Box::pin(finalize_all(&mut context, &fires, false));
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(drain.as_mut().poll(&mut task).is_pending());
+                // Dropping the real host future models guest-task cancellation.
+            }
+            assert_eq!(
+                fires.lock().expect("test FIFO").len(),
+                1,
+                "cancelled drain must leave its unresolved operation in the FIFO"
+            );
+            context.resources = ResourceTable::new();
+            assert_eq!(
+                stores.kv.lock().available_pages(),
+                0,
+                "resource destruction must not recycle pages before completion"
+            );
+            resolve_test_completion(&completion, failed);
+            finalize_all(&mut context, &fires, true).await?;
+            assert!(fires.lock().expect("test FIFO").is_empty());
+            assert_eq!(
+                stores.kv.lock().available_pages(),
+                1,
+                "teardown must settle the original transaction and release its page"
+            );
+            assert_eq!(failure.lock().expect("test failure").is_some(), failed);
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
