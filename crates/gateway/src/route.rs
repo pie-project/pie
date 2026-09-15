@@ -77,7 +77,14 @@ impl RoutingHandle {
         self
     }
 
-    pub fn admit(&self, _req: &Request) -> AdmissionDecision {
+    pub fn admit(&self, req: &Request) -> AdmissionDecision {
+        if matches!(
+            &req.message,
+            client_api::ClientMessage::ListProcesses { .. }
+                | client_api::ClientMessage::TerminateProcess { .. }
+        ) {
+            return AdmissionDecision::Admit;
+        }
         admit(&self.routing.borrow(), &self.admission)
     }
 
@@ -329,6 +336,56 @@ mod tests {
         let (_rt, rr) = watch::channel(table_v);
         let (_ct, cr) = watch::channel(Arc::new(connset(connected)));
         RoutingHandle::new(rr, cr)
+    }
+
+    #[test]
+    fn process_control_survives_resource_saturation_but_launches_do_not() {
+        for (kv, inflight) in [(255, 0), (0, 256)] {
+            let h = handle_with(
+                table(vec![worker(1, "m", Health::Healthy, kv, inflight)]),
+                &[1],
+            );
+            let mut request = req();
+            for message in [
+                ClientMessage::ListProcesses { corr_id: 1 },
+                ClientMessage::TerminateProcess {
+                    corr_id: 1,
+                    process_id: "running".into(),
+                },
+            ] {
+                request.message = message;
+                assert_eq!(h.admit(&request), AdmissionDecision::Admit);
+            }
+            request.message = ClientMessage::LaunchProcess {
+                corr_id: 1,
+                inferlet: "chat".into(),
+                input: String::new(),
+                capture_outputs: false,
+            };
+            assert!(matches!(h.admit(&request), AdmissionDecision::Reject(_)));
+            assert!(matches!(h.admit(&req()), AdmissionDecision::Reject(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn process_control_still_requires_a_healthy_connected_worker() {
+        for (health, connected) in [(Health::Unreachable, vec![1]), (Health::Healthy, vec![])] {
+            let h = handle_with(table(vec![worker(1, "m", health, 255, 256)]), &connected);
+            let reg = StubRegistry {
+                answers: Default::default(),
+                calls: Mutex::new(Vec::new()),
+            };
+            let mut request = req();
+            request.message = ClientMessage::ListProcesses { corr_id: 1 };
+            assert_eq!(h.admit(&request), AdmissionDecision::Admit);
+            assert_eq!(
+                h.dispatch_with_retry(&reg, &request, None)
+                    .await
+                    .unwrap_err(),
+                RouteError::NoCandidate
+            );
+            assert!(reg.calls.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
