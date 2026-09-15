@@ -43,7 +43,6 @@ executor. See `src/executor/arena.rs`.
 cargo test -p checkpoint                    # the whole compiler, no GPU needed
 cargo clippy -p checkpoint --all-targets
 cargo fmt -p checkpoint --check
-UPDATE_GOLDEN=1 cargo test -p checkpoint --test golden_plans
 ```
 
 No GPU, in any configuration. A `cuda` feature stood here, gating a
@@ -100,7 +99,7 @@ deliberately not a second compiler; the two share no code, which is what makes
 disagreement mean something.
 
 `pie model import` runs it on every plan it compiles, before a byte is read.
-The golden-plan tests run it too, over all sixteen goldens, so a golden cannot
+The golden-plan tests run it too, over all fifteen goldens, so a golden cannot
 be regenerated from a broken compiler.
 
 `dump::describe` is the one-line boot-log summary and `dump::plan_stats_json`
