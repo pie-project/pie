@@ -307,6 +307,7 @@ pub(crate) enum ChannelReadMode {
 enum ChannelPoll {
     Ready(Result<Vec<u8>, String>),
     Finalize(crate::pipeline::fire::PendingOp),
+    AwaitCompletion(crate::pipeline::fire::PendingFires),
     Pending {
         cell: Arc<Mutex<ChannelCell>>,
         fires: Option<crate::pipeline::fire::PendingFires>,
@@ -332,16 +333,16 @@ fn poll_channel(
     {
         let ready = cell.lock().unwrap().read();
         match ready {
-            Ok(_) if pop_settled => {
-                if let Some(op) = fires
-                    .as_ref()
-                    .and_then(|fires| fires.lock().unwrap().pop_front())
+            Ok(_) => {
+                if pop_settled && let Some(op) = crate::pipeline::fire::pop_settled(fires.as_ref())
                 {
                     return Ok(ChannelPoll::Finalize(op));
                 }
-            }
-            Ok(_) => {
-                return Ok(ChannelPoll::Pending { cell, fires });
+                // A visible channel may precede fire completion. Wait on that
+                // completion, not the already-ready channel, before taking it.
+                return Ok(ChannelPoll::AwaitCompletion(
+                    fires.expect("the ready take has a pending fire queue"),
+                ));
             }
             Err(ChannelError::Empty) => {}
             Err(error) => return Ok(ChannelPoll::Ready(Err(error.to_string()))),
@@ -380,12 +381,17 @@ async fn materialize_channel(
         let state = match state {
             ChannelPoll::Pending {
                 fires: Some(fires), ..
-            } => {
+            }
+            | ChannelPoll::AwaitCompletion(fires) => {
                 let _finalize_guard = fires.finalize_guard().await;
                 let state = accessor.with(|mut access| {
                     poll_channel(access.get(), &this, mode, true, settle_ready_take)
                 })?;
                 match state {
+                    ChannelPoll::AwaitCompletion(fires) => {
+                        fires.await_front_completion().await;
+                        continue;
+                    }
                     ChannelPoll::Finalize(op) => {
                         let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
                         accessor.with(|mut access| {
@@ -405,6 +411,7 @@ async fn materialize_channel(
                 return Ok(value);
             }
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
+            ChannelPoll::AwaitCompletion(_) => unreachable!("completion wait holds finalizer gate"),
             ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
                 if let Err(error) =
@@ -428,10 +435,15 @@ pub(crate) async fn materialize_channel_blocking(
         let state = match state {
             ChannelPoll::Pending {
                 fires: Some(fires), ..
-            } => {
+            }
+            | ChannelPoll::AwaitCompletion(fires) => {
                 let _finalize_guard = fires.finalize_guard().await;
                 let state = poll_channel(ctx, &this, mode, true, settle_ready_take)?;
                 match state {
+                    ChannelPoll::AwaitCompletion(fires) => {
+                        fires.await_front_completion().await;
+                        continue;
+                    }
                     ChannelPoll::Finalize(op) => {
                         let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
                         crate::pipeline::fire::complete_finalize(ctx, finalized);
@@ -449,6 +461,7 @@ pub(crate) async fn materialize_channel_blocking(
                 return Ok(value);
             }
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
+            ChannelPoll::AwaitCompletion(_) => unreachable!("completion wait holds finalizer gate"),
             ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
                 if let Err(error) =
@@ -2554,6 +2567,102 @@ mod tests {
             port_rows(&[bound("timestep", PortKind::LaneVector, None)]),
             Ok(None)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_ready_take_keeps_pending_kv_for_teardown() -> anyhow::Result<()> {
+        use super::*;
+        use crate::pipeline::fire::lifecycle_tests::{
+            pending_fire_fixture, resolve_test_completion,
+        };
+        use std::future::Future;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        for failed in [false, true] {
+            // The channel is visible before the native completion, which is
+            // the ready-Take path that used to remove an unresolved fire.
+            let mirror = Box::new([7i32, 0]);
+            let words = Box::new([
+                AtomicU64::new(0),
+                AtomicU64::new(1),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ]);
+            let mut cell = ChannelCell::new(vec![1], Dtype::I32, 1);
+            cell.role = Some(HostRole::Reader);
+            cell.attach_reader_mirror(
+                0,
+                mirror.as_ptr() as u64,
+                words.as_ptr() as u64,
+                4,
+                1,
+                0,
+                0,
+                1,
+                2,
+                3,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let cell = Arc::new(Mutex::new(cell));
+            assert_eq!(
+                cell.lock().expect("test channel").read(),
+                Ok(7i32.to_ne_bytes().to_vec())
+            );
+            let (fires, completion, ws, stores, failure) = pending_fire_fixture(vec![cell.clone()]);
+            let mut context = ProcessCtx::new(
+                uuid::Uuid::new_v4(),
+                "test".into(),
+                crate::inferlet::process::OutputMode::Discard,
+                &crate::inferlet::sandbox::InstancePolicy::deny_all(),
+                None,
+            )
+            .await?;
+            context.ctx().table.push(ws)?;
+            let channel = context.ctx().table.push(Channel {
+                cell: cell.clone(),
+                fires: Some(fires.clone()),
+            })?;
+            {
+                let mut take = Box::pin(materialize_channel_blocking(
+                    &mut context,
+                    channel,
+                    ChannelReadMode::Take,
+                ));
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(take.as_mut().poll(&mut task).is_pending());
+            }
+            assert_eq!(
+                fires.lock().expect("test FIFO").len(),
+                1,
+                "cancelled ready Take must not remove an unresolved fire"
+            );
+            assert_eq!(
+                words[0].load(Ordering::Acquire),
+                0,
+                "the visible channel must not be consumed before finalization"
+            );
+            *context.ctx().table = wasmtime::component::ResourceTable::new();
+            assert_eq!(stores.kv.lock().available_pages(), 0);
+            resolve_test_completion(&completion, failed);
+            crate::pipeline::fire::finalize_all(&mut context, &fires, true).await?;
+            assert!(fires.lock().expect("test FIFO").is_empty());
+            assert_eq!(
+                stores.kv.lock().available_pages(),
+                1,
+                "the original submitted page must be reclaimed after teardown"
+            );
+            assert_eq!(failure.lock().expect("test failure").is_some(), failed);
+            let value = cell.lock().expect("test channel").read();
+            if failed {
+                assert!(
+                    matches!(value, Err(ChannelError::Poisoned(_))),
+                    "a failed callback must still poison its reader"
+                );
+            } else {
+                assert_eq!(value, Ok(7i32.to_ne_bytes().to_vec()));
+            }
+        }
+        Ok(())
     }
 
     fn binding() -> AttentionBinding {
