@@ -3329,7 +3329,7 @@ impl Shell {
                 images: u64::from(composition.images()),
                 voxels: u64::from(composition.voxel_rows()),
                 clips: u64::from(composition.clips()),
-                readouts: u64::from(lane_count),
+                readouts: readout_rows.len() as u64,
             },
         )?;
         let caches = self.pools.table(
