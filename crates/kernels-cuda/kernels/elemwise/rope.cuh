@@ -556,25 +556,25 @@ __global__ __launch_bounds__(BLOCK) void q_rmsnorm_rope_partial(
     __syncthreads();
     const float inv_rms = rsqrtf(partial[kWarps] / static_cast<float>(head_dim) + eps);
 
-    const int half = head_dim / 2;
-    const int rope_angles = rotary_dim / 2;
+    // the norm covers the whole head; only the first rotary_dim entries turn,
+    // paired (i, i + rotary_dim/2) at theta^(-2i/rotary_dim) -- the convention
+    // HF, mlx-lm and llama.cpp share.
+    const int rope_half = rotary_dim / 2;
     const int pos = positions[row];
-    for (int dim_pair = threadIdx.x; dim_pair < half; dim_pair += BLOCK) {
+    for (int i = rotary_dim + threadIdx.x; i < head_dim; i += BLOCK) {
+        yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * inv_rms * bf16_to_f32(weight[i]));
+    }
+    for (int dim_pair = threadIdx.x; dim_pair < rope_half; dim_pair += BLOCK) {
+        const int mate = dim_pair + rope_half;
         const float a = bf16_to_f32(xr[dim_pair]) * inv_rms * bf16_to_f32(weight[dim_pair]);
-        const float b =
-            bf16_to_f32(xr[dim_pair + half]) * inv_rms * bf16_to_f32(weight[dim_pair + half]);
-        if (dim_pair < rope_angles) {
-            const float freq = powf(theta,
-                -2.f * static_cast<float>(dim_pair) / static_cast<float>(head_dim));
-            const float ang = static_cast<float>(pos) * freq;
-            float cos_v, sin_v;
-            __sincosf(ang, &sin_v, &cos_v);
-            yr[dim_pair] = f32_to_bf16(a * cos_v - b * sin_v);
-            yr[dim_pair + half] = f32_to_bf16(b * cos_v + a * sin_v);
-        } else {
-            yr[dim_pair] = f32_to_bf16(a);
-            yr[dim_pair + half] = f32_to_bf16(b);
-        }
+        const float b = bf16_to_f32(xr[mate]) * inv_rms * bf16_to_f32(weight[mate]);
+        const float freq = powf(theta,
+            -2.f * static_cast<float>(dim_pair) / static_cast<float>(rotary_dim));
+        const float ang = static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+        yr[dim_pair] = f32_to_bf16(a * cos_v - b * sin_v);
+        yr[mate] = f32_to_bf16(b * cos_v + a * sin_v);
     }
 }
 
@@ -598,24 +598,22 @@ __global__ void rope_partial(
     const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int total_heads = num_q_heads + num_kv_heads;
-    const int half = head_dim / 2;
-    const int rope_angles = rotary_dim / 2;
+    // the first rotary_dim entries of each head turn, paired
+    // (i, i + rotary_dim/2) at theta^(-2i/rotary_dim) -- the convention HF,
+    // mlx-lm and llama.cpp share; dims at or past rotary_dim are left alone.
+    const int half = rotary_dim / 2;
     const int pos = positions[row] + position_delta;
 
     for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
         const int head_idx = t / half;
         const int dim_pair = t % half;
 
-        float cos_v = 1.f, sin_v = 0.f;
-        if (dim_pair < rope_angles) {
-            const float freq = powf(theta,
-                -2.f * static_cast<float>(dim_pair) /
-                       static_cast<float>(head_dim));
-            const float ang = static_cast<float>(pos) * freq;
-            __sincosf(ang, &sin_v, &cos_v);
-        }
-
-        if (dim_pair >= rope_angles) continue;
+        const float freq = powf(theta,
+            -2.f * static_cast<float>(dim_pair) /
+                   static_cast<float>(rotary_dim));
+        const float ang = static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
 
         if (head_idx < num_q_heads) {
             T* qp = q +
