@@ -159,9 +159,13 @@ template <typename T>
   const int h = int(pos.y);
   const int m = int(pos.z);
   const int n_head = int(grid.y);
-  const int half_hd = head_dim / 2;
+  // Partial rotary follows the HF/mlx convention: the rotated width is
+  // 2*grid.x, the frequencies run over that width, and a pair sits
+  // rotary/2 apart (not head_dim/2). With rotary == head_dim this is the
+  // full-head rotation as before.
+  const int half_hd = int(grid.x);
 
-  float d = 2.0f * static_cast<float>(i) / static_cast<float>(head_dim);
+  float d = static_cast<float>(i) / static_cast<float>(half_hd);
   float inv_freq = exp2(-d * base);
   float theta = scale * static_cast<float>(position[m]) * inv_freq;
   float costheta = fast::cos(theta);
