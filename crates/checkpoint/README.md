@@ -127,8 +127,8 @@ They live in the wiki, under `loader/`:
 | `contribution.md` | Paper design notes — *don't trust the loader, check the plan* |
 
 A `metal_todos.md` row stood here — "what the refactor changed in the Metal ABI
-but could not run". There is no Metal ABI: the engines pass Rust types, and
-`engine-metal` left the workspace entirely in R3. The page is still in the wiki
+but could not run". There is no Metal ABI: the engines pass Rust types, so
+`engine-metal` needed no C ABI to keep in step. The page is still in the wiki
 as a record of what was never verified.
 
 Source comments cite these by filename — "`spec.md` §3.3", "`loader/architecture.md`
