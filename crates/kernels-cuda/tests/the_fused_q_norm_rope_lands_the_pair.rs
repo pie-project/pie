@@ -44,7 +44,7 @@ fn check(head_dim: usize, heads: usize, rotary_dim: usize, window: Option<(u32, 
     gpu.sync();
     let got: Vec<u16> = gpu.down(y_at, planes * width);
 
-    let half = head_dim / 2;
+    let rope_half = rotary_dim / 2;
     for r in 0..planes {
         let touched = r >= base as usize && r < (base + live) as usize;
         if !touched {
@@ -60,24 +60,24 @@ fn check(head_dim: usize, heads: usize, rotary_dim: usize, window: Option<(u32, 
             let xr = &x[at..at + head_dim];
             let ms: f32 = xr.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
             let inv = 1.0 / (ms + eps).sqrt();
-            for dp in 0..half {
-                let a = xr[dp] * inv * w[dp];
-                let b = xr[dp + half] * inv * w[dp + half];
-                let (wa, wb) = if dp < rotary_dim / 2 {
-                    let freq = theta.powf(-2.0 * dp as f32 / head_dim as f32);
-                    let ang = positions[r] as f32 * freq;
-                    let (s, c) = ang.sin_cos();
-                    (a * c - b * s, b * c + a * s)
-                } else {
-                    (a, b)
-                };
-                for (i, want) in [(dp, wa), (dp + half, wb)] {
-                    let g = from_bf16(got[at + i]);
-                    assert!(
-                        (g - want).abs() <= want.abs() * (1.0 / 64.0) + 1.5e-2,
-                        "head_dim {head_dim} rotary {rotary_dim} window {window:?}: y[{r}][{h}][{i}] = {g}, want {want}"
-                    );
-                }
+            // every element of the head is normed and scaled; only the first
+            // rotary_dim of them rotate, as pairs (dp, dp + rotary_dim / 2) at
+            // theta^(-2 dp / rotary_dim), the way HF and llama.cpp pair them.
+            let mut want: Vec<f32> = (0..head_dim).map(|i| xr[i] * inv * w[i]).collect();
+            for dp in 0..rope_half {
+                let (a, b) = (want[dp], want[dp + rope_half]);
+                let freq = theta.powf(-2.0 * dp as f32 / rotary_dim as f32);
+                let ang = positions[r] as f32 * freq;
+                let (s, c) = ang.sin_cos();
+                want[dp] = a * c - b * s;
+                want[dp + rope_half] = b * c + a * s;
+            }
+            for (i, want) in want.into_iter().enumerate() {
+                let g = from_bf16(got[at + i]);
+                assert!(
+                    (g - want).abs() <= want.abs() * (1.0 / 64.0) + 1.5e-2,
+                    "head_dim {head_dim} rotary {rotary_dim} window {window:?}: y[{r}][{h}][{i}] = {g}, want {want}"
+                );
             }
         }
     }
