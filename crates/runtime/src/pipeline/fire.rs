@@ -1243,7 +1243,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             qo_indptr = ?geometry.qo_indptr,
             reads_mtp_logits = p_reads_mtp_logits,
             block_draft = ?req.lanes.first().map(|lane| lane.block_draft),
-            "fire geometry resolved"
+            "fire geometry resolved on host path"
         );
         req.single_token_mode = req.lanes.iter().all(|lane| lane.tokens.len() == 1);
         req.max_layers = {
@@ -2588,9 +2588,8 @@ async fn fire_device_geometry<C: FireContext>(
         geometry = ?req.geometry,
         lanes = req.lanes.len(),
         qo_indptr = ?resolved_qo_indptr,
-        reads_mtp_logits = ?req.lanes.first().map(|lane| lane.drafts),
-        block_draft = "absent",
-        "fire geometry resolved"
+        reads_mtp_logits = req.lanes.first().is_some_and(|lane| lane.drafts),
+        "fire geometry resolved on device path; block_draft is resolved on the host path only"
     );
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
