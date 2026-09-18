@@ -550,6 +550,20 @@ impl LaneTurn {
     }
 }
 
+/// Runs one lane request inside a Metal autorelease pool, so the command
+/// buffers a submission autoreleases are drained at the request boundary rather
+/// than accumulating for the life of the lane thread. Off Apple, or without the
+/// Metal shell, it is just the panic guard the caller already needed.
+fn handle_lane_request<R>(request: impl FnOnce() -> R) -> std::thread::Result<R> {
+    let caught = || std::panic::catch_unwind(std::panic::AssertUnwindSafe(request));
+    #[cfg(all(target_vendor = "apple", feature = "metal"))]
+    {
+        objc2::rc::autoreleasepool(|_| caught())
+    }
+    #[cfg(not(all(target_vendor = "apple", feature = "metal")))]
+    caught()
+}
+
 impl EngineLoop {
     fn spawn(
         engine_idx: usize,
@@ -703,7 +717,7 @@ impl EngineLoop {
                  which requires unwinding; under `panic = \"abort\"` a panic \
                  in one lane takes down every session the runtime is serving"
             );
-            let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let handled = handle_lane_request(|| {
                 match request {
                     LaneRequest::Launch {
                         token, submission, ..
@@ -750,7 +764,7 @@ impl EngineLoop {
                     }
                 }
                 false
-            }));
+            });
             match handled {
                 Ok(true) => return,
                 Ok(false) => {}

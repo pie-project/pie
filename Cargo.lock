@@ -4372,6 +4372,7 @@ dependencies = [
  "lru",
  "model-ir",
  "models",
+ "objc2",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.32.1",
