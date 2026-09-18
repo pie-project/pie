@@ -130,6 +130,7 @@ metal = ["worker/metal"]
 vulkan = ["worker/vulkan"]
 wgpu = ["worker/wgpu"]
 profile-fire = ["worker/profile-fire"]
+session-lifetime-diagnostic = ["worker/session-lifetime-diagnostic"]
 
 [dependencies]
 bootstrap = { path = "crates/bootstrap" }

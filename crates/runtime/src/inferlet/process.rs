@@ -14,7 +14,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -27,6 +27,22 @@ use super::linker;
 use super::program::ProgramName;
 
 const RUN_INTERFACE: &str = "pie:inferlet/run@0.3.0";
+
+/// Counts process capacity releases, so a load reporter can sample on the
+/// release instead of on its own timer. A watch counter rather than a
+/// `Notify` because a reporter that was busy when the release happened still
+/// sees it on its next `changed()`. Only teardown moves it: the per-fire free
+/// paths are too hot to wake a reporter on.
+static RELEASES: LazyLock<watch::Sender<u64>> = LazyLock::new(|| watch::Sender::new(0));
+
+pub(crate) fn note_release() {
+    RELEASES.send_modify(|count| *count += 1);
+}
+
+/// Observes process capacity releases; the value only ever increases.
+pub fn releases() -> watch::Receiver<u64> {
+    RELEASES.subscribe()
+}
 
 static RESTARTABLE: LazyLock<RwLock<HashSet<ProcessId>>> = LazyLock::new(Default::default);
 static RESTART_REQUESTED: LazyLock<RwLock<HashSet<ProcessId>>> = LazyLock::new(Default::default);
@@ -84,13 +100,18 @@ pub enum ProcessEvent {
 }
 
 impl ProcessEvent {
+    /// The two events a process ends with. Named because a session that only
+    /// has the wire form still has to recognise "this process is over".
+    pub const RETURN: &'static str = "return";
+    pub const ERROR: &'static str = "error";
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::Stdout(_) => "stdout",
             Self::Stderr(_) => "stderr",
             Self::Message(_) => "message",
-            Self::Return(_) => "return",
-            Self::Error(_) => "error",
+            Self::Return(_) => Self::RETURN,
+            Self::Error(_) => Self::ERROR,
         }
     }
 
@@ -417,14 +438,51 @@ pub fn detach(process_id: ProcessId) {
     let _ = SERVICES.send(&resolve(process_id), Message::DetachClient);
 }
 
+/// Terminate a process (fire-and-forget). The caller is an owner — a closing
+/// session, a client, or a fail-loud path — so this never restarts.
 pub fn terminate(process_id: ProcessId, result: Result<String, String>) {
-    let process_id = resolve(process_id);
-    if SERVICES
-        .send(&process_id, Message::Terminate { result })
-        .is_ok()
-    {
-        crate::scheduler::worker::post_process_terminate(process_id);
+    terminate_with(process_id, result, Origin::Owner);
+}
+
+/// The run task reporting its own end: the one termination a parked restart
+/// request may replace.
+fn terminate_from_run(process_id: ProcessId, result: Result<String, String>) {
+    terminate_with(process_id, result, Origin::Run);
+}
+
+fn terminate_with(process_id: ProcessId, result: Result<String, String>, origin: Origin) {
+    let target = resolve(process_id);
+    // The result is cloned for the first attempt because `ServiceMap::send`
+    // consumes the message and does not hand it back on failure; one string
+    // clone per termination is cheaper than widening that signature.
+    if deliver_terminate(target, result.clone(), origin) {
+        return;
     }
+    // The other side of the handover window described on `Process::successor`:
+    // the resolve above can read the alias a moment before the restart
+    // publishes it, and the old actor is gone by the time the send lands.
+    let republished = resolve(process_id);
+    if republished != target {
+        deliver_terminate(republished, result, origin);
+    }
+}
+
+/// Post a Terminate to one live actor; false if it is no longer registered.
+fn deliver_terminate(
+    process_id: ProcessId,
+    result: Result<String, String>,
+    origin: Origin,
+) -> bool {
+    // Early wait-set drop for a live process, guarded on registry delivery
+    // so an already-quiesced pid cannot mint a fresh tombstone.
+    if SERVICES
+        .send(&process_id, Message::Terminate { result, origin })
+        .is_err()
+    {
+        return false;
+    }
+    crate::scheduler::worker::post_process_terminate(process_id);
+    true
 }
 
 pub fn stdout(process_id: ProcessId, content: String) {
@@ -466,6 +524,17 @@ pub struct ProcessStats {
     pub elapsed_secs: u64,
 }
 
+/// Who asked for a process to end. Carried on the message rather than
+/// inferred from the result, because the two are indistinguishable there: an
+/// owner's kill and a guest failure both arrive as an `Err` string.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// The run task reporting its own completion.
+    Run,
+    /// A session closing, a client kill, a signal, or a worker cancel.
+    Owner,
+}
+
 enum Message {
     AttachClient {
         client_id: ClientId,
@@ -474,6 +543,7 @@ enum Message {
     DetachClient,
     Terminate {
         result: Result<String, String>,
+        origin: Origin,
     },
 
     Stdout {
@@ -507,6 +577,17 @@ struct Process {
     capture_outputs: bool,
     output_buffer: VecDeque<ProcessEvent>,
     result_tx: SharedResultTx,
+    /// Set by the first `Terminate` this actor handles.
+    terminated: bool,
+    /// The replacement a restart spawned, if any.
+    ///
+    /// The handover window: a restart registers its successor in `SERVICES`
+    /// before it publishes the alias naming it, so for that moment a
+    /// Terminate for the client's pid still resolves here and lands in this
+    /// mailbox after the end has been claimed. Whoever holds the successor
+    /// forwards such a Terminate on, which is what keeps a re-run from
+    /// outliving the session that closed it.
+    successor: Option<ProcessId>,
 }
 
 impl Process {
@@ -549,6 +630,8 @@ impl Process {
             capture_outputs,
             output_buffer: VecDeque::new(),
             result_tx,
+            terminated: false,
+            successor: None,
         }
     }
 
@@ -679,7 +762,7 @@ impl Process {
             let _ = tx.send(result.clone());
         }
 
-        terminate(process_id, result);
+        terminate_from_run(process_id, result);
     }
 
     fn restart(&mut self) -> bool {
@@ -696,6 +779,9 @@ impl Process {
         );
         match spawned {
             Ok(new_id) => {
+                self.successor = Some(new_id);
+                // Published before this process finishes tearing down, so a
+                // client message in the handover window reaches the re-run.
                 RESTART_ALIAS
                     .write()
                     .unwrap()
@@ -716,10 +802,46 @@ impl Process {
         }
     }
 
-    fn terminate(&mut self, result: Result<String, String>) {
+    fn terminate(&mut self, result: Result<String, String>, origin: Origin) {
+        // Natural completion and the owning session are both entitled to end
+        // a process, and `ServiceMap::remove` does not discard the messages
+        // already in the mailbox, so two Terminates can arrive. Claim the end
+        // before any of it happens — including the restart branch, whose
+        // replacement a second pass would disown by clearing its alias.
+        if self.terminated {
+            // Relayed, not dropped, when a restart left a replacement behind:
+            // see the handover window on `successor`. Resolve from the stable
+            // client pid because the immediate successor may itself have
+            // restarted and aliases are only published for that stable id.
+            if let Some(successor) = self.successor {
+                let target = resolve(self.client_pid);
+                terminate_with(
+                    if target == self.process_id {
+                        successor
+                    } else {
+                        self.client_pid
+                    },
+                    result,
+                    origin,
+                );
+            }
+            return;
+        }
+        self.terminated = true;
+
         self.handle.abort();
 
-        let restarted = restart_requested(self.process_id) && self.restart();
+        // If the planner asked for a re-run, a fresh process takes over the
+        // reply channel and FCFS position; nothing is delivered for this
+        // abandoned attempt. Teardown below still runs unconditionally.
+        //
+        // Only the run task's own end may be replaced. An owner's Terminate
+        // aborts the run before the guest can finish, so honouring the
+        // planner's parked request there would spawn a replacement the owner
+        // never asked for, does not know about, and cannot reach to close.
+        // The request is forgotten either way, so it cannot be honoured later.
+        let restarted =
+            origin == Origin::Run && restart_requested(self.process_id) && self.restart();
         forget_restart_state(self.process_id);
 
         if !restarted {
@@ -743,6 +865,7 @@ impl Process {
 
         let _ = server::inbox::clear(self.process_id.to_string());
         SERVICES.remove(&self.process_id);
+        note_release();
 
         if !restarted {
             RESTART_ALIAS.write().unwrap().remove(&self.client_pid);
@@ -776,8 +899,8 @@ impl ServiceHandler for Process {
                 self.client_id = None;
             }
 
-            Message::Terminate { result } => {
-                self.terminate(result);
+            Message::Terminate { result, origin } => {
+                self.terminate(result, origin);
             }
 
             Message::Stdout { content } => self.deliver_event(ProcessEvent::Stdout(content)),
@@ -801,5 +924,278 @@ impl ServiceHandler for Process {
                 }));
             }
         }
+    }
+}
+
+// =============================================================================
+// Test probe
+// =============================================================================
+
+/// A process-shaped mailbox with no WASM task behind it.
+///
+/// A real `Process` cannot serve a model-free test: with no program loader
+/// running, its run task fails on its first poll and terminates the actor
+/// before an assertion can look at it. The probe registers in the same
+/// `SERVICES` map, so an owner still reaches it through the ordinary
+/// `terminate`/`detach` path.
+#[cfg(test)]
+pub(crate) mod probe {
+    use super::{Message, ProcessId, SERVICES};
+    use crate::service::ServiceHandler;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    /// What an owner asked a probe process to do.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum Saw {
+        Terminated,
+        Detached,
+    }
+
+    struct Probe {
+        id: ProcessId,
+        saw: mpsc::UnboundedSender<Saw>,
+    }
+
+    impl ServiceHandler for Probe {
+        type Message = Message;
+
+        async fn handle(&mut self, msg: Message) {
+            let saw = match msg {
+                Message::Terminate { .. } => Saw::Terminated,
+                Message::DetachClient => Saw::Detached,
+                _ => return,
+            };
+            let ended = saw == Saw::Terminated;
+            let _ = self.saw.send(saw);
+            // A real process unregisters when it ends, and only then — a
+            // detached process is still live. Without this every probe any
+            // test ever made would stay in the global map for the life of the
+            // test binary. Reported first: the report rides an unbounded
+            // channel, so the receiver still sees it after the removal drops
+            // this actor.
+            if ended {
+                SERVICES.remove(&self.id);
+            }
+        }
+    }
+
+    /// Register a probe process; returns its id and its record of what it saw.
+    pub(crate) fn register() -> (ProcessId, mpsc::UnboundedReceiver<Saw>) {
+        let id = Uuid::new_v4();
+        let (saw, rx) = mpsc::unbounded_channel();
+        SERVICES
+            .spawn(id, || Probe { id, saw })
+            .expect("fresh process id");
+        (id, rx)
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The real actor, built without `Process::new`. `new` spawns the run
+    /// task, which cannot get past `linker::instantiate` with no program
+    /// loader spawned — the error comes back before the first await point, so
+    /// the task terminates the actor on its first poll, before any assertion
+    /// could look at it. The join handle here is therefore an inert task and
+    /// `Process::run` never executes: what follows covers `Process::terminate`
+    /// and not the run path into it.
+    fn idle_process() -> Process {
+        let id = Uuid::new_v4();
+        Process {
+            process_id: id,
+            client_pid: id,
+            username: "test".to_string(),
+            program: ProgramName {
+                name: "test".to_string(),
+                version: "0.0.0".to_string(),
+            },
+            input: String::new(),
+            start_time: Instant::now(),
+            handle: tokio::spawn(std::future::pending::<()>()),
+            client_id: None,
+            // No client attached, so the end event lands in the output buffer
+            // instead, which is where this test counts it.
+            capture_outputs: true,
+            output_buffer: VecDeque::new(),
+            result_tx: Arc::new(Mutex::new(None)),
+            terminated: false,
+            successor: None,
+        }
+    }
+
+    /// Everything a probe saw, up to it unregistering and dropping its
+    /// sender. Bounded, so a probe that never reports fails the test instead
+    /// of hanging the suite.
+    async fn drained(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<probe::Saw>,
+    ) -> Result<Vec<probe::Saw>, tokio::time::error::Elapsed> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut seen = Vec::new();
+            while let Some(saw) = rx.recv().await {
+                seen.push(saw);
+            }
+            seen
+        })
+        .await
+    }
+
+    /// The buffer is the observable rather than `RELEASES` or the planner:
+    /// it belongs to this one actor, so a test running beside this one cannot
+    /// move it.
+    #[tokio::test]
+    async fn second_terminate_is_ignored() {
+        let mut process = idle_process();
+
+        process
+            .handle(Message::Terminate {
+                result: Ok("first".to_string()),
+                origin: Origin::Run,
+            })
+            .await;
+        process
+            .handle(Message::Terminate {
+                result: Err("second".to_string()),
+                origin: Origin::Owner,
+            })
+            .await;
+
+        let delivered: Vec<_> = process
+            .output_buffer
+            .iter()
+            .map(|event| (event.name(), event.value().to_string()))
+            .collect();
+        assert_eq!(delivered, vec![(ProcessEvent::RETURN, "first".to_string())]);
+    }
+
+    /// The successor is a probe and the recorded link is set by hand:
+    /// `restart` itself cannot run here, because the process it spawns dies
+    /// in `linker::instantiate` with no program loader. So this covers the
+    /// relay decision in `Process::terminate`, not the restart that records
+    /// the successor.
+    #[tokio::test]
+    async fn terminate_after_restart_is_relayed_to_the_successor() {
+        let (successor, mut saw) = probe::register();
+        let mut process = idle_process();
+        process.terminated = true;
+        process.successor = Some(successor);
+
+        process
+            .handle(Message::Terminate {
+                result: Err("session closed".to_string()),
+                origin: Origin::Owner,
+            })
+            .await;
+
+        // The probe unregisters on Terminate, so the channel closing is the
+        // proof that exactly one relay arrived.
+        assert_eq!(
+            drained(&mut saw).await.expect("successor saw nothing"),
+            vec![probe::Saw::Terminated]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminate_after_two_restarts_reaches_the_latest_successor() {
+        let (latest, mut saw) = probe::register();
+        let mut process = idle_process();
+        let client_pid = process.client_pid;
+        process.terminated = true;
+        process.successor = Some(Uuid::new_v4());
+        RESTART_ALIAS.write().unwrap().insert(client_pid, latest);
+
+        process
+            .handle(Message::Terminate {
+                result: Err("session closed".to_string()),
+                origin: Origin::Owner,
+            })
+            .await;
+
+        let seen = drained(&mut saw).await;
+        RESTART_ALIAS.write().unwrap().remove(&client_pid);
+        SERVICES.remove(&latest);
+        assert_eq!(
+            seen.expect("latest successor saw nothing"),
+            vec![probe::Saw::Terminated]
+        );
+    }
+
+    /// The blocker this rule closes: the planner parks a restart request and
+    /// only then wakes the victim, so an owner's Terminate can land in that
+    /// window. Honouring the request there spawns a replacement outside the
+    /// closing session, which nothing would ever end.
+    ///
+    /// The request is parked through `declare_restartable` + `request_restart`
+    /// rather than by writing the static, so the test fails if that path
+    /// changes shape.
+    #[tokio::test]
+    async fn owner_terminate_does_not_restart() {
+        let mut process = idle_process();
+        let pid = process.process_id;
+        declare_restartable(pid);
+        // Held, not asserted here: `declare_restartable` has already written a
+        // global, so failing before the cleanup below would leave it behind.
+        let parked = request_restart(pid);
+
+        process
+            .handle(Message::Terminate {
+                result: Err("session closed".to_string()),
+                origin: Origin::Owner,
+            })
+            .await;
+
+        let alias = RESTART_ALIAS.read().unwrap().get(&pid).copied();
+        let cleared = !is_restartable(pid) && !restart_requested(pid);
+        let delivered: Vec<_> = process
+            .output_buffer
+            .iter()
+            .map(|event| (event.name(), event.value().to_string()))
+            .collect();
+        // Global maps: this test's entries go before any assertion, so a
+        // failure cannot leave them behind for the rest of the binary.
+        if let Some(successor) = process.successor {
+            SERVICES.remove(&successor);
+            RESTART_ALIAS.write().unwrap().remove(&pid);
+        }
+        forget_restart_state(pid);
+
+        assert!(parked, "a declared process must park");
+        assert_eq!(process.successor, None, "no replacement may be spawned");
+        assert_eq!(alias, None, "no alias may be published for the client pid");
+        assert!(cleared, "the parked request must be forgotten either way");
+        assert_eq!(
+            delivered,
+            vec![(ProcessEvent::ERROR, "session closed".to_string())]
+        );
+    }
+
+    /// A Terminate for a retired pid reaches the process the alias names.
+    /// Delivered by the first resolve, since the alias is published before
+    /// the call: the re-resolve after a failed send needs the alias to change
+    /// mid-call, and no test task can change it there — the two resolves have
+    /// only a synchronous failed send between them.
+    #[tokio::test]
+    async fn terminate_follows_the_restart_alias() {
+        let (live, mut saw) = probe::register();
+        // Never registered, so only the alias can lead anywhere.
+        let retired = Uuid::new_v4();
+        RESTART_ALIAS.write().unwrap().insert(retired, live);
+
+        terminate(retired, Err("session closed".to_string()));
+
+        let seen = drained(&mut saw).await;
+        // Global map: cleared before the assertion so a failure cannot leave
+        // the entry behind for another test in this binary.
+        RESTART_ALIAS.write().unwrap().remove(&retired);
+        assert_eq!(
+            seen.expect("aliased process saw nothing"),
+            vec![probe::Saw::Terminated]
+        );
     }
 }

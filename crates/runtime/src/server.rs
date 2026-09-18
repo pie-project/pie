@@ -21,6 +21,37 @@ use crate::service::{ServiceHandler, ServiceMap};
 
 pub type ClientId = u32;
 
+#[cfg(feature = "session-lifetime-diagnostic")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOwnerKeys {
+    pub outboxes: Vec<ClientId>,
+    pub services: Vec<ClientId>,
+    pub service_tasks: Vec<ClientId>,
+}
+
+/// Reads the exact keys in each real owner map sequentially.
+///
+/// Callers must establish a quiescent checkpoint before comparing the sets.
+#[cfg(feature = "session-lifetime-diagnostic")]
+pub fn session_owner_keys() -> SessionOwnerKeys {
+    let mut outboxes: Vec<_> = SESSION_OUTBOX.iter().map(|entry| *entry.key()).collect();
+    let mut services = CLIENT_SERVICES.keys();
+    let mut service_tasks = CLIENT_SERVICES.handle_keys();
+    outboxes.sort_unstable();
+    services.sort_unstable();
+    service_tasks.sort_unstable();
+    SessionOwnerKeys {
+        outboxes,
+        services,
+        service_tasks,
+    }
+}
+
+#[cfg(feature = "session-lifetime-diagnostic")]
+pub fn init_session_lifetime_diagnostic(max_upload_bytes: usize) {
+    init(max_upload_bytes);
+}
+
 static STATE: OnceLock<Arc<ServerState>> = OnceLock::new();
 static SESSION_OUTBOX: LazyLock<
     DashMap<ClientId, Arc<TokioMutex<mpsc::Receiver<WireServerMessage>>>>,
@@ -206,6 +237,14 @@ struct Session {
     pub(super) username: String,
     state: Arc<ServerState>,
     pub(super) inflight_uploads: DashMap<UploadKey, InFlightUpload>,
+    /// Processes this session launched with `capture_outputs`. `process::spawn`
+    /// pre-registers this session as their client, so `AttachProcess` answers
+    /// "already attached" to everyone else: no other session can ever adopt
+    /// one. Kept apart from `attached_processes` because that makes ending the
+    /// session the last chance to stop them.
+    pub(super) captured_launches: Vec<ProcessId>,
+    /// Processes someone else launched that this session attached to. They
+    /// outlive the session; only the attachment goes.
     pub(super) attached_processes: Vec<ProcessId>,
     pub(super) installed_programs: HashSet<ProgramName>,
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
@@ -223,6 +262,7 @@ impl Session {
             username: "internal".to_string(),
             state,
             inflight_uploads: DashMap::new(),
+            captured_launches: Vec::new(),
             attached_processes: Vec::new(),
             installed_programs: HashSet::new(),
             file_waiters: HashMap::new(),
@@ -230,7 +270,27 @@ impl Session {
         }
     }
 
+    /// This session owns `process_id`, whichever way it came by it.
+    pub(super) fn owns_process(&self, process_id: ProcessId) -> bool {
+        self.captured_launches.contains(&process_id)
+            || self.attached_processes.contains(&process_id)
+    }
+
+    /// Drop `process_id` from both lists: it is gone, so it must neither pass
+    /// the ownership check nor be terminated a second time by `cleanup`.
+    pub(super) fn forget_process(&mut self, process_id: ProcessId) {
+        self.captured_launches.retain(|id| *id != process_id);
+        self.attached_processes.retain(|id| *id != process_id);
+    }
+
     fn cleanup(&mut self) {
+        // Detaching a captured launch would only clear its client id and
+        // leave it running for the runtime's life, unreachable: nobody else
+        // can attach to it. The owner has to end it.
+        for process_id in self.captured_launches.drain(..) {
+            process::terminate(process_id, Err("session closed".to_string()));
+        }
+
         for process_id in self.attached_processes.drain(..) {
             process::detach(process_id);
         }
@@ -259,6 +319,13 @@ impl ServiceHandler for Session {
                 event,
                 value,
             } => {
+                // A returned or errored process is over, and this is the only
+                // notice the session gets. Without it a long-lived session
+                // keeps every pid it ever launched, and closing terminates
+                // each of them again.
+                if event == ProcessEvent::RETURN || event == ProcessEvent::ERROR {
+                    self.forget_process(process_id);
+                }
                 self.send_process_event(process_id, &event, value).await;
             }
             SessionMessage::File {
@@ -406,5 +473,52 @@ impl Session {
                 self.send_response(corr_id, true, "Pong".to_string()).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inferlet::process::probe::{self, Saw};
+
+    async fn saw(rx: &mut mpsc::UnboundedReceiver<Saw>) -> Saw {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("probe reported nothing")
+            .expect("probe stopped")
+    }
+
+    /// Both processes are probe mailboxes, not real `Process` actors: a real
+    /// one needs a program loader and terminates itself on its first poll
+    /// without one, which would race every assertion here. So this covers
+    /// `cleanup`'s choice and the `terminate`/`detach` delivery path, not
+    /// `Process`'s own teardown.
+    #[tokio::test]
+    async fn cleanup_terminates_captured_launches_and_only_releases_attachments() {
+        let state = Arc::new(ServerState {
+            next_client_id: AtomicU32::new(1),
+            max_upload_bytes: 1024,
+        });
+        let (out_tx, _out_rx) = mpsc::channel(1);
+        // A sentinel id: the owner maps `cleanup` clears are process-global.
+        let mut session = Session::new_inproc(ClientId::MAX, state, out_tx);
+
+        let (launched, mut launched_saw) = probe::register();
+        let (attached, mut attached_saw) = probe::register();
+        session.captured_launches.push(launched);
+        session.attached_processes.push(attached);
+
+        session.cleanup();
+
+        assert_eq!(saw(&mut launched_saw).await, Saw::Terminated);
+        assert_eq!(saw(&mut attached_saw).await, Saw::Detached);
+        // The point of the split: detaching releases the client but leaves
+        // the process running and registered.
+        assert!(process::list().contains(&attached));
+
+        // Left registered by the assertion above, so end it here rather than
+        // leaving it in the global map for the rest of the binary.
+        process::terminate(attached, Err("test over".to_string()));
+        assert_eq!(saw(&mut attached_saw).await, Saw::Terminated);
     }
 }

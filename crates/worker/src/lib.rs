@@ -11,6 +11,12 @@ pub mod weights;
 mod executor;
 mod link;
 
+#[cfg(feature = "session-lifetime-diagnostic")]
+pub mod session_lifetime_diagnostic {
+    pub use crate::link::gateway::{
+        GatewayLink, SessionObserver, SessionOwnerKeys, connect_gateway,
+    };
+}
 pub use config::Config;
 pub use controller_api::Role;
 pub use link::control::ControlLink;

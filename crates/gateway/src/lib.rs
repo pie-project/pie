@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::Router;
 use controller_api::GatewayInfo;
-use ids::{ReqId, WorkerId};
+use ids::{ReqId, SessionId, WorkerId};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
@@ -103,6 +103,14 @@ impl TurnRouter for RouteBackend {
     async fn cancel(&self, worker: WorkerId, req: ReqId) {
         if let Some(client) = self.workers.client(worker) {
             let _ = client.cancel(tarpc::context::current(), req).await;
+        }
+    }
+
+    async fn close_session(&self, worker: WorkerId, session: SessionId) {
+        if let Some(client) = self.workers.client(worker) {
+            let _ = client
+                .close_session(tarpc::context::current(), session)
+                .await;
         }
     }
 
