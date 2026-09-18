@@ -107,12 +107,11 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
         }
         Err(None) => return,
     };
+    let corr = first.message.corr_id();
     let (handle, first_rx) = match state.sessions.create(ident, first, Affinity::Sticky).await {
         Ok(pair) => pair,
         Err(e) => {
-            let _ = tx
-                .send(Message::Text(error_json(&e.to_string()).into()))
-                .await;
+            let _ = tx.send(refusal(corr, &e.to_string())).await;
             let _ = tx.send(Message::Close(None)).await;
             return;
         }
