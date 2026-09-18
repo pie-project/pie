@@ -1,7 +1,9 @@
-
+//#include "common/bf16.inc.wgsl"
+//#include "common/reduce.inc.wgsl"
 
 const PIE_KMAX = 256u;
 
+//#if defined(PIE_COMMITTED)
 @group(0) @binding(0) var<storage, read> qkv: array<u32>;
 @group(0) @binding(1) var<storage, read> indptr: array<i32>;
 @group(0) @binding(2) var<storage, read> replay: array<i32>;
@@ -27,7 +29,7 @@ fn st_get(i: u32) -> f32 {
 fn st_set(i: u32, v: f32) {
     work[i] = v;
 }
-
+//#elif defined(PIE_CHUNKED)
 @group(0) @binding(0) var<storage, read> qkv: array<u32>;
 @group(0) @binding(1) var<storage, read> indptr: array<i32>;
 @group(0) @binding(2) var<storage, read> gates: array<f32>;
@@ -42,7 +44,7 @@ struct Params {
     v_dim: i32,
 }
 @group(0) @binding(6) var<uniform> params: Params;
-
+//#else
 @group(0) @binding(0) var<storage, read> qkv: array<u32>;
 @group(0) @binding(1) var<storage, read> gates: array<f32>;
 @group(0) @binding(2) var<storage, read_write> rstate: array<f32>;
@@ -56,21 +58,28 @@ struct Params {
     v_dim: i32,
 }
 @group(0) @binding(5) var<uniform> params: Params;
-
+//#endif
+//#if !defined(PIE_COMMITTED)
 fn st_get(i: u32) -> f32 {
     return rstate[i];
 }
 fn st_set(i: u32, v: f32) {
     rstate[i] = v;
 }
-
+//#endif
 
 var<workgroup> sq: array<f32, PIE_KMAX>;
 var<workgroup> sk: array<f32, PIE_KMAX>;
+// Values read from storage that steer control flow around a barrier are
+// made workgroup-uniform through `workgroupUniformLoad`: Tint (Chrome's WGSL
+// front end) cannot see that every invocation reads the same word, and it
+// refuses a barrier under a branch it cannot prove uniform.
+var<workgroup> pie_uniform: vec4<i32>;
 
+//#if defined(PIE_DK_REG)
 
 var<private> st_reg: array<f32, PIE_DK_REG>;
-
+//#endif
 
 fn load_qkv(i: u32) -> f32 {
     return pie_bf16_at(qkv[i >> 1u], i);
@@ -112,7 +121,7 @@ fn token(tid: u32, t: u32, hv: u32, hk: u32, state_base: u32) {
     let decay = exp(gates[fused]);
     let beta = gates[fused + v_heads];
     let out = (t * v_heads + hv) * dv;
-
+//#if defined(PIE_DK_REG)
     if (tid < dv) {
         var kv_mem = 0.0;
         for (var i = 0u; i < dk; i = i + 1u) {
@@ -129,7 +138,7 @@ fn token(tid: u32, t: u32, hv: u32, hk: u32, state_base: u32) {
         }
         y[out + tid] = acc;
     }
-
+//#else
     for (var c = tid; c < dv; c = c + u32(PIE_GROUP_X)) {
         let cell = state_base + c * dk;
         var kv_mem = 0.0;
@@ -147,7 +156,7 @@ fn token(tid: u32, t: u32, hv: u32, hk: u32, state_base: u32) {
         }
         y[out + c] = acc;
     }
-
+//#endif
     workgroupBarrier();
 }
 
@@ -158,27 +167,33 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     let v_heads = u32(params.v_heads);
     let hk = hv / (v_heads / u32(params.k_heads));
     let head = u32(params.v_dim) * u32(params.k_dim);
-
+//#if defined(PIE_COMMITTED)
     let r = group.z;
     let lane0 = u32(params.lane0);
     var begin = indptr[r];
     for (var j = 0u; j < r; j = j + 1u) {
         begin = begin + replay[lane0 + j];
     }
-    let span = (indptr[r + 1u] - indptr[r]) + replay[lane0 + r];
+    let span_word = (indptr[r + 1u] - indptr[r]) + replay[lane0 + r];
+    let slot_word = slots[lane0 + r];
+    if (tid == 0u) {
+        pie_uniform = vec4<i32>(span_word, slot_word, min(commit[lane0 + r], span_word), 0);
+    }
+    let uniform_words = workgroupUniformLoad(&pie_uniform);
+    let span = uniform_words.x;
+    let slot = uniform_words.y;
+    let keep = uniform_words.z;
     if (span <= 0) {
         return;
     }
-    let slot = slots[lane0 + r];
     if (slot < 0) {
         return;
     }
-    let keep = min(commit[lane0 + r], span);
     let dk = u32(params.k_dim);
     let dv = u32(params.v_dim);
     let bank = (u32(slot) * v_heads + hv) * head;
     let state_base = ((lane0 + r) * v_heads + hv) * head;
-
+//#if defined(PIE_DK_REG)
 
     if (tid < dv) {
         for (var i = 0u; i < dk; i = i + 1u) {
@@ -194,7 +209,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
             }
         }
     }
-
+//#else
 
     for (var c = tid; c < dv; c = c + u32(PIE_GROUP_X)) {
         for (var i = 0u; i < dk; i = i + 1u) {
@@ -212,15 +227,20 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
             }
         }
     }
-
+//#endif
+//#elif defined(PIE_CHUNKED)
     let r = group.z;
-    let begin = indptr[r];
-    let end = indptr[r + 1u];
+    if (tid == 0u) {
+        pie_uniform = vec4<i32>(indptr[r], indptr[r + 1u], 0, 0);
+    }
+    let uniform_words = workgroupUniformLoad(&pie_uniform);
+    let begin = uniform_words.x;
+    let end = uniform_words.y;
     if (end <= begin) {
         return;
     }
     let state_base = (slots[u32(begin)] * v_heads + hv) * head;
-
+//#if defined(PIE_DK_REG)
     let dvc = u32(params.v_dim);
     let dkc = u32(params.k_dim);
     if (tid < dvc) {
@@ -229,20 +249,21 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         }
     }
     workgroupBarrier();
-
+//#endif
     for (var t = begin; t < end; t = t + 1) {
         token(tid, u32(t), hv, hk, state_base);
     }
-
+//#if defined(PIE_DK_REG)
     if (tid < dvc) {
         for (var i = 0u; i < dkc; i = i + 1u) {
             rstate[state_base + tid * dkc + i] = st_reg[i];
         }
     }
-
+//#endif
+//#else
     let n = group.z;
     let state_base = (slots[n] * v_heads + hv) * head;
-
+//#if defined(PIE_DK_REG)
     let dvs = u32(params.v_dim);
     let dks = u32(params.k_dim);
     if (tid < dvs) {
@@ -251,14 +272,21 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         }
     }
     workgroupBarrier();
-
+//#endif
     token(tid, n, hv, hk, state_base);
-
+//#if defined(PIE_DK_REG)
     if (tid < dvs) {
         for (var i = 0u; i < dks; i = i + 1u) {
             rstate[state_base + tid * dks + i] = st_reg[i];
         }
     }
-
+//#endif
+//#endif
 }
 
+// pie:instantiate gated_delta_bf16 PIE_GROUP_X=128
+// pie:instantiate gated_delta_chunked_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1
+// pie:instantiate gated_delta_committed_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1
+// pie:instantiate gated_delta_r128_bf16 PIE_GROUP_X=128 PIE_DK_REG=128
+// pie:instantiate gated_delta_chunked_r128_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1 PIE_DK_REG=128
+// pie:instantiate gated_delta_committed_r128_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1 PIE_DK_REG=128

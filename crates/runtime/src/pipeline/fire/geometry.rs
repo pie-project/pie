@@ -14,6 +14,7 @@ pub struct DecodeEnvelope {
     pub loop_carried: bool,
     pub device_positions: bool,
     pub device_fold_len: bool,
+    pub device_mask: bool,
 }
 
 #[cfg(test)]
@@ -238,6 +239,7 @@ pub fn classify_decode_envelope_why(
 
     let mut device_positions = false;
     let mut device_fold_len = false;
+    let mut device_mask = false;
     for binding in &container.ports {
         match (&binding.port, &binding.source) {
             (Port::EmbedTokens | Port::KvLen, PortSource::Channel(_)) => {}
@@ -383,12 +385,24 @@ pub fn classify_decode_envelope_why(
                 ) {
                     return Err("device attention mask must be a bool channel".to_string());
                 }
-                return decline(
-                    "a channel-bound dense AttnMask belongs to the pool-owned \
-                     device-geometry class; the envelope compose carries no \
-                     per-lane mask state"
-                        .to_string(),
-                );
+                let dims = declaration.shape.dims();
+                let rows_per_fire = match dims {
+                    [rows, keys] if *keys > 0 => *rows,
+                    [keys] if *keys > 0 => 1,
+                    _ => {
+                        return decline(format!(
+                            "a device attention mask is a [tokens, keys] (or [keys]) bool \
+                             channel; this one is {dims:?}"
+                        ));
+                    }
+                };
+                if rows_per_fire != token_count {
+                    return decline(format!(
+                        "the device attention mask holds {rows_per_fire} row(s) and the \
+                         fire embeds {token_count} token(s); one row per token"
+                    ));
+                }
+                device_mask = true;
             }
             (Port::AttnMask, _) => {
                 return Ok(None);
@@ -408,6 +422,7 @@ pub fn classify_decode_envelope_why(
         loop_carried,
         device_positions,
         device_fold_len,
+        device_mask,
     }))
 }
 
@@ -418,6 +433,9 @@ pub fn envelope_required_ports(envelope: &DecodeEnvelope) -> PortMask {
     }
     if envelope.device_fold_len {
         required = required.with(Port::RsFoldLen);
+    }
+    if envelope.device_mask {
+        required = required.with(Port::AttnMask);
     }
     required
 }
@@ -1086,7 +1104,7 @@ mod tests {
         section3_single_seq_decode_geometry();
         decode_envelope_accepts_shape_equivalent_variants();
         decode_envelope_accepts_channel_embed_indptr();
-        a_device_carried_bool_mask_is_declined_to_the_pooled_class();
+        a_device_carried_bool_mask_rides_the_envelope_as_a_device_mask();
         decode_envelope_accepts_seeded_prefill_tokens();
         decode_envelope_derives_multitoken_and_multilane_shapes();
         beam_rectangular_batch_geometry();
@@ -1181,7 +1199,7 @@ mod tests {
         assert_eq!(envelope.template(&container).unwrap().qo_indptr, vec![0, 1]);
     }
 
-    fn a_device_carried_bool_mask_is_declined_to_the_pooled_class() {
+    fn a_device_carried_bool_mask_rides_the_envelope_as_a_device_mask() {
         let mut container = section3_container();
         container.stages[0].ops = vec![
             Op::ChanTake(0),
@@ -1199,19 +1217,30 @@ mod tests {
             source: PortSource::Channel(mask),
         });
 
-        let mut why = String::new();
-        let classified = classify_decode_envelope_why(&container, &mut why).unwrap();
+        let envelope = classify_decode_envelope(&container)
+            .unwrap()
+            .expect("a [tokens, keys] bool mask channel is a device-resolved mask");
         assert!(
-            classified.is_none(),
-            "a channel-bound dense mask must not classify as a decode envelope"
+            envelope.device_mask,
+            "the envelope names the mask as device-resolved"
         );
         assert!(
-            why.contains("pool-owned device-geometry"),
-            "the decline must name where the trace belongs, got {why:?}"
+            envelope_required_ports(&envelope).contains(Port::AttnMask),
+            "an engine must serve AttnMask to take this envelope"
         );
 
-        let bad = container.channels.len() as u32 - 1;
-        container.channels[bad as usize].dtype = ChanDType::Concrete(Dtype::U32);
+        let bad = container.channels.len() - 1;
+        container.channels[bad].shape = Shape::matrix(2, 8);
+        let mut why = String::new();
+        assert!(
+            classify_decode_envelope_why(&container, &mut why)
+                .unwrap()
+                .is_none()
+        );
+        assert!(why.contains("one row per token"), "got {why:?}");
+
+        container.channels[bad].shape = Shape::matrix(1, 8);
+        container.channels[bad].dtype = ChanDType::Concrete(Dtype::U32);
         assert!(classify_decode_envelope(&container).is_err());
     }
     fn decode_envelope_accepts_seeded_prefill_tokens() {

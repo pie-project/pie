@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read_write> x: array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read> positions: array<i32>;
@@ -41,7 +41,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var axis_pos = 0;
     var i1 = 0u;
     var i2 = 0u;
-
+//#if defined(PIE_BLOCKED)
     let total = params.s0 + params.s1 + params.s2;
     var within = 0;
     if (i < params.s0) {
@@ -57,7 +57,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     inv_freq = exp2(-(2.0 * f32(within) / f32(total)) * params.base_);
     i1 = row + u32(i);
     i2 = i1 + u32(half_hd);
-
+//#elif defined(PIE_SPLIT)
     var within = 0;
     var before = 0;
     var width = 0;
@@ -83,7 +83,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     inv_freq = exp2(-(f32(within) / f32(width)) * params.base_);
     i1 = row + u32(2 * before + within);
     i2 = i1 + u32(width);
-
+//#else
     let r = i % 3;
     if (r == 1 && i < 3 * params.s1) {
         axis_pos = pos_h;
@@ -95,7 +95,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     inv_freq = exp2(-(2.0 * f32(i) / f32(params.head_dim)) * params.base_);
     i1 = row + u32(i);
     i2 = i1 + u32(half_hd);
-
+//#endif
     let theta = f32(axis_pos) * inv_freq;
     let c = cos(theta);
     let s = sin(theta);
@@ -105,3 +105,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     store_at(i2, x1 * s + x2 * c);
 }
 
+// pie:instantiate rope_mrope_interleaved_bf16 PIE_GROUP_X=64
+// pie:instantiate rope_mrope_blocked_bf16 PIE_BLOCKED=1 PIE_GROUP_X=64
+// pie:instantiate rope_mrope_split_bf16 PIE_SPLIT=1 PIE_GROUP_X=64

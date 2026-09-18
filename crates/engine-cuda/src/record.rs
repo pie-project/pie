@@ -22,6 +22,7 @@ pub struct Fire<'a> {
     pub lanes: Option<Lanes<'a>>,
     pub conditionals: Option<crate::window::Conditionals<'a>>,
     pub decoding: &'a model_ir::ClassSet,
+    pub tiers: &'a Tiers,
     pub towered: bool,
     pub lane_ceiling: u32,
     pub ceilings: Ceilings<'a>,
@@ -330,7 +331,13 @@ pub fn cuts(compiled: &CompiledModel, admits: &[Admit]) -> core::result::Result<
     Ok(cuts)
 }
 
-pub const MAX_BODIES: usize = 512;
+pub const MAX_BODIES: usize = 1024;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tiers {
+    pub plain: model_ir::ClassSet,
+    pub wide: Box<[u32]>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BodyKey {
@@ -347,10 +354,11 @@ impl BodyKey {
         bucket: u32,
         decoding: &model_ir::ClassSet,
         lane_ceiling: u32,
+        tiers: &Tiers,
     ) -> BodyKey {
         BodyKey {
             bucket,
-            classes: Ladder::of(classes, bucket, decoding, lane_ceiling),
+            classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
             patch: None,
         }
     }
@@ -361,11 +369,12 @@ impl BodyKey {
         bucket: u32,
         decoding: &model_ir::ClassSet,
         lane_ceiling: u32,
+        tiers: &Tiers,
         patch: Option<(&WindowTable, u32)>,
     ) -> BodyKey {
         BodyKey {
             bucket,
-            classes: Ladder::of(classes, bucket, decoding, lane_ceiling),
+            classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
             patch: patch.map(|(classes, bucket)| AxisKey::of(classes, bucket)),
         }
     }
@@ -397,10 +406,19 @@ impl Ladder {
         bucket: u32,
         decoding: &model_ir::ClassSet,
         lane_ceiling: u32,
+        tiers: &Tiers,
     ) -> Ladder {
+        let plain = classes
+            .present_in_order()
+            .all(|class| tiers.plain.contains(class as usize));
+        let listed: Vec<u32> = if plain {
+            classes.present_in_order().collect()
+        } else {
+            tiers.wide.to_vec()
+        };
         Ladder(
-            classes
-                .present_in_order()
+            listed
+                .into_iter()
                 .map(|class| {
                     (
                         class,
@@ -517,7 +535,9 @@ impl AxisCarve<'_> {
 
     #[must_use]
     pub fn lanes(&self, span: MaskSpan) -> Option<(u32, u32)> {
-        self.prefix(span, self.lane_ceiling?)
+        let cap = self.lane_ceiling?;
+        let (_, own) = self.prefix(span, cap)?;
+        Some((span.lane_offset, own.min(cap)))
     }
 
     fn prefix(&self, span: MaskSpan, cap: u32) -> Option<(u32, u32)> {
@@ -771,6 +791,7 @@ impl Bodies {
             at.descriptor.bucket,
             at.decoding,
             at.lane_ceiling,
+            at.tiers,
             at.towered.then_some((
                 at.descriptor.table(model_ir::RowAxis::Patches),
                 at.descriptor.patch_bucket,
@@ -856,11 +877,22 @@ impl Bodies {
         walk_capture(at, run, place, Streams::Serial)?;
 
         if self.sealed_decline() {
-            if self.recorder.bstats.sealed_declines == 1 {
+            let declines = self.recorder.bstats.sealed_declines;
+            if declines.is_power_of_two() || declines.is_multiple_of(1000) {
+                let why = if !self.map.bodies.contains_key(&key) {
+                    "no body is resident for it"
+                } else if short {
+                    "its grids grew past the resident body"
+                } else if moved {
+                    "its schedule shape moved from the resident body's"
+                } else {
+                    "the resident body is empty"
+                };
                 eprintln!(
-                    "engine-cuda: the sealed map holds no body for {key} — \
+                    "engine-cuda: the sealed map holds no body for {key} ({why}) — \
                      this shape walks eagerly for the life of the load \
-                     (BodyTally::sealed_declines counts each such fire)"
+                     (BodyTally::sealed_declines counts each such fire; {declines} so far) {}",
+                    self.body_stats()
                 );
             }
             return Ok(());
@@ -875,11 +907,12 @@ impl Bodies {
             if warmed == WARM_FIRES {
                 eprintln!(
                     "engine-cuda: body {key} declines to capture — a schedule it \
-                     built would not fit its workspace grant, so `graph_capturable` \
+                     built refused its graph form ({}), so `graph_capturable` \
                      is false and this composition walks eagerly for good. The \
                      prefill float grant is sized at the lattice's top rung in \
                      `inputs::reserve` (`prefill_float_bytes`); a bucket that \
-                     outgrows it is this line."
+                     outgrows it is this line.",
+                    run.uncapturable_why().join("; ")
                 );
             }
             self.recorder.bstats.declines += 1;
@@ -982,7 +1015,7 @@ impl Bodies {
                 }
             }
         }
-        let _ = self.insert_body(key, Body {
+        let seated = self.insert_body(key.clone(), Body {
             script: steps.into_boxed_slice(),
             grids,
             shape,
@@ -990,6 +1023,17 @@ impl Bodies {
             launched_at: crate::settle::Airborne::NEVER,
             pinned: false,
         });
+        if seated && let Some(body) = self.map.bodies.get_mut(&key) {
+            for step in body.script.iter() {
+                match step {
+                    Step::Exec { exec, .. } => exec.launch(at.stream)?,
+                    Step::Island(cut) => {
+                        walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
+                    }
+                }
+            }
+            body.launched_at = at_seq;
+        }
         Ok(())
     }
 
@@ -1017,7 +1061,14 @@ impl Recorder {
         *PRICE.get_or_init(|| {
             let nodes = graph.nodes().filter(|nodes| *nodes > 0)?;
             let (bytes, _) = crate::device::nodes::exec_footprint(graph, COPIES).ok()?;
-            (bytes > 0.0).then(|| (bytes / nodes as f64).ceil() as usize)
+            let price = (bytes > 0.0).then(|| (bytes / nodes as f64).ceil() as usize);
+            if crate::serve::diag::on().arm_trace {
+                eprintln!(
+                    "[arm-trace] node price {price:?} B/node, weighed on a {nodes}-node graph \
+                     ({bytes:.0} B per instantiation over {COPIES} copies)"
+                );
+            }
+            price
         })
     }
 }
@@ -1247,6 +1298,13 @@ mod tests {
         model_ir::ClassSet::default()
     }
 
+    fn plain_tiers() -> Tiers {
+        Tiers {
+            plain: model_ir::ClassSet::of(0..8usize),
+            wide: Box::new([]),
+        }
+    }
+
     fn table(classes: &[(u32, u32)]) -> WindowTable {
         let mut at = (0, 0);
         WindowTable::new(
@@ -1275,19 +1333,19 @@ mod tests {
 
     fn a_rung_is_the_keys_own_ceiling_and_arming_computes_the_same_one() {
         let decoding = model_ir::ClassSet::of([0usize]);
-        let fired = BodyKey::of(&table(&[(3, 3)]), 8, &decoding, LANES);
+        let fired = BodyKey::of(&table(&[(3, 3)]), 8, &decoding, LANES, &plain_tiers());
         assert_eq!(
             fired.to_string(),
             "b8[c0:4]",
             "the lane ceiling binds below the bucket, and three rows say nothing",
         );
         assert_eq!(
-            BodyKey::of(&table(&[(3, 3)]), 2, &decoding, LANES).to_string(),
+            BodyKey::of(&table(&[(3, 3)]), 2, &decoding, LANES, &plain_tiers()).to_string(),
             "b2[c0:2]",
             "and the bucket binds below the lane ceiling",
         );
         assert_eq!(
-            BodyKey::of(&table(&[(3, 3)]), 8, &prefill_only(), LANES).to_string(),
+            BodyKey::of(&table(&[(3, 3)]), 8, &prefill_only(), LANES, &plain_tiers()).to_string(),
             "b8[c0:8]",
             "a class the decode arm does not name takes the bucket whole",
         );
@@ -1352,7 +1410,7 @@ mod tests {
     fn the_map_never_inserts_a_body_whose_script_is_empty() {
         let mut graphs = Bodies::new();
         let classes = table(&[(8, 1)]);
-        let key = BodyKey::of(&classes, 8, &prefill_only(), LANES);
+        let key = BodyKey::of(&classes, 8, &prefill_only(), LANES, &plain_tiers());
         let empty = Body {
             script: Box::new([]),
             grids: Box::new([]),

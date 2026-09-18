@@ -716,6 +716,8 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
+ "serde",
+ "termcolor",
  "unicode-width",
 ]
 
@@ -766,6 +768,16 @@ dependencies = [
  "libc",
  "unicode-width",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1695,9 +1707,9 @@ dependencies = [
  "model-exec",
  "model-ir",
  "naga",
- "pollster",
  "toml",
  "tracing",
+ "web-rt",
  "wgpu",
 ]
 
@@ -2041,8 +2053,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2052,9 +2066,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2064,9 +2080,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2751,6 +2769,7 @@ name = "kernels-wgpu"
 version = "0.5.0"
 dependencies = [
  "dtype",
+ "serde_json",
 ]
 
 [[package]]
@@ -3651,6 +3670,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "pie-web"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "checkpoint",
+ "client-api",
+ "console_error_panic_hook",
+ "engine",
+ "engine-wgpu",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "js-sys",
+ "model-ir",
+ "models",
+ "rmp-serde",
+ "runtime",
+ "serde",
+ "serde_json",
+ "tokenizer",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "wasi-web",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasmtime-web",
+ "web-rt",
+ "web-sys",
+ "wgpu",
+ "ztensor",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3753,12 +3806,6 @@ dependencies = [
  "flate2",
  "miniz_oxide 0.8.9",
 ]
-
-[[package]]
-name = "pollster"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
 
 [[package]]
 name = "portable-atomic"
@@ -4350,7 +4397,7 @@ dependencies = [
  "bytes",
  "checkpoint",
  "checkpoint-dsl",
- "client",
+ "client-api",
  "crossbeam",
  "cudarc",
  "dashmap",
@@ -4363,11 +4410,13 @@ dependencies = [
  "eta-ir",
  "fancy-regex",
  "futures",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "grammar",
  "http",
  "image",
  "ipnet",
- "libc",
  "libloading 0.9.0",
  "lru",
  "model-ir",
@@ -4382,7 +4431,6 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
- "tarpc",
  "tempfile",
  "thiserror",
  "tokenizer",
@@ -4394,12 +4442,16 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "waker",
+ "wasi-web",
  "wasm-encoder 0.254.0",
  "wasm-metadata 0.254.0",
  "wasmparser 0.254.0",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+ "wasmtime-web",
+ "web-rt",
+ "wgpu",
  "ztensor",
  "ztensor-compat",
 ]
@@ -5820,6 +5872,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
+name = "wasi-web"
+version = "0.5.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "wasmtime",
+ "wasmtime-wasi-io",
+]
+
+[[package]]
 name = "wasip2"
 version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6273,6 +6334,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmtime-web"
+version = "0.5.0"
+dependencies = [
+ "cranelift-codegen",
+ "wasmtime",
+]
+
+[[package]]
 name = "wast"
 version = "258.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6292,6 +6361,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7555c008cca87f2ac58d9f83ccda7e7b44611093ce28eb28f052e7c78024b9bf"
 dependencies = [
  "wast",
+]
+
+[[package]]
+name = "web-rt"
+version = "0.5.0"
+dependencies = [
+ "slab",
+ "wasmtime-internal-fiber",
 ]
 
 [[package]]
@@ -6351,12 +6428,17 @@ dependencies = [
  "cfg_aliases",
  "document-features",
  "hashbrown 0.17.1",
+ "js-sys",
  "log",
+ "naga",
  "portable-atomic",
  "profiling",
  "raw-window-handle",
  "smallvec",
  "static_assertions",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu-core",
  "wgpu-hal",
  "wgpu-types",
@@ -6478,10 +6560,12 @@ checksum = "99dad6f1fbdbbdb4c278a6508b059d44688f5cebddf78d005a46a31340269286"
 dependencies = [
  "bitflags",
  "bytemuck",
+ "js-sys",
  "log",
  "naga-types",
  "raw-window-handle",
  "static_assertions",
+ "web-sys",
 ]
 
 [[package]]

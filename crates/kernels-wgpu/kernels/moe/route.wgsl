@@ -1,8 +1,9 @@
-
+//#include "common/bf16.inc.wgsl"
 
 const ROUTER_MAX_TOPK = 16u;
 const ROUTER_MAX_EXPERTS = 1024u;
 
+//#if defined(PIE_ROUTER_TOPK)
 
 @group(0) @binding(0) var<storage, read> logits: array<u32>;
 @group(0) @binding(1) var<storage, read_write> expert_ids: array<i32>;
@@ -83,18 +84,19 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         for (var r = 0u; r < k; r = r + 1u) {
             let e = chosen_i[r];
             var w = exp(chosen[r] - mx) / sum;
-
+//#if defined(PIE_SCALED)
             w = w * pie_bf16_at(per_expert_scale[e >> 1u], e);
-
+//#endif
             expert_ids[row * k + r] = i32(e);
             expert_weights[row * k + r] = w;
         }
     }
 }
 
+//#elif defined(PIE_ROUTER_SIGMOID)
 
 @group(0) @binding(0) var<storage, read> logits: array<u32>;
-
+//#if defined(PIE_BIASED)
 @group(0) @binding(1) var<storage, read> correction: array<f32>;
 @group(0) @binding(2) var<storage, read_write> expert_ids: array<i32>;
 @group(0) @binding(3) var<storage, read_write> expert_weights: array<f32>;
@@ -106,7 +108,7 @@ struct Params {
     scaling: f32,
 }
 @group(0) @binding(4) var<uniform> params: Params;
-
+//#else
 @group(0) @binding(1) var<storage, read_write> expert_ids: array<i32>;
 @group(0) @binding(2) var<storage, read_write> expert_weights: array<f32>;
 
@@ -117,21 +119,21 @@ struct Params {
     scaling: f32,
 }
 @group(0) @binding(3) var<uniform> params: Params;
-
+//#endif
 
 var<workgroup> s_score: array<f32, ROUTER_MAX_EXPERTS>;
 var<workgroup> s_rank: array<f32, ROUTER_MAX_EXPERTS>;
 
 fn score_of(x: f32) -> f32 {
-
+//#if defined(PIE_SQRT_SOFTPLUS)
     var sp = x;
     if (x <= 20.0) {
         sp = log(1.0 + exp(x));
     }
     return sqrt(max(sp, 0.0));
-
+//#else
     return 1.0 / (1.0 + exp(-x));
-
+//#endif
 }
 
 @compute @workgroup_size(PIE_GROUP_X)
@@ -149,11 +151,11 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         if (e < n) {
             let at = row * n + e;
             s = score_of(pie_bf16_at(logits[at >> 1u], at));
-
+//#if defined(PIE_BIASED)
             rank = s + correction[e];
-
+//#else
             rank = s;
-
+//#endif
         }
         s_score[e] = s;
         s_rank[e] = rank;
@@ -192,6 +194,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
+//#elif defined(PIE_EXPERT_COMBINE)
 
 @group(0) @binding(0) var<storage, read> routed: array<u32>;
 @group(0) @binding(1) var<storage, read> expert_weights: array<f32>;
@@ -233,6 +236,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+//#elif defined(PIE_EXPERT_BIAS_COMBINE)
 
 @group(0) @binding(0) var<storage, read> x: array<u32>;
 @group(0) @binding(1) var<storage, read> bias: array<u32>;
@@ -279,6 +283,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+//#elif defined(PIE_HASH_ROUTE)
 
 @group(0) @binding(0) var<storage, read> token_ids: array<u32>;
 @group(0) @binding(1) var<storage, read> tid2eid: array<u32>;
@@ -342,6 +347,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+//#elif defined(PIE_GROUP_ROUTES)
 
 @group(0) @binding(0) var<storage, read_write> routes: array<i32>;
 
@@ -360,6 +366,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     routes[row * params.groups + slot] = i32(slot);
 }
 
+//#else
 
 @group(0) @binding(0) var<storage, read> routed: array<u32>;
 @group(0) @binding(1) var<storage, read> shared_: array<u32>;
@@ -392,5 +399,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         out_[gid.x] = pie_bf16_into(out_[gid.x], lo, v0);
     }
 }
+//#endif
 
-
+// pie:instantiate router_topk_f32w_bfloat16 PIE_ROUTER_TOPK=1 PIE_GROUP_X=256
+// pie:instantiate router_topk_scaled_f32w_bfloat16 PIE_ROUTER_TOPK=1 PIE_SCALED=1 PIE_GROUP_X=256
+// pie:instantiate router_topk_sigmoid PIE_ROUTER_SIGMOID=1 PIE_GROUP_X=256
+// pie:instantiate router_topk_sigmoid_biased PIE_ROUTER_SIGMOID=1 PIE_BIASED=1 PIE_GROUP_X=256
+// pie:instantiate router_topk_sqrt_softplus PIE_ROUTER_SIGMOID=1 PIE_BIASED=1 PIE_SQRT_SOFTPLUS=1 PIE_GROUP_X=256
+// pie:instantiate expert_combine PIE_EXPERT_COMBINE=1 PIE_GROUP_X=256
+// pie:instantiate expert_bias_combine PIE_EXPERT_BIAS_COMBINE=1 PIE_GROUP_X=256
+// pie:instantiate shared_expert_combine PIE_GROUP_X=256
+// pie:instantiate hash_route_gather PIE_HASH_ROUTE=1 PIE_GROUP_X=256
+// pie:instantiate group_routes PIE_GROUP_ROUTES=1 PIE_GROUP_X=256

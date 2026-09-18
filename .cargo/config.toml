@@ -1,0 +1,9 @@
+# The browser host (`crates/web`) builds for wasm32-unknown-unknown. Rust's
+# shadow stack pointer is exported so the page can save and restore it per
+# fiber (see `crates/wasmtime-web`), and getrandom is pointed at the Web
+# Crypto backend. Native targets are untouched by this section.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "link-arg=--export=__stack_pointer",
+    "--cfg", "getrandom_backend=\"wasm_js\"",
+]

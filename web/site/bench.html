@@ -1,0 +1,48 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>pie in the browser — benchmark</title>
+<style> body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; } pre { background: #f4f4f4; padding: 0.75rem; white-space: pre-wrap; } </style>
+<h1>benchmark: the runtime in this tab, through the client SDK</h1>
+<pre id="out"></pre>
+<script type="importmap">
+{ "imports": {
+    "msgpack-lite": "https://esm.sh/msgpack-lite@0.1.26",
+    "@noble/hashes/blake3.js": "https://esm.sh/@noble/hashes@2.2.0/blake3.js",
+    "@noble/hashes/utils.js": "https://esm.sh/@noble/hashes@2.2.0/utils.js"
+} }
+</script>
+<script type="module">
+  import * as pie from "./pie.mjs";
+  import { PieClient } from "./sdk/index.js";
+  import { runBench, runCorners } from "./bench.mjs";
+  import { page, loadRuntime, installInferlet } from "./harness.mjs";
+
+  const { log, params, modelUrl, finish, fail } = page();
+  const what = params.get("what") ?? "both";
+  const config = params.get("config") ?? "";
+
+  try {
+    await loadRuntime(params);
+    // `fetch_ms` is the time to the last byte served; `boot_ms` the rest of the boot.
+    const t0 = performance.now();
+    let tFetch = 0;
+    const summary = await pie.bootLazy(modelUrl, config.split(",").map((s) => s.trim()).filter(Boolean).join("\n") + "\n", () => { tFetch = performance.now() - t0; });
+    const bootMs = performance.now() - t0 - tFetch;
+    log(`model ${modelUrl.split("/").pop()}: fetched in ${tFetch.toFixed(0)} ms, booted in ${bootMs.toFixed(0)} ms, sku ${summary.sku}`);
+    const { program } = await installInferlet("text-completion");
+    const { program: carried } = await installInferlet("naive-baseline");
+
+    const client = new PieClient("pie://local");
+    await client.connect();
+    const opts = { carried, memory: async () => (await pie.memoryBytes()) / 1048576, makeClient: () => new PieClient("pie://local") };
+    const result = { host: "browser", model: summary.sku, fetch_ms: +tFetch.toFixed(0), boot_ms: +bootMs.toFixed(0), memory_mib_after_boot: +((await pie.memoryBytes()) / 1048576).toFixed(0) };
+    if (what !== "corners") result.bench = await runBench(client, program, log, opts);
+    if (what !== "bench") result.corners = await runCorners(client, program, log, opts);
+    result.memory_mib_end = +((await pie.memoryBytes()) / 1048576).toFixed(0);
+    await client.close();
+    log("RESULT " + JSON.stringify(result));
+    finish(0);
+  } catch (e) {
+    fail(e);
+  }
+</script>

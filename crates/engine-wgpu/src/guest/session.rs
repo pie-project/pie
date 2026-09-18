@@ -20,6 +20,20 @@ const WORKGROUP: u32 = eta_compiler::codegen::wgsl::WORKGROUP;
 
 const GROUPS_PER_CORE: u32 = 4;
 
+/// The status word's seat at the head of a stage's outbox.
+const STATUS_SPAN: u64 = eta_exec::STATUS_BYTES as u64;
+
+/// What a fresh outbox holds before the first fire sizes it.
+const OUTBOX_FLOOR: u64 = 256;
+
+/// The outbox is read through a staging copy on every host: in the browser
+/// a fresh staging buffer mapped behind its copy lands in under a
+/// millisecond, where mapping the outbox itself behind the frame that fills
+/// it took three, and mapping it only after the frame reported done took
+/// an event-loop turn more (see `Raw::read_async` for what becomes of the
+/// staging buffers).
+const OUTBOX_KIND: Memory = Memory::Host;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct Cfg {
@@ -54,9 +68,67 @@ fn as_bytes<T: Copy>(items: &[T]) -> Vec<u8> {
     out
 }
 
-struct Stage {
-    pipelines: Vec<wgpu::ComputePipeline>,
+/// A program's device code, built once per program and shared by every
+/// session of it: the layouts (one shape for every guest) and each stage's
+/// pipelines. A bind then makes only its own buffers and bind groups, which
+/// keeps a process's bind cheap and, in the browser, keeps pipelines from
+/// piling up for the page's GC to release.
+pub struct Code {
+    binds: wgpu::BindGroupLayout,
+    _layout: wgpu::PipelineLayout,
+    stages: Vec<Vec<wgpu::ComputePipeline>>,
 
+    /// Per stage, whether its dispatches stride the grid (and so want every
+    /// core) or run one workgroup.
+    strides: Vec<bool>,
+}
+
+impl std::fmt::Debug for Code {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Code")
+            .field("stages", &self.stages.len())
+            .field(
+                "dispatches",
+                &self.stages.iter().map(Vec::len).sum::<usize>(),
+            )
+            .finish()
+    }
+}
+
+impl Code {
+    pub fn new(device: &Context, code: &[crate::guest::Lowered]) -> Result<Code> {
+        let core = device.core().clone();
+        let binds = bind_layout(&core);
+        let layout = core
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("pie guest"),
+                bind_group_layouts: &[Some(&binds)],
+                immediate_size: 0,
+            });
+        core.take_error("create_pipeline_layout")?;
+        let stages = code
+            .iter()
+            .map(|lowered| build_pipelines(&core, &layout, lowered))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Code {
+            binds,
+            _layout: layout,
+            stages,
+            strides: code
+                .iter()
+                .map(|lowered| lowered.strides_the_grid)
+                .collect(),
+        })
+    }
+
+    #[must_use]
+    pub fn stages(&self) -> usize {
+        self.stages.len()
+    }
+}
+
+struct Stage {
     group: wgpu::BindGroup,
 
     groups: u32,
@@ -73,15 +145,25 @@ struct Stage {
 
     heap: Buffer,
 
-    landing: Buffer,
+    /// Where a fire's answer lands for the host: the status word, then each
+    /// value the stage puts, copied in by the frame that computed them and
+    /// read back in one go (`collect`) — one round trip to the device per
+    /// stage, which is what the browser can afford.
+    outbox: Buffer,
+
+    /// The values the last `read_back` seated in the outbox: value, where
+    /// it starts there, and how many bytes it holds.
+    outbox_layout: Vec<(u32, u64, u64)>,
+
+    /// The outbox's bytes as of the last `collect`.
+    collected: Vec<u8>,
 }
 
 pub struct Session {
     status: Buffer,
     stages: Vec<Stage>,
 
-    _binds: wgpu::BindGroupLayout,
-    _layout: wgpu::PipelineLayout,
+    code: Arc<Code>,
 }
 
 impl std::fmt::Debug for Session {
@@ -100,7 +182,7 @@ impl Session {
     pub fn new(
         device: &Context,
         plans: &[LaunchStagePlan],
-        code: &[crate::guest::Lowered],
+        code: Arc<Code>,
         extents: &Extents,
     ) -> Result<Session> {
         if plans.is_empty() {
@@ -109,13 +191,13 @@ impl Session {
                 why: "a guest package with no stages has nothing to run".into(),
             });
         }
-        if code.len() != plans.len() {
+        if code.stages() != plans.len() {
             return Err(Fault::Program {
                 at: "guest::session",
                 why: format!(
                     "{} stage plans but {} compiled forms; a session runs every stage or none",
                     plans.len(),
-                    code.len()
+                    code.stages()
                 ),
             });
         }
@@ -124,28 +206,23 @@ impl Session {
         status.write(0, &[0u8; eta_exec::STATUS_BYTES])?;
 
         let core = device.core().clone();
-        let binds = bind_layout(&core);
-        let layout = core
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("pie guest"),
-                bind_group_layouts: &[Some(&binds)],
-                immediate_size: 0,
-            });
-        core.take_error("create_pipeline_layout")?;
-
         let mut stages = Vec::with_capacity(plans.len());
-        for (plan, lowered) in plans.iter().zip(code) {
+        for (at, plan) in plans.iter().enumerate() {
             stages.push(build_stage(
-                device, &core, &binds, &layout, &status, plan, lowered, extents,
+                device,
+                &core,
+                &code.binds,
+                &status,
+                plan,
+                extents,
+                code.strides[at],
             )?);
         }
 
         Ok(Session {
             status,
             stages,
-            _binds: binds,
-            _layout: layout,
+            code,
         })
     }
 
@@ -238,36 +315,102 @@ impl Session {
             at: "guest::session",
             why: format!("stage {at} is past this package's {}", self.stages.len()),
         })?;
-        for pipeline in &stage.pipelines {
+        for pipeline in &self.code.stages[at] {
             frame.dispatch("guest", pipeline, &stage.group, [stage.groups, 1, 1])?;
         }
         Ok(())
     }
 
-    pub fn read_back(&mut self, frame: &mut Frame, stage: usize, value: u32) -> Result<()> {
-        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
-            at: "guest::session",
-            why: format!("value {value} is not stage {stage}'s"),
-        })?;
-        let stage = &self.stages[stage];
+    /// Records, at the end of `frame`, the copies that seat the status word
+    /// and `values` in the stage's outbox; `collect` reads them once the
+    /// frame has run.
+    pub fn read_back(
+        &mut self,
+        device: &Context,
+        frame: &mut Frame,
+        stage: usize,
+        values: &[u32],
+    ) -> Result<()> {
+        let mut layout = Vec::with_capacity(values.len());
+        let mut cursor = STATUS_SPAN;
+        for &value in values {
+            let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: format!("value {value} is not stage {stage}'s"),
+            })?;
+            let held = self.stages[stage].heap.bytes() - at;
+            layout.push((value, at, cursor, len.next_multiple_of(4).min(held)));
+            cursor += len.next_multiple_of(4).min(held);
+        }
+        let Session { status, stages, .. } = self;
+        let seat = &mut stages[stage];
+        if seat.outbox.bytes() < cursor {
+            seat.outbox = Buffer::with(device, cursor, OUTBOX_KIND)?;
+        }
+        frame.copy(status, 0, &seat.outbox, 0, STATUS_SPAN)?;
+        for &(_, at, into, len) in &layout {
+            frame.copy(&seat.heap, at, &seat.outbox, into, len)?;
+        }
+        seat.outbox_layout = layout
+            .into_iter()
+            .map(|(value, _, into, len)| (value, into, len))
+            .collect();
+        seat.collected.clear();
+        Ok(())
+    }
 
-        let len = len.next_multiple_of(4).min(stage.heap.bytes() - at);
-        frame.copy(&stage.heap, at, &stage.landing, at, len)
+    /// Reads the stage's outbox back, once, after its frame was submitted.
+    /// The read's own copy queues behind the frame, so its landing is the
+    /// frame's landing too; `status` and `taken` then answer from memory.
+    pub fn collect(&mut self, stage: usize) -> Result<()> {
+        let stages = self.stages.len();
+        let seat = self.stages.get_mut(stage).ok_or_else(|| Fault::Program {
+            at: "guest::session",
+            why: format!("stage {stage} is past this package's {stages}"),
+        })?;
+        let span = seat
+            .outbox_layout
+            .last()
+            .map_or(STATUS_SPAN, |&(_, into, len)| into + len);
+        let mut out = vec![0u8; span as usize];
+        seat.outbox.read(0, &mut out)?;
+        seat.collected = out;
+        Ok(())
     }
 
     pub fn taken(&self, stage: usize, value: u32) -> Result<Vec<u8>> {
-        let (at, len) = self.span(stage, value).ok_or_else(|| Fault::Program {
+        let (_, held) = self.span(stage, value).ok_or_else(|| Fault::Program {
             at: "guest::session",
             why: format!("value {value} is not stage {stage}'s"),
         })?;
-        let mut out = vec![0u8; len as usize];
-        self.stages[stage].landing.read(at, &mut out)?;
-        Ok(out)
+        let seat = &self.stages[stage];
+        let &(_, into, len) = seat
+            .outbox_layout
+            .iter()
+            .find(|&&(seated, _, _)| seated == value)
+            .ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: format!("value {value} of stage {stage} was not read back"),
+            })?;
+        let (into, end) = (into as usize, (into + len.min(held)) as usize);
+        seat.collected
+            .get(into..end)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: format!("value {value} of stage {stage} was not collected"),
+            })
     }
 
-    pub fn status(&self) -> Result<Option<u32>> {
-        let mut raw = [0u8; eta_exec::STATUS_BYTES];
-        self.status.read(0, &mut raw)?;
+    pub fn status(&self, stage: usize) -> Result<Option<u32>> {
+        let raw = self
+            .stages
+            .get(stage)
+            .and_then(|seat| seat.collected.get(..4))
+            .ok_or_else(|| Fault::Program {
+                at: "guest::session",
+                why: format!("stage {stage}'s status was not collected"),
+            })?;
         let code = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
         Ok((code != 0).then_some(code))
     }
@@ -329,16 +472,66 @@ fn alias_reshapes(plan: &LaunchStagePlan, values: &mut [u64]) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn build_pipelines(
+    core: &Arc<Core>,
+    pipeline_layout: &wgpu::PipelineLayout,
+    lowered: &crate::guest::Lowered,
+) -> Result<Vec<wgpu::ComputePipeline>> {
+    // A stage may be all boundary: a pass whose epilogue only puts the
+    // logits on a channel lowers to no dispatch at all, and runs as the
+    // copies around it (the readout widened into the heap, the heap read
+    // back into the channel).
+    if lowered.entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let started = crate::device::host::Instant::now();
+    let built = crate::guest::validated(core, "create_compute_pipeline", || {
+        let module = core
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("pie guest"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&lowered.source)),
+            });
+        lowered
+            .entries
+            .iter()
+            .map(|entry| {
+                core.device
+                    .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("pie guest"),
+                        layout: Some(pipeline_layout),
+                        module: &module,
+                        entry_point: Some(entry),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        cache: None,
+                    })
+            })
+            .collect()
+    })
+    .map_err(|error| Fault::Wgpu {
+        what: "create_compute_pipeline",
+        why: format!(
+            "a guest stage's {} step(s) ({}) were refused: {error}",
+            lowered.entries.len(),
+            lowered.entries.join(", ")
+        ),
+    });
+    tracing::info!(
+        entries = lowered.entries.len(),
+        ms = started.elapsed().as_millis() as u64,
+        "guest stage pipelines built"
+    );
+    built
+}
+
 fn build_stage(
     device: &Context,
     core: &Arc<Core>,
     binds: &wgpu::BindGroupLayout,
-    pipeline_layout: &wgpu::PipelineLayout,
     status: &Buffer,
     plan: &LaunchStagePlan,
-    lowered: &crate::guest::Lowered,
     extents: &Extents,
+    strides_the_grid: bool,
 ) -> Result<Stage> {
     let descriptors = plan
         .value_types
@@ -406,47 +599,7 @@ fn build_stage(
 
     let bytes = scratch.total.max(256);
     let heap = Buffer::zeroed(device, bytes)?;
-    let landing = Buffer::with(device, bytes, Memory::Host)?;
-
-    if lowered.entries.is_empty() {
-        return Err(Fault::Program {
-            at: "guest::session",
-            why: "a stage emitted no dispatches, so nothing would run".into(),
-        });
-    }
-
-    let scope = core.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let module = core
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("pie guest"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&lowered.source)),
-        });
-    let pipelines: Vec<wgpu::ComputePipeline> = lowered
-        .entries
-        .iter()
-        .map(|entry| {
-            core.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("pie guest"),
-                    layout: Some(pipeline_layout),
-                    module: &module,
-                    entry_point: Some(entry),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    cache: None,
-                })
-        })
-        .collect();
-    if let Some(error) = pollster::block_on(scope.pop()) {
-        return Err(Fault::Wgpu {
-            what: "create_compute_pipeline",
-            why: format!(
-                "a guest stage's {} step(s) ({}) were refused: {error}",
-                lowered.entries.len(),
-                lowered.entries.join(", ")
-            ),
-        });
-    }
+    let outbox = Buffer::with(device, OUTBOX_FLOOR, OUTBOX_KIND)?;
 
     let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("pie guest"),
@@ -481,9 +634,8 @@ fn build_stage(
     core.take_error("create_bind_group")?;
 
     Ok(Stage {
-        pipelines,
         group,
-        groups: if lowered.strides_the_grid {
+        groups: if strides_the_grid {
             groups_for(&descriptors, device)
         } else {
             1
@@ -495,6 +647,8 @@ fn build_stage(
         _offs: offs,
         _cfg: cfg,
         heap,
-        landing,
+        outbox,
+        outbox_layout: Vec::new(),
+        collected: Vec::new(),
     })
 }

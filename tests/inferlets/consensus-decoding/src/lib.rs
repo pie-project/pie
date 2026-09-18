@@ -303,7 +303,18 @@ async fn main(input: Input) -> Result<String> {
 
             // Per-lane top-p + temperature sample over [B, vocab] logits
             // (row-wise nucleus, independent Gumbel noise per lane).
-            let logits = intrinsics::logits(); // [B, vocab]
+            // `intrinsics::logits()` squeezes to rank-1 `[vocab]` when the fire
+            // reads out a single row, so a lone candidate (B=1) has to be
+            // reshaped back to `[B, vocab]` the way the beam search does. B>=2
+            // arrives as `[B, vocab]` already, and must be left as the bare
+            // intrinsic: the library's fused nucleus fast path only claims the
+            // logits when they are the intrinsic behind at most a reshape, and
+            // an unconditional reshape here defeats it and empties the sample.
+            let logits = if b == 1 {
+                reshape(intrinsics::logits(), [b, vocab])
+            } else {
+                intrinsics::logits()
+            }; // [B, vocab]
             let scaled = &logits / temperature;
             let probs = softmax(&scaled);
             let keep = pivot_threshold(&probs, cummass_le(top_p));

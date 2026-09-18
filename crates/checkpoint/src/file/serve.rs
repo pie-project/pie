@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -106,10 +107,26 @@ impl Artifact {
         serving::alignment(&self.spans())
     }
 
+    /// The zero-copy view of an object: the mapped file, or the chunk of a
+    /// memory mount it lies in. An object straddling two chunks has no such
+    /// view and is refused; `object_bytes` reads it either way.
     pub fn object(&self, name: &str) -> Result<&[u8], Error> {
+        match self.object_bytes(name)? {
+            Cow::Borrowed(bytes) => Ok(bytes),
+            Cow::Owned(_) => Err(Error::Checkpoint(format!(
+                "{name:?} lies across two chunks of the memory mount {}, which has no \
+                 zero-copy view of it",
+                self.path.display()
+            ))),
+        }
+    }
+
+    /// An object's bytes: borrowed where a zero-copy view exists, a copy
+    /// where it lies across two chunks of a memory mount.
+    pub fn object_bytes(&self, name: &str) -> Result<Cow<'_, [u8]>, Error> {
         self.source
             .tensor(name)
-            .and_then(|tensor| tensor.map())
+            .and_then(|tensor| tensor.bytes())
             .map_err(Error::from)
     }
 
@@ -168,9 +185,18 @@ impl Artifact {
     }
 
     pub fn verify(&self, objects: &[&str]) -> Result<(), Error> {
-        let mut work = Vec::new();
+        let mut blobs = Vec::with_capacity(objects.len());
         for object in objects {
-            self.gather(object, &mut work)?;
+            if !serving::is_serving(object) {
+                return Err(Error::Checkpoint(format!(
+                    "{object:?} is a metadata object, which is not served"
+                )));
+            }
+            blobs.push(self.object_bytes(object)?);
+        }
+        let mut work = Vec::new();
+        for (object, bytes) in objects.iter().zip(&blobs) {
+            self.gather(object, bytes, &mut work)?;
         }
         self.hash(&work)
     }
@@ -185,14 +211,13 @@ impl Artifact {
         Ok(())
     }
 
-    fn gather<'a>(&'a self, object: &'a str, into: &mut Vec<Work<'a>>) -> Result<(), Error> {
-        if !serving::is_serving(object) {
-            return Err(Error::Checkpoint(format!(
-                "{object:?} is a metadata object, which is not served"
-            )));
-        }
+    fn gather<'a>(
+        &'a self,
+        object: &'a str,
+        bytes: &'a [u8],
+        into: &mut Vec<Work<'a>>,
+    ) -> Result<(), Error> {
         let blocks = self.blocks(object)?;
-        let bytes = self.object(object)?;
         if bytes.len() as u64 != blocks.size() {
             return Err(Error::Checkpoint(format!(
                 "the serving artifact {} maps {} bytes for {object:?} and its block table \
@@ -218,6 +243,32 @@ impl Artifact {
     }
 
     fn hash(&self, work: &[Work<'_>]) -> Result<(), Error> {
+        // Bytes already in memory (or a platform with one thread) are hashed
+        // in place; the reader lanes exist to keep a disk busy.
+        let found =
+            if cfg!(target_arch = "wasm32") || self.source.store(ztensor::StoreId(0)).is_memory() {
+                work.iter()
+                    .map(|item| item.algorithm.digest(item.bytes).value)
+                    .collect()
+            } else {
+                self.hash_across_readers(work)?
+            };
+        if found.len() != work.len() {
+            return Err(Error::Internal(format!(
+                "{} blocks were hashed for {} of work",
+                found.len(),
+                work.len()
+            )));
+        }
+        for (item, found) in work.iter().zip(&found) {
+            if found.as_slice() != item.stated {
+                return Err(Error::Checkpoint(item.refusal(self.path.as_path(), found)));
+            }
+        }
+        Ok(())
+    }
+
+    fn hash_across_readers(&self, work: &[Work<'_>]) -> Result<Vec<Vec<u8>>, Error> {
         let width = READERS.min(work.len().max(1));
         let per = work.len().div_ceil(width);
         let found: Vec<Vec<u8>> = std::thread::scope(|scope| {
@@ -242,19 +293,7 @@ impl Artifact {
             }
             Ok::<_, Error>(found)
         })?;
-        if found.len() != work.len() {
-            return Err(Error::Internal(format!(
-                "{} blocks were hashed for {} of work",
-                found.len(),
-                work.len()
-            )));
-        }
-        for (item, found) in work.iter().zip(&found) {
-            if found.as_slice() != item.stated {
-                return Err(Error::Checkpoint(item.refusal(self.path.as_path(), found)));
-            }
-        }
-        Ok(())
+        Ok(found)
     }
 }
 

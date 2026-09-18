@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>signed zero through Tint</title>
+<pre id="out"></pre>
+<script type="module">
+  const out = document.getElementById("out");
+  const log = (s) => { out.textContent += s + "\n"; console.log(s); };
+  const adapter = await navigator.gpu.requestAdapter();
+  const device = await adapter.requestDevice();
+  log(`adapter: ${adapter.info?.vendor} ${adapter.info?.architecture}`);
+  const code = `
+    @group(0) @binding(0) var<storage, read> x: array<f32>;
+    @group(0) @binding(1) var<storage, read_write> y: array<u32>;
+    fn sign_bit(v: f32) -> bool { return (bitcast<u32>(v) & 0x80000000u) != 0u; }
+    var<private> neg_zero_bits : u32 = 0x80000000u;
+    fn NEG_ZERO() -> f32 { return bitcast<f32>(neg_zero_bits); }
+    fn neg_zero_if_both(l: f32, r: f32) -> f32 { if (sign_bit(l) && sign_bit(r)) { return -0.0; } return l + r; }
+    @compute @workgroup_size(1) fn main() {
+      y[0] = bitcast<u32>(-0.0);                 // literal
+      y[1] = bitcast<u32>(-x[0]);                // negate a runtime 0.0
+      y[2] = bitcast<u32>(x[1]);                 // -0.0 read from memory
+      y[3] = bitcast<u32>(neg_zero_if_both(x[1], x[1]));  // returned literal
+      y[4] = bitcast<u32>(x[1] * 1.0);           // -0.0 * 1.0
+      y[5] = bitcast<u32>(min(x[1], 0.0));       // min(-0.0, 0.0)
+      y[6] = bitcast<u32>(select(0.0, -0.0, sign_bit(x[1])));
+      y[7] = bitcast<u32>(0.0 - x[0]);           // 0.0 - 0.0
+      y[8] = bitcast<u32>(NEG_ZERO());           // bits through var<private>
+      y[9] = bitcast<u32>(bitcast<f32>(0x80000000u)); // bits as a constant
+    }`;
+  const module = device.createShaderModule({ code });
+  const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+  const xs = new Float32Array([0.0, -0.0]);
+  const xb = device.createBuffer({ size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(xb, 0, xs);
+  const yb = device.createBuffer({ size: 40, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const rb = device.createBuffer({ size: 40, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: xb } }, { binding: 1, resource: { buffer: yb } }] });
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass(); pass.setPipeline(pipeline); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(1); pass.end();
+  enc.copyBufferToBuffer(yb, 0, rb, 0, 40);
+  device.queue.submit([enc.finish()]);
+  await rb.mapAsync(GPUMapMode.READ);
+  const y = new Uint32Array(rb.getMappedRange());
+  const names = ["literal -0.0", "-(0.0 from memory)", "-0.0 from memory", "returned literal -0.0", "-0.0 * 1.0", "min(-0.0, 0.0)", "select(0.0, -0.0, true)", "0.0 - 0.0", "bits via var<private>", "bitcast of constant bits"];
+  names.forEach((n, i) => log(`${n}: 0x${y[i].toString(16).padStart(8, "0")} ${y[i] === 0x80000000 ? "(-0.0)" : y[i] === 0 ? "(+0.0)" : ""}`));
+  window.__pie_done?.(0);
+</script>

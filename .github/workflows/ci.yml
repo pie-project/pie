@@ -465,3 +465,129 @@ jobs:
           ldd target/debug/pie | grep -E "libcudart|libcublas|libcublasLt" \
             && { echo "FAIL: CUDA shared lib leaked into binary"; exit 1; } \
             || echo "OK: no CUDA shared deps"
+
+  # The browser port: every crate the tab links must keep compiling and
+  # clippy-clean for wasm32-unknown-unknown, and the same crates natively,
+  # with their tests. No GPU here — `web/test.sh` (Chrome + WebGPU) is the
+  # local gate; this catches the portability regressions, which land at
+  # compile time.
+  browser-check:
+    name: browser port (wasm32 + native gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cache cargo registry + targets
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            target-wasm
+          key: ${{ runner.os }}-cargo-web-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-web-
+
+      # The client SDK's tests import its two runtime dependencies.
+      - name: Install client SDK dependencies
+        working-directory: sdk/client/javascript
+        run: npm install --no-save msgpack-lite@0.1.26 @noble/hashes@2.2.0
+
+      - name: web/check.sh
+        run: ./web/check.sh
+
+  # The wgpu engine end to end with no GPU: a random-weight miniature served
+  # over Mesa's lavapipe, the SDK's corner cases against it.
+  wgpu-lavapipe:
+    name: wgpu engine on lavapipe (no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install lavapipe
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+
+      - name: Cache cargo registry + targets
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lavapipe-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lavapipe-
+
+      - name: Cache the tokenizer
+        uses: actions/cache@v5
+        with:
+          path: ~/qwen35-tokenizer
+          key: qwen35-tokenizer-v1
+
+      - name: Fetch the tokenizer
+        run: |
+          mkdir -p ~/qwen35-tokenizer
+          for f in tokenizer.json tokenizer_config.json chat_template.jinja; do
+            [ -s ~/qwen35-tokenizer/$f ] || curl -sSL -o ~/qwen35-tokenizer/$f https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/$f
+          done
+
+      - name: Install client SDK dependencies
+        working-directory: sdk/client/javascript
+        run: npm install --no-save msgpack-lite@0.1.26 @noble/hashes@2.2.0 ws
+
+      - name: Serve the miniature on lavapipe and run the corner cases
+        run: PIE_TOKENIZER_DIR=$HOME/qwen35-tokenizer ./web/tools/ci-lavapipe.sh
+
+  # Every kernel through Chrome's Tint, on SwiftShader (no GPU). Kernels that
+  # bind more storage buffers than SwiftShader allows are skipped, not failed.
+  tint-swiftshader:
+    name: kernels through Tint (SwiftShader)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cache cargo registry + targets
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tint-
+
+      - name: Install Playwright's Chromium
+        run: |
+          npm install --prefix web/tools playwright@1.63.0
+          npx --prefix web/tools playwright install --with-deps chromium
+
+      - name: Dump every kernel variant
+        run: cargo run -q -p kernels-wgpu --example dump_wgsl -- web/tools/wgsl
+
+      - name: Compile them through Tint
+        run: PIE_CHROME_ARGS="--use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader" node web/tools/headless.mjs web/tools wgsl-check.html --timeout 900000

@@ -8,6 +8,25 @@ pub const FORMATS: &[&str] = &["gguf", "hdf5", "npz", "onnx", "pt", "safetensors
 
 pub fn detect(path: impl AsRef<Path>) -> Result<&'static str> {
     let path = path.as_ref();
+    // A memory mount is sniffed where it lies — through the reader, so a
+    // chunked or lazily fetched mount answers too; only the zip containers
+    // need to be walked, and they are read from a file.
+    if let Some(len) = ztensor::memfs::len(path) {
+        let mut head = [0u8; 9];
+        let take = usize::try_from(len.min(9)).unwrap_or(9);
+        if ztensor::memfs::read(path, 0, &mut head[..take]).is_none() {
+            return Err(Error::Unsupported(format!(
+                "{}: the mounted bytes could not be read",
+                path.display()
+            )));
+        }
+        return detect_head(path, &head[..take], || {
+            Err(Error::Unsupported(format!(
+                "{}: zip-container formats (.pt/.npz) are read from a file, not a memory mount",
+                path.display()
+            )))
+        });
+    }
     let mut file = File::open(path)?;
     let mut head = [0u8; 9];
     let mut n = 0;
@@ -17,8 +36,27 @@ pub fn detect(path: impl AsRef<Path>) -> Result<&'static str> {
             got => n += got,
         }
     }
-    let head = &head[..n];
+    detect_head(path, &head[..n], || zip_is_pt(path))
+}
 
+#[cfg(any(feature = "pickle", feature = "npz"))]
+fn zip_is_pt(path: &Path) -> Result<bool> {
+    Ok(zip::ZipArchive::new(File::open(path)?)
+        .ok()
+        .map(|z| z.file_names().any(|n| n.ends_with("data.pkl")))
+        .unwrap_or(false))
+}
+
+#[cfg(not(any(feature = "pickle", feature = "npz")))]
+fn zip_is_pt(_path: &Path) -> Result<bool> {
+    Ok(false)
+}
+
+fn detect_head(
+    path: &Path,
+    head: &[u8],
+    zip_is_pt: impl FnOnce() -> Result<bool>,
+) -> Result<&'static str> {
     if head.len() >= 8 && head[..8] == ztensor::format::MAGIC {
         return Ok("zt");
     }
@@ -30,17 +68,14 @@ pub fn detect(path: impl AsRef<Path>) -> Result<&'static str> {
     }
     if head.starts_with(b"PK\x03\x04") {
         #[cfg(any(feature = "pickle", feature = "npz"))]
-        {
-            let is_pt = zip::ZipArchive::new(File::open(path)?)
-                .ok()
-                .map(|z| z.file_names().any(|n| n.ends_with("data.pkl")))
-                .unwrap_or(false);
-            return Ok(if is_pt { "pt" } else { "npz" });
-        }
+        return Ok(if zip_is_pt()? { "pt" } else { "npz" });
         #[cfg(not(any(feature = "pickle", feature = "npz")))]
-        return Err(Error::Unsupported(
-            "zip-container formats (.pt/.npz) are not compiled in".into(),
-        ));
+        {
+            let _ = zip_is_pt;
+            return Err(Error::Unsupported(
+                "zip-container formats (.pt/.npz) are not compiled in".into(),
+            ));
+        }
     }
     if head.len() >= 9 && head[8] == b'{' {
         let header_len = u64::from_le_bytes(head[..8].try_into().unwrap());
@@ -152,4 +187,50 @@ pub fn open_all(paths: &[impl AsRef<Path>]) -> Result<Source> {
 
 pub fn index_all(paths: &[impl AsRef<Path>]) -> Result<Source> {
     options().map(false).open_all(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn detect_every_case() {
+        a_mounted_artifact_is_detected_and_indexed_in_memory();
+    }
+
+    fn a_mounted_artifact_is_detected_and_indexed_in_memory() {
+        let dir =
+            std::env::temp_dir().join(format!("ztensor_compat_detect_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("model.zt");
+        let mut writer = ztensor::Writer::create(&real).unwrap();
+        writer
+            .add("w", vec![4], ztensor::Leaf::U8, &[1u8, 2, 3, 4])
+            .unwrap();
+        writer.finish().unwrap();
+        let bytes = std::fs::read(&real).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let fake = Path::new("/nowhere/on/this/machine/compat.zt");
+        assert!(detect(fake).is_err());
+        ztensor::memfs::mount(fake, Arc::from(bytes.as_slice()));
+        assert_eq!(detect(fake).unwrap(), "zt");
+        let source = index(fake).unwrap();
+        assert_eq!(source.tensor("w").unwrap().map().unwrap(), &[1, 2, 3, 4]);
+        assert!(source.store(ztensor::StoreId(0)).is_memory());
+
+        // A zip container has to be walked, and a mount is not a file to walk.
+        let zipped = Path::new("/nowhere/on/this/machine/archive.npz");
+        ztensor::memfs::mount(zipped, Arc::from(&b"PK\x03\x04rest"[..]));
+        let err = detect(zipped).unwrap_err().to_string();
+        assert!(
+            err.contains("mount") || err.contains("not compiled in"),
+            "{err}"
+        );
+
+        ztensor::memfs::unmount(fake);
+        ztensor::memfs::unmount(zipped);
+    }
 }

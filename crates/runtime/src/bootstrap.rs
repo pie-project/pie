@@ -1,10 +1,15 @@
-use anyhow::{Context, Result, ensure};
+#[cfg(not(target_arch = "wasm32"))]
+use anyhow::Context;
+use anyhow::{Result, ensure};
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(target_arch = "wasm32"))]
 use tracing_subscriber::layer::SubscriberExt;
+#[cfg(not(target_arch = "wasm32"))]
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::engine;
@@ -12,6 +17,7 @@ use crate::inferlet::sandbox::{FsPolicy, NetworkPolicy};
 use crate::inferlet::{linker, process, program, python};
 use crate::model::{self, ModelMetadata};
 use crate::server;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::telemetry;
 
 static RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -127,7 +133,6 @@ pub struct EngineConfig {
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    pub request_timeout_secs: u64,
     pub submit_deadline_us: u64,
     pub silence_timeout_secs: u64,
     pub frame_size: u32,
@@ -161,6 +166,7 @@ pub async fn bootstrap(config: Config) -> Result<BootstrapHandle> {
     bootstrap_inner(config).await
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn bootstrap_with_listener(
     config: Config,
     _listener: tokio::net::TcpListener,
@@ -342,8 +348,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .filter(|ms| *ms > 0)
         && let Some(planner) = crate::planner::planner_for(arena_model_idx, 0)
     {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(period));
+        crate::rt::spawn(async move {
+            let mut interval = crate::rt::time::interval(std::time::Duration::from_millis(period));
             loop {
                 interval.tick().await;
                 let d = planner.diagnostics();
@@ -427,12 +433,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     ));
     crate::scheduler::set_frame_size(scheduler.frame_size as usize);
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
-    let scheduler_shutdown = crate::scheduler::spawn(
-        &engines,
-        kv_page_size as u32,
-        scheduler.request_timeout_secs,
-    )
-    .await?;
+    let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
     active_guard.disarm();
     Ok(BootstrapHandle {
         port: bound_port,
@@ -445,6 +446,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 }
 
 fn verify_config(config: &Config) -> Result<()> {
+    #[cfg(not(target_arch = "wasm32"))]
     fs::create_dir_all(&config.cache_dir)
         .with_context(|| format!("Could not create cache dir: {:?}", config.cache_dir))?;
 
@@ -480,8 +482,21 @@ fn verify_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
 
+/// A tab interprets guests with Pulley on JSPI fibers and has no virtual
+/// memory to pool, so it takes wasmtime's on-demand allocator and the
+/// platform settings `wasmtime-web` knows.
+#[cfg(target_arch = "wasm32")]
+fn init_wasmtime(_runtime: &RuntimeConfig) -> wasmtime::Engine {
+    let mut wasm_config = wasmtime::Config::default();
+    wasmtime_web::configure(&mut wasm_config).expect("configure wasmtime for the browser");
+    wasm_config.wasm_component_model_async(true);
+    wasmtime::Engine::new(&wasm_config).unwrap()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
 
@@ -513,6 +528,18 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     wasmtime::Engine::new(&wasm_config).unwrap()
 }
 
+/// The page installs its own console subscriber before bootstrapping and
+/// passes `skip_tracing`; nothing here has a file or an exporter to write to.
+#[cfg(target_arch = "wasm32")]
+fn init_tracing(
+    _log_dir: &Option<PathBuf>,
+    _verbose: bool,
+    _telemetry_config: &TelemetryConfig,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn init_tracing(
     log_dir: &Option<PathBuf>,
     verbose: bool,
@@ -537,7 +564,6 @@ fn init_tracing(
     } else {
         None
     };
-
     let otel_layer = if telemetry_config.enabled {
         telemetry::init_otel_layer(&telemetry_config.endpoint, &telemetry_config.service_name)
     } else {

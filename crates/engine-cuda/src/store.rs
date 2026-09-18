@@ -438,6 +438,30 @@ impl Pools {
         self.pool.spare_bytes(reserve)
     }
 
+    pub fn spare_bytes_for_bodies(&self, room: u64) -> Result<u64> {
+        let live = self.pool.spare_bytes(0)?;
+        let reserve = self
+            .declared_bytes()
+            .max(self.high_water_bytes())
+            .saturating_sub(self.committed_bytes());
+        Ok(live.saturating_sub(reserve).max(live.min(room)))
+    }
+
+    pub(crate) fn reserve_arena(&self, max_bytes: u64, label: &'static str) -> Result<Arena> {
+        Arena::reserve(&self.pool, max_bytes, label)
+    }
+
+    pub(crate) fn commit_arena(&mut self, arena: &mut Arena, bytes: u64) -> Result<()> {
+        let mut targets = [elastic::Target {
+            arena,
+            want: elastic::Want::Prefix(bytes),
+        }];
+        match elastic::commit_atomically(&mut self.pool, &mut targets)? {
+            Commit::Committed => Ok(()),
+            refusal => Err(refuse(&self.pool, refusal)),
+        }
+    }
+
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
         self.arenas()

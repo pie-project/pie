@@ -385,6 +385,44 @@ impl Drop for Pipelines {
     }
 }
 
+fn descriptor<'a>(
+    name: &'static str,
+    module: &'a wgpu::ShaderModule,
+    cache: Option<&'a wgpu::PipelineCache>,
+) -> wgpu::ComputePipelineDescriptor<'a> {
+    wgpu::ComputePipelineDescriptor {
+        label: Some(name),
+        layout: None,
+        module,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache,
+    }
+}
+
+/// Compiles under a validation scope and pops it, so a refused tier falls
+/// through to the next one. The tier's `enable` lines go on top: Tint wants
+/// them and naga takes them.
+fn compile(
+    core: &Arc<Core>,
+    cache: Option<&wgpu::PipelineCache>,
+    name: &'static str,
+    tier: kernels_wgpu::Capability,
+    wgsl: &str,
+) -> std::result::Result<wgpu::ComputePipeline, String> {
+    let wgsl = kernels_wgpu::with_enables(wgsl, tier);
+    crate::guest::validated(core, "create_compute_pipeline", || {
+        let module = core
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(name),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&wgsl)),
+            });
+        core.device
+            .create_compute_pipeline(&descriptor(name, &module, cache))
+    })
+}
+
 fn build(
     core: &Arc<Core>,
     cache: Option<&wgpu::PipelineCache>,
@@ -399,26 +437,7 @@ fn build(
         why,
     };
     let declared = reflect(wgsl).map_err(shader)?;
-    let scope = core.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let module = core
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(name),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(wgsl)),
-        });
-    let pipeline = core
-        .device
-        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(name),
-            layout: None,
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache,
-        });
-    if let Some(error) = pollster::block_on(scope.pop()) {
-        return Err(shader(error.to_string()));
-    }
+    let pipeline = compile(core, cache, name, tier, wgsl).map_err(shader)?;
     let layout = pipeline.get_bind_group_layout(0);
     Ok(Pipeline {
         name,

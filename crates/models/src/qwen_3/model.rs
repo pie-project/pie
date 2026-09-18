@@ -572,6 +572,43 @@ impl Model {
         }
     }
 
+    /// A miniature of the family for tests that need a model, not a
+    /// capable one: the 0.8B's layout at a fraction of its width, three
+    /// gated-delta layers and one attention layer (eight value heads, so every
+    /// four-bit plane keeps sixteen rows), over the real tokenizer's
+    /// vocabulary so the artifact serves the same prompts. Weights come from
+    /// `web/tools/tiny_qwen35.py`, which writes a random snapshot this row
+    /// imports (about 40 MiB as an artifact).
+    pub fn tiny(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                hidden: 256,
+                layers: 4,
+                attn_every: 4,
+                q_heads: 4,
+                kv_heads: 2,
+                head_dim: 64,
+                rotary_dim: 32,
+                theta: 10_000_000.0,
+                k_heads: 4,
+                v_heads: 8,
+                k_dim: 128,
+                v_dim: 128,
+                conv_kernel: 4,
+                mlp: MlpDims::Dense { inter: 512 },
+                vocab: 248_320,
+                tied: true,
+                norm_eps: 1e-6,
+                tower: None,
+                draft: None,
+                dflash_head: None,
+            },
+        )
+    }
+
     pub fn d3b(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -622,6 +659,38 @@ impl Model {
                 v_dim: 128,
                 conv_kernel: 4,
                 mlp: MlpDims::Dense { inter: 6144 },
+                vocab: 248_320,
+                tied: true,
+                norm_eps: 1e-6,
+                tower: None,
+                draft: None,
+                dflash_head: None,
+            },
+        )
+    }
+
+    /// Qwen3.5-4B: the 2B's layout with a wider trunk (2560 × 32 layers,
+    /// 16/4 attention heads, 16 key and 32 value linear-attention heads).
+    pub fn d4b(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                hidden: 2560,
+                layers: 32,
+                attn_every: 4,
+                q_heads: 16,
+                kv_heads: 4,
+                head_dim: 256,
+                rotary_dim: 64,
+                theta: 10_000_000.0,
+                k_heads: 16,
+                v_heads: 32,
+                k_dim: 128,
+                v_dim: 128,
+                conv_kernel: 4,
+                mlp: MlpDims::Dense { inter: 9216 },
                 vocab: 248_320,
                 tied: true,
                 norm_eps: 1e-6,

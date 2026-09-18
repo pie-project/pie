@@ -2,24 +2,22 @@ pub(crate) mod batch;
 pub(crate) mod dispatch;
 pub(crate) mod fire_plan;
 pub(crate) mod frame;
+pub mod lane;
 pub(crate) mod probe;
 pub(crate) mod stats;
 pub mod worker;
 
 pub use frame::FrameStamp;
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 
-#[allow(unused_imports)]
 pub(crate) use dispatch::{
-    bind_instance, bind_instance_classified, close_channels, close_instance, copy_d2d, copy_d2h,
-    copy_d2h_tracked, copy_h2d, copy_h2d_tracked, copy_h2h, copy_kv_cells, copy_rs_d2d,
-    register_channel, register_channels, register_channels_bind_classified, register_program,
+    close_channels, copy_d2h_tracked, copy_h2d_tracked, copy_kv_cells,
+    register_channels_bind_classified,
 };
 pub use stats::{AggregateStats, HostSubmitStats};
 pub use worker::BatchScheduler;
@@ -83,8 +81,8 @@ pub(crate) fn ledger_monotonic_ns() -> u64 {
     // epoch is the first call rather than boot, which the ledger does not
     // care about: every consumer reads these as deltas or as trace ordering,
     // never against a wall clock or a device timestamp.
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let start = *START.get_or_init(std::time::Instant::now);
+    static START: std::sync::OnceLock<crate::rt::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(crate::rt::Instant::now);
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -221,47 +219,15 @@ pub struct SchedulerShutdownHandle {
     schedulers: Vec<BatchScheduler>,
 }
 
-fn dynamic_schedulers() -> &'static Mutex<HashMap<EngineId, BatchScheduler>> {
-    static SCHEDULERS: OnceLock<Mutex<HashMap<EngineId, BatchScheduler>>> = OnceLock::new();
-    SCHEDULERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn build_engine_scheduler(
-    engine_id: EngineId,
-    page_size: u32,
-    request_timeout_secs: u64,
-) -> Result<BatchScheduler> {
+fn build_engine_scheduler(engine_id: EngineId, page_size: u32) -> Result<BatchScheduler> {
     let limits = crate::engine::get_spec(engine_id)?.scheduler_limits();
     Ok(BatchScheduler::new(
         engine_id,
         engine_id,
         page_size,
         limits,
-        request_timeout_secs,
         configured_frame_size(),
     ))
-}
-
-pub fn spawn_engine(engine_id: EngineId, page_size: u32, request_timeout_secs: u64) -> Result<()> {
-    let mut schedulers = dynamic_schedulers().lock().unwrap();
-    if schedulers.contains_key(&engine_id) {
-        return Err(anyhow!(
-            "engine {engine_id} already has a dynamic scheduler"
-        ));
-    }
-    let scheduler = build_engine_scheduler(engine_id, page_size, request_timeout_secs)?;
-    schedulers.insert(engine_id, scheduler);
-    Ok(())
-}
-
-pub fn stop_engine(engine_id: EngineId) -> Result<()> {
-    let scheduler = dynamic_schedulers()
-        .lock()
-        .unwrap()
-        .remove(&engine_id)
-        .ok_or_else(|| anyhow!("engine {engine_id} has no dynamic scheduler"))?;
-    drop(scheduler);
-    Ok(())
 }
 
 impl SchedulerShutdownHandle {
@@ -271,14 +237,10 @@ impl SchedulerShutdownHandle {
     }
 }
 
-pub async fn spawn(
-    engine_indices: &[usize],
-    page_size: u32,
-    request_timeout_secs: u64,
-) -> Result<SchedulerShutdownHandle> {
+pub async fn spawn(engine_indices: &[usize], page_size: u32) -> Result<SchedulerShutdownHandle> {
     let schedulers: Vec<BatchScheduler> = engine_indices
         .iter()
-        .map(|&engine_id| build_engine_scheduler(engine_id, page_size, request_timeout_secs))
+        .map(|&engine_id| build_engine_scheduler(engine_id, page_size))
         .collect::<Result<_>>()?;
 
     Ok(SchedulerShutdownHandle { schedulers })

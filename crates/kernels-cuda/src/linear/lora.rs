@@ -74,7 +74,7 @@ pub fn correct(
     let bytes = (rows as usize)
         .saturating_mul(rank as usize)
         .saturating_mul(2);
-    let waist = ctx.scratch(OP, WAIST, bytes)?;
+    let waist = ctx.scratch_shared(OP, WAIST, bytes)?;
     let mut projected = Tensor::new(waist as u64, rows, rank, x.dtype);
 
     super::moe::select_gemv(

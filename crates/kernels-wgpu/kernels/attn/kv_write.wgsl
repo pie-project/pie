@@ -34,3 +34,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     v_pages[dst >> 1u] = v_new[src >> 1u];
 }
 
+// pie:instantiate kv_append_paged_bfloat16 PIE_GROUP_X=64

@@ -1,0 +1,383 @@
+[
+ {
+  "id": "text-completion",
+  "inferlet": "text-completion",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16
+  }
+ },
+ {
+  "id": "chat-completion",
+  "inferlet": "chat-completion",
+  "input": {
+   "prompt": "What is the capital of France?",
+   "max_tokens": 16,
+   "temperature": 0
+  }
+ },
+ {
+  "id": "naive-baseline",
+  "inferlet": "naive-baseline",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7
+  }
+ },
+ {
+  "id": "naive-masked-dense",
+  "inferlet": "naive-masked",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7,
+   "mask_mode": "dense"
+  }
+ },
+ {
+  "id": "naive-masked-structured",
+  "inferlet": "naive-masked",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7,
+   "mask_mode": "structured"
+  }
+ },
+ {
+  "id": "naive-masked-prefill",
+  "inferlet": "naive-masked",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7,
+   "mask_mode": "dense-prefill"
+  }
+ },
+ {
+  "id": "beam-search",
+  "inferlet": "beam-search",
+  "input": {
+   "max_tokens": 8,
+   "beams": 2
+  },
+  "sampled": true
+ },
+ {
+  "id": "repetition-penalty",
+  "inferlet": "repetition-penalty",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "repetition_penalty": 1.3,
+   "seed": 7
+  }
+ },
+ {
+  "id": "dry-repetition-penalty",
+  "inferlet": "dry-repetition-penalty",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7
+  },
+  "sampled": true
+ },
+ {
+  "id": "attention-sink",
+  "inferlet": "attention-sink",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "sink_size": 4,
+   "window_size": 32
+  }
+ },
+ {
+  "id": "sliding-window-attention",
+  "inferlet": "sliding-window-attention",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "window_size": 32
+  }
+ },
+ {
+  "id": "consensus-decoding",
+  "inferlet": "consensus-decoding",
+  "input": {
+   "question": "What is 2+2?",
+   "num_candidates": 2,
+   "max_tokens": 8
+  },
+  "sampled": true
+ },
+ {
+  "id": "contrastive-decoding",
+  "inferlet": "contrastive-decoding",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 8
+  }
+ },
+ {
+  "id": "mirostat-v2-sampling",
+  "inferlet": "mirostat-v2-sampling",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16
+  },
+  "sampled": true
+ },
+ {
+  "id": "locally-typical-sampling",
+  "inferlet": "locally-typical-sampling",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7
+  }
+ },
+ {
+  "id": "entropy-adaptive-temperature",
+  "inferlet": "entropy-adaptive-temperature",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "seed": 7
+  },
+  "sampled": true
+ },
+ {
+  "id": "eta-epsilon-sampling",
+  "inferlet": "eta-epsilon-sampling",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7
+  }
+ },
+ {
+  "id": "top-a-sampling",
+  "inferlet": "top-a-sampling",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7
+  }
+ },
+ {
+  "id": "xtc-sampling",
+  "inferlet": "xtc-sampling",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7
+  }
+ },
+ {
+  "id": "tail-free-sampling",
+  "inferlet": "tail-free-sampling",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7
+  }
+ },
+ {
+  "id": "greenlist-watermarking",
+  "inferlet": "greenlist-watermarking",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16
+  }
+ },
+ {
+  "id": "gumbel-watermark",
+  "inferlet": "gumbel-watermark",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7
+  }
+ },
+ {
+  "id": "synthid-tournament-sampling",
+  "inferlet": "synthid-tournament-sampling",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7
+  }
+ },
+ {
+  "id": "json-schema-constrained-decoding",
+  "inferlet": "json-schema-constrained-decoding",
+  "input": {
+   "prompt": "A person named Ann who is 30 years old",
+   "schema": "{\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\"}, \"age\": {\"type\": \"integer\"}}, \"required\": [\"name\", \"age\"]}",
+   "max_tokens": 32
+  }
+ },
+ {
+  "id": "prefix-tree-kv-cache",
+  "inferlet": "prefix-tree-kv-cache",
+  "input": {
+   "num_tokens": 8
+  }
+ },
+ {
+  "id": "rs-window-decode",
+  "inferlet": "rs-window-decode",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16
+  }
+ },
+ {
+  "id": "tova-attention",
+  "inferlet": "tova-attention",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7,
+   "cache_size": 64
+  }
+ },
+ {
+  "id": "trackb-h2o",
+  "inferlet": "trackb-h2o",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7,
+   "page_budget": 8
+  }
+ },
+ {
+  "id": "trackb-snapkv",
+  "inferlet": "trackb-snapkv",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "seed": 7,
+   "page_budget": 8
+  }
+ },
+ {
+  "id": "token-healing",
+  "inferlet": "token-healing",
+  "input": {
+   "prompt": "The capital of France is Par",
+   "max_tokens": 8
+  }
+ },
+ {
+  "id": "text-completion-bench",
+  "inferlet": "text-completion-bench",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.7,
+   "ignore_eos": true
+  }
+ },
+ {
+  "id": "snapkv-eviction",
+  "inferlet": "snapkv-eviction",
+  "input": {
+   "max_tokens": 8,
+   "filler": 6
+  }
+ },
+ {
+  "id": "sampling-primitives",
+  "inferlet": "sampling-primitives",
+  "input": {}
+ },
+ {
+  "id": "prefill-rows",
+  "inferlet": "prefill-rows",
+  "input": {
+   "ids": "[785, 6722, 315, 9625, 374]"
+  }
+ },
+ {
+  "id": "dry-repetition-penalty-cold",
+  "inferlet": "dry-repetition-penalty",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.05,
+   "seed": 7
+  }
+ },
+ {
+  "id": "naive-baseline-cold",
+  "inferlet": "naive-baseline",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.05,
+   "seed": 7
+  }
+ },
+ {
+  "id": "top-a-sampling-cold",
+  "inferlet": "top-a-sampling",
+  "input": {
+   "prompt": "The capital of France is",
+   "max_tokens": 16,
+   "temperature": 0.05,
+   "seed": 7
+  }
+ },
+ {
+  "id": "beam-search-1",
+  "inferlet": "beam-search",
+  "input": {
+   "max_tokens": 8,
+   "beams": 1
+  },
+  "sampled": true
+ },
+ {
+  "id": "consensus-decoding-1",
+  "inferlet": "consensus-decoding",
+  "input": {
+   "question": "What is 2+2?",
+   "num_candidates": 1,
+   "max_tokens": 8
+  },
+  "sampled": true
+ },
+ {
+  "id": "sort-probe",
+  "inferlet": "sort-probe",
+  "input": {}
+ },
+ {
+  "id": "sort-probe-light",
+  "inferlet": "sort-probe",
+  "input": {
+   "light": true
+  }
+ }
+]

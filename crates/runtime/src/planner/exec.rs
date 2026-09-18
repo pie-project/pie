@@ -1,6 +1,6 @@
+use crate::rt::Instant;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use super::{ProcessId, ResidencyPlanner};
 
@@ -15,11 +15,11 @@ fn spawn_watched(
     task: impl std::future::Future<Output = ()> + Send + 'static,
     on_fail: impl FnOnce(&Arc<ResidencyPlanner>, ProcessId) + Send + 'static,
 ) -> bool {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+    if !crate::rt::has_runtime() {
         return false;
     };
-    let handle = runtime.spawn(task);
-    runtime.spawn(async move {
+    let handle = crate::rt::spawn(task);
+    crate::rt::spawn(async move {
         if let Err(join_error) = handle.await {
             println!("[planner-exec] pid={pid} {label} task DIED: {join_error}");
             on_fail(&planner, pid);
@@ -173,7 +173,7 @@ impl Drop for ResidencyTxnGuard {
             return;
         };
         let (model, engine) = (self.model, self.engine);
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if !crate::rt::has_runtime() {
             tracing::error!(
                 model,
                 engine,
@@ -182,7 +182,7 @@ impl Drop for ResidencyTxnGuard {
             );
             return;
         };
-        runtime.spawn(async move {
+        crate::rt::spawn(async move {
             let _ = completion.wait().await;
             abort_residency_txn(model, engine, txn);
             if let Some(planner) = crate::planner::planner_for(model, engine) {

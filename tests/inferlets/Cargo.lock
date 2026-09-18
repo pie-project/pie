@@ -690,6 +690,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sort-probe"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

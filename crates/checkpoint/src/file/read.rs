@@ -131,6 +131,11 @@ fn split_shard_name(path: &Path) -> Option<(String, u32, u32)> {
 const ZT_NAMES: [&str; 2] = ["model.zt", "archive.zt"];
 
 pub fn discover_zt_files(snapshot_dir: &Path) -> Vec<PathBuf> {
+    // A mounted path is an artifact handed over by name; there is no
+    // directory around it to search.
+    if ztensor::memfs::is_mounted(snapshot_dir) {
+        return vec![snapshot_dir.to_path_buf()];
+    }
     if snapshot_dir.is_file()
         && snapshot_dir
             .extension()
@@ -187,6 +192,20 @@ pub fn read_meta(metadata: &Metadata, path: &str) -> Result<Option<Vec<u8>>, Err
                 object.name
             ))
         })?;
+    if let Some(mounted) = ztensor::memfs::chunks(&file.path) {
+        return mounted
+            .read(object.file_offset, object.span_bytes)
+            .map(Some)
+            .ok_or_else(|| {
+                Error::Checkpoint(format!(
+                    "cannot read {} from {}: outside its {} mounted bytes{}",
+                    object.name,
+                    file.path,
+                    mounted.len(),
+                    ztensor::memfs::read_failure(&file.path)
+                ))
+            });
+    }
     let mut handle = std::fs::File::open(&file.path)
         .map_err(|err| Error::Checkpoint(format!("cannot open {}: {err}", file.path)))?;
     handle
@@ -303,13 +322,16 @@ pub fn verify_declared_files(
 ) -> Result<(), Error> {
     for file in &plan.files {
         let path = snapshot_dir.join(&file.path);
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.len() == file.size_bytes => {}
-            Ok(meta) => {
+        let found = match ztensor::memfs::len(&path) {
+            Some(mounted) => Ok(mounted),
+            None => std::fs::metadata(&path).map(|meta| meta.len()),
+        };
+        match found {
+            Ok(len) if len == file.size_bytes => {}
+            Ok(len) => {
                 return Err(Error::Checkpoint(format!(
-                    "{} is {} bytes on disk, the plan declares {}",
+                    "{} is {len} bytes on disk, the plan declares {}",
                     path.display(),
-                    meta.len(),
                     file.size_bytes
                 )));
             }

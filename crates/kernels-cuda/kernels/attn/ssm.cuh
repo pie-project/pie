@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 
 #include "prelude/device.cuh"
+#include "prelude/mma.cuh"
 
 namespace pie::attn {
 
@@ -128,8 +129,10 @@ __global__ void ssm_causal_conv1d_chunked_batched(
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
     const int* begin_at,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    int lanes_stated)
 {
+    (void)lanes_stated;
     const int c = blockIdx.x;
     const int r = blockIdx.y;
     if (c >= C) return;
@@ -213,8 +216,10 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
     const int* begin_at,
-    const u32* __restrict__ win)
+    const u32* __restrict__ win,
+    int lanes_stated)
 {
+    (void)lanes_stated;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int r = blockIdx.y;
     if (c >= C) return;
@@ -281,6 +286,140 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
     }
 }
 
+constexpr int CONV_TT = 32;
+
+template <class T, bool SILU = true, bool RESIDUAL = false>
+__global__ void ssm_causal_conv1d_chunked_batched_row_tile(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ y,
+    T* __restrict__ state_out_base,
+    const int* __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    int C, int K, int dil, bool write_state,
+    const u8* __restrict__ write_state_mask,
+    const int* commit_len,
+    const int* begin_at,
+    const u32* __restrict__ win,
+    int lanes_stated)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int lanes = win != nullptr ? static_cast<int>(win[2]) : lanes_stated;
+    if (lanes <= 0) return;
+    const int total = static_cast<int>(qo_indptr[lanes]);
+    const int tile0 = static_cast<int>(blockIdx.y) * CONV_TT;
+    if (tile0 >= total) return;
+    const int tile_end = min(tile0 + CONV_TT, total);
+    const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const int span = (K - 1) * dil + 1;
+    const float bias_v = bias ? Elem<T>::to_f32(bias[c]) : 0.f;
+    float wv[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        wv[k] = (k < K) ? Elem<T>::to_f32(weight[c * K + k]) : 0.f;
+    }
+    int r = 0;
+    {
+        int lo = 0, hi = lanes - 1;
+        while (lo < hi) {
+            const int mid = (lo + hi + 1) >> 1;
+            if (static_cast<int>(qo_indptr[mid]) <= tile0) lo = mid; else hi = mid - 1;
+        }
+        r = lo;
+    }
+    for (; r < lanes; ++r) {
+        int t0 = static_cast<int>(qo_indptr[r]);
+        int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
+        if (t0 >= tile_end) break;
+        const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+        if (begin_at != nullptr) {
+            int b = begin_at[rl];
+            if (b > Nr) b = Nr;
+            if (b > 0) { t0 += b; Nr -= b; }
+        }
+        if (commit_len != nullptr) {
+            const int cl = commit_len[rl];
+            if (cl < Nr) Nr = cl;
+        }
+        if (Nr <= 0) continue;
+        const int slot = slot_ids[rl];
+        if (slot < 0) continue;
+        const T* x_r = x + static_cast<long long>(t0 + row0) * C;
+        T* y_r = y + static_cast<long long>(t0 + row0) * C;
+        T* state = state_out_base + static_cast<long long>(slot) * slot_stride_elems;
+        const int t_lo = max(tile0, t0) - t0;
+        const int t_hi = min(tile_end, t0 + Nr) - t0;
+        for (int t = t_lo; t < t_hi; ++t) {
+            float acc = bias_v;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                if (k >= K) break;
+                const int src_t = t - (K - 1 - k) * dil;
+                float xv = 0.f;
+                if (src_t < 0) {
+                    xv = Elem<T>::to_f32(state[(span + src_t) * C + c]);
+                } else {
+                    xv = Elem<T>::to_f32(x_r[static_cast<long long>(src_t) * C + c]);
+                }
+                acc += wv[k] * xv;
+            }
+            y_r[static_cast<long long>(t) * C + c] = Elem<T>::from_f32(
+                conv_out<SILU, RESIDUAL>(acc, Elem<T>::to_f32(x_r[static_cast<long long>(t) * C + c])));
+        }
+    }
+}
+
+template <class T>
+__global__ void ssm_causal_conv1d_state_commit(
+    const T* __restrict__ x,
+    T* __restrict__ state_out_base,
+    const int* __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    int C, int K, int dil,
+    const u8* __restrict__ write_state_mask,
+    const int* commit_len,
+    const int* begin_at,
+    const u32* __restrict__ win,
+    int lanes_stated)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int lanes = win != nullptr ? static_cast<int>(win[2]) : lanes_stated;
+    const int r = static_cast<int>(blockIdx.y);
+    if (r >= lanes) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    if (write_state_mask != nullptr && write_state_mask[rl] == 0) return;
+    const int slot = slot_ids[rl];
+    if (slot < 0) return;
+    int t0 = static_cast<int>(qo_indptr[r]);
+    int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
+    if (begin_at != nullptr) {
+        int b = begin_at[rl];
+        if (b > Nr) b = Nr;
+        if (b > 0) { t0 += b; Nr -= b; }
+    }
+    if (commit_len != nullptr) {
+        const int cl = commit_len[rl];
+        if (cl < Nr) Nr = cl;
+    }
+    if (Nr <= 0) return;
+    const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const int span = (K - 1) * dil + 1;
+    const T* x_r = x + static_cast<long long>(t0 + row0) * C;
+    T* state = state_out_base + static_cast<long long>(slot) * slot_stride_elems;
+    for (int s = 0; s < span; ++s) {
+        const int src_t = Nr - span + s;
+        const float v = (src_t < 0)
+            ? Elem<T>::to_f32(state[(span + src_t) * C + c])
+            : Elem<T>::to_f32(x_r[static_cast<long long>(src_t) * C + c]);
+        state[s * C + c] = Elem<T>::from_f32(v);
+    }
+}
+
 template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void ssm_causal_conv1d_update_batched(
     const T* __restrict__ x,
@@ -301,7 +440,8 @@ __global__ void ssm_causal_conv1d_update_batched(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= R || c >= C) return;
 
-    const int slot = slot_ids[r];
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int slot = slot_ids[rl];
     if (slot < 0) return;
     T* state = state_base + (long long)slot * slot_stride_elems;
     const T* x_r = x + (long long)r_row * C;
@@ -354,7 +494,8 @@ __global__ void ssm_causal_conv1d_update_batched_vec8(
     const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
     if (r >= R || c0 >= C) return;
 
-    const int slot = slot_ids[r];
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int slot = slot_ids[rl];
     if (slot < 0) return;
     T* state = state_base + (long long)slot * slot_stride_elems;
     const int span = K - 1;
@@ -1243,7 +1384,8 @@ __global__ void ssm_gated_delta_step_batched_gqa(
     const int h = blockIdx.y;
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
-    const int slot = slot_ids[r];
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int slot = slot_ids[rl];
     if (slot < 0) return;
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
@@ -1681,7 +1823,8 @@ __global__ void ssm_gated_delta_step_batched_gqa_smem(
     if (v_idx >= V_d) return;
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
-    const int slot = slot_ids[r];
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int slot = slot_ids[rl];
     if (slot < 0) return;
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
@@ -1763,7 +1906,6 @@ __global__ void ssm_gated_delta_step_batched_gqa_smem(
         for (int i = threadIdx.x; i < n_vec; i += BV) dst[i] = src[i];
     }
 }
-
 
 __device__ __forceinline__ void gdn_load8(
     const __nv_bfloat16* __restrict__ p, float (&s)[8]) {
@@ -1850,7 +1992,8 @@ __global__ void __launch_bounds__(256) ssm_gdn_decode_step(
 
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
-    const int slot = slot_ids[r];
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int slot = slot_ids[rl];
     if (slot < 0) return;
 
     const int tid = threadIdx.x;
@@ -2422,6 +2565,462 @@ __global__ void ssm_kda_chunked_batched(
             if (lane == 0) out[((t + row0) * H + h) * D + vi] = acc;
         }
 
+        __syncthreads();
+    }
+}
+
+constexpr int GDN_CH = 64;
+constexpr int GDN_BVT = 32;
+
+struct GdnLane {
+    int t0;
+    int T;
+    int rl;
+    int slot;
+};
+
+__device__ __forceinline__ GdnLane gdn_lane(
+    int r,
+    const u32* __restrict__ qo_indptr,
+    const int* __restrict__ slot_ids,
+    const int* __restrict__ commit_len,
+    const int* __restrict__ begin_at,
+    const u32* __restrict__ win)
+{
+    GdnLane lane;
+    lane.rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    lane.t0 = static_cast<int>(qo_indptr[r]);
+    lane.T = static_cast<int>(qo_indptr[r + 1]) - lane.t0;
+    if (begin_at != nullptr) {
+        int b = begin_at[lane.rl];
+        if (b > lane.T) b = lane.T;
+        if (b > 0) { lane.t0 += b; lane.T -= b; }
+    }
+    if (commit_len != nullptr) {
+        const int c = commit_len[lane.rl];
+        if (c < lane.T) lane.T = c;
+    }
+    lane.slot = lane.T > 0 ? slot_ids[lane.rl] : -1;
+    return lane;
+}
+
+__device__ __forceinline__ int gdn_chunk_base(
+    int r,
+    const u32* __restrict__ qo_indptr,
+    const int* __restrict__ begin_at,
+    const u32* __restrict__ win)
+{
+    int t0 = static_cast<int>(qo_indptr[r]);
+    if (begin_at != nullptr) {
+        const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+        const int T = static_cast<int>(qo_indptr[r + 1]) - t0;
+        int b = begin_at[rl];
+        if (b > T) b = T;
+        if (b > 0) t0 += b;
+    }
+    return t0 / GDN_CH + r;
+}
+
+__device__ __forceinline__ int gdn_slot_lane(
+    int s, int lanes,
+    const u32* __restrict__ qo_indptr,
+    const int* __restrict__ begin_at,
+    const u32* __restrict__ win)
+{
+    int lo = 0, hi = lanes - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (gdn_chunk_base(mid, qo_indptr, begin_at, win) <= s) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+constexpr int GDN_WARPS = 8;
+
+template <int BK, int BV>
+__global__ void __launch_bounds__(256) ssm_gdn_chunk_wu(
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ g_log,
+    const float* __restrict__ beta,
+    const int* __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    const int* __restrict__ commit_len,
+    const int* __restrict__ begin_at,
+    float* __restrict__ gcum,
+    __nv_bfloat16* __restrict__ qb,
+    __nv_bfloat16* __restrict__ kb_out,
+    __nv_bfloat16* __restrict__ kT,
+    __nv_bfloat16* __restrict__ w_out,
+    __nv_bfloat16* __restrict__ u_out,
+    int lanes, int K_h, int V_h,
+    const u32* __restrict__ win)
+{
+    static_assert(BV == BK, "the value rows reuse the key buffer");
+    namespace wmma = ::nvcuda::wmma;
+    extern __shared__ float smem[];
+    float* A = smem;                                                        // CH*CH
+    __nv_bfloat16* kb = reinterpret_cast<__nv_bfloat16*>(smem + GDN_CH * GDN_CH); // CH*BK
+    __nv_bfloat16* Tb = kb + GDN_CH * BK;                                   // CH*CH
+    float* G = reinterpret_cast<float*>(Tb + GDN_CH * GDN_CH);
+    float* B = G + GDN_CH;
+    float* BE = B + GDN_CH;
+    float* arow = BE + GDN_CH;
+    const int h = blockIdx.y;
+    const int s = blockIdx.x;
+    if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
+    if (lanes <= 0) return;
+    const int r = gdn_slot_lane(s, lanes, qo_indptr, begin_at, win);
+    const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
+    if (lane.T <= 0 || lane.slot < 0) return;
+    const int j = s - (lane.t0 / GDN_CH + r);
+    if (j < 0 || j * GDN_CH >= lane.T) return;
+    const int ta = lane.t0 + j * GDN_CH;
+    const int L = min(GDN_CH, lane.t0 + lane.T - ta);
+    const int hk = h / (V_h / K_h);
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    if (tid == 0) {
+        float acc = 0.f;
+        for (int i = 0; i < L; ++i) {
+            acc += g_log[static_cast<long long>(ta + i) * V_h + h];
+            G[i] = acc;
+        }
+    }
+    for (int i = tid; i < L; i += blockDim.x) {
+        B[i] = beta[static_cast<long long>(ta + i) * V_h + h];
+    }
+    __nv_bfloat16* kT_s = kT + (static_cast<long long>(s) * K_h + hk) * BK * GDN_CH;
+    for (int e = tid; e < GDN_CH * BK; e += blockDim.x) {
+        const int i = e / BK, kk = e % BK;
+        const long long row = (static_cast<long long>(ta + i) * K_h + hk) * BK + kk;
+        const __nv_bfloat16 kv = i < L ? __float2bfloat16(k_norm[row]) : __float2bfloat16(0.f);
+        kb[e] = kv;
+        kT_s[static_cast<long long>(kk) * GDN_CH + i] = kv;
+        if (i < L) {
+            kb_out[row] = kv;
+            qb[row] = __float2bfloat16(q_norm[row]);
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < L; i += blockDim.x) {
+        gcum[static_cast<long long>(ta + i) * V_h + h] = G[i];
+        BE[i] = B[i] * __expf(G[i]);
+    }
+    {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+        for (int tile = warp; tile < 16; tile += GDN_WARPS) {
+            const int m0 = (tile >> 2) * 16, n0 = (tile & 3) * 16;
+            wmma::fill_fragment(c, 0.f);
+            for (int k0 = 0; k0 < BK; k0 += 16) {
+                wmma::load_matrix_sync(a, kb + m0 * BK + k0, BK);
+                wmma::load_matrix_sync(b, kb + n0 * BK + k0, BK);
+                wmma::mma_sync(c, a, b, c);
+            }
+            wmma::store_matrix_sync(A + m0 * GDN_CH + n0, c, GDN_CH, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < GDN_CH * GDN_CH; e += blockDim.x) {
+        const int i = e / GDN_CH, jj = e % GDN_CH;
+        A[e] = (i < L && jj < i) ? A[e] * B[i] * __expf(G[i] - G[jj]) : 0.f;
+    }
+    __syncthreads();
+    for (int i = 0; i < L; ++i) {
+        if (tid < i) arow[tid] = A[i * GDN_CH + tid];
+        __syncthreads();
+        if (tid < GDN_CH) {
+            const int c = tid;
+            float t = (c == i) ? 1.f : 0.f;
+            if (c < i) {
+                for (int jj = c; jj < i; ++jj) t -= arow[jj] * A[jj * GDN_CH + c];
+            }
+            A[i * GDN_CH + c] = t;
+        }
+        __syncthreads();
+    }
+    for (int e = tid; e < GDN_CH * GDN_CH; e += blockDim.x) {
+        const int i = e / GDN_CH, jj = e % GDN_CH;
+        Tb[e] = __float2bfloat16((i < L && jj < L) ? A[e] * BE[jj] : 0.f);
+    }
+    __syncthreads();
+    {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+        float* mine = reinterpret_cast<float*>(kb) + warp * 256;
+        const int lane_id = tid & 31;
+        for (int tile = warp; tile < 4 * (BK / 16); tile += GDN_WARPS) {
+            const int m0 = (tile / (BK / 16)) * 16, n0 = (tile % (BK / 16)) * 16;
+            wmma::fill_fragment(c, 0.f);
+            for (int k0 = 0; k0 < GDN_CH; k0 += 16) {
+                wmma::load_matrix_sync(a, Tb + m0 * GDN_CH + k0, GDN_CH);
+                wmma::load_matrix_sync(b, kT_s + n0 * GDN_CH + k0, GDN_CH);
+                wmma::mma_sync(c, a, b, c);
+            }
+            wmma::store_matrix_sync(mine, c, 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane_id; e < 256; e += 32) {
+                const int i = m0 + e / 16, kk = n0 + e % 16;
+                if (i < L) {
+                    w_out[(static_cast<long long>(ta + i) * V_h + h) * BK + kk] = __float2bfloat16(mine[e]);
+                }
+            }
+            __syncwarp();
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < GDN_CH * GDN_CH; e += blockDim.x) {
+        const int i = e / GDN_CH, jj = e % GDN_CH;
+        Tb[e] = __float2bfloat16((i < L && jj < L) ? A[e] : 0.f);
+    }
+    __nv_bfloat16* vbT = kb;
+    for (int e = tid; e < GDN_CH * BV; e += blockDim.x) {
+        const int i = e / BV, vv = e % BV;
+        const float val = i < L ? v[(static_cast<long long>(ta + i) * V_h + h) * BV + vv] * B[i] : 0.f;
+        vbT[vv * GDN_CH + i] = __float2bfloat16(val);
+    }
+    __syncthreads();
+    {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+        float* mine = A + warp * 256;
+        const int lane_id = tid & 31;
+        for (int tile = warp; tile < 4 * (BV / 16); tile += GDN_WARPS) {
+            const int m0 = (tile / (BV / 16)) * 16, n0 = (tile % (BV / 16)) * 16;
+            wmma::fill_fragment(c, 0.f);
+            for (int k0 = 0; k0 < GDN_CH; k0 += 16) {
+                wmma::load_matrix_sync(a, Tb + m0 * GDN_CH + k0, GDN_CH);
+                wmma::load_matrix_sync(b, vbT + n0 * GDN_CH + k0, GDN_CH);
+                wmma::mma_sync(c, a, b, c);
+            }
+            wmma::store_matrix_sync(mine, c, 16, wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane_id; e < 256; e += 32) {
+                const int i = m0 + e / 16, vv = n0 + e % 16;
+                if (i < L) {
+                    u_out[(static_cast<long long>(ta + i) * V_h + h) * BV + vv] = __float2bfloat16(mine[e]);
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+template <typename StateT, int BK, int BV, int BVT>
+__global__ void __launch_bounds__(256) ssm_gdn_chunk_h(
+    const float* __restrict__ gcum,
+    const __nv_bfloat16* __restrict__ kT,
+    const __nv_bfloat16* __restrict__ w,
+    __nv_bfloat16* __restrict__ u,
+    __nv_bfloat16* __restrict__ vnT,
+    __nv_bfloat16* __restrict__ hcT,
+    StateT* __restrict__ state_base,
+    const int* __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    const int* __restrict__ commit_len,
+    const int* __restrict__ begin_at,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
+    int lanes, int K_h, int V_h,
+    const u32* __restrict__ win)
+{
+    static_assert(BVT == 16, "one value tile per mma column");
+    namespace wmma = ::nvcuda::wmma;
+    __shared__ float hf[BK * BVT];
+    __shared__ float dl[BK * BVT];
+    __shared__ float vn[GDN_CH * BVT];
+    __shared__ __nv_bfloat16 hT[BVT * BK];
+    __shared__ __nv_bfloat16 vnTs[BVT * GDN_CH];
+    __shared__ float sE[GDN_CH];
+    const int vt = static_cast<int>(blockIdx.x) % (BV / BVT);
+    const int h = (static_cast<int>(blockIdx.x) / (BV / BVT)) % V_h;
+    const int r = static_cast<int>(blockIdx.x) / ((BV / BVT) * V_h);
+    if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
+    if (r >= lanes) return;
+    const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
+    if (lane.T <= 0 || lane.slot < 0) return;
+    const int hk = h / (V_h / K_h);
+    const int v0 = vt * BVT;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    StateT* state = state_base
+        + static_cast<long long>(lane.slot) * slot_stride_elems
+        + static_cast<long long>(h) * BK * BV;
+    for (int e = tid; e < BK * BVT; e += blockDim.x) {
+        const int kk = e / BVT, vv = e % BVT;
+        hf[e] = state_load(state + static_cast<long long>(kk) * BV + v0 + vv);
+    }
+    __syncthreads();
+    const int base = lane.t0 / GDN_CH + r;
+    const int nchunks = (lane.T + GDN_CH - 1) / GDN_CH;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+    for (int j = 0; j < nchunks; ++j) {
+        const int sj = base + j;
+        const int ta = lane.t0 + j * GDN_CH;
+        const int L = min(GDN_CH, lane.t0 + lane.T - ta);
+        __nv_bfloat16* hcT_s = hcT + (static_cast<long long>(sj) * V_h + h) * BV * BK;
+        for (int e = tid; e < BVT * BK; e += blockDim.x) {
+            const int vv = e / BK, kk = e % BK;
+            const __nv_bfloat16 hv = __float2bfloat16(hf[kk * BVT + vv]);
+            hT[e] = hv;
+            hcT_s[static_cast<long long>(v0 + vv) * BK + kk] = hv;
+        }
+        if (tid < GDN_CH) {
+            const float gl = gcum[static_cast<long long>(ta + L - 1) * V_h + h];
+            sE[tid] = tid < L ? __expf(gl - gcum[static_cast<long long>(ta + tid) * V_h + h]) : 0.f;
+        }
+        __syncthreads();
+        if (warp < 4) {
+            const int m0 = warp * 16;
+            wmma::fill_fragment(c, 0.f);
+            for (int k0 = 0; k0 < BK; k0 += 16) {
+                wmma::load_matrix_sync(a, w + (static_cast<long long>(ta + m0) * V_h + h) * BK + k0, V_h * BK);
+                wmma::load_matrix_sync(b, hT + k0, BK);
+                wmma::mma_sync(c, a, b, c);
+            }
+            wmma::store_matrix_sync(vn + m0 * BVT, c, BVT, wmma::mem_row_major);
+        }
+        __syncthreads();
+        __nv_bfloat16* vnT_s = vnT + (static_cast<long long>(sj) * V_h + h) * BV * GDN_CH;
+        for (int e = tid; e < GDN_CH * BVT; e += blockDim.x) {
+            const int i = e / BVT, vv = e % BVT;
+            float vnew = 0.f;
+            if (i < L) {
+                const long long ui = (static_cast<long long>(ta + i) * V_h + h) * BV + v0 + vv;
+                vnew = __bfloat162float(u[ui]) - vn[e];
+                u[ui] = __float2bfloat16(vnew);
+            }
+            const __nv_bfloat16 vb = __float2bfloat16(vnew);
+            vnT_s[static_cast<long long>(v0 + vv) * GDN_CH + i] = vb;
+            vnTs[vv * GDN_CH + i] = __float2bfloat16(vnew * sE[i]);
+        }
+        __syncthreads();
+        {
+            const int m0 = warp * 16;
+            wmma::fill_fragment(c, 0.f);
+            const __nv_bfloat16* kT_s = kT + (static_cast<long long>(sj) * K_h + hk) * BK * GDN_CH;
+            for (int k0 = 0; k0 < GDN_CH; k0 += 16) {
+                wmma::load_matrix_sync(a, kT_s + m0 * GDN_CH + k0, GDN_CH);
+                wmma::load_matrix_sync(b, vnTs + k0, GDN_CH);
+                wmma::mma_sync(c, a, b, c);
+            }
+            wmma::store_matrix_sync(dl + m0 * BVT, c, BVT, wmma::mem_row_major);
+        }
+        __syncthreads();
+        const float gl = __expf(gcum[static_cast<long long>(ta + L - 1) * V_h + h]);
+        for (int e = tid; e < BK * BVT; e += blockDim.x) {
+            hf[e] = hf[e] * gl + dl[e];
+        }
+        __syncthreads();
+    }
+    if (write_state && row_persists(write_state_mask, lane.rl)) {
+        for (int e = tid; e < BK * BVT; e += blockDim.x) {
+            const int kk = e / BVT, vv = e % BVT;
+            state_store(state + static_cast<long long>(kk) * BV + v0 + vv, hf[e]);
+        }
+    }
+}
+
+template <int BK, int BV, int BVT>
+__global__ void __launch_bounds__(256) ssm_gdn_chunk_o(
+    const float* __restrict__ gcum,
+    const __nv_bfloat16* __restrict__ qb,
+    const __nv_bfloat16* __restrict__ kb,
+    const __nv_bfloat16* __restrict__ vnT,
+    const __nv_bfloat16* __restrict__ hcT,
+    const int* __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    const int* __restrict__ commit_len,
+    const int* __restrict__ begin_at,
+    float* __restrict__ out,
+    int lanes, int K_h, int V_h,
+    const u32* __restrict__ win)
+{
+    static_assert(BVT == 16, "one value tile per mma column");
+    namespace wmma = ::nvcuda::wmma;
+    __shared__ float S[GDN_CH * GDN_CH];
+    __shared__ __nv_bfloat16 Sb[GDN_CH * GDN_CH];
+    __shared__ float o1[GDN_CH * BVT];
+    __shared__ float o2[GDN_CH * BVT];
+    __shared__ float sG[GDN_CH];
+    const int h = blockIdx.y;
+    const int s = blockIdx.x;
+    if (win != nullptr) lanes = min(lanes, static_cast<int>(win[2]));
+    if (lanes <= 0) return;
+    const int r = gdn_slot_lane(s, lanes, qo_indptr, begin_at, win);
+    const GdnLane lane = gdn_lane(r, qo_indptr, slot_ids, commit_len, begin_at, win);
+    if (lane.T <= 0 || lane.slot < 0) return;
+    const int j = s - (lane.t0 / GDN_CH + r);
+    if (j < 0 || j * GDN_CH >= lane.T) return;
+    const int ta = lane.t0 + j * GDN_CH;
+    const int L = min(GDN_CH, lane.t0 + lane.T - ta);
+    const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const int hk = h / (V_h / K_h);
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    for (int i = tid; i < GDN_CH; i += blockDim.x) {
+        sG[i] = i < L ? gcum[static_cast<long long>(ta + i) * V_h + h] : 0.f;
+    }
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+    const __nv_bfloat16* q_s = qb + (static_cast<long long>(ta) * K_h + hk) * BK;
+    const __nv_bfloat16* k_s = kb + (static_cast<long long>(ta) * K_h + hk) * BK;
+    for (int tile = warp; tile < 16; tile += GDN_WARPS) {
+        const int m0 = (tile >> 2) * 16, n0 = (tile & 3) * 16;
+        wmma::fill_fragment(c, 0.f);
+        for (int k0 = 0; k0 < BK; k0 += 16) {
+            wmma::load_matrix_sync(a, q_s + static_cast<long long>(m0) * K_h * BK + k0, K_h * BK);
+            wmma::load_matrix_sync(b, k_s + static_cast<long long>(n0) * K_h * BK + k0, K_h * BK);
+            wmma::mma_sync(c, a, b, c);
+        }
+        wmma::store_matrix_sync(S + m0 * GDN_CH + n0, c, GDN_CH, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for (int e = tid; e < GDN_CH * GDN_CH; e += blockDim.x) {
+        const int i = e / GDN_CH, jj = e % GDN_CH;
+        Sb[e] = __float2bfloat16((i < L && jj <= i) ? S[e] * __expf(sG[i] - sG[jj]) : 0.f);
+    }
+    __syncthreads();
+    const __nv_bfloat16* hcT_s = hcT + (static_cast<long long>(s) * V_h + h) * BV * BK;
+    const __nv_bfloat16* vnT_s = vnT + (static_cast<long long>(s) * V_h + h) * BV * GDN_CH;
+    for (int vt = 0; vt < BV / BVT; ++vt) {
+        const int v0 = vt * BVT;
+        if (warp < 4) {
+            const int m0 = warp * 16;
+            wmma::fill_fragment(c, 0.f);
+            for (int k0 = 0; k0 < BK; k0 += 16) {
+                wmma::load_matrix_sync(a, q_s + static_cast<long long>(m0) * K_h * BK + k0, K_h * BK);
+                wmma::load_matrix_sync(b, hcT_s + static_cast<long long>(v0) * BK + k0, BK);
+                wmma::mma_sync(c, a, b, c);
+            }
+            wmma::store_matrix_sync(o1 + m0 * BVT, c, BVT, wmma::mem_row_major);
+        } else {
+            const int m0 = (warp - 4) * 16;
+            wmma::fill_fragment(c, 0.f);
+            for (int k0 = 0; k0 < GDN_CH; k0 += 16) {
+                wmma::load_matrix_sync(a, Sb + m0 * GDN_CH + k0, GDN_CH);
+                wmma::load_matrix_sync(b, vnT_s + static_cast<long long>(v0) * GDN_CH + k0, GDN_CH);
+                wmma::mma_sync(c, a, b, c);
+            }
+            wmma::store_matrix_sync(o2 + m0 * BVT, c, BVT, wmma::mem_row_major);
+        }
+        __syncthreads();
+        for (int e = tid; e < GDN_CH * BVT; e += blockDim.x) {
+            const int i = e / BVT, vv = e % BVT;
+            if (i < L) {
+                out[(static_cast<long long>(ta + i + row0) * V_h + h) * BV + v0 + vv]
+                    = o1[e] * __expf(sG[i]) + o2[e];
+            }
+        }
         __syncthreads();
     }
 }

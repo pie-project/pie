@@ -1,11 +1,13 @@
-"""Greedy text completion, host-driven — the Python twin of `text-completion`.
+"""Greedy text completion, device-carried — the Python twin of `text-completion`.
 
 Same program as `tests/inferlets/text-completion/src/lib.rs`, traced from
-Python: one chunked prefill, then a 1-wide decode loop whose ONE host-driven
-channel is the token (`reduce_argmax` on the device, back to the host, down
-again as a host-writer cell). Everything else the fire reads is derived from
-the KV length by device arithmetic in the epilogue. The traced container is
-byte-identical to the Rust inferlet's, so both share one program-cache entry.
+Python: one chunked prefill whose greedy pick seeds the decode once, then a
+1-wide decode pass whose token is loop-carried on the device (`reduce_argmax`
+in the epilogue, put straight back into the channel `embed` reads) with the
+host draining a mirror behind the runtime's run-ahead window (`run_ahead`).
+Everything else the fire reads is derived from the KV length by device
+arithmetic in the epilogue. The traced container is byte-identical to the
+Rust inferlet's, so both share one program-cache entry.
 """
 
 from inferlet import chat, model
@@ -20,17 +22,17 @@ from inferlet.eta import (
     dtype,
     indptr,
     intrinsics,
+    channel_capacity,
     kv_page_size,
     prefill_chunks,
+    run_ahead,
     reduce_argmax,
     reshape,
 )
 
-
 def greedy(logits):
     """The greedy pick over a logits row, as a one-lane `[1]` i32 cell."""
     return reshape(reduce_argmax(logits), [1])
-
 
 async def main(input: dict) -> dict:
     prompt_text = input.get("prompt", "The capital of France is")
@@ -97,9 +99,10 @@ async def main(input: dict) -> dict:
         first = await tok_out.take_scalar()
     generated.append(first)
 
-    # ── DECODE (1-wide, host-driven token) ────────────────────────────────
+    # ── DECODE (1-wide, device loop-carried token) ─────────────────────────
     if len(generated) < max_tokens:
         tok_in = Channel.from_([first], dtype.i32).named("tok_in")
+        tok_out = Channel([1], dtype.i32).capacity(channel_capacity()).named("tok_out")
         embed_indptr = Channel.from_([0, 1], dtype.u32).named("embed_indptr")
         positions = Channel.from_([n], dtype.u32).named("positions")
         pages = Channel.from_(range(max_pages), dtype.u32).named("pages")
@@ -107,7 +110,6 @@ async def main(input: dict) -> dict:
         w_slot = Channel.from_([n // page_size], dtype.u32).named("w_slot")
         w_off = Channel.from_([n % page_size], dtype.u32).named("w_off")
         kv_len = Channel.from_([n + 1], dtype.u32).named("kv_len")
-        tok_out = Channel([1], dtype.i32).named("tok_out")
 
         fwd = ForwardPass(kind)
         fwd.embed(tok_in, embed_indptr)
@@ -120,6 +122,7 @@ async def main(input: dict) -> dict:
                 w_slot=w_slot,
                 w_off=w_off,
                 positions=positions,
+                writable_pages=n // page_size,
             ),
             rs_ws,
         )
@@ -129,22 +132,24 @@ async def main(input: dict) -> dict:
             # `length` is the readable extent this fire runs at, so it is
             # also the position the NEXT fire's token sits at.
             length = kv_len.take()
+            token = greedy(intrinsics.logits())
             next_length = length + 1
             page_count = next_length.div_ceil(page_size)
+            tok_in.put(token)
             kv_len.put(next_length)
             positions.put(length)
             w_slot.put(length // page_size)
             w_off.put(length % page_size)
             page_indptr.put(indptr(1, page_count))
-            tok_out.put(greedy(intrinsics.logits()))
+            tok_out.put(token)
 
-        while True:
-            fwd.submit(pipe)
-            token = await tok_out.take_scalar()
-            generated.append(token)
-            if len(generated) >= max_tokens:
-                break
-            tok_in.put([token])
+        budget = max_tokens - 1
+
+        async def on_token() -> bool:
+            generated.append(await tok_out.take_scalar())
+            return True
+
+        await run_ahead(pipe, fwd, budget, on_token)
     pipe.close()
 
     return {

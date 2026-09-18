@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::store::SpaceSeat;
 use crate::store::kv::{Facts, Geometry, Paging, SpaceFacts};
 
-const GRANT_INT_BYTES: u64 = 8 << 20;
+const GRANT_INT_BYTES: u64 = 1 << 20;
 
 const GRANT_FLOAT_BYTES: u64 = 64 << 20;
 
@@ -361,10 +361,11 @@ impl Inputs {
         ports: &[PortSeat],
         selections: usize,
         masked: bool,
+        schedule_streams: &[Option<u32>],
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
-        let lanes = u64::from(budget.max_lanes);
-        let pages = u64::from(budget.max_lanes) * u64::from(paging.pages_per_slot);
+        let lanes = u64::from(crate::window::lane_capacity(budget.max_lanes));
+        let pages = lanes * u64::from(paging.pages_per_slot);
         let window_slots =
             crate::window::Slots::new(classes, lanes, runs, gathered, rows, spaces, pages);
         let window_ints = window_slots.words();
@@ -444,12 +445,12 @@ impl Inputs {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let self_cond = (self_cond_taps > 0).then(|| take(rows * self_cond_taps * 4 * 2));
         let runs = runs.max(1);
-        let grants: Vec<Option<Grant>> = facts
+        let floats_of: Vec<Option<u64>> = facts
             .plans
             .iter()
             .map(|seat| {
                 seat.map(|seat| {
-                    let floats = match seat.kind {
+                    match seat.kind {
                         StructKind::AttnPrefillPlan => graph_float_bytes(&seat.reading, device.num_sm)
                             .max(prefill_float_bytes(
                                 &seat.reading,
@@ -466,10 +467,33 @@ impl Inputs {
                             latent_float_bytes(seat.reading.head_dim, device.num_sm)
                         }
                     }
-                    .max(GRANT_FLOAT_BYTES);
+                    .max(GRANT_FLOAT_BYTES)
+                })
+            })
+            .collect();
+        let mut per_stream: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        for (plan, floats) in floats_of.iter().enumerate() {
+            if let (Some(floats), Some(Some(stream))) = (floats, schedule_streams.get(plan)) {
+                let held = per_stream.entry(*stream).or_insert(0);
+                *held = (*held).max(*floats);
+            }
+        }
+        let shared: std::collections::BTreeMap<u32, u64> = per_stream
+            .iter()
+            .map(|(stream, floats)| (*stream, take(*floats)))
+            .collect();
+        let grants: Vec<Option<Grant>> = floats_of
+            .iter()
+            .enumerate()
+            .map(|(plan, floats)| {
+                floats.map(|floats| {
+                    let float_at = match schedule_streams.get(plan) {
+                        Some(Some(stream)) => shared[stream],
+                        _ => take(floats),
+                    };
                     Grant {
                         int_at: (0..runs).map(|_| take(GRANT_INT_BYTES)).collect(),
-                        float_at: take(floats),
+                        float_at,
                         float_bytes: floats,
                     }
                 })
@@ -516,7 +540,7 @@ impl Inputs {
             group_of_lane,
             packings,
             spaces,
-            max_lanes: budget.max_lanes,
+            max_lanes: crate::window::lane_capacity(budget.max_lanes),
             max_rows: budget.max_tokens,
             plan_values: grants.len(),
             plans: (0..runs as usize)

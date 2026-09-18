@@ -86,13 +86,29 @@ struct Uses {
     consumers: Vec<u32>,
 }
 
-fn uses(plan: &LaunchStagePlan) -> Uses {
+/// The local value each op's first result lands in. A stage plan numbers
+/// its values by position — a running count of results, boundary ops
+/// included — and leaves every op's `result_id` at zero (`lower_plan_op`),
+/// so the count names a result here and the field does not: read the field
+/// and every reshape "covers" value 0, and a reshape of the logits is elided
+/// while its alias goes nowhere.
+fn result_bases(plan: &LaunchStagePlan) -> Vec<u32> {
+    let mut bases = Vec::with_capacity(plan.ops.len());
+    let mut next = 0u32;
+    for op in &plan.ops {
+        bases.push(next);
+        next = next.wrapping_add(u32::from(op.result_count));
+    }
+    bases
+}
+
+fn uses(plan: &LaunchStagePlan, bases: &[u32]) -> Uses {
     let count = plan.value_types.len();
     let mut producer = alloc::vec![u32::MAX; count];
     let mut consumers = alloc::vec![0u32; count];
     for (node, op) in plan.ops.iter().enumerate() {
         for result in 0..u32::from(op.result_count) {
-            if let Some(slot) = producer.get_mut((op.result_id + result) as usize) {
+            if let Some(slot) = producer.get_mut((bases[node] + result) as usize) {
                 *slot = node as u32;
             }
         }
@@ -111,7 +127,8 @@ fn uses(plan: &LaunchStagePlan) -> Uses {
 #[must_use]
 pub fn analyze_stage(plan: &LaunchStagePlan) -> StageFusion {
     let types = symbolic_types(&plan.value_types);
-    let uses = uses(plan);
+    let bases = result_bases(plan);
+    let uses = uses(plan, &bases);
     let bound: Vec<bool> = {
         let mut bound = alloc::vec![false; plan.value_types.len()];
         for &value in &plan.channel_bindings {
@@ -129,7 +146,7 @@ pub fn analyze_stage(plan: &LaunchStagePlan) -> StageFusion {
         if op.tag != tags::RESHAPE || op.args.is_empty() || op.result_count == 0 {
             continue;
         }
-        let result = op.result_id;
+        let result = bases[node];
         let source = op.args[0];
         if bound.get(result as usize).copied().unwrap_or(true) {
             continue;
@@ -142,11 +159,16 @@ pub fn analyze_stage(plan: &LaunchStagePlan) -> StageFusion {
         fusion.elided.push(node as u32);
     }
 
-    fusion.direct_argmax = direct_argmax(plan, &uses, &table);
+    fusion.direct_argmax = direct_argmax(plan, &bases, &uses, &table);
     fusion
 }
 
-fn direct_argmax(plan: &LaunchStagePlan, uses: &Uses, table: &AliasTable) -> Vec<DirectArgmax> {
+fn direct_argmax(
+    plan: &LaunchStagePlan,
+    bases: &[u32],
+    uses: &Uses,
+    table: &AliasTable,
+) -> Vec<DirectArgmax> {
     let mut found = Vec::new();
     for (node, op) in plan.ops.iter().enumerate() {
         if op.tag != tags::REDUCE_ARGMAX || op.args.is_empty() {
@@ -179,7 +201,7 @@ fn direct_argmax(plan: &LaunchStagePlan, uses: &Uses, table: &AliasTable) -> Vec
             }
             let source_dims = plan
                 .value_types
-                .get(source.result_id as usize)
+                .get(bases[producer as usize] as usize)
                 .map(|value| value.axes.as_slice());
             let reduced_dims = plan
                 .value_types
@@ -258,6 +280,55 @@ mod tests {
         an_argmax_of_the_logits_is_reported();
         an_argmax_through_an_op_that_is_not_a_reshape_is_refused();
         a_reshape_read_twice_breaks_the_chain();
+        a_plan_that_numbers_no_result_is_numbered_by_position();
+    }
+
+    /// `lower_plan_op` leaves `result_id` at zero on every op; the prefill
+    /// guest that came through it had its logits reshape elided against
+    /// value 0 and answered token 0.
+    fn a_plan_that_numbers_no_result_is_numbered_by_position() {
+        let mut logits = op(tags::INTRINSIC_VAL, 0, &[]);
+        logits.intrinsic = Some(IntrinsicId::Logits);
+        let mut stage = plan(
+            vec![
+                logits,
+                op(tags::RESHAPE, 0, &[0]),
+                op(tags::REDUCE_ARGMAX, 0, &[1]),
+                op(tags::RESHAPE, 0, &[2]),
+                LaunchOp {
+                    tag: tags::CHAN_PUT,
+                    result_count: 0,
+                    args: vec![3],
+                    ..LaunchOp::default()
+                },
+            ],
+            vec![
+                value(&[
+                    Dimension::Symbolic(crate::plan::SymbolicExtent::SampledRows),
+                    Dimension::Static(128),
+                ]),
+                value(&[Dimension::Static(128)]),
+                LaunchPlanValue {
+                    dtype: Dtype::I32,
+                    axes: vec![],
+                },
+                LaunchPlanValue {
+                    dtype: Dtype::I32,
+                    axes: vec![Dimension::Static(1)],
+                },
+            ],
+        );
+        stage.channel_bindings = vec![8];
+        let fusion = analyze_stage(&stage);
+        assert_eq!(fusion.elided, [1, 3], "both reshapes cover their source");
+        assert_eq!(
+            fusion.aliases,
+            [(1, 0), (3, 2)],
+            "each elided reshape reads its own source, never value 0"
+        );
+        assert_eq!(fusion.direct_argmax.len(), 1);
+        assert_eq!(fusion.direct_argmax[0].source_value, 0);
+        assert!(fusion.direct_argmax[0].requires_single_row);
     }
 
     fn a_plain_reshape_is_elided() {

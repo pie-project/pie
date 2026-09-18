@@ -222,3 +222,18 @@ sdk/inferlet/javascript/wit/
 # Run output and scratch: `out/` was committed once already.
 out/
 marlin_scratch/
+
+# wasm32 check builds (browser host)
+target-wasm/
+web/site/pkg/
+web/site/models
+web/site/inferlets/
+web/site/sdk
+web/site/models2b
+web/tools/wgsl/
+web/site/models4b
+web/site/models9b
+web/tools/node_modules/
+web/tools/package*.json
+web/site/models-tiny/
+web/bench/results/*.raw

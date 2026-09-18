@@ -49,7 +49,7 @@ pub(crate) fn defer_resource_teardown(
         remove_scratch(scratch_dir.as_deref());
         return;
     }
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+    if !crate::rt::has_runtime() {
         tracing::error!(
             pid = %process_id,
             "process teardown found pending fires without a Tokio runtime; preserving the \
@@ -85,5 +85,5 @@ pub(crate) fn defer_resource_teardown(
         }
         crate::scheduler::worker::notify_process_quiesced(process_id);
     };
-    runtime.spawn(task);
+    crate::rt::spawn(task);
 }

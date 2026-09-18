@@ -274,7 +274,7 @@ pub(crate) fn lock_trace_enabled() -> bool {
 }
 struct TimedGuard<'a> {
     guard: parking_lot::MutexGuard<'a, Inner>,
-    held_from: Option<std::time::Instant>,
+    held_from: Option<crate::rt::Instant>,
 }
 impl<'a> std::ops::Deref for TimedGuard<'a> {
     type Target = Inner;
@@ -778,7 +778,7 @@ impl ResidencyPlanner {
     }
 
     pub fn arm_drain_task(self: &Arc<Self>) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if !crate::rt::has_runtime() {
             return;
         };
         let notify = Arc::new(Notify::new());
@@ -786,7 +786,7 @@ impl ResidencyPlanner {
             return;
         }
         let planner = self.clone();
-        runtime.spawn(async move {
+        crate::rt::spawn(async move {
             loop {
                 notify.notified().await;
                 planner.plan();
@@ -827,7 +827,7 @@ impl ResidencyPlanner {
                 held_from: None,
             };
         }
-        let t0 = std::time::Instant::now();
+        let t0 = crate::rt::Instant::now();
         let guard = self.inner.lock();
         let waited = t0.elapsed().as_nanos() as u64;
         LOCK_CENSUS.n.fetch_add(1, Ordering::Relaxed);
@@ -835,7 +835,7 @@ impl ResidencyPlanner {
         LOCK_CENSUS.wait_max_ns.fetch_max(waited, Ordering::Relaxed);
         TimedGuard {
             guard,
-            held_from: Some(std::time::Instant::now()),
+            held_from: Some(crate::rt::Instant::now()),
         }
     }
 
@@ -3045,7 +3045,7 @@ mod starvation_race_tests {
         }
 
         let p = planner.clone();
-        let head_task = tokio::spawn(async move {
+        let head_task = crate::rt::spawn(async move {
             p.acquire(
                 head,
                 head,
@@ -3057,7 +3057,7 @@ mod starvation_race_tests {
             .await
         });
         for _ in 0..200 {
-            tokio::task::yield_now().await;
+            crate::rt::yield_now().await;
             if planner.diagnostics().queue.len() == 1 {
                 break;
             }
@@ -3118,9 +3118,9 @@ mod starvation_race_tests {
             rs_slots: 0,
         };
         let p = planner.clone();
-        let parked = tokio::spawn(async move { p.acquire(head, head, demand).await });
+        let parked = crate::rt::spawn(async move { p.acquire(head, head, demand).await });
         for _ in 0..200 {
-            tokio::task::yield_now().await;
+            crate::rt::yield_now().await;
             if planner.diagnostics().queue.len() == 1 {
                 break;
             }

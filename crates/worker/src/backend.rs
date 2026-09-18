@@ -139,14 +139,7 @@ fn device_boot(
         Some(false) if knobs.bodies() => knobs.recording = Recording::Shaped,
         _ => {}
     }
-    if let Recording::Bodies {
-        golden,
-        mem_megabytes,
-    } = &mut knobs.recording
-    {
-        if let Some(stated) = opts.golden {
-            *golden = stated;
-        }
+    if let Recording::Bodies { mem_megabytes } = &mut knobs.recording {
         if let Some(megabytes) = opts.bodies_mem {
             *mem_megabytes = megabytes;
         }

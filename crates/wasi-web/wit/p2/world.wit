@@ -1,0 +1,24 @@
+// The exact WASI 0.2 surface wasi-web hosts. Pinned to the 0.2.12 package
+// versions wasmtime 48 ships; wasmtime's semver-aware linker lets a guest
+// built against any earlier 0.2.x (wasm32-wasip2 std imports 0.2.9) link.
+package wasi-web:p2;
+
+world imports {
+  import wasi:cli/environment@0.2.12;
+  import wasi:cli/exit@0.2.12;
+  import wasi:cli/stdin@0.2.12;
+  import wasi:cli/stdout@0.2.12;
+  import wasi:cli/stderr@0.2.12;
+  import wasi:cli/terminal-input@0.2.12;
+  import wasi:cli/terminal-output@0.2.12;
+  import wasi:cli/terminal-stdin@0.2.12;
+  import wasi:cli/terminal-stdout@0.2.12;
+  import wasi:cli/terminal-stderr@0.2.12;
+  import wasi:clocks/monotonic-clock@0.2.12;
+  import wasi:clocks/wall-clock@0.2.12;
+  import wasi:random/random@0.2.12;
+  import wasi:random/insecure@0.2.12;
+  import wasi:random/insecure-seed@0.2.12;
+  import wasi:filesystem/types@0.2.12;
+  import wasi:filesystem/preopens@0.2.12;
+}

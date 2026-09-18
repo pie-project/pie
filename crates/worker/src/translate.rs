@@ -118,7 +118,6 @@ fn build_model(
         metadata,
         engines,
         scheduler: runtime::bootstrap::SchedulerConfig {
-            request_timeout_secs: runtime.request_timeout.as_secs(),
             submit_deadline_us: runtime.submit_deadline.as_micros(),
             silence_timeout_secs: runtime.silence_timeout.as_secs(),
             frame_size: runtime.frame_size,

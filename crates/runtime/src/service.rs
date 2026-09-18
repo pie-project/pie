@@ -4,7 +4,8 @@ use std::future::Future;
 use std::hash::Hash;
 use std::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::task;
+
+use crate::rt as task;
 
 pub(crate) trait ServiceHandler: Send + 'static {
     type Message: Send + 'static;

@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tint check of every pie kernel</title>
+<pre id="out"></pre>
+<script type="module">
+  const out = document.getElementById("out");
+  const log = (s) => { out.textContent += s + "\n"; console.log(s); };
+  const adapter = await navigator.gpu?.requestAdapter();
+  if (!adapter) { log("no WebGPU adapter"); window.__pie_done?.(2); }
+  log(`adapter: ${adapter.info?.vendor ?? "?"} ${adapter.info?.architecture ?? ""}, ${adapter.limits.maxStorageBuffersPerShaderStage} storage buffers per stage`);
+  const device = await adapter.requestDevice({ requiredLimits: {
+    maxStorageBuffersPerShaderStage: adapter.limits.maxStorageBuffersPerShaderStage,
+    maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+    maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
+  }, requiredFeatures: [...adapter.features].filter((f) => ["subgroups", "shader-f16"].includes(f)) });
+  device.addEventListener("uncapturederror", () => {});
+  const index = await (await fetch("wgsl/index.json")).json();
+  const failures = [];
+  // A kernel that binds more storage buffers than this adapter allows is not
+  // a Tint refusal: it is one the engine would never pick here (SwiftShader
+  // allows 10, a discrete GPU 16 or more).
+  const beyond = [];
+  for (const entry of index) {
+    const code = await (await fetch(`wgsl/${entry.name}.wgsl`)).text();
+    device.pushErrorScope("validation");
+    const module = device.createShaderModule({ code, label: entry.name });
+    const info = await module.getCompilationInfo();
+    const errors = info.messages.filter((m) => m.type === "error");
+    const scopeError = await device.popErrorScope();
+    let pipelineError = null;
+    if (errors.length === 0) {
+      device.pushErrorScope("validation");
+      device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+      pipelineError = await device.popErrorScope();
+    }
+    if (errors.length === 0 && pipelineError && /exceeds the maximum/.test(pipelineError.message)) {
+      beyond.push(entry.name);
+      log(`SKIP ${entry.name} (${entry.file}, ${entry.tier}): beyond this adapter's limits`);
+      continue;
+    }
+    if (errors.length || pipelineError) {
+      const lines = errors.map((m) => `${m.lineNum}:${m.linePos} ${m.message}`);
+      if (pipelineError) lines.push(`pipeline: ${pipelineError.message.split("\n")[0]}`);
+      failures.push({ name: entry.name, file: entry.file, lines });
+      log(`FAIL ${entry.name} (${entry.file}, ${entry.tier})\n    ${lines.join("\n    ")}`);
+    }
+  }
+  log(`\n${index.length - failures.length - beyond.length} ok, ${failures.length} refused by Tint, ${beyond.length} beyond this adapter's limits`);
+  window.__pie_result = failures;
+  window.__pie_done?.(failures.length ? 1 : 0);
+</script>

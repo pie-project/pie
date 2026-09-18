@@ -1,5 +1,4 @@
 use engine::fire::{Mask, Masking, RsReset, RsVerb};
-use model_compiler::CompiledModel;
 
 use crate::error::{Fault, Result};
 use crate::record;
@@ -79,46 +78,24 @@ enum BodySynth {
         class: usize,
         rows: Vec<u32>,
     },
-    Fragmented { lanes: Vec<(usize, u32)> },
     Tower {
         class: usize,
         rows: u32,
         images: u32,
         patches: u32,
     },
-    Ensemble { lanes: Vec<(usize, u32)> },
-    Joint { lanes: Vec<(usize, u32)> },
+    Wide { lanes: Vec<(usize, u32)> },
 }
 
 impl BodySynth {
-    fn present(&self) -> Vec<usize> {
-        let mut classes = match self {
-            BodySynth::Decode { class, .. } | BodySynth::Prefill { class, .. } => vec![*class],
-            BodySynth::Mixed { decode, class, .. } => vec![*decode, *class],
-            BodySynth::Fragmented { lanes }
-            | BodySynth::Ensemble { lanes }
-            | BodySynth::Joint { lanes } => lanes.iter().map(|(class, _)| *class).collect(),
-            BodySynth::Tower { class, .. } => vec![*class],
-        };
-        classes.sort_unstable();
-        classes.dedup();
-        classes
-    }
-
     fn kind(&self) -> Kind {
         match self {
             BodySynth::Decode { .. } => Kind::Decode,
             BodySynth::Prefill { .. } => Kind::Prefill,
             BodySynth::Mixed { .. } => Kind::Mixed,
-            BodySynth::Fragmented { .. } => Kind::Fragmented,
             BodySynth::Tower { .. } => Kind::Tower,
-            BodySynth::Ensemble { .. } => Kind::Ensemble,
-            BodySynth::Joint { .. } => Kind::Joint,
+            BodySynth::Wide { .. } => Kind::Wide,
         }
-    }
-
-    fn skips_on_present_set(&self) -> bool {
-        !matches!(self, BodySynth::Tower { .. })
     }
 
     fn lanes(&self) -> (Vec<(usize, u32)>, Vec<(u32, u32)>) {
@@ -140,22 +117,13 @@ impl BodySynth {
                     .collect(),
                 Vec::new(),
             ),
-            BodySynth::Fragmented { lanes } | BodySynth::Joint { lanes } => {
-                (lanes.clone(), Vec::new())
-            }
+            BodySynth::Wide { lanes } => (lanes.clone(), Vec::new()),
             BodySynth::Tower {
                 class,
                 rows,
                 images,
                 patches,
             } => (vec![(*class, *rows)], vec![(*images, *patches)]),
-            BodySynth::Ensemble { lanes } => (
-                lanes
-                    .iter()
-                    .flat_map(|(class, count)| vec![(*class, 1u32); *count as usize])
-                    .collect(),
-                Vec::new(),
-            ),
         }
     }
 }
@@ -165,23 +133,19 @@ pub enum Kind {
     Decode,
     Prefill,
     Mixed,
-    Fragmented,
     Tower,
-    Ensemble,
-    Joint,
+    Wide,
 }
 
 impl Kind {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 5;
 
     pub const ALL: [Kind; Kind::COUNT] = [
         Kind::Decode,
         Kind::Prefill,
         Kind::Mixed,
-        Kind::Fragmented,
         Kind::Tower,
-        Kind::Ensemble,
-        Kind::Joint,
+        Kind::Wide,
     ];
 
     pub fn at(self) -> usize {
@@ -195,10 +159,8 @@ impl core::fmt::Display for Kind {
             Kind::Decode => "decode",
             Kind::Prefill => "prefill",
             Kind::Mixed => "mixed",
-            Kind::Fragmented => "fragmented",
             Kind::Tower => "tower",
-            Kind::Ensemble => "ensemble",
-            Kind::Joint => "joint",
+            Kind::Wide => "wide",
         })
     }
 }
@@ -216,8 +178,7 @@ struct Deployment {
     decoders: Vec<usize>,
     prefilling: Vec<usize>,
     media: Vec<usize>,
-    fragmenting: Vec<Vec<usize>>,
-    joining: Vec<Vec<usize>>,
+    wide: Vec<usize>,
     decoding: model_ir::ClassSet,
     seats: u32,
     context: u32,
@@ -307,24 +268,6 @@ fn mixed_keys(deployment: &Deployment, into: &mut Targets) {
     }
 }
 
-fn fragmented_keys(deployment: &Deployment, into: &mut Targets) {
-    for point in deployment.buckets.iter().copied() {
-        for present in &deployment.fragmenting {
-            match fragment_rows(deployment, present, point) {
-                Some(lanes) => {
-                    into.targets.push((point, BodySynth::Fragmented { lanes }));
-                }
-                None => into.unfireable.push(unfireable_line(
-                    deployment,
-                    &format!("fragmented {present:?}"),
-                    &format!("bucket {point}"),
-                    None,
-                )),
-            }
-        }
-    }
-}
-
 fn tower_keys(deployment: &Deployment, into: &mut Targets) {
     for patches in deployment.patch_points.iter().copied() {
         for class in deployment.media.iter().copied() {
@@ -354,56 +297,42 @@ fn tower_keys(deployment: &Deployment, into: &mut Targets) {
     }
 }
 
-fn ensemble_keys(deployment: &Deployment, into: &mut Targets) {
-    let words = deployment.decoders.len() as u32;
-    if words < 2 {
-        return;
-    }
-    for LatticePoint { bucket, lanes } in deployment.points.iter().copied() {
-        match ensemble_lanes(deployment, lanes) {
-            Some(lanes) => {
-                into.targets.push((bucket, BodySynth::Ensemble { lanes }));
-            }
-            None => into.unfireable.push(unfireable_line(
-                deployment,
-                &format!("ensemble {:?}", deployment.decoders),
-                &format!("bucket {bucket}"),
-                Some(&format!("{words} decode word(s) in {lanes} lane(s)")),
-            )),
-        }
-    }
-}
-
-fn ensemble_lanes(deployment: &Deployment, lanes: u32) -> Option<Vec<(usize, u32)>> {
-    let words = deployment.decoders.len() as u32;
-    if words < 2 || lanes < words {
-        return None;
-    }
-    let base = lanes / words;
-    let over = lanes % words;
-    Some(
-        deployment
-            .decoders
+fn wide_keys(deployment: &Deployment, into: &mut Targets) {
+    for point in deployment.buckets.iter().copied() {
+        let seats = deployment.seats.min(deployment.max_lanes).min(point) as usize;
+        let decoders: Vec<usize> = deployment
+            .wide
             .iter()
             .copied()
-            .enumerate()
-            .map(|(at, class)| (class, base + u32::from((at as u32) < over)))
-            .collect(),
-    )
-}
-
-fn joint_keys(deployment: &Deployment, into: &mut Targets) {
-    for point in deployment.buckets.iter().copied() {
-        for present in &deployment.joining {
-            match joint_rows(deployment, present, point) {
-                Some(lanes) => into.targets.push((point, BodySynth::Joint { lanes })),
-                None => into.unfireable.push(unfireable_line(
-                    deployment,
-                    &format!("joint {present:?}"),
-                    &format!("bucket {point}"),
-                    None,
-                )),
+            .filter(|class| deployment.decoding.contains(*class))
+            .take(seats)
+            .collect();
+        let prefilling: Vec<usize> = deployment
+            .wide
+            .iter()
+            .copied()
+            .filter(|class| !deployment.decoding.contains(*class))
+            .take(seats.saturating_sub(decoders.len()))
+            .collect();
+        let rows_left = point - decoders.len() as u32;
+        let spread = if prefilling.is_empty() {
+            Some(Vec::new())
+        } else {
+            Shell::spread(rows_left, prefilling.len() as u32, deployment.context)
+        };
+        match spread {
+            Some(rows) if decoders.len() + prefilling.len() > 1 => {
+                let mut lanes: Vec<(usize, u32)> =
+                    decoders.iter().map(|class| (*class, 1u32)).collect();
+                lanes.extend(prefilling.iter().zip(rows).map(|(class, rows)| (*class, rows)));
+                into.targets.push((point, BodySynth::Wide { lanes }));
             }
+            _ => into.unfireable.push(unfireable_line(
+                deployment,
+                "wide",
+                &format!("bucket {point}"),
+                None,
+            )),
         }
     }
 }
@@ -412,10 +341,8 @@ const ARMS: [fn(&Deployment, &mut Targets); Kind::COUNT] = [
     decode_keys,
     prefill_keys,
     mixed_keys,
-    fragmented_keys,
     tower_keys,
-    ensemble_keys,
-    joint_keys,
+    wide_keys,
 ];
 
 impl core::fmt::Display for BodySynth {
@@ -438,28 +365,8 @@ impl core::fmt::Display for BodySynth {
                 images,
                 patches,
             } => write!(f, "tower c{class} {rows}r x{images} img {patches}p"),
-            BodySynth::Fragmented { lanes } => {
-                write!(f, "fragmented ")?;
-                for (at, (class, rows)) in lanes.iter().enumerate() {
-                    if at > 0 {
-                        f.write_str("+")?;
-                    }
-                    write!(f, "c{class}:{rows}")?;
-                }
-                Ok(())
-            }
-            BodySynth::Ensemble { lanes } => {
-                write!(f, "ensemble ")?;
-                for (at, (class, count)) in lanes.iter().enumerate() {
-                    if at > 0 {
-                        f.write_str("+")?;
-                    }
-                    write!(f, "c{class} x{count}")?;
-                }
-                Ok(())
-            }
-            BodySynth::Joint { lanes } => {
-                write!(f, "joint ")?;
+            BodySynth::Wide { lanes } => {
+                write!(f, "wide ")?;
                 for (at, (class, rows)) in lanes.iter().enumerate() {
                     if at > 0 {
                         f.write_str("+")?;
@@ -917,6 +824,15 @@ impl Shell {
     }
 
     pub(super) fn arm_bodies(&mut self) -> Result<()> {
+        self.arm_lattice(false)
+    }
+
+    pub fn verify_bodies(&mut self) -> Result<usize> {
+        self.arm_lattice(true)?;
+        Ok(self.armed.as_ref().map_or(0, |armed| armed.armed))
+    }
+
+    fn arm_lattice(&mut self, verify: bool) -> Result<()> {
         if !self.records_bodies() || !Self::keyable_units(&self.compiled) {
             return Ok(());
         }
@@ -982,18 +898,22 @@ impl Shell {
             decoders: self
                 .decoding
                 .iter()
-                .filter(|class| textual(*class))
+                .filter(|class| textual(*class) && self.tiers.plain.contains(*class))
                 .collect(),
             prefilling: (0..classes)
                 .filter(|class| {
                     !self.decoding.contains(*class)
                         && textual(*class)
-                        && !self.landing[*class].is_empty()
+                        && self.tiers.plain.contains(*class)
                 })
                 .collect(),
             media: self.media.iter().collect(),
-            fragmenting: self.fragmenting(),
-            joining: self.joining(),
+            wide: self
+                .decoding
+                .iter()
+                .chain((0..classes).filter(|class| !self.decoding.contains(*class)))
+                .filter(|class| textual(*class) && !self.landing[*class].is_empty())
+                .collect(),
             decoding: self.decoding.clone(),
             seats,
             context,
@@ -1006,17 +926,15 @@ impl Shell {
         }
         let Targets {
             mut targets,
-            mut unfireable,
+            unfireable,
         } = found;
         let top = targets.iter().map(|(bucket, _)| *bucket).max();
         let rank = |kind: Kind| match kind {
             Kind::Decode => 0u8,
-            Kind::Ensemble => 1,
-            Kind::Mixed => 2,
-            Kind::Prefill => 3,
-            Kind::Joint => 4,
-            Kind::Fragmented => 5,
-            Kind::Tower => 6,
+            Kind::Mixed => 1,
+            Kind::Prefill => 2,
+            Kind::Wide => 3,
+            Kind::Tower => 4,
         };
         targets
             .sort_by_key(|(bucket, target)| (Some(*bucket) != top, rank(target.kind()), *bucket));
@@ -1028,7 +946,6 @@ impl Shell {
         let mut wanted = 0usize;
         let mut tally = [(0usize, 0usize); Kind::COUNT];
         let mut refused: Option<String> = None;
-        let mut unadmitted: Vec<Vec<usize>> = Vec::new();
 
         let mut never = 0usize;
         let mut never_from = 0u32;
@@ -1039,14 +956,16 @@ impl Shell {
         let mut ballot = Ballot::open(&self.device);
         for (bucket, target) in targets {
             let spent = self.cache.body_stats();
-            let spare = self.pools.spare_bytes().unwrap_or(u64::MAX);
+            let room = (self.bodies_mem as u64).saturating_sub(spent.census.bytes as u64);
+            let spare = self.pools.spare_bytes_for_bodies(room).unwrap_or(u64::MAX);
             let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
             let margin = price.max(unit_margin);
             let headroom = spare < margin;
-            let mine = spent.census.bodies >= record::MAX_BODIES
-                || spent.census.bytes >= self.bodies_mem
-                || headroom;
-            if ballot.any(&self.device, mine) {
+            let mine = !verify
+                && (spent.census.bodies >= record::MAX_BODIES
+                    || spent.census.bytes >= self.bodies_mem
+                    || headroom);
+            if !verify && ballot.any(&self.device, mine) {
                 if never == 0 {
                     never_from = bucket;
                     belted = spent.census.bodies >= record::MAX_BODIES;
@@ -1058,14 +977,8 @@ impl Shell {
                 never += 1;
                 continue;
             }
-            let present = target.present();
-            if target.skips_on_present_set() && unadmitted.contains(&present) {
-                unfireable.push(format!(
-                    "bucket {bucket}, {target}: inadmissible present set"
-                ));
-                continue;
-            }
             wanted += 1;
+            let began = std::time::Instant::now();
             let at = target.kind().at();
             let (lanes, media) = target.lanes();
             tally[at].1 += 1;
@@ -1075,7 +988,6 @@ impl Shell {
                 self.synthetic_lanes_with(&lanes, &media)
             };
             self.armed_body = None;
-            let mut faulted = false;
             for _ in 0..record::WARM_FIRES {
                 let fired = self.fire_synthetic(&owned);
                 let landed = self.device.synchronize();
@@ -1084,38 +996,130 @@ impl Shell {
                         eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
                     }
                     refused = Some(format!("bucket {bucket}, {target}: {why}"));
-                    faulted = true;
                     break;
                 }
             }
-            let admitted = self.armed_body.is_some();
             let key = self.armed_body.take();
-            if self.golden
+            let warmed_ms = began.elapsed().as_secs_f64() * 1000.0;
+            let mut golden_ms = (0f64, 0f64);
+            if verify
                 && let Some(key) = key.as_ref()
                 && self.cache.holds_body(key)
             {
-                let verdict = self
-                    .golden(key, &owned)
-                    .and_then(|()| self.golden_real(key, &owned));
-                if let Err(fault) = verdict {
-                    if super::diag::on().golden_skip {
-                        eprintln!("[arm-trace] golden refused {key}: {fault}");
-                        self.cache.body_drop(key);
-                    } else {
-                        return Err(fault);
-                    }
-                }
+                let clock = std::time::Instant::now();
+                self.golden(key, &owned)?;
+                golden_ms.0 = clock.elapsed().as_secs_f64() * 1000.0;
+                let clock = std::time::Instant::now();
+                self.golden_real(key, &owned)?;
+                golden_ms.1 = clock.elapsed().as_secs_f64() * 1000.0;
             }
             if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
                 armed += 1;
                 tally[at].0 += 1;
+                if let Some(wanted) = super::diag::on().arm_bench.as_deref()
+                    && let Some(key) = key.as_ref()
+                    && key.to_string().contains(wanted)
+                {
+                    let mut shapes: Vec<(&str, Vec<(usize, u32)>)> = vec![("lattice", lanes.clone())];
+                    let classes: Vec<usize> = lanes.iter().map(|(class, _)| *class).fold(Vec::new(), |mut seen, class| {
+                        if !seen.contains(&class) {
+                            seen.push(class);
+                        }
+                        seen
+                    });
+                    let decoders: Vec<usize> = classes
+                        .iter()
+                        .copied()
+                        .filter(|class| self.decoding.contains(*class))
+                        .collect();
+                    if matches!(target, BodySynth::Wide { .. }) && decoders.len() > 1 {
+                        let seats = (bucket as usize).min(lanes.len()).max(2);
+                        for &class in &decoders[1..] {
+                            shapes.push(("alone", vec![(class, 1u32); seats]));
+                            let mut pair = vec![(decoders[0], 1u32); seats / 2];
+                            pair.extend(vec![(class, 1u32); seats - seats / 2]);
+                            shapes.push(("pair", pair));
+                        }
+                    } else if classes.len() > 1 && lanes.iter().all(|(_, rows)| *rows == 1) {
+                        let mut skewed = vec![(classes[0], 1u32); lanes.len() + 1 - classes.len()];
+                        skewed.extend(classes[1..].iter().map(|class| (*class, 1u32)));
+                        shapes.push(("skewed", skewed));
+                    }
+                    for (what, shape) in shapes {
+                        let owned = self.synthetic_lanes(&shape);
+                        let mut timed = Ok(());
+                        let mut rows_back = 0usize;
+                        for _ in 0..10 {
+                            timed = timed.and(self.fire_synthetic_as(&owned, crate::serve::Golden::Off).map(|out| rows_back = out.len())).and(self.device.synchronize());
+                        }
+                        let before = self.cache.body_stats().tally;
+                        let began = std::time::Instant::now();
+                        const FIRES: u32 = 50;
+                        for _ in 0..FIRES {
+                            timed = timed.and(self.fire_synthetic(&owned)).and(self.device.synchronize());
+                        }
+                        let us = began.elapsed().as_secs_f64() * 1e6 / f64::from(FIRES);
+                        let after = self.cache.body_stats().tally;
+                        let replayed = after.hits - before.hits;
+                        let lanes_of = |class: usize| shape.iter().filter(|(c, _)| *c == class).count();
+                        let layout: Vec<String> = shape
+                            .iter()
+                            .map(|(class, _)| *class)
+                            .fold(Vec::new(), |mut seen, class| {
+                                if !seen.contains(&class) {
+                                    seen.push(class);
+                                }
+                                seen
+                            })
+                            .iter()
+                            .map(|c| format!("c{c}x{}", lanes_of(*c)))
+                            .collect();
+                        match timed {
+                            Ok(()) => eprintln!(
+                                "[arm-bench] {key} {what} [{}] {us:.0} us/fire, replayed {replayed}/{FIRES}, rows back {rows_back}, misses +{} declines +{} eager +{}",
+                                layout.join(" "),
+                                after.misses - before.misses,
+                                after.sealed_declines - before.sealed_declines,
+                                (after.eager_rotating + after.eager_buffered + after.eager_copy_world)
+                                    - (before.eager_rotating + before.eager_buffered + before.eager_copy_world)
+                            ),
+                            Err(why) => eprintln!("[arm-bench] {key} {what} refused: {why}"),
+                        }
+                    }
+                }
                 if super::diag::on().arm_trace
                     && let Some(key) = key.as_ref()
                 {
-                    eprintln!("[arm-trace] armed {key}");
+                    let last = self.cache.body_stats().last_capture;
+                    let islands: Vec<String> = self
+                        .cache
+                        .body_script(key)
+                        .into_iter()
+                        .filter(|(island, _, _)| *island)
+                        .map(|(_, from, upto)| {
+                            let ops: Vec<&str> = (from..upto)
+                                .map(|at| {
+                                    self.compiled
+                                        .template()
+                                        .get(at as usize)
+                                        .and_then(|region| self.trace.nodes.get(region.nodes.start as usize))
+                                        .map_or("?", |node| model_ir::Operands::name(&node.op))
+                                })
+                                .collect();
+                            format!("{from}..{upto}:{}", ops.join("+"))
+                        })
+                        .collect();
+                    eprintln!(
+                        "[arm-trace] armed {key} nodes={} edges={} islands={} ms={:.0} (warm+capture {warmed_ms:.0}, golden {:.0}, real {:.0}){}",
+                        last.nodes,
+                        last.edges,
+                        last.islands,
+                        began.elapsed().as_secs_f64() * 1000.0,
+                        golden_ms.0,
+                        golden_ms.1,
+                        if islands.is_empty() { String::new() } else { format!(" [{}]", islands.join(" ")) }
+                    );
                 }
-            } else if !admitted && !faulted && target.skips_on_present_set() {
-                unadmitted.push(present);
             }
         }
 
@@ -1156,108 +1160,36 @@ impl Shell {
             seal,
         };
         eprintln!("engine-cuda: {report}");
-        if !matches!(seal, Seal::Open) {
+        if super::diag::on().arm_trace {
+            let slabs = kernels_cuda::jit::Slabs::census();
+            let total: usize = slabs.iter().map(|(_, bytes)| *bytes).sum();
+            let free = crate::device::nodes::free_bytes().unwrap_or(0);
+            eprintln!(
+                "[arm-trace] device memory: free {} MiB; arena committed {} MiB, inputs reserve {} MiB, buffered activations {} MiB, readout rows {} MiB, rs scratch {} MiB, pool committed {} MiB",
+                free >> 20,
+                self.arena.bytes() >> 20,
+                self.inputs.bytes() >> 20,
+                self.buffer_bytes() >> 20,
+                self.readout_rows.bytes() >> 20,
+                self.rs_scratch.as_ref().map_or(0, |buffer| buffer.bytes()) >> 20,
+                self.pools.committed_bytes() >> 20,
+            );
+            eprintln!(
+                "[arm-trace] scratch slabs {} MiB: {}",
+                total >> 20,
+                slabs
+                    .iter()
+                    .take(12)
+                    .map(|(name, bytes)| format!("{name}={}", bytes >> 20))
+                    .collect::<Vec<String>>()
+                    .join(" ")
+            );
+        }
+        if !verify && !matches!(seal, Seal::Open) {
             self.cache.seal_bodies();
         }
         self.armed = Some(report);
         Ok(())
-    }
-
-    fn fragmenting(&self) -> Vec<Vec<usize>> {
-        let classes = self.compiled.classes.classes.len();
-        let mut seen: Vec<&model_ir::ClassSet> = Vec::new();
-        let mut found: Vec<Vec<usize>> = Vec::new();
-        for region in self.compiled.template() {
-            if region.mask.len() < 2 || seen.contains(&&region.mask) {
-                continue;
-            }
-            seen.push(&region.mask);
-            for separator in 0..classes {
-                if region.mask.contains(separator) {
-                    continue;
-                }
-                let Some(present) = Self::witness(&self.compiled, &region.mask, separator) else {
-                    continue;
-                };
-                if present.iter().any(|class| self.media.contains(*class)) {
-                    continue;
-                }
-                if Self::breaks(&self.compiled, &region.mask, &present) && !found.contains(&present)
-                {
-                    found.push(present);
-                }
-            }
-        }
-        found
-    }
-
-    fn joining(&self) -> Vec<Vec<usize>> {
-        let mut found: Vec<Vec<usize>> = Vec::new();
-        for region in self.compiled.template() {
-            if region.mask.len() < 2 {
-                continue;
-            }
-            let present: Vec<usize> = region.mask.iter().collect();
-            if present
-                .iter()
-                .any(|class| self.decoding.contains(*class) || self.media.contains(*class))
-                || found.contains(&present)
-            {
-                continue;
-            }
-            found.push(present);
-        }
-        found
-    }
-
-    fn witness(
-        compiled: &CompiledModel,
-        mask: &model_ir::ClassSet,
-        separator: usize,
-    ) -> Option<Vec<usize>> {
-        let mut whole: Vec<usize> = mask.iter().collect();
-        whole.push(separator);
-        let order = compiled
-            .order
-            .class_order(&model_ir::ClassSet::of(whole.iter().copied()));
-        let mut before: Option<usize> = None;
-        let mut after: Option<usize> = None;
-        let mut passed = false;
-        for class in order {
-            let class = class as usize;
-            if class == separator {
-                passed = true;
-                continue;
-            }
-            if !mask.contains(class) {
-                continue;
-            }
-            if passed {
-                after = Some(class);
-                break;
-            }
-            before = Some(class);
-        }
-        let mut present = vec![before?, separator, after?];
-        present.sort_unstable();
-        Some(present)
-    }
-
-    fn breaks(compiled: &CompiledModel, mask: &model_ir::ClassSet, present: &[usize]) -> bool {
-        let order = compiled
-            .order
-            .class_order(&model_ir::ClassSet::of(present.iter().copied()));
-        let mut runs = 0usize;
-        let mut inside = false;
-        for class in order {
-            if mask.contains(class as usize) {
-                runs += usize::from(!inside);
-                inside = true;
-            } else {
-                inside = false;
-            }
-        }
-        runs > 1
     }
 
     fn spread(rows: u32, lanes: u32, context: u32) -> Option<Vec<u32>> {
@@ -1269,73 +1201,6 @@ impl Shell {
         let over = rows % lanes;
         Some((0..lanes).map(|at| base + u32::from(at < over)).collect())
     }
-}
-
-fn joint_rows(
-    deployment: &Deployment,
-    present: &[usize],
-    bucket: u32,
-) -> Option<Vec<(usize, u32)>> {
-    let width = present.len() as u32;
-    let seats = deployment.seats.min(deployment.max_lanes);
-    if width < 2 || seats < width || bucket < width {
-        return None;
-    }
-    let lanes_per_class = (seats / width).max(1);
-    let mut lanes = Vec::new();
-    let base = bucket / width;
-    let over = bucket % width;
-    for (at, class) in present.iter().enumerate() {
-        let rows = base + u32::from((at as u32) < over);
-        for share in Shell::spread(rows, lanes_per_class, deployment.context)? {
-            lanes.push((*class, share));
-        }
-    }
-    Some(lanes)
-}
-
-fn fragment_rows(
-    deployment: &Deployment,
-    present: &[usize],
-    bucket: u32,
-) -> Option<Vec<(usize, u32)>> {
-    let width = present.len() as u32;
-    if width < 2 || deployment.seats < width || deployment.max_lanes < width || bucket < width {
-        return None;
-    }
-    let decodes = present
-        .iter()
-        .filter(|class| deployment.decoding.contains(**class))
-        .count() as u32;
-    let prefilling: Vec<usize> = present
-        .iter()
-        .copied()
-        .filter(|class| !deployment.decoding.contains(*class))
-        .collect();
-    if prefilling.is_empty() {
-        return None;
-    }
-    let rows = Shell::spread(
-        bucket - decodes,
-        prefilling.len() as u32,
-        deployment.context,
-    )?;
-    if rows.len() != prefilling.len() {
-        return None;
-    }
-    let mut taken = rows.into_iter();
-    Some(
-        present
-            .iter()
-            .map(|class| {
-                if deployment.decoding.contains(*class) {
-                    (*class, 1u32)
-                } else {
-                    (*class, taken.next().unwrap_or(1))
-                }
-            })
-            .collect(),
-    )
 }
 
 fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
@@ -1431,72 +1296,6 @@ fn evidence(walked: &[Vec<f32>], replayed: &[Vec<f32>]) -> Option<String> {
         x.to_bits(),
         y.to_bits(),
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{BodySynth, Deployment, LatticePoint, Targets, ensemble_keys};
-
-    fn deployment(decoders: usize, point: LatticePoint) -> Deployment {
-        Deployment {
-            points: vec![point],
-            buckets: Vec::new(),
-            patch_points: Vec::new(),
-            decoders: (0..decoders).collect(),
-            prefilling: Vec::new(),
-            media: Vec::new(),
-            fragmenting: Vec::new(),
-            joining: Vec::new(),
-            decoding: model_ir::ClassSet::of(0..decoders),
-            seats: point.lanes,
-            context: 512,
-            max_lanes: point.lanes,
-            patch_fold: 1,
-        }
-    }
-
-    fn lanes(target: &BodySynth) -> Vec<(usize, u32)> {
-        match target {
-            BodySynth::Ensemble { lanes } => lanes.clone(),
-            other => panic!("the ensemble arm produced {other}"),
-        }
-    }
-
-    #[test]
-    fn two_decode_words_arm_the_pair_at_the_rungs_lane_count() {
-        let mut found = Targets::default();
-        ensemble_keys(
-            &deployment(
-                2,
-                LatticePoint {
-                    bucket: 256,
-                    lanes: 256,
-                },
-            ),
-            &mut found,
-        );
-        assert_eq!(
-            found.targets.len(),
-            1,
-            "one key per rung, and there is one rung"
-        );
-        let (bucket, target) = &found.targets[0];
-        assert_eq!(*bucket, 256);
-        assert_eq!(
-            lanes(target),
-            vec![(0, 128), (1, 128)],
-            "the rung's lanes are split across the two decode words"
-        );
-        assert_eq!(target.present(), vec![0, 1]);
-        let (rows, media) = target.lanes();
-        assert!(media.is_empty(), "an ensemble lane submits no image");
-        assert_eq!(rows.len(), 256, "one lane per row");
-        assert!(
-            rows.iter().all(|(_, rows)| *rows == 1),
-            "a decode lane is one row"
-        );
-        assert_eq!(rows.iter().map(|(_, rows)| *rows).sum::<u32>(), 256);
-    }
 }
 
 #[derive(Debug, Clone)]

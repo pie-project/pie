@@ -65,7 +65,20 @@ function hashBytes(bytes) {
  * It is a SUGGESTION off the wire: run it through `fileName()` before joining
  * it to a directory.
  */
-export class ReceivedFile extends Buffer {
+// A browser has no `Buffer`; there the payload is the `Uint8Array` the
+// chunks were concatenated into, with the same `length`/`subarray` surface.
+const Bytes = globalThis.Buffer ?? Uint8Array;
+
+/** `Buffer.concat` where there is a Buffer, a plain byte concat elsewhere. */
+function concatBytes(chunks) {
+    if (globalThis.Buffer) return Buffer.concat(chunks);
+    const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+    let at = 0;
+    for (const c of chunks) { out.set(c, at); at += c.length; }
+    return out;
+}
+
+export class ReceivedFile extends Bytes {
     /**
      * @param {Buffer} data The file's bytes.
      * @param {string|null} name The name the inferlet suggested, or null.
@@ -301,7 +314,7 @@ export class PieClient {
 
         if (chunk_index === total_chunks - 1) {
             this.pendingDownloads.delete(file_hash);
-            const completeData = Buffer.concat(download.buffer);
+            const completeData = concatBytes(download.buffer);
             const computedHash = hashBytes(completeData);
             if (computedHash === file_hash && this.processEventQueues.has(download.processId)) {
                 const file = ReceivedFile.wrap(completeData, download.name);

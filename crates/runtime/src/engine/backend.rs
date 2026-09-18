@@ -80,6 +80,27 @@ pub mod open {
             .map(|engine| Box::new(engine) as EngineBox)
             .map_err(::anyhow::Error::msg)
     }
+
+    /// A tab requests its adapter and device itself (both are promises
+    /// there) and hands them in; the engine is otherwise the same. Native
+    /// hosts may do the same, which keeps the browser host building there.
+    #[cfg(feature = "wgpu")]
+    pub fn wgpu_on_device(
+        config_bytes: &[u8],
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    ) -> Result<EngineBox> {
+        engine_wgpu::open_with_device(
+            config_bytes,
+            crate::engine::load::contract_for,
+            adapter,
+            device,
+            queue,
+        )
+        .map(|engine| Box::new(engine) as EngineBox)
+        .map_err(::anyhow::Error::msg)
+    }
 }
 
 #[cfg(feature = "cuda")]

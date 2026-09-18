@@ -44,6 +44,7 @@ impl Airborne {
     }
 }
 
+/// Whom to tell, and as what, once a step's work has landed.
 pub struct Done {
     pub at: engine::StepDone,
 

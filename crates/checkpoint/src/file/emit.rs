@@ -336,6 +336,13 @@ fn available_bytes(directory: &Path) -> Result<u64, Error> {
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
+/// A platform with no filesystem to state (a browser tab) never emits an
+/// artifact; report nothing available so a caller refuses up front.
+#[cfg(not(any(unix, windows)))]
+fn available_bytes(_directory: &Path) -> Result<u64, Error> {
+    Ok(0)
+}
+
 #[cfg(windows)]
 fn available_bytes(directory: &Path) -> Result<u64, Error> {
     use std::os::windows::ffi::OsStrExt;

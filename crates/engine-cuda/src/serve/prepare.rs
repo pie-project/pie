@@ -407,6 +407,18 @@ impl FrameShell for Shell {
                 }
             }
         }
+        let readouts_ceiling = model_compiler::arena::readouts_ceiling(&self.budget);
+        if readout_rows.len() as u64 > readouts_ceiling {
+            return Err(Fault::Ceiling {
+                what: "rows one fire reads logits for (READOUTS_PER_LANE per lane)",
+                need: readout_rows.len() as u64,
+                have: readouts_ceiling,
+            });
+        }
+        self.arena.ensure(
+            &mut self.pools,
+            self.compiled.arena.prefix_for(readout_rows.len() as u64),
+        )?;
         let descriptor = FireDescriptor::of(&composition);
 
         let lane_facts: Vec<model_exec::fire::LaneFacts> = lanes
@@ -700,6 +712,7 @@ impl FrameShell for Shell {
         let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut fresh: Vec<u32> = Vec::new();
+        let mut rs_pages_named = 0u32;
         let mut rs_moves: Vec<RsMove<'a>> = Vec::with_capacity(lanes.len());
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut rs_order: Vec<u32> = vec![0; lanes.len()];
@@ -802,6 +815,9 @@ impl FrameShell for Shell {
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold_len.as_deref());
+            if let RsVerb::Buffer { pages, .. } | RsVerb::FoldBuffered { pages, .. } = &seated.rs {
+                rs_pages_named = rs_pages_named.max(pages.iter().copied().max().map_or(0, |page| page + 1));
+            }
             let (verb, folded) = match &seated.rs {
                 RsVerb::Fold => (RsMove::None, row.rows),
                 RsVerb::Buffer {
@@ -880,6 +896,11 @@ impl FrameShell for Shell {
                         row.source
                     ),
                 });
+            }
+            if verb != RsMove::None
+                && let Some(buffers) = self.buffers.as_mut()
+            {
+                buffers.ensure(&mut self.pools, rs_pages_named)?;
             }
             rs_moves.push(verb);
             rs_lens.push(narrow(u64::from(folded)));
@@ -1169,7 +1190,23 @@ impl FrameShell for Shell {
             .iter()
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
-        let copies_here = copies && masks.iter().all(|lane| lane.mask.is_none());
+        let lane_ceiling = self.lane_ceiling();
+        let token_axis = composition.axis(model_ir::RowAxis::Tokens);
+        let patches = composition.axis(model_ir::RowAxis::Patches);
+        let key = record::BodyKey::of_axes(
+            &token_axis.classes,
+            token_axis.bucket,
+            &self.decoding,
+            lane_ceiling,
+            &self.tiers,
+            self.towered.then_some((&patches.classes, patches.bucket)),
+        );
+        let copies_here = copies
+            && key
+                .classes
+                .rungs()
+                .iter()
+                .all(|(class, _)| !self.masked.contains(*class as usize));
         let class_tables = [
             composition.table(model_ir::RowAxis::Tokens),
             composition.table(model_ir::RowAxis::Patches),
@@ -1233,16 +1270,6 @@ impl FrameShell for Shell {
         let staged = crate::mask::stage(&masks)?;
         super::btrace::mark("mask");
 
-        let lane_ceiling = self.lane_ceiling();
-        let token_axis = composition.axis(model_ir::RowAxis::Tokens);
-        let patches = composition.axis(model_ir::RowAxis::Patches);
-        let key = record::BodyKey::of_axes(
-            &token_axis.classes,
-            token_axis.bucket,
-            &self.decoding,
-            lane_ceiling,
-            self.towered.then_some((&patches.classes, patches.bucket)),
-        );
         let ladder = key.classes.clone();
         let patch_ladder = key.patch.as_ref().map(|axis| axis.classes.clone());
         let records_bodies = self.records_bodies();
@@ -1306,14 +1333,14 @@ impl FrameShell for Shell {
         let mut qo_absolute: Vec<i32> = Vec::new();
         let mut lane_carve = composition.lane_count();
         if bodied {
-            let ceiling = ladder.lane_reach(lane_ceiling).min(self.budget.max_lanes) as usize;
-            lane_carve = lane_carve.max(ceiling as u32);
+            let capacity = crate::window::lane_capacity(self.budget.max_lanes);
+            lane_carve = lane_carve.max(capacity);
             for geometry in &mut geometries {
-                geometry.pad_to(ceiling);
+                geometry.pad_to(capacity as usize);
             }
             qo_absolute = windows.qo_absolute_host().to_vec();
-            kv::pad_indptr(&mut qo_absolute, ceiling);
-            windows.stage_qo_absolute(ceiling as u32);
+            kv::pad_indptr(&mut qo_absolute, capacity as usize);
+            windows.stage_qo_absolute(capacity);
         }
         let geometries = geometries;
 

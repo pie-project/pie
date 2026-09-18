@@ -1,0 +1,220 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>pie in the browser</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem auto; max-width: 56rem; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; }
+  fieldset { border: 1px solid #ccc; margin: 1rem 0; }
+  label { display: inline-block; min-width: 9rem; }
+  input[type=text] { width: 30rem; }
+  button { margin: 0.25rem 0; }
+  pre { background: #f4f4f4; padding: 0.75rem; white-space: pre-wrap; max-height: 24rem; overflow: auto; }
+  #output { background: #fffbe6; min-height: 4rem; }
+  progress { width: 30rem; }
+</style>
+
+<h1>pie in the browser</h1>
+<p>The same runtime, WebGPU engine and inferlet sandbox as <code>pie serve</code>, compiled to wasm32 and running in this tab.</p>
+
+<fieldset>
+  <legend>1. Model</legend>
+  <label for="model">artifact URL</label>
+  <input id="model" type="text" value="models/qwen--qwen3-5-0-8b.qwen35-d0-8b-u4g64-kv-bf16.wgpu.zt">
+  <br>
+  <label for="config">engine config</label>
+  <input id="config" type="text" value='max_forward_tokens = 512, max_forward_requests = 4, max_total_pages = 512'>
+  <br>
+  <button id="boot">Load model and boot</button>
+  <progress id="progress" value="0" max="1"></progress>
+  <span id="boot-status"></span>
+</fieldset>
+
+<fieldset>
+  <legend>2. Inferlet</legend>
+  <label for="inferlet">component URL</label>
+  <input id="inferlet" type="text" value="inferlets/text_completion.wasm">
+  <br>
+  <label for="manifest">manifest URL</label>
+  <input id="manifest" type="text" value="inferlets/text-completion.Pie.toml">
+  <br>
+  <button id="install" disabled>Install</button>
+  <span id="install-status"></span>
+</fieldset>
+
+<fieldset>
+  <legend>3. Run</legend>
+  <label for="prompt">prompt</label>
+  <input id="prompt" type="text" value="The capital of France is">
+  <br>
+  <label for="max-tokens">max tokens</label>
+  <input id="max-tokens" type="text" value="32" style="width: 4rem">
+  <br>
+  <button id="run" disabled>Run</button>
+  <span id="run-status"></span>
+  <pre id="output"></pre>
+</fieldset>
+
+<pre id="log"></pre>
+
+<script type="module">
+  import * as pie from "./pie.mjs";
+
+  const $ = (id) => document.getElementById(id);
+  const log = (s) => { $("log").textContent += s + "\n"; console.log(s); };
+  const params = new URLSearchParams(location.search);
+  const auto = params.has("auto");
+  if (params.has("trace")) globalThis.__pieFiberTrace = true;
+  if (params.has("ticks")) globalThis.__pieTickTrace = true;
+  if (params.get("model")) $("model").value = params.get("model");
+  if (params.get("prompt")) $("prompt").value = params.get("prompt");
+  if (params.get("config")) $("config").value = params.get("config");
+  if (params.get("max_tokens")) $("max-tokens").value = params.get("max_tokens");
+  if (params.get("inferlet")) $("inferlet").value = params.get("inferlet");
+  if (params.get("manifest")) $("manifest").value = params.get("manifest");
+
+  let program = null;
+  let runsLeft = Number(params.get("runs") ?? 1);
+
+  async function fetchWithProgress(url, onProgress) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${url}: ${res.status}`);
+    const total = Number(res.headers.get("content-length") ?? 0);
+    const reader = res.body.getReader();
+    const chunks = [];
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      got += value.length;
+      onProgress?.(got, total);
+    }
+    const out = new Uint8Array(got);
+    let at = 0;
+    for (const c of chunks) { out.set(c, at); at += c.length; }
+    return out;
+  }
+
+  function configToml() {
+    const lines = $("config").value.split(",").map((s) => s.trim()).filter(Boolean);
+    return lines.join("\n") + "\n";
+  }
+
+  async function boot() {
+    $("boot").disabled = true;
+    try {
+      $("boot-status").textContent = "loading wasm…";
+      const t0 = performance.now();
+      // `?worker=0` runs the runtime on this thread instead of its worker.
+      const { worker } = await pie.load("./pkg/pie_web_bg.wasm", params.get("log") ?? undefined, { worker: params.get("worker") !== "0" });
+      log(`wasm loaded in ${(performance.now() - t0).toFixed(0)} ms (${worker ? "in a worker" : "on the main thread"})`);
+      $("boot-status").textContent = "downloading model…";
+      const url = $("model").value;
+      let source = "network";
+      const t1 = performance.now();
+      const summary = await pie.bootLazy(url, configToml(), (got, total, from) => {
+        source = from;
+        $("progress").value = total ? Math.min(1, got / total) : 0;
+        const verb = from === "cache" ? "serving model ranges from the cache" : "serving model ranges";
+        $("boot-status").textContent = `${verb}… ${(got / 1048576).toFixed(0)} MiB`;
+      });
+      log(`model from ${source}`);
+      log(`booted in ${(performance.now() - t1).toFixed(0)} ms: ${JSON.stringify(summary)}`);
+      log(`wasm memory: ${((await pie.memoryBytes()) / 1048576).toFixed(0)} MiB`);
+      $("boot-status").textContent = `ready: ${summary.sku ?? ""}`;
+      $("install").disabled = false;
+    } catch (e) {
+      log(`boot failed: ${e.stack ?? e}`);
+      $("boot-status").textContent = `failed: ${e}`;
+      window.__pie_done?.(1);
+      throw e;
+    }
+  }
+
+  async function install() {
+    $("install").disabled = true;
+    try {
+      const [wasmBytes, manifest] = await Promise.all([
+        fetchWithProgress($("inferlet").value),
+        fetch($("manifest").value).then((r) => r.text()),
+      ]);
+      const t0 = performance.now();
+      program = await pie.install(wasmBytes, manifest);
+      log(`installed ${program} in ${(performance.now() - t0).toFixed(0)} ms`);
+      $("install-status").textContent = `installed ${program}`;
+      $("run").disabled = false;
+    } catch (e) {
+      log(`install failed: ${e.stack ?? e}`);
+      $("install-status").textContent = `failed: ${e}`;
+      window.__pie_done?.(1);
+      throw e;
+    }
+  }
+
+  async function run() {
+    $("run").disabled = true;
+    $("output").textContent = "";
+    $("run-status").textContent = "running…";
+    try {
+      const session = new pie.Session();
+      // `?input=<json>` adds or overrides fields of the inferlet's input.
+      const extra = params.get("input") ? JSON.parse(params.get("input")) : {};
+      const input = JSON.stringify({ prompt: $("prompt").value, max_tokens: Number($("max-tokens").value), ...extra });
+      const t0 = performance.now();
+      let tokens = 0;
+      let watchdog = null;
+      if (params.has("debug")) {
+        watchdog = setInterval(async () => {
+          try { log(`[debug ${((performance.now() - t0) / 1000).toFixed(0)}s]\n${await pie.debugDump()}`); }
+          catch (e) { log(`[debug] dump failed: ${e}`); }
+        }, 20000);
+      }
+      const last = await session.run(program, input, (m) => {
+        if (m.event === "stdout" || m.event === "message") {
+          $("output").textContent += m.value;
+          tokens += 1;
+        } else if (m.event === "stderr") {
+          log(`stderr: ${m.value}`);
+        } else if (m.event === "return") {
+          // text-completion returns {text, count, tokens} as JSON.
+          try {
+            const out = JSON.parse(m.value);
+            $("output").textContent += out.text ?? m.value;
+            tokens = out.count ?? tokens;
+            log(`returned: ${m.value}`);
+          } catch {
+            // A streaming inferlet returns the text it already streamed.
+            if (tokens === 0) $("output").textContent += m.value;
+          }
+        } else if (m.event === "error") {
+          $("output").textContent += `\n[error] ${m.value}`;
+        }
+      });
+      clearInterval(watchdog);
+      const ms = performance.now() - t0;
+      log(`process ${last.event} after ${ms.toFixed(0)} ms, ${tokens} event(s)`);
+      log(`output: ${JSON.stringify($("output").textContent.slice(0, 300))}`);
+      $("run-status").textContent = `${last.event} in ${(ms / 1000).toFixed(1)} s`;
+      session.close();
+      if (last.event !== "return") window.__pie_done?.(1);
+      else if (--runsLeft <= 0) window.__pie_done?.(0);
+    } catch (e) {
+      log(`run failed: ${e.message ?? e}`);
+      $("run-status").textContent = `failed: ${e}`;
+      window.__pie_done?.(1);
+    } finally {
+      $("run").disabled = false;
+    }
+  }
+
+  $("boot").onclick = boot;
+  $("install").onclick = install;
+  $("run").onclick = run;
+
+  if (auto) {
+    await boot();
+    await install();
+    const runs = Number(params.get("runs") ?? 1);
+    for (let i = 0; i < runs; i++) await run();
+  }
+</script>

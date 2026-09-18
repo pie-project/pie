@@ -1,0 +1,57 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>pie in the browser — inferlet matrix</title>
+<style> body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; } pre { background: #f4f4f4; padding: 0.75rem; white-space: pre-wrap; } </style>
+<h1>inferlet matrix: every general inferlet, once, in this tab</h1>
+<p>Boots the model once, then installs and runs each entry of <code>matrix.json</code>. Each line is <code>MATRIX id ⟨tab⟩ status ⟨tab⟩ output</code>; <code>web/tools/matrix.sh</code> runs the same list natively and compares.</p>
+<pre id="out"></pre>
+<script type="module">
+  import * as pie from "./pie.mjs";
+  import { page, loadRuntime, inferletBytes } from "./harness.mjs";
+
+  const { log, params, modelUrl, finish, fail } = page();
+  // `?only=a,b,c` runs those entries alone.
+  const only = params.get("only")?.split(",").filter(Boolean);
+  // An entry that neither returns nor errors within this is reported as a
+  // timeout and its session closed, so the rest of the list still runs.
+  const entryTimeoutMs = Number(params.get("entry_timeout") ?? 60000);
+  try {
+    await loadRuntime(params);
+    const summary = await pie.bootLazy(modelUrl, params.get("config") ?? "");
+    log(`booted ${summary.sku}`);
+    const list = (await (await fetch("matrix.json")).json()).filter((e) => !only || only.includes(e.id));
+    let failures = 0;
+    for (const entry of list) {
+      const t0 = performance.now();
+      let status = "ok";
+      let output = "";
+      try {
+        const { bytes, manifest } = await inferletBytes(entry.inferlet);
+        const program = await pie.install(bytes, manifest);
+        const s = new pie.Session();
+        const streamed = [];
+        let returned = null;
+        try {
+          const run = s.run(program, JSON.stringify(entry.input), (m) => {
+            if (m.event === "stdout" || m.event === "message") streamed.push(m.value);
+          });
+          const last = await Promise.race([run, new Promise((r) => setTimeout(() => r({ event: "timeout", value: `${entryTimeoutMs} ms` }), entryTimeoutMs))]);
+          if (last.event === "return") returned = last.value;
+          else status = `${last.event}: ${String(last.value).slice(0, 200)}`;
+          if (last.event === "timeout") log(`EXEC ${await pie.executorState()}`);
+        } finally {
+          s.close();
+        }
+        output = streamed.join("") + (returned === null ? "" : `⏎${returned}`);
+      } catch (e) {
+        status = `threw: ${String(e.message ?? e).slice(0, 200)}`;
+      }
+      if (status !== "ok") failures += 1;
+      log(`MATRIX ${entry.id}\t${status}\t${JSON.stringify(output)}\t${(performance.now() - t0).toFixed(0)} ms`);
+    }
+    log(`RESULT ${JSON.stringify({ host: "browser", entries: list.length, failures })}`);
+    finish(failures ? 1 : 0);
+  } catch (e) {
+    fail(e);
+  }
+</script>

@@ -1,0 +1,64 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>pie in the browser — page lifecycle</title>
+<style> body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; } pre { background: #f4f4f4; padding: 0.75rem; white-space: pre-wrap; } </style>
+<h1>page lifecycle: reload, hidden tab, memory ceiling</h1>
+<pre id="out"></pre>
+<script type="module">
+  import * as pie from "./pie.mjs";
+  import { SHORT, page, loadRuntime, installInferlet, complete } from "./harness.mjs";
+
+  const { log, params, modelUrl, results, verdict: check, finish, fail } = page();
+  const phase = params.get("phase") ?? "first";
+
+  try {
+    await loadRuntime(params);
+    // The lazy path: ranges from the network on the first visit (the cache is
+    // filled in the background after boot) and from the OPFS copy on the reload.
+    let from = "";
+    let fetchMs = 0;
+    const t0 = performance.now();
+    await pie.bootLazy(modelUrl, "", (got, total, source) => { from = source; fetchMs = performance.now() - t0; });
+    const bootMs = performance.now() - t0 - fetchMs;
+    check(`model source on phase "${phase}"`, phase === "first" ? from === "network" || from === "cache" : from === "cache",
+      `${from}, ${fetchMs.toFixed(0)} ms of ranges, ${bootMs.toFixed(0)} ms boot`);
+    if (phase === "first") {
+      const tc = performance.now();
+      await pie.awaitCache();
+      log(`background cache fill finished in ${(performance.now() - tc).toFixed(0)} ms`);
+    }
+
+    const { program } = await installInferlet("text-completion");
+    const run = (n) => complete(program, { prompt: SHORT, max_tokens: n });
+    await run(2);
+
+    // A hidden tab: Chrome throttles timers to once a second (and, after
+    // five minutes, once a minute). The runtime's wake path is microtask-
+    // driven, so generation should not slow to the throttled cadence.
+    const visible = await run(32);
+    let hidden = null;
+    if (params.has("hide") && window.__pie_hide) {
+      await window.__pie_hide();
+      await new Promise((r) => setTimeout(r, 1500));
+      hidden = await run(32);
+      await window.__pie_show();
+    }
+    check("32 tokens visible", visible.event === "return", `${visible.ms.toFixed(0)} ms`);
+    if (hidden) check("32 tokens while hidden (≤ 4× visible)", hidden.event === "return" && hidden.ms <= 4 * visible.ms + 200, `${hidden.ms.toFixed(0)} ms`);
+
+    // Memory: linear memory never shrinks; after the model bytes are freed the
+    // runtime should sit well under the 4 GiB ceiling with room for growth.
+    const mib = (await pie.memoryBytes()) / 1048576;
+    check("wasm memory under 2 GiB after boot and runs", mib < 2048, `${mib.toFixed(0)} MiB`);
+
+    // A long generation to move the KV pool around, then a short one.
+    const long = await run(200);
+    const short = await run(4);
+    check("200-token run then a 4-token run", long.event === "return" && short.event === "return", `${long.ms.toFixed(0)} ms, ${short.ms.toFixed(0)} ms`);
+
+    log("RESULT " + JSON.stringify({ host: "browser", phase, corners: results }));
+    finish(results.every((r) => r.ok) ? 0 : 1);
+  } catch (e) {
+    fail(e);
+  }
+</script>

@@ -1,0 +1,38 @@
+[package]
+name = "wasi-web"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Minimal WASI host for wasmtime that also builds for wasm32-unknown-unknown (a browser tab): no filesystem, no sockets, no threads, host-driven clock."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "wasi_web"
+path = "src/lib.rs"
+
+[dependencies]
+wasmtime = { version = "48.0.1", default-features = false, features = [
+    "runtime",
+    "std",
+    "anyhow",
+    "async",
+    "component-model",
+    "component-model-async",
+] }
+# wasi:io streams/poll/error, no_std-friendly; the p2 stdio streams are built on it.
+wasmtime-wasi-io = { version = "48.0.1" }
+getrandom = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The browser has no mmap; wasmtime's custom-virtual-memory backend is the only
+# platform feature this crate needs to type-check on wasm32. Codegen/interpreter
+# features (pulley) are the host crate's choice.
+wasmtime = { version = "48.0.1", default-features = false, features = ["custom-virtual-memory"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+wasmtime = { version = "48.0.1", default-features = false, features = ["cranelift", "wat"] }
+
+[lints]
+workspace = true

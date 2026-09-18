@@ -511,7 +511,7 @@ pub async fn compile_wasm_component(
     wasm_binary: Vec<u8>,
 ) -> Result<Component> {
     let engine = engine.clone();
-    match tokio::task::spawn_blocking(move || Component::from_binary(&engine, &wasm_binary)).await {
+    match crate::rt::spawn_blocking(move || Component::from_binary(&engine, &wasm_binary)).await {
         Ok(Ok(component)) => Ok(component),
         Ok(Err(e)) => Err(anyhow!("Failed to compile WASM: {}", e)),
         Err(e) => Err(anyhow!("Compilation task failed: {}", e)),

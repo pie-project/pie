@@ -7,22 +7,63 @@ pub const DEFAULT_POWER_PREFERENCE: &str = "high-performance";
 pub const DEFAULT_DEVICE_MEMORY: u64 = 8 << 30;
 
 pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Wgpu, String> {
-    let doc: toml::Table = std::str::from_utf8(config_bytes)
+    let doc = parse(config_bytes)?;
+    tuning(&doc);
+    Ok(Wgpu::new(device_boot(&doc), contract_for))
+}
+
+/// The browser's `open`: the host has already awaited `request_device` and
+/// hands the adapter, device and queue in, since nothing here can block.
+#[cfg(feature = "wgpu")]
+pub fn open_with_device(
+    config_bytes: &[u8],
+    contract_for: ContractFor,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+) -> Result<Wgpu, String> {
+    let doc = parse(config_bytes)?;
+    tuning(&doc);
+    Ok(Wgpu::with_device(
+        device_boot(&doc),
+        contract_for,
+        crate::device::Handed {
+            adapter,
+            device,
+            queue,
+        },
+    ))
+}
+
+/// Picks the adapter the config names and opens the shell's device on it,
+/// with the feature and limit policy native `open` uses, so both hosts agree.
+#[cfg(feature = "wgpu")]
+pub async fn request_device(
+    config_bytes: &[u8],
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
+    let doc = parse(config_bytes)?;
+    let handed = crate::device::request(&device_boot(&doc))
+        .await
+        .map_err(|fault| fault.to_string())?;
+    Ok((handed.adapter, handed.device, handed.queue))
+}
+
+fn parse(config_bytes: &[u8]) -> Result<toml::Table, String> {
+    std::str::from_utf8(config_bytes)
         .map_err(|error| format!("the wgpu boot config is not utf-8: {error}"))?
         .parse()
-        .map_err(|error| format!("the wgpu boot config is not TOML: {error}"))?;
-    tuning(&doc);
-    Ok(Wgpu::new(
-        DeviceBoot {
-            adapter_index: adapter_index(&doc),
-            backends: backends(&doc),
-            gpu_mem_utilization: gpu_mem_utilization(&doc),
-            power_preference: power_preference(&doc),
-            pipeline_cache: pipeline_cache(&doc),
-            device_memory: device_memory(&doc),
-        },
-        contract_for,
-    ))
+        .map_err(|error| format!("the wgpu boot config is not TOML: {error}"))
+}
+
+fn device_boot(doc: &toml::Table) -> DeviceBoot {
+    DeviceBoot {
+        adapter_index: adapter_index(doc),
+        backends: backends(doc),
+        gpu_mem_utilization: gpu_mem_utilization(doc),
+        power_preference: power_preference(doc),
+        pipeline_cache: pipeline_cache(doc),
+        device_memory: device_memory(doc),
+    }
 }
 
 fn table(doc: &toml::Table) -> Option<&toml::Table> {

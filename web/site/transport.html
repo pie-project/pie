@@ -1,0 +1,90 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>pie in the browser — transport cost</title>
+<style> body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; } pre { background: #f4f4f4; padding: 0.75rem; white-space: pre-wrap; } </style>
+<h1>transport cost: a message round trip, no GPU</h1>
+<p>The runtime boots without an engine; every number here is the client protocol alone.</p>
+<pre id="out"></pre>
+<script type="importmap">
+{ "imports": {
+    "msgpack-lite": "https://esm.sh/msgpack-lite@0.1.26",
+    "@noble/hashes/blake3.js": "https://esm.sh/@noble/hashes@2.2.0/blake3.js",
+    "@noble/hashes/utils.js": "https://esm.sh/@noble/hashes@2.2.0/utils.js"
+} }
+</script>
+<script type="module">
+  import * as pie from "./pie.mjs";
+  import { PieClient } from "./sdk/index.js";
+  import { page, loadRuntime, installInferlet } from "./harness.mjs";
+
+  const { log, params, modelUrl, finish, fail } = page();
+  const N = Number(params.get("n") ?? 200);
+  const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+
+  try {
+    await loadRuntime(params);
+    await pie.bootLazy(modelUrl, "engine = false\n");
+    const r = {};
+
+    // JSON path: pie.mjs Session, one ping round trip.
+    {
+      const s = new pie.Session();
+      await s.request({ type: "ping" });
+      const t = [];
+      for (let i = 0; i < N; i++) {
+        const t0 = performance.now();
+        await s.request({ type: "ping" });
+        t.push(performance.now() - t0);
+      }
+      s.close();
+      r.json_ping_ms = +median(t).toFixed(3);
+      log(`JSON session ping: median ${r.json_ping_ms} ms over ${N}`);
+    }
+
+    // SDK path: MessagePack frames over the in-page WebSocket shim.
+    {
+      const client = new PieClient("pie://local");
+      await client.connect();
+      await client.ping?.().catch(() => {});
+      const t = [];
+      for (let i = 0; i < N; i++) {
+        const t0 = performance.now();
+        await client._sendMsgAndWait({ type: "ping" });
+        t.push(performance.now() - t0);
+      }
+      r.sdk_ping_ms = +median(t).toFixed(3);
+      log(`SDK ping: median ${r.sdk_ping_ms} ms over ${N}`);
+      await client.close();
+    }
+
+    // Executor tick cost: an empty tick from JS.
+    {
+      const t0 = performance.now();
+      for (let i = 0; i < N; i++) await pie.tickOnce();
+      r.empty_tick_ms = +((performance.now() - t0) / N).toFixed(3);
+      log(`empty executor tick: ${r.empty_tick_ms} ms`);
+    }
+
+    // No engine was booted: a launch must be refused by name, not panic.
+    {
+      await installInferlet("text-completion");
+      const s = new pie.Session();
+      let refused;
+      try {
+        await s.request({ type: "launch_process", inferlet: "text-completion@0.1.0", input: "{}", capture_outputs: true });
+        refused = "launched?!";
+      } catch (e) {
+        refused = String(e.message ?? e);
+      }
+      await s.close();
+      r.launch_without_engine = refused.includes("no engine") ? "refused by name" : refused.slice(0, 120);
+      log(`launch without an engine: ${r.launch_without_engine}`);
+      if (r.launch_without_engine !== "refused by name") throw new Error(`launch without engine: ${refused}`);
+    }
+
+    log("RESULT " + JSON.stringify({ host: "browser", transport: r }));
+    finish(0);
+  } catch (e) {
+    fail(e);
+  }
+</script>

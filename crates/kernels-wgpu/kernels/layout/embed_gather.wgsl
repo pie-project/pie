@@ -1,4 +1,5 @@
-
+//#include "common/bf16.inc.wgsl"
+//#include "common/affine.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read> w: array<u32>;
 @group(0) @binding(1) var<storage, read> scales: array<u32>;
@@ -38,3 +39,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
 }
 
+// pie:instantiate embed_gather_mb_bf16_gs_32_b_2 PIE_GROUP=32 PIE_BITS=2 PIE_GROUP_X=256
+// pie:instantiate embed_gather_mb_bf16_gs_32_b_4 PIE_GROUP=32 PIE_BITS=4 PIE_GROUP_X=256
+// pie:instantiate embed_gather_mb_bf16_gs_32_b_8 PIE_GROUP=32 PIE_BITS=8 PIE_GROUP_X=256
+// pie:instantiate embed_gather_mb_bf16_gs_64_b_2 PIE_GROUP=64 PIE_BITS=2 PIE_GROUP_X=256
+// pie:instantiate embed_gather_mb_bf16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4 PIE_GROUP_X=256
+// pie:instantiate embed_gather_mb_bf16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8 PIE_GROUP_X=256
+// pie:instantiate embed_gather_mb_bf16_gs_128_b_2 PIE_GROUP=128 PIE_BITS=2 PIE_GROUP_X=256
+// pie:instantiate embed_gather_mb_bf16_gs_128_b_4 PIE_GROUP=128 PIE_BITS=4 PIE_GROUP_X=256
+// pie:instantiate embed_gather_mb_bf16_gs_128_b_8 PIE_GROUP=128 PIE_BITS=8 PIE_GROUP_X=256

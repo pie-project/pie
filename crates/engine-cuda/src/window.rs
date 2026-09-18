@@ -124,6 +124,11 @@ pub struct Slots {
     gathered_stride: u64,
 }
 
+#[must_use]
+pub const fn lane_capacity(max_lanes: u32) -> u32 {
+    max_lanes.saturating_mul(2)
+}
+
 impl Slots {
     #[must_use]
     pub fn new(
@@ -665,10 +670,24 @@ impl Windows {
         let held = (0..self.runs(region)).all(|run| {
             let window = self.at(region, run);
             let span = window.span();
-            span.rows == 0
+            let admitted = span.rows == 0
                 || (window.is_interval()
                     && (moves || (span.row_offset == 0 && span.rows >= total))
-                    && (span.lane_offset == 0 || finds_its_lane))
+                    && (span.lane_offset == 0 || finds_its_lane));
+            if !admitted && crate::serve::diag::on().arm_trace {
+                eprintln!(
+                    "[admit] region {region} run {run} islands: rows={} row_offset={} lanes={} \
+                     lane_offset={} of {total}, interval={}, moves={moves}, \
+                     finds_its_lane={finds_its_lane}, segments={}",
+                    span.rows,
+                    span.row_offset,
+                    span.lanes,
+                    span.lane_offset,
+                    window.is_interval(),
+                    window.segs()
+                );
+            }
+            admitted
         });
         if held { Admit::Captured } else { Admit::Island }
     }
@@ -822,6 +841,7 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], spaces: &[Geometry]) -> Win
 pub struct At {
     pub region: Cell<u32>,
     pub run: Cell<u32>,
+    pub lane: Cell<u32>,
 }
 
 impl At {
@@ -885,6 +905,7 @@ impl<'a> Cursor<'a> {
     pub fn new(place: &'a At) -> Cursor<'a> {
         place.region.set(0);
         place.run.set(0);
+        place.lane.set(0);
         Cursor {
             at: 0,
             place,
@@ -909,6 +930,7 @@ impl<'a> Cursor<'a> {
     pub fn across(place: &'a At, lanes: Lanes<'a>) -> Cursor<'a> {
         place.region.set(0);
         place.run.set(0);
+        place.lane.set(0);
         lanes.at.set(0);
         Cursor {
             at: 0,
@@ -1055,6 +1077,7 @@ impl Sink for Cursor<'_> {
     fn region_begin(&mut self, region: &Region) {
         self.place.region.set(self.at);
         self.place.run.set(0);
+        self.place.lane.set(region.stream);
         if let Some(pump) = self.pump
             && self.fault.is_none()
             && let Err(fault) = pump.rotor.at(self.at, pump.compute)

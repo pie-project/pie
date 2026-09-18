@@ -1,11 +1,12 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 use crate::api::DeviceBoot;
+use crate::encode::Mark;
 use crate::error::{Fault, Result};
 
 use super::alloc::{Memory, Raw, Slab};
+use super::host::{self, Signal};
 
 static RESERVATIONS: AtomicU64 = AtomicU64::new(0);
 
@@ -37,22 +38,31 @@ fn gate() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[must_use]
 pub fn present() -> bool {
     let _gate = gate();
     let instance = instance(wgpu::Backends::all());
-    !pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())).is_empty()
+    host::block_on(
+        "enumerate_adapters",
+        instance.enumerate_adapters(wgpu::Backends::all()),
+    )
+    .is_ok_and(|adapters| !adapters.is_empty())
 }
 
-pub(crate) const STAGING_BYTES: u64 = 256 << 20;
+/// A browser cannot ask synchronously; the real answer is the host's own
+/// `request_adapter`, and this only says the WebGPU backend is compiled in.
+#[cfg(target_arch = "wasm32")]
+#[must_use]
+pub fn present() -> bool {
+    wgpu::Instance::enabled_backend_features().contains(wgpu::Backends::BROWSER_WEBGPU)
+}
 
 pub(crate) const DUMMY_BYTES: u64 = 256;
 
 const UNIFORM_CHUNK: u64 = 1 << 20;
 
 const SCRATCH_CHUNK: u64 = 8 << 20;
-
-const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 const TIMING_QUERIES: u32 = 4096;
 
@@ -90,6 +100,8 @@ impl Timing {
         }
     }
 
+    /// Maps the resolved timestamps and records them. The map lands by
+    /// callback, so the caller parks for it the way it parks for a frame.
     fn harvest(&self, core: &Core, first: bool) {
         if self.names.is_empty() {
             return;
@@ -101,15 +113,11 @@ impl Timing {
             u64::from(self.names.len() as u32) * 16
         };
         let slice = self.readback.slice(0..bytes);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        let _ = core.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(WAIT_TIMEOUT),
-        });
-        if !matches!(rx.recv(), Ok(Ok(()))) {
+        let mapped = Signal::new();
+        let deliver = mapped.clone();
+        slice.map_async(wgpu::MapMode::Read, move |r| deliver.notify(r));
+        core.kick();
+        if !matches!(mapped.park("timestamps"), Ok(Ok(()))) {
             return;
         }
         if let Ok(view) = slice.get_mapped_range() {
@@ -149,7 +157,15 @@ pub(crate) struct Core {
     pub(crate) limits: wgpu::Limits,
     pub(crate) enabled: Enabled,
 
-    pub(crate) staging: Mutex<Option<wgpu::Buffer>>,
+    /// Staging buffers whose reads are done, destroyed at the next read: a
+    /// step's worth at a time, off the map callback. Left to a page's GC
+    /// they went by the hundred, and the queue stalled for hundreds of
+    /// milliseconds while the GPU process released them; destroyed in the
+    /// map callback itself they cost a millisecond a step.
+    pub(crate) spent: Mutex<Vec<wgpu::Buffer>>,
+
+    /// Fires the callbacks natively; nothing in a tab.
+    poller: host::Poller,
 
     pub(crate) uniforms: Mutex<Vec<wgpu::Buffer>>,
     pub(crate) scratch: Mutex<Vec<wgpu::Buffer>>,
@@ -182,30 +198,47 @@ impl Core {
         }
     }
 
-    pub(crate) fn wait_for(&self, index: &wgpu::SubmissionIndex) -> Result<()> {
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(index.clone()),
-                timeout: Some(WAIT_TIMEOUT),
-            })
-            .map_err(|e| self.fault("Device::poll", e))?;
+    /// Something was submitted or a map was asked for: native's poll thread
+    /// goes round once more, so the callbacks fire.
+    pub(crate) fn kick(&self) {
+        self.poller.kick();
+    }
+
+    /// Parks until everything submitted so far has run. The queue says so
+    /// by callback (see `host`).
+    pub(crate) fn wait_for(&self, _index: &wgpu::SubmissionIndex) -> Result<()> {
+        let done = Signal::new();
+        let landed = done.clone();
+        self.queue.on_submitted_work_done(move || landed.notify(()));
+        self.kick();
+        done.park("Device::poll")?;
         self.take_error("submission")
+    }
+
+    /// Destroys the staging buffers spent since the last call.
+    pub(crate) fn destroy_spent(&self) {
+        let spent = std::mem::take(
+            &mut *self
+                .spent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for buffer in spent {
+            buffer.destroy();
+        }
+    }
+
+    /// Keeps an unmapped staging buffer for `destroy_spent`.
+    pub(crate) fn spend(&self, buffer: wgpu::Buffer) {
+        self.spent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(buffer);
     }
 
     pub(crate) fn submit_once(&self, encoder: wgpu::CommandEncoder) -> Result<()> {
         let index = self.queue.submit(std::iter::once(encoder.finish()));
         self.wait_for(&index)
-    }
-
-    pub(crate) fn staging<'a>(&self, guard: &'a mut Option<wgpu::Buffer>) -> &'a wgpu::Buffer {
-        guard.get_or_insert_with(|| {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("pie staging"),
-                size: STAGING_BYTES,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        })
     }
 
     pub(crate) fn uniform_chunk(&self) -> wgpu::Buffer {
@@ -260,6 +293,8 @@ impl Core {
     }
 }
 
+/// Cloning shares the device: every field is a handle or a fact about it.
+#[derive(Clone)]
 pub struct Context {
     pub(crate) core: Arc<Core>,
     working_set: u64,
@@ -299,7 +334,7 @@ fn rank(kind: wgpu::DeviceType, preference: wgpu::PowerPreference) -> u8 {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
 fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>, Option<u32>) {
     use ash::vk;
     let Some(hal) = (unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }) else {
@@ -350,68 +385,144 @@ fn vulkan_facts(adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>, Option<u3
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))]
 fn vulkan_facts(_adapter: &wgpu::Adapter) -> (Option<u64>, Option<u32>, Option<u32>) {
     (None, None, None)
 }
 
-impl Context {
-    pub fn bind(boot: &DeviceBoot) -> Result<Context> {
-        let backends = boot
-            .backends
-            .as_deref()
-            .map_or(wgpu::Backends::all(), wgpu::Backends::from_comma_list);
-        let preference = match boot.power_preference.as_str() {
-            "low-power" | "low_power" => wgpu::PowerPreference::LowPower,
-            "none" => wgpu::PowerPreference::None,
-            _ => wgpu::PowerPreference::HighPerformance,
-        };
-        let _gate = gate();
-        let instance = instance(backends);
-        let mut adapters = pollster::block_on(instance.enumerate_adapters(backends));
-        adapters.sort_by_key(|a| rank(a.get_info().device_type, preference));
-        let roster: Vec<String> = adapters
-            .iter()
-            .map(|a| {
-                let i = a.get_info();
-                format!("{} ({:?}, {:?})", i.name, i.device_type, i.backend)
-            })
-            .collect();
-        if adapters.is_empty() {
-            return Err(Fault::NoDevice {
-                detail: format!("no wgpu adapter on backends {backends:?}"),
-            });
-        }
-        let adapter = adapters
-            .into_iter()
-            .nth(boot.adapter_index as usize)
-            .ok_or_else(|| Fault::NoDevice {
-                detail: format!(
-                    "no adapter at index {} (seen: {roster:?})",
-                    boot.adapter_index
-                ),
-            })?;
-        let info = adapter.get_info();
-        let offered = adapter.features();
-        let wanted = wgpu::Features::SUBGROUP
-            | wgpu::Features::SHADER_F16
-            | wgpu::Features::TIMESTAMP_QUERY
-            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-            | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
-            | wgpu::Features::PIPELINE_CACHE;
-        let features = offered & wanted;
-        let limits = adapter.limits();
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+/// An adapter and the device opened on it, whichever path asked.
+pub struct Handed {
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+}
+
+fn backends_of(boot: &DeviceBoot) -> wgpu::Backends {
+    boot.backends
+        .as_deref()
+        .map_or(wgpu::Backends::all(), wgpu::Backends::from_comma_list)
+}
+
+fn preference_of(boot: &DeviceBoot) -> wgpu::PowerPreference {
+    match boot.power_preference.as_str() {
+        "low-power" | "low_power" => wgpu::PowerPreference::LowPower,
+        "none" => wgpu::PowerPreference::None,
+        _ => wgpu::PowerPreference::HighPerformance,
+    }
+}
+
+/// The features the shell asks for, of those the adapter offers. One policy
+/// for both hosts, so a device the browser opens is the device native opens.
+#[must_use]
+pub fn wanted_features(offered: wgpu::Features) -> wgpu::Features {
+    let wanted = wgpu::Features::SUBGROUP
+        | wgpu::Features::SHADER_F16
+        | wgpu::Features::TIMESTAMP_QUERY
+        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+        | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+        | wgpu::Features::PIPELINE_CACHE;
+    offered & wanted
+}
+
+/// Opens the shell's device on `adapter`: the wanted features and every limit
+/// the adapter has.
+pub async fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)> {
+    let info = adapter.get_info();
+    adapter
+        .request_device(&wgpu::DeviceDescriptor {
             label: Some("pie"),
-            required_features: features,
-            required_limits: limits.clone(),
+            required_features: wanted_features(adapter.features()),
+            required_limits: adapter.limits(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
-        }))
+        })
+        .await
         .map_err(|e| Fault::NoDevice {
             detail: format!("request_device on {}: {e}", info.name),
-        })?;
+        })
+}
+
+/// Native enumerates and ranks, so `adapter_index` picks among what is there.
+#[cfg(not(target_arch = "wasm32"))]
+async fn request_adapter(boot: &DeviceBoot) -> Result<wgpu::Adapter> {
+    let backends = backends_of(boot);
+    let preference = preference_of(boot);
+    let instance = instance(backends);
+    let mut adapters = instance.enumerate_adapters(backends).await;
+    adapters.sort_by_key(|a| rank(a.get_info().device_type, preference));
+    let roster: Vec<String> = adapters
+        .iter()
+        .map(|a| {
+            let i = a.get_info();
+            format!("{} ({:?}, {:?})", i.name, i.device_type, i.backend)
+        })
+        .collect();
+    if adapters.is_empty() {
+        return Err(Fault::NoDevice {
+            detail: format!("no wgpu adapter on backends {backends:?}"),
+        });
+    }
+    adapters
+        .into_iter()
+        .nth(boot.adapter_index as usize)
+        .ok_or_else(|| Fault::NoDevice {
+            detail: format!(
+                "no adapter at index {} (seen: {roster:?})",
+                boot.adapter_index
+            ),
+        })
+}
+
+/// A browser has one adapter to ask for and ranks nothing.
+#[cfg(target_arch = "wasm32")]
+async fn request_adapter(boot: &DeviceBoot) -> Result<wgpu::Adapter> {
+    let _ = rank;
+    let instance = instance(backends_of(boot));
+    instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: preference_of(boot),
+            ..wgpu::RequestAdapterOptions::default()
+        })
+        .await
+        .map_err(|e| Fault::NoDevice {
+            detail: format!("request_adapter: {e}"),
+        })
+}
+
+/// Picks the adapter `boot` names and opens the shell's device on it. A page
+/// awaits this itself and hands the result to `Context::adopt`; `Context::bind`
+/// parks on it.
+pub async fn request(boot: &DeviceBoot) -> Result<Handed> {
+    let adapter = request_adapter(boot).await?;
+    let (device, queue) = request_device(&adapter).await?;
+    Ok(Handed {
+        adapter,
+        device,
+        queue,
+    })
+}
+
+impl Context {
+    /// Opens the device `boot` names, parking on the adapter and device
+    /// requests. A page off a green thread cannot park: it awaits `request`
+    /// itself and opens the engine with `open_with_device`.
+    pub fn bind(boot: &DeviceBoot) -> Result<Context> {
+        let _gate = gate();
+        let handed = host::block_on("request_device", request(boot))??;
+        Context::adopt(boot, handed)
+    }
+
+    /// Builds the shell's context on a device already opened by `request`.
+    pub fn adopt(boot: &DeviceBoot, handed: Handed) -> Result<Context> {
+        let Handed {
+            adapter,
+            device,
+            queue,
+        } = handed;
+        let info = adapter.get_info();
+        let features = device.features();
+        let limits = device.limits();
         let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         {
             let sink = Arc::clone(&last_error);
@@ -436,6 +547,7 @@ impl Context {
             pipeline_cache: features.contains(wgpu::Features::PIPELINE_CACHE),
         };
         let max_buffer = limits.max_buffer_size;
+        let poller = host::Poller::start(device.clone());
         let core = Arc::new(Core {
             device,
             queue,
@@ -443,7 +555,8 @@ impl Context {
             info,
             limits,
             enabled,
-            staging: Mutex::new(None),
+            spent: Mutex::new(Vec::new()),
+            poller,
             uniforms: Mutex::new(Vec::new()),
             scratch: Mutex::new(Vec::new()),
             last_error,
@@ -894,15 +1007,16 @@ impl Frame {
                 );
             }
         }
-        let started = std::time::Instant::now();
+        let started = Mark::now();
         let finished = encoder.finish();
-        crate::encode::record_read_phase(0, started.elapsed().as_nanos() as u64);
+        crate::encode::record_read_phase(0, started.ns());
         let index = core.queue.submit(std::iter::once(finished));
-        crate::encode::record_submit(started.elapsed().as_nanos() as u64, 0);
+        crate::encode::record_submit(started.ns(), 0);
         let inner = Arc::clone(&self.inner);
         core.queue.on_submitted_work_done(move || {
             inner.done.store(true, Ordering::Release);
         });
+        core.kick();
         *self
             .inner
             .index
@@ -920,34 +1034,40 @@ impl Frame {
     }
 
     pub fn commit_timed(mut self) -> Result<f64> {
-        let started = std::time::Instant::now();
+        let started = Mark::now();
         self.submit()?;
         Pending {
             inner: Arc::clone(&self.inner),
         }
         .wait()?;
-        Ok(started.elapsed().as_secs_f64())
+        Ok(started.secs())
     }
 
-    pub fn commit_async(
-        mut self,
-        on_done: Option<Box<dyn Fn(Option<String>) + Send + 'static>>,
-    ) -> Result<Pending> {
+    /// Submits and returns at once; `on_done` runs when the work lands, with
+    /// the refusal if it did not.
+    pub fn commit_async(mut self, on_done: Option<OnDone>) -> Result<Pending> {
         self.submit()?;
         let pending = Pending {
             inner: Arc::clone(&self.inner),
         };
         if let Some(on_done) = on_done {
-            let watched = Pending {
-                inner: Arc::clone(&self.inner),
-            };
-            std::thread::spawn(move || {
-                on_done(watched.wait().err().map(|fault| fault.to_string()));
-            });
+            self.watch(on_done);
         }
         Ok(pending)
     }
+
+    /// The queue tells `on_done` when the work has run.
+    fn watch(&self, on_done: OnDone) {
+        let inner = Arc::clone(&self.inner);
+        self.inner.core.queue.on_submitted_work_done(move || {
+            let refused = inner.core.take_error("submission").err();
+            on_done(refused.map(|fault| fault.to_string()));
+        });
+        self.inner.core.kick();
+    }
 }
+
+pub type OnDone = Box<dyn FnOnce(Option<String>) + Send + 'static>;
 
 impl Drop for Frame {
     fn drop(&mut self) {
@@ -966,32 +1086,21 @@ impl std::fmt::Debug for Pending {
 }
 
 impl Pending {
-    #[must_use]
-    pub fn landed(&self) -> bool {
-        if self.inner.done.load(Ordering::Acquire) {
-            return true;
-        }
-        let _ = self.inner.core.device.poll(wgpu::PollType::Poll);
-        self.inner.done.load(Ordering::Acquire)
-    }
-
+    /// Parks until the frame's work has run: the queue says so by callback
+    /// (see `host`), and the caller is resumed then.
     pub fn wait(&self) -> Result<()> {
-        let index = self
-            .inner
-            .index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        match index {
-            Some(index) => {
-                let started = std::time::Instant::now();
-                self.inner.core.wait_for(&index)?;
-                crate::encode::record_submit(0, started.elapsed().as_nanos() as u64);
-                crate::encode::record_wait_call();
-                self.inner.harvest();
-                Ok(())
-            }
-            None => Ok(()),
+        if !self.inner.done.load(Ordering::Acquire) {
+            let done = Signal::new();
+            let landed = done.clone();
+            self.inner
+                .core
+                .queue
+                .on_submitted_work_done(move || landed.notify(()));
+            self.inner.core.kick();
+            done.park("Pending::wait")?;
         }
+        crate::encode::record_wait_call();
+        self.inner.harvest();
+        self.inner.core.take_error("submission")
     }
 }

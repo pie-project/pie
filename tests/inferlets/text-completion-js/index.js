@@ -1,14 +1,9 @@
-// Greedy text completion, host-driven — the JavaScript twin of `text-completion`.
 //
 // Same program as `tests/inferlets/text-completion/src/lib.rs`, traced from
-// JavaScript: one chunked prefill, then a 1-wide decode loop whose ONE
-// host-driven channel is the token. The traced container is byte-identical
-// to the Rust inferlet's, so both share one program-cache entry. Host reads
-// block (`takeScalar`), since a JS guest cannot lower `async func` imports.
 
 import { chat, eta, model } from '@pie-project/inferlet';
 
-const { Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, dtype, indptr, intrinsics, kvPageSize, prefillChunks, reduceArgmax, reshape } = eta;
+const { Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, channelCapacity, dtype, indptr, intrinsics, kvPageSize, prefillChunks, reduceArgmax, reshape, runAhead } = eta;
 
 const range = (a, b) => Array.from({ length: b - a }, (_, i) => a + i);
 const divCeil = (a, b) => Math.floor((a + b - 1) / b);
@@ -68,9 +63,10 @@ export function main(input) {
   }
   generated.push(first);
 
-  // ── DECODE (1-wide, host-driven token) ────────────────────────────────
+  // ── DECODE (1-wide, device loop-carried token) ─────────────────────────
   if (generated.length < maxTokens) {
     const tokIn = Channel.from([first], dtype.i32).named('tok_in');
+    const tokOut = new Channel([1], dtype.i32).capacity(channelCapacity()).named('tok_out');
     const embedIndptr = Channel.from([0, 1], dtype.u32).named('embed_indptr');
     const positions = Channel.from([n], dtype.u32).named('positions');
     const pages = Channel.from(range(0, maxPages), dtype.u32).named('pages');
@@ -78,32 +74,31 @@ export function main(input) {
     const wSlot = Channel.from([Math.floor(n / pageSize)], dtype.u32).named('w_slot');
     const wOff = Channel.from([n % pageSize], dtype.u32).named('w_off');
     const kvLen = Channel.from([n + 1], dtype.u32).named('kv_len');
-    const tokOut = new Channel([1], dtype.i32).named('tok_out');
 
     const fwd = new ForwardPass(kind);
     fwd.embed(tokIn, embedIndptr);
-    fwd.bindState(ws, { kvLen, pages, pageIndptr, wSlot, wOff, positions }, rsWs);
+    fwd.bindState(ws, { kvLen, pages, pageIndptr, wSlot, wOff, positions, writablePages: Math.floor(n / pageSize) }, rsWs);
     fwd.epilogue(() => {
       // `length` is the readable extent this fire runs at, so it is also
       // the position the NEXT fire's token sits at.
       const length = kvLen.take();
+      const token = greedy(intrinsics.logits());
       const nextLength = length.add(1);
       const pageCount = nextLength.divCeil(pageSize);
+      tokIn.put(token);
       kvLen.put(nextLength);
       positions.put(length);
       wSlot.put(length.div(pageSize));
       wOff.put(length.rem(pageSize));
       pageIndptr.put(indptr(1, pageCount));
-      tokOut.put(greedy(intrinsics.logits()));
+      tokOut.put(token);
     });
 
-    for (;;) {
-      fwd.submit(pipe);
-      const token = tokOut.takeScalar();
-      generated.push(token);
-      if (generated.length >= maxTokens) break;
-      tokIn.put([token]);
-    }
+    const budget = maxTokens - 1;
+    runAhead(pipe, fwd, budget, () => {
+      generated.push(tokOut.takeScalar());
+      return true;
+    });
   }
   pipe.close();
 

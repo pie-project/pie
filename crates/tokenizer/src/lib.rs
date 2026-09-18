@@ -204,6 +204,12 @@ impl Tokenizer {
         loader::tiktoken::from_file(path)
     }
 
+    /// The tiktoken loader over bytes already in hand: the rank file's text
+    /// and its `tokenizer_config.json`; `label` names the rank file in errors.
+    pub fn from_tiktoken_str(ranks: &str, config_json: &[u8], label: &str) -> anyhow::Result<Self> {
+        loader::tiktoken::from_str(ranks, config_json, label)
+    }
+
     pub fn decoder(self: &Arc<Self>, skip_special: bool) -> TokenizerDecoder {
         TokenizerDecoder {
             tokenizer: self.clone(),

@@ -65,7 +65,9 @@ fn p_kind(p : u32) -> u32 { return p_at(p, 9u); }
 fn p_pred_tag(p : u32) -> u32 { return p_at(p, 10u); }
 fn p_lit_dtype(p : u32) -> u32 { return p_at(p, 11u); }
 fn p_lit_bits(p : u32) -> u32 { return p_at(p, 12u); }
-fn p_pred_payload(p : u32) -> u32 { return p_at(p, 13u); }
+// A pivot's predicate payload rides in `a1` (`OpParams::of` seats it there
+// when the op has no second argument); word 13 is the channel slot.
+fn p_pred_payload(p : u32) -> u32 { return p_a1(p); }
 fn p_dtype(p : u32) -> u32 { return p_at(p, 14u); }
 
 
@@ -430,6 +432,11 @@ const RED_ARGMAX : u32 = 3u;
 
 fn POS_INF() -> f32 { return bitcast<f32>(0x7F800000u); }
 fn NEG_INF() -> f32 { return bitcast<f32>(0xFF800000u); }
+// The literal `-0.0` folds to `+0.0` under Tint (Chrome), where a runtime
+// negation keeps its sign; the bits are read through a `var<private>` so no
+// compiler folds them (the same route `for_tint` takes for the infinities).
+var<private> pie_neg_zero_bits : u32 = 0x80000000u;
+fn NEG_ZERO() -> f32 { return bitcast<f32>(pie_neg_zero_bits); }
 
 fn cmax(l : f32, r : f32) -> f32 {
   let ln = l != l;
@@ -438,7 +445,7 @@ fn cmax(l : f32, r : f32) -> f32 {
   if (ln) { return r; }
   if (rn) { return l; }
   if (l == 0.0 && r == 0.0) {
-    if (sign_bit(l) && sign_bit(r)) { return -0.0; }
+    if (sign_bit(l) && sign_bit(r)) { return NEG_ZERO(); }
     return 0.0;
   }
   if (l > r) { return l; }
@@ -452,7 +459,7 @@ fn cmin(l : f32, r : f32) -> f32 {
   if (ln) { return r; }
   if (rn) { return l; }
   if (l == 0.0 && r == 0.0) {
-    if (sign_bit(l) || sign_bit(r)) { return -0.0; }
+    if (sign_bit(l) || sign_bit(r)) { return NEG_ZERO(); }
     return 0.0;
   }
   if (l < r) { return l; }
@@ -540,7 +547,10 @@ fn arg_takes(lv : f32, li : u32, rv : f32, ri : u32, level : u32, count : u32, l
   let rnan = rv != rv;
   if (rnan) { return false; }
   if (lnan) { return true; }
-  return rv > lv;
+  // A tie goes to the lower index, as the host reference (`argmax_row`) and
+  // the CUDA ladder decide it; lane order alone would pick whichever side of
+  // the butterfly held the tied value.
+  return rv > lv || (rv == lv && ri < li);
 }
 
 fn op_reduce_finish(p : u32, kind : u32) {
@@ -616,6 +626,61 @@ fn op_copy(p : u32) {
   }
   for (var i : u32 = tid; i < n; i = i + lanes) {
     let j = pick(na, i);
+    if (odt == DT_F32) { st_f(o, i, ld_f(a, j)); }
+    else if (odt == DT_I32) { st_i(o, i, ld_i(a, j)); }
+    else { st_u(o, i, ld_u(a, j)); }
+  }
+}
+
+// Broadcast (0x38): the source's axes align with the output's leading axes,
+// as the host reference (`broadcast_value`) and the CUDA runtime align them; a
+// source axis of extent 1 (or one the source does not have) repeats.
+fn bcast_src(a : u32, o : u32, linear : u32) -> u32 {
+  let orank = d_rank(o);
+  let arank = d_rank(a);
+  var rem : u32 = linear;
+  var src : u32 = 0u;
+  var sstride : array<u32, 4> = array<u32, 4>(1u, 1u, 1u, 1u);
+  for (var dim : i32 = i32(orank) - 2; dim >= 0; dim = dim - 1) {
+    let next = u32(dim) + 1u;
+    var sd : u32 = 1u;
+    if (next < arank) { sd = d_dim(a, next); }
+    sstride[dim] = sstride[dim + 1] * sd;
+  }
+  for (var dim : u32 = 0u; dim < orank; dim = dim + 1u) {
+    var stride : u32 = 1u;
+    for (var next : u32 = dim + 1u; next < orank; next = next + 1u) { stride = stride * d_dim(o, next); }
+    if (stride == 0u) { stride = 1u; }
+    let coord = rem / stride;
+    rem = rem % stride;
+    var sd : u32 = 1u;
+    if (dim < arank) { sd = d_dim(a, dim); }
+    if (sd != 1u) { src = src + coord * sstride[dim]; }
+  }
+  return src;
+}
+
+fn op_broadcast(p : u32) {
+  let a = p_a0(p);
+  let o = p_o0(p);
+  let n = d_len(o);
+  let odt = d_dtype(o);
+  if (odt == DT_BOOL) {
+    let words = (n + 3u) / 4u;
+    for (var w : u32 = tid; w < words; w = w + lanes) {
+      var b : array<bool, 4>;
+      for (var k : u32 = 0u; k < 4u; k = k + 1u) {
+        let i = w * 4u + k;
+        var v = false;
+        if (i < n) { v = ld_b(a, bcast_src(a, o, i)); }
+        b[k] = v;
+      }
+      st_b_word(o, w, n, b[0], b[1], b[2], b[3]);
+    }
+    return;
+  }
+  for (var i : u32 = tid; i < n; i = i + lanes) {
+    let j = bcast_src(a, o, i);
     if (odt == DT_F32) { st_f(o, i, ld_f(a, j)); }
     else if (odt == DT_I32) { st_i(o, i, ld_i(a, j)); }
     else { st_u(o, i, ld_u(a, j)); }
@@ -1317,7 +1382,7 @@ fn ptir_step(p : u32) {
     case 0x40u: { op_cumulative(p, false); }
     case 0x41u: { op_cumulative(p, true); }
 
-    case 0x38u: { op_copy(p); }
+    case 0x38u: { op_broadcast(p); }
     case 0x39u: { op_copy(p); }
     case 0x3Au: { op_transpose(p); }
 

@@ -1,0 +1,219 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>pie in the browser — host corner cases</title>
+<style> body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; } pre { background: #f4f4f4; padding: 0.75rem; white-space: pre-wrap; } </style>
+<h1>host corner cases: the things only a tab can get wrong</h1>
+<pre id="out"></pre>
+<script type="module">
+  import * as pie from "./pie.mjs";
+  import { page, loadRuntime, inferletBytes } from "./harness.mjs";
+
+  const { log, params, modelUrl, results, check, finish, fail } = page();
+
+  // Is the UI thread free? A 10 ms interval and requestAnimationFrame run
+  // while the runtime works; the longest gap between interval firings is how
+  // long the page went unresponsive (with the runtime on this thread it is
+  // the whole compile or step; in its worker it should stay near 10 ms).
+  const meter = () => {
+    const t0 = performance.now();
+    let last = t0;
+    let maxGap = 0;
+    let ticks = 0;
+    const interval = setInterval(() => {
+      const now = performance.now();
+      maxGap = Math.max(maxGap, now - last);
+      last = now;
+      ticks++;
+    }, 10);
+    let frames = 0;
+    let raf = requestAnimationFrame(function frame() { frames++; raf = requestAnimationFrame(frame); });
+    const timeline0 = document.timeline.currentTime;
+    return {
+      stop() {
+        clearInterval(interval);
+        cancelAnimationFrame(raf);
+        const ms = performance.now() - t0;
+        return { maxGapMs: +maxGap.toFixed(1), ticks, frames, timelineMs: +(document.timeline.currentTime - timeline0).toFixed(0), ms: +ms.toFixed(0) };
+      },
+    };
+  };
+  const timed = async (fn) => {
+    const m = meter();
+    try {
+      return { result: await fn(), ...m.stop() };
+    } catch (e) {
+      m.stop();
+      throw e;
+    }
+  };
+  const uiFree = (d) => d.maxGapMs < 100 && d.ticks > 0 && (d.frames > 0 || d.timelineMs > 0);
+  const fmt = (d) => `max interval gap ${d.maxGapMs} ms over ${d.ticks} ticks in ${d.ms} ms; ${d.frames} frames, timeline +${d.timelineMs} ms`;
+
+  try {
+    // `?worker=0` runs the runtime on this thread; the UI-thread checks then show what it costs.
+    const { worker } = await loadRuntime(params);
+    log(`runtime ${worker ? "in a worker" : "on the main thread"}`);
+
+    await check("lazy boot of a missing artifact URL → rejected, module still usable", async () => {
+      try {
+        await pie.bootLazy("models/no-such-model.zt", "");
+        return "booted?!";
+      } catch (e) {
+        return `rejected: ${String(e.message ?? e).slice(0, 80)}`;
+      }
+    }, (d) => d.startsWith("rejected"));
+
+    await check("launch before boot → refused, not a crash", async () => {
+      const s = new pie.Session();
+      try {
+        await s.request({ type: "launch_process", inferlet: "text-completion@0.1.0", input: "{}", capture_outputs: true });
+        return "launched?!";
+      } catch (e) {
+        return `refused: ${e.message}`;
+      } finally {
+        s.close();
+      }
+    }, (d) => d.startsWith("refused") || d.startsWith("threw"));
+
+    const summary = await pie.bootLazy(modelUrl, "");
+    log(`booted ${summary.sku}`);
+
+    await check("boot a second time in the same tab → clear refusal", async () => {
+      try {
+        await pie.bootLazy(modelUrl, "");
+        return "booted twice?!";
+      } catch (e) {
+        return `refused: ${e}`;
+      }
+    }, (d) => d.includes("single-use") || d.includes("refused"));
+
+    const { bytes: wasm, manifest } = await inferletBytes("text-completion");
+    let program = null;
+    await check("UI thread free during install", async () => {
+      const d = await timed(() => pie.install(new Uint8Array(wasm), manifest));
+      program = d.result;
+      return fmt(d);
+    }, () => program !== null);
+    if (program === null) program = await pie.install(new Uint8Array(wasm), manifest);
+    let uiChecks = [];
+    const uiCheck = async (name, fn) => {
+      let detail = null;
+      await check(name, async () => { detail = await timed(fn); return `${fmt(detail)}${worker ? "" : " (main thread: expected to block)"}`; }, () => uiFree(detail));
+      uiChecks.push(detail);
+    };
+
+    // The first launch compiles the component with Cranelift (about a second
+    // of CPU) and the first frames compile the pipelines with Tint.
+    await uiCheck("UI thread free during the first launch (Cranelift compile + pipeline compiles)", async () => {
+      const s = new pie.Session();
+      const last = await s.run(program, JSON.stringify({ prompt: "Hi", max_tokens: 2 }));
+      s.close();
+      if (last.event !== "return") throw new Error(`first run ${last.event}: ${last.value}`);
+    });
+
+    // A long generation: prefill, then 200 decode steps, each a submit and a
+    // landing callback in the runtime's thread.
+    await uiCheck("UI thread free during a 200-token generation (interval max gap well under 100 ms, rAF ticking)", async () => {
+      const s = new pie.Session();
+      const last = await s.run(program, JSON.stringify({ prompt: "The capital of France is", max_tokens: 200 }));
+      s.close();
+      const out = JSON.parse(last.value);
+      if (out.count !== 200) throw new Error(`generated ${out.count} tokens`);
+    });
+
+    await check("install the same program again (force) → same name, still runs", async () => {
+      const again = await pie.install(new Uint8Array(wasm), manifest);
+      const s = new pie.Session();
+      const last = await s.run(again, JSON.stringify({ prompt: "Hi", max_tokens: 2 }));
+      s.close();
+      return `${again}: ${last.event}`;
+    }, (d) => d === `${program}: return`);
+
+    // Installing stores bytes; compiling happens at the first launch (as it
+    // does natively), so garbage installs and then fails to launch.
+    await check("garbage bytes as a program → launch fails, runtime survives", async () => {
+      const name = await pie.install(new Uint8Array([1, 2, 3, 4]), manifest.replace('name = "text-completion"', 'name = "garbage"'));
+      const s = new pie.Session();
+      let first;
+      try {
+        first = (await s.run(name, JSON.stringify({ prompt: "Hi", max_tokens: 2 }))).event;
+      } catch (e) {
+        first = `refused (${String(e.message ?? e).slice(0, 50)})`;
+      }
+      const last = await s.run(program, JSON.stringify({ prompt: "Hi", max_tokens: 2 }));
+      s.close();
+      return `garbage launch: ${first}; next run ${last.event}`;
+    }, (d) => (d.includes("garbage launch: error") || d.includes("garbage launch: refused")) && d.endsWith("return"));
+
+    await check("send to a closed session → error", async () => {
+      const s = new pie.Session();
+      s.close();
+      try {
+        await s.send({ type: "ping", corr_id: 1 });
+        return "sent?!";
+      } catch (e) {
+        return `refused: ${e.message}`;
+      }
+    }, (d) => d.startsWith("refused"));
+
+    await check("recv on an unknown session → error", async () => {
+      try {
+        await pie.Session.prototype.recv.call({ id: 999999 }, 100, 1);
+        return "received?!";
+      } catch (e) {
+        return `refused: ${e}`;
+      }
+    }, (d) => d.startsWith("refused"));
+
+    await check("malformed client message → error, session still usable", async () => {
+      const s = new pie.Session();
+      let refused;
+      try {
+        await s.send({ type: "no_such_type" });
+        refused = "accepted?!";
+      } catch (e) {
+        refused = "refused";
+      }
+      const pong = await s.request({ type: "ping" });
+      s.close();
+      return `${refused}; ping → ${JSON.stringify(pong)}`;
+    }, (d) => d.startsWith("refused"));
+
+    await check("close a session mid-run → runtime keeps serving", async () => {
+      const s = new pie.Session();
+      await s.send({ type: "launch_process", corr_id: 1, inferlet: program, input: JSON.stringify({ prompt: "Hi", max_tokens: 300 }), capture_outputs: true });
+      await new Promise((r) => setTimeout(r, 100));
+      s.close();
+      const t = new pie.Session();
+      const last = await t.run(program, JSON.stringify({ prompt: "Hi", max_tokens: 3 }));
+      t.close();
+      return `next run ${last.event}`;
+    }, (d) => d === "next run return");
+
+    await check("20 sessions opened and closed → all answer ping", async () => {
+      let n = 0;
+      for (let i = 0; i < 20; i++) {
+        const s = new pie.Session();
+        await s.request({ type: "ping" });
+        s.close();
+        n++;
+      }
+      return `${n} sessions`;
+    }, (d) => d === "20 sessions");
+
+    await check("memory stable across 50 sessions × 1 run", async () => {
+      const before = await pie.memoryBytes();
+      for (let i = 0; i < 50; i++) {
+        const s = new pie.Session();
+        await s.run(program, JSON.stringify({ prompt: "Hi", max_tokens: 1 }));
+        s.close();
+      }
+      return `${(before / 1048576).toFixed(0)} → ${((await pie.memoryBytes()) / 1048576).toFixed(0)} MiB`;
+    }, (d) => { const [a, b] = d.match(/\d+/g).map(Number); return b - a <= 64; });
+
+    log("RESULT " + JSON.stringify({ host: "browser", worker, ui_thread: uiChecks, corners: results }));
+    finish(results.every((r) => r.ok) ? 0 : 1);
+  } catch (e) {
+    fail(e);
+  }
+</script>

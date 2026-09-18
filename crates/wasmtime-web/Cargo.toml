@@ -1,0 +1,19 @@
+[package]
+name = "wasmtime-web"
+version = "0.5.0"
+edition = "2024"
+
+[dependencies]
+wasmtime = { version = "48.0.1", default-features = false, features = [
+    "runtime",
+    "std",
+    "anyhow",
+    "async",
+    "cranelift",
+    "pulley",
+    "component-model",
+    "component-model-async",
+    "custom-fiber",
+    "custom-virtual-memory",
+] }
+cranelift-codegen = { version = "0.135.1", default-features = false }

@@ -10,5 +10,7 @@ fn sdpa_lse_base2(max_score: f32, sum_exp_score: f32) -> f32 {
     if (sum_exp_score > 0.0) {
         return max_score * PIE_SDPA_LOG2E + log2(sum_exp_score);
     }
-    return bitcast<f32>(0xff800000u);
+    // A `var`: Tint refuses a constant-folded infinity.
+    var bits = 0xff800000u;
+    return bitcast<f32>(bits);
 }

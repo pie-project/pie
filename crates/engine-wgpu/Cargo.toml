@@ -12,7 +12,6 @@ name = "engine_wgpu"
 path = "src/lib.rs"
 
 [dependencies]
-memmap2 = "0.9"
 toml = "1.1"
 model-ir = { path = "../model-ir" }
 kernels-wgpu = { path = "../kernels-wgpu" }
@@ -24,21 +23,35 @@ eta-exec = { path = "../eta-exec" }
 
 eta-compiler = { path = "../eta-compiler" }
 checkpoint = { path = "../checkpoint" }
-libc = "0.2"
 tracing = "0.1"
 
+naga = { version = "30", default-features = false, features = ["wgsl-in"], optional = true }
+
+# The native arm: wgpu over Vulkan/Metal/DX12, raw Vulkan facts through ash,
+# and files through libc/memmap2. Waits are callbacks on both hosts (see
+# `device::host`), so nothing here blocks the device.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9"
+libc = "0.2"
 wgpu = { version = "30", default-features = false, features = [
     "wgsl",
     "vulkan",
     "metal",
     "dx12",
 ], optional = true }
-pollster = { version = "0.4", optional = true }
-
-naga = { version = "30", default-features = false, features = ["wgsl-in"], optional = true }
-
 ash = { version = "0.38", default-features = false, optional = true }
+
+# The browser arm: wgpu over the tab's own WebGPU. The host is single-threaded,
+# so wgpu's web types may claim `Send + Sync` without atomics.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The engine lane is a green thread in a tab; a wait for the device parks it.
+web-rt = { path = "../web-rt" }
+wgpu = { version = "30", default-features = false, features = [
+    "wgsl",
+    "webgpu",
+    "fragile-send-sync-non-atomic-wasm",
+], optional = true }
 
 [features]
 default = []
-wgpu = ["dep:wgpu", "dep:pollster", "dep:naga", "dep:ash"]
+wgpu = ["dep:wgpu", "dep:naga", "dep:ash"]

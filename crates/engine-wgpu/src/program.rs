@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
+use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel, Ticket};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value};
 use eta_ir::registry::{GeometryClass, Port};
@@ -13,20 +14,391 @@ pub enum Refusal {
     Program(String),
 }
 
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Closed { what, id } => write!(f, "{what} {id} is closed"),
+            Refusal::Program(why) => f.write_str(why),
+        }
+    }
+}
+
 impl From<String> for Refusal {
     fn from(why: String) -> Refusal {
         Refusal::Program(why)
     }
 }
 
+/// A bound instance as the engine lane sees it: the host's view of its rings
+/// and, on a device, the half that runs its passes.
+///
+/// The two halves share the rings themselves (`Arc<ChannelState>`), so a
+/// pass's puts are what the host takes next; only the interpreter's
+/// `poisoned` flag lives in each `InterpInstance`, and the device half
+/// raises it for the host through `poisoned`. Keeping the device half apart
+/// is what lets the browser run a pass off the lane (from a step's landing)
+/// while the lane keeps binding, publishing and taking.
 struct Instance {
     program: ProgramId,
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
     geometry: GeometryClass,
 
+    /// The bind's channel ids, in the program's dense order.
+    channels: Vec<ChannelId>,
+
+    /// Raised by the device half when one of its passes faults.
+    poisoned: Arc<AtomicBool>,
+
     #[cfg(feature = "wgpu")]
+    half: Arc<std::sync::Mutex<Half>>,
+
+    /// Held while this instance's pass is queued behind a step still
+    /// airborne; a fire that reads its envelope waits on it.
+    #[cfg(feature = "wgpu")]
+    gate: Arc<Gate>,
+}
+
+impl Instance {
+    /// The host's `InterpInstance`, with the device half's poisoning
+    /// reflected.
+    fn host(&mut self) -> &InterpInstance {
+        if self.poisoned.load(Ordering::Acquire) {
+            self.inst.poisoned = true;
+        }
+        &self.inst
+    }
+}
+
+/// Passes counted: on the device, and on the host interpreter (tests).
+#[derive(Default)]
+pub(crate) struct Tally {
+    device: AtomicU64,
+    interpreted: AtomicU64,
+}
+
+/// The device half of an instance: what a pass on the device reads and
+/// writes, owned by whoever runs the pass (the lane natively, the landing
+/// worker in the browser).
+#[cfg(feature = "wgpu")]
+pub(crate) struct Half {
+    id: InstanceId,
+    program: ProgramId,
+    plan: Arc<ExecPlan>,
+    inst: InterpInstance,
     session: crate::guest::session::Session,
+    poisoned: Arc<AtomicBool>,
+}
+
+/// One pass's inputs: the host-side rows, and the readout seat the pass
+/// widens on the device when it reads the logits.
+#[cfg(feature = "wgpu")]
+pub(crate) struct Pass<'a> {
+    pub logits: Option<&'a [f32]>,
+    pub rows: u32,
+    pub vocab: u32,
+    pub mtp_logits: Option<&'a [f32]>,
+    pub mtp_width: u32,
+    pub readout: Option<crate::guest::run::Readout<'a>>,
+}
+
+#[cfg(feature = "wgpu")]
+impl Half {
+    /// Runs one pass on the device. Blocks (natively) or parks (a green
+    /// thread in the browser) on the stage's readback.
+    pub(crate) fn fire(
+        &mut self,
+        device: &crate::device::Context,
+        widen: &crate::guest::widen::Widen,
+        tally: &Tally,
+        pass: Pass<'_>,
+    ) -> Result<(), Refusal> {
+        let instance = self.id;
+        if self.plan.needs_logits && pass.readout.is_none() {
+            return Err(Refusal::Program(format!(
+                "instance {instance} reads logits, but its lane offered no readout seat"
+            )));
+        }
+        if let Some(values) = pass.mtp_logits
+            && pass.mtp_width != pass.vocab
+        {
+            return Err(Refusal::Program(format!(
+                "instance {instance} reads a draft column {} wide against a \
+                 {}-wide trunk readout ({} draft values); this shell reads both at \
+                 one pitch",
+                pass.mtp_width,
+                pass.vocab,
+                values.len()
+            )));
+        }
+        let inputs = PassInputs {
+            logits: pass.logits,
+            mtp_logits: pass.mtp_logits,
+            rows: pass.rows,
+            vocab: pass.vocab,
+
+            mtp_draft_row: pass.mtp_logits.map(|_| 0),
+            attn_score: None,
+        };
+        let mut runner =
+            crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.readout);
+        let outcome = eta_exec::step_with(&mut self.inst, &self.plan, &inputs, &mut runner);
+        let ran = runner.ran().len();
+        if self.inst.poisoned {
+            self.poisoned.store(true, Ordering::Release);
+        }
+        if ran > 0 && tally.device.fetch_add(1, Ordering::AcqRel) == 0 {
+            tracing::info!(stages = ran, "a guest pass dispatched on the device");
+        }
+        let program = self.program;
+        match outcome {
+            StepOutcome::Committed => Ok(()),
+            StepOutcome::Blocked(channel) => Err(Refusal::Program(format!(
+                "instance {instance} (program {program}) blocked on channel {channel}"
+            ))),
+            StepOutcome::Faulted(why) => Err(Refusal::Program(format!(
+                "instance {instance} (program {program}) faulted: {why}"
+            ))),
+        }
+    }
+}
+
+/// Where the engine lane waits for an instance's queued passes: they run
+/// from the step's landing, and a next fire that reads the
+/// instance's envelope (a device-carried loop) must see their puts first.
+/// Only the lane ever parks here, so one waker slot is enough.
+#[cfg(feature = "wgpu")]
+#[derive(Default)]
+pub(crate) struct Gate {
+    inner: std::sync::Mutex<(u32, Option<std::task::Waker>)>,
+}
+
+#[cfg(feature = "wgpu")]
+impl Gate {
+    fn enter(self: &Arc<Self>) -> Held {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0 += 1;
+        Held {
+            gate: Arc::clone(self),
+        }
+    }
+
+    /// Passes of the instance queued behind steps still airborne.
+    fn airborne(&self) -> u32 {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+    }
+
+    fn leave(&self) {
+        let waker = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.0 = inner.0.saturating_sub(1);
+            if inner.0 == 0 { inner.1.take() } else { None }
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Parks the engine lane until no pass of the instance is queued.
+    fn settle(&self, instance: InstanceId) -> Result<(), Refusal> {
+        let airborne = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+        if airborne == 0 {
+            return Ok(());
+        }
+        tracing::debug!(instance, "fire parks until the instance's guest pass ran");
+        crate::device::host::block_on_poll("guest gate", |cx| {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.0 == 0 {
+                std::task::Poll::Ready(())
+            } else {
+                inner.1 = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        })
+        .map_err(|_| {
+            Refusal::Program(format!(
+                "instance {instance} has a guest pass in flight, and waiting for it off the \
+                 engine lane would stall the host"
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+/// One entry into a gate, left when dropped — whether the pass ran, faulted
+/// or never started.
+#[cfg(feature = "wgpu")]
+pub(crate) struct Held {
+    gate: Arc<Gate>,
+}
+
+#[cfg(feature = "wgpu")]
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.gate.leave();
+    }
+}
+
+/// A step's attached passes, taken off the lane to run from the step's
+/// landing. Owns clones of all it needs, so the landing
+/// worker never reaches the plane.
+#[cfg(feature = "wgpu")]
+pub struct Guests {
+    device: crate::device::Context,
+    widen: Arc<crate::guest::widen::Widen>,
+    tally: Arc<Tally>,
+    policies: Vec<engine::fire::Readout>,
+    attached: Vec<Attached>,
+}
+
+#[cfg(feature = "wgpu")]
+struct Attached {
+    lane: u32,
+    /// How many lanes of the step the instance serves, from `lane` on: a
+    /// pass reads all of their rows as one rectangle.
+    lanes: usize,
+    half: Arc<std::sync::Mutex<Half>>,
+    held: Held,
+}
+
+/// One attached pass, ready to run on any green thread: it owns its lane's
+/// rows and readout seat, and leaves its gate when it returns.
+#[cfg(feature = "wgpu")]
+pub(crate) type Job = Box<dyn FnOnce() -> Result<(), Refusal> + Send + 'static>;
+
+#[cfg(feature = "wgpu")]
+impl Guests {
+    /// Splits the step's passes into one job per attachment. Each instance's
+    /// device half is its own and the widen takes its config from the job's
+    /// frame, so the jobs may run at once: their stages then queue back to
+    /// back on the device and their readbacks land together.
+    pub(crate) fn jobs(
+        self,
+        rows: &[Vec<f32>],
+        drafts: &[Vec<f32>],
+        seat: &crate::device::Buffer,
+        layout: &[(u32, u32)],
+        out_width: u32,
+        mtp_width: u32,
+    ) -> Vec<Job> {
+        let Guests {
+            device,
+            widen,
+            tally,
+            policies,
+            attached,
+        } = self;
+        let mut readouts: Vec<Option<engine::fire::LaneReadout>> =
+            crate::api::lane_readouts(&policies, rows)
+                .into_iter()
+                .map(Some)
+                .collect();
+        attached
+            .into_iter()
+            .map(
+                |Attached {
+                     lane,
+                     lanes,
+                     half,
+                     held,
+                 }| {
+                    let at = lane as usize;
+                    let span = at..(at + lanes).min(readouts.len());
+                    // The instance's lanes, end to end: one readout of every row.
+                    let readout = {
+                        let mut joined: Option<engine::fire::LaneReadout> = None;
+                        for lane in span.clone() {
+                            let Some(next) = readouts.get_mut(lane).and_then(Option::take) else {
+                                continue;
+                            };
+                            match joined.as_mut() {
+                                None => joined = Some(next),
+                                Some(joined) => {
+                                    joined.rows += next.rows;
+                                    joined.values.extend(next.values);
+                                }
+                            }
+                        }
+                        joined
+                    };
+                    let mtp: Option<Vec<f32>> = (mtp_width > 0)
+                        .then(|| {
+                            span.clone()
+                                .filter_map(|lane| drafts.get(lane))
+                                .flat_map(|values| values.iter().copied())
+                                .collect::<Vec<f32>>()
+                        })
+                        .filter(|values| !values.is_empty());
+                    // The rows on the device, when the lanes sit end to end in the seat.
+                    let on_device = {
+                        let entries: Vec<(u32, u32)> = span
+                            .clone()
+                            .filter_map(|lane| layout.get(lane).copied())
+                            .collect();
+                        let contiguous = entries
+                            .windows(2)
+                            .all(|pair| pair[0].0 + pair[0].1 == pair[1].0);
+                        let count: u32 = entries.iter().map(|&(_, count)| count).sum();
+                        (contiguous && count > 0).then(|| {
+                            (
+                                u64::from(entries[0].0) * u64::from(out_width) * 2,
+                                count * out_width,
+                            )
+                        })
+                    };
+                    let seat = seat.clone();
+                    let device = device.clone();
+                    let widen = Arc::clone(&widen);
+                    let tally = Arc::clone(&tally);
+                    let job: Job = Box::new(move || {
+                        let _held = held;
+                        let (logits, rows, vocab) = match &readout {
+                            Some(lane) if lane.rows > 0 => {
+                                (Some(lane.values.as_slice()), lane.rows, lane.width)
+                            }
+                            _ => (None, 0, 0),
+                        };
+                        let readout = on_device.map(|(at, width)| crate::guest::run::Readout {
+                            seat: &seat,
+                            at,
+                            width,
+                        });
+                        half.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .fire(
+                                &device,
+                                &widen,
+                                &tally,
+                                Pass {
+                                    logits,
+                                    rows,
+                                    vocab,
+                                    mtp_logits: mtp.as_deref(),
+                                    mtp_width,
+                                    readout,
+                                },
+                            )
+                    });
+                    job
+                },
+            )
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -41,9 +413,14 @@ pub struct Plane {
     next_instance: u64,
 
     #[cfg(feature = "wgpu")]
-    widen: Option<crate::guest::widen::Widen>,
+    widen: Option<Arc<crate::guest::widen::Widen>>,
 
-    tally: (u64, u64),
+    /// Each program's device code, built at its first bind and shared by
+    /// every session of it.
+    #[cfg(feature = "wgpu")]
+    codes: BTreeMap<ProgramId, Arc<crate::guest::session::Code>>,
+
+    tally: Arc<Tally>,
 }
 
 impl Plane {
@@ -95,13 +472,28 @@ impl Plane {
             numel,
             registration.capacity.max(1) as usize,
         ));
+        // A channel the host reads or writes is published as it is: the ring
+        // already lives in host memory in the runtime's own layout (cells of
+        // `cap1` slots, then the head, tail, poison and closed words), so the
+        // runtime reads a device pass's puts straight from it, the way it
+        // reads a CUDA endpoint's pinned mirror, and needs no pump to learn a
+        // loop-carried value before the next fire. A device-only channel
+        // stays private, as on CUDA.
+        let mirror = (registration.host_role != eta_ir::container::HostRole::None
+            && registration.capacity > 0)
+            .then(|| HostMirror {
+                mirror: ring.cells_ptr() as u64,
+                words: ring.words_ptr() as u64,
+                cell_bytes: u32::try_from(ring.cell_bytes()).unwrap_or(u32::MAX),
+                capacity: registration.capacity,
+            });
         self.channels.insert(registration.id, ring);
         Ok(RegisteredChannel {
             id: registration.id,
 
             reader_wait_id: 0,
             writer_wait_id: 0,
-            mirror: None,
+            mirror,
         })
     }
 
@@ -173,15 +565,27 @@ impl Plane {
         })?;
         self.next_instance += 1;
         let id = self.next_instance;
+        let poisoned = Arc::new(AtomicBool::new(false));
         self.instances.insert(
             id,
             Instance {
                 program: binding.program,
+                #[cfg(feature = "wgpu")]
+                half: Arc::new(std::sync::Mutex::new(Half {
+                    id,
+                    program: binding.program,
+                    plan: Arc::clone(&plan),
+                    inst: inst.clone(),
+                    session,
+                    poisoned: Arc::clone(&poisoned),
+                })),
+                #[cfg(feature = "wgpu")]
+                gate: Arc::default(),
                 plan,
                 inst,
                 geometry: binding.geometry,
-                #[cfg(feature = "wgpu")]
-                session,
+                channels: binding.channels.clone(),
+                poisoned,
             },
         );
         Ok(BoundInstance {
@@ -189,6 +593,69 @@ impl Plane {
             program: binding.program,
             geometry: binding.geometry,
         })
+    }
+
+    /// The first of `tickets` that disagrees with where the instance's
+    /// channels stand, as a sentence. A ticket predicts a channel's head
+    /// (what the pass takes from) and tail (what it puts to); the engine
+    /// answers from the ring, moved past every pass still queued behind an
+    /// airborne step by that pass's declared takes and puts.
+    #[must_use]
+    pub fn disagreeing_ticket(&self, instance: InstanceId, tickets: &[Ticket]) -> Option<String> {
+        let seat = self.instances.get(&instance)?;
+        #[cfg(feature = "wgpu")]
+        let airborne = u64::from(seat.gate.airborne());
+        #[cfg(not(feature = "wgpu"))]
+        let airborne = 0u64;
+        for ticket in tickets {
+            let Some(dense) = seat.channels.iter().position(|id| *id == ticket.channel) else {
+                return Some(format!(
+                    "instance {instance} predicted about channel {}, which it does not carry",
+                    ticket.channel
+                ));
+            };
+            let Some(ring) = seat.inst.channels.get(dense) else {
+                return Some(format!(
+                    "instance {instance} carries channel {} as its {dense}th, past its rings",
+                    ticket.channel
+                ));
+            };
+            let (takes, puts) =
+                seat.plan
+                    .package
+                    .stages
+                    .iter()
+                    .fold((0u64, 0u64), |(takes, puts), stage| {
+                        (
+                            takes
+                                + stage.takes.iter().filter(|&&c| c as usize == dense).count()
+                                    as u64,
+                            puts + stage
+                                .puts
+                                .iter()
+                                .filter(|p| p.channel as usize == dense)
+                                .count() as u64,
+                        )
+                    });
+            let head = ring.head() + airborne * takes;
+            let tail = ring.tail() + airborne * puts;
+            let stated = |claim: u64, held: u64, end: &str| {
+                (claim != Ticket::NONE && claim != held).then(|| {
+                    format!(
+                        "instance {instance}'s channel {} stands at {end} {held} and the caller \
+                         predicted {claim}",
+                        ticket.channel
+                    )
+                })
+            };
+            if let Some(why) = stated(ticket.expected_head, head, "head") {
+                return Some(why);
+            }
+            if let Some(why) = stated(ticket.expected_tail, tail, "tail") {
+                return Some(why);
+            }
+        }
+        None
     }
 
     #[must_use]
@@ -228,7 +695,13 @@ impl Plane {
         else {
             return Ok(None);
         };
+        #[cfg(feature = "wgpu")]
+        seat.gate.settle(instance)?;
         let ring = &seat.inst.channels[binding.channel as usize];
+        #[cfg(feature = "wgpu")]
+        if ring.is_empty() {
+            self.settle_writers(seat.channels[binding.channel as usize])?;
+        }
         if ring.is_empty() {
             return Err(Refusal::Program(format!(
                 "instance {instance}: the `rs_fold_len` ring is empty at the fire"
@@ -251,10 +724,24 @@ impl Plane {
         })
     }
 
+    /// Parks until every airborne pass of any instance bound to `channel`
+    /// has landed: a ring another program's epilogue fills (a prefill
+    /// seeding the decode's loop-carried token) is read here at the fire.
+    #[cfg(feature = "wgpu")]
+    fn settle_writers(&self, channel: ChannelId) -> Result<(), Refusal> {
+        for (&id, seat) in &self.instances {
+            if seat.gate.airborne() > 0 && seat.channels.contains(&channel) {
+                seat.gate.settle(id)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn envelope_tokens(
         &self,
         instance: InstanceId,
         rows: usize,
+        lane_at: usize,
     ) -> Result<Option<Vec<u32>>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
@@ -275,7 +762,15 @@ impl Plane {
                     seat.geometry
                 ))
             })?;
+        // A device-carried step reads the token the previous step's pass put;
+        // the browser may still have that pass queued behind its landing.
+        #[cfg(feature = "wgpu")]
+        seat.gate.settle(instance)?;
         let ring = &seat.inst.channels[binding.channel as usize];
+        #[cfg(feature = "wgpu")]
+        if ring.is_empty() {
+            self.settle_writers(seat.channels[binding.channel as usize])?;
+        }
         if ring.is_empty() {
             return Err(Refusal::Program(format!(
                 "instance {instance}: the `embed_tokens` ring is empty at the fire"
@@ -291,13 +786,81 @@ impl Plane {
                 )));
             }
         };
-        if ids.len() != rows {
+        let span = self.lane_span(seat, instance, "embed_tokens", ids.len(), rows, lane_at)?;
+        Ok(Some(ids[span].to_vec()))
+    }
+
+    /// How many lanes of a step the instance serves: the spans its program's
+    /// `embed_indptr` port names (one when the port is absent).
+    pub fn lane_count(&self, instance: InstanceId) -> Result<usize, Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance,
+        })?;
+        Ok(self.embed_indptr(seat).len().saturating_sub(1).max(1))
+    }
+
+    /// The program's `embed_indptr` port as read now: a constant, or its
+    /// channel's front; empty when the port is absent.
+    fn embed_indptr(&self, seat: &Instance) -> Vec<u32> {
+        match seat
+            .plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == Port::EmbedIndptr)
+        {
+            Some(binding) if binding.is_const => seat
+                .plan
+                .const_ports
+                .iter()
+                .find(|c| c.port == Port::EmbedIndptr)
+                .map(|c| match &c.value {
+                    Value::U32(v) => v.clone(),
+                    Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default(),
+            Some(binding) => match seat.inst.channels[binding.channel as usize].front() {
+                Value::U32(v) => v,
+                Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        }
+    }
+
+    /// Which of a channel's cells belong to the `lane_at`th lane of the
+    /// instance in this fire: all of them when the instance serves one lane,
+    /// else the lane's span of the program's `embed_indptr` port (a constant
+    /// or a channel of its own).
+    fn lane_span(
+        &self,
+        seat: &Instance,
+        instance: InstanceId,
+        what: &str,
+        cells: usize,
+        rows: usize,
+        lane_at: usize,
+    ) -> Result<std::ops::Range<usize>, Refusal> {
+        if lane_at == 0 && cells == rows {
+            return Ok(0..rows);
+        }
+        let indptr = self.embed_indptr(seat);
+        let (Some(&start), Some(&end)) = (indptr.get(lane_at), indptr.get(lane_at + 1)) else {
             return Err(Refusal::Program(format!(
-                "instance {instance}: `embed_tokens` carries {} id(s) for a lane of {rows} row(s)",
-                ids.len()
+                "instance {instance}: `{what}` carries {cells} cell(s) for lane {lane_at} of \
+                 {rows} row(s), and the program's `embed_indptr` ({indptr:?}) does not place it"
+            )));
+        };
+        let (start, end) = (start as usize, end as usize);
+        if end < start || end > cells || end - start != rows {
+            return Err(Refusal::Program(format!(
+                "instance {instance}: `{what}` places lane {lane_at} at {start}..{end} of \
+                 {cells} cell(s), and the lane has {rows} row(s)"
             )));
         }
-        Ok(Some(ids))
+        Ok(start..end)
     }
 
     pub fn publish(
@@ -323,7 +886,8 @@ impl Plane {
                 decl.shape
             ))
         })?;
-        match eta_exec::host_put(&seat.inst, &seat.plan, channel, &value) {
+        let plan = Arc::clone(&seat.plan);
+        match eta_exec::host_put(seat.host(), &plan, channel, &value) {
             HostOp::Ok => Ok(true),
             HostOp::WouldBlock => Ok(false),
             HostOp::Poisoned => Err(Refusal::Program(format!("instance {instance} is poisoned"))),
@@ -343,7 +907,8 @@ impl Plane {
                 "instance {instance} carries no channel {channel}"
             )));
         }
-        match eta_exec::host_take(&seat.inst, &seat.plan, channel) {
+        let plan = Arc::clone(&seat.plan);
+        match eta_exec::host_take(seat.host(), &plan, channel) {
             (HostOp::Ok, Some(value)) => {
                 let mut bytes = vec![0u8; eta_exec::wire_cell_bytes(value.dtype(), value.len())];
                 eta_exec::encode_wire(&value, &mut bytes);
@@ -362,8 +927,123 @@ impl Plane {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn fire(
+    /// Takes a step's attached passes off the lane, to run from the step's
+    /// landing: each instance's gate is entered here and left once its pass
+    /// ran (or the guests were dropped unrun).
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn deferred(
+        &self,
+        device: &crate::device::Context,
+        attachments: impl IntoIterator<Item = (InstanceId, u32)>,
+        policies: Vec<engine::fire::Readout>,
+    ) -> Result<Guests, Refusal> {
+        let mut attached = Vec::new();
+        for (instance, lane) in attachments {
+            let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+                what: "instance",
+                id: instance,
+            })?;
+            attached.push(Attached {
+                lane,
+                lanes: self.embed_indptr(seat).len().saturating_sub(1).max(1),
+                half: Arc::clone(&seat.half),
+                held: seat.gate.enter(),
+            });
+        }
+        let widen = self.widen.as_ref().ok_or_else(|| {
+            Refusal::Program(
+                "a step attaches instances, and the plane built no readout widen".to_owned(),
+            )
+        })?;
+        Ok(Guests {
+            device: device.clone(),
+            widen: Arc::clone(widen),
+            tally: Arc::clone(&self.tally),
+            policies,
+            attached,
+        })
+    }
+
+    /// The attention mask the instance's program binds to a channel, read
+    /// from that ring at the fire for a device-resolved envelope: a bool
+    /// rectangle of one row per token of the fire and the keys along the
+    /// row, given to the engine as the run-length masks a host-evaluated
+    /// mask would be. `None` when the program binds no mask channel.
+    pub fn envelope_mask(
+        &self,
+        instance: InstanceId,
+        rows: usize,
+        lane_at: usize,
+    ) -> Result<Option<engine::fire::Masking>, Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance,
+        })?;
+        if !seat.geometry.ports().contains(Port::EmbedTokens) {
+            return Ok(None);
+        }
+        let Some(binding) = seat
+            .plan
+            .package
+            .ports
+            .iter()
+            .find(|binding| binding.port == Port::AttnMask && !binding.is_const)
+        else {
+            return Ok(None);
+        };
+        #[cfg(feature = "wgpu")]
+        seat.gate.settle(instance)?;
+        let ring = &seat.inst.channels[binding.channel as usize];
+        #[cfg(feature = "wgpu")]
+        if ring.is_empty() {
+            self.settle_writers(seat.channels[binding.channel as usize])?;
+        }
+        if ring.is_empty() {
+            return Err(Refusal::Program(format!(
+                "instance {instance}: the `attn_mask` ring is empty at the fire"
+            )));
+        }
+        let Value::Bool(cells) = ring.front() else {
+            return Err(Refusal::Program(format!(
+                "instance {instance}: `attn_mask` holds {:?}, not bools",
+                ring.front().dtype()
+            )));
+        };
+        let keys = seat
+            .plan
+            .package
+            .channels
+            .get(binding.channel as usize)
+            .and_then(|decl| decl.shape.last().copied())
+            .map_or(0, |keys| keys as usize);
+        if keys == 0 || cells.len() % keys != 0 {
+            return Err(Refusal::Program(format!(
+                "instance {instance}: `attn_mask` holds {} cell(s) over {keys} key(s)",
+                cells.len()
+            )));
+        }
+        let span = self.lane_span(
+            seat,
+            instance,
+            "attn_mask",
+            cells.len() / keys,
+            rows,
+            lane_at,
+        )?;
+        let masks: Vec<engine::fire::Mask> = cells[span.start * keys..span.end * keys]
+            .chunks_exact(keys)
+            .map(|row| engine::fire::Mask::new(runs_of(row), keys as u64))
+            .collect();
+        Ok(Some(match masks.as_slice() {
+            [only] => engine::fire::Masking::Extent(only.clone()),
+            _ => engine::fire::Masking::Rows(masks),
+        }))
+    }
+
+    #[doc(hidden)]
+    /// Runs one pass of `instance` on the host interpreter, for tests: an
+    /// attached guest runs on the device (`fire`) on every host.
+    pub fn fire_interpreted(
         &mut self,
         instance: InstanceId,
         logits: Option<&[f32]>,
@@ -371,48 +1051,18 @@ impl Plane {
         vocab: u32,
         mtp_logits: Option<&[f32]>,
         mtp_width: u32,
-        #[cfg(feature = "wgpu")] device: Option<&crate::device::Context>,
-        #[cfg(feature = "wgpu")] readout: Option<crate::guest::run::Readout<'_>>,
     ) -> Result<(), Refusal> {
-        let Plane {
-            instances,
-            tally,
-            #[cfg(feature = "wgpu")]
-            widen,
-            ..
-        } = self;
-        let seat = instances.get_mut(&instance).ok_or(Refusal::Closed {
+        let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance,
         })?;
-
-        #[cfg(feature = "wgpu")]
-        let device_half = match (device, widen.is_some()) {
-            (Some(device), true) => device,
-            (None, _) => {
-                return Err(Refusal::Program(format!(
-                    "instance {instance} has a device half, but the shell offered no device"
-                )));
-            }
-            (_, false) => {
-                return Err(Refusal::Program(format!(
-                    "instance {instance} has a device half, but the plane built no readout widen"
-                )));
-            }
-        };
-
-        #[cfg(feature = "wgpu")]
-        if seat.plan.needs_logits && readout.is_none() {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads logits, but its lane offered no readout seat"
-            )));
-        }
-
         if let Some(values) = mtp_logits
             && mtp_width != vocab
         {
             return Err(Refusal::Program(format!(
-                "instance {instance} reads a draft column {mtp_width} wide against a                  {vocab}-wide trunk readout ({} draft values); this shell reads both at                  one pitch",
+                "instance {instance} reads a draft column {mtp_width} wide against a \
+                 {vocab}-wide trunk readout ({} draft values); this shell reads both at \
+                 one pitch",
                 values.len()
             )));
         }
@@ -421,73 +1071,11 @@ impl Plane {
             mtp_logits,
             rows,
             vocab,
-
             mtp_draft_row: mtp_logits.map(|_| 0),
             attn_score: None,
         };
-
-        #[cfg(feature = "wgpu")]
-        let (outcome, ran) = {
-            let widen = widen.as_ref().expect("the device arm checked for one");
-            let session = &mut seat.session;
-            let mut runner = crate::guest::run::OnDevice::new(device_half, session, widen, readout);
-            let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner);
-            let ran = runner.ran().len();
-            widen.disarm();
-            (outcome, ran)
-        };
-
-        #[cfg(not(feature = "wgpu"))]
-        return {
-            let _ = (&inputs, tally, seat);
-            Err(Refusal::Program(format!(
-                "instance {instance}: this build carries no wgpu device, so a guest pass has nowhere to run"
-            )))
-        };
-
-        #[cfg(feature = "wgpu")]
-        {
-            if ran > 0 {
-                if tally.0 == 0 {
-                    tracing::info!(stages = ran, "a guest pass dispatched on the device");
-                }
-                tally.0 += 1;
-            }
-            let program = seat.program;
-            match outcome {
-                StepOutcome::Committed => Ok(()),
-                StepOutcome::Blocked(channel) => Err(Refusal::Program(format!(
-                    "instance {instance} (program {program}) blocked on channel {channel}"
-                ))),
-                StepOutcome::Faulted(why) => Err(Refusal::Program(format!(
-                    "instance {instance} (program {program}) faulted: {why}"
-                ))),
-            }
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn fire_interpreted(
-        &mut self,
-        instance: InstanceId,
-        logits: Option<&[f32]>,
-        rows: u32,
-        vocab: u32,
-    ) -> Result<(), Refusal> {
-        let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
-            what: "instance",
-            id: instance,
-        })?;
-        let inputs = PassInputs {
-            logits,
-            mtp_logits: None,
-            rows,
-            vocab,
-            mtp_draft_row: None,
-            attn_score: None,
-        };
         let outcome = eta_exec::step(&mut seat.inst, &seat.plan, &inputs);
-        self.tally.1 += 1;
+        self.tally.interpreted.fetch_add(1, Ordering::AcqRel);
         let program = seat.program;
         match outcome {
             StepOutcome::Committed => Ok(()),
@@ -528,7 +1116,7 @@ impl Plane {
 
         if self.widen.is_none() {
             match crate::guest::widen::Widen::new(device) {
-                Ok(widen) => self.widen = Some(widen),
+                Ok(widen) => self.widen = Some(Arc::new(widen)),
                 Err(why) => return Err(format!("the readout widen did not build: {why}")),
             }
         }
@@ -541,13 +1129,27 @@ impl Plane {
             query_len: binding.extents.query_len,
             key_len: binding.extents.key_len,
         };
-        crate::guest::session::Session::new(device, &plan.package.plans, compiled.all(), &extents)
+        let code = match self.codes.get(&binding.program) {
+            Some(code) => Arc::clone(code),
+            None => {
+                let code = Arc::new(
+                    crate::guest::session::Code::new(device, compiled.all())
+                        .map_err(|why| format!("its device code did not build: {why}"))?,
+                );
+                self.codes.insert(binding.program, Arc::clone(&code));
+                code
+            }
+        };
+        crate::guest::session::Session::new(device, &plan.package.plans, code, &extents)
             .map_err(|why| format!("its device half did not build: {why}"))
     }
 
     #[must_use]
     pub fn tally(&self) -> (u64, u64) {
-        self.tally
+        (
+            self.tally.device.load(Ordering::Acquire),
+            self.tally.interpreted.load(Ordering::Acquire),
+        )
     }
 
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {
@@ -583,4 +1185,31 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
         Dtype::F32 => Value::F32(words().map(f32::from_le_bytes).collect()),
         _ => return None,
     })
+}
+
+/// A bool row as the run lengths the runtime's masks carry: alternating
+/// runs of `false` and `true`, starting with `false` (a leading zero when the
+/// row opens with `true`).
+fn runs_of(row: &[u8]) -> Vec<u32> {
+    let mut runs = Vec::new();
+    let mut current = false;
+    let mut count = 0u32;
+    if row.first().is_some_and(|&cell| cell != 0) {
+        runs.push(0);
+        current = true;
+    }
+    for &cell in row {
+        let value = cell != 0;
+        if value == current {
+            count += 1;
+        } else {
+            runs.push(count);
+            current = value;
+            count = 1;
+        }
+    }
+    if !row.is_empty() {
+        runs.push(count);
+    }
+    runs
 }

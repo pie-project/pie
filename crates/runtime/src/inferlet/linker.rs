@@ -102,11 +102,20 @@ impl Linker {
         variant: LinkerVariant,
     ) -> Result<WasmLinker<ProcessCtx>> {
         let mut linker = WasmLinker::<ProcessCtx>::new(engine);
+        #[cfg(target_arch = "wasm32")]
+        let _ = policy;
 
+        #[cfg(target_arch = "wasm32")]
+        wasmtime_wasi::add_to_linker(&mut linker).expect("Failed to link WASI");
+
+        #[cfg(not(target_arch = "wasm32"))]
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
+        #[cfg(not(target_arch = "wasm32"))]
         wasmtime_wasi::p3::add_to_linker(&mut linker).expect("Failed to link WASI p3");
+        #[cfg(not(target_arch = "wasm32"))]
         wasmtime_wasi_http::p3::add_to_linker(&mut linker).expect("Failed to link WASI HTTP p3");
 
+        #[cfg(not(target_arch = "wasm32"))]
         {
             let mut root = linker.root();
             let mut random = root
@@ -121,6 +130,7 @@ impl Linker {
                 .expect("Failed to shim get-insecure-seed");
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         if policy.network.allow {
             wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
                 .expect("Failed to link WASI HTTP");
@@ -330,7 +340,7 @@ impl ServiceHandler for Linker {
                 let policy = self.policy.clone();
                 let base_cache = Arc::clone(&self.base_linker_cache);
                 let pre_cache = Arc::clone(&self.instance_pre_cache);
-                tokio::task::spawn(async move {
+                crate::rt::spawn(async move {
                     let result = Linker::instantiate(
                         engine,
                         policy,

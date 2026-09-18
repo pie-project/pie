@@ -121,6 +121,26 @@ impl ChannelState {
         self.capacity
     }
 
+    #[must_use]
+    pub fn cell_bytes(&self) -> usize {
+        self.cell_bytes
+    }
+
+    /// The cells as a raw address: `cap1` slots of `cell_bytes`, never
+    /// reallocated, so an engine may publish it as the ring's host mirror.
+    /// A reader that took the tail word (`Acquire`) sees the cells published
+    /// before it (`push` stores the tail `Release`).
+    #[must_use]
+    pub fn cells_ptr(&self) -> *const u8 {
+        self.cells.lock().expect(POISONED).as_ptr()
+    }
+
+    /// The four words (head, tail, poison, closed) as a raw address.
+    #[must_use]
+    pub fn words_ptr(&self) -> *const AtomicU64 {
+        self.words.as_ptr()
+    }
+
     fn slot_range(&self, sequence: u64) -> std::ops::Range<usize> {
         let base = (sequence % self.cap1 as u64) as usize * self.cell_bytes;
         base..base + self.cell_bytes

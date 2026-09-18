@@ -1,7 +1,9 @@
-
+//#include "common/bf16.inc.wgsl"
+//#include "common/reduce.inc.wgsl"
 
 const PIE_DMAX = 256u;
 
+//#if defined(PIE_COMMITTED)
 @group(0) @binding(0) var<storage, read> mixed: array<u32>;
 @group(0) @binding(1) var<storage, read> indptr: array<i32>;
 @group(0) @binding(2) var<storage, read> replay: array<i32>;
@@ -30,7 +32,7 @@ fn st_get(i: u32) -> f32 {
 fn st_set(i: u32, v: f32) {
     work[i] = v;
 }
-
+//#elif defined(PIE_CHUNKED)
 @group(0) @binding(0) var<storage, read> mixed: array<u32>;
 @group(0) @binding(1) var<storage, read> indptr: array<i32>;
 @group(0) @binding(2) var<storage, read> f: array<u32>;
@@ -48,7 +50,7 @@ struct Params {
     gate_floor: f32,
 }
 @group(0) @binding(9) var<uniform> params: Params;
-
+//#else
 @group(0) @binding(0) var<storage, read> mixed: array<u32>;
 @group(0) @binding(1) var<storage, read> f: array<u32>;
 @group(0) @binding(2) var<storage, read> b: array<u32>;
@@ -65,18 +67,24 @@ struct Params {
     gate_floor: f32,
 }
 @group(0) @binding(8) var<uniform> params: Params;
-
+//#endif
+//#if !defined(PIE_COMMITTED)
 fn st_get(i: u32) -> f32 {
     return rstate[i];
 }
 fn st_set(i: u32, v: f32) {
     rstate[i] = v;
 }
-
+//#endif
 
 var<workgroup> sq: array<f32, PIE_DMAX>;
 var<workgroup> sk: array<f32, PIE_DMAX>;
 var<workgroup> sg: array<f32, PIE_DMAX>;
+// Values read from storage that steer control flow around a barrier are
+// made workgroup-uniform through `workgroupUniformLoad`: Tint (Chrome's WGSL
+// front end) cannot see that every invocation reads the same word, and it
+// refuses a barrier under a branch it cannot prove uniform.
+var<workgroup> pie_uniform: vec4<i32>;
 
 fn load_mixed(i: u32) -> f32 {
     return pie_bf16_at(mixed[i >> 1u], i);
@@ -152,22 +160,28 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     let d = u32(params.head_dim);
     let cells = d * d;
     let heads = u32(params.heads);
-
+//#if defined(PIE_COMMITTED)
     let r = group.z;
     let lane0 = u32(params.lane0);
     var begin = indptr[r];
     for (var j = 0u; j < r; j = j + 1u) {
         begin = begin + replay[lane0 + j];
     }
-    let span = (indptr[r + 1u] - indptr[r]) + replay[lane0 + r];
+    let span_word = (indptr[r + 1u] - indptr[r]) + replay[lane0 + r];
+    let slot_word = slots[lane0 + r];
+    if (tid == 0u) {
+        pie_uniform = vec4<i32>(span_word, slot_word, min(commit[lane0 + r], span_word), 0);
+    }
+    let uniform_words = workgroupUniformLoad(&pie_uniform);
+    let span = uniform_words.x;
+    let slot = uniform_words.y;
+    let keep = uniform_words.z;
     if (span <= 0) {
         return;
     }
-    let slot = slots[lane0 + r];
     if (slot < 0) {
         return;
     }
-    let keep = min(commit[lane0 + r], span);
     let bank = (u32(slot) * heads + h) * cells;
     let state_base = ((lane0 + r) * heads + h) * cells;
     for (var i = tid; i < cells; i = i + u32(PIE_GROUP_X)) {
@@ -183,10 +197,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
             workgroupBarrier();
         }
     }
-
+//#elif defined(PIE_CHUNKED)
     let r = group.z;
-    let begin = indptr[r];
-    let end = indptr[r + 1u];
+    if (tid == 0u) {
+        pie_uniform = vec4<i32>(indptr[r], indptr[r + 1u], 0, 0);
+    }
+    let uniform_words = workgroupUniformLoad(&pie_uniform);
+    let begin = uniform_words.x;
+    let end = uniform_words.y;
     if (end <= begin) {
         return;
     }
@@ -194,10 +212,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     for (var t = begin; t < end; t = t + 1) {
         token(tid, u32(t), h, state_base);
     }
-
+//#else
     let n = group.z;
     let state_base = (slots[n] * heads + h) * cells;
     token(tid, n, h, state_base);
-
+//#endif
 }
 
+// pie:instantiate kda_step_bf16 PIE_GROUP_X=128
+// pie:instantiate kda_chunked_bf16 PIE_GROUP_X=128 PIE_CHUNKED=1
+// pie:instantiate kda_committed_bf16 PIE_GROUP_X=128 PIE_COMMITTED=1

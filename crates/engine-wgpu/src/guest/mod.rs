@@ -79,10 +79,41 @@ fn every_op_emits(stage: usize, plan: &LaunchStagePlan) -> Result<(), Refused> {
 
 pub fn step_source(stage: usize, plan: &LaunchStagePlan) -> Result<wgsl::Stepwise, Refused> {
     every_op_emits(stage, plan)?;
-    wgsl::emit_launch_steps(ENTRY, plan).map_err(|why| Refused::Emitting {
+    let mut stepwise = wgsl::emit_launch_steps(ENTRY, plan).map_err(|why| Refused::Emitting {
         stage,
         why: why.to_string(),
-    })
+    })?;
+    stepwise.source = for_tint(stepwise.source);
+    tracing::trace!(source = %stepwise.source, "guest stage source");
+    Ok(stepwise)
+}
+
+/// Tint folds `bitcast<f32>(0xFF800000u)` at compile time and refuses the
+/// infinity it folds to, where naga is content to leave it be. Reading the
+/// bits through a `var<private>` makes the same bitcast a runtime expression
+/// for both.
+fn for_tint(source: String) -> String {
+    const FOLDED: [(&str, &str, &str); 2] = [
+        (
+            "bitcast<f32>(0x7F800000u)",
+            "bitcast<f32>(pie_pos_inf_bits)",
+            "var<private> pie_pos_inf_bits : u32 = 0x7F800000u;\n",
+        ),
+        (
+            "bitcast<f32>(0xFF800000u)",
+            "bitcast<f32>(pie_neg_inf_bits)",
+            "var<private> pie_neg_inf_bits : u32 = 0xFF800000u;\n",
+        ),
+    ];
+    let mut out = source;
+    let mut header = String::new();
+    for (folded, read, decl) in FOLDED {
+        if out.contains(folded) {
+            out = out.replace(folded, read);
+            header.push_str(decl);
+        }
+    }
+    header + &out
 }
 
 pub struct Compiled {
@@ -191,9 +222,29 @@ impl Forms {
     }
 }
 
+// The on-device guest path waits on its stages: native blocks on the device,
+// the browser parks the engine lane (see `device::park`).
 #[cfg(feature = "wgpu")]
 pub mod run;
 #[cfg(feature = "wgpu")]
 pub mod session;
 #[cfg(feature = "wgpu")]
 pub mod widen;
+
+/// Builds pipelines under a validation scope and reports what was refused.
+/// Popping the scope waits on the device, so the caller parks for it; one
+/// that cannot park (a page off a green thread) gets the refusal as text.
+#[cfg(feature = "wgpu")]
+pub(crate) fn validated<T>(
+    core: &crate::device::ctx::Core,
+    what: &'static str,
+    build: impl FnOnce() -> T,
+) -> std::result::Result<T, String> {
+    let scope = core.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let built = build();
+    match crate::device::host::block_on(what, scope.pop()) {
+        Ok(Some(error)) => Err(error.to_string()),
+        Ok(None) => Ok(built),
+        Err(fault) => Err(fault.to_string()),
+    }
+}

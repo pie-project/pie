@@ -4,7 +4,8 @@ use crate::arena::Arena;
 use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::exports::{
-    Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes,
+    Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes, plain_of,
+    schedule_streams,
     media_classes, regions_lane_shifting, regions_launching_schedules, regions_shifting,
 };
 use crate::inputs::Inputs;
@@ -75,6 +76,60 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
+    if boot.knobs.diagnostics.arm_trace {
+        let mut streams: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+        for (at, region) in compiled.template().iter().enumerate() {
+            let op = boot
+                .trace
+                .nodes
+                .get(region.nodes.start as usize)
+                .map_or("?", |node| model_ir::Operands::name(&node.op));
+            if op.starts_with("attention.") {
+                streams
+                    .entry(region.stream)
+                    .or_default()
+                    .push(format!("r{at}:{}:{:?}", op.trim_start_matches("attention."), region.mask.iter().collect::<Vec<_>>()));
+            }
+        }
+        for (stream, regions) in &streams {
+            eprintln!("[arm-trace] attention regions on stream {stream}: {}", regions.join(" "));
+        }
+        let (at, slots) = compiled.arena.peak();
+        eprintln!(
+            "[arm-trace] budget: max_tokens {} max_lanes {} buckets {:?}",
+            boot.budget.max_tokens, boot.budget.max_lanes, boot.budget.buckets
+        );
+        eprintln!(
+            "[arm-trace] arena prefix for {} readouts: {} MiB",
+            boot.budget.max_lanes,
+            compiled.arena.prefix_for(u64::from(boot.budget.max_lanes)) >> 20
+        );
+        eprintln!(
+            "[arm-trace] arena reserved {} MiB (live bound {} MiB), peak at node {at}: {} slots, {} MiB",
+            compiled.arena.bytes >> 20,
+            compiled.arena.live_bound() >> 20,
+            slots.len(),
+            slots.iter().map(|(_, _, _, bytes)| *bytes).sum::<u64>() >> 20
+        );
+        for (value, span, offset, bytes) in slots.iter().take(16) {
+            let what = match &boot.trace.values[value.0 as usize].def {
+                model_ir::Def::Op(node) => model_ir::Operands::name(&boot.trace.nodes[*node as usize].op).to_string(),
+                other => format!("{other:?}").chars().take(20).collect(),
+            };
+            let rows = match &compiled.arena.placements[value.0 as usize] {
+                model_compiler::arena::Placement::Arena { rows, width, dtype, .. } => format!("{rows:?} x {width} {dtype:?}"),
+                _ => String::new(),
+            };
+            eprintln!(
+                "[arm-trace]   value {} {what}: {} MiB at {} MiB, live nodes {}..{} [{rows}]",
+                value.0,
+                bytes >> 20,
+                offset >> 20,
+                span.first,
+                span.last
+            );
+        }
+    }
     Ok(Baked {
         device,
         compiled,
@@ -151,6 +206,15 @@ impl Shell {
         let corrected = corrected_classes(&boot.trace, &compiled);
         let landing = landing_requests(boot.classify, &compiled.classes);
         let decoding = decoding_of(&landing);
+        let tiers = crate::record::Tiers {
+            plain: plain_of(&landing),
+            wide: landing
+                .iter()
+                .enumerate()
+                .filter(|(_, requests)| !requests.is_empty())
+                .map(|(class, _)| class as u32)
+                .collect(),
+        };
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
@@ -175,6 +239,9 @@ impl Shell {
             paging,
         )?;
 
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!("[arm-trace] device free {} MiB before weights", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+        }
         let mut weights = Weights::resident(
             &boot.trace,
             boot.contract,
@@ -189,9 +256,17 @@ impl Shell {
             decode_dense,
             boot.deferred_tier,
         )?;
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!("[arm-trace] device free {} MiB after weights resident", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+        }
         crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
         weights.rotate(&boot.trace, &compiled)?;
-        let arena = Arena::reserve(&compiled.arena)?;
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!("[arm-trace] device free {} MiB after rotate", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+        }
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!("[arm-trace] device free {} MiB after weights", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+        }
         let pools = Pools::reserve(
             device.ordinal(),
             boot.knobs.gpu_mem_utilization,
@@ -199,7 +274,16 @@ impl Shell {
             paging,
             &facts,
         )?;
-        let buffers = Buffers::reserve(&boot.trace, paging)?;
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!("[arm-trace] device free {} MiB after pools", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+        }
+        let buffers = Buffers::reserve(&boot.trace, paging, &pools)?;
+        let mut pools = pools;
+        let mut arena = Arena::reserve(&compiled.arena, &pools)?;
+        arena.ensure(
+            &mut pools,
+            compiled.arena.prefix_for(u64::from(boot.budget.max_lanes)),
+        )?;
         let predicate = crate::store::rs::Predicate::reserve(boot.budget.max_lanes)?;
         let spaces = boot
             .trace
@@ -277,6 +361,9 @@ impl Shell {
                 ),
             });
         }
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!("[arm-trace] device free {} MiB after buffers", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+        }
         let inputs = Inputs::reserve(
             &boot.budget,
             paging,
@@ -294,6 +381,7 @@ impl Shell {
             &feeds.seats(),
             feeds.selections.len(),
             !masked.is_empty(),
+            &schedule_streams(&boot.trace, &compiled),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
@@ -319,6 +407,9 @@ impl Shell {
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;
         pools.watch(airborne.clone());
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!("[arm-trace] device free {} MiB after inputs", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+        }
         let readout_rows = crate::device::Buffer::zeroed(
             (boot.budget.max_lanes as usize)
                 .saturating_mul(boot.budget.max_tokens as usize)
@@ -356,6 +447,7 @@ impl Shell {
             adapter_fact,
             corrected,
             decoding,
+            tiers,
             landing,
             classify: boot.classify,
             armed: None,
@@ -371,7 +463,6 @@ impl Shell {
             graphs: boot.graphs,
             copies: boot.knobs.copies,
             pad: boot.knobs.pad(),
-            golden: boot.knobs.golden(),
             golden_arm: Golden::Off,
             bodies: boot.knobs.bodies(),
             bodies_mem: (boot.knobs.bodies_mem() as usize).saturating_mul(1 << 20),
@@ -426,6 +517,9 @@ impl Shell {
                  eagerly (~470 kernel launches of host time per decode step) with nothing \
                  captured; leave the key unstated to serve them"
             );
+        }
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!("[arm-trace] device free {} MiB before arming", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
         }
         shell.arm_bodies()?;
         if boot.world.rank != 0 {

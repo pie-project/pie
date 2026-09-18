@@ -8,14 +8,15 @@ pub(crate) use ctx::OutputMode;
 pub use ctx::ProcessCtx;
 pub(crate) use residency::ProcessResidency;
 
+use crate::rt::Instant;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::rt::JoinHandle;
 use anyhow::{Result, anyhow};
 use tokio::sync::{Semaphore, oneshot};
-use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 type SharedResultTx = Arc<Mutex<Option<oneshot::Sender<Result<String, String>>>>>;
@@ -535,7 +536,7 @@ impl Process {
             capture_outputs,
             result_tx.clone(),
         );
-        let handle = tokio::spawn(task);
+        let handle = crate::rt::spawn(task);
 
         Process {
             process_id,
@@ -665,7 +666,9 @@ impl Process {
         }
         if crate::planner::trace_enabled() {
             println!(
-                "[process t_us={} pid={}] guest finished ok={} restart_requested={}",
+                "[process t_us={} pid={}] guest finished ok={} restart_requested={} \
+                 admission_wait_us={admission_wait_us} instantiate_us={instantiate_us} \
+                 wasm_run_us={wasm_run_us}",
                 crate::scheduler::fire_timing_now_us(),
                 process_id,
                 result.is_ok(),

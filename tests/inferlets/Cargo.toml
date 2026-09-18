@@ -55,6 +55,7 @@ members = [
     "prefill-rows",
     "context-aware-decoding",
     "sampling-primitives",
+    "sort-probe",
     "sliding-window-attention",
     "snapkv-eviction",
     "tail-free-sampling",
