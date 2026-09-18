@@ -146,15 +146,23 @@ pub fn tool_names(tools: &[String]) -> Option<String> {
     Some(names.join(" | "))
 }
 
-pub const JSON_GRAMMAR: &str = r#"json-object ::= "{" json-members? "}"
-json-members ::= json-pair ("," json-pair)*
-json-pair ::= json-string ":" json-value
+/// The JSON value production every tool grammar in this crate ends with.
+///
+/// `json-char` bars U+0000-U+001F, as RFC 8259 §7 does: a raw control
+/// character the grammar let through would be a call `serde_json` refuses.
+/// `ws` sits where RFC 8259 §2 allows insignificant whitespace — around the
+/// structural characters and nowhere else — so a model that writes `: ` or a
+/// newline between tokens keeps a legal token rather than running to budget.
+pub const JSON_GRAMMAR: &str = r#"json-object ::= "{" ws (json-members ws)? "}"
+json-members ::= json-pair (ws "," ws json-pair)*
+json-pair ::= json-string ws ":" ws json-value
 json-value ::= json-string | json-number | json-object | json-array | "true" | "false" | "null"
 json-string ::= "\"" json-chars "\""
 json-chars ::= json-char*
-json-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
+json-char ::= [^"\\\x00-\x1F] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
-json-array ::= "[" (json-value ("," json-value)*)? "]"
+json-array ::= "[" ws (json-value (ws "," ws json-value)* ws)? "]"
+ws ::= [ \t\n\r]*
 "#;
 
 impl Instruct for ChatMLInstruct {
