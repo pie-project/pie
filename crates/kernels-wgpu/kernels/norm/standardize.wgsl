@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read_write> out_: array<u32>;
 @group(0) @binding(1) var<storage, read> bias: array<u32>;
@@ -32,3 +32,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// pie:instantiate standardize_bf16

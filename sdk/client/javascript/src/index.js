@@ -65,7 +65,17 @@ function hashBytes(bytes) {
  * It is a SUGGESTION off the wire: run it through `fileName()` before joining
  * it to a directory.
  */
-export class ReceivedFile extends Buffer {
+const Bytes = globalThis.Buffer ?? Uint8Array;
+
+function concatBytes(chunks) {
+    if (globalThis.Buffer) return Buffer.concat(chunks);
+    const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+    let at = 0;
+    for (const c of chunks) { out.set(c, at); at += c.length; }
+    return out;
+}
+
+export class ReceivedFile extends Bytes {
     /**
      * @param {Buffer} data The file's bytes.
      * @param {string|null} name The name the inferlet suggested, or null.
@@ -165,9 +175,13 @@ export const Instance = Process;
 export class PieClient {
     /**
      * @param {string} serverUri The WebSocket server URI (e.g., "ws://127.0.0.1:8080").
+     * @param {{ WebSocket?: typeof WebSocket }} [options] `WebSocket`: the socket
+     *   class to connect with (default the global one); an in-page transport
+     *   such as @pie-project/web's passes its own.
      */
-    constructor(serverUri) {
+    constructor(serverUri, { WebSocket: Socket = globalThis.WebSocket } = {}) {
         this.serverUri = serverUri;
+        this.Socket = Socket;
         this.ws = null;
         this.corrIdCounter = 0;
         this.pendingRequests = new Map();
@@ -187,7 +201,7 @@ export class PieClient {
      * @returns {Promise<void>}
      */
     connect() {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        if (this.ws && this.ws.readyState === this.Socket.OPEN) {
             return Promise.resolve();
         }
         if (this.connectionPromise) {
@@ -196,7 +210,7 @@ export class PieClient {
 
         this.connectionPromise = new Promise((resolve, reject) => {
             try {
-                this.ws = new WebSocket(this.serverUri);
+                this.ws = new this.Socket(this.serverUri);
                 this.ws.binaryType = 'blob';
 
                 this.ws.onopen = () => {
@@ -301,7 +315,7 @@ export class PieClient {
 
         if (chunk_index === total_chunks - 1) {
             this.pendingDownloads.delete(file_hash);
-            const completeData = Buffer.concat(download.buffer);
+            const completeData = concatBytes(download.buffer);
             const computedHash = hashBytes(completeData);
             if (computedHash === file_hash && this.processEventQueues.has(download.processId)) {
                 const file = ReceivedFile.wrap(completeData, download.name);
@@ -315,7 +329,7 @@ export class PieClient {
      */
     async close() {
         return new Promise((resolve) => {
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            if (!this.ws || this.ws.readyState !== this.Socket.OPEN) {
                 this._rejectPendingRequests(new Error("WebSocket connection closed."));
                 resolve();
                 return;
@@ -351,7 +365,7 @@ export class PieClient {
      */
     _sendMsgAndWait(msg) {
         return new Promise((resolve, reject) => {
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            if (!this.ws || this.ws.readyState !== this.Socket.OPEN) {
                 return reject(new Error("WebSocket is not connected."));
             }
             const corr_id = this._getNextCorrId();
@@ -370,7 +384,7 @@ export class PieClient {
 
     /** @private */
     async _sendMsg(msg) {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        if (!this.ws || this.ws.readyState !== this.Socket.OPEN) {
             throw new Error("WebSocket is not connected.");
         }
         const encoded = msgpack.encode(msg);

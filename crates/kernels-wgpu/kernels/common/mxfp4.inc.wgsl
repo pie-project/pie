@@ -25,7 +25,8 @@ fn pie_mxfp4_code(word: u32, i: u32) -> f32 {
 
 fn pie_mxfp4_block_scale(code: u32) -> f32 {
     if (code == 0xffu) {
-        return bitcast<f32>(0x7fc00000u);
+        var nan_bits = 0x7fc00000u;
+        return bitcast<f32>(nan_bits);
     }
     return ldexp(1.0, i32(code) - 127);
 }

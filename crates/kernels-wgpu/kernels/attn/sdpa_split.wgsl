@@ -1,13 +1,13 @@
-
+//#include "common/bf16.inc.wgsl"
 
 const PIE_SPLIT_NEG_INF: f32 = -3.0e38;
 
 @group(0) @binding(0) var<storage, read> part_o: array<u32>;
 @group(0) @binding(1) var<storage, read> part_lse: array<f32>;
 @group(0) @binding(2) var<storage, read_write> o_out: array<u32>;
-
+//#if defined(PIE_LSE)
 @group(0) @binding(3) var<storage, read_write> lse_out: array<f32>;
-
+//#endif
 
 struct Params {
     head_dim: i32,
@@ -15,11 +15,11 @@ struct Params {
     rows: i32,
     splits: i32,
 }
-
+//#if defined(PIE_LSE)
 @group(0) @binding(4) var<uniform> params: Params;
-
+//#else
 @group(0) @binding(3) var<uniform> params: Params;
-
+//#endif
 
 fn finite_(x: f32) -> bool {
     return abs(x) < 3.0e38;
@@ -47,11 +47,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (top == PIE_SPLIT_NEG_INF) {
         o_out[(col * u32(params.head_dim) + d) >> 1u] = pie_pack_bf16(0.0, 0.0);
-
+//#if defined(PIE_LSE)
         if (d == 0u) {
-            lse_out[col] = bitcast<f32>(0xff800000u);
+            var neg_inf_bits = 0xff800000u;
+            lse_out[col] = bitcast<f32>(neg_inf_bits);
         }
-
+//#endif
         return;
     }
 
@@ -72,10 +73,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let inv = select(1.0 / total, 1.0, total == 0.0);
     o_out[(col * u32(params.head_dim) + d) >> 1u] = pie_pack_bf16(lo * inv, hi * inv);
-
+//#if defined(PIE_LSE)
     if (d == 0u) {
         lse_out[col] = top + log2(total);
     }
-
+//#endif
 }
 
+// pie:instantiate sdpa_split_fold_bf16 PIE_GROUP_X=256
+// pie:instantiate sdpa_split_fold_lse_bf16 PIE_GROUP_X=256 PIE_LSE=1

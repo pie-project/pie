@@ -28,7 +28,7 @@ pub(crate) async fn register_channel(
     plan: ChannelRegistration,
 ) -> Result<Arc<ChannelEndpoint>> {
     let handle = scheduler_handle(engine_idx)?;
-    let result = handle.register_channel(engine_idx, plan.clone()).await;
+    let result = handle.register_channel(plan.clone()).await;
     match result {
         Ok(channel) => {
             let closer_handle = handle.clone();
@@ -48,7 +48,7 @@ pub(crate) async fn register_channels(
         return Ok(Vec::new());
     }
     let handle = scheduler_handle(engine_idx)?;
-    match handle.register_channels(engine_idx, plans.clone()).await {
+    match handle.register_channels(plans.clone()).await {
         Ok(channels) => {
             let closer_handle = handle.clone();
             let closer: crate::engine::ChannelCloser =
@@ -135,7 +135,7 @@ pub(crate) async fn register_channels_bind_classified(
         extents,
     );
     match handle
-        .register_channels_bind(pipeline_id, engine_idx, plans, program, bind)
+        .register_channels_bind(pipeline_id, plans, program, bind)
         .await
     {
         Ok((channels, bound)) => {

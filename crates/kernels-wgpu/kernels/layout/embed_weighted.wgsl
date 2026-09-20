@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read> ids: array<i32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
@@ -37,3 +37,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     y[(n * hidden + u32(c)) >> 1u] = pie_pack_bf16(lo, hi);
 }
 
+// pie:instantiate embed_weighted_bf16 PIE_GROUP_X=256

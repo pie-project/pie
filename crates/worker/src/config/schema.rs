@@ -145,10 +145,14 @@ fn walk(
             format!("{prefix}.{}", field.name)
         };
         let nested = if field.ty == "toml::Table" {
-            let Some(inner) = options_struct(engine) else {
-                continue;
-            };
-            Some(inner.to_owned())
+            if field.name != "options" {
+                None
+            } else {
+                let Some(inner) = options_struct(engine) else {
+                    continue;
+                };
+                Some(inner.to_owned())
+            }
         } else {
             let inner = field
                 .ty
@@ -231,6 +235,32 @@ mod tests {
         schema_covers_exactly_the_settable_keys();
         the_summary_stops_at_the_blank_doc_line();
         a_derived_field_has_no_default_to_print();
+        a_free_form_table_is_a_leaf_not_the_options_struct();
+    }
+
+    fn a_free_form_table_is_a_leaf_not_the_options_struct() {
+        for engine in [
+            EngineKind::CudaNative,
+            EngineKind::Metal,
+            EngineKind::Vulkan,
+            EngineKind::Wgpu,
+        ] {
+            let keys = keys(engine);
+            assert!(
+                keys.iter().all(|k| !k.contains(".tuning.")),
+                "{}: a table recursed: {keys:?}",
+                engine.as_str()
+            );
+        }
+        let tuning: Vec<String> = keys(EngineKind::Metal)
+            .into_iter()
+            .filter(|k| k.ends_with(".tuning"))
+            .collect();
+        assert_eq!(
+            tuning.len(),
+            1,
+            "metal lists its tuning table once: {tuning:?}"
+        );
     }
 
     fn schema_covers_exactly_the_settable_keys() {

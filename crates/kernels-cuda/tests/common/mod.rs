@@ -4,7 +4,7 @@ use core::ffi::c_void;
 
 use kernels_cuda::cudarc::cublas::sys as blas;
 use kernels_cuda::cudarc::runtime::sys as rt;
-use kernels_cuda::jit::Ctx;
+use kernels_cuda::jit::{Ctx, Slabs};
 
 fn check(code: rt::cudaError, call: &str) {
     assert_eq!(
@@ -16,6 +16,7 @@ fn check(code: rt::cudaError, call: &str) {
 
 pub struct Gpu {
     stream: rt::cudaStream_t,
+    slabs: Slabs,
     device: Vec<*mut c_void>,
     cublas: blas::cublasHandle_t,
 }
@@ -45,8 +46,11 @@ impl Gpu {
                 blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
                 "`cublasSetStream_v2` did not bind the test's stream"
             );
+            let slabs = Slabs::open();
+            slabs.attach(stream.cast());
             Self {
                 stream,
+                slabs,
                 device: Vec::new(),
                 cublas,
             }
@@ -56,7 +60,7 @@ impl Gpu {
     pub fn ctx(&self) -> Ctx {
         // SAFETY: the stream outlives every fire in a test, and `Gpu`'s drop
         // synchronizes before destroying it.
-        unsafe { Ctx::on(self.stream.cast()).with_cublas(self.cublas.cast()) }
+        unsafe { Ctx::on(self.stream.cast()).with_cublas(self.cublas.cast()).with_slabs(self.slabs) }
     }
 
     pub fn zeros(&mut self, bytes: usize) -> u64 {

@@ -47,7 +47,6 @@ pub enum Recording {
     Off,
     Shaped,
     Bodies {
-        golden: bool,
         mem_megabytes: u32,
     },
 }
@@ -55,7 +54,6 @@ pub enum Recording {
 impl Default for Recording {
     fn default() -> Recording {
         Recording::Bodies {
-            golden: true,
             mem_megabytes: DEFAULT_BODIES_MEGABYTES,
         }
     }
@@ -70,11 +68,6 @@ impl Recording {
     #[must_use]
     pub fn bodies(self) -> bool {
         matches!(self, Recording::Bodies { .. })
-    }
-
-    #[must_use]
-    pub fn golden(self) -> bool {
-        matches!(self, Recording::Bodies { golden: true, .. })
     }
 
     #[must_use]
@@ -125,11 +118,6 @@ impl Knobs {
     }
 
     #[must_use]
-    pub fn golden(&self) -> bool {
-        self.recording.golden()
-    }
-
-    #[must_use]
     pub fn bodies_mem(&self) -> u32 {
         self.recording.bodies_mem()
     }
@@ -159,7 +147,7 @@ pub enum Golden {
 
 pub const DEFAULT_GPU_MEM_UTILIZATION: f64 = 0.90;
 
-pub const DEFAULT_BODIES_MEGABYTES: u32 = 2048;
+pub const DEFAULT_BODIES_MEGABYTES: u32 = 4096;
 
 pub struct Boot<'a> {
     pub classify: model_ir::ClassifyFn,

@@ -359,7 +359,7 @@ fn denoise_step(
 /// `clip` is `[h*w, channels]` in raster order and the timestep's sinusoid
 /// is appended to EVERY row, because the arm reads one packed rectangle:
 /// the CUDA shell seats one voxel width a fire and refuses a lane that
-/// feeds two (`IMAGEGEN_CONTRACT.md` §6). The model text splits the
+/// feeds two. The model text splits the
 /// columns back apart (`super::model::port::LATENT_VOXELS`).
 fn voxel_arm(
     case: &Case,

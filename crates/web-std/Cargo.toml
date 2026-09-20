@@ -1,0 +1,18 @@
+[package]
+name = "web-std"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The runtime substrate a browser tab offers pie: a single-threaded executor the page ticks, timers over performance.now(), a channel whose blocking receive parks a green thread, and green threads on wasmtime's fibers. Stands in for tokio's runtime, std::thread and crossbeam on wasm32."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "web_std"
+path = "src/lib.rs"
+
+[dependencies]
+slab = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasmtime-fiber = { version = "=48.0.1", package = "wasmtime-internal-fiber", features = ["custom", "std"] }

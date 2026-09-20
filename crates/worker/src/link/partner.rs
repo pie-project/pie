@@ -22,7 +22,6 @@ pub(crate) struct PartnerBootstrap {
     pub transfer: crate::config::OffloadTransfer,
     pub model_idx: usize,
     pub page_size: u32,
-    pub request_timeout_secs: u64,
     pub max_outstanding: u32,
 }
 
@@ -195,14 +194,6 @@ fn finish_cleanup(worker_id: WorkerId, link: PartnerLink, model_idx: usize) {
         return;
     };
     runtime::offload::close_engine_surrogates(engine_id);
-    if let Err(error) = runtime::scheduler::stop_engine(engine_id) {
-        tracing::warn!(
-            partner = %worker_id,
-            engine_id,
-            %error,
-            "stopping remote scheduler"
-        );
-    }
     if let Err(error) = runtime::offload::unregister_remote_store(model_idx, engine_id) {
         tracing::warn!(
             partner = %worker_id,

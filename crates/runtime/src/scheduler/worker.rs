@@ -1,7 +1,8 @@
+use crate::rt::Instant;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ::engine::{ChannelRegistration, ProgramRegistration, StateCopy};
 
@@ -17,6 +18,9 @@ use super::batch::{self, AdmissionLimits};
 use super::frame::{self, FramePlan, FramePolicy, FrameStamp};
 use super::stats::{self, SchedulerStats};
 
+use super::lane::{ControlReplyRx, Lane, LaneCommit, LaunchReplyRx, LaunchResult};
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeaveKind {
     Terminate,
@@ -24,33 +28,14 @@ pub(crate) enum LeaveKind {
     Close,
 }
 
-fn post_pipeline_leave(id: ProcessId, owner: Option<ProcessId>, kind: LeaveKind) {
+fn broadcast(make: impl Fn() -> SchedulerItem) {
     let handles = super::handle_registry().read().unwrap();
     for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::PipelineLeave(id, owner, kind, None));
+        let _ = handle.send(make());
     }
 }
 
-pub(crate) fn notify_lane_close(scope: ProcessId, owner: Option<ProcessId>) {
-    post_pipeline_leave(scope, owner, LeaveKind::Close);
-}
-
-pub(crate) fn notify_process_suspend(pid: ProcessId) {
-    post_pipeline_leave(pid, Some(pid), LeaveKind::Suspend);
-}
-
-pub(crate) fn notify_process_resume(pid: ProcessId) {
-    let handles = super::handle_registry().read().unwrap();
-    for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::ProcessResume(pid));
-    }
-}
-
-pub(crate) fn post_process_terminate(pid: ProcessId) {
-    post_pipeline_leave(pid, None, LeaveKind::Terminate);
-}
-
-pub(crate) fn post_process_terminate_fenced(pid: ProcessId) -> Vec<TerminateFence> {
+fn broadcast_leave_fenced(pid: ProcessId, kind: LeaveKind) -> Vec<TerminateFence> {
     let handles = super::handle_registry().read().unwrap();
     handles
         .iter()
@@ -61,13 +46,33 @@ pub(crate) fn post_process_terminate_fenced(pid: ProcessId) -> Vec<TerminateFenc
                 .send(SchedulerItem::PipelineLeave(
                     pid,
                     None,
-                    LeaveKind::Terminate,
+                    kind,
                     Some(response),
                 ))
                 .ok()
                 .map(|_| received)
         })
         .collect()
+}
+
+pub(crate) fn notify_lane_close(scope: ProcessId, owner: Option<ProcessId>) {
+    broadcast(|| SchedulerItem::PipelineLeave(scope, owner, LeaveKind::Close, None));
+}
+
+pub(crate) fn notify_process_suspend(pid: ProcessId) {
+    broadcast(|| SchedulerItem::PipelineLeave(pid, Some(pid), LeaveKind::Suspend, None));
+}
+
+pub(crate) fn notify_process_resume(pid: ProcessId) {
+    broadcast(|| SchedulerItem::ProcessResume(pid));
+}
+
+pub(crate) fn post_process_terminate(pid: ProcessId) {
+    broadcast(|| SchedulerItem::PipelineLeave(pid, None, LeaveKind::Terminate, None));
+}
+
+pub(crate) fn post_process_terminate_fenced(pid: ProcessId) -> Vec<TerminateFence> {
+    broadcast_leave_fenced(pid, LeaveKind::Terminate)
 }
 
 pub(crate) type TerminateFence = tokio::sync::oneshot::Receiver<()>;
@@ -78,79 +83,33 @@ pub(crate) async fn await_terminate_fences(fences: Vec<TerminateFence>) {
     }
 }
 
-async fn notify_pipeline_leave_and_wait(pid: ProcessId, kind: LeaveKind) {
-    let responses = {
-        let handles = super::handle_registry().read().unwrap();
-        handles
-            .iter()
-            .flatten()
-            .filter_map(|handle| {
-                let (response, received) = tokio::sync::oneshot::channel();
-                handle
-                    .send(SchedulerItem::PipelineLeave(
-                        pid,
-                        None,
-                        kind,
-                        Some(response),
-                    ))
-                    .ok()
-                    .map(|_| received)
-            })
-            .collect::<Vec<_>>()
-    };
-    for response in responses {
-        let _ = response.await;
-    }
-}
-
 pub(crate) async fn notify_pipeline_close(pid: ProcessId) {
-    notify_pipeline_leave_and_wait(pid, LeaveKind::Close).await;
+    await_terminate_fences(broadcast_leave_fenced(pid, LeaveKind::Close)).await;
 }
 
 pub(crate) fn notify_lane_park(pid: ProcessId, seq: u64) {
-    let handles = super::handle_registry().read().unwrap();
-    for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::LanePark { lane: pid, seq });
-    }
+    broadcast(|| SchedulerItem::LanePark { lane: pid, seq });
 }
 
 pub(crate) fn notify_execution_slot_released(pid: ProcessId) {
-    let handles = super::handle_registry().read().unwrap();
-    for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::ExecutionSlotReleased(pid));
-    }
+    broadcast(|| SchedulerItem::ExecutionSlotReleased(pid));
 }
 
 pub(crate) fn notify_process_quiesced(pid: ProcessId) {
-    let handles = super::handle_registry().read().unwrap();
-    for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::ProcessQuiesced(pid));
-    }
+    broadcast(|| SchedulerItem::ProcessQuiesced(pid));
 }
 
 pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
-    let handles = super::handle_registry().read().unwrap();
-    for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::ExecutionSlotConsumed(pid));
-    }
+    broadcast(|| SchedulerItem::ExecutionSlotConsumed(pid));
 }
 
 pub(crate) fn notify_admission_queued(pid: ProcessId) {
-    let handles = super::handle_registry().read().unwrap();
-    for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::AdmissionQueued(pid));
-    }
+    broadcast(|| SchedulerItem::AdmissionQueued(pid));
 }
 
 pub(crate) fn notify_admission_dequeued(pid: ProcessId) {
-    let handles = super::handle_registry().read().unwrap();
-    for handle in handles.iter().flatten() {
-        let _ = handle.send(SchedulerItem::AdmissionDequeued(pid));
-    }
+    broadcast(|| SchedulerItem::AdmissionDequeued(pid));
 }
-
-#[allow(dead_code)]
-pub(crate) fn notify_pipeline_join(_pid: ProcessId) {}
 
 pub(crate) static BACKSTOP_RETIREMENTS: AtomicU64 = AtomicU64::new(0);
 static NEXT_LOGICAL_FIRE_ID: AtomicU64 = AtomicU64::new(1);
@@ -219,7 +178,11 @@ pub(crate) fn wave_trace_emit(line: String) {
     static BUFFERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let buffered = *BUFFERED.get_or_init(|| {
+        #[cfg(target_arch = "wasm32")]
+        let on = false;
+        #[cfg(not(target_arch = "wasm32"))]
         let on = std::env::var_os("PIE_WAVE_TRACE").is_some_and(|v| v == "buffer");
+        #[cfg(not(target_arch = "wasm32"))]
         if on {
             std::thread::spawn(|| {
                 loop {
@@ -242,9 +205,9 @@ pub(crate) fn wave_trace_emit(line: String) {
 }
 
 pub(crate) fn wave_trace_us() -> u128 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static START: std::sync::OnceLock<crate::rt::Instant> = std::sync::OnceLock::new();
     START
-        .get_or_init(std::time::Instant::now)
+        .get_or_init(crate::rt::Instant::now)
         .elapsed()
         .as_micros()
 }
@@ -340,49 +303,87 @@ enum SchedulerItem {
     DebugDump {
         response: tokio::sync::oneshot::Sender<String>,
     },
-    Lane(LaneReply),
     Stop,
 }
 
-struct NudgeWaker {
-    tx: crossbeam::channel::Sender<SchedulerItem>,
+type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;
+type SchedRx = tokio::sync::mpsc::UnboundedReceiver<SchedulerItem>;
+#[derive(Default)]
+struct LaneReplies {
+    next_control_id: u64,
+    waits: FuturesUnordered<ReplyWait>,
 }
 
-impl std::task::Wake for NudgeWaker {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
+impl LaneReplies {
+    fn is_empty(&self) -> bool {
+        self.waits.is_empty()
     }
 
-    fn wake_by_ref(self: &Arc<Self>) {
-        let _ = self.tx.send(SchedulerItem::Nudge);
+    fn post_launch(&mut self, reply: LaunchReplyRx) {
+        self.waits.push(ReplyWait::Launch(reply));
+    }
+
+    fn next_control_id(&mut self) -> u64 {
+        self.next_control_id += 1;
+        self.next_control_id
+    }
+
+    fn post_control(&mut self, id: u64, reply: ControlReplyRx) {
+        self.waits.push(ReplyWait::Control { id, reply });
+    }
+
+    fn try_next(&mut self) -> Option<LaneReply> {
+        self.waits.next().now_or_never().flatten()
     }
 }
 
-fn arm_completion_nudge(completion: &SubmissionCompletion, waker: &std::task::Waker) -> bool {
-    if completion.is_settled() {
-        return false;
+enum ReplyWait {
+    Launch(LaunchReplyRx),
+    Control { id: u64, reply: ControlReplyRx },
+}
+
+enum LaneReply {
+    Launch(LaunchResult),
+    Control { id: u64, commit: LaneCommit },
+}
+
+impl std::future::Future for ReplyWait {
+    type Output = LaneReply;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<LaneReply> {
+        match self.get_mut() {
+            ReplyWait::Launch(reply) => std::pin::Pin::new(reply).poll(cx).map(|answer| {
+                LaneReply::Launch(answer.unwrap_or_else(|_| {
+                    Err("the engine lane dropped this launch unanswered".to_string())
+                }))
+            }),
+            ReplyWait::Control { id, reply } => {
+                std::pin::Pin::new(reply)
+                    .poll(cx)
+                    .map(|answer| LaneReply::Control {
+                        id: *id,
+                        commit: answer.unwrap_or_else(|_| LaneCommit::AsyncControl {
+                            result: Err(
+                                "the engine lane dropped this control unanswered".to_string()
+                            ),
+                        }),
+                    })
+            }
+        }
     }
-    let table = waker::WakerTable::global();
-    let slot = completion.wait_id();
-    let observed = table.published(slot).unwrap_or_default();
-    if !table.register(slot, waker, observed) {
-        return false;
-    }
-    if completion.is_settled() {
-        table.deregister(slot);
-        return false;
-    }
-    true
 }
 
 #[derive(Clone)]
-enum PreLaunchCopy {
+pub(super) enum PreLaunchCopy {
     Kv(::engine::KvCopy),
     State(StateCopy),
 }
 
 impl PreLaunchCopy {
-    fn label(&self) -> &'static str {
+    pub(super) fn label(&self) -> &'static str {
         match self {
             Self::Kv(_) => "KV copy",
             Self::State(_) => "recurrent-state copy",
@@ -390,117 +391,7 @@ impl PreLaunchCopy {
     }
 }
 
-struct LaneLaunch(crate::engine::FrameFire);
-unsafe impl Send for LaneLaunch {}
-
-struct LaneCharge<'a> {
-    stats: &'a SchedulerStats,
-    began: Instant,
-    control: bool,
-    charge: bool,
-    prefill: bool,
-}
-
-impl Drop for LaneCharge<'_> {
-    fn drop(&mut self) {
-        if !self.charge {
-            return;
-        }
-        use std::sync::atomic::Ordering::Relaxed;
-        let us = self.began.elapsed().as_micros() as u64;
-        let q = &self.stats.fire.quorum;
-        if self.control {
-            q.lane_control_us.fetch_add(us, Relaxed);
-            q.lane_control_n.fetch_add(1, Relaxed);
-            q.lane_control_max_us.fetch_max(us, Relaxed);
-        } else if self.prefill {
-            q.lane_prefill_us.fetch_add(us, Relaxed);
-            q.lane_prefill_n.fetch_add(1, Relaxed);
-        } else {
-            q.lane_launch_us.fetch_add(us, Relaxed);
-            q.lane_launch_n.fetch_add(1, Relaxed);
-        }
-    }
-}
-
-enum LaneRequest {
-    Launch {
-        token: u64,
-        submission: LaneLaunch,
-        prefill: bool,
-    },
-    Control {
-        token: u64,
-        item: Box<QueuedItem>,
-    },
-    Shutdown {
-        response: crossbeam::channel::Sender<(Option<EngineBox>, ChannelJoin)>,
-    },
-}
-
-enum LaneReply {
-    LaunchDone {
-        token: u64,
-        result: std::result::Result<SubmissionCompletion, String>,
-    },
-    ControlDone {
-        token: u64,
-        commit: LaneCommit,
-    },
-}
-
-enum LaneCommit {
-    None,
-    BindInstance {
-        pipeline_id: Option<ProcessId>,
-        bound: BoundInstance,
-        respond: BindRespond,
-    },
-    BindFinished {
-        pipeline_id: Option<ProcessId>,
-    },
-    CloseInstance {
-        id: u64,
-    },
-    AsyncControl {
-        result: std::result::Result<SubmissionCompletion, String>,
-    },
-}
-
-enum Owed {
-    Launch(u64),
-    Control(u64),
-    Nothing,
-}
-
-impl Owed {
-    fn of(request: &LaneRequest) -> Owed {
-        match request {
-            LaneRequest::Launch { token, .. } => Owed::Launch(*token),
-            LaneRequest::Control { token, .. } => Owed::Control(*token),
-            LaneRequest::Shutdown { .. } => Owed::Nothing,
-        }
-    }
-
-    fn answer(self, reply_tx: &crossbeam::channel::Sender<SchedulerItem>, why: &str) {
-        let reply = match self {
-            Owed::Launch(token) => LaneReply::LaunchDone {
-                token,
-                result: Err(why.to_string()),
-            },
-            Owed::Control(token) => LaneReply::ControlDone {
-                token,
-                commit: LaneCommit::AsyncControl {
-                    result: Err(why.to_string()),
-                },
-            },
-            Owed::Nothing => return,
-        };
-        let _ = reply_tx.send(SchedulerItem::Lane(reply));
-    }
-}
-
-enum BindRespond {
+pub(super) enum BindRespond {
     Bind(tokio::sync::oneshot::Sender<Result<BoundInstance>>),
     ChannelsBind {
         registered: Vec<RegisteredChannel>,
@@ -511,932 +402,7 @@ enum BindRespond {
     },
 }
 
-struct EngineLoop {
-    launch_tx: crossbeam::channel::Sender<LaneRequest>,
-    control_tx: crossbeam::channel::Sender<LaneRequest>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-#[derive(Default)]
-struct LaneTurn {
-    launch_run: u32,
-    control_run: u32,
-}
-
-impl LaneTurn {
-    const LAUNCH_RUN_BEFORE_CONTROL: u32 = 2;
-
-    const CONTROL_RUN_MAX: u32 = 32;
-
-    const fn control_due(&self) -> bool {
-        self.launch_run >= Self::LAUNCH_RUN_BEFORE_CONTROL
-            && self.control_run < Self::CONTROL_RUN_MAX
-    }
-
-    fn took_launch(&mut self) {
-        self.launch_run = self.launch_run.saturating_add(1);
-    }
-
-    fn took_control(&mut self) {
-        self.control_run = self.control_run.saturating_add(1);
-        if self.control_run >= Self::CONTROL_RUN_MAX {
-            self.end_control_turn();
-        }
-    }
-
-    fn end_control_turn(&mut self) {
-        self.launch_run = 0;
-        self.control_run = 0;
-    }
-}
-
-impl EngineLoop {
-    fn spawn(
-        engine_idx: usize,
-        engine: Option<EngineBox>,
-        reply_tx: crossbeam::channel::Sender<SchedulerItem>,
-        stats: Arc<SchedulerStats>,
-    ) -> Self {
-        let (launch_tx, launch_rx) = crossbeam::channel::unbounded::<LaneRequest>();
-        let (control_tx, control_rx) = crossbeam::channel::unbounded::<LaneRequest>();
-        let thread = std::thread::Builder::new()
-            .name(format!("pie-engine-{engine_idx}"))
-            .spawn(move || Self::run(engine_idx, engine, launch_rx, control_rx, reply_tx, stats))
-            .expect("spawn pie-engine lane thread");
-        Self {
-            launch_tx,
-            control_tx,
-            thread: Some(thread),
-        }
-    }
-
-    fn post(&self, request: LaneRequest) {
-        let _ = match &request {
-            LaneRequest::Launch { .. } => self.launch_tx.send(request),
-            LaneRequest::Control { .. } | LaneRequest::Shutdown { .. } => {
-                self.control_tx.send(request)
-            }
-        };
-    }
-
-    fn shutdown(&mut self) -> (Option<EngineBox>, ChannelJoin) {
-        let (response_tx, response_rx) = crossbeam::channel::bounded(1);
-        let _ = self.control_tx.send(LaneRequest::Shutdown {
-            response: response_tx,
-        });
-        let state = response_rx
-            .recv()
-            .unwrap_or_else(|_| (None, ChannelJoin::new()));
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        state
-    }
-
-    fn next_request(
-        launch_rx: &crossbeam::channel::Receiver<LaneRequest>,
-        control_rx: &crossbeam::channel::Receiver<LaneRequest>,
-        turn: &mut LaneTurn,
-    ) -> std::result::Result<LaneRequest, ()> {
-        use crossbeam::channel::TryRecvError;
-        const ENGINE_LANE_HOT_US: u64 = 1_000_000;
-        let hot_window = Duration::from_micros(ENGINE_LANE_HOT_US);
-        let mut spin_until = Instant::now() + hot_window;
-        loop {
-            if turn.control_due() {
-                match control_rx.try_recv() {
-                    Ok(request) => {
-                        turn.took_control();
-                        return Ok(request);
-                    }
-                    Err(TryRecvError::Disconnected) => {
-                        return launch_rx.try_recv().map_err(|_| ());
-                    }
-                    Err(TryRecvError::Empty) => turn.end_control_turn(),
-                }
-            }
-            match launch_rx.try_recv() {
-                Ok(request) => {
-                    turn.took_launch();
-                    return Ok(request);
-                }
-                Err(TryRecvError::Disconnected) => {
-                    return control_rx.try_recv().map_err(|_| ());
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-            match control_rx.try_recv() {
-                Ok(request) => {
-                    turn.took_control();
-                    return Ok(request);
-                }
-                Err(TryRecvError::Disconnected) => {
-                    return launch_rx.try_recv().map_err(|_| ());
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-            if Instant::now() < spin_until {
-                std::hint::spin_loop();
-                continue;
-            }
-            let mut select = crossbeam::channel::Select::new();
-            select.recv(launch_rx);
-            select.recv(control_rx);
-            select.ready();
-            spin_until = Instant::now() + hot_window;
-        }
-    }
-
-    fn run(
-        engine_idx: usize,
-        mut engine: Option<EngineBox>,
-        launch_rx: crossbeam::channel::Receiver<LaneRequest>,
-        control_rx: crossbeam::channel::Receiver<LaneRequest>,
-        reply_tx: crossbeam::channel::Sender<SchedulerItem>,
-        stats: Arc<SchedulerStats>,
-    ) {
-        let mut channels = ChannelJoin::new();
-        let broker = crate::engine::CompletionBroker::new();
-        let settlements = crate::engine::completion::FrameSettlements::new();
-        if let Some(engine) = engine.as_mut()
-            && let Err(error) = engine.bind_thread()
-        {
-            tracing::error!(engine_idx, %error, "engine lane could not bind its thread");
-        }
-        if let Some(engine) = engine.as_mut()
-            && engine.settles_asynchronously()
-        {
-            let book = std::sync::Arc::clone(&settlements);
-            let published = broker.clone();
-            engine.on_complete(std::sync::Arc::new(move |at: engine::StepDone, outcome| {
-                book.settled(at.frame, &outcome, &published);
-            }));
-        }
-        let mut stash: Option<LaneRequest> = None;
-        let mut lane_turn = LaneTurn::default();
-        loop {
-            let request = match stash.take() {
-                Some(stashed) => {
-                    lane_turn.took_launch();
-                    stashed
-                }
-                None => match Self::next_request(&launch_rx, &control_rx, &mut lane_turn) {
-                    Ok(request) => request,
-                    Err(()) => break,
-                },
-            };
-            let lane_began = Instant::now();
-            let lane_was_control = matches!(request, LaneRequest::Control { .. });
-            let lane_was_prefill = matches!(request, LaneRequest::Launch { prefill: true, .. });
-            let lane_was_work = lane_was_control || matches!(request, LaneRequest::Launch { .. });
-            let _lane_charge = LaneCharge {
-                stats: &stats,
-                began: lane_began,
-                control: lane_was_control,
-                charge: lane_was_work,
-                prefill: lane_was_prefill,
-            };
-            let owed = Owed::of(&request);
-            #[cfg(panic = "abort")]
-            compile_error!(
-                "the engine lane answers its owed frame from the panic path, \
-                 which requires unwinding; under `panic = \"abort\"` a panic \
-                 in one lane takes down every session the runtime is serving"
-            );
-            let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match request {
-                    LaneRequest::Launch {
-                        token, submission, ..
-                    } => {
-                        let LaneLaunch(mut frame) = submission;
-                        let result = match engine.as_mut() {
-                            Some(engine) => {
-                                crate::probe_fire!(stats.fire.execute.engine_fire_us, {
-                                    Self::fire_frame(
-                                        engine,
-                                        &channels,
-                                        &mut frame,
-                                        &launch_rx,
-                                        &mut stash,
-                                        &broker,
-                                        &settlements,
-                                    )
-                                })
-                            }
-                            None => Err("engine has no backend installed".to_string()),
-                        };
-                        if let Err(reason) = &result {
-                            let _ = reason;
-                            let cells: Vec<_> = frame.terminal_cells().collect();
-                            crate::engine::completion::settle(
-                                &cells,
-                                crate::engine::completion::TERMINAL_OUTCOME_FAILED,
-                            );
-                        }
-                        let _ = reply_tx
-                            .send(SchedulerItem::Lane(LaneReply::LaunchDone { token, result }));
-                    }
-                    LaneRequest::Control { token, item } => {
-                        let commit =
-                            Self::execute_control(engine_idx, &mut engine, &mut channels, *item);
-                        let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::ControlDone {
-                            token,
-                            commit,
-                        }));
-                    }
-                    LaneRequest::Shutdown { response } => {
-                        let _ = response.send((engine.take(), std::mem::take(&mut channels)));
-                        return true;
-                    }
-                }
-                false
-            }));
-            match handled {
-                Ok(true) => return,
-                Ok(false) => {}
-                Err(_) => {
-                    tracing::error!(
-                        "engine lane panicked mid-request; failing it and every request \
-                         behind it rather than leaving them in flight"
-                    );
-                    settlements.close_all(&broker);
-                    owed.answer(&reply_tx, "the engine lane panicked serving this request");
-                    if let Some(stashed) = stash.take() {
-                        Owed::of(&stashed)
-                            .answer(&reply_tx, "the engine lane is down after a panic");
-                    }
-                    Self::drain_poisoned(&launch_rx, &control_rx, &reply_tx, engine, channels);
-                    return;
-                }
-            }
-        }
-        drop(engine.take());
-    }
-
-    fn drain_poisoned(
-        launch_rx: &crossbeam::channel::Receiver<LaneRequest>,
-        control_rx: &crossbeam::channel::Receiver<LaneRequest>,
-        reply_tx: &crossbeam::channel::Sender<SchedulerItem>,
-        engine: Option<EngineBox>,
-        channels: ChannelJoin,
-    ) {
-        std::mem::forget(engine);
-        drop(channels);
-        let mut turn = LaneTurn::default();
-        while let Ok(request) = Self::next_request(launch_rx, control_rx, &mut turn) {
-            if let LaneRequest::Shutdown { response } = request {
-                let _ = response.send((None, ChannelJoin::new()));
-                return;
-            }
-            Owed::of(&request).answer(reply_tx, "the engine lane is down after a panic");
-        }
-    }
-
-    fn fire_frame(
-        engine: &mut EngineBox,
-        channels: &ChannelJoin,
-        frame: &mut crate::engine::FrameFire,
-        launch_rx: &crossbeam::channel::Receiver<LaneRequest>,
-        stash: &mut Option<LaneRequest>,
-        broker: &crate::engine::CompletionBroker,
-        settlements: &std::sync::Arc<crate::engine::completion::FrameSettlements>,
-    ) -> std::result::Result<SubmissionCompletion, String> {
-        use crate::engine::completion;
-
-        if stash.is_none()
-            && let Ok(queued) = launch_rx.try_recv()
-        {
-            if let LaneRequest::Launch { submission, .. } = &queued
-                && let Some(first) = submission.0.steps.first()
-            {
-                engine.expect_fire(&first.submission);
-            }
-            *stash = Some(queued);
-        }
-
-        let submitted = ::engine::FrameSubmission {
-            steps: frame
-                .steps
-                .iter_mut()
-                .map(|step| std::mem::take(&mut step.submission))
-                .collect(),
-        };
-
-        for step in &submitted.steps {
-            for attachment in &step.attachments {
-                if let Err(error) = channels.pump_in(engine.as_mut(), attachment.instance) {
-                    return Err(format!("channel publish: {error}"));
-                }
-            }
-        }
-        let ticket = match engine.submit(&submitted) {
-            Ok(ticket) => ticket,
-            Err(error) if error.is_retryable() => {
-                return Err(format!(
-                    "frame admission answered a retryable refusal past static \
-                     admission, which the frame contract forbids: {error}"
-                ));
-            }
-            Err(error) => return Err(format!("{error}")),
-        };
-
-        let asynchronous = engine.settles_asynchronously();
-        let mut wakes: Vec<u64> = Vec::new();
-        for step in &submitted.steps {
-            for attachment in &step.attachments {
-                let deferred = asynchronous.then_some(&mut wakes);
-                if let Err(error) =
-                    channels.pump_out_with(engine.as_mut(), attachment.instance, deferred)
-                {
-                    return Err(format!("channel take: {error}"));
-                }
-            }
-        }
-
-        if !asynchronous {
-            for step in &frame.steps {
-                completion::settle(&step.terminal_cells, completion::TERMINAL_OUTCOME_SUCCESS);
-            }
-            return Ok(SubmissionCompletion::ready());
-        }
-
-        let completion = broker.submission_completion(waker::FIRST_COMPLETION_EPOCH);
-        let cells: Vec<_> = frame.terminal_cells().collect();
-        settlements.expect(
-            ticket.id,
-            ticket.steps.len(),
-            cells,
-            wakes,
-            &completion,
-            broker,
-        );
-        Ok(completion)
-    }
-
-    fn execute_control(
-        engine_idx: usize,
-        engine: &mut Option<EngineBox>,
-        channels: &mut ChannelJoin,
-        item: QueuedItem,
-    ) -> LaneCommit {
-        match item {
-            QueuedItem::Launch(_) => unreachable!(),
-            QueuedItem::PreLaunchCopy {
-                plan: _,
-                logical_completion,
-                ..
-            } if logical_completion.is_settled() => LaneCommit::AsyncControl {
-                result: Err("pre-launch copy already settled".to_string()),
-            },
-            QueuedItem::PreLaunchCopy {
-                plan: _,
-                logical_completion,
-                ..
-            } if logical_completion.cancel_requested() => {
-                logical_completion
-                    .reject_unsubmitted("logical fire cancelled before pre-launch copy");
-                LaneCommit::AsyncControl {
-                    result: Err("logical fire cancelled before pre-launch copy".to_string()),
-                }
-            }
-            QueuedItem::PreLaunchCopy {
-                plan,
-                logical_completion,
-                ..
-            } => {
-                let operation = plan.label();
-                match engine.as_mut() {
-                    Some(engine) => {
-                        let submitted = crate::engine::verbs::settled(match plan {
-                            PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
-                            PreLaunchCopy::State(plan) => engine.copy_state(&plan),
-                        });
-                        match submitted {
-                            Ok(completion) => LaneCommit::AsyncControl {
-                                result: Ok(completion),
-                            },
-                            Err(error) => {
-                                let message = format!("pre-launch {operation} rejected: {error:#}");
-                                logical_completion.reject_unsubmitted(message.clone());
-                                LaneCommit::AsyncControl {
-                                    result: Err(message),
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        logical_completion.reject_unsubmitted("engine has no backend installed");
-                        LaneCommit::AsyncControl {
-                            result: Err("engine has no backend installed".to_string()),
-                        }
-                    }
-                }
-            }
-            QueuedItem::RegisterProgram { plan, response } => {
-                if response.is_closed() {
-                    tracing::warn!(
-                        operation = "register_program",
-                        "scheduler RPC cancelled before resource creation"
-                    );
-                    return LaneCommit::None;
-                }
-                let result = match engine.as_mut() {
-                    Some(engine) => {
-                        let backend = crate::engine::verbs::codegen_backend(engine);
-                        let plan = crate::pipeline::program::with_host_codegen(&plan, backend);
-                        engine.register_program(&plan).map_err(anyhow::Error::from)
-                    }
-                    None => Err(anyhow!("engine has no backend installed")),
-                };
-                match result {
-                    Ok(program_id) => {
-                        if response.send(Ok(program_id)).is_err() {
-                            tracing::warn!(
-                                operation = "register_program",
-                                program_hash = format_args!("0x{:016x}", plan.program_hash),
-                                "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        let _ = response.send(Err(error));
-                    }
-                }
-                LaneCommit::None
-            }
-            QueuedItem::RegisterChannel { plan, response } => {
-                if response.is_closed() {
-                    Self::release_channel_plan_wait_slots(std::slice::from_ref(&plan));
-                    tracing::warn!(
-                        operation = "register_channel",
-                        channel_id = plan.id,
-                        "scheduler RPC cancelled before resource creation"
-                    );
-                    return LaneCommit::None;
-                }
-                let result = if channels.contains(plan.id) {
-                    Err(anyhow!("channel {} is already registered", plan.id))
-                } else {
-                    match engine.as_mut() {
-                        Some(engine) => {
-                            crate::engine::verbs::register_channel(engine, engine_idx, &plan)
-                                .inspect(|channel| {
-                                    channels.insert(channel.clone(), plan.host_role);
-                                })
-                        }
-                        None => Err(anyhow!("engine has no backend installed")),
-                    }
-                };
-                match result {
-                    Ok(channel) => {
-                        if let Err(Ok(channel)) = response.send(Ok(channel)) {
-                            if let Some(engine) = engine.as_mut() {
-                                Self::rollback_channel_set(
-                                    engine,
-                                    channels,
-                                    std::slice::from_ref(&channel),
-                                    "register_channel",
-                                    true,
-                                );
-                            }
-                            Self::release_registered_channel_wait_slots(std::slice::from_ref(
-                                &channel,
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        if response.send(Err(error)).is_err() {
-                            Self::release_channel_plan_wait_slots(std::slice::from_ref(&plan));
-                        }
-                    }
-                }
-                LaneCommit::None
-            }
-            QueuedItem::RegisterChannels { plans, response } => {
-                if response.is_closed() {
-                    Self::release_channel_plan_wait_slots(&plans);
-                    tracing::warn!(
-                        operation = "register_channels",
-                        "scheduler RPC cancelled before resource creation"
-                    );
-                    return LaneCommit::None;
-                }
-                let result = match engine.as_mut() {
-                    Some(engine) => {
-                        Self::register_channel_set(engine, engine_idx, channels, &plans)
-                    }
-                    None => Err(anyhow!("engine has no backend installed")),
-                };
-                match result {
-                    Ok(registered) => {
-                        if let Err(Ok(registered)) = response.send(Ok(registered)) {
-                            if let Some(engine) = engine.as_mut() {
-                                Self::rollback_channel_set(
-                                    engine,
-                                    channels,
-                                    &registered,
-                                    "register_channels",
-                                    true,
-                                );
-                            }
-                            Self::release_registered_channel_wait_slots(&registered);
-                        }
-                    }
-                    Err(error) => {
-                        if response.send(Err(error)).is_err() {
-                            Self::release_channel_plan_wait_slots(&plans);
-                        }
-                    }
-                }
-                LaneCommit::None
-            }
-            QueuedItem::BindInstance {
-                pipeline_id,
-                plan,
-                response,
-            } => {
-                if response.is_closed() {
-                    EngineLoop::release_wait_slots([plan.pacing_wait_id]);
-                    tracing::warn!(
-                        operation = "bind_instance",
-                        program_id = plan.program_id(),
-                        "scheduler RPC cancelled before resource creation"
-                    );
-                    return LaneCommit::BindFinished { pipeline_id };
-                }
-                match engine.as_mut() {
-                    Some(engine) => match engine
-                        .bind_instance(&plan.binding)
-                        .map(|bound| {
-                            crate::engine::BoundInstance::new(
-                                plan.engine_id,
-                                &bound,
-                                plan.pacing_wait_id,
-                            )
-                        })
-                        .map_err(anyhow::Error::from)
-                    {
-                        Ok(bound) => {
-                            channels.bind(bound.instance_id, plan.binding.channels.clone());
-                            LaneCommit::BindInstance {
-                                pipeline_id,
-                                bound,
-                                respond: BindRespond::Bind(response),
-                            }
-                        }
-                        Err(error) => {
-                            if response.send(Err(error)).is_err() {
-                                EngineLoop::release_wait_slots([plan.pacing_wait_id]);
-                            }
-                            LaneCommit::BindFinished { pipeline_id }
-                        }
-                    },
-                    None => {
-                        if response
-                            .send(Err(anyhow!("engine has no backend installed")))
-                            .is_err()
-                        {
-                            Self::release_wait_slots([plan.pacing_wait_id]);
-                        }
-                        LaneCommit::BindFinished { pipeline_id }
-                    }
-                }
-            }
-            QueuedItem::RegisterChannelsBind {
-                pipeline_id,
-                plans,
-                program,
-                mut bind,
-                response,
-            } => {
-                if response.is_closed() {
-                    EngineLoop::release_channel_plan_wait_slots(&plans);
-                    EngineLoop::release_wait_slots([bind.pacing_wait_id]);
-                    tracing::warn!(
-                        operation = "register_channels_bind",
-                        program_id = bind.program_id(),
-                        "scheduler RPC cancelled before resource creation"
-                    );
-                    return LaneCommit::BindFinished { pipeline_id };
-                }
-                let Some(engine) = engine.as_mut() else {
-                    if response
-                        .send(Err(anyhow!("engine has no backend installed")))
-                        .is_err()
-                    {
-                        EngineLoop::release_channel_plan_wait_slots(&plans);
-                        EngineLoop::release_wait_slots([bind.pacing_wait_id]);
-                    }
-                    return LaneCommit::BindFinished { pipeline_id };
-                };
-                let registered =
-                    match Self::register_channel_set(engine, engine_idx, channels, &plans) {
-                        Ok(registered) => registered,
-                        Err(error) => {
-                            if response.send(Err(error)).is_err() {
-                                Self::release_channel_plan_wait_slots(&plans);
-                                Self::release_wait_slots([bind.pacing_wait_id]);
-                            }
-                            return LaneCommit::BindFinished { pipeline_id };
-                        }
-                    };
-                if response.is_closed() {
-                    Self::rollback_channel_set(
-                        engine,
-                        channels,
-                        &registered,
-                        "register_channels_bind",
-                        true,
-                    );
-                    EngineLoop::release_registered_channel_wait_slots(&registered);
-                    Self::release_wait_slots([bind.pacing_wait_id]);
-                    return LaneCommit::BindFinished { pipeline_id };
-                }
-                let program_registered = program.is_some();
-                if let Some(plan) = &program {
-                    let backend = crate::engine::verbs::codegen_backend(engine);
-                    let plan = &crate::pipeline::program::with_host_codegen(plan, backend);
-                    match engine.register_program(plan).map_err(anyhow::Error::from) {
-                        Ok(program_id) => bind.binding.program = program_id,
-                        Err(error) => {
-                            tracing::error!(
-                                ?error,
-                                "register_program refused; rolling the bind's channels back"
-                            );
-                            Self::rollback_channel_set(
-                                engine,
-                                channels,
-                                &registered,
-                                "register_channels_bind",
-                                false,
-                            );
-                            if response.send(Err(error)).is_err() {
-                                EngineLoop::release_registered_channel_wait_slots(&registered);
-                                Self::release_wait_slots([bind.pacing_wait_id]);
-                            }
-                            return LaneCommit::BindFinished { pipeline_id };
-                        }
-                    }
-                }
-                if response.is_closed() {
-                    Self::rollback_channel_set(
-                        engine,
-                        channels,
-                        &registered,
-                        "register_channels_bind",
-                        true,
-                    );
-                    Self::release_registered_channel_wait_slots(&registered);
-                    Self::release_wait_slots([bind.pacing_wait_id]);
-                    if program_registered {
-                        tracing::warn!(
-                            operation = "register_channels_bind",
-                            program_id = bind.program_id(),
-                            "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
-                        );
-                    }
-                    return LaneCommit::BindFinished { pipeline_id };
-                }
-                match engine
-                    .bind_instance(&bind.binding)
-                    .map(|bound| {
-                        crate::engine::BoundInstance::new(
-                            bind.engine_id,
-                            &bound,
-                            bind.pacing_wait_id,
-                        )
-                    })
-                    .map_err(anyhow::Error::from)
-                {
-                    Ok(bound) => {
-                        channels.bind(bound.instance_id, bind.binding.channels.clone());
-                        LaneCommit::BindInstance {
-                            pipeline_id,
-                            bound,
-                            respond: BindRespond::ChannelsBind {
-                                registered,
-                                program_id: bind.program_id(),
-                                program_registered,
-                                response,
-                            },
-                        }
-                    }
-                    Err(error) => {
-                        Self::rollback_channel_set(
-                            engine,
-                            channels,
-                            &registered,
-                            "register_channels_bind",
-                            false,
-                        );
-                        if response.send(Err(error)).is_err() {
-                            Self::release_registered_channel_wait_slots(&registered);
-                            Self::release_wait_slots([bind.pacing_wait_id]);
-                        }
-                        LaneCommit::BindFinished { pipeline_id }
-                    }
-                }
-            }
-            QueuedItem::CopyKv { plan, response } => match engine.as_mut() {
-                Some(engine) => match crate::engine::verbs::settled(engine.copy_kv(&plan)) {
-                    Ok(completion) => {
-                        let _ = response.send(Ok(completion.clone()));
-                        LaneCommit::AsyncControl {
-                            result: Ok(completion),
-                        }
-                    }
-                    Err(err) => {
-                        let message = format!("{err:#}");
-                        let _ = response.send(Err(err));
-                        LaneCommit::AsyncControl {
-                            result: Err(message),
-                        }
-                    }
-                },
-                None => {
-                    let _ = response.send(Err(anyhow!("engine has no backend installed")));
-                    LaneCommit::AsyncControl {
-                        result: Err("engine has no backend installed".to_string()),
-                    }
-                }
-            },
-            QueuedItem::CopyKvTracked { plan, completion } => match engine.as_mut() {
-                Some(engine) => match crate::engine::verbs::settled(engine.copy_kv(&plan)) {
-                    Ok(native_completion) => LaneCommit::AsyncControl {
-                        result: Ok(native_completion),
-                    },
-                    Err(error) => {
-                        let message = format!("{error:#}");
-                        completion.resolve(&Err(error));
-                        LaneCommit::AsyncControl {
-                            result: Err(message),
-                        }
-                    }
-                },
-                None => {
-                    completion.resolve(&Err(anyhow!("engine has no backend installed")));
-                    LaneCommit::AsyncControl {
-                        result: Err("engine has no backend installed".to_string()),
-                    }
-                }
-            },
-            QueuedItem::CopyState { plan, response } => match engine.as_mut() {
-                Some(engine) => match crate::engine::verbs::settled(engine.copy_state(&plan)) {
-                    Ok(completion) => {
-                        let _ = response.send(Ok(completion.clone()));
-                        LaneCommit::AsyncControl {
-                            result: Ok(completion),
-                        }
-                    }
-                    Err(err) => {
-                        let message = format!("{err:#}");
-                        let _ = response.send(Err(err));
-                        LaneCommit::AsyncControl {
-                            result: Err(message),
-                        }
-                    }
-                },
-                None => {
-                    let _ = response.send(Err(anyhow!("engine has no backend installed")));
-                    LaneCommit::AsyncControl {
-                        result: Err("engine has no backend installed".to_string()),
-                    }
-                }
-            },
-            QueuedItem::CloseInstance { id, .. } => match engine.as_mut() {
-                Some(engine) => match engine.close_instance(id).map_err(anyhow::Error::from) {
-                    Ok(()) => {
-                        channels.unbind(id);
-                        LaneCommit::CloseInstance { id }
-                    }
-                    Err(err) => {
-                        tracing::warn!(instance_id = id, ?err, "scheduler close_instance failed");
-                        LaneCommit::None
-                    }
-                },
-                None => {
-                    tracing::warn!(instance_id = id, "scheduler has no backend installed");
-                    LaneCommit::None
-                }
-            },
-            QueuedItem::CloseChannels { ids } => {
-                for id in ids {
-                    let result = if !channels.contains(id) {
-                        Err(anyhow!("channel {id} is unknown or stale"))
-                    } else {
-                        match engine.as_mut() {
-                            Some(engine) => Self::close_channel(engine, id).map(|()| {
-                                channels.remove(id);
-                            }),
-                            None => Err(anyhow!("engine has no backend installed")),
-                        }
-                    };
-                    if let Err(err) = result {
-                        tracing::warn!(channel_id = id, ?err, "scheduler close_channel failed");
-                    }
-                }
-                LaneCommit::None
-            }
-        }
-    }
-
-    fn close_channel(engine: &mut EngineBox, id: u64) -> Result<()> {
-        match engine.close_channel(id) {
-            Ok(()) | Err(engine::Error::Unsupported { .. }) => Ok(()),
-            Err(error) => Err(anyhow::Error::from(error)),
-        }
-    }
-
-    fn register_channel_set(
-        engine: &mut EngineBox,
-        engine_idx: usize,
-        channels: &mut ChannelJoin,
-        plans: &[ChannelRegistration],
-    ) -> Result<Vec<RegisteredChannel>> {
-        let mut registered = Vec::with_capacity(plans.len());
-        let mut registered_ids = Vec::with_capacity(plans.len());
-        for plan in plans {
-            if channels.contains(plan.id) {
-                for channel_id in registered_ids.iter().rev() {
-                    let _ = engine.close_channel(*channel_id);
-                    channels.remove(*channel_id);
-                }
-                return Err(anyhow!("channel {} is already registered", plan.id));
-            }
-            match crate::engine::verbs::register_channel(engine, engine_idx, plan) {
-                Ok(channel) => {
-                    channels.insert(channel.clone(), plan.host_role);
-                    registered_ids.push(plan.id);
-                    registered.push(channel);
-                }
-                Err(cause) => {
-                    for channel_id in registered_ids.iter().rev() {
-                        let _ = engine.close_channel(*channel_id);
-                        channels.remove(*channel_id);
-                    }
-                    return Err(cause);
-                }
-            }
-        }
-        Ok(registered)
-    }
-
-    fn rollback_channel_set(
-        engine: &mut EngineBox,
-        channels: &mut ChannelJoin,
-        registered: &[RegisteredChannel],
-        operation: &'static str,
-        cancellation: bool,
-    ) {
-        for channel in registered.iter().rev() {
-            let channel_id = channel.binding.channel_id;
-            match Self::close_channel(engine, channel_id) {
-                Ok(()) => {
-                    channels.remove(channel_id);
-                }
-                Err(error) => {
-                    tracing::error!(
-                        operation,
-                        cancellation,
-                        channel_id,
-                        ?error,
-                        "scheduler cancellation rollback close_channel failed"
-                    );
-                }
-            }
-        }
-        tracing::warn!(
-            operation,
-            cancellation,
-            channel_count = registered.len(),
-            "scheduler registration rollback closed registered channels"
-        );
-    }
-
-    fn release_channel_plan_wait_slots(plans: &[ChannelRegistration]) {
-        let _ = plans;
-    }
-
-    fn release_registered_channel_wait_slots(registered: &[RegisteredChannel]) {
-        Self::release_wait_slots(
-            registered
-                .iter()
-                .flat_map(|channel| [channel.reader_wait_id, channel.writer_wait_id]),
-        );
-    }
-
-    fn release_wait_slots(wait_ids: impl IntoIterator<Item = u64>) {
-        let wait_ids: Vec<u64> = wait_ids.into_iter().collect();
-        let table = waker::WakerTable::global();
-        table.sweep(&wait_ids);
-        for wait_id in wait_ids {
-            table.deregister(wait_id);
-            table.free(wait_id);
-        }
-    }
-}
-
-enum QueuedItem {
+pub(super) enum QueuedItem {
     Launch(QueuedLaunch),
     PreLaunchCopy {
         plan: PreLaunchCopy,
@@ -1490,7 +456,7 @@ enum QueuedItem {
     },
 }
 
-struct QueuedLaunch {
+pub(super) struct QueuedLaunch {
     fire_id: u64,
     framed: bool,
     request: Box<PendingRequest>,
@@ -1518,7 +484,7 @@ impl std::ops::Deref for QueuedLaunch {
 }
 
 enum LaunchState {
-    Posted { token: u64 },
+    Posted,
     Accepted(SubmissionCompletion),
     Failed(String),
 }
@@ -1539,7 +505,7 @@ struct PendingLaunchBatch {
 }
 
 enum ControlSlotState {
-    Posted { token: u64 },
+    Posted { id: u64 },
     Ready(SubmissionCompletion),
 }
 
@@ -1552,8 +518,6 @@ struct PendingControl {
     operation: &'static str,
     holds_launches: bool,
 }
-
-const CONTROL_SETTLE_POLL_US: u64 = 500;
 
 #[derive(Default)]
 struct InFlightControls {
@@ -1593,9 +557,9 @@ impl InFlightControls {
         self.settling.push(control);
     }
 
-    fn position_posted(&self, token: u64) -> Option<usize> {
+    fn position_posted(&self, id: u64) -> Option<usize> {
         self.settling.iter().position(
-            |control| matches!(control.state, ControlSlotState::Posted { token: t } if t == token),
+            |control| matches!(control.state, ControlSlotState::Posted { id: t } if t == id),
         )
     }
 }
@@ -1728,7 +692,7 @@ struct ScanCache {
 type SlotBuffer = Vec<Vec<Option<Box<PendingRequest>>>>;
 
 struct SchedulerControl {
-    tx: crossbeam::channel::Sender<SchedulerItem>,
+    tx: SchedTx,
     active_senders: AtomicUsize,
     shutdown_wait: Condvar,
     shutdown_gate: Mutex<()>,
@@ -1920,22 +884,15 @@ impl SchedulerHandle {
         Ok(program_id)
     }
 
-    pub async fn register_channel(
-        &self,
-        engine_id: crate::engine::EngineId,
-        plan: ChannelRegistration,
-    ) -> Result<RegisteredChannel> {
-        let _ = engine_id;
+    pub async fn register_channel(&self, plan: ChannelRegistration) -> Result<RegisteredChannel> {
         self.request(|response| SchedulerItem::RegisterChannel { plan, response })
             .await?
     }
 
     pub async fn register_channels(
         &self,
-        engine_id: crate::engine::EngineId,
         plans: Vec<ChannelRegistration>,
     ) -> Result<Vec<RegisteredChannel>> {
-        let _ = engine_id;
         self.request(|response| SchedulerItem::RegisterChannels { plans, response })
             .await?
     }
@@ -1956,12 +913,10 @@ impl SchedulerHandle {
     pub async fn register_channels_bind(
         &self,
         pipeline_id: Option<ProcessId>,
-        engine_id: crate::engine::EngineId,
         plans: Vec<ChannelRegistration>,
         program: ProgramRegistration,
         mut bind: InstanceBindingPlan,
     ) -> Result<(Vec<RegisteredChannel>, BoundInstance)> {
-        let _ = engine_id;
         let program_hash = program.program_hash;
         let cached = {
             let program_ids = self.inner.program_ids.lock().unwrap();
@@ -2016,7 +971,7 @@ impl SchedulerHandle {
     }
 
     pub(crate) async fn debug_dump(&self) -> Result<String> {
-        tokio::time::timeout(
+        crate::rt::time::timeout(
             std::time::Duration::from_secs(2),
             self.request(|response| SchedulerItem::DebugDump { response }),
         )
@@ -2049,7 +1004,7 @@ impl SchedulerHandle {
 pub struct BatchScheduler {
     engine_id: EngineId,
     handle: SchedulerHandle,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Option<crate::rt::thread::JoinHandle<()>>,
     stats: Arc<SchedulerStats>,
 }
 
@@ -2059,10 +1014,9 @@ impl BatchScheduler {
         engine_idx: usize,
         page_size: u32,
         limits: SchedulerLimits,
-        request_timeout_secs: u64,
         frame_size: usize,
     ) -> Self {
-        let (tx, rx) = crossbeam::channel::unbounded::<SchedulerItem>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SchedulerItem>();
         let stats = Arc::new(SchedulerStats::default());
         let handle = SchedulerHandle {
             inner: Arc::new(SchedulerControl {
@@ -2079,11 +1033,10 @@ impl BatchScheduler {
         crate::scheduler::install_scheduler_handle(engine_id, handle.clone());
         let stats_for_loop = Arc::clone(&stats);
         let nudge_tx = handle.inner.tx.clone();
-        let thread = std::thread::Builder::new()
+        let thread = crate::rt::thread::Builder::new()
             .name(format!("pie-sched-{engine_idx}"))
             .spawn(move || {
-                let _request_timeout = Duration::from_secs(request_timeout_secs);
-                Self::run(
+                crate::rt::block_on(Self::run(
                     engine_id,
                     rx,
                     nudge_tx,
@@ -2091,7 +1044,7 @@ impl BatchScheduler {
                     limits,
                     stats_for_loop,
                     frame_size,
-                );
+                ));
             })
             .expect("spawn pie-sched thread");
         Self {
@@ -2120,23 +1073,18 @@ impl BatchScheduler {
         }
     }
 
-    fn run(
+    async fn run(
         engine_id: EngineId,
-        rx: crossbeam::channel::Receiver<SchedulerItem>,
-        nudge_tx: crossbeam::channel::Sender<SchedulerItem>,
+        mut rx: SchedRx,
+        nudge_tx: SchedTx,
         page_size: u32,
         limits: SchedulerLimits,
         stats: Arc<SchedulerStats>,
         frame_size: usize,
     ) {
-        let lane_reply_tx = nudge_tx.clone();
-        let nudge_waker = std::task::Waker::from(Arc::new(NudgeWaker {
-            tx: nudge_tx.clone(),
-        }));
         let engine = crate::engine::take_engine_backend(engine_id).ok();
-        let mut lane = EngineLoop::spawn(engine_id, engine, lane_reply_tx, Arc::clone(&stats));
-        let mut lane_inflight: u64 = 0;
-        let mut lane_token: u64 = 0;
+        let mut lane = Lane::spawn(engine_id, engine, Arc::clone(&stats));
+        let mut replies = LaneReplies::default();
         let mut instances = HashMap::new();
         let mut pending = PendingQueue::default();
         let mut scan_cache = ScanCache::default();
@@ -2153,50 +1101,37 @@ impl BatchScheduler {
         );
         frame_policy
             .preload_free_slots(crate::inferlet::process::execution_slot_capacity().unwrap_or(0));
-        let mut stall_since: Option<std::time::Instant> = None;
+        let mut stall_since: Option<crate::rt::Instant> = None;
         let mut stall_dumps: u32 = 0;
 
         loop {
             let mut progress = false;
-            let mailbox_epoch = rx.len();
-            for _ in 0..mailbox_epoch {
+            while let Some(reply) = replies.try_next() {
+                Self::apply_lane_reply(
+                    reply,
+                    &mut in_flight_launches,
+                    &mut instances,
+                    &mut in_flight_control,
+                    &mut frame_policy,
+                    &nudge_tx,
+                );
+                progress = true;
+            }
+            loop {
                 let Ok(item) = rx.try_recv() else { break };
                 progress = true;
-                match item {
-                    SchedulerItem::DebugDump { response } => {
-                        let _ = response.send(Self::render_debug_dump(
-                            &pending,
-                            &in_flight_launches,
-                            &in_flight_control,
-                            &instances,
-                            &frame_policy,
-                        ));
-                    }
-                    SchedulerItem::Lane(reply) => {
-                        Self::apply_lane_reply(
-                            reply,
-                            &mut lane_inflight,
-                            &mut in_flight_launches,
-                            &mut in_flight_control,
-                            &mut instances,
-                            &mut frame_policy,
-                            &nudge_tx,
-                        );
-                    }
-                    item => {
-                        Self::enqueue_item(
-                            &mut pending,
-                            &mut terminated_processes,
-                            &mut in_flight_control,
-                            &instances,
-                            limits,
-                            page_size,
-                            &mut stopping,
-                            &mut frame_policy,
-                            item,
-                        );
-                    }
-                }
+                Self::enqueue_item(
+                    &mut pending,
+                    &mut terminated_processes,
+                    &in_flight_launches,
+                    &mut in_flight_control,
+                    &instances,
+                    limits,
+                    page_size,
+                    &mut stopping,
+                    &mut frame_policy,
+                    item,
+                );
             }
             progress |= Self::retire_ready_launches(
                 &mut in_flight_launches,
@@ -2207,8 +1142,7 @@ impl BatchScheduler {
             progress |= Self::retire_ready_control(&mut in_flight_control);
             let (dispatched, wait_hint) = Self::dispatch_ready_items(
                 &lane,
-                &mut lane_inflight,
-                &mut lane_token,
+                &mut replies,
                 &mut instances,
                 &mut pending,
                 &mut in_flight_launches,
@@ -2226,7 +1160,7 @@ impl BatchScheduler {
                 && pending.is_empty()
                 && in_flight_launches.is_empty()
                 && in_flight_control.is_empty()
-                && lane_inflight == 0
+                && replies.is_empty()
             {
                 break;
             }
@@ -2248,35 +1182,40 @@ impl BatchScheduler {
             let item = if pending.is_empty()
                 && in_flight_launches.is_empty()
                 && in_flight_control.is_empty()
+                && replies.is_empty()
                 && !stopping
             {
-                match rx.recv() {
-                    Ok(item) => Some(item),
-                    Err(_) => {
+                match rx.recv().await {
+                    Some(item) => Some(item),
+                    None => {
                         stopping = true;
                         None
                     }
                 }
             } else {
-                let mut armed = true;
-                if let Some(front) = in_flight_launches.front() {
-                    match &front.state {
-                        LaunchState::Posted { .. } => {}
-                        LaunchState::Accepted(completion) => {
-                            armed &= arm_completion_nudge(completion, &nudge_waker);
-                        }
-                        LaunchState::Failed(_) => armed = false,
-                    }
-                }
-                for control in in_flight_control.iter() {
-                    match &control.state {
-                        ControlSlotState::Posted { .. } => {}
-                        ControlSlotState::Ready(completion) => {
-                            armed &= arm_completion_nudge(completion, &nudge_waker);
-                        }
-                    }
-                }
-                if !armed {
+                let front_launch =
+                    in_flight_launches
+                        .front()
+                        .and_then(|front| match &front.state {
+                            LaunchState::Accepted(completion) => Some(completion.clone()),
+                            _ => None,
+                        });
+                let mut control_settles: Vec<SubmissionCompletion> = in_flight_control
+                    .iter()
+                    .filter_map(|control| match &control.state {
+                        ControlSlotState::Ready(completion) => Some(completion.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let front_failed = in_flight_launches
+                    .front()
+                    .is_some_and(|front| matches!(front.state, LaunchState::Failed(_)));
+                if front_failed
+                    || front_launch
+                        .as_ref()
+                        .is_some_and(SubmissionCompletion::is_settled)
+                    || control_settles.iter().any(SubmissionCompletion::is_settled)
+                {
                     continue;
                 }
                 let backstop = Duration::from_millis(250);
@@ -2284,7 +1223,59 @@ impl BatchScheduler {
                 let idle_park = in_flight_launches.is_empty();
                 let control_park = idle_park && in_flight_control.holds_launches();
                 let park_began = Instant::now();
-                let parked = rx.recv_timeout(recv_wait);
+                let have_replies = !replies.is_empty();
+                let have_settle = front_launch.is_some();
+                let have_control_settles = !control_settles.is_empty();
+                let mut reply_answer = None;
+                let parked = {
+                    let settle_wait = async {
+                        match front_launch {
+                            Some(completion) => completion.await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    let control_settle_wait = async {
+                        if control_settles.is_empty() {
+                            std::future::pending().await
+                        } else {
+                            let (result, _, _) =
+                                futures::future::select_all(control_settles.iter_mut()).await;
+                            result
+                        }
+                    };
+                    tokio::select! {
+                        mailbox = crate::rt::time::timeout(recv_wait, rx.recv()) => mailbox,
+                        reply = replies.waits.next(), if have_replies => {
+                            reply_answer = reply;
+                            Ok(Some(SchedulerItem::Nudge))
+                        }
+                        settled = settle_wait, if have_settle => {
+                            let _ = settled;
+                            Ok(Some(SchedulerItem::Nudge))
+                        }
+                        settled = control_settle_wait, if have_control_settles => {
+                            let _ = settled;
+                            Ok(Some(SchedulerItem::Nudge))
+                        }
+                    }
+                };
+                if let Some(reply) = reply_answer {
+                    Self::apply_lane_reply(
+                        reply,
+                        &mut in_flight_launches,
+                        &mut instances,
+                        &mut in_flight_control,
+                        &mut frame_policy,
+                        &nudge_tx,
+                    );
+                }
+                tracing::debug!(
+                    ?recv_wait,
+                    timed_out = parked.is_err(),
+                    slept_us = park_began.elapsed().as_micros() as u64,
+                    ?wait_hint,
+                    "scheduler parked"
+                );
                 if parked.is_err() && crate::planner::trace_enabled() {
                     static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
                     let mut last = LAST.lock().unwrap();
@@ -2350,8 +1341,12 @@ impl BatchScheduler {
                     }
                 }
                 match parked {
-                    Ok(item) => Some(item),
-                    Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    Ok(Some(item)) => Some(item),
+                    Ok(None) => {
+                        stopping = true;
+                        None
+                    }
+                    Err(_) => {
                         let missed = in_flight_launches.front().is_some_and(|front| {
                             matches!(&front.state, LaunchState::Accepted(c) if c.is_settled())
                         }) || in_flight_control.iter().any(|control| {
@@ -2366,7 +1361,7 @@ impl BatchScheduler {
                             );
                         }
                         let stalled_for = stall_since
-                            .get_or_insert_with(std::time::Instant::now)
+                            .get_or_insert_with(crate::rt::Instant::now)
                             .elapsed();
                         if stalled_for
                             >= Duration::from_secs(10)
@@ -2387,39 +1382,14 @@ impl BatchScheduler {
                         }
                         None
                     }
-                    Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
-                        stopping = true;
-                        None
-                    }
                 }
             };
 
             if let Some(item) = item {
-                if let SchedulerItem::DebugDump { response } = item {
-                    let _ = response.send(Self::render_debug_dump(
-                        &pending,
-                        &in_flight_launches,
-                        &in_flight_control,
-                        &instances,
-                        &frame_policy,
-                    ));
-                    continue;
-                }
-                if let SchedulerItem::Lane(reply) = item {
-                    Self::apply_lane_reply(
-                        reply,
-                        &mut lane_inflight,
-                        &mut in_flight_launches,
-                        &mut in_flight_control,
-                        &mut instances,
-                        &mut frame_policy,
-                        &nudge_tx,
-                    );
-                    continue;
-                }
                 Self::enqueue_item(
                     &mut pending,
                     &mut terminated_processes,
+                    &in_flight_launches,
                     &mut in_flight_control,
                     &instances,
                     limits,
@@ -2483,7 +1453,7 @@ impl BatchScheduler {
         let _ = writeln!(out, "in_flight_launches ({}):", in_flight_launches.len());
         for batch in in_flight_launches {
             let state = match &batch.state {
-                LaunchState::Posted { token } => format!("posted(token={token})"),
+                LaunchState::Posted => "posted".to_string(),
                 LaunchState::Accepted(c) => format!("settled={}", c.is_settled()),
                 LaunchState::Failed(msg) => format!("failed({msg})"),
             };
@@ -2499,7 +1469,7 @@ impl BatchScheduler {
         }
         for control in in_flight_control.iter() {
             let state = match &control.state {
-                ControlSlotState::Posted { token } => format!("posted(token={token})"),
+                ControlSlotState::Posted { id } => format!("posted(id={id})"),
                 ControlSlotState::Ready(c) => format!("settled={}", c.is_settled()),
             };
             let _ = writeln!(
@@ -2516,6 +1486,7 @@ impl BatchScheduler {
     fn enqueue_item(
         pending: &mut PendingQueue,
         terminated_processes: &mut HashSet<ProcessId>,
+        in_flight_launches: &VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut InFlightControls,
         instances: &HashMap<u64, TrackedInstance>,
         limits: SchedulerLimits,
@@ -2528,8 +1499,14 @@ impl BatchScheduler {
             SchedulerItem::Stop => {
                 *stopping = true;
             }
-            SchedulerItem::DebugDump { .. } => {
-                unreachable!("DebugDump is intercepted before enqueue_item")
+            SchedulerItem::DebugDump { response } => {
+                let _ = response.send(Self::render_debug_dump(
+                    pending,
+                    in_flight_launches,
+                    in_flight_control,
+                    instances,
+                    frame_policy,
+                ));
             }
             SchedulerItem::Nudge => {}
             SchedulerItem::ExecutionSlotReleased(pid) => {
@@ -2687,7 +1664,7 @@ impl BatchScheduler {
                 response,
             } => {
                 if pipeline_id.is_some_and(|pid| terminated_processes.contains(&pid)) {
-                    EngineLoop::release_wait_slots([plan.pacing_wait_id]);
+                    Lane::release_wait_slots([plan.pacing_wait_id]);
                     let _ = response.send(Err(anyhow!(
                         "process departed before instance bind admission"
                     )));
@@ -2711,8 +1688,7 @@ impl BatchScheduler {
                 response,
             } => {
                 if pipeline_id.is_some_and(|pid| terminated_processes.contains(&pid)) {
-                    EngineLoop::release_channel_plan_wait_slots(&plans);
-                    EngineLoop::release_wait_slots([bind.pacing_wait_id]);
+                    Lane::release_wait_slots([bind.pacing_wait_id]);
                     let _ = response.send(Err(anyhow!(
                         "process departed before channel bind admission"
                     )));
@@ -2748,7 +1724,6 @@ impl BatchScheduler {
                     Self::queue_close_channel(pending, id);
                 }
             }
-            SchedulerItem::Lane(_) => unreachable!(),
         }
     }
 
@@ -2804,9 +1779,9 @@ impl BatchScheduler {
         pending.replace(kept);
     }
 
-    fn queue_attempt(pending: &mut PendingQueue, request: PendingRequest) {
+    fn queue_attempt(pending: &mut PendingQueue, mut request: PendingRequest) {
         let mut copies = Vec::with_capacity(2);
-        if let Some(plan) = request.prelaunch_copy.clone() {
+        if let Some(plan) = request.prelaunch_copy.take() {
             copies.push(QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::Kv(plan),
                 logical_completion: request.completion.clone(),
@@ -2814,7 +1789,7 @@ impl BatchScheduler {
                 pipeline_id: request.pipeline_id,
             });
         }
-        if let Some(plan) = request.prelaunch_state_copy.clone() {
+        if let Some(plan) = request.prelaunch_state_copy.take() {
             copies.push(QueuedItem::PreLaunchCopy {
                 plan: PreLaunchCopy::State(plan),
                 logical_completion: request.completion.clone(),
@@ -2919,9 +1894,8 @@ impl BatchScheduler {
 
     #[allow(clippy::too_many_arguments)]
     fn dispatch_ready_items(
-        engine_loop: &EngineLoop,
-        lane_inflight: &mut u64,
-        lane_token: &mut u64,
+        engine_loop: &Lane,
+        replies: &mut LaneReplies,
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
@@ -2939,8 +1913,7 @@ impl BatchScheduler {
             slot_buffer,
             frame_policy,
             engine_loop,
-            lane_inflight,
-            lane_token,
+            replies,
             instances,
             pending,
             in_flight_launches,
@@ -2990,11 +1963,9 @@ impl BatchScheduler {
                         let item = pending.pop_front().expect("close front");
                         Self::post_control(
                             engine_loop,
-                            lane_inflight,
-                            lane_token,
+                            replies,
                             instances,
                             in_flight_control,
-                            frame_policy,
                             item,
                         );
                         progress = true;
@@ -3030,15 +2001,7 @@ impl BatchScheduler {
                 }
                 _ => {
                     let item = pending.pop_front().expect("front item present");
-                    Self::post_control(
-                        engine_loop,
-                        lane_inflight,
-                        lane_token,
-                        instances,
-                        in_flight_control,
-                        frame_policy,
-                        item,
-                    );
+                    Self::post_control(engine_loop, replies, instances, in_flight_control, item);
                     progress = true;
                 }
             }
@@ -3050,27 +2013,17 @@ impl BatchScheduler {
             let Some(item) = pending.remove(index) else {
                 break;
             };
-            Self::post_control(
-                engine_loop,
-                lane_inflight,
-                lane_token,
-                instances,
-                in_flight_control,
-                frame_policy,
-                item,
-            );
+            Self::post_control(engine_loop, replies, instances, in_flight_control, item);
             progress = true;
         }
         (progress, wait_hint)
     }
 
     fn post_control(
-        engine_loop: &EngineLoop,
-        lane_inflight: &mut u64,
-        lane_token: &mut u64,
+        engine_loop: &Lane,
+        replies: &mut LaneReplies,
         instances: &mut HashMap<u64, TrackedInstance>,
         in_flight_control: &mut InFlightControls,
-        _frame_policy: &mut FramePolicy,
         item: QueuedItem,
     ) {
         match &item {
@@ -3105,8 +2058,7 @@ impl BatchScheduler {
             }
             _ => {}
         }
-        *lane_token += 1;
-        let token = *lane_token;
+        let id = replies.next_control_id();
         let holds_launches = !Self::standalone_copy(&item);
         match &item {
             QueuedItem::PreLaunchCopy {
@@ -3116,7 +2068,7 @@ impl BatchScheduler {
                 pipeline_id,
             } => {
                 in_flight_control.push(PendingControl {
-                    state: ControlSlotState::Posted { token },
+                    state: ControlSlotState::Posted { id },
                     logical_completion: Some(logical_completion.clone()),
                     process_id: *process_id,
                     pipeline_id: *pipeline_id,
@@ -3127,7 +2079,7 @@ impl BatchScheduler {
             }
             QueuedItem::CopyKv { .. } => {
                 in_flight_control.push(PendingControl {
-                    state: ControlSlotState::Posted { token },
+                    state: ControlSlotState::Posted { id },
                     logical_completion: None,
                     process_id: None,
                     pipeline_id: None,
@@ -3138,7 +2090,7 @@ impl BatchScheduler {
             }
             QueuedItem::CopyKvTracked { completion, .. } => {
                 in_flight_control.push(PendingControl {
-                    state: ControlSlotState::Posted { token },
+                    state: ControlSlotState::Posted { id },
                     logical_completion: None,
                     process_id: None,
                     pipeline_id: None,
@@ -3149,7 +2101,7 @@ impl BatchScheduler {
             }
             QueuedItem::CopyState { .. } => {
                 in_flight_control.push(PendingControl {
-                    state: ControlSlotState::Posted { token },
+                    state: ControlSlotState::Posted { id },
                     logical_completion: None,
                     process_id: None,
                     pipeline_id: None,
@@ -3160,11 +2112,7 @@ impl BatchScheduler {
             }
             _ => {}
         }
-        *lane_inflight += 1;
-        engine_loop.post(LaneRequest::Control {
-            token,
-            item: Box::new(item),
-        });
+        replies.post_control(id, engine_loop.control(item));
     }
 
     fn scan_queue<'a>(
@@ -3208,9 +2156,8 @@ impl BatchScheduler {
         scan_cache: &mut ScanCache,
         slot_buffer: &mut SlotBuffer,
         frame_policy: &mut FramePolicy,
-        engine_loop: &EngineLoop,
-        lane_inflight: &mut u64,
-        lane_token: &mut u64,
+        engine_loop: &Lane,
+        replies: &mut LaneReplies,
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
@@ -3240,10 +2187,6 @@ impl BatchScheduler {
                         .quorum
                         .idle_break_control
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    merge_hint(
-                        &mut wait_hint,
-                        Duration::from_micros(CONTROL_SETTLE_POLL_US),
-                    );
                 }
                 break;
             }
@@ -3321,12 +2264,10 @@ impl BatchScheduler {
                     }
                 }
             };
-            #[allow(clippy::let_and_return)]
             let (frame_progress, posted) = Self::post_frame(
                 slot_buffer,
                 engine_loop,
-                lane_inflight,
-                lane_token,
+                replies,
                 instances,
                 pending,
                 in_flight_launches,
@@ -3349,7 +2290,6 @@ impl BatchScheduler {
         (progress, wait_hint)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn admits_to_frame(
         request: &PendingRequest,
         instances: &HashMap<u64, TrackedInstance>,
@@ -3382,9 +2322,8 @@ impl BatchScheduler {
     )]
     fn post_frame(
         slot_buffer: &mut SlotBuffer,
-        engine_loop: &EngineLoop,
-        lane_inflight: &mut u64,
-        lane_token: &mut u64,
+        engine_loop: &Lane,
+        replies: &mut LaneReplies,
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
@@ -3461,20 +2400,13 @@ impl BatchScheduler {
                 instance.in_flight += 1;
             }
         }
-        *lane_token += 1;
-        let token = *lane_token;
+        replies.post_launch(engine_loop.fire(submission, total_tokens > batch_size as usize));
         in_flight_launches.push_back(PendingLaunchBatch {
-            state: LaunchState::Posted { token },
+            state: LaunchState::Posted,
             requests,
             started: Instant::now(),
             batch_size,
             total_tokens,
-        });
-        *lane_inflight += 1;
-        engine_loop.post(LaneRequest::Launch {
-            token,
-            submission: LaneLaunch(submission),
-            prefill: total_tokens > batch_size as usize,
         });
         (true, true)
     }
@@ -3488,7 +2420,7 @@ impl BatchScheduler {
         let mut progress = false;
         while let Some(front) = in_flight_launches.front() {
             let launch_failure = match &front.state {
-                LaunchState::Posted { .. } => break,
+                LaunchState::Posted => break,
                 LaunchState::Failed(message) => Some(message.clone()),
                 LaunchState::Accepted(_) => None,
             };
@@ -3615,170 +2547,192 @@ impl BatchScheduler {
         retired
     }
 
+    fn accept_launch_reply(
+        batch: &mut PendingLaunchBatch,
+        instances: &mut HashMap<u64, TrackedInstance>,
+        result: LaunchResult,
+    ) {
+        match result {
+            Ok(completion) => {
+                for request in &batch.requests {
+                    if let Some(instance) = instances.get_mut(&request.instance_id) {
+                        let epoch = instance.next_target_epoch;
+                        request.completion.commit_target_epoch(epoch);
+                        instance.next_target_epoch = epoch + 1;
+                    }
+                }
+                batch.state = LaunchState::Accepted(completion);
+            }
+            Err(message) => {
+                batch.state = LaunchState::Failed(message);
+            }
+        }
+    }
+
     fn apply_lane_reply(
         reply: LaneReply,
-        lane_inflight: &mut u64,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
+        instances: &mut HashMap<u64, TrackedInstance>,
+        in_flight_control: &mut InFlightControls,
+        frame_policy: &mut FramePolicy,
+        rollback_tx: &SchedTx,
+    ) {
+        match reply {
+            LaneReply::Launch(result) => {
+                let batch = in_flight_launches
+                    .iter_mut()
+                    .find(|batch| matches!(batch.state, LaunchState::Posted))
+                    .expect("a launch answer arrives only while its batch is posted");
+                Self::accept_launch_reply(batch, instances, result);
+            }
+            LaneReply::Control { id, commit } => Self::apply_control_commit(
+                id,
+                commit,
+                in_flight_control,
+                instances,
+                frame_policy,
+                rollback_tx,
+            ),
+        }
+    }
+
+    fn apply_control_commit(
+        id: u64,
+        commit: LaneCommit,
         in_flight_control: &mut InFlightControls,
         instances: &mut HashMap<u64, TrackedInstance>,
         frame_policy: &mut FramePolicy,
-        rollback_tx: &crossbeam::channel::Sender<SchedulerItem>,
+        rollback_tx: &SchedTx,
     ) {
-        *lane_inflight = lane_inflight.saturating_sub(1);
-        match reply {
-            LaneReply::LaunchDone { token, result } => {
-                let Some(batch) = in_flight_launches.iter_mut().find(
-                    |batch| matches!(batch.state, LaunchState::Posted { token: t } if t == token),
-                ) else {
-                    tracing::error!(token, "lane launch reply for an unknown batch");
+        match commit {
+            LaneCommit::None => {}
+            LaneCommit::BindFinished { pipeline_id } => {
+                frame_policy.on_bind_completed(pipeline_id);
+            }
+            LaneCommit::BindInstance {
+                pipeline_id,
+                bound,
+                respond,
+            } => {
+                frame_policy.on_bind_completed(pipeline_id);
+                if instances.contains_key(&bound.instance_id) {
+                    tracing::error!(
+                        instance_id = bound.instance_id,
+                        "bind committed an already-bound instance id"
+                    );
+                    let error = anyhow!("instance {} is already bound", bound.instance_id);
+                    match respond {
+                        BindRespond::Bind(response) => {
+                            let _ = response.send(Err(error));
+                        }
+                        BindRespond::ChannelsBind { response, .. } => {
+                            let _ = response.send(Err(error));
+                        }
+                    }
+                    return;
+                }
+                let instance_id = bound.instance_id;
+                instances.insert(instance_id, TrackedInstance::from_bound(&bound));
+                match respond {
+                    BindRespond::Bind(response) => {
+                        if let Err(Ok(bound)) = response.send(Ok(bound)) {
+                            tracing::warn!(
+                                operation = "bind_instance",
+                                instance_id = bound.instance_id,
+                                "scheduler cancellation rollback enqueued bound instance"
+                            );
+                            if rollback_tx
+                                .send(SchedulerItem::CloseInstance {
+                                    id: bound.instance_id,
+                                    pacing_wait_id: bound.pacing_wait_id,
+                                })
+                                .is_err()
+                            {
+                                tracing::error!(
+                                    operation = "bind_instance",
+                                    instance_id = bound.instance_id,
+                                    "scheduler cancellation rollback enqueue failed"
+                                );
+                            }
+                        }
+                    }
+                    BindRespond::ChannelsBind {
+                        registered,
+                        program_id,
+                        program_registered,
+                        response,
+                    } => {
+                        if let Err(Ok((registered, _, bound))) =
+                            response.send(Ok((registered, program_id, bound)))
+                        {
+                            tracing::warn!(
+                                operation = "register_channels_bind",
+                                instance_id = bound.instance_id,
+                                channel_count = registered.len(),
+                                "scheduler cancellation rollback enqueued bound instance and channels"
+                            );
+                            if program_registered {
+                                tracing::warn!(
+                                    operation = "register_channels_bind",
+                                    program_id,
+                                    "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
+                                );
+                            }
+                            Lane::release_registered_channel_wait_slots(&registered);
+                            let instance_id = bound.instance_id;
+                            if rollback_tx
+                                .send(SchedulerItem::CloseInstance {
+                                    id: instance_id,
+                                    pacing_wait_id: bound.pacing_wait_id,
+                                })
+                                .is_err()
+                            {
+                                tracing::error!(
+                                    operation = "register_channels_bind",
+                                    instance_id,
+                                    "scheduler cancellation rollback close_instance enqueue failed"
+                                );
+                            }
+                            for channel in registered {
+                                let channel_id = channel.binding.channel_id;
+                                if rollback_tx
+                                    .send(SchedulerItem::CloseChannel { id: channel_id })
+                                    .is_err()
+                                {
+                                    tracing::error!(
+                                        operation = "register_channels_bind",
+                                        channel_id,
+                                        "scheduler cancellation rollback close_channel enqueue failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            LaneCommit::CloseInstance { id } => {
+                if let Some(instance) = instances.remove(&id) {
+                    instance.close_wait_slots();
+                }
+            }
+            LaneCommit::AsyncControl { result } => {
+                let Some(index) = in_flight_control.position_posted(id) else {
+                    tracing::error!(
+                        id,
+                        "lane async-control reply without a matching control slot"
+                    );
                     return;
                 };
                 match result {
                     Ok(completion) => {
-                        for request in &batch.requests {
-                            if let Some(instance) = instances.get_mut(&request.instance_id) {
-                                let epoch = instance.next_target_epoch;
-                                request.completion.commit_target_epoch(epoch);
-                                instance.next_target_epoch = epoch + 1;
-                            }
-                        }
-                        batch.state = LaunchState::Accepted(completion);
+                        in_flight_control.settling[index].state =
+                            ControlSlotState::Ready(completion);
                     }
-                    Err(message) => {
-                        batch.state = LaunchState::Failed(message);
+                    Err(_) => {
+                        in_flight_control.settling.remove(index);
                     }
                 }
             }
-            LaneReply::ControlDone { token, commit } => match commit {
-                LaneCommit::None => {}
-                LaneCommit::BindFinished { pipeline_id } => {
-                    frame_policy.on_bind_completed(pipeline_id);
-                }
-                LaneCommit::BindInstance {
-                    pipeline_id,
-                    bound,
-                    respond,
-                } => {
-                    frame_policy.on_bind_completed(pipeline_id);
-                    if instances.contains_key(&bound.instance_id) {
-                        tracing::error!(
-                            instance_id = bound.instance_id,
-                            "bind committed an already-bound instance id"
-                        );
-                        let error = anyhow!("instance {} is already bound", bound.instance_id);
-                        match respond {
-                            BindRespond::Bind(response) => {
-                                let _ = response.send(Err(error));
-                            }
-                            BindRespond::ChannelsBind { response, .. } => {
-                                let _ = response.send(Err(error));
-                            }
-                        }
-                        return;
-                    }
-                    let instance_id = bound.instance_id;
-                    instances.insert(instance_id, TrackedInstance::from_bound(&bound));
-                    match respond {
-                        BindRespond::Bind(response) => {
-                            if let Err(Ok(bound)) = response.send(Ok(bound)) {
-                                tracing::warn!(
-                                    operation = "bind_instance",
-                                    instance_id = bound.instance_id,
-                                    "scheduler cancellation rollback enqueued bound instance"
-                                );
-                                if rollback_tx
-                                    .send(SchedulerItem::CloseInstance {
-                                        id: bound.instance_id,
-                                        pacing_wait_id: bound.pacing_wait_id,
-                                    })
-                                    .is_err()
-                                {
-                                    tracing::error!(
-                                        operation = "bind_instance",
-                                        instance_id = bound.instance_id,
-                                        "scheduler cancellation rollback enqueue failed"
-                                    );
-                                }
-                            }
-                        }
-                        BindRespond::ChannelsBind {
-                            registered,
-                            program_id,
-                            program_registered,
-                            response,
-                        } => {
-                            if let Err(Ok((registered, _, bound))) =
-                                response.send(Ok((registered, program_id, bound)))
-                            {
-                                tracing::warn!(
-                                    operation = "register_channels_bind",
-                                    instance_id = bound.instance_id,
-                                    channel_count = registered.len(),
-                                    "scheduler cancellation rollback enqueued bound instance and channels"
-                                );
-                                if program_registered {
-                                    tracing::warn!(
-                                        operation = "register_channels_bind",
-                                        program_id,
-                                        "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
-                                    );
-                                }
-                                EngineLoop::release_registered_channel_wait_slots(&registered);
-                                let instance_id = bound.instance_id;
-                                if rollback_tx
-                                    .send(SchedulerItem::CloseInstance {
-                                        id: instance_id,
-                                        pacing_wait_id: bound.pacing_wait_id,
-                                    })
-                                    .is_err()
-                                {
-                                    tracing::error!(
-                                        operation = "register_channels_bind",
-                                        instance_id,
-                                        "scheduler cancellation rollback close_instance enqueue failed"
-                                    );
-                                }
-                                for channel in registered {
-                                    let channel_id = channel.binding.channel_id;
-                                    if rollback_tx
-                                        .send(SchedulerItem::CloseChannel { id: channel_id })
-                                        .is_err()
-                                    {
-                                        tracing::error!(
-                                            operation = "register_channels_bind",
-                                            channel_id,
-                                            "scheduler cancellation rollback close_channel enqueue failed"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                LaneCommit::CloseInstance { id } => {
-                    if let Some(instance) = instances.remove(&id) {
-                        instance.close_wait_slots();
-                    }
-                }
-                LaneCommit::AsyncControl { result } => {
-                    let Some(index) = in_flight_control.position_posted(token) else {
-                        tracing::error!(
-                            token,
-                            "lane async-control reply without a matching control slot"
-                        );
-                        return;
-                    };
-                    match result {
-                        Ok(completion) => {
-                            in_flight_control.settling[index].state =
-                                ControlSlotState::Ready(completion);
-                        }
-                        Err(_) => {
-                            in_flight_control.settling.remove(index);
-                        }
-                    }
-                }
-            },
         }
     }
 
@@ -3871,18 +2825,16 @@ mod tests {
     }
 
     fn a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight() {
-        let (reply_tx, reply_rx) = crossbeam::channel::unbounded();
-        let mut lane = EngineLoop::spawn(
+        let mut lane = Lane::spawn(
             0,
             Some(Box::new(PanickingEngine)),
-            reply_tx,
             Arc::new(SchedulerStats::default()),
         );
 
+        let mut answers = Vec::new();
         for token in [7_u64, 8] {
-            lane.post(LaneRequest::Launch {
-                token,
-                submission: LaneLaunch(crate::engine::FrameFire {
+            let answer_rx = lane.fire(
+                crate::engine::FrameFire {
                     steps: vec![crate::engine::StepFire {
                         submission: ::engine::Step {
                             lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
@@ -3894,19 +2846,18 @@ mod tests {
                         instances: vec![0],
                         logical_fire_ids: vec![token],
                     }],
-                }),
-                prefill: false,
-            });
+                },
+                false,
+            );
+            answers.push((token, answer_rx));
         }
 
-        for want in [7_u64, 8] {
-            let reply = reply_rx
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap_or_else(|_| panic!("token {want} was never answered"));
-            let SchedulerItem::Lane(LaneReply::LaunchDone { token, result }) = reply else {
-                panic!("a launch must be answered with a launch reply");
-            };
-            assert_eq!(token, want, "answered in the order posted");
+        for (want, answer_rx) in answers {
+            let result = crate::rt::block_on(async {
+                crate::rt::time::timeout(Duration::from_secs(10), answer_rx).await
+            })
+            .unwrap_or_else(|_| panic!("token {want} was never answered"))
+            .unwrap_or_else(|_| panic!("token {want} was never answered"));
             let Err(err) = result else {
                 panic!("a panicking engine cannot have launched anything");
             };
@@ -3950,19 +2901,16 @@ mod tests {
 
     fn a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying() {
         let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (reply_tx, reply_rx) = crossbeam::channel::unbounded();
-        let mut lane = EngineLoop::spawn(
+        let mut lane = Lane::spawn(
             0,
             Some(Box::new(ExhaustedEngine {
                 submits: Arc::clone(&submits),
             })),
-            reply_tx,
             Arc::new(SchedulerStats::default()),
         );
 
-        lane.post(LaneRequest::Launch {
-            token: 42,
-            submission: LaneLaunch(crate::engine::FrameFire {
+        let answer_rx = lane.fire(
+            crate::engine::FrameFire {
                 steps: vec![crate::engine::StepFire {
                     submission: ::engine::Step {
                         lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
@@ -3974,17 +2922,15 @@ mod tests {
                     instances: vec![0],
                     logical_fire_ids: vec![42],
                 }],
-            }),
-            prefill: false,
-        });
+            },
+            false,
+        );
 
-        let reply = reply_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the launch must be answered, not slept on");
-        let SchedulerItem::Lane(LaneReply::LaunchDone { token, result }) = reply else {
-            panic!("a launch must be answered with a launch reply");
-        };
-        assert_eq!(token, 42);
+        let result = crate::rt::block_on(async {
+            crate::rt::time::timeout(Duration::from_secs(10), answer_rx).await
+        })
+        .expect("the launch must be answered, not slept on")
+        .expect("the launch must be answered, not slept on");
         let Err(error) = result else {
             panic!("an engine that refuses everything cannot have admitted a frame");
         };

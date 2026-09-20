@@ -120,9 +120,18 @@ pub struct Gateway {
     _worker_task: tokio::task::JoinHandle<()>,
 }
 
+fn no_nagle(listener: TcpListener) -> impl axum::serve::Listener<Addr = std::net::SocketAddr> {
+    use axum::serve::ListenerExt;
+    listener.tap_io(|tcp| {
+        if let Err(error) = tcp.set_nodelay(true) {
+            tracing::warn!(%error, "TCP_NODELAY refused on a client connection");
+        }
+    })
+}
+
 impl Gateway {
     pub async fn serve(self) -> Result<()> {
-        axum::serve(self.listener, self.app)
+        axum::serve(no_nagle(self.listener), self.app)
             .await
             .context("gateway client-facing serve")?;
         Ok(())
@@ -138,7 +147,7 @@ impl Gateway {
         let serve_shutdown = shutdown.clone();
         let serve_task = tokio::spawn(async move {
             let graceful = async move { serve_shutdown.notified().await };
-            if let Err(e) = axum::serve(listener, app)
+            if let Err(e) = axum::serve(no_nagle(listener), app)
                 .with_graceful_shutdown(graceful)
                 .await
             {

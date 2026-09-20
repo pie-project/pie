@@ -1,4 +1,4 @@
-
+//#include "common/u64.inc.wgsl"
 
 const PIE_MAX_NGRAM = 4;
 const PIE_MAX_HEADS = 32;
@@ -47,6 +47,7 @@ fn ple_cell(cell: i32, eos: i32) -> i32 {
     return cell - 1;
 }
 
+//#if defined(PIE_PLE_UPDATE)
 
 @group(0) @binding(0) var<storage, read> ids: array<i32>;
 @group(0) @binding(1) var<storage, read_write> state: array<i32>;
@@ -90,6 +91,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     state[slab + u32(span - 1)] = fresh + 1;
 }
 
+//#elif defined(PIE_PLE_CHUNKED)
 
 @group(0) @binding(0) var<storage, read> ids: array<i32>;
 @group(0) @binding(1) var<storage, read> indptr: array<i32>;
@@ -156,6 +158,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+//#else
 
 @group(0) @binding(0) var<storage, read> ids: array<i32>;
 @group(0) @binding(1) var<storage, read> indptr: array<i32>;
@@ -242,5 +245,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         state[slab + u32(p)] = next[p];
     }
 }
+//#endif
 
-
+// pie:instantiate ple_ngram_ids_update PIE_PLE_UPDATE=1 PIE_GROUP_X=64
+// pie:instantiate ple_ngram_ids_chunked PIE_PLE_CHUNKED=1 PIE_GROUP_X=64
+// pie:instantiate ple_ngram_ids_committed PIE_GROUP_X=64

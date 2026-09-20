@@ -63,7 +63,6 @@ const TAIL: &str = r#"
 [runtime]
 # Batching and timeouts. Every default here is measured; `pie config list`
 # carries the reasoning.
-request_timeout = "120s"
 # submit_deadline          = "50ms"
 # silence_timeout          = "30s"
 # frame_size               = 2     # guest contract: the submit depth is

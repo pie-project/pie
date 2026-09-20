@@ -126,6 +126,37 @@ pub fn expand(
     Ok(hoist_enables(&prelude, &body))
 }
 
+/// The `enable` directives a tier's builtins need under Tint. naga parses the
+/// subgroup builtins without one and rejects `enable subgroups;` outright, so a
+/// browser prepends these to the module it hands the device and reflects the
+/// bare text.
+#[must_use]
+pub fn enables_of(tier: crate::Capability) -> &'static [&'static str] {
+    match tier {
+        crate::Capability::Subgroup => &["enable subgroups;"],
+        crate::Capability::Baseline | crate::Capability::Fp16 | crate::Capability::Matrix => &[],
+    }
+}
+
+#[must_use]
+pub fn with_enables(wgsl: &str, tier: crate::Capability) -> String {
+    let missing: Vec<&str> = enables_of(tier)
+        .iter()
+        .copied()
+        .filter(|line| !wgsl.lines().any(|have| have.trim() == *line))
+        .collect();
+    if missing.is_empty() {
+        return wgsl.to_owned();
+    }
+    let mut out = String::with_capacity(wgsl.len() + 32);
+    for line in missing {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(wgsl);
+    out
+}
+
 fn hoist_enables(prelude: &str, body: &str) -> String {
     let mut enables: Vec<&str> = Vec::new();
     let mut rest = String::with_capacity(body.len());
@@ -347,4 +378,29 @@ fn term_truth(
     }
 
     Err(uncondition())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_subgroup_module_gets_its_enable_once() {
+        let once = with_enables("fn main() {}\n", crate::Capability::Subgroup);
+        assert!(once.starts_with("enable subgroups;\n"));
+        let twice = with_enables(&once, crate::Capability::Subgroup);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn the_baseline_module_is_left_alone() {
+        let text = "fn main() {}\n";
+        assert_eq!(with_enables(text, crate::Capability::Baseline), text);
+    }
+
+    #[test]
+    fn enables_in_the_body_are_hoisted_above_the_prelude() {
+        let out = hoist_enables("const A = 1;\n", "fn f() {}\nenable f16;\n");
+        assert!(out.starts_with("enable f16;\nconst A = 1;\n"));
+    }
 }

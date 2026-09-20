@@ -326,6 +326,21 @@ fn request_flags(request: &model_ir::Request) -> u32 {
 }
 
 #[must_use]
+pub(crate) fn plain_of(landing: &[Vec<model_ir::Request>]) -> model_ir::ClassSet {
+    model_ir::ClassSet::of(
+        landing
+            .iter()
+            .enumerate()
+            .filter(|(_, requests)| {
+                requests
+                    .iter()
+                    .any(|request| request_flags(request) == u32::from(request.query_len() != 1))
+            })
+            .map(|(class, _)| class),
+    )
+}
+
+#[must_use]
 pub(crate) fn decoding_of(landing: &[Vec<model_ir::Request>]) -> model_ir::ClassSet {
     model_ir::ClassSet::of(
         landing
@@ -603,6 +618,42 @@ fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> mo
 }
 
 #[must_use]
+pub(crate) fn schedule_streams(trace: &Trace, compiled: &CompiledModel) -> Vec<Option<u32>> {
+    let mut streams: Vec<Option<Vec<u32>>> = vec![None; trace.values.len()];
+    let mut inputs: Vec<ValueId> = Vec::new();
+    for region in compiled.template() {
+        for node in region.nodes.clone() {
+            let Some(node) = trace.nodes.get(node as usize) else {
+                continue;
+            };
+            inputs.clear();
+            node.op.inputs(&mut inputs);
+            for id in &inputs {
+                let at = id.0 as usize;
+                if !trace
+                    .values
+                    .get(at)
+                    .is_some_and(|decl| matches!(decl.ty, model_ir::Ty::Struct(_)))
+                {
+                    continue;
+                }
+                let readers = streams[at].get_or_insert_with(Vec::new);
+                if !readers.contains(&region.stream) {
+                    readers.push(region.stream);
+                }
+            }
+        }
+    }
+    streams
+        .into_iter()
+        .map(|readers| match readers.as_deref() {
+            Some([stream]) => Some(*stream),
+            _ => None,
+        })
+        .collect()
+}
+
+#[must_use]
 pub(crate) fn regions_launching_schedules(
     trace: &Trace,
     compiled: &CompiledModel,
@@ -630,11 +681,7 @@ pub(crate) fn regions_launching_schedules(
                 let Some(slot) = out.get_mut(at) else {
                     continue;
                 };
-                if claimed[at] {
-                    if *slot != Some(here) {
-                        *slot = None;
-                    }
-                } else {
+                if !claimed[at] {
                     claimed[at] = true;
                     *slot = Some(here);
                 }

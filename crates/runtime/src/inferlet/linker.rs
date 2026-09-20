@@ -102,11 +102,20 @@ impl Linker {
         variant: LinkerVariant,
     ) -> Result<WasmLinker<ProcessCtx>> {
         let mut linker = WasmLinker::<ProcessCtx>::new(engine);
+        #[cfg(target_arch = "wasm32")]
+        let _ = policy;
 
+        #[cfg(target_arch = "wasm32")]
+        wasmtime_wasi::add_to_linker(&mut linker).expect("Failed to link WASI");
+
+        #[cfg(not(target_arch = "wasm32"))]
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).expect("Failed to link WASI");
+        #[cfg(not(target_arch = "wasm32"))]
         wasmtime_wasi::p3::add_to_linker(&mut linker).expect("Failed to link WASI p3");
+        #[cfg(not(target_arch = "wasm32"))]
         wasmtime_wasi_http::p3::add_to_linker(&mut linker).expect("Failed to link WASI HTTP p3");
 
+        #[cfg(not(target_arch = "wasm32"))]
         {
             let mut root = linker.root();
             let mut random = root
@@ -121,6 +130,7 @@ impl Linker {
                 .expect("Failed to shim get-insecure-seed");
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         if policy.network.allow {
             wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
                 .expect("Failed to link WASI HTTP");
@@ -236,7 +246,7 @@ impl Linker {
                 Self::instance_pre_cell(&instance_pre_cache, program_name, generation);
             let pre = cell
                 .get_or_try_init(|| async {
-                    base_linker
+                    Self::linker_for(&engine, &base_linker, &component)?
                         .instantiate_pre(&component)
                         .map_err(|error| anyhow!("Instantiation pre-link error: {error}"))
                 })
@@ -245,13 +255,33 @@ impl Linker {
                 .await
                 .map_err(|e| anyhow!("Instantiation error: {e}"))?
         } else {
-            dynamic_linker
-                .expect("dynamic dependencies require a cloned linker")
+            let linker = dynamic_linker.expect("dynamic dependencies require a cloned linker");
+            Self::linker_for(&engine, &linker, &component)?
                 .instantiate_async(&mut store, &component)
                 .await
                 .map_err(|e| anyhow!("Instantiation error: {e}"))?
         };
         Ok((store, instance))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn linker_for<'a>(
+        _engine: &Engine,
+        linker: &'a WasmLinker<ProcessCtx>,
+        _component: &Component,
+    ) -> Result<std::borrow::Cow<'a, WasmLinker<ProcessCtx>>> {
+        Ok(std::borrow::Cow::Borrowed(linker))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn linker_for<'a>(
+        engine: &Engine,
+        linker: &'a WasmLinker<ProcessCtx>,
+        component: &Component,
+    ) -> Result<std::borrow::Cow<'a, WasmLinker<ProcessCtx>>> {
+        let mut linker = linker.clone();
+        wasmtime_wasi::stub_unhosted(&mut linker, engine, component)?;
+        Ok(std::borrow::Cow::Owned(linker))
     }
 
     async fn resolve_dependencies_and_runtime(
@@ -330,7 +360,7 @@ impl ServiceHandler for Linker {
                 let policy = self.policy.clone();
                 let base_cache = Arc::clone(&self.base_linker_cache);
                 let pre_cache = Arc::clone(&self.instance_pre_cache);
-                tokio::task::spawn(async move {
+                crate::rt::spawn(async move {
                     let result = Linker::instantiate(
                         engine,
                         policy,

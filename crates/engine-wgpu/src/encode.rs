@@ -110,6 +110,29 @@ pub fn profile_shapes(on: bool) {
 }
 
 #[cfg(feature = "wgpu")]
+#[derive(Clone, Copy)]
+pub(crate) struct Mark {
+    at: crate::device::host::Instant,
+}
+
+#[cfg(feature = "wgpu")]
+impl Mark {
+    pub(crate) fn now() -> Mark {
+        Mark {
+            at: crate::device::host::Instant::now(),
+        }
+    }
+
+    pub(crate) fn ns(self) -> u64 {
+        self.at.elapsed().as_nanos() as u64
+    }
+
+    pub(crate) fn secs(self) -> f64 {
+        self.ns() as f64 * 1e-9
+    }
+}
+
+#[cfg(feature = "wgpu")]
 fn timing() -> bool {
     TIMING.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -246,13 +269,10 @@ impl<'a> Sink<'a> {
 #[cfg(feature = "wgpu")]
 impl Encode for Sink<'_> {
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
-        let started = timing().then(std::time::Instant::now);
+        let started = timing().then(Mark::now);
         let out = self.fire_inner(fire, args);
         if let Some(started) = started {
-            HOST_NS.fetch_add(
-                started.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            HOST_NS.fetch_add(started.ns(), std::sync::atomic::Ordering::Relaxed);
         }
         out
     }
@@ -338,19 +358,21 @@ impl Sink<'_> {
                                 ),
                             ));
                         }
-                        let len = remaining.min(binding.slab().size.saturating_sub(at));
-                        let mut bytes = vec![0u8; len.next_multiple_of(4) as usize];
-                        binding
-                            .slab()
-                            .read(at, &mut bytes[..len as usize])
-                            .map_err(|fault| Sink::refuse(fire, fault))?;
-                        let staged_len = bytes.len() as u64;
-                        let (chunk, slot) = self.frame.scratch_slot(staged_len);
-                        core.queue.write_buffer(&chunk, slot, &bytes);
-                        scratch_views += 1;
-                        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        views.push((chunk, slot, staged_len, false));
-                        continue;
+                        {
+                            let len = remaining.min(binding.slab().size.saturating_sub(at));
+                            let mut bytes = vec![0u8; len.next_multiple_of(4) as usize];
+                            binding
+                                .slab()
+                                .read(at, &mut bytes[..len as usize])
+                                .map_err(|fault| Sink::refuse(fire, fault))?;
+                            let staged_len = bytes.len() as u64;
+                            let (chunk, slot) = self.frame.scratch_slot(staged_len);
+                            core.queue.write_buffer(&chunk, slot, &bytes);
+                            scratch_views += 1;
+                            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            views.push((chunk, slot, staged_len, false));
+                            continue;
+                        }
                     }
                     let len = remaining
                         .next_multiple_of(4)

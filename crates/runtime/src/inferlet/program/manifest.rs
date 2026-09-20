@@ -87,6 +87,15 @@ impl Manifest {
         self.runtime.get("python-runtime").map(String::as_str)
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub async fn from_url(registry_url: &str, name: &ProgramName) -> Result<Self> {
+        bail!(
+            "cannot fetch the manifest of {name} from {}: this host has no registry client",
+            manifest_url(registry_url, name)
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn from_url(registry_url: &str, name: &ProgramName) -> Result<Self> {
         let url = manifest_url(registry_url, name);
 

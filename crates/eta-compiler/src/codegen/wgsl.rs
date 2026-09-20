@@ -17,7 +17,7 @@ const SORT_ROUNDS: u32 = 28;
 
 const BARRIER: &str = "  storageBarrier();\n";
 
-pub const WGSL_EMITTER_VERSION: u16 = 3;
+pub const WGSL_EMITTER_VERSION: u16 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -156,6 +156,78 @@ fn sort_rounds(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> u32
     rounds.min(SORT_ROUNDS)
 }
 
+// Native drivers recompile everything an entry point reaches per pipeline, so
+// naming the op cuts a stage's build from minutes to seconds; Dawn reuses the
+// compile of the shared switch instead, and specialising defeats that.
+fn specialize() -> bool {
+    !cfg!(target_arch = "wasm32")
+}
+
+fn step_call(at: usize, tag: u8) -> String {
+    if !specialize() {
+        return alloc::format!("ptir_step({at}u)");
+    }
+    let p = alloc::format!("{at}u");
+    match tag {
+        0x01..=0x0B => alloc::format!("map_unary({p}, {}u)", tag - 0x01),
+        0x10..=0x15 => alloc::format!("bin_arith({p}, {}u)", tag - 0x10),
+        0x1F => alloc::format!("bin_arith({p}, 6u)"),
+        0x16..=0x1B => alloc::format!("cmp_op({p}, {}u)", tag - 0x16),
+        0x1C..=0x1E => alloc::format!("logic_op({p}, {}u)", tag - 0x1C),
+        0x20 => alloc::format!("op_select({p})"),
+        0x40 => alloc::format!("op_cumulative({p}, false)"),
+        0x41 => alloc::format!("op_cumulative({p}, true)"),
+        0x38 => alloc::format!("op_broadcast({p})"),
+        0x39 | 0xA1 => alloc::format!("op_copy({p})"),
+        0x3A => alloc::format!("op_transpose({p})"),
+        0x60 => alloc::format!("op_gather({p})"),
+        0x61 => alloc::format!("op_gather_row({p})"),
+        0x62 => alloc::format!("op_scatter({p}, true)"),
+        0x63 => alloc::format!("op_scatter({p}, false)"),
+        0x64 => alloc::format!("op_iota({p})"),
+        0x65 => alloc::format!("op_mask_apply({p})"),
+        0x66..=0x68 => alloc::format!("op_struct_mask({p}, {}u)", tag - 0x66),
+        0x70 => alloc::format!("op_rng({p}, false)"),
+        0x71 => alloc::format!("op_rng({p}, true)"),
+        0x50 => alloc::format!("op_sort_desc_finish({p})"),
+        0x51 => alloc::format!("op_top_k_finish({p})"),
+        0x58 => alloc::format!("op_pivot_finish({p})"),
+        0x55 => alloc::format!("op_matmul({p})"),
+        0x81 => alloc::format!("op_const({p})"),
+        _ => alloc::format!("ptir_step({p})"),
+    }
+}
+
+fn reduce_kind(tag: u8) -> Option<&'static str> {
+    match tag {
+        tags::REDUCE_SUM => Some("RED_SUM"),
+        tags::REDUCE_MAX => Some("RED_MAX"),
+        tags::REDUCE_MIN => Some("RED_MIN"),
+        tags::REDUCE_ARGMAX => Some("RED_ARGMAX"),
+        _ => None,
+    }
+}
+
+fn reduce_level_call(at: usize, tag: u8, level: u32) -> String {
+    if !specialize() {
+        return alloc::format!("ptir_reduce_level({at}u, {level}u)");
+    }
+    match reduce_kind(tag) {
+        Some(kind) => alloc::format!("op_reduce_level({at}u, {kind}, {level}u)"),
+        None => alloc::format!("ptir_reduce_level({at}u, {level}u)"),
+    }
+}
+
+fn reduce_finish_call(at: usize, tag: u8) -> String {
+    if !specialize() {
+        return alloc::format!("ptir_reduce_finish({at}u)");
+    }
+    match reduce_kind(tag) {
+        Some(kind) => alloc::format!("op_reduce_finish({at}u, {kind})"),
+        None => alloc::format!("ptir_reduce_finish({at}u)"),
+    }
+}
+
 fn emit_op(body: &mut String, at: usize, tag: u8, rounds: u32) {
     if is_sort(tag) {
         let _ = writeln!(body, "  ptir_sort_seed({at}u);");
@@ -166,17 +238,17 @@ fn emit_op(body: &mut String, at: usize, tag: u8, rounds: u32) {
         }
         let _ = writeln!(body, "  ptir_sort_pre({at}u);");
         body.push_str(BARRIER);
-        let _ = writeln!(body, "  ptir_step({at}u);");
+        let _ = writeln!(body, "  {};", step_call(at, tag));
         body.push_str(BARRIER);
         let _ = writeln!(body, "  ptir_pivot_pack({at}u);");
     } else if is_reduce(tag) {
         for level in 0..REDUCE_LEVELS {
-            let _ = writeln!(body, "  ptir_reduce_level({at}u, {level}u);");
+            let _ = writeln!(body, "  {};", reduce_level_call(at, tag, level));
             body.push_str(BARRIER);
         }
-        let _ = writeln!(body, "  ptir_reduce_finish({at}u);");
+        let _ = writeln!(body, "  {};", reduce_finish_call(at, tag));
     } else {
-        let _ = writeln!(body, "  ptir_step({at}u);");
+        let _ = writeln!(body, "  {};", step_call(at, tag));
     }
     body.push_str(BARRIER);
 }
@@ -315,18 +387,21 @@ fn step_op(
             );
         }
         push(alloc::format!("  ptir_sort_pre({at}u);\n"), "pre");
-        push(alloc::format!("  ptir_step({at}u);\n"), "step");
+        push(alloc::format!("  {};\n", step_call(at, tag)), "step");
         push(alloc::format!("  ptir_pivot_pack({at}u);\n"), "pack");
     } else if is_reduce(tag) {
         for level in 0..REDUCE_LEVELS {
             push(
-                alloc::format!("  ptir_reduce_level({at}u, {level}u);\n"),
+                alloc::format!("  {};\n", reduce_level_call(at, tag, level)),
                 &alloc::format!("l{level}"),
             );
         }
-        push(alloc::format!("  ptir_reduce_finish({at}u);\n"), "fin");
+        push(
+            alloc::format!("  {};\n", reduce_finish_call(at, tag)),
+            "fin",
+        );
     } else {
-        push(alloc::format!("  ptir_step({at}u);\n"), "step");
+        push(alloc::format!("  {};\n", step_call(at, tag)), "step");
     }
 }
 
@@ -378,6 +453,7 @@ mod tests {
     fn wgsl_every_case() {
         the_runtime_and_the_emitter_agree_on_the_ladders_height();
         the_runtime_grew_no_sequencing_the_emitter_cannot_spell();
+        every_arm_of_the_runtime_switch_is_spelled_directly();
         the_runtime_and_the_emitter_agree_on_the_workgroup();
         every_emitted_tag_has_a_runtime_arm();
         the_reduce_ladder_has_its_three_entry_points();
@@ -409,6 +485,47 @@ mod tests {
             "the runtime folds {declared} rungs and the emitter spells {}",
             super::REDUCE_LEVELS
         );
+    }
+
+    fn every_arm_of_the_runtime_switch_is_spelled_directly() {
+        if !super::specialize() {
+            return;
+        }
+        let switch = RUNTIME
+            .split("fn ptir_step(p : u32) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the runtime defines `ptir_step`");
+        let mut arms = 0;
+        for line in switch.lines() {
+            let Some(rest) = line.trim().strip_prefix("case 0x") else {
+                continue;
+            };
+            let (hex, call) = rest.split_once("u: {").expect("a switch arm");
+            let tag = u8::from_str_radix(hex, 16).expect("a tag");
+            let call = call
+                .trim()
+                .trim_end_matches('}')
+                .trim()
+                .trim_end_matches(';');
+            let spelled = super::step_call(7, tag);
+            let expected = call.replace("(p,", "(7u,").replace("(p)", "(7u)");
+            if call.is_empty() {
+                assert_eq!(spelled, "ptir_step(7u)", "tag {tag:#x} does nothing");
+            } else {
+                assert_eq!(spelled, expected, "tag {tag:#x}");
+            }
+            arms += 1;
+        }
+        assert!(arms > 40, "the switch has {arms} arms");
+        for tag in [
+            tags::REDUCE_SUM,
+            tags::REDUCE_MAX,
+            tags::REDUCE_MIN,
+            tags::REDUCE_ARGMAX,
+        ] {
+            assert!(super::reduce_kind(tag).is_some());
+        }
     }
 
     fn the_runtime_grew_no_sequencing_the_emitter_cannot_spell() {
@@ -564,7 +681,7 @@ mod tests {
 
 #[cfg(test)]
 mod stepwise_tests {
-    use super::{RUNTIME, Refused, WORKGROUP, emit_launch_stage, emit_launch_steps};
+    use super::{ENTRY_MARKER, RUNTIME, Refused, WORKGROUP, emit_launch_stage, emit_launch_steps};
     use crate::codegen::launch::{LaunchOp, LaunchPlanValue, LaunchStagePlan};
     use crate::plan::Dimension;
     use alloc::format;
@@ -601,10 +718,23 @@ mod stepwise_tests {
 
     fn calls(source: &str) -> Vec<String> {
         source
+            .splitn(2, ENTRY_MARKER)
+            .nth(1)
+            .unwrap_or(source)
             .lines()
             .filter_map(|line| {
                 let line = line.trim();
-                line.starts_with("ptir_").then(|| line.to_string())
+                [
+                    "ptir_",
+                    "op_",
+                    "map_unary(",
+                    "bin_arith(",
+                    "cmp_op(",
+                    "logic_op(",
+                ]
+                .iter()
+                .any(|head| line.starts_with(head))
+                .then(|| line.to_string())
             })
             .collect()
     }
@@ -725,8 +855,13 @@ mod stepwise_tests {
         );
         let one = emit_launch_stage("whole", &stage).expect("emits");
         let many = emit_launch_steps("s", &stage).expect("emits");
-        assert!(!one.contains("ptir_step(1u)"), "the reshape reads no bytes");
-        assert!(!many.source.contains("ptir_step(1u)"));
+        let one_body = one.split(ENTRY_MARKER).nth(1).unwrap();
+        let many_body = many.source.split(ENTRY_MARKER).nth(1).unwrap();
+        assert!(
+            !one_body.contains("(1u)") && !one_body.contains("(1u,"),
+            "the reshape reads no bytes"
+        );
+        assert!(!many_body.contains("(1u)") && !many_body.contains("(1u,"));
         assert!(
             many.steps.iter().all(|step| step.node != 1),
             "an elided node gets no dispatch of its own"

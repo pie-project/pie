@@ -1,23 +1,32 @@
-use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Result, anyhow, bail};
+#[cfg(not(target_arch = "wasm32"))]
+use anyhow::anyhow;
+use anyhow::{Result, bail};
 use std::collections::HashMap;
 
 use super::ProgramName;
-use super::manifest::{Manifest, manifest_url};
+use super::manifest::Manifest;
+#[cfg(not(target_arch = "wasm32"))]
+use super::manifest::manifest_url;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn wasm_path(programs_dir: &Path, name: &ProgramName) -> PathBuf {
     programs_dir
         .join(&name.name)
         .join(format!("{}.wasm", name.version))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn manifest_path(programs_dir: &Path, name: &ProgramName) -> PathBuf {
     programs_dir
         .join(&name.name)
         .join(format!("{}.toml", name.version))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn wasm_url(registry_url: &str, name: &ProgramName) -> String {
     format!(
         "{}/api/v1/inferlets/{}/{}/download",
@@ -31,6 +40,7 @@ pub struct Repository {
     index: HashMap<ProgramName, Manifest>,
     preloaded_binaries: HashMap<ProgramName, Vec<u8>>,
     registry_url: String,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     programs_dir: PathBuf,
 }
 
@@ -49,9 +59,15 @@ impl Repository {
     }
 
     pub async fn fetch_wasm_binary(&mut self, name: &ProgramName) -> Result<Vec<u8>> {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(wasm_binary) = self.preloaded_binaries.get(name) {
+            return Ok(wasm_binary.clone());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(wasm_binary) = self.preloaded_binaries.remove(name) {
             return Ok(wasm_binary);
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if self.index.contains_key(name) {
             let wasm = wasm_path(&self.programs_dir, name);
             let wasm_binary = tokio::fs::read(&wasm)
@@ -68,9 +84,15 @@ impl Repository {
             .index
             .iter()
             .map(|(name, manifest)| {
+                #[cfg(not(target_arch = "wasm32"))]
                 let size = std::fs::metadata(wasm_path(&self.programs_dir, name))
                     .map(|m| m.len())
                     .unwrap_or(0);
+                #[cfg(target_arch = "wasm32")]
+                let size = self
+                    .preloaded_binaries
+                    .get(name)
+                    .map_or(0, |bytes| bytes.len() as u64);
                 (name.clone(), manifest.clone(), size)
             })
             .collect();
@@ -78,6 +100,13 @@ impl Repository {
         out
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn remove(&mut self, name: &ProgramName) -> Result<bool> {
+        let known = self.index.remove(name).is_some();
+        Ok(self.preloaded_binaries.remove(name).is_some() || known)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn remove(&mut self, name: &ProgramName) -> Result<bool> {
         if self.index.remove(name).is_none() && !wasm_path(&self.programs_dir, name).exists() {
             return Ok(false);
@@ -101,6 +130,20 @@ impl Repository {
         self.index.contains_key(name)
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub async fn add_from_registry(
+        &mut self,
+        name: &ProgramName,
+        _force_overwrite: bool,
+    ) -> Result<()> {
+        bail!(
+            "program {name} is not installed, and this host cannot fetch it from {}: \
+             install it from bytes",
+            self.registry_url
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn add_from_registry(
         &mut self,
         name: &ProgramName,
@@ -172,6 +215,10 @@ impl Repository {
         Ok(())
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn load_program_cache(&mut self) {}
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_program_cache(&mut self) {
         self.lift_doubled_programs_dir();
         let dir = self.programs_dir.clone();
@@ -233,6 +280,7 @@ impl Repository {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn lift_doubled_programs_dir(&self) {
         let nested = self.programs_dir.join("programs");
         let Ok(entries) = std::fs::read_dir(&nested) else {
@@ -247,6 +295,13 @@ impl Repository {
         let _ = std::fs::remove_dir(&nested);
     }
 
+    #[cfg(target_arch = "wasm32")]
+    async fn store_program_cache(&mut self, _wasm_binary: &[u8], manifest: Manifest) -> Result<()> {
+        self.index.insert(manifest.program_name(), manifest);
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     async fn store_program_cache(&mut self, wasm_binary: &[u8], manifest: Manifest) -> Result<()> {
         let name = manifest.program_name();
         let dir = self.programs_dir.join(&name.name);

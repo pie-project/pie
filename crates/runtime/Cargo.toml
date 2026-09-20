@@ -20,46 +20,15 @@ eta-compiler = { path = "../eta-compiler" }
 engine-cuda = { path = "../engine-cuda", optional = true, default-features = false }
 engine-metal = { path = "../engine-metal", optional = true }
 
-client = { path = "../client" }
-tokio = { version = "1.53", features = ["full"] }
+client-api = { path = "../client-api" }
 parking_lot = "0.12"
-tarpc = { version = "0.37", features = ["serde1"] }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
 rand = { version = "0.10.2", features = ["std_rng", "sys_rng"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing = "0.1.44"
-tracing-appender = "0.2"
-tracing-opentelemetry = "0.33"
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
-    "grpc-tonic",
-    "trace",
-    "metrics",
-] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
-wasmtime = { version = "48.0.1", default-features = false, features = [
-    "runtime",
-    "std",
-    "anyhow",
-    "async",
-    "backtrace",
-    "cranelift",
-    "parallel-compilation",
-    "component-model",
-    "component-model-async",
-    "pooling-allocator",
-    "addr2line",
-    "demangle",
-] }
-wasmtime-wasi = { version = "48.0.1", default-features = false, features = ["p2", "p3"] }
-wasmtime-wasi-http = { version = "48.0.1", default-features = false, features = [
-    "p2",
-    "p3",
-    "default-send-request",
-] }
 http = "1"
 bytes = "1.12.1"
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
@@ -87,15 +56,12 @@ async-trait = "0.1.91"
 wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }
 wasmparser = "0.254.0"
 wasm-metadata = "0.254.0"
-libc = "0.2"
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
     "std",
     "driver",
     "fallback-dynamic-loading",
 ] }
 libloading = { version = "0.9", optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
-crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 rustc-hash = "2.1"
 smallvec = "1"
 lru = "0.18.1"
@@ -104,6 +70,67 @@ ipnet = "2"
 engine-vulkan = { path = "../engine-vulkan", optional = true }
 
 engine-wgpu = { path = "../engine-wgpu", optional = true }
+wgpu = { version = "30", default-features = false, features = ["wgsl"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.53", features = ["full"] }
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+tracing-appender = "0.2"
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "grpc-tonic",
+    "trace",
+    "metrics",
+] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
+wasmtime = { version = "48.0.1", default-features = false, features = [
+    "runtime",
+    "std",
+    "anyhow",
+    "async",
+    "backtrace",
+    "cranelift",
+    "parallel-compilation",
+    "component-model",
+    "component-model-async",
+    "pooling-allocator",
+    "addr2line",
+    "demangle",
+] }
+wasmtime-wasi = { version = "48.0.1", default-features = false, features = ["p2", "p3"] }
+wasmtime-wasi-http = { version = "48.0.1", default-features = false, features = [
+    "p2",
+    "p3",
+    "default-send-request",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.53", default-features = false, features = ["sync", "macros"] }
+web-std = { path = "../web-std" }
+wasmtime-web = { path = "../wasmtime-web" }
+wasmtime = { version = "48.0.1", default-features = false, features = [
+    "runtime",
+    "std",
+    "anyhow",
+    "async",
+    "cranelift",
+    "pulley",
+    "component-model",
+    "component-model-async",
+    "custom-fiber",
+    "custom-virtual-memory",
+] }
+uuid = { version = "1.24.0", features = ["serde", "v4", "js"] }
+wgpu = { version = "30", default-features = false, features = [
+    "wgsl",
+    "webgpu",
+    "fragile-send-sync-non-atomic-wasm",
+], optional = true }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 engine-metal = { path = "../engine-metal", optional = true }
@@ -113,7 +140,7 @@ default = []
 cuda = ["dep:engine-cuda", "engine-cuda/cuda", "dep:cudarc", "dep:libloading", "cudarc/cuda-13000"]
 metal = ["dep:engine-metal"]
 vulkan = ["dep:engine-vulkan", "engine-vulkan/vulkan"]
-wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu"]
+wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu", "dep:wgpu"]
 profile-fire = []
 
 [dev-dependencies]

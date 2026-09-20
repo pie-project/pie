@@ -100,6 +100,18 @@ impl Slabs {
     pub const PROCESS: Slabs = Slabs(0);
 
     #[must_use]
+    pub fn census() -> Vec<(&'static str, usize)> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::census()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Vec::new()
+        }
+    }
+
+    #[must_use]
     pub fn open() -> Slabs {
         static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
         Slabs(NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
@@ -136,6 +148,8 @@ pub struct Pad {
 
 pub const NO_REGION: u32 = u32::MAX;
 
+pub const SHARED_REGION: u32 = u32::MAX - 1;
+
 pub struct Ctx {
     stream: *mut c_void,
     cublas: *mut c_void,
@@ -146,6 +160,7 @@ pub struct Ctx {
 
     stage: core::cell::Cell<u64>,
     region: core::cell::Cell<u32>,
+    lane: core::cell::Cell<u32>,
 }
 
 impl Ctx {
@@ -165,6 +180,7 @@ impl Ctx {
             }),
             stage: core::cell::Cell::new(0),
             region: core::cell::Cell::new(NO_REGION),
+            lane: core::cell::Cell::new(0),
         }
     }
 
@@ -229,6 +245,25 @@ impl Ctx {
         }
     }
 
+    pub fn scratch_shared(
+        &self,
+        op: &'static str,
+        name: &'static str,
+        bytes: usize,
+    ) -> Result<*mut c_void, Error> {
+        #[cfg(feature = "cuda")]
+        {
+            let region = SHARED_REGION.saturating_sub(self.lane.get().min(1 << 8));
+            crate::jit::device::take(self.slabs.0, self.stream, name, region, bytes)
+                .map_err(|fault| fault.at(op))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (name, bytes);
+            Err(crate::jit::runtimeless(op))
+        }
+    }
+
     #[must_use]
     pub const fn slabs(&self) -> Slabs {
         self.slabs
@@ -250,6 +285,9 @@ impl Ctx {
         self.stage.set(0);
     }
 
+    pub fn arm_lane(&self, lane: u32) {
+        self.lane.set(lane);
+    }
     pub fn arm_region(&self, region: u32) {
         self.region.set(region);
     }

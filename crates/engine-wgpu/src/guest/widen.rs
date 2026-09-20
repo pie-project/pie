@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::device::Context;
@@ -45,10 +44,6 @@ pub struct Widen {
 
     binds: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
-
-    cfg: wgpu::Buffer,
-
-    armed: Cell<bool>,
 }
 
 impl std::fmt::Debug for Widen {
@@ -60,13 +55,6 @@ impl std::fmt::Debug for Widen {
 impl Widen {
     pub fn new(device: &Context) -> Result<Widen> {
         let core = device.core().clone();
-        let cfg = core.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pie widen cfg"),
-            size: size_of::<Cfg>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        core.take_error("create_buffer")?;
 
         let storage = |at: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
             binding: at,
@@ -106,37 +94,33 @@ impl Widen {
             });
         core.take_error("create_pipeline_layout")?;
 
-        let scope = core.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let module = core
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("pie widen"),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(SOURCE)),
-            });
-        let pipeline = core
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("pie widen"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
-        if let Some(error) = pollster::block_on(scope.pop()) {
-            return Err(Fault::Shader {
-                file: "widen.wgsl",
-                entrypoint: "main",
-                why: format!("the readout widen was refused: {error}"),
-            });
-        }
+        let pipeline = crate::guest::validated(&core, "create_compute_pipeline", || {
+            let module = core
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("pie widen"),
+                    source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(SOURCE)),
+                });
+            core.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("pie widen"),
+                    layout: Some(&layout),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                })
+        })
+        .map_err(|error| Fault::Shader {
+            file: "widen.wgsl",
+            entrypoint: "main",
+            why: format!("the readout widen was refused: {error}"),
+        })?;
 
         Ok(Widen {
             core,
             binds,
             pipeline,
-            cfg,
-            armed: Cell::new(false),
         })
     }
 
@@ -149,14 +133,6 @@ impl Widen {
         dst_at: u64,
         lanes: u32,
     ) -> Result<()> {
-        if self.armed.get() {
-            return Err(Fault::Program {
-                at: "guest::widen",
-                why: "a second readout widen was recorded into one frame; there is one config \
-                      slot and the first would run with the second's offsets"
-                    .into(),
-            });
-        }
         if !src_at.is_multiple_of(4) || !dst_at.is_multiple_of(4) {
             return Err(Fault::Program {
                 at: "guest::widen",
@@ -166,17 +142,14 @@ impl Widen {
                 ),
             });
         }
-        self.core.queue.write_buffer(
-            &self.cfg,
-            0,
-            &config_bytes(Cfg {
-                src_word: u32::try_from(src_at / 4).unwrap_or(u32::MAX),
-                dst_word: u32::try_from(dst_at / 4).unwrap_or(u32::MAX),
-                lanes,
-                pad: 0,
-            }),
-        );
-        self.armed.set(true);
+        let bytes = config_bytes(Cfg {
+            src_word: u32::try_from(src_at / 4).unwrap_or(u32::MAX),
+            dst_word: u32::try_from(dst_at / 4).unwrap_or(u32::MAX),
+            lanes,
+            pad: 0,
+        });
+        let (cfg, cfg_at) = frame.uniform_slot(bytes.len() as u64);
+        self.core.queue.write_buffer(&cfg, cfg_at, &bytes);
 
         let group = self
             .core
@@ -195,7 +168,11 @@ impl Widen {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: self.cfg.as_entire_binding(),
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &cfg,
+                            offset: cfg_at,
+                            size: std::num::NonZeroU64::new(bytes.len() as u64),
+                        }),
                     },
                 ],
             });
@@ -207,10 +184,6 @@ impl Widen {
             &group,
             [lanes.div_ceil(WG).max(1), 1, 1],
         )
-    }
-
-    pub fn disarm(&self) {
-        self.armed.set(false);
     }
 }
 

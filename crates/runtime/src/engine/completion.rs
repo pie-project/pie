@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::Poll;
 
+use crate::rt::SegQueue;
 use anyhow::{Result, anyhow};
-use crossbeam::queue::SegQueue;
 use waker::{FIRST_COMPLETION_EPOCH, WakerSlotId, WakerTable};
 
 pub type TerminalOutcomeCode = u32;
@@ -41,17 +41,27 @@ impl TerminalCell {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct CellPtr(pub *mut TerminalCell);
+
+// SAFETY: see the type's doc — the pointee outlives every holder (the same
+// lifetime argument `settle` makes) and is only touched through its atomics.
+unsafe impl Send for CellPtr {}
+unsafe impl Sync for CellPtr {}
+
+impl CellPtr {
+    pub const NULL: CellPtr = CellPtr(ptr::null_mut());
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CompletionTarget {
     pub wait_id: u64,
 
     pub target_epoch: u64,
 
-    pub terminal_cell: *mut TerminalCell,
+    pub terminal_cell: CellPtr,
 }
-
-unsafe impl Send for CompletionTarget {}
-unsafe impl Sync for CompletionTarget {}
 
 pub trait CompletionLease: Send + Sync {
     fn is_closed(&self) -> bool;
@@ -117,8 +127,8 @@ impl OwnedTerminalCell {
             .0
     }
 
-    fn as_mut_ptr(&self) -> *mut TerminalCell {
-        ptr::from_ref(self.cell()).cast_mut()
+    fn as_mut_ptr(&self) -> CellPtr {
+        CellPtr(ptr::from_ref(self.cell()).cast_mut())
     }
 
     fn load(&self) -> TerminalOutcome {
@@ -218,7 +228,7 @@ impl SubmissionCompletionState {
         }
     }
 
-    fn terminal_cell_ptr(&self) -> Option<*mut TerminalCell> {
+    fn terminal_cell_ptr(&self) -> Option<CellPtr> {
         match &self.mode {
             SubmissionCompletionMode::WakeOnly => None,
             SubmissionCompletionMode::Terminal { cell } => Some(cell.as_mut_ptr()),
@@ -340,7 +350,7 @@ impl CompletionBroker {
         let target = CompletionTarget {
             wait_id: completion.wait_id(),
             target_epoch,
-            terminal_cell: ptr::null_mut(),
+            terminal_cell: CellPtr::NULL,
         };
         (target, completion)
     }
@@ -436,7 +446,7 @@ impl SubmissionCompletion {
         }
     }
 
-    pub fn terminal_cell_ptr(&self) -> Option<*mut TerminalCell> {
+    pub fn terminal_cell_ptr(&self) -> Option<CellPtr> {
         match &self.kind {
             SubmissionCompletionKind::Pending(pending) => pending.state.terminal_cell_ptr(),
             SubmissionCompletionKind::ReadyOk
@@ -622,7 +632,7 @@ impl WorkItemCompletionState {
         self.target_epoch.load(Ordering::Acquire)
     }
 
-    fn terminal_cell_ptr(&self) -> *mut TerminalCell {
+    fn terminal_cell_ptr(&self) -> CellPtr {
         self.terminal.as_mut_ptr()
     }
 
@@ -772,7 +782,7 @@ impl WorkItemCompletion {
         self.state.target_epoch()
     }
 
-    pub fn terminal_cell_ptr(&self) -> *mut TerminalCell {
+    pub fn terminal_cell_ptr(&self) -> CellPtr {
         self.state.terminal_cell_ptr()
     }
 
@@ -832,8 +842,8 @@ impl Drop for WorkItemCompletion {
     }
 }
 
-pub fn settle(cells: &[*mut TerminalCell], outcome: TerminalOutcomeCode) {
-    for &cell in cells {
+pub fn settle(cells: &[CellPtr], outcome: TerminalOutcomeCode) {
+    for &CellPtr(cell) in cells {
         if cell.is_null() {
             continue;
         }
@@ -848,18 +858,12 @@ pub fn settle(cells: &[*mut TerminalCell], outcome: TerminalOutcomeCode) {
 
 struct PendingFrame {
     remaining: usize,
-    cells: Vec<*mut TerminalCell>,
-    frame_cell: *mut TerminalCell,
+    cells: Vec<CellPtr>,
+    frame_cell: CellPtr,
     wait_id: u64,
     epoch: u64,
     wakes: Vec<u64>,
 }
-
-// SAFETY: the pointers are `TerminalCell` addresses owned by
-// `WorkItemCompletion`s the scheduler holds for the whole life of the frame
-// (the same lifetime argument `settle` makes), and every access through them
-// is a release store into an `AtomicU32`. The waker ids are integers.
-unsafe impl Send for PendingFrame {}
 
 #[derive(Default)]
 pub struct FrameSettlements {
@@ -882,7 +886,7 @@ impl FrameSettlements {
         &self,
         frame: u64,
         steps: usize,
-        cells: Vec<*mut TerminalCell>,
+        cells: Vec<CellPtr>,
         wakes: Vec<u64>,
         completion: &SubmissionCompletion,
         broker: &CompletionBroker,
@@ -929,14 +933,26 @@ impl FrameSettlements {
                 let seen = book.early.entry(frame).or_insert((0, false));
                 seen.0 += 1;
                 seen.1 |= failed;
+                tracing::debug!(
+                    frame,
+                    failed,
+                    early = seen.0,
+                    "settled before its frame was booked"
+                );
                 return;
             };
             pending.remaining = pending.remaining.saturating_sub(1);
             if !failed && pending.remaining > 0 {
+                tracing::debug!(
+                    frame,
+                    remaining = pending.remaining,
+                    "step settled, frame still open"
+                );
                 return;
             }
             book.frames.remove(&frame).expect("present just above")
         };
+        tracing::debug!(frame, failed, "frame settled; publishing");
         publish(&pending, failed, broker);
     }
 
@@ -962,6 +978,7 @@ fn publish(pending: &PendingFrame, failed: bool, broker: &CompletionBroker) {
     settle(&[pending.frame_cell], code);
     broker.notify(pending.wait_id, pending.epoch);
     for wait_id in &pending.wakes {
-        waker::WakerTable::global().wake(*wait_id);
+        let outcome = waker::WakerTable::global().wake(*wait_id);
+        tracing::debug!(wait_id, ?outcome, "published to a waiter");
     }
 }

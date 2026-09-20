@@ -12,7 +12,6 @@ name = "engine_wgpu"
 path = "src/lib.rs"
 
 [dependencies]
-memmap2 = "0.9"
 toml = "1.1"
 model-ir = { path = "../model-ir" }
 kernels-wgpu = { path = "../kernels-wgpu" }
@@ -24,21 +23,29 @@ eta-exec = { path = "../eta-exec" }
 
 eta-compiler = { path = "../eta-compiler" }
 checkpoint = { path = "../checkpoint" }
-libc = "0.2"
 tracing = "0.1"
 
+naga = { version = "30", default-features = false, features = ["wgsl-in"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9"
+libc = "0.2"
 wgpu = { version = "30", default-features = false, features = [
     "wgsl",
     "vulkan",
     "metal",
     "dx12",
 ], optional = true }
-pollster = { version = "0.4", optional = true }
-
-naga = { version = "30", default-features = false, features = ["wgsl-in"], optional = true }
-
 ash = { version = "0.38", default-features = false, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-std = { path = "../web-std" }
+wgpu = { version = "30", default-features = false, features = [
+    "wgsl",
+    "webgpu",
+    "fragile-send-sync-non-atomic-wasm",
+], optional = true }
 
 [features]
 default = []
-wgpu = ["dep:wgpu", "dep:pollster", "dep:naga", "dep:ash"]
+wgpu = ["dep:wgpu", "dep:naga", "dep:ash"]

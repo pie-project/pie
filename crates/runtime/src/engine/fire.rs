@@ -1,7 +1,7 @@
 use engine::fire::{KvDelta, Lane, Step};
 use eta_ir::registry::GeometryClass;
 
-use crate::engine::completion::TerminalCell;
+use crate::engine::completion::CellPtr;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FireRequest {
@@ -81,7 +81,7 @@ impl FireRequest {
 
 pub struct StepFire {
     pub submission: Step,
-    pub terminal_cells: Vec<*mut TerminalCell>,
+    pub terminal_cells: Vec<CellPtr>,
     pub instances: Vec<u64>,
     pub logical_fire_ids: Vec<u64>,
 }
@@ -92,7 +92,7 @@ pub struct FrameFire {
 }
 
 impl FrameFire {
-    pub fn terminal_cells(&self) -> impl Iterator<Item = *mut TerminalCell> + '_ {
+    pub fn terminal_cells(&self) -> impl Iterator<Item = CellPtr> + '_ {
         self.steps
             .iter()
             .flat_map(|step| step.terminal_cells.iter().copied())

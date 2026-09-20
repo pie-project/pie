@@ -1,4 +1,5 @@
-
+//#include "common/bf16.inc.wgsl"
+//#include "common/reduce.inc.wgsl"
 
 fn index_rope_word(word: u32, i: i32, rope_dim: i32, pos: i32, theta: f32) -> u32 {
     let freq = pow(theta, -2.0 * f32(i) / f32(rope_dim));
@@ -10,6 +11,7 @@ fn index_rope_word(word: u32, i: i32, rope_dim: i32, pos: i32, theta: f32) -> u3
     return pie_pack_bf16(a * c - b * s, b * c + a * s);
 }
 
+//#if defined(PIE_INDEX_KNORM)
 
 @group(0) @binding(0) var<storage, read_write> idx_k: array<u32>;
 @group(0) @binding(1) var<storage, read> w: array<u32>;
@@ -71,6 +73,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
+//#elif defined(PIE_INDEX_Q_ROPE)
 
 @group(0) @binding(0) var<storage, read_write> idx_q: array<u32>;
 @group(0) @binding(1) var<storage, read> positions: array<i32>;
@@ -98,6 +101,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+//#else
 
 const PIE_LANES_PER_KEY = 64;
 const PIE_KEYS_PER_PASS = PIE_GROUP_X / PIE_LANES_PER_KEY;
@@ -257,5 +261,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         }
     }
 }
+//#endif
 
-
+// pie:instantiate index_knorm_rope_bf16 PIE_INDEX_KNORM=1 PIE_GROUP_X=256
+// pie:instantiate index_q_rope_bf16 PIE_INDEX_Q_ROPE=1 PIE_GROUP_X=32
+// pie:instantiate index_topk_paged_bf16 PIE_GROUP_X=256

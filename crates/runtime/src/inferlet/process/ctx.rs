@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OwnedSemaphorePermit;
 use wasmtime::component::{ResourceAny, ResourceTable};
-use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxView, WasiView};
+#[cfg(not(target_arch = "wasm32"))]
+use wasmtime_wasi::FsPerms;
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+#[cfg(not(target_arch = "wasm32"))]
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
 use super::ProcessId;
@@ -26,7 +29,9 @@ pub struct ProcessCtx {
 
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
+    #[cfg(not(target_arch = "wasm32"))]
     http_ctx: WasiHttpCtx,
+    #[cfg(not(target_arch = "wasm32"))]
     http_hooks: PieHttpHooks,
 
     network_allowed: bool,
@@ -79,10 +84,12 @@ impl WasiView for ProcessCtx {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub struct PieHttpHooks {
     network_allowed: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl WasiHttpHooks for PieHttpHooks {
     fn is_supported_scheme(&mut self, scheme: &http::uri::Scheme) -> bool {
         self.network_allowed
@@ -90,6 +97,7 @@ impl WasiHttpHooks for PieHttpHooks {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl WasiHttpView for ProcessCtx {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView {
@@ -108,8 +116,38 @@ impl ProcessCtx {
         policy: &InstancePolicy,
         py_runtime_dir: Option<&Path>,
     ) -> anyhow::Result<Self> {
+        #[cfg(target_arch = "wasm32")]
+        let wasi_ctx = {
+            let mut builder = WasiCtx::builder();
+            match output {
+                OutputMode::Discard => {}
+                OutputMode::Stream => {
+                    let (out, err) = (LogStream::new_stdout(id), LogStream::new_stderr(id));
+                    builder = builder
+                        .stdout(move |bytes| out.write_bytes(bytes))
+                        .stderr(move |bytes| err.write_bytes(bytes));
+                }
+                OutputMode::Log { program } => {
+                    let program: Arc<str> = Arc::from(program);
+                    let (out, err) = (
+                        LogStream::new_server_stdout(program.clone()),
+                        LogStream::new_server_stderr(program),
+                    );
+                    builder = builder
+                        .stdout(move |bytes| out.write_bytes(bytes))
+                        .stderr(move |bytes| err.write_bytes(bytes));
+                }
+            }
+            let _ = py_runtime_dir;
+            builder.build()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let scratch_dir: Option<PathBuf> = None;
+
+        #[cfg(not(target_arch = "wasm32"))]
         let mut builder = WasiCtx::builder();
 
+        #[cfg(not(target_arch = "wasm32"))]
         if policy.network.allow {
             builder.inherit_network();
             if !policy.network.is_unrestricted() {
@@ -121,6 +159,7 @@ impl ProcessCtx {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         match output {
             OutputMode::Discard => {}
             OutputMode::Stream => {
@@ -134,6 +173,7 @@ impl ProcessCtx {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         let scratch_dir = if policy.fs.allow {
             let scratch_dir = policy.fs.base_dir.join(id.to_string());
             std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
@@ -146,6 +186,7 @@ impl ProcessCtx {
             None
         };
 
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(dir) = py_runtime_dir {
             let runtime_dir = dir.join("runtime");
             let site_packages_dir = dir.join("site-packages");
@@ -170,12 +211,17 @@ impl ProcessCtx {
                 .expect("failed to preopen site-packages dir");
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let wasi_ctx = builder.build();
+
         Ok(ProcessCtx {
             id,
             username,
-            wasi_ctx: builder.build(),
+            wasi_ctx,
             resource_table: ResourceTable::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             http_ctx: WasiHttpCtx::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             http_hooks: PieHttpHooks {
                 network_allowed: policy.network.allow,
             },

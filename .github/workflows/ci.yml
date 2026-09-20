@@ -465,3 +465,119 @@ jobs:
           ldd target/debug/pie | grep -E "libcudart|libcublas|libcublasLt" \
             && { echo "FAIL: CUDA shared lib leaked into binary"; exit 1; } \
             || echo "OK: no CUDA shared deps"
+
+  browser-check:
+    name: browser port (wasm32 + native gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cache cargo registry + targets
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            target-wasm
+          key: ${{ runner.os }}-cargo-web-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-web-
+
+      - name: Install client SDK dependencies
+        working-directory: sdk/client/javascript
+        run: npm install --no-save msgpack-lite@0.1.26 @noble/hashes@2.2.0
+
+      - name: scripts/web-check.sh
+        run: ./scripts/web-check.sh
+
+  wgpu-lavapipe:
+    name: wgpu engine on lavapipe (no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install lavapipe
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+
+      - name: Cache cargo registry + targets
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lavapipe-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lavapipe-
+
+      - name: Cache the tokenizer
+        uses: actions/cache@v5
+        with:
+          path: ~/qwen35-tokenizer
+          key: qwen35-tokenizer-v1
+
+      - name: Fetch the tokenizer
+        run: |
+          mkdir -p ~/qwen35-tokenizer
+          for f in tokenizer.json tokenizer_config.json chat_template.jinja; do
+            [ -s ~/qwen35-tokenizer/$f ] || curl -sSL -o ~/qwen35-tokenizer/$f https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/$f
+          done
+
+      - name: Install client SDK dependencies
+        working-directory: sdk/client/javascript
+        run: npm install --no-save msgpack-lite@0.1.26 @noble/hashes@2.2.0 ws
+
+      - name: Serve the miniature on lavapipe and run the corner cases
+        run: PIE_TOKENIZER_DIR=$HOME/qwen35-tokenizer ./tests/web/tools/ci-lavapipe.sh
+
+  tint-swiftshader:
+    name: kernels through Tint (SwiftShader)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cache cargo registry + targets
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tint-
+
+      - name: Install Playwright's Chromium
+        run: |
+          npm install --prefix tests/web/tools playwright@1.63.0
+          npx --prefix tests/web/tools playwright install --with-deps chromium
+
+      - name: Dump every kernel variant
+        run: cargo run -q -p kernels-wgpu --example dump_wgsl -- crates/kernels-wgpu/tools/wgsl
+
+      - name: Compile them through Tint
+        run: PIE_CHROME_ARGS="--use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader" node tests/web/tools/headless.mjs . crates/kernels-wgpu/tools/wgsl-check.html --timeout 900000

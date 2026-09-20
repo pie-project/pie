@@ -572,6 +572,36 @@ impl Model {
         }
     }
 
+    pub fn tiny(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                hidden: 256,
+                layers: 4,
+                attn_every: 4,
+                q_heads: 4,
+                kv_heads: 2,
+                head_dim: 64,
+                rotary_dim: 32,
+                theta: 10_000_000.0,
+                k_heads: 4,
+                v_heads: 8,
+                k_dim: 128,
+                v_dim: 128,
+                conv_kernel: 4,
+                mlp: MlpDims::Dense { inter: 512 },
+                vocab: 248_320,
+                tied: true,
+                norm_eps: 1e-6,
+                tower: None,
+                draft: None,
+                dflash_head: None,
+            },
+        )
+    }
+
     pub fn d3b(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -622,6 +652,36 @@ impl Model {
                 v_dim: 128,
                 conv_kernel: 4,
                 mlp: MlpDims::Dense { inter: 6144 },
+                vocab: 248_320,
+                tied: true,
+                norm_eps: 1e-6,
+                tower: None,
+                draft: None,
+                dflash_head: None,
+            },
+        )
+    }
+
+    pub fn d4b(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                hidden: 2560,
+                layers: 32,
+                attn_every: 4,
+                q_heads: 16,
+                kv_heads: 4,
+                head_dim: 256,
+                rotary_dim: 64,
+                theta: 10_000_000.0,
+                k_heads: 16,
+                v_heads: 32,
+                k_dim: 128,
+                v_dim: 128,
+                conv_kernel: 4,
+                mlp: MlpDims::Dense { inter: 9216 },
                 vocab: 248_320,
                 tied: true,
                 norm_eps: 1e-6,

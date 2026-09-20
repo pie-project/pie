@@ -126,10 +126,7 @@ fn the_token_reading_fires_alone() {
         &weights,
         64,
         vec![16, 64],
-        Recording::Bodies {
-            golden: false,
-            mem_megabytes: 0,
-        },
+        Recording::Bodies { mem_megabytes: 0 },
     );
 
     let program = rig.register(epilogue(TEXT_ROWS, WIDTH), 7);
