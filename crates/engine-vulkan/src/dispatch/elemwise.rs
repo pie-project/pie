@@ -114,6 +114,7 @@ impl Run<'_> {
             | Elementwise::Silu { .. }
             | Elementwise::Gelu { .. }
             | Elementwise::Tanh { .. }
+            | Elementwise::Hadamard { .. }
             | Elementwise::Mul { .. }
             | Elementwise::Add { .. }
             | Elementwise::RopeAxes { .. }

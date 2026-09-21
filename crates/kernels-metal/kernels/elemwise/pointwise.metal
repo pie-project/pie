@@ -70,6 +70,39 @@ instantiate_activation(act_tanh, float32, float)
 instantiate_activation(act_gelu_tanh, bfloat16, bfloat)
 instantiate_activation(act_gelu_tanh, float32, float)
 
+// A blockwise-128 Hadamard: the row's last dim is cut into contiguous
+// 128-vectors, and each is multiplied by the normalized 128x128 Sylvester
+// Hadamard matrix H, whose entries are (-1)^popcount(i & j) / sqrt(128). H is
+// symmetric and orthonormal, so H . H = I and the op is its own inverse. One
+// threadgroup owns one 128-block; the block is staged in threadgroup memory
+// before any lane writes, so the transform is safe in place.
+template <typename T>
+[[kernel]] void hadamard_block_128(
+    device T* x  [[buffer(0)]],
+    uint gid     [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]]) {
+  constexpr uint BLOCK = 128u;
+  constexpr float INV_SQRT = 0.08838834764831845f;  // 1 / sqrt(128)
+  threadgroup float tile[BLOCK];
+  const size_t base = size_t(gid) * size_t(BLOCK);
+  tile[lid] = float(x[base + lid]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float acc = 0.0f;
+  for (uint j = 0u; j < BLOCK; ++j) {
+    const float sign = (popcount(lid & j) & 1u) ? -1.0f : 1.0f;
+    acc += sign * tile[j];
+  }
+  x[base + lid] = static_cast<T>(acc * INV_SQRT);
+}
+
+#define instantiate_hadamard_block_128(name, itype)                  \
+  template [[host_name("hadamard_block_128_" #name)]]               \
+  [[kernel]] void hadamard_block_128<itype>(                        \
+      device itype*, uint, uint);
+
+instantiate_hadamard_block_128(bfloat16, bfloat)
+instantiate_hadamard_block_128(float32, float)
+
 template <typename T>
 [[kernel]] void clamp_bounds(
     device T* x                [[buffer(0)]],

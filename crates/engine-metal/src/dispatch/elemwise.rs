@@ -164,6 +164,9 @@ impl Run<'_> {
             Elementwise::Tanh { x, x_out: _ } => {
                 elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), self.tensor(*x))
             }
+            Elementwise::Hadamard { x, x_out: _ } => {
+                elemwise::pointwise::hadamard(self.ctx(), self.tensor(*x))
+            }
             Elementwise::Mul { x, y, z } => elemwise::pointwise::mul(
                 self.ctx(),
                 self.tensor(*x),

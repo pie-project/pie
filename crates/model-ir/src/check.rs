@@ -163,6 +163,12 @@ pub enum Fault {
         want: Dtype,
         ty: Ty,
     },
+    HadamardBlock {
+        node: usize,
+        op: &'static str,
+        id: ValueId,
+        last: Option<Dim>,
+    },
 }
 
 pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
@@ -305,6 +311,21 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
                     want,
                     ty: decl.ty.clone(),
                     def: DefKind::of(&decl.def),
+                });
+            }
+        }
+
+        if let Operation::Elementwise(Elementwise::Hadamard { x, .. }) = &node.op
+            && in_range(*x)
+            && let Ty::Tensor { shape, .. } = &trace.values[x.0 as usize].ty
+        {
+            let last = shape.last().copied();
+            if !matches!(last, Some(Dim::Const(d)) if d % 128 == 0) {
+                faults.push(Fault::HadamardBlock {
+                    node: j,
+                    op,
+                    id: *x,
+                    last,
                 });
             }
         }
@@ -719,6 +740,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::Silu { .. }
             | Elementwise::Gelu { .. }
             | Elementwise::Tanh { .. }
+            | Elementwise::Hadamard { .. }
             | Elementwise::Mul { .. }
             | Elementwise::Add { .. } => &[],
         },
@@ -1109,6 +1131,19 @@ impl Display for Fault {
                     V(*id),
                     N(*want),
                     T(ty)
+                )
+            }
+            Fault::HadamardBlock {
+                node,
+                op,
+                id,
+                last,
+            } => {
+                write!(
+                    f,
+                    "node {node} ({op}): {} has last dim {last:?}, but a Hadamard block \
+                     transform needs a last dim that is a multiple of 128",
+                    V(*id)
                 )
             }
         }

@@ -86,6 +86,35 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
     activation(ctx, OP, entry, x, o)
 }
 
+/// A blockwise-128 Hadamard over the last dim, in place. The row width must be
+/// a multiple of 128; each contiguous 128-vector is turned by the normalized
+/// 128x128 Sylvester Hadamard matrix, which is its own inverse.
+pub fn hadamard(ctx: &Ctx<'_>, x: Tensor) -> Result<(), Error> {
+    const OP: &str = "elementwise.hadamard";
+    const BLOCK: u32 = 128;
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "hadamard_block_128_bfloat16",
+        F32 => "hadamard_block_128_float32",
+    });
+    if x.width % BLOCK != 0 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the row width {} is not a multiple of {BLOCK}; the block Hadamard turns \
+                 contiguous {BLOCK}-vectors",
+                x.width
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at(FILE, entry).apply(Grid::of(
+            elementwise(OP, x.width, x.rows)?,
+            [BLOCK, 1, 1],
+        )),
+        &[x.arg_mut()],
+    )
+}
+
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.clamp";

@@ -942,6 +942,19 @@ pub fn tanh(x: &Value) -> Value {
     x_out
 }
 
+pub fn hadamard(x: &Value) -> Value {
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::Hadamard {
+            x: x.id(),
+            x_out: x_out.id(),
+        },
+        &[x],
+    );
+    x_out
+}
+
 pub fn mul(x: &Value, y: &Value) -> Value {
     let r = x.rec();
     assert_eq!(x.ty(), y.ty(), "a product's operands share a type");
