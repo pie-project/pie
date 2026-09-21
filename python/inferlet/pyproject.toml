@@ -30,7 +30,7 @@ build = [
 dev = [
     "componentize-py>=0.19",
     "pytest>=7.0",
-    "pytest-asyncio>=0.21",
+    "pytest-asyncio>=1.4.0",
     "mypy>=1.0",
     "ruff>=0.1",
 ]
