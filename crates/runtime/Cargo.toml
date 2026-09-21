@@ -73,6 +73,7 @@ grammar = { path = "../grammar" }
 models = { path = "../models" }
 checkpoint = { path = "../checkpoint", default-features = false }
 checkpoint-dsl = { path = "../checkpoint-dsl" }
+media = { path = "../media" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 image = { version = "0.25", default-features = false, features = [
@@ -88,12 +89,6 @@ wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }
 wasmparser = "0.254.0"
 wasm-metadata = "0.254.0"
 libc = "0.2"
-cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
-    "std",
-    "driver",
-    "fallback-dynamic-loading",
-] }
-libloading = { version = "0.9", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 rustc-hash = "2.1"
@@ -110,7 +105,7 @@ engine-metal = { path = "../engine-metal", optional = true }
 
 [features]
 default = []
-cuda = ["dep:engine-cuda", "engine-cuda/cuda", "dep:cudarc", "dep:libloading", "cudarc/cuda-13000"]
+cuda = ["dep:engine-cuda", "engine-cuda/cuda", "media/nvenc"]
 metal = ["dep:engine-metal"]
 vulkan = ["dep:engine-vulkan", "engine-vulkan/vulkan"]
 wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu"]

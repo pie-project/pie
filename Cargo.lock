@@ -2939,6 +2939,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
+name = "media"
+version = "0.5.0"
+dependencies = [
+ "cudarc",
+ "image",
+ "libloading 0.9.0",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4352,7 +4361,6 @@ dependencies = [
  "checkpoint-dsl",
  "client",
  "crossbeam",
- "cudarc",
  "dashmap",
  "engine",
  "engine-cuda",
@@ -4368,8 +4376,8 @@ dependencies = [
  "image",
  "ipnet",
  "libc",
- "libloading 0.9.0",
  "lru",
+ "media",
  "model-ir",
  "models",
  "opentelemetry 0.32.0",

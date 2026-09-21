@@ -2,7 +2,6 @@
 extern crate engine_cuda as _;
 
 pub mod bootstrap;
-pub mod codec;
 pub mod engine;
 pub mod inferlet;
 pub mod model;

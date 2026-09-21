@@ -39,6 +39,7 @@ members = [
     "crates/models",
     "crates/checkpoint-dsl",
     "crates/chat-template",
+    "crates/media",
     "crates/kernels-cuda",
     "crates/kernels-metal",
     "crates/engine-cuda",

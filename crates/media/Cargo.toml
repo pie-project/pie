@@ -1,0 +1,30 @@
+[package]
+name = "media"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Media coding for Pie: still images (PNG/JPEG/GIF/WebP), WAV audio, Y4M and MP4 containers, RGB→I420/NV12 colour conversion, and optional NVENC hardware H.264/HEVC encode."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "media"
+path = "src/lib.rs"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+] }
+cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "fallback-dynamic-loading",
+] }
+libloading = { version = "0.9", optional = true }
+
+[features]
+default = []
+nvenc = ["dep:cudarc", "dep:libloading", "cudarc/cuda-13000"]
