@@ -14,7 +14,9 @@ pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
     if !(lo <= hi) {
         return Err(refuse(
             OP,
-            format!("the bounds {lo} and {hi} cross, and a clamp between them is the constant {hi}"),
+            format!(
+                "the bounds {lo} and {hi} cross, and a clamp between them is the constant {hi}"
+            ),
         ));
     }
     let n = x.elements();
@@ -40,12 +42,7 @@ pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
     )
 }
 
-pub fn clamp_learned(
-    ctx: &Ctx,
-    lo: Tensor,
-    hi: Tensor,
-    x: &mut Tensor,
-) -> Result<(), Error> {
+pub fn clamp_learned(ctx: &Ctx, lo: Tensor, hi: Tensor, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.clamp_learned";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     for (what, bound) in [("lower", lo), ("upper", hi)] {
@@ -79,8 +76,11 @@ pub fn clamp_learned(
     nonzero(OP, "the element count", lanes)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::clamp_learned<{t}>")))
-            .apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::elemwise::clamp_learned<{t}>")),
+        )
+        .apply(Launch::flat(lanes, BLOCK)),
         &[
             x.arg(),
             lo.arg(),

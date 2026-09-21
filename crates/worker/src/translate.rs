@@ -17,7 +17,7 @@ pub fn build(
     }
 
     let pie_home = bootstrap::paths::pie_home();
-    let cache_dir = pie_home.join("programs");
+    let cache_dir = bootstrap::paths::inferlets_dir();
     let log_dir = Some(pie_home.join("logs"));
 
     let model = build_model(&user.model, &user.runtime, engines, metadata)?;
@@ -26,9 +26,15 @@ pub fn build(
         host: user.server.host.clone(),
         port: user.server.port,
         cache_dir,
+        builtin_programs: builtins::all()
+            .iter()
+            .map(|b| runtime::bootstrap::BuiltinProgram {
+                manifest: b.manifest,
+                component: b.component,
+            })
+            .collect(),
         verbose: user.server.verbose,
         log_dir,
-        registry_url: user.server.registry.clone(),
         telemetry: runtime::bootstrap::TelemetryConfig {
             enabled: user.telemetry.enabled,
             endpoint: user.telemetry.endpoint.clone(),
@@ -45,12 +51,12 @@ pub fn build(
             allow_network: user.sandbox.allow_network,
             network_allowed_hosts: user.sandbox.network_allowed_hosts.clone(),
             max_upload_mb: user.server.max_upload.as_mib() as usize,
-            py_runtime_dir: pie_home.join("py-runtime"),
+            languages_dir: bootstrap::paths::languages_dir(),
+            compile_cache_dir: Some(bootstrap::paths::compile_cache_dir()),
         },
         model,
         skip_tracing: true,
         max_concurrent_processes: user.runtime.max_concurrent_processes,
-        python_snapshot: user.sandbox.python_snapshot,
     })
 }
 

@@ -265,7 +265,7 @@ def main() -> int:
     ap.add_argument("--config", default=None)
     ap.add_argument("--pie", default=None)
     ap.add_argument("--inferlet",
-                    default=os.path.join(REPO, "tests/inferlets/mini-dit-parity"))
+                    default=os.path.join(REPO, "examples/mini-dit-parity"))
     ap.add_argument("--steps", type=int, default=6,
                     help="Euler steps; fires are steps + 1")
     ap.add_argument("--seed", type=int, default=7)

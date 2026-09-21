@@ -82,7 +82,10 @@ pub fn group_routes(ctx: &Ctx, groups: u32, routes: &mut Tensor) -> Result<(), E
     let rows = nonzero(OP, "rows", routes.rows)?;
     let groups = nonzero(OP, "the group count", groups)?;
     let lanes = rows.checked_mul(groups).ok_or_else(|| {
-        refuse(OP, format!("the routes will not launch: {rows} tokens x {groups} groups"))
+        refuse(
+            OP,
+            format!("the routes will not launch: {rows} tokens x {groups} groups"),
+        )
     })?;
     ctx.fire(
         OP,

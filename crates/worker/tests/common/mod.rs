@@ -91,7 +91,7 @@ pub async fn boot_cuda() -> WorkerHandle {
 
 pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/inferlets")
+        .join("../../examples")
         .join(name);
     assert!(
         dir.is_dir(),

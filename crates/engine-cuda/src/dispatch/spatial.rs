@@ -265,15 +265,7 @@ impl Run<'_> {
                                 .to_string(),
                     })?;
                 let mut slab = pool.slab;
-                spatial::cache_store(
-                    self.ctx(),
-                    x,
-                    x,
-                    slot_ids,
-                    grid,
-                    *frames,
-                    &mut slab,
-                )
+                spatial::cache_store(self.ctx(), x, x, slot_ids, grid, *frames, &mut slab)
             }
             Spatial::Patchify {
                 x,

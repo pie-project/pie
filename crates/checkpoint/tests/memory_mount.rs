@@ -43,7 +43,7 @@ fn write_zt(path: &Path, wide: usize) -> (Vec<u8>, Vec<u8>) {
         let values: Vec<f32> = (0..3000).map(|at| (index * 3000 + at) as f32).collect();
         writer
             .add(
-                &wide_name(index),
+                wide_name(index),
                 vec![3000],
                 ztensor::Leaf::F32,
                 &f32_bytes(&values),
@@ -334,7 +334,7 @@ fn a_chunked_mount_reads_like_the_file() {
         finalized: Vec::new(),
         reads: Vec::new(),
     };
-    assert!(matches!(checkpoint::verify::verify(&view, None), Ok(_)));
+    assert!(checkpoint::verify::verify(&view, None).is_ok());
     let mounted = Execution::new(&plan, Path::new("/")).run().unwrap();
     assert_eq!(mounted.tensors["a.weight"], a);
     assert_eq!(mounted.tensors["b.weight"], b);

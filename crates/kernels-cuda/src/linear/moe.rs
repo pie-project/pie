@@ -257,15 +257,22 @@ pub fn topk_sigmoid_sink(
         ));
     }
     if let Some(bias) = &correction_bias {
-        debug_assert_eq!(bias.dtype, Dtype::F32, "`{OP}` reads an f32 correction bias");
+        debug_assert_eq!(
+            bias.dtype,
+            Dtype::F32,
+            "`{OP}` reads an f32 correction bias"
+        );
     }
     if let Some(scale) = &global_scale {
         debug_assert_eq!(scale.dtype, Dtype::F32, "`{OP}` reads an f32 global scale");
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::moe_topk_sigmoid_sink<{t}>")))
-            .apply(rms(logits.rows)),
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::moe_topk_sigmoid_sink<{t}>")),
+        )
+        .apply(rms(logits.rows)),
         &[
             logits.arg(),
             routes.arg(),
@@ -474,8 +481,8 @@ fn select_grouped(
     experts: u32,
 ) -> Result<(), Error> {
     use cudarc::cublas::sys::{
-        cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmBatchedEx,
-        cublasHandle_t, cublasOperation_t, cublasStatus_t, cudaDataType,
+        cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmBatchedEx, cublasHandle_t,
+        cublasOperation_t, cublasStatus_t, cudaDataType,
     };
 
     let (t, scalar) = match x.dtype {
@@ -494,9 +501,12 @@ fn select_grouped(
     let per_expert = fan.route_count.div_ceil(experts);
     let block = block_rows(per_expert);
     let blocks = experts + fan.route_count.div_ceil(block);
-    let rows = blocks
-        .checked_mul(block)
-        .ok_or_else(|| refuse(op, format!("{blocks} blocks of {block} rows overflow the fire")))?;
+    let rows = blocks.checked_mul(block).ok_or_else(|| {
+        refuse(
+            op,
+            format!("{blocks} blocks of {block} rows overflow the fire"),
+        )
+    })?;
 
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
@@ -509,7 +519,12 @@ fn select_grouped(
     let elem = x.dtype.bytes_ceil();
     let slab = |name: &'static str, bytes: u64| -> Result<u64, Error> {
         usize::try_from(bytes)
-            .map_err(|_| refuse(op, format!("{name} wants {bytes} bytes, past this host's usize")))
+            .map_err(|_| {
+                refuse(
+                    op,
+                    format!("{name} wants {bytes} bytes, past this host's usize"),
+                )
+            })
             .and_then(|bytes| ctx.scratch(op, name, bytes))
             .map(|ptr| ptr as usize as u64)
     };
@@ -530,9 +545,8 @@ fn select_grouped(
 
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::moe_align_decode<::pie::i32>").apply(
-            Launch::grid([1, 1, 1], [BLOCK, 1, 1]).smem((3 * experts + 34) * 4),
-        ),
+        Fire::at(FILE, "::pie::linear::moe_align_decode<::pie::i32>")
+            .apply(Launch::grid([1, 1, 1], [BLOCK, 1, 1]).smem((3 * experts + 34) * 4)),
         &[
             routes.arg(),
             ArgValue::Ptr(sorted),
@@ -913,9 +927,21 @@ fn matmul_select_mlxu4(
     const DECODE_BLOCK: u32 = 128;
 
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    debug_assert_eq!(codes.dtype, Dtype::U8, "a packed bank's planes bind as bytes");
-    debug_assert_eq!(scales.dtype, Dtype::U8, "a packed bank's planes bind as bytes");
-    debug_assert_eq!(biases.dtype, Dtype::U8, "a packed bank's planes bind as bytes");
+    debug_assert_eq!(
+        codes.dtype,
+        Dtype::U8,
+        "a packed bank's planes bind as bytes"
+    );
+    debug_assert_eq!(
+        scales.dtype,
+        Dtype::U8,
+        "a packed bank's planes bind as bytes"
+    );
+    debug_assert_eq!(
+        biases.dtype,
+        Dtype::U8,
+        "a packed bank's planes bind as bytes"
+    );
     let fan = selected(op, x, routes, y)?;
     let k = stated(op, nonzero(op, "K, the bank's contracted width", x.width)?)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
@@ -1026,7 +1052,11 @@ fn matmul_select_mlxu4(
         return ctx.fire(
             op,
             Fire::at("linear/quant.cuh", symbol(&entry)).apply(Launch::grid(
-                [if wmma { work_cap } else { experts }, y.width.div_ceil(GROUPED_TILE_N), 1],
+                [
+                    if wmma { work_cap } else { experts },
+                    y.width.div_ceil(GROUPED_TILE_N),
+                    1,
+                ],
                 [GROUPED_BLOCK, 1, 1],
             )),
             &args,

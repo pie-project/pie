@@ -106,8 +106,11 @@ pub fn embed_concat_mlxu4(
     })?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::layout::embed_concat_mlxu4<{t}>")))
-            .apply(Launch::flat(lanes, BLOCK)),
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::layout::embed_concat_mlxu4<{t}>")),
+        )
+        .apply(Launch::flat(lanes, BLOCK)),
         &[
             ids.arg(),
             codes.arg(),

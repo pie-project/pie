@@ -370,6 +370,9 @@ mod tests {
             .iter()
             .filter(|row| matches!(row, model_ir::CacheRow::State { .. }))
             .count();
-        assert_eq!(states, 36, "18 gdn layers, a conv bank and a delta bank each");
+        assert_eq!(
+            states, 36,
+            "18 gdn layers, a conv bank and a delta bank each"
+        );
     }
 }

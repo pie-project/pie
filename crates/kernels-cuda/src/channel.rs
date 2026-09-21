@@ -324,5 +324,4 @@ mod tests {
         );
         assert_eq!((lane.taken_count, lane.put_count), (2, 1));
     }
-
 }

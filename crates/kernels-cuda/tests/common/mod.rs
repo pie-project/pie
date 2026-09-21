@@ -60,7 +60,11 @@ impl Gpu {
     pub fn ctx(&self) -> Ctx {
         // SAFETY: the stream outlives every fire in a test, and `Gpu`'s drop
         // synchronizes before destroying it.
-        unsafe { Ctx::on(self.stream.cast()).with_cublas(self.cublas.cast()).with_slabs(self.slabs) }
+        unsafe {
+            Ctx::on(self.stream.cast())
+                .with_cublas(self.cublas.cast())
+                .with_slabs(self.slabs)
+        }
     }
 
     pub fn zeros(&mut self, bytes: usize) -> u64 {

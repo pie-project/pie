@@ -1,7 +1,7 @@
 use crate::error::Error;
 
 use crate::attn::plan::{Built, DecodePlanInfo, Live, Sizes, Toggles};
-use crate::attn::sched::{at, AlignedAllocator, Staging, narrow, narrow_all, spans};
+use crate::attn::sched::{AlignedAllocator, Staging, at, narrow, narrow_all, spans};
 use crate::jit::refuse;
 
 #[derive(Clone, Copy, Debug)]
@@ -65,7 +65,10 @@ pub fn estimate(
             high = mid;
         }
     }
-    let filled: u64 = pages.iter().map(|&p| u64::from(p.max(1).div_ceil(low))).sum();
+    let filled: u64 = pages
+        .iter()
+        .map(|&p| u64::from(p.max(1).div_ceil(low)))
+        .sum();
     let new_batch_size = u32::try_from(filled)
         .map_err(|_| refuse(op, "the split's work items do not fit a 32-bit count"))?;
 
@@ -160,8 +163,10 @@ fn layout(
     };
 
     let mut ints = AlignedAllocator::new(op, int_space);
-    info.request_indices_offset = Some(ints.alloc(padded * 4, 16, "batch_decode_request_indices")?);
-    info.kv_tile_indices_offset = Some(ints.alloc(padded * 4, 16, "batch_decode_kv_tile_indices")?);
+    info.request_indices_offset =
+        Some(ints.alloc(padded * 4, 16, "batch_decode_request_indices")?);
+    info.kv_tile_indices_offset =
+        Some(ints.alloc(padded * 4, 16, "batch_decode_kv_tile_indices")?);
     info.o_indptr_offset = Some(ints.alloc((padded + 1) * 4, 16, "batch_decode_o_indptr")?);
     info.kv_chunk_size_ptr_offset = Some(ints.alloc(4, 1, "batch_decode_kv_chunk_size_ptr")?);
 
@@ -169,9 +174,18 @@ fn layout(
     if sched.split_kv {
         let heads = u64::from(num_qo_heads);
         let head_dim = u64::from(head_dim);
-        info.v_offset = Some(floats.alloc((heads * padded as u64 * head_dim * 4) as usize, 16, "batch_decode_tmp_v")?);
-        info.s_offset = Some(floats.alloc((heads * padded as u64 * 4) as usize, 16, "batch_decode_tmp_s")?);
-        info.block_valid_mask_offset = Some(ints.alloc(padded, 16, "batch_decode_block_valid_mask")?);
+        info.v_offset = Some(floats.alloc(
+            (heads * padded as u64 * head_dim * 4) as usize,
+            16,
+            "batch_decode_tmp_v",
+        )?);
+        info.s_offset = Some(floats.alloc(
+            (heads * padded as u64 * 4) as usize,
+            16,
+            "batch_decode_tmp_s",
+        )?);
+        info.block_valid_mask_offset =
+            Some(ints.alloc(padded, 16, "batch_decode_block_valid_mask")?);
     }
 
     Ok(Laid {
@@ -231,7 +245,14 @@ pub fn plan(
     float_bytes: usize,
 ) -> Result<Built<DecodePlanInfo>, Error> {
     let sched = schedule(op, req, max_grid_size)?;
-    let laid = layout(op, req.num_qo_heads, req.head_dim, &sched, int_bytes, float_bytes)?;
+    let laid = layout(
+        op,
+        req.num_qo_heads,
+        req.head_dim,
+        &sched,
+        int_bytes,
+        float_bytes,
+    )?;
     let int_upload = stage(op, &sched, req.page_size, &laid)?;
     Ok(Built {
         info: laid.info,
@@ -281,7 +302,11 @@ pub fn static_nonsplit(
 ) -> Result<Built<DecodePlanInfo>, Error> {
     let n = narrow(op, "batch_decode_request_indices", i64::from(num_requests))?;
     let live_n = narrow(op, "batch_decode_request_indices", i64::from(live.requests))?;
-    let first = narrow(op, "batch_decode_request_indices", i64::from(live.lane_offset))?;
+    let first = narrow(
+        op,
+        "batch_decode_request_indices",
+        i64::from(live.lane_offset),
+    )?;
     let sched = Schedule {
         split_kv: false,
         enable_cuda_graph,

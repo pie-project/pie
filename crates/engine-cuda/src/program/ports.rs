@@ -403,8 +403,7 @@ pub fn resolves(class: GeometryClass, port: Port) -> bool {
     if class.ports().contains(port) {
         return true;
     }
-    matches!(port, Port::EmbedIndptr | Port::AttnMask)
-        && class == GeometryClass::DeviceGeometry
+    matches!(port, Port::EmbedIndptr | Port::AttnMask) && class == GeometryClass::DeviceGeometry
 }
 
 fn read_cell(
@@ -514,9 +513,7 @@ mod tests {
             w_slot: Some(vec![41, 41, 41]),
             w_off: Some(vec![6, 7, 8]),
             mask: Some(vec![
-                true, false, false, false,
-                true, true, false, false,
-                true, true, true, false,
+                true, false, false, false, true, true, false, false, true, true, true, false,
             ]),
             ..Envelope::default()
         };
@@ -570,18 +567,11 @@ mod tests {
                 port.name()
             );
         }
-        for class in [
-            GeometryClass::DecodeEnvelope,
-            GeometryClass::DeviceGeometry,
-        ] {
+        for class in [GeometryClass::DecodeEnvelope, GeometryClass::DeviceGeometry] {
             assert!(super::resolves(class, Port::RsFoldLen));
         }
-        for class in [
-            GeometryClass::DecodeEnvelope,
-            GeometryClass::DeviceGeometry,
-        ] {
+        for class in [GeometryClass::DecodeEnvelope, GeometryClass::DeviceGeometry] {
             assert!(!super::resolves(class, Port::Readout));
         }
     }
-
 }

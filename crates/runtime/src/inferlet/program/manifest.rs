@@ -35,26 +35,47 @@ pub struct Package {
     pub repository: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readme: Option<String>,
+    /// `"builtin"` marks a program built into the pie binary and served on
+    /// its HTTP routes; absent for everything else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+}
+
+/// `[runtime]`: what the program needs from the host and, for a script,
+/// how the host runs it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Runtime {
+    /// The host interface version the program was written against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core: Option<String>,
+    /// Set when the artifact is source the host runs under that language's
+    /// component rather than a component of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<Language>,
+    /// The entry function a script's language component calls; `main` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    /// How that function takes the input; `input` by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<Call>,
+}
+
+impl Runtime {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub package: Package,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub runtime: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Runtime::is_empty")]
+    pub runtime: Runtime,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parameters: BTreeMap<String, Parameter>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: BTreeMap<String, String>,
-}
-
-pub fn manifest_url(registry_url: &str, name: &ProgramName) -> String {
-    format!(
-        "{}/api/v1/inferlets/{}/{}/manifest",
-        registry_url.trim_end_matches('/'),
-        name.name,
-        name.version
-    )
 }
 
 impl Manifest {
@@ -83,39 +104,109 @@ impl Manifest {
             .collect()
     }
 
-    pub fn python_runtime(&self) -> Option<&str> {
-        self.runtime.get("python-runtime").map(String::as_str)
+    /// The language the program's artifact is source in, when it is a
+    /// script the host runs under a language component rather than a
+    /// component of its own. `None` is a wasm component.
+    pub fn language(&self) -> Option<Language> {
+        self.runtime.language
     }
 
-    #[cfg(target_arch = "wasm32")]
-    pub async fn from_url(registry_url: &str, name: &ProgramName) -> Result<Self> {
-        bail!(
-            "cannot fetch the manifest of {name} from {}: this host has no registry client",
-            manifest_url(registry_url, name)
-        )
+    /// The entry function a script's language component calls.
+    pub fn entry(&self) -> &str {
+        self.runtime.entry.as_deref().unwrap_or("main")
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    pub async fn from_url(registry_url: &str, name: &ProgramName) -> Result<Self> {
-        let url = manifest_url(registry_url, name);
+    /// How a script's entry takes the input.
+    pub fn call(&self) -> Call {
+        self.runtime.call.unwrap_or_default()
+    }
 
-        let response = reqwest::get(&url)
-            .await
-            .map_err(|e| anyhow!("Failed to fetch manifest from {}: {}", url, e))?;
+    /// The artifact's extension: `wasm` for a component, the language's for
+    /// a script.
+    pub fn artifact_extension(&self) -> &'static str {
+        self.language().map_or("wasm", Language::extension)
+    }
 
-        if !response.status().is_success() {
-            bail!(
-                "Failed to fetch manifest: {} returned {}",
-                url,
-                response.status()
-            );
+    /// The file name a script's tracebacks quote.
+    pub fn script_file(&self) -> String {
+        format!("{}.{}", self.package.name, self.artifact_extension())
+    }
+}
+
+/// How a script's entry function takes the input: `input` passes the
+/// parsed input as its one argument, `kwargs` spreads the input object as
+/// keyword arguments (what a decorated client function declares).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Call {
+    #[default]
+    Input,
+    Kwargs,
+}
+
+impl Call {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Kwargs => "kwargs",
         }
+    }
+}
 
-        let manifest_content = response
-            .text()
-            .await
-            .map_err(|e| anyhow!("Failed to read manifest response: {}", e))?;
+/// A language the host has (or may have) a language component for. The
+/// artifact of a program in one of these is its source, stored beside its
+/// manifest as `<version>.<extension>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    Python,
+    JavaScript,
+}
 
-        Self::parse(&manifest_content)
+impl Language {
+    /// Every language the host can run scripts in.
+    pub const ALL: [Language; 2] = [Language::Python, Language::JavaScript];
+
+    pub fn parse(word: &str) -> Result<Self> {
+        match word {
+            "python" => Ok(Self::Python),
+            "javascript" => Ok(Self::JavaScript),
+            other => bail!(
+                "unknown [runtime] language {other:?}: pie knows \"python\" and \"javascript\""
+            ),
+        }
+    }
+
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        match extension {
+            "py" => Some(Self::Python),
+            "js" | "mjs" => Some(Self::JavaScript),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Python => "python",
+            Self::JavaScript => "javascript",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Python => "py",
+            Self::JavaScript => "js",
+        }
+    }
+
+    /// The language component's file name under the languages dir.
+    pub fn component_file(self) -> String {
+        format!("{}.wasm", self.name())
+    }
+}
+
+impl std::fmt::Display for Language {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
     }
 }

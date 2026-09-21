@@ -71,8 +71,14 @@ struct SyntheticMedia {
 
 #[derive(Debug, Clone)]
 enum BodySynth {
-    Decode { lanes: u32, class: usize },
-    Prefill { class: usize, rows: Vec<u32> },
+    Decode {
+        lanes: u32,
+        class: usize,
+    },
+    Prefill {
+        class: usize,
+        rows: Vec<u32>,
+    },
     Mixed {
         decode: usize,
         class: usize,
@@ -84,7 +90,9 @@ enum BodySynth {
         images: u32,
         patches: u32,
     },
-    Wide { lanes: Vec<(usize, u32)> },
+    Wide {
+        lanes: Vec<(usize, u32)>,
+    },
 }
 
 impl BodySynth {
@@ -324,7 +332,12 @@ fn wide_keys(deployment: &Deployment, into: &mut Targets) {
             Some(rows) if decoders.len() + prefilling.len() > 1 => {
                 let mut lanes: Vec<(usize, u32)> =
                     decoders.iter().map(|class| (*class, 1u32)).collect();
-                lanes.extend(prefilling.iter().zip(rows).map(|(class, rows)| (*class, rows)));
+                lanes.extend(
+                    prefilling
+                        .iter()
+                        .zip(rows)
+                        .map(|(class, rows)| (*class, rows)),
+                );
                 into.targets.push((point, BodySynth::Wide { lanes }));
             }
             _ => into.unfireable.push(unfireable_line(
@@ -337,13 +350,8 @@ fn wide_keys(deployment: &Deployment, into: &mut Targets) {
     }
 }
 
-const ARMS: [fn(&Deployment, &mut Targets); Kind::COUNT] = [
-    decode_keys,
-    prefill_keys,
-    mixed_keys,
-    tower_keys,
-    wide_keys,
-];
+const ARMS: [fn(&Deployment, &mut Targets); Kind::COUNT] =
+    [decode_keys, prefill_keys, mixed_keys, tower_keys, wide_keys];
 
 impl core::fmt::Display for BodySynth {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -519,6 +527,7 @@ impl Shell {
                 group: None,
                 peer: None,
                 ports: &[],
+                attn_classes: None,
             })
             .collect();
 
@@ -1020,13 +1029,17 @@ impl Shell {
                     && let Some(key) = key.as_ref()
                     && key.to_string().contains(wanted)
                 {
-                    let mut shapes: Vec<(&str, Vec<(usize, u32)>)> = vec![("lattice", lanes.clone())];
-                    let classes: Vec<usize> = lanes.iter().map(|(class, _)| *class).fold(Vec::new(), |mut seen, class| {
-                        if !seen.contains(&class) {
-                            seen.push(class);
-                        }
-                        seen
-                    });
+                    let mut shapes: Vec<(&str, Vec<(usize, u32)>)> =
+                        vec![("lattice", lanes.clone())];
+                    let classes: Vec<usize> = lanes.iter().map(|(class, _)| *class).fold(
+                        Vec::new(),
+                        |mut seen, class| {
+                            if !seen.contains(&class) {
+                                seen.push(class);
+                            }
+                            seen
+                        },
+                    );
                     let decoders: Vec<usize> = classes
                         .iter()
                         .copied()
@@ -1050,18 +1063,26 @@ impl Shell {
                         let mut timed = Ok(());
                         let mut rows_back = 0usize;
                         for _ in 0..10 {
-                            timed = timed.and(self.fire_synthetic_as(&owned, crate::serve::Golden::Off).map(|out| rows_back = out.len())).and(self.device.synchronize());
+                            timed = timed
+                                .and(
+                                    self.fire_synthetic_as(&owned, crate::serve::Golden::Off)
+                                        .map(|out| rows_back = out.len()),
+                                )
+                                .and(self.device.synchronize());
                         }
                         let before = self.cache.body_stats().tally;
                         let began = std::time::Instant::now();
                         const FIRES: u32 = 50;
                         for _ in 0..FIRES {
-                            timed = timed.and(self.fire_synthetic(&owned)).and(self.device.synchronize());
+                            timed = timed
+                                .and(self.fire_synthetic(&owned))
+                                .and(self.device.synchronize());
                         }
                         let us = began.elapsed().as_secs_f64() * 1e6 / f64::from(FIRES);
                         let after = self.cache.body_stats().tally;
                         let replayed = after.hits - before.hits;
-                        let lanes_of = |class: usize| shape.iter().filter(|(c, _)| *c == class).count();
+                        let lanes_of =
+                            |class: usize| shape.iter().filter(|(c, _)| *c == class).count();
                         let layout: Vec<String> = shape
                             .iter()
                             .map(|(class, _)| *class)
@@ -1080,8 +1101,12 @@ impl Shell {
                                 layout.join(" "),
                                 after.misses - before.misses,
                                 after.sealed_declines - before.sealed_declines,
-                                (after.eager_rotating + after.eager_buffered + after.eager_copy_world)
-                                    - (before.eager_rotating + before.eager_buffered + before.eager_copy_world)
+                                (after.eager_rotating
+                                    + after.eager_buffered
+                                    + after.eager_copy_world)
+                                    - (before.eager_rotating
+                                        + before.eager_buffered
+                                        + before.eager_copy_world)
                             ),
                             Err(why) => eprintln!("[arm-bench] {key} {what} refused: {why}"),
                         }
@@ -1102,7 +1127,9 @@ impl Shell {
                                     self.compiled
                                         .template()
                                         .get(at as usize)
-                                        .and_then(|region| self.trace.nodes.get(region.nodes.start as usize))
+                                        .and_then(|region| {
+                                            self.trace.nodes.get(region.nodes.start as usize)
+                                        })
                                         .map_or("?", |node| model_ir::Operands::name(&node.op))
                                 })
                                 .collect();
@@ -1117,7 +1144,11 @@ impl Shell {
                         began.elapsed().as_secs_f64() * 1000.0,
                         golden_ms.0,
                         golden_ms.1,
-                        if islands.is_empty() { String::new() } else { format!(" [{}]", islands.join(" ")) }
+                        if islands.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", islands.join(" "))
+                        }
                     );
                 }
             }
@@ -1324,9 +1355,7 @@ pub struct Armed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Seal {
     Complete,
-    Partial {
-        never: usize,
-    },
+    Partial { never: usize },
     Open,
 }
 

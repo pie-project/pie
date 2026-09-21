@@ -114,6 +114,7 @@ pub enum RaggedArm {
     Full,
     ReferenceSelfOnly,
     ReferenceTags,
+    ClassTable,
     RelativeBias,
 }
 
@@ -127,6 +128,7 @@ fn prefill_ragged_symbol(
         RaggedArm::Full => ("kNone", "VariantFull", "RaggedParams"),
         RaggedArm::ReferenceSelfOnly => ("kCustom", "ReferenceSelfOnly", "RaggedRefParams"),
         RaggedArm::ReferenceTags => ("kCustom", "ReferenceTags", "RaggedTagParams"),
+        RaggedArm::ClassTable => ("kCustom", "ClassTable", "RaggedClassParams"),
         RaggedArm::RelativeBias => ("kNone", "RelativeBias", "RaggedBiasParams"),
     };
     Ok(symbol(&format!(

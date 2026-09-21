@@ -92,10 +92,14 @@ pub struct Handles {
     pub mask_indptr: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
+    pub class_table: Option<(Tensor, u32)>,
     pub lane_of_row: Tensor,
 }
 
 const AXES: u64 = 3;
+
+const CLASS_TABLE_BYTES: u64 =
+    (engine::fire::ATTN_CLASSES_MAX as u64) * (engine::fire::ATTN_CLASSES_MAX as u64);
 
 #[derive(Debug, Clone, Copy)]
 pub struct PatchSeat {
@@ -161,6 +165,7 @@ pub struct PackingFire<'a> {
     pub lane_indptr: &'a [i32],
     pub reference_start: &'a [i32],
     pub reference_tag: &'a [i32],
+    pub attn_class: &'a [i32],
     pub permutation: &'a [i32],
 }
 
@@ -170,6 +175,7 @@ pub struct PackingHandles {
     pub lane_indptr: Tensor,
     pub reference_start: Tensor,
     pub reference_tag: Tensor,
+    pub attn_class: Tensor,
     pub permutation: Tensor,
 }
 
@@ -179,6 +185,7 @@ struct PackingAt {
     lane_indptr: u64,
     reference_start: u64,
     reference_tag: u64,
+    attn_class: u64,
     permutation: u64,
 }
 
@@ -209,6 +216,7 @@ pub struct Fire<'a> {
     pub lane_reach: u32,
     pub group_of_lane: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
+    pub class_table: Option<(&'a [u8], u32)>,
 }
 
 #[derive(Debug)]
@@ -294,6 +302,7 @@ pub struct Staged {
     space_indices: Vec<u32>,
     space_lanes: u32,
     packed: bool,
+    class_count: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -325,6 +334,7 @@ pub struct Inputs {
     mask_bits: u64,
     mask_bytes: u64,
     mask_indptr: u64,
+    class_table: u64,
     patch: Option<PatchAt>,
     mrope: Option<u64>,
     mrope_bytes: u64,
@@ -396,6 +406,7 @@ impl Inputs {
         };
         let mask_bits = take(mask_bytes);
         let mask_indptr = take((lanes + 1) * 4);
+        let class_table = take(CLASS_TABLE_BYTES);
         let spaces: Vec<SpaceAt> = (0..spaces)
             .map(|_| SpaceAt {
                 indptr: take((lanes + 1) * 4),
@@ -414,6 +425,7 @@ impl Inputs {
                 lane_indptr: take((lanes + 1) * 4),
                 reference_start: take(lanes * 4),
                 reference_tag: take(rows * 4),
+                attn_class: take(rows * 4),
                 permutation: take(rows * 4),
             })
             .collect();
@@ -451,18 +463,23 @@ impl Inputs {
             .map(|seat| {
                 seat.map(|seat| {
                     match seat.kind {
-                        StructKind::AttnPrefillPlan => graph_float_bytes(&seat.reading, device.num_sm)
-                            .max(prefill_float_bytes(
-                                &seat.reading,
-                                budget.buckets.last().copied().unwrap_or(budget.max_tokens),
-                                budget.max_lanes,
-                                &device,
-                            )),
+                        StructKind::AttnPrefillPlan => {
+                            graph_float_bytes(&seat.reading, device.num_sm).max(
+                                prefill_float_bytes(
+                                    &seat.reading,
+                                    budget.buckets.last().copied().unwrap_or(budget.max_tokens),
+                                    budget.max_lanes,
+                                    &device,
+                                ),
+                            )
+                        }
                         StructKind::AttnPrefillPlanSm90 => {
                             graph_float_bytes(&seat.reading, device.num_sm)
                         }
-                        StructKind::AttnDecodePlan => graph_float_bytes(&seat.reading, device.num_sm)
-                            .max(decode_float_bytes(&seat.reading, budget.max_lanes)),
+                        StructKind::AttnDecodePlan => {
+                            graph_float_bytes(&seat.reading, device.num_sm)
+                                .max(decode_float_bytes(&seat.reading, budget.max_lanes))
+                        }
                         StructKind::MlaPlan => {
                             latent_float_bytes(seat.reading.head_dim, device.num_sm)
                         }
@@ -471,7 +488,8 @@ impl Inputs {
                 })
             })
             .collect();
-        let mut per_stream: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        let mut per_stream: std::collections::BTreeMap<u32, u64> =
+            std::collections::BTreeMap::new();
         for (plan, floats) in floats_of.iter().enumerate() {
             if let (Some(floats), Some(Some(stream))) = (floats, schedule_streams.get(plan)) {
                 let held = per_stream.entry(*stream).or_insert(0);
@@ -529,12 +547,17 @@ impl Inputs {
             mask_bits,
             mask_bytes,
             mask_indptr,
+            class_table,
             patch,
             mrope,
             mrope_bytes: if mrope.is_some() { rows * AXES * 4 } else { 0 },
             self_cond,
             self_cond_taps,
-            self_cond_bytes: if self_cond.is_some() { rows * self_cond_taps * 4 } else { 0 },
+            self_cond_bytes: if self_cond.is_some() {
+                rows * self_cond_taps * 4
+            } else {
+                0
+            },
             ports,
             lane_of_row,
             group_of_lane,
@@ -695,7 +718,11 @@ impl Inputs {
 
         put(self.tokens, bytes_of(fire.tokens), "staged tokens")?;
         put(self.positions, bytes_of(fire.positions), "staged positions")?;
-        put(self.windows, bytes_of(fire.windows), "staged window boundaries")?;
+        put(
+            self.windows,
+            bytes_of(fire.windows),
+            "staged window boundaries",
+        )?;
         let live = if fire.live_rows == 0 {
             rows
         } else {
@@ -714,7 +741,11 @@ impl Inputs {
                 ),
             ));
         }
-        put(self.lane_of_row, bytes_of(fire.lane_of_row), "staged lane of row")?;
+        put(
+            self.lane_of_row,
+            bytes_of(fire.lane_of_row),
+            "staged lane of row",
+        )?;
         put(self.slot_ids, bytes_of(fire.slot_ids), "staged slot ids")?;
         if space_lanes > lanes {
             let inert = vec![-1i32; (space_lanes - lanes) as usize];
@@ -728,7 +759,11 @@ impl Inputs {
         let qo_absolute = if fire.qo_absolute.is_empty() {
             None
         } else {
-            put(self.qo_absolute, bytes_of(fire.qo_absolute), "staged absolute qo bounds")?;
+            put(
+                self.qo_absolute,
+                bytes_of(fire.qo_absolute),
+                "staged absolute qo bounds",
+            )?;
             Some(fire.qo_absolute.len())
         };
 
@@ -742,7 +777,11 @@ impl Inputs {
         let adapter_rows = match fire.adapter_routes {
             None => None,
             Some(routes) => {
-                put(self.adapter_routes, bytes_of(routes), "staged adapter routes")?;
+                put(
+                    self.adapter_routes,
+                    bytes_of(routes),
+                    "staged adapter routes",
+                )?;
                 Some(routes.len() as u32)
             }
         };
@@ -757,8 +796,26 @@ impl Inputs {
             None => None,
             Some(staged) => {
                 put(self.mask_bits, &staged.bits, "staged mask bits")?;
-                put(self.mask_indptr, bytes_of(&staged.indptr), "staged mask indptr")?;
+                put(
+                    self.mask_indptr,
+                    bytes_of(&staged.indptr),
+                    "staged mask indptr",
+                )?;
                 Some(u32::try_from(staged.bits.len()).unwrap_or(u32::MAX))
+            }
+        };
+        let class_count = match fire.class_table {
+            None => None,
+            Some((table, count)) => {
+                if table.len() as u64 > CLASS_TABLE_BYTES {
+                    return Err(crate::error::Fault::Ceiling {
+                        what: "attention class table bytes",
+                        need: table.len() as u64,
+                        have: CLASS_TABLE_BYTES,
+                    });
+                }
+                put(self.class_table, table, "staged attention class table")?;
+                Some(count)
             }
         };
 
@@ -782,7 +839,11 @@ impl Inputs {
             for (at, packing) in self.packings.iter().zip(fire.packings) {
                 for (offset, table, what) in [
                     (at.group_indptr, packing.group_indptr, "staged group bounds"),
-                    (at.lane_indptr, packing.lane_indptr, "staged packed lane bounds"),
+                    (
+                        at.lane_indptr,
+                        packing.lane_indptr,
+                        "staged packed lane bounds",
+                    ),
                 ] {
                     lane_table.clear();
                     lane_table.extend_from_slice(table);
@@ -793,10 +854,27 @@ impl Inputs {
                 lane_table.clear();
                 lane_table.extend_from_slice(packing.reference_start);
                 lane_table.resize(space_lanes as usize, 0);
-                put(at.reference_start, bytes_of(&lane_table), "staged reference tails")?;
+                put(
+                    at.reference_start,
+                    bytes_of(&lane_table),
+                    "staged reference tails",
+                )?;
                 for (offset, table, what) in [
-                    (at.reference_tag, packing.reference_tag, "staged reference tags"),
-                    (at.permutation, packing.permutation, "staged row permutation"),
+                    (
+                        at.reference_tag,
+                        packing.reference_tag,
+                        "staged reference tags",
+                    ),
+                    (
+                        at.attn_class,
+                        packing.attn_class,
+                        "staged attention classes",
+                    ),
+                    (
+                        at.permutation,
+                        packing.permutation,
+                        "staged row permutation",
+                    ),
                 ] {
                     row_table.clear();
                     row_table.extend_from_slice(table);
@@ -809,11 +887,27 @@ impl Inputs {
         let mut space_indices = Vec::with_capacity(self.spaces.len());
         for (at, geometry) in self.spaces.iter().zip(fire.spaces) {
             put(at.indptr, bytes_of(&geometry.indptr), "staged kv indptr")?;
-            put(at.indices, bytes_of(&geometry.indices), "staged kv page ids")?;
-            put(at.last_page_len, bytes_of(&geometry.last_page_len), "staged last page len")?;
+            put(
+                at.indices,
+                bytes_of(&geometry.indices),
+                "staged kv page ids",
+            )?;
+            put(
+                at.last_page_len,
+                bytes_of(&geometry.last_page_len),
+                "staged last page len",
+            )?;
             put(at.kv_len, bytes_of(&geometry.kv_len), "staged kv len")?;
-            put(at.write_page, bytes_of(&geometry.write_page), "staged write page")?;
-            put(at.write_offset, bytes_of(&geometry.write_offset), "staged write offset")?;
+            put(
+                at.write_page,
+                bytes_of(&geometry.write_page),
+                "staged write page",
+            )?;
+            put(
+                at.write_offset,
+                bytes_of(&geometry.write_offset),
+                "staged write offset",
+            )?;
             space_indices.push(geometry.indices.len() as u32);
         }
 
@@ -829,6 +923,7 @@ impl Inputs {
             space_indices,
             space_lanes,
             packed,
+            class_count,
         })
     }
 
@@ -838,7 +933,8 @@ impl Inputs {
             .ports
             .iter()
             .find(|at| at.seat.kind == kind && at.seat.port == port)?;
-        let rows = rows.min(u32::try_from(at.bytes / at.seat.row_bytes().max(1)).unwrap_or(u32::MAX));
+        let rows =
+            rows.min(u32::try_from(at.bytes / at.seat.row_bytes().max(1)).unwrap_or(u32::MAX));
         Some(Tensor::new(
             self.store.ptr() + at.at,
             rows,
@@ -900,9 +996,11 @@ impl Inputs {
         self.store.stage(stream, at.payload, payload)?;
         self.store.stage(stream, at.segments, bytes_of(segments))?;
         self.store.stage(stream, at.routes, bytes_of(routes))?;
-        self.store.stage(stream, at.positions, bytes_of(positions))?;
+        self.store
+            .stage(stream, at.positions, bytes_of(positions))?;
         if !embed_rows.is_empty() {
-            self.store.stage(stream, at.embed_rows, bytes_of(embed_rows))?;
+            self.store
+                .stage(stream, at.embed_rows, bytes_of(embed_rows))?;
         }
         if !embed_weights.is_empty() {
             self.store
@@ -1002,7 +1100,8 @@ impl Inputs {
         let base = self.store.ptr();
         let weights_at = at + self.self_cond_bytes;
         self.store.stage(stream, at, bytes_of(rows))?;
-        self.store.stage(stream, weights_at, f32_bytes_of(weights))?;
+        self.store
+            .stage(stream, weights_at, f32_bytes_of(weights))?;
         let taps = self.self_cond_taps as u32;
         let token_rows = (rows.len() as u64 / self.self_cond_taps.max(1)) as u32;
         Ok((
@@ -1030,6 +1129,7 @@ impl Inputs {
             space_indices,
             space_lanes,
             packed,
+            class_count,
         } = staged;
         let readouts = *readouts;
         let (rows, lanes) = (*rows, *lanes);
@@ -1042,14 +1142,14 @@ impl Inputs {
         let (at_row_valid, at_slot_ids) = (self.row_valid, self.slot_ids);
         let (at_routes, at_mask, at_mask_indptr) =
             (self.adapter_routes, self.mask_bits, self.mask_indptr);
+        let at_class_table = self.class_table;
+        let class_count = *class_count;
         let at_readouts = self.readout_rows;
         let places: Vec<SpaceAt> = self.spaces.clone();
         let at_lane_of_row = self.lane_of_row;
         let at_group_of_lane = self.group_of_lane;
         let packing_places: Vec<PackingAt> = self.packings.clone();
-        let Inputs {
-            store, staging, ..
-        } = self;
+        let Inputs { store, staging, .. } = self;
         let host = staging[slot.at() as usize].host();
 
         let mut spans: Vec<(u64, *const u8, usize)> = Vec::with_capacity(24);
@@ -1078,6 +1178,9 @@ impl Inputs {
             copy(at_mask, *bytes as usize)?;
             copy(at_mask_indptr, (lanes as usize + 1) * 4)?;
         }
+        if let Some(count) = class_count {
+            copy(at_class_table, (count as usize) * (count as usize))?;
+        }
         let mut packings = Vec::with_capacity(packing_places.len());
         if packed {
             copy(at_group_of_lane, space_lanes as usize * 4)?;
@@ -1086,12 +1189,14 @@ impl Inputs {
                 copy(at.lane_indptr, (space_lanes as usize + 1) * 4)?;
                 copy(at.reference_start, space_lanes as usize * 4)?;
                 copy(at.reference_tag, rows as usize * 4)?;
+                copy(at.attn_class, rows as usize * 4)?;
                 copy(at.permutation, rows as usize * 4)?;
                 packings.push(PackingHandles {
                     group_indptr: i32s(base + at.group_indptr, space_lanes + 1),
                     lane_indptr: i32s(base + at.lane_indptr, space_lanes + 1),
                     reference_start: i32s(base + at.reference_start, space_lanes),
                     reference_tag: i32s(base + at.reference_tag, rows),
+                    attn_class: i32s(base + at.attn_class, rows),
                     permutation: i32s(base + at.permutation, rows),
                 });
             }
@@ -1141,12 +1246,24 @@ impl Inputs {
             mask_indptr: mask_bytes.map(|_| i32s(base + at_mask_indptr, lanes + 1)),
             group_of_lane: packed.then(|| i32s(base + at_group_of_lane, space_lanes)),
             packings,
+            class_table: class_count.map(|count| {
+                (
+                    Tensor::new(base + at_class_table, count * count, 1, Dtype::U8),
+                    count,
+                )
+            }),
             lane_of_row: i32s(base + at_lane_of_row, rows),
         })
     }
 
     #[must_use]
-    pub fn seats(&self, handles: &Handles, pages: u32, rows: u32, lanes: u32) -> crate::store::Seats {
+    pub fn seats(
+        &self,
+        handles: &Handles,
+        pages: u32,
+        rows: u32,
+        lanes: u32,
+    ) -> crate::store::Seats {
         crate::store::Seats {
             lanes,
             rows,

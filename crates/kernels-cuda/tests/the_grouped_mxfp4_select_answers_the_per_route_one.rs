@@ -108,11 +108,25 @@ fn check_held(tokens: usize, n: usize, k: usize, by_token: bool, biased: bool) {
         let mut y = Tensor::new(into, route_count as u32, n as u32, Dtype::Bf16);
         if biased {
             matmul_select_bias(
-                &ctx, x, codes_t, scales_t, bias_t, routes_t, &mut y, GroupSeat::RESIDENT,
+                &ctx,
+                x,
+                codes_t,
+                scales_t,
+                bias_t,
+                routes_t,
+                &mut y,
+                GroupSeat::RESIDENT,
             )
         } else {
             matmul_select_quant(
-                &ctx, x, codes_t, scales_t, None, routes_t, &mut y, GroupSeat::RESIDENT,
+                &ctx,
+                x,
+                codes_t,
+                scales_t,
+                None,
+                routes_t,
+                &mut y,
+                GroupSeat::RESIDENT,
             )
         }
         .expect("the mxfp4 select fires");
@@ -208,7 +222,14 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
     let mut run = || {
         for _ in 0..3 {
             matmul_select_quant(
-                &ctx, x, codes_t, scales_t, None, routes_t, &mut y, GroupSeat::RESIDENT,
+                &ctx,
+                x,
+                codes_t,
+                scales_t,
+                None,
+                routes_t,
+                &mut y,
+                GroupSeat::RESIDENT,
             )
             .expect("the mxfp4 select fires");
         }
@@ -217,7 +238,14 @@ fn price(n: usize, k: usize, by_token: bool, label: &str) {
         let t0 = Instant::now();
         for _ in 0..REPS {
             matmul_select_quant(
-                &ctx, x, codes_t, scales_t, None, routes_t, &mut y, GroupSeat::RESIDENT,
+                &ctx,
+                x,
+                codes_t,
+                scales_t,
+                None,
+                routes_t,
+                &mut y,
+                GroupSeat::RESIDENT,
             )
             .expect("the mxfp4 select fires");
         }

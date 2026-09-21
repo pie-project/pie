@@ -3,9 +3,11 @@ use std::process::Command;
 
 use anyhow::Result;
 
+use runtime::inferlet::program::{Language, Repository};
+
 use crate::ui::{Mark, Palette};
 
-type CollectedSection = (&'static str, Vec<(String, String, Status)>);
+type Checks = Vec<(String, String, Status)>;
 
 #[derive(serde::Serialize)]
 pub struct DoctorReport {
@@ -26,23 +28,24 @@ struct Section {
 struct Check {
     check: String,
     detail: String,
-    status: &'static str,
+    status: Status,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Status {
+    Pass,
+    Warn,
+    #[serde(rename = "blocking")]
+    Fail,
 }
 
 impl Status {
-    fn word(self) -> &'static str {
+    fn mark(self) -> Mark {
         match self {
-            Status::Pass => "pass",
-            Status::Warn => "warn",
-            Status::Fail => "blocking",
-        }
-    }
-
-    fn mark(word: &str) -> Mark {
-        match word {
-            "pass" => Mark::Did,
-            "warn" => Mark::Warn,
-            _ => Mark::Blocked,
+            Status::Pass => Mark::Did,
+            Status::Warn => Mark::Warn,
+            Status::Fail => Mark::Blocked,
         }
     }
 }
@@ -56,7 +59,7 @@ impl crate::ui::Report for DoctorReport {
                 crate::ui::Table::new([crate::ui::Align::Left, crate::ui::Align::Left], 1);
             for check in &section.checks {
                 table.push(crate::ui::Row::new(
-                    Status::mark(check.status),
+                    check.status.mark(),
                     [check.check.clone(), check.detail.clone()],
                 ));
             }
@@ -93,11 +96,14 @@ pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
     let mut passes = 0usize;
     let mut failures = 0usize;
 
-    let mut sections: Vec<CollectedSection> = Vec::new();
+    let mut sections: Vec<(&'static str, Checks)> = Vec::new();
 
     let (path, origin) = bootstrap::cli_config_path(global);
 
-    sections.push(("system", vec![check_platform(), check_py_runtime()]));
+    let mut system = vec![check_platform()];
+    system.extend(Language::ALL.into_iter().map(check_language));
+    sections.push(("system", system));
+    sections.push(("built-in inferlets", check_builtin_inferlets()));
     sections.push(("gpus", check_gpus(configured_engine(&path).as_deref())));
     sections.push((
         "engines",
@@ -140,7 +146,7 @@ pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
                     .map(|(check, detail, status)| Check {
                         check,
                         detail,
-                        status: status.word(),
+                        status,
                     })
                     .collect(),
             })
@@ -155,7 +161,7 @@ pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
     })
 }
 
-fn check_config(path: &Path, origin: bootstrap::Origin) -> Vec<(String, String, Status)> {
+fn check_config(path: &Path, origin: bootstrap::Origin) -> Checks {
     if !path.exists() {
         return if origin == bootstrap::Origin::Default {
             vec![(
@@ -267,11 +273,71 @@ fn absent_because(name: &str) -> String {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum Status {
-    Pass,
-    Warn,
-    Fail,
+/// The newest version of `name` installed under the inferlets directory.
+fn installed_version(name: &str) -> Option<String> {
+    let mut repo = Repository::new(bootstrap::paths::inferlets_dir());
+    repo.refresh();
+    repo.newest(name).map(|program| program.version)
+}
+
+/// The programs behind the HTTP routes are built into this binary, one per
+/// API. A copy installed on disk shadows the built-in one; a pie built with
+/// `PIE_BUILTINS=skip` has none.
+fn check_builtin_inferlets() -> Checks {
+    let mut programs: Vec<&str> = gateway::ingress::compat::ROUTES
+        .iter()
+        .map(|(_, name)| *name)
+        .collect();
+    programs.sort_unstable();
+    programs.dedup();
+    let inferlets_dir = crate::ui::short_path(&bootstrap::paths::inferlets_dir());
+    programs
+        .into_iter()
+        .map(|name| {
+            let routes: Vec<&str> = gateway::ingress::compat::ROUTES
+                .iter()
+                .filter(|(_, program)| *program == name)
+                .map(|(route, _)| *route)
+                .collect();
+            let routes = routes.join(", ");
+            match (builtins::find(name), installed_version(name)) {
+                (Some(builtin), None) => (
+                    name.to_string(),
+                    format!("{name}@{} built in, serves {routes}", builtin.version),
+                    Status::Pass,
+                ),
+                (Some(builtin), Some(installed)) if installed != builtin.version => (
+                    name.to_string(),
+                    format!(
+                        "{name}@{} built in; {name}@{installed} in {inferlets_dir} shadows it for {routes}",
+                        builtin.version
+                    ),
+                    Status::Pass,
+                ),
+                (Some(builtin), Some(_)) => (
+                    name.to_string(),
+                    format!(
+                        "{name}@{} built in; the copy in {inferlets_dir} is what serves {routes}",
+                        builtin.version
+                    ),
+                    Status::Pass,
+                ),
+                (None, Some(installed)) => (
+                    name.to_string(),
+                    format!("{name}@{installed} installed, serves {routes} (not built into this pie)"),
+                    Status::Pass,
+                ),
+                (None, None) => (
+                    name.to_string(),
+                    format!(
+                        "not built into this pie and not installed, so {routes} answer 404; \
+                         `pie inferlet install` a build of crates/builtins/inferlets/{name}"
+                    ),
+                    Status::Warn,
+                ),
+            }
+        })
+        .collect()
 }
 
 fn check_platform() -> (String, String, Status) {
@@ -284,20 +350,24 @@ fn check_platform() -> (String, String, Status) {
     ("Platform".to_string(), info, Status::Pass)
 }
 
-fn check_py_runtime() -> (String, String, Status) {
-    let dir = crate::local::py_runtime::runtime_dir();
-    if crate::local::py_runtime::is_installed() {
+fn check_language(language: Language) -> (String, String, Status) {
+    let path = crate::ops::language::path(language);
+    if path.is_file() {
         (
-            "python".to_string(),
-            format!("runtime at {}", crate::ui::short_path(&dir)),
+            language.name().to_string(),
+            format!("language component at {}", crate::ui::short_path(&path)),
             Status::Pass,
         )
     } else {
         (
-            "python".to_string(),
-            "runtime not installed — `pie serve` fetches it on the way up \
-             (Rust inferlets do not need it)"
-                .to_string(),
+            language.name().to_string(),
+            format!(
+                "no language component at {}; {language} inferlets need it. `pie language \
+                 install pie-language-{language}.tar.gz` (a release asset; install.sh \
+                 fetches it) puts it there, or {language}/inferlet/language/build.sh \
+                 builds one",
+                crate::ui::short_path(&path)
+            ),
             Status::Warn,
         )
     }
@@ -321,7 +391,7 @@ fn nvidia_probe_applies(named_engine: Option<&str>) -> bool {
     }
 }
 
-fn check_gpus(named_engine: Option<&str>) -> Vec<(String, String, Status)> {
+fn check_gpus(named_engine: Option<&str>) -> Checks {
     if !nvidia_probe_applies(named_engine) {
         return vec![(
             "GPU".into(),
@@ -364,7 +434,7 @@ fn check_gpus(named_engine: Option<&str>) -> Vec<(String, String, Status)> {
     }
 }
 
-fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> {
+fn check_tuning(config_path: &Path) -> Checks {
     let file: toml::Value = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|content| toml::from_str(&content).ok())
@@ -400,11 +470,7 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
         )),
     }
 
-    let frame_knobs = [
-        "runtime.frame_size",
-        "runtime.frame_submit_depth",
-        "runtime.frame_dispatch_depth",
-    ];
+    let frame_knobs = ["runtime.frame_size", "runtime.frame_dispatch_depth"];
     let pinned: Vec<&str> = frame_knobs
         .iter()
         .copied()
@@ -419,7 +485,11 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
     } else {
         (
             "batching".to_string(),
-            format!("{} of 3 knobs set in this config", pinned.len()),
+            format!(
+                "{} of {} knobs set in this config",
+                pinned.len(),
+                frame_knobs.len()
+            ),
             Status::Pass,
         )
     });
@@ -431,7 +501,7 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
 mod tests {
     use super::*;
 
-    fn tuning_of(config: &str) -> Vec<(String, String, Status)> {
+    fn tuning_of(config: &str) -> Checks {
         let path = std::env::temp_dir().join(format!(
             "pie-doctor-tuning-{}-{:?}.toml",
             std::process::id(),
@@ -441,6 +511,24 @@ mod tests {
         let checks = check_tuning(&path);
         let _ = std::fs::remove_file(&path);
         checks
+    }
+
+    #[test]
+    fn every_route_is_served_by_a_built_in_program_and_vice_versa() {
+        let routes = gateway::ingress::compat::ROUTES;
+        for (route, name) in routes {
+            assert!(
+                builtins::find(name).is_some(),
+                "{route}: {name} is not built in"
+            );
+        }
+        for builtin in builtins::all() {
+            assert!(
+                routes.iter().any(|(_, name)| *name == builtin.name),
+                "{} is built in but no route serves it",
+                builtin.name
+            );
+        }
     }
 
     #[test]

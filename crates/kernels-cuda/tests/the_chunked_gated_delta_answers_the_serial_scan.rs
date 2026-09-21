@@ -63,22 +63,51 @@ fn the_chunked_gated_delta_answers_the_serial_scan() {
         let gates_t = Tensor::new(gates_at, rows as u32, 2 * v_heads, Dtype::F32);
         let fired = if serial {
             ssm::gated_delta_chunked_serial(
-                &gpu.ctx(), qkv, Tensor::ABSENT, gates_t, &pool, k_heads, v_heads, k_dim, v_dim, &mut y,
+                &gpu.ctx(),
+                qkv,
+                Tensor::ABSENT,
+                gates_t,
+                &pool,
+                k_heads,
+                v_heads,
+                k_dim,
+                v_dim,
+                &mut y,
             )
         } else {
             ssm::gated_delta_chunked(
-                &gpu.ctx(), qkv, Tensor::ABSENT, gates_t, &pool, k_heads, v_heads, k_dim, v_dim, &mut y,
+                &gpu.ctx(),
+                qkv,
+                Tensor::ABSENT,
+                gates_t,
+                &pool,
+                k_heads,
+                v_heads,
+                k_dim,
+                v_dim,
+                &mut y,
             )
         };
         fired.expect("the gated delta fires");
         gpu.sync();
-        (gpu.down(y_at, rows * (v_heads * v_dim) as usize), gpu.down(slab_at, 3 * stride))
+        (
+            gpu.down(y_at, rows * (v_heads * v_dim) as usize),
+            gpu.down(slab_at, 3 * stride),
+        )
     };
     let (y_serial, state_serial) = run(true);
     let (y_chunked, state_chunked) = run(false);
     let (y_again, state_again) = run(false);
-    let unstable = y_chunked.iter().zip(&y_again).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-    let unstable_state = state_chunked.iter().zip(&state_again).filter(|(a, b)| a != b).count();
+    let unstable = y_chunked
+        .iter()
+        .zip(&y_again)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let unstable_state = state_chunked
+        .iter()
+        .zip(&state_again)
+        .filter(|(a, b)| a != b)
+        .count();
     assert!(
         unstable == 0 && unstable_state == 0,
         "two chunked fires disagree with each other: {unstable} output cells, {unstable_state} state cells"
@@ -107,6 +136,9 @@ fn the_chunked_gated_delta_answers_the_serial_scan() {
         let err = (a - b).abs() / a.abs().max(b.abs()).max(1.0);
         worst_state = worst_state.max(err);
     }
-    assert!(worst_state < 3e-2, "the final states differ by {worst_state}");
+    assert!(
+        worst_state < 3e-2,
+        "the final states differ by {worst_state}"
+    );
     eprintln!("chunked vs serial: worst output error {worst}, worst state error {worst_state}");
 }

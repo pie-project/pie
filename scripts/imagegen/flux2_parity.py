@@ -218,7 +218,7 @@ def main() -> int:
     ap.add_argument("cmd", choices=["case", "run", "collect", "compare", "all"])
     ap.add_argument("--golden", default=DEFAULT_GOLDEN)
     ap.add_argument("--out", default="/tmp/flux2-parity")
-    ap.add_argument("--inferlet", default=os.path.join(REPO, "tests/inferlets/flux2-parity"))
+    ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/flux2-parity"))
     ap.add_argument("--config", default=None,
                     help=f"the serving config; its `[model] model` must be the artifact "
                          f"`{DEFAULT_SKU}` imported")

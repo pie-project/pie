@@ -18,11 +18,7 @@ pub(crate) struct Scores {
 }
 
 impl Scores {
-    pub(crate) fn reserve(
-        exports: &[ValueId],
-        heads: u32,
-        lanes: u32,
-    ) -> Result<Option<Scores>> {
+    pub(crate) fn reserve(exports: &[ValueId], heads: u32, lanes: u32) -> Result<Option<Scores>> {
         if exports.is_empty() || heads == 0 || lanes == 0 {
             return Ok(None);
         }

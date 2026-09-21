@@ -1,0 +1,29 @@
+{
+  "name": "@pie-project/browser",
+  "version": "0.5.0",
+  "description": "pie in a browser tab: the runtime and the WebGPU engine as wasm, driven from the page and spoken to with @pie-project/client",
+  "type": "module",
+  "main": "dist/pie.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./dist/pie.mjs"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "index.d.ts"
+  ],
+  "scripts": {
+    "build": "./build.sh release",
+    "bundle": "esbuild src/pie.mjs src/worker.mjs --bundle --format=esm --outdir=dist --out-extension:.js=.mjs --external:./worker.mjs --external:fs --define:__PIE_WASM__='\"./pie_browser_bg.wasm\"' --log-level=warning --log-override:duplicate-object-key=silent && cp pkg/pie_browser_bg.wasm dist/"
+  },
+  "dependencies": {
+    "@pie-project/client": "^0.5.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

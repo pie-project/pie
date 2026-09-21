@@ -20,7 +20,9 @@ impl DispatchElementwise for Run<'_> {
 
 fn fused_norm(norm: NormKind, width: u32) -> Option<elemwise::modulate::NormKind> {
     match norm {
-        NormKind::Layernorm { eps } => Some(elemwise::modulate::NormKind::LayerNormNoAffine { eps }),
+        NormKind::Layernorm { eps } => {
+            Some(elemwise::modulate::NormKind::LayerNormNoAffine { eps })
+        }
         NormKind::Rmsnorm { head_dim, eps } if head_dim == width => {
             Some(elemwise::modulate::NormKind::RmsNormNoScale { eps })
         }
@@ -140,9 +142,12 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*y),
             ),
-            Elementwise::Clamp { x, lo, hi, x_out: _ } => {
-                elemwise::clip::clamp(self.ctx(), *lo, *hi, &mut self.tensor(*x))
-            }
+            Elementwise::Clamp {
+                x,
+                lo,
+                hi,
+                x_out: _,
+            } => elemwise::clip::clamp(self.ctx(), *lo, *hi, &mut self.tensor(*x)),
             Elementwise::ClampLearned {
                 x,
                 lo,
@@ -491,7 +496,12 @@ impl Run<'_> {
             ),
             Elementwise::GateSigmoidMul { x, gate, x_out: _ } => {
                 let fan = self.plane_fan(self.tensor(*x).rows);
-                elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), fan, &mut self.tensor(*x))
+                elemwise::gate::sigmoid_mul(
+                    self.ctx(),
+                    self.tensor(*gate),
+                    fan,
+                    &mut self.tensor(*x),
+                )
             }
             Elementwise::GateSigmoidMulHeads {
                 x,
@@ -641,7 +651,11 @@ impl Run<'_> {
                             &mut self.tensor(*out),
                         )?;
                         if self.read_elsewhere(*normed) {
-                            self.scale_free_norm(*norm, self.tensor(*r), &mut self.tensor(*normed))?;
+                            self.scale_free_norm(
+                                *norm,
+                                self.tensor(*r),
+                                &mut self.tensor(*normed),
+                            )?;
                         }
                         Ok(())
                     }

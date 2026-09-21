@@ -14,7 +14,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::engine;
 use crate::inferlet::sandbox::{FsPolicy, NetworkPolicy};
-use crate::inferlet::{linker, process, program, python};
+use crate::inferlet::{linker, process, program};
 use crate::model::{self, ModelMetadata};
 use crate::server;
 #[cfg(not(target_arch = "wasm32"))]
@@ -67,15 +67,24 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub cache_dir: PathBuf,
+    /// The built-in inferlets: registered at boot beside whatever
+    /// `cache_dir` holds, each shadowed by a copy of its own name and
+    /// version installed there.
+    pub builtin_programs: Vec<BuiltinProgram>,
     pub verbose: bool,
     pub log_dir: Option<PathBuf>,
-    pub registry_url: String,
     pub telemetry: TelemetryConfig,
     pub runtime: RuntimeConfig,
     pub model: ModelConfig,
     pub skip_tracing: bool,
     pub max_concurrent_processes: Option<usize>,
-    pub python_snapshot: bool,
+}
+
+/// One built-in inferlet: its manifest as TOML and its component.
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltinProgram {
+    pub manifest: &'static str,
+    pub component: &'static [u8],
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +103,11 @@ pub struct RuntimeConfig {
     pub network_allowed_hosts: Vec<String>,
 
     pub max_upload_mb: usize,
-    pub py_runtime_dir: PathBuf,
+    /// Where the `<language>.wasm` language components live.
+    pub languages_dir: PathBuf,
+    /// Where wasmtime caches compiled code across boots; `None` compiles
+    /// every component on every boot.
+    pub compile_cache_dir: Option<PathBuf>,
 }
 
 pub struct ModelConfig {
@@ -183,17 +196,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     }
     let wasm_engine = init_wasmtime(&config.runtime);
 
-    python::runtime::init(
-        &wasm_engine,
-        &config.runtime.py_runtime_dir,
-        config.python_snapshot,
-    );
-
     program::spawn(
         &wasm_engine,
-        config.registry_url.clone(),
         config.cache_dir.clone(),
-    );
+        config.runtime.languages_dir.clone(),
+        &config.builtin_programs,
+    )?;
 
     let fs_policy = FsPolicy {
         allow: config.runtime.allow_fs,
@@ -496,6 +504,20 @@ fn init_wasmtime(_runtime: &RuntimeConfig) -> wasmtime::Engine {
 #[cfg(not(target_arch = "wasm32"))]
 fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
+
+    if let Some(dir) = &runtime.compile_cache_dir {
+        let mut cache_config = wasmtime::CacheConfig::new();
+        cache_config.with_directory(dir);
+        match wasmtime::Cache::new(cache_config) {
+            Ok(cache) => {
+                wasm_config.cache(Some(cache));
+            }
+            Err(error) => tracing::warn!(
+                "compile cache at {} unavailable, every component compiles on this boot: {error:#}",
+                dir.display()
+            ),
+        }
+    }
 
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
     pooling_config.total_component_instances(runtime.wasm_max_instances);

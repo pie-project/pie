@@ -79,14 +79,20 @@ def unpatchify(tokens: np.ndarray, c: int, hs: int, ws: int, p: int) -> np.ndarr
     x = x.transpose(0, 3, 1, 4, 2, 5)
     return np.ascontiguousarray(x.reshape(b, c, hs, ws))
 
-def numbered(out: str, stem: str, euler: bool) -> list[str]:
+def loop_of(args) -> str | None:
+    """The loop a run integrates: `euler`, a `--solver`, or none (one step)."""
+    return getattr(args, "solver", None) or ("euler" if args.euler else None)
+
+
+def numbered(out: str, stem: str, euler) -> list[str]:
     """`<out>/<stem>[_euler]_<b>.json` for every batch element `b`, in order.
 
     Matched by pattern and not by prefix: `pie_euler_0.json` starts with
     `pie_`, so a prefix test folds the four-step run's files into the
     one-step run's and stacks a batch of four against a golden of two.
     """
-    pattern = re.compile(rf"^{re.escape(stem)}{'_euler' if euler else ''}_(\d+)\.json$")
+    suffix = f"_{euler}" if isinstance(euler, str) else ("_euler" if euler else "")
+    pattern = re.compile(rf"^{re.escape(stem)}{suffix}_(\d+)\.json$")
     found = []
     for name in os.listdir(out):
         match = pattern.match(name)
@@ -141,7 +147,7 @@ def cases(args) -> list[str]:
             "t_scale": float(cfg["euler_t_scale"]),
             "steps": int(cfg["euler_steps"]) if args.euler else 0,
         }
-        path = os.path.join(args.out, f"case{'_euler' if args.euler else ''}_{b}.json")
+        path = os.path.join(args.out, f"case{'_' + loop_of(args) if loop_of(args) else ''}_{b}.json")
         with open(path, "w") as f:
             json.dump(case, f)
         written.append(path)
@@ -151,7 +157,7 @@ def cases(args) -> list[str]:
 def wasm(inferlet: str) -> str:
     """The newest `.wasm` a build left for `inferlet`, building one first.
 
-    Newest wins, not first, for `tests/inferlets/conftest.py`'s reason: a
+    Newest wins, not first, for `tests/examples/conftest.py`'s reason: a
     release artifact built once by hand would otherwise shadow every debug
     rebuild afterwards, silently.
     """
@@ -178,7 +184,7 @@ def wasm(inferlet: str) -> str:
     return max(present, key=os.path.getmtime)
 
 def run(args) -> None:
-    paths = numbered(args.out, "case", args.euler)
+    paths = numbered(args.out, "case", loop_of(args))
     if not paths:
         raise SystemExit(f"{args.out}: no case JSON; run `case` first")
     pie = args.pie or shutil.which("pie") or os.path.join(REPO, "target/debug/pie")
@@ -190,7 +196,7 @@ def run(args) -> None:
     binary = wasm(args.inferlet)
     manifest = os.path.join(args.inferlet, "Pie.toml")
     for b, case in enumerate(paths):
-        out = os.path.join(args.out, f"pie{'_euler' if args.euler else ''}_{b}.json")
+        out = os.path.join(args.out, f"pie{'_' + loop_of(args) if loop_of(args) else ''}_{b}.json")
         cmd = [pie]
         if args.config:
             cmd += ["--config", args.config]
@@ -203,10 +209,16 @@ def run(args) -> None:
             step = -(-len(text) // n)
             for i in range(n):
                 cmd += [f"--case_{i}", text[i * step:(i + 1) * step]]
-        if args.euler:
+        if args.solver:
+            cmd += ["--solver", args.solver]
+        elif args.euler:
             cmd += ["--euler", "true"]
         if getattr(args, "cfg", False):
             cmd += ["--cfg", "true", "--cfg_scale", str(args.cfg_scale)]
+        if getattr(args, "classes", None):
+            cmd += ["--classes", args.classes]
+        if getattr(args, "sweep", None):
+            cmd += ["--sweep", str(args.sweep)]
         print(f"[run] {' '.join(cmd)}")
         done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
         if done.returncode != 0:
@@ -233,6 +245,148 @@ def document(path: str) -> dict:
     if isinstance(doc, str):
         doc = json.loads(doc)
     return doc
+
+def classes(args) -> int:
+    """A STRUCTURED ATTENTION MASK, STATED BY THE GUEST — does it mask, and
+    only what it says? One step in four modes of `--classes`, all 3-lane
+    fires of one shape, so every claim is bit-for-bit within its own kind:
+
+      all vs none    ->  two classes whose table lets everything see
+                         everything must land the plain step EXACTLY: the
+                         class arm of the kernel adds a predicate and no
+                         arithmetic.
+      split vs none  ->  an identity table over a left/right split of the
+                         image grid and a first/last split of the text rows
+                         must MOVE the velocity: the mask does something.
+      split-swap     ->  negating the class-1 text rows must leave every
+                         class-0 (left-half) image row EXACTLY where `split`
+                         put it, and move the class-1 rows: rows see only
+                         their own class, through every block, and the
+                         context lane (class -1) stays visible to both.
+    """
+    bad = 0
+    answers = {}
+    for mode in ("none", "all", "split", "split-swap"):
+        run_args = argparse.Namespace(**vars(args))
+        run_args.classes = mode
+        run_args.euler = False
+        run_args.solver = None
+        run_args.out = os.path.join(args.out, mode)
+        cases(run_args)
+        run(run_args)
+        answers[mode] = [document(path) for path in numbered(run_args.out, "pie", False)]
+    batches = len(answers["none"])
+    if not batches:
+        print("[classes] FAIL the guest published nothing")
+        return 1
+    for at in range(batches):
+        v = {mode: np.asarray(answers[mode][at]["velocity"], dtype=np.float32) for mode in answers}
+        rows = int(answers["none"][at]["image_rows"])
+        width = int(answers["none"][at]["patch_features"])
+        side = int(round(rows ** 0.5))
+        left = np.array([(i % side) < side // 2 for i in range(rows)])
+        rel = lambda a, b: float(np.linalg.norm(a - b)) / max(float(np.linalg.norm(b)), 1e-30)
+        if np.array_equal(v["all"], v["none"]):
+            print(f"[classes] batch {at}: PASS an all-ones table is the plain step, exactly")
+        else:
+            print(f"[classes] batch {at}: FAIL an all-ones table moved the step by rel "
+                  f"{rel(v['all'], v['none']):.3g}")
+            bad += 1
+        moved = rel(v["split"], v["none"])
+        if moved > 1e-3:
+            print(f"[classes] batch {at}: PASS the split table moves the velocity by rel {moved:.4f}")
+        else:
+            print(f"[classes] batch {at}: FAIL the split table left the velocity at rel {moved:.3g}")
+            bad += 1
+        s = v["split"].reshape(rows, width)
+        w = v["split-swap"].reshape(rows, width)
+        if np.array_equal(s[left], w[left]):
+            print(f"[classes] batch {at}: PASS class-0 image rows ignore the class-1 text, exactly")
+        else:
+            print(f"[classes] batch {at}: FAIL class-0 image rows moved by rel "
+                  f"{rel(w[left], s[left]):.3g} when only class-1 text changed")
+            bad += 1
+        right = rel(w[~left], s[~left])
+        if right > 1e-3:
+            print(f"[classes] batch {at}: PASS class-1 image rows follow the class-1 text (rel {right:.4f})")
+        else:
+            print(f"[classes] batch {at}: FAIL class-1 image rows ignored their own text (rel {right:.3g})")
+            bad += 1
+    if bad:
+        print(f"[classes] FAIL {bad} claim(s) failed")
+        return 1
+    print("[classes] PASS")
+    return 0
+
+
+def sweep(args) -> int:
+    """N REQUESTS IN ONE FIRE. `--sweep N` submits N attention groups (3N
+    lanes) together, each group on pipelines of its own, and reads N
+    velocities back. Two claims, no golden:
+
+      g1 == g0 exactly  ->  group 1 repeats group 0's inputs. Bit-for-bit
+                            equality is only possible inside ONE fire: a
+                            lane's bf16 answer depends on the fire's
+                            composition (documented: rel 0.0056 between a
+                            six-lane and a three-lane fire), so this is the
+                            proof the runtime packed the groups together.
+      g2 != g0          ->  group 2 scaled its latent, so its velocity
+                            must move: the groups are independent lanes,
+                            not one lane read N times.
+
+    The lone 3-lane step is run too and its distance from g0 is REPORTED
+    (expected small and non-zero: same math, another fire's accumulation).
+    """
+    n = args.sweep or 4
+    run_args = argparse.Namespace(**vars(args))
+    run_args.sweep = n
+    run_args.euler = False
+    run_args.solver = None
+    run_args.out = os.path.join(args.out, f"sweep{n}")
+    cases(run_args)
+    run(run_args)
+    swept = [document(path) for path in numbered(run_args.out, "pie", False)]
+    lone_args = argparse.Namespace(**vars(args))
+    lone_args.sweep = None
+    lone_args.euler = False
+    lone_args.solver = None
+    lone_args.out = os.path.join(args.out, "lone")
+    cases(lone_args)
+    run(lone_args)
+    lone = [document(path) for path in numbered(lone_args.out, "pie", False)]
+    if not swept:
+        print("[sweep] FAIL the guest published nothing")
+        return 1
+    bad = 0
+    rel = lambda a, b: float(np.linalg.norm(a - b)) / max(float(np.linalg.norm(b)), 1e-30)
+    for at, doc in enumerate(swept):
+        vs = [np.asarray(v, dtype=np.float32) for v in doc["sweep_velocity"]]
+        if len(vs) != n:
+            print(f"[sweep] batch {at}: FAIL {len(vs)} velocities for {n} groups")
+            bad += 1
+            continue
+        if np.array_equal(vs[0], vs[1]):
+            print(f"[sweep] batch {at}: PASS group 1 repeats group 0 exactly — one fire")
+        else:
+            print(f"[sweep] batch {at}: FAIL group 1 differs from group 0 by rel "
+                  f"{rel(vs[1], vs[0]):.3g}; the groups did not share a fire")
+            bad += 1
+        moved = rel(vs[2], vs[0]) if n > 2 else 1.0
+        if moved > 1e-3:
+            print(f"[sweep] batch {at}: PASS group 2 is its own request (rel {moved:.4f})")
+        else:
+            print(f"[sweep] batch {at}: FAIL group 2 landed group 0's velocity (rel {moved:.3g})")
+            bad += 1
+        if at < len(lone):
+            alone = np.asarray(lone[at]["velocity"], dtype=np.float32)
+            print(f"[sweep] batch {at}: lone 3-lane fire vs group 0 of the {3 * n}-lane fire: "
+                  f"rel {rel(vs[0], alone):.3g} (reported)")
+    if bad:
+        print(f"[sweep] FAIL {bad} claim(s) failed")
+        return 1
+    print("[sweep] PASS")
+    return 0
+
 
 def guidance(args) -> int:
     """CLASSIFIER-FREE GUIDANCE, ON THE DEVICE — does it run, and is it right?
@@ -322,7 +476,7 @@ def collect(args) -> str:
     cfg = config(args.golden)
     p = cfg["patch_size"]
     c, hs, ws = cfg["latent_shape"]
-    paths = numbered(args.out, "pie", args.euler)
+    paths = numbered(args.out, "pie", loop_of(args))
     if not paths:
         raise SystemExit(f"{args.out}: no pie answer; run `run` first")
     docs = [document(path) for path in paths]
@@ -339,12 +493,13 @@ def collect(args) -> str:
         return unpatchify(tokens, c, hs, ws, p)
 
     out: dict[str, np.ndarray] = {}
-    if args.euler:
+    if loop_of(args):
+        name = loop_of(args)
         steps = len(docs[0]["euler_v"])
         for i in range(steps):
-            out[f"euler.v{i}"] = stack("euler_v", i)
-            out[f"euler.x{i + 1}"] = stack("euler_x", i)
-        out["euler.latent"] = out[f"euler.x{steps}"]
+            out[f"{name}.v{i}"] = stack("euler_v", i)
+            out[f"{name}.x{i + 1}"] = stack("euler_x", i)
+        out[f"{name}.latent"] = out[f"{name}.x{steps}"]
     elif args.tap:
         planes = [np.asarray(doc["velocity"], dtype=np.float32) for doc in docs]
         tw = docs[0].get("velocity_width", width)
@@ -355,18 +510,18 @@ def collect(args) -> str:
             [np.asarray(doc["velocity"], dtype=np.float32).reshape(rows, width) for doc in docs]
         )
 
-    path = os.path.join(args.out, f"mini_dit_pie{'_euler' if args.euler else ''}.npz")
+    path = os.path.join(args.out, f"mini_dit_pie{'_' + loop_of(args) if loop_of(args) else ''}.npz")
     np.savez(path, **out)
     print(f"[collect] {len(out)} tensors from {len(docs)} batch element(s) -> {path}")
     return path
 
 def compare(args) -> int:
-    mine = os.path.join(args.out, f"mini_dit_pie{'_euler' if args.euler else ''}.npz")
+    mine = os.path.join(args.out, f"mini_dit_pie{'_' + loop_of(args) if loop_of(args) else ''}.npz")
     if not os.path.exists(mine):
         raise SystemExit(f"{mine}: no pie npz; run `collect` first")
     theirs = os.path.join(
         args.golden,
-        f"mini_dit_{'euler' if args.euler else 'dump'}_{args.policy}.npz",
+        f"mini_dit_{loop_of(args) or 'dump'}_{args.policy}.npz",
     )
     cmd = [
         sys.executable, os.path.join(HERE, "compare.py"), mine, theirs,
@@ -384,14 +539,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("cmd", choices=["case", "run", "collect", "compare", "all", "guidance"])
+    ap.add_argument("cmd", choices=["case", "run", "collect", "compare", "all", "guidance", "classes", "sweep"])
+    ap.add_argument("--sweep", type=int, default=None, help="groups to pack into one fire (`sweep`)")
     ap.add_argument("--golden", default=DEFAULT_GOLDEN)
     ap.add_argument("--out", default="/tmp/mini-dit-parity")
     ap.add_argument("--policy", choices=["bf16", "fp32"], default="bf16",
                     help="which emulation of the reference to diff against")
+    ap.add_argument("--solver", choices=["dpm2m"], default=None,
+                    help="integrate the Euler golden's schedule with this solver on the device")
     ap.add_argument("--euler", action="store_true",
                     help="the four-step schedule instead of one step")
-    ap.add_argument("--inferlet", default=os.path.join(REPO, "tests/inferlets/mini-dit-parity"))
+    ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/mini-dit-parity"))
     ap.add_argument("--config", default=None,
                     help=f"the serving config; its `[model] model` must be the artifact "
                          f"`{DEFAULT_SKU}` imported")
@@ -405,9 +563,15 @@ def main() -> int:
                          "attention groups, one fire, combined in the epilogue")
     ap.add_argument("--cfg-scale", dest="cfg_scale", type=float, default=1.0)
     args = ap.parse_args()
+    if args.solver:
+        args.euler = True
 
     if args.cmd == "guidance":
         return guidance(args)
+    if args.cmd == "classes":
+        return classes(args)
+    if args.cmd == "sweep":
+        return sweep(args)
     if args.cmd == "case":
         cases(args)
     elif args.cmd == "run":

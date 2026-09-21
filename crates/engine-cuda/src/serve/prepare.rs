@@ -93,7 +93,9 @@ impl FrameShell for Shell {
                 match self.programs.geometry_of(attached.instance) {
                     None | Some(eta_ir::registry::GeometryClass::Host) => true,
                     Some(eta_ir::registry::GeometryClass::DecodeEnvelope) => {
-                        self.programs.token_device_source(attached.instance).is_some()
+                        self.programs
+                            .token_device_source(attached.instance)
+                            .is_some()
                             && lanes
                                 .get(attached.lane as usize)
                                 .is_some_and(|seated| seated.lane.tokens.len() == 1)
@@ -407,10 +409,29 @@ impl FrameShell for Shell {
                 }
             }
         }
-        let readouts_ceiling = model_compiler::arena::readouts_ceiling(&self.budget);
+        // Logits are gathered into the readouts-carved plane; a velocity or
+        // hidden seam is read off a tokens-shaped plane and is bounded by the
+        // fire's own rows.
+        let readouts_ceiling = composition
+            .lanes()
+            .iter()
+            .filter(|row| readout_count[row.source as usize] > 0)
+            .map(|row| match self.exports.readout_for(row.class as usize) {
+                Some(seam) if seam.seam != engine::fire::ReadoutSeam::Logits => {
+                    u64::from(self.budget.max_tokens)
+                }
+                Some(seam) => self
+                    .compiled
+                    .arena
+                    .readout_ceiling_of(seam.value)
+                    .unwrap_or_else(|| model_compiler::arena::readouts_ceiling(&self.budget)),
+                None => model_compiler::arena::readouts_ceiling(&self.budget),
+            })
+            .min()
+            .unwrap_or_else(|| model_compiler::arena::readouts_ceiling(&self.budget));
         if readout_rows.len() as u64 > readouts_ceiling {
             return Err(Fault::Ceiling {
-                what: "rows one fire reads logits for (READOUTS_PER_LANE per lane)",
+                what: "rows one fire reads out through its readout plane",
                 need: readout_rows.len() as u64,
                 have: readouts_ceiling,
             });
@@ -428,18 +449,24 @@ impl FrameShell for Shell {
                 group: seated.group,
             })
             .collect();
+        let lane_classes: Vec<Option<&[i32]>> = lanes
+            .iter()
+            .map(|seated| seated.attn_classes.map(|stated| stated.classes.as_slice()))
+            .collect();
+        let class_table = self.class_table_of(composition.lanes(), lanes)?;
         let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
             (Vec::new(), Vec::new())
         } else {
             let groups = model_exec::fire::group_of_lane(composition.lanes(), &lane_facts);
             let mut packings = Vec::with_capacity(self.feeds.selections.len());
             for &select in &self.feeds.selections {
-                let packed = model_exec::fire::pack(
+                let packed = model_exec::fire::pack_with_classes(
                     select,
                     composition.lanes(),
                     &lane_facts,
                     &groups,
                     composition.rows(),
+                    &lane_classes,
                 )
                 .map_err(model_exec::Error::Fire)?;
                 packings.push(packed);
@@ -816,7 +843,8 @@ impl FrameShell for Shell {
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold_len.as_deref());
             if let RsVerb::Buffer { pages, .. } | RsVerb::FoldBuffered { pages, .. } = &seated.rs {
-                rs_pages_named = rs_pages_named.max(pages.iter().copied().max().map_or(0, |page| page + 1));
+                rs_pages_named =
+                    rs_pages_named.max(pages.iter().copied().max().map_or(0, |page| page + 1));
             }
             let (verb, folded) = match &seated.rs {
                 RsVerb::Fold => (RsMove::None, row.rows),
@@ -1270,16 +1298,18 @@ impl FrameShell for Shell {
         let staged = crate::mask::stage(&masks)?;
         super::btrace::mark("mask");
 
+        let totals = model_ir::PerAxis::from_fn(|axis| composition.axis(axis).rows);
+        // The widened table, as `segmentation` holds it: what a body was
+        // recorded under is what it replays under.
+        let key = key.with_islands(&record::widen(
+            &self.compiled,
+            &windows.admits_axes(totals, &self.shifted, &self.lane_shifted),
+        ));
         let ladder = key.classes.clone();
         let patch_ladder = key.patch.as_ref().map(|axis| axis.classes.clone());
         let records_bodies = self.records_bodies();
         let (admits, world): (std::sync::Arc<[crate::window::Admit]>, bool) = if records_bodies {
-            self.segmentation(
-                &key,
-                &windows,
-                model_ir::PerAxis::from_fn(|axis| composition.axis(axis).rows),
-                copies_here,
-            )
+            self.segmentation(&key, &windows, totals, copies_here)
         } else {
             (Vec::new().into(), true)
         };
@@ -1353,6 +1383,7 @@ impl FrameShell for Shell {
                 lane_indptr: &packed.lane_indptr,
                 reference_start: &packed.reference_start,
                 reference_tag: &packed.reference_tag,
+                attn_class: &packed.attn_class,
                 permutation: &packed.permutation,
             })
             .collect();
@@ -1374,6 +1405,9 @@ impl FrameShell for Shell {
                 lane_of_row: &lane_of_row,
                 group_of_lane: &group_of_lane,
                 packings: &packing_fires,
+                class_table: class_table
+                    .as_ref()
+                    .map(|stated| (stated.table.as_slice(), stated.count)),
             },
         )?;
 
@@ -1403,6 +1437,7 @@ impl FrameShell for Shell {
             token_injects,
             bodied,
             admits,
+            islands: key.islands.clone(),
             ladder,
             lane_ceiling,
             patch_ladder,
@@ -1585,5 +1620,88 @@ mod tests {
         }
         let error = resolve_fold_len(FoldLen::Host(4), 0, 0, None).unwrap_err();
         assert!(error.to_string().contains("bonus token"), "{error}");
+    }
+}
+
+impl Shell {
+    /// The attention class table this fire stages: the one every stating
+    /// lane agrees on, checked against each lane's rows, or none.
+    fn class_table_of<'a>(
+        &self,
+        rows: &[model_exec::fire::LaneRow],
+        lanes: &[super::lanes::Seated<'a>],
+    ) -> Result<Option<&'a engine::fire::AttnClasses>> {
+        let mut table: Option<&'a engine::fire::AttnClasses> = None;
+        for (source, seated) in lanes.iter().enumerate() {
+            let Some(stated) = seated.attn_classes else {
+                continue;
+            };
+            if self.feeds.selections.is_empty() {
+                return Err(Fault::program(
+                    "serve::classes",
+                    "a lane states attention classes and this model packs no attention \
+                     group; the mask applies to group-packed `attention.ragged` only",
+                ));
+            }
+            let owned = rows
+                .iter()
+                .find(|r| r.source as usize == source)
+                .map_or(0, |r| r.rows);
+            if stated.classes.len() as u32 != owned {
+                return Err(Fault::program(
+                    "serve::classes",
+                    format!(
+                        "a lane states {} attention classes and carries {owned} rows; one \
+                         class per row",
+                        stated.classes.len()
+                    ),
+                ));
+            }
+            if stated.count == 0 || stated.count > engine::fire::ATTN_CLASSES_MAX {
+                return Err(Fault::program(
+                    "serve::classes",
+                    format!(
+                        "a lane states {} attention classes; the table holds 1..={}",
+                        stated.count,
+                        engine::fire::ATTN_CLASSES_MAX
+                    ),
+                ));
+            }
+            if stated.table.len() as u64 != u64::from(stated.count) * u64::from(stated.count) {
+                return Err(Fault::program(
+                    "serve::classes",
+                    format!(
+                        "a lane's class table is {} bytes for {} classes; it is count x count",
+                        stated.table.len(),
+                        stated.count
+                    ),
+                ));
+            }
+            if let Some(bad) = stated
+                .classes
+                .iter()
+                .find(|c| **c >= 0 && **c as u32 >= stated.count)
+            {
+                return Err(Fault::program(
+                    "serve::classes",
+                    format!(
+                        "a lane's row names attention class {bad} and the table holds {}",
+                        stated.count
+                    ),
+                ));
+            }
+            match table {
+                None => table = Some(stated),
+                Some(have) if have.count == stated.count && have.table == stated.table => {}
+                Some(_) => {
+                    return Err(Fault::program(
+                        "serve::classes",
+                        "two lanes of one fire state different attention class tables; \
+                         a fire reads one",
+                    ));
+                }
+            }
+        }
+        Ok(table)
     }
 }

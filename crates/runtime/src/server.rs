@@ -324,8 +324,6 @@ impl Session {
                 corr_id,
                 name,
                 version,
-                wasm_hash: _,
-                manifest_hash: _,
             } => self.handle_check_program(corr_id, name, version).await,
 
             ClientMessage::Query {

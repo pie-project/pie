@@ -22,7 +22,7 @@ pub use units::{ByteSize, Duration};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Client-facing listener, plus what pie fetches inferlets from.
+    /// Client-facing listener.
     /// OpenTelemetry export. Off by default.
     /// Batching and timeout policy. Every field has a measured default; the
     /// frame knobs are part of the guest contract.
@@ -265,10 +265,6 @@ pub struct ServerConfig {
     /// Independent of `--log-level`, which sets the tracing filter.
     #[serde(default)]
     pub verbose: bool,
-    /// Where `pie inferlet` downloads from, and where the engine fetches a
-    /// program it is asked to run but does not have.
-    #[serde(default = "default_registry")]
-    pub registry: String,
     /// Tokio worker threads. Derived from the visible CPUs, capped at 64.
     #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
@@ -283,7 +279,6 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             verbose: false,
-            registry: default_registry(),
             worker_threads: default_worker_threads(),
             max_upload: default_max_upload(),
         }
@@ -306,9 +301,6 @@ fn default_host() -> String {
 }
 fn default_port() -> u16 {
     8080
-}
-fn default_registry() -> String {
-    "https://registry.pie-project.org/".to_string()
 }
 fn default_true() -> bool {
     true
@@ -390,16 +382,6 @@ pub struct SandboxConfig {
     /// Unused pool slots kept warm rather than torn down.
     #[serde(default = "default_warm_slots")]
     pub warm_slots: u32,
-    /// Apply the host-side snapshot optimization to Python components.
-    ///
-    /// On by default. It only affects bootstrap cost, so turning it off is a
-    /// debugging step -- it changes which wasmtime linker variant is built.
-    /// Fetch the Python WASM runtime at boot when it is missing. Python
-    /// inferlets need it; Rust inferlets do not.
-    #[serde(default = "default_true")]
-    pub python_snapshot: bool,
-    #[serde(default = "default_true")]
-    pub python_runtime: bool,
 }
 
 impl Default for SandboxConfig {
@@ -413,8 +395,6 @@ impl Default for SandboxConfig {
             max_memory: default_max_memory(),
             warm_memory: ByteSize::from_mib(0),
             warm_slots: default_warm_slots(),
-            python_snapshot: true,
-            python_runtime: true,
         }
     }
 }
@@ -1056,6 +1036,9 @@ device = ["cpu"]
             ("server", "max_upload_mb = 256"),
             ("runtime", "submit_deadline_us = 50000"),
             ("runtime", "silence_timeout_secs = 30"),
+            ("server", "registry = \"https://registry.pie-project.org/\""),
+            ("sandbox", "python_runtime = true"),
+            ("sandbox", "python_snapshot = true"),
         ] {
             let toml = format!("{MINIMAL_METAL}\n[{section}]\n{legacy}\n");
             assert!(

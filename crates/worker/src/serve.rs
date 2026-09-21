@@ -530,14 +530,13 @@ fn build_partner_bootstrap(
     })
 }
 
+/// The verbose banner goes to stderr; the ready line is the CLI's to print,
+/// so a process embedding the server (the Node addon, the Python wheel)
+/// keeps its stdout.
 fn log_serving(cfg: &config::Config, url: &str) {
-    use std::io::Write;
-
     if cfg.server.verbose {
         eprintln!("{}", StartupBanner::from_config(cfg).render(url));
     }
-    println!("{}", banner::ready_line(url));
-    let _ = std::io::stdout().flush();
 }
 
 async fn assemble_control_and_edge(

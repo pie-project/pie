@@ -127,9 +127,22 @@ No real model, no download, CPU-only, ~1 s.  It is the smallest graph that
 exercises exactly the M0 substrate patterns and nothing else.
 
 ```bash
-python mini_dit_ref.py            # --init --dump --euler
+python mini_dit_ref.py            # --init --dump --euler --dpm2m
 python mini_dit_ref.py --out-dir /somewhere/else
 ```
+
+`--dpm2m` integrates the Euler golden's start and schedule with DPM-Solver++ 2M
+(`mini_dit_dpm2m_{fp32,bf16}.npz`); `mini_dit_parity.py all --solver dpm2m` drives
+the guest's device loop (`latent::dpm2m_step`) against it, and `gates.py` runs that as
+the `dpm-2m` row. `mini_dit_parity.py classes` drives the guest-stated attention
+mask (`forward-pass.attention-classes`) through four modes and checks its identities
+without a golden; `gates.py` runs that as `attn-classes`.
+
+On a card smaller than the roster assumes, `gates.py` takes `PIE_GATES_ROWS`,
+`PIE_GATES_MEM`, `PIE_GATES_VOXELS` (the VAE ladder asks 21 GiB at its 65 536
+default) and `PIE_GATES_T2I_BIG` / `PIE_GATES_T2I_SMALL` (the text-to-image gate's
+picture sizes). The mini-dit golden dir needs a `tokenizer.json` beside the weights
+before `pie model import` (any BPE tokenizer; the runtime insists on one).
 
 ### Architecture (see `config.json` for the machine-readable copy)
 
@@ -374,7 +387,7 @@ the pixels the reference VAE decodes it to
 (`golden/z-image/zimage_vae/{latent,pixels,mean}.f32` + `shapes.json`).  The
 engine gate `engine-cuda/tests/the_z_image_vae_answers_the_reference` feeds
 that latent from the HOST; this script feeds it the way a guest can, through
-`tests/inferlets/zimage-vae-parity`: the latent bound as the reading's
+`examples/zimage-vae-parity`: the latent bound as the reading's
 `Voxels` port CHANNEL (whose declared shape is the clip's box), the answer
 read off `intrinsics::pixels()`, and the picture out through
 `frames.from-channel` + `session.send-frames`.
@@ -462,7 +475,7 @@ encode `[1,512,512] -> [1,32,32]` cos 0.999957, mean |err| 0.0069, max 0.115.
 
 #### The pie side — `flux2_parity.py`
 
-`tests/inferlets/flux2-parity` is the `flux2-mini` row's guest: one denoise
+`examples/flux2-parity` is the `flux2-mini` row's guest: one denoise
 step over three lanes of one group — the text lane (`context` port, the raw
 `[32, 192]` stack), the target lane (`latents`, 64 rows) and ONE reference
 lane (`latents` again, both references' 128 rows, at their own `T`
@@ -485,7 +498,7 @@ Measured (bf16 pie vs the fp32 golden): max-abs 0.0059, rel 0.0044, cos
 
 #### The REAL row — `flux2_klein_parity.py`
 
-`tests/inferlets/flux2-klein-parity` is the `flux2-klein-4b` row against the
+`examples/flux2-klein-parity` is the `flux2-klein-4b` row against the
 same dump: the `text` reading over the family's chat template (the ids are
 checked against `text.input_ids` exactly), one `denoise` step over the
 golden's own step-0 inputs, one independent step per sigma from the
@@ -630,7 +643,7 @@ seconds and pixels — because that product is exactly what the pie port takes:
 
 #### The pie side — `ltx2_parity.py`
 
-`tests/inferlets/ltx2-parity` is the `ltx25-mini` row's guest. A denoise case
+`examples/ltx2-parity` is the `ltx25-mini` row's guest. A denoise case
 is FOUR lanes of one group, each on its own pipeline: `Video` (latents,
 three coordinates, timestep), `Audio` (latents, one coordinate, timestep),
 `Context` (the video text context, timestep) and `Reference` (the audio text
@@ -748,7 +761,7 @@ pie model import <dir with h3_mini.safetensors> --sku minimax-h3-mini-bf16-kv-bf
 python h3_parity.py all --out /tmp/h3-parity --config ~/.pie/config.h3-mini.toml
 ```
 
-The guest (`tests/inferlets/h3-parity`) runs the `refine` pass (the text lane
+The guest (`examples/h3-parity`) runs the `refine` pass (the text lane
 alone) and then one `denoise` step of FOUR lanes in one attention group — text,
 video, audio, reference — one pipeline each, one timestep cell per pass. Use a
 PRIVATE config with its own `[server] port` and an `[engine] max_model_len` at
@@ -1029,7 +1042,7 @@ full transcript of every command — servers' logs included — lands in
 Eleven of the twelve gates pass and reproduce the number their family
 recorded, to the last digit the table prints.  The one red row is
 `flux2-mini`, and it is not drift: the guest
-`tests/inferlets/flux2-parity/src/lib.rs` submits all THREE passes of its one
+`examples/flux2-parity/src/lib.rs` submits all THREE passes of its one
 attention group down ONE `Pipeline`, and a pipeline is serial — the three
 arrive as one lane and count once.  `97bdf6185` (frame-seal) made that a
 named refusal ("attention group 0 never composed: 3 live forward passes name

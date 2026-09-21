@@ -21,7 +21,7 @@ interface working-set {
 
     // A half-open declaration [start, end) of WorkingSet-relative page
     // indexes. Unlike page-range, an absent end follows later lease growth at
-    // the storage contract. A pass using SDK-generated dense page geometry
+    // the storage contract. A pass using library-generated dense page geometry
     // must be recreated if growth exceeds its bind-time page envelope. When
     // end is present, start must not exceed it. This type is only for forward-
     // pass readable/writable declarations; reserve/discard/slice continue to

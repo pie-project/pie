@@ -56,12 +56,38 @@ fn bank(lcg: &mut Lcg, experts: usize, n: usize, k: usize) -> Bank {
     }
 }
 
-fn check(experts: usize, n: usize, k: usize, tokens: usize, top_k: usize, by_token: bool, seed: u64) {
-    check_with(experts, n, k, tokens, top_k, by_token, seed, tokens * top_k >= 16);
+fn check(
+    experts: usize,
+    n: usize,
+    k: usize,
+    tokens: usize,
+    top_k: usize,
+    by_token: bool,
+    seed: u64,
+) {
+    check_with(
+        experts,
+        n,
+        k,
+        tokens,
+        top_k,
+        by_token,
+        seed,
+        tokens * top_k >= 16,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check_with(experts: usize, n: usize, k: usize, tokens: usize, top_k: usize, by_token: bool, seed: u64, bf16_weights: bool) {
+fn check_with(
+    experts: usize,
+    n: usize,
+    k: usize,
+    tokens: usize,
+    top_k: usize,
+    by_token: bool,
+    seed: u64,
+    bf16_weights: bool,
+) {
     let mut lcg = Lcg::seeded(seed);
     let bank = bank(&mut lcg, experts, n, k);
     let act_rows = if by_token { tokens } else { tokens * top_k };
@@ -83,8 +109,18 @@ fn check_with(experts: usize, n: usize, k: usize, tokens: usize, top_k: usize, b
     let ctx = gpu.ctx();
     let x_t = Tensor::new(x_at, act_rows as u32, k as u32, Dtype::Bf16);
     let codes_t = Tensor::new(codes_at, experts as u32, (n * k / 2) as u32, Dtype::U8);
-    let scales_t = Tensor::new(scales_at, experts as u32, (n * (k / GROUP) * 2) as u32, Dtype::U8);
-    let biases_t = Tensor::new(biases_at, experts as u32, (n * (k / GROUP) * 2) as u32, Dtype::U8);
+    let scales_t = Tensor::new(
+        scales_at,
+        experts as u32,
+        (n * (k / GROUP) * 2) as u32,
+        Dtype::U8,
+    );
+    let biases_t = Tensor::new(
+        biases_at,
+        experts as u32,
+        (n * (k / GROUP) * 2) as u32,
+        Dtype::U8,
+    );
     let routes_t = Tensor::new(routes_at, tokens as u32, top_k as u32, Dtype::I32);
     let mut y_t = Tensor::new(y_at, (tokens * top_k) as u32, n as u32, Dtype::Bf16);
     matmul_select_quant(
@@ -110,7 +146,11 @@ fn check_with(experts: usize, n: usize, k: usize, tokens: usize, top_k: usize, b
             let mut want = 0f32;
             for c in 0..k {
                 let w = bank.dequant[(e * n + r) * k + c];
-                let w = if bf16_weights { from_bf16(to_bf16(w)) } else { w };
+                let w = if bf16_weights {
+                    from_bf16(to_bf16(w))
+                } else {
+                    w
+                };
                 want += w * x[xr * k + c];
             }
             let g = from_bf16(got[route * n + r]);
@@ -124,7 +164,8 @@ fn check_with(experts: usize, n: usize, k: usize, tokens: usize, top_k: usize, b
         }
     }
     assert_eq!(
-        bad, 0,
+        bad,
+        0,
         "{bad} of {} outputs differ from the dequantized dot (worst relative error {worst:.4})",
         tokens * top_k * n
     );

@@ -1,5 +1,5 @@
 use engine_cuda::window::{Copies, Windows};
-use model_compiler::{CompiledModel, Budget, DeviceProfile, FamilyCosts, compile};
+use model_compiler::{Budget, CompiledModel, DeviceProfile, FamilyCosts, compile};
 use model_dsl::Platform;
 use model_exec::fire::{Lane, compose};
 
@@ -40,7 +40,9 @@ fn arms() -> (DeviceProfile, DeviceProfile) {
 }
 
 fn sku() -> (Trace, CompiledModel, CompiledModel) {
-    let trace = models::sku(SKU).unwrap_or_else(|| panic!("`{SKU}` is in the catalog")).trace;
+    let trace = models::sku(SKU)
+        .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"))
+        .trace;
     let trace = trace(Platform::Cuda);
     let (split, grouped) = arms();
     let split = compile(&trace, &budget(), &split).expect("the split arm bakes");
@@ -71,7 +73,15 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
     let lanes = one_lane_per_class(&grouped);
     let fire = compose(&grouped, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
-    let mut windows = Windows::of(&plan, &grouped, model_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]), &indptr(&rows), Copies::off(), test_slots()).expect("the windows");
+    let mut windows = Windows::of(
+        &plan,
+        &grouped,
+        model_ir::PerAxis::new([fire.classes(), fire.patch_classes(), fire.voxel_classes()]),
+        &indptr(&rows),
+        Copies::off(),
+        test_slots(),
+    )
+    .expect("the windows");
 
     let packed = windows.packed();
     const BASE: u64 = 0x1000;

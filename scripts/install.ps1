@@ -8,6 +8,7 @@
 #   PIE_FLAVOR        cuda (native CUDA, needs an NVIDIA GPU; default) or vulkan
 #                     (any Vulkan 1.2 device).
 #   PIE_INSTALL_DIR   Install location for pie.exe (default: %LOCALAPPDATA%\Pie\bin).
+#   PIE_HOME          Where the Python and JavaScript support goes (default: %USERPROFILE%\.pie).
 #   PIE_REPO          GitHub owner/name (default: pie-project/pie).
 #   PIE_DOWNLOAD_BASE Override the asset base URL (default: GitHub releases).
 #   PIE_NO_PATH       Do not add PIE_INSTALL_DIR to the user PATH when set.
@@ -188,6 +189,26 @@ try {
     Add-UserPath $installDir
 
     Write-Ok "Pie was installed to $(Join-Path $installDir "pie.exe")"
+
+    # Python and JavaScript inferlets run under a language component per
+    # language. Each is its own archive, laid out like PIE_HOME and extracted
+    # with the tar Windows 10+ ships; the built-in inferlets are in the binary.
+    Write-Step "Installing Python and JavaScript support"
+    $pieHome = Get-EnvOrDefault "PIE_HOME" (Join-Path $env:USERPROFILE ".pie")
+    foreach ($language in @("python", "javascript")) {
+        $langArchive = Join-Path $tmp "pie-language-$language.tar.gz"
+        $langUrl = "$downloadBase/pie-language-$language.tar.gz"
+        try {
+            Save-Url $langUrl $langArchive
+            New-Item -ItemType Directory -Force -Path $pieHome | Out-Null
+            & tar -C $pieHome -xzf $langArchive
+            if ($LASTEXITCODE -ne 0) { throw "tar exited with $LASTEXITCODE" }
+            Write-Ok "$language support was installed to $(Join-Path $pieHome "languages")"
+        } catch {
+            Write-Warn "no pie-language-$language.tar.gz for this release ($langUrl); $language inferlets need it (pie language install <that file> adds it later)"
+        }
+    }
+
     Write-Heading "Next steps"
     Write-Detail "pie --version"
     Write-Detail "pie config init"

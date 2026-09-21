@@ -12,8 +12,7 @@ use crate::inferlet::host;
 use crate::service::{Service, ServiceHandler};
 
 use super::process::{OutputMode, ProcessCtx, ProcessId};
-use super::program::{self, InstalledComponent, ProgramName};
-use super::python::runtime as py_runtime;
+use super::program::{self, ProgramName};
 use super::sandbox::{FsPolicy, InstancePolicy, NetworkPolicy};
 
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
@@ -51,33 +50,7 @@ pub(crate) fn invalidate(program_name: &ProgramName) {
 type InstancePreKey = (ProgramName, u64);
 type InstancePreCell = Arc<OnceCell<InstancePre<ProcessCtx>>>;
 type InstancePreCache = Arc<Mutex<HashMap<InstancePreKey, InstancePreCell>>>;
-type BaseLinkerCell = Arc<OnceCell<Arc<WasmLinker<ProcessCtx>>>>;
-type BaseLinkerCache = Arc<Mutex<HashMap<LinkerVariant, BaseLinkerCell>>>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum LinkerVariant {
-    Plain,
-    PythonFull,
-    PythonStripped,
-}
-
-impl LinkerVariant {
-    fn for_program(python_runtime: bool, any_snapshotted: bool) -> Self {
-        match (python_runtime, any_snapshotted) {
-            (false, _) => Self::Plain,
-            (true, false) => Self::PythonFull,
-            (true, true) => Self::PythonStripped,
-        }
-    }
-
-    fn shared_modules(self) -> &'static [(String, wasmtime::Module)] {
-        match self {
-            Self::Plain => &[],
-            Self::PythonFull => py_runtime::full_modules(),
-            Self::PythonStripped => py_runtime::stripped_modules(),
-        }
-    }
-}
+type BaseLinkerCache = Arc<OnceCell<Arc<WasmLinker<ProcessCtx>>>>;
 
 struct Linker {
     engine: Engine,
@@ -91,7 +64,7 @@ impl Linker {
         Linker {
             engine: engine.clone(),
             policy,
-            base_linker_cache: Arc::new(Mutex::new(HashMap::new())),
+            base_linker_cache: Arc::new(OnceCell::new()),
             instance_pre_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -99,7 +72,6 @@ impl Linker {
     fn build_base_linker(
         engine: &Engine,
         policy: &InstancePolicy,
-        variant: LinkerVariant,
     ) -> Result<WasmLinker<ProcessCtx>> {
         let mut linker = WasmLinker::<ProcessCtx>::new(engine);
         #[cfg(target_arch = "wasm32")]
@@ -138,12 +110,6 @@ impl Linker {
 
         host::add_to_linker(&mut linker)?;
 
-        for (name, module) in variant.shared_modules() {
-            linker.root().module(name, module).unwrap_or_else(|error| {
-                panic!("Failed to register shared module '{name}': {error}")
-            });
-        }
-
         Ok(linker)
     }
 
@@ -151,20 +117,9 @@ impl Linker {
         engine: &Engine,
         policy: &InstancePolicy,
         cache: &BaseLinkerCache,
-        variant: LinkerVariant,
     ) -> Result<Arc<WasmLinker<ProcessCtx>>> {
-        let cell = {
-            let mut cache = cache.lock().unwrap();
-            Arc::clone(
-                cache
-                    .entry(variant)
-                    .or_insert_with(|| Arc::new(OnceCell::new())),
-            )
-        };
-        let linker = cell
-            .get_or_try_init(|| async {
-                Self::build_base_linker(engine, policy, variant).map(Arc::new)
-            })
+        let linker = cache
+            .get_or_try_init(|| async { Self::build_base_linker(engine, policy).map(Arc::new) })
             .await?;
         Ok(Arc::clone(linker))
     }
@@ -210,27 +165,16 @@ impl Linker {
             .await
             .ok_or_else(|| anyhow!("Component not found for program: {}", program_name))?;
 
-        let (dependency_components, python_runtime, any_snapshotted) =
-            Self::resolve_dependencies_and_runtime(program_name, &main).await?;
+        let dependency_components = Self::resolve_dependencies(program_name).await?;
         let generation = main.generation;
         let component = main.component;
         let cacheable_instance_pre = dependency_components.is_empty();
 
-        let linker_variant = LinkerVariant::for_program(python_runtime.is_some(), any_snapshotted);
-        let py_runtime_dir_for_ctx = python_runtime.is_some().then(py_runtime::dir).flatten();
-
-        let process_ctx = ProcessCtx::new(
-            process_id,
-            username,
-            output,
-            &policy,
-            py_runtime_dir_for_ctx,
-        )
-        .await?;
+        let process_ctx =
+            ProcessCtx::new(process_id, username, output, &policy, main.script).await?;
         let mut store = Store::new(&engine, process_ctx);
 
-        let base_linker =
-            Self::base_linker(&engine, &policy, &base_linker_cache, linker_variant).await?;
+        let base_linker = Self::base_linker(&engine, &policy, &base_linker_cache).await?;
 
         let dynamic_linker = if dependency_components.is_empty() {
             None
@@ -284,16 +228,10 @@ impl Linker {
         Ok(std::borrow::Cow::Owned(linker))
     }
 
-    async fn resolve_dependencies_and_runtime(
-        program_name: &ProgramName,
-        main: &InstalledComponent,
-    ) -> Result<(Vec<Component>, Option<String>, bool)> {
+    async fn resolve_dependencies(program_name: &ProgramName) -> Result<Vec<Component>> {
         let manifest = program::fetch_manifest(program_name)
             .await
             .ok_or_else(|| anyhow!("Manifest not found for: {}", program_name))?;
-
-        let mut python_runtime: Option<String> = main.python_runtime.clone();
-        let mut any_snapshotted = main.snapshotted;
 
         let dep_names = manifest.dependency_names();
         let mut components = Vec::with_capacity(dep_names.len());
@@ -302,32 +240,10 @@ impl Linker {
             let dep = program::get_wasm_component(&dep_name)
                 .await
                 .ok_or_else(|| anyhow!("Dependency component not found: {}", dep_name))?;
-
-            if dep.snapshotted {
-                any_snapshotted = true;
-            }
-
-            if let Some(dep_py_rt) = dep.python_runtime.as_deref() {
-                match &python_runtime {
-                    Some(existing) if existing != dep_py_rt => {
-                        return Err(anyhow!(
-                            "Conflicting python-runtime versions among dependencies of {}: \
-                             '{}' vs '{}' (from {})",
-                            program_name,
-                            existing,
-                            dep_py_rt,
-                            dep_name,
-                        ));
-                    }
-                    None => python_runtime = Some(dep_py_rt.to_string()),
-                    _ => {}
-                }
-            }
-
             components.push(dep.component);
         }
 
-        Ok((components, python_runtime, any_snapshotted))
+        Ok(components)
     }
 }
 

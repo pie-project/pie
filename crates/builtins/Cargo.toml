@@ -1,0 +1,7 @@
+[package]
+name = "builtins"
+version.workspace = true
+edition = "2024"
+description = "The built-in inferlets, compiled to wasm and embedded: what serves pie's OpenAI / Anthropic / Gemini routes"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"

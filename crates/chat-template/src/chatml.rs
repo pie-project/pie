@@ -152,7 +152,7 @@ json-pair ::= json-string ":" json-value
 json-value ::= json-string | json-number | json-object | json-array | "true" | "false" | "null"
 json-string ::= "\"" json-chars "\""
 json-chars ::= json-char*
-json-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
+json-char ::= [^"\\\x00-\x1f] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 json-number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
 json-array ::= "[" (json-value ("," json-value)*)? "]"
 "#;

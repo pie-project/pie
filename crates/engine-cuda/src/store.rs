@@ -6,8 +6,8 @@ use model_ir::{Attention, CacheRow, Def, Dtype, Operation, Trace};
 
 use crate::device::elastic::{self, Arena, Commit, PhysicalPool};
 use crate::error::{Fault, Result};
-use crate::settle::Airborne;
 use crate::run::{CachePool, CacheTable, PoolSlabs};
+use crate::settle::Airborne;
 use crate::store::kv::{Facts, Paging};
 
 impl From<model_exec::store::Fault> for Fault {
@@ -173,7 +173,10 @@ enum Shape {
         values_plane: usize,
         head_stride: u64,
     },
-    State { stride: u64, dtype: Dtype },
+    State {
+        stride: u64,
+        dtype: Dtype,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -318,7 +321,10 @@ impl Pools {
                         bytes,
                         "bytes of a recurrent slab",
                     )?]);
-                    shapes.push(Shape::State { stride, dtype: *dtype });
+                    shapes.push(Shape::State {
+                        stride,
+                        dtype: *dtype,
+                    });
                 }
             }
             debug_assert_eq!(rows.len(), index + 1, "one arena set per cache row");
@@ -393,9 +399,7 @@ impl Pools {
 
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.arenas()
-            .map(elastic::Arena::max_bytes)
-            .sum()
+        self.arenas().map(elastic::Arena::max_bytes).sum()
     }
 
     #[must_use]
@@ -419,7 +423,8 @@ impl Pools {
             .pooled
             .iter()
             .map(|row| {
-                mapped(row.watermark_bytes(pages, page_size)).saturating_mul(row.planes.len() as u64)
+                mapped(row.watermark_bytes(pages, page_size))
+                    .saturating_mul(row.planes.len() as u64)
             })
             .sum();
         rows.saturating_add(pooled)
@@ -464,16 +469,12 @@ impl Pools {
 
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
-        self.arenas()
-            .map(elastic::Arena::committed_bytes)
-            .sum()
+        self.arenas().map(elastic::Arena::committed_bytes).sum()
     }
 
     #[must_use]
     pub fn high_water_bytes(&self) -> u64 {
-        self.arenas()
-            .map(elastic::Arena::high_water_bytes)
-            .sum()
+        self.arenas().map(elastic::Arena::high_water_bytes).sum()
     }
 
     #[must_use]
@@ -504,9 +505,7 @@ impl Pools {
 
     #[must_use]
     pub fn bases(&self) -> Vec<u64> {
-        self.arenas()
-            .map(elastic::Arena::base)
-            .collect()
+        self.arenas().map(elastic::Arena::base).collect()
     }
 
     pub fn table(&self, seats: &Seats) -> Result<CacheTable> {
@@ -539,29 +538,31 @@ impl Pools {
                             dtype,
                         )
                     };
-                    CachePool::Kv { space, pool: KvPool {
-                        keys: plane(0, keys_width),
-                        values: plane(values_plane, values_width),
-                        bf16_keys: Tensor::new(0, 0, 0, dtype),
-                        bf16_values: Tensor::new(0, 0, 0, dtype),
-                        key_scales: Tensor::new(0, 0, 0, Dtype::U8),
-                        value_scales: Tensor::new(0, 0, 0, Dtype::U8),
-                        page_indices: seat.page_indices,
-                        page_indptr: seat.page_indptr,
-                        last_page_lens: seat.last_page_lens,
-                        row_valid: seat.row_valid,
-                        env_min: Tensor::new(0, 0, 0, dtype),
-                        env_max: Tensor::new(0, 0, 0, dtype),
-                        has_envelopes: false,
-                        page_size: narrow(u64::from(self.paging.page_size)),
-                        seq_stride: wide(keys_width),
-                        head_stride: wide(head_stride),
-                        layout: NHD,
-                        scheme_byte: 0,
-                        block_size: 0,
-                        max_pages_per_request: narrow(u64::from(self.paging.pages_per_slot)),
-                        pages_in_batch: narrow(u64::from(seats.pages)),
-                    },
+                    CachePool::Kv {
+                        space,
+                        pool: KvPool {
+                            keys: plane(0, keys_width),
+                            values: plane(values_plane, values_width),
+                            bf16_keys: Tensor::new(0, 0, 0, dtype),
+                            bf16_values: Tensor::new(0, 0, 0, dtype),
+                            key_scales: Tensor::new(0, 0, 0, Dtype::U8),
+                            value_scales: Tensor::new(0, 0, 0, Dtype::U8),
+                            page_indices: seat.page_indices,
+                            page_indptr: seat.page_indptr,
+                            last_page_lens: seat.last_page_lens,
+                            row_valid: seat.row_valid,
+                            env_min: Tensor::new(0, 0, 0, dtype),
+                            env_max: Tensor::new(0, 0, 0, dtype),
+                            has_envelopes: false,
+                            page_size: narrow(u64::from(self.paging.page_size)),
+                            seq_stride: wide(keys_width),
+                            head_stride: wide(head_stride),
+                            layout: NHD,
+                            scheme_byte: 0,
+                            block_size: 0,
+                            max_pages_per_request: narrow(u64::from(self.paging.pages_per_slot)),
+                            pages_in_batch: narrow(u64::from(seats.pages)),
+                        },
                     }
                 }
                 Shape::State { stride, dtype } => CachePool::Recurrent(RecurrentPool {
@@ -599,12 +600,7 @@ impl Pools {
         self.zero_slot(Some(stream), slot)
     }
 
-    pub fn copy_slot(
-        &mut self,
-        stream: *mut core::ffi::c_void,
-        src: u32,
-        dst: u32,
-    ) -> Result<()> {
+    pub fn copy_slot(&mut self, stream: *mut core::ffi::c_void, src: u32, dst: u32) -> Result<()> {
         for slot in [src, dst] {
             if slot >= self.paging.slots {
                 return Err(Fault::Ceiling {
@@ -636,11 +632,7 @@ impl Pools {
         Ok(())
     }
 
-    pub fn copy_kv(
-        &mut self,
-        stream: *mut core::ffi::c_void,
-        moves: &[Move],
-    ) -> Result<()> {
+    pub fn copy_kv(&mut self, stream: *mut core::ffi::c_void, moves: &[Move]) -> Result<()> {
         if moves.is_empty() {
             return Ok(());
         }
@@ -682,12 +674,10 @@ impl Pools {
                         continue;
                     }
                     let bytes = u64::from(span.tokens) * cell;
-                    let src = (u64::from(span.src_page) * page_size
-                        + u64::from(span.src_token))
-                        * cell;
-                    let dst = (u64::from(span.dst_page) * page_size
-                        + u64::from(span.dst_token))
-                        * cell;
+                    let src =
+                        (u64::from(span.src_page) * page_size + u64::from(span.src_token)) * cell;
+                    let dst =
+                        (u64::from(span.dst_page) * page_size + u64::from(span.dst_token)) * cell;
                     if src == dst {
                         continue;
                     }
@@ -723,10 +713,7 @@ impl Pools {
             let bytes = stride * u64::from(elem_size(dtype));
             let at = out.len();
             out.resize(at + usize::try_from(bytes).unwrap_or(0), 0);
-            crate::device::copy_d2h(
-                arena.span(u64::from(slot) * bytes, bytes)?,
-                &mut out[at..],
-            )?;
+            crate::device::copy_d2h(arena.span(u64::from(slot) * bytes, bytes)?, &mut out[at..])?;
         }
         Ok(out)
     }
@@ -855,7 +842,13 @@ impl Pools {
                                 .collect(),
                         )
                     }
-                    _ => elastic::Want::Prefix(watermark_bytes(shape, at, kv_pages, state_slots, page_size)),
+                    _ => elastic::Want::Prefix(watermark_bytes(
+                        shape,
+                        at,
+                        kv_pages,
+                        state_slots,
+                        page_size,
+                    )),
                 };
                 targets.push(elastic::Target { arena, want });
             }
@@ -863,7 +856,10 @@ impl Pools {
         for row in pooled.iter_mut() {
             let bytes = row.watermark_bytes(kv_pages, page_size);
             for arena in row.planes.iter_mut() {
-                targets.push(elastic::Target { arena, want: elastic::Want::Prefix(bytes) });
+                targets.push(elastic::Target {
+                    arena,
+                    want: elastic::Want::Prefix(bytes),
+                });
             }
         }
         let outcome = elastic::commit_atomically(pool, &mut targets)?;
@@ -1034,7 +1030,10 @@ impl engine::frame::Supply for Pools {
     }
 
     fn trim(&mut self, hint: engine::frame::Demand) {
-        let idle = self.airborne.as_ref().is_none_or(|counts| counts.count() == 0);
+        let idle = self
+            .airborne
+            .as_ref()
+            .is_none_or(|counts| counts.count() == 0);
         if !idle {
             return;
         }

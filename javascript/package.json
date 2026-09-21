@@ -1,0 +1,14 @@
+{
+  "name": "pie-javascript",
+  "private": true,
+  "description": "The npm packages of pie, as one workspace: one install, and the packages depend on each other by version.",
+  "workspaces": [
+    "client",
+    "inferlet",
+    "browser",
+    "server"
+  ],
+  "scripts": {
+    "test": "npm test --workspaces --if-present"
+  }
+}

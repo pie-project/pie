@@ -122,7 +122,9 @@ pub fn rope_axes(
                 format!("one ladder hands its axes out round-robin, and {dims:?} is not flat"),
             ));
         }
-        return fire(ctx, x, positions, form, dims, thetas, rotary_dim, head_dim, heads, rows, o);
+        return fire(
+            ctx, x, positions, form, dims, thetas, rotary_dim, head_dim, heads, rows, o,
+        );
     }
     let mut spanned = 0u32;
     for (a, &d) in dims.iter().enumerate() {

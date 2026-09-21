@@ -148,6 +148,7 @@ pub struct Pad {
 
 pub const NO_REGION: u32 = u32::MAX;
 
+#[cfg(feature = "cuda")]
 pub const SHARED_REGION: u32 = u32::MAX - 1;
 
 pub struct Ctx {
@@ -174,10 +175,7 @@ impl Ctx {
             cublas: core::ptr::null_mut(),
             comm: core::ptr::null_mut(),
             slabs: Slabs::PROCESS,
-            pad: core::cell::Cell::new(Pad {
-                rows: 0,
-                bucket: 0,
-            }),
+            pad: core::cell::Cell::new(Pad { rows: 0, bucket: 0 }),
             stage: core::cell::Cell::new(0),
             region: core::cell::Cell::new(NO_REGION),
             lane: core::cell::Cell::new(0),
@@ -357,8 +355,11 @@ impl Ctx {
         if trace_fires() {
             let now = std::time::Instant::now();
             let gap = {
-                static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-                let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                static LAST: std::sync::Mutex<Option<std::time::Instant>> =
+                    std::sync::Mutex::new(None);
+                let mut last = LAST
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let gap = last.map_or(0, |at| now.duration_since(at).as_micros());
                 *last = Some(now);
                 gap
@@ -486,6 +487,4 @@ mod tests {
             "the pad is the fire's, and the stream outlives the fire"
         );
     }
-
 }
-

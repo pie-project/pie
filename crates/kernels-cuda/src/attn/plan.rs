@@ -171,16 +171,17 @@ impl PrefillPlan {
     ) -> Result<(), Error> {
         planned_head_dim(op, self.shape.head_dim, head_dim)?;
         if let Some(kv_heads) = kv_heads
-            && self.shape.num_kv_heads != kv_heads {
-                return Err(refuse(
-                    op,
-                    format!(
-                        "the stated kv head count {kv_heads} is not the {} this fire's \
+            && self.shape.num_kv_heads != kv_heads
+        {
+            return Err(refuse(
+                op,
+                format!(
+                    "the stated kv head count {kv_heads} is not the {} this fire's \
                          prefill schedule was planned at",
-                        self.shape.num_kv_heads
-                    ),
-                ));
-            }
+                    self.shape.num_kv_heads
+                ),
+            ));
+        }
         if self.window != window {
             return Err(refuse(
                 op,
@@ -246,7 +247,12 @@ pub struct MlaPlan {
 
 impl MlaPlan {
     pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
-        upload(ctx, "attention.mla_plan", &self.int_upload, self.workspace.int_ptr)
+        upload(
+            ctx,
+            "attention.mla_plan",
+            &self.int_upload,
+            self.workspace.int_ptr,
+        )
     }
 }
 
@@ -437,8 +443,13 @@ pub fn plan_prefill(
                     enable_cuda_graph: false,
                     ..req
                 };
-                let built =
-                    sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
+                let built = sched_prefill::plan(
+                    OP,
+                    &req,
+                    device,
+                    workspace.int_bytes,
+                    workspace.float_bytes,
+                )?;
                 (built, false, Some(declined.to_string()))
             }
             Err(declined) => return Err(declined),

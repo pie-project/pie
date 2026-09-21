@@ -1,19 +1,19 @@
 name: Release PyPI Package
 
+# One package per run. `pie-server` depends on `pie-client`: publish
+# `pie-client` first when it changed. `pie-server` is an abi3 wheel per
+# platform, each with every engine that platform supports.
+
 on:
   workflow_dispatch:
     inputs:
       package:
-        description: 'Package to release'
+        description: Package to release
         required: true
         type: choice
-        options:
-          - pie-client (sdk/client/python/)
-          - pie-bakery (sdk/inferlet/tools/bakery/)
-          - inferlet (sdk/inferlet/python/)
+        options: [pie-client, inferlet, pie-server]
       dry_run:
-        description: 'Dry run (build and validate but do not publish)'
-        required: false
+        description: Build and validate, do not publish
         type: boolean
         default: false
 
@@ -21,334 +21,134 @@ permissions:
   contents: read
 
 jobs:
-  setup:
+  pure:
+    if: inputs.package != 'pie-server'
     runs-on: ubuntu-latest
-    outputs:
-      package_path: ${{ steps.info.outputs.path }}
-      build_backend: ${{ steps.info.outputs.backend }}
-    steps:
-      - name: Extract package info
-        id: info
-        run: |
-          case "${{ inputs.package }}" in
-            "pie-client (sdk/client/python/)")
-              echo "path=sdk/client/python" >> "$GITHUB_OUTPUT"
-              echo "backend=python" >> "$GITHUB_OUTPUT"
-              ;;
-            "pie-bakery (sdk/inferlet/tools/bakery/)")
-              echo "path=sdk/inferlet/tools/bakery" >> "$GITHUB_OUTPUT"
-              echo "backend=python" >> "$GITHUB_OUTPUT"
-              ;;
-            "inferlet (sdk/inferlet/python/)")
-              echo "path=sdk/inferlet/python" >> "$GITHUB_OUTPUT"
-              echo "backend=python" >> "$GITHUB_OUTPUT"
-              ;;
-          esac
-
-  # ============================================================================
-  # Pure Python builds
-  # ============================================================================
-
-  build-python:
-    needs: setup
-    if: needs.setup.outputs.build_backend == 'python'
-    runs-on: ubuntu-latest
+    env:
+      DIR: python/${{ inputs.package == 'pie-client' && 'client' || 'inferlet' }}
     steps:
       - uses: actions/checkout@v7
-
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-
-      - name: Install build tools
-        run: python -m pip install --upgrade build twine uv
-
-      # Two gates, cheap then real. The name check needs no toolchain and
-      # catches an SDK that still imports a WIT interface the host no longer
-      # offers; the componentize build below resolves the world for real.
-      - name: Check SDK targets a live WIT surface
-        if: needs.setup.outputs.package_path == 'sdk/inferlet/python'
-        run: scripts/check-sdk-interfaces.sh
-
-      # The unit tests stub `wit_world`, so they prove the wrapper layer's
-      # marshalling but say nothing about whether the world is real -- the
-      # previous suite passed for months against a mock of a deleted
-      # interface.
-      - name: Unit tests
-        if: needs.setup.outputs.package_path == 'sdk/inferlet/python'
+      - run: python -m pip install --upgrade build pytest
+      - name: tests
         run: |
-          python -m pip install pytest
-          python -m pytest sdk/inferlet/python/tests -q
-
-      # This is the one that checks the world. The wheel's `import inferlet`
-      # cannot run outside a componentize-py build (the smoke test below says
-      # so), but componentize-py itself can be installed here, and building a
-      # component resolves every WIT import against `crates/inferlet/wit/` for
-      # real. An interface, function, or signature the host no longer offers
-      # fails at this step.
-      - name: Build a component against the SDK
-        if: needs.setup.outputs.package_path == 'sdk/inferlet/python'
+          case "$DIR" in
+            python/client)   python -m pip install -e "$DIR" && python -m pytest -q "$DIR/tests" ;;
+            python/inferlet) PYTHONPATH="$DIR/src" python -m pytest -q "$DIR/tests" ;;
+          esac
+      # The unit tests stub `wit_world`; a componentize-py build resolves every
+      # WIT import against `crates/inferlet/wit` for real.
+      - name: a component builds against the inferlet library
+        if: inputs.package == 'inferlet'
         run: |
           python -m pip install componentize-py
-          mkdir -p "$RUNNER_TEMP/componentize"
-          cat > "$RUNNER_TEMP/componentize/app.py" <<'PY'
-          import inferlet
+          mkdir -p "$RUNNER_TEMP/app"
+          cat > "$RUNNER_TEMP/app/app.py" <<'PY'
           from inferlet import chat, model, reasoning, session, tokenizer
           from wit_world.exports import Run as RunBase
 
-
           class Run(RunBase):
               async def run(self, input: str) -> str:
-                  # Touch each surviving surface so an interface that lost a
-                  # function fails the build instead of the first user.
-                  _ = (
-                      model.name(),
-                      model.pass_kind(),
-                      model.frame_size(),
-                      model.rs_state_size(),
-                      tokenizer.encode("hi"),
-                      chat.stop_tokens(),
-                      chat.Decoder(),
-                      reasoning.Decoder(),
-                  )
+                  _ = (model.name(), model.pass_kind(), model.frame_size(), model.rs_state_size(),
+                       tokenizer.encode("hi"), chat.stop_tokens(), chat.Decoder(), reasoning.Decoder())
                   session.send(input)
                   return "ok"
           PY
+          bash scripts/check-inferlet-interfaces.sh
           componentize-py -d crates/inferlet/wit -w inferlet componentize \
-            -p "$RUNNER_TEMP/componentize" \
-            -p sdk/inferlet/python/src \
-            -p sdk/inferlet/python/src/inferlet/bindings \
-            app -o "$RUNNER_TEMP/componentize/app.wasm"
+            -p "$RUNNER_TEMP/app" -p python/inferlet/src -p python/inferlet/src/inferlet/bindings \
+            app -o "$RUNNER_TEMP/app/app.wasm"
+      - run: python -m build "$DIR"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist-pure
+          path: ${{ env.DIR }}/dist
+          if-no-files-found: error
 
-      - name: Build package
-        run: python -m build "${{ needs.setup.outputs.package_path }}"
-
-      - name: Check metadata
-        run: python -m twine check "${{ needs.setup.outputs.package_path }}"/dist/*
-
-      - name: Check package data
-        if: needs.setup.outputs.package_path == 'sdk/inferlet/tools/bakery'
+  wheel:
+    if: inputs.package == 'pie-server'
+    name: wheel (${{ matrix.target.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { label: linux-x86_64,  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu,  features: 'cuda,vulkan,wgpu', container: 'nvidia/cuda:13.0.0-devel-rockylinux8' }
+          - { label: linux-aarch64, runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu, features: 'cuda,vulkan,wgpu', container: 'nvidia/cuda:13.0.0-devel-rockylinux8' }
+          - { label: macos-arm64,   runner: macos-15,           triple: aarch64-apple-darwin,      features: 'metal,wgpu' }
+          - { label: windows-x64,   runner: windows-large-x64,  triple: x86_64-pc-windows-msvc,    features: 'cuda,vulkan' }
+    runs-on: ${{ matrix.target.runner }}
+    container: ${{ matrix.target.container }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          triple: ${{ matrix.target.triple }}
+          features: ${{ matrix.target.features }}
+          manylinux: ${{ matrix.target.container && 'true' || 'false' }}
+          cache-key: release-pie-server-${{ matrix.target.label }}
+      - if: '!matrix.target.container'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - shell: bash
         run: |
-          python - <<'PY'
-          import pathlib
-          import sys
-          import zipfile
+          python3 -m pip install maturin
+          cd python/server
+          python3 -m maturin build --profile release-min --target ${{ matrix.target.triple }} \
+            --no-default-features --features ${{ matrix.target.features }} --out dist \
+            ${{ matrix.target.container && '--compatibility manylinux_2_28' || '' }}
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist-${{ matrix.target.label }}
+          path: python/server/dist
+          if-no-files-found: error
 
-          wheel = next(pathlib.Path("sdk/inferlet/tools/bakery/dist").glob("*.whl"))
-          required = {
-              "bakery/templates/Pie.toml.template",
-              "bakery/templates/rust/Cargo.toml.template",
-              "bakery/templates/typescript/index.ts.template",
-              "bakery/wit/world.wit",
-              "bakery/wit/deps/cli.wit",
-          }
-          with zipfile.ZipFile(wheel) as zf:
-              names = set(zf.namelist())
-          missing = sorted(required - names)
-          if missing:
-              print("Missing package data:")
-              for name in missing:
-                  print(f"  - {name}")
-              sys.exit(1)
-          PY
+  sdist:
+    if: inputs.package == 'pie-server'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install maturin && maturin sdist --out dist
+        working-directory: python/server
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist-sdist
+          path: python/server/dist
+          if-no-files-found: error
 
-      - name: Smoke test wheel
+  publish:
+    needs: [pure, wheel, sdist]
+    if: >-
+      always() && !cancelled()
+      && (inputs.package == 'pie-server' || needs.pure.result == 'success')
+      && (inputs.package != 'pie-server' || (needs.wheel.result == 'success' && needs.sdist.result == 'success'))
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade twine && ls -la dist && python -m twine check dist/*
+      - name: smoke test
         run: |
-          python -m venv "$RUNNER_TEMP/smoke"
-          "$RUNNER_TEMP/smoke/bin/python" -m pip install "${{ needs.setup.outputs.package_path }}"/dist/*.whl
-
-          case "${{ needs.setup.outputs.package_path }}" in
-            "sdk/client/python")
-              "$RUNNER_TEMP/smoke/bin/python" -c "import pie_client"
-              "$RUNNER_TEMP/smoke/bin/pie-client" --help >/dev/null
-              ;;
-            "sdk/inferlet/tools/bakery")
-              "$RUNNER_TEMP/smoke/bin/python" -c "import bakery"
-              "$RUNNER_TEMP/smoke/bin/bakery" --help >/dev/null
-              ;;
-            "sdk/inferlet/python")
-              # `import inferlet` needs the WIT-generated `wit_world`, which only
-              # exists inside a componentize-py build, not a plain venv. Verify
-              # the wheel installed and is registered instead.
-              "$RUNNER_TEMP/smoke/bin/python" -m pip show inferlet >/dev/null
-              ;;
+          python -m venv smoke
+          case "${{ inputs.package }}" in
+            pie-client) smoke/bin/pip install dist/*.whl && smoke/bin/python -c "import pie_client" && smoke/bin/pie-client --help >/dev/null ;;
+            inferlet)   smoke/bin/pip install dist/*.whl && smoke/bin/pip show inferlet >/dev/null ;;  # `import inferlet` needs a componentize-py build
+            pie-server) smoke/bin/pip install dist/pie_server-*-manylinux*x86_64.whl && smoke/bin/python -c "from pie import _engine; from pie.config import Config; print(Config().to_toml())" ;;
           esac
-
-      - name: Dry run publish
-        if: inputs.dry_run == true
-        run: uv publish --dry-run "${{ needs.setup.outputs.package_path }}"/dist/*
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: wheels-python
-          path: ${{ needs.setup.outputs.package_path }}/dist
-
-  # ============================================================================
-  # Maturin builds
-  # ============================================================================
-
-  build-maturin-linux-x86_64:
-    needs: setup
-    if: needs.setup.outputs.build_backend == 'maturin'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          target: x86_64
-          args: --release --out dist -i python3.10 -i python3.11 -i python3.12 -i python3.13
-          working-directory: ${{ needs.setup.outputs.package_path }}
-          manylinux: auto
-      - uses: actions/upload-artifact@v6
-        with:
-          name: wheels-linux-x86_64
-          path: ${{ needs.setup.outputs.package_path }}/dist
-
-  build-maturin-linux-aarch64:
-    needs: setup
-    if: needs.setup.outputs.build_backend == 'maturin'
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          target: aarch64
-          args: --release --out dist -i python3.10 -i python3.11 -i python3.12 -i python3.13
-          working-directory: ${{ needs.setup.outputs.package_path }}
-          manylinux: auto
-      - uses: actions/upload-artifact@v6
-        with:
-          name: wheels-linux-aarch64
-          path: ${{ needs.setup.outputs.package_path }}/dist
-
-  build-maturin-macos:
-    needs: setup
-    if: needs.setup.outputs.build_backend == 'maturin'
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          target: aarch64-apple-darwin
-          args: --release --out dist
-          working-directory: ${{ needs.setup.outputs.package_path }}
-      - uses: actions/upload-artifact@v6
-        with:
-          name: wheels-macos-aarch64
-          path: ${{ needs.setup.outputs.package_path }}/dist
-
-  build-maturin-windows:
-    needs: setup
-    if: needs.setup.outputs.build_backend == 'maturin'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          args: --release --out dist
-          working-directory: ${{ needs.setup.outputs.package_path }}
-      - uses: actions/upload-artifact@v6
-        with:
-          name: wheels-windows
-          path: ${{ needs.setup.outputs.package_path }}/dist
-
-  build-maturin-sdist:
-    needs: setup
-    if: needs.setup.outputs.build_backend == 'maturin'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --out dist
-          working-directory: ${{ needs.setup.outputs.package_path }}
-      - uses: actions/upload-artifact@v6
-        with:
-          name: wheels-sdist
-          path: ${{ needs.setup.outputs.package_path }}/dist
-
-  check-maturin:
-    needs:
-      - setup
-      - build-maturin-linux-x86_64
-      - build-maturin-linux-aarch64
-      - build-maturin-macos
-      - build-maturin-windows
-      - build-maturin-sdist
-    if: needs.setup.outputs.build_backend == 'maturin'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v7
-        with:
-          pattern: wheels-*
-          merge-multiple: true
-          path: dist
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
-      - name: Install build tools
-        run: python -m pip install --upgrade twine uv
-
-      - name: Check metadata
-        run: python -m twine check dist/*
-
-      - name: Dry run publish
-        if: inputs.dry_run == true
-        run: uv publish --dry-run dist/*
-
-  # ============================================================================
-  # Publish
-  # ============================================================================
-
-  publish-python:
-    name: Publish to PyPI (pure Python)
-    runs-on: ubuntu-latest
-    needs: [setup, build-python]
-    if: needs.setup.outputs.build_backend == 'python' && inputs.dry_run == false
-    environment: pypi
-    steps:
-      - uses: actions/download-artifact@v7
-        with:
-          name: wheels-python
-          path: dist
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
-
-  publish-maturin:
-    name: Publish to PyPI (maturin)
-    runs-on: ubuntu-latest
-    needs: [setup, check-maturin]
-    if: needs.setup.outputs.build_backend == 'maturin' && inputs.dry_run == false
-    environment: pypi
-    steps:
-      - uses: actions/download-artifact@v7
-        with:
-          pattern: wheels-*
-          merge-multiple: true
-          path: dist
-      - name: Publish to PyPI
+      - if: inputs.dry_run == false
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}

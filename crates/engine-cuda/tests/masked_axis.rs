@@ -6,7 +6,8 @@ fn carries_a_head(sku: &str) -> bool {
 }
 
 fn masked_arms(trace: &Trace) -> usize {
-    trace.nodes
+    trace
+        .nodes
         .iter()
         .filter(|node| matches!(node.op, Operation::Attention(Attention::Masked { .. })))
         .count()
@@ -87,14 +88,8 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
     );
 }
 
-mod maskless {
-    
-}
+mod maskless {}
 
-mod devgeo {
-    
-}
+mod devgeo {}
 
-mod gemma {
-    
-}
+mod gemma {}

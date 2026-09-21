@@ -41,7 +41,12 @@ pub fn block_dyn_conv(
     }
     let lanes = match x.indptr.rows.checked_sub(1) {
         Some(lanes) if lanes > 0 => lanes,
-        _ => return Err(refuse(OP, "the request CSR this fire names spans no request")),
+        _ => {
+            return Err(refuse(
+                OP,
+                "the request CSR this fire names spans no request",
+            ));
+        }
     };
     let channels = nonzero(OP, "the convolution's channel count", x.data.width)?;
     let taps_n = nonzero(OP, "the tap count this statement states", taps)?;
@@ -76,7 +81,9 @@ pub fn block_dyn_conv(
             format!(
                 "the base kernel is [{}, {}], and two sides of {taps_n} taps over {channels} channels \
                  are [{}, {channels}]",
-                base.rows, base.width, 2 * taps_n
+                base.rows,
+                base.width,
+                2 * taps_n
             ),
         ));
     }

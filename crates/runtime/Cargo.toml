@@ -53,8 +53,6 @@ image = { version = "0.25", default-features = false, features = [
 blake3 = "1.8.5"
 fancy-regex = "0.18.0"
 async-trait = "0.1.91"
-wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }
-wasmparser = "0.254.0"
 wasm-metadata = "0.254.0"
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
     "std",
@@ -84,7 +82,6 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
     "metrics",
 ] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
 wasmtime = { version = "48.0.1", default-features = false, features = [
     "runtime",
     "std",
@@ -96,6 +93,7 @@ wasmtime = { version = "48.0.1", default-features = false, features = [
     "component-model",
     "component-model-async",
     "pooling-allocator",
+    "cache",
     "addr2line",
     "demangle",
 ] }

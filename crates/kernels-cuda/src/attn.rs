@@ -184,7 +184,13 @@ fn fa2_decode(
             fa2::decode(ctx, op, point(arm), &params)?;
         }
         Some(rel) => {
-            rel_table(op, &rel.bias, q.data.rows, plan.shape.num_q_heads, rel.extent)?;
+            rel_table(
+                op,
+                &rel.bias,
+                q.data.rows,
+                plan.shape.num_q_heads,
+                rel.extent,
+            )?;
             let arm = fa2::decode_rel_arm(plan.full_attention_variant(), window_left);
             let params = DecodeRelParams {
                 base: params,
@@ -266,7 +272,13 @@ fn fa2_prefill(
                     "the relative-bias arm is causal and takes no custom mask",
                 ));
             }
-            rel_table(op, &rel.bias, q.data.rows, plan.shape.num_q_heads, rel.extent)?;
+            rel_table(
+                op,
+                &rel.bias,
+                q.data.rows,
+                plan.shape.num_q_heads,
+                rel.extent,
+            )?;
             let arm = fa2::prefill_rel_arm(plan.full_attention_variant(), window_left);
             let params = PrefillRelParams {
                 base: params,
@@ -299,7 +311,9 @@ pub fn decode(
 ) -> Result<(), Error> {
     const OP: &str = "attention.decode";
     plan.accepts(OP, head_dim, window)?;
-    fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None)
+    fa2_decode(
+        ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -316,7 +330,19 @@ pub fn decode_lse(
 ) -> Result<(), Error> {
     const OP: &str = "attention.decode_lse";
     plan.accepts(OP, head_dim, window)?;
-    fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, Some(lse), None)
+    fa2_decode(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        Some(lse),
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -333,7 +359,9 @@ pub fn prefill(
 ) -> Result<(), Error> {
     const OP: &str = "attention.prefill";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
-    fa2_prefill(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, None)
+    fa2_prefill(
+        ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -412,9 +440,21 @@ pub struct RelBias {
     pub log_alpha: f32,
 }
 
-fn rel_table(op: &'static str, bias: &Tensor, rows: u32, heads: u32, extent: u32) -> Result<(), Error> {
+fn rel_table(
+    op: &'static str,
+    bias: &Tensor,
+    rows: u32,
+    heads: u32,
+    extent: u32,
+) -> Result<(), Error> {
     if bias.dtype != Dtype::F32 {
-        return Err(refuse(op, format!("the relative-bias table is {:?}, and the score adds f32", bias.dtype)));
+        return Err(refuse(
+            op,
+            format!(
+                "the relative-bias table is {:?}, and the score adds f32",
+                bias.dtype
+            ),
+        ));
     }
     let width = u64::from(heads) * u64::from(extent);
     if bias.rows != rows || u64::from(bias.width) != width {
@@ -443,7 +483,19 @@ pub fn decode_rel(
 ) -> Result<(), Error> {
     const OP: &str = "attention.decode_rel";
     plan.accepts(OP, head_dim, window)?;
-    fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, Some(rel))
+    fa2_decode(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        None,
+        Some(rel),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -461,7 +513,20 @@ pub fn prefill_rel(
 ) -> Result<(), Error> {
     const OP: &str = "attention.prefill_rel";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
-    fa2_prefill(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None, Some(rel))
+    fa2_prefill(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        None,
+        None,
+        Some(rel),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

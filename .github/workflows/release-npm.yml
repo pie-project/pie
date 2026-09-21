@@ -1,96 +1,146 @@
 name: Release npm Package
 
+# One package from the `javascript/` workspace per run. `server` and
+# `browser` depend on `client` by version range: publish `client` first when
+# it changed. `server`'s addon ships as one platform package per target
+# (`optionalDependencies`), each with every engine that platform supports.
+
 on:
   workflow_dispatch:
     inputs:
       package:
-        description: 'Package to release'
+        description: Package to release
         required: true
         type: choice
-        options:
-          - pie-client (sdk/client/javascript/)
-          - inferlet (sdk/inferlet/javascript/)
+        options: [client, inferlet, browser, server]
       dry_run:
-        description: 'Dry run (build but do not publish)'
-        required: false
+        description: Build and pack, do not publish
         type: boolean
         default: false
 
 permissions:
   contents: read
 
+env:
+  NPM_CONFIG_FUND: 'false'
+  NPM_CONFIG_AUDIT: 'false'
+
 jobs:
-  build-and-publish:
+  browser:
+    if: inputs.package == 'browser'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      
+      - uses: ./.github/actions/toolchain
+        with:
+          triple: wasm32-unknown-unknown
+          cache-key: ${{ runner.os }}-release-browser
       - uses: actions/setup-node@v6
         with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-      
-      - name: Determine package path
-        id: info
-        run: |
-          case "${{ inputs.package }}" in
-            "pie-client (sdk/client/javascript/)")
-              echo "path=sdk/client/javascript" >> $GITHUB_OUTPUT
-              ;;
-            "inferlet (sdk/inferlet/javascript/)")
-              echo "path=sdk/inferlet/javascript" >> $GITHUB_OUTPUT
-              ;;
-          esac
-      
-      # The generated bindings under src/bindings are not checked by
-      # `npm run build`, so an interface the runtime no longer offers would
-      # publish silently. This needs no toolchain and is the check that
-      # catches that drift.
-      - name: Check SDK targets a live WIT surface
-        if: steps.info.outputs.path == 'sdk/inferlet/javascript'
-        run: scripts/check-sdk-interfaces.sh
+          node-version: '22'
+      - name: wasm-bindgen-cli, at Cargo.lock's version
+        run: cargo install wasm-bindgen-cli --locked --version "$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')"
+      - run: npm ci --include=dev
+        working-directory: javascript
+      - run: bash javascript/browser/build.sh min
+      - uses: actions/upload-artifact@v6
+        with:
+          name: browser-dist
+          path: javascript/browser/dist
+          if-no-files-found: error
 
-      - name: Install dependencies
-        working-directory: ${{ steps.info.outputs.path }}
-        run: npm ci
-
-      # Regenerate and diff, rather than trusting what is checked in. The
-      # committed bindings are an artifact of whatever world they were last
-      # generated from, and `tsc` is happy to typecheck against a stale one --
-      # every specifier still resolves, just to the wrong shapes. This is the
-      # step that makes the build below mean something.
-      - name: Bindings are current with crates/inferlet/wit
-        if: steps.info.outputs.path == 'sdk/inferlet/javascript'
-        working-directory: ${{ steps.info.outputs.path }}
+  addon:
+    if: inputs.package == 'server'
+    name: addon (${{ matrix.target.npm }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { npm: linux-x64,    runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu,  features: 'cuda,vulkan,wgpu', lib: libpie_server.so,    container: 'nvidia/cuda:13.0.0-devel-rockylinux8' }
+          - { npm: linux-arm64,  runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu, features: 'cuda,vulkan,wgpu', lib: libpie_server.so,    container: 'nvidia/cuda:13.0.0-devel-rockylinux8' }
+          - { npm: darwin-arm64, runner: macos-15,           triple: aarch64-apple-darwin,      features: 'metal,wgpu',       lib: libpie_server.dylib }
+          - { npm: win32-x64,    runner: windows-large-x64,  triple: x86_64-pc-windows-msvc,    features: 'cuda,vulkan',      lib: pie_server.dll }
+    runs-on: ${{ matrix.target.runner }}
+    container: ${{ matrix.target.container }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          triple: ${{ matrix.target.triple }}
+          features: ${{ matrix.target.features }}
+          manylinux: ${{ matrix.target.container && 'true' || 'false' }}
+          cache-key: release-server-${{ matrix.target.npm }}
+      - shell: bash
         run: |
+          cargo build --profile release-min --target ${{ matrix.target.triple }} -p pie-server-node --no-default-features --features ${{ matrix.target.features }}
+          cp "${CARGO_TARGET_DIR:-target}/${{ matrix.target.triple }}/release-min/${{ matrix.target.lib }}" javascript/server/npm/${{ matrix.target.npm }}/pie-server.node
+      - uses: actions/upload-artifact@v6
+        with:
+          name: addon-${{ matrix.target.npm }}
+          path: javascript/server/npm/${{ matrix.target.npm }}/pie-server.node
+          if-no-files-found: error
+
+  publish:
+    needs: [browser, addon]
+    if: >-
+      always() && !cancelled()
+      && (inputs.package != 'browser' || needs.browser.result == 'success')
+      && (inputs.package != 'server' || needs.addon.result == 'success')
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v7
+        if: inputs.package == 'browser'
+        with:
+          name: browser-dist
+          path: javascript/browser/dist
+      - uses: actions/download-artifact@v7
+        if: inputs.package == 'server'
+        with:
+          pattern: addon-*
+          path: javascript/server/npm
+      - if: inputs.package == 'server'
+        run: for d in javascript/server/npm/addon-*; do mv "$d/pie-server.node" "${d/addon-/}/"; done && ls -la javascript/server/npm/*/
+      - run: npm ci --include=dev
+        working-directory: javascript
+      # The checked-in bindings are an artifact of whatever world they were
+      # last generated from; regenerate and diff.
+      - if: inputs.package == 'inferlet'
+        working-directory: javascript/inferlet
+        run: |
+          bash ../../scripts/check-inferlet-interfaces.sh
           npm run generate-bindings
           git diff --exit-code -- src/bindings tsconfig.json
-
-      - name: Build
-        working-directory: ${{ steps.info.outputs.path }}
-        run: npm run build --if-present
-
-      - name: Test
-        if: steps.info.outputs.path == 'sdk/client/javascript' || steps.info.outputs.path == 'sdk/inferlet/javascript'
-        working-directory: ${{ steps.info.outputs.path }}
-        run: npm test
-
-      - name: Dry run - publish
-        if: inputs.dry_run == true
-        working-directory: ${{ steps.info.outputs.path }}
+      - working-directory: javascript
         run: |
-          set +e
-          npm publish --dry-run --access public 2>&1 | tee "$RUNNER_TEMP/npm-publish-dry-run.log"
-          status=${PIPESTATUS[0]}
-          set -e
-
-          if [ "$status" -ne 0 ] && ! grep -q "previously published versions" "$RUNNER_TEMP/npm-publish-dry-run.log"; then
-            exit "$status"
-          fi
-      
-      - name: Publish to npm
+          npm run build --if-present -w ${{ inputs.package }}
+          npm test -w ${{ inputs.package }}
+      - name: platform packages match the wrapper's version
+        if: inputs.package == 'server'
+        working-directory: javascript/server
+        run: |
+          node -e '
+            const w = require("./package.json");
+            for (const [name, want] of Object.entries(w.optionalDependencies)) {
+              const v = require(`./npm/${name.replace("@pie-project/server-", "")}/package.json`).version;
+              if (v !== w.version || want !== w.version) { console.error(`${name}: ${v}, wrapper ${w.version} wants ${want}`); process.exit(1); }
+            }'
+      - name: pack
+        working-directory: javascript
+        run: |
+          npm pack -w ${{ inputs.package }}
+          [[ "${{ inputs.package }}" != server ]] || for d in server/npm/*/; do (cd "$d" && npm pack); done
+      - name: publish
         if: inputs.dry_run == false
-        working-directory: ${{ steps.info.outputs.path }}
-        run: npm publish --access public
+        working-directory: javascript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          [[ "${{ inputs.package }}" != server ]] || for d in server/npm/*/; do (cd "$d" && npm publish --access public); done
+          npm publish --access public -w ${{ inputs.package }}

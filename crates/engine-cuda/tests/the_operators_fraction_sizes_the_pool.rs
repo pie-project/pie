@@ -30,7 +30,10 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
 }
 
 fn the_boot_carries_the_fraction_and_absence_is_the_configs_default() {
-    engine_cuda::open(boot_with(0.75), no_contract(), |name| models::sku(name).map(|sku| sku.classify)).expect("a fraction in range opens");
+    engine_cuda::open(boot_with(0.75), no_contract(), |name| {
+        models::sku(name).map(|sku| sku.classify)
+    })
+    .expect("a fraction in range opens");
 
     assert!(
         (Knobs::default().gpu_mem_utilization - engine_cuda::DEFAULT_GPU_MEM_UTILIZATION).abs()
@@ -45,14 +48,19 @@ fn the_boot_carries_the_fraction_and_absence_is_the_configs_default() {
         "a boot that states nothing is the same answer"
     );
 
-    engine_cuda::open(boot_with(1.0), no_contract(), |name| models::sku(name).map(|sku| sku.classify)).expect("the whole card opens");
+    engine_cuda::open(boot_with(1.0), no_contract(), |name| {
+        models::sku(name).map(|sku| sku.classify)
+    })
+    .expect("the whole card opens");
 }
 
 fn an_out_of_range_fraction_refuses_at_boot_by_the_knobs_name() {
     for fraction in [0.0, 1.5, -0.25, f64::NAN, f64::INFINITY] {
-        let refusal = engine_cuda::open(boot_with(fraction), no_contract(), |name| models::sku(name).map(|sku| sku.classify))
-            .err()
-            .unwrap_or_else(|| panic!("`{fraction}` is not a deployment"));
+        let refusal = engine_cuda::open(boot_with(fraction), no_contract(), |name| {
+            models::sku(name).map(|sku| sku.classify)
+        })
+        .err()
+        .unwrap_or_else(|| panic!("`{fraction}` is not a deployment"));
         assert!(
             refusal.contains("gpu_mem_utilization"),
             "the refusal names the knob; got: {refusal}"

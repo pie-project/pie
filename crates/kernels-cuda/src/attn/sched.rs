@@ -80,7 +80,9 @@ impl Staging {
         let len = values.len() * 4;
         self.check(offset + len, len, what)?;
         for (slot, value) in self.bytes[offset..offset + len]
-            .as_chunks_mut::<4>().0.iter_mut()
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
             .zip(values)
         {
             slot.copy_from_slice(&value.to_le_bytes());
@@ -182,8 +184,12 @@ pub fn at(offset: Option<u32>) -> usize {
 }
 
 pub fn narrow(op: &'static str, what: &'static str, value: i64) -> Result<i32, Error> {
-    i32::try_from(value)
-        .map_err(|_| refuse(op, format!("`{what}` reaches {value}, past the device's i32")))
+    i32::try_from(value).map_err(|_| {
+        refuse(
+            op,
+            format!("`{what}` reaches {value}, past the device's i32"),
+        )
+    })
 }
 
 pub fn narrow_all(op: &'static str, what: &'static str, values: &[i64]) -> Result<Vec<i32>, Error> {
@@ -227,7 +233,9 @@ impl CostHeap {
     #[must_use]
     pub fn new(lanes: u32) -> Self {
         Self {
-            heap: (0..lanes).map(|id| Reverse(Lane { cost: 0.0, id })).collect(),
+            heap: (0..lanes)
+                .map(|id| Reverse(Lane { cost: 0.0, id }))
+                .collect(),
         }
     }
 

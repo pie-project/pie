@@ -105,8 +105,16 @@ fn check(
         rope::partial(&sink, q, k, p, rotary_dim, head_dim, theta).expect("the launch");
         frame.commit().expect("the commit");
     }
-    let got_q = bf16_floats(&handles.read(hq, u64::from(rows * q_width) * 2).expect("read q"));
-    let got_k = bf16_floats(&handles.read(hk, u64::from(rows * k_width) * 2).expect("read k"));
+    let got_q = bf16_floats(
+        &handles
+            .read(hq, u64::from(rows * q_width) * 2)
+            .expect("read q"),
+    );
+    let got_k = bf16_floats(
+        &handles
+            .read(hk, u64::from(rows * k_width) * 2)
+            .expect("read k"),
+    );
 
     for (label, src, got, heads, width) in [
         ("q", &q_in, &got_q, q_heads, q_width),

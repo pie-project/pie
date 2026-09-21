@@ -1,465 +1,131 @@
 name: Publish Nightly
 
-# Manual builds of `pie` for distribution. Each run rewrites the
-# `nightly` rolling pre-release on this repo's GitHub Releases —
-# every artifact is uploaded with `gh release upload --clobber`, so
-# download URLs stay stable across runs.
-#
-# The prepare-release job creates the release if needed before any
-# matrix jobs start uploading assets.
+# Rewrites the rolling pre-release: every asset is uploaded with --clobber,
+# so download URLs stay stable. `targets` filters the binary matrix by label
+# substring (`cuda`, `macos`, `x86_64-linux-vulkan`, ...).
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to update (assets uploaded with --clobber)"
+        description: Release tag to update
         type: string
-        default: "nightly"
-      desktop:
-        description: "Build the desktop GPU artifacts (macOS arm64 Metal + wgpu, Windows x86_64 CUDA + Vulkan, Linux x86_64 Vulkan + wgpu)"
-        type: boolean
-        default: true
-      cuda_manylinux:
-        description: "Build the per-compute-capability CUDA matrix (manylinux_2_28, glibc 2.28; the CUDA release path)"
+        default: nightly
+      targets:
+        description: Binary targets to build (comma-separated label substrings; `all`; `none`)
+        type: string
+        default: all
+      languages:
+        description: Build pie-language-python.tar.gz and pie-language-javascript.tar.gz
         type: boolean
         default: true
 
 permissions:
-  contents: write     # needed for `gh release upload`
-
-env:
-  # Release notes body — keeps the release page in sync with the
-  # latest workflow run.
-  RELEASE_NOTES: |
-    Rolling build from commit ${{ github.sha }} on ${{ github.ref_name }}.
-    Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  contents: write
 
 jobs:
-  # =========================================================================
-  # Create/update the rolling release before any matrix job tries to upload.
-  # This keeps `gh release upload` from racing a missing release, and keeps
-  # the rolling build out of GitHub's "Latest" release slot.
-  # =========================================================================
-  prepare-release:
-    if: inputs.desktop || inputs.cuda_manylinux
+  plan:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
     steps:
-      - name: Ensure rolling release exists
+      - uses: actions/checkout@v7
+      - run: bash scripts/ci/release.sh ensure "${{ inputs.tag }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.tag }}
+      - id: plan
+        shell: python
         run: |
-          set -euxo pipefail
-          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            release_id="$(gh release view "${TAG}" --json databaseId --jq .databaseId --repo "${GITHUB_REPOSITORY}")"
-            gh api \
-              -X PATCH \
-              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
-              -f tag_name="${TAG}" \
-              -f name="${TAG}" \
-              -f body="${RELEASE_NOTES}" \
-              -F draft=false \
-              -F prerelease=true \
-              -f make_latest=false
-          else
-            gh release create "${TAG}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --target "${GITHUB_SHA}" \
-              --title "${TAG}" \
-              --notes "${RELEASE_NOTES}" \
-              --prerelease \
-              --latest=false
-          fi
+          import json, os
+          # Linux CUDA builds in the manylinux_2_28 container (glibc 2.28 floor);
+          # device code is NVRTC-compiled at run time, so one build per
+          # architecture serves every compute capability.
+          cuda = "nvidia/cuda:13.0.0-devel-rockylinux8"
+          rows = [
+            dict(label="aarch64-macos-metal",    runner="macos-15",           triple="aarch64-apple-darwin",       features="metal"),
+            dict(label="aarch64-macos-wgpu",     runner="macos-15",           triple="aarch64-apple-darwin",       features="wgpu"),
+            dict(label="x86_64-windows-cuda",    runner="windows-large-x64",  triple="x86_64-pc-windows-msvc",     features="cuda"),
+            dict(label="x86_64-windows-vulkan",  runner="windows-latest",     triple="x86_64-pc-windows-msvc",     features="vulkan"),
+            dict(label="x86_64-linux-vulkan",    runner="ubuntu-latest",      triple="x86_64-unknown-linux-gnu",   features="vulkan"),
+            dict(label="x86_64-linux-wgpu",      runner="ubuntu-latest",      triple="x86_64-unknown-linux-gnu",   features="wgpu"),
+            dict(label="aarch64-linux-vulkan",   runner="ubuntu-large-arm64", triple="aarch64-unknown-linux-gnu",  features="vulkan"),
+            dict(label="x86_64-linux-cuda13.0",  runner="ubuntu-large-x64",   triple="x86_64-unknown-linux-gnu",   features="cuda", container=cuda),
+            dict(label="aarch64-linux-cuda13.0", runner="ubuntu-large-arm64", triple="aarch64-unknown-linux-gnu",  features="cuda", container=cuda),
+          ]
+          want = [w.strip() for w in "${{ inputs.targets }}".split(",") if w.strip()]
+          if want == ["all"]:
+              chosen = rows
+          elif want == ["none"]:
+              chosen = []
+          else:
+              chosen = [r for r in rows if any(w in r["label"] for w in want)]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"targets={json.dumps(chosen)}\n")
 
-  # =========================================================================
-  # Desktop GPU artifacts: Windows x86_64 (CUDA) and macOS arm64 (Metal).
-  # The Linux CUDA artifacts come from the cuda-manylinux job below.
-  # =========================================================================
-  desktop:
-    if: inputs.desktop
-    needs: prepare-release
-    name: desktop / ${{ matrix.target.label }}
+  binaries:
+    needs: plan
+    if: needs.plan.outputs.targets != '[]'
+    name: ${{ matrix.target.label }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - label: aarch64-macos-metal
-            # macos-15 gets Xcode 16 with libc++ 17, which has
-            # `std::atomic_ref` (C++20). macos-14's Xcode 15.4 ships libc++
-            # 15, which doesn't.
-            runner: macos-15
-            platform: macos
-            triple: aarch64-apple-darwin
-            archive: tar.gz
-            backend: metal
-            features: metal
-          - label: x86_64-windows-cuda
-            runner: windows-large-x64
-            platform: windows
-            triple: x86_64-pc-windows-msvc
-            archive: zip
-            backend: cuda
-            # `pie`'s only NVIDIA feature; the ABI it pins (13.x, in
-            # `engine-cuda`'s cudarc line) must agree with the toolkit
-            # installed below. `cudaGraphAddNode` takes five parameters in
-            # libcudart.so.12 and six in .so.13, and a mismatch segfaults
-            # inside the driver rather than returning an error.
-            features: cuda
-          - label: x86_64-linux-vulkan
-            runner: ubuntu-latest
-            platform: linux
-            triple: x86_64-unknown-linux-gnu
-            archive: tar.gz
-            backend: vulkan
-            features: vulkan
-          - label: aarch64-linux-vulkan
-            runner: ubuntu-large-arm64
-            platform: linux
-            triple: aarch64-unknown-linux-gnu
-            archive: tar.gz
-            backend: vulkan
-            features: vulkan
-          - label: x86_64-windows-vulkan
-            runner: windows-latest
-            platform: windows
-            triple: x86_64-pc-windows-msvc
-            archive: zip
-            backend: vulkan
-            features: vulkan
-          - label: x86_64-linux-wgpu
-            runner: ubuntu-latest
-            platform: linux
-            triple: x86_64-unknown-linux-gnu
-            archive: tar.gz
-            backend: wgpu
-            features: wgpu
-          - label: aarch64-macos-wgpu
-            runner: macos-15
-            platform: macos
-            triple: aarch64-apple-darwin
-            archive: tar.gz
-            backend: wgpu
-            features: wgpu
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
     runs-on: ${{ matrix.target.runner }}
-    env:
-      ARTIFACT_NAME: pie-${{ matrix.target.label }}.${{ matrix.target.archive }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target.triple }}
-
-      - name: Install build deps (macOS only)
-        if: matrix.target.platform == 'macos'
-        run: brew install cmake ninja libomp
-
-      - name: Install Slang (vulkan only)
-        if: matrix.target.backend == 'vulkan'
-        shell: bash
-        env:
-          SLANG_VERSION: '2026.17'
-        run: |
-          set -euxo pipefail
-          case "${{ matrix.target.triple }}" in
-            aarch64-*) slang_arch=aarch64 ;;
-            *)         slang_arch=x86_64 ;;
-          esac
-          if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
-            asset="slang-${SLANG_VERSION}-windows-${slang_arch}.zip"
-          else
-            asset="slang-${SLANG_VERSION}-linux-${slang_arch}.tar.gz"
-          fi
-          url="https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/${asset}"
-          mkdir -p "${RUNNER_TEMP}/slang"
-          curl -fsSL -o "${RUNNER_TEMP}/${asset}" "$url"
-          if [[ "${asset}" == *.zip ]]; then
-            7z x -o"${RUNNER_TEMP}/slang" "${RUNNER_TEMP}/${asset}"
-            echo "PIE_SLANGC=${RUNNER_TEMP}/slang/bin/slangc.exe" >> "$GITHUB_ENV"
-          else
-            tar xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}/slang"
-            echo "PIE_SLANGC=${RUNNER_TEMP}/slang/bin/slangc" >> "$GITHUB_ENV"
-          fi
-          "${RUNNER_TEMP}/slang/bin/slangc" -v || true
-
-      - name: Install CUDA toolkit (windows cuda only)
-        if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: '13.0.0'
-
-      - name: Verify CUDA toolkit (windows cuda only)
-        if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          nvcc --version
-          test -n "${CUDA_PATH:-${CUDA_HOME:-}}"
-
-      - name: Set up MSVC environment (windows cuda only)
-        # ggml-cuda's enable_language(CUDA) under CMake's Visual Studio
-        # generator needs the CUDA MSBuild toolset integration, which the
-        # toolkit installer doesn't reliably register on the hosted image
-        # ("No CUDA toolset found"). We build with the Ninja generator
-        # instead (set in the cargo step); sourcing the MSVC dev environment
-        # here puts cl.exe on PATH so nvcc/CMake can use it as host compiler.
-        if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
-        # node24 equivalent of ilammy/msvc-dev-cmd (which is node20-only and
-        # warns under the Node-20 deprecation). Sets up vcvars so cl.exe is on
-        # PATH for the Ninja CUDA build.
-        uses: TheMrMilchmann/setup-msvc-dev@v4.0.0
-        with:
-          arch: x64
-
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: build-${{ matrix.target.label }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: build-${{ matrix.target.label }}-
-
-      - name: cargo build (release-min)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
-            # ggml-cuda produces many long object paths. Keep the target root
-            # short enough for the legacy 260-character path limit on Windows.
-            export CARGO_TARGET_DIR="C:/t/pie-${{ matrix.target.backend }}"
-            # 32-core windows-large runner: parallelize the native CUDA build
-            # fully (was capped at 4 for the old small hosted runners).
-            export CMAKE_BUILD_PARALLEL_LEVEL="$(nproc 2>/dev/null || echo 8)"
-            if [[ "${{ matrix.target.backend }}" == "cuda" ]]; then
-              # Drive nvcc via Ninja — the VS generator can't find the CUDA
-              # toolset on the hosted image. cl.exe is on PATH from the
-              # preceding msvc-dev-cmd step.
-              export CMAKE_GENERATOR=Ninja
-              ninja --version
-              # Git Bash ships /usr/bin/link.exe (GNU coreutils `link`), which
-              # shadows MSVC's link.exe for rustc once msvc-dev-cmd activates the
-              # MSVC env (rustc then resolves the linker via PATH and picks the
-              # GNU one -> "extra operand" link errors). Drop it so `link`
-              # resolves to MSVC's linker. (Only needed on the cuda leg, which is
-              # the only one that runs msvc-dev-cmd.)
-              rm -f /usr/bin/link /usr/bin/link.exe || true
-            fi
-          fi
-          # `release-min`: thin LTO and strip=symbols, defined in the
-          # workspace Cargo.toml. Smaller and faster than plain `release`
-          # (no LTO at all by default), without fat LTO's many-hour link
-          # cost. `-p pie` because the root package carries the
-          # `[[bin]] name = "pie"`; `worker` is a library.
-          cargo build --profile release-min \
-            --target ${{ matrix.target.triple }} \
-            -p pie \
-            --features ${{ matrix.target.features }}
-
-      - name: Package
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p dist
-          TARGET_ROOT="target"
-          if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
-            TARGET_ROOT="C:/t/pie-${{ matrix.target.backend }}"
-          fi
-          BIN_DIR="${TARGET_ROOT}/${{ matrix.target.triple }}/release-min"
-          if [[ "${{ matrix.target.archive }}" == "zip" ]]; then
-            # Windows .exe; 7z preinstalled on windows-latest.
-            7z a "dist/${ARTIFACT_NAME}" "${BIN_DIR}/pie.exe"
-          else
-            tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
-          fi
-          ls -la dist/
-
-      - name: Upload to release (--clobber)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          # Many matrix legs --clobber the same rolling release concurrently;
-          # GitHub's asset API intermittently 5xx/422s under that contention.
-          # Retry a few times before failing the leg.
-          for attempt in 1 2 3 4 5; do
-            if gh release upload "${{ inputs.tag }}" "dist/${ARTIFACT_NAME}" --clobber --repo "${{ github.repository }}"; then
-              exit 0
-            fi
-            echo "upload attempt ${attempt} failed; retrying in $((attempt * 10))s" >&2
-            sleep $((attempt * 10))
-          done
-          echo "upload failed after retries" >&2
-          exit 1
-
-  # =========================================================================
-  # CUDA matrix on GH-hosted larger runners with a manylinux_2_28 base —
-  # binaries with a glibc 2.28 floor (RHEL 8 / Ubuntu 20.04 / Debian 11).
-  #
-  # Matrix = CUDA-version × os-arch. Device code is compiled at runtime by
-  # NVRTC and cached on disk, so the binary carries no SM-specific code and
-  # one artifact per architecture serves every compute capability. Built
-  # inside nvidia/cuda:X.Y-devel-rockylinux8 containers on
-  # ubuntu-large-{x64,arm64}.
-  # Opt-in via the `cuda_manylinux` workflow input.
-  # =========================================================================
-  cuda-manylinux:
-    if: inputs.cuda_manylinux
-    needs: prepare-release
-    name: cuda / ${{ matrix.target.os_arch }} / cuda-${{ matrix.cuda.short }}
-    runs-on: ${{ matrix.target.runner }}
+    container: ${{ matrix.target.container }}
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda:
-          # One row today (CUDA 12 was cut; the driver floor is r580), kept
-          # as a matrix axis rather than flattened, because the next CUDA
-          # major re-enters as a second row.
-          - { version: "13.0.0", short: "13.0", feature: cuda }
-        target:
-          - { os_arch: x86_64,  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
-          - { os_arch: aarch64, runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
-    container: nvidia/cuda:${{ matrix.cuda.version }}-devel-rockylinux8
-    env:
-      ARTIFACT_NAME: pie-${{ matrix.target.os_arch }}-linux-cuda${{ matrix.cuda.short }}.tar.gz
-      CMAKE_CUDA_RUNTIME_LIBRARY: Shared
-      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
-
-      - name: Bootstrap container
-        shell: bash
-        run: |
-          set -euxo pipefail
-          # `ninja-build` lives in the PowerTools repo on Rocky 8;
-          # EPEL covers extras. `patch` for the vendored llama.cpp
-          # patches; `git` for CPM's git fetches. NCCL ships in
-          # NVIDIA's cuda repo (already configured by the base image)
-          # as `libnccl-devel`; pulls `libnccl` runtime in via deps.
-          dnf install -y epel-release dnf-plugins-core
-          dnf config-manager --set-enabled powertools
-          dnf install -y --setopt=install_weak_deps=False \
-            openssl-devel pkg-config perl git patch \
-            cmake ninja-build \
-            gcc-toolset-12-gcc gcc-toolset-12-gcc-c++ \
-            libnccl libnccl-devel
-          # `gh` so this job uploads the same way the desktop legs do. The
-          # `softprops/action-gh-release` step it replaces ignored `tag_name`
-          # inside this container and fell back to `github.ref`, a branch with
-          # no release, which the API then refused.
-          dnf install -y 'dnf-command(config-manager)'
-          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
-          dnf install -y --setopt=install_weak_deps=False gh
-          # Pin compiler explicitly: `source enable` only adjusts PATH —
-          # cmake-rs probes CC/CXX env vars and otherwise picks
-          # `/usr/bin/cc` (gcc-8.5, no <span> / C++20). Same nvcc
-          # host-compiler issue applies via CUDAHOSTCXX (nvcc
-          # auto-picks gcc-8.5 and silently drops `-std=c++20`).
-          {
-            echo "CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
-            echo "CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
-            echo "AR=/opt/rh/gcc-toolset-12/root/usr/bin/ar"
-            echo "CUDAHOSTCXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
-            echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}"
-            echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/opt/rh/gcc-toolset-12/root/usr/lib"
-            echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64/pkgconfig"
-            # rustc's final link must go through the gcc-toolset-12 gcc driver
-            # so libstdc++_nonshared.a is pulled in for the C++17/20 libstdc++
-            # symbols (std::filesystem, std::__throw_bad_array_new_length) the
-            # C++ drivers use. The stock /usr/bin/cc (gcc-8.5) links the old
-            # system libstdc++ and fails the link with undefined symbols.
-            # The linker env var is per-target-triple; derive its name from the
-            # triple so this one bootstrap works for both x86_64 and aarch64.
-            echo "CARGO_TARGET_$(echo '${{ matrix.target.triple }}' | tr 'a-z-' 'A-Z_')_LINKER=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
-          } >> "$GITHUB_ENV"
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-            sh -s -- -y --profile minimal --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Cache cargo
-        uses: actions/cache@v5
+      - uses: ./.github/actions/toolchain
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: build-cuda-${{ matrix.target.os_arch }}-${{ matrix.cuda.short }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: build-cuda-${{ matrix.target.os_arch }}-${{ matrix.cuda.short }}-
-
-      - name: cargo build (release-min)
+          triple: ${{ matrix.target.triple }}
+          features: ${{ matrix.target.features }}
+          manylinux: ${{ matrix.target.container && 'true' || 'false' }}
+          cache-key: build-${{ matrix.target.label }}
+      - shell: bash
+        run: cargo build --profile release-min --target ${{ matrix.target.triple }} -p pie --features ${{ matrix.target.features }}
+      - name: Package and upload
         shell: bash
-        run: |
-          set -euxo pipefail
-          # `release-min`: thin LTO and strip=symbols. Defined in the
-          # workspace Cargo.toml, which also records why `panic=abort` is
-          # NOT among them.
-          #
-          # `-p pie`, not `-p worker`: the root package carries the `[[bin]]`
-          # the Package step tars; `worker` is a library.
-          #
-          # The CUDA ABI comes from the matrix, so the artifact's `cuda13.0`
-          # label and the runtime it is compiled against are one value.
-          cargo build --profile release-min \
-            --target ${{ matrix.target.triple }} \
-            -p pie \
-            --features ${{ matrix.cuda.feature }}
-
-      - name: Package
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p dist
-          BIN_DIR="target/${{ matrix.target.triple }}/release-min"
-          tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
-          ls -la dist/
-
-      - name: Upload to release (--clobber)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.tag }}
-        shell: bash
         run: |
-          set -euxo pipefail
-          test -f "dist/${ARTIFACT_NAME}"
-          for attempt in 1 2 3 4 5; do
-            if gh release upload "${TAG}" "dist/${ARTIFACT_NAME}" --clobber --repo "${GITHUB_REPOSITORY}"; then
-              exit 0
-            fi
-            echo "upload attempt ${attempt} failed; retrying in $((attempt * 10))s" >&2
-            sleep $((attempt * 10))
-          done
-          echo "upload failed after retries" >&2
-          exit 1
+          set -euo pipefail
+          bin="${CARGO_TARGET_DIR:-target}/${{ matrix.target.triple }}/release-min"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            asset="pie-${{ matrix.target.label }}.zip"; 7z a "$asset" "$bin/pie.exe"
+          else
+            asset="pie-${{ matrix.target.label }}.tar.gz"; tar -C "$bin" -czf "$asset" pie
+          fi
+          ls -la "$asset"
+          bash scripts/ci/release.sh upload "${{ inputs.tag }}" "$asset"
 
-  # =========================================================================
-  # Refresh the release notes once after all builds finish.
-  # =========================================================================
-  refresh-notes:
-    if: always() && (inputs.desktop || inputs.cuda_manylinux)
-    needs: [desktop, cuda-manylinux]
+  # Pure wasm: one asset per language serves every platform. install.sh
+  # extracts them into PIE_HOME; the built-in inferlets need none, being
+  # in the binary.
+  languages:
+    needs: plan
+    if: inputs.languages
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Edit release notes + body
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - run: uv tool install componentize-py
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: bash scripts/build-languages.sh target/languages
+      - run: bash scripts/ci/release.sh upload "${{ inputs.tag }}" target/languages/pie-language-python.tar.gz target/languages/pie-language-javascript.tar.gz
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.tag }}
-        run: |
-          set -euxo pipefail
-          release_id="$(gh release view "${TAG}" --json databaseId --jq .databaseId --repo "${GITHUB_REPOSITORY}")"
-          gh api \
-            -X PATCH \
-            "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
-            -f tag_name="${TAG}" \
-            -f name="${TAG}" \
-            -f body="${RELEASE_NOTES}" \
-            -F draft=false \
-            -F prerelease=true \
-            -f make_latest=false
+
+  notes:
+    needs: [binaries, languages]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash scripts/ci/release.sh ensure "${{ inputs.tag }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

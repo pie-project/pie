@@ -4,9 +4,9 @@ use crate::arena::Arena;
 use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::exports::{
-    Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes, plain_of,
+    Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes,
+    media_classes, plain_of, regions_lane_shifting, regions_launching_schedules, regions_shifting,
     schedule_streams,
-    media_classes, regions_lane_shifting, regions_launching_schedules, regions_shifting,
 };
 use crate::inputs::Inputs;
 use crate::program::Plane as ProgramPlane;
@@ -77,7 +77,8 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     }
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
     if boot.knobs.diagnostics.arm_trace {
-        let mut streams: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+        let mut streams: std::collections::BTreeMap<u32, Vec<String>> =
+            std::collections::BTreeMap::new();
         for (at, region) in compiled.template().iter().enumerate() {
             let op = boot
                 .trace
@@ -85,14 +86,18 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 .get(region.nodes.start as usize)
                 .map_or("?", |node| model_ir::Operands::name(&node.op));
             if op.starts_with("attention.") {
-                streams
-                    .entry(region.stream)
-                    .or_default()
-                    .push(format!("r{at}:{}:{:?}", op.trim_start_matches("attention."), region.mask.iter().collect::<Vec<_>>()));
+                streams.entry(region.stream).or_default().push(format!(
+                    "r{at}:{}:{:?}",
+                    op.trim_start_matches("attention."),
+                    region.mask.iter().collect::<Vec<_>>()
+                ));
             }
         }
         for (stream, regions) in &streams {
-            eprintln!("[arm-trace] attention regions on stream {stream}: {}", regions.join(" "));
+            eprintln!(
+                "[arm-trace] attention regions on stream {stream}: {}",
+                regions.join(" ")
+            );
         }
         let (at, slots) = compiled.arena.peak();
         eprintln!(
@@ -113,11 +118,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         );
         for (value, span, offset, bytes) in slots.iter().take(16) {
             let what = match &boot.trace.values[value.0 as usize].def {
-                model_ir::Def::Op(node) => model_ir::Operands::name(&boot.trace.nodes[*node as usize].op).to_string(),
+                model_ir::Def::Op(node) => {
+                    model_ir::Operands::name(&boot.trace.nodes[*node as usize].op).to_string()
+                }
                 other => format!("{other:?}").chars().take(20).collect(),
             };
             let rows = match &compiled.arena.placements[value.0 as usize] {
-                model_compiler::arena::Placement::Arena { rows, width, dtype, .. } => format!("{rows:?} x {width} {dtype:?}"),
+                model_compiler::arena::Placement::Arena {
+                    rows, width, dtype, ..
+                } => format!("{rows:?} x {width} {dtype:?}"),
                 _ => String::new(),
             };
             eprintln!(
@@ -206,12 +215,27 @@ impl Shell {
         let corrected = corrected_classes(&boot.trace, &compiled);
         let landing = landing_requests(boot.classify, &compiled.classes);
         let decoding = decoding_of(&landing);
+        let feeds = Feeds::of(&boot.trace, &compiled);
+        // A wide body is captured from representative lanes and keyed by the
+        // whole wide list, so only classes a synthetic lane can stand in for
+        // join it: text-stream, non-denoising, port-free.
         let tiers = crate::record::Tiers {
             plain: plain_of(&landing),
             wide: landing
                 .iter()
                 .enumerate()
-                .filter(|(_, requests)| !requests.is_empty())
+                .filter(|(class, requests)| {
+                    !requests.is_empty()
+                        && requests.iter().all(|request| {
+                            !request.denoise()
+                                && request.stream() == model_ir::Stream::Text
+                                && request.reading() == 0
+                        })
+                        && !feeds
+                            .ports
+                            .iter()
+                            .any(|(_, readers)| readers.contains(*class))
+                })
                 .map(|(class, _)| class as u32)
                 .collect(),
         };
@@ -240,7 +264,10 @@ impl Shell {
         )?;
 
         if boot.knobs.diagnostics.arm_trace {
-            eprintln!("[arm-trace] device free {} MiB before weights", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+            eprintln!(
+                "[arm-trace] device free {} MiB before weights",
+                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+            );
         }
         let mut weights = Weights::resident(
             &boot.trace,
@@ -257,15 +284,24 @@ impl Shell {
             boot.deferred_tier,
         )?;
         if boot.knobs.diagnostics.arm_trace {
-            eprintln!("[arm-trace] device free {} MiB after weights resident", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+            eprintln!(
+                "[arm-trace] device free {} MiB after weights resident",
+                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+            );
         }
         crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
         weights.rotate(&boot.trace, &compiled)?;
         if boot.knobs.diagnostics.arm_trace {
-            eprintln!("[arm-trace] device free {} MiB after rotate", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+            eprintln!(
+                "[arm-trace] device free {} MiB after rotate",
+                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+            );
         }
         if boot.knobs.diagnostics.arm_trace {
-            eprintln!("[arm-trace] device free {} MiB after weights", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+            eprintln!(
+                "[arm-trace] device free {} MiB after weights",
+                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+            );
         }
         let pools = Pools::reserve(
             device.ordinal(),
@@ -275,7 +311,10 @@ impl Shell {
             &facts,
         )?;
         if boot.knobs.diagnostics.arm_trace {
-            eprintln!("[arm-trace] device free {} MiB after pools", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+            eprintln!(
+                "[arm-trace] device free {} MiB after pools",
+                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+            );
         }
         let buffers = Buffers::reserve(&boot.trace, paging, &pools)?;
         let mut pools = pools;
@@ -350,7 +389,6 @@ impl Shell {
                 model_ir::Operation::Layout(model_ir::Layout::ScatterLiveRows { .. })
             )
         });
-        let feeds = Feeds::of(&boot.trace, &compiled);
         if let Some(value) = feeds.unlanded.first() {
             return Err(Fault::Unbound {
                 what: format!(
@@ -362,7 +400,10 @@ impl Shell {
             });
         }
         if boot.knobs.diagnostics.arm_trace {
-            eprintln!("[arm-trace] device free {} MiB after buffers", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+            eprintln!(
+                "[arm-trace] device free {} MiB after buffers",
+                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+            );
         }
         let inputs = Inputs::reserve(
             &boot.budget,
@@ -408,7 +449,10 @@ impl Shell {
         let mut pools = pools;
         pools.watch(airborne.clone());
         if boot.knobs.diagnostics.arm_trace {
-            eprintln!("[arm-trace] device free {} MiB after inputs", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+            eprintln!(
+                "[arm-trace] device free {} MiB after inputs",
+                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+            );
         }
         let readout_rows = crate::device::Buffer::zeroed(
             (boot.budget.max_lanes as usize)
@@ -519,7 +563,10 @@ impl Shell {
             );
         }
         if boot.knobs.diagnostics.arm_trace {
-            eprintln!("[arm-trace] device free {} MiB before arming", crate::device::nodes::free_bytes().unwrap_or(0) >> 20);
+            eprintln!(
+                "[arm-trace] device free {} MiB before arming",
+                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+            );
         }
         shell.arm_bodies()?;
         if boot.world.rank != 0 {

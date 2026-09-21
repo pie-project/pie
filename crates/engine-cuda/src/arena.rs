@@ -89,9 +89,10 @@ pub fn carve(base: u64, map: &ArenaMap, rows: model_compiler::FireRows) -> SlotT
     let mut cells: Vec<Option<Tensor>> = Vec::with_capacity(map.placements.len());
     for value in 0..map.placements.len() {
         let value = ValueId(value as u32);
-        cells.push(rect(map, value, rows).map(|rect| {
-            Tensor::new(base + rect.offset, rect.rows, rect.width, rect.dtype)
-        }));
+        cells.push(
+            rect(map, value, rows)
+                .map(|rect| Tensor::new(base + rect.offset, rect.rows, rect.width, rect.dtype)),
+        );
     }
     SlotTable(cells)
 }
@@ -106,7 +107,9 @@ mod tests {
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
     fn compiled() -> (model_ir::Trace, model_compiler::CompiledModel) {
-        let trace = models::sku(SKU).expect("the catalog ships the smoke's SKU").trace;
+        let trace = models::sku(SKU)
+            .expect("the catalog ships the smoke's SKU")
+            .trace;
         let trace = trace(Platform::Cuda);
         let compiled = compile(&trace, &Budget::new(4, 64), &DeviceProfile::default())
             .expect("the smoke's SKU bakes");
@@ -116,11 +119,14 @@ mod tests {
     #[test]
     fn the_carve_fits_the_allocation_it_asks_for() {
         let (_, compiled) = compiled();
-        let slots = carve(0, &compiled.arena, model_compiler::FireRows::text_only(64, 4));
+        let slots = carve(
+            0,
+            &compiled.arena,
+            model_compiler::FireRows::text_only(64, 4),
+        );
         for handle in slots.0.iter().flatten() {
             let end = handle.ptr
-                + handle.elements()
-                    * model_compiler::arena::elem_bytes(handle.dtype).unwrap_or(0);
+                + handle.elements() * model_compiler::arena::elem_bytes(handle.dtype).unwrap_or(0);
             assert!(
                 end <= compiled.arena.bytes,
                 "a rectangle ending at {end} in an arena of {} bytes",

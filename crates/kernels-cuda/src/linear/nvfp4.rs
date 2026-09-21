@@ -80,7 +80,10 @@ fn fire(
     if scales.rows != n {
         return Err(refuse(
             op,
-            format!("a {}-row scale plane is not {n} rows over a {n}x{k} weight", scales.rows),
+            format!(
+                "a {}-row scale plane is not {n} rows over a {n}x{k} weight",
+                scales.rows
+            ),
         ));
     }
     if !tensor_scale.is_finite() {

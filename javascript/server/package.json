@@ -1,0 +1,48 @@
+{
+  "name": "@pie-project/server",
+  "version": "0.5.0",
+  "description": "What `pie serve` boots, inside a Node.js process, on the native GPU engines.",
+  "type": "module",
+  "main": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs"
+    }
+  },
+  "files": [
+    "index.mjs",
+    "index.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bash build.sh release",
+    "build:dev": "bash build.sh dev",
+    "test": "node --test test/server.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "dependencies": {
+    "@pie-project/client": "^0.5.0",
+    "ws": "^8.18.0"
+  },
+  "optionalDependencies": {
+    "@pie-project/server-linux-x64": "0.5.0",
+    "@pie-project/server-linux-arm64": "0.5.0",
+    "@pie-project/server-darwin-arm64": "0.5.0",
+    "@pie-project/server-win32-x64": "0.5.0"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pie-project/pie",
+    "directory": "javascript/server"
+  }
+}

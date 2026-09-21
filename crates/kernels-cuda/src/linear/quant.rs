@@ -1,7 +1,9 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+};
 use crate::linear::gemm;
 use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
@@ -152,7 +154,10 @@ fn affine(
         (OffsetKind::Post | OffsetKind::PreInt | OffsetKind::PreReal, None) => {
             return Err(refuse(
                 op,
-                format!("{} was declared with no offset plane to read", offset.spelling()),
+                format!(
+                    "{} was declared with no offset plane to read",
+                    offset.spelling()
+                ),
             ));
         }
         _ => {}
@@ -298,7 +303,10 @@ pub fn decoded_plane(
     if codes.rows != n {
         return Err(refuse(
             op,
-            format!("the code plane holds {} rows and the entry states {n}", codes.rows),
+            format!(
+                "the code plane holds {} rows and the entry states {n}",
+                codes.rows
+            ),
         ));
     }
     let bits: u32 = if codes.width == k {
@@ -310,7 +318,10 @@ pub fn decoded_plane(
     } else {
         return Err(refuse(
             op,
-            format!("a {}-byte code row stores a {k}-wide row at neither two, four nor eight bits", codes.width),
+            format!(
+                "a {}-byte code row stores a {k}-wide row at neither two, four nor eight bits",
+                codes.width
+            ),
         ));
     };
     let groups = scales.width / 2;
@@ -364,7 +375,10 @@ pub fn decode_into(
     if codes.rows != n {
         return Err(refuse(
             op,
-            format!("the code plane holds {} rows and the entry states {n}", codes.rows),
+            format!(
+                "the code plane holds {} rows and the entry states {n}",
+                codes.rows
+            ),
         ));
     }
     let bits: u32 = if codes.width == k {
@@ -376,7 +390,10 @@ pub fn decode_into(
     } else {
         return Err(refuse(
             op,
-            format!("a {}-byte code row stores a {k}-wide row at neither two, four nor eight bits", codes.width),
+            format!(
+                "a {}-byte code row stores a {k}-wide row at neither two, four nor eight bits",
+                codes.width
+            ),
         ));
     };
     let groups = scales.width / 2;

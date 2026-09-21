@@ -40,8 +40,9 @@ impl Buffer {
 
             let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
             // SAFETY: `base` is a live local; the allocation is this buffer's, freed exactly once in `Drop`.
-            let allocated =
-                unsafe { crate::device::ctx::check("cudaMalloc", rt::cudaMalloc(&raw mut base, bytes)) };
+            let allocated = unsafe {
+                crate::device::ctx::check("cudaMalloc", rt::cudaMalloc(&raw mut base, bytes))
+            };
             if let Err(fault) = allocated {
                 return Err(out_of_room(fault, bytes));
             }
@@ -168,7 +169,12 @@ impl Buffer {
         }
     }
 
-    pub fn stage(&mut self, stream: *mut core::ffi::c_void, offset: u64, bytes: &[u8]) -> Result<()> {
+    pub fn stage(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
         self.span(offset, bytes.len())?;
         if bytes.is_empty() {
             return Ok(());
@@ -558,7 +564,9 @@ impl Pinned {
             return false;
         }
         // SAFETY: the span is inside this allocation, which outlives the copy.
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.host.add(offset), bytes.len()) }
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.host.add(offset), bytes.len())
+        }
         true
     }
 }
@@ -604,7 +612,11 @@ fn map_anon(bytes: usize) -> Option<*mut u8> {
             0,
         )
     };
-    if at == libc::MAP_FAILED { None } else { Some(at.cast()) }
+    if at == libc::MAP_FAILED {
+        None
+    } else {
+        Some(at.cast())
+    }
 }
 
 #[cfg(unix)]
@@ -617,7 +629,9 @@ fn unmap_anon(at: *mut u8, bytes: usize) {
 
 #[cfg(windows)]
 fn map_anon(bytes: usize) -> Option<*mut u8> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+    };
     // SAFETY: a fresh committed reservation of a stated length, owned by nobody else.
     let at = unsafe {
         VirtualAlloc(
@@ -694,7 +708,9 @@ impl Pinning {
             };
             if asked.is_err() {
                 // SAFETY: undoing the registration this call just made.
-                unsafe { let _ = rt::cudaHostUnregister(self.host.cast()); }
+                unsafe {
+                    let _ = rt::cudaHostUnregister(self.host.cast());
+                }
                 asked?;
             }
             let host = self.host;
@@ -777,12 +793,7 @@ pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Resu
     }
 }
 
-pub fn copy_d2d(
-    stream: *mut core::ffi::c_void,
-    dst: u64,
-    src: u64,
-    bytes: usize,
-) -> Result<()> {
+pub fn copy_d2d(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize) -> Result<()> {
     if bytes == 0 {
         return Ok(());
     }
@@ -811,12 +822,7 @@ pub fn copy_d2d(
     }
 }
 
-pub fn copy_any(
-    stream: *mut core::ffi::c_void,
-    dst: u64,
-    src: u64,
-    bytes: usize,
-) -> Result<()> {
+pub fn copy_any(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize) -> Result<()> {
     if bytes == 0 {
         return Ok(());
     }
@@ -943,7 +949,8 @@ pub fn is_host_pointer(at: u64) -> bool {
         use cudarc::runtime::sys as rt;
         // SAFETY: a zeroed attribute record the call fills; the query reads nothing else.
         let mut attrs: rt::cudaPointerAttributes = unsafe { core::mem::zeroed() };
-        let asked = unsafe { rt::cudaPointerGetAttributes(&raw mut attrs, at as *const core::ffi::c_void) };
+        let asked =
+            unsafe { rt::cudaPointerGetAttributes(&raw mut attrs, at as *const core::ffi::c_void) };
         asked == rt::cudaError::cudaSuccess && attrs.type_ == rt::cudaMemoryType::cudaMemoryTypeHost
     }
     #[cfg(not(feature = "cuda"))]
@@ -961,7 +968,8 @@ pub fn is_capturing(stream: *mut core::ffi::c_void) -> bool {
         let mut status = rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
         // SAFETY: a live stream handle and a local the query writes.
         let asked = unsafe { rt::cudaStreamIsCapturing(stream.cast(), &raw mut status) };
-        asked == rt::cudaError::cudaSuccess && status != rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
+        asked == rt::cudaError::cudaSuccess
+            && status != rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
     }
     #[cfg(not(feature = "cuda"))]
     {

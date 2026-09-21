@@ -10,10 +10,7 @@ pub enum ArgValue {
     I64(i64),
     Usize(u64),
     Bool(bool),
-    Bytes {
-        ptr: *const u8,
-        len: usize,
-    },
+    Bytes { ptr: *const u8, len: usize },
 }
 
 impl ArgValue {

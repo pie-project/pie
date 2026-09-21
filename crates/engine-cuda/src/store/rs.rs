@@ -99,7 +99,9 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
     };
     let mut widest = 0u64;
     for node in &trace.nodes {
-        let Operation::Attention(Attention::SsmGatedDeltaChunked { qkv, z, gates, y, .. }) = &node.op
+        let Operation::Attention(Attention::SsmGatedDeltaChunked {
+            qkv, z, gates, y, ..
+        }) = &node.op
         else {
             continue;
         };
@@ -145,23 +147,27 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                 }
                 _ => continue,
             };
-            let conv = defined.get(&qkv.0).copied().and_then(|n| {
-                match &trace.nodes[n].op {
-                    Operation::Attention(Attention::SsmCausalConv1dChunked { x, .. }) if chunked => {
+            let conv = defined
+                .get(&qkv.0)
+                .copied()
+                .and_then(|n| match &trace.nodes[n].op {
+                    Operation::Attention(Attention::SsmCausalConv1dChunked { x, .. })
+                        if chunked =>
+                    {
                         Some((n, *x))
                     }
                     Operation::Attention(Attention::SsmCausalConv1d { x, .. }) if !chunked => {
                         Some((n, *x))
                     }
                     _ => None,
-                }
-            });
-            let prep = defined.get(&gates.0).copied().and_then(|n| {
-                match &trace.nodes[n].op {
+                });
+            let prep = defined
+                .get(&gates.0)
+                .copied()
+                .and_then(|n| match &trace.nodes[n].op {
                     Operation::Attention(Attention::SsmGdnPrep { ba, .. }) => Some((n, *ba)),
                     _ => None,
-                }
-            });
+                });
             let (Some((conv_at, x)), Some((prep_at, ba))) = (conv, prep) else {
                 if !chunked {
                     continue;
@@ -182,8 +188,10 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)
                     ),
                 });
             }
-            let qkv_width = width_of(trace, x).ok_or_else(|| unsized_plane("the conv's rows", x))?;
-            let ba_width = width_of(trace, ba).ok_or_else(|| unsized_plane("the gate prep's `[b | a]`", ba))?;
+            let qkv_width =
+                width_of(trace, x).ok_or_else(|| unsized_plane("the conv's rows", x))?;
+            let ba_width = width_of(trace, ba)
+                .ok_or_else(|| unsized_plane("the gate prep's `[b | a]`", ba))?;
             let page = u64::from(paging);
             let layer = if chunked { layers } else { decode_layers };
             planes.insert(

@@ -1,0 +1,57 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>pie in the browser — transport cost</title>
+<style> body { font: 14px/1.4 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; } pre { background: #f4f4f4; padding: 0.75rem; white-space: pre-wrap; } </style>
+<h1>transport cost: a message round trip, no GPU</h1>
+<p>The runtime boots without an engine; every number here is the client protocol alone.</p>
+<pre id="out"></pre>
+<script type="module">
+  import * as pie from "../../javascript/browser/dist/pie.mjs";
+  import { page, loadRuntime, installInferlet, connect } from "./harness.mjs";
+
+  const { log, params, modelUrl, finish, fail } = page();
+  const N = Number(params.get("n") ?? 200);
+  const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+
+  try {
+    await loadRuntime(params);
+    await pie.bootLazy(modelUrl, "engine = false\n");
+    const r = {};
+
+    {
+      const client = pie.client();
+      await client.connect();
+      await client.ping?.().catch(() => {});
+      const t = [];
+      for (let i = 0; i < N; i++) {
+        const t0 = performance.now();
+        await client._sendMsgAndWait({ type: "ping" });
+        t.push(performance.now() - t0);
+      }
+      r.client_ping_ms = +median(t).toFixed(3);
+      log(`client ping: median ${r.client_ping_ms} ms over ${N}`);
+      await client.close();
+    }
+
+    {
+      await installInferlet("text-completion");
+      const client = await connect();
+      let refused;
+      try {
+        await client.launchProcess("text-completion@0.3.0", {});
+        refused = "launched?!";
+      } catch (e) {
+        refused = String(e.message ?? e);
+      }
+      await client.close();
+      r.launch_without_engine = refused.includes("no engine") ? "refused by name" : refused.slice(0, 120);
+      log(`launch without an engine: ${r.launch_without_engine}`);
+      if (r.launch_without_engine !== "refused by name") throw new Error(`launch without engine: ${refused}`);
+    }
+
+    log("RESULT " + JSON.stringify({ host: "browser", transport: r }));
+    finish(0);
+  } catch (e) {
+    fail(e);
+  }
+</script>

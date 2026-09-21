@@ -161,7 +161,7 @@ interface forward {
         /// `self-conditioning-from`. The channel's shape is validated
         /// against the port here (`[rows, width]` for latents / context /
         /// axis-positions, `[width]` or `[1, width]` for a lane vector),
-        /// and it must be bound into this pass's program (the SDK reads
+        /// and it must be bound into this pass's program (the inferlet library reads
         /// it in the prologue when nothing else does). Every port the
         /// reading declares must be bound before `program`.
         input: func(port: string, ch: borrow<channel>) -> result<_, error>;
@@ -209,6 +209,16 @@ interface forward {
         /// Set before `program`, and after `group`. A model that predicts
         /// no velocity refuses the whole program at bind.
         peer: func(group: u32) -> result<_, error>;
+
+        /// A structured attention mask over this pass's rows, applied to the
+        /// reading's group-packed attention: `classes` names one class in
+        /// `0..count` per row (or -1: the row attends, and is attended by,
+        /// every row); `table[q * count + kv]` non-zero lets a q-class row
+        /// attend a kv-class row. `count` is at most 64. Every lane of one
+        /// attention group states the same table; rows of lanes that state
+        /// nothing are class -1. Regional prompting, attention coupling and
+        /// cross-frame restriction are all one table. Set before `program`.
+        attention-classes: func(classes: list<s32>, table: list<u8>, count: u32) -> result<_, error>;
 
         /// Bind an optional readout-index channel separately from embedding.
         readout: func(indices: borrow<channel>) -> result<_, error>;

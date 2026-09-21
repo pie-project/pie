@@ -1,9 +1,9 @@
 use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
-    Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader,
-    LaneRecord, LaneShape, Layout, Lifetime, NO_TICKET, OpParams, OpRuntime, SCRATCH_ALIGN,
-    ValueDesc, describe, layout, layout_reusing,
+    Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader, LaneRecord,
+    LaneShape, Layout, Lifetime, NO_TICKET, OpParams, OpRuntime, SCRATCH_ALIGN, ValueDesc,
+    describe, layout, layout_reusing,
 };
 use eta_ir::Dtype;
 use eta_ir::container::HostRole;
@@ -218,7 +218,10 @@ pub struct Rings {
 }
 
 impl Rings {
-    pub fn allocate(shapes: &[ChannelShape], endpoints: Vec<Option<Arc<Endpoint>>>) -> Result<Rings> {
+    pub fn allocate(
+        shapes: &[ChannelShape],
+        endpoints: Vec<Option<Arc<Endpoint>>>,
+    ) -> Result<Rings> {
         if endpoints.len() != shapes.len() {
             return Err(Fault::program(
                 "program::launch",
@@ -255,7 +258,11 @@ impl Rings {
         let mut registry = Buffer::zeroed(full_at + slots * MAX_RING as usize)?;
         let cap1: Vec<u8> = shapes
             .iter()
-            .flat_map(|shape| u32::try_from(shape.ring()).unwrap_or(u32::MAX).to_le_bytes())
+            .flat_map(|shape| {
+                u32::try_from(shape.ring())
+                    .unwrap_or(u32::MAX)
+                    .to_le_bytes()
+            })
             .collect();
         registry.write(2 * words as u64, &cap1)?;
         let device = kernels_cuda::channel::Rings::new(
@@ -293,7 +300,10 @@ impl Rings {
         let mut full = vec![0u8; slots * MAX_RING as usize];
         for (channel, shape) in self.shapes.iter().enumerate() {
             let ring = shape.ring();
-            let cursor = cursors.get(channel).copied().unwrap_or(Cursor { head: 0, tail: 0 });
+            let cursor = cursors
+                .get(channel)
+                .copied()
+                .unwrap_or(Cursor { head: 0, tail: 0 });
             head.extend_from_slice(&((cursor.head % ring) as u32).to_le_bytes());
             tail.extend_from_slice(&((cursor.tail % ring) as u32).to_le_bytes());
             for sequence in cursor.head..cursor.tail {
@@ -746,7 +756,9 @@ fn region_rows(plan: &LaunchStagePlan, descriptors: &[ValueDesc]) -> Vec<u32> {
             match region.kind {
                 RegionKind::Generated => rows,
                 RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => rows,
-                RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => rows.min(ORDER_ROW_BLOCKS),
+                RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => {
+                    rows.min(ORDER_ROW_BLOCKS)
+                }
                 RegionKind::Library(_) => 1,
             }
         })
@@ -766,7 +778,12 @@ fn selects(plan: &LaunchStagePlan, region: &LaunchRegion) -> bool {
 
 fn temporary_floor(plan: &LaunchStagePlan, descriptors: &[ValueDesc], rows: &[u32]) -> u64 {
     let align = |bytes: u64| bytes.next_multiple_of(u64::from(SCRATCH_ALIGN));
-    let widest = descriptors.iter().map(|d| u64::from(d.last)).max().unwrap_or(1).max(1);
+    let widest = descriptors
+        .iter()
+        .map(|d| u64::from(d.last))
+        .max()
+        .unwrap_or(1)
+        .max(1);
     plan.fused
         .iter()
         .zip(rows)
@@ -1233,9 +1250,7 @@ impl Prepared {
     }
 
     fn channel_slots_ptr(&self) -> u64 {
-        self.table.ptr()
-            + LANE_HEADER_BYTES
-            + u64::from(self.lanes) * LANE_RECORD_BYTES
+        self.table.ptr() + LANE_HEADER_BYTES + u64::from(self.lanes) * LANE_RECORD_BYTES
     }
 }
 
@@ -1259,8 +1274,11 @@ pub(super) fn record_bytes<T: Copy>(record: &T) -> Vec<u8> {
 pub(super) fn slice_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
     // SAFETY: as `record_bytes`, over a contiguous run of them.
     unsafe {
-        std::slice::from_raw_parts(records.as_ptr().cast::<u8>(), std::mem::size_of_val(records))
-            .to_vec()
+        std::slice::from_raw_parts(
+            records.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(records),
+        )
+        .to_vec()
     }
 }
 
@@ -1380,7 +1398,7 @@ pub fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn only_bool_is_packed_and_the_round_trip_is_lossless() {
         for (dtype, numel) in [
@@ -1414,5 +1432,4 @@ mod tests {
             }
         }
     }
-
 }

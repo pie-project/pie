@@ -174,7 +174,11 @@ impl PhysicalPool {
 
     pub fn try_reserve(&mut self, pages: u64) -> bool {
         let charged = self.committed_pages + self.held_pages;
-        if pages > self.budget_pages.saturating_sub(charged.min(self.budget_pages)) {
+        if pages
+            > self
+                .budget_pages
+                .saturating_sub(charged.min(self.budget_pages))
+        {
             return false;
         }
         self.held_pages += pages;
@@ -223,7 +227,8 @@ impl PhysicalPool {
             let mut handle: dr::CUmemGenericAllocationHandle = 0;
             // SAFETY: `handle` and `prop` are live locals; the handle is
             // released exactly once, by `release_handle`.
-            let made = unsafe { dr::cuMemCreate(&raw mut handle, bytes as usize, &raw const prop, 0) };
+            let made =
+                unsafe { dr::cuMemCreate(&raw mut handle, bytes as usize, &raw const prop, 0) };
             said("cuMemCreate", made)?;
             Ok(handle)
         }
@@ -601,14 +606,8 @@ pub struct Target<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Commit {
     Committed,
-    Exhausted {
-        required: u64,
-        budget: u64,
-    },
-    Impossible {
-        required: u64,
-        ceiling: u64,
-    },
+    Exhausted { required: u64, budget: u64 },
+    Impossible { required: u64, ceiling: u64 },
 }
 
 pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) -> Result<Commit> {
@@ -641,8 +640,11 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
         .iter()
         .zip(&wanted)
         .map(|(target, units)| {
-            let fresh: Vec<usize> =
-                units.iter().copied().filter(|&u| target.arena.unbacked(u)).collect();
+            let fresh: Vec<usize> = units
+                .iter()
+                .copied()
+                .filter(|&u| target.arena.unbacked(u))
+                .collect();
             (fresh, target.arena.cached.len())
         })
         .collect();
@@ -743,5 +745,4 @@ mod tests {
         assert_eq!(pages_for_bytes(LOGICAL_PAGE_BYTES), 1);
         assert_eq!(pages_for_bytes(LOGICAL_PAGE_BYTES + 1), 2);
     }
-
 }
