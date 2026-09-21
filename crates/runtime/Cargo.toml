@@ -76,12 +76,6 @@ checkpoint-dsl = { path = "../checkpoint-dsl" }
 media = { path = "../media" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
-image = { version = "0.25", default-features = false, features = [
-    "png",
-    "jpeg",
-    "gif",
-    "webp",
-] }
 blake3 = "1.8.5"
 fancy-regex = "0.18.0"
 async-trait = "0.1.91"

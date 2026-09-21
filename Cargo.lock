@@ -4373,7 +4373,6 @@ dependencies = [
  "futures",
  "grammar",
  "http",
- "image",
  "ipnet",
  "libc",
  "lru",
