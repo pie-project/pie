@@ -759,11 +759,6 @@ impl ModelConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    /// How long a client request may run before the runtime gives up on it.
-    /// The outermost of the three clocks here — bounds the answer a caller
-    /// is waiting for, distinct from `submit_deadline` and `silence_timeout`.
-    #[serde(default = "default_request_timeout")]
-    pub request_timeout: Duration,
     /// How long a pipeline hard-blocking a frame's seal may go without
     /// submitting before the runtime stops waiting for it, in microseconds.
     /// Does not fail the pipeline — the lane is dropped from the wait-set
@@ -796,7 +791,6 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            request_timeout: default_request_timeout(),
             submit_deadline: default_submit_deadline(),
             silence_timeout: default_silence_timeout(),
             frame_size: default_frame_size(),
@@ -808,10 +802,6 @@ impl Default for RuntimeConfig {
 
 impl RuntimeConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(
-            self.request_timeout.as_micros() > 0,
-            "runtime.request_timeout must be > 0"
-        );
         ensure!(
             self.submit_deadline.as_micros() > 0,
             "runtime.submit_deadline must be > 0"
@@ -854,10 +844,6 @@ impl RuntimeConfig {
         }
         Ok(())
     }
-}
-
-fn default_request_timeout() -> Duration {
-    Duration::from_secs(120)
 }
 
 fn default_submit_deadline() -> Duration {
@@ -1068,7 +1054,6 @@ device = ["cpu"]
             ("sandbox", "wasm_max_memory_mb = 4096"),
             ("sandbox", "wasm_warm_memory_mb = 0"),
             ("server", "max_upload_mb = 256"),
-            ("runtime", "request_timeout_secs = 120"),
             ("runtime", "submit_deadline_us = 50000"),
             ("runtime", "silence_timeout_secs = 30"),
         ] {

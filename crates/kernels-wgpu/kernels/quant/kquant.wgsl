@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 const PIE_LANES = 32u;
 const PIE_SLICES = 2u;
@@ -76,6 +76,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
             let base = row * row_bytes + g * u32(PIE_BLOCK_BYTES);
             var sum = 0.0;
 
+//#if PIE_SCHEME == 2
             let d = gguf_f16(base + 80u);
             let dmin = gguf_f16(base + 82u);
             for (var b = 0u; b < 16u; b = b + 1u) {
@@ -93,7 +94,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
                 sum = sum + d * f32(packed & 0x0fu) * part
                           - dmin * f32(packed >> 4u) * xsum;
             }
-
+//#endif
+//#if PIE_SCHEME == 3
             let d = gguf_f16(base + 108u);
             for (var b = 0u; b < 16u; b = b + 1u) {
                 let step = (b >> 1u) & 3u;
@@ -111,7 +113,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
                 }
                 sum = sum + d * f32(q3k_scale(base + 96u, b) - 32) * part;
             }
-
+//#endif
+//#if PIE_SCHEME == 4
             let d = gguf_f16(base);
             let dmin = gguf_f16(base + 2u);
             for (var b = 0u; b < 8u; b = b + 1u) {
@@ -129,7 +132,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
                 let sm = q4k_scale_min(base + 4u, b);
                 sum = sum + d * sm.x * part - dmin * sm.y * xsum;
             }
-
+//#endif
+//#if PIE_SCHEME == 5
             let d = gguf_f16(base);
             let dmin = gguf_f16(base + 2u);
             for (var b = 0u; b < 8u; b = b + 1u) {
@@ -149,7 +153,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
                 let sm = q4k_scale_min(base + 4u, b);
                 sum = sum + d * sm.x * part - dmin * sm.y * xsum;
             }
-
+//#endif
+//#if PIE_SCHEME == 6
             let d = gguf_f16(base + 208u);
             for (var half_ = 0u; half_ < 2u; half_ = half_ + 1u) {
                 for (var quarter = 0u; quarter < 4u; quarter = quarter + 1u) {
@@ -169,7 +174,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
                     }
                 }
             }
-
+//#endif
             acc[r] = acc[r] + sum;
         }
     }
@@ -197,3 +202,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
+// pie:instantiate kquant_q2k_bf16 PIE_SCHEME=2 PIE_BLOCK_BYTES=84
+// pie:instantiate kquant_q3k_bf16 PIE_SCHEME=3 PIE_BLOCK_BYTES=110
+// pie:instantiate kquant_q4k_bf16 PIE_SCHEME=4 PIE_BLOCK_BYTES=144
+// pie:instantiate kquant_q5k_bf16 PIE_SCHEME=5 PIE_BLOCK_BYTES=176
+// pie:instantiate kquant_q6k_bf16 PIE_SCHEME=6 PIE_BLOCK_BYTES=210

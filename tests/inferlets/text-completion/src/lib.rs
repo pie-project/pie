@@ -1,30 +1,5 @@
-//! Greedy text completion, **host-driven** — the fixture the serving door is
-//! gated on.
 //!
-//! # Why this is not `naive-baseline` with the sampler swapped
 //!
-//! Every other decode inferlet in this directory carries its next token ON THE
-//! DEVICE: the epilogue writes the sampled token straight back into the channel
-//! the `embed` port reads, and the host never sees it. That is the fast shape,
-//! and it needs an engine that resolves the `EmbedTokens`/`KvLen` descriptor
-//! ports at kernel time — `GeometryClass::DecodeEnvelope`, or the pooled
-//! device-geometry class above it.
-//!
-//! The CUDA shell does not, and says so: its load answers `ports:
-//! PortMask::NONE` and `geometry: GeometryClass::Host`, so every geometry
-//! vector a fire runs on is staged from the host. Against that shell a
-//! device-carried token is a value the runtime cannot know, and the fire is
-//! refused by name (`EmbedTokens is not host-derivable`) rather than run on a
-//! guess.
-//!
-//! So this one brings the TOKEN back to the host and sends it down again as a
-//! host-writer cell — and only the token. Everything else the fire reads is
-//! DERIVED from the KV length by pure arithmetic, so the epilogue still
-//! carries it on the device exactly as `naive-baseline` does, and the runtime's
-//! host shadow folds the same arithmetic to know what each fire will read.
-//! One host round trip per token, which is the honest depth for a shell with
-//! no descriptor-port plane, and it is entirely within what the contract
-//! serves today.
 //!
 //! Greedy (`reduce_argmax`) rather than sampled, because the point of the gate
 //! is that the same prompt produces the same continuation on every run.
@@ -87,7 +62,10 @@ async fn main(input: Input) -> Result<Output> {
             return Err("this program has no recurrent-only path (it needs a KV cache)".into());
         }
         model::ForwardKind::Diffusion => {
-            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+            return Err(
+                "this program decodes a token at a time; a diffusion model wants a canvas loop"
+                    .into(),
+            );
         }
     };
     let page_size = kv_page_size();
@@ -172,28 +150,12 @@ async fn main(input: Input) -> Result<Output> {
     }
     generated.push(first as u32);
 
-    // ── DECODE (1-wide, host-driven token) ────────────────────────────────
-    //
-    // ONE channel is host-driven, and it is the token. Everything else the
-    // fire reads — the position, the write slot and offset, the page CSR and
-    // the readable extent — is DERIVED from the KV length by pure
-    // arithmetic, so the epilogue carries it on the device and the runtime's
-    // host shadow folds the same arithmetic
-    // (`eta_compiler::eval::pareval`) to know what each fire will read.
-    // That is `naive-baseline`'s decode exactly, minus the one put that makes
-    // it undecidable: `tok_in.put(&token)`.
-    //
-    // The token cannot go the same way, and that is not a gap in this
-    // program. A sampled token is device-DECIDED — the shadow commits it
-    // unknown rather than guessing — so a fire that reads it needs an engine
-    // resolving the `EmbedTokens` port at kernel time. The CUDA shell answers
-    // `ports: PortMask::NONE` and `geometry: GeometryClass::Host`: it stages
-    // every geometry vector from the host and resolves no descriptor port on
-    // the device. So the token comes back to the host, and goes down again as
-    // a host-writer cell — one round trip per token, which is the honest
-    // depth here.
+    // ── DECODE (1-wide, device loop-carried token) ─────────────────────────
     if generated.len() < max_tokens {
         let tok_in = Channel::from([first]).named("tok_in");
+        let tok_out = Channel::new([1], dtype::i32)
+            .capacity(channel_capacity() as u32)
+            .named("tok_out");
         let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
         let positions = Channel::from([n]).named("positions");
         let pages = Channel::from_iter(0..max_pages).named("pages");
@@ -201,7 +163,6 @@ async fn main(input: Input) -> Result<Output> {
         let w_slot = Channel::from([n / page_size]).named("w_slot");
         let w_off = Channel::from([n % page_size]).named("w_off");
         let kv_len = Channel::from([n + 1]).named("kv_len");
-        let tok_out = Channel::new([1], dtype::i32).named("tok_out");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &embed_indptr)?;
@@ -210,7 +171,7 @@ async fn main(input: Input) -> Result<Output> {
                 working_set: &ws,
                 geometry: KvGeometry {
                     readable_pages: ..,
-                    writable_pages: ..,
+                    writable_pages: (n / page_size)..,
                     kv_len: &kv_len,
                     pages: &pages,
                     page_indptr: &page_indptr,
@@ -230,25 +191,28 @@ async fn main(input: Input) -> Result<Output> {
             // `length` is the readable extent this fire runs at, so it is
             // also the position the NEXT fire's token sits at.
             let length = kv_len.take();
+            let token = greedy(intrinsics::logits());
             let next_length = &length + 1u32;
             let page_count = next_length.div_ceil(page_size);
+            tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
             w_slot.put(&length / page_size);
             w_off.put(&length % page_size);
             page_indptr.put(indptr(1, &page_count));
-            tok_out.put(&greedy(intrinsics::logits()));
+            tok_out.put(&token);
         });
 
-        loop {
-            fwd.submit(&pipe).context("decode submit")?;
-            let token = tok_out.take_host::<i32>().await.context("decode drain")?;
+        let budget = max_tokens - 1;
+        run_ahead(&pipe, &fwd, budget, async || {
+            let token = tok_out
+                .take_host::<i32>()
+                .await
+                .with_context(|| format!("decode drain @{}", generated.len()))?;
             generated.push(token as u32);
-            if generated.len() >= max_tokens {
-                break;
-            }
-            tok_in.put([token]);
-        }
+            Ok(ControlFlow::Continue(()))
+        })
+        .await?;
     }
     pipe.close();
 

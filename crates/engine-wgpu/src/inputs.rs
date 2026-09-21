@@ -53,6 +53,8 @@ pub struct Handles {
 
     pub positions: Tensor,
 
+    pub readout_rows: Tensor,
+
     pub windows: u32,
 
     pub spaces: Vec<SpaceHandles>,
@@ -117,6 +119,8 @@ pub struct Fire<'a> {
 
     pub positions: &'a [i32],
 
+    pub readout_rows: &'a [i32],
+
     pub windows: &'a [i32],
 
     pub slot_ids: &'a [i32],
@@ -159,6 +163,7 @@ pub struct Inputs {
     store: Buffer,
     tokens: u64,
     positions: u64,
+    readout_rows: u64,
     windows: u64,
     window_ints: u64,
     row_valid: u64,
@@ -209,6 +214,7 @@ impl Inputs {
         };
         let tokens = take(rows * 4);
         let positions = take(rows * 4);
+        let readout_rows = take(rows * 4);
         let windows = take(window_ints * 4);
         let row_valid = take(rows);
         let slot_ids = take(lanes * 4);
@@ -258,6 +264,7 @@ impl Inputs {
             store,
             tokens,
             positions,
+            readout_rows,
             windows,
             window_ints,
             row_valid,
@@ -295,6 +302,15 @@ impl Inputs {
 
         self.store.write(self.tokens, bytes_of(fire.tokens))?;
         self.store.write(self.positions, bytes_of(fire.positions))?;
+        if fire.readout_rows.len() > rows as usize {
+            return Err(Fault::Ceiling {
+                what: "readout rows in one fire",
+                need: fire.readout_rows.len() as u64,
+                have: u64::from(rows),
+            });
+        }
+        self.store
+            .write(self.readout_rows, bytes_of(fire.readout_rows))?;
         if fire.windows.len() as u64 > self.window_ints {
             return Err(Fault::Ceiling {
                 what: "packed window boundaries",
@@ -536,6 +552,12 @@ impl Inputs {
         Ok(Handles {
             tokens: i32s(handles, &self.store, self.tokens, rows)?,
             positions: i32s(handles, &self.store, self.positions, rows)?,
+            readout_rows: i32s(
+                handles,
+                &self.store,
+                self.readout_rows,
+                fire.readout_rows.len().max(1) as u32,
+            )?,
 
             windows: handles.bind(&self.store, self.windows, fire.windows.len() as u64 * 4)?,
             spaces,

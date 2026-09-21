@@ -155,7 +155,17 @@ is not enough.  Step 3 has to take these out, and here is what it takes out:
     attention/decode.cuh                  the two `q + batch_idx * q_stride_n`
                                           in the batch decode device function
                                           become
-                                          `q + params.q_indptr[batch_idx] * ...`.
+                                          `q + params.q_indptr[batch_idx] * ...`;
+                                          and, once `chunk_start`/`chunk_end`
+                                          are known, a block whose tile starts
+                                          at or past `kv_len` stores the empty
+                                          state's partial and returns. A body
+                                          replayed from a CUDA graph keeps the
+                                          tile split of the lengths it was
+                                          captured with; a shorter request has
+                                          tiles past its end, and upstream's
+                                          `chunk_end - chunk_start` wraps to
+                                          ~4e9 there.
     attention/cascade.cuh                 a trailing
                                           `const uint32_t* __restrict__ win`
                                           on the two Persistent kernels, the

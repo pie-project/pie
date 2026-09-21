@@ -1,9 +1,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::encode::Mark;
 use crate::error::{Fault, Result};
 
-use super::ctx::{Context, Core, STAGING_BYTES, note_reservation};
+use super::ctx::{Context, Core, note_reservation};
+use super::host::Signal;
+
+#[cfg(not(target_arch = "wasm32"))]
+const PREAD_CHUNK: u64 = 256 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Memory {
@@ -12,6 +17,8 @@ pub enum Memory {
     Host,
 
     Staging,
+
+    Readback,
 }
 
 static IDS: AtomicU64 = AtomicU64::new(1);
@@ -38,11 +45,16 @@ impl Raw {
                 have: core.limits.max_buffer_size,
             });
         }
-        let mappable = kind != Memory::Device && core.enabled.mappable_primary;
-        let mut usage = wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_SRC
-            | wgpu::BufferUsages::COPY_DST;
-        if mappable {
+        let mappable =
+            kind == Memory::Readback || (kind != Memory::Device && core.enabled.mappable_primary);
+        let mut usage = if kind == Memory::Readback {
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST
+        } else {
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST
+        };
+        if mappable && kind != Memory::Readback {
             usage |= wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE;
         }
         let buffer = core.device.create_buffer(&wgpu::BufferDescriptor {
@@ -104,7 +116,11 @@ impl Raw {
             self.core.queue.write_buffer(&self.buffer, offset, bytes);
             return Ok(());
         }
+        self.write_unaligned(offset, bytes)
+    }
 
+    fn write_unaligned(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        let len = bytes.len() as u64;
         let start = offset & !3;
         let end = (offset + len).next_multiple_of(4).min(self.size);
         let mut window = vec![0u8; (end - start) as usize];
@@ -120,69 +136,86 @@ impl Raw {
         if into.is_empty() {
             return Ok(());
         }
-
-        let core = &self.core;
-        let mut guard = core
-            .staging
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let staging = core.staging(&mut guard);
-        let mut at = 0u64;
-        let total = into.len() as u64;
-        while at < total {
-            let want = (total - at).min(STAGING_BYTES - 8);
-            let from = offset + at;
-            let start = from & !3;
-            let end = (from + want).next_multiple_of(4).min(self.size);
-            let len = end - start;
-            let mut encoder = core
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("pie read"),
-                });
-            encoder.copy_buffer_to_buffer(&self.buffer, start, staging, 0, Some(len));
-
-            let t0 = std::time::Instant::now();
-            let index = core.queue.submit(std::iter::once(encoder.finish()));
-            crate::encode::record_read_phase(0, t0.elapsed().as_nanos() as u64);
-            let (tx, rx) = std::sync::mpsc::channel();
-            staging
-                .slice(0..len)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let _ = tx.send(result);
-                });
-            let t1 = std::time::Instant::now();
-            core.wait_for(&index)?;
-            crate::encode::record_read_phase(1, t1.elapsed().as_nanos() as u64);
-            let t2 = std::time::Instant::now();
-            let mapped = loop {
-                match rx.try_recv() {
-                    Ok(result) => break result,
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        core.device
-                            .poll(wgpu::PollType::Poll)
-                            .map_err(|e| core.fault("Device::poll", e))?;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        return Err(core.fault("map_async", "the map callback never ran"));
-                    }
-                }
-            };
-            mapped.map_err(|e| core.fault("map_async", e))?;
-            crate::encode::record_read_phase(2, t2.elapsed().as_nanos() as u64);
-            {
-                let view = staging
-                    .slice(0..len)
-                    .get_mapped_range()
-                    .map_err(|e| core.fault("get_mapped_range", e))?;
-                let skip = (from - start) as usize;
-                let take = (end - from).min(want) as usize;
-                into[at as usize..at as usize + take].copy_from_slice(&view[skip..skip + take]);
-                at += take as u64;
-            }
-            staging.unmap();
-        }
+        let back = Signal::new();
+        let deliver = back.clone();
+        self.read_async(offset, into.len() as u64, move |raw| deliver.notify(raw));
+        let raw = back.park("Buffer::read")??;
+        into.copy_from_slice(&raw[..into.len()]);
         Ok(())
+    }
+
+    pub(crate) fn read_async(
+        &self,
+        offset: u64,
+        len: u64,
+        on_read: impl FnOnce(Result<Vec<u8>>) + Send + 'static,
+    ) {
+        if let Err(fault) = self.span(offset, len) {
+            return on_read(Err(fault));
+        }
+        if len == 0 {
+            return on_read(Ok(Vec::new()));
+        }
+        let core = &self.core;
+        let start = offset & !3;
+        let end = (offset + len).next_multiple_of(4).min(self.size);
+        let span = end - start;
+        let skip = (offset - start) as usize;
+        let take = len as usize;
+        if self.kind == Memory::Readback {
+            let mapped = self.buffer.clone();
+            let core = Arc::clone(core);
+            self.buffer
+                .slice(start..end)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let read = result
+                        .map_err(|e| core.fault("map_async", e))
+                        .and_then(|()| {
+                            let view = mapped
+                                .slice(start..end)
+                                .get_mapped_range()
+                                .map_err(|e| core.fault("get_mapped_range", e))?;
+                            Ok(view[skip..skip + take].to_vec())
+                        });
+                    mapped.unmap();
+                    on_read(read);
+                });
+            self.core.kick();
+            return;
+        }
+        core.destroy_spent();
+        let staging = core.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pie read"),
+            size: span,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = core
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pie read"),
+            });
+        encoder.copy_buffer_to_buffer(&self.buffer, start, &staging, 0, Some(span));
+        core.queue.submit(std::iter::once(encoder.finish()));
+        let mapped = staging.clone();
+        let core = Arc::clone(core);
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let read = result
+                    .map_err(|e| core.fault("map_async", e))
+                    .and_then(|()| {
+                        let view = mapped
+                            .slice(..)
+                            .get_mapped_range()
+                            .map_err(|e| core.fault("get_mapped_range", e))?;
+                        Ok(view[skip..skip + take].to_vec())
+                    });
+                mapped.unmap();
+                core.spend(mapped);
+                on_read(read);
+            });
+        self.core.kick();
     }
 
     pub(crate) fn zero(&self, offset: u64, len: u64) -> Result<()> {
@@ -207,6 +240,8 @@ impl Raw {
 impl Drop for Raw {
     fn drop(&mut self) {
         self.core.allocated.fetch_sub(self.size, Ordering::Relaxed);
+        // A browser frees the memory only when the JS wrapper is collected.
+        self.buffer.destroy();
     }
 }
 
@@ -271,9 +306,9 @@ impl Buffer {
 
     pub fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
         self.span(offset, bytes.len() as u64)?;
-        let started = std::time::Instant::now();
+        let started = Mark::now();
         let out = self.slab.write(offset, bytes);
-        crate::encode::record_io(true, started.elapsed().as_nanos() as u64);
+        crate::encode::record_io(true, started.ns());
         out
     }
 
@@ -284,10 +319,26 @@ impl Buffer {
 
     pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
         self.span(offset, into.len() as u64)?;
-        let started = std::time::Instant::now();
+        let started = Mark::now();
         let out = self.slab.read(offset, into);
-        crate::encode::record_io(false, started.elapsed().as_nanos() as u64);
+        crate::encode::record_io(false, started.ns());
         out
+    }
+
+    pub fn read_async(
+        &self,
+        offset: u64,
+        len: u64,
+        on_read: impl FnOnce(Result<Vec<u8>>) + Send + 'static,
+    ) {
+        if let Err(fault) = self.span(offset, len) {
+            return on_read(Err(fault));
+        }
+        self.slab.read_async(offset, len, on_read);
+    }
+
+    pub(crate) fn queue_verdict(&self) -> Result<()> {
+        self.slab.core.take_error("submission")
     }
 
     pub fn write_from_file(
@@ -315,6 +366,26 @@ pub struct FileWriter {
 }
 
 impl FileWriter {
+    #[cfg(target_arch = "wasm32")]
+    pub fn pread(
+        &self,
+        _file: &std::fs::File,
+        jobs: &[(u64, u64, u64)],
+        _threads: usize,
+    ) -> Result<()> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        for &(into, _, len) in jobs {
+            self.slab.span(into, len)?;
+        }
+        Err(Fault::Device {
+            call: "pread",
+            why: "a browser host has no file to read positionally".to_string(),
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn pread(
         &self,
         file: &std::fs::File,
@@ -332,7 +403,7 @@ impl FileWriter {
         for &(into, from, len) in jobs {
             let mut at = 0u64;
             while at < len {
-                let piece = (len - at).min(STAGING_BYTES);
+                let piece = (len - at).min(PREAD_CHUNK);
                 let dst = into + at;
                 let src = from + at;
 
@@ -380,6 +451,7 @@ impl FileWriter {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn pread_jobs(file: &std::fs::File, jobs: &[(usize, u64, u64)], threads: usize) -> Result<()> {
     let threads = threads.clamp(1, jobs.len().max(1));
     let per = jobs.len().div_ceil(threads).max(1);
@@ -408,6 +480,7 @@ fn pread_jobs(file: &std::fs::File, jobs: &[(usize, u64, u64)], threads: usize) 
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 unsafe fn pread_all(file: &std::fs::File, dst: *mut u8, from: u64, len: u64) -> Result<()> {
     let mut done = 0u64;
     while done < len {

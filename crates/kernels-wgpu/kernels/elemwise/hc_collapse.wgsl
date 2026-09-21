@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 const HC_MAX_MULT = 8u;
 
@@ -41,3 +41,4 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
+// pie:instantiate hc_collapse_bf16 PIE_GROUP_X=256

@@ -1,4 +1,5 @@
-
+//#include "common/bf16.inc.wgsl"
+//#include "common/reduce.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> z: array<u32>;
@@ -38,12 +39,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         let zr = pie_bf16_at(z[(base + i) >> 1u], base + i);
         let e = 1.0 / (1.0 + exp(-abs(zr)));
         let sig = select(e, 1.0 - e, zr < 0.0);
-
+//#if defined(PIE_SIGMOID)
         let gate = sig;
-
+//#else
         let gate = zr * sig;
-
+//#endif
         store_out(base + i, (x[base + i] * inv) * w[i] * gate);
     }
 }
 
+// pie:instantiate gated_rms_f32_bf16 PIE_GROUP_X=256
+// pie:instantiate gated_rms_sigmoid_f32_bf16 PIE_GROUP_X=256 PIE_SIGMOID=1

@@ -1,4 +1,4 @@
-
+//#include "common/reduce.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read> normed: array<f32>;
 @group(0) @binding(1) var<storage, read> hc_fn: array<f32>;
@@ -26,3 +26,4 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
+// pie:instantiate hc_project PIE_GROUP_X=256

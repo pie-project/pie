@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
-use client::message::{ClientMessage, ServerMessage as WireServerMessage};
+use client_api::message::{ClientMessage, ServerMessage as WireServerMessage};
 use dashmap::DashMap;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
@@ -101,7 +101,7 @@ pub async fn recv_messages(
         return Ok(out);
     }
 
-    match tokio::time::timeout(Duration::from_millis(max_wait_ms), receiver.recv()).await {
+    match crate::rt::time::timeout(Duration::from_millis(max_wait_ms), receiver.recv()).await {
         Ok(Some(first)) => out.push(first),
         Ok(None) => return Ok(out),
         Err(_) => return Ok(out),

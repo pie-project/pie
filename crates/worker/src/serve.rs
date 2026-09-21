@@ -526,7 +526,6 @@ fn build_partner_bootstrap(
         transfer: user_cfg.offload.transfer,
         model_idx,
         page_size: metadata.page_size,
-        request_timeout_secs: user_cfg.runtime.request_timeout.as_secs(),
         max_outstanding: user_cfg.offload.max_outstanding_per_partner,
     })
 }

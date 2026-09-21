@@ -144,7 +144,7 @@ impl Drop for CopyCompletionGuard {
         let engine = self.engine;
         let ws = self.ws;
         let indexes = std::mem::take(&mut self.indexes);
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if !crate::rt::has_runtime() {
             Self::invalidate(model, engine, ws, &indexes);
             if let Some(lease) = lease {
                 std::mem::forget(lease);
@@ -154,7 +154,7 @@ impl Drop for CopyCompletionGuard {
             );
             return;
         };
-        runtime.spawn(async move {
+        crate::rt::spawn(async move {
             let _ = completion.await;
             Self::invalidate(model, engine, ws, &indexes);
             drop(lease);
@@ -891,7 +891,7 @@ pub(crate) async fn seat_lane_slots(
     ws: crate::store::kv::page_table::WorkingSetId,
 ) -> Result<(), String> {
     use crate::store::seat::SeatError;
-    let deadline = tokio::time::Instant::now() + SEAT_WAIT;
+    let deadline = crate::rt::time::Instant::now() + SEAT_WAIT;
     loop {
         let mut freed = Box::pin(stores.seats_freed.notified());
         freed.as_mut().enable();
@@ -907,7 +907,7 @@ pub(crate) async fn seat_lane_slots(
                 "pipeline: seating this fire's lanes: {refusal}; no release can seat it"
             ));
         }
-        let now = tokio::time::Instant::now();
+        let now = crate::rt::time::Instant::now();
         if now >= deadline {
             return Err(format!(
                 "pipeline: seating this fire's lanes: {refusal}; waited {:?} for a peer to \
@@ -915,7 +915,7 @@ pub(crate) async fn seat_lane_slots(
                 SEAT_WAIT
             ));
         }
-        let _ = tokio::time::timeout(deadline - now, freed).await;
+        let _ = crate::rt::time::timeout(deadline - now, freed).await;
     }
 }
 
@@ -1051,12 +1051,21 @@ impl Drop for TicketReservation {
     }
 }
 
+fn trace_channel_wait(waiting_on_reader: bool, waiting_on_fire: bool) {
+    tracing::debug!(
+        waiting_on_reader,
+        waiting_on_fire,
+        "guest parks on a channel"
+    );
+}
+
 pub(crate) async fn await_channel_progress(
     cell: &Arc<Mutex<crate::pipeline::channel::ChannelCell>>,
     fires: Option<&PendingFires>,
 ) -> Result<(), String> {
     let wait = cell.lock().unwrap().reader_wait_state();
     let oldest = fires.and_then(|f| f.lock().unwrap().front().map(|op| op.completion_signal()));
+    trace_channel_wait(wait.is_some(), oldest.is_some());
     match (wait, oldest) {
         (Some((endpoint, observed_tail)), Some(signal)) => {
             tokio::select! {
@@ -1140,10 +1149,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 )));
             }
             let device_resolved = match &p.decode_envelope {
-                Some(envelope) if envelope.device_fold_len => {
-                    PortMask::of(&[Port::EmbedTokens, Port::RsFoldLen])
+                Some(envelope) => {
+                    let mut ports = PortMask::of(&[Port::EmbedTokens]);
+                    if envelope.device_fold_len {
+                        ports = ports.with(Port::RsFoldLen);
+                    }
+                    if envelope.device_mask {
+                        ports = ports.with(Port::AttnMask);
+                    }
+                    ports
                 }
-                Some(_) => PortMask::of(&[Port::EmbedTokens]),
                 None => PortMask::NONE,
             };
             let geometry_clock = crate::scheduler::probe::ProbeClock::start();
@@ -1532,6 +1547,7 @@ pub async fn submit_frame<C: FireContext>(
     this: Resource<Pipeline>,
     slot_reps: Vec<Option<u32>>,
 ) -> Anyhow<Result<(), String>> {
+    tracing::debug!("guest submits a frame");
     let k = crate::scheduler::configured_frame_size();
     if slot_reps.len() != k {
         return Ok(Err(format!(
@@ -2790,7 +2806,7 @@ pub(crate) mod lifecycle_tests {
         } else {
             // The completion owns this terminal cell for the entire write.
             unsafe {
-                (*completion.terminal_cell_ptr())
+                (*completion.terminal_cell_ptr().0)
                     .publish(crate::engine::completion::TERMINAL_OUTCOME_SUCCESS);
             }
             completion

@@ -6,10 +6,12 @@ pub(crate) mod linker;
 pub mod process;
 pub mod program;
 pub(crate) mod python;
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) mod sandbox;
 
 pub use process::ProcessId;
 pub(crate) use process::{ProcessCtx, ProcessEvent};
 pub(crate) use program::Manifest;
 pub use program::ProgramName;
+#[cfg_attr(target_arch = "wasm32", allow(unused_imports))]
 pub(crate) use sandbox::InstancePolicy;

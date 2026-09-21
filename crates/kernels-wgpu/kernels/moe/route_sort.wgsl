@@ -1,7 +1,8 @@
-
+//#include "common/bf16.inc.wgsl"
 
 const ROUTER_MAX_EXPERTS = 1024u;
 
+//#if defined(PIE_ROUTE_SORT)
 @group(0) @binding(0) var<storage, read> expert_ids: array<i32>;
 @group(0) @binding(1) var<storage, read_write> perm: array<i32>;
 @group(0) @binding(2) var<storage, read_write> row_expert: array<i32>;
@@ -89,6 +90,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>) {
     }
 }
 
+//#elif defined(PIE_ROUTE_GATHER)
 @group(0) @binding(0) var<storage, read> x: array<u32>;
 @group(0) @binding(1) var<storage, read_write> out_: array<u32>;
 @group(0) @binding(2) var<storage, read> perm: array<i32>;
@@ -132,6 +134,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     out_[word] = lo | (hi << 16u);
 }
 
+//#else
 @group(0) @binding(0) var<storage, read> sorted: array<u32>;
 @group(0) @binding(1) var<storage, read_write> y: array<u32>;
 @group(0) @binding(2) var<storage, read> inv: array<i32>;
@@ -162,5 +165,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     y[word] = sorted[u32(at) * half_width + c2];
 }
+//#endif
 
-
+// pie:instantiate route_sort PIE_ROUTE_SORT=1
+// pie:instantiate route_gather PIE_ROUTE_GATHER=1
+// pie:instantiate route_scatter PIE_ROUTE_SCATTER=1

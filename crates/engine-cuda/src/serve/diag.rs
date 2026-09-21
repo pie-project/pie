@@ -4,9 +4,9 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostics {
     pub golden_probe: bool,
-    pub golden_skip: bool,
     pub arm_trace: bool,
     pub ptr_trace: Option<String>,
+    pub arm_bench: Option<String>,
     pub graph_dot: Option<PathBuf>,
     pub grid_trace: Option<String>,
     pub plan_trace: Option<String>,
@@ -23,9 +23,9 @@ impl Default for Diagnostics {
     fn default() -> Diagnostics {
         Diagnostics {
             golden_probe: false,
-            golden_skip: false,
             arm_trace: false,
             ptr_trace: None,
+            arm_bench: None,
             graph_dot: None,
             grid_trace: None,
             plan_trace: None,
@@ -51,7 +51,6 @@ impl Diagnostics {
         let mut words: Vec<String> = Vec::new();
         for (word, on) in [
             ("golden-probe", self.golden_probe),
-            ("golden-skip", self.golden_skip),
             ("arm-trace", self.arm_trace),
             ("capture-serial", self.capture_serial),
             ("boundary-trace", self.boundary_trace),
@@ -65,6 +64,7 @@ impl Diagnostics {
         }
         for (word, value) in [
             ("ptr-trace", self.ptr_trace.clone()),
+            ("arm-bench", self.arm_bench.clone()),
             ("grid-trace", self.grid_trace.clone()),
             ("plan-trace", self.plan_trace.clone()),
             (
@@ -96,9 +96,9 @@ fn switch(word: &str, value: &str) -> std::result::Result<bool, String> {
     }
 }
 
-const WORDS: &str = "`golden-probe`, `golden-skip`, `arm-trace`, \
+const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `ptr-trace=<key substring>`, `graph-dot=<dir>`, `grid-trace=<key substring>`, \
-     `plan-trace=<rows|all>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
+     `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`";
 
 impl std::str::FromStr for Diagnostics {
@@ -117,7 +117,6 @@ impl std::str::FromStr for Diagnostics {
             };
             match word {
                 "golden-probe" => diag.golden_probe = switch(word, value)?,
-                "golden-skip" => diag.golden_skip = switch(word, value)?,
                 "arm-trace" => diag.arm_trace = switch(word, value)?,
                 "capture-serial" => diag.capture_serial = switch(word, value)?,
                 "boundary-trace" => diag.boundary_trace = switch(word, value)?,
@@ -126,7 +125,7 @@ impl std::str::FromStr for Diagnostics {
                 "nan-check" => diag.nan_check = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
                 "gumbel-direct" => diag.gumbel_direct = switch(word, value)?,
-                "ptr-trace" | "grid-trace" | "plan-trace" | "graph-dot" => {
+                "ptr-trace" | "grid-trace" | "plan-trace" | "graph-dot" | "arm-bench" => {
                     if value.is_empty() {
                         return Err(format!(
                             "`{word}` takes a value: `{word}=<{}>`",
@@ -139,6 +138,7 @@ impl std::str::FromStr for Diagnostics {
                     }
                     match word {
                         "ptr-trace" => diag.ptr_trace = Some(value.to_string()),
+                        "arm-bench" => diag.arm_bench = Some(value.to_string()),
                         "grid-trace" => diag.grid_trace = Some(value.to_string()),
                         "plan-trace" => diag.plan_trace = Some(value.to_string()),
                         _ => diag.graph_dot = Some(PathBuf::from(value)),

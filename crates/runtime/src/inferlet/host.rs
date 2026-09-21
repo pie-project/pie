@@ -17,6 +17,8 @@ pub mod types;
 
 use crate::inferlet::ProcessCtx;
 use wasmtime::component::HasSelf;
+#[cfg(target_arch = "wasm32")]
+use wasmtime_wasi as wasmtime_wasi_http;
 use wasmtime_wasi::WasiView;
 
 impl crate::pipeline::fire::FireContext for ProcessCtx {

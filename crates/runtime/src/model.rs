@@ -353,8 +353,20 @@ pub const ROWS: &[Row] = &[
         arch: "qwen3_5",
     },
     Row {
+        id: "qwen35-tiny-u4g64-kv-bf16",
+        layers: 4,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
         id: "qwen35-d2b-u4g64-kv-bf16",
         layers: 24,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen35-d4b-u4g64-kv-bf16",
+        layers: 32,
         vocab: 248_320,
         arch: "qwen3_5",
     },

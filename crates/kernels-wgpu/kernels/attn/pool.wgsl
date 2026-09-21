@@ -1,16 +1,20 @@
-
+//#include "common/bf16.inc.wgsl"
+//#include "common/reduce.inc.wgsl"
 
 fn pie_neg_inf() -> f32 {
-    return bitcast<f32>(0xff800000u);
+    // A `var`: Tint refuses a constant-folded infinity.
+    var bits = 0xff800000u;
+    return bitcast<f32>(bits);
 }
 
 fn byte_at(word: u32, i: u32) -> u32 {
     return (word >> ((i & 3u) * 8u)) & 0xffu;
 }
 
+//#if defined(PIE_POOL_BOUNDARY)
 
 @group(0) @binding(0) var<storage, read> positions: array<i32>;
-
+//#if defined(PIE_PREFILL)
 @group(0) @binding(1) var<storage, read> qo_indptr: array<u32>;
 @group(0) @binding(2) var<storage, read_write> out_pos: array<i32>;
 @group(0) @binding(3) var<storage, read_write> out_req: array<i32>;
@@ -23,7 +27,7 @@ struct Params {
     ratio: i32,
 }
 @group(0) @binding(6) var<uniform> params: Params;
-
+//#else
 @group(0) @binding(1) var<storage, read_write> out_pos: array<i32>;
 @group(0) @binding(2) var<storage, read_write> out_req: array<i32>;
 @group(0) @binding(3) var<storage, read_write> out_rope: array<i32>;
@@ -33,7 +37,7 @@ struct Params {
     ratio: i32,
 }
 @group(0) @binding(5) var<uniform> params: Params;
-
+//#endif
 
 @compute @workgroup_size(PIE_GROUP_X, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -46,7 +50,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let is_boundary = valid && (((p + 1) % params.ratio) == 0);
     out_pos[u32(t)] = select(-1, p, is_boundary);
     out_rope[u32(t)] = select(0, (p / params.ratio) * params.ratio, is_boundary);
-
+//#if defined(PIE_PREFILL)
     var lo = 0;
     var hi = params.num_requests;
     loop {
@@ -61,11 +65,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     out_req[u32(t)] = lo;
-
+//#else
     out_req[u32(t)] = t;
-
+//#endif
 }
 
+//#elif defined(PIE_POOL_STATE_WRITE)
 
 @group(0) @binding(0) var<storage, read> kv: array<u32>;
 @group(0) @binding(1) var<storage, read> score: array<u32>;
@@ -100,6 +105,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     state_score[dst] = score[src];
 }
 
+//#elif defined(PIE_POOL_GATHER)
 
 @group(0) @binding(0) var<storage, read> state_kv: array<u32>;
 @group(0) @binding(1) var<storage, read> state_score: array<u32>;
@@ -188,6 +194,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     out_[at] = pie_pack_bf16(pooled(d, bpos, req), pooled(d + 1, bpos, req));
 }
 
+//#elif defined(PIE_POOL_STORE)
 
 @group(0) @binding(0) var<storage, read> entries: array<u32>;
 @group(0) @binding(1) var<storage, read_write> comp_kv_pages: array<u32>;
@@ -219,12 +226,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     comp_kv_pages[(slot * u32(params.head_dim) + u32(d)) >> 1u] = entries[(c * u32(params.head_dim) + u32(d)) >> 1u];
 }
 
+//#else
 
 const PIE_POOL_HEAD_MAX = 512u;
 const PIE_PAIRS_PER_THREAD = PIE_POOL_HEAD_MAX / (2u * PIE_GROUP_X);
 @group(0) @binding(0) var<storage, read> q: array<u32>;
 @group(0) @binding(1) var<storage, read> comp_kv_pages: array<u32>;
-
+//#if defined(PIE_SELECTED)
 @group(0) @binding(2) var<storage, read> selection: array<i32>;
 @group(0) @binding(3) var<storage, read_write> out_: array<u32>;
 @group(0) @binding(4) var<storage, read_write> lse_out: array<f32>;
@@ -241,7 +249,7 @@ struct Params {
     scale: f32,
 }
 @group(0) @binding(9) var<uniform> params: Params;
-
+//#else
 @group(0) @binding(2) var<storage, read_write> out_: array<u32>;
 @group(0) @binding(3) var<storage, read_write> lse_out: array<f32>;
 @group(0) @binding(4) var<storage, read> positions: array<i32>;
@@ -256,7 +264,7 @@ struct Params {
     scale: f32,
 }
 @group(0) @binding(8) var<uniform> params: Params;
-
+//#endif
 
 var<workgroup> pie_pool_q: array<f32, PIE_POOL_HEAD_MAX>;
 var<workgroup> pie_pool_visible: i32;
@@ -267,15 +275,15 @@ fn pool_slot(req: i32, pos: i32) -> u32 {
 }
 
 fn key_of(n: i32, qi: u32, num_visible: i32) -> i32 {
-
+//#if defined(PIE_SELECTED)
     let c = selection[qi * u32(params.top_k) + u32(n)];
     if (c < 0 || c >= num_visible) {
         return -1;
     }
     return c;
-
+//#else
     return n;
-
+//#endif
 }
 
 @compute @workgroup_size(PIE_GROUP_X, 1, 1)
@@ -299,10 +307,11 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     workgroupBarrier();
     let num_visible = workgroupUniformLoad(&pie_pool_visible);
 
+//#if defined(PIE_SELECTED)
     var steps = params.top_k;
-
+//#else
     var steps = num_visible;
-
+//#endif
     if (num_visible <= 0) {
         steps = 0;
     }
@@ -377,5 +386,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
         }
     }
 }
+//#endif
 
-
+// pie:instantiate pool_boundary_decode PIE_POOL_BOUNDARY=1 PIE_GROUP_X=128
+// pie:instantiate pool_boundary_prefill PIE_POOL_BOUNDARY=1 PIE_PREFILL=1 PIE_GROUP_X=128
+// pie:instantiate pool_state_write_bf16 PIE_POOL_STATE_WRITE=1 PIE_GROUP_X=256
+// pie:instantiate pool_gather_paged_bf16 PIE_POOL_GATHER=1 PIE_GROUP_X=256
+// pie:instantiate pool_store_entries_bf16 PIE_POOL_STORE=1 PIE_GROUP_X=256
+// pie:instantiate pool_lse_paged PIE_GROUP_X=128
+// pie:instantiate pool_lse_selected_paged PIE_SELECTED=1 PIE_GROUP_X=128

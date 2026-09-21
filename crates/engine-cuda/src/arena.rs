@@ -3,30 +3,42 @@ use model_compiler::ArenaMap;
 use model_exec::store::arena::rect;
 use model_ir::ValueId;
 
-use crate::device::Buffer;
+use crate::device::elastic;
 use crate::error::{Fault, Result};
 use crate::run::SlotTable;
+use crate::store::Pools;
 
 #[derive(Debug)]
 pub struct Arena {
-    store: Buffer,
+    store: elastic::Arena,
+    committed: u64,
 }
 
 impl Arena {
-    pub fn reserve(map: &ArenaMap) -> Result<Arena> {
+    pub fn reserve(map: &ArenaMap, pools: &Pools) -> Result<Arena> {
         Ok(Arena {
-            store: Buffer::zeroed(usize::try_from(map.bytes).unwrap_or(usize::MAX))?,
+            store: pools.reserve_arena(map.bytes, "activation arena")?,
+            committed: 0,
         })
+    }
+
+    pub fn ensure(&mut self, pools: &mut Pools, bytes: u64) -> Result<()> {
+        if bytes <= self.committed {
+            return Ok(());
+        }
+        pools.commit_arena(&mut self.store, bytes)?;
+        self.committed = bytes;
+        Ok(())
     }
 
     #[must_use]
     pub fn base(&self) -> u64 {
-        self.store.ptr()
+        self.store.base()
     }
 
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.store.bytes() as u64
+        self.committed
     }
 
     #[must_use]
@@ -41,7 +53,34 @@ impl Arena {
             need: at,
             have: base,
         })?;
-        self.store.read(offset, into)
+        if offset.saturating_add(into.len() as u64) > self.committed {
+            return Err(Fault::Ceiling {
+                what: "bytes into the arena's committed prefix",
+                need: offset.saturating_add(into.len() as u64),
+                have: self.committed,
+            });
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::runtime::sys as rt;
+            // SAFETY: `at..at + len` lies inside the committed prefix.
+            unsafe {
+                crate::device::ctx::check(
+                    "cudaMemcpy",
+                    rt::cudaMemcpy(
+                        into.as_mut_ptr().cast(),
+                        at as *const core::ffi::c_void,
+                        into.len(),
+                        rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                    ),
+                )
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = into;
+            Err(Fault::Runtimeless)
+        }
     }
 }
 
@@ -61,7 +100,7 @@ pub fn carve(base: u64, map: &ArenaMap, rows: model_compiler::FireRows) -> SlotT
 mod tests {
     use model_compiler::{Budget, DeviceProfile, compile};
     use model_dsl::Platform;
-    
+
     use super::*;
 
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";

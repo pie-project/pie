@@ -151,6 +151,7 @@ pub struct PrefillPlan {
     pub window: Option<u32>,
     pub causal: bool,
     pub graph_capturable: bool,
+    pub graph_refusal: Option<String>,
     pub mask_indptr: Option<Tensor>,
     pub device: Device,
 }
@@ -428,17 +429,17 @@ pub fn plan_prefill(
         window_left: window.map(|w| w - 1),
     };
 
-    let (built, capturable) =
+    let (built, capturable, graph_refusal) =
         match sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes) {
-            Ok(built) => (built, enable_cuda_graph),
-            Err(_) if enable_cuda_graph => {
+            Ok(built) => (built, enable_cuda_graph, None),
+            Err(declined) if enable_cuda_graph => {
                 let req = sched_prefill::Request {
                     enable_cuda_graph: false,
                     ..req
                 };
                 let built =
                     sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
-                (built, false)
+                (built, false, Some(declined.to_string()))
             }
             Err(declined) => return Err(declined),
         };
@@ -466,6 +467,7 @@ pub fn plan_prefill(
         window,
         causal,
         graph_capturable: capturable,
+        graph_refusal,
         mask_indptr,
         device: *device,
     })

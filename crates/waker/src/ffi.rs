@@ -1,4 +1,4 @@
-#[cfg(panic = "abort")]
+#[cfg(all(panic = "abort", not(target_arch = "wasm32")))]
 compile_error!(
     "the waker's C ABI contract is `never unwinds, returns 0/1`, which is \
      implemented with `catch_unwind` and so requires `panic = \"unwind\"`"

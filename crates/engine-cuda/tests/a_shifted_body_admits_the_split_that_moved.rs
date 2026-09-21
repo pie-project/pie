@@ -1,4 +1,4 @@
-use engine_cuda::record::BodyKey;
+use engine_cuda::record::{BodyKey, Tiers};
 use engine_cuda::window::{Copies, Windows};
 use model_compiler::{Budget, CompiledModel, DeviceProfile, compile};
 use model_exec::fire::{Composition, Lane, compose};
@@ -255,6 +255,13 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
     );
 }
 
+fn plain() -> Tiers {
+    Tiers {
+        plain: model_ir::ClassSet::of(0..8usize),
+        wide: Box::new([]),
+    }
+}
+
 fn two_splits_of_one_key_move_a_launch_the_total_does_not() {
     let (trace, compiled) = baked();
     let first = split(&compiled, 5, 3);
@@ -267,8 +274,8 @@ fn two_splits_of_one_key_move_a_launch_the_total_does_not() {
         "and therefore a lattice point",
     );
     assert_eq!(
-        BodyKey::of_axes(first.classes(), first.bucket(), &no_decode_class(), LANES, None),
-        BodyKey::of_axes(second.classes(), second.bucket(), &no_decode_class(), LANES, None),
+        BodyKey::of_axes(first.classes(), first.bucket(), &no_decode_class(), LANES, &plain(), None),
+        BodyKey::of_axes(second.classes(), second.bucket(), &no_decode_class(), LANES, &plain(), None),
         "the two fires must reach the SAME body, or there is no hazard here",
     );
 

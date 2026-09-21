@@ -134,6 +134,7 @@ impl Shell {
             shifted: &self.shifted,
             schedule_readers: &self.schedule_readers,
             decoding: &self.decoding,
+            tiers: &self.tiers,
             seq,
         };
         super::btrace::mark("prepare_tail");
@@ -180,6 +181,7 @@ struct FireCtx<'a> {
     shifted: &'a [bool],
     schedule_readers: &'a [Option<u32>],
     decoding: &'a model_ir::ClassSet,
+    tiers: &'a record::Tiers,
     seq: u64,
 }
 
@@ -731,6 +733,7 @@ impl FireCtx<'_> {
                     lanes: forked,
                     conditionals,
                     decoding: self.decoding,
+                    tiers: self.tiers,
                     lane_ceiling: p.lane_ceiling,
                     towered: p.towered,
                     ceilings,

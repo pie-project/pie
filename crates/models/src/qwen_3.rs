@@ -41,6 +41,16 @@ pub fn skus() -> Vec<crate::Sku> {
             |tp: u32| Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
+            "qwen35-tiny",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::tiny(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
             "qwen35-d0.8b",
             1,
             [Dtype::U4g64],
@@ -59,6 +69,16 @@ pub fn skus() -> Vec<crate::Sku> {
             template::chatml,
             &tokenizer::CONTRACT,
             |tp: u32| Model::d2b(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
+            "qwen35-d4b",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::d4b(Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
             "qwen35-d9b-dflash",

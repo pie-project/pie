@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use client::message::ServerMessage;
+use client_api::message::ServerMessage;
 
 use crate::inferlet::process;
 use crate::inferlet::program;
@@ -26,7 +26,7 @@ impl Session {
 
     pub(super) async fn handle_query(&mut self, corr_id: u32, subject: String, _record: String) {
         match subject.as_str() {
-            client::message::QUERY_MODEL_STATUS => {
+            client_api::message::QUERY_MODEL_STATUS => {
                 let mut stats = serde_json::Map::new();
 
                 {
@@ -333,7 +333,7 @@ impl Session {
                     false,
                     format!(
                         "unknown query subject {subject:?} (known: {})",
-                        client::message::QUERY_MODEL_STATUS
+                        client_api::message::QUERY_MODEL_STATUS
                     ),
                 )
                 .await
@@ -492,6 +492,18 @@ impl Session {
                 return;
             }
             self.installed_programs.insert(program_name.clone());
+        }
+
+        if crate::store::registry::all_for_model(0).is_empty() {
+            self.send_response(
+                corr_id,
+                false,
+                "no engine is serving this model, so nothing can run a forward pass; \
+                 boot with an engine to launch programs"
+                    .to_string(),
+            )
+            .await;
+            return;
         }
 
         let client_id = if capture_outputs { Some(self.id) } else { None };
@@ -703,11 +715,14 @@ impl Session {
         name: Option<String>,
     ) {
         let file_hash = blake3::hash(&data).to_hex().to_string();
-        let total_chunks = data.len().div_ceil(client::message::CHUNK_SIZE_BYTES);
+        let total_chunks = data.len().div_ceil(client_api::message::CHUNK_SIZE_BYTES);
 
         let uuid_str = process_id.to_string();
 
-        for (i, chunk) in data.chunks(client::message::CHUNK_SIZE_BYTES).enumerate() {
+        for (i, chunk) in data
+            .chunks(client_api::message::CHUNK_SIZE_BYTES)
+            .enumerate()
+        {
             self.send(ServerMessage::File {
                 process_id: uuid_str.clone(),
                 file_hash: file_hash.clone(),

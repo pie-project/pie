@@ -896,7 +896,9 @@ impl<'c> Run<'c> {
         };
         ctx.arm(self.here());
         ctx.arm_stage(self.live_at());
-        ctx.arm_region(self.place.region.get());
+        let region = self.place.region.get();
+        ctx.arm_region(region);
+        ctx.arm_lane(self.place.lane.get());
         ctx
     }
 
@@ -1764,17 +1766,17 @@ impl<'c> Run<'c> {
         let standing = self.reading_standing(plan);
         let carve = standing.ceiling();
         let carve_lanes = standing.lane_carve();
+        let staged = self
+            .windows
+            .qo_absolute()
+            .map_or(0, |bounds| bounds.rows.saturating_sub(1))
+            .min((seat.kv_indptr.len() as u32).saturating_sub(1))
+            .min(seat.kv_len.len() as u32);
         let ceiling: Option<(u32, u32)> = standing
             .absolute()
             .then_some(carve_lanes)
             .flatten()
             .and_then(|(before, own)| {
-                let staged = self
-                    .windows
-                    .qo_absolute()
-                    .map_or(0, |bounds| bounds.rows.saturating_sub(1))
-                    .min((seat.kv_indptr.len() as u32).saturating_sub(1))
-                    .min(seat.kv_len.len() as u32);
                 let covered = staged.checked_sub(before)?;
                 Some((before, own.min(covered)))
             })
@@ -1812,7 +1814,7 @@ impl<'c> Run<'c> {
         let shape = Shape {
             num_requests: ceiling.map_or(span.lanes, |(_, lanes)| lanes),
             lane_offset: match ceiling {
-                Some((first, _)) => first,
+                Some((_, lanes)) => staged.saturating_sub(lanes),
                 None if standing.plane() => span.lane_offset,
                 None => 0,
             },
@@ -1939,6 +1941,17 @@ impl<'c> Run<'c> {
             StructSlot::Prefill(plan) => plan.graph_capturable,
             _ => true,
         })
+    }
+
+    pub(crate) fn uncapturable_why(&self) -> Vec<String> {
+        self.structs
+            .iter()
+            .flatten()
+            .filter_map(|(_, slot)| match slot {
+                StructSlot::Prefill(plan) => plan.graph_refusal.clone(),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) fn put(&mut self, id: ValueId, built: StructSlot) {

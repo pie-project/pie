@@ -207,6 +207,11 @@ impl Shell {
     }
 
     #[must_use]
+    pub fn buffer_capacity_bytes(&self) -> u64 {
+        self.buffers.as_ref().map_or(0, Buffers::capacity_bytes)
+    }
+
+    #[must_use]
     pub fn mode(&self) -> Graphs {
         self.graphs
     }

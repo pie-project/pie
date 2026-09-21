@@ -16,18 +16,48 @@ const MAX_ROUTES: u64 = 1 << 18;
 
 const COPY_THREADS: usize = 16;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Mapping {
     map: memmap2::Mmap,
 }
 
+#[cfg(target_arch = "wasm32")]
+pub struct Mapping {
+    never: std::convert::Infallible,
+}
+
 impl std::fmt::Debug for Mapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Mapping")
-            .field("len", &self.map.len())
-            .finish()
+        f.debug_struct("Mapping").field("len", &self.len()).finish()
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+impl Mapping {
+    pub fn open(path: &std::path::Path) -> Result<Mapping> {
+        Err(Fault::Device {
+            call: "mmap",
+            why: format!("{}: a browser host maps no file", path.display()),
+        })
+    }
+
+    #[must_use]
+    pub fn bytes(&self, _offset: u64, _len: u64) -> Option<&[u8]> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self.never {}
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Mapping {
     pub fn open(path: &std::path::Path) -> Result<Mapping> {
         let file = std::fs::File::open(path).map_err(|e| Fault::Device {
@@ -623,11 +653,35 @@ fn copy_plane(map: &Mapping, plane: &HostPlane, into: usize) -> Result<()> {
     Ok(())
 }
 
+fn copy_row_at(map: &Mapping, plane: &HostPlane, seat: usize, row: i32, into: usize) -> Result<()> {
+    if row < 0 || row as u32 >= plane.rows {
+        return Err(Fault::Ceiling {
+            what: "expert ids a route names",
+            need: u64::try_from(row).unwrap_or(u64::MAX),
+            have: u64::from(plane.rows),
+        });
+    }
+    plane.copy_row(
+        map,
+        row as u64,
+        (into + seat * plane.per as usize) as *mut u8,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn copy_rows(map: &Mapping, plane: &HostPlane, unique: &[i32], into: usize) -> Result<()> {
+    let _ = COPY_THREADS;
+    for (seat, &row) in unique.iter().enumerate() {
+        copy_row_at(map, plane, seat, row, into)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn copy_rows(map: &Mapping, plane: &HostPlane, unique: &[i32], into: usize) -> Result<()> {
     if unique.is_empty() {
         return Ok(());
     }
-    let per = plane.per as usize;
     let threads = COPY_THREADS.min(unique.len());
     let chunk = unique.len().div_ceil(threads);
     let faults: Vec<Result<()>> = std::thread::scope(|scope| {
@@ -637,16 +691,7 @@ fn copy_rows(map: &Mapping, plane: &HostPlane, unique: &[i32], into: usize) -> R
             .map(|(at, rows)| {
                 scope.spawn(move || {
                     for (i, &row) in rows.iter().enumerate() {
-                        let seat = at * chunk + i;
-                        if row < 0 || row as u32 >= plane.rows {
-                            return Err(Fault::Ceiling {
-                                what: "expert ids a route names",
-                                need: u64::try_from(row).unwrap_or(u64::MAX),
-                                have: u64::from(plane.rows),
-                            });
-                        }
-
-                        plane.copy_row(map, row as u64, (into + seat * per) as *mut u8)?;
+                        copy_row_at(map, plane, at * chunk + i, row, into)?;
                     }
                     Ok(())
                 })
@@ -952,6 +997,7 @@ impl Plan {
         residency
             .admit_tiers(tiers)
             .map_err(|why| Fault::Residency(why.to_string()))?;
+        admit_streaming(tiers)?;
         Ok(Layout {
             tier,
             tiers,
@@ -959,6 +1005,24 @@ impl Plan {
             ring: pump,
         })
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn admit_streaming(_tiers: Tiers) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn admit_streaming(tiers: Tiers) -> Result<()> {
+    if tiers.host == 0 && tiers.spilled == 0 {
+        return Ok(());
+    }
+    Err(Fault::Residency(format!(
+        "this load would stream {} bytes of routed experts and {} bytes of spilled dense \
+         planes from the artifact between steps, and a browser host streams nothing: \
+         raise the device weight budget or serve a smaller checkpoint",
+        tiers.host, tiers.spilled
+    )))
 }
 
 pub struct Gathered {

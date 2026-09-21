@@ -32,6 +32,7 @@ members = [
 
     "crates/inferlet",
     "crates/inferlet-macros",
+    "crates/wasmtime-web",
 
     "crates/model-ir",
     "crates/model-dsl",
@@ -48,6 +49,8 @@ members = [
     "crates/engine-vulkan",
     "crates/kernels-wgpu",
     "crates/engine-wgpu",
+    "crates/web-std",
+    "crates/web",
 
     "sdk/server/python",
 ]

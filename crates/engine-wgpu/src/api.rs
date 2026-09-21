@@ -75,6 +75,8 @@ pub struct Wgpu {
     programs: crate::program::Plane,
 
     adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
+
+    handed: Option<crate::device::Handed>,
 }
 
 impl Wgpu {
@@ -91,6 +93,19 @@ impl Wgpu {
             pending: None,
             programs: crate::program::Plane::default(),
             adapters: BTreeMap::new(),
+            handed: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_device(
+        boot: DeviceBoot,
+        contract_for: ContractFor,
+        handed: crate::device::Handed,
+    ) -> Wgpu {
+        Wgpu {
+            handed: Some(handed),
+            ..Wgpu::new(boot, contract_for)
         }
     }
 
@@ -201,11 +216,17 @@ fn fault(fault: Fault) -> Error {
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
         Fault::Program { .. } => Error::Program(fault.to_string()),
-        Fault::Wgpu { .. } | Fault::NoDevice { .. } => Error::Device(fault.to_string()),
+        Fault::Wgpu { .. } | Fault::NoDevice { .. } | Fault::Blocking { .. } => {
+            Error::Device(fault.to_string())
+        }
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
 
         Fault::Residency(_) => Error::Impossible(fault.to_string()),
     }
+}
+
+fn runahead_of(frames_in_flight: u8) -> engine::runahead::Runahead {
+    engine::runahead::Runahead::of(frames_in_flight.max(1))
 }
 
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
@@ -380,8 +401,7 @@ impl Engine for Wgpu {
             budgets,
             residency,
             ordinal,
-
-            frames_in_flight: _,
+            frames_in_flight,
         } = request;
 
         if ordinal > 0 {
@@ -411,9 +431,10 @@ impl Engine for Wgpu {
             slots: budgets.slots,
             pages: budgets.pages,
 
-            runahead: engine::runahead::Runahead::of(1),
+            runahead: runahead_of(frames_in_flight),
             device: &self.boot,
             residency,
+            handed: self.handed.take(),
         })
         .map_err(fault)?;
         let weights_resident = !shell.weights_stream();
@@ -464,7 +485,9 @@ impl Engine for Wgpu {
             },
             profile,
 
-            ports: PortMask::DECODE_ENVELOPE.with(eta_ir::registry::Port::RsFoldLen),
+            ports: PortMask::DECODE_ENVELOPE
+                .with(eta_ir::registry::Port::RsFoldLen)
+                .with(eta_ir::registry::Port::AttnMask),
             geometry: GeometryClass::DecodeEnvelope,
 
             kv_copy: KvCopyDomains {
@@ -475,7 +498,7 @@ impl Engine for Wgpu {
             },
             kv_handle: None,
             media_encode: false,
-            device_channel_commit: false,
+            device_channel_commit: true,
             rs_verbs: shell.serves_rs_verbs(),
             bidirectional_attention: false,
         };
@@ -502,7 +525,7 @@ impl Engine for Wgpu {
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         frame.validate_for(engine::fire::Serves {
-            device_channel_commit: false,
+            device_channel_commit: true,
             rs_verbs: self.caps.as_ref().is_some_and(|caps| caps.rs_verbs),
             bidirectional: false,
         })?;
@@ -512,6 +535,7 @@ impl Engine for Wgpu {
         self.pending = None;
 
         let mut steps = Vec::with_capacity(frame.steps.len());
+        tracing::debug!(frame = id, steps = frame.steps.len(), "wgpu submit");
         let mut pending = Vec::with_capacity(frame.steps.len());
         for (index, step) in frame.steps.iter().enumerate() {
             if let Some(next) = frame.steps.get(index + 1) {
@@ -522,28 +546,7 @@ impl Engine for Wgpu {
                 frame: id,
                 step: index as u32,
             };
-            let fired = self
-                .fire_step(step, at)
-                .and_then(|(ticket, mut step_pending)| {
-                    if !step.attachments.is_empty() {
-                        let shell = self.loaded_mut()?;
-                        let rows = shell.rows_of(&step_pending.landed).map_err(fault)?;
-
-                        let drafts = shell.draft_rows_of(&step_pending.landed);
-                        let mtp_width = shell.mtp_width();
-                        step_pending.rows = Some(rows);
-                        let landed = step_pending.landed;
-                        self.run_attachments(
-                            step,
-                            &readouts_of(&step_pending),
-                            drafts.as_deref(),
-                            mtp_width,
-                            &landed,
-                        )?;
-                    }
-                    Ok((ticket, step_pending))
-                });
-            match fired {
+            match self.fire_step(step, at) {
                 Ok((ticket, step_pending)) => {
                     steps.push(ticket);
                     pending.push(step_pending);
@@ -603,15 +606,10 @@ impl Engine for Wgpu {
             .iter()
             .map(|seed| (seed.channel, seed.bytes.clone()))
             .collect();
-        let landed = match self.programs.package(binding.program) {
-            Some(package) => {
-                let package = package.clone();
-                match self.shell.as_mut() {
-                    Some(shell) => adapter_of(shell, &package, bound.id, &seeds),
-                    None => Ok(None),
-                }
-            }
-            None => Ok(None),
+        let package = self.programs.package(binding.program).cloned();
+        let landed = match (package, self.shell.as_mut()) {
+            (Some(package), Some(shell)) => adapter_of(shell, &package, bound.id, &seeds),
+            _ => Ok(None),
         };
         match landed {
             Ok(Some(binding)) => {
@@ -671,9 +669,7 @@ impl Engine for Wgpu {
     }
 
     fn settles_asynchronously(&self) -> bool {
-        self.shell
-            .as_ref()
-            .is_some_and(|shell| shell.frames_in_flight() > 1)
+        true
     }
 
     fn on_complete(&mut self, sink: engine::CompletionSink) {
@@ -774,60 +770,45 @@ impl Engine for Wgpu {
 }
 
 impl Wgpu {
-    fn run_attachments(
+    #[cfg(feature = "wgpu")]
+    fn deferred_guests(
         &mut self,
-        step: &Step,
-        readouts: &[LaneReadout],
-        drafts: Option<&[Vec<f32>]>,
-        mtp_width: u32,
-        landed: &crate::serve::Landed,
-    ) -> EngineResult<()> {
-        let Wgpu {
-            shell, programs, ..
-        } = self;
-        for attachment in &step.attachments {
-            let readout = readouts.get(attachment.lane as usize);
-            let (logits, rows, vocab) = match readout {
-                Some(lane) if lane.rows > 0 => {
-                    (Some(lane.values.as_slice()), lane.rows, lane.width)
-                }
-                _ => (None, 0, 0),
-            };
-
-            let mtp_logits = drafts
-                .and_then(|lanes| lanes.get(attachment.lane as usize))
-                .filter(|values| !values.is_empty() && mtp_width > 0)
-                .map(Vec::as_slice);
-
-            #[cfg(feature = "wgpu")]
-            let (device, seat) = match shell.as_ref() {
-                Some(shell) => (
-                    Some(shell.device()),
-                    shell
-                        .readout_row(landed, attachment.lane)
-                        .map(|(seat, at, width)| crate::guest::run::Readout { seat, at, width }),
-                ),
-                None => (None, None),
-            };
-            programs
-                .fire(
-                    attachment.instance,
-                    logits,
-                    rows,
-                    vocab,
-                    mtp_logits,
-                    mtp_width,
-                    #[cfg(feature = "wgpu")]
-                    device,
-                    #[cfg(feature = "wgpu")]
-                    seat,
-                )
-                .map_err(refusal)?;
+        submission: &Step,
+    ) -> EngineResult<Option<crate::landing::Guests>> {
+        if submission.attachments.is_empty() {
+            return Ok(None);
         }
-        if let Some(shell) = shell.as_mut() {
-            shell.forget_seat(landed);
+        let device = self.loaded()?.device().clone();
+        let policies = submission
+            .lanes
+            .iter()
+            .map(|lane| lane.readout.clone())
+            .collect();
+        self.programs
+            .deferred(
+                &device,
+                submission
+                    .attachments
+                    .iter()
+                    .map(|attachment| (attachment.instance, attachment.lane)),
+                policies,
+            )
+            .map(Some)
+            .map_err(refusal)
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    fn deferred_guests(
+        &mut self,
+        submission: &Step,
+    ) -> EngineResult<Option<crate::landing::Guests>> {
+        if submission.attachments.is_empty() {
+            Ok(None)
+        } else {
+            Err(Error::Program(
+                "this build carries no wgpu device, so a guest pass has nowhere to run".into(),
+            ))
         }
-        Ok(())
     }
 
     fn fire_step(
@@ -874,18 +855,43 @@ impl Wgpu {
         self.next_fire = self.next_fire.wrapping_add(1);
 
         let mut resolved: Vec<Option<Vec<u32>>> = vec![None; submission.lanes.len()];
+        let mut resolved_masks: Vec<Option<engine::fire::Masking>> =
+            vec![None; submission.lanes.len()];
         for attachment in &submission.attachments {
-            let Some(lane) = submission.lanes.get(attachment.lane as usize) else {
-                return Err(Error::Invalid(format!(
-                    "attachment names lane {} of a {}-lane step",
-                    attachment.lane,
-                    submission.lanes.len()
-                )));
-            };
-            resolved[attachment.lane as usize] = self
+            let lane_count = self
                 .programs
-                .envelope_tokens(attachment.instance, lane.tokens.len())
+                .lane_count(attachment.instance)
                 .map_err(refusal)?;
+            for lane_at in 0..lane_count {
+                let lane_index = attachment.lane as usize + lane_at;
+                let Some(lane) = submission.lanes.get(lane_index) else {
+                    return Err(Error::Invalid(format!(
+                        "attachment names lane {} of a {}-lane step",
+                        lane_index,
+                        submission.lanes.len()
+                    )));
+                };
+                if lane_at == 0
+                    && !lane.channels.is_empty()
+                    && let Some(why) = self
+                        .programs
+                        .disagreeing_ticket(attachment.instance, &lane.channels)
+                {
+                    return Err(Error::Program(format!(
+                        "this fire's channel predictions and the engine's disagree: {why}"
+                    )));
+                }
+                resolved[lane_index] = self
+                    .programs
+                    .envelope_tokens(attachment.instance, lane.tokens.len(), lane_at)
+                    .map_err(refusal)?;
+                if lane.mask.is_none() {
+                    resolved_masks[lane_index] = self
+                        .programs
+                        .envelope_mask(attachment.instance, lane.tokens.len(), lane_at)
+                        .map_err(refusal)?;
+                }
+            }
         }
 
         let mut verbs: Vec<engine::fire::RsVerb> = submission
@@ -910,6 +916,8 @@ impl Wgpu {
                 *len = engine::fire::FoldLen::Host(n);
             }
         }
+
+        let guests = self.deferred_guests(submission)?;
 
         let sink = self.sink.clone();
 
@@ -959,7 +967,7 @@ impl Wgpu {
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                     captures_scores: lane.captures_scores,
 
-                    mask: lane.mask.as_ref(),
+                    mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
 
                     adapter: lane_adapters[at].or(lane.adapter),
                     positions: &lane.positions,
@@ -987,6 +995,7 @@ impl Wgpu {
                     attachments: &[],
                     media: &media,
                     done,
+                    guests,
                 },
                 None,
             )
@@ -1014,8 +1023,11 @@ impl Wgpu {
 }
 
 fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
-    let rows: &[Vec<f32>] = step.rows.as_deref().unwrap_or(&[]);
-    step.readout
+    lane_readouts(&step.readout, step.rows.as_deref().unwrap_or(&[]))
+}
+
+pub(crate) fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<LaneReadout> {
+    policies
         .iter()
         .enumerate()
         .map(|(lane, policy)| {

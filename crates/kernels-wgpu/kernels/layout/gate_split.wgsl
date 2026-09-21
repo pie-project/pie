@@ -24,3 +24,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     gate_out[out_row + h * hd + i] = qg[qg_row + h * 2u * hd + hd + i];
 }
 
+// pie:instantiate q_gate_split_bf16 PIE_GROUP_X=256

@@ -1,4 +1,5 @@
-
+//#include "common/bf16.inc.wgsl"
+//#include "common/reduce.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read> x: array<u32>;
 @group(0) @binding(1) var<storage, read_write> out_: array<u32>;
@@ -45,3 +46,4 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
     }
 }
 
+// pie:instantiate vnorm_single_row_bf16 PIE_GROUP_X=256 N_READS=4

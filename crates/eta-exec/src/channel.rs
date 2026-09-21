@@ -121,6 +121,21 @@ impl ChannelState {
         self.capacity
     }
 
+    #[must_use]
+    pub fn cell_bytes(&self) -> usize {
+        self.cell_bytes
+    }
+
+    #[must_use]
+    pub fn cells_ptr(&self) -> *const u8 {
+        self.cells.lock().expect(POISONED).as_ptr()
+    }
+
+    #[must_use]
+    pub fn words_ptr(&self) -> *const AtomicU64 {
+        self.words.as_ptr()
+    }
+
     fn slot_range(&self, sequence: u64) -> std::ops::Range<usize> {
         let base = (sequence % self.cap1 as u64) as usize * self.cell_bytes;
         base..base + self.cell_bytes

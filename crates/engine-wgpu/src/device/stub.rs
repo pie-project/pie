@@ -29,9 +29,17 @@ pub struct Context {
     never: std::convert::Infallible,
 }
 
+pub struct Handed {
+    never: std::convert::Infallible,
+}
+
 impl Context {
     pub fn bind(_boot: &DeviceBoot) -> Result<Context> {
         Err(Fault::Deviceless)
+    }
+
+    pub fn adopt(_boot: &DeviceBoot, handed: Handed) -> Result<Context> {
+        match handed.never {}
     }
 
     #[must_use]
@@ -130,10 +138,7 @@ impl Frame {
         match self.never {}
     }
 
-    pub fn commit_async(
-        self,
-        _on_done: Option<Box<dyn Fn(Option<String>) + Send + 'static>>,
-    ) -> Result<Pending> {
+    pub fn commit_async(self, _on_done: Option<OnDone>) -> Result<Pending> {
         match self.never {}
     }
 
@@ -152,6 +157,8 @@ impl Frame {
         match self.never {}
     }
 }
+
+pub type OnDone = Box<dyn FnOnce(Option<String>) + Send + 'static>;
 
 #[derive(Debug)]
 pub struct Pending {
@@ -174,6 +181,7 @@ pub enum Memory {
     Device,
     Host,
     Staging,
+    Readback,
 }
 
 #[derive(Clone, Debug)]
@@ -222,6 +230,19 @@ impl Buffer {
     }
 
     pub fn read(&self, _offset: u64, _into: &mut [u8]) -> Result<()> {
+        match self.never {}
+    }
+
+    pub fn read_async(
+        &self,
+        _offset: u64,
+        _len: u64,
+        _on_read: impl FnOnce(Result<Vec<u8>>) + Send + 'static,
+    ) {
+        match self.never {}
+    }
+
+    pub(crate) fn queue_verdict(&self) -> Result<()> {
         match self.never {}
     }
 

@@ -1,4 +1,4 @@
-
+//#include "common/bf16.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read> o1: array<u32>;
 @group(0) @binding(1) var<storage, read> lse1: array<f32>;
@@ -56,3 +56,4 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+// pie:instantiate merge_lse_combine_bf16 PIE_GROUP_X=256

@@ -122,7 +122,10 @@ async fn main(input: Input) -> Result<String> {
                 );
             }
             model::ForwardKind::Diffusion => {
-                return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+                return Err(
+                    "this program decodes a token at a time; a diffusion model wants a canvas loop"
+                        .into(),
+                );
             }
         };
         let rs_prefix = &rs_ws[..rs_ws.len().min(1)];
@@ -303,7 +306,13 @@ async fn main(input: Input) -> Result<String> {
 
             // Per-lane top-p + temperature sample over [B, vocab] logits
             // (row-wise nucleus, independent Gumbel noise per lane).
-            let logits = intrinsics::logits(); // [B, vocab]
+            // B=1 arrives squeezed to `[vocab]`; B>=2 must stay the bare intrinsic,
+            // or the fused nucleus fast path is skipped and the sample comes back empty.
+            let logits = if b == 1 {
+                reshape(intrinsics::logits(), [b, vocab])
+            } else {
+                intrinsics::logits()
+            }; // [B, vocab]
             let scaled = &logits / temperature;
             let probs = softmax(&scaled);
             let keep = pivot_threshold(&probs, cummass_le(top_p));

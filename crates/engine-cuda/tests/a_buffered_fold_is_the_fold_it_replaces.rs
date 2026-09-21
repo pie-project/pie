@@ -93,11 +93,12 @@ fn ready(what: &str) -> Option<Shell> {
     })
     .expect("the shell loads");
     eprintln!(
-        "{what}: buffered-activation pool is {:.2} MiB",
+        "{what}: buffered-activation pool spans {:.2} MiB, {:.2} MiB committed at load",
+        shell.buffer_capacity_bytes() as f64 / (1 << 20) as f64,
         shell.buffer_bytes() as f64 / (1 << 20) as f64,
     );
     assert!(
-        shell.buffer_bytes() > 0,
+        shell.buffer_capacity_bytes() > 0,
         "a GDN plan reserved no buffered-activation pool, so nothing below can be true"
     );
     Some(shell)
@@ -347,10 +348,12 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
         .zip(plain_row)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
+    let allowed = rounding_floor(plain_row);
     assert!(
-        worst <= 1e-3,
-        "the mixed fire's own outputs differ from the plain fold's by {worst} — the tail \
-         segment `[4, {WINDOW})` did not run, or did not continue from the boundary"
+        worst <= allowed,
+        "the mixed fire's own outputs differ from the plain fold's by {worst} (over the \
+         {allowed} bf16 rounding allows) — the tail segment `[4, {WINDOW})` did not run, \
+         or did not continue from the boundary"
     );
 }
 
@@ -390,7 +393,10 @@ fn one_fire_folds_the_lane_that_committed_and_not_the_lane_that_buffered() {
     );
 }
 
-const LOGIT_FLOOR: f32 = 2e-2;
+fn rounding_floor(logits: &[f32]) -> f32 {
+    let magnitude = logits.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+    4.0 * 2f32.powi(magnitude.log2().floor() as i32 - 7)
+}
 
 fn bank_gap(a: &[u8], b: &[u8]) -> (f32, usize, usize) {
     let cells = |bytes: &[u8]| -> Vec<f32> {
@@ -462,7 +468,10 @@ fn the_read_path_replays_the_buffer_it_folds() {
         argmax(&round[0]),
         argmax(&plain[0])
     );
-    assert!(d <= LOGIT_FLOOR, "the read path answers other logits than a plain fold of the prefix: {d}");
+    assert!(
+        d <= rounding_floor(&plain[0]),
+        "the read path answers other logits than a plain fold of the prefix: {d}"
+    );
 
     fire(&mut shell, &[seated(7, &second, fold_buffered_at(k, 6, 6), RsReset::Held)]).expect("B's buffer folds");
     let differing = folded_ab
@@ -502,5 +511,8 @@ fn the_read_path_replays_the_buffer_it_folds() {
     );
     let d = spread(&plain[0], &partial[0]);
     eprintln!("read path, truncated fold: last-row logit spread {d:.4}");
-    assert!(d <= LOGIT_FLOOR, "a truncated fold changed what the window computes: {d}");
+    assert!(
+        d <= rounding_floor(&plain[0]),
+        "a truncated fold changed what the window computes: {d}"
+    );
 }

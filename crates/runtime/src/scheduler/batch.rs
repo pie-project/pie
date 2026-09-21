@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::engine::completion::TerminalCell;
+use crate::engine::completion::CellPtr;
 use crate::engine::{FrameFire, SchedulerLimits, StepFire};
 use crate::scheduler::ProcessId;
 
@@ -15,7 +15,7 @@ pub(crate) struct StepBuild {
     pub(crate) instance_ids: Vec<u64>,
     pub(crate) boundary_programs: Vec<bool>,
     pub(crate) member_lane_indptr: Vec<u32>,
-    pub(crate) terminal_cells: Vec<*mut TerminalCell>,
+    pub(crate) terminal_cells: Vec<CellPtr>,
     pub(crate) logical_fire_ids: Vec<u64>,
 }
 

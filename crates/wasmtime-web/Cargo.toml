@@ -1,0 +1,35 @@
+[package]
+name = "wasmtime-web"
+version = "0.5.0"
+edition = "2024"
+
+[dependencies]
+wasmtime = { version = "48.0.1", default-features = false, features = [
+    "runtime",
+    "std",
+    "anyhow",
+    "async",
+    "cranelift",
+    "pulley",
+    "component-model",
+    "component-model-async",
+    "custom-fiber",
+    "custom-virtual-memory",
+] }
+cranelift-codegen = { version = "0.135.1", default-features = false }
+wasmtime-wasi-io = { version = "48.0.1" }
+getrandom = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+wasmtime = { version = "48.0.1", default-features = false, features = ["cranelift", "wat"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"

@@ -109,6 +109,22 @@ pub(crate) fn take(
     Ok(held.slabs[&(name, region, scope)].ptr)
 }
 
+#[must_use]
+pub fn census() -> Vec<(&'static str, usize)> {
+    let arenas = locked();
+    let mut by_name: HashMap<&'static str, usize> = HashMap::new();
+    for arena in arenas.values() {
+        for ((name, _, _), slab) in &arena.slabs {
+            *by_name.entry(name).or_insert(0) += slab.bytes;
+        }
+    }
+    let mut out: Vec<(&'static str, usize)> = by_name.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    out
+}
+
+const SLAB_GRAIN: usize = 8 << 20;
+
 fn grow(
     arena: &mut Arena,
     name: &'static str,
@@ -123,7 +139,7 @@ fn grow(
     if old_bytes >= bytes {
         return Ok(());
     }
-    let want = bytes.max(old_bytes.saturating_mul(2));
+    let want = bytes.div_ceil(SLAB_GRAIN).saturating_mul(SLAB_GRAIN);
     let mut fresh: *mut c_void = core::ptr::null_mut();
 
     // SAFETY: a live local out-parameter and a byte count this caller checked

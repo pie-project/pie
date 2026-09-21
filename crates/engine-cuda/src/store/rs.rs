@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use model_ir::{Attention, Dim, Dtype, Operands, Operation, Trace, Ty, ValueId};
 
 use crate::device::Buffer;
+use crate::device::elastic::Arena;
 use crate::error::{Fault, Result};
+use crate::store::Pools;
 use crate::store::kv::Paging;
 
 pub const PLANE_DTYPE: Dtype = Dtype::Bf16;
@@ -39,7 +41,8 @@ impl Planes {
 
 #[derive(Debug)]
 pub struct Buffers {
-    slab: Buffer,
+    arena: Arena,
+    committed_pages: u32,
     planes: Planes,
     page_tokens: u32,
     slots: u32,
@@ -49,7 +52,7 @@ pub struct Buffers {
 }
 
 impl Buffers {
-    pub fn reserve(trace: &Trace, paging: Paging) -> Result<Option<Buffers>> {
+    pub fn reserve(trace: &Trace, paging: Paging, pools: &Pools) -> Result<Option<Buffers>> {
         let Some((planes, per_token, layers)) = read(trace, paging.page_size)? else {
             return Ok(None);
         };
@@ -60,7 +63,8 @@ impl Buffers {
             .saturating_mul(u64::from(layers))
             .saturating_mul(ELEMENT);
         Ok(Some(Buffers {
-            slab: Buffer::zeroed(usize::try_from(bytes).unwrap_or(usize::MAX))?,
+            arena: pools.reserve_arena(bytes, "rs buffered activations")?,
+            committed_pages: 0,
             planes,
             page_tokens: paging.page_size,
             slots: paging.slots,
@@ -256,7 +260,35 @@ impl Buffers {
 
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.slab.bytes() as u64
+        self.arena.committed_bytes()
+    }
+
+    #[must_use]
+    pub fn capacity_bytes(&self) -> u64 {
+        self.per_page
+            .saturating_mul(u64::from(self.slots))
+            .saturating_mul(u64::from(self.layers))
+            .saturating_mul(ELEMENT)
+    }
+
+    pub fn ensure(&mut self, pools: &mut Pools, pages: u32) -> Result<()> {
+        if pages <= self.committed_pages {
+            return Ok(());
+        }
+        if pages > self.slots {
+            return Err(Fault::Ceiling {
+                what: "rs buffer page slots",
+                need: u64::from(pages),
+                have: u64::from(self.slots),
+            });
+        }
+        let bytes = u64::from(pages)
+            .saturating_mul(u64::from(self.layers))
+            .saturating_mul(self.per_page)
+            .saturating_mul(ELEMENT);
+        pools.commit_arena(&mut self.arena, bytes)?;
+        self.committed_pages = pages;
+        Ok(())
     }
 
     #[must_use]
@@ -279,9 +311,16 @@ impl Buffers {
                 have: u64::from(self.page_tokens),
             });
         }
-        let block = (u64::from(plane.layer) * u64::from(self.slots) + u64::from(page_slot))
+        if page_slot >= self.committed_pages {
+            return Err(Fault::Ceiling {
+                what: "rs buffer pages committed before this fire",
+                need: u64::from(page_slot) + 1,
+                have: u64::from(self.committed_pages),
+            });
+        }
+        let block = (u64::from(page_slot) * u64::from(self.layers) + u64::from(plane.layer))
             * self.per_page;
-        Ok(self.slab.ptr() + (block + plane.at + u64::from(row) * plane.width) * ELEMENT)
+        Ok(self.arena.base() + (block + plane.at + u64::from(row) * plane.width) * ELEMENT)
     }
 }
 
