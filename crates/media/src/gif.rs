@@ -1,8 +1,6 @@
 use image::AnimationDecoder;
 use image::codecs::gif::GifDecoder;
 
-/// One picture of an animation: `height * width * 3` bytes, RGB, row by
-/// row, and the second it is shown at.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
     pub rgb: Vec<u8>,
@@ -11,7 +9,6 @@ pub struct Frame {
     pub timestamp: f32,
 }
 
-/// Every frame of a GIF, in the order it plays.
 pub fn frames(bytes: &[u8]) -> Result<Vec<Frame>, String> {
     let decoder =
         GifDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| format!("gif decode: {e}"))?;
@@ -73,7 +70,6 @@ mod tests {
         assert!(why.contains("gif decode"), "{why}");
     }
 
-    /// A four by two GIF: one red frame, then a blue one.
     fn two_frames() -> Vec<u8> {
         use image::codecs::gif::GifEncoder;
         use image::{Delay, Frame as GifFrame, RgbaImage};

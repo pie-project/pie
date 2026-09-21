@@ -30,13 +30,8 @@ pub fn decode(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     Ok((rgb.into_raw(), width, height))
 }
 
-/// The filter the vision front-ends resample with: every picture that
-/// reaches a model goes through this one, so a change here changes what
-/// every model sees.
 const RESAMPLE: FilterType = FilterType::CatmullRom;
 
-/// `rgb`, a `width` x `height` picture, resampled to `target_width` x
-/// `target_height`.
 pub fn resize(
     rgb: &[u8],
     width: u32,
