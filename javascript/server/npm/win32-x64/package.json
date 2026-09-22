@@ -1,6 +1,6 @@
 {
   "name": "@pie-project/server-win32-x64",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "The win32-x64 native addon of @pie-project/server.",
   "main": "pie-server.node",
   "files": [

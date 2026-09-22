@@ -1,6 +1,6 @@
 {
   "name": "@pie-project/browser",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "pie in a browser tab: the runtime and the WebGPU engine as wasm, driven from the page and spoken to with @pie-project/client",
   "type": "module",
   "main": "dist/pie.mjs",
