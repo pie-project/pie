@@ -4,7 +4,6 @@ This module provides functions for working with Pie-specific paths and directori
 """
 
 import os
-import stat
 from pathlib import Path
 
 
@@ -26,23 +25,3 @@ def get_default_config_path() -> Path:
 def expand_tilde(path: str) -> Path:
     """Expand ~ in a path string to the user's home directory."""
     return Path(path).expanduser()
-
-
-def check_private_key_permissions(path: Path) -> None:
-    """Check that a private key file has secure permissions (0o600).
-
-    Raises:
-        PermissionError: If the file permissions are too permissive.
-    """
-    if os.name != "posix":
-        # Skip permission check on non-Unix systems
-        return
-
-    file_stat = path.stat()
-    mode = file_stat.st_mode & 0o777
-
-    if mode != 0o600:
-        raise PermissionError(
-            f"Private key file at '{path}' has insecure permissions: {oct(mode)}. "
-            f"Run: `chmod 600 '{path}'`"
-        )

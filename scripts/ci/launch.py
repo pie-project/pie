@@ -16,7 +16,7 @@ async def main() -> int:
     url, name = sys.argv[1], sys.argv[2]
     given = json.loads(sys.argv[3]) if len(sys.argv) > 3 else {"prompt": "The capital of France is", "max_tokens": 4}
     async with PieClient(url) as client:
-        await client.authenticate("ci", None)
+        await client.authenticate("ci")
         try:
             process = await client.launch_process(name, given)
             print("ok", str(await process.result())[:200])

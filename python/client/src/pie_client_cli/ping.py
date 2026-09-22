@@ -18,7 +18,6 @@ def handle_ping_command(
     host: Optional[str] = None,
     port: Optional[int] = None,
     username: Optional[str] = None,
-    private_key_path: Optional[Path] = None,
 ) -> None:
     """Handle the `pie-cli ping` command.
 
@@ -31,7 +30,6 @@ def handle_ping_command(
         host=host,
         port=port,
         username=username,
-        private_key_path=private_key_path,
     )
 
     url = f"ws://{client_config.host}:{client_config.port}"

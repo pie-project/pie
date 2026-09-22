@@ -61,14 +61,7 @@ PortOption = Annotated[
 
 UsernameOption = Annotated[
     Optional[str],
-    typer.Option("--username", help="The username to use for authentication."),
-]
-
-PrivateKeyPathOption = Annotated[
-    Optional[Path],
-    typer.Option(
-        "--private-key-path", help="Path to the private key file for authentication."
-    ),
+    typer.Option("--username", help="The username to identify as."),
 ]
 
 
@@ -101,7 +94,6 @@ def submit(
     host: HostOption = None,
     port: PortOption = None,
     username: UsernameOption = None,
-    private_key_path: PrivateKeyPathOption = None,
     no_output: Annotated[
         bool,
         typer.Option("-d", "--no-output", help="Don't capture the inferlet outputs."),
@@ -131,7 +123,6 @@ def submit(
             host=host,
             port=port,
             username=username,
-            private_key_path=expand_path(private_key_path),
             capture_outputs=not no_output,
             link=[expand_path(p) for p in link] if link else None,
             arguments=arguments,
@@ -164,7 +155,6 @@ def install(
     host: HostOption = None,
     port: PortOption = None,
     username: UsernameOption = None,
-    private_key_path: PrivateKeyPathOption = None,
     force: Annotated[
         bool,
         typer.Option(
@@ -184,7 +174,6 @@ def install(
             host=host,
             port=port,
             username=username,
-            private_key_path=expand_path(private_key_path),
             force=force,
         )
     except Exception as e:
@@ -203,7 +192,6 @@ def ping(
     host: HostOption = None,
     port: PortOption = None,
     username: UsernameOption = None,
-    private_key_path: PrivateKeyPathOption = None,
 ) -> None:
     """Check if the Pie engine is alive and responsive."""
     try:
@@ -212,7 +200,6 @@ def ping(
             host=host,
             port=port,
             username=username,
-            private_key_path=expand_path(private_key_path),
         )
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
@@ -230,7 +217,6 @@ def list_processes(
     host: HostOption = None,
     port: PortOption = None,
     username: UsernameOption = None,
-    private_key_path: PrivateKeyPathOption = None,
     full: Annotated[
         bool, typer.Option("--full", help="Display the full UUID.")
     ] = False,
@@ -245,7 +231,6 @@ def list_processes(
             host=host,
             port=port,
             username=username,
-            private_key_path=expand_path(private_key_path),
             full=full,
             long=long,
         )
@@ -268,7 +253,6 @@ def attach(
     host: HostOption = None,
     port: PortOption = None,
     username: UsernameOption = None,
-    private_key_path: PrivateKeyPathOption = None,
 ) -> None:
     """Attach to a running inferlet instance and stream its output."""
     try:
@@ -278,7 +262,6 @@ def attach(
             host=host,
             port=port,
             username=username,
-            private_key_path=expand_path(private_key_path),
         )
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
@@ -299,7 +282,6 @@ def abort(
     host: HostOption = None,
     port: PortOption = None,
     username: UsernameOption = None,
-    private_key_path: PrivateKeyPathOption = None,
 ) -> None:
     """Terminate a running inferlet instance."""
     try:
@@ -309,7 +291,6 @@ def abort(
             host=host,
             port=port,
             username=username,
-            private_key_path=expand_path(private_key_path),
         )
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
@@ -323,9 +304,6 @@ def abort(
 
 @config_app.command("init")
 def config_init(
-    enable_auth: Annotated[
-        bool, typer.Option("--enable-auth/--no-auth", help="Enable authentication.")
-    ] = True,
     path: Annotated[
         Optional[str],
         typer.Option("--path", help="Path where the config file should be saved."),
@@ -333,7 +311,7 @@ def config_init(
 ) -> None:
     """Create a default config file."""
     try:
-        config_cmd.handle_config_init(enable_auth=enable_auth, custom_path=path)
+        config_cmd.handle_config_init(custom_path=path)
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
@@ -348,14 +326,7 @@ def config_update(
         Optional[int], typer.Option("--port", help="Port to connect to.")
     ] = None,
     username: Annotated[
-        Optional[str], typer.Option("--username", help="Username for authentication.")
-    ] = None,
-    private_key_path: Annotated[
-        Optional[str],
-        typer.Option("--private-key-path", help="Path to private key file."),
-    ] = None,
-    enable_auth: Annotated[
-        Optional[bool], typer.Option("--enable-auth", help="Enable authentication.")
+        Optional[str], typer.Option("--username", help="Username to identify as.")
     ] = None,
     path: Annotated[
         Optional[str], typer.Option("--path", help="Path to the config file to update.")
@@ -367,8 +338,6 @@ def config_update(
             host=host,
             port=port,
             username=username,
-            private_key_path=private_key_path,
-            enable_auth=enable_auth,
             custom_path=path,
         )
     except Exception as e:

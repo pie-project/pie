@@ -189,7 +189,6 @@ def handle_submit_command(
     host: Optional[str] = None,
     port: Optional[int] = None,
     username: Optional[str] = None,
-    private_key_path: Optional[Path] = None,
     capture_outputs: bool = True,
     link: Optional[list[Path]] = None,
     arguments: Optional[list[str]] = None,
@@ -238,7 +237,6 @@ def handle_submit_command(
         host=host,
         port=port,
         username=username,
-        private_key_path=private_key_path,
     )
 
     client = engine.connect_and_authenticate(client_config)

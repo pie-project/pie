@@ -20,7 +20,6 @@ def handle_install_command(
     host: Optional[str] = None,
     port: Optional[int] = None,
     username: Optional[str] = None,
-    private_key_path: Optional[Path] = None,
     force: bool = False,
 ) -> None:
     """Handle the `pie-cli install` command.
@@ -49,7 +48,6 @@ def handle_install_command(
         host=host,
         port=port,
         username=username,
-        private_key_path=private_key_path,
     )
 
     client = engine.connect_and_authenticate(client_config)

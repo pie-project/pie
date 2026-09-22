@@ -18,7 +18,6 @@ def handle_abort_command(
     host: Optional[str] = None,
     port: Optional[int] = None,
     username: Optional[str] = None,
-    private_key_path: Optional[Path] = None,
 ) -> None:
     """Handle the `pie-cli abort` command.
 
@@ -34,7 +33,6 @@ def handle_abort_command(
         host=host,
         port=port,
         username=username,
-        private_key_path=private_key_path,
     )
 
     client = engine.connect_and_authenticate(client_config)

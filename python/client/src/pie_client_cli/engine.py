@@ -1,7 +1,7 @@
 """Engine client utilities for the Pie CLI.
 
-This module provides utilities for connecting to the Pie engine, authentication,
-and streaming inferlet output with signal handling.
+This module provides utilities for connecting to the Pie engine and streaming
+inferlet output with signal handling.
 """
 
 import asyncio
@@ -16,7 +16,6 @@ from typing import Optional
 import typer
 
 from pie_client import PieClient, Event, Process
-from pie_client.crypto import ParsedPrivateKey
 
 from . import path as path_utils
 from .config import ConfigFile
@@ -29,8 +28,6 @@ class ClientConfig:
     host: str
     port: int
     username: str
-    private_key: Optional[ParsedPrivateKey]
-    enable_auth: bool
 
     @classmethod
     def create(
@@ -39,7 +36,6 @@ class ClientConfig:
         host: Optional[str] = None,
         port: Optional[int] = None,
         username: Optional[str] = None,
-        private_key_path: Optional[Path] = None,
     ) -> "ClientConfig":
         """Create a ClientConfig, merging command-line args with config file.
 
@@ -47,7 +43,7 @@ class ClientConfig:
         """
         # Read config file if any parameter is missing
         config_file: Optional[ConfigFile] = None
-        if host is None or port is None or username is None or private_key_path is None:
+        if host is None or port is None or username is None:
             config_file_path = config_path or path_utils.get_default_config_path()
             if config_file_path.exists():
                 config_file = ConfigFile.load(config_file_path)
@@ -63,43 +59,7 @@ class ClientConfig:
             username or (config_file.username if config_file else None) or os.getlogin()
         )
 
-        # Get enable_auth setting
-        enable_auth = (
-            config_file.enable_auth
-            if config_file and config_file.enable_auth is not None
-            else True
-        )
-
-        # Load private key if auth is enabled
-        private_key: Optional[ParsedPrivateKey] = None
-        if enable_auth:
-            key_path = private_key_path
-            if key_path is None and config_file and config_file.private_key_path:
-                key_path = Path(config_file.private_key_path).expanduser()
-
-            if key_path is None:
-                raise ValueError(
-                    "Private key is required when authentication is enabled. "
-                    "Set private_key_path in config or use --private-key-path."
-                )
-
-            key_path = key_path.expanduser()
-
-            # Check permissions on Unix
-            if os.name == "posix":
-                path_utils.check_private_key_permissions(key_path)
-
-            # Read and parse the private key
-            key_content = key_path.read_text()
-            private_key = ParsedPrivateKey.parse(key_content)
-
-        return cls(
-            host=final_host,
-            port=final_port,
-            username=final_username,
-            private_key=private_key,
-            enable_auth=enable_auth,
-        )
+        return cls(host=final_host, port=final_port, username=final_username)
 
 
 async def _connect_and_authenticate_async(client_config: ClientConfig) -> PieClient:
@@ -113,17 +73,10 @@ async def _connect_and_authenticate_async(client_config: ClientConfig) -> PieCli
         raise ConnectionError(f"Could not connect to engine at {url}. Is it running?")
 
     try:
-        await client.authenticate(client_config.username, client_config.private_key)
+        await client.authenticate(client_config.username)
     except Exception as e:
         await client.close()
-        if client_config.enable_auth:
-            raise ConnectionError(
-                f"Failed to authenticate with engine using the specified private key: {e}"
-            )
-        else:
-            raise ConnectionError(
-                f"Failed to authenticate with engine (client public key authentication disabled): {e}"
-            )
+        raise ConnectionError(f"Failed to identify to the engine as '{client_config.username}': {e}")
 
     return client
 

@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 import msgpack
 import websockets
@@ -11,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .inferlet import Inferlet
-from .crypto import ParsedPrivateKey
 
 
 class Event(Enum):
@@ -325,56 +323,15 @@ class PieClient:
     # Authentication
     # =========================================================================
 
-    async def authenticate(
-        self, username: str, private_key: ParsedPrivateKey | None = None
-    ) -> None:
-        """
-        Authenticate the client with the server using public key authentication.
+    async def authenticate(self, username: str) -> None:
+        """Identify to the server as `username`.
 
-        :param username: The username to authenticate as.
-        :param private_key: The private key for signing the challenge.
-                           Required if the server has authentication enabled.
-        :raises Exception: If authentication fails.
+        :raises Exception: If the server rejects the username.
         """
         msg = {"type": "auth_identify", "username": username}
         ok, result = await self._send_msg_and_wait(msg)
-
         if not ok:
             raise Exception(f"Username '{username}' rejected by server: {result}")
-
-        if result in (
-            "Authenticated (Engine disabled authentication)",
-            # Gateway-fronted sessions arrive pre-authenticated (the edge
-            # supplied the identity via `x-pie-identity`); the engine answers
-            # identify with this instead of a challenge.
-            "Already authenticated",
-        ):
-            return
-
-        if private_key is None:
-            raise Exception(
-                "Server requires public key authentication but no private key provided"
-            )
-
-        try:
-            challenge = base64.b64decode(result)
-        except Exception as e:
-            raise Exception(f"Failed to decode challenge from server: {e}")
-
-        signature_bytes = private_key.sign(challenge)
-        signature_b64 = base64.b64encode(signature_bytes).decode("utf-8")
-
-        msg = {"type": "auth_prove", "signature": signature_b64}
-        ok, result = await self._send_msg_and_wait(msg)
-
-        if not ok:
-            raise Exception(
-                f"Signature verification failed for username '{username}': {result}"
-            )
-
-    # =========================================================================
-    # Queries
-    # =========================================================================
 
     async def query(self, subject: str, record: str) -> tuple[bool, str]:
         """Send a generic query to the server."""

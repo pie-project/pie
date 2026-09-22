@@ -71,6 +71,7 @@ runs:
         # the VS generator does not find the CUDA toolset; and Git Bash's
         # coreutils `link` must not shadow MSVC's linker.
         echo "CARGO_TARGET_DIR=C:/t/pie" >> "$GITHUB_ENV"
+        echo "PIE_BUILTINS_TARGET_DIR=C:/t/pie-inferlets" >> "$GITHUB_ENV"
         echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
         rm -f /usr/bin/link /usr/bin/link.exe || true
 
@@ -82,5 +83,6 @@ runs:
           ~/.cargo/git
           target
           C:/t/pie
+          C:/t/pie-inferlets
         key: ${{ inputs.cache-key }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: ${{ inputs.cache-key }}-
