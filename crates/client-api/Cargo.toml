@@ -1,9 +1,9 @@
 [package]
-name = "client-api"
+name = "pie-client-api"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Public client↔server message vocabulary + edge-session frames for pie: the only public, versioned interface."
+description = "Public client↔server message vocabulary + edge-session frames for pie: the only public, versioned interface. Internal to pie; depend on `pie-client` instead."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 

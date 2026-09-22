@@ -1,0 +1,9 @@
+# The inferlets built into the pie binary, one cargo workspace targeting
+# wasm32-wasip2; crates/builtins/build.rs builds every member whose Pie.toml
+# says `tier = "builtin"` and embeds it.
+[workspace]
+resolver = "2"
+members = ["compat", "compat-openai", "compat-anthropic", "compat-gemini"]
+
+[profile.release]
+lto = true

@@ -521,7 +521,7 @@ def main() -> int:
                     help="the trajectory mode's step count (--mode steps); the family pins eight")
     ap.add_argument("--stop", type=int, default=None,
                     help="stop the trajectory after N steps and diff against sched.xN")
-    ap.add_argument("--inferlet", default=os.path.join(REPO, "tests/inferlets/zimage-parity"))
+    ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/zimage-parity"))
     ap.add_argument("--config", default=None,
                     help="the serving config; its `[model] model` must be the row's artifact")
     ap.add_argument("--pie", default=None, help="the pie binary (default: PATH, else target/debug)")

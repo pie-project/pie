@@ -172,7 +172,12 @@ impl Run<'_> {
                     self.ctx(),
                     packed,
                     self.tensor(*perm),
-                    &mut kernels_cuda::Tensor::new(whole.ptr, packed.rows, whole.width, whole.dtype),
+                    &mut kernels_cuda::Tensor::new(
+                        whole.ptr,
+                        packed.rows,
+                        whole.width,
+                        whole.dtype,
+                    ),
                 )
             }
             Layout::TopK {

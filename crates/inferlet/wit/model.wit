@@ -275,7 +275,7 @@ interface model {
     // for one backbone), `pinned-sigmas` a distilled model's fixed sigma
     // list, descending, without the final 0 (empty when the guest builds
     // its own), and `stream-shifts` names the per-modality shifts of a
-    // family that runs several schedules at once. The SDK's
+    // family that runs several schedules at once. The library's
     // `latent::FlowMatchEuler` is built from this.
     // `none` when no reading denoises.
     record stream-shift {
@@ -404,7 +404,7 @@ interface model {
     // budget holds every other lane's decode for as long as it runs; a fire
     // of this size leaves the step room for them. A hint, not a limit: the
     // runtime never splits a fire, and a guest may chunk larger or smaller
-    // — the SDK's `prefill_chunks` takes it as its default cap. Not static:
+    // — the inferlet library's `prefill_chunks` takes it as its default cap. Not static:
     // it moves with the number of live processes.
     prefill-chunk-hint: func() -> u32;
 

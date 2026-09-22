@@ -478,11 +478,28 @@ impl Session {
         input: String,
         capture_outputs: bool,
     ) {
-        let program_name = match ProgramName::parse(&inferlet) {
-            Ok(p) => p,
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-                return;
+        // A bare `name` is its newest installed version: how the gateway's
+        // fixed routes reach the built-in inferlets.
+        let program_name = if inferlet.contains('@') {
+            match ProgramName::parse(&inferlet) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.send_response(corr_id, false, e.to_string()).await;
+                    return;
+                }
+            }
+        } else {
+            match program::newest(&inferlet).await {
+                Some(p) => p,
+                None => {
+                    self.send_response(
+                        corr_id,
+                        false,
+                        format!("no program named '{inferlet}' is installed"),
+                    )
+                    .await;
+                    return;
+                }
             }
         };
 

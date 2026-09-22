@@ -160,7 +160,9 @@ pub fn planes_of(
         .iter()
         .filter(|seat| crate::role_of(&seat.name) == role.bank())
         .collect();
-    let sited = of_role.iter().any(|seat| crate::site_of(&seat.name).is_some());
+    let sited = of_role
+        .iter()
+        .any(|seat| crate::site_of(&seat.name).is_some());
     let want = match sited {
         true => site,
         false => None,
@@ -277,7 +279,12 @@ pub fn planes_of(
 }
 
 fn f32_at(wire: &[u8], at: usize) -> f32 {
-    let bytes = [wire[at * 4], wire[at * 4 + 1], wire[at * 4 + 2], wire[at * 4 + 3]];
+    let bytes = [
+        wire[at * 4],
+        wire[at * 4 + 1],
+        wire[at * 4 + 2],
+        wire[at * 4 + 3],
+    ];
     f32::from_le_bytes(bytes)
 }
 
@@ -324,7 +331,9 @@ mod tests {
     }
 
     fn a_layered_cell_becomes_one_plane_per_layer_bank() {
-        let cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let cell = wire(&[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ]);
         let planes = planes_of(Role::A, None, &cell, &a_seats()).expect("a full-rank A");
         assert_eq!(planes.len(), 2, "one plane per layer bank");
         assert_eq!(planes[0].0, "layer.0.lora_a");
@@ -388,8 +397,13 @@ mod tests {
     }
 
     fn a_site_the_banks_do_not_declare_is_refused_by_name() {
-        let sited = vec![seat("layer.0.o.lora_a", 2, 3), seat("layer.1.o.lora_a", 2, 3)];
-        let cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let sited = vec![
+            seat("layer.0.o.lora_a", 2, 3),
+            seat("layer.1.o.lora_a", 2, 3),
+        ];
+        let cell = wire(&[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ]);
         let planes = planes_of(Role::A, Some(Site::O), &cell, &sited).expect("the named site");
         assert_eq!(planes[0].0, "layer.0.o.lora_a");
         assert_eq!(planes[1].0, "layer.1.o.lora_a");
@@ -403,5 +417,4 @@ mod tests {
             "says what was asked: {why}"
         );
     }
-
 }

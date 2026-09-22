@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OwnedSemaphorePermit;
@@ -13,6 +13,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpVi
 use super::ProcessId;
 use super::output::LogStream;
 use super::residency::ProcessResidency;
+use crate::inferlet::program::Script;
 use crate::inferlet::sandbox::InstancePolicy;
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::rs::RsWorkingSetId;
@@ -37,6 +38,10 @@ pub struct ProcessCtx {
     network_allowed: bool,
 
     scratch_dir: Option<PathBuf>,
+
+    /// Set when the component is a language component and this is the
+    /// script it runs.
+    script: Option<Arc<Script>>,
 
     dynamic_resource_map: HashMap<u32, ResourceAny>,
     guest_resource_map: Vec<(ResourceAny, u32)>,
@@ -109,12 +114,16 @@ impl WasiHttpView for ProcessCtx {
 }
 
 impl ProcessCtx {
+    pub fn script(&self) -> Option<&Arc<Script>> {
+        self.script.as_ref()
+    }
+
     pub async fn new(
         id: ProcessId,
         username: String,
         output: OutputMode,
         policy: &InstancePolicy,
-        py_runtime_dir: Option<&Path>,
+        script: Option<Arc<Script>>,
     ) -> anyhow::Result<Self> {
         #[cfg(target_arch = "wasm32")]
         let wasi_ctx = {
@@ -138,7 +147,6 @@ impl ProcessCtx {
                         .stderr(move |bytes| err.write_bytes(bytes));
                 }
             }
-            let _ = py_runtime_dir;
             builder.build()
         };
         #[cfg(target_arch = "wasm32")]
@@ -187,31 +195,6 @@ impl ProcessCtx {
         };
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(dir) = py_runtime_dir {
-            let runtime_dir = dir.join("runtime");
-            let site_packages_dir = dir.join("site-packages");
-
-            const PYTHON_PATH: &str = "/python:/0:/bundled";
-
-            builder
-                .env("PYTHONHOME", "/python")
-                .env("PYTHONPATH", PYTHON_PATH)
-                .env("PYTHONUNBUFFERED", "1");
-
-            builder
-                .preopened_dir(runtime_dir.join("python"), "python", FsPerms::ReadOnly)
-                .expect("failed to preopen python dir");
-
-            builder
-                .preopened_dir(runtime_dir.join("bundled"), "bundled", FsPerms::ReadOnly)
-                .expect("failed to preopen bundled dir");
-
-            builder
-                .preopened_dir(site_packages_dir, "0", FsPerms::ReadOnly)
-                .expect("failed to preopen site-packages dir");
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
         let wasi_ctx = builder.build();
 
         Ok(ProcessCtx {
@@ -227,6 +210,7 @@ impl ProcessCtx {
             },
             network_allowed: policy.network.allow,
             scratch_dir,
+            script,
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,

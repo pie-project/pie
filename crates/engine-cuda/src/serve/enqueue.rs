@@ -98,12 +98,20 @@ impl Shell {
                 p.rs.rows_ext,
                 self.buffers.as_ref().map_or(0, Buffers::ext_row_bytes),
             );
-            if self.rs_scratch.as_ref().is_none_or(|have| (have.bytes() as u64) < need) {
+            if self
+                .rs_scratch
+                .as_ref()
+                .is_none_or(|have| (have.bytes() as u64) < need)
+            {
                 self.drain()?;
-                self.rs_scratch = Some(Buffer::zeroed(usize::try_from(need).unwrap_or(usize::MAX))?);
+                self.rs_scratch =
+                    Some(Buffer::zeroed(usize::try_from(need).unwrap_or(usize::MAX))?);
             }
         }
-        let rs_scratch = self.rs_scratch.as_ref().map(|have| (have.ptr(), have.bytes() as u64));
+        let rs_scratch = self
+            .rs_scratch
+            .as_ref()
+            .map(|have| (have.ptr(), have.bytes() as u64));
         let mut fire = FireCtx {
             device: &self.device,
             trace: &self.trace,
@@ -602,6 +610,7 @@ impl FireCtx<'_> {
             self_cond_weights: staged.self_cond.map(|(_, weights)| weights),
             lane_of_row: handles.lane_of_row,
             group_of_lane: handles.group_of_lane,
+            class_table: handles.class_table,
             packings: p
                 .packings
                 .iter()
@@ -703,7 +712,10 @@ impl FireCtx<'_> {
             run = run.conditional(body, &stream);
         }
         let rs_scratch = (p.rs.rows_ext > 0)
-            .then(|| self.rs_scratch.map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes)))
+            .then(|| {
+                self.rs_scratch
+                    .map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes))
+            })
             .flatten();
         if p.rs.buffered
             && let Some(pool) = self.buffers
@@ -737,6 +749,7 @@ impl FireCtx<'_> {
                     lane_ceiling: p.lane_ceiling,
                     towered: p.towered,
                     ceilings,
+                    islands: &p.islands,
                 };
 
                 self.cache.fire_body(&fire, &mut run, &place)

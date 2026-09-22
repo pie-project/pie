@@ -359,7 +359,7 @@ def main() -> int:
         action="store_true",
         help="the two connector passes instead of the joint denoise step",
     )
-    ap.add_argument("--inferlet", default=os.path.join(REPO, "tests/inferlets/ltx2-parity"))
+    ap.add_argument("--inferlet", default=os.path.join(REPO, "examples/ltx2-parity"))
     ap.add_argument(
         "--config",
         default=None,

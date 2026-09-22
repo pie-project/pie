@@ -29,7 +29,11 @@ impl Serving {
         let artifact = Artifact::open(path).ok()?;
         Some(Serving {
             artifact: Arc::new(artifact),
-            names: trace.params.iter().map(|param| param.name.clone()).collect(),
+            names: trace
+                .params
+                .iter()
+                .map(|param| param.name.clone())
+                .collect(),
             path: path.to_path_buf(),
         })
     }
@@ -55,7 +59,8 @@ impl Serving {
         let name = self.names.get(id as usize)?;
         let located = self.artifact.locate(name).ok()?;
         let start = located.at + located.plane.offset;
-        if located.plane.len > reserved || start.checked_add(reserved)? > self.artifact.mapped_len() {
+        if located.plane.len > reserved || start.checked_add(reserved)? > self.artifact.mapped_len()
+        {
             return None;
         }
         let blob = self.artifact.object(&located.object).ok()?;
@@ -133,10 +138,9 @@ impl Serving {
             let landing = match by_object.get_mut(&located.object) {
                 Some(landing) => landing,
                 None => {
-                    let blocks = self
-                        .artifact
-                        .blocks(&located.object)
-                        .map_err(|why| format!("`{name}` states no readable block digests: {why}"))?;
+                    let blocks = self.artifact.blocks(&located.object).map_err(|why| {
+                        format!("`{name}` states no readable block digests: {why}")
+                    })?;
                     by_object.insert(
                         located.object.clone(),
                         Landing {
@@ -234,7 +238,6 @@ fn read_exact_at(file: &std::fs::File, buf: &mut [u8], at: u64) -> std::io::Resu
 }
 
 pub unsafe fn read_into(refill: &Landings, into: *mut u8) -> Result<(), String> {
-
     let file = std::fs::File::open(&refill.path)
         .map_err(|why| format!("{}: {why}", refill.path.display()))?;
     let mut work: Vec<Work<'_>> = Vec::new();
@@ -271,7 +274,9 @@ pub unsafe fn read_into(refill: &Landings, into: *mut u8) -> Result<(), String> 
                 // SAFETY: `cursor - plane.offset < plane.len`, inside the
                 // plane's reservation the caller vouches for.
                 let dst = Carried(unsafe {
-                    into.add(usize::try_from(plane.into + (cursor - plane.offset)).unwrap_or(usize::MAX))
+                    into.add(
+                        usize::try_from(plane.into + (cursor - plane.offset)).unwrap_or(usize::MAX),
+                    )
                 });
                 segments.push((upto - cursor, Some(dst)));
                 cursor = upto;
@@ -295,7 +300,9 @@ pub unsafe fn read_into(refill: &Landings, into: *mut u8) -> Result<(), String> 
         let per = work.len().div_ceil(width.max(1));
         let mut reading = Vec::with_capacity(width);
         for lane in 0..width {
-            let mine = work.get(lane * per..((lane + 1) * per).min(work.len())).unwrap_or(&[]);
+            let mine = work
+                .get(lane * per..((lane + 1) * per).min(work.len()))
+                .unwrap_or(&[]);
             let file = &file;
             let path = &refill.path;
             reading.push(scope.spawn(move || {
@@ -337,9 +344,9 @@ pub unsafe fn read_into(refill: &Landings, into: *mut u8) -> Result<(), String> 
         reading
             .into_iter()
             .flat_map(|thread| {
-                thread
-                    .join()
-                    .unwrap_or_else(|_| vec![Err(Failed::Read("a read worker panicked".to_string()))])
+                thread.join().unwrap_or_else(|_| {
+                    vec![Err(Failed::Read("a read worker panicked".to_string()))]
+                })
             })
             .collect()
     });
@@ -412,10 +419,19 @@ mod tests {
     fn a_plane_is_found_by_its_name_and_not_by_where_it_sits() {
         let dir = tmp("byname");
         let path = dir.join("m.zt");
-        let planes = vec![("head", vec![2u8; 4096]), ("norm", vec![3u8; 4096]), ("embed", vec![1u8; 4096])];
-        emit::write(&path, &Stamp::of("cuda", "qwen_3"), &BTreeMap::new(), 4096, &leaves(&planes), |o, p, _| {
-            panic!("{o}/{p} is not streamed")
-        })
+        let planes = vec![
+            ("head", vec![2u8; 4096]),
+            ("norm", vec![3u8; 4096]),
+            ("embed", vec![1u8; 4096]),
+        ];
+        emit::write(
+            &path,
+            &Stamp::of("cuda", "qwen_3"),
+            &BTreeMap::new(),
+            4096,
+            &leaves(&planes),
+            |o, p, _| panic!("{o}/{p} is not streamed"),
+        )
         .unwrap();
 
         let trace = trace(&["embed", "norm", "head"]);
@@ -431,14 +447,27 @@ mod tests {
         let dir = tmp("reserved");
         let path = dir.join("m.zt");
         let planes = vec![("short", vec![5u8; 100]), ("long", vec![6u8; 4096])];
-        emit::write(&path, &Stamp::of("cuda", "qwen_3"), &BTreeMap::new(), 4096, &leaves(&planes), |o, p, _| {
-            panic!("{o}/{p} is not streamed")
-        })
+        emit::write(
+            &path,
+            &Stamp::of("cuda", "qwen_3"),
+            &BTreeMap::new(),
+            4096,
+            &leaves(&planes),
+            |o, p, _| panic!("{o}/{p} is not streamed"),
+        )
         .unwrap();
         let serving = Serving::open(&path, &trace(&["short", "long"])).expect("it opens");
         assert_eq!(serving.plane_reserved(0, 256), Some(&planes[0].1[..]));
-        assert_eq!(serving.plane_reserved(0, 64), None, "a plane longer than its seat");
-        assert_eq!(serving.plane_reserved(1, 1 << 40), None, "a reservation past the file");
+        assert_eq!(
+            serving.plane_reserved(0, 64),
+            None,
+            "a plane longer than its seat"
+        );
+        assert_eq!(
+            serving.plane_reserved(1, 1 << 40),
+            None,
+            "a reservation past the file"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -459,7 +488,11 @@ mod tests {
                 term: Some(Term::parse("g64_u4_bf16_b_bf16").unwrap()),
                 layout: None,
                 attributes: None,
-                planes: vec![Payload::Whole(&codes), Payload::Whole(&scales), Payload::Whole(&biases)],
+                planes: vec![
+                    Payload::Whole(&codes),
+                    Payload::Whole(&scales),
+                    Payload::Whole(&biases),
+                ],
             }],
             |o, p, _| panic!("{o}/{p} is not streamed"),
         )
@@ -481,14 +514,21 @@ mod tests {
         // SAFETY: the landings tile `image`, which is this thread's own.
         unsafe { read_into(&refill, image.as_mut_ptr()) }.expect("the fill reads and verifies");
         assert_eq!(&image[..128], &codes[..]);
-        assert!(image[128..256].iter().all(|b| *b == 0), "the reservation's tail is zeroed");
+        assert!(
+            image[128..256].iter().all(|b| *b == 0),
+            "the reservation's tail is zeroed"
+        );
         assert_eq!(&image[256..264], &biases[..]);
 
         let mut raw = std::fs::read(&path).unwrap();
-        let at = raw.windows(8).position(|w| w == &scales[..]).expect("the scales are in the file");
+        let at = raw
+            .windows(8)
+            .position(|w| w == &scales[..])
+            .expect("the scales are in the file");
         raw[at + 3] ^= 0xFF;
         std::fs::write(&path, &raw).unwrap();
-        let why = unsafe { read_into(&refill, image.as_mut_ptr()) }.expect_err("a rotted block must not pass");
+        let why = unsafe { read_into(&refill, image.as_mut_ptr()) }
+            .expect_err("a rotted block must not pass");
         assert!(why.contains("block 0 of \"w\""), "{why}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -496,8 +536,7 @@ mod tests {
     fn an_ordinary_checkpoint_is_not_a_serving_artifact() {
         let dir = tmp("plain");
         let path = dir.join("plain.zt");
-        let mut writer =
-            checkpoint::file::write::Writer::create(&path, &BTreeMap::new()).unwrap();
+        let mut writer = checkpoint::file::write::Writer::create(&path, &BTreeMap::new()).unwrap();
         let decl = checkpoint::types::TensorDecl {
             id: checkpoint::types::TensorId(0),
             name: "embed".to_string(),

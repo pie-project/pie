@@ -101,7 +101,10 @@ pub(crate) fn take(
     {
         return Err(Fault::Unwarmed {
             name,
-            have: held.slabs.get(&(name, region, scope)).map_or(0, |slab| slab.bytes),
+            have: held
+                .slabs
+                .get(&(name, region, scope))
+                .map_or(0, |slab| slab.bytes),
             need: bytes,
         });
     }

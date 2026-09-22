@@ -1,4 +1,3 @@
-
 use std::path::{Path, PathBuf};
 
 use engine_cuda::{Boot, Shell};
@@ -95,10 +94,11 @@ fn every_armed_body_answers_its_eager_walk() {
     let Some(mut shell) = ready("every_armed_body_answers_its_eager_walk") else {
         return;
     };
-    let armed = shell
-        .armed()
-        .map_or(0, |armed| armed.armed);
-    assert!(armed > 0, "the lattice armed no body, so there is nothing to answer for");
+    let armed = shell.armed().map_or(0, |armed| armed.armed);
+    assert!(
+        armed > 0,
+        "the lattice armed no body, so there is nothing to answer for"
+    );
     let verified = shell
         .verify_bodies()
         .expect("every armed body answers its eager walk");

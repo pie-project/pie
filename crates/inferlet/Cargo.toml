@@ -13,10 +13,10 @@ include = ["src/**/*", "wit/**/*"]
 
 [dependencies]
 wit-bindgen = { version = "0.59.0", features = ["async-spawn"] }
-inferlet-macros = { version = "0.5.0", path = "../inferlet-macros" }
+inferlet-macros = { version = "0.5.1", path = "../inferlet-macros" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-eta-dsl = { path = "../eta-dsl" }
+eta-dsl = { package = "pie-eta-dsl", version = "0.5.1", path = "../eta-dsl" }
 
 [lints]
 workspace = true

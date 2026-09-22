@@ -544,7 +544,13 @@ impl Device {
         if let Some(plan) = self.plans.get(&(m, n, k)) {
             return Some(Arc::clone(plan));
         }
-        let plan = Arc::new(build_lt_plan(self.lt.handle, self.lt.workspace_bytes, m, n, k)?);
+        let plan = Arc::new(build_lt_plan(
+            self.lt.handle,
+            self.lt.workspace_bytes,
+            m,
+            n,
+            k,
+        )?);
         self.plans.insert((m, n, k), Arc::clone(&plan));
         Some(plan)
     }
@@ -804,9 +810,12 @@ impl TuneArena {
         let mut graph: cudaGraph_t = std::ptr::null_mut();
         let mut exec: cudaGraphExec_t = std::ptr::null_mut();
         let captured = unsafe {
-            cudaStreamBeginCapture(stream, cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal)
-                == cudaError::cudaSuccess
-                && cudaMemsetAsync(self.flush, 0, self.flush_bytes, stream) == cudaError::cudaSuccess
+            cudaStreamBeginCapture(
+                stream,
+                cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal,
+            ) == cudaError::cudaSuccess
+                && cudaMemsetAsync(self.flush, 0, self.flush_bytes, stream)
+                    == cudaError::cudaSuccess
                 && cudaEventRecordWithFlags(self.start, stream, cudaEventRecordExternal)
                     == cudaError::cudaSuccess
                 && fire()

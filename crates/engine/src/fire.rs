@@ -103,6 +103,19 @@ pub enum Readout {
     None,
 }
 
+/// A structured attention mask over a lane's rows: `classes[row]` in
+/// `0..count`, or -1 for a row that attends and is attended by every row;
+/// `table[q * count + kv] != 0` lets a q-class row attend a kv-class row.
+/// Every lane of one attention group states the same table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AttnClasses {
+    pub classes: Vec<i32>,
+    pub table: Vec<u8>,
+    pub count: u32,
+}
+
+pub const ATTN_CLASSES_MAX: u32 = 64;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lane {
     pub slot: u32,
@@ -139,6 +152,8 @@ pub struct Lane {
     pub ports: Vec<PortFeed>,
     #[serde(default)]
     pub kv_less: bool,
+    #[serde(default)]
+    pub attn_classes: Option<AttnClasses>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -28,7 +28,9 @@ fn check(geo: Geometry, window: Option<Window>) {
         k_dim,
         v_dim,
     } = geo;
-    let (rows, live, base) = window.as_ref().map_or((3, 3, 0), |w| (w.bucket, w.live, w.base));
+    let (rows, live, base) = window
+        .as_ref()
+        .map_or((3, 3, 0), |w| (w.bucket, w.live, w.base));
     let planes = base + rows;
     let slots: u32 = 4;
     let slot_of: [i32; 3] = [2, 0, 3];
@@ -112,7 +114,8 @@ fn check(geo: Geometry, window: Option<Window>) {
             let k_inv = (k.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt().recip();
             let g = gates[plane * 2 * vh + h].exp();
             let beta = gates[plane * 2 * vh + vh + h];
-            let state = &mut want_slab[slot * stride + h * kd * vd..slot * stride + (h + 1) * kd * vd];
+            let state =
+                &mut want_slab[slot * stride + h * kd * vd..slot * stride + (h + 1) * kd * vd];
             for j in 0..vd {
                 let kv_mem: f32 = (0..kd).map(|i| state[i * vd + j] * g * k[i] * k_inv).sum();
                 let delta = (v[j] - kv_mem) * beta;

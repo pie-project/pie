@@ -205,7 +205,9 @@ fn new_stream() -> Result<*mut c_void> {
     let mut stream: rt::cudaStream_t = core::ptr::null_mut();
     // SAFETY: a live local out-parameter; the stream is this pool's and is
     // destroyed exactly once in `Drop`.
-    unsafe { crate::device::ctx::check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))? };
+    unsafe {
+        crate::device::ctx::check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?
+    };
     Ok(stream.cast())
 }
 

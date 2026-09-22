@@ -157,8 +157,12 @@ fn launch_rows(compiled: &CompiledModel, table: &Windows) -> Vec<u32> {
 }
 
 fn split(compiled: &CompiledModel, hot: u32, cold: u32) -> Composition {
-    compose(compiled, &budget(), &[Lane::new(1, hot), Lane::new(0, cold)])
-        .expect("the two-class fire composes")
+    compose(
+        compiled,
+        &budget(),
+        &[Lane::new(1, hot), Lane::new(0, cold)],
+    )
+    .expect("the two-class fire composes")
 }
 
 #[test]
@@ -274,8 +278,22 @@ fn two_splits_of_one_key_move_a_launch_the_total_does_not() {
         "and therefore a lattice point",
     );
     assert_eq!(
-        BodyKey::of_axes(first.classes(), first.bucket(), &no_decode_class(), LANES, &plain(), None),
-        BodyKey::of_axes(second.classes(), second.bucket(), &no_decode_class(), LANES, &plain(), None),
+        BodyKey::of_axes(
+            first.classes(),
+            first.bucket(),
+            &no_decode_class(),
+            LANES,
+            &plain(),
+            None
+        ),
+        BodyKey::of_axes(
+            second.classes(),
+            second.bucket(),
+            &no_decode_class(),
+            LANES,
+            &plain(),
+            None
+        ),
         "the two fires must reach the SAME body, or there is no hazard here",
     );
 

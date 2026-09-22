@@ -1,0 +1,31 @@
+[package]
+name = "pie-server-py"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Python bindings for the pie engine: what `pie serve` boots, inside a Python process."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[features]
+default = ["cuda"]
+cuda = ["pie/cuda"]
+metal = ["pie/metal"]
+vulkan = ["pie/vulkan"]
+wgpu = ["pie/wgpu"]
+
+[lib]
+name = "pie_engine"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+pie = { path = "../..", default-features = false }
+worker = { path = "../../crates/worker", default-features = false }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+tokio = { version = "1.53", features = ["rt-multi-thread"] }
+toml = "1.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

@@ -632,6 +632,13 @@ impl Process {
                 .get_typed_func::<(&str,), (Result<String, String>,)>(&mut store, &run_func_export)
                 .map_err(|e| format!("Failed to get 'run' function: {e:?}"))?;
 
+            // A script's component is its language component; the script
+            // itself rides in the launch input.
+            let input = match store.data().script() {
+                Some(script) => script.envelope(&input),
+                None => input,
+            };
+
             let wasm_run_start = Instant::now();
             let call = run_func.call_async(&mut store, (&input,));
             let called = call.await;

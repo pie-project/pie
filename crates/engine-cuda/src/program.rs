@@ -16,7 +16,9 @@ use crate::error::{Fault, Result};
 
 pub use compile::{Cache, Compiled, Disk, Module, Region, Stage, Target};
 pub use endpoint::Endpoint;
-pub use launch::{ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes, scratch_offsets};
+pub use launch::{
+    ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes, scratch_offsets,
+};
 pub use ports::Envelope;
 pub use session::{Fired, Launched, Session, seeds_of};
 pub use wave::Wave;
@@ -65,7 +67,9 @@ impl Program {
                 .get(index)
                 .is_some_and(|stage| !stage.regions.is_empty());
             stages.push(if launches {
-                Some(Prepared::build(stage_plan, &shapes, extents, lanes, stream)?)
+                Some(Prepared::build(
+                    stage_plan, &shapes, extents, lanes, stream,
+                )?)
             } else {
                 None
             });
@@ -84,7 +88,10 @@ impl Plane {
         bytes: u64,
     ) -> Result<(u64, u64)> {
         let bound = self.instances.get(&instance).ok_or_else(|| {
-            Fault::program("program::plane", format!("self-conditioning feed of unbound instance {instance}"))
+            Fault::program(
+                "program::plane",
+                format!("self-conditioning feed of unbound instance {instance}"),
+            )
         })?;
         let mut out = [0u64; 2];
         for (slot, id) in [rows, weights].into_iter().enumerate() {
@@ -101,7 +108,9 @@ impl Plane {
             if width < bytes {
                 return Err(Fault::program(
                     "program::plane",
-                    format!("self-conditioning feed channel {id}'s cell holds {width} bytes; the taps want {bytes}"),
+                    format!(
+                        "self-conditioning feed channel {id}'s cell holds {width} bytes; the taps want {bytes}"
+                    ),
                 ));
             }
             out[slot] = address;
@@ -113,14 +122,21 @@ impl Plane {
 impl Plane {
     fn dense_channel(&self, instance: u64, id: u64, what: &str) -> Result<(&Bound, u32)> {
         let bound = self.instances.get(&instance).ok_or_else(|| {
-            Fault::program("program::plane", format!("{what} of unbound instance {instance}"))
-        })?;
-        let dense = bound.ids.iter().position(|&held| held == id).ok_or_else(|| {
             Fault::program(
                 "program::plane",
-                format!("{what} names channel {id}, which instance {instance} does not carry"),
+                format!("{what} of unbound instance {instance}"),
             )
         })?;
+        let dense = bound
+            .ids
+            .iter()
+            .position(|&held| held == id)
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("{what} names channel {id}, which instance {instance} does not carry"),
+                )
+            })?;
         Ok((bound, dense as u32))
     }
 
@@ -356,7 +372,10 @@ impl Plane {
         let program = self.programs.get(&bound.program_id).ok_or_else(|| {
             Fault::program(
                 "program::plane",
-                format!("instance {id} names program {}, which is gone", bound.program_id),
+                format!(
+                    "instance {id} names program {}, which is gone",
+                    bound.program_id
+                ),
             )
         })?;
         Ok(program.plan.needs_mtp_drafts)
@@ -394,11 +413,7 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn disagreeing_ticket(
-        &self,
-        id: u64,
-        tickets: &[engine::Ticket],
-    ) -> Option<String> {
+    pub fn disagreeing_ticket(&self, id: u64, tickets: &[engine::Ticket]) -> Option<String> {
         let bound = self.instances.get(&id)?;
         for ticket in tickets {
             let Some(dense) = bound.ids.iter().position(|held| *held == ticket.channel) else {

@@ -30,8 +30,10 @@ fn check(epilogue: Epilogue, m: usize, n: usize, k: usize) {
     let a_at = gpu.up(&a_raw);
     let y_at = gpu.up(&y_raw);
     let ctx = gpu.ctx();
-    skinny_bf16(&ctx, w_at, a_at, y_at, m as i32, n as i32, k as i32, epilogue)
-        .unwrap_or_else(|e| panic!("{epilogue:?} m={m} n={n} k={k}: {e}"));
+    skinny_bf16(
+        &ctx, w_at, a_at, y_at, m as i32, n as i32, k as i32, epilogue,
+    )
+    .unwrap_or_else(|e| panic!("{epilogue:?} m={m} n={n} k={k}: {e}"));
     gpu.sync();
     let got: Vec<u16> = gpu.down(y_at, tall * n);
 
@@ -52,7 +54,10 @@ fn check(epilogue: Epilogue, m: usize, n: usize, k: usize) {
                     let g = round(dot(r, c));
                     let u = round(dot(r, n + c));
                     let v = gelu_tanh(g) * u;
-                    (v, noise(g) * u.abs() + noise(u) * g.abs() + v.abs() * (1.0 / 64.0) + 1e-3)
+                    (
+                        v,
+                        noise(g) * u.abs() + noise(u) * g.abs() + v.abs() * (1.0 / 64.0) + 1e-3,
+                    )
                 }
             };
             let g = from_bf16(got[r * n + c]);
@@ -62,7 +67,11 @@ fn check(epilogue: Epilogue, m: usize, n: usize, k: usize) {
             );
         }
     }
-    assert_eq!(&got[m * n..], &y_raw[m * n..], "{epilogue:?} m={m} n={n} k={k}: the row past m moved");
+    assert_eq!(
+        &got[m * n..],
+        &y_raw[m * n..],
+        "{epilogue:?} m={m} n={n} k={k}: the row past m moved"
+    );
 }
 
 #[test]
@@ -94,10 +103,22 @@ fn the_geglu_epilogue_lands_the_gated_product() {
 }
 
 fn a_shape_the_block_does_not_divide_is_refused_without_firing() {
-    assert!(!covers(1, 96, 128, Epilogue::Store), "n=96 is not whole 64s");
-    assert!(!covers(65, 64, 128, Epilogue::Store), "m=65 is past the tile");
-    assert!(!covers(1, 64, 192, Epilogue::Store), "k=192 is not whole 128s");
-    assert!(!covers(1, 48, 128, Epilogue::Geglu), "I=48 is not whole 32s");
+    assert!(
+        !covers(1, 96, 128, Epilogue::Store),
+        "n=96 is not whole 64s"
+    );
+    assert!(
+        !covers(65, 64, 128, Epilogue::Store),
+        "m=65 is past the tile"
+    );
+    assert!(
+        !covers(1, 64, 192, Epilogue::Store),
+        "k=192 is not whole 128s"
+    );
+    assert!(
+        !covers(1, 48, 128, Epilogue::Geglu),
+        "I=48 is not whole 32s"
+    );
     assert!(covers(64, 32, 128, Epilogue::Geglu));
     let mut gpu = Gpu::open();
     let w = gpu.up(&vec![0u16; 96 * 128]);

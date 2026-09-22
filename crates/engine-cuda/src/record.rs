@@ -26,6 +26,8 @@ pub struct Fire<'a> {
     pub towered: bool,
     pub lane_ceiling: u32,
     pub ceilings: Ceilings<'a>,
+    /// [`BodyKey::islands`] as prepared for this fire.
+    pub islands: &'a [u8],
 }
 #[derive(Default)]
 pub struct Bodies {
@@ -129,18 +131,10 @@ pub struct Stretch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Uncut {
-    Eager {
-        regions: u32,
-    },
-    Fork {
-        region: u32,
-    },
-    Bracket {
-        region: u32,
-    },
-    Plan {
-        region: u32,
-    },
+    Eager { regions: u32 },
+    Fork { region: u32 },
+    Bracket { region: u32 },
+    Plan { region: u32 },
 }
 
 impl core::fmt::Display for Uncut {
@@ -269,7 +263,10 @@ fn welds(compiled: &CompiledModel) -> Vec<Vec<u32>> {
     welds
 }
 
-pub fn cuts(compiled: &CompiledModel, admits: &[Admit]) -> core::result::Result<Vec<Stretch>, Uncut> {
+pub fn cuts(
+    compiled: &CompiledModel,
+    admits: &[Admit],
+) -> core::result::Result<Vec<Stretch>, Uncut> {
     let template = compiled.template();
     let table = widen(compiled, admits);
     if table.iter().any(|admit| *admit == Admit::Island) {
@@ -284,7 +281,9 @@ pub fn cuts(compiled: &CompiledModel, admits: &[Admit]) -> core::result::Result<
             let admit = table.get(index).copied().unwrap_or(Admit::Island);
             match seen.iter().find(|(mask, _)| **mask == region.mask) {
                 Some((_, held)) if *held != admit => {
-                    return Err(Uncut::Plan { region: index as u32 });
+                    return Err(Uncut::Plan {
+                        region: index as u32,
+                    });
                 }
                 Some(_) => {}
                 None => seen.push((&region.mask, admit)),
@@ -317,7 +316,12 @@ pub fn cuts(compiled: &CompiledModel, admits: &[Admit]) -> core::result::Result<
                     return Err(Uncut::Bracket { region: at });
                 }
             }
-            cuts.push(Stretch { unit, from: at, upto: at + 1, island });
+            cuts.push(Stretch {
+                unit,
+                from: at,
+                upto: at + 1,
+                island,
+            });
         }
         for event in &region.wait {
             pending.retain(|held| held != event);
@@ -326,7 +330,9 @@ pub fn cuts(compiled: &CompiledModel, admits: &[Admit]) -> core::result::Result<
         pending.extend(region.close);
     }
     if !cuts.iter().any(|cut| !cut.island) {
-        return Err(Uncut::Eager { regions: template.len() as u32 });
+        return Err(Uncut::Eager {
+            regions: template.len() as u32,
+        });
     }
     Ok(cuts)
 }
@@ -344,6 +350,11 @@ pub struct BodyKey {
     pub bucket: u32,
     pub classes: Ladder,
     pub patch: Option<AxisKey>,
+    /// The regions the fire's windows keep out of a graph, one bit each
+    /// (empty: none). A sliding or evicted window admits differently from
+    /// a whole one at the same bucket and classes, and a body is only
+    /// replayable for the admissibility it was recorded under.
+    pub islands: Box<[u8]>,
 }
 
 impl BodyKey {
@@ -360,6 +371,7 @@ impl BodyKey {
             bucket,
             classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
             patch: None,
+            islands: Box::default(),
         }
     }
 
@@ -376,7 +388,24 @@ impl BodyKey {
             bucket,
             classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
             patch: patch.map(|(classes, bucket)| AxisKey::of(classes, bucket)),
+            islands: Box::default(),
         }
+    }
+
+    /// The same key, carrying which regions `admits` keeps out of a graph.
+    #[must_use]
+    pub fn with_islands(mut self, admits: &[Admit]) -> BodyKey {
+        let mut bits = vec![0u8; admits.len().div_ceil(8)];
+        for (at, admit) in admits.iter().enumerate() {
+            if *admit == Admit::Island {
+                bits[at / 8] |= 1 << (at % 8);
+            }
+        }
+        while bits.last() == Some(&0) {
+            bits.pop();
+        }
+        self.islands = bits.into();
+        self
     }
 }
 
@@ -445,7 +474,12 @@ impl Ladder {
 
     #[must_use]
     pub fn flat(classes: &WindowTable, rung: u32) -> Ladder {
-        Ladder(classes.present_in_order().map(|class| (class, rung)).collect())
+        Ladder(
+            classes
+                .present_in_order()
+                .map(|class| (class, rung))
+                .collect(),
+        )
     }
 
     #[must_use]
@@ -470,7 +504,10 @@ impl Ladder {
 
     #[must_use]
     pub fn lane_reach(&self, lane_ceiling: u32) -> u32 {
-        self.0.iter().map(|(_, rung)| (*rung).min(lane_ceiling)).sum()
+        self.0
+            .iter()
+            .map(|(_, rung)| (*rung).min(lane_ceiling))
+            .sum()
     }
 }
 
@@ -488,6 +525,12 @@ impl core::fmt::Display for BodyKey {
         f.write_str("]")?;
         if let Some(patch) = &self.patch {
             write!(f, "+{patch}")?;
+        }
+        if !self.islands.is_empty() {
+            f.write_str("~i")?;
+            for byte in self.islands.iter().rev() {
+                write!(f, "{byte:02x}")?;
+            }
         }
         Ok(())
     }
@@ -786,7 +829,7 @@ impl Bodies {
         prepare.settle()?;
         crate::serve::btrace::mark("settle");
         let shape = run.schedule_shape();
-        let key = BodyKey::of_axes(
+        let mut key = BodyKey::of_axes(
             at.descriptor.table(model_ir::RowAxis::Tokens),
             at.descriptor.bucket,
             at.decoding,
@@ -797,6 +840,7 @@ impl Bodies {
                 at.descriptor.patch_bucket,
             )),
         );
+        key.islands = at.islands.into();
 
         crate::serve::btrace::mark("key");
         let at_seq = self.recorder.at_seq;
@@ -987,7 +1031,11 @@ impl Bodies {
                 self.recorder.kept.push((key.clone(), graph));
             }
         }
-        self.recorder.last_capture = LastCapture { nodes, edges, islands };
+        self.recorder.last_capture = LastCapture {
+            nodes,
+            edges,
+            islands,
+        };
         if steps.is_empty() {
             self.body_refuse(key);
             return Ok(());
@@ -1015,14 +1063,17 @@ impl Bodies {
                 }
             }
         }
-        let seated = self.insert_body(key.clone(), Body {
-            script: steps.into_boxed_slice(),
-            grids,
-            shape,
-            bytes,
-            launched_at: crate::settle::Airborne::NEVER,
-            pinned: false,
-        });
+        let seated = self.insert_body(
+            key.clone(),
+            Body {
+                script: steps.into_boxed_slice(),
+                grids,
+                shape,
+                bytes,
+                launched_at: crate::settle::Airborne::NEVER,
+                pinned: false,
+            },
+        );
         if seated && let Some(body) = self.map.bodies.get_mut(&key) {
             for step in body.script.iter() {
                 match step {
@@ -1146,10 +1197,18 @@ impl BodyMap {
             segmented: self
                 .bodies
                 .values()
-                .filter(|body| body.script.iter().any(|step| matches!(step, Step::Island(_))))
+                .filter(|body| {
+                    body.script
+                        .iter()
+                        .any(|step| matches!(step, Step::Island(_)))
+                })
                 .count(),
             bytes: self.bodies.values().filter_map(|body| body.bytes).sum(),
-            unweighed: self.bodies.values().filter(|body| body.bytes.is_none()).count(),
+            unweighed: self
+                .bodies
+                .values()
+                .filter(|body| body.bytes.is_none())
+                .count(),
         }
     }
 
@@ -1175,9 +1234,9 @@ impl BodyMap {
         }
         while self.body_order.len() >= MAX_BODIES {
             let Some(at) = self.body_order.iter().position(|key| {
-                self.bodies.get(key).is_none_or(|body| {
-                    !body.pinned && airborne.settled_past(body.launched_at)
-                })
+                self.bodies
+                    .get(key)
+                    .is_none_or(|body| !body.pinned && airborne.settled_past(body.launched_at))
             }) else {
                 seating.evictions += 1;
                 return seating;
@@ -1216,12 +1275,7 @@ impl<'a> Fire<'a> {
     }
 }
 
-fn walk_capture(
-    at: &Fire<'_>,
-    run: &mut Run<'_>,
-    place: &At,
-    streams: Streams,
-) -> Result<()> {
+fn walk_capture(at: &Fire<'_>, run: &mut Run<'_>, place: &At, streams: Streams) -> Result<()> {
     walk_capture_units(at, run, place, streams, Units::All, Regions::All)
 }
 
@@ -1238,7 +1292,10 @@ fn walk_capture_cut(
         place,
         streams,
         Units::One(cut.unit),
-        Regions::Span { from: cut.from, upto: cut.upto },
+        Regions::Span {
+            from: cut.from,
+            upto: cut.upto,
+        },
     )
 }
 
@@ -1354,6 +1411,7 @@ mod tests {
             bucket: 8,
             classes: Ladder::single(0, Ladder::rung(0, 8, &decoding, LANES)),
             patch: None,
+            islands: Box::default(),
         };
         assert_eq!(armed, fired, "the armed key must be the fired key");
     }
@@ -1363,13 +1421,33 @@ mod tests {
             bucket,
             classes: Ladder::single(0, bucket),
             patch: None,
+            islands: Box::default(),
         }
+    }
+
+    #[test]
+    fn a_key_carries_which_regions_are_islands() {
+        let whole = rung(8);
+        let same = rung(8).with_islands(&[Admit::Captured, Admit::Captured]);
+        assert_eq!(whole, same, "no island is the plain key");
+        assert_eq!(same.to_string(), "b8[c0:8]");
+        let cut = rung(8).with_islands(&[Admit::Captured, Admit::Island, Admit::Captured]);
+        assert_ne!(whole, cut, "a windowed fire is not the whole-window body");
+        assert_eq!(cut.to_string(), "b8[c0:8]~i02");
+        let mut ten = vec![Admit::Captured; 9];
+        ten.push(Admit::Island);
+        assert_eq!(rung(8).with_islands(&ten).to_string(), "b8[c0:8]~i0200");
     }
 
     fn weighing(bytes: usize) -> Body {
         Body {
-            script: vec![Step::Island(Stretch { unit: 0, from: 0, upto: 1, island: true })]
-                .into_boxed_slice(),
+            script: vec![Step::Island(Stretch {
+                unit: 0,
+                from: 0,
+                upto: 1,
+                island: true,
+            })]
+            .into_boxed_slice(),
             grids: Vec::new().into_boxed_slice(),
             shape: 0,
             launched_at: crate::settle::Airborne::NEVER,
@@ -1380,7 +1458,11 @@ mod tests {
 
     fn what_a_load_has_spent_is_what_its_resident_bodies_weigh() {
         let mut graphs = Bodies::new();
-        assert_eq!(graphs.body_stats().census.bytes, 0, "an empty map has spent nothing");
+        assert_eq!(
+            graphs.body_stats().census.bytes,
+            0,
+            "an empty map has spent nothing"
+        );
         for (bucket, bytes) in [(8u32, 3_000usize), (16, 5_000), (32, 7_000)] {
             assert!(graphs.insert_body(rung(bucket), weighing(bytes)));
         }
@@ -1404,7 +1486,11 @@ mod tests {
             "an unweighable body moved the budget: {}",
             graphs.body_stats(),
         );
-        assert_eq!(graphs.body_stats().census.bodies, 4, "and it still took a seat");
+        assert_eq!(
+            graphs.body_stats().census.bodies,
+            4,
+            "and it still took a seat"
+        );
     }
 
     fn the_map_never_inserts_a_body_whose_script_is_empty() {

@@ -26,7 +26,10 @@ pub fn rel_bias(
     if x.width != heads * d_rel {
         return Err(refuse(
             OP,
-            format!("the relative features are {} wide and the statement names {heads} x {d_rel}", x.width),
+            format!(
+                "the relative features are {} wide and the statement names {heads} x {d_rel}",
+                x.width
+            ),
         ));
     }
     if w.dtype != x.dtype || w.rows != d_rel || w.width != extent {

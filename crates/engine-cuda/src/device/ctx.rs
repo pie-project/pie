@@ -109,10 +109,7 @@ impl Context {
                 }
 
                 let mut notify: rt::cudaStream_t = core::ptr::null_mut();
-                let status = rt::cudaStreamCreateWithFlags(
-                    &raw mut notify,
-                    1,
-                );
+                let status = rt::cudaStreamCreateWithFlags(&raw mut notify, 1);
                 if status != rt::cudaError::cudaSuccess {
                     blas::cublasDestroy_v2(handle);
                     rt::cudaStreamDestroy(stream);

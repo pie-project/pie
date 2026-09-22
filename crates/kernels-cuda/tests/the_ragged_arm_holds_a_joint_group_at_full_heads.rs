@@ -60,7 +60,10 @@ fn against_dense(rows: u32, hd: u32, heads: u32, seed: u64) {
     for r in 0..rows {
         let mut row_bad = false;
         for c in 0..width {
-            let (g, w) = (from_bf16(got[r * width + c]), from_bf16(want[r * width + c]));
+            let (g, w) = (
+                from_bf16(got[r * width + c]),
+                from_bf16(want[r * width + c]),
+            );
             let err = (g - w).abs();
             if err > TOLERANCE * w.abs().max(1.0) {
                 row_bad = true;
@@ -72,7 +75,9 @@ fn against_dense(rows: u32, hd: u32, heads: u32, seed: u64) {
         }
         bad_rows += usize::from(row_bad);
     }
-    eprintln!("{rows} rows, {heads} heads of {hd}: worst |diff| {worst:.2e} at row {worst_row}, {bad_rows} rows past tolerance");
+    eprintln!(
+        "{rows} rows, {heads} heads of {hd}: worst |diff| {worst:.2e} at row {worst_row}, {bad_rows} rows past tolerance"
+    );
     assert_eq!(
         bad_rows, 0,
         "{rows} rows, {heads} heads of {hd}: {bad_rows} rows disagree with the dense kernel (worst {worst:.2e} at row {worst_row})"

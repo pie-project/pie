@@ -17,7 +17,7 @@ path = "src/lib.rs"
 [dependencies]
 model-ir = { path = "../model-ir" }
 
-eta-ir = { path = "../eta-ir", features = ["serde"] }
+eta-ir = { package = "pie-eta-ir", path = "../eta-ir", features = ["serde"] }
 
 eta-compiler = { path = "../eta-compiler" }
 

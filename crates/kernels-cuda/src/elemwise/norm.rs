@@ -293,7 +293,10 @@ pub fn rmsnorm_grouped_plus_one(
     if y.width == 0 || !y.width.is_multiple_of(group) {
         return Err(refuse(
             OP,
-            format!("the {}-wide row is not a whole number of {group}-wide groups", y.width),
+            format!(
+                "the {}-wide row is not a whole number of {group}-wide groups",
+                y.width
+            ),
         ));
     }
     debug_assert_eq!(
@@ -307,7 +310,9 @@ pub fn rmsnorm_grouped_plus_one(
         OP,
         Fire::at(
             FILE,
-            symbol(&format!("::pie::elemwise::rmsnorm_grouped_plus_one<{t}, 256>")),
+            symbol(&format!(
+                "::pie::elemwise::rmsnorm_grouped_plus_one<{t}, 256>"
+            )),
         )
         .apply(launch),
         &[
@@ -412,7 +417,9 @@ pub fn residual_add_rmsnorm(
     let plus = if plus_one { "true" } else { "false" };
     let vectors = y.dtype == Dtype::Bf16
         && y.width.is_multiple_of(VEC_WIDTH)
-        && [x.ptr, y.ptr, weight.ptr, out.ptr].iter().all(|&at| aligned16(at));
+        && [x.ptr, y.ptr, weight.ptr, out.ptr]
+            .iter()
+            .all(|&at| aligned16(at));
     let (entrypoint, block) = if vectors {
         let block = (y.width / VEC_WIDTH).clamp(WARP, BLOCK).next_power_of_two();
         (
@@ -465,7 +472,11 @@ pub fn rmsnorm_residual_add(
         .ok_or_else(|| {
             refuse(
                 OP,
-                format!("a {}-wide row is wider than the fused chain seats ({})", y.width, BLOCK * 32),
+                format!(
+                    "a {}-wide row is wider than the fused chain seats ({})",
+                    y.width,
+                    BLOCK * 32
+                ),
             )
         })?;
     let ty = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -477,7 +488,11 @@ pub fn rmsnorm_residual_add(
     let rows = nonzero(OP, "rows", y.rows)?;
     let (s_arg, scaled_arg, has_scale) = match &scale {
         Some((s, scaled)) => (s.arg(), scaled.arg(), "true"),
-        None => (crate::jit::ArgValue::ABSENT, crate::jit::ArgValue::ABSENT, "false"),
+        None => (
+            crate::jit::ArgValue::ABSENT,
+            crate::jit::ArgValue::ABSENT,
+            "false",
+        ),
     };
     let (w1_arg, out_arg, eps1, has_post, plus) = match &post {
         Some(post) => (
@@ -551,23 +566,16 @@ pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> 
     let width = stated(OP, nonzero(OP, "the biased row's width", out.width)?)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::add_bias<{t}, {tb}>")))
-            .apply(route_rows(out.rows, out.width)),
-        &[
-            out.arg(),
-            bias.arg(),
-            width.arg(),
-            ctx.stage(),
-        ],
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::elemwise::add_bias<{t}, {tb}>")),
+        )
+        .apply(route_rows(out.rows, out.width)),
+        &[out.arg(), bias.arg(), width.arg(), ctx.stage()],
     )
 }
 
-pub fn standardize(
-    ctx: &Ctx,
-    bias: Tensor,
-    scale: Tensor,
-    out: &mut Tensor,
-) -> Result<(), Error> {
+pub fn standardize(ctx: &Ctx, bias: Tensor, scale: Tensor, out: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.standardize";
     let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "rows", out.rows)?;

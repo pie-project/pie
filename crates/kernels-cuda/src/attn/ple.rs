@@ -93,8 +93,7 @@ pub fn ngram_ids(
     let rows = nonzero(OP, "rows", ids.rows)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::ple_ngram_ids_update")
-            .apply(Launch::flat(rows, BLOCK)),
+        Fire::at(FILE, "::pie::attn::ple_ngram_ids_update").apply(Launch::flat(rows, BLOCK)),
         &[
             ids.arg(),
             state.slab.arg(),

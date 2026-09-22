@@ -15,7 +15,7 @@ crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-eta-ir = { path = "../eta-ir", features = ["serde"] }
+eta-ir = { package = "pie-eta-ir", path = "../eta-ir", features = ["serde"] }
 serde = { version = "1.0", default-features = false, features = [
     "alloc",
     "derive",

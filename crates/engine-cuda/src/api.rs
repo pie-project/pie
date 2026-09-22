@@ -946,7 +946,6 @@ intended for diagnostics, not serving",
         }
         self.loaded_mut()?.copy_kv(&moves).map_err(fault)
     }
-
 }
 
 impl Cuda {
@@ -1028,6 +1027,7 @@ impl Cuda {
                     group: lane.group,
                     peer: lane.peer,
                     ports: &lane.ports,
+                    attn_classes: lane.attn_classes.as_ref(),
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

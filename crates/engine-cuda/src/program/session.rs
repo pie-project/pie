@@ -372,14 +372,32 @@ impl Session {
         }
         stages_and_plans_agree(compiled)?;
 
-        if plan.needs_logits && self.bound & (1u64 << (eta_ir::op::IntrinsicId::Logits as u32)) == 0
-        {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `logits` intrinsic and no buffer has been \
-                 bound to it; the emitted kernel dereferences the side table's zero, \
-                 which is address zero",
-            ));
+        for (intrinsic, name, why) in [
+            (
+                eta_ir::op::IntrinsicId::Logits,
+                "logits",
+                "the emitted kernel dereferences the side table's zero, which is address zero",
+            ),
+            (
+                eta_ir::op::IntrinsicId::Velocity,
+                "velocity",
+                "the lane's reading plants no `velocity` export",
+            ),
+            (
+                eta_ir::op::IntrinsicId::Hidden,
+                "hidden",
+                "the lane's reading plants no `hidden` export",
+            ),
+        ] {
+            if plan.reads_intrinsic(intrinsic) && self.bound & (1u64 << (intrinsic as u32)) == 0 {
+                return Err(Fault::program(
+                    "program::session",
+                    format!(
+                        "this program reads the `{name}` intrinsic and no buffer has been bound \
+                         to it; {why}"
+                    ),
+                ));
+            }
         }
         if plan.needs_mtp_logits
             && self.bound & (1u64 << (eta_ir::op::IntrinsicId::MtpLogits as u32)) == 0

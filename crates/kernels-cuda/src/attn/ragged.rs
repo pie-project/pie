@@ -1,7 +1,7 @@
 use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
 use crate::attn::fa2_abi::{
-    PrefillRaggedBiasParams, PrefillRaggedParams, PrefillRaggedRefParams, PrefillRaggedTagParams,
-    UintFastdiv, sm_scale_or_default,
+    PrefillRaggedBiasParams, PrefillRaggedClassParams, PrefillRaggedParams, PrefillRaggedRefParams,
+    PrefillRaggedTagParams, UintFastdiv, sm_scale_or_default,
 };
 use crate::attn::kv;
 use crate::attn::plan::Device;
@@ -25,9 +25,24 @@ const KV_CHUNK_SENTINEL: i32 = i32::MAX;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaggedMask {
     None,
-    ReferenceSelfOnly { ref_start: Tensor },
-    ReferenceTags { q_tags: Tensor, kv_tags: Tensor },
-    RelativeBias { table: Tensor, max_len: u32 },
+    ReferenceSelfOnly {
+        ref_start: Tensor,
+    },
+    ReferenceTags {
+        q_tags: Tensor,
+        kv_tags: Tensor,
+    },
+    /// `q_classes[q] < 0 || kv_classes[kv] < 0 || table[q_class * count + kv_class] != 0`.
+    ClassTable {
+        q_classes: Tensor,
+        kv_classes: Tensor,
+        table: Tensor,
+        count: u32,
+    },
+    RelativeBias {
+        table: Tensor,
+        max_len: u32,
+    },
 }
 
 #[must_use]
@@ -249,6 +264,49 @@ pub fn ragged(
                     base: params,
                     q_tags: q_tags.ptr,
                     kv_tags: kv_tags.ptr,
+                },
+            )
+        }
+        RaggedMask::ClassTable {
+            q_classes,
+            kv_classes,
+            table,
+            count,
+        } => {
+            let sides = [("query", q_classes, q.rows), ("key", kv_classes, k.rows)];
+            for (what, classes, rows) in sides {
+                if classes.dtype != Dtype::I32 || classes.rows < rows {
+                    return Err(refuse(
+                        OP,
+                        format!(
+                            "the {what} class table is {:?} with {} entries; the mask reads one \
+                             i32 per row of the {rows}-row {what} rectangle",
+                            classes.dtype, classes.rows
+                        ),
+                    ));
+                }
+            }
+            let cells = u64::from(count) * u64::from(count);
+            if table.dtype != Dtype::U8 || u64::from(table.rows) < cells {
+                return Err(refuse(
+                    OP,
+                    format!(
+                        "the class table is {:?} with {} entries; the mask reads {count} x {count} \
+                         bytes",
+                        table.dtype, table.rows
+                    ),
+                ));
+            }
+            fa2::prefill_ragged(
+                ctx,
+                OP,
+                point(RaggedArm::ClassTable),
+                &PrefillRaggedClassParams {
+                    base: params,
+                    q_classes: q_classes.ptr,
+                    kv_classes: kv_classes.ptr,
+                    table: table.ptr,
+                    count,
                 },
             )
         }

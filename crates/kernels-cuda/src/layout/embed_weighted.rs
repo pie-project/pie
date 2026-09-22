@@ -20,12 +20,18 @@ pub fn embed_weighted(
 ) -> Result<(), Error> {
     const OP: &str = "layout.embed_weighted";
     let t = dtype_dispatch!(OP, table.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    debug_assert_eq!(y.dtype, table.dtype, "`{OP}` gathers into the table's element");
+    debug_assert_eq!(
+        y.dtype, table.dtype,
+        "`{OP}` gathers into the table's element"
+    );
 
     if ids.dtype != Dtype::I32 {
         return Err(refuse(
             OP,
-            format!("the taps this gather is handed are {:?}, and it reads i32 rows", ids.dtype),
+            format!(
+                "the taps this gather is handed are {:?}, and it reads i32 rows",
+                ids.dtype
+            ),
         ));
     }
     if weights.dtype != Dtype::F32 {
@@ -60,7 +66,12 @@ pub fn embed_weighted(
     let vocab = stated(OP, nonzero(OP, "the table's row count", vocab)?)?;
     let hidden = stated(OP, nonzero(OP, "the gathered row's width", y.width)?)?;
     let rows = nonzero(OP, "rows", y.rows)?;
-    let threads = y.width.div_ceil(WARP).max(1).saturating_mul(WARP).min(MAX_BLOCK);
+    let threads = y
+        .width
+        .div_ceil(WARP)
+        .max(1)
+        .saturating_mul(WARP)
+        .min(MAX_BLOCK);
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::layout::embed_weighted<{t}>")))

@@ -456,6 +456,9 @@ pub struct Prepared<'a> {
     token_injects: Vec<crate::inputs::TokenInject>,
     bodied: bool,
     admits: std::sync::Arc<[crate::window::Admit]>,
+    /// The key's island bits, so the fire records and replays under the key
+    /// that was prepared.
+    islands: Box<[u8]>,
     ladder: record::Ladder,
     lane_ceiling: u32,
     patch_ladder: Option<record::Ladder>,

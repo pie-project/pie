@@ -217,23 +217,25 @@ pie-tart
 /.orig_gemm.cpp
 
 # Derived JavaScript-facing WIT world (npm run derive-wit / generate-bindings)
-sdk/inferlet/javascript/wit/
+javascript/inferlet/wit/
 
 # Run output and scratch: `out/` was committed once already.
 out/
 marlin_scratch/
 
 target-wasm/
-sdk/server/web/pkg/
-sdk/server/web/dist/
-sdk/server/web/node_modules/
-tests/web/models
-tests/web/models2b
-tests/web/models4b
-tests/web/models9b
-tests/web/models-tiny/
-tests/web/inferlets/
-tests/web/tools/node_modules/
-tests/web/tools/package*.json
+javascript/browser/pkg/
+javascript/browser/dist/
+javascript/server/pie-server*.node
+javascript/server/npm/*/pie-server.node
+javascript/**/*.tgz
+tests/browser/models
+tests/browser/models2b
+tests/browser/models4b
+tests/browser/models9b
+tests/browser/models-tiny/
+tests/browser/inferlets/
+tests/browser/languages/
+tests/browser/tools/package*.json
 crates/kernels-wgpu/tools/wgsl/
-benches/web/results/*.raw
+scripts/bench/browser/results/*.raw

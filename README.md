@@ -26,11 +26,11 @@ customized per application without modifying the engine.
 
 ## Quick Start
 
-Pie is a standalone binary, no Python needed. For Windows, see the
-[installation guide](https://pie-project.org/docs/guide/install).
+Pie is a standalone binary, no Python needed.
 
 ```bash
-curl -fsSL https://pie-project.org/install.sh | bash
+curl -fsSL https://pie-project.org/install.sh | bash        # Linux, macOS, WSL
+irm https://pie-project.org/install.ps1 | iex               # Windows PowerShell
 ```
 
 ```bash
@@ -38,6 +38,11 @@ pie config init
 pie model import Qwen/Qwen3.5-0.8B
 pie serve
 ```
+
+The installer also places the Python and JavaScript language components
+(`pie-language-<language>.tar.gz`, one release asset per language) under
+`~/.pie/languages`; `pie language list` shows them, and `pie language install
+<file>` adds one from a downloaded asset or a locally built `.wasm`.
 
 A checkpoint is matched against the catalog's import contracts at load and
 refused by name when none fits; `pie model list` prints the SKU beside every
@@ -56,6 +61,36 @@ pie-client submit text-completion -- --prompt "The capital of France is"
 pie run --path ./target/wasm32-wasip2/debug/text_completion.wasm \
         --manifest ./Pie.toml -- --prompt "The capital of France is"
 ```
+
+### Compatible APIs
+
+`pie serve` also speaks the APIs existing clients already use, on the same
+port, with no API key:
+
+| Route | Client |
+|---|---|
+| `POST /v1/chat/completions`, `/v1/completions`, `/v1/responses`, `GET /v1/models` | `openai` |
+| `POST /v1/messages` | `anthropic` |
+| `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent?alt=sse` | `google-genai` |
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+print(client.chat.completions.create(model="default", messages=[{"role": "user", "content": "Hi"}]).choices[0].message.content)
+```
+
+The same server embeds in a process: `pie-server` on PyPI (`python/server`)
+and `@pie-project/server` on npm (`javascript/server`) boot what `pie serve`
+boots and hand back the address, each carrying every engine its platform
+supports (`engine.type` picks one at boot); `@pie-project/browser` is pie
+compiled for the browser.
+
+Each API is served by a built-in inferlet (`crates/builtins/inferlets/compat-openai`,
+`compat-anthropic`, `compat-gemini`) built into the `pie` binary; `pie doctor`
+lists them, and a newer version installed with `pie inferlet install` takes
+over. Tool calling, JSON schema output, streaming and reasoning
+(`reasoning_content`, `thinking` blocks, thought parts) are supported; images
+are not yet.
 
 ### Backends
 

@@ -2,8 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated,
-    symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
 };
 use crate::tensor::Tensor;
 
@@ -634,14 +633,20 @@ pub fn argmax(ctx: &Ctx, x: Tensor, column: u32, y: &mut Tensor) -> Result<(), E
     if column >= y.width {
         return Err(refuse(
             OP,
-            format!("column {column} is outside the {}-wide plane it writes", y.width),
+            format!(
+                "column {column} is outside the {}-wide plane it writes",
+                y.width
+            ),
         ));
     }
     debug_assert_eq!(x.rows, y.rows, "an argmax lands one entry per row");
     ctx.fire(
         OP,
-        Fire::at(TOPK_FILE, symbol(&format!("::pie::layout::argmax_rows<{t}>")))
-            .apply(Launch::per_row(rows, THREADS)),
+        Fire::at(
+            TOPK_FILE,
+            symbol(&format!("::pie::layout::argmax_rows<{t}>")),
+        )
+        .apply(Launch::per_row(rows, THREADS)),
         &[
             x.arg(),
             y.arg(),
@@ -679,15 +684,24 @@ pub fn topk(
     let rows = nonzero(OP, "rows", x.rows)?;
     nonzero(OP, "width", x.width)?;
     if values.rows != rows || values.width != k || values.dtype != Dtype::F32 {
-        return Err(refuse(OP, format!("the values plane is not [{rows}, {k}] f32")));
+        return Err(refuse(
+            OP,
+            format!("the values plane is not [{rows}, {k}] f32"),
+        ));
     }
     if indices.rows != rows || indices.width != k || indices.dtype != Dtype::I32 {
-        return Err(refuse(OP, format!("the indices plane is not [{rows}, {k}] i32")));
+        return Err(refuse(
+            OP,
+            format!("the indices plane is not [{rows}, {k}] i32"),
+        ));
     }
     ctx.fire(
         OP,
-        Fire::at(TOPK_FILE, symbol(&format!("::pie::layout::topk_rows<{t}, {k}>")))
-            .apply(Launch::per_row(rows, TOPK_THREADS)),
+        Fire::at(
+            TOPK_FILE,
+            symbol(&format!("::pie::layout::topk_rows<{t}, {k}>")),
+        )
+        .apply(Launch::per_row(rows, TOPK_THREADS)),
         &[
             x.arg(),
             values.arg(),

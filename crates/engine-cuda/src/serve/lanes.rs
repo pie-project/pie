@@ -1,4 +1,4 @@
-use engine::fire::{Boundary, Masking, PortFeed, RsReset, RsVerb, SelfCondInput};
+use engine::fire::{AttnClasses, Boundary, Masking, PortFeed, RsReset, RsVerb, SelfCondInput};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Lane<'a> {
@@ -29,6 +29,7 @@ pub struct Seated<'a> {
     pub group: Option<u32>,
     pub peer: Option<u32>,
     pub ports: &'a [PortFeed],
+    pub attn_classes: Option<&'a AttnClasses>,
 }
 
 impl<'a> Seated<'a> {
@@ -53,6 +54,7 @@ impl<'a> Seated<'a> {
             group: None,
             peer: None,
             ports: &[],
+            attn_classes: None,
         }
     }
 

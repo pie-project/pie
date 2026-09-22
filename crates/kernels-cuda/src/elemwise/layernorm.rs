@@ -19,13 +19,7 @@ pub fn layernorm_no_scale(ctx: &Ctx, x: Tensor, eps: f32, y: &mut Tensor) -> Res
             symbol(&format!("::pie::elemwise::layernorm_no_scale<{t}, 256>")),
         )
         .apply(Launch::per_row(rows, BLOCK)),
-        &[
-            x.arg(),
-            y.arg(),
-            hidden.arg(),
-            eps.arg(),
-            ctx.stage(),
-        ],
+        &[x.arg(), y.arg(), hidden.arg(), eps.arg(), ctx.stage()],
     )
 }
 

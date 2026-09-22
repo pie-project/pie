@@ -1,8 +1,11 @@
-use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Subcommand};
-use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
-use runtime::inferlet::program::{Manifest, ProgramName, Repository};
+use anyhow::{Context, Result, bail};
+use clap::{Args, Subcommand};
+
+use runtime::inferlet::program::{
+    Language, Manifest, Package, ParameterType, ProgramName, Repository, Runtime,
+};
 
 use crate::ui::{self, Align, Answer, Mark, Palette, Row, Table};
 
@@ -10,9 +13,9 @@ use crate::ui::{self, Align, Answer, Mark, Palette, Row, Table};
 pub enum InferletCmd {
     List,
 
-    Info(InfoArgs),
+    Info(TargetArgs),
 
-    Download(TargetArgs),
+    Install(InstallArgs),
 
     Remove(TargetArgs),
 }
@@ -23,70 +26,107 @@ pub struct TargetArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct InfoArgs {
-    pub inferlet: String,
+pub struct InstallArgs {
+    /// A built `.wasm`, or a `.py` script (which needs no build).
+    pub artifact: PathBuf,
+
+    /// Its manifest. Defaults to `<stem>.toml` beside the artifact, then
+    /// `Pie.toml` beside it; a bare script needs none.
+    #[arg(long, short = 'm')]
+    pub manifest: Option<PathBuf>,
+
+    /// Replace an installed program of the same name and version.
+    #[arg(long)]
+    pub force: bool,
 }
 
-pub async fn run(cmd: InferletCmd, global: &bootstrap::GlobalArgs) -> Result<Answer> {
+pub async fn run(cmd: InferletCmd) -> Result<Answer> {
     match cmd {
         InferletCmd::List => list(),
-        InferletCmd::Info(args) => info(args, global).await,
-        InferletCmd::Download(args) => download(args, global).await,
-        InferletCmd::Remove(args) => remove(args).await,
+        InferletCmd::Info(args) => info(args),
+        InferletCmd::Install(args) => install(args).await,
+        InferletCmd::Remove(args) => remove(args),
     }
 }
 
-fn programs_dir() -> std::path::PathBuf {
-    bootstrap::paths::pie_home().join("programs")
-}
-
-pub(crate) fn cached_version(name: &str) -> Option<ProgramName> {
-    open(String::new())
-        .cached()
-        .into_iter()
-        .map(|(program, _, _)| program)
-        .filter(|program| program.name == name)
-        .max_by(|a, b| version_order(&a.version).cmp(&version_order(&b.version)))
-}
-
-fn version_order(version: &str) -> (u64, u64, u64, String) {
-    let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(Some(major)), Some(Some(minor)), Some(Some(patch))) => {
-            (major, minor, patch, String::new())
+/// What is installed under the inferlets directory, plus the programs built
+/// into the binary (which a disk install of the same name and version
+/// shadows).
+fn open() -> Repository {
+    let mut repo = Repository::new(bootstrap::paths::inferlets_dir());
+    repo.refresh();
+    for builtin in builtins::all() {
+        if let Ok(manifest) = Manifest::parse(builtin.manifest) {
+            repo.add_builtin(manifest, builtin.component);
         }
-        _ => (0, 0, 0, version.to_string()),
     }
+    repo
 }
 
-fn open(registry_url: String) -> Repository {
-    let mut repo = Repository::new(registry_url, programs_dir());
-    repo.load_program_cache();
-    repo
+/// Resolve `name` (its newest installed version) or `name@version` against
+/// what is installed. Nothing is fetched: an absent program is an error
+/// that says what is here instead.
+pub(crate) fn resolve_installed(spec: &str) -> Result<ProgramName> {
+    resolve_in(&open(), spec)
+}
+
+fn resolve_in(repo: &Repository, spec: &str) -> Result<ProgramName> {
+    let name = match spec.split_once('@') {
+        None => spec,
+        Some((name, _)) => {
+            let program = ProgramName::parse(spec)?;
+            if repo.exists(&program) {
+                return Ok(program);
+            }
+            let others: Vec<String> = repo
+                .cached()
+                .into_iter()
+                .filter(|(program, _, _)| program.name == name)
+                .map(|(program, _, _)| program.version)
+                .collect();
+            if !others.is_empty() {
+                bail!(
+                    "{spec} is not installed; {name} is here as {}",
+                    others.join(", ")
+                );
+            }
+            name
+        }
+    };
+    repo.newest(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{spec} is not installed; `pie inferlet list` shows what is, \
+             `pie inferlet install <file.wasm>` adds one"
+        )
+    })
 }
 
 #[derive(serde::Serialize)]
 #[serde(transparent)]
 pub struct InferletList {
-    inferlets: Vec<CachedInferlet>,
+    inferlets: Vec<InstalledInferlet>,
 }
 
 #[derive(serde::Serialize)]
-struct CachedInferlet {
+struct InstalledInferlet {
     name: String,
     version: String,
     description: Option<String>,
     bytes: u64,
+    /// Served from the binary, not the inferlets directory.
+    builtin: bool,
 }
 
 impl ui::Report for InferletList {
     fn render(&self, palette: &Palette) {
         if self.inferlets.is_empty() {
-            println!("nothing downloaded yet");
-            println!("  inferlets arrive on first use, or with `pie inferlet download <name>`");
+            println!("nothing installed yet");
+            println!(
+                "  `pie inferlet install <file.wasm | file.py>` adds one; `pie run <file>` runs one without installing it"
+            );
             return;
         }
-        let mut table = Table::new([Align::Left, Align::Right, Align::Left], 2);
+        let mut table = Table::new([Align::Left, Align::Right, Align::Left, Align::Left], 2);
         for inferlet in &self.inferlets {
             let description = inferlet
                 .description
@@ -102,6 +142,7 @@ impl ui::Report for InferletList {
                 [
                     format!("{}@{}", inferlet.name, inferlet.version),
                     ui::bytes(inferlet.bytes),
+                    if inferlet.builtin { "built-in" } else { "" }.to_string(),
                     description,
                 ],
             ));
@@ -111,12 +152,13 @@ impl ui::Report for InferletList {
 }
 
 fn list() -> Result<Answer> {
-    let repo = open(String::new());
+    let repo = open();
     Ok(Answer::report(InferletList {
         inferlets: repo
             .cached()
             .into_iter()
-            .map(|(name, manifest, bytes)| CachedInferlet {
+            .map(|(name, manifest, bytes)| InstalledInferlet {
+                builtin: repo.is_builtin(&name),
                 name: name.name,
                 version: name.version,
                 description: manifest.package.description,
@@ -126,26 +168,143 @@ fn list() -> Result<Answer> {
     }))
 }
 
-async fn download(args: TargetArgs, global: &bootstrap::GlobalArgs) -> Result<Answer> {
-    let (cfg_path, _) = bootstrap::cli_config_path(global);
-    let cfg = crate::derive::load_worker_config(&cfg_path)?;
-    let name = resolve_inferlet_id(&args.inferlet, &cfg.server.registry).await?;
-    let mut repo = open(cfg.server.registry.clone());
-    if repo.exists(&name) {
+async fn install(args: InstallArgs) -> Result<Answer> {
+    let artifact = load_artifact(&args.artifact, args.manifest.as_deref())?;
+    let name = artifact.manifest.program_name();
+
+    let mut repo = open();
+    if repo.exists(&name) && !args.force {
         return Ok(Answer::noop(format!(
-            "{}@{} was already downloaded",
-            name.name, name.version
+            "{name} is already installed; `--force` replaces it"
         )));
     }
-    repo.add_from_registry(&name, false).await?;
+    repo.add(artifact.bytes, artifact.manifest, args.force)
+        .await
+        .with_context(|| format!("installing {name}"))?;
     Ok(Answer::did(format!(
-        "downloaded {}@{}",
-        name.name, name.version
+        "installed {name} into {}",
+        ui::short_path(repo.programs_dir())
     )))
 }
 
-async fn remove(args: TargetArgs) -> Result<Answer> {
-    let mut repo = open(String::new());
+/// A program read from disk with the manifest that names it: a component
+/// beside its manifest, or a script, whose manifest may be synthesized from
+/// the file alone.
+#[derive(Debug)]
+pub struct Artifact {
+    pub bytes: Vec<u8>,
+    pub manifest: Manifest,
+    /// The manifest as the engine will receive it.
+    pub manifest_toml: String,
+}
+
+/// Read `path` and settle its manifest. A `.wasm` needs a manifest beside
+/// it (or named with `manifest`). A script (`.py`) takes the manifest beside
+/// it when there is one, else one synthesized from the file name; either
+/// way the manifest states the script's language.
+pub(crate) fn load_artifact(path: &Path, manifest: Option<&Path>) -> Result<Artifact> {
+    if !path.is_file() {
+        bail!("no file at {}", path.display());
+    }
+    let language = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(Language::from_extension);
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+
+    let manifest_path = match manifest {
+        Some(named) => Ok(named.to_path_buf()),
+        None => manifest_beside(path),
+    };
+    let mut manifest = match (manifest_path, language) {
+        (Ok(manifest_path), _) => {
+            let content = std::fs::read_to_string(&manifest_path)
+                .with_context(|| format!("reading {}", manifest_path.display()))?;
+            Manifest::parse(&content)
+                .with_context(|| format!("reading {}", manifest_path.display()))?
+        }
+        (Err(_), Some(language)) => synthesized_manifest(path, language)?,
+        (Err(error), None) => return Err(error),
+    };
+
+    match (language, manifest.language()) {
+        (Some(from_file), None) => manifest.runtime.language = Some(from_file),
+        (Some(from_file), Some(declared)) if from_file != declared => bail!(
+            "{} is {from_file} source but its manifest says `language = \"{declared}\"`",
+            path.display()
+        ),
+        (None, Some(declared)) => bail!(
+            "{} is a component but its manifest says `language = \"{declared}\"`; a \
+             {declared} inferlet is its source file, not a build",
+            path.display()
+        ),
+        _ => {}
+    }
+
+    let manifest_toml = manifest.to_toml()?;
+    Ok(Artifact {
+        bytes,
+        manifest,
+        manifest_toml,
+    })
+}
+
+/// The manifest a bare script implies: named after the file, version
+/// 0.0.0, in the file's language.
+fn synthesized_manifest(path: &Path, language: Language) -> Result<Manifest> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+    let name = stem.replace('_', "-");
+    ProgramName::parse(&format!("{name}@0.0.0")).with_context(|| {
+        format!(
+            "{} cannot name a program; a `Pie.toml` beside it can",
+            path.display()
+        )
+    })?;
+    Ok(Manifest {
+        package: Package {
+            name,
+            version: "0.0.0".to_string(),
+            description: None,
+            authors: Vec::new(),
+            repository: None,
+            readme: None,
+            tier: None,
+        },
+        runtime: Runtime {
+            language: Some(language),
+            ..Default::default()
+        },
+        parameters: Default::default(),
+        dependencies: Default::default(),
+    })
+}
+
+/// The manifest an artifact carries beside it: `<stem>.toml` (the installed
+/// layout) or `Pie.toml` (a project directory).
+fn manifest_beside(artifact: &Path) -> Result<PathBuf> {
+    let sibling = artifact.with_extension("toml");
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+    if let Some(dir) = artifact.parent() {
+        let pie_toml = dir.join("Pie.toml");
+        if pie_toml.is_file() {
+            return Ok(pie_toml);
+        }
+    }
+    bail!(
+        "no manifest beside {}: expected {} or a Pie.toml in the same directory; \
+         `--manifest` names one elsewhere",
+        artifact.display(),
+        sibling.display()
+    )
+}
+
+fn remove(args: TargetArgs) -> Result<Answer> {
+    let mut repo = open();
     let name = match args.inferlet.split_once('@') {
         Some(_) => ProgramName::parse(&args.inferlet)?,
         None => {
@@ -155,17 +314,16 @@ async fn remove(args: TargetArgs) -> Result<Answer> {
                 .map(|(name, _, _)| name)
                 .filter(|name| name.name == args.inferlet)
                 .collect();
-            match matching.len() {
-                0 => bail!(
-                    "{} is not downloaded; `pie inferlet list` shows what is",
+            match matching.as_slice() {
+                [] => bail!(
+                    "{} is not installed; `pie inferlet list` shows what is",
                     args.inferlet
                 ),
-                1 => matching.into_iter().next().unwrap(),
-                _ => {
-                    let versions: Vec<String> =
-                        matching.iter().map(|n| n.version.clone()).collect();
+                [one] => one.clone(),
+                many => {
+                    let versions: Vec<&str> = many.iter().map(|n| n.version.as_str()).collect();
                     bail!(
-                        "{} has {} versions downloaded ({}); name the one to remove",
+                        "{} has {} versions installed ({}); name the one to remove",
                         args.inferlet,
                         versions.len(),
                         versions.join(", ")
@@ -174,36 +332,48 @@ async fn remove(args: TargetArgs) -> Result<Answer> {
             }
         }
     };
+    if repo.is_builtin(&name) {
+        bail!(
+            "{name} is built into this pie and cannot be removed; installing another version \
+             of {} shadows it",
+            name.name
+        );
+    }
     Ok(if repo.remove(&name)? {
-        Answer::did(format!("removed {}@{}", name.name, name.version))
+        Answer::did(format!("removed {name}"))
     } else {
-        Answer::noop(format!("{}@{} was not downloaded", name.name, name.version))
+        Answer::noop(format!("{name} was not installed"))
     })
 }
 
-async fn info(args: InfoArgs, global: &bootstrap::GlobalArgs) -> Result<Answer> {
-    let (cfg_path, _) = bootstrap::cli_config_path(global);
-    let cfg = crate::derive::load_worker_config(&cfg_path)?;
-
-    let program = resolve_inferlet_id(&args.inferlet, &cfg.server.registry).await?;
-    let manifest = Manifest::from_url(&cfg.server.registry, &program).await?;
+fn info(args: TargetArgs) -> Result<Answer> {
+    let repo = open();
+    let program = resolve_in(&repo, &args.inferlet)?;
+    let manifest = repo
+        .fetch_manifest(&program)
+        .ok_or_else(|| anyhow::anyhow!("{}", repo.not_installed(&program)))?;
 
     Ok(Answer::report(InferletInfo {
-        name: program.name.clone(),
-        version: program.version.clone(),
-        description: manifest.package.description.clone(),
-        authors: manifest.package.authors.clone(),
-        repository: manifest.package.repository.clone(),
+        name: program.name,
+        version: program.version,
+        description: manifest.package.description,
+        authors: manifest.package.authors,
+        repository: manifest.package.repository,
         runtime: serde_json::to_value(&manifest.runtime)?,
         dependencies: serde_json::to_value(&manifest.dependencies)?,
         parameters: manifest
             .parameters
-            .iter()
+            .into_iter()
             .map(|(name, p)| Parameter {
-                name: name.clone(),
-                r#type: parameter_type_name(&p.param_type),
+                name,
+                r#type: match p.param_type {
+                    ParameterType::String => "string",
+                    ParameterType::Int => "int",
+                    ParameterType::Float => "float",
+                    ParameterType::Bool => "bool",
+                },
                 optional: p.optional,
-                description: p.description.clone(),
+                description: p.description,
             })
             .collect(),
     }))
@@ -294,90 +464,107 @@ impl ui::Report for InferletInfo {
     }
 }
 
-#[derive(Deserialize)]
-struct RegistryInferlet {
-    versions: Vec<RegistryVersion>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[derive(Deserialize)]
-struct RegistryVersion {
-    num: String,
-}
-
-pub(crate) async fn resolve_inferlet_id(inferlet: &str, registry_url: &str) -> Result<ProgramName> {
-    match inferlet.split_once('@') {
-        Some((name, "latest")) => {
-            validate_bare_inferlet_name(name)?;
-            let version = latest_version(name, registry_url).await?;
-            Ok(ProgramName {
-                name: name.to_string(),
-                version,
-            })
-        }
-        Some(_) => ProgramName::parse(inferlet),
-        None => {
-            validate_bare_inferlet_name(inferlet)?;
-            let version = latest_version(inferlet, registry_url).await?;
-            Ok(ProgramName {
-                name: inferlet.to_string(),
-                version,
-            })
-        }
+    fn manifest(name: &str, version: &str) -> Manifest {
+        Manifest::parse(&format!(
+            "[package]\nname = \"{name}\"\nversion = \"{version}\"\n"
+        ))
+        .unwrap()
     }
-}
 
-async fn latest_version(name: &str, registry_url: &str) -> Result<String> {
-    let url = format!(
-        "{}/api/v1/inferlets/{}",
-        registry_url.trim_end_matches('/'),
-        name
-    );
-    let resp = reqwest::get(&url)
-        .await
-        .with_context(|| format!("resolve latest inferlet version from {url}"))?;
-    if !resp.status().is_success() {
-        bail!(
-            "resolve latest inferlet version: {url} returned {}",
-            resp.status()
+    async fn repo_with(dir: &Path, programs: &[(&str, &str)]) -> Repository {
+        let mut repo = Repository::new(dir.to_path_buf());
+        for (name, version) in programs {
+            repo.add(b"\0asm".to_vec(), manifest(name, version), false)
+                .await
+                .unwrap();
+        }
+        repo
+    }
+
+    #[tokio::test]
+    async fn inferlet_every_case() {
+        a_bare_name_resolves_to_the_newest_installed_version().await;
+        an_absent_program_is_refused_with_what_is_here().await;
+        the_manifest_beside_a_wasm_is_its_stem_toml_then_pie_toml();
+        a_bare_script_is_named_by_its_file_in_its_language();
+        a_script_beside_a_manifest_takes_the_manifest_and_states_its_language();
+        a_component_whose_manifest_claims_a_language_is_refused();
+    }
+
+    fn a_bare_script_is_named_by_its_file_in_its_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("beam_search.py");
+        std::fs::write(&script, "async def main(input): return input\n").unwrap();
+        let artifact = load_artifact(&script, None).unwrap();
+        assert_eq!(
+            artifact.manifest.program_name().to_string(),
+            "beam-search@0.0.0"
         );
+        assert_eq!(artifact.manifest.language(), Some(Language::Python));
+        assert!(artifact.manifest_toml.contains("language = \"python\""));
+        assert_eq!(artifact.bytes, b"async def main(input): return input\n");
     }
-    let body = resp
-        .text()
-        .await
-        .with_context(|| format!("read latest inferlet metadata from {url}"))?;
-    latest_version_from_registry_json(&body)
-        .with_context(|| format!("resolve latest version for {name:?}"))
-}
 
-fn latest_version_from_registry_json(body: &str) -> Result<String> {
-    let info: RegistryInferlet =
-        serde_json::from_str(body).context("parse registry inferlet metadata")?;
-    info.versions
-        .into_iter()
-        .find(|v| !v.num.is_empty())
-        .map(|v| v.num)
-        .ok_or_else(|| anyhow!("registry returned no versions"))
-}
-
-fn validate_bare_inferlet_name(name: &str) -> Result<()> {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        bail!("inferlet name is empty");
-    };
-    if !first.is_ascii_alphanumeric() {
-        bail!("invalid inferlet name {name:?}: must start with an ASCII letter or digit");
+    fn a_script_beside_a_manifest_takes_the_manifest_and_states_its_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("main.py");
+        std::fs::write(&script, "x = 1\n").unwrap();
+        std::fs::write(
+            dir.path().join("Pie.toml"),
+            "[package]\nname = \"twin\"\nversion = \"0.2.0\"\n",
+        )
+        .unwrap();
+        let artifact = load_artifact(&script, None).unwrap();
+        assert_eq!(artifact.manifest.program_name().to_string(), "twin@0.2.0");
+        assert_eq!(artifact.manifest.language(), Some(Language::Python));
     }
-    if chars.any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
-        bail!("invalid inferlet name {name:?}: use only ASCII letters, digits, '-' and '_'");
-    }
-    Ok(())
-}
 
-fn parameter_type_name(param_type: &runtime::inferlet::program::ParameterType) -> &'static str {
-    match param_type {
-        runtime::inferlet::program::ParameterType::String => "string",
-        runtime::inferlet::program::ParameterType::Int => "int",
-        runtime::inferlet::program::ParameterType::Float => "float",
-        runtime::inferlet::program::ParameterType::Bool => "bool",
+    fn a_component_whose_manifest_claims_a_language_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = dir.path().join("0.1.0.wasm");
+        std::fs::write(&wasm, b"\0asm").unwrap();
+        std::fs::write(
+            dir.path().join("0.1.0.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[runtime]\nlanguage = \"python\"\n",
+        )
+        .unwrap();
+        let err = load_artifact(&wasm, None).unwrap_err().to_string();
+        assert!(err.contains("component"), "{err}");
+    }
+
+    async fn a_bare_name_resolves_to_the_newest_installed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo_with(dir.path(), &[("beam", "0.1.0"), ("beam", "0.2.0")]).await;
+        assert_eq!(resolve_in(&repo, "beam").unwrap().version, "0.2.0");
+        assert_eq!(resolve_in(&repo, "beam@0.1.0").unwrap().version, "0.1.0");
+    }
+
+    async fn an_absent_program_is_refused_with_what_is_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo_with(dir.path(), &[("beam", "0.1.0")]).await;
+        let err = resolve_in(&repo, "beam@0.9.0").unwrap_err().to_string();
+        assert!(err.contains("0.1.0"), "{err}");
+        let err = resolve_in(&repo, "sink").unwrap_err().to_string();
+        assert!(err.contains("pie inferlet install"), "{err}");
+        let err = resolve_in(&repo, "sink@0.1.0").unwrap_err().to_string();
+        assert!(err.contains("pie inferlet install"), "{err}");
+    }
+
+    fn the_manifest_beside_a_wasm_is_its_stem_toml_then_pie_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = dir.path().join("0.1.0.wasm");
+        std::fs::write(&wasm, b"\0asm").unwrap();
+        assert!(manifest_beside(&wasm).is_err());
+        std::fs::write(dir.path().join("Pie.toml"), "").unwrap();
+        assert_eq!(manifest_beside(&wasm).unwrap(), dir.path().join("Pie.toml"));
+        std::fs::write(dir.path().join("0.1.0.toml"), "").unwrap();
+        assert_eq!(
+            manifest_beside(&wasm).unwrap(),
+            dir.path().join("0.1.0.toml")
+        );
     }
 }

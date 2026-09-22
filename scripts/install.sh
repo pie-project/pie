@@ -3,20 +3,22 @@
 #
 #   curl -fsSL https://pie-project.org/install.sh | bash
 #   curl -fsSL https://pie-project.org/install.sh | PIE_FLAVOR=cuda13.0 bash
-#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.5.0 bash
+#   curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.5.1 bash
 #
 # Environment overrides:
-#   PIE_VERSION       Release tag (default: 0.5.0).
-#   PIE_FLAVOR        metal|wgpu (macOS arm64) | cuda{12.8,13.0}|vulkan|wgpu (Linux). Auto-detected when unset.
+#   PIE_VERSION       Release tag (default: 0.5.1).
+#   PIE_FLAVOR        metal|wgpu (macOS arm64) | cuda13.0|vulkan|wgpu (Linux, WSL included). Auto-detected when unset.
 #   PIE_INSTALL_DIR   Install location for the `pie` binary (default: ~/.local/bin).
+#   PIE_HOME          Where the Python and JavaScript support goes (default: ~/.pie).
 #   PIE_REPO          GitHub owner/name (default: pie-project/pie).
 #   PIE_DOWNLOAD_BASE Override the asset base URL (default: GitHub releases).
 
 set -euo pipefail
 
 PIE_REPO="${PIE_REPO:-pie-project/pie}"
-PIE_VERSION="${PIE_VERSION:-0.5.0}"
+PIE_VERSION="${PIE_VERSION:-0.5.1}"
 PIE_INSTALL_DIR="${PIE_INSTALL_DIR:-${HOME}/.local/bin}"
+PIE_HOME="${PIE_HOME:-${HOME}/.pie}"
 PIE_DOWNLOAD_BASE="${PIE_DOWNLOAD_BASE:-https://github.com/${PIE_REPO}/releases/download/${PIE_VERSION}}"
 PIE_DETECTED_FLAVOR=""
 PIE_FLAVOR_REASON=""
@@ -70,7 +72,7 @@ case "$os_raw" in
   Linux)               os=linux ;;
   Darwin)              os=darwin ;;
   MINGW*|MSYS*|CYGWIN*)
-    err "Windows is not supported. Use WSL and the Linux build." ;;
+    err "on Windows, run install.ps1 in PowerShell (irm https://pie-project.org/install.ps1 | iex), or run this script inside WSL for the Linux build" ;;
   *)
     err "unsupported operating system: $os_raw" ;;
 esac
@@ -219,6 +221,22 @@ if ! install -m 0755 "${tmp}/pie" "${PIE_INSTALL_DIR}/pie"; then
 fi
 
 ok "Pie was installed to ${PIE_INSTALL_DIR}/pie"
+
+# Python and JavaScript inferlets run under a language component per
+# language. Each is its own archive, laid out like PIE_HOME so it extracts
+# straight into it; the built-in inferlets are in the binary itself.
+step "Installing Python and JavaScript support"
+for language in python javascript; do
+  lang_url="${PIE_DOWNLOAD_BASE}/pie-language-${language}.tar.gz"
+  debug "Trying:   ${lang_url}"
+  if fetch "$lang_url" "${tmp}/pie-language-${language}.tar.gz" && tar -tzf "${tmp}/pie-language-${language}.tar.gz" >/dev/null 2>&1; then
+    mkdir -p "${PIE_HOME}" || err "could not create ${PIE_HOME}"
+    tar -C "${PIE_HOME}" -xzf "${tmp}/pie-language-${language}.tar.gz"
+    ok "${language} support was installed to ${PIE_HOME}/languages"
+  else
+    warn "no pie-language-${language}.tar.gz for ${PIE_VERSION}; ${language} inferlets need it (\`pie language install <that file>\` adds it later)"
+  fi
+done
 
 path_for_shell() {
   case "${PIE_INSTALL_DIR}" in

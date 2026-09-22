@@ -17,10 +17,6 @@ pub enum ClientMessage {
         corr_id: u32,
         name: String,
         version: String,
-        #[serde(default)]
-        wasm_hash: Option<String>,
-        #[serde(default)]
-        manifest_hash: Option<String>,
     },
 
     #[serde(rename = "query")]

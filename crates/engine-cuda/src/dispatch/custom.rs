@@ -113,8 +113,12 @@ impl model_exec::DispatchProbe for Run<'_> {
         let mut outs = Vec::new();
         node.op.outputs(&mut outs);
         for id in outs {
-            let Some(decl) = self.values().get(id.0 as usize) else { continue };
-            let model_ir::Ty::Tensor { dtype, .. } = &decl.ty else { continue };
+            let Some(decl) = self.values().get(id.0 as usize) else {
+                continue;
+            };
+            let model_ir::Ty::Tensor { dtype, .. } = &decl.ty else {
+                continue;
+            };
             let elem: usize = match dtype {
                 model_ir::Dtype::Bf16 | model_ir::Dtype::F16 => 2,
                 model_ir::Dtype::F32 => 4,
@@ -127,7 +131,9 @@ impl model_exec::DispatchProbe for Run<'_> {
             }
             let bytes = total.min(1 << 20);
             let mut host = vec![0u8; bytes];
-            if crate::device::copy_any(self.ctx().stream(), host.as_mut_ptr() as u64, t.ptr, bytes).is_err() {
+            if crate::device::copy_any(self.ctx().stream(), host.as_mut_ptr() as u64, t.ptr, bytes)
+                .is_err()
+            {
                 continue;
             }
             let bad = match dtype {
@@ -144,7 +150,12 @@ impl model_exec::DispatchProbe for Run<'_> {
             if let Some(at) = bad {
                 eprintln!(
                     "nan-check: {} layer={:?} value={} dtype={:?} rows={} width={} first non-finite at element {at}",
-                    node.op.name(), node.layer, id.0, dtype, t.rows, t.width
+                    node.op.name(),
+                    node.layer,
+                    id.0,
+                    dtype,
+                    t.rows,
+                    t.width
                 );
             }
         }

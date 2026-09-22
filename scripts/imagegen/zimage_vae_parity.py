@@ -53,7 +53,7 @@ DEFAULT_GOLDEN = os.path.join(
 )
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-INFERLET = os.path.join(REPO, "tests/inferlets/zimage-vae-parity")
+INFERLET = os.path.join(REPO, "examples/zimage-vae-parity")
 
 COS_TOL = 0.999
 ABS_TOL = 0.05

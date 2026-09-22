@@ -1,0 +1,20 @@
+{
+  "name": "@pie-project/client",
+  "version": "0.5.1",
+  "description": "JavaScript client for Pie",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.2.0",
+    "msgpack-lite": "^0.2.2"
+  }
+}

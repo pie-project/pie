@@ -545,6 +545,62 @@ def cmd_euler(out_dir: str):
         np.savez(path, **d)
         print(f"[euler/{name}] {len(d)} tensors -> {path}   final |x| = {x.abs().mean():.6f}")
 
+def dpm2m_tables(sig):
+    """Per-step scalars of DPM-Solver++ 2M on a flow schedule, the SDK's
+    `latent::Dpm2m::of` in numpy: step i goes from sig[i] to sig[i+1] with
+    `x0 = x - sig[i] v`, `x <- ratio x + gain D`, `D = (1 + mix) x0 - mix x0_prev`.
+    The first step and the step onto sigma 0 are first order (mix 0)."""
+    lam = lambda s: math.log(max(1.0 - s, 1e-12) / max(s, 1e-12))
+    ratio, gain, mix = [], [], []
+    h_prev = None
+    for i in range(len(sig) - 1):
+        ss, st = sig[i], sig[i + 1]
+        a_s, a_t = 1.0 - ss, 1.0 - st
+        e = 0.0 if st <= 0.0 else (st * a_s) / (ss * a_t)
+        h = math.inf if st <= 0.0 else lam(st) - lam(ss)
+        ratio.append(st / ss if ss > 0.0 else 0.0)
+        gain.append(-a_t * (e - 1.0))
+        mix.append(h / (2.0 * h_prev) if (h_prev is not None and math.isfinite(h)
+                                          and math.isfinite(h_prev) and h_prev != 0.0) else 0.0)
+        h_prev = h
+    return ratio, gain, mix
+
+
+def cmd_dpm2m(out_dir: str):
+    """The Euler golden's start and schedule, integrated by DPM-Solver++ 2M."""
+    m = build()
+    _, text, context, _ = fixed_inputs()
+    b = CONFIG["dump_batch"]
+    c, hs, ws = CONFIG["latent_shape"]
+    g = torch.Generator().manual_seed(CONFIG["euler_noise_seed"])
+    x0 = torch.randn(b, c, hs, ws, generator=g)
+    sig = CONFIG["euler_sigmas"]
+    ratio, gain, mix = dpm2m_tables(sig)
+    for name in ("fp32", "bf16"):
+        pol = Policy(name)
+        d = Dump()
+        d.put("dpm2m.x_init", x0)
+        d["dpm2m.sigmas"] = np.asarray(sig, dtype=np.float32)
+        d["dpm2m.ratio"] = np.asarray(ratio, dtype=np.float32)
+        d["dpm2m.gain"] = np.asarray(gain, dtype=np.float32)
+        d["dpm2m.mix"] = np.asarray(mix, dtype=np.float32)
+        x = x0.clone()
+        prev = torch.zeros_like(x0)
+        for i in range(CONFIG["euler_steps"]):
+            t = torch.full((b,), sig[i] * CONFIG["euler_t_scale"])
+            v = forward(m, x, text, context, t, pol, dump=d, prefix=f"dpm2m.s{i}.")
+            d.put(f"dpm2m.v{i}", v)
+            pred = x - sig[i] * v
+            D = (1.0 + mix[i]) * pred - mix[i] * prev
+            x = ratio[i] * x + gain[i] * D
+            prev = pred
+            d.put(f"dpm2m.x{i + 1}", x)
+        d.put("dpm2m.latent", x)
+        path = os.path.join(out_dir, f"mini_dit_dpm2m_{name}.npz")
+        np.savez(path, **d)
+        print(f"[dpm2m/{name}] {len(d)} tensors -> {path}   final |x| = {x.abs().mean():.6f}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -552,9 +608,10 @@ def main():
     ap.add_argument("--init", action="store_true")
     ap.add_argument("--dump", action="store_true")
     ap.add_argument("--euler", action="store_true")
+    ap.add_argument("--dpm2m", action="store_true")
     ap.add_argument("--all", action="store_true")
     a = ap.parse_args()
-    if not (a.init or a.dump or a.euler):
+    if not (a.init or a.dump or a.euler or a.dpm2m):
         a.all = True
     os.makedirs(a.out_dir, exist_ok=True)
     torch.set_grad_enabled(False)
@@ -564,6 +621,8 @@ def main():
         cmd_dump(a.out_dir)
     if a.all or a.euler:
         cmd_euler(a.out_dir)
+    if a.all or a.dpm2m:
+        cmd_dpm2m(a.out_dir)
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,35 @@
+{
+  "name": "@pie-project/inferlet",
+  "version": "0.5.1",
+  "description": "JavaScript library for writing Pie inferlets",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run src/__tests__ && node --test language/transform.test.mjs",
+    "test:watch": "vitest",
+    "generate-bindings": "node scripts/derive-js-wit.mjs && node -e \"require('node:fs').rmSync('src/bindings',{recursive:true,force:true})\" && jco types wit -o src/bindings --world-name inferlet && node scripts/gen-tsconfig-paths.mjs",
+    "derive-wit": "node scripts/derive-js-wit.mjs"
+  },
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "^0.22.0",
+    "@bytecodealliance/jco": "^1.32.1",
+    "acorn": "^8.18.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  },
+  "files": [
+    "dist",
+    "language",
+    "scripts",
+    "wit"
+  ]
+}

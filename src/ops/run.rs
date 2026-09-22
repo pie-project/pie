@@ -1,11 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use clap::Args;
 use client::client::{Client, ProcessEvent};
 
+use crate::ops::inferlet::{Artifact, load_artifact};
+
 #[derive(Args, Debug)]
 pub struct RunArgs {
+    /// An installed inferlet's name, or a path to a `.wasm` or `.py`.
     pub inferlet: Option<String>,
 
     #[arg(long, short = 'p')]
@@ -23,58 +26,71 @@ pub struct RunArgs {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Target {
-    Registry(String),
+    /// A name to resolve against what is installed (or curated in this tree).
+    Installed(String),
+    /// A file to upload and run: a component or a script, with its manifest
+    /// beside it, named, or (for a script) implied.
     Local {
-        wasm: PathBuf,
-        manifest: PathBuf,
-        name: String,
+        path: PathBuf,
+        manifest: Option<PathBuf>,
     },
+}
+
+/// Whether a `pie run` positional names a file rather than an installed
+/// program: it carries a path separator or an artifact extension.
+fn looks_like_a_file(word: &str) -> bool {
+    word.contains(['/', '\\'])
+        || Path::new(word)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e, "wasm" | "py" | "js" | "mjs"))
 }
 
 pub fn target(
     inferlet: Option<&str>,
     path: Option<&Path>,
     manifest: Option<&Path>,
-    read_manifest: impl FnOnce(&Path) -> Result<String>,
 ) -> Result<Target> {
     match (inferlet, path) {
         (None, None) => bail!(
-            "name an inferlet to run, or point `--path` at a local `.wasm`. \
-             `pie inferlet list` shows what is already here."
+            "name an inferlet to run, or a `.wasm` or `.py` to run from a file. \
+             `pie inferlet list` shows what is installed."
         ),
         (Some(inferlet), Some(path)) => bail!(
             "both an inferlet name ({inferlet:?}) and `--path {}` -- run one or \
              the other. Arguments for the inferlet go after `--`.",
             path.display()
         ),
+        (Some(inferlet), None) if looks_like_a_file(inferlet) => {
+            let path = Path::new(inferlet);
+            if !path.exists() {
+                bail!("no file at {}", path.display());
+            }
+            Ok(Target::Local {
+                path: path.to_path_buf(),
+                manifest: manifest.map(Path::to_path_buf),
+            })
+        }
         (Some(inferlet), None) => {
             if manifest.is_some() {
                 bail!(
-                    "`--manifest` describes a local build, so it only means something with `--path`"
+                    "`--manifest` describes a local build, so it only means something with a file"
                 );
             }
-            Ok(Target::Registry(inferlet.to_string()))
+            Ok(Target::Installed(inferlet.to_string()))
         }
         (None, Some(path)) => {
             if !path.exists() {
                 bail!("no file at {}", path.display());
             }
-            let manifest = manifest.ok_or_else(|| {
-                anyhow!(
-                    "`--path` needs `--manifest`: the manifest is where the \
-                     program's name and version come from, and a `.wasm` on its \
-                     own does not carry them"
-                )
-            })?;
-            if !manifest.exists() {
+            if let Some(manifest) = manifest
+                && !manifest.exists()
+            {
                 bail!("no manifest at {}", manifest.display());
             }
-            let name = manifest_program_name(&read_manifest(manifest)?)
-                .with_context(|| format!("reading {}", manifest.display()))?;
             Ok(Target::Local {
-                wasm: path.to_path_buf(),
-                manifest: manifest.to_path_buf(),
-                name,
+                path: path.to_path_buf(),
+                manifest: manifest.map(Path::to_path_buf),
             })
         }
     }
@@ -84,7 +100,10 @@ pub fn target(
 pub struct Curated {
     pub root: PathBuf,
     pub manifest: PathBuf,
+    /// A component built from the directory's Rust source.
     pub wasm: Option<PathBuf>,
+    /// The directory's script, when the inferlet is one (`main.py`, `index.js`).
+    pub script: Option<PathBuf>,
     pub name: String,
 }
 
@@ -95,6 +114,11 @@ impl Curated {
             crate::ui::short_path(&self.root),
             self.name
         )
+    }
+
+    /// What to upload: the script if the inferlet is one, else the build.
+    pub fn artifact(&self) -> Option<&PathBuf> {
+        self.script.as_ref().or(self.wasm.as_ref())
     }
 }
 
@@ -108,7 +132,7 @@ pub fn curated_roots() -> Vec<PathBuf> {
         .collect();
     if let Ok(cwd) = std::env::current_dir() {
         for ancestor in cwd.ancestors() {
-            let candidate = ancestor.join("tests").join("inferlets");
+            let candidate = ancestor.join("examples");
             if candidate.join("Cargo.toml").is_file() {
                 roots.push(candidate);
                 break;
@@ -132,7 +156,13 @@ pub fn curated_in(roots: &[PathBuf], name: &str) -> Option<Curated> {
         if !manifest.is_file() {
             return None;
         }
-        let built = root.join("target").join("wasm32-wasip2");
+        let script = ["main.py", "index.js"]
+            .iter()
+            .map(|file| root.join(name).join(file))
+            .find(|path| path.is_file());
+        let built = std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(|| root.join("target"), PathBuf::from)
+            .join("wasm32-wasip2");
         let wasm = ["release", "debug"]
             .iter()
             .map(|profile| built.join(profile).join(&artifact))
@@ -141,24 +171,10 @@ pub fn curated_in(roots: &[PathBuf], name: &str) -> Option<Curated> {
             root: root.clone(),
             manifest,
             wasm,
+            script,
             name: name.to_string(),
         })
     })
-}
-
-pub fn manifest_program_name(content: &str) -> Result<String> {
-    let manifest: toml::Value = toml::from_str(content).context("parse the manifest")?;
-    let package = manifest
-        .get("package")
-        .and_then(toml::Value::as_table)
-        .ok_or_else(|| anyhow!("the manifest has no [package] table"))?;
-    let field = |key: &str| {
-        package
-            .get(key)
-            .and_then(toml::Value::as_str)
-            .ok_or_else(|| anyhow!("the manifest's [package] has no {key}"))
-    };
-    Ok(format!("{}@{}", field("name")?, field("version")?))
 }
 
 pub fn arguments_to_input(arguments: &[String]) -> String {
@@ -225,58 +241,48 @@ fn typed(value: &str) -> serde_json::Value {
     }
 }
 
-async fn resolve(target: Target, registry: &str) -> Result<(Target, String)> {
-    let spec = match target {
-        Target::Local { ref name, .. } => {
-            let name = name.clone();
-            return Ok((target, name));
-        }
-        Target::Registry(spec) => spec,
-    };
+/// What `pie run` will do once the target is settled: the program to
+/// launch, and the artifact to upload first when it comes from a file.
+pub struct Plan {
+    pub program: String,
+    pub upload: Option<(PathBuf, Artifact)>,
+}
 
-    if spec.contains('@') {
-        let program = crate::ops::inferlet::resolve_inferlet_id(&spec, registry)
-            .await
-            .with_context(|| format!("resolving {spec:?}"))?
-            .to_string();
-        return Ok((Target::Registry(spec), program));
-    }
+fn resolve(target: Target) -> Result<Plan> {
+    let spec = match target {
+        Target::Local { path, manifest } => return plan_local(&path, manifest.as_deref()),
+        Target::Installed(spec) => spec,
+    };
 
     let curated = curated(&spec);
     if let Some(found) = &curated
-        && let Some(wasm) = &found.wasm
+        && let Some(artifact) = found.artifact()
     {
-        let manifest = std::fs::read_to_string(&found.manifest)
-            .with_context(|| format!("reading {}", found.manifest.display()))?;
-        let name = manifest_program_name(&manifest)
-            .with_context(|| format!("reading {}", found.manifest.display()))?;
-        return Ok((
-            Target::Local {
-                wasm: wasm.clone(),
-                manifest: found.manifest.clone(),
-                name: name.clone(),
-            },
-            name,
-        ));
+        return plan_local(artifact, Some(&found.manifest));
     }
 
-    if let Some(program) = crate::ops::inferlet::cached_version(&spec) {
-        let program = program.to_string();
-        return Ok((Target::Registry(spec), program));
-    }
-
-    match crate::ops::inferlet::resolve_inferlet_id(&spec, registry).await {
-        Ok(program) => Ok((Target::Registry(spec), program.to_string())),
+    match crate::ops::inferlet::resolve_installed(&spec) {
+        Ok(program) => Ok(Plan {
+            program: program.to_string(),
+            upload: None,
+        }),
         Err(error) => match curated {
-            Some(found) => Err(error.context(format!(
-                "{spec:?} is in this tree at {} but has not been built; \
-                 `{}` builds it",
+            Some(found) => bail!(
+                "{spec:?} is in this tree at {} but has not been built; `{}` builds it",
                 crate::ui::short_path(&found.manifest),
                 found.build_hint()
-            ))),
-            None => Err(error.context(format!("resolving {spec:?}"))),
+            ),
+            None => Err(error),
         },
     }
+}
+
+fn plan_local(path: &Path, manifest: Option<&Path>) -> Result<Plan> {
+    let artifact = load_artifact(path, manifest)?;
+    Ok(Plan {
+        program: artifact.manifest.program_name().to_string(),
+        upload: Some((path.to_path_buf(), artifact)),
+    })
 }
 
 pub async fn run(
@@ -297,24 +303,23 @@ pub async fn run(
         args.inferlet.as_deref(),
         args.path.as_deref(),
         args.manifest.as_deref(),
-        |path| std::fs::read_to_string(path).map_err(Into::into),
     )?;
 
     let (controller, gateway, mut worker) = crate::derive::derive_standalone(&content)?;
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
-    let registry = worker.server.registry.clone();
     let model = worker.model.name.clone();
 
-    let (target, program) = resolve(target, &registry).await?;
+    let plan = resolve(target)?;
 
-    match &target {
-        Target::Local { wasm, .. } => println!(
-            "Running {program} on {model}\n  from {}",
-            crate::ui::short_path(wasm)
+    match &plan.upload {
+        Some((path, _)) => println!(
+            "Running {} on {model}\n  from {}",
+            plan.program,
+            crate::ui::short_path(path)
         ),
-        Target::Registry(_) => println!("Running {program} on {model}"),
+        None => println!("Running {} on {model}", plan.program),
     }
     println!();
 
@@ -323,8 +328,7 @@ pub async fn run(
         .context("boot the engine")?;
     let outcome = drive(
         &pie.listen_addr.to_string(),
-        &target,
-        &program,
+        &plan,
         &args.arguments,
         args.out.as_deref(),
     )
@@ -399,11 +403,11 @@ fn write_received(
 
 async fn drive(
     addr: &str,
-    target: &Target,
-    program: &str,
+    plan: &Plan,
     arguments: &[String],
     out_dir: Option<&Path>,
 ) -> Result<std::process::ExitCode> {
+    let program = &plan.program;
     let client = Client::connect_with_identity(&format!("ws://{addr}/v1/ws"), "pie-run")
         .await
         .context("connect to the engine this command just booted")?;
@@ -412,11 +416,11 @@ async fn drive(
         .await
         .context("authenticate")?;
 
-    if let Target::Local { wasm, manifest, .. } = target {
+    if let Some((path, artifact)) = &plan.upload {
         client
-            .add_program(wasm, manifest, true)
+            .add_program_bytes(&artifact.bytes, &artifact.manifest_toml, true)
             .await
-            .with_context(|| format!("uploading {}", wasm.display()))?;
+            .with_context(|| format!("uploading {}", path.display()))?;
     }
 
     let mut process = client
@@ -511,9 +515,46 @@ mod tests {
     fn run_every_case() {
         a_curated_name_resolves_to_the_build_beside_its_manifest();
         an_unbuilt_curated_directory_is_found_without_a_wasm();
+        a_script_twin_is_its_source_and_needs_no_build();
         release_outranks_debug();
         a_name_that_is_a_path_is_not_a_curated_name();
+        a_positional_with_an_artifact_extension_is_a_file();
         the_documented_invocation_produces_the_documented_input();
+    }
+
+    fn a_script_twin_is_its_source_and_needs_no_build() {
+        let dir = tempfile::tempdir().unwrap();
+        tree(dir.path(), "text-completion-py", None);
+        std::fs::write(dir.path().join("text-completion-py").join("main.py"), "").unwrap();
+        let found = curated_in(&[dir.path().to_path_buf()], "text-completion-py").unwrap();
+        assert!(found.wasm.is_none());
+        assert_eq!(
+            found.artifact().unwrap(),
+            &dir.path().join("text-completion-py").join("main.py")
+        );
+    }
+
+    fn a_positional_with_an_artifact_extension_is_a_file() {
+        assert!(looks_like_a_file("main.py"));
+        assert!(looks_like_a_file("build/x.wasm"));
+        assert!(looks_like_a_file("./text-completion"));
+        assert!(!looks_like_a_file("text-completion"));
+        assert!(!looks_like_a_file("text-completion@0.1.0"));
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("probe.py");
+        std::fs::write(&script, "").unwrap();
+        let script_str = script.to_str().unwrap();
+        assert_eq!(
+            target(Some(script_str), None, None).unwrap(),
+            Target::Local {
+                path: script.clone(),
+                manifest: None
+            }
+        );
+        assert_eq!(
+            target(Some("probe"), None, None).unwrap(),
+            Target::Installed("probe".to_string())
+        );
     }
 
     fn a_curated_name_resolves_to_the_build_beside_its_manifest() {

@@ -235,9 +235,8 @@ fn read_params(
     loop {
         let mut offset: usize = 0;
         let mut size: usize = 0;
-        let code = unsafe {
-            dr::cuFuncGetParamInfo(func, shape.len(), &raw mut offset, &raw mut size)
-        };
+        let code =
+            unsafe { dr::cuFuncGetParamInfo(func, shape.len(), &raw mut offset, &raw mut size) };
         if code != dr::CUresult::CUDA_SUCCESS {
             break;
         }
@@ -350,21 +349,13 @@ pub struct Rebind {
 
 #[cfg(not(feature = "cuda"))]
 #[allow(unused_variables)]
-pub fn rebind(
-    exec: &crate::device::GraphExec,
-    graph: &Graph,
-    subset: &[usize],
-) -> Result<Rebind> {
+pub fn rebind(exec: &crate::device::GraphExec, graph: &Graph, subset: &[usize]) -> Result<Rebind> {
     Err(Fault::Runtimeless)
 }
 
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_lines)]
-pub fn rebind(
-    exec: &crate::device::GraphExec,
-    graph: &Graph,
-    subset: &[usize],
-) -> Result<Rebind> {
+pub fn rebind(exec: &crate::device::GraphExec, graph: &Graph, subset: &[usize]) -> Result<Rebind> {
     use cudarc::driver::sys as dr;
 
     let raw: dr::CUgraph = graph.raw().cast();
@@ -423,22 +414,23 @@ pub fn rebind(
     }
     out.identity_us = began.elapsed().as_secs_f64() * 1e6;
 
-    let try_one = |mutate: &dyn Fn(&mut dr::CUDA_KERNEL_NODE_PARAMS)|
-     -> core::result::Result<(), i32> {
-        let Some((node, params)) = held.first() else {
-            return Err(-1);
+    let try_one =
+        |mutate: &dyn Fn(&mut dr::CUDA_KERNEL_NODE_PARAMS)| -> core::result::Result<(), i32> {
+            let Some((node, params)) = held.first() else {
+                return Err(-1);
+            };
+            let mut changed = *params;
+            mutate(&mut changed);
+            let code =
+                unsafe { dr::cuGraphExecKernelNodeSetParams_v2(hexec, *node, &raw const changed) };
+            let answer = if code == dr::CUresult::CUDA_SUCCESS {
+                Ok(())
+            } else {
+                Err(code as i32)
+            };
+            let _ = unsafe { dr::cuGraphExecKernelNodeSetParams_v2(hexec, *node, params) };
+            answer
         };
-        let mut changed = *params;
-        mutate(&mut changed);
-        let code = unsafe { dr::cuGraphExecKernelNodeSetParams_v2(hexec, *node, &raw const changed) };
-        let answer = if code == dr::CUresult::CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(code as i32)
-        };
-        let _ = unsafe { dr::cuGraphExecKernelNodeSetParams_v2(hexec, *node, params) };
-        answer
-    };
 
     out.grid = try_one(&|p| p.gridDimX = p.gridDimX.max(1) + 1);
     out.smem = try_one(&|p| p.sharedMemBytes += 16);
@@ -490,9 +482,7 @@ pub fn rebind(
     let mine = held.first().map(|(_, p)| arity(p.func)).unwrap_or(0);
     let other = held
         .iter()
-        .find(|(_, p)| {
-            held.first().is_some_and(|(_, q)| p.func != q.func) && arity(p.func) != mine
-        })
+        .find(|(_, p)| held.first().is_some_and(|(_, q)| p.func != q.func) && arity(p.func) != mine)
         .or_else(|| {
             held.iter()
                 .find(|(_, p)| held.first().is_some_and(|(_, q)| p.func != q.func))
@@ -561,7 +551,11 @@ pub fn rebind(
         p.gridDimZ = 1;
     });
 
-    let picked: Vec<usize> = subset.iter().copied().filter(|at| *at < held.len()).collect();
+    let picked: Vec<usize> = subset
+        .iter()
+        .copied()
+        .filter(|at| *at < held.len())
+        .collect();
     let began = std::time::Instant::now();
     for at in &picked {
         let (node, params) = &held[*at];

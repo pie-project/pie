@@ -1,12 +1,11 @@
 [package]
-name = "dtype"
+name = "pie-dtype"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The one element-type enum: what a weight plane, a kv page, a checkpoint tensor and a compute value all say when asked what they hold. A leaf crate — the enum, its width in bits, plain serde, no internal deps."
+description = "The one element-type enum: what a weight plane, a kv page, a checkpoint tensor and a compute value all say when asked what they hold. A leaf crate — the enum, its width in bits, plain serde, no internal deps. Internal to pie; depend on `inferlet` or `pie-client` instead."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
-publish = false
 
 [lib]
 name = "dtype"

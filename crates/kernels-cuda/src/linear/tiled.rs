@@ -27,7 +27,11 @@ impl Tuple {
     const fn smem(self) -> u32 {
         let staging = self.stages * self.m * LD_A;
         let epilogue = self.m * (self.n + 8);
-        if staging > epilogue { staging * 2 } else { epilogue * 2 }
+        if staging > epilogue {
+            staging * 2
+        } else {
+            epilogue * 2
+        }
     }
 }
 
@@ -49,7 +53,11 @@ pub const LONG_PREFILL_ROWS: u32 = 512;
 
 #[must_use]
 pub const fn tuple_for(rows: u32) -> Tuple {
-    if rows >= LONG_PREFILL_ROWS { LONG } else { SHORT }
+    if rows >= LONG_PREFILL_ROWS {
+        LONG
+    } else {
+        SHORT
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -136,7 +144,17 @@ pub fn matmul(
     seat: GroupSeat,
 ) -> Result<(), Error> {
     let tuple = tuple_for(y.rows);
-    tiled_launch(ctx, "linear.matmul", act, codes, scales, biases, y, seat, tuple)
+    tiled_launch(
+        ctx,
+        "linear.matmul",
+        act,
+        codes,
+        scales,
+        biases,
+        y,
+        seat,
+        tuple,
+    )
 }
 
 pub fn lm_head(
@@ -149,7 +167,17 @@ pub fn lm_head(
     seat: GroupSeat,
 ) -> Result<(), Error> {
     let tuple = tuple_for(y.rows);
-    tiled_launch(ctx, "linear.lm_head", act, codes, scales, biases, y, seat, tuple)
+    tiled_launch(
+        ctx,
+        "linear.lm_head",
+        act,
+        codes,
+        scales,
+        biases,
+        y,
+        seat,
+        tuple,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -163,7 +191,17 @@ pub fn matmul_with(
     seat: GroupSeat,
     tuple: Tuple,
 ) -> Result<(), Error> {
-    tiled_launch(ctx, "linear.matmul", act, codes, scales, biases, y, seat, tuple)
+    tiled_launch(
+        ctx,
+        "linear.matmul",
+        act,
+        codes,
+        scales,
+        biases,
+        y,
+        seat,
+        tuple,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -274,7 +312,11 @@ pub const THIN_ROWS: u32 = 8;
 #[must_use]
 pub const fn carve_for(n: u32, rows: u32) -> Carve {
     let bands = n.div_ceil(BAND);
-    let deepest = if rows <= THIN_ROWS { THIN_SPLIT } else { WIDE_SPLIT };
+    let deepest = if rows <= THIN_ROWS {
+        THIN_SPLIT
+    } else {
+        WIDE_SPLIT
+    };
     #[allow(clippy::manual_checked_ops)]
     let want = if bands == 0 {
         deepest
@@ -288,10 +330,7 @@ pub const fn carve_for(n: u32, rows: u32) -> Carve {
     } else {
         want
     };
-    Carve {
-        bands: 1,
-        split,
-    }
+    Carve { bands: 1, split }
 }
 
 const fn bucket(rows: u32) -> u32 {
@@ -476,11 +515,8 @@ pub fn repack(
     let words = n_pad / BAND * (k / BAND) * 32;
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            "::pie::linear::repack_affine_tiled<::pie::i32(4)>",
-        )
-        .apply(Launch::flat(words, BLOCK)),
+        Fire::at(FILE, "::pie::linear::repack_affine_tiled<::pie::i32(4)>")
+            .apply(Launch::flat(words, BLOCK)),
         &[
             codes.arg(),
             out_codes.arg(),

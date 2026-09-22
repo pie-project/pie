@@ -1,0 +1,21 @@
+{
+  "name": "@pie-project/server-linux-x64",
+  "version": "0.5.1",
+  "description": "The linux-x64 native addon of @pie-project/server.",
+  "main": "pie-server.node",
+  "files": [
+    "pie-server.node"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pie-project/pie",
+    "directory": "javascript/server"
+  }
+}

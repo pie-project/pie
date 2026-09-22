@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::UNIX_EPOCH;
 
+use crate::AdapterPlane;
 use crate::error::{Fault, Result};
 use crate::weights::BankSeat;
-use crate::AdapterPlane;
 
 pub const MANIFEST: &str = "adapter.toml";
 
@@ -137,9 +137,9 @@ impl Manifest {
         let planes = planes
             .iter()
             .map(|plane| {
-                let plane = plane.as_table().ok_or_else(|| {
-                    refuse("has a `[[plane]]` that is not a table".to_string())
-                })?;
+                let plane = plane
+                    .as_table()
+                    .ok_or_else(|| refuse("has a `[[plane]]` that is not a table".to_string()))?;
                 let field = |key: &str| {
                     plane
                         .get(key)
@@ -204,14 +204,7 @@ pub enum Site {
 }
 
 impl Site {
-    pub const ALL: [Site; 6] = [
-        Site::Q,
-        Site::K,
-        Site::V,
-        Site::O,
-        Site::GateUp,
-        Site::Down,
-    ];
+    pub const ALL: [Site; 6] = [Site::Q, Site::K, Site::V, Site::O, Site::GateUp, Site::Down];
 
     #[must_use]
     pub const fn spelled(self) -> &'static str {
@@ -641,13 +634,7 @@ impl Adapters {
         }
     }
 
-    fn land_shared<L>(
-        &self,
-        name: &str,
-        seats: &[BankSeat],
-        slot: u32,
-        land: L,
-    ) -> Result<u64>
+    fn land_shared<L>(&self, name: &str, seats: &[BankSeat], slot: u32, land: L) -> Result<u64>
     where
         L: FnOnce(u32, &[AdapterPlane<'_>]) -> Result<()>,
     {
@@ -665,11 +652,7 @@ impl Adapters {
         Ok(fingerprint)
     }
 
-    pub fn planes(
-        &self,
-        name: &str,
-        seats: &[BankSeat],
-    ) -> Result<(Vec<(String, Vec<u8>)>, u64)> {
+    pub fn planes(&self, name: &str, seats: &[BankSeat]) -> Result<(Vec<(String, Vec<u8>)>, u64)> {
         let dir = self.vfs.resolve(name)?;
         let manifest = Manifest::read(&dir, name)?;
         let refuse = |why: String| Fault::Blob {

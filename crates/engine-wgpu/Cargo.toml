@@ -18,7 +18,7 @@ kernels-wgpu = { path = "../kernels-wgpu" }
 engine = { path = "../engine" }
 model-exec = { path = "../model-exec" }
 model-compiler = { path = "../model-compiler" }
-eta-ir = { path = "../eta-ir" }
+eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 eta-exec = { path = "../eta-exec" }
 
 eta-compiler = { path = "../eta-compiler" }

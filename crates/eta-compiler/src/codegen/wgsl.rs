@@ -718,9 +718,8 @@ mod stepwise_tests {
 
     fn calls(source: &str) -> Vec<String> {
         source
-            .splitn(2, ENTRY_MARKER)
-            .nth(1)
-            .unwrap_or(source)
+            .split_once(ENTRY_MARKER)
+            .map_or(source, |(_, after)| after)
             .lines()
             .filter_map(|line| {
                 let line = line.trim();

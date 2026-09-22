@@ -62,6 +62,9 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 GOLDEN = os.environ.get("PIE_IMAGEGEN_GOLDEN", "/root/.cache/pie-imagegen/golden")
+# The text-to-image gate's picture sizes; a 24 GiB card runs 512 and 128.
+T2I_BIG = int(os.environ.get("PIE_GATES_T2I_BIG", "1024"))
+T2I_SMALL = int(os.environ.get("PIE_GATES_T2I_SMALL", "256"))
 ARTIFACTS = os.environ.get("PIE_IMAGEGEN_ARTIFACTS", "/root/.cache/pie-imagegen")
 VENV = "/root/.venv/imagegen/bin/python"
 
@@ -116,7 +119,7 @@ gpu_mem_utilization = {mem}
 max_model_len = {rows}
 
 [runtime]
-request_timeout = "{timeout}"
+silence_timeout = "{timeout}"
 
 [sandbox]
 allow_fs = true
@@ -141,16 +144,23 @@ def write_config(ctx, gate) -> str:
         port += 1
     scratch = os.path.join(ctx.out, gate.name, "scratch")
     os.makedirs(scratch, exist_ok=True)
+    # A smaller card overrides what the roster states: PIE_GATES_ROWS (the
+    # slot ceiling), PIE_GATES_MEM (utilisation) and PIE_GATES_VOXELS (the
+    # VAE ladder, which is 21 GiB at the 65 536 default).
+    if os.environ.get("PIE_GATES_VOXELS"):
+        spec["voxels"] = int(os.environ["PIE_GATES_VOXELS"])
     text = CONFIG.format(
         name=gate.name, port=port, scratch=scratch,
         model=spec.pop("model"),
         graphs=spec.pop("graphs", "on"),
-        mem=spec.pop("mem", 0.90),
-        rows=spec.pop("rows", 32768),
+        mem=float(os.environ.get("PIE_GATES_MEM") or spec.pop("mem", 0.90)),
+        rows=int(os.environ.get("PIE_GATES_ROWS") or spec.pop("rows", 32768)),
         timeout=spec.pop("timeout", "600s"),
         voxels=("max_voxels = {}".format(spec.pop("voxels"))
                 if "voxels" in spec else ""),
     )
+    spec.pop("mem", None)
+    spec.pop("rows", None)
     assert not spec, f"{gate.name}: unknown config keys {sorted(spec)}"
     path = os.path.join(ctx.config_dir, f"config.gates-{gate.name}.toml")
     with open(path, "w") as f:
@@ -211,6 +221,7 @@ def step(ctx, argv, cwd, timeout, marker, log) -> tuple[int, str]:
     env = dict(os.environ)
     env.setdefault("PIE_IMAGEGEN_GOLDEN", GOLDEN)
     env.setdefault("PIE_IMAGEGEN_ARTIFACTS", ARTIFACTS)
+    env["PATH"] = os.path.dirname(os.path.abspath(ctx.pie)) + os.pathsep + env.get("PATH", "")
     proc = None
     text = ""
     try:
@@ -553,6 +564,29 @@ def t2i_readout(text: str) -> str:
             bits.append(f"both-at-once differs from either {both:.4f} ({ok})")
         except Exception as why:
             bits.append(f"reference claims unread: {why}")
+    stat = re.search(r"\[gates\] inpaint: mask_rows=(\d+) kept_max_abs=(\S+) painted_mean_abs=(\S+)", text)
+    if stat:
+        rows, kept, painted = int(stat.group(1)), float(stat.group(2)), float(stat.group(3))
+        ok = "pass" if kept == 0.0 and painted > 0.0 and rows > 0 else "FAIL"
+        bits.append(f"inpaint: {rows} rows repainted, kept rows moved {kept} in latent, "
+                    f"painted rows {painted:.4f} ({ok})")
+    if {"small", "inpaint"} <= named.keys():
+        try:
+            import numpy as np
+            from PIL import Image
+
+            def px(p):
+                return np.asarray(Image.open(p).convert("RGB"), dtype=np.float32) / 255.0
+
+            init, done = px(named["small"]), px(named["inpaint"])
+            half = init.shape[1] // 2
+            left = float(np.abs(done[:, :half] - init[:, :half]).mean())
+            right = float(np.abs(done[:, half:] - init[:, half:]).mean())
+            ok = "pass" if right > 2 * max(left, 1e-6) else "FAIL"
+            bits.append(f"inpaint pixels: kept half {left:.4f} from the input, painted half "
+                        f"{right:.4f} ({ok})")
+        except Exception as why:
+            bits.append(f"inpaint claims unread: {why}")
     if pngs:
         bits.append(named.get("picture", pngs[0]))
     return "  ".join(bits) or "no picture"
@@ -626,7 +660,8 @@ def t2v_step(prompt_ids, width, height, frames, steps, seed,
     return build
 
 def t2i_step(prompt, width, height, steps, seed,
-             init_from=None, strength=None, refs_from=None, out_name="picture"):
+             init_from=None, strength=None, refs_from=None, out_name="picture",
+             mask_rect=None):
     def build(ctx, gate):
         out = os.path.join(ctx.out, gate.name, out_name)
         os.makedirs(out, exist_ok=True)
@@ -640,6 +675,8 @@ def t2i_step(prompt, width, height, steps, seed,
                      "--strength", str(strength)]
         for name in refs_from or []:
             argv += ["--ref-image", os.path.join(ctx.out, gate.name, name, "image.png")]
+        if mask_rect is not None:
+            argv += ["--mask-rect", mask_rect]
         return (argv, REPO)
     return build
 
@@ -682,6 +719,47 @@ def roster() -> list[Gate]:
             steps=[("two scales", harness("mini_dit_parity.py", "guidance", "--out", "{out}",
                                           "--config", "{config}"))],
             readout=guidance_readout,
+            timeout=1800,
+        ),
+        Gate(
+            name="dpm-2m",
+            wraps="mini_dit_parity.py all --solver dpm2m",
+            expected="cos >= 0.9999 on every step's latent",
+            note="A HIGHER-ORDER SOLVER AS A DEVICE LOOP: DPM-Solver++ 2M "
+                 "(`latent::dpm2m_step`), the previous data prediction carried "
+                 "in a channel, the per-fire scalars in tables, against a numpy "
+                 "reference of the same update on the Euler golden's start and "
+                 "schedule. The first proof that a sampler other than Euler is "
+                 "an epilogue and not a host loop.",
+            needs=[(g("mini-dit", "mini_dit_dpm2m_bf16.npz"),
+                    "python scripts/imagegen/mini_dit_ref.py --dpm2m"),
+                   (a("mini-dit.zt"),
+                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --sku mini-dit-bf16-kv-bf16 "
+                    f"--out {a('mini-dit.zt')}")],
+            config=dict(port=8601, model=a("mini-dit.zt"), rows=65536, mem=0.60),
+            steps=[("four DPM++ 2M steps", harness("mini_dit_parity.py", "all", "--solver",
+                                                  "dpm2m", "--out", "{out}",
+                                                  "--config", "{config}"))],
+            readout=plain,
+            timeout=1800,
+        ),
+        Gate(
+            name="attn-classes",
+            wraps="mini_dit_parity.py classes",
+            expected="an all-ones table IS the plain step; a split table moves it; "
+                     "class-0 rows ignore class-1 text exactly",
+            note="A STRUCTURED ATTENTION MASK STATED BY THE GUEST "
+                 "(`forward-pass.attention-classes`): one class per row and a "
+                 "count x count table, applied by the engine to the reading's "
+                 "group-packed `attention.ragged` with no family code involved. "
+                 "Every claim is an identity within fires of one shape.",
+            needs=[(a("mini-dit.zt"),
+                    f"{IMPORT} $PIE_IMAGEGEN_GOLDEN/mini-dit/ --sku mini-dit-bf16-kv-bf16 "
+                    f"--out {a('mini-dit.zt')}")],
+            config=dict(port=8601, model=a("mini-dit.zt"), rows=65536, mem=0.60),
+            steps=[("four modes", harness("mini_dit_parity.py", "classes", "--out", "{out}",
+                                          "--config", "{config}"))],
+            readout=plain,
             timeout=1800,
         ),
         Gate(
@@ -969,31 +1047,35 @@ def roster() -> list[Gate]:
                     f"--out {a('flux2-klein-4b.zt')}")],
             config=dict(port=8611, model=a("flux2-klein-4b.zt"), rows=32768, mem=0.90),
             steps=[("prompt -> picture",
-                    t2i_step("a red bicycle leaning on a blue wall", 1024, 1024, 4, 0)),
+                    t2i_step("a red bicycle leaning on a blue wall", T2I_BIG, T2I_BIG, 4, 0)),
                    ("a 256^2 picture to start from",
-                    t2i_step("a red bicycle leaning on a blue wall", 256, 256, 4, 0,
+                    t2i_step("a red bicycle leaning on a blue wall", T2I_SMALL, T2I_SMALL, 4, 0,
                              out_name="small")),
                    ("that picture back in at 0.4",
-                    t2i_step("a red bicycle leaning on a green hedge", 256, 256, 4, 0,
+                    t2i_step("a red bicycle leaning on a green hedge", T2I_SMALL, T2I_SMALL, 4, 0,
                              init_from="small", strength=0.4, out_name="i2i")),
                    ("and at 1.0, which is no init at all",
-                    t2i_step("a red bicycle leaning on a green hedge", 256, 256, 4, 0,
+                    t2i_step("a red bicycle leaning on a green hedge", T2I_SMALL, T2I_SMALL, 4, 0,
                              init_from="small", strength=1.0, out_name="i2i-washed")),
                    ("the same prompt with no init",
-                    t2i_step("a red bicycle leaning on a green hedge", 256, 256, 4, 0,
+                    t2i_step("a red bicycle leaning on a green hedge", T2I_SMALL, T2I_SMALL, 4, 0,
                              out_name="txt2img")),
                    ("a picture with no reference at all",
-                    t2i_step("a bicycle in a snowy field at dawn", 256, 256, 4, 3,
+                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
                              out_name="ref-none")),
                    ("the same prompt and seed, with the blue-wall picture in view",
-                    t2i_step("a bicycle in a snowy field at dawn", 256, 256, 4, 3,
+                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
                              refs_from=["small"], out_name="ref-a")),
                    ("and with the green-hedge picture instead",
-                    t2i_step("a bicycle in a snowy field at dawn", 256, 256, 4, 3,
+                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
                              refs_from=["txt2img"], out_name="ref-b")),
                    ("and both at once, on one lane",
-                    t2i_step("a bicycle in a snowy field at dawn", 256, 256, 4, 3,
-                             refs_from=["small", "txt2img"], out_name="ref-ab"))],
+                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
+                             refs_from=["small", "txt2img"], out_name="ref-ab")),
+                   ("inpaint the right half of the small picture",
+                    t2i_step("a red bicycle leaning on a green hedge", T2I_SMALL, T2I_SMALL, 4, 0,
+                             init_from="small", strength=1.0, mask_rect=f"{T2I_SMALL // 2},0,{T2I_SMALL},{T2I_SMALL}",
+                             out_name="inpaint"))],
             readout=t2i_readout,
             timeout=5400,
         ),
@@ -1008,7 +1090,7 @@ def text_to_image(args) -> int:
     `decode_latent.py` finishes the job with the checkpoint's own autoencoder.
     Either way this prints `[gates] picture: <path>` and its pixel size.
     """
-    inferlet = os.path.join(REPO, "tests/inferlets/text-to-image")
+    inferlet = os.path.join(REPO, "examples/text-to-image")
     workspace = os.path.dirname(inferlet)
     if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
         done = subprocess.run(["cargo", "build", "-p", "text-to-image", "--release",
@@ -1037,6 +1119,8 @@ def text_to_image(args) -> int:
     for i, path in enumerate(args.ref_images or []):
         for n, piece in enumerate(b64_pieces(path)):
             cmd += [f"--ref_{i}_{n}", piece]
+    if args.mask_rect:
+        cmd += ["--mask_rect", args.mask_rect]
     print("$ " + " ".join(cmd), flush=True)
     done = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
     sys.stdout.write(done.stdout)
@@ -1044,6 +1128,16 @@ def text_to_image(args) -> int:
     if done.returncode != 0:
         print(f"[gates] pie run failed ({done.returncode})")
         return 1
+    for line in done.stdout.splitlines():
+        if line.startswith("{") and "kept_max_abs" in line:
+            try:
+                report = json.loads(line)
+            except ValueError:
+                continue
+            if report.get("mask_rows") is not None:
+                print(f"[gates] inpaint: mask_rows={report['mask_rows']} "
+                      f"kept_max_abs={report['kept_max_abs']} "
+                      f"painted_mean_abs={report['painted_mean_abs']}")
 
     png = os.path.join(args.out, "image.png")
     if not os.path.exists(png):
@@ -1085,7 +1179,7 @@ def text_to_image(args) -> int:
     size = os.path.getsize(png)
     print(f"[gates] {w}x{h} PNG, {size} bytes")
     print(f"[gates] picture: {png}")
-    if size < 100_000:
+    if size < w * h:
         print(f"[gates] suspiciously small for a {w}x{h} photograph")
         return 1
     return 0
@@ -1106,7 +1200,7 @@ def text_to_video(args) -> int:
     wall")` -- the golden's own prompt, so the clip is comparable with
     `$PIE_IMAGEGEN_GOLDEN/wan22/wan22_golden.mp4`.
     """
-    inferlet = os.path.join(REPO, "tests/inferlets/text-to-video")
+    inferlet = os.path.join(REPO, "examples/text-to-video")
     workspace = os.path.dirname(inferlet)
     if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
         done = subprocess.run(["cargo", "build", "-p", "text-to-video", "--release",
@@ -1281,6 +1375,7 @@ def main() -> int:
     ap.add_argument("--ref-image", dest="ref_images", action="append", default=None,
                     help=argparse.SUPPRESS)
     ap.add_argument("--strength", type=float, default=0.6, help=argparse.SUPPRESS)
+    ap.add_argument("--mask-rect", dest="mask_rect", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--guidance", type=float, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--width", type=int, default=1024, help=argparse.SUPPRESS)
     ap.add_argument("--height", type=int, default=1024, help=argparse.SUPPRESS)

@@ -160,11 +160,12 @@ impl Exports {
         let drafts = named(DRAFTS_SEAM).into_iter().next();
         let drafts_depth = match &drafts {
             Some(export) => {
-                let width = model_exec::store::kv::width_of(trace, export.value).map_err(|why| {
-                    Fault::Unbound {
-                        what: format!("the `{DRAFTS_SEAM}` export's width: {why}"),
-                    }
-                })?;
+                let width =
+                    model_exec::store::kv::width_of(trace, export.value).map_err(|why| {
+                        Fault::Unbound {
+                            what: format!("the `{DRAFTS_SEAM}` export's width: {why}"),
+                        }
+                    })?;
                 match u32::try_from(width) {
                     Ok(depth) if depth > 0 => depth,
                     _ => {

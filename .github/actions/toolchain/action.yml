@@ -1,0 +1,86 @@
+name: toolchain
+description: Rust plus what the selected engine features need, and the cargo cache.
+
+inputs:
+  features:
+    description: Comma-separated engine features (cuda, metal, vulkan, wgpu).
+    default: ''
+  triple:
+    description: Rust target triple to install.
+    default: ''
+  manylinux:
+    description: "'true' inside the rockylinux8 container: bootstrap it instead of installing Rust."
+    default: 'false'
+  cache-key:
+    description: Cache key prefix; empty skips the cache.
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - if: inputs.manylinux == 'true'
+      shell: bash
+      run: bash scripts/ci/rockylinux8-bootstrap.sh ${{ inputs.triple }}
+
+    - if: inputs.manylinux != 'true'
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.triple }}
+
+    # rust-toolchain.toml pins the toolchain; install it here, serially, so
+    # concurrent cargo calls (maturin, napi) do not race to.
+    - if: inputs.manylinux != 'true'
+      shell: bash
+      run: rustup toolchain install
+
+    - if: runner.os == 'macOS'
+      shell: bash
+      run: brew install cmake ninja libomp
+
+    # The Vulkan kernels compile to SPIR-V at build time.
+    - if: contains(inputs.features, 'vulkan')
+      shell: bash
+      env:
+        SLANG_VERSION: '2026.17'
+      run: |
+        set -euo pipefail
+        arch=x86_64; [[ "$(uname -m)" =~ ^(aarch64|arm64)$ ]] && arch=aarch64
+        if [[ "$RUNNER_OS" == Windows ]]; then asset="slang-${SLANG_VERSION}-windows-${arch}.zip"; else asset="slang-${SLANG_VERSION}-linux-${arch}.tar.gz"; fi
+        curl -fsSL -o "${RUNNER_TEMP}/${asset}" "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/${asset}"
+        mkdir -p "${RUNNER_TEMP}/slang"
+        case "$asset" in
+          *.zip) 7z x -o"${RUNNER_TEMP}/slang" "${RUNNER_TEMP}/${asset}" >/dev/null; echo "PIE_SLANGC=${RUNNER_TEMP}/slang/bin/slangc.exe" >> "$GITHUB_ENV" ;;
+          *)     tar xzf "${RUNNER_TEMP}/${asset}" -C "${RUNNER_TEMP}/slang"; echo "PIE_SLANGC=${RUNNER_TEMP}/slang/bin/slangc" >> "$GITHUB_ENV" ;;
+        esac
+
+    # The toolkit must match the CUDA 13 ABI engine-cuda's cudarc line pins.
+    - if: runner.os == 'Windows' && contains(inputs.features, 'cuda')
+      uses: Jimver/cuda-toolkit@v0.2.35
+      with:
+        cuda: '13.0.0'
+
+    - if: runner.os == 'Windows' && contains(inputs.features, 'cuda')
+      uses: TheMrMilchmann/setup-msvc-dev@v4.0.0
+      with:
+        arch: x64
+
+    - if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        # A short target root for the 260-character path limit; Ninja because
+        # the VS generator does not find the CUDA toolset; and Git Bash's
+        # coreutils `link` must not shadow MSVC's linker.
+        echo "CARGO_TARGET_DIR=C:/t/pie" >> "$GITHUB_ENV"
+        echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+        rm -f /usr/bin/link /usr/bin/link.exe || true
+
+    - if: inputs.cache-key != ''
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+          C:/t/pie
+        key: ${{ inputs.cache-key }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ inputs.cache-key }}-

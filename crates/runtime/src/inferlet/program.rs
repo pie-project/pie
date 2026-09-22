@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::oneshot;
 use wasmtime::Engine as WasmEngine;
 use wasmtime::component::Component;
@@ -11,40 +11,55 @@ use crate::service::{Service, ServiceHandler};
 
 mod manifest;
 mod repository;
-pub use manifest::{Manifest, ParameterType};
+pub use manifest::{Call, Language, Manifest, Package, ParameterType, Runtime};
 pub use repository::Repository;
-
-use super::python::runtime as py_runtime;
-use super::python::snapshot;
 
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
-pub fn spawn(wasm_engine: &WasmEngine, registry_url: String, programs_dir: PathBuf) {
-    let mut repository = Repository::new(registry_url, programs_dir);
+/// Start the program service over `programs_dir`. Language components come
+/// from `languages_dir` (`<language>.wasm`) on first use, or from bytes via
+/// [`add_language`]. Each of `builtins` is registered unless the directory
+/// already holds that name and version: a copy installed on disk shadows
+/// the built-in one.
+pub fn spawn(
+    wasm_engine: &WasmEngine,
+    programs_dir: PathBuf,
+    languages_dir: PathBuf,
+    builtins: &[crate::bootstrap::BuiltinProgram],
+) -> Result<()> {
+    let mut repository = Repository::new(programs_dir);
 
-    repository.load_program_cache();
+    repository.refresh();
+    for builtin in builtins {
+        let manifest =
+            Manifest::parse(builtin.manifest).context("a built-in inferlet's manifest")?;
+        repository.add_builtin(manifest, builtin.component);
+    }
 
     SERVICE
-        .spawn(|| ProgramService::new(wasm_engine, repository))
+        .spawn(|| ProgramService::new(wasm_engine, repository, languages_dir))
         .expect("Program manager already spawned");
+    Ok(())
 }
 
 pub async fn add(wasm_binary: Vec<u8>, manifest: Manifest, force_overwrite: bool) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Add {
         wasm_binary,
-        manifest,
+        manifest: Box::new(manifest),
         force_overwrite,
         response: tx,
     })?;
     rx.await?
 }
 
-pub async fn add_from_registry(name: &ProgramName, force_overwrite: bool) -> Result<()> {
+/// A language component from bytes, for a host with no languages directory
+/// to read (the browser).
+pub async fn add_language(language: Language, wasm_binary: Vec<u8>) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICE.send(Message::AddFromRegistry {
-        name: name.clone(),
-        force_overwrite,
+    SERVICE.send(Message::AddLanguage {
+        language,
+        wasm_binary,
         response: tx,
     })?;
     rx.await?
@@ -61,15 +76,16 @@ pub async fn is_registered(name: &ProgramName) -> bool {
     rx.await.unwrap_or(false)
 }
 
-pub async fn is_installed(name: &ProgramName) -> bool {
+/// The newest installed version of a program named `name`.
+pub async fn newest(name: &str) -> Option<ProgramName> {
     let (tx, rx) = oneshot::channel();
     SERVICE
-        .send(Message::IsInstalled {
-            name: name.clone(),
+        .send(Message::Newest {
+            name: name.to_string(),
             response: tx,
         })
         .ok();
-    rx.await.unwrap_or(false)
+    rx.await.ok().flatten()
 }
 
 pub async fn install(name: &ProgramName) -> Result<()> {
@@ -79,17 +95,6 @@ pub async fn install(name: &ProgramName) -> Result<()> {
         response: tx,
     })?;
     rx.await?
-}
-
-pub async fn uninstall(name: &ProgramName) -> bool {
-    let (tx, rx) = oneshot::channel();
-    SERVICE
-        .send(Message::Uninstall {
-            name: name.clone(),
-            response: tx,
-        })
-        .ok();
-    rx.await.unwrap_or(false)
 }
 
 pub async fn fetch_manifest(name: &ProgramName) -> Option<Manifest> {
@@ -146,59 +151,86 @@ impl std::fmt::Display for ProgramName {
     }
 }
 
+/// A script program's source, handed to its language component at launch.
+#[derive(Debug)]
+pub struct Script {
+    /// `name@version`, for the language component's messages.
+    pub name: String,
+    /// The file name tracebacks quote.
+    pub file: String,
+    pub source: String,
+    /// The function the language component calls with the input.
+    pub entry: String,
+    /// How that function takes it.
+    pub call: Call,
+}
+
+impl Script {
+    /// The launch input the language component unwraps: the script and
+    /// the caller's input, verbatim, in one JSON envelope.
+    pub fn envelope(&self, input: &str) -> String {
+        serde_json::json!({
+            "__pie_script__": {
+                "name": self.name,
+                "file": self.file,
+                "source": self.source,
+                "entry": self.entry,
+                "call": self.call.name(),
+            },
+            "input": input,
+        })
+        .to_string()
+    }
+}
+
 struct ProgramService {
     wasm_engine: WasmEngine,
     repository: Repository,
     installed: HashMap<ProgramName, InstalledProgram>,
-    explicit_installs: std::collections::HashSet<ProgramName>,
+    explicit_installs: HashSet<ProgramName>,
     generation: u64,
+    languages_dir: PathBuf,
+    /// Handed over as bytes, compiled on first use.
+    language_binaries: HashMap<Language, Vec<u8>>,
+    /// Compiled once, shared by every script program in that language.
+    languages: HashMap<Language, Component>,
 }
 
 #[derive(Clone)]
 struct InstalledProgram {
     component: Component,
-    snapshotted: bool,
-    python_runtime: Option<String>,
+    script: Option<Arc<Script>>,
 }
 
 #[derive(Clone)]
 pub struct InstalledComponent {
     pub component: Component,
     pub generation: u64,
-    pub snapshotted: bool,
-    pub python_runtime: Option<String>,
+    /// `Some` for a script program: the component is its language's
+    /// language component, and this is what that component runs.
+    pub script: Option<Arc<Script>>,
 }
 
 impl ProgramService {
-    fn new(wasm_engine: &WasmEngine, repository: Repository) -> Self {
+    fn new(wasm_engine: &WasmEngine, repository: Repository, languages_dir: PathBuf) -> Self {
         ProgramService {
             wasm_engine: wasm_engine.clone(),
             repository,
             installed: HashMap::new(),
-            explicit_installs: std::collections::HashSet::new(),
+            explicit_installs: HashSet::new(),
             generation: 0,
+            languages_dir,
+            language_binaries: HashMap::new(),
+            languages: HashMap::new(),
         }
-    }
-
-    fn is_installed(&self, name: &ProgramName) -> bool {
-        self.installed.contains_key(name)
-    }
-
-    fn get_manifest(&self, name: &ProgramName) -> Option<Manifest> {
-        self.repository.fetch_manifest(name)
     }
 
     fn get_component(&self, name: &ProgramName) -> Option<InstalledComponent> {
         self.installed.get(name).map(|p| InstalledComponent {
             component: p.component.clone(),
             generation: self.generation,
-            snapshotted: p.snapshotted,
-            python_runtime: p.python_runtime.clone(),
+            script: p.script.clone(),
         })
-    }
-
-    fn is_registered(&self, name: &ProgramName) -> bool {
-        self.repository.exists(name)
     }
 
     fn uninstall(&mut self, name: &ProgramName) -> bool {
@@ -243,14 +275,44 @@ impl ProgramService {
         Ok(())
     }
 
-    async fn add_from_registry(&mut self, name: &ProgramName, force_overwrite: bool) -> Result<()> {
-        self.repository
-            .add_from_registry(name, force_overwrite)
-            .await?;
-        if force_overwrite {
-            self.uninstall(name);
+    fn add_language(&mut self, language: Language, wasm_binary: Vec<u8>) {
+        self.languages.remove(&language);
+        self.language_binaries.insert(language, wasm_binary);
+    }
+
+    /// The compiled language component for `language`: compiled once from the
+    /// bytes handed over, else from `<languages_dir>/<language>.wasm`.
+    async fn language_component(&mut self, language: Language) -> Result<Component> {
+        if let Some(component) = self.languages.get(&language) {
+            return Ok(component.clone());
         }
-        Ok(())
+        let path = self.languages_dir.join(language.component_file());
+        let binary = match self.language_binaries.remove(&language) {
+            Some(binary) => binary,
+            #[cfg(not(target_arch = "wasm32"))]
+            None => tokio::fs::read(&path).await.map_err(|e| {
+                anyhow!(
+                    "no {language} language component at {}: {e}; `pie language install \
+                     pie-language-{language}.tar.gz` puts one there",
+                    path.display()
+                )
+            })?,
+            #[cfg(target_arch = "wasm32")]
+            None => bail!(
+                "no {language} language component: this host reads no files, so the page \
+                 must add it from bytes before a {language} program runs"
+            ),
+        };
+        let component = compile_wasm_component(&self.wasm_engine, binary)
+            .await
+            .with_context(|| {
+                format!(
+                    "compiling the {language} language component {}",
+                    path.display()
+                )
+            })?;
+        self.languages.insert(language, component.clone());
+        Ok(component)
     }
 
     async fn install(&mut self, name: &ProgramName) -> Result<()> {
@@ -259,96 +321,63 @@ impl ProgramService {
             return Ok(());
         }
 
-        if !self.repository.exists(name) {
-            self.repository.add_from_registry(name, false).await?;
-        }
+        let manifest = self
+            .repository
+            .fetch_manifest(name)
+            .ok_or_else(|| anyhow!("{}", self.repository.not_installed(name)))?;
 
         let dependencies = self.resolve_dependencies(name).await?;
 
         for dep_name in &dependencies {
             if !self.installed.contains_key(dep_name) {
-                let dep_wasm = self.repository.fetch_wasm_binary(dep_name).await?;
-                let dep_component = compile_wasm_component(&self.wasm_engine, dep_wasm).await?;
-                let dep_python_runtime = self
+                let dep_manifest = self
                     .repository
                     .fetch_manifest(dep_name)
-                    .and_then(|m| m.python_runtime().map(str::to_string));
+                    .ok_or_else(|| anyhow!("{}", self.repository.not_installed(dep_name)))?;
+                if let Some(language) = dep_manifest.language() {
+                    bail!(
+                        "{name} depends on {dep_name}, which is a {language} script; only a \
+                         component can be a dependency"
+                    );
+                }
+                let dep_wasm = self.repository.fetch_binary(dep_name).await?;
+                let dep_component = compile_wasm_component(&self.wasm_engine, dep_wasm).await?;
                 self.installed.insert(
                     dep_name.clone(),
                     InstalledProgram {
                         component: dep_component,
-                        snapshotted: false,
-                        python_runtime: dep_python_runtime,
+                        script: None,
                     },
                 );
             }
         }
 
-        let wasm_binary = self.repository.fetch_wasm_binary(name).await?;
+        let binary = self.repository.fetch_binary(name).await?;
 
-        let python_runtime = self
-            .repository
-            .fetch_manifest(name)
-            .and_then(|m| m.python_runtime().map(str::to_string));
-
-        let should_snapshot = python_runtime.is_some()
-            && py_runtime::is_available()
-            && py_runtime::is_snapshot_enabled();
-
-        let (component, snapshotted) = if should_snapshot {
-            let manifest = self
-                .repository
-                .fetch_manifest(name)
-                .ok_or_else(|| anyhow!("Manifest disappeared mid-install: {}", name))?;
-            let dep_components: Vec<Component> = manifest
-                .dependency_names()
-                .into_iter()
-                .filter_map(|n| self.installed.get(&n).map(|p| p.component.clone()))
-                .collect();
-
-            match snapshot::snapshot_from_bytes(&self.wasm_engine, &wasm_binary, dep_components)
-                .await
-            {
-                Ok(snap_bytes) => match compile_wasm_component(&self.wasm_engine, snap_bytes).await
-                {
-                    Ok(c) => (c, true),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Compile of snapshotted component failed for {}, falling back to non-snapshotted: {e:#}",
-                            name,
-                        );
-                        (
-                            compile_wasm_component(&self.wasm_engine, wasm_binary).await?,
-                            false,
-                        )
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        "Snapshot pipeline failed for {}, falling back to non-snapshotted: {e:#}",
-                        name,
-                    );
-                    (
-                        compile_wasm_component(&self.wasm_engine, wasm_binary).await?,
-                        false,
-                    )
-                }
+        let (component, script) = match manifest.language() {
+            None => (
+                compile_wasm_component(&self.wasm_engine, binary).await?,
+                None,
+            ),
+            Some(language) => {
+                let source = String::from_utf8(binary)
+                    .map_err(|e| anyhow!("{name} is not UTF-8 {language} source: {e}"))?;
+                let script = Script {
+                    name: name.to_string(),
+                    file: manifest.script_file(),
+                    source,
+                    entry: manifest.entry().to_string(),
+                    call: manifest.call(),
+                };
+                (
+                    self.language_component(language).await?,
+                    Some(Arc::new(script)),
+                )
             }
-        } else {
-            (
-                compile_wasm_component(&self.wasm_engine, wasm_binary).await?,
-                false,
-            )
         };
 
-        self.installed.insert(
-            name.clone(),
-            InstalledProgram {
-                component,
-                snapshotted,
-                python_runtime,
-            },
-        );
+        self.installed
+            .insert(name.clone(), InstalledProgram { component, script });
         self.explicit_installs.insert(name.clone());
         self.bump_generation();
 
@@ -356,8 +385,6 @@ impl ProgramService {
     }
 
     async fn resolve_dependencies(&mut self, name: &ProgramName) -> Result<Vec<ProgramName>> {
-        use std::collections::HashSet;
-
         let mut resolved: Vec<ProgramName> = Vec::new();
         let mut visited: HashSet<ProgramName> = HashSet::new();
         let mut stack: Vec<(ProgramName, bool)> = vec![(name.clone(), false)];
@@ -374,7 +401,10 @@ impl ProgramService {
             visited.insert(current.clone());
 
             if !self.repository.exists(&current) {
-                self.repository.add_from_registry(&current, false).await?;
+                bail!(
+                    "{}, and {name} depends on it",
+                    self.repository.not_installed(&current)
+                );
             }
 
             let manifest = self
@@ -427,14 +457,14 @@ enum Message {
 
     Add {
         wasm_binary: Vec<u8>,
-        manifest: Manifest,
+        manifest: Box<Manifest>,
         force_overwrite: bool,
         response: oneshot::Sender<Result<()>>,
     },
 
-    AddFromRegistry {
-        name: ProgramName,
-        force_overwrite: bool,
+    AddLanguage {
+        language: Language,
+        wasm_binary: Vec<u8>,
         response: oneshot::Sender<Result<()>>,
     },
 
@@ -443,19 +473,14 @@ enum Message {
         response: oneshot::Sender<bool>,
     },
 
-    IsInstalled {
-        name: ProgramName,
-        response: oneshot::Sender<bool>,
+    Newest {
+        name: String,
+        response: oneshot::Sender<Option<ProgramName>>,
     },
 
     Install {
         name: ProgramName,
         response: oneshot::Sender<Result<()>>,
-    },
-
-    Uninstall {
-        name: ProgramName,
-        response: oneshot::Sender<bool>,
     },
 
     GetWasmComponent {
@@ -468,9 +493,14 @@ impl ServiceHandler for ProgramService {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
+        // An install, removal or replacement on disk since the last message
+        // is seen now; a replaced program's compiled form is dropped.
+        for stale in self.repository.refresh() {
+            self.uninstall(&stale);
+        }
         match msg {
             Message::GetMetadata { name, response } => {
-                let _ = response.send(self.get_manifest(&name));
+                let _ = response.send(self.repository.fetch_manifest(&name));
             }
             Message::Add {
                 wasm_binary,
@@ -478,26 +508,24 @@ impl ServiceHandler for ProgramService {
                 force_overwrite,
                 response,
             } => {
-                let _ = response.send(self.add(wasm_binary, manifest, force_overwrite).await);
+                let _ = response.send(self.add(wasm_binary, *manifest, force_overwrite).await);
             }
-            Message::AddFromRegistry {
-                name,
-                force_overwrite,
+            Message::AddLanguage {
+                language,
+                wasm_binary,
                 response,
             } => {
-                let _ = response.send(self.add_from_registry(&name, force_overwrite).await);
+                self.add_language(language, wasm_binary);
+                let _ = response.send(Ok(()));
             }
             Message::Exists { name, response } => {
-                let _ = response.send(self.is_registered(&name));
+                let _ = response.send(self.repository.exists(&name));
             }
-            Message::IsInstalled { name, response } => {
-                let _ = response.send(self.is_installed(&name));
+            Message::Newest { name, response } => {
+                let _ = response.send(self.repository.newest(&name));
             }
             Message::Install { name, response } => {
                 let _ = response.send(self.install(&name).await);
-            }
-            Message::Uninstall { name, response } => {
-                let _ = response.send(self.uninstall(&name));
             }
             Message::GetWasmComponent { name, response } => {
                 let _ = response.send(self.get_component(&name));

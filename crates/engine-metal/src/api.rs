@@ -997,6 +997,12 @@ impl Metal {
             .iter()
             .enumerate()
             .map(|(at, lane)| {
+                if lane.attn_classes.is_some() {
+                    return Err(Error::Unsupported {
+                        verb: "attention classes",
+                        engine: "metal",
+                    });
+                }
                 Ok(Seated {
                     lane: Lane {
                         slot: lane.slot,

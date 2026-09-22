@@ -7,9 +7,10 @@ use eta_dsl::Tensor;
 
 pub mod prelude {
     pub use super::{
-        DenoiseLoop, FlowMatchEuler, LaneClock, LaneRows, apg, at, cfg_combine, dynamic_shift,
-        encode_ids, encode_ids_rows, encode_text, euler_step, guided_velocity, noise,
-        positions_for, positions_grid, resume_or_step, rng_state, seed_or_step,
+        DenoiseLoop, Dpm2m, Dpm2mChannels, FlowMatchEuler, LaneClock, LaneRows, apg, at,
+        cfg_combine, dpm2m_step, dynamic_shift, encode_ids, encode_ids_rows, encode_text,
+        euler_step, guided_velocity, inpaint_step, noise, positions_for, positions_grid,
+        resume_or_step, rng_state, seed_or_step,
     };
     pub use crate::eta::attention::prelude::*;
 }
@@ -309,6 +310,7 @@ pub struct DenoiseLoop {
     pipes: Vec<Pipeline>,
     dts: Vec<f32>,
     ts: Vec<f32>,
+    sigmas: Vec<f32>,
     fires: u32,
 }
 
@@ -325,6 +327,7 @@ impl DenoiseLoop {
             pipes: Vec::new(),
             dts,
             ts,
+            sigmas: sched.sigmas.clone(),
             fires: sched.steps() + 1,
         }
     }
@@ -346,6 +349,13 @@ impl DenoiseLoop {
     #[must_use]
     pub fn dts(&self, tag: &str) -> Channel {
         Channel::from(self.dts.clone()).named(&format!("{tag}_dts"))
+    }
+
+    /// The sigma the latent sits at after fire `k`: fire 0 seeds at
+    /// `sigmas[0]`, fire `k` steps to `sigmas[k]`, and the last lands on 0.
+    #[must_use]
+    pub fn sigmas(&self, tag: &str) -> Channel {
+        Channel::from(self.sigmas.clone()).named(&format!("{tag}_sigmas"))
     }
 
     pub fn fire(&self, passes: &[&ForwardPass]) -> Result<(), String> {
@@ -420,6 +430,139 @@ pub fn resume_or_step(
         out.put(&next);
     }
     rng.put(&state + &Tensor::constant([0u32, 1u32]));
+}
+
+/// One step of inpainting: rows with `mask` 1 take the Euler step, rows with
+/// `mask` 0 are `init` re-noised to the sigma this fire lands at, so the kept
+/// region is the init picture bit for bit once sigma reaches 0.
+#[allow(clippy::too_many_arguments)]
+pub fn inpaint_step(
+    k: &Tensor,
+    x: &Channel,
+    init: &Channel,
+    mask: &Channel,
+    sigmas: &Channel,
+    velocity: &Tensor,
+    dts: &Channel,
+    rng: &Channel,
+    shape: [u32; 2],
+    out: Option<&Channel>,
+) {
+    let current = x.take();
+    let stepped = euler_step(&current, velocity, &at(&dts.read(), k));
+    let state = rng.take();
+    let eps = noise(shape, &state);
+    let x0 = init.read();
+    let one = broadcast(Tensor::constant([1.0f32]), shape);
+    let sigma = broadcast(reshape(at(&sigmas.read(), k), [1, 1]), shape);
+    let kept = &(&x0 * &(&one - &sigma)) + &(&eps * &sigma);
+    let m = broadcast(reshape(mask.read(), [shape[0], 1]), shape);
+    let blended = &(&m * &stepped) + &(&(&one - &m) * &kept);
+    let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
+    let next = select(&first, &kept, &blended);
+    x.put(&next);
+    if let Some(out) = out {
+        out.put(&next);
+    }
+    rng.put(&state + &Tensor::constant([0u32, 1u32]));
+}
+
+/// DPM-Solver++ 2M over a flow schedule, as per-fire scalar tables indexed
+/// by `DenoiseLoop`'s fire `k` (fire 0 is the seed and steps nowhere; fire
+/// `k` steps from `sigmas[k-1]` to `sigmas[k]`). With `x0 = x - sigma_s * v`
+/// the update is `x <- ratio * x + gain * D`, `D = (1 + mix) * x0 - mix *
+/// x0_prev`; the first step and the step onto sigma 0 are first order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dpm2m {
+    pub sigma_s: Vec<f32>,
+    pub ratio: Vec<f32>,
+    pub gain: Vec<f32>,
+    pub mix: Vec<f32>,
+}
+
+impl Dpm2m {
+    #[must_use]
+    pub fn of(sched: &FlowMatchEuler) -> Dpm2m {
+        let s = &sched.sigmas;
+        let lambda = |sigma: f32| ((1.0 - sigma).max(1e-12) / sigma.max(1e-12)).ln();
+        let mut tables = Dpm2m {
+            sigma_s: vec![s.first().copied().unwrap_or(1.0)],
+            ratio: vec![0.0],
+            gain: vec![0.0],
+            mix: vec![0.0],
+        };
+        let mut h_prev: Option<f32> = None;
+        for k in 1..s.len() {
+            let (ss, st) = (s[k - 1], s[k]);
+            let (alpha_s, alpha_t) = (1.0 - ss, 1.0 - st);
+            let e = if st <= 0.0 {
+                0.0
+            } else {
+                (st * alpha_s) / (ss * alpha_t)
+            };
+            let h = if st <= 0.0 {
+                f32::INFINITY
+            } else {
+                lambda(st) - lambda(ss)
+            };
+            tables.sigma_s.push(ss);
+            tables.ratio.push(if ss > 0.0 { st / ss } else { 0.0 });
+            tables.gain.push(-alpha_t * (e - 1.0));
+            tables.mix.push(match h_prev {
+                Some(hp) if h.is_finite() && hp.is_finite() && hp != 0.0 => h / (2.0 * hp),
+                _ => 0.0,
+            });
+            h_prev = Some(h);
+        }
+        tables
+    }
+
+    #[must_use]
+    pub fn channels(&self, tag: &str) -> Dpm2mChannels {
+        Dpm2mChannels {
+            sigma_s: Channel::from(self.sigma_s.clone()).named(&format!("{tag}_sigma_s")),
+            ratio: Channel::from(self.ratio.clone()).named(&format!("{tag}_ratio")),
+            gain: Channel::from(self.gain.clone()).named(&format!("{tag}_gain")),
+            mix: Channel::from(self.mix.clone()).named(&format!("{tag}_mix")),
+        }
+    }
+}
+
+pub struct Dpm2mChannels {
+    pub sigma_s: Channel,
+    pub ratio: Channel,
+    pub gain: Channel,
+    pub mix: Channel,
+}
+
+/// One DPM-Solver++ 2M fire: `x` is the loop-carried latent (seeded by the
+/// guest), `x0_prev` the previous fire's data prediction (seeded with zeros).
+/// Answers this fire's data prediction.
+pub fn dpm2m_step(
+    k: &Tensor,
+    x: &Channel,
+    x0_prev: &Channel,
+    tables: &Dpm2mChannels,
+    velocity: &Tensor,
+    shape: [u32; 2],
+    out: Option<&Channel>,
+) -> Tensor {
+    let scalar = |table: &Channel| broadcast(reshape(at(&table.read(), k), [1, 1]), shape);
+    let current = x.take();
+    let x0 = &current - &(velocity * &scalar(&tables.sigma_s));
+    let prev = x0_prev.take();
+    let mix = scalar(&tables.mix);
+    let one = broadcast(Tensor::constant([1.0f32]), shape);
+    let d = &(&x0 * &(&one + &mix)) - &(&prev * &mix);
+    let stepped = &(&current * &scalar(&tables.ratio)) + &(&d * &scalar(&tables.gain));
+    let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
+    let next = select(&first, &current, &stepped);
+    x.put(&next);
+    x0_prev.put(&x0);
+    if let Some(out) = out {
+        out.put(&next);
+    }
+    x0
 }
 
 pub async fn encode_text(prompt: &str, reading: &str) -> Result<Channel, String> {

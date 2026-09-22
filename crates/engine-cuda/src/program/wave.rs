@@ -187,7 +187,11 @@ impl Wave {
     }
 
     fn reserve(&mut self, bytes: usize) -> Result<()> {
-        if self.arena.as_ref().is_some_and(|arena| arena.bytes() >= bytes) {
+        if self
+            .arena
+            .as_ref()
+            .is_some_and(|arena| arena.bytes() >= bytes)
+        {
             return Ok(());
         }
         if let Some(outgrown) = self.arena.take() {
@@ -232,8 +236,14 @@ mod tests {
             SettleLane::default(),
         );
         assert_eq!((first, second), (0, 1));
-        assert_eq!((wave.pull[0].ticket_offset, wave.pull[0].ticket_count), (0, 2));
-        assert_eq!((wave.pull[1].ticket_offset, wave.pull[1].ticket_count), (2, 1));
+        assert_eq!(
+            (wave.pull[0].ticket_offset, wave.pull[0].ticket_count),
+            (0, 2)
+        );
+        assert_eq!(
+            (wave.pull[1].ticket_offset, wave.pull[1].ticket_count),
+            (2, 1)
+        );
         assert_eq!(
             (wave.publish[1].ticket_offset, wave.publish[1].ticket_count),
             (2, 1)
@@ -242,7 +252,9 @@ mod tests {
             (wave.settle[1].ticket_offset, wave.settle[1].ticket_count),
             (2, 1)
         );
-        assert_eq!(wave.tickets.iter().map(|t| t.slot).collect::<Vec<_>>(), vec![0, 1, 7]);
+        assert_eq!(
+            wave.tickets.iter().map(|t| t.slot).collect::<Vec<_>>(),
+            vec![0, 1, 7]
+        );
     }
-
 }

@@ -569,6 +569,18 @@ pub trait PassWit: Sized + 'static {
              `forward-diffusion` verb, and a peer is a velocity to guide with"
             .to_string())
     }
+    fn attention_classes(
+        &self,
+        _classes: &[i32],
+        _table: &[u8],
+        _count: u32,
+    ) -> Result<(), String> {
+        Err(
+            "this pass interface carries no attention classes; `attention-classes` is a \
+             `forward` / `forward-diffusion` verb over group-packed attention"
+                .to_string(),
+        )
+    }
 }
 
 impl PassWit for wit_attention::ForwardPass {
@@ -613,6 +625,9 @@ impl PassWit for wit_attention::ForwardPass {
     fn peer(&self, ordinal: u32) -> Result<(), String> {
         wit_attention::ForwardPass::peer(self, ordinal)
     }
+    fn attention_classes(&self, classes: &[i32], table: &[u8], count: u32) -> Result<(), String> {
+        wit_attention::ForwardPass::attention_classes(self, classes, table, count)
+    }
 }
 
 impl PassWit for wit_diffusion::ForwardPass {
@@ -655,6 +670,9 @@ impl PassWit for wit_diffusion::ForwardPass {
     }
     fn peer(&self, ordinal: u32) -> Result<(), String> {
         wit_diffusion::ForwardPass::peer(self, ordinal)
+    }
+    fn attention_classes(&self, classes: &[i32], table: &[u8], count: u32) -> Result<(), String> {
+        wit_diffusion::ForwardPass::attention_classes(self, classes, table, count)
     }
 }
 
@@ -988,6 +1006,20 @@ impl<W: PassWit> Pass<W> {
             return Err("forward pass program is already attached".to_string());
         }
         self.wit.peer(ordinal)
+    }
+
+    /// A structured attention mask: one class per row of this pass (or -1),
+    /// and a `count x count` table of which q class attends which kv class.
+    pub fn attention_classes(
+        &self,
+        classes: &[i32],
+        table: &[u8],
+        count: u32,
+    ) -> Result<(), String> {
+        if self.inner.borrow().program_attached {
+            return Err("forward pass program is already attached".to_string());
+        }
+        self.wit.attention_classes(classes, table, count)
     }
 
     fn ensure_ports_available(&self, ports: &[Port]) -> Result<(), String> {

@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/bootstrap",
+    "crates/builtins",
     "crates/runtime",
     "crates/controller",
     "crates/gateway",
@@ -50,12 +51,14 @@ members = [
     "crates/kernels-wgpu",
     "crates/engine-wgpu",
     "crates/web-std",
-    "crates/web",
+    "crates/browser",
 
-    "sdk/server/python",
+    "python/server",
+    "javascript/server",
 ]
 default-members = [
     "crates/bootstrap",
+    "crates/builtins",
     "crates/runtime",
     "crates/controller",
     "crates/gateway",
@@ -91,10 +94,12 @@ default-members = [
     "crates/eta-dsl",
     "crates/eta-compiler",
     "crates/inferlet-macros",
-    "sdk/server/python",
+    "python/server",
+    "javascript/server",
 ]
 exclude = [
-    "tests/inferlets",
+    "examples",
+    "crates/builtins/inferlets",
     ".claude",
 ]
 
@@ -139,6 +144,9 @@ profile-fire = ["worker/profile-fire"]
 bootstrap = { path = "crates/bootstrap" }
 controller = { path = "crates/controller" }
 gateway = { path = "crates/gateway" }
+builtins = { path = "crates/builtins" }
+tar = "0.4"
+flate2 = "1"
 worker = { path = "crates/worker", default-features = false }
 runtime = { path = "crates/runtime" }
 models = { path = "crates/models" }
@@ -146,7 +154,7 @@ checkpoint = { path = "crates/checkpoint" }
 checkpoint-dsl = { path = "crates/checkpoint-dsl" }
 ztensor = { workspace = true }
 tokenizer = { path = "crates/tokenizer" }
-client = { path = "crates/client" }
+client = { package = "pie-client", path = "crates/client" }
 ids = { path = "crates/ids" }
 controller-api = { path = "crates/controller-api" }
 
@@ -158,9 +166,7 @@ tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking", "stream"] }
-tar = "0.4"
-xz2 = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 toml_edit = "0.25.13"
 
 [dev-dependencies]
@@ -170,7 +176,7 @@ tempfile = "3"
 libc = "0.2"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 
 rust-version = "1.91"
 

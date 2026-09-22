@@ -19,7 +19,7 @@ default = []
 cuda = ["dep:cudarc", "cudarc/cuda-13000"]
 
 [dependencies]
-dtype = { path = "../dtype" }
+dtype = { package = "pie-dtype", path = "../dtype" }
 
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
     "std",

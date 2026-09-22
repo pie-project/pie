@@ -16,7 +16,11 @@ pub(crate) fn gemv_bf16(
             format!("needs n > 0 and k > 0 in whole eights, and was handed n={n}, k={k}"),
         ));
     }
-    for (address, what) in [(weight, "the weight"), (act, "the activation"), (out, "the output")] {
+    for (address, what) in [
+        (weight, "the weight"),
+        (act, "the activation"),
+        (out, "the output"),
+    ] {
         if address == 0 {
             return Err(refuse("linear.gemv", format!("{what} is null")));
         }
@@ -39,13 +43,21 @@ pub(crate) fn gemv_bf16(
         ArgValue::I32(k),
         ArgValue::F32(0.0),
     ];
-    let blackwell = ctx.compute_capability_major().is_some_and(|major| major >= 10);
+    let blackwell = ctx
+        .compute_capability_major()
+        .is_some_and(|major| major >= 10);
 
     if n <= 4096 {
         let (instantiation, warps) = if blackwell {
-            ("::pie::linear::gemv_splitk_bf16_kernel<::pie::i32(4), 2>", 4)
+            (
+                "::pie::linear::gemv_splitk_bf16_kernel<::pie::i32(4), 2>",
+                4,
+            )
         } else {
-            ("::pie::linear::gemv_splitk_bf16_kernel<::pie::i32(8), 1>", 8)
+            (
+                "::pie::linear::gemv_splitk_bf16_kernel<::pie::i32(8), 1>",
+                8,
+            )
         };
         return ctx.fire(
             "linear.gemv",
@@ -62,8 +74,10 @@ pub(crate) fn gemv_bf16(
     };
     ctx.fire(
         "linear.gemv",
-        Fire::at("linear/gemv.cuh", instantiation)
-            .apply(Launch::grid([n.unsigned_abs().div_ceil(4), 1, 1], [32, 4, 1])),
+        Fire::at("linear/gemv.cuh", instantiation).apply(Launch::grid(
+            [n.unsigned_abs().div_ceil(4), 1, 1],
+            [32, 4, 1],
+        )),
         &values,
     )
 }

@@ -207,6 +207,21 @@ const _: () = assert!(
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
+pub struct PrefillRaggedClassParams {
+    pub base: PrefillRaggedParams,
+    pub q_classes: DevicePtr,
+    pub kv_classes: DevicePtr,
+    pub table: DevicePtr,
+    pub count: u32,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<PrefillRaggedClassParams>() == 344,
+    "PrefillRaggedClassParams: sizeof disagrees with ::pie::attn::fa2::RaggedClassParams",
+);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
 pub struct PrefillRaggedBiasParams {
     pub base: PrefillRaggedParams,
     pub bias: DevicePtr,

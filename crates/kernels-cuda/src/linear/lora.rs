@@ -1,7 +1,9 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+};
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/lora.cuh";
@@ -31,8 +33,14 @@ pub fn correct(
 
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` walks i32 adapter ids");
-    debug_assert_eq!(bank_a.dtype, x.dtype, "the adapter bank rides the activation's dtype");
-    debug_assert_eq!(bank_b.dtype, x.dtype, "the adapter bank rides the activation's dtype");
+    debug_assert_eq!(
+        bank_a.dtype, x.dtype,
+        "the adapter bank rides the activation's dtype"
+    );
+    debug_assert_eq!(
+        bank_b.dtype, x.dtype,
+        "the adapter bank rides the activation's dtype"
+    );
 
     let rows = nonzero(OP, "rows", x.rows)?;
     let in_width = nonzero(OP, "the correction's input width", x.width)?;

@@ -46,9 +46,7 @@ impl std::str::FromStr for Graphs {
 pub enum Recording {
     Off,
     Shaped,
-    Bodies {
-        mem_megabytes: u32,
-    },
+    Bodies { mem_megabytes: u32 },
 }
 
 impl Default for Recording {

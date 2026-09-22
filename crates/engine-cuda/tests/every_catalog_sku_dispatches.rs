@@ -14,14 +14,12 @@ struct Refusal {
     needle: &'static str,
 }
 
-const REFUSED: &[Refusal] = &[
-    Refusal {
-        op: "attention.pool_lse_selected",
-        why: "no selected reader in pool.cuh; metal, vulkan and wgpu all cover it",
-        file: "src/dispatch/attn.rs",
-        needle: "op: \"attention.pool_lse_selected\"",
-    },
-];
+const REFUSED: &[Refusal] = &[Refusal {
+    op: "attention.pool_lse_selected",
+    why: "no selected reader in pool.cuh; metal, vulkan and wgpu all cover it",
+    file: "src/dispatch/attn.rs",
+    needle: "op: \"attention.pool_lse_selected\"",
+}];
 
 fn refuses_split_mrope(op: &model_ir::ops::Operation) -> bool {
     matches!(

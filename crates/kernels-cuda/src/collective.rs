@@ -67,8 +67,12 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
             return answered(OP, "ncclAllGather", code);
         }
 
-        let world = u32::try_from(y.elements() / x.elements())
-            .map_err(|_| refuse(OP, "the gathered rectangle is more shards than a u32 counts"))?;
+        let world = u32::try_from(y.elements() / x.elements()).map_err(|_| {
+            refuse(
+                OP,
+                "the gathered rectangle is more shards than a u32 counts",
+            )
+        })?;
         let bytes = usize::try_from(y.elements().saturating_mul(y.dtype.bytes_ceil()))
             .map_err(|_| refuse(OP, "the gathered rectangle does not fit this address space"))?;
         let stage = ctx.scratch(OP, "all_gather_stage", bytes)?;

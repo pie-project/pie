@@ -14,7 +14,7 @@ use kernels_metal::elemwise::rope;
 use model_ir::Dtype;
 
 fn noise(at: u64) -> u32 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5e5e_1234_9ABC_DEF0;
+    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     (x >> 32) as u32
@@ -105,18 +105,26 @@ fn check(
         rope::partial(&sink, q, k, p, rotary_dim, head_dim, theta).expect("the launch");
         frame.commit().expect("the commit");
     }
-    let got_q = bf16_floats(&handles.read(hq, u64::from(rows * q_width) * 2).expect("read q"));
-    let got_k = bf16_floats(&handles.read(hk, u64::from(rows * k_width) * 2).expect("read k"));
+    let got_q = bf16_floats(
+        &handles
+            .read(hq, u64::from(rows * q_width) * 2)
+            .expect("read q"),
+    );
+    let got_k = bf16_floats(
+        &handles
+            .read(hk, u64::from(rows * k_width) * 2)
+            .expect("read k"),
+    );
 
     for (label, src, got, heads, width) in [
         ("q", &q_in, &got_q, q_heads, q_width),
         ("k", &k_in, &got_k, kv_heads, k_width),
     ] {
-        for r in 0..rows as usize {
+        for (r, &position) in positions.iter().enumerate() {
             for h in 0..heads as usize {
                 let at = r * width as usize + h * head_dim as usize;
                 let mut want = src[at..at + head_dim as usize].to_vec();
-                turn(&mut want, positions[r], rotary_dim as usize, theta);
+                turn(&mut want, position, rotary_dim as usize, theta);
                 for (i, want) in want.into_iter().enumerate() {
                     let g = got[at + i];
                     assert!(

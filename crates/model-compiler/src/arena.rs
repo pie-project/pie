@@ -172,9 +172,23 @@ pub struct FireRows {
 
 pub const READOUTS_PER_LANE: u64 = 16;
 
+/// A readout plane whose row is at most this wide (a velocity or hidden
+/// export) is carved for every token; a wider one (vocab-wide logits) for
+/// `READOUTS_PER_LANE` rows a lane.
+pub const NARROW_READOUT_ROW_BYTES: u64 = 64 << 10;
+
 #[must_use]
 pub fn readouts_ceiling(budget: &crate::Budget) -> u64 {
     (u64::from(budget.max_lanes) * READOUTS_PER_LANE).min(u64::from(budget.max_tokens))
+}
+
+#[must_use]
+pub fn readout_rows(width: u64, elem: u64, budget: &crate::Budget) -> u64 {
+    if width.saturating_mul(elem) <= NARROW_READOUT_ROW_BYTES {
+        u64::from(budget.max_tokens)
+    } else {
+        readouts_ceiling(budget)
+    }
 }
 
 impl FireRows {
@@ -469,6 +483,21 @@ impl ArenaMap {
         most
     }
 
+    /// The rows one fire may read out through `value`'s plane.
+    #[must_use]
+    pub fn readout_ceiling_of(&self, value: ValueId) -> Option<u64> {
+        match self.placements.get(self.root(value).0 as usize)? {
+            Placement::Arena {
+                bytes,
+                rows: RowExpr::Readouts,
+                width,
+                dtype,
+                ..
+            } => Some(bytes / width.saturating_mul(elem_bytes(*dtype)?).max(1)),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn prefix_for(&self, readouts: u64) -> u64 {
         self.placements
@@ -581,10 +610,13 @@ fn rectangles(trace: &Trace, budgets: &Budgets) -> Result<Vec<Placement>, Error>
                             value,
                             why: Unrectangled::PackedElement,
                         })?;
+                        let carved = match rows {
+                            RowExpr::Readouts => readout_rows(width, elem, &budgets.tokens),
+                            _ => rows.max(budgets),
+                        };
                         Ok(Placement::Arena {
                             offset: 0,
-                            bytes: rows
-                                .max(budgets)
+                            bytes: carved
                                 .checked_mul(width)
                                 .and_then(|bytes| bytes.checked_mul(elem))
                                 .ok_or(Error::Unrectangled {

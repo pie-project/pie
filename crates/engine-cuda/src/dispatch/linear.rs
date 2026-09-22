@@ -1,5 +1,5 @@
-use kernels_cuda::linear;
 use kernels_cuda::Tensor;
+use kernels_cuda::linear;
 use kernels_cuda::linear::moe::GroupSeat;
 use kernels_cuda::linear::quant::OffsetKind;
 use model_exec::{DispatchLinear, KernelError};
@@ -54,23 +54,23 @@ impl Run<'_> {
                 None => self.row_major_matmul(act, w, y),
             },
             Linear::LmHead { act, w, y } => match self.maybe_tiled_planes(*w) {
-                    Some((codes, scales, biases, seat)) => {
-                        let act = self.tensor(*act);
-                        let entry = if act.rows >= PREFILL_ROWS {
-                            linear::tiled::lm_head
-                        } else {
-                            linear::tiled::lm_head_gemv
-                        };
-                        entry(
-                            self.ctx(),
-                            act,
-                            codes,
-                            scales,
-                            biases,
-                            &mut self.tensor(*y),
-                            seat,
-                        )
-                    }
+                Some((codes, scales, biases, seat)) => {
+                    let act = self.tensor(*act);
+                    let entry = if act.rows >= PREFILL_ROWS {
+                        linear::tiled::lm_head
+                    } else {
+                        linear::tiled::lm_head_gemv
+                    };
+                    entry(
+                        self.ctx(),
+                        act,
+                        codes,
+                        scales,
+                        biases,
+                        &mut self.tensor(*y),
+                        seat,
+                    )
+                }
                 None => self.row_major_lm_head(act, w, y),
             },
             Linear::MatmulGeglu {
@@ -192,15 +192,13 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MlpSwigluClampSplit { gate, up, limit, y } => {
-                linear::mlp::swiglu_clamp_split(
-                    self.ctx(),
-                    self.tensor(*gate),
-                    self.tensor(*up),
-                    *limit,
-                    &mut self.tensor(*y),
-                )
-            }
+            Linear::MlpSwigluClampSplit { gate, up, limit, y } => linear::mlp::swiglu_clamp_split(
+                self.ctx(),
+                self.tensor(*gate),
+                self.tensor(*up),
+                *limit,
+                &mut self.tensor(*y),
+            ),
             Linear::MlpGegluTanh { gate, up, y } => {
                 let fan = self.plane_fan(self.tensor(*y).rows);
                 linear::mlp::geglu_tanh(
@@ -430,8 +428,10 @@ impl Run<'_> {
                     });
                 }
                 let rows = x.rows * groups_nz;
-                let x = kernels_cuda::tensor::Tensor::new(x.ptr, rows, x.width / groups_nz, x.dtype);
-                let mut y = kernels_cuda::tensor::Tensor::new(y.ptr, rows, y.width / groups_nz, y.dtype);
+                let x =
+                    kernels_cuda::tensor::Tensor::new(x.ptr, rows, x.width / groups_nz, x.dtype);
+                let mut y =
+                    kernels_cuda::tensor::Tensor::new(y.ptr, rows, y.width / groups_nz, y.dtype);
                 let (bank, experts) = self.expert_bank(*w);
                 linear::moe::matmul_select(
                     self.ctx(),
@@ -661,7 +661,9 @@ impl Run<'_> {
         }
         let count = routes.rows as usize * routes.width as usize;
         let mut picked = vec![0i32; count];
-        if crate::device::copy_any(stream, picked.as_mut_ptr() as u64, routes.ptr, count * 4).is_err() {
+        if crate::device::copy_any(stream, picked.as_mut_ptr() as u64, routes.ptr, count * 4)
+            .is_err()
+        {
             return None;
         }
         let mut unique: Vec<i32> = picked.iter().copied().filter(|e| *e >= 0).collect();
@@ -676,7 +678,10 @@ impl Run<'_> {
             return None;
         }
         let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
-        let remapped: Vec<i32> = picked.iter().map(|e| if *e < 0 { -1 } else { slot_of(*e) }).collect();
+        let remapped: Vec<i32> = picked
+            .iter()
+            .map(|e| if *e < 0 { -1 } else { slot_of(*e) })
+            .collect();
         let stage = |name: &'static str, plane: Tensor| -> Option<Tensor> {
             let width = plane.width as usize;
             let ptr = staging(name, unique.len() * width)?;
@@ -689,7 +694,12 @@ impl Run<'_> {
                 )
                 .ok()?;
             }
-            Some(Tensor::new(ptr, unique.len() as u32, plane.width, plane.dtype))
+            Some(Tensor::new(
+                ptr,
+                unique.len() as u32,
+                plane.width,
+                plane.dtype,
+            ))
         };
         let staged_codes = stage("moe.staged.codes", codes)?;
         let staged_scales = stage("moe.staged.scales", scales)?;
@@ -715,15 +725,24 @@ fn staging(name: &'static str, bytes: usize) -> Option<u64> {
     if bytes == 0 {
         return None;
     }
-    let mut held = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut held = HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let map = held.get_or_insert_with(HashMap::new);
     if let Some((ptr, cap)) = map.get(name)
         && *cap >= bytes
     {
         return Some(*ptr);
     }
-    let fresh = crate::device::alloc::raw_alloc(bytes.max(map.get(name).map_or(0, |(_, cap)| cap * 2)))?;
-    if let Some((old, _)) = map.insert(name, (fresh, bytes.max(map.get(name).map_or(0, |(_, cap)| cap * 2)))) {
+    let fresh =
+        crate::device::alloc::raw_alloc(bytes.max(map.get(name).map_or(0, |(_, cap)| cap * 2)))?;
+    if let Some((old, _)) = map.insert(
+        name,
+        (
+            fresh,
+            bytes.max(map.get(name).map_or(0, |(_, cap)| cap * 2)),
+        ),
+    ) {
         crate::device::alloc::raw_free(old);
     }
     Some(fresh)

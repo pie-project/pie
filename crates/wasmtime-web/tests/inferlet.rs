@@ -8,7 +8,7 @@ use wasmtime::component::{Component, Linker, ResourceType};
 
 fn guest_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/inferlets/target/wasm32-wasip2/release/text_completion.wasm")
+        .join("../../examples/target/wasm32-wasip2/release/text_completion.wasm")
 }
 
 fn stub_pie_world(
@@ -49,39 +49,11 @@ fn stub_pie_world(
 }
 
 #[test]
-fn a_javascript_inferlet_links_and_instantiates() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/inferlets/naive-baseline-js/target/naive_baseline_js.wasm");
-    let Ok(bytes) = std::fs::read(&path) else {
-        eprintln!(
-            "skipping: {} not built (bakery build tests/inferlets/naive-baseline-js -o {})",
-            path.display(),
-            path.display()
-        );
-        return;
-    };
-    let engine = common::engine();
-    let component = Component::new(&engine, &bytes).expect("naive-baseline-js component");
-    let mut linker = Linker::<common::State>::new(&engine);
-    wasmtime_web::add_to_linker(&mut linker).expect("add_to_linker");
-    wasmtime_web::stub_unhosted(&mut linker, &engine, &component).expect("stub_unhosted");
-    stub_pie_world(&engine, &mut linker, &component);
-    let (state, _stdout, _stderr) = common::state();
-    let mut store = Store::new(&engine, state);
-    common::block_on(async {
-        linker
-            .instantiate_async(&mut store, &component)
-            .await
-            .unwrap_or_else(|e| panic!("instantiate naive-baseline-js: {e:?}"));
-    });
-}
-
-#[test]
 fn text_completion_links_and_instantiates() {
     let path = guest_path();
     let Ok(bytes) = std::fs::read(&path) else {
         eprintln!(
-            "skipping: {} not built (cd tests/inferlets && cargo build -p text-completion --release --target wasm32-wasip2)",
+            "skipping: {} not built (cd examples && cargo build -p text-completion --release --target wasm32-wasip2)",
             path.display()
         );
         return;

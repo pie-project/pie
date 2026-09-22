@@ -24,6 +24,8 @@ pub struct DeviceInfo {
 
     pub max_storage_buffer_binding: u64,
 
+    pub max_storage_buffers: u32,
+
     pub cores: u32,
 }
 

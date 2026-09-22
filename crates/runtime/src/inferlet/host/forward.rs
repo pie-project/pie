@@ -973,6 +973,52 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
+    async fn core_attention_classes(
+        &mut self,
+        this: Resource<ForwardPass>,
+        classes: Vec<i32>,
+        table: Vec<u8>,
+        count: u32,
+    ) -> Anyhow<Result<(), String>> {
+        if let Err(error) = self.core_gate(&this, None)? {
+            return Ok(Err(error));
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if pass.bindings.attn_classes.is_some() {
+            return Ok(Err(
+                "forward pass attention classes are already set".to_string()
+            ));
+        }
+        let max = ::engine::fire::ATTN_CLASSES_MAX;
+        if count == 0 || count > max {
+            return Ok(Err(format!(
+                "attention classes: `count` is {count}; the table holds 1..={max} classes"
+            )));
+        }
+        if table.len() as u64 != u64::from(count) * u64::from(count) {
+            return Ok(Err(format!(
+                "attention classes: the table is {} bytes for {count} classes; it is \
+                 count x count, row-major, q class by kv class",
+                table.len()
+            )));
+        }
+        if let Some(bad) = classes.iter().find(|c| **c >= 0 && **c as u32 >= count) {
+            return Ok(Err(format!(
+                "attention classes: a row names class {bad} and the table holds {count}; \
+                 a class is in 0..count, or -1 for an unconstrained row"
+            )));
+        }
+        pass.bindings.attn_classes = Some(::engine::fire::AttnClasses {
+            classes,
+            table,
+            count,
+        });
+        Ok(Ok(()))
+    }
+
     async fn core_canvas(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1425,6 +1471,7 @@ impl ProcessCtx {
                 group: pass.bindings.group,
                 peer: pass.bindings.peer,
                 ports: port_bindings.iter().map(PortBinding::feed).collect(),
+                attn_classes: pass.bindings.attn_classes.clone(),
             };
             (
                 embed,
@@ -1513,7 +1560,7 @@ impl ProcessCtx {
             {
                 return Ok(Err(format!(
                     "pipeline: port `{}`'s channel is not bound into this pass's program; \
-                     read it in a stage (the SDK's `input` does) so the program declares it",
+                     read it in a stage (the inferlet library's `input` does) so the program declares it",
                     port.name
                 )));
             }
@@ -2239,6 +2286,17 @@ macro_rules! forward_pass_readings {
             group: u32,
         ) -> Anyhow<Result<(), String>> {
             self.core_peer(this, group).await
+        }
+
+        async fn attention_classes(
+            &mut self,
+            this: Resource<ForwardPass>,
+            classes: Vec<i32>,
+            table: Vec<u8>,
+            count: u32,
+        ) -> Anyhow<Result<(), String>> {
+            self.core_attention_classes(this, classes, table, count)
+                .await
         }
     };
 }

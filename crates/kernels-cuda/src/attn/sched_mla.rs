@@ -2,7 +2,7 @@ use crate::error::Error;
 
 use crate::attn::plan::{Built, Device, Live, MlaPlanInfo};
 use crate::attn::sched::{
-    AlignedAllocator, at, CostHeap, Staging, cost_function, lengths, narrow, packed_causal_kv_end,
+    AlignedAllocator, CostHeap, Staging, at, cost_function, lengths, narrow, packed_causal_kv_end,
     spans,
 };
 use crate::jit::refuse;
@@ -182,10 +182,13 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
                         ));
                     }
                     let slot = merge_cta_counter;
-                    let base = i64::from(req.qo_indptr[i]) * i64::from(req.num_heads)
-                        + tile_start as i64;
-                    merge_packed_offset_start[slot] =
-                        narrow(op, "mla_merge_packed_offset_start", base + offset_start as i64)?;
+                    let base =
+                        i64::from(req.qo_indptr[i]) * i64::from(req.num_heads) + tile_start as i64;
+                    merge_packed_offset_start[slot] = narrow(
+                        op,
+                        "mla_merge_packed_offset_start",
+                        base + offset_start as i64,
+                    )?;
                     merge_packed_offset_end[slot] = narrow(
                         op,
                         "mla_merge_packed_offset_end",
@@ -229,7 +232,9 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
                     cluster.partial_indptr.push(-1);
                 }
                 cluster.q_start.push(tile_start as i32);
-                cluster.kv_start.push(narrow(op, "mla_kv_start", kv_start as i64)?);
+                cluster
+                    .kv_start
+                    .push(narrow(op, "mla_kv_start", kv_start as i64)?);
                 cluster
                     .kv_end
                     .push(narrow(op, "mla_kv_end", (kv_start + actual_len) as i64)?);
@@ -246,8 +251,9 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     for i in 0..num_clusters as usize {
         work_indptr[i + 1] = work_indptr[i] + clusters[i].q_indptr.len() as i32;
     }
-    let total_num_works =
-        *work_indptr.last().expect("work_indptr has num_clusters + 1 entries") as usize;
+    let total_num_works = *work_indptr
+        .last()
+        .expect("work_indptr has num_clusters + 1 entries") as usize;
     if total_num_works > MAX_TOTAL_NUM_WORKS {
         return Err(refuse(
             op,
@@ -303,22 +309,23 @@ pub fn plan(
     let per_sm = 4 * device.num_sm as usize;
     let mut ints = AlignedAllocator::new(op, int_bytes);
     info.q_indptr_offset = Some(ints.alloc(works, 16, "mla_q_indptr")?);
-    info.kv_indptr_offset =
-        Some(ints.alloc(works, 16, "mla_kv_indptr")?);
-    info.partial_indptr_offset =
-        Some(ints.alloc(works, 16, "mla_partial_indptr")?);
-    info.merge_packed_offset_start_offset = Some(ints.alloc(per_sm, 16, "mla_merge_packed_offset_start")?);
-    info.merge_packed_offset_end_offset = Some(ints.alloc(per_sm, 16, "mla_merge_packed_offset_end")?);
-    info.merge_partial_packed_offset_start_offset = Some(ints.alloc(per_sm, 16, "mla_merge_partial_packed_offset_start")?);
-    info.merge_partial_packed_offset_end_offset = Some(ints.alloc(per_sm, 16, "mla_merge_partial_packed_offset_end")?);
+    info.kv_indptr_offset = Some(ints.alloc(works, 16, "mla_kv_indptr")?);
+    info.partial_indptr_offset = Some(ints.alloc(works, 16, "mla_partial_indptr")?);
+    info.merge_packed_offset_start_offset =
+        Some(ints.alloc(per_sm, 16, "mla_merge_packed_offset_start")?);
+    info.merge_packed_offset_end_offset =
+        Some(ints.alloc(per_sm, 16, "mla_merge_packed_offset_end")?);
+    info.merge_partial_packed_offset_start_offset =
+        Some(ints.alloc(per_sm, 16, "mla_merge_partial_packed_offset_start")?);
+    info.merge_partial_packed_offset_end_offset =
+        Some(ints.alloc(per_sm, 16, "mla_merge_partial_packed_offset_end")?);
     info.merge_partial_stride_offset = Some(ints.alloc(per_sm, 16, "mla_merge_partial_stride")?);
     info.q_len_offset = Some(ints.alloc(works, 16, "mla_q_len")?);
     info.kv_len_offset = Some(ints.alloc(works, 16, "mla_kv_len")?);
     info.q_start_offset = Some(ints.alloc(works, 16, "mla_q_start")?);
     info.kv_start_offset = Some(ints.alloc(works, 16, "mla_kv_start")?);
     info.kv_end_offset = Some(ints.alloc(works, 16, "mla_kv_end")?);
-    info.work_indptr_offset =
-        Some(ints.alloc(works, 16, "mla_work_indptr")?);
+    info.work_indptr_offset = Some(ints.alloc(works, 16, "mla_work_indptr")?);
 
     let writes: [(Option<u32>, &Vec<i32>, &'static str); 14] = [
         (info.q_indptr_offset, &sched.q_indptr, "mla_q_indptr"),
@@ -373,9 +380,12 @@ pub fn plan(
     const SIZEOF_DTYPE_O: usize = 2;
     let mut floats = AlignedAllocator::new(op, float_bytes);
     let rows = 2 * sched.num_clusters as usize * sched.cluster_tile_q as usize;
-    info.partial_o_offset = Some(floats.alloc(rows * SIZEOF_DTYPE_O * req.head_dim_o as usize, 16, "mla_partial_o")?);
-    info.partial_lse_offset =
-        Some(floats.alloc(rows * 4, 16, "mla_partial_lse")?);
+    info.partial_o_offset = Some(floats.alloc(
+        rows * SIZEOF_DTYPE_O * req.head_dim_o as usize,
+        16,
+        "mla_partial_o",
+    )?);
+    info.partial_lse_offset = Some(floats.alloc(rows * 4, 16, "mla_partial_lse")?);
 
     Ok(Built {
         info,

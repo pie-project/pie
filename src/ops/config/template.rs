@@ -40,7 +40,6 @@ const HEADER: &str = r#"# Pie configuration, written by `pie config init`. Edit 
 [server]
 host = "127.0.0.1"          # loopback. Exposing the port is an edit here.
 port = 8080
-registry = "https://registry.pie-project.org/"
 verbose = false
 telemetry = false
 # otlp_endpoint   = "http://localhost:4317"
@@ -80,8 +79,6 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # max_instances   = 1000
 # warm_memory     = "0B"
 # warm_slots      = 100
-# python_snapshot = true
-# python_runtime  = true
 
 # [cluster]
 # Distributed serving only. A single-node config omits this section entirely.

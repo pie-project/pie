@@ -234,12 +234,19 @@ pub struct Ranking {
 impl Ranking {
     pub fn of(trace: &Trace, planes: &Attachments) -> Result<Ranking> {
         let bytes = crate::weights::plane_bytes(trace)?;
-        let full = bytes.iter().map(|b| b.next_multiple_of(crate::weights::ALIGN)).sum();
+        let full = bytes
+            .iter()
+            .map(|b| b.next_multiple_of(crate::weights::ALIGN))
+            .sum();
         let (banks, packed) = routed(trace, planes, &bytes)?;
         let streamable: BTreeSet<usize> = banks
             .iter()
             .map(|bank| bank.param)
-            .chain(packed.iter().flat_map(|group| group.planes.iter().map(|plane| plane.param)))
+            .chain(
+                packed
+                    .iter()
+                    .flat_map(|group| group.planes.iter().map(|plane| plane.param)),
+            )
             .collect();
         let mut floor: Vec<usize> = Vec::new();
         let mut floor_bytes = 0u64;
@@ -276,7 +283,10 @@ impl Ranking {
             .map(|(at, param)| (param, at))
             .collect();
         spillable.sort_by_key(|group| {
-            (rank.get(&group.param).copied().unwrap_or(usize::MAX), group.param)
+            (
+                rank.get(&group.param).copied().unwrap_or(usize::MAX),
+                group.param,
+            )
         });
         Ok(Ranking {
             full,
@@ -590,9 +600,8 @@ fn routed(
         };
         let (bank, dense) = match op {
             Linear::MoeMatmulSelect { bank, .. } => (*bank, true),
-            Linear::MoeMatmulSelectBias { bank, .. } | Linear::MoeMatmulSelectQuant { bank, .. } => {
-                (*bank, false)
-            }
+            Linear::MoeMatmulSelectBias { bank, .. }
+            | Linear::MoeMatmulSelectQuant { bank, .. } => (*bank, false),
             _ => continue,
         };
         let at = weight_of(trace, bank)?;
@@ -649,7 +658,9 @@ fn routed(
                       pair with `TensorContract::scaling`",
             });
         };
-        let mut all: Vec<usize> = std::iter::once(at).chain(companions.iter().copied()).collect();
+        let mut all: Vec<usize> = std::iter::once(at)
+            .chain(companions.iter().copied())
+            .collect();
         all.sort_unstable();
         all.dedup();
         let planes: Vec<GroupPlane> = all
@@ -872,7 +883,10 @@ impl Tier {
         let mut seats = Vec::with_capacity(plan.banks.len());
         let (mut entry_at, mut counter_at) = (0usize, 0usize);
         for (bank, span) in plan.banks().iter().zip(&layout) {
-            debug_assert_eq!(span.0, bank.param as u64, "the layout walks the banks first");
+            debug_assert_eq!(
+                span.0, bank.param as u64,
+                "the layout walks the banks first"
+            );
             seats.push(Seat {
                 param: bank.param,
                 name: bank.name.clone(),
@@ -969,13 +983,20 @@ impl Tier {
         if !mapped.is_empty() {
             bump(Stat::Loads);
             let bytes: u64 = mapped.iter().map(|plane| plane.bytes).sum();
-            let groups = plan.groups().iter().filter(|group| group.held == Held::Mapped).count();
+            let groups = plan
+                .groups()
+                .iter()
+                .filter(|group| group.held == Held::Mapped)
+                .count();
             eprintln!(
                 "engine-cuda: the MAPPED tier holds {groups} group(s), {} plane(s), {bytes} \
                  byte(s) read where they lie in {} — neither budget held them; a GPU touch \
                  faults the page in over HMM",
                 mapped.len(),
-                source.as_ref().map_or_else(|| "<no artifact>".to_string(), |artifact| artifact.path().display().to_string()),
+                source.as_ref().map_or_else(
+                    || "<no artifact>".to_string(),
+                    |artifact| artifact.path().display().to_string()
+                ),
             );
         }
         let mut roster: Vec<&GroupPlan> = plan
@@ -1257,7 +1278,11 @@ impl Tier {
             self.berths.push(Berth {
                 tier: Held::Pinned,
                 at: where_at,
-                shape: self.groups[at].planes.iter().map(|plane| plane.reserved).collect(),
+                shape: self.groups[at]
+                    .planes
+                    .iter()
+                    .map(|plane| plane.reserved)
+                    .collect(),
                 holds: Some(at),
             });
             self.groups[at].berth = Some(berth);
@@ -1356,7 +1381,11 @@ impl Tier {
                 self.berths.push(Berth {
                     tier: held,
                     at: where_at,
-                    shape: self.groups[at].planes.iter().map(|plane| plane.reserved).collect(),
+                    shape: self.groups[at]
+                        .planes
+                        .iter()
+                        .map(|plane| plane.reserved)
+                        .collect(),
                     holds: Some(at),
                 });
                 self.groups[at].berth = Some(berth);
@@ -1387,8 +1416,7 @@ impl Tier {
             let byte = plane * 8;
             word[byte..byte + 8].copy_from_slice(&address.to_ne_bytes());
         }
-        self.cell_shadow
-            .write(group.cell_at * CELL as usize, &word);
+        self.cell_shadow.write(group.cell_at * CELL as usize, &word);
     }
 
     fn copy_cell(&self, at: usize, stream: *mut c_void) -> Result<()> {
@@ -1434,10 +1462,13 @@ impl Tier {
 
     #[must_use]
     pub fn handles(&self, param: usize) -> Option<Handles> {
-        self.seats.iter().find(|seat| seat.param == param).map(|seat| Handles {
-            table: self.table.ptr() + seat.entry_at as u64 * ENTRY,
-            counts: self.counts.ptr() + seat.counter_at as u64 * COUNTER,
-        })
+        self.seats
+            .iter()
+            .find(|seat| seat.param == param)
+            .map(|seat| Handles {
+                table: self.table.ptr() + seat.entry_at as u64 * ENTRY,
+                counts: self.counts.ptr() + seat.counter_at as u64 * COUNTER,
+            })
     }
 
     pub fn drain(&self, stream: *mut c_void) -> Result<()> {
@@ -1502,7 +1533,8 @@ impl Tier {
                 seat.slot_of[*out as usize] = None;
                 let entry = seat.entry_at + *out as usize;
                 let value = pinned_address_of(seat, *out);
-                self.shadow.write(entry * ENTRY as usize, &value.to_ne_bytes());
+                self.shadow
+                    .write(entry * ENTRY as usize, &value.to_ne_bytes());
                 copy_any(
                     notify,
                     self.table.ptr() + entry as u64 * ENTRY,
@@ -1520,7 +1552,8 @@ impl Tier {
                 usize::try_from(seat.stride).unwrap_or(usize::MAX),
             )?;
             let entry = seat.entry_at + *into as usize;
-            self.shadow.write(entry * ENTRY as usize, &dst.to_ne_bytes());
+            self.shadow
+                .write(entry * ENTRY as usize, &dst.to_ne_bytes());
             copy_any(
                 notify,
                 self.table.ptr() + entry as u64 * ENTRY,
@@ -1555,7 +1588,12 @@ impl Tier {
                 .map(|(at, plane)| (*at, plane.bytes))
                 .collect();
             for (dst, (src, bytes)) in into.into_iter().zip(from) {
-                copy_any(notify, dst, src, usize::try_from(bytes).unwrap_or(usize::MAX))?;
+                copy_any(
+                    notify,
+                    dst,
+                    src,
+                    usize::try_from(bytes).unwrap_or(usize::MAX),
+                )?;
             }
             self.landed.record(notify)?;
             self.swap = Some(swap);
@@ -1760,7 +1798,12 @@ impl Tier {
             .map(|(at, plane)| (*at, plane.bytes))
             .collect();
         for (dst, (src, bytes)) in into.into_iter().zip(from) {
-            copy_any(notify, dst, src, usize::try_from(bytes).unwrap_or(usize::MAX))?;
+            copy_any(
+                notify,
+                dst,
+                src,
+                usize::try_from(bytes).unwrap_or(usize::MAX),
+            )?;
         }
         self.landed.record(notify)?;
         self.landed.settle()?;
@@ -1848,13 +1891,16 @@ mod tests {
     use super::*;
 
     fn a3b() -> Trace {
-        let trace = models::sku("qwen35-a3b-bf16-kv-bf16").expect("the catalog ships the SKU").trace;
+        let trace = models::sku("qwen35-a3b-bf16-kv-bf16")
+            .expect("the catalog ships the SKU")
+            .trace;
         trace(Platform::Cuda)
     }
 
     fn gpt_oss() -> Trace {
-        let trace =
-            models::sku("gptoss-20b-bf16-mxfp4-kv-bf16").expect("the catalog ships the SKU").trace;
+        let trace = models::sku("gptoss-20b-bf16-mxfp4-kv-bf16")
+            .expect("the catalog ships the SKU")
+            .trace;
         trace(Platform::Cuda)
     }
 
@@ -1909,7 +1955,10 @@ mod tests {
         let why = Plan::of(&trace, &Attachments::new(), Budgets::device(1 << 20))
             .expect_err("a megabyte holds nothing");
         let said = why.to_string();
-        assert!(said.contains("REGISTERED"), "the refusal names the floor: {said}");
+        assert!(
+            said.contains("REGISTERED"),
+            "the refusal names the floor: {said}"
+        );
         assert!(
             said.contains("cannot be moved to another tier"),
             "and says why those planes and not the others: {said}"
@@ -1919,5 +1968,4 @@ mod tests {
             "and that the rest already spilled: {said}"
         );
     }
-
 }
