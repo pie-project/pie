@@ -22,7 +22,7 @@
     "@bytecodealliance/componentize-js": "^0.22.0",
     "@bytecodealliance/jco": "^1.32.1",
     "acorn": "^8.18.0",
-    "esbuild": "^0.28.0",
+    "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
     "vitest": "^5.0.0"
   },
