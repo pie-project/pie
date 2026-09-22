@@ -27,6 +27,7 @@ env:
 
 jobs:
   browser:
+    name: "browser: build"
     if: inputs.package == 'browser'
     runs-on: ubuntu-latest
     steps:
@@ -51,17 +52,18 @@ jobs:
 
   addon:
     if: inputs.package == 'server'
-    name: addon (${{ matrix.target.npm }})
+    name: "server: addon (${{ matrix.target.npm }})"
     strategy:
       fail-fast: false
       matrix:
         target:
-          - { npm: linux-x64,    runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu,  features: 'cuda,vulkan,wgpu', lib: libpie_server.so,    container: 'nvidia/cuda:13.0.0-devel-rockylinux8' }
-          - { npm: linux-arm64,  runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu, features: 'cuda,vulkan,wgpu', lib: libpie_server.so,    container: 'nvidia/cuda:13.0.0-devel-rockylinux8' }
+          # Linux on ubuntu-22.04 (glibc 2.35): the Slang release that compiles
+          # the Vulkan kernels needs 2.34, which rules out the 2.28 container.
+          - { npm: linux-x64,    runner: ubuntu-22.04,       triple: x86_64-unknown-linux-gnu,  features: 'cuda,vulkan,wgpu', lib: libpie_server.so }
+          - { npm: linux-arm64,  runner: ubuntu-22.04-arm,   triple: aarch64-unknown-linux-gnu, features: 'cuda,vulkan,wgpu', lib: libpie_server.so }
           - { npm: darwin-arm64, runner: macos-15,           triple: aarch64-apple-darwin,      features: 'metal,wgpu',       lib: libpie_server.dylib }
           - { npm: win32-x64,    runner: windows-large-x64,  triple: x86_64-pc-windows-msvc,    features: 'cuda,vulkan',      lib: pie_server.dll }
     runs-on: ${{ matrix.target.runner }}
-    container: ${{ matrix.target.container }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
@@ -69,7 +71,6 @@ jobs:
         with:
           triple: ${{ matrix.target.triple }}
           features: ${{ matrix.target.features }}
-          manylinux: ${{ matrix.target.container && 'true' || 'false' }}
           cache-key: release-server-${{ matrix.target.npm }}
       - shell: bash
         run: |
@@ -82,6 +83,7 @@ jobs:
           if-no-files-found: error
 
   publish:
+    name: "npm: check + publish"
     needs: [browser, addon]
     if: >-
       always() && !cancelled()
@@ -117,10 +119,11 @@ jobs:
           bash ../../scripts/check-inferlet-interfaces.sh
           npm run generate-bindings
           git diff --exit-code -- src/bindings tsconfig.json
+      # `browser`'s build is the artifact above; `inferlet` compiles here.
       - working-directory: javascript
         run: |
-          npm run build --if-present -w ${{ inputs.package }}
-          npm test -w ${{ inputs.package }}
+          [[ "${{ inputs.package }}" != inferlet ]] || npm run build -w inferlet
+          npm test --if-present -w ${{ inputs.package }}
       - name: platform packages match the wrapper's version
         if: inputs.package == 'server'
         working-directory: javascript/server

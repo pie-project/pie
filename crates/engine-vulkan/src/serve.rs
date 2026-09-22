@@ -302,6 +302,8 @@ pub struct Shell {
 
     states_mrope: bool,
 
+    gathers_readout: bool,
+
     copies: bool,
 
     last: FireCost,
@@ -478,6 +480,11 @@ impl Shell {
         });
 
         let states_mrope = declared_width(&boot.trace, RuntimeInput::MropePositions) > 0;
+        let gathers_readout = boot
+            .trace
+            .values
+            .iter()
+            .any(|decl| matches!(&decl.def, model_ir::Def::Input(RuntimeInput::ReadoutRows)));
         if declared_width(&boot.trace, RuntimeInput::SelfCondRows) > 0 {
             return Err(Fault::Program {
                 at: "serve::load",
@@ -593,7 +600,7 @@ impl Shell {
                     images: u64::from(budgets.max_images()),
                     voxels: u64::from(budgets.max_voxels()),
                     clips: u64::from(budgets.max_clips()),
-                    readouts: u64::from(boot.budget.max_tokens),
+                    readouts: model_compiler::arena::readouts_ceiling(&boot.budget),
                 },
             )?;
             let logits = carved.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
@@ -725,6 +732,7 @@ impl Shell {
             patch_fold,
             drops_patch_rows,
             states_mrope,
+            gathers_readout,
             facts,
             spaces,
 
@@ -1783,11 +1791,13 @@ impl Shell {
             }
         }
 
+        let (readout_rows, readout_layout) = readout_table(&composition, lanes)?;
         let bound = self.inputs[arm].write(
             &self.handles,
             &crate::inputs::Fire {
                 tokens: &tokens,
                 positions: &positions,
+                readout_rows: &readout_rows,
                 windows: &boundaries,
                 slot_ids: &slot_ids,
                 slot_of_row: &slot_of_row,
@@ -1810,6 +1820,15 @@ impl Shell {
         )?;
         windows.bind(&self.handles, bound.windows)?;
 
+        let readouts = u64::from(lane_count).max(readout_rows.len() as u64);
+        let readouts_ceiling = model_compiler::arena::readouts_ceiling(&self.budgets.tokens);
+        if readouts > readouts_ceiling {
+            return Err(Fault::Ceiling {
+                what: "rows one fire reads logits for (READOUTS_PER_LANE per lane)",
+                need: readouts,
+                have: readouts_ceiling,
+            });
+        }
         let slots = self.arena.slots(
             &self.handles,
             &self.compiled.arena,
@@ -1820,7 +1839,7 @@ impl Shell {
                 images: u64::from(composition.images()),
                 voxels: u64::from(composition.voxel_rows()),
                 clips: u64::from(composition.clips()),
-                readouts: u64::from(lane_count),
+                readouts,
             },
         )?;
         let caches = self.pools.table(
@@ -1848,6 +1867,7 @@ impl Shell {
         let bindings = FireBindings {
             tokens: bound.tokens,
             positions: bound.positions,
+            readout_rows: bound.readout_rows,
 
             adapter_routes: bound.adapter_routes,
 
@@ -1908,7 +1928,8 @@ impl Shell {
             lanes,
             done,
             arm,
-            composition,
+            readout_rows,
+            readout_layout,
             descriptor,
             seats,
             tables,
@@ -2020,7 +2041,8 @@ pub struct Prepared<'a> {
     done: Option<Done>,
 
     arm: usize,
-    composition: Composition,
+    readout_rows: Vec<i32>,
+    readout_layout: Vec<(u32, u32)>,
     descriptor: FireDescriptor,
     seats: Vec<Seat>,
 
@@ -2065,6 +2087,45 @@ pub struct Landed {
 }
 
 pub const READOUT_ROWS_PER_LANE: u32 = 8;
+
+type ReadoutTable = (Vec<i32>, Vec<(u32, u32)>);
+
+fn readout_table(composition: &Composition, lanes: &[Seated<'_>]) -> Result<ReadoutTable> {
+    let mut table: Vec<i32> = Vec::with_capacity(lanes.len());
+    let mut layout: Vec<(u32, u32)> = vec![(0, 0); lanes.len()];
+    for row in composition.lanes() {
+        if row.rows == 0 {
+            continue;
+        }
+        let source = row.source as usize;
+        let named = lanes.get(source).and_then(|seated| seated.readout);
+        let picks: Vec<u32> = match named {
+            Some(list) if !list.is_empty() => {
+                for &at in list {
+                    if at >= row.rows {
+                        return Err(Fault::Ceiling {
+                            what: "rows in the lane a readout names",
+                            need: u64::from(at) + 1,
+                            have: u64::from(row.rows),
+                        });
+                    }
+                }
+                list.iter().map(|&at| row.row_offset + at).collect()
+            }
+            _ => vec![row.row_offset + row.rows - 1],
+        };
+        layout[source] = (
+            u32::try_from(table.len()).unwrap_or(u32::MAX),
+            u32::try_from(picks.len()).unwrap_or(u32::MAX),
+        );
+        table.extend(
+            picks
+                .iter()
+                .map(|&at| i32::try_from(at).unwrap_or(i32::MAX)),
+        );
+    }
+    Ok((table, layout))
+}
 
 fn readout_rows(max_lanes: u32) -> u32 {
     max_lanes
@@ -2215,59 +2276,36 @@ impl engine::frame::Shell for Shell {
         };
 
         let seat_rows = self.readout[prepared.arm].bytes() / (width * 2).max(1);
-        let mut layout: Vec<(u32, u32)> = vec![(0, 0); prepared.lanes.len()];
-        let mut cursor: u64 = 0;
-        for row in prepared.composition.lanes() {
-            let source = row.source as usize;
-            if row.rows == 0 {
-                continue;
-            }
-            let named = prepared.lanes.get(source).and_then(|seated| seated.readout);
-            let picks: Vec<u32> = match named {
-                Some(list) if !list.is_empty() => {
-                    for &at in list {
-                        if at >= row.rows {
-                            return Err(Fault::Ceiling {
-                                what: "rows in the lane a readout names",
-                                need: u64::from(at) + 1,
-                                have: u64::from(row.rows),
-                            });
-                        }
-                    }
-                    list.iter().map(|&at| row.row_offset + at).collect()
-                }
-                _ => vec![row.row_offset + row.rows - 1],
+        if prepared.readout_rows.len() as u64 > seat_rows {
+            return Err(Fault::Ceiling {
+                what: "readout rows in one step",
+                need: prepared.readout_rows.len() as u64,
+                have: seat_rows,
+            });
+        }
+        let layout = prepared.readout_layout.clone();
+        for (cursor, &token_row) in prepared.readout_rows.iter().enumerate() {
+            let cursor = cursor as u64;
+            let at = if self.gathers_readout {
+                cursor
+            } else {
+                u64::try_from(token_row).unwrap_or(0)
             };
-            let need = cursor + picks.len() as u64;
-            if need > seat_rows {
-                return Err(Fault::Ceiling {
-                    what: "readout rows in one step",
-                    need,
-                    have: seat_rows,
-                });
-            }
-            layout[source] = (
-                u32::try_from(cursor).unwrap_or(u32::MAX),
-                u32::try_from(picks.len()).unwrap_or(u32::MAX),
-            );
-            for at in picks {
+            frame.copy(
+                self.arena.store(),
+                base + at * width * 2,
+                &self.readout[prepared.arm],
+                cursor * width * 2,
+                width * 2,
+            )?;
+            if let Some((draft_base, seat)) = draft.as_ref() {
                 frame.copy(
                     self.arena.store(),
-                    base + u64::from(at) * width * 2,
-                    &self.readout[prepared.arm],
-                    cursor * width * 2,
-                    width * 2,
+                    draft_base + at * u64::from(self.mtp_width) * 2,
+                    seat,
+                    cursor * u64::from(self.mtp_width) * 2,
+                    u64::from(self.mtp_width) * 2,
                 )?;
-                if let Some((draft_base, seat)) = draft.as_ref() {
-                    frame.copy(
-                        self.arena.store(),
-                        draft_base + u64::from(at) * u64::from(self.mtp_width) * 2,
-                        seat,
-                        cursor * u64::from(self.mtp_width) * 2,
-                        u64::from(self.mtp_width) * 2,
-                    )?;
-                }
-                cursor += 1;
             }
         }
 

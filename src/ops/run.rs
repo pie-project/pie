@@ -160,7 +160,9 @@ pub fn curated_in(roots: &[PathBuf], name: &str) -> Option<Curated> {
             .iter()
             .map(|file| root.join(name).join(file))
             .find(|path| path.is_file());
-        let built = root.join("target").join("wasm32-wasip2");
+        let built = std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(|| root.join("target"), PathBuf::from)
+            .join("wasm32-wasip2");
         let wasm = ["release", "debug"]
             .iter()
             .map(|profile| built.join(profile).join(&artifact))

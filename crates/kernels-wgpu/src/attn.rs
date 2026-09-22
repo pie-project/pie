@@ -220,11 +220,18 @@ pub struct Split {
     pub keys: u32,
 }
 
+/// Storage buffers the split kernel binds; a device offering fewer (SwiftShader: 10)
+/// runs the plain decode.
+const SPLIT_STORAGE_BUFFERS: u32 = 11;
+
 #[must_use]
 pub fn splits_for(q_heads: u32, rows: u32, keys: u32, info: DeviceInfo) -> u32 {
     let tuning = crate::tuning::current();
     let occupied = q_heads.saturating_mul(rows).max(1);
-    if tuning.sdpa_split_max <= 1 || occupied >= info.cores.max(1) {
+    if tuning.sdpa_split_max <= 1
+        || occupied >= info.cores.max(1)
+        || (info.max_storage_buffers != 0 && info.max_storage_buffers < SPLIT_STORAGE_BUFFERS)
+    {
         return 1;
     }
 

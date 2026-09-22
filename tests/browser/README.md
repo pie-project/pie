@@ -58,11 +58,11 @@ the table from `scripts/bench/browser/results/`.
 
 ## Gates without a GPU
 
-`./scripts/browser-check.sh`: clippy with `-D warnings` for every crate the tab
-links, on `wasm32-unknown-unknown` and natively, the native tests of the
-touched crates, rustfmt, and `node --check` over the scripts. CI runs it as
-`browser-check`. Two more CI jobs run the engine on a random-weight
-miniature of Qwen3.5 (`scripts/tiny_qwen35.py`): `wgpu-lavapipe`
-(`tools/ci-lavapipe.sh`, the native wgpu server over Mesa's lavapipe with the
-library corner cases and `sort-probe`) and `tint-swiftshader` (every kernel
-variant through Tint on SwiftShader).
+CI's `browser:` job runs `./scripts/browser-check.sh` (clippy with `-D warnings`
+for every crate the tab links on `wasm32-unknown-unknown`, the wgpu feature
+natively, `node --check` over the scripts), every kernel variant through Tint
+on SwiftShader, and `index.html`/`transport.html` in headless Chromium on
+SwiftShader with a random-weight miniature of Qwen3.5 (`scripts/tiny_qwen35.py`).
+The native engines run the same miniature on Mesa's lavapipe in the
+`wgpu:`/`vulkan:` jobs (`scripts/ci/lavapipe.sh`: the library corner cases,
+`sort-probe`, one compat API call, a Python and a JavaScript inferlet).

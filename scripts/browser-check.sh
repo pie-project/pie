@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# The tab's crates on wasm32-unknown-unknown, the wgpu feature natively (the
+# workspace jobs lint default features), and the pages' scripts.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -6,25 +8,17 @@ WASM_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web
   checkpoint checkpoint-dsl ztensor ztensor-compat tokenizer grammar chat-template
   models model-ir model-dsl model-compiler engine model-exec eta-ir eta-dsl eta-compiler
   eta-exec waker ids dtype client-api)
-NATIVE_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web
-  checkpoint ztensor ztensor-compat tokenizer grammar eta-compiler waker models)
-FMT_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web
-  checkpoint ztensor ztensor-compat tokenizer grammar eta-compiler waker models)
+NATIVE_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web)
 
 pkgs() { for c in "$@"; do printf -- '-p %s ' "$c"; done; }
 
-echo "== wasm32: check + clippy"
+echo "== wasm32: clippy"
 CARGO_TARGET_DIR=target-wasm cargo clippy --target wasm32-unknown-unknown \
   $(pkgs "${WASM_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu -- -D warnings
 
-echo "== native: check + clippy"
+echo "== native, wgpu feature: clippy + tests"
 cargo clippy $(pkgs "${NATIVE_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu -- -D warnings
-
-echo "== native: tests"
 cargo test -q $(pkgs "${NATIVE_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu
-
-echo "== rustfmt (touched crates only; the cuda crates are not rustfmt-clean upstream)"
-cargo fmt $(pkgs "${FMT_CRATES[@]}") -- --check
 
 echo "== javascript"
 for f in javascript/browser/src/*.mjs tests/browser/*.mjs tests/browser/tools/*.mjs scripts/bench/browser/*.mjs; do
@@ -41,5 +35,4 @@ for f in tests/browser/*.html crates/kernels-wgpu/tools/*.html; do
     process.exit(r.status);
   ' "$f"
 done
-(cd javascript/client && node --test >/dev/null && echo "client tests ok")
 echo "== ok"

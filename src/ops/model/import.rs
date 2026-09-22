@@ -1282,7 +1282,7 @@ fn resolve_snapshot(repo_id: &str) -> Result<(PathBuf, bool)> {
     let repo_dir = crate::local::hf::resolve_cache_dir()
         .join(format!("models--{}", repo_id.replace('/', "--")));
     let snapshots = repo_dir.join("snapshots");
-    let fetched = !snapshots.exists();
+    let mut fetched = !snapshots.exists();
     if fetched {
         crate::ops::model::fetch_snapshot(repo_id)?;
     }
@@ -1292,10 +1292,20 @@ fn resolve_snapshot(repo_id: &str) -> Result<(PathBuf, bool)> {
         .filter_map(|entry| entry.ok())
         .find(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|entry| entry.path());
-    match snapshot {
-        Some(path) => Ok((path, fetched)),
-        None => bail!("{repo_id} has no snapshot under {}", snapshots.display()),
+    let Some(path) = snapshot else {
+        bail!("{repo_id} has no snapshot under {}", snapshots.display())
+    };
+    // A snapshot an earlier download left without its weights fetches the rest.
+    if !fetched && !has_weights(&path) {
+        crate::ops::model::fetch_snapshot(repo_id)?;
+        fetched = true;
     }
+    Ok((path, fetched))
+}
+
+fn has_weights(snapshot: &Path) -> bool {
+    checkpoint::file::read::discover_safetensors_files(snapshot).is_ok()
+        || checkpoint::file::read::discover_zt_file(snapshot).is_some()
 }
 
 fn store_name(repo_id: &str) -> String {

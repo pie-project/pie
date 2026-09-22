@@ -1,8 +1,7 @@
 name: CI
 
-# The toolchain is `rust-toolchain.toml` (rustup installs it on the first
-# cargo call); the `dtolnay/rust-toolchain` steps only decide what the
-# action downloads.
+# Jobs are named `<target>: <what runs>`. The toolchain is `rust-toolchain.toml`
+# (rustup installs it on the first cargo call).
 
 on:
   push:
@@ -18,7 +17,8 @@ env:
   NPM_CONFIG_AUDIT: 'false'
 
 jobs:
-  lint:
+  workspace-lint:
+    name: "workspace: fmt + clippy"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -26,8 +26,8 @@ jobs:
         with:
           cache-key: ${{ runner.os }}-lint
       # engine-cuda and kernels-cuda are not rustfmt-clean; engine-cuda has
-      # no default engine feature and is tested by `verify`; the two server
-      # crates default to CUDA and lint without an engine below.
+      # no default engine feature and is tested by `workspace-test`; the two
+      # server crates default to CUDA and lint without an engine below.
       - name: cargo fmt
         run: cargo fmt --check $(bash scripts/ci/members.sh engine-cuda kernels-cuda)
       - name: cargo clippy
@@ -39,8 +39,8 @@ jobs:
       - name: cargo clippy (engine-metal, Apple half)
         run: cargo clippy --no-deps --all-targets -p engine-metal --target aarch64-apple-darwin -- -D warnings
 
-  verify:
-    name: build + test (workspace)
+  workspace-test:
+    name: "workspace: build + test"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -72,24 +72,25 @@ jobs:
           python3 scripts/cfg-feature-audit.py
           python3 scripts/metal-kernel-audit.py --one-way
 
-  no-engine:
-    name: no engine (${{ matrix.os }})
+  pie-no-engine:
+    name: "pie: no engine (${{ matrix.os }})"
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
         with:
           cache-key: ${{ runner.os }}-no-engine
-      - run: |
+      - shell: bash
+        run: |
           cargo build -p pie --no-default-features
           cargo test -p worker --no-default-features
 
-  servers:
-    name: pie-server (node addon + python wheel, no engine)
+  pie-server:
+    name: "pie-server: node addon + python wheel"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -121,7 +122,7 @@ jobs:
   # `examples` is its own workspace, so `cargo build --workspace` never
   # touches the inferlet library's only consumers.
   examples:
-    name: examples (wasm32-wasip2)
+    name: "examples: wasm32-wasip2"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -141,7 +142,7 @@ jobs:
           RUSTFLAGS: -D warnings
 
   packages:
-    name: python + javascript packages (inferlet, client)
+    name: "packages: python + javascript"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -169,12 +170,34 @@ jobs:
           npx -w inferlet tsc --noEmit
           npm test --workspaces --if-present
 
+  languages:
+    name: "languages: python + javascript components"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - run: uv tool install componentize-py
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: bash scripts/build-languages.sh target/languages
+      - uses: actions/upload-artifact@v6
+        with:
+          name: languages
+          path: target/languages/pie-language-*.tar.gz
+          if-no-files-found: error
+
   browser:
-    name: browser (wasm32 + native gate)
+    name: "browser: wasm32 lint → Tint → serve in Chromium"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
+        with:
+          triple: wasm32-unknown-unknown
       - uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -183,23 +206,86 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin/wasm-bindgen
             target
             target-wasm
           key: ${{ runner.os }}-browser-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-browser-
+      - uses: actions/cache@v5
+        with:
+          path: ~/qwen35-tokenizer
+          key: qwen35-tokenizer-v1
+      - run: bash scripts/ci/tokenizer.sh ~/qwen35-tokenizer
       - run: npm ci --include=dev --ignore-scripts
         working-directory: javascript
-      - run: ./scripts/browser-check.sh
+      - run: |
+          npm install --prefix tests/browser/tools playwright@1.63.0
+          npx --prefix tests/browser/tools playwright install --with-deps chromium
+      - name: wasm32 lint
+        run: ./scripts/browser-check.sh
+      - name: kernels through Tint
+        run: |
+          cargo run -q -p kernels-wgpu --example dump_wgsl -- crates/kernels-wgpu/tools/wgsl
+          node tests/browser/tools/headless.mjs . crates/kernels-wgpu/tools/wgsl-check.html --timeout 900000
+        env:
+          PIE_CHROME_ARGS: --use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader
+      # The tab boots a random-weight miniature on SwiftShader; the artifact
+      # is what a wgpu `pie` imports.
+      - name: serve in Chromium
+        run: |
+          [[ -x ~/.cargo/bin/wasm-bindgen ]] || cargo install wasm-bindgen-cli --locked --version "$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')"
+          cargo build --release -p pie --features wgpu
+          python3 scripts/tiny_qwen35.py "$RUNNER_TEMP/snapshot" --tokenizer ~/qwen35-tokenizer
+          PIE_HOME="$RUNNER_TEMP/home" target/release/pie model import "$RUNNER_TEMP/snapshot" --sku qwen35-tiny-u4g64-kv-bf16 --keep-source
+          mkdir -p tests/browser/models && cp "$(find "$RUNNER_TEMP/home/models" -name '*.wgpu.zt' | head -1)" tests/browser/models/tiny.wgpu.zt
+          ./javascript/browser/build.sh release
+          ./tests/browser/tools/inferlets.sh
+          node tests/browser/tools/headless.mjs . "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" --timeout 300000
+          node tests/browser/tools/headless.mjs . "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=max_total_pages%20%3D%20512,max_forward_tokens%20%3D%201024,max_forward_requests%20%3D%208,max_state_slots%20%3D%2016" --timeout 900000
+        env:
+          PIE_CHROME_ARGS: --use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader
 
-  wgpu-lavapipe:
-    name: wgpu engine on lavapipe (no GPU)
+  wgpu-serve:
+    name: "wgpu: serve on lavapipe"
+    needs: languages
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
         with:
           triple: wasm32-wasip2
-          cache-key: ${{ runner.os }}-lavapipe
+          cache-key: ${{ runner.os }}-lavapipe-wgpu
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@v6
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - uses: actions/cache@v5
+        with:
+          path: ~/qwen35-tokenizer
+          key: qwen35-tokenizer-v1
+      - run: bash scripts/ci/tokenizer.sh ~/qwen35-tokenizer
+      - uses: actions/download-artifact@v7
+        with:
+          name: languages
+          path: ${{ runner.temp }}/languages
+      - run: npm ci --include=dev --ignore-scripts
+        working-directory: javascript
+      - run: PIE_TOKENIZER_DIR=$HOME/qwen35-tokenizer bash scripts/ci/lavapipe.sh
+        env:
+          PIE_ENGINE: wgpu
+          PIE_LANGUAGES_DIR: ${{ runner.temp }}/languages
+
+  vulkan-serve:
+    name: "vulkan: serve on lavapipe"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/toolchain
+        with:
+          triple: wasm32-wasip2
+          features: vulkan
+          cache-key: ${{ runner.os }}-lavapipe-vulkan
       - uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -208,44 +294,53 @@ jobs:
         with:
           path: ~/qwen35-tokenizer
           key: qwen35-tokenizer-v1
-      - run: |
-          mkdir -p ~/qwen35-tokenizer
-          for f in tokenizer.json tokenizer_config.json chat_template.jinja; do
-            [ -s ~/qwen35-tokenizer/$f ] || curl -sSL -o ~/qwen35-tokenizer/$f https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/$f
-          done
+      - run: bash scripts/ci/tokenizer.sh ~/qwen35-tokenizer
       - run: npm ci --include=dev --ignore-scripts
         working-directory: javascript
-      - run: PIE_TOKENIZER_DIR=$HOME/qwen35-tokenizer ./tests/browser/tools/ci-lavapipe.sh
+      - run: PIE_TOKENIZER_DIR=$HOME/qwen35-tokenizer bash scripts/ci/lavapipe.sh
+        env:
+          PIE_ENGINE: vulkan
 
-  tint-swiftshader:
-    name: kernels through Tint (SwiftShader)
+  # The GPU runner is a RunPod pod that sleeps between runs: `cuda-up` resumes
+  # it, the pod registers an ephemeral `self-hosted,cuda` runner, `cuda-down`
+  # stops it. Runs on main and on PRs labelled `ci-cuda`, once the repo has
+  # RUNPOD_POD_ID (variable) and RUNPOD_API_KEY (secret).
+  cuda-up:
+    name: "cuda: wake the pod"
+    if: vars.RUNPOD_POD_ID != '' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-cuda'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          cache-key: ${{ runner.os }}-tint
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-      - run: |
-          npm install --prefix tests/browser/tools playwright@1.63.0
-          npx --prefix tests/browser/tools playwright install --with-deps chromium
-      - run: cargo run -q -p kernels-wgpu --example dump_wgsl -- crates/kernels-wgpu/tools/wgsl
-      - run: PIE_CHROME_ARGS="--use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader" node tests/browser/tools/headless.mjs . crates/kernels-wgpu/tools/wgsl-check.html --timeout 900000
+      - run: bash scripts/ci/runpod.sh start
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_POD_ID: ${{ vars.RUNPOD_POD_ID }}
 
-  # The one runner with a GPU; opt in with the `ci-cuda` label.
   cuda:
-    name: engine-cuda on hardware
+    name: "cuda: serve on hardware"
+    needs: cuda-up
     runs-on: [self-hosted, cuda]
-    if: contains(github.event.pull_request.labels.*.name, 'ci-cuda')
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - run: nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && df -h /workspace
       - run: cargo test -p engine-cuda --features cuda --no-run --all-targets
       - run: cargo test -p engine-cuda --features cuda -- --ignored
-      - run: cargo build -p pie --features cuda
+      - run: bash scripts/ci/cuda-e2e.sh
       - name: no CUDA shared library is linked
         run: |
-          ldd target/debug/pie
-          ! ldd target/debug/pie | grep -E "libcudart|libcublas|libcublasLt"
+          ldd "${CARGO_TARGET_DIR:-target}/debug/pie"
+          ! ldd "${CARGO_TARGET_DIR:-target}/debug/pie" | grep -E "libcudart|libcublas|libcublasLt"
+
+  cuda-down:
+    name: "cuda: stop the pod"
+    needs: [cuda-up, cuda]
+    if: always() && needs.cuda-up.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash scripts/ci/runpod.sh stop
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_POD_ID: ${{ vars.RUNPOD_POD_ID }}

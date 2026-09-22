@@ -1146,12 +1146,19 @@ device = ["cpu"]
     }
 
     fn the_seat_count_is_stated_once_or_derived_from_the_roster() {
+        let plane = if cfg!(windows) {
+            "C:/adapters/0/a.bin"
+        } else {
+            "/adapters/0/a.bin"
+        };
         let toml = MINIMAL_METAL.replace(
             "model = \"Qwen/Qwen3-0.6B\"",
-            "model = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
-             [[model.adapters.registered]]\n\
-             id = 2\n\
-             planes = { \"layer.0.lora_a\" = \"/adapters/0/a.bin\" }\n",
+            &format!(
+                "model = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
+                 [[model.adapters.registered]]\n\
+                 id = 2\n\
+                 planes = {{ \"layer.0.lora_a\" = \"{plane}\" }}\n"
+            ),
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
         cfg.validate().unwrap();
@@ -1159,7 +1166,7 @@ device = ["cpu"]
         assert_eq!(cfg.model.adapters.registered.len(), 1);
         assert_eq!(
             cfg.model.adapters.registered[0].planes["layer.0.lora_a"],
-            "/adapters/0/a.bin"
+            plane
         );
 
         let stated = toml.replace("[model.adapters]", "[model.adapters]\nseats = 8");

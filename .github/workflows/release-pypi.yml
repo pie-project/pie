@@ -22,6 +22,7 @@ permissions:
 
 jobs:
   pure:
+    name: "${{ inputs.package }}: build"
     if: inputs.package != 'pie-server'
     runs-on: ubuntu-latest
     env:
@@ -69,17 +70,18 @@ jobs:
 
   wheel:
     if: inputs.package == 'pie-server'
-    name: wheel (${{ matrix.target.label }})
+    name: "pie-server: wheel (${{ matrix.target.label }})"
     strategy:
       fail-fast: false
       matrix:
         target:
-          - { label: linux-x86_64,  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu,  features: 'cuda,vulkan,wgpu', container: 'nvidia/cuda:13.0.0-devel-rockylinux8' }
-          - { label: linux-aarch64, runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu, features: 'cuda,vulkan,wgpu', container: 'nvidia/cuda:13.0.0-devel-rockylinux8' }
+          # Linux on ubuntu-22.04 (glibc 2.35, so manylinux_2_35): the Slang
+          # release that compiles the Vulkan kernels needs 2.34.
+          - { label: linux-x86_64,  runner: ubuntu-22.04,       triple: x86_64-unknown-linux-gnu,  features: 'cuda,vulkan,wgpu', manylinux: manylinux_2_35 }
+          - { label: linux-aarch64, runner: ubuntu-22.04-arm,   triple: aarch64-unknown-linux-gnu, features: 'cuda,vulkan,wgpu', manylinux: manylinux_2_35 }
           - { label: macos-arm64,   runner: macos-15,           triple: aarch64-apple-darwin,      features: 'metal,wgpu' }
           - { label: windows-x64,   runner: windows-large-x64,  triple: x86_64-pc-windows-msvc,    features: 'cuda,vulkan' }
     runs-on: ${{ matrix.target.runner }}
-    container: ${{ matrix.target.container }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
@@ -87,10 +89,8 @@ jobs:
         with:
           triple: ${{ matrix.target.triple }}
           features: ${{ matrix.target.features }}
-          manylinux: ${{ matrix.target.container && 'true' || 'false' }}
           cache-key: release-pie-server-${{ matrix.target.label }}
-      - if: '!matrix.target.container'
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - shell: bash
@@ -99,7 +99,7 @@ jobs:
           cd python/server
           python3 -m maturin build --profile release-min --target ${{ matrix.target.triple }} \
             --no-default-features --features ${{ matrix.target.features }} --out dist \
-            ${{ matrix.target.container && '--compatibility manylinux_2_28' || '' }}
+            ${{ matrix.target.manylinux && format('--compatibility {0}', matrix.target.manylinux) || '' }}
       - uses: actions/upload-artifact@v6
         with:
           name: dist-${{ matrix.target.label }}
@@ -107,6 +107,7 @@ jobs:
           if-no-files-found: error
 
   sdist:
+    name: "pie-server: sdist"
     if: inputs.package == 'pie-server'
     runs-on: ubuntu-latest
     steps:
@@ -123,6 +124,7 @@ jobs:
           if-no-files-found: error
 
   publish:
+    name: "pypi: check + publish"
     needs: [pure, wheel, sdist]
     if: >-
       always() && !cancelled()

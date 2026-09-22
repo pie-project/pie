@@ -25,6 +25,7 @@ permissions:
 
 jobs:
   plan:
+    name: "release: plan"
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.plan.outputs.targets }}
@@ -65,7 +66,7 @@ jobs:
   binaries:
     needs: plan
     if: needs.plan.outputs.targets != '[]'
-    name: ${{ matrix.target.label }}
+    name: "pie: ${{ matrix.target.label }}"
     strategy:
       fail-fast: false
       matrix:
@@ -102,6 +103,7 @@ jobs:
   # extracts them into PIE_HOME; the built-in inferlets need none, being
   # in the binary.
   languages:
+    name: "languages: assets"
     needs: plan
     if: inputs.languages
     runs-on: ubuntu-latest
@@ -120,8 +122,37 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  notes:
+  # The installers against what was just uploaded.
+  install:
+    name: "install: ${{ matrix.os }}"
     needs: [binaries, languages]
+    if: always() && !cancelled() && needs.binaries.result == 'success' && needs.languages.result != 'failure'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          PIE_VERSION="${{ inputs.tag }}" PIE_FLAVOR="${{ runner.os == 'macOS' && 'metal' || 'wgpu' }}" bash scripts/install.sh
+          export PATH="$HOME/.local/bin:$PATH"
+          pie --version && pie doctor || true
+          pie language list
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PIE_VERSION = "${{ inputs.tag }}"; $env:PIE_FLAVOR = "vulkan"
+          ./scripts/install.ps1
+          $env:PATH = "$env:LOCALAPPDATA\Pie\bin;$env:PATH"
+          pie --version
+          pie language list
+
+  notes:
+    name: "release: notes"
+    needs: [binaries, languages, install]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:

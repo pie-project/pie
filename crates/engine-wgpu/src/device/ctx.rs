@@ -631,6 +631,7 @@ impl Context {
             max_workgroup_invocations: self.core.limits.max_compute_invocations_per_workgroup,
             max_shared_bytes: self.core.limits.max_compute_workgroup_storage_size,
             max_storage_buffer_binding: self.core.limits.max_storage_buffer_binding_size,
+            max_storage_buffers: self.core.limits.max_storage_buffers_per_shader_stage,
         }
     }
 
