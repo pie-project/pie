@@ -3,7 +3,7 @@ use model_dsl::{
     Request, Value, ops, seam,
 };
 
-use super::model::{Attn, Gdn, Mixer, Mlp, Model, Ple, Residual, Tower};
+use super::model::{Attn, Gdn, Indexer, Mixer, Mlp, Model, Ple, Residual, Tower};
 
 const MROPE_SECTIONS: [u32; 3] = [11, 11, 10];
 
@@ -71,8 +71,18 @@ impl ForwardHybrid for Model {
         let plane = u64::from(self.kv_heads) * u64::from(self.head_dim);
         for w in &self.layers {
             match &w.mixer {
-                Mixer::Attn(a) => {
-                    c.kv(kv, a.kv.clone(), [plane, plane]);
+                Mixer::Attn { attn, indexer } => {
+                    c.kv(kv, attn.kv.clone(), [plane, plane]);
+                    if let Some(ix) = indexer {
+                        // One row holds both the raw indexer keys and, at every block's
+                        // closing cell, the mean that stands for the block: `pool_kv_append`
+                        // writes `boundary_pos` = cell (b+1)*ratio-1 and `index_topk` reads
+                        // block j at (j+1)*ratio-1. Block b+1 means over [(b+1)r, (b+2)r-1],
+                        // which never includes (b+1)r-1, and within a fire the appends run
+                        // before the mean, which runs before the write-back.
+                        let index = c.kv_space(self.kv);
+                        c.kv(index, ix.keys.clone(), [u64::from(ix.head_dim)]);
+                    }
                 }
                 Mixer::Gdn(g) => {
                     let conv_ch = u64::from(Gdn::qkv_width(g.k_heads, g.v_heads, g.k_dim, g.v_dim));
@@ -139,9 +149,18 @@ impl ForwardHybrid for Model {
 
             let (x, normed) = mix_in(&y, &w.attn_res, m);
             let o = match &w.mixer {
-                Mixer::Attn(a) => {
-                    attn_mixer(&x, &inputs, m, &plan_m, &plan_d, &plan_p, &plan_s, &mask, a)
-                }
+                Mixer::Attn { attn, indexer } => attn_mixer(
+                    &x,
+                    &inputs,
+                    m,
+                    &plan_m,
+                    &plan_d,
+                    &plan_p,
+                    &plan_s,
+                    &mask,
+                    attn,
+                    indexer.as_ref(),
+                ),
                 Mixer::Gdn(g) => gdn_mixer(&x, &inputs, g),
             };
             y = inject(&o, &normed, &w.attn_res, m, &y);
@@ -164,7 +183,7 @@ impl ForwardHybrid for Model {
             let (dlogits, _) = logits.split(&Facts::drafts());
 
             let w = &mtp.block;
-            let Mixer::Attn(a) = &w.mixer else {
+            let Mixer::Attn { attn: a, .. } = &w.mixer else {
                 unreachable!("the draft head's block is full attention");
             };
             let mut token = ops::layout::argmax(&[&dlogits]);
@@ -402,6 +421,38 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
     ops::elemwise::add_bias(&mg.fc2_bias, &ops::linear::matmul(&a, &mg.fc2))
 }
 
+fn boundaries(positions: &Value, row_valid: &Value, ratio: u32) -> (Value, Value, Value) {
+    let (one, many) = positions.split(&Facts::qo_one());
+    let (dpos, dreq, drope) = ops::attn::pool_boundary_decode(&one, row_valid, ratio);
+    let (ppos, preq, prope) = ops::attn::pool_boundary_prefill(&many, row_valid, ratio);
+    (
+        Value::merge(vec![dpos, ppos]),
+        Value::merge(vec![dreq, preq]),
+        Value::merge(vec![drope, prope]),
+    )
+}
+
+fn qsa_select(x: &Value, inputs: &Input<Facts>, m: &Model, a: &Attn, ix: &Indexer) -> Value {
+    let keys = inputs.kv(&ix.keys);
+    let write_page = inputs.write_page(&ix.keys);
+    let write_offset = inputs.write_offset(&ix.keys);
+    let positions = inputs.positions();
+
+    let qk = ops::linear::matmul(x, &ix.qk_proj);
+    let (q, k) = ops::layout::split_rows(&qk, ix.heads * ix.head_dim);
+
+    ops::attn::index_kv_append(&k, keys, &write_page, &write_offset);
+    let (bpos, breq, brope) = boundaries(&positions, &inputs.row_valid(), ix.ratio);
+    let blk = ops::attn::index_block_mean(&bpos, &breq, keys, ix.head_dim, ix.ratio, m.kv);
+    let blk = ops::elemwise::rmsnorm_plus_one(&blk, &ix.k_norm, ix.norm_eps);
+    let blk = ops::elemwise::rope_partial_q(&blk, &brope, a.rotary_dim, ix.head_dim, a.theta);
+    ops::attn::pool_kv_append(&blk, &bpos, &breq, keys, &write_page, &write_offset);
+
+    let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &ix.q_norm, ix.head_dim, ix.norm_eps);
+    let q = ops::elemwise::rope_partial_q(&q, &positions, a.rotary_dim, ix.head_dim, a.theta);
+    ops::attn::index_topk(&q, None, keys, ix.heads, ix.head_dim, ix.top_k, ix.ratio)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attn_mixer(
     x: &Value,
@@ -413,6 +464,7 @@ fn attn_mixer(
     plan_s: &Value,
     mask: &Value,
     a: &Attn,
+    ix: Option<&Indexer>,
 ) -> Value {
     let pages = inputs.kv(&a.kv);
     let write_page = inputs.write_page(&a.kv);
@@ -428,21 +480,41 @@ fn attn_mixer(
     ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     seam::at(seam::ATTN_Q, &[&q]);
 
-    let [mq, sq, dq, p] = q.split([
-        Facts::masked(),
-        Facts::captures_scores(),
-        Facts::qo_one(),
-        Predicate::rest(),
-    ]);
+    let classes = || {
+        [
+            Facts::masked(),
+            Facts::captures_scores(),
+            Facts::qo_one(),
+            Predicate::rest(),
+        ]
+    };
+    let [mq, sq, dq, p] = q.split(classes());
     let (so, lse) = ops::attn::prefill_lse(&sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
     seam::at(seam::SCORES, &[&lse]);
+    let (od, op) = match ix.map(|ix| (ix, qsa_select(x, inputs, m, a, ix))) {
+        Some((ix, selection)) => {
+            let [_, _, d_sel, p_sel] = selection.split(classes());
+            (
+                ops::attn::decode_selected(
+                    &dq, plan_d, &d_sel, pages, None, d, a.sm_scale, ix.ratio,
+                ),
+                ops::attn::prefill_selected(
+                    &p, plan_p, &p_sel, pages, None, d, m.kv_heads, a.sm_scale, ix.ratio,
+                ),
+            )
+        }
+        None => (
+            ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
+            ops::attn::prefill(&p, plan_p, pages, None, d, m.kv_heads, a.sm_scale),
+        ),
+    };
     let o = Value::merge(vec![
         ops::attn::masked(
             &mq, plan_m, mask, pages, None, d, m.kv_heads, true, a.sm_scale,
         ),
         so,
-        ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
-        ops::attn::prefill(&p, plan_p, pages, None, d, m.kv_heads, a.sm_scale),
+        od,
+        op,
     ]);
     seam::at(seam::ATTN_OUT, &[&o]);
     ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
