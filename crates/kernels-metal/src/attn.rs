@@ -927,6 +927,172 @@ pub fn kv_append_shared(
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::probe::Probe;
+
+    const HEAD_DIM: u32 = 64;
+    const Q_HEADS: u32 = 4;
+    const KV_HEADS: u32 = 2;
+
+    fn bf16(buf: u32, rows: u32, width: u32) -> Tensor {
+        Tensor::new(buf, rows, width, Dtype::Bf16)
+    }
+
+    fn i32t(buf: u32, rows: u32) -> Tensor {
+        Tensor::new(buf, rows, 1, Dtype::I32)
+    }
+
+    fn u32t(buf: u32, rows: u32) -> Tensor {
+        Tensor::new(buf, rows, 1, Dtype::U32)
+    }
+
+    fn gqa_pool() -> KvPool {
+        let plane = KV_HEADS * HEAD_DIM;
+        KvPool {
+            keys: bf16(60, 4096, plane),
+            values: bf16(61, 4096, plane),
+            page_indices: u32t(62, 64),
+            page_indptr: u32t(63, 8),
+            page_size: 16,
+            seq_stride: u64::from(plane),
+            head_stride: u64::from(HEAD_DIM),
+        }
+    }
+
+    fn decode_plan() -> DecodePlan {
+        DecodePlan {
+            positions: i32t(7, 2),
+            request_of_token: i32t(8, 2),
+            mask: Tensor::new(9, 2, 64, Dtype::U8),
+            mask_enabled: Tensor::new(10, 2, 1, Dtype::U8),
+            mask_stride: 64,
+        }
+    }
+
+    #[test]
+    fn attn_2_every_case() {
+        every_selected_entry_is_a_kernel_a_shader_stamps();
+        a_selection_and_a_window_are_not_asked_for_together();
+        a_zero_block_width_expands_to_nothing_and_is_refused();
+        a_selection_short_of_the_launch_is_refused();
+    }
+
+    // `Fire::at` names an entry point by string and nothing resolves it until a
+    // real device does, where a typo is a nil pipeline. The Metal audit's
+    // `--table` mode, which used to hold the two sides together, is retired, so
+    // this holds its own: the shipped width is `d_256` and no test launches it.
+    //
+    // A shader stamps its entry points through an `instantiate_*` macro, so the
+    // name never appears whole in the source; read the invocations and spell the
+    // names the way the macro pastes them.
+    fn every_selected_entry_is_a_kernel_a_shader_stamps() {
+        fn stamped(file: &str, macro_name: &str, spell: fn(&[&str]) -> String) -> Vec<String> {
+            let source = crate::sources::resolve(file)
+                .unwrap_or_else(|why| panic!("{file} resolves: {why}"));
+            source
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with(&format!("{macro_name}(")))
+                .map(|line| {
+                    let args = line
+                        .trim_start_matches(&format!("{macro_name}("))
+                        .trim_end_matches(')')
+                        .split(',')
+                        .map(str::trim)
+                        .collect::<Vec<_>>();
+                    spell(&args)
+                })
+                .collect()
+        }
+
+        let paged = stamped(
+            "attn/sdpa_paged.metal",
+            "instantiate_sdpa_paged_selected",
+            |args| format!("sdpa_paged_selected_{}_d_{}", args[0], args[2]),
+        );
+        for entry in SDPA_SELECTED {
+            assert!(
+                paged.iter().any(|stamped| stamped == entry),
+                "`{entry}` is named by the host and stamped by no shader; \
+                 attn/sdpa_paged.metal stamps {paged:?}"
+            );
+        }
+
+        let pool = stamped(
+            "attn/pool.metal",
+            "instantiate_index_block_mean_paged",
+            |args| format!("index_block_mean_paged_{}", args[0]),
+        );
+        assert!(
+            pool.contains(&"index_block_mean_paged_bfloat16".to_string()),
+            "the block mean is named by the host and stamped by no shader; \
+             attn/pool.metal stamps {pool:?}"
+        );
+    }
+
+    // A window names the last n cells and a selection names these blocks; taking
+    // both would let one of them silently win.
+    fn a_selection_and_a_window_are_not_asked_for_together() {
+        let probe = Probe::default();
+        let why = decode_selected(
+            &probe,
+            bf16(1, 2, Q_HEADS * HEAD_DIM),
+            &decode_plan(),
+            i32t(11, 2),
+            &gqa_pool(),
+            Some(32),
+            HEAD_DIM,
+            0.125,
+            4,
+            bf16(12, 2, Q_HEADS * HEAD_DIM),
+        )
+        .expect_err("a window and a selection are two answers to one question");
+        assert!(format!("{why}").contains("sliding window"), "{why}");
+        assert!(probe.fires().is_empty());
+    }
+
+    fn a_zero_block_width_expands_to_nothing_and_is_refused() {
+        let probe = Probe::default();
+        let why = decode_selected(
+            &probe,
+            bf16(1, 2, Q_HEADS * HEAD_DIM),
+            &decode_plan(),
+            i32t(11, 2),
+            &gqa_pool(),
+            None,
+            HEAD_DIM,
+            0.125,
+            0,
+            bf16(12, 2, Q_HEADS * HEAD_DIM),
+        )
+        .expect_err("a zero block width names no cells");
+        assert!(format!("{why}").contains("block width"), "{why}");
+        assert!(probe.fires().is_empty());
+    }
+
+    fn a_selection_short_of_the_launch_is_refused() {
+        let probe = Probe::default();
+        let why = decode_selected(
+            &probe,
+            bf16(1, 4, Q_HEADS * HEAD_DIM),
+            &decode_plan(),
+            Tensor::new(11, 2, 8, Dtype::I32),
+            &gqa_pool(),
+            None,
+            HEAD_DIM,
+            0.125,
+            4,
+            bf16(12, 4, Q_HEADS * HEAD_DIM),
+        )
+        .expect_err("two selection rows do not seat four query rows");
+        assert!(format!("{why}").contains("seats 2 rows"), "{why}");
+        assert!(probe.fires().is_empty());
+    }
+}
+
 pub mod mla {
     use dtype::Dtype;
 
