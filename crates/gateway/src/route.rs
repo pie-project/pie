@@ -77,6 +77,10 @@ impl RoutingHandle {
         self
     }
 
+    pub fn table(&self) -> RoutingTable {
+        self.routing.borrow().clone()
+    }
+
     pub fn admit(&self, req: &Request) -> AdmissionDecision {
         if matches!(
             &req.message,

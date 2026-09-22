@@ -215,6 +215,7 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
     tracing::info!(%gateway_id, %worker_addr, "gateway registered with controller");
     tokio::spawn(controller::heartbeat_loop(control, gateway_id, info));
 
+    ingress::status::started();
     let app = Router::new()
         .merge(ingress::router(state.clone()))
         .merge(blob::router(blobs));
