@@ -14,13 +14,13 @@ path = "src/lib.rs"
 
 [dependencies]
 engine = { path = "../engine" }
-eta-ir = { path = "../eta-ir" }
+eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 model-ir = { path = "../model-ir" }
 eta-compiler = { path = "../eta-compiler" }
 engine-cuda = { path = "../engine-cuda", optional = true, default-features = false }
 engine-metal = { path = "../engine-metal", optional = true }
 
-client-api = { path = "../client-api" }
+client-api = { package = "pie-client-api", path = "../client-api" }
 parking_lot = "0.12"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -42,24 +42,13 @@ grammar = { path = "../grammar" }
 models = { path = "../models" }
 checkpoint = { path = "../checkpoint", default-features = false }
 checkpoint-dsl = { path = "../checkpoint-dsl" }
+media = { path = "../media" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
-image = { version = "0.25", default-features = false, features = [
-    "png",
-    "jpeg",
-    "gif",
-    "webp",
-] }
 blake3 = "1.8.5"
 fancy-regex = "0.18.0"
 async-trait = "0.1.91"
 wasm-metadata = "0.254.0"
-cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
-    "std",
-    "driver",
-    "fallback-dynamic-loading",
-] }
-libloading = { version = "0.9", optional = true }
 rustc-hash = "2.1"
 smallvec = "1"
 lru = "0.18.1"
@@ -135,7 +124,7 @@ engine-metal = { path = "../engine-metal", optional = true }
 
 [features]
 default = []
-cuda = ["dep:engine-cuda", "engine-cuda/cuda", "dep:cudarc", "dep:libloading", "cudarc/cuda-13000"]
+cuda = ["dep:engine-cuda", "engine-cuda/cuda", "media/nvenc"]
 metal = ["dep:engine-metal"]
 vulkan = ["dep:engine-vulkan", "engine-vulkan/vulkan"]
 wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu", "dep:wgpu"]

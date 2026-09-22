@@ -1,6 +1,6 @@
 {
   "name": "@pie-project/client",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "JavaScript client for Pie",
   "type": "module",
   "main": "src/index.js",

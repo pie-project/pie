@@ -82,8 +82,8 @@ print(client.chat.completions.create(model="default", messages=[{"role": "user",
 The same server embeds in a process: `pie-server` on PyPI (`python/server`)
 and `@pie-project/server` on npm (`javascript/server`) boot what `pie serve`
 boots and hand back the address, each carrying every engine its platform
-supports (`engine.type` picks one at boot); `@pie-project/browser` is pie
-compiled for the browser.
+supports (`engine.type` picks one at boot); under a bundler the same
+`@pie-project/server` import is pie compiled for the browser, on WebGPU.
 
 Each API is served by a built-in inferlet (`crates/builtins/inferlets/compat-openai`,
 `compat-anthropic`, `compat-gemini`) built into the `pie` binary; `pie doctor`

@@ -49,8 +49,13 @@ impl Default for BootConfig {
 }
 
 impl BootConfig {
-    pub fn parse(toml_text: &str) -> Result<Self> {
-        toml::from_str(toml_text).context("parse the boot config")
+    /// TOML text, or the same document as JSON (what a page hands over
+    /// from an object).
+    pub fn parse(text: &str) -> Result<Self> {
+        if text.trim_start().starts_with('{') {
+            return serde_json::from_str(text).context("parse the boot config");
+        }
+        toml::from_str(text).context("parse the boot config")
     }
 }
 

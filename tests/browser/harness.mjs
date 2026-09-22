@@ -1,4 +1,4 @@
-import * as pie from "../../javascript/browser/dist/pie.mjs";
+import * as pie from "../../javascript/server-web/dist/pie.mjs";
 
 export const DEFAULT_MODEL = "models/qwen--qwen3-5-0-8b.qwen35-d0-8b-u4g64-kv-bf16.wgpu.zt";
 export const SHORT = "The capital of France is";

@@ -1,6 +1,6 @@
 # The browser suite
 
-Everything that runs `@pie-project/browser` (`javascript/browser`) in a real browser.
+Everything that runs `@pie-project/browser` (`javascript/server-web`) in a real browser.
 Pages are served from the repository root, so they import the package's
 `dist/` bundle by relative path.
 
@@ -11,7 +11,7 @@ PIE_HOME=~/.pie-browser pie model import Qwen/Qwen3.5-0.8B     # a wgpu build of
 ln -s ~/.pie-browser/models/Qwen--Qwen3.5-0.8B tests/browser/models
 npm install --prefix tests/browser/tools playwright@1.63.0
 npx --prefix tests/browser/tools playwright install chromium
-./javascript/browser/build.sh
+./javascript/server-web/build.sh
 ./tests/browser/tools/inferlets.sh      # the inferlets matrix.json names, beside the pages
 ```
 
@@ -38,6 +38,7 @@ on, streams its console, and exits with the status the page reports.
 | `index.html?auto` | boot, install, a completion; `&prompt=`, `&max_tokens=`, `&config=key%20%3D%20value,…`, `&log=` (console filter), `&worker=0` (runtime on the page thread), `&input=%7B…%7D` (extra inferlet input) |
 | `corners.html` | host corner cases: a missing artifact, launch before boot, a second boot, the UI thread during compile and a 200-token run, re-install, garbage bytes, closed and malformed connections, many connections, memory over 50 runs |
 | `transport.html` | the cost of a client ping, and a launch without an engine (`engine = false`) |
+| `server.html` | the `Server` class both hosts share: start, a registered language, install, a completion, shutdown |
 | `client.html` | the JavaScript client against the tab |
 | `bench.html?what=corners` | the inferlet library corner cases shared with the native benchmark (`tests/browser/bench.mjs`) |
 | `matrix.html?only=…` | the inferlets in `matrix.json` (device-carried loops and masks, watermarks, grammar-constrained decoding, token healing, beam search, the epilogue-op probe, the JavaScript twin); `tools/matrix.sh` runs them here and against a native `pie serve` and compares |

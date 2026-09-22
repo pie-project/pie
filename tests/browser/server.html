@@ -1,0 +1,52 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>pie: the Server class</title>
+<p>The one surface both hosts share: <code>Server.start</code>, a registered language, <code>install</code>, <code>connect</code>, <code>shutdown</code>.</p>
+<pre id="out"></pre>
+<script type="module">
+  import { Server } from "../../javascript/server-web/dist/pie.mjs";
+  import { registerLanguage } from "../../javascript/server-web/src/languages.mjs";
+
+  const out = document.getElementById("out");
+  const log = (s) => { out.textContent += s + "\n"; console.log(s); };
+  const finish = (status) => window.__pie_done?.(status);
+  const params = new URLSearchParams(location.search);
+  const model = params.get("model") ?? "models/tiny.wgpu.zt";
+  const config = { max_total_pages: 512, max_forward_tokens: 1024, max_forward_requests: 8, max_state_slots: 16 };
+
+  try {
+    // What `import "@pie-project/language-python"` does.
+    registerLanguage("python", new URL("languages/python.wasm", location.href));
+
+    const t0 = performance.now();
+    const server = await Server.start({ model, config, onProgress: (got, total) => { out.dataset.progress = `${got}/${total}`; } });
+    log(`booted in ${(performance.now() - t0).toFixed(0)} ms: ${JSON.stringify(server.summary)}`);
+    if (!server.running || server.url !== "pie://local") throw new Error(`running=${server.running} url=${server.url}`);
+
+    const manifest = await fetch("../../examples/text-completion-py/Pie.toml").then((r) => r.text());
+    const program = await server.install(new URL("../../examples/text-completion-py/main.py", location.href), manifest);
+    log(`installed ${program}`);
+
+    const client = await server.connect();
+    const proc = await client.launchProcess(program, { prompt: "The capital of France is", max_tokens: 4 });
+    let result = null;
+    for (;;) {
+      const { event, value } = await proc.recv();
+      if (event === "return") { result = JSON.parse(value); break; }
+      if (event === "error") throw new Error(`process: ${value}`);
+    }
+    log(`return: ${JSON.stringify(result)}`);
+    if (result.count !== 4) throw new Error(`wanted 4 tokens, got ${result.count}`);
+
+    await server.shutdown();
+    if (server.running) throw new Error("still running after shutdown");
+    let refused = false;
+    await server.connect().catch(() => { refused = true; });
+    if (!refused) throw new Error("connect() after shutdown was not refused");
+    log("ok: shutdown");
+    finish(0);
+  } catch (e) {
+    log(`failed: ${e.stack ?? e}`);
+    finish(1);
+  }
+</script>

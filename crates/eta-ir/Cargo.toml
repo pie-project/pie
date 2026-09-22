@@ -1,10 +1,10 @@
 [package]
-name = "eta-ir"
+name = "pie-eta-ir"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "ETA — the Embedded Tensor Algebra IR: the shape-typed op vocabulary, the stage-tagged channel-carrying trace container and its canonical wire format, shape/dtype inference, and the bind-time validator. The representation layer every other compiler crate builds on."
+description = "ETA — the Embedded Tensor Algebra IR: the shape-typed op vocabulary, the stage-tagged channel-carrying trace container and its canonical wire format, shape/dtype inference, and the bind-time validator. The representation layer every other compiler crate builds on. Internal to pie; depend on `inferlet` instead."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 keywords = ["pie", "eta", "tensor", "ir"]
@@ -21,7 +21,7 @@ std = []
 serde = ["dep:serde", "dtype/serde"]
 
 [dependencies]
-dtype = { path = "../dtype", default-features = false }
+dtype = { package = "pie-dtype", version = "0.5.2", path = "../dtype", default-features = false }
 
 serde = { version = "1.0", default-features = false, features = [
     "alloc",

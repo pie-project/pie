@@ -5,8 +5,10 @@
   "workspaces": [
     "client",
     "inferlet",
-    "browser",
-    "server"
+    "server-web",
+    "server",
+    "language-python",
+    "language-javascript"
   ],
   "scripts": {
     "test": "npm test --workspaces --if-present"

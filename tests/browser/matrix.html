@@ -6,7 +6,7 @@
 <p>Boots the model once, then installs and runs each entry of <code>matrix.json</code>. Each line is <code>MATRIX id ⟨tab⟩ status ⟨tab⟩ output</code>; <code>tools/matrix.sh</code> runs the same list natively and compares.</p>
 <pre id="out"></pre>
 <script type="module">
-  import * as pie from "../../javascript/browser/dist/pie.mjs";
+  import * as pie from "../../javascript/server-web/dist/pie.mjs";
   import { page, loadRuntime, installInferlet, connect, run } from "./harness.mjs";
 
   const { log, params, modelUrl, finish, fail } = page();

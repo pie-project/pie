@@ -1,19 +1,28 @@
 {
   "name": "@pie-project/server",
-  "version": "0.5.1",
-  "description": "What `pie serve` boots, inside a Node.js process, on the native GPU engines.",
+  "version": "0.5.2",
+  "description": "What `pie serve` boots, inside your process: on the native GPU engines under Node.js, on WebGPU under a bundler for the browser.",
   "type": "module",
   "main": "index.mjs",
   "types": "index.d.ts",
   "exports": {
     ".": {
       "types": "./index.d.ts",
-      "import": "./index.mjs"
+      "browser": "./web.mjs",
+      "node": "./index.mjs",
+      "default": "./index.mjs"
+    },
+    "./languages": {
+      "types": "./languages.d.ts",
+      "default": "./languages.mjs"
     }
   },
   "files": [
     "index.mjs",
     "index.d.ts",
+    "web.mjs",
+    "languages.mjs",
+    "languages.d.ts",
     "README.md"
   ],
   "scripts": {
@@ -31,13 +40,14 @@
   ],
   "dependencies": {
     "@pie-project/client": "^0.5.0",
+    "@pie-project/server-web": "0.5.2",
     "ws": "^8.18.0"
   },
   "optionalDependencies": {
-    "@pie-project/server-linux-x64": "0.5.1",
-    "@pie-project/server-linux-arm64": "0.5.1",
-    "@pie-project/server-darwin-arm64": "0.5.1",
-    "@pie-project/server-win32-x64": "0.5.1"
+    "@pie-project/server-linux-x64": "0.5.2",
+    "@pie-project/server-linux-arm64": "0.5.2",
+    "@pie-project/server-darwin-arm64": "0.5.2",
+    "@pie-project/server-win32-x64": "0.5.2"
   },
   "license": "Apache-2.0",
   "repository": {

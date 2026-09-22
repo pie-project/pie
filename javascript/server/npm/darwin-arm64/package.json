@@ -1,6 +1,6 @@
 {
   "name": "@pie-project/server-darwin-arm64",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "The darwin-arm64 native addon of @pie-project/server.",
   "main": "pie-server.node",
   "files": [

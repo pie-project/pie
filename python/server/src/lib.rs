@@ -15,6 +15,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use pie::StandaloneHandle;
+use runtime::inferlet::program;
 
 /// The runtime outlives the handle's shutdown: every engine is joined on it.
 type Live = (StandaloneHandle, tokio::runtime::Runtime);
@@ -28,6 +29,7 @@ fn stop((handle, runtime): Live) {
 struct PyEngineHandle {
     url: String,
     live: Mutex<Option<Live>>,
+    runtime: tokio::runtime::Handle,
 }
 
 #[pymethods]
@@ -44,12 +46,53 @@ impl PyEngineHandle {
         self.live.lock().unwrap().is_some()
     }
 
+    /// Hand the runtime a language component (`python`, `javascript`) from
+    /// bytes; a script inferlet in that language can run once this returns.
+    /// Blocks with the GIL released.
+    fn install_language(
+        &self,
+        py: Python<'_>,
+        language: &str,
+        component: &[u8],
+    ) -> PyResult<String> {
+        let language = program::Language::parse(language)
+            .map_err(|e| PyValueError::new_err(format!("language: {e:#}")))?;
+        let runtime = self.runtime()?;
+        let component = component.to_vec();
+        py.detach(|| runtime.block_on(program::add_language(language, component)))
+            .map_err(|e| PyRuntimeError::new_err(format!("install language: {e:#}")))?;
+        Ok(language.name().to_string())
+    }
+
+    /// Install an inferlet from its component bytes and manifest text,
+    /// replacing an installed version; returns `name@version`. Blocks with
+    /// the GIL released.
+    fn install(&self, py: Python<'_>, component: &[u8], manifest: &str) -> PyResult<String> {
+        let manifest = program::Manifest::parse(manifest)
+            .map_err(|e| PyValueError::new_err(format!("manifest: {e:#}")))?;
+        let name = manifest.program_name().to_string();
+        let runtime = self.runtime()?;
+        let component = component.to_vec();
+        py.detach(|| runtime.block_on(program::add(component, manifest, true)))
+            .map_err(|e| PyRuntimeError::new_err(format!("install: {e:#}")))?;
+        Ok(name)
+    }
+
     /// Stop every engine, join them, and release the runtime. Idempotent;
     /// blocks with the GIL released.
     fn shutdown(&self, py: Python<'_>) {
         if let Some(live) = self.live.lock().unwrap().take() {
             py.detach(|| stop(live));
         }
+    }
+}
+
+impl PyEngineHandle {
+    fn runtime(&self) -> PyResult<tokio::runtime::Handle> {
+        if self.live.lock().unwrap().is_none() {
+            return Err(PyRuntimeError::new_err("the server is shut down"));
+        }
+        Ok(self.runtime.clone())
     }
 }
 
@@ -89,6 +132,7 @@ fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
             .map_err(|e| PyRuntimeError::new_err(format!("start: {e:#}")))?;
         Ok(PyEngineHandle {
             url: format!("ws://{}", handle.listen_addr),
+            runtime: runtime.handle().clone(),
             live: Mutex::new(Some((handle, runtime))),
         })
     })

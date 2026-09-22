@@ -41,6 +41,7 @@ members = [
     "crates/models",
     "crates/checkpoint-dsl",
     "crates/chat-template",
+    "crates/media",
     "crates/kernels-cuda",
     "crates/kernels-metal",
     "crates/engine-cuda",
@@ -153,7 +154,7 @@ checkpoint = { path = "crates/checkpoint" }
 checkpoint-dsl = { path = "crates/checkpoint-dsl" }
 ztensor = { workspace = true }
 tokenizer = { path = "crates/tokenizer" }
-client = { path = "crates/client" }
+client = { package = "pie-client", path = "crates/client" }
 ids = { path = "crates/ids" }
 controller-api = { path = "crates/controller-api" }
 
@@ -175,7 +176,7 @@ tempfile = "3"
 libc = "0.2"
 
 [workspace.package]
-version = "0.5.1"
+version = "0.5.2"
 
 rust-version = "1.91"
 

@@ -27,6 +27,12 @@ runs:
       with:
         targets: ${{ inputs.triple }}
 
+    # rust-toolchain.toml pins the toolchain; install it here, serially, so
+    # concurrent cargo calls (maturin, napi) do not race to.
+    - if: inputs.manylinux != 'true'
+      shell: bash
+      run: rustup toolchain install
+
     - if: runner.os == 'macOS'
       shell: bash
       run: brew install cmake ninja libomp

@@ -224,8 +224,8 @@ out/
 marlin_scratch/
 
 target-wasm/
-javascript/browser/pkg/
-javascript/browser/dist/
+javascript/server-web/pkg/
+javascript/server-web/dist/
 javascript/server/pie-server*.node
 javascript/server/npm/*/pie-server.node
 javascript/**/*.tgz

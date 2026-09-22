@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib
+import importlib.util
 from typing import TYPE_CHECKING, Any
 
 from pie.config import Config
@@ -61,22 +63,42 @@ class Server:
                 "build the wheel with `maturin develop` in python/server"
             ) from error
         self._handle = await asyncio.to_thread(_engine.bootstrap, self._config.to_toml())
+        # `pip install "pie-server[python,javascript]"`: a language package that
+        # is importable is installed, so its inferlets run.
+        for language in ("python", "javascript"):
+            if importlib.util.find_spec(f"pie_language_{language}") is not None:
+                component = importlib.import_module(f"pie_language_{language}")
+                await self.install_language(language, component.read())
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
         await self.shutdown()
         return False
 
+    async def install_language(self, language: str, component: bytes) -> str:
+        """Hand the runtime a language component (`python`, `javascript`) from bytes;
+        a script inferlet in that language runs once this returns."""
+        return await asyncio.to_thread(self._alive().install_language, language, component)
+
+    async def install(self, component: bytes, manifest: str) -> str:
+        """Install an inferlet from its component bytes and manifest text, replacing
+        an installed version; returns `name@version`."""
+        return await asyncio.to_thread(self._alive().install, component, manifest)
+
     async def connect(self) -> "PieClient":
         """A `PieClient` connected to this engine; closed by `shutdown()`."""
-        if not self.running:
-            raise RuntimeError("server is not started; use `async with Server(cfg) as server:`")
+        self._alive()
         from pie_client import PieClient
 
         client = PieClient(self.url)
         await client.connect()
         self._clients.append(client)
         return client
+
+    def _alive(self) -> Any:
+        if not self.running:
+            raise RuntimeError("server is not started; use `async with Server(cfg) as server:`")
+        return self._handle
 
     async def shutdown(self) -> None:
         """Close the clients from `connect()`, then stop the engine. Idempotent."""

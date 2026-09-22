@@ -5,7 +5,6 @@ extern crate engine_cuda as _;
 extern crate wasmtime_web as wasmtime_wasi;
 
 pub mod bootstrap;
-pub mod codec;
 pub mod engine;
 pub mod inferlet;
 pub mod model;

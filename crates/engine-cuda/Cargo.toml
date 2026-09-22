@@ -25,7 +25,7 @@ model-exec = { path = "../model-exec" }
 
 eta-exec = { path = "../eta-exec" }
 
-eta-ir = { path = "../eta-ir" }
+eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 eta-compiler = { path = "../eta-compiler" }
 model-compiler = { path = "../model-compiler" }
 checkpoint = { path = "../checkpoint" }

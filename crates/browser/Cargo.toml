@@ -21,7 +21,7 @@ models = { path = "../models" }
 checkpoint = { path = "../checkpoint", default-features = false }
 tokenizer = { path = "../tokenizer" }
 ztensor = { workspace = true }
-client-api = { path = "../client-api" }
+client-api = { package = "pie-client-api", path = "../client-api" }
 web-std = { path = "../web-std" }
 wasmtime-web = { path = "../wasmtime-web" }
 anyhow = "1.0"

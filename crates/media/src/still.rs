@@ -1,3 +1,4 @@
+use image::imageops::FilterType;
 use image::{ExtendedColorType, ImageEncoder};
 
 const JPEG_QUALITY: u8 = 92;
@@ -29,6 +30,25 @@ pub fn decode(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     Ok((rgb.into_raw(), width, height))
 }
 
+const RESAMPLE: FilterType = FilterType::CatmullRom;
+
+pub fn resize(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Vec<u8>, String> {
+    let owed = width as usize * height as usize * 3;
+    let buf = image::RgbImage::from_raw(width, height, rgb.to_vec()).ok_or_else(|| {
+        format!(
+            "a {height} x {width} RGB picture is {owed} bytes and {} arrived",
+            rgb.len()
+        )
+    })?;
+    Ok(image::imageops::resize(&buf, target_width, target_height, RESAMPLE).into_raw())
+}
+
 pub fn webp(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     image::codecs::webp::WebPEncoder::new_lossless(&mut out)
@@ -44,6 +64,7 @@ mod tests {
     #[test]
     fn still_every_case() {
         a_png_decodes_back_to_the_pixels_it_encoded();
+        a_resize_keeps_the_extent_it_was_asked_for();
         bytes_that_are_no_picture_are_refused_by_name();
         png_round_trips_a_gradient_exactly();
         jpeg_and_webp_carry_the_same_picture();
@@ -62,6 +83,14 @@ mod tests {
         let why = decode(b"not a picture, just some bytes").expect_err("no magic");
         assert!(why.contains("still decode failed"), "{why}");
         assert!(why.contains("30 bytes"), "the refusal counts them: {why}");
+    }
+
+    fn a_resize_keeps_the_extent_it_was_asked_for() {
+        let (w, h) = (8u32, 4u32);
+        let out = resize(&gradient(w, h), w, h, 4, 2).expect("a gradient resizes");
+        assert_eq!(out.len(), 4 * 2 * 3, "the pixels the caller asked for");
+        let why = resize(&[0, 0, 0], w, h, 4, 2).expect_err("three bytes are no picture");
+        assert!(why.contains("96 bytes and 3 arrived"), "{why}");
     }
 
     fn gradient(w: u32, h: u32) -> Vec<u8> {

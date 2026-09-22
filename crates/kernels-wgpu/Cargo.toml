@@ -19,7 +19,7 @@ default = []
 
 [dependencies]
 
-dtype = { path = "../dtype" }
+dtype = { package = "pie-dtype", path = "../dtype" }
 
 [lints]
 workspace = true

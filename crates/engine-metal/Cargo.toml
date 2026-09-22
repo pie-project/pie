@@ -23,7 +23,7 @@ model-exec = { path = "../model-exec" }
 eta-exec = { path = "../eta-exec" }
 
 eta-compiler = { path = "../eta-compiler" }
-eta-ir = { path = "../eta-ir" }
+eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 model-compiler = { path = "../model-compiler" }
 checkpoint = { path = "../checkpoint" }
 
@@ -67,4 +67,4 @@ tokenizer = { path = "../tokenizer" }
 serde_json = "1"
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
-eta-dsl = { path = "../eta-dsl" }
+eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }

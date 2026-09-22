@@ -1,5 +1,5 @@
 // wasm32 has no stack-switching backend: the fiber hooks are forwarded to the
-// page's JSPI glue (javascript/browser/src/platform.mjs). wasm-bindgen's own JSPI
+// page's JSPI glue (javascript/server-web/src/platform.mjs). wasm-bindgen's own JSPI
 // cannot host them: it evacuates a suspended activation's shadow-stack frames,
 // and wasmtime hands the fiber raw pointers into the resumer's frame.
 #[cfg(target_arch = "wasm32")]

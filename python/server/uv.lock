@@ -353,7 +353,7 @@ wheels = [
 
 [[package]]
 name = "pie-client"
-version = "0.5.1"
+version = "0.5.2"
 source = { editable = "../client" }
 dependencies = [
     { name = "blake3" },
@@ -375,15 +375,38 @@ requires-dist = [
 ]
 
 [[package]]
+name = "pie-language-javascript"
+version = "0.5.2"
+source = { editable = "../language-javascript" }
+
+[[package]]
+name = "pie-language-python"
+version = "0.5.2"
+source = { editable = "../language-python" }
+
+[[package]]
 name = "pie-server"
-version = "0.5.1"
+version = "0.5.2"
 source = { editable = "." }
 dependencies = [
     { name = "pie-client" },
 ]
 
+[package.optional-dependencies]
+javascript = [
+    { name = "pie-language-javascript" },
+]
+python = [
+    { name = "pie-language-python" },
+]
+
 [package.metadata]
-requires-dist = [{ name = "pie-client", editable = "../client" }]
+requires-dist = [
+    { name = "pie-client", editable = "../client" },
+    { name = "pie-language-javascript", marker = "extra == 'javascript'", editable = "../language-javascript" },
+    { name = "pie-language-python", marker = "extra == 'python'", editable = "../language-python" },
+]
+provides-extras = ["python", "javascript"]
 
 [[package]]
 name = "pycparser"

@@ -178,7 +178,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
       - run: uv tool install componentize-py
       - uses: actions/setup-node@v6
         with:
@@ -192,9 +192,14 @@ jobs:
 
   browser:
     name: "browser: wasm32 lint → Tint → serve in Chromium"
+    needs: languages
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: languages
+          path: ${{ runner.temp }}/languages
       - uses: ./.github/actions/toolchain
         with:
           triple: wasm32-unknown-unknown
@@ -238,10 +243,12 @@ jobs:
           python3 scripts/tiny_qwen35.py "$RUNNER_TEMP/snapshot" --tokenizer ~/qwen35-tokenizer
           PIE_HOME="$RUNNER_TEMP/home" target/release/pie model import "$RUNNER_TEMP/snapshot" --sku qwen35-tiny-u4g64-kv-bf16 --keep-source
           mkdir -p tests/browser/models && cp "$(find "$RUNNER_TEMP/home/models" -name '*.wgpu.zt' | head -1)" tests/browser/models/tiny.wgpu.zt
-          ./javascript/browser/build.sh release
-          ./tests/browser/tools/inferlets.sh
+          ./javascript/server-web/build.sh release
+          for l in python javascript; do tar xzf "$RUNNER_TEMP/languages/pie-language-$l.tar.gz" -C "$RUNNER_TEMP/home"; done
+          PIE_HOME="$RUNNER_TEMP/home" ./tests/browser/tools/inferlets.sh
           node tests/browser/tools/headless.mjs . "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" --timeout 300000
           node tests/browser/tools/headless.mjs . "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=max_total_pages%20%3D%20512,max_forward_tokens%20%3D%201024,max_forward_requests%20%3D%208,max_state_slots%20%3D%2016" --timeout 900000
+          node tests/browser/tools/headless.mjs . "tests/browser/server.html?model=models/tiny.wgpu.zt" --timeout 900000
         env:
           PIE_CHROME_ARGS: --use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader
 
@@ -258,7 +265,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
       - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - uses: actions/cache@v5
         with:

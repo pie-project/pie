@@ -11,7 +11,7 @@ on:
         description: Package to release
         required: true
         type: choice
-        options: [pie-client, inferlet, pie-server]
+        options: [pie-client, inferlet, pie-server, pie-language-python, pie-language-javascript]
       dry_run:
         description: Build and validate, do not publish
         type: boolean
@@ -26,18 +26,30 @@ jobs:
     if: inputs.package != 'pie-server'
     runs-on: ubuntu-latest
     env:
-      DIR: python/${{ inputs.package == 'pie-client' && 'client' || 'inferlet' }}
+      DIR: python/${{ inputs.package == 'pie-client' && 'client' || inputs.package == 'inferlet' && 'inferlet' || inputs.package == 'pie-language-python' && 'language-python' || 'language-javascript' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - run: python -m pip install --upgrade build pytest
+      # A language package carries the component `scripts/build-languages.sh` builds.
+      - if: startsWith(inputs.package, 'pie-language-')
+        uses: astral-sh/setup-uv@v7
+      - if: startsWith(inputs.package, 'pie-language-')
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - if: startsWith(inputs.package, 'pie-language-')
+        run: |
+          uv tool install componentize-py
+          bash scripts/build-languages.sh target/languages "${DIR#python/language-}"
       - name: tests
         run: |
           case "$DIR" in
-            python/client)   python -m pip install -e "$DIR" && python -m pytest -q "$DIR/tests" ;;
-            python/inferlet) PYTHONPATH="$DIR/src" python -m pytest -q "$DIR/tests" ;;
+            python/client)      python -m pip install -e "$DIR" && python -m pytest -q "$DIR/tests" ;;
+            python/inferlet)    PYTHONPATH="$DIR/src" python -m pytest -q "$DIR/tests" ;;
+            python/language-*)  PYTHONPATH="$DIR/src" python -c "import importlib; m = importlib.import_module('pie_language_' + '${DIR#python/language-}'); assert len(m.read()) > 1_000_000, 'the component is missing'" ;;
           esac
       # The unit tests stub `wit_world`; a componentize-py build resolves every
       # WIT import against `crates/inferlet/wit` for real.

@@ -1,7 +1,7 @@
 {
-  "name": "@pie-project/browser",
-  "version": "0.5.1",
-  "description": "pie in a browser tab: the runtime and the WebGPU engine as wasm, driven from the page and spoken to with @pie-project/client",
+  "name": "@pie-project/server-web",
+  "version": "0.5.2",
+  "description": "The browser half of @pie-project/server: the runtime and the WebGPU engine as wasm, reached through `import { Server } from \"@pie-project/server\"` under a bundler.",
   "type": "module",
   "main": "dist/pie.mjs",
   "types": "index.d.ts",
@@ -9,6 +9,10 @@
     ".": {
       "types": "./index.d.ts",
       "default": "./dist/pie.mjs"
+    },
+    "./languages": {
+      "types": "./src/languages.d.ts",
+      "default": "./src/languages.mjs"
     }
   },
   "files": [
@@ -24,6 +28,11 @@
     "@pie-project/client": "^0.5.0"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.28.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pie-project/pie",
+    "directory": "javascript/server-web"
   }
 }

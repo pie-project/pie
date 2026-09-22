@@ -1,6 +1,6 @@
 pub(crate) mod host;
 pub use host::frames::{FrameStore, Frames, Pcm};
-pub use host::media::{decode as media_codec, span_digest};
+pub use host::media::{decode as media_decode, span_digest};
 pub use host::pie::inferlet::frames::{AudioFormat, ImageFormat};
 pub(crate) mod linker;
 pub mod process;

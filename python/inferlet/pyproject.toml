@@ -1,6 +1,6 @@
 [project]
 name = "inferlet"
-version = "0.5.1"
+version = "0.5.2"
 description = "Python library for writing Pie inferlets"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "jinja2>=3.0",
+    "jinja2>=3.1.6",
 ]
 
 [project.optional-dependencies]
@@ -29,10 +29,10 @@ build = [
 ]
 dev = [
     "componentize-py>=0.19",
-    "pytest>=7.0",
-    "pytest-asyncio>=0.21",
-    "mypy>=1.0",
-    "ruff>=0.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "mypy>=2.3.1",
+    "ruff>=0.16.8",
 ]
 
 [build-system]

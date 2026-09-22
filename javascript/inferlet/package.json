@@ -1,6 +1,6 @@
 {
   "name": "@pie-project/inferlet",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "JavaScript library for writing Pie inferlets",
   "type": "module",
   "main": "dist/index.js",
@@ -20,15 +20,14 @@
   },
   "devDependencies": {
     "@bytecodealliance/componentize-js": "^0.22.0",
-    "@bytecodealliance/jco": "^1.32.1",
+    "@bytecodealliance/jco": "^1.34.0",
     "acorn": "^8.18.0",
-    "esbuild": "^0.28.0",
+    "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.0"
+    "vitest": "^5.0.1"
   },
   "files": [
     "dist",
-    "language",
     "scripts",
     "wit"
   ]

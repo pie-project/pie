@@ -1,7 +1,7 @@
 name: Release npm Package
 
 # One package from the `javascript/` workspace per run. `server` and
-# `browser` depend on `client` by version range: publish `client` first when
+# `server-web` depend on `client` by version range: publish `client` first when
 # it changed. `server`'s addon ships as one platform package per target
 # (`optionalDependencies`), each with every engine that platform supports.
 
@@ -12,7 +12,7 @@ on:
         description: Package to release
         required: true
         type: choice
-        options: [client, inferlet, browser, server]
+        options: [client, inferlet, server-web, server, language-python, language-javascript]
       dry_run:
         description: Build and pack, do not publish
         type: boolean
@@ -26,16 +26,39 @@ env:
   NPM_CONFIG_AUDIT: 'false'
 
 jobs:
-  browser:
-    name: "browser: build"
-    if: inputs.package == 'browser'
+  language:
+    name: "${{ inputs.package }}: component"
+    if: startsWith(inputs.package, 'language-')
+    runs-on: ubuntu-latest
+    env:
+      LANGUAGE: ${{ inputs.package == 'language-python' && 'python' || 'javascript' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+      - run: uv tool install componentize-py
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: bash scripts/build-languages.sh target/languages "$LANGUAGE"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.package }}
+          path: javascript/${{ inputs.package }}/${{ env.LANGUAGE }}.wasm
+          if-no-files-found: error
+
+  web:
+    name: "server-web: build"
+    if: inputs.package == 'server-web'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
         with:
           triple: wasm32-unknown-unknown
-          cache-key: ${{ runner.os }}-release-browser
+          cache-key: ${{ runner.os }}-release-server-web
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
@@ -43,11 +66,11 @@ jobs:
         run: cargo install wasm-bindgen-cli --locked --version "$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')"
       - run: npm ci --include=dev
         working-directory: javascript
-      - run: bash javascript/browser/build.sh min
+      - run: bash javascript/server-web/build.sh min
       - uses: actions/upload-artifact@v6
         with:
-          name: browser-dist
-          path: javascript/browser/dist
+          name: server-web-dist
+          path: javascript/server-web/dist
           if-no-files-found: error
 
   addon:
@@ -84,11 +107,12 @@ jobs:
 
   publish:
     name: "npm: check + publish"
-    needs: [browser, addon]
+    needs: [web, addon, language]
     if: >-
       always() && !cancelled()
-      && (inputs.package != 'browser' || needs.browser.result == 'success')
+      && (inputs.package != 'server-web' || needs.web.result == 'success')
       && (inputs.package != 'server' || needs.addon.result == 'success')
+      && (!startsWith(inputs.package, 'language-') || needs.language.result == 'success')
     runs-on: ubuntu-latest
     environment: npm
     steps:
@@ -98,17 +122,22 @@ jobs:
           node-version: '22'
           registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@v7
-        if: inputs.package == 'browser'
+        if: inputs.package == 'server-web'
         with:
-          name: browser-dist
-          path: javascript/browser/dist
+          name: server-web-dist
+          path: javascript/server-web/dist
       - uses: actions/download-artifact@v7
         if: inputs.package == 'server'
         with:
           pattern: addon-*
           path: javascript/server/npm
+      - uses: actions/download-artifact@v7
+        if: startsWith(inputs.package, 'language-')
+        with:
+          name: ${{ inputs.package }}
+          path: javascript/${{ inputs.package }}
       - if: inputs.package == 'server'
-        run: for d in javascript/server/npm/addon-*; do mv "$d/pie-server.node" "${d/addon-/}/"; done && ls -la javascript/server/npm/*/
+        run: for d in javascript/server/npm/addon-*; do mv "$d/pie-server.node" "${d/addon-/}/" && rmdir "$d"; done && ls -la javascript/server/npm/*/
       - run: npm ci --include=dev
         working-directory: javascript
       # The checked-in bindings are an artifact of whatever world they were
@@ -119,7 +148,7 @@ jobs:
           bash ../../scripts/check-inferlet-interfaces.sh
           npm run generate-bindings
           git diff --exit-code -- src/bindings tsconfig.json
-      # `browser`'s build is the artifact above; `inferlet` compiles here.
+      # `server-web`'s build is the artifact above; `inferlet` compiles here.
       - working-directory: javascript
         run: |
           [[ "${{ inputs.package }}" != inferlet ]] || npm run build -w inferlet
@@ -144,6 +173,11 @@ jobs:
         working-directory: javascript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # Idempotent, so a rerun publishes only what is missing.
         run: |
-          [[ "${{ inputs.package }}" != server ]] || for d in server/npm/*/; do (cd "$d" && npm publish --access public); done
-          npm publish --access public -w ${{ inputs.package }}
+          publish() {
+            local id; id=$(node -p 'const p = require("./package.json"); `${p.name}@${p.version}`')
+            if npm view "$id" version >/dev/null 2>&1; then echo "$id is already published"; else npm publish --access public; fi
+          }
+          [[ "${{ inputs.package }}" != server ]] || for d in server/npm/*/; do (cd "$d" && publish); done
+          (cd ${{ inputs.package }} && publish)

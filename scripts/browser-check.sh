@@ -6,8 +6,8 @@ cd "$(dirname "$0")/.."
 
 WASM_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web
   checkpoint checkpoint-dsl ztensor ztensor-compat tokenizer grammar chat-template
-  models model-ir model-dsl model-compiler engine model-exec eta-ir eta-dsl eta-compiler
-  eta-exec waker ids dtype client-api)
+  models model-ir model-dsl model-compiler engine model-exec pie-eta-ir pie-eta-dsl eta-compiler
+  eta-exec waker ids pie-dtype pie-client-api)
 NATIVE_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web)
 
 pkgs() { for c in "$@"; do printf -- '-p %s ' "$c"; done; }
@@ -21,7 +21,7 @@ cargo clippy $(pkgs "${NATIVE_CRATES[@]}") --features runtime/wgpu,engine-wgpu/w
 cargo test -q $(pkgs "${NATIVE_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu
 
 echo "== javascript"
-for f in javascript/browser/src/*.mjs tests/browser/*.mjs tests/browser/tools/*.mjs scripts/bench/browser/*.mjs; do
+for f in javascript/server-web/src/*.mjs tests/browser/*.mjs tests/browser/tools/*.mjs scripts/bench/browser/*.mjs; do
   node --check "$f"
 done
 for f in tests/browser/*.html crates/kernels-wgpu/tools/*.html; do

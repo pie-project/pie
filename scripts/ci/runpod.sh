@@ -13,7 +13,10 @@ case "${1:?start|stop|status}" in
   start)
     s=$(status); echo "$s"
     case "$s" in RUNNING*) exit 0 ;; esac
-    call POST /start >/dev/null
+    for attempt in 1 2 3; do
+      call POST /start >/dev/null && break
+      echo "start attempt $attempt failed; retrying" >&2; sleep 20
+    done
     # A stopped pod resumes only when its host has the GPU free; say so
     # rather than leaving the job to queue for a runner that never comes.
     for _ in $(seq 1 30); do

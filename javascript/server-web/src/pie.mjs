@@ -1,6 +1,7 @@
 import { PieClient } from "@pie-project/client";
 
 import { socketClass } from "./transport.mjs";
+import { attachLanguages } from "./languages.mjs";
 
 export { PieClient };
 
@@ -114,4 +115,97 @@ export async function bootLazy(url, config, onProgress) {
 
 export async function awaitCache() {
   return await ready().call("awaitCache", []);
+}
+
+async function bytesOf(source) {
+  if (source instanceof Uint8Array) return source;
+  if (source instanceof ArrayBuffer) return new Uint8Array(source);
+  const response = await fetch(source);
+  if (!response.ok) throw new Error(`pie: ${source}: ${response.status} ${response.statusText}`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+/** One running pie in this tab, with the surface of the Node host. */
+export class Server {
+  #summary;
+  #open = true;
+  #detach = null;
+
+  constructor(summary) {
+    this.#summary = summary;
+  }
+
+  /**
+   * Boot the runtime and the WebGPU engine. `model` is the URL of a
+   * `.wgpu.zt` artifact served with Range support; `config` the boot config
+   * (an object, or TOML text). Resolves once the weights are on the device,
+   * with every registered language component installed.
+   */
+  static async start({ model, config = {}, onProgress, worker = true, log, wasmUrl } = {}) {
+    if (typeof model !== "string") throw new Error("Server.start: `model` is the URL of the artifact to serve");
+    if (!backend) await load({ worker, log, wasmUrl });
+    const summary = await bootLazy(model, typeof config === "string" ? config : JSON.stringify(config), onProgress);
+    const server = new Server(summary);
+    server.#detach = await attachLanguages(server);
+    return server;
+  }
+
+  /** What the boot found: model, sku, weight bytes, kv pages. */
+  get summary() {
+    return this.#summary;
+  }
+
+  /** The in-page address clients connect to. */
+  get url() {
+    return "pie://local";
+  }
+
+  /** True until `shutdown()`. */
+  get running() {
+    return this.#open && backend !== null;
+  }
+
+  /** A language component (`python`, `javascript`) from bytes or a URL. */
+  async installLanguage(language, source) {
+    this.#alive();
+    return installLanguage(language, await bytesOf(source));
+  }
+
+  /** An inferlet from its component bytes (or URL) and manifest text, replacing an installed version. */
+  async install(source, manifest) {
+    this.#alive();
+    return install(await bytesOf(source), manifest);
+  }
+
+  /** A `PieClient` connected in-page. */
+  async connect() {
+    this.#alive();
+    return connect();
+  }
+
+  /** Bytes of wasm memory in use. */
+  async memoryBytes() {
+    this.#alive();
+    return memoryBytes();
+  }
+
+  /** Resolves once the artifact is copied into the origin's private file system. */
+  async awaitCache() {
+    this.#alive();
+    return awaitCache();
+  }
+
+  /** Stop the worker and release the runtime. Idempotent. */
+  async shutdown() {
+    if (!this.#open) return;
+    this.#open = false;
+    this.#detach?.();
+    backend?.terminate?.();
+    backend = null;
+    Socket = null;
+  }
+
+  #alive() {
+    if (!this.running) throw new Error("the server is shut down");
+  }
 }

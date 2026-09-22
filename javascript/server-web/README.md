@@ -1,9 +1,12 @@
-# @pie-project/browser
+# @pie-project/server-web
 
-pie in a browser tab: the same runtime, WebGPU engine and inferlet sandbox as
-`pie serve`, compiled to `wasm32-unknown-unknown`. No server-side inference:
-the page fetches a `.wgpu.zt` artifact, the weights land in WebGPU buffers,
-and inferlets run under wasmtime's Pulley interpreter inside the same module.
+The browser half of `@pie-project/server`: the same runtime, WebGPU engine
+and inferlet sandbox as `pie serve`, compiled to `wasm32-unknown-unknown`.
+No server-side inference: the page fetches a `.wgpu.zt` artifact, the
+weights land in WebGPU buffers, and inferlets run under wasmtime's Pulley
+interpreter inside the same module. A bundler reaches it through
+`@pie-project/server`'s `browser` export condition; nothing imports it by
+name.
 
 ## Use
 
@@ -15,18 +18,24 @@ wasm are fetched relative to the module, so serve them from your own origin
 does this by itself; without one, copy `dist/` next to your page).
 
 ```js
-import { load, bootLazy, install, connect } from "@pie-project/browser";
+import { Server } from "@pie-project/server";      // resolves here under a bundler
+import "@pie-project/language-python";
 
-await load();                                     // the wasm, in a Web Worker
-await bootLazy("/models/qwen3.5-0.8b.wgpu.zt");   // served with Range support
-const program = await install(inferletBytes, manifestToml);
-const client = await connect();                   // a PieClient, as for `pie serve`
+const server = await Server.start({ model: "/models/qwen3.5-0.8b.wgpu.zt" });   // served with Range support
+const program = await server.install(inferletBytes, manifestToml);
+const client = await server.connect();              // a PieClient, as for `pie serve`
 const proc = await client.launchProcess(program, { prompt: "The capital of France is", max_tokens: 16 });
 for (;;) {
   const { event, value } = await proc.recv();
   if (event === "return" || event === "error") break;
 }
+await server.shutdown();
 ```
+
+The page-level functions behind the class (`load`, `bootLazy`, `install`,
+`installLanguage`, `connect`, `awaitCache`, `memoryBytes`) are exported as
+well; `tests/browser` drives them directly.
+
 
 - The page must be cross-origin isolated (`Cross-Origin-Opener-Policy:
   same-origin`, `Cross-Origin-Embedder-Policy: require-corp`), and the
@@ -54,7 +63,7 @@ for (;;) {
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.128 --locked   # must match Cargo.lock
-./javascript/browser/build.sh          # release; `min` for the 23 MB shipping build, `dev` for debug
+./javascript/server-web/build.sh          # release; `min` for the 23 MB shipping build, `dev` for debug
 ```
 
 `build.sh` builds `crates/browser`, runs wasm-bindgen into `pkg/`, and bundles
@@ -71,7 +80,8 @@ live under `tests/browser` (see its README).
 | `crates/web-std` | The executor the page ticks, timers over `performance.now()`, crossbeam-shaped channels, and green threads on fibers. The runtime's scheduler and engine lanes run on those unchanged; `crates/runtime`'s `rt` facade names it on wasm32. |
 | `crates/engine-wgpu` | The same engine on both hosts, written for the browser: no GPU wait blocks, every step lands by callback, guests run from the landing. What differs by host sits in `device/host.rs`. |
 | `src/worker.mjs` | The host: wasm init, the tick loop, sessions, the artifact served by byte range. Runs in a Web Worker so the page stays responsive through the inferlet's in-browser compile and every forward pass; `load({ worker: false })` runs it on the page for debugging. |
-| `src/pie.mjs` | The page-side API: `load`, `bootLazy`, `install`, `connect`. |
+| `src/pie.mjs` | The page-side API: the `Server` class over `load`, `bootLazy`, `install`, `connect`. |
+| `src/languages.mjs` | The language registry `@pie-project/server/languages` re-exports: what a language package calls on import. |
 | `src/platform.mjs` | Fibers (JSPI), the clock, the wake hook the wasm imports. |
 | `src/transport.mjs` | The client's in-page socket over the runtime's frame API. |
 

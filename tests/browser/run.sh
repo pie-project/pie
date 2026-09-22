@@ -16,7 +16,7 @@ cargo run -q -p kernels-wgpu --example dump_wgsl -- crates/kernels-wgpu/tools/wg
 node tests/browser/tools/headless.mjs . crates/kernels-wgpu/tools/wgsl-check.html --timeout 300000 | tail -2
 
 echo "== build the host"
-./javascript/browser/build.sh release > /dev/null
+./javascript/server-web/build.sh release > /dev/null
 ./tests/browser/tools/inferlets.sh
 
 run "boot, install, run (worker)" "index.html?auto&max_tokens=${PIE_WEB_TOKENS:-16}&runs=${PIE_WEB_RUNS:-2}"

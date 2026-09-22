@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pie-server"
-version = "0.5.1"
+version = "0.5.2"
 description = "What `pie serve` boots, inside a Python process: `pie.server.Server`."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,10 @@ dependencies = [
     "pie-client",
 ]
 
+[project.optional-dependencies]
+python = ["pie-language-python"]
+javascript = ["pie-language-javascript"]
+
 [tool.maturin]
 python-source = "python"
 python-packages = ["pie"]
@@ -29,6 +33,8 @@ manifest-path = "Cargo.toml"
 
 [tool.uv.sources]
 pie-client = { path = "../client", editable = true }
+pie-language-python = { path = "../language-python", editable = true }
+pie-language-javascript = { path = "../language-javascript", editable = true }
 
 [tool.uv]
 cache-keys = [

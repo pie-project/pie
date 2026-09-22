@@ -14,6 +14,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use pie::StandaloneHandle;
+use runtime::inferlet::program;
 
 /// The runtime outlives the handle's shutdown: every engine is joined on it.
 type Live = (StandaloneHandle, tokio::runtime::Runtime);
@@ -27,6 +28,7 @@ fn stop((handle, runtime): Live) {
 pub struct Server {
     url: String,
     live: Mutex<Option<Live>>,
+    runtime: tokio::runtime::Handle,
 }
 
 #[napi]
@@ -44,12 +46,98 @@ impl Server {
         self.live.lock().unwrap().is_some()
     }
 
+    /// Hand the runtime a language component (`python`, `javascript`) from
+    /// bytes; a script inferlet in that language can run once this resolves.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn install_language(
+        &self,
+        language: String,
+        component: Buffer,
+    ) -> Result<AsyncTask<InstallLanguage>> {
+        Ok(AsyncTask::new(InstallLanguage {
+            runtime: self.runtime()?,
+            language,
+            component: component.to_vec(),
+        }))
+    }
+
+    /// Install an inferlet from its component bytes and manifest text,
+    /// replacing an installed version. Resolves to `name@version`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn install(&self, component: Buffer, manifest: String) -> Result<AsyncTask<Install>> {
+        Ok(AsyncTask::new(Install {
+            runtime: self.runtime()?,
+            component: component.to_vec(),
+            manifest,
+        }))
+    }
+
     /// Stop every engine, join them, and release the runtime. Idempotent.
     #[napi(ts_return_type = "Promise<void>")]
     pub fn shutdown(&self) -> AsyncTask<Shutdown> {
         AsyncTask::new(Shutdown {
             live: self.live.lock().unwrap().take(),
         })
+    }
+
+    fn runtime(&self) -> Result<tokio::runtime::Handle> {
+        if self.live.lock().unwrap().is_none() {
+            return Err(failed("install", "the server is shut down"));
+        }
+        Ok(self.runtime.clone())
+    }
+}
+
+pub struct InstallLanguage {
+    runtime: tokio::runtime::Handle,
+    language: String,
+    component: Vec<u8>,
+}
+
+#[napi]
+impl Task for InstallLanguage {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> Result<String> {
+        let language = program::Language::parse(&self.language)
+            .map_err(|e| invalid("language", format!("{e:#}")))?;
+        let component = std::mem::take(&mut self.component);
+        self.runtime
+            .block_on(program::add_language(language, component))
+            .map_err(|e| failed("install language", format!("{e:#}")))?;
+        Ok(language.name().to_string())
+    }
+
+    fn resolve(&mut self, _env: Env, name: String) -> Result<String> {
+        Ok(name)
+    }
+}
+
+pub struct Install {
+    runtime: tokio::runtime::Handle,
+    component: Vec<u8>,
+    manifest: String,
+}
+
+#[napi]
+impl Task for Install {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> Result<String> {
+        let manifest = program::Manifest::parse(&self.manifest)
+            .map_err(|e| invalid("manifest", format!("{e:#}")))?;
+        let name = manifest.program_name().to_string();
+        let component = std::mem::take(&mut self.component);
+        self.runtime
+            .block_on(program::add(component, manifest, true))
+            .map_err(|e| failed("install", format!("{e:#}")))?;
+        Ok(name)
+    }
+
+    fn resolve(&mut self, _env: Env, name: String) -> Result<String> {
+        Ok(name)
     }
 }
 
@@ -130,6 +218,7 @@ fn boot(toml_str: &str) -> Result<Server> {
         .map_err(|e| failed("start", format!("{e:#}")))?;
     Ok(Server {
         url: format!("ws://{}", handle.listen_addr),
+        runtime: runtime.handle().clone(),
         live: Mutex::new(Some((handle, runtime))),
     })
 }

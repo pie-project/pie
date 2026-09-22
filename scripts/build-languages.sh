@@ -6,6 +6,9 @@
 #   pie-language-python.tar.gz          languages/python.wasm
 #   pie-language-javascript.tar.gz      languages/javascript.wasm
 #
+# and the same wasm into the packages that ship it: javascript/language-*
+# (npm) and python/language-*/src/pie_language_* (PyPI).
+#
 #   scripts/build-languages.sh [OUT_DIR] [LANGUAGE...]
 #     OUT_DIR     where the archives go        (default: target/languages)
 #     LANGUAGE    python | javascript          (default: both)
@@ -34,6 +37,8 @@ for language in "${languages[@]}"; do
   echo "== $language"
   "$root/$language/inferlet/language/build.sh" "$stage/languages/$language.wasm"
   tar -C "$stage" -czf "$out/pie-language-$language.tar.gz" languages
+  cp "$stage/languages/$language.wasm" "$root/javascript/language-$language/$language.wasm"
+  cp "$stage/languages/$language.wasm" "$root/python/language-$language/src/pie_language_$language/$language.wasm"
   rm -rf "$stage"
   echo "== $out/pie-language-$language.tar.gz ($(du -h "$out/pie-language-$language.tar.gz" | cut -f1))"
 done

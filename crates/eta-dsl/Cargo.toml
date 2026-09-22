@@ -1,10 +1,10 @@
 [package]
-name = "eta-dsl"
+name = "pie-eta-dsl"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The ETA embedded DSL: a Tensor / Channel eDSL plus the neutral trace Builder that lowers stage closures into a canonical ETA trace container. Tracing is its implementation strategy, not its identity; the author-facing ForwardPass/Pipeline/WorkingSet surface lives in `inferlet`."
+description = "The ETA embedded DSL: a Tensor / Channel eDSL plus the neutral trace Builder that lowers stage closures into a canonical ETA trace container. Tracing is its implementation strategy, not its identity; the author-facing ForwardPass/Pipeline/WorkingSet surface lives in `inferlet`. Internal to pie; depend on `inferlet` instead."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 keywords = ["pie", "eta", "tracing", "inferlet"]
@@ -19,7 +19,7 @@ default = ["std"]
 std = ["eta-ir/std"]
 
 [dependencies]
-eta-ir = { path = "../eta-ir", default-features = false }
+eta-ir = { package = "pie-eta-ir", version = "0.5.2", path = "../eta-ir", default-features = false }
 
 [dev-dependencies]
 eta-compiler = { path = "../eta-compiler" }
