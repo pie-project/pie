@@ -60,7 +60,6 @@ pub use engine::Capabilities as EngineCapabilities;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn metal_geometry_is_stated(opts: &MetalEngineOptions) -> Result<()> {
     for (key, value) in [
-        ("total_pages", opts.total_pages),
         ("max_forward_tokens", opts.max_forward_tokens),
         ("max_forward_requests", opts.max_forward_requests),
         ("kv_page_size", opts.kv_page_size),
@@ -448,8 +447,8 @@ pub(crate) fn create_engine_backend(
                     max_adapters: adapters.seats(),
                     page_size,
                     max_context,
-                    slots: opts.max_state_slots.unwrap_or(256).max(1),
-                    pages: opts.total_pages.max(1),
+                    slots: opts.max_state_slots.unwrap_or(0),
+                    pages: opts.total_pages,
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
                     max_voxels: None,

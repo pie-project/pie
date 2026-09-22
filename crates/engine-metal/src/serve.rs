@@ -242,6 +242,8 @@ pub struct FireCost {
     pub copied: u32,
 }
 
+const DEFAULT_SLOTS: u32 = 256;
+
 pub struct Shell {
     device: Context,
     keepalive: Option<crate::keepalive::KeepAlive>,
@@ -430,12 +432,40 @@ impl Shell {
             }
         }
 
-        let paging = Paging::of(
-            boot.page_size,
-            boot.context,
-            boot.slots,
-            u64::from(boot.pages),
-        )?;
+        let demand = |slots: u32, pages: u64| -> Result<u64> {
+            crate::store::pool_demand(
+                &boot.trace,
+                Paging::of(boot.page_size, boot.context, slots, pages)?,
+            )
+        };
+        let room = crate::store::accounting::Accounting::with_scratch(
+            device.working_set(),
+            crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
+            boot.residency.device_demand(),
+            compiled.arena.bytes,
+            0,
+        )
+        .pool;
+        let slots = match boot.slots {
+            0 => {
+                let per_slot = demand(1, 1)?.saturating_sub(demand(0, 1)?);
+                (room / 2)
+                    .checked_div(per_slot)
+                    .and_then(|slots| u32::try_from(slots).ok())
+                    .map_or(DEFAULT_SLOTS, |slots| slots.clamp(1, DEFAULT_SLOTS))
+            }
+            stated => stated,
+        };
+        let pages = match boot.pages {
+            0 => {
+                let one = demand(slots, 1)?;
+                let per_page = demand(slots, 2)?.saturating_sub(one).max(1);
+                let fixed = one.saturating_sub(per_page);
+                (room.saturating_sub(fixed) / per_page).max(1)
+            }
+            stated => u64::from(stated),
+        };
+        let paging = Paging::of(boot.page_size, boot.context, slots, pages)?;
         let handles = Handles::new();
         let cuts = crate::experts::cuts(&boot.trace, &compiled, &boot.residency)?;
         let run_caps: Vec<u32> = (0..compiled.template().len())
@@ -549,6 +579,15 @@ impl Shell {
                     acct.weights, acct.scratch, acct.minimum, acct.floor, acct.working_set
                 );
             }
+            engine::memory::publish(engine::MemoryPlan {
+                working_set: acct.working_set,
+                ceiling: acct.ceiling,
+                weights: acct.weights,
+                scratch: acct.scratch,
+                floor: acct.floor,
+                pool: acct.pool,
+                minimum: acct.minimum,
+            });
         }
         let arena = Arena::reserve(&device, &compiled.arena)?;
         let pools = Pools::reserve(&device, &boot.trace, paging, &facts)?;

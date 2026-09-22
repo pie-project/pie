@@ -21,8 +21,21 @@ pub trait GatewayInbound {
     async fn redirect(req_id: ReqId);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryReport {
+    pub working_set: u64,
+    pub ceiling: u64,
+    pub weights: u64,
+    pub scratch: u64,
+    pub floor: u64,
+    pub pool: u64,
+    pub minimum: u64,
+}
+
 #[tarpc::service]
 pub trait WorkerControl {
+    async fn memory() -> Option<MemoryReport>;
+
     async fn dispatch(req: Request) -> Accepted;
 
     async fn cancel(req_id: ReqId);

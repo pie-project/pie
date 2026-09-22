@@ -79,7 +79,7 @@ impl Default for MetalEngineOptions {
     fn default() -> Self {
         Self {
             kv_page_size: 32,
-            total_pages: 1024,
+            total_pages: 0,
             max_forward_tokens: 10240,
             max_forward_requests: 512,
             max_model_len: None,

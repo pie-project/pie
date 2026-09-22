@@ -14,20 +14,38 @@ pub fn started() {
 
 pub async fn status(State(state): State<GatewayState>) -> Json<Value> {
     let table = state.routing.table();
-    let workers: Vec<Value> = table
-        .workers
-        .iter()
-        .map(|w| {
-            json!({
-                "id": w.id.to_string(),
-                "model": w.model,
-                "role": format!("{:?}", w.role).to_lowercase(),
-                "health": format!("{:?}", w.health).to_lowercase(),
-                "inflight": w.coarse_load.inflight,
-                "kv_pressure_bucket": w.coarse_load.kv_pressure_bucket,
-            })
-        })
-        .collect();
+    let mut workers: Vec<Value> = Vec::with_capacity(table.workers.len());
+    for w in &table.workers {
+        let memory = match state.workers.client(w.id) {
+            Some(client) => client
+                .memory(tarpc::context::current())
+                .await
+                .ok()
+                .flatten()
+                .map(|m| {
+                    json!({
+                        "working_set": m.working_set,
+                        "ceiling": m.ceiling,
+                        "weights": m.weights,
+                        "scratch": m.scratch,
+                        "floor": m.floor,
+                        "pool": m.pool,
+                        "pool_needed": m.minimum,
+                        "free": m.pool.saturating_sub(m.minimum),
+                    })
+                }),
+            None => None,
+        };
+        workers.push(json!({
+            "id": w.id.to_string(),
+            "model": w.model,
+            "role": format!("{:?}", w.role).to_lowercase(),
+            "health": format!("{:?}", w.health).to_lowercase(),
+            "inflight": w.coarse_load.inflight,
+            "kv_pressure_bucket": w.coarse_load.kv_pressure_bucket,
+            "memory": memory,
+        }));
+    }
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_s": START.get().map_or(0, |t| t.elapsed().as_secs()),

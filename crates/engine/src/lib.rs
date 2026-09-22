@@ -15,6 +15,7 @@ pub mod error;
 pub mod fire;
 pub mod frame;
 pub mod load;
+pub mod memory;
 pub mod program;
 pub mod runahead;
 pub mod transfer;
@@ -32,6 +33,7 @@ pub use fire::{
     Serves, Step,
 };
 pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
+pub use memory::MemoryPlan;
 pub use program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };

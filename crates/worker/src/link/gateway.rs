@@ -212,6 +212,18 @@ struct SessionHandle {
 }
 
 impl WorkerControl for WorkerControlServer {
+    async fn memory(self, _: tarpc::context::Context) -> Option<worker_api::MemoryReport> {
+        engine::memory::latest().map(|p| worker_api::MemoryReport {
+            working_set: p.working_set,
+            ceiling: p.ceiling,
+            weights: p.weights,
+            scratch: p.scratch,
+            floor: p.floor,
+            pool: p.pool,
+            minimum: p.minimum,
+        })
+    }
+
     async fn dispatch(self, _: tarpc::context::Context, req: Request) -> Accepted {
         match self.admit(req).await {
             Ok(()) => Accepted::Ok {
