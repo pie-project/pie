@@ -20,7 +20,7 @@ testkit = []
 
 
 [dependencies]
-dtype = { path = "../dtype" }
+dtype = { package = "pie-dtype", path = "../dtype" }
 half = "2"
 ztensor = { workspace = true }
 sha2 = "0.10"

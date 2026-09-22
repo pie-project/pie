@@ -54,28 +54,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "dtype"
-version = "0.5.0"
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
-
-[[package]]
-name = "eta-dsl"
-version = "0.5.0"
-dependencies = [
- "eta-ir",
-]
-
-[[package]]
-name = "eta-ir"
-version = "0.5.0"
-dependencies = [
- "dtype",
-]
 
 [[package]]
 name = "foldhash"
@@ -179,10 +161,10 @@ dependencies = [
 
 [[package]]
 name = "inferlet"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
- "eta-dsl",
  "inferlet-macros",
+ "pie-eta-dsl",
  "serde",
  "serde_json",
  "wit-bindgen",
@@ -190,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet-macros"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "quote",
  "syn 3.0.6",
@@ -230,6 +212,24 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "pie-dtype"
+version = "0.5.1"
+
+[[package]]
+name = "pie-eta-dsl"
+version = "0.5.1"
+dependencies = [
+ "pie-eta-ir",
+]
+
+[[package]]
+name = "pie-eta-ir"
+version = "0.5.1"
+dependencies = [
+ "pie-dtype",
+]
 
 [[package]]
 name = "pin-project-lite"

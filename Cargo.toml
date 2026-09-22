@@ -153,7 +153,7 @@ checkpoint = { path = "crates/checkpoint" }
 checkpoint-dsl = { path = "crates/checkpoint-dsl" }
 ztensor = { workspace = true }
 tokenizer = { path = "crates/tokenizer" }
-client = { path = "crates/client" }
+client = { package = "pie-client", path = "crates/client" }
 ids = { path = "crates/ids" }
 controller-api = { path = "crates/controller-api" }
 

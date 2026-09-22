@@ -14,13 +14,13 @@ path = "src/lib.rs"
 
 [dependencies]
 engine = { path = "../engine" }
-eta-ir = { path = "../eta-ir" }
+eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 model-ir = { path = "../model-ir" }
 eta-compiler = { path = "../eta-compiler" }
 engine-cuda = { path = "../engine-cuda", optional = true, default-features = false }
 engine-metal = { path = "../engine-metal", optional = true }
 
-client-api = { path = "../client-api" }
+client-api = { package = "pie-client-api", path = "../client-api" }
 parking_lot = "0.12"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }

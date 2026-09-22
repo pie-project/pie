@@ -1,16 +1,13 @@
-name: Release Cargo Package
+name: Release Cargo Packages
 
+# `inferlet` and `pie-client` are the public crates; the `pie-` prefixed ones
+# are the internals they depend on, published so crates.io can resolve them.
 # `inferlet` carries the `pie:inferlet` WIT package itself, so a WIT bump is
-# released by publishing `inferlet`; `inferlet-macros` is independent.
+# released by publishing `inferlet`.
 
 on:
   workflow_dispatch:
     inputs:
-      package:
-        description: Crate to release
-        required: true
-        type: choice
-        options: [client, inferlet, inferlet-macros]
       dry_run:
         description: Build and verify, do not publish
         type: boolean
@@ -19,13 +16,16 @@ on:
 permissions:
   contents: read
 
+env:
+  PACKAGES: -p pie-dtype -p pie-eta-ir -p pie-eta-dsl -p inferlet-macros -p inferlet -p pie-client-api -p pie-client
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p ${{ inputs.package }}
-      - run: cargo publish -p ${{ inputs.package }} ${{ inputs.dry_run && '--dry-run' || '' }}
+      - run: cargo test $PACKAGES
+      - run: cargo publish $PACKAGES ${{ inputs.dry_run && '--dry-run' || '' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
