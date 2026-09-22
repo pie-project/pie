@@ -105,6 +105,57 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     state_score[dst] = score[src];
 }
 
+//#elif defined(PIE_INDEX_BLOCK_MEAN)
+
+@group(0) @binding(0) var<storage, read> key_pages: array<u32>;
+@group(0) @binding(1) var<storage, read_write> out_: array<u32>;
+@group(0) @binding(2) var<storage, read> boundary_pos: array<i32>;
+@group(0) @binding(3) var<storage, read> boundary_req: array<i32>;
+@group(0) @binding(4) var<storage, read> page_indices: array<u32>;
+@group(0) @binding(5) var<storage, read> page_indptr: array<u32>;
+struct Params {
+    head_dim: i32,
+    ratio: i32,
+    page_size: i32,
+    rows: i32,
+}
+@group(0) @binding(6) var<uniform> params: Params;
+
+fn pool_slot(req: i32, pos: i32) -> u32 {
+    let page = page_indices[page_indptr[u32(req)] + u32(pos / params.page_size)];
+    return page * u32(params.page_size) + u32(pos % params.page_size);
+}
+
+fn block_mean(d: i32, bpos: i32, req: i32) -> f32 {
+    var acc = 0.0;
+    for (var i = 0; i < params.ratio; i = i + 1) {
+        let pos = bpos + i - (params.ratio - 1);
+        if (pos < 0) {
+            continue;
+        }
+        let e = pool_slot(req, pos) * u32(params.head_dim) + u32(d);
+        acc = acc + pie_bf16_at(key_pages[e >> 1u], e);
+    }
+    return acc / f32(params.ratio);
+}
+
+@compute @workgroup_size(PIE_GROUP_X, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let d = i32(gid.x) * 2;
+    let c = gid.y;
+    if (d >= params.head_dim || c >= u32(params.rows)) {
+        return;
+    }
+    let bpos = boundary_pos[c];
+    let req = boundary_req[c];
+    let at = (c * u32(params.head_dim) + u32(d)) >> 1u;
+    if (bpos < 0) {
+        out_[at] = 0u;
+        return;
+    }
+    out_[at] = pie_pack_bf16(block_mean(d, bpos, req), block_mean(d + 1, bpos, req));
+}
+
 //#elif defined(PIE_POOL_GATHER)
 
 @group(0) @binding(0) var<storage, read> state_kv: array<u32>;
@@ -392,6 +443,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
 // pie:instantiate pool_boundary_prefill PIE_POOL_BOUNDARY=1 PIE_PREFILL=1 PIE_GROUP_X=128
 // pie:instantiate pool_state_write_bf16 PIE_POOL_STATE_WRITE=1 PIE_GROUP_X=256
 // pie:instantiate pool_gather_paged_bf16 PIE_POOL_GATHER=1 PIE_GROUP_X=256
+// pie:instantiate index_block_mean_paged_bf16 PIE_INDEX_BLOCK_MEAN=1 PIE_GROUP_X=256
 // pie:instantiate pool_store_entries_bf16 PIE_POOL_STORE=1 PIE_GROUP_X=256
 // pie:instantiate pool_lse_paged PIE_GROUP_X=128
 // pie:instantiate pool_lse_selected_paged PIE_SELECTED=1 PIE_GROUP_X=128

@@ -27,6 +27,10 @@ fn pie_word_at(base: u32, lane: u32, i: u32) -> u32 {
 
 @group(0) @binding(11) var<storage, read_write> lse_out: array<f32>;
 //#endif
+//#if defined(PIE_SELECTED)
+
+@group(0) @binding(10) var<storage, read> selection: array<i32>;
+//#endif
 
 struct Params {
     gqa_factor: i32,
@@ -38,9 +42,15 @@ struct Params {
 //#if defined(PIE_TILED)
     n_rows: i32,
 //#endif
+//#if defined(PIE_SELECTED)
+    top_k: i32,
+    ratio: i32,
+//#endif
 }
 //#if defined(PIE_LSE)
 @group(0) @binding(12) var<uniform> params: Params;
+//#elif defined(PIE_SELECTED)
+@group(0) @binding(11) var<uniform> params: Params;
 //#else
 @group(0) @binding(10) var<uniform> params: Params;
 //#endif
@@ -139,6 +149,12 @@ fn main(
         }
 //#if defined(PIE_TILED)
         pie_steps = last + 1;
+//#elif defined(PIE_SELECTED)
+        // A block count, not a cell count: `top_k` names blocks under the
+        // unified `index_topk` contract, and the open block adds ratio - 1.
+        let nblocks = (last + 1) / params.ratio;
+        let count = min(params.top_k, nblocks) * params.ratio + (params.ratio - 1);
+        pie_steps = (count + PIE_ROWS - 1) / PIE_ROWS;
 //#else
 
         let count = max(min(last, hi) - lo + 1, 0);
@@ -176,10 +192,27 @@ fn main(
     for (var j = 0; j < steps; j++) {
 //#if defined(PIE_TILED)
         let kp = j;
+//#elif defined(PIE_SELECTED)
+        let n = i32(slot) + j * PIE_ROWS;
+        let nblocks = (q_pos + 1) / params.ratio;
+        let sel_end = min(params.top_k, nblocks) * params.ratio;
+        var kp = -1;
+        if (n < sel_end) {
+            let c = selection[row * u32(params.top_k) + u32(n / params.ratio)];
+            if (c >= 0 && c < nblocks) {
+                kp = c * params.ratio + (n % params.ratio);
+            }
+        } else {
+            kp = nblocks * params.ratio + (n - sel_end);
+        }
 //#else
         let kp = lo + i32(slot) + j * PIE_ROWS;
 //#endif
+//#if defined(PIE_SELECTED)
+        let take = live && kp >= 0 && keeps(row, kp, q_pos, start);
+//#else
         let take = live && kp <= hi && keeps(row, kp, q_pos, start);
+//#endif
         var base = 0u;
         var partial = 0.0;
         if (take) {
@@ -275,6 +308,10 @@ fn main(
 //#endif
 }
 
+// pie:instantiate sdpa_paged_selected_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=16 PIE_SELECTED=1
+// pie:instantiate sdpa_paged_selected_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=16 PIE_SELECTED=1
+// pie:instantiate sdpa_paged_selected_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=16 PIE_SELECTED=1
+// pie:instantiate sdpa_paged_selected_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_LANES=16 PIE_ROWS=16 PIE_SELECTED=1
 // pie:instantiate sdpa_paged_decode_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_LANES=16 PIE_ROWS=16
 // pie:instantiate sdpa_paged_decode_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_LANES=16 PIE_ROWS=16
 // pie:instantiate sdpa_paged_decode_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_LANES=16 PIE_ROWS=16

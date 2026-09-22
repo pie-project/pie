@@ -9,6 +9,8 @@ const FILE: &str = "attn/index.cuh";
 
 const K_BLOCK: u32 = 256;
 
+const POOL_BLOCK: u32 = 256;
+
 #[must_use]
 fn q_rope_block(n_heads: i32) -> u32 {
     (n_heads.unsigned_abs().div_ceil(32) * 32).max(32)
@@ -126,11 +128,57 @@ pub fn kv_append(
     )
 }
 
+pub fn block_mean(
+    ctx: &Ctx,
+    boundary_pos: Tensor,
+    boundary_req: Tensor,
+    keys: &KvPool,
+    head_dim: u32,
+    ratio: u32,
+    entries: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.index_block_mean";
+    dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
+    debug_assert!(
+        boundary_pos.dtype == Dtype::I32 && boundary_req.dtype == Dtype::I32,
+        "`{OP}` reads the i32 block tables `attention.pool_boundary_*` published"
+    );
+    let head_dim = count(OP, "the key width this mean states", head_dim)?;
+    pool_pitch(OP, keys, head_dim)?;
+    if stated(OP, entries.width)? != head_dim {
+        return Err(refuse(
+            OP,
+            "the stated head width is not the entry this mean sized",
+        ));
+    }
+    let ratio = count(OP, "the block width this mean pools over", ratio)?;
+    let rows = count(OP, "rows", boundary_pos.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at("attn/pool.cuh", "::pie::attn::index_block_mean_paged<::pie::bf16>")
+            .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
+        &[
+            keys.keys.arg(),
+            entries.arg(),
+            boundary_pos.arg(),
+            boundary_req.arg(),
+            keys.page_indices.arg(),
+            keys.page_indptr.arg(),
+            head_dim.arg(),
+            ratio.arg(),
+            keys.page_size.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    let _ = rows;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn topk(
     ctx: &Ctx,
     q: RaggedTensor,
-    weights: Tensor,
+    weights: Option<Tensor>,
     keys: &KvPool,
     heads: u32,
     head_dim: u32,
@@ -156,7 +204,9 @@ pub fn topk(
             ),
         ));
     }
-    if stated(OP, weights.width)? != heads {
+    if let Some(w) = weights
+        && stated(OP, w.width)? != heads
+    {
         return Err(refuse(
             OP,
             "the index head weights are not one per stated head",
@@ -189,7 +239,7 @@ pub fn topk(
             .apply(Launch::per_row(selection.rows, K_BLOCK)),
         &[
             q.data.arg(),
-            weights.arg(),
+            ArgValue::Ptr(weights.map_or(0, |w| w.ptr)),
             keys.keys.arg(),
             q.indptr.arg(),
             keys.page_indices.arg(),

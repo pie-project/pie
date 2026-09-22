@@ -190,16 +190,13 @@ __global__ void index_topk_paged(
 
     const int stride = (ratio > 0) ? ratio : 1;
     const int total = abs_q + 1;
-    int npools = (total > 0) ? total / stride : 0;
-    int tail = (total > 0) ? total - npools * stride : 0;
-    if (tail > topk) tail = topk;
-    const int pool_budget = (topk - tail) / stride;
-    if (npools > score_stride) npools = score_stride;
+    int nkeys = (total > 0) ? total / stride : 0;
+    if (nkeys > score_stride) nkeys = score_stride;
 
     float* frow = scores + static_cast<long long>(t) * score_stride;
     const T* qi = idx_q + static_cast<long long>(t_row) * H * D;
-    const T* wi = idx_w + static_cast<long long>(t_row) * H;
-    for (int j = tid; j < npools; j += kBlock) {
+    const T* wi = (idx_w != nullptr) ? idx_w + static_cast<long long>(t_row) * H : nullptr;
+    for (int j = tid; j < nkeys; j += kBlock) {
         const int cell = (j + 1) * stride - 1;
         const int page =
             static_cast<int>(kv_page_indices[pages_first + cell / page_size]);
@@ -211,25 +208,20 @@ __global__ void index_topk_paged(
             const T* qh = qi + static_cast<long long>(h) * D;
             float dot = 0.f;
             for (int d = 0; d < D; ++d) dot += Elem<T>::to_f32(qh[d]) * Elem<T>::to_f32(kj[d]);
-            acc += fmaxf(dot, 0.f) * Elem<T>::to_f32(wi[h]);
+            acc += fmaxf(dot, 0.f) * (idx_w != nullptr ? Elem<T>::to_f32(wi[h]) : 1.f);
         }
         frow[j] = acc;
     }
     __syncthreads();
 
-    for (int i = tid; i < tail; i += kBlock) srow[i] = npools * stride + i;
-
-    if (npools <= pool_budget) {
-        for (int n = tid; n < topk - tail; n += kBlock) {
-            const int j = n / stride;
-            srow[tail + n] = (j < npools) ? j * stride + (n % stride) : -1;
-        }
+    if (nkeys <= topk) {
+        for (int n = tid; n < topk; n += kBlock) srow[n] = (n < nkeys) ? n : -1;
         return;
     }
 
     __shared__ float red[kBlock];
     float lo_l = pos_inf(), hi_l = -pos_inf();
-    for (int j = tid; j < npools; j += kBlock) {
+    for (int j = tid; j < nkeys; j += kBlock) {
         lo_l = fminf(lo_l, frow[j]);
         hi_l = fmaxf(hi_l, frow[j]);
     }
@@ -249,21 +241,19 @@ __global__ void index_topk_paged(
         if (tid == 0) cnt_s = 0;
         __syncthreads();
         int c = 0;
-        for (int j = tid; j < npools; j += kBlock) if (frow[j] >= mid) c++;
+        for (int j = tid; j < nkeys; j += kBlock) if (frow[j] >= mid) c++;
         atomicAdd(&cnt_s, c);
         __syncthreads();
         const int cnt = cnt_s;
-        if (cnt > pool_budget) lo = mid; else hi = mid;
+        if (cnt > topk) lo = mid; else hi = mid;
         __syncthreads();
         thr = hi;
     }
 
     if (tid == 0) {
-        int n = tail;
-        for (int j = 0; j < npools && n + stride <= topk; ++j) {
-            if (frow[j] >= thr) {
-                for (int i = 0; i < stride; ++i) srow[n++] = j * stride + i;
-            }
+        int n = 0;
+        for (int j = 0; j < nkeys && n < topk; ++j) {
+            if (frow[j] >= thr) srow[n++] = j;
         }
         for (; n < topk; ++n) srow[n] = -1;
     }

@@ -160,6 +160,7 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
     const constant int& topk           [[buffer(13)]],
 
     const constant int& ratio          [[buffer(14)]],
+    const constant int& has_weights    [[buffer(15)]],
     uint3 tgpos     [[threadgroup_position_in_grid]],
     uint3 lid       [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -203,7 +204,7 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
         for (int d = 0; d < D; ++d) {
           dot += float(qh[d]) * float(kj[d]);
         }
-        acc += max(dot, 0.0f) * float(wi[h]);
+        acc += max(dot, 0.0f) * ((has_weights != 0) ? float(wi[h]) : 1.0f);
       }
     }
     const float folded = simd_sum(acc);

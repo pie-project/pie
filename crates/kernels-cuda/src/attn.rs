@@ -14,6 +14,8 @@ pub mod plan;
 
 pub mod pool;
 
+pub mod selected;
+
 pub mod sched;
 
 pub mod sched_decode;

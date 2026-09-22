@@ -1,4 +1,4 @@
-use kernels_cuda::attn::{self, fa2, index, mla, plan, pool};
+use kernels_cuda::attn::{self, fa2, index, mla, plan, pool, selected};
 use kernels_cuda::attn_dense;
 use model_exec::{DispatchAttention, KernelError};
 use model_ir::{Attention, Operands, StructKind};
@@ -214,6 +214,50 @@ impl Run<'_> {
                 *window,
                 *head_dim,
                 *sm_scale,
+                &mut self.tensor(*o),
+            ),
+            Attention::DecodeSelected {
+                q,
+                plan: _,
+                selection,
+                cache,
+                window,
+                head_dim,
+                sm_scale,
+                ratio,
+                o,
+            } => selected::attention_decode_selected(
+                self.ctx(),
+                self.ragged_q(*q),
+                self.tensor(*selection),
+                &self.pool_absolute(*cache),
+                *window,
+                *head_dim,
+                *sm_scale,
+                *ratio,
+                &mut self.tensor(*o),
+            ),
+            Attention::PrefillSelected {
+                q,
+                plan: _,
+                selection,
+                cache,
+                window,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                ratio,
+                o,
+            } => selected::attention_prefill_selected(
+                self.ctx(),
+                self.ragged_q(*q),
+                self.tensor(*selection),
+                &self.pool_absolute(*cache),
+                *window,
+                *head_dim,
+                *kv_heads,
+                *sm_scale,
+                *ratio,
                 &mut self.tensor(*o),
             ),
             Attention::DecodeRel {
@@ -1073,7 +1117,7 @@ impl Run<'_> {
             } => index::topk(
                 self.ctx(),
                 self.ragged_lanes(*q),
-                self.tensor(*weights),
+                weights.map(|w| self.tensor(w)),
                 &self.pool(*keys),
                 *heads,
                 *head_dim,
@@ -1092,6 +1136,22 @@ impl Run<'_> {
                 &self.pool(*keys),
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
+            ),
+            Attention::IndexBlockMean {
+                boundary_pos,
+                boundary_req,
+                keys,
+                head_dim,
+                ratio,
+                entries,
+            } => index::block_mean(
+                self.ctx(),
+                self.tensor(*boundary_pos),
+                self.tensor(*boundary_req),
+                &self.pool(*keys),
+                *head_dim,
+                *ratio,
+                &mut self.tensor(*entries),
             ),
             Attention::PoolBoundaryDecode {
                 positions,

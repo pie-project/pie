@@ -40,6 +40,13 @@ const SDPA_DECODE: [&str; 4] = [
     "sdpa_paged_decode_bfloat16_d_512",
 ];
 
+const SDPA_SELECTED: [&str; 4] = [
+    "sdpa_paged_selected_bfloat16_d_64",
+    "sdpa_paged_selected_bfloat16_d_128",
+    "sdpa_paged_selected_bfloat16_d_256",
+    "sdpa_paged_selected_bfloat16_d_512",
+];
+
 const SDPA_TILED: [&str; 4] = [
     "sdpa_paged_tiled_bfloat16_d_64",
     "sdpa_paged_tiled_bfloat16_d_128",
@@ -416,6 +423,149 @@ fn vector(
             [SDPA_THREADS, 1, 1],
         )),
         &args,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn selected(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    q: Tensor,
+    pool: &KvPool,
+    positions: Tensor,
+    request_of_token: Tensor,
+    mask: Tensor,
+    mask_enabled: Tensor,
+    mask_stride: u32,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    ratio: u32,
+    selection: Tensor,
+    o: Tensor,
+) -> Result<(), Error> {
+    dtype_dispatch!(op, q.dtype, { Bf16 => () });
+    debug_assert!(
+        o.rows == q.rows && o.width == q.width && o.dtype == q.dtype,
+        "the attention lands one output row per query row"
+    );
+    debug_assert_eq!(
+        selection.dtype,
+        Dtype::I32,
+        "`{op}` walks the i32 block ids `attention.index_topk` published"
+    );
+    if window.is_some() {
+        return Err(refuse(
+            op,
+            "a selection and a sliding window are two answers to which keys a row reads",
+        ));
+    }
+    let shape = Paged::of(op, q, pool, None, true, head_dim)?;
+    let ratio = nonzero(op, "the block width this reader expands", ratio)?;
+    let top_k = nonzero(op, "the selection budget", selection.width)?;
+    if selection.rows < shape.rows {
+        return Err(refuse(
+            op,
+            format!(
+                "the selection seats {} rows and this reader launches {}",
+                selection.rows, shape.rows
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at(FILE, SDPA_SELECTED[shape.at]).apply(Grid::of(
+            vector_grid(op, shape.q_heads, shape.rows)?,
+            [SDPA_THREADS, 1, 1],
+        )),
+        &[
+            q.arg(),
+            pool.keys.arg(),
+            pool.values.arg(),
+            o.arg_mut(),
+            stated(op, shape.gqa)?.arg(),
+            positions.arg(),
+            request_of_token.arg(),
+            pool.page_indices.arg(),
+            pool.page_indptr.arg(),
+            pool.page_size.arg(),
+            stated(op, shape.kv_heads)?.arg(),
+            sm_scale.arg(),
+            mask.arg(),
+            mask_stride.arg(),
+            mask_enabled.arg(),
+            shape.window.arg(),
+            ctx.absent()?,
+            selection.arg(),
+            stated(op, top_k)?.arg(),
+            stated(op, ratio)?.arg(),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decode_selected(
+    ctx: &Ctx<'_>,
+    q: Tensor,
+    plan: &DecodePlan,
+    selection: Tensor,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    ratio: u32,
+    o: Tensor,
+) -> Result<(), Error> {
+    selected(
+        ctx,
+        "attention.decode_selected",
+        q,
+        pool,
+        plan.positions,
+        plan.request_of_token,
+        plan.mask,
+        plan.mask_enabled,
+        plan.mask_stride,
+        window,
+        head_dim,
+        sm_scale,
+        ratio,
+        selection,
+        o,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_selected(
+    ctx: &Ctx<'_>,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    selection: Tensor,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    ratio: u32,
+    o: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.prefill_selected";
+    kv_heads_agree(OP, pool, head_dim, kv_heads)?;
+    selected(
+        ctx,
+        OP,
+        q.data,
+        pool,
+        plan.positions,
+        plan.request_of_token,
+        plan.mask,
+        plan.mask_enabled,
+        plan.mask_stride,
+        window,
+        head_dim,
+        sm_scale,
+        ratio,
+        selection,
+        o,
     )
 }
 
@@ -1466,6 +1616,8 @@ pub mod index {
 
     const FILE: &str = "attn/index.metal";
 
+    const FILE_POOL: &str = "attn/pool.metal";
+
     const K_BLOCK: u32 = 256;
 
     const MAX_ROPE_DIM: u32 = 256;
@@ -1595,11 +1747,59 @@ pub mod index {
         super::mla::kv_append(ctx, k, no_rope, keys, write_page, write_offset)
     }
 
+    pub fn block_mean(
+        ctx: &Ctx<'_>,
+        boundary_pos: Tensor,
+        boundary_req: Tensor,
+        keys: &KvPool,
+        head_dim: u32,
+        ratio: u32,
+        entries: Tensor,
+    ) -> Result<(), Error> {
+        const OP: &str = "attention.index_block_mean";
+        let entry =
+            dtype_dispatch!(OP, entries.dtype, { Bf16 => "index_block_mean_paged_bfloat16" });
+        debug_assert!(
+            boundary_pos.dtype == Dtype::I32 && boundary_req.dtype == Dtype::I32,
+            "`{OP}` reads the i32 block tables `attention.pool_boundary_*` published"
+        );
+        if keys.page_size <= 0 {
+            return Err(refuse(OP, "the index cache page size is zero"));
+        }
+        let head_dim = nonzero(OP, "the key width this mean states", head_dim)?;
+        pool_pitch(OP, keys, head_dim)?;
+        if entries.width != head_dim {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the stated head width {head_dim} is not the {}-wide entry it sized",
+                    entries.width
+                ),
+            ));
+        }
+        let ratio = nonzero(OP, "the block width this mean pools over", ratio)?;
+        let rows = nonzero(OP, "rows", boundary_pos.rows)?;
+        ctx.fire(
+            Fire::at(FILE_POOL, entry).apply(Grid::of([head_dim, rows, 1], [head_dim, 1, 1])),
+            &[
+                keys.keys.arg(),
+                entries.arg_mut(),
+                boundary_pos.arg(),
+                boundary_req.arg(),
+                keys.page_indices.arg(),
+                keys.page_indptr.arg(),
+                stated(OP, head_dim)?.arg(),
+                stated(OP, ratio)?.arg(),
+                keys.page_size.arg(),
+            ],
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn topk(
         ctx: &Ctx<'_>,
         q: Tensor,
-        weights: Tensor,
+        weights: Option<Tensor>,
         keys: &KvPool,
         positions: Tensor,
         request_of_token: Tensor,
@@ -1640,7 +1840,7 @@ pub mod index {
                 ),
             ));
         }
-        if weights.width != heads {
+        if weights.is_some_and(|w| w.width != heads) {
             return Err(refuse(
                 OP,
                 "the index head weights are not one per stated head",
@@ -1667,7 +1867,7 @@ pub mod index {
             Fire::at(FILE, entry).apply(Grid::of([K_BLOCK, rows, 1], [K_BLOCK, 1, 1])),
             &[
                 q.arg(),
-                weights.arg(),
+                weights.unwrap_or(q).arg(),
                 keys.keys.arg(),
                 positions.arg(),
                 request_of_token.arg(),
@@ -1681,8 +1881,26 @@ pub mod index {
                 stated(OP, stride)?.arg(),
                 stated(OP, top_k)?.arg(),
                 stated(OP, ratio)?.arg(),
+                i32::from(weights.is_some()).arg(),
             ],
         )
+    }
+
+    /// The KV cells a selection of block ids names, in file order: every complete
+    /// block's `ratio` cells, then the open block that runs to `q_pos`.
+    #[must_use]
+    pub fn selected_block_cells(selection: &[i32], ratio: i32, q_pos: i32) -> Vec<i32> {
+        let j_end = q_pos + 1;
+        let nblocks = if ratio > 0 { j_end / ratio } else { 0 };
+        let mut cells = Vec::new();
+        for &c in selection {
+            if c < 0 || c >= nblocks {
+                continue;
+            }
+            cells.extend((0..ratio).map(|i| c * ratio + i));
+        }
+        cells.extend(nblocks * ratio..j_end);
+        cells
     }
 
     #[must_use]
@@ -1764,6 +1982,119 @@ pub mod index {
             topk_refuses_a_zero_key_stride();
             topk_refuses_the_three_shapes_its_cuda_twin_refuses();
             topk_refuses_a_score_slab_shorter_than_the_launch();
+            topk_takes_a_ranking_with_no_weighting_vector();
+            block_mean_refuses_a_zero_block_width();
+            block_mean_refuses_an_entry_that_is_not_the_stated_head();
+            a_selection_names_its_blocks_cells_and_then_the_open_block();
+            naming_every_block_is_naming_every_cell();
+            a_block_boundary_query_reads_no_open_block();
+            a_selection_drops_its_sentinels_and_anything_past_the_query();
+            the_bisection_publishes_block_ids_ascending_with_a_minus_one_tail();
+        }
+
+        fn topk_takes_a_ranking_with_no_weighting_vector() {
+            let probe = Probe::default();
+            let pool = index_pool();
+            topk(
+                &probe,
+                bf16(1, 4, HEADS * DIM),
+                None,
+                &pool,
+                i32t(9, 4, 1),
+                i32t(10, 4, 1),
+                f32t(3, 4, 4096),
+                HEADS,
+                DIM,
+                TOPK,
+                4,
+                i32t(4, 4, TOPK),
+            )
+            .expect("a checkpoint with no weights_proj ranks by the bare rectified sum");
+            assert_eq!(probe.fires().len(), 1);
+        }
+
+        fn block_mean_refuses_a_zero_block_width() {
+            let probe = Probe::default();
+            let pool = index_pool();
+            let why = block_mean(
+                &probe,
+                i32t(1, 4, 1),
+                i32t(2, 4, 1),
+                &pool,
+                DIM,
+                0,
+                bf16(3, 4, DIM),
+            )
+            .expect_err("a zero block width pools nothing");
+            assert!(format!("{why}").contains("block width"), "{why}");
+            assert!(probe.fires().is_empty());
+        }
+
+        fn block_mean_refuses_an_entry_that_is_not_the_stated_head() {
+            let probe = Probe::default();
+            let pool = index_pool();
+            let why = block_mean(
+                &probe,
+                i32t(1, 4, 1),
+                i32t(2, 4, 1),
+                &pool,
+                DIM,
+                4,
+                bf16(3, 4, DIM / 2),
+            )
+            .expect_err("a half-width entry is not the head the mean states");
+            assert!(format!("{why}").contains("wide entry"), "{why}");
+            assert!(probe.fires().is_empty());
+        }
+
+        fn a_selection_names_its_blocks_cells_and_then_the_open_block() {
+            // q_pos 13 closes three blocks; the open one is [12, 14).
+            assert_eq!(
+                selected_block_cells(&[0, 2, -1, -1], 4, 13),
+                vec![0, 1, 2, 3, 8, 9, 10, 11, 12, 13],
+            );
+        }
+
+        fn naming_every_block_is_naming_every_cell() {
+            // The identity the whole design rests on: below the budget the
+            // selection covers every complete block, and block cells plus the
+            // open block are exactly the causal prefix.
+            for q_pos in 0..40 {
+                let blocks: Vec<i32> = (0..(q_pos + 1) / 4).collect();
+                assert_eq!(
+                    selected_block_cells(&blocks, 4, q_pos),
+                    (0..=q_pos).collect::<Vec<i32>>(),
+                    "q_pos {q_pos}"
+                );
+            }
+        }
+
+        fn a_block_boundary_query_reads_no_open_block() {
+            // q_pos 11 closes block 2, so the query's own token competes in the
+            // ranking like any other and the open block is empty.
+            assert_eq!(selected_block_cells(&[2], 4, 11), vec![8, 9, 10, 11]);
+            assert_eq!(selected_block_cells(&[], 4, 11), Vec::<i32>::new());
+        }
+
+        fn a_selection_drops_its_sentinels_and_anything_past_the_query() {
+            // -1 pads and a block the query cannot see yet are both dropped, and
+            // what survives is strictly ascending and duplicate-free.
+            let cells = selected_block_cells(&[-1, 0, 9, -1], 4, 13);
+            assert_eq!(cells, vec![0, 1, 2, 3, 12, 13]);
+            assert!(cells.windows(2).all(|w| w[0] < w[1]));
+        }
+
+        fn the_bisection_publishes_block_ids_ascending_with_a_minus_one_tail() {
+            // `blocks = min(top_k, nblocks)` is a legal work bound only because
+            // the ids come out ascending with every -1 at the end.
+            let scores = [0.5f32, 9.0, -2.0, 3.5, 3.5, 0.0, 7.0, 1.0];
+            for topk in 1..=scores.len() {
+                let sel = bisect_select(&scores, topk);
+                assert_eq!(sel.len(), topk);
+                let live: Vec<i32> = sel.iter().copied().take_while(|c| *c >= 0).collect();
+                assert!(live.windows(2).all(|w| w[0] < w[1]), "{sel:?}");
+                assert!(sel[live.len()..].iter().all(|c| *c == -1), "{sel:?}");
+            }
         }
 
         fn kv_append_refuses_a_pool_that_is_not_one_row_per_token() {
@@ -1784,7 +2115,7 @@ pub mod index {
             let why = topk(
                 &probe,
                 bf16(1, 1, HEADS * DIM),
-                bf16(2, 1, HEADS),
+                Some(bf16(2, 1, HEADS)),
                 &pool,
                 i32t(9, 1, 1),
                 i32t(10, 1, 1),
@@ -1806,7 +2137,7 @@ pub mod index {
             let bad_q = topk(
                 &probe,
                 bf16(1, 1, HEADS * DIM + 8),
-                bf16(2, 1, HEADS),
+                Some(bf16(2, 1, HEADS)),
                 &pool,
                 i32t(9, 1, 1),
                 i32t(10, 1, 1),
@@ -1823,7 +2154,7 @@ pub mod index {
             let bad_w = topk(
                 &probe,
                 bf16(1, 1, HEADS * DIM),
-                bf16(2, 1, HEADS - 1),
+                Some(bf16(2, 1, HEADS - 1)),
                 &pool,
                 i32t(9, 1, 1),
                 i32t(10, 1, 1),
@@ -1843,7 +2174,7 @@ pub mod index {
             let bad_sel = topk(
                 &probe,
                 bf16(1, 1, HEADS * DIM),
-                bf16(2, 1, HEADS),
+                Some(bf16(2, 1, HEADS)),
                 &pool,
                 i32t(9, 1, 1),
                 i32t(10, 1, 1),
@@ -1869,7 +2200,7 @@ pub mod index {
             let why = topk(
                 &probe,
                 bf16(1, 8, HEADS * DIM),
-                bf16(2, 8, HEADS),
+                Some(bf16(2, 8, HEADS)),
                 &pool,
                 i32t(9, 8, 1),
                 i32t(10, 8, 1),

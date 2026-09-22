@@ -212,6 +212,49 @@ template <typename T>
 instantiate_pool_store_entries(bfloat16, bfloat)
 
 
+template <typename T>
+[[kernel]] void index_block_mean_paged(
+    const device T* key_pages      [[buffer(0)]],
+    device T* out                  [[buffer(1)]],
+    const device int* boundary_pos [[buffer(2)]],
+    const device int* boundary_req [[buffer(3)]],
+    const device uint* page_indices[[buffer(4)]],
+    const device uint* page_indptr [[buffer(5)]],
+    const constant int& head_dim   [[buffer(6)]],
+    const constant int& ratio      [[buffer(7)]],
+    const constant int& page_size  [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  const int d = int(gid.x);
+  const int c = int(gid.y);
+  if (d >= head_dim) return;
+  const int bpos = boundary_pos[c];
+  const int req = boundary_req[c];
+  if (bpos < 0) {
+    out[size_t(c) * size_t(head_dim) + size_t(d)] = T(0);
+    return;
+  }
+  float acc = 0.0f;
+  for (int i = 0; i < ratio; ++i) {
+    const int pos = bpos + i - (ratio - 1);
+    if (pos < 0) continue;
+    const size_t slot =
+        pool_paged_slot(page_indices, page_indptr, req, pos, page_size);
+    acc += float(key_pages[slot * size_t(head_dim) + size_t(d)]);
+  }
+  out[size_t(c) * size_t(head_dim) + size_t(d)] = T(acc / float(ratio));
+}
+
+#define instantiate_index_block_mean_paged(name, itype)                  \
+  template [[host_name("index_block_mean_paged_" #name)]]                \
+  [[kernel]] void index_block_mean_paged<itype>(                         \
+      const device itype*, device itype*, const device int*,             \
+      const device int*, const device uint*, const device uint*,         \
+      const constant int&, const constant int&, const constant int&,     \
+      uint2);
+
+instantiate_index_block_mean_paged(bfloat16, bfloat)
+
+
 constant int POOL_ATTN_BLOCK = 128;
 
 constant int POOL_HEAD_MAX = 512;

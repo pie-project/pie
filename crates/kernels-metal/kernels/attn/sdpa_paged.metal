@@ -35,7 +35,8 @@ template <
     bool WITH_LSE,
     int PAGE_SIZE,
     bool FAST_FULL,
-    int BN>
+    int BN,
+    bool SELECTED = false>
 inline void sdpa_paged_decode_body(
     const device T* queries,
     const device T* k_pages,
@@ -60,6 +61,9 @@ inline void sdpa_paged_decode_body(
     threadgroup float* sum_exp_scores,
     threadgroup float* factors,
     threadgroup float* final_sum,
+    const device int* selection,
+    const int top_k,
+    const int ratio,
     uint3 tid,
     uint3 tpg,
     uint simd_gid,
@@ -67,6 +71,9 @@ inline void sdpa_paged_decode_body(
   static_assert(
       !(WITH_SINK && WITH_LSE),
       "a folded sink and a published lse are two readings of one denominator");
+  static_assert(
+      !(SELECTED && (WITH_SINK || WITH_LSE)),
+      "the selected reader publishes neither a sink nor an lse");
   constexpr int BD = 32;
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = V / BD;
@@ -138,7 +145,34 @@ inline void sdpa_paged_decode_body(
   const int first_page = kv_start / stride;
   const int last_page = last_kp / stride;
 
-  if (last_page - first_page + 1 >= BN) {
+  if constexpr (SELECTED) {
+    // `attends` reads the user mask only: the dense walks take causality from
+    // `last_kp`, which this one replaces, so it carries its own guards. A block
+    // below `nblocks` holds only cells below `nblocks * ratio <= q_pos + 1`, so
+    // rejecting the block is the whole causal test. `index_topk` names blocks
+    // ascending and pads with -1, which is what bounds the walk at `blocks`.
+    const int j_end = q_pos + 1;
+    const int nblocks = j_end / ratio;
+    const int blocks = min(top_k, nblocks);
+    const device int* srow = selection + size_t(row) * size_t(top_k);
+    const int steps = blocks * ratio;
+    for (int n = int(simd_gid); n < steps; n += BN) {
+      const int c = srow[n / ratio];
+      if (c < 0 || c >= nblocks) continue;
+      const int kp = c * ratio + (n % ratio);
+      const size_t slot =
+          size_t(kv_page_indices[page_base + kp / stride]) * stride +
+          size_t(kp % stride);
+      if (attends(kp)) absorb(slot);
+    }
+    // The open block the selection cannot name: its cells are never complete.
+    for (int kp = nblocks * ratio + int(simd_gid); kp < j_end; kp += BN) {
+      const size_t slot =
+          size_t(kv_page_indices[page_base + kp / stride]) * stride +
+          size_t(kp % stride);
+      if (attends(kp)) absorb(slot);
+    }
+  } else if (last_page - first_page + 1 >= BN) {
     for (int pix = first_page + simd_gid; pix <= last_page; pix += BN) {
       const size_t base = size_t(kv_page_indices[page_base + pix]) * stride;
       const int lo = max(kv_start, pix * stride);
@@ -286,7 +320,47 @@ template <
       kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
       sinks, nullptr, outputs, max_scores, sum_exp_scores, factors,
-      final_sum, tid, tpg, simd_gid, simd_lid);
+      final_sum, nullptr, 0, 1, tid, tpg, simd_gid, simd_lid);
+}
+
+template <typename T, int D, int V = D>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_selected(
+    const device T* queries     [[buffer(0)]],
+    const device T* k_pages     [[buffer(1)]],
+    const device T* v_pages     [[buffer(2)]],
+    device T* out               [[buffer(3)]],
+    const constant int& gqa_factor          [[buffer(4)]],
+    const device int* position_ids          [[buffer(5)]],
+    const device int* req_of_token          [[buffer(6)]],
+    const device uint* kv_page_indices      [[buffer(7)]],
+    const device uint* kv_page_indptr       [[buffer(8)]],
+    const constant int& page_size           [[buffer(9)]],
+    const constant int& n_kv_heads          [[buffer(10)]],
+    const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],
+    const device uint& attention_mask_stride[[buffer(13)]],
+    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const constant int& window                 [[buffer(15)]],
+    const device T* sinks                      [[buffer(16)]],
+    const device int* selection                [[buffer(17)]],
+    const constant int& top_k                  [[buffer(18)]],
+    const constant int& ratio                  [[buffer(19)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tpg       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  constexpr int BN = 32;
+  threadgroup float outputs[sdpa_decode_outputs<BN>()];
+  threadgroup float max_scores[BN];
+  threadgroup float sum_exp_scores[BN];
+  threadgroup float factors[BN];
+  threadgroup float final_sum[1];
+  sdpa_paged_decode_body<T, D, V, false, false, 0, false, BN, true>(
+      queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
+      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      attention_mask, attention_mask_stride, attention_mask_enabled, window,
+      sinks, nullptr, outputs, max_scores, sum_exp_scores, factors, final_sum,
+      selection, top_k, ratio, tid, tpg, simd_gid, simd_lid);
 }
 
 template <typename T, int D, int V = D>
@@ -323,8 +397,8 @@ template <typename T, int D, int V = D>
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
       kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
-      sinks, lse, outputs, max_scores, sum_exp_scores, factors, final_sum, tid,
-      tpg, simd_gid, simd_lid);
+      sinks, lse, outputs, max_scores, sum_exp_scores, factors, final_sum,
+      nullptr, 0, 1, tid, tpg, simd_gid, simd_lid);
 }
 
 constant constexpr int kSdpaQT = 32;
@@ -751,6 +825,22 @@ instantiate_sdpa_paged(bfloat16, bfloat, 512, 512)
 instantiate_sdpa_paged(bfloat16, bfloat, 128, 128)
 instantiate_sdpa_paged(bfloat16, bfloat, 64, 64)
 instantiate_sdpa_paged_sink(bfloat16, bfloat, 64, 64)
+
+#define instantiate_sdpa_paged_selected(name, itype, d, v)                 \
+  template [[host_name("sdpa_paged_selected_" #name "_d_" #d)]]            \
+  [[kernel]] void sdpa_paged_selected<itype, d, v>(                        \
+      const device itype*, const device itype*, const device itype*,       \
+      device itype*, const constant int&, const device int*,               \
+      const device int*, const device uint*, const device uint*,           \
+      const constant int&, const constant int&, const constant float&,     \
+      const device uchar*, const device uint&, const device uchar*,        \
+      const constant int&, const device itype*, const device int*,         \
+      const constant int&, const constant int&, uint3, uint3, uint, uint);
+
+instantiate_sdpa_paged_selected(bfloat16, bfloat, 256, 256)
+instantiate_sdpa_paged_selected(bfloat16, bfloat, 512, 512)
+instantiate_sdpa_paged_selected(bfloat16, bfloat, 128, 128)
+instantiate_sdpa_paged_selected(bfloat16, bfloat, 64, 64)
 
 #define instantiate_sdpa_paged_lse(name, itype, d, v)                      \
   template [[host_name("sdpa_paged_decode_lse_" #name "_d_" #d)]]          \

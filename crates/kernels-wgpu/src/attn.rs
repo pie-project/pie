@@ -200,6 +200,13 @@ const SDPA_TILED_LSE: [&str; 4] = [
     "sdpa_paged_tiled_lse_bfloat16_d_512",
 ];
 
+const SDPA_SELECTED: [&str; 4] = [
+    "sdpa_paged_selected_bfloat16_d_64",
+    "sdpa_paged_selected_bfloat16_d_128",
+    "sdpa_paged_selected_bfloat16_d_256",
+    "sdpa_paged_selected_bfloat16_d_512",
+];
+
 const SDPA_SPLIT: [&str; 4] = [
     "sdpa_paged_split_bfloat16_d_64",
     "sdpa_paged_split_bfloat16_d_128",
@@ -559,6 +566,144 @@ pub(crate) fn vector(
             .groups([shape.q_heads, shape.rows, 1])
             .group([SDPA_LANES, SDPA_TILE, 1]),
         &args,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn selected(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    q: Tensor,
+    pool: &KvPool,
+    positions: Tensor,
+    request_of_token: Tensor,
+    mask: Tensor,
+    mask_enabled: Tensor,
+    mask_stride: u32,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    ratio: u32,
+    selection: Tensor,
+    o: Tensor,
+) -> Result<(), Error> {
+    dtype_dispatch!(op, q.dtype, { Bf16 => () });
+    debug_assert!(
+        o.rows == q.rows && o.width == q.width && o.dtype == q.dtype,
+        "the attention lands one output row per query row"
+    );
+    debug_assert_eq!(
+        selection.dtype,
+        Dtype::I32,
+        "`{op}` walks the i32 block ids `attention.index_topk` published"
+    );
+    if window.is_some() {
+        return Err(refuse(
+            op,
+            "a selection and a sliding window are two answers to which keys a row reads",
+        ));
+    }
+    let shape = Paged::of(op, q, pool, None, head_dim)?;
+    let ratio = nonzero(op, "the block width this reader expands", ratio)?;
+    let top_k = nonzero(op, "the selection budget", selection.width)?;
+    if selection.rows < shape.rows {
+        return Err(refuse(
+            op,
+            format!(
+                "the selection seats {} rows and this reader launches {}",
+                selection.rows, shape.rows
+            ),
+        ));
+    }
+    let mut args = sdpa_args(
+        ctx,
+        op,
+        q,
+        pool,
+        positions,
+        request_of_token,
+        mask,
+        mask_enabled,
+        mask_stride,
+        &shape,
+        sm_scale,
+        o,
+    )?;
+    args.push(selection.arg());
+    args.push(stated(op, top_k)?.arg());
+    args.push(stated(op, ratio)?.arg());
+    ctx.fire(
+        Fire::at(FILE, SDPA_SELECTED[shape.at])
+            .groups([shape.q_heads, shape.rows, 1])
+            .group([SDPA_LANES, SDPA_TILE, 1]),
+        &args,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decode_selected(
+    ctx: &Ctx<'_>,
+    q: Tensor,
+    plan: &DecodePlan,
+    selection: Tensor,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    ratio: u32,
+    o: Tensor,
+) -> Result<(), Error> {
+    selected(
+        ctx,
+        "attention.decode_selected",
+        q,
+        pool,
+        plan.positions,
+        plan.request_of_token,
+        plan.mask,
+        plan.mask_enabled,
+        plan.mask_stride,
+        window,
+        head_dim,
+        sm_scale,
+        ratio,
+        selection,
+        o,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_selected(
+    ctx: &Ctx<'_>,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    selection: Tensor,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    ratio: u32,
+    o: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.prefill_selected";
+    kv_heads_agree(OP, pool, head_dim, kv_heads)?;
+    selected(
+        ctx,
+        OP,
+        q.data,
+        pool,
+        plan.positions,
+        plan.request_of_token,
+        plan.mask,
+        plan.mask_enabled,
+        plan.mask_stride,
+        window,
+        head_dim,
+        sm_scale,
+        ratio,
+        selection,
+        o,
     )
 }
 
@@ -1487,6 +1632,10 @@ pub mod index {
 
     const FILE: &str = "attn/index.wgsl";
 
+    const FILE_POOL: &str = "attn/pool.wgsl";
+
+    const POOL_GROUP: u32 = 256;
+
     const K_BLOCK: u32 = 256;
 
     const Q_ROPE_GROUP: u32 = 32;
@@ -1610,10 +1759,61 @@ pub mod index {
         super::mla::kv_append(ctx, k, no_rope, keys, write_page, write_offset)
     }
 
+    pub fn block_mean(
+        ctx: &Ctx<'_>,
+        boundary_pos: Tensor,
+        boundary_req: Tensor,
+        keys: &KvPool,
+        head_dim: u32,
+        ratio: u32,
+        entries: Tensor,
+    ) -> Result<(), Error> {
+        const OP: &str = "attention.index_block_mean";
+        let entry = dtype_dispatch!(OP, entries.dtype, { Bf16 => "index_block_mean_paged_bf16" });
+        debug_assert!(
+            boundary_pos.dtype == Dtype::I32 && boundary_req.dtype == Dtype::I32,
+            "`{OP}` reads the i32 block tables `attention.pool_boundary_*` published"
+        );
+        if keys.page_size <= 0 {
+            return Err(refuse(OP, "the index cache page size is zero"));
+        }
+        let head_dim = nonzero(OP, "the key width this mean states", head_dim)?;
+        super::even_lanes(OP, "index key", head_dim)?;
+        pool_pitch(OP, keys, head_dim)?;
+        if entries.width != head_dim {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the stated head width {head_dim} is not the {}-wide entry it sized",
+                    entries.width
+                ),
+            ));
+        }
+        let ratio = nonzero(OP, "the block width this mean pools over", ratio)?;
+        let rows = nonzero(OP, "rows", boundary_pos.rows)?;
+        ctx.fire(
+            Fire::at(FILE_POOL, entry)
+                .groups([head_dim.div_ceil(2), rows, 1])
+                .group([POOL_GROUP, 1, 1]),
+            &[
+                keys.keys.arg(),
+                entries.arg_mut(),
+                boundary_pos.arg(),
+                boundary_req.arg(),
+                keys.page_indices.arg(),
+                keys.page_indptr.arg(),
+                stated(OP, head_dim)?.arg(),
+                stated(OP, ratio)?.arg(),
+                keys.page_size.arg(),
+                stated(OP, rows)?.arg(),
+            ],
+        )
+    }
+
     pub fn topk(
         ctx: &Ctx<'_>,
         q: Tensor,
-        weights: Tensor,
+        weights: Option<Tensor>,
         keys: &KvPool,
         positions: Tensor,
         request_of_token: Tensor,
@@ -1654,7 +1854,7 @@ pub mod index {
                 ),
             ));
         }
-        if weights.width != heads {
+        if weights.is_some_and(|w| w.width != heads) {
             return Err(refuse(
                 OP,
                 "the index head weights are not one per stated head",
@@ -1681,7 +1881,7 @@ pub mod index {
             Fire::at(FILE, entry).apply(Grid::of([K_BLOCK * rows, 1, 1], [K_BLOCK, 1, 1])),
             &[
                 q.arg(),
-                weights.arg(),
+                weights.unwrap_or(q).arg(),
                 keys.keys.arg(),
                 positions.arg(),
                 request_of_token.arg(),
@@ -1695,8 +1895,26 @@ pub mod index {
                 stated(OP, stride)?.arg(),
                 stated(OP, top_k)?.arg(),
                 stated(OP, ratio)?.arg(),
+                i32::from(weights.is_some()).arg(),
             ],
         )
+    }
+
+    /// The KV cells a selection of block ids names, in file order: every complete
+    /// block's `ratio` cells, then the open block that runs to `q_pos`.
+    #[must_use]
+    pub fn selected_block_cells(selection: &[i32], ratio: i32, q_pos: i32) -> Vec<i32> {
+        let j_end = q_pos + 1;
+        let nblocks = if ratio > 0 { j_end / ratio } else { 0 };
+        let mut cells = Vec::new();
+        for &c in selection {
+            if c < 0 || c >= nblocks {
+                continue;
+            }
+            cells.extend((0..ratio).map(|i| c * ratio + i));
+        }
+        cells.extend(nblocks * ratio..j_end);
+        cells
     }
 
     #[must_use]
