@@ -8,6 +8,12 @@ constant constexpr int kIndexSimds = kIndexBlock / 32;
 
 constant constexpr int kMaxRopeDim = 256;
 
+// `index_topk`'s scorer for a handful of heads: lanes that share one key, and
+// the widest key it holds a register slice of.
+constant constexpr int kSmallHeads = 4;
+constant constexpr int kSmallLanes = 8;
+constant constexpr int kSmallMaxDim = 128;
+
 
 inline float index_tg_sum(float v, threadgroup float* partials,
                           threadgroup float* bcast, uint simd_lane,
@@ -171,6 +177,8 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
 
   threadgroup float partials[kIndexSimds];
   threadgroup float bcast[1];
+  threadgroup int sg_count[kIndexSimds];
+  threadgroup float key_partials[kIndexSimds];
 
   const int r = req_of_token[t];
   const int pages_first = int(kv_page_indptr[r]);
@@ -179,54 +187,116 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
   if (nkeys > score_stride) nkeys = score_stride;
   if (nkeys < 0) nkeys = 0;
 
-  device float* frow = scores + size_t(t) * size_t(score_stride);
-  const device bfloat* qi = idx_q + size_t(t) * size_t(H) * size_t(D);
-  const device bfloat* wi = idx_w + size_t(t) * size_t(H);
-
-  constexpr int kLanesPerKey = 64;
-  constexpr int kKeysPerPass = kIndexBlock / kLanesPerKey;
-  constexpr int kSimdsPerKey = kLanesPerKey / 32;
-  threadgroup float key_partials[kIndexSimds];
-  const int slot = tid / kLanesPerKey;
-  const int hh = tid % kLanesPerKey;
-  for (int j0 = 0; j0 < nkeys; j0 += kKeysPerPass) {
-    const int j = j0 + slot;
-    float acc = 0.0f;
-    if (j < nkeys) {
-      const int cell = (j + 1) * stride - 1;
-      const int page = int(kv_page_indices[pages_first + cell / page_size]);
-      const int off = cell % page_size;
-      const device bfloat* kj =
-          key_pages + (size_t(page) * size_t(page_size) + size_t(off)) * size_t(D);
-      for (int h = hh; h < H; h += kLanesPerKey) {
-        const device bfloat* qh = qi + size_t(h) * size_t(D);
-        float dot = 0.0f;
-        for (int d = 0; d < D; ++d) {
-          dot += float(qh[d]) * float(kj[d]);
-        }
-        acc += max(dot, 0.0f) * ((has_weights != 0) ? float(wi[h]) : 1.0f);
-      }
-    }
-    const float folded = simd_sum(acc);
-    if (simd_lane == 0) key_partials[simd_group] = folded;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < kKeysPerPass && j0 + tid < nkeys) {
-      float total = 0.0f;
-      for (int g = 0; g < kSimdsPerKey; ++g) {
-        total += key_partials[tid * kSimdsPerKey + g];
-      }
-      frow[j0 + tid] = total;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-
+  // Every complete block is named, so there is nothing to rank and nothing to
+  // score: below the budget this kernel is only the identity selection.
   if (nkeys <= topk) {
     for (int n = tid; n < topk; n += kIndexBlock) {
       srow[n] = (n < nkeys) ? n : -1;
     }
     return;
   }
+
+  device float* frow = scores + size_t(t) * size_t(score_stride);
+  const device bfloat* qi = idx_q + size_t(t) * size_t(H) * size_t(D);
+  const device bfloat* wi = idx_w + size_t(t) * size_t(H);
+
+  if (H <= kSmallHeads && D % (2 * kSmallLanes) == 0 && D <= kSmallMaxDim) {
+    // A few heads cannot fill the lane-per-head layout below: at 4 heads, 60
+    // of its 64 lanes idle and each of the others walks a whole dot product
+    // alone. Here `kSmallLanes` lanes share one key, each holding a slice of
+    // the width for every head, and fold the slices with shuffles.
+    constexpr int kSlice = kSmallMaxDim / kSmallLanes;
+    constexpr int kKeysPerPass = kIndexBlock / kSmallLanes;
+    const int dpl = D / kSmallLanes;
+    const int sub = int(simd_lane) % kSmallLanes;
+    const int slot = tid / kSmallLanes;
+    float qr[kSmallHeads][kSlice];
+    float w[kSmallHeads];
+    for (int h = 0; h < kSmallHeads; ++h) {
+      for (int i = 0; i < kSlice; ++i) {
+        qr[h][i] = (h < H && i < dpl)
+                       ? float(qi[size_t(h) * size_t(D) + size_t(sub * dpl + i)])
+                       : 0.0f;
+      }
+      w[h] = (h < H) ? ((has_weights != 0) ? float(wi[h]) : 1.0f) : 0.0f;
+    }
+    for (int j0 = 0; j0 < nkeys; j0 += kKeysPerPass) {
+      const int j = j0 + slot;
+      float part[kSmallHeads];
+      for (int h = 0; h < kSmallHeads; ++h) part[h] = 0.0f;
+      if (j < nkeys) {
+        const int cell = (j + 1) * stride - 1;
+        const int page = int(kv_page_indices[pages_first + cell / page_size]);
+        const int off = cell % page_size;
+        // Two bf16 a word: `dpl` is even and the row is D-aligned, so the
+        // slice starts on a 4-byte boundary.
+        const device uint* kw = (const device uint*)(
+            key_pages + (size_t(page) * size_t(page_size) + size_t(off)) * size_t(D) +
+            size_t(sub * dpl));
+        for (int i = 0; i < kSlice; i += 2) {
+          if (i < dpl) {
+            const uint bits = kw[i / 2];
+            const float k0 = as_type<float>(bits << 16);
+            const float k1 = as_type<float>(bits & 0xffff0000u);
+            for (int h = 0; h < kSmallHeads; ++h) {
+              part[h] = fma(qr[h][i], k0, fma(qr[h][i + 1], k1, part[h]));
+            }
+          }
+        }
+      }
+      // Every lane folds, the tail's idle ones with zeros: a shuffle wants
+      // the whole simdgroup.
+      for (int h = 0; h < kSmallHeads; ++h) {
+        for (int m = 1; m < kSmallLanes; m <<= 1) {
+          part[h] += simd_shuffle_xor(part[h], ushort(m));
+        }
+      }
+      if (j < nkeys && sub == 0) {
+        float acc = 0.0f;
+        for (int h = 0; h < kSmallHeads; ++h) {
+          acc += max(part[h], 0.0f) * w[h];
+        }
+        frow[j] = acc;
+      }
+    }
+  } else {
+    constexpr int kLanesPerKey = 64;
+    constexpr int kKeysPerPass = kIndexBlock / kLanesPerKey;
+    constexpr int kSimdsPerKey = kLanesPerKey / 32;
+    const int slot = tid / kLanesPerKey;
+    const int hh = tid % kLanesPerKey;
+    for (int j0 = 0; j0 < nkeys; j0 += kKeysPerPass) {
+      const int j = j0 + slot;
+      float acc = 0.0f;
+      if (j < nkeys) {
+        const int cell = (j + 1) * stride - 1;
+        const int page = int(kv_page_indices[pages_first + cell / page_size]);
+        const int off = cell % page_size;
+        const device bfloat* kj =
+            key_pages + (size_t(page) * size_t(page_size) + size_t(off)) * size_t(D);
+        for (int h = hh; h < H; h += kLanesPerKey) {
+          const device bfloat* qh = qi + size_t(h) * size_t(D);
+          float dot = 0.0f;
+          for (int d = 0; d < D; ++d) {
+            dot += float(qh[d]) * float(kj[d]);
+          }
+          acc += max(dot, 0.0f) * ((has_weights != 0) ? float(wi[h]) : 1.0f);
+        }
+      }
+      const float folded = simd_sum(acc);
+      if (simd_lane == 0) key_partials[simd_group] = folded;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (tid < kKeysPerPass && j0 + tid < nkeys) {
+        float total = 0.0f;
+        for (int g = 0; g < kSimdsPerKey; ++g) {
+          total += key_partials[tid * kSimdsPerKey + g];
+        }
+        frow[j0 + tid] = total;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
   float lo_l = INFINITY;
   float hi_l = -INFINITY;
@@ -240,6 +310,8 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
   float thr = hi;
   for (int it = 0; it < 40; ++it) {
     const float mid = 0.5f * (lo + hi);
+    // Adjacent floats: `mid` is `lo` or `hi`, and no pass can move either.
+    if (mid <= lo || mid >= hi) break;
     float c = 0.0f;
     for (int j = tid; j < nkeys; j += kIndexBlock) {
       if (frow[j] >= mid) c += 1.0f;
@@ -252,15 +324,36 @@ inline void index_rope_pair(device bfloat* row, int i, int rope_dim, int pos,
       hi = mid;
     }
     thr = hi;
+    // Exactly the budget at or above `hi`: any lower threshold that still
+    // keeps the count within it names the same set.
+    if (cnt == topk) break;
   }
 
-  if (tid == 0) {
-    int n = 0;
-    for (int j = 0; j < nkeys && n < topk; ++j) {
-      if (frow[j] >= thr) srow[n++] = j;
-    }
-    for (; n < topk; ++n) {
-      srow[n] = -1;
-    }
+  // Each thread takes a contiguous run of blocks in order, so an exclusive
+  // prefix of the counts puts every id where one thread walking them all
+  // would have: ascending, and the budget's first when a tie overfills it.
+  const int order = int(simd_group) * 32 + int(simd_lane);
+  const int chunk = (nkeys + kIndexBlock - 1) / kIndexBlock;
+  const int b0 = min(order * chunk, nkeys);
+  const int b1 = min(b0 + chunk, nkeys);
+  int mine = 0;
+  for (int j = b0; j < b1; ++j) {
+    if (frow[j] >= thr) ++mine;
+  }
+  const int before = simd_prefix_exclusive_sum(mine);
+  const int simd_total = simd_sum(mine);
+  if (simd_lane == 0) sg_count[simd_group] = simd_total;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  int n = before;
+  int total = 0;
+  for (int g = 0; g < kIndexSimds; ++g) {
+    if (g < int(simd_group)) n += sg_count[g];
+    total += sg_count[g];
+  }
+  for (int j = b0; j < b1 && n < topk; ++j) {
+    if (frow[j] >= thr) srow[n++] = j;
+  }
+  for (int m = min(total, topk) + tid; m < topk; m += kIndexBlock) {
+    srow[m] = -1;
   }
 }
