@@ -7,20 +7,12 @@
 
 #define PIE_GROUP_X 128
 [[vk::binding(0)]] StructuredBuffer<int> positions;
-#if defined(PIE_PREFILL)
-[[vk::binding(1)]] StructuredBuffer<uint> qo_indptr;
-[[vk::binding(2)]] RWStructuredBuffer<int> out_pos;
-[[vk::binding(3)]] RWStructuredBuffer<int> out_req;
-[[vk::binding(4)]] RWStructuredBuffer<int> out_rope;
-[[vk::binding(5)]] StructuredBuffer<uint8_t> row_valid;
-struct Push { int n; int num_requests; int ratio; };
-#else
 [[vk::binding(1)]] RWStructuredBuffer<int> out_pos;
 [[vk::binding(2)]] RWStructuredBuffer<int> out_req;
 [[vk::binding(3)]] RWStructuredBuffer<int> out_rope;
 [[vk::binding(4)]] StructuredBuffer<uint8_t> row_valid;
+[[vk::binding(5)]] StructuredBuffer<int> req_of_token;
 struct Push { int n; int ratio; };
-#endif
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -32,17 +24,10 @@ void main(uint3 gid : SV_DispatchThreadID) {
     bool is_boundary = valid && (((p + 1) % pc.ratio) == 0);
     out_pos[uint(t)] = is_boundary ? p : -1;
     out_rope[uint(t)] = is_boundary ? (p / pc.ratio) * pc.ratio : 0;
-#if defined(PIE_PREFILL)
-    int lo = 0;
-    int hi = pc.num_requests;
-    while (lo + 1 < hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (int(qo_indptr[uint(mid)]) <= t) lo = mid; else hi = mid;
-    }
-    out_req[uint(t)] = lo;
-#else
-    out_req[uint(t)] = t;
-#endif
+    // The request this row belongs to in the FIRE, because the pages the block
+    // is filed into are the fire's. A row index inside this class's own window
+    // would name whichever request sat at that offset.
+    out_req[uint(t)] = req_of_token[uint(t)];
 }
 
 #elif defined(PIE_POOL_STATE_WRITE)

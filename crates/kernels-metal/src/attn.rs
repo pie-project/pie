@@ -2432,9 +2432,11 @@ pub mod pool {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn boundary_decode(
         ctx: &Ctx<'_>,
         positions: Tensor,
+        request_of_token: Tensor,
         row_valid: Tensor,
         ratio: u32,
         boundary_pos: Tensor,
@@ -2457,6 +2459,7 @@ pub mod pool {
                 n.arg(),
                 ratio.arg(),
                 row_valid.arg(),
+                request_of_token.arg(),
             ],
         )
     }
@@ -2465,6 +2468,7 @@ pub mod pool {
     pub fn boundary_prefill(
         ctx: &Ctx<'_>,
         positions: RaggedTensor,
+        request_of_token: Tensor,
         row_valid: Tensor,
         ratio: u32,
         boundary_pos: Tensor,
@@ -2476,23 +2480,18 @@ pub mod pool {
         boundary_rope_table(OP, &boundary_pos, &boundary_rope);
         let n = stated(OP, nonzero(OP, "rows", boundary_pos.rows)?)?;
         let ratio = stated(OP, nonzero(OP, "the pooling ratio", ratio)?)?;
-        let num_requests = stated(
-            OP,
-            nonzero(OP, "requests", positions.indptr.rows.saturating_sub(1))?,
-        )?;
         ctx.fire(
             Fire::at(FILE, "pool_boundary_prefill")
                 .apply(Grid::of([boundary_pos.rows, 1, 1], [META_BLOCK, 1, 1])),
             &[
                 positions.data.arg(),
-                positions.indptr.arg(),
                 boundary_pos.arg_mut(),
                 boundary_req.arg_mut(),
                 boundary_rope.arg_mut(),
                 n.arg(),
-                num_requests.arg(),
                 ratio.arg(),
                 row_valid.arg(),
+                request_of_token.arg(),
             ],
         )
     }

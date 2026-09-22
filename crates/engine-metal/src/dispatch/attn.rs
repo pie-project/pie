@@ -1181,6 +1181,7 @@ impl Run<'_> {
             } => attn::pool::boundary_decode(
                 self.ctx(),
                 self.tensor(*positions),
+                self.cut_rows(self.bindings().tables.request_of_token),
                 self.tensor(*row_valid),
                 *ratio,
                 self.tensor(*boundary_pos),
@@ -1197,6 +1198,7 @@ impl Run<'_> {
             } => attn::pool::boundary_prefill(
                 self.ctx(),
                 self.ragged(*positions),
+                self.cut_rows(self.bindings().tables.request_of_token),
                 self.tensor(*row_valid),
                 *ratio,
                 self.tensor(*boundary_pos),

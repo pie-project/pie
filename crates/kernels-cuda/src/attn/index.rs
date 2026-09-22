@@ -155,8 +155,11 @@ pub fn block_mean(
     let rows = count(OP, "rows", boundary_pos.rows)?;
     ctx.fire(
         OP,
-        Fire::at("attn/pool.cuh", "::pie::attn::index_block_mean_paged<::pie::bf16>")
-            .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
+        Fire::at(
+            "attn/pool.cuh",
+            "::pie::attn::index_block_mean_paged<::pie::bf16>",
+        )
+        .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
         &[
             keys.keys.arg(),
             entries.arg(),

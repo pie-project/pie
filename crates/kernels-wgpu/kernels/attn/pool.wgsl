@@ -14,30 +14,16 @@ fn byte_at(word: u32, i: u32) -> u32 {
 //#if defined(PIE_POOL_BOUNDARY)
 
 @group(0) @binding(0) var<storage, read> positions: array<i32>;
-//#if defined(PIE_PREFILL)
-@group(0) @binding(1) var<storage, read> qo_indptr: array<u32>;
-@group(0) @binding(2) var<storage, read_write> out_pos: array<i32>;
-@group(0) @binding(3) var<storage, read_write> out_req: array<i32>;
-@group(0) @binding(4) var<storage, read_write> out_rope: array<i32>;
-
-@group(0) @binding(5) var<storage, read> row_valid: array<u32>;
-struct Params {
-    n: i32,
-    num_requests: i32,
-    ratio: i32,
-}
-@group(0) @binding(6) var<uniform> params: Params;
-//#else
 @group(0) @binding(1) var<storage, read_write> out_pos: array<i32>;
 @group(0) @binding(2) var<storage, read_write> out_req: array<i32>;
 @group(0) @binding(3) var<storage, read_write> out_rope: array<i32>;
 @group(0) @binding(4) var<storage, read> row_valid: array<u32>;
+@group(0) @binding(5) var<storage, read> req_of_token: array<i32>;
 struct Params {
     n: i32,
     ratio: i32,
 }
-@group(0) @binding(5) var<uniform> params: Params;
-//#endif
+@group(0) @binding(6) var<uniform> params: Params;
 
 @compute @workgroup_size(PIE_GROUP_X, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -50,24 +36,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let is_boundary = valid && (((p + 1) % params.ratio) == 0);
     out_pos[u32(t)] = select(-1, p, is_boundary);
     out_rope[u32(t)] = select(0, (p / params.ratio) * params.ratio, is_boundary);
-//#if defined(PIE_PREFILL)
-    var lo = 0;
-    var hi = params.num_requests;
-    loop {
-        if (lo + 1 >= hi) {
-            break;
-        }
-        let mid = lo + (hi - lo) / 2;
-        if (i32(qo_indptr[u32(mid)]) <= t) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    out_req[u32(t)] = lo;
-//#else
-    out_req[u32(t)] = t;
-//#endif
+    // The request this row belongs to in the FIRE, because the pages the block
+    // is filed into are the fire's. A row index inside this class's own window
+    // would name whichever request sat at that offset.
+    out_req[u32(t)] = req_of_token[u32(t)];
 }
 
 //#elif defined(PIE_POOL_STATE_WRITE)

@@ -20,6 +20,7 @@ inline size_t pool_paged_slot(
     const constant int& n         [[buffer(4)]],
     const constant int& ratio     [[buffer(5)]],
     const device uchar* row_valid [[buffer(6)]],
+    const device int* req_of_token[[buffer(7)]],
     uint gid [[thread_position_in_grid]]) {
   const int t = int(gid);
   if (t >= n) return;
@@ -27,20 +28,22 @@ inline size_t pool_paged_slot(
   const bool valid = row_valid[t] != 0;
   const bool is_boundary = valid && (((p + 1) % ratio) == 0);
   out_pos[t] = is_boundary ? p : -1;
-  out_req[t] = t;
+  // The request this row belongs to in the FIRE, because the pages the block is
+  // filed into are the fire's. A row index inside this class's own window would
+  // name whichever request sat at that offset.
+  out_req[t] = req_of_token[t];
   out_rope[t] = is_boundary ? (p / ratio) * ratio : 0;
 }
 
 [[kernel]] void pool_boundary_prefill(
     const device int* positions    [[buffer(0)]],
-    const device uint* qo_indptr   [[buffer(1)]],
-    device int* out_pos            [[buffer(2)]],
-    device int* out_req            [[buffer(3)]],
-    device int* out_rope           [[buffer(4)]],
-    const constant int& n          [[buffer(5)]],
-    const constant int& num_requests [[buffer(6)]],
-    const constant int& ratio      [[buffer(7)]],
-    const device uchar* row_valid  [[buffer(8)]],
+    device int* out_pos            [[buffer(1)]],
+    device int* out_req            [[buffer(2)]],
+    device int* out_rope           [[buffer(3)]],
+    const constant int& n          [[buffer(4)]],
+    const constant int& ratio      [[buffer(5)]],
+    const device uchar* row_valid  [[buffer(6)]],
+    const device int* req_of_token [[buffer(7)]],
     uint gid [[thread_position_in_grid]]) {
   const int t = int(gid);
   if (t >= n) return;
@@ -50,17 +53,8 @@ inline size_t pool_paged_slot(
   out_pos[t] = is_boundary ? p : -1;
   out_rope[t] = is_boundary ? (p / ratio) * ratio : 0;
 
-  int lo = 0;
-  int hi = num_requests;
-  while (lo + 1 < hi) {
-    const int mid = lo + (hi - lo) / 2;
-    if (int(qo_indptr[mid]) <= t) {
-      lo = mid;
-    } else {
-      hi = mid;
-    }
-  }
-  out_req[t] = lo;
+  // As above: the fire's request, not this window's row group.
+  out_req[t] = req_of_token[t];
 }
 
 
