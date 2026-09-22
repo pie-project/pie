@@ -942,17 +942,34 @@ pub fn tanh(x: &Value) -> Value {
     x_out
 }
 
-pub fn hadamard(x: &Value) -> Value {
+/// A blockwise Hadamard (butterfly FWHT) over the last dim. `block` is the
+/// power-of-two transform size; each contiguous `block`-vector is turned by the
+/// normalized Sylvester Hadamard matrix. When `signs` is `Some`, its ±1 entries
+/// multiply the activation on load, before the butterfly — the Randomized
+/// Hadamard `H·S`; the sign vector repeats block-wise if it is wider than one
+/// block.
+pub fn hadamard(x: &Value, block: u32, signs: Option<&Value>) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
+    let mut ins: Vec<&Value> = vec![x];
+    if let Some(s) = signs {
+        ins.push(s);
+    }
     r.push(
         Elementwise::Hadamard {
             x: x.id(),
             x_out: x_out.id(),
+            block,
+            signs: signs.map(Value::id),
         },
-        &[x],
+        &ins,
     );
     x_out
+}
+
+/// A pure blockwise Hadamard, with no sign diagonal.
+pub fn hadamard_plain(x: &Value, block: u32) -> Value {
+    hadamard(x, block, None)
 }
 
 pub fn mul(x: &Value, y: &Value) -> Value {

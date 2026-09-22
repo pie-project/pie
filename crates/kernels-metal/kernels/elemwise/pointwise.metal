@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <metal_simdgroup>
 using namespace metal;
 
 
@@ -70,38 +71,160 @@ instantiate_activation(act_tanh, float32, float)
 instantiate_activation(act_gelu_tanh, bfloat16, bfloat)
 instantiate_activation(act_gelu_tanh, float32, float)
 
-// A blockwise-128 Hadamard: the row's last dim is cut into contiguous
-// 128-vectors, and each is multiplied by the normalized 128x128 Sylvester
-// Hadamard matrix H, whose entries are (-1)^popcount(i & j) / sqrt(128). H is
-// symmetric and orthonormal, so H . H = I and the op is its own inverse. One
-// threadgroup owns one 128-block; the block is staged in threadgroup memory
-// before any lane writes, so the transform is safe in place.
-template <typename T>
-[[kernel]] void hadamard_block_128(
-    device T* x  [[buffer(0)]],
-    uint gid     [[threadgroup_position_in_grid]],
-    uint lid     [[thread_position_in_threadgroup]]) {
-  constexpr uint BLOCK = 128u;
-  constexpr float INV_SQRT = 0.08838834764831845f;  // 1 / sqrt(128)
-  threadgroup float tile[BLOCK];
-  const size_t base = size_t(gid) * size_t(BLOCK);
-  tile[lid] = float(x[base + lid]);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float acc = 0.0f;
-  for (uint j = 0u; j < BLOCK; ++j) {
-    const float sign = (popcount(lid & j) & 1u) ? -1.0f : 1.0f;
-    acc += sign * tile[j];
+// A blockwise butterfly FWHT over the last dim. The row is cut into contiguous
+// N-vectors (N a power of two) and each is turned by the normalized Sylvester
+// Hadamard matrix H, whose entries are (-1)^popcount(i & j) / sqrt(N). The
+// standard radix-2 fast Walsh-Hadamard transform pairs each index g with
+// g ^ 2^b at stage b, and its natural (Sylvester) ordering is exactly H, so the
+// pure transform is symmetric and orthonormal: H . H = I.
+//
+// When a sign buffer is bound (signs_width != 0) each element is multiplied by
+// its ±1 sign on load, before the butterfly — this realizes the Randomized
+// Hadamard H·S. Because S and H do not commute, H·S is not self-inverse. The
+// sign vector repeats block-wise: element at flat offset `p` reads
+// signs[p % signs_width].
+//
+// The elements of one N-block are spread across the group's threads in an
+// interleaved layout: register i of thread t holds the block's element
+// (i * THREADS + t). Stages whose stride is below the simd width are exchanged
+// with simd_shuffle_xor; the wide variant exchanges the mid stages (one simd
+// width up to the threadgroup size) through threadgroup memory; the top stages
+// live entirely within a thread's own registers.
+
+// N <= 256: one simdgroup (32 lanes) owns one block, no threadgroup memory.
+template <typename T, int N>
+[[kernel]] void fwht_simd(
+    device T* x                       [[buffer(0)]],
+    const device T* signs             [[buffer(1)]],
+    const constant uint& signs_width  [[buffer(2)]],
+    uint tgid                         [[threadgroup_position_in_grid]],
+    uint lane                         [[thread_position_in_threadgroup]]) {
+  constexpr int NW = 32;
+  constexpr int NE = N / NW;
+  const float scale = 1.0f / sqrt(float(N));
+  const size_t base = size_t(tgid) * size_t(N);
+
+  thread float reg[NE];
+  for (int i = 0; i < NE; ++i) {
+    const uint within = uint(i) * uint(NW) + lane;
+    const size_t p = base + size_t(within);
+    float s = 1.0f;
+    if (signs_width != 0u) {
+      s = float(signs[uint(p % size_t(signs_width))]);
+    }
+    reg[i] = float(x[p]) * s * scale;
   }
-  x[base + lid] = static_cast<T>(acc * INV_SQRT);
+
+  for (uint b = 1u; b < uint(NW); b <<= 1) {
+    for (int i = 0; i < NE; ++i) {
+      const float v = reg[i];
+      const float v2 = simd_shuffle_xor(v, b);
+      reg[i] = ((lane & b) == 0u) ? (v2 + v) : (v2 - v);
+    }
+  }
+
+  for (int step = 1; step < NE; step <<= 1) {
+    for (int j = 0; j < NE; j += 2 * step) {
+      for (int k = 0; k < step; ++k) {
+        const float a = reg[j + k];
+        const float bb = reg[j + k + step];
+        reg[j + k] = a + bb;
+        reg[j + k + step] = a - bb;
+      }
+    }
+  }
+
+  for (int i = 0; i < NE; ++i) {
+    x[base + size_t(uint(i) * uint(NW) + lane)] = static_cast<T>(reg[i]);
+  }
 }
 
-#define instantiate_hadamard_block_128(name, itype)                  \
-  template [[host_name("hadamard_block_128_" #name)]]               \
-  [[kernel]] void hadamard_block_128<itype>(                        \
-      device itype*, uint, uint);
+// N >= 512: one threadgroup (THREADS threads) owns one block; the mid stages go
+// through threadgroup memory.
+template <typename T, int N, int THREADS>
+[[kernel]] void fwht_tg(
+    device T* x                       [[buffer(0)]],
+    const device T* signs             [[buffer(1)]],
+    const constant uint& signs_width  [[buffer(2)]],
+    uint tgid                         [[threadgroup_position_in_grid]],
+    uint tid                          [[thread_position_in_threadgroup]]) {
+  constexpr int NW = 32;
+  constexpr int NE = N / THREADS;
+  const float scale = 1.0f / sqrt(float(N));
+  const size_t base = size_t(tgid) * size_t(N);
+  threadgroup float shmem[N];
 
-instantiate_hadamard_block_128(bfloat16, bfloat)
-instantiate_hadamard_block_128(float32, float)
+  thread float reg[NE];
+  for (int i = 0; i < NE; ++i) {
+    const uint within = uint(i) * uint(THREADS) + tid;
+    const size_t p = base + size_t(within);
+    float s = 1.0f;
+    if (signs_width != 0u) {
+      s = float(signs[uint(p % size_t(signs_width))]);
+    }
+    reg[i] = float(x[p]) * s * scale;
+  }
+
+  for (uint b = 1u; b < uint(NW); b <<= 1) {
+    for (int i = 0; i < NE; ++i) {
+      const float v = reg[i];
+      const float v2 = simd_shuffle_xor(v, b);
+      reg[i] = ((tid & b) == 0u) ? (v2 + v) : (v2 - v);
+    }
+  }
+
+  for (uint b = uint(NW); b < uint(THREADS); b <<= 1) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < NE; ++i) {
+      shmem[uint(i) * uint(THREADS) + tid] = reg[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < NE; ++i) {
+      const uint within = uint(i) * uint(THREADS) + tid;
+      const float partner = shmem[within ^ b];
+      reg[i] = ((tid & b) == 0u) ? (reg[i] + partner) : (partner - reg[i]);
+    }
+  }
+
+  for (int step = 1; step < NE; step <<= 1) {
+    for (int j = 0; j < NE; j += 2 * step) {
+      for (int k = 0; k < step; ++k) {
+        const float a = reg[j + k];
+        const float bb = reg[j + k + step];
+        reg[j + k] = a + bb;
+        reg[j + k + step] = a - bb;
+      }
+    }
+  }
+
+  for (int i = 0; i < NE; ++i) {
+    x[base + size_t(uint(i) * uint(THREADS) + tid)] = static_cast<T>(reg[i]);
+  }
+}
+
+#define instantiate_fwht_simd(name, itype, n)                        \
+  template [[host_name("fwht_simd_" #name "_n_" #n)]]                \
+  [[kernel]] void fwht_simd<itype, n>(                               \
+      device itype*, const device itype*, const constant uint&,      \
+      uint, uint);
+
+instantiate_fwht_simd(bfloat16, bfloat, 64)
+instantiate_fwht_simd(bfloat16, bfloat, 128)
+instantiate_fwht_simd(bfloat16, bfloat, 256)
+instantiate_fwht_simd(float32, float, 64)
+instantiate_fwht_simd(float32, float, 128)
+instantiate_fwht_simd(float32, float, 256)
+
+#define instantiate_fwht_tg(name, itype, n, threads)                 \
+  template [[host_name("fwht_tg_" #name "_n_" #n)]]                   \
+  [[kernel]] void fwht_tg<itype, n, threads>(                        \
+      device itype*, const device itype*, const constant uint&,      \
+      uint, uint);
+
+instantiate_fwht_tg(bfloat16, bfloat, 512, 256)
+instantiate_fwht_tg(bfloat16, bfloat, 1024, 256)
+instantiate_fwht_tg(float32, float, 512, 256)
+instantiate_fwht_tg(float32, float, 1024, 256)
 
 template <typename T>
 [[kernel]] void clamp_bounds(

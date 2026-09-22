@@ -167,8 +167,25 @@ pub enum Fault {
         node: usize,
         op: &'static str,
         id: ValueId,
+        block: u32,
         last: Option<Dim>,
+        why: HadamardWhy,
     },
+}
+
+/// The smallest and largest Hadamard block the Metal butterfly instantiates.
+pub const HADAMARD_MIN: u32 = 64;
+pub const HADAMARD_MAX: u32 = 1024;
+
+/// Which Hadamard invariant a [`Fault::HadamardBlock`] flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HadamardWhy {
+    /// The block size is not a power of two in the supported span.
+    Block,
+    /// The activation's last dim is not a whole number of blocks.
+    Width,
+    /// The sign diagonal's last dim is not a whole number of blocks.
+    Signs,
 }
 
 pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
@@ -315,18 +332,56 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             }
         }
 
-        if let Operation::Elementwise(Elementwise::Hadamard { x, .. }) = &node.op
-            && in_range(*x)
-            && let Ty::Tensor { shape, .. } = &trace.values[x.0 as usize].ty
+        if let Operation::Elementwise(Elementwise::Hadamard {
+            x, block, signs, ..
+        }) = &node.op
         {
-            let last = shape.last().copied();
-            if !matches!(last, Some(Dim::Const(d)) if d % 128 == 0) {
+            let block = *block;
+            // The block must be a power of two in the kernel's supported span.
+            if !block.is_power_of_two() || !(HADAMARD_MIN..=HADAMARD_MAX).contains(&block) {
                 faults.push(Fault::HadamardBlock {
                     node: j,
                     op,
                     id: *x,
-                    last,
+                    block,
+                    last: None,
+                    why: HadamardWhy::Block,
                 });
+            } else {
+                // The transformed row's last dim must tile into whole blocks.
+                if in_range(*x)
+                    && let Ty::Tensor { shape, .. } = &trace.values[x.0 as usize].ty
+                {
+                    let last = shape.last().copied();
+                    if !matches!(last, Some(Dim::Const(d)) if d % u64::from(block) == 0) {
+                        faults.push(Fault::HadamardBlock {
+                            node: j,
+                            op,
+                            id: *x,
+                            block,
+                            last,
+                            why: HadamardWhy::Width,
+                        });
+                    }
+                }
+                // A present sign diagonal repeats block-wise, so its own last
+                // dim must itself be a whole number of blocks.
+                if let Some(s) = signs
+                    && in_range(*s)
+                    && let Ty::Tensor { shape, .. } = &trace.values[s.0 as usize].ty
+                {
+                    let last = shape.last().copied();
+                    if !matches!(last, Some(Dim::Const(d)) if d % u64::from(block) == 0) {
+                        faults.push(Fault::HadamardBlock {
+                            node: j,
+                            op,
+                            id: *s,
+                            block,
+                            last,
+                            why: HadamardWhy::Signs,
+                        });
+                    }
+                }
             }
         }
     }
@@ -1137,15 +1192,29 @@ impl Display for Fault {
                 node,
                 op,
                 id,
+                block,
                 last,
-            } => {
-                write!(
+                why,
+            } => match why {
+                HadamardWhy::Block => write!(
                     f,
-                    "node {node} ({op}): {} has last dim {last:?}, but a Hadamard block \
-                     transform needs a last dim that is a multiple of 128",
+                    "node {node} ({op}): a Hadamard block of {block} is not a power of two in \
+                     [{HADAMARD_MIN}, {HADAMARD_MAX}]; the butterfly turns 64, 128, 256, 512 \
+                     and 1024-vectors",
+                ),
+                HadamardWhy::Width => write!(
+                    f,
+                    "node {node} ({op}): {} has last dim {last:?}, but a Hadamard block of \
+                     {block} needs a last dim that is a multiple of {block}",
                     V(*id)
-                )
-            }
+                ),
+                HadamardWhy::Signs => write!(
+                    f,
+                    "node {node} ({op}): the sign diagonal {} has last dim {last:?}, but it \
+                     repeats block-wise and so needs a last dim that is a multiple of {block}",
+                    V(*id)
+                ),
+            },
         }
     }
 }

@@ -1,21 +1,29 @@
 #![cfg(target_vendor = "apple")]
 
-//! `elementwise.hadamard` on Metal turns each contiguous 128-vector of a row's
-//! last dim by the normalized 128x128 Sylvester Hadamard matrix H, whose
-//! entries are `(-1)^popcount(i & j) / sqrt(128)`. H is symmetric and
-//! orthonormal, so `H . H = I`: the op is its own inverse. This checks the
-//! Metal output against a host reference, pins the exact matrix entries with a
-//! one-hot orientation probe (a transposed or mis-strided matrix fails it),
-//! confirms the round trip, and confirms the shape guard rejects a last dim
-//! that is not a multiple of 128 at validation, not at runtime.
+//! `elementwise.hadamard` on Metal is a blockwise butterfly FWHT: the row's
+//! last dim is cut into contiguous `block`-vectors (a power of two) and each is
+//! turned by the normalized Sylvester Hadamard matrix H, whose entries are
+//! `(-1)^popcount(i & j) / sqrt(block)`. The fast Walsh-Hadamard transform's
+//! natural (Sylvester) ordering is exactly H, so the pure transform is
+//! symmetric and orthonormal: `H . H = I`.
+//!
+//! When a ±1 sign diagonal S is supplied it multiplies the activation on load,
+//! before the butterfly — the Randomized Hadamard `H·S`. S and H do not
+//! commute, so `H·S` is NOT self-inverse; the signed path is checked only by
+//! bit-exact agreement with the host reference.
+//!
+//! This checks the Metal output against a host reference across both the
+//! simdgroup (block <= 256) and threadgroup (block >= 512) pipelines, pins the
+//! exact matrix entries with a one-hot orientation probe, confirms the round
+//! trip for the pure transform, and confirms the shape guards reject a last dim
+//! that is not a multiple of `block` and a non-power-of-two block at
+//! validation, not at runtime.
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::elemwise::pointwise;
 use model_ir::{Dtype, Elementwise, Operation};
-
-const BLOCK: usize = 128;
 
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5e5e_1234_9ABC_DEF0;
@@ -26,6 +34,13 @@ fn noise(at: u64) -> u32 {
 
 fn unit(at: u64) -> f32 {
     (f64::from(noise(at)) / f64::from(u32::MAX)) as f32 * 2.0 - 1.0
+}
+
+/// A deterministic ±1 sign vector of the given width.
+fn signs_of(width: usize, salt: u64) -> Vec<f32> {
+    (0..width as u64)
+        .map(|i| if noise(i ^ salt) & 1 == 0 { 1.0 } else { -1.0 })
+        .collect()
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -41,48 +56,73 @@ fn f32_floats(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// The host reference: each contiguous 128-vector is left-multiplied by the
-/// normalized Sylvester Hadamard matrix. Accumulated in f64 for a clean gold.
-fn blockwise_h(x: &[f32]) -> Vec<f32> {
-    let inv = 1.0f64 / 128.0f64.sqrt();
+/// The host reference: each contiguous `block`-vector is optionally scaled by
+/// the ±1 diagonal S (which repeats block-wise across the flattened row) and
+/// then left-multiplied by the normalized Sylvester Hadamard matrix. Signs are
+/// indexed by flat offset, matching the kernel's `p % signs_width`. Accumulated
+/// in f64 for a clean gold.
+fn blockwise_h_signed(x: &[f32], block: usize, signs: Option<&[f32]>) -> Vec<f32> {
+    let inv = 1.0f64 / (block as f64).sqrt();
+    let sw = signs.map_or(0, <[f32]>::len);
     let mut out = vec![0.0f32; x.len()];
-    for block in x.chunks_exact(BLOCK).enumerate() {
-        let (b, chunk) = block;
-        for i in 0..BLOCK {
+    for (b, chunk) in x.chunks_exact(block).enumerate() {
+        let base = b * block;
+        let signed: Vec<f64> = (0..block)
+            .map(|j| {
+                let s = signs.map_or(1.0, |sg| f64::from(sg[(base + j) % sw]));
+                s * f64::from(chunk[j])
+            })
+            .collect();
+        for i in 0..block {
             let mut acc = 0.0f64;
-            for (j, &v) in chunk.iter().enumerate() {
+            for (j, &v) in signed.iter().enumerate() {
                 let sign = if (i & j).count_ones() & 1 == 1 {
                     -1.0
                 } else {
                     1.0
                 };
-                acc += sign * f64::from(v);
+                acc += sign * v;
             }
-            out[b * BLOCK + i] = (acc * inv) as f32;
+            out[base + i] = (acc * inv) as f32;
         }
     }
     out
 }
 
 /// Run the Metal op over `rows x width` f32 values held row-major, in place,
-/// and read the result back.
+/// and read the result back. An optional ±1 sign diagonal is bound as a second
+/// buffer.
 fn run(
     device: &Context,
     handles: &Handles,
     pipelines: &Pipelines,
     rows: u32,
     width: u32,
+    block: u32,
     data: &[f32],
+    signs: Option<&[f32]>,
 ) -> Vec<f32> {
     let bytes = u64::from(rows) * u64::from(width) * 4;
     let mut buf = Buffer::zeroed(device, bytes).expect("a buffer");
     buf.write(0, &f32_bytes(data)).expect("write x");
     let handle = handles.bind(&buf, 0, buf.bytes()).expect("a handle");
     let x = Tensor::new(handle, rows, width, Dtype::F32);
+
+    // Keep the sign buffer alive for the whole frame.
+    let sign_hold = signs.map(|s| {
+        let sbytes = (s.len() * 4) as u64;
+        let mut sbuf = Buffer::zeroed(device, sbytes).expect("a sign buffer");
+        sbuf.write(0, &f32_bytes(s)).expect("write signs");
+        let shandle = handles.bind(&sbuf, 0, sbuf.bytes()).expect("a sign handle");
+        let stensor = Tensor::new(shandle, 1, s.len() as u32, Dtype::F32);
+        (sbuf, stensor)
+    });
+    let signs_tensor = sign_hold.as_ref().map(|(_, t)| *t);
+
     {
         let frame = device.frame().expect("a frame");
         let sink = Sink::new(device, &frame, pipelines, handles);
-        pointwise::hadamard(&sink, x).expect("the launch");
+        pointwise::hadamard(&sink, x, block, signs_tensor).expect("the launch");
         frame.commit().expect("the commit");
     }
     f32_floats(&handles.read(handle, bytes).expect("read x"))
@@ -97,14 +137,47 @@ fn close(got: f32, want: f32, at: &str) {
     );
 }
 
-fn agrees(device: &Context, handles: &Handles, pipelines: &Pipelines, rows: u32, width: u32) {
+/// Bit-exact agreement of the pure (unsigned) transform for a rectangle.
+fn agrees(
+    device: &Context,
+    handles: &Handles,
+    pipelines: &Pipelines,
+    rows: u32,
+    width: u32,
+    block: u32,
+) {
     let n = u64::from(rows) * u64::from(width);
-    let salt = (u64::from(rows) << 20) ^ u64::from(width);
+    let salt = (u64::from(rows) << 32) ^ (u64::from(width) << 8) ^ u64::from(block);
     let x: Vec<f32> = (0..n).map(|at| unit(at ^ salt)).collect();
-    let got = run(device, handles, pipelines, rows, width, &x);
-    let want = blockwise_h(&x);
+    let got = run(device, handles, pipelines, rows, width, block, &x, None);
+    let want = blockwise_h_signed(&x, block as usize, None);
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
-        close(g, w, &format!("[{rows}x{width}] element {i}"));
+        close(g, w, &format!("[{rows}x{width}] block {block} element {i}"));
+    }
+}
+
+/// Bit-exact agreement of the signed transform `H·(S·x)` for a rectangle.
+fn agrees_signed(
+    device: &Context,
+    handles: &Handles,
+    pipelines: &Pipelines,
+    rows: u32,
+    width: u32,
+    block: u32,
+    signs_width: usize,
+) {
+    let n = u64::from(rows) * u64::from(width);
+    let salt = (u64::from(rows) << 32) ^ (u64::from(width) << 8) ^ u64::from(block);
+    let x: Vec<f32> = (0..n).map(|at| unit(at ^ salt ^ 0x5157_u64)).collect();
+    let signs = signs_of(signs_width, 0xF00D ^ u64::from(block));
+    let got = run(device, handles, pipelines, rows, width, block, &x, Some(&signs));
+    let want = blockwise_h_signed(&x, block as usize, Some(&signs));
+    for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+        close(
+            g,
+            w,
+            &format!("signed [{rows}x{width}] block {block} sw {signs_width} element {i}"),
+        );
     }
 }
 
@@ -117,73 +190,92 @@ fn the_hadamard_transform_agrees() {
     let handles = Handles::new();
     let pipelines = Pipelines::new();
 
-    // Bit-exact against the host reference: one block, four blocks (512),
-    // forty blocks (5120 = Qwen 27B hidden), and a batched rectangle.
-    agrees(&device, &handles, &pipelines, 1, 128);
-    agrees(&device, &handles, &pipelines, 1, 512);
-    agrees(&device, &handles, &pipelines, 1, 5120);
-    agrees(&device, &handles, &pipelines, 6, 5120);
-
-    // Orientation probe: a one-hot input picks out one column of H. Because H
-    // is symmetric this is also row k, and its exact signed entries are pinned
-    // — a transposed or mis-strided matrix would not reproduce them.
-    let inv = 1.0f32 / 128.0f32.sqrt();
-    {
-        // one-hot at position 1 of a single block -> H[:,1] = inv * (-1)^(i&1)
-        let mut x = vec![0.0f32; 128];
-        x[1] = 1.0;
-        let got = run(&device, &handles, &pipelines, 1, 128, &x);
-        for (i, &g) in got.iter().enumerate() {
-            let want = if i & 1 == 1 { -inv } else { inv };
-            close(g, want, &format!("probe k=1 entry {i}"));
-        }
+    // Bit-exact against the host reference across both pipelines: block 128 and
+    // 256 ride the simdgroup variant; block 512 rides the threadgroup variant.
+    // Shapes cover one block, several blocks, and a batch of rows.
+    for &block in &[128u32, 256, 512] {
+        agrees(&device, &handles, &pipelines, 1, block, block); // one block
+        agrees(&device, &handles, &pipelines, 1, block * 4, block); // several blocks
+        agrees(&device, &handles, &pipelines, 5, block * 3, block); // a batch
     }
-    {
-        // one-hot at position 3 of the SECOND block of a 256-wide row. Block 0
-        // must stay zero; block 1 must be H[:,3] = inv * (-1)^popcount(i&3).
-        let mut x = vec![0.0f32; 256];
-        x[128 + 3] = 1.0;
-        let got = run(&device, &handles, &pipelines, 1, 256, &x);
-        for (i, &g) in got.iter().take(128).enumerate() {
-            close(g, 0.0, &format!("probe block0 entry {i}"));
+    // The 5120-wide Qwen 27B hidden width, several blocks of 512, batched.
+    agrees(&device, &handles, &pipelines, 6, 5120, 512);
+    // Also exercise the smaller simd sizes.
+    agrees(&device, &handles, &pipelines, 3, 64 * 5, 64);
+    agrees(&device, &handles, &pipelines, 2, 1024 * 2, 1024);
+
+    // Signed path `H·(S·x)`, bit-exact against the host reference. A full-width
+    // diagonal (signs_width == width) and a block-wide diagonal that repeats
+    // block-wise across the row are both exercised, on both pipelines.
+    for &block in &[128u32, 256, 512] {
+        agrees_signed(&device, &handles, &pipelines, 4, block * 3, block, (block * 3) as usize);
+        agrees_signed(&device, &handles, &pipelines, 4, block * 3, block, block as usize);
+    }
+
+    // Orientation probe: a one-hot input picks out one column of H. Because H is
+    // symmetric this is also row k, and its exact signed entries are pinned — a
+    // transposed or mis-strided matrix would not reproduce them. Tested at each
+    // block size, and in the SECOND block of a two-block row so striding is
+    // exercised too.
+    for &block in &[128u32, 256, 512] {
+        let bl = block as usize;
+        let inv = 1.0f32 / (block as f32).sqrt();
+        let k = 3usize;
+        let mut x = vec![0.0f32; bl * 2];
+        x[bl + k] = 1.0;
+        let got = run(&device, &handles, &pipelines, 1, block * 2, block, &x, None);
+        for (i, &g) in got.iter().take(bl).enumerate() {
+            close(g, 0.0, &format!("probe block0 (n={block}) entry {i}"));
         }
-        for i in 0..128usize {
-            let want = if (i & 3).count_ones() & 1 == 1 {
+        for i in 0..bl {
+            let want = if (i & k).count_ones() & 1 == 1 {
                 -inv
             } else {
                 inv
             };
-            close(got[128 + i], want, &format!("probe block1 entry {i}"));
+            close(got[bl + i], want, &format!("probe block1 (n={block}) entry {i}"));
         }
     }
 
-    // Round trip: H . H = I, so applying twice returns the input.
-    {
-        let n: u64 = 5120;
-        let x: Vec<f32> = (0..n).map(|at| unit(at ^ 0xABCD)).collect();
-        let once = run(&device, &handles, &pipelines, 1, 5120, &x);
-        let twice = run(&device, &handles, &pipelines, 1, 5120, &once);
+    // Round trip: H . H = I for the PURE transform, so applying twice returns
+    // the input. (Not tested for the signed transform, which is not an
+    // involution.)
+    for &block in &[128u32, 256, 512] {
+        let n = u64::from(block) * 9;
+        let width = block * 9;
+        let x: Vec<f32> = (0..n).map(|at| unit(at ^ 0xABCD ^ u64::from(block))).collect();
+        let once = run(&device, &handles, &pipelines, 1, width, block, &x, None);
+        let twice = run(&device, &handles, &pipelines, 1, width, block, &once, None);
         for (i, (&t, &orig)) in twice.iter().zip(x.iter()).enumerate() {
-            close(t, orig, &format!("round-trip element {i}"));
+            close(t, orig, &format!("round-trip (n={block}) element {i}"));
         }
     }
 
-    // Shape guard: a last dim that is not a multiple of 128 is a validation
-    // fault, caught by `model_ir::check` before any kernel runs.
+    // Shape guard: a last dim that is not a multiple of `block`, and a
+    // non-power-of-two `block`, are validation faults caught by `model_ir::check`
+    // before any kernel runs.
     assert!(
-        hadamard_check_faults(100),
-        "d = 100 (not a multiple of 128) must fail model-ir validation"
+        hadamard_check_faults(100, 128),
+        "last dim 100 (not a multiple of 128) must fail model-ir validation"
     );
     assert!(
-        !hadamard_check_faults(128),
-        "d = 128 is a valid Hadamard block width and must pass validation"
+        !hadamard_check_faults(256, 128),
+        "last dim 256 is a whole number of 128-blocks and must pass validation"
+    );
+    assert!(
+        hadamard_check_faults(768, 96),
+        "block 96 is not a power of two and must fail model-ir validation"
+    );
+    assert!(
+        !hadamard_check_faults(512, 512),
+        "block 512 with a matching last dim must pass validation"
     );
 }
 
-/// Build a one-node trace `x_out = hadamard(x)` with `x` of shape
+/// Build a one-node trace `x_out = hadamard(x, block)` with `x` of shape
 /// `[tokens, d]` and report whether `model_ir::check` flags a `HadamardBlock`
 /// fault for it.
-fn hadamard_check_faults(d: u64) -> bool {
+fn hadamard_check_faults(d: u64, block: u32) -> bool {
     use model_ir::{
         Def, Dim, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId,
     };
@@ -211,6 +303,8 @@ fn hadamard_check_faults(d: u64) -> bool {
             op: Operation::Elementwise(Elementwise::Hadamard {
                 x: ValueId(0),
                 x_out: ValueId(1),
+                block,
+                signs: None,
             }),
             guard: Guard::Always,
             layer: None,

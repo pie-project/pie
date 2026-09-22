@@ -408,6 +408,8 @@ pub enum Elementwise {
     Hadamard {
         x: ValueId,
         x_out: ValueId,
+        block: u32,
+        signs: Option<ValueId>,
     },
     Mul {
         x: ValueId,
@@ -635,7 +637,12 @@ impl Operands for Elementwise {
             Self::Silu { x, .. } => sink.push(*x),
             Self::Gelu { x, .. } => sink.push(*x),
             Self::Tanh { x, .. } => sink.push(*x),
-            Self::Hadamard { x, .. } => sink.push(*x),
+            Self::Hadamard { x, signs, .. } => {
+                sink.push(*x);
+                if let Some(s) = signs {
+                    sink.push(*s);
+                }
+            }
             Self::Mul { x, y, .. } => sink.extend([*x, *y]),
             Self::Add { x, y, .. } => sink.extend([*x, *y]),
             Self::RopeAxes { x, positions, .. } => sink.extend([*x, *positions]),
