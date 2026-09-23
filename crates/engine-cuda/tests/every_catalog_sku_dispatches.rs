@@ -34,6 +34,10 @@ fn refuses_split_mrope(op: &model_ir::ops::Operation) -> bool {
 const CANNOT_SERVE: &[(&str, &[&str])] = &[
     ("dsv4-flash-bf16-kv-bf16", &["attention.pool_lse_selected"]),
     (
+        "dsv4-flash-mini-bf16-kv-bf16",
+        &["attention.pool_lse_selected"],
+    ),
+    (
         "dsv4-flash-u4g64-u2g64-kv-bf16",
         &["attention.pool_lse_selected"],
     ),
