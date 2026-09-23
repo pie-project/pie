@@ -263,6 +263,12 @@ pub const ROWS: &[Row] = &[
         arch: "gptoss",
     },
     Row {
+        id: "kimik3-mini-bf16-mxfp4-kv-bf16",
+        layers: 8,
+        vocab: 163_840,
+        arch: "kimi_k3",
+    },
+    Row {
         id: "kimik3-bf16-mxfp4-kv-bf16",
         layers: 8,
         vocab: 163_840,

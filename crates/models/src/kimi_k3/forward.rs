@@ -2,7 +2,7 @@ use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam,
 };
 
-use super::model::{Kda, Mixer, Mla, Mlp, Model};
+use super::model::{AttnRes, Kda, Mixer, Mla, Mlp, Model};
 
 pub struct Facts {
     pub qo_one: bool,
@@ -77,15 +77,34 @@ impl ForwardHybrid for Model {
         let ids = inputs.tokens();
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab);
         let mut blocks: Vec<Value> = Vec::new();
+        let every = m.attn_res == AttnRes::Every;
 
         let routes = inputs.adapter_routes();
-        for (_, w) in inputs.walk_layers(&m.layers) {
+        for (l, w) in inputs.walk_layers(&m.layers) {
+            // The sublayer input: under `Every`, a blend of the closed blocks and
+            // the running prefix sum `y` (the released model); under
+            // `AtBlockStart`, `y` itself, re-blended where a block opens.
+            let mut h = y.clone();
             if let Some(b) = &w.res_blend {
-                y = ops::elemwise::res_blend(&y, &blocks, &b.norm, b.norm_eps, &b.proj);
+                if every {
+                    if !blocks.is_empty() {
+                        h = ops::elemwise::res_blend(&y, &blocks, &b.norm, b.norm_eps, &b.proj);
+                    }
+                } else {
+                    y = ops::elemwise::res_blend(&y, &blocks, &b.norm, b.norm_eps, &b.proj);
+                    blocks.push(y.clone());
+                    h = y.clone();
+                }
+            }
+            // Where a block opens the prefix sum is banked and restarts from
+            // this layer's attention output.
+            let mut fresh = false;
+            if every && m.opens_block(l) {
                 blocks.push(y.clone());
+                fresh = true;
             }
 
-            let x = ops::elemwise::rmsnorm(&y, &w.mixer_norm, w.mixer_norm_eps);
+            let x = ops::elemwise::rmsnorm(&h, &w.mixer_norm, w.mixer_norm_eps);
             let o = match &w.mixer {
                 Mixer::Mla(a) => mla_mixer(&x, &inputs, &plan, m, a),
                 Mixer::Kda(k) => kda_mixer(&x, &inputs, k),
@@ -100,9 +119,19 @@ impl ForwardHybrid for Model {
                 let (px, _) = x.split(&Facts::has_adapter());
                 ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &routes, &adapted)
             };
-            y = ops::elemwise::residual_add(&o, &y);
+            y = if fresh {
+                o
+            } else {
+                ops::elemwise::residual_add(&o, &y)
+            };
 
-            let x = ops::elemwise::rmsnorm(&y, &w.mlp_norm, w.mlp_norm_eps);
+            let h = match &w.mlp_res {
+                Some(b) if !blocks.is_empty() => {
+                    ops::elemwise::res_blend(&y, &blocks, &b.norm, b.norm_eps, &b.proj)
+                }
+                _ => y.clone(),
+            };
+            let x = ops::elemwise::rmsnorm(&h, &w.mlp_norm, w.mlp_norm_eps);
             let f = match &w.mlp {
                 Mlp::Dense {
                     gate_up,
@@ -121,29 +150,57 @@ impl ForwardHybrid for Model {
                 ),
                 Mlp::Routed {
                     router,
+                    bias,
                     gate_up,
                     down,
                     shared,
+                    latent,
                     experts,
                     top_k,
+                    renorm,
                     routed_scaling,
                     inter,
                     beta,
                     up_cap,
                 } => {
-                    let (routes, weights) = ops::linear::moe_topk_sigmoid(
-                        &ops::linear::matmul(&x, router),
-                        *experts,
-                        *top_k,
-                        false,
-                        *routed_scaling,
-                    );
-                    let hidden = ops::linear::moe_matmul_select_quant(&x, gate_up, &routes, *top_k);
+                    let logits = ops::linear::matmul(&x, router);
+                    let (routes, weights) = match bias {
+                        Some(bias) => ops::linear::moe_topk_sigmoid_biased(
+                            &logits,
+                            bias,
+                            *experts,
+                            *top_k,
+                            *renorm,
+                            *routed_scaling,
+                        ),
+                        None => ops::linear::moe_topk_sigmoid(
+                            &logits,
+                            *experts,
+                            *top_k,
+                            *renorm,
+                            *routed_scaling,
+                        ),
+                    };
+                    let z = match latent {
+                        Some(lat) => ops::linear::matmul(&x, &lat.down),
+                        None => x.clone(),
+                    };
+                    let hidden = ops::linear::moe_matmul_select_quant(&z, gate_up, &routes, *top_k);
                     let act = ops::linear::mlp_situ(&hidden, *inter, *beta, *up_cap);
                     let routed = ops::linear::moe_weighted_sum(
                         &ops::linear::moe_matmul_select_quant(&act, down, &routes, *top_k),
                         &weights,
                     );
+                    let routed = match latent {
+                        Some(lat) => {
+                            let r = match &lat.norm {
+                                Some(norm) => ops::elemwise::rmsnorm(&routed, norm, lat.norm_eps),
+                                None => routed,
+                            };
+                            ops::linear::matmul(&r, &lat.up)
+                        }
+                        None => routed,
+                    };
                     match shared {
                         None => routed,
                         Some(s) => {
@@ -169,6 +226,12 @@ impl ForwardHybrid for Model {
             y = ops::elemwise::residual_add(&f, &y);
         }
 
+        let y = match &m.output_res {
+            Some(b) if !blocks.is_empty() => {
+                ops::elemwise::res_blend(&y, &blocks, &b.norm, b.norm_eps, &b.proj)
+            }
+            _ => y,
+        };
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
         let logits = ops::linear::lm_head(&x, &m.head);
         if m.head.dim(0) < u64::from(m.vocab) {
@@ -264,15 +327,31 @@ fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
         {
             let mixed = ops::attn::ssm_causal_conv1d(&qkv_d, &k.conv, conv, k.conv_kernel);
             ops::attn::ssm_kda_step(
-                &mixed, &f_d, &b_d, &k.dt_bias, &k.a_log, delta, k.heads, k.head_dim, k.norm_eps,
-                0.0,
+                &mixed,
+                &f_d,
+                &b_d,
+                &k.dt_bias,
+                &k.a_log,
+                delta,
+                k.heads,
+                k.head_dim,
+                k.norm_eps,
+                k.gate_floor,
             )
         },
         {
             let mixed = ops::attn::ssm_causal_conv1d_chunked(&qkv_p, &k.conv, conv, k.conv_kernel);
             ops::attn::ssm_kda_chunked(
-                &mixed, &f_p, &b_p, &k.dt_bias, &k.a_log, delta, k.heads, k.head_dim, k.norm_eps,
-                0.0,
+                &mixed,
+                &f_p,
+                &b_p,
+                &k.dt_bias,
+                &k.a_log,
+                delta,
+                k.heads,
+                k.head_dim,
+                k.norm_eps,
+                k.gate_floor,
             )
         },
     ]);
