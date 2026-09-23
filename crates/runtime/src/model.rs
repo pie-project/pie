@@ -239,6 +239,12 @@ pub const ROWS: &[Row] = &[
         arch: "gptoss",
     },
     Row {
+        id: "gptoss-20b-mini-bf16-mxfp4-kv-bf16",
+        layers: 5,
+        vocab: 201_088,
+        arch: "gptoss",
+    },
+    Row {
         id: "gptoss-120b-bf16-mxfp4-kv-bf16",
         layers: 36,
         vocab: 201_088,
