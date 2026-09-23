@@ -401,17 +401,25 @@ fn packed_bank(
         pairing.group_size,
         &w.name,
     );
+    // Two legs per expert (gate, up) stack to `[2E, inter, cols]`, which is the
+    // declared `[E, 2*inter, cols]` rectangle byte for byte; one leg per expert
+    // already is the declared shape, and a transmute to the type an expression
+    // has is refused.
+    let stacked = vec![legs, per_leg, cols];
     let bank = TensorType::new(extents(w), encoding(Dtype::Mxfp4));
     let bank_scales = TensorType::new(counted.clone(), encoding(Dtype::E8m0));
+    let codes = Expr::concat(0, codes);
+    let scales = Expr::concat(0, scales);
+    let (codes, scales) = if stacked == extents(w) {
+        (codes, scales)
+    } else {
+        (codes.transmute(bank), scales.transmute(bank_scales))
+    };
     b.extend([
-        TensorContract::inferred(
-            w.name.clone(),
-            Expr::concat(0, codes).transmute(bank),
-            encoding(Dtype::Mxfp4),
-        ),
+        TensorContract::inferred(w.name.clone(), codes, encoding(Dtype::Mxfp4)),
         TensorContract::new(
             model_dsl::scales_name(&w.name),
-            Expr::concat(0, scales).transmute(bank_scales),
+            scales,
             counted,
             encoding(Dtype::E8m0),
         )
