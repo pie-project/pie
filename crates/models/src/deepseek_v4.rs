@@ -78,6 +78,22 @@ pub fn skus() -> Vec<crate::Sku> {
             |tp: u32| flash_u2g64(tp),
         ),
         (
+            "dsv4-flash-mini",
+            1,
+            [Dtype::Bf16],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::r1,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::flash_mini(
+                Dtype::Bf16,
+                Routed::uniform(Dtype::Bf16),
+                Dtype::Bf16,
+                Dtype::Bf16,
+                tp
+            ),
+        ),
+        (
             "dsv4-base",
             1,
             [Dtype::Bf16],
