@@ -136,33 +136,42 @@ impl Model {
     }
 
     pub fn b20(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(
-            w,
-            experts,
-            kv,
-            tp,
-            Dims {
-                hidden: 2880,
-                layers: 24,
-                q_heads: 64,
-                kv_heads: 8,
-                head_dim: 64,
-                theta: 150_000.0,
-                yarn_factor: 32.0,
-                yarn_beta_fast: 32.0,
-                yarn_beta_slow: 1.0,
-                yarn_attention_factor: 1.346_573_6,
-                yarn_original_max_position: 4096,
-                window: 128,
-                experts: 32,
-                top_k: 4,
-                inter: 2880,
-                swiglu_limit: 7.0,
-                swiglu_alpha: 1.702,
-                vocab: 201_088,
-                norm_eps: 1e-5,
-            },
-        )
+        Model::new(w, experts, kv, tp, Model::b20_dims())
+    }
+
+    /// The five-layer, sixteen-expert carve of gpt-oss-20b that
+    /// `scripts/bench/shrink_checkpoint.py --layers 0-4 --experts 16` writes:
+    /// every width is the 20B's, so every kernel sees production shapes on a
+    /// single small GPU. The same convention as `qwen_3::Model::a3b_mini`.
+    pub fn b20_mini(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::b20_dims();
+        d.layers = 5;
+        d.experts = 16;
+        Model::new(w, experts, kv, tp, d)
+    }
+
+    fn b20_dims() -> Dims {
+        Dims {
+            hidden: 2880,
+            layers: 24,
+            q_heads: 64,
+            kv_heads: 8,
+            head_dim: 64,
+            theta: 150_000.0,
+            yarn_factor: 32.0,
+            yarn_beta_fast: 32.0,
+            yarn_beta_slow: 1.0,
+            yarn_attention_factor: 1.346_573_6,
+            yarn_original_max_position: 4096,
+            window: 128,
+            experts: 32,
+            top_k: 4,
+            inter: 2880,
+            swiglu_limit: 7.0,
+            swiglu_alpha: 1.702,
+            vocab: 201_088,
+            norm_eps: 1e-5,
+        }
     }
 
     pub fn b120(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {

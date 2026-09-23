@@ -40,6 +40,16 @@ pub fn skus() -> Vec<crate::Sku> {
             |tp: u32| Model::b20(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
         ),
         (
+            "gptoss-20b-mini",
+            1,
+            [Dtype::Bf16, Dtype::Mxfp4],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::gpt_oss,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::b20_mini(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+        ),
+        (
             "gptoss-120b",
             1,
             [Dtype::Bf16, Dtype::Mxfp4],
