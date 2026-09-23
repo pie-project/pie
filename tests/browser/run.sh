@@ -24,7 +24,7 @@ run "host corner cases" "corners.html"
 run "transport (no engine)" "transport.html?n=100" 300000
 run "client page" "client.html?max_tokens=8"
 run "library corner cases (bench page)" "bench.html?what=corners"
-run "chat-completion" "index.html?auto&runs=1&max_tokens=24&inferlet=inferlets/chat_completion.wasm&manifest=inferlets/chat-completion.Pie.toml&input=%7B%22prompt%22%3A%22What%20is%20the%20capital%20of%20France%3F%22%2C%22max_tokens%22%3A24%2C%22temperature%22%3A0%7D"
+run "chat-completion" "index.html?auto&runs=1&max_tokens=24&inferlet=inferlets/chat_completion.wasm&input=%7B%22prompt%22%3A%22What%20is%20the%20capital%20of%20France%3F%22%2C%22max_tokens%22%3A24%2C%22temperature%22%3A0%7D"
 run "deterministic inferlets (matrix)" "matrix.html?only=sort-probe,sampling-primitives,prefill-rows,dry-repetition-penalty-cold,naive-baseline-cold,naive-baseline-js,top-a-sampling-cold,json-schema-constrained-decoding,token-healing,rs-window-decode,repetition-penalty,greenlist-watermarking,gumbel-watermark,attention-sink,sliding-window-attention,naive-masked-dense,naive-masked-structured,contrastive-decoding,text-completion-bench,beam-search-1&entry_timeout=240000" 1500000
 echo "== page lifecycle"
 node tests/browser/tools/lifecycle.mjs 2>&1 | grep -E 'ok  |FAIL|lifecycle\]' | cut -c1-140

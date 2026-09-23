@@ -72,6 +72,26 @@ class ReceivedFile(bytes):
         return path
 
 
+_SCRIPT_EXTENSIONS = {".py": "py", ".js": "js", ".mjs": "js"}
+
+
+def program_file(path: str | Path) -> str:
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".wasm":
+        return f"{path.stem.replace('_', '-')}.wasm"
+    extension = _SCRIPT_EXTENSIONS.get(suffix)
+    if extension is None:
+        raise ValueError(
+            f"{path}: not a program pie can install; a program is a `.wasm` component "
+            "or a `.py` / `.js` script"
+        )
+    stem = path.stem
+    if stem in ("main", "index"):
+        stem = path.resolve().parent.name
+    return f"{stem.replace('_', '-')}.{extension}"
+
+
 class Process:
     """Represents a running process on the server."""
 
@@ -124,7 +144,6 @@ class Process:
     async def terminate(self):
         """Request termination of the process."""
         await self.client.terminate_process(self.process_id)
-
 
 
 class PieClient:
@@ -389,25 +408,30 @@ class PieClient:
             raise Exception(f"Upload failed: {result}")
         return result
 
-    async def install_program(self, wasm_path: str | Path, manifest_path: str | Path, force_overwrite: bool = False):
-        """Install a program from files: a component or a script, and its
-        manifest."""
-        await self.install_program_bytes(
-            Path(wasm_path).read_bytes(), Path(manifest_path).read_text(), force_overwrite
+    async def install_program(
+        self, path: str | Path, version: str | None = None, force_overwrite: bool = False
+    ) -> str:
+        path = Path(path)
+        return await self.install_program_bytes(
+            path.read_bytes(), program_file(path), version, force_overwrite
         )
 
-    async def install_program_bytes(self, program_bytes: bytes, manifest: str, force_overwrite: bool = False):
-        """Install a program to the server in chunks: its artifact (a
-        component, or a script's source when the manifest names a
-        `[runtime] language`) and its manifest TOML."""
+    async def install_program_bytes(
+        self,
+        program_bytes: bytes,
+        file: str,
+        version: str | None = None,
+        force_overwrite: bool = False,
+    ) -> str:
         program_hash = blake3.blake3(program_bytes).hexdigest()
         template = {
             "type": "add_program",
             "program_hash": program_hash,
-            "manifest": manifest,
+            "file": file,
+            "version": version,
             "force_overwrite": force_overwrite,
         }
-        await self._upload_chunked(program_bytes, template)
+        return await self._upload_chunked(program_bytes, template)
 
     # =========================================================================
     # File Transfer (fire-and-forget, no response expected)
@@ -493,11 +517,12 @@ class PieClient:
         `await process.result()` waits for what it returns.
         """
         if isinstance(program, Inferlet):
-            if not await self.check_program(program.program):
-                await self.install_program_bytes(
-                    program.source.encode("utf-8"), program.manifest_toml()
+            if await self.check_program(program.program):
+                program = program.program
+            else:
+                program = await self.install_program_bytes(
+                    program.source.encode("utf-8"), f"{program.name}.py", program.version
                 )
-            program = program.program
         return await self.launch_process(program, input=kwargs)
 
     async def attach_process(self, process_id: str) -> Process:

@@ -251,7 +251,6 @@ def run(args) -> None:
     if not os.path.exists(pie):
         raise SystemExit(f"{pie}: no pie binary. Build one with `cargo build -p pie --features cuda`, or pass --pie.")
     binary = wasm(args.inferlet)
-    manifest = os.path.join(args.inferlet, "Pie.toml")
     base = scratch_base(args.config)
     files_dir = os.path.join(args.out, "pie_files")
     shutil.rmtree(files_dir, ignore_errors=True)
@@ -263,7 +262,7 @@ def run(args) -> None:
         payload.append(doc["probe_latents_file"])
 
     cmd = [pie, "--config", os.path.expanduser(args.config), "run", "--path", binary,
-           "--manifest", manifest, "-o", files_dir, "--", "--case_file", "case.json",
+           "-o", files_dir, "--", "--case_file", "case.json",
            "--wait_secs", str(args.wait)]
     print(f"[run] {' '.join(cmd)}")
     before = set(os.listdir(base))

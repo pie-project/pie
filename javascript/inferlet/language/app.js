@@ -3,13 +3,7 @@
 //
 // A JavaScript inferlet is its source, an ES module that imports
 // `@pie-project/inferlet` (or the host's `pie:inferlet/*` interfaces) and
-// exports its entry (`main` unless the manifest names another). The host
-// installs this component once and, for each JavaScript program it
-// launches, instantiates it with the program's source folded into the
-// launch input, the same envelope the Python language component unwraps:
 //
-//     {"__pie_script__": {"name": "beam-search@0.1.0", "file": "index.js",
-//                         "source": "...", "entry": "main", "call": "input"},
 //      "input": "<the caller's input, verbatim>"}
 //
 // StarlingMonkey evaluates scripts at run time but has no way to load an ES
@@ -127,20 +121,17 @@ export const run = {
       throw `the JavaScript language component was launched without a program: the launch input carries no '${ENVELOPE_KEY}' envelope`;
     }
     const script = outer[ENVELOPE_KEY];
-    const entry = script.entry || 'main';
     const file = script.file || 'index.js';
     const inputData = parseInput(outer.input ?? '');
     try {
       const exports = await evaluateModule(script.source, file, resolveModule);
-      const fn = exports[entry] ?? (entry === 'main' ? exports.default : undefined);
+      const fn = exports.main ?? exports.default;
       if (typeof fn !== 'function') {
         throw new Error(
-          `${script.name ?? 'the program'} exports no \`${entry}\`; a JavaScript inferlet is a module ` +
-          'that exports an entry function, `export function main(input)` unless the manifest names another',
+          `${script.name ?? 'the program'} exports no \`main\`; a JavaScript inferlet is a module ` +
+          'that exports `function main(input)` (or exports it as its default)',
         );
       }
-      // `call = "kwargs"` and `call = "input"` coincide here: a JavaScript
-      // entry takes the input object as its one argument either way.
       return encode(await fn(inputData));
     } catch (e) {
       throw describeError(e);

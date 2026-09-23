@@ -29,7 +29,8 @@ pub fn build(
         builtin_programs: builtins::all()
             .iter()
             .map(|b| runtime::bootstrap::BuiltinProgram {
-                manifest: b.manifest,
+                name: b.name,
+                version: b.version,
                 component: b.component,
             })
             .collect(),

@@ -142,13 +142,12 @@ def run(args) -> None:
             f"`cargo build -p pie --features cuda`, or pass --pie."
         )
     binary = wasm(args.inferlet)
-    manifest = os.path.join(args.inferlet, "Pie.toml")
     for b, case in enumerate(paths):
         out = os.path.join(args.out, f"pie_{b}.json")
         cmd = [pie]
         if args.config:
             cmd += ["--config", args.config]
-        cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
+        cmd += ["run", "--path", binary, "--"]
         if args.case_file:
             cmd += ["--case_file", os.path.basename(case)]
         else:

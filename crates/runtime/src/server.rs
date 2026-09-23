@@ -335,7 +335,8 @@ impl Session {
             ClientMessage::AddProgram {
                 corr_id,
                 program_hash,
-                manifest,
+                file,
+                version,
                 force_overwrite,
                 chunk_index,
                 total_chunks,
@@ -344,7 +345,8 @@ impl Session {
                 self.handle_add_program(
                     corr_id,
                     program_hash,
-                    manifest,
+                    file,
+                    version,
                     force_overwrite,
                     chunk_index,
                     total_chunks,

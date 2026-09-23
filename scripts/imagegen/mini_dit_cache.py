@@ -88,7 +88,6 @@ def run_cache(args, where: str, threshold: float | None) -> list[dict]:
             f"`cargo build -p pie --features cuda`, or pass --pie."
         )
     binary = P.wasm(args.inferlet)
-    manifest = os.path.join(args.inferlet, "Pie.toml")
     os.makedirs(where, exist_ok=True)
     docs = []
     for b, case in enumerate(paths):
@@ -96,7 +95,7 @@ def run_cache(args, where: str, threshold: float | None) -> list[dict]:
         cmd = [pie]
         if args.config:
             cmd += ["--config", args.config]
-        cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
+        cmd += ["run", "--path", binary, "--"]
         text = open(case).read()
         n = 8
         step = -(-len(text) // n)

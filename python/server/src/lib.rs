@@ -64,18 +64,20 @@ impl PyEngineHandle {
         Ok(language.name().to_string())
     }
 
-    /// Install an inferlet from its component bytes and manifest text,
-    /// replacing an installed version; returns `name@version`. Blocks with
-    /// the GIL released.
-    fn install(&self, py: Python<'_>, component: &[u8], manifest: &str) -> PyResult<String> {
-        let manifest = program::Manifest::parse(manifest)
-            .map_err(|e| PyValueError::new_err(format!("manifest: {e:#}")))?;
-        let name = manifest.program_name().to_string();
+    #[pyo3(signature = (bytes, file, version=None))]
+    fn install(
+        &self,
+        py: Python<'_>,
+        bytes: &[u8],
+        file: &str,
+        version: Option<&str>,
+    ) -> PyResult<String> {
         let runtime = self.runtime()?;
-        let component = component.to_vec();
-        py.detach(|| runtime.block_on(program::add(component, manifest, true)))
+        let bytes = bytes.to_vec();
+        let name = py
+            .detach(|| runtime.block_on(program::add(bytes, file, version, true)))
             .map_err(|e| PyRuntimeError::new_err(format!("install: {e:#}")))?;
-        Ok(name)
+        Ok(name.to_string())
     }
 
     /// Stop every engine, join them, and release the runtime. Idempotent;

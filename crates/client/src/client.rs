@@ -370,27 +370,26 @@ impl Client {
 
     pub async fn add_program(
         &self,
-        wasm_path: &Path,
-        manifest_path: &Path,
+        path: &Path,
+        version: Option<&str>,
         force_overwrite: bool,
-    ) -> Result<()> {
-        let blob = fs::read(wasm_path)
-            .with_context(|| format!("Failed to read WASM file: {:?}", wasm_path))?;
-        let manifest = fs::read_to_string(manifest_path)
-            .with_context(|| format!("Failed to read manifest file: {:?}", manifest_path))?;
-        self.add_program_bytes(&blob, &manifest, force_overwrite)
+    ) -> Result<String> {
+        let blob = fs::read(path).with_context(|| format!("Failed to read {:?}", path))?;
+        let file = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .with_context(|| format!("{:?} has no file name", path))?;
+        self.add_program_bytes(&blob, file, version, force_overwrite)
             .await
     }
 
-    /// Install a program from its artifact bytes (a component, or a
-    /// script's source when the manifest names a `[runtime] language`) and
-    /// its manifest TOML.
     pub async fn add_program_bytes(
         &self,
         blob: &[u8],
-        manifest: &str,
+        file: &str,
+        version: Option<&str>,
         force_overwrite: bool,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let program_hash = hash_blob(blob);
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let (tx, rx) = oneshot::channel();
@@ -409,7 +408,8 @@ impl Client {
             let msg = ClientMessage::AddProgram {
                 corr_id: *corr_id_guard,
                 program_hash: program_hash.clone(),
-                manifest: manifest.to_string(),
+                file: file.to_string(),
+                version: version.map(str::to_string),
                 force_overwrite,
                 chunk_index,
                 total_chunks,
@@ -422,7 +422,7 @@ impl Client {
 
         let (ok, result) = rx.await?;
         if ok {
-            Ok(())
+            Ok(result)
         } else {
             anyhow::bail!("Program install failed: {}", result)
         }

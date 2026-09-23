@@ -2,7 +2,8 @@ pub struct InFlightUpload {
     pub total_chunks: usize,
     pub buffer: Vec<u8>,
     pub next_chunk_index: usize,
-    pub manifest: String,
+    pub file: String,
+    pub version: Option<String>,
     pub force_overwrite: bool,
     pub max_total_bytes: usize,
 }
@@ -11,7 +12,8 @@ pub enum ChunkResult {
     InProgress,
     Complete {
         buffer: Vec<u8>,
-        manifest: String,
+        file: String,
+        version: Option<String>,
         force_overwrite: bool,
     },
     Error(String),
@@ -20,7 +22,8 @@ pub enum ChunkResult {
 impl InFlightUpload {
     pub fn new(
         total_chunks: usize,
-        manifest: String,
+        file: String,
+        version: Option<String>,
         force_overwrite: bool,
         max_total_bytes: usize,
     ) -> Self {
@@ -28,7 +31,8 @@ impl InFlightUpload {
             total_chunks,
             buffer: Vec::new(),
             next_chunk_index: 0,
-            manifest,
+            file,
+            version,
             force_overwrite,
             max_total_bytes,
         }
@@ -72,7 +76,8 @@ impl InFlightUpload {
         if self.next_chunk_index == self.total_chunks {
             ChunkResult::Complete {
                 buffer: std::mem::take(&mut self.buffer),
-                manifest: std::mem::take(&mut self.manifest),
+                file: std::mem::take(&mut self.file),
+                version: self.version.take(),
                 force_overwrite: self.force_overwrite,
             }
         } else {

@@ -183,8 +183,8 @@ export const host = {
   async installLanguage(language, wasmBytes) {
     return await driven(bindings.pie_install_language(language, wasmBytes));
   },
-  async install(wasmBytes, manifestToml) {
-    return await driven(bindings.pie_install_program(wasmBytes, manifestToml));
+  async install(bytes, file, version) {
+    return await driven(bindings.pie_install_program(bytes, file, version ?? undefined));
   },
 
   async memoryBytes() {

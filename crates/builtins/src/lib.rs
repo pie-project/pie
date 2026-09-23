@@ -1,17 +1,12 @@
 //! The built-in inferlets: what serves pie's OpenAI / Anthropic / Gemini
-//! routes, compiled from `inferlets/*` (every one whose Pie.toml says
-//! `tier = "builtin"`) and embedded, so a pie binary serves those routes
-//! with nothing installed beside it and the inferlets always match the host
 //! interface they were built against.
 //!
 //! `build.rs` does the compiling; this crate only holds the bytes.
 
-/// One embedded inferlet: its manifest as TOML and its component.
 #[derive(Clone, Copy, Debug)]
 pub struct Builtin {
     pub name: &'static str,
     pub version: &'static str,
-    pub manifest: &'static str,
     pub component: &'static [u8],
 }
 
@@ -30,7 +25,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_builtin_is_a_named_component_with_a_builtin_manifest() {
+    fn every_builtin_is_a_named_component() {
         let mut names: Vec<&str> = ALL.iter().map(|b| b.name).collect();
         names.sort_unstable();
         names.dedup();
@@ -40,16 +35,6 @@ mod tests {
             assert!(
                 b.component.starts_with(b"\0asm"),
                 "{}: component is not wasm",
-                b.name
-            );
-            assert!(
-                b.manifest.contains("tier = \"builtin\""),
-                "{}: not builtin",
-                b.name
-            );
-            assert!(
-                b.manifest.contains(&format!("name = \"{}\"", b.name)),
-                "{}: manifest names something else",
                 b.name
             );
         }

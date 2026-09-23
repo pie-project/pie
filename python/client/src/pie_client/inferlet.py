@@ -17,10 +17,11 @@ inside it or passed in as an argument. A closure over a local, or a use of
 a module-level name, is refused here with the name, since the server would
 only discover it as a NameError.
 
-The manifest is derived: the name from the function's, the version from a
-hash of the source (so an edit is a new program and an unchanged one is
-never re-uploaded), the parameter schema from the signature's annotations
-and defaults, the description from the docstring.
+The name is derived from the function's, the version from a hash of the
+source (so an edit is a new program and an unchanged one is never
+re-uploaded). The language component calls the module's `main` with the
+caller's input as one object, so the source is sent with a `main` appended
+that spreads that object over the function's keyword parameters.
 """
 
 from __future__ import annotations
@@ -30,57 +31,23 @@ import builtins
 import inspect
 import symtable
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import blake3
 
-_TYPE_NAMES = {str: "string", int: "int", float: "float", bool: "bool"}
-
 
 @dataclass(frozen=True)
 class Inferlet:
-    """A function readied to run on pie: its source and the manifest that
-    names it."""
-
     fn: Callable[..., Any]
     name: str
     version: str
-    entry: str
     source: str
-    description: str | None
-    parameters: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def program(self) -> str:
         """`name@version`, the id the server launches by."""
         return f"{self.name}@{self.version}"
-
-    def manifest_toml(self) -> str:
-        lines = [
-            "[package]",
-            f'name = "{self.name}"',
-            f'version = "{self.version}"',
-        ]
-        if self.description:
-            lines.append(f"description = {_toml_string(self.description)}")
-        lines += [
-            "",
-            "[runtime]",
-            'language = "python"',
-            f'entry = "{self.entry}"',
-            'call = "kwargs"',
-        ]
-        if self.parameters:
-            lines += ["", "[parameters]"]
-            for pname, spec in self.parameters.items():
-                parts = [f'type = "{spec["type"]}"']
-                if spec.get("optional"):
-                    parts.append("optional = true")
-                if spec.get("description"):
-                    parts.append(f"description = {_toml_string(spec['description'])}")
-                lines.append(f"{pname} = {{{', '.join(parts)}}}")
-        return "\n".join(lines) + "\n"
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """The function still runs locally when called directly."""
@@ -92,7 +59,6 @@ def inferlet(
     *,
     name: str | None = None,
     version: str | None = None,
-    description: str | None = None,
 ) -> Any:
     """Mark a function as an inferlet. Bare (`@inferlet`) or with options
     (`@inferlet(name="beam-search", version="1.2.0")`)."""
@@ -100,17 +66,12 @@ def inferlet(
     def wrap(fn: Callable[..., Any]) -> Inferlet:
         source = function_source(fn)
         check_self_contained(fn, source)
-        program_name = name or fn.__name__.replace("_", "-")
-        doc = description if description is not None else _first_line(inspect.getdoc(fn))
-        parameters = parameter_schema(fn)
+        source = with_entry(source, fn)
         return Inferlet(
             fn=fn,
-            name=program_name,
+            name=name or fn.__name__.replace("_", "-"),
             version=version or hashed_version(source),
-            entry=fn.__name__,
             source=source,
-            description=doc,
-            parameters=parameters,
         )
 
     return wrap if fn is None else wrap(fn)
@@ -136,6 +97,18 @@ def function_source(fn: Callable[..., Any]) -> str:
         raise ValueError(f"{fn.__name__} is not a function definition")
     lines = dedented.splitlines(keepends=True)
     return "".join(lines[node.lineno - 1 :])
+
+
+def with_entry(source: str, fn: Callable[..., Any]) -> str:
+    entry = fn.__name__
+    if entry == "main":
+        head, _, tail = source.partition("def main(")
+        source = f"{head}def _main({tail}"
+        entry = "_main"
+    call = f"{entry}(**input)"
+    if inspect.iscoroutinefunction(fn):
+        call = f"await {call}"
+    return f"{source}\n\nasync def main(input):\n    return {call}\n"
 
 
 def check_self_contained(fn: Callable[..., Any], source: str) -> None:
@@ -168,35 +141,8 @@ def check_self_contained(fn: Callable[..., Any], source: str) -> None:
         )
 
 
-def parameter_schema(fn: Callable[..., Any]) -> dict[str, dict[str, Any]]:
-    """`[parameters]` from the signature: annotated `str`/`int`/`float`/
-    `bool` become typed entries, a default makes one optional, and anything
-    else is passed through as a string."""
-    schema: dict[str, dict[str, Any]] = {}
-    for pname, param in inspect.signature(fn).parameters.items():
-        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
-            continue
-        entry: dict[str, Any] = {"type": _TYPE_NAMES.get(param.annotation, "string")}
-        if param.default is not inspect.Parameter.empty:
-            entry["optional"] = True
-            entry["description"] = f"default: {param.default!r}"
-        schema[pname] = entry
-    return schema
-
-
 def hashed_version(source: str) -> str:
     """A semver-shaped version that is a function of the source, so the
     server's copy is content-addressed: `0.<16 bits>.<16 bits>`."""
     digest = blake3.blake3(source.encode("utf-8")).hexdigest()
     return f"0.{int(digest[:4], 16)}.{int(digest[4:8], 16)}"
-
-
-def _first_line(doc: str | None) -> str | None:
-    if not doc:
-        return None
-    return doc.strip().splitlines()[0].strip() or None
-
-
-def _toml_string(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-    return f'"{escaped}"'

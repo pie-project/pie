@@ -115,7 +115,7 @@ wheels = [
 
 [[package]]
 name = "inferlet"
-version = "0.5.2"
+version = "0.5.4"
 source = { editable = "." }
 dependencies = [
     { name = "jinja2" },

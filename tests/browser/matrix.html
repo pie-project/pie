@@ -24,7 +24,7 @@
       let output = "";
       try {
         // A script twin needs its language component installed first;
-        // installInferlet does that from the manifest's language.
+        // installInferlet does that from the artifact's extension.
         const { program } = await installInferlet(entry.inferlet);
         const client = await connect();
         const streamed = [];

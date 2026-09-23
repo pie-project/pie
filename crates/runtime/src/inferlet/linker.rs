@@ -1,5 +1,3 @@
-pub(super) mod dynamic;
-
 use std::collections::{HashMap, hash_map::Entry};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -165,10 +163,8 @@ impl Linker {
             .await
             .ok_or_else(|| anyhow!("Component not found for program: {}", program_name))?;
 
-        let dependency_components = Self::resolve_dependencies(program_name).await?;
         let generation = main.generation;
         let component = main.component;
-        let cacheable_instance_pre = dependency_components.is_empty();
 
         let process_ctx =
             ProcessCtx::new(process_id, username, output, &policy, main.script).await?;
@@ -176,35 +172,19 @@ impl Linker {
 
         let base_linker = Self::base_linker(&engine, &policy, &base_linker_cache).await?;
 
-        let dynamic_linker = if dependency_components.is_empty() {
-            None
-        } else {
-            let mut linker = base_linker.as_ref().clone();
-            dynamic::instantiate_libraries(&engine, &mut linker, &mut store, dependency_components)
-                .await?;
-            Some(linker)
-        };
-
-        let instance = if cacheable_instance_pre {
-            let (cell, _cache_hit) =
-                Self::instance_pre_cell(&instance_pre_cache, program_name, generation);
-            let pre = cell
-                .get_or_try_init(|| async {
-                    Self::linker_for(&engine, &base_linker, &component)?
-                        .instantiate_pre(&component)
-                        .map_err(|error| anyhow!("Instantiation pre-link error: {error}"))
-                })
-                .await?;
-            pre.instantiate_async(&mut store)
-                .await
-                .map_err(|e| anyhow!("Instantiation error: {e}"))?
-        } else {
-            let linker = dynamic_linker.expect("dynamic dependencies require a cloned linker");
-            Self::linker_for(&engine, &linker, &component)?
-                .instantiate_async(&mut store, &component)
-                .await
-                .map_err(|e| anyhow!("Instantiation error: {e}"))?
-        };
+        let (cell, _cache_hit) =
+            Self::instance_pre_cell(&instance_pre_cache, program_name, generation);
+        let pre = cell
+            .get_or_try_init(|| async {
+                Self::linker_for(&engine, &base_linker, &component)?
+                    .instantiate_pre(&component)
+                    .map_err(|error| anyhow!("Instantiation pre-link error: {error}"))
+            })
+            .await?;
+        let instance = pre
+            .instantiate_async(&mut store)
+            .await
+            .map_err(|e| anyhow!("Instantiation error: {e}"))?;
         Ok((store, instance))
     }
 
@@ -226,24 +206,6 @@ impl Linker {
         let mut linker = linker.clone();
         wasmtime_wasi::stub_unhosted(&mut linker, engine, component)?;
         Ok(std::borrow::Cow::Owned(linker))
-    }
-
-    async fn resolve_dependencies(program_name: &ProgramName) -> Result<Vec<Component>> {
-        let manifest = program::fetch_manifest(program_name)
-            .await
-            .ok_or_else(|| anyhow!("Manifest not found for: {}", program_name))?;
-
-        let dep_names = manifest.dependency_names();
-        let mut components = Vec::with_capacity(dep_names.len());
-
-        for dep_name in dep_names {
-            let dep = program::get_wasm_component(&dep_name)
-                .await
-                .ok_or_else(|| anyhow!("Dependency component not found: {}", dep_name))?;
-            components.push(dep.component);
-        }
-
-        Ok(components)
     }
 }
 

@@ -257,14 +257,13 @@ def run(args) -> None:
             f"`cargo build -p pie --features cuda`, or pass --pie."
         )
     binary = wasm(args.inferlet)
-    manifest = os.path.join(args.inferlet, "Pie.toml")
     scratch = scratch_dir(args.config)
     for b, case in enumerate(paths):
         out = os.path.join(args.out, f"pie{suffix(args)}_{b}.json")
         cmd = [pie]
         if args.config:
             cmd += ["--config", args.config]
-        cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
+        cmd += ["run", "--path", binary, "--"]
         text = ""
         if args.case_file:
             if scratch and os.path.abspath(scratch) != os.path.abspath(args.out):

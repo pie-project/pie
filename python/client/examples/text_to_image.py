@@ -14,7 +14,7 @@ name is what makes the difference between writing `file-0000.bin` and writing
 guest can drive), so it is what this example is about.
 
 `text-to-image` must already be on the server: `pie inferlet install
-<text_to_image.wasm>`, or `client.install_program(wasm, manifest)` as below,
+<text_to_image.wasm>`, or `client.install_program(wasm)` as below,
 or a `pie run text-to-image` from a source checkout, which uploads it.
 """
 
@@ -29,14 +29,14 @@ INFERLET = "text-to-image@0.1.0"
 
 
 async def draw(uri: str, prompt: str, out: Path, steps: int, size: int,
-               wasm: str | None, manifest: str | None) -> int:
+               wasm: str | None) -> int:
     async with PieClient(uri) as client:
         await client.authenticate("example")
 
         # Only when pointed at a local build. A published inferlet is already
         # there and this is skipped.
-        if wasm and manifest:
-            await client.install_program(wasm, manifest, force_overwrite=True)
+        if wasm:
+            await client.install_program(wasm, force_overwrite=True)
 
         process = await client.launch_process(
             INFERLET,
@@ -81,10 +81,9 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=4)
     ap.add_argument("--size", type=int, default=1024)
     ap.add_argument("--wasm", default=None, help="a local build to upload first")
-    ap.add_argument("--manifest", default=None, help="its Pie.toml")
     args = ap.parse_args()
     return asyncio.run(draw(args.uri, args.prompt, args.out, args.steps,
-                            args.size, args.wasm, args.manifest))
+                            args.size, args.wasm))
 
 
 if __name__ == "__main__":

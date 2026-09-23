@@ -188,13 +188,12 @@ def run(args) -> None:
             f"`cargo build -p pie --features cuda`, or pass --pie."
         )
     binary = wasm(args.inferlet)
-    manifest = os.path.join(args.inferlet, "Pie.toml")
     for b, case in enumerate(paths):
         out = os.path.join(args.out, f"pie{suffix(args)}_{b}.json")
         cmd = [pie]
         if args.config:
             cmd += ["--config", args.config]
-        cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
+        cmd += ["run", "--path", binary, "--"]
         text = ""
         if args.case_file:
             cmd += ["--case_file", os.path.basename(case)]
@@ -257,11 +256,10 @@ def one_run(args, case: dict) -> tuple[np.ndarray, np.ndarray]:
     """One pie run of `case`, in memory — the video and audio answers."""
     pie = args.pie or shutil.which("pie") or os.path.join(REPO, "target/debug/pie")
     binary = wasm(args.inferlet)
-    manifest = os.path.join(args.inferlet, "Pie.toml")
     cmd = [pie]
     if args.config:
         cmd += ["--config", args.config]
-    cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
+    cmd += ["run", "--path", binary, "--"]
     for i, piece in enumerate(split(json.dumps(case), PIECES)):
         cmd += [f"--case_{i}", piece]
     done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)

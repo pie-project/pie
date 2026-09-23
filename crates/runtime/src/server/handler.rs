@@ -3,7 +3,7 @@ use client_api::message::ServerMessage;
 
 use crate::inferlet::process;
 use crate::inferlet::program;
-use crate::inferlet::{Manifest, ProcessId, ProgramName};
+use crate::inferlet::{ProcessId, ProgramName};
 use crate::model;
 
 use super::data_transfer::{ChunkResult, InFlightUpload};
@@ -368,7 +368,8 @@ impl Session {
         &mut self,
         corr_id: u32,
         program_hash: String,
-        manifest: String,
+        file: String,
+        version: Option<String>,
         force_overwrite: bool,
         chunk_index: usize,
         total_chunks: usize,
@@ -394,7 +395,8 @@ impl Session {
                 key.clone(),
                 InFlightUpload::new(
                     total_chunks,
-                    manifest,
+                    file,
+                    version,
                     force_overwrite,
                     self.state.max_upload_bytes,
                 ),
@@ -412,7 +414,8 @@ impl Session {
             }
             ChunkResult::Complete {
                 buffer,
-                manifest: manifest_str,
+                file,
+                version,
                 force_overwrite,
             } => {
                 drop(inflight);
@@ -431,30 +434,16 @@ impl Session {
                     return;
                 }
 
-                let manifest = match Manifest::parse(&manifest_str) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        self.send_response(corr_id, false, format!("Invalid manifest: {}", e))
-                            .await;
-                        return;
-                    }
-                };
-                let program_name = manifest.program_name();
-
-                match program::add(buffer, manifest, force_overwrite).await {
-                    Ok(()) => {
+                match program::add(buffer, &file, version.as_deref(), force_overwrite).await {
+                    Ok(program_name) => {
                         if force_overwrite {
                             self.installed_programs.remove(&program_name);
                         }
                         match program::install(&program_name).await {
                             Ok(()) => {
-                                self.installed_programs.insert(program_name);
-                                self.send_response(
-                                    corr_id,
-                                    true,
-                                    "Program installed successfully".to_string(),
-                                )
-                                .await;
+                                self.installed_programs.insert(program_name.clone());
+                                self.send_response(corr_id, true, program_name.to_string())
+                                    .await;
                             }
                             Err(e) => {
                                 self.send_response(corr_id, false, e.to_string()).await;
@@ -687,6 +676,7 @@ impl Session {
                 InFlightUpload::new(
                     total_chunks,
                     String::new(),
+                    None,
                     false,
                     self.state.max_upload_bytes,
                 ),

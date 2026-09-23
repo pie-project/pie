@@ -1,6 +1,6 @@
-import { PieClient } from "@pie-project/client";
+import { PieClient, programFile } from "@pie-project/client";
 
-export { PieClient };
+export { PieClient, programFile };
 
 export interface LoadInfo {
   worker: boolean;
@@ -32,7 +32,7 @@ export function bootLazy(
 
 export function awaitCache(): Promise<void>;
 
-export function install(wasmBytes: Uint8Array | ArrayBuffer, manifestToml: string): Promise<string>;
+export function install(bytes: Uint8Array | ArrayBuffer, file: string, version?: string | null): Promise<string>;
 
 export function client(): PieClient;
 
@@ -57,7 +57,7 @@ export class Server {
   readonly url: string;
   readonly running: boolean;
   installLanguage(language: "python" | "javascript" | string, source: Uint8Array | ArrayBuffer | URL | string): Promise<string>;
-  install(source: Uint8Array | ArrayBuffer | URL | string, manifest: string): Promise<string>;
+  install(source: Uint8Array | ArrayBuffer | URL | string, file?: string | null, version?: string | null): Promise<string>;
   connect(): Promise<PieClient>;
   memoryBytes(): Promise<number>;
   awaitCache(): Promise<void>;

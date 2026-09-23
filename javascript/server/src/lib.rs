@@ -61,14 +61,18 @@ impl Server {
         }))
     }
 
-    /// Install an inferlet from its component bytes and manifest text,
-    /// replacing an installed version. Resolves to `name@version`.
     #[napi(ts_return_type = "Promise<string>")]
-    pub fn install(&self, component: Buffer, manifest: String) -> Result<AsyncTask<Install>> {
+    pub fn install(
+        &self,
+        bytes: Buffer,
+        file: String,
+        version: Option<String>,
+    ) -> Result<AsyncTask<Install>> {
         Ok(AsyncTask::new(Install {
             runtime: self.runtime()?,
-            component: component.to_vec(),
-            manifest,
+            bytes: bytes.to_vec(),
+            file,
+            version,
         }))
     }
 
@@ -116,8 +120,9 @@ impl Task for InstallLanguage {
 
 pub struct Install {
     runtime: tokio::runtime::Handle,
-    component: Vec<u8>,
-    manifest: String,
+    bytes: Vec<u8>,
+    file: String,
+    version: Option<String>,
 }
 
 #[napi]
@@ -126,14 +131,17 @@ impl Task for Install {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<String> {
-        let manifest = program::Manifest::parse(&self.manifest)
-            .map_err(|e| invalid("manifest", format!("{e:#}")))?;
-        let name = manifest.program_name().to_string();
-        let component = std::mem::take(&mut self.component);
-        self.runtime
-            .block_on(program::add(component, manifest, true))
+        let bytes = std::mem::take(&mut self.bytes);
+        let name = self
+            .runtime
+            .block_on(program::add(
+                bytes,
+                &self.file,
+                self.version.as_deref(),
+                true,
+            ))
             .map_err(|e| failed("install", format!("{e:#}")))?;
-        Ok(name)
+        Ok(name.to_string())
     }
 
     fn resolve(&mut self, _env: Env, name: String) -> Result<String> {

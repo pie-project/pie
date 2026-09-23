@@ -1,5 +1,3 @@
-//! Build every `inferlets/*` whose Pie.toml says `tier = "builtin"` for
-//! wasm32-wasip2 and hand the components to `lib.rs` as `include_bytes!`.
 //!
 //! The inferlets are a separate cargo workspace (they target wasm), so this
 //! runs cargo for it, into that workspace's own target directory. The
@@ -18,7 +16,7 @@ use std::process::Command;
 struct Builtin {
     name: String,
     version: String,
-    manifest: PathBuf,
+    dir: PathBuf,
 }
 
 fn main() {
@@ -49,10 +47,7 @@ fn main() {
 
     let builtins = find_builtins(&inferlets);
     for builtin in &builtins {
-        println!(
-            "cargo:rerun-if-changed={}",
-            builtin.manifest.parent().unwrap().display()
-        );
+        println!("cargo:rerun-if-changed={}", builtin.dir.display());
     }
 
     let mut generated = String::from("static ALL: &[Builtin] = &[\n");
@@ -68,10 +63,9 @@ fn main() {
             fs::copy(&wasm, &staged)
                 .unwrap_or_else(|e| panic!("{} was not built: {e}", wasm.display()));
             generated.push_str(&format!(
-                "    Builtin {{ name: {:?}, version: {:?}, manifest: include_str!({:?}), component: include_bytes!({:?}) }},\n",
+                "    Builtin {{ name: {:?}, version: {:?}, component: include_bytes!({:?}) }},\n",
                 builtin.name,
                 builtin.version,
-                builtin.manifest.display().to_string(),
                 staged.display().to_string(),
             ));
         }
@@ -80,38 +74,36 @@ fn main() {
     fs::write(out_dir.join("builtins.rs"), generated).expect("write builtins.rs");
 }
 
-/// Every `<dir>/Pie.toml` under `inferlets` that says `tier = "builtin"`,
-/// with its `version`.
 fn find_builtins(inferlets: &Path) -> Vec<Builtin> {
     let mut builtins = Vec::new();
     let entries =
         fs::read_dir(inferlets).unwrap_or_else(|e| panic!("reading {}: {e}", inferlets.display()));
     for entry in entries.flatten() {
-        let manifest = entry.path().join("Pie.toml");
-        let Ok(text) = fs::read_to_string(&manifest) else {
+        let cargo_toml = entry.path().join("Cargo.toml");
+        let Ok(text) = fs::read_to_string(&cargo_toml) else {
             continue;
         };
-        if !text
-            .lines()
-            .any(|line| string_value(line, "tier").as_deref() == Some("builtin"))
-        {
+        if !text.lines().any(|line| {
+            line.split_once('=')
+                .is_some_and(|(k, v)| k.trim() == "crate-type" && v.contains("cdylib"))
+        }) {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
         let version = text
             .lines()
             .find_map(|line| string_value(line, "version"))
-            .unwrap_or_else(|| panic!("{}: no version", manifest.display()));
+            .unwrap_or_else(|| panic!("{}: no version", cargo_toml.display()));
         builtins.push(Builtin {
             name,
             version,
-            manifest,
+            dir: entry.path(),
         });
     }
     builtins.sort_by(|a, b| a.name.cmp(&b.name));
     assert!(
         !builtins.is_empty(),
-        "no Pie.toml under {} says tier = \"builtin\"",
+        "no crate under {} builds a component",
         inferlets.display()
     );
     builtins

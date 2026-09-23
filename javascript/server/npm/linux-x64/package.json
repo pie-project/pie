@@ -1,6 +1,6 @@
 {
   "name": "@pie-project/server-linux-x64",
-  "version": "0.5.2",
+  "version": "0.5.4",
   "description": "The linux-x64 native addon of @pie-project/server.",
   "main": "pie-server.node",
   "files": [

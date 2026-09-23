@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "bootstrap"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -404,7 +404,7 @@ checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
 
 [[package]]
 name = "builtins"
-version = "0.5.2"
+version = "0.5.4"
 
 [[package]]
 name = "bumpalo"
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "chat-template"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "serde_json",
  "tokenizer",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "checkpoint"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "half",
  "libc",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "checkpoint-dsl"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "checkpoint",
  "model-dsl",
@@ -777,7 +777,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "controller"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "controller-api",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "controller-api"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "ids",
  "serde",
@@ -1632,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "engine"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "eta-compiler",
  "model-ir",
@@ -1644,7 +1644,7 @@ dependencies = [
 
 [[package]]
 name = "engine-cuda"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "checkpoint",
  "checkpoint-dsl",
@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "engine-metal"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "block2",
  "checkpoint",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "engine-vulkan"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "ash",
  "checkpoint",
@@ -1722,7 +1722,7 @@ dependencies = [
 
 [[package]]
 name = "engine-wgpu"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "ash",
  "checkpoint",
@@ -1790,7 +1790,7 @@ dependencies = [
 
 [[package]]
 name = "eta-compiler"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "naga",
  "pie-eta-ir",
@@ -1799,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "eta-exec"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "eta-compiler",
  "pie-eta-ir",
@@ -2012,7 +2012,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2145,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "grammar"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "criterion 0.5.1",
@@ -2521,7 +2521,7 @@ dependencies = [
 
 [[package]]
 name = "ids"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "serde",
 ]
@@ -2581,7 +2581,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "inferlet-macros",
  "pie-eta-dsl",
@@ -2592,7 +2592,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet-macros"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "quote",
  "syn 3.0.6",
@@ -2757,7 +2757,7 @@ dependencies = [
 
 [[package]]
 name = "kernels-cuda"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "cudarc",
  "pie-dtype",
@@ -2766,21 +2766,21 @@ dependencies = [
 
 [[package]]
 name = "kernels-metal"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "pie-dtype",
 ]
 
 [[package]]
 name = "kernels-vulkan"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "pie-dtype",
 ]
 
 [[package]]
 name = "kernels-wgpu"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "pie-dtype",
  "serde_json",
@@ -2962,7 +2962,7 @@ checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
 name = "media"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "cudarc",
  "image",
@@ -3047,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "model-compiler"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "model-dsl",
  "model-ir",
@@ -3057,14 +3057,14 @@ dependencies = [
 
 [[package]]
 name = "model-dsl"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "model-ir",
 ]
 
 [[package]]
 name = "model-exec"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "model-compiler",
  "model-dsl",
@@ -3074,7 +3074,7 @@ dependencies = [
 
 [[package]]
 name = "model-ir"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "pie-dtype",
  "serde",
@@ -3082,7 +3082,7 @@ dependencies = [
 
 [[package]]
 name = "models"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "chat-template",
  "checkpoint",
@@ -3703,7 +3703,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pie"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "bootstrap",
@@ -3736,7 +3736,7 @@ dependencies = [
 
 [[package]]
 name = "pie-browser"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "checkpoint",
@@ -3769,7 +3769,7 @@ dependencies = [
 
 [[package]]
 name = "pie-client"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3794,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "pie-client-api"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -3802,7 +3802,7 @@ dependencies = [
 
 [[package]]
 name = "pie-dtype"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -3810,7 +3810,7 @@ dependencies = [
 
 [[package]]
 name = "pie-eta-dsl"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "eta-compiler",
  "pie-eta-ir",
@@ -3818,7 +3818,7 @@ dependencies = [
 
 [[package]]
 name = "pie-eta-ir"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "pie-dtype",
  "serde",
@@ -3826,7 +3826,7 @@ dependencies = [
 
 [[package]]
 name = "pie-server-node"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "napi",
  "napi-build",
@@ -3842,7 +3842,7 @@ dependencies = [
 
 [[package]]
 name = "pie-server-py"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "pie",
  "pyo3",
@@ -4555,7 +4555,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4599,7 +4599,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokenizer",
  "tokio",
- "toml 1.1.4+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-opentelemetry 0.33.0",
@@ -4607,6 +4606,7 @@ dependencies = [
  "uuid",
  "waker",
  "wasm-metadata 0.254.0",
+ "wasmparser 0.254.0",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
@@ -5438,7 +5438,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokenizer"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5881,7 +5881,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "bindgen",
  "engine",
@@ -6045,7 +6045,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waker"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "loom",
  "tokio",
@@ -6552,7 +6552,7 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-web"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "cranelift-codegen",
  "getrandom 0.3.4",
@@ -6584,7 +6584,7 @@ dependencies = [
 
 [[package]]
 name = "web-std"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "slab",
  "wasmtime-internal-fiber",
@@ -7267,7 +7267,7 @@ dependencies = [
 
 [[package]]
 name = "worker"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "blake3",
@@ -7302,7 +7302,7 @@ dependencies = [
 
 [[package]]
 name = "worker-api"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "controller-api",
  "futures",

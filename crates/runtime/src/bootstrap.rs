@@ -80,10 +80,10 @@ pub struct Config {
     pub max_concurrent_processes: Option<usize>,
 }
 
-/// One built-in inferlet: its manifest as TOML and its component.
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltinProgram {
-    pub manifest: &'static str,
+    pub name: &'static str,
+    pub version: &'static str,
     pub component: &'static [u8],
 }
 
