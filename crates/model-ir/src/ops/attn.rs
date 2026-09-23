@@ -515,6 +515,9 @@ pub enum Attention {
         primes: Vec<u64>,
         offsets: Vec<u64>,
         heads_per_ngram: u32,
+        /// An i32 table the ids are mapped through before hashing (Engram's
+        /// tokenizer-compressed ids); the window keeps raw ids.
+        map: Option<ValueId>,
         ngram_ids: ValueId,
     },
     PleNgramIdsChunked {
@@ -525,6 +528,7 @@ pub enum Attention {
         primes: Vec<u64>,
         offsets: Vec<u64>,
         heads_per_ngram: u32,
+        map: Option<ValueId>,
         ngram_ids: ValueId,
     },
 }
@@ -888,8 +892,15 @@ impl Operands for Attention {
             } => {
                 sink.extend([*q, *positions, *request_of_token, *selection, *entries]);
             }
-            Self::PleNgramIds { ids, state, .. } => sink.extend([*ids, *state]),
-            Self::PleNgramIdsChunked { ids, state, .. } => sink.extend([*ids, *state]),
+            Self::PleNgramIds {
+                ids, state, map, ..
+            }
+            | Self::PleNgramIdsChunked {
+                ids, state, map, ..
+            } => {
+                sink.extend([*ids, *state]);
+                sink.extend(*map);
+            }
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {

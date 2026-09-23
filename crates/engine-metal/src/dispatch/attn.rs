@@ -611,6 +611,7 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             }
             | Attention::PleNgramIdsChunked {
@@ -621,6 +622,7 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } if self.rs_seat().is_some() => {
                 const OP: &str = "attention.ple_ngram_ids_committed";
@@ -641,6 +643,7 @@ impl Run<'_> {
                     primes,
                     offsets,
                     *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
                     self.tensor(*ngram_ids),
                 )
             }
@@ -747,6 +750,7 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } => {
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
@@ -762,6 +766,7 @@ impl Run<'_> {
                     primes,
                     offsets,
                     *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
                     self.tensor(*ngram_ids),
                 )
             }
@@ -773,6 +778,7 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } => {
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
@@ -788,6 +794,7 @@ impl Run<'_> {
                     primes,
                     offsets,
                     *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
                     self.tensor(*ngram_ids),
                 )
             }

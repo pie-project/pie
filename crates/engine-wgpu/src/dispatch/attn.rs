@@ -630,8 +630,13 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } => {
+                if map.is_some() {
+                    // Engram's id map is not carried by this backend's hasher yet.
+                    return Err(kernels_wgpu::Error::Unsupported { op: op.name() });
+                }
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
                     return Err(kernels_wgpu::Error::Unsupported { op: op.name() });
                 };
@@ -656,8 +661,13 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } => {
+                if map.is_some() {
+                    // Engram's id map is not carried by this backend's hasher yet.
+                    return Err(kernels_wgpu::Error::Unsupported { op: op.name() });
+                }
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
                     return Err(kernels_wgpu::Error::Unsupported { op: op.name() });
                 };

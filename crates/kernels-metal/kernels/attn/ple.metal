@@ -17,6 +17,14 @@ inline void ple_mask_window(thread int* window, int ngram, int eos) {
   }
 }
 
+// Engram hashes tokenizer-compressed ids: the window holds raw ids (so the
+// state and the eos barrier stay in the tokenizer's id space) and is mapped
+// after masking, so the pre-start padding maps like every other id.
+inline void ple_map_window(const device int* map, int has_map, thread int* window, int ngram) {
+  if (!has_map) return;
+  for (int p = 0; p < ngram; ++p) window[p] = map[window[p]];
+}
+
 inline void ple_hash_row(
     const device ulong* hash,
     thread const int* window,
@@ -50,6 +58,8 @@ inline void ple_hash_row(
     const constant int& heads               [[buffer(6)]],
     const constant int& heads_per_ngram     [[buffer(7)]],
     const constant int& eos                 [[buffer(8)]],
+    const device int* map                   [[buffer(9)]],
+    const constant int& has_map             [[buffer(10)]],
     uint pos [[thread_position_in_grid]]) {
   const int r = int(pos);
   const int span = ngram - 1;
@@ -63,6 +73,7 @@ inline void ple_hash_row(
     window[p] = cell == 0 ? eos : cell - 1;
   }
   ple_mask_window(window, ngram, eos);
+  ple_map_window(map, has_map, window, ngram);
 
   int out[PLE_MAX_HEADS];
   ple_hash_row(hash, window, ngram, heads, heads_per_ngram, out);
@@ -87,6 +98,8 @@ inline void ple_hash_row(
     const constant int& heads               [[buffer(7)]],
     const constant int& heads_per_ngram     [[buffer(8)]],
     const constant int& eos                 [[buffer(9)]],
+    const device int* map                   [[buffer(10)]],
+    const constant int& has_map             [[buffer(11)]],
     uint pos [[thread_position_in_grid]]) {
   const int r = int(pos);
   const int begin = indptr[r];
@@ -110,6 +123,7 @@ inline void ple_hash_row(
       }
     }
     ple_mask_window(window, ngram, eos);
+    ple_map_window(map, has_map, window, ngram);
 
     int out[PLE_MAX_HEADS];
     ple_hash_row(hash, window, ngram, heads, heads_per_ngram, out);
@@ -142,6 +156,8 @@ inline void ple_hash_row(
     const constant int& heads               [[buffer(10)]],
     const constant int& heads_per_ngram     [[buffer(11)]],
     const constant int& eos                 [[buffer(12)]],
+    const device int* map                   [[buffer(13)]],
+    const constant int& has_map             [[buffer(14)]],
     uint pos [[thread_position_in_grid]]) {
   const int r = int(pos);
   int begin = indptr[r];
@@ -171,6 +187,7 @@ inline void ple_hash_row(
       }
     }
     ple_mask_window(window, ngram, eos);
+    ple_map_window(map, has_map, window, ngram);
 
     const int replayed = replay[lane0 + r];
     if (t < replayed) {
