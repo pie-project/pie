@@ -29,7 +29,7 @@ fn pie_word_at(base: u32, lane: u32, i: u32) -> u32 {
 //#endif
 //#if defined(PIE_SELECTED)
 
-@group(0) @binding(10) var<storage, read> selection: array<i32>;
+@group(0) @binding(11) var<storage, read> selection: array<i32>;
 //#endif
 
 struct Params {
@@ -50,7 +50,7 @@ struct Params {
 //#if defined(PIE_LSE)
 @group(0) @binding(12) var<uniform> params: Params;
 //#elif defined(PIE_SELECTED)
-@group(0) @binding(11) var<uniform> params: Params;
+@group(0) @binding(12) var<uniform> params: Params;
 //#else
 @group(0) @binding(10) var<uniform> params: Params;
 //#endif
