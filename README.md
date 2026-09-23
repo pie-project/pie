@@ -53,18 +53,8 @@ pie model import Qwen/Qwen3.5-0.8B
 
 ## Write an inferlet
 
-`Pie.toml` names the program and its language; `main.py` is the program. This
-one is greedy text completion, one forward pass per token:
-
-```toml
-[package]
-name = "quickstart"
-version = "0.1.0"
-
-[runtime]
-language = "python"
-core = "^0.2.0"
-```
+A program is one file; its extension says the language. This one is greedy
+text completion, one forward pass per token:
 
 ```python
 from inferlet import chat, model
@@ -116,7 +106,7 @@ serve` holds the terminal, and the Python client (`pip install pie-client`)
 submits the same file from another shell:
 
 ```bash
-pie-client submit --path main.py --manifest Pie.toml -- --prompt "The capital of France is"
+pie-client submit --path main.py -- --prompt "The capital of France is"
 ```
 
 ## Compatible APIs

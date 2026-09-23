@@ -8,7 +8,6 @@ import json
 import shutil
 import subprocess
 import tempfile
-import tomllib
 from pathlib import Path
 from typing import Optional
 
@@ -67,35 +66,6 @@ def _parse_cli_value(s: str):
     if s == "false":
         return False
     return s
-
-
-def parse_manifest(manifest_content: str) -> tuple[str, str]:
-    """Parse the manifest to extract name and version.
-
-    Args:
-        manifest_content: The TOML manifest content as a string.
-
-    Returns:
-        A tuple of (name, version).
-
-    Raises:
-        ValueError: If the manifest is missing required fields.
-    """
-    manifest = tomllib.loads(manifest_content)
-
-    package = manifest.get("package")
-    if package is None:
-        raise ValueError("Manifest missing [package] section")
-
-    name = package.get("name")
-    if name is None:
-        raise ValueError("Manifest missing package.name field")
-
-    version = package.get("version")
-    if version is None:
-        raise ValueError("Manifest missing package.version field")
-
-    return name, version
 
 
 def compose_components(
@@ -184,7 +154,7 @@ def compose_components(
 def handle_submit_command(
     inferlet: Optional[str] = None,
     path: Optional[Path] = None,
-    manifest: Optional[Path] = None,
+    version: Optional[str] = None,
     config: Optional[Path] = None,
     host: Optional[str] = None,
     port: Optional[int] = None,
@@ -197,15 +167,14 @@ def handle_submit_command(
     """Handle the `pie-cli submit` command.
 
     You can specify an inferlet either by installed name or by path (mutually exclusive):
-
     - By name: pie-client submit text-completion@0.1.0 -- --prompt "hello"
-    - By path: pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml -- --prompt "hello"
+    - By path: pie-client submit --path ./my_inferlet.wasm -- --prompt "hello"
 
     Steps:
     1. Creates a client configuration from config file and command-line arguments
     2. Connects to the Pie engine server
     3. If using path and libraries are specified, composes them with the inferlet using wac
-    4. Uploads the composed inferlet if not already on server (path mode only)
+    4. Uploads the inferlet; the server answers with the `name@version` to launch (path mode only)
     5. Launches the inferlet with the provided arguments
     6. When capturing outputs, streams the inferlet output with signal handling
     """
@@ -220,11 +189,6 @@ def handle_submit_command(
     if inferlet is not None and path is not None:
         arguments = [inferlet] + (arguments or [])
         inferlet = None
-
-    # Validate manifest is provided when using --path
-    if path is not None and manifest is None:
-        typer.echo("Error: --manifest is required when using --path", err=True)
-        raise typer.Exit(1)
 
     link = link or []
     arguments = arguments or []
@@ -247,34 +211,18 @@ def handle_submit_command(
             if not path.exists():
                 raise FileNotFoundError(f"Inferlet file not found: {path}")
 
-            if not manifest.exists():
-                raise FileNotFoundError(f"Manifest file not found: {manifest}")
-
-            manifest_content = manifest.read_text()
-
-            # Parse the manifest to extract name and version
-            name, version = parse_manifest(manifest_content)
-            inferlet_name = f"{name}@{version}"
-
-            typer.echo(f"Inferlet: {inferlet_name}")
-
-            # If libraries are specified, compose them and always upload
             if link:
-                with tempfile.NamedTemporaryFile(suffix=".wasm", delete=False) as tmp:
-                    composed_path = Path(tmp.name)
-                    try:
-                        compose_components(path, link, composed_path)
-                        engine.install_program(client, composed_path, manifest, force_overwrite=force_overwrite)
-                    finally:
-                        composed_path.unlink(missing_ok=True)
-                typer.echo("✅ Inferlet installed successfully.")
-            # No composition - check if program already exists before installing
+                with tempfile.TemporaryDirectory() as composed_dir:
+                    composed_path = Path(composed_dir) / path.name
+                    compose_components(path, link, composed_path)
+                    inferlet_name = engine.install_program(
+                        client, composed_path, version, force_overwrite=force_overwrite
+                    )
             else:
-                if not engine.check_program(client, inferlet_name):
-                    engine.install_program(client, path, manifest, force_overwrite=force_overwrite)
-                    typer.echo("✅ Inferlet installed successfully.")
-                else:
-                    typer.echo("Inferlet already exists on server.")
+                inferlet_name = engine.install_program(
+                    client, path, version, force_overwrite=force_overwrite
+                )
+            typer.echo(f"✅ Installed {inferlet_name}.")
 
             # Launch the instance
             instance = engine.launch_process(

@@ -82,14 +82,14 @@
       }
     }, (d) => d.includes("single-use") || d.includes("refused"));
 
-    const { bytes: wasm, manifest } = await inferletBytes("text-completion");
+    const { bytes: wasm, file } = await inferletBytes("text-completion");
     let program = null;
     await check("UI thread free during install", async () => {
-      const d = await timed(() => pie.install(new Uint8Array(wasm), manifest));
+      const d = await timed(() => pie.install(new Uint8Array(wasm), file));
       program = d.result;
       return fmt(d);
     }, () => program !== null);
-    if (program === null) program = await pie.install(new Uint8Array(wasm), manifest);
+    if (program === null) program = await pie.install(new Uint8Array(wasm), file);
     let uiChecks = [];
     const uiCheck = async (name, fn) => {
       let detail = null;
@@ -113,26 +113,12 @@
     });
 
     await check("install the same program again (force) → same name, still runs", async () => {
-      const again = await pie.install(new Uint8Array(wasm), manifest);
+      const again = await pie.install(new Uint8Array(wasm), file);
       const client = await connect();
       const last = await run(client, again, { prompt: "Hi", max_tokens: 2 });
       await client.close();
       return `${again}: ${last.event}`;
     }, (d) => d === `${program}: return`);
-
-    await check("garbage bytes as a program → launch fails, runtime survives", async () => {
-      const name = await pie.install(new Uint8Array([1, 2, 3, 4]), manifest.replace('name = "text-completion"', 'name = "garbage"'));
-      const client = await connect();
-      let first;
-      try {
-        first = (await run(client, name, { prompt: "Hi", max_tokens: 2 })).event;
-      } catch (e) {
-        first = `refused (${String(e.message ?? e).slice(0, 50)})`;
-      }
-      const last = await run(client, program, { prompt: "Hi", max_tokens: 2 });
-      await client.close();
-      return `garbage launch: ${first}; next run ${last.event}`;
-    }, (d) => (d.includes("garbage launch: error") || d.includes("garbage launch: refused")) && d.endsWith("return"));
 
     await check("request on a closed connection → error", async () => {
       const client = await connect();

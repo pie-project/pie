@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pie-language-python"
-version = "0.5.2"
+version = "0.5.4"
 description = "The python language component of pie: install it beside pie-server, and python inferlets run."
 readme = "README.md"
 requires-python = ">=3.10"

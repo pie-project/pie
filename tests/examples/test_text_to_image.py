@@ -15,7 +15,6 @@ no `--path`, and that what arrives is a named file -- is
 `test_generating_images.py`. This suite is about the sampler.
 
 Two claims, one per row:
-
   * on a generative row with a text encoder (FLUX.2 klein-4B), four steps at 1024²
     land a finite 64x64x128 latent whose sigmas are the model's own, and
     `scripts/imagegen/decode_latent.py` turns it into a PNG of the stated size;
@@ -26,7 +25,6 @@ Two claims, one per row:
 **WANTS A GENERATIVE MODEL.** There is no text-model fallback: a row with no
 denoise reading is reported as a skip, not a failure. The runs that mean to
 exercise the door name their config:
-
     CUDA_VISIBLE_DEVICES=3 uv run python tests/examples/test_text_to_image.py \\
         --config ~/.pie/config.flux2.toml \\
         --model-dir ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*/
@@ -88,8 +86,7 @@ NO_LATENT = (
 )
 
 
-def build_guest() -> tuple[Path, Path]:
-    """Build the guest and return its `.wasm` and `Pie.toml`."""
+def build_guest() -> Path:
     if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
         subprocess.run(
             ["cargo", "build", "-p", NAME, "--release", "--target", "wasm32-wasip2"],
@@ -100,7 +97,7 @@ def build_guest() -> tuple[Path, Path]:
             / f"{NAME.replace('-', '_')}.wasm")
     if not wasm.exists():
         raise FileNotFoundError(f"no guest at {wasm}; build it or unset PIE_INFERLETS_NO_BUILD")
-    return wasm, INFERLETS_DIR / NAME / "Pie.toml"
+    return wasm
 
 
 def find_cli(binary: str | None) -> Path:
@@ -130,12 +127,11 @@ def resolve(path: str) -> str:
 
 
 def run_guest(args, out_dir: Path, extra: list[str]) -> tuple[int, str, str]:
-    wasm, manifest = build_guest()
+    wasm = build_guest()
     cmd = [str(find_cli(args.pie))]
     if args.config:
         cmd += ["--config", resolve(args.config)]
-    cmd += ["run", "--path", str(wasm), "--manifest", str(manifest),
-            "-o", str(out_dir), "--"] + extra
+    cmd += ["run", "--path", str(wasm), "-o", str(out_dir), "--"] + extra
     print("Run:   ", " ".join(cmd))
     proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True,
                           timeout=args.timeout)

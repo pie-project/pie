@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use ::runtime::inferlet::program::{Manifest, ProgramName};
+use ::runtime::inferlet::program::ProgramName;
 use worker::WorkerHandle;
 
 fn snapshot_in_hub(repo: &str) -> String {
@@ -89,7 +89,7 @@ pub async fn boot_cuda() -> WorkerHandle {
     boot_cuda_model(&snapshot()).await
 }
 
-pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
+pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, ProgramName) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../examples")
         .join(name);
@@ -116,17 +116,22 @@ pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
     };
     let wasm =
         std::fs::read(&wasm_path).unwrap_or_else(|e| panic!("read {}: {e}", wasm_path.display()));
-    let manifest =
-        Manifest::parse(&std::fs::read_to_string(dir.join("Pie.toml")).unwrap()).unwrap();
-    let program_name = ProgramName::parse(&format!("{name}@{}", manifest.package.version)).unwrap();
-    (wasm, manifest, program_name)
+    let program_name = ::runtime::inferlet::program::identify(
+        &format!("{name}.wasm"),
+        None,
+        &wasm,
+    )
+    .expect("the example names itself")
+    .name;
+    (wasm, program_name)
 }
 
 pub async fn install_inferlet(name: &str) -> ProgramName {
-    let (wasm, manifest, program_name) = load_curated_inferlet(name);
-    ::runtime::inferlet::program::add(wasm, manifest, true)
+    let (wasm, program_name) = load_curated_inferlet(name);
+    let installed = ::runtime::inferlet::program::add(wasm, &format!("{name}.wasm"), None, true)
         .await
         .expect("add program");
+    assert_eq!(installed, program_name);
     ::runtime::inferlet::program::install(&program_name)
         .await
         .expect("install program");

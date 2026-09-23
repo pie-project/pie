@@ -35,20 +35,15 @@ export function loadRuntime(params) {
   return pie.load({ log: params.get("log") ?? undefined, worker: params.get("worker") !== "0" });
 }
 
-/** The `[runtime] language` a manifest declares, if it is a script. */
-function manifestLanguage(manifest) {
-  const m = /^\s*language\s*=\s*"([a-z]+)"/m.exec(manifest);
-  return m ? m[1] : null;
-}
-
-const EXTENSION = { python: "py", javascript: "js" };
+const LANGUAGE = { wasm: null, py: "python", js: "javascript" };
 
 export async function inferletBytes(name) {
-  const manifest = await fetch(`inferlets/${name}.Pie.toml`).then((r) => r.text());
-  const language = manifestLanguage(manifest);
-  const file = `inferlets/${name.replace(/-/g, "_")}.${language ? EXTENSION[language] : "wasm"}`;
-  const bytes = new Uint8Array(await fetch(file).then((r) => r.arrayBuffer()));
-  return { bytes, manifest, language };
+  const stem = name.replace(/-/g, "_");
+  for (const ext of Object.keys(LANGUAGE)) {
+    const r = await fetch(`inferlets/${stem}.${ext}`);
+    if (r.ok) return { bytes: new Uint8Array(await r.arrayBuffer()), file: `${name}.${ext}`, language: LANGUAGE[ext] };
+  }
+  throw new Error(`no inferlets/${stem}.{wasm,py,js} beside the page; tools/inferlets.sh copies them from examples`);
 }
 
 const languages = new Map();
@@ -66,9 +61,9 @@ export async function ensureLanguage(language) {
 }
 
 export async function installInferlet(name) {
-  const { bytes, manifest, language } = await inferletBytes(name);
+  const { bytes, file, language } = await inferletBytes(name);
   if (language) await ensureLanguage(language);
-  return { program: await pie.install(bytes, manifest), bytes, manifest };
+  return { program: await pie.install(bytes, file), bytes, file };
 }
 
 export const connect = pie.connect;

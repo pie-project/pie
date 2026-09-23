@@ -26,10 +26,7 @@ for (const entry of list) {
   let output = "";
   try {
     const file = entry.inferlet.replace(/-/g, "_");
-    const manifest = `${root}examples/${entry.inferlet}/Pie.toml`;
-    await client.installProgram(`${root}examples/target/wasm32-wasip2/release/${file}.wasm`, manifest, true);
-    const toml = readFileSync(manifest, "utf8");
-    const program = `${toml.match(/^name\s*=\s*"([^"]+)"/m)[1]}@${toml.match(/^version\s*=\s*"([^"]+)"/m)[1]}`;
+    const program = await client.installProgram(`${root}examples/target/wasm32-wasip2/release/${file}.wasm`, null, true);
     const proc = await client.launchProcess(program, entry.input);
     const streamed = [];
     let returned = null;

@@ -36,8 +36,7 @@ INFERLETS_DIR = REPO_ROOT / "examples"
 NAME = "frames-probe"
 
 
-def build_guest() -> tuple[Path, Path]:
-    """Build the fixture and return its `.wasm` and `Pie.toml`."""
+def build_guest() -> Path:
     if not os.environ.get("PIE_INFERLETS_NO_BUILD"):
         subprocess.run(
             ["cargo", "build", "-p", NAME, "--target", "wasm32-wasip2"],
@@ -47,7 +46,7 @@ def build_guest() -> tuple[Path, Path]:
     wasm = INFERLETS_DIR / "target" / "wasm32-wasip2" / "debug" / f"{NAME.replace('-', '_')}.wasm"
     if not wasm.exists():
         raise FileNotFoundError(f"no guest at {wasm}; build it or unset PIE_INFERLETS_NO_BUILD")
-    return wasm, INFERLETS_DIR / NAME / "Pie.toml"
+    return wasm
 
 
 def build_cli(features: str, release: bool) -> Path:
@@ -156,7 +155,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=1800)
     args = parser.parse_args()
 
-    wasm, manifest = build_guest()
+    wasm = build_guest()
     binary = build_cli(args.features, release=not args.debug_cli)
 
     out_dir = Path(args.out) if args.out else Path(tempfile.mkdtemp(prefix="pie-frames-"))
@@ -166,7 +165,6 @@ def main() -> int:
     cmd = [
         str(binary), "run",
         "--path", str(wasm),
-        "--manifest", str(manifest),
         "-o", str(out_dir),
         "--",
         "--width", str(args.width),

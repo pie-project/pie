@@ -4,7 +4,7 @@
 //! acceptance rule, its schedule, its self-conditioning taps, its stopping
 //! rule, and what gets committed. Nothing here needed a host change.
 //!
-//! Knobs (all inputs; see `Pie.toml`):
+//! Knobs (all inputs):
 //! - `variant`: the acceptance rule —
 //!   `reference`: the entropy-bound budget (EB-sampler, Ben-Hamu et al.
 //!   2505.24857) — DiffusionGemma's own;

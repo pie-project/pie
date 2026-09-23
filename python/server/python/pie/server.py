@@ -17,6 +17,8 @@ import asyncio
 import copy
 import importlib
 import importlib.util
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pie.config import Config
@@ -80,10 +82,23 @@ class Server:
         a script inferlet in that language runs once this returns."""
         return await asyncio.to_thread(self._alive().install_language, language, component)
 
-    async def install(self, component: bytes, manifest: str) -> str:
-        """Install an inferlet from its component bytes and manifest text, replacing
-        an installed version; returns `name@version`."""
-        return await asyncio.to_thread(self._alive().install, component, manifest)
+    async def install(
+        self,
+        source: str | os.PathLike[str] | bytes,
+        file: str | None = None,
+        version: str | None = None,
+    ) -> str:
+        if isinstance(source, bytes):
+            if file is None:
+                raise TypeError("install(bytes) needs `file`, the name the bytes install under")
+        else:
+            from pie_client import program_file
+
+            path = Path(source)
+            if file is None:
+                file = program_file(path)
+            source = path.read_bytes()
+        return await asyncio.to_thread(self._alive().install, source, file, version)
 
     async def connect(self) -> "PieClient":
         """A `PieClient` connected to this engine; closed by `shutdown()`."""

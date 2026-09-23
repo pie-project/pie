@@ -8,14 +8,10 @@ use crate::ops::inferlet::{Artifact, load_artifact};
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// An installed inferlet's name, or a path to a `.wasm` or `.py`.
     pub inferlet: Option<String>,
 
     #[arg(long, short = 'p')]
     pub path: Option<PathBuf>,
-
-    #[arg(long, short = 'm')]
-    pub manifest: Option<PathBuf>,
 
     #[arg(long = "out", short = 'o', value_name = "DIR")]
     pub out: Option<PathBuf>,
@@ -28,11 +24,8 @@ pub struct RunArgs {
 pub enum Target {
     /// A name to resolve against what is installed (or curated in this tree).
     Installed(String),
-    /// A file to upload and run: a component or a script, with its manifest
-    /// beside it, named, or (for a script) implied.
     Local {
         path: PathBuf,
-        manifest: Option<PathBuf>,
     },
 }
 
@@ -46,14 +39,10 @@ fn looks_like_a_file(word: &str) -> bool {
             .is_some_and(|e| matches!(e, "wasm" | "py" | "js" | "mjs"))
 }
 
-pub fn target(
-    inferlet: Option<&str>,
-    path: Option<&Path>,
-    manifest: Option<&Path>,
-) -> Result<Target> {
+pub fn target(inferlet: Option<&str>, path: Option<&Path>) -> Result<Target> {
     match (inferlet, path) {
         (None, None) => bail!(
-            "name an inferlet to run, or a `.wasm` or `.py` to run from a file. \
+            "name an inferlet to run, or a `.wasm`, `.py` or `.js` to run from a file. \
              `pie inferlet list` shows what is installed."
         ),
         (Some(inferlet), Some(path)) => bail!(
@@ -68,29 +57,15 @@ pub fn target(
             }
             Ok(Target::Local {
                 path: path.to_path_buf(),
-                manifest: manifest.map(Path::to_path_buf),
             })
         }
-        (Some(inferlet), None) => {
-            if manifest.is_some() {
-                bail!(
-                    "`--manifest` describes a local build, so it only means something with a file"
-                );
-            }
-            Ok(Target::Installed(inferlet.to_string()))
-        }
+        (Some(inferlet), None) => Ok(Target::Installed(inferlet.to_string())),
         (None, Some(path)) => {
             if !path.exists() {
                 bail!("no file at {}", path.display());
             }
-            if let Some(manifest) = manifest
-                && !manifest.exists()
-            {
-                bail!("no manifest at {}", manifest.display());
-            }
             Ok(Target::Local {
                 path: path.to_path_buf(),
-                manifest: manifest.map(Path::to_path_buf),
             })
         }
     }
@@ -99,7 +74,7 @@ pub fn target(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Curated {
     pub root: PathBuf,
-    pub manifest: PathBuf,
+    pub dir: PathBuf,
     /// A component built from the directory's Rust source.
     pub wasm: Option<PathBuf>,
     /// The directory's script, when the inferlet is one (`main.py`, `index.js`).
@@ -152,14 +127,14 @@ pub fn curated_in(roots: &[PathBuf], name: &str) -> Option<Curated> {
     }
     let artifact = format!("{}.wasm", name.replace('-', "_"));
     roots.iter().find_map(|root| {
-        let manifest = root.join(name).join("Pie.toml");
-        if !manifest.is_file() {
-            return None;
-        }
+        let dir = root.join(name);
         let script = ["main.py", "index.js"]
             .iter()
-            .map(|file| root.join(name).join(file))
+            .map(|file| dir.join(file))
             .find(|path| path.is_file());
+        if script.is_none() && !dir.join("Cargo.toml").is_file() {
+            return None;
+        }
         let built = std::env::var_os("CARGO_TARGET_DIR")
             .map_or_else(|| root.join("target"), PathBuf::from)
             .join("wasm32-wasip2");
@@ -169,7 +144,7 @@ pub fn curated_in(roots: &[PathBuf], name: &str) -> Option<Curated> {
             .find(|path| path.is_file());
         Some(Curated {
             root: root.clone(),
-            manifest,
+            dir,
             wasm,
             script,
             name: name.to_string(),
@@ -250,7 +225,7 @@ pub struct Plan {
 
 fn resolve(target: Target) -> Result<Plan> {
     let spec = match target {
-        Target::Local { path, manifest } => return plan_local(&path, manifest.as_deref()),
+        Target::Local { path } => return plan_local(&path),
         Target::Installed(spec) => spec,
     };
 
@@ -258,7 +233,7 @@ fn resolve(target: Target) -> Result<Plan> {
     if let Some(found) = &curated
         && let Some(artifact) = found.artifact()
     {
-        return plan_local(artifact, Some(&found.manifest));
+        return plan_local(artifact);
     }
 
     match crate::ops::inferlet::resolve_installed(&spec) {
@@ -269,7 +244,7 @@ fn resolve(target: Target) -> Result<Plan> {
         Err(error) => match curated {
             Some(found) => bail!(
                 "{spec:?} is in this tree at {} but has not been built; `{}` builds it",
-                crate::ui::short_path(&found.manifest),
+                crate::ui::short_path(&found.dir),
                 found.build_hint()
             ),
             None => Err(error),
@@ -277,10 +252,10 @@ fn resolve(target: Target) -> Result<Plan> {
     }
 }
 
-fn plan_local(path: &Path, manifest: Option<&Path>) -> Result<Plan> {
-    let artifact = load_artifact(path, manifest)?;
+fn plan_local(path: &Path) -> Result<Plan> {
+    let artifact = load_artifact(path, None)?;
     Ok(Plan {
-        program: artifact.manifest.program_name().to_string(),
+        program: artifact.identity.name.to_string(),
         upload: Some((path.to_path_buf(), artifact)),
     })
 }
@@ -299,11 +274,7 @@ pub async fn run(
         )
     })?;
 
-    let target = target(
-        args.inferlet.as_deref(),
-        args.path.as_deref(),
-        args.manifest.as_deref(),
-    )?;
+    let target = target(args.inferlet.as_deref(), args.path.as_deref())?;
 
     let (controller, gateway, mut worker) = crate::derive::derive_standalone(&content)?;
     if let Some(words) = diag {
@@ -417,10 +388,21 @@ async fn drive(
         .context("authenticate")?;
 
     if let Some((path, artifact)) = &plan.upload {
-        client
-            .add_program_bytes(&artifact.bytes, &artifact.manifest_toml, true)
+        let installed = client
+            .add_program_bytes(
+                &artifact.bytes,
+                &artifact.file,
+                Some(&artifact.identity.name.version),
+                true,
+            )
             .await
             .with_context(|| format!("uploading {}", path.display()))?;
+        if installed != *program {
+            bail!(
+                "{} was installed as {installed}, not {program}",
+                path.display()
+            );
+        }
     }
 
     let mut process = client
@@ -496,7 +478,7 @@ mod tests {
     fn tree(dir: &Path, name: &str, profile: Option<&str>) {
         std::fs::create_dir_all(dir.join(name)).unwrap();
         std::fs::write(
-            dir.join(name).join("Pie.toml"),
+            dir.join(name).join("Cargo.toml"),
             format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
         )
         .unwrap();
@@ -513,7 +495,7 @@ mod tests {
 
     #[test]
     fn run_every_case() {
-        a_curated_name_resolves_to_the_build_beside_its_manifest();
+        a_curated_name_resolves_to_the_build_of_its_crate();
         an_unbuilt_curated_directory_is_found_without_a_wasm();
         a_script_twin_is_its_source_and_needs_no_build();
         release_outranks_debug();
@@ -524,7 +506,7 @@ mod tests {
 
     fn a_script_twin_is_its_source_and_needs_no_build() {
         let dir = tempfile::tempdir().unwrap();
-        tree(dir.path(), "text-completion-py", None);
+        std::fs::create_dir_all(dir.path().join("text-completion-py")).unwrap();
         std::fs::write(dir.path().join("text-completion-py").join("main.py"), "").unwrap();
         let found = curated_in(&[dir.path().to_path_buf()], "text-completion-py").unwrap();
         assert!(found.wasm.is_none());
@@ -545,19 +527,18 @@ mod tests {
         std::fs::write(&script, "").unwrap();
         let script_str = script.to_str().unwrap();
         assert_eq!(
-            target(Some(script_str), None, None).unwrap(),
+            target(Some(script_str), None).unwrap(),
             Target::Local {
                 path: script.clone(),
-                manifest: None
             }
         );
         assert_eq!(
-            target(Some("probe"), None, None).unwrap(),
+            target(Some("probe"), None).unwrap(),
             Target::Installed("probe".to_string())
         );
     }
 
-    fn a_curated_name_resolves_to_the_build_beside_its_manifest() {
+    fn a_curated_name_resolves_to_the_build_of_its_crate() {
         let dir = tempfile::tempdir().unwrap();
         tree(dir.path(), "text-to-image", Some("release"));
         let found = curated_in(&[dir.path().to_path_buf()], "text-to-image").unwrap();

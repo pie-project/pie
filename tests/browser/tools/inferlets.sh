@@ -9,7 +9,6 @@ for name in $(python3 -c 'import json; print(" ".join(sorted({e["inferlet"] for 
     *-py) cp "examples/$name/main.py" "tests/browser/inferlets/${name//-/_}.py" ;;
     *) cp "examples/target/wasm32-wasip2/release/${name//-/_}.wasm" tests/browser/inferlets/ ;;
   esac
-  cp "examples/$name/Pie.toml" "tests/browser/inferlets/$name.Pie.toml"
 done
 # The script twins run under their language component, which
 # the page installs from bytes: copy the ones the examples workspace built.

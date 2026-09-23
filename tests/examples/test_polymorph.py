@@ -10,7 +10,6 @@ correctness gate, because a batcher that corrupts a neighbours' rows shows up
 exactly there.
 
 Usage::
-
     python/server/.venv/bin/python tests/examples/test_polymorph.py
     ... --model Qwen/Qwen3-0.6B --timeout 300
 """
@@ -21,7 +20,6 @@ import asyncio
 import json
 import os
 import time
-import tomllib
 from pathlib import Path
 
 
@@ -42,7 +40,7 @@ from conftest import INFERLETS_DIR, run_tests  # noqa: E402
 _installed: dict[str, str] = {}  # name -> inferlet_id
 
 
-def _resolve(name: str) -> tuple[Path, Path]:
+def _resolve(name: str) -> Path:
     wasm_name = name.replace("-", "_")
     inferlet_dir = INFERLETS_DIR / name
     candidates = [
@@ -54,21 +52,15 @@ def _resolve(name: str) -> tuple[Path, Path]:
     ]
     present = [p for p in candidates if p.exists()]
     wasm_path = max(present, key=lambda p: p.stat().st_mtime, default=None)
-    manifest_path = inferlet_dir / "Pie.toml"
     if wasm_path is None:
         raise FileNotFoundError(f"no wasm for {name}")
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"no Pie.toml for {name}")
-    return wasm_path, manifest_path
+    return wasm_path
 
 
 async def _ensure_installed(client, name: str) -> str:
     if name in _installed:
         return _installed[name]
-    wasm_path, manifest_path = _resolve(name)
-    manifest = tomllib.loads(manifest_path.read_text())
-    inferlet_id = f"{manifest['package']['name']}@{manifest['package']['version']}"
-    await client.install_program(wasm_path, manifest_path, force_overwrite=True)
+    inferlet_id = await client.install_program(_resolve(name), force_overwrite=True)
     _installed[name] = inferlet_id
     return inferlet_id
 

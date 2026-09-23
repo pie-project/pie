@@ -1,9 +1,0 @@
-[package]
-name = "compat-anthropic"
-version = "0.1.0"
-description = "The Anthropic API over the loaded model: /v1/messages"
-authors = ["Pie Team"]
-tier = "builtin"
-
-[runtime]
-core = "^0.2.0"

@@ -8,12 +8,11 @@ and that what comes back is a named file a decoder turns into a picture of the
 size that was asked for.
 
 Three claims, in the order the guide teaches them:
-
   * `pie model list` / `pie model info` report the served row's GENERATIVE
     facts -- its readings, its latent space, its schedule -- off the catalog,
     without opening a tensor;
   * `pie run text-to-image -o DIR -- --prompt "..."` runs the guest BY NAME.
-    No `--path`, no `--manifest`: the name resolves against the
+    No `--path`: the name resolves against the
     `examples` of the checkout the command runs in;
   * the file that arrives is NAMED -- `image.png` where the row drives its own
     `vae.decode` reading, `image.latent.f32` where it does not, never
@@ -31,7 +30,6 @@ carry. A person looking at the PNG is still the check on fidelity.
 
 **WANTS A GENERATIVE MODEL.** A config bound to a text row has nothing to
 drive here and is reported as a skip, not a failure:
-
     CUDA_VISIBLE_DEVICES=3 uv run python tests/examples/test_generating_images.py \\
         --config ~/.pie/config.t2i-client.toml \\
         --model-dir ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*/
@@ -53,7 +51,6 @@ with the IMAGE LANE ALONE -- an unconditioned denoise, reported as a success,
 decoding to exactly the textured field the note above says this suite cannot
 tell from a photograph. Measured on FLUX.2-klein-4B on 2026-09-06, 4 steps at
 1024**2, one prompt and seed, one GPU with no neighbours:
-
     50 ms, before the fix   1 of 3 correct eager, 4 of 5 bodied, and the wrong
                             ones bit-identical to each other per trajectory --
                             a race, which reads exactly like a numerics
@@ -243,7 +240,6 @@ def the_store_says_what_the_row_can_do(args) -> dict:
 # ---------------------------------------------------------------------------
 
 def a_bare_name_draws_a_named_file(args, out_dir: Path) -> dict:
-    """`pie run text-to-image` -- no `--path`, no `--manifest`."""
     cmd = [str(find_cli(args.pie)), "--config", resolve(args.config), "run", NAME,
            "-o", str(out_dir), "--",
            "--prompt", args.prompt,

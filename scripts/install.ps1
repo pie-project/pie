@@ -1,10 +1,10 @@
 # pie installer - served at https://pie-project.org/install.ps1
 #
 #   irm https://pie-project.org/install.ps1 | iex
-#   $env:PIE_VERSION = "0.5.2"; irm https://pie-project.org/install.ps1 | iex
+#   $env:PIE_VERSION = "0.5.4"; irm https://pie-project.org/install.ps1 | iex
 #
 # Environment overrides:
-#   PIE_VERSION       Release tag (default: 0.5.2).
+#   PIE_VERSION       Release tag (default: 0.5.4).
 #   PIE_FLAVOR        cuda (native CUDA, needs an NVIDIA GPU; default) or vulkan
 #                     (any Vulkan 1.2 device).
 #   PIE_INSTALL_DIR   Install location for pie.exe (default: %LOCALAPPDATA%\Pie\bin).
@@ -140,7 +140,7 @@ if ($machineArch -notin @("AMD64", "x86_64")) {
 }
 
 $repo = Get-EnvOrDefault "PIE_REPO" "pie-project/pie"
-$version = Get-EnvOrDefault "PIE_VERSION" "0.5.2"
+$version = Get-EnvOrDefault "PIE_VERSION" "0.5.4"
 $installDir = Get-EnvOrDefault "PIE_INSTALL_DIR" (Join-Path $env:LOCALAPPDATA "Pie\bin")
 $downloadBase = Get-EnvOrDefault "PIE_DOWNLOAD_BASE" "https://github.com/$repo/releases/download/$version"
 $flavor = Get-EnvOrDefault "PIE_FLAVOR" "cuda"

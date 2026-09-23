@@ -1,20 +1,24 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Inferlet, inferlet, withUpgradePath } from '../src/index.js';
+import { Inferlet, inferlet, programFile, withUpgradePath } from '../src/index.js';
 
 test('a function becomes a module exporting it, named and versioned by its source', () => {
   const tokenCount = inferlet(async function tokenCount(input) {
     return pie.model.encode(input.prompt).length;
-  }, { description: 'How many tokens.' });
+  });
   assert.ok(tokenCount instanceof Inferlet);
   assert.equal(tokenCount.name, 'tokenCount');
   assert.match(tokenCount.version, /^0\.\d+\.\d+$/);
   assert.equal(tokenCount.program, `tokenCount@${tokenCount.version}`);
+  assert.equal(tokenCount.file, 'tokenCount.js');
   assert.match(tokenCount.source, /^export const main = async function tokenCount\(input\)/);
-  const manifest = tokenCount.manifestToml();
-  assert.match(manifest, /language = "javascript"/);
-  assert.match(manifest, /entry = "main"/);
-  assert.match(manifest, /description = "How many tokens."/);
+});
+
+test('a program file is named by its stem, an entry script by its directory', () => {
+  assert.equal(programFile('/x/release/beam_search.wasm'), 'beam-search.wasm');
+  assert.equal(programFile('/x/text-completion-py/main.py'), 'text-completion-py.py');
+  assert.equal(programFile('/x/text_completion_js/index.mjs'), 'text-completion-js.js');
+  assert.throws(() => programFile('/x/notes.txt'));
 });
 
 test('the same source is the same version and an edit is a new one', () => {

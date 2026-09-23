@@ -1,6 +1,6 @@
 {
   "name": "@pie-project/language-javascript",
-  "version": "0.5.2",
+  "version": "0.5.4",
   "description": "The javascript language component of pie: import it, and javascript inferlets run on @pie-project/server.",
   "type": "module",
   "main": "index.mjs",

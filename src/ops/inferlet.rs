@@ -3,9 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
-use runtime::inferlet::program::{
-    Language, Manifest, Package, ParameterType, ProgramName, Repository, Runtime,
-};
+use runtime::inferlet::program::{self, Identity, ProgramName, Repository};
 
 use crate::ui::{self, Align, Answer, Mark, Palette, Row, Table};
 
@@ -27,13 +25,10 @@ pub struct TargetArgs {
 
 #[derive(Args, Debug)]
 pub struct InstallArgs {
-    /// A built `.wasm`, or a `.py` script (which needs no build).
     pub artifact: PathBuf,
 
-    /// Its manifest. Defaults to `<stem>.toml` beside the artifact, then
-    /// `Pie.toml` beside it; a bare script needs none.
-    #[arg(long, short = 'm')]
-    pub manifest: Option<PathBuf>,
+    #[arg(long)]
+    pub version: Option<String>,
 
     /// Replace an installed program of the same name and version.
     #[arg(long)]
@@ -56,8 +51,8 @@ fn open() -> Repository {
     let mut repo = Repository::new(bootstrap::paths::inferlets_dir());
     repo.refresh();
     for builtin in builtins::all() {
-        if let Ok(manifest) = Manifest::parse(builtin.manifest) {
-            repo.add_builtin(manifest, builtin.component);
+        if let Ok(name) = ProgramName::parse(&format!("{}@{}", builtin.name, builtin.version)) {
+            repo.add_builtin(name, builtin.component);
         }
     }
     repo
@@ -111,7 +106,7 @@ pub struct InferletList {
 struct InstalledInferlet {
     name: String,
     version: String,
-    description: Option<String>,
+    language: Option<String>,
     bytes: u64,
     /// Served from the binary, not the inferlets directory.
     builtin: bool,
@@ -128,22 +123,13 @@ impl ui::Report for InferletList {
         }
         let mut table = Table::new([Align::Left, Align::Right, Align::Left, Align::Left], 2);
         for inferlet in &self.inferlets {
-            let description = inferlet
-                .description
-                .as_deref()
-                .unwrap_or("")
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
             table.push(Row::new(
                 Mark::Plain,
                 [
                     format!("{}@{}", inferlet.name, inferlet.version),
                     ui::bytes(inferlet.bytes),
+                    inferlet.language.clone().unwrap_or_default(),
                     if inferlet.builtin { "built-in" } else { "" }.to_string(),
-                    description,
                 ],
             ));
         }
@@ -157,11 +143,11 @@ fn list() -> Result<Answer> {
         inferlets: repo
             .cached()
             .into_iter()
-            .map(|(name, manifest, bytes)| InstalledInferlet {
+            .map(|(name, language, bytes)| InstalledInferlet {
                 builtin: repo.is_builtin(&name),
                 name: name.name,
                 version: name.version,
-                description: manifest.package.description,
+                language: language.map(|l| l.name().to_string()),
                 bytes,
             })
             .collect(),
@@ -169,8 +155,8 @@ fn list() -> Result<Answer> {
 }
 
 async fn install(args: InstallArgs) -> Result<Answer> {
-    let artifact = load_artifact(&args.artifact, args.manifest.as_deref())?;
-    let name = artifact.manifest.program_name();
+    let artifact = load_artifact(&args.artifact, args.version.as_deref())?;
+    let name = artifact.identity.name.clone();
 
     let mut repo = open();
     if repo.exists(&name) && !args.force {
@@ -178,129 +164,64 @@ async fn install(args: InstallArgs) -> Result<Answer> {
             "{name} is already installed; `--force` replaces it"
         )));
     }
-    repo.add(artifact.bytes, artifact.manifest, args.force)
-        .await
-        .with_context(|| format!("installing {name}"))?;
+    repo.add(
+        artifact.bytes,
+        name.clone(),
+        artifact.identity.language,
+        args.force,
+    )
+    .await
+    .with_context(|| format!("installing {name}"))?;
     Ok(Answer::did(format!(
         "installed {name} into {}",
         ui::short_path(repo.programs_dir())
     )))
 }
 
-/// A program read from disk with the manifest that names it: a component
-/// beside its manifest, or a script, whose manifest may be synthesized from
-/// the file alone.
 #[derive(Debug)]
 pub struct Artifact {
     pub bytes: Vec<u8>,
-    pub manifest: Manifest,
-    /// The manifest as the engine will receive it.
-    pub manifest_toml: String,
+    pub file: String,
+    pub identity: Identity,
 }
 
-/// Read `path` and settle its manifest. A `.wasm` needs a manifest beside
-/// it (or named with `manifest`). A script (`.py`) takes the manifest beside
-/// it when there is one, else one synthesized from the file name; either
-/// way the manifest states the script's language.
-pub(crate) fn load_artifact(path: &Path, manifest: Option<&Path>) -> Result<Artifact> {
+pub(crate) fn load_artifact(path: &Path, version: Option<&str>) -> Result<Artifact> {
     if !path.is_file() {
         bail!("no file at {}", path.display());
     }
-    let language = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .and_then(Language::from_extension);
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-
-    let manifest_path = match manifest {
-        Some(named) => Ok(named.to_path_buf()),
-        None => manifest_beside(path),
-    };
-    let mut manifest = match (manifest_path, language) {
-        (Ok(manifest_path), _) => {
-            let content = std::fs::read_to_string(&manifest_path)
-                .with_context(|| format!("reading {}", manifest_path.display()))?;
-            Manifest::parse(&content)
-                .with_context(|| format!("reading {}", manifest_path.display()))?
-        }
-        (Err(_), Some(language)) => synthesized_manifest(path, language)?,
-        (Err(error), None) => return Err(error),
-    };
-
-    match (language, manifest.language()) {
-        (Some(from_file), None) => manifest.runtime.language = Some(from_file),
-        (Some(from_file), Some(declared)) if from_file != declared => bail!(
-            "{} is {from_file} source but its manifest says `language = \"{declared}\"`",
-            path.display()
-        ),
-        (None, Some(declared)) => bail!(
-            "{} is a component but its manifest says `language = \"{declared}\"`; a \
-             {declared} inferlet is its source file, not a build",
-            path.display()
-        ),
-        _ => {}
-    }
-
-    let manifest_toml = manifest.to_toml()?;
+    let file = program_file(path)?;
+    let identity = program::identify(&file, version, &bytes)
+        .with_context(|| format!("{} is not a program pie can install", path.display()))?;
     Ok(Artifact {
         bytes,
-        manifest,
-        manifest_toml,
+        file,
+        identity,
     })
 }
 
-/// The manifest a bare script implies: named after the file, version
-/// 0.0.0, in the file's language.
-fn synthesized_manifest(path: &Path, language: Language) -> Result<Manifest> {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
-    let name = stem.replace('_', "-");
-    ProgramName::parse(&format!("{name}@0.0.0")).with_context(|| {
-        format!(
-            "{} cannot name a program; a `Pie.toml` beside it can",
+pub(crate) fn program_file(path: &Path) -> Result<String> {
+    let extension = path.extension().and_then(|e| e.to_str()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} has no extension; a program is a `.wasm`, `.py` or `.js` file",
             path.display()
         )
     })?;
-    Ok(Manifest {
-        package: Package {
-            name,
-            version: "0.0.0".to_string(),
-            description: None,
-            authors: Vec::new(),
-            repository: None,
-            readme: None,
-            tier: None,
-        },
-        runtime: Runtime {
-            language: Some(language),
-            ..Default::default()
-        },
-        parameters: Default::default(),
-        dependencies: Default::default(),
-    })
-}
-
-/// The manifest an artifact carries beside it: `<stem>.toml` (the installed
-/// layout) or `Pie.toml` (a project directory).
-fn manifest_beside(artifact: &Path) -> Result<PathBuf> {
-    let sibling = artifact.with_extension("toml");
-    if sibling.is_file() {
-        return Ok(sibling);
-    }
-    if let Some(dir) = artifact.parent() {
-        let pie_toml = dir.join("Pie.toml");
-        if pie_toml.is_file() {
-            return Ok(pie_toml);
-        }
-    }
-    bail!(
-        "no manifest beside {}: expected {} or a Pie.toml in the same directory; \
-         `--manifest` names one elsewhere",
-        artifact.display(),
-        sibling.display()
-    )
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+    let name = if matches!(stem, "main" | "index") && extension != "wasm" {
+        std::fs::canonicalize(path)
+            .ok()
+            .and_then(|p| p.parent()?.file_name()?.to_str().map(str::to_string))
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or_else(|| stem.to_string())
+    } else {
+        stem.to_string()
+    };
+    Ok(format!("{}.{extension}", name.replace('_', "-")))
 }
 
 fn remove(args: TargetArgs) -> Result<Answer> {
@@ -349,33 +270,18 @@ fn remove(args: TargetArgs) -> Result<Answer> {
 fn info(args: TargetArgs) -> Result<Answer> {
     let repo = open();
     let program = resolve_in(&repo, &args.inferlet)?;
-    let manifest = repo
-        .fetch_manifest(&program)
+    let (_, language, bytes) = repo
+        .cached()
+        .into_iter()
+        .find(|(name, _, _)| *name == program)
         .ok_or_else(|| anyhow::anyhow!("{}", repo.not_installed(&program)))?;
 
     Ok(Answer::report(InferletInfo {
+        builtin: repo.is_builtin(&program),
         name: program.name,
         version: program.version,
-        description: manifest.package.description,
-        authors: manifest.package.authors,
-        repository: manifest.package.repository,
-        runtime: serde_json::to_value(&manifest.runtime)?,
-        dependencies: serde_json::to_value(&manifest.dependencies)?,
-        parameters: manifest
-            .parameters
-            .into_iter()
-            .map(|(name, p)| Parameter {
-                name,
-                r#type: match p.param_type {
-                    ParameterType::String => "string",
-                    ParameterType::Int => "int",
-                    ParameterType::Float => "float",
-                    ParameterType::Bool => "bool",
-                },
-                optional: p.optional,
-                description: p.description,
-            })
-            .collect(),
+        language: language.map(|l| l.name().to_string()),
+        bytes,
     }))
 }
 
@@ -383,20 +289,9 @@ fn info(args: TargetArgs) -> Result<Answer> {
 pub struct InferletInfo {
     name: String,
     version: String,
-    description: Option<String>,
-    authors: Vec<String>,
-    repository: Option<String>,
-    runtime: serde_json::Value,
-    dependencies: serde_json::Value,
-    parameters: Vec<Parameter>,
-}
-
-#[derive(serde::Serialize)]
-struct Parameter {
-    name: String,
-    r#type: &'static str,
-    optional: bool,
-    description: Option<String>,
+    language: Option<String>,
+    bytes: u64,
+    builtin: bool,
 }
 
 impl ui::Report for InferletInfo {
@@ -405,94 +300,58 @@ impl ui::Report for InferletInfo {
             "{}",
             palette.bold(format!("{}@{}", self.name, self.version))
         );
-        if let Some(description) = &self.description {
-            println!("{description}");
-        }
-        if let Some(repository) = &self.repository {
-            println!("{}", palette.dim(repository));
-        }
-
-        if self.parameters.is_empty() {
-            println!("\n{}", palette.dim("(no parameters)"));
-            return;
-        }
-
-        println!("\n{}", palette.bold("Parameters"));
-        let name_width = self
-            .parameters
-            .iter()
-            .map(|p| p.name.chars().count())
-            .max()
-            .unwrap_or(4)
-            .max("name".len());
-        let type_width = self
-            .parameters
-            .iter()
-            .map(|p| p.r#type.chars().count())
-            .max()
-            .unwrap_or(4)
-            .max("type".len());
-
+        let kind = match &self.language {
+            Some(language) => format!("{language} script"),
+            None => "component".to_string(),
+        };
+        let from = if self.builtin {
+            "built into this pie"
+        } else {
+            "installed"
+        };
         println!(
             "{}",
-            palette.dim(format!(
-                "{:<name_width$}  {:<type_width$}  required  description",
-                "name", "type"
-            ))
+            palette.dim(format!("{kind}, {}, {from}", ui::bytes(self.bytes)))
         );
-        for parameter in &self.parameters {
-            let required = format!(
-                "{:<8}",
-                if parameter.optional {
-                    "optional"
-                } else {
-                    "yes"
-                }
-            );
-            let required = if parameter.optional {
-                palette.dim(required).to_string()
-            } else {
-                palette.green(required).to_string()
-            };
-            println!(
-                "{}  {:<type_width$}  {required}  {}",
-                palette.accent(format!("{:<name_width$}", parameter.name)),
-                parameter.r#type,
-                palette.dim(parameter.description.as_deref().unwrap_or("")),
-            );
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn manifest(name: &str, version: &str) -> Manifest {
-        Manifest::parse(&format!(
-            "[package]\nname = \"{name}\"\nversion = \"{version}\"\n"
-        ))
-        .unwrap()
-    }
+    use runtime::inferlet::program::Language;
 
     async fn repo_with(dir: &Path, programs: &[(&str, &str)]) -> Repository {
         let mut repo = Repository::new(dir.to_path_buf());
         for (name, version) in programs {
-            repo.add(b"\0asm".to_vec(), manifest(name, version), false)
+            let name = ProgramName::parse(&format!("{name}@{version}")).unwrap();
+            repo.add(b"\0asm".to_vec(), name, None, false)
                 .await
                 .unwrap();
         }
         repo
     }
 
+    fn component_named(package: &str) -> Vec<u8> {
+        let name = program::PACKAGE_SECTION.as_bytes();
+        let mut payload = vec![name.len() as u8];
+        payload.extend_from_slice(name);
+        payload.extend_from_slice(package.as_bytes());
+        let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+        bytes.push(0);
+        bytes.push(payload.len() as u8);
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
     #[tokio::test]
     async fn inferlet_every_case() {
         a_bare_name_resolves_to_the_newest_installed_version().await;
         an_absent_program_is_refused_with_what_is_here().await;
-        the_manifest_beside_a_wasm_is_its_stem_toml_then_pie_toml();
         a_bare_script_is_named_by_its_file_in_its_language();
-        a_script_beside_a_manifest_takes_the_manifest_and_states_its_language();
-        a_component_whose_manifest_claims_a_language_is_refused();
+        an_entry_script_is_named_by_its_directory();
+        a_component_is_named_by_the_package_it_carries();
+        a_declared_version_beats_the_hash_and_a_given_one_beats_both();
     }
 
     fn a_bare_script_is_named_by_its_file_in_its_language() {
@@ -500,40 +359,67 @@ mod tests {
         let script = dir.path().join("beam_search.py");
         std::fs::write(&script, "async def main(input): return input\n").unwrap();
         let artifact = load_artifact(&script, None).unwrap();
+        assert_eq!(artifact.file, "beam-search.py");
+        assert_eq!(artifact.identity.name.name, "beam-search");
         assert_eq!(
-            artifact.manifest.program_name().to_string(),
-            "beam-search@0.0.0"
+            artifact.identity.name.version,
+            program::hashed_version(b"async def main(input): return input\n")
         );
-        assert_eq!(artifact.manifest.language(), Some(Language::Python));
-        assert!(artifact.manifest_toml.contains("language = \"python\""));
+        assert_eq!(artifact.identity.language, Some(Language::Python));
         assert_eq!(artifact.bytes, b"async def main(input): return input\n");
     }
 
-    fn a_script_beside_a_manifest_takes_the_manifest_and_states_its_language() {
+    fn an_entry_script_is_named_by_its_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("main.py");
-        std::fs::write(&script, "x = 1\n").unwrap();
-        std::fs::write(
-            dir.path().join("Pie.toml"),
-            "[package]\nname = \"twin\"\nversion = \"0.2.0\"\n",
-        )
-        .unwrap();
-        let artifact = load_artifact(&script, None).unwrap();
-        assert_eq!(artifact.manifest.program_name().to_string(), "twin@0.2.0");
-        assert_eq!(artifact.manifest.language(), Some(Language::Python));
+        let project = dir.path().join("text_completion_js");
+        std::fs::create_dir(&project).unwrap();
+        let script = project.join("index.js");
+        std::fs::write(&script, "export function main(input) { return input; }\n").unwrap();
+        let artifact = load_artifact(&script, Some("0.2.0")).unwrap();
+        assert_eq!(artifact.file, "text-completion-js.js");
+        assert_eq!(
+            artifact.identity.name.to_string(),
+            "text-completion-js@0.2.0"
+        );
+        assert_eq!(artifact.identity.language, Some(Language::JavaScript));
     }
 
-    fn a_component_whose_manifest_claims_a_language_is_refused() {
+    fn a_component_is_named_by_the_package_it_carries() {
         let dir = tempfile::tempdir().unwrap();
-        let wasm = dir.path().join("0.1.0.wasm");
-        std::fs::write(&wasm, b"\0asm").unwrap();
+        let wasm = dir.path().join("text_completion.wasm");
+        std::fs::write(&wasm, component_named("text-completion@0.3.0")).unwrap();
+        let artifact = load_artifact(&wasm, None).unwrap();
+        assert_eq!(artifact.identity.name.to_string(), "text-completion@0.3.0");
+        assert_eq!(artifact.identity.language, None);
+        let err = load_artifact(&wasm, Some("9.9.9")).unwrap_err();
+        assert!(format!("{err:#}").contains("names itself"), "{err:#}");
+
+        let bare = dir.path().join("probe.wasm");
+        std::fs::write(&bare, b"\0asm\x01\0\0\0").unwrap();
+        let artifact = load_artifact(&bare, Some("0.1.0")).unwrap();
+        assert_eq!(artifact.identity.name.to_string(), "probe@0.1.0");
+    }
+
+    fn a_declared_version_beats_the_hash_and_a_given_one_beats_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("probe.py");
         std::fs::write(
-            dir.path().join("0.1.0.toml"),
-            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[runtime]\nlanguage = \"python\"\n",
+            &script,
+            "__version__ = \"1.2.3\"\nasync def main(i): return i\n",
         )
         .unwrap();
-        let err = load_artifact(&wasm, None).unwrap_err().to_string();
-        assert!(err.contains("component"), "{err}");
+        assert_eq!(
+            load_artifact(&script, None).unwrap().identity.name.version,
+            "1.2.3"
+        );
+        assert_eq!(
+            load_artifact(&script, Some("2.0.0"))
+                .unwrap()
+                .identity
+                .name
+                .version,
+            "2.0.0"
+        );
     }
 
     async fn a_bare_name_resolves_to_the_newest_installed_version() {
@@ -552,19 +438,5 @@ mod tests {
         assert!(err.contains("pie inferlet install"), "{err}");
         let err = resolve_in(&repo, "sink@0.1.0").unwrap_err().to_string();
         assert!(err.contains("pie inferlet install"), "{err}");
-    }
-
-    fn the_manifest_beside_a_wasm_is_its_stem_toml_then_pie_toml() {
-        let dir = tempfile::tempdir().unwrap();
-        let wasm = dir.path().join("0.1.0.wasm");
-        std::fs::write(&wasm, b"\0asm").unwrap();
-        assert!(manifest_beside(&wasm).is_err());
-        std::fs::write(dir.path().join("Pie.toml"), "").unwrap();
-        assert_eq!(manifest_beside(&wasm).unwrap(), dir.path().join("Pie.toml"));
-        std::fs::write(dir.path().join("0.1.0.toml"), "").unwrap();
-        assert_eq!(
-            manifest_beside(&wasm).unwrap(),
-            dir.path().join("0.1.0.toml")
-        );
     }
 }

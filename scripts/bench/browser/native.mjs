@@ -16,19 +16,10 @@ const root = new URL("../../..", import.meta.url).pathname;
 
 const client = new PieClient(uri);
 await client.connect();
-await client.installProgram(
-  `${root}examples/target/wasm32-wasip2/release/text_completion.wasm`,
-  `${root}examples/text-completion/Pie.toml`,
-  true,
-);
-await client.installProgram(
-  `${root}examples/target/wasm32-wasip2/release/naive_baseline.wasm`,
-  `${root}examples/naive-baseline/Pie.toml`,
-  true,
-);
-const program = "text-completion@0.3.0";
+const program = await client.installProgram(`${root}examples/target/wasm32-wasip2/release/text_completion.wasm`, null, true);
+const carried = await client.installProgram(`${root}examples/target/wasm32-wasip2/release/naive_baseline.wasm`, null, true);
 const opts = {
-  carried: "naive-baseline@0.1.0",
+  carried,
   makeClient: () => new PieClient(uri),
   fixture: process.env.PIE_BENCH_FIXTURE === "1",
 };

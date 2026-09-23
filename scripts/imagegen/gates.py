@@ -1107,7 +1107,6 @@ def text_to_image(args) -> int:
         return 1
     wasm = max(present, key=os.path.getmtime)
     cmd = [args.pie, "--config", args.config, "run", "--path", wasm,
-           "--manifest", os.path.join(inferlet, "Pie.toml"),
            "-o", args.out, "--",
            "--prompt", args.prompt, "--width", str(args.width),
            "--height", str(args.height), "--steps", str(args.steps),
@@ -1217,7 +1216,6 @@ def text_to_video(args) -> int:
         return 1
     wasm = max(present, key=os.path.getmtime)
     cmd = [args.pie, "--config", args.config, "run", "--path", wasm,
-           "--manifest", os.path.join(inferlet, "Pie.toml"),
            "-o", args.out, "--",
            "--prompt-ids", args.prompt_ids, "--width", str(args.width),
            "--height", str(args.height), "--frames", str(args.frames),

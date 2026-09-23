@@ -1,9 +1,0 @@
-[package]
-name = "compat-openai"
-version = "0.1.0"
-description = "The OpenAI API over the loaded model: /v1/chat/completions, /v1/completions and /v1/responses"
-authors = ["Pie Team"]
-tier = "builtin"
-
-[runtime]
-core = "^0.2.0"

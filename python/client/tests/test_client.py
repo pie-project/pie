@@ -9,7 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pie_client import PieClient
+from pie_client import PieClient, inferlet, program_file
 from pie_client_cli import engine
 
 
@@ -22,8 +22,9 @@ class ClosedWebSocket:
 
 
 class RespondingWebSocket:
-    def __init__(self, client):
+    def __init__(self, client, result="ok"):
         self.client = client
+        self.result = result
         self.sent = []
 
     async def send(self, encoded):
@@ -33,7 +34,7 @@ class RespondingWebSocket:
         if future is None:
             raise AssertionError("response future was not registered before send")
         if not future.done():
-            future.set_result((True, "ok"))
+            future.set_result((True, self.result))
 
 
 class NeverEventProcess:
@@ -53,7 +54,8 @@ class PythonClientTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "add_program",
                 "program_hash": "hash",
-                "manifest": "name = 'demo'",
+                "file": "demo.wasm",
+                "version": None,
                 "force_overwrite": False,
             },
         )
@@ -61,6 +63,27 @@ class PythonClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(client.pending_requests, {})
         self.assertEqual(len(client.ws.sent), 1)
+
+    async def test_install_sends_the_file_name_and_version_and_returns_the_id(self):
+        client = PieClient("ws://example.invalid")
+        client.ws = RespondingWebSocket(client, result="demo@1.2.0")
+
+        installed = await client.install_program_bytes(b"source", "demo.py", "1.2.0")
+
+        self.assertEqual(installed, "demo@1.2.0")
+        [frame] = client.ws.sent
+        self.assertEqual(frame["type"], "add_program")
+        self.assertEqual(frame["file"], "demo.py")
+        self.assertEqual(frame["version"], "1.2.0")
+        self.assertFalse(frame["force_overwrite"])
+        self.assertNotIn("manifest", frame)
+
+    def test_a_program_is_named_by_its_file_or_its_directory(self):
+        self.assertEqual(program_file("/a/b/text_completion.wasm"), "text-completion.wasm")
+        self.assertEqual(program_file("/a/beam_search_py/main.py"), "beam-search-py.py")
+        self.assertEqual(program_file("/a/beam-search-js/index.mjs"), "beam-search-js.js")
+        with self.assertRaises(ValueError):
+            program_file("/a/b/notes.txt")
 
     async def test_listener_rejects_pending_requests_when_connection_ends(self):
         client = PieClient("ws://example.invalid")
