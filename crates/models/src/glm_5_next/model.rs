@@ -281,6 +281,25 @@ impl Model {
         )
     }
 
+    /// The first `layers` layers of GLM-5.3-Flash at full width with the first
+    /// `experts` routed experts (top-k unchanged): a performance delegate cut
+    /// by `scripts/bench/shrink_checkpoint.py` (`glm5_next_mlx`). Eight layers
+    /// hold every layer kind: three dense KDA, DSA + MoE, three KDA + MoE, DSA.
+    pub fn flash_mini(
+        layers: u32,
+        experts: u32,
+        w: Dtype,
+        bank: Dtype,
+        kv: Dtype,
+        tp: u32,
+    ) -> Model {
+        let mut d = Model::flash_dims();
+        d.layers = layers;
+        d.moe.experts = experts;
+        d.moe.top_k = d.moe.top_k.min(experts);
+        Model::new(w, bank, None, false, kv, tp, d)
+    }
+
     pub fn flash_mtp(w: Dtype, experts: Dtype, head_experts: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
