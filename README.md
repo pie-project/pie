@@ -17,52 +17,109 @@
 [Paper (SOSP'25)]: https://ingim.org/papers/gim2025pie.pdf
 
 Pie runs small user-supplied WebAssembly programs, called *inferlets*, directly
-next to the model. Inferlets have direct access to the KV cache and forward
-pass, so agent loops, tool calls, custom samplers, and cache policies are
-customized per application without modifying the engine.
+next to the model. An inferlet drives the forward pass and owns its KV cache,
+so agent loops, tool calls, custom samplers and cache policies are written per
+application, in Python, JavaScript or Rust, without modifying the engine.
 
 > **Note**
 > Pie is pre-release software under active development.
 
-## Quick Start
+## Install
 
-Pie is a standalone binary, no Python needed.
+Pie is one binary plus a language component per scripting language, all on the
+[latest release](https://github.com/pie-project/pie/releases/latest). Pick the
+archive for your platform and GPU (`cuda`, `metal`, `vulkan` or `wgpu`):
+
+```bash
+tar -xzf pie-x86_64-linux-cuda13.0.tar.gz
+install pie ~/.local/bin/                             # anywhere on PATH
+pie language install pie-language-python.tar.gz       # Python inferlets
+pie language install pie-language-javascript.tar.gz   # JavaScript inferlets
+```
+
+The installer does the same four steps, choosing the archive for you:
 
 ```bash
 curl -fsSL https://pie-project.org/install.sh | bash        # Linux, macOS, WSL
 irm https://pie-project.org/install.ps1 | iex               # Windows PowerShell
 ```
 
+Then a model:
+
 ```bash
 pie config init
 pie model import Qwen/Qwen3.5-0.8B
-pie serve
 ```
 
-The installer also places the Python and JavaScript language components
-(`pie-language-<language>.tar.gz`, one release asset per language) under
-`~/.pie/languages`; `pie language list` shows them, and `pie language install
-<file>` adds one from a downloaded asset or a locally built `.wasm`.
+## Write an inferlet
 
-A checkpoint is matched against the catalog's import contracts at load and
-refused by name when none fits; `pie model list` prints the SKU beside every
-snapshot it can see.
+`Pie.toml` names the program and its language; `main.py` is the program. This
+one is greedy text completion, one forward pass per token:
 
-`pie serve` holds the terminal. From another shell, submit an inferlet with the
-Python client (`pip install pie-client`):
+```toml
+[package]
+name = "quickstart"
+version = "0.1.0"
+
+[runtime]
+language = "python"
+core = "^0.2.0"
+```
+
+```python
+from inferlet import chat, model
+from inferlet.eta import ForwardPass, Pipeline, WorkingSet, intrinsics, reduce_argmax
+
+
+async def main(input: dict) -> dict:
+    tokens = chat.prefix() + model.encode(input.get("prompt", "The capital of France is"))
+    max_tokens = int(input.get("max_tokens", 8))
+    ws = WorkingSet(tokens=len(tokens) + max_tokens)  # KV pages (and recurrent state on a hybrid model)
+    pipe = Pipeline()
+
+    done = 0  # tokens already in the KV cache
+    for _ in range(max_tokens):
+        fwd = ForwardPass()
+        fwd.embed(tokens[done:])                        # the new tokens
+        fwd.bind_state(ws, ws.geometry(done, len(tokens)))
+        out = fwd.epilogue(lambda: reduce_argmax(intrinsics.logits()))  # runs on the device
+        pipe.submit(fwd)
+        done = len(tokens)
+        tokens.append(await out)
+    pipe.close()
+
+    return {"text": model.decode(tokens[-max_tokens:])}
+```
+
+Every line stands for device state. `embed` seeds the token channel,
+`ws.geometry` derives the KV geometry of the span, and the `epilogue` is
+traced once and runs on the GPU after each forward pass; the host only sees
+the token it publishes. The same program in JavaScript is
+[`examples/quickstart-js`](examples/quickstart-js); Rust inferlets use the
+[`inferlet`](https://crates.io/crates/inferlet) crate and compile to
+`wasm32-wasip2`. [`examples/`](examples) goes on from here: chunked prefill
+with a device loop-carried decode, beam search, speculative decoding,
+constrained decoding, KV-cache sharing, diffusion.
+
+## Run it
 
 ```bash
-pie-client submit text-completion -- --prompt "The capital of France is"
+pie run main.py -- --prompt "The capital of France is"
 ```
 
-`pie run` is the same round trip without a server:
+```
+{"text": " Paris, and the capital of the United States is Washington,"}
+```
+
+`pie run` boots a one-shot engine for the program. To keep one running, `pie
+serve` holds the terminal, and the Python client (`pip install pie-client`)
+submits the same file from another shell:
 
 ```bash
-pie run --path ./target/wasm32-wasip2/debug/text_completion.wasm \
-        --manifest ./Pie.toml -- --prompt "The capital of France is"
+pie-client submit --path main.py --manifest Pie.toml -- --prompt "The capital of France is"
 ```
 
-### Compatible APIs
+## Compatible APIs
 
 `pie serve` also speaks the APIs existing clients already use, on the same
 port, with no API key:
@@ -79,40 +136,22 @@ client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
 print(client.chat.completions.create(model="default", messages=[{"role": "user", "content": "Hi"}]).choices[0].message.content)
 ```
 
-The same server embeds in a process: `pie-server` on PyPI (`python/server`)
-and `@pie-project/server` on npm (`javascript/server`) boot what `pie serve`
-boots and hand back the address, each carrying every engine its platform
-supports (`engine.type` picks one at boot); under a bundler the same
-`@pie-project/server` import is pie compiled for the browser, on WebGPU.
+Each API is itself a built-in inferlet, with tool calling, JSON-schema output,
+streaming and reasoning. The same server embeds in a process as
+[`pie-server`](https://pypi.org/project/pie-server/) on PyPI and
+[`@pie-project/server`](https://www.npmjs.com/package/@pie-project/server) on
+npm; under a bundler the npm package is pie compiled for the browser, on
+WebGPU.
 
-Each API is served by a built-in inferlet (`crates/builtins/inferlets/compat-openai`,
-`compat-anthropic`, `compat-gemini`) built into the `pie` binary; `pie doctor`
-lists them, and a newer version installed with `pie inferlet install` takes
-over. Tool calling, JSON schema output, streaming and reasoning
-(`reasoning_content`, `thinking` blocks, thought parts) are supported; images
-are not yet.
+## Building from source
 
-### Backends
-
-Four engines serve today, each a compile-time feature:
+Four engines, each a compile-time feature:
 
 ```bash
 cargo build --release -p pie --bin pie --features cuda    # NVIDIA, Linux/Windows
 cargo build --release -p pie --bin pie --features metal   # Apple silicon, macOS
-cargo build --release -p pie --bin pie --features vulkan  # any Vulkan 1.2 device
+cargo build --release -p pie --bin pie --features vulkan  # any Vulkan 1.2 device (slangc on PATH)
 cargo build --release -p pie --bin pie --features wgpu    # WebGPU: Vulkan, Metal or D3D12
-```
-
-`vulkan` compiles Slang to SPIR-V at build time and wants `slangc` on `PATH`
-(or `PIE_SLANGC`); `wgpu` needs no shader toolchain.
-
-## Building inferlets
-
-Inferlets compile to the `wasm32-wasip2` component target:
-
-```bash
-rustup target add wasm32-wasip2
-cargo build --target wasm32-wasip2
 ```
 
 ## Getting Help
