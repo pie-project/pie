@@ -29,7 +29,7 @@ from ..media import Audio, Image
 from .builder import Builder, DslChannel
 from .ir import Dtype, Port, Shape, Stage, numel, shape_of
 from .trace import ChannelState, TraceError
-from .value import ConstData, Tensor, const_data, unpack_elems
+from .value import ConstData, Tensor, const_data, reshape, unpack_elems
 
 ForwardKind = _wit_model.ForwardKind
 
@@ -106,16 +106,48 @@ class Channel:
     reads one back.
     """
 
-    __slots__ = ("_dsl",)
+    __slots__ = ("_dsl", "_pending")
 
     def __init__(self, shape, dtype: Dtype) -> None:
         self._dsl = DslChannel.new(shape_of(shape), dtype)
+        self._pending = None
 
     @classmethod
     def _wrap(cls, dsl: DslChannel) -> "Channel":
         ch = cls.__new__(cls)
         ch._dsl = dsl
+        ch._pending = None
         return ch
+
+    @classmethod
+    def _lazy(cls) -> "Channel":
+        """An output channel declared by a stage body's return value: its
+        shape and dtype are the returned tensor's, known once the pass
+        traces (at first submit). `capacity`/`named` before that are kept."""
+        ch = cls.__new__(cls)
+        ch._dsl = None
+        ch._pending = {}
+        return ch
+
+    def _materialize(self, value: Tensor) -> None:
+        """Inside a stage body: declare this lazy channel as the returned
+        tensor's cell and record the put."""
+        shape = value.shape if numel(value.shape) != 1 or len(value.shape) == 1 else (1,)
+        if shape != value.shape:
+            value = reshape(value, shape)
+        self._dsl = DslChannel.new(shape, value.dtype)
+        pending, self._pending = self._pending, None
+        if "capacity" in pending:
+            self._dsl.capacity(pending["capacity"])
+        if "name" in pending:
+            self._dsl.named(pending["name"])
+        self._dsl.put_tensor(value)
+
+    @property
+    def dsl(self) -> DslChannel:
+        if self._dsl is None:
+            raise InferletError("this output channel is declared by its stage body; submit the pass first")
+        return self._dsl
 
     @staticmethod
     def writer(shape, dtype: Dtype) -> "Channel":
@@ -151,56 +183,62 @@ class Channel:
         return Channel._wrap(DslChannel.seeded(shape_of(shape), dtype))
 
     def _wit(self):
-        return _host_channel(self._dsl.state)
+        return _host_channel(self.dsl.state)
 
     def capacity(self, n: int) -> "Channel":
         """Widen the ring to `n` cells (deeper run-ahead). Must precede first use."""
+        if self._dsl is None:
+            self._pending["capacity"] = n
+            return self
         if self._dsl.state.host is not None:
             raise TraceError("capacity must be set before the channel is used")
         self._dsl.capacity(n)
         return self
 
     def named(self, name: str) -> "Channel":
+        if self._dsl is None:
+            self._pending["name"] = name
+            return self
         self._dsl.named(name)
         return self
 
     @property
     def gid(self) -> int:
         """Declaration order — the container keys channels by it."""
-        return self._dsl.gid
+        return self.dsl.gid
 
     @property
     def name(self) -> str:
-        return self._dsl.name
+        return self.dsl.name
 
     @property
     def dtype(self) -> Dtype:
-        return self._dsl.dtype
+        return self.dsl.dtype
 
     @property
     def shape(self) -> Shape:
-        return self._dsl.shape
+        return self.dsl.shape
 
     # -- in-program ------------------------------------------------------------
 
     def take(self) -> Tensor:
         """Consume a cell inside a stage body — records a `ChanTake`."""
-        return self._dsl.take()
+        return self.dsl.take()
 
     def read(self) -> Tensor:
         """Peek a cell inside a stage body — records a `ChanRead`."""
-        return self._dsl.read()
+        return self.dsl.read()
 
     def put(self, v, dtype: Dtype | None = None) -> None:
         """Inside a stage body with a `Tensor`: record a device `ChanPut`. On
         the host with data: stage the next cell for the following submit."""
         if isinstance(v, Tensor):
-            self._dsl.put_tensor(v)
+            self.dsl.put_tensor(v)
             return
         data = const_data(v, dtype if dtype is not None else self.dtype)
         if data.dtype is not self.dtype:
             raise TypeError(f"channel {self.name} holds {self.dtype.wire_name}, put {data.dtype.wire_name}")
-        self._dsl.note_host_put()
+        self.dsl.note_host_put()
         try:
             self._wit().put(data.data)
         except _WitErr:
@@ -218,13 +256,13 @@ class Channel:
         """Consume a cell on the host, decoded to a list of Python numbers
         (bools for a bool channel). Awaits in-flight fires; a poisoned
         channel raises `InferletError`."""
-        self._dsl.note_host_take()
+        self.dsl.note_host_take()
         raw = await _wit_async(self._wit().take(), what=f"{self.name} take")
         return unpack_elems(bytes(raw), self.dtype)
 
     async def read_host(self) -> list:
         """Peek a cell on the host (leaves it full)."""
-        self._dsl.note_host_read()
+        self.dsl.note_host_read()
         raw = await _wit_async(self._wit().read(), what=f"{self.name} read")
         return unpack_elems(bytes(raw), self.dtype)
 
@@ -240,6 +278,11 @@ class Channel:
         if not v:
             raise InferletError(f"{self.name} read: channel cell is empty")
         return v[0]
+
+    def __await__(self):
+        """`await ch` consumes a cell on the host: the number for a
+        one-element cell, else the list (`take_scalar` / `take_host`)."""
+        return (self.take_scalar() if numel(self.shape) == 1 else self.take_host()).__await__()
 
 
 # ---------------------------------------------------------------------------
@@ -271,23 +314,62 @@ class WorkingSet:
     """The attention working set — a logical page address space over the KV
     mapping trie. Every page reference is working-set-relative."""
 
-    __slots__ = ("kv",)
+    __slots__ = ("kv", "grant", "_rs")
 
-    def __init__(self) -> None:
+    def __init__(self, *, tokens: int | None = None) -> None:
+        """`tokens=n` reserves the pages `n` tokens need up front (`grant`);
+        `geometry()` then addresses them."""
         self.kv = _wit_ws.KvWorkingSet()
+        self.grant = None
+        self._rs = None
+        if tokens is not None:
+            self.reserve(max(-(-tokens // kv_page_size()), 1))
 
     @classmethod
     def _wrap(cls, kv) -> "WorkingSet":
         ws = cls.__new__(cls)
         ws.kv = kv
+        ws.grant = None
+        ws._rs = None
         return ws
 
     def page_len(self) -> int:
         return self.kv.page_len()
 
     def reserve(self, pages: int) -> PageGrant:
+        """Reserve `pages` fresh pages. The first grant is kept as `grant`."""
         r = _wit(self.kv.reserve, pages, what="reserve KV")
-        return PageGrant(r.start, r.len)
+        grant = PageGrant(r.start, r.len)
+        if self.grant is None:
+            self.grant = grant
+        return grant
+
+    @property
+    def rs(self) -> list["RsWorkingSet"]:
+        """The recurrent state a hybrid model folds this sequence into: one
+        `RsWorkingSet`, made on first use; empty on an attention model."""
+        if self._rs is None:
+            self._rs = [RsWorkingSet()] if _wit_model.pass_kind() == ForwardKind.HYBRID else []
+        return self._rs
+
+    def geometry(self, start: int, end: int) -> "KvGeometry":
+        """The `KvGeometry` of a fire that embeds tokens `[start, end)` of one
+        contiguous sequence into this working set's pages: `kv_len`,
+        `page_indptr`, `w_slot`, `w_off`, `positions` are all derived from the
+        span, and `pages` is the reserved grant. Edit the returned fields
+        (`mask`, `writable_pages`, ...) for anything else."""
+        if not 0 <= start < end:
+            raise InferletError(f"geometry: [{start}, {end}) is not a span of tokens to embed")
+        page = kv_page_size()
+        pages = self.grant.ids if self.grant is not None else list(range(-(-end // page)))
+        return KvGeometry(
+            kv_len=Channel.from_([end], Dtype.U32),
+            pages=Channel.from_(pages, Dtype.U32),
+            page_indptr=Channel.from_([0, -(-end // page)], Dtype.U32),
+            w_slot=Channel.from_([p // page for p in range(start, end)], Dtype.U32),
+            w_off=Channel.from_([p % page for p in range(start, end)], Dtype.U32),
+            positions=Channel.from_(range(start, end), Dtype.U32),
+        )
 
     def update_index(self, key: bytes) -> None:
         _wit(self.kv.update_index, bytes(key), what="update_index")
@@ -381,6 +463,82 @@ class Pipeline:
     def park(self) -> None:
         """Leave the frame wait-set until this pipeline submits again."""
         _wit_attention.park(self.wit)
+
+    def submit(self, fwd: "ForwardPass") -> None:
+        """Enqueue one pass as a single-slot frame."""
+        self.submit_frame([fwd])
+
+    def submit_frame(self, slots: Sequence["ForwardPass | None"]) -> None:
+        """Submit ONE FRAME: up to `frame_size()` slots, slot i executing in
+        wave i; trailing slots pad with no-ops."""
+        k = frame_size()
+        if len(slots) > k:
+            raise InferletError(f"frame holds {len(slots)} slot(s); model.frame-size() is {k}")
+        live = [p for p in slots if p is not None]
+        for p in live:
+            p.attach_program()
+        if not live:
+            return
+        mod = live[0]._mod
+        borrows: list = [p.wit if p is not None else None for p in slots]
+        borrows.extend([None] * (k - len(borrows)))
+        _wit(mod.submit, self.wit, borrows, what="submit")
+
+    async def run_ahead(
+        self,
+        fwd: "ForwardPass",
+        budget: int,
+        on_token: Callable[[], Awaitable[bool] | bool | None],
+    ) -> int:
+        """Keep the runtime's run-ahead window full while `on_token` consumes
+        results, until `budget` fires submit or `on_token` returns False.
+        Returns the run count."""
+        if budget == 0:
+            return 0
+        # Live slots per frame. A pass that binds a dense device mask takes one;
+        # so does a pass on a recurrent or hybrid model, whose frame's waves carry
+        # the same sequence's state one into the next (a frame of one live slot
+        # measured faster than a full one on Qwen3.5-0.8B). A dense attention
+        # pass fills the frame.
+        r = 1 if fwd.binds_device_mask() or fwd.kind != ForwardKind.ATTENTION else frame_size()
+        window_frames = max((channel_capacity() - 1) // max(r, 1), 1)
+        submitted = 0
+        consumed = 0
+
+        def submit_one_frame() -> None:
+            nonlocal submitted
+            live = min(r, budget - submitted)
+            if live == 0:
+                return
+            self.submit_frame([fwd] * live)
+            submitted += live
+
+        for _ in range(window_frames):
+            if submitted >= budget:
+                break
+            submit_one_frame()
+
+        ended = False
+        if submitted >= budget and not ended:
+            self.close()
+            ended = True
+        while consumed < submitted:
+            cont = on_token()
+            if inspect.isawaitable(cont):
+                cont = await cont
+            if cont is False:
+                if not ended:
+                    self.close()
+                return consumed + 1
+            consumed += 1
+            if submitted < budget and submitted - consumed <= (window_frames - 1) * r:
+                submit_one_frame()
+            if submitted >= budget and not ended:
+                self.close()
+                ended = True
+        if not ended:
+            self.close()
+        return consumed
 
 
 # ---------------------------------------------------------------------------
@@ -556,8 +714,16 @@ class ForwardPass:
     def binds_device_mask(self) -> bool:
         return any(p == Port.ATTN_MASK for p, _ in self._ports)
 
-    def embed(self, tokens: Channel, indptr: Channel) -> None:
-        """Bind token ids and CSR row indptr (both channels)."""
+    def embed(self, tokens: Channel | Sequence[int], indptr: Channel | Sequence[int] | None = None) -> None:
+        """Bind token ids and the CSR row indptr. A token list becomes an i32
+        channel; `indptr` omitted is the one row `[0, n]`, a list is a u32
+        channel."""
+        if not isinstance(tokens, Channel):
+            tokens = Channel.from_(list(tokens), Dtype.I32)
+        if indptr is None:
+            indptr = Channel.from_([0, numel(tokens.shape)], Dtype.U32)
+        elif not isinstance(indptr, Channel):
+            indptr = Channel.from_(list(indptr), Dtype.U32)
         self._ensure_ports_available([Port.EMBED_TOKENS, Port.EMBED_INDPTR])
         _wit(self.wit.embed, tokens._wit(), indptr._wit(), what="embed")
         self._ports += [(Port.EMBED_TOKENS, tokens), (Port.EMBED_INDPTR, indptr)]
@@ -692,14 +858,15 @@ class ForwardPass:
             what="bind_recurrent",
         )
 
-    def bind_state(self, ws: WorkingSet, geom: KvGeometry, rs: Sequence[RsWorkingSet] = ()) -> None:
+    def bind_state(self, ws: WorkingSet, geom: KvGeometry, rs: Sequence[RsWorkingSet] | None = None) -> None:
         """Kind-independent binding for the common text program: the KV
-        geometry, plus — on a hybrid model — the recurrent working set(s),
-        folding every token straight into the recurrence."""
+        geometry, plus — on a hybrid model — the recurrent working set(s)
+        (`ws.rs` unless given), folding every token straight into the
+        recurrence."""
         if self.kind in (ForwardKind.ATTENTION, ForwardKind.DIFFUSION):
             self.attention(ws, geom)
         elif self.kind == ForwardKind.HYBRID:
-            self.bind_hybrid(KvBinding(ws, geom), list(rs), RsGeometry(fold_len=None, buffer=(0, 0)))
+            self.bind_hybrid(KvBinding(ws, geom), list(ws.rs if rs is None else rs), RsGeometry(fold_len=None, buffer=(0, 0)))
         else:
             raise InferletError("bind_state: a recurrent-only model has no KV geometry to bind")
 
@@ -818,9 +985,23 @@ class ForwardPass:
     def prologue(self, body: Callable[[], None]) -> Callable[[], None]:
         return self._set_stage(Stage.PROLOGUE, body)
 
-    def epilogue(self, body: Callable[[], None]) -> Callable[[], None]:
-        """Attach the `epilogue` stage (sampling programs; after the forward)."""
-        return self._set_stage(Stage.EPILOGUE, body)
+    def epilogue(self, body: Callable[[], Tensor | None]) -> Channel:
+        """Attach the `epilogue` stage (sampling programs; after the forward).
+        A body that returns a tensor declares an output channel of that
+        cell, put once per fire; the channel is returned and read on the
+        host (`await out`). `out.capacity(n)` widens it for run-ahead."""
+        out = Channel._lazy()
+
+        def traced() -> None:
+            value = body()
+            if value is None:
+                return
+            if not isinstance(value, Tensor):
+                raise TypeError(f"an epilogue returns a Tensor to publish, or None; got {type(value).__name__}")
+            out._materialize(value)
+
+        self._set_stage(Stage.EPILOGUE, traced)
+        return out
 
     def on_attn_proj(self, body: Callable[[], None]) -> Callable[[], None]:
         if self.kind == ForwardKind.RECURRENT:
@@ -847,10 +1028,6 @@ class ForwardPass:
         _wit(self.wit.program, traced.encode(), handles, what="program")
         self._program_attached = True
 
-    def submit(self, on: Pipeline) -> None:
-        """Enqueue this pass as a single-slot frame on `on`."""
-        submit_frame(on, [self])
-
 
 class AdapterExpr:
     __slots__ = ("kind", "args")
@@ -873,75 +1050,3 @@ def scale(e: AdapterExpr, l: Channel) -> AdapterExpr:  # noqa: E741
     return AdapterExpr("scale", l, e)
 
 
-def submit_frame(on: Pipeline, slots: Sequence[ForwardPass | None]) -> None:
-    """Submit ONE FRAME on `on`: up to `frame_size()` slots, slot i executing
-    in wave i; trailing slots pad with no-ops."""
-    k = frame_size()
-    if len(slots) > k:
-        raise InferletError(f"frame holds {len(slots)} slot(s); model.frame-size() is {k}")
-    live = [p for p in slots if p is not None]
-    for p in live:
-        p.attach_program()
-    if not live:
-        return
-    mod = live[0]._mod
-    borrows: list = [p.wit if p is not None else None for p in slots]
-    borrows.extend([None] * (k - len(borrows)))
-    _wit(mod.submit, on.wit, borrows, what="submit")
-
-
-async def run_ahead(
-    on: Pipeline,
-    fwd: ForwardPass,
-    budget: int,
-    on_token: Callable[[], Awaitable[bool]],
-) -> int:
-    """Keep the runtime's run-ahead window full while `on_token` consumes
-    results, until `budget` fires submit or `on_token` returns False.
-    Returns the run count."""
-    if budget == 0:
-        return 0
-    # Live slots per frame. A pass that binds a dense device mask takes one;
-    # so does a pass on a recurrent or hybrid model, whose frame's waves carry
-    # the same sequence's state one into the next (a frame of one live slot
-    # measured faster than a full one on Qwen3.5-0.8B). A dense attention
-    # pass fills the frame.
-    r = 1 if fwd.binds_device_mask() or fwd.kind != ForwardKind.ATTENTION else frame_size()
-    window_frames = max((channel_capacity() - 1) // max(r, 1), 1)
-    submitted = 0
-    consumed = 0
-
-    def submit_one_frame() -> None:
-        nonlocal submitted
-        live = min(r, budget - submitted)
-        if live == 0:
-            return
-        submit_frame(on, [fwd] * live)
-        submitted += live
-
-    for _ in range(window_frames):
-        if submitted >= budget:
-            break
-        submit_one_frame()
-
-    ended = False
-    if submitted >= budget and not ended:
-        on.close()
-        ended = True
-    while consumed < submitted:
-        cont = on_token()
-        if inspect.isawaitable(cont):
-            cont = await cont
-        if cont is False:
-            if not ended:
-                on.close()
-            return consumed + 1
-        consumed += 1
-        if submitted < budget and submitted - consumed <= (window_frames - 1) * r:
-            submit_one_frame()
-        if submitted >= budget and not ended:
-            on.close()
-            ended = True
-    if not ended:
-        on.close()
-    return consumed

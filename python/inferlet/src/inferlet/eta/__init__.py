@@ -7,11 +7,9 @@ A stage body is an ordinary Python function traced once at first submit::
 
     from inferlet.eta import *
 
-    tok_out = Channel([1], dtype.i32).named("tok_out")
-
-    @fwd.epilogue
-    def _():
-        tok_out.put(reshape(reduce_argmax(intrinsics.logits()), [1]))
+    tok_out = fwd.epilogue(lambda: reduce_argmax(intrinsics.logits()))
+    pipe.submit(fwd)
+    token = await tok_out
 
 The emitted container bytes are identical to the Rust `inferlet` crate's for the same
 program, so a Python and a Rust inferlet share the host's program cache.
@@ -43,10 +41,8 @@ from .bridge import (
     pad_tokens,
     prefill_chunk_hint,
     prefill_chunks,
-    run_ahead,
     scale,
     submit_deadline_us,
-    submit_frame,
     unpad_tokens,
 )
 from .ir import Dtype, Port, Stage, dtype

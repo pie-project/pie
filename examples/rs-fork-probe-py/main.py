@@ -25,7 +25,6 @@ from inferlet.eta import (
     kv_page_size,
     reduce_argmax,
     reshape,
-    run_ahead,
 )
 
 
@@ -74,7 +73,7 @@ async def append_tokens(ws: WorkingSet, rs: list, pipeline: Pipeline, start: int
     def _():
         next_token.put(reshape(reduce_argmax(intrinsics.logits()), [1]))
 
-    fwd.submit(pipeline)
+    pipeline.submit(fwd)
     return await next_token.take_scalar()
 
 
@@ -142,7 +141,7 @@ async def generate(ws: WorkingSet, rs: list, pipeline: Pipeline, seq_len: int, f
         generated.append(token)
         return True
 
-    await run_ahead(pipeline, fwd, budget, on_token)
+    await pipeline.run_ahead(fwd, budget, on_token)
     return generated
 
 

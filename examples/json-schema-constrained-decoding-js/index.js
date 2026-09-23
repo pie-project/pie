@@ -74,7 +74,7 @@ export function main(input) {
 
   prefillMask.put(mask.unpackMask(constraint.mask(), vocab));
   const pipeline = new Pipeline();
-  prefill.submit(pipeline);
+  pipeline.submit(prefill);
   const first = firstOut.takeScalar();
 
   const generated = [first];
@@ -115,7 +115,7 @@ export function main(input) {
     let submitted = 0;
     while (submitted < budget) {
       grammarMask.put(mask.unpackMask(constraint.mask(), vocab));
-      decode.submit(pipeline);
+      pipeline.submit(decode);
       submitted += 1;
       const token = tokenOut.takeScalar();
       generated.push(token);

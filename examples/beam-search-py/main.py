@@ -35,7 +35,6 @@ from inferlet.eta import (
     or_,
     reduce_argmax,
     reshape,
-    run_ahead,
     top_k,
 )
 
@@ -197,10 +196,10 @@ async def main(input: dict) -> str:
             await drain()
             return True
 
-        await run_ahead(pipeline, fwd, max_steps, on_step)
+        await pipeline.run_ahead(fwd, max_steps, on_step)
     else:
         for _ in range(max_steps):
-            fwd.submit(pipeline)
+            pipeline.submit(fwd)
             parents = await drain()
             next_rs = [rs_working_sets[p].fork(pipeline) for p in parents]
             bind_state(next_rs)

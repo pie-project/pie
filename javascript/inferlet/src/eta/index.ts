@@ -7,10 +7,9 @@
 //     import { eta } from '@pie-project/inferlet';
 //     const { Channel, ForwardPass, dtype, intrinsics, reduceArgmax, reshape } = eta;
 //
-//     const tokOut = new Channel([1], dtype.i32).named('tok_out');
-//     fwd.epilogue(() => {
-//       tokOut.put(reshape(reduceArgmax(intrinsics.logits()), [1]));
-//     });
+//     const tokOut = fwd.epilogue(() => reduceArgmax(intrinsics.logits()));
+//     pipe.submit(fwd);
+//     const token = tokOut.takeScalar();
 //
 // The emitted container bytes are identical to the Rust `inferlet` crate's for the same
 // program, so a JS inferlet and a Rust inferlet share the host's program
@@ -35,10 +34,8 @@ export {
   padTokens,
   prefillChunkHint,
   prefillChunks,
-  runAhead,
   scale,
   submitDeadlineUs,
-  submitFrame,
   unpadTokens,
 } from './bridge.js';
 export type { ForwardKind, KvBinding, KvGeometry, PageDecl, PageRange, RsGeometry } from './bridge.js';

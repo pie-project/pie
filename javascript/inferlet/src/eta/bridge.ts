@@ -24,7 +24,7 @@ import { Builder, DslChannel } from './builder.js';
 import { kernel } from './intrinsics.js';
 import { Dtype, Port, Shape, Stage, numel, portName, shapeOf } from './ir.js';
 import { ChannelState, TraceError } from './trace.js';
-import { ConstData, ConstLike, Tensor, constData, unpackElems } from './value.js';
+import { ConstData, ConstLike, Tensor, constData, reshape, unpackElems } from './value.js';
 
 export type ForwardKind = witModel.ForwardKind;
 
@@ -92,19 +92,49 @@ export function unpadTokens(window: ArrayLike<number>): number[] {
  * `put(data)` stages a cell and `takeHost()` reads one back (blocking).
  */
 export class Channel {
-  /** @internal The trace-side half. */
-  readonly dsl: DslChannel;
+  private dsl_: DslChannel | null;
+  private pending: { capacity?: number; name?: string } | null = null;
 
   constructor(shape: readonly number[], dtype: Dtype);
   /** @internal */
   constructor(dsl: DslChannel);
   constructor(shapeOrDsl: readonly number[] | DslChannel, dtype?: Dtype) {
     if (shapeOrDsl instanceof DslChannel) {
-      this.dsl = shapeOrDsl;
+      this.dsl_ = shapeOrDsl;
       return;
     }
     if (dtype === undefined) throw new TypeError('new Channel(shape, dtype)');
-    this.dsl = DslChannel.new(shapeOf(shapeOrDsl), dtype);
+    this.dsl_ = DslChannel.new(shapeOf(shapeOrDsl), dtype);
+  }
+
+  /** @internal An output channel declared by a stage body's return value:
+   * its shape and dtype are the returned tensor's, known once the pass
+   * traces (at first submit). `capacity`/`named` before that are kept. */
+  static lazy(): Channel {
+    const ch = new Channel(DslChannel.new([1], Dtype.I32));
+    ch.dsl_ = null;
+    ch.pending = {};
+    return ch;
+  }
+
+  /** @internal Inside a stage body: declare this lazy channel as the
+   * returned tensor's cell and record the put. */
+  materialize(value: Tensor): void {
+    const one = numel(value.shape) === 1 && value.shape.length !== 1;
+    const shape = one ? [1] : value.shape;
+    if (one) value = reshape(value, shape);
+    this.dsl_ = DslChannel.new(shape, value.dtype);
+    const pending = this.pending ?? {};
+    this.pending = null;
+    if (pending.capacity !== undefined) this.dsl_.capacity(pending.capacity);
+    if (pending.name !== undefined) this.dsl_.named(pending.name);
+    this.dsl_.putTensor(value);
+  }
+
+  /** @internal The trace-side half. */
+  get dsl(): DslChannel {
+    if (this.dsl_ === null) throw new InferletError('this output channel is declared by its stage body; submit the pass first');
+    return this.dsl_;
   }
 
   /** An initially empty channel whose producer is the host. */
@@ -145,12 +175,20 @@ export class Channel {
 
   /** Widen the ring to `n` cells (deeper run-ahead). Must precede first use. */
   capacity(n: number): this {
+    if (this.dsl_ === null) {
+      this.pending!.capacity = n;
+      return this;
+    }
     if (this.dsl.state.host !== null) throw new TraceError('capacity must be set before the channel is used');
     this.dsl.capacity(n);
     return this;
   }
 
   named(name: string): this {
+    if (this.dsl_ === null) {
+      this.pending!.name = name;
+      return this;
+    }
     this.dsl.named(name);
     return this;
   }
@@ -259,18 +297,61 @@ export class PageGrant {
  * mapping trie. Every page reference is working-set-relative. */
 export class WorkingSet {
   readonly kv: witWs.KvWorkingSet;
+  /** The first `reserve` grant; `geometry()` addresses it. */
+  grant: PageGrant | undefined;
+  private rs_: RsWorkingSet[] | undefined;
 
-  constructor(kv?: witWs.KvWorkingSet) {
-    this.kv = kv ?? new witWs.KvWorkingSet();
+  /** `{ tokens: n }` reserves the pages `n` tokens need up front (`grant`). */
+  constructor(opts: { tokens?: number } = {}) {
+    this.kv = new witWs.KvWorkingSet();
+    if (opts.tokens !== undefined) this.reserve(Math.max(Math.ceil(opts.tokens / kvPageSize()), 1));
+  }
+
+  /** @internal */
+  static wrap(kv: witWs.KvWorkingSet): WorkingSet {
+    const ws = Object.create(WorkingSet.prototype) as { -readonly [K in keyof WorkingSet]: WorkingSet[K] };
+    ws.kv = kv;
+    ws.grant = undefined;
+    return ws as WorkingSet;
   }
 
   pageLen(): number {
     return this.kv.pageLen();
   }
 
+  /** Reserve `pages` fresh pages. The first grant is kept as `grant`. */
   reserve(pages: number): PageGrant {
     const r = wit('reserve KV', () => this.kv.reserve(pages));
-    return new PageGrant(r.start, r.len);
+    const grant = new PageGrant(r.start, r.len);
+    this.grant ??= grant;
+    return grant;
+  }
+
+  /** The recurrent state a hybrid model folds this sequence into: one
+   * `RsWorkingSet`, made on first use; empty on an attention model. */
+  get rs(): RsWorkingSet[] {
+    this.rs_ ??= witModel.passKind() === 'hybrid' ? [new RsWorkingSet()] : [];
+    return this.rs_;
+  }
+
+  /** The `KvGeometry` of a fire that embeds tokens `[start, end)` of one
+   * contiguous sequence into this working set's pages: `kvLen`,
+   * `pageIndptr`, `wSlot`, `wOff`, `positions` are all derived from the
+   * span, and `pages` is the reserved grant. Edit the returned fields
+   * (`mask`, `writablePages`, ...) for anything else. */
+  geometry(start: number, end: number): KvGeometry {
+    if (!(0 <= start && start < end)) throw new InferletError(`geometry: [${start}, ${end}) is not a span of tokens to embed`);
+    const page = kvPageSize();
+    const span = Array.from({ length: end - start }, (_, i) => start + i);
+    const pages = this.grant?.ids ?? Array.from({ length: Math.ceil(end / page) }, (_, i) => i);
+    return {
+      kvLen: Channel.from([end], Dtype.U32),
+      pages: Channel.from(pages, Dtype.U32),
+      pageIndptr: Channel.from([0, Math.ceil(end / page)], Dtype.U32),
+      wSlot: Channel.from(span.map((p) => Math.floor(p / page)), Dtype.U32),
+      wOff: Channel.from(span.map((p) => p % page), Dtype.U32),
+      positions: Channel.from(span, Dtype.U32),
+    };
   }
 
   updateIndex(key: Uint8Array): void {
@@ -279,7 +360,7 @@ export class WorkingSet {
 
   static fromIndex(key: Uint8Array): WorkingSet | undefined {
     const kv = wit('fromIndex', () => witWs.KvWorkingSet.fromIndex(key));
-    return kv ? new WorkingSet(kv) : undefined;
+    return kv ? WorkingSet.wrap(kv) : undefined;
   }
 
   static removeIndex(key: Uint8Array): boolean {
@@ -291,11 +372,11 @@ export class WorkingSet {
   }
 
   fork(on: Pipeline): WorkingSet {
-    return new WorkingSet(wit('fork', () => this.kv.fork(on.wit)));
+    return WorkingSet.wrap(wit('fork', () => this.kv.fork(on.wit)));
   }
 
   slice(on: Pipeline, start: number, len: number): WorkingSet {
-    return new WorkingSet(wit('slice', () => this.kv.slice(on.wit, { start, len })));
+    return WorkingSet.wrap(wit('slice', () => this.kv.slice(on.wit, { start, len })));
   }
 
   copyInto(on: Pipeline, dstPageIds: ArrayLike<number>, dstTokIdx: ArrayLike<number>, srcPageIds: ArrayLike<number>, srcTokIdx: ArrayLike<number>): void {
@@ -355,6 +436,71 @@ export class Pipeline {
   /** Leave the frame wait-set until this pipeline submits again. */
   park(): void {
     witAttention.park(this.wit);
+  }
+
+  /** Enqueue one pass as a single-slot frame. */
+  submit(fwd: ForwardPass): void {
+    this.submitFrame([fwd]);
+  }
+
+  /** Submit ONE FRAME: up to `frameSize()` slots, slot i executing in wave
+   * i; trailing slots pad with no-ops. */
+  submitFrame(slots: (ForwardPass | undefined)[]): void {
+    const k = frameSize();
+    if (slots.length > k) throw new InferletError(`frame holds ${slots.length} slot(s); model.frame-size() is ${k}`);
+    const live = slots.filter((p): p is ForwardPass => p !== undefined);
+    for (const p of live) p.attachProgram();
+    if (!live.length) return;
+    const borrows: (AnyPass | undefined)[] = slots.map((p) => p?.wit);
+    while (borrows.length < k) borrows.push(undefined);
+    live[0].submitWith(this, borrows);
+  }
+
+  /**
+   * Keep the runtime's run-ahead window full while `onToken` consumes
+   * results, until `budget` fires submit or `onToken` returns `false`.
+   * Returns the run count. `onToken` is synchronous here (host reads block).
+   */
+  runAhead(fwd: ForwardPass, budget: number, onToken: () => boolean | void): number {
+    if (budget === 0) return 0;
+    // Live slots per frame. A pass that binds a dense device mask takes one;
+    // so does a pass on a recurrent or hybrid model, whose frame's waves carry
+    // the same sequence's state one into the next (a frame of one live slot
+    // measured faster than a full one on Qwen3.5-0.8B). A dense attention pass
+    // fills the frame.
+    const r = fwd.bindsDeviceMask() || fwd.kind !== 'attention' ? 1 : frameSize();
+    const windowFrames = Math.max(Math.floor((channelCapacity() - 1) / Math.max(r, 1)), 1);
+    let submitted = 0;
+    let consumed = 0;
+    const submitOneFrame = () => {
+      const live = Math.min(r, budget - submitted);
+      if (live === 0) return;
+      this.submitFrame(new Array(live).fill(fwd));
+      submitted += live;
+    };
+    for (let i = 0; i < windowFrames; i++) {
+      if (submitted >= budget) break;
+      submitOneFrame();
+    }
+    let ended = false;
+    if (submitted >= budget && !ended) {
+      this.close();
+      ended = true;
+    }
+    while (consumed < submitted) {
+      if (onToken() === false) {
+        if (!ended) this.close();
+        return consumed + 1;
+      }
+      consumed += 1;
+      if (submitted < budget && submitted - consumed <= (windowFrames - 1) * r) submitOneFrame();
+      if (submitted >= budget && !ended) {
+        this.close();
+        ended = true;
+      }
+    }
+    if (!ended) this.close();
+    return consumed;
   }
 }
 
@@ -525,8 +671,13 @@ export class ForwardPass {
     return this.ports.some(([p]) => p === Port.ATTN_MASK);
   }
 
-  /** Bind token ids and CSR row indptr (both channels). */
-  embed(tokens: Channel, indptr: Channel): void {
+  /** Bind token ids and the CSR row indptr. A token array becomes an i32
+   * channel; `indptr` omitted is the one row `[0, n]`, an array is a u32
+   * channel. */
+  embed(tokens: Channel | ArrayLike<number>, indptr?: Channel | ArrayLike<number>): void {
+    if (!(tokens instanceof Channel)) tokens = Channel.from(Array.from(tokens), Dtype.I32);
+    if (indptr === undefined) indptr = Channel.from([0, numel(tokens.shape)], Dtype.U32);
+    else if (!(indptr instanceof Channel)) indptr = Channel.from(Array.from(indptr), Dtype.U32);
     this.ensurePortsAvailable([Port.EMBED_TOKENS, Port.EMBED_INDPTR]);
     wit('embed', () => this.wit.embed(tokens.wit(), indptr.wit()));
     this.ports.push([Port.EMBED_TOKENS, tokens], [Port.EMBED_INDPTR, indptr]);
@@ -702,11 +853,11 @@ export class ForwardPass {
   }
 
   /** Kind-independent binding for the common text program: the KV geometry,
-   * plus — on a hybrid model — the recurrent working set(s), folding every
-   * token straight into the recurrence. */
-  bindState(ws: WorkingSet, geom: KvGeometry, rs: RsWorkingSet[] = []): void {
+   * plus — on a hybrid model — the recurrent working set(s) (`ws.rs` unless
+   * given), folding every token straight into the recurrence. */
+  bindState(ws: WorkingSet, geom: KvGeometry, rs?: RsWorkingSet[]): void {
     if (this.kind === 'attention' || this.kind === 'diffusion') this.attention(ws, geom);
-    else if (this.kind === 'hybrid') this.bindHybrid({ workingSet: ws, geometry: geom }, rs, { buffer: [0, 0] });
+    else if (this.kind === 'hybrid') this.bindHybrid({ workingSet: ws, geometry: geom }, rs ?? ws.rs, { buffer: [0, 0] });
     else throw new InferletError('bindState: a recurrent-only model has no KV geometry to bind');
   }
 
@@ -765,9 +916,19 @@ export class ForwardPass {
   prologue(body: () => void): void {
     this.setStage(Stage.PROLOGUE, body);
   }
-  /** Attach the `epilogue` stage (sampling programs; after the forward). */
-  epilogue(body: () => void): void {
-    this.setStage(Stage.EPILOGUE, body);
+  /** Attach the `epilogue` stage (sampling programs; after the forward). A
+   * body that returns a tensor declares an output channel of that cell, put
+   * once per fire; the channel is returned and read on the host
+   * (`out.takeScalar()`). `out.capacity(n)` widens it for run-ahead. */
+  epilogue(body: () => Tensor | void): Channel {
+    const out = Channel.lazy();
+    this.setStage(Stage.EPILOGUE, () => {
+      const value = body();
+      if (value === undefined) return;
+      if (!(value instanceof Tensor)) throw new TypeError('an epilogue returns a Tensor to publish, or nothing');
+      out.materialize(value);
+    });
+    return out;
   }
   onAttnProj(body: () => void): void {
     if (this.kind === 'recurrent') throw new InferletError('a recurrent-only pass has no attention layer to tap');
@@ -787,11 +948,6 @@ export class ForwardPass {
     const handles = traced.channels.map(hostChannel);
     wit('program', () => this.wit.program(traced.encode(), handles));
     this.programAttached = true;
-  }
-
-  /** Enqueue this pass as a single-slot frame on `on`. */
-  submit(on: Pipeline): void {
-    submitFrame(on, [this]);
   }
 
   /** @internal */
@@ -824,60 +980,3 @@ export function scale(e: AdapterExpr, l: Channel): AdapterExpr {
 }
 
 /** Submit ONE FRAME on `on`: up to `frameSize()` slots. */
-export function submitFrame(on: Pipeline, slots: (ForwardPass | undefined)[]): void {
-  const k = frameSize();
-  if (slots.length > k) throw new InferletError(`frame holds ${slots.length} slot(s); model.frame-size() is ${k}`);
-  const live = slots.filter((p): p is ForwardPass => p !== undefined);
-  for (const p of live) p.attachProgram();
-  if (!live.length) return;
-  const borrows: (AnyPass | undefined)[] = slots.map((p) => p?.wit);
-  while (borrows.length < k) borrows.push(undefined);
-  live[0].submitWith(on, borrows);
-}
-
-/**
- * Keep the runtime's run-ahead window full while `onToken` consumes results,
- * until `budget` fires submit or `onToken` returns `false`. Returns the run
- * count. `onToken` is synchronous here (host reads block).
- */
-export function runAhead(on: Pipeline, fwd: ForwardPass, budget: number, onToken: () => boolean | void): number {
-  if (budget === 0) return 0;
-  // Live slots per frame. A pass that binds a dense device mask takes one;
-  // so does a pass on a recurrent or hybrid model, whose frame's waves carry
-  // the same sequence's state one into the next (a frame of one live slot
-  // measured faster than a full one on Qwen3.5-0.8B). A dense attention pass
-  // fills the frame.
-  const r = fwd.bindsDeviceMask() || fwd.kind !== 'attention' ? 1 : frameSize();
-  const windowFrames = Math.max(Math.floor((channelCapacity() - 1) / Math.max(r, 1)), 1);
-  let submitted = 0;
-  let consumed = 0;
-  const submitOneFrame = () => {
-    const live = Math.min(r, budget - submitted);
-    if (live === 0) return;
-    submitFrame(on, new Array(live).fill(fwd));
-    submitted += live;
-  };
-  for (let i = 0; i < windowFrames; i++) {
-    if (submitted >= budget) break;
-    submitOneFrame();
-  }
-  let ended = false;
-  if (submitted >= budget && !ended) {
-    on.close();
-    ended = true;
-  }
-  while (consumed < submitted) {
-    if (onToken() === false) {
-      if (!ended) on.close();
-      return consumed + 1;
-    }
-    consumed += 1;
-    if (submitted < budget && submitted - consumed <= (windowFrames - 1) * r) submitOneFrame();
-    if (submitted >= budget && !ended) {
-      on.close();
-      ended = true;
-    }
-  }
-  if (!ended) on.close();
-  return consumed;
-}

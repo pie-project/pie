@@ -25,7 +25,6 @@ from inferlet.eta import (
     channel_capacity,
     kv_page_size,
     prefill_chunks,
-    run_ahead,
     reduce_argmax,
     reshape,
 )
@@ -94,7 +93,7 @@ async def main(input: dict) -> dict:
         def _prefill_epilogue():
             tok_out.put(greedy(intrinsics.logits()))
 
-        fwd.submit(pipe)
+        pipe.submit(fwd)
         # Every chunk samples and every sample must be drained.
         first = await tok_out.take_scalar()
     generated.append(first)
@@ -149,7 +148,7 @@ async def main(input: dict) -> dict:
             generated.append(await tok_out.take_scalar())
             return True
 
-        await run_ahead(pipe, fwd, budget, on_token)
+        await pipe.run_ahead(fwd, budget, on_token)
     pipe.close()
 
     return {

@@ -28,7 +28,6 @@ from inferlet.eta import (
     reduce_max,
     reduce_sum,
     reshape,
-    run_ahead,
     select,
     softmax,
 )
@@ -118,7 +117,7 @@ async def main(input: dict) -> dict:
         rng_p.put(r_next)
 
     pipe = Pipeline()
-    fwd_p.submit(pipe)
+    pipe.submit(fwd_p)
     generated.append(await tok_out_p.take_scalar())
     s1.append(await s1_out_p.take_scalar())
     s2.append(await s2_out_p.take_scalar())
@@ -176,7 +175,7 @@ async def main(input: dict) -> dict:
             s2.append(await s2_out.take_scalar())
             return True
 
-        await run_ahead(pipe, fwd, max_tokens - 1, on_token)
+        await pipe.run_ahead(fwd, max_tokens - 1, on_token)
     pipe.close()
 
     mean_s1 = sum(s1) / len(s1)

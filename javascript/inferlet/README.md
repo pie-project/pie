@@ -4,35 +4,39 @@ The JavaScript library for writing Pie inferlets — the small programs that run
 next to the model.
 
 ```js
-import { model, eta } from '@pie-project/inferlet';
-const { Channel, ForwardPass, Pipeline, WorkingSet, dtype, intrinsics, reduceArgmax, reshape } = eta;
+import { chat, eta, model } from '@pie-project/inferlet';
+const { ForwardPass, Pipeline, WorkingSet, intrinsics, reduceArgmax } = eta;
 
 export function main(input) {
-  const prompt = model.encode(input.prompt ?? 'The capital of France is');
-  const n = prompt.length;
-  const ws = new WorkingSet();
-  ws.reserve(1);
-
-  const tokens = Channel.from(prompt, dtype.i32);
-  const indptr = Channel.from([0, n], dtype.u32);
-  const tokOut = new Channel([1], dtype.i32);
-  // ...kvLen / pages / pageIndptr / wSlot / wOff / positions as in
-  // examples/text-completion-js/index.js
-
-  const fwd = new ForwardPass();              // picks the model's pass kind
-  fwd.embed(tokens, indptr);
-  fwd.bindState(ws, { kvLen, pages, pageIndptr, wSlot, wOff, positions });
-  fwd.epilogue(() => {                        // traced once, runs on the device
-    tokOut.put(reshape(reduceArgmax(intrinsics.logits()), [1]));
-  });
-
+  const tokens = [...chat.prefix(), ...model.encode(input.prompt ?? 'The capital of France is')];
+  const maxTokens = Number(input.max_tokens ?? 8);
+  const ws = new WorkingSet({ tokens: tokens.length + maxTokens }); // KV pages (and recurrent state on a hybrid model)
   const pipe = new Pipeline();
-  fwd.submit(pipe);
-  const first = tokOut.takeScalar();           // blocks until the fire settles
+
+  let done = 0; // tokens already in the KV cache
+  for (let i = 0; i < maxTokens; i++) {
+    const fwd = new ForwardPass();                       // the model's pass kind
+    fwd.embed(tokens.slice(done));                       // the new tokens
+    fwd.bindState(ws, ws.geometry(done, tokens.length));
+    const out = fwd.epilogue(() => reduceArgmax(intrinsics.logits())); // traced once, runs on the device
+    pipe.submit(fwd);
+    done = tokens.length;
+    tokens.push(out.takeScalar());                       // blocks until the fire settles
+  }
   pipe.close();
-  return { text: model.decode([first]) };
+
+  return { text: model.decode(tokens.slice(-maxTokens)) };
 }
 ```
+
+That is `examples/quickstart-js`. Every line above stands for device state:
+`embed(array)` seeds the token and row channels, `ws.geometry(start, end)`
+derives the six KV-geometry channels of one contiguous span (edit its fields
+for anything else), and an `epilogue` that returns a tensor publishes it on a
+channel the host reads. The explicit spellings — `Channel.from(...,
+dtype.u32)`, a `{ kvLen, pages, ... }` geometry, `ch.put(tensor)` inside the
+stage — are the same objects and stay available; `examples/text-completion-js`
+uses them for chunked prefill and a device loop-carried decode.
 
 ## What is here
 
@@ -40,7 +44,7 @@ export function main(input) {
 crates and `inferlet::eta`): `Tensor` with `.add/.sub/.mul/.div/.rem/.neg/
 .divCeil`, the op set (`reduceArgmax`, `gumbelMax`, `nucleusSample`,
 `softmax`, `topK`, …), `Channel`, `WorkingSet`, `RsWorkingSet`,
-`ForwardPass`, `Pipeline`, `runAhead`, `prefillChunks`, and `eta.diffusion`
+`ForwardPass`, `Pipeline` (`submit`, `runAhead`), `prefillChunks`, and `eta.diffusion`
 (the diffusion pass's `Mode` plus `entropyBoundAccept` / `stableAndConfident` /
 `linearTemperature`). The container bytes
 it emits are **byte-identical** to the Rust `inferlet` crate's for the same program

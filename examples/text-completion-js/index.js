@@ -3,7 +3,7 @@
 
 import { chat, eta, model } from '@pie-project/inferlet';
 
-const { Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, channelCapacity, dtype, indptr, intrinsics, kvPageSize, prefillChunks, reduceArgmax, reshape, runAhead } = eta;
+const { Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, channelCapacity, dtype, indptr, intrinsics, kvPageSize, prefillChunks, reduceArgmax, reshape } = eta;
 
 const range = (a, b) => Array.from({ length: b - a }, (_, i) => a + i);
 const divCeil = (a, b) => Math.floor((a + b - 1) / b);
@@ -57,7 +57,7 @@ export function main(input) {
     fwd.epilogue(() => {
       tokOut.put(greedy(intrinsics.logits()));
     });
-    fwd.submit(pipe);
+    pipe.submit(fwd);
     // Every chunk samples and every sample must be drained.
     first = tokOut.takeScalar();
   }
@@ -95,7 +95,7 @@ export function main(input) {
     });
 
     const budget = maxTokens - 1;
-    runAhead(pipe, fwd, budget, () => {
+    pipe.runAhead(fwd, budget, () => {
       generated.push(tokOut.takeScalar());
       return true;
     });

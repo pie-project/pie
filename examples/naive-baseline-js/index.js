@@ -24,7 +24,6 @@ const {
   kvPageSize,
   prefillChunks,
   reshape,
-  runAhead,
 } = eta;
 
 const range = (a, b) => Array.from({ length: b - a }, (_, i) => a + i);
@@ -96,7 +95,7 @@ export function main(input) {
       }
       rngP.put(rNext);
     });
-    fwdP.submit(pipe);
+    pipe.submit(fwdP);
     g0 = tokOutP.takeScalar();
     if (wantStats) {
       s1OutP.takeHost();
@@ -151,7 +150,7 @@ export function main(input) {
     });
 
     const budget = maxTokens - 1;
-    runAhead(pipe, fwd, budget, () => {
+    pipe.runAhead(fwd, budget, () => {
       const t = tokOut.takeScalar();
       if (wantStats) {
         s1Out.takeHost();

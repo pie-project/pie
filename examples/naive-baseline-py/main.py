@@ -26,7 +26,6 @@ from inferlet.eta import (
     kv_page_size,
     prefill_chunks,
     reshape,
-    run_ahead,
 )
 
 
@@ -114,7 +113,7 @@ async def main(input: dict) -> dict:
                 s2_out_p.put(mirror)
             rng_p.put(r_next)
 
-        fwd_p.submit(pipe)
+        pipe.submit(fwd_p)
         # Every chunk samples; only the last chunk's token continues the
         # prompt. The intermediate takes cannot be skipped.
         g0 = await tok_out_p.take_scalar()
@@ -191,7 +190,7 @@ async def main(input: dict) -> dict:
             generated.append(t)
             return True
 
-        await run_ahead(pipe, fwd, budget, on_token)
+        await pipe.run_ahead(fwd, budget, on_token)
     pipe.close()
 
     return {

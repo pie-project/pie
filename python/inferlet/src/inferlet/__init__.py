@@ -14,15 +14,11 @@ Python inferlet and a Rust inferlet share the host's program cache.
         ws = WorkingSet()
         ws.reserve(max_pages)
         fwd = ForwardPass()
-        fwd.embed(tokens, indptr)
-        fwd.bind_state(ws, KvGeometry(...))
-
-        @fwd.epilogue
-        def _():
-            tok_out.put(reshape(reduce_argmax(intrinsics.logits()), [1]))
-
-        fwd.submit(pipe)
-        token = await tok_out.take_scalar()
+        fwd.embed(tokens)
+        fwd.bind_state(ws, ws.geometry(0, len(tokens)))
+        tok_out = fwd.epilogue(lambda: reduce_argmax(intrinsics.logits()))
+        pipe.submit(fwd)
+        token = await tok_out
 
 A Python inferlet is run as source by the Python language component
 (`language/build.sh` builds it with `componentize-py`); the generated

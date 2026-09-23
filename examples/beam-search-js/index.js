@@ -14,7 +14,7 @@ import { eta, model } from '@pie-project/inferlet';
 
 const {
   Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, broadcast, cast, channelCapacity, dtype, eq, gather, intrinsics,
-  iota, logSoftmax, or, reduceArgmax, reshape, runAhead, topK,
+  iota, logSoftmax, or, reduceArgmax, reshape, topK,
 } = eta;
 
 const POOL_PAGES = 8; // shared pool pages (over-allocated; compaction bounds this)
@@ -162,13 +162,13 @@ export function main(input) {
   };
 
   if (rsWorkingSets.length === 0) {
-    runAhead(pipeline, fwd, maxSteps, () => {
+    pipeline.runAhead(fwd, maxSteps, () => {
       drain();
       return true;
     });
   } else {
     for (let step = 0; step < maxSteps; step++) {
-      fwd.submit(pipeline);
+      pipeline.submit(fwd);
       const parents = drain();
       const nextRs = parents.map((p) => rsWorkingSets[p].fork(pipeline));
       bindState(nextRs);

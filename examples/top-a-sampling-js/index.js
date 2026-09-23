@@ -8,7 +8,7 @@ import { chat, eta, model } from '@pie-project/inferlet';
 
 const {
   Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, broadcast, cast, channelCapacity, constant, dtype, ge, gumbelMax,
-  indptr, intrinsics, iota, kvPageSize, reduceMax, reduceSum, reshape, runAhead, select, softmax,
+  indptr, intrinsics, iota, kvPageSize, reduceMax, reduceSum, reshape, select, softmax,
 } = eta;
 
 const range = (a, b) => Array.from({ length: b - a }, (_, i) => a + i);
@@ -91,7 +91,7 @@ export function main(input) {
   });
 
   const pipe = new Pipeline();
-  fwdP.submit(pipe);
+  pipe.submit(fwdP);
   generated.push(tokOutP.takeScalar());
   s1.push(s1OutP.takeScalar());
   s2.push(s2OutP.takeScalar());
@@ -135,7 +135,7 @@ export function main(input) {
       rng.put(rNext);
     });
 
-    runAhead(pipe, fwd, maxTokens - 1, () => {
+    pipe.runAhead(fwd, maxTokens - 1, () => {
       generated.push(tokOut.takeScalar());
       s1.push(s1Out.takeScalar());
       s2.push(s2Out.takeScalar());

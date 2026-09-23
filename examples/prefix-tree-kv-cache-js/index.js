@@ -7,7 +7,7 @@
 
 import { chat, eta, model } from '@pie-project/inferlet';
 
-const { Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, channelCapacity, dtype, indptr, intrinsics, kvPageSize, reduceArgmax, reshape, runAhead } = eta;
+const { Channel, ForwardPass, Pipeline, RsWorkingSet, WorkingSet, channelCapacity, dtype, indptr, intrinsics, kvPageSize, reduceArgmax, reshape } = eta;
 
 const range = (a, b) => Array.from({ length: b - a }, (_, i) => a + i);
 const divCeil = (a, b) => Math.floor((a + b - 1) / b);
@@ -36,7 +36,7 @@ function appendTokens(ws, rs, pipeline, start, tokens) {
   fwd.epilogue(() => {
     nextToken.put(reshape(reduceArgmax(intrinsics.logits()), [1]));
   });
-  fwd.submit(pipeline);
+  pipeline.submit(fwd);
   return nextToken.takeScalar();
 }
 
@@ -78,7 +78,7 @@ function generate(ws, rs, pipeline, seqLen, firstToken, maxTokens) {
     tokenOut.put(token);
   });
 
-  runAhead(pipeline, fwd, maxTokens - generated.length, () => {
+  pipeline.runAhead(fwd, maxTokens - generated.length, () => {
     const token = tokenOut.takeScalar();
     if (stop.has(token)) return false;
     generated.push(token);

@@ -99,7 +99,7 @@ async def main(input: dict) -> str:
 
     prefill_mask.put(mask.unpack_mask(constraint.mask(), vocab))
     pipeline = Pipeline()
-    prefill.submit(pipeline)
+    pipeline.submit(prefill)
     first = await first_out.take_scalar()
 
     generated = [first]
@@ -154,7 +154,7 @@ async def main(input: dict) -> str:
         submitted = 0
         while submitted < budget:
             grammar_mask.put(mask.unpack_mask(constraint.mask(), vocab))
-            decode.submit(pipeline)
+            pipeline.submit(decode)
             submitted += 1
             token = await token_out.take_scalar()
             generated.append(token)
