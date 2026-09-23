@@ -1793,9 +1793,7 @@ pub mod index {
         let ratio = nonzero(OP, "the block width this mean pools over", ratio)?;
         let rows = nonzero(OP, "rows", boundary_pos.rows)?;
         ctx.fire(
-            Fire::at(FILE_POOL, entry)
-                .groups([head_dim.div_ceil(2), rows, 1])
-                .group([POOL_GROUP, 1, 1]),
+            Fire::at(FILE_POOL, entry).apply(Grid::of([head_dim, rows, 1], [POOL_GROUP, 1, 1])),
             &[
                 keys.keys.arg(),
                 entries.arg_mut(),
