@@ -33,10 +33,12 @@ const fn entry(name: &'static str, reads: Reads) -> EntryInfo {
 
 pub const ENTRIES: &[EntryInfo] = &[
     entry("attention.decode", Reads::RowsAndLanes),
+    entry("attention.decode_selected", Reads::RowsAndLanes),
     entry("attention.decode_lse", Reads::RowsAndLanes),
     entry("attention.decode_rel", Reads::RowsAndLanes),
     entry("attention.masked", Reads::RowsAndLanes),
     entry("attention.prefill", Reads::RowsAndLanes),
+    entry("attention.prefill_selected", Reads::RowsAndLanes),
     entry("attention.prefill_lse", Reads::RowsAndLanes),
     entry("attention.ragged", Reads::RowsAndLanes),
     entry("attention.prefill_rel", Reads::RowsAndLanes),
@@ -44,6 +46,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("attention.plan_prefill", Reads::Nothing),
     entry("attention.index_layernorm_rope", Reads::Rows),
     entry("attention.index_rope", Reads::Rows),
+    entry("attention.index_block_mean", Reads::Rows),
     entry("attention.index_topk", Reads::Rows),
     entry("attention.kv_append", Reads::Rows),
     entry("attention.kv_append_shared", Reads::Rows),

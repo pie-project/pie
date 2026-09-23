@@ -7,20 +7,12 @@
 
 #define PIE_GROUP_X 128
 [[vk::binding(0)]] StructuredBuffer<int> positions;
-#if defined(PIE_PREFILL)
-[[vk::binding(1)]] StructuredBuffer<uint> qo_indptr;
-[[vk::binding(2)]] RWStructuredBuffer<int> out_pos;
-[[vk::binding(3)]] RWStructuredBuffer<int> out_req;
-[[vk::binding(4)]] RWStructuredBuffer<int> out_rope;
-[[vk::binding(5)]] StructuredBuffer<uint8_t> row_valid;
-struct Push { int n; int num_requests; int ratio; };
-#else
 [[vk::binding(1)]] RWStructuredBuffer<int> out_pos;
 [[vk::binding(2)]] RWStructuredBuffer<int> out_req;
 [[vk::binding(3)]] RWStructuredBuffer<int> out_rope;
 [[vk::binding(4)]] StructuredBuffer<uint8_t> row_valid;
+[[vk::binding(5)]] StructuredBuffer<int> req_of_token;
 struct Push { int n; int ratio; };
-#endif
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -32,17 +24,10 @@ void main(uint3 gid : SV_DispatchThreadID) {
     bool is_boundary = valid && (((p + 1) % pc.ratio) == 0);
     out_pos[uint(t)] = is_boundary ? p : -1;
     out_rope[uint(t)] = is_boundary ? (p / pc.ratio) * pc.ratio : 0;
-#if defined(PIE_PREFILL)
-    int lo = 0;
-    int hi = pc.num_requests;
-    while (lo + 1 < hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (int(qo_indptr[uint(mid)]) <= t) lo = mid; else hi = mid;
-    }
-    out_req[uint(t)] = lo;
-#else
-    out_req[uint(t)] = t;
-#endif
+    // The request this row belongs to in the FIRE, because the pages the block
+    // is filed into are the fire's. A row index inside this class's own window
+    // would name whichever request sat at that offset.
+    out_req[uint(t)] = req_of_token[uint(t)];
 }
 
 #elif defined(PIE_POOL_STATE_WRITE)
@@ -70,6 +55,45 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint src = i * uint(pc.width) + uint(d);
     state_kv[dst] = kv[src];
     state_score[dst] = score[src];
+}
+
+#elif defined(PIE_INDEX_BLOCK_MEAN)
+
+#define PIE_GROUP_X 256
+PIE_BUFFER_RO(0, key_pages);
+PIE_BUFFER_RW(1, out_);
+[[vk::binding(2)]] StructuredBuffer<int> boundary_pos;
+[[vk::binding(3)]] StructuredBuffer<int> boundary_req;
+[[vk::binding(4)]] StructuredBuffer<uint> page_indices;
+[[vk::binding(5)]] StructuredBuffer<uint> page_indptr;
+struct Push { int head_dim; int ratio; int page_size; int rows; };
+[[vk::push_constant]] ConstantBuffer<Push> pc;
+
+uint pool_slot(int req, int pos) {
+    uint page = page_indices[page_indptr[uint(req)] + uint(pos / pc.page_size)];
+    return page * uint(pc.page_size) + uint(pos % pc.page_size);
+}
+
+[numthreads(PIE_GROUP_X, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    int d = int(gid.x);
+    uint c = gid.y;
+    if (d >= pc.head_dim || c >= uint(pc.rows)) return;
+    int bpos = boundary_pos[c];
+    int req = boundary_req[c];
+    uint at = c * uint(pc.head_dim) + uint(d);
+    if (bpos < 0) {
+        out_[at] = PIE_STORE(0.0);
+        return;
+    }
+    float acc = 0.0;
+    for (int i = 0; i < pc.ratio; i++) {
+        int pos = bpos + i - (pc.ratio - 1);
+        if (pos < 0) continue;
+        uint slot = pool_slot(req, pos);
+        acc += PIE_LOAD(key_pages[slot * uint(pc.head_dim) + uint(d)]);
+    }
+    out_[at] = PIE_STORE(acc / float(pc.ratio));
 }
 
 #elif defined(PIE_POOL_GATHER)
@@ -279,6 +303,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate pool_boundary_prefill PIE_POOL_BOUNDARY=1 PIE_PREFILL=1
 // pie:instantiate pool_state_write_bf16 PIE_POOL_STATE_WRITE=1
 // pie:instantiate pool_gather_paged_bf16 PIE_POOL_GATHER=1
+// pie:instantiate index_block_mean_paged_bf16 PIE_INDEX_BLOCK_MEAN=1
 // pie:instantiate pool_store_entries_bf16 PIE_POOL_STORE=1
 // pie:instantiate pool_lse_paged
 // pie:instantiate pool_lse_selected_paged PIE_SELECTED=1

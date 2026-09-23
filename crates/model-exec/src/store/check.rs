@@ -26,7 +26,9 @@ pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel
             | Attention::PrefillLse { plan, .. }
             | Attention::DecodeRel { plan, .. }
             | Attention::PrefillRel { plan, .. }
-            | Attention::Masked { plan, .. } => *plan,
+            | Attention::Masked { plan, .. }
+            | Attention::DecodeSelected { plan, .. }
+            | Attention::PrefillSelected { plan, .. } => *plan,
             _ => continue,
         };
         let Some(Def::Op(built_by)) = trace.values.get(consumed.0 as usize).map(|v| &v.def) else {

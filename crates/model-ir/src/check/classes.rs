@@ -427,6 +427,8 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::Ragged { .. }
             | Attention::DecodeLse { .. }
             | Attention::PrefillLse { .. }
+            | Attention::DecodeSelected { .. }
+            | Attention::PrefillSelected { .. }
             | Attention::Sink { .. }
             | Attention::MergeLse { .. }
             | Attention::LogitSoftcap { .. }
@@ -446,6 +448,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::IndexLayernormRope { .. }
             | Attention::IndexRope { .. }
             | Attention::IndexTopk { .. }
+            | Attention::IndexBlockMean { .. }
             | Attention::PoolBoundaryDecode { .. }
             | Attention::PoolBoundaryPrefill { .. }
             | Attention::PoolGather { .. }

@@ -436,7 +436,7 @@ fn index_select(
     let weights = ops::linear::matmul(x, &ix.weights_proj);
     ops::attn::index_topk(
         &q,
-        &weights,
+        Some(&weights),
         keys,
         ix.heads,
         ix.head_dim,

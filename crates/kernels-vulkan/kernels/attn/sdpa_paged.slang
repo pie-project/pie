@@ -33,6 +33,9 @@ PIE_BUFFER_RO(10, sinks);
 #elif defined(PIE_LSE)
 
 [[vk::binding(11)]] RWStructuredBuffer<float> lse_out;
+#elif defined(PIE_SELECTED)
+
+[[vk::binding(11)]] StructuredBuffer<int> selection;
 #endif
 
 struct Push {
@@ -42,6 +45,10 @@ struct Push {
     float scale;
     uint attention_mask_stride;
     int window;
+#if defined(PIE_SELECTED)
+    int top_k;
+    int ratio;
+#endif
 #if defined(PIE_TILED)
     int n_rows;
 #endif
@@ -192,7 +199,28 @@ void decode_walk(uint row, uint q_head, uint n_q_heads, int k_lo, int k_hi,
     float max_score = PIE_SDPA_NEG_INF;
     float sum_exp = 0.0;
     if (walks) {
-        for (int kp = k_lo + int(sg); kp <= k_hi; kp += int(subgroups)) {
+        // `keeps` carries the causal and mask tests, so the selected walk only
+        // has to name cells: a block below `nblocks` and then the open block.
+#if defined(PIE_SELECTED)
+        int nblocks = (q_pos + 1) / pc.ratio;
+        int sel_end = min(pc.top_k, nblocks) * pc.ratio;
+        int steps = sel_end + (pc.ratio - 1);
+#else
+        int steps = k_hi - k_lo + 1;
+#endif
+        for (int n = int(sg); n < steps; n += int(subgroups)) {
+#if defined(PIE_SELECTED)
+            int kp;
+            if (n < sel_end) {
+                int c = selection[row * uint(pc.top_k) + uint(n / pc.ratio)];
+                if (c < 0 || c >= nblocks) continue;
+                kp = c * pc.ratio + (n % pc.ratio);
+            } else {
+                kp = nblocks * pc.ratio + (n - sel_end);
+            }
+#else
+            int kp = k_lo + n;
+#endif
             if (!keeps(row, kp, q_pos, start)) continue;
             uint slot = page_slot(req, kp);
             uint base = (slot * uint(pc.n_kv_heads) + uint(kv_head)) * uint(PIE_HEAD_DIM);
@@ -314,6 +342,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint group_i
 #endif
 }
 
+// pie:instantiate sdpa_paged_selected_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_SELECTED=1
+// pie:instantiate sdpa_paged_selected_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_SELECTED=1
+// pie:instantiate sdpa_paged_selected_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_SELECTED=1
+// pie:instantiate sdpa_paged_selected_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_SELECTED=1
 // pie:instantiate sdpa_paged_decode_bfloat16_d_64 PIE_HEAD_DIM=64
 // pie:instantiate sdpa_paged_decode_bfloat16_d_128 PIE_HEAD_DIM=128
 // pie:instantiate sdpa_paged_decode_bfloat16_d_256 PIE_HEAD_DIM=256

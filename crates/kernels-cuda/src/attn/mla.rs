@@ -374,7 +374,7 @@ pub fn kv_append(
     )
 }
 
-mod naive {
+pub(crate) mod naive {
     use super::{ArgValue, Ctx, Error, Fire, Launch, refuse};
     use crate::jit::Arg;
 

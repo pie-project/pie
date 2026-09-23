@@ -89,7 +89,7 @@ PIE_BUFFER_RO(2, key_pages);
 [[vk::binding(6)]] StructuredBuffer<uint> kv_page_indptr;
 [[vk::binding(7)]] RWStructuredBuffer<float> scores;
 [[vk::binding(8)]] RWStructuredBuffer<int> selection;
-struct Push { int H; int D; int page_size; int score_stride; int topk; int ratio; };
+struct Push { int H; int D; int page_size; int score_stride; int topk; int ratio; int has_weights; };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
 groupshared float pie_key_acc[PIE_GROUP_X];
@@ -105,11 +105,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint pages_first = kv_page_indptr[uint(r)];
     int stride = pc.ratio > 0 ? pc.ratio : 1;
     int total = positions[t] + 1;
-    int npools = total > 0 ? total / stride : 0;
-    int tail = total > 0 ? total - npools * stride : 0;
-    if (tail > topk) tail = topk;
-    int pool_budget = (topk - tail) / stride;
-    if (npools > pc.score_stride) npools = pc.score_stride;
+    int nkeys = total > 0 ? total / stride : 0;
+    if (nkeys > pc.score_stride) nkeys = pc.score_stride;
 
     uint frow = t * uint(pc.score_stride);
     uint H = uint(pc.H);
@@ -119,10 +116,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
     int slot = tid / PIE_LANES_PER_KEY;
     int hh = tid % PIE_LANES_PER_KEY;
-    for (int j0 = 0; j0 < npools; j0 += PIE_KEYS_PER_PASS) {
+    for (int j0 = 0; j0 < nkeys; j0 += PIE_KEYS_PER_PASS) {
         int j = j0 + slot;
         float acc = 0.0;
-        if (j < npools) {
+        if (j < nkeys) {
             int cell = (j + 1) * stride - 1;
             uint page = kv_page_indices[pages_first + uint(cell / pc.page_size)];
             uint kj = (page * uint(pc.page_size) + uint(cell % pc.page_size)) * D;
@@ -130,12 +127,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 uint qh = qi + h * D;
                 float dot = 0.0;
                 for (uint d = 0u; d < D; d++) dot += PIE_LOAD(idx_q[qh + d]) * PIE_LOAD(key_pages[kj + d]);
-                acc += max(dot, 0.0) * PIE_LOAD(idx_w[wi + h]);
+                acc += max(dot, 0.0) * (pc.has_weights != 0 ? PIE_LOAD(idx_w[wi + h]) : 1.0);
             }
         }
         pie_key_acc[tid] = acc;
         GroupMemoryBarrierWithGroupSync();
-        if (tid < PIE_KEYS_PER_PASS && j0 + tid < npools) {
+        if (tid < PIE_KEYS_PER_PASS && j0 + tid < nkeys) {
             float sum = 0.0;
             for (int g = 0; g < PIE_LANES_PER_KEY; g++) sum += pie_key_acc[tid * PIE_LANES_PER_KEY + g];
             scores[frow + uint(j0 + tid)] = sum;
@@ -144,19 +141,16 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
     AllMemoryBarrierWithGroupSync();
 
-    for (int i = tid; i < tail; i += PIE_GROUP_X) selection[srow + uint(i)] = npools * stride + i;
-
-    if (npools <= pool_budget) {
-        for (int n = tid; n < topk - tail; n += PIE_GROUP_X) {
-            int j = n / stride;
-            selection[srow + uint(tail + n)] = (j < npools) ? j * stride + (n % stride) : -1;
+    if (nkeys <= topk) {
+        for (int n = tid; n < topk; n += PIE_GROUP_X) {
+            selection[srow + uint(n)] = (n < nkeys) ? n : -1;
         }
         return;
     }
 
     float lo_l = 3.0e38;
     float hi_l = -3.0e38;
-    for (int j = tid; j < npools; j += PIE_GROUP_X) {
+    for (int j = tid; j < nkeys; j += PIE_GROUP_X) {
         float s = scores[frow + uint(j)];
         lo_l = min(lo_l, s);
         hi_l = max(hi_l, s);
@@ -168,20 +162,18 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     for (int it = 0; it < 40; it++) {
         float mid = 0.5 * (lo + hi);
         float c = 0.0;
-        for (int j = tid; j < npools; j += PIE_GROUP_X) {
+        for (int j = tid; j < nkeys; j += PIE_GROUP_X) {
             if (scores[frow + uint(j)] >= mid) c += 1.0;
         }
         int cnt = int(pie_workgroup_sum(c));
-        if (cnt > pool_budget) lo = mid; else hi = mid;
+        if (cnt > topk) lo = mid; else hi = mid;
         thr = hi;
     }
 
     if (tid == 0) {
-        int n = tail;
-        for (int j = 0; j < npools && n + stride <= topk; j++) {
-            if (scores[frow + uint(j)] >= thr) {
-                for (int i = 0; i < stride; i++) selection[srow + uint(n++)] = j * stride + i;
-            }
+        int n = 0;
+        for (int j = 0; j < nkeys && n < topk; j++) {
+            if (scores[frow + uint(j)] >= thr) selection[srow + uint(n++)] = j;
         }
         for (; n < topk; n++) selection[srow + uint(n)] = -1;
     }

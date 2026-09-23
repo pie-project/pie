@@ -89,9 +89,25 @@ pub struct Layer {
     pub mlp: Mlp,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Mixer {
-    Attn(Attn),
+    Attn {
+        attn: Attn,
+        indexer: Option<Indexer>,
+    },
     Gdn(Gdn),
+}
+
+pub struct Indexer {
+    pub heads: u32,
+    pub head_dim: u32,
+    pub ratio: u32,
+    pub top_k: u32,
+    pub norm_eps: f32,
+    pub qk_proj: Weight,
+    pub q_norm: Weight,
+    pub k_norm: Weight,
+    pub keys: String,
 }
 
 pub struct Ple {
@@ -134,6 +150,14 @@ struct PleDims {
     conv_kernel: u32,
 }
 
+#[derive(Clone, Copy)]
+struct IndexerDims {
+    heads: u32,
+    head_dim: u32,
+    budget: u32,
+    ratio: u32,
+}
+
 struct Dims {
     hidden: u32,
     layers: u32,
@@ -152,6 +176,7 @@ struct Dims {
     lowrank: u32,
     moe: MoeDims,
     ple: Option<PleDims>,
+    indexer: Option<IndexerDims>,
     vocab: u32,
     eos: u32,
     norm_eps: f32,
@@ -260,6 +285,12 @@ impl Model {
                 seed: 1234,
                 conv_kernel: 4,
             }),
+            indexer: Some(IndexerDims {
+                heads: 4,
+                head_dim: 128,
+                budget: 2048,
+                ratio: 4,
+            }),
             vocab: 248_320,
             eos: 248_044,
             norm_eps: 1e-6,
@@ -288,49 +319,54 @@ impl Model {
     }
 
     pub fn flash_micro(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(
-            Mix::of(w),
-            kv,
-            tp,
-            Dims {
-                hidden: 64,
-                layers: 4,
-                attn_every: 2,
-                q_heads: 4,
-                kv_heads: 2,
-                head_dim: 64,
-                rotary_dim: 16,
-                theta: 10_000_000.0,
-                k_heads: 2,
-                v_heads: 4,
-                k_dim: 16,
-                v_dim: 16,
-                conv_kernel: 4,
-                streams: 4,
-                lowrank: 16,
-                moe: MoeDims {
-                    experts: 8,
-                    top_k: 2,
-                    inter: 32,
-                    shared_inter: 32,
-                },
-                ple: Some(PleDims {
-                    layer: 2,
-                    heads_per_ngram: 2,
-                    ngram: 3,
-                    base_vocab: 1000,
-                    divisible_by: 128,
-                    split_parts: 128,
-                    seed: 1234,
-                    conv_kernel: 4,
-                }),
-                vocab: 256,
-                eos: 3,
-                norm_eps: 1e-6,
-                draft: false,
-                tower: None,
+        Model::new(Mix::of(w), kv, tp, Model::flash_micro_dims())
+    }
+
+    fn flash_micro_dims() -> Dims {
+        Dims {
+            hidden: 64,
+            layers: 4,
+            attn_every: 2,
+            q_heads: 4,
+            kv_heads: 2,
+            head_dim: 64,
+            rotary_dim: 16,
+            theta: 10_000_000.0,
+            k_heads: 2,
+            v_heads: 4,
+            k_dim: 16,
+            v_dim: 16,
+            conv_kernel: 4,
+            streams: 4,
+            lowrank: 16,
+            moe: MoeDims {
+                experts: 8,
+                top_k: 2,
+                inter: 32,
+                shared_inter: 32,
             },
-        )
+            ple: Some(PleDims {
+                layer: 2,
+                heads_per_ngram: 2,
+                ngram: 3,
+                base_vocab: 1000,
+                divisible_by: 128,
+                split_parts: 128,
+                seed: 1234,
+                conv_kernel: 4,
+            }),
+            indexer: Some(IndexerDims {
+                heads: 2,
+                head_dim: 16,
+                budget: 32,
+                ratio: 4,
+            }),
+            vocab: 256,
+            eos: 3,
+            norm_eps: 1e-6,
+            draft: false,
+            tower: None,
+        }
     }
 
     fn new(mix: Mix, kv: Dtype, tp: u32, d: Dims) -> Model {
@@ -368,6 +404,7 @@ impl Model {
         let block = |n: &dyn Fn(&str) -> String,
                      attn: bool,
                      kv_name: String,
+                     index_name: Option<String>,
                      conv_name: String,
                      delta_name: String,
                      experts_w: Dtype|
@@ -375,7 +412,29 @@ impl Model {
             {
                 let mixer = if attn {
                     let hd = u64::from(d.head_dim);
-                    Mixer::Attn(Attn {
+                    let indexer = index_name.zip(d.indexer).map(|(keys, ix)| {
+                        assert!(
+                            ix.budget.is_multiple_of(ix.ratio),
+                            "a token budget of {} is not a whole number of {}-token blocks",
+                            ix.budget,
+                            ix.ratio,
+                        );
+                        let ihd = u64::from(ix.head_dim);
+                        let q_w = u64::from(ix.heads) * ihd;
+                        Indexer {
+                            heads: ix.heads,
+                            head_dim: ix.head_dim,
+                            ratio: ix.ratio,
+                            top_k: ix.budget / ix.ratio,
+                            norm_eps: d.norm_eps,
+                            qk_proj: Weight::sym(n("index_qk_proj"), [q_w + ihd, hidden], proj)
+                                .packed([q_w, ihd]),
+                            q_norm: Weight::sym(n("index_q_norm"), [ihd], dense),
+                            k_norm: Weight::sym(n("index_k_norm"), [ihd], dense),
+                            keys,
+                        }
+                    });
+                    let attn = Attn {
                         rotary_dim: d.rotary_dim,
                         theta: d.theta,
                         sm_scale: (d.head_dim as f32).sqrt().recip(),
@@ -396,7 +455,8 @@ impl Model {
                         k_norm: Weight::sym(n("k_norm"), [hd], dense),
                         k_norm_eps: d.norm_eps,
                         kv: kv_name,
-                    })
+                    };
+                    Mixer::Attn { attn, indexer }
                 } else {
                     let k_heads = d.k_heads / tp;
                     let v_heads = d.v_heads / tp;
@@ -471,6 +531,7 @@ impl Model {
                     &|s: &str| format!("layer.{l}.{s}"),
                     attn_at(l),
                     format!("kv.{l}"),
+                    attn_at(l).then(|| format!("index.{l}")),
                     format!("conv.{l}"),
                     format!("delta.{l}"),
                     experts_w,
@@ -551,6 +612,7 @@ impl Model {
                 &|s: &str| format!("mtp.layer.{s}"),
                 true,
                 "kv.mtp".to_string(),
+                None,
                 "conv.mtp".to_string(),
                 "delta.mtp".to_string(),
                 proj,

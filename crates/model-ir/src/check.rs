@@ -541,6 +541,12 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::Ragged { .. } => &[(In(3), I32), (In(4), I32)],
             Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
+            Attention::DecodeSelected { .. } => {
+                &[(In(1), DECODE_PLAN), (In(2), I32), (In(3), CACHE)]
+            }
+            Attention::PrefillSelected { .. } => {
+                &[(In(1), PREFILL_PLAN), (In(2), I32), (In(3), CACHE)]
+            }
             Attention::DecodeRel { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (In(3), F32)],
             Attention::PrefillRel { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (In(3), F32)],
             Attention::Sink { .. } => &[(In(1), F32)],
@@ -573,8 +579,9 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             }
             Attention::SsmKdaStep { .. } | Attention::SsmKdaChunked { .. } => &[(In(5), CACHE)],
             Attention::IndexLayernormRope { .. } | Attention::IndexRope { .. } => &[(In(1), I32)],
-            Attention::IndexTopk { .. } => &[(In(2), CACHE), (Out(0), I32)],
+            Attention::IndexTopk { .. } => &[(In(1), CACHE), (Out(0), I32)],
             Attention::IndexKvAppend { .. } => &[(In(1), CACHE), (In(2), I32), (In(3), I32)],
+            Attention::IndexBlockMean { .. } => &[(In(0), I32), (In(1), I32), (In(2), CACHE)],
             Attention::PoolBoundaryDecode { .. } | Attention::PoolBoundaryPrefill { .. } => &[
                 (In(0), I32),
                 (In(1), U8),

@@ -114,6 +114,68 @@ pub fn prefill(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn decode_selected(
+    q: &Value,
+    plan: &Value,
+    selection: &Value,
+    pages: ValueId,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    ratio: u32,
+) -> Value {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    r.push(
+        Attention::DecodeSelected {
+            q: q.id(),
+            plan: plan.id(),
+            selection: selection.id(),
+            cache: pages,
+            window,
+            head_dim,
+            sm_scale,
+            ratio,
+            o: o.id(),
+        },
+        &[q, plan, selection],
+    );
+    o
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_selected(
+    q: &Value,
+    plan: &Value,
+    selection: &Value,
+    pages: ValueId,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    ratio: u32,
+) -> Value {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    r.push(
+        Attention::PrefillSelected {
+            q: q.id(),
+            plan: plan.id(),
+            selection: selection.id(),
+            cache: pages,
+            window,
+            head_dim,
+            kv_heads,
+            sm_scale,
+            ratio,
+            o: o.id(),
+        },
+        &[q, plan, selection],
+    );
+    o
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn decode_rel(
     q: &Value,
     plan: &Value,
@@ -1052,7 +1114,7 @@ pub fn index_rope(
 #[allow(clippy::too_many_arguments)]
 pub fn index_topk(
     q: &Value,
-    weights: &Value,
+    weights: Option<&Value>,
     keys: ValueId,
     heads: u32,
     head_dim: u32,
@@ -1061,10 +1123,12 @@ pub fn index_topk(
 ) -> Value {
     let r = q.rec();
     let selection = r.fresh(tensor(q.rows(), top_k, Dtype::I32));
+    let mut deps = vec![q];
+    deps.extend(weights);
     r.push(
         Attention::IndexTopk {
             q: q.id(),
-            weights: weights.id(),
+            weights: weights.map(Value::id),
             keys,
             heads,
             head_dim,
@@ -1072,9 +1136,33 @@ pub fn index_topk(
             ratio,
             selection: selection.id(),
         },
-        &[q, weights],
+        &deps,
     );
     selection
+}
+
+pub fn index_block_mean(
+    boundary_pos: &Value,
+    boundary_req: &Value,
+    keys: ValueId,
+    head_dim: u32,
+    ratio: u32,
+    dtype: Dtype,
+) -> Value {
+    let r = boundary_pos.rec();
+    let entries = r.fresh(tensor(boundary_pos.rows(), head_dim, dtype));
+    r.push(
+        Attention::IndexBlockMean {
+            boundary_pos: boundary_pos.id(),
+            boundary_req: boundary_req.id(),
+            keys,
+            head_dim,
+            ratio,
+            entries: entries.id(),
+        },
+        &[boundary_pos, boundary_req],
+    );
+    entries
 }
 
 pub fn index_kv_append(k: &Value, keys: ValueId, write_page: &Value, write_offset: &Value) {

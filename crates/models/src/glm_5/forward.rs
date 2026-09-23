@@ -254,5 +254,5 @@ fn index_select(x: &Value, q_a: &Value, inputs: &Input<Facts>, ix: &Indexer) -> 
         ix.theta,
     );
     let weights = ops::linear::matmul(q_a, &ix.weights_proj);
-    ops::attn::index_topk(&q, &weights, keys, ix.heads, ix.head_dim, ix.top_k, 1)
+    ops::attn::index_topk(&q, Some(&weights), keys, ix.heads, ix.head_dim, ix.top_k, 1)
 }
