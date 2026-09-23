@@ -300,6 +300,10 @@ class Plan:
     # so the shared experts keep their logits.
     sink_suffixes: tuple[str, ...] = ()
     sink_rows: int = 0
+    # DeepSeek-V4.1 Engram: the hash-table base the miniature is re-carved to
+    # (None keeps the source's tables whole) and the carve derived from it.
+    engram_vocab: int | None = None
+    engram_carve: "EngramCarve | None" = None
 
 
 def _text_cfg(cfg: dict, plan: Plan) -> dict:
@@ -353,6 +357,57 @@ def _rewrite_dsv4(cfg: dict, plan: Plan) -> None:
         # say "the first N" -- so they have to stay leading after the cut.
         cfg["num_hash_layers"] = _prefix_count(
             plan, "num_hash_layers", cfg["num_hash_layers"])
+
+
+def _rewrite_dsv41(cfg: dict, plan: Plan) -> None:
+    """DeepSeek-V4.1: the CSA2 plan (`compress_ratios`, the KV / index /
+    candidate source layers), the Engram modules and the DSpark head are all
+    stated by layer id, so every list is re-indexed onto the kept layers and
+    a kept layer that would read a dropped source is refused."""
+    _rewrite_common(cfg, plan)
+    tc = _text_cfg(cfg, plan)
+    remap = {src: i for i, src in enumerate(plan.src_layers)}
+    if isinstance(tc.get("compress_ratios"), list):
+        tc["compress_ratios"] = _slice_list(tc["compress_ratios"], plan.src_layers)
+    ratios = tc.get("compress_ratios") or []
+
+    def kept(key: str) -> list[int]:
+        return [remap[s] for s in tc.get(key, []) if s in remap]
+
+    kv_sources = kept("kv_source_layer_ids")
+    index_sources = kept("index_source_layer_ids")
+    for i, ratio in enumerate(ratios):
+        if ratio and not any(s <= i for s in kv_sources):
+            raise SystemExit(
+                f"deepseek_v41: kept layer {i} (source {plan.src_layers[i]}) compresses "
+                f"at ratio {ratio} but no kept KV source layer precedes it; keep one of "
+                f"{tc.get('kv_source_layer_ids')} before it")
+        if ratio and not any(s <= i for s in index_sources):
+            raise SystemExit(
+                f"deepseek_v41: kept layer {i} (source {plan.src_layers[i]}) attends "
+                f"over a selection but no kept index source precedes it; keep one of "
+                f"{tc.get('index_source_layer_ids')} before it")
+    tc["kv_source_layer_ids"] = kv_sources
+    tc["index_source_layer_ids"] = index_sources
+    cand = tc.get("candidate_source_layer_id")
+    if isinstance(cand, int):
+        tc["candidate_source_layer_id"] = remap.get(cand, -1)
+    # DSpark is a separate bring-up: no draft stages, no target layers.
+    tc["num_nextn_predict_layers"] = 0
+    if "dspark_block_size" in tc:
+        tc["dspark_block_size"] = 0
+    if "dspark_target_layer_ids" in tc:
+        tc["dspark_target_layer_ids"] = []
+    carve = plan.engram_carve
+    if carve is not None:
+        tc["engram_layer_ids"] = [remap[s] for s in carve.kept_src_layers]
+        tc["engram_num_embeddings"] = [sum(p) for p, _ in carve.dst]
+        tc["engram_vocab_size"] = carve.dst_base
+    else:
+        tc["engram_layer_ids"] = kept("engram_layer_ids")
+        if isinstance(tc.get("engram_num_embeddings"), list):
+            keep_ix = [i for i, s in enumerate(tc.get("engram_layer_ids_src", []))]
+            del keep_ix
 
 
 def _rewrite_kimi(cfg: dict, plan: Plan) -> None:
@@ -1129,6 +1184,23 @@ FAMILIES: dict[str, dict[str, Any]] = {
         default_layers="0-3,42",
         config_rewrite=_rewrite_dsv4,
     ),
+    # DeepSeek-V4.1-Flash as released: `layers.` at the top, one plane per
+    # expert, fp8 dense planes beside `.scale` e8m0 exponents (read out to
+    # bf16 here), fp4 experts as packed codes beside their exponents (kept),
+    # and two Engram hash tables of 384M rows each, re-carved by (n-gram
+    # order, head) to a smaller base (`--engram-vocab`).
+    "deepseek_v41": dict(
+        layer_prefix="layers.",
+        expert_re=re.compile(r"\.ffn\.experts\.(\d+)\."),
+        router_suffixes=("ffn.gate.weight", "ffn.gate.bias", "ffn.gate.bias_vl"),
+        globals_keep=("embed.weight", "head.weight", "norm.weight"),
+        # SWA (0), SWA + Engram (1), Full at ratio 2 (2), Reuse (3), the
+        # decoder's Full at ratio 1 and candidate source (20), Reuse (21),
+        # Reindex (24) and a Reuse after it (25): every CSA2 mode once.
+        default_layers="0-3,20,21,24,25",
+        config_rewrite=_rewrite_dsv41,
+        text_cfg_key="text_config",
+    ),
     "qwen4_exp": dict(
         layer_prefix="language_model.model.layers.",
         # Stacked on dim 0, like gpt-oss and Qwen3.5: one `switch_mlp` triple
@@ -1348,14 +1420,19 @@ class OutTensor:
     # published n-gram head buffers, which describe a hashing the carve just
     # changed.
     literal: bytes | None = None
+    # An fp8 plane read out to bf16 on the way through, with its e8m0
+    # exponent plane (DeepSeek-V4.1's dense weights and Engram tables).
+    dequant_scale: "OutTensor | None" = None
 
     @property
     def out_bytes(self) -> int:
         if self.literal is not None:
             return len(self.literal)
         if self.rows is None or not self.src.shape:
-            return self.src.nbytes
-        return self.src.row_bytes * self.rows
+            n = self.src.nbytes
+        else:
+            n = self.src.row_bytes * self.rows
+        return 2 * n if self.dequant_scale is not None else n
 
 
 def layer_index(name: str, prefix: str) -> int | None:
@@ -1434,6 +1511,10 @@ def main() -> int:
                     help="drop the vision tower and flatten the text sub-config "
                          "to the top level, producing a text-only checkpoint of "
                          "the same decoder (Kimi-K3)")
+    ap.add_argument("--engram-vocab", type=int, default=None,
+                    help="DeepSeek-V4.1: re-carve each Engram hash table to this "
+                         "bucket base (the release hashes at 16,000,000; a "
+                         "miniature at 20,000 keeps ~480k of 384M rows per table)")
     ap.add_argument("--cache", default=None,
                     help="raw tensor cache dir (default: <out>/.srccache)")
     ap.add_argument("--keep-cache", action="store_true")
@@ -1475,7 +1556,9 @@ def main() -> int:
         parts=parts or None,
         sink_suffixes=fam.get("sink_suffixes", ()),
         sink_rows=fam.get("sink_rows", 0),
+        engram_vocab=args.engram_vocab,
     )
+    plan.engram_carve = plan_engram_carve(cfg, plan)
     # Which source rows the hashed table is re-cut from is pure arithmetic over
     # the config, and it decides which shards get read at all -- so it is
     # settled before the pairs are.
@@ -1516,6 +1599,8 @@ def main() -> int:
     print("[3/6] applying expert-bank slicing")
     outs = assign_rows(pairs, src, plan)
     checks = apply_ple_carve(outs, src, plan)
+    src_names = apply_engram_carve(outs, src, plan, weight_map, src_names)
+    outs = mark_fp8_readout(outs, plan)
     raw_total = sum(src[n].nbytes for n in src_names)
     total = sum(src[n].keep_bytes for n in src_names)
     if total < raw_total:
@@ -1598,6 +1683,8 @@ def main() -> int:
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
     copy_aux_files(args.repo, args.revision, out_dir)
     write_index(out_dir, shard_files)
+    if plan.family == "deepseek_v41":
+        write_engram_token_map(out_dir)
 
     if not args.keep_cache:
         shutil.rmtree(cache, ignore_errors=True)
@@ -1607,6 +1694,222 @@ def main() -> int:
           f"{len(outs)} tensors, {len(plan.src_layers)} layers, "
           f"{plan.experts or 'all'} experts)")
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# DeepSeek-V4.1: the Engram hash tables, re-carved; fp8 planes read out
+# --------------------------------------------------------------------------- #
+def _next_prime_after(start: int, seen: set[int]) -> int:
+    """`engram.find_next_prime`: the smallest unused prime above `start`."""
+    candidate = start + 1
+    while not _is_prime(candidate) or candidate in seen:
+        candidate += 1
+    return candidate
+
+
+def engram_geometry(base: int, orders: int, heads: int, modules: int
+                    ) -> list[tuple[list[int], list[int]]]:
+    """`EngramLayout.from_args`: per module, one prime-sized bucket range per
+    (n-gram order, head), the primes drawn in module order from a search that
+    restarts at `base - 1` for every order and never reuses a prime. Returns
+    (primes, offsets) per module; a module's table is `sum(primes)` rows."""
+    seen: set[int] = set()
+    out: list[tuple[list[int], list[int]]] = []
+    for _ in range(modules):
+        primes: list[int] = []
+        offsets: list[int] = []
+        total = 0
+        for _ in range(orders):
+            current = base - 1
+            for _ in range(heads):
+                current = _next_prime_after(current, seen)
+                seen.add(current)
+                primes.append(current)
+                offsets.append(total)
+                total += current
+        out.append((primes, offsets))
+    return out
+
+
+@dataclass
+class EngramCarve:
+    src_base: int
+    dst_base: int
+    # every source module's geometry, in the source's module order
+    src: list[tuple[list[int], list[int]]]
+    # the kept modules' geometry, in kept order (the miniature's module order)
+    dst: list[tuple[list[int], list[int]]]
+    # source layer id of each kept module, in kept order
+    kept_src_layers: list[int]
+    # source module index of each kept module
+    kept_src_modules: list[int]
+
+
+ENGRAM_RE = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
+
+
+def plan_engram_carve(cfg: dict, plan: Plan) -> EngramCarve | None:
+    if plan.family != "deepseek_v41" or plan.engram_vocab is None:
+        return None
+    tc = _text_cfg(cfg, plan)
+    layer_ids = list(tc.get("engram_layer_ids") or [])
+    if not layer_ids:
+        return None
+    orders = int(tc["engram_max_ngram_size"]) - 1
+    heads = int(tc["engram_n_heads"])
+    src_base = int(tc["engram_vocab_size"])
+    src = engram_geometry(src_base, orders, heads, len(layer_ids))
+    stated = list(tc.get("engram_num_embeddings") or [])
+    for i, (primes, _) in enumerate(src):
+        if i < len(stated) and sum(primes) != stated[i]:
+            raise SystemExit(
+                f"deepseek_v41: this tool derives {sum(primes)} rows for Engram module "
+                f"{i} and config.json states {stated[i]}; the carve reads the head "
+                f"segments the derivation names, so it must not run against a hashing "
+                f"it cannot reproduce")
+    kept = [(s, m) for m, s in enumerate(layer_ids) if s in plan.src_layers]
+    kept.sort(key=lambda sm: plan.src_layers.index(sm[0]))
+    dst = engram_geometry(plan.engram_vocab, orders, heads, len(kept))
+    return EngramCarve(
+        src_base=src_base, dst_base=plan.engram_vocab, src=src, dst=dst,
+        kept_src_layers=[s for s, _ in kept], kept_src_modules=[m for _, m in kept],
+    )
+
+
+def apply_engram_carve(outs: list["OutTensor"], src: dict[str, SrcTensor], plan: Plan,
+                       weight_map: dict[str, str], src_names: list[str]) -> list[str]:
+    """Turn each kept Engram table into a concatenation of one row window per
+    (order, head): the first `dst_primes[j]` rows of the source's segment `j`,
+    fetched as its own range (the segments are sixteen million rows apart).
+    Returns the download list with the whole tables dropped from it."""
+    carve = plan.engram_carve
+    if carve is None:
+        return src_names
+    drop: set[str] = set()
+    extra: list[str] = []
+    for ot in outs:
+        m = ENGRAM_RE.match(ot.name)
+        if m is None:
+            continue
+        out_layer = int(m.group(1))
+        src_layer = plan.src_layers[out_layer]
+        k = carve.kept_src_layers.index(src_layer)
+        s_primes, s_offsets = carve.src[carve.kept_src_modules[k]]
+        d_primes, _ = carve.dst[k]
+        pieces: list[Piece] = []
+        for j, (row0, rows) in enumerate(zip(s_offsets, d_primes)):
+            if rows > s_primes[j]:
+                raise SystemExit(f"{ot.name}: head {j} wants {rows} rows of {s_primes[j]}")
+            clone = SrcTensor(ot.src.name, ot.src.shard, ot.src.dtype, list(ot.src.shape),
+                              ot.src.start, ot.src.end, keep_from=row0, keep_rows=rows)
+            key = f"{ot.src.name}#engram{j}"
+            src[key] = clone
+            weight_map[key] = ot.src.shard
+            extra.append(key)
+            pieces.append(Piece(clone, row0, rows))
+        ot.pieces = pieces
+        ot.rows = sum(d_primes)
+        drop.add(ot.src.name)
+    if not drop:
+        return src_names
+    print(f"      the Engram tables are re-carved by head: {carve.src_base} -> "
+          f"{carve.dst_base} buckets, {[sum(p) for p, _ in carve.dst]} rows kept of "
+          f"{[sum(p) for p, _ in carve.src]}")
+    return sorted((set(src_names) - drop) | set(extra))
+
+
+def mark_fp8_readout(outs: list["OutTensor"], plan: Plan) -> list["OutTensor"]:
+    """Pair every fp8 plane with its `.scale` exponents so it is written as
+    bf16, and drop the exponent planes from the output. The fp4 experts
+    (int8 code pairs) are not touched: pie reads them as MXFP4."""
+    if plan.family != "deepseek_v41":
+        return outs
+    by_name = {ot.name: ot for ot in outs}
+    kept: list[OutTensor] = []
+    consumed: set[str] = set()
+    for ot in outs:
+        if ot.src.dtype == "F8_E4M3" and ot.name.endswith(".weight"):
+            scale = by_name.get(ot.name[: -len(".weight")] + ".scale")
+            if scale is not None:
+                ot.dequant_scale = scale
+                consumed.add(scale.name)
+    for ot in outs:
+        if ot.name not in consumed:
+            kept.append(ot)
+    n = sum(1 for ot in kept if ot.dequant_scale is not None)
+    if n:
+        print(f"      {n} fp8 planes are read out to bf16 with their e8m0 exponents")
+    return kept
+
+
+_E4M3_LUT = None
+
+
+def _e4m3_lut():
+    global _E4M3_LUT
+    if _E4M3_LUT is None:
+        import numpy as np
+        vals = np.zeros(256, dtype=np.float32)
+        for b in range(256):
+            sign = -1.0 if b & 0x80 else 1.0
+            e = (b >> 3) & 0xF
+            m = b & 7
+            if e == 0:
+                v = m / 8.0 * 2.0 ** -6
+            elif e == 15 and m == 7:
+                v = float("nan")
+            else:
+                v = (1.0 + m / 8.0) * 2.0 ** (e - 7)
+            vals[b] = sign * v
+        _E4M3_LUT = vals
+    return _E4M3_LUT
+
+
+def dequant_fp8_bf16(weight: bytes, wshape: list[int], scale: bytes, sshape: list[int]
+                     ) -> Iterable[bytes]:
+    """fp8 e4m3 codes times their e8m0 block exponents, rounded to bf16
+    (nearest even), a block-aligned chunk of rows at a time."""
+    import numpy as np
+    rows, cols = int(wshape[0]), int(wshape[1])
+    srows, scols = int(sshape[0]), int(sshape[1])
+    if rows % srows or cols % scols:
+        raise SystemExit(f"a [{rows}, {cols}] plane does not block by [{srows}, {scols}] exponents")
+    br, bc = rows // srows, cols // scols
+    lut = _e4m3_lut()
+    w = np.frombuffer(weight, dtype=np.uint8).reshape(rows, cols)
+    s = np.frombuffer(scale, dtype=np.uint8).reshape(srows, scols)
+    step = max(br, (8192 // br) * br)
+    for r0 in range(0, rows, step):
+        r1 = min(rows, r0 + step)
+        f = lut[w[r0:r1]].reshape((r1 - r0) // br, br, scols, bc)
+        e = np.ldexp(np.float32(1.0), s[r0 // br:r1 // br].astype(np.int32) - 127)
+        f = (f * e[:, None, :, None]).reshape(r1 - r0, cols).astype(np.float32)
+        u = f.view(np.uint32)
+        rounded = ((u + np.uint32(0x7FFF) + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+        yield rounded.tobytes()
+
+
+def write_engram_token_map(out_dir: Path) -> None:
+    """`engram.token_map` beside the shards: the tokenizer-compressed id of
+    every token, which Engram hashes over (see engram_token_map.py)."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from engram_token_map import FILE, build_compressed_token_map, write_plane
+    except ImportError as exc:
+        print(f"      engram token map skipped ({exc}); run engram_token_map.py on the snapshot")
+        return
+    tok = out_dir / "tokenizer.json"
+    if not tok.exists():
+        print("      engram token map skipped: no tokenizer.json in the snapshot")
+        return
+    try:
+        lookup, compressed = build_compressed_token_map(tok)
+    except ImportError as exc:
+        print(f"      engram token map skipped ({exc}); run engram_token_map.py on the snapshot")
+        return
+    write_plane(out_dir / FILE, lookup)
+    print(f"      engram token map: {len(lookup)} ids -> {compressed} compressed")
 
 
 def cache_key(t: SrcTensor) -> str:
@@ -1697,6 +2000,17 @@ def output_entry(cache: Path, ot: OutTensor
     if ot.literal is not None:
         data = ot.literal
         return ot.name, ot.src.dtype, shape, (lambda: iter((data,)))
+    if ot.dequant_scale is not None:
+        weight = OutTensor(ot.name, ot.src, rows=ot.rows, pieces=ot.pieces)
+        _, wdtype, wshape, wgen = output_entry(cache, weight)
+        _, sdtype, sshape, sgen = output_entry(cache, ot.dequant_scale)
+        if wdtype != "F8_E4M3" or sdtype != "F8_E8M0":
+            raise SystemExit(f"{ot.name}: read-out expects F8_E4M3 beside F8_E8M0, got {wdtype}/{sdtype}")
+
+        def readout(wgen=wgen, sgen=sgen, wshape=wshape, sshape=sshape) -> Iterable[bytes]:
+            return dequant_fp8_bf16(b"".join(wgen()), wshape, b"".join(sgen()), sshape)
+
+        return ot.name, "BF16", wshape, readout
     if ot.pieces is not None:
         shape[0] = ot.rows
 

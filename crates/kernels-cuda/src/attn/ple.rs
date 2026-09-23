@@ -113,14 +113,14 @@ pub fn ngram_ids(
     )
 }
 
-/// Engram's tokenizer-compressed ids: one i32 per vocabulary row.
+/// Engram's tokenizer-compressed ids: one i64 per vocabulary row.
 fn id_map(op: &'static str, map: Option<&Tensor>) -> Result<(), Error> {
     if let Some(map) = map {
-        if map.dtype != Dtype::I32 {
+        if map.dtype != Dtype::I64 {
             return Err(refuse(
                 op,
                 format!(
-                    "the id map is {:?}, and the hasher maps through i32",
+                    "the id map is {:?}, and the hasher maps through i64",
                     map.dtype
                 ),
             ));

@@ -25,7 +25,7 @@ pub struct Model {
     pub final_norm_eps: f32,
     pub mtp: Option<Mtp>,
     /// V4.1: the tokenizer-compressed id every token hashes as in an Engram
-    /// n-gram (`engram.token_map`, one i32 per vocabulary row).
+    /// n-gram (`engram.token_map`, one i64 per vocabulary row).
     pub token_map: Option<Weight>,
 }
 
@@ -1367,7 +1367,7 @@ impl Model {
             final_norm_eps: d.norm_eps,
             mtp: None,
             token_map: (!plan.engram_layers.is_empty())
-                .then(|| Weight::sym("engram.token_map", [d.vocab as u64], Dtype::I32)),
+                .then(|| Weight::sym("engram.token_map", [d.vocab as u64], Dtype::I64)),
         }
     }
 }

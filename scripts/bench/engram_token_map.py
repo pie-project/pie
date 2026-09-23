@@ -63,9 +63,9 @@ def build_compressed_token_map(tokenizer_json: Path) -> tuple[list[int], int]:
 
 
 def write_plane(path: Path, lookup: list[int]) -> None:
-    data = struct.pack(f"<{len(lookup)}i", *lookup)
+    data = struct.pack(f"<{len(lookup)}q", *lookup)
     header = json.dumps(
-        {PLANE: {"dtype": "I32", "shape": [len(lookup)], "data_offsets": [0, len(data)]}},
+        {PLANE: {"dtype": "I64", "shape": [len(lookup)], "data_offsets": [0, len(data)]}},
         separators=(",", ":"),
     ).encode()
     header += b" " * ((-len(header)) % 8)

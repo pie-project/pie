@@ -515,7 +515,7 @@ pub enum Attention {
         primes: Vec<u64>,
         offsets: Vec<u64>,
         heads_per_ngram: u32,
-        /// An i32 table the ids are mapped through before hashing (Engram's
+        /// An i64 table the ids are mapped through before hashing (Engram's
         /// tokenizer-compressed ids); the window keeps raw ids.
         map: Option<ValueId>,
         ngram_ids: ValueId,

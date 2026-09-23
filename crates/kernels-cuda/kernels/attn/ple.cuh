@@ -49,10 +49,10 @@ __device__ __forceinline__ void ple_mask_window(
 // state and the eos barrier stay in the tokenizer's id space) and is mapped
 // after masking, so the pre-start padding maps like every other id.
 __device__ __forceinline__ void ple_map_window(
-    const PleHash& h, const int* __restrict__ map, int* window)
+    const PleHash& h, const long long* __restrict__ map, int* window)
 {
     if (map == nullptr) return;
-    for (int p = 0; p < h.ngram; ++p) window[p] = map[window[p]];
+    for (int p = 0; p < h.ngram; ++p) window[p] = (int)map[window[p]];
 }
 
 __global__ void ple_ngram_ids_update(
@@ -63,7 +63,7 @@ __global__ void ple_ngram_ids_update(
     int* __restrict__ ngram_ids,
     int rows,
     PleHash h,
-    const int* __restrict__ map,
+    const long long* __restrict__ map,
     const u32* __restrict__ win)
 {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -108,7 +108,7 @@ __global__ void ple_ngram_ids_chunked(
     const int* commit_len,
     const int* begin_at,
     PleHash h,
-    const int* __restrict__ map,
+    const long long* __restrict__ map,
     const u32* __restrict__ win)
 {
     const int r = blockIdx.x;

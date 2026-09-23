@@ -93,16 +93,16 @@ fn hash_plane(op: &'static str, hash: Tensor, shape: &Shape) -> Result<(), Error
     Ok(())
 }
 
-/// Engram's tokenizer-compressed ids: an optional i32 table the window is
+/// Engram's tokenizer-compressed ids: an optional i64 table the window is
 /// mapped through, bound as an absent buffer and a zero flag when unused.
 fn id_map(op: &'static str, ctx: &Ctx<'_>, map: Option<Tensor>) -> Result<[ArgValue; 2], Error> {
     match map {
         Some(map) => {
-            if map.dtype != Dtype::I32 {
+            if map.dtype != Dtype::I64 {
                 return Err(refuse(
                     op,
                     format!(
-                        "the id map is {:?}, and the hasher maps through i32",
+                        "the id map is {:?}, and the hasher maps through i64",
                         map.dtype
                     ),
                 ));
