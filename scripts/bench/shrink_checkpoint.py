@@ -404,10 +404,12 @@ def _rewrite_dsv41(cfg: dict, plan: Plan) -> None:
         tc["engram_num_embeddings"] = [sum(p) for p, _ in carve.dst]
         tc["engram_vocab_size"] = carve.dst_base
     else:
-        tc["engram_layer_ids"] = kept("engram_layer_ids")
+        source_ids = tc.get("engram_layer_ids", [])
         if isinstance(tc.get("engram_num_embeddings"), list):
-            keep_ix = [i for i, s in enumerate(tc.get("engram_layer_ids_src", []))]
-            del keep_ix
+            tc["engram_num_embeddings"] = [size for source_id, size in
+                                           zip(source_ids, tc["engram_num_embeddings"])
+                                           if source_id in remap]
+        tc["engram_layer_ids"] = kept("engram_layer_ids")
 
 
 def _rewrite_kimi(cfg: dict, plan: Plan) -> None:
@@ -1796,6 +1798,10 @@ def apply_engram_carve(outs: list["OutTensor"], src: dict[str, SrcTensor], plan:
         k = carve.kept_src_layers.index(src_layer)
         s_primes, s_offsets = carve.src[carve.kept_src_modules[k]]
         d_primes, _ = carve.dst[k]
+        if not ot.src.shape or ot.src.shape[0] != sum(s_primes):
+            raise SystemExit(
+                f"{ot.src.name}: expected {sum(s_primes)} Engram table rows, "
+                f"got {ot.src.shape[0] if ot.src.shape else 'no first dimension'}")
         pieces: list[Piece] = []
         for j, (row0, rows) in enumerate(zip(s_offsets, d_primes)):
             if rows > s_primes[j]:

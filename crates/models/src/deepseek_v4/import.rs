@@ -15,7 +15,10 @@ impl Model {
     ) -> Result<ModelContract, Error> {
         let mut refusals: Vec<String> = Vec::new();
         let arms: &[(&str, ImportArm<Self>)] = if self.hyper.single_pass {
-            &[("a DeepSeek-V4.1 checkpoint", Self::import_from_v41)]
+            &[
+                ("a DeepSeek-V4.1 checkpoint", Self::import_from_v41),
+                ("a DeepSeek-V4.1 MLX checkpoint", Self::import_from_v41_mlx),
+            ]
         } else {
             &[
                 (
@@ -177,7 +180,7 @@ impl Model {
         reads
     }
 
-    /// DeepSeek-V4.1-Flash, as DeepSeek and `mlx_lm` publish it: the trunk
+    /// DeepSeek-V4.1-Flash in its per-expert release layout: the trunk
     /// under `layers.{l}.` with `embed.weight`, `head.weight` and `norm.weight`
     /// at the top, routed experts as per-expert `ffn.experts.{e}.w1/w3/w2`
     /// planes. Every plane is read at whatever representation the file
@@ -190,12 +193,52 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        let mut b = Builder::new(src, self.tp, platform);
-        b.read(&self.embed, "embed.weight")?;
-        if let Some(head) = &self.head {
-            b.read(head, "head.weight")?;
+        self.import_from_v41_layout(src, platform, false)
+    }
+
+    pub fn import_from_v41_mlx(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        if src
+            .get("model.layers.0.ffn.switch_mlp.gate_proj.weight")
+            .is_none()
+        {
+            return Err(Error::Illegible {
+                name: "dsv4".to_string(),
+                detail: "no stacked MLX V4.1 expert bank in model.layers".to_string(),
+            });
         }
-        b.read(&self.final_norm, "norm.weight")?;
+        self.import_from_v41_layout(src, platform, true)
+    }
+
+    fn import_from_v41_layout(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+        mlx: bool,
+    ) -> Result<ModelContract, Error> {
+        let mut b = Builder::new(src, self.tp, platform);
+        b.read(
+            &self.embed,
+            if mlx {
+                "model.embed_tokens.weight"
+            } else {
+                "embed.weight"
+            },
+        )?;
+        if let Some(head) = &self.head {
+            b.read(head, if mlx { "lm_head.weight" } else { "head.weight" })?;
+        }
+        b.read(
+            &self.final_norm,
+            if mlx {
+                "model.norm.weight"
+            } else {
+                "norm.weight"
+            },
+        )?;
         if let Some(map) = &self.token_map {
             if src.get("engram.token_map").is_none() {
                 return Err(Error::Illegible {
@@ -210,14 +253,27 @@ impl Model {
         }
 
         for (l, w) in self.layers.iter().enumerate() {
-            let n = |s: &str| format!("layers.{l}.{s}");
+            let n = |s: &str| {
+                if mlx {
+                    format!("model.layers.{l}.{s}")
+                } else {
+                    format!("layers.{l}.{s}")
+                }
+            };
             let at = &w.attn;
 
             for (mix, tag) in [(&w.attn_mix, "attn"), (&w.mlp_mix, "ffn")] {
-                b.read(&mix.scale, n(&format!("hc_{tag}_scale")))?;
-                b.read(&mix.base, n(&format!("hc_{tag}_base")))?;
+                let name = |plane: &str| {
+                    if mlx {
+                        n(&format!("{tag}_hc.{plane}"))
+                    } else {
+                        n(&format!("hc_{tag}_{plane}"))
+                    }
+                };
+                b.read(&mix.scale, name("scale"))?;
+                b.read(&mix.base, name("base"))?;
                 if let Some(dynamic) = &mix.dynamic {
-                    b.read(dynamic, n(&format!("hc_{tag}_fn")))?;
+                    b.read(dynamic, name("fn"))?;
                 }
             }
             if let Some(norm) = &w.attn_norm {
@@ -274,7 +330,14 @@ impl Model {
             };
             b.read(router, n("ffn.gate.weight"))?;
             match gate {
-                Gate::Bias { bias } => b.read(bias, n("ffn.gate.bias"))?,
+                Gate::Bias { bias } => b.read(
+                    bias,
+                    n(if mlx {
+                        "ffn.gate.e_score_correction_bias"
+                    } else {
+                        "ffn.gate.bias"
+                    }),
+                )?,
                 Gate::Hash { .. } => {
                     return Err(Error::Illegible {
                         name: "dsv4".to_string(),
@@ -285,8 +348,13 @@ impl Model {
             let expert = |e: u32, leg: &str| n(&format!("ffn.experts.{e}.{leg}.weight"));
             match gate_up {
                 GateUp::Split { gate, up } => {
-                    read_bank(&mut b, src, gate, (0..*experts).map(|e| expert(e, "w1")))?;
-                    read_bank(&mut b, src, up, (0..*experts).map(|e| expert(e, "w3")))?;
+                    if mlx {
+                        b.read(gate, n("ffn.switch_mlp.gate_proj.weight"))?;
+                        b.read(up, n("ffn.switch_mlp.up_proj.weight"))?;
+                    } else {
+                        read_bank(&mut b, src, gate, (0..*experts).map(|e| expert(e, "w1")))?;
+                        read_bank(&mut b, src, up, (0..*experts).map(|e| expert(e, "w3")))?;
+                    }
                 }
                 GateUp::Fused(_) => {
                     return Err(Error::Illegible {
@@ -295,15 +363,34 @@ impl Model {
                     });
                 }
             }
-            read_bank(&mut b, src, down, (0..*experts).map(|e| expert(e, "w2")))?;
+            if mlx {
+                b.read(down, n("ffn.switch_mlp.down_proj.weight"))?;
+            } else {
+                read_bank(&mut b, src, down, (0..*experts).map(|e| expert(e, "w2")))?;
+            }
             b.read_concat(
                 shared_gate_up,
                 [
-                    n("ffn.shared_experts.w1.weight"),
-                    n("ffn.shared_experts.w3.weight"),
+                    n(if mlx {
+                        "ffn.shared_experts.gate_proj.weight"
+                    } else {
+                        "ffn.shared_experts.w1.weight"
+                    }),
+                    n(if mlx {
+                        "ffn.shared_experts.up_proj.weight"
+                    } else {
+                        "ffn.shared_experts.w3.weight"
+                    }),
                 ],
             )?;
-            b.read(shared_down, n("ffn.shared_experts.w2.weight"))?;
+            b.read(
+                shared_down,
+                n(if mlx {
+                    "ffn.shared_experts.down_proj.weight"
+                } else {
+                    "ffn.shared_experts.w2.weight"
+                }),
+            )?;
 
             if let Some(e) = &w.engram {
                 b.read(&e.table, n("engram.embed.weight"))?;
@@ -694,4 +781,74 @@ fn one_bank_row(dtype: Dtype, from: String, rows: u64, cols: u64) -> Expr {
 
 fn slab(expr: Expr, shape: Vec<i64>, encoding: checkpoint::types::Encoding) -> Expr {
     expr.transmute(TensorType::new(shape, encoding))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    use ztensor::provide::{Catalog, Entry, Location, Store, StoreId};
+
+    use super::*;
+    use crate::deepseek_v4::model::Routed;
+
+    #[test]
+    fn single_pass_import_reads_stacked_mlx_experts() {
+        let mut model = Model::flash41_mini(
+            Dtype::Bf16,
+            Routed::split(Dtype::Bf16),
+            Dtype::Bf16,
+            Dtype::Bf16,
+            1,
+        );
+        model.layers.truncate(1);
+        model.token_map = None;
+
+        let path =
+            std::env::temp_dir().join(format!("dsv41_mlx_import_{}.bin", std::process::id()));
+        let mut catalog = Catalog::new();
+        let mut offset = 0;
+        for (weight, name) in model.mlx_planes() {
+            let mut shape = weight.shape.clone();
+            if name.contains("ffn.shared_experts.gate_proj.")
+                || name.contains("ffn.shared_experts.up_proj.")
+            {
+                shape[0] /= 2;
+            }
+            let width = if weight.dtype == Dtype::F32 { 4 } else { 2 };
+            let len = shape.iter().product::<u64>() * width;
+            catalog.insert(
+                name,
+                Entry::leaf(
+                    shape,
+                    if weight.dtype == Dtype::F32 {
+                        ztensor::Leaf::F32
+                    } else {
+                        ztensor::Leaf::BF16
+                    },
+                    Location {
+                        store: StoreId(0),
+                        offset,
+                        len,
+                    },
+                ),
+            );
+            offset += len;
+        }
+        let file = File::create(&path).unwrap();
+        file.set_len(offset).unwrap();
+        drop(file);
+        let store = Store::index(&path, "safetensors").unwrap();
+        let src = ztensor::Source::from_parts(vec![store], catalog).unwrap();
+
+        let contract = model.import(&src, Platform::Cuda).unwrap();
+        assert!(contract.tensors.iter().any(|tensor| {
+            tensor.name == model.layers[0].mlp_mix.base.name
+                && matches!(&tensor.expr, Expr::Src(name) if name == "model.layers.0.ffn_hc.base")
+        }));
+        assert!(contract.tensors.iter().any(|tensor| {
+            matches!(&tensor.expr, Expr::Src(name) if name == "model.layers.0.ffn.switch_mlp.down_proj.weight")
+        }));
+        std::fs::remove_file(path).unwrap();
+    }
 }
