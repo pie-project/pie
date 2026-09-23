@@ -197,6 +197,12 @@ pub const ROWS: &[Row] = &[
         arch: "glm5_next",
     },
     Row {
+        id: "glm53-flash-mini-u4g64-u4g64-kv-bf16-tp2",
+        layers: 8,
+        vocab: 154_880,
+        arch: "glm5_next",
+    },
+    Row {
         id: "glm53-flash-mtp-u8g64-u2g64-u4g64-kv-bf16",
         layers: 45,
         vocab: 154_880,
@@ -251,6 +257,12 @@ pub const ROWS: &[Row] = &[
         arch: "gptoss",
     },
     Row {
+        id: "gptoss-20b-mini-bf16-mxfp4-kv-bf16-tp2",
+        layers: 5,
+        vocab: 201_088,
+        arch: "gptoss",
+    },
+    Row {
         id: "gptoss-120b-bf16-mxfp4-kv-bf16",
         layers: 36,
         vocab: 201_088,
@@ -264,6 +276,12 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         id: "kimik3-mini-bf16-mxfp4-kv-bf16",
+        layers: 8,
+        vocab: 163_840,
+        arch: "kimi_k3",
+    },
+    Row {
+        id: "kimik3-mini-bf16-mxfp4-kv-bf16-tp2",
         layers: 8,
         vocab: 163_840,
         arch: "kimi_k3",
@@ -354,6 +372,12 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         id: "qwen36-35b-a3b-mini-u4g64-kv-bf16",
+        layers: 5,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen36-35b-a3b-mini-u4g64-kv-bf16-tp2",
         layers: 5,
         vocab: 248_320,
         arch: "qwen3_5",
@@ -462,6 +486,12 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         id: "qwen35-d0.8b-bf16-kv-bf16",
+        layers: 24,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen35-d0.8b-bf16-kv-bf16-tp2",
         layers: 24,
         vocab: 248_320,
         arch: "qwen3_5",

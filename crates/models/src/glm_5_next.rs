@@ -31,6 +31,16 @@ pub fn skus() -> Vec<crate::Sku> {
             |tp: u32| Model::flash_mini(8, 32, Dtype::U4g64, Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
+            "glm53-flash-mini",
+            2,
+            [Dtype::U4g64, Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::instruct,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::flash_mini(8, 32, Dtype::U4g64, Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
             "glm53-flash",
             1,
             [Dtype::U8g64, Dtype::U2g64],

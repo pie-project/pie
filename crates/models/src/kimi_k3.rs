@@ -20,6 +20,16 @@ pub fn skus() -> Vec<crate::Sku> {
             |tp: u32| Model::k3_mini(8, 32, 4, Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
         ),
         (
+            "kimik3-mini",
+            2,
+            [Dtype::Bf16, Dtype::Mxfp4],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::instruct3,
+            &tokenizer::CONTRACT3,
+            |tp: u32| Model::k3_mini(8, 32, 4, Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, tp),
+        ),
+        (
             "kimik3",
             1,
             [Dtype::Bf16, Dtype::Mxfp4],
