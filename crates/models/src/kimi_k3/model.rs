@@ -341,9 +341,12 @@ impl Model {
         let moe_in = u64::from(d.moe.latent.unwrap_or(d.hidden));
         let full_at = |l: u32| closes_a_block(l, d.full_attn_every);
         let moe_at = |l: u32| l >= d.dense_layers;
+        // Under `Every` the first layer has no closed block to blend with, so
+        // its `self_attention_res_*` planes are never read (the reference skips
+        // the blend while `block_residual` is empty).
         let blend_at = |l: u32| match d.attn_res {
             AttnRes::AtBlockStart => l > 0 && closes_a_block(l - 1, d.res_block),
-            AttnRes::Every => true,
+            AttnRes::Every => l > 0,
         };
 
         let a = &d.mla;
