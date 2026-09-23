@@ -421,7 +421,7 @@ impl Model {
                         a_log: Weight::sym(n("kda_a_log"), [kda_heads as u64], Dtype::F32)
                             .columns(),
                         gate: Weight::sym(n("kda_gate"), [kda_width, hidden], weights).columns(),
-                        o_norm: Weight::sym(n("kda_o_norm"), [k.head_dim as u64], weights),
+                        o_norm: Weight::sym(n("kda_o_norm"), [k.head_dim as u64], Dtype::F32),
                         o_norm_eps: k.norm_eps,
                         o_proj: Weight::sym(n("kda_o_proj"), [hidden, kda_width], weights).rows(),
                         conv_state: format!("conv.{l}"),

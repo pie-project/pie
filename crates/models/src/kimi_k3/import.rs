@@ -242,8 +242,27 @@ impl Model {
         b.read(&k.f_a, at(l, "self_attn.f_a_proj.weight"))?;
         b.read(&k.f_b, at(l, "self_attn.f_b_proj.weight"))?;
         b.read(&k.b, at(l, "self_attn.b_proj.weight"))?;
-        b.read(&k.dt_bias, at(l, "self_attn.dt_bias"))?;
-        b.read(&k.a_log, at(l, "self_attn.A_log"))?;
+        // stored flat `[heads * head_dim]`; read as the `[heads, head_dim]` plane
+        b.read_expr(
+            &k.dt_bias,
+            Expr::src(at(l, "self_attn.dt_bias")).transmute(TensorType::raw(
+                lifted(&k.dt_bias, cut_axis(&k.dt_bias)),
+                checkpoint::types::DType::F32,
+            )),
+        )?;
+        // The released Kimi-K3 stores `A_log` as `[128]` against 96 heads; the
+        // reference's KDA gate loads one entry per head (`A_log + i_h`), so the
+        // first `heads` entries are the decays and the tail is never read.
+        let a_log = at(l, "self_attn.A_log");
+        let stored = src
+            .get(&a_log)
+            .map(|t| t.shape().iter().product::<u64>())
+            .unwrap_or(0);
+        if stored > u64::from(k.heads) {
+            b.read_expr(&k.a_log, Expr::src(a_log).slice(0, 0, i64::from(k.heads)))?;
+        } else {
+            b.read(&k.a_log, a_log)?;
+        }
         b.read(&k.gate, at(l, "self_attn.g_proj.weight"))?;
         b.read(&k.o_norm, at(l, "self_attn.o_norm.weight"))?;
         b.read(&k.o_proj, at(l, "self_attn.o_proj.weight"))?;
