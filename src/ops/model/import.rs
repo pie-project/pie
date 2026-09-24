@@ -464,9 +464,7 @@ pub fn run(mut args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate
     writer
         .finish()
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
-    if let Some(spool) = spool {
-        spool.remove();
-    }
+    drop(spool);
     drop(overlay);
     let out_file = name_the_specialization(out_file, &source.name, &stamp, args.out.as_deref())?;
     if let Err(why) = runtime::engine::load::verify_artifact(&out_file, platform) {
@@ -720,9 +718,7 @@ fn overlay_onto_artifact(
             .map_err(|err| anyhow!("cannot finish the artifact: {err}"))?;
         Ok(written)
     })();
-    if let Some(spool) = spool {
-        spool.remove();
-    }
+    drop(spool);
     let written_bytes = outcome.map_err(restore)?;
 
     let renamed = match base_file
@@ -1104,15 +1100,29 @@ pub(crate) struct Spool {
 }
 
 impl Spool {
+    // The spool is this import's alone, the way the artifact it feeds is
+    // written through a per-process `.partial` file. Two imports of one model
+    // into one store lay their planes out identically, so a spool they shared
+    // would let the neighbour's `read` punch holes through planes this import
+    // has yet to read back; the zeros then carry their own digests through
+    // every check on the way to being served.
     pub(crate) fn create(out_file: &Path) -> Result<Self> {
-        let path = out_file.with_extension("spool.tmp");
+        static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = out_file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "out.zt".to_string());
+        let path = out_file.with_file_name(format!(
+            ".{name}.{}.{}.spool",
+            std::process::id(),
+            OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
         let file = std::fs::File::options()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .read(true)
             .write(true)
             .open(&path)
@@ -1141,9 +1151,10 @@ impl Spool {
         release(&self.file, offset, len);
         Ok(bytes)
     }
+}
 
-    pub(crate) fn remove(self) {
-        drop(self.file);
+impl Drop for Spool {
+    fn drop(&mut self) {
         std::fs::remove_file(&self.path).ok();
     }
 }
@@ -2093,6 +2104,38 @@ mod tests {
         an_unknown_row_name_is_refused_with_the_catalog();
         a_row_that_does_not_read_the_checkpoint_refuses_by_name();
         the_chosen_row_is_in_the_filename_the_dry_run_reports();
+        two_imports_beside_one_output_spool_apart();
+    }
+
+    fn two_imports_beside_one_output_spool_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("archive.zt");
+        let mut first = Spool::create(&out).unwrap();
+        first.publish("plane", b"first").unwrap();
+        let mut second = Spool::create(&out).unwrap();
+        second.publish("plane", b"other").unwrap();
+        assert_eq!(second.read("plane").unwrap(), b"other");
+        assert_eq!(
+            first.read("plane").unwrap(),
+            b"first",
+            "a second import beside the same output neither truncates this one's spool \
+             nor punches holes through what it has yet to read back"
+        );
+        let spools = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".spool"))
+            .count();
+        assert_eq!(
+            spools, 2,
+            "each import spools beside the output under its own name"
+        );
+        drop((first, second));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "and takes its spool with it"
+        );
     }
 
     fn a_banks_planes_publish_in_schedule_order_not_declaration_order() {
