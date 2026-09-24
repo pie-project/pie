@@ -285,6 +285,17 @@ pub fn contract_for(
                 )
             });
     }
+    if sku.recipe.tp > 1 {
+        // an import states the whole checkpoint; the ranks of a tensor-parallel
+        // group band their shares out of a stamped artifact at load (own_contract),
+        // so a raw snapshot cannot be served at tp > 1 directly
+        return Err(format!(
+            "{:?} is a {}-rank row and {checkpoint:?} is an unconverted checkpoint: the ranks \
+             band their shares out of a stamped artifact, so convert it first (`pie model import` \
+             with the 1-rank row) and serve the artifact",
+            trace.name, sku.recipe.tp
+        ));
+    }
     sku.contract(&source, trace.platform).map_err(|error| {
         format!(
             "the import contract for {:?} does not fit {checkpoint:?}: {error}",

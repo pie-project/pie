@@ -84,6 +84,15 @@ PIE_MAX_FORWARD_TOKENS_DEFAULT = 10240
 PIE_MAX_FORWARD_REQUESTS_DEFAULT = 512
 
 
+def _output_token_count(obj: dict) -> int:
+    """Output tokens of one inferlet reply: `num_output_tokens` (text-completion-bench),
+    else `count` (the KV-policy inferlets), else the length of `token_ids`."""
+    for key in ("num_output_tokens", "count"):
+        if key in obj:
+            return int(obj[key])
+    return len(obj.get("token_ids") or [])
+
+
 def bench_inferlet_wasm(inferlet_dir: str | None) -> Path:
     if not inferlet_dir:
         raise FileNotFoundError(
@@ -852,9 +861,13 @@ async def run(args: argparse.Namespace):
                         obj = json.loads(msg)
                         if i == args.warmup and first_output_text[0] is None:
                             first_output_text[0] = obj.get("text", "")
-                        output_tokens = int(obj["num_output_tokens"])
+                        # text-completion-bench reports `num_output_tokens` and
+                        # `token_ids`; the KV-policy inferlets (trackb-h2o,
+                        # trackb-snapkv, ...) report the count as `count` and
+                        # no ids, so the ids are checked only when they exist
+                        output_tokens = int(_output_token_count(obj))
                         token_ids = [int(token) for token in obj.get("token_ids") or []]
-                        if len(token_ids) != output_tokens:
+                        if "token_ids" in obj and len(token_ids) != output_tokens:
                             raise ValueError(
                                 f"output token count {len(token_ids)}, expected {output_tokens}"
                             )
@@ -902,7 +915,7 @@ async def run(args: argparse.Namespace):
                             True,
                             returned - start,
                             output_tokens,
-                            int(obj["num_prompt_tokens"]),
+                            int(obj.get("num_prompt_tokens") or 0),  # the KV-policy inferlets report none
                             ttft_s=ttft_s,
                             intertoken_us=gaps or None,
                             client_send_s=client_send_s,
@@ -981,8 +994,8 @@ async def run(args: argparse.Namespace):
                                 RequestResult(True, elapsed, int(out), int(prompt))
                                 for out, prompt in zip(req_out, req_prompt)
                             ]
-                        total_out = int(obj["num_output_tokens"])
-                        total_prompt = int(obj["num_prompt_tokens"])
+                        total_out = int(_output_token_count(obj))
+                        total_prompt = int(obj.get("num_prompt_tokens") or 0)
                         per_out = total_out // max(1, len(indices))
                         per_prompt = total_prompt // max(1, len(indices))
                         return [

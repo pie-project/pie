@@ -141,6 +141,16 @@ pub fn skus() -> Vec<crate::Sku> {
             |tp: u32| Model::a3b_mini(Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
+            "qwen36-35b-a3b-mini",
+            2,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::a3b_mini(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
             "qwen36-35b-a3b-mini64",
             1,
             [Dtype::U4g64],
@@ -243,6 +253,16 @@ pub fn skus() -> Vec<crate::Sku> {
         (
             "qwen35-d0.8b",
             1,
+            [Dtype::Bf16],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::d0_8b(Dtype::Bf16, Dtype::Bf16, tp),
+        ),
+        (
+            "qwen35-d0.8b",
+            2,
             [Dtype::Bf16],
             Dtype::Bf16,
             model_dsl::trace_hybrid,

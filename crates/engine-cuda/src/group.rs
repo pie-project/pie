@@ -24,9 +24,58 @@ const GRACE: Duration = Duration::from_secs(30);
 pub struct Group {
     ranks: Vec<Arc<Mutex<Cuda>>>,
     ordinals: Vec<i32>,
-    comms: Vec<Arc<Comm>>,
-    poisoned: Arc<Mutex<Option<String>>>,
+    poison: Poison,
     facts: Option<DeviceFacts>,
+}
+
+/// The first refusal poisons the group: every later verb answers it without
+/// touching a rank, and the communicators are aborted so a rank the refusing
+/// rank left inside a collective comes back.
+struct Poison {
+    why: Mutex<Option<String>>,
+    aborts: Vec<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl Poison {
+    fn over(comms: &[Arc<Comm>]) -> Poison {
+        Poison {
+            why: Mutex::new(None),
+            aborts: comms
+                .iter()
+                .map(|comm| {
+                    let comm = Arc::clone(comm);
+                    Arc::new(move || comm.abort()) as Arc<dyn Fn() + Send + Sync>
+                })
+                .collect(),
+        }
+    }
+
+    fn why(&self) -> Option<String> {
+        self.why.lock().map(|held| held.clone()).unwrap_or(None)
+    }
+
+    fn set(&self, why: &str) {
+        if let Ok(mut held) = self.why.lock() {
+            if held.is_some() {
+                return;
+            }
+            *held = Some(why.to_string());
+        }
+        // `ncclCommAbort` raises NCCL's abort flag first — which is what frees
+        // a rank spinning in a collective — and then tears the communicator
+        // down, and that teardown waits for every CUDA graph that captured a
+        // collective on it to die. The armed bodies hold those graphs for the
+        // life of the shell, so an abort run on the lane thread never comes
+        // back and the runtime never hears the refusal: the frame stays
+        // pending until the client gives up (#649). The cause recorded above
+        // is what refuses the next verb; the abort runs apart from the lane.
+        for (rank, abort) in self.aborts.iter().enumerate() {
+            let abort = Arc::clone(abort);
+            let _ = std::thread::Builder::new()
+                .name(format!("tp-abort-{rank}"))
+                .spawn(move || abort());
+        }
+    }
 }
 
 pub fn open_group(
@@ -120,8 +169,7 @@ pub fn open_group(
     Ok(Group {
         ranks,
         ordinals,
-        comms: held,
-        poisoned: Arc::new(Mutex::new(None)),
+        poison: Poison::over(&held),
         facts,
     })
 }
@@ -133,21 +181,11 @@ impl Group {
     }
 
     fn poison(&self) -> Option<String> {
-        self.poisoned
-            .lock()
-            .map(|held| held.clone())
-            .unwrap_or(None)
+        self.poison.why()
     }
 
     fn poison_with(&self, why: &str) {
-        if let Ok(mut held) = self.poisoned.lock()
-            && held.is_none()
-        {
-            *held = Some(why.to_string());
-        }
-        for comm in &self.comms {
-            comm.abort();
-        }
+        self.poison.set(why);
     }
 
     fn each_within<R, F>(&mut self, wait: Duration, verb: F) -> EngineResult<Vec<R>>
@@ -212,6 +250,12 @@ impl Group {
                         while heard < size {
                             let left = grace.saturating_duration_since(std::time::Instant::now());
                             match rx.recv_timeout(left) {
+                                Ok((rank, Err(error))) => {
+                                    heard += 1;
+                                    eprintln!(
+                                        "engine-cuda: tensor-parallel rank {rank} refused: {error}"
+                                    );
+                                }
                                 Ok(_) => heard += 1,
                                 Err(_) => break,
                             }
@@ -327,6 +371,15 @@ impl Engine for Group {
 
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
         let mut answers = self.each_within(LOAD_WAIT, move |rank| rank.load(request.clone()))?;
+        // a rank's facts (codegen backend, pools) exist only once it has loaded;
+        // the snapshot taken at open was empty, and a group that keeps it says
+        // "no codegen backend" to the host, which then emits no kernels and
+        // every program registration is refused ("stage 0 region 0 is a
+        // generated region and the host emitted nothing for it")
+        self.facts = self.ranks[0]
+            .try_lock()
+            .ok()
+            .and_then(|rank| rank.device_facts().cloned());
         Ok(answers.swap_remove(0))
     }
 
@@ -461,5 +514,61 @@ impl Engine for Group {
                 rank.disconnect(message);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use super::*;
+
+    /// A rank's refusal must reach the runtime even when aborting the
+    /// communicators never returns (a shell whose armed bodies hold the graphs
+    /// NCCL's teardown waits for): the cause is recorded at once, the next
+    /// verb reads it, and the abort is asked of each communicator exactly once.
+    #[test]
+    fn a_poison_whose_abort_never_returns_still_answers() {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let (release, parked) = mpsc::channel::<()>();
+        let parked = Mutex::new(parked);
+        let poison = Poison {
+            why: Mutex::new(None),
+            aborts: vec![Arc::new({
+                let aborts = Arc::clone(&aborts);
+                move || {
+                    aborts.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(parked) = parked.lock() {
+                        let _ = parked.recv();
+                    }
+                }
+            })],
+        };
+        assert_eq!(poison.why(), None);
+
+        let began = Instant::now();
+        poison.set("rank 0 refused: load failed: this plan names a verb the shell does not bind");
+        poison.set("rank 1 refused: later, and not the cause");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "poisoning waited on the abort"
+        );
+        assert_eq!(
+            poison.why().as_deref(),
+            Some("rank 0 refused: load failed: this plan names a verb the shell does not bind")
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while aborts.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            aborts.load(Ordering::SeqCst),
+            1,
+            "the abort was not asked once"
+        );
+        drop(release);
     }
 }
