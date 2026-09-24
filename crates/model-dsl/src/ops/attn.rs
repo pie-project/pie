@@ -276,6 +276,44 @@ pub fn masked(
     o
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn masked_lse(
+    q: &Value,
+    plan: &Value,
+    mask: &Value,
+    pages: ValueId,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    causal: bool,
+    sm_scale: f32,
+) -> (Value, Value) {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    let lse = r.fresh(tensor(
+        q.rows(),
+        q.width() / u64::from(head_dim),
+        Dtype::F32,
+    ));
+    r.push(
+        Attention::MaskedLse {
+            q: q.id(),
+            plan: plan.id(),
+            mask: mask.id(),
+            cache: pages,
+            window,
+            head_dim,
+            kv_heads,
+            causal,
+            sm_scale,
+            o: o.id(),
+            lse: lse.id(),
+        },
+        &[q, plan, mask],
+    );
+    (o, lse)
+}
+
 pub fn decode_lse(
     q: &Value,
     plan: &Value,

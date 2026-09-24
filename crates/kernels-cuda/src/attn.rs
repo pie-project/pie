@@ -434,6 +434,44 @@ pub fn masked(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn masked_lse(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    mask: Tensor,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    sm_scale: f32,
+    o: &mut Tensor,
+    lse: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.masked_lse";
+    debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
+    plan.accepts(OP, head_dim, None, window)?;
+    let Some(mask_indptr) = plan.mask_indptr else {
+        return Err(refuse(
+            OP,
+            "no mask span table rides this prefill plan; the engine binds one at plan build",
+        ));
+    };
+    fa2_prefill(
+        ctx,
+        OP,
+        q,
+        plan,
+        pool,
+        window,
+        head_dim,
+        sm_scale,
+        o,
+        Some(lse),
+        Some((mask, mask_indptr)),
+        None,
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RelBias {
     pub bias: Tensor,

@@ -85,6 +85,19 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
     },
+    MaskedLse {
+        q: ValueId,
+        plan: ValueId,
+        mask: ValueId,
+        cache: ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        kv_heads: u32,
+        causal: bool,
+        sm_scale: f32,
+        o: ValueId,
+        lse: ValueId,
+    },
     Dense {
         q: ValueId,
         k: ValueId,
@@ -570,6 +583,13 @@ impl Operands for Attention {
                 mask,
                 cache,
                 ..
+            }
+            | Self::MaskedLse {
+                q,
+                plan,
+                mask,
+                cache,
+                ..
             } => sink.extend([*q, *plan, *mask, *cache]),
             Self::Dense {
                 q, k, v, segments, ..
@@ -910,6 +930,7 @@ impl Operands for Attention {
             Self::Decode { o, .. } => sink.push(*o),
             Self::Prefill { o, .. } => sink.push(*o),
             Self::Masked { o, .. } => sink.push(*o),
+            Self::MaskedLse { o, lse, .. } => sink.extend([*o, *lse]),
             Self::Dense { o, .. } => sink.push(*o),
             Self::Ragged { o, .. } => sink.push(*o),
             Self::DecodeLse { o, lse, .. } => sink.extend([*o, *lse]),
@@ -981,6 +1002,7 @@ impl Operands for Attention {
             Self::Decode { .. } => {}
             Self::Prefill { .. } => {}
             Self::Masked { .. } => {}
+            Self::MaskedLse { .. } => {}
             Self::Dense { .. } => {}
             Self::Ragged { .. } => {}
             Self::DecodeLse { .. } => {}
@@ -1038,6 +1060,7 @@ impl Operands for Attention {
             Self::Decode { .. } => "attention.decode",
             Self::Prefill { .. } => "attention.prefill",
             Self::Masked { .. } => "attention.masked",
+            Self::MaskedLse { .. } => "attention.masked_lse",
             Self::Dense { .. } => "attention.dense",
             Self::Ragged { .. } => "attention.ragged",
             Self::DecodeLse { .. } => "attention.decode_lse",
