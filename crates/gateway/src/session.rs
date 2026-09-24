@@ -83,6 +83,8 @@ pub trait TurnRouter: Send + Sync + 'static {
 
     async fn cancel(&self, worker: WorkerId, req: ReqId);
 
+    async fn end_session(&self, session: SessionId);
+
     fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>>;
 }
 
@@ -333,6 +335,7 @@ impl SessionHandle {
 
     pub async fn close(&self) {
         self.cancel().await;
+        self.inner.router.end_session(self.session).await;
     }
 
     pub fn id(&self) -> SessionId {
@@ -350,6 +353,9 @@ impl Drop for SessionHandle {
                 tokio::spawn(async move { router.cancel(worker, req_id).await });
             }
         }
+        let router = self.inner.router.clone();
+        let session = self.session;
+        tokio::spawn(async move { router.end_session(session).await });
     }
 }
 
@@ -411,6 +417,7 @@ mod tests {
         dispatched: Mutex<Vec<ReqId>>,
         affinities: Mutex<Vec<Option<u64>>>,
         cancels: Mutex<Vec<(WorkerId, ReqId)>>,
+        ended: Mutex<Vec<SessionId>>,
         _connected_tx: watch::Sender<Arc<HashSet<WorkerId>>>,
         connected_rx: watch::Receiver<Arc<HashSet<WorkerId>>>,
     }
@@ -425,6 +432,7 @@ mod tests {
                 dispatched: Mutex::new(Vec::new()),
                 affinities: Mutex::new(Vec::new()),
                 cancels: Mutex::new(Vec::new()),
+                ended: Mutex::new(Vec::new()),
                 _connected_tx: tx,
                 connected_rx: rx,
             })
@@ -454,6 +462,9 @@ mod tests {
         }
         async fn cancel(&self, worker: WorkerId, req: ReqId) {
             self.cancels.lock().unwrap().push((worker, req));
+        }
+        async fn end_session(&self, session: SessionId) {
+            self.ended.lock().unwrap().push(session);
         }
         fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>> {
             self.connected_rx.clone()
@@ -521,6 +532,19 @@ mod tests {
         let req_id = router.dispatched.lock().unwrap()[0];
         drop(rx);
         assert_eq!(sessions.feed(req_id, chunk()).await, Control::Abort);
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_ends_it_on_the_worker() {
+        let router = MockRouter::new(Some(WorkerId(3)));
+        let sessions = Sessions::new(router.clone());
+        let (handle, _rx) = sessions
+            .create(ident(), input(), Affinity::Sticky)
+            .await
+            .unwrap();
+        let session = handle.id();
+        handle.close().await;
+        assert!(router.ended.lock().unwrap().contains(&session));
     }
 
     #[tokio::test]

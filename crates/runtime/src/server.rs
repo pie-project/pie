@@ -207,6 +207,10 @@ struct Session {
     state: Arc<ServerState>,
     pub(super) inflight_uploads: DashMap<UploadKey, InFlightUpload>,
     pub(super) attached_processes: Vec<ProcessId>,
+    /// The subset of `attached_processes` this session launched with output
+    /// capture — the launcher owns them, so its close ends them (below);
+    /// processes merely attached to are another session's and only detach.
+    pub(super) launched_processes: HashSet<ProcessId>,
     pub(super) installed_programs: HashSet<ProgramName>,
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
     out_tx: mpsc::Sender<WireServerMessage>,
@@ -224,15 +228,26 @@ impl Session {
             state,
             inflight_uploads: DashMap::new(),
             attached_processes: Vec::new(),
+            launched_processes: HashSet::new(),
             installed_programs: HashSet::new(),
             file_waiters: HashMap::new(),
             out_tx,
         }
     }
 
+    // A process this session launched with capture streams to this client
+    // and nobody else, so once the client is gone its output has no reader
+    // and its KV seat would otherwise outlive the client for as long as it
+    // runs; end it. A process only attached to belongs to another launcher,
+    // so it just detaches, as before. A launch with outputs off never joins
+    // either list and runs on as a background process.
     fn cleanup(&mut self) {
         for process_id in self.attached_processes.drain(..) {
-            process::detach(process_id);
+            if self.launched_processes.contains(&process_id) {
+                process::terminate(process_id, Err("client disconnected".to_string()));
+            } else {
+                process::detach(process_id);
+            }
         }
 
         SESSION_OUTBOX.remove(&self.id);
@@ -406,5 +421,44 @@ impl Session {
                 self.send_response(corr_id, true, "Pong".to_string()).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inferlet::process::probe::{self, Seen};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_closed_session_ends_what_it_launched_and_only_detaches_what_it_attached() {
+        let launched = ProcessId::new_v4();
+        let attached = ProcessId::new_v4();
+        let background = ProcessId::new_v4();
+        let seen_launched = probe::spawn(launched);
+        let seen_attached = probe::spawn(attached);
+        let mut seen_background = probe::spawn(background);
+
+        let mut session = Session::new_inproc(7, install_state(0), mpsc::channel(1).0);
+        session.attached_processes = vec![launched, attached];
+        session.launched_processes.insert(launched);
+        drop(session);
+
+        match seen_launched.await {
+            Ok(Seen::Terminate(Err(why))) => assert_eq!(why, "client disconnected"),
+            other => panic!("a launched process must be terminated, got {other:?}"),
+        }
+        match seen_attached.await {
+            Ok(Seen::Detach) => {}
+            other => panic!("a merely attached process must only detach, got {other:?}"),
+        }
+        for _ in 0..8 {
+            crate::rt::yield_now().await;
+        }
+        assert!(
+            seen_background.try_recv().is_err(),
+            "a process launched without outputs is not this session's to touch"
+        );
+        process::terminate(attached, Err(String::new()));
+        process::terminate(background, Err(String::new()));
     }
 }

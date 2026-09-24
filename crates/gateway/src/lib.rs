@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::Router;
 use controller_api::GatewayInfo;
-use ids::{ReqId, WorkerId};
+use ids::{ReqId, SessionId, WorkerId};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
@@ -103,6 +103,14 @@ impl TurnRouter for RouteBackend {
     async fn cancel(&self, worker: WorkerId, req: ReqId) {
         if let Some(client) = self.workers.client(worker) {
             let _ = client.cancel(tarpc::context::current(), req).await;
+        }
+    }
+
+    async fn end_session(&self, session: SessionId) {
+        // A sticky session may have reached more than one worker over its
+        // life; the one that never held it ignores the call.
+        for client in self.workers.clients() {
+            let _ = client.end_session(tarpc::context::current(), session).await;
         }
     }
 
