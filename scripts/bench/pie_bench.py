@@ -300,6 +300,13 @@ def build_config(args: argparse.Namespace):
             engine_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "swap_pool_size", 0):
             engine_options["swap_pool_size"] = args.swap_pool_size
+        # `--max-model-len` is ONE REQUEST's context ceiling, the knob every
+        # engine bench forwards (llama.cpp as `--ctx-size`, vLLM and SGLang
+        # as their own `max_model_len`, the Metal branch below). This branch
+        # did not, so the engine served its own 4096 default whatever the
+        # shape asked, and every long-context cell was refused at the first
+        # page past it.
+        engine_options["max_model_len"] = args.max_model_len
     elif args.engine == "metal":
         # Apple Silicon. The Metal engine sizes its own heap from the
         # checkpoint and exposes no memory-fraction knob, so the CUDA-shaped
