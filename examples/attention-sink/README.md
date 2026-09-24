@@ -44,6 +44,14 @@ token  = argmax(logits)
 | `sink_size` | int | `4` | Number of initial positions that remain visible forever |
 | `window_size` | int | `64` | Number of recent positions visible outside the sink |
 
+## Output
+
+One JSON object, the shape the other KV-policy inferlets (and
+`scripts/bench/pie_bench.py`) read: `text`, `count` (generated tokens),
+`prompt_len`, `sink_size`, `window_size`, `kv_len` (KV positions live at the
+last fire) and `visible_kv` (keys the last fire's query could see, at most
+`sink_size + window_size`).
+
 ## Implementation notes
 
 This is in the suite because it selects KV entries by **position**, which ETA's

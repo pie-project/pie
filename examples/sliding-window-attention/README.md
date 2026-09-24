@@ -47,6 +47,13 @@ token  = argmax(logits)
 | `max_tokens` | int | `512` | Maximum number of generated tokens |
 | `window_size` | int | `64` | Number of recent positions visible to each query |
 
+## Output
+
+One JSON object, the shape the other KV-policy inferlets (and
+`scripts/bench/pie_bench.py`) read: `text`, `count` (generated tokens),
+`prompt_len`, `window_size`, `kv_len` (KV positions live at the last fire) and
+`visible_kv` (keys the last fire's query could see, at most `window_size`).
+
 ## Implementation notes
 
 Like `attention-sink`, this inferlet is possible because it selects KV by

@@ -96,22 +96,40 @@ async def test_json_schema_constrained_decoding(client, args):
     assert "value" in output
 
 
+async def _kv_policy_report(client, args, name: str, inputs: dict) -> dict:
+    """The report the KV-policy programs share: `sampler`, `text` and `count`.
+
+    `count` is the field `scripts/bench/pie_bench.py` reads, so a program in
+    this family that answered prose never produced a bench number (#656).
+    """
+    report = await _report(client, args, name, inputs)
+    assert report["sampler"] == name, report
+    assert 1 <= report["count"] <= inputs["max_tokens"], report
+    return report
+
+
 async def test_attention_sink(client, args):
-    await _nonempty(
+    report = await _kv_policy_report(
         client,
         args,
         "attention-sink",
         {"prompt": "Count upward.", "max_tokens": 4, "sink_size": 1, "window_size": 2},
     )
+    assert report["kv_len"] > report["prompt_len"] >= 1, report
+    # The text proves at least one decode fire ran, and a decode row admits
+    # the sink, the window, and nothing else.
+    assert report["visible_kv"] <= report["sink_size"] + report["window_size"], report
 
 
 async def test_sliding_window_attention(client, args):
-    await _nonempty(
+    report = await _kv_policy_report(
         client,
         args,
         "sliding-window-attention",
         {"prompt": "Count upward.", "max_tokens": 4, "window_size": 2},
     )
+    assert report["kv_len"] > report["prompt_len"] >= 1, report
+    assert report["visible_kv"] <= report["window_size"], report
 
 
 async def test_prefix_tree_kv_cache(client, args):
@@ -585,7 +603,7 @@ def _score_geometry(model: str) -> dict:
 
 
 async def test_tova_attention(client, args):
-    report = await _report(
+    report = await _kv_policy_report(
         client, args, "tova-attention",
         {"prompt": _TOVA_PROMPT, "max_tokens": 8, "cache_size": 16, **_score_geometry(args.model)},
     )
@@ -647,7 +665,7 @@ async def test_h2o_attention(client, args):
     """
     common = {"prompt": _EVICT_PROMPT, "max_tokens": 12,
               "temperature": _COHERENCE_TAU, "seed": 4242, **_score_geometry(args.model)}
-    report = await _report(
+    report = await _kv_policy_report(
         client, args, "trackb-h2o", {**common, "page_budget": 4096})
     # The split is real: both halves ran, and together they are the generation.
     assert report["observe_fires"] > 0, report
@@ -731,7 +749,7 @@ async def test_h2o_attention(client, args):
 async def test_snapkv_attention(client, args):
     common = {"prompt": _EVICT_PROMPT, "max_tokens": 12,
               "temperature": _COHERENCE_TAU, "seed": 4242, **_score_geometry(args.model)}
-    report = await _report(
+    report = await _kv_policy_report(
         client, args, "trackb-snapkv", {**common, "page_budget": 4096})
     # SnapKV reads a DIFFERENT TAP from every other policy here: the prefill
     # capture, which records the last `window` rows of the prompt against the
