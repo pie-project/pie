@@ -1,4 +1,4 @@
-use model_compiler::{Budgets, CompiledModel, DeviceProfile};
+use model_compiler::{Budget, Budgets, CompiledModel, DeviceProfile};
 
 use crate::arena::Arena;
 use crate::device::Context;
@@ -18,16 +18,18 @@ use crate::weights::Weights;
 
 use super::{Boot, FireCost, Golden, Graphs, Shell};
 
+/// The least `max_forward_tokens` is served at when the card is short: one
+/// prefill chunk a frame, which serves, and under it the halving stops.
+const TOKENS_FLOOR: u32 = 1024;
+
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
     let device = Context::bind(boot.ordinal, boot.comm)?;
 
     kernels_cuda::disk::install(boot.cache_dir);
 
-    boot.budget.buckets = crate::api::lattice(
-        std::mem::take(&mut boot.budget.buckets),
-        boot.budget.max_tokens,
-    );
+    let stated_buckets = std::mem::take(&mut boot.budget.buckets);
+    boot.budget.buckets = crate::api::lattice(stated_buckets.clone(), boot.budget.max_tokens);
 
     let mut profile = boot.profile.take().unwrap_or(DeviceProfile {
         sms: device.device().num_sm,
@@ -44,11 +46,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         crate::GROUPED.iter().map(|op| (*op).to_string()).collect()
     } else {
         Vec::new()
-    };
-    let budgets = Budgets {
-        tokens: boot.budget.clone(),
-        patches: boot.patches.clone(),
-        voxels: boot.voxels.clone(),
     };
     boot.trace = model_ir::fuse::residual_norm(boot.trace.clone());
     if boot.knobs.diagnostics.fuse_chains {
@@ -75,6 +72,73 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         eta_compiler::codegen::cuda::fused::GUMBEL_DIRECT
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
+    // The activation arena and the attention workspaces are sized from
+    // `max_forward_tokens`, and on a wide model at a long envelope they are
+    // gigabytes before a sequence seats. The card's share after the weight
+    // tier is what they must fit in, half of it, so the cache rows, the
+    // bodies and the guests' programs have the other half; the token budget
+    // halves toward its floor until they do, and the lattice follows.
+    let (free, total) = crate::store::device_memory()?;
+    let after_weights =
+        crate::device::elastic::budget_bytes(free, total, boot.knobs.gpu_mem_utilization)
+            .saturating_sub(crate::store::weight_tier_bytes(
+                &boot.trace,
+                boot.residency.device_demand(),
+                0,
+            )?);
+    let facts = kv::probe(&boot.trace)?;
+    let budgets_at = |budget: &Budget| Budgets {
+        tokens: budget.clone(),
+        patches: boot.patches.clone(),
+        voxels: boot.voxels.clone(),
+    };
+    let budget_at = |tokens: u32| {
+        let mut budget = boot.budget.clone();
+        budget.max_tokens = tokens;
+        let mut buckets: Vec<u32> = stated_buckets
+            .iter()
+            .copied()
+            .filter(|bucket| *bucket < tokens)
+            .collect();
+        if !stated_buckets.is_empty() {
+            buckets.push(tokens);
+        }
+        budget.buckets = crate::api::lattice(buckets, tokens);
+        budget
+    };
+    let asked_tokens = boot.budget.max_tokens;
+    let floor = boot.budget.max_lanes.max(TOKENS_FLOOR).min(asked_tokens);
+    let working_at = |tokens: u32| -> u64 {
+        let budget = budget_at(tokens);
+        let Ok(compiled) =
+            model_compiler::compile_axes(&boot.trace, &budgets_at(&budget), &profile)
+        else {
+            return u64::MAX;
+        };
+        compiled
+            .arena
+            .prefix_for(u64::from(budget.max_lanes))
+            .saturating_add(crate::inputs::attention_workspace_bytes(
+                &budget,
+                &facts,
+                &device.device(),
+                &crate::exports::schedule_streams(&boot.trace, &compiled),
+            ))
+    };
+    let tokens = crate::store::tokens_within(asked_tokens, floor, after_weights / 2, working_at);
+    if tokens != asked_tokens {
+        eprintln!(
+            "engine-cuda: [engine] max_forward_tokens {asked_tokens} is served at {tokens}: at \
+             {asked_tokens} the activation arena and attention workspaces take {} MiB of the \
+             {} MiB this card has after the weight tier under [engine] gpu_mem_utilization, and \
+             the cache rows, graph bodies and guest programs need the other half. State a \
+             smaller max_forward_tokens to choose it, or a larger gpu_mem_utilization.",
+            working_at(asked_tokens) >> 20,
+            after_weights >> 20,
+        );
+        boot.budget = budget_at(tokens);
+    }
+    let budgets = budgets_at(&boot.budget);
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
     if boot.knobs.diagnostics.arm_trace {
         let mut streams: std::collections::BTreeMap<u32, Vec<String>> =
@@ -579,6 +643,22 @@ impl Shell {
             boot.budget.max_lanes,
             shell.out_width().map_or(0, |width| width.saturating_mul(4)),
         );
+        let decoded = crate::store::decoded_weight_reserve(
+            widest_affine_plane(&shell.trace, shell.weights.table()),
+            shell.compiled.streams.streams,
+        );
+        let held_for_fires = programs.saturating_add(decoded);
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!(
+                "[arm-trace] held for fires: guest programs {} MiB at {} lanes, decoded-weight \
+                 tiles {} MiB ({} MiB widest plane on {} stream(s))",
+                programs >> 20,
+                boot.budget.max_lanes,
+                decoded >> 20,
+                widest_affine_plane(&shell.trace, shell.weights.table()) >> 20,
+                shell.compiled.streams.streams,
+            );
+        }
         let footprint = |shell: &Shell| Footprint {
             total: device_total,
             before: device_total.saturating_sub(free_before),
@@ -593,6 +673,10 @@ impl Shell {
                 .map_or(0, crate::scores::Scores::bytes),
             cache_rows: shell.pools.committed_bytes(),
             bodies: shell.cache.body_stats().census.bytes as u64,
+            scratch: kernels_cuda::jit::Slabs::census()
+                .iter()
+                .map(|(_, bytes)| *bytes as u64)
+                .sum(),
         };
         let bodies = if shell.records_bodies() {
             shell.bodies_mem as u64
@@ -600,9 +684,35 @@ impl Shell {
             0
         };
         let resident = footprint(&shell);
-        shell
+        let fitted = shell
             .pools
-            .fit_the_card(bodies.saturating_add(programs), &resident)?;
+            .fit_the_card(bodies, held_for_fires, &resident)?;
+        if fitted.bodies < bodies {
+            eprintln!(
+                "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
+                 with the weights, activations and inputs resident, one sequence at the declared \
+                 context and the guests' programs seated, {} MiB is left for the graph bodies \
+                 and the cache rows together, and the bodies take at most a quarter of it. \
+                 State a smaller bodies_mem to choose it.",
+                bodies >> 20,
+                fitted.bodies >> 20,
+                fitted.spare >> 20,
+            );
+            shell.bodies_mem = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
+        }
+        if (fitted.slots as usize) < shell.held.len() {
+            eprintln!(
+                "engine-cuda: [engine] max_state_slots {} is served at {} on this card: the \
+                 recurrent slab is declared for every slot, and at {} it left no room for one \
+                 sequence's kv pages beside it; the pool seats {} sequences at the declared \
+                 context. State a smaller max_state_slots to choose it.",
+                shell.held.len(),
+                fitted.slots,
+                shell.held.len(),
+                fitted.fit / u64::from(shell.pools.paging().pages_per_slot),
+            );
+            shell.held.truncate(fitted.slots as usize);
+        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
@@ -611,19 +721,31 @@ impl Shell {
         }
         shell.arm_bodies()?;
         let resident = footprint(&shell);
-        if let Some(fitted) = shell.pools.fit_the_card(programs, &resident)? {
+        let fitted = shell.pools.fit_the_card(0, held_for_fires, &resident)?;
+        if fitted.fit != fitted.asked {
             let paging = shell.pools.paging();
             eprintln!(
                 "engine-cuda: the pool was declared {} pages ({} MiB), past the {} MiB this card \
                  hands out for the cache rows under [engine] gpu_mem_utilization once {} MiB is \
-                 held for the programs guests register at {} lanes ({resident}); sized to {} \
-                 pages ({} MiB), {} sequences at the declared context. State [engine] \
-                 max_total_pages to choose the count.",
+                 held for the programs guests register at {} lanes and {} MiB for the \
+                 decoded-weight tiles on {} stream(s){} ({resident}); sized to {} pages ({} \
+                 MiB), {} sequences at the declared context. State [engine] max_total_pages \
+                 to choose the count.",
                 fitted.asked,
                 shell.pools.declared_at(fitted.asked) >> 20,
                 fitted.room >> 20,
-                fitted.held >> 20,
+                programs >> 20,
                 boot.budget.max_lanes,
+                decoded >> 20,
+                shell.compiled.streams.streams,
+                if fitted.held < held_for_fires {
+                    format!(
+                        ", held down to {} MiB together so one sequence seats",
+                        fitted.held >> 20
+                    )
+                } else {
+                    String::new()
+                },
                 fitted.fit,
                 shell.pools.declared_bytes() >> 20,
                 fitted.fit / u64::from(paging.pages_per_slot),
@@ -651,6 +773,7 @@ struct Footprint {
     scores: u64,
     cache_rows: u64,
     bodies: u64,
+    scratch: u64,
 }
 
 impl core::fmt::Display for Footprint {
@@ -659,7 +782,8 @@ impl core::fmt::Display for Footprint {
             f,
             "the device holds {} bytes, {} of them in use before this load began; this load \
              put down weights {}, activation arena {}, inputs {}, buffered activations {}, \
-             readout rows {}, attention scores {}, cache rows {}, graph bodies {}",
+             readout rows {}, attention scores {}, cache rows {}, graph bodies {}, kernel \
+             scratch {}",
             self.total,
             self.before,
             self.weights,
@@ -670,8 +794,42 @@ impl core::fmt::Display for Footprint {
             self.scores,
             self.cache_rows,
             self.bodies,
+            self.scratch,
         )
     }
+}
+
+/// The widest plane this load decodes to bf16 before a dense gemm: every
+/// weight the table seats as codes and scales, at the `[n, k]` the trace
+/// declares for it, two bytes an element.
+fn widest_affine_plane(trace: &model_ir::Trace, table: &crate::run::WeightTable) -> u64 {
+    trace
+        .values
+        .iter()
+        .filter_map(|decl| {
+            let model_ir::Def::Weight(w) = &decl.def else {
+                return None;
+            };
+            let model_ir::Ty::Tensor { shape, .. } = &decl.ty else {
+                return None;
+            };
+            table
+                .0
+                .get(*w as usize)
+                .and_then(Option::as_ref)
+                .filter(|row| matches!(row, crate::run::WeightRow::Planes { .. }))?;
+            Some(
+                shape
+                    .iter()
+                    .map(|dim| match dim {
+                        model_ir::Dim::Const(n) => *n,
+                        _ => 1,
+                    })
+                    .fold(2u64, u64::saturating_mul),
+            )
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64 {

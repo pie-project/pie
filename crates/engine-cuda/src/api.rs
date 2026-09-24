@@ -575,9 +575,11 @@ intended for diagnostics, not serving",
                 elastic_budget_pages,
             },
             limits: FireLimits {
-                max_lanes: budgets.max_lanes,
-                max_tokens: budgets.max_tokens,
-                max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
+                max_lanes: shell.budget().max_lanes,
+                max_tokens: shell.budget().max_tokens,
+                max_page_refs: paging
+                    .pages_per_slot
+                    .saturating_mul(shell.budget().max_lanes),
                 max_context: paging.context(),
             },
             profile,

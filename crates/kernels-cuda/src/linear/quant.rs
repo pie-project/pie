@@ -14,6 +14,10 @@ const BLOCK: u32 = 256;
 
 const WARP: u32 = 32;
 
+/// The bf16 tile a plane is decoded into before the dense gemm reads it:
+/// one a stream, the size of the widest plane fired on it, since the decode
+/// and the gemm are consecutive on the stream. Keyed by region it was one a
+/// region, the whole model in bf16 across a load.
 const DECODED_WEIGHT: &str = "linear.quant.decoded_weight";
 
 fn route_rows(rows: u32, width: u32) -> Launch {
@@ -333,7 +337,7 @@ pub fn decoded_plane(
     }
     let group = k / groups;
     let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
-    let tile = ctx.scratch(op, DECODED_WEIGHT, bytes)? as usize as u64;
+    let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;
     let words = extent(op, u64::from(n) * u64::from(k) / u64::from(32 / bits))?;
     ctx.fire(
         op,
@@ -507,7 +511,7 @@ fn dense_affine_via_dense(
         return Ok(());
     }
     let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
-    let tile = ctx.scratch(op, DECODED_WEIGHT, bytes)? as usize as u64;
+    let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;
     let words = extent(op, u64::from(n) * u64::from(k) / u64::from(32 / bits))?;
     ctx.fire(
         op,

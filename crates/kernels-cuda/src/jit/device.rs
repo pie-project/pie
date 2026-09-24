@@ -148,6 +148,18 @@ fn grow(
     // SAFETY: a live local out-parameter and a byte count this caller checked
     // is non-zero.
     let code = unsafe { rt::cudaMalloc(&raw mut fresh, want) };
+    if code == rt::cudaError::cudaErrorMemoryAllocation {
+        let _ = unsafe { rt::cudaGetLastError() };
+        let (mut free, mut total) = (0usize, 0usize);
+        // SAFETY: two live locals; the call only writes them.
+        let _ = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
+        return Err(Fault::Exhausted {
+            name,
+            have: old_bytes,
+            need: want,
+            free,
+        });
+    }
     if code != rt::cudaError::cudaSuccess || fresh.is_null() {
         return Err(Fault::Device {
             call: "cudaMalloc",

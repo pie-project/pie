@@ -87,6 +87,12 @@ pub(crate) enum Fault {
         have: usize,
         need: usize,
     },
+    Exhausted {
+        name: &'static str,
+        have: usize,
+        need: usize,
+        free: usize,
+    },
 }
 
 #[cfg(feature = "cuda")]
@@ -100,6 +106,18 @@ impl core::fmt::Display for Fault {
                 "the `{name}` scratch holds {have} bytes and this capture needs {need}; \
                  growing it mid-capture would poison the graph — warm it with an eager \
                  fire before capturing"
+            ),
+            Self::Exhausted {
+                name,
+                have,
+                need,
+                free,
+            } => write!(
+                f,
+                "`cudaMalloc` answered cudaErrorMemoryAllocation growing the `{name}` scratch \
+                 from {have} to {need} bytes, with {free} bytes free on the device: this \
+                 fire's workspace lies outside the fitted pool, so the load left too little \
+                 beside the weights, the cache rows and the graph bodies for it"
             ),
         }
     }

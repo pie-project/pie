@@ -139,6 +139,11 @@ impl PhysicalPool {
         self.handle_bytes
     }
 
+    #[must_use]
+    pub const fn granularity(&self) -> u64 {
+        self.granularity
+    }
+
     pub fn spare_bytes(&self, reserve: u64) -> Result<u64> {
         #[cfg(feature = "cuda")]
         {
@@ -289,16 +294,24 @@ impl Want {
     }
 }
 
+/// The unit an arena of `max_bytes` maps in: a 256th of it, held between the
+/// driver's granularity and the pool's handle size, so a small arena is
+/// backed in small pieces and a large one in few handles.
+#[must_use]
+pub fn map_unit_for(max_bytes: u64, granularity: u64, handle_bytes: u64) -> u64 {
+    let ceiling = align_up(max_bytes, granularity).max(granularity);
+    align_up(
+        (max_bytes / HANDLES_PER_ARENA)
+            .clamp(granularity, handle_bytes)
+            .min(ceiling),
+        granularity,
+    )
+    .max(granularity)
+}
+
 impl Arena {
     pub fn reserve(pool: &PhysicalPool, max_bytes: u64, label: &'static str) -> Result<Arena> {
-        let ceiling = align_up(max_bytes, pool.granularity).max(pool.granularity);
-        let map_unit = align_up(
-            (max_bytes / HANDLES_PER_ARENA)
-                .clamp(pool.granularity, pool.handle_bytes)
-                .min(ceiling),
-            pool.granularity,
-        )
-        .max(pool.granularity);
+        let map_unit = map_unit_for(max_bytes, pool.granularity, pool.handle_bytes);
         let virtual_bytes = align_up(max_bytes, map_unit);
         if virtual_bytes == 0 {
             return Ok(Arena {
@@ -356,6 +369,11 @@ impl Arena {
     #[must_use]
     pub const fn max_bytes(&self) -> u64 {
         self.max_bytes
+    }
+
+    #[must_use]
+    pub const fn map_unit(&self) -> u64 {
+        self.map_unit
     }
 
     #[must_use]
