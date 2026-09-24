@@ -813,3 +813,51 @@ impl ServiceHandler for Process {
         }
     }
 }
+
+/// A stand-in registered under a process id, so a test can see what the
+/// registry delivers to a process without instantiating a guest.
+#[cfg(test)]
+pub(crate) mod probe {
+    use super::*;
+
+    #[derive(Debug)]
+    pub(crate) enum Seen {
+        Terminate(Result<String, String>),
+        Detach,
+        Other,
+    }
+
+    struct Probe {
+        process_id: ProcessId,
+        report: Option<oneshot::Sender<Seen>>,
+    }
+
+    impl ServiceHandler for Probe {
+        type Message = Message;
+
+        async fn handle(&mut self, msg: Message) {
+            let seen = match msg {
+                Message::Terminate { result } => {
+                    SERVICES.remove(&self.process_id);
+                    Seen::Terminate(result)
+                }
+                Message::DetachClient => Seen::Detach,
+                _ => Seen::Other,
+            };
+            if let Some(report) = self.report.take() {
+                let _ = report.send(seen);
+            }
+        }
+    }
+
+    pub(crate) fn spawn(process_id: ProcessId) -> oneshot::Receiver<Seen> {
+        let (report, seen) = oneshot::channel();
+        SERVICES
+            .spawn(process_id, || Probe {
+                process_id,
+                report: Some(report),
+            })
+            .expect("a fresh process id");
+        seen
+    }
+}

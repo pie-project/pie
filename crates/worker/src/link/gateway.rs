@@ -241,6 +241,22 @@ impl WorkerControl for WorkerControlServer {
         tracing::debug!(%req_id, ?p, "set_priority: no runtime hook (no-op)");
     }
 
+    async fn end_session(self, _: tarpc::context::Context, session: SessionId) {
+        // Dropping the turn sender ends the session driver, which closes the
+        // runtime session; that terminates the processes it launched (their
+        // client is gone) and returns their KV seats.
+        if self
+            .sessions
+            .sessions
+            .lock()
+            .await
+            .remove(&session)
+            .is_some()
+        {
+            tracing::debug!(%session, "session ended by gateway; tearing down");
+        }
+    }
+
     async fn drain(self, _: tarpc::context::Context) {
         tracing::info!("drain: no runtime hook (best-effort no-op)");
     }

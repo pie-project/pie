@@ -524,6 +524,7 @@ impl Session {
             Ok(process_id) => {
                 if capture_outputs {
                     self.attached_processes.push(process_id);
+                    self.launched_processes.insert(process_id);
                     self.send_response(corr_id, true, process_id.to_string())
                         .await;
                 } else {

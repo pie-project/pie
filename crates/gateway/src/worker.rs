@@ -73,6 +73,16 @@ impl WorkerRegistry {
         self.inner.clients.read().unwrap().get(&id).cloned()
     }
 
+    pub fn clients(&self) -> Vec<WorkerControlClient> {
+        self.inner
+            .clients
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+
     fn dispatch_impl(
         &self,
         id: WorkerId,
