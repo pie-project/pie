@@ -80,25 +80,28 @@ impl Run<'_> {
                 packed,
                 y,
             } => {
-                let a = self.tensor(*act);
-                let weight = self.tensor(*w);
-                let out = self.tensor(*y);
-                let (m, k) = (a.rows as i32, a.width as i32);
-                let i = i32::try_from(*intermediate).unwrap_or(0);
-                if self.dense_weight(*w)
-                    && weight.rows == 2 * *intermediate
-                    && linear::skinny::covers(m, i, k, linear::skinny::Epilogue::Geglu)
-                {
-                    return linear::skinny::skinny_bf16(
-                        self.ctx(),
-                        weight.ptr,
-                        a.ptr,
-                        out.ptr,
-                        m,
-                        i,
-                        k,
-                        linear::skinny::Epilogue::Geglu,
-                    );
+                // The skinny leg reads the weight as one dense handle; a split-plane
+                // bank resolves only through the matmul below.
+                if self.dense_weight(*w) {
+                    let a = self.tensor(*act);
+                    let weight = self.tensor(*w);
+                    let out = self.tensor(*y);
+                    let (m, k) = (a.rows as i32, a.width as i32);
+                    let i = i32::try_from(*intermediate).unwrap_or(0);
+                    if weight.rows == 2 * *intermediate
+                        && linear::skinny::covers(m, i, k, linear::skinny::Epilogue::Geglu)
+                    {
+                        return linear::skinny::skinny_bf16(
+                            self.ctx(),
+                            weight.ptr,
+                            a.ptr,
+                            out.ptr,
+                            m,
+                            i,
+                            k,
+                            linear::skinny::Epilogue::Geglu,
+                        );
+                    }
                 }
                 self.linear(&Linear::Matmul {
                     act: *act,
