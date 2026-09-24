@@ -1,8 +1,8 @@
 use engine_cuda::device::elastic::map_unit_for;
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
 use engine_cuda::store::{
-    Accounting, BODIES_FLOOR_BYTES, bodies_allowance, decoded_weight_reserve, pages_within,
-    program_scratch_reserve, tokens_within,
+    Accounting, BODIES_FLOOR_BYTES, bodies_allowance, decoded_weight_reserve, holds_within,
+    pages_within, program_scratch_reserve, tokens_within,
 };
 use engine_cuda::{DeviceBoot, Knobs};
 
@@ -35,6 +35,63 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     the_pool_leaves_room_for_the_programs_guests_register();
     the_reservations_scale_to_a_twenty_four_gigabyte_card();
     the_decoded_weight_tiles_are_held_out_of_the_pool();
+    the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture();
+}
+
+fn the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture() {
+    // pie-evals nightly 36021487786 on an L40S: gemma-4-31b 4-bit at a 6144
+    // envelope. Past one 5280 MiB sequence the card had 6581 MiB; holding
+    // the programs (1024 MiB at 256 lanes) and a reserve for the decoded
+    // tiles ate it all, bodies_mem was held to 0, nothing armed, and the
+    // first fire — a capture — found the `decoded_weight` scratch at 0 bytes
+    // and needed 176160768.
+    const SPARE: u64 = 6581 << 20;
+    const PROGRAMS: u64 = 1024 << 20;
+    const CONFIGURED: u64 = 4 << 30;
+    const MLP_PLANE: u64 = 21_504 * 5376 * 2;
+    const FIRST_CAPTURE: u64 = 176_160_768;
+
+    let (bodies, programs) = holds_within(CONFIGURED, PROGRAMS, SPARE);
+    assert!(bodies >= BODIES_FLOOR_BYTES, "the floor holds: {bodies}");
+    assert_eq!(programs, PROGRAMS, "and the programs still fit beside it");
+    assert!(
+        bodies + programs < SPARE,
+        "a second sequence's worth is left: {}",
+        SPARE - bodies - programs
+    );
+
+    let (bodies, programs) = holds_within(CONFIGURED, PROGRAMS, 700 << 20);
+    assert_eq!(
+        bodies, BODIES_FLOOR_BYTES,
+        "on a short card the floor comes first"
+    );
+    assert_eq!(
+        programs,
+        (700 << 20) - BODIES_FLOOR_BYTES,
+        "and the programs take what is left"
+    );
+    assert_eq!(
+        holds_within(CONFIGURED, PROGRAMS, 0),
+        (0, 0),
+        "but never past one sequence"
+    );
+    assert_eq!(
+        holds_within(256 << 20, PROGRAMS, SPARE).0,
+        256 << 20,
+        "a configured allowance under the floor is the floor"
+    );
+
+    // The tile a stream is warmed with at load covers the widest plane its
+    // regions decode, so the capture's want is under what was taken.
+    let tile = decoded_weight_reserve(MLP_PLANE, 1);
+    assert!(
+        tile >= FIRST_CAPTURE,
+        "the mlp stream's tile holds the capture: {tile}"
+    );
+    assert!(
+        tile >= MLP_PLANE && tile < MLP_PLANE + (8 << 20),
+        "in the scratch grain"
+    );
 }
 
 fn the_decoded_weight_tiles_are_held_out_of_the_pool() {

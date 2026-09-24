@@ -70,6 +70,22 @@ impl OffsetKind {
     }
 }
 
+/// Takes this stream's decoded-weight tile at `bytes` now, so the first
+/// fire that decodes a plane finds it and no capture ever has to grow it —
+/// a load whose bodies are held to nothing arms no body at load, and its
+/// first fire is a capture.
+pub fn warm_decoded_weight(ctx: &Ctx, bytes: u64) -> Result<(), Error> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    ctx.scratch_stream(
+        "linear.matmul",
+        DECODED_WEIGHT,
+        usize::try_from(bytes).unwrap_or(usize::MAX),
+    )
+    .map(|_| ())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn matmul(
     ctx: &Ctx,
