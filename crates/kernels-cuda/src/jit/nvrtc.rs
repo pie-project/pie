@@ -452,3 +452,93 @@ impl Drop for Program {
         unsafe { nvrtc::nvrtcDestroyProgram(&raw mut self.0) };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jit::Root;
+
+    /// The units that include the fp8 shim directly, each named with a kernel
+    /// that converts fp8 and one that does not. The bf16 one is the point:
+    /// NVRTC lowers the whole unit, so a shim that refuses an architecture
+    /// takes every kernel in the unit with it, not only the fp8 ones.
+    const FP8_UNITS: &[(&str, &[&str])] = &[
+        (
+            "attn/kv.cuh",
+            &[
+                "::pie::attn::kv_append_explicit<::pie::true_type::value>",
+                "::pie::attn::kv_append_fp8_per_tensor",
+                "::pie::attn::kv_append_per_token_head<::pie::true_type::value>",
+                "::pie::attn::dequant_fp8_pages_active",
+                "::pie::attn::dequant_fp8_per_token_head_pages_active<::pie::bf16>",
+            ],
+        ),
+        (
+            "linear/quant.cuh",
+            &["::pie::linear::quant_act_fp8_per_group"],
+        ),
+    ];
+
+    fn lowers(file: &'static str, arch: &str, extra: &[&str]) -> Result<(), String> {
+        let (_, wanted) = FP8_UNITS
+            .iter()
+            .find(|(name, _)| *name == file)
+            .expect("listed above");
+        let root = Root::of(file).expect("a carried unit");
+        let mut options: Vec<&str> = root.options.to_vec();
+        options.extend_from_slice(extra);
+        let wanted: Vec<String> = wanted.iter().map(|&w| w.to_owned()).collect();
+        compile_text(&Job {
+            name: root.name,
+            source: root.text.to_owned(),
+            arch,
+            options: &options,
+            headers: root.header_set(),
+            floor: Toolchain::ANY,
+            wanted: &wanted,
+            device_link: root.needs_device_runtime(),
+        })
+        .map(|_| ())
+        .map_err(|why| why.to_string())
+    }
+
+    fn nvrtc_is_here() -> bool {
+        let present = unsafe { nvrtc::is_culib_present() };
+        if !present {
+            eprintln!("skipped: libnvrtc is not loadable on this box");
+        }
+        present
+    }
+
+    /// sm_80 has no fp8 cvt and takes the portable path; sm_89 is where the
+    /// instruction arrives; sm_120 is the box this crate is developed on.
+    /// Needs libnvrtc, not a device: the compile targets an architecture.
+    #[test]
+    fn the_fp8_shim_lowers_below_sm_89() {
+        if !nvrtc_is_here() {
+            return;
+        }
+        for arch in ["sm_80", "sm_89", "sm_120"] {
+            for (file, _) in FP8_UNITS {
+                if let Err(why) = lowers(file, arch, &[]) {
+                    panic!("`{file}` would not lower at {arch}: {why}");
+                }
+            }
+        }
+    }
+
+    /// The portable path is what sm_80 runs, so it has to lower on the
+    /// architecture that has the hardware cvt too: that is how it is held
+    /// against the instruction on a box that has one.
+    #[test]
+    fn the_portable_fp8_path_lowers_where_the_hardware_one_does() {
+        if !nvrtc_is_here() {
+            return;
+        }
+        for (file, _) in FP8_UNITS {
+            if let Err(why) = lowers(file, "sm_89", &["-DPIE_HALFTYPE_FORCE_PORTABLE"]) {
+                panic!("`{file}` would not lower portably at sm_89: {why}");
+            }
+        }
+    }
+}
