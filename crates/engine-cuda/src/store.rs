@@ -95,6 +95,38 @@ impl Accounting {
     }
 }
 
+/// What `Pools::fit_the_card` did when the declared pool was larger than
+/// the card: the page count asked, the count it was sized to, and the bytes
+/// the card had for the cache rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fitted {
+    pub asked: u64,
+    pub fit: u64,
+    pub room: u64,
+}
+
+/// The largest page count at or under `asked` whose watermark fits `room`,
+/// or zero when not even the first page does. `declared_at` is the watermark
+/// at a page count and only ever grows with it, so this is a bisection over
+/// a step function, not a division: each plane rounds up to a map unit, and
+/// a model has dozens of planes.
+#[must_use]
+pub fn pages_within(asked: u64, room: u64, declared_at: impl Fn(u64) -> u64) -> u64 {
+    if declared_at(asked) <= room {
+        return asked;
+    }
+    let (mut fits, mut over) = (0u64, asked);
+    while over - fits > 1 {
+        let probe = fits + (over - fits) / 2;
+        if declared_at(probe) <= room {
+            fits = probe;
+        } else {
+            over = probe;
+        }
+    }
+    fits
+}
+
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut bytes: u64 = 0;
     for row in &trace.caches {
@@ -404,7 +436,14 @@ impl Pools {
 
     #[must_use]
     pub fn declared_bytes(&self) -> u64 {
-        let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
+        self.declared_at(self.paging.pages())
+    }
+
+    /// The watermark the cache rows reach with `pages` kv pages declared and
+    /// the paging's state slots, as the map units the pool would back.
+    #[must_use]
+    pub fn declared_at(&self, pages: u64) -> u64 {
+        let pages = u32::try_from(pages).unwrap_or(u32::MAX);
         let slots = self.paging.slots;
         let page_size = self.paging.page_size;
         let unit = self.pool.map_unit_bytes().max(1);
@@ -450,6 +489,48 @@ impl Pools {
             .max(self.high_water_bytes())
             .saturating_sub(self.committed_bytes());
         Ok(live.saturating_sub(reserve).max(live.min(room)))
+    }
+
+    /// Sizes the declared pool to the card. The page count arrives from the
+    /// operator's config (or its 256-slot default) knowing nothing of the
+    /// device, and the watermark it declares is what `spare_bytes` holds back
+    /// and what the runtime admits frames against, so a pool declared past
+    /// what the card can back turns every growth into a refusal the runtime's
+    /// static admission has already forbidden. Called once everything else
+    /// this load puts on the device is resident; `held_back` is what arming
+    /// is entitled to ahead of the cache rows. Refuses when not even one
+    /// sequence at the declared context fits.
+    pub fn fit_the_card(&mut self, held_back: u64) -> Result<Option<Fitted>> {
+        let room = self
+            .pool
+            .spare_bytes(0)?
+            .saturating_add(self.committed_bytes())
+            .saturating_sub(held_back);
+        let asked = self.paging.pages();
+        if self.declared_at(asked) <= room {
+            return Ok(None);
+        }
+        let fit = pages_within(asked, room, |pages| self.declared_at(pages));
+        let one_slot = u64::from(self.paging.pages_per_slot);
+        if fit < one_slot {
+            return Err(Fault::Residency(format!(
+                "the card does not hold this deployment: with the weights, activations and \
+                 inputs resident, the elastic budget under `[engine] gpu_mem_utilization` \
+                 leaves {room} bytes for the cache rows{bodies}, and one sequence at the \
+                 declared context, beside the declared state slots, needs {need} across \
+                 them. Lower `[engine] max_model_len` \
+                 or `[engine] max_state_slots`, raise `[engine] gpu_mem_utilization`, or \
+                 state a `[model] device_weight_budget` that streams the weight tier down.",
+                bodies = if held_back == 0 {
+                    String::new()
+                } else {
+                    format!(" after {held_back} held for `[engine] bodies_mem`")
+                },
+                need = self.declared_at(one_slot),
+            )));
+        }
+        self.paging.pages = fit;
+        Ok(Some(Fitted { asked, fit, room }))
     }
 
     pub(crate) fn reserve_arena(&self, max_bytes: u64, label: &'static str) -> Result<Arena> {

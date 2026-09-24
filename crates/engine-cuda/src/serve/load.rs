@@ -562,6 +562,35 @@ impl Shell {
                  captured; leave the key unstated to serve them"
             );
         }
+        let held_back = if shell.records_bodies() {
+            shell.bodies_mem as u64
+        } else {
+            0
+        };
+        if let Some(fitted) = shell.pools.fit_the_card(held_back)? {
+            let paging = shell.pools.paging();
+            eprintln!(
+                "engine-cuda: the pool was declared {} pages ({} MiB), past the {} MiB this card \
+                 hands out for the cache rows under [engine] gpu_mem_utilization once the \
+                 weights, activations and inputs are resident{}; sized to {} pages ({} MiB), \
+                 {} sequences at the declared context. State [engine] max_total_pages to \
+                 choose the count.",
+                fitted.asked,
+                shell.pools.declared_at(fitted.asked) >> 20,
+                fitted.room >> 20,
+                if held_back == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " and {} MiB is held for [engine] bodies_mem",
+                        held_back >> 20
+                    )
+                },
+                fitted.fit,
+                shell.pools.declared_bytes() >> 20,
+                fitted.fit / u64::from(paging.pages_per_slot),
+            );
+        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",

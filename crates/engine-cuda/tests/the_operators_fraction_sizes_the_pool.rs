@@ -1,5 +1,5 @@
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
-use engine_cuda::store::Accounting;
+use engine_cuda::store::{Accounting, pages_within};
 use engine_cuda::{DeviceBoot, Knobs};
 
 const CARD: u64 = 48_305_799_168;
@@ -27,6 +27,55 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     the_whole_card_is_the_arithmetic_the_pool_had_before();
     the_fraction_is_of_the_card_and_charges_what_is_already_on_it();
     the_card_does_not_hold_a_deployment_whose_weights_leave_no_context();
+    the_declared_pool_is_sized_to_what_the_card_hands_out();
+}
+
+fn the_declared_pool_is_sized_to_what_the_card_hands_out() {
+    // gpt-oss-20b at 16 tokens a page: 24 layers of a key and a value plane,
+    // each 512 wide in bf16, so 16 KiB of every page lands in each of 48
+    // planes and each plane is backed in 32 MiB map units. The config's
+    // 256-slot default at a 4096 context asks 65536 pages, the 49152 MiB
+    // pool issue #630 saw declared on a 32 GB card.
+    const PLANES: u64 = 48;
+    const PLANE_PAGE: u64 = 16 * 1024;
+    const MAP_UNIT: u64 = 32 << 20;
+    let declared_at = |pages: u64| PLANES * (pages * PLANE_PAGE).div_ceil(MAP_UNIT) * MAP_UNIT;
+    let asked = 65536;
+    assert_eq!(declared_at(asked), 49152 << 20);
+
+    let room = 13_826_523_136;
+    let fit = pages_within(asked, room, declared_at);
+    assert_eq!(
+        fit, 16384,
+        "256 MiB of every plane, the last unit that fits"
+    );
+    assert!(declared_at(fit) <= room, "what is declared is backed");
+    assert!(
+        declared_at(fit + 1) > room,
+        "and nothing the card could back is left on the table"
+    );
+    assert_eq!(
+        declared_at(fit),
+        12288 << 20,
+        "the step function lands under the room, not at it"
+    );
+
+    assert_eq!(
+        pages_within(asked, 49152 << 20, declared_at),
+        asked,
+        "a pool that fits is the pool that was asked"
+    );
+    assert_eq!(
+        pages_within(asked, u64::MAX, declared_at),
+        asked,
+        "and never more than asked"
+    );
+    assert_eq!(
+        pages_within(asked, PLANES * MAP_UNIT - 1, declared_at),
+        0,
+        "under one map unit a plane, not one page fits, which the caller refuses"
+    );
+    assert_eq!(pages_within(0, room, declared_at), 0);
 }
 
 fn the_boot_carries_the_fraction_and_absence_is_the_configs_default() {
