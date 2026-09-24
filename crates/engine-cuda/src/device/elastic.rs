@@ -59,6 +59,7 @@ pub struct PhysicalPool {
     handle_bytes: u64,
     budget_pages: u64,
     hard_pages: u64,
+    pledged_pages: u64,
     held_pages: u64,
     committed_pages: u64,
     high_water_pages: u64,
@@ -85,6 +86,7 @@ impl PhysicalPool {
                 handle_bytes,
                 budget_pages: pages,
                 hard_pages: pages,
+                pledged_pages: 0,
                 held_pages: 0,
                 committed_pages: 0,
                 high_water_pages: 0,
@@ -107,6 +109,7 @@ impl PhysicalPool {
             handle_bytes: MAP_UNIT_BYTES,
             budget_pages: pages,
             hard_pages: pages,
+            pledged_pages: 0,
             held_pages: 0,
             committed_pages: 0,
             high_water_pages: 0,
@@ -177,13 +180,16 @@ impl PhysicalPool {
         self.handle_bytes
     }
 
+    /// What the pool can still take: the budget past what is committed and
+    /// what is promised.
+    #[must_use]
+    pub const fn spare_pages(&self) -> u64 {
+        self.budget_pages
+            .saturating_sub(self.committed_pages + self.held_pages)
+    }
+
     pub fn try_reserve(&mut self, pages: u64) -> bool {
-        let charged = self.committed_pages + self.held_pages;
-        if pages
-            > self
-                .budget_pages
-                .saturating_sub(charged.min(self.budget_pages))
-        {
+        if pages > self.spare_pages() {
             return false;
         }
         self.held_pages += pages;
@@ -205,6 +211,20 @@ impl PhysicalPool {
         self.committed_pages -= self.committed_pages.min(pages);
     }
 
+    /// Pledges the pool `pages` whatever the device reports free from here
+    /// on. A fit declares a watermark from what the card has left, and the
+    /// runtime admits frames against that watermark; what a fire allocates
+    /// beside the pool afterwards (a program's scratch, a kernel's slab)
+    /// comes out of the safety floor the budget held back, not out of the
+    /// pages the fit already promised, so a recalibration that finds the
+    /// room taken does not refuse a frame inside the pledge. Past it the
+    /// device's word stands.
+    pub fn pledge(&mut self, pages: u64) {
+        self.pledged_pages = pages;
+        self.budget_pages = self.budget_pages.max(pages);
+        self.hard_pages = self.hard_pages.max(self.budget_pages);
+    }
+
     pub fn recalibrate(&mut self) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -216,11 +236,18 @@ impl PhysicalPool {
             crate::device::ctx::check("cudaMemGetInfo", asked)?;
             let available =
                 budget_bytes(free as u64, total as u64, self.utilization) / LOGICAL_PAGE_BYTES;
-            let charged = self.committed_pages + self.held_pages;
-            self.budget_pages = charged.saturating_add(available).max(charged);
-            self.hard_pages = self.hard_pages.max(self.budget_pages);
+            self.recalibrate_to(available);
         }
         Ok(())
+    }
+
+    /// The budget as the device states it: what is charged plus the
+    /// `available` pages under the ceiling, and never under the pledge.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn recalibrate_to(&mut self, available: u64) {
+        let charged = self.committed_pages + self.held_pages;
+        self.budget_pages = charged.saturating_add(available).max(self.pledged_pages);
+        self.hard_pages = self.hard_pages.max(self.budget_pages);
     }
 
     fn acquire_handle(&self, bytes: u64) -> Result<u64> {
@@ -624,8 +651,17 @@ pub struct Target<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Commit {
     Committed,
-    Exhausted { required: u64, budget: u64 },
-    Impossible { required: u64, ceiling: u64 },
+    /// The growth this commit would map, and the pages the pool had left
+    /// for it: a refusal is the first past the second, never the footprint
+    /// against the whole budget.
+    Exhausted {
+        growth: u64,
+        spare: u64,
+    },
+    Impossible {
+        required: u64,
+        ceiling: u64,
+    },
 }
 
 pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) -> Result<Commit> {
@@ -650,8 +686,8 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
     }
     if !pool.try_reserve(growth) {
         return Ok(Commit::Exhausted {
-            required,
-            budget: pool.budget_pages(),
+            growth,
+            spare: pool.spare_pages(),
         });
     }
     let was: Vec<(Vec<usize>, usize)> = targets
@@ -741,7 +777,55 @@ mod tests {
     #[test]
     fn elastic_every_case() {
         a_promise_charges_the_budget_before_it_is_a_mapping();
+        a_pledge_outlives_what_the_device_reports_free();
         a_partial_page_is_a_whole_page();
+    }
+
+    fn a_pledge_outlives_what_the_device_reports_free() {
+        // Issue #672: the fit declared the pool from what the card had left
+        // and the runtime admitted a c64 frame against it, then a fire took
+        // room beside the pool and the recalibration under the frame's
+        // commit budgeted only what was free, refusing the growth as
+        // retryable past static admission.
+        let mut pool = PhysicalPool::stated(100 * LOGICAL_PAGE_BYTES);
+        pool.pledge(90);
+        assert_eq!(
+            pool.budget_pages(),
+            100,
+            "a pledge under the budget changes nothing"
+        );
+        assert!(pool.try_reserve(40));
+        pool.mark_committed(40);
+
+        pool.recalibrate_to(20);
+        assert_eq!(
+            pool.budget_pages(),
+            90,
+            "the device says 60; the pledge stands"
+        );
+        assert_eq!(pool.spare_pages(), 50);
+        assert!(
+            pool.try_reserve(50),
+            "the frame inside the pledge is admitted"
+        );
+        pool.mark_committed(50);
+        assert_eq!(pool.spare_pages(), 0);
+        assert!(!pool.try_reserve(1), "and the pledge is where it ends");
+
+        pool.recalibrate_to(30);
+        assert_eq!(
+            pool.budget_pages(),
+            120,
+            "past the pledge the device's word stands"
+        );
+        assert_eq!(pool.spare_pages(), 30);
+
+        let mut unpledged = PhysicalPool::stated(100 * LOGICAL_PAGE_BYTES);
+        assert!(unpledged.try_reserve(40));
+        unpledged.mark_committed(40);
+        unpledged.recalibrate_to(20);
+        assert_eq!(unpledged.budget_pages(), 60);
+        assert!(!unpledged.try_reserve(50), "as it was without one");
     }
 
     fn a_promise_charges_the_budget_before_it_is_a_mapping() {
