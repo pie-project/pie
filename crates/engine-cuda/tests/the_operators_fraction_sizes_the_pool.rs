@@ -1,5 +1,5 @@
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
-use engine_cuda::store::Accounting;
+use engine_cuda::store::{Accounting, pages_within, program_scratch_reserve};
 use engine_cuda::{DeviceBoot, Knobs};
 
 const CARD: u64 = 48_305_799_168;
@@ -27,6 +27,122 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     the_whole_card_is_the_arithmetic_the_pool_had_before();
     the_fraction_is_of_the_card_and_charges_what_is_already_on_it();
     the_card_does_not_hold_a_deployment_whose_weights_leave_no_context();
+    the_declared_pool_is_sized_to_what_the_card_hands_out();
+    the_pool_leaves_room_for_the_programs_guests_register();
+}
+
+fn the_pool_leaves_room_for_the_programs_guests_register() {
+    // pie-evals nightly 35971363958 on an RTX 5090: gpt-oss-20b at 256 lanes,
+    // the card handing out 9765 MiB for the cache rows once the load was
+    // resident. text-completion-bench's sampling epilogue holds three f32 rows
+    // of the 201088-wide out seam per lane, so its scratch at 256 lanes was
+    // 617840640 bytes, allocated at the first fire past static admission —
+    // and the pool, fitted to the room, had left 549 MiB.
+    const PLANES: u64 = 48;
+    const PLANE_PAGE: u64 = 16 * 1024;
+    const MAP_UNIT: u64 = 32 << 20;
+    const ROOM: u64 = 9765 << 20;
+    const LANES: u32 = 256;
+    const VOCAB: u64 = 201_088;
+    const BENCH_SCRATCH: u64 = 617_840_640;
+    let declared_at = |pages: u64| PLANES * (pages * PLANE_PAGE).div_ceil(MAP_UNIT) * MAP_UNIT;
+    let asked = 65536;
+
+    let blind = pages_within(asked, ROOM, declared_at);
+    assert_eq!(
+        blind, 12288,
+        "the fit without a program reserve, as the nightly saw it"
+    );
+    assert!(
+        ROOM - declared_at(blind) < BENCH_SCRATCH,
+        "and what it left ({}) is under the program's scratch, the c64/c256 refusal",
+        ROOM - declared_at(blind)
+    );
+
+    let reserve = program_scratch_reserve(LANES, VOCAB * 4);
+    assert!(
+        reserve >= BENCH_SCRATCH,
+        "the reserve at {LANES} lanes covers the program: {reserve} vs {BENCH_SCRATCH}"
+    );
+    assert_eq!(
+        reserve,
+        256 * 804_352 * 4,
+        "four out-seam rows a lane, at 256 lanes"
+    );
+
+    let fit = pages_within(asked, ROOM - reserve, declared_at);
+    assert!(
+        fit < blind && fit >= 4096,
+        "the pool yields, and still seats sequences: {fit}"
+    );
+    assert!(
+        ROOM - declared_at(fit) >= BENCH_SCRATCH,
+        "what the fitted pool leaves holds the program's scratch"
+    );
+
+    assert_eq!(
+        program_scratch_reserve(300, VOCAB * 4),
+        program_scratch_reserve(512, VOCAB * 4),
+        "the shell grows a program's scratch by doublings, so the reserve rounds the lanes up"
+    );
+    assert_eq!(
+        program_scratch_reserve(LANES, 0),
+        0,
+        "a plan with no out seam registers no sampler"
+    );
+    assert_eq!(
+        program_scratch_reserve(u32::MAX, u64::MAX),
+        eta_exec::SCRATCH_MAX_BYTES,
+        "and never past what the program contract lets one program take"
+    );
+}
+
+fn the_declared_pool_is_sized_to_what_the_card_hands_out() {
+    // gpt-oss-20b at 16 tokens a page: 24 layers of a key and a value plane,
+    // each 512 wide in bf16, so 16 KiB of every page lands in each of 48
+    // planes and each plane is backed in 32 MiB map units. The config's
+    // 256-slot default at a 4096 context asks 65536 pages, the 49152 MiB
+    // pool issue #630 saw declared on a 32 GB card.
+    const PLANES: u64 = 48;
+    const PLANE_PAGE: u64 = 16 * 1024;
+    const MAP_UNIT: u64 = 32 << 20;
+    let declared_at = |pages: u64| PLANES * (pages * PLANE_PAGE).div_ceil(MAP_UNIT) * MAP_UNIT;
+    let asked = 65536;
+    assert_eq!(declared_at(asked), 49152 << 20);
+
+    let room = 13_826_523_136;
+    let fit = pages_within(asked, room, declared_at);
+    assert_eq!(
+        fit, 16384,
+        "256 MiB of every plane, the last unit that fits"
+    );
+    assert!(declared_at(fit) <= room, "what is declared is backed");
+    assert!(
+        declared_at(fit + 1) > room,
+        "and nothing the card could back is left on the table"
+    );
+    assert_eq!(
+        declared_at(fit),
+        12288 << 20,
+        "the step function lands under the room, not at it"
+    );
+
+    assert_eq!(
+        pages_within(asked, 49152 << 20, declared_at),
+        asked,
+        "a pool that fits is the pool that was asked"
+    );
+    assert_eq!(
+        pages_within(asked, u64::MAX, declared_at),
+        asked,
+        "and never more than asked"
+    );
+    assert_eq!(
+        pages_within(asked, PLANES * MAP_UNIT - 1, declared_at),
+        0,
+        "under one map unit a plane, not one page fits, which the caller refuses"
+    );
+    assert_eq!(pages_within(0, room, declared_at), 0);
 }
 
 fn the_boot_carries_the_fraction_and_absence_is_the_configs_default() {

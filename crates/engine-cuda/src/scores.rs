@@ -44,6 +44,11 @@ impl Scores {
     }
 
     #[must_use]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.store.bytes() as u64
+    }
+
+    #[must_use]
     pub(crate) fn slab(&self) -> Tensor {
         Tensor::new(
             self.store.ptr(),

@@ -940,6 +940,11 @@ impl Prepared {
         if lanes <= self.lanes {
             return Ok(());
         }
+        // The buffers the last growth outgrew were kept for the fires still
+        // reading them; freeing waits for the device, so it happens here,
+        // once per growth, rather than hoarding a generation per doubling
+        // until this batch is dropped.
+        self.retired.clear();
         let lanes = lanes
             .checked_next_power_of_two()
             .unwrap_or(lanes)
@@ -1013,10 +1018,23 @@ impl Prepared {
 
         let scratch_bytes = (self.scratch_stride as usize * lanes as usize)
             .max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256));
-        self.retired.push(std::mem::replace(
-            &mut self.scratch,
-            Buffer::zeroed_on(stream, scratch_bytes)?,
-        ));
+        // A program arrives after the load declared its pool, so this is the
+        // one allocation the pool's fit could only reserve for, not count;
+        // when it does not fit the refusal is final and says so, since a
+        // frame past static admission has no retry to answer.
+        let scratch = Buffer::zeroed_on(stream, scratch_bytes).map_err(|fault| match fault {
+            Fault::OutOfMemory { need, have } => Fault::Residency(format!(
+                "a guest program's scratch does not fit beside this load: {} bytes a lane at \
+                 {lanes} lanes wants {need}, and the device has {have} free once the weights, \
+                 the declared kv pool and everything else the load holds are resident. Lower \
+                 `[engine] max_forward_requests`, or state `[engine] max_total_pages` under \
+                 the count the load derived.",
+                self.scratch_stride
+            )),
+            other => other,
+        })?;
+        self.retired
+            .push(std::mem::replace(&mut self.scratch, scratch));
         self.retired.push(std::mem::replace(
             &mut self.pending,
             Buffer::zeroed_on(

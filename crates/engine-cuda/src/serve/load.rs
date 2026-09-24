@@ -154,6 +154,7 @@ impl Shell {
             compiled,
             budgets,
         } = bake(&mut boot)?;
+        let (free_before, device_total) = crate::store::device_memory()?;
         device.open_lanes(
             compiled.streams.streams.saturating_sub(1),
             compiled.streams.events,
@@ -567,6 +568,41 @@ impl Shell {
                  captured; leave the key unstated to serve them"
             );
         }
+        // The cache rows are declared last, from what the card has left: once
+        // with the bodies' allowance held ahead of them so arming is not
+        // starved, and again after arming, when the bodies have taken what
+        // they take and the rest is the rows' to declare. What the guests'
+        // programs will take at the admitted lane count is held through both,
+        // since they arrive after the pool is declared and the fires that
+        // bring them are past static admission by then.
+        let programs = crate::store::program_scratch_reserve(
+            boot.budget.max_lanes,
+            shell.out_width().map_or(0, |width| width.saturating_mul(4)),
+        );
+        let footprint = |shell: &Shell| Footprint {
+            total: device_total,
+            before: device_total.saturating_sub(free_before),
+            weights: shell.weights.bytes(),
+            arena: shell.arena.bytes(),
+            inputs: shell.inputs.bytes(),
+            buffers: shell.buffer_bytes(),
+            readout: shell.readout_rows.bytes() as u64,
+            scores: shell
+                .scores
+                .as_ref()
+                .map_or(0, crate::scores::Scores::bytes),
+            cache_rows: shell.pools.committed_bytes(),
+            bodies: shell.cache.body_stats().census.bytes as u64,
+        };
+        let bodies = if shell.records_bodies() {
+            shell.bodies_mem as u64
+        } else {
+            0
+        };
+        let resident = footprint(&shell);
+        shell
+            .pools
+            .fit_the_card(bodies.saturating_add(programs), &resident)?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
@@ -574,10 +610,67 @@ impl Shell {
             );
         }
         shell.arm_bodies()?;
+        let resident = footprint(&shell);
+        if let Some(fitted) = shell.pools.fit_the_card(programs, &resident)? {
+            let paging = shell.pools.paging();
+            eprintln!(
+                "engine-cuda: the pool was declared {} pages ({} MiB), past the {} MiB this card \
+                 hands out for the cache rows under [engine] gpu_mem_utilization once {} MiB is \
+                 held for the programs guests register at {} lanes ({resident}); sized to {} \
+                 pages ({} MiB), {} sequences at the declared context. State [engine] \
+                 max_total_pages to choose the count.",
+                fitted.asked,
+                shell.pools.declared_at(fitted.asked) >> 20,
+                fitted.room >> 20,
+                fitted.held >> 20,
+                boot.budget.max_lanes,
+                fitted.fit,
+                shell.pools.declared_bytes() >> 20,
+                fitted.fit / u64::from(paging.pages_per_slot),
+            );
+        }
         if boot.world.rank != 0 {
             shell.programs.set_shadow(true);
         }
         Ok(shell)
+    }
+}
+
+/// What holds the device when the cache rows come to be declared, in bytes:
+/// what was in use before this load began (other processes, and this one's
+/// context) and each thing the load has put down since. The elastic budget
+/// is what `[engine] gpu_mem_utilization` leaves after all of it.
+struct Footprint {
+    total: u64,
+    before: u64,
+    weights: u64,
+    arena: u64,
+    inputs: u64,
+    buffers: u64,
+    readout: u64,
+    scores: u64,
+    cache_rows: u64,
+    bodies: u64,
+}
+
+impl core::fmt::Display for Footprint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "the device holds {} bytes, {} of them in use before this load began; this load \
+             put down weights {}, activation arena {}, inputs {}, buffered activations {}, \
+             readout rows {}, attention scores {}, cache rows {}, graph bodies {}",
+            self.total,
+            self.before,
+            self.weights,
+            self.arena,
+            self.inputs,
+            self.buffers,
+            self.readout,
+            self.scores,
+            self.cache_rows,
+            self.bodies,
+        )
     }
 }
 

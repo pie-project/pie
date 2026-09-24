@@ -95,6 +95,69 @@ impl Accounting {
     }
 }
 
+/// What `Pools::fit_the_card` did when the declared pool was larger than
+/// the card: the page count asked, the count it was sized to, the bytes the
+/// card had for the cache rows, and what was held back from them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fitted {
+    pub asked: u64,
+    pub fit: u64,
+    pub room: u64,
+    pub held: u64,
+}
+
+/// The rows a guest program's epilogue holds per lane, each as wide as the
+/// out seam: the logits it reads, and the mask, noise and probability rows
+/// a sampling program derives from them.
+pub const PROGRAM_ROWS_A_LANE: u64 = 4;
+
+/// What one guest program's scratch takes at the admitted lane count. A
+/// program is registered after the load, so its stride is not known when
+/// the cache rows are declared; what is known is that its per-lane scratch
+/// is laid out over rows of the out seam, that the shell sizes it for the
+/// lane count rounded up to a power of two, and that the program contract
+/// caps the whole at `eta_exec::SCRATCH_MAX_BYTES`. The pool leaves this
+/// much on the card so the first program to arrive is not the frame that
+/// finds the pool has taken everything.
+#[must_use]
+pub fn program_scratch_reserve(max_lanes: u32, out_row_bytes: u64) -> u64 {
+    let lanes = u64::from(
+        max_lanes
+            .max(1)
+            .checked_next_power_of_two()
+            .unwrap_or(u32::MAX),
+    );
+    let row = out_row_bytes
+        .checked_next_multiple_of(eta_exec::SCRATCH_ALIGN)
+        .unwrap_or(u64::MAX);
+    lanes
+        .saturating_mul(row)
+        .saturating_mul(PROGRAM_ROWS_A_LANE)
+        .min(eta_exec::SCRATCH_MAX_BYTES)
+}
+
+/// The largest page count at or under `asked` whose watermark fits `room`,
+/// or zero when not even the first page does. `declared_at` is the watermark
+/// at a page count and only ever grows with it, so this is a bisection over
+/// a step function, not a division: each plane rounds up to a map unit, and
+/// a model has dozens of planes.
+#[must_use]
+pub fn pages_within(asked: u64, room: u64, declared_at: impl Fn(u64) -> u64) -> u64 {
+    if declared_at(asked) <= room {
+        return asked;
+    }
+    let (mut fits, mut over) = (0u64, asked);
+    while over - fits > 1 {
+        let probe = fits + (over - fits) / 2;
+        if declared_at(probe) <= room {
+            fits = probe;
+        } else {
+            over = probe;
+        }
+    }
+    fits
+}
+
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut bytes: u64 = 0;
     for row in &trace.caches {
@@ -137,7 +200,7 @@ pub fn admit_the_card(
     }
     .saturating_add(extra_resident);
     let accounting = Accounting::of(
-        card_bytes()?,
+        device_memory()?.1,
         utilization,
         weights,
         one_slot_bytes(trace, paging)?,
@@ -146,7 +209,8 @@ pub fn admit_the_card(
     Ok(accounting)
 }
 
-fn card_bytes() -> Result<u64> {
+/// The device's free and total bytes, as the driver reports them now.
+pub fn device_memory() -> Result<(u64, u64)> {
     #[cfg(feature = "cuda")]
     {
         use cudarc::runtime::sys as rt;
@@ -155,7 +219,7 @@ fn card_bytes() -> Result<u64> {
         // SAFETY: two live locals; the call only writes them.
         let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
         crate::device::ctx::check("cudaMemGetInfo", asked)?;
-        Ok(total as u64)
+        Ok((free as u64, total as u64))
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -232,6 +296,7 @@ pub struct Pools {
     shapes: Vec<Shape>,
     pooled: Vec<PoolRow>,
     paging: Paging,
+    asked: u64,
     airborne: Option<Airborne>,
     committed_kv_pages: u32,
     committed_state_slots: u32,
@@ -348,6 +413,7 @@ impl Pools {
             shapes,
             pooled,
             paging,
+            asked: paging.pages(),
             airborne: None,
             committed_kv_pages: 0,
             committed_state_slots: 0,
@@ -404,7 +470,14 @@ impl Pools {
 
     #[must_use]
     pub fn declared_bytes(&self) -> u64 {
-        let pages = u32::try_from(self.paging.pages()).unwrap_or(u32::MAX);
+        self.declared_at(self.paging.pages())
+    }
+
+    /// The watermark the cache rows reach with `pages` kv pages declared and
+    /// the paging's state slots, as the map units the pool would back.
+    #[must_use]
+    pub fn declared_at(&self, pages: u64) -> u64 {
+        let pages = u32::try_from(pages).unwrap_or(u32::MAX);
         let slots = self.paging.slots;
         let page_size = self.paging.page_size;
         let unit = self.pool.map_unit_bytes().max(1);
@@ -450,6 +523,54 @@ impl Pools {
             .max(self.high_water_bytes())
             .saturating_sub(self.committed_bytes());
         Ok(live.saturating_sub(reserve).max(live.min(room)))
+    }
+
+    /// Sizes the declared pool to the card. The page count arrives from the
+    /// operator's config (or its 256-slot default) knowing nothing of the
+    /// device, and the watermark it declares is what `spare_bytes` holds back
+    /// and what the runtime admits frames against, so a pool declared past
+    /// what the card can back turns every growth into a refusal the runtime's
+    /// static admission has already forbidden. The fit is against the elastic
+    /// budget as it stands now, so it is called once everything else this
+    /// load puts on the device is resident, and again after arming, when the
+    /// bodies have taken what they take and the rest is the cache rows' to
+    /// declare (the count grows back toward what was asked, never past it).
+    /// `held_back` is what arming is entitled to ahead of the cache rows; it
+    /// yields before one sequence at the declared context does, since a pool
+    /// under one sequence is no deployment. `resident` spells what is on the
+    /// device already, for the refusal when not even that sequence fits.
+    pub fn fit_the_card(
+        &mut self,
+        held_back: u64,
+        resident: &dyn core::fmt::Display,
+    ) -> Result<Option<Fitted>> {
+        let live = self
+            .pool
+            .spare_bytes(0)?
+            .saturating_add(self.committed_bytes());
+        let one_slot = u64::from(self.paging.pages_per_slot).min(self.asked);
+        let need = self.declared_at(one_slot);
+        let held = held_back.min(live.saturating_sub(need));
+        let room = live.saturating_sub(held);
+        let fit = pages_within(self.asked, room, |pages| self.declared_at(pages));
+        if fit < one_slot {
+            return Err(Fault::Residency(format!(
+                "the card does not hold this deployment: {resident}; under `[engine] \
+                 gpu_mem_utilization` that leaves {room} bytes for the cache rows, and one \
+                 sequence at the declared context, beside the declared state slots, needs \
+                 {need} across them. Lower `[engine] max_model_len` or `[engine] \
+                 max_state_slots`, raise `[engine] gpu_mem_utilization`, state a `[model] \
+                 device_weight_budget` that streams the weight tier down, or free what \
+                 else holds the device."
+            )));
+        }
+        self.paging.pages = fit;
+        Ok((fit != self.asked).then_some(Fitted {
+            asked: self.asked,
+            fit,
+            room,
+            held,
+        }))
     }
 
     pub(crate) fn reserve_arena(&self, max_bytes: u64, label: &'static str) -> Result<Arena> {
