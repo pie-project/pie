@@ -250,10 +250,10 @@ async def test_churn_two_waves(client, args):
 MASKED_FLEET = [
     ("text-completion", {"prompt": ATTEND, "max_tokens": 12}, _gate_attends, 0.0),
     ("sliding-window-attention",
-     {"prompt": "Count upward.", "max_tokens": 8, "window_size": 2}, _gate_nonempty, 0.0),
+     {"prompt": "Count upward.", "max_tokens": 8, "window_size": 2}, _gate_json("count"), 0.0),
     ("attention-sink",
      {"prompt": "Count upward.", "max_tokens": 8, "sink_size": 1, "window_size": 2},
-     _gate_nonempty, 0.1),
+     _gate_json("count"), 0.1),
     ("beam-search", {"max_tokens": 4, "beams": 3}, _gate_contains("[beam] width=3"), 0.1),
     ("consensus-decoding",
      {"question": "What is 2 + 2?", "num_candidates": 2, "max_tokens": 4},

@@ -12,8 +12,7 @@
 
 use inferlet::chat;
 use inferlet::eta::hybrid::prelude::*;
-use serde::Deserialize;
-
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 struct Input {
@@ -43,18 +42,64 @@ fn default_window_size() -> u32 {
     64
 }
 
+/// The report every KV-policy program here answers with (`tova-attention`,
+/// `snapkv-eviction`, ...): the text, the counts, and what the policy did.
+/// `scripts/bench/pie_bench.py` reads `count`; a bare string is not a reply
+/// it can parse.
+#[derive(Serialize)]
+struct Output {
+    sampler: &'static str,
+    /// The continuation, greedily decoded.
+    text: String,
+    /// How many tokens it is.
+    count: usize,
+    /// Prompt tokens, chat-templated.
+    prompt_len: u32,
+    /// Leading positions every decode query may see.
+    sink_size: u32,
+    /// Recent positions a decode query may see (the input, floored at 1).
+    window_size: u32,
+    /// KV positions live at the last fire: the prompt plus every token fed
+    /// back.
+    kv_len: u32,
+    /// Keys the last fire's query could see, counted from the same rule that
+    /// built the first decode row (the rows after it evolve on the device).
+    /// The prefill is causal and sees the whole prompt; a decode row sees at
+    /// most `sink_size + window_size`.
+    visible_kv: u32,
+}
+
 fn host_sink_window_mask(pool_len: u32, query: u32, sink: u32, window: u32) -> Vec<bool> {
     (0..pool_len)
         .map(|key| key <= query && (key < sink || key.saturating_add(window) > query))
         .collect()
 }
 
-#[inferlet::main]
-async fn main(input: Input) -> Result<String> {
-    if input.max_tokens == 0 {
-        return Ok(String::new());
-    }
+/// The report after `fires` decode fires over an `n`-token prompt.
+fn report(generated: &[u32], n: u32, sink: u32, window: u32, fires: u32) -> Result<Output> {
+    let kv_len = n + fires;
+    let visible_kv = if fires == 0 {
+        n
+    } else {
+        host_sink_window_mask(kv_len, kv_len - 1, sink, window)
+            .iter()
+            .filter(|visible| **visible)
+            .count() as u32
+    };
+    Ok(Output {
+        sampler: "attention-sink",
+        text: model::decode(generated)?,
+        count: generated.len(),
+        prompt_len: n,
+        sink_size: sink,
+        window_size: window,
+        kv_len,
+        visible_kv,
+    })
+}
 
+#[inferlet::main]
+async fn main(input: Input) -> Result<Output> {
     let sink = input.sink_size;
     let window = input.window_size.max(1);
     // **THE PAGE SIZE IS THE ENGINE'S, NOT A LITERAL.** This file carried
@@ -73,6 +118,18 @@ async fn main(input: Input) -> Result<String> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
+    if input.max_tokens == 0 {
+        return Ok(Output {
+            sampler: "attention-sink",
+            text: String::new(),
+            count: 0,
+            prompt_len: n,
+            sink_size: sink,
+            window_size: window,
+            kv_len: 0,
+            visible_kv: 0,
+        });
+    }
     let stop_tokens = chat::stop_tokens();
     let pool_pages = (n + input.max_tokens as u32 + 2).div_ceil(page_t);
     let pool_len = pool_pages * page_t;
@@ -91,7 +148,10 @@ async fn main(input: Input) -> Result<String> {
             );
         }
         model::ForwardKind::Diffusion => {
-            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+            return Err(
+                "this program decodes a token at a time; a diffusion model wants a canvas loop"
+                    .into(),
+            );
         }
     };
     let slots = ws
@@ -164,7 +224,7 @@ async fn main(input: Input) -> Result<String> {
     }
     if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
         pipeline.close();
-        return model::decode(&generated);
+        return report(&generated, n, sink, window, 0);
     }
 
     let token_in = Channel::from([first as i32]).named("token_in");
@@ -236,8 +296,12 @@ async fn main(input: Input) -> Result<String> {
     });
 
     let budget = input.max_tokens.saturating_sub(generated.len());
+    // Decode fires whose token came back — a stop token's fire wrote its KV
+    // position like any other, so it counts toward `kv_len`.
+    let mut fires = 0u32;
     run_ahead(&pipeline, &decode, budget, async || {
         let token = token_out.take_host::<i32>().await? as u32;
+        fires += 1;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }
@@ -248,5 +312,5 @@ async fn main(input: Input) -> Result<String> {
     // Any fire still in flight after an early stop is left untaken; close
     // releases the scheduler wait-set and reclaims them.
     pipeline.close();
-    model::decode(&generated)
+    report(&generated, n, sink, window, fires)
 }
