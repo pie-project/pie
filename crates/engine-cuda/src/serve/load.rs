@@ -638,6 +638,22 @@ impl Shell {
             boot.budget.max_lanes,
             shell.out_width().map_or(0, |width| width.saturating_mul(4)),
         );
+        let decoded = crate::store::decoded_weight_reserve(
+            widest_affine_plane(&shell.trace, shell.weights.table()),
+            shell.compiled.streams.streams,
+        );
+        let held_for_fires = programs.saturating_add(decoded);
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!(
+                "[arm-trace] held for fires: guest programs {} MiB at {} lanes, decoded-weight \
+                 tiles {} MiB ({} MiB widest plane on {} stream(s))",
+                programs >> 20,
+                boot.budget.max_lanes,
+                decoded >> 20,
+                widest_affine_plane(&shell.trace, shell.weights.table()) >> 20,
+                shell.compiled.streams.streams,
+            );
+        }
         let footprint = |shell: &Shell| Footprint {
             total: device_total,
             before: device_total.saturating_sub(free_before),
@@ -652,6 +668,10 @@ impl Shell {
                 .map_or(0, crate::scores::Scores::bytes),
             cache_rows: shell.pools.committed_bytes(),
             bodies: shell.cache.body_stats().census.bytes as u64,
+            scratch: kernels_cuda::jit::Slabs::census()
+                .iter()
+                .map(|(_, bytes)| *bytes as u64)
+                .sum(),
         };
         let bodies = if shell.records_bodies() {
             shell.bodies_mem as u64
@@ -659,7 +679,9 @@ impl Shell {
             0
         };
         let resident = footprint(&shell);
-        let fitted = shell.pools.fit_the_card(bodies, programs, &resident)?;
+        let fitted = shell
+            .pools
+            .fit_the_card(bodies, held_for_fires, &resident)?;
         if fitted.bodies < bodies {
             eprintln!(
                 "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
@@ -694,20 +716,31 @@ impl Shell {
         }
         shell.arm_bodies()?;
         let resident = footprint(&shell);
-        let fitted = shell.pools.fit_the_card(0, programs, &resident)?;
+        let fitted = shell.pools.fit_the_card(0, held_for_fires, &resident)?;
         if fitted.fit != fitted.asked {
             let paging = shell.pools.paging();
             eprintln!(
                 "engine-cuda: the pool was declared {} pages ({} MiB), past the {} MiB this card \
                  hands out for the cache rows under [engine] gpu_mem_utilization once {} MiB is \
-                 held for the programs guests register at {} lanes ({resident}); sized to {} \
-                 pages ({} MiB), {} sequences at the declared context. State [engine] \
-                 max_total_pages to choose the count.",
+                 held for the programs guests register at {} lanes and {} MiB for the \
+                 decoded-weight tiles on {} stream(s){} ({resident}); sized to {} pages ({} \
+                 MiB), {} sequences at the declared context. State [engine] max_total_pages \
+                 to choose the count.",
                 fitted.asked,
                 shell.pools.declared_at(fitted.asked) >> 20,
                 fitted.room >> 20,
-                fitted.held >> 20,
+                programs >> 20,
                 boot.budget.max_lanes,
+                decoded >> 20,
+                shell.compiled.streams.streams,
+                if fitted.held < held_for_fires {
+                    format!(
+                        ", held down to {} MiB together so one sequence seats",
+                        fitted.held >> 20
+                    )
+                } else {
+                    String::new()
+                },
                 fitted.fit,
                 shell.pools.declared_bytes() >> 20,
                 fitted.fit / u64::from(paging.pages_per_slot),
@@ -735,6 +768,7 @@ struct Footprint {
     scores: u64,
     cache_rows: u64,
     bodies: u64,
+    scratch: u64,
 }
 
 impl core::fmt::Display for Footprint {
@@ -743,7 +777,8 @@ impl core::fmt::Display for Footprint {
             f,
             "the device holds {} bytes, {} of them in use before this load began; this load \
              put down weights {}, activation arena {}, inputs {}, buffered activations {}, \
-             readout rows {}, attention scores {}, cache rows {}, graph bodies {}",
+             readout rows {}, attention scores {}, cache rows {}, graph bodies {}, kernel \
+             scratch {}",
             self.total,
             self.before,
             self.weights,
@@ -754,8 +789,42 @@ impl core::fmt::Display for Footprint {
             self.scores,
             self.cache_rows,
             self.bodies,
+            self.scratch,
         )
     }
+}
+
+/// The widest plane this load decodes to bf16 before a dense gemm: every
+/// weight the table seats as codes and scales, at the `[n, k]` the trace
+/// declares for it, two bytes an element.
+fn widest_affine_plane(trace: &model_ir::Trace, table: &crate::run::WeightTable) -> u64 {
+    trace
+        .values
+        .iter()
+        .filter_map(|decl| {
+            let model_ir::Def::Weight(w) = &decl.def else {
+                return None;
+            };
+            let model_ir::Ty::Tensor { shape, .. } = &decl.ty else {
+                return None;
+            };
+            table
+                .0
+                .get(*w as usize)
+                .and_then(Option::as_ref)
+                .filter(|row| matches!(row, crate::run::WeightRow::Planes { .. }))?;
+            Some(
+                shape
+                    .iter()
+                    .map(|dim| match dim {
+                        model_ir::Dim::Const(n) => *n,
+                        _ => 1,
+                    })
+                    .fold(2u64, u64::saturating_mul),
+            )
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64 {

@@ -1,8 +1,8 @@
 use engine_cuda::device::elastic::map_unit_for;
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
 use engine_cuda::store::{
-    Accounting, BODIES_FLOOR_BYTES, bodies_allowance, pages_within, program_scratch_reserve,
-    tokens_within,
+    Accounting, BODIES_FLOOR_BYTES, bodies_allowance, decoded_weight_reserve, pages_within,
+    program_scratch_reserve, tokens_within,
 };
 use engine_cuda::{DeviceBoot, Knobs};
 
@@ -34,6 +34,54 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     the_declared_pool_is_sized_to_what_the_card_hands_out();
     the_pool_leaves_room_for_the_programs_guests_register();
     the_reservations_scale_to_a_twenty_four_gigabyte_card();
+    the_decoded_weight_tiles_are_held_out_of_the_pool();
+}
+
+fn the_decoded_weight_tiles_are_held_out_of_the_pool() {
+    // pie-evals nightly 35998007139 on an L40S: gemma-4-31b 4-bit fitted its
+    // pool to 6456 MiB with 1024 MiB held for the guests, then the first
+    // prefill's `linear.matmul` died in `cudaMalloc`: an affine plane is
+    // decoded to bf16 before the dense gemm, into a scratch the pool never
+    // held out. The widest such plane is the lm_head, vocab 262144 by hidden
+    // 5376; the mlp planes are 21504 by 5376.
+    const VOCAB: u64 = 262_144;
+    const HIDDEN: u64 = 5376;
+    const INTERMEDIATE: u64 = 21_504;
+    const POOL_ROOM: u64 = 6456 << 20;
+    const ONE_SLOT_4K: u64 = 3520 << 20;
+    const GRAIN: u64 = 8 << 20;
+
+    let lm_head = VOCAB * HIDDEN * 2;
+    let mlp = INTERMEDIATE * HIDDEN * 2;
+    assert_eq!(lm_head, 2_818_572_288);
+    assert_eq!(mlp, 231_211_008);
+
+    let tile = decoded_weight_reserve(lm_head, 1);
+    assert_eq!(
+        tile,
+        lm_head.next_multiple_of(GRAIN),
+        "one tile a stream, in the scratch grain"
+    );
+    assert_eq!(
+        decoded_weight_reserve(lm_head, 2),
+        2 * tile,
+        "a side stream holds its own"
+    );
+    assert_eq!(
+        decoded_weight_reserve(0, 4),
+        0,
+        "a dense load decodes nothing"
+    );
+    assert!(
+        POOL_ROOM - tile >= ONE_SLOT_4K,
+        "held out of the fitted pool, the L40S still seats a 4k sequence: {} MiB left",
+        (POOL_ROOM - tile) >> 20
+    );
+    assert!(
+        60 * 7 * mlp > 48 << 30,
+        "one tile a region, as it was, is more than the card: {} MiB",
+        (60 * 7 * mlp) >> 20
+    );
 }
 
 fn the_reservations_scale_to_a_twenty_four_gigabyte_card() {

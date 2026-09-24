@@ -167,6 +167,20 @@ pub fn program_scratch_reserve(max_lanes: u32, out_row_bytes: u64) -> u64 {
         .min(eta_exec::SCRATCH_MAX_BYTES)
 }
 
+/// What the decoded-weight tiles take on this load: a plane stored in codes
+/// and scales is decoded to bf16 before a prefill's dense gemm reads it,
+/// into one tile a stream the size of the widest plane fired on it, in the
+/// 8 MiB grain the scratch grows by. The pool holds this out for them as it
+/// does for the guests' programs, since the tiles are taken at fire time.
+#[must_use]
+pub fn decoded_weight_reserve(widest_plane_bytes: u64, streams: u32) -> u64 {
+    const GRAIN: u64 = 8 << 20;
+    widest_plane_bytes
+        .checked_next_multiple_of(GRAIN)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::from(streams.max(1)))
+}
+
 /// The largest page count at or under `asked` whose watermark fits `room`,
 /// or zero when not even the first page does. `declared_at` is the watermark
 /// at a page count and only ever grows with it, so this is a bisection over

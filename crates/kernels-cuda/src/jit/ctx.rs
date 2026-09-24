@@ -243,6 +243,29 @@ impl Ctx {
         }
     }
 
+    /// A slab one per stream, whatever region asks: for a tile a launch
+    /// fills and the next launch on the same stream consumes, so a model
+    /// with hundreds of such regions holds one tile a stream, not one a
+    /// region. A capture sees the slab as it was warmed, so arming fires
+    /// the widest plane eagerly first.
+    pub fn scratch_stream(
+        &self,
+        op: &'static str,
+        name: &'static str,
+        bytes: usize,
+    ) -> Result<*mut c_void, Error> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::jit::device::take(self.slabs.0, self.stream, name, NO_REGION, bytes)
+                .map_err(|fault| fault.at(op))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (name, bytes);
+            Err(crate::jit::runtimeless(op))
+        }
+    }
+
     pub fn scratch_shared(
         &self,
         op: &'static str,
