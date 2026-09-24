@@ -45,6 +45,7 @@ def build_engine(args: argparse.Namespace, max_running_requests: int):
     supported = server_arg_names(ServerArgs)
     engine_kwargs = {
         "model_path": args.model,
+        "trust_remote_code": True,  # a shrunk checkpoint (pie-evals miniature) keeps the family's modeling code
         "mem_fraction_static": args.gpu_mem_util,
         "disable_cuda_graph": args.sglang_disable_cuda_graph,
         "disable_radix_cache": True,
