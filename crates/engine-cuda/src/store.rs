@@ -96,13 +96,14 @@ impl Accounting {
 }
 
 /// What `Pools::fit_the_card` did when the declared pool was larger than
-/// the card: the page count asked, the count it was sized to, and the bytes
-/// the card had for the cache rows.
+/// the card: the page count asked, the count it was sized to, the bytes the
+/// card had for the cache rows, and what was held back from them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fitted {
     pub asked: u64,
     pub fit: u64,
     pub room: u64,
+    pub held: u64,
 }
 
 /// The largest page count at or under `asked` whose watermark fits `room`,
@@ -169,7 +170,7 @@ pub fn admit_the_card(
     }
     .saturating_add(extra_resident);
     let accounting = Accounting::of(
-        card_bytes()?,
+        device_memory()?.1,
         utilization,
         weights,
         one_slot_bytes(trace, paging)?,
@@ -178,7 +179,8 @@ pub fn admit_the_card(
     Ok(accounting)
 }
 
-fn card_bytes() -> Result<u64> {
+/// The device's free and total bytes, as the driver reports them now.
+pub fn device_memory() -> Result<(u64, u64)> {
     #[cfg(feature = "cuda")]
     {
         use cudarc::runtime::sys as rt;
@@ -187,7 +189,7 @@ fn card_bytes() -> Result<u64> {
         // SAFETY: two live locals; the call only writes them.
         let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
         crate::device::ctx::check("cudaMemGetInfo", asked)?;
-        Ok(total as u64)
+        Ok((free as u64, total as u64))
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -264,6 +266,7 @@ pub struct Pools {
     shapes: Vec<Shape>,
     pooled: Vec<PoolRow>,
     paging: Paging,
+    asked: u64,
     airborne: Option<Airborne>,
     committed_kv_pages: u32,
     committed_state_slots: u32,
@@ -380,6 +383,7 @@ impl Pools {
             shapes,
             pooled,
             paging,
+            asked: paging.pages(),
             airborne: None,
             committed_kv_pages: 0,
             committed_state_slots: 0,
@@ -496,41 +500,47 @@ impl Pools {
     /// device, and the watermark it declares is what `spare_bytes` holds back
     /// and what the runtime admits frames against, so a pool declared past
     /// what the card can back turns every growth into a refusal the runtime's
-    /// static admission has already forbidden. Called once everything else
-    /// this load puts on the device is resident; `held_back` is what arming
-    /// is entitled to ahead of the cache rows. Refuses when not even one
-    /// sequence at the declared context fits.
-    pub fn fit_the_card(&mut self, held_back: u64) -> Result<Option<Fitted>> {
-        let room = self
+    /// static admission has already forbidden. The fit is against the elastic
+    /// budget as it stands now, so it is called once everything else this
+    /// load puts on the device is resident, and again after arming, when the
+    /// bodies have taken what they take and the rest is the cache rows' to
+    /// declare (the count grows back toward what was asked, never past it).
+    /// `held_back` is what arming is entitled to ahead of the cache rows; it
+    /// yields before one sequence at the declared context does, since a pool
+    /// under one sequence is no deployment. `resident` spells what is on the
+    /// device already, for the refusal when not even that sequence fits.
+    pub fn fit_the_card(
+        &mut self,
+        held_back: u64,
+        resident: &dyn core::fmt::Display,
+    ) -> Result<Option<Fitted>> {
+        let live = self
             .pool
             .spare_bytes(0)?
-            .saturating_add(self.committed_bytes())
-            .saturating_sub(held_back);
-        let asked = self.paging.pages();
-        if self.declared_at(asked) <= room {
-            return Ok(None);
-        }
-        let fit = pages_within(asked, room, |pages| self.declared_at(pages));
-        let one_slot = u64::from(self.paging.pages_per_slot);
+            .saturating_add(self.committed_bytes());
+        let one_slot = u64::from(self.paging.pages_per_slot).min(self.asked);
+        let need = self.declared_at(one_slot);
+        let held = held_back.min(live.saturating_sub(need));
+        let room = live.saturating_sub(held);
+        let fit = pages_within(self.asked, room, |pages| self.declared_at(pages));
         if fit < one_slot {
             return Err(Fault::Residency(format!(
-                "the card does not hold this deployment: with the weights, activations and \
-                 inputs resident, the elastic budget under `[engine] gpu_mem_utilization` \
-                 leaves {room} bytes for the cache rows{bodies}, and one sequence at the \
-                 declared context, beside the declared state slots, needs {need} across \
-                 them. Lower `[engine] max_model_len` \
-                 or `[engine] max_state_slots`, raise `[engine] gpu_mem_utilization`, or \
-                 state a `[model] device_weight_budget` that streams the weight tier down.",
-                bodies = if held_back == 0 {
-                    String::new()
-                } else {
-                    format!(" after {held_back} held for `[engine] bodies_mem`")
-                },
-                need = self.declared_at(one_slot),
+                "the card does not hold this deployment: {resident}; under `[engine] \
+                 gpu_mem_utilization` that leaves {room} bytes for the cache rows, and one \
+                 sequence at the declared context, beside the declared state slots, needs \
+                 {need} across them. Lower `[engine] max_model_len` or `[engine] \
+                 max_state_slots`, raise `[engine] gpu_mem_utilization`, state a `[model] \
+                 device_weight_budget` that streams the weight tier down, or free what \
+                 else holds the device."
             )));
         }
         self.paging.pages = fit;
-        Ok(Some(Fitted { asked, fit, room }))
+        Ok((fit != self.asked).then_some(Fitted {
+            asked: self.asked,
+            fit,
+            room,
+            held,
+        }))
     }
 
     pub(crate) fn reserve_arena(&self, max_bytes: u64, label: &'static str) -> Result<Arena> {
