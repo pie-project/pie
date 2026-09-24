@@ -229,6 +229,50 @@ pub fn masked(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn masked_lse(
+    ctx: &Ctx<'_>,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    mask: Tensor,
+    pool: &KvPool,
+    window: Option<u32>,
+    causal: bool,
+    head_dim: u32,
+    sm_scale: f32,
+    o: Tensor,
+    lse: Tensor,
+    requests: u32,
+    tuning: &DeviceTuning,
+) -> Result<(), Error> {
+    const OP: &str = "attention.masked_lse";
+    if mask.dtype != dtype::Dtype::U8 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the mask this op states is {:?}, and the shader reads packed u8 mask planes",
+                mask.dtype
+            ),
+        ));
+    }
+    arbitrate(
+        ctx,
+        OP,
+        q.data,
+        pool,
+        plan,
+        mask,
+        window,
+        causal,
+        head_dim,
+        sm_scale,
+        o,
+        Some(lse),
+        requests,
+        tuning,
+    )
+}
+
 #[cfg(test)]
 mod tests {
 

@@ -73,6 +73,15 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             head_dim,
             kv_heads,
             ..
+        }
+        | Attention::MaskedLse {
+            q,
+            plan,
+            cache,
+            window,
+            head_dim,
+            kv_heads,
+            ..
         } => Some(Reader {
             q: *q,
             plan: *plan,

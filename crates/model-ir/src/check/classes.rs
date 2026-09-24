@@ -423,6 +423,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::DecodeRel { .. }
             | Attention::PrefillRel { .. }
             | Attention::Masked { .. }
+            | Attention::MaskedLse { .. }
             | Attention::Dense { .. }
             | Attention::Ragged { .. }
             | Attention::DecodeLse { .. }

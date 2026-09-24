@@ -27,6 +27,7 @@ pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel
             | Attention::DecodeRel { plan, .. }
             | Attention::PrefillRel { plan, .. }
             | Attention::Masked { plan, .. }
+            | Attention::MaskedLse { plan, .. }
             | Attention::DecodeSelected { plan, .. }
             | Attention::PrefillSelected { plan, .. } => *plan,
             _ => continue,

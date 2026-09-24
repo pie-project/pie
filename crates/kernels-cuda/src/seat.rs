@@ -37,6 +37,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("attention.decode_lse", Reads::RowsAndLanes),
     entry("attention.decode_rel", Reads::RowsAndLanes),
     entry("attention.masked", Reads::RowsAndLanes),
+    entry("attention.masked_lse", Reads::RowsAndLanes),
     entry("attention.prefill", Reads::RowsAndLanes),
     entry("attention.prefill_selected", Reads::RowsAndLanes),
     entry("attention.prefill_lse", Reads::RowsAndLanes),

@@ -238,6 +238,7 @@ impl Run<'_> {
                 self.tensor(*o),
             ),
             Attention::Masked { causal: false, .. }
+            | Attention::MaskedLse { causal: false, .. }
             | Attention::BlockDynConv { .. }
             | Attention::SelectorWalk { .. }
             | Attention::Ragged { .. } => Err(kernels_vulkan::Error::Unsupported { op: op.name() }),
@@ -268,6 +269,32 @@ impl Run<'_> {
                 *head_dim,
                 *sm_scale,
                 self.tensor(*o),
+                self.requests(),
+                &kernels_vulkan::tuning::current(),
+            ),
+            Attention::MaskedLse {
+                q,
+                plan,
+                mask,
+                cache,
+                window,
+                head_dim,
+                kv_heads: _,
+                causal: _,
+                sm_scale,
+                o,
+                lse,
+            } => attn::arbiter::masked_lse(
+                self.ctx(),
+                self.ragged(*q),
+                self.prefill_plan(*plan),
+                self.cut_rows(self.tensor(*mask)),
+                self.pool(*cache),
+                *window,
+                *head_dim,
+                *sm_scale,
+                self.tensor(*o),
+                self.tensor(*lse),
                 self.requests(),
                 &kernels_vulkan::tuning::current(),
             ),
