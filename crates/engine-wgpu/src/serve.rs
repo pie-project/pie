@@ -376,7 +376,7 @@ impl Shell {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
                     Some(model_ir::Operation::Attention(
-                        model_ir::Attention::Masked { .. }
+                        model_ir::Attention::Masked { .. } | model_ir::Attention::MaskedLse { .. }
                     ))
                 )
             });

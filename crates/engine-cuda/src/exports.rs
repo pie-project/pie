@@ -254,7 +254,9 @@ pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> model_i
     classes_running(trace, compiled, |op| {
         matches!(
             op,
-            model_ir::Operation::Attention(model_ir::Attention::Masked { .. })
+            model_ir::Operation::Attention(
+                model_ir::Attention::Masked { .. } | model_ir::Attention::MaskedLse { .. }
+            )
         )
     })
 }

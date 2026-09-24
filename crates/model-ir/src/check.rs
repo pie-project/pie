@@ -529,6 +529,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::Decode { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE)],
             Attention::Prefill { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE)],
             Attention::Masked { .. } => &[(In(1), PREFILL_PLAN), (In(3), CACHE)],
+            Attention::MaskedLse { .. } => &[(In(1), PREFILL_PLAN), (In(3), CACHE), (Out(1), F32)],
             Attention::Dense { .. } => &[(In(3), I32)],
             Attention::Ragged {
                 mask: RaggedMask::ReferenceSelfOnly { .. },

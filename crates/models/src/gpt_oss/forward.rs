@@ -6,6 +6,8 @@ pub struct Facts {
     pub qo_one: bool,
     pub has_adapter: bool,
     pub block_draft: bool,
+    pub captures_scores: bool,
+    pub masked: bool,
 }
 
 impl Facts {
@@ -20,6 +22,14 @@ impl Facts {
     pub fn block_draft() -> Predicate {
         Predicate::fact(2)
     }
+
+    pub fn captures_scores() -> Predicate {
+        Predicate::fact(3)
+    }
+
+    pub fn masked() -> Predicate {
+        Predicate::fact(4)
+    }
 }
 
 impl Classify for Facts {
@@ -28,6 +38,8 @@ impl Classify for Facts {
             qo_one: r.query_len() == 1,
             has_adapter: r.has_adapter(),
             block_draft: r.drafts_a_block(),
+            captures_scores: r.captures_scores(),
+            masked: r.has_custom_mask(),
         }
     }
 
@@ -35,6 +47,8 @@ impl Classify for Facts {
         u64::from(self.qo_one)
             | (u64::from(self.has_adapter) << 1)
             | (u64::from(self.block_draft) << 2)
+            | (u64::from(self.captures_scores) << 3)
+            | (u64::from(self.masked) << 4)
     }
 }
 
@@ -63,7 +77,21 @@ impl ForwardHybrid for Model {
             None => (inputs.clone(), inputs.clone()),
         };
         let positions = trunk_inputs.positions();
-        let (input_d, input_p) = trunk_inputs.split(&Facts::qo_one());
+        let classes = [
+            Facts::masked(),
+            Facts::captures_scores(),
+            Facts::qo_one(),
+            Predicate::rest(),
+        ];
+        let [input_m, input_s, input_d, input_p] = trunk_inputs.split(classes.clone());
+        let plan_m = [
+            ops::attn::plan_prefill(&input_m, m.q_heads, m.kv_heads, m.head_dim, Some(m.window)),
+            ops::attn::plan_prefill(&input_m, m.q_heads, m.kv_heads, m.head_dim, None),
+        ];
+        let plan_s = [
+            ops::attn::plan_prefill(&input_s, m.q_heads, m.kv_heads, m.head_dim, Some(m.window)),
+            ops::attn::plan_prefill(&input_s, m.q_heads, m.kv_heads, m.head_dim, None),
+        ];
         let plan_d = [
             ops::attn::plan_decode(&input_d, m.q_heads, m.kv_heads, m.head_dim, Some(m.window)),
             ops::attn::plan_decode(&input_d, m.q_heads, m.kv_heads, m.head_dim, None),
@@ -117,8 +145,37 @@ impl ForwardHybrid for Model {
                 Reading::Windowed => Some(m.window),
                 Reading::Full => None,
             };
-            let (dq, p) = q.split(&Facts::qo_one());
+            let [mq, sq, dq, p] = q.split(classes.clone());
             let a = Value::merge(vec![
+                {
+                    let (o, lse) = ops::attn::masked_lse(
+                        &mq,
+                        &plan_m[at.reading as usize],
+                        &mask,
+                        pages,
+                        win,
+                        d,
+                        m.kv_heads,
+                        true,
+                        at.sm_scale,
+                    );
+                    ops::attn::sink(&o, &lse, &at.sinks, d)
+                },
+                {
+                    let (o, lse) = ops::attn::prefill_lse(
+                        &sq,
+                        &plan_s[at.reading as usize],
+                        pages,
+                        win,
+                        d,
+                        m.kv_heads,
+                        at.sm_scale,
+                    );
+                    if let Reading::Full = at.reading {
+                        seam::at(seam::SCORES, &[&lse]);
+                    }
+                    ops::attn::sink(&o, &lse, &at.sinks, d)
+                },
                 {
                     let (o, lse) = ops::attn::decode_lse(
                         &dq,
