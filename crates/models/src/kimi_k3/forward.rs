@@ -234,6 +234,7 @@ impl ForwardHybrid for Model {
             _ => y,
         };
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
+        let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = ops::linear::lm_head(&x, &m.head);
         if m.head.dim(0) < u64::from(m.vocab) {
             ops::collective::all_gather(&logits, m.tp)
