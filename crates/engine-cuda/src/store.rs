@@ -124,6 +124,19 @@ pub fn bodies_allowance(configured: u64, room: u64) -> u64 {
     configured.min(room).min((room / 4).max(BODIES_FLOOR_BYTES))
 }
 
+/// What is held for the bodies and the guests' programs together on a
+/// card with `spare` bytes past one sequence, in the order they yield: the
+/// bodies' floor first, since a load with no armed body walks every step
+/// eagerly and that is no serve, then the programs, then the bodies' share
+/// of what is left. Returns `(bodies, programs)`.
+#[must_use]
+pub fn holds_within(configured: u64, programs: u64, spare: u64) -> (u64, u64) {
+    let floor = configured.min(BODIES_FLOOR_BYTES).min(spare);
+    let programs = programs.min(spare.saturating_sub(floor));
+    let bodies = bodies_allowance(configured, spare.saturating_sub(programs)).max(floor);
+    (bodies, programs)
+}
+
 /// The largest token budget at or under `max_tokens`, halving toward
 /// `floor`, whose working set (`working`, the activation arena and the
 /// attention workspaces at that budget) fits `room`. Halving keeps the
@@ -688,11 +701,9 @@ impl Pools {
             self.declared_at(one_slot)
         };
         let configured = bodies;
-        let programs = programs.min(live.saturating_sub(need));
-        let mut bodies = bodies_allowance(
-            configured,
-            live.saturating_sub(need).saturating_sub(programs),
-        );
+        let asked_programs = programs;
+        let (mut bodies, mut programs) =
+            holds_within(configured, asked_programs, live.saturating_sub(need));
         let mut held = programs.saturating_add(bodies);
         let mut room = live.saturating_sub(held);
         let mut fit = pages_within(self.ceiling, room, |pages| self.declared_at(pages));
@@ -742,10 +753,8 @@ impl Pools {
                 need = self.declared_at(one_slot);
                 // The slab the slots gave back is room the bodies were
                 // refused when the allowance was struck; strike it again.
-                bodies = bodies_allowance(
-                    configured,
-                    live.saturating_sub(need).saturating_sub(programs),
-                );
+                (bodies, programs) =
+                    holds_within(configured, asked_programs, live.saturating_sub(need));
                 held = programs.saturating_add(bodies);
                 room = live.saturating_sub(held);
                 fit = pages_within(self.ceiling, room, |pages| self.declared_at(pages));

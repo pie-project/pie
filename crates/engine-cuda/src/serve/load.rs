@@ -647,20 +647,48 @@ impl Shell {
             boot.budget.max_lanes,
             shell.out_width().map_or(0, |width| width.saturating_mul(4)),
         );
-        let decoded = crate::store::decoded_weight_reserve(
-            widest_affine_plane(&shell.trace, shell.weights.table()),
-            shell.compiled.streams.streams,
-        );
-        let held_for_fires = programs.saturating_add(decoded);
+        // A plane stored as codes and scales is decoded to bf16 before a
+        // prefill's dense gemm, into one tile a stream. The tile is taken
+        // now, at the widest plane the regions on each stream read, so the
+        // fit sees it resident and no fire — a capture least of all — has to
+        // grow it: a load whose bodies are held to nothing arms no body at
+        // load, and its first fire is a capture.
+        let tiles = decoded_weight_tiles(&shell.trace, &shell.compiled, shell.weights.table());
+        let mut decoded = 0u64;
+        for (stream, plane) in tiles.iter().enumerate() {
+            let tile = crate::store::decoded_weight_reserve(*plane, 1);
+            let ctx = match stream {
+                0 => Some(shell.device.ctx()),
+                n => shell.device.side_ctx().get(n - 1).copied(),
+            };
+            let Some(ctx) = ctx else {
+                continue;
+            };
+            kernels_cuda::linear::quant::warm_decoded_weight(ctx, tile).map_err(|why| {
+                Fault::Residency(format!(
+                    "the card does not hold this deployment: the decoded-weight tile stream \
+                     {stream} decodes its widest plane into, {tile} bytes, would not allocate \
+                     beside the weights, activations and inputs ({why}). Lower `[model] \
+                     device_weight_budget`, raise `[engine] gpu_mem_utilization`, or free what \
+                     else holds the device."
+                ))
+            })?;
+            decoded = decoded.saturating_add(tile);
+        }
+        let held_for_fires = programs;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
-                "[arm-trace] held for fires: guest programs {} MiB at {} lanes, decoded-weight \
-                 tiles {} MiB ({} MiB widest plane on {} stream(s))",
+                "[arm-trace] held for fires: guest programs {} MiB at {} lanes; decoded-weight \
+                 tiles taken at load: {} MiB over {} stream(s) ({})",
                 programs >> 20,
                 boot.budget.max_lanes,
                 decoded >> 20,
-                widest_affine_plane(&shell.trace, shell.weights.table()) >> 20,
-                shell.compiled.streams.streams,
+                tiles.len(),
+                tiles
+                    .iter()
+                    .map(|plane| format!("{}", plane >> 20))
+                    .collect::<Vec<String>>()
+                    .join("/"),
             );
         }
         let footprint = |shell: &Shell| Footprint {
@@ -731,21 +759,18 @@ impl Shell {
             eprintln!(
                 "engine-cuda: the pool was declared {} pages ({} MiB), past the {} MiB this card \
                  hands out for the cache rows under [engine] gpu_mem_utilization once {} MiB is \
-                 held for the programs guests register at {} lanes and {} MiB for the \
-                 decoded-weight tiles on {} stream(s){} ({resident}); sized to {} pages ({} \
-                 MiB), {} sequences at the declared context. State [engine] max_total_pages \
-                 to choose the count.",
+                 held for the programs guests register at {} lanes{} ({resident}); sized to {} \
+                 pages ({} MiB), {} sequences at the declared context. State [engine] \
+                 max_total_pages to choose the count.",
                 fitted.asked,
                 shell.pools.declared_at(fitted.asked) >> 20,
                 fitted.room >> 20,
                 programs >> 20,
                 boot.budget.max_lanes,
-                decoded >> 20,
-                shell.compiled.streams.streams,
-                if fitted.held < held_for_fires {
+                if fitted.held.saturating_sub(fitted.bodies) < held_for_fires {
                     format!(
-                        ", held down to {} MiB together so one sequence seats",
-                        fitted.held >> 20
+                        ", held down to {} MiB so one sequence and the bodies' floor seat",
+                        fitted.held.saturating_sub(fitted.bodies) >> 20
                     )
                 } else {
                     String::new()
@@ -803,37 +828,61 @@ impl core::fmt::Display for Footprint {
     }
 }
 
-/// The widest plane this load decodes to bf16 before a dense gemm: every
-/// weight the table seats as codes and scales, at the `[n, k]` the trace
-/// declares for it, two bytes an element.
-fn widest_affine_plane(trace: &model_ir::Trace, table: &crate::run::WeightTable) -> u64 {
-    trace
-        .values
-        .iter()
-        .filter_map(|decl| {
-            let model_ir::Def::Weight(w) = &decl.def else {
-                return None;
+/// Per stream, the widest plane the regions launched on it decode to bf16
+/// before a dense gemm: every weight the table seats as codes and scales
+/// that a region on that stream reads, at the `[n, k]` the trace declares
+/// for it, two bytes an element. Index 0 is the main stream, `n` the
+/// `n`th side stream.
+fn decoded_weight_tiles(
+    trace: &model_ir::Trace,
+    compiled: &CompiledModel,
+    table: &crate::run::WeightTable,
+) -> Vec<u64> {
+    use model_ir::Operands;
+
+    let plane_bytes = |id: model_ir::ValueId| -> Option<u64> {
+        let decl = trace.values.get(id.0 as usize)?;
+        let model_ir::Def::Weight(w) = &decl.def else {
+            return None;
+        };
+        let model_ir::Ty::Tensor { shape, .. } = &decl.ty else {
+            return None;
+        };
+        table
+            .0
+            .get(*w as usize)
+            .and_then(Option::as_ref)
+            .filter(|row| matches!(row, crate::run::WeightRow::Planes { .. }))?;
+        Some(
+            shape
+                .iter()
+                .map(|dim| match dim {
+                    model_ir::Dim::Const(n) => *n,
+                    _ => 1,
+                })
+                .fold(2u64, u64::saturating_mul),
+        )
+    };
+    let mut tiles: Vec<u64> = vec![0; compiled.streams.streams.max(1) as usize];
+    let mut inputs: Vec<model_ir::ValueId> = Vec::new();
+    for region in compiled.template() {
+        let Some(slot) = tiles.get_mut(region.stream as usize) else {
+            continue;
+        };
+        for node in region.nodes.clone() {
+            let Some(node) = trace.nodes.get(node as usize) else {
+                continue;
             };
-            let model_ir::Ty::Tensor { shape, .. } = &decl.ty else {
-                return None;
-            };
-            table
-                .0
-                .get(*w as usize)
-                .and_then(Option::as_ref)
-                .filter(|row| matches!(row, crate::run::WeightRow::Planes { .. }))?;
-            Some(
-                shape
-                    .iter()
-                    .map(|dim| match dim {
-                        model_ir::Dim::Const(n) => *n,
-                        _ => 1,
-                    })
-                    .fold(2u64, u64::saturating_mul),
-            )
-        })
-        .max()
-        .unwrap_or(0)
+            inputs.clear();
+            node.op.inputs(&mut inputs);
+            for id in &inputs {
+                if let Some(bytes) = plane_bytes(*id) {
+                    *slot = (*slot).max(bytes);
+                }
+            }
+        }
+    }
+    tiles
 }
 
 fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64 {
