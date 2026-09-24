@@ -317,6 +317,10 @@ impl Shell {
             );
         }
         let buffers = Buffers::reserve(&boot.trace, paging, &pools)?;
+        let unbuffered = buffers
+            .is_none()
+            .then(|| crate::store::rs::unbuffered(&boot.trace))
+            .flatten();
         let mut pools = pools;
         let mut arena = Arena::reserve(&compiled.arena, &pools)?;
         arena.ensure(
@@ -485,6 +489,7 @@ impl Shell {
             arena,
             pools,
             buffers,
+            unbuffered,
             rs_scratch: None,
             predicate,
             inputs,
