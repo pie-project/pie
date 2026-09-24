@@ -201,12 +201,14 @@ pub fn pie_boot_lazy(config_toml: String, model_name: String, len: f64) -> js_sy
 }
 
 #[wasm_bindgen]
-pub fn pie_install_program(component: Vec<u8>, manifest_toml: String) -> js_sys::Promise {
+pub fn pie_install_program(
+    bytes: Vec<u8>,
+    file: String,
+    version: Option<String>,
+) -> js_sys::Promise {
     promise(async move {
-        let manifest = runtime::inferlet::program::Manifest::parse(&manifest_toml)?;
-        let name = manifest.program_name().to_string();
-        runtime::inferlet::program::add(component, manifest, true).await?;
-        Ok(JsValue::from_str(&name))
+        let name = runtime::inferlet::program::add(bytes, &file, version.as_deref(), true).await?;
+        Ok(JsValue::from_str(&name.to_string()))
     })
 }
 

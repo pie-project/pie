@@ -1,9 +1,9 @@
-import { PieClient } from "@pie-project/client";
+import { PieClient, programFile } from "@pie-project/client";
 
 import { socketClass } from "./transport.mjs";
 import { attachLanguages } from "./languages.mjs";
 
-export { PieClient };
+export { PieClient, programFile };
 
 const WASM_PATH = typeof __PIE_WASM__ === "undefined" ? "../pkg/pie_browser_bg.wasm" : __PIE_WASM__;
 
@@ -93,9 +93,9 @@ export async function connect() {
   return c;
 }
 
-export async function install(wasmBytes, manifestToml) {
-  const copy = new Uint8Array(wasmBytes).slice();
-  return await ready().call("install", [copy, manifestToml], { transfer: [copy.buffer] });
+export async function install(bytes, file, version = null) {
+  const copy = new Uint8Array(bytes).slice();
+  return await ready().call("install", [copy, file, version], { transfer: [copy.buffer] });
 }
 
 /** Hand the runtime a language component (`"python"`, `"javascript"`)
@@ -117,9 +117,12 @@ export async function awaitCache() {
   return await ready().call("awaitCache", []);
 }
 
+function isBytes(source) {
+  return source instanceof Uint8Array || source instanceof ArrayBuffer;
+}
+
 async function bytesOf(source) {
-  if (source instanceof Uint8Array) return source;
-  if (source instanceof ArrayBuffer) return new Uint8Array(source);
+  if (isBytes(source)) return new Uint8Array(source);
   const response = await fetch(source);
   if (!response.ok) throw new Error(`pie: ${source}: ${response.status} ${response.statusText}`);
   return new Uint8Array(await response.arrayBuffer());
@@ -171,10 +174,13 @@ export class Server {
     return installLanguage(language, await bytesOf(source));
   }
 
-  /** An inferlet from its component bytes (or URL) and manifest text, replacing an installed version. */
-  async install(source, manifest) {
+  async install(source, file = null, version = null) {
     this.#alive();
-    return install(await bytesOf(source), manifest);
+    if (!file) {
+      if (isBytes(source)) throw new Error("Server.install: bytes need `file`, the program's file name (`x.wasm`, `x.py`, `x.js`)");
+      file = programFile(new URL(source, location.href));
+    }
+    return install(await bytesOf(source), file, version);
   }
 
   /** A `PieClient` connected in-page. */

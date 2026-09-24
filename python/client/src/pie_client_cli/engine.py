@@ -278,20 +278,20 @@ def attach_process(client: PieClient, instance_id: str) -> Process:
 
 def install_program(
     client: PieClient,
-    wasm_path: str,
-    manifest_path: str,
+    path: str | Path,
+    version: Optional[str] = None,
     force_overwrite: bool = False,
-) -> None:
-    """Install a program (sync wrapper).
+) -> str:
+    """Install a program (sync wrapper); returns the installed `name@version`.
 
     Args:
         client: The PieClient instance.
-        wasm_path: Path to the WASM binary file.
-        manifest_path: Path to the manifest TOML file.
+        path: The `.wasm` component or `.py` / `.js` script; its file name names the program.
+        version: The version to install as; None takes the artifact's own, else a hash of its bytes.
         force_overwrite: If True, overwrite an existing program with the same name+version.
     """
-    asyncio.get_event_loop().run_until_complete(
-        client.install_program(wasm_path, manifest_path, force_overwrite=force_overwrite)
+    return asyncio.get_event_loop().run_until_complete(
+        client.install_program(path, version, force_overwrite=force_overwrite)
     )
 
 

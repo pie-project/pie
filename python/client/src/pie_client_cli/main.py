@@ -80,14 +80,15 @@ def submit(
     ] = None,
     path: Annotated[
         Optional[Path],
-        typer.Option("--path", "-p", help="Path to a local .wasm inferlet file"),
-    ] = None,
-    manifest: Annotated[
-        Optional[Path],
         typer.Option(
-            "--manifest",
-            "-m",
-            help="Path to the manifest TOML file (required when using --path)",
+            "--path", "-p", help="Path to a local inferlet: a .wasm component or a .py/.js script"
+        ),
+    ] = None,
+    version: Annotated[
+        Optional[str],
+        typer.Option(
+            "--version",
+            help="Version to install a --path inferlet as (default: the one it declares, else a hash)",
         ),
     ] = None,
     config: ConfigOption = None,
@@ -112,13 +113,13 @@ def submit(
     You can specify an inferlet either by installed name or by path (mutually exclusive):
 
     - By name: pie-client submit text-completion@0.1.0 -- --prompt "hello"
-    - By path: pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml -- --prompt "hello"
+    - By path: pie-client submit --path ./my_inferlet.wasm -- --prompt "hello"
     """
     try:
         submit_cmd.handle_submit_command(
             inferlet=inferlet,
             path=expand_path(path),
-            manifest=expand_path(manifest),
+            version=version,
             config=expand_path(config),
             host=host,
             port=port,
@@ -141,16 +142,15 @@ def submit(
 def install(
     path: Annotated[
         Path,
-        typer.Option("--path", "-p", help="Path to a local .wasm inferlet file"),
+        typer.Argument(help="Path to a local inferlet: a .wasm component or a .py/.js script"),
     ],
-    manifest: Annotated[
-        Path,
+    version: Annotated[
+        Optional[str],
         typer.Option(
-            "--manifest",
-            "-m",
-            help="Path to the manifest TOML file",
+            "--version",
+            help="Version to install as (default: the one the inferlet declares, else a hash)",
         ),
-    ],
+    ] = None,
     config: ConfigOption = None,
     host: HostOption = None,
     port: PortOption = None,
@@ -164,12 +164,14 @@ def install(
 ) -> None:
     """Install an inferlet to a running Pie engine without launching it.
 
-    Example: pie-client install --path ./my_inferlet.wasm --manifest ./Pie.toml
+    The file names the program (`my_inferlet.wasm` installs as `my-inferlet`).
+
+    Example: pie-client install ./my_inferlet.wasm
     """
     try:
         install_cmd.handle_install_command(
             path=expand_path(path),
-            manifest=expand_path(manifest),
+            version=version,
             config=expand_path(config),
             host=host,
             port=port,

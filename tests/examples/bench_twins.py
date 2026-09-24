@@ -26,7 +26,7 @@ import time
 
 from pie_client import Event, PieClient
 
-from conftest import find_artifact, inferlet_id
+from conftest import find_artifact
 
 SUFFIX = {"rust": "", "py": "-py", "js": "-js"}
 
@@ -99,12 +99,11 @@ async def main() -> int:
             for lang in a.langs.split(","):
                 name = which + SUFFIX[lang]
                 try:
-                    wasm, manifest = find_artifact(name)
+                    artifact = find_artifact(name)
                 except FileNotFoundError as e:
                     print(f"{name}: skipped ({e})")
                     continue
-                await client.install_program(wasm, manifest, force_overwrite=True)
-                iid = inferlet_id(manifest)
+                iid = await client.install_program(artifact, force_overwrite=True)
                 args = {**INPUTS.get(which, {"prompt": "The capital of France is"}), "max_tokens": a.max_tokens}
                 if a.prompt is not None:
                     args["prompt"] = a.prompt

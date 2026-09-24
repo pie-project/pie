@@ -22,7 +22,6 @@ import argparse
 import asyncio
 import sys
 import time
-import tomllib
 from pathlib import Path
 from typing import Callable, Coroutine
 
@@ -220,10 +219,11 @@ def _build_guests():
         print("Guests: built from source")
 
 
-def find_artifact(name: str) -> tuple[Path, Path]:
-    """The artifact and `Pie.toml` of the curated inferlet `name`: a script
-    twin's source (`main.py`, `index.js`), else the NEWEST `.wasm` among
-    the places a build leaves one.
+def find_artifact(name: str) -> Path:
+    """The artifact of the curated inferlet `name`: a script twin's source
+    (`main.py`, `index.js`), else the NEWEST `.wasm` among the places a
+    build leaves one. `client.install_program` names it by the file (a
+    script by its directory) and answers with the `name@version` to launch.
 
     Rust workspace artifacts live under this directory's target/ (release or
     debug); the member paths are fallbacks for inferlets built outside the
@@ -239,12 +239,9 @@ def find_artifact(name: str) -> tuple[Path, Path]:
     """
     wasm_name = name.replace("-", "_")
     inferlet_dir = INFERLETS_DIR / name
-    manifest_path = inferlet_dir / "Pie.toml"
     for script in ("main.py", "index.js"):
         if (inferlet_dir / script).exists():
-            if not manifest_path.exists():
-                raise FileNotFoundError(f"No Pie.toml at {manifest_path}")
-            return inferlet_dir / script, manifest_path
+            return inferlet_dir / script
     candidates = [
         INFERLETS_DIR / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
         INFERLETS_DIR / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
@@ -258,15 +255,7 @@ def find_artifact(name: str) -> tuple[Path, Path]:
         raise FileNotFoundError(
             f"No WASM binary for {name} (tried: {', '.join(str(p) for p in candidates)})"
         )
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"No Pie.toml at {manifest_path}")
-    return wasm_path, manifest_path
-
-
-def inferlet_id(manifest_path: Path) -> str:
-    """`name@version` from a `Pie.toml`, the id `launch_process` takes."""
-    manifest = tomllib.loads(manifest_path.read_text())
-    return f"{manifest['package']['name']}@{manifest['package']['version']}"
+    return wasm_path
 
 
 async def run_inferlet(
@@ -280,13 +269,12 @@ async def run_inferlet(
 
     Returns the concatenated stdout on success.
     Raises ``RuntimeError`` on error or timeout, ``FileNotFoundError`` if the
-    WASM binary or manifest is missing.
+    artifact is missing.
     """
     if extra_args is None:
         extra_args = []
-    wasm_path, manifest_path = find_artifact(name)
-    await client.install_program(wasm_path, manifest_path, force_overwrite=True)
-    process = await client.launch_process(inferlet_id(manifest_path), input=extra_args)
+    program = await client.install_program(find_artifact(name), force_overwrite=True)
+    process = await client.launch_process(program, input=extra_args)
 
     output_parts: list[str] = []
     start = time.time()

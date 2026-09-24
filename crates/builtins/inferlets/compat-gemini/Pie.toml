@@ -1,9 +1,0 @@
-[package]
-name = "compat-gemini"
-version = "0.1.0"
-description = "The Gemini API over the loaded model: /v1beta/models/{model}:generateContent and :streamGenerateContent"
-authors = ["Pie Team"]
-tier = "builtin"
-
-[runtime]
-core = "^0.2.0"

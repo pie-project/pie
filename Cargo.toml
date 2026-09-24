@@ -176,7 +176,7 @@ tempfile = "3"
 libc = "0.2"
 
 [workspace.package]
-version = "0.5.2"
+version = "0.5.4"
 
 rust-version = "1.91"
 

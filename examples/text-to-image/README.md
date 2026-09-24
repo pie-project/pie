@@ -7,8 +7,7 @@ job is a host-answered fact (imagegen design D1, D4, D11, D12).
 ## Run it
 
 Build the guest once, then run it by name. `pie run` finds a bare name in the
-`examples` of the checkout the command runs in, so no `--path` and no
-`--manifest`:
+`examples` of the checkout the command runs in, so no `--path`:
 
 ```bash
 cargo build -p text-to-image --release --target wasm32-wasip2   # from examples

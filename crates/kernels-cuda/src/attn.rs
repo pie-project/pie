@@ -724,16 +724,31 @@ pub fn res_blend(
         ));
     }
     let plane_bytes = u64::from(y.rows) * u64::from(y.width) * 2;
-    for pair in blocks.windows(2) {
-        if pair[1].ptr != pair[0].ptr.wrapping_add(plane_bytes) {
-            return Err(refuse(
+    let stacked = blocks
+        .windows(2)
+        .all(|pair| pair[1].ptr == pair[0].ptr.wrapping_add(plane_bytes));
+    // The kernel walks `blocks + (j * rows + t) * hidden`. The planner does not
+    // place the closed blocks side by side (they are residual snapshots taken
+    // layers apart), so scattered ones are staged into one stacked scratch.
+    let first = if stacked {
+        blocks.first().map_or(prefix.ptr, |b| b.ptr)
+    } else {
+        let span = usize::try_from(plane_bytes)
+            .ok()
+            .and_then(|p| p.checked_mul(blocks.len()))
+            .ok_or_else(|| refuse(OP, "the stacked blocks do not fit a usize"))?;
+        let stack = ctx.scratch(OP, "elemwise.res_blend_blocks", span)? as usize as u64;
+        for (j, block) in blocks.iter().enumerate() {
+            stage_plane(
+                ctx,
                 OP,
-                "the candidate blocks do not land as stacked planes; the kernel walks \
-                 `blocks + (j * rows + t) * hidden` and cannot gather scattered slots",
-            ));
+                stack + j as u64 * plane_bytes,
+                block.ptr,
+                plane_bytes,
+            )?;
         }
-    }
-    let first = blocks.first().map_or(prefix.ptr, |b| b.ptr);
+        stack
+    };
     ctx.fire(
         OP,
         Fire::at(
@@ -754,4 +769,37 @@ pub fn res_blend(
             ctx.stage(),
         ],
     )
+}
+
+/// One device-to-device plane copy on the context's stream.
+fn stage_plane(ctx: &Ctx, op: &'static str, dst: u64, src: u64, bytes: u64) -> Result<(), Error> {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        let code = unsafe {
+            rt::cudaMemcpyAsync(
+                dst as usize as *mut core::ffi::c_void,
+                src as usize as *const core::ffi::c_void,
+                usize::try_from(bytes).map_err(|_| refuse(op, "a plane wider than usize"))?,
+                rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                ctx.stream().cast(),
+            )
+        };
+        if code != rt::cudaError::cudaSuccess {
+            return Err(refuse(
+                op,
+                format!(
+                    "`cudaMemcpyAsync` answered {} stacking a block",
+                    code as i32
+                ),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ctx, dst, src, bytes);
+        Err(crate::jit::runtimeless(op))
+    }
 }

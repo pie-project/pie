@@ -49,6 +49,21 @@ function hashBytes(bytes) {
     return bytesToHex(blake3(bytes));
 }
 
+const PROGRAM_EXTENSION = { wasm: 'wasm', py: 'py', js: 'js', mjs: 'js' };
+
+export function programFile(path) {
+    const text = path instanceof URL ? decodeURIComponent(path.pathname) : String(path);
+    const parts = text.replace(/\\/g, '/').replace(/\/+$/, '').split('/');
+    const base = parts.pop();
+    const dot = base.lastIndexOf('.');
+    if (dot <= 0) throw new Error(`${text} has no extension; a program is a .wasm, .py or .js file`);
+    const extension = PROGRAM_EXTENSION[base.slice(dot + 1)];
+    if (!extension) throw new Error(`${text} is not a program pie can install; a program is a .wasm component or a .py / .js script`);
+    const stem = base.slice(0, dot);
+    const name = extension !== 'wasm' && (stem === 'main' || stem === 'index') ? (parts.pop() || stem) : stem;
+    return `${name.replace(/_/g, '-')}.${extension}`;
+}
+
 /**
  * One complete file an inferlet sent, with the name it suggested.
  *
@@ -113,17 +128,9 @@ export class ReceivedFile extends Bytes {
     }
 }
 
-/**
- * Represents a running process on the server.
- */
-/**
- * A JavaScript function readied to run on pie as an inferlet: its source
- * (the function's own text, as an ES module exporting it) and the manifest
- * that names it. Built by `inferlet()`.
- */
 export class Inferlet {
-    constructor({ fn, name, version, entry, source, description }) {
-        Object.assign(this, { fn, name, version, entry, source, description });
+    constructor({ fn, name, version, source }) {
+        Object.assign(this, { fn, name, version, source });
     }
 
     /** `name@version`, the id the server launches by. */
@@ -131,12 +138,8 @@ export class Inferlet {
         return `${this.name}@${this.version}`;
     }
 
-    manifestToml() {
-        const q = (s) => JSON.stringify(String(s));
-        const lines = ['[package]', `name = ${q(this.name)}`, `version = ${q(this.version)}`];
-        if (this.description) lines.push(`description = ${q(this.description)}`);
-        lines.push('', '[runtime]', 'language = "javascript"', `entry = ${q(this.entry)}`);
-        return lines.join('\n') + '\n';
+    get file() {
+        return `${this.name}.js`;
     }
 }
 
@@ -149,7 +152,6 @@ export class Inferlet {
  * ReferenceError on the server. The version is a hash of the source, so
  * an edit is a new program and an unchanged one is never re-uploaded.
  * @param {Function} fn
- * @param {{name?: string, version?: string, description?: string}} [options]
  * @returns {Inferlet}
  */
 export function inferlet(fn, options = {}) {
@@ -159,12 +161,11 @@ export function inferlet(fn, options = {}) {
     // and would not stand alone; an arrow or a function expression does.
     const isPlain = /^(async\s+)?function\b/.test(text) || /^(async\s*)?(\(|[A-Za-z_$][\w$]*\s*=>)/.test(text);
     if (!isPlain) throw new TypeError('inferlet() takes a function declaration, function expression or arrow function');
-    const entry = 'main';
-    const source = `export const ${entry} = ${text};\n`;
+    const source = `export const main = ${text};\n`;
     const name = options.name ?? (fn.name || 'inferlet').replace(/_/g, '-');
     const digest = hashBytes(new TextEncoder().encode(source));
     const version = options.version ?? `0.${parseInt(digest.slice(0, 4), 16)}.${parseInt(digest.slice(4, 8), 16)}`;
-    return new Inferlet({ fn, name, version, entry, source, description: options.description ?? null });
+    return new Inferlet({ fn, name, version, source });
 }
 
 export class Process {
@@ -513,26 +514,17 @@ export class PieClient {
     // Program Upload
     // =========================================================================
 
-    /**
-     * Installs a program to the server in chunks.
-     * @param {string} wasmPath Path to the WASM binary file (Node.js only).
-     * @param {string} manifestPath Path to the manifest TOML file (Node.js only).
-     */
-    async installProgram(wasmPath, manifestPath, forceOverwrite = false) {
+    async installProgram(path, version = null, forceOverwrite = false) {
         const fs = await import('fs');
-        const programBytes = fs.readFileSync(wasmPath);
-        const manifest = fs.readFileSync(manifestPath, 'utf-8');
-        return await this.installProgramBytes(programBytes, manifest, forceOverwrite);
+        const { resolve } = await import('path');
+        const programBytes = fs.readFileSync(path);
+        return await this.installProgramBytes(programBytes, programFile(resolve(path)), version, forceOverwrite);
     }
 
     /**
-     * Installs a program from its artifact bytes (a component, or a script's
-     * source when the manifest names a `[runtime] language`) and its
-     * manifest TOML.
      * @param {Uint8Array} programBytes
-     * @param {string} manifest
      */
-    async installProgramBytes(programBytes, manifest, forceOverwrite = false) {
+    async installProgramBytes(programBytes, file, version = null, forceOverwrite = false) {
         // msgpack-lite encodes a Node Buffer as `bin`, which is what the
         // server's `chunk_data` is; a bare Uint8Array would go out as an
         // array of numbers and the upload would never be answered.
@@ -555,7 +547,8 @@ export class PieClient {
                 type: "add_program",
                 corr_id,
                 program_hash: programHash,
-                manifest,
+                file,
+                version,
                 force_overwrite: forceOverwrite,
                 chunk_index: i,
                 total_chunks: totalChunks,
@@ -568,6 +561,7 @@ export class PieClient {
         if (!ok) {
             throw new Error(`Program install failed: ${result}`);
         }
+        return result;
     }
 
     // =========================================================================
@@ -645,7 +639,7 @@ export class PieClient {
         if (program instanceof Inferlet) {
             if (!(await this.checkProgram(program.program))) {
                 await this.installProgramBytes(
-                    new TextEncoder().encode(program.source), program.manifestToml(),
+                    new TextEncoder().encode(program.source), program.file, program.version,
                 );
             }
             program = program.program;

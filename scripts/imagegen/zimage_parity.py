@@ -298,11 +298,10 @@ def run(args) -> None:
     if not os.path.exists(pie):
         raise SystemExit(f"{pie}: no pie binary. Build one with `cargo build -p pie --features cuda`, or pass --pie.")
     binary = wasm(args.inferlet)
-    manifest = os.path.join(args.inferlet, "Pie.toml")
     cmd = [pie]
     if args.config:
         cmd += ["--config", args.config]
-    cmd += ["run", "--path", binary, "--manifest", manifest, "--"]
+    cmd += ["run", "--path", binary, "--"]
     if mode == "text":
         cmd += ["--prompt", prompt_of(args), "--text_only", "true"]
     else:

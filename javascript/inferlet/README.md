@@ -72,8 +72,9 @@ npm test                     # vitest (stubs in src/__tests__)
 ```
 
 A JavaScript inferlet is its source: there is no build. `pie run index.js`
-(or `pie inferlet install index.js`, or `client.install_program(index_js,
-pie_toml)`) hands the module to the server, which runs it under the
+(or `pie inferlet install index.js`, or `client.installProgram("index.js")`,
+which names the program by its directory) hands the module to the server,
+which runs it under the
 JavaScript language component -- one wasm bundling StarlingMonkey, this
 library and acorn, built once by `language/build.sh` (componentize-js against
 the derived world in `wit/`) and installed at

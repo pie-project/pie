@@ -178,11 +178,10 @@ def run(args) -> None:
             f"`cargo build -p pie --features cuda`, or pass --pie."
         )
     binary = wasm()
-    manifest = os.path.join(INFERLET, "Pie.toml")
     cmd = [pie]
     if args.config:
         cmd += ["--config", os.path.expanduser(args.config)]
-    cmd += ["run", "--path", binary, "--manifest", manifest]
+    cmd += ["run", "--path", binary]
     if args.png_dir:
         os.makedirs(args.png_dir, exist_ok=True)
         cmd += ["-o", args.png_dir]

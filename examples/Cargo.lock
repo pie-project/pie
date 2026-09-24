@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "inferlet-macros",
  "pie-eta-dsl",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet-macros"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "quote",
  "syn",
@@ -504,18 +504,18 @@ dependencies = [
 
 [[package]]
 name = "pie-dtype"
-version = "0.5.1"
+version = "0.5.2"
 
 [[package]]
 name = "pie-eta-dsl"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "pie-eta-ir",
 ]
 
 [[package]]
 name = "pie-eta-ir"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "pie-dtype",
 ]

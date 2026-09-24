@@ -4,17 +4,14 @@ A Python inferlet is its source, not a build. The host installs this
 component once, and for each Python program it launches an instance of it
 with the program's source folded into the launch input:
 
-    {"__pie_script__": {"name": "beam-search@0.1.0", "file": "main.py",
-                        "source": "...", "entry": "main", "call": "input"},
+    {"__pie_script__": {"name": "beam-search@0.1.0", "file": "beam-search.py",
+                        "source": "..."},
      "input": "<the caller's input, verbatim>"}
 
-`call` is how the entry takes the input: `"input"` (the default) passes the
-parsed input as its one argument, `"kwargs"` (what the client's `@inferlet`
-decorator declares) spreads the input object as keyword arguments.
-
 `run` unwraps that envelope, executes the source as a fresh module, and
-awaits its entry point on the caller's input exactly as a compiled Python
-inferlet's generated wrapper would. Nothing about the `inferlet` package or
+calls its `main` with the parsed input as the one argument, awaiting the
+result when it is awaitable, exactly as a compiled Python inferlet's
+generated wrapper would. Nothing about the `inferlet` package or
 the WIT world is different: the source sees the same `inferlet` the build
 would have bundled, because this component bundles it.
 
@@ -134,30 +131,17 @@ class Run(exports.Run):
                 f"input carries no {ENVELOPE_KEY!r} envelope"
             )
         script = outer[ENVELOPE_KEY]
-        entry = script.get("entry") or "main"
-        call = script.get("call") or "input"
         input_data = _parse_input(outer.get("input", ""))
 
         try:
             module = _load(script)
-            fn = getattr(module, entry, None)
+            fn = getattr(module, "main", None)
             if fn is None:
                 raise _WitErr(
-                    f"{script.get('name', 'the program')} defines no `{entry}`; "
-                    "a Python inferlet is a module with an entry function, "
-                    "`async def main(input: dict)` unless the manifest names another"
+                    f"{script.get('name', 'the program')} defines no `main`; "
+                    "a Python inferlet is a module with an `async def main(input: dict)`"
                 )
-            if call == "kwargs":
-                # A decorated client function: the input's keys are its
-                # keyword arguments.
-                if not isinstance(input_data, dict):
-                    raise _WitErr(
-                        f"{script.get('name', 'the program')} takes keyword arguments, "
-                        "so its input must be a JSON object"
-                    )
-                result = fn(**input_data)
-            else:
-                result = fn(input_data)
+            result = fn(input_data)
             if inspect.isawaitable(result):
                 result = await result
             return _encode(result, _inferlet.get_return_value)

@@ -23,8 +23,8 @@
     log(`booted in ${(performance.now() - t0).toFixed(0)} ms: ${JSON.stringify(server.summary)}`);
     if (!server.running || server.url !== "pie://local") throw new Error(`running=${server.running} url=${server.url}`);
 
-    const manifest = await fetch("../../examples/text-completion-py/Pie.toml").then((r) => r.text());
-    const program = await server.install(new URL("../../examples/text-completion-py/main.py", location.href), manifest);
+    // Named by its directory: `text-completion-py.py`.
+    const program = await server.install(new URL("../../examples/text-completion-py/main.py", location.href));
     log(`installed ${program}`);
 
     const client = await server.connect();

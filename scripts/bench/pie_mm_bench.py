@@ -49,19 +49,15 @@ if str(SERVER_PY) not in sys.path:
 WASM_NAME = "image_qa_bench.wasm"
 
 
-def bench_inferlet_paths(inferlet_dir: str) -> tuple[Path, Path, str]:
-    import tomllib
-
+def bench_inferlet_wasm(inferlet_dir: str) -> Path:
     d = Path(inferlet_dir).expanduser().resolve()
     wasm = d / "target" / "wasm32-wasip2" / "release" / WASM_NAME
-    manifest = d / "Pie.toml"
     if not wasm.exists():
         raise FileNotFoundError(
             f"missing {wasm}; build with: cd {d} && "
             "cargo build --target wasm32-wasip2 --release"
         )
-    pkg = tomllib.loads(manifest.read_text())["package"]
-    return wasm, manifest, f"{pkg['name']}@{pkg['version']}"
+    return wasm
 
 
 def build_config(args: argparse.Namespace, port: int):
@@ -164,7 +160,7 @@ async def run(args: argparse.Namespace):
             "return_text": args.dump_first_text,
         }
 
-    wasm, manifest, pkg = bench_inferlet_paths(args.inferlet_dir)
+    wasm = bench_inferlet_wasm(args.inferlet_dir)
     cfg, config_blob = build_config(args, 0)
     first_text: list[str | None] = [None]
     sem = asyncio.Semaphore(args.concurrency) if (args.mode == "tput" and args.concurrency > 0) else None
@@ -172,7 +168,7 @@ async def run(args: argparse.Namespace):
     async with Server(cfg) as server:
         client = await server.connect()
         try:
-            await client.install_program(wasm, manifest, force_overwrite=True)
+            pkg = await client.install_program(wasm, force_overwrite=True)
 
             async def one(i: int, *, max_tokens: int | None = None) -> RequestResult:
                 start = time.perf_counter()

@@ -22,7 +22,7 @@ import { Server } from "@pie-project/server";      // resolves here under a bund
 import "@pie-project/language-python";
 
 const server = await Server.start({ model: "/models/qwen3.5-0.8b.wgpu.zt" });   // served with Range support
-const program = await server.install(inferletBytes, manifestToml);
+const program = await server.install("/inferlets/beam_search.wasm");   // a URL, or bytes with a file name
 const client = await server.connect();              // a PieClient, as for `pie serve`
 const proc = await client.launchProcess(program, { prompt: "The capital of France is", max_tokens: 16 });
 for (;;) {

@@ -1,6 +1,6 @@
 {
   "name": "@pie-project/language-python",
-  "version": "0.5.2",
+  "version": "0.5.4",
   "description": "The python language component of pie: import it, and python inferlets run on @pie-project/server.",
   "type": "module",
   "main": "index.mjs",

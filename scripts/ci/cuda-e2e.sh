@@ -53,14 +53,16 @@ submit() { uv run --project python/client python scripts/ci/launch.py "ws://127.
 wasm=$(cd examples && cargo metadata --format-version 1 --no-deps | jq -r .target_directory)/wasm32-wasip2/release
 tc=$wasm/text_completion.wasm
 nb=$wasm/naive_baseline.wasm
-man=examples/text-completion/Pie.toml
 submit text-completion | grep -q '^error' || { echo "expected: not installed"; exit 1; }
-"$pie" inferlet install "$tc" -m "$man"
+"$pie" inferlet install "$tc"
 submit text-completion | grep -q "^ok.*Paris" || { echo "expected: Paris"; exit 1; }
-"$pie" inferlet install "$nb" -m "$man" --force
-submit text-completion | grep -q "^ok.*sampler" || { echo "expected: the replacement's output"; exit 1; }
+"$pie" inferlet install "$nb"
+submit naive-baseline | grep -q "^ok.*sampler" || { echo "expected: the second program's output"; exit 1; }
+"$pie" inferlet install "$tc" --force
+submit text-completion | grep -q "^ok.*Paris" || { echo "expected: Paris after the replacement"; exit 1; }
 "$pie" inferlet remove text-completion@0.3.0
 submit text-completion | grep -q '^error' || { echo "expected: removed"; exit 1; }
+"$pie" inferlet remove naive-baseline
 if grep -q 'panicked at' "$log"; then echo "the server panicked"; grep -A3 'panicked at' "$log"; exit 1; fi
 kill $serve; wait $serve 2>/dev/null || true
 

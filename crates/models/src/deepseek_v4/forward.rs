@@ -3,7 +3,7 @@ use model_dsl::{
     ops, seam,
 };
 
-use super::model::{Gate, GateUp, Hyper, Indexer, Mix, Mlp, Model};
+use super::model::{Engram, Gate, GateUp, Hyper, Indexer, Mix, Mlp, Model, Pool, Selection};
 
 pub struct Facts {
     pub qo_one: bool,
@@ -39,6 +39,21 @@ impl Classify for Facts {
     }
 }
 
+/// What one sub-block hands the next under V4.1: the mixing coefficients it
+/// predicted (Single-Pass mHC reads the residual once, so a sub-block's input
+/// mix is the previous sub-block's prediction) and the latest sparse selection
+/// (CSA2 Reuse Mode layers attend over the ranking a preceding layer made).
+struct Carry<'m> {
+    mix: Option<PrevMix<'m>>,
+    selection: Option<(Value, u32)>,
+}
+
+struct PrevMix<'m> {
+    mixes: Value,
+    scale: &'m Weight,
+    base: &'m Weight,
+}
+
 impl ForwardHybrid for Model {
     type Facts = Facts;
 
@@ -49,13 +64,20 @@ impl ForwardHybrid for Model {
         for w in &self.layers {
             let at = &w.attn;
             c.kv(kv, at.kv.clone(), [at.kv_down.dim(0)]);
-            if let Some(p) = &at.pool {
+            if let Some(p) = &at.pool
+                && p.owner
+            {
                 let pool = c.kv_space(self.kv);
                 c.kv(pool, p.entries.clone(), [self.head_dim as u64]);
             }
-            if let Some(ix) = &at.indexer {
+            if let Some(ix) = &at.indexer
+                && ix.owns_keys
+            {
                 let index = c.kv_space(self.kv);
                 c.kv(index, ix.keys.clone(), [ix.head_dim as u64]);
+            }
+            if let Some(e) = &w.engram {
+                c.state(e.ids_state.clone(), [u64::from(e.ngram) - 1], Dtype::I32);
             }
         }
         if let Some(mtp) = &self.mtp {
@@ -81,7 +103,14 @@ impl ForwardHybrid for Model {
             ops::elemwise::hc_expand(&ops::layout::embed(&ids, &m.embed, m.vocab), hy.streams);
 
         let adapter_routes = inputs.adapter_routes();
+        let mut carry = Carry {
+            mix: None,
+            selection: None,
+        };
         for (l, w) in inputs.walk_layers(&m.layers) {
+            if let Some(e) = &w.engram {
+                streams = engram(&streams, &ids, &inputs, m, e);
+            }
             let next = m.layers.get(l as usize + 1);
             streams = layer(
                 m,
@@ -94,6 +123,7 @@ impl ForwardHybrid for Model {
                 &streams,
                 &ids,
                 false,
+                &mut carry,
             );
         }
 
@@ -110,6 +140,7 @@ impl ForwardHybrid for Model {
                     hy.gate_eps,
                 )
             }
+            None if hy.single_pass => premix(&streams, carry.mix.as_ref(), m),
             None => {
                 let (mut y, mut rest) = ops::layout::split_rows(&streams, m.hidden);
                 for _ in 1..hy.streams - 1 {
@@ -137,6 +168,10 @@ impl ForwardHybrid for Model {
             let mut token = ops::layout::argmax(&[&dlogits]);
             let mut hidden = dstreams;
             let mut chain: Vec<Value> = Vec::with_capacity(mtp.depth as usize);
+            let mut draft_carry = Carry {
+                mix: None,
+                selection: None,
+            };
             for step in 0..mtp.depth {
                 let e = ops::layout::embed(&token, &m.embed, m.vocab);
                 let e = ops::elemwise::rmsnorm(&e, &mtp.enorm, mtp.norm_eps);
@@ -158,6 +193,7 @@ impl ForwardHybrid for Model {
                     &fused,
                     &token,
                     step > 0,
+                    &mut draft_carry,
                 );
                 let normed = ops::elemwise::hc_rmsnorm_f32(&out, hy.norm_eps);
                 let mixes = ops::elemwise::hc_project(&normed, &mtp.hc_head.dynamic, hy.streams);
@@ -187,17 +223,18 @@ impl ForwardHybrid for Model {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn layer(
-    m: &Model,
+fn layer<'m>(
+    m: &'m Model,
     inputs: &Input<Facts>,
     plan_p: &Value,
     positions: &Value,
     adapter_routes: &Value,
-    w: &super::model::Layer,
+    w: &'m super::model::Layer,
     next: Option<&super::model::Layer>,
     streams: &Value,
     ids: &Value,
     chain: bool,
+    carry: &mut Carry<'m>,
 ) -> Value {
     let hy = &m.hyper;
     let kv_heads = kv_heads(m);
@@ -207,7 +244,7 @@ fn layer(
     let write_page = inputs.write_page(&at.kv);
     let write_offset = inputs.write_offset(&at.kv);
 
-    let (x, post_mix, comb_mix) = gate(streams, &w.attn_mix, hy);
+    let (x, post_mix, comb_mix) = sublayer_input(streams, &w.attn_mix, m, carry);
     let x = match &w.attn_norm {
         Some(n) => ops::elemwise::rmsnorm(&x, n, hy.norm_eps),
         None => x,
@@ -258,85 +295,124 @@ fn layer(
 
     let (o, lse) = match &at.pool {
         Some(p) => {
-            let ape = p.compressor.as_ref().map(|c| {
-                if !chain {
-                    let state_kv = ops::linear::matmul(&x, &c.wkv);
-                    let state_score = ops::linear::matmul(&x, &c.wgate);
-                    ops::attn::pool_state_write(
-                        &state_kv,
-                        &state_score,
-                        pages,
-                        &write_page,
-                        &write_offset,
-                        m.head_dim,
-                        p.ratio,
-                    );
-                }
-                &c.ape
-            });
             let entries = inputs.kv(&p.entries);
-            let entry_page = inputs.write_page(&p.entries);
-            let entry_offset = inputs.write_offset(&p.entries);
-
             let row_valid = inputs.row_valid();
             let request_of_token = inputs.request_of_token();
             let (bpos, breq, brope) = boundaries(pos, &row_valid, p.ratio);
-            let pooled =
-                ops::attn::pool_gather(&bpos, &breq, pages, ape, m.head_dim, p.ratio, m.act);
-            let pooled = match &p.compressor {
-                Some(c) => ops::elemwise::rmsnorm(&pooled, &c.norm, c.norm_eps),
-                None => pooled,
-            };
-            let pooled = ops::elemwise::rope_partial_last_yarn(
-                &pooled,
-                &brope,
-                at.rope_dim,
-                m.head_dim,
-                at.theta,
-                true,
-                false,
-                at.yarn,
-            );
-            if !chain {
-                ops::attn::pool_kv_append(
-                    &pooled,
-                    &bpos,
-                    &breq,
-                    entries,
-                    &entry_page,
-                    &entry_offset,
-                );
-            }
-            let selection = at.indexer.as_ref().map(|ix| {
-                indexer(
+
+            if p.owner {
+                let latent = compress(
+                    m,
                     &x,
-                    &q_a,
-                    ix,
-                    pos,
+                    p,
+                    pages,
+                    &write_page,
+                    &write_offset,
                     &bpos,
                     &breq,
-                    &brope,
-                    inputs.kv(&ix.keys),
-                    &inputs.write_page(&ix.keys),
-                    &inputs.write_offset(&ix.keys),
-                    m.act,
                     chain,
-                )
-            });
-            let (po, plse) = match (&selection, &at.indexer) {
-                (Some(selection), Some(ix)) => ops::attn::pool_lse_selected(
+                );
+                if let Some(ix) = &at.indexer
+                    && let (Some(wk), Some(k_norm)) = (&ix.wk, &ix.k_norm)
+                    && ix.owns_keys
+                    && !chain
+                {
+                    // CSA2: the index keys are a projection of the compressed
+                    // latent, taken before its rotation.
+                    let k = ops::elemwise::rmsnorm(
+                        &ops::linear::matmul(&latent, wk),
+                        k_norm,
+                        hy.norm_eps,
+                    );
+                    let k = ops::elemwise::rope_partial_last_yarn(
+                        &k,
+                        &brope,
+                        ix.rope_dim,
+                        ix.head_dim,
+                        ix.theta,
+                        true,
+                        false,
+                        ix.yarn,
+                    );
+                    ops::attn::pool_kv_append(
+                        &k,
+                        &bpos,
+                        &breq,
+                        inputs.kv(&ix.keys),
+                        &inputs.write_page(&ix.keys),
+                        &inputs.write_offset(&ix.keys),
+                    );
+                }
+                let pooled = ops::elemwise::rope_partial_last_yarn(
+                    &latent,
+                    &brope,
+                    at.rope_dim,
+                    m.head_dim,
+                    at.theta,
+                    true,
+                    false,
+                    at.yarn,
+                );
+                if !chain {
+                    ops::attn::pool_kv_append(
+                        &pooled,
+                        &bpos,
+                        &breq,
+                        entries,
+                        &inputs.write_page(&p.entries),
+                        &inputs.write_offset(&p.entries),
+                    );
+                }
+            }
+
+            let selection = match at.selection {
+                Selection::None => None,
+                Selection::Own => {
+                    let ix = at
+                        .indexer
+                        .as_ref()
+                        .expect("a layer that ranks its own selection carries an indexer");
+                    let s = match &ix.compressor {
+                        Some(_) => indexer(
+                            &x,
+                            &q_a,
+                            ix,
+                            pos,
+                            &bpos,
+                            &breq,
+                            &brope,
+                            inputs.kv(&ix.keys),
+                            &inputs.write_page(&ix.keys),
+                            &inputs.write_offset(&ix.keys),
+                            m.act,
+                            chain,
+                        ),
+                        None => rank(&x, &q_a, ix, pos, inputs.kv(&ix.keys), p.ratio),
+                    };
+                    carry.selection = Some((s.clone(), ix.top_k));
+                    Some((s, ix.top_k))
+                }
+                Selection::Shared => Some(
+                    carry
+                        .selection
+                        .clone()
+                        .expect("a CSA2 Reuse Mode layer follows a layer that ranked"),
+                ),
+            };
+            let (po, plse) = match &selection {
+                Some((selection, top_k)) => ops::attn::pool_lse_selected(
                     &q,
                     pos,
                     &request_of_token,
                     selection,
                     entries,
                     p.ratio,
-                    ix.top_k,
+                    *top_k,
                     m.heads,
                     m.head_dim,
                     at.sm_scale,
                 ),
-                _ => ops::attn::pool_lse(
+                None => ops::attn::pool_lse(
                     &q,
                     pos,
                     &request_of_token,
@@ -383,7 +459,7 @@ fn layer(
     };
     let streams = ops::elemwise::hc_fold(&o, streams, &post_mix, &comb_mix);
 
-    let (x, post_mix, comb_mix) = gate(&streams, &w.mlp_mix, hy);
+    let (x, post_mix, comb_mix) = sublayer_input(&streams, &w.mlp_mix, m, carry);
     let x = match &w.mlp_norm {
         Some(n) => ops::elemwise::rmsnorm(&x, n, hy.norm_eps),
         None => x,
@@ -395,6 +471,168 @@ fn layer(
         f
     };
     ops::elemwise::hc_fold(&f, &streams, &post_mix, &comb_mix)
+}
+
+/// The compressed KV latent this layer owns, before its rotation. V4 pools a
+/// gated, positionally embedded window; V4.1 pools `ratio` positions under a
+/// softmax gate (ratio 2) or projects every token (ratio 1); the base model
+/// averages. A gated compressor writes its per-token state beside the window
+/// KV and gathers it at each group's closing position.
+#[allow(clippy::too_many_arguments)]
+fn compress(
+    m: &Model,
+    x: &Value,
+    p: &Pool,
+    pages: ValueId,
+    write_page: &Value,
+    write_offset: &Value,
+    bpos: &Value,
+    breq: &Value,
+    chain: bool,
+) -> Value {
+    match &p.compressor {
+        Some(c) => match &c.wgate {
+            Some(wgate) => {
+                if !chain {
+                    let state_kv = ops::linear::matmul(x, &c.wkv);
+                    let state_score = ops::linear::matmul(x, wgate);
+                    ops::attn::pool_state_write(
+                        &state_kv,
+                        &state_score,
+                        pages,
+                        write_page,
+                        write_offset,
+                        m.head_dim,
+                        p.ratio,
+                    );
+                }
+                let pooled = ops::attn::pool_gather(
+                    bpos,
+                    breq,
+                    pages,
+                    c.ape.as_ref(),
+                    m.head_dim,
+                    p.ratio,
+                    m.act,
+                );
+                ops::elemwise::rmsnorm(&pooled, &c.norm, c.norm_eps)
+            }
+            None => {
+                let kv = ops::linear::matmul(x, &c.wkv);
+                ops::elemwise::rmsnorm(&kv, &c.norm, c.norm_eps)
+            }
+        },
+        None => ops::attn::pool_gather(bpos, breq, pages, None, m.head_dim, p.ratio, m.act),
+    }
+}
+
+/// The sub-block's input and the coefficients that fold its output back.
+/// Under Single-Pass mHC the input is mixed with the previous sub-block's
+/// prediction, and this sub-block's own prediction is kept for the next; the
+/// very first sub-block reads stream 0 (the one-hot initial mix).
+fn sublayer_input<'m>(
+    streams: &Value,
+    mix: &'m Mix,
+    m: &'m Model,
+    carry: &mut Carry<'m>,
+) -> (Value, Value, Value) {
+    let hy = &m.hyper;
+    if !hy.single_pass {
+        return gate(streams, mix, hy);
+    }
+    let normed = ops::elemwise::hc_rmsnorm_f32(streams, hy.norm_eps);
+    let mixes = match &mix.dynamic {
+        Some(dynamic) => ops::elemwise::hc_project(&normed, dynamic, hy.streams),
+        None => normed,
+    };
+    let (_, post_mix, comb_mix) = ops::elemwise::hc_gates(
+        &mixes,
+        streams,
+        &mix.scale,
+        &mix.base,
+        hy.streams,
+        hy.gate_eps,
+        hy.alpha,
+        hy.sinkhorn,
+    );
+    let x = premix(streams, carry.mix.as_ref(), m);
+    carry.mix = Some(PrevMix {
+        mixes,
+        scale: &mix.scale,
+        base: &mix.base,
+    });
+    (x, post_mix, comb_mix)
+}
+
+/// `pre · streams` for the previous sub-block's `pre`: the gates kernel over
+/// the previous mixes and this residual lands exactly that as its input row
+/// (its other two outputs restate the previous sub-block's and are dropped).
+/// Before any sub-block ran, the one-hot initial mix reads stream 0.
+fn premix(streams: &Value, prev: Option<&PrevMix<'_>>, m: &Model) -> Value {
+    let hy = &m.hyper;
+    match prev {
+        Some(p) => {
+            let (x, _, _) = ops::elemwise::hc_gates(
+                &p.mixes,
+                streams,
+                p.scale,
+                p.base,
+                hy.streams,
+                hy.gate_eps,
+                hy.alpha,
+                hy.sinkhorn,
+            );
+            x
+        }
+        None => ops::layout::split_rows(streams, m.hidden).0,
+    }
+}
+
+/// Engram: the position's n-gram hashes fetch table rows; `wkv` turns them
+/// into one key per residual stream and a shared value; every stream adds the
+/// value under a gate that is a normalised dot product of the stream against
+/// its key (signed square root, then sigmoid).
+fn engram(streams: &Value, ids: &Value, inputs: &Input<Facts>, m: &Model, e: &Engram) -> Value {
+    let hy = &m.hyper;
+    let state = inputs.state(&e.ids_state);
+    let map = m.token_map.as_ref();
+
+    let one = Facts::qo_one();
+    let (ids_d, ids_p) = ids.split(&one);
+    let grams = Value::merge(vec![
+        ops::attn::ple_ngram_ids(
+            &ids_d,
+            state,
+            e.pad,
+            &e.mults,
+            &e.primes,
+            &e.offsets,
+            e.heads_per_ngram,
+            map,
+        ),
+        ops::attn::ple_ngram_ids_chunked(
+            &ids_p,
+            state,
+            e.pad,
+            &e.mults,
+            &e.primes,
+            &e.offsets,
+            e.heads_per_ngram,
+            map,
+        ),
+    ]);
+    let rows: u64 = e.primes.iter().sum();
+    let fetched = ops::layout::embed_concat(
+        &grams,
+        &e.table,
+        u32::try_from(rows).expect("the Engram table addresses in i32"),
+    );
+    let kv = ops::linear::matmul(&fetched, &e.wkv);
+    let (key, value) = ops::layout::split_rows(&kv, hy.streams * m.hidden);
+    let key = ops::elemwise::rmsnorm_grouped_plus_one(&key, &e.k_weight, m.hidden, e.eps);
+    let query = ops::elemwise::rmsnorm_grouped_plus_one(streams, &e.q_weight, m.hidden, e.eps);
+    let gated = ops::elemwise::ple_gate(&key, &query, &value, hy.streams);
+    ops::elemwise::residual_add(&gated, streams)
 }
 
 const PREDICT_K: u32 = 16;
@@ -410,6 +648,11 @@ fn predict_next(streams: &Value, next: Option<&super::model::Layer>, hy: &Hyper)
     else {
         return None;
     };
+    if hy.single_pass {
+        // The next layer's input mix is this layer's own prediction, which is
+        // not settled here: the hint would score the wrong row.
+        return None;
+    }
     let (px, _, _) = gate(streams, &next.mlp_mix, hy);
     let px = match &next.mlp_norm {
         Some(n) => ops::elemwise::rmsnorm(&px, n, hy.norm_eps),
@@ -551,6 +794,7 @@ fn kv_heads(m: &Model) -> u32 {
     u32::try_from(row / head).expect("a head count inside u32")
 }
 
+/// V4's indexer: its own gated compressor over the hidden state makes the keys.
 #[allow(clippy::too_many_arguments)]
 fn indexer(
     x: &Value,
@@ -566,13 +810,21 @@ fn indexer(
     act: Dtype,
     chain: bool,
 ) -> Value {
-    let c = &ix.compressor;
-    let ratio = c.ape.dim(0);
+    let c = ix
+        .compressor
+        .as_ref()
+        .expect("the V4 indexer compresses its own keys");
+    let ape = c
+        .ape
+        .as_ref()
+        .expect("the V4 index compressor is positionally embedded");
+    let wgate = c.wgate.as_ref().expect("the V4 index compressor is gated");
+    let ratio = ape.dim(0);
     let ratio = u32::try_from(ratio).expect("a pooling ratio inside u32");
 
     if !chain {
         let state_kv = ops::linear::matmul(x, &c.wkv);
-        let state_score = ops::linear::matmul(x, &c.wgate);
+        let state_score = ops::linear::matmul(x, wgate);
         ops::attn::pool_state_write(
             &state_kv,
             &state_score,
@@ -587,7 +839,7 @@ fn indexer(
         boundary_pos,
         boundary_req,
         keys,
-        Some(&c.ape),
+        Some(ape),
         ix.head_dim,
         ratio,
         act,
@@ -614,6 +866,40 @@ fn indexer(
         );
     }
 
+    let q = ops::linear::matmul(q_a, &ix.wq_b);
+    let q = ops::elemwise::rope_partial_last_yarn(
+        &q,
+        positions,
+        ix.rope_dim,
+        ix.head_dim,
+        ix.theta,
+        true,
+        false,
+        ix.yarn,
+    );
+    let weights = ops::linear::matmul(x, &ix.weights_proj);
+    ops::attn::index_topk(
+        &q,
+        Some(&weights),
+        keys,
+        ix.heads,
+        ix.head_dim,
+        ix.top_k,
+        ratio,
+    )
+}
+
+/// CSA2's ranking over keys a KV source published (this layer's own or a
+/// preceding layer's): a rotated index query per head against every visible
+/// key, rectified, combined by the head weights, the top entries kept.
+fn rank(
+    x: &Value,
+    q_a: &Value,
+    ix: &Indexer,
+    positions: &Value,
+    keys: ValueId,
+    ratio: u32,
+) -> Value {
     let q = ops::linear::matmul(q_a, &ix.wq_b);
     let q = ops::elemwise::rope_partial_last_yarn(
         &q,

@@ -23,13 +23,29 @@ from common import (
 )
 
 
+def server_arg_names(server_args_cls) -> set[str]:
+    """The keyword arguments `sglang.Engine` accepts: `ServerArgs` was a
+    dataclass through 0.5.x and a pydantic model after, and its constructor
+    signature is the fallback for anything else."""
+    fields = getattr(server_args_cls, "__dataclass_fields__", None)
+    if fields:
+        return set(fields)
+    fields = getattr(server_args_cls, "model_fields", None)
+    if fields:
+        return set(fields)
+    import inspect
+
+    return set(inspect.signature(server_args_cls).parameters)
+
+
 def build_engine(args: argparse.Namespace, max_running_requests: int):
     import sglang as sgl
     from sglang.srt.server_args import ServerArgs
 
-    supported = set(ServerArgs.__dataclass_fields__)
+    supported = server_arg_names(ServerArgs)
     engine_kwargs = {
         "model_path": args.model,
+        "trust_remote_code": True,  # a shrunk checkpoint (pie-evals miniature) keeps the family's modeling code
         "mem_fraction_static": args.gpu_mem_util,
         "disable_cuda_graph": args.sglang_disable_cuda_graph,
         "disable_radix_cache": True,

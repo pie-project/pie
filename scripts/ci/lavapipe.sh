@@ -87,8 +87,8 @@ curl -fsS -X POST "$http/v1/chat/completions" -H 'content-type: application/json
 if [ -n "${PIE_LANGUAGES_DIR:-}" ]; then
   echo "== a Python and a JavaScript inferlet, under their language components"
   for language in python javascript; do "$pie" language install "$PIE_LANGUAGES_DIR/pie-language-$language.tar.gz"; done
-  "$pie" inferlet install examples/text-completion-py/main.py -m examples/text-completion-py/Pie.toml
-  "$pie" inferlet install examples/text-completion-js/index.js -m examples/text-completion-js/Pie.toml
+  "$pie" inferlet install examples/text-completion-py/main.py
+  "$pie" inferlet install examples/text-completion-js/index.js
   for name in text-completion-py text-completion-js; do
     uv run --project python/client python scripts/ci/launch.py "$ws" "$name" | tee /dev/stderr | grep -q '^ok' || exit 1
   done

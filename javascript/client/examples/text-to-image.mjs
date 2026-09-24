@@ -15,7 +15,6 @@
  * guest can drive), so it is what this example is about.
  *
  * `text-to-image` must already be on the server: `pie inferlet install
- * <text_to_image.wasm>`, or `installProgram(wasm, manifest)` as below, or a
  * `pie run text-to-image` from a source checkout, which uploads it.
  */
 
@@ -36,15 +35,14 @@ const outDir = flag('out', './out');
 const steps = Number(flag('steps', 4));
 const size = Number(flag('size', 1024));
 const wasm = flag('wasm', null);
-const manifest = flag('manifest', null);
 
 const client = new PieClient(uri);
 await client.connect();
 
 // Only when pointed at a local build. A published inferlet is already there
 // and this is skipped.
-if (wasm && manifest) {
-    await client.installProgram(wasm, manifest, true);
+if (wasm) {
+    await client.installProgram(wasm, null, true);
 }
 
 const process_ = await client.launchProcess(INFERLET, {

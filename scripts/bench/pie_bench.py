@@ -58,7 +58,6 @@ EMBEDDED_CLI_ENGINES: set[str] = {
 }
 
 
-
 def reconstruct_token_arrivals(
     first_arrival_s: float,
     intertoken_us: list[int],
@@ -85,16 +84,14 @@ PIE_MAX_FORWARD_TOKENS_DEFAULT = 10240
 PIE_MAX_FORWARD_REQUESTS_DEFAULT = 512
 
 
-def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
+def bench_inferlet_wasm(inferlet_dir: str | None) -> Path:
     if not inferlet_dir:
         raise FileNotFoundError(
             "text-completion-bench is not part of the curated inferlets; pass "
             "--inferlet-dir or set PIE_BENCH_INFERLET_DIR"
         )
     inferlet_dir = Path(inferlet_dir).expanduser().resolve()
-    manifest = inferlet_dir / "Pie.toml"
-    pkg = tomllib.loads(manifest.read_text())["package"]
-    # Derive the artifact from the manifest rather than hard-coding
+    pkg = tomllib.loads((inferlet_dir / "Cargo.toml").read_text())["package"]
     # text-completion-bench's (cargo folds dashes to underscores). Without this
     # the harness can bench exactly ONE inferlet, which is why the
     # `eta::run_ahead` change had no way to be measured.
@@ -124,7 +121,7 @@ def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
             f"{wasm} is older than {inferlet_dir}/src; rebuild with: "
             f"cd {inferlet_dir} && cargo build --target wasm32-wasip2 --release"
         )
-    return wasm, manifest, f"{pkg['name']}@{pkg['version']}"
+    return wasm
 
 
 def find_free_port() -> int:
@@ -732,10 +729,10 @@ async def run(args: argparse.Namespace):
         prompt_token_ids, _ = hf_chat_token_ids_and_counts(
             args.model, args.system, prompts, getattr(args, "think", None)
         )
-    wasm, manifest, pkg = bench_inferlet_paths(args.inferlet_dir)
+    wasm = bench_inferlet_wasm(args.inferlet_dir)
 
     async with pie_client(args) as (client, engine_config):
-        await client.install_program(wasm, manifest, force_overwrite=True)
+        pkg = await client.install_program(wasm, force_overwrite=True)
 
         first_output_text: list[str | None] = [None]
         output_token_ids_by_process: dict[str, list[int]] = {}

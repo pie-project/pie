@@ -34,9 +34,6 @@
   <label for="inferlet">component URL</label>
   <input id="inferlet" type="text" value="inferlets/text_completion.wasm">
   <br>
-  <label for="manifest">manifest URL</label>
-  <input id="manifest" type="text" value="inferlets/text-completion.Pie.toml">
-  <br>
   <button id="install" disabled>Install</button>
   <span id="install-status"></span>
 </fieldset>
@@ -69,7 +66,6 @@
   if (params.get("config")) $("config").value = params.get("config");
   if (params.get("max_tokens")) $("max-tokens").value = params.get("max_tokens");
   if (params.get("inferlet")) $("inferlet").value = params.get("inferlet");
-  if (params.get("manifest")) $("manifest").value = params.get("manifest");
 
   let program = null;
   let runsLeft = Number(params.get("runs") ?? 1);
@@ -132,12 +128,10 @@
   async function install() {
     $("install").disabled = true;
     try {
-      const [wasmBytes, manifest] = await Promise.all([
-        fetchWithProgress($("inferlet").value),
-        fetch($("manifest").value).then((r) => r.text()),
-      ]);
+      const url = $("inferlet").value;
+      const bytes = await fetchWithProgress(url);
       const t0 = performance.now();
-      program = await pie.install(wasmBytes, manifest);
+      program = await pie.install(bytes, pie.programFile(new URL(url, location.href)));
       log(`installed ${program} in ${(performance.now() - t0).toFixed(0)} ms`);
       $("install-status").textContent = `installed ${program}`;
       $("run").disabled = false;

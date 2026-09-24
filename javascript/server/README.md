@@ -17,7 +17,7 @@ const server = await Server.start({
   config: { server: { port: 0 } },               // the rest of `pie serve`'s config
 });
 
-await server.install(inferletBytes, manifestToml);   // an inferlet of your own, from bytes or a URL
+await server.install('./beam_search.wasm');           // an inferlet of your own: a path or URL, or bytes with a file name
 const client = await server.connect();               // a PieClient
 const process = await client.launchProcess('text-completion', { prompt: 'Hello' });
 console.log(await process.result());

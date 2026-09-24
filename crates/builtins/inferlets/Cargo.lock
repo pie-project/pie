@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet"
-version = "0.5.1"
+version = "0.5.4"
 dependencies = [
  "inferlet-macros",
  "pie-eta-dsl",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet-macros"
-version = "0.5.1"
+version = "0.5.4"
 dependencies = [
  "quote",
  "syn",
@@ -215,18 +215,18 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "pie-dtype"
-version = "0.5.1"
+version = "0.5.4"
 
 [[package]]
 name = "pie-eta-dsl"
-version = "0.5.1"
+version = "0.5.4"
 dependencies = [
  "pie-eta-ir",
 ]
 
 [[package]]
 name = "pie-eta-ir"
-version = "0.5.1"
+version = "0.5.4"
 dependencies = [
  "pie-dtype",
 ]

@@ -12,12 +12,12 @@
 // dependency; this wrapper loads it and adds `connect()`.
 
 import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import WebSocket from 'ws';
-import { PieClient } from '@pie-project/client';
+import { PieClient, programFile } from '@pie-project/client';
 import { attachLanguages } from '@pie-project/server-web/languages';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -50,11 +50,24 @@ function load() {
   return native;
 }
 
+function isBytes(source) {
+  return source instanceof Uint8Array || source instanceof ArrayBuffer;
+}
+
+function urlOf(source) {
+  if (source instanceof URL) return source;
+  try {
+    return new URL(String(source));
+  } catch {
+    return pathToFileURL(String(source));
+  }
+}
+
 /** Bytes from what `install*` accept: bytes, or a file/http URL to read. */
 async function bytesOf(source) {
   if (source instanceof Uint8Array) return source;
   if (source instanceof ArrayBuffer) return new Uint8Array(source);
-  const url = source instanceof URL ? source : new URL(String(source), 'file://');
+  const url = urlOf(source);
   if (url.protocol === 'file:') return new Uint8Array(await readFile(fileURLToPath(url)));
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url}: ${response.status} ${response.statusText}`);
@@ -126,10 +139,13 @@ export class Server {
     return handle.installLanguage(language, Buffer.from(await bytesOf(source)));
   }
 
-  /** An inferlet from its component bytes (or URL) and manifest text, replacing an installed version. Resolves to `name@version`. */
-  async install(source, manifest) {
+  async install(source, file = null, version = null) {
     const handle = this.#alive();
-    return handle.install(Buffer.from(await bytesOf(source)), manifest);
+    if (!file) {
+      if (isBytes(source)) throw new Error('Server.install: bytes need `file`, the program\'s file name (`x.wasm`, `x.py`, `x.js`)');
+      file = programFile(urlOf(source));
+    }
+    return handle.install(Buffer.from(await bytesOf(source)), file, version ?? undefined);
   }
 
   /** A `PieClient` connected to this engine (over Node's `ws`, which can send the identity header). Closed by `shutdown()`. */

@@ -45,6 +45,16 @@ __device__ __forceinline__ void ple_mask_window(
     }
 }
 
+// Engram hashes tokenizer-compressed ids: the window holds raw ids (so the
+// state and the eos barrier stay in the tokenizer's id space) and is mapped
+// after masking, so the pre-start padding maps like every other id.
+__device__ __forceinline__ void ple_map_window(
+    const PleHash& h, const long long* __restrict__ map, int* window)
+{
+    if (map == nullptr) return;
+    for (int p = 0; p < h.ngram; ++p) window[p] = (int)map[window[p]];
+}
+
 __global__ void ple_ngram_ids_update(
     const int* __restrict__ ids,
     int* __restrict__ state_base,
@@ -53,6 +63,7 @@ __global__ void ple_ngram_ids_update(
     int* __restrict__ ngram_ids,
     int rows,
     PleHash h,
+    const long long* __restrict__ map,
     const u32* __restrict__ win)
 {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -73,6 +84,7 @@ __global__ void ple_ngram_ids_update(
         window[p] = cell == 0 ? h.eos : cell - 1;
     }
     ple_mask_window(h, window);
+    ple_map_window(h, map, window);
 
     int out[PLE_MAX_HEADS];
     ple_hash_row(h, window, out);
@@ -96,6 +108,7 @@ __global__ void ple_ngram_ids_chunked(
     const int* commit_len,
     const int* begin_at,
     PleHash h,
+    const long long* __restrict__ map,
     const u32* __restrict__ win)
 {
     const int r = blockIdx.x;
@@ -138,6 +151,7 @@ __global__ void ple_ngram_ids_chunked(
             }
         }
         ple_mask_window(h, window);
+        ple_map_window(h, map, window);
         int out[PLE_MAX_HEADS];
         ple_hash_row(h, window, out);
         for (int k = 0; k < h.heads; ++k) {

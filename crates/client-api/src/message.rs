@@ -30,7 +30,8 @@ pub enum ClientMessage {
     AddProgram {
         corr_id: u32,
         program_hash: String,
-        manifest: String,
+        file: String,
+        version: Option<String>,
         force_overwrite: bool,
         chunk_index: usize,
         total_chunks: usize,

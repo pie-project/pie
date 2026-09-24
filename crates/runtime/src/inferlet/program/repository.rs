@@ -8,7 +8,9 @@ use anyhow::anyhow;
 use anyhow::{Result, bail};
 
 use super::ProgramName;
-use super::manifest::Manifest;
+use super::language::Language;
+#[cfg(not(target_arch = "wasm32"))]
+use super::language::artifact_extension;
 
 /// `major.minor.patch` as a sortable triple; anything else sorts first.
 fn semver_key(version: &str) -> (u64, u64, u64) {
@@ -32,24 +34,12 @@ fn artifact_path(programs_dir: &Path, name: &ProgramName, extension: &str) -> Pa
         .join(format!("{}.{extension}", name.version))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn manifest_path(programs_dir: &Path, name: &ProgramName) -> PathBuf {
-    programs_dir
-        .join(&name.name)
-        .join(format!("{}.toml", name.version))
-}
-
-/// The programs this host can run: a local directory of
-/// `<name>/<version>.{wasm,py,js}` + `<version>.toml` pairs, the built-in
-/// inferlets the binary carries, and whatever was added from bytes. Nothing
-/// is fetched; a program that is not here is an error that names where it
-/// was expected.
 pub struct Repository {
-    index: HashMap<ProgramName, Manifest>,
+    index: HashMap<ProgramName, Option<Language>>,
     preloaded_binaries: HashMap<ProgramName, Vec<u8>>,
     /// What the binary carries: not removable, and shadowed by a disk copy
     /// of the same name and version.
-    builtin: HashMap<ProgramName, (Manifest, &'static [u8])>,
+    builtin: HashMap<ProgramName, &'static [u8]>,
     /// The index entries that came from disk, with their artifact's mtime,
     /// so [`Repository::refresh`] can tell a replaced artifact from a kept one.
     #[cfg(not(target_arch = "wasm32"))]
@@ -73,18 +63,15 @@ impl Repository {
         &self.programs_dir
     }
 
-    pub fn fetch_manifest(&self, name: &ProgramName) -> Option<Manifest> {
-        self.index.get(name).cloned()
+    pub fn language(&self, name: &ProgramName) -> Option<Option<Language>> {
+        self.index.get(name).copied()
     }
 
     /// A copy of the same name and version already here (installed on
     /// disk) wins.
-    pub fn add_builtin(&mut self, manifest: Manifest, component: &'static [u8]) {
-        let name = manifest.program_name();
-        self.index
-            .entry(name.clone())
-            .or_insert_with(|| manifest.clone());
-        self.builtin.insert(name, (manifest, component));
+    pub fn add_builtin(&mut self, name: ProgramName, component: &'static [u8]) {
+        self.index.entry(name.clone()).or_insert(None);
+        self.builtin.insert(name, component);
     }
 
     /// Served from the binary: built in, and not shadowed by a disk copy.
@@ -113,14 +100,14 @@ impl Repository {
             return Ok(binary);
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(manifest) = self.index.get(name).filter(|_| self.shadowed(name)) {
-            let path = artifact_path(&self.programs_dir, name, manifest.artifact_extension());
+        if let Some(language) = self.index.get(name).filter(|_| self.shadowed(name)) {
+            let path = artifact_path(&self.programs_dir, name, artifact_extension(*language));
             let binary = tokio::fs::read(&path)
                 .await
                 .map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
             return Ok(binary);
         }
-        if let Some((_, component)) = self.builtin.get(name) {
+        if let Some(component) = self.builtin.get(name) {
             return Ok(component.to_vec());
         }
 
@@ -135,18 +122,18 @@ impl Repository {
         )
     }
 
-    pub fn cached(&self) -> Vec<(ProgramName, Manifest, u64)> {
-        let mut out: Vec<(ProgramName, Manifest, u64)> = self
+    pub fn cached(&self) -> Vec<(ProgramName, Option<Language>, u64)> {
+        let mut out: Vec<(ProgramName, Option<Language>, u64)> = self
             .index
             .iter()
-            .map(|(name, manifest)| {
+            .map(|(name, language)| {
                 #[cfg(not(target_arch = "wasm32"))]
                 let size = match self.builtin.get(name).filter(|_| !self.shadowed(name)) {
-                    Some((_, component)) => component.len() as u64,
+                    Some(component) => component.len() as u64,
                     None => std::fs::metadata(artifact_path(
                         &self.programs_dir,
                         name,
-                        manifest.artifact_extension(),
+                        artifact_extension(*language),
                     ))
                     .map(|m| m.len())
                     .unwrap_or(0),
@@ -156,7 +143,7 @@ impl Repository {
                     .preloaded_binaries
                     .get(name)
                     .map_or(0, |bytes| bytes.len() as u64);
-                (name.clone(), manifest.clone(), size)
+                (name.clone(), *language, size)
             })
             .collect();
         out.sort_by(|a, b| (&a.0.name, &a.0.version).cmp(&(&b.0.name, &b.0.version)));
@@ -176,8 +163,8 @@ impl Repository {
 
     /// Removing a disk copy uncovers the built-in it shadowed.
     fn restore_builtin(&mut self, name: &ProgramName) {
-        if let Some((manifest, _)) = self.builtin.get(name) {
-            self.index.insert(name.clone(), manifest.clone());
+        if self.builtin.contains_key(name) {
+            self.index.insert(name.clone(), None);
         }
     }
 
@@ -193,19 +180,7 @@ impl Repository {
             return Ok(false);
         }
         self.preloaded_binaries.remove(name);
-        let mut paths = vec![manifest_path(&self.programs_dir, name)];
-        paths.extend(
-            ARTIFACT_EXTENSIONS
-                .iter()
-                .map(|extension| artifact_path(&self.programs_dir, name, extension)),
-        );
-        for path in paths {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(anyhow!("removing {:?}: {}", path, e)),
-            }
-        }
+        remove_artifacts(&self.programs_dir, name, None)?;
         let _ = std::fs::remove_dir(self.programs_dir.join(&name.name));
         self.on_disk.remove(name);
         self.restore_builtin(name);
@@ -227,20 +202,19 @@ impl Repository {
 
     pub async fn add(
         &mut self,
-        wasm_binary: Vec<u8>,
-        manifest: Manifest,
+        binary: Vec<u8>,
+        name: ProgramName,
+        language: Option<Language>,
         force_overwrite: bool,
-    ) -> Result<()> {
-        let name = manifest.program_name();
-
+    ) -> Result<bool> {
         if !force_overwrite && self.index.contains_key(&name) {
-            return Ok(());
+            return Ok(false);
         }
 
-        self.store_program_cache(&wasm_binary, manifest).await?;
-        self.preloaded_binaries.insert(name, wasm_binary);
+        self.store_program_cache(&binary, &name, language).await?;
+        self.preloaded_binaries.insert(name, binary);
 
-        Ok(())
+        Ok(true)
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -295,23 +269,14 @@ impl Repository {
             changed.push(name);
         }
         for (name, artifacts) in found {
-            // The manifest says what the artifact is; a `.py` beside a
-            // manifest that claims a component (or the reverse) is not this
-            // program.
-            let Some(manifest) = std::fs::read_to_string(manifest_path(&self.programs_dir, &name))
-                .ok()
-                .and_then(|text| Manifest::parse(&text).ok())
-            else {
+            let Some((extension, mtime)) = artifacts.iter().max_by_key(|(_, mtime)| *mtime) else {
                 continue;
             };
-            let Some((_, mtime)) = artifacts
-                .iter()
-                .find(|(extension, _)| extension == manifest.artifact_extension())
-            else {
-                continue;
-            };
+            let language = Language::from_extension(extension);
             match self.on_disk.get(&name) {
-                Some(seen) if seen == mtime => continue,
+                Some(seen) if seen == mtime && self.index.get(&name) == Some(&language) => {
+                    continue;
+                }
                 Some(_) => {
                     self.preloaded_binaries.remove(&name);
                     changed.push(name.clone());
@@ -319,23 +284,32 @@ impl Repository {
                 None => {}
             }
             self.on_disk.insert(name.clone(), *mtime);
-            self.index.insert(name, manifest);
+            self.index.insert(name, language);
         }
         changed
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn store_program_cache(&mut self, _wasm_binary: &[u8], manifest: Manifest) -> Result<()> {
-        self.index.insert(manifest.program_name(), manifest);
+    async fn store_program_cache(
+        &mut self,
+        _binary: &[u8],
+        name: &ProgramName,
+        language: Option<Language>,
+    ) -> Result<()> {
+        self.index.insert(name.clone(), language);
         Ok(())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    async fn store_program_cache(&mut self, binary: &[u8], manifest: Manifest) -> Result<()> {
-        let name = manifest.program_name();
+    async fn store_program_cache(
+        &mut self,
+        binary: &[u8],
+        name: &ProgramName,
+        language: Option<Language>,
+    ) -> Result<()> {
         let dir = self.programs_dir.join(&name.name);
-        let artifact = artifact_path(&self.programs_dir, &name, manifest.artifact_extension());
-        let manifest_file = manifest_path(&self.programs_dir, &name);
+        let extension = artifact_extension(language);
+        let artifact = artifact_path(&self.programs_dir, name, extension);
 
         tokio::fs::create_dir_all(&dir)
             .await
@@ -344,16 +318,30 @@ impl Repository {
         tokio::fs::write(&artifact, binary)
             .await
             .map_err(|e| anyhow!("writing {}: {e}", artifact.display()))?;
-        tokio::fs::write(&manifest_file, manifest.to_toml()?)
-            .await
-            .map_err(|e| anyhow!("Failed to write manifest file: {}", e))?;
+        remove_artifacts(&self.programs_dir, name, Some(extension))?;
 
         let mtime = std::fs::metadata(&artifact).and_then(|m| m.modified()).ok();
         self.on_disk.insert(name.clone(), mtime);
-        self.index.insert(name, manifest);
+        self.index.insert(name.clone(), language);
 
         Ok(())
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn remove_artifacts(programs_dir: &Path, name: &ProgramName, keep: Option<&str>) -> Result<()> {
+    for extension in ARTIFACT_EXTENSIONS {
+        if Some(extension) == keep {
+            continue;
+        }
+        let path = artifact_path(programs_dir, name, extension);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow!("removing {:?}: {}", path, e)),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -368,17 +356,15 @@ fn read_dir(dir: &Path) -> impl Iterator<Item = PathBuf> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use crate::inferlet::program::Language;
 
-    fn manifest(toml: &str) -> Manifest {
-        Manifest::parse(toml).unwrap()
+    fn named(name: &str, version: &str) -> ProgramName {
+        ProgramName::parse(&format!("{name}@{version}")).unwrap()
     }
 
     #[tokio::test]
     async fn repository_every_case() {
         a_script_is_stored_as_its_source_and_found_again_on_reload().await;
-        a_component_and_a_script_of_one_name_do_not_shadow_each_other().await;
-        an_unknown_language_is_refused_at_add().await;
+        a_version_is_one_artifact_and_the_newer_kind_replaces_the_older().await;
         a_bare_name_resolves_to_its_newest_version().await;
         a_builtin_is_listed_served_and_shadowed_but_not_removed().await;
         a_running_host_sees_installs_removals_and_replacements().await;
@@ -388,13 +374,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut host = Repository::new(dir.path().to_path_buf());
         host.refresh();
-        let manifest = manifest("[package]\nname = \"late\"\nversion = \"0.1.0\"\n");
-        let name = manifest.program_name();
+        let name = named("late", "0.1.0");
         assert!(!host.exists(&name));
 
         // `pie inferlet install`, from another process.
         let mut cli = Repository::new(dir.path().to_path_buf());
-        cli.add(b"\0asm-one".to_vec(), manifest.clone(), true)
+        cli.add(b"\0asm-one".to_vec(), name.clone(), None, true)
             .await
             .unwrap();
         assert!(
@@ -407,7 +392,7 @@ mod tests {
         // A replacement of the same version is reported, so its compiled
         // form is dropped.
         std::thread::sleep(std::time::Duration::from_millis(20));
-        cli.add(b"\0asm-two".to_vec(), manifest.clone(), true)
+        cli.add(b"\0asm-two".to_vec(), name.clone(), None, true)
             .await
             .unwrap();
         let path = dir.path().join("late").join("0.1.0.wasm");
@@ -431,9 +416,8 @@ mod tests {
     async fn a_builtin_is_listed_served_and_shadowed_but_not_removed() {
         let dir = tempfile::tempdir().unwrap();
         let mut repo = Repository::new(dir.path().to_path_buf());
-        let manifest = manifest("[package]\nname = \"compat\"\nversion = \"0.1.0\"\n");
-        let name = manifest.program_name();
-        repo.add_builtin(manifest.clone(), b"\0asm-builtin");
+        let name = named("compat", "0.1.0");
+        repo.add_builtin(name.clone(), b"\0asm-builtin");
         assert!(repo.exists(&name) && repo.is_builtin(&name));
         assert_eq!(repo.fetch_binary(&name).await.unwrap(), b"\0asm-builtin");
         assert_eq!(repo.cached()[0].2, b"\0asm-builtin".len() as u64);
@@ -449,7 +433,7 @@ mod tests {
         );
 
         // The same name and version installed on disk takes over.
-        repo.add(b"\0asm-disk".to_vec(), manifest.clone(), true)
+        repo.add(b"\0asm-disk".to_vec(), name.clone(), None, true)
             .await
             .unwrap();
         assert!(!repo.is_builtin(&name));
@@ -463,10 +447,10 @@ mod tests {
 
         // And a disk install already there at boot is not replaced.
         let mut repo = Repository::new(dir.path().to_path_buf());
-        repo.add(b"\0asm-disk".to_vec(), manifest.clone(), true)
+        repo.add(b"\0asm-disk".to_vec(), name.clone(), None, true)
             .await
             .unwrap();
-        repo.add_builtin(manifest, b"\0asm-builtin");
+        repo.add_builtin(name.clone(), b"\0asm-builtin");
         assert!(!repo.is_builtin(&name));
     }
 
@@ -474,12 +458,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut repo = Repository::new(dir.path().to_path_buf());
         for version in ["0.9.0", "0.10.0", "0.2.5"] {
-            let manifest = manifest(&format!(
-                "[package]\nname = \"probe\"\nversion = \"{version}\"\n[runtime]\nlanguage = \"python\"\n"
-            ));
-            repo.add(b"async def main(i): return i".to_vec(), manifest, false)
-                .await
-                .unwrap();
+            repo.add(
+                b"async def main(i): return i".to_vec(),
+                named("probe", version),
+                Some(Language::Python),
+                false,
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(
             repo.newest("probe").map(|p| p.version).as_deref(),
@@ -493,13 +479,24 @@ mod tests {
     async fn a_script_is_stored_as_its_source_and_found_again_on_reload() {
         let dir = tempfile::tempdir().unwrap();
         let mut repo = Repository::new(dir.path().to_path_buf());
-        let manifest = manifest(
-            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n[runtime]\nlanguage = \"python\"\nentry = \"go\"\n",
-        );
-        let name = manifest.program_name();
-        repo.add(b"def go(input): return input\n".to_vec(), manifest, false)
+        let name = named("probe", "0.1.0");
+        assert!(
+            repo.add(
+                b"def main(input): return input\n".to_vec(),
+                name.clone(),
+                Some(Language::Python),
+                false,
+            )
             .await
-            .unwrap();
+            .unwrap()
+        );
+        assert!(
+            !repo
+                .add(b"x".to_vec(), name.clone(), Some(Language::Python), false)
+                .await
+                .unwrap(),
+            "a held name is left alone"
+        );
         assert!(dir.path().join("probe").join("0.1.0.py").is_file());
         assert!(!dir.path().join("probe").join("0.1.0.wasm").exists());
 
@@ -507,39 +504,33 @@ mod tests {
         reloaded.refresh();
         assert!(reloaded.exists(&name));
         let source = reloaded.fetch_binary(&name).await.unwrap();
-        assert_eq!(source, b"def go(input): return input\n");
-        let found = reloaded.fetch_manifest(&name).unwrap();
-        assert_eq!(found.language(), Some(Language::Python));
-        assert_eq!(found.entry(), "go");
-        assert_eq!(found.script_file(), "probe.py");
+        assert_eq!(source, b"def main(input): return input\n");
+        assert_eq!(reloaded.language(&name), Some(Some(Language::Python)));
 
         assert!(reloaded.remove(&name).unwrap());
         assert!(!dir.path().join("probe").join("0.1.0.py").exists());
         assert!(!reloaded.exists(&name));
     }
 
-    async fn a_component_and_a_script_of_one_name_do_not_shadow_each_other() {
+    async fn a_version_is_one_artifact_and_the_newer_kind_replaces_the_older() {
         let dir = tempfile::tempdir().unwrap();
         let mut repo = Repository::new(dir.path().to_path_buf());
-        let wasm = manifest("[package]\nname = \"twin\"\nversion = \"0.1.0\"\n");
-        repo.add(b"\0asm".to_vec(), wasm, false).await.unwrap();
-        // A stray source file beside a component manifest is not the program.
-        std::fs::write(dir.path().join("twin").join("0.1.0.py"), "x").unwrap();
+        let name = named("twin", "0.1.0");
+        repo.add(b"\0asm".to_vec(), name.clone(), None, false)
+            .await
+            .unwrap();
+        assert_eq!(repo.language(&name), Some(None));
+        repo.add(b"x".to_vec(), name.clone(), Some(Language::Python), true)
+            .await
+            .unwrap();
+        assert!(!dir.path().join("twin").join("0.1.0.wasm").exists());
+        assert_eq!(repo.language(&name), Some(Some(Language::Python)));
+
         let mut reloaded = Repository::new(dir.path().to_path_buf());
         reloaded.refresh();
         let cached = reloaded.cached();
         assert_eq!(cached.len(), 1);
-        assert_eq!(
-            cached[0].2, 4,
-            "the component's size, not the stray source's"
-        );
-    }
-
-    async fn an_unknown_language_is_refused_at_add() {
-        let err = Manifest::parse(
-            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n[runtime]\nlanguage = \"cobol\"\n",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("cobol"), "{err}");
+        assert_eq!(cached[0].1, Some(Language::Python));
+        assert_eq!(cached[0].2, 1, "the script's size");
     }
 }
