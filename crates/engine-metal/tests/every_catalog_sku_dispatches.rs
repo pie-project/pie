@@ -53,7 +53,10 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
         "kimik3-mini-bf16-mxfp4-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
     ),
-    ("glm53-flash-mini-u4g64-u4g64-kv-bf16-tp2", &["collective.all_reduce"]),
+    (
+        "glm53-flash-mini-u4g64-u4g64-kv-bf16-tp2",
+        &["collective.all_reduce"],
+    ),
     (
         "gptoss-20b-mini-bf16-mxfp4-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
