@@ -234,6 +234,7 @@ impl ForwardHybrid for Model {
         }
 
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.norm_eps) * m.head_scale;
+        let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         ops::linear::lm_head(&x, &m.unembed)
     }
 }

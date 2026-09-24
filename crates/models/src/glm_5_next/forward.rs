@@ -162,6 +162,7 @@ impl ForwardHybrid for Model {
         }
         let y = ops::elemwise::residual_add(&rest, &y);
 
+        let y = ops::layout::gather_rows(&y, &inputs.readout_rows());
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
         let logits = ops::linear::lm_head(&x, &m.head);
 

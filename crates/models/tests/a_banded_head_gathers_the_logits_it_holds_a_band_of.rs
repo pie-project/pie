@@ -1,10 +1,17 @@
-use model_dsl::{Collective, Def, Linear, Operation, Platform, Shard, Trace, ValueId};
+use model_dsl::{Collective, Def, Dim, Linear, Operation, Platform, Shard, Trace, Ty, ValueId};
 
 fn banded(trace: &Trace, w: ValueId) -> bool {
     match trace.values[w.0 as usize].def {
         Def::Weight(at) => matches!(trace.params[at as usize].shard, Shard::Cut { axis: 0, .. }),
         _ => false,
     }
+}
+
+fn readouts(trace: &Trace, v: ValueId) -> bool {
+    matches!(
+        &trace.values[v.0 as usize].ty,
+        Ty::Tensor { shape, .. } if shape.first() == Some(&Dim::Readouts)
+    )
 }
 
 #[test]
@@ -29,14 +36,27 @@ fn a_banded_head_gathers_the_logits_it_holds_a_band_of() {
             .collect();
 
         for node in &trace.nodes {
-            let Operation::Linear(Linear::LmHead { w, y, .. }) = &node.op else {
+            let Operation::Linear(Linear::LmHead { act, w, y }) = &node.op else {
                 continue;
             };
-            if banded(&trace, *w) && !gathered.contains(y) {
+            if !banded(&trace, *w) {
+                continue;
+            }
+            if !gathered.contains(y) {
                 faults.push(format!(
                     "`{}` reads out through a vocab-banded head and nothing gathers \
                      the result: this rank lands only its columns of the logits, so \
                      the readout owes an `all_gather` before anything reads them",
+                    row.name,
+                ));
+            }
+            if !readouts(&trace, *act) {
+                faults.push(format!(
+                    "`{}` feeds its vocab-banded head every row of the fire: the \
+                     gather then carries rows x vocab across the world for a prefill \
+                     whose rows nobody reads out, and the engine reads the `out` seam \
+                     by readout index, so the head owes a `gather_rows` over \
+                     `readout_rows` first",
                     row.name,
                 ));
             }
