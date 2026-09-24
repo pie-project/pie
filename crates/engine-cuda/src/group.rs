@@ -327,6 +327,15 @@ impl Engine for Group {
 
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
         let mut answers = self.each_within(LOAD_WAIT, move |rank| rank.load(request.clone()))?;
+        // a rank's facts (codegen backend, pools) exist only once it has loaded;
+        // the snapshot taken at open was empty, and a group that keeps it says
+        // "no codegen backend" to the host, which then emits no kernels and
+        // every program registration is refused ("stage 0 region 0 is a
+        // generated region and the host emitted nothing for it")
+        self.facts = self.ranks[0]
+            .try_lock()
+            .ok()
+            .and_then(|rank| rank.device_facts().cloned());
         Ok(answers.swap_remove(0))
     }
 
