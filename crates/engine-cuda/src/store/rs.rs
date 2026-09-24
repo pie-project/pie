@@ -121,6 +121,26 @@ fn ext_row_bytes(trace: &Trace) -> Result<u64> {
     Ok(widest)
 }
 
+/// Why a plan `read` reserves nothing for still has a recurrence a lane may ask
+/// to buffer: the pair this shell buffers is the gated-delta one, and a plan
+/// whose chunked recurrence is KDA (as `glm5_next` runs it) is named as such,
+/// so the refusal says what is missing rather than that nothing was declared.
+pub fn unbuffered(trace: &Trace) -> Option<String> {
+    trace.nodes.iter().enumerate().find_map(|(at, node)| {
+        matches!(
+            node.op,
+            Operation::Attention(Attention::SsmKdaChunked { .. })
+        )
+        .then(|| {
+            format!(
+                "its chunked recurrence at node {at} is KDA (`SsmKdaChunked`), and this shell \
+                 buffers the gated-delta pair only (`SsmCausalConv1dChunked` into \
+                 `SsmGatedDeltaChunked` with an `SsmGdnPrep`)"
+            )
+        })
+    })
+}
+
 pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, u64, u32)>> {
     {
         let paging = page_tokens;
@@ -453,5 +473,60 @@ impl Predicate {
         let mut out = vec![0u8; lanes as usize];
         self.region.read(self.at_mask, &mut out)?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use model_ir::{Guard, Node, Platform};
+
+    use super::*;
+
+    fn plan(nodes: Vec<Operation>) -> Trace {
+        Trace {
+            name: "rs".to_string(),
+            platform: Platform::Cuda,
+            params: Vec::new(),
+            caches: Vec::new(),
+            values: Vec::new(),
+            nodes: nodes
+                .into_iter()
+                .map(|op| Node {
+                    op,
+                    guard: Guard::Always,
+                    layer: None,
+                })
+                .collect(),
+            seams: Vec::new(),
+            drafter: None,
+        }
+    }
+
+    /// A KDA plan reserves no buffered planes, and the refusal a lane's
+    /// recurrent verb then meets names the recurrence it has rather than
+    /// saying none was declared.
+    #[test]
+    fn a_kda_recurrence_is_named_as_the_one_this_shell_does_not_buffer() {
+        let kda = plan(vec![Operation::Attention(Attention::SsmKdaChunked {
+            mixed: ValueId(0),
+            f: ValueId(1),
+            b: ValueId(2),
+            dt_bias: ValueId(3),
+            a_log: ValueId(4),
+            state: ValueId(5),
+            heads: 4,
+            head_dim: 32,
+            norm_eps: 1e-6,
+            gate_floor: 0.0,
+            y: ValueId(6),
+        })]);
+        assert!(
+            read(&kda, 16)
+                .expect("a plan with no gated-delta pair reads clean")
+                .is_none()
+        );
+        let why = unbuffered(&kda).expect("the KDA recurrence is named");
+        assert!(why.contains("node 0 is KDA"), "{why}");
+        assert_eq!(unbuffered(&plan(Vec::new())), None);
     }
 }
