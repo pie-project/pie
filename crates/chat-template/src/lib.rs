@@ -11,6 +11,7 @@ pub mod glm;
 pub mod harmony;
 pub mod inkling;
 pub mod kimi;
+pub mod kimi3;
 
 pub use decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder, ThinkingDecoder};
 

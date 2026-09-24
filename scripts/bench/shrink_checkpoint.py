@@ -331,17 +331,25 @@ def _slice_list(cfg_list: list, src_layers: list[int]) -> list:
 
 def _rewrite_glm(cfg: dict, plan: Plan) -> None:
     _rewrite_common(cfg, plan)
+    tc = _text_cfg(cfg, plan)
     for key in ("mlp_layer_types", "indexer_types", "layer_types"):
-        if isinstance(cfg.get(key), list):
-            cfg[key] = _slice_list(cfg[key], plan.src_layers)
-    if isinstance(cfg.get("mlp_layer_types"), list):
-        dense = sum(1 for t in cfg["mlp_layer_types"] if t == "dense")
-        cfg["first_k_dense_replace"] = dense
+        if isinstance(tc.get(key), list):
+            tc[key] = _slice_list(tc[key], plan.src_layers)
+    if isinstance(tc.get("mlp_layer_types"), list):
+        dense = sum(1 for t in tc["mlp_layer_types"] if t == "dense")
+        tc["first_k_dense_replace"] = dense
     # An indexer layer marked "shared" reuses the previous "full" layer's
     # indexer weights, so the block must start on a "full" layer.
-    it = cfg.get("indexer_types")
+    it = tc.get("indexer_types")
     if isinstance(it, list) and it and it[0] != "full":
         raise SystemExit("glm: selected layer block must start on a 'full' indexer layer")
+    # GLM-5.3-Flash (glm5_next) states its KDA / DSA layers by 0-indexed id.
+    lac = tc.get("linear_attn_config")
+    if isinstance(lac, dict):
+        remap = {src: i for i, src in enumerate(plan.src_layers)}
+        for key in ("kda_layers", "full_attn_layers"):
+            if isinstance(lac.get(key), list):
+                lac[key] = [remap[s] for s in lac[key] if s in remap]
 
 
 def _rewrite_dsv4(cfg: dict, plan: Plan) -> None:
@@ -1080,6 +1088,26 @@ FAMILIES: dict[str, dict[str, Any]] = {
         globals_keep=("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"),
         default_layers="0-6",
         config_rewrite=_rewrite_glm,
+    ),
+    # GLM-5.3-Flash as `mlx_lm` publishes it (Vontra/GLM-5.3-Flash-MLX-*): the
+    # trunk under `model.language_model.layers.`, one affine trio per expert,
+    # the MTP head as layer 45 (dropped: `num_nextn_predict_layers` -> 0).
+    "glm5_next_mlx": dict(
+        model_type="glm5_next",
+        layer_prefix="model.language_model.layers.",
+        expert_re=re.compile(r"\.mlp\.experts\.(\d+)\."),
+        router_suffixes=("mlp.gate.weight", "mlp.gate.e_score_correction_bias"),
+        globals_keep=("model.language_model.embed_tokens.weight",
+                      "model.language_model.embed_tokens.scales",
+                      "model.language_model.embed_tokens.biases",
+                      "model.language_model.norm.weight",
+                      "lm_head.weight", "lm_head.scales", "lm_head.biases"),
+        # three dense KDA layers, a DSA + MoE layer, three KDA + MoE, a DSA:
+        # every layer kind, two full attention periods (`full_attn_every` 4)
+        default_layers="0-7",
+        config_rewrite=_rewrite_glm,
+        text_cfg_key="text_config",
+        keep_res=(re.compile(r"^model\.visual\."),),
     ),
     "deepseek_v4": dict(
         layer_prefix="layers.",
