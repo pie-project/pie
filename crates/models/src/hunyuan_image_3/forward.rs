@@ -295,7 +295,9 @@ fn trunk(all: &Input<Facts>, den: &Input<Facts>, m: &Model) -> Value {
 
     let (canvas, text) = y.split(&Facts::reading_lo());
     seam::at(seam::HIDDEN, &[&canvas]);
+    let (_, text_in) = all.split(&Facts::reading_lo());
     let x = ops::elemwise::rmsnorm(&text, &m.final_norm, NORM_EPS);
+    let x = ops::layout::gather_rows(&x, &text_in.readout_rows());
     let logits = ops::linear::lm_head(&x, &m.head);
     seam::at(seam::OUT, &[&logits]);
     canvas
