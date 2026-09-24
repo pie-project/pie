@@ -904,7 +904,14 @@ fn a_coalesced_row_shard_bank_stays_internal_and_keeps_the_members_scales() {
     let bytes = (rows * cols * 2) as u64;
     let mut tensors = Vec::new();
     for i in 0..N as u32 {
-        tensors.push(sized_raw(i, &format!("w{i}"), u64::from(i) * bytes, bytes, &[rows, cols], DType::Bf16));
+        tensors.push(sized_raw(
+            i,
+            &format!("w{i}"),
+            u64::from(i) * bytes,
+            bytes,
+            &[rows, cols],
+            DType::Bf16,
+        ));
     }
     // verify_plan reads the file back, so the planes need a real backing file
     let dir = std::env::temp_dir().join(format!("pie-row-shard-bank-{}", std::process::id()));
@@ -937,7 +944,11 @@ fn a_coalesced_row_shard_bank_stays_internal_and_keeps_the_members_scales() {
                     vec![rows, cols],
                     Encoding::Raw(DType::Bf16),
                 );
-                if i == 3 { t.scaling(scaling.clone()) } else { t }
+                if i == 3 {
+                    t.scaling(scaling.clone())
+                } else {
+                    t
+                }
             })
             .collect(),
         groups: Vec::new(),
@@ -958,11 +969,15 @@ fn a_coalesced_row_shard_bank_stays_internal_and_keeps_the_members_scales() {
         .map(|t| t.name.as_str())
         .collect();
     assert!(
-        !published.iter().any(|name| name.starts_with("__pie.row_shard_bank")),
+        !published
+            .iter()
+            .any(|name| name.starts_with("__pie.row_shard_bank")),
         "the bank is published: {published:?}"
     );
     assert!(
-        plan.tensors.iter().any(|t| t.name.starts_with("__pie.row_shard_bank")),
+        plan.tensors
+            .iter()
+            .any(|t| t.name.starts_with("__pie.row_shard_bank")),
         "the coalescer did not fire, so this test covers nothing"
     );
 }
