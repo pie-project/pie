@@ -79,10 +79,12 @@ pub fn ngram_ids(
     primes: &[u64],
     offsets: &[u64],
     heads_per_ngram: u32,
+    map: Option<Tensor>,
     ngram_ids: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ple_ngram_ids";
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` reads i32 token ids");
+    id_map(OP, map.as_ref())?;
     debug_assert_eq!(ngram_ids.dtype, Dtype::I32, "`{OP}` lands i32 table rows");
     let h = hash_arg(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     debug_assert_eq!(
@@ -105,9 +107,27 @@ pub fn ngram_ids(
                 ptr: std::ptr::from_ref(&h).cast(),
                 len: size_of::<PleHash>(),
             },
+            ArgValue::Ptr(map.map_or(0, |t| t.ptr)),
             ctx.stage(),
         ],
     )
+}
+
+/// Engram's tokenizer-compressed ids: one i64 per vocabulary row.
+fn id_map(op: &'static str, map: Option<&Tensor>) -> Result<(), Error> {
+    if let Some(map) = map {
+        if map.dtype != Dtype::I64 {
+            return Err(refuse(
+                op,
+                format!(
+                    "the id map is {:?}, and the hasher maps through i64",
+                    map.dtype
+                ),
+            ));
+        }
+        nonzero(op, "the id map's rows", map.rows)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -120,10 +140,12 @@ pub fn ngram_ids_chunked(
     primes: &[u64],
     offsets: &[u64],
     heads_per_ngram: u32,
+    map: Option<Tensor>,
     ngram_ids: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ple_ngram_ids_chunked";
     debug_assert_eq!(ids.data.dtype, Dtype::I32, "`{OP}` reads i32 token ids");
+    id_map(OP, map.as_ref())?;
     debug_assert_eq!(ngram_ids.dtype, Dtype::I32, "`{OP}` lands i32 table rows");
     let h = hash_arg(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     let lanes = nonzero(OP, "request lanes", ids.indptr.rows.saturating_sub(1))?;
@@ -146,6 +168,7 @@ pub fn ngram_ids_chunked(
                 ptr: std::ptr::from_ref(&h).cast(),
                 len: size_of::<PleHash>(),
             },
+            ArgValue::Ptr(map.map_or(0, |t| t.ptr)),
             ctx.stage(),
         ],
     )

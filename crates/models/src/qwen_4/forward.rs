@@ -292,6 +292,7 @@ fn ple(y: &Value, ids: &Value, inputs: &Input<Facts>, m: &Model, p: &Ple) -> Val
             &p.primes,
             &p.offsets,
             p.heads_per_ngram,
+            None,
         ),
         ops::attn::ple_ngram_ids_chunked(
             &ids_p,
@@ -301,6 +302,7 @@ fn ple(y: &Value, ids: &Value, inputs: &Input<Facts>, m: &Model, p: &Ple) -> Val
             &p.primes,
             &p.offsets,
             p.heads_per_ngram,
+            None,
         ),
     ]);
     let e = ops::layout::embed_concat(

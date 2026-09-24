@@ -852,6 +852,7 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } => kernels_cuda::attn_ple::ngram_ids(
                 self.ctx(),
@@ -862,6 +863,7 @@ impl Run<'_> {
                 primes,
                 offsets,
                 *heads_per_ngram,
+                map.map(|id| self.tensor(id)),
                 &mut self.tensor(*ngram_ids),
             ),
             Attention::PleNgramIdsChunked {
@@ -872,6 +874,7 @@ impl Run<'_> {
                 primes,
                 offsets,
                 heads_per_ngram,
+                map,
                 ngram_ids,
             } => {
                 let tail = self.recurrent_tail_absolute(*state);
@@ -884,6 +887,7 @@ impl Run<'_> {
                     primes,
                     offsets,
                     *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
                     &mut self.tensor(*ngram_ids),
                 )?;
                 let Some(tail) = tail else { return Ok(()) };
@@ -896,6 +900,7 @@ impl Run<'_> {
                     primes,
                     offsets,
                     *heads_per_ngram,
+                    map.map(|id| self.tensor(id)),
                     &mut self.tensor(*ngram_ids),
                 )
             }

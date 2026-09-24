@@ -570,6 +570,7 @@ pub fn selector_walk(
     picks
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn ple_ngram_ids(
     ids: &Value,
     state: ValueId,
@@ -578,6 +579,7 @@ pub fn ple_ngram_ids(
     primes: &[u64],
     offsets: &[u64],
     heads_per_ngram: u32,
+    map: Option<&Weight>,
 ) -> Value {
     let r = ids.rec();
     let ngram_ids = r.fresh(tensor(ids.rows(), primes.len() as u64, Dtype::I32));
@@ -590,6 +592,7 @@ pub fn ple_ngram_ids(
             primes: primes.to_vec(),
             offsets: offsets.to_vec(),
             heads_per_ngram,
+            map: map.map(|w| r.weight(w)),
             ngram_ids: ngram_ids.id(),
         },
         &[ids],
@@ -597,6 +600,7 @@ pub fn ple_ngram_ids(
     ngram_ids
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn ple_ngram_ids_chunked(
     ids: &Value,
     state: ValueId,
@@ -605,6 +609,7 @@ pub fn ple_ngram_ids_chunked(
     primes: &[u64],
     offsets: &[u64],
     heads_per_ngram: u32,
+    map: Option<&Weight>,
 ) -> Value {
     let r = ids.rec();
     let ngram_ids = r.fresh(tensor(ids.rows(), primes.len() as u64, Dtype::I32));
@@ -617,6 +622,7 @@ pub fn ple_ngram_ids_chunked(
             primes: primes.to_vec(),
             offsets: offsets.to_vec(),
             heads_per_ngram,
+            map: map.map(|w| r.weight(w)),
             ngram_ids: ngram_ids.id(),
         },
         &[ids],

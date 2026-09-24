@@ -47,6 +47,30 @@ pub const ROWS: &[Row] = &[
         arch: "deepseek_v4",
     },
     Row {
+        id: "dsv41-flash-u4g64-kv-bf16",
+        layers: 40,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+    },
+    Row {
+        id: "dsv41-flash-bf16-mxfp4-kv-bf16",
+        layers: 40,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+    },
+    Row {
+        id: "dsv41-flash-mini-bf16-mxfp4-kv-bf16",
+        layers: 8,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+    },
+    Row {
+        id: "dsv4-flash-mini-bf16-kv-bf16",
+        layers: 5,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+    },
+    Row {
         id: "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16",
         layers: 5,
         vocab: 129_280,

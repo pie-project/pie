@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::encode::{Arg, Ctx, Fire, nonzero, refuse, stated};
+use crate::encode::{Arg, ArgValue, Ctx, Fire, nonzero, refuse, stated};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
 const FILE: &str = "attn/ple.metal";
@@ -93,6 +93,27 @@ fn hash_plane(op: &'static str, hash: Tensor, shape: &Shape) -> Result<(), Error
     Ok(())
 }
 
+/// Engram's tokenizer-compressed ids: an optional i64 table the window is
+/// mapped through, bound as an absent buffer and a zero flag when unused.
+fn id_map(op: &'static str, ctx: &Ctx<'_>, map: Option<Tensor>) -> Result<[ArgValue; 2], Error> {
+    match map {
+        Some(map) => {
+            if map.dtype != Dtype::I64 {
+                return Err(refuse(
+                    op,
+                    format!(
+                        "the id map is {:?}, and the hasher maps through i64",
+                        map.dtype
+                    ),
+                ));
+            }
+            nonzero(op, "the id map's rows", map.rows)?;
+            Ok([map.arg(), 1i32.arg()])
+        }
+        None => Ok([ctx.absent()?, 0i32.arg()]),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn ngram_ids(
     ctx: &Ctx<'_>,
@@ -104,6 +125,7 @@ pub fn ngram_ids(
     primes: &[u64],
     offsets: &[u64],
     heads_per_ngram: u32,
+    map: Option<Tensor>,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ple_ngram_ids";
@@ -118,6 +140,7 @@ pub fn ngram_ids(
     }
     let shape = shape(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     hash_plane(OP, hash, &shape)?;
+    let map_args = id_map(OP, ctx, map)?;
     debug_assert_eq!(
         ngram_ids.width, shape.heads,
         "one output column per hashed head"
@@ -140,6 +163,8 @@ pub fn ngram_ids(
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.heads_per_ngram)?.arg(),
             stated(OP, shape.eos)?.arg(),
+            map_args[0],
+            map_args[1],
         ],
     )
 }
@@ -155,6 +180,7 @@ pub fn ngram_ids_chunked(
     primes: &[u64],
     offsets: &[u64],
     heads_per_ngram: u32,
+    map: Option<Tensor>,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ple_ngram_ids_chunked";
@@ -178,6 +204,7 @@ pub fn ngram_ids_chunked(
     }
     let shape = shape(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     hash_plane(OP, hash, &shape)?;
+    let map_args = id_map(OP, ctx, map)?;
     debug_assert_eq!(
         ngram_ids.width, shape.heads,
         "one output column per hashed head"
@@ -205,6 +232,8 @@ pub fn ngram_ids_chunked(
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.heads_per_ngram)?.arg(),
             stated(OP, shape.eos)?.arg(),
+            map_args[0],
+            map_args[1],
         ],
     )
 }
@@ -341,6 +370,7 @@ pub fn ngram_ids_committed(
     primes: &[u64],
     offsets: &[u64],
     heads_per_ngram: u32,
+    map: Option<Tensor>,
     ngram_ids: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ple_ngram_ids_committed";
@@ -355,6 +385,7 @@ pub fn ngram_ids_committed(
     }
     let shape = shape(OP, eos, mults, primes, offsets, heads_per_ngram)?;
     hash_plane(OP, hash, &shape)?;
+    let map_args = id_map(OP, ctx, map)?;
     nonzero(OP, "extended rows", ids.rows)?;
     let lanes = match indptr.rows.checked_sub(1) {
         Some(lanes) if lanes > 0 => lanes,
@@ -381,6 +412,8 @@ pub fn ngram_ids_committed(
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.heads_per_ngram)?.arg(),
             stated(OP, shape.eos)?.arg(),
+            map_args[0],
+            map_args[1],
         ],
     )
 }
@@ -446,6 +479,7 @@ mod tests {
             &PRIMES,
             &OFFSETS,
             2,
+            None,
             i32t(2, 6, 4),
         )
         .expect_err("a four-constant plane cannot hold eleven");
@@ -465,6 +499,7 @@ mod tests {
             &PRIMES,
             &OFFSETS,
             3,
+            None,
             i32t(2, 6, 4),
         )
         .expect_err("four heads are not three per order");
