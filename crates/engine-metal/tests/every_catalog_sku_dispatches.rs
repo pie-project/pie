@@ -53,10 +53,7 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
         "kimik3-mini-bf16-mxfp4-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
     ),
-    (
-        "glm53-flash-mini-u4g64-u4g64-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
+    ("glm53-flash-mini-u4g64-u4g64-kv-bf16-tp2", &["collective.all_reduce"]),
     (
         "gptoss-20b-mini-bf16-mxfp4-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
@@ -65,10 +62,7 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
         "qwen36-35b-a3b-mini-u4g64-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
     ),
-    (
-        "qwen35-d0.8b-bf16-kv-bf16-tp2",
-        &["collective.all_gather", "collective.all_reduce"],
-    ),
+    ("qwen35-d0.8b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
     (
         "gemma4-e4b-bf16-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
