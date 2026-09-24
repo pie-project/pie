@@ -918,18 +918,11 @@ impl FrameShell for Shell {
             };
             if verb != RsMove::None && self.buffers.is_none() {
                 return Err(Fault::Unbound {
-                    what: match self.unbuffered.as_deref() {
-                        Some(why) => format!(
-                            "lane {}'s recurrent verb, against a plan whose chunked recurrence \
-                             this shell does not buffer ({why})",
-                            row.source
-                        ),
-                        None => format!(
-                            "lane {}'s recurrent verb, against a plan that declares no chunked \
-                             recurrence to buffer",
-                            row.source
-                        ),
-                    },
+                    what: format!(
+                        "lane {}'s recurrent verb, against a plan that declares no chunked \
+                         recurrence to buffer",
+                        row.source
+                    ),
                 });
             }
             if verb != RsMove::None

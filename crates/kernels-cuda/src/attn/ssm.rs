@@ -1164,6 +1164,29 @@ impl Kda {
         })
     }
 
+    /// The scan walks each head's `D x D` state in place, so a fire in which
+    /// some row may not fold its boundary (no fold asked, or a predicate
+    /// naming the lanes that do) gets a working copy per row and head; a
+    /// fire that folds everywhere walks the slots themselves.
+    fn work(
+        self,
+        ctx: &Ctx,
+        op: &'static str,
+        state: &RecurrentPool,
+        rows: u32,
+    ) -> Result<u64, Error> {
+        if state.write_state && state.write_state_mask.is_absent() {
+            return Ok(0);
+        }
+        let cells = u64::from(self.head_dim) * u64::from(self.head_dim);
+        plane(
+            ctx,
+            op,
+            "attn.ssm_kda_work",
+            u64::from(rows) * u64::from(self.heads) * cells,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn stage(
         self,
@@ -1269,8 +1292,9 @@ pub fn kda_step(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
     f32_state(OP, state)?;
-    seated(OP, state, "ssm_kda_step_batched", false, false, false)?;
+    seated(OP, state, "ssm_kda_step_batched", true, false, false)?;
     let staged = shape.stage(ctx, OP, mixed, f, b, dt_bias, a_log, norm_eps, gate_floor)?;
+    let work = shape.work(ctx, OP, state, shape.n)?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::ssm_kda_step_batched").apply(
@@ -1289,6 +1313,9 @@ pub fn kda_step(
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            ArgValue::Ptr(work),
             ctx.stage(),
         ],
     )
@@ -1320,10 +1347,11 @@ pub fn kda_chunked(
     let shape = Kda::of(OP, mixed.data, f, b, y, heads, head_dim)?;
     let lanes = requests(OP, mixed)?;
     f32_state(OP, state)?;
-    seated(OP, state, "ssm_kda_chunked_batched", false, false, false)?;
+    seated(OP, state, "ssm_kda_chunked_batched", true, true, true)?;
     let staged = shape.stage(
         ctx, OP, mixed.data, f, b, dt_bias, a_log, norm_eps, gate_floor,
     )?;
+    let work = shape.work(ctx, OP, state, lanes)?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::ssm_kda_chunked_batched").apply(
@@ -1346,6 +1374,11 @@ pub fn kda_chunked(
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
+            state.write_state.arg(),
+            state.commit_len.arg(),
+            state.write_state_mask.arg(),
+            state.begin_at.arg(),
+            ArgValue::Ptr(work),
             ctx.stage(),
         ],
     )

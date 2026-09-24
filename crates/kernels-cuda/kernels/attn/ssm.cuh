@@ -2448,6 +2448,23 @@ __global__ void ssm_kda_qkv_prep(
     }
 }
 
+// The KDA scan walks its `D x D` head state in place, so a row that does not
+// fold this fire's boundary (an unfolded buffer, a masked lane, the replayed
+// tail past a commit) walks a copy of it in `work` and the slot stays what
+// the fold before it left.
+__device__ __forceinline__ float* kda_state_or_copy(
+    float* __restrict__ st,
+    float* __restrict__ work,
+    long long at,
+    int D,
+    bool fold)
+{
+    if (fold) return st;
+    float* copy = work + at * D * D;
+    for (int i = threadIdx.x; i < D * D; i += blockDim.x) copy[i] = st[i];
+    return copy;
+}
+
 __global__ void ssm_kda_step_batched(
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
@@ -2459,6 +2476,9 @@ __global__ void ssm_kda_step_batched(
     long long slot_stride_elems,
     float* __restrict__ out,
     int H, int D,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
+    float* __restrict__ work,
     const u32* __restrict__ win)
 {
     const int r = blockIdx.x;
@@ -2477,8 +2497,9 @@ __global__ void ssm_kda_step_batched(
 
     const int slot = slot_ids[r];
     if (slot < 0) return;
-    float* st = state_base + (long long)slot * slot_stride_elems +
-                (long long)h * D * D;
+    float* st = kda_state_or_copy(
+        state_base + (long long)slot * slot_stride_elems + (long long)h * D * D,
+        work, rh, D, folds(write_state, write_state_mask, r));
     float* out_h = out + ((long long)r_row * H + h) * D;
 
     extern __shared__ float smem[];
@@ -2536,6 +2557,11 @@ __global__ void ssm_kda_chunked_batched(
     long long slot_stride_elems,
     float* __restrict__ out,
     int H, int D,
+    bool write_state,
+    const int* __restrict__ commit_len,
+    const u8* __restrict__ write_state_mask,
+    const int* __restrict__ begin_at,
+    float* __restrict__ work,
     const u32* __restrict__ win)
 {
     const int r = blockIdx.x;
@@ -2545,12 +2571,23 @@ __global__ void ssm_kda_chunked_batched(
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
 
-    const long long begin = qo_indptr[r];
-    const long long end = qo_indptr[r + 1];
+    long long begin = qo_indptr[r];
+    long long end = qo_indptr[r + 1];
+    if (begin_at != nullptr) {
+        const long long b = begin + begin_at[rl];
+        if (b > begin) begin = b < end ? b : end;
+    }
+    if (commit_len != nullptr) {
+        const long long c = begin + commit_len[rl];
+        if (c < end) end = c;
+    }
     if (end <= begin) return;
 
-    float* st = state_base + (long long)slot_ids[rl] * slot_stride_elems +
-                (long long)h * D * D;
+    const int slot = slot_ids[rl];
+    if (slot < 0) return;
+    float* st = kda_state_or_copy(
+        state_base + (long long)slot * slot_stride_elems + (long long)h * D * D,
+        work, (long long)r * H + h, D, folds(write_state, write_state_mask, rl));
 
     extern __shared__ float smem[];
     float* sq = smem;

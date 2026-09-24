@@ -776,6 +776,7 @@ impl Run<'_> {
                         *y,
                     );
                 }
+                self.rs_move("attention.ssm_causal_conv1d", *x, self.tensor(*x))?;
                 attn::ssm::causal_conv1d(
                     self.ctx(),
                     self.tensor(*x),
@@ -1058,20 +1059,40 @@ impl Run<'_> {
                 norm_eps,
                 gate_floor,
                 y,
-            } => attn::ssm::kda_step(
-                self.ctx(),
-                self.tensor(*mixed),
-                self.tensor(*f),
-                self.tensor(*b),
-                self.tensor(*dt_bias),
-                self.tensor(*a_log),
-                &self.recurrent(*state),
-                *heads,
-                *head_dim,
-                *norm_eps,
-                *gate_floor,
-                &mut self.tensor(*y),
-            ),
+            } => {
+                if self.rs_extended() {
+                    return self.kda_extended(
+                        "attention.ssm_kda_step",
+                        *mixed,
+                        *f,
+                        *b,
+                        *dt_bias,
+                        *a_log,
+                        *state,
+                        *heads,
+                        *head_dim,
+                        *norm_eps,
+                        *gate_floor,
+                        *y,
+                    );
+                }
+                self.rs_move("attention.ssm_kda_step", *f, self.tensor(*f))?;
+                self.rs_move("attention.ssm_kda_step", *b, self.tensor(*b))?;
+                attn::ssm::kda_step(
+                    self.ctx(),
+                    self.tensor(*mixed),
+                    self.tensor(*f),
+                    self.tensor(*b),
+                    self.tensor(*dt_bias),
+                    self.tensor(*a_log),
+                    &self.recurrent(*state),
+                    *heads,
+                    *head_dim,
+                    *norm_eps,
+                    *gate_floor,
+                    &mut self.tensor(*y),
+                )
+            }
             Attention::SsmKdaChunked {
                 mixed,
                 f,
@@ -1084,20 +1105,56 @@ impl Run<'_> {
                 norm_eps,
                 gate_floor,
                 y,
-            } => attn::ssm::kda_chunked(
-                self.ctx(),
-                self.ragged_lanes(*mixed),
-                self.tensor(*f),
-                self.tensor(*b),
-                self.tensor(*dt_bias),
-                self.tensor(*a_log),
-                &self.recurrent_absolute(*state),
-                *heads,
-                *head_dim,
-                *norm_eps,
-                *gate_floor,
-                &mut self.tensor(*y),
-            ),
+            } => {
+                if self.rs_extended() {
+                    return self.kda_extended(
+                        "attention.ssm_kda_chunked",
+                        *mixed,
+                        *f,
+                        *b,
+                        *dt_bias,
+                        *a_log,
+                        *state,
+                        *heads,
+                        *head_dim,
+                        *norm_eps,
+                        *gate_floor,
+                        *y,
+                    );
+                }
+                self.rs_move("attention.ssm_kda_chunked", *f, self.tensor(*f))?;
+                self.rs_move("attention.ssm_kda_chunked", *b, self.tensor(*b))?;
+                let tail = self.recurrent_tail_absolute(*state);
+                attn::ssm::kda_chunked(
+                    self.ctx(),
+                    self.ragged_lanes(*mixed),
+                    self.tensor(*f),
+                    self.tensor(*b),
+                    self.tensor(*dt_bias),
+                    self.tensor(*a_log),
+                    &self.recurrent_absolute(*state),
+                    *heads,
+                    *head_dim,
+                    *norm_eps,
+                    *gate_floor,
+                    &mut self.tensor(*y),
+                )?;
+                let Some(tail) = tail else { return Ok(()) };
+                attn::ssm::kda_chunked(
+                    self.ctx(),
+                    self.ragged_lanes(*mixed),
+                    self.tensor(*f),
+                    self.tensor(*b),
+                    self.tensor(*dt_bias),
+                    self.tensor(*a_log),
+                    &tail,
+                    *heads,
+                    *head_dim,
+                    *norm_eps,
+                    *gate_floor,
+                    &mut self.tensor(*y),
+                )
+            }
             Attention::IndexLayernormRope {
                 k,
                 positions,
@@ -1550,6 +1607,69 @@ impl Run<'_> {
                 v_heads,
                 k_dim,
                 v_dim,
+                &mut y_ext,
+            )?;
+        }
+        self.rs_land(op, y_ext, y)?;
+        self.rs_layer_done();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn kda_extended(
+        &self,
+        op: &'static str,
+        mixed: ValueId,
+        f: ValueId,
+        b: ValueId,
+        dt_bias: ValueId,
+        a_log: ValueId,
+        state: ValueId,
+        heads: u32,
+        head_dim: u32,
+        norm_eps: f32,
+        gate_floor: f32,
+        y: ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        let mixed_ext = self.rs_ext_of(op, mixed)?;
+        let f_ext = self.rs_extend(op, f, true)?;
+        let b_ext = self.rs_extend(op, b, true)?;
+        let csr = self.rs_ext_csr(op)?;
+        let mut y_ext = self.rs_out(op, y)?;
+        let tail = self.recurrent_tail_absolute(state);
+        attn::ssm::kda_chunked(
+            self.ctx(),
+            RaggedTensor {
+                data: mixed_ext,
+                indptr: csr,
+            },
+            f_ext,
+            b_ext,
+            self.tensor(dt_bias),
+            self.tensor(a_log),
+            &self.recurrent_absolute(state),
+            heads,
+            head_dim,
+            norm_eps,
+            gate_floor,
+            &mut y_ext,
+        )?;
+        if let Some(tail) = tail {
+            attn::ssm::kda_chunked(
+                self.ctx(),
+                RaggedTensor {
+                    data: mixed_ext,
+                    indptr: csr,
+                },
+                f_ext,
+                b_ext,
+                self.tensor(dt_bias),
+                self.tensor(a_log),
+                &tail,
+                heads,
+                head_dim,
+                norm_eps,
+                gate_floor,
                 &mut y_ext,
             )?;
         }
