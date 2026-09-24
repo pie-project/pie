@@ -16,6 +16,19 @@ __device__ __forceinline__ float silu_f(float z) {
     return z / (1.f + __expf(-z));
 }
 
+// Whether lane `r` folds this fire's boundary: a fire that buffers its rows
+// for a later commit asks every arm not to write the state, and a
+// predicated fire names the lanes that do.
+__device__ __forceinline__ bool row_persists(
+    const u8* __restrict__ mask, int r) {
+    return mask == nullptr || mask[r] != 0;
+}
+
+__device__ __forceinline__ bool folds(
+    bool write_state, const u8* __restrict__ mask, int r) {
+    return write_state && row_persists(mask, r);
+}
+
 template <bool SILU, bool RESIDUAL>
 __device__ __forceinline__ float conv_out(float acc, float x_t) {
     if constexpr (RESIDUAL) {
@@ -430,6 +443,8 @@ __global__ void ssm_causal_conv1d_update_batched(
     long long slot_stride_elems,
     T* __restrict__ y,
     int R, int C, int K, int dil,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
     const u32* __restrict__ win)
 {
     const int r = blockIdx.y;
@@ -465,6 +480,7 @@ __global__ void ssm_causal_conv1d_update_batched(
     }
     y_r[c] = Elem<T>::from_f32(conv_out<SILU, RESIDUAL>(acc, new_x));
 
+    if (!folds(write_state, write_state_mask, rl)) return;
     const int span = (K - 1) * dil;
     for (int k = 0; k < span; ++k) {
         state[k * C + c] = state[(k + 1) * C + c];
@@ -482,6 +498,8 @@ __global__ void ssm_causal_conv1d_update_batched_vec8(
     long long slot_stride_elems,
     T* __restrict__ y,
     int R, int C, int K,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
     const u32* __restrict__ win)
 {
     constexpr int VEC = 8;
@@ -547,6 +565,7 @@ __global__ void ssm_causal_conv1d_update_batched_vec8(
     }
     *reinterpret_cast<uint4*>(y + (long long)r_row * C + c0) = yv.raw;
 
+    if (!folds(write_state, write_state_mask, rl)) return;
     #pragma unroll
     for (int k = 0; k < K_MAX - 1; ++k) {
         if (k < span) {
@@ -825,6 +844,15 @@ __device__ __forceinline__ void state_store<__nv_bfloat16>(
     *p = __float2bfloat16(v);
 }
 
+// What a value reads back as once it has been through the state's cell: the
+// unfolded step rounds where the folded one stores, so both answer alike.
+template <typename StateT>
+__device__ __forceinline__ float state_round(float v) {
+    StateT cell;
+    state_store(&cell, v);
+    return state_load(&cell);
+}
+
 template <bool KLast>
 __device__ __forceinline__ long long state_offset(
     int k_idx, int v_idx, int K_d, int V_d) {
@@ -841,11 +869,6 @@ __device__ __forceinline__ float warp_sum(float x) {
         x += __shfl_down_sync(0xffffffffu, x, offset);
     }
     return __shfl_sync(0xffffffffu, x, 0);
-}
-
-__device__ __forceinline__ bool row_persists(
-    const u8* __restrict__ mask, int r) {
-    return mask == nullptr || mask[r] != 0;
 }
 
 template <typename StateT, bool KLast>
@@ -1374,6 +1397,8 @@ __global__ void ssm_gated_delta_step_batched_gqa(
     long long slot_stride_elems,
     float*       __restrict__ out,
     int K_h, int V_h, int K_d, int V_d,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
     const u32* __restrict__ win)
 {
     const int r = blockIdx.x;
@@ -1387,6 +1412,7 @@ __global__ void ssm_gated_delta_step_batched_gqa(
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     const int slot = slot_ids[rl];
     if (slot < 0) return;
+    const bool fold = folds(write_state, write_state_mask, rl);
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
     const long long vh = (long long)r * V_h + h;
@@ -1417,7 +1443,7 @@ __global__ void ssm_gated_delta_step_batched_gqa(
             const long long off =
                 state_offset<KLast>(k_idx, v_idx, K_d, V_d);
             const float s = state_load(state + off) * g_h;
-            state_store(state + off, s);
+            if (fold) state_store(state + off, s);
             kv_mem += s * sk[k_idx];
         }
 
@@ -1428,8 +1454,11 @@ __global__ void ssm_gated_delta_step_batched_gqa(
         for (int k_idx = 0; k_idx < K_d; ++k_idx) {
             const long long off =
                 state_offset<KLast>(k_idx, v_idx, K_d, V_d);
-            const float s = state_load(state + off) + sk[k_idx] * delta;
-            state_store(state + off, s);
+            const float decayed = fold
+                ? state_load(state + off)
+                : state_round<StateT>(state_load(state + off) * g_h);
+            const float s = decayed + sk[k_idx] * delta;
+            if (fold) state_store(state + off, s);
             out_v += s * sq[k_idx];
         }
         out_bh[v_idx] = out_v;
@@ -1810,6 +1839,8 @@ __global__ void ssm_gated_delta_step_batched_gqa_smem(
     long long slot_stride_elems,
     float*       __restrict__ out,
     int K_h, int V_h, int K_d, int V_d,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
     const u32* __restrict__ win)
 {
     const int vt = blockIdx.x;
@@ -1826,6 +1857,7 @@ __global__ void ssm_gated_delta_step_batched_gqa_smem(
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     const int slot = slot_ids[rl];
     if (slot < 0) return;
+    const bool fold = folds(write_state, write_state_mask, rl);
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
     const long long vh = (long long)r * V_h + h;
@@ -1894,12 +1926,12 @@ __global__ void ssm_gated_delta_step_batched_gqa_smem(
 
         if (vec_tile) {
             s_state[k * BV + threadIdx.x] = __float2bfloat16(s);
-        } else {
+        } else if (fold) {
             state[(long long)k * V_d + v_idx] = __float2bfloat16(s);
         }
     }
     out_bh[v_idx] = out_v;
-    if (vec_tile) {
+    if (vec_tile && fold) {
         __syncthreads();
         const uint4* __restrict__ src = reinterpret_cast<const uint4*>(s_state);
         uint4* __restrict__ dst = reinterpret_cast<uint4*>(state);
@@ -1976,6 +2008,8 @@ __global__ void __launch_bounds__(256) ssm_gdn_decode_step(
     float* __restrict__ out,
     int K_h, int V_h, int K_d, int V_d, int conv_dim,
     float q_scale,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
     const u32* __restrict__ win)
 {
     constexpr int BLOCK = 256;
@@ -1995,6 +2029,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_decode_step(
     const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
     const int slot = slot_ids[rl];
     if (slot < 0) return;
+    const bool fold = folds(write_state, write_state_mask, rl);
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -2077,7 +2112,7 @@ __global__ void __launch_bounds__(256) ssm_gdn_decode_step(
         s[u] = sn;
         x[u] = sn * qi;
     }
-    if (live) gdn_store8(cell, s);
+    if (live && fold) gdn_store8(cell, s);
     gdn_column_sum<TPR, WARPS, BV>(x, red, tot, tid, lane, warp);
     if (tid < TPR) {
         float* o = out + ((long long)r_row * V_h + h) * V_d + j0;

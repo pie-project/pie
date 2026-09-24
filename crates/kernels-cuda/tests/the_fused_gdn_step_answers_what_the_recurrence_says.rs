@@ -20,8 +20,26 @@ struct Window {
     base: u32,
 }
 
+/// How the fire treats the recurrent boundary: folded into the state, left
+/// buffered for a later commit, or folded on the lanes a predicate names.
+#[derive(Clone, Copy)]
+enum Boundary {
+    Folded,
+    Buffered,
+    Predicated([u8; 3]),
+}
+
+/// Elements past each slot's state bank; eight keeps the fused arm's
+/// vector stride, anything else sends a 128-wide head to the staged arm.
+const PAD: usize = 8;
+
 #[allow(clippy::too_many_lines)]
 fn check(geo: Geometry, window: Option<Window>) {
+    check_at(geo, window, Boundary::Folded, PAD);
+}
+
+#[allow(clippy::too_many_lines)]
+fn check_at(geo: Geometry, window: Option<Window>, boundary: Boundary, pad: usize) {
     let Geometry {
         k_heads,
         v_heads,
@@ -42,7 +60,7 @@ fn check(geo: Geometry, window: Option<Window>) {
     );
     let conv_dim = 2 * kh * kd + vh * vd;
     let bank = vh * kd * vd;
-    let stride = bank + 8;
+    let stride = bank + pad;
 
     let mut lcg = Lcg::seeded(0x6d6e);
     let (qkv_raw, qkv) = lcg.row(planes as usize * conv_dim);
@@ -60,6 +78,10 @@ fn check(geo: Geometry, window: Option<Window>) {
     let slab_at = gpu.up(&slab_raw);
     let gates_at = gpu.up(&gates);
     let slots_at = gpu.up(&slot_of);
+    let mask_at = match boundary {
+        Boundary::Predicated(lanes) => gpu.up(&lanes),
+        Boundary::Folded | Boundary::Buffered => 0,
+    };
     let y_at = gpu.zeros(planes as usize * vh * vd * 4);
     let ctx = gpu.ctx();
     if window.is_some() {
@@ -73,8 +95,11 @@ fn check(geo: Geometry, window: Option<Window>) {
         slot_stride_elems: stride as i64,
         conv_slab: Tensor::ABSENT,
         conv_stride: 0,
-        write_state: true,
-        write_state_mask: Tensor::ABSENT,
+        write_state: !matches!(boundary, Boundary::Buffered),
+        write_state_mask: match boundary {
+            Boundary::Predicated(_) => Tensor::new(mask_at, rows, 1, Dtype::U8),
+            Boundary::Folded | Boundary::Buffered => Tensor::ABSENT,
+        },
         commit_len: Tensor::ABSENT,
         begin_at: Tensor::ABSENT,
         fused_decay: false,
@@ -105,6 +130,11 @@ fn check(geo: Geometry, window: Option<Window>) {
         let plane = base as usize + r;
         let row = &qkv[plane * conv_dim..(plane + 1) * conv_dim];
         let slot = slot_of[r] as usize;
+        let folds = match boundary {
+            Boundary::Folded => true,
+            Boundary::Buffered => false,
+            Boundary::Predicated(lanes) => lanes[r] != 0,
+        };
         for h in 0..vh {
             let h_k = h / (vh / kh);
             let q = &row[h_k * kd..(h_k + 1) * kd];
@@ -123,7 +153,9 @@ fn check(geo: Geometry, window: Option<Window>) {
                 for i in 0..kd {
                     let sn = round(state[i * vd + j] * g) + k[i] * k_inv * delta;
                     out += sn * q[i] * q_inv;
-                    state[i * vd + j] = round(sn);
+                    if folds {
+                        state[i * vd + j] = round(sn);
+                    }
                 }
                 want_y[(plane * vh + h) * vd + j] = out;
             }
@@ -150,6 +182,56 @@ fn the_fused_gdn_step_answers_what_the_recurrence_says_every_case() {
     the_fused_step_retires_a_buckets_padded_rows_and_reads_the_planes_where_the_window_says();
     the_fused_step_answers_at_a_64_wide_head();
     the_fused_step_answers_at_an_uneven_head();
+    every_step_arm_leaves_the_state_when_the_fire_buffers_its_rows();
+    every_step_arm_folds_the_lanes_the_predicate_names();
+}
+
+/// A speculative window buffers its rows unfolded: each arm answers what the
+/// recurrence says and leaves the state where it found it. The fused arm at
+/// a vector stride, the staged arm at a 128-wide head off it, and the
+/// per-value arm at a head the fused tile does not fit.
+fn every_step_arm_leaves_the_state_when_the_fire_buffers_its_rows() {
+    for (geo, pad) in step_arms() {
+        check_at(geo, None, Boundary::Buffered, pad);
+    }
+}
+
+fn every_step_arm_folds_the_lanes_the_predicate_names() {
+    for (geo, pad) in step_arms() {
+        check_at(geo, None, Boundary::Predicated([1, 0, 1]), pad);
+    }
+}
+
+fn step_arms() -> [(Geometry, usize); 3] {
+    [
+        (
+            Geometry {
+                k_heads: 2,
+                v_heads: 4,
+                k_dim: 128,
+                v_dim: 128,
+            },
+            PAD,
+        ),
+        (
+            Geometry {
+                k_heads: 1,
+                v_heads: 2,
+                k_dim: 128,
+                v_dim: 128,
+            },
+            4,
+        ),
+        (
+            Geometry {
+                k_heads: 1,
+                v_heads: 2,
+                k_dim: 40,
+                v_dim: 40,
+            },
+            PAD,
+        ),
+    ]
 }
 
 fn the_fused_step_answers_at_a_128_wide_head_with_a_gqa_fan() {

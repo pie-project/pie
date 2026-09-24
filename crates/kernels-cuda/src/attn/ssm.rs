@@ -225,7 +225,7 @@ fn conv1d_update(
         op,
         state,
         "ssm_causal_conv1d_update_batched",
-        false,
+        true,
         false,
         false,
     )?;
@@ -270,7 +270,11 @@ fn conv1d_update(
             Launch::grid([channels.div_ceil(BLOCK), rows, 1], [BLOCK, 1, 1]),
         )
     };
-    args.push(ctx.stage());
+    args.extend([
+        state.write_state.arg(),
+        state.write_state_mask.arg(),
+        ctx.stage(),
+    ]);
     ctx.fire(op, Fire::at(FILE, entrypoint).apply(launch), &args)
 }
 
@@ -647,7 +651,7 @@ pub fn gated_delta(
         OP,
         state,
         "ssm_gated_delta_step_batched_gqa",
-        false,
+        true,
         false,
         false,
     )?;
@@ -685,6 +689,8 @@ pub fn gated_delta(
             stated(OP, v_heads)?.arg(),
             stated(OP, k_dim)?.arg(),
             stated(OP, v_dim)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
             ctx.stage(),
         ],
     )
@@ -735,6 +741,8 @@ impl Delta {
                 stated(op, self.v_dim)?.arg(),
                 stated(op, self.conv_dim)?.arg(),
                 q_scale.arg(),
+                state.write_state.arg(),
+                state.write_state_mask.arg(),
                 ctx.stage(),
             ],
         )
