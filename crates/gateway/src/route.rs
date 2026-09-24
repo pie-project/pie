@@ -77,11 +77,15 @@ impl RoutingHandle {
         self
     }
 
+    // Admission sheds what takes a seat on a worker, and only a launch does:
+    // a ping, an upload, a query or a terminate holds no KV and no lane, and a
+    // client whose first frame is one of those (installing its program, or
+    // reaping the processes that saturated the pool) must not find its
+    // session refused and its socket closed for a pool another session fills.
     pub fn admit(&self, req: &Request) -> AdmissionDecision {
-        if matches!(
+        if !matches!(
             &req.message,
-            client_api::ClientMessage::ListProcesses { .. }
-                | client_api::ClientMessage::TerminateProcess { .. }
+            client_api::ClientMessage::LaunchProcess { .. }
         ) {
             return AdmissionDecision::Admit;
         }
@@ -352,6 +356,12 @@ mod tests {
                     corr_id: 1,
                     process_id: "running".into(),
                 },
+                ClientMessage::Ping { corr_id: 1 },
+                ClientMessage::AttachProcess {
+                    corr_id: 1,
+                    process_id: "running".into(),
+                },
+                req().message,
             ] {
                 request.message = message;
                 assert_eq!(h.admit(&request), AdmissionDecision::Admit);
@@ -363,7 +373,6 @@ mod tests {
                 capture_outputs: false,
             };
             assert!(matches!(h.admit(&request), AdmissionDecision::Reject(_)));
-            assert!(matches!(h.admit(&req()), AdmissionDecision::Reject(_)));
         }
     }
 

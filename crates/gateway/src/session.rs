@@ -122,10 +122,22 @@ impl Inner {
             message: input.message,
         };
 
-        self.router
-            .admit(&request)
-            .await
-            .map_err(|r| SessionError::Admission(r.0))?;
+        if let Err(r) = self.router.admit(&request).await {
+            // The client hears each refusal under its own id; the server log
+            // hears the first and then every doubling, so a pool that admits
+            // nothing for minutes leaves a trace without a line per launch.
+            static REFUSED: AtomicU64 = AtomicU64::new(0);
+            let refused = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if refused.is_power_of_two() {
+                tracing::warn!(
+                    tenant = %tenant,
+                    refused,
+                    "turn refused at admission: {}",
+                    r.0
+                );
+            }
+            return Err(SessionError::Admission(r.0));
+        }
 
         let (tx, rx) = mpsc::channel(self.pipe_cap);
         {

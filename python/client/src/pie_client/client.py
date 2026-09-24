@@ -173,6 +173,10 @@ class PieClient:
 
         # Buffer for early events to prevent race conditions.
         self.orphan_events = {}
+        # The gateway says why before it closes a socket it refuses (an
+        # `{"type": "error"}` text frame ahead of the close); that reason is
+        # what the waiters hear instead of a bare "connection closed".
+        self.server_error = None
 
     async def __aenter__(self):
         """Enter the async context, establishing the connection."""
@@ -203,6 +207,8 @@ class PieClient:
                         await self._process_server_message(message)
                     except msgpack.UnpackException:
                         pass
+                else:
+                    self._note_server_error(raw_msg)
         except (
             websockets.ConnectionClosedOK,
             websockets.ConnectionClosedError,
@@ -210,7 +216,19 @@ class PieClient:
         ):
             pass
         finally:
-            self._fail_connection_waiters(ConnectionError("WebSocket connection closed"))
+            why = "WebSocket connection closed"
+            if self.server_error:
+                why = f"{why}: {self.server_error}"
+            self._fail_connection_waiters(ConnectionError(why))
+
+    def _note_server_error(self, text: str):
+        """Remember the reason in a `{"type": "error"}` text frame."""
+        try:
+            message = json.loads(text)
+        except ValueError:
+            return
+        if isinstance(message, dict) and message.get("type") == "error":
+            self.server_error = str(message.get("message") or "")
 
     async def _process_server_message(self, message: dict):
         """Route incoming server messages based on their type."""

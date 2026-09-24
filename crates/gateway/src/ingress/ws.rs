@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -110,10 +110,19 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
     let (handle, first_rx) = match state.sessions.create(ident, first, Affinity::Sticky).await {
         Ok(pair) => pair,
         Err(e) => {
+            // A session refused on its first turn is closed, and the reason
+            // rides on the close frame as well as the error frame ahead of
+            // it: a client that reads only its response frames still sees
+            // why its socket went, and so does the server log.
+            let why = e.to_string();
+            tracing::warn!("session refused on its first turn: {why}");
+            let _ = tx.send(Message::Text(error_json(&why).into())).await;
             let _ = tx
-                .send(Message::Text(error_json(&e.to_string()).into()))
+                .send(Message::Close(Some(CloseFrame {
+                    code: close_code::POLICY,
+                    reason: why.into(),
+                })))
                 .await;
-            let _ = tx.send(Message::Close(None)).await;
             return;
         }
     };
