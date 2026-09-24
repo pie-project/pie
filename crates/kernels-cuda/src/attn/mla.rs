@@ -775,14 +775,17 @@ mod mla_fa2 {
         }
     }
 
+    // The kernel reads its warp from `threadIdx.y` and its warpgroup from
+    // `threadIdx.z`; a flat 256-wide block hands every thread warp 0 of
+    // warpgroup 0 and a lane index up to 255, and the tile loads then run 32
+    // rows into the 16-row `CTA_TILE_KV` buffers.
+    pub const BLOCK: [u32; 3] = [32, 4, 2];
+
     #[must_use]
     pub const fn grid(info: &MlaPlanInfo, arm: Arm) -> Launch {
-        Launch::grid(
-            [info.num_blks_x as u32, info.num_blks_y as u32, 1],
-            [256, 1, 1],
-        )
-        .smem(arm.smem)
-        .cooperative()
+        Launch::grid([info.num_blks_x as u32, info.num_blks_y as u32, 1], BLOCK)
+            .smem(arm.smem)
+            .cooperative()
     }
 
     pub fn fire(
@@ -823,11 +826,9 @@ fn dispatch_dense(
     causal: bool,
     o: &mut Tensor,
 ) -> Result<(), Error> {
-    let Some(major) = ctx.compute_capability_major() else {
-        return Err(refuse(op, "the device's compute capability is unknowable"));
-    };
-
-    if major >= 10 {
+    // The plan carries the device it was scheduled for, so the arm follows the
+    // same device; a plan built for an Ada ceiling takes the Ada arm anywhere.
+    if plan.device.cc_major >= 10 {
         let num_requests = kv::lanes_of(op, qo_indptr)?;
         return naive::fire(
             ctx,
@@ -864,13 +865,6 @@ fn dispatch_dense(
             "no `DISPATCH_SMEM_CONFIG` arm fits this device's shared memory per SM",
         ));
     };
-    if mla_fa2::ARMS[arm].cta_tile_kv < 32 {
-        return Err(refuse(
-            op,
-            "the only `DISPATCH_SMEM_CONFIG` arm that fits this device's shared memory is \
-             `CTA_TILE_KV = 16`, which writes past its own `SharedStorage` (measured)",
-        ));
-    }
 
     let params = mla_fa2::pack(
         plan,
@@ -1057,4 +1051,22 @@ pub fn attention_prefill_selected(
         true,
         o,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mla_fa2::{ARMS, BLOCK, arm_index};
+    use crate::attn::plan::Device;
+
+    #[test]
+    fn the_ada_ceiling_takes_the_sixteen_row_arm_and_it_fits_one_block() {
+        let arm = arm_index(Device::L40S.max_smem_per_sm).expect("an arm fits the L40S");
+        assert_eq!(ARMS[arm].cta_tile_kv, 16);
+        assert!(ARMS[arm].smem <= Device::L40S.max_smem_per_block_optin);
+        assert_eq!(
+            BLOCK,
+            [32, 4, 2],
+            "a lane, a warp in its warpgroup, a warpgroup"
+        );
+    }
 }
