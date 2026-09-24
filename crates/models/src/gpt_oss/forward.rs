@@ -202,6 +202,7 @@ impl ForwardHybrid for Model {
             }
             _ => (x, None),
         };
+        let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = ops::linear::lm_head(&x, &m.head);
         let logits = if m.head.dim(0) < u64::from(m.vocab) {
             ops::collective::all_gather(&logits, m.tp)
