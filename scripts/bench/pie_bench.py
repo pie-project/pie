@@ -915,7 +915,7 @@ async def run(args: argparse.Namespace):
                             True,
                             returned - start,
                             output_tokens,
-                            int(obj["num_prompt_tokens"]),
+                            int(obj.get("num_prompt_tokens") or 0),  # the KV-policy inferlets report none
                             ttft_s=ttft_s,
                             intertoken_us=gaps or None,
                             client_send_s=client_send_s,
