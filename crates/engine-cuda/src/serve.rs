@@ -68,7 +68,6 @@ pub struct Shell {
     arena: Arena,
     pools: Pools,
     buffers: Option<Buffers>,
-    unbuffered: Option<String>,
     rs_scratch: Option<crate::device::Buffer>,
     predicate: crate::store::rs::Predicate,
     inputs: Inputs,
