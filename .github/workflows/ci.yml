@@ -162,6 +162,7 @@ jobs:
           python -m pip install pytest -e python/client
           PYTHONPATH=python/inferlet/src python -m pytest -q python/inferlet/tests
           python -m pytest -q python/client/tests
+          python -m pytest -q scripts/bench/tests
       - name: javascript
         working-directory: javascript
         run: |
