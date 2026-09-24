@@ -106,6 +106,36 @@ pub struct Fitted {
     pub held: u64,
 }
 
+/// The rows a guest program's epilogue holds per lane, each as wide as the
+/// out seam: the logits it reads, and the mask, noise and probability rows
+/// a sampling program derives from them.
+pub const PROGRAM_ROWS_A_LANE: u64 = 4;
+
+/// What one guest program's scratch takes at the admitted lane count. A
+/// program is registered after the load, so its stride is not known when
+/// the cache rows are declared; what is known is that its per-lane scratch
+/// is laid out over rows of the out seam, that the shell sizes it for the
+/// lane count rounded up to a power of two, and that the program contract
+/// caps the whole at `eta_exec::SCRATCH_MAX_BYTES`. The pool leaves this
+/// much on the card so the first program to arrive is not the frame that
+/// finds the pool has taken everything.
+#[must_use]
+pub fn program_scratch_reserve(max_lanes: u32, out_row_bytes: u64) -> u64 {
+    let lanes = u64::from(
+        max_lanes
+            .max(1)
+            .checked_next_power_of_two()
+            .unwrap_or(u32::MAX),
+    );
+    let row = out_row_bytes
+        .checked_next_multiple_of(eta_exec::SCRATCH_ALIGN)
+        .unwrap_or(u64::MAX);
+    lanes
+        .saturating_mul(row)
+        .saturating_mul(PROGRAM_ROWS_A_LANE)
+        .min(eta_exec::SCRATCH_MAX_BYTES)
+}
+
 /// The largest page count at or under `asked` whose watermark fits `room`,
 /// or zero when not even the first page does. `declared_at` is the watermark
 /// at a page count and only ever grows with it, so this is a bisection over

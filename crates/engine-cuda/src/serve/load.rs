@@ -566,7 +566,14 @@ impl Shell {
         // The cache rows are declared last, from what the card has left: once
         // with the bodies' allowance held ahead of them so arming is not
         // starved, and again after arming, when the bodies have taken what
-        // they take and the rest is the rows' to declare.
+        // they take and the rest is the rows' to declare. What the guests'
+        // programs will take at the admitted lane count is held through both,
+        // since they arrive after the pool is declared and the fires that
+        // bring them are past static admission by then.
+        let programs = crate::store::program_scratch_reserve(
+            boot.budget.max_lanes,
+            shell.out_width().map_or(0, |width| width.saturating_mul(4)),
+        );
         let footprint = |shell: &Shell| Footprint {
             total: device_total,
             before: device_total.saturating_sub(free_before),
@@ -582,13 +589,15 @@ impl Shell {
             cache_rows: shell.pools.committed_bytes(),
             bodies: shell.cache.body_stats().census.bytes as u64,
         };
-        let held_back = if shell.records_bodies() {
+        let bodies = if shell.records_bodies() {
             shell.bodies_mem as u64
         } else {
             0
         };
         let resident = footprint(&shell);
-        shell.pools.fit_the_card(held_back, &resident)?;
+        shell
+            .pools
+            .fit_the_card(bodies.saturating_add(programs), &resident)?;
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
@@ -597,16 +606,19 @@ impl Shell {
         }
         shell.arm_bodies()?;
         let resident = footprint(&shell);
-        if let Some(fitted) = shell.pools.fit_the_card(0, &resident)? {
+        if let Some(fitted) = shell.pools.fit_the_card(programs, &resident)? {
             let paging = shell.pools.paging();
             eprintln!(
                 "engine-cuda: the pool was declared {} pages ({} MiB), past the {} MiB this card \
-                 hands out for the cache rows under [engine] gpu_mem_utilization ({resident}); \
-                 sized to {} pages ({} MiB), {} sequences at the declared context. State \
-                 [engine] max_total_pages to choose the count.",
+                 hands out for the cache rows under [engine] gpu_mem_utilization once {} MiB is \
+                 held for the programs guests register at {} lanes ({resident}); sized to {} \
+                 pages ({} MiB), {} sequences at the declared context. State [engine] \
+                 max_total_pages to choose the count.",
                 fitted.asked,
                 shell.pools.declared_at(fitted.asked) >> 20,
                 fitted.room >> 20,
+                fitted.held >> 20,
+                boot.budget.max_lanes,
                 fitted.fit,
                 shell.pools.declared_bytes() >> 20,
                 fitted.fit / u64::from(paging.pages_per_slot),
