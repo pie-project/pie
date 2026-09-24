@@ -97,6 +97,31 @@ class PythonClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ConnectionError):
             await future
 
+    async def test_listener_relays_the_reason_the_server_gave_before_closing(self):
+        class RefusingWebSocket:
+            def __init__(self):
+                self.frames = iter(['{"type":"error","message":"admission rejected: cluster saturated"}'])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.frames)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        client = PieClient("ws://example.invalid")
+        client.ws = RefusingWebSocket()
+        future = asyncio.get_running_loop().create_future()
+        client.pending_requests[1] = future
+
+        await client._listen_to_server()
+
+        with self.assertRaises(ConnectionError) as raised:
+            await future
+        self.assertIn("admission rejected: cluster saturated", str(raised.exception))
+
     async def test_stream_output_detaches_on_stdin_eof_from_monitor_thread(self):
         original_sigint = signal.getsignal(signal.SIGINT)
         with mock.patch("sys.stdin", io.StringIO("")):

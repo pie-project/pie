@@ -52,6 +52,26 @@ pub struct Recorder {
     at_seq: u64,
     bstats: BodyTally,
     last_capture: LastCapture,
+    sealed_seen: HashSet<BodyKey>,
+}
+
+/// Whether a sealed-map decline is worth a log line: the first fire of each
+/// shape says which shape walks eagerly, and every doubling of the count
+/// says how many have — a load that declines every decode step for minutes
+/// leaves a handful of lines, not one per thousand fires.
+fn reports_decline<K: Eq + std::hash::Hash + Clone>(
+    seen: &mut HashSet<K>,
+    key: &K,
+    declines: u64,
+) -> bool {
+    if seen.len() > MAX_BODIES * 4 {
+        seen.clear();
+    }
+    let first = !seen.contains(key);
+    if first {
+        seen.insert(key.clone());
+    }
+    first || declines.is_power_of_two()
 }
 
 impl Bodies {
@@ -922,7 +942,7 @@ impl Bodies {
 
         if self.sealed_decline() {
             let declines = self.recorder.bstats.sealed_declines;
-            if declines.is_power_of_two() || declines.is_multiple_of(1000) {
+            if reports_decline(&mut self.recorder.sealed_seen, &key, declines) {
                 let why = if !self.map.bodies.contains_key(&key) {
                     "no body is resident for it"
                 } else if short {
@@ -1386,6 +1406,32 @@ mod tests {
         a_rung_is_the_keys_own_ceiling_and_arming_computes_the_same_one();
         what_a_load_has_spent_is_what_its_resident_bodies_weigh();
         the_map_never_inserts_a_body_whose_script_is_empty();
+        a_sealed_decline_is_reported_once_a_shape_and_then_at_each_doubling();
+    }
+
+    fn a_sealed_decline_is_reported_once_a_shape_and_then_at_each_doubling() {
+        let mut seen = HashSet::new();
+        let reported: Vec<u64> = (1..=40_000u64)
+            .filter(|declines| {
+                let key = if *declines == 1 {
+                    "b256[c0:256]"
+                } else {
+                    "b1[c1:1]"
+                };
+                reports_decline(&mut seen, &key, *declines)
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            vec![
+                1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768
+            ],
+            "the first fire of each shape and each doubling of the count, no line per thousand"
+        );
+        assert!(
+            reports_decline(&mut seen, &"b8[c1:8]", 40_001),
+            "a shape not seen before is reported whatever the count"
+        );
     }
 
     fn a_rung_is_the_keys_own_ceiling_and_arming_computes_the_same_one() {
