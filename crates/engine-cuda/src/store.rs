@@ -763,6 +763,16 @@ impl Pools {
             )));
         }
         self.paging.pages = fit;
+        // The runtime admits frames against this watermark, so the pool is
+        // pledged it beside what its other arenas hold now: a frame inside
+        // it is a frame the fit already sized the card for, and what a fire
+        // allocates beside the pool later is not its refusal to answer.
+        let others = self
+            .pool
+            .committed_pages()
+            .saturating_sub(elastic::pages_for_bytes(self.committed_bytes()));
+        self.pool
+            .pledge(elastic::pages_for_bytes(self.declared_at(fit)).saturating_add(others));
         Ok(Fitted {
             asked: self.asked,
             fit,
@@ -1295,9 +1305,9 @@ fn refuse(pool: &PhysicalPool, outcome: Commit) -> Fault {
             "store::commit",
             "a committed outcome reached the refusal path".to_string(),
         ),
-        Commit::Exhausted { required, budget } => Fault::OutOfMemory {
-            need: required.saturating_mul(page),
-            have: budget.saturating_mul(page),
+        Commit::Exhausted { growth, spare } => Fault::OutOfMemory {
+            need: growth.saturating_mul(page),
+            have: spare.saturating_mul(page),
         },
         Commit::Impossible { required, ceiling } => Fault::Ceiling {
             what: "bytes of elastic device memory",
