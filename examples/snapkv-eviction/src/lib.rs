@@ -106,7 +106,9 @@ struct Input {
     /// mixers, and only those export a score plane.
     #[serde(default = "default_layers")]
     layers: u32,
-    /// Query heads per exported layer. qwen35-d0.8b: `q_heads: 8` at `tp == 1`.
+    /// Query heads per exported layer. qwen35-d0.8b: `q_heads: 8`, the
+    /// model's count at any rank count: a tensor-parallel load gathers the
+    /// ranks' bands into the model's planes.
     #[serde(default = "default_heads")]
     heads: u32,
     #[serde(default)]

@@ -442,8 +442,12 @@ impl Shell {
             .unwrap_or(0);
         let score_values: Vec<model_ir::ValueId> =
             exports.scores.iter().map(|export| export.value).collect();
-        let scores =
-            crate::scores::Scores::reserve(&score_values, score_heads, boot.budget.max_lanes)?;
+        let scores = crate::scores::Scores::reserve(
+            &score_values,
+            score_heads,
+            boot.budget.max_lanes,
+            boot.world,
+        )?;
 
         let airborne = crate::settle::Airborne::new();
         let mut pools = pools;
