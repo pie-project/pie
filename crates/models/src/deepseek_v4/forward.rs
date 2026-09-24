@@ -152,6 +152,7 @@ impl ForwardHybrid for Model {
             }
         };
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
+        let x = ops::layout::gather_rows(&x, &inputs.readout_rows());
         let logits = match &m.head {
             Some(head) => ops::linear::lm_head(&x, head),
             None => ops::linear::lm_head(&x, &m.embed),
@@ -161,7 +162,8 @@ impl ForwardHybrid for Model {
             let (input_mtp, _) = inputs.split(&Facts::drafts());
             let plan_mtp =
                 ops::attn::plan_prefill(&input_mtp, m.heads, kv_heads, m.head_dim, Some(m.window));
-            let (dstreams, _) = streams.split(&Facts::drafts());
+            let (dstreams, _) =
+                ops::layout::gather_rows(&streams, &inputs.readout_rows()).split(&Facts::drafts());
             let (dpos, _) = positions.split(&Facts::drafts());
             let (dlogits, _) = logits.split(&Facts::drafts());
 
