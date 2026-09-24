@@ -1,0 +1,28 @@
+name: evals
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    name: "evals: send to pie-evals"
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       (github.event.action != 'labeled' || github.event.label.name == 'evals-full'))
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.PIE_EVALS_DISPATCH_TOKEN }}
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR: ${{ github.event.pull_request.number }}
+          MODE: ${{ contains(github.event.pull_request.labels.*.name, 'evals-full') && 'full' || 'targeted' }}
+        run: |
+          [ -n "$GH_TOKEN" ] || { echo "::warning::PIE_EVALS_DISPATCH_TOKEN is not set"; exit 0; }
+          gh api repos/pie-project/pie-evals/dispatches -f event_type=pie-eval \
+            -f "client_payload[pie_commit]=$COMMIT" -f "client_payload[pr]=$PR" -f "client_payload[mode]=$MODE"
