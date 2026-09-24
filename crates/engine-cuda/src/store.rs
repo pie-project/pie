@@ -104,6 +104,37 @@ pub struct Fitted {
     pub fit: u64,
     pub room: u64,
     pub held: u64,
+    pub bodies: u64,
+    pub spare: u64,
+    pub slots: u32,
+}
+
+/// The least `[engine] bodies_mem` is held down to on a card with little
+/// room: enough for the decode bodies, which are what a serve replays every
+/// step and cost tens of megabytes each.
+pub const BODIES_FLOOR_BYTES: u64 = 512 << 20;
+
+/// What the graph bodies may take on this card: the configured allowance,
+/// or a quarter of `room` — what is left for them and the cache rows once
+/// one sequence and the guests' programs are seated — whichever is less,
+/// but not under the floor while the room affords it. A fixed 4 GiB on a
+/// 24 GB card is a sixth of the device before a second sequence seats.
+#[must_use]
+pub fn bodies_allowance(configured: u64, room: u64) -> u64 {
+    configured.min(room).min((room / 4).max(BODIES_FLOOR_BYTES))
+}
+
+/// The largest token budget at or under `max_tokens`, halving toward
+/// `floor`, whose working set (`working`, the activation arena and the
+/// attention workspaces at that budget) fits `room`. Halving keeps the
+/// bucket lattice a prefix of what the operator asked for.
+#[must_use]
+pub fn tokens_within(max_tokens: u32, floor: u32, room: u64, working: impl Fn(u32) -> u64) -> u32 {
+    let mut tokens = max_tokens;
+    while tokens > floor && working(tokens) > room {
+        tokens = (tokens / 2).max(floor);
+    }
+    tokens
 }
 
 /// The rows a guest program's epilogue holds per lane, each as wide as the
@@ -190,23 +221,29 @@ pub fn admit_the_card(
     trace: &Trace,
     paging: Paging,
 ) -> Result<Accounting> {
-    let full: u64 = crate::weights::plane_bytes(trace)?
-        .iter()
-        .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
-        .sum();
-    let weights = match weights {
-        0 => full,
-        stated => stated.min(full),
-    }
-    .saturating_add(extra_resident);
     let accounting = Accounting::of(
         device_memory()?.1,
         utilization,
-        weights,
+        weight_tier_bytes(trace, weights, extra_resident)?,
         one_slot_bytes(trace, paging)?,
     );
     accounting.admit()?;
     Ok(accounting)
+}
+
+/// The bytes this load's weight tier puts on the device: every plane the
+/// trace declares, or the `[model] device_weight_budget` stated under it,
+/// plus what else rides along resident.
+pub fn weight_tier_bytes(trace: &Trace, stated: u64, extra_resident: u64) -> Result<u64> {
+    let full: u64 = crate::weights::plane_bytes(trace)?
+        .iter()
+        .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
+        .sum();
+    Ok(match stated {
+        0 => full,
+        stated => stated.min(full),
+    }
+    .saturating_add(extra_resident))
 }
 
 /// The device's free and total bytes, as the driver reports them now.
@@ -297,6 +334,7 @@ pub struct Pools {
     pooled: Vec<PoolRow>,
     paging: Paging,
     asked: u64,
+    ceiling: u64,
     airborne: Option<Airborne>,
     committed_kv_pages: u32,
     committed_state_slots: u32,
@@ -414,6 +452,7 @@ impl Pools {
             pooled,
             paging,
             asked: paging.pages(),
+            ceiling: paging.pages(),
             airborne: None,
             committed_kv_pages: 0,
             committed_state_slots: 0,
@@ -474,21 +513,40 @@ impl Pools {
     }
 
     /// The watermark the cache rows reach with `pages` kv pages declared and
-    /// the paging's state slots, as the map units the pool would back.
+    /// the paging's state slots, as the map units their arenas back.
     #[must_use]
     pub fn declared_at(&self, pages: u64) -> u64 {
+        self.declared_by(pages, self.paging.slots, |arena, _| arena.map_unit())
+    }
+
+    /// The same watermark were the planes re-reserved for `pages`: each in
+    /// the unit an arena of that size earns, which for a small pool is the
+    /// driver's granularity rather than the handle a huge one maps in.
+    fn declared_reshaped(&self, pages: u64, slots: u32) -> u64 {
+        let (granularity, handle) = (self.pool.granularity(), self.pool.map_unit_bytes());
+        self.declared_by(pages, slots, |_, bytes| {
+            elastic::map_unit_for(bytes, granularity, handle)
+        })
+    }
+
+    fn declared_by(&self, pages: u64, slots: u32, unit_of: impl Fn(&Arena, u64) -> u64) -> u64 {
         let pages = u32::try_from(pages).unwrap_or(u32::MAX);
-        let slots = self.paging.slots;
         let page_size = self.paging.page_size;
-        let unit = self.pool.map_unit_bytes().max(1);
-        let mapped = |bytes: u64| bytes.div_ceil(unit).saturating_mul(unit);
+        let mapped = |bytes: u64, arena: &Arena| {
+            let unit = unit_of(arena, bytes).max(1);
+            bytes.div_ceil(unit).saturating_mul(unit)
+        };
         let rows: u64 = self
             .rows
             .iter()
             .zip(self.shapes.iter())
             .map(|(planes, shape)| {
-                (0..planes.len())
-                    .map(|at| mapped(watermark_bytes(shape, at, pages, slots, page_size)))
+                planes
+                    .iter()
+                    .enumerate()
+                    .map(|(at, arena)| {
+                        mapped(watermark_bytes(shape, at, pages, slots, page_size), arena)
+                    })
                     .sum::<u64>()
             })
             .sum();
@@ -496,11 +554,61 @@ impl Pools {
             .pooled
             .iter()
             .map(|row| {
-                mapped(row.watermark_bytes(pages, page_size))
-                    .saturating_mul(row.planes.len() as u64)
+                let bytes = row.watermark_bytes(pages, page_size);
+                row.planes
+                    .iter()
+                    .map(|arena| mapped(bytes, arena))
+                    .sum::<u64>()
             })
             .sum();
         rows.saturating_add(pooled)
+    }
+
+    /// Re-reserves the kv planes and compressor slabs for a pool of `pages`,
+    /// so each maps in the unit its size earns rather than the one the asked
+    /// count gave it. Only before anything is committed to them: a mapped
+    /// unit has a base a table may already hold.
+    fn reshape(&mut self, pages: u64, slots: u32) -> Result<()> {
+        let narrow = u32::try_from(pages).unwrap_or(u32::MAX);
+        let page_size = self.paging.page_size;
+        let fresh = |arena: &Arena| {
+            if arena.committed_bytes() == 0 {
+                Ok(())
+            } else {
+                Err(Fault::program(
+                    "store::reshape",
+                    "a cache plane reshaped under committed pages",
+                ))
+            }
+        };
+        for (planes, shape) in self.rows.iter_mut().zip(self.shapes.iter()) {
+            let (label, changed) = match shape {
+                Shape::Kv { .. } => ("bytes of a kv plane", true),
+                Shape::State { .. } => ("bytes of a recurrent slab", slots != self.paging.slots),
+            };
+            if !changed {
+                continue;
+            }
+            for (at, arena) in planes.iter_mut().enumerate() {
+                fresh(arena)?;
+                *arena = Arena::reserve(
+                    &self.pool,
+                    watermark_bytes(shape, at, narrow, slots, page_size),
+                    label,
+                )?;
+            }
+        }
+        for row in &mut self.pooled {
+            let bytes = row.watermark_bytes(narrow, page_size);
+            for arena in &mut row.planes {
+                fresh(arena)?;
+                *arena = Arena::reserve(&self.pool, bytes, "bytes of a compressor state slab")?;
+            }
+        }
+        self.ceiling = pages;
+        self.paging.pages = pages;
+        self.paging.slots = slots;
+        Ok(())
     }
 
     #[must_use]
@@ -534,25 +642,101 @@ impl Pools {
     /// budget as it stands now, so it is called once everything else this
     /// load puts on the device is resident, and again after arming, when the
     /// bodies have taken what they take and the rest is the cache rows' to
-    /// declare (the count grows back toward what was asked, never past it).
-    /// `held_back` is what arming is entitled to ahead of the cache rows; it
-    /// yields before one sequence at the declared context does, since a pool
-    /// under one sequence is no deployment. `resident` spells what is on the
-    /// device already, for the refusal when not even that sequence fits.
+    /// declare. `programs` is held for the guests' programs throughout;
+    /// `bodies` is the configured allowance, which `bodies_allowance` holds
+    /// down to what the room affords, and both yield before one sequence at
+    /// the declared context does, since a pool under one sequence is no
+    /// deployment. While nothing is committed to the planes, a pool the
+    /// asked count's map unit would leave under a sequence is re-reserved
+    /// in the finer unit its own size earns. `resident` spells what is on
+    /// the device already, for the refusal when not even that sequence fits.
     pub fn fit_the_card(
         &mut self,
-        held_back: u64,
+        bodies: u64,
+        programs: u64,
         resident: &dyn core::fmt::Display,
-    ) -> Result<Option<Fitted>> {
+    ) -> Result<Fitted> {
         let live = self
             .pool
             .spare_bytes(0)?
             .saturating_add(self.committed_bytes());
-        let one_slot = u64::from(self.paging.pages_per_slot).min(self.asked);
-        let need = self.declared_at(one_slot);
-        let held = held_back.min(live.saturating_sub(need));
-        let room = live.saturating_sub(held);
-        let fit = pages_within(self.asked, room, |pages| self.declared_at(pages));
+        let fresh = self
+            .rows
+            .iter()
+            .flatten()
+            .chain(self.pooled.iter().flat_map(|row| row.planes.iter()))
+            .all(|arena| arena.committed_bytes() == 0);
+        let one_slot = u64::from(self.paging.pages_per_slot).min(self.ceiling);
+        let mut need = if fresh {
+            self.declared_at(one_slot)
+                .min(self.declared_reshaped(one_slot, self.paging.slots))
+        } else {
+            self.declared_at(one_slot)
+        };
+        let configured = bodies;
+        let programs = programs.min(live.saturating_sub(need));
+        let mut bodies = bodies_allowance(
+            configured,
+            live.saturating_sub(need).saturating_sub(programs),
+        );
+        let mut held = programs.saturating_add(bodies);
+        let mut room = live.saturating_sub(held);
+        let mut fit = pages_within(self.ceiling, room, |pages| self.declared_at(pages));
+        if fresh && fit < self.ceiling {
+            let slots = self.paging.slots;
+            let fine = pages_within(self.ceiling, room, |pages| {
+                self.declared_reshaped(pages, slots)
+            });
+            if fine > fit {
+                self.reshape(fine, slots)?;
+                fit = fine;
+            }
+        }
+        // A hybrid declares a recurrent slab for every state slot, whatever
+        // the pool seats, and on a short card that slab alone can be the
+        // refusal. The runtime seats a lane on two slots, so two is the
+        // least; between that and the count asked, the slots and the kv
+        // seats are brought level, each giving the other its room.
+        if fit < one_slot
+            && fresh
+            && self
+                .shapes
+                .iter()
+                .any(|shape| matches!(shape, Shape::State { .. }))
+        {
+            let mut slots = self.paging.slots;
+            let mut pages = fit;
+            for _ in 0..8 {
+                let fewer = pages_within(u64::from(slots), room, |slots| {
+                    self.declared_reshaped(one_slot, u32::try_from(slots).unwrap_or(u32::MAX))
+                });
+                if fewer < 2 {
+                    break;
+                }
+                slots = u32::try_from(fewer).unwrap_or(u32::MAX);
+                pages = pages_within(self.ceiling, room, |pages| {
+                    self.declared_reshaped(pages, slots)
+                });
+                let seated = u32::try_from(pages / one_slot.max(1)).unwrap_or(u32::MAX);
+                if slots <= seated.saturating_mul(2).max(2) {
+                    break;
+                }
+                slots = seated.saturating_mul(2).max(2);
+            }
+            if pages >= one_slot && slots < self.paging.slots {
+                self.reshape(pages, slots)?;
+                need = self.declared_at(one_slot);
+                // The slab the slots gave back is room the bodies were
+                // refused when the allowance was struck; strike it again.
+                bodies = bodies_allowance(
+                    configured,
+                    live.saturating_sub(need).saturating_sub(programs),
+                );
+                held = programs.saturating_add(bodies);
+                room = live.saturating_sub(held);
+                fit = pages_within(self.ceiling, room, |pages| self.declared_at(pages));
+            }
+        }
         if fit < one_slot {
             return Err(Fault::Residency(format!(
                 "the card does not hold this deployment: {resident}; under `[engine] \
@@ -565,12 +749,15 @@ impl Pools {
             )));
         }
         self.paging.pages = fit;
-        Ok((fit != self.asked).then_some(Fitted {
+        Ok(Fitted {
             asked: self.asked,
             fit,
             room,
             held,
-        }))
+            bodies,
+            spare: live.saturating_sub(need).saturating_sub(programs),
+            slots: self.paging.slots,
+        })
     }
 
     pub(crate) fn reserve_arena(&self, max_bytes: u64, label: &'static str) -> Result<Arena> {

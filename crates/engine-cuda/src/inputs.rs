@@ -55,6 +55,66 @@ fn latent_float_bytes(rank: u32, sms: u32) -> u64 {
     (partial_o + partial_lse).next_multiple_of(ALIGN) + 2 * ALIGN
 }
 
+/// The float workspace each attention plan's launches need, sized for the
+/// budget's widest fire: a prefill plan for `max_tokens` rows over
+/// `max_lanes`, a decode plan for `max_lanes` rows, on this device's SMs.
+fn plan_floats(budget: &Budget, facts: &Facts, device: &Device) -> Vec<Option<u64>> {
+    facts
+        .plans
+        .iter()
+        .map(|seat| {
+            seat.map(|seat| {
+                match seat.kind {
+                    StructKind::AttnPrefillPlan => graph_float_bytes(&seat.reading, device.num_sm)
+                        .max(prefill_float_bytes(
+                            &seat.reading,
+                            budget.buckets.last().copied().unwrap_or(budget.max_tokens),
+                            budget.max_lanes,
+                            device,
+                        )),
+                    StructKind::AttnPrefillPlanSm90 => {
+                        graph_float_bytes(&seat.reading, device.num_sm)
+                    }
+                    StructKind::AttnDecodePlan => graph_float_bytes(&seat.reading, device.num_sm)
+                        .max(decode_float_bytes(&seat.reading, budget.max_lanes)),
+                    StructKind::MlaPlan => latent_float_bytes(seat.reading.head_dim, device.num_sm),
+                }
+                .max(GRANT_FLOAT_BYTES)
+            })
+        })
+        .collect()
+}
+
+/// What the attention workspaces come to at this budget: plans launched on
+/// one stream share a workspace sized for the widest of them, every other
+/// plan holds its own. This is the lane- and token-scaled part of the
+/// inputs, and on a wide model at a long envelope it is gigabytes, so the
+/// boot sizes the token budget against it before anything is allocated.
+#[must_use]
+pub fn attention_workspace_bytes(
+    budget: &Budget,
+    facts: &Facts,
+    device: &Device,
+    schedule_streams: &[Option<u32>],
+) -> u64 {
+    let floats_of = plan_floats(budget, facts, device);
+    let mut per_stream: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+    let mut own = 0u64;
+    for (plan, floats) in floats_of.iter().enumerate() {
+        let Some(floats) = floats else { continue };
+        match schedule_streams.get(plan) {
+            Some(Some(stream)) => {
+                let held = per_stream.entry(*stream).or_insert(0);
+                *held = (*held).max(*floats);
+            }
+            _ => own = own.saturating_add(*floats),
+        }
+    }
+    per_stream
+        .values()
+        .fold(own, |sum, floats| sum.saturating_add(*floats))
+}
+
 const ALIGN: u64 = 256;
 
 const CLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -457,37 +517,7 @@ impl Inputs {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let self_cond = (self_cond_taps > 0).then(|| take(rows * self_cond_taps * 4 * 2));
         let runs = runs.max(1);
-        let floats_of: Vec<Option<u64>> = facts
-            .plans
-            .iter()
-            .map(|seat| {
-                seat.map(|seat| {
-                    match seat.kind {
-                        StructKind::AttnPrefillPlan => {
-                            graph_float_bytes(&seat.reading, device.num_sm).max(
-                                prefill_float_bytes(
-                                    &seat.reading,
-                                    budget.buckets.last().copied().unwrap_or(budget.max_tokens),
-                                    budget.max_lanes,
-                                    &device,
-                                ),
-                            )
-                        }
-                        StructKind::AttnPrefillPlanSm90 => {
-                            graph_float_bytes(&seat.reading, device.num_sm)
-                        }
-                        StructKind::AttnDecodePlan => {
-                            graph_float_bytes(&seat.reading, device.num_sm)
-                                .max(decode_float_bytes(&seat.reading, budget.max_lanes))
-                        }
-                        StructKind::MlaPlan => {
-                            latent_float_bytes(seat.reading.head_dim, device.num_sm)
-                        }
-                    }
-                    .max(GRANT_FLOAT_BYTES)
-                })
-            })
-            .collect();
+        let floats_of = plan_floats(budget, facts, &device);
         let mut per_stream: std::collections::BTreeMap<u32, u64> =
             std::collections::BTreeMap::new();
         for (plan, floats) in floats_of.iter().enumerate() {

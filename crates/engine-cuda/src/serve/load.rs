@@ -1,4 +1,4 @@
-use model_compiler::{Budgets, CompiledModel, DeviceProfile};
+use model_compiler::{Budget, Budgets, CompiledModel, DeviceProfile};
 
 use crate::arena::Arena;
 use crate::device::Context;
@@ -18,16 +18,18 @@ use crate::weights::Weights;
 
 use super::{Boot, FireCost, Golden, Graphs, Shell};
 
+/// The least `max_forward_tokens` is served at when the card is short: one
+/// prefill chunk a frame, which serves, and under it the halving stops.
+const TOKENS_FLOOR: u32 = 1024;
+
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
     let device = Context::bind(boot.ordinal, boot.comm)?;
 
     kernels_cuda::disk::install(boot.cache_dir);
 
-    boot.budget.buckets = crate::api::lattice(
-        std::mem::take(&mut boot.budget.buckets),
-        boot.budget.max_tokens,
-    );
+    let stated_buckets = std::mem::take(&mut boot.budget.buckets);
+    boot.budget.buckets = crate::api::lattice(stated_buckets.clone(), boot.budget.max_tokens);
 
     let mut profile = boot.profile.take().unwrap_or(DeviceProfile {
         sms: device.device().num_sm,
@@ -44,11 +46,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         crate::GROUPED.iter().map(|op| (*op).to_string()).collect()
     } else {
         Vec::new()
-    };
-    let budgets = Budgets {
-        tokens: boot.budget.clone(),
-        patches: boot.patches.clone(),
-        voxels: boot.voxels.clone(),
     };
     boot.trace = model_ir::fuse::residual_norm(boot.trace.clone());
     if boot.knobs.diagnostics.fuse_chains {
@@ -75,6 +72,73 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         eta_compiler::codegen::cuda::fused::GUMBEL_DIRECT
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
+    // The activation arena and the attention workspaces are sized from
+    // `max_forward_tokens`, and on a wide model at a long envelope they are
+    // gigabytes before a sequence seats. The card's share after the weight
+    // tier is what they must fit in, half of it, so the cache rows, the
+    // bodies and the guests' programs have the other half; the token budget
+    // halves toward its floor until they do, and the lattice follows.
+    let (free, total) = crate::store::device_memory()?;
+    let after_weights =
+        crate::device::elastic::budget_bytes(free, total, boot.knobs.gpu_mem_utilization)
+            .saturating_sub(crate::store::weight_tier_bytes(
+                &boot.trace,
+                boot.residency.device_demand(),
+                0,
+            )?);
+    let facts = kv::probe(&boot.trace)?;
+    let budgets_at = |budget: &Budget| Budgets {
+        tokens: budget.clone(),
+        patches: boot.patches.clone(),
+        voxels: boot.voxels.clone(),
+    };
+    let budget_at = |tokens: u32| {
+        let mut budget = boot.budget.clone();
+        budget.max_tokens = tokens;
+        let mut buckets: Vec<u32> = stated_buckets
+            .iter()
+            .copied()
+            .filter(|bucket| *bucket < tokens)
+            .collect();
+        if !stated_buckets.is_empty() {
+            buckets.push(tokens);
+        }
+        budget.buckets = crate::api::lattice(buckets, tokens);
+        budget
+    };
+    let asked_tokens = boot.budget.max_tokens;
+    let floor = boot.budget.max_lanes.max(TOKENS_FLOOR).min(asked_tokens);
+    let working_at = |tokens: u32| -> u64 {
+        let budget = budget_at(tokens);
+        let Ok(compiled) =
+            model_compiler::compile_axes(&boot.trace, &budgets_at(&budget), &profile)
+        else {
+            return u64::MAX;
+        };
+        compiled
+            .arena
+            .prefix_for(u64::from(budget.max_lanes))
+            .saturating_add(crate::inputs::attention_workspace_bytes(
+                &budget,
+                &facts,
+                &device.device(),
+                &crate::exports::schedule_streams(&boot.trace, &compiled),
+            ))
+    };
+    let tokens = crate::store::tokens_within(asked_tokens, floor, after_weights / 2, working_at);
+    if tokens != asked_tokens {
+        eprintln!(
+            "engine-cuda: [engine] max_forward_tokens {asked_tokens} is served at {tokens}: at \
+             {asked_tokens} the activation arena and attention workspaces take {} MiB of the \
+             {} MiB this card has after the weight tier under [engine] gpu_mem_utilization, and \
+             the cache rows, graph bodies and guest programs need the other half. State a \
+             smaller max_forward_tokens to choose it, or a larger gpu_mem_utilization.",
+            working_at(asked_tokens) >> 20,
+            after_weights >> 20,
+        );
+        boot.budget = budget_at(tokens);
+    }
+    let budgets = budgets_at(&boot.budget);
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
     if boot.knobs.diagnostics.arm_trace {
         let mut streams: std::collections::BTreeMap<u32, Vec<String>> =
@@ -595,9 +659,33 @@ impl Shell {
             0
         };
         let resident = footprint(&shell);
-        shell
-            .pools
-            .fit_the_card(bodies.saturating_add(programs), &resident)?;
+        let fitted = shell.pools.fit_the_card(bodies, programs, &resident)?;
+        if fitted.bodies < bodies {
+            eprintln!(
+                "engine-cuda: [engine] bodies_mem {} MiB is held down to {} MiB on this card: \
+                 with the weights, activations and inputs resident, one sequence at the declared \
+                 context and the guests' programs seated, {} MiB is left for the graph bodies \
+                 and the cache rows together, and the bodies take at most a quarter of it. \
+                 State a smaller bodies_mem to choose it.",
+                bodies >> 20,
+                fitted.bodies >> 20,
+                fitted.spare >> 20,
+            );
+            shell.bodies_mem = usize::try_from(fitted.bodies).unwrap_or(usize::MAX);
+        }
+        if (fitted.slots as usize) < shell.held.len() {
+            eprintln!(
+                "engine-cuda: [engine] max_state_slots {} is served at {} on this card: the \
+                 recurrent slab is declared for every slot, and at {} it left no room for one \
+                 sequence's kv pages beside it; the pool seats {} sequences at the declared \
+                 context. State a smaller max_state_slots to choose it.",
+                shell.held.len(),
+                fitted.slots,
+                shell.held.len(),
+                fitted.fit / u64::from(shell.pools.paging().pages_per_slot),
+            );
+            shell.held.truncate(fitted.slots as usize);
+        }
         if boot.knobs.diagnostics.arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
@@ -606,7 +694,8 @@ impl Shell {
         }
         shell.arm_bodies()?;
         let resident = footprint(&shell);
-        if let Some(fitted) = shell.pools.fit_the_card(programs, &resident)? {
+        let fitted = shell.pools.fit_the_card(0, programs, &resident)?;
+        if fitted.fit != fitted.asked {
             let paging = shell.pools.paging();
             eprintln!(
                 "engine-cuda: the pool was declared {} pages ({} MiB), past the {} MiB this card \
