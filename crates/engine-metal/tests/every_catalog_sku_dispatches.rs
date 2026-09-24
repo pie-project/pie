@@ -65,13 +65,45 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
         "qwen36-35b-a3b-mini-u4g64-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
     ),
+    (
+        "qwen36-35b-a3b-u4g64-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    (
+        "qwen36-27b-u4g64-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    (
+        "qwen36-27b-bf16-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    (
+        "qwen38-27b-u4g64-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    (
+        "qwen38-27b-bf16-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
     ("qwen35-d0.8b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
+    ("qwen35-d0.8b-u4g64-kv-bf16-tp2", &["collective.all_reduce"]),
+    ("qwen35-d2b-u4g64-kv-bf16-tp2", &["collective.all_reduce"]),
+    ("qwen35-d4b-u4g64-kv-bf16-tp2", &["collective.all_reduce"]),
+    (
+        "qwen35-d9b-u4g64-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    ("qwen35-d3b-bf16-kv-bf16-tp2", &["collective.all_reduce"]),
     (
         "gemma4-e4b-bf16-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
     ),
     (
         "gemma4-31b-bf16-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    (
+        "gemma4-31b-u4g64-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
     ),
     (
@@ -83,11 +115,23 @@ const CANNOT_SERVE: &[(&str, &[&str])] = &[
         &["collective.all_gather", "collective.all_reduce"],
     ),
     (
+        "gptoss-20b-u4g64-mxfp4-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    (
+        "gptoss-20b-bf16-mxfp4-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    (
         "qwen35-a3b-bf16-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
     ),
     (
         "muse-glimmer-30b-bf16-kv-bf16-tp2",
+        &["collective.all_gather", "collective.all_reduce"],
+    ),
+    (
+        "muse-glimmer-30b-u4g64-kv-bf16-tp2",
         &["collective.all_gather", "collective.all_reduce"],
     ),
     (
