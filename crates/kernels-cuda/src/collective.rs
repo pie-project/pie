@@ -89,6 +89,27 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     }
 }
 
+/// Runs `body`'s collectives as one NCCL group, so several small gathers on
+/// the same communicator and stream go out as one launch instead of one each.
+pub fn grouped<R>(op: &'static str, body: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::nccl::sys as nccl;
+
+        answered(op, "ncclGroupStart", unsafe { nccl::ncclGroupStart() })?;
+        let ran = body();
+        let ended = answered(op, "ncclGroupEnd", unsafe { nccl::ncclGroupEnd() });
+        let out = ran?;
+        ended?;
+        Ok(out)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = op;
+        body()
+    }
+}
+
 pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "collective.reduce_scatter";
     let comm = ctx.comm(OP)?;

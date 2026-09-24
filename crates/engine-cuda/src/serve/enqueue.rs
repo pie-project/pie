@@ -984,6 +984,17 @@ impl FireCtx<'_> {
             "enqueue.epilogue",
         )?;
         super::btrace::mark("epi_reap");
+        // a tensor-parallel rank captured only its band of each layer's heads;
+        // the epilogue reads the model's planes, so the bands are gathered
+        // first (every rank fires the same frame, so every rank gathers the
+        // same lanes)
+        if let Some(slab) = self.scores {
+            for (lane, seated) in p.lanes.iter().enumerate() {
+                if seated.captures_scores {
+                    slab.gather(self.device.ctx(), lane as u32)?;
+                }
+            }
+        }
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| a.at == Boundary::Epilogue) {
             let lane = attached.lane as usize;

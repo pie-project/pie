@@ -226,7 +226,8 @@ struct Input {
     #[serde(default = "default_layers")]
     layers: u32,
     /// Query heads per exported attention layer. `Model::d0_8b`'s
-    /// `q_heads: 8`, at `tp == 1`.
+    /// `q_heads: 8`: the model's count at any rank count, since a
+    /// tensor-parallel load gathers the ranks' bands into the model's planes.
     #[serde(default = "default_heads")]
     heads: u32,
     /// Prefill chunk width, clamped to the engine's `max_embed_length()`.
@@ -259,7 +260,7 @@ fn default_report() -> bool {
 fn default_layers() -> u32 {
     6
 }
-/// qwen35-d0.8b: `q_heads: 8` at `tp == 1`.
+/// qwen35-d0.8b: `q_heads: 8`, the model's count at any rank count.
 fn default_heads() -> u32 {
     8
 }
