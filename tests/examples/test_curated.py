@@ -400,14 +400,27 @@ async def test_synthid_tournament_sampling(client, args):
     assert 0.0 <= report["mean_null_score"] <= 1.0, report
 
 
+async def _cfg_report(client, args, inputs: dict) -> dict:
+    """The JSON report of classifier-free-guidance: `count` and `token_ids` are
+    what `scripts/bench/pie_bench.py` reads, so the prose this program used to
+    answer with never produced a bench number (#660)."""
+    report = await _report(client, args, "classifier-free-guidance", inputs)
+    assert report["sampler"] == "classifier-free-guidance", report
+    assert 1 <= report["count"] <= inputs["max_tokens"], report
+    assert len(report["token_ids"]) == report["count"], report
+    assert report["steps"] >= report["count"], report
+    assert 0.0 <= report["guidance_shift"] <= 1.0, report
+    return report
+
+
 async def test_classifier_free_guidance(client, args):
-    output = await _nonempty(
+    report = await _cfg_report(
         client,
         args,
-        "classifier-free-guidance",
         {"max_tokens": 4, "guidance": 2.0, "negative_prompt": "Talk about the weather."},
     )
-    assert "[cfg]" in output and "mean_kl=" in output, output
+    assert report["guidance"] == 2.0, report
+    assert report["mean_kl"] >= 0.0, report
 
 
 def _assert_kl_identity(output: str) -> None:
@@ -437,11 +450,15 @@ def _assert_kl_identity(output: str) -> None:
 
 
 async def test_classifier_free_guidance_identity(client, args):
-    """guidance=1.0 is plain conditional sampling, so the KL must be exactly 0."""
-    output = await _nonempty(
-        client, args, "classifier-free-guidance", {"max_tokens": 4, "guidance": 1.0}
-    )
-    _assert_kl_identity(output)
+    """guidance=1.0 is plain conditional sampling, so the KL must be exactly 0.
+
+    Same tolerance as `_assert_kl_identity`, read from the JSON field rather
+    than the printed four decimals.
+    """
+    report = await _cfg_report(client, args, {"max_tokens": 4, "guidance": 1.0})
+    assert abs(report["mean_kl"]) < 5e-5, f"mean_kl is not an identity: {report}"
+    assert report["guidance_shift"] == 0.0, report
+    assert report["identity_violation"] is False, report
 
 
 async def test_context_aware_decoding(client, args):

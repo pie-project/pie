@@ -45,6 +45,15 @@ cancels in the softmax.
 | `max_tokens` | int | `32` | Number of generated tokens |
 | `seed` | int | — | RNG key for the Gumbel-max draw |
 
+## Output
+
+One JSON object, the shape the other sampler inferlets (and
+`scripts/bench/pie_bench.py`) read: `text`, `count` (generated tokens),
+`token_ids`, `prompt_len`, `guidance`, `steps` (guided picks, the stop token
+included), `guidance_shift` (fraction of steps at which guidance moved the
+argmax), `mean_kl` (mean KL(P_cfg ‖ P_cond) in nats) and `identity_violation`
+(`true` when `guidance = 1` produced a shift or a KL beyond float noise).
+
 ## Cost
 
 **13.87 ms/token, 4.21× the [`naive-baseline`](../naive-baseline) control** on
