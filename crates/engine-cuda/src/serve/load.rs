@@ -295,7 +295,17 @@ fn refit_lanes(
     if working_at(asked, false) <= room {
         return Ok((compiled, budgets, tiles_of(&planes, false)));
     }
-    let lanes = crate::store::tokens_within(asked, 1, room, |lanes| working_at(lanes, true));
+    let fitted = crate::store::tokens_within(asked, 1, room, |lanes| working_at(lanes, true));
+    let one_sequence = crate::store::one_slot_bytes(&boot.trace, paging)?;
+    let slab = sequence.saturating_sub(one_sequence);
+    let lanes = if slab == 0 {
+        fitted
+    } else {
+        crate::store::lanes_within_seats(fitted, 8, paging.slots, one_sequence, slab, |lanes| {
+            live.saturating_sub(crate::store::BODIES_FLOOR_BYTES)
+                .saturating_sub(working_at(lanes, true))
+        })
+    };
     for (stream, plane) in planes.iter().enumerate() {
         if plane.widest > plane.at_tokens {
             eprintln!(
@@ -311,17 +321,29 @@ fn refit_lanes(
     if lanes == asked || working_at(lanes, true) > room {
         return Ok((compiled, budgets, tiles_of(&planes, true)));
     }
-    eprintln!(
-        "engine-cuda: [engine] max_forward_requests {asked} is served at {lanes}: at {asked} \
-         the activation arena, attention workspaces, decoded-weight tiles and guest programs \
-         take {} MiB of the {} MiB this card has after the weight tier under [engine] \
-         gpu_mem_utilization, and one sequence at the declared context and the bodies' floor \
-         need {} MiB beside them. State a smaller max_forward_requests to choose it, or a \
-         larger gpu_mem_utilization.",
-        working_at(asked, true) >> 20,
-        live >> 20,
-        (sequence + crate::store::BODIES_FLOOR_BYTES) >> 20,
-    );
+    if fitted < asked {
+        eprintln!(
+            "engine-cuda: [engine] max_forward_requests {asked} is served at {fitted}: at \
+             {asked} the activation arena, attention workspaces, decoded-weight tiles and guest \
+             programs take {} MiB of the {} MiB this card has after the weight tier under \
+             [engine] gpu_mem_utilization, and one sequence at the declared context and the \
+             bodies' floor need {} MiB beside them. State a smaller max_forward_requests to \
+             choose it, or a larger gpu_mem_utilization.",
+            working_at(asked, true) >> 20,
+            live >> 20,
+            (sequence + crate::store::BODIES_FLOOR_BYTES) >> 20,
+        );
+    }
+    if lanes < fitted {
+        eprintln!(
+            "engine-cuda: [engine] max_forward_requests {fitted} is served at {lanes}: the \
+             runtime admits no more lanes than the state slots seat, and what {fitted} lanes \
+             reserve left the pool fewer seats than lanes; at {lanes} the cache rows have {} \
+             MiB more. State a smaller max_forward_requests to choose it, or a larger \
+             gpu_mem_utilization.",
+            working_at(fitted, true).saturating_sub(working_at(lanes, true)) >> 20,
+        );
+    }
     boot.budget = budget_at(lanes);
     let budgets = budgets_at(&boot.budget);
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, profile)?;

@@ -2,7 +2,8 @@ use engine_cuda::device::elastic::map_unit_for;
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
 use engine_cuda::store::{
     Accounting, BODIES_FLOOR_BYTES, bodies_allowance, decoded_weight_reserve, holds_within,
-    least_state_slots, pages_within, program_scratch_reserve, state_slots_within, tokens_within,
+    lanes_within_seats, least_state_slots, pages_within, program_scratch_reserve,
+    state_slots_within, tokens_within,
 };
 use engine_cuda::{DeviceBoot, Knobs};
 
@@ -39,6 +40,60 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes();
     a_tight_fit_still_seats_one_buffered_lane();
     a_hybrids_slots_are_cut_to_what_leaves_the_pages_their_half();
+    a_hybrids_lanes_are_levelled_to_the_seats_the_pool_holds();
+}
+
+fn a_hybrids_lanes_are_levelled_to_the_seats_the_pool_holds() {
+    // pie-evals nightly 36103818429 on an RTX 4090: qwen3.6-27b u4g64 at an
+    // 8k envelope held room for 256 lanes, the pool seated 16 state slots
+    // (the runtime admitted 8 lanes) and 384 kv pages, one sequence. A
+    // sequence's kv is 384 MiB and a slot's slab 78 MiB, per that pool.
+    const CARD: u64 = 25_250_627_584;
+    const BEFORE: u64 = 426_901_504;
+    const WEIGHTS: u64 = 15_300_601_856;
+    const ARENA: u64 = 838_467_584;
+    const INPUTS: u64 = 2_150_089_216;
+    const ATTENTION: u64 = 570_425_344;
+    const LANES: u32 = 256;
+    const TOKENS: u32 = 4096;
+    const VOCAB: u64 = 248_320;
+    const ONE_SEQUENCE: u64 = 384 << 20;
+    const SLAB: u64 = 78 << 20;
+    let live = budget_bytes(CARD - BEFORE, CARD, 0.90) - WEIGHTS;
+    let room_at = |lanes: u32| {
+        let fewer = u64::from(LANES - lanes);
+        live - BODIES_FLOOR_BYTES
+            - (ARENA - fewer * VOCAB * 2)
+            - (INPUTS - fewer * 2 * 24 * 64 * 256 * 4)
+            - ATTENTION
+            - program_scratch_reserve(lanes, VOCAB * 4)
+            - u64::from(lanes) * u64::from(TOKENS) * 8
+    };
+    let seats = |lanes: u32| {
+        state_slots_within(LANES, room_at(lanes), ONE_SEQUENCE, |slots| {
+            u64::from(slots) * SLAB
+        }) / 2
+    };
+    assert!(seats(LANES) < 8, "at 256 lanes: {} seats", seats(LANES));
+
+    let lanes = lanes_within_seats(LANES, 8, LANES, ONE_SEQUENCE, SLAB, room_at);
+    assert_eq!(lanes, 8, "halved to the floor");
+    assert!(
+        seats(lanes) >= lanes,
+        "where every lane seats: {}",
+        seats(lanes)
+    );
+    let pages = room_at(lanes) - u64::from(2 * seats(lanes)) * SLAB;
+    assert!(
+        pages >= 4 * ONE_SEQUENCE,
+        "and the kv pages hold {} sequences at the declared context, not one",
+        pages / ONE_SEQUENCE
+    );
+    assert_eq!(
+        lanes_within_seats(LANES, 8, 2 * LANES, ONE_SEQUENCE, SLAB, |_| 1 << 40),
+        LANES,
+        "a pool that seats the lanes keeps them"
+    );
 }
 
 fn a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes() {
