@@ -81,6 +81,8 @@ pub struct FireBindings {
 
     pub readout_rows: Tensor,
 
+    pub readout_rows_host: Vec<i32>,
+
     pub nan_flags: Option<Tensor>,
 
     pub patches: Option<Tensor>,
@@ -381,7 +383,9 @@ impl<'c> Run<'c> {
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
             Some(Dim::Lanes) => (window.lane_offset, window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
-            Some(Dim::Readouts) => return handle,
+            Some(Dim::Readouts) => {
+                readout_span(&self.fire.readout_rows_host, window.row_offset, window.rows)
+            }
             Some(Dim::Const(_)) | None => return handle,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
@@ -836,5 +840,36 @@ impl<'c> Run<'c> {
                 id.0
             ),
         }
+    }
+}
+
+fn readout_span(rows: &[i32], offset: u32, count: u32) -> (u32, u32) {
+    let contains =
+        |row: &i32| *row >= 0 && (*row as u32) >= offset && (*row as u32) - offset < count;
+    let Some(first) = rows.iter().position(contains) else {
+        return (0, 0);
+    };
+    let end = rows.iter().rposition(contains).unwrap() + 1;
+    assert!(
+        rows[first..end].iter().all(contains),
+        "a lane-contiguous window must have contiguous readouts"
+    );
+    (first as u32, (end - first) as u32)
+}
+
+#[cfg(test)]
+mod readout_tests {
+    use super::readout_span;
+    #[test]
+    fn token_windows_select_their_own_readouts_in_a_mixed_batch() {
+        let rows = [
+            511, 512, 513, 514, 515, 516, 517, 518, 519, 520, 521, 522, 523,
+        ];
+        assert_eq!(readout_span(&rows, 0, 512), (0, 1));
+        assert_eq!(readout_span(&rows, 512, 8), (1, 8));
+        assert_eq!(readout_span(&rows, 520, 4), (9, 4));
+        assert_eq!(readout_span(&rows, 0, 524), (0, 13));
+        assert_eq!(readout_span(&rows, 524, 8), (0, 0));
+        assert_eq!(readout_span(&[511, 515, 512, 514, 520], 512, 8), (1, 3));
     }
 }

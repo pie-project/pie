@@ -1,4 +1,6 @@
 pub mod arbiter;
+pub mod q8;
+pub mod split;
 
 pub mod dense;
 
@@ -389,6 +391,11 @@ fn vector(
         o.rows == q.rows && o.width == q.width && o.dtype == q.dtype,
         "the attention lands one output row per query row"
     );
+    if q8::enabled(pool, head_dim) {
+        return q8::attention(
+            ctx, op, q, pool, plan, window, causal, head_dim, sm_scale, o, lse, false,
+        );
+    }
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
     let entry = match lse {
         None => SDPA_DECODE[shape.at],
@@ -459,6 +466,9 @@ fn selected(
             op,
             "a selection and a sliding window are two answers to which keys a row reads",
         ));
+    }
+    if q8::enabled(pool, head_dim) {
+        return Err(refuse(op, "selected attention requires BF16 KV"));
     }
     let shape = Paged::of(op, q, pool, None, true, head_dim)?;
     let ratio = nonzero(op, "the block width this reader expands", ratio)?;
@@ -589,6 +599,18 @@ fn tiled(
         o.rows == q.rows && o.width == q.width && o.dtype == q.dtype,
         "the attention lands one output row per query row"
     );
+    if q8::enabled(pool, head_dim) {
+        let decode = DecodePlan {
+            positions: plan.positions,
+            request_of_token: plan.request_of_token,
+            mask,
+            mask_enabled: plan.mask_enabled,
+            mask_stride: plan.mask_stride,
+        };
+        return q8::attention(
+            ctx, op, q, pool, &decode, window, causal, head_dim, sm_scale, o, lse, true,
+        );
+    }
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
     let entry = match lse {
         None => SDPA_TILED[shape.at],
@@ -867,8 +889,22 @@ fn append_paged(
     );
     let (head_dim, heads) = head_split(op, pool, k.width)?;
     let lanes = head_grid(op, head_dim, heads, k.rows)?;
+    let q8 = q8::enabled(pool, head_dim);
+    let (file, entry, grid) = if q8 {
+        (
+            "attn/q8_write.metal",
+            "kv_append_paged_q8",
+            Grid::of([32, heads, k.rows], [32, 1, 1]),
+        )
+    } else {
+        (
+            "attn/kv_write.metal",
+            entry,
+            Grid::of(lanes, head_group(lanes)),
+        )
+    };
     ctx.fire(
-        Fire::at("attn/kv_write.metal", entry).apply(Grid::of(lanes, head_group(lanes))),
+        Fire::at(file, entry).apply(grid),
         &[
             k.arg(),
             v.arg(),

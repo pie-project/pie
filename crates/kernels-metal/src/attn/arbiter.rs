@@ -116,6 +116,22 @@ fn arbitrate(
     requests: u32,
     tuning: &DeviceTuning,
 ) -> Result<(), Error> {
+    if super::q8::enabled(pool, head_dim) {
+        return super::q8::attention(
+            ctx,
+            op,
+            q,
+            pool,
+            &as_decode(plan, mask),
+            window,
+            causal,
+            head_dim,
+            sm_scale,
+            o,
+            lse,
+            tuning.sdpa_mpp && should_tile(q.rows, requests, tuning),
+        );
+    }
     if !should_tile(q.rows, requests, tuning) {
         return vector(
             ctx,
@@ -270,6 +286,66 @@ pub fn masked_lse(
         Some(lse),
         requests,
         tuning,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_with_scratch(
+    ctx: &Ctx<'_>,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    pool: &KvPool,
+    window: Option<u32>,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    o: Tensor,
+    requests: u32,
+    tuning: &DeviceTuning,
+    partials: &dyn Fn(u32, u32) -> Option<Tensor>,
+) -> Result<(), Error> {
+    if tuning.sdpa_mpp
+        && kv_heads == 4
+        && super::split::try_paged(
+            ctx, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, requests,
+            partials,
+        )?
+    {
+        return Ok(());
+    }
+
+    prefill(
+        ctx, q, plan, pool, window, head_dim, kv_heads, sm_scale, o, requests, tuning,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn masked_with_scratch(
+    ctx: &Ctx<'_>,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    mask: Tensor,
+    pool: &KvPool,
+    window: Option<u32>,
+    causal: bool,
+    head_dim: u32,
+    sm_scale: f32,
+    o: Tensor,
+    requests: u32,
+    tuning: &DeviceTuning,
+    partials: &dyn Fn(u32, u32) -> Option<Tensor>,
+) -> Result<(), Error> {
+    if tuning.sdpa_mpp
+        && super::split::try_paged(
+            ctx, q.data, pool, plan, mask, window, causal, head_dim, sm_scale, o, requests,
+            partials,
+        )?
+    {
+        return Ok(());
+    }
+
+    masked(
+        ctx, q, plan, mask, pool, window, causal, head_dim, sm_scale, o, requests, tuning,
     )
 }
 

@@ -25,40 +25,40 @@ const fn recurrence_grid(heads: u32, rows: u32) -> Grid {
 }
 
 macro_rules! gdn_scan_points {
-    ($(($v:literal, $p:literal)),+ $(,)?) => {
-        fn gdn_scan_point(vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
-            match (vrows, per) {
-                $(($v, $p) => Some((
-                    concat!("gated_delta_scan_bfloat16_l_32_v_", $v, "_p_", $p),
+    ($(($l:literal, $v:literal, $p:literal)),+ $(,)?) => {
+        fn gdn_scan_point(lanes: u32, vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
+            match (lanes, vrows, per) {
+                $(($l, $v, $p) => Some((
+                    concat!("gated_delta_scan_bfloat16_l_", $l, "_v_", $v, "_p_", $p),
                     concat!(
-                        "PIE_STAMP_gdn_scan(\"gated_delta_scan_bfloat16_l_32_v_",
-                        $v, "_p_", $p, "\", 32, ", $v, ", ", $p, ")"
+                        "PIE_STAMP_gdn_scan(\"gated_delta_scan_bfloat16_l_", $l, "_v_",
+                        $v, "_p_", $p, "\", ", $l, ", ", $v, ", ", $p, ")"
                     ),
                 )),)+
                 _ => None,
             }
         }
 
-        fn gdn_scan_step_point(vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
-            match (vrows, per) {
-                $(($v, $p) => Some((
-                    concat!("gated_delta_scan_step_bfloat16_l_32_v_", $v, "_p_", $p),
+        fn gdn_scan_step_point(lanes: u32, vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
+            match (lanes, vrows, per) {
+                $(($l, $v, $p) => Some((
+                    concat!("gated_delta_scan_step_bfloat16_l_", $l, "_v_", $v, "_p_", $p),
                     concat!(
-                        "PIE_STAMP_gdn_scan_step(\"gated_delta_scan_step_bfloat16_l_32_v_",
-                        $v, "_p_", $p, "\", 32, ", $v, ", ", $p, ")"
+                        "PIE_STAMP_gdn_scan_step(\"gated_delta_scan_step_bfloat16_l_", $l, "_v_",
+                        $v, "_p_", $p, "\", ", $l, ", ", $v, ", ", $p, ")"
                     ),
                 )),)+
                 _ => None,
             }
         }
 
-        fn gdn_scan_committed_point(vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
-            match (vrows, per) {
-                $(($v, $p) => Some((
-                    concat!("gated_delta_scan_committed_bfloat16_l_32_v_", $v, "_p_", $p),
+        fn gdn_scan_committed_point(lanes: u32, vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
+            match (lanes, vrows, per) {
+                $(($l, $v, $p) => Some((
+                    concat!("gated_delta_scan_committed_bfloat16_l_", $l, "_v_", $v, "_p_", $p),
                     concat!(
-                        "PIE_STAMP_gdn_scan_committed(\"gated_delta_scan_committed_bfloat16_l_32_v_",
-                        $v, "_p_", $p, "\", 32, ", $v, ", ", $p, ")"
+                        "PIE_STAMP_gdn_scan_committed(\"gated_delta_scan_committed_bfloat16_l_", $l, "_v_",
+                        $v, "_p_", $p, "\", ", $l, ", ", $v, ", ", $p, ")"
                     ),
                 )),)+
                 _ => None,
@@ -68,34 +68,69 @@ macro_rules! gdn_scan_points {
 }
 
 gdn_scan_points!(
-    (1, 2),
-    (2, 2),
-    (4, 2),
-    (8, 2),
-    (1, 4),
-    (2, 4),
-    (4, 4),
-    (8, 4),
-    (1, 8),
-    (2, 8),
-    (4, 8),
-    (8, 8),
+    (8, 2, 16),
+    (32, 1, 2),
+    (32, 2, 2),
+    (32, 4, 2),
+    (32, 8, 2),
+    (32, 1, 4),
+    (32, 2, 4),
+    (32, 4, 4),
+    (32, 8, 4),
+    (32, 1, 8),
+    (32, 2, 8),
+    (32, 4, 8),
+    (32, 8, 8),
 );
 
 fn gdn_scan_launch(shape: &Delta, requests: u32) -> Option<(&'static str, &'static str, Grid)> {
     let tuned = crate::tuning::current();
-    if tuned.gdn_scan_lanes != GDN_SCAN_LANES {
+    if ![8, GDN_SCAN_LANES].contains(&tuned.gdn_scan_lanes) {
         return None;
     }
-    gdn_scan_launch_at(shape, requests, tuned.gdn_scan_rows, gdn_scan_point)
+    gdn_scan_launch_at(
+        shape,
+        requests,
+        tuned.gdn_scan_lanes,
+        tuned.gdn_scan_rows,
+        gdn_scan_point,
+    )
+}
+
+fn gdn_staged_launch_at(
+    shape: &Delta,
+    requests: u32,
+    rows: u32,
+    lanes: u32,
+    vrows: u32,
+) -> Option<Grid> {
+    if lanes != 8
+        || vrows != 2
+        || shape.k_dim != 128
+        || shape.v_dim != 128
+        || requests == 0
+        || rows / requests < 32
+    {
+        return None;
+    }
+    Some(Grid::of(
+        [8, 64, shape.v_heads.checked_mul(requests)?],
+        [8, 16, 1],
+    ))
 }
 
 fn gdn_scan_step_launch(shape: &Delta, rows: u32) -> Option<(&'static str, &'static str, Grid)> {
     let tuned = crate::tuning::current();
-    if tuned.gdn_scan_lanes != GDN_SCAN_LANES {
+    if ![8, GDN_SCAN_LANES].contains(&tuned.gdn_scan_lanes) {
         return None;
     }
-    gdn_scan_launch_at(shape, rows, tuned.gdn_scan_rows, gdn_scan_step_point)
+    gdn_scan_launch_at(
+        shape,
+        rows,
+        tuned.gdn_scan_lanes,
+        tuned.gdn_scan_rows,
+        gdn_scan_step_point,
+    )
 }
 
 fn gdn_scan_committed_launch(
@@ -103,28 +138,37 @@ fn gdn_scan_committed_launch(
     lanes: u32,
 ) -> Option<(&'static str, &'static str, Grid)> {
     let tuned = crate::tuning::current();
-    if tuned.gdn_scan_lanes != GDN_SCAN_LANES {
+    if ![8, GDN_SCAN_LANES].contains(&tuned.gdn_scan_lanes) {
         return None;
     }
-    gdn_scan_launch_at(shape, lanes, tuned.gdn_scan_rows, gdn_scan_committed_point)
+    gdn_scan_launch_at(
+        shape,
+        lanes,
+        tuned.gdn_scan_lanes,
+        tuned.gdn_scan_rows,
+        gdn_scan_committed_point,
+    )
 }
 
 fn gdn_scan_launch_at(
     shape: &Delta,
     requests: u32,
+    lanes: u32,
     vrows: u32,
-    point: fn(u32, u32) -> Option<(&'static str, &'static str)>,
+    point: fn(u32, u32, u32) -> Option<(&'static str, &'static str)>,
 ) -> Option<(&'static str, &'static str, Grid)> {
-    if vrows == 0
+    if ![8, GDN_SCAN_LANES].contains(&lanes)
+        || vrows == 0
         || !shape.v_dim.is_multiple_of(vrows)
-        || !shape.k_dim.is_multiple_of(GDN_SCAN_LANES)
+        || !shape.k_dim.is_multiple_of(lanes)
     {
         return None;
     }
-    let (entry, stamp) = point(vrows, shape.k_dim / GDN_SCAN_LANES)?;
+    let (entry, stamp) = point(lanes, vrows, shape.k_dim / lanes)?;
     let row_groups = shape.v_dim / vrows;
-    let tg_rows = if row_groups.is_multiple_of(GDN_SCAN_TG_ROWS) {
-        GDN_SCAN_TG_ROWS
+    let target_tg_rows = GDN_SCAN_LANES * GDN_SCAN_TG_ROWS / lanes;
+    let tg_rows = if row_groups.is_multiple_of(target_tg_rows) {
+        target_tg_rows
     } else {
         1
     };
@@ -132,10 +176,7 @@ fn gdn_scan_launch_at(
     Some((
         entry,
         stamp,
-        Grid::of(
-            [GDN_SCAN_LANES, row_groups, z],
-            [GDN_SCAN_LANES, tg_rows, 1],
-        ),
+        Grid::of([lanes, row_groups, z], [lanes, tg_rows, 1]),
     ))
 }
 
@@ -350,8 +391,20 @@ pub fn causal_conv1d_chunked(
         "the state bank a dilated conv reads is `(width - 1) * dilation + 1` rows of channels"
     );
     let lanes = requests(OP, x)?;
+    let parallel = hist <= 32 && x.data.rows / lanes.max(1) >= 256;
+    let (entry, grid) = if parallel {
+        (
+            "causal_conv1d_chunked_parallel_bfloat16",
+            Grid::of(
+                [channels, lanes, x.data.rows.div_ceil(32)],
+                [channels.min(CONV_GROUP), 1, 1],
+            ),
+        )
+    } else {
+        (entry, conv_grid(channels, lanes))
+    };
     ctx.fire(
-        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(conv_grid(channels, lanes)),
+        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(grid),
         &[
             x.data.arg(),
             x.indptr.arg(),
@@ -496,6 +549,24 @@ pub fn gated_delta_chunked(
         stated(OP, shape.k_dim)?.arg(),
         stated(OP, shape.v_dim)?.arg(),
     ];
+    let tuned = crate::tuning::current();
+    if let Some(grid) = gdn_staged_launch_at(
+        &shape,
+        lanes,
+        qkv.data.rows,
+        tuned.gdn_scan_lanes,
+        tuned.gdn_scan_rows,
+    ) {
+        return ctx.fire(
+            Fire::at(
+                "attn/ssm_gdn_staged.metal",
+                "gated_delta_staged_bfloat16_b16",
+            )
+            .stamp("PIE_GDN_STAGED(\"gated_delta_staged_bfloat16_b16\", 16)")
+            .apply(grid),
+            &args,
+        );
+    }
     if let Some((point, stamp, grid)) = gdn_scan_launch(&shape, lanes) {
         return ctx.fire(
             Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
@@ -655,12 +726,22 @@ mod tests {
     fn ssm_every_case() {
         the_three_scans_share_one_geometry();
         a_shape_the_stamp_does_not_name_falls_back();
+        assert!(gdn_staged_launch_at(&D27B, 4, 127, 8, 2).is_none());
+        assert_eq!(
+            gdn_staged_launch_at(&D27B, 4, 128, 8, 2),
+            Some(Grid::of([8, 64, 4 * 48], [8, 16, 1]))
+        );
+        assert!(gdn_staged_launch_at(&D27B, 4, 2048, 32, 4).is_none());
+        assert!(gdn_staged_launch_at(&D27B, 0, 0, 8, 2).is_none());
+        assert!(gdn_staged_launch_at(&Delta { v_dim: 64, ..D27B }, 4, 2048, 8, 2).is_none());
+        assert!(gdn_staged_launch_at(&Delta { k_dim: 64, ..D27B }, 4, 2048, 8, 2).is_none());
     }
 
     fn the_three_scans_share_one_geometry() {
-        let plain = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_point).expect("stamped");
-        let step = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_step_point).expect("stamped");
-        let committed = gdn_scan_launch_at(&D27B, 3, 4, gdn_scan_committed_point).expect("stamped");
+        let plain = gdn_scan_launch_at(&D27B, 3, 32, 4, gdn_scan_point).expect("stamped");
+        let step = gdn_scan_launch_at(&D27B, 3, 32, 4, gdn_scan_step_point).expect("stamped");
+        let committed =
+            gdn_scan_launch_at(&D27B, 3, 32, 4, gdn_scan_committed_point).expect("stamped");
         assert_eq!(plain.0, "gated_delta_scan_bfloat16_l_32_v_4_p_4");
         assert_eq!(step.0, "gated_delta_scan_step_bfloat16_l_32_v_4_p_4");
         assert_eq!(
@@ -671,6 +752,16 @@ mod tests {
         assert_eq!(plain.2, step.2);
         assert_eq!(plain.2, committed.2);
         assert_eq!(plain.2, Grid::of([32, 32, 3 * 48], [32, 4, 1]));
+        let packed = gdn_scan_launch_at(&D27B, 3, 8, 2, gdn_scan_point).expect("packed");
+        let packed_step = gdn_scan_launch_at(&D27B, 3, 8, 2, gdn_scan_step_point).expect("packed");
+        let packed_commit =
+            gdn_scan_launch_at(&D27B, 3, 8, 2, gdn_scan_committed_point).expect("packed");
+        assert_eq!(packed.0, "gated_delta_scan_bfloat16_l_8_v_2_p_16");
+        assert_eq!(packed.2, Grid::of([8, 64, 3 * 48], [8, 16, 1]));
+        assert_eq!(packed.2, packed_step.2);
+        assert_eq!(packed.2, packed_commit.2);
+        assert!(gdn_scan_launch_at(&D27B, 3, 8, 4, gdn_scan_point).is_none());
+        assert!(gdn_scan_launch_at(&D27B, 3, 0, 2, gdn_scan_point).is_none());
     }
 
     fn a_shape_the_stamp_does_not_name_falls_back() {
