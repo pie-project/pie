@@ -441,17 +441,18 @@ enum Scratch {
 }
 
 impl Scratch {
-    fn fitting(arena: usize, mapped: u64) -> Result<Scratch> {
+    fn fitting(arena: usize, mapped: u64, beside: &Path) -> Result<Scratch> {
         let need = arena as u64 + mapped + (2 << 30);
-        if need <= available_memory() {
+        let free = available_memory();
+        if arena == 0 || need <= free {
             return Ok(Scratch::Ram(vec![0u8; arena]));
         }
         eprintln!(
             "engine-cuda: the load's {arena}-byte transform arena does not fit \
-             what is left of this machine's memory beside its {mapped} mapped \
-             bytes; spilling the arena to disk"
+             the {free} bytes left of this machine's memory beside its {mapped} \
+             mapped bytes; spilling the arena to disk"
         );
-        SpillArena::new(arena).map(Scratch::Disk)
+        SpillArena::new(arena, &[std::env::temp_dir(), beside.to_path_buf()]).map(Scratch::Disk)
     }
 
     fn as_mut(&mut self) -> &mut [u8] {
@@ -463,33 +464,96 @@ impl Scratch {
 }
 
 fn available_memory() -> u64 {
-    let meminfo = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| {
-            text.lines().find_map(|line| {
-                let rest = line.strip_prefix("MemAvailable:")?;
-                let kb: u64 = rest.trim().trim_end_matches(" kB").trim().parse().ok()?;
-                Some(kb * 1024)
-            })
-        });
-    let cgroup = || -> Option<u64> {
-        let max: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
-        let current: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
-        Some(max.saturating_sub(current))
-    }();
-    match (meminfo, cgroup) {
+    let read = |path: &str| std::fs::read_to_string(path).ok();
+    headroom(
+        read("/proc/meminfo").as_deref(),
+        read("/sys/fs/cgroup/memory.max").as_deref(),
+        read("/sys/fs/cgroup/memory.current").as_deref(),
+        read("/sys/fs/cgroup/memory.stat").as_deref(),
+    )
+}
+
+/// `memory.current` counts the page cache the group's reads left behind, which
+/// reclaim hands back on demand, so it is netted out as `MemAvailable` does.
+fn headroom(
+    meminfo: Option<&str>,
+    max: Option<&str>,
+    current: Option<&str>,
+    stat: Option<&str>,
+) -> u64 {
+    let field = |text: Option<&str>, key: &str| -> Option<u64> {
+        text?.lines().find_map(|line| {
+            let rest = line.strip_prefix(key)?;
+            rest.trim().trim_end_matches("kB").trim().parse().ok()
+        })
+    };
+    let number = |text: Option<&str>| -> Option<u64> { text?.trim().parse().ok() };
+    let host = field(meminfo, "MemAvailable:").map(|kb| kb * 1024);
+    let cgroup = number(max).zip(number(current)).map(|(max, current)| {
+        let cached =
+            field(stat, "inactive_file ").unwrap_or(0) + field(stat, "active_file ").unwrap_or(0);
+        max.saturating_sub(current.saturating_sub(cached))
+    });
+    match (host, cgroup) {
         (Some(a), Some(b)) => a.min(b),
         (Some(a), None) | (None, Some(a)) => a,
         (None, None) => u64::MAX,
     }
+}
+
+struct Volume {
+    free: u64,
+    tmpfs: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn volume(at: &Path) -> Option<Volume> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(at.as_os_str().as_bytes()).ok()?;
+    let mut said: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a struct this frame owns.
+    if unsafe { libc::statfs(path.as_ptr(), &raw mut said) } != 0 {
+        return None;
+    }
+    Some(Volume {
+        free: said
+            .f_bavail
+            .checked_mul(u64::try_from(said.f_bsize).ok()?)?,
+        tmpfs: said.f_type == libc::TMPFS_MAGIC,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn volume(_at: &Path) -> Option<Volume> {
+    None
+}
+
+/// A tmpfs is the memory the spill is leaving, and a volume short of `len`
+/// takes the sparse `ftruncate` and SIGBUSes the landing; a volume `statfs`
+/// cannot describe is taken on trust.
+fn spill_site(
+    candidates: &[(std::path::PathBuf, Option<Volume>)],
+    len: u64,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let mut refused = Vec::new();
+    for (dir, volume) in candidates {
+        match volume {
+            Some(Volume { tmpfs: true, .. }) => {
+                refused.push(format!("{} is a tmpfs", dir.display()));
+            }
+            Some(Volume { free, .. }) if *free < len => refused.push(format!(
+                "{} has {:.2} GiB free",
+                dir.display(),
+                *free as f64 / (1u64 << 30) as f64
+            )),
+            _ => return Ok(dir.clone()),
+        }
+    }
+    Err(format!(
+        "no volume has {:.2} GiB of real disk for the arena: {}. Point TMPDIR at one that does",
+        len as f64 / (1u64 << 30) as f64,
+        refused.join(", ")
+    ))
 }
 
 struct SpillArena {
@@ -498,9 +562,15 @@ struct SpillArena {
 }
 
 impl SpillArena {
-    fn new(len: usize) -> Result<SpillArena> {
-        let dir = std::env::temp_dir();
+    fn new(len: usize, candidates: &[std::path::PathBuf]) -> Result<SpillArena> {
+        let refuse = |why: String| Fault::Load(checkpoint::error::Error::Checkpoint(why));
+        let sites: Vec<_> = candidates
+            .iter()
+            .map(|dir| (dir.clone(), volume(dir)))
+            .collect();
+        let dir = spill_site(&sites, len as u64).map_err(refuse)?;
         let path = dir.join(format!("pie-arena-{}", std::process::id()));
+        eprintln!("engine-cuda: the arena spills to {}", path.display());
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -508,24 +578,40 @@ impl SpillArena {
             .truncate(true)
             .open(&path)
             .map_err(|why| {
-                Fault::Load(checkpoint::error::Error::Checkpoint(format!(
+                refuse(format!(
                     "the arena spill file {} does not open: {why}",
                     path.display()
-                )))
+                ))
             })?;
         let _ = std::fs::remove_file(&path);
         file.set_len(len as u64).map_err(|why| {
-            Fault::Load(checkpoint::error::Error::Checkpoint(format!(
+            refuse(format!(
                 "the arena spill file does not grow to {len} bytes: {why}"
-            )))
+            ))
         })?;
+        // Claim the pages now so a full volume refuses by name instead of
+        // SIGBUS on the first write it cannot back.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the open descriptor and the length it was just sized to.
+            if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as libc::off_t) } != 0 {
+                let why = std::io::Error::last_os_error();
+                if !matches!(
+                    why.raw_os_error(),
+                    Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL)
+                ) {
+                    return Err(refuse(format!(
+                        "the arena spill file under {} does not preallocate {len} bytes: {why}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
         // SAFETY: a fresh shared mapping over a file this fn just created,
         // sized, and unlinked, so no other process can reach it.
-        let map = unsafe { memmap2::MmapMut::map_mut(&file) }.map_err(|why| {
-            Fault::Load(checkpoint::error::Error::Checkpoint(format!(
-                "the arena spill file does not map: {why}"
-            )))
-        })?;
+        let map = unsafe { memmap2::MmapMut::map_mut(&file) }
+            .map_err(|why| refuse(format!("the arena spill file does not map: {why}")))?;
         Ok(SpillArena { map, len })
     }
 
@@ -711,7 +797,7 @@ impl Weights {
                 sink.landed
             } else {
                 let bytes = usize::try_from(landing.memory.arena_bytes()).unwrap_or(0);
-                let mut scratch = Scratch::fitting(bytes, plan.spill_demand())?;
+                let mut scratch = Scratch::fitting(bytes, plan.spill_demand(), snapshot)?;
                 let mut backing: &mut [u8] = scratch.as_mut();
                 Execution::new(&landing, snapshot)
                     .arena(&mut backing)
@@ -1222,5 +1308,30 @@ mod tests {
         assert_eq!(places[0].rows, 248_320);
         assert_eq!(places[0].width, 1024);
         assert_eq!(places[0].bytes, 248_320 * 1024 * 2);
+    }
+
+    #[test]
+    fn the_headroom_nets_the_cgroups_page_cache_out_of_its_usage() {
+        let meminfo = "MemAvailable:   743437580 kB\n";
+        let stat = "anon 758157312\ninactive_file 23216467968\nactive_file 66810552320\n";
+        let pod = headroom(
+            Some(meminfo),
+            Some("93999996928\n"),
+            Some("93473275904\n"),
+            Some(stat),
+        );
+        assert_eq!(
+            pod,
+            93_999_996_928 - (93_473_275_904 - 23_216_467_968 - 66_810_552_320)
+        );
+        assert_eq!(
+            headroom(
+                None,
+                Some("100\n"),
+                Some("100\n"),
+                Some("inactive_file 500\n")
+            ),
+            100
+        );
     }
 }
