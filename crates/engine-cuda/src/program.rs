@@ -506,23 +506,46 @@ impl Plane {
         }
 
         for (program_id, extents, members) in groups {
-            let program = programs.get_mut(&program_id).ok_or_else(|| {
-                Fault::program(
-                    "program::plane",
-                    format!("a staged fire names program {program_id}, which is gone"),
-                )
-            })?;
-            let ceiling = program
-                .batch(extents, 1, stream)?
-                .stages
-                .iter()
-                .flatten()
-                .map(Prepared::lane_ceiling)
-                .min()
-                .unwrap_or(u32::MAX)
-                .max(1) as usize;
-            for chunk in members.chunks(ceiling) {
-                Plane::fly_one(programs, instances, program_id, extents, chunk, stream)?;
+            let mut from = 0;
+            let mut refused: Option<(usize, Fault)> = None;
+            while from < members.len() {
+                let program = programs.get_mut(&program_id).ok_or_else(|| {
+                    Fault::program(
+                        "program::plane",
+                        format!("a staged fire names program {program_id}, which is gone"),
+                    )
+                })?;
+                let ceiling = program
+                    .batch(extents, 1, stream)?
+                    .stages
+                    .iter()
+                    .flatten()
+                    .map(Prepared::lane_ceiling)
+                    .min()
+                    .unwrap_or(u32::MAX)
+                    .max(1) as usize;
+                if let Some((width, fault)) = refused.take()
+                    && ceiling >= width
+                {
+                    return Err(fault);
+                }
+                let to = members.len().min(from + ceiling);
+                match Plane::fly_one(
+                    programs,
+                    instances,
+                    program_id,
+                    extents,
+                    &members[from..to],
+                    stream,
+                ) {
+                    Ok(()) => from = to,
+                    // The scratch did not fit at this width and the stage capped
+                    // its lanes under it: the same members fly again, narrower.
+                    Err(fault @ Fault::OutOfMemory { .. }) if to - from > 1 => {
+                        refused = Some((to - from, fault));
+                    }
+                    Err(fault) => return Err(fault),
+                }
             }
         }
         Ok(())

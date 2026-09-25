@@ -481,6 +481,7 @@ pub struct Prepared {
     temporary_bytes: u32,
     region_rows: Vec<u32>,
     lanes: u32,
+    lane_cap: u32,
     filled: u32,
     bindings: Vec<u32>,
 }
@@ -929,6 +930,7 @@ impl Prepared {
             temporary_bytes,
             region_rows,
             lanes: 0,
+            lane_cap: u32::MAX,
             filled: 0,
             bindings: plan.channel_bindings.clone(),
         };
@@ -1019,20 +1021,40 @@ impl Prepared {
         let scratch_bytes = (self.scratch_stride as usize * lanes as usize)
             .max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256));
         // A program arrives after the load declared its pool, so this is the
-        // one allocation the pool's fit could only reserve for, not count;
-        // when it does not fit the refusal is final and says so, since a
-        // frame past static admission has no retry to answer.
-        let scratch = Buffer::zeroed_on(stream, scratch_bytes).map_err(|fault| match fault {
-            Fault::OutOfMemory { need, have } => Fault::Residency(format!(
-                "a guest program's scratch does not fit beside this load: {} bytes a lane at \
-                 {lanes} lanes wants {need}, and the device has {have} free once the weights, \
-                 the declared kv pool and everything else the load holds are resident. Lower \
-                 `[engine] max_forward_requests`, or state `[engine] max_total_pages` under \
-                 the count the load derived.",
-                self.scratch_stride
-            )),
-            other => other,
-        })?;
+        // one allocation the pool's fit could only reserve for, not count.
+        // When it does not fit, the scratch this growth outgrew is freed
+        // first (the free waits for the fires reading it) and the growth is
+        // tried once more; past that the lanes are capped under this width
+        // and the wave flies narrower, and only one lane failing is final,
+        // since a frame past static admission has no retry to answer.
+        let scratch = match Buffer::zeroed_on(stream, scratch_bytes) {
+            Err(Fault::OutOfMemory { .. }) => {
+                self.scratch = Buffer::zeroed(0)?;
+                self.lanes = 0;
+                Buffer::zeroed_on(stream, scratch_bytes).map_err(|fault| match fault {
+                    Fault::OutOfMemory { need, have } if lanes > 1 => {
+                        self.lane_cap = lanes / 2;
+                        eprintln!(
+                            "engine-cuda: a guest program's scratch does not fit beside this \
+                             load at {lanes} lanes ({need} bytes wanted, {have} free); its \
+                             fires fly at most {} lanes wide",
+                            self.lane_cap
+                        );
+                        fault
+                    }
+                    Fault::OutOfMemory { need, have } => Fault::Residency(format!(
+                        "a guest program's scratch does not fit beside this load: {} bytes a \
+                         lane at {lanes} lanes wants {need}, and the device has {have} free once \
+                         the weights, the declared kv pool and everything else the load holds \
+                         are resident. Lower `[engine] max_forward_requests`, or state `[engine] \
+                         max_total_pages` under the count the load derived.",
+                        self.scratch_stride
+                    )),
+                    other => other,
+                })?
+            }
+            other => other?,
+        };
         self.retired
             .push(std::mem::replace(&mut self.scratch, scratch));
         self.retired.push(std::mem::replace(
@@ -1241,10 +1263,11 @@ impl Prepared {
     #[must_use]
     pub fn lane_ceiling(&self) -> u32 {
         if self.scratch_stride == 0 {
-            return u32::MAX;
+            return self.lane_cap;
         }
         u32::try_from(eta_exec::SCRATCH_MAX_BYTES / u64::from(self.scratch_stride))
             .unwrap_or(u32::MAX)
+            .min(self.lane_cap)
             .max(1)
     }
 
