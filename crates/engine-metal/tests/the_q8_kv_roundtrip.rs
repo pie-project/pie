@@ -48,6 +48,12 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
         assert!(status.success(), "isolated Q8 integration test failed");
         return;
     }
+    assert!(kernels_metal::tuning::override_with(
+        kernels_metal::tuning::Overrides {
+            sdpa_mpp: Some(std::env::var("PIE_TEST_MPP").as_deref() == Ok("1")),
+            ..Default::default()
+        }
+    ));
     let dev = Context::bind().unwrap();
     let handles = Handles::new();
     let pipes = Pipelines::new();
@@ -59,6 +65,13 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
         (256, 35, 6, 2, 3, 3, 65, 32),
         (512, 35, 6, 2, 3, 3, 65, 32),
         (256, 8, 24, 4, 1, 130, 4096, 32),
+        (256, 1, 4, 2, 1, 3, 65, 32),
+        (256, 8, 4, 2, 2, 4, 65, 32),
+        (256, 16, 8, 2, 2, 4, 65, 32),
+        (256, 8, 2, 2, 2, 4, 65, 32),
+        (256, 9, 10, 2, 3, 4, 65, 32),
+        (256, 8, 14, 2, 2, 4, 65, 32),
+        (256, 8, 16, 2, 2, 4, 65, 32),
         (256, 35, 6, 2, 3, 6, 65, 16),
         (256, 512, 2, 1, 1, 19, 65, 32),
         (256, 32, 24, 4, 4, 5, 65, 32),
@@ -240,8 +253,9 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                     }
                 }
             }
-            let words = m.div_ceil(8) as u32
-                * attn::split::workspace_words(attn::split::split_count(m as u32));
+            let per = attn::split::workspace_words(attn::split::split_count(m as u32), qh as u32)
+                .unwrap();
+            let words = m.div_ceil(8) as u32 * per;
             let workspace = upload(&vec![0xa5; words as usize * 4 + 64]);
             for route in 0..5 {
                 if !causal && route != 1 {
@@ -252,7 +266,7 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                 let qt = tensor(&qb, m, qh * d, Dtype::Bf16);
                 let yt = tensor(&y, m, qh * d, Dtype::Bf16);
                 if route == 4 {
-                    if d != 256 || qh != 24 || window.is_some() {
+                    if d != 256 || page != 32 || !(8..=128).contains(&m) || window.is_some() {
                         continue;
                     }
                     assert!(
@@ -268,7 +282,7 @@ fn stored_q8_and_all_attention_routes_match_fp64() {
                             scale,
                             yt,
                             requests as u32,
-                            &|rows, width| (rows == 1 && width <= words).then(|| tensor(
+                            &|rows, width| (rows == 1 && width <= per).then(|| tensor(
                                 &workspace,
                                 1,
                                 width as usize,

@@ -39,9 +39,8 @@ pub(super) fn attention(
         && q.rows >= 32;
     let paired = !mpp
         && dim == 256
-        && shape.rows == 8
-        && shape.q_heads == 24
-        && shape.kv_heads == 4
+        && shape.rows < 32
+        && shape.gqa.is_multiple_of(2)
         && pool.page_size == 32
         && causal
         && window.is_none()

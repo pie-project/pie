@@ -427,9 +427,19 @@ impl Weights {
                 "MPP packing requires immutable resident weights".into(),
             ));
         }
+        let mut dense = vec![false; trace.params.len()];
+        for node in &trace.nodes {
+            if let model_ir::Operation::Linear(
+                model_ir::Linear::Matmul { w, .. } | model_ir::Linear::LmHead { w, .. },
+            ) = &node.op
+                && let model_ir::Def::Weight(at) = trace.values[w.0 as usize].def
+            {
+                dense[at as usize] = true;
+            }
+        }
         let pipelines = Pipelines::new();
-        for (param, row) in trace.params.iter().zip(&mut self.table.0) {
-            if param.source != ParamSource::Checkpoint {
+        for ((param, row), used) in trace.params.iter().zip(&mut self.table.0).zip(dense) {
+            if !used || param.source != ParamSource::Checkpoint {
                 continue;
             }
             let Some(WeightRow::Planes(bank)) = row else {

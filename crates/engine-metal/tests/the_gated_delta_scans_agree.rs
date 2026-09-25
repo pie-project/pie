@@ -99,7 +99,9 @@ fn the_scans_agree() {
     {
         let mut bytes = Vec::with_capacity((T * QKV_WIDTH * 2) as usize);
         for at in 0..u64::from(T) * u64::from(QKV_WIDTH) {
-            bytes.extend_from_slice(&bf16(unit(at)));
+            bytes.extend_from_slice(&bf16(
+                unit(at) * 2.0f32.powi((noise(at ^ 0xabcd) % 17) as i32 - 8),
+            ));
         }
         qkv_b.write(0, &bytes).expect("write qkv");
     }

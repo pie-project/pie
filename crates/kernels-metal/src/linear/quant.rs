@@ -563,41 +563,13 @@ pub fn act_x_wt(
         stated(op, contraction)?,
     );
     let tuned = crate::tuning::current();
-    let cold_tile = if rows == 8 && bits == 4 && group == 64 && w.mpp_codes.is_some() {
-        match (contraction, columns) {
-            (5120, 5120) => Some((8, 64, 2)),
-            (5120, 12288) => Some((8, 16, 1)),
-            (5120, 10240) => Some((8, 128, 2)),
-            (5120, 34816) => Some((8, 16, 1)),
-            (5120, 16384) => Some((8, 32, 1)),
-            (6144, 5120) | (17408, 5120) => Some((8, 128, 4)),
-            _ => None,
-        }
-    } else {
-        None
+    let bm = match rows {
+        1..=8 => 8,
+        9..=16 => 16,
+        17..=24 => 24,
+        _ => 32,
     };
-    let wide_eight = rows == 8 && (16384..=65536).contains(&columns);
-    let bm = if let Some((bm, _, _)) = cold_tile {
-        bm
-    } else if wide_eight {
-        8
-    } else {
-        32
-    };
-    let bn = if let Some((_, bn, _)) = cold_tile {
-        bn
-    } else {
-        128
-    };
-    let bm = if bm == 32 {
-        match rows {
-            1..=16 => 16,
-            17..=24 => 24,
-            _ => 32,
-        }
-    } else {
-        bm
-    };
+    let bn = if bm == 8 { 64 } else { 128 };
     if tuned.qmm_mpp
         && bits == 4
         && group == 64
@@ -626,32 +598,16 @@ pub fn act_x_wt(
                 None
             };
             let split = if partial.is_some() { partitions } else { 1u32 };
-            let local = cold_tile.is_some() && split == 4;
             let packed = w.mpp_codes.is_some();
-            let simdgroups = if let Some((_, _, sg)) = cold_tile {
-                sg
-            } else if wide_eight {
-                2
-            } else if bn == 256 {
-                8
-            } else {
-                4
-            };
-            let kind = if packed { "packed" } else { "native" };
-            let pipeline = cold_tile.is_none() && rows <= 16 && columns <= 8192;
-            let linear_mode = if rows >= 1024
-                && split == 1
-                && packed
-                && contraction == 17408
-                && columns == 5120
-                && bm == 32
-                && bn == 128
-                && simdgroups == 4
-            {
+            let local = bm == 8 && packed && split == 4;
+            let simdgroups = if bm == 8 { 2 } else { 4 };
+            let pipeline = !local && rows <= 16 && columns <= 8192;
+            let linear_mode = if rows >= 1024 && split == 1 && packed {
                 16
             } else {
                 -1
             };
+            let kind = if packed { "packed" } else { "native" };
             let index = if packed
                 && rows >= 1024
                 && split == 1

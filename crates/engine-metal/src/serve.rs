@@ -3242,6 +3242,7 @@ impl Shell {
 
         let mut readout_first: Vec<u32>;
         let mut readout_count: Vec<u32>;
+        let mut readout_indptr = vec![0u32];
         let readout_rows: Vec<i32> = {
             let mut placed: Vec<(u32, u32, usize)> = composition
                 .lanes()
@@ -3269,6 +3270,7 @@ impl Shell {
                     }
                     table.push(i32::try_from(row_offset + row).unwrap_or(0));
                 }
+                readout_indptr.push(table.len() as u32);
             }
             table
         };
@@ -3358,7 +3360,7 @@ impl Shell {
             positions: bound.positions,
             adapter_routes: bound.adapter_routes,
             readout_rows: bound.readout_rows,
-            readout_rows_host: readout_rows.clone(),
+            readout_indptr,
             nan_flags: match self.nan_flags.as_ref() {
                 Some(plane) => {
                     let words = self.trace.values.len() as u32 + 1;

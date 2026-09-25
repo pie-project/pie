@@ -7,8 +7,7 @@ gdn_staged(const device bfloat *qkv [[buffer(0)]], const device int *indptr [[bu
            const device uint *slots [[buffer(4)]], device float *y [[buffer(5)]],
            constant int &kh [[buffer(6)]], constant int &vh [[buffer(7)]],
            constant int &dk [[buffer(8)]], constant int &dv [[buffer(9)]],
-           uint3 tile [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-           uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+           uint3 tile [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   constexpr int D = 128, ROWS = 32;
   const int req = tile.z / vh, hv = tile.z % vh, hk = hv / (vh / kh);
   const int begin = indptr[req], end = indptr[req + 1];
@@ -24,25 +23,24 @@ gdn_staged(const device bfloat *qkv [[buffer(0)]], const device int *indptr [[bu
       gate_data[BLOCK * 2];
   for (int start = begin; start < end; start += BLOCK) {
     const int count = min(BLOCK, end - start);
-    for (int b = sg; b < count; b += 4) {
+    for (int b = tid / 8; b < count; b += 16) {
       const size_t row = size_t(start + b) * pitch;
-      float qr[4], kr[4], qs = 0, ks = 0;
+      float qr[16], kr[16];
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        qr[j] = float(qkv[row + size_t(hk) * dk + lane * 4 + j]);
-        kr[j] = float(qkv[row + keys + size_t(hk) * dk + lane * 4 + j]);
-        qs += qr[j] * qr[j];
-        ks += kr[j] * kr[j];
+      for (int j = 0; j < 16; ++j) {
+        const int d = packed_lane * 16 + j;
+        qr[j] = float(qkv[row + size_t(hk) * dk + d]);
+        kr[j] = float(qkv[row + keys + size_t(hk) * dk + d]);
       }
-      const float qi = metal::rsqrt(gdn_row_sum<32>(qs) + 1e-6f) * scale;
-      const float ki = metal::rsqrt(gdn_row_sum<32>(ks) + 1e-6f);
+      const float qi = metal::rsqrt(gdn_row_sum<8>(gdn_packed_dot(qr, qr)) + 1e-6f) * scale;
+      const float ki = metal::rsqrt(gdn_row_sum<8>(gdn_packed_dot(kr, kr)) + 1e-6f);
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const int d = lane * 4 + j, at = b * D + (d % 16) * 8 + d / 16;
+      for (int j = 0; j < 16; ++j) {
+        const int at = b * D + j * 8 + packed_lane;
         queries[at] = qr[j] * qi;
         key_data[at] = kr[j] * ki;
       }
-      if (lane == 0) {
+      if (packed_lane == 0) {
         const size_t g = size_t(start + b) * 2 * vh + hv;
         gate_data[b] = metal::exp(gates[g]);
         gate_data[BLOCK + b] = gates[g + vh];
@@ -94,4 +92,4 @@ gdn_staged(const device bfloat *qkv [[buffer(0)]], const device int *indptr [[bu
   template [[host_name(name)]] [[kernel]] void gdn_staged<block>(                                  \
       const device bfloat *, const device int *, const device float *, device float *,             \
       const device uint *, device float *, constant int &, constant int &, constant int &,         \
-      constant int &, uint3, uint, uint, uint);
+      constant int &, uint3, uint);

@@ -2,6 +2,7 @@
 using namespace metal;
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
+template <int GH>
 [[kernel]] void pie_q8_batch_split(
     const device bfloat *queries [[buffer(0)]], const device int8_t *k_pages [[buffer(1)]],
     const device int8_t *v_pages [[buffer(2)]], device bfloat *out [[buffer(3)]],
@@ -19,8 +20,10 @@ using namespace mpp::tensor_ops;
     uint simd_gid [[simdgroup_index_in_threadgroup]], uint simd_lid [[thread_index_in_simdgroup]]) {
 
   constexpr int SG = 8;
-  workspace += tile.z * (24576 + splits * 192 * 258);
-  constexpr int GH = 6, M = 48, N = 32, D = 256;
+  constexpr int M = 8 * GH, N = 32, D = 256;
+  const uint heads = GH * n_kv_heads, packed_rows = 8 * heads;
+  const uint query_words = packed_rows * D / 2;
+  workspace += tile.z * (query_words + splits * packed_rows * (D + 2));
   const uint tid = simd_gid * 32 + simd_lid, nt = SG * 32;
   const int row0 = (tile_base + tile.z) * 8, kv = tile.x;
   bool simple = row0 + 8 <= qrows && window == 0;
@@ -53,7 +56,7 @@ using namespace mpp::tensor_ops;
   matmul2d<pvd, execution_simdgroups<SG>> pvop;
   auto acc = pvop.template get_destination_cooperative_tensor<decltype(p), decltype(v0), float>();
   for (ushort i = 0; i < acc.get_capacity(); ++i)
-    acc[i] = 0;
+    if (acc.is_valid_element(i)) acc[i] = 0;
   for (uint query = 0; query < (simple ? 1 : 8) && row0 + query < qrows; ++query) {
     const int req = req_of_token[row0 + query];
     bool seen = false;
@@ -153,53 +156,73 @@ using namespace mpp::tensor_ops;
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   }
-  device float *results = workspace + 24576 + (tile.y * 192 + tile.x * M) * D;
+  device float *results = workspace + query_words + (tile.y * packed_rows + tile.x * M) * D;
   auto rv = tensor(results, extents<int, D, M>{}, array<int, 2>{1, D});
   acc.store(rv);
-  device float *stats = workspace + 24576 + splits * 192 * D + (tile.y * 192 + tile.x * M) * 2;
+  device float *stats = workspace + query_words + splits * packed_rows * D + (tile.y * packed_rows + tile.x * M) * 2;
   for (uint r = tid; r < M; r += nt) {
     stats[r * 2] = maxima[r];
     stats[r * 2 + 1] = totals[r];
   }
 }
 
+template <int GH>
 kernel void
 pie_q8_batch_pack(const device bfloat *q [[buffer(0)]], device float *workspace [[buffer(1)]],
                   constant uint &qrows [[buffer(2)]], constant uint &splits [[buffer(3)]],
-                  constant uint &tile_base [[buffer(4)]], uint i [[thread_position_in_grid]]) {
-  uint tile = i / 49152, local = i % 49152, d = local % 256, h = (local / 256) % 24,
-       r = local / (24 * 256);
+                  constant uint &tile_base [[buffer(4)]], constant uint &heads [[buffer(5)]],
+                  uint i [[thread_position_in_grid]]) {
+  const uint packed_rows = 8 * heads, elements = packed_rows * 256;
+  uint tile = i / elements, local = i % elements, d = local % 256, h = (local / 256) % heads,
+       r = local / (heads * 256);
   uint row = (tile_base + tile) * 8 + r;
-  device bfloat *dst =
-      reinterpret_cast<device bfloat *>(workspace + tile * (24576 + splits * 192 * 258));
-  dst[((h / 6) * 48 + r * 6 + h % 6) * 256 + d] =
-      row < qrows ? q[(row * 24 + h) * 256 + d] : bfloat(0);
+  device bfloat *dst = reinterpret_cast<device bfloat *>(
+      workspace + tile * (elements / 2 + splits * packed_rows * 258));
+  dst[((h / GH) * (8 * GH) + r * GH + h % GH) * 256 + d] =
+      row < qrows ? q[(row * heads + h) * 256 + d] : bfloat(0);
 }
+template <int GH>
 kernel void pie_q8_batch_reduce(const device float *workspace [[buffer(0)]],
                                 device bfloat *out [[buffer(1)]],
                                 constant uint &splits [[buffer(2)]],
                                 constant uint &qrows [[buffer(3)]],
                                 constant uint &tile_base [[buffer(4)]],
+                                constant uint &heads [[buffer(5)]],
                                 uint group [[threadgroup_position_in_grid]],
                                 uint d [[thread_index_in_threadgroup]]) {
-  uint tile = group / 192, r = group % 192, head = (r / 48) * 6 + r % 6,
-       row = (tile_base + tile) * 8 + (r % 48) / 6;
+  const uint packed_rows = 8 * heads, query_words = packed_rows * 128;
+  uint tile = group / packed_rows, r = group % packed_rows, head = (r / (8 * GH)) * GH + r % GH,
+       row = (tile_base + tile) * 8 + (r % (8 * GH)) / GH;
   if (row >= qrows)
     return;
-  workspace += tile * (24576 + splits * 192 * 258);
+  workspace += tile * (query_words + splits * packed_rows * 258);
   threadgroup float weights[32];
-  const device float *results = workspace + 24576;
-  const device float *stats = results + splits * 192 * 256;
+  const device float *results = workspace + query_words;
+  const device float *stats = results + splits * packed_rows * 256;
   uint lane = d % 32;
-  float mx = simd_max(lane < splits ? stats[(lane * 192 + r) * 2] : -1e30f);
+  float mx = simd_max(lane < splits ? stats[(lane * packed_rows + r) * 2] : -1e30f);
   if (d < splits)
-    weights[d] = fast::exp(stats[(d * 192 + r) * 2] - mx);
+    weights[d] = fast::exp(stats[(d * packed_rows + r) * 2] - mx);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float sum = 0, den = 0;
   for (uint s = 0; s < splits; ++s) {
     float f = weights[s];
-    sum += results[(s * 192 + r) * 256 + d] * f;
-    den += stats[(s * 192 + r) * 2 + 1] * f;
+    sum += results[(s * packed_rows + r) * 256 + d] * f;
+    den += stats[(s * packed_rows + r) * 2 + 1] * f;
   }
-  out[(row * 24 + head) * 256 + d] = bfloat(den > 0 ? sum / den : 0);
+  out[(row * heads + head) * 256 + d] = bfloat(den > 0 ? sum / den : 0);
 }
+#define PIE_Q8_BATCH(gh) \
+  template [[host_name("pie_q8_batch_split_g" #gh)]] [[kernel]] void pie_q8_batch_split<gh>( \
+      const device bfloat *, const device int8_t *, const device int8_t *, device bfloat *, \
+      const constant int &, const device int *, const device int *, const device uint *, \
+      const device uint *, const constant int &, const constant int &, const constant float &, \
+      const device uchar *, const device uint &, const device uchar *, const constant int &, \
+      const device bfloat *, device float *, constant uint &, constant uint &, constant uint &, \
+      uint3, uint3, uint, uint); \
+  template [[host_name("pie_q8_batch_pack_g" #gh)]] [[kernel]] void pie_q8_batch_pack<gh>( \
+      const device bfloat *, device float *, constant uint &, constant uint &, constant uint &, \
+      constant uint &, uint); \
+  template [[host_name("pie_q8_batch_reduce_g" #gh)]] [[kernel]] void pie_q8_batch_reduce<gh>( \
+      const device float *, device bfloat *, constant uint &, constant uint &, constant uint &, \
+      constant uint &, uint, uint);

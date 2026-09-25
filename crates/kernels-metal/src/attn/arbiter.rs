@@ -305,7 +305,6 @@ pub fn prefill_with_scratch(
     partials: &dyn Fn(u32, u32) -> Option<Tensor>,
 ) -> Result<(), Error> {
     if tuning.sdpa_mpp
-        && kv_heads == 4
         && super::split::try_paged(
             ctx, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, requests,
             partials,

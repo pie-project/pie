@@ -391,20 +391,8 @@ pub fn causal_conv1d_chunked(
         "the state bank a dilated conv reads is `(width - 1) * dilation + 1` rows of channels"
     );
     let lanes = requests(OP, x)?;
-    let parallel = hist <= 32 && x.data.rows / lanes.max(1) >= 256;
-    let (entry, grid) = if parallel {
-        (
-            "causal_conv1d_chunked_parallel_bfloat16",
-            Grid::of(
-                [channels, lanes, x.data.rows.div_ceil(32)],
-                [channels.min(CONV_GROUP), 1, 1],
-            ),
-        )
-    } else {
-        (entry, conv_grid(channels, lanes))
-    };
     ctx.fire(
-        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(grid),
+        Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(conv_grid(channels, lanes)),
         &[
             x.data.arg(),
             x.indptr.arg(),

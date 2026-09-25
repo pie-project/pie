@@ -608,7 +608,18 @@ fn tiled(
             mask_stride: plan.mask_stride,
         };
         return q8::attention(
-            ctx, op, q, pool, &decode, window, causal, head_dim, sm_scale, o, lse, true,
+            ctx,
+            op,
+            q,
+            pool,
+            &decode,
+            window,
+            causal,
+            head_dim,
+            sm_scale,
+            o,
+            lse,
+            crate::tuning::current().sdpa_mpp,
         );
     }
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
