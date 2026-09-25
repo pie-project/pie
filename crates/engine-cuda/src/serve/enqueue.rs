@@ -143,6 +143,7 @@ impl Shell {
             schedule_readers: &self.schedule_readers,
             decoding: &self.decoding,
             tiers: &self.tiers,
+            decoded_tiles: &self.decoded_tiles,
             seq,
         };
         super::btrace::mark("prepare_tail");
@@ -190,6 +191,7 @@ struct FireCtx<'a> {
     schedule_readers: &'a [Option<u32>],
     decoding: &'a model_ir::ClassSet,
     tiers: &'a record::Tiers,
+    decoded_tiles: &'a [u64],
     seq: u64,
 }
 
@@ -707,7 +709,8 @@ impl FireCtx<'_> {
             &place,
         )
         .across(&side_ctx, &stream)
-        .ceilings(ceilings);
+        .ceilings(ceilings)
+        .decoded_tiles(self.decoded_tiles);
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);
         }

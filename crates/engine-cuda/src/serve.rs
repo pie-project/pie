@@ -96,6 +96,7 @@ pub struct Shell {
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
+    decoded_tiles: Vec<u64>,
     arming: bool,
     golden_arm: Golden,
     armed_body: Option<record::BodyKey>,

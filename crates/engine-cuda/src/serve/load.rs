@@ -207,7 +207,126 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         device,
         compiled,
         budgets,
+        profile,
     })
+}
+
+/// The lane budget fitted to what the card has with the weights resident:
+/// what scales with `max_forward_requests` and the decoded-weight tiles are
+/// taken before the cache rows, and on a short card leave no room for one
+/// sequence. The tile yields first, held to the widest plane fired at token
+/// rows (a plane past it is served by the fused-dequant arm), then the
+/// lanes halve toward one; `Pools::fit_the_card` still refuses past that.
+fn refit_lanes(
+    boot: &mut Boot<'_>,
+    device: &Context,
+    compiled: CompiledModel,
+    budgets: Budgets,
+    profile: &DeviceProfile,
+    paging: Paging,
+    table: &crate::run::WeightTable,
+) -> Result<(CompiledModel, Budgets, Vec<u64>)> {
+    let (free, total) = crate::store::device_memory()?;
+    let live = crate::device::elastic::budget_bytes(free, total, boot.knobs.gpu_mem_utilization);
+    let facts = kv::probe(&boot.trace)?;
+    let sequence = crate::store::least_sequence_bytes(&boot.trace, paging)?;
+    let out_row = match Exports::of(&boot.trace, &compiled)?.out {
+        Some(out) => kv::width_of(&boot.trace, out)?.saturating_mul(4),
+        None => 0,
+    };
+    let asked = boot.budget.max_lanes;
+    let tokens = boot.budget.max_tokens;
+    let budget_at = |lanes: u32| {
+        let mut budget = boot.budget.clone();
+        budget.max_lanes = lanes;
+        budget
+    };
+    let budgets_at = |budget: &Budget| Budgets {
+        tokens: budget.clone(),
+        patches: boot.patches.clone(),
+        voxels: boot.voxels.clone(),
+    };
+    let tiles_of = |planes: &[DecodedPlanes], scoped: bool| -> Vec<u64> {
+        planes
+            .iter()
+            .map(|plane| {
+                if scoped {
+                    plane.at_tokens
+                } else {
+                    plane.widest
+                }
+            })
+            .collect()
+    };
+    let working_at = |lanes: u32, scoped: bool| -> u64 {
+        let budget = budget_at(lanes);
+        let Ok(compiled) = model_compiler::compile_axes(&boot.trace, &budgets_at(&budget), profile)
+        else {
+            return u64::MAX;
+        };
+        let tiles: u64 = tiles_of(
+            &decoded_weight_planes(&boot.trace, &compiled, table),
+            scoped,
+        )
+        .iter()
+        .map(|plane| crate::store::decoded_weight_reserve(*plane, 1))
+        .fold(0u64, u64::saturating_add);
+        compiled
+            .arena
+            .prefix_for(u64::from(lanes))
+            .saturating_add(crate::inputs::attention_workspace_bytes(
+                &budget,
+                &facts,
+                &device.device(),
+                &schedule_streams(&boot.trace, &compiled),
+            ))
+            .saturating_add(tiles)
+            .saturating_add(crate::store::program_scratch_reserve(lanes, out_row))
+            .saturating_add(
+                u64::from(lanes)
+                    .saturating_mul(u64::from(tokens))
+                    .saturating_mul(8),
+            )
+    };
+    let room = live
+        .saturating_sub(sequence)
+        .saturating_sub(crate::store::BODIES_FLOOR_BYTES);
+    let planes = decoded_weight_planes(&boot.trace, &compiled, table);
+    if working_at(asked, false) <= room {
+        return Ok((compiled, budgets, tiles_of(&planes, false)));
+    }
+    let lanes = crate::store::tokens_within(asked, 1, room, |lanes| working_at(lanes, true));
+    for (stream, plane) in planes.iter().enumerate() {
+        if plane.widest > plane.at_tokens {
+            eprintln!(
+                "engine-cuda: the decoded-weight tile on stream {stream} is held to {} MiB, the \
+                 widest plane fired at token rows, not the {} MiB plane fired at readout rows: \
+                 at {asked} lanes it leaves no room for one sequence on this card. A plane past \
+                 the tile is served by the fused-dequant arm.",
+                crate::store::decoded_weight_reserve(plane.at_tokens, 1) >> 20,
+                crate::store::decoded_weight_reserve(plane.widest, 1) >> 20,
+            );
+        }
+    }
+    if lanes == asked || working_at(lanes, true) > room {
+        return Ok((compiled, budgets, tiles_of(&planes, true)));
+    }
+    eprintln!(
+        "engine-cuda: [engine] max_forward_requests {asked} is served at {lanes}: at {asked} \
+         the activation arena, attention workspaces, decoded-weight tiles and guest programs \
+         take {} MiB of the {} MiB this card has after the weight tier under [engine] \
+         gpu_mem_utilization, and one sequence at the declared context and the bodies' floor \
+         need {} MiB beside them. State a smaller max_forward_requests to choose it, or a \
+         larger gpu_mem_utilization.",
+        working_at(asked, true) >> 20,
+        live >> 20,
+        (sequence + crate::store::BODIES_FLOOR_BYTES) >> 20,
+    );
+    boot.budget = budget_at(lanes);
+    let budgets = budgets_at(&boot.budget);
+    let compiled = model_compiler::compile_axes(&boot.trace, &budgets, profile)?;
+    let planes = decoded_weight_planes(&boot.trace, &compiled, table);
+    Ok((compiled, budgets, tiles_of(&planes, true)))
 }
 
 impl Shell {
@@ -217,8 +336,67 @@ impl Shell {
             mut device,
             compiled,
             budgets,
+            profile,
         } = bake(&mut boot)?;
         let (free_before, device_total) = crate::store::device_memory()?;
+        let paging = Paging::of(
+            boot.page_size,
+            boot.context,
+            boot.slots,
+            u64::from(boot.pages),
+        )?;
+        let decode_dense = landing_requests(boot.classify, &compiled.classes)
+            .iter()
+            .flatten()
+            .any(model_ir::Request::denoise);
+        let decoded_dense = if decode_dense {
+            crate::weights::decoded_dense_bytes(&boot.trace)
+        } else {
+            0
+        };
+        let accounting = crate::store::admit_the_card(
+            boot.knobs.gpu_mem_utilization,
+            boot.residency.device_demand(),
+            decoded_dense,
+            &boot.trace,
+            paging,
+        )?;
+
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!(
+                "[arm-trace] device free {} MiB before weights",
+                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+            );
+        }
+        let mut weights = Weights::resident(
+            &boot.trace,
+            boot.contract,
+            boot.checkpoint,
+            boot.residency.clone(),
+            device.stream(),
+            checkpoint::plan::StorageTarget::for_backend(
+                checkpoint::types::BackendKind::Cuda,
+                boot.world.rank,
+                boot.world.size,
+            ),
+            decode_dense,
+            boot.deferred_tier,
+        )?;
+        if boot.knobs.diagnostics.arm_trace {
+            eprintln!(
+                "[arm-trace] device free {} MiB after weights resident",
+                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
+            );
+        }
+        let (compiled, budgets, tiles) = refit_lanes(
+            &mut boot,
+            &device,
+            compiled,
+            budgets,
+            &profile,
+            paging,
+            weights.table(),
+        )?;
         device.open_lanes(
             compiled.streams.streams.saturating_sub(1),
             compiled.streams.events,
@@ -308,52 +486,6 @@ impl Shell {
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
         let schedule_readers = regions_launching_schedules(&boot.trace, &compiled);
-        let paging = Paging::of(
-            boot.page_size,
-            boot.context,
-            boot.slots,
-            u64::from(boot.pages),
-        )?;
-        let decode_dense = landing.iter().flatten().any(model_ir::Request::denoise);
-        let decoded_dense = if decode_dense {
-            crate::weights::decoded_dense_bytes(&boot.trace)
-        } else {
-            0
-        };
-        let accounting = crate::store::admit_the_card(
-            boot.knobs.gpu_mem_utilization,
-            boot.residency.device_demand(),
-            decoded_dense,
-            &boot.trace,
-            paging,
-        )?;
-
-        if boot.knobs.diagnostics.arm_trace {
-            eprintln!(
-                "[arm-trace] device free {} MiB before weights",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
-            );
-        }
-        let mut weights = Weights::resident(
-            &boot.trace,
-            boot.contract,
-            boot.checkpoint,
-            boot.residency.clone(),
-            device.stream(),
-            checkpoint::plan::StorageTarget::for_backend(
-                checkpoint::types::BackendKind::Cuda,
-                boot.world.rank,
-                boot.world.size,
-            ),
-            decode_dense,
-            boot.deferred_tier,
-        )?;
-        if boot.knobs.diagnostics.arm_trace {
-            eprintln!(
-                "[arm-trace] device free {} MiB after weights resident",
-                crate::device::nodes::free_bytes().unwrap_or(0) >> 20
-            );
-        }
         crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
         weights.rotate(&boot.trace, &compiled)?;
         if boot.knobs.diagnostics.arm_trace {
@@ -579,6 +711,7 @@ impl Shell {
             golden_arm: Golden::Off,
             bodies: boot.knobs.bodies(),
             bodies_mem: (boot.knobs.bodies_mem() as usize).saturating_mul(1 << 20),
+            decoded_tiles: Vec::new(),
             arming: false,
             armed_body: None,
             segments: std::collections::HashMap::new(),
@@ -644,11 +777,14 @@ impl Shell {
         );
         // A plane stored as codes and scales is decoded to bf16 before a
         // prefill's dense gemm, into one tile a stream. The tile is taken
-        // now, at the widest plane the regions on each stream read, so the
+        // now, at the widest plane the lane fit left each stream, so the
         // fit sees it resident and no fire — a capture least of all — has to
         // grow it: a load whose bodies are held to nothing arms no body at
         // load, and its first fire is a capture.
-        let tiles = decoded_weight_tiles(&shell.trace, &shell.compiled, shell.weights.table());
+        shell.decoded_tiles = tiles
+            .iter()
+            .map(|plane| crate::store::decoded_weight_reserve(*plane, 1))
+            .collect();
         let mut decoded = 0u64;
         for (stream, plane) in tiles.iter().enumerate() {
             let tile = crate::store::decoded_weight_reserve(*plane, 1);
@@ -823,16 +959,25 @@ impl core::fmt::Display for Footprint {
     }
 }
 
-/// Per stream, the widest plane the regions launched on it decode to bf16
-/// before a dense gemm: every weight the table seats as codes and scales
-/// that a region on that stream reads, at the `[n, k]` the trace declares
-/// for it, two bytes an element. Index 0 is the main stream, `n` the
-/// `n`th side stream.
-fn decoded_weight_tiles(
+/// The widest plane one stream decodes to bf16 before a dense gemm, and the
+/// widest among those fired at token rows: the lm_head is fired at readout
+/// rows and is the widest plane of a text model by far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DecodedPlanes {
+    widest: u64,
+    at_tokens: u64,
+}
+
+/// Per stream, the planes the linear and attention nodes launched on it
+/// decode to bf16 before a dense gemm, at the `[n, k]` the trace declares,
+/// two bytes an element; an embedding gathers from the codes and a repacked
+/// plane has its own kernels. A linear's plane is fired at the rows its
+/// output lands. Index 0 is the main stream, `n` the `n`th side stream.
+fn decoded_weight_planes(
     trace: &model_ir::Trace,
     compiled: &CompiledModel,
     table: &crate::run::WeightTable,
-) -> Vec<u64> {
+) -> Vec<DecodedPlanes> {
     use model_ir::Operands;
 
     let plane_bytes = |id: model_ir::ValueId| -> Option<u64> {
@@ -847,7 +992,15 @@ fn decoded_weight_tiles(
             .0
             .get(*w as usize)
             .and_then(Option::as_ref)
-            .filter(|row| matches!(row, crate::run::WeightRow::Planes { .. }))?;
+            .filter(|row| {
+                matches!(
+                    row,
+                    crate::run::WeightRow::Planes {
+                        repacked: false,
+                        ..
+                    }
+                )
+            })?;
         Some(
             shape
                 .iter()
@@ -858,26 +1011,56 @@ fn decoded_weight_tiles(
                 .fold(2u64, u64::saturating_mul),
         )
     };
-    let mut tiles: Vec<u64> = vec![0; compiled.streams.streams.max(1) as usize];
+    let token_rows = |id: model_ir::ValueId| -> bool {
+        let Some(decl) = trace.values.get(id.0 as usize) else {
+            return false;
+        };
+        let model_ir::Ty::Tensor { shape, .. } = &decl.ty else {
+            return false;
+        };
+        matches!(
+            shape.first(),
+            Some(dim) if dim.axis().is_some()
+                && !matches!(
+                    dim,
+                    model_ir::Dim::Lanes | model_ir::Dim::LanesPlus(_) | model_ir::Dim::Readouts
+                )
+        )
+    };
+    let mut planes: Vec<DecodedPlanes> =
+        vec![DecodedPlanes::default(); compiled.streams.streams.max(1) as usize];
     let mut inputs: Vec<model_ir::ValueId> = Vec::new();
+    let mut outputs: Vec<model_ir::ValueId> = Vec::new();
     for region in compiled.template() {
-        let Some(slot) = tiles.get_mut(region.stream as usize) else {
+        let Some(slot) = planes.get_mut(region.stream as usize) else {
             continue;
         };
         for node in region.nodes.clone() {
             let Some(node) = trace.nodes.get(node as usize) else {
                 continue;
             };
+            let at_tokens = match &node.op {
+                model_ir::Operation::Linear(_) => {
+                    outputs.clear();
+                    node.op.outputs(&mut outputs);
+                    outputs.iter().any(|id| token_rows(*id))
+                }
+                model_ir::Operation::Attention(_) => true,
+                _ => continue,
+            };
             inputs.clear();
             node.op.inputs(&mut inputs);
             for id in &inputs {
                 if let Some(bytes) = plane_bytes(*id) {
-                    *slot = (*slot).max(bytes);
+                    slot.widest = slot.widest.max(bytes);
+                    if at_tokens {
+                        slot.at_tokens = slot.at_tokens.max(bytes);
+                    }
                 }
             }
         }
     }
-    tiles
+    planes
 }
 
 fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64 {
@@ -929,4 +1112,5 @@ pub(super) struct Baked {
     pub(super) device: Context,
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
+    pub(super) profile: DeviceProfile,
 }

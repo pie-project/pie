@@ -539,6 +539,8 @@ pub struct Run<'c> {
 
     body: Option<&'c Ctx>,
 
+    decoded: &'c [u64],
+
     copy: CopyPlan,
 
     ceilings: Ceilings<'c>,
@@ -576,6 +578,7 @@ impl<'c> Run<'c> {
             side: &[],
             stream: &place.region,
             body: None,
+            decoded: &[],
             copy: CopyPlan::default(),
             ceilings: Ceilings::default(),
             stood: Cell::new(None),
@@ -949,6 +952,28 @@ impl<'c> Run<'c> {
         self.body = Some(body);
         self.stream = stream;
         self
+    }
+
+    /// The decoded-weight tile each stream was warmed with at load, main
+    /// stream first; a plane wider than its tile is served by the
+    /// fused-dequant arm rather than growing it.
+    #[must_use]
+    pub fn decoded_tiles(mut self, tiles: &'c [u64]) -> Self {
+        self.decoded = tiles;
+        self
+    }
+
+    /// Whether this region's stream holds an `[n, k]` plane in bf16. A load
+    /// that warmed no tiles, and the conditional stream, decode as they did.
+    pub(crate) fn decoded_tile_holds(&self, n: u32, k: u32) -> bool {
+        let at = match self.body {
+            Some(_) if self.stream.get() == crate::window::BODY => return true,
+            _ if self.side.is_empty() => 0,
+            _ => self.stream.get() as usize,
+        };
+        self.decoded
+            .get(at)
+            .is_none_or(|tile| u64::from(n).saturating_mul(u64::from(k)).saturating_mul(2) <= *tile)
     }
 
     pub(crate) fn ctx(&self) -> &'c Ctx {
