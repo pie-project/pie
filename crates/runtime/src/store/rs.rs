@@ -796,6 +796,18 @@ impl RsStore {
         self.pool.available()
     }
 
+    /// The distinct slots these working sets hold, a slot shared by forks counted once.
+    pub fn held_slots(&self, working_sets: impl IntoIterator<Item = RsWorkingSetId>) -> usize {
+        let mut held = BTreeSet::new();
+        for ws in working_sets {
+            if let Some(entry) = self.working_sets.get(ws) {
+                held.extend(entry.folded);
+                held.extend(entry.buffer.iter().flatten());
+            }
+        }
+        held.len()
+    }
+
     pub fn capacity_slots(&self) -> u32 {
         self.pool.capacity()
     }

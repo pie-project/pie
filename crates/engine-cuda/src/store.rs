@@ -194,6 +194,14 @@ pub fn decoded_weight_reserve(widest_plane_bytes: u64, streams: u32) -> u64 {
         .saturating_mul(u64::from(streams.max(1)))
 }
 
+/// The least state slots a fitted pool holds for `seated` kv sequences: two
+/// per seat, one per posted frame, and never under the three one buffered
+/// lane holds alone (its folded state and the two pages a window spans).
+#[must_use]
+pub fn least_state_slots(seated: u32) -> u32 {
+    seated.saturating_mul(2).max(3)
+}
+
 /// The largest page count at or under `asked` whose watermark fits `room`,
 /// or zero when not even the first page does. `declared_at` is the watermark
 /// at a page count and only ever grows with it, so this is a bisection over
@@ -732,9 +740,9 @@ impl Pools {
         }
         // A hybrid declares a recurrent slab for every state slot, whatever
         // the pool seats, and on a short card that slab alone can be the
-        // refusal. The runtime seats a lane on two slots, so two is the
-        // least; between that and the count asked, the slots and the kv
-        // seats are brought level, each giving the other its room.
+        // refusal. Between the least a lane needs (`least_state_slots`)
+        // and the count asked, the slots and the kv seats are brought
+        // level, each giving the other its room.
         if fit < one_slot && fresh && self.has_state() {
             let mut slots = self.paging.slots;
             let mut pages = fit;
@@ -742,7 +750,7 @@ impl Pools {
                 let fewer = pages_within(u64::from(slots), room, |slots| {
                     self.declared_reshaped(one_slot, u32::try_from(slots).unwrap_or(u32::MAX))
                 });
-                if fewer < 2 {
+                if fewer < u64::from(least_state_slots(0)) {
                     break;
                 }
                 slots = u32::try_from(fewer).unwrap_or(u32::MAX);
@@ -750,10 +758,10 @@ impl Pools {
                     self.declared_reshaped(pages, slots)
                 });
                 let seated = u32::try_from(pages / one_slot.max(1)).unwrap_or(u32::MAX);
-                if slots <= seated.saturating_mul(2).max(2) {
+                if slots <= least_state_slots(seated) {
                     break;
                 }
-                slots = seated.saturating_mul(2).max(2);
+                slots = least_state_slots(seated);
             }
             if pages >= one_slot && slots < self.paging.slots {
                 self.reshape(pages, slots)?;

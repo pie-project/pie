@@ -2,7 +2,7 @@ use engine_cuda::device::elastic::map_unit_for;
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
 use engine_cuda::store::{
     Accounting, BODIES_FLOOR_BYTES, bodies_allowance, decoded_weight_reserve, holds_within,
-    pages_within, program_scratch_reserve, tokens_within,
+    least_state_slots, pages_within, program_scratch_reserve, tokens_within,
 };
 use engine_cuda::{DeviceBoot, Knobs};
 
@@ -37,6 +37,7 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     the_decoded_weight_tiles_are_held_out_of_the_pool();
     the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture();
     a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes();
+    a_tight_fit_still_seats_one_buffered_lane();
 }
 
 fn a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes() {
@@ -93,6 +94,11 @@ fn a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes() {
         LANES,
         "with the tile held to the widest plane fired at token rows, the asked lanes fit"
     );
+}
+
+fn a_tight_fit_still_seats_one_buffered_lane() {
+    // One seat levelled to two slots starved every buffered lane (#686).
+    assert_eq!(least_state_slots(1), 3);
 }
 
 fn the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture() {
