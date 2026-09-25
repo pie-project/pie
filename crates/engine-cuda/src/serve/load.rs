@@ -867,8 +867,9 @@ impl Shell {
             eprintln!(
                 "engine-cuda: [engine] max_state_slots {} is served at {} on this card: the \
                  recurrent slab is declared for every slot, and at {} it left no room for one \
-                 sequence's kv pages beside it; the pool seats {} sequences at the declared \
-                 context. State a smaller max_state_slots to choose it.",
+                 sequence's kv pages beside it, so the slots were cut to what leaves the pages \
+                 half of the room past one sequence; the pool seats {} sequences at the \
+                 declared context. State a smaller max_state_slots to choose it.",
                 shell.held.len(),
                 fitted.slots,
                 shell.held.len(),
