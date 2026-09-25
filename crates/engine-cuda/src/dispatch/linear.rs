@@ -567,7 +567,8 @@ impl Run<'_> {
         match self.maybe_planes(*w) {
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
-                let entry = if act.rows >= PREFILL_ROWS && !seat.streams() {
+                let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
+                let entry = if act.rows >= PREFILL_ROWS && !seat.streams() && held {
                     linear::quant::matmul_via_dense
                 } else {
                     linear::quant::matmul
@@ -610,7 +611,8 @@ impl Run<'_> {
         match self.maybe_planes(*w) {
             Some((codes, scales, biases, seat)) => {
                 let act = self.tensor(*act);
-                let entry = if act.rows >= PREFILL_ROWS && !seat.streams() {
+                let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
+                let entry = if act.rows >= PREFILL_ROWS && !seat.streams() && held {
                     linear::quant::lm_head_via_dense
                 } else {
                     linear::quant::lm_head

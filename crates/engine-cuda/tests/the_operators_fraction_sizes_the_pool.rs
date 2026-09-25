@@ -36,6 +36,63 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     the_reservations_scale_to_a_twenty_four_gigabyte_card();
     the_decoded_weight_tiles_are_held_out_of_the_pool();
     the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture();
+    a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes();
+}
+
+fn a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes() {
+    // Issue #679: an RTX 4090 (25250627584 bytes, 426901504 in use) at
+    // gpu_mem_utilization 0.9 with qwen3.6-27b u4g64, 15300601856 of
+    // weights, a 4096 envelope and 256 lanes: the load put down an
+    // 838467584-byte arena and 2150089216 of inputs, took the lm_head's
+    // tile (vocab 248320 by hidden 5120 in bf16) and found no room for one
+    // sequence.
+    const CARD: u64 = 25_250_627_584;
+    const BEFORE: u64 = 426_901_504;
+    const WEIGHTS: u64 = 15_300_601_856;
+    const ARENA: u64 = 838_467_584;
+    const INPUTS: u64 = 2_150_089_216;
+    const LANES: u32 = 256;
+    const TOKENS: u32 = 4096;
+    const VOCAB: u64 = 248_320;
+    const HIDDEN: u64 = 5120;
+    const INTERMEDIATE: u64 = 17_408;
+    // One sequence: 16 full-attention layers' kv at 4096, and the 48
+    // linear-attention layers' recurrent state for each of a lane's two slots.
+    const SEQUENCE: u64 = 16 * 2 * 4096 * 4 * 256 * 2 + 2 * (48 * 48 * 128 * 128 * 4);
+    // A lane's share of the inputs (two prefill workspaces padding a 64-row
+    // tile) and of the arena (one vocab-wide bf16 readout row).
+    const INPUTS_A_LANE: u64 = 2 * 24 * 64 * 256 * 4;
+    const ARENA_A_LANE: u64 = VOCAB * 2;
+
+    let live = budget_bytes(CARD - BEFORE, CARD, 0.90) - WEIGHTS;
+    let lm_head = decoded_weight_reserve(VOCAB * HIDDEN * 2, 1);
+    let mlp = decoded_weight_reserve(INTERMEDIATE * HIDDEN * 2, 1);
+    let working = |lanes: u32, tile: u64| {
+        let fewer = u64::from(LANES - lanes);
+        (ARENA - fewer * ARENA_A_LANE)
+            + (INPUTS - fewer * INPUTS_A_LANE)
+            + tile
+            + program_scratch_reserve(lanes, VOCAB * 4)
+            + u64::from(lanes) * u64::from(TOKENS) * 8
+    };
+    assert!(
+        live - working(LANES, lm_head) < SEQUENCE,
+        "the boot the issue saw: at 256 lanes with the lm_head tile, what is left ({}) is \
+         under one sequence ({SEQUENCE})",
+        live - working(LANES, lm_head)
+    );
+
+    let room = live - SEQUENCE - BODIES_FLOOR_BYTES;
+    assert_eq!(
+        tokens_within(LANES, 1, room, |lanes| working(lanes, lm_head)),
+        128,
+        "with the tile kept, the lanes would halve once to seat one sequence"
+    );
+    assert_eq!(
+        tokens_within(LANES, 1, room, |lanes| working(lanes, mlp)),
+        LANES,
+        "with the tile held to the widest plane fired at token rows, the asked lanes fit"
+    );
 }
 
 fn the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture() {

@@ -241,6 +241,19 @@ pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     Ok(bytes)
 }
 
+/// One sequence's cache rows: its kv pages at the declared context and the
+/// recurrent slabs, the least `Pools::fit_the_card` seats before refusing.
+pub fn least_sequence_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
+    let mut state: u64 = 0;
+    for row in &trace.caches {
+        if let CacheRow::State { name, slab, dtype } = row {
+            let stride: u64 = slab.iter().product();
+            state = state.saturating_add(stride * elem_bytes(name, *dtype)?);
+        }
+    }
+    Ok(one_slot_bytes(trace, paging)?.saturating_add(state))
+}
+
 pub fn admit_the_card(
     utilization: f64,
     weights: u64,
