@@ -43,6 +43,12 @@ pub fn capture(
     scores: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.score_capture";
+    if super::q8::enabled(pool, head_dim) {
+        return Err(refuse(
+            OP,
+            "score capture is not yet supported with PIE_METAL_KV_Q8=1",
+        ));
+    }
     if window.is_some() {
         return Err(refuse(
             OP,

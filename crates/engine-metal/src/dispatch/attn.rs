@@ -153,7 +153,7 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-            } => attn::arbiter::prefill(
+            } => attn::arbiter::prefill_with_scratch(
                 self.ctx(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
@@ -165,6 +165,7 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.requests(),
                 &kernels_metal::tuning::current(),
+                &|rows, width| self.partials(rows, width),
             ),
             Attention::DecodeSelected {
                 q,
@@ -241,7 +242,7 @@ impl Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-            } => attn::arbiter::masked(
+            } => attn::arbiter::masked_with_scratch(
                 self.ctx(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
@@ -254,6 +255,7 @@ impl Run<'_> {
                 self.tensor(*o),
                 self.requests(),
                 &kernels_metal::tuning::current(),
+                &|rows, width| self.partials(rows, width),
             ),
             Attention::MaskedLse {
                 kv_heads: _,

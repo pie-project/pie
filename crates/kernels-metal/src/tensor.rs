@@ -74,6 +74,8 @@ pub struct RecurrentPool {
 pub struct Bank {
     pub codes: Tensor,
 
+    pub mpp_codes: Option<Tensor>,
+
     pub scales: Tensor,
 
     pub biases: Option<Tensor>,

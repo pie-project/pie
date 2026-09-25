@@ -508,6 +508,7 @@ impl Shell {
         )?;
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
+        weights.repack_mpp(&device, &handles, &boot.trace)?;
         handles.seal();
 
         {
@@ -515,12 +516,12 @@ impl Shell {
             let acct = crate::store::accounting::Accounting::with_scratch(
                 device.working_set(),
                 crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
-                boot.residency.device_demand(),
+                weights.bytes(),
                 compiled.arena.bytes,
                 kv_pool,
             );
             acct.admit(
-                Some(boot.residency.device_demand()),
+                Some(weights.bytes()),
                 crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
             )?;
             let source = boot.residency.source_bytes();
@@ -3241,6 +3242,7 @@ impl Shell {
 
         let mut readout_first: Vec<u32>;
         let mut readout_count: Vec<u32>;
+        let mut readout_indptr = vec![0u32];
         let readout_rows: Vec<i32> = {
             let mut placed: Vec<(u32, u32, usize)> = composition
                 .lanes()
@@ -3268,10 +3270,19 @@ impl Shell {
                     }
                     table.push(i32::try_from(row_offset + row).unwrap_or(0));
                 }
+                readout_indptr.push(table.len() as u32);
             }
             table
         };
 
+        let readouts_ceiling = model_compiler::arena::readouts_ceiling(&self.budgets.tokens);
+        if readout_rows.len() as u64 > readouts_ceiling {
+            return Err(Fault::Ceiling {
+                what: "rows one fire reads logits for (READOUTS_PER_LANE per lane)",
+                need: readout_rows.len() as u64,
+                have: readouts_ceiling,
+            });
+        }
         let bound = self.inputs[arm].write(
             &self.handles,
             &crate::inputs::Fire {
@@ -3349,6 +3360,7 @@ impl Shell {
             positions: bound.positions,
             adapter_routes: bound.adapter_routes,
             readout_rows: bound.readout_rows,
+            readout_indptr,
             nan_flags: match self.nan_flags.as_ref() {
                 Some(plane) => {
                     let words = self.trace.values.len() as u32 + 1;

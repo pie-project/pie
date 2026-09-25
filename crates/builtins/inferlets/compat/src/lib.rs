@@ -28,6 +28,7 @@ pub mod holdback;
 pub mod prompt;
 pub mod request;
 pub mod run;
+mod speculative;
 
 pub use demux::Event;
 pub use envelope::Envelope;
