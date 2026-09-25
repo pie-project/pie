@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use controller_api::{Health, Role, RoutableWorker, RoutingTable};
 use ids::WorkerId;
 use tokio::sync::watch;
 use worker_api::{Accepted, Request};
 
-use crate::admission::{AdmissionConfig, AdmissionDecision, admit};
+use crate::admission::{AdmissionConfig, AdmissionDecision, RejectReason, admit};
 
 pub type AffinityKey = u64;
 
@@ -58,6 +58,10 @@ pub struct RoutingHandle {
     routing: watch::Receiver<RoutingTable>,
     connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
     admission: AdmissionConfig,
+    // Tokio's mutex hands out the lock in arrival order, so launches that
+    // find the pool full are seated first-come first-served.
+    queue: Arc<tokio::sync::Mutex<()>>,
+    queued: Arc<AtomicUsize>,
 }
 
 impl RoutingHandle {
@@ -69,6 +73,8 @@ impl RoutingHandle {
             routing,
             connected,
             admission: AdmissionConfig::default(),
+            queue: Arc::default(),
+            queued: Arc::default(),
         }
     }
 
@@ -90,6 +96,45 @@ impl RoutingHandle {
             return AdmissionDecision::Admit;
         }
         admit(&self.routing.borrow(), &self.admission)
+    }
+
+    // A launch the pool cannot seat now waits for the routing table to show
+    // headroom again rather than being refused; dropping the future (the
+    // client went away) leaves the queue.
+    pub async fn admit_queued(&self, req: &Request) -> AdmissionDecision {
+        let decision = self.admit(req);
+        let is_launch = matches!(
+            &req.message,
+            client_api::ClientMessage::LaunchProcess { .. }
+        );
+        if !is_launch
+            || (decision != AdmissionDecision::Reject(RejectReason::ClusterSaturated)
+                && self.queued.load(Ordering::Acquire) == 0)
+        {
+            return decision;
+        }
+        struct Queued<'a>(&'a AtomicUsize);
+        impl Drop for Queued<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        if self.queued.fetch_add(1, Ordering::AcqRel) >= self.admission.max_queued_launches {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            return AdmissionDecision::Reject(RejectReason::QueueFull);
+        }
+        let _queued = Queued(&self.queued);
+        let _turn = self.queue.lock().await;
+        let mut routing = self.routing.clone();
+        loop {
+            match admit(&routing.borrow_and_update(), &self.admission) {
+                AdmissionDecision::Reject(RejectReason::ClusterSaturated) => {}
+                decision => return decision,
+            }
+            if routing.changed().await.is_err() {
+                return AdmissionDecision::Reject(RejectReason::ClusterSaturated);
+            }
+        }
     }
 
     pub fn select_worker(&self, affinity: Option<AffinityKey>) -> Vec<WorkerId> {
@@ -374,6 +419,51 @@ mod tests {
             };
             assert!(matches!(h.admit(&request), AdmissionDecision::Reject(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn saturated_launches_queue_in_order_until_the_pool_frees() {
+        let (routing, rr) = watch::channel(table(vec![worker(1, "m", Health::Healthy, 255, 0)]));
+        let (_ct, cr) = watch::channel(Arc::new(connset(&[1])));
+        let h = RoutingHandle::new(rr, cr).with_admission(AdmissionConfig {
+            max_queued_launches: 3,
+            ..AdmissionConfig::default()
+        });
+        let mut launch = req();
+        launch.message = ClientMessage::LaunchProcess {
+            corr_id: 1,
+            inferlet: "chat".into(),
+            input: String::new(),
+            capture_outputs: false,
+        };
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut waiting = Vec::new();
+        for i in 0..3 {
+            let (h, launch, order) = (h.clone(), launch.clone(), order.clone());
+            waiting.push(tokio::spawn(async move {
+                let decision = h.admit_queued(&launch).await;
+                order.lock().unwrap().push(i);
+                decision
+            }));
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            h.admit_queued(&launch).await,
+            AdmissionDecision::Reject(RejectReason::QueueFull)
+        );
+        waiting.remove(1).abort();
+        tokio::task::yield_now().await;
+        routing.send_replace(table(vec![worker(1, "m", Health::Healthy, 0, 0)]));
+        for task in waiting {
+            assert_eq!(task.await.unwrap(), AdmissionDecision::Admit);
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 2]);
+
+        routing.send_replace(table(vec![worker(1, "m", Health::Unreachable, 0, 0)]));
+        assert_eq!(
+            h.admit_queued(&launch).await,
+            AdmissionDecision::Reject(RejectReason::NoHealthyWorker)
+        );
     }
 
     #[tokio::test]

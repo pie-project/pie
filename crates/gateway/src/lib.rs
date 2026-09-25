@@ -82,7 +82,7 @@ struct RouteBackend {
 #[async_trait::async_trait]
 impl TurnRouter for RouteBackend {
     async fn admit(&self, req: &Request) -> std::result::Result<(), AdmitReject> {
-        match self.routing.admit(req) {
+        match self.routing.admit_queued(req).await {
             AdmissionDecision::Admit => Ok(()),
             AdmissionDecision::Reject(reason) => Err(AdmitReject(reason.to_string())),
         }
