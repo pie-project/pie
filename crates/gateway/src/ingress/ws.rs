@@ -10,7 +10,7 @@ use futures::{SinkExt, StreamExt};
 
 use crate::GatewayState;
 use crate::ingress::identity;
-use crate::session::{Affinity, Identity, TokenRx, TurnInput};
+use crate::session::{Affinity, Identity, SessionError, TokenRx, TurnInput};
 use crate::worker::{MAX_CLIENT_FRAME_BYTES, MAX_CLIENT_FRAME_RECV_BYTES};
 use client_api::ClientMessage;
 use worker_api::{Priority, Tokens};
@@ -129,9 +129,26 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
 
     let mut live = LiveTurns::new();
     live.push(first_rx);
+    // A launch may wait at admission for a seat, so it waits here beside the
+    // session's running turns and keeps their output flowing; every other
+    // frame (an upload's chunks among them) is still dispatched in order.
+    let admit = |req: TurnInput| {
+        let corr = req.message.corr_id();
+        let handle = &handle;
+        async move { (corr, handle.turn(req).await) }
+    };
+    let mut admitting = futures::stream::FuturesUnordered::new();
 
     loop {
         tokio::select! {
+            Some((corr, turn)) = admitting.next(), if !admitting.is_empty() => match turn {
+                Ok(new_rx) => live.push(new_rx),
+                Err(e) => {
+                    if tx.send(refusal(corr, &SessionError::to_string(&e))).await.is_err() {
+                        break;
+                    }
+                }
+            },
             ev = live.next() => match ev {
                 TurnEvent::Item(Tokens::Chunk(msg)) => {
                     match encode(&msg) {
@@ -177,6 +194,7 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                     }
                 }
                 Some(Ok(Message::Text(t))) => match parse_incoming(t.as_str()) {
+                    Ok(Incoming::Turn(req)) if is_launch(&req) => admitting.push(admit(req)),
                     Ok(Incoming::Turn(req)) => {
                         let corr = req.message.corr_id();
                         match handle.turn(req).await {
@@ -194,6 +212,7 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
                     }
                 },
                 Some(Ok(Message::Binary(b))) => match parse_incoming_bytes(&b) {
+                    Ok(Incoming::Turn(req)) if is_launch(&req) => admitting.push(admit(req)),
                     Ok(Incoming::Turn(req)) => {
                         let corr = req.message.corr_id();
                         match handle.turn(req).await {
@@ -217,7 +236,12 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
         }
     }
 
+    drop(admitting);
     handle.close().await;
+}
+
+fn is_launch(req: &TurnInput) -> bool {
+    matches!(req.message, ClientMessage::LaunchProcess { .. })
 }
 
 async fn read_first_turn(
