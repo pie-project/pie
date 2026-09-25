@@ -188,6 +188,7 @@ fn every_row_count_is_timed() {
         let mut reference: Option<Vec<f32>> = None;
         for &m in &rows {
             let bank = Bank {
+                mpp_codes: None,
                 codes: Tensor::new(hc, n, k, Dtype::U4g64),
                 scales: Tensor::new(hs, n, k / group, Dtype::Bf16),
                 biases: Some(Tensor::new(hb, n, k / group, Dtype::Bf16)),
