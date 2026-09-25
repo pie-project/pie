@@ -915,6 +915,21 @@ impl Shell {
         if boot.world.rank != 0 {
             shell.programs.set_shadow(true);
         }
+        // Only a warm fire waits on the device, and a load whose bodies were
+        // held to nothing fires none: a fault raised by what the load put
+        // down asynchronously would otherwise be the first request's to
+        // find, as a sticky error from whichever call touches the context
+        // next, under a banner that said ready.
+        shell.device.synchronize().map_err(|why| {
+            Fault::program(
+                "serve::load",
+                format!(
+                    "the device faulted under this load's own work ({why}); a context that \
+                     has faulted serves nothing, so the load is refused rather than reported \
+                     ready"
+                ),
+            )
+        })?;
         Ok(shell)
     }
 }
