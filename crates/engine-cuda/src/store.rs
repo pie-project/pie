@@ -735,13 +735,7 @@ impl Pools {
         // refusal. The runtime seats a lane on two slots, so two is the
         // least; between that and the count asked, the slots and the kv
         // seats are brought level, each giving the other its room.
-        if fit < one_slot
-            && fresh
-            && self
-                .shapes
-                .iter()
-                .any(|shape| matches!(shape, Shape::State { .. }))
-        {
+        if fit < one_slot && fresh && self.has_state() {
             let mut slots = self.paging.slots;
             let mut pages = fit;
             for _ in 0..8 {
@@ -853,6 +847,13 @@ impl Pools {
     }
 
     #[must_use]
+    pub fn has_state(&self) -> bool {
+        self.shapes
+            .iter()
+            .any(|shape| matches!(shape, Shape::State { .. }))
+    }
+
+    #[must_use]
     pub fn committed_watermarks(&self) -> (u32, u32) {
         (self.committed_kv_pages, self.committed_state_slots)
     }
@@ -956,12 +957,8 @@ impl Pools {
 
     pub fn copy_slot(&mut self, stream: *mut core::ffi::c_void, src: u32, dst: u32) -> Result<()> {
         for slot in [src, dst] {
-            if slot >= self.paging.slots {
-                return Err(Fault::Ceiling {
-                    what: "recurrent slots",
-                    need: u64::from(slot) + 1,
-                    have: u64::from(self.paging.slots),
-                });
+            if !slab_row(self.has_state(), self.paging.slots, slot)? {
+                return Ok(());
             }
         }
         if src == dst {
@@ -1048,12 +1045,8 @@ impl Pools {
     }
 
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
-        if slot >= self.paging.slots {
-            return Err(Fault::Ceiling {
-                what: "recurrent slots",
-                need: u64::from(slot) + 1,
-                have: u64::from(self.paging.slots),
-            });
+        if !slab_row(self.has_state(), self.paging.slots, slot)? {
+            return Ok(Vec::new());
         }
         self.ensure_state(slot + 1)?;
         let mut out = Vec::new();
@@ -1073,12 +1066,8 @@ impl Pools {
     }
 
     fn zero_slot(&mut self, stream: Option<*mut core::ffi::c_void>, slot: u32) -> Result<()> {
-        if slot >= self.paging.slots {
-            return Err(Fault::Ceiling {
-                what: "recurrent slots",
-                need: u64::from(slot) + 1,
-                have: u64::from(self.paging.slots),
-            });
+        if !slab_row(self.has_state(), self.paging.slots, slot)? {
+            return Ok(());
         }
         self.ensure_state(slot + 1)?;
         for (planes, shape) in self.rows.iter().zip(&self.shapes) {
@@ -1320,6 +1309,22 @@ fn watermark_bytes(
     }
 }
 
+/// Whether a slab holds a row for the seat. The runtime seats a kv-only
+/// model with no ceiling, so the slot count only binds a model with a slab.
+fn slab_row(has_state: bool, slots: u32, slot: u32) -> Result<bool> {
+    if !has_state {
+        return Ok(false);
+    }
+    if slot >= slots {
+        return Err(Fault::Ceiling {
+            what: "recurrent slots",
+            need: u64::from(slot) + 1,
+            have: u64::from(slots),
+        });
+    }
+    Ok(true)
+}
+
 fn refuse(pool: &PhysicalPool, outcome: Commit) -> Fault {
     let page = pool.page_bytes();
     match outcome {
@@ -1361,12 +1366,8 @@ impl engine::frame::Supply for Pools {
     type Error = Fault;
 
     fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
-        if demand.state_slots > self.paging.slots {
-            return Err(Fault::Ceiling {
-                what: "kv slots",
-                need: u64::from(demand.state_slots),
-                have: u64::from(self.paging.slots),
-            });
+        if let Some(highest) = demand.state_slots.checked_sub(1) {
+            slab_row(self.has_state(), self.paging.slots, highest)?;
         }
         let capacity =
             u64::from(self.paging.slots).saturating_mul(u64::from(self.paging.pages_per_slot));
@@ -1423,5 +1424,29 @@ impl Pools {
         );
         kv_drop > u64::from(self.committed_kv_pages) >> TRIM_HYSTERESIS_SHIFT
             || state_drop > u64::from(self.committed_state_slots) >> TRIM_HYSTERESIS_SHIFT
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_every_case() {
+        a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse();
+    }
+
+    // gemma-4 (no slab) with 256 slots reserved seated a lane at 312.
+    fn a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse() {
+        assert!(!slab_row(false, 256, 312).expect("no slab, no ceiling"));
+        assert!(slab_row(true, 256, 255).expect("the last row"));
+        assert!(matches!(
+            slab_row(true, 256, 312),
+            Err(Fault::Ceiling {
+                what: "recurrent slots",
+                need: 313,
+                have: 256
+            })
+        ));
     }
 }
