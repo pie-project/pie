@@ -541,4 +541,55 @@ mod tests {
             }
         }
     }
+
+    /// The affine-u4 arms are chosen by shape, never by capability, so
+    /// sm_90 keeps every arm sm_89 has: no `__CUDA_ARCH__` gate in those
+    /// units, the prelude or the shims may admit 890 and refuse 900 (#680).
+    #[test]
+    fn no_arch_gate_on_the_affine_u4_path_refuses_sm_90() {
+        use crate::source::{LIBRARY, SHIM};
+
+        let admits = |op: &str, bound: u32, arch: u32| match op {
+            ">=" => arch >= bound,
+            "<=" => arch <= bound,
+            "==" => arch == bound,
+            "!=" => arch != bound,
+            ">" => arch > bound,
+            _ => arch < bound,
+        };
+        let units = ["linear/quant.cuh", "linear/tiled.cuh"]
+            .map(|file| Root::of(file).expect("a carried unit"));
+        let scanned = units.iter().map(|root| (root.name, root.text)).chain(
+            SHIM.iter()
+                .chain(LIBRARY.iter().filter(|h| h.name.starts_with("prelude/")))
+                .map(|h| (h.name, h.text)),
+        );
+        let mut gates = 0;
+        for (name, text) in scanned {
+            for (at, _) in text.match_indices("__CUDA_ARCH__") {
+                let rest = text[at + "__CUDA_ARCH__".len()..].trim_start();
+                let Some(op) = [">=", "<=", "==", "!=", ">", "<"]
+                    .into_iter()
+                    .find(|op| rest.starts_with(op))
+                else {
+                    continue;
+                };
+                let digits: String = rest[op.len()..]
+                    .trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                let Ok(bound) = digits.parse::<u32>() else {
+                    continue;
+                };
+                gates += 1;
+                assert!(
+                    !admits(op, bound, 890) || admits(op, bound, 900),
+                    "`{name}` gates on `__CUDA_ARCH__ {op} {bound}`, which admits sm_89 and \
+                     refuses sm_90"
+                );
+            }
+        }
+        assert!(gates > 0, "the scan read no `__CUDA_ARCH__` gate at all");
+    }
 }
