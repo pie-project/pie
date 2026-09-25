@@ -167,6 +167,7 @@ impl FrameShell for Shell {
         }
 
         let mut device_pages: Vec<Option<Vec<u32>>> = vec![None; lanes.len()];
+        let mut device_window: Vec<Option<Vec<u32>>> = vec![None; lanes.len()];
         let mut device_writes: Vec<Option<(Vec<u32>, Vec<u32>)>> = vec![None; lanes.len()];
         let mut device_masks: Vec<Option<Masking>> = vec![None; lanes.len()];
         let mut lane_rows: Vec<u32> = lanes
@@ -193,8 +194,8 @@ impl FrameShell for Shell {
                     )
                 })
             };
-            device_pages[source] = ports
-                .pages()?
+            let relative = ports.pages()?;
+            device_pages[source] = relative
                 .map(|relative| {
                     relative
                         .iter()
@@ -202,6 +203,15 @@ impl FrameShell for Shell {
                         .collect::<Result<Vec<u32>>>()
                 })
                 .transpose()?;
+            let window = lanes[source].window;
+            if !window.is_empty() {
+                device_window[source] = relative.map(|relative| {
+                    relative
+                        .iter()
+                        .map(|&page| window.get(page as usize).copied().unwrap_or(0))
+                        .collect()
+                });
+            }
             if ports.owns_pages() {
                 lane_rows[source] = ports.rows();
             }
@@ -731,6 +741,7 @@ impl FrameShell for Shell {
 
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
+        let mut window_ids: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         let mut kv_less_seats: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -819,6 +830,11 @@ impl FrameShell for Shell {
             tables.push(match &device_pages[source] {
                 Some(pages) => std::borrow::Cow::Owned(pages.clone()),
                 None => std::borrow::Cow::Borrowed(seated.pages),
+            });
+            window_ids.push(match (&device_pages[source], &device_window[source]) {
+                (_, Some(ids)) => std::borrow::Cow::Owned(ids.clone()),
+                (Some(_), None) => std::borrow::Cow::Borrowed(&[][..]),
+                (None, None) => std::borrow::Cow::Borrowed(seated.window),
             });
             let masking = device_masks[source].as_ref().or(seated.mask);
             let runs_masked_arm = self.masked.contains(row.class as usize);
@@ -1179,15 +1195,70 @@ impl FrameShell for Shell {
         let indptr_host = kv::indptr(&seats)?;
         let paging = self.pools.paging();
         let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
+        let window_tables = if self.pools.has_windowed() {
+            seats
+                .iter()
+                .zip(&tables)
+                .zip(&window_ids)
+                .zip(&kv_less_seats)
+                .map(|(((seat, table), ids), &kv_less)| {
+                    if kv_less {
+                        Ok(table.to_vec())
+                    } else {
+                        kv::window_table(&paging, seat, table, ids)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let window_refs: Vec<&[u32]> = window_tables.iter().map(Vec::as_slice).collect();
         let mut geometries = (0..self.spaces)
-            .map(|_| kv::geometry_with(&paging, &seats, &table_refs))
+            .map(|space| {
+                if self.pools.windowed_space(space as u32) {
+                    kv::geometry_with(&paging, &seats, &window_refs)
+                } else {
+                    kv::geometry_with(&paging, &seats, &table_refs)
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
         super::btrace::mark("page_arith");
         if writes.iter().any(Option::is_some) {
-            for geometry in &mut geometries {
+            let lane_of = |row: usize| {
+                composition
+                    .lanes()
+                    .iter()
+                    .position(|lane| {
+                        (lane.row_offset as usize..(lane.row_offset + lane.rows) as usize)
+                            .contains(&row)
+                    })
+                    .unwrap_or(0)
+            };
+            for (space, geometry) in geometries.iter_mut().enumerate() {
+                let windowed = self.pools.windowed_space(space as u32);
                 for (row, stated) in writes.iter().enumerate() {
                     let Some((page, offset)) = *stated else {
                         continue;
+                    };
+                    let page = if windowed {
+                        let lane = lane_of(row);
+                        let at = tables[lane]
+                            .iter()
+                            .position(|&held| i64::from(held) == i64::from(page));
+                        match at.and_then(|at| window_tables[lane].get(at)) {
+                            Some(&id) if id != 0 => id as i32,
+                            _ => {
+                                return Err(Fault::program(
+                                    "serve::prepare",
+                                    format!(
+                                        "row {row} writes page {page}, which lane {lane}'s \
+                                         windowed table holds no live page for"
+                                    ),
+                                ));
+                            }
+                        }
+                    } else {
+                        page
                     };
                     let (Some(write_page), Some(write_offset)) = (
                         geometry.write_page.get_mut(row),

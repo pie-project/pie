@@ -643,6 +643,7 @@ mod tests {
             pages_per_slot: 1,
             slots,
             pages: u64::from(slots),
+            window: None,
         }
     }
 

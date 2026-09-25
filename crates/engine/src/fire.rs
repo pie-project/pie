@@ -93,6 +93,15 @@ pub struct KvDelta {
     pub pages: Vec<u32>,
     #[serde(default)]
     pub translation: Vec<u32>,
+    /// The ids of the lane's pages in the windowed kv spaces, aligned with
+    /// `translation` when it is stated and with `pages` otherwise; 0 is the
+    /// null page a page wholly behind the window reads.
+    #[serde(default)]
+    pub window: Vec<u32>,
+    /// Windowed pages copied `(src, dst)` before the fire runs, beside the
+    /// full pages the fire's pre-launch copy moves.
+    #[serde(default)]
+    pub window_copies: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

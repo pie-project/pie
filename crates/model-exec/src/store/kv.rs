@@ -197,6 +197,16 @@ pub struct Paging {
     pub pages_per_slot: u32,
     pub slots: u32,
     pub pages: u64,
+    pub window: Option<Windowed>,
+}
+
+/// The windowed kv spaces' paging: `tokens` is the widest window a
+/// windowed row is read through, `fire_pages` the most one fire's rows add
+/// past the windows of the lanes they land in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Windowed {
+    pub tokens: u32,
+    pub fire_pages: u32,
 }
 
 impl Paging {
@@ -213,7 +223,63 @@ impl Paging {
             pages_per_slot: context.div_ceil(page_size).max(1),
             slots,
             pages: pages.max(1),
+            window: None,
         })
+    }
+
+    /// The paging with windowed spaces read through `tokens` and fires of
+    /// at most `max_tokens` rows. A window that spans the context holds
+    /// every page, so it is no window at all.
+    #[must_use]
+    pub fn windowed(mut self, tokens: Option<u32>, max_tokens: u32) -> Paging {
+        self.window = tokens
+            .filter(|&tokens| tokens < self.context())
+            .map(|tokens| Windowed {
+                tokens,
+                fire_pages: max_tokens.div_ceil(self.page_size) + 1,
+            });
+        self
+    }
+
+    /// The windowed pages one sequence holds between fires: its window,
+    /// which may straddle one more page than it fills.
+    #[must_use]
+    pub fn window_held(&self) -> u32 {
+        self.window.map_or(self.pages_per_slot, |w| {
+            (w.tokens.div_ceil(self.page_size) + 1).min(self.pages_per_slot)
+        })
+    }
+
+    /// The windowed pages a slot-seated lane cycles through: its window
+    /// and the most one fire's rows add past it.
+    #[must_use]
+    pub fn window_ring(&self) -> u32 {
+        self.window.map_or(self.pages_per_slot, |w| {
+            (self.window_held() + w.fire_pages).min(self.pages_per_slot)
+        })
+    }
+
+    /// The windowed pool beside `pages` kv pages: page 0, the null page
+    /// every page behind a window reads, one sequence's window and fire
+    /// rows, then a page for every two kv pages past that sequence's. A
+    /// short sequence holds as many windowed pages as kv pages, so a pool
+    /// split by long sequences alone would seat far fewer short ones than
+    /// the kv pages do; the half keeps them within a few percent while a
+    /// long one still costs its window.
+    #[must_use]
+    pub fn window_pages_at(&self, pages: u64) -> u64 {
+        match self.window {
+            None => pages,
+            Some(_) => {
+                let past = pages.saturating_sub(u64::from(self.pages_per_slot));
+                1 + pages.min(u64::from(self.window_ring()) + past / 2)
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn window_pages(&self) -> u64 {
+        self.window_pages_at(self.pages)
     }
 
     #[must_use]
@@ -346,6 +412,61 @@ pub fn geometry_with(paging: &Paging, seats: &[Seat], tables: &[&[u32]]) -> Resu
     Ok(out)
 }
 
+/// A lane's table in a windowed space, as long as its table in the full
+/// one so the lengths, schedules and mask columns read the same: a page
+/// wholly behind the window of the lane's first row reads the null page 0,
+/// the rest the windowed ids the lane was handed (`ids`, aligned with
+/// `table`). A lane handed none keeps its own pages one past the null
+/// page, refused past the pool rather than folded onto a live one, and a
+/// lane seated by slot cycles through a ring of the slot's pages.
+pub fn window_table(paging: &Paging, seat: &Seat, table: &[u32], ids: &[u32]) -> Result<Vec<u32>> {
+    let Some(window) = paging.window else {
+        return Ok(table.to_vec());
+    };
+    let page_size = u64::from(paging.page_size);
+    let pages = (u64::from(seat.have) + u64::from(seat.rows))
+        .div_ceil(page_size)
+        .max(1);
+    let first = u64::from(seat.have.saturating_sub(window.tokens)) / page_size;
+    let ring = u64::from(paging.window_ring());
+    let capacity = paging.window_pages();
+    (0..pages)
+        .map(|page| {
+            if page < first {
+                return Ok(0);
+            }
+            let id = if !ids.is_empty() {
+                u64::from(*ids.get(page as usize).ok_or(Fault::Ceiling {
+                    what: "windowed pages this lane stated",
+                    need: page + 1,
+                    have: ids.len() as u64,
+                })?)
+            } else if table.is_empty() {
+                1 + u64::from(seat.slot) * ring + page % ring
+            } else {
+                u64::from(table.get(page as usize).copied().unwrap_or(u32::MAX)) + 1
+            };
+            if id == 0 {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "windowed page {page} of a lane holding {} tokens, which its window \
+                         still reads and the runtime has released",
+                        seat.have
+                    ),
+                });
+            }
+            if id >= capacity {
+                return Err(Fault::Ceiling {
+                    what: "windowed kv pages",
+                    need: id + 1,
+                    have: capacity,
+                });
+            }
+            narrow(id, "windowed page indices").map(|id| id as u32)
+        })
+        .collect()
+}
+
 pub fn indptr(seats: &[Seat]) -> Result<Vec<i32>> {
     let mut out = Vec::with_capacity(seats.len() + 1);
     let mut at = 0u64;
@@ -379,6 +500,32 @@ mod tests {
         a_prefill_writes_its_own_prompt_and_then_attends_it();
         a_decode_step_appends_one_row_past_what_the_slot_holds();
         a_sequence_past_its_slots_pages_is_refused_rather_than_wrapped();
+        a_windowed_table_reads_the_null_page_behind_the_window();
+    }
+
+    fn a_windowed_table_reads_the_null_page_behind_the_window() {
+        let paging = Paging::of(16, 256, 1, 16)
+            .expect("a page size of 16 spells geometry")
+            .windowed(Some(32), 16);
+        let seat = Seat {
+            slot: 0,
+            have: 70,
+            rows: 1,
+        };
+        let table = [4, 3, 2, 1, 0];
+        assert_eq!(
+            window_table(&paging, &seat, &table, &[0, 0, 3, 4, 2]).expect("the ids stand"),
+            vec![0, 0, 3, 4, 2],
+            "tokens 38 on sit from page 2, so pages 0 and 1 read the null page"
+        );
+        assert_eq!(
+            window_table(&paging, &seat, &table, &[]).expect("the lane's own pages"),
+            vec![0, 0, 3, 2, 1],
+        );
+        assert!(
+            window_table(&paging, &seat, &table, &[5, 1, 0, 4, 2]).is_err(),
+            "a page the window still reads is never the null page"
+        );
     }
 
     fn a_prefill_writes_its_own_prompt_and_then_attends_it() {

@@ -54,6 +54,7 @@ struct Synthetic {
     captures: bool,
     slot: u32,
     pages: Vec<u32>,
+    window: Vec<u32>,
     held: Option<u32>,
     media: Option<SyntheticMedia>,
     stream: u8,
@@ -423,6 +424,7 @@ impl Shell {
                     drafts: request.drafts(),
                     captures: request.captures_scores(),
                     slot: (at as u32) % slots,
+                    window: Vec::new(),
                     pages: {
                         let pages = u64::from(rows).div_ceil(page_size).max(1);
                         let table: Vec<u32> = (next_page..next_page + pages)
@@ -470,6 +472,19 @@ impl Shell {
                         }),
                 }
             })
+            .map(|mut lane| {
+                // A synthetic lane's content is never read back, so its
+                // pages fold into the windowed pool past the null page.
+                let windowed = self.pools.paging().window_pages().saturating_sub(1).max(1);
+                if self.pools.has_windowed() {
+                    lane.window = lane
+                        .pages
+                        .iter()
+                        .map(|&page| 1 + u32::try_from(u64::from(page) % windowed).unwrap_or(0))
+                        .collect();
+                }
+                lane
+            })
             .collect()
     }
 
@@ -514,6 +529,8 @@ impl Shell {
                 held: lane.held,
                 kv_less: false,
                 translation: &[],
+                window: &lane.window,
+                window_copies: &[],
                 mask: lane.mask.as_ref(),
                 adapter: lane.adapter,
                 drafts: lane.drafts,

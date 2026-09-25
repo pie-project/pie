@@ -41,6 +41,12 @@ pub struct PoolFacts {
     pub adapter_banks: u32,
     pub elastic_page_bytes: u64,
     pub elastic_budget_pages: u64,
+    /// The windowed kv pool, page 0 its null page, and the window its rows
+    /// are read through; zero when the model declares no windowed space.
+    #[serde(default)]
+    pub window_pages: u32,
+    #[serde(default)]
+    pub window_tokens: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

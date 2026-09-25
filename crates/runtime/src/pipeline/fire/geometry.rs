@@ -516,7 +516,7 @@ impl ReqGeometry {
                     kv: ::engine::KvDelta {
                         held,
                         pages,
-                        translation: Vec::new(),
+                        ..Default::default()
                     },
                     mask: None,
                     adapter: None,

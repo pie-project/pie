@@ -476,6 +476,7 @@ impl Engine for Wgpu {
 
                 elastic_page_bytes: 0,
                 elastic_budget_pages: 0,
+                ..PoolFacts::default()
             },
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,

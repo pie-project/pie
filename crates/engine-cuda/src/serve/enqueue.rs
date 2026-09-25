@@ -91,6 +91,21 @@ impl Shell {
         p: &mut Prepared<'_>,
         slot: &SlotGuard,
     ) -> Result<(u32, Option<Readback>)> {
+        let page_size = self.pools.paging().page_size;
+        let window_copies: Vec<crate::store::Move> = p
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.window_copies)
+            .map(|&(src, dst)| crate::store::Move {
+                src_page: src,
+                src_token: 0,
+                dst_page: dst,
+                dst_token: 0,
+                tokens: page_size,
+            })
+            .collect();
+        self.pools
+            .copy_kv(self.device.stream(), &[], &window_copies)?;
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
         if p.rs.rows_ext > 0 {
