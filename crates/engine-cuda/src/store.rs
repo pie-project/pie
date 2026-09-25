@@ -246,6 +246,28 @@ pub fn state_slots_within(
     least_state_slots(u32::try_from(seats).unwrap_or(u32::MAX))
 }
 
+/// The lanes a hybrid is served at: the runtime admits no more lanes than
+/// the pool seats in state slots, so a lane past them only holds room the
+/// seats could have. The lanes halve toward `floor` while they outnumber
+/// the seats `state_slots_within` cuts to in `room_at(lanes)`, the pool's
+/// room with what that many lanes reserve given back.
+#[must_use]
+pub fn lanes_within_seats(
+    lanes: u32,
+    floor: u32,
+    slots: u32,
+    one_sequence: u64,
+    slab: u64,
+    room_at: impl Fn(u32) -> u64,
+) -> u32 {
+    tokens_within(lanes, floor.min(lanes), 0, |lanes| {
+        let seats = state_slots_within(slots, room_at(lanes), one_sequence, |slots| {
+            u64::from(slots).saturating_mul(slab)
+        }) / 2;
+        u64::from(lanes.saturating_sub(seats))
+    })
+}
+
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut bytes: u64 = 0;
     for row in &trace.caches {
