@@ -224,6 +224,27 @@ pub fn pages_within(asked: u64, room: u64, declared_at: impl Fn(u64) -> u64) -> 
     fits
 }
 
+/// The state slots a hybrid's pool holds when `room` does not seat one
+/// sequence beside the `asked` count's slabs: the most whole seats of two
+/// slots (one a posted frame, as the runtime admits lanes) whose slabs take
+/// at most half of what is past `one_sequence`, the kv pages' watermark at
+/// the declared context, and never under what one buffered lane holds
+/// (`least_state_slots`). `slabs_at` is the slabs' watermark at a slot count.
+#[must_use]
+pub fn state_slots_within(
+    asked: u32,
+    room: u64,
+    one_sequence: u64,
+    slabs_at: impl Fn(u32) -> u64,
+) -> u32 {
+    let seats = pages_within(
+        u64::from(asked / 2),
+        room.saturating_sub(one_sequence) / 2,
+        |seats| slabs_at(u32::try_from(seats).unwrap_or(u32::MAX).saturating_mul(2)),
+    );
+    least_state_slots(u32::try_from(seats).unwrap_or(u32::MAX))
+}
+
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut bytes: u64 = 0;
     for row in &trace.caches {
@@ -740,29 +761,17 @@ impl Pools {
         }
         // A hybrid declares a recurrent slab for every state slot, whatever
         // the pool seats, and on a short card that slab alone can be the
-        // refusal. Between the least a lane needs (`least_state_slots`)
-        // and the count asked, the slots and the kv seats are brought
-        // level, each giving the other its room.
+        // refusal. The slots are then cut to what leaves the kv pages their
+        // half of the room past one sequence, in the whole seats the
+        // runtime admits lanes by.
         if fit < one_slot && fresh && self.has_state() {
-            let mut slots = self.paging.slots;
-            let mut pages = fit;
-            for _ in 0..8 {
-                let fewer = pages_within(u64::from(slots), room, |slots| {
-                    self.declared_reshaped(one_slot, u32::try_from(slots).unwrap_or(u32::MAX))
-                });
-                if fewer < u64::from(least_state_slots(0)) {
-                    break;
-                }
-                slots = u32::try_from(fewer).unwrap_or(u32::MAX);
-                pages = pages_within(self.ceiling, room, |pages| {
-                    self.declared_reshaped(pages, slots)
-                });
-                let seated = u32::try_from(pages / one_slot.max(1)).unwrap_or(u32::MAX);
-                if slots <= least_state_slots(seated) {
-                    break;
-                }
-                slots = least_state_slots(seated);
-            }
+            let one_sequence = self.declared_reshaped(one_slot, 0);
+            let slots = state_slots_within(self.paging.slots, room, one_sequence, |slots| {
+                self.declared_reshaped(0, slots)
+            });
+            let pages = pages_within(self.ceiling, room, |pages| {
+                self.declared_reshaped(pages, slots)
+            });
             if pages >= one_slot && slots < self.paging.slots {
                 self.reshape(pages, slots)?;
                 need = self.declared_at(one_slot);
