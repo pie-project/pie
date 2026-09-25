@@ -28,7 +28,7 @@
 
 use inferlet::chat;
 use inferlet::eta::hybrid::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const PAGE_T: u32 = 16;
 
@@ -54,6 +54,37 @@ fn default_max_tokens() -> usize {
 
 fn default_guidance() -> f32 {
     1.5
+}
+
+/// The report the other sampler programs answer with (`tova-attention`,
+/// `entropy-adaptive-temperature`, ...): the text, the counts, and what the
+/// rule did. `#[inferlet::main]` serialises a struct with serde_json and
+/// returns a `String` verbatim, so the prose this program used to return
+/// ("<text>\n\n[cfg] guidance=...") reached `scripts/bench/pie_bench.py` as a
+/// reply it could not parse -- "Expecting value" at the first character of the
+/// continuation, or an unescaped control character once the continuation
+/// happened to open with a quote.
+#[derive(Serialize)]
+struct Output {
+    sampler: &'static str,
+    /// The continuation, greedily decoded from the guided distribution.
+    text: String,
+    /// How many tokens it is.
+    count: usize,
+    /// The same tokens, for the harness's token-parity gate.
+    token_ids: Vec<u32>,
+    /// Conditional prompt tokens, chat-templated.
+    prompt_len: u32,
+    guidance: f32,
+    /// Guided picks, the stop token included.
+    steps: u64,
+    /// Fraction of steps at which guidance moved the argmax.
+    guidance_shift: f64,
+    /// Mean KL(P_cfg || P_cond) over the steps, in nats.
+    mean_kl: f64,
+    /// At `guidance = 1` the rule is the identity, so a shift or a KL beyond
+    /// float noise is a defect in this arithmetic or in the backend under it.
+    identity_violation: bool,
 }
 
 /// Eqn 4 of 2306.17806 in the log-domain, plus the two diagnostics that prove
@@ -88,17 +119,16 @@ fn rs_for_sequence() -> Result<Vec<RsWorkingSet>> {
         model::ForwardKind::Recurrent => Err(
             "classifier-free guidance has no recurrent-only path: it reads two KV streams".into(),
         ),
-        model::ForwardKind::Diffusion => Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into()),
+        model::ForwardKind::Diffusion => Err(
+            "this program decodes a token at a time; a diffusion model wants a canvas loop".into(),
+        ),
     }
 }
 
 #[inferlet::main]
-async fn main(input: Input) -> Result<String> {
+async fn main(input: Input) -> Result<Output> {
     if !input.guidance.is_finite() || input.guidance < 0.0 {
         return Err("guidance must be finite and non-negative".into());
-    }
-    if input.max_tokens == 0 {
-        return Ok(String::new());
     }
 
     let max_tokens =
@@ -112,6 +142,10 @@ async fn main(input: Input) -> Result<String> {
     if cond_prompt.is_empty() {
         cond_prompt.push(0);
     }
+    let nc = u32::try_from(cond_prompt.len()).map_err(|_| "prompt is too long")?;
+    if input.max_tokens == 0 {
+        return report(&[], nc, gamma, 0, 0, 0.0);
+    }
     // The unconditional stream drops the conditioning text. With no negative
     // prompt it keeps only the chat scaffolding, which is the paper's
     // "unconditional" ∅ context for an instruction-tuned model.
@@ -122,7 +156,6 @@ async fn main(input: Input) -> Result<String> {
         uncond_prompt.push(0);
     }
 
-    let nc = u32::try_from(cond_prompt.len()).map_err(|_| "prompt is too long")?;
     let nu = u32::try_from(uncond_prompt.len()).map_err(|_| "negative prompt is too long")?;
     let cond_pages = (nc + max_tokens + 1).div_ceil(PAGE_T);
     let uncond_pages = (nu + max_tokens + 1).div_ceil(PAGE_T);
@@ -249,7 +282,7 @@ async fn main(input: Input) -> Result<String> {
     }
     if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
         pipeline.close();
-        return report(&generated, gamma, shifts, scored, kl_total);
+        return report(&generated, nc, gamma, shifts, scored, kl_total);
     }
 
     // ---- decode loop: uncond runs one step ahead, cond consumes it -------
@@ -386,16 +419,17 @@ async fn main(input: Input) -> Result<String> {
     }
     pipeline.close();
 
-    report(&generated, gamma, shifts, scored, kl_total)
+    report(&generated, nc, gamma, shifts, scored, kl_total)
 }
 
 fn report(
     generated: &[u32],
+    prompt_len: u32,
     gamma: f32,
     shifts: u64,
     scored: u64,
     kl_total: f64,
-) -> Result<String> {
+) -> Result<Output> {
     let text = model::decode(generated)?;
     let mean_kl = if scored == 0 {
         0.0
@@ -417,13 +451,17 @@ fn report(
     } else {
         mean_kl
     };
-    let identity = if (gamma - 1.0).abs() < 1e-6 && (shifts > 0 || mean_kl > 1e-3) {
-        " IDENTITY-VIOLATION"
-    } else {
-        ""
-    };
-    Ok(format!(
-        "{text}\n\n[cfg] guidance={gamma:.2} steps={scored} guidance_shift={:.3} mean_kl={mean_kl:.4}{identity}",
-        shifts as f64 / scored.max(1) as f64
-    ))
+    let identity_violation = (gamma - 1.0).abs() < 1e-6 && (shifts > 0 || mean_kl > 1e-3);
+    Ok(Output {
+        sampler: "classifier-free-guidance",
+        text,
+        count: generated.len(),
+        token_ids: generated.to_vec(),
+        prompt_len,
+        guidance: gamma,
+        steps: scored,
+        guidance_shift: shifts as f64 / scored.max(1) as f64,
+        mean_kl,
+        identity_violation,
+    })
 }
