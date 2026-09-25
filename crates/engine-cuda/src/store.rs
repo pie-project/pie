@@ -151,9 +151,10 @@ pub fn tokens_within(max_tokens: u32, floor: u32, room: u64, working: impl Fn(u3
 }
 
 /// The rows a guest program's epilogue holds per lane, each as wide as the
-/// out seam: the logits it reads, and the mask, noise and probability rows
-/// a sampling program derives from them.
-pub const PROGRAM_ROWS_A_LANE: u64 = 4;
+/// out seam: the logits it reads, and the scaled, probability, mask, noise
+/// and Gumbel rows a top-p sampling program derives from them (6292224
+/// bytes a lane at a 262144 vocabulary, measured).
+pub const PROGRAM_ROWS_A_LANE: u64 = 6;
 
 /// What one guest program's scratch takes at the admitted lane count. A
 /// program is registered after the load, so its stride is not known when
