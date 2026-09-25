@@ -92,6 +92,20 @@ pub(crate) fn kv_working_set_ids(
     })
 }
 
+pub(crate) fn rs_working_set_ids(
+    pid: uuid::Uuid,
+    model: usize,
+    engine: usize,
+) -> HashSet<RsWorkingSetId> {
+    with_residency(pid, |residency| {
+        residency
+            .rs_working_sets
+            .iter()
+            .filter_map(|&(m, d, ws)| (m == model && d == engine).then_some(ws))
+            .collect()
+    })
+}
+
 pub(crate) fn kv_suspend_handles(
     pid: uuid::Uuid,
     model: usize,

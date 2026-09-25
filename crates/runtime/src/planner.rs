@@ -204,6 +204,11 @@ pub enum PlannerError {
         total: u32,
         cause: StarveCause,
     },
+    RsHog {
+        need: u32,
+        held: u32,
+        total: u32,
+    },
     Cancelled,
 }
 
@@ -244,6 +249,11 @@ impl std::fmt::Display for PlannerError {
                 } else {
                     "pages"
                 },
+            ),
+            PlannerError::RsHog { need, held, total } => write!(
+                f,
+                "state pool exhausted by this process alone: it holds {held} slots and asks \
+                 {need} more of a {total}-slot pool — raise `[engine] max_state_slots`"
             ),
             PlannerError::Cancelled => f.write_str("planner request cancelled"),
         }
@@ -2010,6 +2020,16 @@ impl ResidencyPlanner {
         if !self.is_wedged() {
             return;
         }
+        // What the head itself holds is not coming back while it waits, so
+        // past that the pool is too small for it, not held by anyone else.
+        let held = match self.with_inner(|inner| inner.queue.get(&key).map(|waiter| waiter.pid)) {
+            Some(pid) => {
+                let (model, engine) = self.port.locus();
+                held_rs_slot_count(pid, model, engine)
+            }
+            None => return,
+        };
+        let hog = demand.rs_slots.saturating_add(held) > total;
         let notify = self.with_inner(|inner| {
             match inner.unmet_head() {
                 Some((head, _)) if head == key => {}
@@ -2025,19 +2045,32 @@ impl ResidencyPlanner {
             if outcome.is_some() {
                 return None;
             }
-            *outcome = Some(Err(PlannerError::Starved {
-                need: demand.rs_slots,
-                free,
-                total,
-                cause: StarveCause::NoRsSlots,
+            *outcome = Some(Err(if hog {
+                PlannerError::RsHog {
+                    need: demand.rs_slots,
+                    held,
+                    total,
+                }
+            } else {
+                PlannerError::Starved {
+                    need: demand.rs_slots,
+                    free,
+                    total,
+                    cause: StarveCause::NoRsSlots,
+                }
             }));
             Some(notify.clone())
         });
         if let Some(notify) = notify {
-            self.stats.starvations.fetch_add(1, Ordering::Relaxed);
+            if hog {
+                self.stats.hog_failures.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.stats.starvations.fetch_add(1, Ordering::Relaxed);
+            }
             tracing::warn!(
                 need = demand.rs_slots,
                 free,
+                held,
                 total,
                 "planner: RS slot pool wedged — failing the head"
             );
@@ -2641,6 +2674,18 @@ fn held_page_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
     })
 }
 
+fn held_rs_slot_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
+    let working_sets = crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine);
+    if working_sets.is_empty() {
+        return 0;
+    }
+    let Some(stores) = crate::store::registry::try_get(model, engine) else {
+        return 0;
+    };
+    let held = stores.rs.lock().unwrap().held_slots(working_sets);
+    u32::try_from(held).unwrap_or(u32::MAX)
+}
+
 fn kv_page_count(
     pid: ProcessId,
     model: usize,
@@ -2852,6 +2897,8 @@ mod starvation_race_tests {
         host: u32,
         pulls: parking_lot::Mutex<Vec<u32>>,
         host_total: u32,
+        // A registered model whose RS store backs the slot calls.
+        rs_model: Option<usize>,
     }
 
     impl RacePool {
@@ -2863,7 +2910,14 @@ mod starvation_race_tests {
                 host: 0,
                 pulls: parking_lot::Mutex::new(Vec::new()),
                 host_total: 0,
+                rs_model: None,
             }
+        }
+
+        fn with_rs<R>(&self, f: impl FnOnce(&mut crate::store::rs::RsStore) -> R) -> Option<R> {
+            let stores = crate::store::registry::get(self.rs_model?, 0);
+            let mut rs = stores.rs.lock().unwrap();
+            Some(f(&mut rs))
         }
 
         fn with_swap(total: u32, host: u32) -> Self {
@@ -2891,7 +2945,8 @@ mod starvation_race_tests {
             (self.host, self.host_total)
         }
         fn rs_stats(&self) -> (u32, u32) {
-            (0, 0)
+            self.with_rs(|rs| (rs.available_slots() as u32, rs.capacity_slots()))
+                .unwrap_or((0, 0))
         }
         fn reclaim_idle(&self) -> u32 {
             0
@@ -2900,7 +2955,7 @@ mod starvation_race_tests {
             self.host_total > 0
         }
         fn locus(&self) -> (usize, usize) {
-            (0, 0)
+            (self.rs_model.unwrap_or(0), 0)
         }
         fn reserve_device(&self, count: u32) -> Option<Vec<PhysicalKvPageId>> {
             let mut free = self.free.lock();
@@ -2927,10 +2982,13 @@ mod starvation_race_tests {
         fn release_device(&self, pages: Vec<PhysicalKvPageId>) {
             self.free.lock().extend(pages);
         }
-        fn reserve_rs(&self, _count: u32) -> Option<Vec<crate::store::rs::RsSlotId>> {
-            Some(Vec::new())
+        fn reserve_rs(&self, count: u32) -> Option<Vec<crate::store::rs::RsSlotId>> {
+            self.with_rs(|rs| rs.reserve_slots(count as usize))
+                .unwrap_or_else(|| Some(Vec::new()))
         }
-        fn release_rs(&self, _slots: Vec<crate::store::rs::RsSlotId>) {}
+        fn release_rs(&self, slots: Vec<crate::store::rs::RsSlotId>) {
+            self.with_rs(|rs| rs.release_slot_reservation(slots));
+        }
     }
 
     #[test]
@@ -3165,5 +3223,71 @@ mod starvation_race_tests {
         assert!(planner.supply_stalled(), "and open again once it lands");
 
         parked.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lane_holding_the_whole_state_pool_is_told_so() {
+        use crate::inferlet::process::residency::{ProcessResidency, register_residency};
+        use crate::store::rs::RsGeometry;
+
+        // One lane holds both slots of a two-slot pool and asks for a third:
+        // nobody else's to come back, so the refusal names the lane (#686).
+        let model = crate::store::registry::register_model(16, &[4], &[2]);
+        let stores = crate::store::registry::get(model, 0);
+        let ws = {
+            let mut rs = stores.rs.lock().unwrap();
+            let ws = rs.create_working_set(RsGeometry {
+                state_size: 64,
+                buffer_page_tokens: 4,
+                fold_granularity: 1,
+            });
+            let folded = rs.prepare_write(ws, true, None).unwrap();
+            let published = rs.publish_prepared(folded).unwrap();
+            rs.settle(published);
+            rs.alloc_buffer(ws, 1).unwrap();
+            let page = rs.prepare_write(ws, false, Some((0, 4))).unwrap();
+            let published = rs.publish_prepared(page).unwrap();
+            rs.settle(published);
+            ws
+        };
+        let pid = ProcessId::new_v4();
+        let residency = Arc::new(std::sync::Mutex::new(ProcessResidency::default()));
+        residency
+            .lock()
+            .unwrap()
+            .rs_working_sets
+            .insert((model, 0, ws));
+        register_residency(pid, Arc::downgrade(&residency));
+
+        let pool = RacePool {
+            rs_model: Some(model),
+            ..RacePool::new(0)
+        };
+        let planner = Arc::new(ResidencyPlanner::new(Arc::new(pool)));
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let error = planner
+            .acquire(
+                pid,
+                pid,
+                Demand {
+                    kv_pages: 0,
+                    rs_slots: 1,
+                },
+            )
+            .await
+            .err()
+            .expect("a pool the lane already holds cannot serve it");
+        assert!(
+            matches!(
+                error,
+                PlannerError::RsHog {
+                    need: 1,
+                    held: 2,
+                    total: 2
+                }
+            ),
+            "{error}"
+        );
     }
 }
