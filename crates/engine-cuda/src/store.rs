@@ -452,6 +452,7 @@ impl Pools {
                     planes,
                     dtype,
                     space,
+                    ..
                 } => {
                     let element = elem_bytes(name, *dtype)?;
                     let cells = paging.pages() * u64::from(paging.page_size);
