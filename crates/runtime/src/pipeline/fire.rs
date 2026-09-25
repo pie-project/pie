@@ -195,6 +195,10 @@ impl KvTxnGuard {
         self.txn.as_ref().map(kv::KvTxn::mapping_version)
     }
 
+    fn seq(&self) -> Option<u64> {
+        self.txn.as_ref().map(kv::KvTxn::seq)
+    }
+
     fn into_inner(mut self) -> Option<kv::KvTxn> {
         self.txn.take()
     }
@@ -564,18 +568,27 @@ fn prepare_host_kv_reserved(
     crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
         let required = host_kv_demand_locked(store, ws, writable.clone(), declaration_realized)
             .map_err(|error| ReservedError::Fatal(format!("pipeline: KV demand: {error}")))?;
-        if required > grant.remaining_kv() {
+        if required > grant.remaining_kv(crate::planner::KvPool::Paged) {
             return Err(ReservedError::Stale);
         }
         let (copies, txn) = if declaration_realized {
             ((Vec::new(), Vec::new()), None)
         } else {
-            kv::realize_declaration_reserved(store, ws.id, writable.clone(), grant.lend_kv())
-                .map_err(|error| {
-                    ReservedError::Fatal(format!("pipeline: KV declaration realization: {error}"))
-                })?
+            kv::realize_declaration_reserved(
+                store,
+                ws.id,
+                writable.clone(),
+                grant.lend_kv(crate::planner::KvPool::Paged),
+            )
+            .map_err(|error| {
+                ReservedError::Fatal(format!("pipeline: KV declaration realization: {error}"))
+            })?
         };
-        if let Err(error) = store.ensure_backed_reserved(ws.id, writable.end, grant.lend_kv()) {
+        if let Err(error) = store.ensure_backed_reserved(
+            ws.id,
+            writable.end,
+            grant.lend_kv(crate::planner::KvPool::Paged),
+        ) {
             if let Some(txn) = txn {
                 kv::abandon(store, txn);
             }
@@ -598,12 +611,16 @@ fn prepare_explicit_kv_reserved(
             kv::prepare_explicit_demand(store, ws.id, write_indexes).map_err(|error| {
                 ReservedError::Fatal(format!("pipeline: device-geometry demand: {error}"))
             })?;
-        if required > grant.remaining_kv() {
+        if required > grant.remaining_kv(crate::planner::KvPool::Paged) {
             return Err(ReservedError::Stale);
         }
-        kv::prepare_explicit_reserved(store, ws.id, write_indexes, grant.lend_kv()).map_err(
-            |error| ReservedError::Fatal(format!("pipeline: device-geometry grant: {error}")),
+        kv::prepare_explicit_reserved(
+            store,
+            ws.id,
+            write_indexes,
+            grant.lend_kv(crate::planner::KvPool::Paged),
         )
+        .map_err(|error| ReservedError::Fatal(format!("pipeline: device-geometry grant: {error}")))
     })
 }
 
@@ -964,6 +981,128 @@ fn stamp_lane_translation(
         lane.kv.translation.clone_from(&table);
     }
     Ok(())
+}
+
+/// The windowed read span and page size of the model's windowed kv spaces,
+/// if it has any.
+fn window_of(stores: &crate::store::registry::Stores) -> Option<(u32, u32)> {
+    crate::store::registry::with_kv_lock(&stores.kv, "host-window", |kv| {
+        kv.window().map(|pool| (pool.tokens, pool.page_size()))
+    })
+}
+
+/// A host fire's lanes as the windowed pool sees them, in the working
+/// set's own page indices.
+fn host_window_lanes(
+    req: &crate::engine::FireRequest,
+    window: Option<(u32, u32)>,
+) -> Vec<crate::store::kv::window::WindowLane<'_>> {
+    let Some((tokens, page_size)) = window else {
+        return Vec::new();
+    };
+    req.lanes
+        .iter()
+        .map(|lane| {
+            crate::store::kv::window::WindowLane::of(
+                &lane.kv.pages,
+                lane.kv.held,
+                u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX),
+                tokens,
+                page_size,
+            )
+        })
+        .collect()
+}
+
+/// The windowed pages a fire asks the planner for, and whether the pool
+/// has that many free now; see `KvStore::window_demand`.
+fn window_demand(
+    stores: &crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+    lanes: &[crate::store::kv::window::WindowLane<'_>],
+    writes: std::ops::Range<u64>,
+) -> Result<(u32, bool), String> {
+    if lanes.is_empty() {
+        return Ok((0, true));
+    }
+    crate::store::registry::with_kv_lock(&stores.kv, "host-window", |kv| {
+        let demand = kv.window_demand(ws, lanes, writes)?;
+        let free = kv.pool_available(crate::planner::KvPool::Windowed);
+        Ok::<_, crate::store::kv::KvStoreError>((demand, demand as usize <= free))
+    })
+    .map_err(|error| format!("pipeline: windowed KV demand: {error}"))
+}
+
+/// Claims from `grant` the windowed pages `lanes` read in the fire of
+/// `epoch`. A grant short of them means the demand went stale.
+fn claim_window(
+    stores: &crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+    lanes: &[crate::store::kv::window::WindowLane<'_>],
+    (copy_src, copy_dst): &kv::PageCopies,
+    grant: &mut crate::planner::AllocationGrant,
+    epoch: Option<u64>,
+) -> Result<Option<crate::store::kv::window::Claimed>, ReservedError> {
+    use crate::store::kv::window::ClaimError;
+    let (Some(epoch), false) = (epoch, lanes.is_empty()) else {
+        return Ok(None);
+    };
+    let copies: Vec<(u32, u32)> = copy_src
+        .iter()
+        .copied()
+        .zip(copy_dst.iter().copied())
+        .collect();
+    crate::store::registry::with_kv_lock(&stores.kv, "host-window", |kv| {
+        let granted = grant.lend_kv(crate::planner::KvPool::Windowed);
+        kv.claim_window(ws, lanes, &copies, granted, epoch)
+            .transpose()
+    })
+    .map_err(|error| match error {
+        ClaimError::Short(_) => ReservedError::Stale,
+        ClaimError::Rewound(why) => ReservedError::Fatal(format!("pipeline: windowed kv: {why}")),
+    })
+}
+
+/// Runs `with` on a device-geometry fire's one windowed lane: the working
+/// set's whole table, since the host does not know the length its lanes
+/// read, so it holds every page it maps.
+fn device_window<R>(
+    stores: &crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+    with: impl FnOnce(
+        &mut crate::store::kv::KvStore,
+        &[crate::store::kv::window::WindowLane<'_>],
+    ) -> Result<R, String>,
+) -> Result<R, String> {
+    crate::store::registry::with_kv_lock(&stores.kv, "host-window", |kv| {
+        let mapped = kv.mapped_len(ws).map_err(|error| error.to_string())?;
+        let pages: Vec<u32> = (0..u32::try_from(mapped).unwrap_or(u32::MAX)).collect();
+        let lane = crate::store::kv::window::WindowLane {
+            pages: &pages,
+            first: 0,
+            end: pages.len(),
+            fresh_from: 0,
+        };
+        with(kv, &[lane])
+    })
+}
+
+/// Hands each lane its windowed ids; a device-geometry fire's lanes all
+/// read the one table they were claimed as.
+fn stamp_lane_window(
+    req: &mut crate::engine::FireRequest,
+    claimed: Option<crate::store::kv::window::Claimed>,
+) {
+    let Some((ids, copies)) = claimed else {
+        return;
+    };
+    let shared = ids.len() == 1;
+    for (at, lane) in req.lanes.iter_mut().enumerate() {
+        lane.kv.window = ids[if shared { 0 } else { at }].clone();
+    }
+    if let Some(lane) = req.lanes.first_mut() {
+        lane.kv.window_copies = copies;
+    }
 }
 
 fn poison_readers(cells: &BoundCells, reason: &str) {
@@ -1385,8 +1524,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
         };
         suppress_defaulted_readout_for_fold(&mut req, readout_defaulted, &rs_plan);
+        let window_lanes = host_window_lanes(&req, window_of(&stores));
         let mut attempts = 0;
-        let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
+        let mut settled_tail = false;
+        let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared, window) = loop {
             let kv_demand = match host_kv_demand(
                 &stores,
                 &ws,
@@ -1401,12 +1542,26 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     "pipeline: KV demand exceeds the planner ABI".to_string()
                 ));
             };
+            let (window_pages, window_free) =
+                match window_demand(&stores, ws.id, &window_lanes, writable_pages.clone()) {
+                    Ok(demand) => demand,
+                    Err(error) => return Ok(Err(error)),
+                };
+            // The pages this sequence's own fires in flight last read come
+            // back when they settle, so settle them before parking on them.
+            if !window_free && !settled_tail {
+                settled_tail = true;
+                if let Err(error) = ctx.settle_pipeline_tail().await {
+                    return Ok(Err(format!("pipeline: settle for windowed kv: {error:#}")));
+                }
+                continue;
+            }
             let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids, &rs_plan) {
                 Ok(demand) => demand,
                 Err(error) => return Ok(Err(error)),
             };
             let demand = crate::planner::Demand {
-                kv_pages: kv_demand,
+                kv_pages: crate::planner::KvPages::new(kv_demand, window_pages),
                 rs_slots: rs_demand,
             };
             let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand).await {
@@ -1439,7 +1594,31 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(ReservedError::Stale) => return Ok(Err(stale_demand_error())),
                 Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
             };
+            let kvtxn = match kvtxn {
+                None if !window_lanes.is_empty() => Some(crate::store::registry::with_kv_lock(
+                    &stores.kv,
+                    "host-window",
+                    kv::read_epoch,
+                )),
+                kvtxn => kvtxn,
+            };
             let kvtxn = KvTxnGuard::new(model, engine, kvtxn);
+            let window = match claim_window(
+                &stores,
+                ws.id,
+                &window_lanes,
+                &copies,
+                &mut grant,
+                kvtxn.seq(),
+            ) {
+                Ok(window) => window,
+                Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
+                    attempts += 1;
+                    continue;
+                }
+                Err(ReservedError::Stale) => return Ok(Err(stale_demand_error())),
+                Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
+            };
             match prepare_bound_rs(
                 ctx,
                 &stores,
@@ -1451,7 +1630,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 &rs_plan,
                 &mut grant,
             )? {
-                Ok(prepared) => break (ws_guard, copies, kvtxn, prepared),
+                Ok(prepared) => break (ws_guard, copies, kvtxn, prepared, window),
                 Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
                     attempts += 1;
                     continue;
@@ -1464,6 +1643,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if let Err(refusal) = map_lane_pages(&mut req, &stores, ws.id) {
             return Ok(Err(refusal));
         }
+        stamp_lane_window(&mut req, window);
         rs_prepared.apply_to(&mut req);
         let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
         let rstxns = RsTxnsGuard::new(model, engine, rs_prepared.txn);
@@ -2333,8 +2513,9 @@ async fn fire_device_geometry<C: FireContext>(
             return Ok(Err(error));
         }
     };
+    let windowed = window_of(&stores).is_some();
     let mut attempts = 0;
-    let (ws_guard, _pages, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
+    let (ws_guard, _pages, (copy_src, copy_dst), kvtxn, rs_prepared, window) = loop {
         let kv_demand =
             match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
                 kv::prepare_explicit_demand(store, ws.id, &write_indexes)
@@ -2365,8 +2546,23 @@ async fn fire_device_geometry<C: FireContext>(
                 return Ok(Err(error));
             }
         };
+        let window_pages = if windowed {
+            match device_window(&stores, ws.id, |kv, lanes| {
+                kv.window_demand(ws.id, lanes, 0..0)
+                    .map_err(|error| error.to_string())
+            }) {
+                // Every page the explicit write backs anew is read too.
+                Ok(demand) => demand.saturating_add(kv_demand),
+                Err(error) => {
+                    reclaim_pending_device_grant(ctx, &fwd);
+                    return Ok(Err(format!("pipeline: windowed KV demand: {error}")));
+                }
+            }
+        } else {
+            0
+        };
         let demand = crate::planner::Demand {
-            kv_pages: kv_demand,
+            kv_pages: crate::planner::KvPages::new(kv_demand, window_pages),
             rs_slots: rs_demand,
         };
         let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand).await {
@@ -2408,6 +2604,39 @@ async fn fire_device_geometry<C: FireContext>(
                 }
             };
         let kvtxn = KvTxnGuard::new(ws.model, ws.engine, Some(kvtxn));
+        let window = if windowed {
+            let claimed = device_window(&stores, ws.id, |kv, lanes| {
+                let granted = grant.lend_kv(crate::planner::KvPool::Windowed);
+                let copies: Vec<(u32, u32)> = copies
+                    .0
+                    .iter()
+                    .copied()
+                    .zip(copies.1.iter().copied())
+                    .collect();
+                Ok(kv
+                    .claim_window(ws.id, lanes, &copies, granted, kvtxn.seq().unwrap_or(0))
+                    .transpose())
+            });
+            match claimed {
+                Ok(Ok(window)) => window,
+                Ok(Err(crate::store::kv::window::ClaimError::Short(_)))
+                    if attempts < STALE_DEMAND_ATTEMPTS =>
+                {
+                    attempts += 1;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    reclaim_pending_device_grant(ctx, &fwd);
+                    return Ok(Err(format!("pipeline: windowed kv: {error}")));
+                }
+                Err(error) => {
+                    reclaim_pending_device_grant(ctx, &fwd);
+                    return Ok(Err(format!("pipeline: windowed kv: {error}")));
+                }
+            }
+        } else {
+            None
+        };
         match prepare_bound_rs(
             ctx,
             &stores,
@@ -2419,7 +2648,7 @@ async fn fire_device_geometry<C: FireContext>(
             &rs_plan,
             &mut grant,
         ) {
-            Ok(Ok(prepared)) => break (ws_guard, pages, copies, kvtxn, prepared),
+            Ok(Ok(prepared)) => break (ws_guard, pages, copies, kvtxn, prepared, window),
             Ok(Err(ReservedError::Stale)) if attempts < STALE_DEMAND_ATTEMPTS => {
                 attempts += 1;
                 continue;
@@ -2591,6 +2820,7 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
     }
+    stamp_lane_window(&mut req, window);
     if ctx
         .resources()
         .get(&fwd)?

@@ -4,20 +4,80 @@ use super::PoolPort;
 use crate::store::kv::page_table::PhysicalKvPageId;
 use crate::store::rs::RsSlotId;
 
+/// A kv page pool, one per page-id space: every full-context kv space
+/// shares the paged ids, and the windowed spaces have their own, held only
+/// while some sequence's window reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvPool {
+    Paged,
+    Windowed,
+}
+
+impl KvPool {
+    pub const ALL: [KvPool; 2] = [KvPool::Paged, KvPool::Windowed];
+}
+
+/// Pages per pool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvPages([u32; 2]);
+
+impl KvPages {
+    #[must_use]
+    pub fn paged(pages: u32) -> Self {
+        KvPages([pages, 0])
+    }
+
+    #[must_use]
+    pub fn new(paged: u32, windowed: u32) -> Self {
+        KvPages([paged, windowed])
+    }
+
+    #[must_use]
+    pub fn is_zero(self) -> bool {
+        self.0 == [0, 0]
+    }
+
+    #[must_use]
+    pub fn saturating_sub(self, have: KvPages) -> KvPages {
+        KvPages(std::array::from_fn(|at| {
+            self.0[at].saturating_sub(have.0[at])
+        }))
+    }
+
+    #[must_use]
+    pub fn covers(self, need: KvPages) -> bool {
+        need.saturating_sub(self).is_zero()
+    }
+}
+
+impl std::ops::Index<KvPool> for KvPages {
+    type Output = u32;
+    fn index(&self, pool: KvPool) -> &u32 {
+        &self.0[pool as usize]
+    }
+}
+
+impl std::ops::IndexMut<KvPool> for KvPages {
+    fn index_mut(&mut self, pool: KvPool) -> &mut u32 {
+        &mut self.0[pool as usize]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Demand {
-    pub kv_pages: u32,
+    pub kv_pages: KvPages,
     pub rs_slots: u32,
 }
 
 impl Demand {
     pub fn is_zero(&self) -> bool {
-        self.kv_pages == 0 && self.rs_slots == 0
+        self.kv_pages.is_zero() && self.rs_slots == 0
     }
 }
 
+/// Pages reserved in each pool, in that pool's own ids.
 pub struct DevicePageReservation {
-    pages: Vec<PhysicalKvPageId>,
+    pages: [Vec<PhysicalKvPageId>; 2],
     port: Option<Arc<dyn PoolPort>>,
 }
 
@@ -36,51 +96,68 @@ impl Default for DevicePageReservation {
 }
 
 impl DevicePageReservation {
-    pub(super) fn new(pages: Vec<PhysicalKvPageId>, port: Arc<dyn PoolPort>) -> Self {
-        Self {
-            pages,
+    pub(super) fn new(pool: KvPool, pages: Vec<PhysicalKvPageId>, port: Arc<dyn PoolPort>) -> Self {
+        let mut reservation = Self {
+            pages: [Vec::new(), Vec::new()],
             port: Some(port),
-        }
+        };
+        reservation.pages[pool as usize] = pages;
+        reservation
     }
 
     pub(super) fn empty() -> Self {
         Self {
-            pages: Vec::new(),
+            pages: [Vec::new(), Vec::new()],
             port: None,
         }
     }
 
-    pub(super) fn len(&self) -> usize {
-        self.pages.len()
+    pub(super) fn len(&self, pool: KvPool) -> usize {
+        self.pages[pool as usize].len()
+    }
+
+    pub(super) fn lens(&self) -> KvPages {
+        let len = |pool: KvPool| u32::try_from(self.len(pool)).unwrap_or(u32::MAX);
+        KvPages::new(len(KvPool::Paged), len(KvPool::Windowed))
     }
 
     pub(super) fn absorb(&mut self, mut other: DevicePageReservation) {
         if self.port.is_none() {
             self.port = other.port.clone();
         }
-        self.pages.append(&mut other.pages);
-    }
-
-    pub(super) fn donate(&mut self, count: usize) -> DevicePageReservation {
-        let n = count.min(self.pages.len());
-        DevicePageReservation {
-            pages: self.pages.drain(..n).collect(),
-            port: self.port.clone(),
+        for pool in KvPool::ALL {
+            self.pages[pool as usize].append(&mut other.pages[pool as usize]);
         }
     }
 
-    pub(super) fn lend(&mut self) -> &mut Vec<PhysicalKvPageId> {
-        &mut self.pages
+    pub(super) fn donate(&mut self, count: KvPages) -> DevicePageReservation {
+        let mut out = DevicePageReservation {
+            pages: [Vec::new(), Vec::new()],
+            port: self.port.clone(),
+        };
+        for pool in KvPool::ALL {
+            let pages = &mut self.pages[pool as usize];
+            let n = (count[pool] as usize).min(pages.len());
+            out.pages[pool as usize] = pages.drain(..n).collect();
+        }
+        out
+    }
+
+    pub(super) fn lend(&mut self, pool: KvPool) -> &mut Vec<PhysicalKvPageId> {
+        &mut self.pages[pool as usize]
     }
 }
 
 impl Drop for DevicePageReservation {
     fn drop(&mut self) {
-        if self.pages.is_empty() {
+        let Some(port) = self.port.take() else {
             return;
-        }
-        if let Some(port) = self.port.take() {
-            port.release_device(std::mem::take(&mut self.pages));
+        };
+        for pool in KvPool::ALL {
+            let pages = std::mem::take(&mut self.pages[pool as usize]);
+            if !pages.is_empty() {
+                port.release_device(pool, pages);
+            }
         }
     }
 }
@@ -149,16 +226,16 @@ impl AllocationGrant {
         self.demand
     }
 
-    pub fn remaining_kv(&self) -> usize {
-        self.kv.pages.len()
+    pub fn remaining_kv(&self, pool: KvPool) -> usize {
+        self.kv.len(pool)
     }
 
     pub fn remaining_rs(&self) -> usize {
         self.rs.slots.len()
     }
 
-    pub fn lend_kv(&mut self) -> &mut Vec<PhysicalKvPageId> {
-        &mut self.kv.pages
+    pub fn lend_kv(&mut self, pool: KvPool) -> &mut Vec<PhysicalKvPageId> {
+        self.kv.lend(pool)
     }
 
     pub fn lend_rs(&mut self) -> &mut Vec<RsSlotId> {

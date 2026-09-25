@@ -122,6 +122,8 @@ pub struct ModelConfig {
 
 pub struct EngineConfig {
     pub total_pages: usize,
+    pub window_pages: u32,
+    pub window_tokens: u32,
     pub cpu_pages: usize,
     pub kv_copy: ::engine::caps::KvCopyDomains,
     pub backend_kind: String,
@@ -311,6 +313,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_rs_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_cache_slots).collect();
+    let arena_windows: Vec<(u32, u32)> = engine_configs
+        .iter()
+        .map(|d| (d.window_tokens, d.window_pages))
+        .collect();
     let arena_max_context: Vec<usize> = engine_configs
         .iter()
         .map(|d| d.limits.max_context)
@@ -342,6 +348,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &arena_rs_slots,
         &arena_max_context,
     );
+    for (engine, &(tokens, pages)) in arena_windows.iter().enumerate() {
+        crate::store::registry::get(arena_model_idx, engine)
+            .kv
+            .lock()
+            .set_window(tokens, kv_page_size as u32, pages);
+    }
 
     crate::planner::init_planner(
         arena_model_idx,
