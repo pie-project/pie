@@ -37,7 +37,6 @@ struct Body {
     stream: bool,
     stream_options: Option<StreamOptions>,
     temperature: Option<f32>,
-    speculative: Option<bool>,
     top_p: Option<f32>,
     top_k: Option<u32>,
     max_tokens: Option<usize>,
@@ -246,9 +245,6 @@ fn parse(body: Value) -> Result<(Request, bool), ApiError> {
     };
     if let Some(t) = body.temperature {
         req.sampling.temperature = t;
-    }
-    if let Some(enabled) = body.speculative {
-        req.sampling.speculative = enabled;
     }
     if let Some(p) = body.top_p {
         req.sampling.top_p = p;

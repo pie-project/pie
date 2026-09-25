@@ -15,20 +15,6 @@ inline float gdn_row_sum(float v) {
   return v;
 }
 
-inline float gdn_packed_dot(
-    const thread float (&a)[16], const thread float (&b)[16]) {
-  #pragma clang fp reassociate(off)
-  float4 p = 0.0f;
-  #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    p.x = fma(a[i], b[i], p.x);
-    p.y = fma(a[4 + i], b[4 + i], p.y);
-    p.z = fma(a[8 + i], b[8 + i], p.z);
-    p.w = fma(a[12 + i], b[12 + i], p.w);
-  }
-  return (p.x + p.y) + (p.z + p.w);
-}
-
 template <typename T, int LANES, int VROWS, int PER>
 inline void gdn_scan_token(
     const device T* qkv,
@@ -56,35 +42,14 @@ inline void gdn_scan_token(
   float k[PER];
   float qs = 0.0f;
   float ks = 0.0f;
-  if constexpr (LANES == 8 && PER == 16) {
-    const device vec<T,4>* qp = reinterpret_cast<const device vec<T,4>*>(qkv + qbase + PER*lane);
-    const device vec<T,4>* kp = reinterpret_cast<const device vec<T,4>*>(qkv + kbase + PER*lane);
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const float4 qv = float4(qp[i]), kv = float4(kp[i]);
-      q[4*i] = qv.x;
-      q[4*i+1] = qv.y;
-      q[4*i+2] = qv.z;
-      q[4*i+3] = qv.w;
-      k[4*i] = kv.x;
-      k[4*i+1] = kv.y;
-      k[4*i+2] = kv.z;
-      k[4*i+3] = kv.w;
-    }
-  } else {
-    for (int i = 0; i < PER; ++i) {
-      const int d = PER * lane + i;
-      const float qv = float(qkv[qbase + size_t(d)]);
-      const float kv = float(qkv[kbase + size_t(d)]);
-      q[i] = qv;
-      k[i] = kv;
-      qs += qv * qv;
-      ks += kv * kv;
-    }
-  }
-  if constexpr (LANES == 8 && PER == 16) {
-    qs = gdn_packed_dot(q, q);
-    ks = gdn_packed_dot(k, k);
+  for (int i = 0; i < PER; ++i) {
+    const int d = PER * lane + i;
+    const float qv = float(qkv[qbase + size_t(d)]);
+    const float kv = float(qkv[kbase + size_t(d)]);
+    q[i] = qv;
+    k[i] = kv;
+    qs += qv * qv;
+    ks += kv * kv;
   }
   const float qinv = metal::rsqrt(gdn_row_sum<LANES>(qs) + 1e-6f) * scale;
   const float kinv = metal::rsqrt(gdn_row_sum<LANES>(ks) + 1e-6f);
@@ -105,7 +70,6 @@ inline void gdn_scan_token(
       st[v][i] *= decay;
       acc += st[v][i] * k[i];
     }
-    if constexpr (LANES == 8 && PER == 16) acc = gdn_packed_dot(st[v], k);
     kv_mem[v] = gdn_row_sum<LANES>(acc);
   }
   for (int v = 0; v < VROWS; ++v) {
@@ -116,7 +80,6 @@ inline void gdn_scan_token(
       st[v][i] += k[i] * delta;
       sum += st[v][i] * q[i];
     }
-    if constexpr (LANES == 8 && PER == 16) sum = gdn_packed_dot(st[v], q);
     sum = gdn_row_sum<LANES>(sum);
     if (lane == 0) {
       y[out + size_t(dv_base + v)] = sum;

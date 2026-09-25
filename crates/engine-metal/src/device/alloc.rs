@@ -49,53 +49,6 @@ impl std::fmt::Debug for Buffer {
 // encoder binding; `Send` only permits the one-time move onto the firing thread.
 unsafe impl Send for Buffer {}
 
-#[derive(Debug)]
-pub(crate) struct DeferredZeroBuffer {
-    buffer: Buffer,
-    initialized: std::cell::Cell<bool>,
-}
-
-impl DeferredZeroBuffer {
-    pub(crate) fn new(device: &super::Context, bytes: u64) -> Result<Self> {
-        #[cfg(target_vendor = "apple")]
-        {
-            let slab = if bytes == 0 {
-                device.empty()
-            } else {
-                device.reserve(bytes)?
-            };
-            Ok(Self {
-                buffer: Buffer {
-                    slab,
-                    bytes,
-                    keep: None,
-                },
-                initialized: std::cell::Cell::new(false),
-            })
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            let _ = (device, bytes);
-            Err(Fault::Deviceless)
-        }
-    }
-
-    pub(crate) fn get(&self) -> Result<&Buffer> {
-        if !self.initialized.get() {
-            let mut buffer = self.buffer.clone();
-            buffer.zero_span(0, buffer.bytes())?;
-            self.initialized.set(true);
-        }
-        Ok(&self.buffer)
-    }
-
-    pub(crate) fn clear(&mut self) -> Result<()> {
-        self.buffer.zero_span(0, self.buffer.bytes())?;
-        self.initialized.set(true);
-        Ok(())
-    }
-}
-
 impl Buffer {
     pub fn zeroed(device: &super::Context, bytes: u64) -> Result<Buffer> {
         #[cfg(target_vendor = "apple")]
@@ -474,32 +427,4 @@ unsafe fn pread_all(fd: std::os::fd::RawFd, dst: *mut u8, from: u64, len: u64) -
         done += got as u64;
     }
     Ok(())
-}
-
-#[cfg(all(test, target_vendor = "apple"))]
-mod deferred_zero_tests {
-    use super::*;
-
-    #[test]
-    fn first_access_clears_dirty_storage_but_later_access_preserves_writes() {
-        let device = crate::device::Context::bind().unwrap();
-        for bytes in [0, 1, 4096, 39731968] {
-            let mut scratch = DeferredZeroBuffer::new(&device, bytes).unwrap();
-            scratch
-                .buffer
-                .write(0, &vec![0xa5; bytes as usize])
-                .unwrap();
-            assert!(!scratch.initialized.get());
-            let mut data = vec![0xff; bytes as usize];
-            scratch.get().unwrap().read(0, &mut data).unwrap();
-            assert!(data.iter().all(|&b| b == 0));
-            let mut live = scratch.get().unwrap().clone();
-            live.write(0, &vec![0x5a; bytes as usize]).unwrap();
-            scratch.get().unwrap().read(0, &mut data).unwrap();
-            assert!(data.iter().all(|&b| b == 0x5a));
-            scratch.clear().unwrap();
-            scratch.get().unwrap().read(0, &mut data).unwrap();
-            assert!(data.iter().all(|&b| b == 0));
-        }
-    }
 }

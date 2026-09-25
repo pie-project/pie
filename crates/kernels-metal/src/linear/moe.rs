@@ -987,7 +987,6 @@ mod tests {
     #[test]
     fn an_mxfp4_bank_reaches_a_tiled_point_with_or_without_a_bias() {
         let bank = Bank {
-            mpp_codes: None,
             codes: Tensor::new(0, 2880, 2880, Dtype::U4g64),
             scales: Tensor::new(1, 2880, 2880 / 32, Dtype::E8m0),
             biases: None,

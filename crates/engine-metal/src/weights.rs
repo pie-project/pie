@@ -215,7 +215,6 @@ impl Weights {
             };
             weight_table.push(Some(match pairings.get(trace.params[at].name.as_str()) {
                 Some(pairing) => WeightRow::Planes(kernels_metal::Bank {
-                    mpp_codes: None,
                     codes: dense(place)?,
                     scales: dense(&places[pairing.scales])?,
                     biases: pairing.biases.map(|at| dense(&places[at])).transpose()?,
@@ -414,72 +413,6 @@ impl Weights {
         Ok(())
     }
 
-    pub fn repack_mpp(&mut self, device: &Context, handles: &Handles, trace: &Trace) -> Result<()> {
-        use crate::device::Pipelines;
-        use crate::encode::Sink;
-        use kernels_metal::encode::{Arg, Encode, Fire, Grid};
-        let tuned = kernels_metal::tuning::current();
-        if !tuned.qmm_mpp {
-            return Ok(());
-        }
-        if self.tier.is_some() || self.rows.is_some() {
-            return Err(Fault::Residency(
-                "MPP packing requires immutable resident weights".into(),
-            ));
-        }
-        let mut dense = vec![false; trace.params.len()];
-        for node in &trace.nodes {
-            if let model_ir::Operation::Linear(
-                model_ir::Linear::Matmul { w, .. } | model_ir::Linear::LmHead { w, .. },
-            ) = &node.op
-                && let model_ir::Def::Weight(at) = trace.values[w.0 as usize].def
-            {
-                dense[at as usize] = true;
-            }
-        }
-        let pipelines = Pipelines::new();
-        for ((param, row), used) in trace.params.iter().zip(&mut self.table.0).zip(dense) {
-            if !used || param.source != ParamSource::Checkpoint {
-                continue;
-            }
-            let Some(WeightRow::Planes(bank)) = row else {
-                continue;
-            };
-            let (n, k) = (bank.codes.rows, bank.codes.width);
-            if bank.bits != 4 || bank.group != 64 || n % 256 != 0 || k % 64 != 0 {
-                continue;
-            }
-            let Some(biases) = bank.biases else { continue };
-            if bank.scales.dtype != Dtype::Bf16 || biases.dtype != Dtype::Bf16 {
-                continue;
-            }
-            let work = n.checked_mul(k / 8).ok_or_else(|| {
-                Fault::Residency("MPP packed bank exceeds the dispatch grid limit".into())
-            })?;
-            let bytes = u64::from(n) * u64::from(k) / 2 + u64::from(n) * u64::from(k / 64) * 4;
-            let buffer = Buffer::zeroed(device, bytes)?;
-            let packed = Tensor::new(handles.bind(&buffer, 0, bytes)?, n, k, Dtype::U4g64);
-            let frame = device.frame()?;
-            let sink = Sink::new(device, &frame, &pipelines, handles);
-            sink.fire(
-                Fire::at("linear/quant_qmm_mpp.metal", "qmm_mpp_pack_bank")
-                    .apply(Grid::of([work, 1, 1], [256, 1, 1])),
-                &[
-                    bank.codes.arg(),
-                    bank.scales.arg(),
-                    biases.arg(),
-                    packed.arg_mut(),
-                    k.arg(),
-                    n.arg(),
-                ],
-            )?;
-            frame.commit()?;
-            bank.mpp_codes = Some(packed);
-            self.decoded.push(buffer);
-        }
-        Ok(())
-    }
-
     pub fn decode_absorbed(
         &mut self,
         device: &Context,
@@ -549,9 +482,7 @@ impl Weights {
 
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.store.bytes()
-            + self.mapped.iter().map(Buffer::bytes).sum::<u64>()
-            + self.decoded.iter().map(Buffer::bytes).sum::<u64>()
+        self.store.bytes() + self.mapped.iter().map(Buffer::bytes).sum::<u64>()
     }
 }
 
@@ -1053,7 +984,6 @@ fn warm(
     for (index, param) in trace.params.iter().enumerate() {
         table.push(Some(match pairings.get(param.name.as_str()) {
             Some(pairing) => WeightRow::Planes(kernels_metal::Bank {
-                mpp_codes: None,
                 codes: row(index)?,
                 scales: row(pairing.scales)?,
                 biases: pairing.biases.map(row).transpose()?,

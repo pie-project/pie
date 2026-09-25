@@ -9,7 +9,6 @@ use eta_exec::{
 use eta_ir::Dtype;
 use eta_ir::op::{IntrinsicId, tags};
 
-use crate::device::alloc::DeferredZeroBuffer;
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
@@ -490,7 +489,7 @@ pub struct Prepared {
     descriptors: Buffer,
     params: Buffer,
     offsets: Buffer,
-    scratch: DeferredZeroBuffer,
+    scratch: Buffer,
     intrinsics: [Option<Slot>; INTRINSIC_SLOTS],
     declared: [Option<Declared>; INTRINSIC_SLOTS],
     channel_count: u32,
@@ -822,7 +821,7 @@ impl Prepared {
         offsets.write(0, &offset_bytes)?;
 
         let scratch_bytes = u64::from(scratch_stride).max(SCRATCH_ALIGN);
-        let scratch = DeferredZeroBuffer::new(device, scratch_bytes)?;
+        let scratch = Buffer::zeroed(device, scratch_bytes)?;
         let status = Buffer::zeroed(device, eta_exec::STATUS_BYTES as u64)?;
 
         let lanes = LaneShape::of(
@@ -927,11 +926,13 @@ impl Prepared {
         if scratch_zeroing_skipped() {
             return Ok(());
         }
-        self.scratch.clear()
+        let bytes = self.scratch.bytes();
+        self.scratch.zero_span(0, bytes)
     }
 
     pub fn zero_scratch(&mut self) -> Result<()> {
-        self.scratch.clear()
+        let bytes = self.scratch.bytes();
+        self.scratch.zero_span(0, bytes)
     }
 
     #[cfg(target_vendor = "apple")]
@@ -939,8 +940,8 @@ impl Prepared {
         if scratch_zeroing_skipped() {
             return Ok(());
         }
-        let scratch = self.scratch.get()?;
-        frame.fill(scratch.slab(), 0, scratch.bytes())?;
+        let bytes = self.scratch.bytes();
+        frame.fill(self.scratch.slab(), 0, bytes)?;
         frame.next_pass()?;
         Ok(())
     }
@@ -1162,7 +1163,7 @@ impl Prepared {
 
     pub fn encode_into(&self, frame: &Frame, region: &Region) -> Result<()> {
         match region.form {
-            Form::Fused => self.encode_fused(frame, region, self.scratch.get()?, 0),
+            Form::Fused => self.encode_fused(frame, region, &self.scratch, 0),
             Form::Streamed => self.encode_streamed(frame, region),
             Form::Grouped | Form::GroupedLibrary => self.encode_grouped(frame, region),
         }
@@ -1200,7 +1201,7 @@ impl Prepared {
                 encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
                 encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
                 encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.get()?.raw()), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
                 encoder.setBuffer_offset_atIndex(Some(grouped.bindings.raw()), 0, 6);
                 encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
@@ -1371,7 +1372,7 @@ impl Prepared {
                 encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
                 encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
                 encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.get()?.raw()), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
                 encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
                 encoder.setBuffer_offset_atIndex(Some(grouped.bindings.raw()), 0, 6);
                 encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);

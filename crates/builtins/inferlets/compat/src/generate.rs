@@ -23,7 +23,6 @@ use inferlet::mask::unpack_mask;
 /// no truncation, no penalties.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sampling {
-    pub speculative: bool,
     pub temperature: f32,
     pub top_p: f32,
     /// 0 means off.
@@ -38,7 +37,6 @@ pub struct Sampling {
 impl Default for Sampling {
     fn default() -> Self {
         Self {
-            speculative: false,
             temperature: 1.0,
             top_p: 1.0,
             top_k: 0,
@@ -156,18 +154,6 @@ pub async fn generate(
     sampling.validate()?;
     if max_tokens == 0 {
         return Ok(0);
-    }
-    if sampling.speculative
-        && sampling.temperature == 0.0
-        && !sampling.penalized()
-        && matcher.is_none()
-        && !prompt.is_empty()
-        && let Some(draft) = model::draft_block()
-        && !draft.bidirectional
-        && draft.proposals_from == 1
-        && (2..=16).contains(&draft.rows)
-    {
-        return crate::speculative::generate(prompt, max_tokens, draft, on_token).await;
     }
     let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
         model::ForwardKind::Attention => Vec::new(),

@@ -102,24 +102,6 @@ pub struct Scratch {
     routers: Vec<u32>,
 }
 
-fn split_partial_room(precast: Option<Room>, width: u64, mpp: bool) -> Room {
-    let mut at = if mpp {
-        precast.map_or(0, |room| room.at + room.bytes())
-    } else {
-        0
-    };
-    Room::lay(
-        &mut at,
-        if mpp {
-            32 * SPLITK_MAX
-        } else {
-            SPLITK_ROWS * SPLITK_MAX
-        },
-        width,
-        Dtype::F32,
-    )
-}
-
 impl Scratch {
     pub fn reserve(
         device: &Context,
@@ -195,12 +177,14 @@ impl Scratch {
                 let (Ok(n), Ok(k)) = (i32::try_from(n), i32::try_from(k)) else {
                     return false;
                 };
-                quant::splitk(n, 8, 8, k, 32, 4) > 1 || (tuning.qmm_mpp && n <= 65536)
+                quant::splitk(n, 8, 8, k, 32, 4) > 1
             })
             .map(|&(n, _)| u64::from(n))
             .max()
-            .map(|n| split_partial_room(precast, n, tuning.qmm_mpp));
-
+            .map(|n| {
+                let mut at = 0u64;
+                Room::lay(&mut at, SPLITK_ROWS * SPLITK_MAX, n, Dtype::F32)
+            });
         let routed = (sorted > 0).then(|| {
             let mut at = 0u64;
             Routed {
@@ -577,22 +561,4 @@ fn routers(trace: &Trace) -> Vec<u32> {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mpp_partials_do_not_overwrite_live_input_sums() {
-        for rows in [8, 32, 64, 2048] {
-            for width in [512, 5120, 17408] {
-                let precast = Room::lay(&mut 0, rows, width, Dtype::F16);
-                let partial = split_partial_room(Some(precast), 34816, true);
-                assert!(partial.at >= precast.at + precast.bytes());
-                assert_eq!(partial.at % ALIGN, 0);
-                assert!(partial.rows >= 64 * 4);
-            }
-        }
-    }
 }

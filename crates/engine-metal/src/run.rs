@@ -81,8 +81,6 @@ pub struct FireBindings {
 
     pub readout_rows: Tensor,
 
-    pub readout_indptr: Vec<u32>,
-
     pub nan_flags: Option<Tensor>,
 
     pub patches: Option<Tensor>,
@@ -383,9 +381,7 @@ impl<'c> Run<'c> {
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
             Some(Dim::Lanes) => (window.lane_offset, window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
-            Some(Dim::Readouts) => {
-                readout_span(&self.fire.readout_indptr, window.lane_offset, window.lanes)
-            }
+            Some(Dim::Readouts) => return handle,
             Some(Dim::Const(_)) | None => return handle,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
@@ -840,29 +836,5 @@ impl<'c> Run<'c> {
                 id.0
             ),
         }
-    }
-}
-
-fn readout_span(indptr: &[u32], lane_offset: u32, lanes: u32) -> (u32, u32) {
-    let first = indptr[lane_offset as usize];
-    let end = indptr[(lane_offset + lanes) as usize];
-    (first, end - first)
-}
-
-#[cfg(test)]
-mod readout_tests {
-    use super::readout_span;
-    #[test]
-    fn lane_windows_preserve_readout_order_and_duplicates() {
-        let rows = [0, 512, 1, 1, 520, 515];
-        let indptr = [0, 4, 6];
-        let select = |lane, count| {
-            let (first, rows_count) = readout_span(&indptr, lane, count);
-            &rows[first as usize..(first + rows_count) as usize]
-        };
-        assert_eq!(select(0, 1), &[0, 512, 1, 1]);
-        assert_eq!(select(1, 1), &[520, 515]);
-        assert_eq!(select(0, 2), &rows);
-        assert!(select(2, 0).is_empty());
     }
 }

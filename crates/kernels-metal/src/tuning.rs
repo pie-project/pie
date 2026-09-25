@@ -44,12 +44,9 @@ pub struct DeviceTuning {
 
     pub fp16_qmm: bool,
 
-    pub qmm_mpp: bool,
-
     pub sdpa_tile_min_rows_per_request: u32,
 
     pub sdpa_mma: bool,
-    pub sdpa_mpp: bool,
 
     pub gdn_scan_lanes: u32,
 
@@ -77,10 +74,8 @@ impl Default for DeviceTuning {
             moe_tile_wide_per: 1 << 24,
             qmm_wide_range: false,
             fp16_qmm: true,
-            qmm_mpp: false,
             sdpa_tile_min_rows_per_request: 32,
             sdpa_mma: true,
-            sdpa_mpp: false,
             gdn_scan_lanes: 32,
             gdn_scan_rows: 4,
             moe_batch_min_per_expert: 2,
@@ -125,10 +120,8 @@ impl DeviceTuning {
             moe_tile_wide_per,
             qmm_wide_range,
             fp16_qmm,
-            qmm_mpp,
             sdpa_tile_min_rows_per_request,
             sdpa_mma,
-            sdpa_mpp,
             gdn_scan_lanes,
             gdn_scan_rows,
             moe_batch_min_per_expert,
@@ -168,10 +161,8 @@ pub struct Overrides {
     pub moe_tile_wide_per: Option<u32>,
     pub qmm_wide_range: Option<bool>,
     pub fp16_qmm: Option<bool>,
-    pub qmm_mpp: Option<bool>,
     pub sdpa_tile_min_rows_per_request: Option<u32>,
     pub sdpa_mma: Option<bool>,
-    pub sdpa_mpp: Option<bool>,
     pub gdn_scan_lanes: Option<u32>,
     pub gdn_scan_rows: Option<u32>,
     pub moe_batch_min_per_expert: Option<u32>,

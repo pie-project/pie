@@ -783,7 +783,6 @@ mod tests {
 
     fn u4_bank(vocab: u32, width: u32) -> Bank {
         Bank {
-            mpp_codes: None,
             codes: Tensor::new(10, vocab, width / 8, Dtype::U32),
             scales: Tensor::new(11, vocab, width / 32, Dtype::Bf16),
             biases: Some(Tensor::new(12, vocab, width / 32, Dtype::Bf16)),
