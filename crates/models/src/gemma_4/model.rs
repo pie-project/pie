@@ -570,6 +570,10 @@ impl Model {
             Dtype::U4g64 => Dtype::U8g64,
             other => other,
         };
+        let proj = match w {
+            Dtype::U4g64 => Dtype::U4g64tiled,
+            other => other,
+        };
         let q_heads = d.q_heads / tp;
         let kv_heads = d.kv_heads / tp;
         let global_kv_heads = d.global_kv_heads / tp;
@@ -636,11 +640,11 @@ impl Model {
                         kv: format!("kv.{}", owner(l)),
                         banks: if shared_at(l) {
                             AttnBanks::Shared {
-                                q_proj: Weight::sym(n("q_proj"), [q_w, hidden], w).columns(),
+                                q_proj: Weight::sym(n("q_proj"), [q_w, hidden], proj).columns(),
                             }
                         } else {
                             AttnBanks::Owned {
-                                qkv: Weight::sym(n("qkv"), [q_w + 2 * kv_w, hidden], w)
+                                qkv: Weight::sym(n("qkv"), [q_w + 2 * kv_w, hidden], proj)
                                     .packed([q_w, kv_w, kv_w]),
                                 k_norm: norm("k_norm", hd),
                                 k_norm_eps: d.norm_eps,
@@ -648,7 +652,7 @@ impl Model {
                         },
                         reading,
                     },
-                    o_proj: Weight::sym(n("o_proj"), [hidden, q_w], w).rows(),
+                    o_proj: Weight::sym(n("o_proj"), [hidden, q_w], proj).rows(),
                     attn_norm: norm("attn_norm", hidden),
                     attn_norm_eps: d.norm_eps,
                     post_attn_norm: norm("post_attn_norm", hidden),
@@ -657,9 +661,9 @@ impl Model {
                     pre_ffw_norm_eps: d.norm_eps,
                     post_ffw_norm: norm("post_ffw_norm", hidden),
                     post_ffw_norm_eps: d.norm_eps,
-                    gate_up: Weight::sym(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
+                    gate_up: Weight::sym(n("gate_up"), [2 * iw, hidden], proj).packed([iw, iw]),
                     inter: intermediate,
-                    down: Weight::sym(n("down"), [hidden, iw], w).rows(),
+                    down: Weight::sym(n("down"), [hidden, iw], proj).rows(),
                     scalar: d
                         .ple_dim
                         .is_none()
