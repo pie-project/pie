@@ -213,10 +213,9 @@ impl pie::inferlet::model::Host for ProcessCtx {
 
     async fn prefill_chunk_hint(&mut self) -> Result<u32> {
         let budget = crate::engine::get_spec(0)?.limits.max_forward_tokens;
-        let live = crate::inferlet::process::live_count().max(1);
-        let page = (model::model().kv_page_size() as usize).max(1);
-        let share = (budget / live) / page * page;
-        Ok(share.clamp(page.min(budget.max(1)), budget.max(1)) as u32)
+        let live = crate::inferlet::process::live_count();
+        let page = model::model().kv_page_size() as usize;
+        Ok(prefill_share(budget, live, page))
     }
 
     async fn rs_state_size(&mut self) -> Result<u64> {
@@ -233,5 +232,24 @@ impl pie::inferlet::model::Host for ProcessCtx {
 
     async fn arena_block_size(&mut self) -> Result<u64> {
         Ok(crate::store::registry::get(0, 0).kv_page_size as u64)
+    }
+}
+
+// A step spends one row on each other live lane's decode, so a prefill chunk
+// gets the rest of the forward budget; chunks that overflow a wave are
+// deferred by the frame seal, not split into more passes.
+fn prefill_share(budget: usize, live: usize, page: usize) -> u32 {
+    let page = page.max(1);
+    let share = budget.saturating_sub(live.saturating_sub(1)) / page * page;
+    share.clamp(page.min(budget.max(1)), budget.max(1)) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_prefill_chunk_keeps_the_budget_the_decoding_lanes_leave() {
+        assert_eq!(super::prefill_share(8192, 256, 16), 7936);
+        assert_eq!(super::prefill_share(8192, 1, 16), 8192);
+        assert_eq!(super::prefill_share(1024, 4096, 16), 16);
     }
 }
