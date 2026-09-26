@@ -168,6 +168,7 @@ fn the_grouped_mxfp4_select_answers_the_per_route_one_every_case() {
     the_token_read_leg_without_a_bias_agrees();
     the_route_read_leg_with_a_bias_agrees();
     a_rectangle_that_divides_neither_tile_agrees();
+    a_row_longer_than_two_blocks_a_lane_agrees();
     the_gpt_oss_legs_are_priced();
     the_fp32_form_agrees_at_both_readings();
     the_fp32_form_agrees_on_a_ragged_rectangle();
@@ -191,6 +192,10 @@ fn the_route_read_leg_with_a_bias_agrees() {
 
 fn a_rectangle_that_divides_neither_tile_agrees() {
     check(48, 200, 160, true, true);
+}
+
+fn a_row_longer_than_two_blocks_a_lane_agrees() {
+    check(24, 96, 2240, true, true);
 }
 
 fn price(n: usize, k: usize, by_token: bool, label: &str) {
