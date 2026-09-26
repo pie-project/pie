@@ -73,7 +73,7 @@ fn check(
         top_k,
         by_token,
         seed,
-        tokens * top_k >= 16,
+        tokens * top_k > 80,
     );
 }
 

@@ -1641,11 +1641,30 @@ __global__ void moe_matmul_select_mlxu4_wmma(
 #endif
 }
 
+template <int kW>
+struct CodeChunk {
+    unsigned w[kW];
+};
+
+template <int kW>
+__device__ __forceinline__ CodeChunk<kW> load_code_chunk(const unsigned* at) {
+    CodeChunk<kW> c;
+    if constexpr (kW == 4) {
+        const uint4 v = *reinterpret_cast<const uint4*>(at);
+        c.w[0] = v.x; c.w[1] = v.y; c.w[2] = v.z; c.w[3] = v.w;
+    } else if constexpr (kW == 2) {
+        const uint2 v = *reinterpret_cast<const uint2*>(at);
+        c.w[0] = v.x; c.w[1] = v.y;
+    } else {
+        c.w[0] = *at;
+    }
+    return c;
+}
+
 template <class T, int kBits, int kGroup, int kRowsT>
 __global__ void moe_matmul_select_mlxu4(
     const T* __restrict__ act,
     const i32* __restrict__ routes,
-    const i32* __restrict__ order,
     const u8* __restrict__ codes,
     const u8* __restrict__ scales,
     const u8* __restrict__ biases,
@@ -1662,6 +1681,12 @@ __global__ void moe_matmul_select_mlxu4(
     constexpr int kPerWord = 32 / kBits;
     constexpr unsigned kMask = (1u << kBits) - 1u;
     constexpr int kWordsPerGroup = kGroup / kPerWord;
+    // A lane takes up to 16 bytes of one group's codes per load, and kU of
+    // those chunks for every row before it computes, so the codes stream.
+    constexpr int kW = kWordsPerGroup < 4 ? kWordsPerGroup : 4;
+    constexpr int kChunk = kW * kPerWord;
+    constexpr int kU = 2;
+    static_assert(kChunk % 8 == 0, "a chunk's activations are whole 16-byte loads");
     const int route = blockIdx.x;
 
     if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
@@ -1678,6 +1703,7 @@ __global__ void moe_matmul_select_mlxu4(
 
     const int groups_per_row = k / kGroup;
     const int words_per_row = k / kPerWord;
+    const int chunks = k / kChunk;
 
     const u8* codes_at = codes;
     const u8* scales_at = scales;
@@ -1697,6 +1723,7 @@ __global__ void moe_matmul_select_mlxu4(
         biases_at + static_cast<long long>(expert) * n * groups_per_row * 2);
 
     const T* x = act + static_cast<long long>(plane_route / act_div) * k;
+    const uint4* x4 = reinterpret_cast<const uint4*>(x);
 
     int row_of[kRows];
 #pragma unroll
@@ -1706,41 +1733,58 @@ __global__ void moe_matmul_select_mlxu4(
 #pragma unroll
     for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
 
-    for (int g = lane_id; g < groups_per_row; g += 32) {
-
-        float part[kRows];
+    for (int c0 = lane_id; c0 < chunks; c0 += 32 * kU) {
+        CodeChunk<kW> ww[kU][kRows];
+        bf16 sv[kU][kRows];
+        bf16 bv[kU][kRows];
 #pragma unroll
-        for (int r = 0; r < kRows; ++r) part[r] = 0.f;
-        float xsum = 0.f;
-
-#pragma unroll
-        for (int q = 0; q < kWordsPerGroup; ++q) {
-            float xv[kPerWord];
-#pragma unroll
-            for (int j = 0; j < kPerWord; ++j) {
-                xv[j] = Elem<T>::to_f32(x[g * kGroup + q * kPerWord + j]);
-                xsum += xv[j];
-            }
+        for (int u = 0; u < kU; ++u) {
+            const int c = min(c0 + 32 * u, chunks - 1);
+            const int g = c * kChunk / kGroup;
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
-                const unsigned word =
-                    w32[static_cast<long long>(row_of[r]) * words_per_row
-                        + g * kWordsPerGroup + q];
-#pragma unroll
-                for (int j = 0; j < kPerWord; ++j) {
-                    const float code = static_cast<float>((word >> (kBits * j)) & kMask);
-                    part[r] = fmaf(code, xv[j], part[r]);
-                }
+                ww[u][r] = load_code_chunk<kW>(
+                    w32 + static_cast<long long>(row_of[r]) * words_per_row + c * kW);
+                const long long fx = static_cast<long long>(row_of[r]) * groups_per_row + g;
+                sv[u][r] = s16[fx];
+                bv[u][r] = b16[fx];
             }
         }
 #pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-            const long long fx =
-                static_cast<long long>(row_of[r]) * groups_per_row + g;
-            const float sv = Elem<bf16>::to_f32(s16[fx]);
-            const float bv = Elem<bf16>::to_f32(b16[fx]);
-            acc[r] = fmaf(part[r], sv, acc[r]);
-            acc[r] = fmaf(xsum, bv, acc[r]);
+        for (int u = 0; u < kU; ++u) {
+            const int c = c0 + 32 * u;
+            if (c >= chunks) break;
+            float part[kRows];
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) part[r] = 0.f;
+            float xsum = 0.f;
+#pragma unroll
+            for (int v = 0; v < kChunk / 8; ++v) {
+                const uint4 xq = x4[(c * kChunk) / 8 + v];
+                const T* xe = reinterpret_cast<const T*>(&xq);
+                float xv[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    xv[j] = Elem<T>::to_f32(xe[j]);
+                    xsum += xv[j];
+                }
+#pragma unroll
+                for (int r = 0; r < kRows; ++r) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int e = v * 8 + j;
+                        const unsigned word = ww[u][r].w[e / kPerWord];
+                        const float code =
+                            static_cast<float>((word >> (kBits * (e % kPerWord))) & kMask);
+                        part[r] = fmaf(code, xv[j], part[r]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                acc[r] = fmaf(part[r], Elem<bf16>::to_f32(sv[u][r]), acc[r]);
+                acc[r] = fmaf(xsum, Elem<bf16>::to_f32(bv[u][r]), acc[r]);
+            }
         }
     }
 #pragma unroll
