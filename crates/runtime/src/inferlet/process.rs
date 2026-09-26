@@ -329,10 +329,10 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         }
         None => None,
     };
-    ctx.admit_execution(permit, duration_us(started.elapsed()));
     if let Some(planner) = crate::planner::planner() {
-        planner.note_admitted(ctx.id());
+        planner.admit(ctx.id()).await;
     }
+    ctx.admit_execution(permit, duration_us(started.elapsed()));
 }
 
 pub fn spawn(
