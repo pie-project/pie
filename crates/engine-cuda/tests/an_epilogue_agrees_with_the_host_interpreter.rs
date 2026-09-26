@@ -176,7 +176,7 @@ fn device_outputs(
     logits: Option<&[f32]>,
     channels: &[u32],
 ) -> Vec<Vec<u8>> {
-    let context = Context::bind(0, core::ptr::null_mut()).expect("a CUDA context");
+    let context = Context::bind(0, None).expect("a CUDA context");
     let stages = compile_bound(bound);
     let launch = eta_compiler::codegen::launch::build(bound, &stages);
     let backend = Backend::parse("cuda").expect("the cuda backend");

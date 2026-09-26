@@ -76,7 +76,7 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn bind(ordinal: i32, comm: *mut c_void) -> Result<Context> {
+    pub fn bind(ordinal: i32, comm: Option<&crate::comm::Comm>) -> Result<Context> {
         #[cfg(feature = "cuda")]
         {
             use cudarc::cublas::sys as blas;
@@ -125,12 +125,15 @@ impl Context {
                 let slabs = Slabs::open();
                 slabs.attach(stream);
                 let ctx = Ctx::on(stream).with_cublas(cublas).with_slabs(slabs);
-                // SAFETY: `comm` is the rank's live communicator (or null),
-                // owned by the boot for as long as this shell fires on it.
-                let ctx = if comm.is_null() {
-                    ctx
-                } else {
-                    ctx.with_comm(comm)
+                // SAFETY: `comm` is the rank's live communicator, and its peer
+                // stages live as long, owned by the boot for as long as this
+                // shell fires on it.
+                let ctx = match comm {
+                    None => ctx,
+                    Some(comm) => match comm.peers() {
+                        None => ctx.with_comm(comm.raw()),
+                        Some(peers) => ctx.with_comm(comm.raw()).with_peers(peers),
+                    },
                 };
                 let device = Device::probe(&ctx).unwrap_or(Device::L40S);
                 Ok(Context {

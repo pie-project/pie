@@ -528,7 +528,7 @@ intended for diagnostics, not serving",
                 .boot
                 .comm
                 .as_ref()
-                .map_or(core::ptr::null_mut(), |comm| comm.raw()),
+                .map_or(core::ptr::null(), Arc::as_ptr),
         })
         .map_err(fault)?;
 
