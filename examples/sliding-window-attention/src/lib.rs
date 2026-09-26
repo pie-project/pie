@@ -141,66 +141,66 @@ async fn main(input: Input) -> Result<Output> {
         .context("reserve sliding-window KV")?;
     let pool_ids = slots.ids().to_vec();
 
-    let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
-    let prefill_slots =
-        Channel::from_iter((0..n).map(|position| pool_ids[(position / page_t) as usize]));
-    let prefill_offsets = Channel::from_iter((0..n).map(|position| position % page_t));
-    let prefill_klen = Channel::from([n]);
-    let prefill_pages = Channel::from(pool_ids.clone());
-    // The page CSR is the wire's source of truth for kv_len: the engine derives
-    // `kv_len = (page_count-1)*page_t + last_page_len`. A pool-wide constant page
-    // count claims a kv length the pass does not have and silently corrupts
-    // attention, so the count must track `kv_len` exactly.
-    let prefill_indptr = Channel::from([0u32, n.div_ceil(page_t)]);
-    let causal = Channel::from_shaped(
-        [n, pool_len],
-        (0..n)
-            .flat_map(|query| (0..pool_len).map(move |key| key <= query))
-            .collect::<Vec<_>>(),
-    );
-    let prefill_positions = Channel::from_iter(0..n);
-    let prefill_embed_indptr = Channel::from([0u32, n]);
-    let first_out = Channel::new([1], dtype::i32).named("first_token");
-
-    let prefill = ForwardPass::new();
-    prefill.embed(&prompt_tokens, &prefill_embed_indptr)?;
-    // Never buffered: every fire folds straight into the recurrence.
-    prefill.attention(
-        Some(KvBinding {
-            working_set: &ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &prefill_klen,
-                pages: &prefill_pages,
-                page_indptr: &prefill_indptr,
-                w_slot: &prefill_slots,
-                w_off: &prefill_offsets,
-                positions: &prefill_positions,
-                mask: Some(&causal),
-            },
-        }),
-        &rs_ws,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
-    prefill.epilogue(move || {
-        first_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
-    });
-
-    // ONE pipeline for the whole stream (R4-4): prefill and decode are one
-    // sequential stream. The host round-trip on `first` stays — its take
-    // seeds the decode channels below.
+    // The prompt is prefilled in `prefill_chunks` spans: one pass over it
+    // is refused once it outgrows the engine's `max_embed_length()`.
     let pipeline = Pipeline::new();
-    prefill
-        .submit(&pipeline)
-        .context("sliding-window prefill")?;
-    if input.max_tokens == 1 {
-        pipeline.close();
+    let mut first = 0u32;
+    for (base, end) in prefill_chunks(n, None) {
+        let len = end - base;
+        let tokens = Channel::from_iter(
+            prompt[base as usize..end as usize]
+                .iter()
+                .map(|&t| t as i32),
+        );
+        let embed_indptr = Channel::from([0u32, len]);
+        let positions = Channel::from_iter(base..end);
+        let slots = Channel::from_iter((base..end).map(|p| pool_ids[(p / page_t) as usize]));
+        let offsets = Channel::from_iter((base..end).map(|p| p % page_t));
+        let klen = Channel::from([end]);
+        let pages = Channel::from(pool_ids.clone());
+        // The page CSR is the wire's source of truth for kv_len: the engine
+        // derives `kv_len = (page_count-1)*page_t + last_page_len`, so the
+        // count must track `kv_len` exactly.
+        let page_indptr = Channel::from([0u32, end.div_ceil(page_t)]);
+        let causal = Channel::from_shaped(
+            [len, pool_len],
+            (base..end)
+                .flat_map(|query| (0..pool_len).map(move |key| key <= query))
+                .collect::<Vec<_>>(),
+        );
+        let first_out = Channel::new([1], dtype::i32).named("first_token");
+
+        let prefill = ForwardPass::new();
+        prefill.embed(&tokens, &embed_indptr)?;
+        prefill.attention(
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &klen,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &slots,
+                    w_off: &offsets,
+                    positions: &positions,
+                    mask: Some(&causal),
+                },
+            }),
+            &rs_ws,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
+            },
+        )?;
+        prefill.epilogue(move || {
+            first_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+        });
+        prefill
+            .submit(&pipeline)
+            .with_context(|| format!("sliding-window-attention prefill @{base}"))?;
+        first = first_out.take_host::<i32>().await? as u32;
     }
-    let first = first_out.take_host::<i32>().await? as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
