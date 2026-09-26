@@ -794,6 +794,23 @@ impl KvPageTable {
         }
     }
 
+    pub fn lease_prefix(&mut self, ws: WorkingSetId, pages: u64) -> Result<(), KvTableError> {
+        let entry = self.entry(ws)?;
+        let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);
+        if pages == 0 || pages > mapped_len {
+            return Err(KvTableError::BadRange {
+                start: 0,
+                end: pages,
+                mapped_len,
+                page_len,
+            });
+        }
+        let segs = self.segments(terminal, mapped_len);
+        let node = self.boundary_terminal(&segs, pages);
+        self.lease_cache_root(node);
+        Ok(())
+    }
+
     pub fn release_cache_root(&mut self, node: NodeId) -> Vec<KvPageBacking> {
         let mut remove = false;
         if let Some(count) = self.cache_roots.get_mut(&node) {

@@ -81,6 +81,7 @@ fn tests_every_case() {
     path_hash_is_none_while_any_contributing_page_hash_is_pending();
     store_explicit_index_roundtrip_remove_preserves_loaded_working_set();
     standing_translation_publishes_immutable_mapping_snapshots();
+    published_prefix_is_adopted_by_its_tokens_and_outlives_its_writer();
 }
 
 fn publish_lookup_flatten_roundtrip() {
@@ -288,4 +289,48 @@ fn standing_translation_publishes_immutable_mapping_snapshots() {
     assert!(v2 > v1);
     assert_eq!(shortened.as_ref(), &[ids[0].0]);
     assert_eq!(mapped.len(), 2, "an in-flight reader keeps the old table");
+}
+
+fn published_prefix_is_adopted_by_its_tokens_and_outlives_its_writer() {
+    use crate::pipeline::fire::kv::match_prefix;
+    let mut store = KvStore::new(4, h(42));
+    let writer = store.create_working_set();
+    let ids = commit_fresh(&mut store, writer, 3, 1);
+    assert_eq!(
+        store
+            .publish_prefix(writer, h(7), &[1, 2, 3, 4, 5], 2)
+            .unwrap(),
+        2
+    );
+    store.release_working_set(writer, store.current_epoch());
+    store.retire_idle();
+    assert_eq!(
+        store.available_pages(),
+        2,
+        "the published pages outlive their writer"
+    );
+
+    let full = store.create_working_set();
+    assert_eq!(
+        match_prefix(&mut store, full, Some(h(7)), &[1, 2, 3, 4, 7], 2).unwrap(),
+        Some(2)
+    );
+    assert_eq!(store.lookup(full, 1).unwrap(), ids[1]);
+    let partial = store.create_working_set();
+    assert_eq!(
+        match_prefix(&mut store, partial, Some(h(7)), &[1, 2, 9, 4, 7], 2).unwrap(),
+        Some(1)
+    );
+    let miss = store.create_working_set();
+    assert_eq!(
+        match_prefix(&mut store, miss, Some(h(8)), &[1, 2, 3, 4, 5], 2).unwrap(),
+        None
+    );
+
+    for ws in [full, partial, miss] {
+        store.release_working_set(ws, store.current_epoch());
+    }
+    store.drop_unused_cache_leases(store.current_epoch());
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 4);
 }
