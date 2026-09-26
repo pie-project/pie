@@ -136,7 +136,7 @@ pub fn lane_of(slot: u32, tokens: Vec<u32>, held: u32, pages: Vec<u32>) -> Lane 
         kv: KvDelta {
             held,
             pages,
-            translation: Vec::new(),
+            ..Default::default()
         },
         ..Lane::default()
     }

@@ -26,7 +26,7 @@ pub struct KvSpace(pub u32);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HybridSpec {
     pub rows: Vec<CacheRow>,
-    dtypes: Vec<Dtype>,
+    dtypes: Vec<(Dtype, Option<u32>)>,
 }
 
 impl HybridSpec {
@@ -36,7 +36,15 @@ impl HybridSpec {
     }
 
     pub fn kv_space(&mut self, dtype: Dtype) -> KvSpace {
-        self.dtypes.push(dtype);
+        self.dtypes.push((dtype, None));
+        KvSpace(self.dtypes.len() as u32 - 1)
+    }
+
+    /// A space whose rows are only ever read through a sliding window of
+    /// `window` tokens, so an engine may keep just that tail of each
+    /// sequence in it.
+    pub fn windowed_kv_space(&mut self, dtype: Dtype, window: u32) -> KvSpace {
+        self.dtypes.push((dtype, Some(window)));
         KvSpace(self.dtypes.len() as u32 - 1)
     }
 
@@ -46,7 +54,7 @@ impl HybridSpec {
         name: impl Into<String>,
         planes: impl IntoIterator<Item = u64>,
     ) {
-        let dtype = *self
+        let (dtype, window) = *self
             .dtypes
             .get(space.0 as usize)
             .unwrap_or_else(|| panic!("kv space {} is not one this spec declared", space.0));
@@ -55,6 +63,7 @@ impl HybridSpec {
             planes: planes.into_iter().collect(),
             dtype,
             space: space.0,
+            window,
         });
     }
 

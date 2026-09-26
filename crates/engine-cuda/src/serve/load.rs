@@ -108,7 +108,14 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     };
     let asked_tokens = boot.budget.max_tokens;
     let floor = boot.budget.max_lanes.max(TOKENS_FLOOR).min(asked_tokens);
+    let window = crate::store::window_of(&boot.trace)?;
     let working_at = |tokens: u32| -> u64 {
+        let windowed = Paging::of(boot.page_size, boot.context, boot.slots, 1)
+            .ok()
+            .and_then(|paging| {
+                crate::store::window_fire_bytes(&boot.trace, paging.windowed(window, tokens)).ok()
+            })
+            .unwrap_or(u64::MAX);
         let budget = budget_at(tokens);
         let Ok(compiled) =
             model_compiler::compile_axes(&boot.trace, &budgets_at(&budget), &profile)
@@ -124,12 +131,14 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 &device.device(),
                 &crate::exports::schedule_streams(&boot.trace, &compiled),
             ))
+            .saturating_add(windowed)
     };
     let tokens = crate::store::tokens_within(asked_tokens, floor, after_weights / 2, working_at);
     if tokens != asked_tokens {
         eprintln!(
             "engine-cuda: [engine] max_forward_tokens {asked_tokens} is served at {tokens}: at \
-             {asked_tokens} the activation arena and attention workspaces take {} MiB of the \
+             {asked_tokens} the activation arena, attention workspaces and one fire's windowed \
+             kv rows take {} MiB of the \
              {} MiB this card has after the weight tier under [engine] gpu_mem_utilization, and \
              the cache rows, graph bodies and guest programs need the other half. State a \
              smaller max_forward_tokens to choose it, or a larger gpu_mem_utilization.",
@@ -366,7 +375,11 @@ impl Shell {
             boot.context,
             boot.slots,
             u64::from(boot.pages),
-        )?;
+        )?
+        .windowed(
+            crate::store::window_of(&boot.trace)?,
+            boot.budget.max_tokens,
+        );
         let decode_dense = landing_requests(boot.classify, &compiled.classes)
             .iter()
             .flatten()

@@ -86,6 +86,8 @@ pub enum CacheRow {
         planes: Vec<u64>,
         dtype: Dtype,
         space: u32,
+        #[serde(default)]
+        window: Option<u32>,
     },
     State {
         name: String,

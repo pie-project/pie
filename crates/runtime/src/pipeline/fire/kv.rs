@@ -52,6 +52,20 @@ impl KvTxn {
     pub fn mapping_version(&self) -> u64 {
         self.mapping_version
     }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+/// A transaction holding only an epoch, for a fire that reads windowed
+/// pages but prepares no kv write; see `KvStore::open_epoch`.
+pub fn read_epoch(store: &mut KvStore) -> KvTxn {
+    KvTxn {
+        seq: store.open_epoch(),
+        cas_intents: Vec::new(),
+        mapping_version: 0,
+    }
 }
 
 fn build_translation(

@@ -318,6 +318,8 @@ fn load_engine(
 
     let engine = runtime::bootstrap::EngineConfig {
         total_pages: caps.pools.kv_pages as usize,
+        window_pages: caps.pools.window_pages,
+        window_tokens: caps.pools.window_tokens,
         cpu_pages: 0,
         kv_copy: caps.kv_copy,
         backend_kind: backend.kind().to_string(),

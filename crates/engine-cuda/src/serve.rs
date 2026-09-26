@@ -118,8 +118,18 @@ impl Shell {
         self.device.synchronize()
     }
 
-    pub fn copy_kv(&mut self, moves: &[crate::store::Move]) -> Result<()> {
-        self.pools.copy_kv(self.device.stream(), moves)
+    /// Copies full pages and token cells in the full kv rows. A windowed
+    /// row's pages are named by the fire that reads them, so cells moved
+    /// between pages here would leave its copy behind.
+    pub fn copy_kv(&mut self, moves: &[crate::store::Move], cells: bool) -> Result<()> {
+        if cells && self.pools.has_windowed() {
+            return Err(Fault::Unbound {
+                what: "a token-cell kv copy on a load with windowed kv rows, whose pages this \
+                       copy does not name"
+                    .to_string(),
+            });
+        }
+        self.pools.copy_kv(self.device.stream(), moves, &[])
     }
 
     #[must_use]

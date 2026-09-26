@@ -2,7 +2,7 @@ pub mod kv;
 pub mod rs;
 
 use kernels_cuda::{KvPool, RecurrentPool, Tensor};
-use model_ir::{Attention, CacheRow, Def, Dtype, Operation, Trace};
+use model_ir::{Attention, CacheRow, Def, Dtype, Operands, Operation, Trace};
 
 use crate::device::elastic::{self, Arena, Commit, PhysicalPool};
 use crate::error::{Fault, Result};
@@ -276,10 +276,15 @@ pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
                 name,
                 planes,
                 dtype,
+                window,
                 ..
             } => {
                 let element = elem_bytes(name, *dtype)?;
-                let cells = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
+                let pages = match (window, paging.window) {
+                    (Some(_), Some(_)) => paging.window_ring(),
+                    _ => paging.pages_per_slot,
+                };
+                let cells = u64::from(pages) * u64::from(paging.page_size);
                 for width in planes {
                     bytes = bytes.saturating_add(cells * width * element);
                 }
@@ -287,6 +292,33 @@ pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
             CacheRow::State { name, slab, dtype } => {
                 let stride: u64 = slab.iter().product();
                 bytes = bytes.saturating_add(stride * elem_bytes(name, *dtype)?);
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// What one fire's rows take in the windowed kv rows past the windows they
+/// land in: every row a fire writes is resident there at once, so this
+/// grows with `max_forward_tokens` as the activation arena does.
+pub fn window_fire_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
+    let Some(window) = paging.window else {
+        return Ok(0);
+    };
+    let cells = u64::from(window.fire_pages) * u64::from(paging.page_size);
+    let mut bytes: u64 = 0;
+    for row in &trace.caches {
+        if let CacheRow::Kv {
+            name,
+            planes,
+            dtype,
+            window: Some(_),
+            ..
+        } = row
+        {
+            let element = elem_bytes(name, *dtype)?;
+            for width in planes {
+                bytes = bytes.saturating_add(cells * width * element);
             }
         }
     }
@@ -360,6 +392,7 @@ pub fn device_memory() -> Result<(u64, u64)> {
 enum Shape {
     Kv {
         space: u32,
+        windowed: bool,
         dtype: Dtype,
         keys_width: u64,
         values_width: u64,
@@ -431,6 +464,7 @@ pub struct Pools {
     committed_kv_pages: u32,
     committed_state_slots: u32,
     backed_pages: Vec<u64>,
+    windowed_backed: bool,
 }
 
 impl Pools {
@@ -452,9 +486,16 @@ impl Pools {
                     planes,
                     dtype,
                     space,
+                    window,
                 } => {
                     let element = elem_bytes(name, *dtype)?;
-                    let cells = paging.pages() * u64::from(paging.page_size);
+                    let windowed = window.is_some() && paging.window.is_some();
+                    let pages = if windowed {
+                        paging.window_pages()
+                    } else {
+                        paging.pages()
+                    };
+                    let cells = pages * u64::from(paging.page_size);
                     let (keys_width, values_width, values_plane) = match planes.as_slice() {
                         [plane] => (*plane, *plane, 0),
                         [keys, values] => (*keys, *values, 1),
@@ -501,6 +542,7 @@ impl Pools {
                     rows.push(planes_of_row);
                     shapes.push(Shape::Kv {
                         space: *space,
+                        windowed,
                         dtype: *dtype,
                         keys_width,
                         values_width,
@@ -549,6 +591,7 @@ impl Pools {
             committed_kv_pages: 0,
             committed_state_slots: 0,
             backed_pages: Vec::new(),
+            windowed_backed: false,
         })
     }
 
@@ -622,6 +665,7 @@ impl Pools {
     }
 
     fn declared_by(&self, pages: u64, slots: u32, unit_of: impl Fn(&Arena, u64) -> u64) -> u64 {
+        let windowed = narrow_pages(self.paging.window_pages_at(pages));
         let pages = u32::try_from(pages).unwrap_or(u32::MAX);
         let page_size = self.paging.page_size;
         let mapped = |bytes: u64, arena: &Arena| {
@@ -637,7 +681,10 @@ impl Pools {
                     .iter()
                     .enumerate()
                     .map(|(at, arena)| {
-                        mapped(watermark_bytes(shape, at, pages, slots, page_size), arena)
+                        mapped(
+                            watermark_bytes(shape, at, pages, windowed, slots, page_size),
+                            arena,
+                        )
                     })
                     .sum::<u64>()
             })
@@ -662,6 +709,7 @@ impl Pools {
     /// unit has a base a table may already hold.
     fn reshape(&mut self, pages: u64, slots: u32) -> Result<()> {
         let narrow = u32::try_from(pages).unwrap_or(u32::MAX);
+        let windowed = narrow_pages(self.paging.window_pages_at(pages));
         let page_size = self.paging.page_size;
         let fresh = |arena: &Arena| {
             if arena.committed_bytes() == 0 {
@@ -685,7 +733,7 @@ impl Pools {
                 fresh(arena)?;
                 *arena = Arena::reserve(
                     &self.pool,
-                    watermark_bytes(shape, at, narrow, slots, page_size),
+                    watermark_bytes(shape, at, narrow, windowed, slots, page_size),
                     label,
                 )?;
             }
@@ -700,6 +748,7 @@ impl Pools {
         self.ceiling = pages;
         self.paging.pages = pages;
         self.paging.slots = slots;
+        self.windowed_backed = false;
         Ok(())
     }
 
@@ -894,6 +943,44 @@ impl Pools {
     }
 
     #[must_use]
+    pub fn windowed_space(&self, space: u32) -> bool {
+        self.shapes.iter().any(
+            |shape| matches!(shape, Shape::Kv { space: at, windowed: true, .. } if *at == space),
+        )
+    }
+
+    #[must_use]
+    pub fn has_windowed(&self) -> bool {
+        self.shapes
+            .iter()
+            .any(|shape| matches!(shape, Shape::Kv { windowed: true, .. }))
+    }
+
+    /// Zeroes page 0 of the windowed rows once they are backed: every page
+    /// behind a window reads it, and a masked column still multiplies its
+    /// value, so it must hold no NaN.
+    fn zero_null_page(&mut self) -> Result<()> {
+        if self.windowed_backed || !self.has_windowed() {
+            return Ok(());
+        }
+        let page_size = self.paging.page_size;
+        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
+            if !matches!(shape, Shape::Kv { windowed: true, .. }) {
+                continue;
+            }
+            for (at, arena) in planes.iter().enumerate() {
+                let bytes = watermark_bytes(shape, at, 0, 1, 0, page_size);
+                crate::device::zero_span(
+                    arena.span(0, bytes)?,
+                    usize::try_from(bytes).unwrap_or(0),
+                )?;
+            }
+        }
+        self.windowed_backed = true;
+        Ok(())
+    }
+
+    #[must_use]
     pub fn committed_watermarks(&self) -> (u32, u32) {
         (self.committed_kv_pages, self.committed_state_slots)
     }
@@ -909,6 +996,7 @@ impl Pools {
             table.push(match *shape {
                 Shape::Kv {
                     space,
+                    windowed,
                     dtype,
                     keys_width,
                     values_width,
@@ -924,7 +1012,12 @@ impl Pools {
                                      geometry"
                             ),
                         })?;
-                    let cells = self.paging.pages() * u64::from(self.paging.page_size);
+                    let pages = if windowed {
+                        self.paging.window_pages()
+                    } else {
+                        self.paging.pages()
+                    };
+                    let cells = pages * u64::from(self.paging.page_size);
                     let plane = |at: usize, width: u64| {
                         Tensor::new(
                             planes.get(at).map_or(0, elastic::Arena::base),
@@ -1023,17 +1116,21 @@ impl Pools {
         Ok(())
     }
 
-    pub fn copy_kv(&mut self, stream: *mut core::ffi::c_void, moves: &[Move]) -> Result<()> {
-        if moves.is_empty() {
+    /// Copies `moves` in the full rows and `windowed` (whole pages) in the
+    /// windowed ones, whose page ids are their own.
+    pub fn copy_kv(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        moves: &[Move],
+        windowed: &[Move],
+    ) -> Result<()> {
+        if moves.is_empty() && windowed.is_empty() {
             return Ok(());
         }
         let page_size = u64::from(self.paging.page_size);
         let mut highest = 0u64;
-        for span in moves {
-            for (page, token) in [
-                (span.src_page, span.src_token),
-                (span.dst_page, span.dst_token),
-            ] {
+        for span in moves.iter().chain(windowed) {
+            for token in [span.src_token, span.dst_token] {
                 let end = u64::from(token) + u64::from(span.tokens);
                 if end > page_size {
                     return Err(Fault::Ceiling {
@@ -1042,12 +1139,15 @@ impl Pools {
                         have: page_size,
                     });
                 }
-                highest = highest.max(u64::from(page) + 1);
             }
+        }
+        for span in moves {
+            highest = highest.max(u64::from(span.src_page.max(span.dst_page)) + 1);
         }
         self.ensure_kv(u32::try_from(highest).unwrap_or(u32::MAX))?;
         for (planes, shape) in self.rows.iter().zip(&self.shapes) {
             let Shape::Kv {
+                windowed: in_window,
                 dtype,
                 keys_width,
                 values_width,
@@ -1057,6 +1157,7 @@ impl Pools {
                 continue;
             };
             let element = u64::from(elem_size(dtype));
+            let moves = if in_window { windowed } else { moves };
             for (at, arena) in planes.iter().enumerate() {
                 let width = if at == 0 { keys_width } else { values_width };
                 let cell = width * element;
@@ -1161,6 +1262,7 @@ impl Pools {
     ) -> Result<()> {
         if demand.kv_pages <= self.committed_kv_pages
             && demand.state_slots <= self.committed_state_slots
+            && (self.windowed_backed || !self.has_windowed())
             && kv_ranges
                 .iter()
                 .all(|&(first, count)| self.pages_backed(first, count))
@@ -1170,7 +1272,7 @@ impl Pools {
         match self.commit_ranges(demand.kv_pages, demand.state_slots, Some(kv_ranges))? {
             Commit::Committed => {
                 self.note_backed(kv_ranges);
-                Ok(())
+                self.zero_null_page()
             }
             refusal => Err(refuse(&self.pool, refusal)),
         }
@@ -1205,6 +1307,7 @@ impl Pools {
         let kv_pages = kv_pages.max(self.committed_kv_pages);
         let state_slots = state_slots.max(self.committed_state_slots);
         let page_size = self.paging.page_size;
+        let windowed = narrow_pages(self.paging.window_pages());
         let Pools {
             pool,
             rows,
@@ -1216,8 +1319,13 @@ impl Pools {
         for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
             for (at, arena) in planes.iter_mut().enumerate() {
                 let want = match (shape, kv_ranges) {
+                    // The windowed pool is what a window per sequence
+                    // takes, so it is backed whole on the first fire.
+                    (Shape::Kv { windowed: true, .. }, _) => {
+                        elastic::Want::Prefix(watermark_bytes(shape, at, 0, windowed, 0, page_size))
+                    }
                     (Shape::Kv { .. }, Some(ranges)) => {
-                        let page_bytes = watermark_bytes(shape, at, 1, 0, page_size);
+                        let page_bytes = watermark_bytes(shape, at, 1, 0, 0, page_size);
                         elastic::Want::Ranges(
                             ranges
                                 .iter()
@@ -1229,6 +1337,7 @@ impl Pools {
                         shape,
                         at,
                         kv_pages,
+                        0,
                         state_slots,
                         page_size,
                     )),
@@ -1255,6 +1364,7 @@ impl Pools {
 
     fn release_to(&mut self, kv_pages: u32, state_slots: u32) {
         let page_size = self.paging.page_size;
+        let windowed = narrow_pages(self.paging.window_pages());
         let Pools {
             pool,
             rows,
@@ -1264,7 +1374,7 @@ impl Pools {
         } = self;
         for (planes, shape) in rows.iter_mut().zip(shapes.iter()) {
             for (at, arena) in planes.iter_mut().enumerate() {
-                let bytes = watermark_bytes(shape, at, kv_pages, state_slots, page_size);
+                let bytes = watermark_bytes(shape, at, kv_pages, windowed, state_slots, page_size);
                 arena.release_tail(pool, bytes);
             }
         }
@@ -1330,18 +1440,21 @@ fn watermark_bytes(
     shape: &Shape,
     plane: usize,
     kv_pages: u32,
+    window_pages: u32,
     state_slots: u32,
     page_size: u32,
 ) -> u64 {
     match *shape {
         Shape::Kv {
+            windowed,
             dtype,
             keys_width,
             values_width,
             ..
         } => {
             let width = if plane == 0 { keys_width } else { values_width };
-            u64::from(kv_pages) * u64::from(page_size) * width * u64::from(elem_size(dtype))
+            let pages = if windowed { window_pages } else { kv_pages };
+            u64::from(pages) * u64::from(page_size) * width * u64::from(elem_size(dtype))
         }
         Shape::State { stride, dtype } => {
             u64::from(state_slots) * stride * u64::from(elem_size(dtype))
@@ -1392,6 +1505,48 @@ fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {
 
 fn elem_size(dtype: Dtype) -> u32 {
     model_compiler::arena::elem_bytes(dtype).unwrap_or(1) as u32
+}
+
+fn narrow_pages(pages: u64) -> u32 {
+    u32::try_from(pages).unwrap_or(u32::MAX)
+}
+
+/// The widest window a windowed kv row is declared with. Every read of such
+/// a row must look through a window no wider, since the pages behind it
+/// read the null page.
+pub fn window_of(trace: &Trace) -> Result<Option<u32>> {
+    for node in &trace.nodes {
+        let Some(read) = kv::reads(&node.op) else {
+            continue;
+        };
+        let Some(Def::Cache(row)) = trace.values.get(read.cache.0 as usize).map(|v| &v.def) else {
+            continue;
+        };
+        if let Some(CacheRow::Kv {
+            name,
+            window: Some(held),
+            ..
+        }) = trace.caches.get(*row as usize)
+            && read.window.is_none_or(|read| read > *held)
+        {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "cache `{name}`, which holds a window of {held} tokens while `{}` reads \
+                     it through {:?}",
+                    node.op.name(),
+                    read.window
+                ),
+            });
+        }
+    }
+    Ok(trace
+        .caches
+        .iter()
+        .filter_map(|row| match row {
+            CacheRow::Kv { window, .. } => *window,
+            CacheRow::State { .. } => None,
+        })
+        .max())
 }
 
 fn narrow(n: u64) -> i32 {

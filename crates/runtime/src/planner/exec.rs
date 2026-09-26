@@ -308,7 +308,7 @@ async fn restore(
     }
     let stores = crate::store::registry::get(model, engine);
     let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
-        kv.prepare_restore(&working_sets, pages.lend())
+        kv.prepare_restore(&working_sets, pages.lend(super::KvPool::Paged))
     });
     drop(pages);
     let txn = match prepared {

@@ -1,9 +1,10 @@
 use engine_cuda::device::elastic::map_unit_for;
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
+use engine_cuda::store::kv::Paging;
 use engine_cuda::store::{
     Accounting, BODIES_FLOOR_BYTES, bodies_allowance, decoded_weight_reserve, holds_within,
-    lanes_within_seats, least_state_slots, pages_within, program_scratch_reserve,
-    state_slots_within, tokens_within,
+    lanes_within_seats, least_state_slots, one_slot_bytes, pages_within, program_scratch_reserve,
+    state_slots_within, tokens_within, window_fire_bytes, window_of,
 };
 use engine_cuda::{DeviceBoot, Knobs};
 
@@ -39,6 +40,7 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     the_bodies_keep_their_floor_and_the_tile_is_taken_before_any_capture();
     a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes();
     a_tight_fit_still_seats_one_buffered_lane();
+    a_sliding_row_holds_its_window_and_not_the_context();
     a_hybrids_slots_are_cut_to_what_leaves_the_pages_their_half();
     a_hybrids_lanes_are_levelled_to_the_seats_the_pool_holds();
 }
@@ -148,6 +150,43 @@ fn a_twenty_seven_b_serves_on_a_twenty_four_gigabyte_card_at_the_asked_lanes() {
         tokens_within(LANES, 1, room, |lanes| working(lanes, mlp)),
         LANES,
         "with the tile held to the widest plane fired at token rows, the asked lanes fit"
+    );
+}
+
+fn a_sliding_row_holds_its_window_and_not_the_context() {
+    // #699: gemma-4-31b's 50 sliding rows (16 kv heads of 256, a window of
+    // 1024) were sized to the context beside its 10 global rows (4 of 512),
+    // 901120 bytes a token: 31373393920 for one sequence at 34816 cells.
+    const GLOBAL: u64 = 10 * 2 * 4 * 512 * 2;
+    const SLIDING: u64 = 50 * 2 * 16 * 256 * 2;
+    let trace = (models::sku("gemma4-31b-u4g64-kv-bf16")
+        .expect("the catalog ships gemma-4-31b")
+        .trace)(model_dsl::Platform::Cuda);
+    let window = window_of(&trace).expect("every sliding read looks through the window");
+    assert_eq!(window, Some(1024));
+    let at = |context: u32| {
+        Paging::of(16, context, 1, 1)
+            .expect("a page size of 16 is a paging")
+            .windowed(window, 2048)
+    };
+    let one = |context: u32| one_slot_bytes(&trace, at(context)).expect("the rows size");
+    // The window straddles 65 pages and one fire's 2048 rows add 129 more.
+    assert_eq!(one(34_816), GLOBAL * 34_816 + SLIDING * 16 * (65 + 129));
+    assert_eq!(one(6144), GLOBAL * 6144 + SLIDING * 16 * (65 + 129));
+    assert_eq!(
+        window_fire_bytes(&trace, at(34_816)).expect("the rows size"),
+        SLIDING * 16 * 129,
+        "and what one fire's rows add is what `max_forward_tokens` is fitted against"
+    );
+    assert_eq!(
+        one(1024),
+        (GLOBAL + SLIDING) * 1024,
+        "a window that spans the context is no window"
+    );
+    assert_eq!(
+        at(34_816).window_pages_at(8 * 2176),
+        1 + 65 + 129 + 7 * 2176 / 2,
+        "past one sequence, a windowed page for every two kv pages"
     );
 }
 

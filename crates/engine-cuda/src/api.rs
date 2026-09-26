@@ -573,6 +573,10 @@ intended for diagnostics, not serving",
                     .unwrap_or(0),
                 elastic_page_bytes,
                 elastic_budget_pages,
+                window_pages: paging.window.map_or(0, |_| {
+                    u32::try_from(paging.window_pages()).unwrap_or(u32::MAX)
+                }),
+                window_tokens: paging.window.map_or(0, |window| window.tokens),
             },
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
@@ -946,7 +950,9 @@ intended for diagnostics, not serving",
                 )));
             }
         }
-        self.loaded_mut()?.copy_kv(&moves).map_err(fault)
+        self.loaded_mut()?
+            .copy_kv(&moves, !copy.moves.is_empty())
+            .map_err(fault)
     }
 }
 
@@ -1013,6 +1019,8 @@ impl Cuda {
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                     kv_less: lane.kv_less,
                     translation: &lane.kv.translation,
+                    window: &lane.kv.window,
+                    window_copies: &lane.kv.window_copies,
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     drafts: lane.drafts,

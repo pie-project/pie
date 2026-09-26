@@ -14,6 +14,12 @@ pub fn geometry_with(paging: &Paging, seats: &[Seat], tables: &[&[u32]]) -> Resu
     Ok(model_exec::store::kv::geometry_with(paging, seats, tables)?)
 }
 
+pub fn window_table(paging: &Paging, seat: &Seat, table: &[u32], ids: &[u32]) -> Result<Vec<u32>> {
+    Ok(model_exec::store::kv::window_table(
+        paging, seat, table, ids,
+    )?)
+}
+
 pub fn width_of(trace: &Trace, value: ValueId) -> Result<u64> {
     Ok(model_exec::store::kv::width_of(trace, value)?)
 }

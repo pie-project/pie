@@ -182,6 +182,7 @@ impl Pools {
                     planes,
                     dtype,
                     space,
+                    ..
                 } => {
                     let planes = split(name, planes)?;
                     let width = planes.keys;
@@ -642,6 +643,7 @@ mod tests {
             pages_per_slot: 1,
             slots,
             pages: u64::from(slots),
+            window: None,
         }
     }
 
