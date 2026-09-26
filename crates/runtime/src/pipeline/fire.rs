@@ -283,10 +283,14 @@ fn host_kv_demand(
     .map_err(|error| format!("pipeline: KV demand: {error}"))
 }
 
+/// `windowed`: the fire reads windowed pages, which come back only once
+/// every fire that read them settles, so a fire that would park settles its
+/// own tail first rather than hold back the pages parked fires wait on.
 async fn acquire_grant<C: FireContext>(
     ctx: &mut C,
     pipeline_id: uuid::Uuid,
     demand: crate::planner::Demand,
+    windowed: bool,
 ) -> Result<crate::planner::AllocationGrant, String> {
     if demand.is_zero() {
         return Ok(crate::planner::AllocationGrant::empty());
@@ -295,6 +299,17 @@ async fn acquire_grant<C: FireContext>(
         return Err("pipeline: KV residency planner is not installed".to_string());
     };
     let pid = ctx.process_id();
+    if windowed {
+        if let Some(grant) = planner.grant_now(pid, demand) {
+            return Ok(grant);
+        }
+        // The tail may hold this frame's earlier slots, which fire only once
+        // the scheduler stops waiting on this one: park the lane first.
+        crate::scheduler::worker::notify_lane_close(pipeline_id, Some(pid));
+        ctx.settle_pipeline_tail()
+            .await
+            .map_err(|error| format!("pipeline: settle for windowed kv: {error:#}"))?;
+    }
     loop {
         match planner
             .acquire(pid, pipeline_id, demand)
@@ -1014,21 +1029,19 @@ fn host_window_lanes(
         .collect()
 }
 
-/// The windowed pages a fire asks the planner for, and whether the pool
-/// has that many free now; see `KvStore::window_demand`.
+/// The windowed pages a fire asks the planner for; see
+/// `KvStore::window_demand`.
 fn window_demand(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
     lanes: &[crate::store::kv::window::WindowLane<'_>],
     writes: std::ops::Range<u64>,
-) -> Result<(u32, bool), String> {
+) -> Result<u32, String> {
     if lanes.is_empty() {
-        return Ok((0, true));
+        return Ok(0);
     }
     crate::store::registry::with_kv_lock(&stores.kv, "host-window", |kv| {
-        let demand = kv.window_demand(ws, lanes, writes)?;
-        let free = kv.pool_available(crate::planner::KvPool::Windowed);
-        Ok::<_, crate::store::kv::KvStoreError>((demand, demand as usize <= free))
+        kv.window_demand(ws, lanes, writes)
     })
     .map_err(|error| format!("pipeline: windowed KV demand: {error}"))
 }
@@ -1525,8 +1538,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         };
         suppress_defaulted_readout_for_fold(&mut req, readout_defaulted, &rs_plan);
         let window_lanes = host_window_lanes(&req, window_of(&stores));
+        let windowed = !window_lanes.is_empty();
         let mut attempts = 0;
-        let mut settled_tail = false;
         let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared, window) = loop {
             let kv_demand = match host_kv_demand(
                 &stores,
@@ -1542,20 +1555,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     "pipeline: KV demand exceeds the planner ABI".to_string()
                 ));
             };
-            let (window_pages, window_free) =
+            let window_pages =
                 match window_demand(&stores, ws.id, &window_lanes, writable_pages.clone()) {
                     Ok(demand) => demand,
                     Err(error) => return Ok(Err(error)),
                 };
-            // The pages this sequence's own fires in flight last read come
-            // back when they settle, so settle them before parking on them.
-            if !window_free && !settled_tail {
-                settled_tail = true;
-                if let Err(error) = ctx.settle_pipeline_tail().await {
-                    return Ok(Err(format!("pipeline: settle for windowed kv: {error:#}")));
-                }
-                continue;
-            }
             let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids, &rs_plan) {
                 Ok(demand) => demand,
                 Err(error) => return Ok(Err(error)),
@@ -1564,7 +1568,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 kv_pages: crate::planner::KvPages::new(kv_demand, window_pages),
                 rs_slots: rs_demand,
             };
-            let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand).await {
+            let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand, windowed).await {
                 Ok(grant) => grant,
                 Err(error) => return Ok(Err(error)),
             };
@@ -2565,7 +2569,7 @@ async fn fire_device_geometry<C: FireContext>(
             kv_pages: crate::planner::KvPages::new(kv_demand, window_pages),
             rs_slots: rs_demand,
         };
-        let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand).await {
+        let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand, windowed).await {
             Ok(grant) => grant,
             Err(error) => {
                 reclaim_pending_device_grant(ctx, &fwd);

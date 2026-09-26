@@ -1010,19 +1010,16 @@ impl ResidencyPlanner {
         )
     }
 
-    pub async fn acquire(
-        self: &Arc<Self>,
-        pid: ProcessId,
-        quorum_id: ProcessId,
-        demand: Demand,
-    ) -> Result<Acquired, PlannerError> {
+    /// The grant `demand` takes without parking, if the pools hand it out
+    /// now; see `acquire`.
+    pub fn grant_now(self: &Arc<Self>, pid: ProcessId, demand: Demand) -> Option<AllocationGrant> {
         if demand.is_zero() {
             if self.waiters.load(Ordering::Acquire) != 0
                 || self.nonresident.load(Ordering::Acquire) != 0
             {
                 self.note_progress(pid);
             }
-            return Ok(Acquired::Granted(AllocationGrant::empty()));
+            return Some(AllocationGrant::empty());
         }
         let uncontended = self.waiters.load(Ordering::Acquire) == 0
             && self.nonresident.load(Ordering::Acquire) == 0;
@@ -1039,7 +1036,7 @@ impl ResidencyPlanner {
             });
             if head_covered && let Some(grant) = self.try_reserve(demand) {
                 self.note_progress(pid);
-                return Ok(Acquired::Granted(grant));
+                return Some(grant);
             }
         }
         if !uncontended {
@@ -1047,6 +1044,18 @@ impl ResidencyPlanner {
         }
         if uncontended && let Some(grant) = self.try_reserve(demand) {
             self.poke_if_runway_short();
+            return Some(grant);
+        }
+        None
+    }
+
+    pub async fn acquire(
+        self: &Arc<Self>,
+        pid: ProcessId,
+        quorum_id: ProcessId,
+        demand: Demand,
+    ) -> Result<Acquired, PlannerError> {
+        if let Some(grant) = self.grant_now(pid, demand) {
             return Ok(Acquired::Granted(grant));
         }
         for pool in KvPool::ALL {
