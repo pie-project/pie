@@ -122,6 +122,7 @@ pub fn embed_concat_mlxu4(
             stated(OP, width)?.arg(),
             stated(OP, group)?.arg(),
             stated(OP, vocab)?.arg(),
+            stated(OP, 0u32)?.arg(),
             crate::jit::ArgValue::Ptr(seat.cell),
             crate::jit::ArgValue::Ptr(seat.hits),
             ctx.stage(),
@@ -165,18 +166,24 @@ pub fn embed_mlx_affine(
             ),
         ));
     };
-    let factor_rows = nonzero(OP, "the factor plane's rows", scales.rows)?;
+    let band = nonzero(OP, "the factor plane's rows", scales.rows)?;
     let per_row = scales.width / 2;
-    if factor_rows != vocab || per_row == 0 || !width.is_multiple_of(per_row) {
+    let Some(group) = affine_band_group(vocab, band, width, per_row) else {
         return Err(refuse(
             OP,
             format!(
-                "a [{factor_rows} x {per_row}] factor plane does not group a \
+                "a [{band} x {per_row}] factor plane does not group a \
                  [{vocab} x {width}] table"
             ),
         ));
-    }
-    let group = width / per_row;
+    };
+    // A tensor-parallel vocab band gathers only its own ids and lands zeros for
+    // the rest; the model's all-reduce after the embed sums the bands.
+    let offset = if band < vocab {
+        crate::layout::comm_rank(ctx, OP)?.saturating_mul(band)
+    } else {
+        0
+    };
     debug_assert_eq!(y.rows, ids.rows, "one output row per id row");
     let rows = nonzero(OP, "rows", ids.rows)?;
     let total = u64::from(rows) * u64::from(width);
@@ -200,10 +207,29 @@ pub fn embed_mlx_affine(
             stated(OP, 1u32)?.arg(),
             stated(OP, width)?.arg(),
             stated(OP, group)?.arg(),
-            stated(OP, vocab)?.arg(),
+            stated(OP, band)?.arg(),
+            stated(OP, offset)?.arg(),
             crate::jit::ArgValue::Ptr(seat.cell),
             crate::jit::ArgValue::Ptr(seat.hits),
             ctx.stage(),
         ],
     )
+}
+
+fn affine_band_group(vocab: u32, band: u32, width: u32, per_row: u32) -> Option<u32> {
+    let whole_or_band = band == vocab || (band < vocab && vocab.is_multiple_of(band));
+    (whole_or_band && per_row != 0 && width.is_multiple_of(per_row)).then(|| width / per_row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::affine_band_group;
+
+    #[test]
+    fn a_tp2_vocab_band_groups_its_half_of_the_table() {
+        assert_eq!(affine_band_group(262_144, 262_144, 5376, 84), Some(64));
+        assert_eq!(affine_band_group(262_144, 131_072, 5376, 84), Some(64));
+        assert_eq!(affine_band_group(262_144, 100_000, 5376, 84), None);
+        assert_eq!(affine_band_group(262_144, 131_072, 5376, 0), None);
+    }
 }

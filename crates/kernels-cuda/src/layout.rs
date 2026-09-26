@@ -85,41 +85,42 @@ pub fn embed_vocab_shard(
     dtype_dispatch!(OP, table.dtype, { Bf16 => () });
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
     debug_assert_eq!(ids.rows, y.rows, "the ids handed over are the rows landed");
-    let comm = ctx.comm(OP)?;
     let local = nonzero(OP, "this rank's band of the embedding table", table.rows)?;
     let hidden = stated(OP, nonzero(OP, "the embedded row's width", y.width)?)?;
     let rows = nonzero(OP, "rows", y.rows)?;
+    let rank = comm_rank(ctx, OP)?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::layout::embed_vocab_shard<::pie::bf16>")
+            .apply(Launch::grid([rows, 1, 1], [BLOCK, 1, 1])),
+        &[
+            ids.arg(),
+            table.arg(),
+            y.arg(),
+            hidden.arg(),
+            stated(OP, local)?.arg(),
+            stated(OP, rank.saturating_mul(local))?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
 
+pub(crate) fn comm_rank(ctx: &Ctx, op: &'static str) -> Result<u32, Error> {
+    let comm = ctx.comm(op)?;
     #[cfg(feature = "cuda")]
     {
-        let rank = {
-            use cudarc::nccl::sys as nccl;
-            let mut rank: i32 = 0;
-            // SAFETY: `comm` is the live communicator this context fires its
-            // collectives on; the out-parameter is a stack i32.
-            let code = unsafe { nccl::ncclCommUserRank(comm.cast(), &mut rank) };
-            crate::collective::answered(OP, "ncclCommUserRank", code)?;
-            u32::try_from(rank).unwrap_or(0)
-        };
-        ctx.fire(
-            OP,
-            Fire::at(FILE, "::pie::layout::embed_vocab_shard<::pie::bf16>")
-                .apply(Launch::grid([rows, 1, 1], [BLOCK, 1, 1])),
-            &[
-                ids.arg(),
-                table.arg(),
-                y.arg(),
-                hidden.arg(),
-                stated(OP, local)?.arg(),
-                stated(OP, rank.saturating_mul(local))?.arg(),
-                ctx.stage(),
-            ],
-        )
+        use cudarc::nccl::sys as nccl;
+        let mut rank: i32 = 0;
+        // SAFETY: `comm` is the live communicator this context fires its
+        // collectives on; the out-parameter is a stack i32.
+        let code = unsafe { nccl::ncclCommUserRank(comm.cast(), &mut rank) };
+        crate::collective::answered(op, "ncclCommUserRank", code)?;
+        Ok(u32::try_from(rank).unwrap_or(0))
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (comm, local, hidden, rows, ids, table, y);
-        Err(crate::jit::runtimeless(OP))
+        let _ = comm;
+        Err(crate::jit::runtimeless(op))
     }
 }
 
