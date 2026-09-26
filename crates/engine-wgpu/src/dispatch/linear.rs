@@ -123,6 +123,7 @@ impl Run<'_> {
             }
             Linear::MatmulGeglu { .. }
             | Linear::LmHeadSoftcap { .. }
+            | Linear::MatmulBias { .. }
             | Linear::RelBias { .. }
             | Linear::MoeTopkSigmoidSink { .. } => {
                 Err(kernels_wgpu::Error::Unsupported { op: op.name() })
