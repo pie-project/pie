@@ -60,6 +60,11 @@ pub trait PoolPort: Send + Sync + 'static {
     );
     fn reserve_rs(&self, count: u32) -> Option<Vec<crate::store::rs::RsSlotId>>;
     fn release_rs(&self, slots: Vec<crate::store::rs::RsSlotId>);
+    /// Free paged pages, and the pages `pids` have reserved but not yet
+    /// written, read together.
+    fn admission_view(&self, _pids: &[ProcessId]) -> (u32, u32) {
+        (self.device_stats(KvPool::Paged).0, 0)
+    }
 }
 
 pub struct RegistryPool {
@@ -170,6 +175,26 @@ impl PoolPort for RegistryPool {
 
     fn release_rs(&self, slots: Vec<crate::store::rs::RsSlotId>) {
         self.with_rs(|rs| rs.release_slot_reservation(slots));
+    }
+
+    fn admission_view(&self, pids: &[ProcessId]) -> (u32, u32) {
+        let working_sets =
+            crate::inferlet::process::residency::kv_working_sets_for(pids, self.model, self.engine);
+        self.with_kv_tagged("planner-admission", |kv| {
+            let unwritten: u64 = working_sets
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|&ws| {
+                    let reserved = kv.page_len(ws).unwrap_or(0);
+                    reserved.saturating_sub(kv.mapped_len(ws).unwrap_or(0))
+                })
+                .sum();
+            (
+                kv.pool_available(KvPool::Paged) as u32,
+                u32::try_from(unwritten).unwrap_or(u32::MAX),
+            )
+        })
     }
 }
 
@@ -720,6 +745,20 @@ pub struct ResidencyPlanner {
     idle_reclaim_exhausted: std::sync::atomic::AtomicBool,
     port: Arc<dyn PoolPort>,
     stats: PlannerStats,
+    admission: parking_lot::Mutex<std::collections::BTreeSet<(u64, ProcessId)>>,
+    admission_signal: Notify,
+}
+
+struct AdmissionTicket<'a> {
+    planner: &'a ResidencyPlanner,
+    key: (u64, ProcessId),
+}
+
+impl Drop for AdmissionTicket<'_> {
+    fn drop(&mut self) {
+        self.planner.admission.lock().remove(&self.key);
+        self.planner.admission_signal.notify_waiters();
+    }
 }
 
 struct WaitRegistration<'a> {
@@ -818,6 +857,8 @@ impl ResidencyPlanner {
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
             port,
             stats: PlannerStats::default(),
+            admission: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
+            admission_signal: Notify::new(),
         }
     }
 
@@ -910,6 +951,56 @@ impl ResidencyPlanner {
         self.lock_inner().procs.get(&pid).map(|proc| proc.seq)
     }
 
+    /// Admits `pid` to execution once the pages it has reserved but not yet
+    /// written fit in the pool beside those of every process already
+    /// admitted, oldest first, so a burst of prompts is not all started
+    /// only to starve each other mid-prefill.
+    pub async fn admit(&self, pid: ProcessId) {
+        let Some(seq) = self.spawn_seq(pid) else {
+            return;
+        };
+        let ticket = AdmissionTicket {
+            planner: self,
+            key: (seq, pid),
+        };
+        self.admission.lock().insert(ticket.key);
+        loop {
+            let signal = self.admission_signal.notified();
+            tokio::pin!(signal);
+            signal.as_mut().enable();
+            {
+                let waiting = self.admission.lock();
+                if waiting.first() == Some(&ticket.key) && self.admission_fits(pid) {
+                    self.note_admitted(pid);
+                    drop(waiting);
+                    return;
+                }
+            }
+            signal.await;
+        }
+    }
+
+    fn admission_fits(&self, pid: ProcessId) -> bool {
+        let mut pids: Vec<ProcessId> = self.with_inner(|inner| {
+            inner
+                .procs
+                .iter()
+                .filter(|(_, proc)| proc.admitted && proc.state == Residency::Resident)
+                .map(|(pid, _)| *pid)
+                .collect()
+        });
+        if pids.is_empty() {
+            return true;
+        }
+        pids.push(pid);
+        let (free, unwritten) = self.port.admission_view(&pids);
+        unwritten <= free
+            || (self.port.reclaim_idle() > 0 && {
+                let (free, unwritten) = self.port.admission_view(&pids);
+                unwritten <= free
+            })
+    }
+
     pub fn note_admitted(&self, pid: ProcessId) {
         let mut inner = self.lock_inner();
         if let Some(proc) = inner.procs.get_mut(&pid) {
@@ -953,11 +1044,13 @@ impl ResidencyPlanner {
         }
         drop(removed);
         self.re_arm_idle_reclaim();
+        self.admission_signal.notify_waiters();
         self.poke();
     }
 
     pub fn pages_freed(self: &Arc<Self>) {
         self.re_arm_idle_reclaim();
+        self.admission_signal.notify_waiters();
         if self.waiters.load(Ordering::Acquire) != 0 {
             self.poke();
         } else {
@@ -2355,6 +2448,7 @@ impl ResidencyPlanner {
             .d2h_pages
             .fetch_add(u64::from(freed), Ordering::Relaxed);
         self.re_arm_idle_reclaim();
+        self.admission_signal.notify_waiters();
         self.poke();
     }
 
@@ -2988,6 +3082,7 @@ mod starvation_race_tests {
         host_total: u32,
         // A registered model whose RS store backs the slot calls.
         rs_model: Option<usize>,
+        unwritten: AtomicU32,
     }
 
     impl RacePool {
@@ -3000,6 +3095,7 @@ mod starvation_race_tests {
                 pulls: parking_lot::Mutex::new(Vec::new()),
                 host_total: 0,
                 rs_model: None,
+                unwritten: AtomicU32::new(0),
             }
         }
 
@@ -3081,6 +3177,32 @@ mod starvation_race_tests {
         fn release_rs(&self, slots: Vec<crate::store::rs::RsSlotId>) {
             self.with_rs(|rs| rs.release_slot_reservation(slots));
         }
+        fn admission_view(&self, _: &[ProcessId]) -> (u32, u32) {
+            (
+                self.free.lock().len() as u32,
+                self.unwritten.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[test]
+    fn a_process_is_admitted_once_its_reserved_pages_fit_beside_the_admitted() {
+        use futures::FutureExt;
+        let pool = Arc::new(RacePool::new(8));
+        pool.refill_after_stall(8, 0);
+        let planner = ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>);
+        let running = ProcessId::new_v4();
+        planner.register(running);
+        assert!(planner.admit(running).now_or_never().is_some());
+
+        let next = ProcessId::new_v4();
+        planner.register(next);
+        pool.unwritten.store(12, Ordering::SeqCst);
+        let mut admit = Box::pin(planner.admit(next));
+        assert!(admit.as_mut().now_or_never().is_none());
+        pool.unwritten.store(6, Ordering::SeqCst);
+        planner.admission_signal.notify_waiters();
+        assert!(admit.as_mut().now_or_never().is_some());
     }
 
     #[test]
