@@ -114,6 +114,33 @@ impl Run<'_> {
                     y: *y,
                 })
             }
+            Linear::MatmulBias {
+                act,
+                w,
+                bias,
+                y,
+                y_out: _,
+            } => {
+                if self.tensor(*act).dtype == Dtype::Bf16 && self.dense_weight(*w) {
+                    return linear::gemm::matmul_bias(
+                        self.ctx(),
+                        self.tensor(*act),
+                        self.tensor(*w),
+                        self.tensor(*bias),
+                        &mut self.tensor(*y),
+                    );
+                }
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *w,
+                    y: *y,
+                })?;
+                kernels_cuda::elemwise::norm::add_bias(
+                    self.ctx(),
+                    self.tensor(*bias),
+                    &mut self.tensor(*y),
+                )
+            }
             Linear::LmHeadSoftcap {
                 act,
                 w,
