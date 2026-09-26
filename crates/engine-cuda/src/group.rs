@@ -144,6 +144,12 @@ pub fn open_group(
         }
         return Err(why);
     }
+    let devices: Vec<i32> = boots.iter().map(|boot| boot.ordinal).collect();
+    if let Some(peers) = crate::comm::open_peers(&devices) {
+        for (comm, peers) in comms.iter_mut().flatten().zip(peers) {
+            comm.set_peers(peers);
+        }
+    }
     let mut ranks = Vec::with_capacity(size);
     let mut ordinals = Vec::with_capacity(size);
     let mut held = Vec::with_capacity(size);

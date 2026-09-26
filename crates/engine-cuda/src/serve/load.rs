@@ -24,7 +24,9 @@ const TOKENS_FLOOR: u32 = 1024;
 
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
-    let device = Context::bind(boot.ordinal, boot.comm)?;
+    // SAFETY: the boot's communicator is held by the engine for the life of
+    // the shell it loads.
+    let device = Context::bind(boot.ordinal, unsafe { boot.comm.as_ref() })?;
 
     kernels_cuda::disk::install(boot.cache_dir);
 
