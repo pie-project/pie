@@ -27,6 +27,8 @@ pub enum OutputMode {
 pub struct ProcessCtx {
     id: ProcessId,
     username: String,
+    /// The program this process runs; scopes what it publishes to share.
+    pub(crate) program: String,
 
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
@@ -200,6 +202,7 @@ impl ProcessCtx {
         Ok(ProcessCtx {
             id,
             username,
+            program: String::new(),
             wasi_ctx,
             resource_table: ResourceTable::new(),
             #[cfg(not(target_arch = "wasm32"))]

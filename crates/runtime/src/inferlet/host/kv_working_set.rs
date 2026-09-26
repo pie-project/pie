@@ -35,6 +35,18 @@ fn scoped_working_set(
     Ok(Ok(ws))
 }
 
+/// A prefix is shareable by its pages only when they are all of the context:
+/// recurrent state and windowed rows would have to travel with them.
+fn pages_alone_hold_kv(kv: &crate::store::kv::KvStore) -> bool {
+    kv.window().is_none() && crate::model::model().rs_caps().state_size == 0
+}
+
+/// Published prefixes are shared only among processes of the same program,
+/// since it is the program that vouches for what its pages hold.
+fn prefix_scope(ctx: &ProcessCtx) -> crate::store::kv::hash::Hash256 {
+    crate::store::kv::hash::cache_domain(ctx.program.as_bytes())
+}
+
 impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
     async fn new(&mut self) -> Result<Resource<KvWorkingSet>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
@@ -141,6 +153,47 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
             }
             Err(error) => Ok(Err(error.to_string())),
         }
+    }
+
+    async fn publish_prefix(
+        &mut self,
+        this: Resource<KvWorkingSet>,
+        tokens: Vec<u32>,
+    ) -> Result<Result<u32, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let ws = self.ctx().table.get(&this)?.clone();
+        let scope = prefix_scope(self);
+        let stores = store_registry::get(ws.model, ws.engine);
+        let published = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+            if !pages_alone_hold_kv(kv) {
+                return Ok(0);
+            }
+            kv.publish_prefix(ws.id, scope, &tokens, stores.kv_page_size)
+        });
+        Ok(published
+            .map(|pages| pages as u32)
+            .map_err(|e| e.to_string()))
+    }
+
+    async fn adopt_prefix(
+        &mut self,
+        this: Resource<KvWorkingSet>,
+        tokens: Vec<u32>,
+    ) -> Result<Result<u32, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let ws = self.ctx().table.get(&this)?.clone();
+        let scope = prefix_scope(self);
+        let stores = store_registry::get(ws.model, ws.engine);
+        let page_size = stores.kv_page_size;
+        let adopted = store_registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+            if !pages_alone_hold_kv(kv) {
+                return Ok(None);
+            }
+            crate::pipeline::fire::kv::match_prefix(kv, ws.id, Some(scope), &tokens, page_size)
+        });
+        Ok(adopted
+            .map(|pages| pages.unwrap_or(0) as u32 * page_size)
+            .map_err(|e| e.to_string()))
     }
 
     async fn discard(

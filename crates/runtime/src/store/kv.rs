@@ -206,7 +206,6 @@ pub struct KvStore {
     opaque_nonce: Hash256,
     opaque_counter: u64,
     domain: Hash256,
-    #[cfg(test)]
     cas: HashMap<Hash256, CasEntry>,
     indexes: HashMap<Vec<u8>, KvIndexEntry>,
     seq: u64,
@@ -215,7 +214,6 @@ pub struct KvStore {
     window: Option<window::WindowPool>,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct CasEntry {
     node: NodeId,
@@ -257,7 +255,6 @@ impl KvStore {
             opaque_nonce,
             opaque_counter: 0,
             domain: hash::cache_domain(&opaque_nonce),
-            #[cfg(test)]
             cas: HashMap::new(),
             indexes: HashMap::new(),
             seq: 0,
@@ -1025,28 +1022,18 @@ impl KvStore {
         }
         self.recycle_backings(freed, seq);
 
-        let intents = {
-            #[cfg(test)]
-            {
-                let mut intents = Vec::new();
-                for (target, commit) in prepared.targets.iter().zip(commits) {
-                    if commit.page_hash.is_none() {
-                        continue;
-                    }
-                    let Some(key) = commit.token_hashes.iter().rev().find_map(|h| *h) else {
-                        continue;
-                    };
-                    if let Ok((node, local)) = self.table.locate_page(ws, target.index()) {
-                        intents.push(CasIntent { key, node, local });
-                    }
-                }
-                intents
+        let mut intents = Vec::new();
+        for (target, commit) in prepared.targets.iter().zip(commits) {
+            if commit.page_hash.is_none() {
+                continue;
             }
-            #[cfg(not(test))]
-            {
-                Vec::new()
+            let Some(key) = commit.token_hashes.iter().rev().find_map(|h| *h) else {
+                continue;
+            };
+            if let Ok((node, local)) = self.table.locate_page(ws, target.index()) {
+                intents.push(CasIntent { key, node, local });
             }
-        };
+        }
         Ok((seq, intents))
     }
 
@@ -1059,7 +1046,6 @@ impl KvStore {
     }
 
     pub fn settle(&mut self, seq: u64, intents: Vec<CasIntent>, success: bool) {
-        #[cfg(test)]
         if success {
             for intent in intents {
                 if self
@@ -1078,8 +1064,6 @@ impl KvStore {
             }
             self.prune_cas_if_bloated();
         }
-        #[cfg(not(test))]
-        let _ = (intents, success);
         self.in_flight = self.in_flight.saturating_sub(1);
         self.outstanding.remove(&seq);
         self.retire_idle();
@@ -1183,7 +1167,6 @@ impl KvStore {
         Ok((mapped - 1) * page_size as u64 + last as u64)
     }
 
-    #[cfg(test)]
     pub fn lookup_cached_page(&mut self, key: &Hash256) -> Option<(NodeId, u64)> {
         let entry = *self.cas.get(key)?;
         let location = TriePageLocation {
@@ -1202,12 +1185,6 @@ impl KvStore {
         (resident && !pinned).then_some((entry.node, entry.local))
     }
 
-    #[cfg(not(test))]
-    pub fn lookup_cached_page(&mut self, _key: &Hash256) -> Option<(NodeId, u64)> {
-        None
-    }
-
-    #[cfg(test)]
     fn prune_cas_if_bloated(&mut self) {
         let cap = (self.pool.capacity() as usize).saturating_mul(4).max(1024);
         if self.cas.len() > cap {
@@ -1269,6 +1246,51 @@ impl KvStore {
         self.table.set_chain_state(ws, Some(*key))?;
         self.invalidate_flat(ws);
         Ok(Some(pages))
+    }
+
+    /// Content-address `ws`'s leading full pages as the KV of `tokens`, chained
+    /// from `scope` so only callers naming the same scope find them, and lease
+    /// them as a cache root, so `adopt_cached_prefix` can map them into any
+    /// other working set until pool pressure drops the lease. Returns the pages
+    /// published.
+    pub fn publish_prefix(
+        &mut self,
+        ws: WorkingSetId,
+        scope: Hash256,
+        tokens: &[u32],
+        page_size: u32,
+    ) -> Result<u64, KvStoreError> {
+        let ps = page_size.max(1) as usize;
+        let pages = ((tokens.len() / ps) as u64).min(self.table.mapped_len(ws)?);
+        if pages == 0 {
+            return Ok(0);
+        }
+        let mut previous = Some(scope);
+        for page in 0..pages {
+            let at = page as usize * ps;
+            let mut token_hashes = Vec::with_capacity(ps);
+            for (offset, &token) in tokens[at..at + ps].iter().enumerate() {
+                let hash = hash::chain_token_slot_hash(
+                    &self.domain,
+                    previous.as_ref(),
+                    token,
+                    (at + offset) as u32,
+                );
+                previous = Some(hash);
+                token_hashes.push(Some(hash));
+            }
+            let page_hash = Some(hash::page_hash(&token_hashes));
+            if self.table.page_hash_at(ws, page)? != page_hash {
+                self.table
+                    .commit_in_place(ws, page, token_hashes, page_hash)?;
+            }
+            let (node, local) = self.table.locate_page(ws, page)?;
+            let key = previous.expect("a page holds at least one token");
+            self.cas.insert(key, CasEntry { node, local });
+        }
+        self.table.lease_prefix(ws, pages)?;
+        self.prune_cas_if_bloated();
+        Ok(pages)
     }
 
     pub fn adopt_offloaded_prefix(

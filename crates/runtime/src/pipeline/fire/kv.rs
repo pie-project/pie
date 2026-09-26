@@ -265,6 +265,7 @@ fn realize_declaration_impl(
 pub fn match_prefix(
     store: &mut KvStore,
     ws: WorkingSetId,
+    scope: Option<Hash256>,
     tokens: &[u32],
     page_size: u32,
 ) -> Result<Option<u64>, KvError> {
@@ -277,7 +278,7 @@ pub fn match_prefix(
         return Ok(None);
     }
     let domain = store.domain();
-    let mut prev: Option<Hash256> = None;
+    let mut prev = scope;
     let mut boundaries = Vec::with_capacity(max_pages);
     for (i, &tok) in tokens[..max_pages * ps].iter().enumerate() {
         let h = hash::chain_token_slot_hash(&domain, prev.as_ref(), tok, i as u32);

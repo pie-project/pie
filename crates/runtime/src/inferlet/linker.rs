@@ -166,8 +166,9 @@ impl Linker {
         let generation = main.generation;
         let component = main.component;
 
-        let process_ctx =
+        let mut process_ctx =
             ProcessCtx::new(process_id, username, output, &policy, main.script).await?;
+        process_ctx.program = program_name.to_string();
         let mut store = Store::new(&engine, process_ctx);
 
         let base_linker = Self::base_linker(&engine, &policy, &base_linker_cache).await?;

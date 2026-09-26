@@ -76,6 +76,20 @@ interface working-set {
         // from-index remain valid. Returns false when the key is absent.
         remove-index: static func(key: list<u8>) -> result<bool, error>;
 
+        // Content-addressed prefix cache. `publish-prefix` offers this set's
+        // leading full pages as the KV of `tokens` (the caller vouches, as for
+        // `update-index`, that page i holds exactly the model's KV of
+        // tokens[0 .. (i+1)*page-size), written by a settled fire with no hooks
+        // or masks) and returns the pages it published. `adopt-prefix` maps the
+        // longest published page-aligned prefix of `tokens` into this still-
+        // empty set, always leaving the last token to compute, and returns the
+        // tokens it covers. Published pages are seen only by processes of the
+        // same program and live until pool pressure reclaims them. A model
+        // whose context is not held in pages alone (recurrent state, windowed
+        // rows) publishes and adopts nothing.
+        publish-prefix: func(tokens: list<u32>) -> result<u32, error>;
+        adopt-prefix: func(tokens: list<u32>) -> result<u32, error>;
+
         // Remove `ranges` (pre-discard indexes, applied atomically) from the
         // mapping, ordered on `on`. Suffix indexes shift; no tombstone
         // remains. Rejected when an interior range on a shared path would

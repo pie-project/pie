@@ -396,6 +396,14 @@ impl WorkingSet {
         KvWorkingSet::remove_index(key)
     }
 
+    pub fn publish_prefix(&self, tokens: &[u32]) -> Result<u32, String> {
+        self.kv.publish_prefix(tokens)
+    }
+
+    pub fn adopt_prefix(&self, tokens: &[u32]) -> Result<u32, String> {
+        self.kv.adopt_prefix(tokens)
+    }
+
     pub fn discard(&self, on: &Pipeline, ranges: &[PageRange]) -> Result<(), String> {
         self.kv.discard(&on.wit, ranges)
     }
