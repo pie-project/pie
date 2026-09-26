@@ -307,12 +307,20 @@ fn refit_lanes(
     let fitted = crate::store::tokens_within(asked, 1, room, |lanes| working_at(lanes, true));
     let one_sequence = crate::store::one_slot_bytes(&boot.trace, paging)?;
     let slab = sequence.saturating_sub(one_sequence);
+    let room_at = |lanes: u32| {
+        live.saturating_sub(crate::store::BODIES_FLOOR_BYTES)
+            .saturating_sub(working_at(lanes, true))
+    };
     let lanes = if slab == 0 {
-        fitted
+        let pages = crate::store::kv_page_bytes(&boot.trace, paging)?;
+        crate::store::lanes_within_seats(fitted, 8, room_at, |room| {
+            crate::store::sequences_within(paging, pages, room)
+        })
     } else {
-        crate::store::lanes_within_seats(fitted, 8, paging.slots, one_sequence, slab, |lanes| {
-            live.saturating_sub(crate::store::BODIES_FLOOR_BYTES)
-                .saturating_sub(working_at(lanes, true))
+        crate::store::lanes_within_seats(fitted, 8, room_at, |room| {
+            crate::store::state_slots_within(paging.slots, room, one_sequence, |slots| {
+                u64::from(slots).saturating_mul(slab)
+            }) / 2
         })
     };
     for (stream, plane) in planes.iter().enumerate() {
@@ -345,11 +353,11 @@ fn refit_lanes(
     }
     if lanes < fitted {
         eprintln!(
-            "engine-cuda: [engine] max_forward_requests {fitted} is served at {lanes}: the \
-             runtime admits no more lanes than the state slots seat, and what {fitted} lanes \
-             reserve left the pool fewer seats than lanes; at {lanes} the cache rows have {} \
-             MiB more. State a smaller max_forward_requests to choose it, or a larger \
-             gpu_mem_utilization.",
+            "engine-cuda: [engine] max_forward_requests {fitted} is served at {lanes}: what \
+             {fitted} lanes reserve left the pool fewer sequences at the declared context than \
+             lanes, and a lane past them only holds room they could have; at {lanes} the \
+             cache rows have {} MiB more. State a smaller max_forward_requests to choose it, \
+             or a larger gpu_mem_utilization.",
             working_at(fitted, true).saturating_sub(working_at(lanes, true)) >> 20,
         );
     }
