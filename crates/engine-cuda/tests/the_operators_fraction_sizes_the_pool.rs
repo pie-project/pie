@@ -3,8 +3,9 @@ use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
 use engine_cuda::store::kv::Paging;
 use engine_cuda::store::{
     Accounting, BODIES_FLOOR_BYTES, bodies_allowance, decoded_weight_reserve, holds_within,
-    lanes_within_seats, least_state_slots, one_slot_bytes, pages_within, program_scratch_reserve,
-    state_slots_within, tokens_within, window_fire_bytes, window_of,
+    kv_page_bytes, lanes_within_seats, least_state_slots, one_slot_bytes, pages_within,
+    program_scratch_reserve, sequences_within, state_slots_within, tokens_within,
+    window_fire_bytes, window_of,
 };
 use engine_cuda::{DeviceBoot, Knobs};
 
@@ -43,6 +44,7 @@ fn the_operators_fraction_sizes_the_pool_every_case() {
     a_sliding_row_holds_its_window_and_not_the_context();
     a_hybrids_slots_are_cut_to_what_leaves_the_pages_their_half();
     a_hybrids_lanes_are_levelled_to_the_seats_the_pool_holds();
+    a_kv_only_models_lanes_are_levelled_to_the_sequences_its_pages_seat();
 }
 
 fn a_hybrids_lanes_are_levelled_to_the_seats_the_pool_holds() {
@@ -78,7 +80,9 @@ fn a_hybrids_lanes_are_levelled_to_the_seats_the_pool_holds() {
     };
     assert!(seats(LANES) < 8, "at 256 lanes: {} seats", seats(LANES));
 
-    let lanes = lanes_within_seats(LANES, 8, LANES, ONE_SEQUENCE, SLAB, room_at);
+    let lanes = lanes_within_seats(LANES, 8, room_at, |room| {
+        state_slots_within(LANES, room, ONE_SEQUENCE, |slots| u64::from(slots) * SLAB) / 2
+    });
     assert_eq!(lanes, 8, "halved to the floor");
     assert!(
         seats(lanes) >= lanes,
@@ -92,9 +96,48 @@ fn a_hybrids_lanes_are_levelled_to_the_seats_the_pool_holds() {
         pages / ONE_SEQUENCE
     );
     assert_eq!(
-        lanes_within_seats(LANES, 8, 2 * LANES, ONE_SEQUENCE, SLAB, |_| 1 << 40),
+        lanes_within_seats(LANES, 8, |_| 1 << 40, |_| LANES),
         LANES,
         "a pool that seats the lanes keeps them"
+    );
+}
+
+fn a_kv_only_models_lanes_are_levelled_to_the_sequences_its_pages_seat() {
+    // pie-evals nightly on an RTX 5090: gemma-4-31b 4-bit at a 6144 context,
+    // fires of 2048, held room for 256 lanes and sized the pool to 539
+    // pages (4080 MiB), one sequence. A lane's share of what 256 reserve is
+    // its program rows, its readout row and its two prefill workspaces'
+    // tiles (32 heads of 512 and of 256, 64 rows, f32).
+    const LANES: u32 = 256;
+    const VOCAB: u64 = 262_144;
+    const POOL: u64 = 4080 << 20;
+    const A_LANE: u64 = VOCAB * 2 + 32 * 64 * (512 + 256) * 4;
+    let trace = (models::sku("gemma4-31b-u4g64-kv-bf16")
+        .expect("the catalog ships gemma-4-31b")
+        .trace)(model_dsl::Platform::Cuda);
+    let paging = Paging::of(16, 6144, LANES, 98_304)
+        .expect("a page size of 16 is a paging")
+        .windowed(window_of(&trace).expect("the window reads"), 2048);
+    let pages = kv_page_bytes(&trace, paging).expect("the rows size");
+    assert_eq!(
+        pages,
+        (10 * 2 * 4 * 512 * 2 * 16, 50 * 2 * 16 * 256 * 2 * 16)
+    );
+    let seats = |room: u64| sequences_within(paging, pages, room);
+    assert_eq!(seats(POOL), 1, "the one sequence the load reported");
+
+    // What fewer lanes give back, less the quarter the bodies take of it.
+    let room_at = |lanes: u32| {
+        let back = u64::from(LANES - lanes) * A_LANE + program_scratch_reserve(LANES, VOCAB * 4)
+            - program_scratch_reserve(lanes, VOCAB * 4);
+        POOL + back * 3 / 4
+    };
+    let lanes = lanes_within_seats(LANES, 8, room_at, seats);
+    assert_eq!(lanes, 8, "halved to the floor");
+    assert_eq!(
+        seats(room_at(lanes)),
+        2,
+        "where the pages seat two sequences"
     );
 }
 
