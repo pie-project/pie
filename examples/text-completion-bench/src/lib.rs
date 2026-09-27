@@ -289,7 +289,9 @@ async fn run_one(
     let prefixes = PrefixCache::new(
         concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")).as_bytes(),
     );
-    let (ws, cached) = prefixes.adopt(&prompt_vec).context("adopt cached prefix")?;
+    let (ws, cached_rs, cached) = prefixes
+        .adopt(&prompt_vec, None)
+        .context("adopt cached prefix")?;
     let page_size = kv_page_size();
     let n = prompt_vec.len() as u32;
     let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size);
@@ -329,10 +331,21 @@ async fn run_one(
     // and are submitted straight to the pipeline. When the prompt fits in
     // one chunk the loop body runs zero times and the pass built below is
     // byte-for-byte what this inferlet built before.
-    let spans: Vec<(u32, u32)> = prefill_chunks(n - cached, None)
-        .into_iter()
-        .map(|(base, end)| (cached + base, cached + end))
-        .collect();
+    //
+    // A hybrid model's recurrent state is published only where a chunk
+    // ends, so chunks are also cut at the cache's boundaries.
+    let cuts = prefixes.boundaries(&prompt_vec, cached, None);
+    let mut spans: Vec<(u32, u32)> = Vec::new();
+    for (base, end) in prefill_chunks(n - cached, None) {
+        let (mut base, end) = (cached + base, cached + end);
+        for &cut in &cuts {
+            if base < cut && cut < end {
+                spans.push((base, cut));
+                base = cut;
+            }
+        }
+        spans.push((base, end));
+    }
     let (last_base, last_end) = *spans.last().expect("prefill_chunks is non-empty");
 
     let toks_p = Channel::from(&prompt_i32[last_base as usize..last_end as usize]).named("toks_p");
@@ -430,7 +443,7 @@ async fn run_one(
     // and an attention model takes the empty binding instead.
     let rs_ws: Vec<RsWorkingSet> = match model::pass_kind() {
         model::ForwardKind::Attention => Vec::new(),
-        model::ForwardKind::Hybrid => vec![RsWorkingSet::new()],
+        model::ForwardKind::Hybrid => vec![cached_rs.unwrap_or_default()],
         model::ForwardKind::Recurrent => {
             return Err(
                 "this benchmark has no recurrent-only path (no registered model reports that kind)"
@@ -446,6 +459,7 @@ async fn run_one(
     // the leading prefill chunks (below) and the first frame share it and
     // stay ordered.
     let pipe = Pipeline::new();
+    let mut states = Vec::new();
 
     // Leading prefill chunks: everything except the last span. They only
     // need to extend the KV, but a pass with no epilogue is rejected at
@@ -518,6 +532,9 @@ async fn run_one(
             .take_host::<i32>()
             .await
             .with_context(|| format!("drain prefill chunk @{base}"))?;
+        if let Some(rs) = rs_ws.first().filter(|_| cuts.contains(&end)) {
+            states.push((end, rs.fork(&pipe).context("snapshot prefill state")?));
+        }
     }
 
     let fwd_p = ForwardPass::new();
@@ -744,9 +761,9 @@ async fn run_one(
     if input.report_timing && honor_wait_for_start {
         session::send("t0");
     }
-    // The prefill has landed: offer its full prompt pages to later requests.
+    // The prefill has landed: offer its prompt prefixes to later requests.
     prefixes
-        .publish(&ws, &pipe, &prompt_vec, cached)
+        .publish(&ws, &states, &pipe, &prompt_vec, cached)
         .context("publish prompt prefix")?;
 
     // **THE HOST ARM'S HANDOFF, AND THE WHOLE OF IT.** The token is
