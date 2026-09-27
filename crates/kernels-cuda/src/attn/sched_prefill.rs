@@ -98,6 +98,16 @@ fn graph_tiles(rows: u32, batch: u32, group: u64, head_dim: u32, cc_major: u32) 
     (tile, tiles)
 }
 
+/// The query rows one work item's partials hold: its CTA tile packs `tile`
+/// rows of a request's query heads, so it spans `tile / group` query rows,
+/// and the partials are laid out by query row across every head (the
+/// kernel strides them by `o_indptr`), not by packed row.
+#[must_use]
+pub fn partial_rows(tile: u32, num_qo_heads: u32, num_kv_heads: u32) -> u64 {
+    let group = (num_qo_heads / num_kv_heads.max(1)).max(1);
+    u64::from(tile.div_ceil(group))
+}
+
 #[must_use]
 pub fn graph_padding(
     rows: u32,
@@ -311,15 +321,15 @@ fn layout(
     let mut floats = AlignedAllocator::new(op, float_space);
     if sched.split_kv {
         let heads = u64::from(req.num_qo_heads);
-        let tile_q = u64::from(sched.cta_tile_q);
+        let rows = partial_rows(sched.cta_tile_q, req.num_qo_heads, req.num_kv_heads);
         let head_dim = u64::from(req.head_dim);
         info.v_offset = Some(floats.alloc(
-            (heads * padded as u64 * tile_q * head_dim * 4) as usize,
+            (heads * padded as u64 * rows * head_dim * 4) as usize,
             16,
             "batch_prefill_tmp_v",
         )?);
         info.s_offset = Some(floats.alloc(
-            (heads * padded as u64 * tile_q * 4) as usize,
+            (heads * padded as u64 * rows * 4) as usize,
             16,
             "batch_prefill_tmp_s",
         )?);
@@ -428,4 +438,58 @@ pub fn workspace_size(
         float_bytes: laid.float_bytes,
         int_bytes: laid.int_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_partials_hold_every_row_the_split_writes() {
+        for (q_heads, kv_heads, head_dim) in [(16, 2, 512), (16, 8, 256), (32, 8, 128), (8, 8, 64)]
+        {
+            for qo in [vec![1u32; 64], vec![1, 7, 300, 1, 33], vec![2048]] {
+                for graph in [true, false] {
+                    let qo_indptr: Vec<i32> = std::iter::once(0)
+                        .chain(qo.iter().scan(0, |at, len| {
+                            *at += *len as i32;
+                            Some(*at)
+                        }))
+                        .collect();
+                    let kv_indptr: Vec<i32> =
+                        (0..=qo.len() as i32).map(|lane| lane * 384).collect();
+                    let rows = *qo_indptr.last().unwrap() as u32;
+                    let req = Request {
+                        qo_indptr: &qo_indptr,
+                        kv_indptr: &kv_indptr,
+                        total_num_rows: rows,
+                        batch_size: qo.len() as u32,
+                        lane_offset: 0,
+                        live: Live {
+                            requests: qo.len() as u32,
+                            lane_offset: 0,
+                            row_offset: 0,
+                            rows,
+                        },
+                        num_qo_heads: q_heads,
+                        num_kv_heads: kv_heads,
+                        head_dim,
+                        page_size: 16,
+                        enable_cuda_graph: graph,
+                        window_left: None,
+                    };
+                    let sched = schedule("test", &req, &Device::L40S).unwrap();
+                    let laid = layout("test", &req, &sched, usize::MAX, usize::MAX).unwrap();
+                    let (Some(v), Some(s)) = (laid.info.v_offset, laid.info.s_offset) else {
+                        continue;
+                    };
+                    let written = u64::from(*sched.o_indptr.last().unwrap() as u32)
+                        * u64::from(q_heads)
+                        * u64::from(head_dim)
+                        * 4;
+                    assert!(written <= u64::from(s - v), "{q_heads}/{kv_heads} {qo:?}");
+                }
+            }
+        }
+    }
 }

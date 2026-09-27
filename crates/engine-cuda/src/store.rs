@@ -246,62 +246,6 @@ pub fn state_slots_within(
     least_state_slots(u32::try_from(seats).unwrap_or(u32::MAX))
 }
 
-/// The lanes a load is served at: a lane past the sequences the pool seats
-/// only holds room the seats could have. The lanes halve toward `floor`
-/// while they outnumber `seats_in(room_at(lanes))`, the seats in the pool's
-/// room with what that many lanes reserve given back: a hybrid's in state
-/// slots (`state_slots_within`), a kv-only model's in pages
-/// (`sequences_within`).
-#[must_use]
-pub fn lanes_within_seats(
-    lanes: u32,
-    floor: u32,
-    room_at: impl Fn(u32) -> u64,
-    seats_in: impl Fn(u64) -> u32,
-) -> u32 {
-    tokens_within(lanes, floor.min(lanes), 0, |lanes| {
-        u64::from(lanes.saturating_sub(seats_in(room_at(lanes))))
-    })
-}
-
-/// The bytes a kv page takes across the rows read through the context, and
-/// across the windowed rows, whose pages `Paging::window_pages_at` counts.
-pub fn kv_page_bytes(trace: &Trace, paging: Paging) -> Result<(u64, u64)> {
-    let (mut plain, mut windowed) = (0u64, 0u64);
-    for row in &trace.caches {
-        if let CacheRow::Kv {
-            name,
-            planes,
-            dtype,
-            window,
-            ..
-        } = row
-        {
-            let page = u64::from(paging.page_size) * elem_bytes(name, *dtype)?;
-            let bytes: u64 = planes.iter().map(|width| page * width).sum();
-            match (window, paging.window) {
-                (Some(_), Some(_)) => windowed = windowed.saturating_add(bytes),
-                _ => plain = plain.saturating_add(bytes),
-            }
-        }
-    }
-    Ok((plain, windowed))
-}
-
-/// The sequences at the declared context a kv-only pool seats in `room`:
-/// the pages it declares there at `page_bytes` (`kv_page_bytes`), whole
-/// sequences of them, as admission hands them out.
-#[must_use]
-pub fn sequences_within(paging: Paging, page_bytes: (u64, u64), room: u64) -> u32 {
-    let (plain, windowed) = page_bytes;
-    let pages = pages_within(paging.pages, room, |pages| {
-        pages
-            .saturating_mul(plain)
-            .saturating_add(paging.window_pages_at(pages).saturating_mul(windowed))
-    });
-    u32::try_from(pages / u64::from(paging.pages_per_slot.max(1))).unwrap_or(u32::MAX)
-}
-
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut bytes: u64 = 0;
     for row in &trace.caches {

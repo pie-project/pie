@@ -1,5 +1,5 @@
 use kernels_cuda::Tensor;
-use kernels_cuda::attn::plan::{Device, Workspace, prefill_graph_padding};
+use kernels_cuda::attn::plan::{Device, Workspace, prefill_graph_padding, prefill_partial_rows};
 use model_compiler::Budget;
 use model_ir::{Dtype, StructKind};
 
@@ -34,9 +34,9 @@ fn prefill_float_bytes(facts: &SpaceFacts, rows: u32, lanes: u32, device: &Devic
         device,
     );
     let heads = u64::from(facts.q_heads);
-    let tile = u64::from(tile);
-    let v = heads * padded * tile * u64::from(facts.head_dim) * 4;
-    let s = heads * padded * tile * 4;
+    let rows = prefill_partial_rows(tile, facts.q_heads, facts.kv_heads);
+    let v = heads * padded * rows * u64::from(facts.head_dim) * 4;
+    let s = heads * padded * rows * 4;
     (v + s).next_multiple_of(ALIGN) + 2 * ALIGN
 }
 
@@ -65,13 +65,12 @@ fn plan_floats(budget: &Budget, facts: &Facts, device: &Device) -> Vec<Option<u6
         .map(|seat| {
             seat.map(|seat| {
                 match seat.kind {
-                    StructKind::AttnPrefillPlan => graph_float_bytes(&seat.reading, device.num_sm)
-                        .max(prefill_float_bytes(
-                            &seat.reading,
-                            budget.buckets.last().copied().unwrap_or(budget.max_tokens),
-                            budget.max_lanes,
-                            device,
-                        )),
+                    StructKind::AttnPrefillPlan => prefill_float_bytes(
+                        &seat.reading,
+                        budget.buckets.last().copied().unwrap_or(budget.max_tokens),
+                        budget.max_lanes,
+                        device,
+                    ),
                     StructKind::AttnPrefillPlanSm90 => {
                         graph_float_bytes(&seat.reading, device.num_sm)
                     }

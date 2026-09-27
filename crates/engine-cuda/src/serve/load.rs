@@ -292,7 +292,10 @@ fn refit_lanes(
                 &schedule_streams(&boot.trace, &compiled),
             ))
             .saturating_add(tiles)
-            .saturating_add(crate::store::program_scratch_reserve(lanes, out_row))
+            .saturating_add(crate::store::program_scratch_reserve(
+                lanes.min(device.device().num_sm),
+                out_row,
+            ))
             .saturating_add(
                 u64::from(lanes)
                     .saturating_mul(u64::from(tokens))
@@ -306,25 +309,7 @@ fn refit_lanes(
     if working_at(asked, false) <= room {
         return Ok((compiled, budgets, tiles_of(&planes, false)));
     }
-    let fitted = crate::store::tokens_within(asked, 1, room, |lanes| working_at(lanes, true));
-    let one_sequence = crate::store::one_slot_bytes(&boot.trace, paging)?;
-    let slab = sequence.saturating_sub(one_sequence);
-    let room_at = |lanes: u32| {
-        live.saturating_sub(crate::store::BODIES_FLOOR_BYTES)
-            .saturating_sub(working_at(lanes, true))
-    };
-    let lanes = if slab == 0 {
-        let pages = crate::store::kv_page_bytes(&boot.trace, paging)?;
-        crate::store::lanes_within_seats(fitted, 8, room_at, |room| {
-            crate::store::sequences_within(paging, pages, room)
-        })
-    } else {
-        crate::store::lanes_within_seats(fitted, 8, room_at, |room| {
-            crate::store::state_slots_within(paging.slots, room, one_sequence, |slots| {
-                u64::from(slots).saturating_mul(slab)
-            }) / 2
-        })
-    };
+    let lanes = crate::store::tokens_within(asked, 1, room, |lanes| working_at(lanes, true));
     for (stream, plane) in planes.iter().enumerate() {
         if plane.widest > plane.at_tokens {
             eprintln!(
@@ -340,29 +325,17 @@ fn refit_lanes(
     if lanes == asked || working_at(lanes, true) > room {
         return Ok((compiled, budgets, tiles_of(&planes, true)));
     }
-    if fitted < asked {
-        eprintln!(
-            "engine-cuda: [engine] max_forward_requests {asked} is served at {fitted}: at \
-             {asked} the activation arena, attention workspaces, decoded-weight tiles and guest \
-             programs take {} MiB of the {} MiB this card has after the weight tier under \
-             [engine] gpu_mem_utilization, and one sequence at the declared context and the \
-             bodies' floor need {} MiB beside them. State a smaller max_forward_requests to \
-             choose it, or a larger gpu_mem_utilization.",
-            working_at(asked, true) >> 20,
-            live >> 20,
-            (sequence + crate::store::BODIES_FLOOR_BYTES) >> 20,
-        );
-    }
-    if lanes < fitted {
-        eprintln!(
-            "engine-cuda: [engine] max_forward_requests {fitted} is served at {lanes}: what \
-             {fitted} lanes reserve left the pool fewer sequences at the declared context than \
-             lanes, and a lane past them only holds room they could have; at {lanes} the \
-             cache rows have {} MiB more. State a smaller max_forward_requests to choose it, \
-             or a larger gpu_mem_utilization.",
-            working_at(fitted, true).saturating_sub(working_at(lanes, true)) >> 20,
-        );
-    }
+    eprintln!(
+        "engine-cuda: [engine] max_forward_requests {asked} is served at {lanes}: at \
+         {asked} the activation arena, attention workspaces, decoded-weight tiles and guest \
+         programs take {} MiB of the {} MiB this card has after the weight tier under \
+         [engine] gpu_mem_utilization, and one sequence at the declared context and the \
+         bodies' floor need {} MiB beside them. State a smaller max_forward_requests to \
+         choose it, or a larger gpu_mem_utilization.",
+        working_at(asked, true) >> 20,
+        live >> 20,
+        (sequence + crate::store::BODIES_FLOOR_BYTES) >> 20,
+    );
     boot.budget = budget_at(lanes);
     let budgets = budgets_at(&boot.budget);
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, profile)?;
@@ -816,8 +789,13 @@ impl Shell {
         // programs will take at the admitted lane count is held through both,
         // since they arrive after the pool is declared and the fires that
         // bring them are past static admission by then.
+        // A guest program's epilogue launches a block a lane, so a flight
+        // past the card's SMs runs in waves anyway: a wider group flies in
+        // several, and its scratch is held at this width, not at the lanes.
+        let flight = shell.device.device().num_sm;
+        shell.programs.set_flight(flight);
         let programs = crate::store::program_scratch_reserve(
-            boot.budget.max_lanes,
+            boot.budget.max_lanes.min(flight),
             shell.out_width().map_or(0, |width| width.saturating_mul(4)),
         );
         // A plane stored as codes and scales is decoded to bf16 before a

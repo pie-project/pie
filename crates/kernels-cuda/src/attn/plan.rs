@@ -484,7 +484,9 @@ pub fn plan_prefill(
     })
 }
 
-pub use crate::attn::sched_prefill::graph_padding as prefill_graph_padding;
+pub use crate::attn::sched_prefill::{
+    graph_padding as prefill_graph_padding, partial_rows as prefill_partial_rows,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn plan_prefill_sm90(
