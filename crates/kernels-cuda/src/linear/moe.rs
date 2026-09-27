@@ -734,6 +734,71 @@ pub(crate) fn select_gemv(
     )
 }
 
+const EXPERT_CAP: u32 = 4096;
+const GROUPED_TILE_N: u32 = 128;
+const GROUPED_BLOCK: u32 = 256;
+const WMMA_ROUTES: u32 = 32;
+
+// The by-route kernels stream each route's expert at the card's rate and the
+// grouped ones read a touched expert once but fill their tiles only as routes
+// pile up; measured on 32- and 128-expert mxfp4 and affine-u4 banks at top-4, 8
+// and 16, grouping overtakes past 80 routes whatever the bank's width.
+const GROUPED_PAST: u32 = 80;
+
+const fn groups_routes(route_count: u32) -> bool {
+    route_count > GROUPED_PAST
+}
+
+struct RouteOrder {
+    order: u64,
+    offsets: u64,
+    work: u64,
+    work_cap: u32,
+}
+
+fn route_order(
+    ctx: &Ctx,
+    op: &'static str,
+    routes: Tensor,
+    fan: &Selected,
+    experts: u32,
+) -> Result<RouteOrder, Error> {
+    const ORDER_BLOCK: u32 = 1024;
+    let offsets_at = (fan.route_count as usize).next_multiple_of(64);
+    let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
+    let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
+    let order = ctx.scratch(
+        op,
+        "moe_route_order",
+        (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
+    )? as usize as u64;
+    let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
+    let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
+    ctx.fire(
+        op,
+        Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
+            .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
+        &[
+            routes.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            stated(op, work_cap)?.arg(),
+            WMMA_ROUTES.arg(),
+            fan.top_k.arg(),
+            stated(op, fan.route_count)?.arg(),
+            stated(op, experts)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(RouteOrder {
+        order,
+        offsets,
+        work,
+        work_cap,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn matmul_select_mxfp4(
     ctx: &Ctx,
@@ -774,49 +839,14 @@ fn matmul_select_mxfp4(
     let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
-    const ROUTE_ORDER: &str = "moe_route_order";
-    const ORDER_BLOCK: u32 = 1024;
-    const EXPERT_CAP: u32 = 4096;
-    // The grouped kernels read an expert once per batch of its routes, the
-    // by-route one once per route but at the card's streaming rate, so grouping
-    // pays only once an expert serves more than two routes on average; routes
-    // over experts is a floor on that average.
-    const GROUPED_REUSE: u32 = 2;
-    const GROUPED_TILE_N: u32 = 128;
-    const GROUPED_BLOCK: u32 = 256;
-    const WMMA_ROUTES: u32 = 32;
-
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    if fan.route_count > GROUPED_REUSE * experts && std::env::var_os("PIE_NO_MXFP4_GROUP").is_none()
-    {
-        let order_words = fan.route_count as usize;
-        let offsets_at = order_words.next_multiple_of(64);
-        let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
-        let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
-        let order = ctx.scratch(
-            op,
-            ROUTE_ORDER,
-            (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
-        )? as usize as u64;
-        let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
-        let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
-        ctx.fire(
-            op,
-            Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
-                .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
-            &[
-                routes.arg(),
-                ArgValue::Ptr(order),
-                ArgValue::Ptr(offsets),
-                ArgValue::Ptr(work),
-                stated(op, work_cap)?.arg(),
-                WMMA_ROUTES.arg(),
-                fan.top_k.arg(),
-                stated(op, fan.route_count)?.arg(),
-                stated(op, experts)?.arg(),
-                ctx.stage(),
-            ],
-        )?;
+    if groups_routes(fan.route_count) && std::env::var_os("PIE_NO_MXFP4_GROUP").is_none() {
+        let RouteOrder {
+            order,
+            offsets,
+            work,
+            work_cap,
+        } = route_order(ctx, op, routes, &fan, experts)?;
         let wmma = x.dtype == Dtype::Bf16 && std::env::var_os("PIE_MXFP4_NO_WMMA").is_none();
         let entry = if wmma {
             "::pie::linear::moe_matmul_select_mxfp4_wmma".to_string()
@@ -990,43 +1020,14 @@ fn matmul_select_mlxu4(
     let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
 
-    const ROUTE_ORDER: &str = "moe_route_order";
-    const ORDER_BLOCK: u32 = 1024;
-    const EXPERT_CAP: u32 = 4096;
-    const GROUPED_FROM: u32 = 16;
-    const GROUPED_TILE_N: u32 = 128;
-    const GROUPED_BLOCK: u32 = 256;
-    const WMMA_ROUTES: u32 = 32;
     let experts = codes.rows.clamp(1, EXPERT_CAP);
-    let order_words = fan.route_count as usize;
-    let offsets_at = order_words.next_multiple_of(64);
-    let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
-    let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
-    let order = ctx.scratch(
-        op,
-        ROUTE_ORDER,
-        (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
-    )? as usize as u64;
-    let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
-    let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
-    ctx.fire(
-        op,
-        Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
-            .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
-        &[
-            routes.arg(),
-            ArgValue::Ptr(order),
-            ArgValue::Ptr(offsets),
-            ArgValue::Ptr(work),
-            stated(op, work_cap)?.arg(),
-            WMMA_ROUTES.arg(),
-            fan.top_k.arg(),
-            stated(op, fan.route_count)?.arg(),
-            stated(op, experts)?.arg(),
-            ctx.stage(),
-        ],
-    )?;
-    if fan.route_count >= GROUPED_FROM {
+    if groups_routes(fan.route_count) {
+        let RouteOrder {
+            order,
+            offsets,
+            work,
+            work_cap,
+        } = route_order(ctx, op, routes, &fan, experts)?;
         let entry = if x.dtype == Dtype::Bf16 {
             format!(
                 "::pie::linear::moe_matmul_select_mlxu4_wmma<::pie::i32({bits}), ::pie::i32({group})>"
@@ -1083,7 +1084,6 @@ fn matmul_select_mlxu4(
         &[
             x.arg(),
             routes.arg(),
-            ArgValue::Ptr(order),
             codes.arg(),
             scales.arg(),
             biases.arg(),
