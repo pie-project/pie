@@ -333,20 +333,45 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
 
     use crate::device::ctx::check;
 
-    const PROBE: usize = 4096;
+    let off = |why: String| Fault::program("comm::open_peers", why);
     let world = u32::try_from(ordinals.len()).unwrap_or(u32::MAX);
     if !matches!(world, 2 | 4 | 8) {
-        return Ok(None);
+        return Err(off(format!("no peer kernel for a group of {world}")));
     }
     for &a in ordinals {
+        let mut vmm = 0;
+        // SAFETY: a live out-parameter; a driver device is its ordinal.
+        let asked = unsafe {
+            cudarc::driver::sys::cuDeviceGetAttribute(
+                &raw mut vmm,
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
+                a,
+            )
+        };
+        if asked != cudarc::driver::sys::CUresult::CUDA_SUCCESS || vmm == 0 {
+            return Err(off(format!("cuda:{a} does not map memory for peers")));
+        }
         for &b in ordinals.iter().filter(|&&b| b != a) {
             let mut reach = 0;
-            // SAFETY: a live out-parameter and two ordinals the runtime counts.
-            check("cudaDeviceCanAccessPeer", unsafe {
-                rt::cudaDeviceCanAccessPeer(&raw mut reach, a, b)
-            })?;
-            if reach == 0 {
-                return Ok(None);
+            let mut native = 0;
+            // SAFETY: live out-parameters and two ordinals the runtime counts.
+            unsafe {
+                check(
+                    "cudaDeviceCanAccessPeer",
+                    rt::cudaDeviceCanAccessPeer(&raw mut reach, a, b),
+                )?;
+                check(
+                    "cudaDeviceGetP2PAttribute",
+                    rt::cudaDeviceGetP2PAttribute(
+                        &raw mut native,
+                        rt::cudaDeviceP2PAttr::cudaDevP2PAttrAccessSupported,
+                        a,
+                        b,
+                    ),
+                )?;
+            }
+            if reach == 0 || native == 0 {
+                return Err(off(format!("cuda:{a} cannot access cuda:{b}")));
             }
         }
     }
@@ -372,56 +397,14 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
             tables.push(signal + kernels_cuda::collective::SIGNAL_BYTES);
         }
     }
-    // cudaDeviceCanAccessPeer is what the driver advertises; a copy through
-    // the mapping is what the link delivers.
-    let mut seen = vec![0u8; PROBE];
-    for (a, &from) in ordinals.iter().enumerate() {
-        for (b, &to) in ordinals.iter().enumerate().filter(|&(_, &to)| to != from) {
-            // SAFETY: both stages are live allocations of at least PROBE bytes.
-            unsafe {
-                check("cudaSetDevice", rt::cudaSetDevice(to))?;
-                check(
-                    "cudaMemset",
-                    rt::cudaMemset(stages[b] as *mut c_void, 0, PROBE),
-                )?;
-                check("cudaSetDevice", rt::cudaSetDevice(from))?;
-                check(
-                    "cudaMemset",
-                    rt::cudaMemset(stages[a] as *mut c_void, 0x5a, PROBE),
-                )?;
-                check(
-                    "cudaMemcpyPeer",
-                    rt::cudaMemcpyPeer(
-                        stages[b] as *mut c_void,
-                        to,
-                        stages[a] as *const c_void,
-                        from,
-                        PROBE,
-                    ),
-                )?;
-                check("cudaSetDevice", rt::cudaSetDevice(to))?;
-                check(
-                    "cudaMemcpy",
-                    rt::cudaMemcpy(
-                        seen.as_mut_ptr().cast(),
-                        stages[b] as *const c_void,
-                        PROBE,
-                        rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
-                    ),
-                )?;
-            }
-            if seen.iter().any(|&byte| byte != 0x5a) {
-                return Ok(None);
-            }
-        }
-    }
     let mut bytes = Vec::with_capacity(table);
     for word in stages.iter().chain(&signals) {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
     let mut peers = Vec::with_capacity(ordinals.len());
     for (rank, &a) in ordinals.iter().enumerate() {
-        // SAFETY: the table region is `table` bytes past this rank's signal.
+        // SAFETY: the table region is `table` bytes past this rank's signal,
+        // and the stage is at least a word.
         unsafe {
             check("cudaSetDevice", rt::cudaSetDevice(a))?;
             check(
@@ -432,6 +415,10 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
                     table,
                     rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
                 ),
+            )?;
+            check(
+                "cudaMemset",
+                rt::cudaMemset(stages[rank] as *mut c_void, 0x40 + rank as i32, 4),
             )?;
         }
         peers.push(kernels_cuda::collective::Peers {
@@ -444,6 +431,51 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
             signals: tables[rank] + size_of::<[u64; 8]>() as u64,
             reach: u64::MAX,
         });
+    }
+    // What the driver advertises is not always what the link carries (#757).
+    // Every rank posts to and reads from every peer with the stores and loads
+    // the collectives use, but in a kernel that never waits: the first round
+    // posts, and the second, after every device has drained, finds what
+    // arrived.
+    let mut statuses = Vec::with_capacity(ordinals.len());
+    for (&a, _) in ordinals.iter().zip(&peers) {
+        crate::device::ctx::bind_thread(a)?;
+        statuses.push(crate::device::Buffer::zeroed(4)?);
+    }
+    for _ in 0..2 {
+        for ((&a, peers), status) in ordinals.iter().zip(&peers).zip(&statuses) {
+            crate::device::ctx::bind_thread(a)?;
+            // SAFETY: the device's legacy stream; the stages and tables are live.
+            let ctx = unsafe { kernels_cuda::Ctx::on(core::ptr::null_mut()) };
+            peers
+                .answer(&ctx, status.ptr())
+                .map_err(crate::error::kernel)?;
+        }
+        for &a in ordinals {
+            crate::device::ctx::bind_thread(a)?;
+            // SAFETY: no arguments; waits for the rounds' kernels.
+            check("cudaDeviceSynchronize", unsafe {
+                rt::cudaDeviceSynchronize()
+            })?;
+        }
+    }
+    for (&a, status) in ordinals.iter().zip(&statuses) {
+        crate::device::ctx::bind_thread(a)?;
+        let mut word = [0u8; 4];
+        status.read(0, &mut word)?;
+        match u32::from_le_bytes(word) {
+            0 => {}
+            1 => {
+                return Err(off(format!(
+                    "cuda:{a} heard nothing from a peer through the mapping"
+                )));
+            }
+            _ => {
+                return Err(off(format!(
+                    "cuda:{a} read the wrong word from a peer's stage"
+                )));
+            }
+        }
     }
     Ok(Some(peers))
 }

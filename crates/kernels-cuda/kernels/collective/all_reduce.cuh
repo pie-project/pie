@@ -54,4 +54,32 @@ __global__ void __launch_bounds__(512, 1) all_gather_peers(
     vllm::multi_gpu_barrier<ngpus, false>(sg, self, rank);
 }
 
+
+// The group's open checks the path before any collective spins on it. Each
+// rank posts a token to every peer's inbox (the tail of its signal block),
+// then looks once for the peers' tokens and the word each peer wrote at the
+// head of its stage. Run twice with every device synchronized in between, the
+// second run finds every token the link delivered; nothing here waits, so a
+// link that does not carry peer traffic leaves the context usable.
+__global__ void peers_answer(
+    const vllm::RankData* __restrict__ stages, const vllm::RankSignals* __restrict__ signals,
+    vllm::Signal* self, int rank, int ngpus, unsigned* status)
+{
+    constexpr int kInbox = 4096 - 64;
+    auto inbox = [](vllm::Signal* sg) {
+        return reinterpret_cast<vllm::FlagType*>(reinterpret_cast<char*>(sg) + kInbox);
+    };
+    for (int k = 0; k < ngpus; k++) {
+        if (k != rank) vllm::st_flag_release(inbox(signals->signals[k]) + rank, 1u);
+    }
+    unsigned verdict = 0;
+    for (int k = 0; k < ngpus; k++) {
+        if (k == rank) continue;
+        const unsigned want = 0x01010101u * static_cast<unsigned>(0x40 + k);
+        if (vllm::ld_flag_acquire(inbox(self) + k) != 1u) verdict = 1;
+        else if (*static_cast<const volatile unsigned*>(stages->ptrs[k]) != want) verdict = 2;
+    }
+    *status = verdict;
+}
+
 }
