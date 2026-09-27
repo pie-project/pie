@@ -314,6 +314,9 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         return;
     }
     let started = Instant::now();
+    if let Some(planner) = crate::planner::planner() {
+        planner.admit(ctx.id()).await;
+    }
     let permit = match ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => {
             let _queued = AdmissionQueued::enter(ctx.id());

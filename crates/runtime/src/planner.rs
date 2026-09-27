@@ -452,6 +452,7 @@ struct Proc {
     restore_retried: bool,
     progressed: bool,
     admitted: bool,
+    respawn: bool,
     signal: Arc<Notify>,
     resident: Arc<AtomicBool>,
 }
@@ -464,6 +465,7 @@ impl Proc {
             restore_retried: false,
             progressed: true,
             admitted: false,
+            respawn: false,
             signal: Arc::new(Notify::new()),
             resident: Arc::new(AtomicBool::new(true)),
         }
@@ -524,6 +526,7 @@ struct Inner {
     prepare_blocked: HashSet<ProcessId>,
     killing: HashSet<ProcessId>,
     runway_round_in_flight: bool,
+    admitting: BTreeMap<(u64, ProcessId), Arc<Notify>>,
 }
 
 impl Inner {
@@ -565,6 +568,31 @@ impl Inner {
             proc.resident.store(resident, Ordering::Release);
         }
         n
+    }
+
+    /// The oldest seq the planner has preempted: evicted and not yet restored,
+    /// being killed, or re-spawned by a kill and not yet re-admitted.
+    fn preempted_floor(&self) -> Option<u64> {
+        self.procs
+            .iter()
+            .filter(|(pid, proc)| {
+                proc.state != Residency::Resident || proc.respawn || self.killing.contains(pid)
+            })
+            .map(|(_, proc)| proc.seq)
+            .min()
+    }
+
+    fn admit_unpreempted(&mut self) {
+        if self.admitting.is_empty() {
+            return;
+        }
+        let blocked = match self.preempted_floor() {
+            Some(floor) => self.admitting.split_off(&(floor + 1, ProcessId::nil())),
+            None => BTreeMap::new(),
+        };
+        for notify in std::mem::replace(&mut self.admitting, blocked).into_values() {
+            notify.notify_one();
+        }
     }
 
     fn unmet_head(&self) -> Option<(EntryKey, &Waiter)> {
@@ -889,6 +917,7 @@ impl ResidencyPlanner {
         self.waiters.store(inner.queue.len(), Ordering::Release);
         self.nonresident
             .store(inner.nonresident_count(), Ordering::Release);
+        inner.admit_unpreempted();
         result
     }
 
@@ -902,7 +931,12 @@ impl ResidencyPlanner {
 
     pub fn register_with_seq(&self, pid: ProcessId, seq: u64) {
         self.with_inner(|inner| {
-            inner.procs.insert(pid, Proc::new(seq));
+            let mut proc = Proc::new(seq);
+            proc.respawn = inner
+                .killing
+                .iter()
+                .any(|killed| inner.procs.get(killed).is_some_and(|p| p.seq == seq));
+            inner.procs.insert(pid, proc);
         });
     }
 
@@ -910,16 +944,41 @@ impl ResidencyPlanner {
         self.lock_inner().procs.get(&pid).map(|proc| proc.seq)
     }
 
-    pub fn note_admitted(&self, pid: ProcessId) {
-        let mut inner = self.lock_inner();
-        if let Some(proc) = inner.procs.get_mut(&pid) {
-            proc.admitted = true;
+    /// Holds `pid` back from execution while an older process is preempted,
+    /// so new work does not take the pages that process needs to come back.
+    pub async fn admit(&self, pid: ProcessId) {
+        loop {
+            let notify = self.with_inner(|inner| {
+                let seq = inner.procs.get(&pid)?.seq;
+                if inner.preempted_floor().is_none_or(|floor| seq <= floor) {
+                    return None;
+                }
+                let notify = Arc::new(Notify::new());
+                inner.admitting.insert((seq, pid), notify.clone());
+                Some(notify)
+            });
+            match notify {
+                Some(notify) => notify.notified().await,
+                None => return,
+            }
         }
+    }
+
+    pub fn note_admitted(&self, pid: ProcessId) {
+        self.with_inner(|inner| {
+            if let Some(proc) = inner.procs.get_mut(&pid) {
+                proc.admitted = true;
+                proc.respawn = false;
+            }
+        });
     }
 
     pub fn unregister(self: &Arc<Self>, pid: ProcessId) {
         let (signal, removed) = self.with_inner(|inner| {
             let departed = inner.procs.remove(&pid);
+            if let Some(proc) = &departed {
+                inner.admitting.remove(&(proc.seq, pid));
+            }
             if departed
                 .as_ref()
                 .is_some_and(|proc| proc.admitted && proc.state == Residency::Resident)
@@ -3097,6 +3156,36 @@ mod starvation_race_tests {
         fn release_rs(&self, slots: Vec<crate::store::rs::RsSlotId>) {
             self.with_rs(|rs| rs.release_slot_reservation(slots));
         }
+    }
+
+    #[test]
+    fn a_younger_process_is_not_admitted_while_an_older_one_is_preempted() {
+        use futures::FutureExt;
+        let planner = Arc::new(ResidencyPlanner::new(
+            Arc::new(RacePool::new(8)) as Arc<dyn PoolPort>
+        ));
+        let [evicted, killed, younger] = [(); 3].map(|_| ProcessId::new_v4());
+        for pid in [evicted, killed, younger] {
+            planner.register(pid);
+        }
+        planner
+            .with_inner(|inner| inner.procs.get_mut(&evicted).unwrap().state = Residency::Evicted);
+        let mut admit = Box::pin(planner.admit(younger));
+        assert!(admit.as_mut().now_or_never().is_none());
+
+        planner.with_inner(|inner| {
+            inner.procs.get_mut(&evicted).unwrap().state = Residency::Resident;
+            inner.killing.insert(killed);
+        });
+        assert!(admit.as_mut().now_or_never().is_none());
+
+        let respawn = ProcessId::new_v4();
+        planner.register_with_seq(respawn, planner.spawn_seq(killed).unwrap());
+        planner.unregister(killed);
+        assert!(planner.admit(respawn).now_or_never().is_some());
+        assert!(admit.as_mut().now_or_never().is_none());
+        planner.note_admitted(respawn);
+        assert!(admit.as_mut().now_or_never().is_some());
     }
 
     #[test]
