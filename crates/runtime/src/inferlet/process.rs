@@ -314,9 +314,6 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         return;
     }
     let started = Instant::now();
-    if let Some(planner) = crate::planner::planner() {
-        planner.admit(ctx.id()).await;
-    }
     let permit = match ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => {
             let _queued = AdmissionQueued::enter(ctx.id());
@@ -610,6 +607,11 @@ impl Process {
         capture_outputs: bool,
         result_tx: SharedResultTx,
     ) {
+        // Held ahead of every admission permit: a preempted process coming
+        // back must not queue behind permits the held-back processes own.
+        if let Some(planner) = crate::planner::planner() {
+            planner.admit(process_id).await;
+        }
         let prewarm_permit = match PREWARM_ADMISSION.get().and_then(|s| s.as_ref()) {
             Some(sem) => Some(
                 Arc::clone(sem)
