@@ -509,6 +509,19 @@ impl RsWorkingSet {
             rs: Rc::new(self.rs.fork(&on.wit)?),
         })
     }
+
+    pub fn update_index(&self, key: &[u8]) -> Result<(), String> {
+        self.rs.update_index(key)
+    }
+
+    pub fn from_index(key: &[u8]) -> Result<Option<RsWorkingSet>, String> {
+        Ok(crate::working_set::RsWorkingSet::from_index(key)?
+            .map(|rs| RsWorkingSet { rs: Rc::new(rs) }))
+    }
+
+    pub fn remove_index(key: &[u8]) -> Result<bool, String> {
+        crate::working_set::RsWorkingSet::remove_index(key)
+    }
 }
 
 impl Default for RsWorkingSet {
