@@ -222,13 +222,18 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     })
 }
 
-/// The lane budget fitted to what the card has with the weights resident:
-/// what scales with `max_forward_requests` and the decoded-weight tiles are
-/// taken before the cache rows, and on a short card leave no room for one
-/// sequence. The tile yields first, held to the widest plane fired at token
-/// rows (a plane past it is served by the fused-dequant arm), then the
-/// lanes halve toward one; `Pools::fit_the_card` still refuses past that.
-fn refit_lanes(
+/// The token and lane budgets fitted to what the card has with the weights
+/// resident. What a fire's working set takes at those budgets (the
+/// activation arena, the attention workspaces, the decoded-weight tiles, the
+/// guests' programs, the score planes and the readout indices) is held to
+/// half of the card past the weights, the half `bake` sizes the token budget
+/// against before the weights are down, and to what leaves one sequence and
+/// the bodies' floor beside it. The tile yields first, held to the widest
+/// plane fired at token rows (a plane past it is served by the fused-dequant
+/// arm), then the token budget halves toward its floor, then the lanes
+/// halve toward one; `Pools::fit_the_card` still refuses past that.
+#[allow(clippy::too_many_arguments)]
+fn refit(
     boot: &mut Boot<'_>,
     device: &Context,
     compiled: CompiledModel,
@@ -240,16 +245,28 @@ fn refit_lanes(
     let (free, total) = crate::store::device_memory()?;
     let live = crate::device::elastic::budget_bytes(free, total, boot.knobs.gpu_mem_utilization);
     let facts = kv::probe(&boot.trace)?;
-    let sequence = crate::store::least_sequence_bytes(&boot.trace, paging)?;
-    let out_row = match Exports::of(&boot.trace, &compiled)?.out {
+    let window = crate::store::window_of(&boot.trace)?;
+    let exports = Exports::of(&boot.trace, &compiled)?;
+    let out_row = match exports.out {
         Some(out) => kv::width_of(&boot.trace, out)?.saturating_mul(4),
         None => 0,
     };
-    let asked = boot.budget.max_lanes;
-    let tokens = boot.budget.max_tokens;
-    let budget_at = |lanes: u32| {
+    let score_values: Vec<model_ir::ValueId> =
+        exports.scores.iter().map(|export| export.value).collect();
+    let score_heads = score_heads(&boot.trace, &exports);
+    let (asked_lanes, asked_tokens) = (boot.budget.max_lanes, boot.budget.max_tokens);
+    let budget_at = |lanes: u32, tokens: u32| {
         let mut budget = boot.budget.clone();
-        budget.max_lanes = lanes;
+        budget.max_lanes = lanes.min(tokens);
+        budget.max_tokens = tokens;
+        let mut buckets: Vec<u32> = budget
+            .buckets
+            .iter()
+            .copied()
+            .filter(|bucket| *bucket < tokens)
+            .collect();
+        buckets.push(tokens);
+        budget.buckets = crate::api::lattice(buckets, tokens);
         budget
     };
     let budgets_at = |budget: &Budget| Budgets {
@@ -269,8 +286,9 @@ fn refit_lanes(
             })
             .collect()
     };
-    let working_at = |lanes: u32, scoped: bool| -> u64 {
-        let budget = budget_at(lanes);
+    let working_at = |lanes: u32, tokens: u32, scoped: bool| -> u64 {
+        let budget = budget_at(lanes, tokens);
+        let lanes = budget.max_lanes;
         let Ok(compiled) = model_compiler::compile_axes(&boot.trace, &budgets_at(&budget), profile)
         else {
             return u64::MAX;
@@ -296,51 +314,101 @@ fn refit_lanes(
                 lanes.min(device.device().num_sm),
                 out_row,
             ))
+            .saturating_add(crate::scores::bytes_for(
+                &score_values,
+                score_heads,
+                lanes,
+                boot.world,
+            ))
             .saturating_add(
                 u64::from(lanes)
                     .saturating_mul(u64::from(tokens))
                     .saturating_mul(8),
             )
     };
-    let room = live
-        .saturating_sub(sequence)
-        .saturating_sub(crate::store::BODIES_FLOOR_BYTES);
+    // What one sequence and the bodies' floor leave a fire, and within it the
+    // half the cache rows are owed when the floors can still reach it.
+    let room_at = |tokens: u32, owed: bool| -> Result<u64> {
+        let sequence =
+            crate::store::least_sequence_bytes(&boot.trace, paging.windowed(window, tokens))?;
+        let room = live
+            .saturating_sub(sequence)
+            .saturating_sub(crate::store::BODIES_FLOOR_BYTES);
+        Ok(if owed { room.min(live / 2) } else { room })
+    };
+    let floor = TOKENS_FLOOR.min(asked_tokens);
+    let fit = |owed: bool, scoped: bool| -> Result<Option<(u32, u32)>> {
+        let mut tokens = asked_tokens;
+        while tokens > floor && working_at(asked_lanes, tokens, scoped) > room_at(tokens, owed)? {
+            tokens = (tokens / 2).max(floor);
+        }
+        let room = room_at(tokens, owed)?;
+        let lanes = crate::store::tokens_within(asked_lanes.min(tokens), 1, room, |lanes| {
+            working_at(lanes, tokens, scoped)
+        });
+        Ok((working_at(lanes, tokens, scoped) <= room).then_some((tokens, lanes)))
+    };
     let planes = decoded_weight_planes(&boot.trace, &compiled, table);
-    if working_at(asked, false) <= room {
+    if working_at(asked_lanes, asked_tokens, false) <= room_at(asked_tokens, true)? {
         return Ok((compiled, budgets, tiles_of(&planes, false)));
     }
-    let lanes = crate::store::tokens_within(asked, 1, room, |lanes| working_at(lanes, true));
-    for (stream, plane) in planes.iter().enumerate() {
-        if plane.widest > plane.at_tokens {
-            eprintln!(
-                "engine-cuda: the decoded-weight tile on stream {stream} is held to {} MiB, the \
-                 widest plane fired at token rows, not the {} MiB plane fired at readout rows: \
-                 at {asked} lanes it leaves no room for one sequence on this card. A plane past \
-                 the tile is served by the fused-dequant arm.",
-                crate::store::decoded_weight_reserve(plane.at_tokens, 1) >> 20,
-                crate::store::decoded_weight_reserve(plane.widest, 1) >> 20,
-            );
+    // The tile stays whole while the half can be met with it; only one
+    // sequence is worth the fused-dequant arm.
+    let (scoped, fitted) = match fit(true, false)? {
+        Some(fitted) => (false, Some(fitted)),
+        None => (true, fit(false, true)?),
+    };
+    if scoped {
+        for (stream, plane) in planes.iter().enumerate() {
+            if plane.widest > plane.at_tokens {
+                eprintln!(
+                    "engine-cuda: the decoded-weight tile on stream {stream} is held to {} MiB, \
+                     the widest plane fired at token rows, not the {} MiB plane fired at \
+                     readout rows: at {asked_lanes} lanes it leaves no room for one sequence on \
+                     this card. A plane past the tile is served by the fused-dequant arm.",
+                    crate::store::decoded_weight_reserve(plane.at_tokens, 1) >> 20,
+                    crate::store::decoded_weight_reserve(plane.widest, 1) >> 20,
+                );
+            }
         }
     }
-    if lanes == asked || working_at(lanes, true) > room {
+    let Some((tokens, lanes)) = fitted else {
         return Ok((compiled, budgets, tiles_of(&planes, true)));
+    };
+    if (lanes, tokens) == (asked_lanes, asked_tokens) {
+        return Ok((compiled, budgets, tiles_of(&planes, scoped)));
     }
     eprintln!(
-        "engine-cuda: [engine] max_forward_requests {asked} is served at {lanes}: at \
-         {asked} the activation arena, attention workspaces, decoded-weight tiles and guest \
-         programs take {} MiB of the {} MiB this card has after the weight tier under \
-         [engine] gpu_mem_utilization, and one sequence at the declared context and the \
-         bodies' floor need {} MiB beside them. State a smaller max_forward_requests to \
-         choose it, or a larger gpu_mem_utilization.",
-        working_at(asked, true) >> 20,
+        "engine-cuda: [engine] max_forward_tokens {asked_tokens} and max_forward_requests \
+         {asked_lanes} are served at {tokens} and {lanes}: at the asked budgets a fire's \
+         working set (activation arena, attention workspaces, decoded-weight tiles, guest \
+         programs) takes {} MiB of the {} MiB this card has after the weight tier under \
+         [engine] gpu_mem_utilization, past the half the cache rows are owed and what one \
+         sequence at the declared context and the bodies' floor need. State smaller budgets \
+         to choose them, or a larger gpu_mem_utilization.",
+        working_at(asked_lanes, asked_tokens, scoped) >> 20,
         live >> 20,
-        (sequence + crate::store::BODIES_FLOOR_BYTES) >> 20,
     );
-    boot.budget = budget_at(lanes);
+    boot.budget = budget_at(lanes, tokens);
     let budgets = budgets_at(&boot.budget);
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, profile)?;
     let planes = decoded_weight_planes(&boot.trace, &compiled, table);
-    Ok((compiled, budgets, tiles_of(&planes, true)))
+    Ok((compiled, budgets, tiles_of(&planes, scoped)))
+}
+
+/// The query heads a score export carries per layer, zero when none is.
+fn score_heads(trace: &model_ir::Trace, exports: &Exports) -> u32 {
+    exports
+        .scores
+        .first()
+        .and_then(|export| match &trace.values[export.value.0 as usize].ty {
+            model_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
+                model_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
+                _ => None,
+            }),
+            model_ir::Ty::Struct(_) => None,
+        })
+        .unwrap_or(0)
 }
 
 impl Shell {
@@ -406,7 +474,7 @@ impl Shell {
                 crate::device::nodes::free_bytes().unwrap_or(0) >> 20
             );
         }
-        let (compiled, budgets, tiles) = refit_lanes(
+        let (compiled, budgets, tiles) = refit(
             &mut boot,
             &device,
             compiled,
@@ -415,6 +483,10 @@ impl Shell {
             paging,
             weights.table(),
         )?;
+        let paging = paging.windowed(
+            crate::store::window_of(&boot.trace)?,
+            boot.budget.max_tokens,
+        );
         device.open_lanes(
             compiled.streams.streams.saturating_sub(1),
             compiled.streams.events,
@@ -644,19 +716,7 @@ impl Shell {
 
         let exports = Exports::of(&boot.trace, &compiled)?;
 
-        let score_heads = exports
-            .scores
-            .first()
-            .and_then(
-                |export| match &boot.trace.values[export.value.0 as usize].ty {
-                    model_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
-                        model_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
-                        _ => None,
-                    }),
-                    model_ir::Ty::Struct(_) => None,
-                },
-            )
-            .unwrap_or(0);
+        let score_heads = score_heads(&boot.trace, &exports);
         let score_values: Vec<model_ir::ValueId> =
             exports.scores.iter().map(|export| export.value).collect();
         let scores = crate::scores::Scores::reserve(
