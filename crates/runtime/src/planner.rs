@@ -956,7 +956,7 @@ impl ResidencyPlanner {
         self.lock_inner().procs.get(&pid).map(|proc| proc.seq)
     }
 
-    /// Holds `pid` back from execution while an older process is preempted,
+    /// Holds `pid` back from starting while an older process is preempted,
     /// so new work does not take the pages that process needs to come back.
     pub async fn admit(&self, pid: ProcessId) {
         loop {
