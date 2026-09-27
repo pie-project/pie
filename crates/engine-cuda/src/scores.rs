@@ -56,6 +56,19 @@ impl Layout {
     }
 }
 
+/// What the score planes take at `lanes`: every lane's block of planes,
+/// each `KV_MAX` wide in f32.
+#[must_use]
+pub(crate) fn bytes_for(exports: &[ValueId], heads: u32, lanes: u32, world: World) -> u64 {
+    if exports.is_empty() || heads == 0 {
+        return 0;
+    }
+    u64::from(lanes)
+        .saturating_mul(u64::from(Layout::of(exports, heads, world).planes))
+        .saturating_mul(u64::from(KV_MAX))
+        .saturating_mul(4)
+}
+
 #[derive(Debug)]
 pub(crate) struct Scores {
     store: Buffer,
@@ -75,10 +88,7 @@ impl Scores {
             return Ok(None);
         }
         let layout = Layout::of(exports, heads, world);
-        let bytes = u64::from(lanes)
-            .saturating_mul(u64::from(layout.planes))
-            .saturating_mul(u64::from(KV_MAX))
-            .saturating_mul(4);
+        let bytes = bytes_for(exports, heads, lanes, world);
         Ok(Some(Scores {
             store: Buffer::zeroed(usize::try_from(bytes).unwrap_or(usize::MAX))?,
             layout,
