@@ -145,6 +145,11 @@ impl PreparedRs {
 
     pub fn apply_to(&self, request: &mut crate::engine::FireRequest) {
         for (row, lane) in request.lanes.iter_mut().enumerate() {
+            // The recurrent state lives in the rs working set's own slot, so it
+            // follows the set across fires, not the lane's seat in its KV set.
+            if let Some(&slot) = self.slot_ids.get(row) {
+                lane.slot = slot;
+            }
             if let Some(verb) = self.verbs.get(row) {
                 lane.rs = verb.clone();
             }
@@ -497,6 +502,7 @@ mod tests {
     #[test]
     fn rs_every_case() {
         first_fire_resets_then_continues_in_place();
+        a_lane_reads_its_working_sets_slot_whatever_fire_folded_it();
         every_plan_shape_lowers_to_its_lane_verb();
         a_device_resident_fold_length_lowers_to_its_port();
         buffered_write_materializes_slabs_and_leaves_the_fold_alone();
@@ -523,6 +529,32 @@ mod tests {
         assert_eq!(out.slot_ids, vec![slot.0]);
         assert_eq!(out.slot_flags, vec![0]);
         settle(&mut store, out.txn);
+    }
+
+    fn a_lane_reads_its_working_sets_slot_whatever_fire_folded_it() {
+        let mut store = RsStore::new(4);
+        let (a, b) = (
+            store.create_working_set(geom()),
+            store.create_working_set(geom()),
+        );
+        let slot_of = |prepared: &PreparedRs, rows: usize| -> Vec<u32> {
+            let mut req = request(rows);
+            prepared.apply_to(&mut req);
+            req.lanes.iter().map(|lane| lane.slot).collect()
+        };
+        let mut folded = Vec::new();
+        for ws in [a, b] {
+            let alone = prepare(&mut store, ws).unwrap();
+            folded.extend(slot_of(&alone, 1));
+            settle(&mut store, alone.txn);
+        }
+        assert_ne!(
+            folded[0], folded[1],
+            "two sets folded as row 0 of two fires"
+        );
+        let both = prepare_many(&mut store, &[a, b], &RsPlan::Fold).unwrap();
+        assert_eq!(slot_of(&both, 2), folded, "and read back as rows 0 and 1");
+        settle(&mut store, both.txn);
     }
 
     fn buffer_plan(start_token: u32, row_tokens: Vec<u32>) -> RsPlan {

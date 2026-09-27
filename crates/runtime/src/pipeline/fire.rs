@@ -2749,7 +2749,6 @@ async fn fire_device_geometry<C: FireContext>(
             .collect(),
         ..crate::engine::FireRequest::default()
     };
-    rs_prepared.apply_to(&mut req);
     ctx.resources().get(&fwd)?.lane.stamp(&mut req);
     let group = ctx.resources().get(&fwd)?.lane.group;
     let peer = ctx.resources().get(&fwd)?.lane.peer;
@@ -2819,6 +2818,7 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
     }
+    rs_prepared.apply_to(&mut req);
     if let Err(refusal) = stamp_lane_translation(&mut req, &stores, ws.id) {
         reclaim_pending_device_grant(ctx, &fwd);
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
