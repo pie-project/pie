@@ -2,10 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
+use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_cuda::device::elastic::budget_bytes;
-use engine_cuda::{Boot, Knobs, Shell};
+use engine_cuda::{Boot, Knobs, Lane, Seated, Shell};
 use model_compiler::Budget;
-use model_dsl::Platform;
+use model_dsl::{Platform, Request};
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
@@ -149,5 +150,35 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
             )
         });
     }
+
+    // A speculative verify reads out every row, past one a lane, and
+    // buffers its rs rows at the highest slots: neither may grow past what
+    // the fit sized (the nightly's "wanted 16777216, 0 available").
+    let rows = 3 * PAGE - 8;
+    let tokens: Vec<u32> = (0..rows).map(|at| 1000 + at * 37).collect();
+    let readout: Vec<u32> = (0..rows).collect();
+    let lane = Lane {
+        slot: 0,
+        word: (sku.classify)(&Request::new(rows, false)),
+        tokens: &tokens,
+    };
+    let verify = Seated {
+        rs: RsVerb::Buffer {
+            pages: (paging.slots - 3..paging.slots).collect(),
+            at: 0,
+            fold: FoldLen::Host(0),
+            replay: 0,
+        },
+        rs_reset: RsReset::Fresh,
+        readout: Some(&readout),
+        ..Seated::of(lane)
+    };
+    assert!(
+        rows > LANES,
+        "the verify reads out more rows than there are lanes"
+    );
+    shell
+        .fire_media(&[verify], &[], &[], &mut Vec::new())
+        .unwrap_or_else(|refusal| panic!("the verify grew past the fit: {refusal}"));
     drop(taken);
 }

@@ -455,10 +455,6 @@ impl FrameShell for Shell {
                 have: readouts_ceiling,
             });
         }
-        self.arena.ensure(
-            &mut self.pools,
-            self.compiled.arena.prefix_for(readout_extent),
-        )?;
         let descriptor = FireDescriptor::of(&composition);
 
         let lane_facts: Vec<model_exec::fire::LaneFacts> = lanes

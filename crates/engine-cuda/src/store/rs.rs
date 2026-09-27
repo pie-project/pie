@@ -336,10 +336,21 @@ impl Buffers {
 
     #[must_use]
     pub fn capacity_bytes(&self) -> u64 {
+        self.slot_bytes().saturating_mul(u64::from(self.slots))
+    }
+
+    /// One page across the layers. The runtime names a buffered page by an
+    /// rs slot, so a fire may commit these up to the highest slot seated.
+    #[must_use]
+    pub fn slot_bytes(&self) -> u64 {
         self.per_page
-            .saturating_mul(u64::from(self.slots))
             .saturating_mul(u64::from(self.layers))
             .saturating_mul(ELEMENT)
+    }
+
+    #[must_use]
+    pub fn map_unit(&self) -> u64 {
+        self.arena.map_unit()
     }
 
     pub fn ensure(&mut self, pools: &mut Pools, pages: u32) -> Result<()> {
@@ -353,10 +364,7 @@ impl Buffers {
                 have: u64::from(self.slots),
             });
         }
-        let bytes = u64::from(pages)
-            .saturating_mul(u64::from(self.layers))
-            .saturating_mul(self.per_page)
-            .saturating_mul(ELEMENT);
+        let bytes = u64::from(pages).saturating_mul(self.slot_bytes());
         pools.commit_arena(&mut self.arena, bytes)?;
         self.committed_pages = pages;
         Ok(())
