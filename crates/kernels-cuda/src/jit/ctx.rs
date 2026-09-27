@@ -155,6 +155,7 @@ pub struct Ctx {
     stream: *mut c_void,
     cublas: *mut c_void,
     comm: *mut c_void,
+    peers: Option<crate::collective::Peers>,
     slabs: Slabs,
 
     pad: core::cell::Cell<Pad>,
@@ -174,6 +175,7 @@ impl Ctx {
             stream,
             cublas: core::ptr::null_mut(),
             comm: core::ptr::null_mut(),
+            peers: None,
             slabs: Slabs::PROCESS,
             pad: core::cell::Cell::new(Pad { rows: 0, bucket: 0 }),
             stage: core::cell::Cell::new(0),
@@ -204,6 +206,21 @@ impl Ctx {
     pub const unsafe fn with_comm(mut self, comm: *mut c_void) -> Self {
         self.comm = comm;
         self
+    }
+
+    /// # Safety
+    ///
+    /// Every pointer in `peers` must stay live, and mapped on this context's
+    /// device, for as long as this context fires collectives.
+    #[must_use]
+    pub const unsafe fn with_peers(mut self, peers: crate::collective::Peers) -> Self {
+        self.peers = Some(peers);
+        self
+    }
+
+    #[must_use]
+    pub const fn peers(&self) -> Option<crate::collective::Peers> {
+        self.peers
     }
 
     #[must_use]

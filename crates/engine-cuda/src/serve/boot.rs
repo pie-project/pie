@@ -168,5 +168,5 @@ pub struct Boot<'a> {
     pub residency: crate::experts::Plan,
     pub deferred_tier: bool,
     pub world: crate::api::World,
-    pub comm: *mut core::ffi::c_void,
+    pub comm: *const crate::comm::Comm,
 }
