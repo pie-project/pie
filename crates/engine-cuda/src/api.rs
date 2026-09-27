@@ -1029,6 +1029,7 @@ impl Cuda {
                     self_cond: lane.self_cond.as_ref(),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
+                    rs_slot: lane.rs_slot,
                     readout: match &lane.readout {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,

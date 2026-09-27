@@ -162,6 +162,7 @@ pub struct Seated<'a> {
     pub readout: Option<&'a [u32]>,
     pub rs: &'a engine::fire::RsVerb,
     pub rs_reset: engine::fire::RsReset,
+    pub rs_slot: Option<u32>,
     pub captures_scores: bool,
     pub translation: &'a [u32],
 }
@@ -187,6 +188,7 @@ impl<'a> Seated<'a> {
             translation: &[],
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
+            rs_slot: None,
         }
     }
 
@@ -2617,7 +2619,7 @@ impl Shell {
                 engine::fire::RsReset::Held => false,
             };
             if fresh {
-                beginning.push(lane.slot);
+                beginning.push(seated.rs_slot.unwrap_or(lane.slot));
             }
             seats.push(Seat {
                 slot: lane.slot,
@@ -2680,7 +2682,7 @@ impl Shell {
                     .map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
                 adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
             }
-            slot_ids.push(lane.slot as i32);
+            slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
             let at_lane = slot_ids.len() as i32 - 1;
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
                 if self.rs_layout.is_none() {
@@ -2800,9 +2802,9 @@ impl Shell {
                 .chain(std::iter::once(written))
                 .max()
                 .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)),
-            state_slots: seats
+            state_slots: slot_ids
                 .iter()
-                .map(|seat| seat.slot.saturating_add(1))
+                .map(|&row| (row as u32).saturating_add(1))
                 .max()
                 .unwrap_or(0),
             workspace: 0,

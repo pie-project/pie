@@ -148,6 +148,7 @@ impl PreparedRs {
             if let Some(verb) = self.verbs.get(row) {
                 lane.rs = verb.clone();
             }
+            lane.rs_slot = self.slot_ids.get(row).copied();
             if let Some(&flags) = self.slot_flags.get(row) {
                 lane.rs_reset = if flags & crate::engine::RS_FLAG_RESET != 0 {
                     engine::fire::RsReset::Fresh
@@ -504,6 +505,23 @@ mod tests {
         fold_buffered_lowers_the_prefix_csr_and_advances_the_boundary();
         a_replay_after_a_mid_page_fold_starts_at_the_buffer_head();
         demand_counts_buffered_materialization();
+        a_forked_state_lowers_its_copy_as_the_lane_row();
+    }
+
+    fn a_forked_state_lowers_its_copy_as_the_lane_row() {
+        let mut store = RsStore::new(16);
+        let parent = store.create_working_set(geom());
+        let first = prepare(&mut store, parent).unwrap();
+        settle(&mut store, first.txn);
+        let child = store.fork(parent).unwrap();
+
+        let write = prepare(&mut store, child).unwrap();
+        let copy = write.copies.1[0];
+        let mut req = request(1);
+        req.lanes[0].slot = 9;
+        write.apply_to(&mut req);
+        assert_eq!(req.lanes[0].rs_slot, Some(copy), "not the kv seat");
+        settle(&mut store, write.txn);
     }
 
     fn first_fire_resets_then_continues_in_place() {
