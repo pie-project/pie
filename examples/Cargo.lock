@@ -9,6 +9,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "asap-grammar-aligned-decoding"
 version = "0.1.0"
 dependencies = [
@@ -40,12 +46,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "blake3"
+version = "1.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures",
+]
+
+[[package]]
 name = "cacheback-speculative-decoding"
 version = "0.1.0"
 dependencies = [
  "inferlet",
  "serde",
 ]
+
+[[package]]
+name = "cc"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f360145194ee8e21db5ee7f3fcd4fe52210864c75c985dae33218202c8bbe040"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
+]
+
+[[package]]
+name = "cfg-if"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "chat-completion"
@@ -73,6 +108,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
 name = "constrained-speculative-decoding"
 version = "0.1.0"
 dependencies = [
@@ -95,6 +136,15 @@ version = "0.1.0"
 dependencies = [
  "inferlet",
  "serde",
+]
+
+[[package]]
+name = "cpufeatures"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -167,6 +217,12 @@ dependencies = [
  "inferlet",
  "serde",
 ]
+
+[[package]]
+name = "find-msvc-tools"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "flux2-klein-parity"
@@ -361,8 +417,9 @@ dependencies = [
 
 [[package]]
 name = "inferlet"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
+ "blake3",
  "inferlet-macros",
  "pie-eta-dsl",
  "serde",
@@ -372,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "inferlet-macros"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "quote",
  "syn",
@@ -406,6 +463,12 @@ name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
+
+[[package]]
+name = "libc"
+version = "0.2.189"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "locally-typical-sampling"
@@ -504,18 +567,18 @@ dependencies = [
 
 [[package]]
 name = "pie-dtype"
-version = "0.5.2"
+version = "0.5.4"
 
 [[package]]
 name = "pie-eta-dsl"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "pie-eta-ir",
 ]
 
 [[package]]
 name = "pie-eta-ir"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "pie-dtype",
 ]
@@ -666,6 +729,12 @@ dependencies = [
  "serde_core",
  "zmij",
 ]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "slab"
