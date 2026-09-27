@@ -398,8 +398,8 @@ interface model {
     max-embed-length: func() -> u32;
 
     // The prefill chunk the scheduler would like to see right now, in
-    // tokens: the per-forward token budget shared evenly among the live
-    // processes, rounded down to whole KV pages, never below one page and
+    // tokens: the per-forward token budget less one decode row for each
+    // other live process, rounded down to whole KV pages, never below one page and
     // never above `max-embed-length`. A prefill fire that fills the whole
     // budget holds every other lane's decode for as long as it runs; a fire
     // of this size leaves the step room for them. A hint, not a limit: the
