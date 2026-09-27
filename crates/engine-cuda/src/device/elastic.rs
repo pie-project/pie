@@ -717,6 +717,43 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
     Ok(Commit::Committed)
 }
 
+/// `bytes` on `device` that every device in `readers` may load and store,
+/// without turning on peer access for the whole device: that maps every
+/// later allocation into the peers, and freeing one then waits on a peer
+/// that may be spinning in a collective (#745). Held for the process's life.
+#[cfg(feature = "cuda")]
+pub fn shared(device: i32, readers: &[i32], bytes: u64) -> Result<u64> {
+    use cudarc::driver::sys as dr;
+
+    let granularity = allocation_granularity(device)?;
+    let bytes = align_up(bytes, granularity) as usize;
+    let prop = allocation_prop(device);
+    let mut handle: dr::CUmemGenericAllocationHandle = 0;
+    let mut base: dr::CUdeviceptr = 0;
+    let mut readers = readers.to_vec();
+    readers.sort_unstable();
+    readers.dedup();
+    let descs: Vec<dr::CUmemAccessDesc> = readers.iter().map(|&d| access_desc(d)).collect();
+    // SAFETY: live locals as out-parameters; the range is mapped to the
+    // handle just made, and neither is released.
+    unsafe {
+        said(
+            "cuMemCreate",
+            dr::cuMemCreate(&raw mut handle, bytes, &raw const prop, 0),
+        )?;
+        said(
+            "cuMemAddressReserve",
+            dr::cuMemAddressReserve(&raw mut base, bytes, granularity as usize, 0, 0),
+        )?;
+        said("cuMemMap", dr::cuMemMap(base, bytes, 0, handle, 0))?;
+        said(
+            "cuMemSetAccess",
+            dr::cuMemSetAccess(base, bytes, descs.as_ptr(), descs.len()),
+        )?;
+    }
+    Ok(base)
+}
+
 #[cfg(feature = "cuda")]
 fn said(call: &'static str, code: cudarc::driver::sys::CUresult) -> Result<()> {
     if code == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
