@@ -1,6 +1,6 @@
 //! Classifier-free guidance for language models (Sanchez et al., 2306.17806).
 //!
-//! Two forward passes run the bound model over two independent KV states: the
+//! Each decode fire runs the bound model over two rows with independent KV states: the
 //! conditional stream sees the full prompt, the unconditional stream sees only
 //! the negative prompt (empty by default). The paper's Eqn 4 is applied to
 //! **log-probabilities**, not raw logits — the two streams have different
@@ -29,8 +29,6 @@
 use inferlet::chat;
 use inferlet::eta::hybrid::prelude::*;
 use serde::{Deserialize, Serialize};
-
-const PAGE_T: u32 = 16;
 
 #[derive(Deserialize)]
 struct Input {
@@ -90,8 +88,12 @@ struct Output {
 /// Eqn 4 of 2306.17806 in the log-domain, plus the two diagnostics that prove
 /// the γ = 1 identity: `shift` is 1 when guidance moved the argmax, and `kl` is
 /// KL(P_cfg ‖ P_cond), which is exactly 0 at γ = 1.
-fn guided_pick(uncond_logits: &Tensor, gamma: f32) -> (Tensor, Tensor, Tensor) {
-    let cond = log_softmax(intrinsics::logits());
+fn guided_pick(
+    cond_logits: &Tensor,
+    uncond_logits: &Tensor,
+    gamma: f32,
+) -> (Tensor, Tensor, Tensor) {
+    let cond = log_softmax(cond_logits);
     let uncond = log_softmax(uncond_logits);
     let guided = log_softmax(&uncond + (&cond - &uncond) * gamma);
 
@@ -136,6 +138,7 @@ async fn main(input: Input) -> Result<Output> {
     let vocab = model::output_vocab_size();
     let gamma = input.guidance;
     let stop_tokens = chat::stop_tokens();
+    let page_t = kv_page_size();
 
     let mut cond_prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     cond_prompt.extend(chat::cue());
@@ -157,267 +160,177 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let nu = u32::try_from(uncond_prompt.len()).map_err(|_| "negative prompt is too long")?;
-    let cond_pages = (nc + max_tokens + 1).div_ceil(PAGE_T);
-    let uncond_pages = (nu + max_tokens + 1).div_ceil(PAGE_T);
-
-    // ---- unconditional stream -------------------------------------------
-    let uncond_ws = WorkingSet::new();
-    let uncond_rs: Vec<RsWorkingSet> = rs_for_sequence()?;
-    uncond_ws
-        .reserve(uncond_pages)
-        .context("reserve unconditional KV")?;
-    let uncond_prompt_i32 = uncond_prompt
-        .iter()
-        .map(|&token| token as i32)
-        .collect::<Vec<_>>();
-
-    let u_prompt_ch = Channel::from(uncond_prompt_i32).named("uncond_prompt");
-    let u_pre_indptr = Channel::from([0u32, nu]).named("uncond_prefill_embed_indptr");
-    let u_pre_pos = Channel::from_iter(0..nu).named("uncond_prefill_positions");
-    let u_pre_pages = Channel::from_iter(0..uncond_pages);
-    let u_pre_page_indptr = Channel::from([0u32, nu.div_ceil(PAGE_T)]);
-    let u_pre_slot = Channel::from_iter((0..nu).map(|p| p / PAGE_T));
-    let u_pre_off = Channel::from_iter((0..nu).map(|p| p % PAGE_T));
-    let u_pre_klen = Channel::from([nu]);
-    let u_pre_out = Channel::new([vocab], dtype::f32).named("uncond_prefill_logits");
-
-    let uncond_prefill = ForwardPass::new();
-    uncond_prefill.embed(&u_prompt_ch, &u_pre_indptr)?;
-    uncond_prefill.attention(
-        Some(KvBinding {
-            working_set: &uncond_ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &u_pre_klen,
-                pages: &u_pre_pages,
-                page_indptr: &u_pre_page_indptr,
-                w_slot: &u_pre_slot,
-                w_off: &u_pre_off,
-                positions: &u_pre_pos,
-                mask: None,
-            },
-        }),
-        &uncond_rs,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
-    uncond_prefill.epilogue(move || {
-        u_pre_out.put(intrinsics::logits());
-    });
-
-    // One pipeline for the whole inferlet: a KV WorkingSet claims the first
-    // pipeline it fires on and never migrates, so prefill and decode for both
-    // streams must share a single scope.
+    // Both streams are rows of one working set: row 0 (unconditional) owns
+    // pages [0, up), row 1 (conditional) owns [up, up + cp).
+    let up = (nu + max_tokens).div_ceil(page_t);
+    let cp = (nc + max_tokens).div_ceil(page_t);
+    let ws = WorkingSet::new();
+    ws.reserve(up + cp).context("reserve KV")?;
+    let rs: Vec<RsWorkingSet> = rs_for_sequence()?
+        .into_iter()
+        .chain(rs_for_sequence()?)
+        .collect();
     let pipeline = Pipeline::new();
-    uncond_prefill.submit(&pipeline).context("uncond prefill")?;
-    let first_uncond_logits = u_pre_out.take_host::<Vec<f32>>().await?;
 
-    // ---- conditional stream ---------------------------------------------
-    let cond_ws = WorkingSet::new();
-    let cond_rs: Vec<RsWorkingSet> = rs_for_sequence()?;
-    cond_ws
-        .reserve(cond_pages)
-        .context("reserve conditional KV")?;
-    let cond_prompt_i32 = cond_prompt
+    // Both prompts but their last tokens prefill as the two rows of one fire;
+    // the last tokens are the first decode fire's input, so both logit rows
+    // are born together.
+    if nu < 2 || nc < 2 {
+        return Err("each templated prompt must hold at least two tokens".into());
+    }
+    let (pu, pc) = (nu - 1, nc - 1);
+    let toks: Vec<i32> = uncond_prompt[..pu as usize]
         .iter()
-        .map(|&token| token as i32)
-        .collect::<Vec<_>>();
-
-    let c_prompt_ch = Channel::from(cond_prompt_i32).named("cond_prompt");
-    let c_pre_indptr = Channel::from([0u32, nc]).named("cond_prefill_embed_indptr");
-    let c_pre_pos = Channel::from_iter(0..nc).named("cond_prefill_positions");
-    let c_pre_pages = Channel::from_iter(0..cond_pages);
-    let c_pre_page_indptr = Channel::from([0u32, nc.div_ceil(PAGE_T)]);
-    let c_pre_slot = Channel::from_iter((0..nc).map(|p| p / PAGE_T));
-    let c_pre_off = Channel::from_iter((0..nc).map(|p| p % PAGE_T));
-    let c_pre_klen = Channel::from([nc]);
-    let c_pre_uncond = Channel::new([vocab], dtype::f32).named("cond_prefill_uncond");
-    let first_out = Channel::new([1], dtype::i32).named("first_token");
-    let first_shift = Channel::new([1], dtype::i32).named("first_shift");
-    let first_kl = Channel::new([1], dtype::f32).named("first_kl");
-
-    let cond_prefill = ForwardPass::new();
-    cond_prefill.embed(&c_prompt_ch, &c_pre_indptr)?;
-    cond_prefill.attention(
+        .chain(&cond_prompt[..pc as usize])
+        .map(|&t| t as i32)
+        .collect();
+    let rows = || (0..pu).map(|p| (0, p)).chain((0..pc).map(|p| (up, p)));
+    let pre_toks = Channel::from(toks).named("prefill_tokens");
+    let pre_indptr = Channel::from([0u32, pu, pu + pc]).named("prefill_embed_indptr");
+    let pre_pages =
+        Channel::from_iter((0..pu.div_ceil(page_t)).chain(up..up + pc.div_ceil(page_t)));
+    let pre_page_indptr = Channel::from([
+        0u32,
+        pu.div_ceil(page_t),
+        pu.div_ceil(page_t) + pc.div_ceil(page_t),
+    ]);
+    let pre_slot = Channel::from_iter(rows().map(|(base, p)| base + p / page_t));
+    let pre_off = Channel::from_iter(rows().map(|(_, p)| p % page_t));
+    let pre_pos = Channel::from_iter(rows().map(|(_, p)| p));
+    let pre_klen = Channel::from([pu, pc]);
+    let drop = Channel::new([1], dtype::i32).named("prefill_drop");
+    let prefill = ForwardPass::new();
+    prefill.embed(&pre_toks, &pre_indptr)?;
+    prefill.attention(
         Some(KvBinding {
-            working_set: &cond_ws,
+            working_set: &ws,
             geometry: KvGeometry {
                 readable_pages: ..,
                 writable_pages: ..,
-                kv_len: &c_pre_klen,
-                pages: &c_pre_pages,
-                page_indptr: &c_pre_page_indptr,
-                w_slot: &c_pre_slot,
-                w_off: &c_pre_off,
-                positions: &c_pre_pos,
+                kv_len: &pre_klen,
+                pages: &pre_pages,
+                page_indptr: &pre_page_indptr,
+                w_slot: &pre_slot,
+                w_off: &pre_off,
+                positions: &pre_pos,
                 mask: None,
             },
         }),
-        &cond_rs,
+        &rs,
         RsGeometry {
             fold_len: None,
             buffer: 0..0,
         },
     )?;
-    cond_prefill.epilogue(move || {
-        let (token, shift, kl) = guided_pick(&c_pre_uncond.take(), gamma);
-        first_out.put(&token);
-        first_shift.put(&shift);
-        first_kl.put(&kl);
+    // A pass needs an epilogue; this one's output is drained and dropped.
+    prefill.epilogue(move || {
+        let flat = reshape(intrinsics::logits(), [2 * vocab]);
+        drop.put(reshape(cast(reduce_argmax(flat), dtype::i32), [1]));
     });
+    prefill.submit(&pipeline).context("prefill")?;
+    drop.take_host::<i32>().await?;
 
-    c_pre_uncond.put(first_uncond_logits);
-    cond_prefill.submit(&pipeline).context("cond prefill")?;
-    let first = first_out.take_host::<i32>().await? as u32;
-    let mut shifts = first_shift.take_host::<i32>().await? as u64;
-    let mut kl_total = first_kl.take_host::<f32>().await? as f64;
-    let mut scored = 1u64;
+    // ---- decode: one two-row fire per token, device-resident -------------
+    // Row 0 is the unconditional stream, row 1 the conditional one. The epilogue
+    // mixes both logit rows on the device and feeds the guided token back to
+    // both rows, so only the token and its two diagnostics cross to the host.
+    let n_pages = up + cp;
+    let live_pages = |pc0: u32, pc1: u32| -> (Vec<u32>, [u32; 3]) {
+        let pages = (0..n_pages)
+            .map(|i| if i < pc0 { i } else { i + up - pc0 })
+            .collect();
+        (pages, [0, pc0, pc0 + pc1])
+    };
+    let (pages0, indptr0) = live_pages(nu.div_ceil(page_t), nc.div_ceil(page_t));
+    let toks = Channel::from([
+        *uncond_prompt.last().unwrap() as i32,
+        *cond_prompt.last().unwrap() as i32,
+    ])
+    .named("toks");
+    let embed_indptr = Channel::from([0u32, 1, 2]).named("embed_indptr");
+    let pos = Channel::from([nu - 1, nc - 1]).named("positions");
+    let klen = Channel::from([nu, nc]).named("kv_len");
+    let pages = Channel::from(pages0).named("pages");
+    let page_indptr = Channel::from(indptr0).named("page_indptr");
+    let w_slot = Channel::from([(nu - 1) / page_t, up + (nc - 1) / page_t]).named("w_slot");
+    let w_off = Channel::from([(nu - 1) % page_t, (nc - 1) % page_t]).named("w_off");
+    let out = Channel::new([3], dtype::f32)
+        .capacity(channel_capacity() as u32)
+        .named("out");
+
+    let decode = ForwardPass::new();
+    decode.embed(&toks, &embed_indptr)?;
+    decode.attention(
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &pos,
+                mask: None,
+            },
+        }),
+        &rs,
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
+        },
+    )?;
+    decode.epilogue(move || {
+        let logits = reshape(intrinsics::logits(), [2, vocab]);
+        let uncond = reshape(gather(&logits, iota(1)), [vocab]);
+        let cond = reshape(gather(&logits, iota(1) + 1u32), [vocab]);
+        let (token, shift, kl) = guided_pick(&cond, &uncond, gamma);
+
+        let length = klen.take();
+        let next_length = &length + 1u32;
+        let base = iota(2) * up;
+        toks.put(broadcast(&token, [2]));
+        pos.put(&length);
+        klen.put(&next_length);
+        w_slot.put(&base + &length / page_t);
+        w_off.put(&length % page_t);
+
+        let page_count = next_length.div_ceil(page_t);
+        let pc0 = broadcast(gather(&page_count, iota(1)), [n_pages]);
+        let i = iota(n_pages);
+        pages.put(select(lt(&i, &pc0), &i, &i + up - &pc0));
+        let k = iota(3);
+        let prefix = gather(cumsum(&page_count), max_elem(&k, 1u32) - 1u32);
+        page_indptr.put(&prefix * cast(gt(&k, 0u32), dtype::u32));
+
+        let token_f = broadcast(cast(&token, dtype::f32), [3]);
+        let shift_f = broadcast(cast(&shift, dtype::f32), [3]);
+        let kl_b = broadcast(&kl, [3]);
+        out.put(select(
+            eq(&k, 0u32),
+            &token_f,
+            select(eq(&k, 1u32), &shift_f, &kl_b),
+        ));
+    });
 
     let mut generated = Vec::with_capacity(input.max_tokens);
-    if !stop_tokens.contains(&first) {
-        generated.push(first);
-    }
-    if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
-        pipeline.close();
-        return report(&generated, nc, gamma, shifts, scored, kl_total);
-    }
-
-    // ---- decode loop: uncond runs one step ahead, cond consumes it -------
-    let u_token = Channel::new([1], dtype::i32).named("uncond_token");
-    let u_embed_indptr = Channel::from([0u32, 1]).named("uncond_embed_indptr");
-    let u_pos = Channel::from([nu]).named("uncond_position");
-    let u_klen = Channel::from([nu + 1]).named("uncond_kv_len");
-    let u_pages = Channel::from_iter(0..uncond_pages).named("uncond_pages");
-    let u_page_indptr =
-        Channel::from([0u32, (nu + 1).div_ceil(PAGE_T)]).named("uncond_page_indptr");
-    let u_slot = Channel::from([nu / PAGE_T]).named("uncond_write_slot");
-    let u_off = Channel::from([nu % PAGE_T]).named("uncond_write_offset");
-    let u_logits_out = Channel::new([vocab], dtype::f32)
-        .capacity(channel_capacity() as u32)
-        .named("uncond_logits");
-
-    let uncond_decode = ForwardPass::new();
-    uncond_decode.embed(&u_token, &u_embed_indptr)?;
-    uncond_decode.attention(
-        Some(KvBinding {
-            working_set: &uncond_ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: (nu / kv_page_size())..,
-                kv_len: &u_klen,
-                pages: &u_pages,
-                page_indptr: &u_page_indptr,
-                w_slot: &u_slot,
-                w_off: &u_off,
-                positions: &u_pos,
-                mask: None,
-            },
-        }),
-        &uncond_rs,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
-    uncond_decode.epilogue(move || {
-        let length = u_klen.take();
-        let next_length = &length + 1u32;
-        let page_count = next_length.div_ceil(PAGE_T);
-
-        u_logits_out.put(intrinsics::logits());
-        u_klen.put(&next_length);
-        u_pos.put(&length);
-        u_slot.put(&length / PAGE_T);
-        u_off.put(&length % PAGE_T);
-        u_page_indptr.put(indptr(1, &page_count));
-    });
-
-    let c_token = Channel::from([first as i32]).named("cond_token");
-    let c_embed_indptr = Channel::from([0u32, 1]).named("cond_embed_indptr");
-    let c_pos = Channel::from([nc]).named("cond_position");
-    let c_klen = Channel::from([nc + 1]).named("cond_kv_len");
-    let c_pages = Channel::from_iter(0..cond_pages).named("cond_pages");
-    let c_page_indptr = Channel::from([0u32, (nc + 1).div_ceil(PAGE_T)]).named("cond_page_indptr");
-    let c_slot = Channel::from([nc / PAGE_T]).named("cond_write_slot");
-    let c_off = Channel::from([nc % PAGE_T]).named("cond_write_offset");
-    let c_uncond = Channel::writer([vocab], dtype::f32).named("cond_uncond_logits");
-    let c_token_out = Channel::new([1], dtype::i32)
-        .capacity(channel_capacity() as u32)
-        .named("cond_token_out");
-    let c_shift_out = Channel::new([1], dtype::i32)
-        .capacity(channel_capacity() as u32)
-        .named("cond_shift_out");
-    let c_kl_out = Channel::new([1], dtype::f32)
-        .capacity(channel_capacity() as u32)
-        .named("cond_kl_out");
-
-    let cond_decode = ForwardPass::new();
-    cond_decode.embed(&c_token, &c_embed_indptr)?;
-    cond_decode.attention(
-        Some(KvBinding {
-            working_set: &cond_ws,
-            geometry: KvGeometry {
-                readable_pages: ..,
-                writable_pages: (nc / kv_page_size())..,
-                kv_len: &c_klen,
-                pages: &c_pages,
-                page_indptr: &c_page_indptr,
-                w_slot: &c_slot,
-                w_off: &c_off,
-                positions: &c_pos,
-                mask: None,
-            },
-        }),
-        &cond_rs,
-        RsGeometry {
-            fold_len: None,
-            buffer: 0..0,
-        },
-    )?;
-    cond_decode.epilogue(move || {
-        let length = c_klen.take();
-        let (token, shift, kl) = guided_pick(&c_uncond.take(), gamma);
-        let next_length = &length + 1u32;
-        let page_count = next_length.div_ceil(PAGE_T);
-
-        c_token.put(&token);
-        c_klen.put(&next_length);
-        c_pos.put(&length);
-        c_slot.put(&length / PAGE_T);
-        c_off.put(&length % PAGE_T);
-        c_page_indptr.put(indptr(1, &page_count));
-        c_token_out.put(&token);
-        c_shift_out.put(&shift);
-        c_kl_out.put(&kl);
-    });
-
-    let budget = input.max_tokens.saturating_sub(generated.len());
-    // Strictly sequential: the unconditional stream must see the token that the
-    // guided distribution actually emitted, so its input is only known after the
-    // conditional fire lands. No run-ahead is possible without speculating.
-    let mut previous = first;
-    for _ in 0..budget {
-        u_token.put(vec![previous as i32]);
-        uncond_decode.submit(&pipeline).context("uncond decode")?;
-        let uncond_logits = u_logits_out.take_host::<Vec<f32>>().await?;
-
-        c_uncond.put(uncond_logits);
-        cond_decode.submit(&pipeline).context("cond decode")?;
-        let token = c_token_out.take_host::<i32>().await? as u32;
-        shifts += c_shift_out.take_host::<i32>().await? as u64;
-        kl_total += c_kl_out.take_host::<f32>().await? as f64;
+    let mut shifts = 0u64;
+    let mut kl_total = 0f64;
+    let mut scored = 0u64;
+    run_ahead(&pipeline, &decode, input.max_tokens, async || {
+        let row = out.take_host::<Vec<f32>>().await?;
+        let token = row[0] as u32;
+        shifts += row[1] as u64;
+        kl_total += row[2] as f64;
         scored += 1;
-
         if stop_tokens.contains(&token) {
-            break;
+            return Ok(ControlFlow::Break(()));
         }
         generated.push(token);
-        previous = token;
-    }
-    pipeline.close();
+        Ok(ControlFlow::Continue(()))
+    })
+    .await?;
 
     report(&generated, nc, gamma, shifts, scored, kl_total)
 }
