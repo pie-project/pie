@@ -533,6 +533,9 @@ intended for diagnostics, not serving",
         .map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
+        let host_kv_pages = shell
+            .seat_host_kv(residency.host_kv_budget, self.boot.world.size)
+            .map_err(fault)?;
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -577,6 +580,7 @@ intended for diagnostics, not serving",
                     u32::try_from(paging.window_pages()).unwrap_or(u32::MAX)
                 }),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
+                host_kv_pages,
             },
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
@@ -593,8 +597,8 @@ intended for diagnostics, not serving",
             geometry: GeometryClass::DeviceGeometry,
             kv_copy: KvCopyDomains {
                 device_to_device: true,
-                device_to_host: false,
-                host_to_device: false,
+                device_to_host: host_kv_pages > 0,
+                host_to_device: host_kv_pages > 0,
                 host_to_host: false,
             },
             kv_handle: None,
@@ -880,12 +884,26 @@ intended for diagnostics, not serving",
             .as_ref()
             .map(|caps| caps.device.domain)
             .and_then(MemoryDomain::ordinal);
-        let served = matches!(
-            (copy.src, copy.dst),
-            (MemoryDomain::CudaDevice(src), MemoryDomain::CudaDevice(dst))
-                if Some(src) == ordinal && Some(dst) == ordinal
-        );
-        if !served {
+        let ours = |domain: MemoryDomain| matches!(domain, MemoryDomain::CudaDevice(device) if Some(device) == ordinal);
+        let swap = match (copy.src, copy.dst) {
+            (src, MemoryDomain::HostPinned) if ours(src) => Some(true),
+            (MemoryDomain::HostPinned, dst) if ours(dst) => Some(false),
+            _ => None,
+        };
+        if let Some(to_host) = swap
+            && copy.moves.is_empty()
+        {
+            let (device, host) = if to_host {
+                (&copy.src_page_ids, &copy.dst_page_ids)
+            } else {
+                (&copy.dst_page_ids, &copy.src_page_ids)
+            };
+            return self
+                .loaded_mut()?
+                .swap_kv(to_host, device, host)
+                .map_err(fault);
+        }
+        if !(ours(copy.src) && ours(copy.dst)) {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),
                 engine: "cuda",

@@ -90,7 +90,7 @@ fn build_model(
                 total_pages: g.caps.pools.kv_pages as usize,
                 window_pages: g.caps.pools.window_pages,
                 window_tokens: g.caps.pools.window_tokens,
-                cpu_pages: 0,
+                cpu_pages: g.caps.pools.host_kv_pages as usize,
                 kv_copy: g.caps.kv_copy,
                 backend_kind,
                 rs_cache_required: g.caps.pools.state_slots != 0,

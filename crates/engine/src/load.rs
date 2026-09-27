@@ -55,6 +55,10 @@ pub struct Residency {
     pub host_weight_budget: Option<u64>,
     #[serde(default = "deferred_by_default")]
     pub deferred_tier: bool,
+    /// Pinned host bytes kv pages may be suspended into; `None` lets the
+    /// engine size it from the host, zero turns host swap off.
+    #[serde(default)]
+    pub host_kv_budget: Option<u64>,
 }
 
 fn deferred_by_default() -> bool {
@@ -82,6 +86,7 @@ impl Residency {
             device_weight_budget: None,
             host_weight_budget: None,
             deferred_tier: true,
+            host_kv_budget: None,
         }
     }
 

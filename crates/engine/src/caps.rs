@@ -47,6 +47,9 @@ pub struct PoolFacts {
     pub window_pages: u32,
     #[serde(default)]
     pub window_tokens: u32,
+    /// Host pages kv can be suspended into by `kv_copy`.
+    #[serde(default)]
+    pub host_kv_pages: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

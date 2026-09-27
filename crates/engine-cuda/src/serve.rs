@@ -132,6 +132,32 @@ impl Shell {
         self.pools.copy_kv(self.device.stream(), moves, &[])
     }
 
+    /// Pins the host kv pages `stated` (or the default) allows one of `ranks`.
+    pub fn seat_host_kv(&mut self, stated: Option<u64>, ranks: u32) -> Result<u32> {
+        let headroom = crate::weights::available_memory();
+        let (pages, asked) = crate::store::host_kv_pages(
+            stated,
+            headroom,
+            ranks,
+            self.pools.paging().pages(),
+            self.pools.paged_page_bytes(),
+        );
+        if pages < asked {
+            eprintln!(
+                "engine-cuda: the host kv pool pins {pages} of the {asked} pages it asked: \
+                 that is what fits this rank's share of the {} MiB of host memory the load left",
+                headroom >> 20,
+            );
+        }
+        self.pools.seat_host(pages)?;
+        Ok(self.pools.host_pages())
+    }
+
+    pub fn swap_kv(&mut self, to_host: bool, device: &[u32], host: &[u32]) -> Result<()> {
+        self.pools
+            .swap_kv(self.device.stream(), to_host, device, host)
+    }
+
     #[must_use]
     pub fn state_slot_bytes(&self) -> u64 {
         self.pools.state_slot_bytes()

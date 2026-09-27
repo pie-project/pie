@@ -476,6 +476,13 @@ pub struct ModelConfig {
     pub device_weight_budget: Option<ByteSize>,
     #[serde(default)]
     pub host_weight_budget: Option<ByteSize>,
+    /// How many pinned host bytes preempted processes' kv may be suspended
+    /// into (`"32GiB"`), shared by the tensor-parallel ranks. Omit for one
+    /// device kv pool's worth; either is capped by the host memory the load
+    /// leaves free. `"0B"` turns host swap off, so kv pressure restarts
+    /// processes instead.
+    #[serde(default)]
+    pub host_kv_budget: Option<ByteSize>,
     /// **MAY A WARM BOOT DEFER THE PINNED TIER?** On (the default) T1's
     /// planes are verified where they lie in the artifact and served from
     /// there while a background thread builds the page-locked copy, so the
@@ -630,6 +637,7 @@ impl ModelConfig {
             device_weight_budget: self.device_weight_budget.map(|b| b.as_bytes()),
             host_weight_budget: self.host_weight_budget.map(|b| b.as_bytes()),
             deferred_tier: self.deferred_tier,
+            host_kv_budget: self.host_kv_budget.map(|b| b.as_bytes()),
         }
     }
 
