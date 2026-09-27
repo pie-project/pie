@@ -171,6 +171,7 @@ pub struct Plane {
     staged: Vec<(u64, Extents, u64)>,
     wave: Wave,
     shadow: bool,
+    flight: u32,
 }
 
 impl Default for Plane {
@@ -192,7 +193,15 @@ impl Plane {
             staged: Vec::new(),
             wave: Wave::default(),
             shadow: false,
+            flight: u32::MAX,
         }
+    }
+
+    /// The most lanes one flight of a program carries, whatever the fire's
+    /// width: a wider group flies in several, so its scratch is held at
+    /// this width rather than at the load's lanes.
+    pub fn set_flight(&mut self, lanes: u32) {
+        self.flight = lanes.max(1);
     }
 
     pub fn set_shadow(&mut self, shadow: bool) {
@@ -491,6 +500,7 @@ impl Plane {
             programs,
             instances,
             staged,
+            flight,
             ..
         } = self;
 
@@ -523,6 +533,7 @@ impl Plane {
                     .map(Prepared::lane_ceiling)
                     .min()
                     .unwrap_or(u32::MAX)
+                    .min(*flight)
                     .max(1) as usize;
                 if let Some((width, fault)) = refused.take()
                     && ceiling >= width
