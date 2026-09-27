@@ -50,6 +50,24 @@ impl Peers {
         })
     }
 
+    /// Launches this rank's half of the check `peers_answer` makes; the
+    /// verdict lands in `status`, 0 when every peer answered.
+    pub fn answer(&self, ctx: &Ctx, status: u64) -> Result<(), Error> {
+        ctx.fire(
+            "collective.peers_answer",
+            Fire::at(FILE, "::pie::collective::peers_answer")
+                .apply(Launch::grid([1, 1, 1], [1, 1, 1])),
+            &[
+                ArgValue::Ptr(self.stages),
+                ArgValue::Ptr(self.signals),
+                ArgValue::Ptr(self.signal),
+                ArgValue::I32(self.rank as i32),
+                ArgValue::I32(self.world as i32),
+                ArgValue::Ptr(status),
+            ],
+        )
+    }
+
     fn launch(packs: u64) -> Launch {
         let blocks = packs.div_ceil(u64::from(THREADS)).clamp(1, MAX_BLOCKS) as u32;
         Launch::grid([blocks, 1, 1], [THREADS, 1, 1])
