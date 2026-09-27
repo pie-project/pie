@@ -439,16 +439,25 @@ impl FrameShell for Shell {
             })
             .min()
             .unwrap_or_else(|| model_compiler::arena::readouts_ceiling(&self.budget));
-        if readout_rows.len() as u64 > readouts_ceiling {
+        let readout_extent = readout_extent(
+            composition.rows(),
+            if self.pad {
+                composition.bucket()
+            } else {
+                composition.rows()
+            },
+            readout_rows.len(),
+        );
+        if readout_extent > readouts_ceiling {
             return Err(Fault::Ceiling {
                 what: "rows one fire reads out through its readout plane",
-                need: readout_rows.len() as u64,
+                need: readout_extent,
                 have: readouts_ceiling,
             });
         }
         self.arena.ensure(
             &mut self.pools,
-            self.compiled.arena.prefix_for(readout_rows.len() as u64),
+            self.compiled.arena.prefix_for(readout_extent),
         )?;
         let descriptor = FireDescriptor::of(&composition);
 
@@ -1655,9 +1664,17 @@ fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
+/// The rows a fire's kernels write through its readout plane: a readout as
+/// tall as the fire is launched at the fire's bucket, so the plane must
+/// hold the bucket, not only the rows read out.
+fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
+    let pad = kernels_cuda::Pad { rows, bucket };
+    u64::from(pad.extent(u32::try_from(readouts).unwrap_or(u32::MAX)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FoldLen, resolve_fold_len};
+    use super::{FoldLen, readout_extent, resolve_fold_len};
 
     const PORT: eta_ir::registry::Port = eta_ir::registry::Port::RsFoldLen;
 
@@ -1665,6 +1682,13 @@ mod tests {
     fn prepare_every_case() {
         a_device_fold_length_is_clamped_to_the_bound_it_was_promised();
         a_fold_length_that_resolves_to_zero_is_refused_by_name();
+        a_readout_as_tall_as_the_fire_holds_the_bucket();
+    }
+
+    fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
+        assert_eq!(readout_extent(133, 256, 133), 256);
+        assert_eq!(readout_extent(133, 256, 5), 5);
+        assert_eq!(readout_extent(133, 133, 133), 133);
     }
 
     fn a_device_fold_length_is_clamped_to_the_bound_it_was_promised() {
