@@ -443,6 +443,7 @@ pub struct Pools {
     committed_state_slots: u32,
     backed_pages: Vec<u64>,
     windowed_backed: bool,
+    buffered: (u64, u64),
 }
 
 impl Pools {
@@ -570,7 +571,14 @@ impl Pools {
             committed_state_slots: 0,
             backed_pages: Vec::new(),
             windowed_backed: false,
+            buffered: (0, 1),
         })
+    }
+
+    /// A fire commits rs buffered pages by slot, so the fit seats them with
+    /// the slots rather than leave them growth past what it sized.
+    pub fn seat_buffered(&mut self, slot_bytes: u64, unit: u64) {
+        self.buffered = (slot_bytes, unit.max(1));
     }
 
     pub fn watch(&mut self, airborne: Airborne) {
@@ -678,7 +686,12 @@ impl Pools {
                     .sum::<u64>()
             })
             .sum();
-        rows.saturating_add(pooled)
+        let (slot_bytes, unit) = self.buffered;
+        let buffered = u64::from(slots)
+            .saturating_mul(slot_bytes)
+            .div_ceil(unit)
+            .saturating_mul(unit);
+        rows.saturating_add(pooled).saturating_add(buffered)
     }
 
     /// Re-reserves the kv planes and compressor slabs for a pool of `pages`,

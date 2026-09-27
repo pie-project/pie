@@ -126,7 +126,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         };
         compiled
             .arena
-            .prefix_for(u64::from(budget.max_lanes))
+            .bytes
             .saturating_add(crate::inputs::attention_workspace_bytes(
                 &budget,
                 &facts,
@@ -284,7 +284,7 @@ fn refit_lanes(
         .fold(0u64, u64::saturating_add);
         compiled
             .arena
-            .prefix_for(u64::from(lanes))
+            .bytes
             .saturating_add(crate::inputs::attention_workspace_bytes(
                 &budget,
                 &facts,
@@ -533,11 +533,13 @@ impl Shell {
         }
         let buffers = Buffers::reserve(&boot.trace, paging, &pools)?;
         let mut pools = pools;
+        if let Some(buffers) = &buffers {
+            pools.seat_buffered(buffers.slot_bytes(), buffers.map_unit());
+        }
+        // Committed whole: a fire reading out past one row a lane (a verify
+        // reads every row) would otherwise grow it outside the fit.
         let mut arena = Arena::reserve(&compiled.arena, &pools)?;
-        arena.ensure(
-            &mut pools,
-            compiled.arena.prefix_for(u64::from(boot.budget.max_lanes)),
-        )?;
+        arena.ensure(&mut pools, compiled.arena.bytes)?;
         let predicate = crate::store::rs::Predicate::reserve(boot.budget.max_lanes)?;
         let spaces = boot
             .trace
