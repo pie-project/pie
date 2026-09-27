@@ -146,6 +146,19 @@ pub struct Pad {
     pub bucket: u32,
 }
 
+impl Pad {
+    /// The rows a kernel launches over for an operand of `rows` rows: the
+    /// fire's rows are padded to the bucket, whatever axis they were read on.
+    #[must_use]
+    pub fn extent(self, rows: u32) -> u32 {
+        if self.bucket > self.rows && rows == self.rows {
+            self.bucket
+        } else {
+            rows
+        }
+    }
+}
+
 pub const NO_REGION: u32 = u32::MAX;
 
 #[cfg(feature = "cuda")]
@@ -346,14 +359,12 @@ impl Ctx {
 
     #[must_use]
     pub fn opaque_rows(&self, rows: i32) -> i32 {
-        let pad = self.pad.get();
-        if pad.bucket <= pad.rows {
+        let Ok(stated) = u32::try_from(rows) else {
             return rows;
-        }
-        if rows < 0 || rows.unsigned_abs() != pad.rows {
-            return rows;
-        }
-        i32::try_from(pad.bucket).unwrap_or(rows).max(rows)
+        };
+        i32::try_from(self.pad.get().extent(stated))
+            .unwrap_or(rows)
+            .max(rows)
     }
 
     #[allow(clippy::unused_self)]
