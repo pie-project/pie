@@ -647,6 +647,20 @@ fn epilogue_pair(nodes: &[Node], i: usize, values: &[ValueDecl]) -> Option<Node>
             guard: first.guard.clone(),
             layer: second.layer.or(first.layer),
         }),
+        (
+            Operation::Linear(Linear::Matmul { act, w, y }),
+            Operation::Elementwise(Elementwise::AddBias { bias, out, out_out }),
+        ) if out == y && !read_elsewhere(nodes, values, *y, i) => Some(Node {
+            op: Operation::Linear(Linear::MatmulBias {
+                act: *act,
+                w: *w,
+                bias: *bias,
+                y: *y,
+                y_out: *out_out,
+            }),
+            guard: first.guard.clone(),
+            layer: second.layer.or(first.layer),
+        }),
         _ => None,
     }
 }
@@ -724,6 +738,7 @@ mod tests {
         a_select_between_the_scale_and_the_fold_moves_ahead_of_the_gather();
         a_norm_of_something_else_stays_apart_and_a_layer_boundary_does_not();
         a_matmul_and_the_geglu_over_it_fold_unless_the_packed_output_has_another_reader();
+        a_matmul_and_the_bias_added_to_it_fold_and_keep_the_alias();
         a_per_head_norm_and_the_q_rope_over_it_fold();
         a_select_and_the_embed_fold_over_its_copy_fold_unless_the_copy_is_read_again();
         an_lm_head_and_the_softcap_over_it_fold_and_keep_the_alias();
@@ -1099,6 +1114,30 @@ mod tests {
             apart.nodes.len(),
             3,
             "a second reader of the packed output keeps the matmul"
+        );
+    }
+
+    fn a_matmul_and_the_bias_added_to_it_fold_and_keep_the_alias() {
+        let add_bias = Node {
+            op: Operation::Elementwise(Elementwise::AddBias {
+                bias: ValueId(4),
+                out: ValueId(2),
+                out_out: ValueId(3),
+            }),
+            guard: Guard::Always,
+            layer: None,
+        };
+        let fused = gemm_epilogues(trace_of(vec![matmul(0, 1, 2), add_bias]));
+        assert_eq!(fused.nodes.len(), 1);
+        assert_eq!(
+            fused.nodes[0].op,
+            Operation::Linear(Linear::MatmulBias {
+                act: ValueId(0),
+                w: ValueId(1),
+                bias: ValueId(4),
+                y: ValueId(2),
+                y_out: ValueId(3),
+            })
         );
     }
 

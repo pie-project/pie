@@ -67,6 +67,13 @@ pub enum Linear {
         y: ValueId,
         y_out: ValueId,
     },
+    MatmulBias {
+        act: ValueId,
+        w: ValueId,
+        bias: ValueId,
+        y: ValueId,
+        y_out: ValueId,
+    },
     MlpSitu {
         packed: ValueId,
         intermediate: u32,
@@ -223,6 +230,7 @@ impl Operands for Linear {
             Self::MatmulGeglu { act, w, .. } | Self::LmHeadSoftcap { act, w, .. } => {
                 sink.extend([*act, *w]);
             }
+            Self::MatmulBias { act, w, bias, .. } => sink.extend([*act, *w, *bias]),
             Self::MlpSitu { packed, .. } => sink.push(*packed),
             Self::MoeTopkSoftmax { logits, .. } => sink.push(*logits),
             Self::MoeTopkSoftmaxScaled { logits, scale, .. } => sink.extend([*logits, *scale]),
@@ -319,6 +327,7 @@ impl Operands for Linear {
             Self::MlpGegluTanhPacked { y, .. } => sink.push(*y),
             Self::MatmulGeglu { packed, y, .. } => sink.extend([*packed, *y]),
             Self::LmHeadSoftcap { y, y_out, .. } => sink.extend([*y, *y_out]),
+            Self::MatmulBias { y, y_out, .. } => sink.extend([*y, *y_out]),
             Self::MlpSitu { y, .. } => sink.push(*y),
             Self::MoeTopkSoftmax {
                 routes, weights, ..
@@ -356,7 +365,9 @@ impl Operands for Linear {
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
         match self {
             Self::LoraCorrect { y, y_out, .. } => sink.push((*y_out, *y)),
-            Self::LmHeadSoftcap { y, y_out, .. } => sink.push((*y_out, *y)),
+            Self::LmHeadSoftcap { y, y_out, .. } | Self::MatmulBias { y, y_out, .. } => {
+                sink.push((*y_out, *y));
+            }
             Self::Matmul { .. }
             | Self::LmHead { .. }
             | Self::MlpSwiglu { .. }
@@ -399,6 +410,7 @@ impl Operands for Linear {
             Self::MlpGegluTanhPacked { .. } => "linear.mlp_geglu_tanh_packed",
             Self::MatmulGeglu { .. } => "linear.matmul_geglu",
             Self::LmHeadSoftcap { .. } => "linear.lm_head_softcap",
+            Self::MatmulBias { .. } => "linear.matmul_bias",
             Self::MlpSitu { .. } => "linear.mlp_situ",
             Self::MoeTopkSoftmax { .. } => "linear.moe_topk_softmax",
             Self::MoeTopkSoftmaxScaled { .. } => "linear.moe_topk_softmax_scaled",

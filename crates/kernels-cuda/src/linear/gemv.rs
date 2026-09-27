@@ -6,6 +6,7 @@ pub(crate) fn gemv_bf16(
     ctx: &Ctx,
     weight: u64,
     act: u64,
+    bias: u64,
     out: u64,
     n: i32,
     k: i32,
@@ -37,7 +38,11 @@ pub(crate) fn gemv_bf16(
     let values = [
         ArgValue::Ptr(weight),
         ArgValue::Ptr(act),
-        ArgValue::ABSENT,
+        if bias == 0 {
+            ArgValue::ABSENT
+        } else {
+            ArgValue::Ptr(bias)
+        },
         ArgValue::Ptr(out),
         ArgValue::I32(n),
         ArgValue::I32(k),

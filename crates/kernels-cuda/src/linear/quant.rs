@@ -549,7 +549,7 @@ fn dense_affine_via_dense(
             stated(op, k)?.arg(),
         ],
     )?;
-    gemm::act_x_wt(ctx, op, act, Tensor::new(tile, n, k, Dtype::Bf16), y)
+    gemm::act_x_wt(ctx, op, act, Tensor::new(tile, n, k, Dtype::Bf16), None, y)
 }
 
 pub fn cast_fp32_to(ctx: &Ctx, src: Tensor, dst: &mut Tensor) -> Result<(), Error> {

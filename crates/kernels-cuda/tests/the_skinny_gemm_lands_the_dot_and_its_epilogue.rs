@@ -3,6 +3,10 @@
 mod common;
 
 use common::{Gpu, Lcg, from_bf16, to_bf16};
+use dtype::Dtype;
+use kernels_cuda::Tensor;
+use kernels_cuda::elemwise::norm::add_bias;
+use kernels_cuda::linear::gemm::{matmul, matmul_bias};
 use kernels_cuda::linear::skinny::{Epilogue, ROWS, covers, skinny_bf16};
 
 fn round(v: f32) -> f32 {
@@ -78,6 +82,7 @@ fn check(epilogue: Epilogue, m: usize, n: usize, k: usize) {
 fn the_skinny_gemm_lands_the_dot_and_its_epilogue_every_case() {
     the_plain_projection_answers_the_dot_at_one_ragged_and_full_rows();
     the_softcap_epilogue_lands_the_capped_logit();
+    a_folded_bias_lands_the_bits_of_the_add_after_the_projection();
     the_geglu_epilogue_lands_the_gated_product();
     a_shape_the_block_does_not_divide_is_refused_without_firing();
 }
@@ -87,6 +92,29 @@ fn the_plain_projection_answers_the_dot_at_one_ragged_and_full_rows() {
         check(Epilogue::Store, m, 192, 128);
     }
     check(Epilogue::Store, 64, 640, 2560);
+}
+
+fn a_folded_bias_lands_the_bits_of_the_add_after_the_projection() {
+    for (m, n, k) in [(1, 512, 256), (1, 4104, 256), (3, 512, 256)] {
+        let mut lcg = Lcg::seeded(0x7b ^ n as u64);
+        let (w_raw, _) = lcg.row(n * k);
+        let (a_raw, _) = lcg.row(m * k);
+        let (b_raw, _) = lcg.row(n);
+        let mut gpu = Gpu::open();
+        let w = Tensor::new(gpu.up(&w_raw), n as u32, k as u32, Dtype::Bf16);
+        let a = Tensor::new(gpu.up(&a_raw), m as u32, k as u32, Dtype::Bf16);
+        let b = Tensor::new(gpu.up(&b_raw), 1, n as u32, Dtype::Bf16);
+        let mut fused = Tensor::new(gpu.zeros(m * n * 2), m as u32, n as u32, Dtype::Bf16);
+        let mut apart = Tensor::new(gpu.zeros(m * n * 2), m as u32, n as u32, Dtype::Bf16);
+        let ctx = gpu.ctx();
+        matmul_bias(&ctx, a, w, b, &mut fused).expect("the biased projection fires");
+        matmul(&ctx, a, w, &mut apart).expect("the projection fires");
+        add_bias(&ctx, b, &mut apart).expect("the add fires");
+        gpu.sync();
+        let got: Vec<u16> = gpu.down(fused.ptr, m * n);
+        let want: Vec<u16> = gpu.down(apart.ptr, m * n);
+        assert_eq!(got, want, "m={m} n={n} k={k}");
+    }
 }
 
 fn the_softcap_epilogue_lands_the_capped_logit() {
