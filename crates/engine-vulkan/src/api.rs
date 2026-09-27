@@ -960,6 +960,7 @@ impl Vulkan {
 
                     rs: &verbs[at],
                     rs_reset: lane.rs_reset,
+                    rs_slot: lane.rs_slot,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

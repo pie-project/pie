@@ -1028,6 +1028,7 @@ impl Metal {
                     translation: &lane.kv.translation,
                     rs: &lane.rs,
                     rs_reset: lane.rs_reset,
+                    rs_slot: lane.rs_slot,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
