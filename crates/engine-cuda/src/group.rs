@@ -145,7 +145,11 @@ pub fn open_group(
         return Err(why);
     }
     let devices: Vec<i32> = boots.iter().map(|boot| boot.ordinal).collect();
-    if let Some(peers) = crate::comm::open_peers(&devices) {
+    let peers = crate::comm::open_peers(&devices).and_then(|peers| {
+        let opened: Vec<&Comm> = comms.iter().flatten().collect();
+        crate::comm::calibrate(&devices, &opened, peers)
+    });
+    if let Some(peers) = peers {
         for (comm, peers) in comms.iter_mut().flatten().zip(peers) {
             comm.set_peers(peers);
         }
