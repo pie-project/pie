@@ -111,14 +111,15 @@ impl PoolPort for RegistryPool {
     }
 
     fn reclaim_idle(&self) -> u32 {
-        self.with_kv_tagged("planner-reclaim-idle", |kv| {
+        let pages = self.with_kv_tagged("planner-reclaim-idle", |kv| {
             let epoch = kv.current_epoch();
             let freed = kv.drop_unused_cache_leases(epoch);
             if freed > 0 {
                 kv.retire_idle();
             }
-            freed as u32
-        })
+            freed
+        });
+        (pages + self.with_rs(|rs| rs.drop_unused_indexes())) as u32
     }
 
     fn suspend_capable(&self) -> bool {
@@ -884,6 +885,17 @@ impl ResidencyPlanner {
         }
     }
 
+    /// Drops the idle cache (unused index roots and snapshots) unless the last
+    /// attempt found nothing and nothing was freed since; true when it freed some.
+    fn reclaim_idle_once(&self) -> bool {
+        if self.idle_reclaim_exhausted.swap(true, Ordering::AcqRel) || self.port.reclaim_idle() == 0
+        {
+            return false;
+        }
+        self.idle_reclaim_exhausted.store(false, Ordering::Release);
+        true
+    }
+
     fn re_arm_idle_reclaim(&self) {
         self.idle_reclaim_exhausted.store(false, Ordering::Release);
     }
@@ -1477,12 +1489,7 @@ impl ResidencyPlanner {
                         self.check_starvation(StarveCause::NoWindowedPages);
                         return;
                     }
-                    if !self
-                        .idle_reclaim_exhausted
-                        .swap(true, std::sync::atomic::Ordering::AcqRel)
-                        && self.port.reclaim_idle() > 0
-                    {
-                        self.idle_reclaim_exhausted.store(false, Ordering::Release);
+                    if self.reclaim_idle_once() {
                         continue;
                     }
                     if !fund_by_eviction {
@@ -1498,6 +1505,7 @@ impl ResidencyPlanner {
                     let rs = if demand.rs_slots > 0 {
                         match self.port.reserve_rs(demand.rs_slots) {
                             Some(slots) => RsSlotReservation::new(slots, self.port.clone()),
+                            None if self.reclaim_idle_once() => continue,
                             None => {
                                 self.check_rs_starvation(key, demand);
                                 return;
