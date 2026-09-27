@@ -217,24 +217,17 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
         // just allocated on device `a`.
         unsafe {
             check("cudaSetDevice", rt::cudaSetDevice(a))?;
-            for &b in ordinals.iter().filter(|&&b| b != a) {
-                let code = rt::cudaDeviceEnablePeerAccess(b, 0);
-                if code != rt::cudaError::cudaErrorPeerAccessAlreadyEnabled {
-                    check("cudaDeviceEnablePeerAccess", code)?;
-                }
-            }
-            let mut stage: *mut c_void = core::ptr::null_mut();
-            check(
-                "cudaMalloc",
-                rt::cudaMalloc(&raw mut stage, STAGE_BYTES as usize),
-            )?;
-            let mut signal: *mut c_void = core::ptr::null_mut();
             let signal_bytes = kernels_cuda::collective::SIGNAL_BYTES as usize + table;
-            check("cudaMalloc", rt::cudaMalloc(&raw mut signal, signal_bytes))?;
-            check("cudaMemset", rt::cudaMemset(signal, 0, signal_bytes))?;
-            stages[rank] = stage as u64;
-            signals[rank] = signal as u64;
-            tables.push(signal as u64 + kernels_cuda::collective::SIGNAL_BYTES);
+            let stage =
+                crate::device::elastic::shared(a, ordinals, STAGE_BYTES + signal_bytes as u64)?;
+            let signal = stage + STAGE_BYTES;
+            check(
+                "cudaMemset",
+                rt::cudaMemset(signal as *mut c_void, 0, signal_bytes),
+            )?;
+            stages[rank] = stage;
+            signals[rank] = signal;
+            tables.push(signal + kernels_cuda::collective::SIGNAL_BYTES);
         }
     }
     // cudaDeviceCanAccessPeer is what the driver advertises; a copy through
