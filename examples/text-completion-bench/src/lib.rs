@@ -30,6 +30,7 @@
 //! field.
 
 use inferlet::eta::hybrid::prelude::*;
+use inferlet::prefix_cache::PrefixCache;
 use inferlet::{chat, session};
 use serde::{Deserialize, Serialize};
 
@@ -283,7 +284,12 @@ async fn run_one(
     let temperature = input.temperature;
     let top_p = input.top_p;
 
-    let ws = WorkingSet::new();
+    // Pages another request already computed for the same leading tokens are
+    // mapped in, not recomputed; only the tokens after them are prefilled.
+    let prefixes = PrefixCache::new(
+        concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")).as_bytes(),
+    );
+    let (ws, cached) = prefixes.adopt(&prompt_vec).context("adopt cached prefix")?;
     let page_size = kv_page_size();
     let n = prompt_vec.len() as u32;
     let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size);
@@ -323,7 +329,10 @@ async fn run_one(
     // and are submitted straight to the pipeline. When the prompt fits in
     // one chunk the loop body runs zero times and the pass built below is
     // byte-for-byte what this inferlet built before.
-    let spans = prefill_chunks(n, None);
+    let spans: Vec<(u32, u32)> = prefill_chunks(n - cached, None)
+        .into_iter()
+        .map(|(base, end)| (cached + base, cached + end))
+        .collect();
     let (last_base, last_end) = *spans.last().expect("prefill_chunks is non-empty");
 
     let toks_p = Channel::from(&prompt_i32[last_base as usize..last_end as usize]).named("toks_p");
@@ -462,7 +471,7 @@ async fn run_one(
                     working_set: &ws,
                     geometry: KvGeometry {
                         readable_pages: ..,
-                        writable_pages: ..,
+                        writable_pages: (base / page_size)..,
                         kv_len: &kv_len_c,
                         pages: &pages_c,
                         page_indptr: &page_indptr_c,
@@ -520,7 +529,7 @@ async fn run_one(
                 working_set: &ws,
                 geometry: KvGeometry {
                     readable_pages: ..,
-                    writable_pages: ..,
+                    writable_pages: (last_base / page_size)..,
                     kv_len: &kv_len_p,
                     pages: &pages_p,
                     page_indptr: &page_indptr_p,
@@ -735,6 +744,10 @@ async fn run_one(
     if input.report_timing && honor_wait_for_start {
         session::send("t0");
     }
+    // The prefill has landed: offer its full prompt pages to later requests.
+    prefixes
+        .publish(&ws, &pipe, &prompt_vec, cached)
+        .context("publish prompt prefix")?;
 
     // **THE HOST ARM'S HANDOFF, AND THE WHOLE OF IT.** The token is
     // here; the decode pass can be built on it now, `tok_in` SEEDED

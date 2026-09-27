@@ -2583,6 +2583,7 @@ dependencies = [
 name = "inferlet"
 version = "0.5.4"
 dependencies = [
+ "blake3",
  "inferlet-macros",
  "pie-eta-dsl",
  "serde",

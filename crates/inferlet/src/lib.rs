@@ -48,6 +48,7 @@ pub mod working_set {
 
 pub mod eta;
 pub mod mask;
+pub mod prefix_cache;
 
 pub mod chat;
 
