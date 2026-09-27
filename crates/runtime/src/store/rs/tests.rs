@@ -35,6 +35,40 @@ fn tests_every_case() {
     run_ahead_successor_after_fork_cows_exactly_once();
     publish_batch_rejects_an_aliased_working_set();
     a_bound_driven_to_zero_is_exact_again();
+    index_snapshots_state_and_is_reclaimed_when_idle();
+}
+
+fn index_snapshots_state_and_is_reclaimed_when_idle() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    let pending = s.prepare_write(ws, true, None).unwrap();
+    let published = s.publish_prepared(pending).unwrap();
+    assert_eq!(
+        s.update_index(b"k".to_vec(), ws),
+        Err(RsError::IndexInFlight)
+    );
+    s.settle(published);
+    let slot = s.folded_slot(ws).unwrap();
+    assert_eq!(s.update_index(b"k".to_vec(), ws), Ok(0));
+
+    write_state(&mut s, ws);
+    assert_ne!(
+        s.folded_slot(ws).unwrap(),
+        slot,
+        "the owner's next write copies"
+    );
+    let adopted = s.from_index(b"k").unwrap().unwrap();
+    assert_eq!(s.folded_slot(adopted).unwrap(), slot);
+    assert_eq!(
+        s.drop_unused_indexes(),
+        0,
+        "an adopter still holds the state"
+    );
+
+    s.release_working_set(adopted, s.current_epoch());
+    assert_eq!(s.drop_unused_indexes(), 1);
+    assert_eq!(s.from_index(b"k"), Ok(None));
+    assert_eq!(s.available_slots(), 11);
 }
 
 fn run_ahead_successor_never_resets_twice() {

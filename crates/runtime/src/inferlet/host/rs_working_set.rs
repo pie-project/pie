@@ -141,11 +141,66 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         }
     }
 
+    async fn update_index(
+        &mut self,
+        this: Resource<RsWorkingSet>,
+        key: Vec<u8>,
+    ) -> Result<Result<(), String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let ws = self.ctx().table.get(&this)?.clone();
+        let stores = store_registry::get(ws.model, ws.engine);
+        let result = stores.rs.lock().unwrap().update_index(key, ws.id);
+        Ok(result.map(slots_freed).map_err(|e| e.to_string()))
+    }
+
+    async fn from_index(
+        &mut self,
+        key: Vec<u8>,
+    ) -> Result<Result<Option<Resource<RsWorkingSet>>, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let (model, engine) = (0, 0);
+        let stores = store_registry::get(model, engine);
+        let indexed = {
+            let mut rs = stores.rs.lock().unwrap();
+            rs.from_index(&key)
+                .and_then(|id| id.map(|id| Ok((id, rs.geometry(id)?))).transpose())
+        };
+        match indexed {
+            Ok(Some((id, geom))) => {
+                let ws = RsWorkingSet::new(model, engine, id, geom);
+                self.register_rs_working_set(model, engine, id);
+                Ok(Ok(Some(self.ctx().table.push(ws)?)))
+            }
+            Ok(None) => Ok(Ok(None)),
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn remove_index(&mut self, key: Vec<u8>) -> Result<Result<bool, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let stores = store_registry::get(0, 0);
+        let removed = stores.rs.lock().unwrap().remove_index(&key);
+        Ok(removed
+            .map(|(removed, freed)| {
+                slots_freed(freed);
+                removed
+            })
+            .map_err(|e| e.to_string()))
+    }
+
     async fn drop(&mut self, this: Resource<RsWorkingSet>) -> Result<()> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let ws = self.ctx().table.delete(this)?;
         self.unregister_rs_working_set(ws.model, ws.engine, ws.id);
         ws.release();
         Ok(())
+    }
+}
+
+fn slots_freed(freed: usize) {
+    if freed != 0
+        && let Some(planner) = crate::planner::planner()
+    {
+        planner.pages_freed();
     }
 }

@@ -6,7 +6,7 @@ pub mod write;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::store::genmap::{GenKey, GenMap};
 use crate::store::pool::{Pool, PoolId};
@@ -86,6 +86,10 @@ pub enum RsError {
     OutOfSlots { requested: usize, available: usize },
     #[error("rs slot grant mismatch: required {required}, granted {granted}")]
     GrantMismatch { required: usize, granted: usize },
+    #[error("rs index key must be 1..={max} bytes", max = crate::store::kv::MAX_INDEX_KEY_BYTES)]
+    BadIndexKey,
+    #[error("rs working set cannot be indexed while a fire still writes its state")]
+    IndexInFlight,
 }
 
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
@@ -146,7 +150,10 @@ pub struct RsStore {
     refs: HashMap<RsSlotId, u32>,
     working_sets: GenMap<RsWsMarker, RsEntry>,
     seq: u64,
-    outstanding: BTreeSet<u64>,
+    /// Unsettled writes by seq, with the slots each one writes.
+    outstanding: BTreeMap<u64, Vec<RsSlotId>>,
+    /// Index snapshots: hidden forks no process holds.
+    indexes: HashMap<Vec<u8>, RsWorkingSetId>,
 }
 
 impl RsStore {
@@ -156,7 +163,8 @@ impl RsStore {
             refs: HashMap::new(),
             working_sets: GenMap::new(),
             seq: 0,
-            outstanding: BTreeSet::new(),
+            outstanding: BTreeMap::new(),
+            indexes: HashMap::new(),
         }
     }
 
@@ -165,7 +173,7 @@ impl RsStore {
     }
 
     pub fn retire_idle(&mut self) {
-        let completed = match self.outstanding.iter().next() {
+        let completed = match self.outstanding.keys().next() {
             Some(&oldest) => oldest.saturating_sub(1),
             None => u64::MAX,
         };
@@ -210,16 +218,104 @@ impl RsStore {
         }))
     }
 
-    pub fn release_working_set(&mut self, ws: RsWorkingSetId, epoch: u64) {
+    /// Releases `ws`, returning how many slots it was the last holder of.
+    pub fn release_working_set(&mut self, ws: RsWorkingSetId, epoch: u64) -> usize {
         let Some(entry) = self.working_sets.remove(ws) else {
-            return;
+            return 0;
         };
-        if let Some(id) = entry.folded {
-            self.decref(id, epoch);
+        entry
+            .folded
+            .into_iter()
+            .chain(entry.buffer.into_iter().flatten())
+            .filter(|&id| self.decref(id, epoch))
+            .count()
+    }
+
+    fn slots(entry: &RsEntry) -> impl Iterator<Item = RsSlotId> + '_ {
+        entry
+            .folded
+            .into_iter()
+            .chain(entry.buffer.iter().flatten().copied())
+    }
+
+    fn validate_index_key(key: &[u8]) -> Result<(), RsError> {
+        if key.is_empty() || key.len() > crate::store::kv::MAX_INDEX_KEY_BYTES {
+            return Err(RsError::BadIndexKey);
         }
-        for id in entry.buffer.into_iter().flatten() {
-            self.decref(id, epoch);
+        Ok(())
+    }
+
+    /// Indexes a snapshot of `ws` under `key`, returning the slots a replaced
+    /// snapshot freed.
+    pub fn update_index(&mut self, key: Vec<u8>, ws: RsWorkingSetId) -> Result<usize, RsError> {
+        Self::validate_index_key(&key)?;
+        let held: HashSet<RsSlotId> = Self::slots(self.entry(ws)?).collect();
+        if self
+            .outstanding
+            .values()
+            .flatten()
+            .any(|id| held.contains(id))
+        {
+            return Err(RsError::IndexInFlight);
         }
+        let snapshot = self.fork(ws)?;
+        Ok(match self.indexes.insert(key, snapshot) {
+            Some(old) => self.release_working_set(old, self.seq),
+            None => 0,
+        })
+    }
+
+    #[allow(
+        clippy::wrong_self_convention,
+        reason = "`from-index` is the WIT name, as on the kv store"
+    )]
+    pub fn from_index(&mut self, key: &[u8]) -> Result<Option<RsWorkingSetId>, RsError> {
+        Self::validate_index_key(key)?;
+        self.indexes
+            .get(key)
+            .copied()
+            .map(|snapshot| self.fork(snapshot))
+            .transpose()
+    }
+
+    pub fn remove_index(&mut self, key: &[u8]) -> Result<(bool, usize), RsError> {
+        Self::validate_index_key(key)?;
+        Ok(match self.indexes.remove(key) {
+            Some(snapshot) => (true, self.release_working_set(snapshot, self.seq)),
+            None => (false, 0),
+        })
+    }
+
+    /// The rs half of the planner's idle reclaim: drops every snapshot that
+    /// holds a slot no live working set does, returning the slots freed.
+    pub fn drop_unused_indexes(&mut self) -> usize {
+        if self.indexes.is_empty() {
+            return 0;
+        }
+        let snapshots: HashSet<RsWorkingSetId> = self.indexes.values().copied().collect();
+        let live: HashSet<RsSlotId> = self
+            .working_sets
+            .iter()
+            .filter(|(ws, _)| !snapshots.contains(ws))
+            .flat_map(|(_, entry)| Self::slots(entry))
+            .collect();
+        let working_sets = &self.working_sets;
+        let mut dropped = Vec::new();
+        self.indexes.retain(|_, snapshot| {
+            let unused = working_sets
+                .get(*snapshot)
+                .is_some_and(|entry| Self::slots(entry).any(|id| !live.contains(&id)));
+            if unused {
+                dropped.push(*snapshot);
+            }
+            !unused
+        });
+        let freed = dropped
+            .into_iter()
+            .map(|snapshot| self.release_working_set(snapshot, self.seq))
+            .sum();
+        self.retire_idle();
+        freed
     }
 
     pub fn alloc_buffer(&mut self, ws: RsWorkingSetId, n: u32) -> Result<PageRange, RsError> {
@@ -563,7 +659,7 @@ impl RsStore {
             None
         };
 
-        let buffers = buffer_targets_src
+        let buffers: Vec<RsBufferTarget> = buffer_targets_src
             .into_iter()
             .map(|(index, slot)| match slot {
                 None => RsBufferTarget::Fresh {
@@ -580,7 +676,12 @@ impl RsStore {
             .collect();
 
         self.seq += 1;
-        self.outstanding.insert(self.seq);
+        let writes = state
+            .iter()
+            .map(|state| state.slot)
+            .chain(buffers.iter().map(RsBufferTarget::dst))
+            .collect();
+        self.outstanding.insert(self.seq, writes);
         Ok(RsPreparedWrite {
             fold_len_is_bound: false,
             ws,
@@ -834,14 +935,16 @@ impl RsStore {
         self.refs.get(&id).copied().unwrap_or(1)
     }
 
-    fn decref(&mut self, id: RsSlotId, epoch: u64) {
+    fn decref(&mut self, id: RsSlotId, epoch: u64) -> bool {
         let count = self.refs.entry(id).or_insert(1);
         *count -= 1;
-        if *count == 0 {
-            self.refs.remove(&id);
-            let epoch = epoch.max(self.seq);
-            self.pool.recycle_after_epoch(vec![id], epoch);
+        if *count != 0 {
+            return false;
         }
+        self.refs.remove(&id);
+        let epoch = epoch.max(self.seq);
+        self.pool.recycle_after_epoch(vec![id], epoch);
+        true
     }
 }
 
