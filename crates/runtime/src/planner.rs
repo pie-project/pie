@@ -1655,8 +1655,9 @@ impl ResidencyPlanner {
                 self.check_starvation(StarveCause::NoSwapRoom);
                 return;
             }
-            self.check_hog(victims.head, victims.head_pid);
-            self.check_starvation(StarveCause::NoEligibleVictim);
+            if !self.check_hog(victims.head, victims.head_pid, KvPool::Paged) {
+                self.check_starvation(StarveCause::NoEligibleVictim);
+            }
             return;
         }
         self.commit_evictions(victims.head, picks, false, victims.runway_grab);
@@ -2195,6 +2196,14 @@ impl ResidencyPlanner {
         if self.with_inner(|inner| inner.kill_in_flight()) {
             return;
         }
+        // A head past the pool with what it holds itself fails: restarting
+        // it would only replay it into the same wall.
+        if let Some((head, pid)) =
+            self.with_inner(|inner| inner.unmet_head().map(|(k, w)| (k, w.pid)))
+            && self.check_hog(head, pid, pool)
+        {
+            return;
+        }
         let Some(victim_key) = self.pick_starvation_victim() else {
             return;
         };
@@ -2294,7 +2303,7 @@ impl ResidencyPlanner {
         first_holder.or(fallback)
     }
 
-    fn check_hog(self: &Arc<Self>, head_key: EntryKey, head_pid: ProcessId) {
+    fn check_hog(self: &Arc<Self>, head_key: EntryKey, head_pid: ProcessId, pool: KvPool) -> bool {
         let transfers_in_flight = self.with_inner(|inner| {
             !inner.evicting.is_empty()
                 || inner
@@ -2303,11 +2312,16 @@ impl ResidencyPlanner {
                     .any(|proc| proc.state == Residency::Restoring)
         });
         if transfers_in_flight {
-            return;
+            return false;
         }
         let (model, engine) = self.port.locus();
-        let held = held_page_count(head_pid, model, engine);
-        let (_, total) = self.port.device_stats(KvPool::Paged);
+        let held = match pool {
+            KvPool::Paged => held_page_count(head_pid, model, engine),
+            KvPool::Windowed => {
+                kv_page_count(head_pid, model, engine, |kv, ws| kv.held_window_pages(ws))
+            }
+        };
+        let (_, total) = self.port.device_stats(pool);
         let notify = self.with_inner(|inner| {
             let waiter = inner.queue.get_mut(&head_key)?;
             let WaitKind::Allocation {
@@ -2319,17 +2333,19 @@ impl ResidencyPlanner {
             else {
                 return None;
             };
-            let need = demand.kv_pages[KvPool::Paged];
+            let need = demand.kv_pages[pool];
             if outcome.is_some() || need.saturating_add(held) <= total {
                 return None;
             }
             *outcome = Some(Err(PlannerError::Hog { need, held, total }));
             Some(notify.clone())
         });
-        if let Some(notify) = notify {
-            self.stats.hog_failures.fetch_add(1, Ordering::Relaxed);
-            notify.notify_waiters();
-        }
+        let Some(notify) = notify else {
+            return false;
+        };
+        self.stats.hog_failures.fetch_add(1, Ordering::Relaxed);
+        notify.notify_waiters();
+        true
     }
 
     fn report_evicted(self: &Arc<Self>, pid: ProcessId, freed: u32) {
@@ -3472,5 +3488,87 @@ mod starvation_race_tests {
         let grant = granted(parked.await.expect("the parked task"));
         assert_eq!(grant.remaining_kv(KvPool::Windowed), 2);
         fire(b, 0, 32, grant);
+    }
+
+    // A lone sequence is served by the pages its own window moved past,
+    // with no other fire left to retire them, and a window that cannot
+    // fit beside what it holds is refused rather than restarted forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lone_window_is_served_by_what_it_moved_past_or_told_it_never_fits() {
+        use crate::inferlet::process::residency::{ProcessResidency, register_residency};
+        use crate::store::kv::window::WindowLane;
+        use crate::store::registry::with_kv_lock;
+
+        let model = crate::store::registry::register_model(16, &[64], &[0]);
+        let stores = crate::store::registry::get(model, 0);
+        let ws = with_kv_lock(&stores.kv, "test", |kv| {
+            kv.set_window(32, 16, 8);
+            kv.create_working_set()
+        });
+        let handle = crate::store::kv::working_set::KvWorkingSet::new(model, 0, ws, 16);
+        let pid = ProcessId::new_v4();
+        let residency = Arc::new(std::sync::Mutex::new(ProcessResidency::default()));
+        residency
+            .lock()
+            .unwrap()
+            .kv_working_sets
+            .insert((model, 0, ws), handle.suspend_handle());
+        register_residency(pid, Arc::downgrade(&residency));
+        let planner = Arc::new(ResidencyPlanner::new(Arc::new(RegistryPool::new(
+            model, 0, false,
+        ))));
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let pages: Vec<u32> = (0..16).collect();
+        let fire = |held: u32, rows: u32| {
+            let planner = planner.clone();
+            let (stores, pages) = (stores.clone(), pages.clone());
+            async move {
+                let demand = with_kv_lock(&stores.kv, "test", |kv| {
+                    let end = u64::from((held + rows).div_ceil(16));
+                    kv.reserve(ws, end.saturating_sub(kv.page_len(ws).unwrap()))
+                        .unwrap();
+                    let lane = WindowLane::of(&pages, held, rows, 32, 16);
+                    let windowed = kv.window_demand(ws, &[lane], 0..0).unwrap();
+                    kv.ensure_backed(ws, end).unwrap();
+                    Demand {
+                        kv_pages: KvPages::new(0, windowed),
+                        rs_slots: 0,
+                    }
+                });
+                let Acquired::Granted(mut grant) = planner.acquire(pid, pid, demand).await? else {
+                    panic!("a resident process is never yielded");
+                };
+                with_kv_lock(&stores.kv, "test", |kv| {
+                    let epoch = kv.open_epoch();
+                    let lane = WindowLane::of(&pages, held, rows, 32, 16);
+                    kv.claim_window(ws, &[lane], &[], grant.lend_kv(KvPool::Windowed), epoch)
+                        .expect("a windowed pool")
+                        .expect("the grant covers the claim");
+                    kv.settle(epoch, Vec::new(), true);
+                });
+                Ok::<(), PlannerError>(())
+            }
+        };
+
+        fire(0, 96).await.expect("six of seven pages");
+        fire(96, 64)
+            .await
+            .expect("four fresh pages, four given back behind the window");
+        let error = fire(160, 96)
+            .await
+            .expect_err("six fresh beside the two it keeps");
+        assert!(
+            matches!(
+                error,
+                PlannerError::Hog {
+                    need: 6,
+                    held: 2,
+                    total: 7
+                }
+            ),
+            "{error}"
+        );
+        drop(handle);
     }
 }
