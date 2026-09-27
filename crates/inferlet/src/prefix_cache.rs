@@ -1,31 +1,45 @@
-//! A prefix cache an inferlet keeps over the working-set index: page `k` of
-//! a prompt is published under `namespace || h_k`, where `h_k` chains the
-//! hashes of the prompt's first `k` pages, so a later prompt with the same
-//! leading pages maps them in instead of prefilling them.
+//! A prefix cache an inferlet keeps over the working-set indexes: a prompt
+//! prefix of `k` pages is published under `namespace || h_k`, where `h_k`
+//! chains the hashes of the prompt's first `k` pages, so a later prompt with
+//! the same leading pages maps them in instead of prefilling them.
+//!
+//! KV pages can be sliced out of a finished prompt, so an attention model
+//! publishes every page. Recurrent state exists only where a prefill chunk
+//! ended and a snapshot is a whole state slot, so a hybrid model publishes
+//! only at boundaries its prefill ends chunks at, each under both indexes.
 
-use crate::eta::{Pipeline, WorkingSet, kv_page_size};
+use crate::eta::{Pipeline, RsWorkingSet, WorkingSet, kv_page_size};
 use crate::model::{self, ForwardKind};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Off,
+    Pages,
+    Boundaries,
+}
 
 pub struct PrefixCache {
     namespace: Vec<u8>,
     page_size: u32,
-    enabled: bool,
+    mode: Mode,
 }
 
 impl PrefixCache {
     /// `namespace` separates programs: keys are global to the model's store,
-    /// so it must name everything the published KV depends on besides tokens.
+    /// so it must name everything the published state depends on besides tokens.
     pub fn new(namespace: &[u8]) -> PrefixCache {
-        // Only models whose context lives in full KV pages: recurrent state
-        // has no index, and gemma4's windowed rows are claimed per tail, so a
-        // page boundary behind the tail would come back without them.
-        let enabled = model::pass_kind() == ForwardKind::Attention
-            && model::rs_state_size() == 0
-            && model::architecture() != "gemma4";
+        // gemma4's windowed rows are claimed per tail, so a page boundary
+        // behind the tail would come back without them.
+        let mode = match model::pass_kind() {
+            _ if model::architecture() == "gemma4" => Mode::Off,
+            ForwardKind::Attention => Mode::Pages,
+            ForwardKind::Hybrid => Mode::Boundaries,
+            ForwardKind::Recurrent | ForwardKind::Diffusion => Mode::Off,
+        };
         PrefixCache {
             namespace: namespace.to_vec(),
             page_size: kv_page_size(),
-            enabled,
+            mode,
         }
     }
 
@@ -46,54 +60,113 @@ impl PrefixCache {
             .collect()
     }
 
-    /// The working set holding the longest published page-aligned prefix of
-    /// `tokens` (always leaving the last token to compute) and the tokens it
-    /// covers; an empty set and 0 when nothing matches.
-    pub fn adopt(&self, tokens: &[u32]) -> Result<(WorkingSet, u32), String> {
-        let max = if self.enabled {
-            tokens.len().saturating_sub(1) as u32 / self.page_size
-        } else {
-            0
-        };
-        let keys = self.keys(tokens, max);
-        // Publishers index every page up to their prompt's end, so the chain
-        // is prefix-closed and a binary search finds the longest hit; an
-        // evicted boundary only makes it settle on a shorter one.
-        let (mut lo, mut hi) = (0, max);
-        let mut best = None;
-        while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            match WorkingSet::from_index(&keys[mid as usize - 1])? {
-                Some(ws) => {
-                    best = Some(ws);
-                    lo = mid;
-                }
-                None => hi = mid - 1,
-            }
+    /// The positions past `from` a hybrid prefill must end a chunk at and
+    /// hand `publish` the state of: `structure` (e.g. message ends) floored to
+    /// pages, else pages 1, 2, 4, 8, ..., so O(log n) snapshots still reuse
+    /// at least half of any shared prefix. Empty for an attention model.
+    pub fn boundaries(&self, tokens: &[u32], from: u32, structure: Option<&[u32]>) -> Vec<u32> {
+        if self.mode != Mode::Boundaries {
+            return Vec::new();
         }
-        Ok(match best {
-            Some(ws) => (ws, lo * self.page_size),
-            None => (WorkingSet::new(), 0),
-        })
+        // Always leave the last token to compute.
+        let limit = tokens.len().saturating_sub(1) as u32;
+        let mut cuts: Vec<u32> = match structure {
+            Some(ends) => ends
+                .iter()
+                .map(|&end| end.min(limit) / self.page_size * self.page_size)
+                .collect(),
+            None => std::iter::successors(Some(self.page_size), |&b| b.checked_mul(2))
+                .take_while(|&b| b <= limit)
+                .collect(),
+        };
+        cuts.retain(|&b| b > from && b > 0);
+        cuts.sort_unstable();
+        cuts.dedup();
+        cuts
     }
 
-    /// Publishes every full page of `tokens` past the first `from` tokens.
+    /// The longest published prefix of `tokens`: its KV working set, its
+    /// recurrent state on a hybrid model, and the tokens it covers; an empty
+    /// set, none and 0 when nothing matches. `structure` must be what the
+    /// publishers passed to `boundaries`.
+    pub fn adopt(
+        &self,
+        tokens: &[u32],
+        structure: Option<&[u32]>,
+    ) -> Result<(WorkingSet, Option<RsWorkingSet>, u32), String> {
+        let miss = || (WorkingSet::new(), None, 0);
+        match self.mode {
+            Mode::Off => Ok(miss()),
+            Mode::Pages => {
+                let max = tokens.len().saturating_sub(1) as u32 / self.page_size;
+                let keys = self.keys(tokens, max);
+                // Publishers index every page up to their prompt's end, so the
+                // chain is prefix-closed and a binary search finds the longest
+                // hit; an evicted boundary only makes it settle on a shorter one.
+                let (mut lo, mut hi) = (0, max);
+                let mut best = None;
+                while lo < hi {
+                    let mid = (lo + hi).div_ceil(2);
+                    match WorkingSet::from_index(&keys[mid as usize - 1])? {
+                        Some(ws) => {
+                            best = Some(ws);
+                            lo = mid;
+                        }
+                        None => hi = mid - 1,
+                    }
+                }
+                Ok(best.map_or_else(miss, |ws| (ws, None, lo * self.page_size)))
+            }
+            Mode::Boundaries => {
+                let cuts = self.boundaries(tokens, 0, structure);
+                let keys = self.keys(tokens, cuts.last().map_or(0, |b| b / self.page_size));
+                // Either half can be reclaimed alone; a boundary needs both.
+                for &b in cuts.iter().rev() {
+                    let key = &keys[(b / self.page_size) as usize - 1];
+                    if let Some(ws) = WorkingSet::from_index(key)?
+                        && let Some(rs) = RsWorkingSet::from_index(key)?
+                    {
+                        return Ok((ws, Some(rs), b));
+                    }
+                }
+                Ok(miss())
+            }
+        }
+    }
+
+    /// Publishes the prefill of `tokens` past the first `from`: every full
+    /// page on an attention model, else each `(boundary, state)` in `states`,
+    /// the state an `rs.fork` taken once the chunk ending there had landed.
     /// `ws` must hold exactly the model's KV of `tokens` from a settled,
     /// unmasked prefill.
     pub fn publish(
         &self,
         ws: &WorkingSet,
+        states: &[(u32, RsWorkingSet)],
         on: &Pipeline,
         tokens: &[u32],
         from: u32,
     ) -> Result<(), String> {
-        if !self.enabled {
+        if self.mode == Mode::Off {
             return Ok(());
         }
         let pages = tokens.len() as u32 / self.page_size;
         let keys = self.keys(tokens, pages);
-        for k in from / self.page_size + 1..=pages {
-            ws.slice(on, 0, k)?.update_index(&keys[k as usize - 1])?;
+        let kv = |k: u32| ws.slice(on, 0, k)?.update_index(&keys[k as usize - 1]);
+        match self.mode {
+            Mode::Off => {}
+            Mode::Pages => {
+                for k in from / self.page_size + 1..=pages {
+                    kv(k)?;
+                }
+            }
+            Mode::Boundaries => {
+                for (b, state) in states {
+                    let k = b / self.page_size;
+                    state.update_index(&keys[k as usize - 1])?;
+                    kv(k)?;
+                }
+            }
         }
         Ok(())
     }
