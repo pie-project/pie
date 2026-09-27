@@ -371,6 +371,9 @@ impl KvStore {
             }
         }
         pool.keep(&window::Holder::Ws(ws), &keep);
+        // What no fire in flight reads is free now: a lone sequence settles
+        // before it asks, so no later settle would retire it.
+        self.retire_idle();
         Ok(u32::try_from(fresh.len()).unwrap_or(u32::MAX))
     }
 
@@ -1486,6 +1489,17 @@ impl KvStore {
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<usize, KvStoreError> {
         Ok(self.table.held_pages(working_sets)?)
+    }
+
+    /// The windowed pages `working_sets`' windows hold.
+    #[must_use]
+    pub fn held_window_pages(&self, working_sets: &HashSet<WorkingSetId>) -> usize {
+        self.window.as_ref().map_or(0, |pool| {
+            working_sets
+                .iter()
+                .map(|&ws| pool.held(&window::Holder::Ws(ws)))
+                .sum()
+        })
     }
 
     pub fn prepare_restore(

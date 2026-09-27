@@ -132,6 +132,11 @@ impl WindowPool {
         self.of.contains_key(&page)
     }
 
+    #[must_use]
+    pub fn held(&self, holder: &Holder) -> usize {
+        self.claims.get(holder).map_or(0, Vec::len)
+    }
+
     /// Gives back what `holder` claims outside `keep`: the pages its next
     /// fire's windows have moved past.
     pub fn keep(&mut self, holder: &Holder, keep: &HashSet<PhysicalKvPageId>) {
