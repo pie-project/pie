@@ -242,9 +242,14 @@ pub fn calibrate(
     }
     let costs = costs(&ranks);
     let reach = reach(&sizes, &costs);
+    let carried = match reach {
+        None => "no messages".to_owned(),
+        Some(u64::MAX) => "messages of every size".to_owned(),
+        Some(bytes) => format!("messages up to {bytes} bytes"),
+    };
     eprintln!(
-        "engine-cuda: peer collectives carry messages up to {reach:?} bytes, NCCL the \
-         rest (peer/NCCL us from 16 KiB up: {:?})",
+        "engine-cuda: peer collectives carry {carried}, NCCL the rest (peer/NCCL us \
+         from 16 KiB up: {:?})",
         costs
             .iter()
             .map(|[peer, nccl]| format!("{peer:.1}/{nccl:.1}"))
