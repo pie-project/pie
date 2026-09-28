@@ -160,7 +160,8 @@ interface working-set {
         // The kv index's twin: insert or replace `key` with a copy-on-write
         // snapshot of this working set, as `fork` takes one. Keys are opaque
         // bytes scoped to the active model/engine store, apart from the kv
-        // index's. No in-flight fire may still write the snapshotted state.
+        // index's. The snapshot is not found until every fire writing it has
+        // settled.
         update-index: func(key: list<u8>) -> result<_, error>;
 
         // Exact best-effort lookup. A missing key, or one reclaimed under
