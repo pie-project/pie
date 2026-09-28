@@ -836,11 +836,13 @@ async def run(args: argparse.Namespace):
             i, start, proc, client_send_s = launched
             ttft_s: float | None = None
             first_arrival_s: float | None = None
+            # `--request-timeout` bounds a running request's silence; until its
+            # first event the request may still be queued at the server
+            timeout = None
             try:
                 while True:
-                    ev, msg = await asyncio.wait_for(
-                        proc.recv(), timeout=args.request_timeout
-                    )
+                    ev, msg = await asyncio.wait_for(proc.recv(), timeout=timeout)
+                    timeout = args.request_timeout
                     if ev == Event.Message and str(msg) == "t0":
                         # Launch-inclusive first-token stamp (see inferlet's
                         # report_timing contract).
@@ -962,13 +964,13 @@ async def run(args: argparse.Namespace):
             if prompt_token_ids is not None:
                 inp["prompt_tokens_batch"] = [prompt_token_ids[i] for i in indices]
             start = time.perf_counter()
+            timeout = None
             try:
                 proc = await client.launch_process(pkg, input=inp)
                 if args.defer_start:
                     while True:
-                        ev, msg = await asyncio.wait_for(
-                            proc.recv(), timeout=args.request_timeout
-                        )
+                        ev, msg = await asyncio.wait_for(proc.recv(), timeout=timeout)
+                        timeout = args.request_timeout
                         if ev == Event.Message and str(msg) == "ready":
                             break
                         if ev == Event.Return:
@@ -986,9 +988,8 @@ async def run(args: argparse.Namespace):
                     start = time.perf_counter()
                     await proc.signal("start")
                 while True:
-                    ev, msg = await asyncio.wait_for(
-                        proc.recv(), timeout=args.request_timeout
-                    )
+                    ev, msg = await asyncio.wait_for(proc.recv(), timeout=timeout)
+                    timeout = args.request_timeout
                     if ev == Event.Return:
                         obj = json.loads(msg)
                         if first_output_text[0] is None:
@@ -1058,11 +1059,11 @@ async def run(args: argparse.Namespace):
                         failed.append(item)
                         continue
                     i, _start, proc, _client_send_s = item
+                    timeout = None
                     try:
                         while True:
-                            ev, msg = await asyncio.wait_for(
-                                proc.recv(), timeout=args.request_timeout
-                            )
+                            ev, msg = await asyncio.wait_for(proc.recv(), timeout=timeout)
+                            timeout = args.request_timeout
                             if ev == Event.Message and str(msg) == "ready":
                                 ready.append((i, proc))
                                 break
