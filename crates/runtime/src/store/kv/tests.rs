@@ -53,11 +53,13 @@ fn sorted_backings(mut v: Vec<KvPageBacking>) -> Vec<u32> {
     v.sort_by_key(|backing| match backing {
         KvPageBacking::Resident(page) => page.0,
         KvPageBacking::Swapped(slot) => slot.0,
+        KvPageBacking::OnDisk(slot) => slot.0,
     });
     v.into_iter()
         .map(|backing| match backing {
             KvPageBacking::Resident(page) => page.0,
             KvPageBacking::Swapped(slot) => slot.0,
+            KvPageBacking::OnDisk(slot) => slot.0,
         })
         .collect()
 }
@@ -81,6 +83,7 @@ fn tests_every_case() {
     path_hash_is_none_while_any_contributing_page_hash_is_pending();
     store_explicit_index_roundtrip_remove_preserves_loaded_working_set();
     standing_translation_publishes_immutable_mapping_snapshots();
+    a_suspend_past_host_swap_spills_to_disk_and_restores_whole();
 }
 
 fn publish_lookup_flatten_roundtrip() {
@@ -288,4 +291,42 @@ fn standing_translation_publishes_immutable_mapping_snapshots() {
     assert!(v2 > v1);
     assert_eq!(shortened.as_ref(), &[ids[0].0]);
     assert_eq!(mapped.len(), 2, "an in-flight reader keeps the old table");
+}
+
+fn a_suspend_past_host_swap_spills_to_disk_and_restores_whole() {
+    let mut store = KvStore::new_with_swap(4, 1, h(42));
+    store.set_disk_swap(2);
+    let ws = store.create_working_set();
+    let before = commit_fresh(&mut store, ws, 3, 1);
+    let sets = HashSet::from([ws]);
+    let super::KvSuspendPrepare::Prepared(txn) = store.prepare_suspend(&sets).unwrap() else {
+        panic!("three private resident pages suspend");
+    };
+    let tiers: Vec<_> = txn
+        .copy_plans()
+        .iter()
+        .map(|(tier, gpu, _)| (*tier, gpu.len()))
+        .collect();
+    assert_eq!(
+        tiers,
+        [(super::SwapTier::Host, 1), (super::SwapTier::Disk, 2)]
+    );
+    assert_eq!(store.commit_suspend(txn).unwrap(), 3);
+    assert_eq!(
+        (store.host_swap_available(), store.disk_swap_available()),
+        (0, 0)
+    );
+    store.retire_idle();
+
+    let mut granted = store.reserve_device_pages(3).unwrap();
+    let txn = store.prepare_restore(&sets, &mut granted).unwrap();
+    assert_eq!(store.commit_restore(txn).unwrap(), 3);
+    assert_eq!(
+        (store.host_swap_available(), store.disk_swap_available()),
+        (1, 2)
+    );
+    assert_eq!(
+        (0..3).filter(|&i| store.lookup(ws, i).is_ok()).count(),
+        before.len()
+    );
 }

@@ -6,7 +6,7 @@ use super::{ProcessId, ResidencyPlanner};
 
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::kv::working_set::KvSuspendHandle;
-use crate::store::kv::{KvRestoreTxn, KvSuspendPrepare, KvSuspendTxn};
+use crate::store::kv::{KvRestoreTxn, KvSuspendPrepare, KvSuspendTxn, SwapTier};
 
 fn spawn_watched(
     planner: Arc<ResidencyPlanner>,
@@ -149,11 +149,40 @@ impl ResidencyTxnGuard {
         }
     }
 
-    fn copy_plan(&self) -> (Vec<u32>, Vec<u32>) {
+    fn copy_plans(&self) -> Vec<(SwapTier, Vec<u32>, Vec<u32>)> {
         match self.txn.as_ref().expect("transaction present") {
-            ResidencyTxn::Suspend(txn) => (txn.gpu_ids(), txn.host_slots()),
-            ResidencyTxn::Restore(txn) => (txn.gpu_ids(), txn.host_slots()),
+            ResidencyTxn::Suspend(txn) => txn.copy_plans(),
+            ResidencyTxn::Restore(txn) => txn.copy_plans(),
         }
+    }
+
+    /// Runs the engine copies of the transaction, one tier after another,
+    /// each armed so a drop mid-copy waits for it before aborting.
+    async fn copy(
+        &mut self,
+        planner: &ResidencyPlanner,
+        pid: ProcessId,
+        out: bool,
+    ) -> Result<(), String> {
+        for (tier, gpu_ids, slots) in self.copy_plans() {
+            tracing::debug!(pid = %pid, ?tier, pages = gpu_ids.len(), out, "planner: kv residency copy");
+            let started = Instant::now();
+            let completion =
+                crate::scheduler::copy_swap_tracked(self.engine, tier, out, &gpu_ids, &slots)
+                    .map_err(|error| format!("{tier:?} copy submit: {error:#}"))?;
+            self.arm(completion.clone());
+            let copied = completion.wait().await;
+            match (tier, out) {
+                (SwapTier::Host, true) => planner.record_d2h_copy(started.elapsed()),
+                (SwapTier::Host, false) => planner.record_h2d_copy(started.elapsed()),
+                (SwapTier::Disk, write) => {
+                    planner.record_disk_copy(write, gpu_ids.len(), started.elapsed());
+                }
+            }
+            self.disarm_completion();
+            copied.map_err(|error| format!("{tier:?} copy: {error}"))?;
+        }
+        Ok(())
     }
 
     fn abort_now(&mut self) {
@@ -256,24 +285,9 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         }
     };
     let mut suspend = ResidencyTxnGuard::suspend(model, engine, txn);
-    let (gpu_ids, host_slots) = suspend.copy_plan();
-    let copy_started = Instant::now();
-    let completion = match crate::scheduler::copy_d2h_tracked(engine, &gpu_ids, &host_slots) {
-        Ok(completion) => completion,
-        Err(error) => {
-            suspend.abort_now();
-            tracing::warn!(pid = %pid, %error, "planner: KV D2H eviction copy rejected");
-            planner.eviction_failed(pid);
-            return;
-        }
-    };
-    suspend.arm(completion.clone());
-    let copied = completion.wait().await;
-    planner.record_d2h_copy(copy_started.elapsed());
-    suspend.disarm_completion();
-    if let Err(error) = copied {
+    if let Err(error) = suspend.copy(&planner, pid, true).await {
         suspend.abort_now();
-        tracing::warn!(pid = %pid, %error, "planner: KV D2H eviction copy failed");
+        tracing::warn!(pid = %pid, %error, "planner: KV eviction copy failed");
         planner.eviction_failed(pid);
         return;
     }
@@ -329,23 +343,9 @@ async fn restore(
         return;
     }
     let mut restore = ResidencyTxnGuard::restore(model, engine, txn);
-    let (gpu_ids, host_slots) = restore.copy_plan();
-    let copy_started = Instant::now();
-    let completion = match crate::scheduler::copy_h2d_tracked(engine, &gpu_ids, &host_slots) {
-        Ok(completion) => completion,
-        Err(error) => {
-            restore.abort_now();
-            planner.restore_deferred(pid, &format!("H2D submit: {error:#}"));
-            return;
-        }
-    };
-    restore.arm(completion.clone());
-    let copied = completion.wait().await;
-    planner.record_h2d_copy(copy_started.elapsed());
-    restore.disarm_completion();
-    if let Err(error) = copied {
+    if let Err(error) = restore.copy(&planner, pid, false).await {
         restore.abort_now();
-        planner.restore_deferred(pid, &format!("H2D copy: {error}"));
+        planner.restore_deferred(pid, &error);
         return;
     }
     let txn = restore.take_restore();

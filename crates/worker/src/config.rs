@@ -483,6 +483,16 @@ pub struct ModelConfig {
     /// processes instead.
     #[serde(default)]
     pub host_kv_budget: Option<ByteSize>,
+    /// How many disk bytes preempted processes' kv may spill into once host
+    /// swap is full (`"200GiB"`), shared by the tensor-parallel ranks, each
+    /// in its own preallocated slot file. `"0B"` (the default) turns the
+    /// disk tier off.
+    #[serde(default)]
+    pub disk_kv_budget: Option<ByteSize>,
+    /// Where the slot files live, one directory per model. Empty derives
+    /// `$PIE_HOME/cache/kv/<model fingerprint>`.
+    #[serde(default)]
+    pub disk_kv_path: String,
     /// **MAY A WARM BOOT DEFER THE PINNED TIER?** On (the default) T1's
     /// planes are verified where they lie in the artifact and served from
     /// there while a background thread builds the page-locked copy, so the
@@ -638,6 +648,9 @@ impl ModelConfig {
             host_weight_budget: self.host_weight_budget.map(|b| b.as_bytes()),
             deferred_tier: self.deferred_tier,
             host_kv_budget: self.host_kv_budget.map(|b| b.as_bytes()),
+            disk_kv_budget: self.disk_kv_budget.map_or(0, |b| b.as_bytes()),
+            disk_kv_dir: (!self.disk_kv_path.is_empty())
+                .then(|| std::path::PathBuf::from(&self.disk_kv_path)),
         }
     }
 

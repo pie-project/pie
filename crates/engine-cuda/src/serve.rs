@@ -153,6 +153,25 @@ impl Shell {
         Ok(self.pools.host_pages())
     }
 
+    /// Opens this rank's share of `budget` disk kv bytes under `dir`.
+    pub fn seat_disk_kv(
+        &mut self,
+        budget: u64,
+        dir: Option<&std::path::Path>,
+        world: crate::World,
+    ) -> Result<u32> {
+        if let Some(dir) = dir.filter(|_| budget > 0) {
+            self.pools
+                .seat_disk(dir, world.rank, budget / u64::from(world.size.max(1)))?;
+        }
+        Ok(self.pools.disk_pages())
+    }
+
+    pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {
+        self.pools
+            .spill_kv(self.device.stream(), to_disk, device, disk)
+    }
+
     pub fn swap_kv(&mut self, to_host: bool, device: &[u32], host: &[u32]) -> Result<()> {
         self.pools
             .swap_kv(self.device.stream(), to_host, device, host)

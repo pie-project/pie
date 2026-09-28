@@ -465,6 +465,17 @@ pub struct Pools {
     windowed_backed: bool,
     buffered: (u64, u64),
     host: Option<HostKv>,
+    disk: Option<DiskKv>,
+}
+
+/// The slot file kv is suspended into below host memory, and the pinned
+/// pages a copy to or from it is staged through, in slot layout.
+#[derive(Debug)]
+struct DiskKv {
+    file: engine::disk::SlotFile,
+    stage: crate::device::Pinned,
+    /// An h2d out of the stage may still be in flight on the stream.
+    stage_busy: bool,
 }
 
 /// The pinned host pages kv is suspended into. Each paged plane keeps its
@@ -603,6 +614,7 @@ impl Pools {
             windowed_backed: false,
             buffered: (0, 1),
             host: None,
+            disk: None,
         })
     }
 
@@ -1257,6 +1269,126 @@ impl Pools {
     #[must_use]
     pub fn host_pages(&self) -> u32 {
         self.host.as_ref().map_or(0, |host| host.pages)
+    }
+
+    /// Opens `dir`'s slot file for this rank with `budget` bytes of kv pages;
+    /// a budget short of one page seats none.
+    pub fn seat_disk(&mut self, dir: &std::path::Path, rank: u32, budget: u64) -> Result<()> {
+        let integrity = |error: std::io::Error| Fault::Integrity {
+            at: "kv slot file",
+            why: error.to_string(),
+        };
+        let file = engine::disk::SlotFile::open(dir, rank, self.paged_page_bytes(), budget)
+            .map_err(integrity)?;
+        self.disk = match file {
+            Some(file) => {
+                let slots =
+                    (engine::disk::STAGE_BYTES / file.stride()).clamp(1, file.slots() as usize);
+                let stage = crate::device::Pinned::mapped_uninit(slots * file.stride())?;
+                Some(DiskKv {
+                    file,
+                    stage,
+                    stage_busy: false,
+                })
+            }
+            None => None,
+        };
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn disk_pages(&self) -> u32 {
+        self.disk.as_ref().map_or(0, |disk| disk.file.slots())
+    }
+
+    /// Copies whole kv pages between the device pool and the slot file,
+    /// `device[i]` with `disk[i]`, through the stage a turn at a time. A
+    /// write waits for the fires that wrote the pages; a read returns once
+    /// its h2d copies are enqueued.
+    pub fn spill_kv(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        to_disk: bool,
+        device: &[u32],
+        disk: &[u32],
+    ) -> Result<()> {
+        let have = u64::from(self.disk_pages());
+        if let Some(&slot) = disk.iter().find(|&&slot| u64::from(slot) >= have) {
+            return Err(Fault::Ceiling {
+                what: "disk kv pages",
+                need: u64::from(slot) + 1,
+                have,
+            });
+        }
+        let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
+        self.ensure_kv(highest)?;
+        let Some(mut spill) = self.disk.take() else {
+            return Ok(());
+        };
+        let copied = self.spill_through(&mut spill, stream, to_disk, device, disk);
+        self.disk = Some(spill);
+        copied
+    }
+
+    fn spill_through(
+        &self,
+        spill: &mut DiskKv,
+        stream: *mut core::ffi::c_void,
+        to_disk: bool,
+        device: &[u32],
+        disk: &[u32],
+    ) -> Result<()> {
+        let integrity = |error: std::io::Error| Fault::Integrity {
+            at: "kv slot file",
+            why: error.to_string(),
+        };
+        let stride = spill.file.stride();
+        let turn = spill.stage.bytes() / stride;
+        let planes = self.paged_planes();
+        let stage = spill.stage.host();
+        for (device, disk) in device.chunks(turn).zip(disk.chunks(turn)) {
+            if spill.stage_busy {
+                crate::device::ctx::sync(stream)?;
+                spill.stage_busy = false;
+            }
+            // SAFETY: the stage is this load's pinned allocation and no copy
+            // on the stream touches it now (synced above or after the d2h).
+            let staged = unsafe { std::slice::from_raw_parts_mut(stage, device.len() * stride) };
+            if !to_disk {
+                for (at, first, count) in engine::disk::runs(disk) {
+                    spill
+                        .file
+                        .read(first, &mut staged[at * stride..(at + count) * stride])
+                        .map_err(integrity)?;
+                }
+            }
+            for (at, &page) in device.iter().enumerate() {
+                let mut offset = at * stride;
+                for &(arena, page_bytes) in &planes {
+                    let on_device = arena.span(u64::from(page) * page_bytes, page_bytes)?;
+                    let on_host = stage as u64 + offset as u64;
+                    let (dst, src) = if to_disk {
+                        (on_host, on_device)
+                    } else {
+                        (on_device, on_host)
+                    };
+                    crate::device::copy_any(stream, dst, src, page_bytes as usize)?;
+                    offset += page_bytes as usize;
+                }
+            }
+            if to_disk {
+                crate::device::ctx::sync(stream)?;
+                for (at, first, count) in engine::disk::runs(disk) {
+                    spill
+                        .file
+                        .write(first, &staged[at * stride..(at + count) * stride])
+                        .map_err(integrity)?;
+                }
+            } else {
+                spill.stage_busy = true;
+            }
+        }
+        Ok(())
     }
 
     /// Copies whole kv pages between the device pool and the host pages,

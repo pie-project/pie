@@ -4,6 +4,22 @@ pub fn engine_cache_dir() -> PathBuf {
     bootstrap::paths::pie_home().join("cache")
 }
 
+/// Where a load's kv slot files live when the config names no path: one
+/// directory per model fingerprint (the trace and its cache rows, the
+/// checkpoint, the page size and the slot format), so no two models share one.
+pub fn kv_dir(request: &engine::LoadRequest) -> PathBuf {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"pie-kv-slots-1");
+    hasher.update(request.trace.name.as_bytes());
+    hasher.update(&rmp_serde::to_vec(&request.trace.caches).unwrap_or_default());
+    hasher.update(format!("{:?}", request.checkpoint).as_bytes());
+    hasher.update(&request.budgets.page_size.to_le_bytes());
+    let fingerprint = hasher.finalize().to_hex();
+    engine_cache_dir()
+        .join("kv")
+        .join(&fingerprint.as_str()[..16])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reclaim {
     Safe,

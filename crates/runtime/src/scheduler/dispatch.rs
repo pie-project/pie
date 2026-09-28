@@ -250,20 +250,6 @@ pub(crate) async fn copy_d2h(
         .await
 }
 
-pub(crate) fn copy_d2h_tracked(
-    engine_idx: EngineId,
-    gpu_phys_ids: &[u32],
-    cpu_pages: &[u32],
-) -> Result<super::ControlCompletion> {
-    scheduler_handle(engine_idx)?.copy_kv_tracked(KvCopy {
-        src: super::device_domain(engine_idx),
-        dst: MemoryDomain::HostPinned,
-        src_page_ids: gpu_phys_ids.to_vec(),
-        dst_page_ids: cpu_pages.to_vec(),
-        moves: Vec::new(),
-    })
-}
-
 pub(crate) async fn copy_h2d(
     engine_idx: EngineId,
     gpu_phys_ids: &[u32],
@@ -280,16 +266,30 @@ pub(crate) async fn copy_h2d(
         .await
 }
 
-pub(crate) fn copy_h2d_tracked(
+/// Copies kv pages between the device and the tier below it they are
+/// suspended in: out of the device when `out`, back into it otherwise.
+pub(crate) fn copy_swap_tracked(
     engine_idx: EngineId,
+    tier: crate::store::kv::SwapTier,
+    out: bool,
     gpu_phys_ids: &[u32],
-    cpu_pages: &[u32],
+    slots: &[u32],
 ) -> Result<super::ControlCompletion> {
+    let device = super::device_domain(engine_idx);
+    let below = match tier {
+        crate::store::kv::SwapTier::Host => MemoryDomain::HostPinned,
+        crate::store::kv::SwapTier::Disk => MemoryDomain::LocalDisk,
+    };
+    let (src, dst, src_page_ids, dst_page_ids) = if out {
+        (device, below, gpu_phys_ids, slots)
+    } else {
+        (below, device, slots, gpu_phys_ids)
+    };
     scheduler_handle(engine_idx)?.copy_kv_tracked(KvCopy {
-        src: MemoryDomain::HostPinned,
-        dst: super::device_domain(engine_idx),
-        src_page_ids: cpu_pages.to_vec(),
-        dst_page_ids: gpu_phys_ids.to_vec(),
+        src,
+        dst,
+        src_page_ids: src_page_ids.to_vec(),
+        dst_page_ids: dst_page_ids.to_vec(),
         moves: Vec::new(),
     })
 }

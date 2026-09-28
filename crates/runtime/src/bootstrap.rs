@@ -125,6 +125,7 @@ pub struct EngineConfig {
     pub window_pages: u32,
     pub window_tokens: u32,
     pub cpu_pages: usize,
+    pub disk_pages: u32,
     pub kv_copy: ::engine::caps::KvCopyDomains,
     pub backend_kind: String,
     pub rs_cache_required: bool,
@@ -312,6 +313,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
+    let arena_disk_pages: Vec<u32> = engine_configs.iter().map(|d| d.disk_pages).collect();
     let arena_rs_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_cache_slots).collect();
     let arena_windows: Vec<(u32, u32)> = engine_configs
         .iter()
@@ -321,9 +323,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .iter()
         .map(|d| d.limits.max_context)
         .collect();
-    let kv_swap_capable = engine_configs
-        .first()
-        .is_some_and(|d| d.kv_copy.device_to_host && d.kv_copy.host_to_device);
+    let kv_swap_capable = engine_configs.first().is_some_and(|d| {
+        (d.kv_copy.device_to_host && d.kv_copy.host_to_device) || d.disk_pages > 0
+    });
     let engine_count = engine_configs.len();
     let engines: Vec<usize> = engine_configs
         .into_iter()
@@ -349,10 +351,10 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &arena_max_context,
     );
     for (engine, &(tokens, pages)) in arena_windows.iter().enumerate() {
-        crate::store::registry::get(arena_model_idx, engine)
-            .kv
-            .lock()
-            .set_window(tokens, kv_page_size as u32, pages);
+        let stores = crate::store::registry::get(arena_model_idx, engine);
+        let mut kv = stores.kv.lock();
+        kv.set_window(tokens, kv_page_size as u32, pages);
+        kv.set_disk_swap(arena_disk_pages[engine]);
     }
 
     crate::planner::init_planner(
@@ -386,6 +388,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      runway={}/{} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
                      d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
+                     disk_free={}/{} disk_w_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
                      runners=[{}]",
                     d.queue.len(),
@@ -429,6 +432,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.h2d_pages_total,
                     d.d2h_copy_us_total / 1000,
                     d.h2d_copy_us_total / 1000,
+                    d.disk_slots_free,
+                    d.disk_slots_total,
+                    d.disk_write_pages_total,
+                    d.disk_read_pages_total,
+                    d.disk_write_us_total / 1000,
+                    d.disk_read_us_total / 1000,
                     d.proc_states[0],
                     d.proc_states[1],
                     d.proc_states[2],

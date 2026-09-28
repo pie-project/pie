@@ -49,7 +49,7 @@ pub enum Checkpoint {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Residency {
     pub device_weight_budget: Option<u64>,
     pub host_weight_budget: Option<u64>,
@@ -59,6 +59,12 @@ pub struct Residency {
     /// engine size it from the host, zero turns host swap off.
     #[serde(default)]
     pub host_kv_budget: Option<u64>,
+    /// Bytes of slot files under `disk_kv_dir` kv pages may be suspended
+    /// into below host memory, shared by the ranks; zero turns it off.
+    #[serde(default)]
+    pub disk_kv_budget: u64,
+    #[serde(default)]
+    pub disk_kv_dir: Option<PathBuf>,
 }
 
 fn deferred_by_default() -> bool {
@@ -87,6 +93,8 @@ impl Residency {
             host_weight_budget: None,
             deferred_tier: true,
             host_kv_budget: None,
+            disk_kv_budget: 0,
+            disk_kv_dir: None,
         }
     }
 

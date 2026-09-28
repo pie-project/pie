@@ -50,6 +50,10 @@ pub struct PoolFacts {
     /// Host pages kv can be suspended into by `kv_copy`.
     #[serde(default)]
     pub host_kv_pages: u32,
+    /// Slot-file pages kv can be suspended into by `kv_copy` to and from
+    /// `MemoryDomain::LocalDisk`.
+    #[serde(default)]
+    pub disk_kv_pages: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -39,6 +39,7 @@ pub type ProcessId = uuid::Uuid;
 pub trait PoolPort: Send + Sync + 'static {
     fn device_stats(&self, pool: KvPool) -> (u32, u32);
     fn host_stats(&self) -> (u32, u32);
+    fn disk_stats(&self) -> (u32, u32);
     fn rs_stats(&self) -> (u32, u32);
     fn reclaim_idle(&self) -> u32;
     fn suspend_capable(&self) -> bool;
@@ -103,6 +104,12 @@ impl PoolPort for RegistryPool {
     fn host_stats(&self) -> (u32, u32) {
         self.with_kv_tagged("planner-host-stats", |kv| {
             (kv.host_swap_available() as u32, kv.host_swap_capacity())
+        })
+    }
+
+    fn disk_stats(&self) -> (u32, u32) {
+        self.with_kv_tagged("planner-disk-stats", |kv| {
+            (kv.disk_swap_available() as u32, kv.disk_swap_capacity())
         })
     }
 
@@ -190,7 +197,9 @@ pub enum StarveCause {
 impl StarveCause {
     fn describe(self) -> &'static str {
         match self {
-            StarveCause::NoSwapRoom => "no host swap room to evict into (or no swap transport)",
+            StarveCause::NoSwapRoom => {
+                "no host or disk swap room to evict into (or no swap transport)"
+            }
             StarveCause::NoEligibleVictim => {
                 "no evictable victim — every page is held by a process OLDER \
                  than the head, which FCFS anti-thrash forbids evicting"
@@ -353,6 +362,10 @@ pub struct PlannerStats {
     pub host_swap_unblocks: AtomicU64,
     pub d2h_pages: AtomicU64,
     pub h2d_pages: AtomicU64,
+    pub disk_write_pages: AtomicU64,
+    pub disk_read_pages: AtomicU64,
+    pub disk_write_us: AtomicU64,
+    pub disk_read_us: AtomicU64,
     pub d2h_copy_us: AtomicU64,
     pub h2d_copy_us: AtomicU64,
 }
@@ -376,6 +389,8 @@ pub struct PlannerDiagnostics {
     pub device_pages_total: u32,
     pub host_slots_free: u32,
     pub host_slots_total: u32,
+    pub disk_slots_free: u32,
+    pub disk_slots_total: u32,
     pub rs_slots_free: u32,
     pub rs_slots_total: u32,
     pub accumulation: u32,
@@ -408,6 +423,10 @@ pub struct PlannerDiagnostics {
     pub host_swap_unblocks_total: u64,
     pub d2h_pages_total: u64,
     pub h2d_pages_total: u64,
+    pub disk_write_pages_total: u64,
+    pub disk_read_pages_total: u64,
+    pub disk_write_us_total: u64,
+    pub disk_read_us_total: u64,
     pub d2h_copy_us_total: u64,
     pub h2d_copy_us_total: u64,
     pub runway_rounds_total: u64,
@@ -1680,13 +1699,20 @@ impl ResidencyPlanner {
         (picks, unhostable)
     }
 
-    fn plan_eviction(self: &Arc<Self>) {
+    /// Free and total slots suspended kv can go to: host, then disk.
+    fn swap_stats(&self) -> (u32, u32) {
         let (host_free, host_total) = self.port.host_stats();
-        if !self.port.suspend_capable() || host_free == 0 {
+        let (disk_free, disk_total) = self.port.disk_stats();
+        (host_free + disk_free, host_total + disk_total)
+    }
+
+    fn plan_eviction(self: &Arc<Self>) {
+        let (swap_free, swap_total) = self.swap_stats();
+        if !self.port.suspend_capable() || swap_free == 0 {
             self.check_starvation(StarveCause::NoSwapRoom);
             return;
         }
-        if host_free.saturating_mul(HOST_RESERVE_DIVISOR) <= host_total && !self.is_wedged() {
+        if swap_free.saturating_mul(HOST_RESERVE_DIVISOR) <= swap_total && !self.is_wedged() {
             self.stats
                 .eviction_deferrals
                 .fetch_add(1, Ordering::Relaxed);
@@ -1705,7 +1731,7 @@ impl ResidencyPlanner {
         let (picks, unhostable) = self.quote_and_pick(
             victims.preferred(),
             victims.deficit,
-            host_free,
+            swap_free,
             model,
             engine,
         );
@@ -1735,8 +1761,8 @@ impl ResidencyPlanner {
         if runway == 0 {
             return;
         }
-        let (host_free, _) = self.port.host_stats();
-        if !self.port.suspend_capable() || host_free == 0 {
+        let (swap_free, _) = self.swap_stats();
+        if !self.port.suspend_capable() || swap_free == 0 {
             return;
         }
         let (free, _) = self.port.device_stats(KvPool::Paged);
@@ -1744,7 +1770,7 @@ impl ResidencyPlanner {
             return;
         };
         let (model, engine) = self.port.locus();
-        let (picks, _unhostable) = self.quote_and_pick(members, deficit, host_free, model, engine);
+        let (picks, _unhostable) = self.quote_and_pick(members, deficit, swap_free, model, engine);
         if picks.is_empty() {
             return;
         }
@@ -2604,9 +2630,20 @@ impl ResidencyPlanner {
             .fetch_add(micros(elapsed), Ordering::Relaxed);
     }
 
+    pub fn record_disk_copy(&self, write: bool, pages: usize, elapsed: Duration) {
+        let (count, us) = if write {
+            (&self.stats.disk_write_pages, &self.stats.disk_write_us)
+        } else {
+            (&self.stats.disk_read_pages, &self.stats.disk_read_us)
+        };
+        count.fetch_add(pages as u64, Ordering::Relaxed);
+        us.fetch_add(micros(elapsed), Ordering::Relaxed);
+    }
+
     pub fn diagnostics(&self) -> PlannerDiagnostics {
         let (device_pages_free, device_pages_total) = self.port.device_stats(KvPool::Paged);
         let (host_slots_free, host_slots_total) = self.port.host_stats();
+        let (disk_slots_free, disk_slots_total) = self.port.disk_stats();
         let (rs_slots_free, rs_slots_total) = self.port.rs_stats();
         let inner = self.lock_inner();
         let queue = inner
@@ -2698,6 +2735,8 @@ impl ResidencyPlanner {
             device_pages_total,
             host_slots_free,
             host_slots_total,
+            disk_slots_free,
+            disk_slots_total,
             rs_slots_free,
             rs_slots_total,
             accumulation,
@@ -2730,6 +2769,10 @@ impl ResidencyPlanner {
             host_swap_unblocks_total: self.stats.host_swap_unblocks.load(Relaxed),
             d2h_pages_total: self.stats.d2h_pages.load(Relaxed),
             h2d_pages_total: self.stats.h2d_pages.load(Relaxed),
+            disk_write_pages_total: self.stats.disk_write_pages.load(Relaxed),
+            disk_read_pages_total: self.stats.disk_read_pages.load(Relaxed),
+            disk_write_us_total: self.stats.disk_write_us.load(Relaxed),
+            disk_read_us_total: self.stats.disk_read_us.load(Relaxed),
             d2h_copy_us_total: self.stats.d2h_copy_us.load(Relaxed),
             h2d_copy_us_total: self.stats.h2d_copy_us.load(Relaxed),
             runway_rounds_total: self.stats.runway_rounds.load(Relaxed),
@@ -2769,7 +2812,7 @@ impl ResidencyPlanner {
     }
 
     pub fn kv_pressure_bucket(&self) -> u8 {
-        let (host_free, host_total) = self.port.host_stats();
+        let (swap_free, swap_total) = self.swap_stats();
         let ratio = |(free, total): (u32, u32)| {
             if total == 0 {
                 0.0
@@ -2781,7 +2824,7 @@ impl ResidencyPlanner {
             .into_iter()
             .map(|pool| ratio(self.port.device_stats(pool)))
             .fold(0.0, f64::max);
-        let mut bucket = (device.max(ratio((host_free, host_total))) * 255.0).round() as u8;
+        let mut bucket = (device.max(ratio((swap_free, swap_total))) * 255.0).round() as u8;
         if self.nonresident.load(Ordering::Acquire) != 0
             || self.waiters.load(Ordering::Acquire) != 0
         {
@@ -3118,6 +3161,9 @@ mod starvation_race_tests {
         }
         fn host_stats(&self) -> (u32, u32) {
             (self.host, self.host_total)
+        }
+        fn disk_stats(&self) -> (u32, u32) {
+            (0, 0)
         }
         fn rs_stats(&self) -> (u32, u32) {
             self.with_rs(|rs| (rs.available_slots() as u32, rs.capacity_slots()))

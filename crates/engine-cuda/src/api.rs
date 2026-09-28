@@ -536,6 +536,13 @@ intended for diagnostics, not serving",
         let host_kv_pages = shell
             .seat_host_kv(residency.host_kv_budget, self.boot.world.size)
             .map_err(fault)?;
+        let disk_kv_pages = shell
+            .seat_disk_kv(
+                residency.disk_kv_budget,
+                residency.disk_kv_dir.as_deref(),
+                self.boot.world,
+            )
+            .map_err(fault)?;
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -581,6 +588,7 @@ intended for diagnostics, not serving",
                 }),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
                 host_kv_pages,
+                disk_kv_pages,
             },
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
@@ -885,6 +893,24 @@ intended for diagnostics, not serving",
             .map(|caps| caps.device.domain)
             .and_then(MemoryDomain::ordinal);
         let ours = |domain: MemoryDomain| matches!(domain, MemoryDomain::CudaDevice(device) if Some(device) == ordinal);
+        let spill = match (copy.src, copy.dst) {
+            (src, MemoryDomain::LocalDisk) if ours(src) => Some(true),
+            (MemoryDomain::LocalDisk, dst) if ours(dst) => Some(false),
+            _ => None,
+        };
+        if let Some(to_disk) = spill
+            && copy.moves.is_empty()
+        {
+            let (device, disk) = if to_disk {
+                (&copy.src_page_ids, &copy.dst_page_ids)
+            } else {
+                (&copy.dst_page_ids, &copy.src_page_ids)
+            };
+            return self
+                .loaded_mut()?
+                .spill_kv(to_disk, device, disk)
+                .map_err(fault);
+        }
         let swap = match (copy.src, copy.dst) {
             (src, MemoryDomain::HostPinned) if ours(src) => Some(true),
             (MemoryDomain::HostPinned, dst) if ours(dst) => Some(false),
