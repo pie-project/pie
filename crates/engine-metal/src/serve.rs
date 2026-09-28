@@ -2755,7 +2755,7 @@ impl Shell {
                     }
                     for _ in 0..rows_here {
                         request_of_token.push(at_lane);
-                        slot_of_row.push(lane.slot as i32);
+                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
                     }
                 }
                 None => {
@@ -2766,7 +2766,7 @@ impl Shell {
                             None => narrow(u64::from(have) + at as u64),
                         });
                         request_of_token.push(at_lane);
-                        slot_of_row.push(lane.slot as i32);
+                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
