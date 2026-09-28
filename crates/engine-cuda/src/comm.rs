@@ -185,11 +185,16 @@ pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peer
     }
 }
 
+/// Replays per size and path; the median decides, so one descheduled thread
+/// or cold first replay does not.
+const SAMPLES: usize = 9;
+
 /// Sets how long a message the peer path carries. Its kernel reads the peers'
 /// stages over whatever link joins the devices, and some PCIe pairs deliver
 /// those reads far slower than NCCL's own transport past short messages
 /// (#741), so every rank times both paths on the same message sizes and the
-/// peer path keeps the sizes it wins. `None` when it wins none.
+/// peer path carries those up to the reach that costs least. `None` when
+/// that is none.
 #[must_use]
 pub fn calibrate(
     ordinals: &[i32],
@@ -199,14 +204,25 @@ pub fn calibrate(
     let sizes: Vec<u64> = (14..=STAGE_BYTES.ilog2())
         .map(|shift| 1u64 << shift)
         .collect();
-    let timed: Vec<Result<Vec<[f64; 2]>>> = std::thread::scope(|scope| {
+    let barrier = std::sync::Barrier::new(ordinals.len());
+    let broken = std::sync::atomic::AtomicBool::new(false);
+    // Every rank starts each replay together, and all stop at the same one
+    // once any has failed, so none is left waiting on a partner.
+    let meet = |failed: bool| {
+        if failed {
+            broken.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        barrier.wait();
+        broken.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let timed: Vec<Result<Samples>> = std::thread::scope(|scope| {
         let racers: Vec<_> = ordinals
             .iter()
             .zip(comms)
             .zip(&peers)
             .map(|((&ordinal, comm), &peers)| {
-                let sizes = &sizes;
-                scope.spawn(move || race(ordinal, comm, peers, sizes))
+                let (sizes, meet) = (&sizes, &meet);
+                scope.spawn(move || race(ordinal, comm, peers, sizes, meet))
             })
             .collect();
         racers
@@ -214,36 +230,24 @@ pub fn calibrate(
             .map(|racer| racer.join().unwrap_or(Err(Fault::Runtimeless)))
             .collect()
     });
-    let mut slowest = vec![[0f64; 2]; sizes.len()];
+    let mut ranks = Vec::with_capacity(timed.len());
     for rank in timed {
         match rank {
-            Ok(rank) => {
-                for (worst, time) in slowest.iter_mut().zip(rank) {
-                    worst[0] = worst[0].max(time[0]);
-                    worst[1] = worst[1].max(time[1]);
-                }
-            }
+            Ok(rank) => ranks.push(rank),
             Err(fault) => {
                 eprintln!("engine-cuda: peer collectives are off, NCCL carries them: {fault}");
                 return None;
             }
         }
     }
-    let wins = slowest
-        .iter()
-        .take_while(|[peer, nccl]| peer <= nccl)
-        .count();
-    let reach = match wins {
-        0 => None,
-        n if n == sizes.len() => Some(u64::MAX),
-        n => Some(sizes[n - 1]),
-    };
+    let costs = costs(&ranks);
+    let reach = reach(&sizes, &costs);
     eprintln!(
         "engine-cuda: peer collectives carry messages up to {reach:?} bytes, NCCL the \
          rest (peer/NCCL us from 16 KiB up: {:?})",
-        slowest
+        costs
             .iter()
-            .map(|[peer, nccl]| format!("{peer:.0}/{nccl:.0}"))
+            .map(|[peer, nccl]| format!("{peer:.1}/{nccl:.1}"))
             .collect::<Vec<_>>()
     );
     let reach = reach?;
@@ -255,74 +259,173 @@ pub fn calibrate(
     )
 }
 
-/// One rank's microseconds per all-reduce, `[peer, nccl]`, at each size. Every
-/// rank runs the same sequence, so each collective finds its partners.
+/// One rank's microseconds per all-reduce, `[peer, nccl]` at each size, for
+/// each replay.
+type Samples = [Vec<[f64; 2]>; SAMPLES];
+
+/// Each size's `[peer, nccl]` cost: the median over replays of the slowest
+/// rank's time, since a collective ends when its last rank does.
+fn costs(ranks: &[Samples]) -> Vec<[f64; 2]> {
+    let sizes = ranks.first().map_or(0, |rank| rank[0].len());
+    (0..sizes)
+        .map(|size| {
+            [0, 1].map(|path| {
+                let mut slowest: [f64; SAMPLES] = std::array::from_fn(|replay| {
+                    ranks
+                        .iter()
+                        .map(|rank| rank[replay][size][path])
+                        .fold(0.0, f64::max)
+                });
+                slowest.sort_by(f64::total_cmp);
+                slowest[SAMPLES / 2]
+            })
+        })
+        .collect()
+}
+
+/// The reach that costs least over one message of every timed size: a near
+/// tie at one size then cannot hand NCCL the sizes the peer path wins past it.
+fn reach(sizes: &[u64], costs: &[[f64; 2]]) -> Option<u64> {
+    let total = |n: usize| {
+        costs[..n].iter().map(|[peer, _]| peer).sum::<f64>()
+            + costs[n..].iter().map(|[_, nccl]| nccl).sum::<f64>()
+    };
+    match (0..=costs.len()).min_by(|&a, &b| total(a).total_cmp(&total(b)))? {
+        0 => None,
+        n if n == sizes.len() => Some(u64::MAX),
+        n => Some(sizes[n - 1]),
+    }
+}
+
+/// One rank's samples at each size. Every rank captures the same graphs and
+/// replays them in the same order, so each collective finds its partners.
 fn race(
     ordinal: i32,
     comm: &Comm,
     peers: kernels_cuda::collective::Peers,
     sizes: &[u64],
-) -> Result<Vec<[f64; 2]>> {
+    meet: &(dyn Fn(bool) -> bool + Sync),
+) -> Result<Samples> {
     #[cfg(feature = "cuda")]
     {
         use cudarc::runtime::sys as rt;
 
         use crate::device::ctx::check;
+        use crate::device::graph::{Event, Graph, GraphExec};
 
-        const ROUNDS: u32 = 8;
-        crate::device::ctx::bind_thread(ordinal)?;
-        let mut stream: *mut c_void = core::ptr::null_mut();
-        // SAFETY: a live out-parameter.
-        check("cudaStreamCreate", unsafe {
-            rt::cudaStreamCreateWithFlags((&raw mut stream).cast(), rt::cudaStreamNonBlocking)
-        })?;
-        let buf = crate::device::Buffer::zeroed(STAGE_BYTES as usize);
-        // SAFETY: the stream is live until the end of this function, and so
-        // are the communicator and the stages the group holds.
-        let paths = unsafe {
-            let nccl = kernels_cuda::Ctx::on(stream).with_comm(comm.raw());
-            [
-                nccl.with_peers(peers),
-                kernels_cuda::Ctx::on(stream).with_comm(comm.raw()),
-            ]
+        // Collectives in one captured graph, replayed as one sample: the
+        // forward's bodies are graphs, so replay time, not launch time, is
+        // what a path costs.
+        const ROUNDS: u32 = 16;
+
+        let plane = |at: u64, bytes: u64| {
+            kernels_cuda::Tensor::new(at, 1, (bytes / 2) as u32, model_ir::Dtype::Bf16)
         };
-        let timed = buf.and_then(|buf| {
-            let mut out = Vec::with_capacity(sizes.len());
+        let partner = || Fault::program("comm::calibrate", "a partner rank failed");
+
+        let mut stream: *mut c_void = core::ptr::null_mut();
+        // Every size runs once eagerly, and every rank drains, before any
+        // capture: binding the thread, building the kernels and NCCL's
+        // connections are not things a capture may do.
+        let warmed = (|| -> Result<_> {
+            crate::device::ctx::bind_thread(ordinal)?;
+            // SAFETY: a live out-parameter.
+            check("cudaStreamCreate", unsafe {
+                rt::cudaStreamCreateWithFlags((&raw mut stream).cast(), rt::cudaStreamNonBlocking)
+            })?;
+            let buf = crate::device::Buffer::zeroed(STAGE_BYTES as usize)?;
+            // SAFETY: the stream is live until the end of this function, and
+            // so are the communicator and the stages the group holds.
+            let paths = unsafe {
+                let nccl = kernels_cuda::Ctx::on(stream).with_comm(comm.raw());
+                [
+                    nccl.with_peers(peers),
+                    kernels_cuda::Ctx::on(stream).with_comm(comm.raw()),
+                ]
+            };
             for &bytes in sizes {
-                let mut t = kernels_cuda::Tensor::new(
-                    buf.ptr(),
-                    1,
-                    (bytes / 2) as u32,
-                    model_ir::Dtype::Bf16,
-                );
-                let mut row = [0f64; 2];
-                for (path, ctx) in paths.iter().enumerate() {
-                    let mut run = |rounds: u32| -> Result<f64> {
-                        let start = std::time::Instant::now();
-                        for _ in 0..rounds {
-                            kernels_cuda::collective::all_reduce(ctx, &mut t)
-                                .map_err(crate::error::kernel)?;
-                        }
-                        // SAFETY: the stream created above.
-                        check("cudaStreamSynchronize", unsafe {
-                            rt::cudaStreamSynchronize(stream.cast())
-                        })?;
-                        Ok(start.elapsed().as_secs_f64() * 1e6 / f64::from(rounds))
-                    };
-                    run(2)?;
-                    row[path] = run(ROUNDS)?;
+                let mut t = plane(buf.ptr(), bytes);
+                for ctx in &paths {
+                    kernels_cuda::collective::all_reduce(ctx, &mut t)
+                        .map_err(crate::error::kernel)?;
                 }
-                out.push(row);
             }
-            Ok(out)
-        });
-        // SAFETY: the stream created above, idle once `timed` is in.
-        unsafe { rt::cudaStreamDestroy(stream.cast()) };
+            // SAFETY: the stream created above.
+            check("cudaStreamSynchronize", unsafe {
+                rt::cudaStreamSynchronize(stream.cast())
+            })?;
+            Ok((buf, paths))
+        })();
+        let armed = match warmed {
+            Err(fault) => {
+                meet(true);
+                Err(fault)
+            }
+            Ok(_) if meet(false) => Err(partner()),
+            Ok((buf, paths)) => (|| -> Result<_> {
+                let mut graphs: Vec<[GraphExec; 2]> = Vec::with_capacity(sizes.len());
+                for &bytes in sizes {
+                    let mut t = plane(buf.ptr(), bytes);
+                    let mut capture = |ctx: &kernels_cuda::Ctx| {
+                        Graph::capture(stream, || {
+                            for _ in 0..ROUNDS {
+                                kernels_cuda::collective::all_reduce(ctx, &mut t)
+                                    .map_err(crate::error::kernel)?;
+                            }
+                            Ok(())
+                        })?
+                        .instantiate(stream)
+                    };
+                    graphs.push([capture(&paths[0])?, capture(&paths[1])?]);
+                }
+                Ok((buf, graphs, Event::timing()?, Event::timing()?))
+            })(),
+        };
+        let timed = match armed {
+            Err(fault) => {
+                meet(true);
+                Err(fault)
+            }
+            Ok((_buf, graphs, start, end)) => {
+                let mut out: Samples = std::array::from_fn(|_| vec![[0.0; 2]; sizes.len()]);
+                let (mut fault, mut halted) = (None, false);
+                'replays: for replay in &mut out {
+                    for (size, pair) in graphs.iter().enumerate() {
+                        for (path, graph) in pair.iter().enumerate() {
+                            if meet(fault.is_some()) {
+                                halted = true;
+                                break 'replays;
+                            }
+                            let took = (|| -> Result<f64> {
+                                start.record(stream)?;
+                                graph.launch(stream)?;
+                                end.record(stream)?;
+                                end.settle()?;
+                                Ok(f64::from(start.elapsed_ms(&end)?) * 1e3 / f64::from(ROUNDS))
+                            })();
+                            match took {
+                                Ok(us) => replay[size][path] = us,
+                                Err(failed) => fault = Some(failed),
+                            }
+                        }
+                    }
+                }
+                match (fault, halted) {
+                    (Some(fault), _) => Err(fault),
+                    (None, true) => Err(partner()),
+                    (None, false) => Ok(out),
+                }
+            }
+        };
+        if !stream.is_null() {
+            // SAFETY: the stream created above, idle once `timed` is in.
+            unsafe { rt::cudaStreamDestroy(stream.cast()) };
+        }
         timed
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (ordinal, comm, peers, sizes);
+        let _ = (ordinal, comm, peers, sizes, meet);
         Err(Fault::Runtimeless)
     }
 }
@@ -501,5 +604,32 @@ fn answered(call: &'static str, code: cudarc::nccl::sys::ncclResult_t) -> Result
             call,
             code: code as i32,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn one_slow_replay_or_near_tie_does_not_set_the_reach() {
+        let sizes: Vec<u64> = (14..=24).map(|shift| 1u64 << shift).collect();
+        // A PRO 6000 x2 boot's costs, which the first-loss rule sent to NCCL
+        // whole on the 16 KiB near tie.
+        let costs = [
+            [11.4, 11.2],
+            [60.0, 13.0],
+            [12.0, 14.0],
+            [48.0, 19.0],
+            [19.0, 56.0],
+            [26.0, 66.0],
+            [40.0, 60.0],
+            [88.0, 103.0],
+            [134.0, 163.0],
+            [247.0, 284.0],
+            [490.0, 545.0],
+        ];
+        assert_eq!(super::reach(&sizes, &costs), Some(u64::MAX));
+        let mut rank: super::Samples = std::array::from_fn(|_| vec![[5.0, 9.0]]);
+        rank[3][0][0] = 60.0;
+        assert_eq!(super::costs(&[rank.clone(), rank]), vec![[5.0, 9.0]]);
     }
 }
