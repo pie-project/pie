@@ -476,6 +476,22 @@ pub struct ModelConfig {
     pub device_weight_budget: Option<ByteSize>,
     #[serde(default)]
     pub host_weight_budget: Option<ByteSize>,
+    /// How many pinned host bytes a preempted process's kv pages and
+    /// recurrent-state slots may be suspended into (`"32GiB"`), shared by
+    /// the tensor-parallel ranks: one rs row per device slot, then kv pages.
+    /// Omit for one device pool's worth; either is capped by the host
+    /// memory the load leaves free. `"0B"` turns host swap off, so kv
+    /// pressure restarts processes instead.
+    #[serde(default)]
+    pub host_kv_budget: Option<ByteSize>,
+    /// How many disk bytes suspended kv may spill into once host swap is
+    /// full (`"200GiB"`), shared by the ranks, each in its own preallocated
+    /// slot file under `disk_kv_path` (default `$PIE_HOME/cache/kv/<checkpoint
+    /// digest>`). `"0B"`, the default, turns the disk tier off.
+    #[serde(default)]
+    pub disk_kv_budget: Option<ByteSize>,
+    #[serde(default)]
+    pub disk_kv_path: Option<std::path::PathBuf>,
     /// **MAY A WARM BOOT DEFER THE PINNED TIER?** On (the default) T1's
     /// planes are verified where they lie in the artifact and served from
     /// there while a background thread builds the page-locked copy, so the
@@ -630,6 +646,9 @@ impl ModelConfig {
             device_weight_budget: self.device_weight_budget.map(|b| b.as_bytes()),
             host_weight_budget: self.host_weight_budget.map(|b| b.as_bytes()),
             deferred_tier: self.deferred_tier,
+            host_kv_budget: self.host_kv_budget.map(|b| b.as_bytes()),
+            disk_kv_budget: self.disk_kv_budget.map_or(0, |b| b.as_bytes()),
+            disk_kv_dir: self.disk_kv_path.clone(),
         }
     }
 

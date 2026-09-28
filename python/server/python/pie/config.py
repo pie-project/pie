@@ -73,6 +73,11 @@ class ModelConfig:
     # Sizes with a unit ("20GiB"); omit for uncapped.
     device_weight_budget: Optional[str] = None
     host_weight_budget: Optional[str] = None
+    # Pinned host bytes for suspended kv; omit for one device kv pool, "0B" for off.
+    host_kv_budget: Optional[str] = None
+    # Disk bytes suspended kv spills to once host is full; "0B"/omitted is off.
+    disk_kv_budget: Optional[str] = None
+    disk_kv_path: Optional[str] = None
     engine: EngineConfig = field(default_factory=EngineConfig)
 
 
@@ -105,7 +110,8 @@ class Config:
 
         m = self.model
         model: dict = {"name": m.name, "model": m.hf_repo}
-        for name in ("sku", "weight_dtype", "device_weight_budget", "host_weight_budget"):
+        for name in ("sku", "weight_dtype", "device_weight_budget", "host_weight_budget",
+                     "host_kv_budget", "disk_kv_budget", "disk_kv_path"):
             put(model, name, getattr(m, name))
 
         engine: dict = {"type": m.engine.type, "device": m.engine.device}

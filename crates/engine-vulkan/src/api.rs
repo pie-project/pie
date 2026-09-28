@@ -743,6 +743,7 @@ impl Engine for Vulkan {
     }
 
     fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
+        copy.device_only("vulkan")?;
         for (at, move_) in copy.moves.iter().enumerate() {
             if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
                 return Err(Error::Invalid(format!(

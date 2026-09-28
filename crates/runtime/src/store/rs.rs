@@ -90,6 +90,8 @@ pub enum RsError {
     BadIndexKey,
     #[error("rs working set cannot be indexed while a fire still writes its state")]
     IndexInFlight,
+    #[error("rs working set is suspended to host")]
+    Suspended,
 }
 
 pub const RS_TRANSLATION_UNMAPPED: u32 = u32::MAX;
@@ -145,8 +147,39 @@ struct RsEntry {
     window_phase: bool,
 }
 
+/// A suspend or restore: `(working set, from, to)` slot moves, host slots
+/// being ids past the device range.
+#[derive(Debug)]
+pub struct RsResidencyTxn {
+    scope: Vec<RsWorkingSetId>,
+    moves: Vec<(RsSlotId, RsSlotId)>,
+    host_base: u32,
+}
+
+impl RsResidencyTxn {
+    /// The engine's slot ids: each device slot and the host row it pairs with.
+    pub fn copy_plan(&self) -> (Vec<u32>, Vec<u32>) {
+        self.moves
+            .iter()
+            .map(|&(from, to)| {
+                let (device, host) = if from.0 >= self.host_base {
+                    (to, from)
+                } else {
+                    (from, to)
+                };
+                (device.0, host.0 - self.host_base)
+            })
+            .unzip()
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.moves.len()
+    }
+}
+
 pub struct RsStore {
     pool: Pool<RsSlotId>,
+    host: Pool<RsSlotId>,
     refs: HashMap<RsSlotId, u32>,
     working_sets: GenMap<RsWsMarker, RsEntry>,
     seq: u64,
@@ -158,8 +191,13 @@ pub struct RsStore {
 
 impl RsStore {
     pub fn new(capacity: u32) -> Self {
+        Self::new_with_host(capacity, 0)
+    }
+
+    pub fn new_with_host(capacity: u32, host_capacity: u32) -> Self {
         Self {
             pool: Pool::new(capacity),
+            host: Pool::new_range(capacity, host_capacity),
             refs: HashMap::new(),
             working_sets: GenMap::new(),
             seq: 0,
@@ -250,6 +288,9 @@ impl RsStore {
     pub fn update_index(&mut self, key: Vec<u8>, ws: RsWorkingSetId) -> Result<usize, RsError> {
         Self::validate_index_key(&key)?;
         let held: HashSet<RsSlotId> = Self::slots(self.entry(ws)?).collect();
+        if held.iter().any(|&id| self.is_host(id)) {
+            return Err(RsError::Suspended);
+        }
         if self
             .outstanding
             .values()
@@ -591,6 +632,11 @@ impl RsStore {
     ) -> Result<RsPreparedWrite, RsError> {
         let (folded, buffer_targets_src) = {
             let entry = self.entry(ws)?;
+            // Fires lease the kv fence the suspend raised and quiesced, so none reaches here.
+            debug_assert!(
+                !self.holds_host(entry),
+                "an rs write on a suspended working set"
+            );
             let src: Vec<(u32, Option<RsSlotId>)> = match buffer_tokens {
                 Some((start, len)) if len > 0 => {
                     let (first, last) = page_span(entry, start, len)?;
@@ -902,11 +948,189 @@ impl RsStore {
         let mut held = BTreeSet::new();
         for ws in working_sets {
             if let Some(entry) = self.working_sets.get(ws) {
-                held.extend(entry.folded);
-                held.extend(entry.buffer.iter().flatten());
+                held.extend(Self::slots(entry).filter(|&id| !self.is_host(id)));
             }
         }
         held.len()
+    }
+
+    fn is_host(&self, id: RsSlotId) -> bool {
+        id.0 >= self.pool.capacity()
+    }
+
+    fn holds_host(&self, entry: &RsEntry) -> bool {
+        Self::slots(entry).any(|id| self.is_host(id))
+    }
+
+    /// Swaps `from` for `to` in every working set of `scope`, returning
+    /// how many held it.
+    fn swap_within(&mut self, scope: &[RsWorkingSetId], from: RsSlotId, to: RsSlotId) -> u32 {
+        let mut held = 0;
+        for &ws in scope {
+            if let Some(entry) = self.working_sets.get_mut(ws) {
+                for id in entry
+                    .folded
+                    .iter_mut()
+                    .chain(entry.buffer.iter_mut().flatten())
+                {
+                    if *id == from {
+                        *id = to;
+                        held += 1;
+                    }
+                }
+            }
+        }
+        held
+    }
+
+    fn held_within(&self, scope: &HashSet<RsWorkingSetId>) -> BTreeMap<RsSlotId, u32> {
+        let mut held = BTreeMap::new();
+        for entry in scope.iter().filter_map(|&ws| self.working_sets.get(ws)) {
+            for id in Self::slots(entry) {
+                *held.entry(id).or_insert(0) += 1;
+            }
+        }
+        held
+    }
+
+    /// The device slots of `working_sets` held by no working set outside them.
+    fn private(&self, working_sets: &HashSet<RsWorkingSetId>) -> Vec<RsSlotId> {
+        self.held_within(working_sets)
+            .into_iter()
+            .filter(|&(id, held)| !self.is_host(id) && self.ref_count(id) == held)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// The slots a suspend frees once the evict drains the set's settled fires.
+    pub fn suspendable_slots(&self, working_sets: &HashSet<RsWorkingSetId>) -> usize {
+        self.private(working_sets).len()
+    }
+
+    fn swapped(&self, working_sets: &HashSet<RsWorkingSetId>) -> Vec<RsSlotId> {
+        self.held_within(working_sets)
+            .into_keys()
+            .filter(|&id| self.is_host(id))
+            .collect()
+    }
+
+    pub fn swapped_slots(&self, working_sets: &HashSet<RsWorkingSetId>) -> usize {
+        self.swapped(working_sets).len()
+    }
+
+    pub fn host_available(&self) -> usize {
+        self.host.available()
+    }
+
+    pub fn host_capacity(&self) -> u32 {
+        self.host.capacity()
+    }
+
+    /// Parks the sets' private, settled slots in host rows, when rows for
+    /// all of them are free; otherwise they stay on the device, and `None`
+    /// says so.
+    pub fn prepare_suspend(
+        &mut self,
+        working_sets: &HashSet<RsWorkingSetId>,
+    ) -> Option<RsResidencyTxn> {
+        let busy: HashSet<RsSlotId> = self.outstanding.values().flatten().copied().collect();
+        let slots: Vec<RsSlotId> = self
+            .private(working_sets)
+            .into_iter()
+            .filter(|id| !busy.contains(id))
+            .collect();
+        if slots.is_empty() {
+            return None;
+        }
+        let host = self.host.try_alloc_n(slots.len())?;
+        Some(self.txn(working_sets, slots.into_iter().zip(host).collect()))
+    }
+
+    fn txn(
+        &self,
+        working_sets: &HashSet<RsWorkingSetId>,
+        moves: Vec<(RsSlotId, RsSlotId)>,
+    ) -> RsResidencyTxn {
+        RsResidencyTxn {
+            scope: working_sets.iter().copied().collect(),
+            moves,
+            host_base: self.pool.capacity(),
+        }
+    }
+
+    /// Swaps each copied slot for its host copy, returning the device slots freed.
+    /// A slot shared outside the set or dropped while the copy ran stays as it is.
+    pub fn commit_suspend(&mut self, txn: RsResidencyTxn) -> usize {
+        let epoch = self.seq;
+        let busy: HashSet<RsSlotId> = self.outstanding.values().flatten().copied().collect();
+        let scope: HashSet<RsWorkingSetId> = txn.scope.iter().copied().collect();
+        let held = self.held_within(&scope);
+        let mut freed = 0;
+        for (device, host) in txn.moves {
+            // A set released while the copy ran holds nothing; what it still
+            // holds is as private and settled as the prepare found it, since
+            // the process is fenced.
+            let within = held.get(&device).copied().unwrap_or(0);
+            if within == 0 {
+                self.host.release_reserved(vec![host]);
+                continue;
+            }
+            debug_assert!(
+                self.ref_count(device) == within && !busy.contains(&device),
+                "an rs slot went shared or busy under its suspend"
+            );
+            self.swap_within(&txn.scope, device, host);
+            if let Some(count) = self.refs.remove(&device) {
+                self.refs.insert(host, count);
+            }
+            self.pool.recycle_after_epoch(vec![device], epoch);
+            freed += 1;
+        }
+        self.retire_idle();
+        freed
+    }
+
+    pub fn abort_suspend(&mut self, txn: RsResidencyTxn) {
+        self.host
+            .release_reserved(txn.moves.into_iter().map(|(_, host)| host).collect());
+    }
+
+    pub fn prepare_restore(
+        &mut self,
+        working_sets: &HashSet<RsWorkingSetId>,
+        granted: &mut Vec<RsSlotId>,
+    ) -> Result<RsResidencyTxn, RsError> {
+        let swapped = self.swapped(working_sets);
+        if granted.len() < swapped.len() {
+            return Err(RsError::GrantMismatch {
+                required: swapped.len(),
+                granted: granted.len(),
+            });
+        }
+        let devices = granted.drain(..swapped.len());
+        Ok(self.txn(working_sets, swapped.into_iter().zip(devices).collect()))
+    }
+
+    /// Swaps each host slot back for its device copy, returning the slots restored.
+    pub fn commit_restore(&mut self, txn: RsResidencyTxn) -> usize {
+        let mut restored = 0;
+        for (host, device) in txn.moves {
+            if self.swap_within(&txn.scope, host, device) == 0 {
+                self.pool.release_reserved(vec![device]);
+                continue;
+            }
+            if let Some(count) = self.refs.remove(&host) {
+                self.refs.insert(device, count);
+            }
+            self.host.release_reserved(vec![host]);
+            restored += 1;
+        }
+        restored
+    }
+
+    pub fn abort_restore(&mut self, txn: RsResidencyTxn) {
+        self.pool
+            .release_reserved(txn.moves.into_iter().map(|(_, device)| device).collect());
     }
 
     pub fn capacity_slots(&self) -> u32 {
@@ -942,6 +1166,10 @@ impl RsStore {
             return false;
         }
         self.refs.remove(&id);
+        if self.is_host(id) {
+            self.host.release_reserved(vec![id]);
+            return true;
+        }
         let epoch = epoch.max(self.seq);
         self.pool.recycle_after_epoch(vec![id], epoch);
         true

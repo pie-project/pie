@@ -127,7 +127,7 @@ fn fail_request(request: LaneRequest, why: &str) {
                 QueuedItem::PreLaunchCopy {
                     logical_completion, ..
                 } => logical_completion.reject_unsubmitted(why),
-                QueuedItem::CopyKvTracked { completion, .. } => {
+                QueuedItem::CopyTracked { completion, .. } => {
                     completion.resolve(&Err(anyhow!("{why}")));
                 }
                 _ => {}
@@ -459,7 +459,7 @@ impl Lane {
             },
             QueuedItem::PreLaunchCopy { .. }
             | QueuedItem::CopyKv { .. }
-            | QueuedItem::CopyKvTracked { .. }
+            | QueuedItem::CopyTracked { .. }
             | QueuedItem::CopyState { .. } => LaneCommit::AsyncControl {
                 result: Err(why.to_string()),
             },
@@ -894,10 +894,13 @@ impl Lane {
                     .and_then(|engine| crate::engine::verbs::settled(engine.copy_state(&plan))),
                 response,
             ),
-            QueuedItem::CopyKvTracked { plan, completion } => {
-                match backend(engine)
-                    .and_then(|engine| crate::engine::verbs::settled(engine.copy_kv(&plan)))
-                {
+            QueuedItem::CopyTracked { plan, completion } => {
+                match backend(engine).and_then(|engine| {
+                    crate::engine::verbs::settled(match plan {
+                        PreLaunchCopy::Kv(plan) => engine.copy_kv(&plan),
+                        PreLaunchCopy::State(plan) => engine.copy_state(&plan),
+                    })
+                }) {
                     Ok(native_completion) => LaneCommit::AsyncControl {
                         result: Ok(native_completion),
                     },

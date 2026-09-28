@@ -58,7 +58,9 @@ pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[us
         kv_page_size,
         num_kv_pages,
         &vec![0; num_kv_pages.len()],
+        &vec![0; num_kv_pages.len()],
         num_slots,
+        &vec![0; num_kv_pages.len()],
         &vec![0; num_kv_pages.len()],
     )
 }
@@ -67,7 +69,9 @@ pub fn register_model_with_swap(
     kv_page_size: u32,
     num_kv_pages: &[usize],
     num_host_pages: &[usize],
+    num_disk_pages: &[u32],
     num_slots: &[usize],
+    num_host_slots: &[usize],
     max_context: &[usize],
 ) -> usize {
     let stores: Vec<Option<Stores>> = (0..num_kv_pages.len())
@@ -75,13 +79,15 @@ pub fn register_model_with_swap(
             let kv = Arc::new(parking_lot::Mutex::new(KvStore::new_with_swap(
                 num_kv_pages[d] as u32,
                 num_host_pages.get(d).copied().unwrap_or(0) as u32,
+                num_disk_pages.get(d).copied().unwrap_or(0),
                 rand::random::<[u8; 32]>(),
             )));
             let slots = num_slots.get(d).copied().unwrap_or(0) as u32;
+            let host_slots = num_host_slots.get(d).copied().unwrap_or(0) as u32;
             let max_context = max_context.get(d).copied().unwrap_or(0);
             Some(Stores {
                 kv,
-                rs: Arc::new(Mutex::new(RsStore::new(slots))),
+                rs: Arc::new(Mutex::new(RsStore::new_with_host(slots, host_slots))),
                 seats: Arc::new(Mutex::new(SeatBook::new(slots))),
                 seats_freed: Arc::new(tokio::sync::Notify::new()),
                 kv_page_size,
@@ -125,6 +131,7 @@ pub fn register_engine_with_swap(
         base_page,
         num_kv_pages as u32,
         num_host_pages as u32,
+        0,
         rand::random::<[u8; 32]>(),
     )));
     stores[engine_idx] = Some(Stores {

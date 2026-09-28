@@ -11,6 +11,8 @@ pub enum MemoryDomain {
     MetalPrivate,
     VulkanDevice(u32),
     WgpuDevice(u32),
+    /// The engine's own slot file, one kv page per slot.
+    LocalDisk,
 }
 
 impl MemoryDomain {
@@ -21,9 +23,10 @@ impl MemoryDomain {
             | MemoryDomain::RocmDevice(ordinal)
             | MemoryDomain::VulkanDevice(ordinal)
             | MemoryDomain::WgpuDevice(ordinal) => Some(ordinal),
-            MemoryDomain::HostPinned | MemoryDomain::MetalShared | MemoryDomain::MetalPrivate => {
-                None
-            }
+            MemoryDomain::HostPinned
+            | MemoryDomain::MetalShared
+            | MemoryDomain::MetalPrivate
+            | MemoryDomain::LocalDisk => None,
         }
     }
 
@@ -166,6 +169,24 @@ impl KvCopy {
         }
         Ok(())
     }
+
+    /// A whole-page move between `device` and a tier below it: the tier,
+    /// whether the pages leave the device, and the page ids on the device
+    /// and in the tier. `None` for any other copy.
+    #[must_use]
+    pub fn tier_move(&self, device: MemoryDomain) -> Option<(MemoryDomain, bool, &[u32], &[u32])> {
+        let tier = |domain| matches!(domain, MemoryDomain::HostPinned | MemoryDomain::LocalDisk);
+        if !self.moves.is_empty() {
+            return None;
+        }
+        if self.src == device && tier(self.dst) {
+            Some((self.dst, true, &self.src_page_ids, &self.dst_page_ids))
+        } else if tier(self.src) && self.dst == device {
+            Some((self.src, false, &self.dst_page_ids, &self.src_page_ids))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,7 +198,32 @@ pub struct StateMove {
     pub token_count: u32,
 }
 
+/// Which pools a state copy's slot ids name: host slots index the pool
+/// `PoolFacts::host_state_slots` advertises.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateDirection {
+    #[default]
+    DeviceToDevice,
+    DeviceToHost,
+    HostToDevice,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StateCopy {
     pub moves: Vec<StateMove>,
+    #[serde(default)]
+    pub direction: StateDirection,
+}
+
+impl StateCopy {
+    /// Refuses a copy to or from host slots on `engine`, which reserves none.
+    pub fn device_only(&self, engine: &'static str) -> crate::Result<()> {
+        if self.direction == StateDirection::DeviceToDevice {
+            return Ok(());
+        }
+        Err(crate::Error::Unsupported {
+            verb: "`copy_state` to or from host slots, which this load does not reserve",
+            engine,
+        })
+    }
 }
