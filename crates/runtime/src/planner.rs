@@ -2271,39 +2271,44 @@ impl ResidencyPlanner {
         {
             return;
         }
-        let Some(victim_key) = self.pick_starvation_victim() else {
-            return;
-        };
-        let notify = self.with_inner(|inner| {
-            let (_, head) = inner.unmet_head()?;
-            if inner.accum.lens().covers(head.kv_need()) || !inner.evicting.is_empty() {
-                return None;
-            }
-            let victim = inner.queue.get_mut(&victim_key)?;
-            let victim_pid = victim.pid;
-            let WaitKind::Allocation {
-                demand,
-                notify,
-                outcome,
-                ..
-            } = &mut victim.kind
-            else {
-                return None;
+        let victims = self.pick_starvation_victims();
+        let notified = self.with_inner(|inner| {
+            let Some((_, head)) = inner.unmet_head() else {
+                return Vec::new();
             };
-            if outcome.is_some() {
-                return None;
+            if inner.accum.lens().covers(head.kv_need()) || !inner.evicting.is_empty() {
+                return Vec::new();
             }
-            *outcome = Some(Err(PlannerError::Starved {
-                need: demand.kv_pages[pool],
-                free,
-                total,
-                cause,
-            }));
-            let notify = notify.clone();
-            inner.killing.insert(victim_pid);
-            Some((notify, victim_pid))
+            let Inner { queue, killing, .. } = inner;
+            victims
+                .iter()
+                .filter_map(|key| {
+                    let victim = queue.get_mut(key)?;
+                    let victim_pid = victim.pid;
+                    let WaitKind::Allocation {
+                        demand,
+                        notify,
+                        outcome,
+                        ..
+                    } = &mut victim.kind
+                    else {
+                        return None;
+                    };
+                    if outcome.is_some() {
+                        return None;
+                    }
+                    *outcome = Some(Err(PlannerError::Starved {
+                        need: demand.kv_pages[pool],
+                        free,
+                        total,
+                        cause,
+                    }));
+                    killing.insert(victim_pid);
+                    Some((notify.clone(), victim_pid))
+                })
+                .collect::<Vec<_>>()
         });
-        if let Some((notify, victim_pid)) = notify {
+        for (notify, victim_pid) in notified {
             self.stats.starvations.fetch_add(1, Ordering::Relaxed);
             let restarting = crate::inferlet::process::request_restart(victim_pid);
             if restarting {
@@ -2324,6 +2329,48 @@ impl ResidencyPlanner {
             }
             notify.notify_waiters();
         }
+    }
+
+    /// Every admitted process is parked, so their asks are all the demand
+    /// there is: restart as many of the youngest holders as it takes to
+    /// serve every older holder, not one per wedge, which moves only the
+    /// few asks its pages cover before the fleet parks again.
+    fn pick_starvation_victims(&self) -> Vec<EntryKey> {
+        let (parked, mut supply) = self.with_inner(|inner| {
+            let parked: Vec<(EntryKey, ProcessId, KvPages)> = inner
+                .queue
+                .iter()
+                .filter_map(|(key, waiter)| match &waiter.kind {
+                    WaitKind::Allocation {
+                        demand,
+                        outcome: None,
+                        ..
+                    } => Some((*key, waiter.pid, demand.kv_pages)),
+                    _ => None,
+                })
+                .collect();
+            (parked, inner.accum.lens())
+        });
+        let free = self.free_pages();
+        for pool in KvPool::ALL {
+            supply[pool] = supply[pool].saturating_add(free[pool]);
+        }
+        let (model, engine) = self.port.locus();
+        let mut held = HashMap::new();
+        for (_, pid, _) in &parked {
+            held.entry(*pid)
+                .or_insert_with(|| held_kv_pages(*pid, model, engine));
+        }
+        let keys = restart_set(
+            &parked,
+            &held,
+            crate::inferlet::process::is_restartable,
+            supply,
+        );
+        if keys.is_empty() {
+            return self.pick_starvation_victim().into_iter().collect();
+        }
+        keys
     }
 
     fn pick_starvation_victim(&self) -> Option<EntryKey> {
@@ -2846,6 +2893,61 @@ fn held_page_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
     })
 }
 
+fn held_kv_pages(pid: ProcessId, model: usize, engine: usize) -> KvPages {
+    let mut held = KvPages::default();
+    kv_page_count(pid, model, engine, |kv, ws| {
+        held = KvPages::new(
+            kv.held_page_count(ws).unwrap_or(0) as u32,
+            kv.held_window_pages(ws) as u32,
+        );
+        0
+    });
+    held
+}
+
+/// The youngest restartable holders (never the head) whose pages, with
+/// `supply`, serve in queue order every ask up to the youngest holder left.
+fn restart_set(
+    parked: &[(EntryKey, ProcessId, KvPages)],
+    held: &HashMap<ProcessId, KvPages>,
+    restartable: impl Fn(ProcessId) -> bool,
+    mut supply: KvPages,
+) -> Vec<EntryKey> {
+    let holds = |pid: &ProcessId| held.get(pid).copied().unwrap_or_default();
+    let mut victims = HashSet::new();
+    let serves_every_holder = |victims: &HashSet<ProcessId>, mut supply: KvPages| {
+        let left: Vec<_> = parked
+            .iter()
+            .filter(|(_, pid, _)| !victims.contains(pid))
+            .collect();
+        let Some(last) = left.iter().rposition(|(_, pid, _)| !holds(pid).is_zero()) else {
+            return true;
+        };
+        left[..=last].iter().all(|(_, _, ask)| {
+            let covered = supply.covers(*ask);
+            supply = supply.saturating_sub(*ask);
+            covered
+        })
+    };
+    let head = parked.first().map(|(_, pid, _)| *pid);
+    let mut keys = Vec::new();
+    for (key, pid, _) in parked.iter().rev() {
+        if serves_every_holder(&victims, supply) {
+            break;
+        }
+        if Some(*pid) == head || holds(pid).is_zero() || victims.contains(pid) || !restartable(*pid)
+        {
+            continue;
+        }
+        victims.insert(*pid);
+        keys.push(*key);
+        for pool in KvPool::ALL {
+            supply[pool] = supply[pool].saturating_add(holds(pid)[pool]);
+        }
+    }
+    keys
+}
+
 fn held_rs_slot_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
     let working_sets = crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine);
     if working_sets.is_empty() {
@@ -2967,6 +3069,24 @@ mod service_order_tests {
         a_restore_holds_the_head_when_no_allocation_is_unmet();
         a_younger_restore_still_queues_behind_an_older_allocation();
         returning_host_room_resumes_the_yield();
+        a_wedge_restarts_enough_holders_for_every_older_one();
+    }
+
+    fn a_wedge_restarts_enough_holders_for_every_older_one() {
+        // Five holders of two windowed pages, each parked on one more, and a
+        // non-holder behind them: the two youngest holders fund the rest.
+        let pids: Vec<ProcessId> = (0..6).map(|_| ProcessId::new_v4()).collect();
+        let parked: Vec<(EntryKey, ProcessId, KvPages)> = pids
+            .iter()
+            .enumerate()
+            .map(|(at, pid)| ((at as u64, at as u64), *pid, KvPages::new(0, 1)))
+            .collect();
+        let held = pids[..5]
+            .iter()
+            .map(|pid| (*pid, KvPages::new(0, 2)))
+            .collect();
+        let keys = restart_set(&parked, &held, |_| true, KvPages::default());
+        assert_eq!(keys, vec![(4, 4), (3, 3)]);
     }
 
     fn a_restore_yields_the_head_to_a_younger_allocation() {
