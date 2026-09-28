@@ -1037,6 +1037,16 @@ async def run(args: argparse.Namespace):
         async def many(indices, *, max_tokens: int | None = None) -> list[RequestResult]:
             if args.single_process_batch and args.mode == "tput":
                 return await batch(indices, max_tokens=max_tokens)
+            if args.concurrency > 0 and not args.defer_start:
+                # the client holds `--concurrency` open itself: a shared server
+                # (PIE_BENCH_SERVER_URL) admits up to its own boot-time cap
+                seats = asyncio.Semaphore(args.concurrency)
+
+                async def seated(i: int) -> RequestResult:
+                    async with seats:
+                        return await one(i, max_tokens=max_tokens)
+
+                return await asyncio.gather(*(seated(i) for i in indices))
             launched = await asyncio.gather(
                 *(launch_one(i, max_tokens=max_tokens) for i in indices)
             )
