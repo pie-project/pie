@@ -164,14 +164,20 @@ const STAGE_BYTES: u64 = 16 << 20;
 
 /// Maps every rank's stage into every other rank when each pair of devices
 /// reaches the other: the group's ranks share this process, so a peer's
-/// buffer is a plain device pointer once peer access is on. `None` when some
-/// pair does not, and the collectives stay on NCCL.
+/// buffer is a plain device pointer once peer access is on. The handshake
+/// below is the whole decision: a link that carries the kernels' stores and
+/// loads carries every message, since at two ranks the peer all-reduce reads
+/// no more than NCCL's ring moves and never crosses host memory (#777).
+/// `None` when some pair does not, and the collectives stay on NCCL.
 #[must_use]
 pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peers>> {
     #[cfg(feature = "cuda")]
     {
         match wire_peers(ordinals) {
-            Ok(peers) => peers,
+            Ok(peers) => {
+                eprintln!("engine-cuda: peer collectives carry the group's bf16 messages");
+                peers
+            }
             Err(fault) => {
                 eprintln!("engine-cuda: peer collectives are off, NCCL carries them: {fault}");
                 None
@@ -182,148 +188,6 @@ pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peer
     {
         let _ = ordinals;
         None
-    }
-}
-
-/// Sets how long a message the peer path carries. Its kernel reads the peers'
-/// stages over whatever link joins the devices, and some PCIe pairs deliver
-/// those reads far slower than NCCL's own transport past short messages
-/// (#741), so every rank times both paths on the same message sizes and the
-/// peer path keeps the sizes it wins. `None` when it wins none.
-#[must_use]
-pub fn calibrate(
-    ordinals: &[i32],
-    comms: &[&Comm],
-    peers: Vec<kernels_cuda::collective::Peers>,
-) -> Option<Vec<kernels_cuda::collective::Peers>> {
-    let sizes: Vec<u64> = (14..=STAGE_BYTES.ilog2())
-        .map(|shift| 1u64 << shift)
-        .collect();
-    let timed: Vec<Result<Vec<[f64; 2]>>> = std::thread::scope(|scope| {
-        let racers: Vec<_> = ordinals
-            .iter()
-            .zip(comms)
-            .zip(&peers)
-            .map(|((&ordinal, comm), &peers)| {
-                let sizes = &sizes;
-                scope.spawn(move || race(ordinal, comm, peers, sizes))
-            })
-            .collect();
-        racers
-            .into_iter()
-            .map(|racer| racer.join().unwrap_or(Err(Fault::Runtimeless)))
-            .collect()
-    });
-    let mut slowest = vec![[0f64; 2]; sizes.len()];
-    for rank in timed {
-        match rank {
-            Ok(rank) => {
-                for (worst, time) in slowest.iter_mut().zip(rank) {
-                    worst[0] = worst[0].max(time[0]);
-                    worst[1] = worst[1].max(time[1]);
-                }
-            }
-            Err(fault) => {
-                eprintln!("engine-cuda: peer collectives are off, NCCL carries them: {fault}");
-                return None;
-            }
-        }
-    }
-    let wins = slowest
-        .iter()
-        .take_while(|[peer, nccl]| peer <= nccl)
-        .count();
-    let reach = match wins {
-        0 => None,
-        n if n == sizes.len() => Some(u64::MAX),
-        n => Some(sizes[n - 1]),
-    };
-    eprintln!(
-        "engine-cuda: peer collectives carry messages up to {reach:?} bytes, NCCL the \
-         rest (peer/NCCL us from 16 KiB up: {:?})",
-        slowest
-            .iter()
-            .map(|[peer, nccl]| format!("{peer:.0}/{nccl:.0}"))
-            .collect::<Vec<_>>()
-    );
-    let reach = reach?;
-    Some(
-        peers
-            .into_iter()
-            .map(|peers| kernels_cuda::collective::Peers { reach, ..peers })
-            .collect(),
-    )
-}
-
-/// One rank's microseconds per all-reduce, `[peer, nccl]`, at each size. Every
-/// rank runs the same sequence, so each collective finds its partners.
-fn race(
-    ordinal: i32,
-    comm: &Comm,
-    peers: kernels_cuda::collective::Peers,
-    sizes: &[u64],
-) -> Result<Vec<[f64; 2]>> {
-    #[cfg(feature = "cuda")]
-    {
-        use cudarc::runtime::sys as rt;
-
-        use crate::device::ctx::check;
-
-        const ROUNDS: u32 = 8;
-        crate::device::ctx::bind_thread(ordinal)?;
-        let mut stream: *mut c_void = core::ptr::null_mut();
-        // SAFETY: a live out-parameter.
-        check("cudaStreamCreate", unsafe {
-            rt::cudaStreamCreateWithFlags((&raw mut stream).cast(), rt::cudaStreamNonBlocking)
-        })?;
-        let buf = crate::device::Buffer::zeroed(STAGE_BYTES as usize);
-        // SAFETY: the stream is live until the end of this function, and so
-        // are the communicator and the stages the group holds.
-        let paths = unsafe {
-            let nccl = kernels_cuda::Ctx::on(stream).with_comm(comm.raw());
-            [
-                nccl.with_peers(peers),
-                kernels_cuda::Ctx::on(stream).with_comm(comm.raw()),
-            ]
-        };
-        let timed = buf.and_then(|buf| {
-            let mut out = Vec::with_capacity(sizes.len());
-            for &bytes in sizes {
-                let mut t = kernels_cuda::Tensor::new(
-                    buf.ptr(),
-                    1,
-                    (bytes / 2) as u32,
-                    model_ir::Dtype::Bf16,
-                );
-                let mut row = [0f64; 2];
-                for (path, ctx) in paths.iter().enumerate() {
-                    let mut run = |rounds: u32| -> Result<f64> {
-                        let start = std::time::Instant::now();
-                        for _ in 0..rounds {
-                            kernels_cuda::collective::all_reduce(ctx, &mut t)
-                                .map_err(crate::error::kernel)?;
-                        }
-                        // SAFETY: the stream created above.
-                        check("cudaStreamSynchronize", unsafe {
-                            rt::cudaStreamSynchronize(stream.cast())
-                        })?;
-                        Ok(start.elapsed().as_secs_f64() * 1e6 / f64::from(rounds))
-                    };
-                    run(2)?;
-                    row[path] = run(ROUNDS)?;
-                }
-                out.push(row);
-            }
-            Ok(out)
-        });
-        // SAFETY: the stream created above, idle once `timed` is in.
-        unsafe { rt::cudaStreamDestroy(stream.cast()) };
-        timed
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (ordinal, comm, peers, sizes);
-        Err(Fault::Runtimeless)
     }
 }
 
@@ -429,7 +293,6 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
             signal: signals[rank],
             stages: tables[rank],
             signals: tables[rank] + size_of::<[u64; 8]>() as u64,
-            reach: u64::MAX,
         });
     }
     // What the driver advertises is not always what the link carries (#757).
