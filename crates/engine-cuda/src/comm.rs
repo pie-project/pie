@@ -189,12 +189,12 @@ pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peer
 /// or cold first replay does not.
 const SAMPLES: usize = 9;
 
-/// Sets how long a message the peer path carries. Its kernel reads the peers'
+/// Sets how long a message the peer path carries. Its kernels read the peers'
 /// stages over whatever link joins the devices, and some PCIe pairs deliver
 /// those reads far slower than NCCL's own transport past short messages
-/// (#741), so every rank times both paths on the same message sizes and the
-/// peer path carries those up to the reach that costs least. `None` when
-/// that is none.
+/// (#741), so every rank times both paths on the same message sizes, for the
+/// all-reduce and the all-gather apart, and each carries its sizes up to the
+/// reach that costs least. `None` when that is none for both.
 #[must_use]
 pub fn calibrate(
     ordinals: &[i32],
@@ -241,40 +241,55 @@ pub fn calibrate(
         }
     }
     let costs = costs(&ranks);
-    let reach = reach(&sizes, &costs);
-    let carried = match reach {
-        None => "no messages".to_owned(),
-        Some(u64::MAX) => "messages of every size".to_owned(),
-        Some(bytes) => format!("messages up to {bytes} bytes"),
-    };
-    eprintln!(
-        "engine-cuda: peer collectives carry {carried}, NCCL the rest (peer/NCCL us \
-         from 16 KiB up: {:?})",
-        costs
+    let [reduce, gather] = [0, 1].map(|op| {
+        let pairs: Vec<[f64; 2]> = costs
             .iter()
-            .map(|[peer, nccl]| format!("{peer:.1}/{nccl:.1}"))
-            .collect::<Vec<_>>()
-    );
-    let reach = reach?;
-    Some(
+            .map(|cost| [cost[2 * op], cost[2 * op + 1]])
+            .collect();
+        let reach = reach(&sizes, &pairs);
+        let carried = match reach {
+            None => "no messages".to_owned(),
+            Some(u64::MAX) => "messages of every size".to_owned(),
+            Some(bytes) => format!("messages up to {bytes} bytes"),
+        };
+        eprintln!(
+            "engine-cuda: peer {} carry {carried}, NCCL the rest (peer/NCCL us from 16 KiB \
+             up: {:?})",
+            ["all-reduces", "all-gathers"][op],
+            pairs
+                .iter()
+                .map(|[peer, nccl]| format!("{peer:.1}/{nccl:.1}"))
+                .collect::<Vec<_>>()
+        );
+        reach.unwrap_or(0)
+    });
+    (reduce > 0 || gather > 0).then(|| {
         peers
             .into_iter()
-            .map(|peers| kernels_cuda::collective::Peers { reach, ..peers })
-            .collect(),
-    )
+            .map(|peers| kernels_cuda::collective::Peers {
+                reach: reduce,
+                gather_reach: gather,
+                ..peers
+            })
+            .collect()
+    })
 }
 
-/// One rank's microseconds per all-reduce, `[peer, nccl]` at each size, for
-/// each replay.
-type Samples = [Vec<[f64; 2]>; SAMPLES];
+/// The paths timed at each size: the all-reduce on the peers and on NCCL,
+/// then the all-gather the same two ways.
+const PATHS: usize = 4;
 
-/// Each size's `[peer, nccl]` cost: the median over replays of the slowest
+/// One rank's microseconds per collective on each path at each size, for each
+/// replay.
+type Samples = [Vec<[f64; PATHS]>; SAMPLES];
+
+/// Each size's cost on each path: the median over replays of the slowest
 /// rank's time, since a collective ends when its last rank does.
-fn costs(ranks: &[Samples]) -> Vec<[f64; 2]> {
+fn costs(ranks: &[Samples]) -> Vec<[f64; PATHS]> {
     let sizes = ranks.first().map_or(0, |rank| rank[0].len());
     (0..sizes)
         .map(|size| {
-            [0, 1].map(|path| {
+            std::array::from_fn(|path| {
                 let mut slowest: [f64; SAMPLES] = std::array::from_fn(|replay| {
                     ranks
                         .iter()
@@ -323,10 +338,33 @@ fn race(
         // what a path costs.
         const ROUNDS: u32 = 16;
 
-        let plane = |at: u64, bytes: u64| {
-            kernels_cuda::Tensor::new(at, 1, (bytes / 2) as u32, model_ir::Dtype::Bf16)
-        };
+        // Gathers come in rows, as the logits do, each gathered row `ROW`
+        // bytes.
+        const ROW: u64 = 16 << 10;
+
+        let world = u64::from(peers.world);
         let partner = || Fault::program("comm::calibrate", "a partner rank failed");
+        let fire = |paths: &[kernels_cuda::Ctx; 2],
+                    bufs: &[crate::device::Buffer; 2],
+                    path: usize,
+                    bytes: u64|
+         -> Result<()> {
+            let ctx = &paths[path % 2];
+            let bf16 = |at: u64, rows: u64, width: u64| {
+                kernels_cuda::Tensor::new(at, rows as u32, width as u32, model_ir::Dtype::Bf16)
+            };
+            let fired = if path < 2 {
+                kernels_cuda::collective::all_reduce(ctx, &mut bf16(bufs[0].ptr(), 1, bytes / 2))
+            } else {
+                let (rows, width) = (bytes.div_ceil(ROW), ROW.min(bytes) / 2);
+                kernels_cuda::collective::all_gather(
+                    ctx,
+                    bf16(bufs[0].ptr(), rows, width / world),
+                    &mut bf16(bufs[1].ptr(), rows, width),
+                )
+            };
+            Ok(fired.map_err(crate::error::kernel)?)
+        };
 
         let mut stream: *mut c_void = core::ptr::null_mut();
         // Every size runs once eagerly, and every rank drains, before any
@@ -338,7 +376,10 @@ fn race(
             check("cudaStreamCreate", unsafe {
                 rt::cudaStreamCreateWithFlags((&raw mut stream).cast(), rt::cudaStreamNonBlocking)
             })?;
-            let buf = crate::device::Buffer::zeroed(STAGE_BYTES as usize)?;
+            let bufs = [
+                crate::device::Buffer::zeroed(STAGE_BYTES as usize)?,
+                crate::device::Buffer::zeroed(STAGE_BYTES as usize)?,
+            ];
             // SAFETY: the stream is live until the end of this function, and
             // so are the communicator and the stages the group holds.
             let paths = unsafe {
@@ -349,17 +390,15 @@ fn race(
                 ]
             };
             for &bytes in sizes {
-                let mut t = plane(buf.ptr(), bytes);
-                for ctx in &paths {
-                    kernels_cuda::collective::all_reduce(ctx, &mut t)
-                        .map_err(crate::error::kernel)?;
+                for path in 0..PATHS {
+                    fire(&paths, &bufs, path, bytes)?;
                 }
             }
             // SAFETY: the stream created above.
             check("cudaStreamSynchronize", unsafe {
                 rt::cudaStreamSynchronize(stream.cast())
             })?;
-            Ok((buf, paths))
+            Ok((bufs, paths))
         })();
         let armed = match warmed {
             Err(fault) => {
@@ -367,23 +406,18 @@ fn race(
                 Err(fault)
             }
             Ok(_) if meet(false) => Err(partner()),
-            Ok((buf, paths)) => (|| -> Result<_> {
-                let mut graphs: Vec<[GraphExec; 2]> = Vec::with_capacity(sizes.len());
+            Ok((bufs, paths)) => (|| -> Result<_> {
+                let mut graphs: Vec<Vec<GraphExec>> = Vec::with_capacity(sizes.len());
                 for &bytes in sizes {
-                    let mut t = plane(buf.ptr(), bytes);
-                    let mut capture = |ctx: &kernels_cuda::Ctx| {
+                    let captured = (0..PATHS).map(|path| {
                         Graph::capture(stream, || {
-                            for _ in 0..ROUNDS {
-                                kernels_cuda::collective::all_reduce(ctx, &mut t)
-                                    .map_err(crate::error::kernel)?;
-                            }
-                            Ok(())
+                            (0..ROUNDS).try_for_each(|_| fire(&paths, &bufs, path, bytes))
                         })?
                         .instantiate(stream)
-                    };
-                    graphs.push([capture(&paths[0])?, capture(&paths[1])?]);
+                    });
+                    graphs.push(captured.collect::<Result<_>>()?);
                 }
-                Ok((buf, graphs, Event::timing()?, Event::timing()?))
+                Ok((bufs, graphs, Event::timing()?, Event::timing()?))
             })(),
         };
         let timed = match armed {
@@ -391,8 +425,8 @@ fn race(
                 meet(true);
                 Err(fault)
             }
-            Ok((_buf, graphs, start, end)) => {
-                let mut out: Samples = std::array::from_fn(|_| vec![[0.0; 2]; sizes.len()]);
+            Ok((_bufs, graphs, start, end)) => {
+                let mut out: Samples = std::array::from_fn(|_| vec![[0.0; PATHS]; sizes.len()]);
                 let (mut fault, mut halted) = (None, false);
                 'replays: for replay in &mut out {
                     for (size, pair) in graphs.iter().enumerate() {
@@ -538,6 +572,7 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
             stages: tables[rank],
             signals: tables[rank] + size_of::<[u64; 8]>() as u64,
             reach: u64::MAX,
+            gather_reach: u64::MAX,
         });
     }
     // What the driver advertises is not always what the link carries (#757).
@@ -633,8 +668,11 @@ mod tests {
             [490.0, 545.0],
         ];
         assert_eq!(super::reach(&sizes, &costs), Some(u64::MAX));
-        let mut rank: super::Samples = std::array::from_fn(|_| vec![[5.0, 9.0]]);
+        let mut rank: super::Samples = std::array::from_fn(|_| vec![[5.0, 9.0, 6.0, 4.0]]);
         rank[3][0][0] = 60.0;
-        assert_eq!(super::costs(&[rank.clone(), rank]), vec![[5.0, 9.0]]);
+        assert_eq!(
+            super::costs(&[rank.clone(), rank]),
+            vec![[5.0, 9.0, 6.0, 4.0]]
+        );
     }
 }
