@@ -6,7 +6,9 @@ use super::{ProcessId, ResidencyPlanner};
 
 use crate::store::kv::page_table::WorkingSetId;
 use crate::store::kv::working_set::KvSuspendHandle;
-use crate::store::kv::{KvRestoreTxn, KvSuspendPrepare, KvSuspendTxn};
+use crate::store::kv::{KvRestoreTxn, KvSuspendPrepare, KvSuspendTxn, SuspendDisposition};
+use crate::store::rs::RsResidencyTxn;
+use ::engine::transfer::StateDirection;
 
 fn spawn_watched(
     planner: Arc<ResidencyPlanner>,
@@ -42,8 +44,9 @@ pub(super) fn spawn_restore(
     planner: Arc<ResidencyPlanner>,
     pid: ProcessId,
     pages: super::grant::DevicePageReservation,
+    slots: super::grant::RsSlotReservation,
 ) {
-    let task = restore(planner.clone(), pid, pages);
+    let task = restore(planner.clone(), pid, pages, slots);
     let spawned = spawn_watched(planner.clone(), pid, "restore", task, |planner, pid| {
         planner.restore_failed(pid, "restore executor died")
     });
@@ -87,18 +90,26 @@ impl Drop for FenceGuard {
 enum ResidencyTxn {
     Suspend(KvSuspendTxn),
     Restore(KvRestoreTxn),
+    RsSuspend(RsResidencyTxn),
+    RsRestore(RsResidencyTxn),
 }
 
 fn abort_residency_txn(model: usize, engine: usize, txn: ResidencyTxn) {
     let stores = crate::store::registry::get(model, engine);
-    let tag = match &txn {
-        ResidencyTxn::Suspend(_) => "planner-evict",
-        ResidencyTxn::Restore(_) => "planner-restore",
-    };
-    crate::store::registry::with_kv_lock(&stores.kv, tag, |kv| match txn {
-        ResidencyTxn::Suspend(txn) => kv.abort_suspend(txn),
-        ResidencyTxn::Restore(txn) => kv.abort_restore(txn),
-    });
+    match txn {
+        ResidencyTxn::Suspend(txn) => {
+            crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
+                kv.abort_suspend(txn)
+            })
+        }
+        ResidencyTxn::Restore(txn) => {
+            crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
+                kv.abort_restore(txn)
+            })
+        }
+        ResidencyTxn::RsSuspend(txn) => stores.rs.lock().unwrap().abort_suspend(txn),
+        ResidencyTxn::RsRestore(txn) => stores.rs.lock().unwrap().abort_restore(txn),
+    }
 }
 
 struct ResidencyTxnGuard {
@@ -109,57 +120,50 @@ struct ResidencyTxnGuard {
 }
 
 impl ResidencyTxnGuard {
-    fn suspend(model: usize, engine: usize, txn: KvSuspendTxn) -> Self {
+    fn new(model: usize, engine: usize, txn: ResidencyTxn) -> Self {
         Self {
             model,
             engine,
-            txn: Some(ResidencyTxn::Suspend(txn)),
+            txn: Some(txn),
             completion: None,
         }
     }
 
-    fn restore(model: usize, engine: usize, txn: KvRestoreTxn) -> Self {
-        Self {
-            model,
-            engine,
-            txn: Some(ResidencyTxn::Restore(txn)),
-            completion: None,
-        }
-    }
-
-    fn arm(&mut self, completion: crate::scheduler::ControlCompletion) {
+    /// Submits the transaction's engine copy, if it moves anything.
+    fn submit(&mut self) -> anyhow::Result<()> {
+        let engine = self.engine;
+        let completion = match self.txn.as_ref().expect("transaction present") {
+            ResidencyTxn::Suspend(txn) if txn.page_count() > 0 => {
+                crate::scheduler::copy_d2h_tracked(engine, &txn.gpu_ids(), &txn.host_slots())?
+            }
+            ResidencyTxn::Restore(txn) if txn.page_count() > 0 => {
+                crate::scheduler::copy_h2d_tracked(engine, &txn.gpu_ids(), &txn.host_slots())?
+            }
+            ResidencyTxn::RsSuspend(txn) | ResidencyTxn::RsRestore(txn) if txn.slot_count() > 0 => {
+                let direction = match self.txn {
+                    Some(ResidencyTxn::RsSuspend(_)) => StateDirection::DeviceToHost,
+                    _ => StateDirection::HostToDevice,
+                };
+                let (src, dst) = txn.copy_plan();
+                crate::scheduler::copy_rs_tracked(engine, direction, &src, &dst)?
+            }
+            _ => return Ok(()),
+        };
         self.completion = Some(completion);
+        Ok(())
     }
 
-    fn disarm_completion(&mut self) {
+    async fn settle(&mut self) -> anyhow::Result<()> {
+        let Some(completion) = self.completion.clone() else {
+            return Ok(());
+        };
+        let copied = completion.wait().await;
         self.completion = None;
+        copied
     }
 
-    fn take_suspend(&mut self) -> KvSuspendTxn {
-        match self.txn.take().expect("suspend transaction present") {
-            ResidencyTxn::Suspend(txn) => txn,
-            ResidencyTxn::Restore(_) => unreachable!("suspend guard carries suspend txn"),
-        }
-    }
-
-    fn take_restore(&mut self) -> KvRestoreTxn {
-        match self.txn.take().expect("restore transaction present") {
-            ResidencyTxn::Restore(txn) => txn,
-            ResidencyTxn::Suspend(_) => unreachable!("restore guard carries restore txn"),
-        }
-    }
-
-    fn copy_plan(&self) -> (Vec<u32>, Vec<u32>) {
-        match self.txn.as_ref().expect("transaction present") {
-            ResidencyTxn::Suspend(txn) => (txn.gpu_ids(), txn.host_slots()),
-            ResidencyTxn::Restore(txn) => (txn.gpu_ids(), txn.host_slots()),
-        }
-    }
-
-    fn abort_now(&mut self) {
-        if let Some(txn) = self.txn.take() {
-            abort_residency_txn(self.model, self.engine, txn);
-        }
+    fn take(&mut self) -> ResidencyTxn {
+        self.txn.take().expect("transaction present")
     }
 }
 
@@ -177,7 +181,7 @@ impl Drop for ResidencyTxnGuard {
             tracing::error!(
                 model,
                 engine,
-                "KV residency transaction dropped with an engine copy in flight and no runtime; \
+                "residency transaction dropped with an engine copy in flight and no runtime; \
                  preserving its pages and slots to avoid reuse during the copy"
             );
             return;
@@ -190,6 +194,23 @@ impl Drop for ResidencyTxnGuard {
             }
         });
     }
+}
+
+/// Submits every transaction's copy, then waits them all; a failure leaves
+/// the guards to abort their transactions once their copies land.
+async fn copy_through(guards: &mut [&mut Option<ResidencyTxnGuard>]) -> Result<(), String> {
+    for guard in guards.iter_mut().filter_map(|guard| guard.as_mut()) {
+        guard
+            .submit()
+            .map_err(|error| format!("submit: {error:#}"))?;
+    }
+    for guard in guards.iter_mut().filter_map(|guard| guard.as_mut()) {
+        guard
+            .settle()
+            .await
+            .map_err(|error| format!("copy: {error:#}"))?;
+    }
+    Ok(())
 }
 
 async fn drain_detachable(pid: ProcessId) {
@@ -224,7 +245,9 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     let handles = crate::inferlet::process::residency::kv_suspend_handles(pid, model, engine);
     let working_sets: HashSet<WorkingSetId> =
         crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine);
-    if working_sets.is_empty() {
+    let rs_working_sets =
+        crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine);
+    if working_sets.is_empty() && rs_working_sets.is_empty() {
         planner.eviction_failed(pid);
         return;
     }
@@ -236,10 +259,20 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
     }
     let stores = crate::store::registry::get(model, engine);
     let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
+        if working_sets.is_empty() || kv.host_swap_capacity() == 0 {
+            return Ok(KvSuspendPrepare::Deferred(
+                SuspendDisposition::NothingReclaimable,
+            ));
+        }
         kv.prepare_suspend(&working_sets)
     });
-    let txn = match prepared {
-        Ok(KvSuspendPrepare::Prepared(txn)) => txn,
+    let mut kv = match prepared {
+        Ok(KvSuspendPrepare::Prepared(txn)) => Some(ResidencyTxnGuard::new(
+            model,
+            engine,
+            ResidencyTxn::Suspend(txn),
+        )),
+        Ok(KvSuspendPrepare::Deferred(SuspendDisposition::NothingReclaimable)) => None,
         Ok(KvSuspendPrepare::Deferred(_)) => {
             planner.eviction_failed_prepare_deferred(pid);
             return;
@@ -255,110 +288,129 @@ async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
             return;
         }
     };
-    let mut suspend = ResidencyTxnGuard::suspend(model, engine, txn);
-    let (gpu_ids, host_slots) = suspend.copy_plan();
-    let copy_started = Instant::now();
-    let completion = match crate::scheduler::copy_d2h_tracked(engine, &gpu_ids, &host_slots) {
-        Ok(completion) => completion,
+    let mut rs = match stores.rs.lock().unwrap().prepare_suspend(&rs_working_sets) {
+        Ok(txn) => {
+            txn.map(|txn| ResidencyTxnGuard::new(model, engine, ResidencyTxn::RsSuspend(txn)))
+        }
         Err(error) => {
-            suspend.abort_now();
-            tracing::warn!(pid = %pid, %error, "planner: KV D2H eviction copy rejected");
-            planner.eviction_failed(pid);
+            drop(kv);
+            tracing::warn!(pid = %pid, %error, "planner: eviction blocked on host rs slots");
+            planner.eviction_failed_host_swap_full(pid);
             return;
         }
     };
-    suspend.arm(completion.clone());
-    let copied = completion.wait().await;
-    planner.record_d2h_copy(copy_started.elapsed());
-    suspend.disarm_completion();
-    if let Err(error) = copied {
-        suspend.abort_now();
-        tracing::warn!(pid = %pid, %error, "planner: KV D2H eviction copy failed");
+    if kv.is_none() && rs.is_none() {
+        planner.eviction_failed_prepare_deferred(pid);
+        return;
+    }
+    let copy_started = Instant::now();
+    if let Err(error) = copy_through(&mut [&mut kv, &mut rs]).await {
+        tracing::warn!(pid = %pid, %error, "planner: eviction copy failed");
         planner.eviction_failed(pid);
         return;
     }
-    let txn = suspend.take_suspend();
-    let freed = crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
-        kv.commit_suspend(txn)
-    });
-    match freed {
-        Ok(freed) => {
-            fence.keep_raised();
-            planner.report_evicted(pid, freed as u32);
+    planner.record_d2h_copy(copy_started.elapsed());
+    let freed = match kv.as_mut().map(ResidencyTxnGuard::take) {
+        Some(ResidencyTxn::Suspend(txn)) => {
+            match crate::store::registry::with_kv_lock(&stores.kv, "planner-evict", |kv| {
+                kv.commit_suspend(txn)
+            }) {
+                Ok(freed) => freed,
+                Err(error) => {
+                    tracing::warn!(pid = %pid, %error, "planner: suspend commit failed");
+                    planner.eviction_failed(pid);
+                    return;
+                }
+            }
         }
-        Err(error) => {
-            tracing::warn!(pid = %pid, %error, "planner: suspend commit failed");
-            planner.eviction_failed(pid);
-        }
-    }
+        _ => 0,
+    };
+    let rs_freed = match rs.as_mut().map(ResidencyTxnGuard::take) {
+        Some(ResidencyTxn::RsSuspend(txn)) => stores.rs.lock().unwrap().commit_suspend(txn),
+        _ => 0,
+    };
+    fence.keep_raised();
+    planner.report_evicted(pid, freed as u32, rs_freed as u32);
 }
 
 async fn restore(
     planner: Arc<ResidencyPlanner>,
     pid: ProcessId,
     mut pages: super::grant::DevicePageReservation,
+    mut slots: super::grant::RsSlotReservation,
 ) {
     let (model, engine) = planner.locus();
     let working_sets: HashSet<WorkingSetId> =
         crate::inferlet::process::residency::kv_working_set_ids(pid, model, engine);
-    if working_sets.is_empty() {
-        drop(pages);
-        planner.report_restored(pid, 0);
-        return;
-    }
+    let rs_working_sets =
+        crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine);
     let stores = crate::store::registry::get(model, engine);
-    let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
-        kv.prepare_restore(&working_sets, pages.lend(super::KvPool::Paged))
-    });
-    drop(pages);
-    let txn = match prepared {
-        Ok(txn) => txn,
-        Err(error) => {
-            planner.restore_deferred(pid, &error.to_string());
-            return;
-        }
-    };
-    if txn.page_count() == 0 {
-        let committed = crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
-            kv.commit_restore(txn)
+    let mut kv = None;
+    if !working_sets.is_empty() {
+        let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
+            kv.prepare_restore(&working_sets, pages.lend(super::KvPool::Paged))
         });
-        match committed {
-            Ok(_) => planner.report_restored(pid, 0),
-            Err(error) => planner.restore_failed(pid, &error.to_string()),
+        match prepared {
+            Ok(txn) => {
+                kv = Some(ResidencyTxnGuard::new(
+                    model,
+                    engine,
+                    ResidencyTxn::Restore(txn),
+                ))
+            }
+            Err(error) => {
+                planner.restore_deferred(pid, &error.to_string());
+                return;
+            }
         }
-        return;
     }
-    let mut restore = ResidencyTxnGuard::restore(model, engine, txn);
-    let (gpu_ids, host_slots) = restore.copy_plan();
+    drop(pages);
+    let mut rs = None;
+    if !rs_working_sets.is_empty() {
+        match stores
+            .rs
+            .lock()
+            .unwrap()
+            .prepare_restore(&rs_working_sets, slots.lend())
+        {
+            Ok(txn) => {
+                rs = Some(ResidencyTxnGuard::new(
+                    model,
+                    engine,
+                    ResidencyTxn::RsRestore(txn),
+                ))
+            }
+            Err(error) => {
+                planner.restore_deferred(pid, &error.to_string());
+                return;
+            }
+        }
+    }
+    drop(slots);
     let copy_started = Instant::now();
-    let completion = match crate::scheduler::copy_h2d_tracked(engine, &gpu_ids, &host_slots) {
-        Ok(completion) => completion,
-        Err(error) => {
-            restore.abort_now();
-            planner.restore_deferred(pid, &format!("H2D submit: {error:#}"));
-            return;
-        }
-    };
-    restore.arm(completion.clone());
-    let copied = completion.wait().await;
-    planner.record_h2d_copy(copy_started.elapsed());
-    restore.disarm_completion();
-    if let Err(error) = copied {
-        restore.abort_now();
-        planner.restore_deferred(pid, &format!("H2D copy: {error}"));
+    if let Err(error) = copy_through(&mut [&mut kv, &mut rs]).await {
+        planner.restore_deferred(pid, &format!("H2D {error}"));
         return;
     }
-    let txn = restore.take_restore();
-    let restored = crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
-        kv.commit_restore(txn)
-    });
-    match restored {
-        Ok(restored) => {
-            planner.report_restored(pid, restored as u32);
-            crate::scheduler::nudge(engine);
+    planner.record_h2d_copy(copy_started.elapsed());
+    let restored = match kv.as_mut().map(ResidencyTxnGuard::take) {
+        Some(ResidencyTxn::Restore(txn)) => {
+            match crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
+                kv.commit_restore(txn)
+            }) {
+                Ok(restored) => restored,
+                Err(error) => {
+                    planner.restore_failed(pid, &error.to_string());
+                    return;
+                }
+            }
         }
-        Err(error) => {
-            planner.restore_failed(pid, &error.to_string());
-        }
-    }
+        _ => 0,
+    };
+    let rs_restored = match rs.as_mut().map(ResidencyTxnGuard::take) {
+        Some(ResidencyTxn::RsRestore(txn)) => stores.rs.lock().unwrap().commit_restore(txn),
+        _ => 0,
+    };
+    planner.report_restored(pid, restored as u32, rs_restored as u32);
+    crate::scheduler::nudge(engine);
 }

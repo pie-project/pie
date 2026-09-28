@@ -177,7 +177,19 @@ pub struct StateMove {
     pub token_count: u32,
 }
 
+/// Which pools a state copy's slot ids name: host slots index the pool
+/// `PoolFacts::host_state_slots` advertises.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateDirection {
+    #[default]
+    DeviceToDevice,
+    DeviceToHost,
+    HostToDevice,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StateCopy {
     pub moves: Vec<StateMove>,
+    #[serde(default)]
+    pub direction: StateDirection,
 }

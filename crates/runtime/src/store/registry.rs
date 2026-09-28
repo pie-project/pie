@@ -60,6 +60,7 @@ pub fn register_model(kv_page_size: u32, num_kv_pages: &[usize], num_slots: &[us
         &vec![0; num_kv_pages.len()],
         num_slots,
         &vec![0; num_kv_pages.len()],
+        &vec![0; num_kv_pages.len()],
     )
 }
 
@@ -68,6 +69,7 @@ pub fn register_model_with_swap(
     num_kv_pages: &[usize],
     num_host_pages: &[usize],
     num_slots: &[usize],
+    num_host_slots: &[usize],
     max_context: &[usize],
 ) -> usize {
     let stores: Vec<Option<Stores>> = (0..num_kv_pages.len())
@@ -78,10 +80,11 @@ pub fn register_model_with_swap(
                 rand::random::<[u8; 32]>(),
             )));
             let slots = num_slots.get(d).copied().unwrap_or(0) as u32;
+            let host_slots = num_host_slots.get(d).copied().unwrap_or(0) as u32;
             let max_context = max_context.get(d).copied().unwrap_or(0);
             Some(Stores {
                 kv,
-                rs: Arc::new(Mutex::new(RsStore::new(slots))),
+                rs: Arc::new(Mutex::new(RsStore::new_with_host(slots, host_slots))),
                 seats: Arc::new(Mutex::new(SeatBook::new(slots))),
                 seats_freed: Arc::new(tokio::sync::Notify::new()),
                 kv_page_size,

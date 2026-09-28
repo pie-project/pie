@@ -36,6 +36,47 @@ fn tests_every_case() {
     publish_batch_rejects_an_aliased_working_set();
     a_bound_driven_to_zero_is_exact_again();
     index_snapshots_state_and_is_reclaimed_when_idle();
+    a_suspend_parks_private_slots_on_host_and_restore_brings_them_back();
+}
+
+fn a_suspend_parks_private_slots_on_host_and_restore_brings_them_back() {
+    let mut s = RsStore::new_with_host(2, 2);
+    let ws = s.create_working_set(geom());
+    write_state(&mut s, ws);
+    let other = s.create_working_set(geom());
+    write_state(&mut s, other);
+    let shared = s.fork(other).unwrap();
+    let set = |ws| std::collections::HashSet::from([ws]);
+
+    let txn = s
+        .prepare_suspend(&set(ws))
+        .unwrap()
+        .expect("a private slot moves");
+    assert_eq!(txn.copy_plan(), (vec![0], vec![0]));
+    assert_eq!(s.commit_suspend(txn), 1);
+    assert_eq!(s.available_slots(), 1);
+    assert_eq!(s.update_index(b"k".to_vec(), ws), Ok(0));
+    assert_eq!(
+        s.from_index(b"k"),
+        Ok(None),
+        "a suspended state is not indexed"
+    );
+    let child = s.fork(ws).unwrap();
+    assert!(
+        s.prepare_suspend(&set(shared)).unwrap().is_none(),
+        "a slot a fork shares stays on device"
+    );
+
+    let both = std::collections::HashSet::from([ws, child]);
+    assert_eq!(s.swapped_slots(&both), 1, "the fork shares the parked slot");
+    let mut granted = s.reserve_slots(1).unwrap();
+    let txn = s.prepare_restore(&both, &mut granted).unwrap();
+    assert_eq!(txn.copy_plan(), (vec![0], vec![0]));
+    assert_eq!(s.commit_restore(txn), 1);
+    assert_eq!((s.swapped_slots(&both), s.host_available()), (0, 2));
+    assert_eq!(s.folded_slot(ws), s.folded_slot(child));
+    s.release_working_set(child, s.current_epoch());
+    write_state(&mut s, ws);
 }
 
 fn index_snapshots_state_and_is_reclaimed_when_idle() {

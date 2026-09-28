@@ -50,6 +50,9 @@ pub struct PoolFacts {
     /// Host pages kv can be suspended into by `kv_copy`.
     #[serde(default)]
     pub host_kv_pages: u32,
+    /// Host rs slots a `StateCopy` may name; zero when states cannot leave the device.
+    #[serde(default)]
+    pub host_state_slots: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

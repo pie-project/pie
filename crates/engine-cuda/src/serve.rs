@@ -68,6 +68,8 @@ pub struct Shell {
     arena: Arena,
     pools: Pools,
     buffers: Option<Buffers>,
+    /// Which rows, state and buffered page, each host rs slot saved.
+    host_saved: Vec<(bool, bool)>,
     rs_scratch: Option<crate::device::Buffer>,
     predicate: crate::store::rs::Predicate,
     inputs: Inputs,
@@ -118,6 +120,58 @@ impl Shell {
         self.device.synchronize()
     }
 
+    /// Host rs slots, one per device slot so every slot can be parked once.
+    #[must_use]
+    pub fn host_state_slots(&self) -> u32 {
+        self.pools.host_rows().0
+    }
+
+    fn state_row_bytes(&self) -> u64 {
+        self.pools.state_slot_bytes() + self.buffers.as_ref().map_or(0, Buffers::slot_bytes)
+    }
+
+    /// Moves whole rs slots, `(device, host)` pairs, out to host rows or back.
+    pub fn copy_state_host(&mut self, to_host: bool, moves: &[(u32, u32)]) -> Result<()> {
+        let stream = self.device.stream();
+        let state_bytes = self.pools.state_slot_bytes();
+        for &(slot, host) in moves {
+            let base = self.pools.host_row(host)?;
+            let at = host as usize;
+            if self.host_saved.len() <= at {
+                self.host_saved.resize(at + 1, (false, false));
+            }
+            if to_host {
+                let spans = self.pools.state_spans(slot, false)?;
+                let page = self.buffers.as_ref().and_then(|b| b.page_span(slot));
+                let mut offset = 0;
+                for &(span, bytes) in &spans {
+                    crate::device::copy_any(stream, base + offset, span, bytes as usize)?;
+                    offset += bytes;
+                }
+                if let Some((span, bytes)) = page {
+                    crate::device::copy_any(stream, base + state_bytes, span, bytes as usize)?;
+                }
+                self.host_saved[at] = (!spans.is_empty(), page.is_some());
+                continue;
+            }
+            let (state, buffer) = self.host_saved[at];
+            if state {
+                let mut offset = 0;
+                for (span, bytes) in self.pools.state_spans(slot, true)? {
+                    crate::device::copy_any(stream, span, base + offset, bytes as usize)?;
+                    offset += bytes;
+                }
+            }
+            if buffer && let Some(buffers) = self.buffers.as_mut() {
+                buffers.ensure(&mut self.pools, slot + 1)?;
+                if let Some((span, bytes)) = buffers.page_span(slot) {
+                    crate::device::copy_any(stream, span, base + state_bytes, bytes as usize)?;
+                }
+            }
+        }
+        self.device.synchronize()
+    }
+
     /// Copies full pages and token cells in the full kv rows. A windowed
     /// row's pages are named by the fire that reads them, so cells moved
     /// between pages here would leave its copy behind.
@@ -132,11 +186,23 @@ impl Shell {
         self.pools.copy_kv(self.device.stream(), moves, &[])
     }
 
-    /// Pins the host kv pages `stated` (or the default) allows one of `ranks`.
+    /// Pins the host kv pages `stated` (or the default) allows one of `ranks`,
+    /// after one host rs row per device slot, which the budget pays first.
     pub fn seat_host_kv(&mut self, stated: Option<u64>, ranks: u32) -> Result<u32> {
-        let headroom = crate::weights::available_memory();
+        let rows = if self.pools.has_state() || self.buffers.is_some() {
+            self.pools.paging().slots
+        } else {
+            0
+        };
+        let row = self.state_row_bytes();
+        let rs_bytes = u64::from(rows) * row * u64::from(ranks.max(1));
+        let (rows, rs_bytes) = match stated {
+            Some(bytes) if bytes < rs_bytes => (0, 0),
+            _ => (rows, rs_bytes),
+        };
+        let headroom = crate::weights::available_memory().saturating_sub(rs_bytes);
         let (pages, asked) = crate::store::host_kv_pages(
-            stated,
+            stated.map(|bytes| bytes - rs_bytes),
             headroom,
             ranks,
             self.pools.paging().pages(),
@@ -149,7 +215,7 @@ impl Shell {
                 headroom >> 20,
             );
         }
-        self.pools.seat_host(pages)?;
+        self.pools.seat_host(pages, rows, row)?;
         Ok(self.pools.host_pages())
     }
 

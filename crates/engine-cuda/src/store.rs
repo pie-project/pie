@@ -469,11 +469,13 @@ pub struct Pools {
 
 /// The pinned host pages kv is suspended into. Each paged plane keeps its
 /// host pages side by side, as its device arena does, so a run of pages
-/// moves in one copy.
+/// moves in one copy; the host rs rows follow them.
 #[derive(Debug)]
 struct HostKv {
     buffer: crate::device::Pinned,
     pages: u32,
+    rows: u32,
+    row_bytes: u64,
 }
 
 impl Pools {
@@ -1138,6 +1140,31 @@ impl Pools {
         Ok(())
     }
 
+    /// The state rows of `slot`, backed first when `commit`; none when the
+    /// load keeps no state or the slot was never backed.
+    pub fn state_spans(&mut self, slot: u32, commit: bool) -> Result<Vec<(u64, u64)>> {
+        if !slab_row(self.has_state(), self.paging.slots, slot)? {
+            return Ok(Vec::new());
+        }
+        if commit {
+            self.ensure_state(slot + 1)?;
+        } else if slot >= self.committed_state_slots {
+            return Ok(Vec::new());
+        }
+        let mut spans = Vec::new();
+        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
+            let Shape::State { stride, dtype } = *shape else {
+                continue;
+            };
+            let Some(arena) = planes.first() else {
+                continue;
+            };
+            let bytes = stride * u64::from(elem_size(dtype));
+            spans.push((arena.span(u64::from(slot) * bytes, bytes)?, bytes));
+        }
+        Ok(spans)
+    }
+
     /// Copies `moves` in the full rows and `windowed` (whole pages) in the
     /// windowed ones, whose page ids are their own.
     pub fn copy_kv(
@@ -1242,16 +1269,45 @@ impl Pools {
         self.paged_planes().iter().map(|&(_, bytes)| bytes).sum()
     }
 
-    /// Pins `pages` host kv pages; zero seats none.
-    pub fn seat_host(&mut self, pages: u32) -> Result<()> {
-        let bytes = u64::from(pages) * self.paged_page_bytes();
+    /// Pins `pages` host kv pages and `rows` host rs rows of `row_bytes`.
+    pub fn seat_host(&mut self, pages: u32, rows: u32, row_bytes: u64) -> Result<()> {
+        let rows = if row_bytes == 0 { 0 } else { rows };
+        let bytes = u64::from(pages) * self.paged_page_bytes() + u64::from(rows) * row_bytes;
         self.host = (bytes > 0)
             .then(|| {
                 crate::device::Pinned::mapped_uninit(usize::try_from(bytes).unwrap_or(usize::MAX))
-                    .map(|buffer| HostKv { buffer, pages })
+                    .map(|buffer| HostKv {
+                        buffer,
+                        pages,
+                        rows,
+                        row_bytes,
+                    })
             })
             .transpose()?;
         Ok(())
+    }
+
+    /// The host rs rows seated and the bytes of one.
+    #[must_use]
+    pub fn host_rows(&self) -> (u32, u64) {
+        self.host
+            .as_ref()
+            .map_or((0, 0), |host| (host.rows, host.row_bytes))
+    }
+
+    /// The host address of rs row `row`.
+    pub fn host_row(&self, row: u32) -> Result<u64> {
+        let (rows, row_bytes) = self.host_rows();
+        match self.host.as_ref() {
+            Some(host) if row < rows => Ok(host.buffer.host() as u64
+                + u64::from(host.pages) * self.paged_page_bytes()
+                + u64::from(row) * row_bytes),
+            _ => Err(Fault::Ceiling {
+                what: "host rs rows",
+                need: u64::from(row) + 1,
+                have: u64::from(rows),
+            }),
+        }
     }
 
     #[must_use]

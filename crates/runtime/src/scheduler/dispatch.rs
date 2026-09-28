@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ::engine::transfer::{KvMove, MemoryDomain, StateMove};
+use ::engine::transfer::{KvMove, MemoryDomain, StateDirection, StateMove};
 use anyhow::Result;
 use eta_ir::registry::GeometryClass;
 
@@ -14,6 +14,7 @@ use crate::engine::{
     ProgramId, SubmissionCompletion,
 };
 
+use super::worker::PreLaunchCopy;
 use super::{ProcessId, scheduler_handle};
 
 pub(crate) async fn register_program(
@@ -255,13 +256,13 @@ pub(crate) fn copy_d2h_tracked(
     gpu_phys_ids: &[u32],
     cpu_pages: &[u32],
 ) -> Result<super::ControlCompletion> {
-    scheduler_handle(engine_idx)?.copy_kv_tracked(KvCopy {
+    scheduler_handle(engine_idx)?.copy_tracked(PreLaunchCopy::Kv(KvCopy {
         src: super::device_domain(engine_idx),
         dst: MemoryDomain::HostPinned,
         src_page_ids: gpu_phys_ids.to_vec(),
         dst_page_ids: cpu_pages.to_vec(),
         moves: Vec::new(),
-    })
+    }))
 }
 
 pub(crate) async fn copy_h2d(
@@ -285,13 +286,32 @@ pub(crate) fn copy_h2d_tracked(
     gpu_phys_ids: &[u32],
     cpu_pages: &[u32],
 ) -> Result<super::ControlCompletion> {
-    scheduler_handle(engine_idx)?.copy_kv_tracked(KvCopy {
+    scheduler_handle(engine_idx)?.copy_tracked(PreLaunchCopy::Kv(KvCopy {
         src: MemoryDomain::HostPinned,
         dst: super::device_domain(engine_idx),
         src_page_ids: cpu_pages.to_vec(),
         dst_page_ids: gpu_phys_ids.to_vec(),
         moves: Vec::new(),
-    })
+    }))
+}
+
+/// Moves whole rs slots between the device and the engine's host rs pool.
+pub(crate) fn copy_rs_tracked(
+    engine_idx: EngineId,
+    direction: StateDirection,
+    src_slots: &[u32],
+    dst_slots: &[u32],
+) -> Result<super::ControlCompletion> {
+    let moves = src_slots
+        .iter()
+        .zip(dst_slots)
+        .map(|(&src_slot_id, &dst_slot_id)| StateMove {
+            src_slot_id,
+            dst_slot_id,
+            ..StateMove::default()
+        })
+        .collect();
+    scheduler_handle(engine_idx)?.copy_tracked(PreLaunchCopy::State(StateCopy { moves, direction }))
 }
 
 pub(crate) async fn copy_d2d(
@@ -358,6 +378,9 @@ pub(crate) async fn copy_rs_d2d(
         })
         .collect();
     scheduler_handle(engine_idx)?
-        .copy_state(StateCopy { moves: slot_ranges })
+        .copy_state(StateCopy {
+            moves: slot_ranges,
+            ..StateCopy::default()
+        })
         .await
 }

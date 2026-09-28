@@ -762,6 +762,7 @@ impl Shell {
             arena,
             pools,
             buffers,
+            host_saved: Vec::new(),
             rs_scratch: None,
             predicate,
             inputs,

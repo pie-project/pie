@@ -37,5 +37,5 @@ pub use program::{
 };
 pub use transfer::{
     KvCopy, KvExport, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, StateCopy,
-    StateMove,
+    StateDirection, StateMove,
 };

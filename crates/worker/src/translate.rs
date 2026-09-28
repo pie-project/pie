@@ -96,6 +96,7 @@ fn build_model(
                 rs_cache_required: g.caps.pools.state_slots != 0,
                 rs_cache_slots: g.caps.pools.state_slots as usize,
                 rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
+                rs_host_slots: g.caps.pools.host_state_slots as usize,
                 has_mtp_logits: g.caps.profile.has_mtp_logits,
                 mtp_depth: g.caps.profile.mtp_depth,
                 draft_block: g.caps.profile.draft_block,

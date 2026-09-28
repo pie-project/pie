@@ -40,6 +40,7 @@ pub trait PoolPort: Send + Sync + 'static {
     fn device_stats(&self, pool: KvPool) -> (u32, u32);
     fn host_stats(&self) -> (u32, u32);
     fn rs_stats(&self) -> (u32, u32);
+    fn rs_host_stats(&self) -> (u32, u32);
     fn reclaim_idle(&self) -> u32;
     fn suspend_capable(&self) -> bool;
     fn locus(&self) -> (usize, usize);
@@ -108,6 +109,10 @@ impl PoolPort for RegistryPool {
 
     fn rs_stats(&self) -> (u32, u32) {
         self.with_rs(|rs| (rs.available_slots() as u32, rs.capacity_slots()))
+    }
+
+    fn rs_host_stats(&self) -> (u32, u32) {
+        self.with_rs(|rs| (rs.host_available() as u32, rs.host_capacity()))
     }
 
     fn reclaim_idle(&self) -> u32 {
@@ -353,6 +358,8 @@ pub struct PlannerStats {
     pub host_swap_unblocks: AtomicU64,
     pub d2h_pages: AtomicU64,
     pub h2d_pages: AtomicU64,
+    pub d2h_rs_slots: AtomicU64,
+    pub h2d_rs_slots: AtomicU64,
     pub d2h_copy_us: AtomicU64,
     pub h2d_copy_us: AtomicU64,
 }
@@ -408,6 +415,8 @@ pub struct PlannerDiagnostics {
     pub host_swap_unblocks_total: u64,
     pub d2h_pages_total: u64,
     pub h2d_pages_total: u64,
+    pub d2h_rs_slots_total: u64,
+    pub h2d_rs_slots_total: u64,
     pub d2h_copy_us_total: u64,
     pub h2d_copy_us_total: u64,
     pub runway_rounds_total: u64,
@@ -510,8 +519,19 @@ impl Waiter {
 
 type EntryKey = (u64, u64);
 
+#[derive(Clone, Copy)]
 struct EvictionMark {
     pages: u32,
+    rs_slots: u32,
+}
+
+impl EvictionMark {
+    fn kv(picks: Vec<(ProcessId, u32)>) -> Vec<(ProcessId, EvictionMark)> {
+        picks
+            .into_iter()
+            .map(|(pid, pages)| (pid, EvictionMark { pages, rs_slots: 0 }))
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -1507,7 +1527,9 @@ impl ResidencyPlanner {
                             Some(slots) => RsSlotReservation::new(slots, self.port.clone()),
                             None if self.reclaim_idle_once() => continue,
                             None => {
-                                self.check_rs_starvation(key, demand);
+                                if !self.plan_rs_eviction(key, demand.rs_slots) {
+                                    self.check_rs_starvation(key, demand);
+                                }
                                 return;
                             }
                         }
@@ -1573,6 +1595,18 @@ impl ResidencyPlanner {
                 Step::ServeRestore { key, pid } => {
                     let (model, engine) = self.port.locus();
                     let swapped = swapped_page_count(pid, model, engine);
+                    let swapped_rs = swapped_rs_slot_count(pid, model, engine);
+                    let slots = if swapped_rs == 0 {
+                        RsSlotReservation::empty()
+                    } else if let Some(slots) = self.port.reserve_rs(swapped_rs) {
+                        RsSlotReservation::new(slots, self.port.clone())
+                    } else if self.reclaim_idle_once() {
+                        continue;
+                    } else {
+                        self.with_inner(|inner| inner.completion_credit += 1);
+                        self.plan_rs_eviction(key, swapped_rs);
+                        return;
+                    };
                     let boarded = self.with_inner(|inner| {
                         match inner.unmet_head() {
                             Some((head, _)) if head == key => {}
@@ -1604,7 +1638,7 @@ impl ResidencyPlanner {
                     });
                     match boarded {
                         Board::Go(pages) => {
-                            exec::spawn_restore(self.clone(), pid, pages);
+                            exec::spawn_restore(self.clone(), pid, pages, slots);
                             continue;
                         }
                         Board::Replan => continue,
@@ -1727,7 +1761,12 @@ impl ResidencyPlanner {
             }
             return;
         }
-        self.commit_evictions(victims.head, picks, false, victims.runway_grab);
+        self.commit_evictions(
+            victims.head,
+            EvictionMark::kv(picks),
+            false,
+            victims.runway_grab,
+        );
     }
 
     fn plan_runway(self: &Arc<Self>) {
@@ -1804,7 +1843,13 @@ impl ResidencyPlanner {
                     continue;
                 }
                 proc.state = Residency::Evicting;
-                inner.evicting.insert(pid, EvictionMark { pages: expected });
+                inner.evicting.insert(
+                    pid,
+                    EvictionMark {
+                        pages: expected,
+                        rs_slots: 0,
+                    },
+                );
                 pages += u64::from(expected);
                 spawned.push(pid);
                 for waiter in inner.queue.values_mut().filter(|w| w.pid == pid) {
@@ -1898,7 +1943,7 @@ impl ResidencyPlanner {
     fn commit_evictions(
         self: &Arc<Self>,
         head_key: EntryKey,
-        picks: Vec<(ProcessId, u32)>,
+        picks: Vec<(ProcessId, EvictionMark)>,
         e6_relaxed: bool,
         runway_grab: u32,
     ) -> bool {
@@ -1920,7 +1965,7 @@ impl ResidencyPlanner {
                     continue;
                 }
                 proc.state = Residency::Evicting;
-                inner.evicting.insert(pid, EvictionMark { pages: expected });
+                inner.evicting.insert(pid, expected);
                 spawned.push(pid);
                 for waiter in inner.queue.values_mut().filter(|w| w.pid == pid) {
                     if let WaitKind::Allocation {
@@ -2064,7 +2109,7 @@ impl ResidencyPlanner {
         let (Some(head), false) = (head, picks.is_empty()) else {
             return false;
         };
-        if !self.commit_evictions(head, picks, true, 0) {
+        if !self.commit_evictions(head, EvictionMark::kv(picks), true, 0) {
             return false;
         }
         self.stats.e6_relaxations.fetch_add(1, Ordering::Relaxed);
@@ -2161,6 +2206,64 @@ impl ResidencyPlanner {
                 false
             }
         }
+    }
+
+    /// Frees rs slots for the head by suspending younger resident processes'
+    /// slots to host. Returns whether evictions are in flight to wait on.
+    fn plan_rs_eviction(self: &Arc<Self>, head_key: EntryKey, need: u32) -> bool {
+        let (host_free, host_total) = self.port.rs_host_stats();
+        if host_total == 0 {
+            return false;
+        }
+        let (free, _) = self.port.rs_stats();
+        let Some((deficit, members)) = self.with_inner(|inner| {
+            let expected: u32 = inner.evicting.values().map(|mark| mark.rs_slots).sum();
+            let deficit = need.saturating_sub(free.saturating_add(expected));
+            let members: Vec<(ProcessId, u64)> = inner
+                .procs
+                .iter()
+                // A process still waiting for admission holds the slots its
+                // prefill took, and nothing returns them before it runs.
+                .filter(|(pid, proc)| {
+                    proc.progressed
+                        && proc.seq > head_key.0
+                        && proc.state == Residency::Resident
+                        && !inner.host_swap_blocked.contains(*pid)
+                        && !inner.prepare_blocked.contains(*pid)
+                })
+                .map(|(pid, proc)| (*pid, proc.seq))
+                .collect();
+            (deficit == 0 || !members.is_empty()).then_some((deficit, members))
+        }) else {
+            return false;
+        };
+        if deficit == 0 {
+            return true;
+        }
+        let (model, engine) = self.port.locus();
+        let mut members = members;
+        members.sort_by_key(|&(_, seq)| std::cmp::Reverse(seq));
+        let mut picks = Vec::new();
+        let (mut covered, mut room) = (0u32, host_free);
+        for (pid, _) in members {
+            if covered >= deficit {
+                break;
+            }
+            let slots = suspendable_rs_slot_count(pid, model, engine);
+            if slots == 0 || slots > room {
+                continue;
+            }
+            room -= slots;
+            covered += slots;
+            picks.push((
+                pid,
+                EvictionMark {
+                    pages: 0,
+                    rs_slots: slots,
+                },
+            ));
+        }
+        !picks.is_empty() && self.commit_evictions(head_key, picks, false, 0)
     }
 
     fn check_rs_starvation(self: &Arc<Self>, key: EntryKey, demand: Demand) {
@@ -2415,7 +2518,7 @@ impl ResidencyPlanner {
         true
     }
 
-    fn report_evicted(self: &Arc<Self>, pid: ProcessId, freed: u32) {
+    fn report_evicted(self: &Arc<Self>, pid: ProcessId, freed: u32, rs_freed: u32) {
         self.with_inner(|inner| {
             inner.settle_eviction(pid);
             let Some(proc) = inner.procs.get_mut(&pid) else {
@@ -2437,6 +2540,9 @@ impl ResidencyPlanner {
         self.stats
             .d2h_pages
             .fetch_add(u64::from(freed), Ordering::Relaxed);
+        self.stats
+            .d2h_rs_slots
+            .fetch_add(u64::from(rs_freed), Ordering::Relaxed);
         self.re_arm_idle_reclaim();
         self.poke();
     }
@@ -2500,7 +2606,7 @@ impl ResidencyPlanner {
         }
     }
 
-    fn report_restored(self: &Arc<Self>, pid: ProcessId, restored: u32) {
+    fn report_restored(self: &Arc<Self>, pid: ProcessId, restored: u32, rs_restored: u32) {
         self.clear_host_swap_blocks();
         let (model, engine) = self.port.locus();
         for handle in crate::inferlet::process::residency::kv_suspend_handles(pid, model, engine) {
@@ -2519,6 +2625,9 @@ impl ResidencyPlanner {
         self.stats
             .h2d_pages
             .fetch_add(u64::from(restored), Ordering::Relaxed);
+        self.stats
+            .h2d_rs_slots
+            .fetch_add(u64::from(rs_restored), Ordering::Relaxed);
         if let Some(signal) = signal {
             signal.notify_waiters();
         }
@@ -2730,6 +2839,8 @@ impl ResidencyPlanner {
             host_swap_unblocks_total: self.stats.host_swap_unblocks.load(Relaxed),
             d2h_pages_total: self.stats.d2h_pages.load(Relaxed),
             h2d_pages_total: self.stats.h2d_pages.load(Relaxed),
+            d2h_rs_slots_total: self.stats.d2h_rs_slots.load(Relaxed),
+            h2d_rs_slots_total: self.stats.h2d_rs_slots.load(Relaxed),
             d2h_copy_us_total: self.stats.d2h_copy_us.load(Relaxed),
             h2d_copy_us_total: self.stats.h2d_copy_us.load(Relaxed),
             runway_rounds_total: self.stats.runway_rounds.load(Relaxed),
@@ -2847,6 +2958,30 @@ fn held_page_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
 }
 
 fn held_rs_slot_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
+    rs_slot_count(pid, model, engine, |rs, ws| {
+        rs.held_slots(ws.iter().copied())
+    })
+}
+
+fn swapped_rs_slot_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
+    rs_slot_count(pid, model, engine, crate::store::rs::RsStore::swapped_slots)
+}
+
+fn suspendable_rs_slot_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
+    rs_slot_count(
+        pid,
+        model,
+        engine,
+        crate::store::rs::RsStore::suspendable_slots,
+    )
+}
+
+fn rs_slot_count(
+    pid: ProcessId,
+    model: usize,
+    engine: usize,
+    count: impl FnOnce(&crate::store::rs::RsStore, &HashSet<crate::store::rs::RsWorkingSetId>) -> usize,
+) -> u32 {
     let working_sets = crate::inferlet::process::residency::rs_working_set_ids(pid, model, engine);
     if working_sets.is_empty() {
         return 0;
@@ -2854,8 +2989,8 @@ fn held_rs_slot_count(pid: ProcessId, model: usize, engine: usize) -> u32 {
     let Some(stores) = crate::store::registry::try_get(model, engine) else {
         return 0;
     };
-    let held = stores.rs.lock().unwrap().held_slots(working_sets);
-    u32::try_from(held).unwrap_or(u32::MAX)
+    let slots = count(&stores.rs.lock().unwrap(), &working_sets);
+    u32::try_from(slots).unwrap_or(u32::MAX)
 }
 
 fn kv_page_count(
@@ -3122,6 +3257,9 @@ mod starvation_race_tests {
         fn rs_stats(&self) -> (u32, u32) {
             self.with_rs(|rs| (rs.available_slots() as u32, rs.capacity_slots()))
                 .unwrap_or((0, 0))
+        }
+        fn rs_host_stats(&self) -> (u32, u32) {
+            (0, 0)
         }
         fn reclaim_idle(&self) -> u32 {
             0
@@ -3416,7 +3554,13 @@ mod starvation_race_tests {
 
         let mark = ProcessId::new_v4();
         planner.with_inner(|inner| {
-            inner.evicting.insert(mark, EvictionMark { pages: 1 });
+            inner.evicting.insert(
+                mark,
+                EvictionMark {
+                    pages: 1,
+                    rs_slots: 0,
+                },
+            );
         });
         assert!(
             !planner.supply_stalled(),

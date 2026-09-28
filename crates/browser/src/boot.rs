@@ -326,6 +326,7 @@ fn load_engine(
         rs_cache_required: caps.pools.state_slots != 0,
         rs_cache_slots: caps.pools.state_slots as usize,
         rs_cache_slot_bytes: caps.pools.state_slot_bytes,
+        rs_host_slots: caps.pools.host_state_slots as usize,
         has_mtp_logits: caps.profile.has_mtp_logits,
         mtp_depth: caps.profile.mtp_depth,
         draft_block: caps.profile.draft_block,

@@ -130,6 +130,7 @@ pub struct EngineConfig {
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
+    pub rs_host_slots: usize,
     pub has_mtp_logits: bool,
     pub mtp_depth: u32,
     pub draft_block: u32,
@@ -313,6 +314,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_rs_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_cache_slots).collect();
+    let arena_rs_host_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_host_slots).collect();
     let arena_windows: Vec<(u32, u32)> = engine_configs
         .iter()
         .map(|d| (d.window_tokens, d.window_pages))
@@ -346,6 +348,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &arena_kv_pages,
         &arena_cpu_pages,
         &arena_rs_slots,
+        &arena_rs_host_slots,
         &arena_max_context,
     );
     for (engine, &(tokens, pages)) in arena_windows.iter().enumerate() {
@@ -385,7 +388,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
                      runway={}/{} \
                      lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
-                     d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
+                     d2h_pages={} h2d_pages={} d2h_rs={} h2d_rs={} d2h_ms={} h2d_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
                      runners=[{}]",
                     d.queue.len(),
@@ -427,6 +430,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     lk_hmax,
                     d.d2h_pages_total,
                     d.h2d_pages_total,
+                    d.d2h_rs_slots_total,
+                    d.h2d_rs_slots_total,
                     d.d2h_copy_us_total / 1000,
                     d.h2d_copy_us_total / 1000,
                     d.proc_states[0],

@@ -14,7 +14,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
+use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
 use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
 use model_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
@@ -850,6 +850,12 @@ impl Engine for Metal {
     }
 
     fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
+        if copy.direction != StateDirection::DeviceToDevice {
+            return Err(Error::Unsupported {
+                verb: "`copy_state` to or from host slots, which this load does not reserve",
+                engine: "metal",
+            });
+        }
         for (at, move_) in copy.moves.iter().enumerate() {
             if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
                 return Err(Error::Invalid(format!(

@@ -387,8 +387,14 @@ impl Engine for Group {
             .map(|loaded| loaded.caps.pools.host_kv_pages)
             .min()
             .unwrap_or(0);
+        let host_state_slots = answers
+            .iter()
+            .map(|loaded| loaded.caps.pools.host_state_slots)
+            .min()
+            .unwrap_or(0);
         for loaded in &mut answers {
             loaded.caps.pools.host_kv_pages = host_kv_pages;
+            loaded.caps.pools.host_state_slots = host_state_slots;
             loaded.caps.kv_copy.device_to_host &= host_kv_pages > 0;
             loaded.caps.kv_copy.host_to_device &= host_kv_pages > 0;
         }

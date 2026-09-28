@@ -14,7 +14,7 @@ use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, L
 use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
+use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
 use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
 use model_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
@@ -581,6 +581,7 @@ intended for diagnostics, not serving",
                 }),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
                 host_kv_pages,
+                host_state_slots: shell.host_state_slots(),
             },
             limits: FireLimits {
                 max_lanes: shell.budget().max_lanes,
@@ -869,12 +870,30 @@ intended for diagnostics, not serving",
             }
         }
         let shell = self.loaded_mut()?;
-        for move_ in &copy.moves {
-            shell
-                .copy_state(move_.src_slot_id, move_.dst_slot_id)
-                .map_err(fault)?;
-        }
-        Ok(())
+        let to_host = match copy.direction {
+            StateDirection::DeviceToDevice => {
+                for move_ in &copy.moves {
+                    shell
+                        .copy_state(move_.src_slot_id, move_.dst_slot_id)
+                        .map_err(fault)?;
+                }
+                return Ok(());
+            }
+            StateDirection::DeviceToHost => true,
+            StateDirection::HostToDevice => false,
+        };
+        let moves: Vec<(u32, u32)> = copy
+            .moves
+            .iter()
+            .map(|m| {
+                if to_host {
+                    (m.src_slot_id, m.dst_slot_id)
+                } else {
+                    (m.dst_slot_id, m.src_slot_id)
+                }
+            })
+            .collect();
+        shell.copy_state_host(to_host, &moves).map_err(fault)
     }
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
