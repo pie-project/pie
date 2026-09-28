@@ -533,7 +533,10 @@ async fn run_one(
             .await
             .with_context(|| format!("drain prefill chunk @{base}"))?;
         if let Some(rs) = rs_ws.first().filter(|_| cuts.contains(&end)) {
-            states.push((end, rs.fork(&pipe).context("snapshot prefill state")?));
+            prefixes
+                .publish_state(rs, &prompt_vec[..end as usize])
+                .context("publish prefill state")?;
+            states.push(end);
         }
     }
 

@@ -556,8 +556,11 @@ fn rs_slot_demand(
     if ids.is_empty() {
         return Ok(0);
     }
-    let store = stores.rs.lock().unwrap();
-    let demand = rs::demand(&store, ids, plan)?;
+    let mut store = stores.rs.lock().unwrap();
+    let mut demand = rs::demand(&store, ids, plan)?;
+    if demand > store.available_slots() && store.yield_indexes(ids) > 0 {
+        demand = rs::demand(&store, ids, plan)?;
+    }
     u32::try_from(demand).map_err(|_| "pipeline: RS demand exceeds the contention ABI".to_string())
 }
 

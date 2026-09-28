@@ -61,7 +61,7 @@ impl PrefixCache {
     }
 
     /// The positions past `from` a hybrid prefill must end a chunk at and
-    /// hand `publish` the state of: `structure` (e.g. message ends) floored to
+    /// hand `publish_state` the state of: `structure` (e.g. message ends) floored to
     /// pages, else pages 1, 2, 4, 8, ..., so O(log n) snapshots still reuse
     /// at least half of any shared prefix. Empty for an attention model.
     pub fn boundaries(&self, tokens: &[u32], from: u32, structure: Option<&[u32]>) -> Vec<u32> {
@@ -135,14 +135,13 @@ impl PrefixCache {
     }
 
     /// Publishes the prefill of `tokens` past the first `from`: every full
-    /// page on an attention model, else each `(boundary, state)` in `states`,
-    /// the state an `rs.fork` taken once the chunk ending there had landed.
-    /// `ws` must hold exactly the model's KV of `tokens` from a settled,
-    /// unmasked prefill.
+    /// page on an attention model, else the KV of each boundary in `states`,
+    /// whose state `publish_state` published. `ws` must hold exactly the
+    /// model's KV of `tokens` from a settled, unmasked prefill.
     pub fn publish(
         &self,
         ws: &WorkingSet,
-        states: &[(u32, RsWorkingSet)],
+        states: &[u32],
         on: &Pipeline,
         tokens: &[u32],
         from: u32,
@@ -161,13 +160,24 @@ impl PrefixCache {
                 }
             }
             Mode::Boundaries => {
-                for (b, state) in states {
-                    let k = b / self.page_size;
-                    state.update_index(&keys[k as usize - 1])?;
-                    kv(k)?;
+                for b in states {
+                    kv(b / self.page_size)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Publishes the recurrent state at `tokens`, which end at one of
+    /// `boundaries`, as soon as the chunk ending there has landed; `publish`
+    /// adds its KV once the whole prefill has, as a slice taken earlier would
+    /// make every later prefill page a copy. The snapshot belongs to the
+    /// index, not to this process, so idle reclaim can take it back.
+    pub fn publish_state(&self, rs: &RsWorkingSet, tokens: &[u32]) -> Result<(), String> {
+        if self.mode != Mode::Boundaries {
+            return Ok(());
+        }
+        let k = tokens.len() as u32 / self.page_size;
+        rs.update_index(&self.keys(tokens, k)[k as usize - 1])
     }
 }

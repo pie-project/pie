@@ -88,8 +88,6 @@ pub enum RsError {
     GrantMismatch { required: usize, granted: usize },
     #[error("rs index key must be 1..={max} bytes", max = crate::store::kv::MAX_INDEX_KEY_BYTES)]
     BadIndexKey,
-    #[error("rs working set cannot be indexed while a fire still writes its state")]
-    IndexInFlight,
     #[error("rs working set is suspended to host")]
     Suspended,
 }
@@ -287,17 +285,8 @@ impl RsStore {
     /// snapshot freed.
     pub fn update_index(&mut self, key: Vec<u8>, ws: RsWorkingSetId) -> Result<usize, RsError> {
         Self::validate_index_key(&key)?;
-        let held: HashSet<RsSlotId> = Self::slots(self.entry(ws)?).collect();
-        if held.iter().any(|&id| self.is_host(id)) {
+        if Self::slots(self.entry(ws)?).any(|id| self.is_host(id)) {
             return Err(RsError::Suspended);
-        }
-        if self
-            .outstanding
-            .values()
-            .flatten()
-            .any(|id| held.contains(id))
-        {
-            return Err(RsError::IndexInFlight);
         }
         let snapshot = self.fork(ws)?;
         Ok(match self.indexes.insert(key, snapshot) {
@@ -312,9 +301,17 @@ impl RsStore {
     )]
     pub fn from_index(&mut self, key: &[u8]) -> Result<Option<RsWorkingSetId>, RsError> {
         Self::validate_index_key(key)?;
+        // A snapshot a fire still writes is not readable yet: it misses until
+        // that fire settles, so publishing never waits on one.
+        let settled = |snapshot: &RsWorkingSetId| {
+            self.working_sets.get(*snapshot).is_some_and(|entry| {
+                !Self::slots(entry).any(|id| self.outstanding.values().flatten().any(|w| *w == id))
+            })
+        };
         self.indexes
             .get(key)
             .copied()
+            .filter(settled)
             .map(|snapshot| self.fork(snapshot))
             .transpose()
     }
@@ -325,6 +322,32 @@ impl RsStore {
             Some(snapshot) => (true, self.release_working_set(snapshot, self.seq)),
             None => (false, 0),
         })
+    }
+
+    /// Drops the snapshots sharing a slot with `working_sets`, so their next
+    /// write lands in place instead of copying to a slot the pool lacks: a
+    /// cache entry never makes live work wait. Returns how many were dropped.
+    pub fn yield_indexes(&mut self, working_sets: &[RsWorkingSetId]) -> usize {
+        let held: HashSet<RsSlotId> = working_sets
+            .iter()
+            .filter_map(|&ws| self.working_sets.get(ws))
+            .flat_map(Self::slots)
+            .collect();
+        let entries = &self.working_sets;
+        let mut dropped = Vec::new();
+        self.indexes.retain(|_, snapshot| {
+            let shares = entries
+                .get(*snapshot)
+                .is_some_and(|entry| Self::slots(entry).any(|id| held.contains(&id)));
+            if shares {
+                dropped.push(*snapshot);
+            }
+            !shares
+        });
+        for &snapshot in &dropped {
+            self.release_working_set(snapshot, self.seq);
+        }
+        dropped.len()
     }
 
     /// The rs half of the planner's idle reclaim: drops every snapshot that
