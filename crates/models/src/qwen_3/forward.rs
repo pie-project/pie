@@ -447,6 +447,22 @@ fn attn_mixer(
     let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
     let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
     let (q, k) = rotate(&q, &k, inputs, m, a, d);
+    // C1: incoherence-processing rotation. H is orthonormal, so (Hq)·(Hk)ᵀ = q·kᵀ
+    // — the scores, and therefore the softmax, are unchanged, and no read-side op
+    // needs to know the cache is rotated. K and V are turned before they are
+    // cached; Q is turned to keep the scores invariant (it is never cached, so it
+    // is free); the block is the whole head, which is exact only because Q and K
+    // turn identically over the RoPE'd sub-block. Each of q/k/v is single-use at
+    // this point, so the fresh-value rotations cannot clobber a still-live buffer.
+    let (q, k, v) = if m.rotate_kv {
+        (
+            ops::elemwise::hadamard_plain(&q, d),
+            ops::elemwise::hadamard_plain(&k, d),
+            ops::elemwise::hadamard_plain(&v, d),
+        )
+    } else {
+        (q, k, v)
+    };
     ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     seam::at(seam::ATTN_Q, &[&q]);
 
@@ -467,6 +483,14 @@ fn attn_mixer(
         ops::attn::prefill(&p, plan_p, pages, None, d, m.kv_heads, a.sm_scale),
     ]);
     seam::at(seam::ATTN_OUT, &[&o]);
+    // C1: undo V's turn. With V cached as V·H, each head's output is
+    // O = P·(V·H) = (P·V)·H = O_true·H, so one more Hadamard (H·H = I) recovers
+    // O_true before the gate and o_proj. `o` is single-use here.
+    let o = if m.rotate_kv {
+        ops::elemwise::hadamard_plain(&o, d)
+    } else {
+        o
+    };
     ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
 }
 
@@ -488,10 +512,32 @@ fn mtp_attn(
     let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
     let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
     let (q, k) = rotate(&q, &k, inputs, m, a, d);
+    // C1: the draft head owns a separate `kv.mtp` cache. To never mix bases in one
+    // cache, it takes the SAME four rotations as the trunk — K/V rotated in when
+    // appended, Q rotated for score-invariance every (chained) step, O un-rotated
+    // out — rather than reading a plain cache with rotated queries.
+    let (q, k) = if m.rotate_kv {
+        (
+            ops::elemwise::hadamard_plain(&q, d),
+            ops::elemwise::hadamard_plain(&k, d),
+        )
+    } else {
+        (q, k)
+    };
     if !chain {
+        let v = if m.rotate_kv {
+            ops::elemwise::hadamard_plain(&v, d)
+        } else {
+            v
+        };
         ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     }
     let o = ops::attn::prefill(&q, plan, pages, None, d, m.kv_heads, a.sm_scale);
+    let o = if m.rotate_kv {
+        ops::elemwise::hadamard_plain(&o, d)
+    } else {
+        o
+    };
     ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
 }
 
