@@ -63,6 +63,11 @@ const SDPA_TILED_LSE: [&str; 4] = [
     "sdpa_paged_tiled_lse_bfloat16_d_512",
 ];
 
+// C2c-1 — the packed 4-bit KV decode read. Only the 256-wide head is stamped:
+// a packed kv head is one whole 256-block, so no other width has a shader.
+const SDPA_DECODE_KV_U4_D256: &str = "sdpa_paged_decode_kv_u4_bfloat16_d_256";
+const SDPA_KV_U4_HEAD_DIM: u32 = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodePlan {
     pub positions: Tensor,
@@ -383,9 +388,35 @@ fn vector(
         "the attention lands one output row per query row"
     );
     let shape = Paged::of(op, q, pool, window, causal, head_dim)?;
-    let entry = match lse {
-        None => SDPA_DECODE[shape.at],
-        Some(_) => SDPA_DECODE_LSE[head_point(op, head_dim, &SDPA_LSE_WIDTHS)?],
+    // The read kernel is chosen by the POOL's dtype — the first KV-dtype dispatch
+    // axis, mirroring how `append_paged` branches its write on `pool.keys.dtype`.
+    // A bf16 pool takes the element-indexed decode; a packed KvU4 pool takes the
+    // dequantizing decode (C2c-1), which exists only as the plain d=256 decode.
+    let entry = match pool.keys.dtype {
+        Dtype::Bf16 => match lse {
+            None => SDPA_DECODE[shape.at],
+            Some(_) => SDPA_DECODE_LSE[head_point(op, head_dim, &SDPA_LSE_WIDTHS)?],
+        },
+        Dtype::KvU4 => {
+            if lse.is_some() {
+                return Err(refuse(
+                    op,
+                    "the packed 4-bit KV cache has no log-sum-exp decode; C2c-1 stamps only the \
+                     plain dequantizing read",
+                ));
+            }
+            if head_dim != SDPA_KV_U4_HEAD_DIM {
+                return Err(refuse(
+                    op,
+                    format!(
+                        "the packed 4-bit KV decode reads whole {SDPA_KV_U4_HEAD_DIM}-element \
+                         heads, but this attention states head width {head_dim}"
+                    ),
+                ));
+            }
+            SDPA_DECODE_KV_U4_D256
+        }
+        other => return Err(Error::DtypeUnsupported { op, dtype: other }),
     };
     let mut args = vec![
         q.arg(),

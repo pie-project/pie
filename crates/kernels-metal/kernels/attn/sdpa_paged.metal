@@ -27,6 +27,40 @@ METAL_FUNC float sdpa_lse_base2(float max_score, float sum_exp_score) {
                               : -INFINITY;
 }
 
+// C2c-1 — the packed 4-bit KV read layout, mirrored from the C2b write path and
+// the C2a codec. One whole kv head is a 256-element block stored in KV_U4_BYTES
+// (130) bytes: 128 nibble bytes then a little-endian fp16 scale. A slot's heads
+// are contiguous, so the block base (in BYTES) is
+//   (slot * n_kv_heads + kv_head) * KV_U4_BYTES.
+// Nibbles are offset-binary: the stored nibble is q + 8, the low nibble of byte
+// b is element 2*b (even), the high nibble is element 2*b+1 (odd); dequant is
+// q * scale. K and V are separate planes, each carrying its own per-block scale.
+#define KV_U4_BLOCK 256u
+#define KV_U4_NIB_BYTES 128u
+#define KV_U4_BYTES 130u
+
+// The block's inline fp16 scale (bytes [128,130), little-endian).
+METAL_FUNC float sdpa_kv_u4_scale(const device uchar* block) {
+  const ushort bits =
+      ushort(block[KV_U4_NIB_BYTES]) | (ushort(block[KV_U4_NIB_BYTES + 1]) << 8);
+  return float(as_type<half>(bits));
+}
+
+// Dequantize this lane's `count` contiguous elements starting at `first` out of
+// one packed block, into `dst`: dst[j] = (nibble(first+j) - 8) * scale. `first`
+// is even (each lane owns a whole-byte-aligned slice), so element parity follows
+// the element index directly.
+METAL_FUNC void sdpa_kv_u4_lane(
+    const device uchar* block, uint first, int count, float scale,
+    thread float* dst) {
+  for (int j = 0; j < count; j++) {
+    const uint e = first + uint(j);
+    const uchar byte = block[e >> 1];
+    const int nib = (e & 1u) ? int((byte >> 4) & 0xf) : int(byte & 0xf);
+    dst[j] = float(nib - 8) * scale;
+  }
+}
+
 template <
     typename T,
     int D,
@@ -35,7 +69,8 @@ template <
     bool WITH_LSE,
     int PAGE_SIZE,
     bool FAST_FULL,
-    int BN>
+    int BN,
+    bool PACKED = false>
 inline void sdpa_paged_decode_body(
     const device T* queries,
     const device T* k_pages,
@@ -106,12 +141,30 @@ inline void sdpa_paged_decode_body(
   const bool masked = mask_word != 0;
 
   auto absorb = [&](size_t slot) {
-    const device T* kptr =
-        k_pages + (slot * n_kv_heads + kv_head_idx) * D + simd_lid * qk_per_thread;
-    const device T* vptr =
-        v_pages + (slot * n_kv_heads + kv_head_idx) * D + simd_lid * v_per_thread;
-    for (int j = 0; j < qk_per_thread; j++) k[j] = kptr[j];
-    for (int j = 0; j < v_per_thread; j++) v[j] = static_cast<U>(vptr[j]);
+    if constexpr (PACKED) {
+      // Byte-index the lane's slice of the packed 130-byte block: read the K and
+      // V per-block fp16 scales once, then dequantize this lane's own elements
+      // (offset-binary q = nibble - 8, dequant = q * scale). Same math as the
+      // bf16 branch below, only the source is the packed cache, not bf16 pages.
+      static_assert(
+          D == 256 && V == 256,
+          "the packed 4-bit KV decode reads whole 256-element heads");
+      const device uchar* kblk =
+          (const device uchar*)k_pages + (slot * n_kv_heads + kv_head_idx) * KV_U4_BYTES;
+      const device uchar* vblk =
+          (const device uchar*)v_pages + (slot * n_kv_heads + kv_head_idx) * KV_U4_BYTES;
+      sdpa_kv_u4_lane(kblk, simd_lid * qk_per_thread, qk_per_thread,
+                      sdpa_kv_u4_scale(kblk), k);
+      sdpa_kv_u4_lane(vblk, simd_lid * v_per_thread, v_per_thread,
+                      sdpa_kv_u4_scale(vblk), v);
+    } else {
+      const device T* kptr =
+          k_pages + (slot * n_kv_heads + kv_head_idx) * D + simd_lid * qk_per_thread;
+      const device T* vptr =
+          v_pages + (slot * n_kv_heads + kv_head_idx) * D + simd_lid * v_per_thread;
+      for (int j = 0; j < qk_per_thread; j++) k[j] = kptr[j];
+      for (int j = 0; j < v_per_thread; j++) v[j] = static_cast<U>(vptr[j]);
+    }
     U score = 0;
     for (int j = 0; j < qk_per_thread; j++) score += q[j] * k[j];
     score = simd_sum(score);
@@ -282,6 +335,49 @@ template <
   threadgroup float factors[BN];
   threadgroup float final_sum[1];
   sdpa_paged_decode_body<T, D, V, WITH_SINK, false, PAGE_SIZE, FAST_FULL, BN>(
+      queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
+      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      attention_mask, attention_mask_stride, attention_mask_enabled, window,
+      sinks, nullptr, outputs, max_scores, sum_exp_scores, factors,
+      final_sum, tid, tpg, simd_gid, simd_lid);
+}
+
+// C2c-1 — the DECODE read over a PACKED 4-bit KV cache. Identical attention math
+// and identical kernel signature to `sdpa_paged_decode` (BN = 32, no sink, no
+// lse, dynamic page size); the K/V pages are the packed KvU4 cache (uchar blocks
+// bound through the same buffers) and the body dequantizes each lane's slice
+// per (PACKED = true). Only the d = 256 head is stamped — a packed head is a
+// whole 256-block, and the host refuses any other width.
+template <typename T, int D, int V = D>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_decode_kv_u4(
+    const device T* queries     [[buffer(0)]],
+    const device T* k_pages     [[buffer(1)]],
+    const device T* v_pages     [[buffer(2)]],
+    device T* out               [[buffer(3)]],
+    const constant int& gqa_factor          [[buffer(4)]],
+    const device int* position_ids          [[buffer(5)]],
+    const device int* req_of_token          [[buffer(6)]],
+    const device uint* kv_page_indices      [[buffer(7)]],
+    const device uint* kv_page_indptr       [[buffer(8)]],
+    const constant int& page_size           [[buffer(9)]],
+    const constant int& n_kv_heads          [[buffer(10)]],
+    const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],
+    const device uint& attention_mask_stride[[buffer(13)]],
+    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const constant int& window                 [[buffer(15)]],
+    const device T* sinks                      [[buffer(16)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tpg       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  constexpr int BN = 32;
+  threadgroup float outputs[sdpa_decode_outputs<BN>()];
+  threadgroup float max_scores[BN];
+  threadgroup float sum_exp_scores[BN];
+  threadgroup float factors[BN];
+  threadgroup float final_sum[1];
+  sdpa_paged_decode_body<T, D, V, false, false, 0, false, BN, true>(
       queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
       kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
       attention_mask, attention_mask_stride, attention_mask_enabled, window,
@@ -751,6 +847,20 @@ instantiate_sdpa_paged(bfloat16, bfloat, 512, 512)
 instantiate_sdpa_paged(bfloat16, bfloat, 128, 128)
 instantiate_sdpa_paged(bfloat16, bfloat, 64, 64)
 instantiate_sdpa_paged_sink(bfloat16, bfloat, 64, 64)
+
+// C2c-1 — the packed 4-bit KV decode read, stamped only at the 256-wide head.
+#define instantiate_sdpa_paged_kv_u4(name, itype, d, v)                    \
+  template [[host_name("sdpa_paged_decode_kv_u4_" #name "_d_" #d)]]        \
+  [[kernel]] void sdpa_paged_decode_kv_u4<itype, d, v>(                     \
+      const device itype*, const device itype*, const device itype*,        \
+      device itype*, const constant int&, const device int*,                \
+      const device int*, const device uint*, const device uint*,            \
+      const constant int&, const constant int&, const constant float&,      \
+      const device uchar*, const device uint&, const device uchar*,         \
+      const constant int&, const device itype*,                             \
+      uint3, uint3, uint, uint);
+
+instantiate_sdpa_paged_kv_u4(bfloat16, bfloat, 256, 256)
 
 #define instantiate_sdpa_paged_lse(name, itype, d, v)                      \
   template [[host_name("sdpa_paged_decode_lse_" #name "_d_" #d)]]          \
