@@ -163,6 +163,15 @@ pub struct Pools {
     shapes: Vec<Shape>,
     paging: Paging,
     watermark: engine::frame::Demand,
+    disk: Option<DiskKv>,
+}
+
+/// The slot file kv is suspended into, and the host pages a copy to or from
+/// it gathers a turn of pages in, in slot layout.
+#[derive(Debug)]
+struct DiskKv {
+    file: engine::disk::SlotFile,
+    stage: engine::disk::Aligned,
 }
 
 impl Pools {
@@ -245,6 +254,7 @@ impl Pools {
             shapes,
             paging,
             watermark: engine::frame::Demand::ZERO,
+            disk: None,
         })
     }
 
@@ -415,7 +425,36 @@ impl Pools {
                 workspace: 0,
             },
         )?;
-        for (slab, shape) in self.slabs.iter().zip(&self.shapes) {
+        for (slab, plane, cell) in self.kv_planes() {
+            let slab = &self.slabs[slab];
+            for span in moves {
+                if span.tokens == 0 {
+                    continue;
+                }
+                let bytes = u64::from(span.tokens) * cell;
+                let at = |page: u32, token: u32| {
+                    plane + (u64::from(page) * page_size + u64::from(token)) * cell
+                };
+                let (src, dst) = (
+                    at(span.src_page, span.src_token),
+                    at(span.dst_page, span.dst_token),
+                );
+                if src == dst {
+                    continue;
+                }
+                slab.span(src, bytes)?;
+                slab.span(dst, bytes)?;
+                frame.copy(slab.slab(), src, slab.slab(), dst, bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every kv plane as its slab index, its offset in the slab, and the
+    /// bytes one token takes in it.
+    fn kv_planes(&self) -> Vec<(usize, u64, u64)> {
+        let mut planes = Vec::new();
+        for (at, shape) in self.shapes.iter().enumerate() {
             let Shape::Kv {
                 head_dim,
                 kv_heads,
@@ -428,32 +467,105 @@ impl Pools {
                 continue;
             };
             let element = u64::from(elem_size(dtype));
-            let keys_cell = u64::from(kv_heads) * u64::from(head_dim) * element;
-            let bases = [(0, keys_cell), (values_at, values_width * element)];
-            let bases = if values_at == 0 {
-                &bases[..1]
-            } else {
-                &bases[..]
-            };
-            for &(plane, cell) in bases {
-                for span in moves {
-                    if span.tokens == 0 {
-                        continue;
+            planes.push((at, 0, u64::from(kv_heads) * u64::from(head_dim) * element));
+            if values_at != 0 {
+                planes.push((at, values_at, values_width * element));
+            }
+        }
+        planes
+    }
+
+    fn page_bytes(&self) -> u64 {
+        let page_size = u64::from(self.paging.page_size);
+        self.kv_planes()
+            .iter()
+            .map(|&(_, _, cell)| page_size * cell)
+            .sum()
+    }
+
+    /// Opens `dir`'s slot file with `budget` bytes of kv pages; a budget
+    /// short of one page seats none.
+    pub fn seat_disk(&mut self, dir: &std::path::Path, budget: u64) -> Result<u32> {
+        let file =
+            engine::disk::SlotFile::open(dir, 0, self.page_bytes(), budget).map_err(slot_file)?;
+        self.disk = file.map(|file| {
+            let turn = (engine::disk::STAGE_BYTES / file.stride()).clamp(1, file.slots() as usize);
+            DiskKv {
+                stage: engine::disk::Aligned::zeroed(turn * file.stride()),
+                file,
+            }
+        });
+        Ok(self.disk.as_ref().map_or(0, |disk| disk.file.slots()))
+    }
+
+    /// Copies whole kv pages between the pool and the slot file, `pages[i]`
+    /// with `slots[i]`, a stage-full at a time. The slabs are shared memory,
+    /// so the caller has drained every command buffer that touches them.
+    pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
+        let have = self.disk.as_ref().map_or(0, |disk| disk.file.slots());
+        if let Some(&slot) = slots.iter().find(|&&slot| slot >= have) {
+            return Err(Fault::Ceiling {
+                what: "disk kv pages",
+                need: u64::from(slot) + 1,
+                have: u64::from(have),
+            });
+        }
+        let highest = pages.iter().map(|&page| page + 1).max().unwrap_or(0);
+        engine::frame::Supply::commit(
+            self,
+            engine::frame::Demand {
+                kv_pages: highest,
+                state_slots: 0,
+                workspace: 0,
+            },
+        )?;
+        let Some(mut disk) = self.disk.take() else {
+            return Ok(());
+        };
+        let copied = self.spill_through(&mut disk, to_disk, pages, slots);
+        self.disk = Some(disk);
+        copied
+    }
+
+    fn spill_through(
+        &mut self,
+        disk: &mut DiskKv,
+        to_disk: bool,
+        pages: &[u32],
+        slots: &[u32],
+    ) -> Result<()> {
+        let stride = disk.file.stride();
+        let turn = disk.stage.as_slice().len() / stride;
+        let page_size = u64::from(self.paging.page_size);
+        let planes = self.kv_planes();
+        for (pages, slots) in pages.chunks(turn).zip(slots.chunks(turn)) {
+            let staged = &mut disk.stage.as_mut_slice()[..pages.len() * stride];
+            if !to_disk {
+                for (at, first, count) in engine::disk::runs(slots) {
+                    disk.file
+                        .read(first, &mut staged[at * stride..(at + count) * stride])
+                        .map_err(slot_file)?;
+                }
+            }
+            for (at, &page) in pages.iter().enumerate() {
+                let mut offset = at * stride;
+                for &(slab, plane, cell) in &planes {
+                    let bytes = page_size * cell;
+                    let on_device = plane + u64::from(page) * bytes;
+                    let on_host = &mut staged[offset..offset + bytes as usize];
+                    if to_disk {
+                        self.slabs[slab].read(on_device, on_host)?;
+                    } else {
+                        self.slabs[slab].write(on_device, on_host)?;
                     }
-                    let bytes = u64::from(span.tokens) * cell;
-                    let at = |page: u32, token: u32| {
-                        plane + (u64::from(page) * page_size + u64::from(token)) * cell
-                    };
-                    let (src, dst) = (
-                        at(span.src_page, span.src_token),
-                        at(span.dst_page, span.dst_token),
-                    );
-                    if src == dst {
-                        continue;
-                    }
-                    slab.span(src, bytes)?;
-                    slab.span(dst, bytes)?;
-                    frame.copy(slab.slab(), src, slab.slab(), dst, bytes)?;
+                    offset += bytes as usize;
+                }
+            }
+            if to_disk {
+                for (at, first, count) in engine::disk::runs(slots) {
+                    disk.file
+                        .write(first, &staged[at * stride..(at + count) * stride])
+                        .map_err(slot_file)?;
                 }
             }
         }
@@ -606,6 +718,13 @@ fn split(name: &str, planes: &[u64]) -> Result<Planes> {
     }
 }
 
+fn slot_file(error: std::io::Error) -> Fault {
+    Fault::Device {
+        call: "kv slot file",
+        why: error.to_string(),
+    }
+}
+
 fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {
     model_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Unbound {
         what: format!("cache `{name}`, stored as {dtype:?}, which has no element size"),
@@ -634,6 +753,7 @@ mod tests {
             }],
             paging: paging(slots),
             watermark: engine::frame::Demand::ZERO,
+            disk: None,
         }
     }
 
@@ -660,6 +780,55 @@ mod tests {
         a_copied_slot_reads_back_as_its_source();
         a_slot_past_the_pool_is_a_ceiling();
         an_attention_only_plan_answers_ok();
+        kv_pages_come_back_from_disk_where_they_are_restored();
+    }
+
+    fn kv_pages_come_back_from_disk_where_they_are_restored() {
+        let Some(device) = device() else { return };
+        let paging = Paging {
+            pages: 4,
+            ..paging(1)
+        };
+        let cell = 3 * 4u64;
+        let plane = paging.pages() * u64::from(paging.page_size) * cell;
+        let mut pools = Pools {
+            slabs: vec![Buffer::zeroed(&device, 2 * plane).expect("a kv slab")],
+            shapes: vec![Shape::Kv {
+                space: 0,
+                head_dim: 3,
+                kv_heads: 1,
+                dtype: STATE_DTYPE,
+                plane_bytes: plane,
+                values_at: plane,
+                values_width: 3,
+                values_bytes: plane,
+            }],
+            paging,
+            watermark: engine::frame::Demand::ZERO,
+            disk: None,
+        };
+        let bytes: Vec<u8> = (0..2 * plane).map(|at| (at % 251) as u8).collect();
+        pools.slabs[0].write(0, &bytes).expect("the pool written");
+        let dir = std::env::temp_dir().join(format!("pie-metal-kv-{}", std::process::id()));
+        assert_eq!(pools.seat_disk(&dir, 1 << 20).expect("a slot file"), 256);
+        pools.spill_kv(true, &[1, 3], &[7, 8]).expect("suspended");
+        pools.slabs[0]
+            .zero_span(0, 2 * plane)
+            .expect("the pool cleared");
+        pools.spill_kv(false, &[2, 0], &[7, 8]).expect("restored");
+        let page = plane / 4;
+        let mut back = vec![0u8; bytes.len()];
+        pools.slabs[0].read(0, &mut back).expect("the pool read");
+        for base in [0, plane] {
+            let at = |page_id: u64| {
+                (base + page_id * page) as usize..(base + (page_id + 1) * page) as usize
+            };
+            assert_eq!(back[at(2)], bytes[at(1)]);
+            assert_eq!(back[at(0)], bytes[at(3)]);
+            assert!(back[at(1)].iter().all(|&b| b == 0));
+        }
+        drop(pools);
+        std::fs::remove_dir_all(dir).expect("the slot file removed");
     }
 
     fn a_copied_slot_reads_back_as_its_source() {
@@ -721,6 +890,7 @@ mod tests {
             shapes: Vec::new(),
             paging: paging(2),
             watermark: engine::frame::Demand::ZERO,
+            disk: None,
         };
         let mut frame = device.frame().expect("a frame");
         pools

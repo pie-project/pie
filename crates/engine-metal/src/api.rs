@@ -513,6 +513,11 @@ impl Engine for Metal {
         .map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
+        // The device pool already is host memory, so a host tier would only
+        // move kv within the same DRAM; suspended kv goes straight to disk.
+        let disk_kv_pages = shell
+            .seat_disk_kv(residency.disk_kv_budget, residency.disk_kv_dir.as_deref())
+            .map_err(fault)?;
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -551,6 +556,7 @@ impl Engine for Metal {
                     .unwrap_or(0),
                 elastic_page_bytes: 0,
                 elastic_budget_pages: 0,
+                disk_kv_pages,
                 ..PoolFacts::default()
             },
             limits: FireLimits {
@@ -834,10 +840,30 @@ impl Engine for Metal {
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
-        let served = self
-            .caps
-            .as_ref()
-            .is_some_and(|caps| copy.src == caps.device.domain && copy.dst == caps.device.domain);
+        let ours = |domain: MemoryDomain| {
+            self.caps
+                .as_ref()
+                .is_some_and(|caps| domain == caps.device.domain)
+        };
+        let to_disk = match (copy.src, copy.dst) {
+            (src, MemoryDomain::LocalDisk) if ours(src) => Some(true),
+            (MemoryDomain::LocalDisk, dst) if ours(dst) => Some(false),
+            _ => None,
+        };
+        if let Some(to_disk) = to_disk
+            && copy.moves.is_empty()
+        {
+            let (pages, slots) = if to_disk {
+                (&copy.src_page_ids, &copy.dst_page_ids)
+            } else {
+                (&copy.dst_page_ids, &copy.src_page_ids)
+            };
+            return self
+                .loaded_mut()?
+                .spill_kv(to_disk, pages, slots)
+                .map_err(fault);
+        }
+        let served = ours(copy.src) && ours(copy.dst);
         if !served {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),
