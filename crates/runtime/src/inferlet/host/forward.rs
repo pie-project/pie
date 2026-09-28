@@ -24,18 +24,6 @@ use super::pie;
 
 type Anyhow<T> = anyhow::Result<T>;
 
-fn model_pass_kind() -> PassKind {
-    let model = crate::model::model();
-    if model.diffusion().is_some() {
-        return PassKind::Diffusion;
-    }
-    match (model.kv_page_size() > 0, model.rs_caps().state_size > 0) {
-        (_, false) => PassKind::Attention,
-        (true, true) => PassKind::Hybrid,
-        (false, true) => PassKind::Recurrent,
-    }
-}
-
 fn reading_of(pass: &ForwardPass) -> Result<Option<&'static models::ReadingFact>, String> {
     let model = crate::model::model();
     if let Some(index) = pass.bindings.reading {
@@ -588,7 +576,7 @@ impl ProcessCtx {
         named: Option<&'static models::ReadingFact>,
     ) -> Anyhow<Result<(), String>> {
         let kind = self.ctx().table.get(this)?.kind;
-        let actual = model_pass_kind();
+        let actual = crate::model::model().pass_kind();
         if kind == PassKind::Attention {
             let reading = match named {
                 Some(reading) => Ok(Some(reading)),
@@ -2016,7 +2004,7 @@ impl ProcessCtx {
             return Ok(Err(error));
         }
         if rs_working_sets.is_empty() {
-            if model_pass_kind() == PassKind::Attention {
+            if crate::model::model().pass_kind() == PassKind::Attention {
                 return Ok(Ok(()));
             }
             return Ok(Err(
@@ -2038,7 +2026,7 @@ impl ProcessCtx {
             pass.bindings.rs_fold_len = fold_len;
             return Ok(Ok(()));
         }
-        let has_recurrent_state = crate::model::model().rs_caps().state_size > 0;
+        let has_recurrent_state = crate::model::model().rs_caps().has_state();
         let (kv_rep, qo_indptr) = {
             let pass = self.ctx().table.get(&this)?;
             let pending = pass

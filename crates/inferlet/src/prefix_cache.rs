@@ -28,10 +28,7 @@ impl PrefixCache {
     /// `namespace` separates programs: keys are global to the model's store,
     /// so it must name everything the published state depends on besides tokens.
     pub fn new(namespace: &[u8]) -> PrefixCache {
-        // gemma4's windowed rows are claimed per tail, so a page boundary
-        // behind the tail would come back without them.
         let mode = match model::pass_kind() {
-            _ if model::architecture() == "gemma4" => Mode::Off,
             ForwardKind::Attention => Mode::Pages,
             ForwardKind::Hybrid => Mode::Boundaries,
             ForwardKind::Recurrent | ForwardKind::Diffusion => Mode::Off,
@@ -173,11 +170,24 @@ impl PrefixCache {
     /// adds its KV once the whole prefill has, as a slice taken earlier would
     /// make every later prefill page a copy. The snapshot belongs to the
     /// index, not to this process, so idle reclaim can take it back.
-    pub fn publish_state(&self, rs: &RsWorkingSet, tokens: &[u32]) -> Result<(), String> {
-        if self.mode != Mode::Boundaries {
-            return Ok(());
+    pub fn publish_state(
+        &self,
+        rs: &RsWorkingSet,
+        keys: &[Vec<u8>],
+        tokens: u32,
+    ) -> Result<(), String> {
+        match keys.get((tokens / self.page_size) as usize - 1) {
+            Some(key) if self.mode == Mode::Boundaries => rs.update_index(key),
+            _ => Ok(()),
         }
-        let k = tokens.len() as u32 / self.page_size;
-        rs.update_index(&self.keys(tokens, k)[k as usize - 1])
+    }
+
+    /// The keys `publish_state` publishes under, one per page of `tokens`;
+    /// computed once for a prompt, since each key chains the pages before it.
+    pub fn state_keys(&self, tokens: &[u32]) -> Vec<Vec<u8>> {
+        if self.mode != Mode::Boundaries {
+            return Vec::new();
+        }
+        self.keys(tokens, tokens.len() as u32 / self.page_size)
     }
 }

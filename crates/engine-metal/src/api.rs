@@ -557,6 +557,9 @@ impl Engine for Metal {
                 elastic_page_bytes: 0,
                 elastic_budget_pages: 0,
                 disk_kv_pages,
+                // The sliding rows are paged in full here: the model's window
+                // is a fact of the model, its pool is not.
+                window_tokens: model_exec::store::kv::declared_window(shell.trace()).unwrap_or(0),
                 ..PoolFacts::default()
             },
             limits: FireLimits {

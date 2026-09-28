@@ -448,6 +448,7 @@ impl Engine for Xla {
                     u32::try_from(paging.window_pages()).unwrap_or(u32::MAX)
                 }),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
+                ..PoolFacts::default()
             },
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,

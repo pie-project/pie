@@ -59,12 +59,25 @@ pub enum RsPlan {
         phase: Vec<bool>,
         page_tokens: Vec<u32>,
     },
+    /// The model's state is a window: each row writes the ring pages of
+    /// the kv page indexes it lands on, then moves its ring.
+    Ring(Vec<RingRow>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RingRow {
+    /// The kv page indexes the row writes.
+    pub pages: Vec<u32>,
+    /// The kv page indexes the lane reads, in the order its table states.
+    pub translate: Vec<u32>,
+    pub advance: crate::store::rs::RingAdvance,
 }
 
 impl RsPlan {
     fn row(&self, index: usize) -> (bool, Option<u32>, Option<(u32, u32)>, RsBufferIntent) {
         match self {
             RsPlan::Fold => (true, None, None, RsBufferIntent::Write),
+            RsPlan::Ring(_) => unreachable!("a ring plan is prepared row by row"),
             RsPlan::Buffer {
                 start_tokens,
                 row_tokens,
@@ -113,6 +126,14 @@ pub fn demand(
     plan: &RsPlan,
 ) -> Result<usize, String> {
     let mut total = 0;
+    if let RsPlan::Ring(rows) = plan {
+        for (&ws, row) in working_sets.iter().zip(rows) {
+            total += store
+                .ring_demand(ws, &row.pages)
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(total);
+    }
     for (index, &ws) in working_sets.iter().enumerate() {
         let (write_state, _, buffer_tokens, _) = plan.row(index);
         total += store
@@ -135,6 +156,11 @@ pub struct PreparedRs {
     pub buffer_read_lens: Vec<u32>,
     pub buffer_heads: Vec<u32>,
     pub verbs: Vec<engine::fire::RsVerb>,
+    /// A ring model's rows: each lane's windowed page ids, aligned with
+    /// the page indexes its row translates, and the windowed pages copied
+    /// `(src, dst)` before the fire runs.
+    pub window: Vec<Vec<u32>>,
+    pub window_copies: Vec<(u32, u32)>,
     pub txn: Option<RsTxn>,
 }
 
@@ -156,6 +182,14 @@ impl PreparedRs {
                     engine::fire::RsReset::Held
                 };
             }
+            if let Some(window) = self.window.get(row) {
+                lane.kv.window.clone_from(window);
+            }
+        }
+        if let Some(lane) = request.lanes.first_mut()
+            && !self.window_copies.is_empty()
+        {
+            lane.kv.window_copies.clone_from(&self.window_copies);
         }
     }
 }
@@ -177,6 +211,34 @@ pub fn prepare_many_reserved(
     prepare_many_impl(store, working_sets, plan, Some(granted))
 }
 
+/// Records every slot the batch hands the engine as read by it, so a
+/// slot one of its fires reads outlives that fire however it is dropped.
+fn note_reads(store: &mut RsStore, published: &RsPublished, out: &PreparedRs) {
+    let Some(&seq) = published.seqs().last() else {
+        return;
+    };
+    let verb_pages = out.verbs.iter().flat_map(|verb| match verb {
+        engine::fire::RsVerb::Buffer { pages, .. }
+        | engine::fire::RsVerb::FoldBuffered { pages, .. } => pages.clone(),
+        engine::fire::RsVerb::Window { read, write, .. } => {
+            read.iter().chain(write).copied().collect()
+        }
+        _ => Vec::new(),
+    });
+    let ids: Vec<u32> = out
+        .slot_ids
+        .iter()
+        .chain(&out.buffer_slot_ids)
+        .chain(&out.buffer_read_slot_ids)
+        .chain(&out.copies.0)
+        .chain(out.window.iter().flatten())
+        .copied()
+        .chain(verb_pages)
+        .filter(|&id| id != 0 && id != crate::store::rs::RS_TRANSLATION_UNMAPPED)
+        .collect();
+    store.note_reads(seq, ids.into_iter().map(crate::store::rs::RsSlotId));
+}
+
 fn empty_prepared() -> PreparedRs {
     PreparedRs {
         slot_ids: Vec::new(),
@@ -190,8 +252,59 @@ fn empty_prepared() -> PreparedRs {
         buffer_heads: Vec::new(),
         buffer_slot_indptr: Vec::new(),
         verbs: Vec::new(),
+        window: Vec::new(),
+        window_copies: Vec::new(),
         txn: None,
     }
+}
+
+fn prepare_ring_rows(
+    store: &mut RsStore,
+    working_sets: &[RsWorkingSetId],
+    rows: &[RingRow],
+    mut granted: Option<&mut Vec<crate::store::rs::RsSlotId>>,
+) -> Result<PreparedRs, String> {
+    if rows.len() != working_sets.len() {
+        return Err(format!(
+            "a ring plan of {} row(s) for {} rs-working-set(s)",
+            rows.len(),
+            working_sets.len()
+        ));
+    }
+    let mut out = empty_prepared();
+    let mut prepared_rows: Vec<RsPreparedWrite> = Vec::with_capacity(rows.len());
+    for (index, (&ws, row)) in working_sets.iter().zip(rows).enumerate() {
+        match store.prepare_ring(ws, &row.pages, granted.as_deref_mut()) {
+            Ok(prepared) => prepared_rows.push(prepared),
+            Err(error) => {
+                store.cancel_batch(prepared_rows);
+                return Err(format!("request row {index}: {error}"));
+            }
+        }
+    }
+    for prepared in &prepared_rows {
+        out.window_copies
+            .extend(prepared.buffer_copy_plan().map(|(src, dst)| (src.0, dst.0)));
+    }
+    let (published, folds) = store
+        .publish_batch(prepared_rows)
+        .map_err(|error| error.to_string())?;
+    store.commit_folds(folds);
+    // The fire reads through the ring as published; only then does the
+    // commit retire what falls behind it.
+    for (&ws, row) in working_sets.iter().zip(rows) {
+        out.window.push(
+            store
+                .ring_translation(ws, row.translate.iter().copied())
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    note_reads(store, &published, &out);
+    for (&ws, row) in working_sets.iter().zip(rows) {
+        store.ring_advance(ws, row.advance, &row.translate);
+    }
+    out.txn = Some(RsTxn { published });
+    Ok(out)
 }
 
 fn prepare_many_impl(
@@ -209,6 +322,9 @@ fn prepare_many_impl(
     }
     if working_sets.is_empty() {
         return Ok(empty_prepared());
+    }
+    if let RsPlan::Ring(rows) = plan {
+        return prepare_ring_rows(store, working_sets, rows, granted);
     }
 
     let buffered = !matches!(plan, RsPlan::Fold);
@@ -382,6 +498,7 @@ fn prepare_many_impl(
             };
             out.verbs.push(match plan {
                 RsPlan::Fold => engine::fire::RsVerb::Fold,
+                RsPlan::Ring(_) => unreachable!("a ring plan returns before the read side"),
                 RsPlan::Buffer {
                     start_tokens,
                     row_tokens,
@@ -448,6 +565,7 @@ fn prepare_many_impl(
         Ok(())
     })(&mut out);
 
+    note_reads(store, &published, &out);
     store.commit_folds(pending_folds);
     if matches!(plan, RsPlan::Window { .. }) {
         for &ws in working_sets {

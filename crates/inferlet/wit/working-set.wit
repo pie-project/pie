@@ -112,7 +112,10 @@ interface working-set {
     // buffered suffix of page slots. A forward pass may write buffered RS
     // state WITHOUT folding it; folding is a separate, explicit operation.
     // Fork is lazy CoW: the first fold/write on a shared folded or buffered
-    // slab copies the relevant object before mutation.
+    // slab copies the relevant object before mutation. For a window the
+    // buffered slots are the ring of its pages, taken by the fires that write
+    // them: `alloc-buffer`, `free-buffer` and `reorder-buffer` then only
+    // keep the declared count, and `discard-buffered` moves the head back.
     resource rs-working-set {
         constructor();
 

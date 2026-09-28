@@ -112,17 +112,13 @@ impl pie::inferlet::model::Host for ProcessCtx {
     }
 
     async fn pass_kind(&mut self) -> Result<pie::inferlet::model::ForwardKind> {
+        use crate::pipeline::instance::PassKind;
         use pie::inferlet::model::ForwardKind;
-        let model = model::model();
-        if model.diffusion().is_some() {
-            return Ok(ForwardKind::Diffusion);
-        }
-        let has_rs = model.rs_caps().state_size > 0;
-        let has_kv = model.kv_page_size() > 0;
-        Ok(match (has_kv, has_rs) {
-            (_, false) => ForwardKind::Attention,
-            (true, true) => ForwardKind::Hybrid,
-            (false, true) => ForwardKind::Recurrent,
+        Ok(match model::model().pass_kind() {
+            PassKind::Attention => ForwardKind::Attention,
+            PassKind::Hybrid => ForwardKind::Hybrid,
+            PassKind::Recurrent => ForwardKind::Recurrent,
+            PassKind::Diffusion => ForwardKind::Diffusion,
         })
     }
 

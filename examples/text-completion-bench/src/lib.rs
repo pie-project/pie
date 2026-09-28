@@ -335,6 +335,7 @@ async fn run_one(
     // A hybrid model's recurrent state is published only where a chunk
     // ends, so chunks are also cut at the cache's boundaries.
     let cuts = prefixes.boundaries(&prompt_vec, cached, None);
+    let state_keys = prefixes.state_keys(&prompt_vec);
     let mut spans: Vec<(u32, u32)> = Vec::new();
     for (base, end) in prefill_chunks(n - cached, None) {
         let (mut base, end) = (cached + base, cached + end);
@@ -534,7 +535,7 @@ async fn run_one(
             .with_context(|| format!("drain prefill chunk @{base}"))?;
         if let Some(rs) = rs_ws.first().filter(|_| cuts.contains(&end)) {
             prefixes
-                .publish_state(rs, &prompt_vec[..end as usize])
+                .publish_state(rs, &state_keys, end)
                 .context("publish prefill state")?;
             states.push(end);
         }

@@ -322,6 +322,7 @@ fn load_engine(
         window_tokens: caps.pools.window_tokens,
         cpu_pages: 0,
         disk_pages: 0,
+        cpu_window_pages: 0,
         kv_copy: caps.kv_copy,
         backend_kind: backend.kind().to_string(),
         rs_cache_required: caps.pools.state_slots != 0,

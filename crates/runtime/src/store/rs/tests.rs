@@ -37,6 +37,131 @@ fn tests_every_case() {
     a_bound_driven_to_zero_is_exact_again();
     index_snapshots_state_and_is_reclaimed_when_idle();
     a_suspend_parks_private_slots_on_host_and_restore_brings_them_back();
+    a_window_is_a_ring_of_pages_anchored_at_its_commit();
+}
+
+// A windowed model's state is a ring: a fire takes the pages it writes,
+// the pages behind the committed position's window retire, a discard moves
+// the head back without touching a page, a fork shares the ring and copies
+// only the page it overwrites, and a suspend parks the ring on the host.
+fn a_window_is_a_ring_of_pages_anchored_at_its_commit() {
+    use super::{RingAdvance, RingGeometry};
+    use std::collections::HashSet;
+    let mut s = RsStore::new_ring(
+        RingGeometry {
+            tokens: 32,
+            page_size: 16,
+        },
+        8,
+        4,
+    );
+    let ws = s.create_working_set(geom());
+    let order: Vec<u32> = (0..16).collect();
+    let advance = |fold, end| RingAdvance {
+        positioned: true,
+        settled: 0,
+        fold,
+        commit_end: end,
+        head: Some(end),
+    };
+    let fire = |s: &mut RsStore, ws, pages: &[u32], advance| {
+        let prepared = s.prepare_ring(ws, pages, None).unwrap();
+        let copies: Vec<_> = prepared.buffer_copy_plan().collect();
+        let published = s.publish_prepared(prepared).unwrap();
+        s.ring_advance(ws, advance, &order);
+        s.settle(published);
+        copies
+    };
+    assert_eq!(s.ring_demand(ws, &[0, 1, 2, 3, 4, 5]), Ok(6));
+    fire(&mut s, ws, &[0, 1, 2, 3, 4, 5], advance(Some(u32::MAX), 96));
+    assert_eq!(s.available_slots(), 5, "four pages behind 96 - 32 retired");
+    assert_eq!(s.ring_positions(ws), Ok(Some((96, 96))));
+    let held = s.ring_translation(ws, 0..7).unwrap();
+    assert_eq!(
+        &held[..4],
+        &[0, 0, 0, 0],
+        "behind the ring reads the null page"
+    );
+    assert!(held[4] != 0 && held[5] != 0 && held[6] == 0);
+
+    // A speculative window: buffered, then taken back, then partly committed.
+    assert_eq!(s.ring_demand(ws, &[6]), Ok(1));
+    fire(&mut s, ws, &[6], advance(Some(0), 104));
+    assert_eq!(s.buffer_tokens(ws), Ok(8));
+    assert_eq!(s.discard_buffered(ws, 8), Ok(()));
+    assert_eq!(
+        s.ring_demand(ws, &[6]),
+        Ok(0),
+        "the page is the ring's already"
+    );
+    fire(&mut s, ws, &[6], advance(Some(5), 104));
+    assert_eq!(s.discard_buffered(ws, 3), Ok(()));
+    assert_eq!(s.ring_positions(ws), Ok(Some((101, 101))));
+    assert_eq!(
+        s.ring_demand(ws, &[3]),
+        Ok(1),
+        "a page behind the window is given back"
+    );
+
+    let child = s.fork(ws).unwrap();
+    assert_eq!(
+        s.ring_demand(child, &[6]),
+        Ok(1),
+        "a shared page copies on write"
+    );
+    let copies = fire(&mut s, child, &[6], advance(Some(u32::MAX), 112));
+    assert_eq!(copies.len(), 1);
+    assert_eq!(s.available_slots(), 3);
+    s.release_working_set(child);
+    s.retire_idle();
+    assert_eq!(s.available_slots(), 4);
+
+    let set: HashSet<_> = [ws].into();
+    let txn = s.prepare_suspend(&set).expect("three private pages");
+    assert!(txn.is_ring() && txn.slot_count() == 3);
+    assert_eq!(s.commit_suspend(txn), 3);
+    assert_eq!((s.held_slots([ws]), s.swapped_slots(&set)), (0, 3));
+    assert_eq!(s.available_slots(), 7);
+    let mut granted = s.reserve_slots(3).unwrap();
+    let txn = s.prepare_restore(&set, &mut granted).unwrap();
+    assert_eq!(s.commit_restore(txn), 3);
+    assert_eq!(s.swapped_slots(&set), 0);
+    assert_eq!(
+        s.ring_demand(ws, &[7]),
+        Ok(1),
+        "the ring reads on from its pages"
+    );
+
+    let device = |settled, end| RingAdvance {
+        positioned: true,
+        settled,
+        fold: None,
+        commit_end: end,
+        head: Some(end),
+    };
+    fire(&mut s, ws, &[7], device(0, 128));
+    assert_eq!(s.ring_positions(ws), Ok(Some((101, 128))));
+    fire(&mut s, ws, &[8], device(128, 144));
+    assert_eq!(
+        s.ring_positions(ws),
+        Ok(Some((128, 144))),
+        "a device-decided fold is settled by the next fire's first token"
+    );
+
+    let lease = RingAdvance {
+        positioned: false,
+        settled: 0,
+        fold: None,
+        commit_end: 0,
+        head: None,
+    };
+    fire(&mut s, ws, &[2], lease);
+    assert_eq!(s.ring_positions(ws), Ok(Some((128, 144))));
+    assert_ne!(
+        s.ring_translation(ws, [2]).unwrap(),
+        [0],
+        "a device-geometry fire keeps the page its lease names"
+    );
 }
 
 fn a_suspend_parks_private_slots_on_host_and_restore_brings_them_back() {
@@ -71,7 +196,7 @@ fn a_suspend_parks_private_slots_on_host_and_restore_brings_them_back() {
     assert_eq!(s.commit_restore(txn), 1);
     assert_eq!((s.swapped_slots(&both), s.host_available()), (0, 2));
     assert_eq!(s.folded_slot(ws), s.folded_slot(child));
-    s.release_working_set(child, s.current_epoch());
+    s.release_working_set(child);
     write_state(&mut s, ws);
 
     s.update_index(b"k".to_vec(), ws).unwrap();
@@ -117,10 +242,32 @@ fn index_snapshots_state_and_is_reclaimed_when_idle() {
     assert_eq!(s.write_demand(other, true, None), Ok(0), "writes in place");
     assert_eq!(s.from_index(b"o"), Ok(None));
 
-    s.release_working_set(adopted, s.current_epoch());
+    s.release_working_set(adopted);
+    let busy = s.prepare_write(other, true, None).unwrap();
+    let busy = s.publish_prepared(busy).unwrap();
     assert_eq!(s.drop_unused_indexes(), 1);
     assert_eq!(s.from_index(b"k"), Ok(None));
-    assert_eq!(s.available_slots(), 10, "the owners hold one slot each");
+    assert_eq!(
+        s.available_slots(),
+        10,
+        "a write the snapshot never fed does not hold its slot back"
+    );
+
+    let third = s.create_working_set(geom());
+    write_state(&mut s, third);
+    let read = s.folded_slot(third).unwrap().unwrap();
+    assert_eq!(s.update_index(b"r".to_vec(), third), Ok(0));
+    s.release_working_set(third);
+    s.note_reads(*busy.seqs().last().unwrap(), [read]);
+    let before = s.available_slots();
+    assert_eq!(s.drop_unused_indexes(), 1);
+    assert_eq!(
+        s.available_slots(),
+        before,
+        "a fire reading a dropped snapshot's slot holds it"
+    );
+    s.settle(busy);
+    assert_eq!(s.available_slots(), before + 1);
 }
 
 fn run_ahead_successor_never_resets_twice() {

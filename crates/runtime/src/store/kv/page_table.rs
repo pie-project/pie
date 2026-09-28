@@ -75,7 +75,6 @@ pub enum NoReclaim {
     AllShared,
     AllSwapped,
     Pinned,
-    Windowed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
