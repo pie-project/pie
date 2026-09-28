@@ -61,7 +61,7 @@ impl PrefixCache {
     }
 
     /// The positions past `from` a hybrid prefill must end a chunk at and
-    /// hand `publish` the state of: `structure` (e.g. message ends) floored to
+    /// hand `publish_state` the state of: `structure` (e.g. message ends) floored to
     /// pages, else pages 1, 2, 4, 8, ..., so O(log n) snapshots still reuse
     /// at least half of any shared prefix. Empty for an attention model.
     pub fn boundaries(&self, tokens: &[u32], from: u32, structure: Option<&[u32]>) -> Vec<u32> {
@@ -134,40 +134,44 @@ impl PrefixCache {
         }
     }
 
-    /// Publishes the prefill of `tokens` past the first `from`: every full
-    /// page on an attention model, else each `(boundary, state)` in `states`,
-    /// the state an `rs.fork` taken once the chunk ending there had landed.
-    /// `ws` must hold exactly the model's KV of `tokens` from a settled,
-    /// unmasked prefill.
+    /// Publishes every full page of `tokens` past the first `from` on an
+    /// attention model. `ws` must hold exactly the model's KV of `tokens`
+    /// from a settled, unmasked prefill.
     pub fn publish(
         &self,
         ws: &WorkingSet,
-        states: &[(u32, RsWorkingSet)],
         on: &Pipeline,
         tokens: &[u32],
         from: u32,
     ) -> Result<(), String> {
-        if self.mode == Mode::Off {
+        if self.mode != Mode::Pages {
             return Ok(());
         }
         let pages = tokens.len() as u32 / self.page_size;
         let keys = self.keys(tokens, pages);
-        let kv = |k: u32| ws.slice(on, 0, k)?.update_index(&keys[k as usize - 1]);
-        match self.mode {
-            Mode::Off => {}
-            Mode::Pages => {
-                for k in from / self.page_size + 1..=pages {
-                    kv(k)?;
-                }
-            }
-            Mode::Boundaries => {
-                for (b, state) in states {
-                    let k = b / self.page_size;
-                    state.update_index(&keys[k as usize - 1])?;
-                    kv(k)?;
-                }
-            }
+        for k in from / self.page_size + 1..=pages {
+            ws.slice(on, 0, k)?.update_index(&keys[k as usize - 1])?;
         }
         Ok(())
+    }
+
+    /// Publishes `tokens`, which end at one of `boundaries`, on a hybrid
+    /// model, as soon as the chunk ending there has landed: `ws` and `rs`
+    /// hold exactly their state. The snapshot belongs to the index, not to
+    /// this process, so idle reclaim can take it back when slots run short.
+    pub fn publish_state(
+        &self,
+        ws: &WorkingSet,
+        rs: &RsWorkingSet,
+        on: &Pipeline,
+        tokens: &[u32],
+    ) -> Result<(), String> {
+        if self.mode != Mode::Boundaries {
+            return Ok(());
+        }
+        let k = tokens.len() as u32 / self.page_size;
+        let key = &self.keys(tokens, k)[k as usize - 1];
+        rs.update_index(key)?;
+        ws.slice(on, 0, k)?.update_index(key)
     }
 }

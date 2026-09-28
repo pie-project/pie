@@ -43,13 +43,14 @@ fn index_snapshots_state_and_is_reclaimed_when_idle() {
     let ws = s.create_working_set(geom());
     let pending = s.prepare_write(ws, true, None).unwrap();
     let published = s.publish_prepared(pending).unwrap();
+    assert_eq!(s.update_index(b"k".to_vec(), ws), Ok(0));
     assert_eq!(
-        s.update_index(b"k".to_vec(), ws),
-        Err(RsError::IndexInFlight)
+        s.from_index(b"k"),
+        Ok(None),
+        "unreadable until its write settles"
     );
     s.settle(published);
     let slot = s.folded_slot(ws).unwrap();
-    assert_eq!(s.update_index(b"k".to_vec(), ws), Ok(0));
 
     write_state(&mut s, ws);
     assert_ne!(
@@ -65,10 +66,18 @@ fn index_snapshots_state_and_is_reclaimed_when_idle() {
         "an adopter still holds the state"
     );
 
+    let other = s.create_working_set(geom());
+    write_state(&mut s, other);
+    assert_eq!(s.update_index(b"o".to_vec(), other), Ok(0));
+    assert_eq!(s.write_demand(other, true, None), Ok(1));
+    assert_eq!(s.yield_indexes(&[other]), 1);
+    assert_eq!(s.write_demand(other, true, None), Ok(0), "writes in place");
+    assert_eq!(s.from_index(b"o"), Ok(None));
+
     s.release_working_set(adopted, s.current_epoch());
     assert_eq!(s.drop_unused_indexes(), 1);
     assert_eq!(s.from_index(b"k"), Ok(None));
-    assert_eq!(s.available_slots(), 11);
+    assert_eq!(s.available_slots(), 10, "the owners hold one slot each");
 }
 
 fn run_ahead_successor_never_resets_twice() {

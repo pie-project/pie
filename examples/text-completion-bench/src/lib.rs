@@ -451,7 +451,10 @@ async fn run_one(
             );
         }
         model::ForwardKind::Diffusion => {
-            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+            return Err(
+                "this program decodes a token at a time; a diffusion model wants a canvas loop"
+                    .into(),
+            );
         }
     };
 
@@ -459,7 +462,6 @@ async fn run_one(
     // the leading prefill chunks (below) and the first frame share it and
     // stay ordered.
     let pipe = Pipeline::new();
-    let mut states = Vec::new();
 
     // Leading prefill chunks: everything except the last span. They only
     // need to extend the KV, but a pass with no epilogue is rejected at
@@ -533,7 +535,9 @@ async fn run_one(
             .await
             .with_context(|| format!("drain prefill chunk @{base}"))?;
         if let Some(rs) = rs_ws.first().filter(|_| cuts.contains(&end)) {
-            states.push((end, rs.fork(&pipe).context("snapshot prefill state")?));
+            prefixes
+                .publish_state(&ws, rs, &pipe, &prompt_vec[..end as usize])
+                .context("publish prefill state")?;
         }
     }
 
@@ -763,7 +767,7 @@ async fn run_one(
     }
     // The prefill has landed: offer its prompt prefixes to later requests.
     prefixes
-        .publish(&ws, &states, &pipe, &prompt_vec, cached)
+        .publish(&ws, &pipe, &prompt_vec, cached)
         .context("publish prompt prefix")?;
 
     // **THE HOST ARM'S HANDOFF, AND THE WHOLE OF IT.** The token is
