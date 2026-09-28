@@ -205,10 +205,13 @@ impl Pools {
                     }
                     let head_dim = restated.map_or(width, |seat| u64::from(seat.head_dim));
                     let kv_heads = restated.map_or(1, |seat| u64::from(seat.kv_heads));
-                    let element = elem_bytes(name, *dtype)?;
                     let cells = paging.pages() * u64::from(paging.page_size);
-                    let plane = cells * width * element;
-                    let values_bytes = cells * planes.values * element;
+                    let plane = cells * row_stride(name, *dtype, width)?;
+                    let values_bytes = if planes.values == 0 {
+                        0
+                    } else {
+                        cells * row_stride(name, *dtype, planes.values)?
+                    };
                     let own_values = !planes.shared && planes.values != 0;
                     slabs.push(Buffer::zeroed(
                         device,
@@ -426,9 +429,17 @@ impl Pools {
             else {
                 continue;
             };
-            let element = u64::from(elem_size(dtype));
-            let keys_cell = u64::from(kv_heads) * u64::from(head_dim) * element;
-            let bases = [(0, keys_cell), (values_at, values_width * element)];
+            // Whole-slot cell strides. For a packed dtype these are the packed
+            // row bytes (codes + inline scale), NOT width * element — a slot's
+            // packed cells are contiguous, so a byte-blit still moves them, but
+            // only when the cell size is the packed stride.
+            let keys_cell = row_stride("kv migration", dtype, u64::from(kv_heads) * u64::from(head_dim))?;
+            let values_cell = if values_width == 0 {
+                0
+            } else {
+                row_stride("kv migration", dtype, values_width)?
+            };
+            let bases = [(0, keys_cell), (values_at, values_cell)];
             let bases = if values_at == 0 {
                 &bases[..1]
             } else {
@@ -553,14 +564,14 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
                 ..
             } => {
                 let planes = split(name, planes)?;
-                let element = elem_bytes(name, *dtype)?;
                 let cells = paging.pages() * u64::from(paging.page_size);
-                let width = if planes.shared {
-                    planes.keys
+                let keys = cells * row_stride(name, *dtype, planes.keys)?;
+                let values = if planes.shared || planes.values == 0 {
+                    0
                 } else {
-                    planes.keys + planes.values
+                    cells * row_stride(name, *dtype, planes.values)?
                 };
-                bytes = bytes.saturating_add(cells * width * element);
+                bytes = bytes.saturating_add(keys.saturating_add(values));
             }
             CacheRow::State { name, slab, dtype } => {
                 let stride: u64 = slab.iter().product();
@@ -608,6 +619,33 @@ fn split(name: &str, planes: &[u64]) -> Result<Planes> {
 fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {
     model_compiler::arena::elem_bytes(dtype).ok_or_else(|| Fault::Unbound {
         what: format!("cache `{name}`, stored as {dtype:?}, which has no element size"),
+    })
+}
+
+/// Bytes one cache row occupies for `width` elements of `dtype`.
+///
+/// A scalar dtype is `width * elem_bytes`. A PACKED dtype (C2b's `KvU4`, and any
+/// other block-quantized cache dtype) has no per-element byte size — its row is
+/// sized from the format's `row_bytes`, which folds the codes and the inline
+/// scale/bias planes of every whole group into one contiguous stride. The width
+/// must be a whole number of the format's quantum (256 for `KvU4`), which a KV
+/// cache of head_dim-256 heads always is; a ragged width is refused here rather
+/// than silently mis-sized. This is the ONE place packed vs. scalar sizing forks
+/// — reserve, migration copy and demand accounting all route through it so a
+/// packed plane is contiguous, whole-slot cells that a byte-blit can move.
+fn row_stride(name: &str, dtype: Dtype, width: u64) -> Result<u64> {
+    if let Some(element) = model_compiler::arena::elem_bytes(dtype) {
+        return Ok(width * element);
+    }
+    let k = u32::try_from(width).map_err(|_| Fault::Unbound {
+        what: format!("cache `{name}`, whose {width}-wide row overflows a packed-plane width"),
+    })?;
+    dtype.row_bytes(k).ok_or_else(|| Fault::Unbound {
+        what: format!(
+            "cache `{name}`, stored as {dtype:?}, whose {width}-wide row is not a whole number of \
+             the format's {}-element blocks",
+            dtype.quantum().elems(k)
+        ),
     })
 }
 

@@ -703,7 +703,6 @@ fn append_paged(
     write_page: Tensor,
     write_offset: Tensor,
 ) -> Result<(), Error> {
-    let entry = dtype_dispatch!(op, k.dtype, { Bf16 => "kv_append_paged_bfloat16" });
     if pool.page_size <= 0 {
         return Err(refuse(op, "the kv page size is zero"));
     }
@@ -716,6 +715,28 @@ fn append_paged(
         "the write tables are u32: one destination page and one in-page slot per lane"
     );
     let (head_dim, heads) = head_split(op, pool, k.width)?;
+    // The write kernel is chosen by the POOL's dtype, not the incoming
+    // activation's: a bf16 pool copies element-for-element, a packed KvU4 pool
+    // quantizes the incoming bf16 head into the 130-byte v1 block. The arg
+    // vector is identical for both — only the entry point and, for the packed
+    // path, the 256-block head constraint differ.
+    let entry = match pool.keys.dtype {
+        Dtype::Bf16 => dtype_dispatch!(op, k.dtype, { Bf16 => "kv_append_paged_bfloat16" }),
+        Dtype::KvU4 => {
+            if head_dim != crate::linear::kv_codec::BLOCK {
+                return Err(refuse(
+                    op,
+                    format!(
+                        "the packed KV codec writes whole {}-element heads, but this pool's head \
+                         is {head_dim} wide",
+                        crate::linear::kv_codec::BLOCK
+                    ),
+                ));
+            }
+            dtype_dispatch!(op, k.dtype, { Bf16 => "kv_append_paged_pack_sym4_bfloat16" })
+        }
+        other => return Err(Error::DtypeUnsupported { op, dtype: other }),
+    };
     let lanes = head_grid(op, head_dim, heads, k.rows)?;
     ctx.fire(
         Fire::at("attn/kv_write.metal", entry).apply(Grid::of(lanes, head_group(lanes))),
