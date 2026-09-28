@@ -26,7 +26,7 @@ use kernels_metal::elemwise::pointwise;
 use model_ir::{Dtype, Elementwise, Operation};
 
 fn noise(at: u64) -> u32 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5e5e_1234_9ABC_DEF0;
+    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     (x >> 32) as u32
@@ -92,6 +92,7 @@ fn blockwise_h_signed(x: &[f32], block: usize, signs: Option<&[f32]>) -> Vec<f32
 /// Run the Metal op over `rows x width` f32 values held row-major, in place,
 /// and read the result back. An optional ±1 sign diagonal is bound as a second
 /// buffer.
+#[allow(clippy::too_many_arguments)]
 fn run(
     device: &Context,
     handles: &Handles,
@@ -170,7 +171,16 @@ fn agrees_signed(
     let salt = (u64::from(rows) << 32) ^ (u64::from(width) << 8) ^ u64::from(block);
     let x: Vec<f32> = (0..n).map(|at| unit(at ^ salt ^ 0x5157_u64)).collect();
     let signs = signs_of(signs_width, 0xF00D ^ u64::from(block));
-    let got = run(device, handles, pipelines, rows, width, block, &x, Some(&signs));
+    let got = run(
+        device,
+        handles,
+        pipelines,
+        rows,
+        width,
+        block,
+        &x,
+        Some(&signs),
+    );
     let want = blockwise_h_signed(&x, block as usize, Some(&signs));
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
         close(
@@ -208,8 +218,24 @@ fn the_hadamard_transform_agrees() {
     // diagonal (signs_width == width) and a block-wide diagonal that repeats
     // block-wise across the row are both exercised, on both pipelines.
     for &block in &[128u32, 256, 512] {
-        agrees_signed(&device, &handles, &pipelines, 4, block * 3, block, (block * 3) as usize);
-        agrees_signed(&device, &handles, &pipelines, 4, block * 3, block, block as usize);
+        agrees_signed(
+            &device,
+            &handles,
+            &pipelines,
+            4,
+            block * 3,
+            block,
+            (block * 3) as usize,
+        );
+        agrees_signed(
+            &device,
+            &handles,
+            &pipelines,
+            4,
+            block * 3,
+            block,
+            block as usize,
+        );
     }
 
     // Orientation probe: a one-hot input picks out one column of H. Because H is
@@ -233,7 +259,11 @@ fn the_hadamard_transform_agrees() {
             } else {
                 inv
             };
-            close(got[bl + i], want, &format!("probe block1 (n={block}) entry {i}"));
+            close(
+                got[bl + i],
+                want,
+                &format!("probe block1 (n={block}) entry {i}"),
+            );
         }
     }
 
@@ -243,7 +273,9 @@ fn the_hadamard_transform_agrees() {
     for &block in &[128u32, 256, 512] {
         let n = u64::from(block) * 9;
         let width = block * 9;
-        let x: Vec<f32> = (0..n).map(|at| unit(at ^ 0xABCD ^ u64::from(block))).collect();
+        let x: Vec<f32> = (0..n)
+            .map(|at| unit(at ^ 0xABCD ^ u64::from(block)))
+            .collect();
         let once = run(&device, &handles, &pipelines, 1, width, block, &x, None);
         let twice = run(&device, &handles, &pipelines, 1, width, block, &once, None);
         for (i, (&t, &orig)) in twice.iter().zip(x.iter()).enumerate() {
@@ -276,9 +308,7 @@ fn the_hadamard_transform_agrees() {
 /// `[tokens, d]` and report whether `model_ir::check` flags a `HadamardBlock`
 /// fault for it.
 fn hadamard_check_faults(d: u64, block: u32) -> bool {
-    use model_ir::{
-        Def, Dim, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId,
-    };
+    use model_ir::{Def, Dim, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId};
 
     let ty = Ty::Tensor {
         shape: vec![Dim::Tokens, Dim::Const(d)],

@@ -89,7 +89,11 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
 /// The entrypoint and threads-per-block for a butterfly FWHT of a given block
 /// size and element type. Blocks up to 256 ride one simdgroup (32 threads);
 /// 512 and 1024 ride a 256-thread threadgroup.
-fn fwht_point(op: &'static str, block: u32, dtype: dtype::Dtype) -> Result<(&'static str, u32), Error> {
+fn fwht_point(
+    op: &'static str,
+    block: u32,
+    dtype: dtype::Dtype,
+) -> Result<(&'static str, u32), Error> {
     Ok(match (block, dtype) {
         (64, dtype::Dtype::Bf16) => ("fwht_simd_bfloat16_n_64", 32),
         (64, dtype::Dtype::F32) => ("fwht_simd_float32_n_64", 32),
