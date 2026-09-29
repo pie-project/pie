@@ -164,11 +164,11 @@ const STAGE_BYTES: u64 = 16 << 20;
 
 /// Maps every rank's stage into every other rank when each pair of devices
 /// reaches the other: the group's ranks share this process, so a peer's
-/// buffer is a plain device pointer once peer access is on. The handshake
-/// below is the whole decision: a link that carries the kernels' stores and
-/// loads carries every message, since at two ranks the peer all-reduce reads
+/// buffer is a plain device pointer once peer access is on. At two ranks the
+/// handshake below is the whole decision: a link that carries the kernels'
+/// stores and loads carries every message, since the peer all-reduce reads
 /// no more than NCCL's ring moves and never crosses host memory (#777).
-/// `None` when some pair does not, and the collectives stay on NCCL.
+/// `None` otherwise, and the collectives stay on NCCL.
 #[must_use]
 pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peers>> {
     #[cfg(feature = "cuda")]
@@ -199,8 +199,10 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
 
     let off = |why: String| Fault::program("comm::open_peers", why);
     let world = u32::try_from(ordinals.len()).unwrap_or(u32::MAX);
-    if !matches!(world, 2 | 4 | 8) {
-        return Err(off(format!("no peer kernel for a group of {world}")));
+    // Past two ranks every rank reads several peers at once; over PCIe that
+    // loses to NCCL at every size, where any pair alone wins (#777).
+    if world != 2 {
+        return Err(off(format!("no peer path for a group of {world}")));
     }
     for &a in ordinals {
         let mut vmm = 0;
