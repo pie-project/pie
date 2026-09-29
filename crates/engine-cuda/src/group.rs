@@ -377,6 +377,20 @@ impl Engine for Group {
 
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
         let mut answers = self.each_within(LOAD_WAIT, move |rank| rank.load(request.clone()))?;
+        // each rank pins and opens its own tiers; the group moves what all of them hold
+        let mut tiers = answers
+            .first()
+            .map(|loaded| loaded.caps.pools)
+            .unwrap_or_default();
+        tiers.least_tiers(answers.iter().map(|loaded| loaded.caps.pools));
+        for loaded in &mut answers {
+            let pools = &mut loaded.caps.pools;
+            pools.host_kv_pages = tiers.host_kv_pages;
+            pools.host_state_slots = tiers.host_state_slots;
+            pools.disk_kv_pages = tiers.disk_kv_pages;
+            loaded.caps.kv_copy.device_to_host &= tiers.host_kv_pages > 0;
+            loaded.caps.kv_copy.host_to_device &= tiers.host_kv_pages > 0;
+        }
         // a rank's facts (codegen backend, pools) exist only once it has loaded;
         // the snapshot taken at open was empty, and a group that keeps it says
         // "no codegen backend" to the host, which then emits no kernels and

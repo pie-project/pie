@@ -1099,12 +1099,34 @@ impl Frame {
         into_at: u64,
         len: u64,
     ) -> Result<()> {
-        if len == 0 {
+        self.copy_regions(source, into, &[(source_at, into_at, len)])
+    }
+
+    /// Copies each `(source_at, into_at, len)` region of `source` into
+    /// `into` under one pair of barriers; a host-mapped `into` is made
+    /// visible to the host once the frame's fence signals.
+    pub fn copy_regions(
+        &mut self,
+        source: &Buffer,
+        into: &Buffer,
+        regions: &[(u64, u64, u64)],
+    ) -> Result<()> {
+        let regions: Vec<vk::BufferCopy> = regions
+            .iter()
+            .filter(|&&(_, _, len)| len > 0)
+            .map(|&(source_at, into_at, len)| {
+                source.span(source_at, len)?;
+                into.span(into_at, len)?;
+                Ok(vk::BufferCopy::default()
+                    .src_offset(source_at)
+                    .dst_offset(into_at)
+                    .size(len))
+            })
+            .collect::<Result<_>>()?;
+        if regions.is_empty() {
             return Ok(());
         }
-        source.span(source_at, len)?;
-        into.span(into_at, len)?;
-        let (source, into) = (source.slab(), into.slab());
+        let (read_back, source, into) = (into.is_host(), source.slab(), into.slab());
         let d = &self.inner.core.device;
         let cmd = self.inner.cmd;
         unsafe {
@@ -1120,22 +1142,21 @@ impl Frame {
                 &[],
                 &[],
             );
-            d.cmd_copy_buffer(
-                cmd,
-                source.buffer,
-                into.buffer,
-                &[vk::BufferCopy::default()
-                    .src_offset(source_at)
-                    .dst_offset(into_at)
-                    .size(len)],
-            );
+            d.cmd_copy_buffer(cmd, source.buffer, into.buffer, &regions);
+            let (host_stage, host_read) = if read_back {
+                (vk::PipelineStageFlags::HOST, vk::AccessFlags::HOST_READ)
+            } else {
+                (vk::PipelineStageFlags::empty(), vk::AccessFlags::empty())
+            };
             let after = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | host_read,
+                );
             d.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | host_stage,
                 vk::DependencyFlags::empty(),
                 &[after],
                 &[],

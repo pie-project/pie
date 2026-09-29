@@ -246,6 +246,33 @@ pub fn state_slots_within(
     least_state_slots(u32::try_from(seats).unwrap_or(u32::MAX))
 }
 
+/// What a host pool of `budget` bytes seats: one rs row per device slot
+/// first (`rows` of `row_bytes`), then kv pages (`pages` of `page_bytes`)
+/// with the rest. Each is what the budget holds of it, so zero seats nothing.
+#[must_use]
+pub fn host_pool(
+    budget: u64,
+    rows: u32,
+    row_bytes: u64,
+    pages: u64,
+    page_bytes: u64,
+) -> (u32, u32) {
+    let clamp = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+    let rows = u64::from(rows).min(budget.checked_div(row_bytes).unwrap_or(0));
+    let pages = pages.min(
+        (budget - rows * row_bytes)
+            .checked_div(page_bytes)
+            .unwrap_or(0),
+    );
+    (clamp(rows), clamp(pages))
+}
+fn slot_file(error: std::io::Error) -> Fault {
+    Fault::Integrity {
+        at: "kv slot file",
+        why: error.to_string(),
+    }
+}
+
 pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let mut bytes: u64 = 0;
     for row in &trace.caches {
@@ -444,6 +471,28 @@ pub struct Pools {
     backed_pages: Vec<u64>,
     windowed_backed: bool,
     buffered: (u64, u64),
+    host: Option<HostKv>,
+    disk: Option<DiskKv>,
+}
+
+/// The slot file kv is suspended into below host memory, and the pinned
+/// page a copy to or from it goes through, in slot layout.
+#[derive(Debug)]
+struct DiskKv {
+    file: engine::disk::SlotFile,
+    stage: crate::device::Pinned,
+    /// An h2d out of the stage may still be in flight on the stream.
+    landing: bool,
+}
+/// The pinned host pages kv is suspended into. Each paged plane keeps its
+/// host pages side by side, as its device arena does, so a run of pages
+/// moves in one copy; the host rs rows follow them.
+#[derive(Debug)]
+struct HostKv {
+    buffer: crate::device::Pinned,
+    pages: u32,
+    rows: u32,
+    row_bytes: u64,
 }
 
 impl Pools {
@@ -572,6 +621,8 @@ impl Pools {
             backed_pages: Vec::new(),
             windowed_backed: false,
             buffered: (0, 1),
+            host: None,
+            disk: None,
         })
     }
 
@@ -1107,6 +1158,26 @@ impl Pools {
         Ok(())
     }
 
+    /// The state rows of `slot`, backed first; none when the load keeps no state.
+    pub fn state_spans(&mut self, slot: u32) -> Result<Vec<(u64, u64)>> {
+        if !slab_row(self.has_state(), self.paging.slots, slot)? {
+            return Ok(Vec::new());
+        }
+        self.ensure_state(slot + 1)?;
+        let mut spans = Vec::new();
+        for (planes, shape) in self.rows.iter().zip(&self.shapes) {
+            let Shape::State { stride, dtype } = *shape else {
+                continue;
+            };
+            let Some(arena) = planes.first() else {
+                continue;
+            };
+            let bytes = stride * u64::from(elem_size(dtype));
+            spans.push((arena.span(u64::from(slot) * bytes, bytes)?, bytes));
+        }
+        Ok(spans)
+    }
+
     /// Copies `moves` in the full rows and `windowed` (whole pages) in the
     /// windowed ones, whose page ids are their own.
     pub fn copy_kv(
@@ -1172,6 +1243,229 @@ impl Pools {
                     )?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The paged planes a kv page spans and the bytes it holds in each: the
+    /// full-context rows' key and value planes and the compressor slabs
+    /// indexed by the same pages. Windowed rows name their own pages.
+    fn paged_planes(&self) -> Vec<(&Arena, u64)> {
+        let page_size = u64::from(self.paging.page_size);
+        let mut planes = Vec::new();
+        for (arenas, shape) in self.rows.iter().zip(&self.shapes) {
+            let Shape::Kv {
+                windowed: false,
+                dtype,
+                keys_width,
+                values_width,
+                ..
+            } = *shape
+            else {
+                continue;
+            };
+            for (at, arena) in arenas.iter().enumerate() {
+                let width = if at == 0 { keys_width } else { values_width };
+                planes.push((arena, page_size * width * u64::from(elem_size(dtype))));
+            }
+        }
+        for row in &self.pooled {
+            let bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
+            planes.extend(row.planes.iter().map(|arena| (arena, bytes)));
+        }
+        planes
+    }
+
+    /// The bytes one kv page holds over every paged plane.
+    #[must_use]
+    pub fn paged_page_bytes(&self) -> u64 {
+        self.paged_planes().iter().map(|&(_, bytes)| bytes).sum()
+    }
+
+    /// Pins `pages` host kv pages and `rows` host rs rows of `row_bytes`.
+    pub fn seat_host(&mut self, pages: u32, rows: u32, row_bytes: u64) -> Result<()> {
+        let rows = if row_bytes == 0 { 0 } else { rows };
+        let bytes = u64::from(pages) * self.paged_page_bytes() + u64::from(rows) * row_bytes;
+        self.host = (bytes > 0)
+            .then(|| {
+                crate::device::Pinned::mapped_uninit(usize::try_from(bytes).unwrap_or(usize::MAX))
+                    .map(|buffer| HostKv {
+                        buffer,
+                        pages,
+                        rows,
+                        row_bytes,
+                    })
+            })
+            .transpose()?;
+        Ok(())
+    }
+
+    /// The host rs rows seated and the bytes of one.
+    #[must_use]
+    pub fn host_rows(&self) -> (u32, u64) {
+        self.host
+            .as_ref()
+            .map_or((0, 0), |host| (host.rows, host.row_bytes))
+    }
+
+    /// The host address of rs row `row`.
+    pub fn host_row(&self, row: u32) -> Result<u64> {
+        let (rows, row_bytes) = self.host_rows();
+        match self.host.as_ref() {
+            Some(host) if row < rows => Ok(host.buffer.host() as u64
+                + u64::from(host.pages) * self.paged_page_bytes()
+                + u64::from(row) * row_bytes),
+            _ => Err(Fault::Ceiling {
+                what: "host rs rows",
+                need: u64::from(row) + 1,
+                have: u64::from(rows),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn host_pages(&self) -> u32 {
+        self.host.as_ref().map_or(0, |host| host.pages)
+    }
+
+    /// Opens `dir`'s slot file for this rank with `budget` bytes of kv pages;
+    /// a budget short of one page seats none.
+    pub fn seat_disk(&mut self, dir: &std::path::Path, rank: u32, budget: u64) -> Result<()> {
+        let file = engine::disk::SlotFile::open(dir, rank, self.paged_page_bytes(), budget)
+            .map_err(slot_file)?;
+        self.disk = file
+            .map(|file| {
+                crate::device::Pinned::mapped_uninit(file.stride()).map(|stage| DiskKv {
+                    file,
+                    stage,
+                    landing: false,
+                })
+            })
+            .transpose()?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn disk_pages(&self) -> u32 {
+        self.disk.as_ref().map_or(0, |disk| disk.file.slots())
+    }
+
+    /// Copies whole kv pages between the device pool and the slot file,
+    /// `device[i]` with `disk[i]`, one page through the stage at a time. A
+    /// write lands behind the fires that wrote the page; a read returns once
+    /// its last h2d copy is enqueued.
+    pub fn spill_kv(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        to_disk: bool,
+        device: &[u32],
+        disk: &[u32],
+    ) -> Result<()> {
+        let have = u64::from(self.disk_pages());
+        if let Some(&slot) = disk.iter().find(|&&slot| u64::from(slot) >= have) {
+            return Err(Fault::Ceiling {
+                what: "disk kv pages",
+                need: u64::from(slot) + 1,
+                have,
+            });
+        }
+        let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
+        self.ensure_kv(highest)?;
+        let Some(mut spill) = self.disk.take() else {
+            return Ok(());
+        };
+        let copied = self.spill_through(&mut spill, stream, to_disk, device, disk);
+        self.disk = Some(spill);
+        copied
+    }
+
+    fn spill_through(
+        &self,
+        spill: &mut DiskKv,
+        stream: *mut core::ffi::c_void,
+        to_disk: bool,
+        device: &[u32],
+        disk: &[u32],
+    ) -> Result<()> {
+        let planes = self.paged_planes();
+        let (stage, stride) = (spill.stage.host(), spill.file.stride());
+        // SAFETY: the stage is this load's pinned page, and every copy on the
+        // stream that touches it is waited for before the host reads or
+        // writes it.
+        let staged = || unsafe { std::slice::from_raw_parts_mut(stage, stride) };
+        for (&page, &slot) in device.iter().zip(disk) {
+            if spill.landing {
+                crate::device::ctx::sync(stream)?;
+                spill.landing = false;
+            }
+            if !to_disk {
+                spill.file.read(slot, staged()).map_err(slot_file)?;
+            }
+            let mut offset = 0u64;
+            for &(arena, page_bytes) in &planes {
+                let on_device = arena.span(u64::from(page) * page_bytes, page_bytes)?;
+                let on_host = stage as u64 + offset;
+                let (dst, src) = if to_disk {
+                    (on_host, on_device)
+                } else {
+                    (on_device, on_host)
+                };
+                crate::device::copy_any(stream, dst, src, page_bytes as usize)?;
+                offset += page_bytes;
+            }
+            if to_disk {
+                crate::device::ctx::sync(stream)?;
+                spill.file.write(slot, staged()).map_err(slot_file)?;
+            } else {
+                spill.landing = true;
+            }
+        }
+        Ok(())
+    }
+    /// Copies whole kv pages between the device pool and the host pages,
+    /// `device[i]` with `host[i]`, enqueued on `stream` behind the fires that
+    /// wrote them.
+    pub fn swap_kv(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        to_host: bool,
+        device: &[u32],
+        host: &[u32],
+    ) -> Result<()> {
+        let have = u64::from(self.host_pages());
+        let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
+        if let Some(&page) = host.iter().find(|&&page| u64::from(page) >= have) {
+            return Err(Fault::Ceiling {
+                what: "host kv pages",
+                need: u64::from(page) + 1,
+                have,
+            });
+        }
+        self.ensure_kv(highest)?;
+        let Some(buffer) = self.host.as_ref().map(|host| host.buffer.host() as u64) else {
+            return Ok(());
+        };
+        let mut runs: Vec<(u32, u32, u32)> = Vec::new();
+        for (&d, &h) in device.iter().zip(host) {
+            match runs.last_mut() {
+                Some((d0, h0, n)) if *d0 + *n == d && *h0 + *n == h => *n += 1,
+                _ => runs.push((d, h, 1)),
+            }
+        }
+        let mut base = 0u64;
+        for (arena, page_bytes) in self.paged_planes() {
+            for &(d, h, n) in &runs {
+                let bytes = u64::from(n) * page_bytes;
+                let on_device = arena.span(u64::from(d) * page_bytes, bytes)?;
+                let on_host = buffer + base + u64::from(h) * page_bytes;
+                let (dst, src) = if to_host {
+                    (on_host, on_device)
+                } else {
+                    (on_device, on_host)
+                };
+                crate::device::copy_any(stream, dst, src, usize::try_from(bytes).unwrap_or(0))?;
+            }
+            base += have * page_bytes;
         }
         Ok(())
     }
@@ -1620,8 +1914,17 @@ mod tests {
     #[test]
     fn store_every_case() {
         a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse();
+        a_host_pool_seats_its_rows_first_and_pages_with_the_rest();
     }
 
+    fn a_host_pool_seats_its_rows_first_and_pages_with_the_rest() {
+        let mib = 1u64 << 20;
+        assert_eq!(host_pool(100 * mib, 8, mib, 1000, mib / 16), (8, 1000));
+        assert_eq!(host_pool(20 * mib, 8, mib, 1000, mib / 16), (8, 192));
+        assert_eq!(host_pool(4 * mib, 8, mib, 1000, mib / 16), (4, 0));
+        assert_eq!(host_pool(0, 8, mib, 1000, mib / 16), (0, 0));
+        assert_eq!(host_pool(mib, 8, 0, 4, mib / 4), (0, 4));
+    }
     // gemma-4 (no slab) with 256 slots reserved seated a lane at 312.
     fn a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse() {
         assert!(!slab_row(false, 256, 312).expect("no slab, no ceiling"));

@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 
 pub(crate) use dispatch::{
-    close_channels, copy_d2h_tracked, copy_h2d_tracked, copy_kv_cells,
+    TierKind, TierMove, close_channels, copy_kv_cells, copy_tier_tracked,
     register_channels_bind_classified,
 };
 pub use stats::{AggregateStats, HostSubmitStats};
@@ -271,7 +271,10 @@ fn rs_state_copy_plan(
             token_count: 0,
         })
         .collect();
-    Ok(Some(::engine::StateCopy { moves: slot_ranges }))
+    Ok(Some(::engine::StateCopy {
+        moves: slot_ranges,
+        ..::engine::StateCopy::default()
+    }))
 }
 
 pub fn submit_async(

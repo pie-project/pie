@@ -370,6 +370,15 @@ impl Buffers {
         Ok(())
     }
 
+    /// The page `slot` names across the layers, when it is backed.
+    #[must_use]
+    pub fn page_span(&self, slot: u32) -> Option<(u64, u64)> {
+        (slot < self.committed_pages).then(|| {
+            let bytes = self.slot_bytes();
+            (self.arena.base() + u64::from(slot) * bytes, bytes)
+        })
+    }
+
     #[must_use]
     pub fn ext_row_bytes(&self) -> u64 {
         self.ext_row_bytes

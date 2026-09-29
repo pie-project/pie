@@ -1012,6 +1012,19 @@ impl Shell {
         Ok(())
     }
 
+    /// Opens `budget` bytes of disk kv pages under `dir`, if any.
+    pub fn seat_disk_kv(&mut self, budget: u64, dir: Option<&std::path::Path>) -> Result<u32> {
+        match dir.filter(|_| budget > 0) {
+            Some(dir) => self.pools.seat_disk(dir, budget),
+            None => Ok(0),
+        }
+    }
+
+    pub fn spill_kv(&mut self, to_disk: bool, pages: &[u32], slots: &[u32]) -> Result<()> {
+        self.drain()?;
+        self.pools.spill_kv(to_disk, pages, slots)
+    }
+
     pub fn copy_state(&mut self, moves: &[(u32, u32)]) -> Result<()> {
         if moves.is_empty() || !self.pools.has_state() {
             return Ok(());

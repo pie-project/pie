@@ -189,6 +189,10 @@ impl RsSlotReservation {
             port: None,
         }
     }
+
+    pub(super) fn lend(&mut self) -> &mut Vec<RsSlotId> {
+        &mut self.slots
+    }
 }
 
 impl Drop for RsSlotReservation {

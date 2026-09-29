@@ -47,6 +47,28 @@ pub struct PoolFacts {
     pub window_pages: u32,
     #[serde(default)]
     pub window_tokens: u32,
+    /// The tiers below the device: host pages kv can be suspended into by
+    /// `kv_copy`, host rows a `StateCopy` may park rs slots in, and slot-file
+    /// pages `kv_copy` serves to and from `MemoryDomain::LocalDisk`. Zero
+    /// means the engine serves no such copies.
+    #[serde(default)]
+    pub host_kv_pages: u32,
+    #[serde(default)]
+    pub host_state_slots: u32,
+    #[serde(default)]
+    pub disk_kv_pages: u32,
+}
+
+impl PoolFacts {
+    /// Keeps only the tier capacity every rank of `ranks` has: a group moves
+    /// what all of them can hold.
+    pub fn least_tiers(&mut self, ranks: impl Iterator<Item = PoolFacts>) {
+        for rank in ranks {
+            self.host_kv_pages = self.host_kv_pages.min(rank.host_kv_pages);
+            self.host_state_slots = self.host_state_slots.min(rank.host_state_slots);
+            self.disk_kv_pages = self.disk_kv_pages.min(rank.disk_kv_pages);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
