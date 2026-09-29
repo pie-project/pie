@@ -12,23 +12,25 @@
 //! - one or two tokens' pairs: each pair's expert is dynamic-sliced out of
 //!   the bank straight into its own dot (independent dots XLA overlaps);
 //! - more pairs (decode at batch): the pairs are sorted by expert and a
-//!   loop runs one dot per active expert (per row tile of it), two experts
-//!   a step, over the rows routed to it; when more experts are active than
-//!   the loop is worth (it pays ~15 us a step, v6e) a `case` streams the
-//!   whole bank instead: every row against every expert in one dot behind
-//!   a free convert (group factors, when the bank has them, scale the
-//!   per-group partials), each pair's row picked out;
+//!   loop runs one dot per active expert (per row tile of it), two a step,
+//!   over the rows routed to it; when more experts are active than the loop
+//!   is worth (a tile's dot costs ~14 us however small the expert, v6e) the
+//!   whole bank streams instead: every row against every expert in one dot
+//!   behind a free convert (group factors, when the bank has them, scale
+//!   the per-group partials), each pair's row picked out. The fire's routes
+//!   pick between the two at run time (each runs in a loop whose trip count
+//!   is zero when not taken);
 //! - many rows (prefill): stable-sort the pairs by expert, gather the
 //!   activation rows in that order, decode the whole bank to bf16 once and
 //!   run one `chlo.ragged_dot`, then un-permute with the inverse sort.
 //!
 //! The bytes floor is the active experts' bytes: at batch 64 with top-4 of
 //! 32 experts and diverse tokens nearly every expert is active and the
-//! whole bank streams (e5m2: 0.67 ms a gpt-oss layer at ~1.19 TB/s, the
-//! rate an XLA dot reads HBM at on v6e). An exact 4-bit form does not
-//! help there: decoding e2m1 with its group scale inside the dot's operand
-//! takes more VPU work per weight than streaming e5m2 costs (measured:
-//! 0.8 ms for the gate/up bank as `i4` codes, 2 ms as `f4E2M1FN`).
+//! whole bank streams (e5m2: ~0.55 ms a gpt-oss layer on v6e). An exact
+//! 4-bit form does not help there: decoding e2m1 with its group scale
+//! inside the dot's operand takes more VPU work per weight than streaming
+//! e5m2 costs (measured: 0.8 ms for the gate/up bank as `i4` codes, 2 ms
+//! as `f4E2M1FN`, 0.45 ms pre-scaled).
 //!
 //! References: `kernels-wgpu/src/linear/moe.rs` + `kernels/moe/{route,
 //! qmv_routed}.wgsl`; the sink router from `kernels-cuda/kernels/linear/
@@ -1247,7 +1249,8 @@ fn every_expert(
 }
 
 /// The rows of one tile of the loop over active experts: the fire's tokens
-/// (a token routes to an expert once), at most 128.
+/// (a token routes to an expert once), at most 128 (`PIE_XLA_MOE_TILE`
+/// lowers the cap, for tuning).
 fn loop_tile(fan: Fan) -> i64 {
     let p = fan.pairs();
     let most = std::env::var("PIE_XLA_MOE_TILE")
@@ -1381,6 +1384,9 @@ fn run_active(
                     let du = cx.const_i(Elem::I32, u, &[]);
                     let t = cx.add(first, du)?;
                     let s = scalar_at(&mut cx, order, t)?;
+                    // The slice's start is `expert · N` computed here: read
+                    // from a per-tile table instead, XLA stopped fusing the
+                    // slice into the dot (v6e, gpt-oss: +4 ms at 64 rows).
                     let ex = scalar_at(&mut cx, skey, s)?;
                     let w = expert(&mut cx, &bank, ex, n)?;
                     let zero = cx.const_i(Elem::I32, 0, &[]);

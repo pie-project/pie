@@ -566,8 +566,10 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, sku: &str) -> R
 /// weight (`y = act · wᵀ`). They land transposed, `[K, N]` with the output
 /// axis minor: XLA's TPU gemm streams a `[N, K]` weight at ~1.2-1.4 TB/s
 /// once a fire has more than one row, and a `[K, N]` one near the HBM
-/// roofline (a single-row gemv is at the roofline either way). A param read
-/// any other way (an embedding gather, a norm, a bank) lands as declared.
+/// roofline (a single-row gemv is at the roofline either way). So do the
+/// sub-byte codes planes of quantized gemm weights the TPU would otherwise
+/// lay out K-minor (below). A param read any other way (an embedding
+/// gather, a norm, a routed bank) lands as declared.
 /// `PIE_XLA_WEIGHT_T=0` lands every param as declared.
 fn gemm_only(trace: &Trace, banks: &std::collections::BTreeSet<usize>) -> std::collections::BTreeSet<usize> {
     use model_ir::{Def, Linear, Operands, Operation};

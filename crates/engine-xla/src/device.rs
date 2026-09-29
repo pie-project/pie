@@ -321,7 +321,7 @@ impl Device {
 /// admits one process per chip, and one that just let go of the bench's lock
 /// file holds the chip a moment longer. `PIE_XLA_OPEN_WAIT` bounds the wait
 /// in seconds (default 60; 0 fails at once).
-fn open_client(plugin: Option<&std::path::Path>) -> Result<Client> {
+pub(crate) fn open_client(plugin: Option<&std::path::Path>) -> Result<Client> {
     let wait = std::env::var("PIE_XLA_OPEN_WAIT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

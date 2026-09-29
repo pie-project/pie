@@ -25,14 +25,21 @@ pub fn client() -> Option<&'static Mutex<Client>> {
     CLIENT
         .get_or_init(|| {
             let lock = lock_device();
-            let api = match crate::pjrt::Api::discover(None) {
-                Ok(api) => api,
+            // A chip another process holds is waited for (`PIE_XLA_OPEN_WAIT`)
+            // and a wait that runs out fails the test: only a host with no
+            // plugin at all skips, so a busy chip never reads as a pass.
+            let client = match crate::device::open_client(None) {
+                Ok(client) => client,
                 Err(e) => {
-                    eprintln!("no PJRT plugin, skipping device tests: {e}");
+                    let why = e.to_string();
+                    assert!(
+                        !(why.contains("lockfile") || why.contains("already in use")),
+                        "the TPU stayed held by another process: {why}"
+                    );
+                    eprintln!("no PJRT plugin, skipping device tests: {why}");
                     return None;
                 }
             };
-            let client = Client::create(api).expect("the plugin loads but will not open a client");
             // The lock is held for the life of the process.
             std::mem::forget(lock);
             Some(Mutex::new(client))
