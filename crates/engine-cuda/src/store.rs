@@ -9,6 +9,7 @@ use crate::error::{Fault, Result};
 use crate::run::{CachePool, CacheTable, PoolSlabs};
 use crate::settle::Airborne;
 use crate::store::kv::{Facts, Paging};
+pub use engine::fit::{least_state_slots, pages_within, state_slots_within};
 
 impl From<model_exec::store::Fault> for Fault {
     fn from(fault: model_exec::store::Fault) -> Fault {
@@ -193,57 +194,6 @@ pub fn decoded_weight_reserve(widest_plane_bytes: u64, streams: u32) -> u64 {
         .checked_next_multiple_of(GRAIN)
         .unwrap_or(u64::MAX)
         .saturating_mul(u64::from(streams.max(1)))
-}
-
-/// The least state slots a fitted pool holds for `seated` kv sequences: two
-/// per seat, one per posted frame, and never under the three one buffered
-/// lane holds alone (its folded state and the two pages a window spans).
-#[must_use]
-pub fn least_state_slots(seated: u32) -> u32 {
-    seated.saturating_mul(2).max(3)
-}
-
-/// The largest page count at or under `asked` whose watermark fits `room`,
-/// or zero when not even the first page does. `declared_at` is the watermark
-/// at a page count and only ever grows with it, so this is a bisection over
-/// a step function, not a division: each plane rounds up to a map unit, and
-/// a model has dozens of planes.
-#[must_use]
-pub fn pages_within(asked: u64, room: u64, declared_at: impl Fn(u64) -> u64) -> u64 {
-    if declared_at(asked) <= room {
-        return asked;
-    }
-    let (mut fits, mut over) = (0u64, asked);
-    while over - fits > 1 {
-        let probe = fits + (over - fits) / 2;
-        if declared_at(probe) <= room {
-            fits = probe;
-        } else {
-            over = probe;
-        }
-    }
-    fits
-}
-
-/// The state slots a hybrid's pool holds when `room` does not seat one
-/// sequence beside the `asked` count's slabs: the most whole seats of two
-/// slots (one a posted frame, as the runtime admits lanes) whose slabs take
-/// at most half of what is past `one_sequence`, the kv pages' watermark at
-/// the declared context, and never under what one buffered lane holds
-/// (`least_state_slots`). `slabs_at` is the slabs' watermark at a slot count.
-#[must_use]
-pub fn state_slots_within(
-    asked: u32,
-    room: u64,
-    one_sequence: u64,
-    slabs_at: impl Fn(u32) -> u64,
-) -> u32 {
-    let seats = pages_within(
-        u64::from(asked / 2),
-        room.saturating_sub(one_sequence) / 2,
-        |seats| slabs_at(u32::try_from(seats).unwrap_or(u32::MAX).saturating_mul(2)),
-    );
-    least_state_slots(u32::try_from(seats).unwrap_or(u32::MAX))
 }
 
 /// What a host pool of `budget` bytes seats: one rs row per device slot
