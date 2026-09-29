@@ -32,7 +32,7 @@ impl ForwardHybrid for TokensAndLatents {
         let mut spec = HybridSpec::new();
         let space = spec.kv_space(Dtype::Bf16);
         let plane = u64::from(HEADS) * u64::from(HEAD_DIM);
-        spec.kv(space, KV_ROW, [plane, plane]);
+        spec.kv(space, KV_ROW, [plane, plane], HEAD_DIM);
         spec
     }
 

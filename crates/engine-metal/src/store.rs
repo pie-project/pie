@@ -182,6 +182,7 @@ impl Pools {
                     planes,
                     dtype,
                     space,
+                    ..
                 } => {
                     let planes = split(name, planes)?;
                     let width = planes.keys;
@@ -569,18 +570,24 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
                 name,
                 planes,
                 dtype,
+                head_dim,
                 ..
             } => {
                 let planes = split(name, planes)?;
                 let cells = paging.pages() * u64::from(paging.page_size);
-                // The demand estimate runs before consumers state a seat, so no
-                // head_dim is available here; KvU4 falls back to its format anchor
-                // (head_dim-256 block), exact for the shipping flagship.
-                let keys = cells * row_stride(name, *dtype, planes.keys, None)?;
+                // The demand estimate runs before consumers state a seat, but the
+                // trace row now carries the cache's head_dim, so a packed KvU4
+                // cache is sized exactly per head at ANY head_dim (matching what
+                // `reserve` computes from the seat), not from the 256 anchor. A
+                // row from a trace serialized before this field carries head_dim
+                // 0, which `row_stride` treats as "unknown" and falls back to the
+                // format anchor — the old behavior.
+                let block = (*head_dim != 0).then_some(*head_dim);
+                let keys = cells * row_stride(name, *dtype, planes.keys, block)?;
                 let values = if planes.shared || planes.values == 0 {
                     0
                 } else {
-                    cells * row_stride(name, *dtype, planes.values, None)?
+                    cells * row_stride(name, *dtype, planes.values, block)?
                 };
                 bytes = bytes.saturating_add(keys.saturating_add(values));
             }

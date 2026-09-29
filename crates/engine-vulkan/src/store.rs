@@ -203,6 +203,7 @@ impl Pools {
                     planes,
                     dtype,
                     space,
+                    ..
                 } => {
                     let planes = split(name, planes)?;
                     let width = planes.keys;

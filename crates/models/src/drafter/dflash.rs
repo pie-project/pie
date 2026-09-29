@@ -241,7 +241,7 @@ impl DFlash {
         for b in &self.blocks {
             let a = &b.attn;
             let plane = u64::from(a.kv_heads) * u64::from(a.head_dim);
-            c.kv(space, a.attn_kv(), [plane, plane]);
+            c.kv(space, a.attn_kv(), [plane, plane], a.head_dim);
         }
     }
 

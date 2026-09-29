@@ -68,8 +68,14 @@ impl ForwardHybrid for Model {
                         kv,
                         a.kv.clone(),
                         [self.kv_lora_rank as u64, a.qk_rope_head_dim as u64],
+                        a.qk_rope_head_dim,
                     );
-                    c.kv(index, a.indexer.keys.clone(), [a.indexer.head_dim as u64]);
+                    c.kv(
+                        index,
+                        a.indexer.keys.clone(),
+                        [a.indexer.head_dim as u64],
+                        a.indexer.head_dim,
+                    );
                 }
                 Mixer::Kda(k) => {
                     let width = (k.heads * k.head_dim) as u64;
@@ -92,11 +98,13 @@ impl ForwardHybrid for Model {
                 kv,
                 mtp.attn.kv.clone(),
                 [self.kv_lora_rank as u64, mtp.attn.qk_rope_head_dim as u64],
+                mtp.attn.qk_rope_head_dim,
             );
             c.kv(
                 index,
                 mtp.attn.indexer.keys.clone(),
                 [mtp.attn.indexer.head_dim as u64],
+                mtp.attn.indexer.head_dim,
             );
         }
         c

@@ -72,7 +72,7 @@ impl ForwardHybrid for Model {
         for w in &self.layers {
             match &w.mixer {
                 Mixer::Attn(a) => {
-                    c.kv(kv, a.kv.clone(), [plane, plane]);
+                    c.kv(kv, a.kv.clone(), [plane, plane], self.head_dim);
                 }
                 Mixer::Gdn(g) => {
                     let conv_ch = u64::from(Gdn::qkv_width(g.k_heads, g.v_heads, g.k_dim, g.v_dim));
@@ -90,7 +90,7 @@ impl ForwardHybrid for Model {
             }
         }
         if self.mtp.is_some() {
-            c.kv(kv, "kv.mtp".to_string(), [plane, plane]);
+            c.kv(kv, "kv.mtp".to_string(), [plane, plane], self.head_dim);
         }
         if let Some(p) = &self.ple {
             let wide = u64::from(self.streams) * u64::from(self.hidden);

@@ -88,7 +88,7 @@ impl ForwardHybrid for Model {
         for w in &self.layers {
             match &w.mixer {
                 Mixer::Attn(a) => {
-                    c.kv(kv, a.kv.clone(), [plane, plane]);
+                    c.kv(kv, a.kv.clone(), [plane, plane], self.head_dim);
                 }
 
                 Mixer::Gdn(g) => {
@@ -108,7 +108,7 @@ impl ForwardHybrid for Model {
         }
         if let Some(mtp) = &self.mtp {
             let a = &mtp.attn;
-            c.kv(kv, a.kv.clone(), [plane, plane]);
+            c.kv(kv, a.kv.clone(), [plane, plane], self.head_dim);
         }
         if let Some(dflash) = &self.dflash {
             dflash.declare_caches(&mut c, kv);

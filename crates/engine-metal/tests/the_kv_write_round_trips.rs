@@ -197,10 +197,12 @@ fn the_kv_write_round_trips() {
     eprintln!("=== C2b: packed 4-bit KV write (dtype g256_u4_f16_n) ===");
 
     // ---- (A) allocation at head_dim 256 (the shipping flagship) -------------
-    // The packed cache is sized from `row_bytes` (130 B per 256-block), not
-    // `width * element`. This is the pre-facts demand-estimate path, which has no
-    // head_dim and anchors at the dtype's 256-block; the write round-trip in (B)
-    // exercises the reserve/head_dim-driven sizing at 128 AND 256.
+    // The packed cache is sized per head from the head_dim the trace row now
+    // carries (a head packs to `head_dim/2 + 2` bytes), not `width * element`.
+    // At head_dim 256 this equals the codec's own 256-block `row_bytes` anchor
+    // (130 B/block), so the estimate is unchanged for the flagship; (C) proves
+    // it now also matches `reserve` at head_dim 128, and (B) exercises the
+    // write path at 128 AND 256.
     {
         const HEAD_DIM: usize = 256;
         const BLOCK: usize = 256;
@@ -224,6 +226,7 @@ fn the_kv_write_round_trips() {
                 planes: vec![width, width],
                 dtype,
                 space: 0,
+                head_dim: HEAD_DIM as u32,
             }],
             values: Vec::new(),
             nodes: Vec::new(),
@@ -380,4 +383,101 @@ fn write_case(rig: &mut Rig, head_dim: usize) {
         mse.is_finite() && mse > 0.0,
         "head_dim {head_dim}: the round-trip MSE should be a finite positive 4-bit error, got {mse:.3e}"
     );
+}
+
+/// C2b(C) — the invariant that generalizes the codec: the pre-facts demand
+/// estimate (`pool_demand`, which sees only the trace) sizes a packed `KvU4`
+/// cache to the EXACT bytes `reserve` later allocates from the stated seat, at
+/// ANY head_dim — not only at the 256 the codec's anchor baked in. Because the
+/// KV row now carries its head_dim, the estimate packs per head just like
+/// `reserve`, so a head_dim-128 model (which the old 256 anchor mis-sized or
+/// outright refused) loads correctly.
+#[test]
+fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
+    use engine_metal::store::Pools;
+    use engine_metal::store::kv::{Facts, SpaceFacts};
+
+    eprintln!("=== C2b(C): pool_demand sizes packed KvU4 exactly at any head_dim ===");
+
+    let paging = Paging::of(PAGE_SIZE, PAGE_SIZE, 0, PAGES).expect("paging");
+
+    // A one-row KvU4 cache of `kv_heads` heads of `head_dim`, split into a key
+    // half and a value half, carrying head_dim on the row.
+    let kv_trace = |dtype: Dtype, kv_heads: u32, head_dim: u32| {
+        let width = u64::from(kv_heads) * u64::from(head_dim);
+        Trace {
+            name: String::from("kv_estimate_probe"),
+            platform: Platform::Metal,
+            params: Vec::new(),
+            caches: vec![CacheRow::Kv {
+                name: String::from("kv"),
+                planes: vec![width, width],
+                dtype,
+                space: 0,
+                head_dim,
+            }],
+            values: Vec::new(),
+            nodes: Vec::new(),
+            seams: Vec::new(),
+            drafter: None,
+        }
+    };
+
+    // (i) A head_dim-128 packed cache whose kv_heads*128 is NOT a multiple of
+    //     256 USED TO REFUSE: the pre-facts path fell back to the codec's
+    //     256-block anchor, and `row_bytes(128)` is not a whole 256-block. With
+    //     the head_dim on the row the estimate sizes per head and succeeds.
+    let odd = kv_trace(Dtype::KvU4, 1, 128); // width 128 — not a 256 multiple
+    let odd_bytes = pool_demand(&odd, paging).expect("head_dim-128 KvU4 must size, not refuse");
+    // The same row with head_dim unknown (0) is the OLD anchor path — it refuses.
+    let mut stale = odd.clone();
+    if let CacheRow::Kv { head_dim, .. } = &mut stale.caches[0] {
+        *head_dim = 0;
+    }
+    assert!(
+        pool_demand(&stale, paging).is_err(),
+        "the pre-schema 256 anchor refuses a 128-wide packed row — the case the fix cures"
+    );
+    eprintln!(
+        "[estim ] head_dim=128 kv_heads=1: sized {odd_bytes} B (the 256 anchor refused this)"
+    );
+
+    // (ii) With a Metal device, the estimate EQUALS reserve's real allocation at
+    //      head_dim 128 AND 256, and a bf16 cache is unchanged (non-regression).
+    let Ok(device) = Context::bind() else {
+        eprintln!("not asked: no Metal device — estimate/refusal already checked");
+        return;
+    };
+    for &(dtype, kv_heads, head_dim) in &[
+        (Dtype::KvU4, 2u32, 256u32),
+        (Dtype::KvU4, 2, 128),
+        (Dtype::KvU4, 1, 128),
+        (Dtype::Bf16, 2, 128),
+    ] {
+        let trace = kv_trace(dtype, kv_heads, head_dim);
+        let est = pool_demand(&trace, paging).expect("demand estimate");
+        // The seat a consumer states: kv_heads heads of head_dim.
+        let facts = Facts {
+            rows: vec![Some(SpaceFacts {
+                head_dim,
+                kv_heads,
+                q_heads: 0,
+                window: None,
+            })],
+            plans: Vec::new(),
+        };
+        let actual = Pools::reserve(&device, &trace, paging, &facts)
+            .expect("reserve")
+            .bytes();
+        eprintln!(
+            "[match ] {dtype:?} kv_heads={kv_heads} head_dim={head_dim:>3}: \
+             pool_demand={est} B  reserve={actual} B"
+        );
+        assert_eq!(
+            est, actual,
+            "{dtype:?} kv_heads={kv_heads} head_dim={head_dim}: the pre-estimate must equal the \
+             real allocation"
+        );
+    }
+    eprintln!("=== C2b(C) done: pre-estimate == reserve at head_dim 128 & 256 ===");
 }
