@@ -63,15 +63,28 @@ const SDPA_TILED_LSE: [&str; 4] = [
     "sdpa_paged_tiled_lse_bfloat16_d_512",
 ];
 
-// C2c-1 — the packed 4-bit KV decode read. Only the 256-wide head is stamped:
-// a packed kv head is one whole 256-block, so no other width has a shader.
-const SDPA_DECODE_KV_U4_D256: &str = "sdpa_paged_decode_kv_u4_bfloat16_d_256";
-const SDPA_KV_U4_HEAD_DIM: u32 = 256;
+// C2c — the packed 4-bit KV reads. A packed kv head is one whole head_dim-block,
+// so the codec block IS the head_dim; the read shaders are stamped per head_dim
+// (mirroring the bf16 SDPA widths) and the dispatch selects by the pool's head
+// width. The widths stamped for the packed path:
+const SDPA_KV_U4_WIDTHS: [u32; 2] = [128, 256];
 
-// C2c-2 — the packed 4-bit KV tiled read (prefill / masked and prefill_lse).
-// Stamped only at the 256-wide head, matching the decode read.
-const SDPA_TILED_KV_U4_D256: &str = "sdpa_paged_tiled_kv_u4_bfloat16_d_256";
-const SDPA_TILED_LSE_KV_U4_D256: &str = "sdpa_paged_tiled_lse_kv_u4_bfloat16_d_256";
+// C2c-1 — the packed 4-bit KV decode read, per head_dim.
+const SDPA_DECODE_KV_U4: [&str; 2] = [
+    "sdpa_paged_decode_kv_u4_bfloat16_d_128",
+    "sdpa_paged_decode_kv_u4_bfloat16_d_256",
+];
+
+// C2c-2 — the packed 4-bit KV tiled read (prefill / masked) and its lse variant
+// (prefill_lse), per head_dim.
+const SDPA_TILED_KV_U4: [&str; 2] = [
+    "sdpa_paged_tiled_kv_u4_bfloat16_d_128",
+    "sdpa_paged_tiled_kv_u4_bfloat16_d_256",
+];
+const SDPA_TILED_LSE_KV_U4: [&str; 2] = [
+    "sdpa_paged_tiled_lse_kv_u4_bfloat16_d_128",
+    "sdpa_paged_tiled_lse_kv_u4_bfloat16_d_256",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodePlan {
@@ -410,16 +423,7 @@ fn vector(
                      plain dequantizing read",
                 ));
             }
-            if head_dim != SDPA_KV_U4_HEAD_DIM {
-                return Err(refuse(
-                    op,
-                    format!(
-                        "the packed 4-bit KV decode reads whole {SDPA_KV_U4_HEAD_DIM}-element \
-                         heads, but this attention states head width {head_dim}"
-                    ),
-                ));
-            }
-            SDPA_DECODE_KV_U4_D256
+            SDPA_DECODE_KV_U4[head_point(op, head_dim, &SDPA_KV_U4_WIDTHS)?]
         }
         other => return Err(Error::DtypeUnsupported { op, dtype: other }),
     };
@@ -488,18 +492,10 @@ fn tiled(
             Some(_) => SDPA_TILED_LSE[head_point(op, head_dim, &SDPA_LSE_WIDTHS)?],
         },
         Dtype::KvU4 => {
-            if head_dim != SDPA_KV_U4_HEAD_DIM {
-                return Err(refuse(
-                    op,
-                    format!(
-                        "the packed 4-bit KV tiled read stages whole {SDPA_KV_U4_HEAD_DIM}-element \
-                         heads, but this attention states head width {head_dim}"
-                    ),
-                ));
-            }
+            let at = head_point(op, head_dim, &SDPA_KV_U4_WIDTHS)?;
             match lse {
-                None => SDPA_TILED_KV_U4_D256,
-                Some(_) => SDPA_TILED_LSE_KV_U4_D256,
+                None => SDPA_TILED_KV_U4[at],
+                Some(_) => SDPA_TILED_LSE_KV_U4[at],
             }
         }
         other => return Err(Error::DtypeUnsupported { op, dtype: other }),
@@ -783,17 +779,24 @@ fn append_paged(
     let entry = match pool.keys.dtype {
         Dtype::Bf16 => dtype_dispatch!(op, k.dtype, { Bf16 => "kv_append_paged_bfloat16" }),
         Dtype::KvU4 => {
-            if head_dim != crate::linear::kv_codec::BLOCK {
-                return Err(refuse(
-                    op,
-                    format!(
-                        "the packed KV codec writes whole {}-element heads, but this pool's head \
-                         is {head_dim} wide",
-                        crate::linear::kv_codec::BLOCK
-                    ),
-                ));
+            // The packed KV codec packs one whole head (an N-block, N == head_dim)
+            // per threadgroup; the write shader is stamped per head_dim. Select it
+            // from the pool's head_dim, refusing a width with no stamped block.
+            dtype_dispatch!(op, k.dtype, { Bf16 => () });
+            match head_dim {
+                128 => "kv_append_paged_pack_sym4_bfloat16_d_128",
+                256 => "kv_append_paged_pack_sym4_bfloat16_d_256",
+                other => {
+                    return Err(refuse(
+                        op,
+                        format!(
+                            "the packed KV codec has no write shader stamped at head width \
+                             {other}; it packs whole {:?}-element heads",
+                            crate::linear::kv_codec::BLOCKS
+                        ),
+                    ));
+                }
             }
-            dtype_dispatch!(op, k.dtype, { Bf16 => "kv_append_paged_pack_sym4_bfloat16" })
         }
         other => return Err(Error::DtypeUnsupported { op, dtype: other }),
     };

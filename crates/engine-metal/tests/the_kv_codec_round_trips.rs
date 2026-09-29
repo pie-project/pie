@@ -142,18 +142,19 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 
 // --- the host reference: quantize_rowmajor, pinned at block = 256 ------------
 
-/// Per-256-block symmetric absmax 4-bit quantize/dequant, in pure host f32 — the
-/// same scheme the C0 test's `quantize_rowmajor` implements. Returns the integer
-/// codes in [-7, 7], the f32-scale reconstruction, and the per-block scale.
-fn host_quantize(data: &[f32]) -> (Vec<i32>, Vec<f32>, Vec<f32>) {
+/// Per-`block`-block symmetric absmax 4-bit quantize/dequant, in pure host f32 —
+/// the same scheme the C0 test's `quantize_rowmajor` implements. Returns the
+/// integer codes in [-7, 7], the f32-scale reconstruction, and the per-block
+/// scale.
+fn host_quantize(data: &[f32], block: usize) -> (Vec<i32>, Vec<f32>, Vec<f32>) {
     const LIM: f32 = 7.0;
-    let blocks = data.len() / BLOCK;
+    let blocks = data.len() / block;
     let mut codes = vec![0i32; data.len()];
     let mut recon = vec![0.0f32; data.len()];
     let mut scales = vec![0.0f32; blocks];
     #[allow(clippy::chunks_exact_to_as_chunks)]
-    for (bi, chunk) in data.chunks_exact(BLOCK).enumerate() {
-        let base = bi * BLOCK;
+    for (bi, chunk) in data.chunks_exact(block).enumerate() {
+        let base = bi * block;
         let absmax = chunk.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
         if absmax == 0.0 {
             // codes stay 0, recon stays 0, scale stays 0 (matches the kernel's
@@ -174,17 +175,20 @@ fn host_quantize(data: &[f32]) -> (Vec<i32>, Vec<f32>, Vec<f32>) {
 /// Decode the codec's packed nibbles back to integer codes in [-7, 7] and pull
 /// out the fp16 scale of each block — a converter-free view of what the pack
 /// kernel actually wrote, used to check the signed-nibble convention directly.
-fn parse_packed(packed: &[u8], blocks: usize) -> (Vec<i32>, Vec<f32>) {
-    let mut codes = vec![0i32; blocks * BLOCK];
+fn parse_packed(packed: &[u8], blocks: usize, block: usize) -> (Vec<i32>, Vec<f32>) {
+    let nib_bytes = block / 2;
+    let per = nib_bytes + 2;
+    let mut codes = vec![0i32; blocks * block];
     let mut scales = vec![0.0f32; blocks];
     for b in 0..blocks {
-        let base = b * 130;
-        for byte_i in 0..128 {
+        let base = b * per;
+        for byte_i in 0..nib_bytes {
             let byte = packed[base + byte_i];
-            codes[b * BLOCK + 2 * byte_i] = i32::from(byte & 0xf) - 8;
-            codes[b * BLOCK + 2 * byte_i + 1] = i32::from(byte >> 4) - 8;
+            codes[b * block + 2 * byte_i] = i32::from(byte & 0xf) - 8;
+            codes[b * block + 2 * byte_i + 1] = i32::from(byte >> 4) - 8;
         }
-        let scale_bits = u16::from(packed[base + 128]) | (u16::from(packed[base + 129]) << 8);
+        let scale_bits =
+            u16::from(packed[base + nib_bytes]) | (u16::from(packed[base + nib_bytes + 1]) << 8);
         scales[b] = f16_bits_to_f32(scale_bits);
     }
     (codes, scales)
@@ -215,10 +219,12 @@ struct Rig<'a> {
 
 impl Rig<'_> {
     /// Pack `data` (given as raw element bytes of `in_dtype`) into the v1 format
-    /// and return the raw packed bytes (`blocks * 130`).
-    fn pack(&self, data_bytes: &[u8], in_dtype: Dtype, elems: usize) -> Vec<u8> {
-        let blocks = (elems / BLOCK) as u64;
-        let packed_bytes = blocks * 130;
+    /// at codec block `block` and return the raw packed bytes
+    /// (`blocks * (block/2 + 2)`).
+    fn pack(&self, data_bytes: &[u8], in_dtype: Dtype, elems: usize, block: usize) -> Vec<u8> {
+        let blocks = (elems / block) as u64;
+        let per = (block / 2 + 2) as u64;
+        let packed_bytes = blocks * per;
         let mut inb = Buffer::zeroed(self.device, data_bytes.len() as u64).expect("in buffer");
         inb.write(0, data_bytes).expect("write in");
         let in_h = self.handles.bind(&inb, 0, inb.bytes()).expect("bind in");
@@ -232,14 +238,15 @@ impl Rig<'_> {
         {
             let frame = self.device.frame().expect("frame");
             let sink = Sink::new(self.device, &frame, self.pipelines, self.handles);
-            kv_codec::pack(&sink, x, pk).expect("pack launch");
+            kv_codec::pack(&sink, x, pk, block as u32).expect("pack launch");
             frame.commit().expect("pack commit");
         }
         self.handles.read(pk_h, packed_bytes).expect("read packed")
     }
 
-    /// Unpack `packed` into `out_dtype` and return the raw element bytes.
-    fn unpack(&self, packed_bytes: &[u8], out_dtype: Dtype, elems: usize) -> Vec<u8> {
+    /// Unpack `packed` into `out_dtype` at codec block `block` and return the raw
+    /// element bytes.
+    fn unpack(&self, packed_bytes: &[u8], out_dtype: Dtype, elems: usize, block: usize) -> Vec<u8> {
         let elem_bytes = match out_dtype {
             Dtype::F32 => 4u64,
             Dtype::Bf16 => 2,
@@ -260,7 +267,7 @@ impl Rig<'_> {
         {
             let frame = self.device.frame().expect("frame");
             let sink = Sink::new(self.device, &frame, self.pipelines, self.handles);
-            kv_codec::unpack(&sink, pk, out).expect("unpack launch");
+            kv_codec::unpack(&sink, pk, out, block as u32).expect("unpack launch");
             frame.commit().expect("unpack commit");
         }
         self.handles.read(out_h, out_bytes).expect("read out")
@@ -288,8 +295,12 @@ fn the_kv_codec_round_trips() {
     eprintln!("=== C2a: 4-bit symmetric KV codec (block=256) round-trip ===");
     eprintln!("    convention: offset-binary nibble (store q+8, unpack (n-8)*scale)");
 
-    // (1)+(2): round-trip vs the host quantize_rowmajor reference, f32.
+    // (1)+(2): round-trip vs the host quantize_rowmajor reference, f32. The codec
+    // block IS the head_dim — each row is one whole block — so this proves the
+    // codec at block 256 AND block 128.
     for &head_dim in &[256usize, 128] {
+        let block = head_dim;
+        let per = block / 2 + 2;
         for (label, data) in [
             (
                 "outlier",
@@ -301,17 +312,21 @@ fn the_kv_codec_round_trips() {
             ),
         ] {
             assert!(
-                data.len() % BLOCK == 0,
-                "test data must be whole 256-blocks"
+                data.len() % block == 0,
+                "test data must be whole {block}-blocks"
             );
-            let blocks = data.len() / BLOCK;
+            let blocks = data.len() / block;
 
-            let packed = rig.pack(&f32_bytes(&data), Dtype::F32, data.len());
-            assert_eq!(packed.len(), blocks * 130, "packed size is 130 B/block");
-            let recon = f32_floats(&rig.unpack(&packed, Dtype::F32, data.len()));
+            let packed = rig.pack(&f32_bytes(&data), Dtype::F32, data.len(), block);
+            assert_eq!(
+                packed.len(),
+                blocks * per,
+                "packed size is {per} B/block at block {block}"
+            );
+            let recon = f32_floats(&rig.unpack(&packed, Dtype::F32, data.len(), block));
 
-            let (host_codes, host_recon, _host_scales) = host_quantize(&data);
-            let (metal_codes, metal_scales) = parse_packed(&packed, blocks);
+            let (host_codes, host_recon, _host_scales) = host_quantize(&data, block);
+            let (metal_codes, metal_scales) = parse_packed(&packed, blocks, block);
 
             // (1) codes are bit-exact vs the host reference — the strongest,
             // converter-free check of quantize + nibble convention.
@@ -337,7 +352,7 @@ fn the_kv_codec_round_trips() {
             // the host's full-precision absmax/7.
             let mut max_scale_rel = 0.0f64;
             #[allow(clippy::chunks_exact_to_as_chunks)]
-            for (bi, chunk) in data.chunks_exact(BLOCK).enumerate() {
+            for (bi, chunk) in data.chunks_exact(block).enumerate() {
                 let absmax = chunk.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
                 let want = absmax / 7.0;
                 let got = metal_scales[bi];
@@ -383,18 +398,19 @@ fn the_kv_codec_round_trips() {
         }
     }
 
-    // bf16 path: exercise the bf16 pack/unpack kernels. Input is bf16-rounded,
-    // so we compare against the bf16 view of the data and just assert a sane
-    // 4-bit error with no NaNs (the exact-math check above is the f32 one).
-    {
-        let data = outlier_data(ROWS, 256, 0xB16);
+    // bf16 path: exercise the bf16 pack/unpack kernels at BOTH block sizes. Input
+    // is bf16-rounded, so we compare against the bf16 view of the data and just
+    // assert a sane 4-bit error with no NaNs (the exact-math check above is the
+    // f32 one).
+    for &block in &[256usize, 128] {
+        let data = outlier_data(ROWS, block, 0xB16 ^ block as u64);
         let bf_in = bf16_bytes(&data);
         let bf_view = bf16_floats(&bf_in); // what the kernel actually sees
-        let packed = rig.pack(&bf_in, Dtype::Bf16, data.len());
-        let recon = bf16_floats(&rig.unpack(&packed, Dtype::Bf16, data.len()));
+        let packed = rig.pack(&bf_in, Dtype::Bf16, data.len(), block);
+        let recon = bf16_floats(&rig.unpack(&packed, Dtype::Bf16, data.len(), block));
         let (mse, max) = errors(&bf_view, &recon);
         eprintln!(
-            "[bf16   ] head_dim=256 | pack->unpack vs bf16 input: MSE={mse:.5e} max-abs={max:.4}"
+            "[bf16   ] head_dim={block:>3} | pack->unpack vs bf16 input: MSE={mse:.5e} max-abs={max:.4}"
         );
         assert!(
             recon.iter().all(|v| v.is_finite()),
@@ -406,36 +422,41 @@ fn the_kv_codec_round_trips() {
         );
     }
 
-    // (edge) all-zero block: scale 0, codes all 0 (nibble 8), recon all 0, no NaN.
-    {
-        let data = vec![0.0f32; 2 * BLOCK];
-        let packed = rig.pack(&f32_bytes(&data), Dtype::F32, data.len());
-        let recon = f32_floats(&rig.unpack(&packed, Dtype::F32, data.len()));
+    // (edge) all-zero block, at BOTH block sizes: scale 0, codes all 0 (nibble 8),
+    // recon all 0, no NaN.
+    for &block in &[256usize, 128] {
+        let per = block / 2 + 2;
+        let nib = block / 2;
+        let data = vec![0.0f32; 2 * block];
+        let packed = rig.pack(&f32_bytes(&data), Dtype::F32, data.len(), block);
+        let recon = f32_floats(&rig.unpack(&packed, Dtype::F32, data.len(), block));
         assert!(
             recon.iter().all(|&v| v == 0.0),
             "all-zero block must reconstruct to zeros with no NaN"
         );
         // every nibble is 8 (the offset-binary encoding of q=0) and each scale is 0.
         for b in 0..2 {
-            for byte_i in 0..128 {
+            for byte_i in 0..nib {
                 assert_eq!(
-                    packed[b * 130 + byte_i],
+                    packed[b * per + byte_i],
                     0x88,
                     "all-zero block: every byte must pack two q=0 nibbles (0x88)"
                 );
             }
             assert_eq!(
-                packed[b * 130 + 128],
+                packed[b * per + nib],
                 0,
                 "all-zero block: fp16 scale low byte"
             );
             assert_eq!(
-                packed[b * 130 + 129],
+                packed[b * per + nib + 1],
                 0,
                 "all-zero block: fp16 scale high byte"
             );
         }
-        eprintln!("[edge   ] all-zero block: scale 0, codes 0x88, recon zeros, no NaN — OK");
+        eprintln!(
+            "[edge   ] all-zero block (block={block}): scale 0, codes 0x88, recon zeros, no NaN — OK"
+        );
     }
 
     // (edge) a width that is not a multiple of 256 must be REJECTED, not padded.
@@ -452,7 +473,7 @@ fn the_kv_codec_round_trips() {
         let pk = Tensor::new(pk_h, 1, 130, Dtype::U8);
         let frame = device.frame().expect("frame");
         let sink = Sink::new(&device, &frame, &pipelines, &handles);
-        let refused = kv_codec::pack(&sink, x, pk);
+        let refused = kv_codec::pack(&sink, x, pk, BLOCK as u32);
         assert!(
             refused.is_err(),
             "a 300-element (non-multiple-of-256) tensor must be refused by the codec"

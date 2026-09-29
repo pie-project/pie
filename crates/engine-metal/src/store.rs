@@ -205,12 +205,15 @@ impl Pools {
                     }
                     let head_dim = restated.map_or(width, |seat| u64::from(seat.head_dim));
                     let kv_heads = restated.map_or(1, |seat| u64::from(seat.kv_heads));
+                    // The packed KV block is the head_dim; pass it so KvU4 planes
+                    // are sized per head (only known when consumers stated a seat).
+                    let block = restated.map(|seat| seat.head_dim);
                     let cells = paging.pages() * u64::from(paging.page_size);
-                    let plane = cells * row_stride(name, *dtype, width)?;
+                    let plane = cells * row_stride(name, *dtype, width, block)?;
                     let values_bytes = if planes.values == 0 {
                         0
                     } else {
-                        cells * row_stride(name, *dtype, planes.values)?
+                        cells * row_stride(name, *dtype, planes.values, block)?
                     };
                     let own_values = !planes.shared && planes.values != 0;
                     slabs.push(Buffer::zeroed(
@@ -437,11 +440,12 @@ impl Pools {
                 "kv migration",
                 dtype,
                 u64::from(kv_heads) * u64::from(head_dim),
+                Some(head_dim),
             )?;
             let values_cell = if values_width == 0 {
                 0
             } else {
-                row_stride("kv migration", dtype, values_width)?
+                row_stride("kv migration", dtype, values_width, Some(head_dim))?
             };
             let bases = [(0, keys_cell), (values_at, values_cell)];
             let bases = if values_at == 0 {
@@ -569,11 +573,14 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
             } => {
                 let planes = split(name, planes)?;
                 let cells = paging.pages() * u64::from(paging.page_size);
-                let keys = cells * row_stride(name, *dtype, planes.keys)?;
+                // The demand estimate runs before consumers state a seat, so no
+                // head_dim is available here; KvU4 falls back to its format anchor
+                // (head_dim-256 block), exact for the shipping flagship.
+                let keys = cells * row_stride(name, *dtype, planes.keys, None)?;
                 let values = if planes.shared || planes.values == 0 {
                     0
                 } else {
-                    cells * row_stride(name, *dtype, planes.values)?
+                    cells * row_stride(name, *dtype, planes.values, None)?
                 };
                 bytes = bytes.saturating_add(keys.saturating_add(values));
             }
@@ -628,18 +635,44 @@ fn elem_bytes(name: &str, dtype: Dtype) -> Result<u64> {
 
 /// Bytes one cache row occupies for `width` elements of `dtype`.
 ///
-/// A scalar dtype is `width * elem_bytes`. A PACKED dtype (C2b's `KvU4`, and any
-/// other block-quantized cache dtype) has no per-element byte size — its row is
-/// sized from the format's `row_bytes`, which folds the codes and the inline
-/// scale/bias planes of every whole group into one contiguous stride. The width
-/// must be a whole number of the format's quantum (256 for `KvU4`), which a KV
-/// cache of head_dim-256 heads always is; a ragged width is refused here rather
-/// than silently mis-sized. This is the ONE place packed vs. scalar sizing forks
-/// — reserve, migration copy and demand accounting all route through it so a
-/// packed plane is contiguous, whole-slot cells that a byte-blit can move.
-fn row_stride(name: &str, dtype: Dtype, width: u64) -> Result<u64> {
+/// A scalar dtype is `width * elem_bytes`. A PACKED dtype has no per-element byte
+/// size — its row is sized from the block layout.
+///
+/// The `KvU4` codec's block IS the model's `head_dim` (rotation-alignment) — pie
+/// serves many head_dims, not just 256 — so its packed size is head_dim-driven,
+/// NOT a baked 256-group: a row of `heads` whole heads packs to
+/// `heads * (head_dim/2 + 2)` bytes (130 per head at head_dim 256, 66 at 128).
+/// When `head_dim` is known (the allocation and migration paths have it), the
+/// KvU4 row is sized from it. When it is not (the pre-facts demand estimate has
+/// only the trace), the format's own `row_bytes` gives the head_dim-256 anchor
+/// (`repr().row_bytes(256) == 130`), which is exact for the head_dim-256 flagship
+/// — the only KvU4 geometry that ships today.
+///
+/// Any other packed dtype (block-quantized weight caches) has no head_dim and is
+/// sized from its format's `row_bytes` as before. This is the ONE place packed
+/// vs. scalar sizing forks — reserve, migration copy and demand accounting all
+/// route through it so a packed plane is contiguous, whole-slot cells that a
+/// byte-blit can move.
+fn row_stride(name: &str, dtype: Dtype, width: u64, head_dim: Option<u32>) -> Result<u64> {
     if let Some(element) = model_compiler::arena::elem_bytes(dtype) {
         return Ok(width * element);
+    }
+    // KvU4 sizes per head_dim-block when the head geometry is known.
+    let kv_block = (dtype == Dtype::KvU4)
+        .then(|| head_dim.filter(|&d| d > 0))
+        .flatten();
+    if let Some(block) = kv_block {
+        let block = u64::from(block);
+        if !width.is_multiple_of(block) {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "cache `{name}`, whose {width}-wide packed KV row is not a whole number of \
+                     {block}-wide heads"
+                ),
+            });
+        }
+        let heads = width / block;
+        return Ok(heads * (block / 2 + 2));
     }
     let k = u32::try_from(width).map_err(|_| Fault::Unbound {
         what: format!("cache `{name}`, whose {width}-wide row overflows a packed-plane width"),

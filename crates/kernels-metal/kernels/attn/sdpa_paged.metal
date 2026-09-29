@@ -28,21 +28,24 @@ METAL_FUNC float sdpa_lse_base2(float max_score, float sum_exp_score) {
 }
 
 // C2c-1 — the packed 4-bit KV read layout, mirrored from the C2b write path and
-// the C2a codec. One whole kv head is a 256-element block stored in KV_U4_BYTES
-// (130) bytes: 128 nibble bytes then a little-endian fp16 scale. A slot's heads
-// are contiguous, so the block base (in BYTES) is
-//   (slot * n_kv_heads + kv_head) * KV_U4_BYTES.
+// the C2a codec. One whole kv head is an N-element block (N == head_dim) stored
+// in N/2 + 2 bytes: N/2 nibble bytes then a little-endian fp16 scale. The block
+// size is a PARAMETER (pie serves many head_dims); it is derived from the read
+// kernel's template D, so `nib_bytes = D/2` and `block_bytes = D/2 + 2` (130 at
+// D = 256, 66 at D = 128). A slot's heads are contiguous, so the block base (in
+// BYTES) is
+//   (slot * n_kv_heads + kv_head) * (D/2 + 2).
 // Nibbles are offset-binary: the stored nibble is q + 8, the low nibble of byte
 // b is element 2*b (even), the high nibble is element 2*b+1 (odd); dequant is
 // q * scale. K and V are separate planes, each carrying its own per-block scale.
-#define KV_U4_BLOCK 256u
-#define KV_U4_NIB_BYTES 128u
-#define KV_U4_BYTES 130u
 
-// The block's inline fp16 scale (bytes [128,130), little-endian).
-METAL_FUNC float sdpa_kv_u4_scale(const device uchar* block) {
+// Bytes per packed head at width D: N/2 nibble bytes + one inline fp16 scale.
+template <int D> constexpr uint sdpa_kv_u4_bytes() { return uint(D) / 2u + 2u; }
+
+// The block's inline fp16 scale (bytes [nib_bytes, nib_bytes+2), little-endian).
+METAL_FUNC float sdpa_kv_u4_scale(const device uchar* block, uint nib_bytes) {
   const ushort bits =
-      ushort(block[KV_U4_NIB_BYTES]) | (ushort(block[KV_U4_NIB_BYTES + 1]) << 8);
+      ushort(block[nib_bytes]) | (ushort(block[nib_bytes + 1]) << 8);
   return float(as_type<half>(bits));
 }
 
@@ -147,16 +150,18 @@ inline void sdpa_paged_decode_body(
       // (offset-binary q = nibble - 8, dequant = q * scale). Same math as the
       // bf16 branch below, only the source is the packed cache, not bf16 pages.
       static_assert(
-          D == 256 && V == 256,
-          "the packed 4-bit KV decode reads whole 256-element heads");
+          D == V && (D % 2 == 0),
+          "the packed 4-bit KV decode reads whole even-width heads (block == head_dim)");
+      constexpr uint nib = uint(D) / 2u;
+      constexpr uint blk_bytes = sdpa_kv_u4_bytes<D>();
       const device uchar* kblk =
-          (const device uchar*)k_pages + (slot * n_kv_heads + kv_head_idx) * KV_U4_BYTES;
+          (const device uchar*)k_pages + (slot * n_kv_heads + kv_head_idx) * blk_bytes;
       const device uchar* vblk =
-          (const device uchar*)v_pages + (slot * n_kv_heads + kv_head_idx) * KV_U4_BYTES;
+          (const device uchar*)v_pages + (slot * n_kv_heads + kv_head_idx) * blk_bytes;
       sdpa_kv_u4_lane(kblk, simd_lid * qk_per_thread, qk_per_thread,
-                      sdpa_kv_u4_scale(kblk), k);
+                      sdpa_kv_u4_scale(kblk, nib), k);
       sdpa_kv_u4_lane(vblk, simd_lid * v_per_thread, v_per_thread,
-                      sdpa_kv_u4_scale(vblk), v);
+                      sdpa_kv_u4_scale(vblk, nib), v);
     } else {
       const device T* kptr =
           k_pages + (slot * n_kv_heads + kv_head_idx) * D + simd_lid * qk_per_thread;
@@ -567,14 +572,17 @@ inline void sdpa_paged_tiled_body(
           // is the packed cache, not bf16 pages. The rest of the tiled body (tile
           // matmul, softmax, lse) reads the staged bf16 tiles unchanged.
           static_assert(
-              D == 256, "the packed 4-bit KV tiled read stages whole 256-element heads");
+              D % 2 == 0,
+              "the packed 4-bit KV tiled read stages whole even-width heads (block == head_dim)");
+          constexpr uint nib = uint(D) / 2u;
+          constexpr uint blk_bytes = sdpa_kv_u4_bytes<D>();
           const device uchar* kblk =
-              (const device uchar*)k_pages + (slot * n_kv_heads + kv_head) * KV_U4_BYTES;
+              (const device uchar*)k_pages + (slot * n_kv_heads + kv_head) * blk_bytes;
           const device uchar* vblk =
-              (const device uchar*)v_pages + (slot * n_kv_heads + kv_head) * KV_U4_BYTES;
+              (const device uchar*)v_pages + (slot * n_kv_heads + kv_head) * blk_bytes;
           float kdq, vdq;
-          sdpa_kv_u4_lane(kblk, uint(d), 1, sdpa_kv_u4_scale(kblk), &kdq);
-          sdpa_kv_u4_lane(vblk, uint(d), 1, sdpa_kv_u4_scale(vblk), &vdq);
+          sdpa_kv_u4_lane(kblk, uint(d), 1, sdpa_kv_u4_scale(kblk, nib), &kdq);
+          sdpa_kv_u4_lane(vblk, uint(d), 1, sdpa_kv_u4_scale(vblk, nib), &vdq);
           ktile[kk * kstride + d] = static_cast<T>(kdq);
           vtile[e] = static_cast<T>(vdq);
         } else {
@@ -796,7 +804,7 @@ template <typename T, int D, int V = D>
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
-  static_assert(D == 256, "the packed 4-bit KV tiled read stages whole 256-element heads");
+  static_assert(D % 2 == 0, "the packed 4-bit KV tiled read stages whole even-width heads (block == head_dim)");
   threadgroup T ktile[sdpa_kt<D>() * sdpa_kstride<D, false>()];
   threadgroup T vtile[sdpa_kt<D>() * D];
   threadgroup T qtile[sdpa_kq<D, false>()];
@@ -839,7 +847,7 @@ template <typename T, int D, int V = D>
     uint3 tpg       [[threadgroups_per_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
     uint simd_lid   [[thread_index_in_simdgroup]]) {
-  static_assert(D == 256, "the packed 4-bit KV tiled read stages whole 256-element heads");
+  static_assert(D % 2 == 0, "the packed 4-bit KV tiled read stages whole even-width heads (block == head_dim)");
   threadgroup T ktile[sdpa_kt<D>() * sdpa_kstride<D, false>()];
   threadgroup T vtile[sdpa_kt<D>() * D];
   threadgroup T qtile[sdpa_kq<D, false>()];
@@ -965,7 +973,9 @@ instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 512, 512, f
       const constant int&, const device itype*, const constant int&,        \
       device float*, uint3, uint3, uint, uint);
 
+instantiate_sdpa_tiled_kv_u4(bfloat16, bfloat, 128, 128)
 instantiate_sdpa_tiled_kv_u4(bfloat16, bfloat, 256, 256)
+instantiate_sdpa_tiled_lse_kv_u4(bfloat16, bfloat, 128, 128)
 instantiate_sdpa_tiled_lse_kv_u4(bfloat16, bfloat, 256, 256)
 
 #define instantiate_sdpa_paged_impl(fn, name, itype, d, v, sink)           \
@@ -1003,6 +1013,7 @@ instantiate_sdpa_paged_sink(bfloat16, bfloat, 64, 64)
       const constant int&, const device itype*,                             \
       uint3, uint3, uint, uint);
 
+instantiate_sdpa_paged_kv_u4(bfloat16, bfloat, 128, 128)
 instantiate_sdpa_paged_kv_u4(bfloat16, bfloat, 256, 256)
 
 #define instantiate_sdpa_paged_lse(name, itype, d, v)                      \

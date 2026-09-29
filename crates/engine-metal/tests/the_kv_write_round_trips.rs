@@ -29,8 +29,11 @@ use kernels_metal::attn;
 use kernels_metal::{KvPool, Tensor};
 use model_ir::{CacheRow, Dtype, Platform, Trace};
 
-const BLOCK: usize = 256;
-const PACKED: usize = 130; // 128 nibble bytes + one fp16 scale
+/// Packed bytes for one head at codec block `block`: `block/2` nibble bytes plus
+/// one inline fp16 scale (130 at block 256, 66 at 128).
+fn packed_bytes(block: usize) -> usize {
+    block / 2 + 2
+}
 
 // --- deterministic outlier-heavy KV data (same mixer as the C2a test) --------
 
@@ -52,18 +55,19 @@ fn gaussian(at: u64) -> f32 {
 }
 
 /// A `rows x (heads*head_dim)` plane of small Gaussians with a few big spikes
-/// planted per 256-block — the outlier shape a plain absmax quantizer strains on.
-fn outlier_plane(rows: usize, width: usize, salt: u64) -> Vec<f32> {
+/// planted per `block`-block — the outlier shape a plain absmax quantizer strains
+/// on.
+fn outlier_plane(rows: usize, width: usize, block: usize, salt: u64) -> Vec<f32> {
     const SPIKES: usize = 3;
     let mut v: Vec<f32> = (0..(rows * width) as u64)
         .map(|i| gaussian(i ^ salt))
         .collect();
-    for blk in 0..(rows * width) / BLOCK {
-        let base = blk * BLOCK;
+    for blk in 0..(rows * width) / block {
+        let base = blk * block;
         for k in 0..SPIKES {
             let key =
                 (blk as u64).wrapping_mul(0x100_0193) ^ (k as u64).wrapping_mul(0x9E37) ^ salt;
-            let pos = (noise(key) as usize) % BLOCK;
+            let pos = (noise(key) as usize) % block;
             let mag = 20.0 + 20.0 * (unit01(key ^ 0xBEEF) as f32);
             let sign = if noise(key ^ 0xF00D) & 1 == 0 {
                 1.0
@@ -117,15 +121,17 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     }
 }
 
-/// Pull the integer codes [-7, 7] and the fp16 scale out of one 130-byte block.
-fn parse_block(bytes: &[u8]) -> ([i32; BLOCK], f32) {
-    let mut codes = [0i32; BLOCK];
-    for byte_i in 0..128 {
+/// Pull the integer codes [-7, 7] and the fp16 scale out of one packed
+/// `block`-element head (`block/2` nibble bytes then a little-endian fp16 scale).
+fn parse_block(bytes: &[u8], block: usize) -> (Vec<i32>, f32) {
+    let nib = block / 2;
+    let mut codes = vec![0i32; block];
+    for byte_i in 0..nib {
         let byte = bytes[byte_i];
         codes[2 * byte_i] = i32::from(byte & 0xf) - 8;
         codes[2 * byte_i + 1] = i32::from(byte >> 4) - 8;
     }
-    let scale_bits = u16::from(bytes[128]) | (u16::from(bytes[129]) << 8);
+    let scale_bits = u16::from(bytes[nib]) | (u16::from(bytes[nib + 1]) << 8);
     (codes, f16_bits_to_f32(scale_bits))
 }
 
@@ -167,10 +173,11 @@ impl Rig {
         h
     }
 
-    /// A zeroed packed plane of `cells` slots, `heads` blocks each — the shape
-    /// the store would reserve for a `KvU4` cache.
-    fn packed_plane(&mut self, cells: usize, heads: usize) -> (u32, u64) {
-        let bytes = (cells * heads * PACKED) as u64;
+    /// A zeroed packed plane of `cells` slots, `heads` blocks each (each block
+    /// `packed_bytes(block)` bytes) — the shape the store would reserve for a
+    /// `KvU4` cache at codec block `block`.
+    fn packed_plane(&mut self, cells: usize, heads: usize, block: usize) -> (u32, u64) {
+        let bytes = (cells * heads * packed_bytes(block)) as u64;
         let b = Buffer::zeroed(&self.device, bytes).expect("packed plane");
         let h = self.handles.bind(&b, 0, b.bytes()).expect("a handle");
         self.keep.push(b);
@@ -181,75 +188,102 @@ impl Rig {
 // --- the test ----------------------------------------------------------------
 
 const HEADS: usize = 2;
-const HEAD_DIM: usize = 256;
 const TOKENS: usize = 6;
 const PAGE_SIZE: u32 = 8;
 const PAGES: u64 = 1;
 
 #[test]
 fn the_kv_write_round_trips() {
-    // ---- (A) allocation: the packed cache is sized from row_bytes -----------
     eprintln!("=== C2b: packed 4-bit KV write (dtype g256_u4_f16_n) ===");
-    assert_eq!(
-        Dtype::KvU4.row_bytes(BLOCK as u32),
-        Some(PACKED as u64),
-        "the packed KV dtype must size a 256-block at 130 bytes"
-    );
 
-    let paging = Paging::of(PAGE_SIZE, PAGE_SIZE, 0, PAGES).expect("paging");
-    let cells = paging.pages() * u64::from(PAGE_SIZE);
-    let width = (HEADS * HEAD_DIM) as u64;
-    let kv_trace = |dtype: Dtype| Trace {
-        name: String::from("kv_size_probe"),
-        platform: Platform::Metal,
-        params: Vec::new(),
-        // a key half and a value half, each `width` elements wide
-        caches: vec![CacheRow::Kv {
-            name: String::from("kv"),
-            planes: vec![width, width],
-            dtype,
-            space: 0,
-        }],
-        values: Vec::new(),
-        nodes: Vec::new(),
-        seams: Vec::new(),
-        drafter: None,
-    };
-    let bf16_bytes_total = pool_demand(&kv_trace(Dtype::Bf16), paging).expect("bf16 demand");
-    let packed_bytes_total = pool_demand(&kv_trace(Dtype::KvU4), paging).expect("packed demand");
+    // ---- (A) allocation at head_dim 256 (the shipping flagship) -------------
+    // The packed cache is sized from `row_bytes` (130 B per 256-block), not
+    // `width * element`. This is the pre-facts demand-estimate path, which has no
+    // head_dim and anchors at the dtype's 256-block; the write round-trip in (B)
+    // exercises the reserve/head_dim-driven sizing at 128 AND 256.
+    {
+        const HEAD_DIM: usize = 256;
+        const BLOCK: usize = 256;
+        const PACKED: usize = 130;
+        assert_eq!(
+            Dtype::KvU4.row_bytes(BLOCK as u32),
+            Some(PACKED as u64),
+            "the packed KV dtype must size a 256-block at 130 bytes"
+        );
 
-    // bf16: two planes of `cells * width * 2`. packed: two planes of
-    // `cells * (width/256) * 130`.
-    let want_bf16 = cells * width * 2 /*bytes*/ * 2 /*planes*/;
-    let blocks_per_plane = width / BLOCK as u64;
-    let want_packed = cells * blocks_per_plane * PACKED as u64 * 2 /*planes*/;
-    assert_eq!(bf16_bytes_total, want_bf16, "bf16 KV cache sizing");
-    assert_eq!(packed_bytes_total, want_packed, "packed KV cache sizing");
-    let ratio = packed_bytes_total as f64 / bf16_bytes_total as f64;
-    eprintln!(
-        "[alloc ] bf16 cache = {bf16_bytes_total} B, packed cache = {packed_bytes_total} B, \
-         ratio = {ratio:.4} (expected {:.4} = 130/512)",
-        130.0 / 512.0
-    );
-    assert!(
-        (ratio - 130.0 / 512.0).abs() < 1e-9,
-        "packed cache must be 130/512 of bf16, got {ratio}"
-    );
+        let paging = Paging::of(PAGE_SIZE, PAGE_SIZE, 0, PAGES).expect("paging");
+        let cells = paging.pages() * u64::from(PAGE_SIZE);
+        let width = (HEADS * HEAD_DIM) as u64;
+        let kv_trace = |dtype: Dtype| Trace {
+            name: String::from("kv_size_probe"),
+            platform: Platform::Metal,
+            params: Vec::new(),
+            // a key half and a value half, each `width` elements wide
+            caches: vec![CacheRow::Kv {
+                name: String::from("kv"),
+                planes: vec![width, width],
+                dtype,
+                space: 0,
+            }],
+            values: Vec::new(),
+            nodes: Vec::new(),
+            seams: Vec::new(),
+            drafter: None,
+        };
+        let bf16_bytes_total = pool_demand(&kv_trace(Dtype::Bf16), paging).expect("bf16 demand");
+        let packed_bytes_total =
+            pool_demand(&kv_trace(Dtype::KvU4), paging).expect("packed demand");
 
-    // ---- (B) the quantizing write path --------------------------------------
+        // bf16: two planes of `cells * width * 2`. packed: two planes of
+        // `cells * (width/256) * 130`.
+        let want_bf16 = cells * width * 2 /*bytes*/ * 2 /*planes*/;
+        let blocks_per_plane = width / BLOCK as u64;
+        let want_packed = cells * blocks_per_plane * PACKED as u64 * 2 /*planes*/;
+        assert_eq!(bf16_bytes_total, want_bf16, "bf16 KV cache sizing");
+        assert_eq!(packed_bytes_total, want_packed, "packed KV cache sizing");
+        let ratio = packed_bytes_total as f64 / bf16_bytes_total as f64;
+        eprintln!(
+            "[alloc ] bf16 cache = {bf16_bytes_total} B, packed cache = {packed_bytes_total} B, \
+             ratio = {ratio:.4} (expected {:.4} = 130/512)",
+            130.0 / 512.0
+        );
+        assert!(
+            (ratio - 130.0 / 512.0).abs() < 1e-9,
+            "packed cache must be 130/512 of bf16, got {ratio}"
+        );
+    }
+
+    // ---- (B) the quantizing write path, at head_dim 256 AND 128 -------------
     let Some(mut rig) = Rig::open() else {
         eprintln!("not asked: no Metal device — allocation sizing already checked");
         return;
     };
+    for &head_dim in &[256usize, 128] {
+        write_case(&mut rig, head_dim);
+    }
+    eprintln!("=== C2b done: the packed write is self-consistent at head_dim 128 & 256 ===");
+}
 
-    // Seed bf16 K and V planes: TOKENS rows of HEADS*256 elements.
-    let k_data = outlier_plane(TOKENS, HEADS * HEAD_DIM, 0x0C2B);
-    let v_data = outlier_plane(TOKENS, HEADS * HEAD_DIM, 0x0F00);
+/// The quantizing-write round-trip at codec block `head_dim`. Seeds bf16 K/V,
+/// runs the real `attention.kv_append` onto a packed `KvU4` pool of `head_dim`
+/// blocks, then decodes the written bytes host-side and asserts the production
+/// self-consistency property (re-quantizing the source against the STORED fp16
+/// scale reproduces the written codes BIT-for-bit) — the crisp proof, at each
+/// block size.
+fn write_case(rig: &mut Rig, head_dim: usize) {
+    let block = head_dim;
+    let per = packed_bytes(block);
+    let width = (HEADS * head_dim) as u64;
+    let cells = PAGES * u64::from(PAGE_SIZE);
+
+    // Seed bf16 K and V planes: TOKENS rows of HEADS*head_dim elements.
+    let k_data = outlier_plane(TOKENS, HEADS * head_dim, block, 0x0C2B ^ head_dim as u64);
+    let v_data = outlier_plane(TOKENS, HEADS * head_dim, block, 0x0F00 ^ head_dim as u64);
 
     let hk = rig.bf16(&k_data);
     let hv = rig.bf16(&v_data);
-    let (keys_h, keys_bytes) = rig.packed_plane(cells as usize, HEADS);
-    let (values_h, _values_bytes) = rig.packed_plane(cells as usize, HEADS);
+    let (keys_h, keys_bytes) = rig.packed_plane(cells as usize, HEADS, block);
+    let (values_h, _values_bytes) = rig.packed_plane(cells as usize, HEADS, block);
     // page tables the write path does not read, but the KvPool type carries.
     let ppi = rig.u32s(&[0u32]);
     let ppp = rig.u32s(&[0u32, 1]);
@@ -264,7 +298,7 @@ fn the_kv_write_round_trips() {
         page_indptr: Tensor::new(ppp, 2, 1, Dtype::U32),
         page_size: PAGE_SIZE as i32,
         seq_stride: width,
-        head_stride: HEAD_DIM as u64,
+        head_stride: head_dim as u64,
     };
     let kt = Tensor::new(hk, TOKENS as u32, width as u32, Dtype::Bf16);
     let vt = Tensor::new(hv, TOKENS as u32, width as u32, Dtype::Bf16);
@@ -281,7 +315,7 @@ fn the_kv_write_round_trips() {
     let keys_raw = rig.handles.read(keys_h, keys_bytes).expect("read keys");
     let values_raw = rig.handles.read(values_h, keys_bytes).expect("read values");
 
-    // Host-side decode + self-consistency check, per (token, head) 256-block.
+    // Host-side decode + self-consistency check, per (token, head) block.
     let mut worst_scale_rel = 0.0f64;
     let mut sse = 0.0f64;
     let mut n = 0usize;
@@ -290,15 +324,15 @@ fn the_kv_write_round_trips() {
         for i in 0..TOKENS {
             for h in 0..HEADS {
                 let slot = i; // page 0, offset i
-                let base = (slot * HEADS + h) * PACKED;
-                let (codes, scale) = parse_block(&raw[base..base + PACKED]);
+                let base = (slot * HEADS + h) * per;
+                let (codes, scale) = parse_block(&raw[base..base + per], block);
 
                 // the block of bf16-viewed source values
                 let mut absmax = 0.0f32;
-                let mut block = [0.0f32; BLOCK];
-                for d in 0..BLOCK {
-                    let x = bf16_view(src[i * HEADS * HEAD_DIM + h * HEAD_DIM + d]);
-                    block[d] = x;
+                let mut src_block = vec![0.0f32; block];
+                for d in 0..block {
+                    let x = bf16_view(src[i * HEADS * head_dim + h * head_dim + d]);
+                    src_block[d] = x;
                     absmax = absmax.max(x.abs());
                 }
 
@@ -313,17 +347,18 @@ fn the_kv_write_round_trips() {
                 //      (A non-self-consistent encoder — dividing by the full
                 //      precision scale but storing the fp16 one — would disagree
                 //      on boundary elements.)
-                for d in 0..BLOCK {
-                    let q = (block[d] / scale).round().clamp(-7.0, 7.0) as i32;
+                for d in 0..block {
+                    let q = (src_block[d] / scale).round().clamp(-7.0, 7.0) as i32;
                     assert_eq!(
                         q, codes[d],
-                        "{label} token {i} head {h} elem {d}: written code {} is not the \
-                         self-consistent quantization {q} of the source against the stored scale",
+                        "head_dim {head_dim} {label} token {i} head {h} elem {d}: written code {} \
+                         is not the self-consistent quantization {q} of the source against the \
+                         stored scale",
                         codes[d]
                     );
                     assert!((-7..=7).contains(&codes[d]), "code out of 4-bit range");
                     let recon = codes[d] as f32 * scale;
-                    let e = f64::from(block[d]) - f64::from(recon);
+                    let e = f64::from(src_block[d]) - f64::from(recon);
                     sse += e * e;
                     worst_abs = worst_abs.max(e.abs());
                     n += 1;
@@ -333,16 +368,16 @@ fn the_kv_write_round_trips() {
     }
     let mse = sse / n as f64;
     eprintln!(
-        "[write ] {n} elems over {TOKENS} tokens x {HEADS} heads (K+V) | codes self-consistent | \
-         fp16 scale rel-dev {worst_scale_rel:.2e} | recon vs bf16 src: max={worst_abs:.4} MSE={mse:.5e}"
+        "[write ] head_dim={head_dim:>3} | {n} elems over {TOKENS} tokens x {HEADS} heads (K+V) | \
+         codes self-consistent (bit-exact) | fp16 scale rel-dev {worst_scale_rel:.2e} | recon vs \
+         bf16 src: max={worst_abs:.4} MSE={mse:.5e}"
     );
     assert!(
         worst_scale_rel < 1.0e-3,
-        "fp16 scale rel-dev {worst_scale_rel:.2e} exceeds the fp16 half-ulp bound"
+        "head_dim {head_dim}: fp16 scale rel-dev {worst_scale_rel:.2e} exceeds the fp16 half-ulp bound"
     );
     assert!(
         mse.is_finite() && mse > 0.0,
-        "the round-trip MSE should be a finite positive 4-bit error, got {mse:.3e}"
+        "head_dim {head_dim}: the round-trip MSE should be a finite positive 4-bit error, got {mse:.3e}"
     );
-    eprintln!("=== C2b done: the packed write is self-consistent and the cache is 130/512 ===");
 }
