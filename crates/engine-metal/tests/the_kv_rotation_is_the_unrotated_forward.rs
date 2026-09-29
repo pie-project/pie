@@ -45,7 +45,7 @@ const STEPS: usize = 3;
 // ---- deterministic synthetic weights (same integer mixer as the sibling
 // Hadamard tests, so the fixture is reproducible with no RNG state) ------------
 fn noise(at: u64) -> u32 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5e5e_1234_9ABC_DEF0;
+    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     (x >> 32) as u32
@@ -63,7 +63,9 @@ fn gaussian(at: u64) -> f32 {
 
 /// A tensor of `len` scaled gaussians, seeded by a per-plane salt.
 fn plane(salt: u64, len: usize, scale: f32) -> Vec<f32> {
-    (0..len as u64).map(|i| scale * gaussian(i ^ salt)).collect()
+    (0..len as u64)
+        .map(|i| scale * gaussian(i ^ salt))
+        .collect()
 }
 
 /// A minimal safetensors writer: `[u64 header-len][JSON header][packed f32 data]`,
@@ -116,7 +118,11 @@ fn synth_fixture(dir: &Path) {
         0.01,
     );
     for l in 0..LAYERS {
-        push(layer(l, "input_layernorm.weight"), vec![HIDDEN as u64], 0.01);
+        push(
+            layer(l, "input_layernorm.weight"),
+            vec![HIDDEN as u64],
+            0.01,
+        );
         push(
             layer(l, "post_attention_layernorm.weight"),
             vec![HIDDEN as u64],
@@ -143,8 +149,16 @@ fn synth_fixture(dir: &Path) {
             vec![HIDDEN as u64, (Q_HEADS * HEAD_DIM) as u64],
             0.05,
         );
-        push(layer(l, "self_attn.q_norm.weight"), vec![HEAD_DIM as u64], 0.01);
-        push(layer(l, "self_attn.k_norm.weight"), vec![HEAD_DIM as u64], 0.01);
+        push(
+            layer(l, "self_attn.q_norm.weight"),
+            vec![HEAD_DIM as u64],
+            0.01,
+        );
+        push(
+            layer(l, "self_attn.k_norm.weight"),
+            vec![HEAD_DIM as u64],
+            0.01,
+        );
         push(
             layer(l, "mlp.gate_proj.weight"),
             vec![INTER as u64, HIDDEN as u64],
@@ -186,8 +200,7 @@ fn try_load(dir: &Path, w: Dtype, rotate: bool) -> Result<Shell, String> {
         Model::micro_text(w, Dtype::Bf16, 1)
     };
     let trace = model_dsl::trace_hybrid("qwen3-micro-text", &model, Platform::Metal);
-    let source =
-        ztensor_compat::index(dir.join("model.safetensors")).map_err(|e| e.to_string())?;
+    let source = ztensor_compat::index(dir.join("model.safetensors")).map_err(|e| e.to_string())?;
     let contract = model
         .import(&source, Platform::Metal)
         .map_err(|e| e.to_string())?;
@@ -285,7 +298,10 @@ fn the_kv_rotation_is_the_unrotated_forward() {
     );
     let (off_h, on_h) = (hadamards(&off_trace), hadamards(&on_trace));
     eprintln!("[trace] rotate_kv=false Hadamard ops = {off_h}; rotate_kv=true = {on_h}");
-    assert_eq!(off_h, 0, "the default path must emit no Hadamard (byte-unchanged SKUs)");
+    assert_eq!(
+        off_h, 0,
+        "the default path must emit no Hadamard (byte-unchanged SKUs)"
+    );
     assert_eq!(
         on_h,
         4 * LAYERS,
@@ -307,8 +323,14 @@ fn the_kv_rotation_is_the_unrotated_forward() {
     let bf16_off = run(&mut load(&dir, Dtype::Bf16, false), 0);
     let bf16_on = run(&mut load(&dir, Dtype::Bf16, true), 1);
     for (step, (a, b)) in bf16_off.iter().zip(bf16_on.iter()).enumerate() {
-        assert!(a.iter().all(|v| v.is_finite()), "bf16 off step {step} non-finite");
-        assert!(b.iter().all(|v| v.is_finite()), "bf16 on step {step} non-finite");
+        assert!(
+            a.iter().all(|v| v.is_finite()),
+            "bf16 off step {step} non-finite"
+        );
+        assert!(
+            b.iter().all(|v| v.is_finite()),
+            "bf16 on step {step} non-finite"
+        );
     }
     let (bf16_max, bf16_mean, spread) = deviation(&bf16_off, &bf16_on);
     let rel = bf16_max / spread.max(1e-6);

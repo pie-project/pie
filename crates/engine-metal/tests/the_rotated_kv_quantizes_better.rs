@@ -32,7 +32,7 @@ use model_ir::Dtype;
 /// Deterministic integer hash (same mixer as the sibling Hadamard test), so the
 /// data is reproducible run to run with no RNG state.
 fn noise(at: u64) -> u32 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5e5e_1234_9ABC_DEF0;
+    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     (x >> 32) as u32
@@ -140,7 +140,11 @@ fn outlier_data(rows: usize, head_dim: usize, salt: u64) -> Vec<f32> {
             let pos = (noise(key) as usize) % head_dim;
             // A spike of magnitude ~20..40, sign from a fresh draw.
             let mag = 20.0 + 20.0 * (unit01(key ^ 0xBEEF) as f32);
-            let sign = if noise(key ^ 0xF00D) & 1 == 0 { 1.0 } else { -1.0 };
+            let sign = if noise(key ^ 0xF00D) & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
             v[base + pos] = sign * mag;
         }
     }
@@ -175,7 +179,9 @@ fn compare_paths(
     // Rotated: H -> quantize/dequantize in the rotated domain -> H again to undo.
     let rotated = hadamard_metal(device, handles, pipelines, rows, head_dim, head_dim, data);
     let rotated_q = quantize_rowmajor(&rotated, block, bits);
-    let rot_recon = hadamard_metal(device, handles, pipelines, rows, head_dim, head_dim, &rotated_q);
+    let rot_recon = hadamard_metal(
+        device, handles, pipelines, rows, head_dim, head_dim, &rotated_q,
+    );
     let rot = errors(data, &rot_recon);
 
     (plain, rot)
@@ -196,9 +202,17 @@ fn the_rotated_kv_quantizes_better() {
     // the "undo" step the rotated path leans on; if it drifts, every number
     // below is suspect. f32, tight tolerance.
     for &head_dim in &[256u32, 128] {
-        let data = uniform_data(ROWS as usize, head_dim as usize, 0xDEAD ^ u64::from(head_dim));
-        let once = hadamard_metal(&device, &handles, &pipelines, ROWS, head_dim, head_dim, &data);
-        let twice = hadamard_metal(&device, &handles, &pipelines, ROWS, head_dim, head_dim, &once);
+        let data = uniform_data(
+            ROWS as usize,
+            head_dim as usize,
+            0xDEAD ^ u64::from(head_dim),
+        );
+        let once = hadamard_metal(
+            &device, &handles, &pipelines, ROWS, head_dim, head_dim, &data,
+        );
+        let twice = hadamard_metal(
+            &device, &handles, &pipelines, ROWS, head_dim, head_dim, &once,
+        );
         let (_, max_rt) = errors(&data, &twice);
         eprintln!("[sanity] head_dim={head_dim}: H(H(x)) round-trip max-abs err = {max_rt:.3e}");
         assert!(
@@ -213,7 +227,11 @@ fn the_rotated_kv_quantizes_better() {
     for &head_dim in &[256u32, 128] {
         for &bits in &[4u32, 3] {
             // --- OUTLIER-HEAVY: the case incoherence processing is meant for.
-            let odata = outlier_data(ROWS as usize, head_dim as usize, 0x0117 ^ u64::from(head_dim));
+            let odata = outlier_data(
+                ROWS as usize,
+                head_dim as usize,
+                0x0117 ^ u64::from(head_dim),
+            );
             let ((mse_p, max_p), (mse_r, max_r)) =
                 compare_paths(&device, &handles, &pipelines, ROWS, head_dim, bits, &odata);
             let ratio = mse_r / mse_p;
@@ -244,7 +262,11 @@ fn the_rotated_kv_quantizes_better() {
             );
 
             // --- UNIFORM (control): no outliers, rotation should NOT help much.
-            let udata = uniform_data(ROWS as usize, head_dim as usize, 0x2222 ^ u64::from(head_dim));
+            let udata = uniform_data(
+                ROWS as usize,
+                head_dim as usize,
+                0x2222 ^ u64::from(head_dim),
+            );
             let ((umse_p, umax_p), (umse_r, umax_r)) =
                 compare_paths(&device, &handles, &pipelines, ROWS, head_dim, bits, &udata);
             let uratio = umse_r / umse_p;
