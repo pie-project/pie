@@ -1866,7 +1866,7 @@ impl ResidencyPlanner {
         }
         if picks.is_empty() {
             if victims.deficit.pages == 0 {
-                self.check_rs_starvation(victims.head, victims.deficit.rs_slots);
+                self.check_rs_starvation(victims.head);
             } else if !unhostable.is_empty() {
                 self.check_starvation(StarveCause::NoSwapRoom);
             } else if !self.check_hog(victims.head, victims.head_pid, KvPool::Paged) {
@@ -2327,16 +2327,31 @@ impl ResidencyPlanner {
         }
     }
 
-    fn check_rs_starvation(self: &Arc<Self>, key: EntryKey, need: u32) {
+    fn check_rs_starvation(self: &Arc<Self>, key: EntryKey) {
         if !self.is_wedged() {
             return;
         }
+        let Some(need) = self.with_inner(|inner| inner.queue.get(&key).map(Waiter::rs_need)) else {
+            return;
+        };
         let (free, total) = self.port.rs_stats();
         if free >= need {
             self.poke();
             return;
         }
         if !self.is_wedged() {
+            return;
+        }
+        let restore = self.with_inner(|inner| {
+            inner
+                .queue
+                .get(&key)
+                .map(|waiter| matches!(waiter.kind, WaitKind::Restore { .. }))
+        });
+        // A parked process's slots come back only through slots others give
+        // up, and when host rows cannot take theirs a restart frees them.
+        if restore == Some(true) {
+            self.check_starvation(StarveCause::NoRsSlots);
             return;
         }
         // What the head itself holds is not coming back while it waits, so
@@ -2436,7 +2451,9 @@ impl ResidencyPlanner {
         };
         let notify = self.with_inner(|inner| {
             let (_, head) = inner.unmet_head()?;
-            if inner.accum.lens().covers(head.kv_need()) || !inner.evicting.is_empty() {
+            let pages_covered =
+                cause != StarveCause::NoRsSlots && inner.accum.lens().covers(head.kv_need());
+            if pages_covered || !inner.evicting.is_empty() {
                 return None;
             }
             let victim = inner.queue.get_mut(&victim_key)?;
@@ -2516,9 +2533,13 @@ impl ResidencyPlanner {
             let quotes =
                 crate::inferlet::process::residency::kv_reclaim_quotes(&pids, model, engine, 1);
             for ((key, _), quote) in selected.iter().zip(quotes) {
-                if let Some(ReclaimQuote::Pages(pages)) = quote
-                    && pages > 0
-                {
+                // A window holder is no suspend candidate, but a restart frees it.
+                let holds = match quote {
+                    Some(ReclaimQuote::Pages(pages)) => pages > 0,
+                    Some(ReclaimQuote::Nothing(NoReclaim::Windowed)) => true,
+                    _ => false,
+                };
+                if holds {
                     if restartable_only {
                         return Some(*key);
                     }

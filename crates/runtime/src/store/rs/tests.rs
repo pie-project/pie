@@ -73,6 +73,12 @@ fn a_suspend_parks_private_slots_on_host_and_restore_brings_them_back() {
     assert_eq!(s.folded_slot(ws), s.folded_slot(child));
     s.release_working_set(child, s.current_epoch());
     write_state(&mut s, ws);
+
+    s.update_index(b"k".to_vec(), ws).unwrap();
+    assert_eq!(s.suspendable_slots(&set(ws)), 1, "an index is no sharer");
+    let txn = s.prepare_suspend(&set(ws)).expect("the index yields");
+    assert_eq!(s.from_index(b"k"), Ok(None));
+    assert_eq!(s.commit_suspend(txn), 1);
 }
 
 fn index_snapshots_state_and_is_reclaimed_when_idle() {

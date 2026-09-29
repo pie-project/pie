@@ -383,7 +383,9 @@ impl Engine for Vulkan {
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
         let patches = patch_ladder(&trace, &budgets);
-        let shell = Shell::load(Boot {
+        let (disk_kv_budget, disk_kv_dir) =
+            (residency.disk_kv_budget, residency.disk_kv_dir.clone());
+        let mut shell = Shell::load(Boot {
             trace,
             contract: &contract,
             checkpoint: &path,
@@ -401,6 +403,9 @@ impl Engine for Vulkan {
             device: &self.boot,
         })
         .map_err(fault)?;
+        let disk_kv_pages = shell
+            .seat_disk_kv(disk_kv_budget, disk_kv_dir.as_deref())
+            .map_err(fault)?;
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -440,6 +445,7 @@ impl Engine for Vulkan {
 
                 elastic_page_bytes: 0,
                 elastic_budget_pages: 0,
+                disk_kv_pages,
                 ..PoolFacts::default()
             },
             limits: FireLimits {
@@ -726,12 +732,16 @@ impl Engine for Vulkan {
 
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
-
-        let served = self
-            .caps
-            .as_ref()
-            .is_some_and(|caps| copy.src == caps.device.domain && copy.dst == caps.device.domain);
-        if !served {
+        let device = self.caps.as_ref().map(|caps| caps.device.domain);
+        if let Some((MemoryDomain::LocalDisk, out, pages, slots)) =
+            device.and_then(|device| copy.tier_move(device))
+        {
+            return self
+                .loaded_mut()?
+                .spill_kv(out, pages, slots)
+                .map_err(fault);
+        }
+        if device.is_none_or(|device| copy.src != device || copy.dst != device) {
             return Err(Error::Unsupported {
                 verb: kv_copy_direction(copy.src, copy.dst),
                 engine: "vulkan",

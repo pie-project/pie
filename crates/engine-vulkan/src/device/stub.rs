@@ -145,6 +145,15 @@ impl Frame {
         match self.never {}
     }
 
+    pub fn copy_regions(
+        &mut self,
+        _source: &Buffer,
+        _into: &Buffer,
+        _regions: &[(u64, u64, u64)],
+    ) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn fill_zero(&mut self, _into: &Buffer, _at: u64, _len: u64) -> Result<()> {
         match self.never {}
     }

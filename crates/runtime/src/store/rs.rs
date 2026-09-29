@@ -993,12 +993,30 @@ impl RsStore {
         held
     }
 
-    /// The device slots of `working_sets` held by no working set outside them.
+    /// The index snapshots sharing a slot with `working_sets`.
+    fn sharing_indexes(&self, working_sets: &HashSet<RsWorkingSetId>) -> HashSet<RsWorkingSetId> {
+        let held = self.held_within(working_sets);
+        self.indexes
+            .values()
+            .copied()
+            .filter(|&snapshot| {
+                self.working_sets
+                    .get(snapshot)
+                    .is_some_and(|entry| Self::slots(entry).any(|id| held.contains_key(&id)))
+            })
+            .collect()
+    }
+
+    /// The device slots of `working_sets` held by no working set outside
+    /// them but index snapshots, which a suspend drops: an index is cache,
+    /// and left holding a parked set's slot it would pin it on the device.
     fn private(&self, working_sets: &HashSet<RsWorkingSetId>) -> Vec<RsSlotId> {
+        let mut scope = self.sharing_indexes(working_sets);
+        scope.extend(working_sets.iter().copied());
+        let shared = self.held_within(&scope);
         self.held_within(working_sets)
-            .into_iter()
-            .filter(|&(id, held)| !self.is_host(id) && self.ref_count(id) == held)
-            .map(|(id, _)| id)
+            .into_keys()
+            .filter(|id| !self.is_host(*id) && self.ref_count(*id) == shared[id])
             .collect()
     }
 
@@ -1043,6 +1061,23 @@ impl RsStore {
             return None;
         }
         let host = self.host.try_alloc_n(slots.len())?;
+        let moving: HashSet<RsSlotId> = slots.iter().copied().collect();
+        let snapshots = self.sharing_indexes(working_sets);
+        let mut dropped = Vec::new();
+        self.indexes.retain(|_, snapshot| {
+            let yields = snapshots.contains(snapshot)
+                && self
+                    .working_sets
+                    .get(*snapshot)
+                    .is_some_and(|entry| Self::slots(entry).any(|id| moving.contains(&id)));
+            if yields {
+                dropped.push(*snapshot);
+            }
+            !yields
+        });
+        for snapshot in dropped {
+            self.release_working_set(snapshot, self.seq);
+        }
         Some(self.txn(working_sets, slots.into_iter().zip(host).collect()))
     }
 
