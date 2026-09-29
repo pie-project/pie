@@ -50,6 +50,8 @@ members = [
     "crates/engine-vulkan",
     "crates/kernels-wgpu",
     "crates/engine-wgpu",
+    "crates/kernels-xla",
+    "crates/engine-xla",
     "crates/web-std",
     "crates/browser",
 
@@ -90,6 +92,8 @@ default-members = [
     "crates/engine-vulkan",
     "crates/kernels-wgpu",
     "crates/engine-wgpu",
+    "crates/kernels-xla",
+    "crates/engine-xla",
     "crates/eta-ir",
     "crates/eta-dsl",
     "crates/eta-compiler",
@@ -138,6 +142,7 @@ cuda = ["worker/cuda"]
 metal = ["worker/metal"]
 vulkan = ["worker/vulkan"]
 wgpu = ["worker/wgpu"]
+xla = ["worker/xla"]
 profile-fire = ["worker/profile-fire"]
 
 [dependencies]

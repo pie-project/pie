@@ -10,6 +10,7 @@ pub enum Platform {
     Metal,
     Wgpu,
     Vulkan,
+    Xla,
 }
 
 impl Platform {
@@ -20,6 +21,7 @@ impl Platform {
             Platform::Metal => "metal",
             Platform::Wgpu => "wgpu",
             Platform::Vulkan => "vulkan",
+            Platform::Xla => "xla",
         }
     }
 

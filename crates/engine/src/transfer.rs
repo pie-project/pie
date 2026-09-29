@@ -11,6 +11,7 @@ pub enum MemoryDomain {
     MetalPrivate,
     VulkanDevice(u32),
     WgpuDevice(u32),
+    XlaDevice(u32),
 }
 
 impl MemoryDomain {
@@ -20,7 +21,8 @@ impl MemoryDomain {
             MemoryDomain::CudaDevice(ordinal)
             | MemoryDomain::RocmDevice(ordinal)
             | MemoryDomain::VulkanDevice(ordinal)
-            | MemoryDomain::WgpuDevice(ordinal) => Some(ordinal),
+            | MemoryDomain::WgpuDevice(ordinal)
+            | MemoryDomain::XlaDevice(ordinal) => Some(ordinal),
             MemoryDomain::HostPinned | MemoryDomain::MetalShared | MemoryDomain::MetalPrivate => {
                 None
             }

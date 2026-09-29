@@ -253,7 +253,21 @@ async fn main(input: Input) -> Result<Output> {
         let carried = runs.iter().position(|&(start, _)| start == base);
         let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
         let embed_indptr_p = Channel::from([0u32, len]).named("embed_indptr_p");
-        let positions_p = Channel::from_iter(base..end).named("positions_p");
+        // **EVERY FIRE ROTATES AT ITS ROW MINUS THE LAG OF THE SPANS BEFORE
+        // IT**, not only the decode: the text after a span sits `rope_delta`
+        // behind its token row, as upstream's `get_rope_index` places it. A
+        // tail rotated at the raw row leaves a hole of `h·w - max(h, w)`
+        // positions and the decode then rotates backwards across it. A run's
+        // own fire states its first position the same way; the host walks
+        // the span from there. (These are rotations only: KV slots, lengths
+        // and the causal bound count rows.)
+        let lag: u32 = runs
+            .iter()
+            .zip(&images)
+            .filter(|((_, run_end), _)| *run_end <= base)
+            .map(|(_, image)| image.token_count() - image.position_span())
+            .sum();
+        let positions_p = Channel::from_iter((base..end).map(|row| row - lag)).named("positions_p");
         let w_slot_pv: Vec<u32> = (base..end)
             .map(|c| pool_ids[(c / page_t) as usize])
             .collect();

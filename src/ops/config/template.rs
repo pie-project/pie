@@ -12,6 +12,8 @@ pub fn default_config_content() -> Result<String> {
         Some(flavor::Flavor::Vulkan) => Some(VULKAN_ENGINE_BLOCK),
         #[cfg(feature = "wgpu")]
         Some(flavor::Flavor::Wgpu) => Some(WGPU_ENGINE_BLOCK),
+        #[cfg(feature = "xla")]
+        Some(flavor::Flavor::Xla) => Some(XLA_ENGINE_BLOCK),
         #[allow(unreachable_patterns)]
         _ => None,
     };
@@ -19,7 +21,7 @@ pub fn default_config_content() -> Result<String> {
         bail!(
             "this pie binary carries no engine, so there is no `[engine]` \
              section to write and the config would not parse. Rebuild with \
-             `--features cuda`, `--features vulkan`, `--features wgpu`, or, \
+             `--features cuda`, `--features vulkan`, `--features wgpu`, `--features xla`, or, \
              on Apple hardware, `--features metal`."
         );
     };
@@ -173,6 +175,23 @@ gpu_mem_utilization = 0.90  # of the device-local heap: weights, kv pool, scratc
 # pipeline_cache       = "/path/to/pipeline.bin"  # omit for in-process only
 "#;
 
+#[cfg(any(feature = "xla", test))]
+const XLA_ENGINE_BLOCK: &str = r#"
+[engine]
+# Which keys are valid here depends on `type`: the common ones below, plus
+# whatever the named engine accepts. The xla shell drives one PJRT device.
+type = "xla"
+device = ["tpu:0"]
+activation_dtype = "bfloat16"
+device_index = 0            # which of the plugin's addressable devices
+mem_utilization = 0.90      # of device memory: weights, kv pool, state pool
+# plugin               = "/path/to/libtpu.so"  # omit: PIE_XLA_PLUGIN, TPU_LIBRARY_PATH, libtpu.so
+# max_total_pages      = 4096   # omit for the engine's own default
+# max_forward_tokens   = 2048
+# max_forward_requests = 64
+# max_state_slots      = 256    # recurrent-state seats (hybrid models)
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +201,7 @@ mod tests {
         default_config_is_parseable();
         the_vulkan_block_states_only_keys_the_engine_declares();
         the_wgpu_block_states_only_keys_the_engine_declares();
+        the_xla_block_states_only_keys_the_engine_declares();
         a_binary_with_an_engine_writes_a_config_that_parses();
         it_names_the_engine_this_binary_actually_has();
     }
@@ -201,6 +221,11 @@ mod tests {
         worker::Config::parse(&content).expect("the wgpu template must parse");
     }
 
+    fn the_xla_block_states_only_keys_the_engine_declares() {
+        let content = format!("{HEADER}{DEFAULT_MODEL_BLOCK}{XLA_ENGINE_BLOCK}{TAIL}");
+        worker::Config::parse(&content).expect("the xla template must parse");
+    }
+
     fn a_binary_with_an_engine_writes_a_config_that_parses() {
         let Ok(content) = default_config_content() else {
             return;
@@ -218,6 +243,8 @@ mod tests {
             Some(flavor::Flavor::Vulkan) => Some("vulkan"),
             #[cfg(feature = "wgpu")]
             Some(flavor::Flavor::Wgpu) => Some("wgpu"),
+            #[cfg(feature = "xla")]
+            Some(flavor::Flavor::Xla) => Some("xla"),
             #[allow(unreachable_patterns)]
             _ => None,
         };

@@ -18,6 +18,7 @@ cuda = ["runtime/cuda"]
 metal = ["runtime/metal"]
 vulkan = ["runtime/vulkan"]
 wgpu = ["runtime/wgpu"]
+xla = ["runtime/xla"]
 nixl = ["dep:transport", "transport/nixl"]
 
 profile-fire = ["runtime/profile-fire"]
