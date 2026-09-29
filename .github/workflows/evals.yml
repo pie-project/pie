@@ -8,11 +8,11 @@ permissions: {}
 
 jobs:
   dispatch:
-    name: "evals: send to pie-evals"
+    name: "evals: send to stats"
     runs-on: ubuntu-latest
     steps:
       - env:
-          GH_TOKEN: ${{ secrets.PIE_EVALS_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.STATS_DISPATCH_TOKEN }}
         run: |
-          [ -n "$GH_TOKEN" ] || { echo "::warning::PIE_EVALS_DISPATCH_TOKEN is not set"; exit 0; }
-          gh api repos/pie-project/pie-evals/dispatches -f event_type=pie-eval -f "client_payload[pie_commit]=$GITHUB_SHA"
+          [ -n "$GH_TOKEN" ] || { echo "::warning::STATS_DISPATCH_TOKEN is not set"; exit 0; }
+          gh api repos/anton-mel/stats/dispatches -f event_type=pie-eval -f "client_payload[pie_commit]=$GITHUB_SHA"
