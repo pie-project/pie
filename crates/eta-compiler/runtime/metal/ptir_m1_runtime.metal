@@ -170,6 +170,53 @@ inline bool m1_sort_better(float value, uint index, float best, uint best_index)
   return index < best_index;
 }
 
+#define M1_CUMMASS_OFF_SLACK 1e-5f
+
+inline bool m1_cummass_keeps_whole_row(float sum, float smallest, float threshold) {
+  const float slack = threshold >= 1.0f ? M1_CUMMASS_OFF_SLACK : 0.0f;
+  return (sum - smallest) < threshold + slack;
+}
+
+inline bool m1_cummass_keeps_row_serial(
+    const device uchar* a0, uint base, uint last, uint dtype, float threshold) {
+  if (last == 0u) return false;
+  float sum = 0.0f;
+  float smallest = INFINITY;
+  for (uint i = 0; i < last; ++i) {
+    const float value = m1_load_f(a0, base + i, dtype);
+    sum += value;
+    smallest = min(smallest, value);
+  }
+  return m1_cummass_keeps_whole_row(sum, smallest, threshold);
+}
+
+inline bool m1_cummass_keeps_row_mt(
+    const device uchar* a0, uint base, uint last, uint dtype, float threshold,
+    uint tid, uint nthreads, threadgroup M1ArgmaxCandidate* tgbuf) {
+  if (last == 0u) return false;
+  float sum = 0.0f;
+  float smallest = INFINITY;
+  for (uint i = tid; i < last; i += nthreads) {
+    const float value = m1_load_f(a0, base + i, dtype);
+    sum += value;
+    smallest = min(smallest, value);
+  }
+  tgbuf[tid] = M1ArgmaxCandidate{sum, as_type<uint>(smallest), 1u, 0u};
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+    if ((tid % (2u * stride)) == 0u && tid + stride < nthreads) {
+      const M1ArgmaxCandidate other = tgbuf[tid + stride];
+      tgbuf[tid].value += other.value;
+      tgbuf[tid].index = as_type<uint>(min(as_type<float>(tgbuf[tid].index), as_type<float>(other.index)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const bool keeps =
+      m1_cummass_keeps_whole_row(tgbuf[0].value, as_type<float>(tgbuf[0].index), threshold);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return keeps;
+}
+
 inline uint m1_desc_key(float value) {
   if (isnan(value)) return 0xFFFFFFFFu;
   if (value == 0.0f) value = 0.0f;
@@ -1077,6 +1124,11 @@ inline void ptir_m1_execute_part(
       } else {
 
         const float threshold = m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
+        if (m1_cummass_keeps_row_serial(a0, base, d0.last, d0.dtype, threshold)) {
+          for (uint i = 0; i < d0.last; ++i)
+            m1_store_b(o0, base + i, !isnan(m1_load_f(a0, base + i, d0.dtype)));
+          continue;
+        }
         for (uint i = 0; i < d0.last; ++i) m1_store_b(o0, base + i, false);
         float exclusive = 0.0f;
         float prev_value = 0.0f;
@@ -1245,6 +1297,12 @@ inline void m1_nucleus_select_mt(
   for (uint row = 0; row < d0.rows; ++row) {
     const uint base = row * d0.last;
     const float threshold = m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
+    if (m1_cummass_keeps_row_mt(a0, base, d0.last, d0.dtype, threshold, tid, nthreads, tgbuf)) {
+      for (uint i = tid; i < d0.last; i += nthreads)
+        m1_store_b(o0, base + i, !isnan(m1_load_f(a0, base + i, d0.dtype)));
+      threadgroup_barrier(mem_flags::mem_device);
+      continue;
+    }
     for (uint i = tid; i < d0.last; i += nthreads) m1_store_b(o0, base + i, false);
     threadgroup_barrier(mem_flags::mem_device);
     float exclusive = 0.0f;
@@ -1820,6 +1878,14 @@ inline void m4_sel_fallback(
   if (mode == 0u) {
     const int signed_k = m1_load_i(a1, 0u, d1.dtype);
     k = signed_k <= 0 ? 0u : uint(signed_k);
+  }
+  if (mode == 1u &&
+      m1_cummass_keeps_row_mt(a0, 0u, n, d0.dtype, threshold, tid, threads, tgbuf)) {
+    for (uint i = tid; i < n; i += threads)
+      m1_store_b(o0, i, !isnan(m1_load_f(a0, i, d0.dtype)));
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0u) st->done = 1u;
+    return;
   }
   float exclusive = st->exclusive;
   uint taken = st->taken;

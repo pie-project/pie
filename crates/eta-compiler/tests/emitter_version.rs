@@ -8,7 +8,7 @@ use msl_corpus::{corpus_bound, corpus_stages, extended_stages};
 
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 40, 0xa92f_4d4b_c783_4735),
-    ("metal", 54, 0x8ee1_2aad_36d1_edd4),
+    ("metal", 55, 0x07a2_0450_8ab3_ff9e),
 ];
 
 fn fingerprint(backend: Backend) -> u64 {
