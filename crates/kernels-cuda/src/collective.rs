@@ -26,26 +26,17 @@ pub struct Peers {
     pub stages: u64,
     /// `vllm::RankSignals`: every rank's signal block, in rank order.
     pub signals: u64,
-    /// Longest message, in bytes, the peer path carries; NCCL carries longer.
-    pub reach: u64,
 }
 
 impl Peers {
-    fn carries(&self, t: &Tensor, bytes: u64) -> bool {
-        t.dtype == dtype::Dtype::Bf16
-            && aligned16(t.ptr)
-            && (t.elements() * 2).is_multiple_of(16)
-            && bytes <= self.reach
+    fn carries(&self, t: &Tensor) -> bool {
+        t.dtype == dtype::Dtype::Bf16 && aligned16(t.ptr) && (t.elements() * 2).is_multiple_of(16)
     }
 
     fn entry(&self, reduce: bool) -> Option<&'static str> {
         Some(match (reduce, self.world) {
             (true, 2) => "::pie::collective::all_reduce_peers<__nv_bfloat16, 2>",
-            (true, 4) => "::pie::collective::all_reduce_peers<__nv_bfloat16, 4>",
-            (true, 8) => "::pie::collective::all_reduce_peers<__nv_bfloat16, 8>",
             (false, 2) => "::pie::collective::all_gather_peers<__nv_bfloat16, 2>",
-            (false, 4) => "::pie::collective::all_gather_peers<__nv_bfloat16, 4>",
-            (false, 8) => "::pie::collective::all_gather_peers<__nv_bfloat16, 8>",
             _ => return None,
         })
     }
@@ -171,7 +162,7 @@ fn copy(ctx: &Ctx, op: &'static str, dst: u64, src: u64, bytes: u64) -> Result<(
 pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "collective.all_reduce";
     if let Some(peers) = ctx.peers()
-        && peers.carries(buf, buf.elements() * 2)
+        && peers.carries(buf)
     {
         return peers.all_reduce(ctx, OP, buf);
     }
@@ -208,7 +199,7 @@ pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), Error> {
 pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "collective.all_gather";
     if let Some(peers) = ctx.peers()
-        && peers.carries(&x, y.elements() * 2)
+        && peers.carries(&x)
         && x.width.is_multiple_of(8)
         && aligned16(y.ptr)
         && y.rows == x.rows
