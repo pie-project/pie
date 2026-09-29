@@ -432,7 +432,14 @@ template <int D, bool KPL> constexpr int sdpa_kp_tile() {
 
 template <int D, bool KPL> constexpr int sdpa_kstride() { return KPL ? D + 2 : D; }
 
-template <typename T, int D, int V, bool WITH_SINK, bool KEY_PER_LANE, bool WITH_LSE>
+template <
+    typename T,
+    int D,
+    int V,
+    bool WITH_SINK,
+    bool KEY_PER_LANE,
+    bool WITH_LSE,
+    bool PACKED = false>
 inline void sdpa_paged_tiled_body(
     const device T* queries,
     const device T* k_pages,
@@ -551,9 +558,30 @@ inline void sdpa_paged_tiled_body(
         const int kp = base + kk;
         const int page = int(kv_page_indices[page_base + kp / page_size]);
         const size_t slot = size_t(page) * page_size + (kp % page_size);
-        const size_t off = (slot * n_kv_heads + kv_head) * D + d;
-        ktile[kk * kstride + d] = k_pages[off];
-        vtile[e] = v_pages[off];
+        if constexpr (PACKED) {
+          // C2c-2 — the packed 4-bit KV staging load. This lane stages element
+          // `d` of the block for cached token `kk`: byte-index the token's
+          // 130-byte block (nibbles + inline fp16 scale), read the block scale,
+          // and unpack the one element (offset-binary q = nibble - 8, dequant =
+          // q * scale). Identical math to the C2c-1 decode read; only the source
+          // is the packed cache, not bf16 pages. The rest of the tiled body (tile
+          // matmul, softmax, lse) reads the staged bf16 tiles unchanged.
+          static_assert(
+              D == 256, "the packed 4-bit KV tiled read stages whole 256-element heads");
+          const device uchar* kblk =
+              (const device uchar*)k_pages + (slot * n_kv_heads + kv_head) * KV_U4_BYTES;
+          const device uchar* vblk =
+              (const device uchar*)v_pages + (slot * n_kv_heads + kv_head) * KV_U4_BYTES;
+          float kdq, vdq;
+          sdpa_kv_u4_lane(kblk, uint(d), 1, sdpa_kv_u4_scale(kblk), &kdq);
+          sdpa_kv_u4_lane(vblk, uint(d), 1, sdpa_kv_u4_scale(vblk), &vdq);
+          ktile[kk * kstride + d] = static_cast<T>(kdq);
+          vtile[e] = static_cast<T>(vdq);
+        } else {
+          const size_t off = (slot * n_kv_heads + kv_head) * D + d;
+          ktile[kk * kstride + d] = k_pages[off];
+          vtile[e] = v_pages[off];
+        }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (!mine) continue;
@@ -737,6 +765,94 @@ template <typename T, int D, int V = D, bool KEY_PER_LANE = false>
       ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
 }
 
+// C2c-2 — the TILED read over a PACKED 4-bit KV cache, covering prefill and the
+// masked prefill (both dispatched as `sdpa_paged_tiled`). Same signature and same
+// attention math as `sdpa_paged_tiled` at the 256-wide head (WITH_SINK = false,
+// KEY_PER_LANE = false); the K/V pages are the packed KvU4 cache (uchar blocks
+// bound through the same buffers) and the shared staging load dequantizes each
+// element per PACKED = true. Only d = 256 is stamped — a packed head is a whole
+// 256-block and the host refuses any other width.
+template <typename T, int D, int V = D>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_tiled_kv_u4(
+    const device T* queries     [[buffer(0)]],
+    const device T* k_pages     [[buffer(1)]],
+    const device T* v_pages     [[buffer(2)]],
+    device T* out               [[buffer(3)]],
+    const constant int& gqa_factor          [[buffer(4)]],
+    const device int* position_ids          [[buffer(5)]],
+    const device int* req_of_token          [[buffer(6)]],
+    const device uint* kv_page_indices      [[buffer(7)]],
+    const device uint* kv_page_indptr       [[buffer(8)]],
+    const constant int& page_size           [[buffer(9)]],
+    const constant int& n_kv_heads          [[buffer(10)]],
+    const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],
+    const device uint& attention_mask_stride[[buffer(13)]],
+    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const constant int& window                 [[buffer(15)]],
+    const device T* sinks                      [[buffer(16)]],
+    const constant int& n_rows                 [[buffer(17)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tpg       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  static_assert(D == 256, "the packed 4-bit KV tiled read stages whole 256-element heads");
+  threadgroup T ktile[sdpa_kt<D>() * sdpa_kstride<D, false>()];
+  threadgroup T vtile[sdpa_kt<D>() * D];
+  threadgroup T qtile[sdpa_kq<D, false>()];
+  threadgroup float ptile[sdpa_kp_tile<D, false>()];
+  sdpa_paged_tiled_body<T, D, V, false, false, false, true>(
+      queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
+      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      attention_mask, attention_mask_stride, attention_mask_enabled, window,
+      sinks, nullptr, n_rows,
+      0, 0,
+      ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
+}
+
+// C2c-2 — the TILED read with a published log-sum-exp (prefill_lse) over a PACKED
+// 4-bit KV cache. Mirrors `sdpa_paged_tiled_lse` at d = 256 (KEY_PER_LANE =
+// false) with PACKED = true and WITH_LSE = true; the same dequantizing staging
+// load feeds the same lse math.
+template <typename T, int D, int V = D>
+[[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_tiled_lse_kv_u4(
+    const device T* queries     [[buffer(0)]],
+    const device T* k_pages     [[buffer(1)]],
+    const device T* v_pages     [[buffer(2)]],
+    device T* out               [[buffer(3)]],
+    const constant int& gqa_factor          [[buffer(4)]],
+    const device int* position_ids          [[buffer(5)]],
+    const device int* req_of_token          [[buffer(6)]],
+    const device uint* kv_page_indices      [[buffer(7)]],
+    const device uint* kv_page_indptr       [[buffer(8)]],
+    const constant int& page_size           [[buffer(9)]],
+    const constant int& n_kv_heads          [[buffer(10)]],
+    const constant float& scale             [[buffer(11)]],
+    const device uchar* attention_mask      [[buffer(12)]],
+    const device uint& attention_mask_stride[[buffer(13)]],
+    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const constant int& window                 [[buffer(15)]],
+    const device T* sinks                      [[buffer(16)]],
+    const constant int& n_rows                 [[buffer(17)]],
+    device float* lse                          [[buffer(18)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 tpg       [[threadgroups_per_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]]) {
+  static_assert(D == 256, "the packed 4-bit KV tiled read stages whole 256-element heads");
+  threadgroup T ktile[sdpa_kt<D>() * sdpa_kstride<D, false>()];
+  threadgroup T vtile[sdpa_kt<D>() * D];
+  threadgroup T qtile[sdpa_kq<D, false>()];
+  threadgroup float ptile[sdpa_kp_tile<D, false>()];
+  sdpa_paged_tiled_body<T, D, V, false, false, true, true>(
+      queries, k_pages, v_pages, out, gqa_factor, position_ids, req_of_token,
+      kv_page_indices, kv_page_indptr, page_size, n_kv_heads, scale,
+      attention_mask, attention_mask_stride, attention_mask_enabled, window,
+      sinks, lse, n_rows,
+      0, 0,
+      ktile, vtile, qtile, ptile, tid, tpg, simd_gid, simd_lid);
+}
+
 template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LANE = false>
 [[kernel]] [[max_total_threads_per_threadgroup(1024)]] void sdpa_paged_tiled_strided(
     const device T* queries     [[buffer(0)]],
@@ -824,6 +940,33 @@ instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 64, 64, tru
 instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 128, 128, true)
 instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 256, 256, false)
 instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 512, 512, false)
+
+// C2c-2 — the packed 4-bit KV tiled read (prefill / masked / prefill_lse),
+// stamped only at the 256-wide head.
+#define instantiate_sdpa_tiled_kv_u4(name, itype, d, v)                    \
+  template [[host_name("sdpa_paged_tiled_kv_u4_" #name "_d_" #d)]]         \
+  [[kernel]] void sdpa_paged_tiled_kv_u4<itype, d, v>(                      \
+      const device itype*, const device itype*, const device itype*,        \
+      device itype*, const constant int&, const device int*,                \
+      const device int*, const device uint*, const device uint*,            \
+      const constant int&, const constant int&, const constant float&,      \
+      const device uchar*, const device uint&, const device uchar*,         \
+      const constant int&, const device itype*, const constant int&,        \
+      uint3, uint3, uint, uint);
+
+#define instantiate_sdpa_tiled_lse_kv_u4(name, itype, d, v)                \
+  template [[host_name("sdpa_paged_tiled_lse_kv_u4_" #name "_d_" #d)]]     \
+  [[kernel]] void sdpa_paged_tiled_lse_kv_u4<itype, d, v>(                  \
+      const device itype*, const device itype*, const device itype*,        \
+      device itype*, const constant int&, const device int*,                \
+      const device int*, const device uint*, const device uint*,            \
+      const constant int&, const constant int&, const constant float&,      \
+      const device uchar*, const device uint&, const device uchar*,         \
+      const constant int&, const device itype*, const constant int&,        \
+      device float*, uint3, uint3, uint, uint);
+
+instantiate_sdpa_tiled_kv_u4(bfloat16, bfloat, 256, 256)
+instantiate_sdpa_tiled_lse_kv_u4(bfloat16, bfloat, 256, 256)
 
 #define instantiate_sdpa_paged_impl(fn, name, itype, d, v, sink)           \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \
