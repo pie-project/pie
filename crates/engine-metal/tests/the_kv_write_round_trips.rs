@@ -35,7 +35,7 @@ const PACKED: usize = 130; // 128 nibble bytes + one fp16 scale
 // --- deterministic outlier-heavy KV data (same mixer as the C2a test) --------
 
 fn noise(at: u64) -> u32 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5e5e_1234_9ABC_DEF0;
+    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     (x >> 32) as u32
@@ -61,10 +61,15 @@ fn outlier_plane(rows: usize, width: usize, salt: u64) -> Vec<f32> {
     for blk in 0..(rows * width) / BLOCK {
         let base = blk * BLOCK;
         for k in 0..SPIKES {
-            let key = (blk as u64).wrapping_mul(0x100_0193) ^ (k as u64).wrapping_mul(0x9E37) ^ salt;
+            let key =
+                (blk as u64).wrapping_mul(0x100_0193) ^ (k as u64).wrapping_mul(0x9E37) ^ salt;
             let pos = (noise(key) as usize) % BLOCK;
             let mag = 20.0 + 20.0 * (unit01(key ^ 0xBEEF) as f32);
-            let sign = if noise(key ^ 0xF00D) & 1 == 0 { 1.0 } else { -1.0 };
+            let sign = if noise(key ^ 0xF00D) & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
             v[base + pos] = sign * mag;
         }
     }
@@ -249,7 +254,7 @@ fn the_kv_write_round_trips() {
     let ppi = rig.u32s(&[0u32]);
     let ppp = rig.u32s(&[0u32, 1]);
     // token i lands in page 0 at in-page offset i.
-    let w_page = rig.u32s(&vec![0u32; TOKENS]);
+    let w_page = rig.u32s(&[0u32; TOKENS]);
     let w_off = rig.u32s(&(0..TOKENS as u32).collect::<Vec<_>>());
 
     let pool = KvPool {

@@ -33,7 +33,7 @@ const BLOCK: usize = 256;
 // --- deterministic data (same mixer as the C0 / hadamard tests) --------------
 
 fn noise(at: u64) -> u32 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5e5e_1234_9ABC_DEF0;
+    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     (x >> 32) as u32
@@ -63,7 +63,11 @@ fn outlier_data(rows: usize, head_dim: usize, salt: u64) -> Vec<f32> {
             let key = (r as u64).wrapping_mul(0x100_0193) ^ (k as u64).wrapping_mul(0x9E37) ^ salt;
             let pos = (noise(key) as usize) % head_dim;
             let mag = 20.0 + 20.0 * (unit01(key ^ 0xBEEF) as f32);
-            let sign = if noise(key ^ 0xF00D) & 1 == 0 { 1.0 } else { -1.0 };
+            let sign = if noise(key ^ 0xF00D) & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
             v[base + pos] = sign * mag;
         }
     }
@@ -147,6 +151,7 @@ fn host_quantize(data: &[f32]) -> (Vec<i32>, Vec<f32>, Vec<f32>) {
     let mut codes = vec![0i32; data.len()];
     let mut recon = vec![0.0f32; data.len()];
     let mut scales = vec![0.0f32; blocks];
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (bi, chunk) in data.chunks_exact(BLOCK).enumerate() {
         let base = bi * BLOCK;
         let absmax = chunk.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
@@ -218,7 +223,10 @@ impl Rig<'_> {
         inb.write(0, data_bytes).expect("write in");
         let in_h = self.handles.bind(&inb, 0, inb.bytes()).expect("bind in");
         let packed = Buffer::zeroed(self.device, packed_bytes).expect("packed buffer");
-        let pk_h = self.handles.bind(&packed, 0, packed.bytes()).expect("bind packed");
+        let pk_h = self
+            .handles
+            .bind(&packed, 0, packed.bytes())
+            .expect("bind packed");
         let x = Tensor::new(in_h, 1, elems as u32, in_dtype);
         let pk = Tensor::new(pk_h, 1, packed_bytes as u32, Dtype::U8);
         {
@@ -238,9 +246,13 @@ impl Rig<'_> {
             other => panic!("unpack test only drives f32/bf16, not {other:?}"),
         };
         let out_bytes = elems as u64 * elem_bytes;
-        let mut pkb = Buffer::zeroed(self.device, packed_bytes.len() as u64).expect("packed buffer");
+        let mut pkb =
+            Buffer::zeroed(self.device, packed_bytes.len() as u64).expect("packed buffer");
         pkb.write(0, packed_bytes).expect("write packed");
-        let pk_h = self.handles.bind(&pkb, 0, pkb.bytes()).expect("bind packed");
+        let pk_h = self
+            .handles
+            .bind(&pkb, 0, pkb.bytes())
+            .expect("bind packed");
         let outb = Buffer::zeroed(self.device, out_bytes).expect("out buffer");
         let out_h = self.handles.bind(&outb, 0, outb.bytes()).expect("bind out");
         let pk = Tensor::new(pk_h, 1, packed_bytes.len() as u32, Dtype::U8);
@@ -279,10 +291,19 @@ fn the_kv_codec_round_trips() {
     // (1)+(2): round-trip vs the host quantize_rowmajor reference, f32.
     for &head_dim in &[256usize, 128] {
         for (label, data) in [
-            ("outlier", outlier_data(ROWS, head_dim, 0x0117 ^ head_dim as u64)),
-            ("uniform", uniform_data(ROWS, head_dim, 0x2222 ^ head_dim as u64)),
+            (
+                "outlier",
+                outlier_data(ROWS, head_dim, 0x0117 ^ head_dim as u64),
+            ),
+            (
+                "uniform",
+                uniform_data(ROWS, head_dim, 0x2222 ^ head_dim as u64),
+            ),
         ] {
-            assert!(data.len() % BLOCK == 0, "test data must be whole 256-blocks");
+            assert!(
+                data.len() % BLOCK == 0,
+                "test data must be whole 256-blocks"
+            );
             let blocks = data.len() / BLOCK;
 
             let packed = rig.pack(&f32_bytes(&data), Dtype::F32, data.len());
@@ -300,7 +321,8 @@ fn the_kv_codec_round_trips() {
                 .filter(|(a, b)| a != b)
                 .count();
             assert_eq!(
-                code_mismatches, 0,
+                code_mismatches,
+                0,
                 "{label} head_dim={head_dim}: {code_mismatches} of {} nibble codes disagree with \
                  the host reference — a quantize or signed-nibble-convention bug",
                 host_codes.len()
@@ -314,6 +336,7 @@ fn the_kv_codec_round_trips() {
             // scale check: the stored fp16 scale is within half an fp16 ulp of
             // the host's full-precision absmax/7.
             let mut max_scale_rel = 0.0f64;
+            #[allow(clippy::chunks_exact_to_as_chunks)]
             for (bi, chunk) in data.chunks_exact(BLOCK).enumerate() {
                 let absmax = chunk.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
                 let want = absmax / 7.0;
@@ -370,7 +393,9 @@ fn the_kv_codec_round_trips() {
         let packed = rig.pack(&bf_in, Dtype::Bf16, data.len());
         let recon = bf16_floats(&rig.unpack(&packed, Dtype::Bf16, data.len()));
         let (mse, max) = errors(&bf_view, &recon);
-        eprintln!("[bf16   ] head_dim=256 | pack->unpack vs bf16 input: MSE={mse:.5e} max-abs={max:.4}");
+        eprintln!(
+            "[bf16   ] head_dim=256 | pack->unpack vs bf16 input: MSE={mse:.5e} max-abs={max:.4}"
+        );
         assert!(
             recon.iter().all(|v| v.is_finite()),
             "bf16 reconstruction has a non-finite value"
@@ -399,8 +424,16 @@ fn the_kv_codec_round_trips() {
                     "all-zero block: every byte must pack two q=0 nibbles (0x88)"
                 );
             }
-            assert_eq!(packed[b * 130 + 128], 0, "all-zero block: fp16 scale low byte");
-            assert_eq!(packed[b * 130 + 129], 0, "all-zero block: fp16 scale high byte");
+            assert_eq!(
+                packed[b * 130 + 128],
+                0,
+                "all-zero block: fp16 scale low byte"
+            );
+            assert_eq!(
+                packed[b * 130 + 129],
+                0,
+                "all-zero block: fp16 scale high byte"
+            );
         }
         eprintln!("[edge   ] all-zero block: scale 0, codes 0x88, recon zeros, no NaN — OK");
     }
@@ -412,7 +445,9 @@ fn the_kv_codec_round_trips() {
         inb.write(0, &f32_bytes(&ragged)).expect("write in");
         let in_h = handles.bind(&inb, 0, inb.bytes()).expect("bind in");
         let packed = Buffer::zeroed(&device, 130).expect("packed buffer");
-        let pk_h = handles.bind(&packed, 0, packed.bytes()).expect("bind packed");
+        let pk_h = handles
+            .bind(&packed, 0, packed.bytes())
+            .expect("bind packed");
         let x = Tensor::new(in_h, 1, 300, Dtype::F32);
         let pk = Tensor::new(pk_h, 1, 130, Dtype::U8);
         let frame = device.frame().expect("frame");
@@ -422,7 +457,10 @@ fn the_kv_codec_round_trips() {
             refused.is_err(),
             "a 300-element (non-multiple-of-256) tensor must be refused by the codec"
         );
-        eprintln!("[edge   ] ragged width 300 rejected: {}", refused.unwrap_err());
+        eprintln!(
+            "[edge   ] ragged width 300 rejected: {}",
+            refused.unwrap_err()
+        );
     }
 
     eprintln!("=== C2a done: Metal KV codec reproduces the host quantize_rowmajor exactly ===");

@@ -433,7 +433,11 @@ impl Pools {
             // row bytes (codes + inline scale), NOT width * element — a slot's
             // packed cells are contiguous, so a byte-blit still moves them, but
             // only when the cell size is the packed stride.
-            let keys_cell = row_stride("kv migration", dtype, u64::from(kv_heads) * u64::from(head_dim))?;
+            let keys_cell = row_stride(
+                "kv migration",
+                dtype,
+                u64::from(kv_heads) * u64::from(head_dim),
+            )?;
             let values_cell = if values_width == 0 {
                 0
             } else {

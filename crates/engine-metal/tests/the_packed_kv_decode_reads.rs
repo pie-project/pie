@@ -37,7 +37,7 @@ const PAGES: u32 = 1;
 // --- deterministic K/V/Q data ------------------------------------------------
 
 fn noise(at: u64) -> u32 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5e5e_1234_9ABC_DEF0;
+    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     (x >> 32) as u32
@@ -64,10 +64,15 @@ fn plane(rows: usize, width: usize, salt: u64) -> Vec<f32> {
     for blk in 0..(rows * width) / BLOCK {
         let base = blk * BLOCK;
         for k in 0..SPIKES {
-            let key = (blk as u64).wrapping_mul(0x100_0193) ^ (k as u64).wrapping_mul(0x9E37) ^ salt;
+            let key =
+                (blk as u64).wrapping_mul(0x100_0193) ^ (k as u64).wrapping_mul(0x9E37) ^ salt;
             let pos = (noise(key) as usize) % BLOCK;
             let mag = 3.0 + 2.0 * (unit01(key ^ 0xBEEF) as f32);
-            let sign = if noise(key ^ 0xF00D) & 1 == 0 { 1.0 } else { -1.0 };
+            let sign = if noise(key ^ 0xF00D) & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
             v[base + pos] = sign * mag;
         }
     }
@@ -90,7 +95,8 @@ fn exact_plane(rows: usize, width: usize, salt: u64) -> Vec<f32> {
     for blk in 0..(rows * width) / BLOCK {
         let base = blk * BLOCK;
         for d in 0..BLOCK {
-            let key = (blk as u64).wrapping_mul(0x100_0193) ^ (d as u64).wrapping_mul(0x9E37) ^ salt;
+            let key =
+                (blk as u64).wrapping_mul(0x100_0193) ^ (d as u64).wrapping_mul(0x9E37) ^ salt;
             let q = (noise(key) % 15) as i32 - 7; // [-7, 7]
             v[base + d] = q as f32 * S;
         }
@@ -119,6 +125,7 @@ fn bf16_bytes(v: &[f32]) -> Vec<u8> {
         .collect()
 }
 
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(2)
@@ -286,7 +293,8 @@ fn decode_over(
     };
     let ot = Tensor::new(ho, rows as u32, (Q_HEADS * HEAD_DIM) as u32, Dtype::Bf16);
     rig.fire(|s| {
-        attn::decode(s, qt, plan, pool, None, HEAD_DIM as u32, sm_scale, ot).expect("decode launch");
+        attn::decode(s, qt, plan, pool, None, HEAD_DIM as u32, sm_scale, ot)
+            .expect("decode launch");
     });
     bf16_floats(&rig.handles.read(ho, obytes).expect("read out"))
 }
@@ -307,16 +315,11 @@ fn deviation(a: &[f32], b: &[f32]) -> (f64, f64) {
 /// over a bf16 cache holding the K/V unpacked FROM the packed cache (the isolate
 /// reference), and over a bf16 cache holding the ORIGINAL K/V (the quant-error
 /// reference). Returns ((isolate max, isolate mean), (quant max, quant mean)).
-fn run_case(
-    rig: &mut Rig,
-    label: &str,
-    k_src: &[f32],
-    v_src: &[f32],
-) -> ((f64, f64), (f64, f64)) {
+fn run_case(rig: &mut Rig, label: &str, k_src: &[f32], v_src: &[f32]) -> ((f64, f64), (f64, f64)) {
     // ---- seed the write tables ----------------------------------------------
     let hk = rig.bf16(k_src);
     let hv = rig.bf16(v_src);
-    let w_page = rig.u32s(&vec![0u32; N_KV]);
+    let w_page = rig.u32s(&[0u32; N_KV]);
     let w_off = rig.u32s(&(0..N_KV as u32).collect::<Vec<_>>());
     let kt = Tensor::new(hk, N_KV as u32, WIDTH, Dtype::Bf16);
     let vt = Tensor::new(hv, N_KV as u32, WIDTH, Dtype::Bf16);
@@ -335,7 +338,10 @@ fn run_case(
     // fresh bf16 pool. Decoding over this pool is what a correct packed read must
     // reproduce (up to bf16 storage rounding of the dequantized values).
     let keys_raw = rig.handles.read(keys_h, kbytes).expect("read packed keys");
-    let values_raw = rig.handles.read(values_h, kbytes).expect("read packed values");
+    let values_raw = rig
+        .handles
+        .read(values_h, kbytes)
+        .expect("read packed values");
     let mut k_deq = vec![0.0f32; N_KV * KV_HEADS * HEAD_DIM];
     let mut v_deq = vec![0.0f32; N_KV * KV_HEADS * HEAD_DIM];
     for i in 0..N_KV {
@@ -477,5 +483,7 @@ fn the_packed_kv_decode_reads() {
         "[bf16-exact] isolate max {e_iso_max:.3e} mean {e_iso_mean:.3e}, lossless-quant \
          max {e_q_max:.3e} — dequant is exact on-grid"
     );
-    eprintln!("=== C2c-1 done: the packed 4-bit KV decode read dequantizes + attends correctly ===");
+    eprintln!(
+        "=== C2c-1 done: the packed 4-bit KV decode read dequantizes + attends correctly ==="
+    );
 }
