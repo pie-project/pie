@@ -1188,6 +1188,32 @@ impl Shell {
         self.weights.residue()
     }
 
+    /// The kv pool's bytes with memory behind them now, and the most that
+    /// ever had at once. Both equal the pool for a fixed pool.
+    #[must_use]
+    pub fn pool_residency(&self) -> (u64, u64) {
+        (self.pools.committed_bytes(), self.pools.high_water_bytes())
+    }
+
+    /// The elastic pool's reporting unit and its budget in that unit; both
+    /// zero for a fixed pool.
+    #[must_use]
+    pub fn pool_elastic(&self) -> (u64, u64) {
+        (
+            self.pools.elastic_page_bytes(),
+            self.pools.elastic_budget_pages(),
+        )
+    }
+
+    /// Lower the kv pool's watermark to `hint` and hand back the memory
+    /// above it. Drains every frame first, because an unmapped page under
+    /// a running kernel is a fault; a fixed pool only lowers the watermark.
+    pub fn release_kv(&mut self, hint: Demand) -> Result<()> {
+        self.drain()?;
+        Supply::trim(&mut self.pools, hint);
+        self.pools.release()
+    }
+
     #[must_use]
     pub fn footprint(&self) -> (u64, u64, u64, u64) {
         (

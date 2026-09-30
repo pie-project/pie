@@ -34,6 +34,10 @@ pub struct Buffer {
     slab: Slab,
     bytes: u64,
     keep: Option<std::sync::Arc<crate::mapping::Mapping>>,
+    /// `false` for a placement sparse buffer: it is a page table over
+    /// heaps, and `contents()` names nothing. Host access to those bytes
+    /// goes through the heaps (`device::elastic::Elastic`), not this view.
+    host: bool,
 }
 
 impl std::fmt::Debug for Buffer {
@@ -41,6 +45,7 @@ impl std::fmt::Debug for Buffer {
         f.debug_struct("Buffer")
             .field("bytes", &self.bytes)
             .field("mapped", &self.keep.is_some())
+            .field("host", &self.host)
             .finish()
     }
 }
@@ -69,6 +74,7 @@ impl DeferredZeroBuffer {
                     slab,
                     bytes,
                     keep: None,
+                    host: true,
                 },
                 initialized: std::cell::Cell::new(false),
             })
@@ -105,6 +111,7 @@ impl Buffer {
                     slab: device.empty(),
                     bytes: 0,
                     keep: None,
+                    host: true,
                 });
             }
             let slab = device.reserve(bytes)?;
@@ -112,6 +119,7 @@ impl Buffer {
                 slab,
                 bytes,
                 keep: None,
+                host: true,
             };
             buffer.zero_span(0, bytes)?;
             Ok(buffer)
@@ -205,6 +213,7 @@ impl Buffer {
                 slab,
                 bytes: cut.bytes(),
                 keep: Some(map),
+                host: true,
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -214,9 +223,29 @@ impl Buffer {
         }
     }
 
+    /// A binding view over a placement sparse buffer of `bytes` (its
+    /// un-rounded length). Encoders bind and blit it like any other buffer;
+    /// `read`, `write` and `zero_span` refuse it, because the sparse buffer
+    /// has no host contents of its own.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn sparse_view(slab: Slab, bytes: u64) -> Buffer {
+        Buffer {
+            slab,
+            bytes,
+            keep: None,
+            host: false,
+        }
+    }
+
     #[must_use]
     pub fn is_mapped(&self) -> bool {
         self.keep.is_some()
+    }
+
+    /// Whether `contents()` names these bytes on the host.
+    #[must_use]
+    pub fn is_host(&self) -> bool {
+        self.host
     }
 
     #[must_use]
@@ -247,6 +276,7 @@ impl Buffer {
     }
 
     fn writable(&self, step: &'static str) -> Result<()> {
+        self.hosted(step)?;
         match &self.keep {
             None => Ok(()),
             Some(map) => Err(Fault::Mapped {
@@ -255,6 +285,18 @@ impl Buffer {
                 why: "a reservation served from an artifact's own mapped pages is read-only".into(),
             }),
         }
+    }
+
+    fn hosted(&self, step: &'static str) -> Result<()> {
+        if self.host {
+            return Ok(());
+        }
+        Err(Fault::Device {
+            call: step,
+            why: "a placement sparse buffer has no host contents; its bytes live in the \
+                  heaps mapped under it"
+                .to_string(),
+        })
     }
 
     pub fn write_from_file(
@@ -403,6 +445,7 @@ impl Buffer {
     }
 
     pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
+        self.hosted("read")?;
         self.span(offset, into.len() as u64)?;
         #[cfg(target_vendor = "apple")]
         {

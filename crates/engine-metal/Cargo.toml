@@ -57,6 +57,15 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLIndirectCommandEncoder",
     "MTLAllocation",
     "MTLPipeline",
+    # The elastic kv pool: placement heaps, the residency set that keeps
+    # them resident on the legacy queue, the MTL4 queue that maps and unmaps
+    # sparse buffer tiles, the shared event that orders those against the
+    # host, and the encoder module that declares the mapping operation.
+    "MTLHeap",
+    "MTLResidencySet",
+    "MTLEvent",
+    "MTL4CommandQueue",
+    "MTLResourceStateCommandEncoder",
 ] }
 
 [dev-dependencies]
