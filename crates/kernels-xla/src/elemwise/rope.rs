@@ -201,7 +201,10 @@ pub(crate) fn int_positions(op: &'static str, positions: Tensor) -> Result<(), E
     if positions.dtype != Dtype::I32 {
         return Err(refuse(
             op,
-            format!("the position stream is {:?}, and this rotation reads i32", positions.dtype),
+            format!(
+                "the position stream is {:?}, and this rotation reads i32",
+                positions.dtype
+            ),
         ));
     }
     Ok(())
@@ -221,7 +224,9 @@ fn rotary_within(op: &'static str, rotary: u32, head_dim: u32) -> Result<(), Err
     if rotary == 0 || !rotary.is_multiple_of(2) || rotary > head_dim {
         return Err(refuse(
             op,
-            format!("the rotated width {rotary} is not a whole number of pairs within the {head_dim}-wide head"),
+            format!(
+                "the rotated width {rotary} is not a whole number of pairs within the {head_dim}-wide head"
+            ),
         ));
     }
     Ok(())
@@ -250,7 +255,10 @@ pub(crate) fn rotate_all(
         if !x.width.is_multiple_of(t.unit as u32) {
             return Err(refuse(
                 op,
-                format!("the {}-wide row is not a whole number of {}-wide heads", x.width, t.unit),
+                format!(
+                    "the {}-wide row is not a whole number of {}-wide heads",
+                    x.width, t.unit
+                ),
             ));
         }
     }
@@ -272,7 +280,11 @@ fn neox(head_dim: u32, rotary: u32, theta: f32, span: u32, interleaved: bool) ->
     let mut t = Turn::new(head_dim as usize, 1);
     let half = (rotary / 2) as usize;
     for i in 0..half {
-        let (lo, hi) = if interleaved { (2 * i, 2 * i + 1) } else { (i, i + half) };
+        let (lo, hi) = if interleaved {
+            (2 * i, 2 * i + 1)
+        } else {
+            (i, i + half)
+        };
         t.pair(lo, hi, 0, inv_freq(theta, i, span));
     }
     t
@@ -363,7 +375,11 @@ fn ramp_bounds(
 
 /// kernels-cuda `yarn_original_freq`.
 fn yarn_freq(base: f32, factor: f32, low: f32, high: f32, i: usize) -> f32 {
-    let denom = if high == low { high + 1e-3 - low } else { high - low };
+    let denom = if high == low {
+        high + 1e-3 - low
+    } else {
+        high - low
+    };
     let ramp = ((i as f32 - low) / denom).clamp(0.0, 1.0);
     base * ((1.0 - ramp) + ramp / factor)
 }
@@ -392,8 +408,13 @@ pub fn partial_last(
             if y.original_max_position == 0 {
                 return Err(refuse(OP, "the YaRN ramp states a zero position span"));
             }
-            let (low, high) =
-                ramp_bounds(rotary_dim, theta, y.beta_fast, y.beta_slow, y.original_max_position);
+            let (low, high) = ramp_bounds(
+                rotary_dim,
+                theta,
+                y.beta_fast,
+                y.beta_slow,
+                y.original_max_position,
+            );
             Some((y.factor, low, high))
         }
         None => None,
@@ -450,7 +471,11 @@ pub fn yarn(
     let mut t = Turn::new(head_dim as usize, 1);
     for i in 0..half {
         let f = yarn_freq(inv_freq(theta, i, head_dim), factor, low, high, i);
-        let (lo, hi) = if interleaved { (2 * i, 2 * i + 1) } else { (i, i + half) };
+        let (lo, hi) = if interleaved {
+            (2 * i, 2 * i + 1)
+        } else {
+            (i, i + half)
+        };
         t.pair(lo, hi, 0, f);
     }
     let t = t.scaled(attention_factor);

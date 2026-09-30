@@ -52,7 +52,9 @@ pub fn client() -> Option<&'static Mutex<Client>> {
 /// and then opens a `Device` with `PIE_XLA_LOCK=1` takes it again instead of
 /// waiting on itself (`flock` on a second open file would).
 pub fn lock_device() -> DeviceLock {
-    let mut held = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut held = HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if held.0 == 0 {
         let path = std::env::temp_dir().join("pie-xla-device.lock");
         let file = std::fs::OpenOptions::new()
@@ -79,7 +81,9 @@ pub struct DeviceLock(());
 
 impl Drop for DeviceLock {
     fn drop(&mut self) {
-        let mut held = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held = HELD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         held.0 -= 1;
         if held.0 == 0 {
             held.1 = None;
@@ -146,7 +150,10 @@ impl Bench {
     }
 
     pub fn bf16(&mut self, rows: u32, width: u32, xs: &[f32]) -> Tensor {
-        let bytes = xs.iter().flat_map(|&x| bf16_bits(x).to_le_bytes()).collect();
+        let bytes = xs
+            .iter()
+            .flat_map(|&x| bf16_bits(x).to_le_bytes())
+            .collect();
         self.raw(Dtype::Bf16, rows, width, bytes)
     }
 
@@ -192,13 +199,17 @@ impl Bench {
         match a.dtype {
             Dtype::F32 => a
                 .bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect(),
             Dtype::Bf16 => a
                 .bytes
-                .chunks_exact(2)
-                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
                 .collect(),
             Dtype::I32 => self.read_i32(t).into_iter().map(|x| x as f32).collect(),
             other => panic!("read_f32 of {other:?}"),
@@ -210,8 +221,10 @@ impl Bench {
         let a = &self.arrays[t.buf as usize];
         assert_eq!(a.dtype, Dtype::I32);
         a.bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect()
     }
 
@@ -287,7 +300,12 @@ impl Bench {
             let a = &self.arrays[b as usize];
             uploads.push(Some(
                 client
-                    .upload(dev, &a.bytes, element_type(a.dtype), &[i64::from(a.rows), i64::from(a.width)])
+                    .upload(
+                        dev,
+                        &a.bytes,
+                        element_type(a.dtype),
+                        &[i64::from(a.rows), i64::from(a.width)],
+                    )
                     .map_err(|e| e.to_string())?,
             ));
         }
@@ -329,7 +347,9 @@ impl Bench {
         if let Some(e) = last {
             e.wait().map_err(|e| e.to_string())?;
         }
-        Ok(Some(started.elapsed().as_secs_f64() / f64::from(iters.max(1))))
+        Ok(Some(
+            started.elapsed().as_secs_f64() / f64::from(iters.max(1)),
+        ))
     }
 
     /// Emits `body` as one module, runs it, and lands every handle it wrote.
@@ -413,7 +433,10 @@ impl Env for Roots {
 
     fn write(&mut self, f: &mut Func, t: Tensor, v: Val) -> Result<(), kernels_xla::Error> {
         let (dtype, rows, width) = self.shapes[t.buf as usize];
-        let want = Ty::new(elem_of("bench.write", dtype)?, &[i64::from(rows), i64::from(width)]);
+        let want = Ty::new(
+            elem_of("bench.write", dtype)?,
+            &[i64::from(rows), i64::from(width)],
+        );
         if f.ty(v) != &want {
             return Err(kernels_xla::Error::Backend {
                 op: "bench.write",
@@ -457,7 +480,7 @@ pub fn assert_close(got: &[f32], want: &[f32], atol: f32, rtol: f32) {
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
         let err = (g - w).abs();
         let bound = atol + rtol * w.abs();
-        if !(err <= bound) {
+        if err.is_nan() || err > bound {
             panic!(
                 "element {i}: got {g}, want {w} (err {err} > {bound}); first 8 got {:?} want {:?}",
                 &got[..got.len().min(8)],

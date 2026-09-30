@@ -8,7 +8,9 @@ use kernels_xla::elemwise::{act, clip, gate};
 fn data(n: usize, seed: u32) -> Vec<f32> {
     (0..n)
         .map(|i| {
-            let h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(40503));
+            let h = (i as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(seed.wrapping_mul(40503));
             round_bf16(((h >> 8) % 2000) as f32 / 1000.0 - 1.0)
         })
         .collect()
@@ -33,7 +35,10 @@ fn erf(x: f32) -> f32 {
 #[test]
 fn activations_and_binaries_answer_the_host() {
     let (rows, width) = (5u32, 72u32);
-    let xs: Vec<f32> = data((rows * width) as usize, 1).iter().map(|v| round_bf16(v * 4.0)).collect();
+    let xs: Vec<f32> = data((rows * width) as usize, 1)
+        .iter()
+        .map(|v| round_bf16(v * 4.0))
+        .collect();
     let ys = data((rows * width) as usize, 2);
     let mut b = Bench::new();
     let x = b.bf16(rows, width, &xs);
@@ -65,7 +70,11 @@ fn activations_and_binaries_answer_the_host() {
         Box::new(|v, w| v * w),
     ];
     for (o, f) in outs.iter().zip(&fs) {
-        let want: Vec<f32> = xs.iter().zip(&ys).map(|(&v, &w)| round_bf16(f(v, w))).collect();
+        let want: Vec<f32> = xs
+            .iter()
+            .zip(&ys)
+            .map(|(&v, &w)| round_bf16(f(v, w)))
+            .collect();
         assert_close(&b.read_f32(*o), &want, 1e-2, 1e-2);
     }
     let want: Vec<f32> = xs.iter().map(|&v| v * sigmoid(v)).collect();
@@ -128,7 +137,10 @@ fn modulation_forms_lane_maps_and_fused_norms_answer_the_host() {
             act::norm_modulate(
                 ctx,
                 x,
-                act::NormKind::Rmsnorm { head_dim: 32, eps: 1e-6 },
+                act::NormKind::Rmsnorm {
+                    head_dim: 32,
+                    eps: 1e-6,
+                },
                 normed,
                 mf,
                 Some(lane),
@@ -303,7 +315,11 @@ fn embed_scale_add_and_its_select_form_answer_the_host() {
     let mut wyo = we.clone();
     let mut wys2 = we.clone();
     for n in 0..rows {
-        let id = if ids[n] >= 0 && (ids[n] as u32) < vocab { ids[n] as usize } else { 0 };
+        let id = if ids[n] >= 0 && (ids[n] as u32) < vocab {
+            ids[n] as usize
+        } else {
+            0
+        };
         for k in 0..hidden {
             let at = n * hidden + k;
             let ev = table[id * hidden + k];
@@ -333,9 +349,18 @@ fn gates_and_clamps_answer_the_host() {
     let (rows, heads, hd) = (5usize, 3usize, 24usize);
     let width = heads * hd;
     let (r, w) = (rows as u32, width as u32);
-    let xs: Vec<f32> = data(rows * width, 11).iter().map(|v| round_bf16(v * 3.0)).collect();
-    let gs: Vec<f32> = data(rows * width, 12).iter().map(|v| round_bf16(v * 5.0)).collect();
-    let gh: Vec<f32> = data((rows + 2) * heads, 13).iter().map(|v| round_bf16(v * 5.0)).collect();
+    let xs: Vec<f32> = data(rows * width, 11)
+        .iter()
+        .map(|v| round_bf16(v * 3.0))
+        .collect();
+    let gs: Vec<f32> = data(rows * width, 12)
+        .iter()
+        .map(|v| round_bf16(v * 5.0))
+        .collect();
+    let gh: Vec<f32> = data((rows + 2) * heads, 13)
+        .iter()
+        .map(|v| round_bf16(v * 5.0))
+        .collect();
     let mut b = Bench::new();
     let x1 = b.bf16(r, w, &xs);
     let g = b.bf16(r, w, &gs);
@@ -356,7 +381,11 @@ fn gates_and_clamps_answer_the_host() {
     {
         return;
     }
-    let w1: Vec<f32> = xs.iter().zip(&gs).map(|(v, g)| round_bf16(v * sigmoid(*g))).collect();
+    let w1: Vec<f32> = xs
+        .iter()
+        .zip(&gs)
+        .map(|(v, g)| round_bf16(v * sigmoid(*g)))
+        .collect();
     let w2: Vec<f32> = xs
         .iter()
         .enumerate()
@@ -366,8 +395,8 @@ fn gates_and_clamps_answer_the_host() {
         })
         .collect();
     let (l, h) = (round_bf16(-1.3), round_bf16(0.7001));
-    let w3: Vec<f32> = xs.iter().map(|v| v.max(l).min(h)).collect();
-    let w4: Vec<f32> = xs.iter().map(|v| v.max(-0.5).min(1.25)).collect();
+    let w3: Vec<f32> = xs.iter().map(|v| v.clamp(l, h)).collect();
+    let w4: Vec<f32> = xs.iter().map(|v| v.clamp(-0.5, 1.25)).collect();
     assert_close(&b.read_f32(x1), &w1, 1e-2, 1e-2);
     assert_close(&b.read_f32(x2), &w2, 1e-2, 1e-2);
     assert_close(&b.read_f32(x3), &w3, 0.0, 0.0);

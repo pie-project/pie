@@ -1,8 +1,8 @@
 //! Binding a traced program to buffers and running it.
 
 use crate::device::Device;
-use crate::inputs::Inputs;
 use crate::error::{Fault, Result};
+use crate::inputs::Inputs;
 use crate::pjrt::{Arg, Buffer};
 use crate::store::Pools;
 use crate::trace::{Signature, Source, Tracer};
@@ -38,7 +38,11 @@ pub fn run(
 }
 
 /// Compiles `tracer`'s program (or finds it) without running it.
-pub fn compile(device: &Device, tracer: Tracer<'_>, extra: &[kernels_xla::hlo::Val]) -> Result<std::sync::Arc<crate::device::Program>> {
+pub fn compile(
+    device: &Device,
+    tracer: Tracer<'_>,
+    extra: &[kernels_xla::hlo::Val],
+) -> Result<std::sync::Arc<crate::device::Program>> {
     let (text, sig) = tracer.finish(extra);
     device.program(&text, sig)
 }
@@ -103,10 +107,7 @@ fn bind_and_run(
         let buffer = match *source {
             Source::Weight { param, .. } => weights.and_then(|w| w.buffer(param)),
             Source::Pool { row, plane } => pools.get(row, plane),
-            Source::Input { input } => uploaded
-                .iter()
-                .find(|(i, _)| *i == input)
-                .map(|(_, b)| b),
+            Source::Input { input } => uploaded.iter().find(|(i, _)| *i == input).map(|(_, b)| b),
             Source::Pack => pack.as_ref(),
             Source::Temp | Source::Packed { .. } => None,
         }

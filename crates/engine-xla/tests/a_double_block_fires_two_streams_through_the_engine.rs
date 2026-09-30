@@ -28,7 +28,13 @@ fn request(rng: &mut Lcg, text_rows: usize, image_rows: usize) -> HostRequest {
     }
 }
 
-fn publish(rig: &mut Rig, handles: &common_dit::LaneHandles, latent: &[f32], t: f32, pos: &[[f32; 2]]) {
+fn publish(
+    rig: &mut Rig,
+    handles: &common_dit::LaneHandles,
+    latent: &[f32],
+    t: f32,
+    pos: &[[f32; 2]],
+) {
     rig.publish(handles.instance, 0, latent);
     rig.publish(handles.instance, 1, &[t]);
     rig.publish(
@@ -45,7 +51,10 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
     };
     let weights = Weights::random(&trace(), 7);
     let mut rig = Rig::load(trace(), &weights, 64, vec![16, 32, 64], None);
-    assert!(rig.profile().has_velocity, "the plan plants a velocity seam");
+    assert!(
+        rig.profile().has_velocity,
+        "the plan plants a velocity seam"
+    );
     assert_eq!(rig.profile().velocity_width, WIDTH);
     assert_eq!(rig.profile().vocab, 0, "a denoiser has no vocabulary");
 
@@ -79,8 +88,20 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
     for (at, req) in requests.iter().enumerate() {
         let text = rig.lane(req.text_rows as u32);
         let image = rig.lane(req.image_rows as u32);
-        publish(&mut rig, &text, &req.text, req.timestep, &req.positions[..req.text_rows]);
-        publish(&mut rig, &image, &req.image, req.timestep, &req.positions[req.text_rows..]);
+        publish(
+            &mut rig,
+            &text,
+            &req.text,
+            req.timestep,
+            &req.positions[..req.text_rows],
+        );
+        publish(
+            &mut rig,
+            &image,
+            &req.image,
+            req.timestep,
+            &req.positions[req.text_rows..],
+        );
         let slot = (2 * at) as u32;
         // Request 0 submits its image lane first: the packing, not the
         // submission order, puts a group's rows together.
@@ -110,14 +131,42 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
 
     // The carrier took the first cells; the second fire reads the second.
     for ((text, image), (first, second)) in handles.iter().zip(requests.iter().zip(&seconds)) {
-        publish(&mut rig, text, &second.text, first.timestep, &first.positions[..first.text_rows]);
-        publish(&mut rig, image, &second.image, first.timestep, &first.positions[first.text_rows..]);
+        publish(
+            &mut rig,
+            text,
+            &second.text,
+            first.timestep,
+            &first.positions[..first.text_rows],
+        );
+        publish(
+            &mut rig,
+            image,
+            &second.image,
+            first.timestep,
+            &first.positions[first.text_rows..],
+        );
     }
     let readouts = rig.fire(lanes.clone(), attachments.clone(), Vec::new());
-    assert_close(&readouts[0].values, &want_second[0].1, "second fire, request 0 image");
-    assert_close(&readouts[1].values, &want_second[0].0, "second fire, request 0 text");
-    assert_close(&readouts[2].values, &want_second[1].0, "second fire, request 1 text");
-    assert_close(&readouts[3].values, &want_second[1].1, "second fire, request 1 image");
+    assert_close(
+        &readouts[0].values,
+        &want_second[0].1,
+        "second fire, request 0 image",
+    );
+    assert_close(
+        &readouts[1].values,
+        &want_second[0].0,
+        "second fire, request 0 text",
+    );
+    assert_close(
+        &readouts[2].values,
+        &want_second[1].0,
+        "second fire, request 1 text",
+    );
+    assert_close(
+        &readouts[3].values,
+        &want_second[1].1,
+        "second fire, request 1 image",
+    );
 
     // Attention classes: text rows class 0, image rows class 1, and a table
     // that keeps each class to itself, so each stream attends only within
@@ -142,8 +191,20 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         })
         .collect();
     for ((text, image), (first, next)) in handles.iter().zip(requests.iter().zip(&apart)) {
-        publish(&mut rig, text, &next.text, first.timestep, &first.positions[..first.text_rows]);
-        publish(&mut rig, image, &next.image, first.timestep, &first.positions[first.text_rows..]);
+        publish(
+            &mut rig,
+            text,
+            &next.text,
+            first.timestep,
+            &first.positions[..first.text_rows],
+        );
+        publish(
+            &mut rig,
+            image,
+            &next.image,
+            first.timestep,
+            &first.positions[first.text_rows..],
+        );
     }
     let mut classed = lanes;
     for lane in &mut classed {
@@ -155,8 +216,24 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         });
     }
     let readouts = rig.fire(classed, attachments, Vec::new());
-    assert_close(&readouts[0].values, &want_apart[0].1, "classed, request 0 image");
-    assert_close(&readouts[1].values, &want_apart[0].0, "classed, request 0 text");
-    assert_close(&readouts[2].values, &want_apart[1].0, "classed, request 1 text");
-    assert_close(&readouts[3].values, &want_apart[1].1, "classed, request 1 image");
+    assert_close(
+        &readouts[0].values,
+        &want_apart[0].1,
+        "classed, request 0 image",
+    );
+    assert_close(
+        &readouts[1].values,
+        &want_apart[0].0,
+        "classed, request 0 text",
+    );
+    assert_close(
+        &readouts[2].values,
+        &want_apart[1].0,
+        "classed, request 1 text",
+    );
+    assert_close(
+        &readouts[3].values,
+        &want_apart[1].1,
+        "classed, request 1 image",
+    );
 }

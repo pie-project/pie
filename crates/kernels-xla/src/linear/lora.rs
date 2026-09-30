@@ -35,7 +35,10 @@ pub fn correct(
     expect(OP, routes, &[Dtype::I32])?;
     let (rows, in_width, out_width) = (x.rows, x.width, y.width);
     if in_width == 0 || out_width == 0 {
-        return Err(refuse(OP, "the correction's input and output widths are nonzero"));
+        return Err(refuse(
+            OP,
+            "the correction's input and output widths are nonzero",
+        ));
     }
     if y.rows != rows || routes.elements() != u64::from(rows) {
         return Err(refuse(

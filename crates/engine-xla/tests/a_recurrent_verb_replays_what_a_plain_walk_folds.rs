@@ -115,5 +115,8 @@ fn a_replayed_buffer_folds_to_the_plain_walk() {
         argmax(&got)
     );
     assert_eq!(argmax(&last), argmax(&got));
-    assert!(worst < 0.5, "the replayed fold drifts {worst} from the plain walk");
+    assert!(
+        worst < 0.5,
+        "the replayed fold drifts {worst} from the plain walk"
+    );
 }

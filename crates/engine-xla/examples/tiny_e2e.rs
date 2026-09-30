@@ -113,7 +113,10 @@ fn run(
     for p in &probes {
         match (&p.outcome, p.finite) {
             (Err(why), _) => {
-                return Err(format!("class {} rows {}: {why} ({})", p.class, p.rows, p.request));
+                return Err(format!(
+                    "class {} rows {}: {why} ({})",
+                    p.class, p.rows, p.request
+                ));
             }
             (Ok(_), Some((false, n))) => {
                 return Err(format!(
@@ -195,7 +198,11 @@ fn agree(shell: &mut Shell, sku: &models::Sku) -> Result<String, String> {
     if probing {
         for id in &prompt[..prompt.len() - 1] {
             shell
-                .fire(&[Lane { slot: 1, word: word(1), tokens: &[*id] }])
+                .fire(&[Lane {
+                    slot: 1,
+                    word: word(1),
+                    tokens: &[*id],
+                }])
                 .map_err(fault("a decode"))?;
         }
         let seated = [engine_xla::serve::Seated::of(Lane {
@@ -223,7 +230,11 @@ fn agree(shell: &mut Shell, sku: &models::Sku) -> Result<String, String> {
             };
             let op = model_ir::Operands::name(&shell.trace().nodes[node].op);
             if c < 0.999 && shown < 12 {
-                eprintln!("  probe: value {} (node {node} `{op}`, layer {:?}): corr {c:.6}", value.0, shell.trace().nodes[node].layer);
+                eprintln!(
+                    "  probe: value {} (node {node} `{op}`, layer {:?}): corr {c:.6}",
+                    value.0,
+                    shell.trace().nodes[node].layer
+                );
                 shown += 1;
             }
         }
@@ -240,7 +251,11 @@ fn agree(shell: &mut Shell, sku: &models::Sku) -> Result<String, String> {
             .remove(0);
     }
     if first.is_empty() || first.len() != last.len() {
-        return Err(format!("readouts of {} and {} values", first.len(), last.len()));
+        return Err(format!(
+            "readouts of {} and {} values",
+            first.len(),
+            last.len()
+        ));
     }
     if !first.iter().chain(&last).all(|v| v.is_finite()) {
         return Err("non-finite logits".to_string());
@@ -265,7 +280,9 @@ fn agree(shell: &mut Shell, sku: &models::Sku) -> Result<String, String> {
 fn argmax(v: &[f32]) -> usize {
     v.iter()
         .enumerate()
-        .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) })
+        .fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+            if x > bv { (i, x) } else { (bi, bv) }
+        })
         .0
 }
 
@@ -320,7 +337,11 @@ fn write_random(trace: &model_dsl::Trace, path: &Path) -> u64 {
         let shape: Vec<u64> = w.shape.clone();
         let n: u64 = shape.iter().product();
         let fan = shape.last().copied().unwrap_or(1).max(1) as f32;
-        let scale = if shape.len() <= 1 { 0.1 } else { 1.0 / fan.sqrt() };
+        let scale = if shape.len() <= 1 {
+            0.1
+        } else {
+            1.0 / fan.sqrt()
+        };
         let mut next = || {
             state ^= state << 13;
             state ^= state >> 7;
@@ -335,7 +356,11 @@ fn write_random(trace: &model_dsl::Trace, path: &Path) -> u64 {
                 .unwrap_or_else(|why| panic!("`{}`'s type parses: {why}", param.name));
             let planes = term.planes(&shape).expect("the type lays out its planes");
             if std::env::var_os("PIE_E2E_WRITE_ONLY").is_some() {
-                eprintln!("  {} {spelled}: {:?}", param.name, planes.iter().map(|p| (&p.path, p.leaf)).collect::<Vec<_>>());
+                eprintln!(
+                    "  {} {spelled}: {:?}",
+                    param.name,
+                    planes.iter().map(|p| (&p.path, p.leaf)).collect::<Vec<_>>()
+                );
             }
             let mut bufs: Vec<Vec<u8>> = Vec::new();
             for plane in &planes {
@@ -343,22 +368,36 @@ fn write_random(trace: &model_dsl::Trace, path: &Path) -> u64 {
                 let elems = plane.elements() as usize;
                 let gain = plane.path == "gain";
                 let buf: Vec<u8> = match plane.leaf {
-                    _ if plane.path == "code" => (0..len).map(|_| (next().to_bits() >> 3) as u8).collect(),
+                    _ if plane.path == "code" => {
+                        (0..len).map(|_| (next().to_bits() >> 3) as u8).collect()
+                    }
                     ztensor::Leaf::BF16 => (0..elems)
                         .flat_map(|_| {
-                            let v = if gain { next().abs() * 0.05 + 0.01 } else { next() * 0.05 };
+                            let v = if gain {
+                                next().abs() * 0.05 + 0.01
+                            } else {
+                                next() * 0.05
+                            };
                             ((v.to_bits() >> 16) as u16).to_le_bytes()
                         })
                         .collect(),
                     ztensor::Leaf::F16 => (0..elems)
                         .flat_map(|_| {
-                            let v = if gain { next().abs() * 0.05 + 0.01 } else { next() * 0.05 };
+                            let v = if gain {
+                                next().abs() * 0.05 + 0.01
+                            } else {
+                                next() * 0.05
+                            };
                             kernels_xla::hlo::f16_bits(v).to_le_bytes()
                         })
                         .collect(),
                     ztensor::Leaf::F32 => (0..elems)
                         .flat_map(|_| {
-                            let v = if gain { next().abs() * 0.05 + 0.01 } else { next() * 0.05 };
+                            let v = if gain {
+                                next().abs() * 0.05 + 0.01
+                            } else {
+                                next() * 0.05
+                            };
                             v.to_le_bytes()
                         })
                         .collect(),
@@ -371,7 +410,9 @@ fn write_random(trace: &model_dsl::Trace, path: &Path) -> u64 {
             total += bufs.iter().map(|b| b.len() as u64).sum::<u64>();
             let slices: Vec<&[u8]> = bufs.iter().map(Vec::as_slice).collect();
             writer
-                .object(param.name.clone(), |o| o.shape(shape.clone()).term(term.clone()).planes(slices))
+                .object(param.name.clone(), |o| {
+                    o.shape(shape.clone()).term(term.clone()).planes(slices)
+                })
                 .unwrap_or_else(|why| panic!("`{}` writes: {why}", param.name));
             continue;
         }
@@ -396,7 +437,10 @@ fn write_random(trace: &model_dsl::Trace, path: &Path) -> u64 {
             Dtype::I32 => (ztensor::Leaf::I32, vec![0u8; n as usize * 4]),
             Dtype::I64 => (ztensor::Leaf::I64, vec![0u8; n as usize * 8]),
             Dtype::U8 | Dtype::Bool => (ztensor::Leaf::U8, vec![0u8; n as usize]),
-            other => panic!("`{}` is {other:?}, which this writer does not draw", param.name),
+            other => panic!(
+                "`{}` is {other:?}, which this writer does not draw",
+                param.name
+            ),
         };
         total += bytes.len() as u64;
         writer

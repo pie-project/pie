@@ -100,7 +100,10 @@ pub fn layernorm_rope(
     rotated(OP, rope_dim, hd)?;
     let rows = nonzero(OP, "rows", k.rows)?;
     if weight.elements() != u64::from(hd) || bias.elements() != u64::from(hd) {
-        return Err(refuse(OP, "the norm's weight and bias are not one value per lane"));
+        return Err(refuse(
+            OP,
+            "the norm's weight and bias are not one value per lane",
+        ));
     }
     if positions.elements() < u64::from(rows) {
         return Err(refuse(OP, "the position table is shorter than the fire"));
@@ -230,12 +233,18 @@ pub fn block_mean(
     }
     let hd = nonzero(OP, "the key width this mean states", head_dim)?;
     if entries.width != hd || keys.keys.width < hd {
-        return Err(refuse(OP, "the stated head width is not the entry's (or the pool's) width"));
+        return Err(refuse(
+            OP,
+            "the stated head width is not the entry's (or the pool's) width",
+        ));
     }
     let ratio = i64::from(nonzero(OP, "the block width this mean pools over", ratio)?);
     let rows = nonzero(OP, "rows", boundary_pos.rows)?;
     if boundary_req.elements() < u64::from(rows) || entries.rows != rows {
-        return Err(refuse(OP, "the boundary tables and entries are one row per token row"));
+        return Err(refuse(
+            OP,
+            "the boundary tables and entries are one row per token row",
+        ));
     }
     let (n, hd) = (i64::from(rows), i64::from(hd));
     ctx.emit(&mut |cx| {
@@ -307,7 +316,10 @@ pub fn topk(
         return Err(refuse(OP, "the index query is not heads x key width"));
     }
     if weights.is_some_and(|w| w.width != h) {
-        return Err(refuse(OP, "the index head weights are not one per stated head"));
+        return Err(refuse(
+            OP,
+            "the index head weights are not one per stated head",
+        ));
     }
     if selection.width != k {
         return Err(refuse(OP, "the selection is not the budget it states"));
@@ -317,7 +329,10 @@ pub fn topk(
         || positions.elements() < u64::from(rows)
         || request_of_token.elements() < u64::from(rows)
     {
-        return Err(refuse(OP, "q and the fire tables are shorter than the selection"));
+        return Err(refuse(
+            OP,
+            "q and the fire tables are shorter than the selection",
+        ));
     }
     let nk = i64::from(keys.max_pages) * i64::from(keys.page_size) / stride;
     if nk == 0 {
@@ -389,7 +404,8 @@ fn index_scores(
         &[q, w, table, indices, indptr, req],
         |f, b, cr, inv| {
             let scores = cr[0];
-            let (q, w, table, indices, indptr, req) = (inv[0], inv[1], inv[2], inv[3], inv[4], inv[5]);
+            let (q, w, table, indices, indptr, req) =
+                (inv[0], inv[1], inv[2], inv[3], inv[4], inv[5]);
             let kbv = ci(f, kb);
             let start = f.mul(b, kbv)?;
             let j = f.iota(Elem::I32, &[n, kb], 1);

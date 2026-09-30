@@ -79,6 +79,9 @@ fn dump(name: &str, values: &[f32]) {
     std::fs::write(std::path::Path::new(&dir).join(name), bytes).expect("the dump writes");
 }
 
+/// First-step logits, per-step (token, logits) pairs, and the greedy tokens.
+type Captioned = (Vec<f32>, Vec<(u32, Vec<f32>)>, Vec<u32>);
+
 /// One prefill of the square and a greedy decode after it; the first
 /// logits, the probes of a one-fire prefill, and the tokens.
 fn caption(
@@ -86,7 +89,7 @@ fn caption(
     word: &dyn Fn(u32, bool) -> u64,
     span: &models::media::EncodedSpan,
     split: bool,
-) -> (Vec<f32>, Vec<(u32, Vec<f32>)>, Vec<u32>) {
+) -> Captioned {
     let pads = span.token_count as usize;
     let before = BEFORE.len();
     let run_end = before + pads + 2;
@@ -101,7 +104,11 @@ fn caption(
     // at `(start, start + y, start + x)` and advance the cursor by `max(h, w)`.
     let lag = span.token_count - span.position_span;
     let row_position = |row: usize| -> u32 {
-        if row < run_end { row as u32 } else { row as u32 - lag }
+        if row < run_end {
+            row as u32
+        } else {
+            row as u32 - lag
+        }
     };
     let mut triples = Vec::with_capacity(tokens.len() * 3);
     let gw = span.grid.w as i32;
@@ -122,7 +129,9 @@ fn caption(
     let rows = [span.rows];
     let grid: Vec<i32> = span
         .positions
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .flat_map(|yx| [0, yx[0] as i32, yx[1] as i32])
         .collect();
     // A route per merged row: the pad row it lands on, counted in the fire
@@ -155,7 +164,10 @@ fn caption(
                     token_positions: &triples[3 * from..3 * to],
                 });
             }
-            shell.fire_seated(&[seated]).expect("a prefill fires").remove(0)
+            shell
+                .fire_seated(&[seated])
+                .expect("a prefill fires")
+                .remove(0)
         };
         fire(0, before, false);
         fire(before, run_end, true);
@@ -197,7 +209,10 @@ fn caption(
             tokens: &fed,
         });
         seated.positions = &at;
-        let row = shell.fire_seated(&[seated]).expect("a decode fires").remove(0);
+        let row = shell
+            .fire_seated(&[seated])
+            .expect("a decode fires")
+            .remove(0);
         produced.push(argmax(&row));
     }
     (logits, probes, produced)
@@ -233,7 +248,11 @@ fn a_solid_square_is_named_by_its_colour() {
             break;
         }
     }
-    assert_eq!(probes.len(), 2, "the plan embeds patches and scatters the tower's rows");
+    assert_eq!(
+        probes.len(),
+        2,
+        "the plan embeds patches and scatters the tower's rows"
+    );
 
     let vision = models::qwen_3::media::Qwen35Vision::new();
     let tokenizer = common::tokenizer(&m);
@@ -254,14 +273,20 @@ fn a_solid_square_is_named_by_its_colour() {
     .expect("the shell loads");
     shell.probe(probes);
 
-
-    for (name, rgb) in [("red", [255u8, 0, 0]), ("green", [0, 255, 0]), ("blue", [0, 0, 255])] {
+    for (name, rgb) in [
+        ("red", [255u8, 0, 0]),
+        ("green", [0, 255, 0]),
+        ("blue", [0, 0, 255]),
+    ] {
         let side = 224u32;
         let picture = Rgb8::new(side, side, rgb.repeat((side * side) as usize)).expect("rgb");
         let span = vision
             .encode(&picture, models::media::Budget::Still, nearest)
             .expect("the square encodes");
-        assert_eq!(span.token_count, 64, "224 x 224 lifts to a 16 x 16 patch grid");
+        assert_eq!(
+            span.token_count, 64,
+            "224 x 224 lifts to a 16 x 16 patch grid"
+        );
 
         let (whole, probes, whole_tokens) = caption(&mut shell, &word, &span, false);
         for (at, (width, values)) in probes.iter().enumerate() {
@@ -279,7 +304,9 @@ fn a_solid_square_is_named_by_its_colour() {
             .zip(&split)
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        eprintln!("{name}: one fire {whole_tokens:?}, three fires {split_tokens:?}, max |Δlogit| {worst}");
+        eprintln!(
+            "{name}: one fire {whole_tokens:?}, three fires {split_tokens:?}, max |Δlogit| {worst}"
+        );
         // The same rows at the same rotations, cut three ways: the tail must
         // still see the span's keys. Text alone cut in two moves the logits
         // by ~0.2; a tail bounded at its rotation instead of its row moved

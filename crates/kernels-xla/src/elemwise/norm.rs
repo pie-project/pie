@@ -87,7 +87,16 @@ fn rms_row(
 }
 
 pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    rms_row(ctx, "elementwise.rmsnorm", x, weight, y, eps, x.width, false)
+    rms_row(
+        ctx,
+        "elementwise.rmsnorm",
+        x,
+        weight,
+        y,
+        eps,
+        x.width,
+        false,
+    )
 }
 
 pub fn rmsnorm_per_head(
@@ -98,7 +107,16 @@ pub fn rmsnorm_per_head(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    rms_row(ctx, "elementwise.rmsnorm_per_head", x, weight, y, eps, head_dim, false)
+    rms_row(
+        ctx,
+        "elementwise.rmsnorm_per_head",
+        x,
+        weight,
+        y,
+        eps,
+        head_dim,
+        false,
+    )
 }
 
 pub fn rmsnorm_plus_one(
@@ -108,7 +126,16 @@ pub fn rmsnorm_plus_one(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    rms_row(ctx, "elementwise.rmsnorm_plus_one", x, weight, y, eps, x.width, true)
+    rms_row(
+        ctx,
+        "elementwise.rmsnorm_plus_one",
+        x,
+        weight,
+        y,
+        eps,
+        x.width,
+        true,
+    )
 }
 
 pub fn rmsnorm_per_head_plus_one(
@@ -147,7 +174,10 @@ pub fn rmsnorm_grouped_plus_one(
     if bank != x.width {
         return Err(refuse(
             OP,
-            format!("the weight bank is {bank} wide and the row it gains is {}", x.width),
+            format!(
+                "the weight bank is {bank} wide and the row it gains is {}",
+                x.width
+            ),
         ));
     }
     ctx.emit(&mut |cx| {
@@ -191,7 +221,10 @@ fn gated_rms(
 ) -> Result<(), Error> {
     expect(op, gate, &[Dtype::Bf16])?;
     if gate.rows != x.rows || gate.width != x.width || y.rows != x.rows || y.width != x.width {
-        return Err(refuse(op, "the gate and the landing ride the normed rectangle"));
+        return Err(refuse(
+            op,
+            "the gate and the landing ride the normed rectangle",
+        ));
     }
     ctx.emit(&mut |cx| {
         let xv = cx.read_f32(x)?;
@@ -325,7 +358,10 @@ pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> R
         if plane.elements() != u64::from(out.width) {
             return Err(refuse(
                 OP,
-                format!("the {what} plane is not one scalar per column of a {}-wide row", out.width),
+                format!(
+                    "the {what} plane is not one scalar per column of a {}-wide row",
+                    out.width
+                ),
             ));
         }
     }
@@ -415,7 +451,10 @@ pub fn residual_add_rmsnorm(
     const OP: &str = "elementwise.residual_add_rmsnorm";
     expect(OP, y, &[Dtype::Bf16, Dtype::F16])?;
     if x.rows != y.rows || x.width != y.width || out.rows != y.rows || out.width != y.width {
-        return Err(refuse(OP, "the residual, the stream and the normed row share one shape"));
+        return Err(refuse(
+            OP,
+            "the residual, the stream and the normed row share one shape",
+        ));
     }
     if weight.elements() != u64::from(y.width) {
         return Err(refuse(OP, "the weight is one gain per column"));
@@ -462,7 +501,10 @@ pub fn rmsnorm_residual_add(
     expect(OP, y, &[Dtype::Bf16, Dtype::F16])?;
     let same = |p: Tensor| p.rows == y.rows && p.width == y.width;
     if !same(x) || !same(t) {
-        return Err(refuse(OP, "the normed row, its scaled copy and the stream share one shape"));
+        return Err(refuse(
+            OP,
+            "the normed row, its scaled copy and the stream share one shape",
+        ));
     }
     if let Some((_, scaled)) = scale
         && !same(scaled)
@@ -539,16 +581,25 @@ pub fn res_blend(
     if blocks.len() > MAX_BLEND_BLOCKS {
         return Err(refuse(
             OP,
-            format!("{} candidate blocks exceed the bound of {MAX_BLEND_BLOCKS}", blocks.len()),
+            format!(
+                "{} candidate blocks exceed the bound of {MAX_BLEND_BLOCKS}",
+                blocks.len()
+            ),
         ));
     }
     let same = |p: Tensor| p.rows == y.rows && p.width == y.width;
     if !same(prefix) || !blocks.iter().all(|b| same(*b)) {
-        return Err(refuse(OP, "every candidate is a [rows, hidden] plane like the blend"));
+        return Err(refuse(
+            OP,
+            "every candidate is a [rows, hidden] plane like the blend",
+        ));
     }
     for (what, p) in [("norm weight", weight), ("projection", proj)] {
         if p.elements() != u64::from(y.width) {
-            return Err(refuse(OP, format!("the {what} is not one value per column")));
+            return Err(refuse(
+                OP,
+                format!("the {what} is not one value per column"),
+            ));
         }
     }
     let (rows, hidden) = (i64::from(y.rows), i64::from(y.width));

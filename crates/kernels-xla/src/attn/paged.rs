@@ -860,7 +860,7 @@ impl Flashed {
 const BUDGET: i64 = 1 << 24;
 
 /// Query rows per block of the blocked driver.
-const BLOCK_ROWS: i64 = 256;
+const BLOCK_ROWS: i64 = 512;
 
 /// Keys per chunk of the blocked driver.
 const BLOCK_KEYS: i64 = 512;
@@ -897,13 +897,14 @@ pub(crate) fn per_row(
     };
     let width = (h.kvh * (h.d + h.dv)).max(h.qh()).max(1);
     let c = pow2_floor((BUDGET / (r * width)).max(8)).min(round_up(total, 8));
+    // TMP-PF: a floor on the per-row chunk (keys), for an A/B.
+    let c = match std::env::var("PF_DECC").ok().and_then(|v| v.parse::<i64>().ok()) {
+        Some(floor) if matches!(keys, KeyList::Range) => c.max(floor.min(round_up(total, 8))),
+        _ => c,
+    };
     // A windowed row admits at most `window` keys: chunks of about that
     // width (whole pages), walked from the lowest admitted one, read the
     // window and not the whole span.
-    let c = match (keys, std::env::var("PF_CCAP").ok().and_then(|v| v.parse::<i64>().ok())) {
-        (KeyList::Range, Some(cap)) if cap < c && c % cap == 0 => cap,
-        _ => c,
-    };
     let c = match (keys, rule.window, geom.ps) {
         (KeyList::Range, Some(w), ps) if ps > 0 => {
             let cw = round_up((w.max(1) as u64).next_power_of_two() as i64, ps);
@@ -911,6 +912,11 @@ pub(crate) fn per_row(
         }
         _ => c,
     };
+    if let (KeyList::Range, Some(w)) = (keys, rule.window)
+        && let Some(walk) = PageWalk::of(f, planes, Some(lane), c)?
+    {
+        return per_row_window(f, planes, h, rule, rows, lane, &walk, c, w, scale);
+    }
     let n = cdiv(total, c);
     let table = match keys {
         KeyList::Range => None,
@@ -1015,6 +1021,86 @@ pub(crate) fn per_row(
     finish(f, Layout::PerRow, &st)
 }
 
+/// The per-row walk of a sliding window: each row walks its own window,
+/// from the page its window starts in, a fixed number of chunks (the window
+/// and a page, in chunks of `c`), so rows at different positions read their
+/// windows and not the span between the lowest and the highest of them.
+#[allow(clippy::too_many_arguments)]
+fn per_row_window(
+    f: &mut Func,
+    planes: &Planes,
+    h: &Heads,
+    rule: &Rule,
+    rows: &Rows,
+    lane: Val,
+    walk: &PageWalk,
+    c: i64,
+    window: i64,
+    scale: f64,
+) -> Built<Flashed> {
+    let Planes::Paged { geom, .. } = *planes else {
+        return bad("the per-row walk reads a paged pool");
+    };
+    let r = f.dims(rows.q)[0];
+    let span = geom.span;
+    let ps = geom.ps;
+    let np = walk.np;
+    // Each row's first page of its window.
+    let lo = clamp_i(f, rows.lo, 0, span - 1)?;
+    let p0 = with_i(f, lo, ps, Func::div)?;
+    let base = with_i(f, p0, ps, Func::mul)?;
+    let n = cdiv(window + ps, c);
+    // Every row's window pages, `[r, n · np]`, read out of the dense table
+    // by index (the same expression in every layer over this pool, so the
+    // program computes it once).
+    let pages = geom.pages;
+    let j = f.iota(Elem::I32, &[r, n * np], 1);
+    let p0b = f.broadcast(p0, &[r, n * np], &[0])?;
+    let at = f.add(j, p0b)?;
+    let at = clamp_i(f, at, 0, pages - 1)?;
+    let lb = f.broadcast(lane, &[r, n * np], &[0])?;
+    let lb = with_i(f, lb, pages, Func::mul)?;
+    let at = f.add(lb, at)?;
+    let at = f.reshape(at, &[r * n * np])?;
+    let table = take(f, geom.pt, at)?;
+    let table = f.reshape(table, &[r, n * np])?;
+    let mut st = init(f, &[r, h.kvh, h.g], h.dv).to_vec();
+    for ci in 0..n {
+        let start = with_i(f, base, ci * c, Func::add)?;
+        let io = f.iota(Elem::I32, &[r, c], 1);
+        let sb = f.broadcast(start, &[r, c], &[0])?;
+        let kp = f.add(io, sb)?;
+        let kc = clamp_i(f, kp, 0, span - 1)?;
+        let lbc = f.broadcast(lane, &[r, c], &[0])?;
+        let x = with_i(f, lbc, span, Func::mul)?;
+        let x = f.add(x, kc)?;
+        let page = f.slice(table, &[0, ci * np], &[r, (ci + 1) * np], &[1, 1])?;
+        let page = f.reshape(page, &[r * np])?;
+        let (k, v) = match fetch_pages(f, planes, h, page)? {
+            Some(kv) => kv,
+            None => return bad("the per-row window walk reads whole pages"),
+        };
+        let (s, v) = if heads_by_slice(h) {
+            let k = f.reshape(k, &[r, c, h.kvh * h.d])?;
+            let v = f.reshape(v, &[r, c, h.kvh * h.dv])?;
+            (by_head(f, rows.q, k, 2)?, v)
+        } else {
+            let k = f.reshape(k, &[r, c, h.kvh, h.d])?;
+            let v = f.reshape(v, &[r, c, h.kvh, h.dv])?;
+            let s = f.dot_general_at(rows.q, k, &[0, 1], &[0, 2], &[3], &[3], Elem::F32, false)?;
+            (s, v)
+        };
+        let lo = f.broadcast(rows.lo, &[r, c], &[0])?;
+        let hi = f.broadcast(rows.hi, &[r, c], &[0])?;
+        let ge = f.compare(Cmp::Ge, kp, lo)?;
+        let lt = f.compare(Cmp::Lt, kp, hi)?;
+        let range = f.and(ge, lt)?;
+        let lg = logits(f, rule, h, rows, x, kp, None, range)?;
+        st = step(f, Layout::PerRow, h, s, &lg, scale, v, &st)?;
+    }
+    finish(f, Layout::PerRow, &st)
+}
+
 /// Row blocks against the flat key axis `0..keys`, each block walking only
 /// the chunks its rows' `[lo, hi)` span.
 pub(crate) fn blocked(
@@ -1028,8 +1114,7 @@ pub(crate) fn blocked(
 ) -> Built<Flashed> {
     let r = f.dims(rows.q)[0];
     let qh = h.qh().max(1);
-    let block_rows = std::env::var("PF_BR").ok().and_then(|v| v.parse().ok()).unwrap_or(BLOCK_ROWS);
-    let br = block_rows.min(round_up(r, 8));
+    let br = BLOCK_ROWS.min(round_up(r, 8));
     let nb = cdiv(r, br);
     let rp = nb * br;
     let rows_p = if rp > r {
@@ -1039,8 +1124,7 @@ pub(crate) fn blocked(
     };
     let width = (h.kvh * (h.d + h.dv)).max(1);
     let fit = pow2_floor((BUDGET / (br * qh)).min(BUDGET / width).max(8));
-    let block_keys = std::env::var("PF_BK").ok().and_then(|v| v.parse().ok()).unwrap_or(BLOCK_KEYS);
-    let c = block_keys.min(fit).min(round_up(keys.max(1), 8));
+    let c = BLOCK_KEYS.min(fit).min(round_up(keys.max(1), 8));
     // Lanes narrower than a chunk: walk them a span at a time, so no chunk
     // straddles two lanes (the mask is then read as a window, below).
     let c = match rule.kp_span {
@@ -1048,7 +1132,7 @@ pub(crate) fn blocked(
         _ => c,
     };
     let walk = PageWalk::of(f, planes, None, c)?;
-    // The keys and values of the chunk at flat key `base`.
+    // The keys and values of the chunk at flat key `base`, `[c, kvh, d]`.
     let fetch_chunk = |f: &mut Func, base: Val| -> Built<(Val, Val)> {
         let paged = match walk {
             Some(w) => {
@@ -1068,11 +1152,11 @@ pub(crate) fn blocked(
         }
     };
     // One chunk of the online softmax for the rows `rb` (a block of `br`).
-    let attend_chunk = |f: &mut Func, rb: &Rows, base: Val, k: Val, v: Val, st: &[Val]| -> Built<Vec<Val>> {
+    let attend_chunk = |f: &mut Func, rb: &Rows, base: Val, st: &[Val]| -> Built<Vec<Val>> {
+        let (k, v) = fetch_chunk(f, base)?;
         let io = f.iota(Elem::I32, &[c], 0);
         let b = f.splat(base, &[c])?;
         let x = f.add(io, b)?;
-        let s = f.dot_general_at(rb.q, k, &[1], &[1], &[3], &[2], Elem::F32, false)?;
         let xb = f.broadcast(x, &[br, c], &[1])?;
         let lo = f.broadcast(rb.lo, &[br, c], &[0])?;
         let hi = f.broadcast(rb.hi, &[br, c], &[0])?;
@@ -1094,11 +1178,9 @@ pub(crate) fn blocked(
             None => (xb, Some(base)),
         };
         let lg = logits(f, rule, h, rb, xb, kp, kbase, range)?;
+        let s = f.dot_general_at(rb.q, k, &[1], &[1], &[3], &[2], Elem::F32, false)?;
         step(f, Layout::Blocked, h, s, &lg, scale, v, st)
     };
-    if nb > 1 && std::env::var("PF_KM").is_ok_and(|v| v == "1") {
-        return key_major(f, h, &rows_p, r, br, nb, c, &fetch_chunk, &attend_chunk);
-    }
     let block = |f: &mut Func, rb: &Rows| -> Built<Flashed> {
         let has = f.compare(Cmp::Lt, rb.lo, rb.hi)?;
         let big = f.like_i(rb.lo, i64::from(i32::MAX));
@@ -1116,18 +1198,15 @@ pub(crate) fn blocked(
         let row_c0 = with_i(f, lo, c, Func::div)?;
         let row_c1 = with_i(f, hi, c - 1, Func::add)?;
         let row_c1 = with_i(f, row_c1, c, Func::div)?;
-        let stat = [h.kvh, br, h.g];
-        let st0 = init(f, &stat, h.dv);
         let mut carried = vec![c0];
-        carried.extend_from_slice(&st0);
+        carried.extend_from_slice(&init(f, &[h.kvh, br, h.g], h.dv));
         let out = f.while_loop(
             &carried,
             |f, a| f.compare(Cmp::Lt, a[0], c1),
             |f, a| {
                 let ci = a[0];
                 let base = with_i(f, ci, c, Func::mul)?;
-                let (k, v) = fetch_chunk(f, base)?;
-                let mut st = attend_chunk(f, rb, base, k, v, &a[1..])?;
+                let mut st = attend_chunk(f, rb, base, &a[1..])?;
                 let next = with_i(f, ci, 1, Func::add)?;
                 let nb = f.splat(next, &[br])?;
                 let cand = f.max(row_c0, nb)?;
@@ -1165,113 +1244,6 @@ pub(crate) fn blocked(
             l: out[2],
         }
     };
-    if rp == r {
-        return Ok(whole);
-    }
-    Ok(Flashed {
-        o: f.slice_axis(whole.o, 0, 0, r)?,
-        m: f.slice_axis(whole.m, 0, 0, r)?,
-        l: f.slice_axis(whole.l, 0, 0, r)?,
-    })
-}
-
-/// The row-block walk turned inside out: key chunks outermost, each fetched
-/// once and met by every block of rows that admits some of it (a block's
-/// state is sliced out of, and written back into, the whole fire's), where
-/// the row-major walk fetches a chunk again for each block. The same chunks
-/// meet each row in the same order, so the answer is the row-major walk's.
-#[allow(clippy::too_many_arguments)]
-fn key_major(
-    f: &mut Func,
-    h: &Heads,
-    rows: &Rows,
-    r: i64,
-    br: i64,
-    nb: i64,
-    c: i64,
-    fetch_chunk: &dyn Fn(&mut Func, Val) -> Built<(Val, Val)>,
-    attend_chunk: &dyn Fn(&mut Func, &Rows, Val, Val, Val, &[Val]) -> Built<Vec<Val>>,
-) -> Built<Flashed> {
-    let rp = nb * br;
-    let has = f.compare(Cmp::Lt, rows.lo, rows.hi)?;
-    let big = f.like_i(rows.lo, i64::from(i32::MAX));
-    let lo = f.select(has, rows.lo, big)?;
-    let none = f.like_i(rows.hi, 0);
-    let hi = f.select(has, rows.hi, none)?;
-    // Per row, then per block, the chunk range `[lo / c, ⌈hi / c⌉)`.
-    let row_c0 = with_i(f, lo, c, Func::div)?;
-    let row_c1 = with_i(f, hi, c - 1, Func::add)?;
-    let row_c1 = with_i(f, row_c1, c, Func::div)?;
-    let b0 = f.reshape(row_c0, &[nb, br])?;
-    let b0 = f.reduce(b0, &[1], Fold::Min)?;
-    let b1 = f.reshape(row_c1, &[nb, br])?;
-    let b1 = f.reduce(b1, &[1], Fold::Max)?;
-    let c0 = f.reduce(b0, &[0], Fold::Min)?;
-    let c1 = f.reduce(b1, &[0], Fold::Max)?;
-    let biota = f.iota(Elem::I32, &[nb], 0);
-    let nbv = f.like_i(biota, nb);
-    // The first block at or past `from` whose range holds chunk `ci`.
-    let next_block = |f: &mut Func, ci: Val, from: Val| -> Built<Val> {
-        let civ = f.splat(ci, &[nb])?;
-        let a = f.compare(Cmp::Le, b0, civ)?;
-        let b = f.compare(Cmp::Lt, civ, b1)?;
-        let open = f.and(a, b)?;
-        let fromv = f.splat(from, &[nb])?;
-        let past = f.compare(Cmp::Ge, biota, fromv)?;
-        let ok = f.and(open, past)?;
-        let cand = f.select(ok, biota, nbv)?;
-        f.reduce(cand, &[0], Fold::Min)
-    };
-    let stat = [h.kvh, rp, h.g];
-    let st0 = init(f, &stat, h.dv);
-    let mut carried = vec![c0];
-    carried.extend_from_slice(&st0);
-    let out = f.while_loop(
-        &carried,
-        |f, a| f.compare(Cmp::Lt, a[0], c1),
-        |f, a| {
-            let ci = a[0];
-            let base = with_i(f, ci, c, Func::mul)?;
-            let (k, v) = fetch_chunk(f, base)?;
-            let zero = scalar_i(f, 0);
-            let first = next_block(f, ci, zero)?;
-            let mut inner = vec![first];
-            inner.extend_from_slice(&a[1..]);
-            let done = f.while_loop(
-                &inner,
-                |f, b| {
-                    let n = scalar_i(f, nb);
-                    f.compare(Cmp::Lt, b[0], n)
-                },
-                |f, b| {
-                    let bi = b[0];
-                    let start = with_i(f, bi, br, Func::mul)?;
-                    let rb = rows.map(f, &mut |f, v| rows_at(f, v, start, br))?;
-                    let zero = scalar_i(f, 0);
-                    let m = f.dynamic_slice(b[1], &[zero, start, zero], &[h.kvh, br, h.g])?;
-                    let l = f.dynamic_slice(b[2], &[zero, start, zero], &[h.kvh, br, h.g])?;
-                    let acc = f.dynamic_slice(b[3], &[zero, start, zero, zero], &[h.kvh, br, h.g, h.dv])?;
-                    let st = attend_chunk(f, &rb, base, k, v, &[m, l, acc])?;
-                    let m = f.dynamic_update_slice(b[1], st[0], &[zero, start, zero])?;
-                    let l = f.dynamic_update_slice(b[2], st[1], &[zero, start, zero])?;
-                    let acc = f.dynamic_update_slice(b[3], st[2], &[zero, start, zero, zero])?;
-                    let from = with_i(f, bi, 1, Func::add)?;
-                    let next = next_block(f, ci, from)?;
-                    Ok(vec![next, m, l, acc])
-                },
-            )?;
-            // The next chunk some row admits.
-            let next = with_i(f, ci, 1, Func::add)?;
-            let nv = f.splat(next, &[rp])?;
-            let cand = f.max(row_c0, nv)?;
-            let open = f.compare(Cmp::Lt, cand, row_c1)?;
-            let end = f.splat(c1, &[rp])?;
-            let cand = f.select(open, cand, end)?;
-            let next = f.reduce(cand, &[0], Fold::Min)?;
-            Ok(vec![next, done[1], done[2], done[3]])
-        },
-    )?;
-    let whole = finish(f, Layout::Blocked, &out[1..])?;
     if rp == r {
         return Ok(whole);
     }

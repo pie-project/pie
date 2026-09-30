@@ -71,12 +71,17 @@ fn a_bank_decodes_to_the_plane_its_codes_and_factors_state() {
     {
         let seed = 10 + at as u32 * 5;
         let groups = k / group as usize;
-        let codes: Vec<u32> = (0..n * k).map(|i| hash(i, seed) >> 7 & ((1 << bits) - 1)).collect();
+        let codes: Vec<u32> = (0..n * k)
+            .map(|i| hash(i, seed) >> 7 & ((1 << bits) - 1))
+            .collect();
         let scales: Vec<f32> = data(n * groups, seed + 1)
             .iter()
             .map(|v| round_bf16((v.abs() + 0.1) / (1 << bits) as f32))
             .collect();
-        let biases: Vec<f32> = data(n * groups, seed + 2).iter().map(|v| round_bf16(v * 0.3)).collect();
+        let biases: Vec<f32> = data(n * groups, seed + 2)
+            .iter()
+            .map(|v| round_bf16(v * 0.3))
+            .collect();
         let want: Vec<f32> = (0..n * k)
             .map(|i| {
                 let g = (i / k) * groups + (i % k) / group as usize;
@@ -85,7 +90,11 @@ fn a_bank_decodes_to_the_plane_its_codes_and_factors_state() {
             .collect();
         let bytes = b.u8(n as u32, (k as u32) * bits / 8, &pack(&codes, bits));
         // Both code views: the bank's packed dtype and the raw bytes.
-        let codes_t = if at % 2 == 0 { retype(bytes, n as u32, k as u32, dtype) } else { bytes };
+        let codes_t = if at % 2 == 0 {
+            retype(bytes, n as u32, k as u32, dtype)
+        } else {
+            bytes
+        };
         let bank = Bank {
             codes: codes_t,
             scales: b.bf16(n as u32, groups as u32, &scales),
@@ -99,7 +108,9 @@ fn a_bank_decodes_to_the_plane_its_codes_and_factors_state() {
     // mxfp4: symmetric, e8m0 scales per 32 codes.
     let lut = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let codes: Vec<u32> = (0..n * k).map(|i| hash(i, 90) >> 9 & 15).collect();
-    let exps: Vec<u8> = (0..n * k / 32).map(|i| 122 + (hash(i, 91) % 8) as u8).collect();
+    let exps: Vec<u8> = (0..n * k / 32)
+        .map(|i| 122 + (hash(i, 91) % 8) as u8)
+        .collect();
     let want: Vec<f32> = (0..n * k)
         .map(|i| {
             let c = codes[i];
@@ -170,7 +181,9 @@ fn mul_scalar_rounds_its_scalar_to_the_row_element() {
     let want_h: Vec<f32> = xs.iter().map(|v| v * sh).collect();
     let got_h: Vec<f32> = b
         .bytes(xh)
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f16_value(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     assert_close(&got_h, &want_h, 0.0, 1e-3);
@@ -182,7 +195,11 @@ fn a_pooled_reader_whose_bound_closes_no_block_reads_nothing() {
     // under the bound, so every row reads nothing (o = 0, lse = -inf).
     let (rows, heads, hd, ps, ratio) = (3usize, 2usize, 8usize, 2usize, 8u32);
     let mut b = Bench::new();
-    let q = b.bf16(rows as u32, (heads * hd) as u32, &data(rows * heads * hd, 7));
+    let q = b.bf16(
+        rows as u32,
+        (heads * hd) as u32,
+        &data(rows * heads * hd, 7),
+    );
     let pos = b.i32(rows as u32, 1, &[0, 3, 5]);
     let req = b.i32(rows as u32, 1, &[0, 0, 0]);
     let keys = b.bf16(8, hd as u32, &data(8 * hd, 8));
@@ -196,11 +213,27 @@ fn a_pooled_reader_whose_bound_closes_no_block_reads_nothing() {
         seq_stride: hd as u64,
         head_stride: hd as u64,
     };
-    let o = b.bf16(rows as u32, (heads * hd) as u32, &vec![1.0; rows * heads * hd]);
+    let o = b.bf16(
+        rows as u32,
+        (heads * hd) as u32,
+        &vec![1.0; rows * heads * hd],
+    );
     let lse = b.f32(rows as u32, heads as u32, &vec![1.0; rows * heads]);
     let ran = b
         .run(|ctx| {
-            pool::attention_lse(ctx, q, pos, req, &pages, ratio, heads as u32, hd as u32, 0.5, o, lse)
+            pool::attention_lse(
+                ctx,
+                q,
+                pos,
+                req,
+                &pages,
+                ratio,
+                heads as u32,
+                hd as u32,
+                0.5,
+                o,
+                lse,
+            )
         })
         .unwrap();
     if !ran {

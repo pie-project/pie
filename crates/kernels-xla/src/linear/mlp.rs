@@ -12,12 +12,7 @@ use crate::hlo::Val;
 use crate::tensor::Tensor;
 
 /// The gate and up halves of a packed `[rows, 2 · intermediate]` row, in f32.
-fn halves(
-    op: &'static str,
-    packed: Tensor,
-    intermediate: u32,
-    y: Tensor,
-) -> Result<(), Error> {
+fn halves(op: &'static str, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
     expect(op, packed, &[Dtype::Bf16])?;
     if packed.width != intermediate.saturating_mul(2) || y.width != intermediate {
         return Err(refuse(
@@ -47,8 +42,13 @@ fn read_halves(cx: &mut Cx<'_>, packed: Tensor, intermediate: u32) -> Result<(Va
 
 fn split(op: &'static str, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Error> {
     expect(op, gate, &[Dtype::Bf16])?;
-    if (up.rows, up.width) != (gate.rows, gate.width) || (y.rows, y.width) != (gate.rows, gate.width) {
-        return Err(refuse(op, "the gate, up and output planes are not one rectangle"));
+    if (up.rows, up.width) != (gate.rows, gate.width)
+        || (y.rows, y.width) != (gate.rows, gate.width)
+    {
+        return Err(refuse(
+            op,
+            "the gate, up and output planes are not one rectangle",
+        ));
     }
     Ok(())
 }
@@ -169,7 +169,10 @@ pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.mlp_gelu_tanh";
     expect(OP, x, &[Dtype::Bf16])?;
     if (y.rows, y.width) != (x.rows, x.width) {
-        return Err(refuse(OP, "the input and output planes are not one rectangle"));
+        return Err(refuse(
+            OP,
+            "the input and output planes are not one rectangle",
+        ));
     }
     ctx.emit(&mut |cx| {
         let v = cx.read_f32(x)?;

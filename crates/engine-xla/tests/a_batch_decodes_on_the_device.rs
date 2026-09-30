@@ -104,7 +104,8 @@ fn decode_step_time_by_batch_width() {
         // `jax.profiler.ProfileData`).
         if let Some(dir) = std::env::var_os("PIE_XLA_BENCH_PROFILE") {
             let api = shell.device().api().expect("a device").clone();
-            let profiler = engine_xla::pjrt::profiler::Profiler::start(&api).expect("a trace starts");
+            let profiler =
+                engine_xla::pjrt::profiler::Profiler::start(&api).expect("a trace starts");
             let mut last = None;
             for _ in 0..8 {
                 last = Some(shell.fire_kept(&seated).expect("a decode fires"));

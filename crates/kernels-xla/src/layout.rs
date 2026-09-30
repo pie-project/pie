@@ -42,7 +42,10 @@ fn same_dtype(op: &'static str, a: Tensor, b: Tensor) -> Result<(), Error> {
 
 fn i32_ids(op: &'static str, what: &str, t: Tensor) -> Result<(), Error> {
     if t.dtype != Dtype::I32 {
-        return Err(refuse(op, format!("the {what} are {:?}, and this op reads i32", t.dtype)));
+        return Err(refuse(
+            op,
+            format!("the {what} are {:?}, and this op reads i32", t.dtype),
+        ));
     }
     Ok(())
 }
@@ -52,7 +55,10 @@ fn index_vec(cx: &mut Cx<'_>, op: &'static str, t: Tensor, n: u32) -> Result<Val
     if t.elements() < u64::from(n) {
         return Err(refuse(
             op,
-            format!("{}x{} indices name fewer than the {n} rows moved", t.rows, t.width),
+            format!(
+                "{}x{} indices name fewer than the {n} rows moved",
+                t.rows, t.width
+            ),
         ));
     }
     let v = cx.read(t)?;
@@ -107,7 +113,13 @@ fn write_head(cx: &mut Cx<'_>, y: Tensor, v: Val) -> Result<(), Error> {
 
 // ------------------------------------------------------------------ embeds
 
-pub fn embed(ctx: &Ctx<'_>, ids: Tensor, table: Tensor, vocab: u32, y: Tensor) -> Result<(), Error> {
+pub fn embed(
+    ctx: &Ctx<'_>,
+    ids: Tensor,
+    table: Tensor,
+    vocab: u32,
+    y: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "layout.embed";
     i32_ids(OP, "token ids", ids)?;
     same_dtype(OP, table, y)?;
@@ -115,7 +127,10 @@ pub fn embed(ctx: &Ctx<'_>, ids: Tensor, table: Tensor, vocab: u32, y: Tensor) -
     if table.width != y.width {
         return Err(refuse(
             OP,
-            format!("the table rows are {} wide and the landing's {}", table.width, y.width),
+            format!(
+                "the table rows are {} wide and the landing's {}",
+                table.width, y.width
+            ),
         ));
     }
     ctx.emit(&mut |cx| {
@@ -146,12 +161,18 @@ pub fn embed_vocab_shard(
     if table.width != y.width {
         return Err(refuse(
             OP,
-            format!("the table rows are {} wide and the landing's {}", table.width, y.width),
+            format!(
+                "the table rows are {} wide and the landing's {}",
+                table.width, y.width
+            ),
         ));
     }
     let offset = i64::from(rank) * i64::from(local);
     if offset > i64::from(i32::MAX) {
-        return Err(refuse(OP, format!("rank {rank}'s band starts past any i32 id")));
+        return Err(refuse(
+            OP,
+            format!("rank {rank}'s band starts past any i32 id"),
+        ));
     }
     ctx.emit(&mut |cx| {
         let ids = index_vec(cx, OP, ids, y.rows)?;
@@ -170,7 +191,10 @@ fn concat_shape(op: &'static str, ids: Tensor, y: Tensor) -> Result<(u32, u32), 
     if y.width == 0 || !y.width.is_multiple_of(heads) {
         return Err(refuse(
             op,
-            format!("the {}-wide landing is not {heads} table rows side by side", y.width),
+            format!(
+                "the {}-wide landing is not {heads} table rows side by side",
+                y.width
+            ),
         ));
     }
     if ids.rows != y.rows {
@@ -199,7 +223,10 @@ pub fn embed_concat(
     if table.width != width {
         return Err(refuse(
             OP,
-            format!("the table rows are {} wide and each landed slice {width}", table.width),
+            format!(
+                "the table rows are {} wide and each landed slice {width}",
+                table.width
+            ),
         ));
     }
     ctx.emit(&mut |cx| {
@@ -237,7 +264,10 @@ fn bank_shape(op: &'static str, table: &Bank, width: u32) -> Result<Elem, Error>
     if !width.is_multiple_of(table.group) {
         return Err(refuse(
             op,
-            format!("the {width}-wide row is not a whole number of {}-code groups", table.group),
+            format!(
+                "the {width}-wide row is not a whole number of {}-code groups",
+                table.group
+            ),
         ));
     }
     if crate::pack::code_elem(table.codes.dtype).is_some() {
@@ -253,13 +283,21 @@ fn bank_shape(op: &'static str, table: &Bank, width: u32) -> Result<Elem, Error>
                 ),
             ));
         }
-        return scale_planes(op, table, width, crate::pack::code_elem(table.codes.dtype).unwrap_or(Elem::U8));
+        return scale_planes(
+            op,
+            table,
+            width,
+            crate::pack::code_elem(table.codes.dtype).unwrap_or(Elem::U8),
+        );
     }
     let elem = elem_of(op, table.codes.dtype)?;
     if !elem.is_int() {
         return Err(refuse(
             op,
-            format!("the code plane is {:?}; codes are packed in an integer plane", table.codes.dtype),
+            format!(
+                "the code plane is {:?}; codes are packed in an integer plane",
+                table.codes.dtype
+            ),
         ));
     }
     let bits = elem.bits();
@@ -389,7 +427,11 @@ pub(crate) fn affine_rows(
         Elem::I64 => Elem::U64,
         e => e,
     };
-    let codes = if unsigned == elem { codes } else { cx.bitcast(codes, unsigned)? };
+    let codes = if unsigned == elem {
+        codes
+    } else {
+        cx.bitcast(codes, unsigned)?
+    };
     let per = i64::from(unsigned.bits() / table.bits);
     let dims = [n, units, per];
     let codes = cx.broadcast(codes, &dims, &[0, 1])?;
@@ -508,7 +550,10 @@ pub fn embed_weighted(
     if weights.dtype != Dtype::F32 {
         return Err(refuse(
             OP,
-            format!("the interpolation weights are {:?}, and this gather reads f32", weights.dtype),
+            format!(
+                "the interpolation weights are {:?}, and this gather reads f32",
+                weights.dtype
+            ),
         ));
     }
     if ids.rows != weights.rows || ids.width != weights.width {
@@ -579,7 +624,10 @@ pub fn split_qkv(
         if t.width != w || t.rows != packed.rows {
             return Err(refuse(
                 OP,
-                format!("the {what} landing is {}x{}, and the cut is {}x{w}", t.rows, t.width, packed.rows),
+                format!(
+                    "the {what} landing is {}x{}, and the cut is {}x{w}",
+                    t.rows, t.width, packed.rows
+                ),
             ));
         }
     }
@@ -617,7 +665,11 @@ pub fn split_q_gate(
     if u64::from(packed.width) != 2 * u64::from(q.width) {
         return Err(refuse(
             OP,
-            format!("the packed row is {} wide, and q + gate is {}", packed.width, 2 * q.width),
+            format!(
+                "the packed row is {} wide, and q + gate is {}",
+                packed.width,
+                2 * q.width
+            ),
         ));
     }
     for t in [q, gate] {
@@ -652,7 +704,10 @@ pub fn split_rows(
     if left.width != width {
         return Err(refuse(
             OP,
-            format!("the left half is {} wide, and the cut states {width}", left.width),
+            format!(
+                "the left half is {} wide, and the cut states {width}",
+                left.width
+            ),
         ));
     }
     if u64::from(left.width) + u64::from(right.width) != u64::from(x.width) {
@@ -667,7 +722,10 @@ pub fn split_rows(
     for t in [left, right] {
         same_dtype(OP, x, t)?;
         if t.rows != x.rows {
-            return Err(refuse(OP, format!("{} rows cut into a {}-row half", x.rows, t.rows)));
+            return Err(refuse(
+                OP,
+                format!("{} rows cut into a {}-row half", x.rows, t.rows),
+            ));
         }
     }
     ctx.emit(&mut |cx| {
@@ -681,14 +739,23 @@ pub fn split_rows(
 }
 
 /// `y = table[:, layer * width .. (layer + 1) * width]` over `y`'s rows.
-pub fn select(ctx: &Ctx<'_>, table: Tensor, layer: u32, width: u32, y: Tensor) -> Result<(), Error> {
+pub fn select(
+    ctx: &Ctx<'_>,
+    table: Tensor,
+    layer: u32,
+    width: u32,
+    y: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "layout.select";
     nonzero(OP, "the slice width this select states", width)?;
     same_dtype(OP, table, y)?;
     if y.width != width {
         return Err(refuse(
             OP,
-            format!("the landing is {} wide, and the select states {width}", y.width),
+            format!(
+                "the landing is {} wide, and the select states {width}",
+                y.width
+            ),
         ));
     }
     let offset = u64::from(layer) * u64::from(width);
@@ -702,7 +769,10 @@ pub fn select(ctx: &Ctx<'_>, table: Tensor, layer: u32, width: u32, y: Tensor) -
         ));
     }
     if y.rows > table.rows {
-        return Err(refuse(OP, format!("{} rows selected from {}", y.rows, table.rows)));
+        return Err(refuse(
+            OP,
+            format!("{} rows selected from {}", y.rows, table.rows),
+        ));
     }
     ctx.emit(&mut |cx| {
         let t = cx.read(table)?;
@@ -719,7 +789,11 @@ fn move_shape(op: &'static str, wide: Tensor, tight: Tensor, index: Tensor) -> R
     if index.elements() < u64::from(tight.rows) {
         return Err(refuse(
             op,
-            format!("{} rows to move and {} rows named", tight.rows, index.elements()),
+            format!(
+                "{} rows to move and {} rows named",
+                tight.rows,
+                index.elements()
+            ),
         ));
     }
     if wide.dtype != tight.dtype || wide.width != tight.width {
@@ -775,14 +849,24 @@ fn scatter_into(
 
 /// `wide[index[i]] = tight[i]`; `wide` keeps every row not named. An index
 /// outside `wide` is dropped.
-pub fn scatter_rows(ctx: &Ctx<'_>, tight: Tensor, index: Tensor, wide: Tensor) -> Result<(), Error> {
+pub fn scatter_rows(
+    ctx: &Ctx<'_>,
+    tight: Tensor,
+    index: Tensor,
+    wide: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "layout.scatter_rows";
     move_shape(OP, wide, tight, index)?;
     ctx.emit(&mut |cx| scatter_into(cx, OP, tight, index, wide, false))
 }
 
 /// [`scatter_rows`] where a negative route skips its row.
-pub fn scatter_live_rows(ctx: &Ctx<'_>, src: Tensor, routes: Tensor, y: Tensor) -> Result<(), Error> {
+pub fn scatter_live_rows(
+    ctx: &Ctx<'_>,
+    src: Tensor,
+    routes: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "layout.scatter_live_rows";
     move_shape(OP, y, src, routes)?;
     ctx.emit(&mut |cx| scatter_into(cx, OP, src, routes, y, true))
@@ -921,21 +1005,33 @@ fn best(cx: &mut Cx<'_>, x: Val, skip: Option<Val>) -> Result<(Val, Val), Error>
 pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Error> {
     const OP: &str = "layout.argmax";
     if !matches!(x.dtype, Dtype::Bf16 | Dtype::F32 | Dtype::F16) {
-        return Err(Error::DtypeUnsupported { op: OP, dtype: x.dtype });
+        return Err(Error::DtypeUnsupported {
+            op: OP,
+            dtype: x.dtype,
+        });
     }
     if y.dtype != Dtype::I32 {
-        return Err(Error::DtypeUnsupported { op: OP, dtype: y.dtype });
+        return Err(Error::DtypeUnsupported {
+            op: OP,
+            dtype: y.dtype,
+        });
     }
     nonzero(OP, "rows", x.rows)?;
     nonzero(OP, "width", x.width)?;
     if column >= y.width {
         return Err(refuse(
             OP,
-            format!("column {column} is outside the {}-wide plane it writes", y.width),
+            format!(
+                "column {column} is outside the {}-wide plane it writes",
+                y.width
+            ),
         ));
     }
     if x.rows != y.rows {
-        return Err(refuse(OP, format!("{} rows ranked into {} rows", x.rows, y.rows)));
+        return Err(refuse(
+            OP,
+            format!("{} rows ranked into {} rows", x.rows, y.rows),
+        ));
     }
     ctx.emit(&mut |cx| {
         let v = cx.read_f32(x)?;
@@ -961,22 +1057,40 @@ pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Er
 /// answers value 0 at column 0. Values land f32, indices i32. Read from
 /// kernels-metal `layout::topk` (`topk.metal`); the GPU stamps k = 8 and 16,
 /// this takes any `k` up to the row width.
-pub fn topk(ctx: &Ctx<'_>, x: Tensor, k: u32, values: Tensor, indices: Tensor) -> Result<(), Error> {
+pub fn topk(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    k: u32,
+    values: Tensor,
+    indices: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "layout.topk";
     if !matches!(x.dtype, Dtype::Bf16 | Dtype::F32 | Dtype::F16) {
-        return Err(Error::DtypeUnsupported { op: OP, dtype: x.dtype });
+        return Err(Error::DtypeUnsupported {
+            op: OP,
+            dtype: x.dtype,
+        });
     }
     let rows = nonzero(OP, "rows", x.rows)?;
     nonzero(OP, "width", x.width)?;
     nonzero(OP, "k", k)?;
     if k > x.width {
-        return Err(refuse(OP, format!("k = {k} is wider than the {}-wide row", x.width)));
+        return Err(refuse(
+            OP,
+            format!("k = {k} is wider than the {}-wide row", x.width),
+        ));
     }
     if values.rows != rows || values.width != k || values.dtype != Dtype::F32 {
-        return Err(refuse(OP, format!("the values plane is not [{rows}, {k}] f32")));
+        return Err(refuse(
+            OP,
+            format!("the values plane is not [{rows}, {k}] f32"),
+        ));
     }
     if indices.rows != rows || indices.width != k || indices.dtype != Dtype::I32 {
-        return Err(refuse(OP, format!("the indices plane is not [{rows}, {k}] i32")));
+        return Err(refuse(
+            OP,
+            format!("the indices plane is not [{rows}, {k}] i32"),
+        ));
     }
     ctx.emit(&mut |cx| {
         let r = i64::from(rows);

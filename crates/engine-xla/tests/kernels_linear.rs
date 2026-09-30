@@ -90,7 +90,15 @@ fn dense_projections_and_their_fused_forms_answer_the_host() {
             gemm::matmul_bias(ctx, x, w, bi, biased)?;
             gemm::lm_head_softcap(ctx, x, w, cap, capped)?;
             gemm::matmul_geglu(ctx, x, g, i as u32, packed, geglu)?;
-            gemm::rel_bias(ctx, rxt, rwt, heads as u32, d_rel as u32, extent as u32, rel)
+            gemm::rel_bias(
+                ctx,
+                rxt,
+                rwt,
+                heads as u32,
+                d_rel as u32,
+                extent as u32,
+                rel,
+            )
         })
         .unwrap()
     {
@@ -106,7 +114,10 @@ fn dense_projections_and_their_fused_forms_answer_the_host() {
         .collect();
     assert_close(&b.read_f32(biased), &want_b, 1e-2, 1e-2);
     let want_c: Vec<f32> = want.iter().map(|v| cap * (v / cap).tanh()).collect();
-    assert!(want.iter().any(|v| v.abs() > cap), "the cap bites somewhere");
+    assert!(
+        want.iter().any(|v| v.abs() > cap),
+        "the cap bites somewhere"
+    );
     assert_close(&b.read_f32(capped), &want_c, 1e-2, 1e-2);
 
     let want_p = gemm_ref(&xs, &gw, m, 2 * i, k);
@@ -126,7 +137,8 @@ fn dense_projections_and_their_fused_forms_answer_the_host() {
             for d in 0..extent {
                 let mut acc = 0.0f64;
                 for j in 0..d_rel {
-                    acc += f64::from(rx[(r * heads + h) * d_rel + j]) * f64::from(rw[j * extent + d]);
+                    acc +=
+                        f64::from(rx[(r * heads + h) * d_rel + j]) * f64::from(rw[j * extent + d]);
                 }
                 want_r[(r * heads + h) * extent + d] = acc as f32;
             }
@@ -202,7 +214,10 @@ fn every_mlp_activation_answers_the_host() {
             .collect()
     };
     let split_ref = |f: &dyn Fn(f32, f32) -> f32| -> Vec<f32> {
-        gs.iter().zip(&us).map(|(&g, &u)| round_bf16(f(g, u))).collect()
+        gs.iter()
+            .zip(&us)
+            .map(|(&g, &u)| round_bf16(f(g, u)))
+            .collect()
     };
     let clamp = |g: f32, u: f32| (g.min(limit), u.clamp(-limit, limit));
     let pie_tanh = |x: f32| x.clamp(-16.0, 16.0).tanh();
@@ -284,7 +299,10 @@ fn a_lora_correction_adds_each_rows_own_adapter() {
     let got = b.read_f32(y);
     // Rows without an adapter keep their bits.
     for r in [2usize, 5] {
-        assert_eq!(&got[r * n_out..(r + 1) * n_out], &ys[r * n_out..(r + 1) * n_out]);
+        assert_eq!(
+            &got[r * n_out..(r + 1) * n_out],
+            &ys[r * n_out..(r + 1) * n_out]
+        );
     }
     assert_close(&got, &want, 2e-2, 1e-2);
 }

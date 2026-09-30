@@ -235,7 +235,7 @@ pub fn lower(
                         let rows = if intrinsic == IntrinsicId::MtpDrafts {
                             n as u32
                         } else {
-                            if width == 0 || n % width as usize != 0 {
+                            if width == 0 || !n.is_multiple_of(width as usize) {
                                 return refuse(format!(
                                     "the `{}` root holds {n} values, not whole {width}-wide rows",
                                     intrinsic.name()
@@ -338,7 +338,7 @@ pub fn lower(
             unreachable!("carried cells are values");
         };
         let v = l.unpack(param, 0, dtype, n)?;
-        let v = l.to_shape(v, &package.values[slot.value as usize].shape)?;
+        let v = l.reshaped(v, &package.values[slot.value as usize].shape)?;
         l.env.insert(slot.value, v);
     }
 
@@ -360,7 +360,7 @@ pub fn lower(
             match slot.feed {
                 Feed::Value(dtype, n) => {
                     let v = l.unpack(pack, slot.at, dtype, n)?;
-                    l.to_shape(v, &value.shape)?
+                    l.reshaped(v, &value.shape)?
                 }
                 Feed::Row { intrinsic, rows } => {
                     let plane = if intrinsic == IntrinsicId::Logits {
@@ -462,7 +462,7 @@ impl Lower<'_> {
 
     /// `v` (one lane's value is `[B, ..]` of any shape with the same count)
     /// reshaped to `shape`.
-    fn to_shape(&mut self, v: Val, shape: &[u32]) -> Lowering<Val> {
+    fn reshaped(&mut self, v: Val, shape: &[u32]) -> Lowering<Val> {
         let dims = self.full(shape);
         Ok(self.f.reshape(v, &dims)?)
     }
@@ -606,9 +606,9 @@ impl Lower<'_> {
         if intrinsic == IntrinsicId::MtpDrafts {
             let grid = self.f.reshape(picked, &[b, r, width])?;
             let tokens = self.argmax_f32(grid)?;
-            return self.to_shape(tokens, shape);
+            return self.reshaped(tokens, shape);
         }
-        self.to_shape(picked, shape)
+        self.reshaped(picked, shape)
     }
 
     // ---------------------------------------------------------------- helpers
@@ -1139,7 +1139,7 @@ impl Lower<'_> {
                     }
                     _ => return refuse(format!("a reduction over {d:?}")),
                 };
-                let y = self.to_shape(y, &shape)?;
+                let y = self.reshaped(y, &shape)?;
                 self.set(result, y)
             }
             tags::REDUCE_ARGMAX => {
@@ -1151,7 +1151,7 @@ impl Lower<'_> {
                     Dtype::I32 | Dtype::U32 => self.argmax_int(x)?,
                     _ => return refuse("argmax over bools"),
                 };
-                let y = self.to_shape(y, &shape)?;
+                let y = self.reshaped(y, &shape)?;
                 self.set(result, y)
             }
             tags::CUMSUM | tags::CUMPROD => {
@@ -1168,7 +1168,7 @@ impl Lower<'_> {
                     Fold::Prod
                 };
                 let y = self.scan(x, fold)?;
-                let y = self.to_shape(y, &shape)?;
+                let y = self.reshaped(y, &shape)?;
                 self.set(result, y)
             }
             tags::BROADCAST => {
@@ -1186,7 +1186,7 @@ impl Lower<'_> {
                         return refuse(format!("a broadcast of {src:?} to {shape:?}"));
                     }
                 }
-                let staged = self.to_shape(x, &padded)?;
+                let staged = self.reshaped(x, &padded)?;
                 let dims = self.full(&shape);
                 let map: Vec<i64> = (0..dims.len() as i64).collect();
                 let y = self.f.broadcast(staged, &dims, &map)?;
@@ -1200,7 +1200,7 @@ impl Lower<'_> {
                 if self.dtype(id) != self.dtype(result) || numel(&self.shape(id)) != numel(&shape) {
                     return refuse("a reshape that changes the count or the dtype");
                 }
-                let y = self.to_shape(x, &shape)?;
+                let y = self.reshaped(x, &shape)?;
                 self.set(result, y)
             }
             tags::TRANSPOSE => {
@@ -1242,9 +1242,9 @@ impl Lower<'_> {
                     .f
                     .slice(index, &[0, 0, 0], &[d[0], d[1], k], &[1, 1, 1])?;
                 let index = self.f.bitcast(index, Elem::U32)?;
-                let values = self.to_shape(values, &shape)?;
+                let values = self.reshaped(values, &shape)?;
                 let second = self.shape(result + 1);
-                let index = self.to_shape(index, &second)?;
+                let index = self.reshaped(index, &second)?;
                 self.set(result, values)?;
                 self.set(result + 1, index)
             }
@@ -1289,7 +1289,7 @@ impl Lower<'_> {
                 let keep = self.f.broadcast(valid, &[b, k, rest], &[0, 1])?;
                 let zero = self.zero_like(picked);
                 let y = self.f.select(keep, picked, zero)?;
-                let y = self.to_shape(y, &shape)?;
+                let y = self.reshaped(y, &shape)?;
                 self.set(result, y)
             }
             tags::GATHER_ROW => {
@@ -1423,7 +1423,7 @@ impl Lower<'_> {
                     self.splitmix(joined)?
                 };
                 let y = self.draw(seed, n, op.rng_kind)?;
-                let y = self.to_shape(y, &shape)?;
+                let y = self.reshaped(y, &shape)?;
                 self.set(result, y)
             }
             other => refuse(format!("`{}` has no StableHLO form here", op_name(other))),
@@ -1674,7 +1674,7 @@ impl Lower<'_> {
                 self.f.compare(Cmp::Ge, x, t)?
             }
         };
-        let keep = self.to_shape(keep, shape)?;
+        let keep = self.reshaped(keep, shape)?;
         self.set(result, keep)
     }
 
@@ -1763,7 +1763,7 @@ impl Lower<'_> {
             },
             combine,
         )?;
-        let y = self.to_shape(y, shape)?;
+        let y = self.reshaped(y, shape)?;
         self.set(result, y)
     }
 }

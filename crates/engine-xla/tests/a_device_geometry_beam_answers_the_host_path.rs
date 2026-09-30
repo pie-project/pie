@@ -67,7 +67,8 @@ impl ForwardHybrid for Tiny {
         let q = ops::linear::matmul(&x, &w("q", HEAD_DIM, WIDTH));
         let k = ops::linear::matmul(&x, &w("k", HEAD_DIM, WIDTH));
         let v = ops::linear::matmul(&x, &w("v", HEAD_DIM, WIDTH));
-        let (q, k) = ops::elemwise::rope_full(&q, &k, &inputs.positions(), HEAD_DIM, 10_000.0, false);
+        let (q, k) =
+            ops::elemwise::rope_full(&q, &k, &inputs.positions(), HEAD_DIM, 10_000.0, false);
         let pages = inputs.kv(KV_ROW);
         ops::attn::kv_append(
             &k,
@@ -199,7 +200,11 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
     // The prompt: one page, shared by every beam.
     let prompt: Vec<u32> = (0..PAGE).map(|i| (i * 7 + 3) % VOCAB).collect();
     let shared = 1u32;
-    rig.fire(vec![host_lane(0, prompt, vec![shared], 0)], Vec::new(), Vec::new());
+    rig.fire(
+        vec![host_lane(0, prompt, vec![shared], 0)],
+        Vec::new(),
+        Vec::new(),
+    );
 
     // Host beams write their own pages 2, 3; device beams 4, 5, which the
     // device path names relatively through the lane's translation table.
@@ -240,7 +245,14 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
         let held = PAGE + step as u32;
         // The host path: each beam states its page table and extent.
         let host: Vec<Lane> = (0..BEAMS as usize)
-            .map(|b| host_lane(1 + b as u32, vec![beam_tokens[b]], vec![shared, host_own[b]], held))
+            .map(|b| {
+                host_lane(
+                    1 + b as u32,
+                    vec![beam_tokens[b]],
+                    vec![shared, host_own[b]],
+                    held,
+                )
+            })
             .collect();
         let want = rig.fire(host, Vec::new(), Vec::new());
 
@@ -276,11 +288,19 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
             .collect();
         rig.fire(lanes, vec![attach(0, instance)], Vec::new());
         let got = rig.take(instance, 4);
-        assert_eq!(got.len(), (BEAMS * VOCAB) as usize, "one logits row per beam");
+        assert_eq!(
+            got.len(),
+            (BEAMS * VOCAB) as usize,
+            "one logits row per beam"
+        );
         for b in 0..BEAMS as usize {
             let row = &got[b * VOCAB as usize..(b + 1) * VOCAB as usize];
             assert_eq!(want[b].values.len(), VOCAB as usize);
-            assert_close(row, &want[b].values, &format!("step {step} beam {b} logits"));
+            assert_close(
+                row,
+                &want[b].values,
+                &format!("step {step} beam {b} logits"),
+            );
         }
     }
 }

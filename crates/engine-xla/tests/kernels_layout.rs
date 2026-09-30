@@ -8,7 +8,9 @@ use kernels_xla::layout;
 fn data(n: usize, seed: u32) -> Vec<f32> {
     (0..n)
         .map(|i| {
-            let h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(40503));
+            let h = (i as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(seed.wrapping_mul(40503));
             round_bf16(((h >> 8) % 2000) as f32 / 1000.0 - 1.0)
         })
         .collect()
@@ -46,7 +48,15 @@ fn embeds_and_select_answer_the_host() {
     let rt = b.bf16(4, 24, &relay);
     let sy = b.zeros(Dtype::Bf16, 3, 8);
     // Shard 1 of a two-rank split of the same table: rows 6..12 (5 real).
-    let shard = b.bf16(6, width, &[&table[(6 * width) as usize..], &vec![0.0; width as usize][..]].concat());
+    let shard = b.bf16(
+        6,
+        width,
+        &[
+            &table[(6 * width) as usize..],
+            &vec![0.0; width as usize][..],
+        ]
+        .concat(),
+    );
     let vy = b.zeros(Dtype::Bf16, n, width);
     if !b
         .run(|ctx| {
@@ -88,7 +98,9 @@ fn embeds_and_select_answer_the_host() {
     }
     assert_close(&b.read_f32(wy), &want, 1e-6, 1e-2);
 
-    let want: Vec<f32> = (0..3).flat_map(|r| relay[r * 24 + 8..r * 24 + 16].to_vec()).collect();
+    let want: Vec<f32> = (0..3)
+        .flat_map(|r| relay[r * 24 + 8..r * 24 + 16].to_vec())
+        .collect();
     assert_close(&b.read_f32(sy), &want, 0.0, 0.0);
 
     let mut want = Vec::new();
@@ -108,7 +120,11 @@ fn pack(codes: &[u32], bits: u32) -> Vec<u8> {
     let per = 8 / bits;
     codes
         .chunks(per as usize)
-        .map(|c| c.iter().enumerate().fold(0u8, |acc, (i, &v)| acc | ((v as u8) << (i as u32 * bits))))
+        .map(|c| {
+            c.iter()
+                .enumerate()
+                .fold(0u8, |acc, (i, &v)| acc | ((v as u8) << (i as u32 * bits)))
+        })
         .collect()
 }
 
@@ -268,7 +284,9 @@ fn splits_cut_where_they_state() {
         return;
     }
     let cut = |x: &[f32], width: usize, lo: usize, hi: usize| -> Vec<f32> {
-        x.chunks(width).flat_map(|row| row[lo..hi].to_vec()).collect()
+        x.chunks(width)
+            .flat_map(|row| row[lo..hi].to_vec())
+            .collect()
     };
     let pw = (qw + 2 * kw) as usize;
     let (qw, kw) = (qw as usize, kw as usize);
@@ -324,7 +342,12 @@ fn row_moves_gather_scatter_and_permute() {
     };
     assert_close(&b.read_f32(s), &scattered(&[4, 99, 1]), 0.0, 0.0);
     assert_close(&b.read_f32(live), &scattered(&[-1, 2, 5]), 0.0, 0.0);
-    assert_close(&b.read_f32(pk), &rows_of(&wide, width, &[2, 5, 0]), 0.0, 0.0);
+    assert_close(
+        &b.read_f32(pk),
+        &rows_of(&wide, width, &[2, 5, 0]),
+        0.0,
+        0.0,
+    );
     assert_close(&b.read_f32(un), &scattered(&[2, 5, 0]), 0.0, 0.0);
 }
 

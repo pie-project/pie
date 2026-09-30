@@ -73,7 +73,10 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
         started.elapsed().as_secs_f64()
     );
     let first = rows[0].clone();
-    assert!(first.iter().all(|v| v.is_finite()), "the prefill's logits are finite");
+    assert!(
+        first.iter().all(|v| v.is_finite()),
+        "the prefill's logits are finite"
+    );
     let mut produced = vec![argmax(&first)];
     let mut step_times = Vec::new();
     for _ in 0..15 {
@@ -125,7 +128,11 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
         argmax(&first),
         argmax(&last)
     );
-    assert_eq!(argmax(&first), argmax(&last), "the two walks pick the same token");
+    assert_eq!(
+        argmax(&first),
+        argmax(&last),
+        "the two walks pick the same token"
+    );
 
     // Three prompts in one fire (prefill, then batched decode) answer what
     // each answers alone: padding lanes and batching leave the real rows be.
@@ -188,8 +195,7 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
         let fed: Vec<[u32; 1]> = next.iter().map(|t| [*t]).collect();
         let rows = shell
             .fire(
-                &fed
-                    .iter()
+                &fed.iter()
                     .enumerate()
                     .map(|(slot, t)| Lane {
                         slot: slot as u32,
@@ -208,7 +214,10 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
             tokenizer.decode(b, true)
         );
     }
-    assert_eq!(alone, together, "a batch answers what each lane answers alone");
+    assert_eq!(
+        alone, together,
+        "a batch answers what each lane answers alone"
+    );
 }
 
 fn f32_order(a: &f64, b: &f64) -> std::cmp::Ordering {

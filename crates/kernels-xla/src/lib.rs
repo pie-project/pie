@@ -6,6 +6,7 @@ pub mod error;
 pub mod hlo;
 pub mod layout;
 pub mod linear;
+pub mod mosaic;
 pub mod pack;
 pub mod spatial;
 pub mod tensor;

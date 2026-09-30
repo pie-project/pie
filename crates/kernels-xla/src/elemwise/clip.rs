@@ -25,7 +25,9 @@ pub fn clamp(ctx: &Ctx<'_>, lo: f32, hi: f32, x: Tensor) -> Result<(), Error> {
     if !matches!(lo.partial_cmp(&hi), Some(Ordering::Less | Ordering::Equal)) {
         return Err(refuse(
             OP,
-            format!("the bounds {lo} and {hi} cross, and a clamp between them is the constant {hi}"),
+            format!(
+                "the bounds {lo} and {hi} cross, and a clamp between them is the constant {hi}"
+            ),
         ));
     }
     let round = |v: f32| {
@@ -54,13 +56,19 @@ pub fn clamp_learned(ctx: &Ctx<'_>, lo: Tensor, hi: Tensor, x: Tensor) -> Result
         if bound.dtype != x.dtype {
             return Err(refuse(
                 OP,
-                format!("the {what} bound is {:?} and the rows it clamps are {:?}", bound.dtype, x.dtype),
+                format!(
+                    "the {what} bound is {:?} and the rows it clamps are {:?}",
+                    bound.dtype, x.dtype
+                ),
             ));
         }
         if bound.elements() != 1 {
             return Err(refuse(
                 OP,
-                format!("the {what} bound is a {} x {} plane, and this clamp reads one scalar", bound.rows, bound.width),
+                format!(
+                    "the {what} bound is a {} x {} plane, and this clamp reads one scalar",
+                    bound.rows, bound.width
+                ),
             ));
         }
     }

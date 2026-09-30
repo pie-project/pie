@@ -6,7 +6,9 @@ use kernels_xla::elemwise::norm;
 fn data(n: usize, seed: u32) -> Vec<f32> {
     (0..n)
         .map(|i| {
-            let h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(40503));
+            let h = (i as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(seed.wrapping_mul(40503));
             round_bf16(((h >> 8) % 2000) as f32 / 1000.0 - 1.0)
         })
         .collect()
@@ -46,8 +48,18 @@ fn rmsnorm_and_its_per_head_plus_one_form_answer_the_host() {
     {
         return;
     }
-    assert_close(&b.read_f32(y), &rms_ref(&xs, &ws, width as usize, 1e-6, false), 1e-2, 1e-2);
-    assert_close(&b.read_f32(z), &rms_ref(&xs, &hs, head as usize, 1e-6, true), 1e-2, 1e-2);
+    assert_close(
+        &b.read_f32(y),
+        &rms_ref(&xs, &ws, width as usize, 1e-6, false),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(z),
+        &rms_ref(&xs, &hs, head as usize, 1e-6, true),
+        1e-2,
+        1e-2,
+    );
 }
 
 #[test]

@@ -34,9 +34,12 @@ pub struct Staged {
 
 /// Compiled stages by (program content, stage, batch shape): a pass that
 /// was seen skips the lowering and the compile both.
+/// A compiled stage's key: program content, stage, batch shape, carried cells.
+type StageKey = ([u8; 32], usize, Batch, Vec<u32>);
+
 #[derive(Default)]
 pub struct Stages {
-    map: HashMap<([u8; 32], usize, Batch, Vec<u32>), Arc<Staged>>,
+    map: HashMap<StageKey, Arc<Staged>>,
     /// Stage executions and lanes they carried, for the tally.
     pub runs: u64,
     pub lanes: u64,
@@ -302,8 +305,10 @@ pub fn launch_stage(
 /// The output words of a stage's packed download.
 #[must_use]
 pub fn words_of(raw: &[u8]) -> Vec<u32> {
-    raw.chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    raw.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect()
 }
 
@@ -320,7 +325,12 @@ pub fn cell_of(all: &[u32], out_words: usize, row: usize, slot: &Slot) -> Result
 }
 
 /// Every lane's put values out of a stage's download.
-pub fn unpack(layout: &Layout, raw: &[u8], lanes: usize, batch: usize) -> Result<Vec<Vec<(u32, Value)>>, String> {
+pub fn unpack(
+    layout: &Layout,
+    raw: &[u8],
+    lanes: usize,
+    batch: usize,
+) -> Result<Vec<Vec<(u32, Value)>>, String> {
     let all = words_of(raw);
     if all.len() != batch * layout.out_words {
         return Err(format!(
@@ -568,8 +578,10 @@ pub fn flush(
         let w = lower::words(dtype, n);
         let raw = cell.download().map_err(|e| e.to_string())?;
         let all: Vec<u32> = raw
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         for (r, inst) in insts.iter().enumerate() {
             let (Some(inst), Some(row)) = (inst, all.get(r * w..(r + 1) * w)) else {
@@ -602,8 +614,9 @@ pub fn step_group(
     carried: &[u32],
     cells: Option<BTreeMap<u32, Buffer>>,
 ) -> (Vec<StepOutcome>, Option<BTreeMap<u32, Buffer>>) {
-    let (outcomes, cells, deferred) =
-        step_group_with(device, stages, key, plan, kept, members, carried, cells, false);
+    let (outcomes, cells, deferred) = step_group_with(
+        device, stages, key, plan, kept, members, carried, cells, false,
+    );
     debug_assert!(deferred.is_none(), "a synchronous pass defers nothing");
     (outcomes, cells)
 }
@@ -622,8 +635,14 @@ pub fn step_group_deferred(
     members: &mut [Member<'_>],
     carried: &[u32],
     cells: Option<BTreeMap<u32, Buffer>>,
-) -> (Vec<StepOutcome>, Option<BTreeMap<u32, Buffer>>, Option<Deferred>) {
-    step_group_with(device, stages, key, plan, kept, members, carried, cells, true)
+) -> (
+    Vec<StepOutcome>,
+    Option<BTreeMap<u32, Buffer>>,
+    Option<Deferred>,
+) {
+    step_group_with(
+        device, stages, key, plan, kept, members, carried, cells, true,
+    )
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -637,7 +656,11 @@ fn step_group_with(
     carried: &[u32],
     cells: Option<BTreeMap<u32, Buffer>>,
     defer: bool,
-) -> (Vec<StepOutcome>, Option<BTreeMap<u32, Buffer>>, Option<Deferred>) {
+) -> (
+    Vec<StepOutcome>,
+    Option<BTreeMap<u32, Buffer>>,
+    Option<Deferred>,
+) {
     let mut outcome: Vec<Option<StepOutcome>> = vec![None; members.len()];
     for (m, member) in members.iter().enumerate() {
         if member.inst.poisoned {
@@ -785,7 +808,9 @@ fn step_group_with(
                                             .find(|slot| slot.value == put.value)
                                         {
                                             Some(slot) => Cell::Out { row, slot: *slot },
-                                            None => Cell::Known(vals[m][put.value as usize].clone()),
+                                            None => {
+                                                Cell::Known(vals[m][put.value as usize].clone())
+                                            }
                                         };
                                         overlays[m].pending.insert(put.channel, cell);
                                     }
@@ -890,7 +915,10 @@ fn bind_roots(
 /// still on the device (`Cell::Out`) is left out of its ring's tail and
 /// answered as (channel, sequence, row, slot) for whoever lands it.
 #[allow(clippy::type_complexity)]
-fn commit(inst: &mut InterpInstance, overlay: &Overlay) -> (StepOutcome, Vec<(usize, u64, usize, Slot)>) {
+fn commit(
+    inst: &mut InterpInstance,
+    overlay: &Overlay,
+) -> (StepOutcome, Vec<(usize, u64, usize, Slot)>) {
     let n = inst.channels.len();
     let mut old_tails = vec![0u64; n];
     let mut new_heads = vec![0u64; n];

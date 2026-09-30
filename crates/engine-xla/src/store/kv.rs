@@ -8,7 +8,9 @@ pub use model_exec::store::kv::{
 
 /// A lane's table in a windowed space (`model_exec::store::kv::window_table`).
 pub fn window_table(paging: &Paging, seat: &Seat, table: &[u32], ids: &[u32]) -> Result<Vec<u32>> {
-    Ok(model_exec::store::kv::window_table(paging, seat, table, ids)?)
+    Ok(model_exec::store::kv::window_table(
+        paging, seat, table, ids,
+    )?)
 }
 
 pub fn geometry(paging: &Paging, seats: &[Seat]) -> Result<Geometry> {

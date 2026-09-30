@@ -54,7 +54,10 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
     assert_eq!(rig.profile().pixels_width, C_OUT);
     assert!(rig.profile().has_velocity);
 
-    let program = rig.register(carrier(&[Shape::new(&[CLIP[1], CLIP[2], C_IN]).expect("a box")], 1));
+    let program = rig.register(carrier(
+        &[Shape::new(&[CLIP[1], CLIP[2], C_IN]).expect("a box")],
+        1,
+    ));
     let cell = rig.channel(vec![CLIP[1], CLIP[2], C_IN], HostRole::Writer);
     let instance = rig.bind(program, vec![cell], voxels());
 
@@ -80,19 +83,34 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
             }],
         );
         let readout = readouts[0].clone();
-        assert_eq!(readout.seam, ReadoutSeam::Pixels, "a VAE lane answers pixels");
+        assert_eq!(
+            readout.seam,
+            ReadoutSeam::Pixels,
+            "a VAE lane answers pixels"
+        );
         assert_eq!(readout.width, C_OUT);
         (readout.values, readout.clips)
     };
 
     let (seam_first, boxes) = fire(&mut rig, &first);
     assert_eq!(boxes, vec![CLIP], "a `same3` convolution keeps the box");
-    assert_close(&seam_first, &conv_reference(&weights, CLIP, &first), "the first fire's pixels");
+    assert_close(
+        &seam_first,
+        &conv_reference(&weights, CLIP, &first),
+        "the first fire's pixels",
+    );
 
     let (seam_second, _) = fire(&mut rig, &second);
-    assert_close(&seam_second, &conv_reference(&weights, CLIP, &second), "the second fire's pixels");
+    assert_close(
+        &seam_second,
+        &conv_reference(&weights, CLIP, &second),
+        "the second fire's pixels",
+    );
     assert!(
-        seam_first.iter().zip(&seam_second).any(|(a, b)| (a - b).abs() > 1e-3),
+        seam_first
+            .iter()
+            .zip(&seam_second)
+            .any(|(a, b)| (a - b).abs() > 1e-3),
         "the second fire re-read the first fire's cell"
     );
 
@@ -106,7 +124,11 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
             payload: host.clone(),
         }],
     );
-    assert_close(&readouts[0].values, &conv_reference(&weights, CLIP, &host), "the host payload's pixels");
+    assert_close(
+        &readouts[0].values,
+        &conv_reference(&weights, CLIP, &host),
+        "the host payload's pixels",
+    );
 
     // The plan's token reading: a velocity off its latent and timestep ports.
     let rows = 5u32;
@@ -115,7 +137,9 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
     let latent_ch = rig.channel(vec![rows, WIDTH], HostRole::Writer);
     let time_ch = rig.channel(vec![1, 1], HostRole::Writer);
     let dit_instance = rig.bind(dit, vec![latent_ch, time_ch], rows);
-    let latent: Vec<f32> = (0..rows as usize * WIDTH as usize).map(|_| bf(rng.unit())).collect();
+    let latent: Vec<f32> = (0..rows as usize * WIDTH as usize)
+        .map(|_| bf(rng.unit()))
+        .collect();
     let timestep = 0.4;
     rig.publish(dit_instance, 0, &latent);
     rig.publish(dit_instance, 1, &[timestep]);

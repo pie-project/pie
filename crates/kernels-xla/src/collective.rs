@@ -21,7 +21,10 @@ fn world_of(op: &'static str, narrow: Tensor, wide: Tensor) -> Result<u64, Error
     if narrow.dtype != wide.dtype {
         return Err(refuse(
             op,
-            format!("the shard is {:?} and the whole {:?}; a collective does not convert", narrow.dtype, wide.dtype),
+            format!(
+                "the shard is {:?} and the whole {:?}; a collective does not convert",
+                narrow.dtype, wide.dtype
+            ),
         ));
     }
     if narrow.rows != wide.rows || narrow.width == 0 || !wide.width.is_multiple_of(narrow.width) {

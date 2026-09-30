@@ -8,6 +8,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Carried cells a group pass left on the device, and whose they are.
+type Carried = (Vec<InstanceId>, BTreeMap<u32, crate::pjrt::Buffer>);
+/// Where an attachment runs: its plan, its content hash, its readout seat.
+type Placed = (Arc<ExecPlan>, [u8; 32], Option<crate::readout::Seat>);
+
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel, Ticket};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value};
@@ -44,7 +49,6 @@ struct Instance {
     channels: Vec<ChannelId>,
 
     poisoned: Arc<AtomicBool>,
-
 }
 
 impl Instance {
@@ -97,7 +101,11 @@ impl Latch {
         if self.holds.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
-        tracing::debug!(frame = self.at.frame, step = self.at.step, "xla step landed");
+        tracing::debug!(
+            frame = self.at.frame,
+            step = self.at.step,
+            "xla step landed"
+        );
         let fault = self
             .fault
             .lock()
@@ -159,7 +167,9 @@ pub struct InFlight {
 
 impl Flights {
     fn lock(&self) -> std::sync::MutexGuard<'_, Book> {
-        self.book.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.book
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Starts a deferred pass's download; it lands itself when the bytes
@@ -398,7 +408,7 @@ pub struct Plane {
 
     /// Per program content, the carried cells its last group pass left on
     /// the device and the instances (in row order) they belong to.
-    carry: BTreeMap<[u8; 32], (Vec<InstanceId>, BTreeMap<u32, crate::pjrt::Buffer>)>,
+    carry: BTreeMap<[u8; 32], Carried>,
 
     /// Guest passes whose last stage is still on the device.
     flights: Arc<Flights>,
@@ -481,10 +491,7 @@ impl Plane {
             })
     }
 
-    pub fn bind(
-        &mut self,
-        binding: &InstanceBinding,
-    ) -> Result<BoundInstance, Refusal> {
+    pub fn bind(&mut self, binding: &InstanceBinding) -> Result<BoundInstance, Refusal> {
         let plan = self
             .programs
             .get(&binding.program)
@@ -758,15 +765,15 @@ impl Plane {
                     _ => Vec::new(),
                 })
                 .unwrap_or_default(),
-            Some(binding) => match {
+            Some(binding) => {
                 let ring = &seat.inst.channels[binding.channel as usize];
                 self.settle_ring(ring);
-                ring.front()
-            } {
-                Value::U32(v) => v,
-                Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
-                _ => Vec::new(),
-            },
+                match ring.front() {
+                    Value::U32(v) => v,
+                    Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
+                    _ => Vec::new(),
+                }
+            }
             None => Vec::new(),
         }
     }
@@ -980,8 +987,7 @@ impl Plane {
             }
         }
         // Where each attachment runs.
-        let mut plans: Vec<Option<(Arc<ExecPlan>, [u8; 32], Option<crate::readout::Seat>)>> =
-            Vec::with_capacity(attachments.len());
+        let mut plans: Vec<Option<Placed>> = Vec::with_capacity(attachments.len());
         let mut carried_of: BTreeMap<[u8; 32], Vec<u32>> = BTreeMap::new();
         // Cells carried from the last fire: kept for a group of exactly the
         // same instances below, written back to the rings otherwise.
@@ -1004,8 +1010,7 @@ impl Plane {
                             kept.is_some_and(|k| k.f32) && at.is_some()
                         }
                         Some(
-                            eta_ir::op::IntrinsicId::MtpLogits
-                            | eta_ir::op::IntrinsicId::MtpDrafts,
+                            eta_ir::op::IntrinsicId::MtpLogits | eta_ir::op::IntrinsicId::MtpDrafts,
                         ) => kept.is_some_and(|k| k.f32 && k.mtp.is_some()) && at.is_some(),
                         _ => false,
                     }
@@ -1049,12 +1054,8 @@ impl Plane {
                     continue;
                 };
                 let mut runner = OnDevice::new(device, &mut self.stages, key, kept, seat);
-                let outcome = eta_exec::step_with(
-                    &mut held.inst,
-                    &plan,
-                    &PassInputs::none(),
-                    &mut runner,
-                );
+                let outcome =
+                    eta_exec::step_with(&mut held.inst, &plan, &PassInputs::none(), &mut runner);
                 ran[at] = true;
                 note(outcome, instance, held.program);
             }
@@ -1071,10 +1072,8 @@ impl Plane {
                 }
             }
             for (key, plan, members) in groups {
-                let wanted: BTreeMap<InstanceId, usize> = members
-                    .iter()
-                    .map(|&at| (attachments[at].0, at))
-                    .collect();
+                let wanted: BTreeMap<InstanceId, usize> =
+                    members.iter().map(|&at| (attachments[at].0, at)).collect();
                 let ids: Vec<InstanceId> = wanted.keys().copied().collect();
                 let cells = match carry.remove(&key) {
                     Some((held, cells)) if held == ids => Some(cells),
@@ -1150,10 +1149,9 @@ impl Plane {
             if ran[at] {
                 continue;
             }
-            let lanes = self
-                .instances
-                .get(&instance)
-                .map_or(1, |seat| self.embed_indptr(seat).len().saturating_sub(1).max(1));
+            let lanes = self.instances.get(&instance).map_or(1, |seat| {
+                self.embed_indptr(seat).len().saturating_sub(1).max(1)
+            });
             let (rows, drafts) = match kept {
                 Some(kept) => {
                     let mut rows = Vec::new();
@@ -1186,10 +1184,7 @@ impl Plane {
     }
 
     /// Writes carried cells back into their instances' rings.
-    fn flush_carry(
-        &mut self,
-        carry: BTreeMap<[u8; 32], (Vec<InstanceId>, BTreeMap<u32, crate::pjrt::Buffer>)>,
-    ) {
+    fn flush_carry(&mut self, carry: BTreeMap<[u8; 32], Carried>) {
         for (_, (ids, cells)) in carry {
             let Some(plan) = ids
                 .iter()
@@ -1198,8 +1193,10 @@ impl Plane {
             else {
                 continue;
             };
-            let insts: Vec<Option<&InterpInstance>> =
-                ids.iter().map(|id| self.instances.get(id).map(|seat| &seat.inst)).collect();
+            let insts: Vec<Option<&InterpInstance>> = ids
+                .iter()
+                .map(|id| self.instances.get(id).map(|seat| &seat.inst))
+                .collect();
             if let Err(why) = crate::guest::run::flush(&plan, &cells, &insts) {
                 tracing::warn!(%why, "carried guest cells did not come back to the host");
                 for id in &ids {

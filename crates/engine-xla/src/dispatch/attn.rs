@@ -216,14 +216,15 @@ impl Run<'_> {
                     {
                         let (table, count) = self.class_table().expect("checked above");
                         let classes_of = |id: model_ir::ValueId, what: &str| {
-                            self.packed_classes(id).ok_or_else(|| kernels_xla::Error::Backend {
-                                op: "attention.ragged",
-                                detail: format!(
-                                    "a lane states attention classes and this attention's \
+                            self.packed_classes(id)
+                                .ok_or_else(|| kernels_xla::Error::Backend {
+                                    op: "attention.ragged",
+                                    detail: format!(
+                                        "a lane states attention classes and this attention's \
                                      {what} rows are not packed by a group selection, so no \
                                      class table applies to them"
-                                ),
-                            })
+                                    ),
+                                })
                         };
                         attn::ragged::RaggedMask::ClassTable {
                             q_classes: classes_of(*q_indptr, "query")?,
@@ -745,20 +746,18 @@ impl Run<'_> {
                 heads_per_ngram,
                 map,
                 ngram_ids,
-            } => {
-attn::ple::ngram_ids(
-                    self.ctx(),
-                    self.tensor(*ids),
-                    &self.recurrent(*state),
-                    *eos,
-                    mults,
-                    primes,
-                    offsets,
-                    *heads_per_ngram,
-                    map.map(|m| self.tensor(m)),
-                    self.tensor(*ngram_ids),
-                )
-            }
+            } => attn::ple::ngram_ids(
+                self.ctx(),
+                self.tensor(*ids),
+                &self.recurrent(*state),
+                *eos,
+                mults,
+                primes,
+                offsets,
+                *heads_per_ngram,
+                map.map(|m| self.tensor(m)),
+                self.tensor(*ngram_ids),
+            ),
             Attention::PleNgramIdsChunked {
                 ids,
                 state,
@@ -769,20 +768,18 @@ attn::ple::ngram_ids(
                 heads_per_ngram,
                 map,
                 ngram_ids,
-            } => {
-attn::ple::ngram_ids_chunked(
-                    self.ctx(),
-                    self.ragged(*ids),
-                    &self.recurrent(*state),
-                    *eos,
-                    mults,
-                    primes,
-                    offsets,
-                    *heads_per_ngram,
-                    map.map(|m| self.tensor(m)),
-                    self.tensor(*ngram_ids),
-                )
-            }
+            } => attn::ple::ngram_ids_chunked(
+                self.ctx(),
+                self.ragged(*ids),
+                &self.recurrent(*state),
+                *eos,
+                mults,
+                primes,
+                offsets,
+                *heads_per_ngram,
+                map.map(|m| self.tensor(m)),
+                self.tensor(*ngram_ids),
+            ),
 
             Attention::SsmCausalConv1d {
                 x,
@@ -1348,7 +1345,8 @@ attn::ple::ngram_ids_chunked(
                 *sm_scale,
                 self.tensor(*o),
                 self.tensor(*lse),
-            ),            Attention::BlockDynConv {
+            ),
+            Attention::BlockDynConv {
                 x,
                 coeff,
                 base,
@@ -1396,7 +1394,11 @@ attn::ple::ngram_ids_chunked(
 
 impl Run<'_> {
     /// `t`'s first rows, as many as `like` has, when it has more.
-    pub(crate) fn first_rows(&self, t: kernels_xla::Tensor, like: model_ir::ValueId) -> kernels_xla::Tensor {
+    pub(crate) fn first_rows(
+        &self,
+        t: kernels_xla::Tensor,
+        like: model_ir::ValueId,
+    ) -> kernels_xla::Tensor {
         let rows = self.tensor(like).rows;
         if t.rows > rows {
             self.handles().cut(t, 0, rows)

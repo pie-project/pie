@@ -11,8 +11,8 @@
 use dtype::Dtype;
 
 use super::ssm::{
-    Committed, Lanes, clamp_i, cmp_i, committed_lanes, count_le, csr_lanes, decode_lanes,
-    flat_i32, land_rows, nonzero, ragged_lanes, take,
+    Committed, Lanes, clamp_i, cmp_i, committed_lanes, count_le, csr_lanes, decode_lanes, flat_i32,
+    land_rows, nonzero, ragged_lanes, take,
 };
 use crate::cx::Ctx;
 use crate::error::{Error, refuse};
@@ -54,7 +54,10 @@ fn hash<'a>(
     if mults.len() < 2 || mults.len() > MAX_NGRAM {
         return Err(refuse(
             op,
-            format!("{} multipliers do not fit the 2..={MAX_NGRAM}-gram range", mults.len()),
+            format!(
+                "{} multipliers do not fit the 2..={MAX_NGRAM}-gram range",
+                mults.len()
+            ),
         ));
     }
     if primes.len() != offsets.len() || primes.is_empty() || primes.len() > MAX_HEADS {
@@ -67,7 +70,11 @@ fn hash<'a>(
             ),
         ));
     }
-    nonzero(op, "the heads per n-gram this statement states", heads_per_ngram)?;
+    nonzero(
+        op,
+        "the heads per n-gram this statement states",
+        heads_per_ngram,
+    )?;
     if primes.len() != (mults.len() - 1) * heads_per_ngram as usize {
         return Err(refuse(
             op,
@@ -121,7 +128,10 @@ fn planes(
     {
         return Err(refuse(
             op,
-            format!("the id map is {:?}, and the hasher maps through i64", m.dtype),
+            format!(
+                "the id map is {:?}, and the hasher maps through i64",
+                m.dtype
+            ),
         ));
     }
     nonzero(op, "rows", ids.rows)?;
@@ -222,7 +232,10 @@ fn hash_lanes(
         let hpn = h.hpn as i64;
         let mb = f.broadcast(mixed, &[t, hpn], &[0])?;
         let primes: Vec<i64> = h.primes[lo..lo + h.hpn].iter().map(|&x| x as i64).collect();
-        let offsets: Vec<i64> = h.offsets[lo..lo + h.hpn].iter().map(|&x| x as i64).collect();
+        let offsets: Vec<i64> = h.offsets[lo..lo + h.hpn]
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
         let pr = f.const_ints(Elem::I64, &primes, &[hpn])?;
         let pr = f.bitcast(pr, Elem::U64)?;
         let pr = f.broadcast(pr, &[t, hpn], &[1])?;
@@ -456,10 +469,16 @@ pub fn selector_walk(
 ) -> Result<(), Error> {
     const OP: &str = "attention.selector_walk";
     if first > 1 {
-        return Err(refuse(OP, "a span's anchor is row 0 and its first mask row 1"));
+        return Err(refuse(
+            OP,
+            "a span's anchor is row 0 and its first mask row 1",
+        ));
     }
     if cand.data.dtype != Dtype::I32 || tokens.dtype != Dtype::I32 || picks.dtype != Dtype::I32 {
-        return Err(refuse(OP, "the candidates, the tokens and the picks are i32"));
+        return Err(refuse(
+            OP,
+            "the candidates, the tokens and the picks are i32",
+        ));
     }
     if unary.dtype != Dtype::F32 {
         return Err(refuse(OP, "the unary logits are f32"));
@@ -468,7 +487,10 @@ pub fn selector_walk(
     let k = nonzero(OP, "candidates a slot", cand.data.width)?;
     let rank = nonzero(OP, "the codebooks' rank", pred.width)?;
     if succ.width != rank || hp.is_some_and(|h| h.width != rank) || pred.rows != succ.rows {
-        return Err(refuse(OP, "the codebooks and the projected hidden disagree on rank or vocabulary"));
+        return Err(refuse(
+            OP,
+            "the codebooks and the projected hidden disagree on rank or vocabulary",
+        ));
     }
     let vocab = nonzero(OP, "the codebooks' vocabulary", pred.rows)?;
     let rows = cand.data.rows;
@@ -478,7 +500,10 @@ pub fn selector_walk(
         || tokens.rows != rows
         || hp.is_some_and(|h| h.rows != rows)
     {
-        return Err(refuse(OP, "unary, hp, tokens and picks carry one row per candidate row"));
+        return Err(refuse(
+            OP,
+            "unary, hp, tokens and picks carry one row per candidate row",
+        ));
     }
     let (t, kk, rk, v, first) = (
         i64::from(rows),

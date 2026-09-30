@@ -336,8 +336,17 @@ fn ragged(b: &mut Bench, runs: &[(i32, i32, i32)], data: Tensor) -> RaggedTensor
 
 #[test]
 fn prefill_walks_row_blocks_and_per_row_alike() {
+    prefill_alike(4, 2, 32, 300);
+}
+
+/// Wide kv heads walk head by head; 620 rows span two row blocks.
+#[test]
+fn a_wide_headed_prefill_walks_each_kv_head_alone() {
+    prefill_alike(8, 2, 128, 620);
+}
+
+fn prefill_alike(qh: usize, kvh: usize, d: usize, n0: i32) {
     let mut rng = Rng(11);
-    let (qh, kvh, d) = (4, 2, 32);
     let lane0: Vec<i32> = (0..45).map(|i| (i * 7 + 3) % 50).collect();
     let pool = Pool::new(
         &mut rng,
@@ -348,7 +357,7 @@ fn prefill_walks_row_blocks_and_per_row_alike() {
         vec![lane0, vec![50, 45], vec![46, 51, 47]],
         45,
     );
-    let runs = [(0, 420, 300), (1, 20, 5), (2, 33, 1)];
+    let runs = [(0, 720 - n0, n0), (1, 20, 5), (2, 33, 1)];
     let fire = Fire::plain(&prefill_rows(&runs, 2));
     let rows = fire.positions.len();
     let q = rng.bf16s(rows * qh * d, 1.0);
@@ -458,11 +467,7 @@ fn long_decode_in(qh: usize, kvh: usize, d: usize, window: Option<u32>) {
     // 64 lanes over 90 pages; lane l holds 1 + (l * 37) % 80 pages of a
     // shared pool (lanes may share pages, as prefix sharing does).
     let lanes: Vec<Vec<i32>> = (0..64)
-        .map(|l| {
-            (0..1 + (l * 37) % 80)
-                .map(|p| ((p * 13 + l) % 90) as i32)
-                .collect()
-        })
+        .map(|l| (0..1 + (l * 37) % 80).map(|p| (p * 13 + l) % 90).collect())
         .collect();
     let pool = Pool::new(&mut rng, ps, kvh, d, 90, lanes, 80);
     let rows: Vec<(i32, i32)> = (0..64)

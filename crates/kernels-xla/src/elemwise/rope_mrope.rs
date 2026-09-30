@@ -32,7 +32,9 @@ fn validate(
     if rotary_dim == 0 || rotary_dim > head_dim || !rotary_dim.is_multiple_of(2) {
         return Err(refuse(
             OP,
-            format!("the rotated prefix {rotary_dim} is not a whole number of pairs within the {head_dim}-wide head"),
+            format!(
+                "the rotated prefix {rotary_dim} is not a whole number of pairs within the {head_dim}-wide head"
+            ),
         ));
     }
     heads(OP, q.width, head_dim)?;
@@ -41,7 +43,10 @@ fn validate(
     if stated > head_dim / 2 {
         return Err(refuse(
             OP,
-            format!("the sections {sections:?} name {stated} pairs and a {head_dim}-wide head has {}", head_dim / 2),
+            format!(
+                "the sections {sections:?} name {stated} pairs and a {head_dim}-wide head has {}",
+                head_dim / 2
+            ),
         ));
     }
     Ok(())
@@ -50,7 +55,10 @@ fn validate(
 fn blocked_pairs(sections: [u32; AXES as usize], rotary_dim: u32) -> Result<u32, Error> {
     let total: u32 = sections.iter().sum();
     if total == 0 {
-        return Err(refuse(OP, format!("the sections {sections:?} name no frequency pair")));
+        return Err(refuse(
+            OP,
+            format!("the sections {sections:?} name no frequency pair"),
+        ));
     }
     Ok((rotary_dim / 2).min(total))
 }

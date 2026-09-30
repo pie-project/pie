@@ -436,6 +436,28 @@ impl Windows {
         &self.windows
     }
 
+    /// What of the windows a traced program depends on when no window's
+    /// lane offsets reach the text (no recurrent-state map): the spans and
+    /// passes, not each lane's row offsets.
+    #[must_use]
+    pub fn shape(&self) -> String {
+        let spans: Vec<_> = self
+            .windows
+            .iter()
+            .map(|w| {
+                (
+                    w.span,
+                    w.pass,
+                    w.passes,
+                    w.gathered.is_some(),
+                    w.patch,
+                    w.voxel,
+                )
+            })
+            .collect();
+        format!("{spans:?}|{:?}|{:?}", self.runs, self.of_region)
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.windows.is_empty()

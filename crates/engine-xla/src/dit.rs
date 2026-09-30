@@ -13,7 +13,9 @@ use engine::fire::{PortKind, ReadoutSeam};
 use kernels_xla::{Emit, Tensor};
 use model_compiler::{CompiledModel, VoxelLadder};
 use model_exec::fire::{Composition, LaneFacts, LaneRow};
-use model_ir::{ClassSet, Def, Dtype, GeomKind, Operands, RuntimeInput, Selection, Trace, Ty, ValueId};
+use model_ir::{
+    ClassSet, Def, Dtype, GeomKind, Operands, RuntimeInput, Selection, Trace, Ty, ValueId,
+};
 
 use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
@@ -624,14 +626,11 @@ impl Dit {
                 }
             }
             for (seat, plane) in &mut planes {
-                let reads = self
-                    .ports
-                    .iter()
-                    .any(|(have, readers)| {
-                        have.kind == seat.kind
-                            && have.port == seat.port
-                            && readers.contains(row.class as usize)
-                    });
+                let reads = self.ports.iter().any(|(have, readers)| {
+                    have.kind == seat.kind
+                        && have.port == seat.port
+                        && readers.contains(row.class as usize)
+                });
                 if !reads {
                     continue;
                 }
@@ -737,8 +736,7 @@ impl Dit {
                     continue;
                 };
                 let cells = row.rows as usize * taps;
-                if sc.taps as usize != taps || sc.rows.len() != cells || sc.weights.len() != cells
-                {
+                if sc.taps as usize != taps || sc.rows.len() != cells || sc.weights.len() != cells {
                     return Err(program(format!(
                         "lane {} states self-conditioning taps of width {} over {} ids, and \
                          this plan reads {taps} taps over the lane's {} rows",
@@ -1002,8 +1000,12 @@ impl Dit {
             for (c, [t, h, w]) in shot.clips.iter().enumerate() {
                 let clip = row.clip_offset as usize + c;
                 slots[clip] = feed.slot as i32;
-                grid[clip * 4..clip * 4 + 4]
-                    .copy_from_slice(&[*t as i32, *h as i32, *w as i32, voxel_row as i32]);
+                grid[clip * 4..clip * 4 + 4].copy_from_slice(&[
+                    *t as i32,
+                    *h as i32,
+                    *w as i32,
+                    voxel_row as i32,
+                ]);
                 voxel_row += i64::from(*t) * i64::from(*h) * i64::from(*w);
                 if let Some(p) = seat.token_patch {
                     if p.contains(&0) || t % p[0] != 0 || h % p[1] != 0 || w % p[2] != 0 {
@@ -1092,7 +1094,9 @@ pub fn land(
             ),
         })?;
         let at = handles.cut(whole, land.first, land.rows);
-        let from = land.port.map(|port| handles.cut(port, land.first, land.rows));
+        let from = land
+            .port
+            .map(|port| handles.cut(port, land.first, land.rows));
         ctx.emit(&mut |cx| {
             let v = match from {
                 Some(port) => cx.read(port)?,
@@ -1103,7 +1107,12 @@ pub fn land(
             };
             cx.write(at, v)
         })
-        .map_err(|why| program(format!("landing merge {} over a port: {why:?}", land.merge.0)))?;
+        .map_err(|why| {
+            program(format!(
+                "landing merge {} over a port: {why:?}",
+                land.merge.0
+            ))
+        })?;
     }
     Ok(())
 }
@@ -1118,8 +1127,10 @@ pub fn pixels_of(
     real: usize,
 ) -> Vec<Pixels> {
     let grid: Vec<i32> = grid
-        .chunks_exact(4)
-        .map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| i32::from_le_bytes(*w))
         .collect();
     let row_bytes = plane_width * 4;
     let mut out: Vec<Pixels> = vec![(Vec::new(), Vec::new()); real];
@@ -1138,8 +1149,10 @@ pub fn pixels_of(
             let to = (from + voxels * row_bytes).min(plane.len());
             values.extend(
                 plane[from..to]
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c)),
             );
         }
         out[lane] = (values, boxes);

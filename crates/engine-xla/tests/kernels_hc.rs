@@ -7,7 +7,9 @@ use kernels_xla::elemwise::hc;
 fn data(n: usize, seed: u32) -> Vec<f32> {
     (0..n)
         .map(|i| {
-            let h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(40503));
+            let h = (i as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(seed.wrapping_mul(40503));
             round_bf16(((h >> 8) % 2000) as f32 / 1000.0 - 1.0)
         })
         .collect()
@@ -27,7 +29,10 @@ fn expand_mix_inject_and_ple_gate_answer_the_host() {
     let gates = data(ROWS * M * H, 2);
     let normed = data(ROWS * M * H, 3);
     let o = data(ROWS * H, 4);
-    let glog: Vec<f32> = data(ROWS * M, 5).iter().map(|v| round_bf16(v * 3.0)).collect();
+    let glog: Vec<f32> = data(ROWS * M, 5)
+        .iter()
+        .map(|v| round_bf16(v * 3.0))
+        .collect();
     let hyper = data(ROWS * M * H, 6);
     let key = data(ROWS * M * H, 7);
     let query: Vec<f32> = data(ROWS * M * H, 8);
@@ -63,9 +68,16 @@ fn expand_mix_inject_and_ple_gate_answer_the_host() {
         for s in 0..M {
             let g = 2.0 * sigmoid(glog[n * M + s] / M as f32);
             let at = (n * M + s) * H;
-            let dot: f32 = (0..H).map(|i| key[at + i] * query[at + i]).sum::<f32>() / (H as f32).sqrt();
+            let dot: f32 =
+                (0..H).map(|i| key[at + i] * query[at + i]).sum::<f32>() / (H as f32).sqrt();
             let mag = dot.abs().max(1e-6).sqrt();
-            let damped = if dot > 0.0 { mag } else if dot < 0.0 { -mag } else { 0.0 };
+            let damped = if dot > 0.0 {
+                mag
+            } else if dot < 0.0 {
+                -mag
+            } else {
+                0.0
+            };
             let pgate = sigmoid(damped);
             for k in 0..H {
                 w_ex[at + k] = x[n * H + k];
@@ -151,7 +163,9 @@ fn the_mhc_chain_norms_projects_gates_folds_and_collapses() {
         .run(|ctx| {
             hc::rmsnorm_f32(ctx, st, 1e-6, normed)?;
             hc::project(ctx, normed, fw, M as u32, mixes)?;
-            hc::gates(ctx, mixes, st, sc, bs, M as u32, gate_eps, alpha, iters, li, post, comb)?;
+            hc::gates(
+                ctx, mixes, st, sc, bs, M as u32, gate_eps, alpha, iters, li, post, comb,
+            )?;
             hc::fold(ctx, xt, st, post, comb, folded)?;
             hc::project(ctx, normed, fc, M as u32, cm)?;
             hc::collapse(ctx, cm, st, sc, bs, M as u32, gate_eps, col)
@@ -187,11 +201,15 @@ fn the_mhc_chain_norms_projects_gates_folds_and_collapses() {
         // Gates read the device's mixes, so this test checks each stage on
         // its own inputs.
         let mix = &got_mixes[n * mix_hc..(n + 1) * mix_hc];
-        let pre: Vec<f32> = (0..M).map(|i| sigmoid(mix[i] * scale[0] + base[i]) + gate_eps).collect();
+        let pre: Vec<f32> = (0..M)
+            .map(|i| sigmoid(mix[i] * scale[0] + base[i]) + gate_eps)
+            .collect();
         for i in 0..M {
             w_post[n * M + i] = sigmoid(mix[M + i] * scale[1] + base[M + i]) * alpha;
         }
-        let logits: Vec<f32> = (0..M * M).map(|t| mix[2 * M + t] * scale[2] + base[2 * M + t]).collect();
+        let logits: Vec<f32> = (0..M * M)
+            .map(|t| mix[2 * M + t] * scale[2] + base[2 * M + t])
+            .collect();
         let c = sinkhorn(&logits, M, iters, gate_eps);
         w_comb[n * M * M..(n + 1) * M * M].copy_from_slice(&c);
         let dpost = &got_post[n * M..(n + 1) * M];
@@ -207,7 +225,9 @@ fn the_mhc_chain_norms_projects_gates_folds_and_collapses() {
             }
         }
         let cmd = &b.read_f32(cm)[n * M..(n + 1) * M];
-        let g: Vec<f32> = (0..M).map(|i| sigmoid(cmd[i] * scale[0] + base[i]) + gate_eps).collect();
+        let g: Vec<f32> = (0..M)
+            .map(|i| sigmoid(cmd[i] * scale[0] + base[i]) + gate_eps)
+            .collect();
         for k in 0..H {
             w_col[n * H + k] = round_bf16((0..M).map(|i| g[i] * row[i * H + k]).sum());
         }

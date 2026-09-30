@@ -16,7 +16,9 @@ fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
     if hidden == 0 || wide == 0 || !wide.is_multiple_of(hidden) {
         return Err(refuse(
             op,
-            format!("the {wide}-wide row is not a whole number of {hidden}-wide hyper-connection streams"),
+            format!(
+                "the {wide}-wide row is not a whole number of {hidden}-wide hyper-connection streams"
+            ),
         ));
     }
     let fan = wide / hidden;
@@ -42,7 +44,10 @@ fn stated_fan(op: &'static str, fan: u32, streams: u32) -> Result<(), Error> {
 /// A `[rows, M·H]` handle read as f32 `[rows, M, H]`.
 fn streams3(cx: &mut Cx<'_>, t: Tensor, m: u32) -> Result<Val, Error> {
     let v = cx.read_f32(t)?;
-    Ok(cx.reshape(v, &[i64::from(t.rows), i64::from(m), i64::from(t.width / m)])?)
+    Ok(cx.reshape(
+        v,
+        &[i64::from(t.rows), i64::from(m), i64::from(t.width / m)],
+    )?)
 }
 
 /// A flat f32 plane's first `n` values as `[n]`.
@@ -96,7 +101,10 @@ pub fn project(
     if hc_fn.width != normed.width || normed.width == 0 {
         return Err(refuse(
             OP,
-            format!("the dynamic plane contracts {} and the stream row is {} wide", hc_fn.width, normed.width),
+            format!(
+                "the dynamic plane contracts {} and the stream row is {} wide",
+                hc_fn.width, normed.width
+            ),
         ));
     }
     if stream_count == 0 || stream_count > MAX_HC_MULT {
@@ -104,7 +112,10 @@ pub fn project(
     }
     let mix_hc = hc_fn.rows;
     let layer_row = 2 * stream_count + stream_count * stream_count;
-    if mixes.width != mix_hc || (mix_hc != layer_row && mix_hc != stream_count) || mixes.rows != normed.rows {
+    if mixes.width != mix_hc
+        || (mix_hc != layer_row && mix_hc != stream_count)
+        || mixes.rows != normed.rows
+    {
         return Err(refuse(
             OP,
             format!(
@@ -258,7 +269,10 @@ pub fn collapse(
     if mixes.width != fan || mixes.rows != y.rows || base.elements() < u64::from(fan) {
         return Err(refuse(
             OP,
-            format!("the collapse folds {fan} streams under a {}-wide mix row", mixes.width),
+            format!(
+                "the collapse folds {fan} streams under a {}-wide mix row",
+                mixes.width
+            ),
         ));
     }
     let (rows, m, h) = (i64::from(y.rows), i64::from(fan), i64::from(y.width));
@@ -282,13 +296,22 @@ pub fn collapse(
 }
 
 /// `y[n, h] = (1/M) Σ_s normed[n, s, h] · σ(gates[n, s, h])`.
-pub fn mix(ctx: &Ctx<'_>, gates: Tensor, normed: Tensor, streams: u32, y: Tensor) -> Result<(), Error> {
+pub fn mix(
+    ctx: &Ctx<'_>,
+    gates: Tensor,
+    normed: Tensor,
+    streams: u32,
+    y: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_mix";
     expect(OP, y, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, normed.width, y.width)?;
     stated_fan(OP, fan, streams)?;
     if gates.width != normed.width || gates.rows != normed.rows || y.rows != normed.rows {
-        return Err(refuse(OP, "the gates ride the normed rectangle element for element"));
+        return Err(refuse(
+            OP,
+            "the gates ride the normed rectangle element for element",
+        ));
     }
     ctx.emit(&mut |cx| {
         let g = streams3(cx, gates, fan)?;
@@ -302,13 +325,22 @@ pub fn mix(ctx: &Ctx<'_>, gates: Tensor, normed: Tensor, streams: u32, y: Tensor
 }
 
 /// `hyper[n, s, h] += 2σ(gates[n, s] / M) · o[n, h]`.
-pub fn inject(ctx: &Ctx<'_>, o: Tensor, gates: Tensor, streams: u32, hyper: Tensor) -> Result<(), Error> {
+pub fn inject(
+    ctx: &Ctx<'_>,
+    o: Tensor,
+    gates: Tensor,
+    streams: u32,
+    hyper: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_inject";
     expect(OP, hyper, &[Dtype::Bf16])?;
     let fan = stream_fan(OP, hyper.width, o.width)?;
     stated_fan(OP, fan, streams)?;
     if gates.width != fan || o.rows != hyper.rows {
-        return Err(refuse(OP, "one gate logit per stream, one output row per wide row"));
+        return Err(refuse(
+            OP,
+            "one gate logit per stream, one output row per wide row",
+        ));
     }
     let (rows, m, h) = (i64::from(hyper.rows), i64::from(fan), i64::from(o.width));
     ctx.emit(&mut |cx| {
@@ -342,7 +374,10 @@ pub fn ple_gate(
     let fan = stream_fan(OP, y.width, value.width)?;
     stated_fan(OP, fan, streams)?;
     if key.width != y.width || query.width != y.width {
-        return Err(refuse(OP, "the key and query ride the stream row they gate"));
+        return Err(refuse(
+            OP,
+            "the key and query ride the stream row they gate",
+        ));
     }
     let (rows, m, h) = (i64::from(y.rows), i64::from(fan), i64::from(value.width));
     ctx.emit(&mut |cx| {

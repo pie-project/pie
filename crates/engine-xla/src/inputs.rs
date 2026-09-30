@@ -42,7 +42,14 @@ impl Inputs {
         Self::default()
     }
 
-    fn push(&mut self, handles: &Handles, dtype: Dtype, rows: u32, width: u32, bytes: Vec<u8>) -> Tensor {
+    fn push(
+        &mut self,
+        handles: &Handles,
+        dtype: Dtype,
+        rows: u32,
+        width: u32,
+        bytes: Vec<u8>,
+    ) -> Tensor {
         let input = self.arrays.len() as u32;
         self.arrays.push(Array {
             dtype,
@@ -104,8 +111,10 @@ impl Inputs {
             pack.push(0);
         }
         let bytes: Vec<u8> = pack.iter().flat_map(|x| x.to_le_bytes()).collect();
-        // TMP-PF: dump the pack and arrays for offline profiling.
-        if let Some(pre) = std::env::var_os("PF_DUMP_PACK") {
+        // `PIE_XLA_DUMP_PACK=<prefix>`: the pack (`<prefix>.i32`) and each
+        // input array (`<prefix>.in<n>`) of the latest fire, for replaying a
+        // `PIE_XLA_DUMP` program offline on real inputs.
+        if let Some(pre) = std::env::var_os("PIE_XLA_DUMP_PACK") {
             let pre = pre.to_string_lossy().to_string();
             let _ = std::fs::write(format!("{pre}.i32"), &bytes);
             for (i, a) in self.arrays.iter().enumerate() {
@@ -154,7 +163,14 @@ impl Inputs {
     }
 
     /// Raw rows of `dtype`.
-    pub fn raw(&mut self, handles: &Handles, dtype: Dtype, rows: u32, width: u32, bytes: Vec<u8>) -> Tensor {
+    pub fn raw(
+        &mut self,
+        handles: &Handles,
+        dtype: Dtype,
+        rows: u32,
+        width: u32,
+        bytes: Vec<u8>,
+    ) -> Tensor {
         self.push(handles, dtype, rows, width, bytes)
     }
 

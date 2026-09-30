@@ -21,10 +21,10 @@
 
 use dtype::Dtype;
 use engine_xla::bench::Bench;
+use kernels_xla::RecurrentPool;
 use kernels_xla::Tensor;
 use kernels_xla::attn::ssm;
 use kernels_xla::hlo::{Combine, Elem, Fold, Func, GatherDims, ScatterDims, Val};
-use kernels_xla::RecurrentPool;
 
 fn width() -> Option<u32> {
     std::env::var("PIE_XLA_BENCH").ok()?;
@@ -257,7 +257,14 @@ fn fused(f: &mut Func, how: Fused, slab: Val, slots: Val, qkv: Val, gates: Val) 
             while lo < r {
                 let hi = (lo + c).min(r);
                 let cut = |f: &mut Func, x: Val| f.slice_axis(x, 0, lo, hi).unwrap();
-                let (sl, qc, kc, vc, gc, bc) = (cut(f, slots), cut(f, q), cut(f, k), cut(f, v), cut(f, g), cut(f, beta));
+                let (sl, qc, kc, vc, gc, bc) = (
+                    cut(f, slots),
+                    cut(f, q),
+                    cut(f, k),
+                    cut(f, v),
+                    cut(f, g),
+                    cut(f, beta),
+                );
                 let s = gather_tiles(f, slab, sl);
                 let s = f.reshape(s, &[hi - lo, H, D, D]).unwrap();
                 let (y, s2) = if io {
@@ -356,7 +363,8 @@ fn fused(f: &mut Func, how: Fused, slab: Val, slots: Val, qkv: Val, gates: Val) 
                 })
                 .unwrap()[0]
             } else {
-                f.for_loop(r, &[s3], |f, i, c| Ok(vec![lane_update(f, c[0], i)?])).unwrap()[0]
+                f.for_loop(r, &[s3], |f, i, c| Ok(vec![lane_update(f, c[0], i)?]))
+                    .unwrap()[0]
             };
             let slab = f.reshape(out, &[n * H * D, D]).unwrap();
             (y, slab)
@@ -377,6 +385,7 @@ enum Math {
 }
 
 /// One token over `s` `[R, H, dv, dk]`: returns `(y [R, H, dv], s')`.
+#[allow(clippy::too_many_arguments)]
 fn step(f: &mut Func, math: Math, s: Val, q: Val, k: Val, v: Val, g: Val, beta: Val) -> (Val, Val) {
     let d = f.dims(s).to_vec();
     let r = d[0];
@@ -416,7 +425,16 @@ fn step(f: &mut Func, math: Math, s: Val, q: Val, k: Val, v: Val, g: Val, beta: 
                 let aq = f.reshape(aq, &[r, H, 1, D]).unwrap();
                 let x = f.concat(&[ak, aq], 2).unwrap();
                 let m = f
-                    .dot_general_at(s, x, &[0, 1], &[0, 1], &[3], &[3], Elem::F32, math == Math::Dot)
+                    .dot_general_at(
+                        s,
+                        x,
+                        &[0, 1],
+                        &[0, 1],
+                        &[3],
+                        &[3],
+                        Elem::F32,
+                        math == Math::Dot,
+                    )
                     .unwrap();
                 let mem = f.slice_axis(m, 3, 0, 1).unwrap();
                 let mem = f.reshape(mem, &[r, H, D]).unwrap();
@@ -474,11 +492,18 @@ fn gated_delta_decode_variants() {
         ssm::gated_delta(ctx, fr.qkv, z, fr.gates, &st, 16, 16, 128, 128, fr.y)
     };
     report("gated_delta (copied slab)", b.time(20, entry).unwrap());
-    report("gated_delta (donated)", b.time_in_place(50, &[bank], entry).unwrap());
+    report(
+        "gated_delta (donated)",
+        b.time_in_place(50, &[bank], entry).unwrap(),
+    );
 
     // The same slab as [(slots) * H * dv, dk]: every slot is whole tiles.
     let m = pool_slots(n) + 1;
-    let tiled = b.f32(m * (H * D) as u32, D as u32, &vec![0.0; (m * stride) as usize]);
+    let tiled = b.f32(
+        m * (H * D) as u32,
+        D as u32,
+        &vec![0.0; (m * stride) as usize],
+    );
     let st2 = pool(tiled, fr.slots);
     let entry2 = |ctx: &kernels_xla::Ctx<'_>| {
         ssm::gated_delta(ctx, fr.qkv, z, fr.gates, &st2, 16, 16, 128, 128, fr.y)
@@ -505,7 +530,11 @@ fn gated_delta_decode_variants() {
     );
     for unique in [false, true] {
         report(
-            if unique { "io tiled unique (donated)" } else { "io tiled (donated)" },
+            if unique {
+                "io tiled unique (donated)"
+            } else {
+                "io tiled (donated)"
+            },
             dev(&mut b, &[tiled], |ctx| {
                 ctx.emit(&mut |cx| {
                     let s = cx.read(tiled)?;
@@ -578,8 +607,16 @@ fn state_block_pieces() {
     let mut b = Bench::new();
     let fr = fire(&mut b, n);
     let m = pool_slots(n) + 1;
-    let tiled = b.f32(m * (H * D) as u32, D as u32, &vec![0.0; (m * stride) as usize]);
-    let rows = b.f32(n * (H * D) as u32, D as u32, &vec![0.5; (n * stride) as usize]);
+    let tiled = b.f32(
+        m * (H * D) as u32,
+        D as u32,
+        &vec![0.0; (m * stride) as usize],
+    );
+    let rows = b.f32(
+        n * (H * D) as u32,
+        D as u32,
+        &vec![0.5; (n * stride) as usize],
+    );
     let small = b.zeros(Dtype::F32, n, (H * D) as u32);
     report(
         "empty (tiny add)",
@@ -735,13 +772,20 @@ fn decode_entries() {
             continue;
         }
         let bank = if blocked {
-            b.f32(m * (H * D) as u32, D as u32, &vec![0.0; (m * stride) as usize])
+            b.f32(
+                m * (H * D) as u32,
+                D as u32,
+                &vec![0.0; (m * stride) as usize],
+            )
         } else {
             b.f32(m, stride, &vec![0.0; (m * stride) as usize])
         };
         let st = pool(bank, fr.slots);
         report(
-            &format!("gated_delta {}", if blocked { "blocked" } else { "row/slot" }),
+            &format!(
+                "gated_delta {}",
+                if blocked { "blocked" } else { "row/slot" }
+            ),
             dev(&mut b, &[bank], |ctx| {
                 ssm::gated_delta(ctx, fr.qkv, z, fr.gates, &st, 16, 16, 128, 128, fr.y)
             }),
@@ -792,8 +836,13 @@ fn decode_entries() {
         };
         let st = pool(bank, fr.slots);
         report(
-            &format!("causal_conv1d {}", if blocked { "blocked" } else { "row/slot" }),
-            dev(&mut b, &[bank], |ctx| ssm::causal_conv1d(ctx, x, w, &st, 4, 1, cy)),
+            &format!(
+                "causal_conv1d {}",
+                if blocked { "blocked" } else { "row/slot" }
+            ),
+            dev(&mut b, &[bank], |ctx| {
+                ssm::causal_conv1d(ctx, x, w, &st, 4, 1, cy)
+            }),
         );
     }
 }

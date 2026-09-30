@@ -14,7 +14,10 @@ struct Rng(u64);
 
 impl Rng {
     fn next(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }
     fn bf16s(&mut self, n: usize, scale: f32) -> Vec<f32> {
@@ -63,7 +66,10 @@ fn boundaries_mark_the_rows_that_close_a_block() {
                 if prefill {
                     pool::boundary_prefill(
                         ctx,
-                        RaggedTensor { data: p, indptr: ip },
+                        RaggedTensor {
+                            data: p,
+                            indptr: ip,
+                        },
                         r,
                         v,
                         ratio,
@@ -80,9 +86,15 @@ fn boundaries_mark_the_rows_that_close_a_block() {
             return;
         }
         let r4 = ratio as i32;
-        let is_b: Vec<bool> = (0..7).map(|t| valid[t] != 0 && (positions[t] + 1) % r4 == 0).collect();
-        let want_p: Vec<i32> = (0..7).map(|t| if is_b[t] { positions[t] } else { -1 }).collect();
-        let want_o: Vec<i32> = (0..7).map(|t| if is_b[t] { positions[t] / r4 * r4 } else { 0 }).collect();
+        let is_b: Vec<bool> = (0..7)
+            .map(|t| valid[t] != 0 && (positions[t] + 1) % r4 == 0)
+            .collect();
+        let want_p: Vec<i32> = (0..7)
+            .map(|t| if is_b[t] { positions[t] } else { -1 })
+            .collect();
+        let want_o: Vec<i32> = (0..7)
+            .map(|t| if is_b[t] { positions[t] / r4 * r4 } else { 0 })
+            .collect();
         assert_eq!(b.read_i32(bp), want_p);
         assert_eq!(b.read_i32(br), reqs.to_vec());
         assert_eq!(b.read_i32(bo), want_o);
@@ -187,7 +199,10 @@ fn the_compressor_files_its_state_and_pools_each_block() {
                     terms.iter().map(|t| (t.0 - m).exp() * t.1).sum::<f32>() / z
                 };
                 let g = got[r * hd + d];
-                assert!((g - want).abs() <= 1e-2 + 1e-2 * want.abs(), "ratio {ratio} row {r} lane {d}: {g} vs {want}");
+                assert!(
+                    (g - want).abs() <= 1e-2 + 1e-2 * want.abs(),
+                    "ratio {ratio} row {r} lane {d}: {g} vs {want}"
+                );
             }
         }
     }
@@ -209,7 +224,10 @@ fn pooled_readers_attend_over_closed_blocks() {
     let keys = b.bf16(CELLS as u32, hd as u32, &keys0);
     let wp = b.u32(4, 1, &[0; 4]);
     let pages = kv_pool(&mut b, keys);
-    if !b.run(|ctx| pool::kv_append(ctx, et, bp, br, &pages, wp, wp)).unwrap() {
+    if !b
+        .run(|ctx| pool::kv_append(ctx, et, bp, br, &pages, wp, wp))
+        .unwrap()
+    {
         return;
     }
     let mut want = keys0.clone();
@@ -242,12 +260,33 @@ fn pooled_readers_attend_over_closed_blocks() {
         b.run(|ctx| {
             if selected {
                 pool::attention_lse_selected(
-                    ctx, qt, pt, rt, st, &pages, ratio as u32, top_k as u32, heads as u32,
-                    hd as u32, scale, o, lse,
+                    ctx,
+                    qt,
+                    pt,
+                    rt,
+                    st,
+                    &pages,
+                    ratio as u32,
+                    top_k as u32,
+                    heads as u32,
+                    hd as u32,
+                    scale,
+                    o,
+                    lse,
                 )
             } else {
                 pool::attention_lse(
-                    ctx, qt, pt, rt, &pages, ratio as u32, heads as u32, hd as u32, scale, o, lse,
+                    ctx,
+                    qt,
+                    pt,
+                    rt,
+                    &pages,
+                    ratio as u32,
+                    heads as u32,
+                    hd as u32,
+                    scale,
+                    o,
+                    lse,
                 )
             }
         })
@@ -286,7 +325,13 @@ fn pooled_readers_attend_over_closed_blocks() {
                 let m = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let z: f32 = s.iter().map(|v| (v - m).exp()).sum();
                 let want: Vec<f32> = (0..hd)
-                    .map(|d| s.iter().zip(&ks).map(|(v, k)| (v - m).exp() * k[d]).sum::<f32>() / z)
+                    .map(|d| {
+                        s.iter()
+                            .zip(&ks)
+                            .map(|(v, k)| (v - m).exp() * k[d])
+                            .sum::<f32>()
+                            / z
+                    })
                     .collect();
                 assert_close(&go[at..at + hd], &want, 1e-2, 1e-2);
                 let lw = (z.ln() + m) * std::f32::consts::LOG2_E;

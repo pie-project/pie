@@ -28,7 +28,11 @@ pub enum Source {
     /// param (0 codes/dense, 1 scales, 2 biases). A `transposed` plane
     /// landed as `[width, rows]` (a gemm weight, its output axis minor: the
     /// MXU streams it at full bandwidth) and reads as `[rows, width]`.
-    Weight { param: u32, plane: u8, transposed: bool },
+    Weight {
+        param: u32,
+        plane: u8,
+        transposed: bool,
+    },
     /// A pool plane, persistent across fires and updated in place.
     Pool { row: u32, plane: u8 },
     /// A per-fire input the shell uploads; `input` indexes the fire's inputs.
@@ -115,7 +119,6 @@ pub fn packed_row_bytes(dtype: Dtype, width: u64) -> Option<u64> {
 struct Binding {
     root: u32,
     row_offset: u32,
-    rows: u32,
 }
 
 /// The root and handle tables. Roots and handles minted before [`seal`]
@@ -142,7 +145,6 @@ impl Handles {
         bindings.push(Binding {
             root: at,
             row_offset: 0,
-            rows: root.rows,
         });
         Tensor::new(bindings.len() as u32 - 1, root.rows, root.width, root.dtype)
     }
@@ -159,7 +161,6 @@ impl Handles {
         bindings.push(Binding {
             root: b.root,
             row_offset: b.row_offset + skip,
-            rows,
         });
         Tensor::new(bindings.len() as u32 - 1, rows, t.width, t.dtype)
     }
@@ -351,7 +352,10 @@ fn root_value(
         current.insert(root, v);
         return Ok(v);
     }
-    let v = if let Source::Weight { transposed: true, .. } = r.source {
+    let v = if let Source::Weight {
+        transposed: true, ..
+    } = r.source
+    {
         params.push((root, r.source));
         // A sub-byte codes plane lands with its rows padded to whole
         // 128-lane tiles (`crate::weights::gemm_only`).
@@ -390,14 +394,22 @@ struct Lens<'a> {
 
 impl Env for Lens<'_> {
     fn read(&mut self, f: &mut Func, t: Tensor) -> Result<Val, kernels_xla::Error> {
-        let (root, offset) = self.handles.locate(t.buf).ok_or_else(|| {
-            kernels_xla::Error::Backend {
-                op: "trace",
-                detail: format!("handle {} was never minted", t.buf),
-            }
-        })?;
+        let (root, offset) =
+            self.handles
+                .locate(t.buf)
+                .ok_or_else(|| kernels_xla::Error::Backend {
+                    op: "trace",
+                    detail: format!("handle {} was never minted", t.buf),
+                })?;
         let r = self.handles.root_of(root);
-        let whole = root_value(self.handles, f, self.current, self.params, self.pack_len, root)?;
+        let whole = root_value(
+            self.handles,
+            f,
+            self.current,
+            self.params,
+            self.pack_len,
+            root,
+        )?;
         let whole = reinterpret(f, whole, r, t)?;
         if offset == 0 && t.rows == r.rows {
             return Ok(whole);
@@ -406,12 +418,13 @@ impl Env for Lens<'_> {
     }
 
     fn write(&mut self, f: &mut Func, t: Tensor, v: Val) -> Result<(), kernels_xla::Error> {
-        let (root, offset) = self.handles.locate(t.buf).ok_or_else(|| {
-            kernels_xla::Error::Backend {
-                op: "trace",
-                detail: format!("handle {} was never minted", t.buf),
-            }
-        })?;
+        let (root, offset) =
+            self.handles
+                .locate(t.buf)
+                .ok_or_else(|| kernels_xla::Error::Backend {
+                    op: "trace",
+                    detail: format!("handle {} was never minted", t.buf),
+                })?;
         let r = self.handles.root_of(root);
         if t.width != r.width || t.dtype != r.dtype {
             return Err(kernels_xla::Error::Backend {
@@ -425,7 +438,14 @@ impl Env for Lens<'_> {
         let next = if offset == 0 && t.rows == r.rows {
             v
         } else {
-            let whole = root_value(self.handles, f, self.current, self.params, self.pack_len, root)?;
+            let whole = root_value(
+                self.handles,
+                f,
+                self.current,
+                self.params,
+                self.pack_len,
+                root,
+            )?;
             let at = f.const_i(Elem::I32, i64::from(offset), &[]);
             let zero = f.const_i(Elem::I32, 0, &[]);
             f.dynamic_update_slice(whole, v, &[at, zero])?
@@ -444,7 +464,10 @@ fn reinterpret(f: &mut Func, v: Val, root: Root, t: Tensor) -> Result<Val, kerne
     }
     let want = storage(t.dtype, root.rows, t.width);
     match want {
-        Some(ty) if ty.elements() * i64::from(ty.elem.bits()) == f.ty(v).elements() * i64::from(f.ty(v).elem.bits()) => {
+        Some(ty)
+            if ty.elements() * i64::from(ty.elem.bits())
+                == f.ty(v).elements() * i64::from(f.ty(v).elem.bits()) =>
+        {
             let bytes = f.bitcast(v, Elem::U8)?;
             let flat = f.reshape(bytes, &[f.ty(bytes).elements()])?;
             let per = i64::from(ty.elem.bits() / 8).max(1);

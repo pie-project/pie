@@ -143,8 +143,24 @@ impl ForwardHybrid for DoubleBlock {
         let v = Value::merge(vec![vt, vi]);
         let dims = [HEAD_DIM / 2, HEAD_DIM / 2, 0, 0];
         let thetas = [THETA, THETA, 0.0, 0.0];
-        let q = ops::elemwise::rope_axes(&q, &pos, dims, thetas, RopeForm::Interleaved, HEAD_DIM, HEAD_DIM);
-        let k = ops::elemwise::rope_axes(&k, &pos, dims, thetas, RopeForm::Interleaved, HEAD_DIM, HEAD_DIM);
+        let q = ops::elemwise::rope_axes(
+            &q,
+            &pos,
+            dims,
+            thetas,
+            RopeForm::Interleaved,
+            HEAD_DIM,
+            HEAD_DIM,
+        );
+        let k = ops::elemwise::rope_axes(
+            &k,
+            &pos,
+            dims,
+            thetas,
+            RopeForm::Interleaved,
+            HEAD_DIM,
+            HEAD_DIM,
+        );
         let perm = inputs.row_permutation();
         let indptr = inputs.group_indptr();
         let o = ops::attn::ragged(
@@ -353,7 +369,14 @@ pub fn modulation(weights: &Weights, timestep: f32) -> Vec<f32> {
     let mut row: Vec<f32> = angles.iter().map(|a| a.cos()).collect();
     row.extend(angles.iter().map(|a| a.sin()));
     let emb: Vec<f32> = row.iter().map(|v| v / (1.0 + (-v).exp())).collect();
-    matmul(&emb, 1, FREQ as usize, weights.get("ada"), 2 * WIDTH as usize, false)
+    matmul(
+        &emb,
+        1,
+        FREQ as usize,
+        weights.get("ada"),
+        2 * WIDTH as usize,
+        false,
+    )
 }
 
 pub fn condition(x: &[f32], rows: usize, m: &[f32]) -> Vec<f32> {
@@ -375,11 +398,11 @@ pub fn condition(x: &[f32], rows: usize, m: &[f32]) -> Vec<f32> {
 pub fn rope(x: &mut [f32], rows: usize, positions: &[[f32; 2]]) {
     let hd = HEAD_DIM as usize;
     let block = hd / 2;
-    for r in 0..rows {
-        for axis in 0..2 {
+    for (r, at) in positions.iter().enumerate().take(rows) {
+        for (axis, &pos) in at.iter().enumerate() {
             let base = axis * block;
             for i in 0..block / 2 {
-                let angle = positions[r][axis] * THETA.powf(-2.0 * i as f32 / block as f32);
+                let angle = pos * THETA.powf(-2.0 * i as f32 / block as f32);
                 let (s, c) = angle.sin_cos();
                 let a = x[r * hd + base + 2 * i];
                 let b = x[r * hd + base + 2 * i + 1];
@@ -418,7 +441,11 @@ pub fn reference(weights: &Weights, request: &HostRequest) -> (Vec<f32>, Vec<f32
 
 /// `reference`, with the two streams attending jointly or each only to
 /// itself (an attention class table that keeps text and image apart).
-pub fn reference_with(weights: &Weights, request: &HostRequest, joint: bool) -> (Vec<f32>, Vec<f32>) {
+pub fn reference_with(
+    weights: &Weights,
+    request: &HostRequest,
+    joint: bool,
+) -> (Vec<f32>, Vec<f32>) {
     let w = WIDTH as usize;
     let hd = HEAD_DIM as usize;
     let m = modulation(weights, request.timestep);
@@ -489,7 +516,8 @@ pub fn conv_reference(weights: &Weights, clip: [u32; 3], x: &[f32]) -> Vec<f32> 
                                     let src =
                                         ((st as usize * h + sh as usize) * w + sw as usize) * c_in;
                                     for ic in 0..c_in {
-                                        let at = oc * (c_in * TAPS as usize) + ic * TAPS as usize + tap;
+                                        let at =
+                                            oc * (c_in * TAPS as usize) + ic * TAPS as usize + tap;
                                         acc += bf(x[src + ic]) * plane[at];
                                     }
                                 }
@@ -705,7 +733,9 @@ impl Rig {
             .expect("the channel reads")
             .expect("the channel holds a cell");
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }

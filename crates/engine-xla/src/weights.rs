@@ -571,7 +571,10 @@ pub(crate) fn serves_this_deployment(path: &Path, backend: &str, sku: &str) -> R
 /// lay out K-minor (below). A param read any other way (an embedding
 /// gather, a norm, a routed bank) lands as declared.
 /// `PIE_XLA_WEIGHT_T=0` lands every param as declared.
-fn gemm_only(trace: &Trace, banks: &std::collections::BTreeSet<usize>) -> std::collections::BTreeSet<usize> {
+fn gemm_only(
+    trace: &Trace,
+    banks: &std::collections::BTreeSet<usize>,
+) -> std::collections::BTreeSet<usize> {
     use model_ir::{Def, Linear, Operands, Operation};
     let mut out = std::collections::BTreeSet::new();
     if std::env::var("PIE_XLA_WEIGHT_T").is_ok_and(|v| v == "0") {
@@ -625,8 +628,8 @@ fn gemm_only(trace: &Trace, banks: &std::collections::BTreeSet<usize>) -> std::c
             let k = kernels_xla::pack::codes_per_row(param.dtype, k).unwrap_or(k);
             return kernels_xla::pack::code_bits(param.dtype).is_some_and(|b| b < 8)
                 && param.dtype != Dtype::Mxfp4
-                && k % CODES_TILE == 0
-                && n % CODES_TILE != 0;
+                && k.is_multiple_of(CODES_TILE)
+                && !n.is_multiple_of(CODES_TILE);
         }
         param.dtype == Dtype::Bf16 && param.shape.len() == 2
     });
@@ -649,8 +652,8 @@ fn fold_of(rows: u64, row: u64) -> (u64, u64) {
     let rows = rows.div_ceil(FOLD) * FOLD;
     let folds = || (0..=7).map(|s| 1u64 << s);
     let f = folds()
-        .find(|f| (f * row) % 128 == 0 && (rows / f) % 128 != 0)
-        .or_else(|| folds().find(|f| (f * row) % 128 == 0))
+        .find(|f| (f * row).is_multiple_of(128) && !(rows / f).is_multiple_of(128))
+        .or_else(|| folds().find(|f| (f * row).is_multiple_of(128)))
         .unwrap_or(FOLD);
     (rows / f, f * row)
 }
@@ -717,7 +720,9 @@ fn gather_only(
 fn transpose_2byte(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
     const B: usize = 64;
     let mut dst = vec![0u8; bytes.len()];
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(16);
     // Each thread fills whole output rows (input columns) `c0..c1`.
     let per = cols.div_ceil(threads).div_ceil(B) * B;
     std::thread::scope(|scope| {
@@ -881,13 +886,14 @@ impl TensorSink for Landing<'_> {
                 }
             }
         } else if let Some(&codes_at) = self.scales_of.get(&at) {
-            self.plain(at, bytes).and_then(|()| match self.held.remove(&codes_at) {
-                Some(codes) => self.prescaled(codes_at, &codes, bytes),
-                None => {
-                    self.held.insert(at, bytes.to_vec());
-                    Ok(())
-                }
-            })
+            self.plain(at, bytes)
+                .and_then(|()| match self.held.remove(&codes_at) {
+                    Some(codes) => self.prescaled(codes_at, &codes, bytes),
+                    None => {
+                        self.held.insert(at, bytes.to_vec());
+                        Ok(())
+                    }
+                })
         } else {
             self.plain(at, bytes)
         };
@@ -986,14 +992,19 @@ impl Weights {
         let mut table = Vec::with_capacity(trace.params.len());
         for (at, param) in trace.params.iter().enumerate() {
             if param.source == ParamSource::Registered {
-                let adapters = u32::try_from(param.shape.first().copied().unwrap_or(0)).unwrap_or(0);
+                let adapters =
+                    u32::try_from(param.shape.first().copied().unwrap_or(0)).unwrap_or(0);
                 let (rows, cols) = rectangle(param.shape.get(1..).unwrap_or(&[]));
                 banks.insert(
                     param.name.clone(),
                     AdapterBank {
                         param: at,
                         adapters,
-                        slot: if adapters == 0 { 0 } else { sizes[at] / u64::from(adapters) },
+                        slot: if adapters == 0 {
+                            0
+                        } else {
+                            sizes[at] / u64::from(adapters)
+                        },
                         rows,
                         cols,
                         elem: model_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),

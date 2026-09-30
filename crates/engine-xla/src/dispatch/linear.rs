@@ -21,12 +21,9 @@ impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_xla::Error> {
         match op {
             Linear::Matmul { act, w, y } => match self.banked(*w) {
-                Some(bank) => linear::quant::matmul(
-                    self.ctx(),
-                    self.tensor(*act),
-                    bank,
-                    self.tensor(*y),
-                ),
+                Some(bank) => {
+                    linear::quant::matmul(self.ctx(), self.tensor(*act), bank, self.tensor(*y))
+                }
 
                 None => match self.maybe_stored(*w) {
                     Some(block) => linear::kquant::matmul(
@@ -44,12 +41,9 @@ impl Run<'_> {
                 },
             },
             Linear::LmHead { act, w, y } => match self.banked(*w) {
-                Some(bank) => linear::quant::lm_head(
-                    self.ctx(),
-                    self.tensor(*act),
-                    bank,
-                    self.tensor(*y),
-                ),
+                Some(bank) => {
+                    linear::quant::lm_head(self.ctx(), self.tensor(*act), bank, self.tensor(*y))
+                }
 
                 None => match self.maybe_stored(*w) {
                     Some(block) => linear::kquant::lm_head(

@@ -11,14 +11,19 @@ struct Rng(u64);
 
 impl Rng {
     fn next(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }
     fn bf16s(&mut self, n: usize, scale: f32) -> Vec<f32> {
         (0..n).map(|_| round_bf16(self.next() * scale)).collect()
     }
     fn f32s(&mut self, n: usize, lo: f32, hi: f32) -> Vec<f32> {
-        (0..n).map(|_| lo + (self.next() * 0.5 + 0.5) * (hi - lo)).collect()
+        (0..n)
+            .map(|_| lo + (self.next() * 0.5 + 0.5) * (hi - lo))
+            .collect()
     }
 }
 
@@ -39,6 +44,7 @@ fn pool(state: Tensor, slots: Tensor) -> RecurrentPool {
 
 /// One lane's conv over `xs` (`n` rows of `c`), from the kept rows `past`
 /// (`hist * c`); returns y and the kept rows after `keep` rows.
+#[allow(clippy::too_many_arguments)]
 fn conv_ref(
     xs: &[f32],
     c: usize,
@@ -124,7 +130,12 @@ fn the_decode_conv_and_short_conv_shift_their_windows() {
         }
         let got_y = b.read_f32(y);
         for r in [0usize, 1, 3] {
-            assert_close(&got_y[r * c..(r + 1) * c], &want_y[r * c..(r + 1) * c], 2e-2, 1e-2);
+            assert_close(
+                &got_y[r * c..(r + 1) * c],
+                &want_y[r * c..(r + 1) * c],
+                2e-2,
+                1e-2,
+            );
         }
         assert_close(&b.read_f32(bank), &want_bank, 0.0, 0.0);
     }
@@ -161,7 +172,10 @@ fn the_chunked_conv_walks_each_lane_from_its_window() {
         let sl = b.i32(rows as u32, 1, &slot_of_row);
         let y = b.zeros(Dtype::Bf16, rows as u32, c as u32);
         let p = pool(bank, sl);
-        let rt = RaggedTensor { data: x, indptr: ip };
+        let rt = RaggedTensor {
+            data: x,
+            indptr: ip,
+        };
         let ran = b
             .run(|ctx| {
                 if residual {
@@ -183,8 +197,7 @@ fn the_chunked_conv_walks_each_lane_from_its_window() {
             }
             let s = lane_slot[l] as usize;
             let past = &bank0[s * hist * c..(s + 1) * hist * c];
-            let (yr, next) =
-                conv_ref(&xs[lo * c..hi * c], c, &ws, k, dil, past, hi - lo, residual);
+            let (yr, next) = conv_ref(&xs[lo * c..hi * c], c, &ws, k, dil, past, hi - lo, residual);
             want_bank[s * hist * c..(s + 1) * hist * c].copy_from_slice(&next);
             assert_close(&got_y[lo * c..hi * c], &yr, 2e-2, 1e-2);
         }
@@ -217,7 +230,10 @@ fn a_wide_conv_decodes_what_its_prefill_reads() {
     let sl = b.i32(rows as u32, 1, &slot_of_row);
     let y = b.zeros(Dtype::Bf16, rows as u32, c as u32);
     let p = pool(bank, sl);
-    let rt = RaggedTensor { data: x, indptr: ip };
+    let rt = RaggedTensor {
+        data: x,
+        indptr: ip,
+    };
     if !b
         .run(|ctx| ssm::causal_conv1d_chunked(ctx, rt, w, &p, k as u32, dil as u32, y))
         .unwrap()
@@ -295,8 +311,16 @@ fn the_committed_conv_lands_the_window_after_the_commit() {
             let s = slot as usize;
             let past = &bank0[s * hist * c..(s + 1) * hist * c];
             let keep = (commit[g] as usize).min(span);
-            let (yr, next) =
-                conv_ref(&xs[begin * c..(begin + span) * c], c, &ws, k, dil, past, keep, false);
+            let (yr, next) = conv_ref(
+                &xs[begin * c..(begin + span) * c],
+                c,
+                &ws,
+                k,
+                dil,
+                past,
+                keep,
+                false,
+            );
             assert_close(&got_y[begin * c..(begin + span) * c], &yr, 2e-2, 1e-2);
             if keep > 0 {
                 want_bank[s * hist * c..(s + 1) * hist * c].copy_from_slice(&next);
@@ -435,7 +459,16 @@ fn the_gated_delta_step_folds_one_token_per_lane() {
     if !b
         .run(|ctx| {
             ssm::gated_delta(
-                ctx, x, z, gt, &p, g.hk as u32, g.hv as u32, g.dk as u32, g.dv as u32, y,
+                ctx,
+                x,
+                z,
+                gt,
+                &p,
+                g.hk as u32,
+                g.hv as u32,
+                g.dk as u32,
+                g.dv as u32,
+                y,
             )
         })
         .unwrap()
@@ -450,7 +483,12 @@ fn the_gated_delta_step_folds_one_token_per_lane() {
             continue;
         }
         let s = slot_of[t] as usize;
-        let yr = g.token(&qkv, &gates, t, &mut want[s * g.stride()..(s + 1) * g.stride()]);
+        let yr = g.token(
+            &qkv,
+            &gates,
+            t,
+            &mut want[s * g.stride()..(s + 1) * g.stride()],
+        );
         assert_close(&got[t * w..(t + 1) * w], &yr, 1e-4, 1e-3);
     }
     assert_close(&b.read_f32(bank), &want, 1e-5, 1e-4);
@@ -467,51 +505,72 @@ fn the_chunked_gated_delta_matches_the_token_walk() {
     // Lanes of 70 (two chunks), 0, 5, 1 and 130 rows, then 3 padded rows
     // (64-row chunks); then lanes of 300 and 141 rows (128-row chunks).
     for (indptr, rows, lane_slot) in [
-        (vec![0i32, 70, 70, 75, 76, 206], 209usize, vec![3i32, 0, 1, 4, 2]),
+        (
+            vec![0i32, 70, 70, 75, 76, 206],
+            209usize,
+            vec![3i32, 0, 1, 4, 2],
+        ),
         (vec![0i32, 300, 441], 443, vec![5, 1]),
     ] {
-    let lanes = indptr.len() - 1;
-    let slots = 6usize;
-    let mut slot_of_row = vec![DROP; rows];
-    for l in 0..lanes {
-        for t in indptr[l]..indptr[l + 1] {
-            slot_of_row[t as usize] = lane_slot[l];
+        let lanes = indptr.len() - 1;
+        let slots = 6usize;
+        let mut slot_of_row = vec![DROP; rows];
+        for l in 0..lanes {
+            for t in indptr[l]..indptr[l + 1] {
+                slot_of_row[t as usize] = lane_slot[l];
+            }
         }
-    }
-    let mut rng = Rng(33);
-    let (qkv, gates) = gdn_inputs(&mut rng, &g, rows);
-    let bank0 = rng.f32s(slots * g.stride(), -0.5, 0.5);
-    let mut b = Bench::new();
-    let x = b.bf16(rows as u32, g.width() as u32, &qkv);
-    let ip = b.i32(indptr.len() as u32, 1, &indptr);
-    let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
-    let gt = b.f32(rows as u32, (2 * g.hv) as u32, &gates);
-    let bank = b.f32(slots as u32, g.stride() as u32, &bank0);
-    let sl = b.i32(rows as u32, 1, &slot_of_row);
-    let y = b.zeros(Dtype::F32, rows as u32, (g.hv * g.dv) as u32);
-    let p = pool(bank, sl);
-    let rt = RaggedTensor { data: x, indptr: ip };
-    if !b
-        .run(|ctx| {
-            ssm::gated_delta_chunked(
-                ctx, rt, z, gt, &p, g.hk as u32, g.hv as u32, g.dk as u32, g.dv as u32, y,
-            )
-        })
-        .unwrap()
-    {
-        return;
-    }
-    let mut want = bank0.clone();
-    let got = b.read_f32(y);
-    let w = g.hv * g.dv;
-    for l in 0..lanes {
-        let s = lane_slot[l] as usize;
-        for t in indptr[l] as usize..indptr[l + 1] as usize {
-            let yr = g.token(&qkv, &gates, t, &mut want[s * g.stride()..(s + 1) * g.stride()]);
-            assert_close(&got[t * w..(t + 1) * w], &yr, 2e-4, 2e-3);
+        let mut rng = Rng(33);
+        let (qkv, gates) = gdn_inputs(&mut rng, &g, rows);
+        let bank0 = rng.f32s(slots * g.stride(), -0.5, 0.5);
+        let mut b = Bench::new();
+        let x = b.bf16(rows as u32, g.width() as u32, &qkv);
+        let ip = b.i32(indptr.len() as u32, 1, &indptr);
+        let z = b.zeros(Dtype::Bf16, rows as u32, (g.hv * g.dv) as u32);
+        let gt = b.f32(rows as u32, (2 * g.hv) as u32, &gates);
+        let bank = b.f32(slots as u32, g.stride() as u32, &bank0);
+        let sl = b.i32(rows as u32, 1, &slot_of_row);
+        let y = b.zeros(Dtype::F32, rows as u32, (g.hv * g.dv) as u32);
+        let p = pool(bank, sl);
+        let rt = RaggedTensor {
+            data: x,
+            indptr: ip,
+        };
+        if !b
+            .run(|ctx| {
+                ssm::gated_delta_chunked(
+                    ctx,
+                    rt,
+                    z,
+                    gt,
+                    &p,
+                    g.hk as u32,
+                    g.hv as u32,
+                    g.dk as u32,
+                    g.dv as u32,
+                    y,
+                )
+            })
+            .unwrap()
+        {
+            return;
         }
-    }
-    assert_close(&b.read_f32(bank), &want, 1e-4, 1e-3);
+        let mut want = bank0.clone();
+        let got = b.read_f32(y);
+        let w = g.hv * g.dv;
+        for l in 0..lanes {
+            let s = lane_slot[l] as usize;
+            for t in indptr[l] as usize..indptr[l + 1] as usize {
+                let yr = g.token(
+                    &qkv,
+                    &gates,
+                    t,
+                    &mut want[s * g.stride()..(s + 1) * g.stride()],
+                );
+                assert_close(&got[t * w..(t + 1) * w], &yr, 2e-4, 2e-3);
+            }
+        }
+        assert_close(&b.read_f32(bank), &want, 1e-4, 1e-3);
     }
 }
 
@@ -554,7 +613,17 @@ fn the_committed_gated_delta_lands_the_state_after_the_commit() {
     if !b
         .run(|ctx| {
             ssm::gated_delta_committed(
-                ctx, x, ip, &seat, gt, &p, g.hk as u32, g.hv as u32, g.dk as u32, g.dv as u32, y,
+                ctx,
+                x,
+                ip,
+                &seat,
+                gt,
+                &p,
+                g.hk as u32,
+                g.hv as u32,
+                g.dk as u32,
+                g.dv as u32,
+                y,
             )
         })
         .unwrap()
@@ -600,6 +669,7 @@ impl Kda {
     fn stride(&self) -> usize {
         self.heads * self.d * self.d
     }
+    #[allow(clippy::too_many_arguments)]
     fn token(
         &self,
         mixed: &[f32],
@@ -615,7 +685,11 @@ impl Kda {
         let row = &mixed[t * 3 * wide..(t + 1) * 3 * wide];
         let mut y = Vec::with_capacity(wide);
         for hh in 0..h {
-            let q = l2(&row[hh * d..(hh + 1) * d], self.eps, 1.0 / (d as f32).sqrt());
+            let q = l2(
+                &row[hh * d..(hh + 1) * d],
+                self.eps,
+                1.0 / (d as f32).sqrt(),
+            );
             let k = l2(&row[wide + hh * d..wide + (hh + 1) * d], self.eps, 1.0);
             let v = &row[2 * wide + hh * d..2 * wide + (hh + 1) * d];
             let alpha = alog[hh].exp();
@@ -679,11 +753,25 @@ fn kda_walks_per_channel_decay_in_step_chunked_and_committed_forms() {
         let sl = b.i32(rows as u32, 1, &slot_of_row);
         let y = b.zeros(Dtype::F32, rows as u32, wide as u32);
         let p = pool(bank, sl);
-        let rt = RaggedTensor { data: m, indptr: ip };
+        let rt = RaggedTensor {
+            data: m,
+            indptr: ip,
+        };
         if !b
             .run(|ctx| {
                 ssm::kda_chunked(
-                    ctx, rt, ft, bt, dtt, alt, &p, kd.heads as u32, kd.d as u32, kd.eps, kd.floor, y,
+                    ctx,
+                    rt,
+                    ft,
+                    bt,
+                    dtt,
+                    alt,
+                    &p,
+                    kd.heads as u32,
+                    kd.d as u32,
+                    kd.eps,
+                    kd.floor,
+                    y,
                 )
             })
             .unwrap()
@@ -696,7 +784,12 @@ fn kda_walks_per_channel_decay_in_step_chunked_and_committed_forms() {
             let s = lane_slot[l] as usize;
             for t in indptr[l] as usize..indptr[l + 1] as usize {
                 let yr = kd.token(
-                    &mixed, &fp, &bp, &dt, &alog, t,
+                    &mixed,
+                    &fp,
+                    &bp,
+                    &dt,
+                    &alog,
+                    t,
                     &mut want[s * kd.stride()..(s + 1) * kd.stride()],
                 );
                 assert_close(&got[t * wide..(t + 1) * wide], &yr, 2e-4, 2e-3);
@@ -718,7 +811,18 @@ fn kda_walks_per_channel_decay_in_step_chunked_and_committed_forms() {
         let p = pool(bank, sl);
         b.run(|ctx| {
             ssm::kda_step(
-                ctx, m, ft, bt, dtt, alt, &p, kd.heads as u32, kd.d as u32, kd.eps, kd.floor, y,
+                ctx,
+                m,
+                ft,
+                bt,
+                dtt,
+                alt,
+                &p,
+                kd.heads as u32,
+                kd.d as u32,
+                kd.eps,
+                kd.floor,
+                y,
             )
         })
         .unwrap();
@@ -730,7 +834,12 @@ fn kda_walks_per_channel_decay_in_step_chunked_and_committed_forms() {
             }
             let s = step_slots[t] as usize;
             let yr = kd.token(
-                &mixed, &fp, &bp, &dt, &alog, t,
+                &mixed,
+                &fp,
+                &bp,
+                &dt,
+                &alog,
+                t,
                 &mut want[s * kd.stride()..(s + 1) * kd.stride()],
             );
             assert_close(&got[t * wide..(t + 1) * wide], &yr, 1e-4, 1e-3);
@@ -764,8 +873,20 @@ fn kda_walks_per_channel_decay_in_step_chunked_and_committed_forms() {
         };
         b.run(|ctx| {
             ssm::kda_committed(
-                ctx, m, ip, &seat, ft, bt, dtt, alt, &p, kd.heads as u32, kd.d as u32, kd.eps,
-                kd.floor, y,
+                ctx,
+                m,
+                ip,
+                &seat,
+                ft,
+                bt,
+                dtt,
+                alt,
+                &p,
+                kd.heads as u32,
+                kd.d as u32,
+                kd.eps,
+                kd.floor,
+                y,
             )
         })
         .unwrap();
@@ -812,7 +933,10 @@ fn the_block_dyn_conv_moves_its_taps_per_row() {
             .run(|ctx| {
                 ssm::block_dyn_conv(
                     ctx,
-                    RaggedTensor { data: x, indptr: ip },
+                    RaggedTensor {
+                        data: x,
+                        indptr: ip,
+                    },
                     ct,
                     bt,
                     side as u32,
@@ -834,11 +958,15 @@ fn the_block_dyn_conv_moves_its_taps_per_row() {
                     let mut acc = 0.0f32;
                     for k in 0..taps.min(t + 1) {
                         let at = side * taps + k;
-                        let coef = ba[at * c + ch] + co[row * 2 * taps * groups + at * groups + ch / group];
+                        let coef = ba[at * c + ch]
+                            + co[row * 2 * taps * groups + at * groups + ch / group];
                         acc += coef * xs[(lo + t - k) * c + ch];
                     }
                     let g = got[row * c + ch];
-                    assert!((g - acc).abs() <= 2e-2 + 1e-2 * acc.abs(), "row {row} ch {ch}: {g} vs {acc}");
+                    assert!(
+                        (g - acc).abs() <= 2e-2 + 1e-2 * acc.abs(),
+                        "row {row} ch {ch}: {g} vs {acc}"
+                    );
                 }
             }
         }
@@ -884,7 +1012,16 @@ fn a_slot_blocked_bank_steps_a_wide_decode_fire_in_rounds() {
     if !b
         .run(|ctx| {
             ssm::gated_delta(
-                ctx, x, z, gt, &p, g.hk as u32, g.hv as u32, g.dk as u32, g.dv as u32, y,
+                ctx,
+                x,
+                z,
+                gt,
+                &p,
+                g.hk as u32,
+                g.hv as u32,
+                g.dk as u32,
+                g.dv as u32,
+                y,
             )
         })
         .unwrap()
@@ -896,7 +1033,12 @@ fn a_slot_blocked_bank_steps_a_wide_decode_fire_in_rounds() {
     let w = g.hv * g.dv;
     for t in (0..rows).filter(|&t| real(t)) {
         let s = slot_of[t] as usize;
-        let yr = g.token(&qkv, &gates, t, &mut want[s * g.stride()..(s + 1) * g.stride()]);
+        let yr = g.token(
+            &qkv,
+            &gates,
+            t,
+            &mut want[s * g.stride()..(s + 1) * g.stride()],
+        );
         assert_close(&got[t * w..(t + 1) * w], &yr, 1e-4, 1e-3);
     }
     // Every slot but the sink is exact; the sink holds garbage.
@@ -935,11 +1077,23 @@ fn slot_blocked_banks_serve_the_chunked_rule_kda_and_the_conv() {
     let sl = b.i32(rows as u32, 1, &slot_of_row);
     let y = b.zeros(Dtype::F32, rows as u32, (g.hv * g.dv) as u32);
     let p = pool(bank, sl);
-    let rt = RaggedTensor { data: x, indptr: ip };
+    let rt = RaggedTensor {
+        data: x,
+        indptr: ip,
+    };
     if !b
         .run(|ctx| {
             ssm::gated_delta_chunked(
-                ctx, rt, z, gt, &p, g.hk as u32, g.hv as u32, g.dk as u32, g.dv as u32, y,
+                ctx,
+                rt,
+                z,
+                gt,
+                &p,
+                g.hk as u32,
+                g.hv as u32,
+                g.dk as u32,
+                g.dv as u32,
+                y,
             )
         })
         .unwrap()
@@ -952,7 +1106,12 @@ fn slot_blocked_banks_serve_the_chunked_rule_kda_and_the_conv() {
     for l in 0..3 {
         let s = lane_slot[l] as usize;
         for t in indptr[l] as usize..indptr[l + 1] as usize {
-            let yr = g.token(&qkv, &gates, t, &mut want[s * g.stride()..(s + 1) * g.stride()]);
+            let yr = g.token(
+                &qkv,
+                &gates,
+                t,
+                &mut want[s * g.stride()..(s + 1) * g.stride()],
+            );
             assert_close(&got[t * w..(t + 1) * w], &yr, 2e-4, 2e-3);
         }
     }
@@ -987,7 +1146,18 @@ fn slot_blocked_banks_serve_the_chunked_rule_kda_and_the_conv() {
     let p = pool(bank, sl);
     b.run(|ctx| {
         ssm::kda_step(
-            ctx, m, ft, bt, dtt, alt, &p, kd.heads as u32, kd.d as u32, kd.eps, kd.floor, y,
+            ctx,
+            m,
+            ft,
+            bt,
+            dtt,
+            alt,
+            &p,
+            kd.heads as u32,
+            kd.d as u32,
+            kd.eps,
+            kd.floor,
+            y,
         )
     })
     .unwrap();

@@ -19,12 +19,16 @@ fn client() -> Option<Client> {
 }
 
 fn bf16_bytes(xs: &[f32]) -> Vec<u8> {
-    xs.iter().flat_map(|&x| bf16_bits(x).to_le_bytes()).collect()
+    xs.iter()
+        .flat_map(|&x| bf16_bits(x).to_le_bytes())
+        .collect()
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -43,33 +47,49 @@ fn a_matmul_and_a_reduce_answer_the_host() {
     let s = f.reduce(y, &[1], Fold::Sum).unwrap();
     let (arg, _) = f.argmax(y, 1, Elem::I32).unwrap();
     let text = f.module("smoke", &[y, s, arg]);
-    let exe = client.compile(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    let exe = client
+        .compile(&text)
+        .unwrap_or_else(|e| panic!("{e}\n{text}"));
     assert_eq!(exe.outputs(), 3);
 
     let xs: Vec<f32> = (0..m * k).map(|i| (i % 5) as f32 - 2.0).collect();
     let ws: Vec<f32> = (0..n * k).map(|i| (i % 3) as f32 - 1.0).collect();
-    let xb = client.upload(dev, &bf16_bytes(&xs), ElementType::Bf16, &[m, k]).unwrap();
-    let wb = client.upload(dev, &bf16_bytes(&ws), ElementType::Bf16, &[n, k]).unwrap();
-    let (outs, done) = exe.execute(dev, vec![Arg::Keep(&xb), Arg::Keep(&wb)]).unwrap();
+    let xb = client
+        .upload(dev, &bf16_bytes(&xs), ElementType::Bf16, &[m, k])
+        .unwrap();
+    let wb = client
+        .upload(dev, &bf16_bytes(&ws), ElementType::Bf16, &[n, k])
+        .unwrap();
+    let (outs, done) = exe
+        .execute(dev, vec![Arg::Keep(&xb), Arg::Keep(&wb)])
+        .unwrap();
     done.wait().unwrap();
 
     let got = f32s(&outs[0].download().unwrap());
     let mut want = vec![0f32; (m * n) as usize];
     for i in 0..m {
         for j in 0..n {
-            want[(i * n + j) as usize] =
-                (0..k).map(|t| xs[(i * k + t) as usize] * ws[(j * k + t) as usize]).sum();
+            want[(i * n + j) as usize] = (0..k)
+                .map(|t| xs[(i * k + t) as usize] * ws[(j * k + t) as usize])
+                .sum();
         }
     }
     assert_eq!(got, want);
     let sums = f32s(&outs[1].download().unwrap());
     for i in 0..m as usize {
-        assert_eq!(sums[i], want[i * n as usize..(i + 1) * n as usize].iter().sum::<f32>());
+        assert_eq!(
+            sums[i],
+            want[i * n as usize..(i + 1) * n as usize]
+                .iter()
+                .sum::<f32>()
+        );
     }
     let args: Vec<i32> = outs[2]
         .download()
         .unwrap()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     for i in 0..m as usize {
@@ -92,14 +112,27 @@ fn a_donated_buffer_is_updated_in_place() {
     let exe = client.compile(&f.module("dus", &[out])).unwrap();
 
     let pool_b = client
-        .upload(dev, &vec![0u8; 8 * 4 * 4], ElementType::F32, &[8, 4])
+        .upload(dev, &[0u8; 8 * 4 * 4], ElementType::F32, &[8, 4])
         .unwrap();
     let row_b = client
-        .upload(dev, &[1f32, 2., 3., 4.].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(), ElementType::F32, &[1, 4])
+        .upload(
+            dev,
+            &[1f32, 2., 3., 4.]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<_>>(),
+            ElementType::F32,
+            &[1, 4],
+        )
         .unwrap();
-    let at_b = client.upload(dev, &5i32.to_le_bytes(), ElementType::S32, &[]).unwrap();
+    let at_b = client
+        .upload(dev, &5i32.to_le_bytes(), ElementType::S32, &[])
+        .unwrap();
     let (outs, done) = exe
-        .execute(dev, vec![Arg::Donate(pool_b), Arg::Keep(&row_b), Arg::Keep(&at_b)])
+        .execute(
+            dev,
+            vec![Arg::Donate(pool_b), Arg::Keep(&row_b), Arg::Keep(&at_b)],
+        )
         .unwrap();
     done.wait().unwrap();
     let got = f32s(&outs[0].download().unwrap());

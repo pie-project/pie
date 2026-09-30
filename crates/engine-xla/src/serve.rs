@@ -11,6 +11,7 @@
 //! only the sink page and the sink slot.
 
 pub mod dry;
+mod warm;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -215,6 +216,15 @@ impl<'a> Seated<'a> {
     }
 }
 
+/// A fire the warm ladder traced and has not compiled yet.
+pub(crate) struct Deferred {
+    key: [u8; 32],
+    shape_key: Option<[u8; 32]>,
+    text: String,
+    sig: crate::trace::Signature,
+    probed: Vec<ValueId>,
+}
+
 /// What one fire cost the host, for the bench.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FireCost {
@@ -268,6 +278,13 @@ pub struct Shell {
     /// Programs by the fire shape that traced them: a fire whose shape was
     /// seen skips the walk and runs what the first one compiled.
     traced: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
+    /// Programs by a plain fire's shape alone (`fire_padded`): its class
+    /// windows, lane counts and input shapes, not how its rows fall to its
+    /// lanes, which reach the program only as input values.
+    shaped: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
+    /// While the warm ladder traces (`warm.rs`): fires whose program is new
+    /// are traced, kept here and not run, and compiled together after.
+    deferred: Option<Vec<Deferred>>,
     /// Token-declared values on a readout-rowed path (`crate::rows`), and
     /// a readout-rowed value that tells their rows.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
@@ -333,7 +350,14 @@ fn classes_running(
 const DEVICE_HEADROOM: u64 = 2 << 30;
 
 /// Rows past the fire limit a prefill fire may pad into (see `fire_inner`).
-const PAD_ROOM: u32 = 64;
+const PAD_ROOM: u32 = 128;
+
+/// The least lane rung of the prefill class in a fire that decodes too, so
+/// such fires vary by their decode rung and row rung alone.
+const MIXED_HOST_RUNG: u32 = 16;
+
+/// The least page bound a fire's tables are laid out to.
+const PAGE_FLOOR: u32 = 16;
 
 /// A lane count's rung: the power of two at or above it.
 fn lane_rung(n: u32) -> u32 {
@@ -348,10 +372,7 @@ impl Shell {
         Shell::load_with(boot, voxels)
     }
 
-    pub fn load_with(
-        boot: Boot<'_>,
-        voxels: Option<model_compiler::VoxelLadder>,
-    ) -> Result<Shell> {
+    pub fn load_with(boot: Boot<'_>, voxels: Option<model_compiler::VoxelLadder>) -> Result<Shell> {
         let device = Device::open(boot.device.plugin.as_deref(), boot.device.ordinal as usize)?;
         Shell::load_on(boot, voxels, device)
     }
@@ -366,7 +387,7 @@ impl Shell {
         compile: bool,
     ) -> Result<Shell> {
         let device = Device::dry(
-            compile.then(|| (boot.device.plugin.as_deref(), boot.device.ordinal as usize)),
+            compile.then_some((boot.device.plugin.as_deref(), boot.device.ordinal as usize)),
         )?;
         Shell::load_on(boot, voxels, device)
     }
@@ -381,11 +402,10 @@ impl Shell {
         // for the padding lanes that fill a decode up to its rung.
         let mut budget = boot.budget.clone();
         if budget.buckets.is_empty() {
-            budget.buckets =
-                std::iter::successors(Some(1u32), |rung| rung.checked_mul(2))
-                    .take_while(|rung| *rung < budget.max_tokens)
-                    .chain(std::iter::once(budget.max_tokens))
-                    .collect();
+            budget.buckets = std::iter::successors(Some(1u32), |rung| rung.checked_mul(2))
+                .take_while(|rung| *rung < budget.max_tokens)
+                .chain(std::iter::once(budget.max_tokens))
+                .collect();
             // One rung past the fire limit, for the padding lanes that
             // bring a full prefill fire's lane counts to their rungs
             // (`fire_inner`); the runtime still sends at most `max_tokens`.
@@ -394,8 +414,10 @@ impl Shell {
                 budget.buckets.push(budget.max_tokens);
             }
         }
-        budget.max_lanes =
-            model_exec::fire::rung_of(&budget.buckets, budget.max_lanes).saturating_add(1);
+        // Lane room for the padding lanes: a decode's up to its rung, and a
+        // prefill beside a decode's up to `MIXED_HOST_RUNG`.
+        budget.max_lanes = model_exec::fire::rung_of(&budget.buckets, budget.max_lanes)
+            .saturating_add(MIXED_HOST_RUNG);
         let budgets = match boot.patches.clone() {
             None => Budgets::of(budget),
             Some(ladder) => Budgets::of(budget).with_patches(ladder),
@@ -574,7 +596,12 @@ impl Shell {
                     .map(|rect| (value, rect.width))
             });
         let mut scores: Vec<(u32, ValueId)> = Vec::new();
-        for seam in boot.trace.seams.iter().filter(|seam| seam.seam == SCORES_SEAM) {
+        for seam in boot
+            .trace
+            .seams
+            .iter()
+            .filter(|seam| seam.seam == SCORES_SEAM)
+        {
             for &value in &seam.values {
                 let layer = match boot.trace.values[value.0 as usize].def {
                     model_ir::Def::Op(node) => boot.trace.nodes[node as usize].layer.unwrap_or(0),
@@ -628,7 +655,8 @@ impl Shell {
             .iter()
             .filter_map(|node| match node.op {
                 model_ir::Operation::Layout(
-                    model_ir::Layout::PoolRows { side, .. } | model_ir::Layout::MergeRows { side, .. },
+                    model_ir::Layout::PoolRows { side, .. }
+                    | model_ir::Layout::MergeRows { side, .. },
                 ) => Some(side.saturating_mul(side)),
                 _ => None,
             })
@@ -640,8 +668,7 @@ impl Shell {
                 model_ir::Operation::Layout(model_ir::Layout::ScatterLiveRows { .. })
             )
         });
-        let states_mrope =
-            declared_width(&boot.trace, model_ir::RuntimeInput::MropePositions) > 0;
+        let states_mrope = declared_width(&boot.trace, model_ir::RuntimeInput::MropePositions) > 0;
         let gathers_readout = boot.trace.values.iter().any(|decl| {
             matches!(
                 &decl.def,
@@ -688,6 +715,8 @@ impl Shell {
             probed: std::collections::HashMap::new(),
             last: FireCost::default(),
             traced: std::collections::HashMap::new(),
+            shaped: std::collections::HashMap::new(),
+            deferred: None,
             readout_rowed,
         })
     }
@@ -832,7 +861,11 @@ impl Shell {
         self.pools.read_slot(slot)
     }
 
-    pub fn register_adapter(&mut self, id: u32, planes: &[crate::weights::AdapterPlane<'_>]) -> Result<()> {
+    pub fn register_adapter(
+        &mut self,
+        id: u32,
+        planes: &[crate::weights::AdapterPlane<'_>],
+    ) -> Result<()> {
         self.weights
             .register_adapter(&self.device, &self.trace, id, planes)
     }
@@ -883,8 +916,12 @@ impl Shell {
                                 bytes,
                             })
                             .collect();
-                        self.weights
-                            .register_adapter(&self.device, &self.trace, grant.slot, &planes)
+                        self.weights.register_adapter(
+                            &self.device,
+                            &self.trace,
+                            grant.slot,
+                            &planes,
+                        )
                     }
                     Err(why) => Err(why),
                 }
@@ -963,7 +1000,11 @@ impl Shell {
 
     /// Fires lanes that carry clips and answers each one's pixels and output
     /// boxes (engine-cuda `Shell::fire_voxels`).
-    pub fn fire_voxels(&mut self, lanes: &[Seated<'_>], clips: &[Clips<'_>]) -> Result<Vec<Pixels>> {
+    pub fn fire_voxels(
+        &mut self,
+        lanes: &[Seated<'_>],
+        clips: &[Clips<'_>],
+    ) -> Result<Vec<Pixels>> {
         let fired = self.fire_full_with(lanes, clips)?;
         if fired.pixels.is_empty() {
             return Err(Fault::Unbound {
@@ -1053,18 +1094,32 @@ impl Shell {
         // The class that takes the rest of the rows: the one with the most.
         let host = by.iter().enumerate().max_by_key(|(_, e)| e.3)?.0;
         let buckets = &self.budgets.tokens.buckets;
+        // A fire that decodes beside its prefill: the prefill's lanes at
+        // `MIXED_HOST_RUNG` at least, and always a rest lane.
+        let mixed = by.len() > 1;
         // Every count at its rung already fills a rung of rows: no rest lane.
         let ones: Vec<(u32, u64)> = by
             .iter()
-            .flat_map(|&(_, word, n, _)| std::iter::repeat_n((1u32, word), (lane_rung(n) - n) as usize))
+            .flat_map(|&(_, word, n, _)| {
+                std::iter::repeat_n((1u32, word), (lane_rung(n) - n) as usize)
+            })
             .collect();
         let exact = real_rows + ones.len() as u32;
-        if buckets.contains(&exact) && lanes.len() + ones.len() <= self.budgets.tokens.max_lanes as usize {
+        if !mixed
+            && buckets.contains(&exact)
+            && lanes.len() + ones.len() <= self.budgets.tokens.max_lanes as usize
+        {
             return Some(ones);
         }
         let mut pads: Vec<(u32, u64)> = Vec::new();
         for (at, &(_, word, n, _)) in by.iter().enumerate() {
-            let want = if at == host { lane_rung(n + 1) - 1 } else { lane_rung(n) };
+            let want = if at != host {
+                lane_rung(n)
+            } else if mixed {
+                lane_rung(n + 1).max(MIXED_HOST_RUNG) - 1
+            } else {
+                lane_rung(n + 1) - 1
+            };
             pads.extend(std::iter::repeat_n((1u32, word), (want - n) as usize));
         }
         let ones = pads.len() as u32;
@@ -1113,7 +1168,11 @@ impl Shell {
                 ),
             })
             .collect();
-        submitted.extend(pad_lanes.iter().map(|&(rows, word)| FireLane::new(word, rows)));
+        submitted.extend(
+            pad_lanes
+                .iter()
+                .map(|&(rows, word)| FireLane::new(word, rows)),
+        );
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
         let descriptor = FireDescriptor::of(&composition);
         let rows = composition.rows();
@@ -1150,7 +1209,9 @@ impl Shell {
             let at_lane = slot_ids.len() as i32;
             if source >= real {
                 // A padding lane: the sink page and the sink slot, nothing else.
-                let pages = u64::from(row.rows).div_ceil(u64::from(paging.page_size)).max(1);
+                let pages = u64::from(row.rows)
+                    .div_ceil(u64::from(paging.page_size))
+                    .max(1);
                 seats.push(Seat {
                     slot: sink_slot,
                     have: 0,
@@ -1292,7 +1353,9 @@ impl Shell {
                 }
                 rs_active = true;
             }
-            rs_plans.push(crate::rs::LanePlan::of(seated.rs, row.rows, row.source, None)?);
+            rs_plans.push(crate::rs::LanePlan::of(
+                seated.rs, row.rows, row.source, None,
+            )?);
             slot_ids.push(state_slot as i32);
             if !seated.positions.is_empty() && seated.positions.len() != lane.tokens.len() {
                 return Err(Fault::Positions {
@@ -1408,7 +1471,8 @@ impl Shell {
         }
 
         // The page bound every gathered table is laid out to: the most pages
-        // any lane holds, rounded up to a power of two.
+        // any lane holds, rounded up to a power of two, and at least
+        // `PAGE_FLOOR` (short lanes share one program as they grow).
         let max_pages = geometries
             .first()
             .map_or(1, |g| {
@@ -1418,12 +1482,12 @@ impl Shell {
                     .max()
                     .unwrap_or(1)
             })
-            .max(1)
+            .max(PAGE_FLOOR)
             .next_power_of_two()
             .min(paging.pages_per_slot.max(1).next_power_of_two());
         // A canonical prefill fire lays every table at the page cap, so its
         // program does not vary with how long its lanes are.
-        let max_pages = if canonical || std::env::var("PF_DECODE_CAP").is_ok() {
+        let max_pages = if canonical {
             paging.pages_per_slot.max(1).next_power_of_two()
         } else {
             max_pages
@@ -1471,7 +1535,10 @@ impl Shell {
             else {
                 return Err(Fault::Program {
                     at: "serve::tokens",
-                    why: format!("a device token feed names lane {}, which this fire does not seat", feed.lane),
+                    why: format!(
+                        "a device token feed names lane {}, which this fire does not seat",
+                        feed.lane
+                    ),
                 });
             };
             if row.rows as usize != feed.words.len() {
@@ -1624,7 +1691,7 @@ impl Shell {
                         },
                     );
                 }
-                Some(std::sync::Arc::new(crate::rs::Seat {
+                Some(std::rc::Rc::new(crate::rs::Seat {
                     plans: rs_plans.clone(),
                     replay: inputs.i32s(handles, &replay, 1),
                     commit: inputs.i32s(handles, &commit, 1),
@@ -1684,8 +1751,69 @@ impl Shell {
             .as_bytes(),
         )
         .as_bytes();
-        let program = match self.traced.get(&key) {
-            Some(program) => std::sync::Arc::clone(program),
+        // A plain fire (no recurrent-state maps, media, clips, captures or
+        // probes) is also keyed by its shape alone, so lanes cut differently
+        // skip the walk too.
+        let plain = !rs_active
+            && !capture
+            && dit_key.is_empty()
+            && composition.patch_rows() == 0
+            && composition.voxel_rows() == 0
+            && self.probes.is_empty();
+        let shape_key = plain.then(|| {
+            let lanes: Vec<(u32, u64)> =
+                descriptor.lanes.iter().map(|l| (l.class, l.word)).collect();
+            *blake3::hash(
+                format!(
+                    "{:?}|{}|{}|{lanes:?}|{}|{}|{max_pages}|{}|{}",
+                    descriptor.classes,
+                    descriptor.rows,
+                    descriptor.bucket,
+                    windows.shape(),
+                    inputs.shapes(),
+                    readout_rows.len(),
+                    self.gathers_readout,
+                )
+                .as_bytes(),
+            )
+            .as_bytes()
+        });
+        let hit = shape_key
+            .and_then(|k| self.shaped.get(&k))
+            .map(std::sync::Arc::clone)
+            .filter(|_| !shape_check());
+        let found = hit.or_else(|| self.traced.get(&key).map(std::sync::Arc::clone));
+        if found.is_none() && self.deferred.is_some() {
+            let (text, sig, probed) = self.trace_text(
+                &slots,
+                &caches,
+                bindings,
+                &windows,
+                &descriptor,
+                readout_t,
+                readout_rows.len() as i64,
+                capture,
+                rs_seat,
+                inputs.pack_len(),
+                &lands,
+                pixels_seat.as_ref(),
+            )?;
+            if let Some(deferred) = self.deferred.as_mut() {
+                deferred.push(Deferred {
+                    key,
+                    shape_key,
+                    text,
+                    sig,
+                    probed,
+                });
+            }
+            return Ok(Fired {
+                rows: vec![Vec::new(); real],
+                ..Fired::default()
+            });
+        }
+        let program = match found {
+            Some(program) => program,
             None => {
                 let program = self.trace_fire(
                     &slots,
@@ -1707,6 +1835,19 @@ impl Shell {
                 program
             }
         };
+        if let Some(shape_key) = shape_key {
+            if shape_check()
+                && let Some(seen) = self.shaped.get(&shape_key)
+                && !std::sync::Arc::ptr_eq(seen, &program)
+            {
+                eprintln!(
+                    "xla: the shape key of a fire of {rows} rows over {lane_count} lanes names \
+                     two programs: its lanes reach its text"
+                );
+            }
+            self.shaped
+                .insert(shape_key, std::sync::Arc::clone(&program));
+        }
         let t2 = std::time::Instant::now();
         if self.device.is_dry() {
             return Ok(Fired {
@@ -1739,8 +1880,10 @@ impl Shell {
             let width = buffer.dims()?.get(1).copied().unwrap_or(1) as u32;
             let values = buffer
                 .download()?
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             probes.push((*value, width, values));
         }
@@ -1754,7 +1897,13 @@ impl Shell {
                     });
                 };
                 let plane_width = plane.dims()?.get(1).copied().unwrap_or(1).max(1) as usize;
-                crate::dit::pixels_of(seat, &plane.download()?, plane_width, &grid.download()?, real)
+                crate::dit::pixels_of(
+                    seat,
+                    &plane.download()?,
+                    plane_width,
+                    &grid.download()?,
+                    real,
+                )
             }
             None => Vec::new(),
         };
@@ -1776,12 +1925,13 @@ impl Shell {
         );
         if timing() {
             eprintln!(
-                "xla fire: rows {rows} lanes {lane_count} max_pages {max_pages} [{}]: stage {:.2}ms trace {:.2}ms run {:.2}ms read {:.2}ms",
+                "xla fire: rows {rows} lanes {lane_count} max_pages {max_pages} [{}]: stage {:.2}ms trace {:.2}ms run {:.2}ms read {:.2}ms at {:.4}s",
                 inputs.shapes(),
                 (t1 - t0).as_secs_f64() * 1e3,
                 (t2 - t1).as_secs_f64() * 1e3,
                 (t3 - t2).as_secs_f64() * 1e3,
-                t3.elapsed().as_secs_f64() * 1e3
+                t3.elapsed().as_secs_f64() * 1e3,
+                t0.duration_since(*timing_epoch()).as_secs_f64()
             );
         }
         let width = self.out_width as usize;
@@ -1793,7 +1943,12 @@ impl Shell {
         let drafts = match (self.mtp, outs.get(1)) {
             (Some((_, mtp_width)), Some(buffer)) if !keep => {
                 let raw = buffer.download()?;
-                rows_from(&raw, &readout_layout, mtp_width as usize, readout_rows.len())
+                rows_from(
+                    &raw,
+                    &readout_layout,
+                    mtp_width as usize,
+                    readout_rows.len(),
+                )
             }
             _ => Vec::new(),
         };
@@ -1819,8 +1974,10 @@ impl Shell {
                 let heads = dims.get(1).copied().unwrap_or(1) as usize;
                 let raw = buffer.download()?;
                 let values: Vec<f32> = raw
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 columns.push((layer, heads, values));
             }
@@ -1883,11 +2040,35 @@ impl Shell {
         readout_t: Tensor,
         n: i64,
         capture: bool,
-        rs: Option<std::sync::Arc<crate::rs::Seat>>,
+        rs: Option<std::rc::Rc<crate::rs::Seat>>,
         pack_len: u32,
         lands: &[crate::dit::Land],
         pixels: Option<&crate::dit::PixelsSeat>,
     ) -> Result<(std::sync::Arc<crate::device::Program>, Vec<ValueId>)> {
+        let (text, sig, probed) = self.trace_text(
+            slots, caches, bindings, windows, descriptor, readout_t, n, capture, rs, pack_len,
+            lands, pixels,
+        )?;
+        Ok((self.device.program(&text, sig)?, probed))
+    }
+
+    /// The program text of one fire's walk, and the values it probes.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_text(
+        &self,
+        slots: &SlotTable,
+        caches: &crate::store::CacheTable,
+        bindings: FireBindings,
+        windows: &Windows,
+        descriptor: &FireDescriptor,
+        readout_t: Tensor,
+        n: i64,
+        capture: bool,
+        rs: Option<std::rc::Rc<crate::rs::Seat>>,
+        pack_len: u32,
+        lands: &[crate::dit::Land],
+        pixels: Option<&crate::dit::PixelsSeat>,
+    ) -> Result<(String, crate::trace::Signature, Vec<ValueId>)> {
         let tracer = Tracer::new(&self.handles).with_pack(pack_len);
         let place = At::new();
         crate::dit::land(&tracer, &self.handles, slots, lands)?;
@@ -1896,7 +2077,6 @@ impl Shell {
                 &tracer,
                 &self.handles,
                 &self.trace.values,
-                &self.trace.nodes,
                 self.weights.table(),
                 slots,
                 caches,
@@ -1921,7 +2101,8 @@ impl Shell {
 
         // A logits plane a `ReadoutRows` gather already narrowed is sliced;
         // any other readout plane is token-shaped and gathered here.
-        let gathered = self.gathers_readout && self.readout_seam == engine::fire::ReadoutSeam::Logits;
+        let gathered =
+            self.gathers_readout && self.readout_seam == engine::fire::ReadoutSeam::Logits;
         let ids = if gathered {
             None
         } else {
@@ -1934,7 +2115,10 @@ impl Shell {
             .chain(self.out.and(self.mtp).map(|(value, _)| value));
         for value in seams {
             let plane = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
-                what: format!("value {}, an exported seam, which the carve gave no rectangle", value.0),
+                what: format!(
+                    "value {}, an exported seam, which the carve gave no rectangle",
+                    value.0
+                ),
             })?;
             let whole = tracer.value(plane)?;
             extras.push(tracer.with(|f| -> Result<kernels_xla::hlo::Val> {
@@ -1977,7 +2161,8 @@ impl Shell {
         }
         let probed_ids: Vec<ValueId> = probed.iter().map(|(value, _)| *value).collect();
         extras.extend(probed.into_iter().map(|(_, read)| read));
-        Ok((crate::exec::compile(&self.device, tracer, &extras)?, probed_ids))
+        let (text, sig) = tracer.finish(&extras);
+        Ok((text, sig, probed_ids))
     }
 
     /// Refuses media rows this load cannot seat, before anything is staged.
@@ -1994,9 +2179,17 @@ impl Shell {
             let patch_rows = u64::from(shot.rows.iter().copied().fold(0u32, u32::saturating_add));
             let rows_here = seated.lane.tokens.len() as u64;
             for (what, have, want) in [
-                ("payload bytes", shot.patches.len() as u64, patch_rows * seat.row_bytes),
+                (
+                    "payload bytes",
+                    shot.patches.len() as u64,
+                    patch_rows * seat.row_bytes,
+                ),
                 ("routes", shot.routes.len() as u64, patch_rows),
-                ("grid positions", shot.positions.len() as u64, patch_rows * 3),
+                (
+                    "grid positions",
+                    shot.positions.len() as u64,
+                    patch_rows * 3,
+                ),
                 (
                     "position-table taps",
                     shot.embed_rows.len() as u64,
@@ -2163,7 +2356,7 @@ impl Shell {
 /// Each lane's rows out of a readout of `n` rows of `width`, in one pass
 /// from the downloaded bytes (bf16 or f32, whichever the seam holds).
 fn rows_from(raw: &[u8], layout: &[(u32, u32)], width: usize, n: usize) -> Vec<Vec<f32>> {
-    let element = if n * width == 0 { 4 } else { raw.len() / (n * width) };
+    let element = raw.len().checked_div(n * width).unwrap_or(4);
     layout
         .iter()
         .map(|&(start, count)| {
@@ -2172,13 +2365,17 @@ fn rows_from(raw: &[u8], layout: &[(u32, u32)], width: usize, n: usize) -> Vec<V
             let bytes = &raw[from.min(raw.len())..to.min(raw.len())];
             if element == 2 {
                 bytes
-                    .chunks_exact(2)
-                    .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
                     .collect()
             } else {
                 bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect()
             }
         })
@@ -2195,18 +2392,6 @@ fn split_rows(values: &[f32], layout: &[(u32, u32)], width: usize) -> Vec<Vec<f3
         })
         .collect()
 }
-
-fn pad_bytes(bytes: &[u8], width: u32) -> Vec<u8> {
-    let width = width.max(1) as usize;
-    let mut v = bytes.to_vec();
-    if v.is_empty() {
-        v = vec![0; width];
-    }
-    let rows = v.len().div_ceil(width);
-    v.resize(rows * width, 0);
-    v
-}
-
 type ReadoutTable = (Vec<i32>, Vec<(u32, u32)>);
 
 /// The token rows whose logits come back, and per real lane where its rows
@@ -2243,7 +2428,11 @@ fn readout_table(
         if source < real {
             layout[source] = (table.len() as u32, picks.len() as u32);
         }
-        table.extend(picks.iter().map(|&at| i32::try_from(at).unwrap_or(i32::MAX)));
+        table.extend(
+            picks
+                .iter()
+                .map(|&at| i32::try_from(at).unwrap_or(i32::MAX)),
+        );
     }
     Ok((table, layout))
 }
@@ -2292,6 +2481,19 @@ pub struct TokenFeed {
 }
 
 /// `PIE_XLA_TIMING=1` prints where each fire's host time goes.
+/// `PIE_XLA_SHAPE_CHECK=1`: trace every fire a shape key would skip and
+/// log when the two programs differ.
+fn shape_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PIE_XLA_SHAPE_CHECK").is_ok_and(|v| v == "1"))
+}
+
+/// When `PIE_XLA_TIMING` lines count their `at` from.
+fn timing_epoch() -> &'static std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now)
+}
+
 pub(crate) fn timing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PIE_XLA_TIMING").is_some_and(|v| v != "0"))

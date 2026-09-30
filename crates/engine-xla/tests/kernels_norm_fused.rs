@@ -9,7 +9,9 @@ use kernels_xla::elemwise::norm;
 fn data(n: usize, seed: u32) -> Vec<f32> {
     (0..n)
         .map(|i| {
-            let h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(40503));
+            let h = (i as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(seed.wrapping_mul(40503));
             round_bf16(((h >> 8) % 2000) as f32 / 1000.0 - 1.0)
         })
         .collect()
@@ -30,7 +32,10 @@ fn the_qwen_path_norms_answer_the_host() {
     let (rows, width, vd) = (3usize, 384usize, 128usize);
     let xs = data(rows * width, 1);
     let ws = data(width, 2);
-    let acc: Vec<f32> = data(rows * width, 3).iter().map(|v| v * 3.0 + 0.1).collect();
+    let acc: Vec<f32> = data(rows * width, 3)
+        .iter()
+        .map(|v| v * 3.0 + 0.1)
+        .collect();
     let zs = data(rows * width, 4);
     let gw: Vec<f32> = data(vd, 5).iter().map(|v| v + 1.0).collect();
     let mut b = Bench::new();
@@ -117,7 +122,12 @@ fn layernorm_without_scale_and_the_fused_residual_norms_answer_the_host() {
                 t,
                 y2,
                 Some((s, scaled)),
-                Some(norm::PostNorm { weight: w1, plus_one: true, eps: 1e-6, out: post }),
+                Some(norm::PostNorm {
+                    weight: w1,
+                    plus_one: true,
+                    eps: 1e-6,
+                    out: post,
+                }),
             )?;
             norm::rmsnorm_residual_add(ctx, x, wt, 1e-6, t3, y3, None, None)
         })
@@ -174,14 +184,21 @@ fn res_blend_softmaxes_over_blocks_and_prefix() {
     let prefix = data(rows * hidden, 10);
     let blocks: Vec<Vec<f32>> = (0..n).map(|j| data(rows * hidden, 11 + j as u32)).collect();
     let nw = data(hidden, 20);
-    let pw: Vec<f32> = data(hidden, 21).iter().map(|v| v * 4.0).map(round_bf16).collect();
+    let pw: Vec<f32> = data(hidden, 21)
+        .iter()
+        .map(|v| v * 4.0)
+        .map(round_bf16)
+        .collect();
     let mut b = Bench::new();
     let p = b.bf16(r, h, &prefix);
     let bs: Vec<_> = blocks.iter().map(|x| b.bf16(r, h, x)).collect();
     let nt = b.bf16(1, h, &nw);
     let pt = b.bf16(1, h, &pw);
     let y = b.zeros(Dtype::Bf16, r, h);
-    if !b.run(|ctx| norm::res_blend(ctx, p, &bs, nt, 1e-6, pt, y)).unwrap() {
+    if !b
+        .run(|ctx| norm::res_blend(ctx, p, &bs, nt, 1e-6, pt, y))
+        .unwrap()
+    {
         return;
     }
     let mut want = vec![0f32; rows * hidden];
@@ -256,8 +273,18 @@ fn the_remaining_norm_entries_answer_the_host() {
         }
         out
     };
-    assert_close(&b.read_f32(per_head), &runs(head, &|at| hs[at % head]), 1e-2, 1e-2);
-    assert_close(&b.read_f32(grouped), &runs(group, &|at| 1.0 + ws[at % width]), 1e-2, 1e-2);
+    assert_close(
+        &b.read_f32(per_head),
+        &runs(head, &|at| hs[at % head]),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(grouped),
+        &runs(group, &|at| 1.0 + ws[at % width]),
+        1e-2,
+        1e-2,
+    );
     assert_close(&b.read_f32(no_scale), &runs(head, &|_| 1.0), 1e-2, 1e-2);
     let mut want_ln = vec![0f32; xs.len()];
     for (row, c) in xs.chunks(width).enumerate() {
@@ -270,11 +297,29 @@ fn the_remaining_norm_entries_answer_the_host() {
     }
     assert_close(&b.read_f32(ln), &want_ln, 1e-2, 1e-2);
     let each = |f: &dyn Fn(usize, f32) -> f32| -> Vec<f32> {
-        xs.iter().enumerate().map(|(at, &v)| round_bf16(f(at % width, v))).collect()
+        xs.iter()
+            .enumerate()
+            .map(|(at, &v)| round_bf16(f(at % width, v)))
+            .collect()
     };
     assert_close(&b.read_f32(biased), &each(&|c, v| v + bs[c]), 0.0, 0.0);
-    assert_close(&b.read_f32(std), &each(&|c, v| (v - bs[c]) * ws[c]), 0.0, 0.0);
-    assert_close(&b.read_f32(ms), &each(&|_, v| v * round_bf16(0.3)), 0.0, 0.0);
-    assert_close(&b.read_f32(ss), &each(&|_, v| (v * 1.7) * sigmoid(v * 1.7)), 1e-2, 1e-2);
+    assert_close(
+        &b.read_f32(std),
+        &each(&|c, v| (v - bs[c]) * ws[c]),
+        0.0,
+        0.0,
+    );
+    assert_close(
+        &b.read_f32(ms),
+        &each(&|_, v| v * round_bf16(0.3)),
+        0.0,
+        0.0,
+    );
+    assert_close(
+        &b.read_f32(ss),
+        &each(&|_, v| (v * 1.7) * sigmoid(v * 1.7)),
+        1e-2,
+        1e-2,
+    );
     assert_close(&b.read_f32(sc), &each(&|_, v| v * 1.5), 0.0, 0.0);
 }

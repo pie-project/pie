@@ -20,7 +20,10 @@ fn same_shape(op: &'static str, a: Tensor, b: Tensor) -> Result<(), Error> {
     if a.rows != b.rows || a.width != b.width {
         return Err(refuse(
             op,
-            format!("a {}x{} rectangle against a {}x{} one", a.rows, a.width, b.rows, b.width),
+            format!(
+                "a {}x{} rectangle against a {}x{} one",
+                a.rows, a.width, b.rows, b.width
+            ),
         ));
     }
     Ok(())
@@ -143,7 +146,10 @@ fn modulation(
     if m.width != vectors * x.width {
         return Err(refuse(
             op,
-            format!("the modulation plane is {} wide, and this form reads {vectors} x {}", m.width, x.width),
+            format!(
+                "the modulation plane is {} wide, and this form reads {vectors} x {}",
+                m.width, x.width
+            ),
         ));
     }
     match lane_of_row {
@@ -154,7 +160,10 @@ fn modulation(
         }
         None => {
             if m.rows < x.rows {
-                return Err(refuse(op, format!("{} modulation vectors for {} rows", m.rows, x.rows)));
+                return Err(refuse(
+                    op,
+                    format!("{} modulation vectors for {} rows", m.rows, x.rows),
+                ));
             }
         }
     }
@@ -163,7 +172,12 @@ fn modulation(
 
 /// `m`'s vector for each of `rows` rows (row `n` reads `lane_of_row[n]`,
 /// else `n`), f32 `[rows, m.width]`.
-fn vectors_of(cx: &mut Cx<'_>, m: Tensor, lane_of_row: Option<Tensor>, rows: u32) -> Result<Val, Error> {
+fn vectors_of(
+    cx: &mut Cx<'_>,
+    m: Tensor,
+    lane_of_row: Option<Tensor>,
+    rows: u32,
+) -> Result<Val, Error> {
     let mv = cx.read_f32(m)?;
     Ok(match lane_of_row {
         Some(map) => {
@@ -238,7 +252,13 @@ pub fn gated_residual_add(
     })
 }
 
-fn gated_sum(cx: &mut Cx<'_>, r: Tensor, g: Tensor, y: Tensor, lane_of_row: Option<Tensor>) -> Result<Val, Error> {
+fn gated_sum(
+    cx: &mut Cx<'_>,
+    r: Tensor,
+    g: Tensor,
+    y: Tensor,
+    lane_of_row: Option<Tensor>,
+) -> Result<Val, Error> {
     let gv = vectors_of(cx, g, lane_of_row, r.rows)?;
     let yv = cx.read_f32(y)?;
     let rv = cx.read_f32(r)?;
@@ -337,13 +357,22 @@ pub fn sinusoid(
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.sinusoid";
     if t.dtype != Dtype::F32 || y.dtype != Dtype::F32 {
-        return Err(refuse(OP, "the timestep plane and the embedding are both f32"));
+        return Err(refuse(
+            OP,
+            "the timestep plane and the embedding are both f32",
+        ));
     }
     if dim < 2 || y.width != dim {
-        return Err(refuse(OP, format!("a {dim}-wide embedding into a {}-wide plane", y.width)));
+        return Err(refuse(
+            OP,
+            format!("a {dim}-wide embedding into a {}-wide plane", y.width),
+        ));
     }
     if t.elements() < u64::from(y.rows) {
-        return Err(refuse(OP, format!("{} timesteps for {} rows", t.elements(), y.rows)));
+        return Err(refuse(
+            OP,
+            format!("{} timesteps for {} rows", t.elements(), y.rows),
+        ));
     }
     let half = dim / 2;
     let log_period = max_period.ln();
@@ -418,7 +447,10 @@ pub fn relative_bucket_bias(
     if y.dtype != Dtype::F32 || y.width != span {
         return Err(refuse(
             OP,
-            format!("the table is {} x {} {:?}; this writes one f32 row of {span} per head", y.rows, y.width, y.dtype),
+            format!(
+                "the table is {} x {} {:?}; this writes one f32 row of {span} per head",
+                y.rows, y.width, y.dtype
+            ),
         ));
     }
     if embedding.rows < num_buckets || embedding.width < heads {
@@ -430,21 +462,36 @@ pub fn relative_bucket_bias(
             ),
         ));
     }
-    let directional = if bidirectional { num_buckets / 2 } else { num_buckets };
+    let directional = if bidirectional {
+        num_buckets / 2
+    } else {
+        num_buckets
+    };
     let max_exact = directional / 2;
     if max_exact == 0 {
-        return Err(refuse(OP, format!("{num_buckets} bucket(s) leave no exact band")));
+        return Err(refuse(
+            OP,
+            format!("{num_buckets} bucket(s) leave no exact band"),
+        ));
     }
     let ratio = f64::from(max_distance) / f64::from(max_exact);
     if !ratio.is_finite() || ratio <= 1.0 {
-        return Err(refuse(OP, format!("max_distance {max_distance} is at or below max_exact {max_exact}")));
+        return Err(refuse(
+            OP,
+            format!("max_distance {max_distance} is at or below max_exact {max_exact}"),
+        ));
     }
     #[allow(clippy::cast_possible_truncation)]
     let log_ratio = ratio.ln() as f32;
     let ids: Vec<i64> = (0..span)
         .map(|c| {
             let d = c as i32 - (max_len as i32 - 1);
-            i64::from(relative_bucket(d, bidirectional, num_buckets as i32, log_ratio))
+            i64::from(relative_bucket(
+                d,
+                bidirectional,
+                num_buckets as i32,
+                log_ratio,
+            ))
         })
         .collect();
     ctx.emit(&mut |cx| {
@@ -499,11 +546,20 @@ pub fn rope_axes(
     if positions.dtype != Dtype::F32 {
         return Err(refuse(
             OP,
-            format!("the position stream is {:?}, and this rotation reads f32 coordinates", positions.dtype),
+            format!(
+                "the position stream is {:?}, and this rotation reads f32 coordinates",
+                positions.dtype
+            ),
         ));
     }
     if head_dim == 0 || !o.width.is_multiple_of(head_dim) {
-        return Err(refuse(OP, format!("a {}-wide row is not a whole number of {head_dim}-wide heads", o.width)));
+        return Err(refuse(
+            OP,
+            format!(
+                "a {}-wide row is not a whole number of {head_dim}-wide heads",
+                o.width
+            ),
+        ));
     }
     let heads = (o.width / head_dim) as usize;
     let axes = dims.iter().take_while(|d| **d != 0).count();
@@ -511,21 +567,33 @@ pub fn rope_axes(
         return Err(refuse(OP, "no axis carries a channel"));
     }
     if let Some(odd) = dims[..axes].iter().find(|d| **d % 2 != 0) {
-        return Err(refuse(OP, format!("axis width {odd} is odd, and an angle turns a pair")));
+        return Err(refuse(
+            OP,
+            format!("axis width {odd} is odd, and an angle turns a pair"),
+        ));
     }
     let span: u32 = dims[..axes].iter().sum();
     let (hd, r) = (head_dim as usize, rotary_dim as usize);
     let angles = r / 2;
     let table = if form == RopeForm::SplitLadder {
         if rotary_dim == 0 || rotary_dim > head_dim {
-            return Err(refuse(OP, format!("the ladder turns a {rotary_dim}-wide prefix of a {head_dim}-wide head")));
+            return Err(refuse(
+                OP,
+                format!("the ladder turns a {rotary_dim}-wide prefix of a {head_dim}-wide head"),
+            ));
         }
         let row = heads as u32 * rotary_dim;
         if span == 0 || span > row || !(row - span).is_multiple_of(2) {
-            return Err(refuse(OP, format!("the ladder's axes own {span} channels of a {row}-wide rotated row")));
+            return Err(refuse(
+                OP,
+                format!("the ladder's axes own {span} channels of a {row}-wide rotated row"),
+            ));
         }
         if dims[..axes].iter().any(|d| *d != dims[0]) {
-            return Err(refuse(OP, format!("one ladder hands its axes out round-robin, and {dims:?} is not flat")));
+            return Err(refuse(
+                OP,
+                format!("one ladder hands its axes out round-robin, and {dims:?} is not flat"),
+            ));
         }
         let pad = ((row - span) / 2) as usize;
         let mut t = Turn::new(heads * hd, axes);
@@ -542,7 +610,11 @@ pub fn rope_axes(
                 let axis = slot % axes;
                 let f = slot / axes;
                 let ladder = (dims[axis] / 2) as usize;
-                let e = if ladder > 1 { f as f32 / (ladder - 1) as f32 } else { 0.0 };
+                let e = if ladder > 1 {
+                    f as f32 / (ladder - 1) as f32
+                } else {
+                    0.0
+                };
                 t.pair(lo, hi, axis, theta_pow(thetas[axis], e));
             }
         }
@@ -551,7 +623,9 @@ pub fn rope_axes(
         if span != rotary_dim || rotary_dim > head_dim || rotary_dim == 0 {
             return Err(refuse(
                 OP,
-                format!("the axes span {span} channels, the rotation states {rotary_dim}, and the head is {head_dim} wide"),
+                format!(
+                    "the axes span {span} channels, the rotation states {rotary_dim}, and the head is {head_dim} wide"
+                ),
             ));
         }
         let mut t = Turn::new(hd, axes);
@@ -565,9 +639,14 @@ pub fn rope_axes(
             let within = angle - first_angle;
             let f = theta_pow(thetas[axis], -2.0 * within as f32 / dims[axis] as f32);
             let (lo, hi) = match form {
-                RopeForm::Interleaved => (first_channel + 2 * within, first_channel + 2 * within + 1),
+                RopeForm::Interleaved => {
+                    (first_channel + 2 * within, first_channel + 2 * within + 1)
+                }
                 RopeForm::Neox => (angle, angle + angles),
-                _ => (first_channel + within, first_channel + (dims[axis] / 2) as usize + within),
+                _ => (
+                    first_channel + within,
+                    first_channel + (dims[axis] / 2) as usize + within,
+                ),
             };
             t.pair(lo, hi, axis, f);
         }
@@ -584,7 +663,13 @@ pub fn rope_axes(
 // ------------------------------------------------------------ embed + scale
 
 /// Rows of `table` by token id, ids outside `[0, vocab)` reading row 0.
-fn embed_rows(cx: &mut Cx<'_>, ids: Tensor, table: Tensor, vocab: u32, rows: u32) -> Result<Val, Error> {
+fn embed_rows(
+    cx: &mut Cx<'_>,
+    ids: Tensor,
+    table: Tensor,
+    vocab: u32,
+    rows: u32,
+) -> Result<Val, Error> {
     let iv = cx.read(ids)?;
     let n = cx.ty(iv).elements();
     let iv = cx.reshape(iv, &[n])?;
@@ -623,7 +708,13 @@ fn bf16_scalar(v: f32) -> f64 {
     f64::from(f32::from_bits(u32::from(crate::hlo::bf16_bits(v)) << 16))
 }
 
-fn embed_checks(op: &'static str, ids: Tensor, table: Tensor, vocab: u32, e: Tensor) -> Result<(), Error> {
+fn embed_checks(
+    op: &'static str,
+    ids: Tensor,
+    table: Tensor,
+    vocab: u32,
+    e: Tensor,
+) -> Result<(), Error> {
     expect(op, table, &[Dtype::Bf16])?;
     if ids.dtype != Dtype::I32 || ids.elements() < u64::from(e.rows) {
         return Err(refuse(op, "one i32 token id per row"));
@@ -631,7 +722,10 @@ fn embed_checks(op: &'static str, ids: Tensor, table: Tensor, vocab: u32, e: Ten
     if vocab == 0 || table.rows < vocab || table.width != e.width {
         return Err(refuse(
             op,
-            format!("a {vocab}-row vocabulary from a {} x {} table into {}-wide rows", table.rows, table.width, e.width),
+            format!(
+                "a {vocab}-row vocabulary from a {} x {} table into {}-wide rows",
+                table.rows, table.width, e.width
+            ),
         ));
     }
     Ok(())
@@ -693,7 +787,10 @@ pub fn embed_scale_add_select(
         same_shape(OP, e, t)?;
     }
     let col = u64::from(layer) * u64::from(width);
-    if width != y_out.width || col + u64::from(width) > u64::from(stacked.width) || stacked.rows < y_out.rows {
+    if width != y_out.width
+        || col + u64::from(width) > u64::from(stacked.width)
+        || stacked.rows < y_out.rows
+    {
         return Err(refuse(
             OP,
             format!(

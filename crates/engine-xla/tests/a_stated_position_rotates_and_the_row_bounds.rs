@@ -21,7 +21,10 @@ use model_dsl::{Platform, Request};
 const SHIFT: u32 = 100;
 
 fn worst(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
 }
 
 #[test]
@@ -33,7 +36,8 @@ fn a_prompt_stated_ahead_of_its_rows_reads_what_it_reads_at_them() {
     let trace = (m.sku.trace)(Platform::Xla);
     let classify = m.sku.classify;
     let word = |len: u32| classify(&Request::new(len, false));
-    let prompt = common::tokenizer(&m).encode("The capital of France is Paris, and the capital of Italy is");
+    let prompt =
+        common::tokenizer(&m).encode("The capital of France is Paris, and the capital of Italy is");
 
     let context = 256;
     let _device = engine_xla::bench::lock_device();
@@ -65,7 +69,10 @@ fn a_prompt_stated_ahead_of_its_rows_reads_what_it_reads_at_them() {
             tokens: &prompt,
         });
         seated.positions = &positions;
-        let prefill = shell.fire_seated(&[seated]).expect("the prefill fires").remove(0);
+        let prefill = shell
+            .fire_seated(&[seated])
+            .expect("the prefill fires")
+            .remove(0);
         let at = [prompt.len() as u32 + shift];
         let fed = [prompt[0]];
         let mut seated = Seated::of(Lane {
@@ -74,16 +81,31 @@ fn a_prompt_stated_ahead_of_its_rows_reads_what_it_reads_at_them() {
             tokens: &fed,
         });
         seated.positions = &at;
-        let decode = shell.fire_seated(&[seated]).expect("the decode fires").remove(0);
+        let decode = shell
+            .fire_seated(&[seated])
+            .expect("the decode fires")
+            .remove(0);
         (prefill, decode)
     };
     let (prefill, decode) = walk(0, 0);
     let (shifted_prefill, shifted_decode) = walk(1, SHIFT);
     drop(shell);
 
-    let (p, d) = (worst(&prefill, &shifted_prefill), worst(&decode, &shifted_decode));
-    eprintln!("{}: stated {SHIFT} ahead, prefill max |Δlogit| {p}, decode {d}", m.sku.name);
+    let (p, d) = (
+        worst(&prefill, &shifted_prefill),
+        worst(&decode, &shifted_decode),
+    );
+    eprintln!(
+        "{}: stated {SHIFT} ahead, prefill max |Δlogit| {p}, decode {d}",
+        m.sku.name
+    );
     // Rounding only: the rotations differ in their f32 angles.
-    assert!(p < 0.5, "a prompt stated {SHIFT} ahead of its rows reads logits {p} away");
-    assert!(d < 0.5, "a decode stated {SHIFT} ahead of its row reads logits {d} away");
+    assert!(
+        p < 0.5,
+        "a prompt stated {SHIFT} ahead of its rows reads logits {p} away"
+    );
+    assert!(
+        d < 0.5,
+        "a decode stated {SHIFT} ahead of its row reads logits {d} away"
+    );
 }

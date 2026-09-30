@@ -143,8 +143,12 @@ fn the_merged_context_rows_and_the_f32_lane_chain_land_the_reference() {
                 feed.port = 0;
             }
         }
-        text_lane.ports.retain(|f| f.kind != PortKind::AxisPositions);
-        image_lane.ports.retain(|f| f.kind != PortKind::AxisPositions);
+        text_lane
+            .ports
+            .retain(|f| f.kind != PortKind::AxisPositions);
+        image_lane
+            .ports
+            .retain(|f| f.kind != PortKind::AxisPositions);
         attachments.push(attach(lanes.len() as u32, t.instance));
         lanes.push(text_lane);
         attachments.push(attach(lanes.len() as u32, i.instance));

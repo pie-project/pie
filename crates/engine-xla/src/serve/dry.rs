@@ -15,9 +15,9 @@
 use engine::fire::{Mask, Masking};
 use model_ir::{ClassifyFn, Request, Stream};
 
+use super::{Lane, Media, PATCH_ROUTE_DROP, Seated, Shell};
 use crate::dit::{Clips, PortCell, SelfCond};
 use crate::error::Result;
-use super::{Lane, Media, PATCH_ROUTE_DROP, Seated, Shell};
 
 /// One dry fire: which class, at how many rows, and what came of it.
 #[derive(Debug, Clone)]
@@ -110,7 +110,12 @@ impl Shell {
     ///
     /// `lean` skips the classes that run a custom-mask, adapter or score
     /// capture arm (a compile check keeps the device briefly).
-    pub fn synthetic_fires(&mut self, classify: ClassifyFn, prefill: u32, lean: bool) -> Vec<Probe> {
+    pub fn synthetic_fires(
+        &mut self,
+        classify: ClassifyFn,
+        prefill: u32,
+        lean: bool,
+    ) -> Vec<Probe> {
         let landing = landing(classify, &self.compiled_model().classes);
         let mut probes = Vec::new();
         for (class, requests) in landing.iter().enumerate() {
@@ -222,14 +227,15 @@ impl Shell {
             seated.kv_less = lane_owned.kv_less;
             seated.bidirectional = lane_owned.bidirectional;
             seated.readout = lane_owned.readout.as_deref();
-            seated.self_cond = lane_owned
-                .self_cond
-                .as_ref()
-                .map(|(taps, rows, weights)| SelfCond {
-                    taps: *taps,
-                    rows,
-                    weights,
-                });
+            seated.self_cond =
+                lane_owned
+                    .self_cond
+                    .as_ref()
+                    .map(|(taps, rows, weights)| SelfCond {
+                        taps: *taps,
+                        rows,
+                        weights,
+                    });
             seated.media = lane_owned.media.as_ref().map(|m| Media {
                 rows: &m.rows,
                 patches: &m.patches,
@@ -264,7 +270,10 @@ impl Shell {
         lane: u32,
     ) -> Result<Owned> {
         let dit = &self.dit;
-        let voxel = self.dry_voxel_class(class).then(|| dit.dry_voxel()).flatten();
+        let voxel = self
+            .dry_voxel_class(class)
+            .then(|| dit.dry_voxel())
+            .flatten();
         // A clip that patches into tokens sets the lane's rows.
         let (rows, clip) = match voxel {
             None => (rows, None),
@@ -375,7 +384,14 @@ impl Shell {
         let patches = (model_compiler::PATCH_LATTICE_FLOOR / fold).max(1) * fold;
         let n = patches as usize;
         let live = n / fold as usize;
-        let mut routes = vec![if self.drops_patch_rows { PATCH_ROUTE_DROP } else { 0 }; n];
+        let mut routes = vec![
+            if self.drops_patch_rows {
+                PATCH_ROUTE_DROP
+            } else {
+                0
+            };
+            n
+        ];
         for (j, route) in routes.iter_mut().take(live).enumerate() {
             *route = (j % rows.max(1) as usize) as i32;
         }

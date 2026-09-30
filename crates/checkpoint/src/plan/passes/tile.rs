@@ -95,9 +95,7 @@ fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering 
         | BackendKind::Vulkan
         | BackendKind::Wgpu
         | BackendKind::Xla
-        | BackendKind::Unknown => {
-            TileLowering::default()
-        }
+        | BackendKind::Unknown => TileLowering::default(),
     }
 }
 

@@ -1147,7 +1147,7 @@ device = ["cpu"]
         }
         assert_eq!(
             KINDS.len(),
-            4,
+            5,
             "an engine kind was added without a line here, so nothing checks its \
              config spelling"
         );

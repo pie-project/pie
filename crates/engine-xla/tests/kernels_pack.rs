@@ -55,7 +55,9 @@ impl Native {
     fn read(&self, t: Tensor) -> Vec<f32> {
         self.planes[t.buf as usize]
             .3
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
             .collect()
     }

@@ -61,12 +61,15 @@ impl Device {
         let client = open_client(plugin).map_err(|e| Fault::NoDevice {
             detail: e.to_string(),
         })?;
-        let device = *client.devices().get(ordinal).ok_or_else(|| Fault::NoDevice {
-            detail: format!(
-                "device {ordinal} asked of a client that addresses {}",
-                client.devices().len()
-            ),
-        })?;
+        let device = *client
+            .devices()
+            .get(ordinal)
+            .ok_or_else(|| Fault::NoDevice {
+                detail: format!(
+                    "device {ordinal} asked of a client that addresses {}",
+                    client.devices().len()
+                ),
+            })?;
         let kind = client.device_kind(device).unwrap_or_default();
         let limit = client
             .memory_stats(device)
@@ -104,7 +107,11 @@ impl Device {
         };
         let kind = client
             .as_ref()
-            .and_then(|c| c.devices().get(ordinal).and_then(|d| c.device_kind(*d).ok()))
+            .and_then(|c| {
+                c.devices()
+                    .get(ordinal)
+                    .and_then(|d| c.device_kind(*d).ok())
+            })
             .unwrap_or_else(|| "dry".to_string());
         Ok(Device {
             client,
@@ -256,7 +263,10 @@ impl Device {
                 if let Some(file) = &file {
                     touch(file);
                 }
-                tracing::debug!(ms = started.elapsed().as_millis() as u64, "xla loaded a cached program");
+                tracing::debug!(
+                    ms = started.elapsed().as_millis() as u64,
+                    "xla loaded a cached program"
+                );
                 exe
             }
             None => {
@@ -340,7 +350,10 @@ pub(crate) fn open_client(plugin: Option<&std::path::Path>) -> Result<Client> {
                     return Err(Fault::NoDevice { detail: why });
                 }
                 if !told {
-                    tracing::warn!(wait, "the device is held by another process; waiting for it");
+                    tracing::warn!(
+                        wait,
+                        "the device is held by another process; waiting for it"
+                    );
                     told = true;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));

@@ -6,8 +6,10 @@
 //! plans its own temporaries), and no copy compaction (a traced slice is
 //! free).
 
-use kernels_xla::{Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor};
-use model_ir::{Def, Dim, Dtype, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
+use kernels_xla::{
+    Bank, Ctx, DecodePlan, KvPool, PrefillPlan, RaggedTensor, RecurrentPool, Tensor,
+};
+use model_ir::{Def, Dim, Dtype, GeomKind, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::store::{CachePool, CacheTable};
 use crate::trace::Handles;
@@ -144,8 +146,6 @@ pub struct Run<'c> {
 
     values: &'c [ValueDecl],
 
-    nodes: &'c [Node],
-
     weights: &'c WeightTable,
 
     arena: &'c SlotTable,
@@ -164,7 +164,7 @@ pub struct Run<'c> {
 
     compressor: Vec<(u32, [Tensor; 2])>,
 
-    rs: Option<std::sync::Arc<crate::rs::Seat>>,
+    rs: Option<std::rc::Rc<crate::rs::Seat>>,
 
     /// Values whose planes a debugging reader asked for, and what the walk
     /// read of them as their writers ran (see `DispatchProbe`).
@@ -183,7 +183,6 @@ impl<'c> Run<'c> {
         ctx: &'c Ctx<'c>,
         handles: &'c Handles,
         values: &'c [ValueDecl],
-        nodes: &'c [Node],
         weights: &'c WeightTable,
         arena: &'c SlotTable,
         caches: &'c CacheTable,
@@ -195,7 +194,6 @@ impl<'c> Run<'c> {
             ctx,
             handles,
             values,
-            nodes,
             weights,
             arena,
             caches,
@@ -225,7 +223,7 @@ impl<'c> Run<'c> {
 
     /// Hands the walk this fire's recurrent seat, when a lane buffers.
     #[must_use]
-    pub fn with_rs(mut self, rs: Option<std::sync::Arc<crate::rs::Seat>>) -> Self {
+    pub fn with_rs(mut self, rs: Option<std::rc::Rc<crate::rs::Seat>>) -> Self {
         self.rs = rs;
         self
     }
@@ -250,7 +248,7 @@ impl<'c> Run<'c> {
         std::mem::take(&mut self.probed.borrow_mut())
     }
 
-    pub(crate) fn rs_seat(&self) -> Option<std::sync::Arc<crate::rs::Seat>> {
+    pub(crate) fn rs_seat(&self) -> Option<std::rc::Rc<crate::rs::Seat>> {
         self.rs.clone()
     }
 
@@ -278,39 +276,17 @@ impl<'c> Run<'c> {
         &self.window().indptr_host
     }
 
-    pub(crate) fn total_tokens(&self) -> u32 {
-        self.window().span.rows
-    }
-
     pub(crate) fn cut_rows(&self, handle: Tensor) -> Tensor {
         let span = self.window().span;
         self.slice(handle, span.row_offset, span.rows)
-    }
-
-    pub(crate) fn at_region(&self) -> u32 {
-        self.place.region.get()
-    }
-
-    pub(crate) fn nodes(&self) -> &'c [Node] {
-        self.nodes
     }
 
     pub(crate) fn handles(&self) -> &'c Handles {
         self.handles
     }
 
-    pub(crate) fn values(&self) -> &'c [ValueDecl] {
-        self.values
-    }
-
     pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
         self.whole(id)
-    }
-
-    /// The root and row a handle starts at: two handles are the same memory
-    /// exactly when these agree.
-    pub(crate) fn address(&self, handle: u32) -> Option<(u32, u32)> {
-        self.handles.locate(handle)
     }
 
     pub(crate) fn ctx(&self) -> &'c Ctx<'c> {
@@ -580,9 +556,7 @@ impl<'c> Run<'c> {
             }
             RuntimeInput::RowPermutation { select } => packing(select).permutation,
             RuntimeInput::Latents { port: p, .. } => port(engine::fire::PortKind::Latents, p),
-            RuntimeInput::LaneVector { port: p, .. } => {
-                port(engine::fire::PortKind::LaneVector, p)
-            }
+            RuntimeInput::LaneVector { port: p, .. } => port(engine::fire::PortKind::LaneVector, p),
             RuntimeInput::Context { port: p, .. } => port(engine::fire::PortKind::Context, p),
             RuntimeInput::AxisPositions { port: p, .. } => {
                 port(engine::fire::PortKind::AxisPositions, p)
@@ -713,7 +687,10 @@ impl<'c> Run<'c> {
         let Def::Cache(space) = self.values[pages.0 as usize].def else {
             return None;
         };
-        self.compressor.iter().find(|(s, _)| *s == space).map(|(_, p)| *p)
+        self.compressor
+            .iter()
+            .find(|(s, _)| *s == space)
+            .map(|(_, p)| *p)
     }
 
     pub(crate) fn put(&mut self, id: ValueId, built: StructSlot) {
@@ -750,21 +727,6 @@ impl<'c> Run<'c> {
             ),
         }
     }
-
-    pub(crate) fn mla_plan(&self, id: ValueId) -> &kernels_xla::attn::mla::MlaPlan {
-        match &self.structs[self.struct_at(id)] {
-            Some(StructSlot::Mla(plan)) => plan,
-            Some(_) => panic!(
-                "value {} holds another plan kind, and this op consumes an MLA plan",
-                id.0
-            ),
-            None => panic!(
-                "value {} holds no plan payload; its plan op has not fired",
-                id.0
-            ),
-        }
-    }
 }
 
 impl model_exec::fire::fallback::Serve for Run<'_> {}
-

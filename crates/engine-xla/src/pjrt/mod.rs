@@ -181,14 +181,14 @@ impl fmt::Debug for Api {
 macro_rules! call {
     ($api:expr, $f:ident, $args:expr) => {{
         let api: &Api = $api;
-        let entry = api.entry(
-            std::mem::offset_of!(sys::PJRT_Api, $f),
-            stringify!($f),
-        );
+        let entry = api.entry(std::mem::offset_of!(sys::PJRT_Api, $f), stringify!($f));
         match entry {
             Err(e) => Err(e),
             Ok(()) => match unsafe { (*api.raw).$f } {
-                None => Err(Error::local(concat!(stringify!($f), " is absent from the plugin"))),
+                None => Err(Error::local(concat!(
+                    stringify!($f),
+                    " is absent from the plugin"
+                ))),
                 // SAFETY: the args struct is fully initialized with its
                 // struct_size by the caller, and outlives the call.
                 Some(f) => api.check(unsafe { f($args) }),
@@ -218,12 +218,16 @@ impl Api {
         let lib = unsafe { libloading::Library::new(path) }
             .map_err(|e| Error::local(format!("cannot load {}: {e}", path.display())))?;
         // SAFETY: `GetPjrtApi` is the one exported entry every PJRT plugin has.
-        let get: libloading::Symbol<'_, unsafe extern "C" fn() -> *const sys::PJRT_Api> =
-            unsafe { lib.get(b"GetPjrtApi\0") }
-                .map_err(|e| Error::local(format!("{} is not a PJRT plugin: {e}", path.display())))?;
+        let get: libloading::Symbol<'_, unsafe extern "C" fn() -> *const sys::PJRT_Api> = unsafe {
+            lib.get(b"GetPjrtApi\0")
+        }
+        .map_err(|e| Error::local(format!("{} is not a PJRT plugin: {e}", path.display())))?;
         let raw = unsafe { get() };
         if raw.is_null() {
-            return Err(Error::local(format!("{} returned no PJRT_Api", path.display())));
+            return Err(Error::local(format!(
+                "{} returned no PJRT_Api",
+                path.display()
+            )));
         }
         let api = Self {
             raw,
@@ -369,9 +373,8 @@ impl Client {
         let mut d = args!(PJRT_Client_AddressableDevices_Args { client: client.raw });
         call!(&client.api, PJRT_Client_AddressableDevices, &mut d)?;
         // SAFETY: the plugin owns this array for the client's lifetime.
-        let devices = unsafe {
-            std::slice::from_raw_parts(d.addressable_devices, d.num_addressable_devices)
-        };
+        let devices =
+            unsafe { std::slice::from_raw_parts(d.addressable_devices, d.num_addressable_devices) };
         client.devices = devices.iter().map(|&raw| Device { raw }).collect();
         Ok(client)
     }
@@ -649,8 +652,8 @@ impl Executable {
         let done = call!(&self.api, PJRT_Executable_Serialize, &mut a);
         let bytes = done.map(|()| {
             // SAFETY: the plugin owns these bytes until the deleter runs.
-            let out = unsafe { slice(a.serialized_bytes.cast::<u8>(), a.serialized_bytes_size) }
-                .to_vec();
+            let out =
+                unsafe { slice(a.serialized_bytes.cast::<u8>(), a.serialized_bytes_size) }.to_vec();
             if let Some(deleter) = a.serialized_executable_deleter {
                 unsafe { deleter(a.serialized_executable) };
             }

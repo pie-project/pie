@@ -8,7 +8,9 @@ use kernels_xla::elemwise::{act, rope, rope_mrope};
 fn data(n: usize, seed: u32) -> Vec<f32> {
     (0..n)
         .map(|i| {
-            let h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(40503));
+            let h = (i as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(seed.wrapping_mul(40503));
             round_bf16(((h >> 8) % 2000) as f32 / 1000.0 - 1.0)
         })
         .collect()
@@ -19,7 +21,15 @@ type Pair = (usize, usize, usize, f32);
 
 /// Rotates every `unit`-wide run of each row by `pairs`, angles `pos[row][axis]·freq`,
 /// cos/sin scaled by `m`; rounds to bf16.
-fn turn_ref(x: &[f32], width: usize, unit: usize, pairs: &[Pair], pos: &[f32], axes: usize, m: f32) -> Vec<f32> {
+fn turn_ref(
+    x: &[f32],
+    width: usize,
+    unit: usize,
+    pairs: &[Pair],
+    pos: &[f32],
+    axes: usize,
+    m: f32,
+) -> Vec<f32> {
     let mut out = x.to_vec();
     for (row, chunk) in out.chunks_mut(width).enumerate() {
         for run in chunk.chunks_mut(unit) {
@@ -40,10 +50,21 @@ fn inv_freq(theta: f32, i: usize, span: u32) -> f32 {
     theta.powf(-2.0 * i as f32 / span as f32)
 }
 
-fn neox_pairs(hd: usize, rot: usize, theta: f32, span: u32, interleaved: bool, offset: usize) -> Vec<Pair> {
+fn neox_pairs(
+    hd: usize,
+    rot: usize,
+    theta: f32,
+    span: u32,
+    interleaved: bool,
+    offset: usize,
+) -> Vec<Pair> {
     (0..rot / 2)
         .map(|i| {
-            let (lo, hi) = if interleaved { (2 * i, 2 * i + 1) } else { (i, i + rot / 2) };
+            let (lo, hi) = if interleaved {
+                (2 * i, 2 * i + 1)
+            } else {
+                (i, i + rot / 2)
+            };
             let _ = hd;
             (offset + lo, offset + hi, 0, inv_freq(theta, i, span))
         })
@@ -115,10 +136,30 @@ fn full_rope_turns_halves_and_interleaved_pairs() {
     let pf: Vec<f32> = pos.iter().map(|&v| v as f32).collect();
     let n = neox_pairs(hd, hd, theta, hd as u32, false, 0);
     let il = neox_pairs(hd, hd, theta, hd as u32, true, 0);
-    assert_close(&b.read_f32(q), &turn_ref(&qs, 2 * hd, hd, &n, &pf, 1, 1.0), 1e-2, 1e-2);
-    assert_close(&b.read_f32(k), &turn_ref(&ks, hd, hd, &n, &pf, 1, 1.0), 1e-2, 1e-2);
-    assert_close(&b.read_f32(qi), &turn_ref(&qs, 2 * hd, hd, &il, &pf, 1, 1.0), 1e-2, 1e-2);
-    assert_close(&b.read_f32(ki), &turn_ref(&ks, hd, hd, &il, &pf, 1, 1.0), 1e-2, 1e-2);
+    assert_close(
+        &b.read_f32(q),
+        &turn_ref(&qs, 2 * hd, hd, &n, &pf, 1, 1.0),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(k),
+        &turn_ref(&ks, hd, hd, &n, &pf, 1, 1.0),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(qi),
+        &turn_ref(&qs, 2 * hd, hd, &il, &pf, 1, 1.0),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(ki),
+        &turn_ref(&ks, hd, hd, &il, &pf, 1, 1.0),
+        1e-2,
+        1e-2,
+    );
 }
 
 fn ramp(head_dim: u32, theta: f32, fast: f32, slow: f32, orig: u32) -> (f32, f32) {
@@ -130,7 +171,11 @@ fn ramp(head_dim: u32, theta: f32, fast: f32, slow: f32, orig: u32) -> (f32, f32
 }
 
 fn bend(f: f32, factor: f32, low: f32, high: f32, i: usize) -> f32 {
-    let denom = if high == low { high + 1e-3 - low } else { high - low };
+    let denom = if high == low {
+        high + 1e-3 - low
+    } else {
+        high - low
+    };
     let r = ((i as f32 - low) / denom).clamp(0.0, 1.0);
     f * ((1.0 - r) + r / factor)
 }
@@ -156,7 +201,17 @@ fn the_tail_rope_turns_inverse_interleaved_and_yarn_ramped() {
         .run(|ctx| {
             rope::partial_last(ctx, a, p, rot as u32, hd as u32, theta, false, false, None)?;
             rope::partial_last(ctx, c, p, rot as u32, hd as u32, theta, true, true, None)?;
-            rope::partial_last(ctx, d, p, rot as u32, hd as u32, theta, false, false, Some(yarn))
+            rope::partial_last(
+                ctx,
+                d,
+                p,
+                rot as u32,
+                hd as u32,
+                theta,
+                false,
+                false,
+                Some(yarn),
+            )
         })
         .unwrap()
     {
@@ -175,9 +230,24 @@ fn the_tail_rope_turns_inverse_interleaved_and_yarn_ramped() {
         .enumerate()
         .map(|(i, &(l, h, a, f))| (l, h, a, bend(f, 4.0, low, high, i)))
         .collect();
-    assert_close(&b.read_f32(a), &turn_ref(&xs, 2 * hd, hd, &plain, &pf, 1, 1.0), 1e-2, 1e-2);
-    assert_close(&b.read_f32(c), &turn_ref(&xs, 2 * hd, hd, &inv, &pf, 1, 1.0), 1e-2, 1e-2);
-    assert_close(&b.read_f32(d), &turn_ref(&xs, 2 * hd, hd, &ramped, &pf, 1, 1.0), 1e-2, 1e-2);
+    assert_close(
+        &b.read_f32(a),
+        &turn_ref(&xs, 2 * hd, hd, &plain, &pf, 1, 1.0),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(c),
+        &turn_ref(&xs, 2 * hd, hd, &inv, &pf, 1, 1.0),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(d),
+        &turn_ref(&xs, 2 * hd, hd, &ramped, &pf, 1, 1.0),
+        1e-2,
+        1e-2,
+    );
 }
 
 #[test]
@@ -194,8 +264,12 @@ fn yarn_rope_bends_frequencies_and_scales_both_halves() {
     let ki = b.bf16(rows as u32, hd as u32, &ks);
     if !b
         .run(|ctx| {
-            rope::yarn(ctx, q, k, p, hd as u32, theta, 40.0, 32.0, 1.0, 1.2, 4096, false)?;
-            rope::yarn(ctx, qi, ki, p, hd as u32, theta, 40.0, 32.0, 1.0, 1.2, 4096, true)
+            rope::yarn(
+                ctx, q, k, p, hd as u32, theta, 40.0, 32.0, 1.0, 1.2, 4096, false,
+            )?;
+            rope::yarn(
+                ctx, qi, ki, p, hd as u32, theta, 40.0, 32.0, 1.0, 1.2, 4096, true,
+            )
         })
         .unwrap()
     {
@@ -211,10 +285,30 @@ fn yarn_rope_bends_frequencies_and_scales_both_halves() {
             .collect()
     };
     let (n, il) = (mk(false), mk(true));
-    assert_close(&b.read_f32(q), &turn_ref(&qs, 2 * hd, hd, &n, &pf, 1, 1.2), 1e-2, 1e-2);
-    assert_close(&b.read_f32(k), &turn_ref(&ks, hd, hd, &n, &pf, 1, 1.2), 1e-2, 1e-2);
-    assert_close(&b.read_f32(qi), &turn_ref(&qs, 2 * hd, hd, &il, &pf, 1, 1.2), 1e-2, 1e-2);
-    assert_close(&b.read_f32(ki), &turn_ref(&ks, hd, hd, &il, &pf, 1, 1.2), 1e-2, 1e-2);
+    assert_close(
+        &b.read_f32(q),
+        &turn_ref(&qs, 2 * hd, hd, &n, &pf, 1, 1.2),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(k),
+        &turn_ref(&ks, hd, hd, &n, &pf, 1, 1.2),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(qi),
+        &turn_ref(&qs, 2 * hd, hd, &il, &pf, 1, 1.2),
+        1e-2,
+        1e-2,
+    );
+    assert_close(
+        &b.read_f32(ki),
+        &turn_ref(&ks, hd, hd, &il, &pf, 1, 1.2),
+        1e-2,
+        1e-2,
+    );
 }
 
 #[test]
@@ -235,9 +329,36 @@ fn mrope_reads_each_pairs_axis_in_all_three_forms() {
     }
     if !b
         .run(|ctx| {
-            rope_mrope::interleaved(ctx, planes[0].0, planes[0].1, p, sections, rot as u32, hd as u32, theta)?;
-            rope_mrope::blocked(ctx, planes[1].0, planes[1].1, p, sections, rot as u32, hd as u32, theta)?;
-            rope_mrope::split(ctx, planes[2].0, planes[2].1, p, sections, rot as u32, hd as u32, theta)
+            rope_mrope::interleaved(
+                ctx,
+                planes[0].0,
+                planes[0].1,
+                p,
+                sections,
+                rot as u32,
+                hd as u32,
+                theta,
+            )?;
+            rope_mrope::blocked(
+                ctx,
+                planes[1].0,
+                planes[1].1,
+                p,
+                sections,
+                rot as u32,
+                hd as u32,
+                theta,
+            )?;
+            rope_mrope::split(
+                ctx,
+                planes[2].0,
+                planes[2].1,
+                p,
+                sections,
+                rot as u32,
+                hd as u32,
+                theta,
+            )
         })
         .unwrap()
     {
@@ -281,12 +402,27 @@ fn mrope_reads_each_pairs_axis_in_all_three_forms() {
         .map(|i| {
             let (axis, within, before) = sect(i);
             let lo = 2 * before + within;
-            (lo, lo + s[axis], axis, theta.powf(-(within as f32) / s[axis] as f32))
+            (
+                lo,
+                lo + s[axis],
+                axis,
+                theta.powf(-(within as f32) / s[axis] as f32),
+            )
         })
         .collect();
     for (plane, pairs) in planes.iter().zip([&inter, &blocked, &split]) {
-        assert_close(&b.read_f32(plane.0), &turn_ref(&qs, 2 * hd, hd, pairs, &pf, 3, 1.0), 1e-2, 1e-2);
-        assert_close(&b.read_f32(plane.1), &turn_ref(&ks, hd, hd, pairs, &pf, 3, 1.0), 1e-2, 1e-2);
+        assert_close(
+            &b.read_f32(plane.0),
+            &turn_ref(&qs, 2 * hd, hd, pairs, &pf, 3, 1.0),
+            1e-2,
+            1e-2,
+        );
+        assert_close(
+            &b.read_f32(plane.1),
+            &turn_ref(&ks, hd, hd, pairs, &pf, 3, 1.0),
+            1e-2,
+            1e-2,
+        );
     }
 }
 
@@ -302,19 +438,35 @@ fn rope_axes_turns_each_form_and_the_ladder() {
     let p = b.f32(rows as u32, 3, &pos);
     let w = (2 * hd) as u32;
     let src = b.bf16(rows as u32, w, &xs);
-    let outs: Vec<_> = (0..3).map(|_| b.zeros(Dtype::Bf16, rows as u32, w)).collect();
+    let outs: Vec<_> = (0..3)
+        .map(|_| b.zeros(Dtype::Bf16, rows as u32, w))
+        .collect();
     // Ladder: 2 heads of 64, rotary 64, three flat axes of 16 → pad 40.
     let (lhd, lrot) = (64usize, 64usize);
     let ldims = [16u32, 16, 16, 0];
     let lx = data(rows * 2 * lhd, 11);
     let lsrc = b.bf16(rows as u32, (2 * lhd) as u32, &lx);
-    let forms = [act::RopeForm::Interleaved, act::RopeForm::Neox, act::RopeForm::Split];
+    let forms = [
+        act::RopeForm::Interleaved,
+        act::RopeForm::Neox,
+        act::RopeForm::Split,
+    ];
     if !b
         .run(|ctx| {
             for (f, o) in forms.iter().zip(&outs) {
                 act::rope_axes(ctx, src, p, dims, thetas, *f, rot as u32, hd as u32, *o)?;
             }
-            act::rope_axes(ctx, lsrc, p, ldims, thetas, act::RopeForm::SplitLadder, lrot as u32, lhd as u32, lsrc)
+            act::rope_axes(
+                ctx,
+                lsrc,
+                p,
+                ldims,
+                thetas,
+                act::RopeForm::SplitLadder,
+                lrot as u32,
+                lhd as u32,
+                lsrc,
+            )
         })
         .unwrap()
     {
@@ -340,7 +492,12 @@ fn rope_axes_turns_each_form_and_the_ladder() {
             };
             pairs.push((lo, hi, axis, fr));
         }
-        assert_close(&b.read_f32(*o), &turn_ref(&xs, 2 * hd, hd, &pairs, &pos, 3, 1.0), 1e-2, 1e-2);
+        assert_close(
+            &b.read_f32(*o),
+            &turn_ref(&xs, 2 * hd, hd, &pairs, &pos, 3, 1.0),
+            1e-2,
+            1e-2,
+        );
     }
     let la = lrot / 2;
     let pad = (2 * lrot - 48) / 2;
@@ -360,7 +517,12 @@ fn rope_axes_turns_each_form_and_the_ladder() {
             lp.push((lo, lo + la, axis, tp(thetas[axis], e)));
         }
     }
-    assert_close(&b.read_f32(lsrc), &turn_ref(&lx, 2 * lhd, 2 * lhd, &lp, &pos, 3, 1.0), 2e-2, 1e-2);
+    assert_close(
+        &b.read_f32(lsrc),
+        &turn_ref(&lx, 2 * lhd, 2 * lhd, &lp, &pos, 3, 1.0),
+        2e-2,
+        1e-2,
+    );
 }
 
 #[test]
@@ -375,7 +537,9 @@ fn the_fused_q_norm_rope_norms_the_head_then_turns_its_prefix() {
     let p = b.i32(rows as u32, 1, &pos);
     let y = b.zeros(Dtype::Bf16, rows as u32, (heads * hd) as u32);
     if !b
-        .run(|ctx| rope::rmsnorm_rope_partial_q(ctx, x, w, hd as u32, 1e-6, p, rot as u32, theta, y))
+        .run(|ctx| {
+            rope::rmsnorm_rope_partial_q(ctx, x, w, hd as u32, 1e-6, p, rot as u32, theta, y)
+        })
         .unwrap()
     {
         return;
@@ -390,5 +554,10 @@ fn the_fused_q_norm_rope_norms_the_head_then_turns_its_prefix() {
     }
     let pf: Vec<f32> = pos.iter().map(|&v| v as f32).collect();
     let pairs = neox_pairs(hd, rot, theta, rot as u32, false, 0);
-    assert_close(&b.read_f32(y), &turn_ref(&normed, heads * hd, hd, &pairs, &pf, 1, 1.0), 2e-2, 1e-2);
+    assert_close(
+        &b.read_f32(y),
+        &turn_ref(&normed, heads * hd, hd, &pairs, &pf, 1, 1.0),
+        2e-2,
+        1e-2,
+    );
 }

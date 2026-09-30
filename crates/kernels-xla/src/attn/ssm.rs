@@ -218,7 +218,12 @@ pub(crate) fn land_rows(f: &mut Func, slab: Val, slot: Val, write: Val, rows: Va
 /// `(8, 128)`, so a row of a `[slots, stride]` bank is strided across tiles
 /// shared by eight slots, and gathering or scattering it is several times
 /// slower than moving a block of whole tiles.
-pub(crate) fn slot_rows(op: &'static str, what: &str, bank: Tensor, stride: u64) -> Result<i64, Error> {
+pub(crate) fn slot_rows(
+    op: &'static str,
+    what: &str,
+    bank: Tensor,
+    stride: u64,
+) -> Result<i64, Error> {
     let width = u64::from(bank.width);
     if width == stride {
         return Ok(1);
@@ -267,7 +272,14 @@ pub(crate) fn take_slots(f: &mut Func, slab: Val, slot: Val, per: i64) -> Built<
 /// Scatters `rows` (`[L, per · width]`) over the slots of a bank of `per`
 /// rows per slot, dropping the lanes `write` is false for (and any slot out
 /// of range).
-pub(crate) fn land_slots(f: &mut Func, slab: Val, slot: Val, write: Val, rows: Val, per: i64) -> Built<Val> {
+pub(crate) fn land_slots(
+    f: &mut Func,
+    slab: Val,
+    slot: Val,
+    write: Val,
+    rows: Val,
+    per: i64,
+) -> Built<Val> {
     if per == 1 {
         return land_rows(f, slab, slot, write, rows);
     }
@@ -579,14 +591,19 @@ fn conv(
     let hist = u64::from(taps - 1) * u64::from(dil) + 1;
     let per = slot_rows(
         op,
-        &format!("conv (a width of {taps} at dilation {dil} keeps {hist} rows of {channels} channels)"),
+        &format!(
+            "conv (a width of {taps} at dilation {dil} keeps {hist} rows of {channels} channels)"
+        ),
         state.conv_state,
         hist * u64::from(channels),
     )?;
     match lanes {
         ConvLanes::Decode => {
             if state.slots.elements() < u64::from(x.rows) {
-                return Err(refuse(op, "the pool names fewer slots than the fire has rows"));
+                return Err(refuse(
+                    op,
+                    "the pool names fewer slots than the fire has rows",
+                ));
             }
         }
         ConvLanes::Ragged(indptr) | ConvLanes::Committed(indptr, _) => csr_lanes(op, indptr)?,
@@ -780,7 +797,10 @@ pub fn gdn_prep(
     }
     for (what, t) in [("dt_bias", dt_bias), ("a_log", a_log)] {
         if t.elements() != vh as u64 {
-            return Err(refuse(OP, format!("the {what} bank is not one value per head")));
+            return Err(refuse(
+                OP,
+                format!("the {what} bank is not one value per head"),
+            ));
         }
     }
     let rows = i64::from(ba.rows);
@@ -834,7 +854,11 @@ fn l2norm(f: &mut Func, x: Val, eps: f64, scale: f64) -> Built<Val> {
     let s = f.reduce(sq, &[2], Fold::Sum)?;
     let s = f.offset(s, eps)?;
     let inv = f.rsqrt(s);
-    let inv = if scale == 1.0 { inv } else { f.scale(inv, scale)? };
+    let inv = if scale == 1.0 {
+        inv
+    } else {
+        f.scale(inv, scale)?
+    };
     let inv = f.broadcast(inv, &d, &[0, 1])?;
     f.mul(x, inv)
 }
@@ -1274,7 +1298,12 @@ fn unit_lower_inverse(f: &mut Func, a: Val) -> Built<Val> {
     let mut blocks = Vec::with_capacity(m as usize);
     for i in 0..m {
         let lo = i * b0;
-        let blk = f.slice(a, &[0, 0, lo, lo], &[n0, n1, lo + b0, lo + b0], &[1, 1, 1, 1])?;
+        let blk = f.slice(
+            a,
+            &[0, 0, lo, lo],
+            &[n0, n1, lo + b0, lo + b0],
+            &[1, 1, 1, 1],
+        )?;
         blocks.push(f.reshape(blk, &[n0, n1, 1, b0, b0])?);
     }
     let diag = f.concat(&blocks, 2)?;
@@ -1288,7 +1317,12 @@ fn unit_lower_inverse(f: &mut Func, a: Val) -> Built<Val> {
             e
         } else {
             let xs = f.concat(&rows, 3)?;
-            let ai = f.slice(diag, &[0, 0, 0, i, 0], &[n0, n1, m, i + 1, i], &[1, 1, 1, 1, 1])?;
+            let ai = f.slice(
+                diag,
+                &[0, 0, 0, i, 0],
+                &[n0, n1, m, i + 1, i],
+                &[1, 1, 1, 1, 1],
+            )?;
             let ai = f.reshape(ai, &[n0, n1, m, i])?;
             let ai = f.broadcast(ai, &[n0, n1, m, i, b0], &[0, 1, 2, 3])?;
             let prod = f.mul(ai, xs)?;
@@ -1303,9 +1337,19 @@ fn unit_lower_inverse(f: &mut Func, a: Val) -> Built<Val> {
     while mm > 1 {
         let half = mm / 2;
         let pairs = f.reshape(inv, &[n0, n1, half, 2, b, b])?;
-        let x11 = f.slice(pairs, &[0, 0, 0, 0, 0, 0], &[n0, n1, half, 1, b, b], &[1; 6])?;
+        let x11 = f.slice(
+            pairs,
+            &[0, 0, 0, 0, 0, 0],
+            &[n0, n1, half, 1, b, b],
+            &[1; 6],
+        )?;
         let x11 = f.reshape(x11, &[n0, n1, half, b, b])?;
-        let x22 = f.slice(pairs, &[0, 0, 0, 1, 0, 0], &[n0, n1, half, 2, b, b], &[1; 6])?;
+        let x22 = f.slice(
+            pairs,
+            &[0, 0, 0, 1, 0, 0],
+            &[n0, n1, half, 2, b, b],
+            &[1; 6],
+        )?;
         let x22 = f.reshape(x22, &[n0, n1, half, b, b])?;
         let mut a21s = Vec::with_capacity(half as usize);
         for p in 0..half {
@@ -1459,7 +1503,10 @@ fn delta(
     match lanes {
         DeltaLanes::Decode => {
             if state.slots.elements() < u64::from(rows) {
-                return Err(refuse(op, "the pool names fewer slots than the fire has rows"));
+                return Err(refuse(
+                    op,
+                    "the pool names fewer slots than the fire has rows",
+                ));
             }
         }
         DeltaLanes::Ragged(indptr) | DeltaLanes::Committed(indptr, _) => csr_lanes(op, indptr)?,
@@ -1518,7 +1565,11 @@ fn delta(
                     ys.push(yv);
                     lo = hi;
                 }
-                let yv = if ys.len() == 1 { ys[0] } else { f.concat(&ys, 0)? };
+                let yv = if ys.len() == 1 {
+                    ys[0]
+                } else {
+                    f.concat(&ys, 0)?
+                };
                 (yv, slab)
             }
             DeltaLanes::Ragged(indptr) | DeltaLanes::Committed(indptr, _) => {
@@ -1685,16 +1736,28 @@ fn kda_in(
     nonzero(op, "the KDA head width this statement states", head_dim)?;
     let (h, d) = (i64::from(heads), i64::from(head_dim));
     if i64::from(mixed.width) != 3 * h * d {
-        return Err(refuse(op, "the post-convolution `[q | k | v]` row is not three head planes"));
+        return Err(refuse(
+            op,
+            "the post-convolution `[q | k | v]` row is not three head planes",
+        ));
     }
     if f.rows != mixed.rows || i64::from(f.width) != h * d {
-        return Err(refuse(op, "the forget projection's row is not one head plane"));
+        return Err(refuse(
+            op,
+            "the forget projection's row is not one head plane",
+        ));
     }
     if b.rows != mixed.rows || i64::from(b.width) != h {
-        return Err(refuse(op, "the beta projection's row is not one entry per head"));
+        return Err(refuse(
+            op,
+            "the beta projection's row is not one entry per head",
+        ));
     }
     if dt_bias.elements() != (h * d) as u64 || a_log.elements() != h as u64 {
-        return Err(refuse(op, "the decay banks are not one plane / one value per head"));
+        return Err(refuse(
+            op,
+            "the decay banks are not one plane / one value per head",
+        ));
     }
     Ok(DeltaIn::Kda {
         mixed,
@@ -1725,7 +1788,9 @@ pub fn kda_step(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_step";
-    let input = kda_in(OP, mixed, f, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor)?;
+    let input = kda_in(
+        OP, mixed, f, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor,
+    )?;
     delta(ctx, OP, input, DeltaLanes::Decode, state, y)
 }
 
@@ -1770,7 +1835,9 @@ pub fn kda_committed(
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_committed";
-    let input = kda_in(OP, mixed, f, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor)?;
+    let input = kda_in(
+        OP, mixed, f, b, dt_bias, a_log, heads, head_dim, norm_eps, gate_floor,
+    )?;
     delta(
         ctx,
         OP,
@@ -1804,7 +1871,10 @@ pub fn block_dyn_conv(
     let taps = nonzero(OP, "the tap count this statement states", taps)?;
     let group = nonzero(OP, "the channels sharing one correction", group)?;
     if side > 1 {
-        return Err(refuse(OP, format!("side {side} is stated, and the projection carries two")));
+        return Err(refuse(
+            OP,
+            format!("side {side} is stated, and the projection carries two"),
+        ));
     }
     if !channels.is_multiple_of(group) {
         return Err(refuse(
@@ -1814,10 +1884,16 @@ pub fn block_dyn_conv(
     }
     let groups = channels / group;
     if coeff.width != 2 * taps * groups || coeff.rows != x.data.rows {
-        return Err(refuse(OP, "the coefficients are not two sides of taps over groups per row"));
+        return Err(refuse(
+            OP,
+            "the coefficients are not two sides of taps over groups per row",
+        ));
     }
     if base.rows != 2 * taps || base.width != channels {
-        return Err(refuse(OP, "the base kernel is not two sides of taps over channels"));
+        return Err(refuse(
+            OP,
+            "the base kernel is not two sides of taps over channels",
+        ));
     }
     if y.rows != x.data.rows || y.width != channels {
         return Err(refuse(OP, "the convolution lands the rows it convolves"));

@@ -43,12 +43,16 @@ impl std::fmt::Debug for Kept {
 
 fn floats(raw: &[u8], f32: bool) -> Vec<f32> {
     if f32 {
-        raw.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        raw.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     } else {
-        raw.chunks_exact(2)
-            .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+        raw.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
             .collect()
     }
 }

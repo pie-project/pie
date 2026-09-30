@@ -208,10 +208,7 @@ pub enum Fault {
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Deviceless => write!(
-                f,
-                "no PJRT device is open on this engine"
-            ),
+            Self::Deviceless => write!(f, "no PJRT device is open on this engine"),
             Self::Xla { what, why } => write!(f, "`{what}` refused: {why}"),
             Self::NoDevice { detail } => write!(f, "no PJRT device to open: {detail}"),
             Self::Device { call, why } => write!(f, "`{call}` refused: {why}"),

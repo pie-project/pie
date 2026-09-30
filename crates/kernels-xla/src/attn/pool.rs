@@ -95,7 +95,10 @@ fn long_enough(op: &'static str, what: &str, t: Tensor, n: u32) -> Result<(), Er
     if t.elements() < u64::from(n) {
         return Err(refuse(
             op,
-            format!("the {what} holds {} entries and this op reads {n}", t.elements()),
+            format!(
+                "the {what} holds {} entries and this op reads {n}",
+                t.elements()
+            ),
         ));
     }
     Ok(())
@@ -119,7 +122,10 @@ fn boundary(
     for t in [boundary_pos, boundary_req, boundary_rope] {
         expect(op, t, &[Dtype::I32])?;
         if t.rows != n {
-            return Err(refuse(op, "the boundary tables are one entry per token row"));
+            return Err(refuse(
+                op,
+                "the boundary tables are one entry per token row",
+            ));
         }
     }
     long_enough(op, "position table", positions, n)?;
@@ -318,7 +324,10 @@ pub fn gather(
         Some(a) => {
             return Err(refuse(
                 OP,
-                format!("an ape {} wide is neither one head width ({hd}) nor two", a.width),
+                format!(
+                    "an ape {} wide is neither one head width ({hd}) nor two",
+                    a.width
+                ),
             ));
         }
     };
@@ -332,13 +341,19 @@ pub fn gather(
     if let Some(a) = ape
         && (a.dtype != Dtype::F32 || a.width != width || a.rows != ratio)
     {
-        return Err(refuse(OP, "the absolute-position plane is not an f32 [ratio, width]"));
+        return Err(refuse(
+            OP,
+            "the absolute-position plane is not an f32 [ratio, width]",
+        ));
     }
     if pages.page_size <= 0 {
         return Err(refuse(OP, "the pooled space's page size is zero"));
     }
     if entries.rows != rows || boundary_req.rows != rows {
-        return Err(refuse(OP, "the boundary tables and entries are one row per token row"));
+        return Err(refuse(
+            OP,
+            "the boundary tables and entries are one row per token row",
+        ));
     }
     let (n, hd, r, coff) = (
         i64::from(rows),
@@ -454,7 +469,10 @@ pub fn kv_append(
     expect(OP, entries, &[Dtype::Bf16])?;
     let rows = nonzero(OP, "rows", entries.rows)?;
     if pool.keys.width < entries.width {
-        return Err(refuse(OP, "the compressed pool's row is narrower than the entry"));
+        return Err(refuse(
+            OP,
+            "the compressed pool's row is narrower than the entry",
+        ));
     }
     long_enough(OP, "boundary position table", boundary_pos, rows)?;
     long_enough(OP, "boundary request table", boundary_req, rows)?;
@@ -646,12 +664,17 @@ fn reader(
     let d = nonzero(op, "the head width", head_dim)?;
     let rows = nonzero(op, "rows", o.rows)?;
     let ratio = nonzero(op, "the pooling ratio", ratio)?;
-    if q.rows < rows || q.width != h * d || o.width != h * d || lse.rows != rows || lse.width != h
-    {
-        return Err(refuse(op, "q, o and lse are not [rows, heads x head width] / [rows, heads]"));
+    if q.rows < rows || q.width != h * d || o.width != h * d || lse.rows != rows || lse.width != h {
+        return Err(refuse(
+            op,
+            "q, o and lse are not [rows, heads x head width] / [rows, heads]",
+        ));
     }
     if entries.keys.width < d {
-        return Err(refuse(op, "the compressed pool's row is narrower than a head"));
+        return Err(refuse(
+            op,
+            "the compressed pool's row is narrower than a head",
+        ));
     }
     long_enough(op, "position table", positions, rows)?;
     long_enough(op, "owning-request table", request_of_token, rows)?;
@@ -661,7 +684,12 @@ fn reader(
             return Err(refuse(op, "the selection is not [rows, top_k]"));
         }
     }
-    let (n, hh, dd, rt) = (i64::from(rows), i64::from(h), i64::from(d), i64::from(ratio));
+    let (n, hh, dd, rt) = (
+        i64::from(rows),
+        i64::from(h),
+        i64::from(d),
+        i64::from(ratio),
+    );
     let nk = match selection {
         Some((_, k)) => i64::from(k),
         None => i64::from(entries.max_pages) * i64::from(entries.page_size) / rt,

@@ -597,3 +597,120 @@ fn a_grouped_matmul_runs_each_slice_through_its_expert() {
         assert_close(&b.read_f32(y), &want, 0.01 * scale.max(1.0), 1e-2);
     }
 }
+
+/// An e5m2-exact weight (what `kernels_xla::pack` lands pre-scaled mxfp4 as).
+fn e5m2_data(n: usize, seed: u32) -> Vec<f32> {
+    const V: [f32; 8] = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0];
+    (0..n)
+        .map(|i| {
+            let h = hash(i, seed);
+            let v = V[(h % 8) as usize];
+            if h & 256 != 0 { -v } else { v }
+        })
+        .collect()
+}
+
+/// The grouped-matmul kernel (`kernels_xla::mosaic::gmm`) at the three
+/// cuts it makes of a bank: the TPU's `E·N`-minor layout in whole
+/// 128-lane blocks and in per-expert element windows (N not whole lane
+/// tiles: gpt-oss's down bank), and a row-major bank; e5m2 and bf16
+/// weights, per-token and per-pair rows, experts with more rows than a
+/// tile, unrouted pairs, a bias. `PIE_XLA_MOE_GMM=0` or another forced
+/// path checks the same cases on the XLA paths.
+#[test]
+fn the_grouped_matmul_kernel_answers_the_host() {
+    let forced = std::env::var("PIE_XLA_MOE_PATH").ok();
+    // (experts, N, K, weights e5m2): K 160 is not whole lane tiles, so the
+    // TPU lays the [E·N, K] bank E·N-minor.
+    for (e, n, k, f8) in [
+        (4usize, 256usize, 160usize, true),
+        (4, 192, 160, true),
+        (5, 64, 256, false),
+    ] {
+        let w = if f8 {
+            e5m2_data(e * n * k, 90 + n as u32)
+        } else {
+            data(e * n * k, 91)
+                .iter()
+                .map(|v| round_bf16(v * 0.25))
+                .collect()
+        };
+        let bias = data(e * n, 92);
+        for (t, tk, per_token, crowded) in [
+            (9usize, 3usize, true, false),
+            (20, 4, true, true),
+            (12, 2, false, false),
+        ] {
+            let rows = if per_token { t } else { t * tk };
+            let x = data(rows * k, 93 + t as u32);
+            let mut routes: Vec<i32> = (0..t * tk)
+                .map(|i| (hash(i, 94 + t as u32) % e as u32) as i32)
+                .collect();
+            if crowded {
+                // Most of the pairs on expert 2 (two tiles and a bit), some
+                // repeats within a token.
+                for (i, r) in routes.iter_mut().enumerate() {
+                    if i % 5 != 0 {
+                        *r = 2;
+                    }
+                }
+            }
+            routes[1] = -1;
+            routes[t * tk - 1] = e as i32;
+            let mut b = Bench::new();
+            let xt = b.bf16(rows as u32, k as u32, &x);
+            let rt = b.i32(t as u32, tk as u32, &routes);
+            let bt = b.bf16(e as u32, n as u32, &bias);
+            let y = b.bf16((t * tk) as u32, n as u32, &vec![PREV; t * tk * n]);
+            let biased = f8 && !per_token;
+            let run = if f8 {
+                let bytes: Vec<u8> = w
+                    .iter()
+                    .map(|&v| (kernels_xla::hlo::f16_bits(v) >> 8) as u8)
+                    .collect();
+                let codes = b.raw(Dtype::E5m2, (e * n) as u32, k as u32, bytes);
+                let scales = b.u8((e * n) as u32, (k / 32) as u32, &vec![127; e * n * k / 32]);
+                let bank = Bank {
+                    codes,
+                    scales,
+                    biases: None,
+                    group: 32,
+                    bits: 4,
+                };
+                if biased {
+                    b.run(|ctx| moe::matmul_select_bias(ctx, xt, bank, bt, rt, y))
+                } else {
+                    b.run(|ctx| moe::matmul_select_quant(ctx, xt, bank, rt, y))
+                }
+            } else {
+                let d = b.bf16((e * n) as u32, k as u32, &w);
+                b.run(|ctx| moe::matmul_select(ctx, xt, d, rt, y))
+            };
+            if !run.unwrap_or_else(|err| panic!("{err}\n{}", b.last_module)) {
+                return;
+            }
+            let off = std::env::var("PIE_XLA_MOE_GMM").is_ok_and(|v| v == "0");
+            if forced.as_deref() == Some("gmm") || (forced.is_none() && !off) {
+                assert!(
+                    b.last_module.contains("tpu_custom_call"),
+                    "the kernel ran for {e}x{n}x{k}"
+                );
+            }
+            let want = select_ref(
+                &w,
+                e,
+                n,
+                k,
+                &x,
+                per_token,
+                &routes,
+                tk,
+                biased.then_some(&bias[..]),
+                PREV,
+            );
+            let got = b.read_f32(y);
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert_close(&got, &want, 0.01 * scale.max(1.0), 1e-2);
+        }
+    }
+}

@@ -1059,6 +1059,200 @@ fn ragged_dot(cx: &mut Cx<'_>, x: Val, w: Val, sizes: Val) -> Result<Val, Error>
     Ok(cx.op_named("chlo.ragged_dot", &[x, w, sizes], attrs, vec![out])[0])
 }
 
+/// Rows of one tile of the grouped matmul kernel (bf16 rows pack in pairs
+/// of sublanes: 16 is the least whole tile).
+const GMM_TM: i64 = 16;
+
+/// `table[ids]` for a short i32 `table` (`[E]`) and `[n]` i32 `ids` in
+/// range, as a one-hot select and sum: XLA lowers a gather from a table this
+/// small to a serial chain of scalar selects (v6e: ~40 us over 768 ids).
+fn pick_small(cx: &mut Cx<'_>, table: Val, ids: Val) -> Result<Val, Error> {
+    let e = cx.dims(table)[0];
+    let n = cx.dims(ids)[0];
+    let is = cx.broadcast(ids, &[n, e], &[0])?;
+    let es = cx.iota(Elem::I32, &[n, e], 1);
+    let hit = cx.compare(Cmp::Eq, is, es)?;
+    let ts = cx.broadcast(table, &[n, e], &[1])?;
+    let zero = cx.const_i(Elem::I32, 0, &[n, e]);
+    let v = cx.select(hit, ts, zero)?;
+    Ok(cx.reduce(v, &[1], Fold::Sum)?)
+}
+
+/// The grouped-matmul kernel (`crate::mosaic::gmm`) for this bank, when its
+/// weights are plain (bf16 or pre-scaled f8, no group factors) and a block
+/// of them fits VMEM. `PIE_XLA_MOE_GMM=0` turns it off.
+///
+/// It reads each routed expert once, at the DMA rate (~1.4 TB/s), with no
+/// per-expert launch. vLLM-TPU's `gmm_v2` streams the same experts in the
+/// same time: 5.3 ms of gate/up and 2.6 ms of down a step for gpt-oss at
+/// 64 lanes. The loop over active experts runs the down experts at ~0.6
+/// TB/s: 12.6 ms for both banks. Measured on v6e, gpt-oss-20b, ms/step with
+/// logits kept, without and with it: 9.3 / 16.0 / 20.8 and 6.5 / 11.1 / 15.9
+/// at widths 8 / 32 / 64.
+/// Keep the XLA around the call free of gathers from short tables
+/// (`pick_small`) and of per-row column offsets: XLA lowers both to serial
+/// scalar code, which cost more than the kernel saved.
+fn gmm_spec(fan: Fan, bank: &Read, elem: Elem) -> Option<crate::mosaic::gmm::Gmm> {
+    use crate::mosaic::gmm::{Gmm, Orient};
+    let off = std::env::var("PIE_XLA_MOE_GMM").is_ok_and(|v| v == "0")
+        && !std::env::var("PIE_XLA_MOE_PATH").is_ok_and(|v| v == "gmm");
+    if off
+        || bank.factor.is_some()
+        || !matches!(bank.codes, Codes::Weights(_))
+        || !matches!(elem, Elem::Bf16 | Elem::F8E5m2 | Elem::F8E4m3fn)
+    {
+        return None;
+    }
+    let (p, e) = (fan.pairs(), fan.experts);
+    let spec = Gmm {
+        // Every active expert's rows round up to whole tiles.
+        tiles: (p + GMM_TM - 1) / GMM_TM + e.min(p),
+        tm: GMM_TM,
+        k: fan.k,
+        n: fan.n,
+        experts: e,
+        w: elem,
+        orient: Orient::of(e * fan.n, fan.k),
+    };
+    spec.out_width().ok().map(|_| spec)
+}
+
+/// The routed matmul through the grouped-matmul kernel: the pairs sorted by
+/// expert (unrouted last), each expert's run of rows padded to whole tiles
+/// of `GMM_TM`, one tile per grid step against its expert's weights, and
+/// each pair's row picked back out. Only the routed experts' weights move.
+/// f32 `[P, N]`.
+fn gmm(
+    cx: &mut Cx<'_>,
+    spec: crate::mosaic::gmm::Gmm,
+    fan: Fan,
+    bank: &Read,
+    x: Val,
+    r: Val,
+    valid: Val,
+    ids: Val,
+) -> Result<Val, Error> {
+    use crate::mosaic::gmm::Orient;
+    let (p, e, n, tm) = (fan.pairs(), fan.experts, fan.n, spec.tm);
+    let (tiles, rows) = (spec.tiles, spec.tiles * spec.tm);
+    let top = cx.const_i(Elem::I32, e, &[p]);
+    let key = cx.select(valid, r, top)?;
+    let iota = cx.iota(Elem::I32, &[p], 0);
+    let by = cx.sort(&[key, iota], 0, true, |f, a, b| {
+        f.compare(Cmp::Lt, a[0], b[0])
+    })?;
+    let (skey, perm) = (by[0], by[1]);
+    // Rows per expert, and each expert's first sorted position and tile.
+    let counts = {
+        let ks = cx.broadcast(skey, &[p, e], &[0])?;
+        let es = cx.iota(Elem::I32, &[p, e], 1);
+        let hit = cx.compare(Cmp::Eq, ks, es)?;
+        let one = cx.const_i(Elem::I32, 1, &[p, e]);
+        let none = cx.const_i(Elem::I32, 0, &[p, e]);
+        let hit = cx.select(hit, one, none)?;
+        cx.reduce(hit, &[0], Fold::Sum)?
+    };
+    let first = {
+        let upto = cx.scan(counts, 0, Fold::Sum)?;
+        cx.sub(upto, counts)?
+    };
+    let per = {
+        let more = cx.const_i(Elem::I32, tm - 1, &[e]);
+        let c = cx.add(counts, more)?;
+        let tt = cx.const_i(Elem::I32, tm, &[e]);
+        cx.div(c, tt)?
+    };
+    let tend = cx.scan(per, 0, Fold::Sum)?;
+    let tstart = cx.sub(tend, per)?;
+    let nt = cx.slice(tend, &[e - 1], &[e], &[1])?;
+    // Tile `t`'s expert: how many experts' tiles end at or before it.
+    let se = {
+        let ends = cx.broadcast(tend, &[tiles, e], &[1])?;
+        let ts = cx.iota(Elem::I32, &[tiles, e], 0);
+        let done = cx.compare(Cmp::Le, ends, ts)?;
+        let one = cx.const_i(Elem::I32, 1, &[tiles, e]);
+        let none = cx.const_i(Elem::I32, 0, &[tiles, e]);
+        let done = cx.select(done, one, none)?;
+        let se = cx.reduce(done, &[1], Fold::Sum)?;
+        let hi = cx.const_i(Elem::I32, e - 1, &[tiles]);
+        cx.min(se, hi)?
+    };
+    // Padded row `i` holds the `rank`-th row routed to its tile's expert.
+    let xs = {
+        let ri = cx.iota(Elem::I32, &[rows], 0);
+        let tt = cx.const_i(Elem::I32, tm, &[rows]);
+        let t = cx.div(ri, tt)?;
+        let ex = pick_small(cx, se, t)?;
+        let base = pick_small(cx, tstart, ex)?;
+        let base = cx.mul(base, tt)?;
+        let rank = cx.sub(ri, base)?;
+        let count = pick_small(cx, counts, ex)?;
+        let ntb = cx.broadcast(nt, &[rows], &[0])?;
+        let live = cx.compare(Cmp::Lt, t, ntb)?;
+        let within = cx.compare(Cmp::Lt, rank, count)?;
+        let ok = cx.and(live, within)?;
+        let at = pick_small(cx, first, ex)?;
+        let at = cx.add(at, rank)?;
+        let pair = take_flat(cx, perm, at)?;
+        let src = if fan.per_token {
+            let kk = cx.const_i(Elem::I32, fan.top_k, &[rows]);
+            cx.div(pair, kk)?
+        } else {
+            pair
+        };
+        let zero = cx.const_i(Elem::I32, 0, &[rows]);
+        let src = cx.select(ok, src, zero)?;
+        cx.take_rows(x, src)?
+    };
+    let w = bank.codes.val();
+    let w = match spec.orient {
+        // The bank's layout on the device: a free transpose.
+        Orient::KMajor => cx.transpose(w, &[1, 0])?,
+        Orient::NMajor => w,
+    };
+    let kernel = spec.kernel()?;
+    let out = kernel.call(cx, &[se, nt, xs, w])?[0];
+    // Pair `i`'s row: its sorted position's rank within its expert's run.
+    let back = cx.sort(&[perm, iota], 0, true, |f, a, b| {
+        f.compare(Cmp::Lt, a[0], b[0])
+    })?[1];
+    let base = pick_small(cx, tstart, ids)?;
+    let tt = cx.const_i(Elem::I32, tm, &[p]);
+    let base = cx.mul(base, tt)?;
+    let at = pick_small(cx, first, ids)?;
+    let rank = cx.sub(back, at)?;
+    let dest = cx.add(base, rank)?;
+    let offsets = spec.offsets()?;
+    if offsets.iter().all(|&o| o == 0) {
+        return Ok(cx.take_rows(out, dest)?);
+    }
+    // Whole rows, then each row's columns from among the few distinct
+    // (static) offsets: a gather at a per-row column offset lowers to one
+    // dynamic slice per pair (v6e: 256 of them, 0.3 ms a layer at 64 tokens).
+    let whole = cx.take_rows(out, dest)?;
+    let width = cx.dims(whole)[1];
+    let table = cx.const_ints(Elem::I32, &offsets, &[e])?;
+    let off = pick_small(cx, table, ids)?;
+    let off = cx.broadcast(off, &[p, n], &[0])?;
+    let mut distinct = offsets.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let mut y: Option<Val> = None;
+    for &o in &distinct {
+        let cut = cx.slice(whole, &[0, o], &[p, o + n], &[1, 1])?;
+        debug_assert!(o + n <= width);
+        y = Some(match y {
+            None => cut,
+            Some(prev) => {
+                let at = cx.const_i(Elem::I32, o, &[p, n]);
+                let here = cx.compare(Cmp::Eq, off, at)?;
+                cx.select(here, cut, prev)?
+            }
+        });
+    }
+    y.ok_or_else(|| refuse("linear.moe", "no expert"))
+}
+
 /// The routed matmul every select entry lowers to: `y[t*k + s] = W[routes[t,
 /// s]] · x_row (+ bias[e])`; a slot routed outside `0..experts` keeps `y`'s
 /// row as it was (the GPU kernels skip its store).
@@ -1100,13 +1294,19 @@ fn routed(
     let whole_ns = bank_bytes / WHOLE_BYTES_PER_NS + r8 * e * n * WHOLE_PARTIAL_FS / 1_000_000;
     let tile_ns = (expert_bytes / 1_200).max(LOOP_TILE_NS + tile * LOOP_ROW_NS);
     let worth = whole_ns / tile_ns;
-    // `PIE_XLA_MOE_PATH=slice|loop|all|ragged` forces a formulation (tests
-    // reach each with small shapes).
+    // `PIE_XLA_MOE_PATH=slice|loop|all|ragged|gmm` forces a formulation
+    // (tests reach each with small shapes; `gmm` falls back to `all` for a
+    // bank the kernel does not read).
     let forced = std::env::var("PIE_XLA_MOE_PATH").ok();
+    let grouped = gmm_spec(fan, &bank, cx.elem(bank.codes.val()));
     let path = match forced.as_deref() {
+        Some("gmm") if grouped.is_none() => "all",
         Some(path) => path,
         None if p <= SLICE_PAIRS && p * expert_bytes.max(SLICE_BYTES) < bank_bytes => "slice",
         None if r8 * e * n * fold > DENSE_ALL => "ragged",
+        // Past a token or two: each routed expert read once, at the DMA
+        // rate, with no per-expert launch (see `gmm_spec`).
+        None if grouped.is_some() => "gmm",
         None if worth < 2 => "all",
         None if worth >= p => "loop",
         None => "active",
@@ -1127,6 +1327,10 @@ fn routed(
             cx.concat(&ys, 0)?
         }
         "all" => every_expert(cx, &bank, fan, x, ids, groups)?,
+        "gmm" => match grouped {
+            Some(spec) => gmm(cx, spec, fan, &bank, x, r, valid, ids)?,
+            None => every_expert(cx, &bank, fan, x, ids, groups)?,
+        },
         "loop" => {
             let plan = plan_active(cx, fan, x, r, valid)?;
             run_active(cx, &plan, &bank, fan, groups, None)?
@@ -1257,7 +1461,9 @@ fn loop_tile(fan: Fan) -> i64 {
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(128);
-    ((fan.tokens.max(1) + 7) / 8 * 8).min(most).min((p + 7) / 8 * 8)
+    ((fan.tokens.max(1) + 7) / 8 * 8)
+        .min(most)
+        .min((p + 7) / 8 * 8)
 }
 
 /// The pairs sorted by expert and cut into row tiles, for [`run_active`].
@@ -1283,7 +1489,9 @@ fn plan_active(cx: &mut Cx<'_>, fan: Fan, x: Val, r: Val, valid: Val) -> Result<
     let top = cx.const_i(Elem::I32, e, &[p]);
     let key = cx.select(valid, r, top)?;
     let iota = cx.iota(Elem::I32, &[p], 0);
-    let by = cx.sort(&[key, iota], 0, true, |f, a, b| f.compare(Cmp::Lt, a[0], b[0]))?;
+    let by = cx.sort(&[key, iota], 0, true, |f, a, b| {
+        f.compare(Cmp::Lt, a[0], b[0])
+    })?;
     let (skey, perm) = (by[0], by[1]);
     let before = {
         let head = cx.const_i(Elem::I32, e + 1, &[1]);

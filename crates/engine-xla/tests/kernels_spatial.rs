@@ -9,7 +9,9 @@ use kernels_xla::spatial::{self, Conv3d, GridRule, Segment, TimePad};
 fn data(n: usize, seed: u32) -> Vec<f32> {
     (0..n)
         .map(|i| {
-            let h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(40503));
+            let h = (i as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(seed.wrapping_mul(40503));
             round_bf16(((h >> 8) % 2000) as f32 / 1000.0 - 1.0)
         })
         .collect()
@@ -45,7 +47,9 @@ fn conv_boxes(conv: &Conv3d, clips: &[Clip]) -> Vec<Clip> {
     clips
         .iter()
         .map(|c| {
-            let e = conv.out_extent([c[0] as u32, c[1] as u32, c[2] as u32]).unwrap_or([0; 3]);
+            let e = conv
+                .out_extent([c[0] as u32, c[1] as u32, c[2] as u32])
+                .unwrap_or([0; 3]);
             let b = [e[0] as i32, e[1] as i32, e[2] as i32, off];
             off += b[0] * b[1] * b[2];
             b
@@ -53,6 +57,7 @@ fn conv_boxes(conv: &Conv3d, clips: &[Clip]) -> Vec<Clip> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn conv_ref(
     x: &[f32],
     clips: &[Clip],
@@ -72,7 +77,9 @@ fn conv_ref(
     let taps = (kt * kh * kw) as usize;
     let mut y = vec![0.0f32; y_rows * c_out];
     for m in 0..y_rows as i32 {
-        let Some((l, og)) = lane_of(y_clips, m) else { continue };
+        let Some((l, og)) = lane_of(y_clips, m) else {
+            continue;
+        };
         let ig = clips[l];
         let (ot, oh, ow) = unravel(og, m - og[3]);
         let base: i32 = clips[..l].iter().map(|c| c[1] * c[2]).sum::<i32>() * pt;
@@ -88,9 +95,9 @@ fn conv_ref(
                 let mut ti = ot * st - pt + it;
                 let mut row: Option<&[f32]> = None;
                 if ti < 0 {
-                    if conv.causal_t && cache.is_some() {
+                    if let (true, Some(cache)) = (conv.causal_t, cache) {
                         let r = (base + ((ti + pt) * ig[1] + hi) * ig[2] + wi) as usize;
-                        row = Some(&cache.unwrap()[r * c_in..(r + 1) * c_in]);
+                        row = Some(&cache[r * c_in..(r + 1) * c_in]);
                     } else if !replicate {
                         continue;
                     } else {
@@ -108,7 +115,8 @@ fn conv_ref(
                     &x[r * c_in..(r + 1) * c_in]
                 });
                 for c in 0..c_in {
-                    acc += f64::from(row[c]) * f64::from(w[n * taps * c_in + tap as usize * c_in + c]);
+                    acc +=
+                        f64::from(row[c]) * f64::from(w[n * taps * c_in + tap as usize * c_in + c]);
                 }
             }
             y[m as usize * c_out + n] = round_bf16(acc as f32 + bias[n]);
@@ -191,11 +199,21 @@ fn conv3d_answers_by_gather_and_by_convolution() {
         .run(|ctx| {
             for (conv, wt, yg, y, yb, cache, y_clips, _) in &runs {
                 spatial::conv3d(ctx, xt, gt, *wt, Some(bt), *conv, *cache, *y, *yg)?;
-                spatial::conv3d_boxed(ctx, xt, &host(&clips), *wt, Some(bt), *conv, *cache, *yb, &host(y_clips))?;
+                spatial::conv3d_boxed(
+                    ctx,
+                    xt,
+                    &host(&clips),
+                    *wt,
+                    Some(bt),
+                    *conv,
+                    *cache,
+                    *yb,
+                    &host(y_clips),
+                )?;
             }
             Ok(())
         })
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| e.to_string())
         .unwrap()
     {
         return;
@@ -261,10 +279,23 @@ fn grid_rules_map_each_box() {
                         let span = n + pad[i] as i32 + back as i32 - k[i] as i32;
                         (span >= 0).then(|| span / stride[i] as i32 + 1)
                     };
-                    (|| Some([axis(t, 0, back_t)?, axis(h, 1, pad_back[1])?, axis(w, 2, pad_back[2])?]))()
+                    (|| {
+                        Some([
+                            axis(t, 0, back_t)?,
+                            axis(h, 1, pad_back[1])?,
+                            axis(w, 2, pad_back[2])?,
+                        ])
+                    })()
                 }
-                GridRule::Upsample { factor, keep_first_frame } => Some([
-                    if keep_first_frame && t > 0 { 1 + (t - 1) * factor[0] as i32 } else { t * factor[0] as i32 },
+                GridRule::Upsample {
+                    factor,
+                    keep_first_frame,
+                } => Some([
+                    if keep_first_frame && t > 0 {
+                        1 + (t - 1) * factor[0] as i32
+                    } else {
+                        t * factor[0] as i32
+                    },
                     h * factor[1] as i32,
                     w * factor[2] as i32,
                 ]),
@@ -274,11 +305,19 @@ fn grid_rules_map_each_box() {
                 }
                 GridRule::Unshuffle { r } => {
                     let r = r.map(|v| v as i32);
-                    (t % r[0] == 0 && h % r[1] == 0 && w % r[2] == 0).then_some([t / r[0], h / r[1], w / r[2]])
+                    (t % r[0] == 0 && h % r[1] == 0 && w % r[2] == 0).then_some([
+                        t / r[0],
+                        h / r[1],
+                        w / r[2],
+                    ])
                 }
                 GridRule::AvgDown { factor } => {
                     let r = factor.map(|v| v as i32);
-                    (h % r[1] == 0 && w % r[2] == 0).then_some([(t + r[0] - 1) / r[0], h / r[1], w / r[2]])
+                    (h % r[1] == 0 && w % r[2] == 0).then_some([
+                        (t + r[0] - 1) / r[0],
+                        h / r[1],
+                        w / r[2],
+                    ])
                 }
             };
             let e = e.unwrap_or([0; 3]);
@@ -338,7 +377,8 @@ fn group_norm_and_attention_stay_inside_their_clip() {
             let rstd = 1.0 / (var + 1e-5).sqrt();
             for r in off..off + n {
                 for ch in gi * cg..(gi + 1) * cg {
-                    let v = (f64::from(x[r * c + ch]) - mean) * rstd * f64::from(wt[ch]) + f64::from(bs[ch]);
+                    let v = (f64::from(x[r * c + ch]) - mean) * rstd * f64::from(wt[ch])
+                        + f64::from(bs[ch]);
                     let v = v / (1.0 + (-v).exp());
                     want[r * c + ch] = v as f32;
                 }
@@ -350,7 +390,9 @@ fn group_norm_and_attention_stay_inside_their_clip() {
     let attn = |frames: Option<i32>| -> Vec<f32> {
         let mut out = vec![0.0f32; rows * c];
         for i in 0..rows as i32 {
-            let Some((_, cl)) = lane_of(&clips, i) else { continue };
+            let Some((_, cl)) = lane_of(&clips, i) else {
+                continue;
+            };
             let plane = cl[1] * cl[2];
             let (lo, hi) = match frames {
                 None => (cl[3], cl[3] + cl[0] * plane),
@@ -363,7 +405,9 @@ fn group_norm_and_attention_stay_inside_their_clip() {
             let s: Vec<f64> = (lo..hi)
                 .map(|j| {
                     let j = j as usize;
-                    (0..c).map(|e| f64::from(q[i * c + e]) * f64::from(kk[j * c + e])).sum::<f64>()
+                    (0..c)
+                        .map(|e| f64::from(q[i * c + e]) * f64::from(kk[j * c + e]))
+                        .sum::<f64>()
                         * f64::from(scale)
                 })
                 .collect();
@@ -371,7 +415,10 @@ fn group_norm_and_attention_stay_inside_their_clip() {
             let p: Vec<f64> = s.iter().map(|v| (v - m).exp()).collect();
             let l: f64 = p.iter().sum();
             for e in 0..c {
-                let acc: f64 = (lo..hi).zip(&p).map(|(j, p)| p * f64::from(v[j as usize * c + e])).sum();
+                let acc: f64 = (lo..hi)
+                    .zip(&p)
+                    .map(|(j, p)| p * f64::from(v[j as usize * c + e]))
+                    .sum();
                 out[i * c + e] = (acc / l) as f32;
             }
         }
@@ -392,7 +439,11 @@ fn resamples_move_voxels_between_clip_layouts() {
         clips
             .iter()
             .map(|cl| {
-                let t = if keep && cl[0] > 0 { 1 + (cl[0] - 1) * f[0] } else { cl[0] * f[0] };
+                let t = if keep && cl[0] > 0 {
+                    1 + (cl[0] - 1) * f[0]
+                } else {
+                    cl[0] * f[0]
+                };
                 let b = [t, cl[1] * f[1], cl[2] * f[2], off];
                 off += b[0] * b[1] * b[2];
                 b
@@ -459,10 +510,18 @@ fn resamples_move_voxels_between_clip_layouts() {
     let pk = b.bf16(unshuf_rows as u32, (c * 8) as u32, &packed);
     let sg = b.i32(2, 4, &flat(&sh_boxes));
     let sy = b.zeros(Dtype::Bf16, span(&sh_boxes) as u32, c as u32);
-    let pk4 = b.bf16(unshuf_rows as u32, (c * 4) as u32, &packed[..unshuf_rows * c * 4]);
+    let pk4 = b.bf16(
+        unshuf_rows as u32,
+        (c * 4) as u32,
+        &packed[..unshuf_rows * c * 4],
+    );
     let ey = b.zeros(Dtype::Bf16, rows as u32, c as u32);
     let ag = b.i32(2, 4, &flat(&avg_boxes));
-    let ay = b.zeros(Dtype::Bf16, span(&avg_boxes) as u32, (c * 8 / group as usize) as u32);
+    let ay = b.zeros(
+        Dtype::Bf16,
+        span(&avg_boxes) as u32,
+        (c * 8 / group as usize) as u32,
+    );
     if !b
         .run(|ctx| {
             spatial::upsample_nearest(ctx, xt, g, [2, 2, 2], true, uy, ug)?;
@@ -480,7 +539,9 @@ fn resamples_move_voxels_between_clip_layouts() {
     // Upsample.
     let mut want = vec![0.0f32; span(&ub) * c];
     for m in 0..span(&ub) as i32 {
-        let Some((l, og)) = lane_of(&ub, m) else { continue };
+        let Some((l, og)) = lane_of(&ub, m) else {
+            continue;
+        };
         let (t, h, w) = unravel(og, m - og[3]);
         let ti = if t == 0 { 0 } else { (t - 1) / 2 + 1 };
         let src = ravel(clips[l], ti, h / 2, w / 2) as usize;
@@ -489,32 +550,43 @@ fn resamples_move_voxels_between_clip_layouts() {
     assert_close(&b.read_f32(uy), &want, 0.0, 0.0);
 
     // Unshuffle and patchify.
-    let unshuffle = |x: &[f32], cin_w: usize, r: [i32; 3], out: &[Clip], inp: &[Clip], rows_out: usize| {
-        let vol = (r[0] * r[1] * r[2]) as usize;
-        let cw = cin_w * vol;
-        let mut want = vec![0.0f32; rows_out * cw];
-        for m in 0..rows_out as i32 {
-            let Some((l, og)) = lane_of(out, m) else { continue };
-            let (t, h, w) = unravel(og, m - og[3]);
-            for col in 0..cw {
-                let (cin, blk) = (col / vol, (col % vol) as i32);
-                let (i1, i2, i3) = (blk / (r[1] * r[2]), (blk / r[2]) % r[1], blk % r[2]);
-                let src = ravel(inp[l], t * r[0] + i1, h * r[1] + i2, w * r[2] + i3) as usize;
-                want[m as usize * cw + col] = x[src * cin_w + cin];
+    let unshuffle =
+        |x: &[f32], cin_w: usize, r: [i32; 3], out: &[Clip], inp: &[Clip], rows_out: usize| {
+            let vol = (r[0] * r[1] * r[2]) as usize;
+            let cw = cin_w * vol;
+            let mut want = vec![0.0f32; rows_out * cw];
+            for m in 0..rows_out as i32 {
+                let Some((l, og)) = lane_of(out, m) else {
+                    continue;
+                };
+                let (t, h, w) = unravel(og, m - og[3]);
+                for col in 0..cw {
+                    let (cin, blk) = (col / vol, (col % vol) as i32);
+                    let (i1, i2, i3) = (blk / (r[1] * r[2]), (blk / r[2]) % r[1], blk % r[2]);
+                    let src = ravel(inp[l], t * r[0] + i1, h * r[1] + i2, w * r[2] + i3) as usize;
+                    want[m as usize * cw + col] = x[src * cin_w + cin];
+                }
             }
-        }
-        want
-    };
+            want
+        };
     let want = unshuffle(&x, c, [1, 2, 2], &dn_boxes, &clips, unshuf_rows);
     assert_close(&b.read_f32(dy), &want, 0.0, 0.0);
     assert_close(&b.read_f32(py), &want, 0.0, 0.0);
 
     // Shuffle (trimmed) and unpatchify.
-    let shuffle = |x: &[f32], c: usize, r: [i32; 3], trim: i32, out: &[Clip], inp: &[Clip], rows_out: usize| {
+    let shuffle = |x: &[f32],
+                   c: usize,
+                   r: [i32; 3],
+                   trim: i32,
+                   out: &[Clip],
+                   inp: &[Clip],
+                   rows_out: usize| {
         let vol = (r[0] * r[1] * r[2]) as usize;
         let mut want = vec![0.0f32; rows_out * c];
         for m in 0..rows_out as i32 {
-            let Some((l, og)) = lane_of(out, m) else { continue };
+            let Some((l, og)) = lane_of(out, m) else {
+                continue;
+            };
             let (t, h, w) = unravel(og, m - og[3]);
             let t = t + trim;
             let src = ravel(inp[l], t / r[0], h / r[1], w / r[2]) as usize;
@@ -525,9 +597,25 @@ fn resamples_move_voxels_between_clip_layouts() {
         }
         want
     };
-    let want = shuffle(&packed, c, [2, 2, 2], 1, &sh_boxes, &dn_boxes, span(&sh_boxes));
+    let want = shuffle(
+        &packed,
+        c,
+        [2, 2, 2],
+        1,
+        &sh_boxes,
+        &dn_boxes,
+        span(&sh_boxes),
+    );
     assert_close(&b.read_f32(sy), &want, 0.0, 0.0);
-    let want = shuffle(&packed[..unshuf_rows * c * 4], c, [1, 2, 2], 0, &clips, &dn_boxes, rows);
+    let want = shuffle(
+        &packed[..unshuf_rows * c * 4],
+        c,
+        [1, 2, 2],
+        0,
+        &clips,
+        &dn_boxes,
+        rows,
+    );
     assert_close(&b.read_f32(ey), &want, 0.0, 0.0);
 
     // Avg-down.
@@ -536,7 +624,9 @@ fn resamples_move_voxels_between_clip_layouts() {
     let c_out = c * vol / group as usize;
     let mut want = vec![0.0f32; span(&avg_boxes) * c_out];
     for m in 0..span(&avg_boxes) as i32 {
-        let Some((l, og)) = lane_of(&avg_boxes, m) else { continue };
+        let Some((l, og)) = lane_of(&avg_boxes, m) else {
+            continue;
+        };
         let ig = clips[l];
         let (t, h, w) = unravel(og, m - og[3]);
         let pad_t = (r1 - ig[0] % r1) % r1;

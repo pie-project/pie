@@ -87,7 +87,9 @@ impl Conv3d {
     #[must_use]
     pub fn out_extent(&self, [t, h, w]: [u32; 3]) -> Option<[u32; 3]> {
         let axis = |n: u32, k: u32, s: u32, front: u32, back: u32| {
-            (n + front + back).checked_sub(k).map(|span| span / s.max(1) + 1)
+            (n + front + back)
+                .checked_sub(k)
+                .map(|span| span / s.max(1) + 1)
         };
         Some([
             axis(t, self.k[0], self.stride[0], self.pad[0], self.back_t())?,
@@ -132,7 +134,10 @@ fn lane_pair(op: &'static str, grid: Tensor, y_grid: Tensor) -> Result<u32, Erro
     let lanes = lanes_of(op, "input", grid)?;
     let o = lanes_of(op, "output", y_grid)?;
     if lanes != o {
-        return Err(refuse(op, format!("{lanes} input lanes against {o} output lanes")));
+        return Err(refuse(
+            op,
+            format!("{lanes} input lanes against {o} output lanes"),
+        ));
     }
     Ok(lanes)
 }
@@ -142,7 +147,10 @@ fn movable(op: &'static str, x: Tensor, y: Tensor) -> Result<(), Error> {
         return Err(Error::DtypeUnsupported { op, dtype: x.dtype });
     }
     if x.dtype != y.dtype {
-        return Err(refuse(op, format!("{:?} into {:?}; the op keeps the element", x.dtype, y.dtype)));
+        return Err(refuse(
+            op,
+            format!("{:?} into {:?}; the op keeps the element", x.dtype, y.dtype),
+        ));
     }
     Ok(())
 }
@@ -437,7 +445,11 @@ pub fn derive_grid(ctx: &Ctx<'_>, grid: Tensor, rule: GridRule, y: Tensor) -> Re
                 let mut outs = Vec::new();
                 let mut ok = yes;
                 for (n, i, back) in [(t, 0, back_t), (h, 1, pad_back[1]), (w, 2, pad_back[2])] {
-                    let span = add_k(cx, n, i64::from(pad[i]) + i64::from(back) - i64::from(kk[i]))?;
+                    let span = add_k(
+                        cx,
+                        n,
+                        i64::from(pad[i]) + i64::from(back) - i64::from(kk[i]),
+                    )?;
                     let fine = cmp_k(cx, Cmp::Ge, span, 0)?;
                     ok = cx.and(ok, fine)?;
                     let o = div_k(cx, span, i64::from(stride[i].max(1)))?;
@@ -557,17 +569,26 @@ fn conv_checks(
     {
         return Err(refuse(
             op,
-            format!("the bias is {}x{} {:?}; expected {} f32", b.rows, b.width, b.dtype, y.width),
+            format!(
+                "the bias is {}x{} {:?}; expected {} f32",
+                b.rows, b.width, b.dtype, y.width
+            ),
         ));
     }
     if let Some(c) = cache {
         if !conv.causal_t || conv.pad[0] == 0 {
-            return Err(refuse(op, "a frame cache is read only under `causal_t` with a front pad"));
+            return Err(refuse(
+                op,
+                "a frame cache is read only under `causal_t` with a front pad",
+            ));
         }
         if c.dtype != x.dtype || c.width != x.width {
             return Err(refuse(
                 op,
-                format!("the cache is {}x{} {:?}; it holds `[frames, C_in]` bf16", c.rows, c.width, c.dtype),
+                format!(
+                    "the cache is {}x{} {:?}; it holds `[frames, C_in]` bf16",
+                    c.rows, c.width, c.dtype
+                ),
             ));
         }
     }
@@ -756,7 +777,11 @@ pub fn conv3d_boxed(
     if clips.len() != y_clips.len() || clips.is_empty() {
         return Err(refuse(
             OP,
-            format!("{} input boxes against {} output boxes", clips.len(), y_clips.len()),
+            format!(
+                "{} input boxes against {} output boxes",
+                clips.len(),
+                y_clips.len()
+            ),
         ));
     }
     let pt = u64::from(conv.pad[0]);
@@ -776,7 +801,11 @@ pub fn conv3d_boxed(
         if [o[0], o[1], o[2]] != want {
             return Err(refuse(
                 OP,
-                format!("clip {l}'s box {:?} convolves to {want:?}, and its output box is {:?}", &c[..3], &o[..3]),
+                format!(
+                    "clip {l}'s box {:?} convolves to {want:?}, and its output box is {:?}",
+                    &c[..3],
+                    &o[..3]
+                ),
             ));
         }
         let o_vox = want.iter().map(|&n| u64::from(n)).product::<u64>();
@@ -787,7 +816,10 @@ pub fn conv3d_boxed(
             && conv.causal_t
             && base + pt * plane > u64::from(cc.rows)
         {
-            return Err(refuse(OP, format!("clip {l}'s cached frames run past the cache")));
+            return Err(refuse(
+                OP,
+                format!("clip {l}'s cached frames run past the cache"),
+            ));
         }
         plan.push((*c, *o, base));
     }
@@ -1091,7 +1123,10 @@ pub fn group_norm(
 ) -> Result<(), Error> {
     const OP: &str = "spatial.group_norm";
     if x.dtype != Dtype::Bf16 {
-        return Err(Error::DtypeUnsupported { op: OP, dtype: x.dtype });
+        return Err(Error::DtypeUnsupported {
+            op: OP,
+            dtype: x.dtype,
+        });
     }
     if y.rows != x.rows || y.width != x.width || y.dtype != x.dtype {
         return Err(refuse(OP, "the landing is one row per input row"));
@@ -1100,13 +1135,19 @@ pub fn group_norm(
     nonzero(OP, "the channel count", x.width)?;
     nonzero(OP, "the group count", groups)?;
     if !x.width.is_multiple_of(groups) {
-        return Err(refuse(OP, format!("{} channels do not divide into {groups} groups", x.width)));
+        return Err(refuse(
+            OP,
+            format!("{} channels do not divide into {groups} groups", x.width),
+        ));
     }
     for (what, t) in [("weight", weight), ("bias", bias)] {
         if t.dtype != Dtype::F32 || t.elements() != u64::from(x.width) {
             return Err(refuse(
                 OP,
-                format!("the {what} is {}x{} {:?}; expected {} f32", t.rows, t.width, t.dtype, x.width),
+                format!(
+                    "the {what} is {}x{} {:?}; expected {} f32",
+                    t.rows, t.width, t.dtype, x.width
+                ),
             ));
         }
     }
@@ -1184,7 +1225,10 @@ pub fn attention(
 ) -> Result<(), Error> {
     const OP: &str = "spatial.attention";
     if q.dtype != Dtype::Bf16 {
-        return Err(Error::DtypeUnsupported { op: OP, dtype: q.dtype });
+        return Err(Error::DtypeUnsupported {
+            op: OP,
+            dtype: q.dtype,
+        });
     }
     for (what, t) in [("key", k_), ("value", v), ("output", y)] {
         if t.rows != q.rows || t.width != q.width || t.dtype != q.dtype {
@@ -1198,7 +1242,10 @@ pub fn attention(
         }
     }
     if segment == Segment::Frames(0) {
-        return Err(refuse(OP, "a block of zero frames holds no keys; state `Segment::Lane`"));
+        return Err(refuse(
+            OP,
+            "a block of zero frames holds no keys; state `Segment::Lane`",
+        ));
     }
     lanes_of(OP, "input", grid)?;
     nonzero(OP, "rows", q.rows)?;
@@ -1360,7 +1407,10 @@ pub fn pixel_shuffle(
     if !x.width.is_multiple_of(vol) || y.width != x.width / vol {
         return Err(refuse(
             OP,
-            format!("{} channels do not unpack as {} x {vol} output channels", x.width, y.width),
+            format!(
+                "{} channels do not unpack as {} x {vol} output channels",
+                x.width, y.width
+            ),
         ));
     }
     let [r1, r2, r3] = r.map(i64::from);
@@ -1411,7 +1461,10 @@ pub fn pixel_unshuffle(
     if u64::from(y.width) != u64::from(x.width) * u64::from(vol) {
         return Err(refuse(
             OP,
-            format!("{} channels do not pack as {} = C x {vol} output channels", x.width, y.width),
+            format!(
+                "{} channels do not pack as {} = C x {vol} output channels",
+                x.width, y.width
+            ),
         ));
     }
     ctx.emit(&mut |cx| {
@@ -1505,7 +1558,10 @@ pub fn avg_down(
     lane_pair(OP, grid, y_grid)?;
     let vol = volume(OP, r)?;
     let widened = u64::from(x.width) * u64::from(vol);
-    if group == 0 || !widened.is_multiple_of(u64::from(group)) || u64::from(y.width) != widened / u64::from(group) {
+    if group == 0
+        || !widened.is_multiple_of(u64::from(group))
+        || u64::from(y.width) != widened / u64::from(group)
+    {
         return Err(refuse(
             OP,
             format!(
@@ -1522,8 +1578,15 @@ pub fn avg_down(
         let tm = cx.sub(top, tm)?;
         let pad = rem_k(cx, tm, r1)?;
         let dims = [i64::from(y.rows), i64::from(y.width), i64::from(group)];
-        let (idx, valid) =
-            unshuffle_index(cx, &m, r, i64::from(x.width), &dims, i64::from(group), Some((2, pad)))?;
+        let (idx, valid) = unshuffle_index(
+            cx,
+            &m,
+            r,
+            i64::from(x.width),
+            &dims,
+            i64::from(group),
+            Some((2, pad)),
+        )?;
         let xv = cx.read_f32(x)?;
         let v = take_elems(cx, xv, idx, valid)?;
         let s = cx.reduce(v, &[2], Fold::Sum)?;

@@ -122,10 +122,10 @@ fn answer(m: &common::Model, prompt: &[u32], full_windows: bool) -> Answer {
     let mut ring_out = Vec::new();
     let mut handed_out = Vec::new();
     let feed = |shell: &mut Shell,
-                    have: u32,
-                    ring_rows: &[u32],
-                    handed_rows: &[u32],
-                    handed: &mut Handed|
+                have: u32,
+                ring_rows: &[u32],
+                handed_rows: &[u32],
+                handed: &mut Handed|
      -> Vec<Vec<f32>> {
         let rows = ring_rows.len() as u32;
         if paging.window.is_some() {
@@ -190,7 +190,10 @@ fn a_windowed_pool_answers_what_full_pages_do() {
         })
         .max();
     let Some(window) = window else {
-        eprintln!("{} declares no windowed kv rows; nothing to compare", m.sku.name);
+        eprintln!(
+            "{} declares no windowed kv rows; nothing to compare",
+            m.sku.name
+        );
         return;
     };
     let tokenizer = common::tokenizer(&m);
@@ -202,7 +205,10 @@ fn a_windowed_pool_answers_what_full_pages_do() {
         prompt.extend(tokenizer.encode(text));
     }
     prompt.extend(tokenizer.encode("Question: what did the keeper count each evening? Answer:"));
-    eprintln!("prompt of {} tokens against a window of {window}", prompt.len());
+    eprintln!(
+        "prompt of {} tokens against a window of {window}",
+        prompt.len()
+    );
 
     let _device = engine_xla::bench::lock_device();
     let windowed = answer(&m, &prompt, false);
@@ -213,7 +219,10 @@ fn a_windowed_pool_answers_what_full_pages_do() {
         windowed.handed,
         tokenizer.decode(&windowed.ring, true)
     );
-    eprintln!("full:     ring {:?}\n          handed {:?}", full.ring, full.handed);
+    eprintln!(
+        "full:     ring {:?}\n          handed {:?}",
+        full.ring, full.handed
+    );
     eprintln!(
         "pools: windowed {} MiB ({} windowed pages, {} ids reused), full {} MiB; weights {} MiB",
         windowed.pool_bytes >> 20,
@@ -222,8 +231,20 @@ fn a_windowed_pool_answers_what_full_pages_do() {
         full.pool_bytes >> 20,
         windowed.weight_bytes >> 20
     );
-    assert!(windowed.reused > 0, "the handed lane released ids behind its window");
-    assert!(windowed.pool_bytes < full.pool_bytes, "the windowed pool is smaller");
-    assert_eq!(windowed.ring, full.ring, "the slot-seated lane decodes the same tokens");
-    assert_eq!(windowed.handed, full.handed, "the handed lane decodes the same tokens");
+    assert!(
+        windowed.reused > 0,
+        "the handed lane released ids behind its window"
+    );
+    assert!(
+        windowed.pool_bytes < full.pool_bytes,
+        "the windowed pool is smaller"
+    );
+    assert_eq!(
+        windowed.ring, full.ring,
+        "the slot-seated lane decodes the same tokens"
+    );
+    assert_eq!(
+        windowed.handed, full.handed,
+        "the handed lane decodes the same tokens"
+    );
 }

@@ -16,7 +16,10 @@ use crate::tensor::{Bank, Tensor};
 /// `out = decode(w)`, bf16 `[n, k]`.
 pub fn decoded_plane(ctx: &Ctx<'_>, op: &'static str, w: Bank, out: Tensor) -> Result<(), Error> {
     if out.dtype != Dtype::Bf16 {
-        return Err(Error::DtypeUnsupported { op, dtype: out.dtype });
+        return Err(Error::DtypeUnsupported {
+            op,
+            dtype: out.dtype,
+        });
     }
     let (n, k) = (out.rows, out.width);
     let p = planes(op, &w, n, k)?;

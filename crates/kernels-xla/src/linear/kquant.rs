@@ -68,7 +68,13 @@ impl Scheme {
     }
 }
 
-const FAMILY: [Scheme; 5] = [Scheme::Q2K, Scheme::Q3K, Scheme::Q4K, Scheme::Q5K, Scheme::Q6K];
+const FAMILY: [Scheme; 5] = [
+    Scheme::Q2K,
+    Scheme::Q3K,
+    Scheme::Q4K,
+    Scheme::Q5K,
+    Scheme::Q6K,
+];
 
 /// The scheme whose rows over a `k`-wide contraction are `row_bytes` long.
 pub fn scheme(op: &'static str, k: u32, row_bytes: u32) -> Result<Scheme, Error> {
@@ -100,7 +106,13 @@ pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), E
     act_x_wt(ctx, "linear.lm_head", act, w, y)
 }
 
-fn act_x_wt(ctx: &Ctx<'_>, op: &'static str, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
+fn act_x_wt(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
     let (m, n, k) = extent(op, act, y)?;
     if !k.is_multiple_of(SUPER) {
         return Err(refuse(
@@ -448,7 +460,12 @@ pub fn to_affine(
     match (w.dtype, Scheme::of_dtype(w.dtype)) {
         (Dtype::U8, _) => {}
         (_, Some(s)) if s == scheme => {}
-        (other, _) => return Err(Error::DtypeUnsupported { op: OP, dtype: other }),
+        (other, _) => {
+            return Err(Error::DtypeUnsupported {
+                op: OP,
+                dtype: other,
+            });
+        }
     }
     let n = w.rows;
     let group = affine_group(scheme);

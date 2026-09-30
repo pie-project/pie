@@ -51,10 +51,14 @@ impl Run<'_> {
         seat: &Seat,
         value: ValueId,
     ) -> Result<Tensor, Error> {
-        let plane = *seat.layout.in_of.get(&value.0).ok_or_else(|| Error::Backend {
-            op,
-            detail: format!("value {} is no recurrence input this load buffers", value.0),
-        })?;
+        let plane = *seat
+            .layout
+            .in_of
+            .get(&value.0)
+            .ok_or_else(|| Error::Backend {
+                op,
+                detail: format!("value {} is no recurrence input this load buffers", value.0),
+            })?;
         let map = self.rs_window(op, seat)?;
         let spec = seat.layout.planes[plane];
         let ext = self.rs_temp(map.rows_ext, spec.width, spec.dtype);
@@ -96,10 +100,17 @@ impl Run<'_> {
         seat: &Seat,
         value: ValueId,
     ) -> Result<Tensor, Error> {
-        let region = *seat.layout.out_of.get(&value.0).ok_or_else(|| Error::Backend {
-            op,
-            detail: format!("value {} is no recurrence output this load extends", value.0),
-        })?;
+        let region = *seat
+            .layout
+            .out_of
+            .get(&value.0)
+            .ok_or_else(|| Error::Backend {
+                op,
+                detail: format!(
+                    "value {} is no recurrence output this load extends",
+                    value.0
+                ),
+            })?;
         let map = self.rs_window(op, seat)?;
         let spec = seat.layout.regions[region];
         let ext = self.rs_temp(map.rows_ext, spec.width, spec.dtype);

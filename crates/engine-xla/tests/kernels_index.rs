@@ -14,7 +14,10 @@ struct Rng(u64);
 
 impl Rng {
     fn next(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }
     fn bf16s(&mut self, n: usize, scale: f32) -> Vec<f32> {
@@ -79,7 +82,9 @@ fn the_index_key_and_query_are_normed_and_roped_in_place() {
         let mean = x.iter().sum::<f32>() / hd as f32;
         let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / hd as f32;
         let inv = 1.0 / (var + eps).sqrt();
-        let mut y: Vec<f32> = (0..hd).map(|d| round_bf16((x[d] - mean) * inv * w[d] + bias[d])).collect();
+        let mut y: Vec<f32> = (0..hd)
+            .map(|d| round_bf16((x[d] - mean) * inv * w[d] + bias[d]))
+            .collect();
         rope_ref(&mut y, positions[r], rope_dim, theta);
         want.extend(y);
     }
@@ -94,10 +99,10 @@ fn the_index_key_and_query_are_normed_and_roped_in_place() {
     b.run(|ctx| index::rope(ctx, qt, pt, heads as u32, qd as u32, qrope as u32, theta))
         .unwrap();
     let mut want = q.clone();
-    for r in 0..rows {
+    for (r, &pos) in positions.iter().enumerate().take(rows) {
         for h in 0..heads {
             let at = (r * heads + h) * qd;
-            rope_ref(&mut want[at..at + qd], positions[r], qrope, theta);
+            rope_ref(&mut want[at..at + qd], pos, qrope, theta);
         }
     }
     assert_close(&b.read_f32(qt), &want, 3e-2, 2e-2);
@@ -117,7 +122,10 @@ fn index_keys_are_filed_and_block_averaged() {
     let wp = b.u32(4, 1, &wpage);
     let wo = b.u32(4, 1, &woff);
     let pool = kv_pool(&mut b, keys);
-    if !b.run(|ctx| index::kv_append(ctx, kt, &pool, wp, wo)).unwrap() {
+    if !b
+        .run(|ctx| index::kv_append(ctx, kt, &pool, wp, wo))
+        .unwrap()
+    {
         return;
     }
     let mut want = keys0.clone();
@@ -167,7 +175,9 @@ fn index_keys_are_filed_and_block_averaged() {
 fn bisect_select(scores: &[f32], topk: usize) -> Vec<i32> {
     let nkeys = scores.len();
     if nkeys <= topk {
-        return (0..topk).map(|n| if n < nkeys { n as i32 } else { -1 }).collect();
+        return (0..topk)
+            .map(|n| if n < nkeys { n as i32 } else { -1 })
+            .collect();
     }
     let mut lo = f32::INFINITY;
     let mut hi = f32::NEG_INFINITY;
@@ -184,7 +194,11 @@ fn bisect_select(scores: &[f32], topk: usize) -> Vec<i32> {
             hi = mid;
         }
     }
-    let mut out: Vec<i32> = (0..nkeys).filter(|&j| scores[j] >= hi).map(|j| j as i32).take(topk).collect();
+    let mut out: Vec<i32> = (0..nkeys)
+        .filter(|&j| scores[j] >= hi)
+        .map(|j| j as i32)
+        .take(topk)
+        .collect();
     out.resize(topk, -1);
     out
 }
@@ -237,7 +251,11 @@ fn the_index_ranks_cached_keys_and_keeps_the_top_k() {
                     (0..heads)
                         .map(|h| {
                             let qh = &q[(r * heads + h) * d..(r * heads + h + 1) * d];
-                            let dot: f32 = qh.iter().zip(&keys0[c * d..(c + 1) * d]).map(|(a, b)| a * b).sum();
+                            let dot: f32 = qh
+                                .iter()
+                                .zip(&keys0[c * d..(c + 1) * d])
+                                .map(|(a, b)| a * b)
+                                .sum();
                             dot.max(0.0) * if weighted { w[r * heads + h] } else { 1.0 }
                         })
                         .sum()

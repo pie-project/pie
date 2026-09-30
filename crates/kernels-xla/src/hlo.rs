@@ -85,7 +85,10 @@ impl Elem {
 
     #[must_use]
     pub const fn is_unsigned(self) -> bool {
-        matches!(self, Self::U4 | Self::U8 | Self::U16 | Self::U32 | Self::U64)
+        matches!(
+            self,
+            Self::U4 | Self::U8 | Self::U16 | Self::U32 | Self::U64
+        )
     }
 
     #[must_use]
@@ -341,6 +344,9 @@ pub fn f16_bits(x: f32) -> u16 {
     sign | v as u16
 }
 
+/// One arm of [`Func::case`]: builds its branch body, yielding the arm's values.
+pub type Branch<'a> = Box<dyn FnOnce(&mut Func) -> Built<Vec<Val>> + 'a>;
+
 impl Func {
     #[must_use]
     pub fn new(name: &str) -> Self {
@@ -471,7 +477,13 @@ impl Func {
 
     /// Emits an op of any dialect (`"chlo.ragged_dot"`) with generic
     /// syntax; several results.
-    pub fn op_named(&mut self, name: &str, operands: &[Val], attrs: &str, outs: Vec<Ty>) -> Vec<Val> {
+    pub fn op_named(
+        &mut self,
+        name: &str,
+        operands: &[Val],
+        attrs: &str,
+        outs: Vec<Ty>,
+    ) -> Vec<Val> {
         let id = self.next;
         self.next += 1;
         let attrs = if attrs.is_empty() {
@@ -509,10 +521,51 @@ impl Func {
             .collect()
     }
 
+    /// `stablehlo.custom_call @target` (API version 1) with a string
+    /// `backend_config`, row-major operand and result layouts, and no side
+    /// effect: how a Mosaic kernel (`crate::mosaic`) is called.
+    pub fn custom_call(
+        &mut self,
+        target: &str,
+        operands: &[Val],
+        config: &str,
+        outs: Vec<Ty>,
+    ) -> Vec<Val> {
+        let layout = |t: &Ty| {
+            let r = t.rank();
+            let order: Vec<i64> = (0..r as i64).rev().collect();
+            match r {
+                0 => "dense<> : tensor<0xindex>".to_string(),
+                1 => "dense<0> : tensor<1xindex>".to_string(),
+                _ => format!("dense<[{}]> : tensor<{r}xindex>", i64s(&order)),
+            }
+        };
+        let ins: Vec<String> = operands.iter().map(|&v| layout(self.ty(v))).collect();
+        let res: Vec<String> = outs.iter().map(layout).collect();
+        let mut escaped = String::with_capacity(config.len());
+        for c in config.chars() {
+            match c {
+                '"' => escaped.push_str("\\22"),
+                '\\' => escaped.push_str("\\5C"),
+                c => escaped.push(c),
+            }
+        }
+        let attrs = format!(
+            "api_version = 1 : i32, backend_config = \"{escaped}\", call_target_name = \"{target}\", \
+             has_side_effect = false, operand_layouts = [{}], result_layouts = [{}]",
+            ins.join(", "),
+            res.join(", ")
+        );
+        self.op_named("stablehlo.custom_call", operands, &attrs, outs)
+    }
+
     /// Emits `op` with generic syntax; several results.
     pub fn op_n(&mut self, op: &str, operands: &[Val], attrs: &str, outs: Vec<Ty>) -> Vec<Val> {
         if outs.len() == 1 {
-            let out = outs.into_iter().next().unwrap_or_else(|| Ty::scalar(Elem::F32));
+            let out = outs
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| Ty::scalar(Elem::F32));
             return vec![self.op(op, operands, attrs, out)];
         }
         let id = self.next;
@@ -554,7 +607,10 @@ impl Func {
         } else {
             format!("%{id}:{}", outs.len())
         };
-        let text = format!("{head} = \"stablehlo.{op}\"({}) ({{", self.names_of(operands));
+        let text = format!(
+            "{head} = \"stablehlo.{op}\"({}) ({{",
+            self.names_of(operands)
+        );
         self.line(&text);
         let args = self.block(block, region)?;
         let _ = args;
@@ -665,12 +721,22 @@ impl Func {
     /// materialized as a literal of every element when XLA imports it).
     fn splat_lit(&mut self, elem: Elem, lit: &str, dims: &[i64]) -> Val {
         let scalar = Ty::scalar(elem);
-        let c = self.op("constant", &[], &format!("value = dense<{lit}> : {scalar}"), scalar);
+        let c = self.op(
+            "constant",
+            &[],
+            &format!("value = dense<{lit}> : {scalar}"),
+            scalar,
+        );
         if dims.is_empty() {
             return c;
         }
         let ty = Ty::new(elem, dims);
-        self.op("broadcast_in_dim", &[c], "broadcast_dimensions = array<i64>", ty)
+        self.op(
+            "broadcast_in_dim",
+            &[c],
+            "broadcast_dimensions = array<i64>",
+            ty,
+        )
     }
 
     /// An integer (or bool) splat of `x` over `dims`.
@@ -687,10 +753,7 @@ impl Func {
     pub fn const_ints(&mut self, elem: Elem, xs: &[i64], dims: &[i64]) -> Built<Val> {
         let ty = Ty::new(elem, dims);
         if ty.elements() != xs.len() as i64 {
-            return malformed(
-                "constant",
-                format!("{} values for {ty}", xs.len()),
-            );
+            return malformed("constant", format!("{} values for {ty}", xs.len()));
         }
         let body = if dims.is_empty() {
             format!("{}", xs.first().copied().unwrap_or(0))
@@ -702,7 +765,12 @@ impl Func {
             let flat = self.const_ints(elem, xs, &[xs.len() as i64])?;
             return self.reshape(flat, dims);
         }
-        Ok(self.op("constant", &[], &format!("value = dense<{body}> : {ty}"), ty))
+        Ok(self.op(
+            "constant",
+            &[],
+            &format!("value = dense<{body}> : {ty}"),
+            ty,
+        ))
     }
 
     /// A dense float array constant (1-d, reshaped as asked).
@@ -1019,8 +1087,10 @@ impl Func {
             if start[i] < 0 || limit[i] > from.dims[i] || start[i] > limit[i] || strides[i] < 1 {
                 return malformed("slice", format!("{start:?}..{limit:?} of {from}"));
             }
-            dims.push((limit[i] - start[i]).div_euclid(strides[i])
-                + i64::from((limit[i] - start[i]).rem_euclid(strides[i]) != 0));
+            dims.push(
+                (limit[i] - start[i]).div_euclid(strides[i])
+                    + i64::from((limit[i] - start[i]).rem_euclid(strides[i]) != 0),
+            );
         }
         if dims == from.dims {
             return Ok(x);
@@ -1100,7 +1170,14 @@ impl Func {
         ))
     }
 
-    pub fn pad(&mut self, x: Val, value: Val, lo: &[i64], hi: &[i64], interior: &[i64]) -> Built<Val> {
+    pub fn pad(
+        &mut self,
+        x: Val,
+        value: Val,
+        lo: &[i64],
+        hi: &[i64],
+        interior: &[i64],
+    ) -> Built<Val> {
         let from = self.ty(x).clone();
         let r = from.rank();
         if lo.len() != r || hi.len() != r || interior.len() != r {
@@ -1125,7 +1202,12 @@ impl Func {
     /// Reverses the listed axes.
     pub fn reverse(&mut self, x: Val, axes: &[i64]) -> Val {
         let ty = self.ty(x).clone();
-        self.op("reverse", &[x], &format!("dimensions = {}", array(axes)), ty)
+        self.op(
+            "reverse",
+            &[x],
+            &format!("dimensions = {}", array(axes)),
+            ty,
+        )
     }
 
     // ----------------------------------------------------------------- linear
@@ -1144,7 +1226,16 @@ impl Func {
         out: Elem,
     ) -> Built<Val> {
         let highest = self.elem(lhs) == Elem::F32 || self.elem(rhs) == Elem::F32;
-        self.dot_general_at(lhs, rhs, lhs_batch, rhs_batch, lhs_contract, rhs_contract, out, highest)
+        self.dot_general_at(
+            lhs,
+            rhs,
+            lhs_batch,
+            rhs_batch,
+            lhs_contract,
+            rhs_contract,
+            out,
+            highest,
+        )
     }
 
     /// `dot_general` with the precision stated: `highest` asks the MXU for
@@ -1166,7 +1257,11 @@ impl Func {
         if lhs_batch.len() != rhs_batch.len() || lhs_contract.len() != rhs_contract.len() {
             return malformed("dot_general", format!("{l} · {r}: axis lists differ"));
         }
-        for (a, b) in lhs_batch.iter().zip(rhs_batch).chain(lhs_contract.iter().zip(rhs_contract)) {
+        for (a, b) in lhs_batch
+            .iter()
+            .zip(rhs_batch)
+            .chain(lhs_contract.iter().zip(rhs_contract))
+        {
             if l.dims[*a as usize] != r.dims[*b as usize] {
                 return malformed("dot_general", format!("{l} · {r}: axis {a} against {b}"));
             }
@@ -1408,7 +1503,11 @@ impl Func {
         if offsets.len() != dims.offset_dims.len() {
             return malformed(
                 "gather",
-                format!("{} offset dims for {} slice axes", dims.offset_dims.len(), offsets.len()),
+                format!(
+                    "{} offset dims for {} slice axes",
+                    dims.offset_dims.len(),
+                    offsets.len()
+                ),
             );
         }
         let rank = batch.len() + offsets.len();
@@ -1433,7 +1532,12 @@ impl Func {
             dims.index_vector_dim,
             array(slice_sizes)
         );
-        Ok(self.op("gather", &[operand, indices], &attrs, Ty::new(op.elem, &out)))
+        Ok(self.op(
+            "gather",
+            &[operand, indices],
+            &attrs,
+            Ty::new(op.elem, &out),
+        ))
     }
 
     /// Rows of a rank-2 `table` picked by the i32 vector `ids`: `[n, width]`.
@@ -1645,12 +1749,7 @@ impl Func {
     }
 
     /// `case` on an i32 index over branches that each yield `outs`.
-    pub fn case(
-        &mut self,
-        index: Val,
-        outs: &[Ty],
-        branches: Vec<Box<dyn FnOnce(&mut Self) -> Built<Vec<Val>> + '_>>,
-    ) -> Built<Vec<Val>> {
+    pub fn case(&mut self, index: Val, outs: &[Ty], branches: Vec<Branch<'_>>) -> Built<Vec<Val>> {
         let id = self.next;
         self.next += 1;
         let head = if outs.len() == 1 {
@@ -1758,7 +1857,13 @@ impl Func {
         let p = self.offset(p, 1.0)?;
         let one = self.like_f(x, 1.0);
         let t = self.div(one, p)?;
-        let coeffs = [1.061_405_429, -1.453_152_027, 1.421_413_741, -0.284_496_736, 0.254_829_592];
+        let coeffs = [
+            1.061_405_429,
+            -1.453_152_027,
+            1.421_413_741,
+            -0.284_496_736,
+            0.254_829_592,
+        ];
         let mut poly = self.like_f(x, coeffs[0]);
         for &c in &coeffs[1..] {
             poly = self.mul(poly, t)?;

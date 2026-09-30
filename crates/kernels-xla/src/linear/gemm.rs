@@ -71,7 +71,15 @@ pub(crate) fn dot_split(
     let rhs = cx.convert(rhs, Elem::Bf16);
     let mut acc: Option<Val> = None;
     for t in bf16_terms(cx, lhs, terms)? {
-        let d = cx.dot_general(t, rhs, lhs_batch, rhs_batch, lhs_contract, rhs_contract, Elem::F32)?;
+        let d = cx.dot_general(
+            t,
+            rhs,
+            lhs_batch,
+            rhs_batch,
+            lhs_contract,
+            rhs_contract,
+            Elem::F32,
+        )?;
         acc = Some(match acc {
             Some(a) => cx.add(a, d)?,
             None => d,
@@ -171,7 +179,13 @@ pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), E
 /// `y = act · wᵀ` for a dense weight. Also the f32-activation lane gemm of
 /// kernels-cuda / kernels-metal `linear::lane_gemm::act_x_wt` (same
 /// signature): an f32 activation is contracted at f32 precision.
-pub fn act_x_wt(ctx: &Ctx<'_>, op: &'static str, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
+pub fn act_x_wt(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    act: Tensor,
+    w: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
     let (m, _, _) = dense(op, act, w, y)?;
     if m == 0 {
         return Ok(());
@@ -186,7 +200,13 @@ pub fn act_x_wt(ctx: &Ctx<'_>, op: &'static str, act: Tensor, w: Tensor, y: Tens
 /// result before its one rounding.
 /// Reference: kernels-cuda `linear::gemm::matmul_bias` (engine-cuda
 /// `Linear::MatmulBias`; its non-gemv tactics add the bias after the store).
-pub fn matmul_bias(ctx: &Ctx<'_>, act: Tensor, w: Tensor, bias: Tensor, y: Tensor) -> Result<(), Error> {
+pub fn matmul_bias(
+    ctx: &Ctx<'_>,
+    act: Tensor,
+    w: Tensor,
+    bias: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "linear.matmul_bias";
     let (m, n, _) = dense(OP, act, w, y)?;
     if bias.elements() != u64::from(n) {
@@ -209,7 +229,13 @@ pub fn matmul_bias(ctx: &Ctx<'_>, act: Tensor, w: Tensor, bias: Tensor, y: Tenso
 /// Reference: kernels-cuda `linear::skinny` `Epilogue::Softcap` (fused on
 /// the accumulator) / `attn::logit_softcap` after `lm_head` (engine-cuda
 /// `Linear::LmHeadSoftcap`).
-pub fn lm_head_softcap(ctx: &Ctx<'_>, act: Tensor, w: Tensor, cap: f32, y: Tensor) -> Result<(), Error> {
+pub fn lm_head_softcap(
+    ctx: &Ctx<'_>,
+    act: Tensor,
+    w: Tensor,
+    cap: f32,
+    y: Tensor,
+) -> Result<(), Error> {
     const OP: &str = "linear.lm_head_softcap";
     if !(cap.is_finite() && cap > 0.0) {
         return Err(refuse(OP, format!("{cap} is not a logit soft cap")));
@@ -290,7 +316,10 @@ pub fn rel_bias(
     const OP: &str = "linear.rel_bias";
     expect(OP, x, &[Dtype::Bf16, Dtype::F16])?;
     if heads == 0 || d_rel == 0 || extent == 0 {
-        return Err(refuse(OP, "the heads, relative width and extent are all nonzero"));
+        return Err(refuse(
+            OP,
+            "the heads, relative width and extent are all nonzero",
+        ));
     }
     if x.width != heads * d_rel {
         return Err(refuse(
@@ -321,7 +350,10 @@ pub fn rel_bias(
     }
     ctx.emit(&mut |cx| {
         let xv = cx.read(x)?;
-        let xv = cx.reshape(xv, &[i64::from(x.rows) * i64::from(heads), i64::from(d_rel)])?;
+        let xv = cx.reshape(
+            xv,
+            &[i64::from(x.rows) * i64::from(heads), i64::from(d_rel)],
+        )?;
         let wv = cx.read(w)?;
         let (xv, wv) = if x.dtype == Dtype::Bf16 {
             (xv, wv)

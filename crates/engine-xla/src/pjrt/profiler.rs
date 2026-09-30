@@ -94,7 +94,8 @@ impl Profiler {
     /// Starts a trace with host and device tracing on (tensorflow
     /// `ProfileOptions`: host level 2, device level 1, version 1, HLO protos).
     pub fn start(api: &Arc<Api>) -> Result<Profiler, Error> {
-        let table = find(api).ok_or_else(|| Error::local("the plugin has no profiler extension"))?;
+        let table =
+            find(api).ok_or_else(|| Error::local("the plugin has no profiler extension"))?;
         const OPTIONS: [u8; 8] = [0x10, 0x02, 0x18, 0x01, 0x28, 0x01, 0x38, 0x01];
         let mut create = CreateArgs {
             struct_size: std::mem::size_of::<CreateArgs>(),

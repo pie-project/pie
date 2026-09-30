@@ -53,7 +53,11 @@ fn gemm_at(x: &[f32], w: &[f32], m: usize, n: usize, k: usize, round: bool) -> V
         for c in 0..n {
             let mut acc = 0.0f64;
             for i in 0..k {
-                let wv = if round { round_bf16(w[c * k + i]) } else { w[c * k + i] };
+                let wv = if round {
+                    round_bf16(w[c * k + i])
+                } else {
+                    w[c * k + i]
+                };
                 acc += f64::from(x[r * k + i]) * f64::from(wv);
             }
             y[r * n + c] = acc as f32;
@@ -89,7 +93,9 @@ fn affine_banks_at_every_group_and_width_answer_the_host() {
     let (m, big, n, k) = (5usize, 1400usize, 12usize, 384usize);
     let xs = data(m * k, 1);
     let xb = data(big * k, 2);
-    let x32: Vec<f32> = (0..m * k).map(|i| data(1, 3 + i as u32)[0] * 1.001 + 1e-4).collect();
+    let x32: Vec<f32> = (0..m * k)
+        .map(|i| data(1, 3 + i as u32)[0] * 1.001 + 1e-4)
+        .collect();
     let mut b = Bench::new();
     let x = b.bf16(m as u32, k as u32, &xs);
     let xbig = b.bf16(big as u32, k as u32, &xb);
@@ -124,7 +130,10 @@ fn affine_banks_at_every_group_and_width_answer_the_host() {
             .iter()
             .map(|v| round_bf16((v.abs() + 0.1) * 0.5 / (1 << bits) as f32))
             .collect();
-        let biases: Vec<f32> = data(n * groups, seed + 2).iter().map(|v| round_bf16(v * 0.3)).collect();
+        let biases: Vec<f32> = data(n * groups, seed + 2)
+            .iter()
+            .map(|v| round_bf16(v * 0.3))
+            .collect();
         let w: Vec<f32> = (0..n * k)
             .map(|i| {
                 let g = (i / k) * groups + (i % k) / group as usize;
@@ -136,7 +145,11 @@ fn affine_banks_at_every_group_and_width_answer_the_host() {
         // Alternate the two code views the entry reads: the bank's packed
         // dtype over logical codes, and the bytes themselves.
         let t = b.u8(n as u32, row_bytes, &packed);
-        let codes_t = if at % 2 == 0 { retype(t, n as u32, k as u32, packed_dtype) } else { t };
+        let codes_t = if at % 2 == 0 {
+            retype(t, n as u32, k as u32, packed_dtype)
+        } else {
+            t
+        };
         let s = b.bf16(n as u32, groups as u32, &scales);
         let bi = b.bf16(n as u32, groups as u32, &biases);
         let y = b.zeros(Dtype::Bf16, m as u32, n as u32);
@@ -159,7 +172,9 @@ fn affine_banks_at_every_group_and_width_answer_the_host() {
     // A mxfp4 bank: symmetric, 4 bits in groups of 32, e8m0 scales.
     let lut = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let mx_codes: Vec<u32> = (0..n * k).map(|i| hash(i, 900) >> 9 & 15).collect();
-    let mx_scales: Vec<u8> = (0..n * k / 32).map(|i| 122 + (hash(i, 901) % 8) as u8).collect();
+    let mx_scales: Vec<u8> = (0..n * k / 32)
+        .map(|i| 122 + (hash(i, 901) % 8) as u8)
+        .collect();
     let mx_w: Vec<f32> = (0..n * k)
         .map(|i| {
             let c = mx_codes[i];
@@ -214,17 +229,52 @@ fn affine_banks_at_every_group_and_width_answer_the_host() {
     // is rounded to bf16 (a GPU qmm's staged tile).
     for c in &cases {
         eprintln!("{}", c.label);
-        assert_close(&b.read_f32(c.y), &gemm_at(&xs, &c.w, m, n, k, false), 1e-2, 1e-2);
-        assert_close(&b.read_f32(c.yb), &gemm_ref(&xb, &c.w, big, n, k), 1e-2, 1e-2);
+        assert_close(
+            &b.read_f32(c.y),
+            &gemm_at(&xs, &c.w, m, n, k, false),
+            1e-2,
+            1e-2,
+        );
+        assert_close(
+            &b.read_f32(c.yb),
+            &gemm_ref(&xb, &c.w, big, n, k),
+            1e-2,
+            1e-2,
+        );
     }
-    assert_close(&b.read_f32(lm), &gemm_at(&xs, &cases[4].w, m, n, k, false), 1e-2, 1e-2);
+    assert_close(
+        &b.read_f32(lm),
+        &gemm_at(&xs, &cases[4].w, m, n, k, false),
+        1e-2,
+        1e-2,
+    );
     // f32 activations: exact products, f32 accumulation.
     eprintln!("f32 activations");
     let (u4w, mxw) = (&cases[4].w, &cases[9].w);
-    assert_close(&b.read_f32(f32s[0]), &gemm_at(&x32, u4w, m, n, k, false), 1e-4, 1e-4);
-    assert_close(&b.read_f32(f32s[1]), &gemm_at(&xb, u4w, big, n, k, false), 1e-4, 1e-4);
-    assert_close(&b.read_f32(f32s[2]), &gemm_at(&x32, mxw, m, n, k, false), 1e-4, 1e-4);
-    assert_close(&b.read_f32(f32s[3]), &gemm_at(&xb, mxw, big, n, k, false), 1e-4, 1e-4);
+    assert_close(
+        &b.read_f32(f32s[0]),
+        &gemm_at(&x32, u4w, m, n, k, false),
+        1e-4,
+        1e-4,
+    );
+    assert_close(
+        &b.read_f32(f32s[1]),
+        &gemm_at(&xb, u4w, big, n, k, false),
+        1e-4,
+        1e-4,
+    );
+    assert_close(
+        &b.read_f32(f32s[2]),
+        &gemm_at(&x32, mxw, m, n, k, false),
+        1e-4,
+        1e-4,
+    );
+    assert_close(
+        &b.read_f32(f32s[3]),
+        &gemm_at(&xb, mxw, big, n, k, false),
+        1e-4,
+        1e-4,
+    );
 }
 
 // ------------------------------------------------------------------ k-quant
@@ -251,7 +301,8 @@ fn kquant_block(scheme: usize, blk: &[u8]) -> Vec<f32> {
                 let packed = byte(b);
                 for l in 0..16 {
                     let q = (byte(at + l) >> shift) & 3;
-                    w[b * 16 + l] = d * (packed & 15) as f32 * q as f32 - dmin * (packed >> 4) as f32;
+                    w[b * 16 + l] =
+                        d * (packed & 15) as f32 * q as f32 - dmin * (packed >> 4) as f32;
                 }
             }
         }
@@ -274,7 +325,11 @@ fn kquant_block(scheme: usize, blk: &[u8]) -> Vec<f32> {
                 let mask_at = (b & 1) * 16;
                 for l in 0..16 {
                     let code = ((byte(at + l) >> shift) & 3) as i32;
-                    let borrow = if byte(mask_at + l) & selector != 0 { 0 } else { 4 };
+                    let borrow = if byte(mask_at + l) & selector != 0 {
+                        0
+                    } else {
+                        4
+                    };
                     w[b * 16 + l] = d * (scale(b) - 32) as f32 * (code - borrow) as f32;
                 }
             }
@@ -285,12 +340,18 @@ fn kquant_block(scheme: usize, blk: &[u8]) -> Vec<f32> {
             let scale_min = |sub: usize| -> (f32, f32) {
                 let base = 4;
                 if sub < 4 {
-                    return ((byte(base + sub) & 63) as f32, (byte(base + sub + 4) & 63) as f32);
+                    return (
+                        (byte(base + sub) & 63) as f32,
+                        (byte(base + sub + 4) & 63) as f32,
+                    );
                 }
                 let a = byte(base + sub + 4);
                 let b = byte(base + sub - 4);
                 let c = byte(base + sub);
-                (((a & 15) | ((b >> 6) << 4)) as f32, ((a >> 4) | ((c >> 6) << 4)) as f32)
+                (
+                    ((a & 15) | ((b >> 6) << 4)) as f32,
+                    ((a >> 4) | ((c >> 6) << 4)) as f32,
+                )
             };
             for b in 0..8 {
                 let pair = b >> 1;
@@ -389,7 +450,11 @@ fn every_k_quant_scheme_answers_the_host() {
         let row_bytes = (blocks * bb) as u32;
         let t = b.u8(n as u32, row_bytes, &plane);
         // Odd cases bind the K-quant dtype itself over the byte row.
-        let t = if at % 2 == 1 { retype(t, n as u32, row_bytes, dtype) } else { t };
+        let t = if at % 2 == 1 {
+            retype(t, n as u32, row_bytes, dtype)
+        } else {
+            t
+        };
         let group: u32 = if matches!(scheme, 4 | 5) { 32 } else { 16 };
         let groups = k as u32 / group;
         cases.push(Case {
@@ -438,8 +503,16 @@ fn every_k_quant_scheme_answers_the_host() {
         assert_close(&b.read_f32(c.y), &want, tol, 1e-2);
         let exact = gemm_at(&xs, &c.dense, m, n, k, false);
         assert_close(&b.read_f32(c.ya), &exact, tol, 1e-2);
-        assert_close(&b.read_f32(c.yb), &gemm_ref(&xb, &c.dense, big, n, k), tol, 1e-2);
-        assert!(b.bytes(c.codes).iter().all(|&q| q < 64), "codes fit six bits");
+        assert_close(
+            &b.read_f32(c.yb),
+            &gemm_ref(&xb, &c.dense, big, n, k),
+            tol,
+            1e-2,
+        );
+        assert!(
+            b.bytes(c.codes).iter().all(|&q| q < 64),
+            "codes fit six bits"
+        );
     }
     let want = gemm_ref(&xs, &cases[2].dense, m, n, k);
     let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
@@ -513,7 +586,10 @@ fn nvfp4_answers_the_host() {
     assert!(scale > 0.1);
     assert_close(&b.read_f32(y), &want, 1e-2 * scale, 1e-2);
     assert_close(&b.read_f32(lm), &want, 1e-5 * scale, 1e-5);
-    let want: Vec<f32> = gemm_ref(&xb, &w, big, n, k).iter().map(|v| v * ts).collect();
+    let want: Vec<f32> = gemm_ref(&xb, &w, big, n, k)
+        .iter()
+        .map(|v| v * ts)
+        .collect();
     let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
     assert_close(&b.read_f32(yb), &want, 1e-2 * scale, 1e-2);
 }
@@ -550,7 +626,10 @@ mod probe {
             }
             let (dtype, rows, width) = self.shapes[t.buf as usize];
             let v = f.param(
-                Ty::new(elem_of("probe", dtype)?, &[i64::from(rows), i64::from(width)]),
+                Ty::new(
+                    elem_of("probe", dtype)?,
+                    &[i64::from(rows), i64::from(width)],
+                ),
                 None,
             );
             self.params.push(t.buf);
@@ -573,7 +652,10 @@ mod probe {
     }
 
     impl Emit for Tracer {
-        fn emit(&self, body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>) -> Result<(), Error> {
+        fn emit(
+            &self,
+            body: &mut dyn FnMut(&mut Cx<'_>) -> Result<(), Error>,
+        ) -> Result<(), Error> {
             let mut func = self.func.borrow_mut();
             let mut env = self.env.borrow_mut();
             let mut cx = Cx::new(&mut func, &mut *env);
@@ -581,7 +663,11 @@ mod probe {
         }
     }
 
-    pub fn time(label: &str, shapes: &[(Dtype, u32, u32)], body: impl FnOnce(&Ctx<'_>) -> Result<(), Error>) {
+    pub fn time(
+        label: &str,
+        shapes: &[(Dtype, u32, u32)],
+        body: impl FnOnce(&Ctx<'_>) -> Result<(), Error>,
+    ) {
         let Some(client) = client() else { return };
         let tracer = Tracer {
             func: RefCell::new(Func::new("main")),
@@ -617,7 +703,9 @@ mod probe {
         let burst = |n: u32| {
             let mut events = Vec::new();
             for _ in 0..n {
-                let (outs, done) = exe.execute(dev, uploads.iter().map(Arg::Keep).collect()).unwrap();
+                let (outs, done) = exe
+                    .execute(dev, uploads.iter().map(Arg::Keep).collect())
+                    .unwrap();
                 events.push((outs, done));
             }
             for (_, done) in events {
@@ -628,7 +716,10 @@ mod probe {
         let n = 200;
         let t = Instant::now();
         burst(n);
-        eprintln!("{label}: {:.1} us/run", t.elapsed().as_secs_f64() * 1e6 / f64::from(n));
+        eprintln!(
+            "{label}: {:.1} us/run",
+            t.elapsed().as_secs_f64() * 1e6 / f64::from(n)
+        );
     }
 }
 
@@ -638,13 +729,7 @@ type Layer<'a> =
 /// `LAYERS` chained projections of one format: tensor 0 is the input,
 /// `1..=LAYERS` the outputs (each the next layer's input), then each
 /// layer's planes.
-fn chain(
-    label: &str,
-    m: u32,
-    width: u32,
-    planes: &[(Dtype, u32, u32)],
-    layer: &Layer<'_>,
-) {
+fn chain(label: &str, m: u32, width: u32, planes: &[(Dtype, u32, u32)], layer: &Layer<'_>) {
     const LAYERS: u32 = 8;
     let mut shapes = vec![(Dtype::Bf16, m, width); 1 + LAYERS as usize];
     for _ in 0..LAYERS {
@@ -669,12 +754,22 @@ fn chain(
 fn probe_projection_formats() {
     use kernels_xla::linear::gemm;
     let (n, k) = (4096u32, 4096u32);
-    let ms: Vec<u32> = std::env::var("PROBE_M").ok().map_or(vec![8, 64, 512], |v| v.split(',').filter_map(|x| x.parse().ok()).collect());
+    let ms: Vec<u32> = std::env::var("PROBE_M").ok().map_or(vec![8, 64, 512], |v| {
+        v.split(',').filter_map(|x| x.parse().ok()).collect()
+    });
     for m in ms {
-        chain(&format!("m={m} dense bf16 x8"), m, n, &[(Dtype::Bf16, n, k)], &|ctx, x, y, p| {
-            gemm::matmul(ctx, x, p[0], y)
-        });
-        let aff = [(Dtype::U8, n, k / 2), (Dtype::Bf16, n, k / 64), (Dtype::Bf16, n, k / 64)];
+        chain(
+            &format!("m={m} dense bf16 x8"),
+            m,
+            n,
+            &[(Dtype::Bf16, n, k)],
+            &|ctx, x, y, p| gemm::matmul(ctx, x, p[0], y),
+        );
+        let aff = [
+            (Dtype::U8, n, k / 2),
+            (Dtype::Bf16, n, k / 64),
+            (Dtype::Bf16, n, k / 64),
+        ];
         chain(&format!("m={m} u4g64 x8"), m, n, &aff, &|ctx, x, y, p| {
             let bank = Bank {
                 codes: Tensor::new(p[0].buf, n, k, Dtype::U4g64),
@@ -685,7 +780,11 @@ fn probe_projection_formats() {
             };
             quant::matmul(ctx, x, bank, y)
         });
-        let g32 = [(Dtype::U8, n, k / 2), (Dtype::Bf16, n, k / 32), (Dtype::Bf16, n, k / 32)];
+        let g32 = [
+            (Dtype::U8, n, k / 2),
+            (Dtype::Bf16, n, k / 32),
+            (Dtype::Bf16, n, k / 32),
+        ];
         chain(&format!("m={m} u4g32 x8"), m, n, &g32, &|ctx, x, y, p| {
             let bank = Bank {
                 codes: Tensor::new(p[0].buf, n, k, Dtype::U4g32),
@@ -697,11 +796,27 @@ fn probe_projection_formats() {
             quant::matmul(ctx, x, bank, y)
         });
         for group in [16u32, 32, 64] {
-            let u8g = [(Dtype::U8, n, k), (Dtype::F32, n, k / group), (Dtype::F32, n, k / group)];
-            chain(&format!("m={m} u8g{group} x8"), m, n, &u8g, &|ctx, x, y, p| {
-                let bank = Bank { codes: p[0], scales: p[1], biases: Some(p[2]), group, bits: 8 };
-                quant::matmul(ctx, x, bank, y)
-            });
+            let u8g = [
+                (Dtype::U8, n, k),
+                (Dtype::F32, n, k / group),
+                (Dtype::F32, n, k / group),
+            ];
+            chain(
+                &format!("m={m} u8g{group} x8"),
+                m,
+                n,
+                &u8g,
+                &|ctx, x, y, p| {
+                    let bank = Bank {
+                        codes: p[0],
+                        scales: p[1],
+                        biases: Some(p[2]),
+                        group,
+                        bits: 8,
+                    };
+                    quant::matmul(ctx, x, bank, y)
+                },
+            );
         }
         if std::env::var("PROBE_SKIP_K").is_ok() {
             let nv = [(Dtype::U8, n, k / 2), (Dtype::U8, n, k / 16)];
@@ -710,10 +825,20 @@ fn probe_projection_formats() {
             });
             continue;
         }
-        for (name, bb) in [("q2_k", 84), ("q3_k", 110), ("q4_k", 144), ("q5_k", 176), ("q6_k", 210)] {
-            chain(&format!("m={m} {name} x8"), m, n, &[(Dtype::U8, n, k / 256 * bb)], &|ctx, x, y, p| {
-                kquant::matmul(ctx, x, p[0], y)
-            });
+        for (name, bb) in [
+            ("q2_k", 84),
+            ("q3_k", 110),
+            ("q4_k", 144),
+            ("q5_k", 176),
+            ("q6_k", 210),
+        ] {
+            chain(
+                &format!("m={m} {name} x8"),
+                m,
+                n,
+                &[(Dtype::U8, n, k / 256 * bb)],
+                &|ctx, x, y, p| kquant::matmul(ctx, x, p[0], y),
+            );
         }
         let nv = [(Dtype::U8, n, k / 2), (Dtype::U8, n, k / 16)];
         chain(&format!("m={m} nvfp4 x8"), m, n, &nv, &|ctx, x, y, p| {

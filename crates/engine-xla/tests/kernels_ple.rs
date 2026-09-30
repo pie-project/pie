@@ -7,7 +7,11 @@ use kernels_xla::attn::ssm::Committed;
 use kernels_xla::{RaggedTensor, RecurrentPool, Tensor};
 
 const DROP: i32 = i32::MAX;
-const MULTS: [u64; 3] = [0x9E37_79B9_7F4A_7C15, 0xC2B2_AE3D_27D4_EB4F, 0x1656_67B1_9E37_79F9];
+const MULTS: [u64; 3] = [
+    0x9E37_79B9_7F4A_7C15,
+    0xC2B2_AE3D_27D4_EB4F,
+    0x1656_67B1_9E37_79F9,
+];
 const PRIMES: [u64; 4] = [1_000_003, 999_983, 65_537, 3_000_000_019];
 const OFFSETS: [u64; 4] = [0, 1_000_003, 2_000_000, 4_000_000_000];
 const EOS: i32 = 1;
@@ -29,11 +33,11 @@ fn cell(c: i32) -> i32 {
 /// The heads of one window `[id, prev1, prev2]`.
 fn hash_row(window: &mut [i32], map: Option<&[i64]>) -> Vec<i32> {
     let mut crossed = false;
-    for p in 1..window.len() {
+    for w in window.iter_mut().skip(1) {
         if crossed {
-            window[p] = EOS;
+            *w = EOS;
         }
-        if window[p] == EOS {
+        if *w == EOS {
             crossed = true;
         }
     }
@@ -87,9 +91,15 @@ fn walk(ids: &[i32], state: &[i32], keep: usize, map: Option<&[i64]>) -> (Vec<i3
 fn ids_of(n: usize, seed: u32) -> Vec<i32> {
     (0..n)
         .map(|i| {
-            let h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(40503));
+            let h = (i as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(seed.wrapping_mul(40503));
             // Every 7th id is the eos barrier.
-            if (h >> 5) % 7 == 0 { EOS } else { ((h >> 8) % 50) as i32 }
+            if (h >> 5).is_multiple_of(7) {
+                EOS
+            } else {
+                ((h >> 8) % 50) as i32
+            }
         })
         .collect()
 }
@@ -117,8 +127,16 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
         let ran = b
             .run(|ctx| {
                 ple::ngram_ids(
-                    ctx, idt, &p, EOS as u32, &MULTS, &PRIMES, &OFFSETS, HPN as u32,
-                    with_map.then_some(mt), out,
+                    ctx,
+                    idt,
+                    &p,
+                    EOS as u32,
+                    &MULTS,
+                    &PRIMES,
+                    &OFFSETS,
+                    HPN as u32,
+                    with_map.then_some(mt),
+                    out,
                 )
             })
             .unwrap();
@@ -160,7 +178,10 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
         b.run(|ctx| {
             ple::ngram_ids_chunked(
                 ctx,
-                RaggedTensor { data: idt, indptr: ip },
+                RaggedTensor {
+                    data: idt,
+                    indptr: ip,
+                },
                 &p,
                 EOS as u32,
                 &MULTS,
@@ -213,8 +234,18 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
         };
         b.run(|ctx| {
             ple::ngram_ids_committed(
-                ctx, idt, ip, &seat, &p, EOS as u32, &MULTS, &PRIMES, &OFFSETS, HPN as u32,
-                with_map.then_some(mt), out,
+                ctx,
+                idt,
+                ip,
+                &seat,
+                &p,
+                EOS as u32,
+                &MULTS,
+                &PRIMES,
+                &OFFSETS,
+                HPN as u32,
+                with_map.then_some(mt),
+                out,
             )
         })
         .unwrap();
@@ -227,10 +258,19 @@ fn ngram_ids_hash_windows_in_decode_chunked_and_committed_forms() {
             let span_r = own + replay[g] as usize;
             let s = seat_slots[g] as usize;
             let keep = (commit[g] as usize).min(span_r);
-            let (o, next) = walk(&ids[begin..begin + span_r], &bank0[s * 2..s * 2 + 2], keep, m);
+            let (o, next) = walk(
+                &ids[begin..begin + span_r],
+                &bank0[s * 2..s * 2 + 2],
+                keep,
+                m,
+            );
             let rep = replay[g] as usize;
             let o0 = indptr[r] as usize;
-            assert_eq!(&got[o0 * 4..(o0 + own) * 4], &o[rep * 4..], "committed lane {r}");
+            assert_eq!(
+                &got[o0 * 4..(o0 + own) * 4],
+                &o[rep * 4..],
+                "committed lane {r}"
+            );
             if keep > 0 {
                 want_bank[s * 2..s * 2 + 2].copy_from_slice(&next);
             }
@@ -253,13 +293,27 @@ fn the_selector_walk_feeds_each_pick_to_the_next_row() {
         s
     };
     let cand: Vec<i32> = (0..rows * k)
-        .map(|i| if i == 7 { -3 } else { (next() % vocab as u32) as i32 })
+        .map(|i| {
+            if i == 7 {
+                -3
+            } else {
+                (next() % vocab as u32) as i32
+            }
+        })
         .collect();
-    let unary: Vec<f32> = (0..rows * k).map(|_| (next() % 1000) as f32 / 500.0 - 1.0).collect();
+    let unary: Vec<f32> = (0..rows * k)
+        .map(|_| (next() % 1000) as f32 / 500.0 - 1.0)
+        .collect();
     let bf = |x: f32| engine_xla::bench::round_bf16(x);
-    let hp: Vec<f32> = (0..rows * rank).map(|_| bf((next() % 1000) as f32 / 500.0 - 1.0)).collect();
-    let pred: Vec<f32> = (0..vocab * rank).map(|_| bf((next() % 1000) as f32 / 500.0 - 1.0)).collect();
-    let succ: Vec<f32> = (0..vocab * rank).map(|_| bf((next() % 1000) as f32 / 500.0 - 1.0)).collect();
+    let hp: Vec<f32> = (0..rows * rank)
+        .map(|_| bf((next() % 1000) as f32 / 500.0 - 1.0))
+        .collect();
+    let pred: Vec<f32> = (0..vocab * rank)
+        .map(|_| bf((next() % 1000) as f32 / 500.0 - 1.0))
+        .collect();
+    let succ: Vec<f32> = (0..vocab * rank)
+        .map(|_| bf((next() % 1000) as f32 / 500.0 - 1.0))
+        .collect();
     let tokens: Vec<i32> = (0..rows).map(|_| (next() % vocab as u32) as i32).collect();
     let before: Vec<i32> = (0..rows as i32).map(|i| 1000 + i).collect();
     for (first, with_hp) in [(0u32, true), (1, false)] {
@@ -276,7 +330,10 @@ fn the_selector_walk_feeds_each_pick_to_the_next_row() {
             .run(|ctx| {
                 ple::selector_walk(
                     ctx,
-                    RaggedTensor { data: ct, indptr: ip },
+                    RaggedTensor {
+                        data: ct,
+                        indptr: ip,
+                    },
                     ut,
                     with_hp.then_some(ht),
                     tt,
@@ -309,7 +366,8 @@ fn the_selector_walk_feeds_each_pick_to_the_next_row() {
                     if prev >= 0 && (prev as usize) < vocab && cid >= 0 && (cid as usize) < vocab {
                         for d in 0..rank {
                             let h = if with_hp { hp[row * rank + d] } else { 1.0 };
-                            part += pred[prev as usize * rank + d] * h * succ[cid as usize * rank + d];
+                            part +=
+                                pred[prev as usize * rank + d] * h * succ[cid as usize * rank + d];
                         }
                     }
                     let v = unary[row * k + c] + part;

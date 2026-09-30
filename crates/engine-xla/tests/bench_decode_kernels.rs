@@ -63,13 +63,19 @@ fn decode_kernels_at_width() {
     };
     report(
         "attn::decode",
-        b.time(20, |ctx| attn::decode(ctx, q, &plan, &pool, None, d, 0.0625, o))
-            .unwrap(),
+        b.time(20, |ctx| {
+            attn::decode(ctx, q, &plan, &pool, None, d, 0.0625, o)
+        })
+        .unwrap(),
     );
 
     // Gated delta: k/v heads 16 of 128.
     let (hk, hv, dk, dv) = (16u32, 16u32, 128u32, 128u32);
-    let qkv = b.bf16(n, 2 * hk * dk + hv * dv, &vec![0.01; (n * (2 * hk * dk + hv * dv)) as usize]);
+    let qkv = b.bf16(
+        n,
+        2 * hk * dk + hv * dv,
+        &vec![0.01; (n * (2 * hk * dk + hv * dv)) as usize],
+    );
     let z = b.zeros(Dtype::Bf16, n, hv * dv);
     let gates = b.f32(n, 2 * hv, &vec![0.1; (n * 2 * hv) as usize]);
     let stride = hv * dv * dk;
@@ -84,8 +90,10 @@ fn decode_kernels_at_width() {
     };
     report(
         "ssm::gated_delta",
-        b.time(20, |ctx| ssm::gated_delta(ctx, qkv, z, gates, &state, hk, hv, dk, dv, y))
-            .unwrap(),
+        b.time(20, |ctx| {
+            ssm::gated_delta(ctx, qkv, z, gates, &state, hk, hv, dk, dv, y)
+        })
+        .unwrap(),
     );
 
     // Causal conv over 6144 channels, width 4.
@@ -171,7 +179,11 @@ fn state_row_scatter_hinted_in_place() {
     let rows = b.f32(n, stride, &vec![1.0; (n * stride) as usize]);
     for unique in [false, true] {
         report(
-            if unique { "put_rows unique" } else { "put_rows" },
+            if unique {
+                "put_rows unique"
+            } else {
+                "put_rows"
+            },
             b.time(20, |ctx| {
                 ctx.emit(&mut |cx| {
                     let s = cx.read(bank)?;
@@ -210,7 +222,11 @@ fn state_row_update_by_loop() {
                     let slot = f.dynamic_slice(i, &[at], &[1])?;
                     let slot = f.reshape(slot, &[])?;
                     let row = f.dynamic_slice(r, &[at, zero], &[1, i64::from(stride)])?;
-                    Ok(vec![f.dynamic_update_slice(carried[0], row, &[slot, zero])?])
+                    Ok(vec![f.dynamic_update_slice(
+                        carried[0],
+                        row,
+                        &[slot, zero],
+                    )?])
                 })?;
                 cx.write(bank, out[0])
             })
@@ -224,10 +240,14 @@ fn state_row_scatter_tiled() {
     let Some(n) = width() else {
         return;
     };
-    use kernels_xla::hlo::{Elem, ScatterDims, GatherDims, Ty};
+    use kernels_xla::hlo::{Elem, GatherDims, ScatterDims, Ty};
     let mut b = Bench::new();
     // A [slots, 2048 * 128] bank, read as tiles of [2048, 128] per slot.
-    let bank = b.f32(n + 1, 2048 * 128, &vec![0.0; ((n + 1) * 2048 * 128) as usize]);
+    let bank = b.f32(
+        n + 1,
+        2048 * 128,
+        &vec![0.0; ((n + 1) * 2048 * 128) as usize],
+    );
     let slots = b.i32(n, 1, &(0..n as i32).collect::<Vec<_>>());
     let rows = b.f32(n, 2048 * 128, &vec![1.0; (n * 2048 * 128) as usize]);
     let _ = Ty::new(Elem::F32, &[]);

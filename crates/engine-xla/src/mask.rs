@@ -54,7 +54,10 @@ pub struct Staged {
 }
 
 pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
-    if lanes.iter().all(|lane| lane.mask.is_none() && !lane.bidirectional) {
+    if lanes
+        .iter()
+        .all(|lane| lane.mask.is_none() && !lane.bidirectional)
+    {
         return Ok(None);
     }
 

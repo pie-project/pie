@@ -19,6 +19,9 @@ use kernels_xla::hlo::Elem;
 use kernels_xla::{KvPool, RecurrentPool, Tensor};
 use model_ir::{CacheRow, Dtype, Trace};
 
+/// Source and destination rows of a pool copy.
+type Moves = (Vec<i64>, Vec<i64>);
+
 use crate::device::Device;
 use crate::error::{Fault, Result};
 use crate::pjrt::Buffer;
@@ -238,9 +241,13 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
                 ..
             } => {
                 let planes = split(name, planes)?;
-                let cells =
-                    plane_pages(paging, windowed_row(paging, *window)) * u64::from(paging.page_size);
-                let values = if planes.shared || planes.values == 0 { 0 } else { planes.values };
+                let cells = plane_pages(paging, windowed_row(paging, *window))
+                    * u64::from(paging.page_size);
+                let values = if planes.shared || planes.values == 0 {
+                    0
+                } else {
+                    planes.values
+                };
                 cells * (planes.keys + values) * elem_bytes(name, *dtype)?
             }
             CacheRow::State { name, slab, dtype } => {
@@ -266,11 +273,13 @@ impl Pools {
         let mut shapes = Vec::with_capacity(trace.caches.len());
         let mut compressor = Vec::new();
         let mut bytes = 0u64;
-        let cells = u32::try_from((paging.pages() + 1) * u64::from(paging.page_size))
-            .map_err(|_| Fault::Ceiling {
-                what: "kv cells in one plane",
-                need: (paging.pages() + 1) * u64::from(paging.page_size),
-                have: u64::from(u32::MAX),
+        let cells =
+            u32::try_from((paging.pages() + 1) * u64::from(paging.page_size)).map_err(|_| {
+                Fault::Ceiling {
+                    what: "kv cells in one plane",
+                    need: (paging.pages() + 1) * u64::from(paging.page_size),
+                    have: u64::from(u32::MAX),
+                }
             })?;
         for (index, row) in trace.caches.iter().enumerate() {
             match row {
@@ -305,11 +314,8 @@ impl Pools {
                     let head_dim = restated.map_or(split.keys, |seat| u64::from(seat.head_dim));
                     let kv_heads = restated.map_or(1, |seat| u64::from(seat.kv_heads));
                     let shared = split.shared || split.values == 0;
-                    let mut row_planes = vec![device.zeros_or_dry(
-                        *dtype,
-                        cells,
-                        narrow(split.keys),
-                    )?];
+                    let mut row_planes =
+                        vec![device.zeros_or_dry(*dtype, cells, narrow(split.keys))?];
                     let keys = handles.root(Root {
                         source: Source::Pool {
                             row: index as u32,
@@ -625,7 +631,13 @@ impl Pools {
     }
 
     /// Copies slot `src` of every state slab over slot `dst`.
-    pub fn copy_slot(&mut self, device: &Device, handles: &Handles, src: u32, dst: u32) -> Result<()> {
+    pub fn copy_slot(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        src: u32,
+        dst: u32,
+    ) -> Result<()> {
         self.check_slot(src)?;
         self.check_slot(dst)?;
         let tracer = Tracer::new(handles);
@@ -689,7 +701,7 @@ impl Pools {
             return Ok(());
         }
         let tracer = Tracer::new(handles);
-        let mut planes: Vec<(Tensor, &(Vec<i64>, Vec<i64>))> = Vec::new();
+        let mut planes: Vec<(Tensor, &Moves)> = Vec::new();
         if !full.0.is_empty() {
             planes.extend(self.kv_planes(false).map(|t| (t, &full)));
         }
@@ -700,8 +712,8 @@ impl Pools {
             tracer.emit(&mut |cx| {
                 let whole = cx.read(t)?;
                 let n = src.len() as i64;
-                let s = cx.const_ints(Elem::I32, &src, &[n])?;
-                let d = cx.const_ints(Elem::I32, &dst, &[n])?;
+                let s = cx.const_ints(Elem::I32, src, &[n])?;
+                let d = cx.const_ints(Elem::I32, dst, &[n])?;
                 let rows = cx.take_rows(whole, s)?;
                 let next = cx.put_rows(whole, d, rows, kernels_xla::hlo::Combine::Set)?;
                 cx.write(t, next)

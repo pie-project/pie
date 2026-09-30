@@ -38,7 +38,10 @@ pub fn sigmoid_mul_heads(
     if head_dim == 0 || x.width == 0 || !x.width.is_multiple_of(head_dim) {
         return Err(refuse(
             OP,
-            format!("the {}-wide row is not a whole number of {head_dim}-wide heads", x.width),
+            format!(
+                "the {}-wide row is not a whole number of {head_dim}-wide heads",
+                x.width
+            ),
         ));
     }
     let heads = x.width / head_dim;

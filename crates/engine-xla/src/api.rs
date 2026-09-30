@@ -27,7 +27,9 @@ use engine::adapter::AdapterRegistration;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
-use engine::fire::{FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout};
+use engine::fire::{
+    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout,
+};
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
@@ -40,6 +42,10 @@ use crate::error::Fault;
 use crate::serve::{Boot, Lane, Seated, Shell};
 
 pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
+
+/// The request classifier of a trace's model, by trace name (engine-cuda's
+/// `ClassifyFor`): what the warm ladder words its synthetic lanes with.
+pub type ClassifyFor = fn(&str) -> Option<model_ir::ClassifyFn>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceBoot {
@@ -75,6 +81,7 @@ pub struct Xla {
     programs: crate::program::Plane,
     boot: DeviceBoot,
     contract_for: ContractFor,
+    classify_for: Option<ClassifyFor>,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
     next_fire: FireId,
@@ -105,6 +112,7 @@ impl Xla {
         Xla {
             boot,
             contract_for,
+            classify_for: None,
             shell: None,
             caps: None,
             next_fire: 1,
@@ -114,6 +122,14 @@ impl Xla {
             adapters: BTreeMap::new(),
             pending: None,
         }
+    }
+
+    /// Names the classifier the warm ladder (`PIE_XLA_PREWARM=1`) words its
+    /// lanes with.
+    #[must_use]
+    pub fn with_classify(mut self, classify_for: ClassifyFor) -> Xla {
+        self.classify_for = Some(classify_for);
+        self
     }
 
     #[must_use]
@@ -381,19 +397,28 @@ impl Engine for Xla {
             budgets.max_clips,
             budgets.max_lanes,
         );
-        let shell = Shell::load_with(Boot {
-            patches,
-            trace,
-            contract: &contract,
-            checkpoint: &path,
-            budget: bake_budgets(&budgets),
-            page_size: budgets.page_size,
-            context: budgets.max_context,
-            slots: budgets.slots,
-            pages: budgets.pages,
-            device: &boot,
-        }, voxels)
+        let shell = Shell::load_with(
+            Boot {
+                patches,
+                trace,
+                contract: &contract,
+                checkpoint: &path,
+                budget: bake_budgets(&budgets),
+                page_size: budgets.page_size,
+                context: budgets.max_context,
+                slots: budgets.slots,
+                pages: budgets.pages,
+                device: &boot,
+            },
+            voxels,
+        )
         .map_err(fault)?;
+        let mut shell = shell;
+        if std::env::var("PIE_XLA_PREWARM").is_ok_and(|v| v == "1")
+            && let Some(classify) = self.classify_for.and_then(|of| of(&shell.trace().name))
+        {
+            shell.prewarm(classify).map_err(fault)?;
+        }
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, pool_bytes) = shell.footprint();
         let paging = shell.paging();
@@ -665,9 +690,14 @@ impl Engine for Xla {
 /// What a step's lanes feed the diffusion and video inputs, read off the
 /// host submission and the channels: per lane its port cells and
 /// self-conditioning taps, per voxel row its payload in the port's element.
+/// A port cell read off a channel: its kind, its channel index, its values.
+type PortCell = (engine::fire::PortKind, u8, Vec<f32>);
+/// A lane's self-conditioning feed: taps, rows, weights.
+type SelfCondFeed = (u32, Vec<i32>, Vec<f32>);
+
 struct LaneFeeds {
-    cells: Vec<Vec<(engine::fire::PortKind, u8, Vec<f32>)>>,
-    self_cond: Vec<Option<(u32, Vec<i32>, Vec<f32>)>>,
+    cells: Vec<Vec<PortCell>>,
+    self_cond: Vec<Option<SelfCondFeed>>,
     voxels: Vec<Vec<u8>>,
 }
 
@@ -721,7 +751,10 @@ impl Xla {
     /// on its descriptor ports: its tokens, positions, KV extent, page
     /// table (translated from the working set's relative indexes to pool
     /// ids), write descriptor and attention mask.
-    fn device_lanes(&self, submission: &engine::fire::Step) -> EngineResult<Vec<Option<DeviceLane>>> {
+    fn device_lanes(
+        &self,
+        submission: &engine::fire::Step,
+    ) -> EngineResult<Vec<Option<DeviceLane>>> {
         let lanes = &submission.lanes;
         let mut out: Vec<Option<DeviceLane>> = (0..lanes.len()).map(|_| None).collect();
         let program = |why: String| Error::Program(why);
@@ -849,7 +882,10 @@ impl Xla {
                 }
                 let tokens = ports.tokens_for(rows).map_err(fault)?.to_vec();
                 let positions = match have {
-                    Some(have) => ports.positions_for(have, rows).map_err(fault)?.map(<[u32]>::to_vec),
+                    Some(have) => ports
+                        .positions_for(have, rows)
+                        .map_err(fault)?
+                        .map(<[u32]>::to_vec),
                     None => None,
                 };
                 out[source] = Some(DeviceLane {
@@ -925,7 +961,9 @@ impl Xla {
                             }
                         };
                         let weights = f32_cell(
-                            self.programs.feed_cell(instance, weights).map_err(refusal)?,
+                            self.programs
+                                .feed_cell(instance, weights)
+                                .map_err(refusal)?,
                             "the self-conditioning weights channel",
                         )?;
                         (ids, weights)
@@ -1052,8 +1090,8 @@ impl Xla {
             vec![None; submission.lanes.len()];
         let mut token_feeds: Vec<crate::serve::TokenFeed> = Vec::new();
         for attachment in &submission.attachments {
-            let device_resolved =
-                self.programs.geometry_of(attachment.instance) == Some(GeometryClass::DeviceGeometry);
+            let device_resolved = self.programs.geometry_of(attachment.instance)
+                == Some(GeometryClass::DeviceGeometry);
             let lane_count = if device_resolved {
                 1
             } else {

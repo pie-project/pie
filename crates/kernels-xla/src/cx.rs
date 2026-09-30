@@ -71,7 +71,9 @@ impl<'a> Cx<'a> {
     pub fn write(&mut self, t: Tensor, v: Val) -> Result<(), Error> {
         let elem = elem_of("write", t.dtype)?;
         let v = self.f.convert(v, elem);
-        let v = self.f.reshape(v, &[i64::from(t.rows), i64::from(t.width)])?;
+        let v = self
+            .f
+            .reshape(v, &[i64::from(t.rows), i64::from(t.width)])?;
         self.env.write(self.f, t, v)
     }
 

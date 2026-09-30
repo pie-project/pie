@@ -91,7 +91,11 @@ fn fire(
     ctx.emit(&mut |cx| {
         let x = cx.read(act)?;
         let x = head_rows(cx, x, m)?;
-        let x = if cx.elem(x) == Elem::F16 { cx.convert(x, Elem::F32) } else { x };
+        let x = if cx.elem(x) == Elem::F16 {
+            cx.convert(x, Elem::F32)
+        } else {
+            x
+        };
         let out = contract(cx, x, codes, scales, k)?;
         let out = cx.scale(out, f64::from(tensor_scale))?;
         cx.write(y, out)
