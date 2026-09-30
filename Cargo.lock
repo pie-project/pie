@@ -1637,6 +1637,7 @@ dependencies = [
  "eta-compiler",
  "model-ir",
  "pie-eta-ir",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

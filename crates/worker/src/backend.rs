@@ -217,7 +217,7 @@ fn land(
              does not ship"
         ));
     }
-    let request = runtime::engine::load::request_of(
+    let mut request = runtime::engine::load::request_of(
         sku,
         snapshot_dir,
         platform,
@@ -226,6 +226,9 @@ fn land(
         -1,
         frames_in_flight,
     )?;
+    if request.residency.disk_kv_budget > 0 && request.residency.disk_kv_dir.is_none() {
+        request.residency.disk_kv_dir = Some(crate::disk::kv_dir(snapshot_dir)?);
+    }
     backend.load(request).map_err(anyhow::Error::from)
 }
 

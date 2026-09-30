@@ -259,8 +259,8 @@ enum SchedulerItem {
         plan: ::engine::KvCopy,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
-    CopyKvTracked {
-        plan: ::engine::KvCopy,
+    CopyTracked {
+        plan: PreLaunchCopy,
         completion: ControlCompletion,
     },
     #[allow(dead_code)]
@@ -377,7 +377,7 @@ impl std::future::Future for ReplyWait {
 }
 
 #[derive(Clone)]
-pub(super) enum PreLaunchCopy {
+pub(crate) enum PreLaunchCopy {
     Kv(::engine::KvCopy),
     State(StateCopy),
 }
@@ -439,8 +439,8 @@ pub(super) enum QueuedItem {
         plan: ::engine::KvCopy,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
-    CopyKvTracked {
-        plan: ::engine::KvCopy,
+    CopyTracked {
+        plan: PreLaunchCopy,
         completion: ControlCompletion,
     },
     CopyState {
@@ -961,9 +961,9 @@ impl SchedulerHandle {
             .await?
     }
 
-    pub(crate) fn copy_kv_tracked(&self, plan: ::engine::KvCopy) -> Result<ControlCompletion> {
+    pub(crate) fn copy_tracked(&self, plan: PreLaunchCopy) -> Result<ControlCompletion> {
         let completion = ControlCompletion::new();
-        self.send(SchedulerItem::CopyKvTracked {
+        self.send(SchedulerItem::CopyTracked {
             plan,
             completion: completion.clone(),
         })?;
@@ -1443,7 +1443,7 @@ impl BatchScheduler {
                 QueuedItem::BindInstance { .. } => "BindInstance".to_string(),
                 QueuedItem::RegisterChannelsBind { .. } => "RegisterChannelsBind".to_string(),
                 QueuedItem::CopyKv { .. } => "CopyKv".to_string(),
-                QueuedItem::CopyKvTracked { .. } => "CopyKvTracked".to_string(),
+                QueuedItem::CopyTracked { plan, .. } => format!("CopyTracked({})", plan.label()),
                 QueuedItem::CopyState { .. } => "CopyState".to_string(),
                 QueuedItem::CloseInstance { id, .. } => format!("CloseInstance {id}"),
                 QueuedItem::CloseChannels { ids } => format!("CloseChannels x{}", ids.len()),
@@ -1709,8 +1709,8 @@ impl BatchScheduler {
             SchedulerItem::CopyKv { plan, response } => {
                 pending.push_back(QueuedItem::CopyKv { plan, response });
             }
-            SchedulerItem::CopyKvTracked { plan, completion } => {
-                pending.push_back(QueuedItem::CopyKvTracked { plan, completion });
+            SchedulerItem::CopyTracked { plan, completion } => {
+                pending.push_back(QueuedItem::CopyTracked { plan, completion });
             }
             SchedulerItem::CopyState { plan, response } => {
                 pending.push_back(QueuedItem::CopyState { plan, response });
@@ -1814,7 +1814,7 @@ impl BatchScheduler {
         matches!(
             item,
             QueuedItem::CopyKv { .. }
-                | QueuedItem::CopyKvTracked { .. }
+                | QueuedItem::CopyTracked { .. }
                 | QueuedItem::CopyState { .. }
         )
     }
@@ -2088,7 +2088,7 @@ impl BatchScheduler {
                     holds_launches,
                 });
             }
-            QueuedItem::CopyKvTracked { completion, .. } => {
+            QueuedItem::CopyTracked { completion, .. } => {
                 in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { id },
                     logical_completion: None,

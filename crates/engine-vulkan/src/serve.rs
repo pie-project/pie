@@ -790,6 +790,18 @@ impl Shell {
         Ok(())
     }
 
+    /// Opens the slot file under `dir` with `budget` bytes of kv pages.
+    pub fn seat_disk_kv(&mut self, budget: u64, dir: Option<&Path>) -> Result<u32> {
+        if let Some(dir) = dir.filter(|_| budget > 0) {
+            self.pools.seat_disk(&self.device, dir, budget)?;
+        }
+        Ok(self.pools.disk_pages())
+    }
+
+    pub fn spill_kv(&mut self, to_disk: bool, device: &[u32], disk: &[u32]) -> Result<()> {
+        self.pools.spill_kv(&self.device, to_disk, device, disk)
+    }
+
     pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
         let mut frame = self.device.frame()?;
         self.pools.copy_slot(&mut frame, src, dst)?;
@@ -1560,7 +1572,7 @@ impl Shell {
                             None => narrow(u64::from(have) + at as u64),
                         });
                         request_of_token.push(at_lane);
-                        slot_of_row.push(lane.slot as i32);
+                        slot_of_row.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
                     }
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }

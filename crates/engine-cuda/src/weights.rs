@@ -463,7 +463,7 @@ impl Scratch {
     }
 }
 
-fn available_memory() -> u64 {
+pub(crate) fn available_memory() -> u64 {
     let read = |path: &str| std::fs::read_to_string(path).ok();
     headroom(
         read("/proc/meminfo").as_deref(),

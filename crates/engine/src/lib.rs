@@ -10,6 +10,8 @@
 pub mod adapter;
 pub mod caps;
 pub mod channel;
+#[cfg(unix)]
+pub mod disk;
 pub mod engine;
 pub mod error;
 pub mod fire;
@@ -37,5 +39,5 @@ pub use program::{
 };
 pub use transfer::{
     KvCopy, KvExport, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, StateCopy,
-    StateMove,
+    StateDirection, StateMove,
 };

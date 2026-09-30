@@ -171,6 +171,48 @@ fn a_buffered_fold_is_the_fold_it_replaces_every_case() {
     a_buffered_fold_is_the_fold_it_replaces();
     one_fire_folds_the_lane_that_committed_and_not_the_lane_that_buffered();
     the_read_path_replays_the_buffer_it_folds();
+    a_state_parked_on_host_resumes_in_another_slot();
+}
+
+fn a_state_parked_on_host_resumes_in_another_slot() {
+    let Some(mut shell) = ready("a parked state") else {
+        return;
+    };
+    let first = window();
+    let second: Vec<u32> = (0..6u32).map(|at| 3000 + at * 41).collect();
+    let fold = |shell: &mut Shell, lane: u32, rs: u32, tokens: &[u32], reset: RsReset| {
+        let lane = Seated {
+            rs_slot: Some(rs),
+            ..seated(lane, tokens, RsVerb::Fold, reset)
+        };
+        fire(shell, &[lane]).expect("the fold runs")
+    };
+
+    shell.seat_host_kv(None, 1).expect("host rows pin");
+    for slot in 4..8 {
+        shell.open(slot).expect("slot opens");
+    }
+    fold(&mut shell, 4, 4, &first, RsReset::Fresh);
+    let plain = fold(&mut shell, 4, 4, &second, RsReset::Held);
+
+    fold(&mut shell, 5, 5, &first, RsReset::Fresh);
+    let parked = shell.state_bytes(5).expect("slot 5 reads back");
+    shell
+        .copy_state_host(true, &[(5, 0)])
+        .expect("slot 5 parks on host");
+    fold(&mut shell, 7, 5, &second, RsReset::Fresh);
+    shell
+        .copy_state_host(false, &[(6, 0)])
+        .expect("the parked state lands in slot 6");
+    assert!(
+        shell.state_bytes(6).expect("slot 6 reads back") == parked,
+        "the state restored from host is not the state parked there"
+    );
+    let resumed = fold(&mut shell, 5, 6, &second, RsReset::Held);
+    assert_eq!(
+        resumed, plain,
+        "a restored state continues other than it would have"
+    );
 }
 
 fn a_deployments_first_fire_is_its_every_fire() {
