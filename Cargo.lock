@@ -1745,6 +1745,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-xla"
+version = "0.5.4"
+dependencies = [
+ "blake3",
+ "checkpoint",
+ "checkpoint-dsl",
+ "engine",
+ "eta-compiler",
+ "eta-exec",
+ "kernels-xla",
+ "libc",
+ "libloading 0.9.0",
+ "model-compiler",
+ "model-dsl",
+ "model-exec",
+ "model-ir",
+ "models",
+ "pie-dtype",
+ "pie-eta-ir",
+ "prost",
+ "serde_json",
+ "tokenizer",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "ztensor",
+ "ztensor-compat",
+]
+
+[[package]]
 name = "enum-ordinalize"
 version = "4.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2786,6 +2815,13 @@ version = "0.5.4"
 dependencies = [
  "pie-dtype",
  "serde_json",
+]
+
+[[package]]
+name = "kernels-xla"
+version = "0.5.4"
+dependencies = [
+ "pie-dtype",
 ]
 
 [[package]]
@@ -4573,6 +4609,7 @@ dependencies = [
  "engine-metal",
  "engine-vulkan",
  "engine-wgpu",
+ "engine-xla",
  "eta-compiler",
  "fancy-regex",
  "futures",

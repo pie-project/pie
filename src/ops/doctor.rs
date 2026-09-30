@@ -258,7 +258,7 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Checks {
     out
 }
 
-const KNOWN_ENGINES: &str = "cuda, metal, vulkan, wgpu";
+const KNOWN_ENGINES: &str = "cuda, metal, vulkan, wgpu, xla";
 
 fn absent_because(name: &str) -> String {
     match name {
@@ -269,6 +269,7 @@ fn absent_because(name: &str) -> String {
         "metal" => "metal engines run on Apple hardware only".to_string(),
         "vulkan" => "not compiled — build with `--features vulkan`".to_string(),
         "wgpu" => "not compiled — build with `--features wgpu`".to_string(),
+        "xla" => "not compiled — build with `--features xla`".to_string(),
         other => format!("unknown engine type `{other}`; this build knows: {KNOWN_ENGINES}"),
     }
 }

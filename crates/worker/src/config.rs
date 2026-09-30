@@ -16,6 +16,7 @@ pub mod units;
 
 pub use backend::{
     CudaNativeEngineOptions, MetalEngineOptions, VulkanEngineOptions, WgpuEngineOptions,
+    XlaEngineOptions,
 };
 pub use units::{ByteSize, Duration};
 
@@ -934,6 +935,17 @@ impl EngineConfig {
                 })?;
                 opts.validate()?;
             }
+            EngineKind::Xla => {
+                let opts: XlaEngineOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [engine] options for engine type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
+                opts.validate()?;
+            }
         }
         Ok(())
     }
@@ -957,6 +969,8 @@ pub enum EngineKind {
     /// The WebGPU shell — one binary over Vulkan, Metal, D3D12 or WebGPU,
     /// whichever the machine has.
     Wgpu,
+    /// The XLA shell: a PJRT plugin, libtpu on a TPU host.
+    Xla,
 }
 
 impl EngineKind {
@@ -966,6 +980,7 @@ impl EngineKind {
             EngineKind::Metal => "metal",
             EngineKind::Vulkan => "vulkan",
             EngineKind::Wgpu => "wgpu",
+            EngineKind::Xla => "xla",
         }
     }
 }
@@ -1133,6 +1148,7 @@ device = ["cpu"]
             (EngineKind::Metal, "metal"),
             (EngineKind::Vulkan, "vulkan"),
             (EngineKind::Wgpu, "wgpu"),
+            (EngineKind::Xla, "xla"),
         ];
         for (kind, spelled) in KINDS {
             assert_eq!(kind.as_str(), *spelled, "{kind:?} names itself");
@@ -1150,7 +1166,7 @@ device = ["cpu"]
         }
         assert_eq!(
             KINDS.len(),
-            4,
+            5,
             "an engine kind was added without a line here, so nothing checks its \
              config spelling"
         );

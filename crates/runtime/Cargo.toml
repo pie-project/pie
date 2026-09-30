@@ -57,6 +57,7 @@ ipnet = "2"
 engine-vulkan = { path = "../engine-vulkan", optional = true }
 
 engine-wgpu = { path = "../engine-wgpu", optional = true }
+engine-xla = { path = "../engine-xla", optional = true }
 wgpu = { version = "30", default-features = false, features = ["wgsl"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -128,6 +129,7 @@ cuda = ["dep:engine-cuda", "engine-cuda/cuda", "media/nvenc"]
 metal = ["dep:engine-metal"]
 vulkan = ["dep:engine-vulkan", "engine-vulkan/vulkan"]
 wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu", "dep:wgpu"]
+xla = ["dep:engine-xla"]
 profile-fire = []
 
 [dev-dependencies]
