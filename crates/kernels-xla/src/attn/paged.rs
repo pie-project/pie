@@ -898,7 +898,10 @@ pub(crate) fn per_row(
     let width = (h.kvh * (h.d + h.dv)).max(h.qh()).max(1);
     let c = pow2_floor((BUDGET / (r * width)).max(8)).min(round_up(total, 8));
     // TMP-PF: a floor on the per-row chunk (keys), for an A/B.
-    let c = match std::env::var("PF_DECC").ok().and_then(|v| v.parse::<i64>().ok()) {
+    let c = match std::env::var("PF_DECC")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+    {
         Some(floor) if matches!(keys, KeyList::Range) => c.max(floor.min(round_up(total, 8))),
         _ => c,
     };
