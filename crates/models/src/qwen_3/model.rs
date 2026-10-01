@@ -24,6 +24,32 @@ pub struct Model {
     pub mtp: Option<Mtp>,
 
     pub dflash: Option<DFlash>,
+
+    /// Bonsai online-Hadamard rotation-undo (M3c). `Some` iff this instance
+    /// serves a Ternary-Bonsai RHT checkpoint: the forward multiplies each
+    /// rotated projection's INPUT activation by `H·(S··)` before the matmul,
+    /// with `S` the width-keyed sign diagonal decoded from the GGUF (M3b). Every
+    /// non-Bonsai SKU leaves this `None`, and the forward is then byte-identical.
+    pub bonsai: Option<BonsaiSigns>,
+}
+
+/// The three width-keyed RHT sign diagonals `S` (registered param banks) the
+/// Bonsai forward feeds to [`model_dsl::ops::elemwise::hadamard_signed`]. Chosen
+/// per site by the rotated weight's INPUT width, exactly as the fork selects by
+/// `weight->ne[0]` (oracle §6):
+///
+/// * `hidden` (5120, `n_embd`) — every residual-stream input: the GDN/attn mixer
+///   input (`in_qkvz` / `attn_q`+`attn_k`), `ffn_gate`+`ffn_up`, and the output
+///   head. (The token-embedding inverse also rides 5120 but is `S·H`, not `H·S` —
+///   see the forward.)
+/// * `ssm` (6144) — the GDN `ssm_out` input (with the v-head reorder) AND, on
+///   full-attention layers, the `attn_output` (o-proj) input (no reorder). Both
+///   have input width `v_heads·v_dim` = `q_heads·head_dim` = 6144.
+/// * `ffn_down` (17408, `n_ff`) — the FFN `down` input.
+pub struct BonsaiSigns {
+    pub hidden: Weight,
+    pub ssm: Weight,
+    pub ffn_down: Weight,
 }
 
 pub const DRAFT_DEPTH: u32 = 1;
@@ -690,6 +716,42 @@ impl Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, None))
     }
 
+    /// The 27B Ternary-Bonsai serve instance (M3c): a `d27b` trunk (no MTP/vision
+    /// — the GGUF carries neither) with the online-Hadamard rotation-undo armed.
+    /// `w` is `Dtype::Ptq1_0` for the real native GGUF; the sign banks are
+    /// declared in the activation compute dtype (`bf16`). Every rotated site in
+    /// the forward keys its diagonal by input width off [`BonsaiSigns`].
+    pub fn d27b_bonsai(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut m = Model::new(w, kv, tp, Model::d27b_dims(None, None));
+        let dt = crate::dense(w);
+        // The real Ternary-Bonsai GGUF stores the GDN `ssm_beta`/`ssm_alpha`
+        // projections (which fuse into `in_ba`) in bf16, NOT ternary — only the
+        // large matmuls (attn/ffn/ssm_out/in_qkvz/embed/head) are PTQ1_0. Serve
+        // `in_ba` in its stored bf16, so the import concatenates the two bf16
+        // sources into a bf16 bank rather than trying to re-encode them into a
+        // ternary block (which has no encoder). Every other GDN companion
+        // (`conv`/`dt_bias`/`a_log`/`gdn_norm`) is already declared in a float
+        // type the import casts the F32 source into.
+        for layer in &mut m.layers {
+            if let Mixer::Gdn(g) = &mut layer.mixer {
+                g.in_ba.dtype = dt;
+            }
+        }
+        // The token-embedding LOOKUP table is served in bf16: `layout.embed`
+        // gathers whole rows and there is no ternary gather kernel, so the ternary
+        // `token_embd` is decoded to bf16 at import (an exact ±-scale dequant of
+        // each block). The tied output head (`lm_head`, read from the GGUF's own
+        // `output.weight`) stays PTQ1_0 so the vocab projection runs on the M1b
+        // ternary decode-in-dot matmul.
+        m.embed.dtype = dt;
+        m.bonsai = Some(BonsaiSigns {
+            hidden: super::rotation::sign_param_in(super::rotation::WIDTH_HIDDEN, dt),
+            ssm: super::rotation::sign_param_in(super::rotation::WIDTH_SSM_OUT, dt),
+            ffn_down: super::rotation::sign_param_in(super::rotation::WIDTH_FFN_DOWN, dt),
+        });
+        m
+    }
+
     pub fn d27b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,
@@ -989,6 +1051,7 @@ impl Model {
             tower,
             mtp,
             dflash,
+            bonsai: None,
         }
     }
 }
