@@ -586,6 +586,19 @@ pub const GT_T3_F16_N: Fmt<'static> = Fmt::Q {
 };
 const _: () = assert!(spells(&GT_T3_F16_N, "gt_t3_f16_n"));
 
+/// PTQ1_0 (Prism-private ternary, block 128): base-3 trit codes at group size
+/// 128 with one fp16 scale per block and no offset. The `Elem::T3` plane accounts
+/// `ceil(128/5) = 26` bytes (the block's `qs[24]` + `qh[2]`) and the f16 gain adds
+/// 2, so a 128-wide block is exactly 28 bytes = 1.75 bpw. The staging that decides
+/// which byte/trit-slot stores each element is handled by the codec, not the Fmt.
+pub const G128_T3_F16_N: Fmt<'static> = Fmt::Q {
+    g: Group::N(128),
+    elem: Elem::T3,
+    gain: &Fmt::Elem(Elem::F16),
+    offset: None,
+};
+const _: () = assert!(spells(&G128_T3_F16_N, "g128_t3_f16_n"));
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,5 +678,14 @@ mod tests {
         assert_eq!(Fmt::Elem(Elem::Bf16).bpw(k), Some(16.0));
         assert_eq!(Fmt::Elem(Elem::Cb(3)).bpw(k), None);
         assert_eq!(G128_U4_F16_Z_U4.bpw(0), None);
+        // PTQ1_0's Fmt is the algebraic ternary shape (group 128, T3, fp16 gain).
+        // It coincides with the block layout for a single block (28 B) but the
+        // generic plane model packs trits as one contiguous 5-per-byte stream, so
+        // for >2 blocks it UNDER-counts vs the real block-padded 28 B/block layout
+        // (the `qh` tail is 4 trits/byte and each block is byte-padded). The exact
+        // on-disk size lives on `Dtype::Ptq1_0::row_bytes`; see the lib tests.
+        assert_eq!(G128_T3_F16_N.row_bytes(128), Some(28));
+        assert_eq!(G128_T3_F16_N.row_bytes(256), Some(56));
+        assert_eq!(G128_T3_F16_N.quantum(), Quantum::Elems(128));
     }
 }
