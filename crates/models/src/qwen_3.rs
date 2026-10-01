@@ -2,6 +2,7 @@ pub mod forward;
 pub mod import;
 pub mod media;
 pub mod model;
+pub mod rotation;
 pub mod template;
 pub mod tokenizer;
 
