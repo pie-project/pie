@@ -204,7 +204,9 @@ impl Shell {
             programs[at] = slot.into_inner().ok().flatten();
         }
         // The compiles' scratch is freed by now: hand it back rather than
-        // keep it in the allocator's arenas.
+        // keep it in the allocator's arenas. glibc's call; the other libcs
+        // have no equivalent, and macOS has to build this crate too.
+        #[cfg(target_os = "linux")]
         // SAFETY: `malloc_trim` only releases free heap pages.
         unsafe {
             libc::malloc_trim(0);
