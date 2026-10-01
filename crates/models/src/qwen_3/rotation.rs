@@ -60,6 +60,30 @@ pub const SIGN_MODE_KEY: &str = "prism.hadamard.sign_mode";
 pub const SIGN_WIDTHS_KEY: &str = "prism.hadamard.sign_widths";
 /// GGUF metadata key: the `int32` array of every `±1` sign, widths end to end.
 pub const SIGN_VALUES_KEY: &str = "prism.hadamard.sign_values";
+/// GGUF metadata key: whether the GDN v-heads are stored **tiled** ("v-grouped",
+/// v-head `p` pairs k-head `p % k_heads`) rather than **block** (`p / rep`). When
+/// true, the GGUF import reorders every v-head-indexed GDN tensor tiled→block so
+/// pie's block-pairing GDN scan kernel pairs v→k correctly, leaving the shared
+/// kernel untouched. Absent or false => the file is already block-stored.
+pub const GDN_V_GROUPED_KEY: &str = "prism.hadamard.gdn_v_grouped";
+
+/// Read the [`GDN_V_GROUPED_KEY`] flag from an opened GGUF source's top-level
+/// metadata. Absent or false => the GDN v-heads are already in block order.
+#[must_use]
+pub fn gdn_v_grouped(src: &ztensor::Source) -> bool {
+    gdn_v_grouped_in(src.attributes())
+}
+
+/// The [`gdn_v_grouped`] decision over a bare metadata map — absent map, absent
+/// key, or a non-`true` value all read as `false`. Split out so it is testable
+/// without opening a GGUF.
+#[must_use]
+pub fn gdn_v_grouped_in(attributes: Option<&Value>) -> bool {
+    matches!(
+        attributes.and_then(|attrs| attrs.get(GDN_V_GROUPED_KEY)),
+        Some(Value::Bool(true))
+    )
+}
 
 /// Input width of every hidden/residual-stream rotated site (`n_embd`).
 pub const WIDTH_HIDDEN: u32 = 5120;
