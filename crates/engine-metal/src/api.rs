@@ -521,6 +521,8 @@ impl Engine for Metal {
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
+        let (pool_committed_bytes, pool_high_water_bytes) = shell.pool_residency();
+        let (elastic_page_bytes, elastic_budget_pages) = shell.pool_elastic();
         let weights_warm = shell.weights_warm();
 
         let paging = shell.paging();
@@ -554,8 +556,8 @@ impl Engine for Metal {
                     .map(|&(_, adapters, _)| adapters)
                     .min()
                     .unwrap_or(0),
-                elastic_page_bytes: 0,
-                elastic_budget_pages: 0,
+                elastic_page_bytes,
+                elastic_budget_pages,
                 disk_kv_pages,
                 ..PoolFacts::default()
             },
@@ -594,8 +596,8 @@ impl Engine for Metal {
                 arena_bytes,
                 pool_bytes,
                 input_bytes,
-                pool_committed_bytes: pool_bytes,
-                pool_high_water_bytes: pool_bytes,
+                pool_committed_bytes,
+                pool_high_water_bytes,
             },
             caps,
         })
