@@ -348,6 +348,11 @@ fn resolve(src: &ztensor::Source, claim: Claim) -> Result<Vec<TensorContract>, E
 }
 fn declare(src: &ztensor::Source, w: &Weight, expr: Expr) -> Result<TensorContract, Error> {
     let want = match encoding(w.dtype) {
+        // A self-contained block (K-quants, PTQ1_0) already carries its grouping
+        // in the payload; it takes no channel axis. Leaving it ungrouped lets its
+        // `want` compare EQUAL to the stored spec so `ladder` copies it through
+        // unchanged (no decode, no re-encode) instead of forcing a conversion.
+        Encoding::Quant(spec) if spec.scheme.is_self_contained() => Encoding::Quant(spec),
         Encoding::Quant(_) => grouped(w),
         raw => raw,
     };
@@ -583,6 +588,13 @@ fn planes(
         return Ok(vec![copy(src, w, from)?]);
     }
     if stored_block(src, &from)? && matches!(encoding(w.dtype), Encoding::Quant(_)) {
+        // Native pass-through: the file already holds this exact self-contained
+        // scheme (e.g. a PTQ1_0 ternary block served as-is). Keep the raw block
+        // bytes — no decode to fp, no re-encode. `ladder` copies the source expr
+        // through unchanged because stored == want.
+        if stored_encoding(src, &from)? == encoding(w.dtype) {
+            return Ok(vec![copy(src, w, from)?]);
+        }
         if placed_road_covers(w) {
             let parts = [from];
             return placed_from_encode(w, |canon| reencoded_from_block(src, canon, &parts));
@@ -625,6 +637,15 @@ fn planes_fused(
         Ok::<bool, Error>(all && stored_block(src, part)?)
     })? && matches!(encoding(w.dtype), Encoding::Quant(_))
     {
+        // Native pass-through of fused self-contained blocks: when every leg is
+        // already stored as exactly the declared scheme (e.g. PTQ1_0), concatenate
+        // the raw block bytes along the row axis — no decode, no re-encode.
+        let want = encoding(w.dtype);
+        if parts.iter().try_fold(true, |all, part| {
+            Ok::<bool, Error>(all && stored_encoding(src, part)? == want)
+        })? {
+            return Ok(vec![fused(src, w, parts)?]);
+        }
         if placed_road_covers(w) {
             return placed_from_encode(w, |canon| reencoded_from_block(src, canon, &parts));
         }
