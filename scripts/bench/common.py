@@ -485,7 +485,12 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         help="Stop a delayed profiler capture after this duration. Zero keeps "
         "the legacy whole-measured-window capture.",
     )
-    p.add_argument("--request-timeout", type=float, default=300.0)
+    p.add_argument(
+        "--request-timeout",
+        type=float,
+        default=300.0,
+        help="Seconds a request may wait; pie_bench counts them from the last event any request of the run heard.",
+    )
     p.add_argument("--tp-size", type=int, default=1)
     p.add_argument(
         "--dp-size",
