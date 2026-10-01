@@ -80,15 +80,20 @@ pub fn decode_block(block: &[u8]) -> [f32; QK_PTQ1_0] {
     out
 }
 
+// Real 28-byte blocks from Ternary-Bonsai-2-27B-PTQ1_0.gguf plus synthetic edge
+// cases, each with its expected f32 produced by the fork's OWN verbatim
+// `dequantize_row_ptq1_0` (and, for the synthetic ones, the fork's verbatim
+// `quantize_row_ptq1_0_ref`). See the module doc for the oracle provenance. The
+// file is a sibling of this one, so `#[path]` points `mod` at it directly — a
+// real declaration the mod-reachability audit can follow (an `include!` is not).
+#[cfg(test)]
+#[path = "ptq1_0_fixture.rs"]
+mod ptq1_0_fixture;
+
 #[cfg(test)]
 mod tests {
+    use super::ptq1_0_fixture::*;
     use super::*;
-
-    // Real 28-byte blocks from Ternary-Bonsai-2-27B-PTQ1_0.gguf plus synthetic
-    // edge cases, each with its expected f32 produced by the fork's OWN verbatim
-    // `dequantize_row_ptq1_0` (and, for the synthetic ones, the fork's verbatim
-    // `quantize_row_ptq1_0_ref`). See the module doc for the oracle provenance.
-    include!("ptq1_0_fixture.rs");
 
     /// The whole point of M1a: pie's host decoder must reproduce the fork's own
     /// dequant BIT-EXACT on every real block and every synthetic edge case.
