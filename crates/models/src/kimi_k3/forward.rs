@@ -45,6 +45,7 @@ impl ForwardHybrid for Model {
                         kv,
                         a.kv.clone(),
                         [self.kv_lora_rank as u64, a.qk_rope_head_dim as u64],
+                        a.qk_rope_head_dim,
                     );
                 }
 

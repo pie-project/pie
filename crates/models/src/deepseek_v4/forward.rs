@@ -48,14 +48,19 @@ impl ForwardHybrid for Model {
         let kv = c.kv_space(self.kv);
         for w in &self.layers {
             let at = &w.attn;
-            c.kv(kv, at.kv.clone(), [at.kv_down.dim(0)]);
+            c.kv(kv, at.kv.clone(), [at.kv_down.dim(0)], self.head_dim);
             if let Some(p) = &at.pool {
                 let pool = c.kv_space(self.kv);
-                c.kv(pool, p.entries.clone(), [self.head_dim as u64]);
+                c.kv(
+                    pool,
+                    p.entries.clone(),
+                    [self.head_dim as u64],
+                    self.head_dim,
+                );
             }
             if let Some(ix) = &at.indexer {
                 let index = c.kv_space(self.kv);
-                c.kv(index, ix.keys.clone(), [ix.head_dim as u64]);
+                c.kv(index, ix.keys.clone(), [ix.head_dim as u64], ix.head_dim);
             }
         }
         if let Some(mtp) = &self.mtp {
@@ -63,6 +68,7 @@ impl ForwardHybrid for Model {
                 kv,
                 mtp.block.attn.kv.clone(),
                 [mtp.block.attn.kv_down.dim(0)],
+                self.head_dim,
             );
         }
         c
