@@ -167,8 +167,8 @@ impl Shell {
     }
 
     /// Pins this rank's host pool: one rs row per device slot, then kv
-    /// pages, from `stated` bytes (or one device pool's worth) shared by
-    /// `ranks`, within the host memory the load left.
+    /// pages, then windowed pages, from `stated` bytes (or one device pool's
+    /// worth of each) shared by `ranks`, within the host memory the load left.
     pub fn seat_host_kv(&mut self, stated: Option<u64>, ranks: u32) -> Result<u32> {
         let ranks = u64::from(ranks.max(1));
         let row = self.state_row_bytes();
@@ -179,11 +179,24 @@ impl Shell {
         };
         let page = self.pools.paged_page_bytes();
         let pages = self.pools.paging().pages();
-        let asked = stated.map_or(u64::from(rows) * row + pages * page, |bytes| bytes / ranks);
+        let window_page = self.pools.window_page_bytes();
+        let window_pages = if window_page > 0 {
+            self.pools.paging().window_pages()
+        } else {
+            0
+        };
+        let whole = u64::from(rows) * row + pages * page + window_pages * window_page;
+        let asked = stated.map_or(whole, |bytes| bytes / ranks);
         let budget = asked.min(crate::weights::available_memory() / ranks);
-        let (rows, pages) = crate::store::host_pool(budget, rows, row, pages, page);
-        self.pools.seat_host(pages, rows, row)?;
+        let (rows, pages, window_pages) =
+            crate::store::host_pool(budget, rows, row, pages, page, window_pages, window_page);
+        self.pools.seat_host(pages, window_pages, rows, row)?;
         Ok(self.pools.host_pages())
+    }
+
+    #[must_use]
+    pub fn host_window_pages(&self) -> u32 {
+        self.pools.host_window_pages()
     }
     /// Opens this rank's share of `budget` disk kv bytes under `dir`.
     pub fn seat_disk_kv(
@@ -204,9 +217,15 @@ impl Shell {
             .spill_kv(self.device.stream(), to_disk, device, disk)
     }
 
-    pub fn swap_kv(&mut self, to_host: bool, device: &[u32], host: &[u32]) -> Result<()> {
+    pub fn swap_kv(
+        &mut self,
+        to_host: bool,
+        device: &[u32],
+        host: &[u32],
+        windowed: &[(u32, u32)],
+    ) -> Result<()> {
         self.pools
-            .swap_kv(self.device.stream(), to_host, device, host)
+            .swap_kv(self.device.stream(), to_host, device, host, windowed)
     }
 
     #[must_use]

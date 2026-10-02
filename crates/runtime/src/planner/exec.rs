@@ -126,7 +126,11 @@ impl Move {
         if let Some(rs) = rs.as_ref().filter(|rs| rs.slot_count() > 0) {
             let (device, slots) = rs.copy_plan();
             copies.push(TierMove {
-                kind: TierKind::Rs,
+                kind: if rs.is_ring() {
+                    TierKind::Window
+                } else {
+                    TierKind::Rs
+                },
                 tier: MemoryDomain::HostPinned,
                 out,
                 device,
@@ -355,7 +359,7 @@ async fn restore(
     let mut kv = None;
     if !working_sets.is_empty() {
         let prepared = crate::store::registry::with_kv_lock(&stores.kv, "planner-restore", |kv| {
-            kv.prepare_restore(&working_sets, pages.lend(super::KvPool::Paged))
+            kv.prepare_restore(&working_sets, pages.lend())
         });
         match prepared {
             Ok(txn) => kv = Some(txn),

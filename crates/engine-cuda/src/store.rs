@@ -9,6 +9,7 @@ use crate::error::{Fault, Result};
 use crate::run::{CachePool, CacheTable, PoolSlabs};
 use crate::settle::Airborne;
 use crate::store::kv::{Facts, Paging};
+pub use engine::fit::{least_state_slots, pages_within, state_slots_within};
 
 impl From<model_exec::store::Fault> for Fault {
     fn from(fault: model_exec::store::Fault) -> Fault {
@@ -195,60 +196,10 @@ pub fn decoded_weight_reserve(widest_plane_bytes: u64, streams: u32) -> u64 {
         .saturating_mul(u64::from(streams.max(1)))
 }
 
-/// The least state slots a fitted pool holds for `seated` kv sequences: two
-/// per seat, one per posted frame, and never under the three one buffered
-/// lane holds alone (its folded state and the two pages a window spans).
-#[must_use]
-pub fn least_state_slots(seated: u32) -> u32 {
-    seated.saturating_mul(2).max(3)
-}
-
-/// The largest page count at or under `asked` whose watermark fits `room`,
-/// or zero when not even the first page does. `declared_at` is the watermark
-/// at a page count and only ever grows with it, so this is a bisection over
-/// a step function, not a division: each plane rounds up to a map unit, and
-/// a model has dozens of planes.
-#[must_use]
-pub fn pages_within(asked: u64, room: u64, declared_at: impl Fn(u64) -> u64) -> u64 {
-    if declared_at(asked) <= room {
-        return asked;
-    }
-    let (mut fits, mut over) = (0u64, asked);
-    while over - fits > 1 {
-        let probe = fits + (over - fits) / 2;
-        if declared_at(probe) <= room {
-            fits = probe;
-        } else {
-            over = probe;
-        }
-    }
-    fits
-}
-
-/// The state slots a hybrid's pool holds when `room` does not seat one
-/// sequence beside the `asked` count's slabs: the most whole seats of two
-/// slots (one a posted frame, as the runtime admits lanes) whose slabs take
-/// at most half of what is past `one_sequence`, the kv pages' watermark at
-/// the declared context, and never under what one buffered lane holds
-/// (`least_state_slots`). `slabs_at` is the slabs' watermark at a slot count.
-#[must_use]
-pub fn state_slots_within(
-    asked: u32,
-    room: u64,
-    one_sequence: u64,
-    slabs_at: impl Fn(u32) -> u64,
-) -> u32 {
-    let seats = pages_within(
-        u64::from(asked / 2),
-        room.saturating_sub(one_sequence) / 2,
-        |seats| slabs_at(u32::try_from(seats).unwrap_or(u32::MAX).saturating_mul(2)),
-    );
-    least_state_slots(u32::try_from(seats).unwrap_or(u32::MAX))
-}
-
 /// What a host pool of `budget` bytes seats: one rs row per device slot
-/// first (`rows` of `row_bytes`), then kv pages (`pages` of `page_bytes`)
-/// with the rest. Each is what the budget holds of it, so zero seats nothing.
+/// first (`rows` of `row_bytes`), then kv pages (`pages` of `page_bytes`),
+/// then windowed pages (`window_pages` of `window_page_bytes`) with the
+/// rest. Each is what the budget holds of it, so zero seats nothing.
 #[must_use]
 pub fn host_pool(
     budget: u64,
@@ -256,15 +207,16 @@ pub fn host_pool(
     row_bytes: u64,
     pages: u64,
     page_bytes: u64,
-) -> (u32, u32) {
+    window_pages: u64,
+    window_page_bytes: u64,
+) -> (u32, u32, u32) {
     let clamp = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
     let rows = u64::from(rows).min(budget.checked_div(row_bytes).unwrap_or(0));
-    let pages = pages.min(
-        (budget - rows * row_bytes)
-            .checked_div(page_bytes)
-            .unwrap_or(0),
-    );
-    (clamp(rows), clamp(pages))
+    let left = budget - rows * row_bytes;
+    let pages = pages.min(left.checked_div(page_bytes).unwrap_or(0));
+    let left = left - pages * page_bytes;
+    let window_pages = window_pages.min(left.checked_div(window_page_bytes).unwrap_or(0));
+    (clamp(rows), clamp(pages), clamp(window_pages))
 }
 fn slot_file(error: std::io::Error) -> Fault {
     Fault::Integrity {
@@ -491,6 +443,7 @@ struct DiskKv {
 struct HostKv {
     buffer: crate::device::Pinned,
     pages: u32,
+    window_pages: u32,
     rows: u32,
     row_bytes: u64,
 }
@@ -1251,11 +1204,23 @@ impl Pools {
     /// full-context rows' key and value planes and the compressor slabs
     /// indexed by the same pages. Windowed rows name their own pages.
     fn paged_planes(&self) -> Vec<(&Arena, u64)> {
+        let mut planes = self.kv_planes(false);
+        let page_size = u64::from(self.paging.page_size);
+        for row in &self.pooled {
+            let bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
+            planes.extend(row.planes.iter().map(|arena| (arena, bytes)));
+        }
+        planes
+    }
+
+    /// The planes of the kv rows that are (or are not) `windowed`, and the
+    /// bytes a page holds in each.
+    fn kv_planes(&self, windowed: bool) -> Vec<(&Arena, u64)> {
         let page_size = u64::from(self.paging.page_size);
         let mut planes = Vec::new();
         for (arenas, shape) in self.rows.iter().zip(&self.shapes) {
             let Shape::Kv {
-                windowed: false,
+                windowed: in_window,
                 dtype,
                 keys_width,
                 values_width,
@@ -1264,16 +1229,21 @@ impl Pools {
             else {
                 continue;
             };
+            if in_window != windowed {
+                continue;
+            }
             for (at, arena) in arenas.iter().enumerate() {
                 let width = if at == 0 { keys_width } else { values_width };
                 planes.push((arena, page_size * width * u64::from(elem_size(dtype))));
             }
         }
-        for row in &self.pooled {
-            let bytes = page_size * row.width * u64::from(elem_size(POOL_STATE));
-            planes.extend(row.planes.iter().map(|arena| (arena, bytes)));
-        }
         planes
+    }
+
+    /// The bytes one windowed kv page holds over every windowed plane.
+    #[must_use]
+    pub fn window_page_bytes(&self) -> u64 {
+        self.kv_planes(true).iter().map(|&(_, bytes)| bytes).sum()
     }
 
     /// The bytes one kv page holds over every paged plane.
@@ -1282,22 +1252,37 @@ impl Pools {
         self.paged_planes().iter().map(|&(_, bytes)| bytes).sum()
     }
 
-    /// Pins `pages` host kv pages and `rows` host rs rows of `row_bytes`.
-    pub fn seat_host(&mut self, pages: u32, rows: u32, row_bytes: u64) -> Result<()> {
+    /// Pins `pages` host kv pages, `window_pages` host windowed pages and
+    /// `rows` host rs rows of `row_bytes`, in that order.
+    pub fn seat_host(
+        &mut self,
+        pages: u32,
+        window_pages: u32,
+        rows: u32,
+        row_bytes: u64,
+    ) -> Result<()> {
         let rows = if row_bytes == 0 { 0 } else { rows };
-        let bytes = u64::from(pages) * self.paged_page_bytes() + u64::from(rows) * row_bytes;
+        let bytes = u64::from(pages) * self.paged_page_bytes()
+            + u64::from(window_pages) * self.window_page_bytes()
+            + u64::from(rows) * row_bytes;
         self.host = (bytes > 0)
             .then(|| {
                 crate::device::Pinned::mapped_uninit(usize::try_from(bytes).unwrap_or(usize::MAX))
                     .map(|buffer| HostKv {
                         buffer,
                         pages,
+                        window_pages,
                         rows,
                         row_bytes,
                     })
             })
             .transpose()?;
         Ok(())
+    }
+
+    #[must_use]
+    pub fn host_window_pages(&self) -> u32 {
+        self.host.as_ref().map_or(0, |host| host.window_pages)
     }
 
     /// The host rs rows seated and the bytes of one.
@@ -1314,6 +1299,7 @@ impl Pools {
         match self.host.as_ref() {
             Some(host) if row < rows => Ok(host.buffer.host() as u64
                 + u64::from(host.pages) * self.paged_page_bytes()
+                + u64::from(host.window_pages) * self.window_page_bytes()
                 + u64::from(row) * row_bytes),
             _ => Err(Fault::Ceiling {
                 what: "host rs rows",
@@ -1423,49 +1409,63 @@ impl Pools {
         Ok(())
     }
     /// Copies whole kv pages between the device pool and the host pages,
-    /// `device[i]` with `host[i]`, enqueued on `stream` behind the fires that
-    /// wrote them.
+    /// `device[i]` with `host[i]`, and the windowed pages `(device, host)`
+    /// between the windowed rows and theirs, enqueued on `stream` behind the
+    /// fires that wrote them.
     pub fn swap_kv(
         &mut self,
         stream: *mut core::ffi::c_void,
         to_host: bool,
         device: &[u32],
         host: &[u32],
+        windowed: &[(u32, u32)],
     ) -> Result<()> {
-        let have = u64::from(self.host_pages());
-        let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
-        if let Some(&page) = host.iter().find(|&&page| u64::from(page) >= have) {
-            return Err(Fault::Ceiling {
-                what: "host kv pages",
-                need: u64::from(page) + 1,
-                have,
-            });
+        let have = [self.host_pages(), self.host_window_pages()].map(u64::from);
+        let paged: Vec<(u32, u32)> = device.iter().copied().zip(host.iter().copied()).collect();
+        for (pairs, have, what) in [
+            (&paged[..], have[0], "host kv pages"),
+            (windowed, have[1], "host windowed pages"),
+        ] {
+            if let Some(&(_, page)) = pairs.iter().find(|&&(_, page)| u64::from(page) >= have) {
+                return Err(Fault::Ceiling {
+                    what,
+                    need: u64::from(page) + 1,
+                    have,
+                });
+            }
         }
+        let highest = device.iter().map(|&page| page + 1).max().unwrap_or(0);
         self.ensure_kv(highest)?;
         let Some(buffer) = self.host.as_ref().map(|host| host.buffer.host() as u64) else {
             return Ok(());
         };
-        let mut runs: Vec<(u32, u32, u32)> = Vec::new();
-        for (&d, &h) in device.iter().zip(host) {
-            match runs.last_mut() {
-                Some((d0, h0, n)) if *d0 + *n == d && *h0 + *n == h => *n += 1,
-                _ => runs.push((d, h, 1)),
-            }
-        }
         let mut base = 0u64;
-        for (arena, page_bytes) in self.paged_planes() {
-            for &(d, h, n) in &runs {
-                let bytes = u64::from(n) * page_bytes;
-                let on_device = arena.span(u64::from(d) * page_bytes, bytes)?;
-                let on_host = buffer + base + u64::from(h) * page_bytes;
-                let (dst, src) = if to_host {
-                    (on_host, on_device)
-                } else {
-                    (on_device, on_host)
-                };
-                crate::device::copy_any(stream, dst, src, usize::try_from(bytes).unwrap_or(0))?;
+        let spaces = [
+            (self.paged_planes(), &paged[..], have[0]),
+            (self.kv_planes(true), windowed, have[1]),
+        ];
+        for (planes, pairs, have) in spaces {
+            let mut runs: Vec<(u32, u32, u32)> = Vec::new();
+            for &(d, h) in pairs {
+                match runs.last_mut() {
+                    Some((d0, h0, n)) if *d0 + *n == d && *h0 + *n == h => *n += 1,
+                    _ => runs.push((d, h, 1)),
+                }
             }
-            base += have * page_bytes;
+            for (arena, page_bytes) in planes {
+                for &(d, h, n) in &runs {
+                    let bytes = u64::from(n) * page_bytes;
+                    let on_device = arena.span(u64::from(d) * page_bytes, bytes)?;
+                    let on_host = buffer + base + u64::from(h) * page_bytes;
+                    let (dst, src) = if to_host {
+                        (on_host, on_device)
+                    } else {
+                        (on_device, on_host)
+                    };
+                    crate::device::copy_any(stream, dst, src, usize::try_from(bytes).unwrap_or(0))?;
+                }
+                base += have * page_bytes;
+            }
         }
         Ok(())
     }
@@ -1919,11 +1919,21 @@ mod tests {
 
     fn a_host_pool_seats_its_rows_first_and_pages_with_the_rest() {
         let mib = 1u64 << 20;
-        assert_eq!(host_pool(100 * mib, 8, mib, 1000, mib / 16), (8, 1000));
-        assert_eq!(host_pool(20 * mib, 8, mib, 1000, mib / 16), (8, 192));
-        assert_eq!(host_pool(4 * mib, 8, mib, 1000, mib / 16), (4, 0));
-        assert_eq!(host_pool(0, 8, mib, 1000, mib / 16), (0, 0));
-        assert_eq!(host_pool(mib, 8, 0, 4, mib / 4), (0, 4));
+        assert_eq!(
+            host_pool(100 * mib, 8, mib, 1000, mib / 16, 0, 0),
+            (8, 1000, 0)
+        );
+        assert_eq!(
+            host_pool(20 * mib, 8, mib, 1000, mib / 16, 100, mib / 16),
+            (8, 192, 0)
+        );
+        assert_eq!(
+            host_pool(30 * mib, 8, mib, 100, mib / 16, 100, mib / 16),
+            (8, 100, 100)
+        );
+        assert_eq!(host_pool(4 * mib, 8, mib, 1000, mib / 16, 0, 0), (4, 0, 0));
+        assert_eq!(host_pool(0, 8, mib, 1000, mib / 16, 0, 0), (0, 0, 0));
+        assert_eq!(host_pool(mib, 8, 0, 4, mib / 4, 0, 0), (0, 4, 0));
     }
     // gemma-4 (no slab) with 256 slots reserved seated a lane at 312.
     fn a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse() {

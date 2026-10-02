@@ -406,6 +406,16 @@ const fn compressor_coff(ratio: u32) -> u64 {
     if ratio == 4 { 2 } else { 1 }
 }
 
+/// What the pool-gather rooms take at `paging`: a state and a score row a
+/// pooled cell, so they grow with the pool as its slabs do.
+#[must_use]
+pub fn pool_bytes(trace: &Trace, paging: Paging) -> u64 {
+    pool_state(trace, paging)
+        .iter()
+        .map(|(_, cells, width)| 2 * cells * width * Dtype::Bf16.bytes_ceil())
+        .sum()
+}
+
 fn pool_state(trace: &Trace, paging: Paging) -> Vec<(u32, u64, u64)> {
     let cells = paging.pages() * u64::from(paging.page_size);
     if cells == 0 {

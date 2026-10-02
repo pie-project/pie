@@ -20,8 +20,7 @@ impl RsLifecycle {
         }
         let stores = crate::store::registry::get(self.model, self.engine);
         let mut rs = stores.rs.lock().unwrap();
-        let epoch = rs.current_epoch();
-        rs.release_working_set(self.id, epoch);
+        rs.release_working_set(self.id);
         rs.retire_idle();
     }
 }

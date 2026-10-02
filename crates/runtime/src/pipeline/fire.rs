@@ -195,10 +195,6 @@ impl KvTxnGuard {
         self.txn.as_ref().map(kv::KvTxn::mapping_version)
     }
 
-    fn seq(&self) -> Option<u64> {
-        self.txn.as_ref().map(kv::KvTxn::seq)
-    }
-
     fn into_inner(mut self) -> Option<kv::KvTxn> {
         self.txn.take()
     }
@@ -283,17 +279,17 @@ fn host_kv_demand(
     .map_err(|error| format!("pipeline: KV demand: {error}"))
 }
 
-/// `windowed`: the fire reads windowed pages, which come back only once
-/// every fire that read them settles, so a fire that would park settles its
-/// own tail first rather than hold back the pages parked fires wait on.
+/// `windowed`: the fire reads ring pages, which come back only once every
+/// fire that read them settles, so a fire that would park settles its own
+/// tail first rather than hold back the pages parked fires wait on.
 async fn acquire_grant<C: FireContext>(
     ctx: &mut C,
     pipeline_id: uuid::Uuid,
     demand: crate::planner::Demand,
     windowed: bool,
-) -> Result<crate::planner::AllocationGrant, String> {
+) -> Result<Option<crate::planner::AllocationGrant>, String> {
     if demand.is_zero() {
-        return Ok(crate::planner::AllocationGrant::empty());
+        return Ok(Some(crate::planner::AllocationGrant::empty()));
     }
     let Some(planner) = crate::planner::planner() else {
         return Err("pipeline: KV residency planner is not installed".to_string());
@@ -301,7 +297,7 @@ async fn acquire_grant<C: FireContext>(
     let pid = ctx.process_id();
     if windowed {
         if let Some(grant) = planner.grant_now(pid, demand) {
-            return Ok(grant);
+            return Ok(Some(grant));
         }
         // The tail may hold this frame's earlier slots, which fire only once
         // the scheduler stops waiting on this one: park the lane first.
@@ -310,15 +306,19 @@ async fn acquire_grant<C: FireContext>(
             .await
             .map_err(|error| format!("pipeline: settle for windowed kv: {error:#}"))?;
     }
-    loop {
-        match planner
-            .acquire(pid, pipeline_id, demand)
-            .await
-            .map_err(|error| format!("pipeline: KV capacity: {error}"))?
-        {
-            crate::planner::Acquired::Granted(grant) => return Ok(grant),
-            crate::planner::Acquired::Yield => settle_and_wait_resident(ctx).await?,
+    // A yield may have dropped snapshots the demand was quoted against, so
+    // the caller quotes it again rather than asking for the same.
+    match planner
+        .acquire(pid, pipeline_id, demand)
+        .await
+        .map_err(|error| format!("pipeline: KV capacity: {error}"))?
+    {
+        crate::planner::Acquired::Granted(grant) => Ok(Some(grant)),
+        crate::planner::Acquired::Yield => {
+            settle_and_wait_resident(ctx).await?;
+            Ok(None)
         }
+        crate::planner::Acquired::Requote => Ok(None),
     }
 }
 
@@ -357,6 +357,61 @@ fn bound_rs_working_set_ids<C: FireContext>(
     Ok(Ok(ids))
 }
 
+fn check_fold_len(fold_len: &Option<Vec<u32>>, rows: usize) -> Result<(), String> {
+    match fold_len {
+        Some(lens) if lens.len() != rows => Err(format!(
+            "rs-geometry.fold-len supplied {} length(s) for {rows} request row(s)",
+            lens.len()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The ring plan of a host fire on a model whose state is a window: each
+/// lane writes the pages its tokens land on from `held`, which every
+/// earlier token of its sequence precedes, and reads through its own pages.
+fn host_ring_plan(
+    req: &crate::engine::FireRequest,
+    page_size: u32,
+    fold_len: &Option<Vec<u32>>,
+    ids: &[crate::store::rs::RsWorkingSetId],
+) -> Result<rs::RsPlan, String> {
+    if ids.is_empty() {
+        return Ok(rs::RsPlan::Fold);
+    }
+    check_fold_len(fold_len, req.lanes.len())?;
+    let page_size = page_size.max(1);
+    Ok(rs::RsPlan::Ring(
+        req.lanes
+            .iter()
+            .enumerate()
+            .map(|(row, lane)| {
+                let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
+                let end = lane.kv.held.saturating_add(rows);
+                let pages = if rows == 0 {
+                    Vec::new()
+                } else {
+                    let first = (lane.kv.held / page_size) as usize;
+                    let last = ((end - 1) / page_size) as usize;
+                    let held = lane.kv.pages.len();
+                    lane.kv.pages[first.min(held)..(last + 1).min(held)].to_vec()
+                };
+                rs::RingRow {
+                    pages,
+                    translate: lane.kv.pages.clone(),
+                    advance: crate::store::rs::RingAdvance {
+                        positioned: true,
+                        settled: lane.kv.held,
+                        fold: fold_len.as_ref().map(|lens| lens[row]),
+                        commit_end: end,
+                        head: (rows > 0).then_some(end),
+                    },
+                }
+            })
+            .collect(),
+    ))
+}
+
 fn rs_plan_for(
     fold_len: &Option<Vec<u32>>,
     stores: &crate::store::registry::Stores,
@@ -367,14 +422,7 @@ fn rs_plan_for(
     if rows == 0 {
         return Ok(rs::RsPlan::Fold);
     }
-    if let Some(lens) = fold_len
-        && lens.len() != rows
-    {
-        return Err(format!(
-            "rs-geometry.fold-len supplied {} length(s) for {rows} request row(s)",
-            lens.len()
-        ));
-    }
+    check_fold_len(fold_len, rows)?;
     let mut row_tokens: Vec<u32> = (0..rows)
         .map(|row| {
             qo_indptr
@@ -583,27 +631,18 @@ fn prepare_host_kv_reserved(
     crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
         let required = host_kv_demand_locked(store, ws, writable.clone(), declaration_realized)
             .map_err(|error| ReservedError::Fatal(format!("pipeline: KV demand: {error}")))?;
-        if required > grant.remaining_kv(crate::planner::KvPool::Paged) {
+        if required > grant.remaining_kv() {
             return Err(ReservedError::Stale);
         }
         let (copies, txn) = if declaration_realized {
             ((Vec::new(), Vec::new()), None)
         } else {
-            kv::realize_declaration_reserved(
-                store,
-                ws.id,
-                writable.clone(),
-                grant.lend_kv(crate::planner::KvPool::Paged),
-            )
-            .map_err(|error| {
-                ReservedError::Fatal(format!("pipeline: KV declaration realization: {error}"))
-            })?
+            kv::realize_declaration_reserved(store, ws.id, writable.clone(), grant.lend_kv())
+                .map_err(|error| {
+                    ReservedError::Fatal(format!("pipeline: KV declaration realization: {error}"))
+                })?
         };
-        if let Err(error) = store.ensure_backed_reserved(
-            ws.id,
-            writable.end,
-            grant.lend_kv(crate::planner::KvPool::Paged),
-        ) {
+        if let Err(error) = store.ensure_backed_reserved(ws.id, writable.end, grant.lend_kv()) {
             if let Some(txn) = txn {
                 kv::abandon(store, txn);
             }
@@ -626,16 +665,12 @@ fn prepare_explicit_kv_reserved(
             kv::prepare_explicit_demand(store, ws.id, write_indexes).map_err(|error| {
                 ReservedError::Fatal(format!("pipeline: device-geometry demand: {error}"))
             })?;
-        if required > grant.remaining_kv(crate::planner::KvPool::Paged) {
+        if required > grant.remaining_kv() {
             return Err(ReservedError::Stale);
         }
-        kv::prepare_explicit_reserved(
-            store,
-            ws.id,
-            write_indexes,
-            grant.lend_kv(crate::planner::KvPool::Paged),
+        kv::prepare_explicit_reserved(store, ws.id, write_indexes, grant.lend_kv()).map_err(
+            |error| ReservedError::Fatal(format!("pipeline: device-geometry grant: {error}")),
         )
-        .map_err(|error| ReservedError::Fatal(format!("pipeline: device-geometry grant: {error}")))
     })
 }
 
@@ -754,7 +789,7 @@ fn prepare_bound_rs<C: FireContext>(
     plan: &rs::RsPlan,
     grant: &mut crate::planner::AllocationGrant,
 ) -> Anyhow<Result<rs::PreparedRs, ReservedError>> {
-    let has_recurrent_state = crate::model::model().rs_caps().state_size > 0;
+    let has_recurrent_state = crate::model::model().rs_caps().has_state();
     if let Err(error) = rs::validate_count(rs_reps.len(), qo_indptr, has_recurrent_state) {
         return Ok(Err(ReservedError::Fatal(format!(
             "pipeline: recurrent-state binding: {error}"
@@ -998,124 +1033,52 @@ fn stamp_lane_translation(
     Ok(())
 }
 
-/// The windowed read span and page size of the model's windowed kv spaces,
-/// if it has any.
-fn window_of(stores: &crate::store::registry::Stores) -> Option<(u32, u32)> {
-    crate::store::registry::with_kv_lock(&stores.kv, "host-window", |kv| {
-        kv.window().map(|pool| (pool.tokens, pool.page_size()))
-    })
-}
-
-/// A host fire's lanes as the windowed pool sees them, in the working
-/// set's own page indices.
-fn host_window_lanes(
-    req: &crate::engine::FireRequest,
-    window: Option<(u32, u32)>,
-) -> Vec<crate::store::kv::window::WindowLane<'_>> {
-    let Some((tokens, page_size)) = window else {
-        return Vec::new();
-    };
-    req.lanes
-        .iter()
-        .map(|lane| {
-            crate::store::kv::window::WindowLane::of(
-                &lane.kv.pages,
-                lane.kv.held,
-                u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX),
-                tokens,
-                page_size,
-            )
-        })
-        .collect()
-}
-
-/// The windowed pages a fire asks the planner for; see
-/// `KvStore::window_demand`.
-fn window_demand(
+/// A device-geometry fire's rows as a ring sees them: the host knows the
+/// pages the fire may write but not where in them its rows land, so each
+/// row commits only to the start of the last written page and reads
+/// through the working set's whole table.
+/// The ring plan of a device-geometry fire: every row writes the pages
+/// the fire's write indexes name and reads through the working set's mapped
+/// pages. The device decides where its tokens land, so the ring keeps every
+/// page it writes and moves on at the next fire whose positions are known.
+fn device_ring_plan(
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
-    lanes: &[crate::store::kv::window::WindowLane<'_>],
-    writes: std::ops::Range<u64>,
-) -> Result<u32, String> {
-    if lanes.is_empty() {
-        return Ok(0);
+    write_indexes: &[u64],
+    fold_len: &Option<Vec<u32>>,
+    ids: &[crate::store::rs::RsWorkingSetId],
+) -> Result<rs::RsPlan, String> {
+    if ids.is_empty() {
+        return Ok(rs::RsPlan::Fold);
     }
-    crate::store::registry::with_kv_lock(&stores.kv, "host-window", |kv| {
-        kv.window_demand(ws, lanes, writes)
-    })
-    .map_err(|error| format!("pipeline: windowed KV demand: {error}"))
-}
-
-/// Claims from `grant` the windowed pages `lanes` read in the fire of
-/// `epoch`. A grant short of them means the demand went stale.
-fn claim_window(
-    stores: &crate::store::registry::Stores,
-    ws: crate::store::kv::page_table::WorkingSetId,
-    lanes: &[crate::store::kv::window::WindowLane<'_>],
-    (copy_src, copy_dst): &kv::PageCopies,
-    grant: &mut crate::planner::AllocationGrant,
-    epoch: Option<u64>,
-) -> Result<Option<crate::store::kv::window::Claimed>, ReservedError> {
-    use crate::store::kv::window::ClaimError;
-    let (Some(epoch), false) = (epoch, lanes.is_empty()) else {
-        return Ok(None);
-    };
-    let copies: Vec<(u32, u32)> = copy_src
+    check_fold_len(fold_len, ids.len())?;
+    let mapped =
+        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.mapped_len(ws))
+            .map_err(|error| error.to_string())?;
+    let written: Vec<u32> = write_indexes
         .iter()
-        .copied()
-        .zip(copy_dst.iter().copied())
+        .map(|&index| u32::try_from(index).unwrap_or(u32::MAX))
         .collect();
-    crate::store::registry::with_kv_lock(&stores.kv, "host-window", |kv| {
-        let granted = grant.lend_kv(crate::planner::KvPool::Windowed);
-        kv.claim_window(ws, lanes, &copies, granted, epoch)
-            .transpose()
-    })
-    .map_err(|error| match error {
-        ClaimError::Short(_) => ReservedError::Stale,
-        ClaimError::Rewound(why) => ReservedError::Fatal(format!("pipeline: windowed kv: {why}")),
-    })
-}
-
-/// Runs `with` on a device-geometry fire's one windowed lane: the working
-/// set's whole table, since the host does not know the length its lanes
-/// read, so it holds every page it maps.
-fn device_window<R>(
-    stores: &crate::store::registry::Stores,
-    ws: crate::store::kv::page_table::WorkingSetId,
-    with: impl FnOnce(
-        &mut crate::store::kv::KvStore,
-        &[crate::store::kv::window::WindowLane<'_>],
-    ) -> Result<R, String>,
-) -> Result<R, String> {
-    crate::store::registry::with_kv_lock(&stores.kv, "host-window", |kv| {
-        let mapped = kv.mapped_len(ws).map_err(|error| error.to_string())?;
-        let pages: Vec<u32> = (0..u32::try_from(mapped).unwrap_or(u32::MAX)).collect();
-        let lane = crate::store::kv::window::WindowLane {
-            pages: &pages,
-            first: 0,
-            end: pages.len(),
-            fresh_from: 0,
-        };
-        with(kv, &[lane])
-    })
-}
-
-/// Hands each lane its windowed ids; a device-geometry fire's lanes all
-/// read the one table they were claimed as.
-fn stamp_lane_window(
-    req: &mut crate::engine::FireRequest,
-    claimed: Option<crate::store::kv::window::Claimed>,
-) {
-    let Some((ids, copies)) = claimed else {
-        return;
-    };
-    let shared = ids.len() == 1;
-    for (at, lane) in req.lanes.iter_mut().enumerate() {
-        lane.kv.window = ids[if shared { 0 } else { at }].clone();
-    }
-    if let Some(lane) = req.lanes.first_mut() {
-        lane.kv.window_copies = copies;
-    }
+    let last = written.iter().copied().max();
+    let extent = u32::try_from(mapped)
+        .unwrap_or(u32::MAX)
+        .max(last.map_or(0, |last| last.saturating_add(1)));
+    let translate: Vec<u32> = (0..extent).collect();
+    Ok(rs::RsPlan::Ring(
+        (0..ids.len())
+            .map(|_| rs::RingRow {
+                pages: written.clone(),
+                translate: translate.clone(),
+                advance: crate::store::rs::RingAdvance {
+                    positioned: false,
+                    settled: 0,
+                    fold: None,
+                    commit_end: 0,
+                    head: None,
+                },
+            })
+            .collect(),
+    ))
 }
 
 fn poison_readers(cells: &BoundCells, reason: &str) {
@@ -1530,17 +1493,21 @@ pub async fn submit_pass_stamped<C: FireContext>(
             Ok(ids) => ids,
             Err(error) => return Ok(Err(error)),
         };
-        let rs_plan = match rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &req.qo_indptr()) {
+        let ring = crate::model::model().rs_caps().window_tokens > 0;
+        let rs_plan = if ring {
+            host_ring_plan(&req, stores.kv_page_size, &rs_fold_len, &rs_ws_ids)
+        } else {
+            rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &req.qo_indptr())
+        };
+        let rs_plan = match rs_plan {
             Ok(plan) => plan,
             Err(error) => {
                 return Ok(Err(format!("pipeline: recurrent-state mode: {error}")));
             }
         };
         suppress_defaulted_readout_for_fold(&mut req, readout_defaulted, &rs_plan);
-        let window_lanes = host_window_lanes(&req, window_of(&stores));
-        let windowed = !window_lanes.is_empty();
         let mut attempts = 0;
-        let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared, window) = loop {
+        let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
             let kv_demand = match host_kv_demand(
                 &stores,
                 &ws,
@@ -1555,21 +1522,17 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     "pipeline: KV demand exceeds the planner ABI".to_string()
                 ));
             };
-            let window_pages =
-                match window_demand(&stores, ws.id, &window_lanes, writable_pages.clone()) {
-                    Ok(demand) => demand,
-                    Err(error) => return Ok(Err(error)),
-                };
             let rs_demand = match rs_slot_demand(&stores, &rs_ws_ids, &rs_plan) {
                 Ok(demand) => demand,
                 Err(error) => return Ok(Err(error)),
             };
             let demand = crate::planner::Demand {
-                kv_pages: crate::planner::KvPages::new(kv_demand, window_pages),
+                kv_pages: kv_demand,
                 rs_slots: rs_demand,
             };
-            let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand, windowed).await {
-                Ok(grant) => grant,
+            let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand, ring).await {
+                Ok(Some(grant)) => grant,
+                Ok(None) => continue,
                 Err(error) => return Ok(Err(error)),
             };
             let ws_guard = match ws.fire_lease() {
@@ -1598,31 +1561,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(ReservedError::Stale) => return Ok(Err(stale_demand_error())),
                 Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
             };
-            let kvtxn = match kvtxn {
-                None if !window_lanes.is_empty() => Some(crate::store::registry::with_kv_lock(
-                    &stores.kv,
-                    "host-window",
-                    kv::read_epoch,
-                )),
-                kvtxn => kvtxn,
-            };
             let kvtxn = KvTxnGuard::new(model, engine, kvtxn);
-            let window = match claim_window(
-                &stores,
-                ws.id,
-                &window_lanes,
-                &copies,
-                &mut grant,
-                kvtxn.seq(),
-            ) {
-                Ok(window) => window,
-                Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
-                    attempts += 1;
-                    continue;
-                }
-                Err(ReservedError::Stale) => return Ok(Err(stale_demand_error())),
-                Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
-            };
             match prepare_bound_rs(
                 ctx,
                 &stores,
@@ -1634,7 +1573,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 &rs_plan,
                 &mut grant,
             )? {
-                Ok(prepared) => break (ws_guard, copies, kvtxn, prepared, window),
+                Ok(prepared) => break (ws_guard, copies, kvtxn, prepared),
                 Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
                     attempts += 1;
                     continue;
@@ -1647,7 +1586,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if let Err(refusal) = map_lane_pages(&mut req, &stores, ws.id) {
             return Ok(Err(refusal));
         }
-        stamp_lane_window(&mut req, window);
         rs_prepared.apply_to(&mut req);
         let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
         let rstxns = RsTxnsGuard::new(model, engine, rs_prepared.txn);
@@ -2517,9 +2455,9 @@ async fn fire_device_geometry<C: FireContext>(
             return Ok(Err(error));
         }
     };
-    let windowed = window_of(&stores).is_some();
+    let ring = crate::model::model().rs_caps().window_tokens > 0;
     let mut attempts = 0;
-    let (ws_guard, _pages, (copy_src, copy_dst), kvtxn, rs_prepared, window) = loop {
+    let (ws_guard, _pages, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
         let kv_demand =
             match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
                 kv::prepare_explicit_demand(store, ws.id, &write_indexes)
@@ -2536,7 +2474,12 @@ async fn fire_device_geometry<C: FireContext>(
                 "pipeline: KV demand exceeds the planner ABI".to_string()
             ));
         };
-        let rs_plan = match rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &rs_qo_indptr) {
+        let rs_plan = if ring {
+            device_ring_plan(&stores, ws.id, &write_indexes, &rs_fold_len, &rs_ws_ids)
+        } else {
+            rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &rs_qo_indptr)
+        };
+        let rs_plan = match rs_plan {
             Ok(plan) => plan,
             Err(error) => {
                 reclaim_pending_device_grant(ctx, &fwd);
@@ -2550,27 +2493,13 @@ async fn fire_device_geometry<C: FireContext>(
                 return Ok(Err(error));
             }
         };
-        let window_pages = if windowed {
-            match device_window(&stores, ws.id, |kv, lanes| {
-                kv.window_demand(ws.id, lanes, 0..0)
-                    .map_err(|error| error.to_string())
-            }) {
-                // Every page the explicit write backs anew is read too.
-                Ok(demand) => demand.saturating_add(kv_demand),
-                Err(error) => {
-                    reclaim_pending_device_grant(ctx, &fwd);
-                    return Ok(Err(format!("pipeline: windowed KV demand: {error}")));
-                }
-            }
-        } else {
-            0
-        };
         let demand = crate::planner::Demand {
-            kv_pages: crate::planner::KvPages::new(kv_demand, window_pages),
+            kv_pages: kv_demand,
             rs_slots: rs_demand,
         };
-        let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand, windowed).await {
-            Ok(grant) => grant,
+        let mut grant = match acquire_grant(ctx, quorum_pipeline_id, demand, ring).await {
+            Ok(Some(grant)) => grant,
+            Ok(None) => continue,
             Err(error) => {
                 reclaim_pending_device_grant(ctx, &fwd);
                 return Ok(Err(error));
@@ -2608,39 +2537,6 @@ async fn fire_device_geometry<C: FireContext>(
                 }
             };
         let kvtxn = KvTxnGuard::new(ws.model, ws.engine, Some(kvtxn));
-        let window = if windowed {
-            let claimed = device_window(&stores, ws.id, |kv, lanes| {
-                let granted = grant.lend_kv(crate::planner::KvPool::Windowed);
-                let copies: Vec<(u32, u32)> = copies
-                    .0
-                    .iter()
-                    .copied()
-                    .zip(copies.1.iter().copied())
-                    .collect();
-                Ok(kv
-                    .claim_window(ws.id, lanes, &copies, granted, kvtxn.seq().unwrap_or(0))
-                    .transpose())
-            });
-            match claimed {
-                Ok(Ok(window)) => window,
-                Ok(Err(crate::store::kv::window::ClaimError::Short(_)))
-                    if attempts < STALE_DEMAND_ATTEMPTS =>
-                {
-                    attempts += 1;
-                    continue;
-                }
-                Ok(Err(error)) => {
-                    reclaim_pending_device_grant(ctx, &fwd);
-                    return Ok(Err(format!("pipeline: windowed kv: {error}")));
-                }
-                Err(error) => {
-                    reclaim_pending_device_grant(ctx, &fwd);
-                    return Ok(Err(format!("pipeline: windowed kv: {error}")));
-                }
-            }
-        } else {
-            None
-        };
         match prepare_bound_rs(
             ctx,
             &stores,
@@ -2652,7 +2548,7 @@ async fn fire_device_geometry<C: FireContext>(
             &rs_plan,
             &mut grant,
         ) {
-            Ok(Ok(prepared)) => break (ws_guard, pages, copies, kvtxn, prepared, window),
+            Ok(Ok(prepared)) => break (ws_guard, pages, copies, kvtxn, prepared),
             Ok(Err(ReservedError::Stale)) if attempts < STALE_DEMAND_ATTEMPTS => {
                 attempts += 1;
                 continue;
@@ -2824,7 +2720,6 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
     }
-    stamp_lane_window(&mut req, window);
     if ctx
         .resources()
         .get(&fwd)?

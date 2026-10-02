@@ -322,6 +322,7 @@ pub fn submit_async_with_kv_copy(
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
         moves: Vec::new(),
+        windowed: Vec::new(),
     });
     scheduler_handle(engine_idx)?.submit_with_identity_and_copy(
         request,
@@ -364,6 +365,7 @@ pub fn submit_prebuilt_async_with_kv_copy(
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
         moves: Vec::new(),
+        windowed: Vec::new(),
     });
     scheduler_handle(engine_idx)?.submit_prebuilt_with_copy(
         request,
@@ -391,6 +393,7 @@ pub fn submit_prebuilt_async_with_kv_and_rs_copy(
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
         moves: Vec::new(),
+        windowed: Vec::new(),
     });
     scheduler_handle(engine_idx)?.submit_prebuilt_with_copy(
         request,
@@ -452,6 +455,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
         src_page_ids: copy_src,
         dst_page_ids: copy_dst,
         moves: Vec::new(),
+        windowed: Vec::new(),
     });
     handle.submit_prebuilt_tracked_with_copy(
         request,

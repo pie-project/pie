@@ -209,6 +209,21 @@ pub struct Windowed {
     pub fire_pages: u32,
 }
 
+/// The widest window a kv row of `trace` is declared with: the model's
+/// bounded half is then a window, whether or not the engine keeps a
+/// windowed pool for it.
+#[must_use]
+pub fn declared_window(trace: &model_ir::Trace) -> Option<u32> {
+    trace
+        .caches
+        .iter()
+        .filter_map(|row| match row {
+            model_ir::CacheRow::Kv { window, .. } => *window,
+            model_ir::CacheRow::State { .. } => None,
+        })
+        .max()
+}
+
 impl Paging {
     pub fn of(page_size: u32, context: u32, slots: u32, pages: u64) -> Result<Paging> {
         if page_size == 0 {

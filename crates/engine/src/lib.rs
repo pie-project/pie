@@ -15,6 +15,7 @@ pub mod disk;
 pub mod engine;
 pub mod error;
 pub mod fire;
+pub mod fit;
 pub mod frame;
 pub mod load;
 pub mod program;

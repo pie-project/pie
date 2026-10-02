@@ -588,6 +588,7 @@ intended for diagnostics, not serving",
                 }),
                 window_tokens: paging.window.map_or(0, |window| window.tokens),
                 host_kv_pages,
+                host_window_pages: shell.host_window_pages(),
                 host_state_slots: shell.host_state_slots(),
                 disk_kv_pages,
             },
@@ -908,10 +909,23 @@ intended for diagnostics, not serving",
         copy.validate()?;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
         if let Some((tier, out, pages, slots)) = device.and_then(|device| copy.tier_move(device)) {
+            // The windowed pairs are stated in the copy's direction; the pool
+            // takes them as (device, host).
+            let windowed: Vec<(u32, u32)> = copy
+                .windowed
+                .iter()
+                .map(|&(src, dst)| if out { (src, dst) } else { (dst, src) })
+                .collect();
+            if tier == MemoryDomain::LocalDisk && !windowed.is_empty() {
+                return Err(Error::Unsupported {
+                    verb: "windowed kv pages to or from disk",
+                    engine: "cuda",
+                });
+            }
             let shell = self.loaded_mut()?;
             return match tier {
                 MemoryDomain::LocalDisk => shell.spill_kv(out, pages, slots),
-                _ => shell.swap_kv(out, pages, slots),
+                _ => shell.swap_kv(out, pages, slots, &windowed),
             }
             .map_err(fault);
         }

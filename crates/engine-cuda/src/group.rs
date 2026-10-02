@@ -386,6 +386,7 @@ impl Engine for Group {
         for loaded in &mut answers {
             let pools = &mut loaded.caps.pools;
             pools.host_kv_pages = tiers.host_kv_pages;
+            pools.host_window_pages = tiers.host_window_pages;
             pools.host_state_slots = tiers.host_state_slots;
             pools.disk_kv_pages = tiers.disk_kv_pages;
             loaded.caps.kv_copy.device_to_host &= tiers.host_kv_pages > 0;
