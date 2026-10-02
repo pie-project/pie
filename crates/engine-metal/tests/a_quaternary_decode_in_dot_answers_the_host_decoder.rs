@@ -277,6 +277,7 @@ fn a_random_activation_answers_the_host_decoded_weights(
         biases: None,
         group: 128,
         bits: 2,
+        mpp_codes: None,
     };
     let act = Tensor::new(hx, mi.unsigned_abs(), ki.unsigned_abs(), Dtype::Bf16);
     let y = Tensor::new(hy, mi.unsigned_abs(), ni.unsigned_abs(), Dtype::Bf16);

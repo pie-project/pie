@@ -178,6 +178,7 @@ fn one_case(
         biases: None,
         group: 128,
         bits: 2,
+        mpp_codes: None,
     };
     let act = Tensor::new(hx, mi, ki, Dtype::Bf16);
     let yt = Tensor::new(hyt, mi, ni, Dtype::Bf16);

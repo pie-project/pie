@@ -246,6 +246,7 @@ impl Weights {
                     biases: None,
                     group: 128,
                     bits: 2,
+                    mpp_codes: None,
                 }),
                 None => WeightRow::Dense(dense(place)?),
             }));
@@ -1117,6 +1118,7 @@ fn warm(
                 biases: None,
                 group: 128,
                 bits: 2,
+                mpp_codes: None,
             }),
             None => WeightRow::Dense(row(index)?),
         };

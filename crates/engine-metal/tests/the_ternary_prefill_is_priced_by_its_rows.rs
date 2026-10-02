@@ -374,6 +374,7 @@ fn time_pq2_0_tiled(
             biases: None,
             group: 128,
             bits: 2,
+            mpp_codes: None,
         };
         let act = Tensor::new(ha, m, k, Dtype::Bf16);
         let y = Tensor::new(ho, m, n, Dtype::Bf16);
@@ -506,6 +507,7 @@ fn time_affine_ceiling(
             biases: Some(Tensor::new(hb, n, k / group, Dtype::Bf16)),
             group,
             bits,
+            mpp_codes: None,
         };
         let act = Tensor::new(ha, m, k, Dtype::Bf16);
         let y = Tensor::new(ho, m, n, Dtype::Bf16);
